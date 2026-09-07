@@ -36,7 +36,7 @@ pub mod daemon_socket;
 
 /// Legacy DeepSeek-era naming kept for external compatibility.
 ///
-/// CodeWhale began life as a DeepSeek CLI; existing health probes, SDK
+/// CodeWhale began life as DeepSeek-TUI; existing health probes, SDK
 /// harnesses, and on-disk layouts still key off these names. Every remaining
 /// legacy reference in this crate routes through this shim so a future
 /// coordinated migration touches exactly one place (repo policy: preserve
