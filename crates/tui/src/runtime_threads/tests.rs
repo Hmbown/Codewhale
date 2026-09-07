@@ -12111,3 +12111,153 @@ fn restart_rebuild_skips_legacy_tool_items_without_identity() -> Result<()> {
     let _ = std::fs::remove_dir_all(dir);
     Ok(())
 }
+
+#[test]
+fn store_load_failures_carry_typed_record_context() -> Result<()> {
+    // #5931: a monitor recognizes a store fault by type, not by message
+    // text, and the file it names is the one on disk.
+    let dir = test_runtime_dir();
+    let store = RuntimeThreadStore::open(dir.clone())?;
+
+    let error = store
+        .load_turn("turn_missing")
+        .expect_err("missing turn loaded");
+    let failure = RuntimeStoreRecordFailure::from_error(&error).expect("typed read context");
+    assert_eq!(failure.operation, RuntimeStoreOperation::Read);
+    assert_eq!(failure.record_kind, RuntimeStoreRecordKind::Turn);
+    assert_eq!(failure.record_id, "turn_missing");
+    assert_eq!(failure.path, store.turn_path("turn_missing")?);
+    assert!(
+        error.to_string().starts_with("Failed to read turn "),
+        "{error}"
+    );
+
+    let item_path = store.item_path("item_garbage")?;
+    std::fs::write(&item_path, "{ not json")?;
+    let error = store
+        .load_item("item_garbage")
+        .expect_err("garbage item loaded");
+    let failure = RuntimeStoreRecordFailure::from_error(&error).expect("typed parse context");
+    assert_eq!(failure.operation, RuntimeStoreOperation::Parse);
+    assert_eq!(failure.record_kind, RuntimeStoreRecordKind::Item);
+    assert_eq!(failure.path, item_path);
+    let notice = failure.notice(&error, false);
+    let shown_path = item_path.display().to_string();
+    assert!(notice.message.contains(&shown_path), "{}", notice.message);
+    assert!(
+        notice
+            .next_action
+            .starts_with(&format!("Move {shown_path} aside")),
+        "{}",
+        notice.next_action
+    );
+    assert!(!notice.reason.is_empty());
+    assert!(!notice.terminal);
+
+    let _ = std::fs::remove_dir_all(dir);
+    Ok(())
+}
+
+#[tokio::test]
+async fn settle_claimed_turn_failure_publishes_store_failure_for_unreadable_turn() -> Result<()> {
+    // #5931: "Failed to load turn after monitor failure" was a log line; the
+    // operator now gets an event naming the file, and drivers learn the turn
+    // can never reach `turn.completed`.
+    let dir = test_runtime_dir();
+    let manager = test_manager(dir.clone())?;
+    let thread = manager
+        .create_thread(CreateThreadRequest::default())
+        .await?;
+    let turn_id = "turn_unreadable_record";
+    let turn_path = manager.store.turn_path(turn_id)?;
+    std::fs::write(&turn_path, "{ not a turn")?;
+
+    manager
+        .settle_claimed_turn_failure(&thread.id, turn_id, "forced monitor failure")
+        .await;
+
+    let events = manager.events_since(&thread.id, None)?;
+    let notice = events
+        .iter()
+        .find(|event| event.event == RUNTIME_STORE_FAILURE_EVENT)
+        .expect("store failure event was published");
+    assert_eq!(notice.turn_id.as_deref(), Some(turn_id));
+    let payload: RuntimeStoreFailureNotice = serde_json::from_value(notice.payload.clone())?;
+    assert_eq!(payload.failure.operation, RuntimeStoreOperation::Parse);
+    assert_eq!(payload.failure.record_kind, RuntimeStoreRecordKind::Turn);
+    assert_eq!(payload.failure.record_id, turn_id);
+    assert_eq!(payload.failure.path, turn_path);
+    assert!(
+        payload.terminal,
+        "an unreadable turn record can never terminalize"
+    );
+    let shown_path = turn_path.display().to_string();
+    assert!(payload.message.contains(&shown_path), "{}", payload.message);
+    assert!(
+        payload.next_action.contains("aside"),
+        "{}",
+        payload.next_action
+    );
+    assert!(
+        events.iter().all(|event| event.event != "turn.completed"),
+        "no terminal receipt can follow an unreadable turn record"
+    );
+
+    let _ = std::fs::remove_dir_all(dir);
+    Ok(())
+}
+
+#[tokio::test]
+async fn report_store_failure_names_the_item_file_without_terminalizing() -> Result<()> {
+    // The monitor's "Failed to read item …" path: the notice carries the
+    // item id and file, and a fault without typed context stays a log line.
+    let dir = test_runtime_dir();
+    let manager = test_manager(dir.clone())?;
+    let thread = manager
+        .create_thread(CreateThreadRequest::default())
+        .await?;
+    let item_id = "item_unreadable";
+    let item_path = manager.store.item_path(item_id)?;
+    std::fs::write(&item_path, "{ not an item")?;
+    let error = manager
+        .store
+        .load_item(item_id)
+        .expect_err("garbage item loaded");
+
+    let published = manager
+        .report_store_failure(
+            &thread.id,
+            Some("turn_monitor"),
+            &format!("Failed to monitor turn: {error}"),
+            &error,
+            false,
+        )
+        .await
+        .expect("a typed store fault publishes");
+    assert_eq!(published.event, RUNTIME_STORE_FAILURE_EVENT);
+    assert_eq!(published.turn_id.as_deref(), Some("turn_monitor"));
+    assert_eq!(published.item_id.as_deref(), Some(item_id));
+    let payload: RuntimeStoreFailureNotice = serde_json::from_value(published.payload)?;
+    assert!(!payload.terminal);
+    assert_eq!(payload.failure.path, item_path);
+    assert_eq!(payload.failure.record_kind, RuntimeStoreRecordKind::Item);
+
+    let plain = anyhow::anyhow!("plain failure");
+    assert!(
+        manager
+            .report_store_failure(&thread.id, None, "plain", &plain, false)
+            .await
+            .is_none()
+    );
+    assert_eq!(
+        manager
+            .events_since(&thread.id, None)?
+            .iter()
+            .filter(|event| event.event == RUNTIME_STORE_FAILURE_EVENT)
+            .count(),
+        1
+    );
+
+    let _ = std::fs::remove_dir_all(dir);
+    Ok(())
+}

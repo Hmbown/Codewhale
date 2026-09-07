@@ -1,4 +1,4 @@
-<!-- source: README.md sha256:dcbd5aa09403 -->
+<!-- source: README.md sha256:3cc3ffc9b995 -->
 # Codewhale
 
 Codewhale là tác nhân lập trình mã nguồn mở dành cho terminal, được xây dựng bằng Rust và được cải thiện công khai cùng những người sử dụng nó.
@@ -42,6 +42,10 @@ codewhale exec "fix the failing tests and explain what changed"
 ```
 
 Codewhale có thể đọc kho mã nguồn, chỉnh sửa tệp, chạy lệnh, kiểm tra kết quả và tiếp tục làm việc hướng đến mục tiêu. Bạn quyết định mức quyền truy cập dành cho nó.
+
+## Giao diện GUI
+
+Thích giao diện đồ họa hơn? Tiện ích CodeWhale for VS Code do cộng đồng duy trì đưa cùng một agent vào thanh bên VS Code — trò chuyện, hội thoại theo luồng, diff trực tiếp và quản lý tác vụ, đều dùng chung Runtime API, giúp phiên làm việc đồng bộ với thiết bị đầu cuối. Cài đặt từ [VS Code Marketplace](https://marketplace.visualstudio.com/items?itemName=HengQuWorld.brotherwhale-vscode); mã nguồn có trên [GitHub](https://github.com/HengQuWorld/CodeWhale-VSCode).
 
 ## Vì sao chọn Codewhale
 

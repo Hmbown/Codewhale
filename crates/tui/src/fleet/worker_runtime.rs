@@ -28,6 +28,7 @@ use super::profile::{
     AgentProfile, FleetDelegationHints, FleetLoadout, FleetProfile, FleetProfilePermissions,
     FleetRole as FleetProfileRole, FleetSlot, ProfileOrigin, canonical_public_role_name,
 };
+use super::role::runtime_role_for_member;
 use crate::config::{ApiProvider, Config};
 use crate::route_runtime::{resolve_route_candidate, resolve_runtime_route};
 use crate::tools::subagent::{AgentWorkerSpec, AgentWorkerToolProfile, FleetRole};
@@ -415,7 +416,7 @@ pub fn fleet_task_to_worker_spec_with_profiles(
     let agent_profile = agent_profile.as_deref();
     let worker_profile = task_spec.worker.as_ref();
     let role = effective_fleet_role(worker_profile, agent_profile);
-    let agent_type = fleet_role_to_agent_type(role.as_deref());
+    let agent_type = runtime_role_for_member(role.as_deref().unwrap_or_default());
     let tool_profile = fleet_tool_profile(worker_profile);
     let objective = fleet_task_prompt_with_profile(task_spec, agent_profile);
     let max_spawn_depth = codewhale_config::FleetExecConfig::default().max_spawn_depth;
@@ -1198,7 +1199,8 @@ fn effective_fleet_reasoning_effort_for_role(
 ) -> Option<String> {
     effective_fleet_reasoning_effort(agent_profile).or_else(|| {
         let role = effective_fleet_role(worker_profile, agent_profile);
-        WorkerRuntimeProfile::for_role(fleet_role_to_agent_type(role.as_deref())).reasoning_effort
+        WorkerRuntimeProfile::for_role(runtime_role_for_member(role.as_deref().unwrap_or_default()))
+            .reasoning_effort
     })
 }
 
@@ -1281,51 +1283,15 @@ fn fleet_route_model_selector_with_source(
     }
 }
 
-/// Map a fleet role name to a `FleetRole`. Unknown roles default to `General`.
-pub(crate) fn fleet_role_to_agent_type(role: Option<&str>) -> FleetRole {
-    match role {
-        Some("smoke-runner") => FleetRole::Verifier,
-        Some("explore") | Some("scout") => FleetRole::Scout,
-        Some("read-only") => FleetRole::Scout,
-        Some("reviewer") => FleetRole::Reviewer,
-        Some("implement") | Some("builder") => FleetRole::Builder,
-        Some("test") | Some("verifier") | Some("tester") => FleetRole::Verifier,
-        // Every canonical dispatch posture is also a seeded roster member
-        // (#5285); the explicit arms keep the roster→runtime mapping 1:1.
-        Some("planner") => FleetRole::Planner,
-        Some("custom") => FleetRole::Custom,
-        // Advisory counsel (#4752). `oracle` and `consultant` are compatibility
-        // aliases for the canonical public role name, `advisor`.
-        Some("consultant") | Some("oracle") | Some("advisor") => FleetRole::Consultant,
-        Some("explorer") => FleetRole::Scout,
-        // Coordination happens through delegation, which needs the full
-        // General surface (#fleet-roster cutover (v0.8.67)). The operator is
-        // the helm of the overall work (it assigns managers to Workflows);
-        // the manager is the middle manager of one Workflow. Both coordinate,
-        // so both get the General surface — explicitly, not by fall-through.
-        Some("manager") | Some("coordinator") | Some("operator") => FleetRole::Worker,
-        // Synthesis is read-only (planner posture: network reads and
-        // read-only probes, never workspace writes). It must never fall
-        // through to General's full-write posture (#fleet-roster cutover
-        // (v0.8.67)).
-        Some("synthesizer") | Some("summarizer") | Some("reducer") => FleetRole::Planner,
-        Some("general") | None => FleetRole::Worker,
-        Some(other) => {
-            // Try parsing as a FleetRole directly
-            FleetRole::from_str(other).unwrap_or(FleetRole::Worker)
-        }
-    }
-}
-
 /// Runtime agent type for a roster member: role name first, falling back to
 /// the org-chart slot name when the role name is empty (#fleet-roster cutover
 /// (v0.8.67)).
 pub(crate) fn roster_member_agent_type(member: &AgentProfile) -> FleetRole {
     let role_name = member.profile.role.name.trim();
     if role_name.is_empty() {
-        fleet_role_to_agent_type(Some(member.profile.slot.as_str()))
+        runtime_role_for_member(member.profile.slot.as_str())
     } else {
-        fleet_role_to_agent_type(Some(role_name))
+        runtime_role_for_member(role_name)
     }
 }
 
@@ -1525,7 +1491,7 @@ pub(crate) fn network_posture_warning_for_task(
     let agent_profile = agent_profile.as_deref();
     let worker_profile = task.worker.as_ref();
     let role = effective_fleet_role(worker_profile, agent_profile);
-    let agent_type = fleet_role_to_agent_type(role.as_deref());
+    let agent_type = runtime_role_for_member(role.as_deref().unwrap_or_default());
     let tool_profile = fleet_tool_profile(worker_profile);
     let (model, model_source) = effective_fleet_model_with_source(
         session_model.unwrap_or("auto"),
@@ -1906,48 +1872,38 @@ mod tests {
 
     #[test]
     fn fleet_role_smoke_runner_maps_to_verifier() {
-        assert_eq!(
-            fleet_role_to_agent_type(Some("smoke-runner")),
-            FleetRole::Verifier
-        );
+        assert_eq!(runtime_role_for_member("smoke-runner"), FleetRole::Verifier);
     }
 
     #[test]
     fn fleet_role_read_only_maps_to_explore() {
-        assert_eq!(
-            fleet_role_to_agent_type(Some("read-only")),
-            FleetRole::Scout
-        );
+        assert_eq!(runtime_role_for_member("read-only"), FleetRole::Scout);
     }
 
     #[test]
     fn fleet_role_reviewer_maps_to_review() {
-        assert_eq!(
-            fleet_role_to_agent_type(Some("reviewer")),
-            FleetRole::Reviewer
-        );
+        assert_eq!(runtime_role_for_member("reviewer"), FleetRole::Reviewer);
     }
 
     #[test]
     fn fleet_role_builder_maps_to_implementer() {
-        assert_eq!(
-            fleet_role_to_agent_type(Some("builder")),
-            FleetRole::Builder
-        );
+        assert_eq!(runtime_role_for_member("builder"), FleetRole::Builder);
     }
 
+    /// An *absent* role is not an *unknown* role: a Fleet task with no `role`
+    /// field has always run on the documented general default, and #5575's
+    /// fail-closed rule is about labels nobody declared, not about the
+    /// unspecified case.
     #[test]
-    fn fleet_role_none_maps_to_general() {
-        assert_eq!(fleet_role_to_agent_type(None), FleetRole::Worker);
+    fn an_unspecified_role_still_maps_to_general() {
+        assert_eq!(runtime_role_for_member(""), FleetRole::Worker);
+        assert_eq!(runtime_role_for_member("   "), FleetRole::Worker);
     }
 
     #[test]
     fn fleet_role_manager_and_coordinator_map_to_general() {
-        assert_eq!(fleet_role_to_agent_type(Some("manager")), FleetRole::Worker);
-        assert_eq!(
-            fleet_role_to_agent_type(Some("coordinator")),
-            FleetRole::Worker
-        );
+        assert_eq!(runtime_role_for_member("manager"), FleetRole::Worker);
+        assert_eq!(runtime_role_for_member("coordinator"), FleetRole::Worker);
     }
 
     #[test]
@@ -1955,10 +1911,7 @@ mod tests {
         // The operator coordinates the overall work (assigns managers to
         // workflows), so it needs the full General surface — by an explicit
         // match arm, not the unknown-role fall-through.
-        assert_eq!(
-            fleet_role_to_agent_type(Some("operator")),
-            FleetRole::Worker
-        );
+        assert_eq!(runtime_role_for_member("operator"), FleetRole::Worker);
     }
 
     #[test]
@@ -2136,7 +2089,7 @@ mod tests {
     fn consultant_and_legacy_advisory_aliases_share_the_consultant_posture() {
         for role in ["consultant", "oracle", "advisor"] {
             assert_eq!(
-                fleet_role_to_agent_type(Some(role)),
+                runtime_role_for_member(role),
                 FleetRole::Consultant,
                 "role {role}"
             );
@@ -2146,10 +2099,10 @@ mod tests {
     #[test]
     fn fleet_role_synthesizer_family_maps_to_read_only_plan() {
         // A synthesizer must never fall through to General's full-write
-        // posture; Plan is read-only with no shell.
+        // posture; Planner is read-only (reads plus read-only shell probes).
         for role in ["synthesizer", "summarizer", "reducer"] {
             assert_eq!(
-                fleet_role_to_agent_type(Some(role)),
+                runtime_role_for_member(role),
                 FleetRole::Planner,
                 "role {role}"
             );
@@ -2207,12 +2160,63 @@ mod tests {
         }
     }
 
+    /// #5575: an undeclared role name must not be able to hand a worker write
+    /// authority. Before this fix the durable driver answered `Worker` here and
+    /// the exact driver answered `Custom` — two different tables, both
+    /// write-capable and full-shell, for a string nobody declared.
     #[test]
-    fn unknown_role_maps_to_general() {
-        assert_eq!(
-            fleet_role_to_agent_type(Some("nonexistent-role")),
-            FleetRole::Worker
-        );
+    fn unknown_role_fails_closed_to_the_read_only_explore_posture() {
+        for unknown in ["nonexistent-role", "audit-lead", "release-checker"] {
+            assert_eq!(
+                runtime_role_for_member(unknown),
+                FleetRole::Scout,
+                "unknown role {unknown:?} must fail closed, never to a write-capable posture"
+            );
+            assert!(
+                !WorkerRuntimeProfile::for_role(runtime_role_for_member(unknown))
+                    .permissions
+                    .write,
+                "unknown role {unknown:?} must never carry write authority"
+            );
+        }
+
+        // The escape hatch is a *declared* role, not a typo: an operator who
+        // wants "inherit whatever the parent has" spells it `custom`.
+        assert_eq!(runtime_role_for_member("custom"), FleetRole::Custom);
+    }
+
+    /// #5575: both Fleet drivers resolve names through the same mapper, so the
+    /// aliases the durable driver used to own privately now resolve to the same
+    /// posture on the exact/named-Fleet driver — which previously dropped every
+    /// one of them into write-capable `custom`.
+    #[test]
+    fn the_two_fleet_drivers_agree_on_every_member_role_alias() {
+        let session = codewhale_workflow::PermissionCeiling {
+            write: true,
+            network_tool: true,
+            shell: codewhale_workflow::ShellCeiling::Full,
+            delegation_depth: 2,
+            tools: true,
+        };
+        for (role, expected, expected_write) in [
+            ("smoke-runner", FleetRole::Verifier, "read_only"),
+            ("read-only", FleetRole::Scout, "read_only"),
+            ("synthesizer", FleetRole::Planner, "read_only"),
+            ("summarizer", FleetRole::Planner, "read_only"),
+            ("reducer", FleetRole::Planner, "read_only"),
+            ("manager", FleetRole::Worker, "workspace_write"),
+            ("coordinator", FleetRole::Worker, "workspace_write"),
+            ("operator", FleetRole::Worker, "workspace_write"),
+        ] {
+            assert_eq!(runtime_role_for_member(role), expected, "role {role}");
+            // The exact driver's authority comes from the same mapper.
+            assert_eq!(
+                crate::fleet::role::ChildAuthority::from_runtime_role(role, session)
+                    .write_authority,
+                expected_write,
+                "role {role} must resolve the same authority on the exact driver"
+            );
+        }
     }
 
     #[test]
@@ -3673,7 +3677,11 @@ mod tests {
             Some("reviewer")
         );
         assert_eq!(
-            fleet_role_to_agent_type(effective_fleet_role(task.worker.as_ref(), None).as_deref()),
+            runtime_role_for_member(
+                effective_fleet_role(task.worker.as_ref(), None)
+                    .as_deref()
+                    .unwrap_or_default()
+            ),
             FleetRole::Reviewer
         );
     }

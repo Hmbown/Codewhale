@@ -1,7 +1,7 @@
 {
   "$schema": "https://agent-plugins.org/schemas/plugin.json",
   "name": "computer-use",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "See the screen and operate it: accessibility-first control, screenshots, zoom, and screen recording on macOS, Windows, and Linux, plus registered remote computers over ssh and HarmonyOS devices over hdc.",
   "author": { "name": "Codewhale" },
   "license": "MIT",

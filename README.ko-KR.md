@@ -1,4 +1,4 @@
-<!-- source: README.md sha256:dcbd5aa09403 -->
+<!-- source: README.md sha256:3cc3ffc9b995 -->
 # Codewhale
 
 Codewhale은 Rust로 만든 터미널용 오픈 소스 코딩 에이전트로, 사용자들과 함께 공개적으로 개선해 나갑니다.
@@ -42,6 +42,10 @@ codewhale exec "fix the failing tests and explain what changed"
 ```
 
 Codewhale은 저장소를 읽고, 파일을 편집하고, 명령을 실행하고, 결과를 확인하며 목표를 향해 계속 작업할 수 있습니다. 어느 정도의 접근 권한을 줄지는 사용자가 결정합니다.
+
+## GUI 프런트엔드
+
+그래픽 인터페이스를 선호하시나요? 커뮤니티가 관리하는 CodeWhale for VS Code 확장은 동일한 에이전트를 VS Code 사이드바에 담아 채팅·스레드 대화·실시간 diff·작업 관리를 같은 Runtime API로 제공하며, 세션은 터미널과 동기화됩니다. [VS Code Marketplace](https://marketplace.visualstudio.com/items?itemName=HengQuWorld.brotherwhale-vscode)에서 설치하세요. 소스 코드는 [GitHub](https://github.com/HengQuWorld/CodeWhale-VSCode)에 있습니다.
 
 ## Codewhale을 선택하는 이유
 

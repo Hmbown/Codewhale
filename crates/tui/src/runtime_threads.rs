@@ -924,6 +924,164 @@ pub struct RuntimeEventRecord {
     pub payload: Value,
 }
 
+/// Event name for a runtime store record the runtime could not read, parse,
+/// or write. Its payload is a [`RuntimeStoreFailureNotice`] (#5931).
+pub const RUNTIME_STORE_FAILURE_EVENT: &str = "runtime.store_failure";
+
+/// Which runtime store file family failed. The nouns are the store's own
+/// directories (`threads/`, `turns/`, `items/`), so a notice can point at one
+/// file and mean it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeStoreRecordKind {
+    Thread,
+    Turn,
+    Item,
+}
+
+impl std::fmt::Display for RuntimeStoreRecordKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Thread => "thread",
+            Self::Turn => "turn",
+            Self::Item => "item",
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeStoreOperation {
+    Read,
+    Parse,
+    Write,
+}
+
+impl std::fmt::Display for RuntimeStoreOperation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Read => "read",
+            Self::Parse => "parse",
+            Self::Write => "write",
+        })
+    }
+}
+
+/// A runtime store record the operator's own disk could not read, parse, or
+/// write. The store's load/save paths attach it as typed `anyhow` context, so
+/// a monitor recognizes a store fault by type instead of by message text and
+/// can name the file and the next action in a visible notice (#5931).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeStoreRecordFailure {
+    pub operation: RuntimeStoreOperation,
+    pub record_kind: RuntimeStoreRecordKind,
+    pub record_id: String,
+    pub path: PathBuf,
+}
+
+impl RuntimeStoreRecordFailure {
+    fn new(
+        operation: RuntimeStoreOperation,
+        record_kind: RuntimeStoreRecordKind,
+        record_id: &str,
+        path: &Path,
+    ) -> Self {
+        Self {
+            operation,
+            record_kind,
+            record_id: record_id.to_string(),
+            path: path.to_path_buf(),
+        }
+    }
+
+    /// The typed store fault behind an error, if any layer of it is one.
+    #[must_use]
+    pub fn from_error(error: &anyhow::Error) -> Option<&Self> {
+        error.downcast_ref::<Self>()
+    }
+
+    /// What the operator can do about it: which file to move aside, or
+    /// where to check space and permissions. Nothing here is guessed.
+    #[must_use]
+    pub fn next_action(&self) -> String {
+        match self.operation {
+            RuntimeStoreOperation::Read | RuntimeStoreOperation::Parse => format!(
+                "Move {} aside (or delete it) and retry; the thread's other records stay in place.",
+                self.path.display()
+            ),
+            RuntimeStoreOperation::Write => format!(
+                "Check free space and permissions for {}, then retry; nothing was overwritten.",
+                self.path.display()
+            ),
+        }
+    }
+
+    /// Build the event payload for this fault. `terminal` says the runtime
+    /// already knows the turn can never reach `turn.completed`.
+    #[must_use]
+    pub fn notice(&self, error: &anyhow::Error, terminal: bool) -> RuntimeStoreFailureNotice {
+        let reason = error
+            .chain()
+            .last()
+            .map(ToString::to_string)
+            .unwrap_or_default();
+        let next_action = self.next_action();
+        let message = format!(
+            "Session runtime store: {} {} at {} could not be {}: {reason}. {next_action}",
+            self.record_kind,
+            self.record_id,
+            self.path.display(),
+            match self.operation {
+                RuntimeStoreOperation::Read => "read",
+                RuntimeStoreOperation::Parse => "parsed",
+                RuntimeStoreOperation::Write => "written",
+            },
+        );
+        RuntimeStoreFailureNotice {
+            failure: self.clone(),
+            error: format!("{error:#}"),
+            reason,
+            next_action,
+            message,
+            terminal,
+        }
+    }
+}
+
+impl std::fmt::Display for RuntimeStoreRecordFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Failed to {} {} {}",
+            self.operation,
+            self.record_kind,
+            self.path.display()
+        )
+    }
+}
+
+/// Payload of a `runtime.store_failure` event: the operator's own on-disk
+/// state failed, and every consumer (task timeline, SSE client, TUI toast)
+/// gets the file, the reason, and the next action rather than a log line.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeStoreFailureNotice {
+    #[serde(flatten)]
+    pub failure: RuntimeStoreRecordFailure,
+    /// Full error chain, outermost first.
+    pub error: String,
+    /// Root cause alone (an OS or parser message), for compact surfaces.
+    pub reason: String,
+    /// What the operator can do about it.
+    pub next_action: String,
+    /// One-line operator text: record, path, reason, and next action.
+    pub message: String,
+    /// True when this turn will never reach `turn.completed`: its own record
+    /// is unreadable or unwritable, so nothing can be terminalized. Drivers
+    /// waiting on the turn should stop waiting.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub terminal: bool,
+}
+
 pub(crate) struct RuntimeEventReplay {
     /// Cursor immediately before the first replayed event. For a tail-limited
     /// replay this advances past omitted history so continuity remains exact.
@@ -1422,17 +1580,41 @@ impl RuntimeThreadStore {
     }
 
     pub fn save_thread(&self, thread: &ThreadRecord) -> Result<()> {
-        write_json_atomic(&self.thread_path(&thread.id)?, thread)
+        let path = self.thread_path(&thread.id)?;
+        write_json_atomic(&path, thread).with_context(|| {
+            RuntimeStoreRecordFailure::new(
+                RuntimeStoreOperation::Write,
+                RuntimeStoreRecordKind::Thread,
+                &thread.id,
+                &path,
+            )
+        })
     }
 
     pub fn save_turn(&self, turn: &TurnRecord) -> Result<()> {
         validated_record_id(&turn.thread_id, "thread id")?;
-        write_json_atomic(&self.turn_path(&turn.id)?, turn)
+        let path = self.turn_path(&turn.id)?;
+        write_json_atomic(&path, turn).with_context(|| {
+            RuntimeStoreRecordFailure::new(
+                RuntimeStoreOperation::Write,
+                RuntimeStoreRecordKind::Turn,
+                &turn.id,
+                &path,
+            )
+        })
     }
 
     pub fn save_item(&self, item: &TurnItemRecord) -> Result<()> {
         validated_record_id(&item.turn_id, "turn id")?;
-        write_json_atomic(&self.item_path(&item.id)?, item)
+        let path = self.item_path(&item.id)?;
+        write_json_atomic(&path, item).with_context(|| {
+            RuntimeStoreRecordFailure::new(
+                RuntimeStoreOperation::Write,
+                RuntimeStoreRecordKind::Item,
+                &item.id,
+                &path,
+            )
+        })
     }
 
     fn remove_turn(&self, turn_id: &str) -> Result<()> {
@@ -1449,10 +1631,22 @@ impl RuntimeThreadStore {
 
     pub fn load_thread(&self, thread_id: &str) -> Result<ThreadRecord> {
         let path = self.thread_path(thread_id)?;
-        let raw = read_store_file(&path)
-            .with_context(|| format!("Failed to read thread {}", path.display()))?;
-        let record: ThreadRecord = serde_json::from_str(&raw)
-            .with_context(|| format!("Failed to parse thread {}", path.display()))?;
+        let raw = read_store_file(&path).with_context(|| {
+            RuntimeStoreRecordFailure::new(
+                RuntimeStoreOperation::Read,
+                RuntimeStoreRecordKind::Thread,
+                thread_id,
+                &path,
+            )
+        })?;
+        let record: ThreadRecord = serde_json::from_str(&raw).with_context(|| {
+            RuntimeStoreRecordFailure::new(
+                RuntimeStoreOperation::Parse,
+                RuntimeStoreRecordKind::Thread,
+                thread_id,
+                &path,
+            )
+        })?;
         if record.schema_version > CURRENT_RUNTIME_SCHEMA_VERSION {
             bail!(
                 "Thread schema v{} is newer than supported v{}",
@@ -1465,10 +1659,22 @@ impl RuntimeThreadStore {
 
     pub fn load_turn(&self, turn_id: &str) -> Result<TurnRecord> {
         let path = self.turn_path(turn_id)?;
-        let raw = read_store_file(&path)
-            .with_context(|| format!("Failed to read turn {}", path.display()))?;
-        let record: TurnRecord = serde_json::from_str(&raw)
-            .with_context(|| format!("Failed to parse turn {}", path.display()))?;
+        let raw = read_store_file(&path).with_context(|| {
+            RuntimeStoreRecordFailure::new(
+                RuntimeStoreOperation::Read,
+                RuntimeStoreRecordKind::Turn,
+                turn_id,
+                &path,
+            )
+        })?;
+        let record: TurnRecord = serde_json::from_str(&raw).with_context(|| {
+            RuntimeStoreRecordFailure::new(
+                RuntimeStoreOperation::Parse,
+                RuntimeStoreRecordKind::Turn,
+                turn_id,
+                &path,
+            )
+        })?;
         if record.schema_version > CURRENT_RUNTIME_SCHEMA_VERSION {
             bail!(
                 "Turn schema v{} is newer than supported v{}",
@@ -1481,10 +1687,22 @@ impl RuntimeThreadStore {
 
     pub fn load_item(&self, item_id: &str) -> Result<TurnItemRecord> {
         let path = self.item_path(item_id)?;
-        let raw = read_store_file(&path)
-            .with_context(|| format!("Failed to read item {}", path.display()))?;
-        let record: TurnItemRecord = serde_json::from_str(&raw)
-            .with_context(|| format!("Failed to parse item {}", path.display()))?;
+        let raw = read_store_file(&path).with_context(|| {
+            RuntimeStoreRecordFailure::new(
+                RuntimeStoreOperation::Read,
+                RuntimeStoreRecordKind::Item,
+                item_id,
+                &path,
+            )
+        })?;
+        let record: TurnItemRecord = serde_json::from_str(&raw).with_context(|| {
+            RuntimeStoreRecordFailure::new(
+                RuntimeStoreOperation::Parse,
+                RuntimeStoreRecordKind::Item,
+                item_id,
+                &path,
+            )
+        })?;
         if record.schema_version > CURRENT_RUNTIME_SCHEMA_VERSION {
             bail!(
                 "Item schema v{} is newer than supported v{}",
@@ -1576,13 +1794,29 @@ impl RuntimeThreadStore {
             if path.extension().is_none_or(|ext| ext != "json") {
                 continue;
             }
-            let raw = read_store_file(&path)
-                .with_context(|| format!("Failed to read {}", path.display()))?;
+            let item_id = path
+                .file_stem()
+                .map(|stem| stem.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let raw = read_store_file(&path).with_context(|| {
+                RuntimeStoreRecordFailure::new(
+                    RuntimeStoreOperation::Read,
+                    RuntimeStoreRecordKind::Item,
+                    &item_id,
+                    &path,
+                )
+            })?;
             #[cfg(test)]
             self.item_dir_files_read
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let item: TurnItemRecord = serde_json::from_str(&raw)
-                .with_context(|| format!("Failed to parse {}", path.display()))?;
+            let item: TurnItemRecord = serde_json::from_str(&raw).with_context(|| {
+                RuntimeStoreRecordFailure::new(
+                    RuntimeStoreOperation::Parse,
+                    RuntimeStoreRecordKind::Item,
+                    &item_id,
+                    &path,
+                )
+            })?;
             if item.schema_version > CURRENT_RUNTIME_SCHEMA_VERSION {
                 bail!(
                     "Item schema v{} is newer than supported v{}",
@@ -1621,13 +1855,29 @@ impl RuntimeThreadStore {
             if path.extension().is_none_or(|ext| ext != "json") {
                 continue;
             }
-            let raw = read_store_file(&path)
-                .with_context(|| format!("Failed to read {}", path.display()))?;
+            let item_id = path
+                .file_stem()
+                .map(|stem| stem.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let raw = read_store_file(&path).with_context(|| {
+                RuntimeStoreRecordFailure::new(
+                    RuntimeStoreOperation::Read,
+                    RuntimeStoreRecordKind::Item,
+                    &item_id,
+                    &path,
+                )
+            })?;
             #[cfg(test)]
             self.item_dir_files_read
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let item: TurnItemRecord = serde_json::from_str(&raw)
-                .with_context(|| format!("Failed to parse {}", path.display()))?;
+            let item: TurnItemRecord = serde_json::from_str(&raw).with_context(|| {
+                RuntimeStoreRecordFailure::new(
+                    RuntimeStoreOperation::Parse,
+                    RuntimeStoreRecordKind::Item,
+                    &item_id,
+                    &path,
+                )
+            })?;
             if item.schema_version > CURRENT_RUNTIME_SCHEMA_VERSION {
                 bail!(
                     "Item schema v{} is newer than supported v{}",
@@ -5138,6 +5388,47 @@ impl RuntimeThreadManager {
         }
     }
 
+    /// Log a store fault and, when the error carries a typed
+    /// [`RuntimeStoreRecordFailure`], publish it as a `runtime.store_failure`
+    /// event so whoever can act on the file sees it: the task timeline, SSE
+    /// clients, and the TUI (#5931). The event log lives in the same store,
+    /// so a fault that also blocks publication stays a log line.
+    async fn report_store_failure(
+        &self,
+        thread_id: &str,
+        turn_id: Option<&str>,
+        message: &str,
+        error: &anyhow::Error,
+        terminal: bool,
+    ) -> Option<RuntimeEventRecord> {
+        tracing::error!(thread_id = %thread_id, turn_id = ?turn_id, "{message}");
+        let failure = RuntimeStoreRecordFailure::from_error(error)?;
+        let notice = failure.notice(error, terminal);
+        let item_id = (failure.record_kind == RuntimeStoreRecordKind::Item)
+            .then_some(failure.record_id.as_str())
+            .filter(|id| validated_record_id(id, "item id").is_ok());
+        match self
+            .emit_event(
+                thread_id,
+                turn_id,
+                item_id,
+                RUNTIME_STORE_FAILURE_EVENT,
+                json!(notice),
+            )
+            .await
+        {
+            Ok(record) => Some(record),
+            Err(emit_error) => {
+                tracing::error!(
+                    thread_id = %thread_id,
+                    path = %failure.path.display(),
+                    "runtime store failure notice could not be published: {emit_error:#}"
+                );
+                None
+            }
+        }
+    }
+
     fn queue_recovery_receipt(&self, receipt: RecoveredTurnReceipt) {
         let thread_id = receipt.turn.thread_id.clone();
         let turn_id = receipt.turn.id.clone();
@@ -6790,19 +7081,37 @@ impl RuntimeThreadManager {
                         item.ended_at = Some(now);
                         match self.store.save_item(&item) {
                             Ok(()) => terminal_items.push(item),
-                            Err(err) => tracing::error!(
-                                item_id = %item.id,
-                                "Failed to terminalize item after monitor failure: {err}"
-                            ),
+                            Err(err) => {
+                                self.report_store_failure(
+                                    thread_id,
+                                    Some(turn_id),
+                                    &format!(
+                                        "Failed to terminalize item {} after monitor failure: {err}",
+                                        item.id
+                                    ),
+                                    &err,
+                                    false,
+                                )
+                                .await;
+                            }
                         }
                     }
                 }
             }
-            Err(err) => tracing::error!(
-                "Failed to list turn items after monitor failure for {turn_id}: {err}"
-            ),
+            Err(err) => {
+                self.report_store_failure(
+                    thread_id,
+                    Some(turn_id),
+                    &format!(
+                        "Failed to list turn items after monitor failure for {turn_id}: {err}"
+                    ),
+                    &err,
+                    false,
+                )
+                .await;
+            }
         }
-        let terminal_turn = {
+        let (terminal_turn, load_failure) = {
             let _turn_mutation = self.store.turn_mutation.lock();
             match self.store.load_turn(turn_id) {
                 Ok(mut turn) => {
@@ -6818,21 +7127,34 @@ impl RuntimeThreadManager {
                         turn.duration_ms = turn.started_at.map(|start| duration_ms(start, now));
                         turn.error = Some(reason.to_string());
                     }
-                    matches!(
-                        turn.status,
-                        RuntimeTurnStatus::Completed
-                            | RuntimeTurnStatus::Failed
-                            | RuntimeTurnStatus::Interrupted
-                            | RuntimeTurnStatus::Canceled
+                    (
+                        matches!(
+                            turn.status,
+                            RuntimeTurnStatus::Completed
+                                | RuntimeTurnStatus::Failed
+                                | RuntimeTurnStatus::Interrupted
+                                | RuntimeTurnStatus::Canceled
+                        )
+                        .then_some(turn),
+                        None,
                     )
-                    .then_some(turn)
                 }
-                Err(err) => {
-                    tracing::error!("Failed to load turn after monitor failure: {err}");
-                    None
-                }
+                Err(err) => (None, Some(err)),
             }
         };
+        if let Some(err) = load_failure {
+            // Without its record the turn can never be terminalized: name
+            // the file now and tell anyone waiting on `turn.completed` to
+            // stop waiting (#5931).
+            self.report_store_failure(
+                thread_id,
+                Some(turn_id),
+                &format!("Failed to load turn after monitor failure: {err}"),
+                &err,
+                true,
+            )
+            .await;
+        }
 
         for item in terminal_items {
             if let Err(err) = self
@@ -6886,16 +7208,30 @@ impl RuntimeThreadManager {
         // a blocking worker while this projection guard remains held.
         let projection_lock = self.projection_lock(thread_id);
         let _projection = projection_lock.lock().await;
+        let mut persist_failure = None;
         let terminal_turn = terminal_turn.and_then(|turn| {
             let _turn_mutation = self.store.turn_mutation.lock();
             match self.store.save_turn(&turn) {
                 Ok(()) => Some(turn),
                 Err(err) => {
-                    tracing::error!("Failed to persist terminal monitor failure: {err}");
+                    persist_failure = Some(err);
                     None
                 }
             }
         });
+        if let Some(err) = persist_failure {
+            // The projection guard is held and the record guard is not; the
+            // publish takes `event_emit` after the projection lock, which is
+            // the documented order. No terminal receipt follows (#5931).
+            self.report_store_failure(
+                thread_id,
+                Some(turn_id),
+                &format!("Failed to persist terminal monitor failure: {err}"),
+                &err,
+                true,
+            )
+            .await;
+        }
         if let Some(turn) = terminal_turn.as_ref() {
             if user_inputs_settled && dynamic_tools_settled {
                 if let Err(err) = self.emit_turn_completed_if_missing(turn, false).await {
@@ -6965,14 +7301,24 @@ impl RuntimeThreadManager {
         .await;
         let failure = match result {
             Ok(Ok(())) => return,
-            Ok(Err(error)) => format!("Failed to monitor {}: {error}", kind.label()),
-            Err(payload) => format!(
-                "{} monitor panicked: {}",
-                kind.label(),
-                panic_payload_message(&*payload)
-            ),
+            Ok(Err(error)) => {
+                let failure = format!("Failed to monitor {}: {error}", kind.label());
+                // An unreadable item or turn under the monitor is the
+                // operator's own state: name the file before settling (#5931).
+                self.report_store_failure(&thread_id, Some(&turn_id), &failure, &error, false)
+                    .await;
+                failure
+            }
+            Err(payload) => {
+                let failure = format!(
+                    "{} monitor panicked: {}",
+                    kind.label(),
+                    panic_payload_message(&*payload)
+                );
+                tracing::error!("{failure}");
+                failure
+            }
         };
-        tracing::error!("{failure}");
         engine.cancel_with_reason(crate::core::engine::CancelReason::Internal);
         self.settle_claimed_turn_failure(&thread_id, &turn_id, &failure)
             .await;

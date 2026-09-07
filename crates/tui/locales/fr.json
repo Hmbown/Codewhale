@@ -1434,6 +1434,8 @@
   "ToolProjectionWarning": "Avertissement : {provider} a omis les outils incompatibles pour cette requête : {tools}",
   "SnapshotsDisabledNotice": "Les instantanés et /undo sont désactivés pour {workspace} : {reason} Augmentez `{config_key}` dans config.toml (ou mettez 0 pour lever la limite) pour les activer.",
   "SessionIdDivergedNotice": "L'identité de session a changé sous cette fenêtre : le moteur enregistre désormais les points de reprise sous {next} (c'était {previous}). Les points antérieurs restent sous l'ancien identifiant ; `codewhale sessions` liste les deux et `codewhale resume {previous}` rouvre l'ancien.",
+  "RuntimeStoreUnreadableNotice": "Magasin d'exécution de la session : impossible de lire {record} dans {path} ({reason}). Mettez ce fichier de côté (ou supprimez-le) et réessayez ; les autres enregistrements du fil restent en place.",
+  "RuntimeStoreUnwritableNotice": "Magasin d'exécution de la session : impossible d'écrire {record} dans {path} ({reason}). Vérifiez l'espace libre et les permissions à cet endroit, puis réessayez ; rien n'a été écrasé.",
   "ProviderExternalSemanticsRevoke": "{semantics} | révocation : {revoke}",
   "ProviderExternalRevoke": "révocation : {revoke}",
   "ProviderExternalChoiceTitle": " Accès à des identifiants externes · {provider} ",

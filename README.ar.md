@@ -1,4 +1,4 @@
-<!-- source: README.md sha256:dcbd5aa09403 -->
+<!-- source: README.md sha256:3cc3ffc9b995 -->
 # Codewhale
 
 Codewhale وكيل مفتوح المصدر للبرمجة عبر الطرفية، مبني بلغة Rust ويتطور علنًا بالتعاون مع الأشخاص الذين يستخدمونه.
@@ -42,6 +42,10 @@ codewhale exec "fix the failing tests and explain what changed"
 ```
 
 يستطيع Codewhale قراءة مستودعك وتعديل الملفات وتشغيل الأوامر وفحص النتائج ومواصلة العمل نحو هدف. وأنت من يقرر مقدار الوصول الذي تمنحه له.
+
+## الواجهة الرسومية
+
+هل تفضّل واجهة رسومية؟ إضافة CodeWhale for VS Code التي يحافظ عليها المجتمع تضع العميل نفسه في الشريط الجانبي لبرنامج VS Code — الدردشة والمحادثات المتسلسلة والفرق المباشرة وإدارة المهام، كل ذلك عبر نفس Runtime API، وتبقى الجلسات متزامنة مع الطرفية. ثبّتها من [سوق VS Code](https://marketplace.visualstudio.com/items?itemName=HengQuWorld.brotherwhale-vscode)؛ المصدر على [GitHub](https://github.com/HengQuWorld/CodeWhale-VSCode).
 
 ## لماذا Codewhale
 

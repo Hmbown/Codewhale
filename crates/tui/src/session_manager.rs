@@ -88,8 +88,9 @@ pub struct QueuedSessionMessage {
 pub struct OfflineQueueState {
     #[serde(default = "default_queue_schema_version")]
     pub schema_version: u32,
-    /// Session ID this queue belongs to. Queue is only restored when
-    /// resuming the same session to prevent stale messages leaking into new chats.
+    /// Session ID this queue belongs to. Redundant with the per-session file
+    /// name it is stored under; the UI's restore path still compares it
+    /// against the live session before adopting the messages.
     #[serde(default)]
     pub session_id: Option<String>,
     #[serde(default)]
@@ -934,6 +935,11 @@ fn serialize_saved_session(session: &SavedSession) -> io::Result<String> {
 pub struct SessionManager {
     /// Directory where sessions are stored
     sessions_dir: PathBuf,
+    /// Which session this manager last parked or restored an offline queue
+    /// for. `clear_offline_queue_state` has no session argument (the
+    /// persistence actor's clear request carries none), so this is what a
+    /// bare clear resolves to — never another instance's session.
+    queue_owner: std::sync::Mutex<Option<String>>,
 }
 
 /// Origin of a crash-recovery checkpoint file.
@@ -956,7 +962,10 @@ pub struct CheckpointRef {
 
 /// File names in `checkpoints/` that are never per-session checkpoints.
 const LEGACY_CHECKPOINT_FILE: &str = "latest.json";
+/// Pre-per-session global offline queue, still read once for migration.
 const OFFLINE_QUEUE_FILE: &str = "offline_queue.json";
+/// Per-session offline queue file: `checkpoints/<session_id>.offline_queue.json`.
+const OFFLINE_QUEUE_SUFFIX: &str = ".offline_queue.json";
 
 impl SessionManager {
     fn approval_receipt_store(&self) -> ApprovalReceiptStore {
@@ -1095,7 +1104,10 @@ impl SessionManager {
         let sessions_dir = normalize_managed_dir(sessions_dir)?;
         // Ensure the sessions directory exists
         fs::create_dir_all(&sessions_dir)?;
-        Ok(Self { sessions_dir })
+        Ok(Self {
+            sessions_dir,
+            queue_owner: std::sync::Mutex::new(None),
+        })
     }
 
     /// Create a `SessionManager` using the default location.
@@ -1401,7 +1413,9 @@ impl SessionManager {
             };
             let source = if name == LEGACY_CHECKPOINT_FILE {
                 CheckpointSource::Legacy
-            } else if name == OFFLINE_QUEUE_FILE {
+            } else if name == OFFLINE_QUEUE_FILE || name.ends_with(OFFLINE_QUEUE_SUFFIX) {
+                // Parked offline queues live in this directory but are not
+                // crash-recovery checkpoints.
                 continue;
             } else {
                 let session_id = name.trim_end_matches(".json").to_string();
@@ -1440,33 +1454,96 @@ impl SessionManager {
         Ok(true)
     }
 
-    /// Save offline queue state (queued + draft messages).
+    /// Park this session's offline queue (queued + draft messages).
+    ///
+    /// Queues are keyed per session (`checkpoints/<session_id>.offline_queue.json`)
+    /// for exactly the reason checkpoints are: concurrent Codewhale instances
+    /// must never overwrite — or delete — each other's unsent user text.
+    ///
+    /// A queue with no session id has no owner to restore it to, so parking is
+    /// refused rather than written to a shared file where the next boot would
+    /// destroy it.
     pub fn save_offline_queue_state(
         &self,
         state: &OfflineQueueState,
         session_id: Option<&str>,
     ) -> std::io::Result<PathBuf> {
-        let checkpoints = self.sessions_dir.join("checkpoints");
-        fs::create_dir_all(&checkpoints)?;
-        let path = checkpoints.join("offline_queue.json");
-        let mut state_with_id = state.clone();
-        state_with_id.session_id = session_id.map(|s| s.to_string());
-        let content = serde_json::to_string_pretty(&state_with_id)
+        let session_id = session_id.ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Offline queue cannot be parked without a session id",
+            )
+        })?;
+        let path = self.validated_offline_queue_path(session_id)?;
+        fs::create_dir_all(self.checkpoints_dir())?;
+        let mut owned = state.clone();
+        // The stamp is redundant with the file name; it stays because the UI's
+        // restore path still compares it against the live session id.
+        owned.session_id = Some(self.validated_session_id(session_id)?.to_string());
+        let content = serde_json::to_string_pretty(&owned)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         write_atomic(&path, content.as_bytes())?;
+        self.remember_queue_owner(session_id);
         Ok(path)
     }
 
-    /// Load offline queue state if present.
-    pub fn load_offline_queue_state(&self) -> std::io::Result<Option<OfflineQueueState>> {
-        let path = self
-            .sessions_dir
-            .join("checkpoints")
-            .join("offline_queue.json");
-        if !path.exists() {
-            return Ok(None);
+    /// Load one session's parked offline queue if present.
+    pub fn load_offline_queue_state(
+        &self,
+        session_id: &str,
+    ) -> std::io::Result<Option<OfflineQueueState>> {
+        let path = self.validated_offline_queue_path(session_id)?;
+        let state = match Self::read_offline_queue_file(&path)? {
+            Some(state) => Some(state),
+            None => self.adopt_legacy_offline_queue(session_id, &path)?,
+        };
+        if state.is_some() {
+            self.remember_queue_owner(session_id);
         }
-        let content = fs::read_to_string(&path)?;
+        Ok(state)
+    }
+
+    /// Remove the parked offline queue for the session this manager last
+    /// parked or restored one for.
+    ///
+    /// The persistence actor's clear request carries no session id, so the
+    /// owner is whichever session this manager instance last wrote a queue
+    /// for. It can therefore never reach another session's parked text.
+    pub fn clear_offline_queue_state(&self) -> std::io::Result<()> {
+        let Some(session_id) = self.queue_owner() else {
+            return Ok(());
+        };
+        self.clear_offline_queue_state_for(&session_id)
+    }
+
+    /// Remove one named session's parked offline queue.
+    pub fn clear_offline_queue_state_for(&self, session_id: &str) -> std::io::Result<()> {
+        let path = self.validated_offline_queue_path(session_id)?;
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        let mut owner = self.lock_queue_owner();
+        if owner.as_deref() == Some(session_id.trim()) {
+            *owner = None;
+        }
+        Ok(())
+    }
+
+    fn validated_offline_queue_path(&self, session_id: &str) -> std::io::Result<PathBuf> {
+        let trimmed = self.validated_session_id(session_id)?;
+        Ok(self
+            .checkpoints_dir()
+            .join(format!("{trimmed}{OFFLINE_QUEUE_SUFFIX}")))
+    }
+
+    fn read_offline_queue_file(path: &Path) -> std::io::Result<Option<OfflineQueueState>> {
+        let content = match fs::read_to_string(path) {
+            Ok(content) => content,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
         let state: OfflineQueueState = serde_json::from_str(&content)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         if state.schema_version > CURRENT_QUEUE_SCHEMA_VERSION {
@@ -1481,16 +1558,55 @@ impl SessionManager {
         Ok(Some(state))
     }
 
-    /// Remove persisted offline queue state.
-    pub fn clear_offline_queue_state(&self) -> std::io::Result<()> {
-        let path = self
-            .sessions_dir
-            .join("checkpoints")
-            .join("offline_queue.json");
-        if path.exists() {
-            fs::remove_file(path)?;
+    /// Migrate the pre-per-session global queue (`checkpoints/offline_queue.json`).
+    ///
+    /// It holds user-authored text, so it is adopted only by the session it was
+    /// stamped for, and it is removed only once this session's copy is durably
+    /// written. A queue stamped for someone else — or for nobody — is left
+    /// exactly where it is, still readable, for its owner to claim.
+    fn adopt_legacy_offline_queue(
+        &self,
+        session_id: &str,
+        path: &Path,
+    ) -> std::io::Result<Option<OfflineQueueState>> {
+        let legacy = self.checkpoints_dir().join(OFFLINE_QUEUE_FILE);
+        // A corrupt or future-schema legacy file must not fail this session's
+        // boot: leave it on disk untouched and start with an empty queue.
+        let Ok(Some(state)) = Self::read_offline_queue_file(&legacy) else {
+            return Ok(None);
+        };
+        if state.session_id.as_deref() != Some(self.validated_session_id(session_id)?) {
+            return Ok(None);
         }
-        Ok(())
+        let content = serde_json::to_string_pretty(&state)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        fs::create_dir_all(self.checkpoints_dir())?;
+        write_atomic(path, content.as_bytes())?;
+        match fs::remove_file(&legacy) {
+            Ok(()) => {}
+            // A second instance of the same session can win the adoption
+            // race: both read the legacy file, both write this session's
+            // per-session copy, and the twin's remove already retired the
+            // legacy one. The queue is durably adopted either way, so a
+            // vanished legacy file is success here, not a boot error.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        Ok(Some(state))
+    }
+
+    fn lock_queue_owner(&self) -> std::sync::MutexGuard<'_, Option<String>> {
+        self.queue_owner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn remember_queue_owner(&self, session_id: &str) {
+        *self.lock_queue_owner() = Some(session_id.trim().to_string());
+    }
+
+    fn queue_owner(&self) -> Option<String> {
+        self.lock_queue_owner().clone()
     }
 
     /// Read a session snapshot without repairing tool call/result pairs.
@@ -4237,7 +4353,12 @@ mod tests {
         manager.save_checkpoint(&session).expect("save checkpoint");
         let checkpoints = tmp.path().join("sessions").join("checkpoints");
         fs::write(checkpoints.join("latest.json"), "{}").expect("write legacy slot");
-        fs::write(checkpoints.join("offline_queue.json"), "{}").expect("write offline queue");
+        fs::write(checkpoints.join("offline_queue.json"), "{}").expect("write legacy queue");
+        fs::write(
+            checkpoints.join(format!("{}.offline_queue.json", session.metadata.id)),
+            "{}",
+        )
+        .expect("write per-session queue");
 
         let refs = manager.list_checkpoints().expect("list checkpoints");
         assert_eq!(refs.len(), 2, "offline queue must not be a candidate");
@@ -4324,7 +4445,7 @@ mod tests {
             .save_offline_queue_state(&state, Some("test-session"))
             .expect("save queue state");
         let loaded = manager
-            .load_offline_queue_state()
+            .load_offline_queue_state("test-session")
             .expect("load queue state")
             .expect("queue state exists");
         assert_eq!(loaded.messages.len(), 1);
@@ -4336,64 +4457,170 @@ mod tests {
             .expect("clear queue state");
         assert!(
             manager
-                .load_offline_queue_state()
+                .load_offline_queue_state("test-session")
                 .expect("load queue state")
+                .is_none()
+        );
+
+        // A queue with no owning session has nowhere to be restored to, so it
+        // is refused rather than written where another session would find it.
+        let unowned = manager.save_offline_queue_state(&state, None);
+        assert!(unowned.is_err(), "unowned queue must not be parked");
+    }
+
+    fn parked(text: &str) -> OfflineQueueState {
+        OfflineQueueState {
+            messages: vec![QueuedSessionMessage {
+                display: text.to_string(),
+                skill_instruction: None,
+                skill_provenance: None,
+            }],
+            ..OfflineQueueState::default()
+        }
+    }
+
+    #[test]
+    fn offline_queues_are_keyed_per_session() {
+        // Replaces the #487 single-slot test, which pinned the shared
+        // `checkpoints/offline_queue.json`: two concurrent Codewhale
+        // instances raced on it and the loser's unsent text was destroyed.
+        // Queues are keyed per session for the same reason checkpoints are.
+        let tmp = tempdir().expect("tempdir");
+        let manager = SessionManager::new(tmp.path().join("sessions")).expect("new");
+
+        manager
+            .save_offline_queue_state(&parked("A text"), Some("session-A"))
+            .expect("park A");
+        manager
+            .save_offline_queue_state(&parked("B text"), Some("session-B"))
+            .expect("park B");
+
+        let a = manager
+            .load_offline_queue_state("session-A")
+            .expect("load A")
+            .expect("A still parked");
+        assert_eq!(a.messages[0].display, "A text");
+        assert_eq!(a.session_id.as_deref(), Some("session-A"));
+        let b = manager
+            .load_offline_queue_state("session-B")
+            .expect("load B")
+            .expect("B still parked");
+        assert_eq!(b.messages[0].display, "B text");
+
+        // Clearing one session's queue leaves the other's alone.
+        manager
+            .clear_offline_queue_state_for("session-A")
+            .expect("clear A");
+        assert!(
+            manager
+                .load_offline_queue_state("session-A")
+                .expect("load A")
+                .is_none()
+        );
+        assert!(
+            manager
+                .load_offline_queue_state("session-B")
+                .expect("load B")
+                .is_some(),
+            "clearing one session must never delete another's unsent text"
+        );
+
+        // A session with nothing parked reads back nothing — it can never
+        // inherit, or destroy, a sibling's queue.
+        assert!(
+            manager
+                .load_offline_queue_state("session-C")
+                .expect("load C")
                 .is_none()
         );
     }
 
     #[test]
-    fn test_offline_queue_stamps_session_id_on_save() {
-        // #487: save_offline_queue_state must stamp the supplied
-        // session id so the load path's mismatch check has something
-        // to compare against. A queue persisted without a session id
-        // is the legacy unscoped form which the load path treats as
-        // stale-risky and refuses to restore.
+    fn bare_clear_only_reaches_this_managers_own_queue() {
+        // The persistence actor's clear request carries no session id, so a
+        // bare clear resolves to whichever session this manager last parked
+        // or restored a queue for.
         let tmp = tempdir().expect("tempdir");
-        let manager = SessionManager::new(tmp.path().join("sessions")).expect("new");
+        let sessions_dir = tmp.path().join("sessions");
+        let mine = SessionManager::new(sessions_dir.clone()).expect("new");
+        let theirs = SessionManager::new(sessions_dir).expect("new");
 
-        let state = OfflineQueueState {
-            messages: vec![QueuedSessionMessage {
-                display: "first parked".to_string(),
-                skill_instruction: None,
-                skill_provenance: None,
-            }],
-            ..OfflineQueueState::default()
-        };
+        theirs
+            .save_offline_queue_state(&parked("their text"), Some("session-B"))
+            .expect("park B");
+        mine.save_offline_queue_state(&parked("my text"), Some("session-A"))
+            .expect("park A");
 
-        manager
-            .save_offline_queue_state(&state, Some("session-A"))
-            .expect("save with session id");
-        let loaded = manager
-            .load_offline_queue_state()
-            .expect("ok")
-            .expect("present");
-        assert_eq!(loaded.session_id.as_deref(), Some("session-A"));
-
-        // Re-saving with a different session id replaces the stamp.
-        manager
-            .save_offline_queue_state(&state, Some("session-B"))
-            .expect("re-save");
-        let reloaded = manager
-            .load_offline_queue_state()
-            .expect("ok")
-            .expect("present");
-        assert_eq!(reloaded.session_id.as_deref(), Some("session-B"));
-
-        // Saving without a session id explicitly (None) clears the
-        // stamp — UI's load path treats that as legacy-unscoped and
-        // fails closed.
-        manager
-            .save_offline_queue_state(&state, None)
-            .expect("save without session id");
-        let unscoped = manager
-            .load_offline_queue_state()
-            .expect("ok")
-            .expect("present");
+        mine.clear_offline_queue_state().expect("clear mine");
         assert!(
-            unscoped.session_id.is_none(),
-            "save with None must persist a missing session_id"
+            mine.load_offline_queue_state("session-A")
+                .expect("load A")
+                .is_none()
         );
+        assert!(
+            theirs
+                .load_offline_queue_state("session-B")
+                .expect("load B")
+                .is_some(),
+            "a bare clear must not reach another instance's parked text"
+        );
+
+        // Nothing parked through this manager: a bare clear is a no-op.
+        let bystander = SessionManager::new(tmp.path().join("sessions")).expect("new");
+        bystander.clear_offline_queue_state().expect("no-op clear");
+        assert!(
+            theirs
+                .load_offline_queue_state("session-B")
+                .expect("load B")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn legacy_global_queue_is_adopted_only_by_its_own_session() {
+        let tmp = tempdir().expect("tempdir");
+        let sessions_dir = tmp.path().join("sessions");
+        let manager = SessionManager::new(sessions_dir.clone()).expect("new");
+        let checkpoints = sessions_dir.join("checkpoints");
+        fs::create_dir_all(&checkpoints).expect("create checkpoints dir");
+        let legacy = checkpoints.join("offline_queue.json");
+        let mut state = parked("text from the old global queue");
+        state.session_id = Some("session-A".to_string());
+        fs::write(
+            &legacy,
+            serde_json::to_string_pretty(&state).expect("serialize"),
+        )
+        .expect("write legacy queue");
+
+        // A different session must not inherit it, and must not delete it.
+        assert!(
+            manager
+                .load_offline_queue_state("session-B")
+                .expect("load B")
+                .is_none()
+        );
+        assert!(legacy.exists(), "another session's text must survive");
+
+        // Its own session adopts it, and the global file is retired only
+        // after the per-session copy is durably written.
+        let adopted = manager
+            .load_offline_queue_state("session-A")
+            .expect("load A")
+            .expect("adopted");
+        assert_eq!(
+            adopted.messages[0].display,
+            "text from the old global queue"
+        );
+        assert!(!legacy.exists(), "adopted legacy queue is retired");
+        assert!(
+            checkpoints.join("session-A.offline_queue.json").exists(),
+            "adoption writes the per-session file"
+        );
+        let again = manager
+            .load_offline_queue_state("session-A")
+            .expect("reload A")
+            .expect("still parked");
+        assert_eq!(again.messages[0].display, "text from the old global queue");
     }
 
     #[test]
@@ -4775,7 +5002,7 @@ mod tests {
         let manager = SessionManager::new(sessions_dir.clone()).expect("new");
         let checkpoints = sessions_dir.join("checkpoints");
         fs::create_dir_all(&checkpoints).expect("create checkpoints dir");
-        let path = checkpoints.join("offline_queue.json");
+        let path = checkpoints.join("session-A.offline_queue.json");
         fs::write(
             &path,
             r#"{
@@ -4787,11 +5014,23 @@ mod tests {
         .expect("write queue");
 
         let err = manager
-            .load_offline_queue_state()
+            .load_offline_queue_state("session-A")
             .expect_err("should reject schema");
         assert!(
             err.to_string().contains("newer than supported"),
             "unexpected error: {err}"
         );
+
+        // An unreadable *legacy* global queue is somebody else's problem to
+        // recover: it must not fail this session's boot, and must survive.
+        let legacy = checkpoints.join("offline_queue.json");
+        fs::write(&legacy, r#"{"schema_version": 999}"#).expect("write legacy queue");
+        assert!(
+            manager
+                .load_offline_queue_state("session-B")
+                .expect("legacy corruption must not fail the boot")
+                .is_none()
+        );
+        assert!(legacy.exists(), "unreadable legacy queue is left in place");
     }
 }

@@ -807,9 +807,10 @@ fn begin_new_session_from_startup(tui: &mut Harness) {
     expect_visible(tui, "New session", "show the launch card");
     // Typing goes straight to the composer; Enter sends the first message
     // and the session begins (the card dissolved on the first keystroke).
-    tui.send("start the session")
-        .expect("type the first prompt");
-    tui.send(keys::key::enter()).expect("send the first prompt");
+    // type_line, not send+enter: a zero-gap PTY write is paste-classified
+    // and the immediate Enter would be absorbed as a pasted newline.
+    tui.type_line("start the session")
+        .expect("type and send the first prompt");
     if tui
         .wait_for(
             |frame| !frame.text().contains('\u{2442}'),

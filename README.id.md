@@ -1,4 +1,4 @@
-<!-- source: README.md sha256:dcbd5aa09403 -->
+<!-- source: README.md sha256:3cc3ffc9b995 -->
 # Codewhale
 
 Codewhale adalah agen pemrograman sumber terbuka untuk terminal Anda, dibuat dengan Rust dan dikembangkan secara terbuka bersama orang-orang yang menggunakannya.
@@ -42,6 +42,10 @@ codewhale exec "fix the failing tests and explain what changed"
 ```
 
 Codewhale dapat membaca repositori Anda, mengedit berkas, menjalankan perintah, memeriksa hasil, dan terus bekerja menuju tujuan. Anda menentukan seberapa besar akses yang dimilikinya.
+
+## GUI frontend
+
+Lebih suka antarmuka grafis? Ekstensi CodeWhale for VS Code yang dikelola komunitas membungkus agen yang sama ke dalam sidebar VS Code — obrolan, percakapan berutas, diff langsung, dan pengelolaan tugas melalui Runtime API yang sama, sehingga sesi tetap sinkron dengan terminal. Pasang dari [VS Code Marketplace](https://marketplace.visualstudio.com/items?itemName=HengQuWorld.brotherwhale-vscode); kode sumber ada di [GitHub](https://github.com/HengQuWorld/CodeWhale-VSCode).
 
 ## Mengapa Codewhale
 

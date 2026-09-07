@@ -24,8 +24,8 @@ use uuid::Uuid;
 
 use crate::config::Config;
 use crate::runtime_threads::{
-    CreateThreadRequest, RuntimeEventRecord, RuntimeThreadManager, RuntimeThreadManagerConfig,
-    RuntimeTurnStatus, SharedRuntimeThreadManager, StartTurnRequest,
+    CreateThreadRequest, RUNTIME_STORE_FAILURE_EVENT, RuntimeEventRecord, RuntimeThreadManager,
+    RuntimeThreadManagerConfig, RuntimeTurnStatus, SharedRuntimeThreadManager, StartTurnRequest,
 };
 use crate::utils::spawn_supervised;
 
@@ -1104,6 +1104,30 @@ async fn ingest_runtime_event(
                 Some((RuntimeTurnStatus::Completed, None))
             }
         }
+        RUNTIME_STORE_FAILURE_EVENT => {
+            // The runtime's own store failed. The notice names the file and
+            // the next action; `terminal` means no `turn.completed` can
+            // follow, so the driver stops waiting instead of idling out (#5931).
+            let message = event
+                .payload
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("Session runtime store failure")
+                .to_string();
+            emit_task_event(
+                events,
+                TaskExecutionEvent::Error {
+                    message: message.clone(),
+                },
+            )
+            .await;
+            event
+                .payload
+                .get("terminal")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+                .then_some((RuntimeTurnStatus::Failed, Some(message)))
+        }
         _ => None,
     }
 }
@@ -1115,6 +1139,8 @@ pub struct TaskManager {
     cfg: TaskManagerConfig,
     default_workspace: Mutex<PathBuf>,
     executor: Arc<dyn TaskExecutor>,
+    /// The runtime thread store this manager drives, when it owns one.
+    runtime_threads: Option<SharedRuntimeThreadManager>,
     tasks_dir: PathBuf,
     artifacts_dir: PathBuf,
     queue_path: PathBuf,
@@ -1165,15 +1191,26 @@ impl TaskManager {
             runtime_threads.clone(),
             cfg.execution_limits,
         ));
-        let manager = Self::start_with_executor(cfg, executor).await?;
+        let manager =
+            Self::start_with_executor_and_runtime(cfg, executor, Some(runtime_threads.clone()))
+                .await?;
         runtime_threads.attach_task_manager(manager.clone());
         Ok(manager)
     }
 
     /// Start the manager with a custom executor (used for tests).
+    #[cfg(test)]
     pub async fn start_with_executor(
         cfg: TaskManagerConfig,
         executor: Arc<dyn TaskExecutor>,
+    ) -> Result<SharedTaskManager> {
+        Self::start_with_executor_and_runtime(cfg, executor, None).await
+    }
+
+    async fn start_with_executor_and_runtime(
+        cfg: TaskManagerConfig,
+        executor: Arc<dyn TaskExecutor>,
+        runtime_threads: Option<SharedRuntimeThreadManager>,
     ) -> Result<SharedTaskManager> {
         let workers = cfg.worker_count.clamp(1, MAX_WORKERS);
         let tasks_dir = cfg.data_dir.join("tasks");
@@ -1200,6 +1237,7 @@ impl TaskManager {
             cfg,
             default_workspace: Mutex::new(default_workspace),
             executor,
+            runtime_threads,
             tasks_dir,
             artifacts_dir,
             queue_path,
@@ -1606,6 +1644,17 @@ impl TaskManager {
     #[must_use]
     pub fn data_dir(&self) -> PathBuf {
         self.cfg.data_dir.clone()
+    }
+
+    /// Live events from the runtime thread store this manager drives, when it
+    /// owns one. The TUI taps `runtime.store_failure` here (#5931).
+    #[must_use]
+    pub fn subscribe_runtime_events(
+        &self,
+    ) -> Option<tokio::sync::broadcast::Receiver<RuntimeEventRecord>> {
+        self.runtime_threads
+            .as_ref()
+            .map(|runtime| runtime.subscribe_events())
     }
 
     /// Resolve a task artifact reference to an absolute path.
@@ -4423,6 +4472,60 @@ mod tests {
         .await;
         assert_eq!(result.status, TaskStatus::Canceled);
         assert_eq!(result.terminal_reason, TaskTerminalReason::Canceled);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn runtime_store_failure_event_reaches_the_task_timeline() -> Result<()> {
+        // #5931: the runtime's own store fault lands in the task timeline,
+        // and a terminal one stops the driver instead of idling it out.
+        let (tx, mut rx) = mpsc::channel(8);
+        let mut final_text = String::new();
+        let path = "/tmp/runtime/turns/turn_store.json";
+        let event = RuntimeEventRecord {
+            schema_version: 1,
+            seq: 7,
+            timestamp: Utc::now(),
+            thread_id: "thr_store".to_string(),
+            turn_id: Some("turn_store".to_string()),
+            item_id: None,
+            event: RUNTIME_STORE_FAILURE_EVENT.to_string(),
+            payload: json!({
+                "operation": "read",
+                "record_kind": "turn",
+                "record_id": "turn_store",
+                "path": path,
+                "error": format!("Failed to read turn {path}: No such file"),
+                "reason": "No such file",
+                "next_action": format!("Move {path} aside (or delete it) and retry."),
+                "message": format!(
+                    "Session runtime store: turn turn_store at {path} could not be read: No such file. Move {path} aside (or delete it) and retry."
+                ),
+            }),
+        };
+
+        assert!(
+            ingest_runtime_event(&event, &mut final_text, &tx)
+                .await
+                .is_none(),
+            "a non-terminal store fault leaves the driver waiting"
+        );
+        let mut saw_error = false;
+        while let Ok(received) = rx.try_recv() {
+            if let TaskExecutionEvent::Error { message } = received {
+                assert!(message.contains(path), "{message}");
+                saw_error = true;
+            }
+        }
+        assert!(saw_error, "store fault missing from the task timeline");
+
+        let mut terminal = event.clone();
+        terminal.payload["terminal"] = json!(true);
+        let (status, error) = ingest_runtime_event(&terminal, &mut final_text, &tx)
+            .await
+            .expect("a terminal store fault ends the turn");
+        assert_eq!(status, RuntimeTurnStatus::Failed);
+        assert!(error.is_some_and(|message| message.contains(path)));
         Ok(())
     }
 }

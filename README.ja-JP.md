@@ -1,4 +1,4 @@
-<!-- source: README.md sha256:dcbd5aa09403 -->
+<!-- source: README.md sha256:3cc3ffc9b995 -->
 # Codewhale
 
 Codewhale は Rust で構築された、ターミナル向けのオープンソース・コーディングエージェントです。利用者とともに、公開の場で改善を続けています。
@@ -42,6 +42,10 @@ codewhale exec "fix the failing tests and explain what changed"
 ```
 
 Codewhale はリポジトリを読み、ファイルを編集し、コマンドを実行して結果を確認しながら、目標に向かって作業を続けます。どこまでアクセスを許可するかは、あなたが決められます。
+
+## GUI フロントエンド
+
+グラフィカルな操作画面を好みますか？コミュニティが保守する CodeWhale for VS Code 拡張機能は、同じエージェントを VS Code サイドバーに統合します。チャット、スレッド会話、ライブ差分、タスク管理をすべて同じ Runtime API 上で行い、セッションはターミナルと同期したままです。[VS Code Marketplace](https://marketplace.visualstudio.com/items?itemName=HengQuWorld.brotherwhale-vscode) からインストールしてください。ソースコードは [GitHub](https://github.com/HengQuWorld/CodeWhale-VSCode) にあります。
 
 ## Codewhale を選ぶ理由
 

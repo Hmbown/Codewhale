@@ -1457,6 +1457,8 @@
   "ToolProjectionWarning": "경고: {provider}가 이 요청에서 호환되지 않는 도구를 제외했습니다: {tools}",
   "SnapshotsDisabledNotice": "{workspace}에서 스냅샷과 /undo가 꺼져 있습니다: {reason} config.toml의 `{config_key}` 값을 높이면(또는 0으로 설정해 상한을 없애면) 켜집니다.",
   "SessionIdDivergedNotice": "이 창의 세션 ID가 바뀌었습니다. 엔진은 이제 {next}로 체크포인트를 저장합니다(이전: {previous}). 이전 체크포인트는 옛 ID 아래에 남습니다. `codewhale sessions`로 둘 다 확인하고 `codewhale resume {previous}`로 이전 세션을 다시 열 수 있습니다.",
+  "RuntimeStoreUnreadableNotice": "세션 런타임 저장소: {path}의 {record}을(를) 읽을 수 없습니다({reason}). 해당 파일을 옮기거나 삭제한 뒤 다시 시도하세요. 스레드의 다른 레코드는 그대로 유지됩니다.",
+  "RuntimeStoreUnwritableNotice": "세션 런타임 저장소: {path}의 {record}을(를) 쓸 수 없습니다({reason}). 해당 위치의 여유 공간과 권한을 확인한 뒤 다시 시도하세요. 아무것도 덮어쓰지 않았습니다.",
   "ProviderExternalSemanticsRevoke": "{semantics} | 취소: {revoke}",
   "ProviderExternalRevoke": "취소: {revoke}",
   "ProviderExternalChoiceTitle": " 외부 자격 증명 접근 · {provider} ",

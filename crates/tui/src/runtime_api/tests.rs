@@ -11332,3 +11332,37 @@ async fn marketplace_add_rejects_symlink_documents_over_http() -> Result<()> {
     handle.abort();
     Ok(())
 }
+
+#[tokio::test]
+async fn stream_compat_mapping_forwards_runtime_store_failures() -> Result<()> {
+    // #5931: compat clients see the operator's store fault with its file.
+    let event = RuntimeEventRecord {
+        schema_version: 1,
+        seq: 9,
+        timestamp: chrono::Utc::now(),
+        thread_id: "thr_test".to_string(),
+        turn_id: Some("turn_test".to_string()),
+        item_id: Some("item_1".to_string()),
+        event: crate::runtime_threads::RUNTIME_STORE_FAILURE_EVENT.to_string(),
+        payload: json!({
+            "operation": "read",
+            "record_kind": "item",
+            "record_id": "item_1",
+            "path": "/tmp/runtime/items/item_1.json",
+            "error": "Failed to read item /tmp/runtime/items/item_1.json: No such file",
+            "reason": "No such file",
+            "next_action": "Move /tmp/runtime/items/item_1.json aside (or delete it) and retry.",
+            "message": "Session runtime store: item item_1 at /tmp/runtime/items/item_1.json could not be read: No such file.",
+        }),
+    };
+    let mapped = map_compat_stream_event(&event).context("missing store failure event")?;
+    let stream = async_stream::stream! {
+        yield Ok::<_, Infallible>(mapped);
+    };
+    let body =
+        axum::body::to_bytes(Sse::new(stream).into_response().into_body(), usize::MAX).await?;
+    let text = String::from_utf8_lossy(&body);
+    assert!(text.contains("event: runtime.store_failure"), "{text}");
+    assert!(text.contains("/tmp/runtime/items/item_1.json"), "{text}");
+    Ok(())
+}

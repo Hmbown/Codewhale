@@ -756,13 +756,20 @@ pub(super) async fn bounded_error_text(response: reqwest::Response, max_bytes: u
     String::from_utf8_lossy(&buf).into_owned()
 }
 
-fn validate_base_url_security(base_url: &str) -> Result<()> {
+fn validate_base_url_security(base_url: &str, provider_allows_insecure_http: bool) -> Result<()> {
     let display_base_url = redact_url_for_display(base_url);
     if base_url.starts_with("https://")
         || base_url.starts_with("http://localhost")
         || base_url.starts_with("http://127.0.0.1")
         || base_url.starts_with("http://[::1]")
     {
+        return Ok(());
+    }
+
+    if base_url.starts_with("http://") && provider_allows_insecure_http {
+        logging::warn(
+            "Using insecure HTTP base URL because this provider sets allow_insecure_http = true in config.toml",
+        );
         return Ok(());
     }
 
@@ -784,10 +791,10 @@ fn validate_base_url_security(base_url: &str) -> Result<()> {
             "Refusing insecure base URL '{display_base_url}'.\n\
              \n\
              Loopback hosts (localhost, 127.0.0.1, [::1]) are auto-allowed.\n\
-             For other trusted local hosts (LAN, llama.cpp on a private IP, etc.)\n\
-             set the env var `{ALLOW_INSECURE_HTTP_ENV}=1` in the shell that runs codewhale and re-run.\n\
-             \n\
-             Example: `{ALLOW_INSECURE_HTTP_ENV}=1 codewhale` (note the underscores).",
+             For one trusted local provider (LAN, llama.cpp on a private IP, etc.) set\n\
+             `allow_insecure_http = true` under its `[providers.<name>]` table in config.toml.\n\
+             To allow it for every provider in this shell instead, set the env var\n\
+             `{ALLOW_INSECURE_HTTP_ENV}=1` and re-run.",
         );
     }
 
@@ -1216,7 +1223,7 @@ impl DeepSeekClient {
         };
         let model_bound_secret_values =
             Arc::new(configured_model_bound_secret_values(config, &api_key));
-        validate_base_url_security(&base_url)?;
+        validate_base_url_security(&base_url, config.allow_insecure_http())?;
         let retry = config.retry_policy();
         let stream_idle_timeout = Duration::from_secs(config.stream_chunk_timeout_secs());
         let http_headers = config.http_headers();
@@ -11263,7 +11270,7 @@ mod tests {
             let _guard = AllowInsecureHttpEnvGuard::capture();
             unsafe { std::env::remove_var(ALLOW_INSECURE_HTTP_ENV) };
 
-            let err = validate_base_url_security("http://api.deepseek.com")
+            let err = validate_base_url_security("http://api.deepseek.com", false)
                 .expect_err("non-local insecure HTTP should be rejected");
             assert!(err.to_string().contains("Refusing insecure base URL"));
         }
@@ -11275,6 +11282,7 @@ mod tests {
 
             let err = validate_base_url_security(
                 "http://user:secret@example.com/v1?api_key=sk-test&ok=1",
+                false,
             )
             .expect_err("non-local insecure HTTP should be rejected");
             let message = err.to_string();
@@ -11289,8 +11297,8 @@ mod tests {
             let _guard = AllowInsecureHttpEnvGuard::capture();
             unsafe { std::env::remove_var(ALLOW_INSECURE_HTTP_ENV) };
 
-            assert!(validate_base_url_security("http://localhost:8080").is_ok());
-            assert!(validate_base_url_security("http://127.0.0.1:8080").is_ok());
+            assert!(validate_base_url_security("http://localhost:8080", false).is_ok());
+            assert!(validate_base_url_security("http://127.0.0.1:8080", false).is_ok());
         }
         // from base_url_security_allows_non_local_http_with_explicit_opt_in
         {
@@ -11298,7 +11306,21 @@ mod tests {
             let _guard = AllowInsecureHttpEnvGuard::capture();
             unsafe { std::env::set_var(ALLOW_INSECURE_HTTP_ENV, "1") };
 
-            assert!(validate_base_url_security("http://192.168.0.110:8000/v1").is_ok());
+            assert!(validate_base_url_security("http://192.168.0.110:8000/v1", false).is_ok());
+        }
+        // #5991: a provider that opts in via its [providers.<name>] table may
+        // use a plain-HTTP base URL without any env var. This is the
+        // 0.9.11-and-earlier behavior the key silently stopped providing.
+        {
+            let _lock = ALLOW_INSECURE_HTTP_ENV_LOCK.lock().unwrap();
+            let _guard = AllowInsecureHttpEnvGuard::capture();
+            unsafe { std::env::remove_var(ALLOW_INSECURE_HTTP_ENV) };
+
+            assert!(validate_base_url_security("http://192.168.0.110:8000/v1", true).is_ok());
+            // The refusal message now leads with the config key.
+            let err = validate_base_url_security("http://api.deepseek.com", false)
+                .expect_err("still refused without either opt-in");
+            assert!(err.to_string().contains("allow_insecure_http = true"));
         }
     }
 

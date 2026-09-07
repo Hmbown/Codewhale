@@ -1112,7 +1112,18 @@ Common event names: `thread.started`, `thread.forked`, `turn.started`,
 `item.failed`, `item.interrupted`, `approval.required`, `approval.decided`,
 `approval.timeout`, `user_input.required`, `user_input.answered`,
 `user_input.canceled`, `tool_call.requested`, `tool_call.resolved`,
-`tool_call.timeout`, `tool_call.canceled`, `sandbox.denied`.
+`tool_call.timeout`, `tool_call.canceled`, `sandbox.denied`,
+`runtime.store_failure`.
+
+`runtime.store_failure` is the runtime reporting a fault in the operator's own
+on-disk state: a thread, turn, or item record under the session's runtime
+store could not be read, parsed, or written. The payload carries `operation`
+(`read` | `parse` | `write`), `record_kind` (`thread` | `turn` | `item`),
+`record_id`, `path`, the full `error` chain, the root-cause `reason`, a
+`next_action` (which file to move aside, or where to check free space and
+permissions), and a one-line `message`. When `terminal` is `true`, the turn's
+own record is unreadable or unwritable and no `turn.completed` will follow;
+clients waiting on that turn should treat it as failed.
 
 Agent-message and reasoning deltas are materialized into the item projection
 before their corresponding `item.delta` event is sequenced. To avoid an fsync

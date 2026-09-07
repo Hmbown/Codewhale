@@ -12,13 +12,16 @@
 //!
 //! Scope: **decision logic + types**. The engine (`core/engine.rs`) reads the
 //! `SharedGoalState` snapshot after each turn and calls `decide_continuation`
-//! to decide whether to re-dispatch. For operate-mode goals the only terminal
-//! stops are a verified completion, a blocked report, or the continuation
-//! backstop (`[goal] max_continuations`); token/time accounting stays visible
-//! as telemetry but does not gate continuation — the run is unbounded like
-//! grokbuild (`DEFAULT_AGENT_BUDGET` as call cap) and kimicode swarm
-//! (`turnBudget` per-task, resumable after budget-reached). Log when the
-//! backstop fires.
+//! to decide whether to re-dispatch. For operate-mode goals the terminal stops
+//! are a verified completion, a blocked report, the stall pause that fires
+//! when a critical verifier reports the same gap set
+//! [`MAX_REPEATED_GAP_PASSES`] times running (enforced in
+//! `GoalState::record_not_achieved`), and the opt-in continuation backstop
+//! (`[goal] max_continuations`); token/time accounting stays visible as
+//! telemetry but does not gate continuation — spend is bounded by stalling,
+//! not by a pass count, like grokbuild (`DEFAULT_AGENT_BUDGET` as call cap)
+//! and kimicode swarm (`turnBudget` per-task, resumable after
+//! budget-reached). Log when the backstop fires.
 
 use std::time::Duration;
 
@@ -28,6 +31,27 @@ use std::time::Duration;
 /// user control ends the run. Operators who want a circuit breaker can opt in
 /// with `[goal] max_continuations`; `0` keeps the default unlimited behavior.
 pub const DEFAULT_MAX_GOAL_CONTINUATIONS: u32 = 0;
+
+/// How many consecutive critical `not_achieved` reviews naming the *same*
+/// normalized gap set a goal may accumulate before it pauses itself with
+/// `GoalPauseReason::NoProgress`.
+///
+/// This is the bound the continuation prompt promises the model, and it is the
+/// only default stop on a goal run: `DEFAULT_MAX_GOAL_CONTINUATIONS` is `0`, so
+/// without it the loop runs until the model volunteers a terminal status.
+/// Enforcement lives in `GoalState::record_not_achieved`, and it reuses the
+/// existing pause authority rather than adding a second one — both continuation
+/// dispatchers already refuse to re-dispatch a non-active goal, and
+/// `RuntimeThreadManager` already mirrors a non-limit pause into the durable
+/// `ThreadGoalStatus::Paused`, so the stop survives a restart and needs an
+/// explicit resume.
+///
+/// The counter is `1` on the first report of a gap set, so `3` means the
+/// verifier named identical remaining work three times running: two whole
+/// continuation passes that moved nothing the verifier can see. Two is too
+/// eager — one pass legitimately fails to land a fix and retries — and anything
+/// larger just buys more identical passes.
+pub const MAX_REPEATED_GAP_PASSES: u32 = 3;
 
 /// Upper bound for one between-turn quiet period. A day is long enough for
 /// coordinator cadences while preventing an accidental giant integer from

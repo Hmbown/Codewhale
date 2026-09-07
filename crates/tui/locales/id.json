@@ -1434,6 +1434,8 @@
   "ToolProjectionWarning": "Peringatan: {provider} menghilangkan alat yang tidak kompatibel untuk permintaan ini: {tools}",
   "SnapshotsDisabledNotice": "Snapshot dan /undo nonaktif untuk {workspace}: {reason} Naikkan `{config_key}` di config.toml (atau setel 0 untuk menghapus batas) untuk mengaktifkannya.",
   "SessionIdDivergedNotice": "Identitas sesi di jendela ini berubah: engine kini menyimpan checkpoint sebagai {next} (sebelumnya {previous}). Checkpoint lama tetap di id lama; `codewhale sessions` menampilkan keduanya dan `codewhale resume {previous}` membuka kembali yang lama.",
+  "RuntimeStoreUnreadableNotice": "Penyimpanan runtime sesi: {record} di {path} tidak dapat dibaca ({reason}). Pindahkan berkas itu (atau hapus) lalu coba lagi; rekaman lain di thread ini tetap utuh.",
+  "RuntimeStoreUnwritableNotice": "Penyimpanan runtime sesi: {record} di {path} tidak dapat ditulis ({reason}). Periksa ruang kosong dan izin di sana, lalu coba lagi; tidak ada yang ditimpa.",
   "ProviderExternalSemanticsRevoke": "{semantics} | cabut: {revoke}",
   "ProviderExternalRevoke": "cabut: {revoke}",
   "ProviderExternalChoiceTitle": " Akses kredensial eksternal · {provider} ",

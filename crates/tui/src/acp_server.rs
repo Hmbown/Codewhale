@@ -2381,9 +2381,16 @@ fn initialize_result(client_protocol_version: Option<u64>, config: &Config) -> V
                 "http": false,
                 "sse": false
             },
+            // ACP `SessionCapabilities` fields are objects, never booleans:
+            // `{}` means "supported", absent/null means "not supported"
+            // (#5969 — a boolean here made JetBrains' strictly-typed client
+            // fail the handshake and kill the agent). `session/load` support
+            // is advertised by the top-level `loadSession` above; it is not a
+            // field of `sessionCapabilities`. We only claim `list` because
+            // `session/list` is the only one of the optional session methods
+            // this server dispatches.
             "sessionCapabilities": {
-                "list": true,
-                "load": true
+                "list": {}
             }
         },
         "agentInfo": {
@@ -2821,14 +2828,22 @@ mod tests {
         assert_eq!(result["agentInfo"]["name"], "codewhale");
         // #5864: enumerating and resuming durable Codewhale sessions is now
         // served, so the capability says so rather than declining it.
+        // #5969: this test used to assert `list == true` and `load == true`,
+        // certifying the wire format that broke every strictly-typed client.
+        // `loadSession` is the top-level boolean that advertises
+        // `session/load`; inside `sessionCapabilities` every field is a
+        // capability *object*, and `load` is not a field at all. Comparing the
+        // whole object pins both halves: a boolean `list` or a resurrected
+        // `load` key fails here.
         assert_eq!(result["agentCapabilities"]["loadSession"], true);
         assert_eq!(
-            result["agentCapabilities"]["sessionCapabilities"]["list"],
-            true
+            result["agentCapabilities"]["sessionCapabilities"],
+            json!({"list": {}})
         );
-        assert_eq!(
-            result["agentCapabilities"]["sessionCapabilities"]["load"],
-            true
+        assert!(
+            result["agentCapabilities"]["sessionCapabilities"]["list"].is_object(),
+            "sessionCapabilities.list must be a SessionListCapabilities object, got {}",
+            result["agentCapabilities"]["sessionCapabilities"]["list"]
         );
         assert_eq!(
             result["agentCapabilities"]["promptCapabilities"]["embeddedContext"],

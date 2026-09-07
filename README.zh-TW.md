@@ -1,4 +1,4 @@
-<!-- source: README.md sha256:dcbd5aa09403 -->
+<!-- source: README.md sha256:3cc3ffc9b995 -->
 # Codewhale
 
 Codewhale 是一款在終端機中使用的開源程式設計代理，以 Rust 打造，並與使用者一起透過公開協作持續改進。
@@ -42,6 +42,10 @@ codewhale exec "fix the failing tests and explain what changed"
 ```
 
 Codewhale 可以讀取你的程式碼儲存庫、編輯檔案、執行指令、檢查結果，並持續朝目標推進。你可以決定要授予它多少存取權限。
+
+## GUI 前端
+
+偏好圖形介面？社群維護的 CodeWhale for VS Code 擴充功能把同一個智慧體放進 VS Code 側邊欄——聊天、執行緒對話、即時 diff 與任務管理，全部基於同一個 Runtime API，並與終端保持同步。可從 [VS Code Marketplace](https://marketplace.visualstudio.com/items?itemName=HengQuWorld.brotherwhale-vscode) 安裝；原始碼見 [GitHub](https://github.com/HengQuWorld/CodeWhale-VSCode)。
 
 ## 為何選擇 Codewhale
 

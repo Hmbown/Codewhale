@@ -20,24 +20,8 @@
 
 /** Contributors whose PRs were merged or harvested into this release. */
 export const RELEASE_CONTRIBUTORS: string[] = [
-  "@h3c-hexin",
-  "@qiuYliangM",
-  "@wuisabel-gif",
-  "@aboimpinto",
-  "@musichen",
   "@gaord",
-  "@SparkofSpike",
-  "@M-Maciej",
-  "@serephus",
-  "@whp233",
-  "@Gabriel-Degret",
-  "@huangxianzhan",
-  "@zhuowp",
-  "@AdityaVG13",
-  "@nightt5879",
-  "@Lstarsky0",
-  "@yiheng-kkk",
-  "@Lfanxing",
+  "@goransh-walia",
 ];
 
 /**
@@ -45,8 +29,8 @@ export const RELEASE_CONTRIBUTORS: string[] = [
  * Each name points at a landed change in the 0.9.12 changelog.
  */
 export const RELEASE_HELPERS: string[] = [
-  "@slowly247",
-  "@ronohara",
+  "@nsfoxer",
+  "@Nefelibata1024",
+  "@Gabriel-Degret",
   "@Lujc0523",
-  "@senka9h",
 ];

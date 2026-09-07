@@ -307,13 +307,10 @@ impl App {
             .eq_ignore_ascii_case("vim");
         let transcript_spacing = TranscriptSpacing::from_setting(&settings.transcript_spacing);
         let max_input_history = settings.max_input_history;
-        // The rapid-keystroke heuristic is the fallback for terminals
-        // without bracketed paste, not a second guess layered on top of a
-        // working one: when bracketed paste is enabled it must stay off, or
-        // every fast-typed command goes through hold/buffer windows that
-        // scramble the composer (Y-7, 2026-08-31 QA). The setting remains
-        // the fallback's switch, honored only when bracketed paste is off.
-        let use_paste_burst_detection = settings.paste_burst_detection && !use_bracketed_paste;
+        // Requesting bracketed paste does not prove the terminal delivers it.
+        // Keep the fallback until handle_paste_burst_key observes a real paste
+        // via bracketed_paste_seen; otherwise raw pasted newlines can submit.
+        let use_paste_burst_detection = settings.paste_burst_detection;
         // Resolve the named theme from settings; unknown values were already
         // normalised to the underwater default in Settings::load. The
         // background_color setting still overlays on top.

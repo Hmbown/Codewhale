@@ -26,23 +26,49 @@ export const CHANGELOG: ChangelogRelease[] = [
     "date": null,
     "unreleased": true,
     "compareUrl": "https://github.com/Hmbown/CodeWhale/compare/v0.9.12...HEAD",
+    "sections": []
+  },
+  {
+    "version": "0.9.13",
+    "date": "2026-09-07",
+    "unreleased": false,
+    "compareUrl": "https://github.com/Hmbown/CodeWhale/compare/v0.9.12...v0.9.13",
     "sections": [
+      {
+        "heading": "Fixed",
+        "items": [
+          "Pasting multiline text is one paste again. 0.9.12 gated the paste-burst heuristic off whenever bracketed paste was *requested*, but a terminal can accept EnableBracketedPaste and still deliver a paste as individual keystrokes — on those terminals (observed on Windows 11) every pasted line was submitted as its own message. The heuristic is again armed whenever tui.paste_burst_detection is on, and the existing bracketed_paste_seen guard still disarms it for the rest of the…",
+          "serve --acp no longer breaks strict JetBrains clients: the initialize response advertised sessionCapabilities.list as a boolean and carried an undefined nested load capability; it now sends {\"list\": {}} with no load key, per the ACP schema (#5969, reported by @Lujc0523).",
+          "Concurrent Codewhale instances no longer destroy each other's queued, unsent text. The offline input queue was one global file that boot cleared on session-id mismatch, so a second instance deleted the first's parked messages. Queues are now keyed per session (mirroring per-session checkpoints), an existing global file is adopted by its owning session rather than discarded, and the adoption race between two instances of the same session tolerates the loser's cleanup.",
+          "A tool call truncated at the provider's output limit can no longer be repaired into valid JSON and executed: repairs that had to synthesize structure (append or discard closers) are routed to the existing malformed-arguments path so the model is asked to re-issue — including when the stream is cut before the closing content-block event (#5986).",
+          "codewhale metrics reads Codewhale's own receipts again: the deepseek-home fallback resolved $HOME/.deepseek unconditionally, so the rollup reported all zeros from a directory nothing has written since 2024. The Codewhale audit log is primary, with a checked legacy fallback.",
+          "The goal-continuation loop's promised stall bound actually bounds stalls now, and undeclared fleet role names fail closed to read-only explore in both fleet drivers instead of resolving to write-capable customs in one and not the other.",
+          "allow_insecure_http = true under a [providers.<name>] table works again. 0.9.12 tightened plain-HTTP base URL handling in a way that silently dropped the per-provider key, leaving the process-wide env var as the only opt-in — LAN llama.cpp and internal-gateway users had to export CODEWHALE_ALLOW_INSECURE_HTTP=1 to connect at all. The key is honored again (parsed, settable and unsettable through codewhale config set providers.<name>.allow_insecure_http, and listed in the…",
+          "A Fleet task that selects a roster member with worker.agent_profile now runs with that member's posture. The launch-time resolver only consulted the resolved member when the legacy worker.role label was absent, so a task labelled manager that selected member:reviewer ran as a write-capable manager instead of a reviewer and was never leased. The member's canonical slot now wins whenever one resolved; the label remains the posture only when no member resolved at all. To keep…"
+        ],
+        "itemCount": 8
+      },
       {
         "heading": "Changed",
         "items": [
+          "The built-in Computer Use plugin bundle is refreshed to the standalone plugin's 0.2.0 runtime (vendored from Hmbown/codewhale-cu-plugin PR #12 @ 906b433): the native macOS accessibility backend with an a11y-first pointer strategy (covered points are refused, previews are drawn), the permission-owning desktop-app socket transport, remote computers over ssh and HarmonyOS HDC with contained temp handling, truthful win32 PowerShell failure reporting, and the shared allow-listed…",
           "/statusline drives the bottom chrome again. Since the 0.9.12 shell redesign the posture bar and the metrics line were built independently of tui.status_items, so every toggle in the picker except the balance fetch was decoration. Each remaining item now shows or hides exactly one thing: model, context_percent, cost, balance, cache, tokens and session_metrics are metrics-line segments, and mode is the posture bar's plan/act/operate chip. The status, agents, reasoning_replay,…",
           "The context reading is back on screen at every fullness. 0.9.12 painted ctx NN% only from 50% up, which left most of a session with no context signal at all; it now paints from 0% and keeps its warning colour from 80% up (#5950).",
           "A child agent parked because its parent's turn ended is shown as parked in the Agents panel, the sidebar and Agent Details, with resume_from / cancel as the recovery, instead of wearing the same \"waiting for input\" label as a child that asked a question. Parked work sorts below live and answerable work and no longer inflates the blocked chip; the receipts roster and the wire state gain parked (#5906, #5921).",
-          "codewhale account keys set|remove|list no longer carry a hardcoded eight-provider list. Provider ids come from the control plane's public catalog (GET /api/model-providers), are validated locally against ^[a-z0-9][a-z0-9-]{0,63}$ before they reach a URL path, and list shows every catalog provider with its label and stored-key state. --from-local maps a catalog row onto the local runtime provider through the catalog's own runtimeProvider field, so a newly supported provider…"
+          "codewhale account keys set|remove|list no longer carry a hardcoded eight-provider list. Provider ids come from the control plane's public catalog (GET /api/model-providers), are validated locally against ^[a-z0-9][a-z0-9-]{0,63}$ before they reach a URL path, and list shows every catalog provider with its label and stored-key state. --from-local maps a catalog row onto the local runtime provider through the catalog's own runtimeProvider field, so a newly supported provider…",
+          "/mcp lists the servers that need a login first, as their own Needs login group above Needs attention, and opens with the cursor already on the first such row so the Enter the screen advertises runs /mcp login <server> straight away; translated in all 15 packs. A snapshot test pins the footer shape the chip landed with (MCP · N connected · N ◆ auth required · N failed) so an expired login never regresses into the failed count (#5926)."
         ],
-        "itemCount": 4
+        "itemCount": 6
       },
       {
         "heading": "Fixed",
         "items": [
-          "The posture bar states how long the session has been working and how long the current turn has run, distinguishing actively working from waiting on a tool, a sub-agent or the operator; the 0.9.12 shell had dropped the overall working-time indicator from the place a glancing user checks (#5914)."
+          "Five of the load-flaky tests tracked in #5929 no longer depend on shared state or live local daemons. Background-hook capture tests wait for the capture file to hold bytes instead of merely existing (the shell's > redirection creates the file empty before cat writes, which read as valid JSON: EOF under load); the session-picker acceptance test drives the real picker over a private store instead of a process-global CODEWHALE_HOME redirect that concurrent tests could observe…",
+          "The posture bar states how long the session has been working and how long the current turn has run, distinguishing actively working from waiting on a tool, a sub-agent or the operator; the 0.9.12 shell had dropped the overall working-time indicator from the place a glancing user checks (#5914).",
+          "A background runtime turn whose own store record could not be read, parsed or written (Failed to read turn …, Failed to read item …) was only a log line. The runtime now publishes a runtime.store_failure event naming the file, the root cause and the next action (move the file aside, or check free space and permissions); the TUI shows it as a warning toast and a transcript line, the task timeline records it, and the runtime API streams it. A turn whose own record is…",
+          "An MCP token refresh that fails to parse the provider's answer keeps the endpoint's receipt — status line, content type, and a 200-byte excerpt with every credential-shaped value (access_token, refresh_token, client_secret, id_token, bearer schemes) masked before the cut — instead of rmcp's bare Failed to parse server response, so a provider outage answering an HTML 502 reads differently from a parser defect, and the login remedy stays named (#5926; remedy wording landed in…"
         ],
-        "itemCount": 1
+        "itemCount": 4
       },
       {
         "heading": "Added",
@@ -60,7 +86,27 @@ export const CHANGELOG: ChangelogRelease[] = [
           "/shannon [world|trace|children] inspects the session's ShannonNet World: agent, projected capabilities, children, and receipts.",
           "ShannonNet sub-agents get compiled context: the session's native-memory hits are imported with provenance and the child's projected World decides what it sees (confidential notes never cross); the session World is checkpointed and closed when the backend drops."
         ],
-        "itemCount": 14
+        "itemCount": 15
+      },
+      {
+        "heading": "Contributors",
+        "items": [
+          "@nsfoxer — reported the 0.9.12 multiline-paste regression with a root-cause analysis that made the fix a one-day turnaround (#5981).",
+          "@Nefelibata1024 — confirmed the paste regression's impact.",
+          "@Gabriel-Degret — reported allow_insecure_http being silently dropped in 0.9.12, with the valid-key list that pinned it (#5991).",
+          "@Lujc0523 — reported the ACP initialize schema violation that made Codewhale unusable from JetBrains IDEs (#5969).",
+          "@gaord — the fleet role-precedence recovery (#5945) and the README link to the community VS Code frontend (#5992).",
+          "@goransh-walia — the propose-only commit_plan rework (#5870)."
+        ],
+        "itemCount": 6
+      },
+      {
+        "heading": "Notes",
+        "items": [
+          "Upgrading from 0.9.12 with Computer Use trusted and enabled: the bundle's content hash changes with the 0.2.0 refresh, so the plugin deactivates and asks for a fresh review — that is the designed fail-closed path for a desktop-driving plugin. Re-trust it from the Extensions page.",
+          "The multiline-paste fix restores v9.11 behavior on terminals that accept EnableBracketedPaste but deliver pastes as keystrokes (reported on Windows 11 / PowerShell). Verified at the input-contract level and in CI; a manual paste check on a real Windows terminal is still welcome — please comment on #5981 with your terminal if anything still misbehaves."
+        ],
+        "itemCount": 2
       }
     ]
   },
@@ -156,6 +202,7 @@ export const CHANGELOG: ChangelogRelease[] = [
       {
         "heading": "Fixed",
         "items": [
+          "Read-only Fleet workers no longer send \"action\": {\"enum\": null} in their projected bash schema. The read-only projection probed the action enum with a mutating index, which auto-vivified the key on schemas that have no action property, and strict OpenAI-compatible validators then rejected the whole request (null is not of type \"array\"). The probe is non-mutating now, in both the read-only projection and the Run arm next to it, and a regression test walks the whole projected…",
           "Fast typing no longer corrupts the composer. The paste-burst heuristic ran on every session until a real bracketed paste arrived, holding, buffering, retro-grabbing, and absorbing Enter on timing guesses; it is now fallback-only (gated off when the terminal provides bracketed paste), the retro-grab is deleted, and Enter on held command text flushes and submits.",
           "Ctrl+C works on the pre-session launch menu and speaks everywhere: the first press arms the two-second exit window with a visible localized \"Press Ctrl+C again to quit\" hint (previously silent), the second exits. The worktree name input keeps Ctrl+C as cancel-input.",
           "Fresh interactive sessions no longer leave a phantom one-message duplicate behind. The TUI claimed one session id (Runtime store lock, turn-start crash checkpoint) while the engine minted a second one; the first SessionUpdated re-keyed the App, the completion commit cleared only the engine id's checkpoint, and codewhale --continue later \"recovered\" the orphaned checkpoint as a duplicate session instead of the real one. The engine now adopts the host-owned id at spawn…",
@@ -166,10 +213,9 @@ export const CHANGELOG: ChangelogRelease[] = [
           "Account sessions no longer read the macOS Keychain. Unsigned or rebuilt codewhale binaries were a new Keychain ACL principal every time, so codewhale web and the TUI popped a password dialog on start. Sessions now use ~/.codewhale/secrets/secrets.json (mode 0600), the same store as provider keys. Extracted from the Keychain-retirement half of #5632.",
           "Hardened the dispatcher-side config parse the same way: ConfigStore loads and project-config parsing now deserialize ConfigToml on a dedicated 16 MiB-stack thread (the guided-setup save path could overflow a 2 MiB worker stack the same way the TUI's ConfigFile parse did), and the #5585 setup-confirm toast test runs its runtime on an equally sized thread instead of overflowing the default libtest stack.",
           "Fixed detached interactive agents reporting worker usage after the parent turn ends with the usage missing from the session/live /cost total (#5597): interactive turns acquire an owner-scoped runtime usage lease, late usage enters the session cost pool without reopening the sealed mailbox, and worker/session/reload accounting share one hashed response identity so retried deliveries stay exactly-once.",
-          "Fixed the sub-agent fiasco class: in-workspace absolute git -C no longer trips the read-only child shell gate with a coherent bounded gate (#5595), turn end parks turn-owned children resumably instead of silently cancelling them (#5596), stale write-claims are released by liveness with coordinate release (#5562), and the verifier role description matches its real surface (#5562).",
-          "Fixed workflow responseSchema failure handling (#5583): bounded repair with typed receipts (kind + attempt), raw-output receipts persisted as artifacts that survive reload, and failures surfaced instead of null success (#5528). Degraded owner snapshots no longer project as ordinary Completed runs (#5582), typed task error kinds enable fail-fast parallel/pipeline (R9), and /workflow confirm finds the draft despite interleaved messages."
+          "Fixed the sub-agent fiasco class: in-workspace absolute git -C no longer trips the read-only child shell gate with a coherent bounded gate (#5595), turn end parks turn-owned children resumably instead of silently cancelling them (#5596), stale write-claims are released by liveness with coordinate release (#5562), and the verifier role description matches its real surface (#5562)."
         ],
-        "itemCount": 24
+        "itemCount": 25
       }
     ]
   },
@@ -390,94 +436,6 @@ export const CHANGELOG: ChangelogRelease[] = [
           "Reports and reproductions that shaped this release: @hardy922 (context- window honesty, #5239), @redstar (bwrap extra roots, #5410), @all-lopezg (SSE UTF-8 garbling on DeepSeek Flash, #5374), @alitvak69 (unverified live pricing, #5241), and @wuisabel-gif (the macOS filtered-suite hang investigation on #5056)."
         ],
         "itemCount": 4
-      }
-    ]
-  },
-  {
-    "version": "0.9.8",
-    "date": "2026-08-16",
-    "unreleased": false,
-    "compareUrl": "https://github.com/Hmbown/CodeWhale/compare/v0.9.7...v0.9.8",
-    "sections": [
-      {
-        "heading": "Fixed",
-        "items": [
-          "sudo (and su/setuid helpers) work again for wheel-group administrators who want Codewhale to be able to escalate: the Linux startup hardening's irreversible PR_SET_NO_NEW_PRIVS flag — inherited by every child process — is now skippable with CODEWHALE_NO_NEW_PRIVS=0 (#5413). The flag stays on by default; the no-ptrace and no-core-dump measures are never skipped.",
-          "Abort-class process deaths no longer poison the terminal (#5424). A stack overflow, allocation failure, or double panic skips the panic hook and every cleanup guard, which is how a v0.9.7 user's mid-turn exit left mouse capture leaking SGR sequences into their shell. An async-signal-safe handler now restores the terminal modes and appends a one-line cause marker to ~/.codewhale/crashes/last-fatal-signal.log before re-raising, keeping the honest 128+signal wait status. A…"
-        ],
-        "itemCount": 2
-      },
-      {
-        "heading": "Changed",
-        "items": [
-          "Prompt-cache prefix is pinned for the session. The tool loop no longer recomposes the system prompt from disk on every model step, so an agent writing a file no longer busts the provider KV prefix cache mid-turn. The system prompt and tool catalog are re-composed only on a declared header change (/model, mode, goal, session resume), which re-pins under a logged reason; an undeclared change is reported as drift and the original pin is kept instead of silently becoming the new…",
-          "Plugin compatibility is now per-component. A reviewed, trusted, enabled bundle that mixes Skills or MCP with unsupported commands, agents, hooks, LSP, native, filesystem-roots, or lifecycle-mutation declarations keeps the supported adapters active and reports the rest as inactive (full / partial / unsupported). All-unsupported bundles still cannot be enabled. The capability hash is now v2 and binds this build's activation policy, so older v1 receipts and any later…"
-        ],
-        "itemCount": 2
-      },
-      {
-        "heading": "Added",
-        "items": [
-          "Opt-in multiline composer mode (composer_multiline_mode = true) makes Enter insert a newline and Shift+Enter send. Alt+Enter, Ctrl+J, and supported Ctrl+Enter/Cmd+Enter behavior stays unchanged (#5345, @AiurArtanis).",
-          "/plugin marketplace add|list|show|remove|install completes the federated marketplace journey (#5311). add reads one LOCAL catalog document in the real published schemas (Kimi, Claude, Codex, or Codewhale native) — no network, regular files only — and persists it beside the plugin state with the same hardened, fail-closed store. list/show render every candidate with per-entry diagnostics, display-only tiers, and honest install plans that say when Codewhale cannot fetch a…",
-          "/rc attach now includes an observed owner/name git remote when the folder has a GitHub, CNB, or Gitee origin, so CWC can label the paired session. Paths stay off the wire. Reconnect after both this client and CWC #202 land to backfill existing empty rows.",
-          "The local Runtime web client keeps the thread rail clipped so New thread cannot paint over the session fact chips. Chips wrap instead of sliding under the rail.",
-          "Z.ai GLM-5.3 is live on the Coding Plan and is now the default direct Z.ai model: DEFAULT_ZAI_MODEL resolves to GLM-5.3 in both codewhale-tui and codewhale-config, and it is the first /model row after /provider zai. Explicit GLM-5.2 selections (model = \"GLM-5.2\" and its glm-5.2 aliases) keep their own id — only the default moved. Limits and reasoning options still inherit from GLM-5.2 until Z.ai publishes distinct 5.3 numbers. No USD price is claimed. A live call can still…",
-          "The TUI transcript renders Markdown blockquotes (> lines) with a quote rail — nested quotes, inline bold/code/links, wrapped continuation rows, and selection copy that keeps the quote text and skips the rail chrome.",
-          "Sub-agent details show the resolved model, fleet role, and type. Labels use the session/role name instead of a generic Agent N (#5371, #5287).",
-          "Documented catalogue output ceilings (including DeepSeek V4's 384K maximum) remain authoritative bounds, while ordinary requests start at a safe 64K cap and explicit overrides can raise it within the resolved route window. A clean output-limit stop continues the turn instead of killing it (#5373, #5516, #5518). Thanks @sfdzhmr and @hxfhd for the route evidence.",
-          "Ollama Cloud is a first-class hosted provider (/provider ollama-cloud) on the official OpenAI-compatible https://ollama.com/v1 route. Local Ollama stays keyless. The exact released ollama + Cloud URL tuple keeps a bounded compatibility path across saved sessions, Fleet, and nested subagents; neighboring remotes stay custom and fail closed against inherited official credentials.",
-          "Homebrew ships a codewhale formula. brew tap Hmbown/deepseek-tui && brew install codewhale is the install path; brew upgrade codewhale updates it. The legacy deepseek-tui formula remains a deprecated alias for one overlap release.",
-          "/title [name|off] sets a per-session tab/window title, shown as [title] … in front of the terminal window title (Codewhale / reasoning… / using tool… / done). The title config key supplies the default (/config title … --save persists it); multi-window workflows can tell parallel sessions apart at a glance. /title is independent of /rename, which keeps naming the session in the picker and composer. Control, bidi, and zero-width format characters are stripped from both the…",
-          "Eden AI is a named OpenAI-compatible Chat Completions provider (edenai, aliases eden-ai / eden_ai) with EDENAI_API_KEY, global and EU base-URL overrides, a live provider-scoped model catalog, and deepseek/deepseek-v4-pro as the verified default. Generic reasoning fields stay omitted because Eden AI routes multiple upstream model families (#5422, Kai Nacke)."
-        ],
-        "itemCount": 20
-      },
-      {
-        "heading": "Fixed",
-        "items": [
-          "Selecting the google provider kind resolved to the antigravity TUI identity (and vice versa): the agy provider entry was inserted at different positions in the config-level enum and the TUI's discriminant-indexed lookup table. The table now matches the enum, so provider pickers, sorted display, and kind round-trips are correct.",
-          "The provider picker's key-entry stage accepted typed input and pastes for OAuth-only providers after antigravity declared OAuth acquisition; those gates now key off the OAuth acquisition class instead of a hard-coded provider identity.",
-          "The webhook hook sink no longer panics when its HTTP client fails to build; it falls back to a default client (#5381, EvanProgramming).",
-          "Session-index JSONL writes are serialized behind a process-wide mutex so concurrent state stores cannot drop an append during compaction (#5382, EvanProgramming; complements the cross-process file lock).",
-          "A billed max_tokens stop followed by a transport error fails the turn instead of continuing into a second request. A clean output-limit stop still continues. Mid-size context windows keep the ordinary 65K internal reservation so compaction does not collapse to the 1K headroom floor when the catalogue documents a matching output ceiling.",
-          "Thinking cycle, /effort, and Settings now walk each model's real ladder instead of the DeepSeek off/high/max shortcut. Grok 4.6 is auto/low/medium/high/xhigh (cannot disable); Grok 4.5 is auto/low/medium/high; first-party DeepSeek keeps a documented low tier. /effort persists and receipts through the same path as Ctrl+T.",
-          "Google Gemini is its own backend (/provider google) on the official OpenAI-compatible route with thought-signature capture/replay and fail-closed replay for thinking models. Antigravity (agy 1.1.13) is a separate provider: consent-gated read-only import of the official CLI's login, then a text-only cloud-code stream (/v1internal:streamGenerateContent). Tools, images, and unknown SSE shapes fail closed. Gemini 3.7 Flash is not advertised until a live turn succeeds on this…",
-          "DeepSeek Flash SSE on macOS no longer turns mid-character HTTP/2 flushes into U+FFFD replacement characters (#5374). Invalid UTF-8 fails the line instead of using lossy decode.",
-          "[workshop] read_result_max_bytes and tool_result_max_bytes raise the model-visible read/tool-result floor; they never lower the compile-time defaults and cap at 2MiB (#5367).",
-          "Fireworks and OpenCode Zen DeepSeek V4 Flash/Pro keep a bundled family rate when the live control plane is down, so session cost is not stuck on unverified_live_pricing (#5241). kimi-k3 stays unpriced until a published rate exists.",
-          "Provider setup ships a typed beginner template catalog (#5350). OpenCode Zen/Go stay first-class key-only rows with their documented hosts and curated models. SenseNova fills a named OpenAI-compatible table on the published https://token.sensenova.cn/v1 host (S or /provider setup sensenova). Agnes is listed as unpublished because this repository has no published URL. /provider P and Settings → beginner templates open the list; T tests /models and refreshes status without…",
-          "Privileged release workflows no longer restore rust-cache, sccache, or npm caches after checking out a caller-supplied SHA (CodeQL cache-poisoning #88–#106). Catalog drift no longer prints raw bundled/upstream blobs (#107)."
-        ],
-        "itemCount": 24
-      },
-      {
-        "heading": "Removed",
-        "items": [
-          "The source-structure budget ratchet (CI step, checker, baseline JSON). It measured line counts, not quality: every legitimate feature required a hand-edited ceiling and the accompanying \"review\" was self-review, so it bought ceremony, not protection. Behavior-measuring gates (dead-code, runtime-contract, persistence-backlog) stay enforced.",
-          "DeepSeek can reuse a key already stored by official DeepSeek Harness (dsh) after codewhale auth external-consent --provider deepseek --mode read-only. Codewhale reads only DEEPSEEK_API_KEY from the exact granted $DSH_HOME/.credentials.yaml and never writes or refreshes that file.",
-          "The TUI markdown parser now honors CommonMark fence-length rules: a opener is not closed by a shorter line, so >` content inside a longer fence stays literal code instead of escaping into a quote.",
-          "Sub-agents finalize when the parent session id changes, so a closed session cannot block new children as a live owner (#5372).",
-          "Child spawn-route receipts stay live and usage is deduped by response (#5366).",
-          "Doctor keeps persisted setup readiness across first-run / update checkpoints (#5340).",
-          "Approval default selection is applied and explained; agents are told when approvals are disabled (#5293).",
-          "A /models 2xx probe is a connection check, not model readiness.",
-          "Site layout uses one container, the ticker no longer implies false provider readiness, and install links stay in the active locale."
-        ],
-        "itemCount": 9
-      },
-      {
-        "heading": "Contributors",
-        "items": [
-          "EvanProgramming (@EvanProgramming) — webhook client panic fallback (#5381); session-index JSONL mutex (#5382).",
-          "Lstarsky0 (@Lstarsky0) — session peek hides internal runtime events (#5376); thinking-ladder test re-pin (#5378); provider-count follow-ups (#5383/#5384); macOS agy fixture canonicalization (#5392); zh-Hans 宪章 terminology (#5397); regenerated website facts harvested and corrected from #5398.",
-          "Matt Van Horn (@mvanhorn) — read-only models settings preview on the website (#5411, fixes #5370).",
-          "Nhat Bui (@buiducnhat) — canonical ultra reasoning effort mapped across provider effort tables (#5409); session titles truncated by character count, not byte offset (#5415).",
-          "Sh1Zuku (@SparkofSpike) — /title and the session name in the terminal tab/window title, plus the mid-turn title deadlock fix (#5419).",
-          "Kai Nacke (@redstar) — Eden AI provider registration, aliases, EDENAI_API_KEY, and the global/EU endpoints (#5422).",
-          "Isabel Wu (@wuisabel-gif) — background verifier test isolated from rustup and $HOME (#5423, slice of #5056)."
-        ],
-        "itemCount": 7
       }
     ]
   }

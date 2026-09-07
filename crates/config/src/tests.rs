@@ -1931,6 +1931,65 @@ fn insecure_skip_tls_verify_resolves_only_for_active_provider() {
     assert!(resolved.insecure_skip_tls_verify);
 }
 
+/// #5991: `allow_insecure_http` is a per-provider key again — parsed from the
+/// `[providers.<name>]` table, settable/unsettable through `config set`, and
+/// listed in the custom-provider field hint. It must stay independent of
+/// `insecure_skip_tls_verify` (which only relaxes TLS verification).
+#[test]
+fn allow_insecure_http_round_trips_and_stays_distinct_from_tls_verify() {
+    let _lock = env_lock();
+    let _env = EnvGuard::without_deepseek_runtime_overrides();
+
+    let raw = r#"
+provider = "openai"
+[providers.openai]
+base_url = "http://192.168.0.110:8000/v1"
+allow_insecure_http = true
+insecure_skip_tls_verify = false
+"#;
+    let config: ConfigToml = toml::from_str(raw).expect("parses");
+    assert_eq!(config.providers.openai.allow_insecure_http, Some(true));
+    assert_eq!(
+        config.providers.openai.insecure_skip_tls_verify,
+        Some(false)
+    );
+
+    // `config set providers.openai.allow_insecure_http true` lands in the
+    // same field and `config get` reads it back.
+    let mut set_target = ConfigToml::default();
+    set_provider_config_value(
+        &mut set_target,
+        ProviderKind::Openai,
+        ProviderConfigField::AllowInsecureHttp,
+        "true",
+    )
+    .expect("set accepts the key");
+    assert_eq!(set_target.providers.openai.allow_insecure_http, Some(true));
+    assert!(
+        set_target
+            .providers
+            .openai
+            .insecure_skip_tls_verify
+            .is_none()
+    );
+    assert_eq!(
+        get_provider_config_value(
+            &set_target.providers.openai,
+            ProviderConfigField::AllowInsecureHttp
+        ),
+        Some("true".to_string())
+    );
+
+    unset_provider_config_value(
+        &mut set_target,
+        ProviderKind::Openai,
+        ProviderConfigField::AllowInsecureHttp,
+    );
+    assert_eq!(set_target.providers.openai.allow_insecure_http, None);
+
+    assert!(CUSTOM_PROVIDER_FIELD_HINT.contains("allow_insecure_http"));
+}
+
 #[test]
 fn openai_provider_accepts_dashscope_bailian_base_url_and_model() {
     let _lock = env_lock();

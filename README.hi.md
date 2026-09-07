@@ -1,4 +1,4 @@
-<!-- source: README.md sha256:dcbd5aa09403 -->
+<!-- source: README.md sha256:3cc3ffc9b995 -->
 # Codewhale
 
 Codewhale आपके टर्मिनल के लिए Rust में बना एक ओपन सोर्स कोडिंग एजेंट है, जिसे इसके उपयोगकर्ताओं के साथ सार्वजनिक रूप से बेहतर बनाया जाता है।
@@ -42,6 +42,10 @@ codewhale exec "fix the failing tests and explain what changed"
 ```
 
 Codewhale आपकी रिपॉज़िटरी पढ़ सकता है, फ़ाइलें संपादित कर सकता है, कमांड चला सकता है, परिणामों की जाँच कर सकता है और लक्ष्य की ओर काम जारी रख सकता है। उसे कितना एक्सेस देना है, यह आप तय करते हैं।
+
+## GUI फ्रंटएंड
+
+क्या आप ग्राफ़िकल इंटरफ़ेस पसंद करते हैं? समुदाय द्वारा अनुरक्षित CodeWhale for VS Code एक्सटेंशन उसी एजेंट को VS Code साइडबार में लाता है — चैट, थ्रेडेड वार्तालाप, लाइव डिफ़ और कार्य प्रबंधन, सभी उसी Runtime API पर आधारित, ताकि सत्र टर्मिनल के साथ सिंक में रहें। इसे [VS Code Marketplace](https://marketplace.visualstudio.com/items?itemName=HengQuWorld.brotherwhale-vscode) से इंस्टॉल करें; सोर्स कोड [GitHub](https://github.com/HengQuWorld/CodeWhale-VSCode) पर है।
 
 ## Codewhale क्यों
 

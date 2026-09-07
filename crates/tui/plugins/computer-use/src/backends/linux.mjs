@@ -8,6 +8,7 @@ import path from "node:path";
 import crypto from "node:crypto";
 import { spawn } from "node:child_process";
 import { run, runOk, ExecError, tryJson, have } from "../exec.mjs";
+import { pngSize } from "../png-size.mjs";
 
 const XKEYS = {
   return: "Return", enter: "Return", tab: "Tab", escape: "Escape", esc: "Escape",
@@ -26,6 +27,13 @@ function spawnDetached(cmd, args, stdinText = "", quiet = true) {
   return child;
 }
 
+/** Coordinate clicks on this backend are always raw pointer events; strategy="a11y" must fail closed rather than silently degrade. */
+function assertEventStrategy(strategy) {
+  if (strategy != null && strategy !== "auto" && strategy !== "event") {
+    throw new ExecError(`strategy "${strategy}" is macOS-only; this backend dispatches coordinate clicks as raw pointer events — use an element target for a semantic action`);
+  }
+}
+
 export function create({ exec }) {
   const tools = {};
   let session = null; // "x11" | "wayland"
@@ -39,6 +47,11 @@ export function create({ exec }) {
     const wayland = !!(process.env.WAYLAND_DISPLAY || process.env.XDG_SESSION_TYPE === "wayland");
     const x11 = !!(process.env.DISPLAY || process.env.XDG_SESSION_TYPE === "x11");
     session = wayland && !x11 ? "wayland" : x11 ? "x11" : null;
+    if (session === null) {
+      const e = new ExecError("no X11 ($DISPLAY) or Wayland ($WAYLAND_DISPLAY) session visible to this process — set DISPLAY or run inside the desktop session");
+      e.code = "no_session";
+      throw e;
+    }
     for (const t of ["xdotool", "wmctrl", "scrot", "import", "grim", "slurp", "wtype", "ydotool", "wf-recorder", "ffmpeg", "xclip", "xsel", "wl-copy", "wl-paste", "python3", "xrandr", "swaymsg", "hyprctl"]) {
       tools[t] = await have(t);
     }
@@ -58,6 +71,24 @@ export function create({ exec }) {
       return { cmd: "import", base: ["-window", "root"] };
     }
     throw new ExecError("no X11 ($DISPLAY) or Wayland ($WAYLAND_DISPLAY) session visible to this process");
+  }
+
+  /** Capture a PNG to `file`, optionally cropped to region [x,y,w,h] points. */
+  async function takeShot(file, region) {
+    const { cmd, base } = await shotTool();
+    let args = [...base];
+    if (cmd === "grim") {
+      if (region) args.push("-g", `${Math.round(region[0])},${Math.round(region[1])} ${Math.round(region[2])}x${Math.round(region[3])}`);
+      args.push(file);
+    } else if (cmd === "scrot") {
+      if (region) args.push("-a", `${Math.round(region[0])},${Math.round(region[1])},${Math.round(region[2])},${Math.round(region[3])}`);
+      args.push(file);
+    } else {
+      if (region) args.push("-crop", `${Math.round(region[2])}x${Math.round(region[3])}+${Math.round(region[0])}+${Math.round(region[1])}`);
+      args.push(file);
+    }
+    const r = await run(cmd, args, { timeoutMs: 10_000 });
+    if (r.code !== 0) throw new ExecError(`${cmd} exited ${r.code}: ${r.stderr.trim().slice(0, 300)}`, r);
   }
 
   function recordingsDir() {
@@ -119,7 +150,7 @@ els = []
 truncated = False
 def info(e, path):
     ext = None
-    try: ext = e.getExtents(pyatspi.DESKTOP_COORDS)
+    try: ext = e.queryComponent().getExtents(pyatspi.DESKTOP_COORDS)
     except Exception: pass
     txt = None
     try:
@@ -151,18 +182,27 @@ def walk(e, path, d):
 walk(root, [], 0)
 print(json.dumps({"found": True, "name": root.name, "elements": els, "truncated": truncated}))`;
 
-  async function atspiResolve(pathArr, pythonBody, extraArg = null) {
+  async function atspiResolve(appName, pathArr, pythonBody, extraArg = null) {
+    await probeSession();
     need("python3", "semantic element actions (AT-SPI)");
     const script = `import json, sys, pyatspi
 desktop = pyatspi.Registry.getDesktop(0)
-target_path = json.loads(sys.argv[1])
-extra = sys.argv[2] if len(sys.argv) > 2 else None
+app_name = sys.argv[1] if len(sys.argv) > 1 and sys.argv[1] else None
+target_path = json.loads(sys.argv[2])
+extra = sys.argv[3] if len(sys.argv) > 3 else None
 node = None
-for i in range(desktop.childCount):
-    a = desktop.getChildAtIndex(i)
-    if a and a.childCount:
-        node = a
-        break
+if app_name:
+    for i in range(desktop.childCount):
+        a = desktop.getChildAtIndex(i)
+        if a and app_name.lower() in (a.name or "").lower():
+            node = a
+            break
+else:
+    for i in range(desktop.childCount):
+        a = desktop.getChildAtIndex(i)
+        if a and a.childCount:
+            node = a
+            break
 if node is None:
     print(json.dumps({"ok": False, "code": "app_not_found"}))
     sys.exit(0)
@@ -186,7 +226,7 @@ try:
 ${pythonBody}
 except Exception as e:
     print(json.dumps({"ok": False, "code": str(e)}))`;
-    const argv = ["-c", script, JSON.stringify(pathArr ?? [])];
+    const argv = ["-c", script, String(appName ?? ""), JSON.stringify(pathArr ?? [])];
     if (extraArg != null) argv.push(String(extraArg));
     const r = await run("python3", argv, { timeoutMs: 30_000 });
     const out = tryJson((r.stdout.trim().split("\n").pop() ?? ""), null);
@@ -226,7 +266,36 @@ except Exception as e:
       if (session === "x11" && !tools.scrot && !tools.import) missing.push("scrot or imagemagick (screenshots)");
       if (!caps.recording) missing.push("ffmpeg (X11) or wf-recorder (Wayland)");
       if (!tools.pyatspi) missing.push("python3-pyatspi (accessibility tree)");
-      return { platform: "linux", session: s, capabilities: caps, missing, note: "Every capability probes at call time and fails closed naming the missing tool." };
+      // Real permission probes, not just `have()`: each check is bounded to 10s.
+      const permissions = { input: "failed", screen_capture: "failed", accessibility: "unavailable" };
+      if (session === "x11" && tools.xdotool) {
+        const r = await run("xdotool", ["getdisplaygeometry"], { timeoutMs: 10_000 });
+        permissions.input = r.code === 0 ? "ok" : "failed";
+      } else if (session === "wayland" && tools.ydotool) {
+        permissions.input = "unavailable"; // ydotool can't be probed without moving the pointer
+      }
+      try {
+        const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cu-probe-"));
+        try {
+          await takeShot(path.join(dir, "probe.png"), [0, 0, 2, 2]);
+          permissions.screen_capture = "ok";
+        } finally {
+          try { fs.rmSync(dir, { recursive: true, force: true }); } catch {}
+        }
+      } catch {}
+      if (tools.pyatspi) {
+        const r = await run("python3", ["-c", "import pyatspi; pyatspi.Registry.getDesktop(0).childCount"], { timeoutMs: 10_000 });
+        permissions.accessibility = r.code === 0 ? "ok" : "failed";
+      }
+      if (permissions.screen_capture === "failed" || permissions.input === "failed") {
+        const bad = [];
+        if (permissions.input === "failed") bad.push(`input (${session === "wayland" ? "ydotool" : "xdotool getdisplaygeometry"})`);
+        if (permissions.screen_capture === "failed") bad.push(`screen_capture (${session === "wayland" ? "grim" : "scrot/import"} probe shot)`);
+        const e = new ExecError(`permission checks failed: ${bad.join("; ")} — permissions ${JSON.stringify(permissions)}`);
+        e.code = "permissions_denied";
+        throw e;
+      }
+      return { platform: "linux", session: s, capabilities: caps, permissions, missing, note: "Every capability probes at call time and fails closed naming the missing tool." };
     },
     list_displays: async () => {
       await probeSession();
@@ -324,25 +393,73 @@ except Exception as e:
     },
     screenshot: async ({ display, region, path: outPath } = {}) => {
       await probeSession();
-      const { cmd, base } = await shotTool();
       const dir = recordingsDir();
       fs.mkdirSync(dir, { recursive: true });
       const file = outPath || path.join(dir, `shot-${new Date().toISOString().replace(/[:.]/g, "-")}-${crypto.randomBytes(3).toString("hex")}.png`);
-      let args = [...base];
-      if (cmd === "grim") {
-        if (region) args.push("-g", `${Math.round(region[0])},${Math.round(region[1])} ${Math.round(region[2])}x${Math.round(region[3])}`);
-        args.push(file);
-      } else if (cmd === "scrot") {
-        if (region) args.push("-a", `${Math.round(region[0])},${Math.round(region[1])},${Math.round(region[2])},${Math.round(region[3])}`);
-        args.push(file);
-      } else {
-        if (region) args.push("-crop", `${Math.round(region[2])}x${Math.round(region[3])}+${Math.round(region[0])}+${Math.round(region[1])}`);
-        args.push(file);
-      }
-      const r = await run(cmd, args, { timeoutMs: 20_000 });
-      if (r.code !== 0) throw new ExecError(`${cmd} exited ${r.code}: ${r.stderr.trim().slice(0, 300)}`, r);
-      lastRaster = { file, bytes: fs.statSync(file).size, capturedAt: new Date().toISOString() };
+      await takeShot(file, region);
+      const dims = pngSize(file);
+      lastRaster = {
+        file,
+        bytes: fs.statSync(file).size,
+        // Region rasters describe the region; full shots get geometry from the
+        // PNG itself (Linux shots are always scale 1: points == pixels).
+        points: region ? { x: region[0], y: region[1], w: region[2], h: region[3] } : dims ? { x: 0, y: 0, w: dims.w, h: dims.h } : null,
+        pixels: dims ?? (region ? { w: Math.round(region[2]), h: Math.round(region[3]) } : null),
+        scale: 1,
+        capturedAt: new Date().toISOString(),
+      };
       return { ...lastRaster };
+    },
+    resolve_element: async ({ app_ref, windowIndex, path: pathArr } = {}) => {
+      await probeSession();
+      need("python3", "element resolution (AT-SPI)");
+      const script = `import json, sys, pyatspi
+desktop = pyatspi.Registry.getDesktop(0)
+app_name = sys.argv[1] if len(sys.argv) > 1 and sys.argv[1] else None
+target_path = json.loads(sys.argv[2])
+root = None
+if app_name:
+    for i in range(desktop.childCount):
+        a = desktop.getChildAtIndex(i)
+        if a and app_name.lower() in (a.name or "").lower():
+            root = a
+            break
+else:
+    for i in range(desktop.childCount):
+        a = desktop.getChildAtIndex(i)
+        if a and a.childCount:
+            root = a
+            break
+if root is None:
+    print(json.dumps({"found": False, "element": None, "reason": "app_not_found"}))
+    sys.exit(0)
+node = root
+ok = True
+for k in target_path:
+    found = None
+    try:
+        if k < node.childCount:
+            found = node.getChildAtIndex(k)
+    except Exception:
+        found = None
+    if found is None:
+        ok = False
+        break
+    node = found
+if not ok:
+    print(json.dumps({"found": True, "element": None, "reason": "element_stale"}))
+    sys.exit(0)
+ext = None
+try: ext = node.queryComponent().getExtents(pyatspi.DESKTOP_COORDS)
+except Exception: pass
+print(json.dumps({"found": True, "reason": None, "element": {
+    "role": node.getRoleName() or None, "label": node.name or None,
+    "position": {"x": ext.x, "y": ext.y} if ext else None,
+    "size": {"w": ext.width, "h": ext.height} if ext else None}}))`;
+      const r = await run("python3", ["-c", script, String(app_ref?.name ?? ""), JSON.stringify(pathArr ?? [])], { timeoutMs: 30_000 });
+      const out = tryJson(r.stdout.trim().split("\n").pop() ?? "", null);
+      if (!out) throw new ExecError(`AT-SPI resolve failed: ${(r.stderr || r.stdout).slice(0, 250)}`, r);
+      return out;
     },
     zoom: async ({ source, region, path: outPath }) => {
       need("ffmpeg", "zoom/crop");
@@ -352,7 +469,7 @@ except Exception as e:
       await runOk("ffmpeg", ["-y", "-loglevel", "error", "-i", src, "-vf", `crop=${Math.round(region[2])}:${Math.round(region[3])}:${Math.round(region[0])}:${Math.round(region[1])}`, out], { timeoutMs: 20_000 });
       return { file: out, bytes: fs.statSync(out).size, region, source: src };
     },
-    left_click: ({ target }) => { assertNum(target.x, "x"); assertNum(target.y, "y"); return inputChain(target.x, target.y, () => clickButton(1, 1)); },
+    left_click: ({ target, strategy }) => { assertNum(target.x, "x"); assertNum(target.y, "y"); assertEventStrategy(strategy); return inputChain(target.x, target.y, () => clickButton(1, 1)); },
     double_click: ({ target }) => inputChain(target.x, target.y, () => clickButton(1, 2)),
     triple_click: ({ target }) => inputChain(target.x, target.y, () => clickButton(1, 3)),
     right_click: ({ target }) => inputChain(target.x, target.y, () => clickButton(3, 1)),
@@ -424,6 +541,7 @@ except Exception as e:
     },
     set_value: async ({ target, value }) => {
       const out = await atspiResolve(
+        target.app_ref?.name,
         target.path,
         `    v = found.queryValue()
     v.currentValue = float(extra)`,
@@ -431,6 +549,7 @@ except Exception as e:
       ).catch(async (e) => {
         // Fall back to the Text interface for text-bearing widgets.
         const out2 = await atspiResolve(
+          target.app_ref?.name,
           target.path,
           `    t = found.queryText()
     t.setTextContents(extra)`,
@@ -455,7 +574,7 @@ except Exception as e:
     else:
         a.doAction(names.index(match))
         print(json.dumps({"ok": True, "sent": True}))`;
-      const out = await atspiResolve(target.path, body, String(action));
+      const out = await atspiResolve(target.app_ref?.name, target.path, body, String(action));
       if (!out.ok) throw new ExecError(`perform_action failed: ${out.code}`);
       return { action_sent: true, strategy: "a11y", action };
     },
@@ -482,7 +601,8 @@ except Exception as e:
       await probeSession();
       if (session === "x11") {
         const out = await xdotool(["getmouselocation"]);
-        const m = /(\d+)\s+(\d+)/.exec(out);
+        const m = /x:(-?\d+)\s+y:(-?\d+)/.exec(out);
+        if (!m) throw new ExecError(`could not parse xdotool getmouselocation output: ${out}`);
         return { x: Number(m[1]), y: Number(m[2]) };
       }
       throw new ExecError("cursor position needs an X11 session in this build");

@@ -28,6 +28,15 @@ notes, and relevant issue/PR comments.
 ## Contributors by time
 
 <details open>
+<summary><strong>v0.9.13 — paste integrity, dispatch safety, and the Computer Use bundle</strong></summary>
+
+Contributors and reporters credited in the [0.9.13 changelog](../CHANGELOG.md):
+merged PRs from [gaord](https://github.com/gaord) and [goransh-walia](https://github.com/goransh-walia);
+reports and reproductions from [nsfoxer](https://github.com/nsfoxer), [Nefelibata1024](https://github.com/Nefelibata1024), [Gabriel-Degret](https://github.com/Gabriel-Degret), and [Lujc0523](https://github.com/Lujc0523).
+
+</details>
+
+<details open>
 <summary><strong>v0.9.12 — native search, live token truth, and runtime surfaces</strong></summary>
 
 **Merged or adapted contributions**

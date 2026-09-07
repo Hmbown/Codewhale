@@ -1,14 +1,14 @@
 // macOS backend. Zero third-party dependencies:
-//  - observation:  osascript JXA over System Events (accessibility tree)
-//  - raw input:    CGEvent posted through JXA's CoreGraphics bridge
-//  - stills/video: /usr/sbin/screencapture  (video requires macOS 13+)
+//  - observation and input: native Accessibility and CoreGraphics APIs
+//  - stills:      /usr/sbin/screencapture
+//  - video:       ScreenCaptureKit in the signed helper (macOS 13+, no overlay)
 //  - crop:         sips   - clipboard: pbcopy/pbpaste
-// All scripts travel as temp files + one base64 payload argument, so tool
-// arguments never become AppleScript syntax.
+// Helper requests travel as one JSON argument without shell interpolation.
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import crypto from "node:crypto";
+import { fileURLToPath } from "node:url";
 import { spawn } from "node:child_process";
 import { run, runOk, ExecError, tryJson, have } from "../exec.mjs";
 
@@ -29,253 +29,151 @@ const MODIFIERS = {
   shift: 1 << 17, ctrl: 1 << 18, control: 1 << 18, alt: 1 << 19, opt: 1 << 19, option: 1 << 19,
   fn: 1 << 23, function: 1 << 23,
 };
+// CGEventType values (CGEventTypes.h). The dragged codes are easy to get
+// wrong: 6 is LeftMouseDragged and 7 is RightMouseDragged, so a left drag sent
+// as 7 is delivered as a right-button drag and no view ever sees it.
 const MOUSE = {
-  left: { down: 1, up: 2, dragged: 7 },
-  right: { down: 3, up: 4, dragged: 8 },
+  left: { down: 1, up: 2, dragged: 6 },
+  right: { down: 3, up: 4, dragged: 7 },
   middle: { down: 25, up: 26, dragged: 27 },
 };
+const MOUSE_MOVED = 5;
 
 export function create({ exec }) {
   const runL = (cmd, args, opts) => exec.run(cmd, args, opts);
-  const state = { activeDisplay: 1, lastRaster: null };
+  const state = { activeDisplay: 1, lastRaster: null, inputApp: null, previewEnabled: false, pointer: null };
 
-  // ---------- JXA helper ----------
-  async function jxa(script, payload = {}, timeoutMs = 20_000) {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cu-jxa-"));
-    try {
-      const file = path.join(dir, "s.js");
-      fs.writeFileSync(file, script);
-      // Payload travels as a plain argv string: osascript is spawned without a
-      // shell, so JSON content can never become script syntax.
-      // Input and accessibility scripts need the Accessibility grant. When the
-      // last probe saw it denied, refuse here with the remedy instead of
-      // letting osascript hang on a TCC prompt nobody can answer (#5917).
-      if (state.tcc?.accessibility === false && /CGEventPost|System Events/.test(script)) {
-        throw new ExecError(`accessibility permission is not granted to ${await grantTarget()}: ${TCC_FIX.accessibility}`);
+  async function nativeHelper() {
+    let helper = process.env.CODEWHALE_CU_APP_BUNDLE
+      ? path.join(process.env.CODEWHALE_CU_APP_BUNDLE, "Contents", "MacOS", "accessibility") : null;
+    if (!helper || !fs.existsSync(helper)) {
+      const source = fileURLToPath(new URL("./darwin-accessibility.m", import.meta.url));
+      const hash = crypto.createHash("sha256").update(fs.readFileSync(source)).update(fs.readFileSync(new URL("./darwin-recording.h", import.meta.url))).digest("hex").slice(0, 16);
+      const dir = path.join(os.homedir(), ".codewhale-cu", "bin");
+      fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+      helper = path.join(dir, `accessibility-${hash}`);
+      if (!fs.existsSync(helper)) {
+        const tmp = `${helper}-${process.pid}`;
+        const r = await runL("clang", ["-fobjc-arc", "-Os", "-framework", "Cocoa", "-framework", "ApplicationServices", "-framework", "ScreenCaptureKit", "-framework", "AVFoundation", "-framework", "CoreMedia", source, "-o", tmp], { timeoutMs: 60_000 });
+        if (r.code !== 0) throw new ExecError(`native accessibility helper needs a built app or Xcode Command Line Tools: ${r.stderr}`, r);
+        fs.renameSync(tmp, helper);
       }
-      const r = await runL("osascript", ["-l", "JavaScript", file, JSON.stringify(payload)], { timeoutMs });
-      if (r.timedOut) {
-        const hint = state.tcc?.accessibility === true
-          ? ""
-          : ` (if macOS is showing a permission prompt, grant Accessibility to ${await grantTarget()}: ${TCC_FIX.accessibility})`;
-        throw new ExecError(`osascript timed out${hint}`, r);
-      }
-      if (r.code !== 0) {
-        const msg = (r.stderr || r.stdout).trim().split("\n")[0] || "osascript failed";
-        throw new ExecError(/(not allowed assistive|assistive access|250)/i.test(r.stderr || "") || /(-25211|-1719|not allowed)/i.test(msg)
-          ? `${msg} (accessibility permission for the host terminal is required: System Settings → Privacy & Security → Accessibility)`
-          : msg, r);
-      }
-      return tryJson(r.stdout.trim(), r.stdout.trim());
-    } finally {
-      try { fs.rmSync(dir, { recursive: true, force: true }); } catch {}
     }
+    return helper;
   }
 
-  const JXA_PRELUDE = `
-    function run(argv){
-      var P = JSON.parse(argv[0]);
-      function g(f){ try { return f(); } catch(e){ return null; } }
-      function num(v){ if (typeof v==='function') v = g(v); if (v===null||v===undefined) return null; if (typeof v==='object'){ try { v = ObjC.unwrap(v); } catch(e){} } var n = Number(v); return isFinite(n)? n : null; }
-      function pt(p){ p = g(function(){return p();}); if(!p) return null; try { return { x: num(p[0]!==undefined?p[0]:p.x), y: num(p[1]!==undefined?p[1]:p.y) }; } catch(e){ return null; } }
-      function sz(s){ s = g(function(){return s();}); if(!s) return null; try { return { w: num(s[0]!==undefined?s[0]:s.width), h: num(s[1]!==undefined?s[1]:s.height) }; } catch(e){ return null; } }
-      function elInfo(el, idx, winIdx, path){
-        return {
-          index: idx, path: path, windowIndex: winIdx,
-          role: g(function(){ return String(el.role()); }),
-          subrole: g(function(){ var s = el.subrole(); return s ? String(s) : null; }),
-          label: g(function(){ var t = el.title(); if(t) return String(t); var n = el.name(); if(n) return String(n); var h = el.help(); return h ? String(h) : null; }),
-          value: g(function(){ var v = el.value(); if (v===null||v===undefined) return null; var s = String(v); return s.length>120? s.slice(0,120)+'…' : s; }),
-          enabled: g(function(){ return !!el.enabled(); }),
-          focused: g(function(){ return !!el.focused(); }),
-          position: pt(function(){ return el.position(); }),
-          size: sz(function(){ return el.size(); }),
-          actions: g(function(){ return el.actions().map(function(a){ return String(a.name()); }); }) || []
-        };
-      }
-  `;
-
-  async function findProcess(ref) {
-    return jxa(`${JXA_PRELUDE}
-      var se = Application('System Events');
-      var procs = se.applicationProcesses.js ? se.applicationProcesses : se.applicationProcesses;
-      var found = null;
-      var list = se.applicationProcesses();
-      for (var i=0;i<list.length;i++){
-        var p = list[i];
-        if (P.pid != null && num(function(){ return p.unixId(); }) === P.pid){ found = p; break; }
-        if (P.bundle_id){ var b = g(function(){ return String(p.bundleIdentifier()); }); if (b && b.toLowerCase()===P.bundle_id.toLowerCase()){ found = p; break; } }
-        if (P.name){ var n = g(function(){ return String(p.name()); }); if (n && n.toLowerCase()===P.name.toLowerCase()){ found = p; break; } }
-      }
-      if (!found) { return JSON.stringify({found:false}); }
-      else {
-        return JSON.stringify({ found: true, name: g(function(){return String(found.name());}), pid: num(function(){return found.unixId();}),
-          bundle_id: g(function(){ var b = found.bundleIdentifier(); return b? String(b): null; }),
-          frontmost: g(function(){ return !!found.frontmost(); }),
-          windows: (function(){ var out=[]; var ws = g(function(){ return found.windows(); }) || [];
-            for (var i=0;i<ws.length;i++){ out.push({ index:i, title: g(function(){ var t = ws[i].name(); return t? String(t): null; })(),
-              subrole: g(function(){ var s = ws[i].subrole(); return s? String(s): null; })(),
-              position: pt(function(){ return ws[i].position(); }), size: sz(function(){ return ws[i].size(); }) }); }
-            return out; })() });
-      }
-    }`, ref);
+  async function native(tool, args = {}) {
+    const helper = await nativeHelper();
+    const r = await runL(helper, [JSON.stringify({ tool, args: { ...args, input_app_ref: state.inputApp } })], { timeoutMs: 20_000 });
+    if (r.code !== 0) throw new ExecError(r.stderr.trim() || "native accessibility helper failed", r);
+    const result = tryJson(r.stdout, null);
+    if (state.previewEnabled && ["type", "key_event", "pointer_sequence", "set_value", "select_text", "perform_action", "hit_test"].includes(tool)) {
+      try { await updatePreview(); } catch (error) { result.preview_error = error.message; }
+    }
+    return result;
   }
 
-  async function walkTree(appRef, depth = 8, maxElements = 400) {
-    return jxa(`${JXA_PRELUDE}
-      var se = Application('System Events');
-      var procs = se.applicationProcesses();
-      var found = null;
-      for (var i=0;i<procs.length;i++){
-        var p = procs[i];
-        if (P.pid != null && num(function(){ return p.unixId(); }) === P.pid){ found = p; break; }
-        if (P.bundle_id){ var b = g(function(){ return String(p.bundleIdentifier()); }); if (b && b.toLowerCase()===P.bundle_id.toLowerCase()){ found = p; break; } }
-        if (P.name){ var n = g(function(){ return String(p.name()); }); if (n && n.toLowerCase()===P.name.toLowerCase()){ found = p; break; } }
-      }
-      if (!found) { return JSON.stringify({found:false}); }
-      else {
-        var elements = [];
-        var truncated = false;
-        function descend(el, winIdx, path, d){
-          if (elements.length >= P.maxElements || d > P.depth){ if (d > P.depth) truncated = true; return; }
-          var info = elInfo(el, elements.length, winIdx, path);
-          elements.push(info);
-          var kids = g(function(){ return el.uiElements(); }) || [];
-          for (var k=0;k<kids.length;k++) descend(kids[k], winIdx, path.concat(k), d+1);
-        }
-        var ws = g(function(){ return found.windows(); }) || [];
-        var winLimit = (P.window_id != null) ? [P.window_id] : null;
-        for (var w=0; w<ws.length; w++){
-          if (winLimit && winLimit.indexOf(w) === -1) continue;
-          descend(ws[w], w, [], 0);
-        }
-        return JSON.stringify({ found: true,
-          name: g(function(){return String(found.name());}), pid: num(function(){return found.unixId();}),
-          bundle_id: g(function(){ var b=found.bundleIdentifier(); return b? String(b): null; }),
-          frontmost: g(function(){ return !!found.frontmost(); }),
-          truncated: truncated, elements: elements });
-      }
-    }`, { ...appRef, depth, maxElements }, 30_000);
+  async function updatePreview(show = false) {
+    const win = await native("window_info", { app_ref: state.inputApp });
+    const dir = path.join(os.homedir(), ".codewhale-cu", "preview");
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    const temp = path.join(dir, "next.png"), file = path.join(dir, "latest.png");
+    const r = await runL("screencapture", ["-x", "-o", "-l", String(win.window_id), "-t", "png", temp], { timeoutMs: 8000 });
+    if (r.code !== 0) throw new ExecError(`background preview capture failed: ${r.stderr}`);
+    fs.renameSync(temp, file);
+    const p = state.pointer;
+    await native("preview_notify", { enabled: true, show, title: `Codewhale · ${win.name}`, x: p ? (p.x-win.points.x)/win.points.w : -1, y: p ? (p.y-win.points.y)/win.points.h : -1 });
+    return { enabled: true, file, app: state.inputApp, pointer: p };
   }
 
-  async function resolveElementPath(appRef, windowIndex, pathArr) {
-    return jxa(`${JXA_PRELUDE}
-      var se = Application('System Events');
-      var procs = se.applicationProcesses();
-      var found = null;
-      for (var i=0;i<procs.length;i++){
-        var p = procs[i];
-        if (P.pid != null && num(function(){ return p.unixId(); }) === P.pid){ found = p; break; }
-        if (P.bundle_id){ var b = g(function(){ return String(p.bundleIdentifier()); }); if (b && b.toLowerCase()===P.bundle_id.toLowerCase()){ found = p; break; } }
-        if (P.name){ var n = g(function(){ return String(p.name()); }); if (n && n.toLowerCase()===P.name.toLowerCase()){ found = p; break; } }
-      }
-      if (!found) { return JSON.stringify({found:false}); }
-      else {
-        var ws = g(function(){ return found.windows(); }) || [];
-        if (!(P.windowIndex >= 0) || P.windowIndex >= ws.length){ return JSON.stringify({found:true, element:false, reason:"window_index_missing"}); }
-        else {
-          var el = ws[P.windowIndex]; var ok = true;
-          for (var k=0;k<P.path.length;k++){
-            var kids = g(function(){ return el.uiElements(); }) || [];
-            if (P.path[k] >= kids.length){ ok = false; break; }
-            el = kids[P.path[k]];
-          }
-          if (!ok) return JSON.stringify({found:true, element:false, reason:"element_stale"});
-          else {
-            var info = elInfo(el, 0, P.windowIndex, P.path);
-            info.app = { name: g(function(){return String(found.name());}), pid: num(function(){return found.unixId();}) };
-            return JSON.stringify({ found:true, element:true, element: info });
-          }
-        }
-      }
-    }`, { ...appRef, windowIndex, path: pathArr }, 30_000);
-  }
-
-  async function elementAction(appRef, windowIndex, pathArr, action) {
-    return jxa(`${JXA_PRELUDE}
-      var se = Application('System Events');
-      var procs = se.applicationProcesses();
-      var found = null;
-      for (var i=0;i<procs.length;i++){
-        var p = procs[i];
-        if (P.pid != null && num(function(){ return p.unixId(); }) === P.pid){ found = p; break; }
-        if (P.bundle_id){ var b = g(function(){ return String(p.bundleIdentifier()); }); if (b && b.toLowerCase()===P.bundle_id.toLowerCase()){ found = p; break; } }
-        if (P.name){ var n = g(function(){ return String(p.name()); }); if (n && n.toLowerCase()===P.name.toLowerCase()){ found = p; break; } }
-      }
-      if (!found) { return JSON.stringify({ok:false, code:"app_not_found"}); }
-      else {
-        var ws = g(function(){ return found.windows(); }) || [];
-        if (!(P.windowIndex >= 0) || P.windowIndex >= ws.length){ return JSON.stringify({ok:false, code:"element_stale"}); }
-        else {
-          var el = ws[P.windowIndex]; var ok = true;
-          for (var k=0;k<P.path.length;k++){
-            var kids = g(function(){ return el.uiElements(); }) || [];
-            if (P.path[k] >= kids.length){ ok = false; break; }
-            el = kids[P.path[k]];
-          }
-          if (!ok){ return JSON.stringify({ok:false, code:"element_stale"}); }
-          else {
-            var done = false, err = null;
-            try {
-              if (P.kind === 'action'){ el.actions.byName(P.action).perform(); done = true; }
-              else if (P.kind === 'set_value'){ el.value = P.value; done = true; }
-              else if (P.kind === 'select_text'){
-                el.attributes.byName('AXSelectedTextRange').value = { loc: P.range[0], len: P.range[1] };
-                done = true;
-              }
-              else { err = 'unknown_kind'; }
-            } catch(e){ err = String(e); }
-            return JSON.stringify({ ok: done && !err, code: err || 'sent', sent: done,
-              element: { role: g(function(){ return String(el.role()); })(), label: g(function(){ var t=el.title(); return t?String(t):(el.name()?String(el.name()):null); })() } });
-          }
-        }
-      }
-    }`, { ...appRef, windowIndex, path: pathArr, kind: action.kind, action: action.action, value: action.value, range: action.range }, 30_000);
-  }
-
-  // ---------- raw input via CGEvent ----------
-  // Every caller hands its values as `payload`; the script reads them as `P`.
-  // The old `(script, timeoutMs)` shape silently swallowed the payload (so
-  // `P.code`, `P.x`, `P.text` were undefined) and coerced the object to a
-  // zero timeout, which is why every CGEvent input on macOS reported
-  // "osascript timed out" instantly (#5917).
-  async function cg(script, payload = {}, timeoutMs = 10_000) {
-    return jxa(`ObjC.import('CoreGraphics');
-      function run(argv){ var P = JSON.parse(argv[0]);
-        ${script}
-      }`, payload, timeoutMs);
-  }
-
-  async function postMouseEvent(type, x, y, button, clickState) {
-    return cg(`var pt = { x: P.x, y: P.y };
-      var ev = $.CGEventCreateMouseEvent($(), P.type, pt, P.button);
-      if (P.clickState > 1) $.CGEventSetIntegerValueField(ev, $.kCGMouseEventClickState, P.clickState);
-      $.CGEventPost($.kCGHIDEventTap, ev);
-      return JSON.stringify({ ok: true, x: P.x, y: P.y, type: P.type, button: P.button });`,
-      { type, x, y, button, clickState });
-  }
-
+  // ---------- pointer input ----------
+  // macOS delivers keyboard events to a chosen process, but not pointer or
+  // scroll events: those are dropped unless they go through the shared event
+  // tap, which moves the user's real cursor. So the pointer path is:
+  //   1. accessibility action on the element under the point (quiet, exact),
+  //   2. otherwise a global gesture that is refused unless the bound
+  //      application owns the window under the point, and that puts the
+  //      cursor back where it was.
+  // Every receipt says which of the two happened.
   function mouseName(button) { return { left: "left", right: "right", middle: "middle" }[button] ?? "left"; }
 
   function assertInScreen(x, y) {
     if (!Number.isFinite(x) || !Number.isFinite(y)) throw new ExecError("coordinates must be finite numbers");
   }
 
-  async function pointerClick(button, x, y, clicks) {
-    assertInScreen(x, y);
-    const m = MOUSE[button] ?? MOUSE.left;
-    await postMouseEvent(m.dragged, x, y, button === "middle" ? 2 : button === "right" ? 1 : 0, clicks);
-    await postMouseEvent(m.down, x, y, button === "middle" ? 2 : button === "right" ? 1 : 0, clicks);
-    await postMouseEvent(m.up, x, y, button === "middle" ? 2 : button === "right" ? 1 : 0, clicks);
-    return { action_sent: true, strategy: "event", at: { x, y }, button, clicks };
+  function buttonCode(button) { return button === "middle" ? 2 : button === "right" ? 1 : 0; }
+
+  /** Refuse a global gesture whose landing point belongs to another application. */
+  async function assertOwnsPoint(x, y) {
+    if (!state.inputApp) throw new ExecError("open_application first to choose which application receives input");
+    const w = await native("window_at_point", { x, y });
+    if (!w?.found) throw new ExecError(`no window at (${x}, ${y}) — take a fresh screenshot and choose a point inside the target window`);
+    if (w.owner_pid !== state.inputApp.pid) {
+      throw new ExecError(`(${x}, ${y}) is covered by a window owned by ${w.owner_name || "another application"} (pid ${w.owner_pid}), not the application input is bound to — raise the window you meant with open_application(activate:true), observe again, or use an element target`);
+    }
+    return w;
   }
 
-  async function keyEvent(code, flags, down) {
-    return cg(`var ev = $.CGEventCreateKeyboardEvent($(), P.code, P.down);
-      if (P.flags) $.CGEventSetFlags(ev, P.flags);
-      $.CGEventPost($.kCGHIDEventTap, ev);
-      return JSON.stringify({ ok: true, code: P.code, down: P.down });`, { code, flags, down });
+  /** What a global gesture cost the user: their cursor, and briefly their foreground. */
+  function pointerCost(r) {
+    return {
+      pointer_moved: true,
+      pointer_restored: !!r?.restored,
+      foreground_taken: !!r?.foreground_taken,
+      ...(r?.foreground_before ? { foreground_before: r.foreground_before } : {}),
+      ...(r?.foreground_after ? { foreground_after: r.foreground_after } : {}),
+    };
   }
+
+  async function gesture(steps, { restore = true, guard = null } = {}) {
+    if (guard) await assertOwnsPoint(guard.x, guard.y);
+    const r = await native("pointer_sequence", { steps, restore });
+    const last = [...steps].reverse().find((s) => s.x != null);
+    if (last) state.pointer = { x: last.x, y: last.y };
+    return r;
+  }
+
+  function clickSteps(button, x, y, clicks) {
+    const m = MOUSE[button] ?? MOUSE.left;
+    const b = buttonCode(button);
+    const steps = [{ type: MOUSE_MOVED, x, y, button: b, clickState: 0 }];
+    for (let i = 1; i <= clicks; i++) {
+      steps.push({ type: m.down, x, y, button: b, clickState: i });
+      steps.push({ type: m.up, x, y, button: b, clickState: i });
+    }
+    return steps;
+  }
+
+  /**
+   * Coordinate pointer click. A left single click is first hit-tested against
+   * the bound application's accessibility tree: when the point names a
+   * pressable element we perform its semantic action, which needs no pointer
+   * and no foreground. strategy="a11y" requires that and fails closed;
+   * strategy="event" goes straight to the guarded global gesture.
+   */
+  async function pointerClick(button, x, y, clicks, strategy = "auto") {
+    assertInScreen(x, y);
+    if (!["auto", "a11y", "event"].includes(strategy)) throw new ExecError(`strategy must be auto, a11y or event (got ${JSON.stringify(strategy)})`);
+    let a11yReason = null;
+    if (strategy !== "event" && button === "left" && clicks === 1) {
+      const hit = await native("hit_test", { x, y, perform: true });
+      if (hit?.action_sent) {
+        return { action_sent: true, strategy: "a11y", action: hit.action, pointer_moved: false, at: { x, y }, button, clicks,
+                 element: { role: hit.element?.role ?? null, label: hit.element?.label ?? null } };
+      }
+      a11yReason = hit?.reason ?? "not_found";
+      if (strategy === "a11y") {
+        throw new ExecError(`no pressable accessibility element at (${x}, ${y}) in the bound application (${a11yReason}) — observe again or use strategy "event"`);
+      }
+    } else if (strategy === "a11y") {
+      throw new ExecError(`strategy "a11y" is only available for a left single click on this backend; ${mouseName(button)} x${clicks} has no accessibility equivalent`);
+    }
+    const r = await gesture(clickSteps(button, x, y, clicks), { restore: true, guard: { x, y } });
+    return { action_sent: true, strategy: "event", at: { x, y }, button, clicks, ...pointerCost(r),
+             ...(a11yReason ? { a11y_reason: a11yReason } : {}) };
+  }
+
+  async function keyEvent(code, flags, down) { return native("key_event", { code, flags, down }); }
 
   function parseChord(text) {
     const parts = String(text).split("+").map((s) => s.trim().toLowerCase()).filter(Boolean);
@@ -292,48 +190,24 @@ export function create({ exec }) {
   }
 
   // ---------- displays ----------
-  async function displayInfo() {
-    const r = await runL("system_profiler", ["SPDisplaysDataType", "-json"], { timeoutMs: 25_000 });
-    const j = tryJson(r.stdout, null);
-    const items = j?.SPDisplaysDataType?.flatMap?.((g) => g.spdisplays_ndrvs ?? []) ?? [];
-    // Main-display point geometry via Finder (pure AppleScript — JXA cannot
-    // bridge C functions that return structs like CGRect).
-    const bounds = await runL("osascript", ["-e", 'tell application "Finder" to get bounds of window of desktop'], { timeoutMs: 12_000 }).then((x) =>
-      x.code === 0 ? x.stdout.trim().split(",").map((n) => Number(n.trim())) : null).catch(() => null);
-    return items.map((d, i) => {
-      const res = (d._spdisplays_resolution ?? "").match(/(\d+)\s*x\s*(\d+)/) ?? [null, null, null];
-      return {
-        index: i + 1,
-        id: d._spdisplays_display_id ?? null,
-        name: d._name ?? `Display ${i + 1}`,
-        pixels: { w: Number(res[1]) || null, h: Number(res[2]) || null },
-        main: String(d.spdisplays_main ?? "n").toLowerCase() === "y" || i === 0,
-      };
-    }).map((d, i) => ({
-      ...d,
-      // Point geometry is only precisely known for the main display; other
-      // displays get best-effort placement to the right of the main display.
-      points: i === 0 && bounds && bounds.length === 4
-        ? { x: bounds[0], y: bounds[1], w: bounds[2] - bounds[0], h: bounds[3] - bounds[1] }
-        : { x: null, y: null, w: null, h: null },
-      scale: d.pixels.w && i === 0 && bounds?.length === 4 && bounds[2] - bounds[0] > 0
-        ? +(d.pixels.w / (bounds[2] - bounds[0])).toFixed(3) : 1,
-    }));
-  }
+  async function displayInfo() { return native("displays"); }
 
   // ---------- screenshots ----------
   function recordingsDir() {
     return process.env.CODEWHALE_CU_RECORDINGS_DIR || path.join(os.homedir(), ".codewhale-cu", "recordings");
   }
 
-  async function screenshot({ display, region, path: outPath } = {}) {
+  async function screenshot({ display, region, app_ref, path: outPath } = {}) {
     const dir = recordingsDir();
     fs.mkdirSync(dir, { recursive: true });
     const file = outPath || path.join(dir, `shot-${new Date().toISOString().replace(/[:.]/g, "-")}-${crypto.randomBytes(3).toString("hex")}.png`);
     if (!/\.png$/.test(file)) throw new ExecError("screenshot path must end in .png");
     const args = ["-x", "-t", "png"];
     const disp = display ?? state.activeDisplay;
-    if (disp && disp !== "all") args.push("-D", String(disp));
+    const window = app_ref ? await native("window_info", { app_ref }) : null;
+    if (window && region) throw new ExecError("choose app_ref or region, not both");
+    if (window) args.push("-o", "-l", String(window.window_id));
+    else if (disp && disp !== "all") args.push("-D", String(disp));
     if (region) {
       if (!region.every((n) => Number.isFinite(n) && n >= 0) || region.length !== 4) {
         throw new ExecError("region must be [x, y, w, h] in screen points");
@@ -342,41 +216,41 @@ export function create({ exec }) {
     }
     args.push(file);
     const r = await runL("screencapture", args, { timeoutMs: 20_000 });
-    if (r.code !== 0) {
-      const detail = r.stderr.trim().slice(0, 300);
-      // This is what screencapture says when the display is locked, asleep, or
-      // the session is not the console user — not a permission problem
-      // (without the Screen Recording grant it exits 0 and omits windows).
-      const remedy = /could not create image/i.test(detail)
-        ? " — the display is locked, asleep, or this session is not at the console; unlock or wake it and retry"
-        : "";
-      throw new ExecError(`screencapture exited ${r.code}: ${detail}${remedy}`, r);
-    }
+    if (r.code !== 0) throw new ExecError(`screencapture exited ${r.code}: ${r.stderr.trim().slice(0, 300)}`, r);
     const stat = fs.statSync(file);
     const displays = await displayInfo();
     const d = displays.find((x) => x.index === (disp === "all" ? 1 : disp)) ?? displays[0];
+    const scale = d?.scale ?? 1;
     state.lastRaster = {
       file,
       bytes: stat.size,
       display: disp ?? 1,
-      points: d?.points ?? null,
-      pixels: d?.pixels ?? null,
+      // Region and window rasters describe that rect, not the whole display.
+      // The PNG header is the pixel ground truth; scale is derived from
+      // pixels/points below so Retina and mixed-DPI stay exact.
+      points: window?.points ?? (region ? { x: region[0], y: region[1], w: region[2], h: region[3] } : d?.points ?? null),
+      pixels: (() => { const header = fs.readFileSync(file); return { w: header.readUInt32BE(16), h: header.readUInt32BE(20) }; })(),
       scale: d?.scale ?? 1,
       capturedAt: new Date().toISOString(),
     };
+    if (state.lastRaster.points?.w) state.lastRaster.scale = state.lastRaster.pixels.w / state.lastRaster.points.w;
     return { ...state.lastRaster, path: file };
   }
 
   async function zoom({ source, region, path: outPath }) {
     if (!source && !state.lastRaster) throw new ExecError("no screenshot taken yet on this computer — call screenshot first");
     const [x, y, w, h] = region;
-    if (![x, y, w, h].every((n) => Number.isFinite(n) && n >= 0)) throw new ExecError("region must be [x, y, w, h] in last-raster pixels");
+    if (![x, y, w, h].every((n) => Number.isInteger(n) && n >= 0) || !w || !h || x + w > state.lastRaster.pixels.w || y + h > state.lastRaster.pixels.h) throw new ExecError("region must be [x, y, w, h] in last-raster pixels");
     const src = source ?? state.lastRaster.file;
     const dir = recordingsDir();
     fs.mkdirSync(dir, { recursive: true });
     const out = outPath || path.join(dir, `zoom-${crypto.randomBytes(4).toString("hex")}.png`);
     await runOk("sips", ["-s", "format", "png", "-c", String(Math.round(h)), String(Math.round(w)), "--cropOffset", String(Math.round(y)), String(Math.round(x)), src, "--out", out], { timeoutMs: 15_000 });
-    return { file: out, bytes: fs.statSync(out).size, source: src, region, scale: state.lastRaster.scale };
+    const parent = state.lastRaster;
+    state.lastRaster = { file: out, bytes: fs.statSync(out).size, source: src, region,
+      points: { x: (parent.points?.x ?? 0) + x / parent.scale, y: (parent.points?.y ?? 0) + y / parent.scale, w: w / parent.scale, h: h / parent.scale },
+      pixels: { w, h }, scale: parent.scale, capturedAt: new Date().toISOString() };
+    return state.lastRaster;
   }
 
   // ---------- recording ----------
@@ -387,50 +261,55 @@ export function create({ exec }) {
     fs.mkdirSync(dir, { recursive: true });
     const id = crypto.randomBytes(4).toString("hex");
     const file = path.join(dir, `rec-${id}.mov`);
-    const args = ["-v", "-x"];
-    const disp = display ?? state.activeDisplay;
-    if (disp && disp !== "all") args.push("-D", String(disp));
-    if (durationSec) args.push("-V", String(Math.max(1, Math.round(durationSec))));
-    if (region) args.unshift("-R", region.join(","));
-    args.push(file);
-    const child = spawn("screencapture", args, { stdio: "ignore", detached: true });
-    child.unref();
-    const startedAt = new Date().toISOString();
-    rec.set(id, { pid: child.pid, file, startedAt, mode: "screencapture", display: disp ?? 1 });
-    if (durationSec) {
-      const timer = setTimeout(() => rec.delete(id), (Math.round(durationSec) + 10) * 1000);
-      timer.unref?.();
-    }
-    await new Promise((res) => setTimeout(res, 400));
-    try { process.kill(child.pid, 0); } catch {
-      rec.delete(id);
-      throw new ExecError("screencapture -v exited immediately — screen recording permission (Screen & System Recording) is likely missing for the host terminal");
-    }
-    return { id, pid: child.pid, file, display: disp ?? 1, durationSec: durationSec ?? null, region: region ?? null, fps: "device-default", startedAt };
+    const displays=await displayInfo();
+    const disp=display ?? state.activeDisplay;
+    const selected=displays.find(d=>d.index===disp);
+    if(!selected) throw new ExecError("choose one available display for recording");
+    if(durationSec!=null && (!Number.isFinite(durationSec) || durationSec<=0)) throw new ExecError("durationSec must be positive");
+    const helper=await nativeHelper();
+    const child=spawn(helper,[JSON.stringify({tool:"record",args:{file,displayID:selected.id,region,durationSec}})],{stdio:["ignore","pipe","pipe"]});
+    const startedAt=new Date().toISOString();
+    let stderr="", output="", ready=false;
+    const completion=new Promise(resolve=>{
+      child.once("error",error=>resolve({code:-1,error:error.message}));
+      child.once("close",code=>resolve({code,error:stderr.trim()}));
+    });
+    child.stderr.on("data",chunk=>{stderr=(stderr+chunk).slice(-4000);});
+    const readyPromise=new Promise((resolve,reject)=>{
+      const timer=setTimeout(()=>{child.kill("SIGTERM");reject(new ExecError("screen recorder startup timed out"));},20000);
+      child.stdout.on("data",chunk=>{
+        output+=chunk;
+        let i;
+        while((i=output.indexOf("\n"))>=0){
+          const line=output.slice(0,i);output=output.slice(i+1);
+          try { if(JSON.parse(line).ready){ready=true;clearTimeout(timer);resolve();} } catch {}
+        }
+      });
+      completion.then(result=>{clearTimeout(timer);if(!ready)reject(new ExecError(result.error || "screen recorder exited before capture started"));});
+    });
+    await readyPromise;
+    rec.set(id,{child,completion,pid:child.pid,file,startedAt,mode:"ScreenCaptureKit",display:disp});
+    return {id,pid:child.pid,file,display:disp,durationSec:durationSec??null,region:region??null,fps:30,mode:"ScreenCaptureKit",startedAt};
   }
 
   async function recordingStop({ id }) {
-    const r = rec.get(id);
-    if (!r) throw new ExecError(`unknown or already-finished recording "${id}" (recording_status/recording_list shows current state)`);
-    let mp4 = null;
-    try { process.kill(r.pid, "SIGINT"); } catch {}
-    await new Promise((res) => setTimeout(res, 1500));
-    const ffmpeg = await import("../exec.mjs").then((m) => m.have("ffmpeg"));
-    if (ffmpeg && fs.existsSync(r.file)) {
-      const out = r.file.replace(/\.mov$/, ".mp4");
-      const rr = await runL("ffmpeg", ["-y", "-loglevel", "error", "-i", r.file, "-c", "copy", out], { timeoutMs: 120_000 });
-      if (rr.code === 0) mp4 = out;
-    }
-    const size = fs.existsSync(r.file) ? fs.statSync(r.file).size : 0;
+    const r=rec.get(id);
+    if(!r) throw new ExecError(`unknown or already-finished recording "${id}"`);
+    if(r.child.exitCode==null && r.child.signalCode==null) r.child.kill("SIGINT");
+    let timer;
+    const result=await Promise.race([r.completion,new Promise(resolve=>{timer=setTimeout(()=>resolve({code:-1,error:"screen recorder finalization timed out; recording retained for retry"}),20000);})]);
+    clearTimeout(timer);
+    if(result.code!==0) throw new ExecError(result.error || "screen recorder failed; partial file retained");
+    const size=fs.existsSync(r.file)?fs.statSync(r.file).size:0;
+    if(!size) throw new ExecError("screen recorder produced no video");
     rec.delete(id);
-    return { id, file: r.file, mp4, bytes: size, startedAt: r.startedAt, stoppedAt: new Date().toISOString() };
+    return {id,file:r.file,mp4:null,bytes:size,mode:r.mode,startedAt:r.startedAt,stoppedAt:new Date().toISOString()};
   }
 
   async function recordingStatus({ id }) {
     const r = rec.get(id);
     if (!r) return { id, running: false };
-    let alive = true;
-    try { process.kill(r.pid, 0); } catch { alive = false; }
+    const alive = r.child.exitCode == null && r.child.signalCode == null;
     return { id, running: alive, pid: r.pid, file: r.file, bytes: fs.existsSync(r.file) ? fs.statSync(r.file).size : 0, startedAt: r.startedAt };
   }
 
@@ -447,86 +326,41 @@ export function create({ exec }) {
   }
 
   // ---------- apps / windows ----------
-  async function listApps() {
-    return jxa(`${JXA_PRELUDE}
-      var se = Application('System Events');
-      var procs = se.applicationProcesses();
-      var out = [];
-      for (var i=0;i<procs.length;i++){
-        var p = procs[i];
-        var bg = g(function(){ return !!p.backgroundOnly(); });
-        var name = g(function(){ return String(p.name()); });
-        var wins = g(function(){ return p.windows(); });
-        out.push({ name: name, pid: num(function(){ return p.unixId(); }),
-          bundle_id: g(function(){ var b = p.bundleIdentifier(); return b? String(b): null; }),
-          frontmost: g(function(){ return !!p.frontmost(); }),
-          hidden: g(function(){ return !!p.hidden(); }),
-          windowCount: wins ? wins.length : 0 });
-      }
-      return JSON.stringify({ apps: out });
-    }`, {}, 25_000);
-  }
+  async function listApps() { return native("list_apps"); }
 
-  // Which app owns the keyboard right now. Raw CGEvents go to it no matter
-  // what the caller meant (#5927), so every input receipt names it.
-  async function frontmostApp() {
-    const r = await jxa(`${JXA_PRELUDE}
-      var se = Application('System Events');
-      var list = se.applicationProcesses.whose({ frontmost: true })();
-      if (!list.length) return JSON.stringify({ found: false });
-      var p = list[0];
-      return JSON.stringify({ found: true, name: g(function(){ return String(p.name()); }), pid: num(function(){ return p.unixId(); }),
-        bundle_id: g(function(){ var b = p.bundleIdentifier(); return b ? String(b) : null; }) });
-    }`, { probe: "frontmost-app" }, 8_000);
-    return r && r.found ? { name: r.name, pid: r.pid, bundle_id: r.bundle_id } : null;
-  }
-
-  // Refuse to post keystrokes when the app the caller named is not the one
-  // that would receive them. Returns the frontmost app for the receipt.
-  async function guardInput(appRef) {
-    const front = await frontmostApp().catch(() => null);
-    if (!appRef) return front;
-    const target = await findProcess(appRef);
-    if (!target.found) throw new ExecError("application not found — call list_apps for exact names/pids");
-    if (!front || front.pid !== target.pid) {
-      throw new ExecError(`refusing to send input: "${target.name}" is not frontmost${front ? ` ("${front.name}" is)` : ""}; bring it forward first with open_application { activate: true } or click into it`);
-    }
-    return front;
-  }
-
-  async function listWindows(appRef) {
-    const p = await findProcess(appRef ?? {});
-    if (!p.found) throw new ExecError("application not found — call list_apps for exact names/pids");
-    return { app: { name: p.name, pid: p.pid, bundle_id: p.bundle_id }, windows: p.windows };
-  }
+  async function listWindows(appRef) { return native("list_windows", { app_ref: appRef }); }
 
   async function openApplication({ name, bundle_id: bid, pid, url: urlArg, activate = false } = {}) {
-    if (!name && !bid) throw new ExecError("open_application needs name or bundle_id");
-    const args = [];
-    if (urlArg) args.push(urlArg);
-    if (bid) args.unshift("-b", bid); else args.unshift("-a", name);
-    if (activate) args.unshift("-F");
-    const r = await runL("open", args, { timeoutMs: 25_000 });
-    if (r.code !== 0) throw new ExecError(`open failed: ${r.stderr.trim().slice(0, 200)}`, r);
+    if (!name && !bid && !pid) throw new ExecError("open_application needs name, bundle_id or pid");
+    // pid is the most specific identity and the only one that separates two
+    // processes of the same bundle (e.g. a second Chrome on its own profile),
+    // so it wins when given.
     const find = {};
-    if (bid) find.bundle_id = bid; else if (pid) find.pid = pid; else find.name = String(name).replace(/\.app$/, "");
-    // `open -F` returns before the app is in front. Wait for the process to
-    // exist and, when activation was asked for, to actually be frontmost;
-    // otherwise the next keystroke lands in whatever app is (#5927).
-    let p = null;
-    for (let attempt = 0; attempt < 10; attempt++) {
-      await new Promise((res) => setTimeout(res, 300));
-      p = await findProcess(find).catch(() => null);
-      if (p?.found && (!activate || p.frontmost)) break;
+    if (pid) find.pid = pid; else if (bid) find.bundle_id = bid; else find.name = String(name).replace(/\.app$/, "");
+    let p;
+    // Binding an already-running app must not ask LaunchServices to reopen
+    // it: reopen can raise windows even with open -g on some applications.
+    if (!urlArg) {
+      try { p = await native("app_info", { app_ref: find, activate }); }
+      catch (error) {
+        if (!error.message.includes("application not found")) throw error;
+      }
     }
-    const resolved = p?.found ? { name: p.name, pid: p.pid, bundle_id: p.bundle_id, frontmost: !!p.frontmost } : null;
-    const frontmost = !!resolved?.frontmost;
-    const note = activate && !frontmost
-      ? (resolved
-        ? `"${resolved.name}" is running but did not come to the front within 3 s; keystrokes would go to another app — retry activation or click into its window before typing`
-        : `the app did not appear within 3 s of \`open\`; call list_apps to see what is running`)
-      : undefined;
-    return { launched: true, activate, frontmost, pid: resolved?.pid ?? null, url: urlArg ?? null, resolved, ...(note ? { note } : {}) };
+    if (!p?.found) {
+      if (!name && !bid) throw new ExecError(`no running application with pid ${pid}; call list_apps for the current processes`);
+      const args = [];
+      if (urlArg) args.push(urlArg);
+      if (bid) args.unshift("-b", bid); else args.unshift("-a", name);
+      if (!activate) args.unshift("-g");
+      const r = await runL("open", args, { timeoutMs: 25_000 });
+      if (r.code !== 0) throw new ExecError(`open failed: ${r.stderr.trim().slice(0, 200)}`, r);
+      await new Promise((res) => setTimeout(res, 600));
+      p = await native("app_info", { app_ref: find, activate });
+    }
+    // A bare executable has no bundle id; carrying an empty one would make the
+    // identity unmatchable.
+    state.inputApp = { pid: p.pid, ...(p.bundle_id ? { bundle_id: p.bundle_id } : {}) };
+    return { launched: true, activate, url: urlArg ?? null, resolved: p?.found ? { name: p.name, pid: p.pid, bundle_id: p.bundle_id, frontmost: p.frontmost } : null };
   }
 
   // ---------- clipboard / cursor / waits ----------
@@ -540,112 +374,28 @@ export function create({ exec }) {
     await new Promise((res, rej) => { child.on("close", res); child.on("error", rej); });
     return { written: String(text ?? "").length };
   }
-  async function cursorPosition() {
-    // Quartz (pyobjc) first — JXA cannot bridge CGEventGetLocation's CGPoint.
-    const py = `from Quartz import CGEventCreate
-l = CGEventCreate(None).location
-print('{\"x\": %d, \"y\": %d}' % (l.x, l.y))`;
-    const r = await runL("python3", ["-c", py], { timeoutMs: 8_000 });
-    if (r.code === 0) {
-      const j = tryJson(r.stdout.trim(), null);
-      if (j && Number.isFinite(j.x)) return { x: j.x, y: j.y };
-    }
-    const cc = await runL("cliclick", ["p"], { timeoutMs: 8_000 });
-    if (cc.code === 0) {
-      const m = /(-?\d+)\s*,\s*(-?\d+)/.exec(cc.stdout.trim());
-      if (m) return { x: Number(m[1]), y: Number(m[2]) };
-    }
-    throw new ExecError("cursor position needs python3 with pyobjc (Quartz) or cliclick on PATH");
-  }
+  async function cursorPosition() { return native("cursor_position"); }
 
   // ---------- probe ----------
-  const TCC_FIX = {
-    accessibility: "System Settings → Privacy & Security → Accessibility → enable the host app, then relaunch it",
-    screen_recording: "System Settings → Privacy & Security → Screen & System Audio Recording → enable the host app, then relaunch it",
-  };
-  // TCC attributes grants to the .app that owns this process tree (the
-  // terminal or IDE hosting the engine), never to node or osascript. Name it so
-  // the remedy says which row to flip.
-  async function hostAppName() {
-    if (state.hostApp !== undefined) return state.hostApp;
-    // Keep the outermost bundle: framework binaries also live inside an .app
-    // (python3 runs from Python.app), but TCC holds the launching app
-    // responsible for everything under it.
-    let pid = process.ppid;
-    let found = null;
-    for (let depth = 0; depth < 12 && pid > 1; depth++) {
-      const r = await runL("ps", ["-o", "ppid=,comm=", "-p", String(pid)], { timeoutMs: 4_000 });
-      if (r.code !== 0) break;
-      const m = /^\s*(\d+)\s+(.*)$/.exec(r.stdout.trim());
-      if (!m) break;
-      const app = /([^/]+)\.app\//.exec(m[2]);
-      if (app) found = app[1];
-      pid = Number(m[1]);
-    }
-    state.hostApp = found;
-    return found;
-  }
-  async function grantTarget() {
-    const host = await hostAppName().catch(() => null);
-    return host ? `"${host}"` : "the app hosting the Codewhale engine (your terminal)";
-  }
-  // Ask TCC instead of guessing from tool presence: screencapture exits 0
-  // without the grant (it just omits windows) and osascript hangs on the
-  // prompt, so probing by running them proves nothing.
-  // The JXA bridge does not expose CGPreflightScreenCaptureAccess, so the
-  // Screen Recording state is read the way TCC enforces it: without the grant,
-  // CGWindowListCopyWindowInfo strips kCGWindowName from every other
-  // process's window. No other windows on screen means the answer is unknown.
-  async function tccState() {
-    const r = await jxa(`ObjC.import('ApplicationServices'); ObjC.import('CoreGraphics'); ObjC.import('Foundation');
-function run(){
-  const out = { accessibility: !!$.AXIsProcessTrusted(), screen_recording: null };
-  const me = $.NSProcessInfo.processInfo.processIdentifier;
-  const list = $.CGWindowListCopyWindowInfo($.kCGWindowListOptionOnScreenOnly | $.kCGWindowListExcludeDesktopElements, $.kCGNullWindowID);
-  const n = Number($.CFArrayGetCount(list));
-  let others = 0, named = 0;
-  for (let i = 0; i < n; i++) {
-    const d = ObjC.deepUnwrap(ObjC.castRefToObject($.CFArrayGetValueAtIndex(list, i)));
-    if (!d || d.kCGWindowOwnerPID === me || d.kCGWindowLayer !== 0) continue;
-    others++;
-    if (typeof d.kCGWindowName === 'string' && d.kCGWindowName.length) named++;
-  }
-  if (others > 0) out.screen_recording = named > 0;
-  return JSON.stringify(out);
-}`, {}, 8_000);
-    return r && typeof r === "object" ? r : {};
-  }
   async function probe() {
-    const caps = { screenshot: true, recording: true, accessibility_tree: true, raw_input: true, clipboard: true, displays: true };
+    const caps = { screenshot: true, recording: true, accessibility_tree: true, clipboard: true, displays: true };
     const perms = {};
-    const missing = [];
-    let tcc = {};
-    try { tcc = await tccState(); } catch (e) { perms.probe_error = String(e?.message || e).slice(0, 200); }
-    state.tcc = tcc;
-    const target = await grantTarget();
-    if (tcc.accessibility === false) {
-      perms.accessibility = "denied";
-      caps.accessibility_tree = false;
-      caps.raw_input = false;
-      missing.push("accessibility");
-    } else {
-      perms.accessibility = tcc.accessibility === true ? "granted" : "unknown";
-    }
-    if (tcc.screen_recording === false) {
-      perms.screen_recording = "denied";
-      caps.screenshot = false;
-      caps.recording = false;
-      missing.push("screen_recording");
-    } else {
-      perms.screen_recording = tcc.screen_recording === true ? "granted" : "unknown";
-    }
-    const how_to_fix = Object.fromEntries(missing.map((m) => [m, `${TCC_FIX[m]} — grant it to ${target}`]));
-    const note = missing.length
-      ? `Missing: ${missing.join(", ")}. Grants belong to ${target}, not to node or osascript. ${Object.values(how_to_fix).join(" ")}`
-      : "Raw pointer/keyboard events go to whatever is frontmost at the target point — activate the app first for click-type actions.";
-    return { platform: "darwin", capabilities: caps, permissions: perms, missing, how_to_fix, host_app: state.hostApp ?? null, note };
+    try {
+      const ax = await native("permissions");
+      perms.accessibility = ax.trusted ? "granted" : "denied";
+    } catch { perms.accessibility = "denied_or_unavailable"; }
+    caps.accessibility_tree = perms.accessibility === "granted";
+    caps.raw_input = caps.accessibility_tree;
+    try {
+      const t = os.tmpdir() + `/cu-probe-${crypto.randomBytes(3).toString("hex")}.png`;
+      const r = await runL("screencapture", ["-x", "-R0,0,2,2", "-t", "png", t], { timeoutMs: 8_000 });
+      perms.screen_capture = r.code === 0 ? "ok" : "failed";
+      try { fs.rmSync(t, { force: true }); } catch {}
+    } catch { perms.screen_capture = "failed"; }
+    caps.screenshot = perms.screen_capture === "ok";
+    caps.recording = caps.screenshot;
+    return { platform: "darwin", capabilities: caps, permissions: perms, note: "macOS does not expose Screen-Recording TCC state to CLI; a black/empty screenshot means Screen Recording permission is missing. Raw input is bound to the process selected by open_application (activate:false by default). It does not require bringing that app forward. App-specific focus behavior still requires verification." };
   }
-
 
   return {
     platform: "darwin",
@@ -660,96 +410,101 @@ function run(){
     list_apps: listApps,
     list_windows: listWindows,
     open_application: openApplication,
-    get_app_state: async ({ app_ref, detail, depth }) => {
-      const t = await walkTree(app_ref ?? {}, detail === "full" ? 12 : 8, detail === "full" ? 800 : 400);
+    get_app_state: async ({ app_ref, detail, depth, window_id }) => {
+      const t = await native("get_app_state", { app_ref, detail, window_id });
       if (!t.found) throw new ExecError("application not found — call list_apps for exact names/pids");
       return t;
     },
+    resolve_element: async ({ app_ref, windowIndex, path: pathArr } = {}) => {
+      const r = await native("resolve_element", { app_ref: app_ref ?? {}, windowIndex: windowIndex ?? 0, path: pathArr ?? [] });
+      return { found: !!r?.found, element: r?.element ?? null, reason: r?.reason ?? null };
+    },
+    preview: async ({ enabled = true } = {}) => {
+      state.previewEnabled = enabled;
+      if (!enabled) { await native("preview_notify", { enabled: false }); return { enabled: false }; }
+      if (!state.inputApp) throw new ExecError("open_application first to choose the preview app");
+      return updatePreview(true);
+    },
     screenshot,
     zoom,
-    left_click: ({ target }) => pointerClick("left", target.x, target.y, 1),
+    left_click: ({ target, strategy }) => pointerClick("left", target.x, target.y, 1, strategy ?? "auto"),
     double_click: ({ target }) => pointerClick("left", target.x, target.y, 2),
     triple_click: ({ target }) => pointerClick("left", target.x, target.y, 3),
     right_click: ({ target }) => pointerClick("right", target.x, target.y, 1),
     middle_click: ({ target }) => pointerClick("middle", target.x, target.y, 1),
     mouse_move: async ({ target }) => {
       assertInScreen(target.x, target.y);
-      await postMouseEvent(5, target.x, target.y, 0, 0);
-      return { action_sent: true, at: { x: target.x, y: target.y } };
+      // A hover has to leave the pointer where it was asked to go.
+      const r = await gesture([{ type: MOUSE_MOVED, x: target.x, y: target.y, button: 0, clickState: 0 }], { restore: false, guard: target });
+      return { action_sent: true, strategy: "event", at: { x: target.x, y: target.y }, ...pointerCost(r) };
     },
-    left_mouse_down: async ({ target }) => { assertInScreen(target.x, target.y); await postMouseEvent(MOUSE.left.down, target.x, target.y, 0, 1); return { action_sent: true }; },
+    left_mouse_down: async ({ target }) => {
+      assertInScreen(target.x, target.y);
+      const r = await gesture([
+        { type: MOUSE_MOVED, x: target.x, y: target.y, button: 0, clickState: 0 },
+        { type: MOUSE.left.down, x: target.x, y: target.y, button: 0, clickState: 1 },
+      ], { restore: false, guard: target });
+      return { action_sent: true, strategy: "event", at: { x: target.x, y: target.y }, ...pointerCost(r) };
+    },
     left_mouse_up: async ({ target }) => {
-      const loc = await cursorPosition();
-      await postMouseEvent(MOUSE.left.up, loc.x, loc.y, 0, 1);
-      return { action_sent: true };
+      const loc = target ?? state.pointer;
+      if (!loc) throw new ExecError("no agent pointer position — mouse_move or left_mouse_down first");
+      assertInScreen(loc.x, loc.y);
+      // No ownership guard: the button is already held, and the drag may have
+      // legitimately left the originating window.
+      const r = await gesture([{ type: MOUSE.left.up, x: loc.x, y: loc.y, button: 0, clickState: 1 }], { restore: false });
+      return { action_sent: true, strategy: "event", at: { x: loc.x, y: loc.y }, ...pointerCost(r) };
     },
     left_click_drag: async ({ from_target: from, to }) => {
       assertInScreen(from.x, from.y); assertInScreen(to.x, to.y);
-      await postMouseEvent(MOUSE.left.down, from.x, from.y, 0, 1);
-      const steps = 12;
-      for (let i = 1; i <= steps; i++) {
-        await new Promise((r) => setTimeout(r, 24));
-        await postMouseEvent(MOUSE.left.dragged, from.x + ((to.x - from.x) * i) / steps, from.y + ((to.y - from.y) * i) / steps, 0, 1);
+      const steps = [
+        { type: MOUSE_MOVED, x: from.x, y: from.y, button: 0, clickState: 0 },
+        { type: MOUSE.left.down, x: from.x, y: from.y, button: 0, clickState: 1, delayMs: 60 },
+      ];
+      const n = 12;
+      for (let i = 1; i <= n; i++) {
+        steps.push({ type: MOUSE.left.dragged, x: from.x + ((to.x - from.x) * i) / n, y: from.y + ((to.y - from.y) * i) / n, button: 0, clickState: 1, delayMs: 45 });
       }
-      await new Promise((r) => setTimeout(r, 60));
-      await postMouseEvent(MOUSE.left.up, to.x, to.y, 0, 1);
-      return { action_sent: true, from, to };
+      steps.push({ type: MOUSE.left.up, x: to.x, y: to.y, button: 0, clickState: 1, delayMs: 80 });
+      const r = await gesture(steps, { restore: true, guard: from });
+      return { action_sent: true, strategy: "event", from, to, ...pointerCost(r) };
     },
     scroll: async ({ target, direction = "down", amount = 5 }) => {
       assertInScreen(target.x, target.y);
-      await postMouseEvent(5, target.x, target.y, 0, 0);
       const dx = direction === "left" ? -amount : direction === "right" ? amount : 0;
       const dy = direction === "up" ? amount : direction === "down" ? -amount : 0;
-      return cg(`var ev = $.CGEventCreateScrollWheelEvent($(), 1, 2, P.dy, P.dx);
-        $.CGEventPost($.kCGHIDEventTap, ev);
-        return JSON.stringify({ ok: true });`, { dx, dy }).then(() => ({ action_sent: true, direction, amount }));
+      // A wheel sends one notch at a time. One event carrying the whole amount
+      // is clamped by the scroll view's momentum handling and moves a fraction
+      // of the distance, so emit the notches.
+      const notches = Math.max(1, Math.min(100, Math.round(amount)));
+      const steps = [{ type: MOUSE_MOVED, x: target.x, y: target.y, button: 0, clickState: 0, delayMs: 40 }];
+      for (let i = 0; i < notches; i++) {
+        steps.push({ scroll: [Math.sign(dx), Math.sign(dy)], delayMs: 15 });
+      }
+      const r = await gesture(steps, { restore: true, guard: target });
+      return { action_sent: true, strategy: "event", direction, amount, ...pointerCost(r) };
     },
-    type: async ({ text, app_ref }) => {
-      if (!text) return { action_sent: false, note: "empty text" };
-      const frontmost_app = await guardInput(app_ref);
-      const r = await cg(`var ev = $.CGEventCreateKeyboardEvent($(), 0, true);
-        $.CGEventKeyboardSetUnicodeString(ev, P.text.length, P.text);
-        $.CGEventPost($.kCGHIDEventTap, ev);
-        var ev2 = $.CGEventCreateKeyboardEvent($(), 0, false);
-        $.CGEventKeyboardSetUnicodeString(ev2, P.text.length, P.text);
-        $.CGEventPost($.kCGHIDEventTap, ev2);
-        return JSON.stringify({ ok: true, chars: P.text.length });`, { text }, 15_000);
-      return { action_sent: true, chars: text.length, strategy: "unicode-events", frontmost_app };
-    },
-    key: async ({ text, repeat = 1, app_ref }) => {
+    type: (args) => native("type", args),
+    key: async ({ text, repeat = 1 }) => {
       const { flags, code, key } = parseChord(text);
-      const frontmost_app = await guardInput(app_ref);
       for (let i = 0; i < Math.max(1, Math.min(100, repeat)); i++) {
         await keyEvent(code, flags, true);
         await keyEvent(code, flags, false);
         if (i < repeat - 1) await new Promise((r) => setTimeout(r, 30));
       }
-      return { action_sent: true, key, code, repeat: Math.max(1, Math.min(100, repeat)), frontmost_app };
+      return { action_sent: true, key, code, repeat: Math.max(1, Math.min(100, repeat)) };
     },
-    hold_key: async ({ text, duration, app_ref }) => {
+    hold_key: async ({ text, duration }) => {
       const { flags, code, key } = parseChord(text);
-      const frontmost_app = await guardInput(app_ref);
       const d = Math.max(0.05, Math.min(30, Number(duration) || 1));
       await keyEvent(code, flags, true);
       await new Promise((r) => setTimeout(r, d * 1000));
       await keyEvent(code, flags, false);
-      return { action_sent: true, key, heldSec: d, frontmost_app };
+      return { action_sent: true, key, heldSec: d };
     },
-    set_value: async ({ target, value }) => {
-      const el = await elementAction(target.app_ref, target.windowIndex, target.path, { kind: "set_value", value });
-      if (!el.ok) throw new ExecError(`set_value failed: ${el.code}`);
-      return { action_sent: true, strategy: "a11y", element: el.element };
-    },
-    select_text: async ({ target, text_range }) => {
-      const el = await elementAction(target.app_ref, target.windowIndex, target.path, { kind: "select_text", range: text_range });
-      if (!el.ok) throw new ExecError(`select_text failed: ${el.code}`);
-      return { action_sent: true, strategy: "a11y", element: el.element };
-    },
-    perform_action: async ({ target, action }) => {
-      const el = await elementAction(target.app_ref, target.windowIndex, target.path, { kind: "action", action });
-      if (!el.ok) throw new ExecError(`perform_action failed: ${el.code} — check the element's actions list from get_app_state`);
-      return { action_sent: el.sent, strategy: "a11y", action, element: el.element };
-    },
+    set_value: (args) => native("set_value", args),
+    select_text: (args) => native("select_text", args),
+    perform_action: (args) => native("perform_action", args),
     read_clipboard: readClipboard,
     write_clipboard: writeClipboard,
     cursor_position: cursorPosition,

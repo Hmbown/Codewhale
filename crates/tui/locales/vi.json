@@ -1457,6 +1457,8 @@
   "ToolProjectionWarning": "Cảnh báo: {provider} đã bỏ qua các công cụ không tương thích trong yêu cầu này: {tools}",
   "SnapshotsDisabledNotice": "Ảnh chụp nhanh và /undo đang tắt cho {workspace}: {reason} Tăng `{config_key}` trong config.toml (hoặc đặt 0 để bỏ giới hạn) để bật lại.",
   "SessionIdDivergedNotice": "Danh tính phiên trong cửa sổ này đã thay đổi: engine hiện lưu checkpoint dưới {next} (trước đó là {previous}). Các checkpoint cũ vẫn nằm dưới id cũ; `codewhale sessions` liệt kê cả hai và `codewhale resume {previous}` mở lại phiên cũ.",
+  "RuntimeStoreUnreadableNotice": "Kho lưu trữ runtime của phiên: không đọc được {record} tại {path} ({reason}). Hãy dời tệp đó sang chỗ khác (hoặc xóa) rồi thử lại; các bản ghi khác của luồng vẫn được giữ nguyên.",
+  "RuntimeStoreUnwritableNotice": "Kho lưu trữ runtime của phiên: không ghi được {record} tại {path} ({reason}). Hãy kiểm tra dung lượng trống và quyền truy cập ở đó rồi thử lại; không có gì bị ghi đè.",
   "ProviderExternalSemanticsRevoke": "{semantics} | thu hồi: {revoke}",
   "ProviderExternalRevoke": "thu hồi: {revoke}",
   "ProviderExternalChoiceTitle": " Truy cập thông tin xác thực ngoài · {provider} ",

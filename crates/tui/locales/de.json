@@ -1434,6 +1434,8 @@
   "ToolProjectionWarning": "Warnung: {provider} hat für diese Anfrage inkompatible Werkzeuge ausgelassen: {tools}",
   "SnapshotsDisabledNotice": "Snapshots und /undo sind für {workspace} aus: {reason} Erhöhe `{config_key}` in config.toml (oder setze es auf 0, um die Grenze aufzuheben), um sie einzuschalten.",
   "SessionIdDivergedNotice": "Die Sitzungsidentität unter diesem Fenster hat sich geändert: Die Engine speichert Checkpoints jetzt als {next} (vorher {previous}). Frühere Checkpoints bleiben unter der alten ID; `codewhale sessions` listet beide und `codewhale resume {previous}` öffnet die frühere wieder.",
+  "RuntimeStoreUnreadableNotice": "Laufzeitspeicher der Sitzung: {record} unter {path} konnte nicht gelesen werden ({reason}). Verschiebe diese Datei beiseite (oder lösche sie) und versuche es erneut; die übrigen Datensätze des Threads bleiben erhalten.",
+  "RuntimeStoreUnwritableNotice": "Laufzeitspeicher der Sitzung: {record} unter {path} konnte nicht geschrieben werden ({reason}). Prüfe dort freien Speicherplatz und Berechtigungen und versuche es erneut; nichts wurde überschrieben.",
   "ProviderExternalSemanticsRevoke": "{semantics} | Widerruf: {revoke}",
   "ProviderExternalRevoke": "Widerruf: {revoke}",
   "ProviderExternalChoiceTitle": " Externer Zugangsdaten-Zugriff · {provider} ",

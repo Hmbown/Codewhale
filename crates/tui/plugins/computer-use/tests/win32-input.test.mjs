@@ -1,7 +1,8 @@
 // Windows backend input truthfulness tests. No Windows box (or GUI) is
 // involved: a fake powershell.exe is placed on PATH, captures the decoded
 // -EncodedCommand payload of every spawn, and exits with a code the test
-// controls — mirroring how the issue was verified upstream (issue #5896).
+// controls — mirroring how the failure-truthfulness was verified when the
+// fix was developed on the codewhale side before this port.
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";

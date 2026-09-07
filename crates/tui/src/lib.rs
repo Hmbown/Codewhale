@@ -3712,9 +3712,10 @@ struct CleanPlan {
 fn collect_clean_targets(checkpoints_dir: &Path) -> CleanPlan {
     // Every `*.json` file in the checkpoints directory is checkpoint state:
     // per-session crash checkpoints (`<session_id>.json`), the legacy
-    // single-slot checkpoint (`latest.json`), and the offline input queue
-    // (`offline_queue.json`). Non-JSON files and subdirectories are left
-    // alone.
+    // single-slot checkpoint (`latest.json`), and the per-session offline
+    // input queue (`<session_id>.offline_queue.json`, plus any leftover
+    // pre-migration `offline_queue.json`). Non-JSON files and subdirectories
+    // are left alone.
     let mut targets: Vec<PathBuf> = std::fs::read_dir(checkpoints_dir)
         .map(|entries| {
             entries

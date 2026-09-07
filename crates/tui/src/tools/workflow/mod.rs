@@ -6570,10 +6570,11 @@ reasoning = "high"
 permissions = "read_only"
 "#;
         let operation = exact_workflow_with(AUDIT_FLEET, None);
-        // Free-form Fleet roles map to Runtime `custom`, whose baseline is
-        // write-capable under this full parent. Keep the production write-scope
-        // gate intact by declaring an exact scope in the fixture.
-        let mut request = exact_write_task_request("auditor");
+        // The member declares `permissions = "read_only"`, and an undeclared
+        // role name no longer hands the child a write-capable posture (#5575),
+        // so a declared write scope is now correctly refused at bind time.
+        // Ask for no write scope, which is what this member actually has.
+        let mut request = exact_task_request("auditor");
         let binding =
             bind_exact_fleet_task_request(&operation, exact_session(), &mut request).expect("bind");
         let receipt = route_admitted_exact_task(&operation, &binding, &mut request)
@@ -6584,8 +6585,8 @@ permissions = "read_only"
         // the posture role, because that is what picked the child's tool
         // surface.
         let posture = binding.authority.posture_role.to_string();
-        assert_eq!(posture, "custom");
-        assert_eq!(receipt.posture_role.as_deref(), Some("custom"));
+        assert_eq!(posture, "explore");
+        assert_eq!(receipt.posture_role.as_deref(), Some("explore"));
 
         // What the run displays is the member's role, not that posture.
         assert_eq!(

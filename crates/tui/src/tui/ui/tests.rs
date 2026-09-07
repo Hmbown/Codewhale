@@ -605,6 +605,79 @@ fn session_id_divergence_notice_names_both_ids_and_the_resume_command() {
     assert!(text.contains("codewhale sessions"));
 }
 
+#[test]
+fn runtime_store_failure_event_becomes_a_toast_naming_the_file_and_remedy() {
+    // #5931: an unreadable runtime store record was only a log line; the
+    // operator now sees the record, the file, the cause, and what to do.
+    let mut app = focus_test_app();
+    let path = "/tmp/runtime/items/item_bad.json";
+    let record = crate::runtime_threads::RuntimeEventRecord {
+        schema_version: 1,
+        seq: 3,
+        timestamp: chrono::Utc::now(),
+        thread_id: "thr_1".to_string(),
+        turn_id: Some("turn_1".to_string()),
+        item_id: Some("item_bad".to_string()),
+        event: crate::runtime_threads::RUNTIME_STORE_FAILURE_EVENT.to_string(),
+        payload: serde_json::json!({
+            "operation": "parse",
+            "record_kind": "item",
+            "record_id": "item_bad",
+            "path": path,
+            "error": format!("Failed to parse item {path}: expected value at line 1 column 3"),
+            "reason": "expected value at line 1 column 3",
+            "next_action": format!("Move {path} aside (or delete it) and retry."),
+            "message": format!("Session runtime store: item item_bad at {path} could not be parsed."),
+        }),
+    };
+    let toasts_before = app.status_toasts.len();
+
+    assert!(super::event_loop::show_runtime_store_failure(
+        &mut app, &record
+    ));
+    let toast = app.status_toasts.back().expect("store failure toast");
+    assert!(matches!(toast.level, StatusToastLevel::Warning));
+    assert!(toast.text.contains("item item_bad"), "{}", toast.text);
+    assert!(toast.text.contains(path), "{}", toast.text);
+    assert!(
+        toast.text.contains("expected value at line 1 column 3"),
+        "{}",
+        toast.text
+    );
+    assert!(
+        toast.text.contains("Move that file aside"),
+        "{}",
+        toast.text
+    );
+    let shown = toast.text.clone();
+    assert!(matches!(
+        app.history.last(),
+        Some(HistoryCell::System { content }) if *content == shown
+    ));
+
+    // A write fault points at space and permissions, not at a file to remove.
+    let mut write_record = record.clone();
+    write_record.payload["operation"] = serde_json::json!("write");
+    assert!(super::event_loop::show_runtime_store_failure(
+        &mut app,
+        &write_record
+    ));
+    let toast = app.status_toasts.back().expect("write failure toast");
+    assert!(
+        toast.text.contains("free space and permissions"),
+        "{}",
+        toast.text
+    );
+
+    // Other runtime events are not this tap's business.
+    let mut other = record.clone();
+    other.event = "item.failed".to_string();
+    assert!(!super::event_loop::show_runtime_store_failure(
+        &mut app, &other
+    ));
+    assert_eq!(app.status_toasts.len(), toasts_before + 2);
+}
+
 fn focus_test_app() -> App {
     let mut app = create_test_app();
     app.onboarding = crate::tui::app::OnboardingState::None;

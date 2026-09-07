@@ -13,7 +13,7 @@ workspace = true
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true
-codewhale-protocol = { path = "../protocol", version = "0.9.12" }
+codewhale-protocol = { path = "../protocol", version = "0.9.13" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

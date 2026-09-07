@@ -1434,6 +1434,8 @@
   "ToolProjectionWarning": "Внимание: {provider} исключил несовместимые инструменты для этого запроса: {tools}",
   "SnapshotsDisabledNotice": "Снимки и /undo отключены для {workspace}: {reason} Увеличьте `{config_key}` в config.toml (или задайте 0, чтобы снять ограничение), чтобы включить их.",
   "SessionIdDivergedNotice": "Идентификатор сеанса в этом окне изменился: движок теперь сохраняет контрольные точки как {next} (было {previous}). Прежние точки остаются под старым id; `codewhale sessions` показывает оба, а `codewhale resume {previous}` открывает прежний сеанс.",
+  "RuntimeStoreUnreadableNotice": "Хранилище среды выполнения сессии: не удалось прочитать {record} в {path} ({reason}). Отложите этот файл (или удалите его) и повторите попытку; остальные записи потока сохраняются.",
+  "RuntimeStoreUnwritableNotice": "Хранилище среды выполнения сессии: не удалось записать {record} в {path} ({reason}). Проверьте свободное место и права доступа там и повторите попытку; ничего не было перезаписано.",
   "ProviderExternalSemanticsRevoke": "{semantics} | отзыв: {revoke}",
   "ProviderExternalRevoke": "отзыв: {revoke}",
   "ProviderExternalChoiceTitle": " Доступ к внешним учётным данным · {provider} ",

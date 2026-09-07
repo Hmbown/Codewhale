@@ -6,7 +6,8 @@ usage: /computer [status|look|computers]
 $ARGUMENTS
 
 - With no arguments or `status`: report whether computer use is usable on
-  the active computer — server reachable, platform, screen size, and which
+  the active computer — server reachable, platform, screen size, whether the
+  Codewhale Computer Use app is doing the work (`via`), and which
   permissions or platform tools are missing (`request_access`) — without
   taking any action.
 - With `look`: take one screenshot of the active computer and describe what

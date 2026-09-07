@@ -1,9 +1,11 @@
 // Transport: turn a registered computer into an executor.
-//  - local: spawn directly
+//  - local: the Codewhale Computer Use app when it is running or registered
+//           (it owns the OS permissions), otherwise spawn directly
 //  - ssh:   run the codewhale-cu remote agent over ssh (args travel as base64 JSON,
 //           so no tool argument can ever become remote shell syntax)
 //  - hdc:   HarmonyOS device over `hdc` shell / file push-pull
 import { run, runOk, ExecError } from "./exec.mjs";
+import { ensureApp, appRequest } from "./app-socket.mjs";
 import { spawn } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
@@ -46,6 +48,22 @@ export function localExec() {
   };
 }
 
+/**
+ * App executor: the local computer driven through the desktop app's socket.
+ * Same `remote()` contract as ssh, but files the app writes are on this disk.
+ */
+export function appExec(app) {
+  return {
+    ...localExec(),
+    kind: "app",
+    app,
+    filesLocal: true,
+    remote(request, opts = {}) {
+      return appRequest(request, { timeoutMs: opts.timeoutMs ?? 30_000 });
+    },
+  };
+}
+
 /** ssh executor: speaks to the remote agent installed by installRemoteAgent(). */
 export function sshExec(computer) {
   const userHost = computer.user ? `${computer.user}@${computer.host}` : computer.host;
@@ -84,7 +102,7 @@ export async function installRemoteAgent(computer) {
   for (const dir of ["", "backends"]) {
     const full = path.join(srcDir, dir);
     for (const f of fs.readdirSync(full)) {
-      if (f.endsWith(".mjs")) rels.push(`src/${dir ? dir + "/" : ""}${f}`);
+      if (f.endsWith(".mjs") || f.endsWith(".m") || f.endsWith(".h")) rels.push(`src/${dir ? dir + "/" : ""}${f}`);
     }
   }
   const marker = ".codewhale-cu/agent";
@@ -118,6 +136,9 @@ export function hdcExec(computer) {
       return localPath;
     },
     async readFile(remotePath, opts = {}) {
+      // Containment: pull into a private mkdtemp dir and remove exactly that
+      // dir. Never rm() the parent of a file placed directly in os.tmpdir() —
+      // that recursively deletes the entire user temp directory.
       const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "cu-hdc-"));
       try {
         const tmp = path.join(dir, "out");
@@ -132,7 +153,17 @@ export function hdcExec(computer) {
 }
 
 export async function executorFor(computer) {
-  if (computer.transport === "local") return localExec();
+  if (computer.transport === "local") {
+    // Test hook: exercise the out-of-process wire path (desktop app / ssh
+    // agent) in-process, so wire argument preparation is covered by tests.
+    if (process.env.CODEWHALE_CU_TEST_REMOTE === "1") {
+      const { handle } = await import("./app-handler.mjs");
+      return { ...appExec({ id: "test", name: "test app" }), remote: (request) => handle(request) };
+    }
+    const status = await ensureApp();
+    if (status.via === "app") return appExec(status.app);
+    return { ...localExec(), appReason: status.reason };
+  }
   if (computer.transport === "ssh") return sshExec(computer);
   if (computer.transport === "hdc") return hdcExec(computer);
   throw new ExecError(`unknown transport ${computer.transport}`);
@@ -149,7 +180,12 @@ export async function backendFor(computer) {
     else if (computer.transport === "hdc") platform = "harmonyos";
     else platform = "linux"; // conservative default for ssh; registration probes it
   }
-  const mod = await import(`./backends/${platform}.mjs`);
-  const exec = await executorFor(computer);
+  // Test hook: inject a fake local backend by absolute path to an .mjs
+  // module exporting `create` (used by tests/, never set in production).
+  const testBackend = computer.transport === "local" && process.env.CODEWHALE_CU_TEST_BACKEND;
+  const mod = await import(testBackend ? url.pathToFileURL(testBackend).href : `./backends/${platform}.mjs`);
+  // Backends always get a direct executor; routing through the app happens
+  // one level up (the server dispatches to `executor.remote` when present).
+  const exec = computer.transport === "local" ? localExec() : await executorFor(computer);
   return { backend: mod.create({ exec, computer, platform }), platform };
 }

@@ -5660,6 +5660,12 @@ fn map_compat_stream_event(event: &crate::runtime_threads::RuntimeEventRecord) -
             ))
         }
         "sandbox.denied" => Some(sse_json("sandbox.denied", payload.clone())),
+        // The operator's own store failed; the payload names the file and
+        // the next action, so compat clients see it too (#5931).
+        crate::runtime_threads::RUNTIME_STORE_FAILURE_EVENT => Some(sse_json(
+            crate::runtime_threads::RUNTIME_STORE_FAILURE_EVENT,
+            payload.clone(),
+        )),
         "turn.completed" => {
             let usage = payload
                 .get("turn")

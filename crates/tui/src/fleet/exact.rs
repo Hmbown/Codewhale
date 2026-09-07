@@ -1765,8 +1765,17 @@ permissions = "read_only"
         }
     }
 
+    /// #5575: a free-form member role keeps its identity and **fails closed**.
+    ///
+    /// This test previously asserted the opposite — `posture_role == "custom"`
+    /// and `write_authority == "workspace_write"` — which is exactly the defect:
+    /// `audit-lead` is a name nobody declared, and the exact driver answered it
+    /// with the widest posture there is while the durable driver answered the
+    /// same class of name with `general`. Identity is still preserved verbatim
+    /// (`member_role`), but an undeclared label now buys the narrowest useful
+    /// posture, not write authority.
     #[test]
-    fn a_free_form_member_role_maps_to_runtime_custom_without_losing_identity() {
+    fn a_free_form_member_role_fails_closed_without_losing_identity() {
         const AUDIT_FLEET: &str = r#"
 name = "audit"
 schema = "exact"
@@ -1784,11 +1793,17 @@ permissions = "read_only"
             .expect("bind");
 
         assert_eq!(binding.member_role, "audit-lead");
-        assert_eq!(binding.authority.posture_role, "custom");
+        assert_eq!(binding.authority.posture_role, "explore");
         assert_eq!(
-            binding.authority.write_authority, "workspace_write",
-            "authority comes from Runtime custom under the session ceiling; \
-             the Fleet permissions block grants nothing"
+            binding.authority.write_authority, "read_only",
+            "an undeclared role name must never grant write authority; an \
+             operator who wants the parent's posture spells the role `custom`"
+        );
+
+        // The escape hatch is a declared role, not a typo.
+        assert_eq!(
+            ChildAuthority::from_runtime_role("custom", full_session()).write_authority,
+            "workspace_write"
         );
     }
 
@@ -2650,7 +2665,8 @@ call_reasoning = "low"
     /// A member's semantic role and its Runtime posture are separate
     /// facts and the receipt keeps both. An operator who named a member
     /// `auditor` must see `auditor` on the receipt, while the surface actually
-    /// selected (`custom`) is disclosed rather than substituted for the name.
+    /// selected (`explore`, the fail-closed posture an undeclared role gets
+    /// since #5575) is disclosed rather than substituted for the name.
     #[tokio::test]
     async fn a_receipt_records_the_posture_without_renaming_the_members_role() {
         const AUDIT_FLEET: &str = r#"
@@ -2672,7 +2688,7 @@ permissions = "read_only"
 
         // Enforcement uses the posture; it is not the operator's role name.
         assert_eq!(binding.member_role, "auditor");
-        assert_eq!(binding.authority.posture_role, "custom");
+        assert_eq!(binding.authority.posture_role, "explore");
 
         let launch = workflow
             .route_admitted_task(&binding, "review the queue")
@@ -2681,9 +2697,9 @@ permissions = "read_only"
         let receipt = &launch.receipt;
 
         assert_eq!(receipt.member_role, "auditor");
-        assert_eq!(receipt.posture_role.as_deref(), Some("custom"));
+        assert_eq!(receipt.posture_role.as_deref(), Some("explore"));
         let line = receipt.line();
         assert!(line.contains("(role auditor)"), "{line}");
-        assert!(line.contains("posture=custom"), "{line}");
+        assert!(line.contains("posture=explore"), "{line}");
     }
 }

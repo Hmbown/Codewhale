@@ -1,4 +1,4 @@
-<!-- source: README.md sha256:dcbd5aa09403 -->
+<!-- source: README.md sha256:3cc3ffc9b995 -->
 # Codewhale
 
 Codewhale, terminaliniz için Rust ile geliştirilmiş ve kullanıcılarıyla birlikte açık biçimde iyileştirilen açık kaynaklı bir kodlama ajanıdır.
@@ -42,6 +42,10 @@ codewhale exec "fix the failing tests and explain what changed"
 ```
 
 Codewhale deponuzu okuyabilir, dosyaları düzenleyebilir, komutları çalıştırabilir, sonuçları inceleyebilir ve bir hedefe doğru çalışmayı sürdürebilir. Ne kadar erişime sahip olacağına siz karar verirsiniz.
+
+## Grafik arayüz
+
+Grafik bir arayüzü mü tercih edersiniz? Topluluk tarafından bakımı yapılan CodeWhale for VS Code eklentisi aynı aracıyı VS Code kenar çubuğuna taşır — sohbet, konu tabanlı görüşmeler, canlı diff ve görev yönetimi, hepsi aynı Runtime API üzerinde; oturumlar terminalle eşitlenmiş kalır. [VS Code Marketplace](https://marketplace.visualstudio.com/items?itemName=HengQuWorld.brotherwhale-vscode) üzerinden kurun; kaynak kodu [GitHub](https://github.com/HengQuWorld/CodeWhale-VSCode) adresinde.
 
 ## Neden Codewhale
 

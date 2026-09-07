@@ -652,12 +652,78 @@ impl ChildAuthority {
     }
 }
 
+/// Org-chart aliases for Fleet **member** role labels: roster slot names and
+/// coordination titles that select a runtime posture but are not part of the
+/// model-facing spawn vocabulary.
+///
+/// Deliberately *not* folded into [`migrate_legacy_role_token`]. That table
+/// feeds [`FleetRole::from_str`], which is also the closed vocabulary the
+/// `agent` tool validates its `type` against, and — decisively — the test the
+/// spawn parser uses to decide whether a `role` string is a posture alias or a
+/// roster profile key. Teaching `from_str` about `manager` or `smoke-runner`
+/// would stop those names resolving as roster members there. So the aliases
+/// live here, one step out, and reach exactly the one consumer that wants
+/// them: [`runtime_role_for_member`].
+///
+/// Every entry maps to the posture the durable Fleet driver already gave it,
+/// so folding them in only ever *narrows* the exact driver (which previously
+/// dropped all of these into write-capable `custom`); none of them widens
+/// authority on either path.
+fn member_role_alias(token: &str) -> Option<FleetRole> {
+    match token {
+        // Coordination happens through delegation, which needs the full
+        // General surface (#fleet-roster cutover (v0.8.67)). The operator is
+        // the helm of the overall work (it assigns managers to Workflows);
+        // the manager is the middle manager of one Workflow. Both coordinate,
+        // so both get the General surface — explicitly, not by fall-through.
+        "manager" | "coordinator" | "operator" => Some(FleetRole::Worker),
+        // Synthesis is read-only (planner posture: network reads and
+        // read-only probes, never workspace writes). It must never fall
+        // through to General's full-write posture (#fleet-roster cutover
+        // (v0.8.67)).
+        "synthesizer" | "summarizer" | "reducer" => Some(FleetRole::Planner),
+        // Documented Fleet task role spellings (`docs/FLEET.md`).
+        "smoke-runner" => Some(FleetRole::Verifier),
+        "read-only" => Some(FleetRole::Scout),
+        _ => None,
+    }
+}
+
 /// Map the Fleet's open semantic role label onto Runtime's closed role policy.
-/// Unknown labels remain useful identity (`auditor`, `research-lead`, …) but
-/// execute under Runtime `custom`, whose capabilities still intersect with the
-/// live parent.
+///
+/// **This is the only name → posture mapper.** Both Fleet drivers resolve
+/// through it: the exact/named-Fleet driver via
+/// [`ChildAuthority::from_runtime_role`], and the durable driver via
+/// `worker_runtime::roster_member_agent_type` and the task-role call sites.
+/// A second table anywhere is the defect this function exists to prevent —
+/// before #5575 the durable driver carried its own alias list, so the same
+/// string (`synthesizer`, `smoke-runner`, `read-only`) resolved to a
+/// read-only posture on one driver and to write-capable `custom` on the other.
+///
+/// Resolution order, and nothing else:
+/// 1. an empty label means *unspecified*, which is the documented general
+///    default a Fleet task without a `role` has always had;
+/// 2. [`FleetRole::from_str`] — the declared closed vocabulary plus its
+///    documented legacy aliases ([`VALID_ROLE_ALIASES`]);
+/// 3. [`member_role_alias`] — the org-chart/slot spellings above;
+/// 4. **fail closed.**
+///
+/// Step 4 is the privilege boundary. An unrecognized label is still useful
+/// identity (`auditor`, `release-lead`, …) and keeps its name on every receipt
+/// via [`public_role_label`], but a name nobody declared must not be able to
+/// hand a worker write authority. It therefore executes on the narrowest
+/// posture that can still do useful work — `explore`: no workspace writes, no
+/// raw shell, network reads and classifier-bounded `Bash` inspection. An
+/// operator who genuinely wants "inherit whatever the parent has" spells that
+/// `custom`, which is a declared role and resolves at step 2.
 pub(crate) fn runtime_role_for_member(role: &str) -> FleetRole {
-    FleetRole::from_str(role).unwrap_or(FleetRole::Custom)
+    let token = role.trim().to_ascii_lowercase();
+    if token.is_empty() {
+        return FleetRole::Worker;
+    }
+    FleetRole::from_str(&token)
+        .or_else(|| member_role_alias(&token))
+        .unwrap_or(FleetRole::Scout)
 }
 
 fn runtime_permission_ceiling(role: &FleetRole) -> PermissionCeiling {

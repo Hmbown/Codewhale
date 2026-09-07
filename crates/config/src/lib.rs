@@ -175,6 +175,13 @@ pub struct ProviderConfigToml {
     pub auth_mode: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub insecure_skip_tls_verify: Option<bool>,
+    /// Explicit consent to a plain-HTTP `base_url` for this provider (a
+    /// llama.cpp box on the LAN, an internal gateway). Loopback hosts are
+    /// always allowed without it. Distinct from `insecure_skip_tls_verify`,
+    /// which skips TLS certificate verification on HTTPS URLs and does not
+    /// permit plain HTTP (#5991).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_insecure_http: Option<bool>,
     #[serde(default, skip_serializing_if = "http_headers_are_effectively_empty")]
     pub http_headers: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -209,6 +216,7 @@ impl ProviderConfigToml {
             && blank(self.wire.as_ref())
             && blank(self.auth_mode.as_ref())
             && self.insecure_skip_tls_verify.is_none()
+            && self.allow_insecure_http.is_none()
             && http_headers_are_effectively_empty(&self.http_headers)
             && blank(self.path_suffix.as_ref())
             && self.auth.is_none()
@@ -926,6 +934,7 @@ enum ProviderConfigField {
     Wire,
     AuthMode,
     InsecureSkipTlsVerify,
+    AllowInsecureHttp,
     HttpHeaders,
     PathSuffix,
 }
@@ -941,6 +950,7 @@ impl ProviderConfigField {
             "wire" | "api_style" | "protocol" | "wire_format" | "dialect" => Self::Wire,
             "auth_mode" => Self::AuthMode,
             "insecure_skip_tls_verify" => Self::InsecureSkipTlsVerify,
+            "allow_insecure_http" => Self::AllowInsecureHttp,
             "http_headers" => Self::HttpHeaders,
             "path_suffix" => Self::PathSuffix,
             _ => return None,
@@ -957,6 +967,7 @@ impl ProviderConfigField {
             Self::Wire => "wire",
             Self::AuthMode => "auth_mode",
             Self::InsecureSkipTlsVerify => "insecure_skip_tls_verify",
+            Self::AllowInsecureHttp => "allow_insecure_http",
             Self::HttpHeaders => "http_headers",
             Self::PathSuffix => "path_suffix",
         }
@@ -994,7 +1005,7 @@ fn is_builtin_provider_config_id(provider_id: &str) -> bool {
 /// Field legs a `[providers.<id>]` custom table accepts through
 /// `config set`, including the required `kind` marker.
 const CUSTOM_PROVIDER_FIELD_HINT: &str = "api_key, base_url, model, context_window, mode, wire, auth_mode, \
-     insecure_skip_tls_verify, http_headers, path_suffix, kind";
+     insecure_skip_tls_verify, allow_insecure_http, http_headers, path_suffix, kind";
 
 fn provider_config_key(provider: ProviderKind, field: ProviderConfigField) -> String {
     format!(
@@ -1019,6 +1030,9 @@ fn get_provider_config_value(
         ProviderConfigField::InsecureSkipTlsVerify => config
             .insecure_skip_tls_verify
             .map(|value| value.to_string()),
+        ProviderConfigField::AllowInsecureHttp => {
+            config.allow_insecure_http.map(|value| value.to_string())
+        }
         ProviderConfigField::HttpHeaders => serialize_http_headers(&config.http_headers),
         ProviderConfigField::PathSuffix => config.path_suffix.clone(),
     }
@@ -1097,6 +1111,12 @@ fn set_provider_config_value(
                 .for_provider_mut(provider)
                 .insecure_skip_tls_verify = Some(parse_bool(value)?);
         }
+        ProviderConfigField::AllowInsecureHttp => {
+            config
+                .providers
+                .for_provider_mut(provider)
+                .allow_insecure_http = Some(parse_bool(value)?);
+        }
         ProviderConfigField::HttpHeaders => {
             let headers = parse_http_headers(value)?;
             config.providers.for_provider_mut(provider).http_headers = headers.clone();
@@ -1152,6 +1172,12 @@ fn unset_provider_config_value(
                 .providers
                 .for_provider_mut(provider)
                 .insecure_skip_tls_verify = None;
+        }
+        ProviderConfigField::AllowInsecureHttp => {
+            config
+                .providers
+                .for_provider_mut(provider)
+                .allow_insecure_http = None;
         }
         ProviderConfigField::HttpHeaders => {
             config
@@ -1213,6 +1239,12 @@ fn insert_provider_config_values(
     if let Some(v) = config.insecure_skip_tls_verify {
         out.insert(
             provider_config_key(provider, ProviderConfigField::InsecureSkipTlsVerify),
+            v.to_string(),
+        );
+    }
+    if let Some(v) = config.allow_insecure_http {
+        out.insert(
+            provider_config_key(provider, ProviderConfigField::AllowInsecureHttp),
             v.to_string(),
         );
     }
@@ -2041,8 +2073,9 @@ impl FleetSlot {
             "summarizer" | "reducer" => Self::Summarizer,
             "general" | "" => Self::General,
             // Removed slots (e.g. the old "tool-heavy") and unknown names parse
-            // as Custom, which dispatches on the General surface — identical to
-            // the behavior the removed variants had.
+            // as Custom. Note the runtime side no longer treats an undeclared
+            // role as write-capable: it fails closed to the read-only `explore`
+            // posture (#5575), so this is narrower than the removed variants.
             other => Self::Custom(other.to_string()),
         }
     }
@@ -2730,7 +2763,9 @@ impl ConfigToml {
             ProviderConfigField::ContextWindow => {
                 toml::Value::Integer(i64::from(parse_context_window(value)?))
             }
-            ProviderConfigField::InsecureSkipTlsVerify => toml::Value::Boolean(parse_bool(value)?),
+            ProviderConfigField::InsecureSkipTlsVerify | ProviderConfigField::AllowInsecureHttp => {
+                toml::Value::Boolean(parse_bool(value)?)
+            }
             ProviderConfigField::HttpHeaders => toml::Value::Table(
                 parse_http_headers(value)?
                     .into_iter()

@@ -1434,6 +1434,8 @@
   "ToolProjectionWarning": "चेतावनी: {provider} ने इस अनुरोध में असंगत टूल हटा दिए: {tools}",
   "SnapshotsDisabledNotice": "{workspace} के लिए स्नैपशॉट और /undo बंद हैं: {reason} इन्हें चालू करने के लिए config.toml में `{config_key}` बढ़ाएँ (या सीमा हटाने के लिए 0 रखें)।",
   "SessionIdDivergedNotice": "इस विंडो की सत्र पहचान बदल गई है: इंजन अब चेकपॉइंट {next} के रूप में सहेजता है (पहले {previous} था)। पुराने चेकपॉइंट पुराने id के तहत ही रहेंगे; `codewhale sessions` दोनों दिखाता है और `codewhale resume {previous}` पुराना सत्र फिर खोलता है।",
+  "RuntimeStoreUnreadableNotice": "सत्र रनटाइम स्टोर: {path} पर {record} पढ़ा नहीं जा सका ({reason})। उस फ़ाइल को अलग रख दें (या हटा दें) और फिर से कोशिश करें; थ्रेड के बाकी रिकॉर्ड यथावत रहते हैं।",
+  "RuntimeStoreUnwritableNotice": "सत्र रनटाइम स्टोर: {path} पर {record} लिखा नहीं जा सका ({reason})। वहाँ खाली जगह और अनुमतियाँ जाँचें, फिर दोबारा कोशिश करें; कुछ भी अधिलेखित नहीं हुआ।",
   "ProviderExternalSemanticsRevoke": "{semantics} | रद्द: {revoke}",
   "ProviderExternalRevoke": "रद्द: {revoke}",
   "ProviderExternalChoiceTitle": " बाहरी क्रेडेंशल एक्सेस · {provider} ",

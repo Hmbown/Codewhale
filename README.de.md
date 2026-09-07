@@ -1,4 +1,4 @@
-<!-- source: README.md sha256:dcbd5aa09403 -->
+<!-- source: README.md sha256:3cc3ffc9b995 -->
 # Codewhale
 
 Codewhale ist ein in Rust entwickelter Open-Source-Coding-Agent für dein Terminal, der gemeinsam mit seinen Nutzerinnen und Nutzern öffentlich weiterentwickelt wird.
@@ -42,6 +42,10 @@ codewhale exec "fix the failing tests and explain what changed"
 ```
 
 Codewhale kann dein Repository lesen, Dateien bearbeiten, Befehle ausführen, Ergebnisse prüfen und auf ein Ziel hinarbeiten. Du entscheidest, wie viel Zugriff der Agent erhält.
+
+## Grafische Oberfläche
+
+Lieber eine grafische Oberfläche? Die von der Community gepflegte Erweiterung CodeWhale for VS Code bringt denselben Agenten in die VS-Code-Seitenleiste — Chat, Thread-Gespräche, Live-Diffs und Aufgabenverwaltung über dieselbe Runtime-API, sodass Sitzungen mit dem Terminal synchron bleiben. Installieren Sie sie aus dem [VS Code Marketplace](https://marketplace.visualstudio.com/items?itemName=HengQuWorld.brotherwhale-vscode); der Quellcode liegt auf [GitHub](https://github.com/HengQuWorld/CodeWhale-VSCode).
 
 ## Warum Codewhale
 

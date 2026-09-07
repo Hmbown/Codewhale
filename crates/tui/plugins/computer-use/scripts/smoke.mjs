@@ -102,13 +102,16 @@ try {
   r = await tool("list_apps");
   log("list_apps", r.parsed?.ok === true && r.parsed?.apps?.length > 0, `${r.parsed?.apps?.length} apps`);
 
-  const someApp = r.parsed?.apps?.find((a) => a.windowCount > 0);
+  // No backend reports windowCount today, so fall back to the app in front —
+  // it is the one guaranteed to have a window worth observing.
+  const apps = r.parsed?.apps ?? [];
+  const someApp = apps.find((a) => a.windowCount > 0) ?? apps.find((a) => a.frontmost) ?? apps[0];
   if (someApp) {
     const st = await tool("get_app_state", { app_ref: { pid: someApp.pid } });
     log("get_app_state", st.parsed?.ok === true && st.parsed?.elements?.length > 0, `${someApp.name}: ${st.parsed?.elements?.length} elements, state_id=${st.parsed?.state_id}`);
     globalThis.__state = st.parsed;
   } else {
-    log("get_app_state", false, "no windowed app to observe");
+    log("get_app_state", false, "list_apps returned no applications to observe");
   }
 
   r = await tool("cursor_position");
@@ -134,7 +137,7 @@ try {
   if (started) {
     await new Promise((res) => setTimeout(res, 2500));
     r = await tool("recording_status", { id: recId });
-    log("recording_status", r.parsed?.ok === true && r.parsed?.running === true, `running=${r.parsed?.running} bytes-so-far=${r.parsed?.bytes} (screencapture flushes at stop)`);
+    log("recording_status", r.parsed?.ok === true && r.parsed?.running === true, `running=${r.parsed?.running} bytes-so-far=${r.parsed?.bytes} (bytes land at stop)`);
     r = await tool("recording_stop", { id: recId });
     const stopped = r.parsed?.ok === true && r.parsed?.file && fs.existsSync(r.parsed.file) && fs.statSync(r.parsed.file).size > 1000;
     log("recording_stop (real file)", stopped, `${path.basename(r.parsed?.file ?? "")} + mp4:${r.parsed?.mp4 ? "yes" : "no"} bytes=${r.parsed?.bytes}`);

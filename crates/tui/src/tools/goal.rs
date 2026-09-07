@@ -354,6 +354,11 @@ pub struct GoalState {
     advisories: Vec<GoalAdvisoryNote>,
     last_gap_fingerprint: Option<String>,
     repeated_gap_count: u32,
+    /// The continuation pass the repeated-gap counter last advanced on.
+    /// The bound is "equivalent gaps on consecutive PASSES", so a verifier
+    /// reporting the same gap several times inside one turn must not trip it
+    /// before any continuation has happened.
+    last_gap_pass: Option<u32>,
 }
 
 impl GoalState {
@@ -402,6 +407,7 @@ impl GoalState {
                     self.advisories.clear();
                     self.last_gap_fingerprint = None;
                     self.repeated_gap_count = 0;
+                    self.last_gap_pass = None;
                 } else if self.token_budget != token_budget {
                     self.token_budget = token_budget;
                 }
@@ -413,6 +419,7 @@ impl GoalState {
                     self.completion_verification = None;
                     self.last_gap_fingerprint = None;
                     self.repeated_gap_count = 0;
+                    self.last_gap_pass = None;
                 }
 
                 if changed || status_changed || self.status.is_none() {
@@ -458,6 +465,7 @@ impl GoalState {
         self.advisories.clear();
         self.last_gap_fingerprint = None;
         self.repeated_gap_count = 0;
+        self.last_gap_pass = None;
         Ok(())
     }
 
@@ -470,6 +478,13 @@ impl GoalState {
     /// the engine is rehydrating, not re-declaring, the goal. Evidence,
     /// blockers, and review notes are runtime-only and start empty; the
     /// durable loop re-derives them on the next pass.
+    ///
+    /// The stall fingerprint is deliberately runtime-only too: a stall does not
+    /// need to be replayed, because
+    /// [`crate::goal_loop::MAX_REPEATED_GAP_PASSES`] already converted it into a
+    /// pause, and a paused goal is what gets persisted and restored here. A
+    /// resume therefore starts a fresh stall window — which is correct, since a
+    /// resume is someone deciding the goal is worth continuing.
     #[must_use]
     pub fn from_persisted(
         objective: &str,
@@ -496,6 +511,7 @@ impl GoalState {
             advisories: Vec::new(),
             last_gap_fingerprint: None,
             repeated_gap_count: 0,
+            last_gap_pass: None,
         }
     }
 
@@ -565,12 +581,38 @@ impl GoalState {
 
         let fingerprint = gap_fingerprint(&verification.gaps)
             .ok_or("Critical not-achieved verification requires at least one concrete gap.")?;
-        self.repeated_gap_count = if self.last_gap_fingerprint.as_deref() == Some(&fingerprint) {
-            self.repeated_gap_count.saturating_add(1)
-        } else {
+        // Advance at most once per continuation pass. `record_not_achieved`
+        // runs per `update_goal` tool call, so counting calls would let a
+        // verifier that reports one gap three times in a single turn pause the
+        // goal before a single continuation had been spent — stopping valid
+        // work rather than a stall.
+        let same_gap = self.last_gap_fingerprint.as_deref() == Some(&fingerprint);
+        let already_counted_this_pass = self.last_gap_pass == Some(self.continuation_count);
+        self.repeated_gap_count = if !same_gap {
             1
+        } else if already_counted_this_pass {
+            self.repeated_gap_count
+        } else {
+            self.repeated_gap_count.saturating_add(1)
         };
+        self.last_gap_pass = Some(self.continuation_count);
         self.last_gap_fingerprint = Some(fingerprint);
+
+        // The stall bound the continuation prompt promises. Pausing *is* the
+        // stop: both continuation dispatchers refuse to re-dispatch a goal
+        // whose snapshot is not "active", and the runtime host mirrors a
+        // non-limit pause into the durable `ThreadGoalStatus::Paused`, so this
+        // needs no second gate in `decide_continuation` and survives a restart
+        // until someone explicitly resumes.
+        if self.repeated_gap_count >= crate::goal_loop::MAX_REPEATED_GAP_PASSES {
+            tracing::warn!(
+                repeated_gap_count = self.repeated_gap_count,
+                max_repeated_gap_passes = crate::goal_loop::MAX_REPEATED_GAP_PASSES,
+                "goal stall pause: critical verifier reported an equivalent gap set on \
+                 consecutive passes; pausing for inspection instead of spending further"
+            );
+            self.mark_paused(GoalPauseReason::NoProgress)?;
+        }
 
         Ok(())
     }
@@ -790,10 +832,11 @@ pub fn thread_goal_status_projection(
 pub fn render_continuation_prompt(snapshot: &GoalSnapshot, continuation_index: u32) -> String {
     let goal_json = serde_json::to_string_pretty(snapshot).unwrap_or_else(|_| "{}".to_string());
     format!(
-        "{}\n\n## Active Goal State\n\n```json\n{}\n```\n\nContinuation pass #{}.\nIf a critical verifier finds remaining work, call `update_goal` with `status: \"not_achieved\"` and its concrete `verification.gaps`; repeated equivalent gap sets pause the loop for inspection instead of spending indefinitely. If the goal is complete, first run or cite a concrete verifier/check when one applies, then call `update_goal` with `status: \"complete\"`, concrete evidence, and `verification: {{\"status\":\"passed\",\"check\":\"...\",\"summary\":\"...\"}}`. For non-verifiable work (docs, research, writing), use `verification: {{\"status\":\"not_applicable\",\"check\":\"...\",\"summary\":\"...\"}}` with a clear rationale instead of fabricating a verifier receipt. If it is blocked, call `update_goal` with `status: \"blocked\"` and the blocker. Otherwise continue making progress toward the objective.",
+        "{}\n\n## Active Goal State\n\n```json\n{}\n```\n\nContinuation pass #{}.\nIf a critical verifier finds remaining work, call `update_goal` with `status: \"not_achieved\"` and its concrete `verification.gaps`; {} equivalent gap sets in a row pause this goal (`no progress`) for inspection instead of spending indefinitely, so report what actually still fails rather than restating the previous pass. If the goal is complete, first run or cite a concrete verifier/check when one applies, then call `update_goal` with `status: \"complete\"`, concrete evidence, and `verification: {{\"status\":\"passed\",\"check\":\"...\",\"summary\":\"...\"}}`. For non-verifiable work (docs, research, writing), use `verification: {{\"status\":\"not_applicable\",\"check\":\"...\",\"summary\":\"...\"}}` with a clear rationale instead of fabricating a verifier receipt. If it is blocked, call `update_goal` with `status: \"blocked\"` and the blocker. Otherwise continue making progress toward the objective.",
         crate::prompts::GOAL_CONTINUATION_PROMPT.trim(),
         goal_json,
         continuation_index,
+        crate::goal_loop::MAX_REPEATED_GAP_PASSES,
     )
 }
 
@@ -1729,6 +1772,9 @@ mod tests {
                 &["first gap"],
             ))
             .expect("first critical review");
+        // Two reports of one gap only count twice when they land on separate
+        // continuation passes; several inside one turn are one pass.
+        state.record_continuation();
         state
             .record_not_achieved(not_achieved_review(
                 GoalReviewRole::Critical,
@@ -1757,6 +1803,97 @@ mod tests {
         let progressed = state.snapshot();
         assert_eq!(progressed.repeated_gap_count, 1);
         assert_eq!(progressed.status, "active");
+    }
+
+    #[test]
+    fn repeated_equivalent_gap_sets_pause_the_loop_for_no_progress() {
+        // The continuation prompt promises this stop, and until it existed the
+        // default Operate goal had none: `DEFAULT_MAX_GOAL_CONTINUATIONS` is 0,
+        // so only the model volunteering complete/blocked ended a run.
+        let mut state = GoalState::default();
+        state
+            .create("stall on purpose".to_string(), None)
+            .expect("create goal");
+
+        for pass in 1..crate::goal_loop::MAX_REPEATED_GAP_PASSES {
+            state
+                .record_not_achieved(not_achieved_review(
+                    GoalReviewRole::Critical,
+                    &["provider copy still wrong", "  Regression   test MISSING "],
+                ))
+                .expect("critical review below the stall bound");
+            let snapshot = state.snapshot();
+            assert_eq!(snapshot.repeated_gap_count, pass);
+            assert!(
+                snapshot.is_active(),
+                "pass {pass} is under the bound and must keep working",
+            );
+            // The bound counts continuation PASSES, so each iteration has to
+            // actually be one. Without this the loop would be several reports
+            // inside a single turn, which deliberately no longer advances it.
+            state.record_continuation();
+        }
+
+        // Reordered and re-cased wording is the same gap set, so restating the
+        // previous pass cannot buy another pass.
+        state
+            .record_not_achieved(not_achieved_review(
+                GoalReviewRole::Critical,
+                &["Regression test missing", "PROVIDER copy still wrong"],
+            ))
+            .expect("stall review is recorded, not rejected");
+
+        let stalled = state.snapshot();
+        assert_eq!(
+            stalled.repeated_gap_count,
+            crate::goal_loop::MAX_REPEATED_GAP_PASSES
+        );
+        assert_eq!(stalled.status, "paused");
+        assert_eq!(stalled.pause_reason, Some(GoalPauseReason::NoProgress));
+        assert!(
+            !stalled.is_active(),
+            "an inactive goal is what stops both continuation dispatchers",
+        );
+
+        // The pause holds: a stalled goal cannot keep reporting gaps at itself.
+        let err = state
+            .record_not_achieved(not_achieved_review(
+                GoalReviewRole::Critical,
+                &["provider copy still wrong"],
+            ))
+            .expect_err("a paused goal takes no further verifier progress");
+        assert!(err.contains("active goal"));
+    }
+
+    #[test]
+    fn repeating_one_gap_inside_a_single_turn_does_not_trip_the_stall_bound() {
+        // `record_not_achieved` runs per `update_goal` tool call. Counting
+        // calls rather than passes meant a verifier that restated the same gap
+        // three times in ONE turn paused the goal before a single continuation
+        // had been spent — stopping valid work and calling it a stall.
+        let mut state = GoalState::default();
+        state
+            .create("one turn, several reports".to_string(), None)
+            .expect("create goal");
+
+        for _ in 0..(crate::goal_loop::MAX_REPEATED_GAP_PASSES + 2) {
+            state
+                .record_not_achieved(not_achieved_review(
+                    GoalReviewRole::Critical,
+                    &["provider copy still wrong"],
+                ))
+                .expect("repeated reports inside one turn are recorded");
+        }
+
+        let snapshot = state.snapshot();
+        assert_eq!(
+            snapshot.repeated_gap_count, 1,
+            "many reports in one turn are still one pass",
+        );
+        assert!(
+            snapshot.is_active(),
+            "no continuation was spent, so there is no stall to pause on",
+        );
     }
 
     #[tokio::test]
@@ -1914,6 +2051,16 @@ mod tests {
         assert!(prompt.contains("Goal Continuation"));
         assert!(prompt.contains("finish issue 2199"));
         assert!(prompt.contains("Continuation pass #2"));
+        // The named bound has to be the one the state machine actually
+        // enforces; the prompt used to promise a stall stop that nothing
+        // implemented.
+        assert!(
+            prompt.contains(&format!(
+                "{} equivalent gap sets in a row",
+                crate::goal_loop::MAX_REPEATED_GAP_PASSES
+            )),
+            "{prompt}"
+        );
     }
 
     #[test]

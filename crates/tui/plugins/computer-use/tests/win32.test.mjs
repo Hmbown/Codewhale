@@ -2,7 +2,8 @@
 // (`create({ exec })`): the fake runner captures the PowerShell scripts so the
 // generated commands can be asserted directly, and no real powershell.exe is
 // ever spawned. These pin the failure-truthful and self-contained-action
-// behavior merged in #5903 without needing a Windows host or a
+// behavior ported from the codewhale-side hardening (injectable runner +
+// truthful PowerShell failure reporting) without needing a Windows host or a
 // fake-powershell.exe-on-PATH fixture.
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -38,6 +39,18 @@ test("win32: input actions fail truthfully on a nonzero exit", async () => {
   const b = mod.create({ exec: { run } });
   await assert.rejects(() => b.left_click({ target: { x: 1, y: 2 } }), /exited 1/);
   await assert.rejects(() => b.left_mouse_down({ target: { x: 1, y: 2 } }), /exited 1/);
+});
+
+test("win32: coordinate clicks refuse strategy=a11y instead of silently degrading", async () => {
+  const { run, calls } = mockExec();
+  const mod = await import("../src/backends/win32.mjs");
+  const b = mod.create({ exec: { run } });
+  // left_click refuses synchronously (it is not async), like every fail-closed
+  // guard in this backend — see backends.test.mjs for the same convention.
+  assert.throws(() => b.left_click({ target: { x: 1, y: 2 }, strategy: "a11y" }), /macOS-only/);
+  assert.equal(calls.length, 0, "no command may be spawned for a refused strategy");
+  // auto and event remain accepted on this backend.
+  assert.equal((await b.left_click({ target: { x: 1, y: 2 }, strategy: "event" })).action_sent, true);
 });
 
 test("win32: targeted left_mouse_down both moves and presses, self-contained", async () => {

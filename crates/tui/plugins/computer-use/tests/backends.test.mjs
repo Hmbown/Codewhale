@@ -111,13 +111,28 @@ test("harmony: clipboard and select_text fail closed with named reasons", async 
 test("linux: probe reports the session and names missing tools (fail-closed)", async () => {
   const mod = await import("../src/backends/linux.mjs");
   const b = mod.create({ exec: (await import("../src/remote-runtime.mjs")).exec });
-  const p = await b.probe();
+  let p = null;
+  try {
+    p = await b.probe();
+  } catch (e) {
+    // No display session on this host: probe must fail closed with no_session.
+    assert.equal(e.code, "no_session");
+    return;
+  }
   assert.equal(p.platform, "linux");
-  assert.ok(["x11", "wayland", null].includes(p.session));
+  assert.ok(["x11", "wayland"].includes(p.session));
   assert.equal(typeof p.missing.length, "number");
-  // On a host with no display session, screenshot must fail closed.
-  if (p.session === null) {
-    await assert.rejects(() => b.screenshot({}), /X11|Wayland/);
+});
+
+test("linux: probe rejects with no_session when no display session is visible", async () => {
+  const saved = {};
+  for (const k of ["DISPLAY", "WAYLAND_DISPLAY", "XDG_SESSION_TYPE"]) { saved[k] = process.env[k]; delete process.env[k]; }
+  try {
+    const mod = await import("../src/backends/linux.mjs");
+    const b = mod.create({ exec: (await import("../src/remote-runtime.mjs")).exec });
+    await assert.rejects(() => b.probe(), (e) => e.code === "no_session" && /DISPLAY/.test(e.message));
+  } finally {
+    for (const k of ["DISPLAY", "WAYLAND_DISPLAY", "XDG_SESSION_TYPE"]) { if (saved[k] !== undefined) process.env[k] = saved[k]; }
   }
 });
 
@@ -150,141 +165,4 @@ test("remote agent answers the platform probe", async () => {
   const reply = JSON.parse(r.stdout.trim());
   assert.equal(reply.ok, true);
   assert.equal(reply.platform, process.platform);
-});
-
-// ---------- darwin: permission probe names the missing grant and its owner (#5917) ----------
-import { create as createDarwin } from "../src/backends/darwin.mjs";
-
-function darwinExec({ accessibility, screen_recording }) {
-  const calls = [];
-  const shell = String(process.ppid + 1);
-  const chain = {
-    [String(process.ppid)]: `${shell} /bin/zsh`,
-    [shell]: "1 /Applications/iTerm.app/Contents/MacOS/iTerm2",
-  };
-  const run = async (cmd, args) => {
-    calls.push({ cmd, args });
-    if (cmd === "osascript") return { code: 0, stdout: JSON.stringify({ accessibility, screen_recording }), stderr: "" };
-    if (cmd === "ps") {
-      const row = chain[args[args.length - 1]];
-      return row ? { code: 0, stdout: row, stderr: "" } : { code: 1, stdout: "", stderr: "" };
-    }
-    return { code: 0, stdout: "", stderr: "" };
-  };
-  return { run, runOk: run, calls };
-}
-
-test("darwin: probe reports denied TCC grants as missing capabilities and names the host app to fix", async () => {
-  const exec = darwinExec({ accessibility: false, screen_recording: false });
-  const b = createDarwin({ exec });
-  const p = await b.probe();
-  assert.deepEqual(p.missing, ["accessibility", "screen_recording"]);
-  assert.equal(p.capabilities.screenshot, false);
-  assert.equal(p.capabilities.recording, false);
-  assert.equal(p.capabilities.accessibility_tree, false);
-  assert.equal(p.capabilities.raw_input, false);
-  assert.equal(p.permissions.accessibility, "denied");
-  assert.equal(p.permissions.screen_recording, "denied");
-  assert.equal(p.host_app, "iTerm");
-  assert.match(p.how_to_fix.accessibility, /Privacy & Security → Accessibility.*"iTerm"/);
-  assert.match(p.how_to_fix.screen_recording, /Screen & System Audio Recording.*"iTerm"/);
-  assert.match(p.note, /Missing: accessibility, screen_recording/);
-});
-
-test("darwin: after a denied probe, input fails fast with the remedy instead of spawning osascript", async () => {
-  const exec = darwinExec({ accessibility: false, screen_recording: true });
-  const b = createDarwin({ exec });
-  await b.probe();
-  const before = exec.calls.filter((c) => c.cmd === "osascript").length;
-  await assert.rejects(() => b.key({ text: "a" }), /accessibility permission is not granted to "iTerm".*Privacy & Security → Accessibility/);
-  assert.equal(exec.calls.filter((c) => c.cmd === "osascript").length, before, "no osascript spawn for a known-denied grant");
-});
-
-test("darwin: granted TCC state reports every capability available and no remedy", async () => {
-  const exec = darwinExec({ accessibility: true, screen_recording: true });
-  const b = createDarwin({ exec });
-  const p = await b.probe();
-  assert.deepEqual(p.missing, []);
-  assert.deepEqual(p.how_to_fix, {});
-  assert.equal(p.permissions.accessibility, "granted");
-  assert.equal(p.permissions.screen_recording, "granted");
-  assert.equal(p.capabilities.screenshot, true);
-  assert.equal(p.capabilities.raw_input, true);
-});
-
-test("darwin: CGEvent input scripts receive their payload and a real timeout (#5917)", async () => {
-  const calls = [];
-  const run = async (cmd, args, opts) => {
-    calls.push({ cmd, args, opts });
-    if (cmd === "osascript") return { code: 0, stdout: JSON.stringify({ ok: true }), stderr: "" };
-    return { code: 1, stdout: "", stderr: "" };
-  };
-  const b = createDarwin({ exec: { run, runOk: run } });
-  await b.key({ text: "cmd+q" });
-  const scripts = calls.filter((c) => c.cmd === "osascript" && JSON.parse(c.args.at(-1)).code !== undefined);
-  assert.equal(scripts.length, 2, "one keydown and one keyup event");
-  for (const c of scripts) {
-    const payload = JSON.parse(c.args[c.args.length - 1]);
-    assert.equal(payload.code, 12, "q keycode travels in the payload");
-    assert.ok(payload.flags > 0, "cmd modifier flag travels in the payload");
-    assert.equal(c.opts.timeoutMs, 10_000, "the timeout is the CGEvent default, not the payload object");
-  }
-  await b.type({ text: "hi" });
-  const typed = JSON.parse(calls.at(-1).args.at(-1));
-  assert.equal(typed.text, "hi");
-  assert.equal(calls.at(-1).opts.timeoutMs, 15_000);
-});
-
-
-// ---------- darwin: keystrokes name and guard the app that receives them (#5927) ----------
-function darwinDesktopExec({ frontmost, calculatorFrontmost }) {
-  const calls = [];
-  const run = async (cmd, args, opts) => {
-    calls.push({ cmd, args, opts });
-    if (cmd === "open") return { code: 0, stdout: "", stderr: "" };
-    if (cmd !== "osascript") return { code: 1, stdout: "", stderr: "" };
-    const payload = JSON.parse(args.at(-1));
-    if (payload.probe === "frontmost-app") return { code: 0, stdout: JSON.stringify({ found: true, ...frontmost }), stderr: "" };
-    if (payload.name || payload.bundle_id || payload.pid != null) {
-      const isCalc = String(payload.name || "").toLowerCase() === "calculator";
-      return { code: 0, stdout: JSON.stringify(isCalc ? { found: true, name: "Calculator", pid: 2, bundle_id: "com.apple.calculator", frontmost: calculatorFrontmost } : { found: false }), stderr: "" };
-    }
-    return { code: 0, stdout: JSON.stringify({ ok: true }), stderr: "" };
-  };
-  return { run, runOk: run, calls };
-}
-const cgEventCalls = (calls) => calls.filter((c) => c.cmd === "osascript" && JSON.parse(c.args.at(-1)).code !== undefined);
-
-test("darwin: open_application with activate reports truthfully when the app never comes to the front", async () => {
-  const exec = darwinDesktopExec({ frontmost: { name: "Ghostty", pid: 1, bundle_id: "com.mitchellh.ghostty" }, calculatorFrontmost: false });
-  const b = createDarwin({ exec });
-  const r = await b.open_application({ name: "Calculator", activate: true });
-  assert.equal(r.launched, true);
-  assert.equal(r.frontmost, false);
-  assert.equal(r.pid, 2);
-  assert.match(r.note, /did not come to the front/);
-});
-
-test("darwin: a guarded key refuses when the named app is not frontmost and posts nothing", async () => {
-  const exec = darwinDesktopExec({ frontmost: { name: "Ghostty", pid: 1, bundle_id: "com.mitchellh.ghostty" }, calculatorFrontmost: false });
-  const b = createDarwin({ exec });
-  await assert.rejects(() => b.key({ text: "cmd+q", app_ref: { name: "Calculator" } }), /"Calculator" is not frontmost \("Ghostty" is\)/);
-  assert.equal(cgEventCalls(exec.calls).length, 0, "no CGEvent may be posted to the wrong app");
-});
-
-test("darwin: an unguarded key still names the app that received it", async () => {
-  const exec = darwinDesktopExec({ frontmost: { name: "Ghostty", pid: 1, bundle_id: "com.mitchellh.ghostty" }, calculatorFrontmost: false });
-  const b = createDarwin({ exec });
-  const r = await b.key({ text: "a" });
-  assert.equal(r.action_sent, true);
-  assert.deepEqual(r.frontmost_app, { name: "Ghostty", pid: 1, bundle_id: "com.mitchellh.ghostty" });
-  assert.equal(cgEventCalls(exec.calls).length, 2);
-});
-
-test("darwin: a guarded key goes through when the named app is frontmost", async () => {
-  const exec = darwinDesktopExec({ frontmost: { name: "Calculator", pid: 2, bundle_id: "com.apple.calculator" }, calculatorFrontmost: true });
-  const b = createDarwin({ exec });
-  const r = await b.type({ text: "7", app_ref: { name: "Calculator" } });
-  assert.equal(r.action_sent, true);
-  assert.equal(r.frontmost_app.name, "Calculator");
 });

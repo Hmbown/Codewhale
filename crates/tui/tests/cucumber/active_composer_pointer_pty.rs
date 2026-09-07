@@ -98,19 +98,25 @@ fn run_pointer_submit_case(rows: u16, cols: u16) {
         &format!("{size}: offline explore ready"),
     );
     tui.send(keys::key::enter()).expect("leave onboarding");
-    wait_or_panic(
-        &mut tui,
-        "New session",
+    // PTY reads can split a redraw: the launch header arrives before the
+    // composer, with onboarding rows still on screen (Buildkite #1861/#1867).
+    // Wait for the input surface as well as the header before asserting it.
+    tui.wait_for(
+        |frame| {
+            let text = frame.text();
+            text.contains("New session") && text.contains('❯') && !text.contains("You're ready.")
+        },
         STARTUP_WAIT,
-        &format!("{size}: show the launch card"),
-    );
+    )
+    .unwrap_or_else(|error| panic!("{size}: show the launch card and composer: {error}"));
     tui.pump();
     assert_startup_contract(tui.frame(), rows, cols, &size);
     // Typing goes straight to the composer; Enter sends the first message
     // and the session begins (the card dissolved on the first keystroke).
-    tui.send("start the session")
-        .expect("type the first prompt");
-    tui.send(keys::key::enter()).expect("send the first prompt");
+    // type_line, not send+enter: a zero-gap PTY write is paste-classified
+    // and the immediate Enter would be absorbed as a pasted newline.
+    tui.type_line("start the session")
+        .expect("type and send the first prompt");
     if tui
         .wait_for(|frame| !frame.text().contains('\u{2442}'), STARTUP_WAIT)
         .is_err()

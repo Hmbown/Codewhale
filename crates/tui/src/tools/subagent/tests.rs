@@ -18910,9 +18910,10 @@ fn the_launched_authority_is_the_one_the_spawn_boundary_accepts() {
         "auditor",
         codewhale_workflow::PermissionCeiling::preset("analyst").expect("preset"),
     );
-    // Free-form Fleet identity maps to Runtime `custom`; the read-only parent
-    // still narrows the effective capability envelope.
-    assert_eq!(authority.posture_role, "custom");
+    // A free-form Fleet identity is undeclared, so it now fails closed to the
+    // read-only `explore` posture rather than inheriting write-capable
+    // `custom` (#5575). The read-only parent narrows on top of that.
+    assert_eq!(authority.posture_role, "explore");
     assert_eq!(authority.write_authority, "read_only");
 
     let mut deny = authority.disallowed_tools.clone();

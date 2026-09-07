@@ -15,10 +15,12 @@ description: Capture screen recordings and screenshots on any registered compute
 
 Platform truths:
 
-- **macOS**: `screencapture -v` per display; stop finalizes a .mov and, when
-  ffmpeg is installed, a stream-copied .mp4 alongside. If a recording dies
-  instantly, the terminal host is missing Screen Recording permission — tell
-  the user, do not retry.
+- **macOS**: ScreenCaptureKit inside the signed helper captures a display or
+  region straight to .mov — no system recorder selection UI and no desktop
+  dimming overlay. If capture is denied, Screen Recording permission is
+  missing for whoever ran it: the Codewhale Computer Use app when
+  `request_access` says `via: "app"`, else the terminal that hosts the
+  server — tell the user which, do not retry.
 - **Windows**: ffmpeg gdigrab of the desktop or a region.
 - **Linux X11**: ffmpeg x11grab (honors $DISPLAY, region, fps). Wayland:
   wf-recorder (per-output via CU_WAYLAND_OUTPUT).

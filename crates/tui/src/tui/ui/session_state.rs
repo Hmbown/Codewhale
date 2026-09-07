@@ -437,7 +437,9 @@ pub(crate) fn record_turn_activity(app: &mut App, event: &EngineEvent, now: Inst
 
 pub(crate) fn persist_offline_queue_state(app: &App) {
     if app.queued_messages.is_empty() && app.queued_draft.is_none() {
-        persistence_actor::persist(PersistRequest::ClearOfflineQueue);
+        persistence_actor::persist(PersistRequest::ClearOfflineQueue {
+            session_id: app.current_session_id.clone(),
+        });
         return;
     }
     let state = OfflineQueueState {

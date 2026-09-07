@@ -252,6 +252,31 @@ jobs:
         # platform backends, and the MCP stdio protocol. No GUI input runs.
         run: (cd crates/tui/plugins/computer-use && npm test)
 
+  vscode-extension:
+    name: VS Code extension
+    timeout-minutes: 15
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: extensions/vscode
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          # The extension targets VS Code >=1.90, whose extension host is
+          # Node 20, and its @types/node pin is ^20. Build and test on the
+          # runtime the extension actually ships against.
+          node-version: 20
+      - name: Install extension dependencies
+        run: npm ci
+      - name: Run VS Code extension suites
+        # extensions/vscode ships node --test suites (api, markdown, sse) that
+        # NO workflow ran: release.yml only reads package.json for a version
+        # string, so the whole client compiled and shipped without its tests or
+        # `tsc` ever running in CI. `npm test` compiles first (tsc -p ./), so
+        # this is the type-check gate for the extension too.
+        run: npm test
+
   safety-gate:
     name: Safety gate
     needs: changes

@@ -148,8 +148,17 @@ test("registering an ssh computer installs the agent and probes the platform", a
     assert.ok(Array.isArray(apps.apps) && apps.apps.length > 0, "apps returned over the wire");
   } else {
     assert.equal(process.platform, "linux", JSON.stringify(apps.error ?? {}));
-    assert.equal(apps.error.code, "tool_error");
-    assert.match(apps.error.message, /wmctrl|swaymsg|hyprctl/u);
+    // A headless CI host fails closed with either shape: the modern
+    // no_session (no $DISPLAY/$WAYLAND_DISPLAY visible to the process)
+    // or the older tool_error naming the missing window-manager tool.
+    // Either answer proves the ssh round trip reached the remote
+    // backend and came back.
+    assert.ok(
+      apps.error.code === "no_session" ||
+        (apps.error.code === "tool_error" &&
+          /wmctrl|swaymsg|hyprctl/u.test(apps.error.message)),
+      JSON.stringify(apps.error ?? {}),
+    );
   }
 });
 

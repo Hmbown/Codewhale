@@ -66,12 +66,17 @@ const COMPUTER_USE_FILES: &[(&str, &str)] = &[
     bundle_file!("skills/recording/SKILL.md"),
     bundle_file!("agent.mjs"),
     bundle_file!("mcp/server.mjs"),
+    bundle_file!("src/app-handler.mjs"),
+    bundle_file!("src/app-socket.mjs"),
     bundle_file!("src/exec.mjs"),
+    bundle_file!("src/png-size.mjs"),
     bundle_file!("src/registry.mjs"),
     bundle_file!("src/remote-runtime.mjs"),
     bundle_file!("src/tools.mjs"),
     bundle_file!("src/transport.mjs"),
     bundle_file!("src/backends/darwin.mjs"),
+    bundle_file!("src/backends/darwin-accessibility.m"),
+    bundle_file!("src/backends/darwin-recording.h"),
     bundle_file!("src/backends/harmonyos.mjs"),
     bundle_file!("src/backends/linux.mjs"),
     bundle_file!("src/backends/win32.mjs"),
@@ -190,6 +195,55 @@ mod tests {
     use super::*;
 
     use crate::plugins::types::{PluginScope, PluginTrustStatus};
+
+    /// The vendored tree and the embed list are two views of one bundle.
+    /// This pins them together so a refreshed bundle can never leave a
+    /// runtime file out of `COMPUTER_USE_FILES` — the materialized server
+    /// would crash at import the first time it needed the missing module —
+    /// and an embed entry can never outlive its file. Development-only
+    /// files stay out of the binary by the documented policy on
+    /// `COMPUTER_USE_FILES`.
+    #[test]
+    fn computer_use_embed_list_matches_the_vendored_runtime_tree() {
+        const DEV_ONLY: &[&str] = &["package.json", "README.md", "scripts/smoke.mjs"];
+
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("plugins/computer-use");
+        let mut on_disk: Vec<String> = Vec::new();
+        let mut stack = vec![root.clone()];
+        while let Some(dir) = stack.pop() {
+            for entry in fs::read_dir(&dir).unwrap() {
+                let entry = entry.unwrap();
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                let relative = path
+                    .strip_prefix(&root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                if relative.starts_with("tests/") || DEV_ONLY.contains(&relative.as_str()) {
+                    continue;
+                }
+                on_disk.push(relative);
+            }
+        }
+        on_disk.sort();
+
+        let mut embedded: Vec<&str> = COMPUTER_USE_FILES
+            .iter()
+            .map(|(relative, _)| *relative)
+            .collect();
+        embedded.sort_unstable();
+
+        let expected: Vec<&str> = on_disk.iter().map(String::as_str).collect();
+        assert_eq!(
+            embedded, expected,
+            "COMPUTER_USE_FILES and crates/tui/plugins/computer-use disagree — sync the embed \
+             list with the vendored runtime tree"
+        );
+    }
 
     #[test]
     fn computer_use_is_discovered_but_never_auto_enabled() {

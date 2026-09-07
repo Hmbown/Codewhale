@@ -4710,12 +4710,17 @@ impl Engine {
                                     tool_state.name, partial_json, tool_state.input_buffer
                                 ));
                             }
-                            if let Some(value) = parse_tool_input(&tool_state.input_buffer) {
-                                tool_state.input = value.clone();
+                            // Mid-stream mirror of a partial buffer. The
+                            // argument text is *expected* to be incomplete
+                            // here, so `structure_synthesized` is ignored on
+                            // purpose; ContentBlockStop below is where an
+                            // unfinished argument becomes an error.
+                            if let Some(parsed) = parse_tool_input(&tool_state.input_buffer) {
+                                tool_state.input = parsed.value.clone();
                                 if crate::logging::is_verbose() {
                                     crate::logging::info(format!(
                                         "Tool '{}' input parsed: {:?}",
-                                        tool_state.name, value
+                                        tool_state.name, parsed.value
                                     ));
                                 }
                             }
@@ -4764,37 +4769,7 @@ impl Engine {
                             "Tool '{}' block stop. Buffer: '{}', Current input: {:?}",
                             tool_state.name, tool_state.input_buffer, tool_state.input
                         ));
-                        if !tool_state.input_buffer.trim().is_empty() {
-                            if let Some(value) = parse_tool_input(&tool_state.input_buffer) {
-                                tool_state.input = value;
-                                crate::logging::info(format!(
-                                    "Tool '{}' final input: {:?}",
-                                    tool_state.name, tool_state.input
-                                ));
-                            } else {
-                                crate::logging::warn(format!(
-                                    "Tool '{}' failed to parse final input buffer: '{}'",
-                                    tool_state.name, tool_state.input_buffer
-                                ));
-                                let error =
-                                    malformed_tool_arguments_error(&tool_state.input_buffer);
-                                tool_state.input_parse_error = Some(error);
-                                tool_state.input =
-                                    malformed_tool_arguments_input(&tool_state.input_buffer);
-                                let _ = self
-                                    .tx_event
-                                    .send(Event::status(format!(
-                                        "⚠ Tool '{}' received malformed arguments from model",
-                                        tool_state.name
-                                    )))
-                                    .await;
-                            }
-                        } else {
-                            crate::logging::warn(format!(
-                                "Tool '{}' input buffer is empty, using initial input: {:?}",
-                                tool_state.name, tool_state.input
-                            ));
-                        }
+                        self.finalize_streamed_tool_input(tool_state).await;
 
                         // Now that the input is finalized, announce the
                         // tool call to the UI. Deferring to here is what
@@ -4848,6 +4823,29 @@ impl Engine {
                 }
             }
         }
+        // A stream cut at the provider's output limit ends without the
+        // closing ContentBlockStop for whatever block was in flight. Those
+        // blocks' inputs still hold the mid-stream mirror's best-effort
+        // parse, which ignores `structure_synthesized` by design — left
+        // as-is, a truncated tool call reaches dispatch through
+        // `tool.input` and executes (#5986). Every block that never
+        // stopped goes through the same finalization gate a normal
+        // ContentBlockStop applies, and is announced with the same
+        // finalized input.
+        for tool_idx in std::mem::take(&mut current_tool_indices).into_values() {
+            let Some(tool_state) = tool_uses.get_mut(tool_idx) else {
+                continue;
+            };
+            self.finalize_streamed_tool_input(tool_state).await;
+            let _ = self
+                .tx_event
+                .send(Event::ToolCallStarted {
+                    id: tool_state.id.clone(),
+                    name: tool_state.name.clone(),
+                    input: final_tool_input(tool_state),
+                })
+                .await;
+        }
         StreamOutcome {
             current_text_raw,
             current_text_visible,
@@ -4868,6 +4866,51 @@ impl Engine {
             request_dispatched_at,
             stream_error,
         }
+    }
+
+    /// Finalize one streamed tool call's input from its accumulated buffer.
+    ///
+    /// The parse that lands here must be structurally intact: a value that
+    /// only parses because the repair ladder appended or discarded closers
+    /// means the argument text was cut off, and dispatching it would
+    /// execute a truncated tool call (#5986). Called for a tool block that
+    /// closes normally (`ContentBlockStop`) and again after the stream ends
+    /// for blocks whose Stop never arrived — a provider cutting the stream
+    /// at its output limit omits the closing event, while the mid-stream
+    /// mirror deliberately ignores `structure_synthesized` because partial
+    /// text is the normal state mid-stream.
+    async fn finalize_streamed_tool_input(&self, tool_state: &mut ToolUseState) {
+        if tool_state.input_buffer.trim().is_empty() {
+            crate::logging::warn(format!(
+                "Tool '{}' input buffer is empty, using initial input: {:?}",
+                tool_state.name, tool_state.input
+            ));
+            return;
+        }
+        let final_parse = parse_tool_input(&tool_state.input_buffer)
+            .filter(|parsed| !parsed.structure_synthesized);
+        if let Some(parsed) = final_parse {
+            tool_state.input = parsed.value;
+            crate::logging::info(format!(
+                "Tool '{}' final input: {:?}",
+                tool_state.name, tool_state.input
+            ));
+            return;
+        }
+        crate::logging::warn(format!(
+            "Tool '{}' failed to parse final input buffer: '{}'",
+            tool_state.name, tool_state.input_buffer
+        ));
+        let error = malformed_tool_arguments_error(&tool_state.input_buffer);
+        tool_state.input_parse_error = Some(error);
+        tool_state.input = malformed_tool_arguments_input(&tool_state.input_buffer);
+        let _ = self
+            .tx_event
+            .send(Event::status(format!(
+                "⚠ Tool '{}' received malformed arguments from model",
+                tool_state.name
+            )))
+            .await;
     }
 
     fn goal_snapshot_with_current_turn_usage(

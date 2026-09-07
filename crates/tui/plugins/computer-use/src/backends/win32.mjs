@@ -55,6 +55,13 @@ const MODVK = { ctrl: 0x11, control: 0x11, alt: 0x12, shift: 0x10, win: 0x5b, me
 // (Add-Type re-definition is tolerated through -ErrorAction SilentlyContinue).
 const USER32_PRELUDE = `Add-Type -TypeDefinition @'\n${USER32}\n'@ -ErrorAction SilentlyContinue;`;
 
+/** Coordinate clicks on this backend are always raw pointer events; strategy="a11y" must fail closed rather than silently degrade. */
+function assertEventStrategy(strategy) {
+  if (strategy != null && strategy !== "auto" && strategy !== "event") {
+    throw new ExecError(`strategy "${strategy}" is macOS-only; this backend dispatches coordinate clicks as raw pointer events — use an element target for a semantic action`);
+  }
+}
+
 export function create(opts = {}) {
   // Allow tests (and other embedders) to inject a runner so no real
   // powershell.exe is spawned. Production uses the imported runner.
@@ -247,7 +254,7 @@ Write-Output '{"ok": true}';`;
       if (r.code !== 0 || !fs.existsSync(out)) throw new ExecError(`zoom failed: ${(r.stderr || "").slice(0, 250)}`, r);
       return { file: out, bytes: fs.statSync(out).size, region, source: src };
     },
-    left_click: ({ target }) => clickAt(0, target.x, target.y, 1),
+    left_click: ({ target, strategy }) => { assertEventStrategy(strategy); return clickAt(0, target.x, target.y, 1); },
     double_click: ({ target }) => clickAt(0, target.x, target.y, 2),
     triple_click: ({ target }) => clickAt(0, target.x, target.y, 3),
     right_click: ({ target }) => clickAt(1, target.x, target.y, 1),

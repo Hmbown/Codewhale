@@ -274,35 +274,64 @@ pub(super) fn final_tool_input(state: &ToolUseState) -> serde_json::Value {
     if !state.input_buffer.trim().is_empty()
         && let Some(parsed) = parse_tool_input(&state.input_buffer)
     {
-        return parsed;
+        // Structure was synthesized to make this parse, so the argument text
+        // was cut off. Route it to the same malformed-arguments path as an
+        // outright parse failure rather than dispatching a completed guess.
+        if parsed.structure_synthesized {
+            return malformed_tool_arguments_input(&state.input_buffer);
+        }
+        return parsed.value;
     }
     state.input.clone()
 }
 
-pub(super) fn parse_tool_input(buffer: &str) -> Option<serde_json::Value> {
+/// A parsed tool-argument buffer, plus whether the parse only succeeded
+/// because the repair ladder synthesized structure (see
+/// `crate::tools::arg_repair`). Mid-stream callers mirroring partial state
+/// may ignore the flag; the caller making the final dispatch decision must
+/// not, because synthesized structure means the argument text was cut off.
+pub(super) struct ParsedToolInput {
+    pub(super) value: serde_json::Value,
+    pub(super) structure_synthesized: bool,
+}
+
+pub(super) fn parse_tool_input(buffer: &str) -> Option<ParsedToolInput> {
     let trimmed = buffer.trim();
     if trimmed.is_empty() {
         return None;
     }
     // Try the deterministic arg-repair ladder first (handles trailing commas,
     // unclosed braces, embedded control chars, etc.)
-    if let Ok(value) = crate::tools::arg_repair::repair(trimmed) {
-        return Some(value);
+    if let Ok(repaired) = crate::tools::arg_repair::repair(trimmed) {
+        return Some(ParsedToolInput {
+            value: repaired.value,
+            structure_synthesized: repaired.structure_synthesized,
+        });
     }
     // Fall back to existing strategies for code-fenced, double-encoded, and
     // segment-extraction patterns that the repair ladder doesn't cover.
     if let Some(stripped) = strip_code_fences(trimmed)
         && let Ok(value) = serde_json::from_str::<serde_json::Value>(&stripped)
     {
-        return Some(value);
+        return Some(ParsedToolInput {
+            value,
+            structure_synthesized: false,
+        });
     }
     if let Ok(serde_json::Value::String(inner)) = serde_json::from_str::<serde_json::Value>(trimmed)
         && let Ok(value) = serde_json::from_str::<serde_json::Value>(&inner)
     {
-        return Some(value);
+        return Some(ParsedToolInput {
+            value,
+            structure_synthesized: false,
+        });
     }
     extract_json_segment(trimmed)
         .and_then(|segment| serde_json::from_str::<serde_json::Value>(&segment).ok())
+        .map(|value| ParsedToolInput {
+            value,
+            structure_synthesized: false,
+        })
 }
 
 /// Decode a JSON container that a provider encoded as a string when the tool

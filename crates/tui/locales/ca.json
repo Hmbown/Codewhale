@@ -1434,6 +1434,8 @@
   "ToolProjectionWarning": "Avís: {provider} ha omès eines incompatibles en aquesta sol·licitud: {tools}",
   "SnapshotsDisabledNotice": "Les instantànies i /undo estan desactivats per a {workspace}: {reason} Augmenta `{config_key}` a config.toml (o posa-ho a 0 per treure el límit) per activar-los.",
   "SessionIdDivergedNotice": "La identitat de la sessió ha canviat sota aquesta finestra: el motor ara desa els punts de control com a {next} (abans era {previous}). Els punts anteriors queden sota l'id antic; `codewhale sessions` els llista tots dos i `codewhale resume {previous}` reobre l'anterior.",
+  "RuntimeStoreUnreadableNotice": "Magatzem d'execució de la sessió: no s'ha pogut llegir {record} a {path} ({reason}). Aparta aquest fitxer (o suprimeix-lo) i torna-ho a provar; la resta de registres del fil es conserven.",
+  "RuntimeStoreUnwritableNotice": "Magatzem d'execució de la sessió: no s'ha pogut escriure {record} a {path} ({reason}). Comprova l'espai lliure i els permisos allà i torna-ho a provar; no s'ha sobreescrit res.",
   "ProviderExternalSemanticsRevoke": "{semantics} | revoca: {revoke}",
   "ProviderExternalRevoke": "revoca: {revoke}",
   "ProviderExternalChoiceTitle": " Accés a credencials externes · {provider} ",

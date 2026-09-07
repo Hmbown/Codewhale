@@ -22,6 +22,9 @@ codewhale-inference/
 !.env.example
 node_modules/
 .vscode/
+# The extension ships its own dev-loop config (F5 Extension Development Host).
+# Without this negation the bare `.vscode/` above swallows it silently.
+!/extensions/vscode/.vscode/
 .idea/
 *.swp
 *.swo

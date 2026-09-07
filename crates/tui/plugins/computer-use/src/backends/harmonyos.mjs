@@ -56,6 +56,13 @@ export function flatten(node, pathArr = [], out = []) {
   return out;
 }
 
+/** Coordinate clicks on this backend are always raw pointer events; strategy="a11y" must fail closed rather than silently degrade. */
+function assertEventStrategy(strategy) {
+  if (strategy != null && strategy !== "auto" && strategy !== "event") {
+    throw new ExecError(`strategy "${strategy}" is macOS-only; this backend dispatches coordinate clicks as raw pointer events — use an element target for a semantic action`);
+  }
+}
+
 export function create({ exec }) {
   const shell = (args, opts = {}) => exec.shell(args, { timeoutMs: 20_000, ...opts });
 
@@ -175,7 +182,7 @@ export function create({ exec }) {
     zoom: async ({ region, path: outPath }) => {
       throw new ExecError("zoom is not supported on the harmony backend yet — screenshot + region on the host is the workaround");
     },
-    left_click: ({ target }) => uiInput(["click", String(Math.round(target.x)), String(Math.round(target.y))]),
+    left_click: ({ target, strategy }) => { assertEventStrategy(strategy); return uiInput(["click", String(Math.round(target.x)), String(Math.round(target.y))]); },
     double_click: ({ target }) => uiInput(["doubleClick", String(Math.round(target.x)), String(Math.round(target.y))]),
     triple_click: async ({ target }) => {
       await uiInput(["doubleClick", String(Math.round(target.x)), String(Math.round(target.y))]);

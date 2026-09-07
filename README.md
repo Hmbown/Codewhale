@@ -60,6 +60,15 @@ codewhale exec "fix the failing tests and explain what changed"
 Codewhale can read your repository, edit files, run commands, inspect results,
 and keep working toward a goal. You decide how much access it has.
 
+## GUI frontend
+
+Prefer a graphical interface? The community-maintained CodeWhale for VS Code
+extension wraps the same agent in a VS Code sidebar — chat, threaded
+conversations, live diffs, and task management over the same Runtime API, so
+sessions stay in sync with the terminal. Install it from the
+[VS Code Marketplace](https://marketplace.visualstudio.com/items?itemName=HengQuWorld.brotherwhale-vscode);
+source code is on [GitHub](https://github.com/HengQuWorld/CodeWhale-VSCode).
+
 ## Why Codewhale
 
 - **Use the model you want.** Connect hosted providers or local models through

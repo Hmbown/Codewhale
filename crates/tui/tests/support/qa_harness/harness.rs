@@ -172,6 +172,22 @@ impl Harness {
         self.pty.write_bytes(&super::paste::unbracketed(text))
     }
 
+    /// Type a line of plain text and submit it: the text goes in as a
+    /// bracketed paste — this harness's terminal advertises bracketed
+    /// paste, and bulk text delivered as one zero-gap keystroke write is
+    /// (correctly) paste-classified by the burst heuristic, whose Enter
+    /// suppression window then swallows the submit — then a beat of idle,
+    /// then Enter. The real `Event::Paste` also disarms the heuristic for
+    /// the rest of the session, so later scripted typing behaves like a
+    /// terminal with verified bracketed paste. Slash commands don't need
+    /// this helper (Enter flushes buffered command text); plain prompts do.
+    pub fn type_line(&mut self, text: &str) -> Result<()> {
+        self.paste(text)?;
+        self.wait_for_text(text, Duration::from_secs(10))?;
+        std::thread::sleep(Duration::from_millis(150));
+        self.pty.write_bytes(&super::keys::key::enter())
+    }
+
     /// Pull whatever the child has written since last call into the frame
     /// parser. Returns `true` if any new bytes arrived.
     pub fn pump(&mut self) -> bool {

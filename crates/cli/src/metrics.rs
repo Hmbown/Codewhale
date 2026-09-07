@@ -1,10 +1,15 @@
 //! `codewhale metrics` — reads the audit log and session/task stores and prints
 //! a human-readable usage rollup.
 //!
-//! Data sources:
-//! - `~/.deepseek/audit.log`   — one JSON line per event (approvals, credentials)
-//! - `~/.deepseek/sessions/`   — saved session JSON files (tool call history)
-//! - `~/.deepseek/tasks/runtime/events/` — runtime thread JSONL event streams
+//! Data sources, all resolved through the shared Codewhale state resolvers so
+//! the reader lands on the same files the writers use:
+//! - `~/.codewhale/audit.log`   — one JSON line per event (approvals, credentials)
+//! - `~/.codewhale/sessions/`   — saved session JSON files (tool call history)
+//! - `~/.codewhale/tasks/runtime/events/` — runtime thread JSONL event streams
+//!
+//! An install that never migrated off the DeepSeek-era `~/.deepseek` root still
+//! reads there, but only for a path that actually exists — see
+//! `resolve_state_file`.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -27,17 +32,22 @@ pub struct MetricsArgs {
 }
 
 pub fn run(args: MetricsArgs) -> Result<()> {
-    let base = deepseek_home();
+    // `resolve_state_dir` is the shared read-path resolver already used by
+    // `doctor` and the session store; the runtime thread store hangs its event
+    // streams off `<tasks>/runtime`. Resolving the home is fallible, and a
+    // rollup of zeros is indistinguishable from real emptiness, so a home we
+    // cannot resolve is an error rather than a silent all-zero report.
+    let audit_log = resolve_state_file("audit.log")?;
+    let sessions = codewhale_config::resolve_state_dir("sessions")?;
+    let runtime_events = codewhale_config::resolve_state_dir("tasks")?
+        .join("runtime")
+        .join("events");
 
     // Collect data from every source; treat missing files as empty.
     let mut rollup = Rollup::default();
-    read_audit_log(&base.join("audit.log"), args.since, &mut rollup);
-    read_session_files(&base.join("sessions"), args.since, &mut rollup);
-    read_runtime_events(
-        &base.join("tasks").join("runtime").join("events"),
-        args.since,
-        &mut rollup,
-    );
+    read_audit_log(&audit_log, args.since, &mut rollup);
+    read_session_files(&sessions, args.since, &mut rollup);
+    read_runtime_events(&runtime_events, args.since, &mut rollup);
 
     if args.json {
         print_json(&rollup)?;
@@ -822,16 +832,26 @@ fn print_human(rollup: &Rollup) {
 // Helpers
 // ──────────────────────────────────────────────────────────────────────────────
 
-fn deepseek_home() -> PathBuf {
-    // This reader preserves the legacy DEEPSEEK_HOME/default-root precedence,
-    // but delegates every environment and platform-home decision to the shared
-    // runtime path authority.
-    codewhale_paths::codewhale_home_override()
-        .ok()
-        .flatten()
-        .or_else(codewhale_paths::legacy_deepseek_home_override)
-        .or_else(codewhale_paths::legacy_deepseek_home)
-        .unwrap_or_else(|| PathBuf::from(codewhale_paths::LEGACY_APP_DIR))
+/// Resolve a file that lives directly in the state root, preferring the
+/// canonical Codewhale root.
+///
+/// This is the file-shaped twin of `codewhale_config::resolve_state_dir` (and
+/// of `default_config_path`, which resolves `config.toml` the same way): the
+/// primary path wins whenever it exists, the legacy DeepSeek path is used only
+/// when it is the *only* one present, and with neither present the primary is
+/// returned so an empty rollup names the canonical location. An explicit
+/// `CODEWHALE_HOME` is an isolation boundary and never falls back.
+///
+/// The two roots are never unioned. `ensure_state_dir` may migrate legacy state
+/// by *copying* it (`StateMigrationKind::Copied` leaves the legacy tree in
+/// place), so summing both roots would double-count every migrated record.
+fn resolve_state_file(name: &str) -> Result<PathBuf> {
+    let primary = codewhale_config::codewhale_home()?.join(name);
+    if codewhale_config::codewhale_home_is_explicit() || primary.exists() {
+        return Ok(primary);
+    }
+    let legacy = codewhale_config::legacy_deepseek_home()?.join(name);
+    Ok(if legacy.exists() { legacy } else { primary })
 }
 
 /// Parse a timestamp from a JSON value field (tries RFC3339).
@@ -1021,5 +1041,101 @@ mod tests {
         rollup.tool_mut("read_file").calls = 4_012;
         rollup.tool_mut("exec_shell").calls = 1_118;
         assert_eq!(rollup.total_tool_calls(), 5_130);
+    }
+
+    // ── State-root resolution ──
+    //
+    // These pin *which* files the rollup reads. Before the fix the reader
+    // resolved `$HOME/.deepseek`, which nothing has written since the v0.8.44
+    // rename, so `codewhale metrics` printed an all-zero rollup as truth.
+
+    /// Isolate the ambient home so the resolver sees a clean, empty install.
+    ///
+    /// The returned guards must stay bound for the life of the test: dropping
+    /// them restores the previous environment. Destructure the tuple so the
+    /// bindings drop in reverse order — the environment is restored *before*
+    /// the lock is released, or a concurrent env-mutating test sees a torn HOME.
+    fn isolated_home() -> (
+        tempfile::TempDir,
+        std::sync::MutexGuard<'static, ()>,
+        Vec<crate::tests::ScopedEnvVar>,
+    ) {
+        let guard = crate::tests::env_lock();
+        let home = tempfile::TempDir::new().expect("tempdir");
+        let vars = vec![
+            crate::tests::ScopedEnvVar::set("HOME", &home.path().to_string_lossy()),
+            crate::tests::ScopedEnvVar::set("USERPROFILE", &home.path().to_string_lossy()),
+            crate::tests::ScopedEnvVar::remove("CODEWHALE_HOME"),
+            crate::tests::ScopedEnvVar::remove("DEEPSEEK_HOME"),
+        ];
+        (home, guard, vars)
+    }
+
+    #[test]
+    fn state_files_resolve_under_the_codewhale_root_on_a_clean_install() {
+        let (home, _lock, _env) = isolated_home();
+        assert_eq!(
+            resolve_state_file("audit.log").expect("resolves"),
+            home.path().join(".codewhale").join("audit.log"),
+            "the reader must land on the root the audit writer actually writes"
+        );
+    }
+
+    #[test]
+    fn a_legacy_file_is_used_only_when_it_is_the_one_that_exists() {
+        let (home, _lock, _env) = isolated_home();
+        let legacy = home.path().join(".deepseek");
+        std::fs::create_dir_all(&legacy).expect("legacy root");
+        std::fs::write(legacy.join("audit.log"), b"{}\n").expect("legacy log");
+
+        assert_eq!(
+            resolve_state_file("audit.log").expect("resolves"),
+            legacy.join("audit.log"),
+            "real DeepSeek-era receipts must not be dropped on the floor"
+        );
+
+        // Once the canonical file exists it wins outright; the two roots are
+        // never summed, because legacy state may have been migrated by copy.
+        let primary = home.path().join(".codewhale");
+        std::fs::create_dir_all(&primary).expect("primary root");
+        std::fs::write(primary.join("audit.log"), b"{}\n").expect("primary log");
+        assert_eq!(
+            resolve_state_file("audit.log").expect("resolves"),
+            primary.join("audit.log")
+        );
+    }
+
+    #[test]
+    fn an_explicit_codewhale_home_is_an_isolation_boundary() {
+        let (home, _lock, _env) = isolated_home();
+        let legacy = home.path().join(".deepseek");
+        std::fs::create_dir_all(&legacy).expect("legacy root");
+        std::fs::write(legacy.join("audit.log"), b"{}\n").expect("legacy log");
+
+        let explicit = tempfile::TempDir::new().expect("tempdir");
+        let _pin =
+            crate::tests::ScopedEnvVar::set("CODEWHALE_HOME", &explicit.path().to_string_lossy());
+
+        assert_eq!(
+            resolve_state_file("audit.log").expect("resolves"),
+            explicit.path().join("audit.log"),
+            "an explicit home must never reach outside its own root"
+        );
+    }
+
+    #[test]
+    fn the_legacy_deepseek_home_variable_is_no_longer_honoured() {
+        // docs/CONFIGURATION.md tells upgraders to rename DEEPSEEK_HOME to
+        // CODEWHALE_HOME; every other subsystem already ignores it, and this
+        // reader was the last consumer of the legacy alias.
+        let (home, _lock, _env) = isolated_home();
+        let stale = tempfile::TempDir::new().expect("tempdir");
+        let _stale =
+            crate::tests::ScopedEnvVar::set("DEEPSEEK_HOME", &stale.path().to_string_lossy());
+
+        assert_eq!(
+            resolve_state_file("audit.log").expect("resolves"),
+            home.path().join(".codewhale").join("audit.log")
+        );
     }
 }

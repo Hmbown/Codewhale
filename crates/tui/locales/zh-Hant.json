@@ -1272,6 +1272,8 @@
   "ToolProjectionWarning": "警告：{provider} 已在本次請求中省略不相容的工具：{tools}",
   "SnapshotsDisabledNotice": "此工作區 {workspace} 的快照與 /undo 已關閉：{reason} 在 config.toml 中提高 `{config_key}`（或設為 0 取消上限）即可開啟。",
   "SessionIdDivergedNotice": "此視窗下的工作階段身分已更改：引擎現在以 {next} 儲存檢查點（之前為 {previous}）。較早的檢查點仍保留在舊 ID 下；`codewhale sessions` 會列出兩者，`codewhale resume {previous}` 可重新開啟較早的工作階段。",
+  "RuntimeStoreUnreadableNotice": "工作階段執行期儲存區：無法讀取 {path} 的 {record}（{reason}）。請將該檔案移開（或刪除）後重試；執行緒的其他記錄保持不變。",
+  "RuntimeStoreUnwritableNotice": "工作階段執行期儲存區：無法寫入 {path} 的 {record}（{reason}）。請檢查該位置的可用空間與權限後重試；沒有任何內容被覆寫。",
   "ProviderExternalReadOnlyDetail": "僅限一個確切檔案；下一步需要明確確認",
   "ProviderExternalReadOnlyLabel": "使用外部 CLI 憑證（唯讀）",
   "ProviderExternalReadOnlySemantics": "僅讀取這一確切檔案；不重新整理、不發起身份提供商或發現請求、不寫入或重寫外部檔案；向所選提供商發起的正常請求可以使用該令牌",

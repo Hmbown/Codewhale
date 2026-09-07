@@ -1457,6 +1457,8 @@
   "ToolProjectionWarning": "警告: {provider} はこのリクエストで互換性のないツールを除外しました: {tools}",
   "SnapshotsDisabledNotice": "{workspace} ではスナップショットと /undo が無効です: {reason} config.toml の `{config_key}` を上げる（または 0 にして上限を外す）と有効になります。",
   "SessionIdDivergedNotice": "このウィンドウのセッション ID が変わりました。エンジンは今後 {next} としてチェックポイントを保存します（以前は {previous}）。以前のチェックポイントは旧 ID のまま残ります。`codewhale sessions` で両方を確認でき、`codewhale resume {previous}` で以前のセッションを再開できます。",
+  "RuntimeStoreUnreadableNotice": "セッションのランタイムストア: {path} の {record} を読み取れませんでした（{reason}）。そのファイルを退避（または削除）して再試行してください。スレッドの他のレコードはそのまま残ります。",
+  "RuntimeStoreUnwritableNotice": "セッションのランタイムストア: {path} の {record} を書き込めませんでした（{reason}）。その場所の空き容量と権限を確認して再試行してください。何も上書きされていません。",
   "ProviderExternalSemanticsRevoke": "{semantics} | 取消: {revoke}",
   "ProviderExternalRevoke": "取消: {revoke}",
   "ProviderExternalChoiceTitle": " 外部認証情報へのアクセス · {provider} ",

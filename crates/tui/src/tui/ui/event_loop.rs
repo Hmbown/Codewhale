@@ -622,19 +622,25 @@ pub async fn run_tui(
         app.status_message = Some(notice);
     }
 
-    if let Ok(manager) = SessionManager::default_location() {
-        match manager.load_offline_queue_state() {
+    // The parked offline queue is keyed per session, so this reads back only
+    // *this* session's own unsent text: a fresh session has none, and a
+    // concurrent instance's queue is a different file that nothing here can
+    // reach. A session that is not being resumed has nothing parked yet.
+    let mut restored_offline_queue = false;
+    if let Some(session_id) = app.current_session_id.clone()
+        && let Ok(manager) = SessionManager::default_location()
+    {
+        match manager.load_offline_queue_state(&session_id) {
             Ok(Some(state)) => {
-                if restore_matching_offline_queue_state(&mut app, state) {
-                    if app.status_message.is_none() && app.queued_message_count() > 0 {
-                        app.status_message = Some(format!(
-                            "Restored {} queued message(s) from previous session — ↑ to edit, Ctrl+X to discard",
-                            app.queued_message_count()
-                        ));
-                    }
-                } else {
-                    // Session mismatch - clear the stale queue
-                    let _ = manager.clear_offline_queue_state();
+                restored_offline_queue = restore_matching_offline_queue_state(&mut app, state);
+                if restored_offline_queue
+                    && app.status_message.is_none()
+                    && app.queued_message_count() > 0
+                {
+                    app.status_message = Some(format!(
+                        "Restored {} queued message(s) from previous session — ↑ to edit, Ctrl+X to discard",
+                        app.queued_message_count()
+                    ));
                 }
             }
             Ok(None) => {}
@@ -789,6 +795,14 @@ pub async fn run_tui(
             persistence_actor::init_actor(handle.clone());
             (handle, task)
         });
+
+    // Re-park the queue restored above, now that the actor exists. Its clear
+    // request carries no session id, so the actor learns which session owns
+    // the parked file from a save — without this, draining a restored queue
+    // to empty would leave the file behind and resend it on the next boot.
+    if restored_offline_queue {
+        persist_offline_queue_state(&app);
+    }
 
     // Returning users recovering a missing key open the picker immediately so
     // recovery cannot silently replace a persisted route. First-run users
@@ -1173,6 +1187,9 @@ pub(crate) async fn run_event_loop(
     let (translation_tx, mut translation_rx) =
         tokio::sync::mpsc::unbounded_channel::<TranslationEvent>();
     let mut pending_translations = 0usize;
+    // #5931: the background runtime's own store faults arrive on its event
+    // channel, which nothing else in this loop reads.
+    let mut runtime_event_rx = task_manager.subscribe_runtime_events();
     let mut pending_thinking_translations = 0usize;
     let mut last_queue_state = (app.queued_messages.clone(), app.queued_draft.clone());
     let mut last_queue_was_empty = app.queued_messages.is_empty() && app.queued_draft.is_none();
@@ -3754,6 +3771,9 @@ pub(crate) async fn run_event_loop(
             app.add_message(HistoryCell::System {
                 content: receipt.render(),
             });
+            transcript_batch_updated = true;
+        }
+        if drain_runtime_store_failures(app, &mut runtime_event_rx) {
             transcript_batch_updated = true;
         }
         if transcript_batch_updated {
@@ -6617,4 +6637,88 @@ pub(crate) fn session_id_divergence_notice(app: &App, previous: &str, next: &str
     app.tr(MessageId::SessionIdDivergedNotice)
         .replace("{previous}", previous)
         .replace("{next}", next)
+}
+
+/// Per-tick budget for the runtime store-failure tap. These events are rare;
+/// the bound only keeps a burst from starving the frame.
+const RUNTIME_STORE_FAILURE_DRAIN_BUDGET: usize = 64;
+
+/// Drain the background runtime's event tap and show every
+/// `runtime.store_failure` (#5931). Other runtime events keep their own
+/// consumers (the task timeline, SSE); this reads only the operator's fault.
+fn drain_runtime_store_failures(
+    app: &mut App,
+    rx: &mut Option<tokio::sync::broadcast::Receiver<crate::runtime_threads::RuntimeEventRecord>>,
+) -> bool {
+    use tokio::sync::broadcast::error::TryRecvError;
+    let Some(receiver) = rx.as_mut() else {
+        return false;
+    };
+    let mut shown = false;
+    for _ in 0..RUNTIME_STORE_FAILURE_DRAIN_BUDGET {
+        match receiver.try_recv() {
+            Ok(event) => shown |= show_runtime_store_failure(app, &event),
+            Err(TryRecvError::Empty) => break,
+            Err(TryRecvError::Lagged(skipped)) => {
+                tracing::warn!(
+                    skipped,
+                    "runtime event tap lagged; a store-failure notice may have been missed"
+                );
+            }
+            Err(TryRecvError::Closed) => {
+                *rx = None;
+                break;
+            }
+        }
+    }
+    shown
+}
+
+/// Show one `runtime.store_failure` event as a warning toast and a transcript
+/// line that names the file and the next action. Any other event is ignored.
+pub(crate) fn show_runtime_store_failure(
+    app: &mut App,
+    event: &crate::runtime_threads::RuntimeEventRecord,
+) -> bool {
+    if event.event != crate::runtime_threads::RUNTIME_STORE_FAILURE_EVENT {
+        return false;
+    }
+    let notice = match serde_json::from_value::<crate::runtime_threads::RuntimeStoreFailureNotice>(
+        event.payload.clone(),
+    ) {
+        Ok(notice) => notice,
+        Err(error) => {
+            tracing::warn!(%error, "runtime store failure notice had an unreadable payload");
+            return false;
+        }
+    };
+    let message = runtime_store_failure_notice(app, &notice);
+    app.push_status_toast(message.clone(), StatusToastLevel::Warning, Some(12_000));
+    app.add_message(HistoryCell::System { content: message });
+    true
+}
+
+/// Text for a runtime store fault: the record, the file, the root cause, and
+/// the remedy the failed operation calls for.
+pub(crate) fn runtime_store_failure_notice(
+    app: &App,
+    notice: &crate::runtime_threads::RuntimeStoreFailureNotice,
+) -> String {
+    use crate::runtime_threads::RuntimeStoreOperation;
+    let id = match notice.failure.operation {
+        RuntimeStoreOperation::Write => MessageId::RuntimeStoreUnwritableNotice,
+        RuntimeStoreOperation::Read | RuntimeStoreOperation::Parse => {
+            MessageId::RuntimeStoreUnreadableNotice
+        }
+    };
+    app.tr(id)
+        .replace(
+            "{record}",
+            &format!(
+                "{} {}",
+                notice.failure.record_kind, notice.failure.record_id
+            ),
+        )
+        .replace("{path}", &notice.failure.path.display().to_string())
+        .replace("{reason}", &notice.reason)
 }

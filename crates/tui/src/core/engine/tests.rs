@@ -5287,6 +5287,90 @@ async fn tool_call_budget_persists_across_model_steps_within_a_turn() {
     );
 }
 
+/// #5986: a provider that cuts the stream at its output limit omits the
+/// closing `ContentBlockStop` for the tool block in flight. The mid-stream
+/// mirror had already assigned the truncated buffer's best-effort parse
+/// (the repair ladder appends the missing `}`), and dispatch reads
+/// `tool.input` directly — so the cut call used to execute with a partial
+/// argument. The post-stream finalization pass must send it down the same
+/// malformed-arguments gate a normal block stop applies.
+#[tokio::test]
+async fn truncated_tool_call_without_block_stop_never_dispatches() {
+    use crate::llm_client::mock::{MockLlmClient, canned};
+
+    let workspace = tempdir().expect("tempdir");
+    fs::write(workspace.path().join("fixture.txt"), "fixture\n").expect("write fixture");
+    // Cut mid-argument, right after a complete string value: stage 4 of the
+    // repair ladder appends one `}` and the text parses — synthesized.
+    let cut_turn = vec![
+        canned::message_start("mock_msg_cut"),
+        canned::tool_use_block_start(0, "call-cut", "read_file"),
+        canned::tool_input_delta(0, r#"{"path": "fixture.txt""#),
+        // Deliberately no block_stop(0): the output limit ended the turn.
+        canned::message_delta("max_tokens", None),
+        canned::message_stop(),
+    ];
+    let mock = std::sync::Arc::new(MockLlmClient::new(vec![
+        cut_turn,
+        canned::simple_text_turn("done"),
+    ]));
+
+    let (status, error, completions) =
+        run_budgeted_read_turn(workspace.path(), None, mock.clone()).await;
+    assert_eq!(status, TurnOutcomeStatus::Completed, "{error:?}");
+
+    let (_, result) = completions
+        .iter()
+        .find(|(id, _)| id == "call-cut")
+        .expect("the cut tool call still reports a completion");
+    let reason = result
+        .as_ref()
+        .expect_err("a truncated tool call must never execute")
+        .to_string();
+    assert!(
+        reason.contains("malformed tool arguments"),
+        "expected the malformed-arguments gate, got: {reason}"
+    );
+}
+
+/// The control for the cut-stream pass: when the omitted block stop is the
+/// only irregularity and the buffered arguments were structurally complete,
+/// the tool still dispatches. Otherwise every provider that skips closing
+/// events would lose all of its tool calls.
+#[tokio::test]
+async fn complete_tool_call_without_block_stop_still_dispatches() {
+    use crate::llm_client::mock::{MockLlmClient, canned};
+
+    let workspace = tempdir().expect("tempdir");
+    fs::write(workspace.path().join("fixture.txt"), "fixture\n").expect("write fixture");
+    let no_stop_turn = vec![
+        canned::message_start("mock_msg_nostop"),
+        canned::tool_use_block_start(0, "call-complete", "read_file"),
+        canned::tool_input_delta(0, r#"{"path": "fixture.txt"}"#),
+        canned::message_delta("tool_use", None),
+        canned::message_stop(),
+    ];
+    let mock = std::sync::Arc::new(MockLlmClient::new(vec![
+        no_stop_turn,
+        canned::simple_text_turn("done"),
+    ]));
+
+    let (status, error, completions) =
+        run_budgeted_read_turn(workspace.path(), None, mock.clone()).await;
+    assert_eq!(status, TurnOutcomeStatus::Completed, "{error:?}");
+
+    let (_, result) = completions
+        .iter()
+        .find(|(id, _)| id == "call-complete")
+        .expect("the tool call reports a completion");
+    let output = result
+        .as_ref()
+        .expect("structurally complete arguments still dispatch")
+        .content
+        .clone();
+    assert!(output.contains("fixture"), "{output}");
+}
+
 /// #4415 AC(c): a write-first named-file task carries a scoped-write
 /// authority envelope naming its exact files. The existing allowed-paths
 /// machinery (`ToolAuthorityEnvelope`, enforced at the registry boundary)
@@ -18726,6 +18810,27 @@ fn final_tool_scenario() {
             final_tool_input(&state),
             json!({"raw_arguments": "{not json"})
         );
+    }
+    // A `write` whose stream was cut at its output limit, right after a
+    // complete string value. `arg_repair` CAN make this parse by appending
+    // one `}`, and before the repair ladder reported provenance that guess
+    // was dispatched — writing a file containing only "first line" while the
+    // model was still mid-argument. It must now take the malformed path, so
+    // the model is told to re-issue instead.
+    {
+        let state = tool_state(json!({}), r#"{"path": "notes.md", "content": "first line""#);
+        assert_eq!(
+            final_tool_input(&state),
+            json!({"raw_arguments": r#"{"path": "notes.md", "content": "first line""#}),
+            "a truncated write must not be dispatched as a completed argument"
+        );
+    }
+    // The guard must not fire on arguments that were merely sloppy: a
+    // trailing comma is structurally complete and still has to dispatch, or
+    // every DeepSeek chunk-boundary repair would start failing tool calls.
+    {
+        let state = tool_state(json!({}), r#"{"command": "ls -la",}"#);
+        assert_eq!(final_tool_input(&state), json!({"command": "ls -la"}));
     }
 }
 

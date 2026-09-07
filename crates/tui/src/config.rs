@@ -3860,6 +3860,10 @@ pub struct ProviderConfig {
     pub oauth_credential_generation: Option<String>,
     #[serde(alias = "insecureSkipTlsVerify")]
     pub insecure_skip_tls_verify: Option<bool>,
+    /// Per-provider consent to a plain-HTTP `base_url` (#5991). Loopback is
+    /// always allowed without it.
+    #[serde(default, alias = "allowInsecureHttp")]
+    pub allow_insecure_http: Option<bool>,
     #[serde(alias = "httpHeaders")]
     pub http_headers: Option<HashMap<String, String>>,
     #[serde(alias = "pathSuffix")]
@@ -6002,6 +6006,17 @@ impl Config {
     pub fn insecure_skip_tls_verify(&self) -> bool {
         self.provider_config()
             .and_then(|provider| provider.insecure_skip_tls_verify)
+            .unwrap_or(false)
+    }
+
+    /// Per-provider consent to a plain-HTTP `base_url` (#5991). Loopback is
+    /// always allowed without it; this covers named LAN/internal hosts the
+    /// user explicitly trusts. Narrower than the env-var override, which
+    /// applies to every provider in the process.
+    #[must_use]
+    pub fn allow_insecure_http(&self) -> bool {
+        self.provider_config()
+            .and_then(|provider| provider.allow_insecure_http)
             .unwrap_or(false)
     }
 
@@ -10898,6 +10913,9 @@ fn merge_provider_config(base: ProviderConfig, override_cfg: ProviderConfig) -> 
         insecure_skip_tls_verify: override_cfg
             .insecure_skip_tls_verify
             .or(base.insecure_skip_tls_verify),
+        allow_insecure_http: override_cfg
+            .allow_insecure_http
+            .or(base.allow_insecure_http),
         http_headers: override_cfg.http_headers.or(base.http_headers),
         path_suffix: override_cfg.path_suffix.or(base.path_suffix),
         reasoning_stream_style: override_cfg
@@ -11896,6 +11914,7 @@ fn provider_config_is_explicit(entry: &ProviderConfig) -> bool {
         || non_empty(entry.path_suffix.as_ref())
         || non_empty(entry.reasoning_stream_style.as_ref())
         || entry.insecure_skip_tls_verify.is_some()
+        || entry.allow_insecure_http.is_some()
         || non_empty(entry.kind.as_ref())
         || non_empty(entry.api_key_env.as_ref())
         || entry.external_credentials.is_some()

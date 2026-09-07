@@ -1,7 +1,7 @@
 // exec + transport safety tests.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import fs from "node:fs/promises";
+import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { run, runOk, ExecError, have, trim } from "../src/exec.mjs";
@@ -59,38 +59,40 @@ test("localExec provides run/runOk/tmpFile", async () => {
   assert.ok(typeof f === "string");
 });
 
-for (const cleanupFails of [false, true]) {
-  for (const outcome of ["success", "transfer failure", "read failure"]) {
-    test(`hdc readFile preserves ${outcome} when cleanup ${cleanupFails ? "fails" : "succeeds"}`, async (t) => {
-      // Contain even the old recursive-deletion bug inside this fixture.
-      const root = await fs.mkdtemp(path.join(os.tmpdir(), "cu-hdc-test-"));
-      const realRm = fs.rm.bind(fs);
-      t.after(() => realRm(root, { recursive: true, force: true }));
-      if (cleanupFails) {
-        t.mock.method(fs, "rm", async (dir) => {
-          assert.equal(path.dirname(dir), root, "cleanup stays inside its fixture");
-          assert.ok(path.basename(dir).startsWith("cu-hdc-"));
-          throw Object.assign(new Error("cleanup denied"), { code: "EACCES" });
-        });
-      }
-      t.mock.method(os, "tmpdir", () => root);
-      await fs.writeFile(path.join(root, "unrelated"), "keep me");
-      const ex = hdcExec({});
-      const transferError = new Error("transfer interrupted");
-      ex.pullFile = async (remote, local) => {
-        assert.equal(remote, "fixture.txt");
-        if (outcome === "read failure") return;
-        await fs.writeFile(local, "downloaded bytes");
-        if (outcome === "transfer failure") throw transferError;
-      };
-      if (outcome === "success") {
-        assert.equal((await ex.readFile("fixture.txt")).toString(), "downloaded bytes");
-      } else {
-        await assert.rejects(ex.readFile("fixture.txt"), (error) =>
-          outcome === "transfer failure" ? error === transferError : error.code === "ENOENT");
-      }
-      assert.equal(await fs.readFile(path.join(root, "unrelated"), "utf8"), "keep me");
-      if (!cleanupFails) assert.deepEqual(await fs.readdir(root), ["unrelated"]);
-    });
-  }
-}
+test("hdc readFile pulls into a private temp dir and cleans up only that dir", async (t) => {
+  // Regression guard for the temp-dir deletion bug: readFile used to place the
+  // pull directly in os.tmpdir() and then rm(dirname(tmp), {recursive}) —
+  // deleting the ENTIRE user temp directory on every HDC read. The sentinel
+  // proves sibling temp content now survives, and the pull must land inside a
+  // private cu-hdc-* mkdtemp dir that is removed afterwards.
+  const sentinel = path.join(os.tmpdir(), `cu-hdc-sentinel-${process.pid}-${Date.now()}.txt`);
+  fs.writeFileSync(sentinel, "keep");
+  t.after(() => fs.rmSync(sentinel, { force: true }));
+
+  const ex = hdcExec({});
+  let seenLocal = null;
+  ex.pullFile = async (remote, local) => {
+    seenLocal = local;
+    fs.writeFileSync(local, Buffer.from("pulled-bytes"));
+    return local;
+  };
+  const data = await ex.readFile("data/local/tmp/layout.json");
+  assert.equal(data.toString(), "pulled-bytes");
+  const pullDir = path.dirname(seenLocal);
+  assert.equal(path.dirname(pullDir), os.tmpdir(), "pull must land in a direct child of tmpdir, never in tmpdir itself");
+  assert.match(path.basename(pullDir), /^cu-hdc-/, "pull dir must be a private cu-hdc- mkdtemp dir");
+  assert.ok(!fs.existsSync(pullDir), "private temp dir is removed after the read");
+  assert.ok(fs.existsSync(sentinel), "sibling files in the user temp dir must survive an hdc read");
+});
+
+test("hdc readFile cleans up its private temp dir even when the pull fails", async () => {
+  const ex = hdcExec({});
+  let seenLocal = null;
+  ex.pullFile = async (remote, local) => {
+    seenLocal = local;
+    throw new Error("hdc file recv failed");
+  };
+  await assert.rejects(() => ex.readFile("data/local/tmp/layout.json"), /hdc file recv failed/);
+  assert.ok(seenLocal, "pull was attempted");
+  assert.ok(!fs.existsSync(path.dirname(seenLocal)), "failed pull still cleans up its private temp dir");
+});

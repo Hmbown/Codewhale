@@ -1457,6 +1457,8 @@
   "ToolProjectionWarning": "警告：{provider} 已在本次请求中省略不兼容的工具：{tools}",
   "SnapshotsDisabledNotice": "此工作区 {workspace} 的快照与 /undo 已关闭：{reason} 在 config.toml 中提高 `{config_key}`（或设为 0 取消上限）即可开启。",
   "SessionIdDivergedNotice": "此窗口下的会话身份已更改：引擎现在以 {next} 保存检查点（之前为 {previous}）。较早的检查点仍保留在旧 ID 下；`codewhale sessions` 会列出两者，`codewhale resume {previous}` 可重新打开较早的会话。",
+  "RuntimeStoreUnreadableNotice": "会话运行时存储：无法读取 {path} 处的 {record}（{reason}）。请将该文件移开（或删除）后重试；线程的其他记录保持不变。",
+  "RuntimeStoreUnwritableNotice": "会话运行时存储：无法写入 {path} 处的 {record}（{reason}）。请检查该位置的可用空间和权限后重试；没有任何内容被覆盖。",
   "ProviderExternalSemanticsRevoke": "{semantics} | 撤销：{revoke}",
   "ProviderExternalRevoke": "撤销：{revoke}",
   "ProviderExternalChoiceTitle": " 外部凭据访问 · {provider} ",

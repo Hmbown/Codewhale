@@ -148,13 +148,45 @@ mod tests {
         let options = TuiOptions {
             ..crate::test_support::test_tui_options(PathBuf::from("."))
         };
-        let mut app = App::new(options, &Config::default());
-        app.use_paste_burst_detection = true;
-        app
+        App::new(options, &Config::default())
     }
 
     fn plain(ch: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn requested_bracketed_paste_keeps_raw_multiline_fallback_until_verified() {
+        for pasted in [
+            "first line\nsecond line\nthird line",
+            "多行粘贴测试\n行1\n行2\n行3",
+        ] {
+            let mut app = test_app();
+            assert!(app.use_bracketed_paste);
+            assert!(!app.bracketed_paste_seen);
+            let t0 = Instant::now();
+            for (i, ch) in pasted.chars().enumerate() {
+                let key = if ch == '\n' {
+                    KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
+                } else {
+                    plain(ch)
+                };
+                assert!(
+                    handle_paste_burst_key(&mut app, &key, t0 + Duration::from_millis(i as u64)),
+                    "raw paste {ch:?} must not reach the submit path"
+                );
+            }
+            app.flush_paste_burst_if_due(t0 + Duration::from_secs(1));
+            assert_eq!(app.input, pasted);
+            assert!(
+                !handle_paste_burst_key(
+                    &mut app,
+                    &KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                    t0 + Duration::from_secs(2),
+                ),
+                "a deliberate Enter after the paste must reach the submit path"
+            );
+        }
     }
 
     /// Y-7 regression (2026-08-31 QA, `tui-swarm-head`): a scripted driver

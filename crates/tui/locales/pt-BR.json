@@ -1457,6 +1457,8 @@
   "ToolProjectionWarning": "Aviso: {provider} omitiu ferramentas incompatíveis nesta solicitação: {tools}",
   "SnapshotsDisabledNotice": "Snapshots e /undo estão desligados para {workspace}: {reason} Aumente `{config_key}` no config.toml (ou defina 0 para remover o limite) para ligá-los.",
   "SessionIdDivergedNotice": "A identidade da sessão mudou nesta janela: o motor agora salva checkpoints como {next} (antes era {previous}). Os checkpoints anteriores ficam sob o id antigo; `codewhale sessions` lista os dois e `codewhale resume {previous}` reabre o anterior.",
+  "RuntimeStoreUnreadableNotice": "Armazenamento de execução da sessão: não foi possível ler {record} em {path} ({reason}). Afaste esse arquivo (ou exclua-o) e tente de novo; os demais registros da thread permanecem.",
+  "RuntimeStoreUnwritableNotice": "Armazenamento de execução da sessão: não foi possível gravar {record} em {path} ({reason}). Verifique o espaço livre e as permissões nesse local e tente de novo; nada foi sobrescrito.",
   "ProviderExternalSemanticsRevoke": "{semantics} | revogar: {revoke}",
   "ProviderExternalRevoke": "revogar: {revoke}",
   "ProviderExternalChoiceTitle": " Acesso a credencial externa · {provider} ",

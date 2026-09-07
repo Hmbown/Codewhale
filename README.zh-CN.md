@@ -1,4 +1,4 @@
-<!-- source: README.md sha256:dcbd5aa09403 -->
+<!-- source: README.md sha256:3cc3ffc9b995 -->
 # Codewhale
 
 Codewhale 是一款面向终端的开源编程智能体，使用 Rust 构建，并与用户一起在公开协作中不断改进。
@@ -45,6 +45,10 @@ codewhale exec "fix the failing tests and explain what changed"
 ```
 
 Codewhale 可以读取你的代码仓库、编辑文件、运行命令、检查结果，并持续推进目标。由你决定授予它多少访问权限。
+
+## GUI 前端
+
+更喜欢图形界面？社区维护的 CodeWhale for VS Code 扩展把同一个智能体放进 VS Code 侧边栏——聊天、线程会话、实时 diff 与任务管理，全部基于同一个 Runtime API，会话与终端保持同步。可从 [VS Code Marketplace](https://marketplace.visualstudio.com/items?itemName=HengQuWorld.brotherwhale-vscode) 安装；源码见 [GitHub](https://github.com/HengQuWorld/CodeWhale-VSCode)。
 
 ## 为什么选择 Codewhale
 

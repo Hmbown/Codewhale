@@ -6,12 +6,9 @@ const computerParam = {
   description: "Computer id to act on. Defaults to the active computer. Providing a different registered id switches to it first (sticky).",
 };
 
-// Optional guard for keystroke tools: the app that must be frontmost.
-const inputAppRef = {
-  type: "object",
-  description: "Refuse to send the keystrokes unless this app is frontmost (name, bundle_id, or pid).",
-  properties: { pid: { type: "integer" }, name: { type: "string" }, bundle_id: { type: "string" } },
-  additionalProperties: false,
+const strategyParam = {
+  enum: ["auto", "a11y", "event"],
+  description: "How the point is dispatched. auto (default): macOS resolves the point against the bound application's accessibility tree first and performs the element's press action, falling back to a raw pointer event; other platforms always use raw events. a11y: require an accessibility press and fail closed otherwise. event: force the raw pointer event.",
 };
 
 const targetSchema = {
@@ -42,6 +39,7 @@ const targetSchema = {
 };
 
 export const TOOLS = [
+  { name: "preview", description: "macOS: show or hide a nonactivating app preview with the agent cursor. Off by default. Enable only when the user asks to watch; disable when finished. Open an application first; subsequent actions update its preview without taking over your mouse.", inputSchema: { type: "object", properties: { enabled: { type: "boolean" }, computer: computerParam }, additionalProperties: false } },
   // ---- computers (switching is a default) ----
   {
     name: "computer_list",
@@ -136,6 +134,7 @@ export const TOOLS = [
     inputSchema: {
       type: "object",
       properties: {
+        app_ref: { type: "object", properties: { name: { type: "string" }, bundle_id: { type: "string" }, pid: { type: "integer" } }, description: "macOS: capture this app window even when it is in the background." },
         display: { type: ["integer", "string"], description: "Display index or 'all'" },
         region: { type: "array", items: { type: "number" }, minItems: 4, maxItems: 4, description: "[x, y, w, h] in screen points" },
         path: { type: "string", description: "Optional output path (absolute). Defaults into the recordings directory." },
@@ -170,7 +169,8 @@ export const TOOLS = [
       type: "object",
       properties: {
         name: { type: "string" }, bundle_id: { type: "string" }, url: { type: "string" },
-        activate: { type: "boolean", description: "Bring to foreground" },
+        pid: { type: "integer", description: "Bind to this exact process. Use when two processes share a bundle id (list_apps shows both); it takes precedence over name and bundle_id and never launches anything." },
+        activate: { type: "boolean", description: "Bring to foreground; defaults to false. Keep false for background work unless the user requests foreground interaction." },
         computer: computerParam,
       },
       additionalProperties: false,
@@ -179,7 +179,7 @@ export const TOOLS = [
   // ---- pointer ----
   {
     name: "left_click", description: "Left-click a coordinate (pixels in the latest raster) or perform the element's press action.",
-    inputSchema: { type: "object", required: ["target"], properties: { target: targetSchema, computer: computerParam }, additionalProperties: false },
+    inputSchema: { type: "object", required: ["target"], properties: { target: targetSchema, strategy: strategyParam, computer: computerParam }, additionalProperties: false },
   },
   {
     name: "double_click", description: "Double-click a target.",
@@ -219,16 +219,16 @@ export const TOOLS = [
   },
   // ---- text & keyboard ----
   {
-    name: "type", description: "Type text into the focused control (unicode). Focus the field first (click/element action). Pass app_ref to refuse unless that app is frontmost; the receipt names frontmost_app either way.",
-    inputSchema: { type: "object", required: ["text"], properties: { text: { type: "string" }, app_ref: inputAppRef, computer: computerParam }, additionalProperties: false },
+    name: "type", description: "Type text into the focused control (unicode). Focus the field first (click/element action).",
+    inputSchema: { type: "object", required: ["text"], properties: { text: { type: "string" }, computer: computerParam }, additionalProperties: false },
   },
   {
-    name: "key", description: "Press a key or chord, e.g. 'return', 'cmd+c' (macOS), 'ctrl+c' (Linux/Windows). Repeat with `repeat`. Pass app_ref to refuse unless that app is frontmost; the receipt names frontmost_app either way.",
-    inputSchema: { type: "object", required: ["text"], properties: { text: { type: "string" }, repeat: { type: "integer", minimum: 1, maximum: 100 }, app_ref: inputAppRef, computer: computerParam }, additionalProperties: false },
+    name: "key", description: "Press a key or chord, e.g. 'return', 'cmd+c' (macOS), 'ctrl+c' (Linux/Windows). Repeat with `repeat`.",
+    inputSchema: { type: "object", required: ["text"], properties: { text: { type: "string" }, repeat: { type: "integer", minimum: 1, maximum: 100 }, computer: computerParam }, additionalProperties: false },
   },
   {
     name: "hold_key", description: "Hold a key for `duration` seconds (0.05..30).",
-    inputSchema: { type: "object", required: ["text", "duration"], properties: { text: { type: "string" }, duration: { type: "number", minimum: 0.05, maximum: 30 }, app_ref: inputAppRef, computer: computerParam }, additionalProperties: false },
+    inputSchema: { type: "object", required: ["text", "duration"], properties: { text: { type: "string" }, duration: { type: "number", minimum: 0.05, maximum: 30 }, computer: computerParam }, additionalProperties: false },
   },
   {
     name: "set_value", description: "Set an editable element's value through the accessibility layer (background-safe, no keystrokes). Element targets only.",
@@ -254,7 +254,7 @@ export const TOOLS = [
   // ---- recording ----
   {
     name: "recording_start",
-    description: "Start screen recording on a computer (mp4/mov). Darwin: screencapture -v (timed or until recording_stop). Linux: x11grab/wf-recorder. Windows: ffmpeg gdigrab. HarmonyOS: snapshot-series muxed with ffmpeg.",
+    description: "Start screen recording on a computer (mp4/mov). Darwin: ScreenCaptureKit via the signed helper (timed or until recording_stop; honors region, no recorder overlay). Linux: x11grab/wf-recorder. Windows: ffmpeg gdigrab. HarmonyOS: snapshot-series muxed with ffmpeg.",
     inputSchema: {
       type: "object",
       properties: {
@@ -305,8 +305,8 @@ export const READ_ONLY_TOOLS = new Set([
 
 /** Tools dispatchable to a remote agent over ssh (allow-list must match agent.mjs). */
 export const REMOTE_TOOLS = new Set([
-  "probe", "list_displays", "switch_display", "list_apps", "list_windows",
-  "open_application", "get_app_state", "screenshot", "zoom",
+  "preview", "probe", "list_displays", "switch_display", "list_apps", "list_windows",
+  "open_application", "get_app_state", "resolve_element", "screenshot", "zoom",
   "left_click", "double_click", "triple_click", "right_click", "middle_click",
   "mouse_move", "left_click_drag", "left_mouse_down", "left_mouse_up", "scroll",
   "type", "key", "hold_key", "set_value", "select_text", "perform_action",

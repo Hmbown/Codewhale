@@ -61,7 +61,13 @@ pub enum PersistRequest {
         session_id: Option<String>,
     },
     /// Remove the queued/draft offline input file.
-    ClearOfflineQueue,
+    ClearOfflineQueue {
+        /// The session whose queue is being cleared. Carried for the same
+        /// reason `ClearCheckpoint` carries one: the queue is keyed per
+        /// session, so a clear must name its own session or it can drain
+        /// against whichever session this manager instance last wrote for.
+        session_id: Option<String>,
+    },
     /// Remove one session's crash-recovery checkpoint file. Scoped: cannot
     /// remove another session's checkpoint.
     ClearCheckpoint { session_id: String },
@@ -105,7 +111,9 @@ enum PendingOfflineQueue {
         state: Box<OfflineQueueState>,
         session_id: Option<String>,
     },
-    Clear,
+    Clear {
+        session_id: Option<String>,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -186,7 +194,7 @@ fn request_label(request: &PersistRequest) -> &'static str {
         PersistRequest::SessionSnapshot(_) => "SessionSnapshot",
         PersistRequest::CompletedCommit { .. } => "CompletedCommit",
         PersistRequest::OfflineQueue { .. } => "OfflineQueue",
-        PersistRequest::ClearOfflineQueue => "ClearOfflineQueue",
+        PersistRequest::ClearOfflineQueue { .. } => "ClearOfflineQueue",
         PersistRequest::ClearCheckpoint { .. } => "ClearCheckpoint",
         PersistRequest::FlushAndReport { .. } => "FlushAndReport",
         PersistRequest::Shutdown => "Shutdown",
@@ -302,7 +310,13 @@ struct PendingState {
     /// as a completion (or vice versa) and the clear intent stays bound to
     /// exactly the session that completed.
     completed_commits: BTreeMap<String, SavedSession>,
-    offline_queue: Option<PendingOfflineQueue>,
+    /// Latest-wins per session id, for the same reason `sessions` above is:
+    /// a single global slot dropped session A's queued text when session B
+    /// queued before the actor drained, which defeats the per-session file
+    /// naming entirely. `None` keys a save with no session id, which
+    /// `save_offline_queue_state` rejects — kept as a key so that error is
+    /// still reported rather than silently coalesced away.
+    offline_queue: BTreeMap<Option<String>, PendingOfflineQueue>,
 }
 
 /// What the actor loop should do after absorbing a request.
@@ -360,13 +374,20 @@ impl PendingState {
                 self.completed_commits.insert(id, session);
             }
             PersistRequest::OfflineQueue { state, session_id } => {
-                self.offline_queue = Some(PendingOfflineQueue::Save {
-                    state: Box::new(state),
-                    session_id,
-                });
+                self.offline_queue.insert(
+                    session_id.clone(),
+                    PendingOfflineQueue::Save {
+                        state: Box::new(state),
+                        session_id,
+                    },
+                );
             }
-            PersistRequest::ClearOfflineQueue => {
-                self.offline_queue = Some(PendingOfflineQueue::Clear);
+            PersistRequest::ClearOfflineQueue { session_id } => {
+                // A clear supersedes a pending save for its OWN session only.
+                self.offline_queue.insert(
+                    session_id.clone(),
+                    PendingOfflineQueue::Clear { session_id },
+                );
             }
             PersistRequest::ClearCheckpoint { session_id } => {
                 // A clear supersedes a pending checkpoint write for the same
@@ -436,7 +457,7 @@ fn flush_inner(manager: &SessionManager, pending: &mut PendingState) -> FlushRep
             manager.save_checkpoint(&session).map(|_| ()),
         );
     }
-    if let Some(request) = pending.offline_queue.take() {
+    for (_, request) in std::mem::take(&mut pending.offline_queue) {
         match request {
             PendingOfflineQueue::Save { state, session_id } => record(
                 "offline-queue".to_string(),
@@ -444,9 +465,15 @@ fn flush_inner(manager: &SessionManager, pending: &mut PendingState) -> FlushRep
                     .save_offline_queue_state(&state, session_id.as_deref())
                     .map(|_| ()),
             ),
-            PendingOfflineQueue::Clear => record(
+            // Prefer the session the clear named. The no-argument form falls
+            // back to whichever session THIS manager instance last saved for,
+            // which is not necessarily the caller's.
+            PendingOfflineQueue::Clear { session_id } => record(
                 "clear-offline-queue".to_string(),
-                manager.clear_offline_queue_state(),
+                match session_id.as_deref() {
+                    Some(id) => manager.clear_offline_queue_state_for(id),
+                    None => manager.clear_offline_queue_state(),
+                },
             ),
         }
     }
@@ -492,11 +519,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn two_sessions_queueing_before_a_drain_both_survive() {
+        // Per-session FILENAMES are not enough on their own: the actor
+        // coalesces pending work before those names are ever used, and the
+        // queue used one global slot while its checkpoint/session neighbours
+        // were already keyed per session. Session A's unsent text was
+        // therefore dropped whenever session B queued first.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let sessions_dir = tmp.path().join("sessions");
+        let manager = SessionManager::new(sessions_dir.clone()).expect("manager");
+        let (handle, task) = spawn_persistence_actor(manager);
+
+        for (session, body) in [("session-A", "text from A"), ("session-B", "text from B")] {
+            let state = OfflineQueueState {
+                messages: vec![QueuedSessionMessage {
+                    display: body.to_string(),
+                    skill_instruction: None,
+                    skill_provenance: None,
+                }],
+                ..OfflineQueueState::default()
+            };
+            handle.try_send(PersistRequest::OfflineQueue {
+                state,
+                session_id: Some(session.to_string()),
+            });
+        }
+
+        let checkpoints = sessions_dir.join("checkpoints");
+        for (session, body) in [("session-A", "text from A"), ("session-B", "text from B")] {
+            let path = checkpoints.join(format!("{session}.offline_queue.json"));
+            // wait_until panics on timeout, which is the failure signal: a
+            // coalesced-away queue never appears.
+            wait_until(|| std::fs::read_to_string(&path).is_ok_and(|f| f.contains(body))).await;
+        }
+
+        // A clear names its own session and must not touch the other's.
+        handle.try_send(PersistRequest::ClearOfflineQueue {
+            session_id: Some("session-A".to_string()),
+        });
+        let a = checkpoints.join("session-A.offline_queue.json");
+        wait_until(|| !a.exists()).await;
+        assert!(
+            checkpoints.join("session-B.offline_queue.json").exists(),
+            "clearing one session must not delete another session's queued text"
+        );
+
+        drop(handle);
+        let _ = task.await;
+    }
+
+    #[tokio::test]
     async fn actor_persists_and_clears_offline_queue_requests() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let sessions_dir = tmp.path().join("sessions");
         let manager = SessionManager::new(sessions_dir.clone()).expect("manager");
-        let queue_path = sessions_dir.join("checkpoints").join("offline_queue.json");
+        // The queue is keyed per session now (#5715-adjacent data-loss fix):
+        // two concurrent instances used to share one global file and the loser
+        // lost its unsent text. The request below carries session-A.
+        let queue_path = sessions_dir
+            .join("checkpoints")
+            .join("session-A.offline_queue.json");
         let (handle, task) = spawn_persistence_actor(manager);
 
         let state = OfflineQueueState {
@@ -518,7 +600,9 @@ mod tests {
         })
         .await;
 
-        handle.try_send(PersistRequest::ClearOfflineQueue);
+        handle.try_send(PersistRequest::ClearOfflineQueue {
+            session_id: Some("session-A".to_string()),
+        });
         wait_until(|| !queue_path.exists()).await;
         handle.try_send(PersistRequest::Shutdown);
         task.await.expect("persistence actor join");

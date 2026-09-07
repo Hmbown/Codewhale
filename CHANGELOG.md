@@ -7,8 +7,64 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.13] - 2026-09-07
+
+Codewhale v0.9.13 is the integrity release for 0.9.12: multiline paste is
+one paste again, truncated tool arguments can no longer execute, strict
+ACP clients connect again, concurrent instances stop destroying each
+other's queued text, and the Computer Use bundle ships at plugin 0.2.0
+with an accessibility-first pointer.
+
 ### Fixed
 
+- Pasting multiline text is one paste again. 0.9.12 gated the
+  paste-burst heuristic off whenever bracketed paste was *requested*, but
+  a terminal can accept `EnableBracketedPaste` and still deliver a paste
+  as individual keystrokes — on those terminals (observed on Windows 11)
+  every pasted line was submitted as its own message. The heuristic is
+  again armed whenever `tui.paste_burst_detection` is on, and the
+  existing `bracketed_paste_seen` guard still disarms it for the rest of
+  the session once a real `Event::Paste` arrives, so fast typing on
+  terminals with working bracketed paste is unaffected (#5981, thanks
+  @nsfoxer).
+- `serve --acp` no longer breaks strict JetBrains clients: the
+  `initialize` response advertised `sessionCapabilities.list` as a
+  boolean and carried an undefined nested `load` capability; it now
+  sends `{"list": {}}` with no `load` key, per the ACP schema (#5969,
+  reported by @Lujc0523).
+- Concurrent Codewhale instances no longer destroy each other's queued,
+  unsent text. The offline input queue was one global file that boot
+  cleared on session-id mismatch, so a second instance deleted the
+  first's parked messages. Queues are now keyed per session (mirroring
+  per-session checkpoints), an existing global file is adopted by its
+  owning session rather than discarded, and the adoption race between
+  two instances of the same session tolerates the loser's cleanup.
+- A tool call truncated at the provider's output limit can no longer be
+  repaired into valid JSON and executed: repairs that had to synthesize
+  structure (append or discard closers) are routed to the existing
+  malformed-arguments path so the model is asked to re-issue — including
+  when the stream is cut before the closing content-block event (#5986).
+- `codewhale metrics` reads Codewhale's own receipts again: the
+  deepseek-home fallback resolved `$HOME/.deepseek` unconditionally, so
+  the rollup reported all zeros from a directory nothing has written
+  since 2024. The Codewhale audit log is primary, with a checked legacy
+  fallback.
+- The goal-continuation loop's promised stall bound actually bounds
+  stalls now, and undeclared fleet role names fail closed to read-only
+  `explore` in both fleet drivers instead of resolving to write-capable
+  customs in one and not the other.
+- `allow_insecure_http = true` under a `[providers.<name>]` table works
+  again. 0.9.12 tightened plain-HTTP base URL handling in a way that
+  silently dropped the per-provider key, leaving the process-wide env
+  var as the only opt-in — LAN llama.cpp and internal-gateway users
+  had to export `CODEWHALE_ALLOW_INSECURE_HTTP=1` to connect at all.
+  The key is honored again (parsed, settable and unsettable through
+  `codewhale config set providers.<name>.allow_insecure_http`, and
+  listed in the custom-provider field hint), it stays distinct from
+  `insecure_skip_tls_verify`, and the refusal message now leads with
+  the config key. Loopback hosts remain auto-allowed and telemetry
+  endpoint validation deliberately still consults neither switch
+  (#5991, thanks @Gabriel-Degret).
 - A Fleet task that selects a roster member with `worker.agent_profile` now
   runs with that member's posture. The launch-time resolver only consulted the
   resolved member when the legacy `worker.role` label was absent, so a task
@@ -24,6 +80,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- The built-in Computer Use plugin bundle is refreshed to the standalone
+  plugin's 0.2.0 runtime (vendored from `Hmbown/codewhale-cu-plugin`
+  PR #12 @ `906b433`): the native macOS accessibility backend with an
+  a11y-first pointer strategy (covered points are refused, previews are
+  drawn), the permission-owning desktop-app socket transport, remote
+  computers over ssh and HarmonyOS HDC with contained temp handling,
+  truthful win32 PowerShell failure reporting, and the shared
+  allow-listed request handler for the app socket and ssh agent. The
+  embed list gained the five new runtime files, and a consistency test
+  now pins the embed list to the vendored tree so the bundle cannot rot
+  silently again. Because the bundle's content hash changes, Computer
+  Use deactivates and asks for a fresh review after upgrading — that is
+  the designed fail-closed path for a desktop-driving plugin. The
+  desktop app itself stays an opt-in install from the plugin
+  distribution; the bundled server runs direct mode and says how to get
+  the app.
 - `/statusline` drives the bottom chrome again. Since the 0.9.12 shell
   redesign the posture bar and the metrics line were built independently of
   `tui.status_items`, so every toggle in the picker except the balance fetch
@@ -82,6 +154,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the current turn has run, distinguishing actively working from waiting on
   a tool, a sub-agent or the operator; the 0.9.12 shell had dropped the overall
   working-time indicator from the place a glancing user checks (#5914).
+- A background runtime turn whose own store record could not be read, parsed
+  or written (`Failed to read turn …`, `Failed to read item …`) was only a log
+  line. The runtime now publishes a `runtime.store_failure` event naming the
+  file, the root cause and the next action (move the file aside, or check free
+  space and permissions); the TUI shows it as a warning toast and a transcript
+  line, the task timeline records it, and the runtime API streams it. A turn
+  whose own record is unreadable or unwritable is reported as terminal, so its
+  task fails at once instead of idling out (#5931).
 
 - An MCP token refresh that fails to parse the provider's answer keeps the
   endpoint's receipt — status line, content type, and a 200-byte excerpt
@@ -179,6 +259,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   path where the approval gate already applies. Thanks
   [@goransh-walia](https://github.com/goransh-walia) for the original
   implementation (PR #5870, fixes #3999).
+
+### Contributors
+
+- **[@nsfoxer](https://github.com/nsfoxer)** — reported the 0.9.12
+  multiline-paste regression with a root-cause analysis that made the
+  fix a one-day turnaround (#5981).
+- **@Nefelibata1024** — confirmed the paste regression's impact.
+- **[@Gabriel-Degret](https://github.com/Gabriel-Degret)** — reported
+  `allow_insecure_http` being silently dropped in 0.9.12, with the
+  valid-key list that pinned it (#5991).
+- **[@Lujc0523](https://github.com/Lujc0523)** — reported the ACP
+  `initialize` schema violation that made Codewhale unusable from
+  JetBrains IDEs (#5969).
+- **[@gaord](https://github.com/gaord)** — the fleet role-precedence
+  recovery (#5945) and the README link to the community VS Code
+  frontend (#5992).
+- **[@goransh-walia](https://github.com/goransh-walia)** — the
+  propose-only `commit_plan` rework (#5870).
+
+### Notes
+
+- Upgrading from 0.9.12 with Computer Use trusted and enabled: the
+  bundle's content hash changes with the 0.2.0 refresh, so the plugin
+  deactivates and asks for a fresh review — that is the designed
+  fail-closed path for a desktop-driving plugin. Re-trust it from the
+  Extensions page.
+- The multiline-paste fix restores v9.11 behavior on terminals that
+  accept `EnableBracketedPaste` but deliver pastes as keystrokes
+  (reported on Windows 11 / PowerShell). Verified at the input-contract
+  level and in CI; a manual paste check on a real Windows terminal is
+  still welcome — please comment on #5981 with your terminal if anything
+  still misbehaves.
 
 ## [0.9.12] - 2026-09-03
 
@@ -8098,6 +8210,7 @@ overflow report and `/theme` picker edge-wrapping patch in #1814.
 Older releases (v0.8.39 and earlier) are archived in [docs/CHANGELOG_ARCHIVE.md](docs/CHANGELOG_ARCHIVE.md).
 
 [Unreleased]: https://github.com/Hmbown/CodeWhale/compare/v0.9.12...HEAD
+[0.9.13]: https://github.com/Hmbown/CodeWhale/compare/v0.9.12...v0.9.13
 [0.9.12]: https://github.com/Hmbown/CodeWhale/compare/v0.9.11...v0.9.12
 [0.9.11]: https://github.com/Hmbown/CodeWhale/compare/v0.9.10...v0.9.11
 [0.9.10]: https://github.com/Hmbown/CodeWhale/compare/v0.9.9...v0.9.10

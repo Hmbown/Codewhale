@@ -10,7 +10,7 @@ If you just want the short version, see the
 [main README](../README.md#install) or
 [简体中文 README](../README.zh-CN.md#安装).
 
-This branch describes the **v0.9.12 source candidate**. Install commands that use
+This branch describes the **v0.9.13 source candidate**. Install commands that use
 `latest` resolve to the latest published package or GitHub Release, which may
 trail the source candidate. A candidate is not a published install until the
 matching package, tag, checksums, and release assets exist.
@@ -47,7 +47,7 @@ and at most three attempts. Explicit mirror settings remain supported. `CODEWHAL
 version; `DEEPSEEK_TUI_VERSION` and `DEEPSEEK_VERSION` remain legacy aliases. The
 manifest and binary must come from the same source, and checksum failure never
 permits replacement. An explicit version or mirror cannot bypass the version
-check: a newer development build is kept, including v0.9.12 when public latest
+check: a newer development build is kept, including v0.9.13 when public latest
 is v0.9.11. Use a separate directory for deliberate rollback.
 
 ### Migrating from npm, Cargo, or another installation
@@ -101,7 +101,7 @@ commands update their own copies, so verify PATH again afterward.
 As checked on 2026-09-04, [latest stable v0.9.11](https://github.com/Hmbown/CodeWhale/releases/tag/v0.9.11)
 publishes Linux x64/arm64, macOS x64/arm64, Windows x64/arm64, and Android arm64
 assets. Artifact presence is distinct from platform qualification.
-The table below describes the v0.9.12 source candidate's platform and secondary
+The table below describes the v0.9.13 source candidate's platform and secondary
 packaging support; `latest` installation still selects the published release.
 Android/Termux is preview pending real-device QA. Linux ARM64 is available from
 v0.8.8 onward. Linux RISC-V prebuilts are temporarily paused because the locked
@@ -126,7 +126,7 @@ v0.8.8 onward. Linux RISC-V prebuilts are temporarily paused because the locked
   [Build from source](#7-build-from-source) below.
 ³ RISC-V source builds currently need upstream `rquickjs-sys` RISC-V bindings or
   a bindgen-enabled dependency build.
-⁴ The v0.9.12 source-candidate npm wrapper recognizes Android arm64 and resolves
+⁴ The v0.9.13 source-candidate npm wrapper recognizes Android arm64 and resolves
   the matching `codewhale` and `codew` Android assets. npm
   installation works only for a package version whose GitHub Release publishes
   those matching assets. The Android/Termux path remains preview-only until the
@@ -138,7 +138,7 @@ Linux `codewhale-linux-arm64` archive in Termux; use the Termux-specific
 Android archive when a release or release candidate publishes one, or build
 from source inside Termux.
 
-The Linux **x64 and arm64** v0.9.12 candidate assets are **static musl builds**.
+The Linux **x64 and arm64** v0.9.13 candidate assets are **static musl builds**.
 The x64 release path has used musl since v0.8.65; v0.9.6 extends the same build
 and static-launch check to arm64. These binaries have no glibc dependency and
 run on their matching architecture across Ubuntu, Debian, RHEL/CentOS, and
@@ -156,7 +156,7 @@ version `GLIBC_2.39' not found
 ```
 
 The npm wrapper, `codewhale update`, and the Unix archive installer retain their
-GNU-binary preflight for older releases. The v0.9.12 arm64 candidate instead uses
+GNU-binary preflight for older releases. The v0.9.13 arm64 candidate instead uses
 `aarch64-unknown-linux-musl`, so it has no `GLIBC_*` floor. If you are installing
 an earlier release on an older arm64 distribution, use:
 

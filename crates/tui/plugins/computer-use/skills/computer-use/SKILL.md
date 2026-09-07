@@ -24,7 +24,11 @@ computer unless given `computer`.
 Observe once, act once, then verify.
 
 1. If readiness is unknown, call `request_access` once. It names missing
-   permissions and missing tools per platform, and never pops dialogs.
+   permissions and missing tools per platform, and never pops dialogs. Its
+   `via` field says who holds the permissions: `"app"` means the Codewhale
+   Computer Use desktop app is doing the work (grants belong to it);
+   `"direct"` means this server process is, and `appHint` says how to
+   install the app so grants stop depending on the host terminal.
 2. `list_apps` shows running apps only. If the user names an app that is
    absent, call `open_application` once with the original user-provided name,
    copied character-for-character — including case, spaces, punctuation, and
@@ -46,15 +50,47 @@ Observe once, act once, then verify.
 ## Choosing targets
 
 - Element: `{"type":"element","state_id":"s-1","index":4}` — prefer this.
+  Elements are revalidated against the live tree before every action: if the
+  element moved, the click lands on its fresh center and the receipt carries
+  `target_reacquired: true`; if it no longer resolves (or changed role) the
+  call fails `element_stale` — call `get_app_state` again for a fresh
+  `state_id`. A `state_id` only works on the computer that issued it
+  (`state_wrong_computer`).
 - Coordinate: `{"type":"coordinate","x":496,"y":331}` — pixels from the latest
   raster only; submit `x`/`y` unchanged, never transform them yourself.
+  `zoom` returns a bindable raster of its own: after zooming, coordinates are
+  pixels in the zoomed image. Points outside the bound raster fail
+  `target_outside_raster` instead of landing somewhere unintended.
 - Never translate pixels into an element target; never invent `state_id`s.
 
 ## Raw input reality (read before clicking)
 
-- macOS: element actions and `set_value` are background-safe. Raw pointer and
-  keyboard events are posted at the target point and land on whatever is
-  frontmost there — activate the app first for click/type flows, then act.
+- macOS: call `open_application` with `activate:false` to bind input to the
+  intended process, even when the app is already running; pass `pid` when two
+  processes share a bundle id. Then the two halves behave differently:
+  - **Keyboard and element actions are quiet.** `type`, `key`, `set_value`,
+    `select_text` and `perform_action` reach the bound process without moving
+    the pointer or changing the foreground. Prefer them.
+  - **Pointer actions may not be.** macOS cannot deliver pointer or scroll
+    events to a chosen process, so `left_click` resolves the coordinate through
+    the accessibility tree first and presses the element it finds
+    (`strategy: "a11y"` in the receipt — quiet). With nothing pressable there,
+    and for double/triple/right/middle click, drag, hover and scroll, it falls
+    back to a real pointer gesture: the cursor moves (and is restored) and the
+    app comes forward. The receipt says `strategy: "event"`, `pointer_moved`
+    and `foreground_taken`. Read it, and tell the user when a step took their
+    foreground. Pass `strategy: "a11y"` when the task must not disturb them —
+    it fails closed rather than falling back.
+  - A pointer gesture is refused when another application's window covers the
+    point; it names the owner. Raise the window you meant with
+    `open_application(activate:true)`, observe again, and retry — do not move
+    or close the reported window.
+  - An accessibility press refuses to cross a modal sheet
+    (`window_blocked_by_modal_sheet`): deal with the sheet first.
+  Use app-scoped screenshots (`app_ref`) to avoid capturing unrelated windows.
+  Do not activate an app or enable `preview` unless the user asks to watch or
+  interact with it. If you enabled a preview, disable it when finished.
+  Close only disposable documents created by your task; never quit a user app.
 - Windows/Linux: raw input is foreground by nature; UIA/AT-SPI element actions
   are the precise path.
 - HarmonyOS: `uitest` synthesizes touches; there is no hover or cursor.
@@ -68,7 +104,8 @@ Observe once, act once, then verify.
 ## Recording
 
 `recording_start` → work → `recording_stop` returns the finalized file path.
-macOS uses `screencapture -v` (a receipt warning about Screen Recording
+macOS uses ScreenCaptureKit inside the signed helper — no system recorder UI
+and no desktop dimming overlay (a receipt warning about Screen Recording
 permission means the user must grant it once). Linux uses x11grab/wf-recorder,
 Windows ffmpeg gdigrab, HarmonyOS snapshot-series (no native CLI recorder —
 the receipt says so). `recording_status` / `recording_list` report bytes and
@@ -86,8 +123,9 @@ paths. Screenshots land in the same directory.
 
 - **Screenshot** — optionally a computer id, display index, or `[x,y,w,h]`
   region; call `screenshot`; report path, size, computer/display. Black or
-  empty capture means the host lacks Screen Recording permission (macOS):
-  say so and stop.
+  empty capture means Screen Recording permission is missing (macOS) for the
+  app (`via: "app"`) or the host terminal (`via: "direct"`): say which and
+  stop.
 - **Record** — `recording_start` (parse computer id, fps, display, duration
   or "record for 30s" → `durationSec` on macOS), then report id, path, mode.
   To stop, find the running id via `recording_list` and call `recording_stop`.
