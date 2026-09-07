@@ -5,6 +5,14 @@
 
 use super::*;
 
+/// Ceiling for the inline half of an MCP OAuth login (discovery, token
+/// endpoint resolution, callback listener bind). This runs on the event-loop
+/// thread, and the Esc cancel token is only armed after it returns, so an
+/// unbounded await here freezes the session with no way out (#5974). Slightly
+/// above `mcp::oauth`'s 5s discovery budget so the more specific error there
+/// wins when discovery is what stalled.
+const MCP_LOGIN_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
+
 /// How long the picker's ⇧F receipt stays in the footer: long enough to read
 /// a route and its roles, short enough to leave the chrome still.
 const FLEET_TOGGLE_TOAST_TTL_MS: u64 = 6_000;
@@ -458,6 +466,25 @@ pub(crate) async fn handle_bang_shell_input(
     Ok(true)
 }
 
+/// Receipt for the Extensions page's "Diagnose" action (`/mcp validate`).
+///
+/// Split out so the wording is testable without standing up an `App`: the
+/// defect in #5974 was not the check itself but that it produced no output,
+/// which reads to a user as a dead button.
+fn mcp_validate_receipt(path: &std::path::Path, total: usize, disabled: usize) -> String {
+    if disabled == 0 {
+        format!(
+            "MCP config OK at {} — {total} server(s) configured; discovery refreshed",
+            path.display()
+        )
+    } else {
+        format!(
+            "MCP config OK at {} — {total} server(s) configured, {disabled} disabled; discovery refreshed",
+            path.display()
+        )
+    }
+}
+
 pub(crate) async fn handle_mcp_ui_action(
     app: &mut App,
     engine_handle: &EngineHandle,
@@ -535,12 +562,26 @@ pub(crate) async fn handle_mcp_ui_action(
                 .map(|()| message = Some(format!("Removed MCP server '{name}'")))
         }
         crate::tui::app::McpUiAction::Login { name, scopes } => {
-            // Only the handshake runs inline: it is a couple of HTTP calls and
-            // it yields the authorization URL. The five-minute browser-callback
-            // wait goes to the background task pattern, because awaiting it
-            // here parked the event loop — a misclicked `[re-auth]` row left
-            // the session unusable with no way to back out.
-            let begun = async {
+            // Only the handshake runs inline: it yields the authorization URL,
+            // and the five-minute browser-callback wait goes to the background
+            // task pattern below, because awaiting THAT here parked the event
+            // loop — a misclicked `[re-auth]` row left the session unusable
+            // with no way to back out.
+            //
+            // The handshake is still awaited on this thread, so it must stay
+            // bounded: it was described as "a couple of HTTP calls", but it
+            // reaches OAuth discovery, whose `AuthorizationManager::new` builds
+            // its own client and ignored the discovery timeout. Against a stale
+            // issuer that hung forever and froze the session (#5974). The bound
+            // now lives at the source in `mcp::oauth` (DISCOVERY_TIMEOUT), and
+            // this second bound covers the rest of the handshake — token
+            // endpoint resolution and listener bind — so no future addition to
+            // this path can reintroduce an unbounded await on the event loop.
+            //
+            // Note the Esc cancel token below is armed only AFTER this await
+            // completes, so it never covered this window; the timeout is what
+            // makes the window survivable.
+            let begun = tokio::time::timeout(MCP_LOGIN_HANDSHAKE_TIMEOUT, async {
                 let cfg = mcp::load_config_with_workspace_and_plugins(
                     &path,
                     &app.workspace,
@@ -558,8 +599,14 @@ pub(crate) async fn handle_mcp_ui_action(
                     config.mcp_oauth_callback_url.as_deref(),
                 )
                 .await
-            }
-            .await;
+            })
+            .await
+            .unwrap_or_else(|_| {
+                Err(anyhow::anyhow!(
+                    "Timed out after {}s starting OAuth login for '{name}'. The server's authorization endpoint did not respond; check the server URL and try again.",
+                    MCP_LOGIN_HANDSHAKE_TIMEOUT.as_secs()
+                ))
+            });
 
             match begun {
                 Ok(login) => {
@@ -640,7 +687,28 @@ pub(crate) async fn handle_mcp_ui_action(
                 Err(err) => Err(err),
             }
         }
-        crate::tui::app::McpUiAction::Validate | crate::tui::app::McpUiAction::Reload => Ok(()),
+        crate::tui::app::McpUiAction::Validate | crate::tui::app::McpUiAction::Reload => {
+            // The Extensions page labels this "Diagnose", and it does refresh
+            // discovery (see `mcp_ui_action_refreshes_discovery`) — but it used
+            // to return without setting a message, so a user who clicked it saw
+            // nothing happen and reasonably reported it as broken (#5974). A
+            // diagnostic that emits no receipt is indistinguishable from a
+            // no-op. Report what was actually checked.
+            match mcp::load_config_with_workspace_and_plugins(
+                &path,
+                &app.workspace,
+                app.plugin_registry.as_ref(),
+            ) {
+                Ok(cfg) => {
+                    let disabled = cfg.servers.values().filter(|s| !s.is_enabled()).count();
+                    message = Some(mcp_validate_receipt(&path, cfg.servers.len(), disabled));
+                    Ok(())
+                }
+                // A config that will not load IS the diagnosis, and the error
+                // is what the operator needs to see.
+                Err(err) => Err(err),
+            }
+        }
         crate::tui::app::McpUiAction::Retry { .. } => Ok(()),
     };
 
@@ -2368,4 +2436,47 @@ pub(crate) fn handle_view_events_boxed<'a>(
         }
         Ok(false)
     })
+}
+
+#[cfg(test)]
+mod mcp_diagnose_tests {
+    use super::{MCP_LOGIN_HANDSHAKE_TIMEOUT, mcp_validate_receipt};
+    use std::path::Path;
+
+    #[test]
+    fn diagnose_reports_what_it_checked_instead_of_saying_nothing() {
+        // #5974: the Extensions page's "Diagnose" row ran `/mcp validate`,
+        // which refreshed discovery and then returned Ok(()) with no message.
+        // A diagnostic that emits no receipt is indistinguishable from a dead
+        // button, which is exactly how it was reported.
+        let msg = mcp_validate_receipt(Path::new("/tmp/mcp.json"), 3, 0);
+        assert!(
+            msg.contains("/tmp/mcp.json"),
+            "names the config it read: {msg}"
+        );
+        assert!(msg.contains('3'), "reports how many servers it saw: {msg}");
+        assert!(!msg.is_empty());
+
+        // A disabled server is the most common "why is nothing working"
+        // question, so the receipt has to distinguish it from absence.
+        let with_disabled = mcp_validate_receipt(Path::new("/tmp/mcp.json"), 3, 1);
+        assert!(
+            with_disabled.contains("1 disabled"),
+            "disabled servers must be visible in the receipt: {with_disabled}"
+        );
+    }
+
+    #[test]
+    fn the_inline_handshake_bound_sits_above_the_discovery_bound() {
+        // Both halves of the #5974 freeze are bounded now: `mcp::oauth`'s
+        // DISCOVERY_TIMEOUT (5s) covers the constructor that ignored its
+        // client's timeout, and this one covers the rest of the inline
+        // handshake. This must stay the looser of the two, or the generic
+        // "starting OAuth login timed out" message would mask the specific
+        // discovery error that tells the operator which endpoint stalled.
+        assert!(
+            MCP_LOGIN_HANDSHAKE_TIMEOUT > std::time::Duration::from_secs(5),
+            "handshake bound must not preempt the discovery bound"
+        );
+    }
 }

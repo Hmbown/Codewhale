@@ -902,15 +902,33 @@ pub async fn discover_streamable_http_oauth(
     discover_streamable_http_oauth_with_headers(url, headers).await
 }
 
+/// Budget for reaching an MCP server's authorization server during discovery.
+/// Applies to both the discovery HTTP client and the `AuthorizationManager`
+/// constructor, which builds its own client and would otherwise be unbounded.
+const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(5);
+
 async fn discover_streamable_http_oauth_with_headers(
     url: &str,
     default_headers: HeaderMap,
 ) -> Result<Option<McpOAuthDiscovery>> {
     let client = apply_default_headers(crate::tls::reqwest_client_builder(), &default_headers)
-        .timeout(Duration::from_secs(5))
+        .timeout(DISCOVERY_TIMEOUT)
         .build()
         .context("building MCP OAuth discovery client")?;
-    let mut manager = AuthorizationManager::new(url).await?;
+    // `AuthorizationManager::new` performs its own network I/O with its own
+    // client, so the 5s timeout above does not reach it — `with_client` only
+    // takes effect afterwards. Against an unreachable or stale issuer that
+    // constructor hangs indefinitely, and the TUI awaits this handshake on the
+    // event-loop thread (#5974), which parks the whole session. Bound it with
+    // the same budget the discovery client uses.
+    let mut manager = timeout(DISCOVERY_TIMEOUT, AuthorizationManager::new(url))
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "MCP OAuth discovery for {url} timed out after {}s while contacting the authorization server",
+                DISCOVERY_TIMEOUT.as_secs()
+            )
+        })??;
     manager.with_client(client)?;
     match manager.resolve_metadata().await {
         Ok(resolution) => Ok(Some(McpOAuthDiscovery {
