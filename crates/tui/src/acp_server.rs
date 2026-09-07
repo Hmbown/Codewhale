@@ -2382,8 +2382,7 @@ fn initialize_result(client_protocol_version: Option<u64>, config: &Config) -> V
                 "sse": false
             },
             "sessionCapabilities": {
-                "list": true,
-                "load": true
+                "list": {}
             }
         },
         "agentInfo": {
@@ -2822,13 +2821,11 @@ mod tests {
         // #5864: enumerating and resuming durable Codewhale sessions is now
         // served, so the capability says so rather than declining it.
         assert_eq!(result["agentCapabilities"]["loadSession"], true);
+        // ACP advertises session/list with an object, not a boolean (#5969).
+        // session/load is advertised only by the top-level loadSession above.
         assert_eq!(
-            result["agentCapabilities"]["sessionCapabilities"]["list"],
-            true
-        );
-        assert_eq!(
-            result["agentCapabilities"]["sessionCapabilities"]["load"],
-            true
+            result["agentCapabilities"]["sessionCapabilities"],
+            json!({"list": {}})
         );
         assert_eq!(
             result["agentCapabilities"]["promptCapabilities"]["embeddedContext"],
