@@ -2303,10 +2303,16 @@ pub fn create_saved_session_with_id_and_mode(
 ) -> SavedSession {
     let now = Utc::now();
 
-    // Generate title from first user message
+    // Generate title from the first real user message. Chat-template
+    // compatibility forces runtime-owned control traffic (sub-agent handoffs,
+    // the Operate contract, restore checkpoints) through `role = "user"`, but
+    // an internal envelope is not what the person typed. Skip those messages
+    // so the auto-generated title comes from the actual prompt; this is the
+    // same recognizer the session peek uses, so title and preview agree about
+    // what counts as conversation.
     let title = messages
         .iter()
-        .find(|m| m.role == "user")
+        .find(|m| m.role == "user" && !crate::runtime_handoff::is_internal_runtime_handoff(m))
         .and_then(|m| {
             m.content.iter().find_map(|block| match block {
                 ContentBlock::Text { text, .. } => {
@@ -4045,6 +4051,41 @@ mod tests {
         assert_eq!(
             session.metadata.title,
             "Fix the session picker history pane"
+        );
+    }
+
+    #[test]
+    fn create_saved_session_skips_runtime_handoffs_when_deriving_title() {
+        let tmp = tempdir().expect("tempdir");
+        // Operate/automation sessions start with runtime-owned control traffic
+        // as the first `user` message. The auto-title must come from the real
+        // prompt that follows, never from the internal envelope.
+        let messages = vec![
+            crate::runtime_handoff::operate_contract_runtime_message(),
+            make_test_message("user", "Ship the session-title fix"),
+        ];
+        let session = create_saved_session(&messages, "test-model", tmp.path(), 100, None);
+        assert_eq!(session.metadata.title, "Ship the session-title fix");
+        assert!(
+            !session.metadata.title.contains("codewhale:runtime"),
+            "internal envelope leaked into the session title: {}",
+            session.metadata.title
+        );
+    }
+
+    #[test]
+    fn create_saved_session_with_only_runtime_traffic_keeps_placeholder_title() {
+        let tmp = tempdir().expect("tempdir");
+        let messages = vec![
+            crate::runtime_handoff::operate_contract_runtime_message(),
+            crate::runtime_handoff::waiting_for_subagents_runtime_message(2),
+        ];
+        let session = create_saved_session(&messages, "test-model", tmp.path(), 100, None);
+        assert_eq!(session.metadata.title, DEFAULT_SESSION_TITLE);
+        assert!(
+            !session.metadata.title.contains("codewhale:runtime"),
+            "internal envelope leaked into the session title: {}",
+            session.metadata.title
         );
     }
 
