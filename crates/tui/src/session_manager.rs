@@ -875,16 +875,10 @@ impl SavedSession {
         let messages = journal.to_messages();
         let now = Utc::now();
         let spawn_depth = journal.spawn_depth.saturating_add(1);
-        let title = messages
-            .iter()
-            .find(|m| m.role == "user")
-            .and_then(|m| {
-                m.content.iter().find_map(|b| match b {
-                    ContentBlock::Text { text, .. } => Some(text.as_str()),
-                    _ => None,
-                })
-            })
-            .map(|s| crate::session_manager::truncate_title(s, 50))
+        // Reuse the conversation-derived title so an imported session that
+        // opens with runtime-owned control traffic (Operate contract, restore
+        // checkpoint) is named after the real prompt, not the envelope.
+        let title = conversation_derived_title(&messages)
             .unwrap_or_else(|| crate::session_manager::DEFAULT_SESSION_TITLE.to_string());
         let metadata = SessionMetadata {
             id: Uuid::new_v4().to_string(),
@@ -2303,30 +2297,11 @@ pub fn create_saved_session_with_id_and_mode(
 ) -> SavedSession {
     let now = Utc::now();
 
-    // Generate title from the first real user message. Chat-template
-    // compatibility forces runtime-owned control traffic (sub-agent handoffs,
-    // the Operate contract, restore checkpoints) through `role = "user"`, but
-    // an internal envelope is not what the person typed. Skip those messages
-    // so the auto-generated title comes from the actual prompt; this is the
-    // same recognizer the session peek uses, so title and preview agree about
-    // what counts as conversation.
-    let title = messages
-        .iter()
-        .find(|m| m.role == "user" && !crate::runtime_handoff::is_internal_runtime_handoff(m))
-        .and_then(|m| {
-            m.content.iter().find_map(|block| match block {
-                ContentBlock::Text { text, .. } => {
-                    let prompt = extract_user_prompt(text);
-                    if prompt.is_empty() {
-                        None
-                    } else {
-                        Some(truncate_title(prompt, 50))
-                    }
-                }
-                _ => None,
-            })
-        })
-        .unwrap_or_else(|| DEFAULT_SESSION_TITLE.to_string());
+    // Generate title from the first real user message (runtime-owned control
+    // traffic is skipped by `conversation_derived_title`). Fall back to the
+    // placeholder when no user-authored prompt exists yet.
+    let title =
+        conversation_derived_title(messages).unwrap_or_else(|| DEFAULT_SESSION_TITLE.to_string());
 
     let journal = SessionJournal::from_messages(messages.to_vec(), 0);
     let leaf_id = journal.leaf_id.clone();
@@ -2627,6 +2602,37 @@ fn truncate_title(s: &str, max_len: usize) -> String {
     }
 }
 
+/// Derive the auto-title from the first real user message of a conversation.
+///
+/// Returns `None` when no user-authored message exists to name the session
+/// after (an empty transcript, or one holding only runtime-owned control
+/// traffic); callers fall back to [`DEFAULT_SESSION_TITLE`].
+///
+/// Chat-template compatibility forces runtime-owned control traffic
+/// (sub-agent handoffs, the Operate contract, restore checkpoints) through
+/// `role = "user"`, but an internal envelope is not what the person typed.
+/// Skip those messages — the same recognizer the session peek uses, so every
+/// caller agrees about what counts as conversation — and strip any leading
+/// `<turn_meta>` envelope from the surviving prompt.
+fn conversation_derived_title(messages: &[Message]) -> Option<String> {
+    messages
+        .iter()
+        .find(|m| m.role == "user" && !crate::runtime_handoff::is_internal_runtime_handoff(m))
+        .and_then(|m| {
+            m.content.iter().find_map(|block| match block {
+                ContentBlock::Text { text, .. } => {
+                    let prompt = extract_user_prompt(text);
+                    if prompt.is_empty() {
+                        None
+                    } else {
+                        Some(truncate_title(prompt, 50))
+                    }
+                }
+                _ => None,
+            })
+        })
+}
+
 /// Format a session for display in a picker
 pub fn format_session_line(meta: &SessionMetadata) -> String {
     let age = format_age(&meta.updated_at);
@@ -2691,6 +2697,11 @@ mod tests {
                 cache_control: None,
             }],
         }
+    }
+
+    fn container_with(messages: Vec<Message>, dir: &std::path::Path) -> SessionImportContainer {
+        let session = create_saved_session(&messages, "test-model", dir, 100, None);
+        session.export_container("test-session.json")
     }
 
     #[test]
@@ -4076,9 +4087,20 @@ mod tests {
     #[test]
     fn create_saved_session_with_only_runtime_traffic_keeps_placeholder_title() {
         let tmp = tempdir().expect("tempdir");
+        let waiting = crate::runtime_handoff::waiting_for_subagents_runtime_message(2);
+        let restored =
+            crate::runtime_handoff::project_messages_for_restore(std::slice::from_ref(&waiting))
+                .into_iter()
+                .next()
+                .expect("restore projection yields one message");
+        // Every runtime handoff shape the session peek filters must also stay
+        // out of the auto-title: the Operate contract, a waiting/restored
+        // sub-agent checkpoint, and a background shell completion.
         let messages = vec![
             crate::runtime_handoff::operate_contract_runtime_message(),
-            crate::runtime_handoff::waiting_for_subagents_runtime_message(2),
+            waiting,
+            restored,
+            crate::runtime_handoff::shell_completion_runtime_message(&[]),
         ];
         let session = create_saved_session(&messages, "test-model", tmp.path(), 100, None);
         assert_eq!(session.metadata.title, DEFAULT_SESSION_TITLE);
@@ -4087,6 +4109,49 @@ mod tests {
             "internal envelope leaked into the session title: {}",
             session.metadata.title
         );
+    }
+
+    #[test]
+    fn import_foreign_derives_title_from_the_first_real_user_message() {
+        let tmp = tempdir().expect("tempdir");
+        // Importing a session whose transcript opens with the Operate contract
+        // (the shape this bug produced on export) must not re-derive the
+        // envelope as the imported title.
+        let container = container_with(
+            vec![
+                crate::runtime_handoff::operate_contract_runtime_message(),
+                make_test_message("user", "Fix the session picker"),
+            ],
+            tmp.path(),
+        );
+        let imported = crate::session_manager::SavedSession::import_foreign(
+            container,
+            tmp.path().to_path_buf(),
+            "test-model".to_string(),
+        )
+        .expect("import succeeds");
+        assert_eq!(imported.metadata.title, "Fix the session picker");
+        assert!(
+            !imported.metadata.title.contains("codewhale:runtime"),
+            "internal envelope leaked into the imported session title: {}",
+            imported.metadata.title
+        );
+    }
+
+    #[test]
+    fn import_foreign_keeps_placeholder_when_only_runtime_traffic() {
+        let tmp = tempdir().expect("tempdir");
+        let container = container_with(
+            vec![crate::runtime_handoff::operate_contract_runtime_message()],
+            tmp.path(),
+        );
+        let imported = crate::session_manager::SavedSession::import_foreign(
+            container,
+            tmp.path().to_path_buf(),
+            "test-model".to_string(),
+        )
+        .expect("import succeeds");
+        assert_eq!(imported.metadata.title, DEFAULT_SESSION_TITLE);
     }
 
     #[test]
