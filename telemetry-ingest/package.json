@@ -16,7 +16,7 @@
   "devDependencies": {
     "@types/node": "^22.20.1",
     "typescript": "^5.7.3",
-    "vitest": "^4.1.9",
+    "vitest": "^5.0.0",
     "wrangler": "^4.107.0"
   },
   "overrides": {
