@@ -140,7 +140,10 @@ fn method_to_u8(method: Method) -> u8 {
     }
 }
 
-fn install_configured_method(method: Method) {
+/// Install `method` as the process-wide notification method for paths that
+/// do not resolve a method of their own (the `notify` tool); `pub(crate)`
+/// so the tool's tests can arrange the installed method.
+pub(crate) fn install_configured_method(method: Method) {
     CONFIGURED_METHOD.store(method_to_u8(method), Ordering::SeqCst);
 }
 
@@ -1753,6 +1756,68 @@ mod tests {
         assert!(gate.quiet);
         assert!(!gate.approval_needed);
         assert!(gate.turn_complete);
+    }
+
+    /// Restores the process-wide configured method after a test mutates it.
+    struct ConfiguredMethodRestore(Method);
+
+    impl ConfiguredMethodRestore {
+        fn capture() -> Self {
+            Self(configured_method())
+        }
+    }
+
+    impl Drop for ConfiguredMethodRestore {
+        fn drop(&mut self) {
+            install_configured_method(self.0);
+        }
+    }
+
+    /// Same single-place contract as the gate: `settings()` must install the
+    /// configured `[notifications].method` so the `notify` tool (which has
+    /// no method of its own) honors it — including `off` (#1322 promise).
+    #[test]
+    fn settings_installs_configured_method_from_config() {
+        let _lock = env_lock();
+        let _method_restore = ConfiguredMethodRestore::capture();
+        let off: crate::config::Config = toml::from_str(
+            r#"
+            [notifications]
+            method = "off"
+            "#,
+        )
+        .expect("method=off config should parse");
+        let _ = settings(&off);
+        assert_eq!(configured_method(), Method::Off);
+
+        let osc9: crate::config::Config = toml::from_str(
+            r#"
+            [notifications]
+            method = "osc9"
+            "#,
+        )
+        .expect("method=osc9 config should parse");
+        let _ = settings(&osc9);
+        assert_eq!(configured_method(), Method::Osc9);
+    }
+
+    /// The installed encoding must round-trip every method so an install/read
+    /// pair can never silently fall back to `Auto`.
+    #[test]
+    fn configured_method_round_trips_every_variant() {
+        let _restore = ConfiguredMethodRestore::capture();
+        for method in [
+            Method::Auto,
+            Method::Osc9,
+            Method::Bel,
+            Method::MacOS,
+            Method::Kitty,
+            Method::Ghostty,
+            Method::Off,
+        ] {
+            install_configured_method(method);
+            assert_eq!(configured_method(), method);
+        }
     }
 
     /// #5041 copy contract: interactive banners lead with the action and

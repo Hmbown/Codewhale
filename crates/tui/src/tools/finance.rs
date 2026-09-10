@@ -14,6 +14,7 @@ use super::spec::{
     ApprovalRequirement, ToolCapability, ToolContext, ToolError, ToolResult, ToolSpec,
     optional_str, optional_u64,
 };
+use crate::network_policy::Decision;
 
 const DEFAULT_TIMEOUT_MS: u64 = 10_000;
 const MAX_TIMEOUT_MS: u64 = 60_000;
@@ -188,7 +189,7 @@ impl ToolSpec for FinanceTool {
     }
 
     fn description(&self) -> &'static str {
-        "Fetch a live market quote for a stock, ETF, or crypto ticker using Yahoo Finance-style public endpoints."
+        "Fetch a live market quote for a stock, ETF, or crypto ticker using Yahoo Finance-style public endpoints. Network-policy aware: both endpoint hosts are checked against the session network policy before any request, and policy rejections fail closed."
     }
 
     fn input_schema(&self) -> Value {
@@ -240,7 +241,7 @@ impl ToolSpec for FinanceTool {
         true
     }
 
-    async fn execute(&self, input: Value, _context: &ToolContext) -> Result<ToolResult, ToolError> {
+    async fn execute(&self, input: Value, context: &ToolContext) -> Result<ToolResult, ToolError> {
         let raw_ticker = match optional_str(&input, "ticker")? {
             Some(ticker) => Some(ticker),
             None => optional_str(&input, "symbol")?,
@@ -258,6 +259,11 @@ impl ToolSpec for FinanceTool {
 
         let request = normalize_request(raw_ticker, type_hint);
         let timeout = Duration::from_millis(timeout_ms);
+
+        // #135: quote and chart hosts are both vetted before any transport
+        // fires, so a tightened session (e.g. network.default = "deny")
+        // cannot leak a request through the chart fallback.
+        check_network_policy(context, &self.endpoints)?;
 
         let quote_result =
             fetch_quote_endpoint(&self.client, timeout, &self.endpoints, &request).await;
@@ -278,6 +284,39 @@ impl ToolSpec for FinanceTool {
             }
         }
     }
+}
+
+/// Fail closed when the session network policy denies (or has not approved)
+/// either endpoint host. Mirrors the Web/web_search/speech family: `Deny`
+/// and an undecided `Prompt` both stop before any request is made; no
+/// attached policy falls through permissively for back-compat.
+fn check_network_policy(
+    context: &ToolContext,
+    endpoints: &FinanceEndpoints,
+) -> Result<(), ToolError> {
+    let Some(decider) = context.network_policy.as_ref() else {
+        return Ok(());
+    };
+    for base in [&endpoints.quote_base, &endpoints.chart_base] {
+        let Some(host) = crate::network_policy::host_from_url(base) else {
+            continue;
+        };
+        match decider.evaluate(&host, "finance") {
+            Decision::Allow => {}
+            Decision::Deny => {
+                return Err(ToolError::permission_denied(format!(
+                    "finance lookup to '{host}' blocked by network policy"
+                )));
+            }
+            Decision::Prompt => {
+                return Err(ToolError::permission_denied(format!(
+                    "finance lookup to '{host}' requires approval; \
+                     re-run after `/network allow {host}` or set network.default = \"allow\" in config"
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn normalize_request(raw_ticker: &str, type_hint: Option<&str>) -> FinanceRequest {
@@ -951,5 +990,97 @@ mod tests {
         assert_eq!(any_of.len(), 2);
         assert_eq!(any_of[0]["required"], json!(["ticker"]));
         assert_eq!(any_of[1]["required"], json!(["symbol"]));
+    }
+
+    fn denied_context_for(host: &str) -> (ToolContext, tempfile::TempDir) {
+        use crate::network_policy::{NetworkPolicy, NetworkPolicyDecider};
+        let (ctx, tmp) = context();
+        let policy = NetworkPolicy {
+            default: Decision::Allow.into(),
+            allow: Vec::new(),
+            deny: vec![host.to_string()],
+            proxy: Vec::new(),
+            proxy_fake_ip_cidrs: Vec::new(),
+            audit: false,
+        };
+        (
+            ctx.with_network_policy(NetworkPolicyDecider::new(policy, None)),
+            tmp,
+        )
+    }
+
+    #[tokio::test]
+    async fn finance_fails_closed_when_network_policy_denies_endpoint_host() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "quoteResponse": {"result": []}
+            })))
+            .mount(&server)
+            .await;
+
+        let host = reqwest::Url::parse(&server.uri())
+            .expect("mock server URL")
+            .host_str()
+            .expect("mock server host")
+            .to_string();
+        let (blocked, _tmp) = denied_context_for(&host);
+
+        let tool = tool_with_server(&server);
+        let error = tool
+            .execute(json!({"ticker": "AAPL"}), &blocked)
+            .await
+            .expect_err("denied host must fail closed");
+        assert!(
+            error.to_string().contains("blocked by network policy"),
+            "{error}"
+        );
+        assert_eq!(
+            server
+                .received_requests()
+                .await
+                .expect("recorded requests")
+                .len(),
+            0,
+            "no request may leave before the policy check"
+        );
+    }
+
+    #[tokio::test]
+    async fn finance_fails_closed_on_prompt_when_default_is_prompt() {
+        let server = MockServer::start().await;
+
+        // default = prompt with no allow list: the undecided host must fail
+        // closed with the approval hint, never with a silent request.
+        let (ctx, tmp) = context();
+        use crate::network_policy::{NetworkPolicy, NetworkPolicyDecider};
+        let policy = NetworkPolicy {
+            default: Decision::Prompt.into(),
+            allow: Vec::new(),
+            deny: Vec::new(),
+            proxy: Vec::new(),
+            proxy_fake_ip_cidrs: Vec::new(),
+            audit: false,
+        };
+        let blocked = ctx.with_network_policy(NetworkPolicyDecider::new(policy, None));
+        drop(tmp);
+
+        let tool = tool_with_server(&server);
+        let error = tool
+            .execute(json!({"ticker": "AAPL"}), &blocked)
+            .await
+            .expect_err("undecided host must not reach the endpoint");
+        assert!(
+            error.to_string().contains("requires approval"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(
+            server
+                .received_requests()
+                .await
+                .expect("recorded requests")
+                .len(),
+            0
+        );
     }
 }

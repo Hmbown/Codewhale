@@ -4652,7 +4652,7 @@ impl ToolSpec for BashTool {
                 },
                 "background": {
                     "type": "boolean",
-                    "description": "Temporary background; killed at session exit. Surviving headless services need background:true,persist:true."
+                    "description": "Temporary background; killed at session exit. Surviving headless services need background:true,persist:true. It is not killed at timeout_ms; plan to poll it with action=wait or stop it with action=cancel."
                 },
                 "interactive": {
                     "type": "boolean",
