@@ -542,7 +542,7 @@ impl WebSearchTool {
             .as_deref()
             .or(env_key.as_deref())
             .ok_or_else(|| {
-                ToolError::execution_failed(
+                ToolError::invalid_input(
                     "Serply search requires an API key. Set `[search] api_key` in config.toml or the SERPLY_API_KEY env var.",
                 )
             })?;
@@ -2965,6 +2965,36 @@ mod tests {
         assert!(
             msg.contains("Baidu") && msg.contains("API key"),
             "error must name the provider and missing key; got `{msg}`"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn serply_missing_key_is_fail_closed_inside_the_backend_chain() {
+        use crate::tools::spec::ToolContext;
+
+        let _guard = crate::test_support::lock_test_env();
+        let prev = std::env::var_os("SERPLY_API_KEY");
+        unsafe { std::env::remove_var("SERPLY_API_KEY") };
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut ctx = ToolContext::new(tmp.path().to_path_buf());
+        ctx.search_api_key = None;
+        let err = WebSearchTool
+            .run_serply_search("anything", 5, 1_000, &ctx)
+            .await
+            .expect_err("missing api_key must be an error");
+
+        match prev {
+            Some(value) => unsafe { std::env::set_var("SERPLY_API_KEY", value) },
+            None => unsafe { std::env::remove_var("SERPLY_API_KEY") },
+        }
+
+        // A configured Serply route that reaches the adapter after a failed
+        // provider-native attempt must stop the chain, not degrade to DuckDuckGo.
+        assert!(
+            matches!(err, crate::tools::spec::ToolError::InvalidInput { .. }),
+            "missing key must be classified fail-closed; got `{err:?}`"
         );
     }
 
