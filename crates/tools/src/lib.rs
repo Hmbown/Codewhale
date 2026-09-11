@@ -129,6 +129,14 @@ pub struct ToolResult {
     /// Whether the execution was successful.
     pub success: bool,
     /// Optional structured metadata.
+    /// Convention: a tool that produced image artifacts (e.g. a computer-use
+    /// screenshot) may list their file paths under the `"images"` key
+    /// (`{"images": ["<abs path>", ...]}`). The engine turn loop attaches each
+    /// readable, provider-accepted image (PNG/JPEG/GIF/WebP within the shared
+    /// size limit, at most a small capped number per result) to the
+    /// tool-result message as image content blocks so vision-capable models
+    /// can see it; unreadable or invalid images are skipped without failing
+    /// the turn.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<Value>,
 }

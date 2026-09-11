@@ -25,6 +25,74 @@ use codewhale_models::Role;
 
 const MAX_APPROVAL_INTENT_SUMMARY_CHARS: usize = 2_000;
 
+/// Most images a single tool result may attach to its message.
+///
+/// Each image rides the request body as a base64 data URL, so an uncapped
+/// `metadata.images` array would let one tool result blow up the turn's token
+/// budget. Two covers the computer-use case (a before/after screenshot pair)
+/// with headroom.
+const MAX_TOOL_RESULT_IMAGES: usize = 2;
+
+/// Build the content blocks for the user message carrying a tool result.
+///
+/// A tool can hand image artifacts (e.g. computer-use screenshots) to the
+/// model through `ToolResult.metadata["images"]`, an array of file paths.
+/// Each readable image becomes the same `<image path="…">`-bracketed
+/// `ContentBlock::ImageUrl` triplet that
+/// [`crate::image_attach::expand_attachment_blocks`] produces for user
+/// attachments, appended after the `ToolResult` block in the same message —
+/// so session persistence, compaction, per-request stripping for blind
+/// routes, and all three wire builders handle it unchanged. A missing,
+/// oversized or non-image file is logged and skipped; it must never fail the
+/// turn.
+fn tool_result_message_content(
+    tool_use_id: String,
+    content: String,
+    is_error: Option<bool>,
+    metadata: Option<&serde_json::Value>,
+    content_blocks: Option<Vec<serde_json::Value>>,
+) -> Vec<ContentBlock> {
+    let mut blocks = vec![ContentBlock::ToolResult {
+        tool_use_id,
+        content,
+        is_error,
+        content_blocks,
+    }];
+    let Some(paths) = metadata
+        .and_then(|metadata| metadata.get("images"))
+        .and_then(serde_json::Value::as_array)
+    else {
+        return blocks;
+    };
+    let mut attached = 0;
+    for path in paths.iter().filter_map(serde_json::Value::as_str) {
+        if attached >= MAX_TOOL_RESULT_IMAGES {
+            tracing::warn!(
+                "tool result declared more than {MAX_TOOL_RESULT_IMAGES} images; skipping the rest"
+            );
+            break;
+        }
+        match crate::image_attach::attach_image_from_path(std::path::Path::new(path)) {
+            Ok(image) => {
+                blocks.push(ContentBlock::Text {
+                    text: format!("<image path=\"{path}\">"),
+                    cache_control: None,
+                });
+                blocks.push(image.content_block());
+                blocks.push(ContentBlock::Text {
+                    text: "</image>".to_string(),
+                    cache_control: None,
+                });
+                attached += 1;
+            }
+            Err(error) => {
+                tracing::warn!("skipping tool result image: {error}");
+            }
+        }
+    }
+    blocks
+}
+
 struct PlannedToolCalls {
     plans: Vec<ToolExecutionPlan>,
     hook_contexts: std::collections::HashMap<String, String>,
@@ -4661,12 +4729,13 @@ impl Engine {
                         .collect::<Vec<_>>();
                     self.add_session_message(Message {
                         role: Role::User,
-                        content: vec![ContentBlock::ToolResult {
-                            tool_use_id: outcome.id,
-                            content: output_for_context,
-                            is_error: (!output.success).then_some(true),
-                            content_blocks: (!content_blocks.is_empty()).then_some(content_blocks),
-                        }],
+                        content: tool_result_message_content(
+                            outcome.id,
+                            output_for_context,
+                            (!output.success).then_some(true),
+                            output.metadata.as_ref(),
+                            (!content_blocks.is_empty()).then_some(content_blocks),
+                        ),
                     })
                     .await;
                 }
@@ -4695,12 +4764,13 @@ impl Engine {
                     );
                     self.add_session_message(Message {
                         role: Role::User,
-                        content: vec![ContentBlock::ToolResult {
-                            tool_use_id: outcome.id,
-                            content: format!("Error: {error}"),
-                            is_error: Some(true),
-                            content_blocks: None,
-                        }],
+                        content: tool_result_message_content(
+                            outcome.id,
+                            format!("Error: {error}"),
+                            Some(true),
+                            None,
+                            None,
+                        ),
                     })
                     .await;
                 }
@@ -6481,6 +6551,152 @@ mod tests {
     use std::path::PathBuf;
     use std::time::Duration;
     use tempfile::tempdir;
+
+    /// A 1x1 PNG, kept as bytes so the tool-result image tests need no
+    /// checked-in fixture file.
+    const PNG_1X1: &[u8] = &[
+        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1f,
+        0x15, 0xc4, 0x89, 0x00, 0x00, 0x00, 0x0a, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0x63, 0x00,
+        0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0d, 0x0a, 0x2d, 0xb4, 0x00, 0x00, 0x00, 0x00, 0x49,
+        0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+    ];
+
+    fn write_tool_result_png(dir: &std::path::Path, name: &str) -> String {
+        let path = dir.join(name);
+        std::fs::write(&path, PNG_1X1).expect("write fixture");
+        path.display().to_string()
+    }
+
+    #[test]
+    fn forkguard_tool_result_images_reach_model_as_image_blocks() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = write_tool_result_png(dir.path(), "shot.png");
+        let metadata = serde_json::json!({"images": [path]});
+
+        let blocks = tool_result_message_content(
+            "call_1".to_string(),
+            "screenshot taken".to_string(),
+            None,
+            Some(&metadata),
+            None,
+        );
+
+        // The ToolResult block comes first, then the same tag/image/tag
+        // triplet a user attachment produces — one user message carries both.
+        assert_eq!(blocks.len(), 4, "{blocks:?}");
+        match &blocks[0] {
+            ContentBlock::ToolResult {
+                tool_use_id,
+                content,
+                is_error,
+                ..
+            } => {
+                assert_eq!(tool_use_id, "call_1");
+                assert_eq!(content, "screenshot taken");
+                assert_eq!(*is_error, None);
+            }
+            other => panic!("expected tool result block, got {other:?}"),
+        }
+        match &blocks[1] {
+            ContentBlock::Text { text, .. } => {
+                assert!(text.starts_with("<image path=\""), "{text}");
+                assert!(text.contains("shot.png"), "{text}");
+            }
+            other => panic!("expected an opening image tag, got {other:?}"),
+        }
+        match &blocks[2] {
+            ContentBlock::ImageUrl { image_url } => {
+                assert!(image_url.url.starts_with("data:image/png;base64,"));
+            }
+            other => panic!("expected an image block, got {other:?}"),
+        }
+        assert_eq!(
+            blocks[3],
+            ContentBlock::Text {
+                text: "</image>".to_string(),
+                cache_control: None,
+            }
+        );
+    }
+
+    #[test]
+    fn forkguard_tool_result_without_images_key_is_unchanged() {
+        for metadata in [
+            None,
+            Some(serde_json::json!({"executed": true})),
+            Some(serde_json::json!({"images": "not-an-array"})),
+        ] {
+            let blocks = tool_result_message_content(
+                "call_1".to_string(),
+                "out".to_string(),
+                None,
+                metadata.as_ref(),
+                None,
+            );
+            assert_eq!(blocks.len(), 1, "{blocks:?}");
+            assert!(matches!(blocks[0], ContentBlock::ToolResult { .. }));
+        }
+    }
+
+    #[test]
+    fn forkguard_tool_result_bad_images_degrade_to_text_only_result() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let not_an_image = dir.path().join("fake.png");
+        std::fs::write(&not_an_image, b"#!/bin/sh\necho hi\n").expect("write fixture");
+        let oversized = dir.path().join("huge.png");
+        std::fs::write(
+            &oversized,
+            vec![0u8; crate::image_attach::MAX_IMAGE_BYTES + 1],
+        )
+        .expect("write fixture");
+        let metadata = serde_json::json!({"images": [
+            dir.path().join("missing.png").display().to_string(),
+            not_an_image.display().to_string(),
+            oversized.display().to_string(),
+        ]});
+
+        let blocks = tool_result_message_content(
+            "call_1".to_string(),
+            "out".to_string(),
+            None,
+            Some(&metadata),
+            None,
+        );
+
+        // Missing, non-image and oversized files are skipped with a log line;
+        // the turn still gets its tool result and no image blocks.
+        assert_eq!(blocks.len(), 1, "{blocks:?}");
+        assert!(matches!(blocks[0], ContentBlock::ToolResult { .. }));
+    }
+
+    #[test]
+    fn forkguard_tool_result_images_are_capped_per_result() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = [
+            write_tool_result_png(dir.path(), "a.png"),
+            write_tool_result_png(dir.path(), "b.png"),
+            write_tool_result_png(dir.path(), "c.png"),
+        ];
+        let metadata = serde_json::json!({"images": paths});
+
+        let blocks = tool_result_message_content(
+            "call_1".to_string(),
+            "out".to_string(),
+            None,
+            Some(&metadata),
+            None,
+        );
+
+        let images = blocks
+            .iter()
+            .filter(|block| matches!(block, ContentBlock::ImageUrl { .. }))
+            .count();
+        assert_eq!(
+            images, MAX_TOOL_RESULT_IMAGES,
+            "an uncapped array would let one tool result blow up the token budget"
+        );
+    }
 
     #[test]
     fn tool_context_for_call_preserves_turn_and_sets_call_origin() {
