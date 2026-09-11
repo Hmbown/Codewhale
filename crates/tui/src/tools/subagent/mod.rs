@@ -19,7 +19,7 @@ use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::sync::{Mutex, RwLock, Semaphore};
+use tokio::sync::{Mutex, RwLock};
 
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
@@ -87,6 +87,7 @@ use coord::{
 
 pub mod advisor;
 pub mod coord;
+mod governor;
 pub mod mailbox;
 mod naming;
 mod worktree;
@@ -358,6 +359,15 @@ const SUBAGENT_SESSION_CLOSED_REASON: &str = "Interrupted: parent session closed
 #[cfg(test)]
 const SUBAGENT_MODEL_WAIT_REASON: &str = "waiting for model response";
 const SUBAGENT_QUEUED_LAUNCH_REASON: &str = "queued: waiting for a sub-agent launch slot";
+/// Queued-reason variant used while the rate-limit governor has paused new
+/// sub-agent launches after sustained provider 429s.
+const SUBAGENT_QUEUED_RATE_LIMIT_REASON: &str = "queued: waiting for provider rate-limit recovery";
+/// While queued, probe the governor for a drained rate-limit window at this
+/// period (see `acquire_queued_launch_permit`).
+const LAUNCH_RECOVERY_PROBE_PERIOD: Duration = Duration::from_secs(5);
+/// Placeholder probe period when the runtime has no governor: the probe
+/// branch no-ops, and a queued child's wall-time deadline always fires first.
+const LAUNCH_RECOVERY_PROBE_PERIOD_WITHOUT_GOVERNOR: Duration = Duration::from_secs(3600);
 /// #freeze: minimum spacing between hot-path (per-step checkpoint) state
 /// persists. `update_checkpoint` fires on every step of every agent; at high
 /// fanout an unconditional full-fleet rewrite under the manager write lock
@@ -2612,6 +2622,14 @@ pub struct SubAgentRuntime {
     /// Durable approval evidence inherited from the parent session. Legacy
     /// runtimes that do not install a store cannot open child approval prompts.
     approval_receipt_store: Option<Result<crate::approval_log::ApprovalReceiptStore, String>>,
+    /// Shared rate-limit governor for the fleet that spawned this runtime.
+    /// Stamped by the spawning manager in
+    /// `spawn_background_with_assignment_options` (the single chokepoint all
+    /// spawn variants funnel through), so every descendant LLM attempt
+    /// reports 429s/successes to the fleet's adaptive scheduler; cloned into
+    /// child runtimes. `None` for runtimes built outside a manager (tests,
+    /// tool-only runtimes).
+    pub(crate) governor: Option<Arc<governor::RateLimitGovernor>>,
 }
 
 impl SubAgentRuntime {
@@ -2673,6 +2691,12 @@ impl SubAgentRuntime {
             ),
             parent_can_prompt: false,
             approval_receipt_store: None,
+            // Stamped by the spawning manager in
+            // `spawn_background_with_assignment_options`, so every descendant
+            // LLM attempt reports 429s/successes to the fleet's rate-limit
+            // governor. `None` for runtimes built outside a manager (tests,
+            // tool-only runtimes).
+            governor: None,
         }
     }
 
@@ -2723,6 +2747,19 @@ impl SubAgentRuntime {
     #[must_use]
     pub fn with_todos(mut self, todos: SharedTodoList) -> Self {
         self.todos = todos;
+        self
+    }
+
+    /// Stamp the fleet's rate-limit governor onto a root runtime. The manager
+    /// owns the governor (and its launch gate), but only runtimes carrying it
+    /// report 429s/successes; without this the whole descendant tree inherits
+    /// `None` and the AIMD scheduler never observes provider throttling.
+    #[must_use]
+    pub(crate) fn with_fleet_governor(
+        mut self,
+        governor: Arc<governor::RateLimitGovernor>,
+    ) -> Self {
+        self.governor = Some(governor);
         self
     }
 
@@ -2969,6 +3006,9 @@ impl SubAgentRuntime {
             // siblings' progress. Parent todo state is still visible to an
             // opt-in forked child as immutable `fork_context` text.
             todos: crate::tools::todo::new_shared_todo_list(),
+            // Inherit the fleet's rate-limit governor so every descendant
+            // LLM attempt reports 429s/successes to the adaptive scheduler.
+            governor: self.governor.clone(),
             parent_mode: self.parent_mode,
             approval_mode: self.approval_mode,
             auto_review_policy: Arc::clone(&self.auto_review_policy),
@@ -3382,7 +3422,20 @@ pub struct SubAgentManager {
     /// publishing a visible "queued" reason instead of bursting. Deeper
     /// descendants bypass the gate so a permit-holding parent waiting on
     /// its own children cannot deadlock the tree.
-    launch_gate: Arc<Semaphore>,
+    ///
+    /// The gate is a [`governor::DynamicGate`] rather than a
+    /// `tokio::sync::Semaphore` so the rate-limit governor can shrink its
+    /// capacity at runtime (even below the number of active children)
+    /// without replacing the `Arc` — a semaphore swap silently fails while
+    /// any child still holds a permit, which is why
+    /// `update_runtime_limits` previously only applied launch-concurrency
+    /// changes to an idle fleet.
+    launch_gate: Arc<governor::DynamicGate>,
+    /// Rate-limit aware scheduler feeding `launch_gate` (swarm-mode
+    /// adaptive throttling). Sub-agent LLM attempts report 429s and
+    /// successes through [`SubAgentRuntime::governor`]; the governor
+    /// shrinks/pauses admissions on sustained 429s and recovers via AIMD.
+    governor: Arc<governor::RateLimitGovernor>,
     /// #freeze: hot-path persist debounce bookkeeping (see
     /// `SUBAGENT_PERSIST_DEBOUNCE`). `last_persist_at` is the last time any
     /// state persist ran; `persist_pending` records that a hot-path write was
@@ -3490,6 +3543,9 @@ impl SubAgentManager {
     /// separately from its execution workspace.
     #[must_use]
     pub fn new_with_state_root(workspace: PathBuf, state_root: PathBuf, max_agents: usize) -> Self {
+        // The governor owns the launch gate it schedules, so manager builders
+        // and the runtime limiter adjust capacity through the pair.
+        let (governor, launch_gate) = governor::RateLimitGovernor::new(max_agents.max(1));
         Self {
             agents: HashMap::new(),
             worker_records: HashMap::new(),
@@ -3514,7 +3570,8 @@ impl SubAgentManager {
             current_session_boot_id: format!("boot_{}", &Uuid::new_v4().to_string()[..12]),
             // Default launch concurrency = the full agent cap; the gate only
             // throttles when a lower `launch_concurrency` is configured.
-            launch_gate: Arc::new(Semaphore::new(max_agents.max(1))),
+            launch_gate,
+            governor,
             last_persist_at: None,
             persist_pending: false,
             last_cleanup_at: None,
@@ -3530,10 +3587,23 @@ impl SubAgentManager {
 
     /// Set the number of direct children that may execute concurrently
     /// before further launches queue (#3095). Clamped to `1..=max_agents`.
+    /// Applied to the live gate capacity, so this also takes effect when
+    /// called after children have started. Routed through the governor so a
+    /// rate-limit pause is not silently lifted by a limit change.
     #[must_use]
-    pub fn with_launch_concurrency(mut self, limit: usize) -> Self {
-        self.launch_gate = Arc::new(Semaphore::new(limit.clamp(1, self.max_agents)));
+    pub fn with_launch_concurrency(self, limit: usize) -> Self {
+        let limit = limit.clamp(1, self.max_agents);
+        self.governor.set_max_capacity(limit);
         self
+    }
+
+    /// The rate-limit governor backing [`Self::launch_gate`]; exposed so the
+    /// engine can stamp it onto root runtimes and tests can drive the
+    /// adaptive scheduler. (Surfacing governor state in status events is a
+    /// parent-repo follow-up.)
+    #[must_use]
+    pub(crate) fn rate_limit_governor(&self) -> Arc<governor::RateLimitGovernor> {
+        Arc::clone(&self.governor)
     }
 
     /// Set the total queued + running admission ceiling for this manager.
@@ -4266,9 +4336,11 @@ impl SubAgentManager {
         self
     }
 
-    /// Apply live runtime limits. The launch semaphore is replaced only when
-    /// no sub-agent is currently running, because active tasks may still hold
-    /// permits from the previous semaphore.
+    /// Apply live runtime limits. The launch gate is a
+    /// [`governor::DynamicGate`], so the new launch concurrency applies to
+    /// the live capacity immediately — children already holding permits keep
+    /// running, and no admission above the new capacity is granted until the
+    /// active count drains. Always returns `true`.
     pub fn update_runtime_limits(
         &mut self,
         max_agents: usize,
@@ -4286,13 +4358,11 @@ impl SubAgentManager {
         } else {
             running_heartbeat_timeout
         };
-        if self.running_count() == 0 {
-            self.launch_gate =
-                Arc::new(Semaphore::new(launch_concurrency.clamp(1, self.max_agents)));
-            true
-        } else {
-            false
-        }
+        let launch_concurrency = launch_concurrency.clamp(1, self.max_agents);
+        // Routed through the governor so a rate-limit pause (gate capacity 0)
+        // is not silently lifted by a runtime limit change.
+        self.governor.set_max_capacity(launch_concurrency);
+        true
     }
 
     /// Build the [`PersistedSubAgentState`] snapshot from the current fleet.
@@ -6597,6 +6667,12 @@ impl SubAgentManager {
         allowed_tools: Option<Vec<String>>,
         options: SubAgentSpawnOptions,
     ) -> Result<SubAgentResult> {
+        // Every manager-spawned runtime carries the fleet governor, so the
+        // spawned agent and its whole descendant tree report 429s/successes
+        // to the adaptive scheduler. Runtimes built outside a manager (tests,
+        // tool-only runtimes) keep `governor: None`.
+        runtime.governor = Some(Arc::clone(&self.governor));
+
         self.cleanup(COMPLETED_AGENT_RETENTION);
 
         self.check_admission_capacity()?;
@@ -10325,7 +10401,7 @@ struct SubAgentTask {
     /// children: the task acquires a permit before its first model step and
     /// holds it until completion, so a fanout burst beyond the limit queues
     /// with a visible reason instead of executing all at once.
-    launch_gate: Option<Arc<Semaphore>>,
+    launch_gate: Option<Arc<governor::DynamicGate>>,
     /// Releases the parent turn's settlement barrier after this turn-owned
     /// child or descendant has completed its terminal fan-in.
     _foreground_child_registration: Option<ForegroundChildRegistration>,
@@ -10415,9 +10491,9 @@ async fn run_subagent_task_inner(task: SubAgentTask) {
     let mut _launch_permit = None;
     let mut launch_wait_timed_out = false;
     if let Some(gate) = task.launch_gate.as_ref() {
-        match Arc::clone(gate).try_acquire_owned() {
-            Ok(permit) => _launch_permit = Some(permit),
-            Err(tokio::sync::TryAcquireError::NoPermits) => {
+        match Arc::clone(gate).try_acquire() {
+            Some(permit) => _launch_permit = Some(permit),
+            None => {
                 match tokio::time::timeout_at(
                     deadline.into(),
                     acquire_queued_launch_permit(&task, Arc::clone(gate)),
@@ -10427,12 +10503,6 @@ async fn run_subagent_task_inner(task: SubAgentTask) {
                     Ok(permit) => _launch_permit = permit,
                     Err(_) => launch_wait_timed_out = true,
                 }
-            }
-            Err(tokio::sync::TryAcquireError::Closed) => {
-                crate::logging::warn(format!(
-                    "sub-agent launch gate closed for {}; proceeding without backpressure",
-                    task.agent_id
-                ));
             }
         }
     }
@@ -10523,28 +10593,69 @@ async fn run_subagent_task_inner(task: SubAgentTask) {
 
 async fn acquire_queued_launch_permit(
     task: &SubAgentTask,
-    gate: Arc<Semaphore>,
-) -> Option<tokio::sync::OwnedSemaphorePermit> {
-    record_queued_launch_progress(task).await;
-    tokio::select! {
-        biased;
-        () = task.runtime.cancel_token.cancelled() => {
-            None
-        }
-        permit = Arc::clone(&gate).acquire_owned() => {
-            permit.ok()
+    gate: Arc<governor::DynamicGate>,
+) -> Option<governor::DynamicGatePermit> {
+    // When the governor has paused launches over sustained provider 429s,
+    // surface the reason in the queued status instead of the generic
+    // "waiting for a launch slot" message.
+    let paused_for_rate_limit = task
+        .runtime
+        .governor
+        .as_ref()
+        .is_some_and(|governor| governor.is_paused(Instant::now()));
+    let queued_reason = if paused_for_rate_limit {
+        SUBAGENT_QUEUED_RATE_LIMIT_REASON
+    } else {
+        SUBAGENT_QUEUED_LAUNCH_REASON
+    };
+    record_queued_launch_progress(task, queued_reason).await;
+    // While queued, periodically probe the governor: if a rate-limit pause
+    // outlives its window (the in-flight fleet finished before any success
+    // could lift the pause), the probe resumes launches instead of leaving
+    // the queue frozen until each child's wall-time deadline.
+    let mut recovery_probe = tokio::time::interval(if task.runtime.governor.is_some() {
+        LAUNCH_RECOVERY_PROBE_PERIOD
+    } else {
+        LAUNCH_RECOVERY_PROBE_PERIOD_WITHOUT_GOVERNOR
+    });
+    // Hold the acquire future across select iterations. Re-creating it on
+    // every probe tick would leave one stale queue entry per tick per queued
+    // child inside the gate (purged only by the next grant wave), which adds
+    // up over a long pause with a full swarm queue.
+    let mut acquire_permit = std::pin::pin!(gate.acquire());
+    loop {
+        tokio::select! {
+            biased;
+            () = task.runtime.cancel_token.cancelled() => {
+                // No Cancelled progress event here: turn-end parking cancels
+                // queued children through the same token and must project as
+                // Interrupted-with-checkpoint, and genuine cancellation is
+                // reported by `run_subagent`'s first-step cancel check.
+                return None;
+            }
+            _ = recovery_probe.tick() => {
+                if let Some(governor) = task.runtime.governor.as_ref() {
+                    governor.recover_if_window_drained(Instant::now());
+                }
+                // If the probe lifted a pause it raised the gate capacity,
+                // which grants queued waiters; the pinned `acquire_permit`
+                // below observes the grant on the next poll.
+            }
+            permit = &mut acquire_permit => {
+                return Some(permit);
+            }
         }
     }
 }
 
-async fn record_queued_launch_progress(task: &SubAgentTask) {
+async fn record_queued_launch_progress(task: &SubAgentTask, queued_reason: &'static str) {
     {
         let mut manager = task.runtime.manager.write().await;
         manager.touch(&task.agent_id);
         manager.record_worker_event(
             &task.agent_id,
             AgentWorkerStatus::Queued,
-            Some(SUBAGENT_QUEUED_LAUNCH_REASON.to_string()),
+            Some(queued_reason.to_string()),
             None,
             None,
         );
@@ -10553,16 +10664,13 @@ async fn record_queued_launch_progress(task: &SubAgentTask) {
         task.runtime.event_tx.as_ref(),
         &task.runtime.context.state_namespace,
         &task.agent_id,
-        SUBAGENT_QUEUED_LAUNCH_REASON.to_string(),
+        queued_reason.to_string(),
         AgentProgressEventMeta::new(AgentWorkerStatus::Queued),
         task.runtime.parent_agent_id.clone(),
         task.runtime.spawn_depth,
     );
     if let Some(mailbox) = task.runtime.mailbox.as_ref() {
-        let _ = mailbox.send(MailboxMessage::progress(
-            &task.agent_id,
-            SUBAGENT_QUEUED_LAUNCH_REASON,
-        ));
+        let _ = mailbox.send(MailboxMessage::progress(&task.agent_id, queued_reason));
     }
 }
 
@@ -11173,8 +11281,11 @@ fn retryable_subagent_provider_failure(
         return Some(RetryableSubAgentProviderFailure {
             label: "rate-limited provider response",
             checkpoint_reason: "api_rate_limited",
-            delay: retry_after
-                .unwrap_or_else(|| subagent_transient_provider_retry_delay(retry_number)),
+            // Honor the provider's `Retry-After` when present. Without it,
+            // back off exponentially with full jitter (capped at 120s) so a
+            // fan-out of children 429'd by the same provider response does
+            // not retry in lockstep (thundering herd).
+            delay: retry_after.unwrap_or_else(|| governor::rate_limit_retry_delay(retry_number)),
         });
     }
 
@@ -11250,14 +11361,36 @@ async fn request_subagent_model_response_with_retries(
         let usage_route = runtime
             .client
             .effective_route_envelope(&runtime.model, chrono::Utc::now());
+        // Report the attempt to the fleet's rate-limit governor; the ratio
+        // denominator for the AIMD heuristic counts retried attempts too.
+        if let Some(governor) = runtime.governor.as_ref() {
+            governor.record_attempt(Instant::now());
+        }
         match tokio::time::timeout(
             runtime.step_api_timeout,
             runtime.client.create_message(request.clone()),
         )
         .await
         {
-            Ok(Ok(response)) => return Ok((response, usage_route)),
+            Ok(Ok(response)) => {
+                // A successful call signals recovery; drives AIMD additive
+                // increase and (once limits age out of the window) unpauses.
+                if let Some(governor) = runtime.governor.as_ref() {
+                    governor.record_success(Instant::now());
+                }
+                return Ok((response, usage_route));
+            }
             Ok(Err(err)) => {
+                // A provider 429 feeds the governor's sliding window (AIMD
+                // multiplicative decrease / pause). `QuotaExhausted` and all
+                // other errors keep their existing paths untouched.
+                if matches!(
+                    err.downcast_ref::<LlmError>(),
+                    Some(LlmError::RateLimited { .. })
+                ) && let Some(governor) = runtime.governor.as_ref()
+                {
+                    governor.record_rate_limited(Instant::now());
+                }
                 let retry_number = transient_failures.saturating_add(1);
                 let Some(retryable) = retryable_subagent_provider_failure(&err, retry_number)
                 else {
