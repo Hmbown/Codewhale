@@ -16,10 +16,11 @@
   "devDependencies": {
     "@types/node": "^22.20.1",
     "typescript": "^5.7.3",
-    "vitest": "^4.1.9",
+    "vitest": "^4.1.11",
     "wrangler": "^4.107.0"
   },
   "overrides": {
+    "sharp": "0.35.4",
     "undici": "7.29.0"
   }
 }

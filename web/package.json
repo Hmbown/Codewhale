@@ -42,14 +42,14 @@
     "postcss": "^8.5.18",
     "tailwindcss": "^3.4.17",
     "typescript": "^5.7.3",
-    "vitest": "^4.1.9",
+    "vitest": "^4.1.11",
     "wrangler": "^4.107.0"
   },
   "overrides": {
     "esbuild": "0.28.1",
     "nanoid": "^3.3.17",
     "postcss": "^8.5.18",
-    "sharp": "0.35.3",
+    "sharp": "0.35.4",
     "ws": "8.21.0",
     "undici": "7.29.0"
   }
