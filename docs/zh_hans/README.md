@@ -41,7 +41,7 @@
 为 Codewhale 贡献代码或做集成开发。
 
 1. [ARCHITECTURE.md](../ARCHITECTURE.md) —— 架构总览
-2. [CONTRIBUTING.md](CONTRIBUTING.md) —— 贡献指南：如何提交 Issue 与 PR、代码约定与验证门禁
+2. [CONTRIBUTING.md](../../CONTRIBUTING.md) —— 贡献指南：如何提交 Issue 与 PR、代码约定与验证门禁
 3. [CODE_OF_CONDUCT.md](../../CODE_OF_CONDUCT.md) —— 社区行为准则
 4. [RUNTIME_API.md](../RUNTIME_API.md) —— Runtime API 与集成契约（供集成与二次开发）
 5. [PLUGIN_AUTHORING.md](PLUGIN_AUTHORING.md) —— 从最小 Skills 示例开始编写、审查和启用插件

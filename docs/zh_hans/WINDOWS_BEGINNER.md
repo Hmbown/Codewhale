@@ -195,7 +195,7 @@ https://github.com/Hmbown/CodeWhale/releases
 
 文件名带 **arm64** 的是给 ARM 架构设备用的，普通电脑不要选。如果你更习惯传统安装方式，也可以下载 **`CodeWhaleSetup.exe`**（Windows 安装器）：它会安装到 `%LOCALAPPDATA%\Programs\CodeWhale\bin` 并自动加入用户 PATH，开始菜单快捷方式指向 `codewhale.bat`，无需手动配置环境变量；因为安装包未签名，双击会弹 Windows SmartScreen 提示，点"更多信息 → 仍要运行"即可。注意：发布页里的 `codewhale-windows-x64.exe` 是**纯命令行程序，不是安装器**，双击只会打开默认 cmd 窗口，请改用 zip 里的 `codewhale.bat` 或安装器的开始菜单项。
 
-![GitHub 发布页，选择 windows-x64 版本](images/github-release-page.png)
+![GitHub 发布页，选择 windows-x64 版本](../images/github-release-page.png)
 
 ### 2.2 第二步：放到固定目录【codewhale-windows-x64-portable.zip】
 
@@ -209,12 +209,12 @@ https://github.com/Hmbown/CodeWhale/releases
 
 1. 打开 Windows【设置】→【系统】→【系统信息】，点击右侧的【高级系统设置】
 
-![打开高级系统设置](images/windows-system-info.png)
+![打开高级系统设置](../images/windows-system-info.png)
 
 2. 在弹出的【系统属性】窗口点【环境变量(N)…】
 3. 在"用户变量"里找到 **Path**，点【编辑(E)…】→【新建(N)】，填入程序所在目录 `D:\codewhale`，一路点【确定】保存
 
-![把 D:\codewhale 加入 Path 环境变量](images/env-path-setting.png)
+![把 D:\codewhale 加入 Path 环境变量](../images/env-path-setting.png)
 
 > 注意：改完环境变量后，**已经打开的终端窗口要关掉重开**才会生效。
 
@@ -225,7 +225,7 @@ https://github.com/Hmbown/CodeWhale/releases
 1. 下载地址：`https://aka.ms/vs/17/release/vc_redist.x64.exe`（64 位系统选 x64，32 位选 x86）
 2. 双击安装，完成后重新启动 `codewhale.exe`
 
-![VCRUNTIME140_1.dll 报错及解决办法](images/vc-runtime-dll-error.png)
+![VCRUNTIME140_1.dll 报错及解决办法](../images/vc-runtime-dll-error.png)
 
 > 离线/内网备选：从其他已装该运行库的电脑复制 `C:\Windows\System32\VCRUNTIME140_1.dll` 到本机同目录，或放到 `codewhale.exe` 同级目录下。
 
