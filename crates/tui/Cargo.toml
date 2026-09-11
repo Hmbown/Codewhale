@@ -109,6 +109,10 @@ htmd = "0.5.4"
 lru = "0.18"
 parking_lot = "0.12"
 tar = "0.4"
+# Vendored static liblzma keeps the full-fidelity session archive export
+# (`session_export`) hermetic on every release target; no system xz headers.
+# liblzma is the maintained, API-compatible continuation of xz2.
+liblzma = { version = "0.4", features = ["static"] }
 flate2 = "1.1"
 sha2.workspace = true
 semver.workspace = true

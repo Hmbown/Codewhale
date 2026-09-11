@@ -124,6 +124,7 @@ mod session_diagnostics;
 mod doctor_loader_tests;
 #[cfg(test)]
 mod session_control_acceptance;
+pub mod session_export;
 #[allow(dead_code)]
 mod session_manager;
 mod session_peek;
@@ -287,7 +288,7 @@ enum Commands {
         #[arg(value_enum)]
         shell: Shell,
     },
-    /// List saved sessions
+    /// List saved sessions, or export one as a full-fidelity archive
     Sessions {
         /// Maximum number of sessions to display
         #[arg(short, long, default_value = "20")]
@@ -295,6 +296,8 @@ enum Commands {
         /// Search sessions by title
         #[arg(short, long)]
         search: Option<String>,
+        #[command(subcommand)]
+        command: Option<SessionsCommand>,
     },
     /// Create default AGENTS.md in current directory
     Init,
@@ -377,6 +380,40 @@ enum Commands {
         /// Fork the most recent session in this workspace without a picker
         #[arg(long = "last", default_value_t = false, conflicts_with = "session_id")]
         last: bool,
+    },
+}
+
+/// Subcommands of `codewhale sessions`. Without one, the command falls back
+/// to listing sessions.
+#[derive(Subcommand, Debug, Clone)]
+enum SessionsCommand {
+    /// List saved sessions (default when no subcommand is given)
+    List {
+        /// Maximum number of sessions to display
+        #[arg(short, long, default_value = "20")]
+        limit: usize,
+        /// Search sessions by title
+        #[arg(short, long)]
+        search: Option<String>,
+    },
+    /// Export a session as a full-fidelity tar.xz archive (complete context:
+    /// system prompt, messages, tool calls and results, plus artifacts)
+    Export {
+        /// Session id (or unambiguous id prefix) to export
+        #[arg(value_name = "SESSION_ID")]
+        id: String,
+        /// Destination .tar.xz path (default: codewhale-session-<id>.tar.xz)
+        #[arg(short, long, value_name = "PATH")]
+        output: Option<PathBuf>,
+        /// Exclude the session artifacts directory from the archive
+        #[arg(long, default_value_t = false)]
+        skip_artifacts: bool,
+        /// xz compression preset, 0 (fastest) through 9 (smallest)
+        #[arg(long, default_value_t = session_export::DEFAULT_XZ_COMPRESSION_LEVEL)]
+        compression: u32,
+        /// Overwrite the destination file if it already exists
+        #[arg(long, default_value_t = false)]
+        force: bool,
     },
 }
 
@@ -2213,7 +2250,23 @@ async fn run_async_main_dispatch(
                 generate_completions(shell);
                 Ok(())
             }
-            Commands::Sessions { limit, search } => list_sessions(limit, search),
+            Commands::Sessions {
+                command,
+                limit,
+                search,
+            } => match command {
+                None => list_sessions(limit, search),
+                Some(SessionsCommand::List { limit, search }) => list_sessions(limit, search),
+                Some(SessionsCommand::Export {
+                    id,
+                    output,
+                    skip_artifacts,
+                    compression,
+                    force,
+                }) => {
+                    run_sessions_export(&id, output.as_deref(), skip_artifacts, compression, force)
+                }
+            },
             Commands::Init => init_project(),
             Commands::Login { api_key } => run_login(api_key),
             Commands::Logout => run_logout(),
@@ -7899,6 +7952,86 @@ fn list_sessions(limit: usize, search: Option<String>) -> Result<()> {
     );
 
     Ok(())
+}
+
+/// Export one saved session as a full-fidelity `tar.xz` archive
+/// (`session_export`). Prefers an exact session id; falls back to an
+/// unambiguous id prefix like the resume flow.
+fn run_sessions_export(
+    id: &str,
+    output: Option<&Path>,
+    skip_artifacts: bool,
+    compression: u32,
+    force: bool,
+) -> Result<()> {
+    use session_export::{SessionArchiveOptions, default_archive_file_name, write_session_archive};
+
+    let manager = SessionManager::default_location()?;
+    let session = match manager.load_session_snapshot(id) {
+        Ok(session) => session,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            manager.load_session_by_prefix(id)?
+        }
+        Err(error) => return Err(error.into()),
+    };
+
+    let output_path = output.map_or_else(
+        || PathBuf::from(default_archive_file_name(&session.metadata)),
+        Path::to_path_buf,
+    );
+    if output_path.exists() && !force {
+        bail!(
+            "{} already exists; pass --force to overwrite it",
+            output_path.display()
+        );
+    }
+
+    let artifacts_dir = if skip_artifacts {
+        None
+    } else {
+        session_export::session_artifacts_dir(manager.sessions_dir(), &session.metadata.id)
+    };
+    let summary = write_session_archive(
+        &session,
+        artifacts_dir.as_deref(),
+        &output_path,
+        SessionArchiveOptions {
+            include_artifacts: !skip_artifacts,
+            compression_level: compression,
+        },
+    )?;
+
+    println!(
+        "Exported session {} ({}) to {}",
+        truncate_id(&session.metadata.id),
+        session.metadata.title,
+        summary.output.display()
+    );
+    println!(
+        "  {} member(s), {} uncompressed -> {} archive",
+        summary.members.len(),
+        format_bytes(summary.total_member_bytes()),
+        format_bytes(summary.compressed_bytes())
+    );
+    if artifacts_dir.is_none() && !skip_artifacts {
+        println!("  (no artifacts directory found for this session)");
+    }
+    println!(
+        "  Restore (full fidelity): /load <extracted session.json> inside the TUI; /resume imports the conversation only"
+    );
+    Ok(())
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const KIB: f64 = 1024.0;
+    let bytes = bytes as f64;
+    if bytes >= KIB * KIB {
+        format!("{:.1} MiB", bytes / (KIB * KIB))
+    } else if bytes >= KIB {
+        format!("{:.1} KiB", bytes / KIB)
+    } else {
+        format!("{bytes} B")
+    }
 }
 
 /// Initialize a new project with AGENTS.md
