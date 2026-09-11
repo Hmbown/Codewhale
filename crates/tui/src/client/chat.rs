@@ -7211,6 +7211,87 @@ mod google_thought_signature_tests {
         request_from(signed_history(signature, true))
     }
 
+    #[tokio::test]
+    async fn gateway_thought_signature_rejection_explains_recovery_after_transport() {
+        use crate::llm_client::LlmClient;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        // An unsigned replay must reach the gateway: it may manage Google's
+        // signatures itself. Only an actual rejection warrants recovery advice.
+        for streaming in [false, true] {
+            for status in [200, 400] {
+                let server = MockServer::start().await;
+                let response = if status == 400 {
+                    ResponseTemplate::new(status).set_body_json(json!({
+                        "error": {
+                            "code": 400,
+                            "message": "Function call is missing a thought_signature in functionCall parts."
+                        }
+                    }))
+                } else if streaming {
+                    ResponseTemplate::new(status)
+                        .insert_header("content-type", "text/event-stream")
+                        .set_body_string("data: [DONE]\n\n")
+                } else {
+                    ResponseTemplate::new(status).set_body_json(json!({
+                        "id": "gateway-replay",
+                        "model": "gemini-3.1-pro-preview",
+                        "choices": [{
+                            "message": {"role": "assistant", "content": "Done."},
+                            "finish_reason": "stop"
+                        }]
+                    }))
+                };
+                Mock::given(method("POST"))
+                    .and(path("/v1/chat/completions"))
+                    .respond_with(response)
+                    .expect(1)
+                    .mount(&server)
+                    .await;
+
+                let mut client = DeepSeekClient::new(&crate::config::Config {
+                    provider: Some("openai".to_string()),
+                    providers: Some(crate::config::ProvidersConfig {
+                        openai: crate::config::ProviderConfig {
+                            api_key: Some("gateway-test-key".to_string()),
+                            base_url: Some(format!("{}/v1", server.uri())),
+                            model: Some("gemini-3.1-pro-preview".to_string()),
+                            ..crate::config::ProviderConfig::default()
+                        },
+                        ..crate::config::ProvidersConfig::default()
+                    }),
+                    ..crate::config::Config::default()
+                })
+                .expect("gateway client");
+                client.isolated_request_state = true;
+                let request = google_request_with_signed_tool(None);
+                let result = if streaming {
+                    client.create_message_stream(request).await.map(|_| ())
+                } else {
+                    client
+                        .create_message_without_response_cache(request)
+                        .await
+                        .map(|_| ())
+                };
+                if status == 400 {
+                    let error = result.expect_err("gateway rejects unsigned replay");
+                    let message = error.to_string();
+                    assert!(message.contains("built-in `google` provider"), "{message}");
+                    assert!(message.contains("start a new session"), "{message}");
+                    assert!(matches!(
+                        error.downcast_ref::<crate::llm_client::LlmError>(),
+                        Some(crate::llm_client::LlmError::InvalidRequest { status: 400, .. })
+                    ));
+                } else {
+                    result.expect("gateway-managed signatures must still work");
+                }
+                server.verify().await;
+            }
+        }
+    }
+
     #[test]
     fn google_route_round_trips_thought_signatures_on_replayed_tool_calls() {
         let request = google_request_with_signed_tool(Some("SIG-abc123"));

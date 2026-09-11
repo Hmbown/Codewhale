@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Gemini tool-call replays rejected by compatible gateways for a missing
+  `thought_signature` now explain how to recover: use the built-in `google`
+  provider or a gateway that preserves signatures, then start a new session.
+  Gateways that manage signatures themselves continue to work. Reported by
+  @Hmbown (#6048).
+
 ## [0.9.13] - 2026-09-10
 
 Codewhale v0.9.13 source candidate addresses integrity issues in 0.9.12:

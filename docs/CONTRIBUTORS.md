@@ -43,6 +43,7 @@ notes, and relevant issue/PR comments.
 
 **Reports and reproductions**
 
+- **[Hmbown](https://github.com/Hmbown)** — identified missing recovery guidance when a compatible gateway rejects Gemini tool-call replay without thought signatures ([#6048](https://github.com/Hmbown/Codewhale/issues/6048)).
 - **[7jrxt42BxFZo4iAnN4CX](https://github.com/7jrxt42BxFZo4iAnN4CX)** — proposed global usage and tool diagnostics and independent goal verification ([#6011](https://github.com/Hmbown/Codewhale/issues/6011), [#6013](https://github.com/Hmbown/Codewhale/issues/6013)); these broader requests remain open.
 - **[nsfoxer](https://github.com/nsfoxer)** — reported the multiline-paste regression and incomplete provider model lists ([#5981](https://github.com/Hmbown/Codewhale/issues/5981), [#6009](https://github.com/Hmbown/Codewhale/issues/6009)).
 - **[Nefelibata1024](https://github.com/Nefelibata1024)** — confirmed the multiline-paste regression's impact ([#5981](https://github.com/Hmbown/Codewhale/issues/5981)).

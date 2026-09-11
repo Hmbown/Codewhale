@@ -1,6 +1,90 @@
 use super::*;
 
 #[test]
+fn missing_google_thought_signature_errors_explain_recovery() {
+    for detail in [
+        "Function call is missing a thought_signature in functionCall parts.",
+        "Function call is missing thought_signature.",
+        "The thought_signature is missing from the function call.",
+    ] {
+        for body in [
+            detail.to_string(),
+            serde_json::json!({"error": {"message": detail, "code": 400}}).to_string(),
+            serde_json::json!({"error": "Bad Request", "message": detail}).to_string(),
+        ] {
+            let message = sanitize_http_error_body(Some("Custom"), 400, &body);
+            assert!(message.contains("built-in `google` provider"), "{message}");
+            assert!(message.contains("start a new session"), "{message}");
+            assert!(message.contains(detail), "provider detail must survive");
+            assert_eq!(sanitize_http_error_body(None, 400, &message), message);
+            let error = LlmError::from_http_response(400, &message);
+            assert!(matches!(
+                error,
+                LlmError::InvalidRequest { status: 400, .. }
+            ));
+            assert!(!error.is_retryable());
+        }
+    }
+}
+
+#[test]
+fn google_thought_signature_hint_requires_a_missing_signature_400() {
+    for (status, detail) in [
+        (400, "Invalid model name"),
+        (400, "Invalid thought_signature in functionCall parts"),
+        (400, "Unsupported parameter: thought_signature"),
+        (
+            401,
+            "Function call is missing a thought_signature in functionCall parts.",
+        ),
+        (
+            429,
+            "Function call is missing a thought_signature in functionCall parts.",
+        ),
+        (
+            500,
+            "Function call is missing a thought_signature in functionCall parts.",
+        ),
+    ] {
+        let body = serde_json::json!({"error": {"message": detail}}).to_string();
+        assert_eq!(
+            sanitize_http_error_body(Some("Custom"), status, &body),
+            detail
+        );
+    }
+}
+
+#[test]
+fn google_thought_signature_hint_keeps_large_provider_errors_bounded() {
+    let body = format!(
+        "Function call is missing a thought_signature in functionCall parts. {}",
+        "界".repeat(3_000)
+    );
+    let message = sanitize_http_error_body(None, 400, &body);
+    assert!(message.contains("start a new session"));
+    assert!(message.chars().count() < 2_000);
+    assert_eq!(sanitize_http_error_body(None, 400, &message), message);
+}
+
+#[test]
+fn google_thought_signature_hint_preserves_quota_and_html_handling() {
+    let detail = "Function call is missing a thought_signature in functionCall parts.";
+    let body = serde_json::json!({
+        "error": {"message": detail, "code": "insufficient_quota"}
+    })
+    .to_string();
+    let message = sanitize_http_error_body(None, 400, &body);
+    assert!(matches!(
+        LlmError::from_http_response(400, &message),
+        LlmError::QuotaExhausted(_)
+    ));
+    let html = format!("<!doctype html><html><body>{detail}</body></html>");
+    let message = sanitize_http_error_body(None, 400, &html);
+    assert!(message.contains("HTML error page"));
+    assert!(!message.contains("<html>"));
+}
+
+#[test]
 fn retryability_distinguishes_transient_failures_from_durable_failures() {
     for error in [
         LlmError::RateLimited {
