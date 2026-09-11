@@ -870,6 +870,7 @@ name = "codewhale-command-contract"
 version = "0.9.13"
 dependencies = [
  "codewhale-core",
+ "serde_json",
 ]
 
 [[package]]
@@ -1050,12 +1051,14 @@ dependencies = [
  "chrono",
  "codewhale-paths",
  "keyring",
+ "regex",
  "serde",
  "serde_json",
  "sha2 0.11.0",
  "tempfile",
  "thiserror 2.0.20",
  "tracing",
+ "url",
 ]
 
 [[package]]
