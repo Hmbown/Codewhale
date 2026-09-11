@@ -1399,8 +1399,27 @@ fi
         perms.set_mode(0o755);
         std::fs::set_permissions(&script, perms).unwrap();
 
-        let text = read_text_with_wlpaste_using_argv(script.to_str().unwrap())
-            .expect("read text through wl-paste helper");
+        // A freshly written helper script can transiently report ETXTBSY
+        // ("Text file busy") when a concurrent test in this parallel suite
+        // forks while the write descriptor is still inherited. Retry the
+        // exec briefly so this assertion exercises the helper contract
+        // rather than the fork/exec window; the bound is load tolerance,
+        // not the behavior under test (same class as #5929).
+        let mut attempts = 0;
+        let text = loop {
+            match read_text_with_wlpaste_using_argv(script.to_str().unwrap()) {
+                Ok(text) => break text,
+                Err(error) => {
+                    attempts += 1;
+                    let busy = error.to_string().contains("Text file busy");
+                    assert!(
+                        busy && attempts < 100,
+                        "read text through wl-paste helper: {error:#}"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            }
+        };
 
         assert_eq!(text, "from-wayland");
     }

@@ -34,6 +34,16 @@ mod session_acceptance;
 #[cfg(test)]
 mod session_control_regression_tests;
 #[cfg(test)]
+mod session_export_regression_tests;
+// FEAT-025 Phase 5: public command-surface parity lives at the `commands` root
+// for the same extraction reason as the host regressions above.
+#[cfg(test)]
+mod session_export_surface_tests;
+// FEAT-025 audit hardening: shared host-bound test support for both export
+// test suites (timestamp normalisation and the exhaustive envelope check).
+#[cfg(test)]
+mod session_export_test_support;
+#[cfg(test)]
 mod session_lifecycle_regression_tests;
 
 use std::sync::OnceLock;
