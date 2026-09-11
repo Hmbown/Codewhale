@@ -6,6 +6,7 @@ pub mod shell_expand;
 pub use approval_mode::ApprovalMode;
 
 use std::collections::HashSet;
+use std::sync::{Arc, RwLock};
 
 use anyhow::Result;
 use bash_arity::BashArityDict;
@@ -118,8 +119,11 @@ pub struct ToolAskRule {
     /// cannot silently authorize a later invocation with extra arguments.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub command_exact: bool,
-    /// Optional workspace-relative file path matched exactly after
-    /// normalization.
+    /// Optional file path matched exactly. A workspace-relative rule
+    /// normalizes against the call's workspace; a ROOTED rule (leading `/`,
+    /// `~/`, or a Windows drive) matches the call path exactly after
+    /// separator and case folding, so it can pin locations outside the
+    /// workspace. Traversal segments never match on either channel.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
     /// Optional absolute workspace root that limits this rule to one repo.
@@ -316,10 +320,20 @@ pub struct ExecPolicyContext<'a> {
 pub struct ExecPolicyEngine {
     /// Layered rulesets (builtin → agent → user). When non-empty, takes precedence
     /// over the legacy flat lists below.
-    rulesets: Vec<Ruleset>,
+    ///
+    /// Shared behind an `Arc<RwLock<..>>` so that [`Self::set_ruleset`] applied
+    /// through one clone is observed by every clone. Hosts clone the engine
+    /// into long-lived side executors (nested sub-agent tool registries); a
+    /// plain `Vec` would leave those executors on a stale ruleset after a live
+    /// permission update, reopening an enforcement gap the parent no longer
+    /// has.
+    rulesets: Arc<RwLock<Vec<Ruleset>>>,
     /// Legacy flat lists kept for backward compatibility with `new()`.
     trusted_prefixes: Vec<String>,
     denied_prefixes: Vec<String>,
+    /// Deliberately clone-private, unlike `rulesets`: a remembered grant is a
+    /// decision the parent session made for its own calls, so it must not
+    /// silently authorize a delegated call in a cloned executor.
     approved_for_session: HashSet<String>,
     /// Arity dictionary for command-prefix allow-rule matching.
     arity_dict: BashArityDict,
@@ -329,7 +343,7 @@ impl ExecPolicyEngine {
     /// Legacy constructor: wraps the two vecs into a User-layer ruleset.
     pub fn new(trusted_prefixes: Vec<String>, denied_prefixes: Vec<String>) -> Self {
         Self {
-            rulesets: vec![],
+            rulesets: Arc::new(RwLock::new(vec![])),
             trusted_prefixes,
             denied_prefixes,
             approved_for_session: HashSet::new(),
@@ -342,7 +356,7 @@ impl ExecPolicyEngine {
     pub fn with_rulesets(mut rulesets: Vec<Ruleset>) -> Self {
         rulesets.sort_by_key(|r| r.layer);
         Self {
-            rulesets,
+            rulesets: Arc::new(RwLock::new(rulesets)),
             trusted_prefixes: vec![],
             denied_prefixes: vec![],
             approved_for_session: HashSet::new(),
@@ -352,17 +366,39 @@ impl ExecPolicyEngine {
 
     /// Add a ruleset layer (re-sorts internally).
     pub fn add_ruleset(&mut self, ruleset: Ruleset) {
-        self.rulesets.push(ruleset);
-        self.rulesets.sort_by_key(|r| r.layer);
+        let mut guard = Self::lock_rulesets(&self.rulesets);
+        guard.push(ruleset);
+        guard.sort_by_key(|r| r.layer);
     }
 
     /// Replace the ruleset at one priority layer without clearing approvals
     /// remembered for the current session.
     pub fn set_ruleset(&mut self, ruleset: Ruleset) {
+        let mut guard = Self::lock_rulesets(&self.rulesets);
+        guard.retain(|existing| existing.layer != ruleset.layer);
+        guard.push(ruleset);
+        guard.sort_by_key(|existing| existing.layer);
+    }
+
+    /// Lock the shared ruleset list for reading or writing.
+    ///
+    /// A poisoned lock (a panic held the guard mid-mutation) is recovered from:
+    /// the ruleset vec is plain data and a torn update sorts itself out on the
+    /// next `set_ruleset`, while refusing to answer policy checks would fail
+    /// closed for every command in the process.
+    fn lock_rulesets(
+        rulesets: &Arc<RwLock<Vec<Ruleset>>>,
+    ) -> std::sync::RwLockWriteGuard<'_, Vec<Ruleset>> {
+        rulesets
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Read-only snapshot of the shared ruleset list.
+    fn read_rulesets(&self) -> std::sync::RwLockReadGuard<'_, Vec<Ruleset>> {
         self.rulesets
-            .retain(|existing| existing.layer != ruleset.layer);
-        self.rulesets.push(ruleset);
-        self.rulesets.sort_by_key(|existing| existing.layer);
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Resolve the effective trusted/denied prefix sets by merging all rulesets.
@@ -372,17 +408,19 @@ impl ExecPolicyEngine {
     /// semantics: any matching deny prefix blocks the command regardless of layer.
     /// Trusted rules are only consulted after deny checks pass.
     fn resolve_prefixes(&self) -> (Vec<String>, Vec<String>) {
-        if self.rulesets.is_empty() {
+        let rulesets = self.read_rulesets();
+        if rulesets.is_empty() {
             return (self.trusted_prefixes.clone(), self.denied_prefixes.clone());
         }
         // Collect all trusted/denied across all layers, highest-priority last so they
         // shadow lower-priority entries with the same prefix.
         let mut trusted: Vec<String> = vec![];
         let mut denied: Vec<String> = vec![];
-        for rs in &self.rulesets {
+        for rs in rulesets.iter() {
             trusted.extend(rs.trusted_prefixes.iter().cloned());
             denied.extend(rs.denied_prefixes.iter().cloned());
         }
+        drop(rulesets);
         // Also merge legacy flat lists as user-layer.
         trusted.extend(self.trusted_prefixes.iter().cloned());
         denied.extend(self.denied_prefixes.iter().cloned());
@@ -395,7 +433,8 @@ impl ExecPolicyEngine {
             .path
             .and_then(|path| normalize_workspace_relative_path(path, ctx.cwd));
 
-        self.rulesets
+        let rulesets = self.read_rulesets();
+        let matched = rulesets
             .iter()
             .flat_map(|ruleset| {
                 ruleset
@@ -415,18 +454,31 @@ impl ExecPolicyEngine {
                 None => true,
             })
             .filter(|(_, rule)| match (rule.path.as_deref(), ctx.path) {
-                (Some(pattern), Some(_)) => match (
-                    normalize_workspace_relative_path(pattern, ctx.cwd),
-                    normalized_path.as_deref(),
-                ) {
-                    (Some(pattern), Some(path)) => pattern == path,
-                    _ => false,
-                },
+                (Some(pattern), Some(call_path)) => {
+                    let ws_rule = normalize_workspace_relative_path(pattern, ctx.cwd);
+                    match (ws_rule, normalized_path.as_deref()) {
+                        // Workspace-relative normalization fails for a call
+                        // outside the workspace or a rule that names one, and
+                        // on a POSIX host a Windows-spelled rule/call pair
+                        // parses as unrelated relative forms. A rule spelling
+                        // an ABSOLUTE path must still be able to match such a
+                        // call exactly, or pinned locations (a real home,
+                        // `/root`, a Windows profile) are unmatchable. The
+                        // helper only fires for rooted rules, so relative
+                        // semantics are unchanged.
+                        (Some(ws_rule), Some(ws_call)) => {
+                            ws_rule == ws_call || absolute_path_rule_matches(pattern, call_path)
+                        }
+                        _ => absolute_path_rule_matches(pattern, call_path),
+                    }
+                }
                 (Some(_), None) => false,
                 (None, _) => true,
             })
             .max_by_key(|(layer, rule)| (*layer, rule.action, ask_rule_specificity(rule)))
-            .map(|(_, rule)| rule.clone())
+            .map(|(_, rule)| (*rule).clone());
+        drop(rulesets);
+        matched
     }
 
     /// Records an approval key for the current session so subsequent checks skip approval.
@@ -730,6 +782,16 @@ fn command_is_chained(command: &str) -> bool {
 /// direction. Matching stays anchored at the first positional token, so a
 /// non-flag token that isn't in the rule ends it — `git push` does not block
 /// `git checkout push`, and `rm` does not block `rmdir`.
+///
+/// Two rule-side spellings widen what a rule can name. cmd.exe-style
+/// single-letter `/` flags (`del /f /s /q`) in the *command* are skippable like
+/// `-` flags, in any position. And a rule token of exactly `*` is a middle
+/// wildcard matching zero or more consecutive command tokens regardless of
+/// shape, so a rule can anchor on a tail (`grep * ~/.ssh/id_rsa`,
+/// `dd * of=/dev/sda`) without enumerating every flag spelling. A wildcard
+/// widens the deny face of a rule — each one must be justified by the rule
+/// author. This engine is deliberately permissive; the rulesets that feed it
+/// own the false-positive discipline of keeping wildcards narrow.
 fn denied_prefix_matches(rule: &str, command: &str) -> bool {
     let rule_tokens: Vec<String> = normalize_command(rule)
         .split_whitespace()
@@ -762,6 +824,24 @@ fn denied_prefix_matches(rule: &str, command: &str) -> bool {
         if j == rule_tokens.len() {
             return true;
         }
+        // A rule token of exactly `*` is a middle wildcard: it matches zero or
+        // more consecutive command tokens regardless of shape — that is its
+        // point, since `grep -i PATTERN ~/.ssh/id_rsa` interleaves flags and
+        // positionals no flag rule could enumerate. `(i, j+1)` lets it match
+        // nothing; `(i+1, j)` skips one more command token. `seen` keeps the
+        // run of states finite. This branch runs BEFORE the end-of-command
+        // bail below so a trailing `*` can still match zero tokens once the
+        // command is exhausted, degrading to plain prefix semantics, and a
+        // wildcard is never itself treated as a command word.
+        if rule_tokens[j] == "*" {
+            if seen.insert((i, j)) {
+                stack.push((i, j + 1));
+                if i < command_tokens.len() {
+                    stack.push((i + 1, j));
+                }
+            }
+            continue;
+        }
         if i >= command_tokens.len() || !seen.insert((i, j)) {
             continue;
         }
@@ -780,11 +860,16 @@ fn denied_prefix_matches(rule: &str, command: &str) -> bool {
         if matches_rule_token {
             stack.push((i + 1, j + 1));
         }
-        if token.starts_with('-') {
+        if token.starts_with('-') || is_single_letter_slash_flag(token) {
             // An unrelated flag is skippable — alone, and (when it could take
             // a separate value) together with the token after it. Consuming it
-            // as a rule token above takes priority, so a rule that names a flag
-            // (`cargo test --danger`) still matches it.
+            // as a rule token above takes priority, so a rule that names a
+            // flag (`cargo test --danger`) still matches it. cmd.exe spells
+            // its flags the same way shells spell paths, so only the
+            // single-letter shape (`/f`, `/s`, `/q`, `/y`) may skip; anything
+            // longer is a POSIX path (`/tmp`, `/etc`, `/usr`, `/dev`) and must
+            // stay positional, or `cp /tmp/new_key ~/.ssh/authorized_keys`
+            // would slip past a rule guarding `~/.ssh/authorized_keys`.
             stack.push((i + 1, j));
             if !token.contains('=') {
                 stack.push((i + 2, j));
@@ -796,6 +881,18 @@ fn denied_prefix_matches(rule: &str, command: &str) -> bool {
     false
 }
 
+/// True for a cmd.exe-style single-letter flag such as `/f`, `/s`, `/q`, `/y`.
+///
+/// cmd.exe flags are a slash plus exactly one letter (`del /f /s /q`, `xcopy
+/// /e /y`), so only that shape may skip like a `-` flag. The narrowness is
+/// load-bearing: multi-character `/`-tokens are real POSIX paths (`/tmp`,
+/// `/etc`, `/usr`, `/dev`) and must keep matching positionally. Case needs no
+/// handling here — `normalize_command` has already lowercased the token.
+fn is_single_letter_slash_flag(token: &str) -> bool {
+    let bytes = token.as_bytes();
+    bytes.len() == 2 && bytes[0] == b'/' && bytes[1].is_ascii_alphabetic()
+}
+
 /// Whether a command word matches a deny rule's command word.
 ///
 /// Exact first, then the command's basename — `/bin/rm`, `./rm`, and
@@ -803,6 +900,13 @@ fn denied_prefix_matches(rule: &str, command: &str) -> bool {
 /// direction only: a rule that spells a path (`/usr/bin/rm`) still requires
 /// that path, because the rule author asked for it specifically. Both
 /// separators are honored so a Windows spelling cannot slip past.
+///
+/// A trailing `.exe` on the command's basename also folds: Windows spells the
+/// same binary `cat.exe` or `C:\Windows\System32\cat.exe`, and a `cat
+/// ~/.ssh/id_rsa` rule must hold against that spelling too. The fold is one
+/// direction only — when the RULE itself ends in `.exe` (`control.exe`) it
+/// keeps requiring that spelling, and `catalog` never matches `cat` because
+/// only a whole `.exe` suffix strips, never a prefix.
 fn command_word_matches(rule_token: &str, command_token: &str) -> bool {
     if command_token == rule_token {
         return true;
@@ -811,10 +915,15 @@ fn command_word_matches(rule_token: &str, command_token: &str) -> bool {
     if rule_token.contains('/') || rule_token.contains('\\') {
         return false;
     }
-    let basename = command_token
+    let mut basename = command_token
         .rsplit(['/', '\\'])
         .next()
         .unwrap_or(command_token);
+    if !rule_token.ends_with(".exe")
+        && let Some(stem) = basename.strip_suffix(".exe")
+    {
+        basename = stem;
+    }
     !basename.is_empty() && basename == rule_token
 }
 
@@ -1027,6 +1136,33 @@ fn parse_path_for_matching_with_case(
 fn is_windows_absolute_path(value: &str) -> bool {
     let bytes = value.as_bytes();
     bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && bytes[2] == b'/'
+}
+
+/// Exact-match fallback for a typed path rule that names an ABSOLUTE path.
+///
+/// The primary match normalizes both sides to workspace-relative form, which
+/// only succeeds when the call lives inside the workspace — so a rule pinning
+/// a location outside it (a real home, `/root`, another user's home, or a
+/// literal `~` spelling the tool passed through unexpanded) could never match.
+/// This fallback fires only when workspace normalization failed on either
+/// side, and only for a ROOTED rule (leading `/`, `~`, or a Windows drive):
+/// separators fold to `/`, case folds on case-insensitive platforms, and the
+/// comparison is plain equality. A relative rule never reaches it, so
+/// workspace-relative semantics are unchanged, and because there are no
+/// wildcards the deny direction keeps its precision while the allow direction
+/// can only ever match the exact path the rule spells.
+fn absolute_path_rule_matches(rule_path: &str, call_path: &str) -> bool {
+    let fold = |value: &str| {
+        let value = value.trim().replace('\\', "/");
+        if platform_paths_are_case_insensitive() {
+            value.to_ascii_lowercase()
+        } else {
+            value
+        }
+    };
+    let rule = fold(rule_path);
+    let rooted = rule.starts_with('/') || rule.starts_with("~/") || is_windows_absolute_path(&rule);
+    rooted && rule == fold(call_path)
 }
 
 fn has_windows_drive_prefix(value: &str) -> bool {
@@ -1396,6 +1532,232 @@ mod tests {
             .check(ctx("rmdir empty-dir", AskForApproval::UnlessTrusted))
             .unwrap();
         assert!(allowed.allow, "rmdir must not be denied: {allowed:?}");
+    }
+
+    #[test]
+    fn denied_prefix_skips_cmd_exe_single_letter_slash_flags() {
+        // cmd.exe spells its flags `/f`, `/s`, `/q` — a slash plus exactly one
+        // letter, in any order and position. A deny rule must hold against
+        // every interleaving (`del /f /s /q`, `del /q /s /f`, ...); the app
+        // would otherwise have to enumerate canonical flag sequences, so the
+        // engine skips the shape itself, like `-` flags.
+        let engine = ExecPolicyEngine::new(
+            vec![],
+            vec![
+                r"del c:\users\x\file".to_string(),
+                r"xcopy c:\src d:\dst".to_string(),
+            ],
+        );
+        for command in [
+            r"del c:\users\x\file",
+            r"del /f c:\users\x\file",
+            r"del /f /s /q c:\users\x\file",
+            r"del /q /s /f c:\users\x\file",
+            r"del /f c:\users\x\file /s /q",
+            r"xcopy /e /y c:\src d:\dst",
+        ] {
+            let decision = engine.check(ctx(command, AskForApproval::Never)).unwrap();
+            assert!(
+                !decision.allow,
+                "cmd.exe flag spelling evaded deny: {command:?} -> {decision:?}"
+            );
+        }
+        // A rule that NAMES a `/x` flag still consumes it as a rule token —
+        // the rule-token branch is tried before the skip branches.
+        let named = ExecPolicyEngine::new(vec![], vec![r"del /q c:\x".to_string()]);
+        let decision = named
+            .check(ctx(r"del /q c:\x", AskForApproval::Never))
+            .unwrap();
+        assert!(
+            !decision.allow,
+            "rule naming a slash flag missed: {decision:?}"
+        );
+    }
+
+    #[test]
+    fn denied_prefix_slash_skipping_keeps_multi_char_slash_tokens_positional() {
+        // The single-letter constraint is load-bearing: `/tmp` is a POSIX
+        // directory, not a flag. If multi-character `/`-tokens skipped, an
+        // exfil command could hide its real operand behind a skipped path and
+        // slip past a rule guarding the sensitive target.
+        let engine = ExecPolicyEngine::new(vec![], vec!["cp ~/.ssh/authorized_keys".to_string()]);
+        for command in [
+            "cp /tmp/new_key ~/.ssh/authorized_keys",
+            "cp /etc/passwd ~/.ssh/authorized_keys",
+        ] {
+            let decision = engine
+                .check(ctx(command, AskForApproval::UnlessTrusted))
+                .unwrap();
+            assert!(
+                decision.allow,
+                "POSIX path argument wrongly treated as a flag: {command:?} -> {decision:?}"
+            );
+        }
+        // The guarded target itself still denies, skip branches or not.
+        let denied = engine
+            .check(ctx(
+                "cp ~/.ssh/authorized_keys ~/.ssh/authorized_keys.bak",
+                AskForApproval::Never,
+            ))
+            .unwrap();
+        assert!(!denied.allow, "guarded target must stay denied: {denied:?}");
+    }
+
+    #[test]
+    fn denied_prefix_middle_wildcard_matches_zero_or_more_tokens() {
+        // A rule token of exactly `*` matches zero or more consecutive command
+        // tokens REGARDLESS of shape — flags, flag values, extra positionals —
+        // so a rule can anchor on its sensitive tail without the app
+        // enumerating every flag spelling.
+        let engine = ExecPolicyEngine::new(
+            vec![],
+            vec![
+                "grep * ~/.ssh/id_rsa".to_string(),
+                "dd * of=/dev/sda".to_string(),
+            ],
+        );
+        for command in [
+            "grep root ~/.ssh/id_rsa",
+            "grep -i root ~/.ssh/id_rsa",
+            "grep -r root ~/.ssh/id_rsa",
+            // The wildcard matches nothing at all.
+            "grep ~/.ssh/id_rsa",
+            // `dd` has no dash flags at all: its operands are `key=value`.
+            "dd if=/dev/zero of=/dev/sda",
+            "dd if=boot.img bs=1M of=/dev/sda",
+            // Deny rules are prefix matches: the anchored tail still denies
+            // when the command continues past it.
+            "grep -i root ~/.ssh/id_rsa > /tmp/out",
+        ] {
+            let decision = engine.check(ctx(command, AskForApproval::Never)).unwrap();
+            assert!(
+                !decision.allow,
+                "wildcard rule missed {command:?}: {decision:?}"
+            );
+        }
+
+        // A rule whose LAST token is `*` still matches a shorter command —
+        // prefix semantics, not suffix equality.
+        let trailing = ExecPolicyEngine::new(vec![], vec!["grep * ~/.ssh/id_rsa *".to_string()]);
+        for command in [
+            "grep root ~/.ssh/id_rsa",
+            "grep -i root ~/.ssh/id_rsa backup",
+        ] {
+            let decision = trailing.check(ctx(command, AskForApproval::Never)).unwrap();
+            assert!(
+                !decision.allow,
+                "trailing-wildcard rule missed {command:?}: {decision:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn denied_prefix_wildcard_stays_anchored_on_the_tail_token() {
+        // The wildcard bridges the MIDDLE of a rule; it does not relax the
+        // tail. A rule is still a prefix match: when the tail token never
+        // appears in the segment, there is no deny — here or inside a chain.
+        let engine = ExecPolicyEngine::new(vec![], vec!["grep * /home/z".to_string()]);
+        for command in ["grep x /etc/y", "ls && grep x /etc/y"] {
+            let decision = engine
+                .check(ctx(command, AskForApproval::UnlessTrusted))
+                .unwrap();
+            assert!(
+                decision.allow,
+                "wildcard rule over-matched {command:?}: {decision:?}"
+            );
+        }
+        // Chained segments are still scanned individually: a wildcard rule
+        // denies when its anchor appears in ANY segment, and does not leak
+        // across the chain boundary in either direction.
+        let chain = ExecPolicyEngine::new(vec![], vec!["grep * ~/.ssh/id_rsa".to_string()]);
+        let denied = chain
+            .check(ctx(
+                "echo hi && grep root ~/.ssh/id_rsa",
+                AskForApproval::Never,
+            ))
+            .unwrap();
+        assert!(!denied.allow, "chained segment must still deny: {denied:?}");
+        let shielded = chain
+            .check(ctx("grep x /etc/y && echo done", AskForApproval::Never))
+            .unwrap();
+        assert!(
+            shielded.allow,
+            "wildcard must not reach into unrelated segments: {shielded:?}"
+        );
+    }
+
+    #[test]
+    fn denied_prefix_leading_wildcard_follows_generic_wildcard_semantics() {
+        // Rules in practice anchor their first token, but a leading `*` is not
+        // an error: the generic DFS gives it the same two branches and it is
+        // never treated as a command word. Documented consequence of keeping
+        // the anchor at the rule's literal first token: the command word after
+        // a leading wildcard is matched exactly, so `/bin/rm` is NOT folded to
+        // `rm` for it. Rule authors should not start rules with `*`; this test
+        // only pins the behavior the generic DFS produces.
+        let engine = ExecPolicyEngine::new(vec![], vec!["* rm -rf /".to_string()]);
+        let bare = engine
+            .check(ctx("rm -rf /", AskForApproval::Never))
+            .unwrap();
+        assert!(
+            !bare.allow,
+            "leading-wildcard rule must match its bare spelling: {bare:?}"
+        );
+        let path = engine
+            .check(ctx("/bin/rm -rf /", AskForApproval::Never))
+            .unwrap();
+        assert!(
+            path.allow,
+            "leading wildcard must not gain command-word folding: {path:?}"
+        );
+    }
+
+    #[test]
+    fn denied_prefix_folds_windows_exe_suffix_on_the_command_word() {
+        // Windows spells the same binary `cat.exe` or
+        // `C:\Windows\System32\cat.exe`; a `cat ~/.ssh/id_rsa` rule must hold
+        // against those spellings. The fold is one-directional: a rule that
+        // names `.exe` itself keeps requiring it, and only a WHOLE `.exe`
+        // suffix strips — `catalog` never becomes `cat`.
+        let engine = ExecPolicyEngine::new(vec![], vec!["cat ~/.ssh/id_rsa".to_string()]);
+        for command in [
+            "cat ~/.ssh/id_rsa",
+            "cat.exe ~/.ssh/id_rsa",
+            "cat.EXE ~/.ssh/id_rsa",
+            r"C:\Windows\System32\cat.exe ~/.ssh/id_rsa",
+        ] {
+            let decision = engine.check(ctx(command, AskForApproval::Never)).unwrap();
+            assert!(
+                !decision.allow,
+                "`.exe` spelling evaded deny: {command:?} -> {decision:?}"
+            );
+        }
+
+        // A rule ending in `.exe` must still require that spelling: the bare
+        // `control` is a different binary and must not match `control.exe`.
+        let control = ExecPolicyEngine::new(vec![], vec!["control.exe".to_string()]);
+        let spelled = control
+            .check(ctx("control.exe", AskForApproval::Never))
+            .unwrap();
+        assert!(!spelled.allow, "control.exe must be denied: {spelled:?}");
+        let bare = control
+            .check(ctx("control", AskForApproval::UnlessTrusted))
+            .unwrap();
+        assert!(
+            bare.allow,
+            "bare `control` must not match rule `control.exe`: {bare:?}"
+        );
+
+        // Only a whole `.exe` suffix folds, never a word prefix.
+        for command in ["catalog ~/.ssh/id_rsa", "catalog.exe ~/.ssh/id_rsa"] {
+            let decision = engine
+                .check(ctx(command, AskForApproval::UnlessTrusted))
+                .unwrap();
+            assert!(
+                decision.allow,
+                "prefix word must not fold into the rule word: {command:?} -> {decision:?}"
+            );
+        }
     }
 
     #[test]
@@ -1891,6 +2253,162 @@ mod tests {
             .unwrap();
 
         assert!(decision.requires_approval);
+    }
+
+    #[test]
+    fn typed_ask_absolute_path_rule_matches_absolute_call_outside_workspace() {
+        let engine =
+            ExecPolicyEngine::with_rulesets(vec![Ruleset::user(vec![], vec![]).with_ask_rules(
+                vec![ToolAskRule {
+                    tool: "read_file".into(),
+                    command: None,
+                    command_exact: false,
+                    path: Some("/root/.ssh/config".into()),
+                    workspace: None,
+                    action: PermissionAction::Deny,
+                }],
+            )]);
+
+        // An absolute rule must reach a call outside the workspace that the
+        // workspace-relative normalization cannot express.
+        let decision = engine
+            .check(ExecPolicyContext {
+                command: "",
+                cwd: "/workspace",
+                tool: Some("read_file"),
+                path: Some("/root/.ssh/config"),
+                ask_for_approval: AskForApproval::OnFailure,
+                sandbox_mode: Some("workspace-write"),
+            })
+            .unwrap();
+        assert_eq!(decision.matched_action, Some(PermissionAction::Deny));
+
+        // A different absolute path must not match.
+        let decision = engine
+            .check(ExecPolicyContext {
+                command: "",
+                cwd: "/workspace",
+                tool: Some("read_file"),
+                path: Some("/root/.ssh/known_hosts"),
+                ask_for_approval: AskForApproval::OnFailure,
+                sandbox_mode: Some("workspace-write"),
+            })
+            .unwrap();
+        assert_eq!(decision.matched_rule, None);
+
+        // The fallback is exact: a traversal spelling of the same file is a
+        // different token string and must stay unmatchable (the documented
+        // "traversal is never matchable" stance, pinned through the rooted
+        // fallback too).
+        let decision = engine
+            .check(ExecPolicyContext {
+                command: "",
+                cwd: "/workspace",
+                tool: Some("read_file"),
+                path: Some("/root/../root/.ssh/config"),
+                ask_for_approval: AskForApproval::OnFailure,
+                sandbox_mode: Some("workspace-write"),
+            })
+            .unwrap();
+        assert_eq!(decision.matched_rule, None);
+    }
+
+    #[test]
+    fn typed_ask_literal_tilde_rule_matches_unexpanded_call_spelling() {
+        let engine =
+            ExecPolicyEngine::with_rulesets(vec![Ruleset::user(vec![], vec![]).with_ask_rules(
+                vec![ToolAskRule {
+                    tool: "read_file".into(),
+                    command: None,
+                    command_exact: false,
+                    path: Some("~/.ssh/config".into()),
+                    workspace: None,
+                    action: PermissionAction::Deny,
+                }],
+            )]);
+
+        let decision = engine
+            .check(ExecPolicyContext {
+                command: "",
+                cwd: "/workspace",
+                tool: Some("read_file"),
+                path: Some("~/.ssh/config"),
+                ask_for_approval: AskForApproval::OnFailure,
+                sandbox_mode: Some("workspace-write"),
+            })
+            .unwrap();
+        assert_eq!(decision.matched_action, Some(PermissionAction::Deny));
+
+        // The tilde-rooted channel is exact as well: a traversal spelling of
+        // the same file must not match (never-matchable-traversal stance).
+        let decision = engine
+            .check(ExecPolicyContext {
+                command: "",
+                cwd: "/workspace",
+                tool: Some("read_file"),
+                path: Some("~/.ssh/../ssh/config"),
+                ask_for_approval: AskForApproval::OnFailure,
+                sandbox_mode: Some("workspace-write"),
+            })
+            .unwrap();
+        assert_eq!(decision.matched_rule, None);
+    }
+
+    #[test]
+    fn typed_ask_relative_path_rule_still_rejects_absolute_call() {
+        // The absolute fallback is rooted-rule-only: a relative rule keeps
+        // its workspace-relative semantics and must not reach an absolute
+        // call path through it.
+        let engine = ExecPolicyEngine::with_rulesets(vec![
+            Ruleset::user(vec![], vec![])
+                .with_ask_rules(vec![ToolAskRule::file_path("edit_file", "src/a.rs")]),
+        ]);
+
+        let decision = engine
+            .check(ExecPolicyContext {
+                command: "",
+                cwd: "/workspace",
+                tool: Some("edit_file"),
+                path: Some("/src/a.rs"),
+                ask_for_approval: AskForApproval::OnFailure,
+                sandbox_mode: Some("workspace-write"),
+            })
+            .unwrap();
+        assert_eq!(decision.matched_rule, None);
+    }
+
+    #[test]
+    fn typed_ask_absolute_path_rule_folds_separators_and_case_on_windows() {
+        let engine =
+            ExecPolicyEngine::with_rulesets(vec![Ruleset::user(vec![], vec![]).with_ask_rules(
+                vec![ToolAskRule {
+                    tool: "read_file".into(),
+                    command: None,
+                    command_exact: false,
+                    path: Some("C:/Users/u/.aws/credentials".into()),
+                    workspace: None,
+                    action: PermissionAction::Deny,
+                }],
+            )]);
+
+        let decision = engine
+            .check(ExecPolicyContext {
+                command: "",
+                cwd: r"C:\workspace",
+                tool: Some("read_file"),
+                path: Some(r"C:\Users\U\.AWS\credentials"),
+                ask_for_approval: AskForApproval::OnFailure,
+                sandbox_mode: Some("workspace-write"),
+            })
+            .unwrap();
+        // The rule folds `C:/Users/u/...` and the call folds `C:\Users\U\...`
+        // to the same form on a case-insensitive platform; on a
+        // case-sensitive one the case difference is a different file.
+        if platform_paths_are_case_insensitive() {
+            assert_eq!(decision.matched_action, Some(PermissionAction::Deny));
+        } else {
+            assert_eq!(decision.matched_rule, None);
+        }
     }
 
     // ── deny / allow action tests ──────────────────────────────────────────
