@@ -604,13 +604,20 @@ pub fn is_exact_xai_platform_route(kind: ProviderKind, base_url: &str) -> bool {
 /// Completions endpoints.
 ///
 /// Z.ai-only request fields must not leak to compatible gateways merely
-/// because they expose the same model id. Both the Coding Plan and general
-/// platform endpoints are first-party; neighboring paths remain distinct.
+/// because they expose the same model id. Both api.z.ai products (Coding
+/// Plan and general platform) and BigModel's general platform endpoint are
+/// first-party: `open.bigmodel.cn/api/paas/v4` is the same open platform
+/// whose docs prescribe the same `thinking` / `reasoning_effort` dialect
+/// (including the forced-thinking GLM-5.3 family), and the bundled catalog
+/// already lists it as the Z.ai catalog API. Neighboring paths — including
+/// BigModel's `/preview` — remain distinct, mirroring the web-search and
+/// official-endpoint families.
 #[must_use]
 pub fn is_exact_zai_chat_route(kind: ProviderKind, base_url: &str) -> bool {
     kind == ProviderKind::Zai
         && (is_exact_https_route(base_url, "api.z.ai", "api/coding/paas/v4")
-            || is_exact_https_route(base_url, "api.z.ai", "api/paas/v4"))
+            || is_exact_https_route(base_url, "api.z.ai", "api/paas/v4")
+            || is_exact_https_route(base_url, "open.bigmodel.cn", "api/paas/v4"))
 }
 
 /// Whether a configured route is one of MiniMax's exact first-party OpenAI
@@ -2200,6 +2207,11 @@ mod tests {
             "https://api.z.ai/api/coding/paas/v4",
             "https://api.z.ai/api/paas/v4/",
             "HTTPS://API.Z.AI/api/paas/v4",
+            // BigModel's general platform endpoint is the same first-party
+            // open platform; authority case stays insignificant.
+            "https://open.bigmodel.cn/api/paas/v4",
+            "https://open.bigmodel.cn/api/paas/v4/",
+            "HTTPS://OPEN.BIGMODEL.CN/api/paas/v4",
         ] {
             assert!(is_exact_zai_chat_route(ProviderKind::Zai, route), "{route}");
         }
@@ -2211,6 +2223,13 @@ mod tests {
             "https://api.z.ai/api/paas/v4#fragment",
             "https://api.z.ai/api/paas/v4//",
             "https://api.z.ai/api/paas/v4/chat/completions",
+            // BigModel neighbors: the undocumented coding path and the
+            // preview product stay fail-closed, like the official-endpoint
+            // and web-search families.
+            "https://open.bigmodel.cn/api/paas/v4/preview",
+            "https://open.bigmodel.cn/api/coding/paas/v4",
+            "http://open.bigmodel.cn/api/paas/v4",
+            "https://open.bigmodel.cn/API/paas/v4",
             "https://gateway.example/v1",
         ] {
             assert!(
@@ -2221,6 +2240,10 @@ mod tests {
         assert!(!is_exact_zai_chat_route(
             ProviderKind::Openai,
             DEFAULT_ZAI_BASE_URL
+        ));
+        assert!(!is_exact_zai_chat_route(
+            ProviderKind::Openai,
+            "https://open.bigmodel.cn/api/paas/v4"
         ));
     }
 

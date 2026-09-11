@@ -1065,6 +1065,58 @@ fn restored_zai_toggle_only_and_unknown_models_enforce_effective_truth() {
 }
 
 #[test]
+fn restored_zai_forced_thinking_models_cannot_claim_effective_off() {
+    // GLM-5.3 / GLM-5.3-Flash reject `thinking.type: "disabled"`; the wire
+    // sends `off` as `reasoning_effort: "low"`, so only `Low` is a truthful
+    // effective receipt for a requested `Off`. GLM-5.2 keeps the toggle.
+    // Both hosts of the first-party open platform enforce the same receipt.
+    let zai_activity =
+        |endpoint: &str, model: &str, effective: ReasoningEffortTier| -> WorkActivityEvent {
+            WorkActivityEvent::ReasoningEffortChanged {
+                requested: ReasoningEffortTier::Off,
+                effective,
+                provider_kind: Some(crate::config::ApiProvider::Zai),
+                provider: "zai".to_string(),
+                endpoint_identity: Some(endpoint.to_string()),
+                model: Some(model.to_string()),
+                ts: 10,
+                operation: None,
+            }
+        };
+    for endpoint in [
+        crate::config::DEFAULT_ZAI_BASE_URL,
+        "https://open.bigmodel.cn/api/paas/v4",
+    ] {
+        for model in [
+            crate::config::ZAI_GLM_5_3_MODEL,
+            crate::config::ZAI_GLM_5_3_FLASH_MODEL,
+        ] {
+            let mut forged = seeded().into_snapshot();
+            forged
+                .activities
+                .push_bounded(zai_activity(endpoint, model, ReasoningEffortTier::Off));
+            validate(&forged).expect_err("forced-thinking Z.ai route cannot prove effective off");
+
+            let mut truthful = seeded().into_snapshot();
+            truthful.activities.push_bounded(zai_activity(
+                endpoint,
+                model,
+                ReasoningEffortTier::Low,
+            ));
+            validate(&truthful).expect("off on a forced-thinking route restores as low");
+        }
+
+        let mut glm_5_2 = seeded().into_snapshot();
+        glm_5_2.activities.push_bounded(zai_activity(
+            endpoint,
+            crate::config::ZAI_GLM_5_2_MODEL,
+            ReasoningEffortTier::Off,
+        ));
+        validate(&glm_5_2).expect("GLM-5.2 still honours the disabled toggle");
+    }
+}
+
+#[test]
 fn restored_named_gateway_cannot_forge_effective_max() {
     let mut snapshot = seeded().into_snapshot();
     snapshot

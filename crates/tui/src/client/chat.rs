@@ -16,9 +16,10 @@ use tokio::time::timeout as tokio_timeout;
 
 use crate::config::{
     TOGETHER_INKLING_MODEL, is_exact_direct_moonshot_k3_route, is_exact_kimi_code_k3_route,
-    is_exact_xai_grok_4_6_route, is_exact_zai_chat_route, is_exact_zai_tiered_effort_route,
-    is_kimi_code_membership_model, minimax_m3_route_uses_max_completion_tokens,
-    moonshot_base_url_is_exact_kimi_code, wire_model_for_provider_route,
+    is_exact_xai_grok_4_6_route, is_exact_zai_chat_route, is_exact_zai_forced_thinking_route,
+    is_exact_zai_tiered_effort_route, is_kimi_code_membership_model,
+    minimax_m3_route_uses_max_completion_tokens, moonshot_base_url_is_exact_kimi_code,
+    wire_model_for_provider_route,
 };
 
 // The bounded response-header wait (`stream_open_timeout`) and its env
@@ -253,9 +254,9 @@ fn apply_direct_moonshot_k3_reasoning_effort(
 }
 
 /// Keep Z.ai controls on exact first-party routes only. The tiered-effort GLM
-/// models (5.2, and 5.3 which inherits its reasoning options) receive the
-/// documented top-level effort, GLM-5.1 and GLM-5-Turbo keep only the generic
-/// thinking toggle, and compatible gateways receive neither field because their
+/// models (5.2, and the forced-thinking 5.3 family) receive the documented
+/// top-level effort, GLM-5.1 and GLM-5-Turbo keep only the generic thinking
+/// toggle, and compatible gateways receive neither field because their
 /// request dialect is not known from provider/model selection alone.
 fn apply_zai_route_reasoning_controls(
     body: &mut Value,
@@ -289,6 +290,10 @@ fn apply_zai_route_reasoning_controls(
         // enabled/disabled thinking control.
         return;
     }
+    if is_exact_zai_forced_thinking_route(provider, base_url, model) {
+        apply_zai_forced_thinking_effort(body, effort);
+        return;
+    }
     match effort
         .map(|value| value.trim().to_ascii_lowercase())
         .as_deref()
@@ -301,6 +306,38 @@ fn apply_zai_route_reasoning_controls(
         // only the generic Z.ai thinking control.
         _ => {}
     }
+}
+
+/// GLM-5.3 and GLM-5.3-Flash are forced-thinking on the exact first-party
+/// Z.ai route: `thinking.type: "disabled"` is rejected with an error and
+/// `reasoning_effort` accepts only low/high/max. The generic Z.ai layer emits
+/// `disabled` for `off`, so a request that was valid for GLM-5.2 fails on
+/// 5.3. Rewrite that payload the way the vendor migration note prescribes —
+/// keep thinking enabled and send the lowest tier — and map the remaining
+/// aliases onto the three documented values, leaving unknown legacy values
+/// omitted so the API owns its documented default (`max`).
+fn apply_zai_forced_thinking_effort(body: &mut Value, effort: Option<&str>) {
+    let thinking_disabled = body
+        .get("thinking")
+        .and_then(|thinking| thinking.get("type"))
+        .and_then(Value::as_str)
+        == Some("disabled");
+    if thinking_disabled {
+        body["thinking"] = json!({
+            "type": "enabled",
+            "clear_thinking": false,
+        });
+    }
+    let Some(effort) = effort else {
+        return;
+    };
+    let wire_effort = match effort.trim().to_ascii_lowercase().as_str() {
+        "off" | "none" | "disabled" | "false" | "low" | "minimum" | "minimal" | "light" => "low",
+        "medium" | "mid" | "high" => "high",
+        "xhigh" | "max" | "highest" | "ultra" | "ultracode" => "max",
+        _ => return,
+    };
+    body["reasoning_effort"] = json!(wire_effort);
 }
 
 /// Add MiniMax's Chat-only reasoning controls only when endpoint and model
@@ -6158,6 +6195,144 @@ mod alias_thinking_detection_tests {
         );
         assert!(body.get("reasoning_effort").is_none());
         assert!(body.get("thinking").is_none());
+    }
+
+    #[test]
+    fn zai_forced_thinking_models_never_send_thinking_disabled() {
+        // BigModel and Z.ai document GLM-5.3 / GLM-5.3-Flash as forced-thinking:
+        // `thinking.type: "disabled"` errors, effort accepts only low/high/max,
+        // and the migration note for a former `disabled` payload is
+        // `enabled` + `reasoning_effort: "low"`. Both hosts of the first-party
+        // open platform — api.z.ai and open.bigmodel.cn — get the rewrite.
+        for zai in [
+            crate::config::DEFAULT_ZAI_BASE_URL,
+            "https://open.bigmodel.cn/api/paas/v4",
+        ] {
+            for model in [
+                crate::config::ZAI_GLM_5_3_MODEL,
+                crate::config::ZAI_GLM_5_3_FLASH_MODEL,
+            ] {
+                let mut body = json!({});
+                apply_route_reasoning_controls(
+                    &mut body,
+                    ApiProvider::Zai,
+                    zai,
+                    model,
+                    Some("off"),
+                );
+                assert_eq!(
+                    body["thinking"]["type"],
+                    json!("enabled"),
+                    "{model} must not send the rejected disabled toggle"
+                );
+                assert_eq!(
+                    body["reasoning_effort"],
+                    json!("low"),
+                    "{model} off becomes low"
+                );
+
+                let mut body = json!({});
+                apply_route_reasoning_controls(
+                    &mut body,
+                    ApiProvider::Zai,
+                    zai,
+                    model,
+                    Some("low"),
+                );
+                assert_eq!(
+                    body["reasoning_effort"],
+                    json!("low"),
+                    "{model} low is native"
+                );
+
+                let mut body = json!({});
+                apply_route_reasoning_controls(
+                    &mut body,
+                    ApiProvider::Zai,
+                    zai,
+                    model,
+                    Some("medium"),
+                );
+                assert_eq!(
+                    body["reasoning_effort"],
+                    json!("high"),
+                    "{model} medium maps to high"
+                );
+
+                let mut body = json!({});
+                apply_route_reasoning_controls(
+                    &mut body,
+                    ApiProvider::Zai,
+                    zai,
+                    model,
+                    Some("max"),
+                );
+                assert_eq!(
+                    body["reasoning_effort"],
+                    json!("max"),
+                    "{model} max stays max"
+                );
+
+                // Unknown legacy values leave the field omitted so the API keeps
+                // its documented default; nothing may reintroduce `disabled`.
+                let mut body = json!({});
+                apply_route_reasoning_controls(
+                    &mut body,
+                    ApiProvider::Zai,
+                    zai,
+                    model,
+                    Some("auto"),
+                );
+                assert!(
+                    body.get("reasoning_effort").is_none(),
+                    "{model} auto stays omitted"
+                );
+                assert_ne!(body["thinking"]["type"], json!("disabled"));
+            }
+
+            // GLM-5.2 honours the generic disabled toggle on both hosts. On
+            // BigModel that toggle now reaches the API (its docs still list
+            // `disabled` for GLM-5.2) instead of being stripped by the
+            // fail-closed gateway path.
+            let mut body = json!({});
+            apply_route_reasoning_controls(
+                &mut body,
+                ApiProvider::Zai,
+                zai,
+                crate::config::ZAI_GLM_5_2_MODEL,
+                Some("off"),
+            );
+            assert_eq!(body["thinking"]["type"], json!("disabled"));
+            assert!(body.get("reasoning_effort").is_none());
+        }
+    }
+
+    #[test]
+    fn zai_bigmodel_adjacent_routes_stay_fail_closed() {
+        // BigModel's `/preview` product and a plain-http neighbor are not the
+        // documented Chat dialect, so they keep the gateway treatment: no
+        // Z.ai reasoning fields, including on a forced-thinking model.
+        for neighboring_route in [
+            "https://open.bigmodel.cn/api/paas/v4/preview",
+            "http://open.bigmodel.cn/api/paas/v4",
+        ] {
+            let mut body = json!({"thinking": {"type": "enabled"}});
+            apply_route_reasoning_controls(
+                &mut body,
+                ApiProvider::Zai,
+                neighboring_route,
+                crate::config::ZAI_GLM_5_3_MODEL,
+                Some("max"),
+            );
+            assert!(
+                body.get("reasoning_effort").is_none(),
+                "{neighboring_route} must not gain tiered effort"
+            );
+            assert!(
+                body.get("thinking").is_none(),
+                "{neighboring_route} must not keep the Z.ai thinking object"
+            );
+        }
     }
 
     #[test]

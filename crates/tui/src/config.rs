@@ -10400,8 +10400,8 @@ pub(crate) fn is_exact_zai_chat_route(provider: ApiProvider, base_url: &str) -> 
 ///
 /// GLM-5.2 is the verified member. GLM-5.3 and GLM-5.3-Flash inherit it
 /// because their catalog rows inherit GLM-5.2's `reasoning_options`
-/// wholesale. If Z.ai publishes different reasoning controls, this
-/// predicate is where they split.
+/// wholesale. Where the 5.3 family does diverge — forced thinking — is
+/// captured by [`is_exact_zai_forced_thinking_route`].
 #[must_use]
 pub(crate) fn is_exact_zai_tiered_effort_route(
     provider: ApiProvider,
@@ -10410,7 +10410,26 @@ pub(crate) fn is_exact_zai_tiered_effort_route(
 ) -> bool {
     is_exact_zai_chat_route(provider, base_url)
         && (model.trim().eq_ignore_ascii_case(ZAI_GLM_5_2_MODEL)
-            || model.trim().eq_ignore_ascii_case(ZAI_GLM_5_3_MODEL)
+            || is_exact_zai_forced_thinking_route(provider, base_url, model))
+}
+
+/// Whether a route is exactly first-party Z.ai GLM-5.3 or GLM-5.3-Flash.
+///
+/// Both BigModel (`docs.bigmodel.cn/cn/guide/capabilities/thinking`) and
+/// Z.ai (`docs.z.ai/guides/capabilities/thinking`) document the 5.3 family
+/// as forced-thinking: `thinking.type: "disabled"` is rejected with an error
+/// and `reasoning_effort` accepts only `low` / `high` / `max`. The migration
+/// note for a former `disabled` payload is `enabled` + `reasoning_effort:
+/// "low"`. GLM-5.2 stays outside this predicate because it still honours
+/// the generic disabled toggle.
+#[must_use]
+pub(crate) fn is_exact_zai_forced_thinking_route(
+    provider: ApiProvider,
+    base_url: &str,
+    model: &str,
+) -> bool {
+    is_exact_zai_chat_route(provider, base_url)
+        && (model.trim().eq_ignore_ascii_case(ZAI_GLM_5_3_MODEL)
             || model.trim().eq_ignore_ascii_case(ZAI_GLM_5_3_FLASH_MODEL))
 }
 
