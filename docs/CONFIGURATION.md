@@ -2848,9 +2848,14 @@ rather than snippets. Set `[search] api_key` to your `ay_live_...` key, or the
 `SOFYA_API_KEY` env var. This is a search-tool backend only; it does not add a
 Sofya model provider.
 
+**Serply** ([serply.io](https://serply.io)) returns Google organic results with
+title, URL, and snippet. Set `[search] api_key` to your Serply key, or the
+`SERPLY_API_KEY` env var. This is a search-tool backend only; it does not add a
+Serply model provider.
+
 ```toml
 [search]
-provider = "firecrawl" # also duckduckgo | bing | tavily | bocha | metaso | searxng | baidu | volcengine | sofya
+provider = "firecrawl" # also duckduckgo | bing | tavily | bocha | metaso | searxng | baidu | volcengine | sofya | serply
 # base_url = "https://search.example/" # optional with provider = "duckduckgo"; required with "searxng"
 # api_key = "YOUR_KEY" # optional for firecrawl; required by the other API providers
 ```

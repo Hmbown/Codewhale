@@ -1338,9 +1338,11 @@ exec_policy = true
 
 **Sofya**([sofya.co](https://sofya.co))返回完整提取页面内容而不是片段。把 `[search] api_key` 设为你的 `ay_live_...` key，或用 `SOFYA_API_KEY` 环境变量。这只是搜索工具后端；它不添加 Sofya 模型 provider。
 
+**Serply**([serply.io](https://serply.io))返回 Google 自然搜索结果，包含标题、URL 和摘要片段。把 `[search] api_key` 设为你的 Serply key，或用 `SERPLY_API_KEY` 环境变量。这只是搜索工具后端；它不添加 Serply 模型 provider。
+
 ```toml
 [search]
-provider = "firecrawl" # 也 duckduckgo | bing | tavily | bocha | metaso | searxng | baidu | volcengine | sofya
+provider = "firecrawl" # 也 duckduckgo | bing | tavily | bocha | metaso | searxng | baidu | volcengine | sofya | serply
 # base_url = "https://search.example/" # provider = "duckduckgo" 时可选;"searxng" 时必填
 # api_key = "YOUR_KEY" # firecrawl 可选;其他 API 提供商必填
 ```

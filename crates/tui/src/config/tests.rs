@@ -2009,6 +2009,35 @@ fn sofya_search_provider_parses_and_round_trips() {
 }
 
 #[test]
+fn explicit_serply_search_provider_is_preserved() {
+    let config: Config = toml::from_str(
+        r#"
+        [search]
+        provider = "serply"
+        "#,
+    )
+    .expect("serply search config");
+
+    assert_eq!(
+        config.search.and_then(|search| search.provider),
+        Some(SearchProvider::Serply)
+    );
+}
+
+#[test]
+fn serply_search_provider_parses_and_round_trips() {
+    assert_eq!(
+        SearchProvider::parse("serply"),
+        Some(SearchProvider::Serply)
+    );
+    assert_eq!(
+        SearchProvider::parse("Serply"),
+        Some(SearchProvider::Serply)
+    );
+    assert_eq!(SearchProvider::Serply.as_str(), "serply");
+}
+
+#[test]
 fn live_search_provider_update_preserves_environment_precedence() {
     let _guard = lock_test_env();
     let previous_codewhale = env::var_os("CODEWHALE_SEARCH_PROVIDER");
