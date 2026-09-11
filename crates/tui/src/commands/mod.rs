@@ -9,6 +9,12 @@
 mod contract;
 pub mod discovery;
 mod groups;
+
+// FEAT-025 host services for the session-export slice: the shared recovery
+// writer and the protected export-destination resolver/writer. Declared at the
+// `commands` root so they stay outside `groups/session`, which FEAT-043 moves
+// to `codewhale-commands`.
+mod session_export_host;
 pub mod traits;
 pub mod user_commands;
 pub mod user_registry;
@@ -2074,6 +2080,8 @@ mod tests {
             "rc",
             "remote-env",
             "title",
+            // FEAT-025 session export slice.
+            "export",
         ];
         for info in command_infos() {
             if info.name == "feat015ctx" || MIGRATED_GROUPS.contains(&info.name) {
@@ -2751,13 +2759,11 @@ mod tests {
                 "/{name} must be pure (no host context bundle)"
             );
         }
-        // Out-of-scope session commands remain legacy for FEAT-025/026.
-        for name in ["export", "structcopy"] {
-            assert!(
-                !registry().has_contextual_handler(name),
-                "/{name} must stay on the legacy dispatch until its owning FEAT"
-            );
-        }
+        // Out-of-scope session command remains legacy for FEAT-026.
+        assert!(
+            !registry().has_contextual_handler("structcopy"),
+            "/structcopy must stay on the legacy dispatch until its owning FEAT"
+        );
     }
 
     // ---------------------------------------------------------------------
@@ -2802,13 +2808,11 @@ mod tests {
             CommandCapabilities::SESSION_CONTROL.union(CommandCapabilities::PRESENTATION),
             "/remote-env declares control plus presentation only"
         );
-        // FEAT-025/FEAT-026 leaves remain legacy until their owning FEATs.
-        for name in ["export", "structcopy"] {
-            assert!(
-                !registry().has_contextual_handler(name),
-                "/{name} must stay on the legacy dispatch"
-            );
-        }
+        // FEAT-026 leaf remains legacy until its owning FEAT.
+        assert!(
+            !registry().has_contextual_handler("structcopy"),
+            "/structcopy must stay on the legacy dispatch"
+        );
     }
 
     #[test]
@@ -2920,5 +2924,114 @@ mod tests {
         assert!(!resume.is_error);
         assert!(resume.action.is_none());
         assert!(resume.message.is_none());
+    }
+
+    // ---------------------------------------------------------------------
+    // FEAT-025: session export entry registers through the portable bridge
+    // (D1/D3/D5). `/export` (alias `/daochu`) declares exactly SESSION_EXPORT;
+    // `/structcopy` remains a direct host handler for FEAT-026, so the root
+    // `session` frontier stays pending.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn feat025_export_entry_registers_through_portable_bridge() {
+        use codewhale_command_contract::handler::{CommandCapabilities, CommandHandler};
+
+        assert!(
+            registry().has_contextual_handler("export"),
+            "/export must register through the portable bridge"
+        );
+        assert!(
+            registry().has_contextual_handler("daochu"),
+            "/daochu must resolve to the same portable bridge entry"
+        );
+
+        let handler = registry()
+            .get("export")
+            .expect("entry")
+            .contextual_handler()
+            .expect("contextual handler");
+        let CommandHandler::Contextual { capabilities, .. } = handler else {
+            panic!("/export must be contextual");
+        };
+        assert_eq!(
+            capabilities,
+            CommandCapabilities::SESSION_EXPORT,
+            "/export declares export authority only"
+        );
+
+        // Least authority is catalogue-wide: no other registration may declare
+        // the session-export capability.
+        let export_declarers: Vec<&str> = registry()
+            .iter()
+            .filter(|command| {
+                command
+                    .contextual_handler()
+                    .is_some_and(|handler| match handler {
+                        CommandHandler::Contextual { capabilities, .. } => {
+                            capabilities.contains(CommandCapabilities::SESSION_EXPORT)
+                        }
+                        CommandHandler::Pure(_) => false,
+                    })
+            })
+            .map(|command| command.info().name)
+            .collect();
+        assert_eq!(
+            export_declarers,
+            vec!["export"],
+            "exactly one registration may declare SESSION_EXPORT"
+        );
+
+        // The legacy function registration was removed for export only: the
+        // contextual entry has no direct host fallback, while `/structcopy`
+        // keeps its concrete-App `FunctionCommand` until FEAT-026.
+        let mut app = create_test_app();
+        let legacy = registry()
+            .get("export")
+            .expect("entry")
+            .execute(&mut app, None);
+        assert_eq!(
+            legacy.message.as_deref(),
+            Some("Error: command has no executable handler"),
+            "/export must not keep a legacy function registration"
+        );
+        assert!(
+            !registry().has_contextual_handler("structcopy"),
+            "/structcopy must stay on the legacy dispatch until FEAT-026"
+        );
+    }
+
+    #[test]
+    fn feat025_export_registered_handler_fails_safely_without_authority() {
+        // The dispatcher builds the envelope from the declared capabilities and
+        // calls this exact handler object. A narrower envelope that omits the
+        // export facet must return the safe error before parsing or performing
+        // any projection, clipboard, recovery, resolution, or write operation.
+        let handler = registry()
+            .get("export")
+            .expect("entry")
+            .contextual_handler()
+            .expect("contextual handler");
+        let codewhale_command_contract::handler::CommandHandler::Contextual {
+            handler: contextual,
+            ..
+        } = handler
+        else {
+            panic!("/export must be contextual");
+        };
+
+        for arg in [None, Some("clipboard"), Some("file out.md")] {
+            let result = contextual(
+                codewhale_command_contract::handler::CommandContexts::empty(),
+                arg,
+            );
+            assert!(result.is_error, "{arg:?} must fail without authority");
+            assert_eq!(
+                result.message.as_deref(),
+                Some("Error: Command capability unavailable: session_export"),
+                "{arg:?} must keep the exact safe error"
+            );
+            assert!(result.action.is_none(), "{arg:?} must produce no action");
+        }
     }
 }
