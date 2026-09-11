@@ -26,15 +26,7 @@ export const CHANGELOG: ChangelogRelease[] = [
     "date": null,
     "unreleased": true,
     "compareUrl": "https://github.com/Hmbown/CodeWhale/compare/v0.9.12...HEAD",
-    "sections": [
-      {
-        "heading": "Fixed",
-        "items": [
-          "Gemini tool-call replays rejected by compatible gateways for a missing thought_signature now explain how to recover: use the built-in google provider or a gateway that preserves signatures, then start a new session. Gateways that manage signatures themselves continue to work. Reported by @Hmbown (#6048)."
-        ],
-        "itemCount": 1
-      }
-    ]
+    "sections": []
   },
   {
     "version": "0.9.13",
