@@ -1,9 +1,10 @@
 # Dot-whale habitat and Watch
 
 The underwater transcript uses the portable 980-point whale for its completion
-visitor. The whale is the home form of a persistent field of dots. The intended
-product lets those dots reorganize to express actual work, beyond this first
-set of authored gaits. This slice
+visitor. The whale is the home form of a persistent field of dots. Version 2
+reorganizes those dots into reasoning knots, woven code, filesystem branches,
+browser layers, circulating traffic and open decision junctions. Original
+recordings retain version 1 behavior; new habitats use version 2. This slice
 replaces the old `≈≈>` / spray / fluke glyph sequence. The explicit Watch panel
 adds foreground telemetry through the same world and score used by native and
 web hosts. Rust audio output remains unfinished.
@@ -79,7 +80,7 @@ the next world boundary; the world's accepted tape remains the replay authority.
 Liveness pulses do not count as repeated tool calls. Silence does not stretch
 occupancy across gaps. Error receipts create a current onset, rather than moving
 a failure back to the operation's start. Typed `ShellPhase::Waiting/Approval`
-can extend an already witnessed human request, preserving the needs ladder.
+can extend an already witnessed human request, preserving the outstanding request without approach-to-owner steering.
 
 The workspace's existing QuickJS dependency runs the actual world and score on
 one lazy worker thread: 64 MiB memory, 128 queued commands, at most ten seconds
@@ -132,7 +133,9 @@ source and liveness contracts are documented in `pet/README.md`.
 The full TUI binary builds offline, its foreground metadata projection test
 passes, and the real PTY walkthrough covers Watch selection, keyboard, mouse
 and resizing down to 40x12. Receipts and source hashes are in
-`CW/artifacts/pet-review-20260912/`. The full product unit suite was not run.
+`CW/artifacts/pet-review-20260912/`. Hosted macOS testing on the initial branch ran 15,418 tests with one Watch-tab
+golden mismatch; its header is corrected in the transformation update. The
+updated head still needs its own hosted verdict.
 
 Local render fixtures exercise the actual ocean, glyph and ambient-life modules
 with literal shell enums extracted from `underwater.rs`; they do not run an

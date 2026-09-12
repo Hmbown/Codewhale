@@ -10,18 +10,18 @@ export class PetNative {
   private world: PetWorld;
   private engine = new PetEngineTelemetry();
   private engineTick = 0;
-  constructor(pointsJSON: string, tapeJSONL = '', interactionsJSON = '[]', live = false) {
+  constructor(pointsJSON: string, tapeJSONL = '', interactionsJSON = '[]', live = false, expressionVersion: 1 | 2 = 2) {
     const points = JSON.parse(pointsJSON) as [number, number][];
     if (!Array.isArray(points) || points.length !== 980 || points.some(p => !Array.isArray(p) || p.length !== 2 || !p.every(n => Number.isFinite(n) && Math.abs(n) <= 1)))
       throw new Error('Invalid native whale body.');
-    this.world = new PetWorld(points, live ? compilePetTelemetry([]) : decodePetJSONL(tapeJSONL), JSON.parse(interactionsJSON) as PetInteraction[]);
+    this.world = new PetWorld(points, live ? compilePetTelemetry([]) : decodePetJSONL(tapeJSONL), JSON.parse(interactionsJSON) as PetInteraction[], expressionVersion);
   }
   step(dt: number, motion: boolean): string { this.world.step(dt, { motion, sensitivity: 1 }); return this.snapshot(); }
   snapshot(): string { return JSON.stringify({ ...this.world.frame, voices: this.world.voices, digest: digest(this.world.sim) }); }
   interact(kind: PetInteraction['kind'], x: number, y: number): void { this.world.interact(kind, x, y); }
   interactions(): string { return JSON.stringify(this.world.interactions); }
   accept(packet: string): void { this.world.acceptTelemetry(JSON.parse(packet)); }
-  recording(withCheckpoint = false): string { return JSON.stringify({ petReplayVersion: 1, tape: this.world.tape,
+  recording(withCheckpoint = false): string { return JSON.stringify({ petReplayVersion: 1, expressionVersion: this.world.sim.expressionVersion, tape: this.world.tape,
     interactions: this.world.interactions, ...(withCheckpoint ? { checkpoint: this.world.checkpoint() } : {}) }); }
   checkpoint(): string { return JSON.stringify(this.world.checkpoint()); }
   restoreCheckpoint(text: string): void {
@@ -32,6 +32,8 @@ export class PetNative {
     if (text.length > 8 * 1024 * 1024) throw new Error('Native habitat exceeds 8 MiB.');
     const r = JSON.parse(text);
     if (!r || r.petReplayVersion !== 1 || !Array.isArray(r.tape) || !Array.isArray(r.interactions)) throw new Error('Invalid native habitat.');
+    if (r.expressionVersion !== undefined && ![1, 2].includes(r.expressionVersion)) throw new Error('Unsupported pet expression version.');
+    if ((r.expressionVersion ?? 1) !== (r.checkpoint?.sim?.expressionVersion ?? 1)) throw new Error('Pet expression version does not match its checkpoint.');
     this.restoreHistory(r.tape, r.interactions, r.checkpoint);
   }
   private restoreHistory(tape: PetWorld['tape'], interactions: PetWorld['interactions'], checkpoint: unknown): void {

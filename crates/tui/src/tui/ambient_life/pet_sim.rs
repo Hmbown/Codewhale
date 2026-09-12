@@ -240,7 +240,7 @@ pub const CHANNELS: [Channel; N_CHANNELS] = [
         freq: 391.99,
         sustained: false,
         arch: Archetype::Address,
-        form: "it turns to face you",
+        form: "decision · junction",
     },
     Channel {
         key: ChannelId::Other,
@@ -271,7 +271,7 @@ impl Mulberry32 {
     pub fn new(seed: u32) -> Self {
         Mulberry32 { a: seed }
     }
-    pub fn next(&mut self) -> f64 {
+    pub fn next_f64(&mut self) -> f64 {
         self.a = self.a.wrapping_add(0x6D2B79F5);
         let mut t = self.a;
         t = (t ^ (t >> 15)).wrapping_mul(t | 1);
@@ -311,8 +311,75 @@ pub struct Frame {
     pub work: f64,
 }
 
-/// The gait field — a velocity field on the body, not a silhouette.
+/// Version 2 fields preserve particle identity and consume no random draws.
+fn field_target(q: &Particle, t: f64, act: f64, att: f64, key: ChannelId) -> Option<(f64, f64)> {
+    let u = q.s * 2.0 - 1.0;
+    let lane = f64::from(q.pod) - 2.5;
+    let a = q.s * std::f64::consts::PI * 2.0;
+    let flow = t * (0.35 + act * 0.65);
+    Some(match key {
+        ChannelId::Reasoning => {
+            let ring = 0.34 + 0.105 * (a * 3.0 + flow + lane * 0.18).cos();
+            (
+                ring * (a * 2.0 + flow * 0.3).cos(),
+                ring * (a * 2.0 + flow * 0.3).sin() * 0.7 + 0.10 * (a * 3.0 + flow).sin(),
+            )
+        }
+        ChannelId::Memory => (
+            0.46 * (a + lane * 0.1 + flow * 0.25).cos(),
+            lane * 0.082 + 0.052 * (a * 2.0 + flow).sin(),
+        ),
+        ChannelId::Code => (
+            u * 0.57,
+            lane * 0.066
+                + 0.12
+                    * (u * 7.0 + flow * 2.0 + f64::from(q.pod) * std::f64::consts::PI / 3.0).sin(),
+        ),
+        ChannelId::Filesystem => {
+            let branch = ((u + 0.3) / 1.3).max(0.0);
+            (
+                u * 0.56,
+                lane * 0.13 * branch + 0.025 * (u * 8.0 - flow).sin(),
+            )
+        }
+        ChannelId::Tool => {
+            let reach = 0.14 + (u + 1.0) * 0.20 + 0.04 * (flow * 3.0 - u * 4.0).sin();
+            (
+                (f64::from(q.pod) * std::f64::consts::PI / 3.0).cos() * reach,
+                (f64::from(q.pod) * std::f64::consts::PI / 3.0).sin() * reach * 0.8 + q.hy * 0.06,
+            )
+        }
+        ChannelId::Browser => (
+            u * 0.56,
+            lane * 0.083 + 0.035 * (u * 5.0 - flow * 2.0).sin(),
+        ),
+        ChannelId::Network | ChannelId::Communication => {
+            let direction = if key == ChannelId::Communication && q.pod % 2 == 1 {
+                -1.0
+            } else {
+                1.0
+            };
+            let phase = a + flow * direction;
+            (
+                0.54 * phase.cos(),
+                phase.sin() * (0.12 + f64::from(q.pod) * 0.035) + lane * 0.024,
+            )
+        }
+        ChannelId::Human => {
+            let gap = if u < 0.0 { -0.075 } else { 0.075 };
+            (
+                u * 0.47 + gap,
+                lane * 0.10 * u.abs() + 0.012 * (flow + a).sin() * (1.0 - att),
+            )
+        }
+        _ => return None,
+    })
+}
+
+/// Version 1 is retained for saved recordings.
 /// Ported line-for-line from PetSim.ts gaitTarget().
+// Keep the numeric port signature aligned with the TypeScript reference.
+#[allow(clippy::too_many_arguments)]
 fn gait_target(
     q: &Particle,
     t: f64,
@@ -321,6 +388,7 @@ fn gait_target(
     att: f64,
     key: ChannelId,
     work: f64,
+    legacy_expression: bool,
 ) -> (f64, f64) {
     let omega = lerp(4.6, 5.2 + act * 2.8, work);
     let breath = 1.0 + (t * 1.85).sin() * lerp(0.048, 0.018, work);
@@ -454,6 +522,10 @@ fn gait_target(
             gy = q.hy * 0.52 + (t * 0.54 + q.jy).cos() * mill;
         }
     }
+    if !legacy_expression && let Some((x, y)) = field_target(q, t, act, att, key) {
+        gx = x;
+        gy = y;
+    }
     (lerp(px, gx, work), lerp(py, gy, work))
 }
 
@@ -477,6 +549,7 @@ fn still_t(key: ChannelId) -> f64 {
 
 pub struct PetSim {
     pub p: Vec<Particle>,
+    legacy_expression: bool,
     phase: f64,
     clock: f64,
     tear: f64,
@@ -486,6 +559,13 @@ pub struct PetSim {
 }
 
 impl PetSim {
+    /// Select the authored v1 field for historical conformance tapes.
+    pub fn legacy_whale() -> Self {
+        let mut sim = Self::whale();
+        sim.legacy_expression = true;
+        sim
+    }
+
     /// Authored body embedded once; all Rust surfaces use these same points.
     pub fn whale() -> Self {
         let points: Vec<(f64, f64)> = include_str!("whale-points.tsv")
@@ -511,9 +591,9 @@ impl PetSim {
                     y: hy,
                     vx: 0.0,
                     vy: 0.0,
-                    s: rng.next(),
-                    jx: rng.next() * 6.283,
-                    jy: rng.next() * 6.283,
+                    s: rng.next_f64(),
+                    jx: rng.next_f64() * 6.283,
+                    jy: rng.next_f64() * 6.283,
                     pod: (i % 6) as u32,
                     hx,
                     hy,
@@ -530,6 +610,7 @@ impl PetSim {
         let cur = ChannelId::Reasoning;
         PetSim {
             p,
+            legacy_expression: false,
             phase: 0.0,
             clock: 0.0,
             tear: 0.0,
@@ -589,7 +670,16 @@ impl PetSim {
                 q.jx += dt * (0.40 + act * 1.1);
                 q.jy += dt * (0.34 + act * 0.9);
             }
-            let (gx, gy) = gait_target(q, t_gait, act, coh, att, ch.key, work);
+            let (gx, gy) = gait_target(
+                q,
+                t_gait,
+                act,
+                coh,
+                att,
+                ch.key,
+                work,
+                self.legacy_expression,
+            );
             let pod_ang = q.pod as f64 * 1.047 + self.phase * 0.22;
             let tx = gx + (q.jx + q.s * 9.0).sin() * blur * wander + pod_ang.cos() * split;
             let ty = gy + (q.jy + q.s * 7.0).cos() * blur * wander + pod_ang.sin() * split * 0.55;
@@ -673,7 +763,7 @@ pub fn digest(sim: &PetSim) -> String {
         let cy = ((q.y + 0.66) / 1.32 * H as f64).floor() as i32;
         if cx >= 0 && cx < W as i32 && cy >= 0 && cy < H as i32 {
             let i = cy as usize * W + cx as usize;
-            grid[i] = grid[i].saturating_add(1).min(255);
+            grid[i] = grid[i].saturating_add(1);
         }
     }
     let mut h: u64 = 0xcbf29ce484222325;

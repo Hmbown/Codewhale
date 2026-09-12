@@ -63,9 +63,9 @@ export class PetWorld {
   private members = new Map<string, PodMember>();
   private lastStill = '';
 
-  constructor(points: [number, number][], tape: readonly PetBucket[] = [], interactions: readonly PetInteraction[] = []) {
+  constructor(points: [number, number][], tape: readonly PetBucket[] = [], interactions: readonly PetInteraction[] = [], expressionVersion: 1 | 2 = 2) {
     if (tape.length > 216_000 || interactions.length > 100_000) throw new Error('Pet recording exceeds its input limit.');
-    this.sim = new PetSim(points);
+    this.sim = new PetSim(points, 0xC0FFEE, expressionVersion);
     this.tapeLog = structuredClone([...tape]);
     this.interactionLog = structuredClone([...interactions]);
     for (let i = 0; i < this.tape.length; i++) {
@@ -137,7 +137,7 @@ export class PetWorld {
       throw new Error('Invalid pet world checkpoint.');
     validatePetState(c.frame.state);
     renderPetPCM(c.voices, 0, 0);
-    const world = new PetWorld(points, tape, interactions);
+    const world = new PetWorld(points, tape, interactions, c.sim?.expressionVersion ?? 1);
     if (c.history !== world.historyDigest()
       || c.bucketIndex >= 0 && world.tape[c.bucketIndex].simTimeMs > c.frame.timeMs + 1e-7
       // acceptTelemetry may fill past gaps after the most recent fixed tick.
@@ -246,7 +246,7 @@ export class PetWorld {
     }
     const sleeping = this.behaviour === 'doze';
     if (sleeping) { this.targetY = .65; this.targetX = .15; }
-    if (needs === 'approach' || needs === 'call') { this.targetX = 0; this.targetY = .3; }
+    if (this.sim.expressionVersion === 1 && (needs === 'approach' || needs === 'call')) { this.targetX = 0; this.targetY = .3; }
     const move = sleeping ? .004 : this.behaviour === 'drift' ? .006 : .018;
     const dx = this.targetX - this.x;
     this.x += dx * move; this.y += (this.targetY - this.y) * move;
@@ -256,7 +256,7 @@ export class PetWorld {
     const state: PetState = {
       activity: telemetry?.activity ?? (wild ? sleeping ? .05 : .18 : .12),
       coherence: telemetry?.coherence ?? (wild ? .94 : .25),
-      attention: Math.max(telemetry?.attention ?? 0, addressed ? .85 : 0, needs === 'call' ? 1 : 0),
+      attention: Math.max(telemetry?.attention ?? 0, addressed ? .85 : 0, this.sim.expressionVersion === 1 && needs === 'call' ? 1 : 0),
       // A touch changes orientation, never hides an instrumentation gap.
       channel: addressed ? 'human' : telemetry?.channel ?? 'other',
       observed: telemetry?.observed ?? (wild ? 1 : 0),

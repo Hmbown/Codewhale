@@ -5,9 +5,13 @@ real activity can reorganize that material into a living expression of the work.
 This is an evolving audiovisual instrument, not a mascot that asks for attention.
 
 The current implementation has a persistent 980-particle world, thirteen event
-categories, seven authored gaits, deterministic audio, replay and checkpoints.
-More expressive forms driven by work are the next design step; arbitrary-form
-transformations are not implemented yet. Missing telemetry stays visibly unknown.
+categories, deterministic audio, replay and checkpoints. Version 2 reorganizes
+the same particles into knots for reasoning, woven strands for code, branches for
+filesystem activity, scanning layers for browsing, and circulating paths for
+network traffic. Human input opens a junction in the field. It does not steer
+the creature toward its owner. The whale re-forms as activity settles.
+These are authored expressions of measured activity, not generated pictures of
+arbitrary task content. Missing telemetry stays visibly unknown.
 
 ## Build from this repository
 
@@ -94,6 +98,11 @@ The thin wire is JSONL, one flat version-1 `PetBucket` per line: PetState plus
 `errors`, `agentIds` and `waiting`. Sequence starts at zero in 400 ms steps.
 Saved replay JSON contains this accepted tape and the interaction journal;
 a versioned checkpoint also contains particle, random-stream and score cursors.
+Recordings also store `expressionVersion`: new worlds use version 2; recordings
+without this field retain the original version 1 particle and behavior rules.
+Checkpoints must agree with the recording's expression version. Unsupported or
+mismatched versions are rejected before changing the current world. This keeps
+old saved habitats replayable while letting new worlds change their visual form.
 The older TSV is a particle conformance tape and cannot preserve audio onsets.
 
 macOS watches `~/.codewhale/pet-state`. iOS watches `pet-state` in Documents.
@@ -118,5 +127,5 @@ Native habitats are limited to 8 MiB; the QuickJS worker has a 64 MiB memory
 limit. Two-hour restoration has been exercised, but serializing full long tapes
 still costs seconds in QuickJS. History rotation and long-session performance
 remain open. TUI audio output, Android Compose/app/audio, macOS popover inspection,
-authenticated Runtime attachment, richer forms and final listening/power quality
+authenticated Runtime attachment, content-driven forms and final listening/power quality
 are unfinished. This branch is a reviewable prototype, not a release candidate.

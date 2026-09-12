@@ -27,7 +27,7 @@ public enum PetCoreError: Error, LocalizedError {
     private let world: JSValue
     private var failure: String?
 
-    public init(points: [(Double, Double)], bundle: URL, tape: String = "", interactions: String = "[]", live: Bool = false, saved: Data? = nil) throws {
+    public init(points: [(Double, Double)], bundle: URL, tape: String = "", interactions: String = "[]", live: Bool = false, saved: Data? = nil, expressionVersion: Int = 2) throws {
         guard let context = JSContext() else { throw PetCoreError.invalid("Unable to create the pet runtime.") }
         self.context = context
         let script = try String(contentsOf: bundle, encoding: .utf8)
@@ -35,7 +35,7 @@ public enum PetCoreError: Error, LocalizedError {
         if let error = context.exception { throw PetCoreError.invalid(error.toString()) }
         let pointData = try JSONSerialization.data(withJSONObject: points.map { [$0.0, $0.1] })
         guard let constructor = context.objectForKeyedSubscript("PetNative"),
-              let world = constructor.construct(withArguments: [String(decoding: pointData, as: UTF8.self), tape, interactions, live]), context.exception == nil
+              let world = constructor.construct(withArguments: [String(decoding: pointData, as: UTF8.self), tape, interactions, live, expressionVersion]), context.exception == nil
         else { throw PetCoreError.invalid(context.exception?.toString() ?? "Invalid pet recording.") }
         if let saved {
             guard saved.count <= 8 * 1024 * 1024, let text = String(data: saved, encoding: .utf8) else { throw PetCoreError.invalid("Invalid pet habitat file.") }
@@ -50,7 +50,7 @@ public enum PetCoreError: Error, LocalizedError {
         else { throw PetCoreError.invalid(context.exception?.toString() ?? "Invalid pet recording.") }
         self.world = world
         self.frame = try JSONDecoder().decode(PetWorldFrame.self, from: Data(text.utf8))
-        self.sim = PetSim(points: points)
+        self.sim = PetSim(points: points, expressionVersion: expressionVersion)
         if saved != nil {
             struct Projection: Decodable { let sim: PetParticleCheckpoint }
             guard let text = world.invokeMethod("checkpoint", withArguments: [])?.toString(), context.exception == nil

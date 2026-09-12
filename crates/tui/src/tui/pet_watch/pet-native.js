@@ -18,11 +18,11 @@ class PetNative {
     world;
     engine = new pet_engine_js_1.PetEngineTelemetry();
     engineTick = 0;
-    constructor(pointsJSON, tapeJSONL = '', interactionsJSON = '[]', live = false) {
+    constructor(pointsJSON, tapeJSONL = '', interactionsJSON = '[]', live = false, expressionVersion = 2) {
         const points = JSON.parse(pointsJSON);
         if (!Array.isArray(points) || points.length !== 980 || points.some(p => !Array.isArray(p) || p.length !== 2 || !p.every(n => Number.isFinite(n) && Math.abs(n) <= 1)))
             throw new Error('Invalid native whale body.');
-        this.world = new pet_world_js_1.PetWorld(points, live ? (0, pet_telemetry_js_1.compilePetTelemetry)([]) : (0, pet_telemetry_js_1.decodePetJSONL)(tapeJSONL), JSON.parse(interactionsJSON));
+        this.world = new pet_world_js_1.PetWorld(points, live ? (0, pet_telemetry_js_1.compilePetTelemetry)([]) : (0, pet_telemetry_js_1.decodePetJSONL)(tapeJSONL), JSON.parse(interactionsJSON), expressionVersion);
     }
     step(dt, motion) { this.world.step(dt, { motion, sensitivity: 1 }); return this.snapshot(); }
     snapshot() { return JSON.stringify({ ...this.world.frame, voices: this.world.voices, digest: (0, pet_sim_js_1.digest)(this.world.sim) }); }
@@ -30,7 +30,7 @@ class PetNative {
     interactions() { return JSON.stringify(this.world.interactions); }
     accept(packet) { this.world.acceptTelemetry(JSON.parse(packet)); }
     recording(withCheckpoint = false) {
-        return JSON.stringify({ petReplayVersion: 1, tape: this.world.tape,
+        return JSON.stringify({ petReplayVersion: 1, expressionVersion: this.world.sim.expressionVersion, tape: this.world.tape,
             interactions: this.world.interactions, ...(withCheckpoint ? { checkpoint: this.world.checkpoint() } : {}) });
     }
     checkpoint() { return JSON.stringify(this.world.checkpoint()); }
@@ -45,6 +45,10 @@ class PetNative {
         const r = JSON.parse(text);
         if (!r || r.petReplayVersion !== 1 || !Array.isArray(r.tape) || !Array.isArray(r.interactions))
             throw new Error('Invalid native habitat.');
+        if (r.expressionVersion !== undefined && ![1, 2].includes(r.expressionVersion))
+            throw new Error('Unsupported pet expression version.');
+        if ((r.expressionVersion ?? 1) !== (r.checkpoint?.sim?.expressionVersion ?? 1))
+            throw new Error('Pet expression version does not match its checkpoint.');
         this.restoreHistory(r.tape, r.interactions, r.checkpoint);
     }
     restoreHistory(tape, interactions, checkpoint) {
@@ -150,10 +154,10 @@ class PetWorld {
     food = null;
     members = new Map();
     lastStill = '';
-    constructor(points, tape = [], interactions = []) {
+    constructor(points, tape = [], interactions = [], expressionVersion = 2) {
         if (tape.length > 216_000 || interactions.length > 100_000)
             throw new Error('Pet recording exceeds its input limit.');
-        this.sim = new pet_sim_js_1.PetSim(points);
+        this.sim = new pet_sim_js_1.PetSim(points, 0xC0FFEE, expressionVersion);
         this.tapeLog = structuredClone([...tape]);
         this.interactionLog = structuredClone([...interactions]);
         for (let i = 0; i < this.tape.length; i++) {
@@ -223,7 +227,7 @@ class PetWorld {
             throw new Error('Invalid pet world checkpoint.');
         (0, pet_sim_js_1.validatePetState)(c.frame.state);
         (0, pet_audio_js_1.renderPetPCM)(c.voices, 0, 0);
-        const world = new PetWorld(points, tape, interactions);
+        const world = new PetWorld(points, tape, interactions, c.sim?.expressionVersion ?? 1);
         if (c.history !== world.historyDigest()
             || c.bucketIndex >= 0 && world.tape[c.bucketIndex].simTimeMs > c.frame.timeMs + 1e-7
             // acceptTelemetry may fill past gaps after the most recent fixed tick.
@@ -364,7 +368,7 @@ class PetWorld {
             this.targetY = .65;
             this.targetX = .15;
         }
-        if (needs === 'approach' || needs === 'call') {
+        if (this.sim.expressionVersion === 1 && (needs === 'approach' || needs === 'call')) {
             this.targetX = 0;
             this.targetY = .3;
         }
@@ -378,7 +382,7 @@ class PetWorld {
         const state = {
             activity: telemetry?.activity ?? (wild ? sleeping ? .05 : .18 : .12),
             coherence: telemetry?.coherence ?? (wild ? .94 : .25),
-            attention: Math.max(telemetry?.attention ?? 0, addressed ? .85 : 0, needs === 'call' ? 1 : 0),
+            attention: Math.max(telemetry?.attention ?? 0, addressed ? .85 : 0, this.sim.expressionVersion === 1 && needs === 'call' ? 1 : 0),
             // A touch changes orientation, never hides an instrumentation gap.
             channel: addressed ? 'human' : telemetry?.channel ?? 'other',
             observed: telemetry?.observed ?? (wild ? 1 : 0),
@@ -532,7 +536,7 @@ exports.CHANNELS = [
     { key: 'agent', label: 'Subagent activity', color: '#b09acb', freq: 220.00, sustained: true, arch: 'pod', form: 'pod · peers' },
     { key: 'orchestration', label: 'Orchestration', color: '#6c8798', freq: 98.00, sustained: true, arch: 'pod', form: 'pod · hub' },
     { key: 'error', label: 'Errors / exceptions', color: '#e79186', freq: 185.00, sustained: false, arch: 'tear', form: 'torn · irregular' },
-    { key: 'human', label: 'Human interaction', color: '#c2b787', freq: 391.99, sustained: false, arch: 'address', form: 'it turns to face you' },
+    { key: 'human', label: 'Human interaction', color: '#c2b787', freq: 391.99, sustained: false, arch: 'address', form: 'decision · junction' },
     { key: 'other', label: 'Unclassified', color: '#738492', freq: 146.83, sustained: false, arch: 'drift', form: 'drifting · unformed' },
 ];
 exports.CHANNEL_INDEX = Object.fromEntries(exports.CHANNELS.map((c, i) => [c.key, i]));
@@ -562,9 +566,42 @@ function mulberry32(seed) {
             a = state;
         } });
 }
-// The gait field — the exact same math as grammar.js gaitTarget(). A gait is a
-// velocity field on the whale's body, not a silhouette.
-function gaitTarget(q, t, act, coh, att, key, work, podSlots) {
+/** Work reorganizes the same particles; no new random draws or invented facts.
+ * These are expressive fields, not diagrams of unobserved network/file topology. */
+function fieldTarget(q, t, act, att, key) {
+    const u = q.s * 2 - 1, lane = q.pod - 2.5, a = q.s * Math.PI * 2;
+    const flow = t * (.35 + act * .65);
+    if (key === 'reasoning') {
+        const ring = .34 + .105 * Math.cos(a * 3 + flow + lane * .18);
+        return [ring * Math.cos(a * 2 + flow * .3), ring * Math.sin(a * 2 + flow * .3) * .7 + .10 * Math.sin(a * 3 + flow)];
+    }
+    if (key === 'memory')
+        return [.46 * Math.cos(a + lane * .1 + flow * .25), lane * .082 + .052 * Math.sin(a * 2 + flow)];
+    if (key === 'code')
+        return [u * .57, lane * .066 + .12 * Math.sin(u * 7 + flow * 2 + q.pod * Math.PI / 3)];
+    if (key === 'filesystem') {
+        const branch = Math.max(0, (u + .3) / 1.3);
+        return [u * .56, lane * .13 * branch + .025 * Math.sin(u * 8 - flow)];
+    }
+    if (key === 'tool') {
+        const reach = .14 + (u + 1) * .20 + .04 * Math.sin(flow * 3 - u * 4);
+        return [Math.cos(q.pod * Math.PI / 3) * reach, Math.sin(q.pod * Math.PI / 3) * reach * .8 + q.hy * .06];
+    }
+    if (key === 'browser')
+        return [u * .56, lane * .083 + .035 * Math.sin(u * 5 - flow * 2)];
+    if (key === 'network' || key === 'communication') {
+        const direction = key === 'communication' && q.pod % 2 === 1 ? -1 : 1;
+        const phase = a + flow * direction;
+        return [.54 * Math.cos(phase), Math.sin(phase) * (.12 + q.pod * .035) + lane * .024];
+    }
+    if (key === 'human') {
+        const gap = u < 0 ? -.075 : .075;
+        return [u * .47 + gap, lane * .10 * Math.abs(u) + .012 * Math.sin(flow + a) * (1 - att)];
+    }
+    return undefined;
+}
+// Version 1 retains the original authored gait for existing recordings.
+function gaitTarget(q, t, act, coh, att, key, work, podSlots, expressionVersion = 1) {
     const { hx, hy, ang, rad, tail, s, pod, jx, jy } = q;
     const omega = lerp(4.6, 5.2 + act * 2.8, work);
     const breath = 1 + Math.sin(t * 1.85) * lerp(0.048, 0.018, work);
@@ -680,6 +717,11 @@ function gaitTarget(q, t, act, coh, att, key, work, podSlots) {
         gx = hx * 0.52 + Math.sin(t * 0.72 + jx) * mill;
         gy = hy * 0.52 + Math.cos(t * 0.54 + jy) * mill;
     }
+    if (expressionVersion === 2) {
+        const field = fieldTarget(q, t, act, att, key);
+        if (field)
+            [gx, gy] = field;
+    }
     return [lerp(px, gx, work), lerp(py, gy, work)];
 }
 // Fixed reduced-motion clock per channel, so ticks still point along the gait.
@@ -689,6 +731,7 @@ const STILL_T = {
     orchestration: 0.85, error: 0.35, human: 0.05, other: 0.90,
 };
 class PetSim {
+    expressionVersion;
     p;
     phase = 0;
     clock = 0;
@@ -697,7 +740,10 @@ class PetSim {
     col = [...REST_RGB];
     cur;
     frame = { r: REST_RGB[0], g: REST_RGB[1], b: REST_RGB[2], alpha: 0.3, hollow: false, channel: 'reasoning', arch: 'gyre', work: 0 };
-    constructor(points, seed = 0xC0FFEE) {
+    constructor(points, seed = 0xC0FFEE, expressionVersion = 2) {
+        this.expressionVersion = expressionVersion;
+        if (expressionVersion !== 1 && expressionVersion !== 2)
+            throw new Error('Unsupported pet expression version.');
         const rand = mulberry32(seed);
         this.p = points.map(([hx, hy], i) => {
             const q = {
@@ -713,7 +759,7 @@ class PetSim {
         this.cur = this.prev = exports.CHANNEL_INDEX['reasoning'];
     }
     checkpoint() {
-        return { version: 1, body: this.p.map(p => [p.hx, p.hy, p.s]),
+        return { version: 1, expressionVersion: this.expressionVersion, body: this.p.map(p => [p.hx, p.hy, p.s]),
             particles: this.p.map(p => [p.x, p.y, p.vx, p.vy, p.jx, p.jy, p.tx, p.ty]),
             phase: this.phase, clock: this.clock, tear: this.tear, previous: this.prev, current: this.cur,
             color: [...this.col], frame: { ...this.frame } };
@@ -723,7 +769,7 @@ class PetSim {
     restore(value) {
         const c = value;
         const inRange = (n, low, high) => Number.isFinite(n) && n >= low && n <= high;
-        if (!c || c.version !== 1 || !Array.isArray(c.body) || c.body.length !== this.p.length
+        if (!c || c.version !== 1 || c.expressionVersion !== undefined && ![1, 2].includes(c.expressionVersion) || (c.expressionVersion ?? 1) !== this.expressionVersion || !Array.isArray(c.body) || c.body.length !== this.p.length
             || c.body.some((v, i) => !Array.isArray(v) || v.length !== 3 || v[0] !== this.p[i].hx || v[1] !== this.p[i].hy || v[2] !== this.p[i].s)
             || !Array.isArray(c.particles) || c.particles.length !== this.p.length
             || c.particles.some(v => !Array.isArray(v) || v.length !== 8 || v.some((n, i) => !inRange(n, i === 4 || i === 5 ? 0 : -8, i === 4 || i === 5 ? 1_000_000 : 8)))
@@ -772,7 +818,7 @@ class PetSim {
                 q.jx += dt * (0.40 + act * 1.1);
                 q.jy += dt * (0.34 + act * 0.9);
             }
-            const [gx, gy] = gaitTarget(q, tGait, act, coh, att, ch.key, work, opts.podSlots);
+            const [gx, gy] = gaitTarget(q, tGait, act, coh, att, ch.key, work, opts.podSlots, this.expressionVersion);
             const podAng = q.pod * 1.047 + this.phase * 0.22;
             const tx = gx + Math.sin(q.jx + q.s * 9) * blur * wander + Math.cos(podAng) * split;
             const ty = gy + Math.cos(q.jy + q.s * 7) * blur * wander + Math.sin(podAng) * split * 0.55;

@@ -20,7 +20,7 @@
 export interface PetState {
   activity: number;    // how much work 0..1
   coherence: number;   // converging school vs thrashing 0..1
-  attention: number;   // how much it needs you 0..1
+  attention: number;   // interaction salience 0..1
   channel: string;     // Whalesong semantic category
   observed: number;    // instrumentation coverage 0..1
   roamX: number;       // tank position, -1..1
@@ -64,7 +64,7 @@ export const CHANNELS: Channel[] = [
   { key: 'agent',         label: 'Subagent activity',  color: '#b09acb', freq: 220.00, sustained: true,  arch: 'pod',     form: 'pod · peers' },
   { key: 'orchestration', label: 'Orchestration',      color: '#6c8798', freq:  98.00, sustained: true,  arch: 'pod',     form: 'pod · hub' },
   { key: 'error',         label: 'Errors / exceptions',color: '#e79186', freq: 185.00, sustained: false, arch: 'tear',    form: 'torn · irregular' },
-  { key: 'human',         label: 'Human interaction',  color: '#c2b787', freq: 391.99, sustained: false, arch: 'address', form: 'it turns to face you' },
+  { key: 'human',         label: 'Human interaction',  color: '#c2b787', freq: 391.99, sustained: false, arch: 'address', form: 'decision · junction' },
   { key: 'other',         label: 'Unclassified',       color: '#738492', freq: 146.83, sustained: false, arch: 'drift',   form: 'drifting · unformed' },
 ];
 export const CHANNEL_INDEX: Record<string, number> = Object.fromEntries(CHANNELS.map((c, i) => [c.key, i]));
@@ -115,15 +115,47 @@ export interface Frame {
 
 export interface PetSimCheckpoint {
   version: 1;
+  expressionVersion?: 1 | 2;
   body: number[][];
   particles: number[][];
   phase: number; clock: number; tear: number; previous: number; current: number;
   color: number[]; frame: Frame;
 }
 
-// The gait field — the exact same math as grammar.js gaitTarget(). A gait is a
-// velocity field on the whale's body, not a silhouette.
-function gaitTarget(q: Particle, t: number, act: number, coh: number, att: number, key: string, work: number, podSlots?: PetOpts['podSlots']): [number, number] {
+/** Work reorganizes the same particles; no new random draws or invented facts.
+ * These are expressive fields, not diagrams of unobserved network/file topology. */
+function fieldTarget(q: Particle, t: number, act: number, att: number, key: string): [number, number] | undefined {
+  const u = q.s * 2 - 1, lane = q.pod - 2.5, a = q.s * Math.PI * 2;
+  const flow = t * (.35 + act * .65);
+  if (key === 'reasoning') {
+    const ring = .34 + .105 * Math.cos(a * 3 + flow + lane * .18);
+    return [ring * Math.cos(a * 2 + flow * .3), ring * Math.sin(a * 2 + flow * .3) * .7 + .10 * Math.sin(a * 3 + flow)];
+  }
+  if (key === 'memory') return [.46 * Math.cos(a + lane * .1 + flow * .25), lane * .082 + .052 * Math.sin(a * 2 + flow)];
+  if (key === 'code') return [u * .57, lane * .066 + .12 * Math.sin(u * 7 + flow * 2 + q.pod * Math.PI / 3)];
+  if (key === 'filesystem') {
+    const branch = Math.max(0, (u + .3) / 1.3);
+    return [u * .56, lane * .13 * branch + .025 * Math.sin(u * 8 - flow)];
+  }
+  if (key === 'tool') {
+    const reach = .14 + (u + 1) * .20 + .04 * Math.sin(flow * 3 - u * 4);
+    return [Math.cos(q.pod * Math.PI / 3) * reach, Math.sin(q.pod * Math.PI / 3) * reach * .8 + q.hy * .06];
+  }
+  if (key === 'browser') return [u * .56, lane * .083 + .035 * Math.sin(u * 5 - flow * 2)];
+  if (key === 'network' || key === 'communication') {
+    const direction = key === 'communication' && q.pod % 2 === 1 ? -1 : 1;
+    const phase = a + flow * direction;
+    return [.54 * Math.cos(phase), Math.sin(phase) * (.12 + q.pod * .035) + lane * .024];
+  }
+  if (key === 'human') {
+    const gap = u < 0 ? -.075 : .075;
+    return [u * .47 + gap, lane * .10 * Math.abs(u) + .012 * Math.sin(flow + a) * (1 - att)];
+  }
+  return undefined;
+}
+
+// Version 1 retains the original authored gait for existing recordings.
+function gaitTarget(q: Particle, t: number, act: number, coh: number, att: number, key: string, work: number, podSlots?: PetOpts['podSlots'], expressionVersion = 1): [number, number] {
   const { hx, hy, ang, rad, tail, s, pod, jx, jy } = q;
   const omega = lerp(4.6, 5.2 + act * 2.8, work);
   const breath = 1 + Math.sin(t * 1.85) * lerp(0.048, 0.018, work);
@@ -224,6 +256,10 @@ function gaitTarget(q: Particle, t: number, act: number, coh: number, att: numbe
     gx = hx * 0.52 + Math.sin(t * 0.72 + jx) * mill;
     gy = hy * 0.52 + Math.cos(t * 0.54 + jy) * mill;
   }
+  if (expressionVersion === 2) {
+    const field = fieldTarget(q, t, act, att, key);
+    if (field) [gx, gy] = field;
+  }
   return [lerp(px, gx, work), lerp(py, gy, work)];
 }
 
@@ -244,7 +280,8 @@ export class PetSim {
   private cur: number;
   frame: Frame = { r: REST_RGB[0], g: REST_RGB[1], b: REST_RGB[2], alpha: 0.3, hollow: false, channel: 'reasoning', arch: 'gyre', work: 0 };
 
-  constructor(points: [number, number][], seed = 0xC0FFEE) {
+  constructor(points: [number, number][], seed = 0xC0FFEE, readonly expressionVersion: 1 | 2 = 2) {
+    if (expressionVersion !== 1 && expressionVersion !== 2) throw new Error('Unsupported pet expression version.');
     const rand = mulberry32(seed);
     this.p = points.map(([hx, hy], i) => {
       const q: Particle = {
@@ -261,7 +298,7 @@ export class PetSim {
   }
 
   checkpoint(): PetSimCheckpoint {
-    return { version: 1, body: this.p.map(p => [p.hx, p.hy, p.s]),
+    return { version: 1, expressionVersion: this.expressionVersion, body: this.p.map(p => [p.hx, p.hy, p.s]),
       particles: this.p.map(p => [p.x, p.y, p.vx, p.vy, p.jx, p.jy, p.tx, p.ty]),
       phase: this.phase, clock: this.clock, tear: this.tear, previous: this.prev, current: this.cur,
       color: [...this.col], frame: { ...this.frame } };
@@ -272,7 +309,7 @@ export class PetSim {
   restore(value: unknown): void {
     const c = value as PetSimCheckpoint;
     const inRange = (n: number, low: number, high: number) => Number.isFinite(n) && n >= low && n <= high;
-    if (!c || c.version !== 1 || !Array.isArray(c.body) || c.body.length !== this.p.length
+    if (!c || c.version !== 1 || c.expressionVersion !== undefined && ![1, 2].includes(c.expressionVersion) || (c.expressionVersion ?? 1) !== this.expressionVersion || !Array.isArray(c.body) || c.body.length !== this.p.length
       || c.body.some((v, i) => !Array.isArray(v) || v.length !== 3 || v[0] !== this.p[i].hx || v[1] !== this.p[i].hy || v[2] !== this.p[i].s)
       || !Array.isArray(c.particles) || c.particles.length !== this.p.length
       || c.particles.some(v => !Array.isArray(v) || v.length !== 8 || v.some((n, i) => !inRange(n, i === 4 || i === 5 ? 0 : -8, i === 4 || i === 5 ? 1_000_000 : 8)))
@@ -317,7 +354,7 @@ export class PetSim {
         q.jx += dt * (0.40 + act * 1.1);
         q.jy += dt * (0.34 + act * 0.9);
       }
-      const [gx, gy] = gaitTarget(q, tGait, act, coh, att, ch.key, work, opts.podSlots);
+      const [gx, gy] = gaitTarget(q, tGait, act, coh, att, ch.key, work, opts.podSlots, this.expressionVersion);
       const podAng = q.pod * 1.047 + this.phase * 0.22;
       const tx = gx + Math.sin(q.jx + q.s * 9) * blur * wander + Math.cos(podAng) * split;
       const ty = gy + Math.cos(q.jy + q.s * 7) * blur * wander + Math.sin(podAng) * split * 0.55;

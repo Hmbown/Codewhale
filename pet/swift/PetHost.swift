@@ -65,6 +65,7 @@ public enum PetSource: String, CaseIterable, Identifiable {
                 saved = try files.load(); store = files
             } catch { persistenceMessage = "Habitat storage is unavailable. Existing files were kept. This visit stays in memory." }
             let legacy = source == .wild && saved == nil && store != nil
+            let hasLegacy = legacy && (defaults.object(forKey: "pet.elapsed") != nil || defaults.object(forKey: "pet.interactions") != nil)
             let interactions = legacy ? defaults.string(forKey: "pet.interactions") ?? "[]" : "[]"
             let restoredCore: PetNativeCore
             if let saved {
@@ -73,14 +74,14 @@ public enum PetSource: String, CaseIterable, Identifiable {
                     store = nil; persistenceMessage = "The habitat could not be restored. Its saved file was kept. This visit stays in memory."
                     restoredCore = try PetNativeCore(points: points, bundle: script, tape: tape, live: source == .live)
                 }
-            } else { restoredCore = try PetNativeCore(points: points, bundle: script, tape: tape, interactions: interactions, live: source == .live) }
+            } else { restoredCore = try PetNativeCore(points: points, bundle: script, tape: tape, interactions: interactions, live: source == .live, expressionVersion: hasLegacy ? 1 : 2) }
             core = restoredCore
             message = source == .wild ? "Simulated creature" : source == .demo ? "Synthetic telemetry" : "Waiting for local telemetry"
             if source == .live, let stateURL { watch(stateURL) }
             if legacy {
                 // Only pre-checkpoint preferences need historical simulation.
                 // The first successful atomic save retires both legacy keys.
-                migratingLegacy = defaults.object(forKey: "pet.elapsed") != nil || defaults.object(forKey: "pet.interactions") != nil
+                migratingLegacy = hasLegacy
                 let elapsed = defaults.double(forKey: "pet.elapsed")
                 if elapsed.isFinite && elapsed > 0 && elapsed <= 86_400 {
                     restoring = true

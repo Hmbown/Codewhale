@@ -28,7 +28,7 @@ fn main() {
     let rows: Vec<(f64, PetState)> =
         tape.trim().lines().filter_map(|l| parse_row(l.split('\t').collect())).collect();
 
-    let mut sim = PetSim::whale();
+    let mut sim = if args.iter().any(|s| s == "--legacy") { PetSim::legacy_whale() } else { PetSim::whale() };
 
     if args.get(1).map(|s| s.as_str()) == Some("--frame") {
         let target: usize = args[2].parse().unwrap();

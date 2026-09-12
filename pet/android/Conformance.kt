@@ -25,7 +25,7 @@ fun main(args: Array<String>) {
     val points = File(args[0]).readLines().filter { it.isNotBlank() }.map { row ->
         val c = row.split('\t').map { it.toDouble() }; require(c.size == 2); Pair(c[0], c[1])
     }
-    val sim = PetSim(points); var frame = 0
+    val sim = PetSim(points, expressionVersion = if (args.contains("--legacy")) 1 else 2); var frame = 0
     generateSequence(::readlnOrNull).forEach { row ->
         val c = row.split('\t')
         if (c.size >= 10 && c[0] != "dt") {

@@ -39,7 +39,7 @@ val CHANNELS = listOf(
     Channel("agent",         "Subagent activity",   0xb0, 0x9a, 0xcb, "pod",     "pod · peers"),
     Channel("orchestration", "Orchestration",       0x6c, 0x87, 0x98, "pod",     "pod · hub"),
     Channel("error",         "Errors / exceptions", 0xe7, 0x91, 0x86, "tear",    "torn · irregular"),
-    Channel("human",         "Human interaction",   0xc2, 0xb7, 0x87, "address", "it turns to face you"),
+    Channel("human",         "Human interaction",   0xc2, 0xb7, 0x87, "address", "decision · junction"),
     Channel("other",         "Unclassified",        0x73, 0x84, 0x92, "drift",   "drifting · unformed"),
 )
 
@@ -87,9 +87,42 @@ data class Frame(
     var channel: String = "reasoning", var arch: String = "gyre", var work: Double = 0.0,
 )
 
-/** The gait field — a velocity field on the body, not a silhouette. */
+// Version 2; the same field math as TypeScript, Swift and Rust.
+private fun fieldTarget(q: Particle, t: Double, act: Double, att: Double, key: String): Pair<Double, Double>? {
+    val u = q.s * 2 - 1; val lane = q.pod - 2.5; val a = q.s * PI * 2
+    val flow = t * (0.35 + act * 0.65)
+    return when (key) {
+        "reasoning" -> {
+            val ring = 0.34 + 0.105 * cos(a * 3 + flow + lane * 0.18)
+            ring * cos(a * 2 + flow * 0.3) to ring * sin(a * 2 + flow * 0.3) * 0.7 + 0.10 * sin(a * 3 + flow)
+        }
+        "memory" -> 0.46 * cos(a + lane * 0.1 + flow * 0.25) to lane * 0.082 + 0.052 * sin(a * 2 + flow)
+        "code" -> u * 0.57 to lane * 0.066 + 0.12 * sin(u * 7 + flow * 2 + q.pod * PI / 3)
+        "filesystem" -> {
+            val branch = max(0.0, (u + 0.3) / 1.3)
+            u * 0.56 to lane * 0.13 * branch + 0.025 * sin(u * 8 - flow)
+        }
+        "tool" -> {
+            val reach = 0.14 + (u + 1) * 0.20 + 0.04 * sin(flow * 3 - u * 4)
+            cos(q.pod * PI / 3) * reach to sin(q.pod * PI / 3) * reach * 0.8 + q.hy * 0.06
+        }
+        "browser" -> u * 0.56 to lane * 0.083 + 0.035 * sin(u * 5 - flow * 2)
+        "network", "communication" -> {
+            val direction = if (key == "communication" && q.pod % 2 == 1) -1.0 else 1.0
+            val phase = a + flow * direction
+            0.54 * cos(phase) to sin(phase) * (0.12 + q.pod * 0.035) + lane * 0.024
+        }
+        "human" -> {
+            val gap = if (u < 0) -0.075 else 0.075
+            u * 0.47 + gap to lane * 0.10 * abs(u) + 0.012 * sin(flow + a) * (1 - att)
+        }
+        else -> null
+    }
+}
+
+/** Version 1 is retained for saved recordings. */
 private fun gaitTarget(q: Particle, t: Double, act: Double, coh: Double,
-                       att: Double, key: String, work: Double): Pair<Double, Double> {
+                       att: Double, key: String, work: Double, expressionVersion: Int = 1): Pair<Double, Double> {
     val omega = lerp(4.6, 5.2 + act * 2.8, work)
     val breath = 1 + sin(t * 1.85) * lerp(0.048, 0.018, work)
     val flex = sin(q.ang * 2.05 + t * omega) * lerp(0.042, 0.016 + act * 0.028, work) * (0.18 + 0.82 * q.tail)
@@ -189,6 +222,7 @@ private fun gaitTarget(q: Particle, t: Double, act: Double, coh: Double,
             gy = q.hy * 0.52 + cos(t * 0.54 + q.jy) * mill
         }
     }
+    if (expressionVersion == 2) fieldTarget(q, t, act, att, key)?.let { gx = it.first; gy = it.second }
     return lerp(px, gx, work) to lerp(py, gy, work)
 }
 
@@ -199,7 +233,7 @@ private fun stillT(key: String) = when (key) {
     "error" -> 0.35; "human" -> 0.05; "other" -> 0.90; else -> 0.4
 }
 
-class PetSim(points: List<Pair<Double, Double>>, seed: Int = 0xC0FFEE.toInt()) {
+class PetSim(points: List<Pair<Double, Double>>, seed: Int = 0xC0FFEE.toInt(), val expressionVersion: Int = 2) {
     val p: List<Particle>
     private var phase = 0.0
     private var clock = 0.0
@@ -210,6 +244,7 @@ class PetSim(points: List<Pair<Double, Double>>, seed: Int = 0xC0FFEE.toInt()) {
     var frame = Frame(); private set
 
     init {
+        require(expressionVersion == 1 || expressionVersion == 2)
         val rng = Mulberry32(seed)
         p = points.mapIndexed { i, (hx, hy) ->
             Particle().apply {
@@ -257,7 +292,7 @@ class PetSim(points: List<Pair<Double, Double>>, seed: Int = 0xC0FFEE.toInt()) {
                 q.jx += dt * (0.40 + act * 1.1)
                 q.jy += dt * (0.34 + act * 0.9)
             }
-            val (gx, gy) = gaitTarget(q, tGait, act, coh, att, ch.key, work)
+            val (gx, gy) = gaitTarget(q, tGait, act, coh, att, ch.key, work, expressionVersion)
             val podAng = q.pod * 1.047 + phase * 0.22
             val tx = gx + sin(q.jx + q.s * 9) * blur * wander + cos(podAng) * split
             val ty = gy + cos(q.jy + q.s * 7) * blur * wander + sin(podAng) * split * 0.55

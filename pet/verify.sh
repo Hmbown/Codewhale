@@ -23,24 +23,28 @@ else
 fi
 
 checkpoints=0
+for expression in v1 v2; do
 for tape in tape.tsv tapes/edge-cases.tsv; do
     case "$tape" in tape.tsv) name=baseline ;; *) name=edge-cases ;; esac
     for mode in animated reduced-motion; do
         set --
         if [ "$mode" = reduced-motion ]; then set -- --reduced-motion; fi
-        stem="conformance-results/$name-$mode"
+        if [ "$expression" = v1 ]; then set -- "$@" --legacy; fi
+        stem="conformance-results/$expression-$name-$mode"
         "$node_cmd" run-tape.ts run "$@" < "$tape" > "$stem-ts.txt"
         (cd rs && ./petsim "$@" < "../$tape") > "$stem-rs.txt"
         if "$with_swift"; then (cd swift && ./petsim --tape "../$tape" "$@") > "$stem-swift.txt"; fi
+        if [ "$expression" = v1 ]; then diff -u "tests/fixtures/v1-$name-$mode.txt" "$stem-ts.txt"; fi
         diff -u "$stem-ts.txt" "$stem-rs.txt"
         if "$with_swift"; then diff -u "$stem-ts.txt" "$stem-swift.txt"; fi
         count=$(wc -l < "$stem-ts.txt" | tr -d ' ')
         [ "$count" -gt 1 ]
         checkpoints=$((checkpoints + count))
-        printf 'PASS %s %s: %s matching checkpoints\n' "$name" "$mode" "$count"
+        printf 'PASS %s %s %s: %s matching checkpoints\n' "$expression" "$name" "$mode" "$count"
     done
 done
-printf 'Core conformance: %s checkpoints across 4 tapes/modes\n' "$checkpoints"
+done
+printf 'Core conformance: %s checkpoints across 2 expression versions and 4 tapes/modes\n' "$checkpoints"
 printf '%s\n' '── ratatui widget (offline, locked) ──'
 (cd tui && "$cargo_cmd" build --offline --locked -q)
 printf '%s\n' 'ratatui crate: built'

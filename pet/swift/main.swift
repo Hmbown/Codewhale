@@ -62,7 +62,7 @@ func renderPng(sim: PetSim, st: PetState, path: String, W: Int = 900, H: Int = 4
 let args = CommandLine.arguments
 let motion = !args.contains("--reduced-motion")
 let tapePath = args.firstIndex(of: "--tape").map { args[$0 + 1] } ?? findFile("tape.tsv")
-let sim = PetSim(points: loadPoints())
+let sim = PetSim(points: loadPoints(), expressionVersion: args.contains("--legacy") ? 1 : 2)
 
 if args.count > 1, args[1] == "--render" {
     let target = Int(args[2])!

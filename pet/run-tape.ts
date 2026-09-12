@@ -50,6 +50,6 @@ if (process.argv[2] === 'maketape') {
   maketape();
 } else {
   const rows = readFileSync(0, 'utf8').trim().split('\n');
-  const sim = new PetSim(points);
+  const sim = new PetSim(points, 0xC0FFEE, process.argv.includes('--legacy') ? 1 : 2);
   console.log(runTape(sim, rows, { motion: !process.argv.includes('--reduced-motion'), sensitivity: 1 }).join('\n'));
 }

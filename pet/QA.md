@@ -17,11 +17,12 @@ npm test
 npm run check:web
 ```
 
-The pet suite currently contains 33 tests: event occupancy/unknown coverage,
+The pet suite currently contains 37 tests: event occupancy/unknown coverage,
 late failures, human request pairing, read-only local SSE reconnect/cursor
-recovery, deterministic world/score/PCM, checkpoint integrity and continuation.
-The standalone verifier compares 190 checkpoints across baseline and edge tapes,
-each animated and still. Omission of Swift is explicit in its output.
+recovery, deterministic world/score/PCM, checkpoint integrity and continuation, expression-version validation and legacy replay.
+The standalone verifier compares 380 checkpoints across baseline and edge tapes,
+each animated and still, under expression versions 1 and 2. Version 1 must also
+match pinned pre-transformation golden digests. Omission of Swift is explicit in its output.
 `npm test` requires the root and web dependencies described by the product.
 `check:web` fetches public GitHub release metadata and requires network access.
 
@@ -63,22 +64,27 @@ Codewhale is a whale living in code. The dots can reorganize to show the work;
 the whale is its home form, not a permanent silhouette restriction. Avoid the
 old framing of a needy creature turning toward its owner. Evaluate readable,
 causal transformations, continuity of particle identity, accessibility and
-honest uncertainty. The current seven gaits are a baseline, not the design ceiling.
+honest uncertainty. Version 2 supplies work-driven knots, strands, branches, layers, circulation and
+open junctions; the same particle identities return to the whale at rest.
 
 ## Local evidence before publication (2026-09-12)
 
-- Packaged pet: 33 tests passed; existing Whalesong consumers: 306 passed after
+- Packaged pet: 37 tests passed; existing Whalesong consumers: 306 passed after
   canonical source relocation. These are overlapping suites, not additive coverage.
 - Product Node gate: 66 package, 12 SDK and 446 web tests passed; production web
   check subsequently passed with the GitHub release fetch available.
-- TypeScript/Rust/Swift: 190 identical checkpoints before and after source relocation.
+- TypeScript/Rust/Swift/Kotlin: 380 identical checkpoints across both expression
+  versions. Legacy golden digests are unchanged.
 - Actual TUI: bounded worker, persistence/export/reopen/corruption and two-hour
   continuation exercised in a PTY. Five persistence, eleven paste and nine artifact
-  guard tests passed in the product; full Rust unit suite was not run.
+  guard tests passed in the product. The initial hosted macOS suite ran 15,418
+  tests with one outdated Watch-tab golden; that header is corrected in this update.
+  A fresh hosted verdict is still required.
 - Apple: eight checkpoint workflows passed; iOS Simulator exercised two-hour
   restoration and visible corruption recovery without overwriting the damaged file.
-- Previous deterministic Kotlin parity, browser workflows and synthetic audio
-  receipts exist locally; they do not establish Android app or listening quality.
+- The updated Apple checkpoint workflows and iOS Simulator build pass. Earlier
+  browser workflows and synthetic audio receipts do not establish Android app
+  or listening quality.
 
 Hosted CI and Grokbot findings are separate evidence. Their actual results belong
 on the pull request. Open implementation gaps are listed in [README.md](README.md).

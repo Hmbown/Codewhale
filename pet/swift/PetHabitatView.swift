@@ -36,8 +36,8 @@ public struct PetHabitatView: View {
             Text(host.message).font(.caption).foregroundStyle(.secondary)
             if !host.persistenceMessage.isEmpty { Text(host.persistenceMessage).font(.caption).foregroundStyle(.secondary) }
             HStack {
-                Button("Attention") { host.interact(food: false) }
-                Button("Feed") { host.interact(food: true) }
+                Button("Focus") { host.interact(food: false) }
+                Button("Pulse") { host.interact(food: true) }
                 Toggle("Sound", isOn: $host.sound)
             }
         }

@@ -10,7 +10,7 @@ import Foundation
 public struct PetState: Codable, Equatable {
     public var activity: Double = 0.35   // how much work 0..1
     public var coherence: Double = 0.8   // converging school vs thrashing
-    public var attention: Double = 0     // how much it needs you
+    public var attention: Double = 0     // interaction salience
     public var channel: String = "reasoning"
     public var observed: Double = 1      // instrumentation coverage
     public var roamX: Double = 0         // tank position -1..1
@@ -40,7 +40,7 @@ public let CHANNELS: [Channel] = [
     Channel(key: "agent",         label: "Subagent activity",   rgb: (0xb0, 0x9a, 0xcb), arch: "pod",     form: "pod · peers"),
     Channel(key: "orchestration", label: "Orchestration",       rgb: (0x6c, 0x87, 0x98), arch: "pod",     form: "pod · hub"),
     Channel(key: "error",         label: "Errors / exceptions", rgb: (0xe7, 0x91, 0x86), arch: "tear",    form: "torn · irregular"),
-    Channel(key: "human",         label: "Human interaction",   rgb: (0xc2, 0xb7, 0x87), arch: "address", form: "it turns to face you"),
+    Channel(key: "human",         label: "Human interaction",   rgb: (0xc2, 0xb7, 0x87), arch: "address", form: "decision · junction"),
     Channel(key: "other",         label: "Unclassified",        rgb: (0x73, 0x84, 0x92), arch: "drift",   form: "drifting · unformed"),
 ]
 
@@ -105,16 +105,45 @@ public struct Frame: Codable {
 /// decoded. Swift restores its existing particle renderer from that same state.
 struct PetParticleCheckpoint: Decodable {
     let version: Int
+    let expressionVersion: Int?
     let body: [[Double]], particles: [[Double]]
     let phase: Double, clock: Double, tear: Double
     let previous: Int, current: Int, color: [Double]
     let frame: Frame
 }
 
-/// The gait field — a velocity field on the body, not a silhouette.
+// Version 2 expresses work as fields while preserving seeded particle identity.
+func fieldTarget(_ q: Particle, _ t: Double, _ act: Double, _ att: Double, _ key: String) -> (Double, Double)? {
+    let u = q.s * 2 - 1, lane = Double(q.pod) - 2.5, a = q.s * Double.pi * 2
+    let flow = t * (0.35 + act * 0.65)
+    switch key {
+    case "reasoning":
+        let ring = 0.34 + 0.105 * cos(a * 3 + flow + lane * 0.18)
+        return (ring * cos(a * 2 + flow * 0.3), ring * sin(a * 2 + flow * 0.3) * 0.7 + 0.10 * sin(a * 3 + flow))
+    case "memory": return (0.46 * cos(a + lane * 0.1 + flow * 0.25), lane * 0.082 + 0.052 * sin(a * 2 + flow))
+    case "code": return (u * 0.57, lane * 0.066 + 0.12 * sin(u * 7 + flow * 2 + Double(q.pod) * Double.pi / 3))
+    case "filesystem":
+        let branch = max(0, (u + 0.3) / 1.3)
+        return (u * 0.56, lane * 0.13 * branch + 0.025 * sin(u * 8 - flow))
+    case "tool":
+        let reach = 0.14 + (u + 1) * 0.20 + 0.04 * sin(flow * 3 - u * 4)
+        return (cos(Double(q.pod) * Double.pi / 3) * reach, sin(Double(q.pod) * Double.pi / 3) * reach * 0.8 + q.hy * 0.06)
+    case "browser": return (u * 0.56, lane * 0.083 + 0.035 * sin(u * 5 - flow * 2))
+    case "network", "communication":
+        let direction = key == "communication" && q.pod % 2 == 1 ? -1.0 : 1.0
+        let phase = a + flow * direction
+        return (0.54 * cos(phase), sin(phase) * (0.12 + Double(q.pod) * 0.035) + lane * 0.024)
+    case "human":
+        let gap = u < 0 ? -0.075 : 0.075
+        return (u * 0.47 + gap, lane * 0.10 * abs(u) + 0.012 * sin(flow + a) * (1 - att))
+    default: return nil
+    }
+}
+
+/// Version 1 is retained for saved recordings.
 /// Ported line-for-line from PetSim.ts gaitTarget().
 func gaitTarget(_ q: Particle, _ t: Double, _ act: Double, _ coh: Double,
-                _ att: Double, _ key: String, _ work: Double, _ podSlots: [(Int, Double)]? = nil) -> (Double, Double) {
+                _ att: Double, _ key: String, _ work: Double, _ podSlots: [(Int, Double)]? = nil, _ expressionVersion: Int = 1) -> (Double, Double) {
     let omega = lerp(4.6, 5.2 + act * 2.8, work)
     let breath = 1 + sin(t * 1.85) * lerp(0.048, 0.018, work)
     let flex = sin(q.ang * 2.05 + t * omega) * lerp(0.042, 0.016 + act * 0.028, work) * (0.18 + 0.82 * q.tail)
@@ -216,6 +245,7 @@ func gaitTarget(_ q: Particle, _ t: Double, _ act: Double, _ coh: Double,
         gx = q.hx * 0.52 + sin(t * 0.72 + q.jx) * mill
         gy = q.hy * 0.52 + cos(t * 0.54 + q.jy) * mill
     }
+    if expressionVersion == 2, let field = fieldTarget(q, t, act, att, key) { gx = field.0; gy = field.1 }
     return (lerp(px, gx, work), lerp(py, gy, work))
 }
 
@@ -231,6 +261,7 @@ func stillT(_ key: String) -> Double {
 
 public final class PetSim {
     public private(set) var p: [Particle]
+    public private(set) var expressionVersion: Int
     var phase = 0.0
     var clock = 0.0
     var tear = 0.0
@@ -239,7 +270,9 @@ public final class PetSim {
     var cur: Int
     public private(set) var frame = Frame()
 
-    public init(points: [(Double, Double)], seed: UInt32 = 0xC0FFEE) {
+    public init(points: [(Double, Double)], seed: UInt32 = 0xC0FFEE, expressionVersion: Int = 2) {
+        precondition(expressionVersion == 1 || expressionVersion == 2)
+        self.expressionVersion = expressionVersion
         var rng = Mulberry32(seed: seed)
         p = points.enumerated().map { (i, pt) in
             var q = Particle()
@@ -259,13 +292,14 @@ public final class PetSim {
     func restoreValidated(_ checkpoint: PetParticleCheckpoint) throws {
         // Array and identity checks also protect this native boundary if its
         // caller changes. Mutation starts only after the complete shape passes.
-        guard checkpoint.version == 1, checkpoint.body.count == p.count,
+        guard checkpoint.version == 1, [1, 2].contains(checkpoint.expressionVersion ?? 1), checkpoint.body.count == p.count,
               checkpoint.particles.count == p.count, checkpoint.color.count == 3,
               CHANNELS.indices.contains(checkpoint.previous), CHANNELS.indices.contains(checkpoint.current),
               checkpoint.body.enumerated().allSatisfy({ i, v in
                   v.count == 3 && v[0] == p[i].hx && v[1] == p[i].hy && v[2] == p[i].s
               }), checkpoint.particles.allSatisfy({ $0.count == 8 && $0.allSatisfy(\.isFinite) })
         else { throw NSError(domain: "CodewhalePet", code: 1, userInfo: [NSLocalizedDescriptionKey: "The particle checkpoint does not match this whale."]) }
+        expressionVersion = checkpoint.expressionVersion ?? 1
         phase = checkpoint.phase; clock = checkpoint.clock; tear = checkpoint.tear
         prev = checkpoint.previous; cur = checkpoint.current
         col = (checkpoint.color[0], checkpoint.color[1], checkpoint.color[2]); frame = checkpoint.frame
@@ -308,7 +342,7 @@ public final class PetSim {
                 p[i].jx += dt * (0.40 + act * 1.1)
                 p[i].jy += dt * (0.34 + act * 0.9)
             }
-            let (gx, gy) = gaitTarget(p[i], tGait, act, coh, att, ch.key, work, podSlots)
+            let (gx, gy) = gaitTarget(p[i], tGait, act, coh, att, ch.key, work, podSlots, expressionVersion)
             let podAng = Double(p[i].pod) * 1.047 + phase * 0.22
             let tx = gx + sin(p[i].jx + p[i].s * 9) * blur * wander + cos(podAng) * split
             let ty = gy + cos(p[i].jy + p[i].s * 7) * blur * wander + sin(podAng) * split * 0.55

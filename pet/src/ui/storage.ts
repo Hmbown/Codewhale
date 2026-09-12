@@ -4,7 +4,7 @@ import type { PetInteraction, PetWorldCheckpoint } from '../core/pet-world.js';
 export interface SavedHabitat {
   petPersistenceVersion: 1; seconds: number; source: 'wild' | 'demo' | 'replay';
   sourceName: string; still: boolean; tape: readonly PetBucket[]; interactions: readonly PetInteraction[];
-  checkpoint?: PetWorldCheckpoint;
+  checkpoint?: PetWorldCheckpoint; expressionVersion?: 1 | 2;
 }
 export interface HabitatEntry { revision: number; habitat: SavedHabitat }
 export interface SavedReference { key: string; savedAt: string }
