@@ -90,7 +90,7 @@ impl WorkspaceFile {
         })
     }
 
-    pub(super) fn sibling(&self, name: &str) -> io::Result<Self> {
+    pub(crate) fn sibling(&self, name: &str) -> io::Result<Self> {
         if !path_is_confined(Path::new(name)) || Path::new(name).components().count() != 1 {
             return Err(invalid_path());
         }
@@ -100,7 +100,7 @@ impl WorkspaceFile {
         })
     }
 
-    pub(super) fn open_update(&self, create: bool, append: bool) -> io::Result<File> {
+    pub(crate) fn open_update(&self, create: bool, append: bool) -> io::Result<File> {
         self.open_with_flags(
             libc::O_RDWR
                 | if create { libc::O_CREAT } else { 0 }
@@ -143,7 +143,7 @@ impl WorkspaceFile {
         self.atomic_write(bytes, false)
     }
 
-    pub(super) fn replace(&self, bytes: &[u8]) -> io::Result<()> {
+    pub(crate) fn replace(&self, bytes: &[u8]) -> io::Result<()> {
         self.atomic_write(bytes, true)
     }
 
@@ -268,7 +268,7 @@ impl WorkspaceFile {
         })
     }
 
-    pub(super) fn sibling(&self, name: &str) -> io::Result<Self> {
+    pub(crate) fn sibling(&self, name: &str) -> io::Result<Self> {
         if !path_is_confined(Path::new(name)) || Path::new(name).components().count() != 1 {
             return Err(invalid_path());
         }
@@ -283,7 +283,7 @@ impl WorkspaceFile {
         })
     }
 
-    pub(super) fn open_update(&self, create: bool, append: bool) -> io::Result<File> {
+    pub(crate) fn open_update(&self, create: bool, append: bool) -> io::Result<File> {
         use std::os::windows::fs::OpenOptionsExt;
         let file = std::fs::OpenOptions::new()
             .read(true)
@@ -317,7 +317,7 @@ impl WorkspaceFile {
         self.atomic_write(bytes, false)
     }
 
-    pub(super) fn replace(&self, bytes: &[u8]) -> io::Result<()> {
+    pub(crate) fn replace(&self, bytes: &[u8]) -> io::Result<()> {
         self.atomic_write(bytes, true)
     }
 
@@ -508,13 +508,13 @@ impl WorkspaceFile {
             "Confined Fleet artifact I/O is unavailable on this platform",
         ))
     }
-    pub(super) fn sibling(&self, _: &str) -> io::Result<Self> {
+    pub(crate) fn sibling(&self, _: &str) -> io::Result<Self> {
         unreachable!()
     }
-    pub(super) fn open_update(&self, _: bool, _: bool) -> io::Result<File> {
+    pub(crate) fn open_update(&self, _: bool, _: bool) -> io::Result<File> {
         unreachable!()
     }
-    pub(super) fn replace(&self, _: &[u8]) -> io::Result<()> {
+    pub(crate) fn replace(&self, _: &[u8]) -> io::Result<()> {
         unreachable!()
     }
     pub(crate) fn open_file(&self) -> io::Result<File> {
@@ -527,7 +527,7 @@ impl WorkspaceFile {
 
 /// Compare already opened lock handles; a replaced lock must never create two
 /// independent critical sections for the same live ledger.
-pub(super) fn same_file(left: &File, right: &File) -> io::Result<bool> {
+pub(crate) fn same_file(left: &File, right: &File) -> io::Result<bool> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;

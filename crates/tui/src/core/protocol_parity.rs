@@ -13,11 +13,10 @@
 //! host must supply — so it lands with the engine handle in Phase C/D, not
 //! here.
 //!
-//! No runtime surface calls these projections yet: the first consumer is the
-//! in-process engine handle that Phase D attaches the TUI and app-server to.
-//! Until then the guard is the compile of this module itself, so dead-code
-//! is allowed here on purpose rather than hidden behind a test cfg (which
-//! would let `cargo build` pass with an unmapped variant).
+//! The foreground pet observer consumes the event projection, retaining only
+//! lifecycle metadata. Other projections remain compile-time parity guards;
+//! dead-code is allowed here rather than hiding those guards behind a test cfg
+//! (which would let `cargo build` pass with an unmapped variant).
 #![allow(dead_code)]
 
 use std::collections::BTreeMap;

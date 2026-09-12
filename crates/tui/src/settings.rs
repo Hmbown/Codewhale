@@ -650,6 +650,7 @@ fn normalize_rail_panel(value: &str) -> &'static str {
         "context" => "context",
         "git" => "git",
         "price" => "price",
+        "watch" => "watch",
         // `pinned` folded into the tasks view (2026-09-02 dock views).
         _ => "tasks",
     }
@@ -1511,6 +1512,7 @@ impl Settings {
                         | "context"
                         | "git"
                         | "price"
+                        | "watch"
                         | "pinned"
                 ) {
                     anyhow::bail!(

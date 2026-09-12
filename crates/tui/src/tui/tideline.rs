@@ -180,6 +180,7 @@ impl InteractionTargetId {
     pub const DOCK_TAB_CONTEXT: Self = Self("dock.tab.context");
     pub const DOCK_TAB_GIT: Self = Self("dock.tab.git");
     pub const DOCK_TAB_PRICE: Self = Self("dock.tab.price");
+    pub const DOCK_TAB_WATCH: Self = Self("dock.tab.watch");
     pub const DOCK_CLOSE: Self = Self("dock.close");
 }
 

@@ -67,3 +67,32 @@ caller-assigned `worker_specs` because worker controls address IDs globally.
 Older runtimes that do not expose one of these endpoints produce a
 `RuntimeCapabilityError` with a stable capability string instead of a generic
 fetch failure.
+
+## Read a thread journal
+
+`threadEvents(threadId, { sinceSeq, replayLimit, signal })` reads the existing
+`GET /v1/threads/{id}/events` SSE endpoint. It never creates a thread or starts
+a turn. Pass an `AbortSignal` to close the subscription. Redirects are refused,
+and incomplete or oversized frames fail instead of producing partial records.
+
+The returned `seq` and `previous_seq` belong to Runtime. Keep the last accepted
+`seq` for reconnects; sequence numbers need not be consecutive. Consumers should
+validate the selected thread and predecessor cursor before advancing their own
+read position. Authentication uses the client constructor's existing `token`
+option and stays in the Authorization header.
+
+
+Consumers that present **current** activity can pass `includeProgress: true`.
+The same endpoint adds `progress=true` and advertises support with
+`x-codewhale-event-progress: 1`. A Runtime without that capability fails
+explicitly; a historical event is not a readiness signal.
+
+Opt-in streams include `{ event: "stream.progress", thread_id, seq, state }`,
+where `state` is `replaying` or `live`. These are transport frames at the existing
+journal cursor, not journal events or new sequence numbers. Initial replay and
+broadcast-lag recovery are `replaying`. The stream becomes `live` only after
+both durable history and the already queued live tail have been drained. A
+request answered during replay therefore settles before readiness is reported.
+Later lag can return the same connection to `replaying`. Consumers should stop
+extending activity while replaying or disconnected and validate the thread and
+cursor. Default streams retain the original event-only contract.

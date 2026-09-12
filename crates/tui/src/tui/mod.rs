@@ -87,6 +87,7 @@ pub mod pager;
 pub mod paste;
 pub mod paste_burst;
 pub mod persistence_actor;
+pub mod pet_watch;
 pub mod phase_strip;
 pub(crate) mod plugin_suggestions;
 pub mod prompt_suggestion;

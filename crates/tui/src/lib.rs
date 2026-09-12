@@ -149,6 +149,9 @@ mod tool_inspection;
 mod tool_output_receipts;
 mod tools;
 mod tui;
+/// Portable, dependency-free dot-whale core and conformance helpers.
+/// The terminal and external renderers share this implementation.
+pub use tui::ambient_life::pet_sim as pet;
 mod turn_route_plan;
 mod utils;
 mod vision;
