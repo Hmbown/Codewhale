@@ -163,7 +163,10 @@ open junctions; the same particle identities return to the whale at rest.
   tests now use CRLF assets and fail against the previous controller. CLI tests
   use a test-only IPC preload for Windows shutdown-handler coverage because
   `child.kill('SIGINT')` forcibly terminates a Windows process; POSIX tests retain
-  the real signal. Current Windows CI is required to verify the platform fix.
+  the real signal. The next Windows run passed 56/57 tests but found intermittent
+  reader contention during replacement. Windows replacement now retries for
+  under two seconds and rechecks destination identity, size and modification
+  time before each attempt. Current Windows CI is required to verify that fix.
 - Bounded Runtime input: a real local HTTP/SSE fixture supplies 260,001 records
   spanning nearly 29 hours of event timestamps. The importer retains fewer than
   512 events and 256 KiB of metadata, including a still-open human request. The

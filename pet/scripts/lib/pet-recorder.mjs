@@ -2,6 +2,7 @@ import { open, link, rename, unlink, lstat } from 'node:fs/promises';
 import { constants } from 'node:fs';
 import { dirname, basename, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
+import { setTimeout as delay } from 'node:timers/promises';
 import { PET_BIN_MS, validatePetBucket, encodePetJSONL } from '../../dist/core/pet-telemetry.js';
 
 async function syncDirectory(path) {
@@ -51,7 +52,21 @@ export async function createPetRecorder(path, { maxBuckets = 216_000, maxBytes =
             // Windows can reject replacement while either writer handle is
             // open. Both files are synced and the old file is archived first.
             await output.close(); output = undefined;
-            await rename(temporary, path); installed = true;
+            for (let attempt = 0; ; attempt++) {
+              const destination = await lstat(path, { bigint: true });
+              if (!destination.isFile() || destination.dev !== held.dev || destination.ino !== held.ino
+                || destination.size !== held.size || destination.mtimeNs !== held.mtimeNs)
+                throw new Error('The live pet recording changed while rotating; existing files were preserved.');
+              try { await rename(temporary, path); break; }
+              catch (error) {
+                // A reader or file scanner can briefly deny replacement on
+                // Windows. Retry for under two seconds, checking identity each
+                // time; persistent denial still stops without deleting history.
+                if (process.platform !== 'win32' || !['EPERM', 'EBUSY'].includes(error.code) || attempt >= 20) throw error;
+                await delay(Math.min(100, (attempt + 1) * 25));
+              }
+            }
+            installed = true;
             // The first row is already published. Account for it before any
             // fallible cleanup/report so a later append sees the actual file.
             sequence = 1; bytes = size; segment++;
