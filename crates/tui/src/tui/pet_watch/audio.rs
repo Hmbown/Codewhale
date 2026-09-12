@@ -65,9 +65,9 @@ impl Target {
             return Ok(());
         }
         let mut bytes = Vec::with_capacity(length * 8);
-        for i in 0..length {
-            bytes.extend_from_slice(&channels[0][i].to_le_bytes());
-            bytes.extend_from_slice(&channels[1][i].to_le_bytes());
+        for (left, right) in channels[0].iter().zip(&channels[1]) {
+            bytes.extend_from_slice(&left.to_le_bytes());
+            bytes.extend_from_slice(&right.to_le_bytes());
         }
         match self.tx.try_send(Packet {
             bytes,
