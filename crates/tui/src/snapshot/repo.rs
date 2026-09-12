@@ -48,6 +48,41 @@ pub struct Snapshot {
     pub session_id: Option<String>,
 }
 
+/// What a file-scoped restore did to one path, relative to the working tree
+/// it was applied to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathRestoreAction {
+    /// Both the snapshot and the working tree had the path; its content came
+    /// back from the snapshot.
+    Modified,
+    /// The snapshot had the path and the working tree no longer did, so the
+    /// restore recreated the file.
+    Recreated,
+    /// The working tree had the path and the snapshot did not, so the restore
+    /// removed the file.
+    Removed,
+}
+
+impl PathRestoreAction {
+    /// Stable wire name, also used by the runtime API response.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Modified => "modified",
+            Self::Recreated => "recreated",
+            Self::Removed => "removed",
+        }
+    }
+}
+
+/// Report of what [`SnapshotRepo::restore_paths`] did to one path.
+#[derive(Debug, Clone)]
+pub struct PathRestoreOutcome {
+    /// Workspace-relative path that was restored.
+    pub path: PathBuf,
+    /// How the working tree changed.
+    pub action: PathRestoreAction,
+}
+
 /// Wrapper around the per-workspace side-git repo.
 pub struct SnapshotRepo {
     git_dir: PathBuf,
@@ -589,6 +624,180 @@ impl SnapshotRepo {
         }
         self.remove_paths_missing_from_target(&current_paths, &target_paths)?;
         Ok(())
+    }
+
+    /// Return whether `rel` differs between snapshot `id` and the current
+    /// working tree.
+    ///
+    /// This is the single-path counterpart of
+    /// [`Self::work_tree_matches_snapshot`]: it answers "would restoring just
+    /// this file change anything?", which is what file-scoped revert
+    /// cursoring needs. A path that exists in neither the snapshot nor the
+    /// working tree does not differ.
+    pub fn path_differs_from_snapshot(&self, id: &SnapshotId, rel: &Path) -> io::Result<bool> {
+        if !is_safe_relative_path(rel) {
+            return Err(io_other(format!(
+                "refusing to compare unsafe path '{}'",
+                rel.display()
+            )));
+        }
+        let in_work = std::fs::symlink_metadata(self.work_tree.join(rel)).is_ok();
+        let in_target = self.tree_paths(id.as_str())?.contains(rel);
+        match (in_target, in_work) {
+            // Neither side has it: nothing to restore and nothing to remove.
+            (false, false) => Ok(false),
+            // The snapshot has it and the working tree lost it.
+            (true, false) => Ok(true),
+            // The path was created after the snapshot.
+            (false, true) => Ok(true),
+            (true, true) => {
+                let rel = rel.to_string_lossy().into_owned();
+                let diff = run_git(
+                    &self.git_dir,
+                    &self.work_tree,
+                    &["diff", "--quiet", id.as_str(), "--", rel.as_str()],
+                )?;
+                Ok(!diff.status.success())
+            }
+        }
+    }
+
+    /// Restore only `rel_paths` from snapshot `id`.
+    ///
+    /// This is the file-scoped counterpart of [`Self::restore`]. The
+    /// difference that matters: the whole-tree `git checkout <sha> -- :/` is
+    /// replaced by a pathspec-limited checkout, so a working-tree path outside
+    /// `rel_paths` is never read, written, or deleted.
+    ///
+    /// A path the snapshot does not track is removed from the working tree
+    /// (that is how a file created after the snapshot is reverted), and a path
+    /// the snapshot tracks but the working tree lost is recreated. A path that
+    /// exists in neither side produces no outcome at all, rather than a
+    /// report claiming a change that did not happen.
+    pub fn restore_paths(
+        &self,
+        id: &SnapshotId,
+        rel_paths: &[PathBuf],
+    ) -> io::Result<Vec<PathRestoreOutcome>> {
+        if rel_paths.is_empty() {
+            return Ok(Vec::new());
+        }
+        for rel in rel_paths {
+            if !is_safe_relative_path(rel) {
+                return Err(io_other(format!(
+                    "refusing to restore unsafe path '{}'",
+                    rel.display()
+                )));
+            }
+        }
+
+        // Same safety net as the whole-tree restore: capture the state this
+        // scoped restore is about to replace, so the restore can itself be
+        // reversed. The `pre-restore:` prefix is deliberately not a `/undo` or
+        // `revert_turn` candidate label, so the net never changes snapshot
+        // selection. Best-effort: a failed safety snapshot must never block
+        // the restore the user asked for.
+        let target_short = &id.as_str()[..id.as_str().len().min(12)];
+        if let Err(e) = self.snapshot_with_session(&format!("pre-restore:{target_short}"), None) {
+            tracing::warn!(
+                target: "snapshot",
+                "pre-restore safety snapshot failed (scoped restore will proceed): {e}"
+            );
+        }
+
+        let target_paths = self.tree_paths(id.as_str())?;
+        // Classify against the state *before* the checkout below, so the
+        // report describes what the restore actually changed.
+        let pre_state: Vec<(PathBuf, bool, bool)> = rel_paths
+            .iter()
+            .map(|rel| {
+                let in_work = std::fs::symlink_metadata(self.work_tree.join(rel)).is_ok();
+                (rel.clone(), target_paths.contains(rel), in_work)
+            })
+            .collect();
+
+        let tracked: Vec<String> = pre_state
+            .iter()
+            .filter(|(_, in_target, _)| *in_target)
+            .map(|(rel, _, _)| rel.to_string_lossy().into_owned())
+            .collect();
+        if !tracked.is_empty() {
+            let mut args: Vec<String> = vec![
+                "checkout".to_string(),
+                id.as_str().to_string(),
+                "--".to_string(),
+            ];
+            args.extend(tracked);
+            let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+            let checkout = run_git(&self.git_dir, &self.work_tree, &arg_refs)?;
+            if !checkout.status.success() {
+                return Err(io_other(format!(
+                    "git checkout failed: {}",
+                    String::from_utf8_lossy(&checkout.stderr).trim()
+                )));
+            }
+        }
+
+        let mut outcomes = Vec::new();
+        for (rel, in_target, was_in_work) in pre_state {
+            match (in_target, was_in_work) {
+                (true, true) => outcomes.push(PathRestoreOutcome {
+                    path: rel,
+                    action: PathRestoreAction::Modified,
+                }),
+                (true, false) => outcomes.push(PathRestoreOutcome {
+                    path: rel,
+                    action: PathRestoreAction::Recreated,
+                }),
+                (false, true) => {
+                    let path = self.work_tree.join(&rel);
+                    let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+                        continue;
+                    };
+                    if metadata.file_type().is_dir() {
+                        let _ = std::fs::remove_dir(&path);
+                    } else {
+                        std::fs::remove_file(&path)?;
+                    }
+                    self.prune_empty_parent_dirs(path.parent());
+                    outcomes.push(PathRestoreOutcome {
+                        path: rel,
+                        action: PathRestoreAction::Removed,
+                    });
+                }
+                // Already in the snapshot's state.
+                (false, false) => {}
+            }
+        }
+        Ok(outcomes)
+    }
+
+    /// `git diff --stat` between snapshot `id` and the current working tree,
+    /// computed inside the side repo.
+    ///
+    /// This is what restoring `id` *would* change, so it must be captured
+    /// before the restore runs — afterwards the work tree matches the snapshot
+    /// and the diff is empty by construction.
+    ///
+    /// It deliberately runs against the side repo rather than the user's. The
+    /// previous summary ran `git diff --stat` in the workspace with the user's
+    /// `.git`, which reports the user's own uncommitted work: it listed files
+    /// the restore had not touched, and reported nothing when that work
+    /// happened to be committed. Returns `None` when nothing differs.
+    pub fn snapshot_diff_stat(&self, id: &SnapshotId) -> io::Result<Option<String>> {
+        let diff = run_git(
+            &self.git_dir,
+            &self.work_tree,
+            &["diff", "--stat", id.as_str(), "--", ":/"],
+        )?;
+        if !diff.status.success() {
+            return Err(io_other(format!(
+                "git diff --stat failed: {}",
+                String::from_utf8_lossy(&diff.stderr).trim()
+            )));
+        }
+        let stat = String::from_utf8_lossy(&diff.stdout).trim().to_string();
+        Ok((!stat.is_empty()).then_some(stat))
     }
 
     /// Return whether the current workspace matches the given snapshot's
@@ -1169,6 +1378,27 @@ fn is_safe_relative_path(path: &Path) -> bool {
             .all(|component| matches!(component, Component::Normal(_)))
 }
 
+/// Normalize a caller-supplied path into a safe workspace-relative path.
+///
+/// Accepts either a workspace-relative path or an absolute path inside
+/// `workspace`. Returns `None` when the result is not a plain relative path —
+/// absolute, empty, containing `..`, or pointing outside the workspace. Every
+/// file-scoped restore path passes through here, so a caller never gets to
+/// name a path the snapshot repo would resolve outside the work tree.
+pub fn workspace_relative_path(workspace: &Path, raw: &str) -> Option<PathBuf> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let candidate = Path::new(trimmed);
+    let rel = if candidate.is_absolute() {
+        candidate.strip_prefix(workspace).ok()?.to_path_buf()
+    } else {
+        candidate.to_path_buf()
+    };
+    is_safe_relative_path(&rel).then_some(rel)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1300,6 +1530,216 @@ mod tests {
         repo.restore(&id).expect("restore");
         assert!(original.exists());
         assert!(!added.exists(), "restore must remove tracked added files");
+    }
+
+    #[test]
+    fn restore_paths_leaves_unrelated_files_alone() {
+        let tmp = tempdir().unwrap();
+        let (repo, _home) = make_repo(tmp.path());
+        let wanted = repo.work_tree().join("wanted.txt");
+        let unrelated = repo.work_tree().join("unrelated.txt");
+
+        std::fs::write(&wanted, b"original").unwrap();
+        std::fs::write(&unrelated, b"original").unwrap();
+        let id = repo.snapshot("pre-turn:1").expect("snapshot");
+
+        std::fs::write(&wanted, b"clobbered").unwrap();
+        std::fs::write(&unrelated, b"also clobbered").unwrap();
+        repo.snapshot("post-turn:1").expect("snapshot 2");
+
+        let outcomes = repo
+            .restore_paths(&id, &[PathBuf::from("wanted.txt")])
+            .expect("scoped restore");
+
+        assert_eq!(std::fs::read_to_string(&wanted).unwrap(), "original");
+        assert_eq!(
+            std::fs::read_to_string(&unrelated).unwrap(),
+            "also clobbered",
+            "a file-scoped restore must not touch a path it was not given"
+        );
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].path, PathBuf::from("wanted.txt"));
+        assert_eq!(outcomes[0].action, PathRestoreAction::Modified);
+    }
+
+    #[test]
+    fn only_restore_paths_is_safe_for_a_single_file_action() {
+        // Characterizes the difference the per-file Revert control depends on.
+        // `restore()` is what the TUI's `patch_undo()` and the runtime's
+        // `patch-undo` endpoint both call. It is scoped in *snapshot selection*
+        // (it picks a recent `tool:` snapshot) but not in *effect*: it checks
+        // out the whole tree, so it also rolls back a working-tree path that no
+        // tool touched. That is the data loss #2 removed the control over, and
+        // it is why a per-file action cannot be built on top of it.
+        let tmp = tempdir().unwrap();
+        let (repo, _home) = make_repo(tmp.path());
+        let touched = repo.work_tree().join("touched.txt");
+        let unrelated = repo.work_tree().join("unrelated.txt");
+
+        std::fs::write(&touched, b"v1").unwrap();
+        std::fs::write(&unrelated, b"snapshot-time").unwrap();
+        let id = repo.snapshot("tool:call-1").expect("snapshot");
+
+        // The tool edits one file; something else — the user, another editor —
+        // changes the other one after the snapshot was taken.
+        std::fs::write(&touched, b"v2").unwrap();
+        std::fs::write(&unrelated, b"user-work-in-progress").unwrap();
+
+        repo.restore(&id).expect("whole-tree restore");
+        assert_eq!(std::fs::read_to_string(&touched).unwrap(), "v1");
+        assert_eq!(
+            std::fs::read_to_string(&unrelated).unwrap(),
+            "snapshot-time",
+            "whole-tree restore rolls back a file no tool touched"
+        );
+
+        // Same situation again, but through the file-scoped path the
+        // `file-revert` endpoint uses.
+        std::fs::write(&touched, b"v1").unwrap();
+        std::fs::write(&unrelated, b"snapshot-time").unwrap();
+        let id2 = repo.snapshot("tool:call-2").expect("snapshot 2");
+        std::fs::write(&touched, b"v2").unwrap();
+        std::fs::write(&unrelated, b"user-work-in-progress").unwrap();
+
+        repo.restore_paths(&id2, &[PathBuf::from("touched.txt")])
+            .expect("scoped restore");
+        assert_eq!(std::fs::read_to_string(&touched).unwrap(), "v1");
+        assert_eq!(
+            std::fs::read_to_string(&unrelated).unwrap(),
+            "user-work-in-progress",
+            "the scoped restore must leave the unrelated edit alone"
+        );
+    }
+
+    #[test]
+    fn snapshot_diff_stat_describes_what_a_restore_would_change() {
+        let tmp = tempdir().unwrap();
+        let (repo, _home) = make_repo(tmp.path());
+        let changed = repo.work_tree().join("changed.txt");
+        let untouched = repo.work_tree().join("untouched.txt");
+
+        std::fs::write(&changed, b"v1").unwrap();
+        std::fs::write(&untouched, b"stable").unwrap();
+        let id = repo.snapshot("pre-turn:1").expect("snapshot");
+
+        std::fs::write(&changed, b"v2").unwrap();
+
+        let stat = repo
+            .snapshot_diff_stat(&id)
+            .expect("diff stat")
+            .expect("the snapshot differs, so something must be reported");
+        assert!(stat.contains("changed.txt"), "got: {stat}");
+        // The stat describes the restore's effect, not the workspace's whole
+        // uncommitted state — a file the restore will not touch must not appear.
+        assert!(!stat.contains("untouched.txt"), "got: {stat}");
+
+        // After restoring, the two sides agree: nothing left to report. (Which
+        // is why the caller must capture this *before* the restore runs.)
+        repo.restore(&id).expect("restore");
+        assert_eq!(repo.snapshot_diff_stat(&id).expect("diff stat"), None);
+    }
+
+    #[test]
+    fn restore_paths_removes_a_file_created_after_the_snapshot() {
+        let tmp = tempdir().unwrap();
+        let (repo, _home) = make_repo(tmp.path());
+        let kept = repo.work_tree().join("kept.txt");
+        let created = repo.work_tree().join("created.txt");
+
+        std::fs::write(&kept, b"kept").unwrap();
+        let id = repo.snapshot("pre-turn:1").expect("snapshot");
+
+        std::fs::write(&created, b"new file").unwrap();
+        repo.snapshot("post-turn:1").expect("snapshot 2");
+
+        let outcomes = repo
+            .restore_paths(&id, &[PathBuf::from("created.txt")])
+            .expect("scoped restore");
+
+        assert!(
+            !created.exists(),
+            "a created file must be removed by revert"
+        );
+        assert!(kept.exists(), "the untouched file must survive");
+        assert_eq!(outcomes[0].action, PathRestoreAction::Removed);
+    }
+
+    #[test]
+    fn restore_paths_recreates_a_file_deleted_after_the_snapshot() {
+        let tmp = tempdir().unwrap();
+        let (repo, _home) = make_repo(tmp.path());
+        let deleted = repo.work_tree().join("deleted.txt");
+
+        std::fs::write(&deleted, b"content").unwrap();
+        let id = repo.snapshot("pre-turn:1").expect("snapshot");
+
+        std::fs::remove_file(&deleted).unwrap();
+        repo.snapshot("post-turn:1").expect("snapshot 2");
+
+        let outcomes = repo
+            .restore_paths(&id, &[PathBuf::from("deleted.txt")])
+            .expect("scoped restore");
+
+        assert_eq!(std::fs::read_to_string(&deleted).unwrap(), "content");
+        assert_eq!(outcomes[0].action, PathRestoreAction::Recreated);
+    }
+
+    #[test]
+    fn restore_paths_rejects_parent_traversal() {
+        let tmp = tempdir().unwrap();
+        let (repo, _home) = make_repo(tmp.path());
+        std::fs::write(repo.work_tree().join("a.txt"), b"a").unwrap();
+        let id = repo.snapshot("pre-turn:1").expect("snapshot");
+
+        let err = repo
+            .restore_paths(&id, &[PathBuf::from("../escape.txt")])
+            .expect_err("traversal must be refused");
+        assert!(err.to_string().contains("unsafe path"), "got: {err}");
+    }
+
+    #[test]
+    fn path_differs_from_snapshot_is_scoped_to_the_named_path() {
+        let tmp = tempdir().unwrap();
+        let (repo, _home) = make_repo(tmp.path());
+        let touched = repo.work_tree().join("touched.txt");
+        let untouched = repo.work_tree().join("untouched.txt");
+
+        std::fs::write(&touched, b"v1").unwrap();
+        std::fs::write(&untouched, b"v1").unwrap();
+        let id = repo.snapshot("pre-turn:1").expect("snapshot");
+
+        std::fs::write(&touched, b"v2").unwrap();
+
+        assert!(
+            repo.path_differs_from_snapshot(&id, Path::new("touched.txt"))
+                .expect("differs")
+        );
+        assert!(
+            !repo
+                .path_differs_from_snapshot(&id, Path::new("untouched.txt"))
+                .expect("differs")
+        );
+    }
+
+    #[test]
+    fn workspace_relative_path_accepts_inside_paths_and_refuses_outside_ones() {
+        let workspace = Path::new("/tmp/ws");
+
+        assert_eq!(
+            workspace_relative_path(workspace, "src/lib.rs"),
+            Some(PathBuf::from("src/lib.rs"))
+        );
+        assert_eq!(
+            workspace_relative_path(workspace, "/tmp/ws/src/lib.rs"),
+            Some(PathBuf::from("src/lib.rs"))
+        );
+        assert_eq!(
+            workspace_relative_path(workspace, "/tmp/other/lib.rs"),
+            None
+        );
+        assert_eq!(workspace_relative_path(workspace, "../escape"), None);
+        assert_eq!(workspace_relative_path(workspace, ""), None);
+        assert_eq!(workspace_relative_path(workspace, "   "), None);
     }
 
     #[test]

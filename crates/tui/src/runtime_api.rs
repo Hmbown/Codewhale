@@ -1145,6 +1145,7 @@ pub fn build_router(state: RuntimeApiState) -> Router {
         .route("/v1/threads/{id}/fork", post(fork_thread))
         .route("/v1/threads/{id}/undo", post(undo_thread_turn))
         .route("/v1/threads/{id}/patch-undo", post(patch_undo_thread_turn))
+        .route("/v1/threads/{id}/file-revert", post(revert_thread_file))
         .route("/v1/threads/{id}/retry", post(retry_thread_turn))
         .route(
             "/v1/threads/{id}/turn-operations/{operation_key}",
@@ -4488,13 +4489,23 @@ async fn patch_undo_thread_turn(
 ) -> Result<(StatusCode, Json<PatchUndoResponse>), ApiError> {
     let depth = req.depth.unwrap_or(0);
 
-    // Step 1: Try snapshot-based file rollback (patch_undo).
     let thread = state
         .runtime_threads
         .get_thread(&id)
         .await
         .map_err(map_thread_err)?;
-    let patch_result = patch_undo_workspace_files(&thread.workspace, thread.session_id.as_deref());
+
+    // File rollback is a workspace mutation, so it needs the trust the TUI's
+    // `/undo` requires. Read it from the thread's own record: the client does
+    // not get to assert it, and the decision belongs here, where the rollback
+    // target is known.
+    let trusted = thread.trust_mode || thread.auto_approve;
+
+    // Step 1: snapshot-based file rollback. The `?` is deliberate — a refusal
+    // or a failed restore aborts *before* the conversation is forked, so the
+    // turn never disappears while its file changes stay on disk.
+    let patch_result =
+        patch_undo_workspace_files(&thread.workspace, thread.session_id.as_deref(), trusted)?;
 
     // Step 2: Remove the last conversation turn (undo_conversation).
     let (forked_thread, original_user_text, original_user_images, _) = state
@@ -4516,75 +4527,97 @@ async fn patch_undo_thread_turn(
 
 /// Restore the newest `tool:` or `pre-turn:` snapshot that differs from the
 /// current workspace — same target selection as the TUI's `patch_undo`.
+///
+/// # The rollback contract
+///
+/// `Ok` is a decision the conversation fork may proceed on: either the files
+/// were restored, or there was *provably* nothing to restore. `Err` aborts the
+/// whole undo, and the caller must not fork either — dropping the turn while
+/// leaving its file changes on disk hands the user a workspace the transcript
+/// can no longer account for, which is worse than refusing outright.
+///
+/// `trusted` mirrors the gate the TUI's `patch_undo()` applies
+/// (`yolo || trust_mode`). It is evaluated *after* a real target is found, so
+/// that "there was nothing to revert" still undoes the conversation, while
+/// "there is something to revert but you are not trusted" aborts.
 fn patch_undo_workspace_files(
     workspace: &FsPath,
     current_session_id: Option<&str>,
-) -> PatchUndoResult {
+    trusted: bool,
+) -> Result<PatchUndoResult, ApiError> {
     let repo = match crate::snapshot::SnapshotRepo::open_or_init(workspace) {
         Ok(repo) => repo,
         Err(e) => {
-            return PatchUndoResult {
+            // Degrade, but loudly. The snapshot repo was never usable for this
+            // workspace, so there is no rollback expectation to correct — but
+            // the result must still say the files were left alone rather than
+            // let a conversation-only undo read as a successful rollback.
+            return Ok(PatchUndoResult {
                 files_restored: false,
-                summary: Some(format!("Snapshot repo unavailable: {e}")),
+                summary: Some(format!(
+                    "Workspace files were NOT reverted — snapshot repo unavailable: {e}"
+                )),
                 snapshot_label: None,
-            };
+            });
         }
     };
     let Some(current_session_id) = current_session_id else {
-        return PatchUndoResult {
+        return Ok(PatchUndoResult {
             files_restored: false,
             summary: Some(
                 "No current session is bound to this thread; workspace files were not changed."
                     .to_string(),
             ),
             snapshot_label: None,
-        };
+        });
     };
-    let snapshots = match repo.list(100) {
-        Ok(snapshots) => snapshots,
-        Err(e) => {
-            return PatchUndoResult {
-                files_restored: false,
-                summary: Some(format!("Failed to list snapshots: {e}")),
-                snapshot_label: None,
-            };
-        }
-    };
+    let snapshots = repo
+        .list(100)
+        .map_err(|e| ApiError::internal(format!("Failed to list snapshots: {e}")))?;
     let target = snapshots
         .iter()
         .filter(|s| s.label.starts_with("tool:") || s.label.starts_with("pre-turn:"))
         .filter(|s| s.session_id.as_deref() == Some(current_session_id))
         .find(|s| matches!(repo.work_tree_matches_snapshot(&s.id), Ok(false)));
     let Some(target) = target else {
-        return PatchUndoResult {
+        return Ok(PatchUndoResult {
             files_restored: false,
             summary: Some(
                 "No current-session tool or pre-turn snapshots differ from the current workspace."
                     .to_string(),
             ),
             snapshot_label: None,
-        };
+        });
     };
-    if let Err(e) = repo.restore(&target.id) {
-        return PatchUndoResult {
-            files_restored: false,
-            summary: Some(format!("Restore failed: {e}")),
-            snapshot_label: None,
-        };
+
+    // Restoring is a workspace mutation. Gate it exactly where the TUI gates
+    // it — after a real, current-session target is known — so the two surfaces
+    // cannot drift into "one refuses, the other half-undoes".
+    if !trusted {
+        return Err(ApiError::conflict(
+            "Refusing to undo workspace files outside trusted mode. \
+             Turn on /trust or switch this thread to Full Access, then undo again.",
+        ));
     }
 
-    // Compute a diff stat for the summary.
-    use crate::dependencies::{ExternalTool as _, Git};
-    let diff_stat = Git::command().and_then(|mut git| {
-        git.args(["diff", "--stat"])
-            .current_dir(workspace)
-            .output()
-            .ok()
-            .and_then(|o| {
-                let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
-                if s.is_empty() { None } else { Some(s) }
-            })
-    });
+    // Capture what this restore is about to change *before* it runs: after the
+    // checkout the work tree matches the snapshot, so a post-restore stat would
+    // always be empty. Runs against the side repo, not the user's — the user's
+    // `git diff --stat` reports their own uncommitted work, which is not what
+    // the undo changed.
+    let diff_stat = match repo.snapshot_diff_stat(&target.id) {
+        Ok(stat) => stat,
+        Err(e) => {
+            tracing::warn!(
+                target: "snapshot",
+                "diff stat for the patch-undo summary failed: {e}"
+            );
+            None
+        }
+    };
+
+    repo.restore(&target.id)
+        .map_err(|e| ApiError::internal(format!("Restore failed: {e}")))?;
 
     let short = &target.id.as_str()[..target.id.as_str().len().min(8)];
     let summary = match diff_stat {
@@ -4593,15 +4626,143 @@ fn patch_undo_workspace_files(
             target.label, short
         ),
         None => format!(
-            "Restored snapshot '{}' ({}). No diff changes detected.",
+            "Restored snapshot '{}' ({}). No diff stat available.",
             target.label, short
         ),
     };
-    PatchUndoResult {
+    Ok(PatchUndoResult {
         files_restored: true,
         summary: Some(summary),
         snapshot_label: Some(target.label.clone()),
+    })
+}
+
+#[derive(Debug, Deserialize)]
+struct RevertThreadFileRequest {
+    /// The single file to restore, relative to the thread's workspace.
+    /// Absolute paths inside the workspace are accepted and normalized.
+    path: String,
+}
+
+#[derive(Debug, Serialize)]
+struct RevertThreadFileResponse {
+    /// Workspace-relative path that was restored.
+    path: String,
+    /// What the restore did to the working tree: `modified`, `recreated`, or
+    /// `removed`.
+    action: String,
+    /// Snapshot the file came from.
+    snapshot_id: String,
+    snapshot_label: String,
+}
+
+/// Restore one file from the newest snapshot that still owns it.
+///
+/// The file-scoped counterpart of `patch-undo`. Where `patch-undo` checks out
+/// a whole snapshot tree, this restores exactly one path, so unrelated
+/// working-tree changes are never rolled back. Snapshot ownership follows the
+/// same rule the TUI's `/undo` applies before it touches files: only
+/// `tool:`/`pre-turn:` snapshots tagged with this thread's own session are
+/// candidates, so a revert cannot reach into another conversation's work.
+///
+/// Nothing to revert is a `409`, not a silent success: the GUI needs to tell
+/// the user *why* the button did nothing.
+async fn revert_thread_file(
+    State(state): State<RuntimeApiState>,
+    Path(id): Path<String>,
+    Json(req): Json<RevertThreadFileRequest>,
+) -> Result<Json<RevertThreadFileResponse>, ApiError> {
+    let thread = state
+        .runtime_threads
+        .get_thread(&id)
+        .await
+        .map_err(map_thread_err)?;
+    let workspace = thread.workspace.clone();
+    let Some(session_id) = thread.session_id.clone() else {
+        return Err(ApiError::conflict(
+            "Thread has no bound session, so no snapshot can be proven to own this file.",
+        ));
+    };
+    let raw_path = req.path;
+
+    // Snapshot listing, diffing and checkout all shell out to git; keep that
+    // off the async runtime's worker threads.
+    let response = tokio::task::spawn_blocking(move || {
+        revert_file_from_snapshot(&workspace, &session_id, &raw_path)
+    })
+    .await
+    .map_err(|e| ApiError::internal(format!("file revert task failed: {e}")))??;
+
+    Ok(Json(response))
+}
+
+fn revert_file_from_snapshot(
+    workspace: &FsPath,
+    session_id: &str,
+    raw_path: &str,
+) -> Result<RevertThreadFileResponse, ApiError> {
+    // Every caller-supplied path passes through this one gate. It accepts a
+    // workspace-relative path or an absolute path inside the workspace and
+    // rejects everything else (`..`, empty, or outside the work tree) before
+    // anything is compared or checked out.
+    let Some(rel) = crate::snapshot::workspace_relative_path(workspace, raw_path) else {
+        return Err(ApiError::bad_request(format!(
+            "path must name a file inside the thread workspace {}; got '{}'",
+            workspace.display(),
+            raw_path
+        )));
+    };
+
+    let repo = crate::snapshot::SnapshotRepo::open_or_init(workspace)
+        .map_err(|e| ApiError::internal(format!("Snapshot repo unavailable: {e}")))?;
+    let snapshots = repo
+        .list(100)
+        .map_err(|e| ApiError::internal(format!("Failed to list snapshots: {e}")))?;
+
+    // Walk newest-first and stop at the first snapshot this session owns whose
+    // copy of this one file differs from the working tree — the file-scoped
+    // analogue of the whole-tree "first snapshot that differs" cursor.
+    let mut target = None;
+    for snapshot in snapshots
+        .iter()
+        .filter(|s| s.label.starts_with("tool:") || s.label.starts_with("pre-turn:"))
+        .filter(|s| s.session_id.as_deref() == Some(session_id))
+    {
+        let differs = repo
+            .path_differs_from_snapshot(&snapshot.id, &rel)
+            .map_err(|e| ApiError::internal(format!("Failed to inspect snapshots: {e}")))?;
+        if differs {
+            target = Some(snapshot);
+            break;
+        }
     }
+
+    let Some(target) = target else {
+        return Err(ApiError::conflict(format!(
+            "No snapshot owned by this session differs from '{}' — there is nothing to revert.",
+            rel.display()
+        )));
+    };
+
+    let paths = [rel.clone()];
+    let outcomes = repo
+        .restore_paths(&target.id, &paths)
+        .map_err(|e| ApiError::internal(format!("File restore failed: {e}")))?;
+
+    let Some(outcome) = outcomes.into_iter().next() else {
+        return Err(ApiError::conflict(format!(
+            "Snapshot '{}' already matches '{}' — nothing was reverted.",
+            target.label,
+            rel.display()
+        )));
+    };
+
+    Ok(RevertThreadFileResponse {
+        path: outcome.path.to_string_lossy().into_owned(),
+        action: outcome.action.as_str().to_string(),
+        snapshot_id: target.id.as_str().to_string(),
+        snapshot_label: target.label.clone(),
+    })
 }
 
 #[derive(Debug, Deserialize)]
