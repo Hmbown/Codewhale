@@ -120,7 +120,10 @@ inputs before replacing the active habitat. Each archive starts with an exact
 checkpoint, and the running world retires history only after storage succeeds.
 The active QuickJS worker remains limited to 64 MiB; retained archives grow on
 disk. The standalone live recorder separately rotates bounded JSONL segments at
-the same watched pathname; see `pet/README.md` for its limits and recovery.
+the same watched pathname. Its `--resume` option preserves the previous tape in
+an archive and starts unknown at that path; the saved world stays with its host.
+A process-lifetime OS lock excludes competing recorders and releases on crash.
+See `pet/README.md` for limits and recovery.
 
 `/workbar watch export` writes a new immutable `artifacts/pet/replay-<id>.json`
 and reports its path through the existing toast system and transcript. Import it in the web
@@ -148,7 +151,9 @@ The live Runtime SSE adapter and this foreground protocol adapter consume
 different existing input contracts; they share event-v1 projection semantics,
 the bucketer, world and score. The Runtime importer separately pairs request
 lifecycles and preserves failure receipt times. Its local SSE/CLI and browser
-fixtures pass; authenticated real-session attachment remains unverified. The
+fixtures pass. Authenticated read-only observation of an existing local Runtime
+journal is verified; new active-session delivery through the native companions
+still needs acceptance QA. The
 source and liveness contracts are documented in `pet/README.md`.
 
 The full TUI binary builds offline, its foreground metadata projection test

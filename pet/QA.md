@@ -184,3 +184,28 @@ open junctions; the same particle identities return to the whale at rest.
 
 Hosted CI and Grokbot findings are separate evidence. Their actual results belong
 on the pull request. Open implementation gaps are listed in [README.md](README.md).
+
+
+## Recorder process restart — September 12, 2026
+
+`--resume` restarts a live recorder at its existing watched pathname. It validates
+and archives the previous complete tape without changing its bytes, continues
+numbered archives, and starts a fresh unknown segment. The existing host habitat
+owns world continuation. No outage duration or activity is inferred from mtime.
+A private empty sidecar uses Node SQLite's OS lock to exclude simultaneous
+writers and release ownership on close or process death. It stores no events.
+
+The local pet check passed 61 tests with zero failures. The focused recorder
+checks cover repeated restarts, archive gaps, baseline/fresh live delivery,
+invalid and incomplete source preservation, a competing writer, changed locks,
+same-size external changes, SIGKILL followed by restart, and clean CLI shutdown.
+Against the previous `6d960525` recorder, resuming rejects with EEXIST and a
+same-size external rewrite is incorrectly accepted; the new guards reject it.
+The required `npm test && npm run check:web` gate passed 66 package, 12 SDK and
+446 web tests, with zero failures and two existing web-check warnings.
+
+This changes the standalone recorder, its tests and documentation. World, score,
+TUI and native bundle bytes are unchanged from the previously verified build.
+Grokbot review and current-head Windows/macOS recorder CI are separate receipts.
+Native active-session delivery, current macOS popover inspection and device
+transport remain open. No release or deployment is implied.

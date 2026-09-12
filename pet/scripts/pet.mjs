@@ -12,17 +12,17 @@ import { createPetRecorder } from './lib/pet-recorder.mjs';
 const args = process.argv.slice(2);
 const option = name => args.find(a => a.startsWith(`--${name}=`))?.slice(name.length + 3);
 if (args.includes('--help')) {
-  console.log('node scripts/pet.mjs --input=trace.jsonl --output=pet.jsonl [--trace=ID] [--format=jsonl|tsv] [--watch]\nnode scripts/pet.mjs --runtime=http://127.0.0.1:7878 --thread=ID --output=pet.jsonl [--segment-buckets=216000]\nUse --demo instead of --input for synthetic telemetry. Output must not already exist.\nLive recording rotates at 216000 buckets or 64 MiB into OUTPUT.segment-NNNNNN.jsonl and continues at the same live path. All archives are retained.\nRuntime reads only the existing local event journal. Optional authentication comes from CODEWHALE_RUNTIME_TOKEN; never put a token in the URL. No agent or provider is started.');
+  console.log('node scripts/pet.mjs --input=trace.jsonl --output=pet.jsonl [--trace=ID] [--format=jsonl|tsv] [--watch]\nnode scripts/pet.mjs --runtime=http://127.0.0.1:7878 --thread=ID --output=pet.jsonl [--segment-buckets=216000] [--resume]\nUse --demo instead of --input for synthetic telemetry. Output must not already exist unless --resume is used for live recording. A resumed recorder preserves the previous segment and starts unknown at the same path.\nLive recording rotates at 216000 buckets or 64 MiB into OUTPUT.segment-NNNNNN.jsonl and continues at the same live path. All archives are retained.\nRuntime reads only the existing local event journal. Optional authentication comes from CODEWHALE_RUNTIME_TOKEN; never put a token in the URL. No agent or provider is started.');
   process.exit(0);
 }
 let output, recorder, monitor, timer, runtime;
 try {
-  for (const a of args) if (!['--demo', '--watch'].includes(a) && !/^--(input|output|trace|format|runtime|thread|segment-buckets)=.+/.test(a)) throw new Error('Unknown or empty option. Use --help.');
+  for (const a of args) if (!['--demo', '--watch', '--resume'].includes(a) && !/^--(input|output|trace|format|runtime|thread|segment-buckets)=.+/.test(a)) throw new Error('Unknown or empty option. Use --help.');
   const input = option('input'), runtimeURL = option('runtime'), path = option('output'), format = option('format') ?? 'jsonl', live = args.includes('--watch') || !!runtimeURL;
   if (!path || [!!input, args.includes('--demo'), !!runtimeURL].filter(Boolean).length !== 1
     || !['jsonl', 'tsv'].includes(format) || live && format !== 'jsonl' || args.includes('--watch') && !input
-    || !!runtimeURL !== !!option('thread') || option('trace') && !input || option('segment-buckets') && !live)
-    throw new Error('Choose one input source, an unused --output path, and JSONL for live recording. Runtime requires --thread.');
+    || !!runtimeURL !== !!option('thread') || option('trace') && !input || option('segment-buckets') && !live || args.includes('--resume') && !live)
+    throw new Error('Choose one input source, an unused --output path (or --resume), and JSONL for live recording. Runtime requires --thread.');
   const load = async () => {
     if (!input) return { events: petDemoEvents(), duration: 80_000 };
     if ((await stat(input)).size > 64 * 1024 * 1024) throw new Error('Input exceeds 64 MiB.');
@@ -32,7 +32,7 @@ try {
     return trace;
   };
   let trace = runtimeURL ? undefined : await load(), buckets = compilePetTelemetry(trace?.events ?? [], trace?.duration ?? 0);
-  if (live) recorder = await createPetRecorder(path, { maxBuckets: option('segment-buckets') === undefined ? 216_000 : Number(option('segment-buckets')), report: text => console.error(text) });
+  if (live) recorder = await createPetRecorder(path, { resume: args.includes('--resume'), maxBuckets: option('segment-buckets') === undefined ? 216_000 : Number(option('segment-buckets')), report: text => console.error(text) });
   else output = await open(path, 'wx', 0o600);
   if (runtimeURL) runtime = await followRuntime({ baseUrl: runtimeURL, threadId: option('thread'),
     token: process.env.CODEWHALE_RUNTIME_TOKEN, report: text => console.error(text) });
@@ -88,7 +88,7 @@ try {
           }
         } else {
           const bin = Math.floor((offset + elapsed) / 400);
-          state = failed ? empty : buckets[bin] ?? empty;
+          state = failed || sequence === 0 ? empty : buckets[bin] ?? empty;
           if (bin === lastBin) state = { ...state, onsets: Array(13).fill(0), errors: 0 };
           lastBin = bin;
         }

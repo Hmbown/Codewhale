@@ -95,10 +95,13 @@ The adapter only reads the existing Runtime journal endpoint
 cd pet
 node scripts/pet.mjs --runtime=http://127.0.0.1:7878 --thread=THREAD_ID --output=pet.jsonl
 node scripts/pet.mjs --input=trace.jsonl --output=other.pet.jsonl --watch
+# Restart an existing live recording at the same path:
+node scripts/pet.mjs --runtime=http://127.0.0.1:7878 --thread=THREAD_ID --output=pet.jsonl --resume
 node scripts/pet.mjs --demo --output=demo.pet.jsonl
 ```
 
-Choose an existing thread and an unused output path. Optional authentication
+Choose an existing thread and an unused output path, or use `--resume` to restart
+a stopped live recorder at its existing path. Optional authentication
 comes from `CODEWHALE_RUNTIME_TOKEN`; tokens are rejected in URLs. Only plain
 HTTP loopback IP origins are accepted. Redirects, invalid envelopes and cursor
 holes are rejected; reconnects resume from the last accepted Runtime cursor.
@@ -118,8 +121,20 @@ events for the bucketer's recurrence window. It removes raw payloads immediately
 Completed output segments remain on disk, so disk use grows with recorded history.
 Rotation requires same-directory hard links and atomic replacement. Unsupported
 storage, an archive-name collision or an external replacement stops recording
-without overwriting the existing files. Restart the recorder with a new unused
-output path; it does not resume a previous process's recording.
+without overwriting the existing files. With `--resume`, the recorder validates
+the previous complete tape, preserves its exact bytes in the next numbered
+archive, and starts a new segment at the same live path. The first bucket is
+unknown; fresh source observations follow. It never invents events or estimates
+the duration of an outage from file timestamps. The companion's separately saved
+habitat preserves its particles and clock across attachment.
+
+A private, empty `OUTPUT.writer-lock` sidecar uses Node's built-in SQLite OS lock
+to exclude simultaneous recorders. Keep this file in place; its lock is released
+on close or process death without deleting a stale PID file. It contains no
+events. Use local storage with working OS locks, hard links and atomic rename.
+Malformed, incomplete, oversized or non-file previous tapes are preserved and
+rejected; use a new output path while retaining the original for recovery.
+`--resume` applies only to live recording, and can also create an unused path.
 
 The thin wire is JSONL, one flat version-1 `PetBucket` per line: PetState plus
 `sequence`, `simTimeMs`, `durationMs`, thirteen-element `onsets` and `activeMs`,
