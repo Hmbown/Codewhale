@@ -141,8 +141,27 @@ public enum PetCoreError: Error, LocalizedError {
     public func pcm(voice: PetVoice, startSample: Int, length: Int, rate: Int) throws -> [[Float]] {
         let voices = String(decoding: try JSONEncoder().encode([voice]), as: UTF8.self)
         failure = nil
-        let text = world.invokeMethod("pcm", withArguments: [voices, startSample, length, rate])?.toString()
-        guard let text, failure == nil else { throw PetCoreError.invalid(failure ?? "Unable to render pet audio.") }
-        return try JSONDecoder().decode([[Float]].self, from: Data(text.utf8))
+        guard let channels = world.invokeMethod("pcmChannels", withArguments: [voices, startSample, length, rate]), failure == nil,
+              channels.isArray, channels.forProperty("length")?.toInt32() == 2
+        else { throw PetCoreError.invalid(failure ?? "Unable to render pet audio.") }
+        return try (0..<2).map { index in
+            guard let channel = channels.atIndex(index) else { throw PetCoreError.invalid("Missing pet audio channel.") }
+            let ctx = context.jsGlobalContextRef
+            var exception: JSValueRef?
+            guard JSValueGetTypedArrayType(ctx, channel.jsValueRef, &exception) == kJSTypedArrayTypeFloat32Array,
+                  exception == nil, let object = JSValueToObject(ctx, channel.jsValueRef, &exception), exception == nil,
+                  JSObjectGetTypedArrayLength(ctx, object, &exception) == length, exception == nil
+            else { throw PetCoreError.invalid("Invalid pet PCM buffer.") }
+            if length == 0 { return [] }
+            guard let bytes = JSObjectGetTypedArrayBytesPtr(ctx, object, &exception), exception == nil
+            else { throw PetCoreError.invalid("Pet PCM buffer is unavailable.") }
+            // JavaScriptCore guarantees this pointer only until its next API
+            // call. Copy immediately; no JS-backed memory escapes the method.
+            let samples = withExtendedLifetime(channel) {
+                Array(UnsafeBufferPointer(start: bytes.assumingMemoryBound(to: Float.self), count: length))
+            }
+            guard samples.allSatisfy(\.isFinite) else { throw PetCoreError.invalid("Invalid pet PCM samples.") }
+            return samples
+        }
     }
 }

@@ -72,6 +72,11 @@ It journals accepted telemetry, interactions, behaviors and persistent pod slots
 positions, so buffer partitioning cannot change the score. Audio mixing is a
 host concern. `pet-native.ts` exposes this exact core to QuickJS/JavaScriptCore.
 The TUI, Apple and Android hosts do not carry their own event bucketers or score schedulers.
+Apple copies validated Float32 PCM channels directly from JavaScriptCore into
+native buffers; it does not serialize sample arrays as JSON. AVAudioEngine
+follows the world clock, rebases presentation after a stall, and discards stale
+voices after a long gap. Device or rendering failures mute sound and report a
+message while the world, persistence and export continue.
 
 The Rust particle implementation lives in the product's
 `crates/tui/src/tui/ambient_life/pet_sim.rs`; this package's runner imports it.
@@ -167,11 +172,13 @@ tail on an IO worker, closes it on pause/background, and discards delayed delive
 The file must be updated by a producer; selecting a completed tape does not make
 it live. Use Import to replay that tape. Device files are not automatically synced
 from the desktop recorder.
-Authenticated read-only attachment has been exercised against a running local
-Runtime 0.9.13 and an existing session journal. Old completed work remains unknown
-at the recorder's current clock. The recorder also closes an idle stream after
-garbage collection. Receiving new active-session work through native companion
-surfaces still needs acceptance QA.
+The current live chain has been exercised with typed synthetic Engine events
+through the actual Runtime journal/SSE endpoint, recorder process and Apple
+file watcher/host. The world receives a fresh human request and clears it after
+its answer; prompt, question and answer text stay out of the recording. This
+uses the existing mock Engine handle without calling a provider. The older
+read-only Runtime 0.9.13 receipt predates the required progress capability and
+does not establish current compatibility.
 
 ## Persistence and current limits
 
@@ -214,7 +221,9 @@ A 30-hour synthetic Still run of the shared core rotated 263 segments and kept
 the active file below 0.45 MB, with exact checkpoint continuation after every
 rotation. Apple and Android separately exercise archive publication, failed saves
 and continued execution in their actual embedded engines. This is not 30 hours
-of animated native-device or power testing. Physical Android device acceptance,
-macOS popover inspection, active-session companion acceptance and final
-listening/power quality remain unfinished. This branch is a reviewable prototype,
-not a release candidate.
+of animated native-device or power testing. Current platform builds, replay,
+live file delivery and measured audio output have separate receipts in [QA.md](QA.md).
+Automatic desktop-to-phone transport is not included: mobile hosts consume a
+local file using the shared contract. Physical-phone listening/battery quality
+and current macOS popover inspection have not been established. The source is
+available as a development build; this branch has not been released.

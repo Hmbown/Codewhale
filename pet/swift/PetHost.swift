@@ -150,13 +150,14 @@ public func petArchiveLabel(_ name: String) -> String {
     }
     private func configureSound() {
         do { try audio.setEnabled(sound && !paused && !failed && !restoring, simulationTime: (core?.frame.timeMs ?? 0) / 1000) }
-        catch { message = "Sound unavailable: \(error.localizedDescription)" }
+        catch { sound = false; message = "Sound unavailable: \(error.localizedDescription)" }
     }
     private func tick() {
         guard !paused, !failed, !restoring, let core else { return }
         do {
             let f = try core.tick(motion: !(still || systemReducedMotion))
-            try audio.present(f.voices, core: core)
+            do { try audio.present(f.voices, core: core) }
+            catch { sound = false; message = "Sound unavailable: \(error.localizedDescription)" }
             count += 1; if count % 150 == 0 { save() }
             objectWillChange.send()
         } catch { audio.stop(); failed = true; message = error.localizedDescription }

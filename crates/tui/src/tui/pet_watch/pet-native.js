@@ -12,7 +12,7 @@ const pet_telemetry_js_1 = require("./pet-telemetry.js");
 const pet_sim_js_1 = require("./pet-sim.js");
 const pet_audio_js_1 = require("./pet-audio.js");
 const pet_engine_js_1 = require("./pet-engine.js");
-/** Synchronous JSON boundary for JavaScriptCore and embedded JS runtimes.
+/** Synchronous native boundary: JSON state and directly transferable PCM.
  * Native hosts share the actual world / score implementation, not a rewrite. */
 class PetNative {
     world;
@@ -101,9 +101,12 @@ class PetNative {
         return JSON.stringify({ width, height, cells, timeMs: frame.timeMs, channel: frame.state.channel, arch: pet_sim_js_1.ARCH_OF[frame.state.channel],
             hollow: frame.state.observed < .92, dozing: frame.behaviour === 'doze', lit: frame.state.lit });
     }
-    pcm(voicesJSON, startSample, length, rate) {
+    pcmChannels(voicesJSON, startSample, length, rate) {
         const p = (0, pet_audio_js_1.renderPetPCM)(JSON.parse(voicesJSON), startSample, length, rate);
-        return JSON.stringify([Array.from(p.left), Array.from(p.right)]);
+        return [p.left, p.right];
+    }
+    pcm(voicesJSON, startSample, length, rate) {
+        return JSON.stringify(this.pcmChannels(voicesJSON, startSample, length, rate).map(channel => Array.from(channel)));
     }
 }
 exports.PetNative = PetNative;

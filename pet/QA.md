@@ -17,9 +17,10 @@ npm test
 npm run check:web
 ```
 
-The pet suite currently contains 48 tests: event occupancy/unknown coverage,
+The pet suite currently contains 63 tests: event occupancy/unknown coverage,
 late failures, human request pairing, read-only local SSE reconnect/cursor
-recovery and cancellation after garbage collection, deterministic world/score/PCM,
+recovery, replay readiness and cancellation after garbage collection, bounded
+long sessions and recorder process restart, deterministic world/score/PCM,
 checkpoint integrity and continuation, immutable segment boundaries, pending input
 retention, browser saves overlapping source changes, live-file freshness/restarts,
 delayed browser reads crossing suspension, expression-version validation and legacy replay.
@@ -67,6 +68,9 @@ workflows, including a generated two-hour synthetic unknown recording, segment
 publication, a save conflict that must preserve the running world, and actual
 live-file appends, pause/resume, in-place restarts, replacement and recreation. It writes
 only disposable fixtures under ignored conformance results and temporary storage.
+The same executable checks 27 tone/noise/long-clock PCM ranges at three sample
+rates through the actual JavaScriptCore Float32 boundary, comparing sample bits
+with the retained JSON path and rejecting malformed or nonfinite buffers.
 Kotlin 2.3.0 can instead be on PATH; its verifier builds only the particle core
 and conformance runner. The actual Compose application is a separate Gradle build:
 
@@ -182,8 +186,9 @@ open junctions; the same particle identities return to the whale at rest.
   companion acceptance. The old idle-stream shutdown failure is covered by a
   real HTTP regression fixture that forces garbage collection before closing.
 
-Hosted CI and Grokbot findings are separate evidence. Their actual results belong
-on the pull request. Open implementation gaps are listed in [README.md](README.md).
+These chronological receipts describe the source at each milestone; later
+sections supersede earlier open items. Hosted CI and Grokbot findings are separate
+evidence on the pull request. Current limits are listed in [README.md](README.md).
 
 
 ## Recorder process restart — September 12, 2026
@@ -257,3 +262,55 @@ These are synthetic event fixtures with real transports, not provider calls.
 
 World, score and native bundle bytes are unchanged. Hosted CI, independent
 Codewhalebot QA, and active-session native delivery remain separate evidence.
+
+
+## Apple audio and scope audit — September 12, 2026
+
+Apple now transfers the shared generator's Float32 channels directly from
+JavaScriptCore. Each channel's type, length and finite samples are checked; its
+borrowed pointer is copied immediately while the JS value remains rooted.
+The JSON PCM method remains available to QuickJS consumers. There is one score
+and sample generator.
+
+Actual AVAudioEngine playback exposed schedules more than a second in the past
+after a 750 ms UI stall. Presentation now rebases against the current world and
+retires stale voices after long gaps. Completion callbacks carry numeric tickets
+back to the main actor, preventing an old completion from retiring a newer node.
+A sound failure mutes and persists the sound preference while world ticks and
+recording exports continue. The previous Apple host stops the world on the same
+injected PCM failure; the corrected host advances from 400 ms to 933 ms and exports.
+
+Local final-source receipts:
+
+- Pet checks: 63 passed, zero failed/canceled. Required product gate: 66 package,
+  14 SDK and 446 web tests passed; web check has zero errors and two existing warnings.
+- Apple: all 11 checkpoint/live-file/storage workflows and 27 exact PCM ranges
+  pass, plus empty/invalid range and four malformed-buffer checks. macOS builds,
+  signs and verifies; iOS Simulator builds from the same final Swift sources.
+- Real AVAudioEngine: 150 frames complete with a forced 750 ms stall. All 12
+  scheduled onsets remain in the future (42–118 ms); the prior output drifts
+  down to 1,703 ms late. This proves scheduling, not subjective listening quality.
+- An 80-second synthetic profile renders 122 voices. Audio-frame p95 falls from
+  70.6 ms on JSON transport to 23.4 ms on final typed transfer, with the same
+  final particle digest and sample peak. An earlier typed-transfer run had zero
+  frames over 33 ms; the final run had six wall-time outliers (worst 738 ms) on
+  the concurrently used machine. This is not a hard frame-time guarantee.
+- The regenerated bundle passes 12 actual TUI Watch tests and all 11 Android
+  instrumentation tests together, plus APK assembly and lint. The score and
+  particle algorithms are unchanged.
+
+The original A–F workstreams map to implemented, buildable source:
+
+| Workstream | Implementation and evidence |
+| --- | --- |
+| A — World | Shared seeded behavior state machine, environment, interaction journal, doze/wake, persistent pod identities and versioned forms. Browser/Apple/Android replay and checkpoint workflows; 380 four-port conformance checkpoints. |
+| B — Audio | One thirteen-category score and PCM generator; browser WebAudio, Apple AVAudioEngine, Android AudioTrack and opt-in TUI ffplay. Deterministic PCM, native cursor tests, Apple output/stall/failure receipts. Listening quality remains a separate human assessment. |
+| C — TUI | Existing Engine events feed Watch through the canonical bucketer; bounded cameo honors open-water collision, palette and motion rules. Actual product build, PTY interaction and 12 Watch checks. |
+| D — macOS | Locally signed LSUIElement application, menu-bar controls, launch-at-login option, Still/sound/source settings and DispatchSource live files. Real process persistence and host workflows; current popover inspection is unverified. |
+| E — Mobile | SwiftUI Simulator app and Compose Android app use the same core and local-file contract. iOS build plus prior Simulator restoration/export/recovery; Android APK/lint plus 11 real-engine/device-lifecycle tests. No automatic phone link is claimed. |
+| F — Live authority | Existing Engine journal and opt-in Runtime replay progress feed one event-v1 bucketer. Synthetic Engine → actual Runtime/SSE → recorder → native Apple host passes without provider calls or raw prompt capture. |
+
+Source and build instructions are published on PR #6110. Commit-specific
+Grokbot review and GitHub checks are recorded there. Shipping, signing for public
+distribution and subjective audiovisual acceptance are not implied by these
+local builds or by a prior commit's green CI.

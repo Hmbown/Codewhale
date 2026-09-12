@@ -4,7 +4,7 @@ import { ARCH_OF, digest, layout } from './pet-sim.js';
 import { renderPetPCM, type PetVoice } from './pet-audio.js';
 import { PetEngineTelemetry } from './pet-engine.js';
 
-/** Synchronous JSON boundary for JavaScriptCore and embedded JS runtimes.
+/** Synchronous native boundary: JSON state and directly transferable PCM.
  * Native hosts share the actual world / score implementation, not a rewrite. */
 export class PetNative {
   private world: PetWorld;
@@ -80,8 +80,11 @@ export class PetNative {
     return JSON.stringify({ width, height, cells, timeMs: frame.timeMs, channel: frame.state.channel, arch: ARCH_OF[frame.state.channel],
       hollow: frame.state.observed < .92, dozing: frame.behaviour === 'doze', lit: frame.state.lit });
   }
-  pcm(voicesJSON: string, startSample: number, length: number, rate: number): string {
+  pcmChannels(voicesJSON: string, startSample: number, length: number, rate: number): [Float32Array, Float32Array] {
     const p = renderPetPCM(JSON.parse(voicesJSON) as PetVoice[], startSample, length, rate);
-    return JSON.stringify([Array.from(p.left), Array.from(p.right)]);
+    return [p.left, p.right];
+  }
+  pcm(voicesJSON: string, startSample: number, length: number, rate: number): string {
+    return JSON.stringify(this.pcmChannels(voicesJSON, startSample, length, rate).map(channel => Array.from(channel)));
   }
 }

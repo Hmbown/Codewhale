@@ -1,5 +1,6 @@
 import Foundation
 import Darwin
+import JavaScriptCore
 
 @main struct AppleCheckpointProof {
     static func require(_ condition: @autoclosure () throws -> Bool, _ message: String) throws {
@@ -23,12 +24,52 @@ import Darwin
     @MainActor static func main() async throws {
         let args = CommandLine.arguments
         let pet = URL(fileURLWithPath: args[1]), out = URL(fileURLWithPath: args[2])
-        let bundle = Bundle(url: pet.appendingPathComponent("macos/CodewhalePet.app"))!
+        let bundle = Bundle(url: args.count > 3 ? URL(fileURLWithPath: args[3]) : pet.appendingPathComponent("macos/CodewhalePet.app"))!
         let script = bundle.url(forResource: "pet-native", withExtension: "js")!
         let tape = try String(contentsOf: bundle.url(forResource: "demo", withExtension: "jsonl")!, encoding: .utf8)
         let points = try String(contentsOf: pet.appendingPathComponent("public/whale-points.tsv"), encoding: .utf8).split(separator: "\n").map { line -> (Double, Double) in
             let v = line.split(separator: "\t").map { Double($0)! }; return (v[0], v[1])
         }
+        // Exercise the actual JavaScriptCore typed-array boundary, including
+        // partial and empty ranges, against the retained JSON transport.
+        let referenceContext = JSContext()!
+        referenceContext.evaluateScript(try String(contentsOf: script, encoding: .utf8))
+        let pointJSON = String(decoding: try JSONSerialization.data(withJSONObject: points.map { [$0.0, $0.1] }), as: UTF8.self)
+        let reference = referenceContext.objectForKeyedSubscript("PetNative")!.construct(withArguments: [pointJSON])!
+        let audioCore = try PetNativeCore(points: points, bundle: script)
+        let audioVoices = [
+            PetVoice(id: "tone", start: 0, duration: 0.44, frequency: 196, gain: 0.04, pan: -0.6, kind: "tone"),
+            PetVoice(id: "noise", start: 12.033, duration: 0.22, frequency: 740, gain: 0.05, pan: 0.4, kind: "noise"),
+            PetVoice(id: "long-clock", start: 600_000, duration: 0.3, frequency: 49, gain: 0.03, pan: 0, kind: "tone"),
+        ]
+        var pcmCases = 0
+        for voice in audioVoices {
+            let voiceJSON = String(decoding: try JSONEncoder().encode([voice]), as: UTF8.self)
+            for rate in [8000, 48000, 96000] {
+                for offset in [-8, 0, 31] {
+                    let start = max(0, Int((voice.start * Double(rate)).rounded(.down)) + offset), count = rate / 10
+                    let transferred = try audioCore.pcm(voice: voice, startSample: start, length: count, rate: rate)
+                    let json = reference.invokeMethod("pcm", withArguments: [voiceJSON, start, count, rate])!.toString()!
+                    try require(referenceContext.exception == nil, "Reference PCM failed")
+                    let expected = try JSONDecoder().decode([[Float]].self, from: Data(json.utf8))
+                    try require(transferred.map { $0.map(\.bitPattern) } == expected.map { $0.map(\.bitPattern) }, "Typed PCM samples differ from JSON at \(rate) Hz / \(offset)")
+                    pcmCases += 1
+                }
+            }
+        }
+        try require(audioCore.pcm(voice: audioVoices[0], startSample: 0, length: 0, rate: 48000) == [[], []], "Empty PCM range rejected")
+        try reject({ _ = try audioCore.pcm(voice: audioVoices[0], startSample: -1, length: 4, rate: 48000) }, "Invalid PCM range accepted")
+        let pcmRoot = out.appendingPathComponent("apple-pcm-fixture-" + UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: pcmRoot, withIntermediateDirectories: true)
+        let originalScript = try String(contentsOf: script, encoding: .utf8)
+        for (index, response) in ["null", "[new Float64Array(n), new Float64Array(n)]", "[new Float32Array(n + 1), new Float32Array(n)]", "[new Float32Array(n).fill(NaN), new Float32Array(n)]"].enumerated() {
+            let invalid = pcmRoot.appendingPathComponent("invalid-\(index).js")
+            try (originalScript + "\nPetNative.prototype.pcmChannels = function(v, s, n, r) { return " + response + "; };\n").write(to: invalid, atomically: true, encoding: .utf8)
+            let badCore = try PetNativeCore(points: points, bundle: invalid)
+            try reject({ _ = try badCore.pcm(voice: audioVoices[0], startSample: 0, length: 4, rate: 48000) }, "Malformed PCM channel accepted")
+        }
+        print("PASS Apple PCM transfer: \(pcmCases) exact tone/noise/long-clock sample ranges, empty input and malformed-buffer rejection")
+
         for input in ["", tape] {
             let original = try PetNativeCore(points: points, bundle: script, tape: input)
             for i in 0..<750 {

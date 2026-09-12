@@ -155,10 +155,12 @@ live delivery to finish before extending any request as current. These frames
 are transport metadata; they do not enter the event journal or pet tape.
 The Runtime importer separately pairs request
 lifecycles and preserves failure receipt times. Its local SSE/CLI and browser
-fixtures pass. Authenticated read-only observation of an existing local Runtime
-journal is verified; new active-session delivery through the native companions
-still needs acceptance QA. The
-source and liveness contracts are documented in `pet/README.md`.
+fixtures pass. Typed synthetic Engine events have also passed through the actual
+Runtime journal/SSE endpoint, recorder process and Apple file watcher/PetHost:
+a fresh request appeared at 1,233 ms and cleared after its answer at 2,000 ms.
+That provider-free fixture proves active native file delivery; physical-phone
+transport and visual popover inspection are separate evidence. The source and
+liveness contracts are documented in `pet/README.md`.
 
 The full TUI binary builds offline, its foreground metadata projection test
 passes, and the real PTY walkthrough covers Watch selection, keyboard, mouse
