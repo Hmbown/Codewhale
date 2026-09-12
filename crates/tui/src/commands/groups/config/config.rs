@@ -615,6 +615,40 @@ pub fn sidebar(app: &mut App, arg: Option<&str>) -> CommandResult {
     const USAGE: &str =
         "Usage: /workbar [bottom|top|left|right|off|tasks|agents|context|watch|pinned] [--save]";
     let raw = arg.map(str::trim).unwrap_or("");
+    let sound_args = raw
+        .split_whitespace()
+        .map(str::to_ascii_lowercase)
+        .collect::<Vec<_>>();
+    if let [watch, sound, rest @ ..] = sound_args.as_slice()
+        && watch == "watch"
+        && sound == "sound"
+    {
+        let enabled = match rest {
+            [] => None,
+            [value] if value == "on" => Some(true),
+            [value] if value == "off" => Some(false),
+            _ => return CommandResult::error("/workbar watch sound on|off"),
+        };
+        if let Some(enabled) = enabled {
+            app.pet_watch.set_sound(enabled);
+            if enabled {
+                crate::tui::work_surface::select_dock_panel(
+                    app,
+                    crate::tui::work_surface::RailPanel::Watch,
+                );
+            }
+            app.needs_redraw = true;
+        }
+        let label = if enabled == Some(true) {
+            MessageId::PetWatchSoundOn
+        } else {
+            app.pet_watch.sound_label()
+        };
+        return CommandResult::message(format!(
+            "{} · /workbar watch sound on|off",
+            tr(app.ui_locale, label)
+        ));
+    }
     if raw.eq_ignore_ascii_case("watch export") {
         return if app.pet_watch.export() {
             CommandResult::message(tr(app.ui_locale, MessageId::PetWatchExportQueued))
@@ -3698,6 +3732,33 @@ mod tests {
         );
         let message = result.message.unwrap_or_default();
         assert!(message.contains("bottom placement"), "got: {message}");
+    }
+
+    #[test]
+    fn watch_sound_command_is_opt_in_and_rejects_invalid_changes() {
+        let mut app = create_test_app();
+        let initial_panel = app.work_surface.panel;
+        let status = sidebar(&mut app, Some("watch sound"));
+        assert!(!status.is_error);
+        assert_eq!(app.pet_watch.sound_label(), MessageId::PetWatchSoundOff);
+        assert_eq!(app.work_surface.panel, initial_panel);
+
+        assert!(!sidebar(&mut app, Some(" WATCH sound ON ")).is_error);
+        assert_eq!(
+            app.work_surface.panel,
+            crate::tui::work_surface::RailPanel::Watch
+        );
+        assert_eq!(app.pet_watch.sound_label(), MessageId::PetWatchSoundPaused);
+        for invalid in [
+            "watch sound yes",
+            "watch sound off extra",
+            "watch sound on --save",
+        ] {
+            assert!(sidebar(&mut app, Some(invalid)).is_error);
+            assert_eq!(app.pet_watch.sound_label(), MessageId::PetWatchSoundPaused);
+        }
+        assert!(!sidebar(&mut app, Some("watch sound off")).is_error);
+        assert_eq!(app.pet_watch.sound_label(), MessageId::PetWatchSoundOff);
     }
 
     #[test]

@@ -1,4 +1,8 @@
 {
+  "PetWatchSoundOn": "ध्वनि चालू",
+  "PetWatchSoundOff": "ध्वनि बंद",
+  "PetWatchSoundPaused": "ध्वनि रुकी हुई",
+  "PetWatchSoundUnavailable": "Codewhale की ध्वनि रुक गई। FFmpeg (ffplay) और ऑडियो आउटपुट की जाँच करें, फिर ध्वनि फिर से चालू करें।",
   "PetWatchRestored": "Watch ने इस सत्र का आवास बहाल कर दिया है। नई टेलीमेट्री की प्रतीक्षा है।",
   "PetWatchStorageUnavailable": "Watch इस आवास को बहाल या सहेज नहीं सका। मौजूदा फ़ाइलें सुरक्षित हैं। इस रन को निर्यात करने के लिए {command} इस्तेमाल करें।",
   "PetWatchExported": "Watch रिकॉर्डिंग सहेजी गई: {path}",

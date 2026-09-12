@@ -45,6 +45,15 @@ cd pet
 three ports. The script fails for a missing tool or failed build; it does not
 silently call an omitted platform verified. See [QA.md](QA.md) for native builds.
 
+In the full terminal, `/workbar watch sound on` enables the shared score and
+`/workbar watch sound off` mutes it. Sound starts off each time the application
+opens. Install FFmpeg with `ffplay` on PATH to use this optional output; Watch
+and recording work without it. The terminal streams the core's stereo 48 kHz
+PCM to one player process. Hiding Watch, opening a modal, quiet mode, or stale
+telemetry presentation suspends output. Reopening starts at the current clock,
+without playing the intervening history. Player failure mutes sound and reports
+a warning while the world continues. `/workbar watch sound` shows its status.
+
 ## One source of meaning
 
 `src/core/pet-telemetry.ts` derives 400 ms buckets from normalized Whalesong
@@ -126,6 +135,6 @@ seconds, so a crash may lose work since the last successful save.
 Native habitats are limited to 8 MiB; the QuickJS worker has a 64 MiB memory
 limit. Two-hour restoration has been exercised, but serializing full long tapes
 still costs seconds in QuickJS. History rotation and long-session performance
-remain open. TUI audio output, Android Compose/app/audio, macOS popover inspection,
+remain open. Android Compose/app/audio, macOS popover inspection,
 authenticated Runtime attachment, content-driven forms and final listening/power quality
 are unfinished. This branch is a reviewable prototype, not a release candidate.

@@ -1,4 +1,8 @@
 {
+  "PetWatchSoundOn": "Âm thanh bật",
+  "PetWatchSoundOff": "Âm thanh tắt",
+  "PetWatchSoundPaused": "Âm thanh tạm dừng",
+  "PetWatchSoundUnavailable": "Âm thanh Codewhale đã dừng. Hãy kiểm tra FFmpeg (ffplay) và đầu ra âm thanh, rồi bật lại âm thanh.",
   "PetWatchRestored": "Watch đã khôi phục môi trường của phiên này. Đang chờ dữ liệu đo mới.",
   "PetWatchStorageUnavailable": "Watch không thể khôi phục hoặc lưu môi trường này. Các tệp hiện có được giữ nguyên. Dùng {command} để xuất lần chạy này.",
   "PetWatchExported": "Đã lưu bản ghi Watch: {path}",

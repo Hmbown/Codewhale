@@ -7,6 +7,7 @@ use codewhale_localization::{MessageId, tr};
 use codewhale_palette::{ChromeInk, chrome_style};
 use ratatui::{Frame, layout::Rect, style::Modifier};
 use serde_json::{Value, json};
+use unicode_width::UnicodeWidthStr;
 
 use crate::core::events::Event;
 use crate::core::protocol_parity::{ProtocolIds, event_to_protocol};
@@ -15,6 +16,7 @@ use crate::tui::app::{App, StatusToastLevel};
 use crate::tui::underwater::ShellPhase;
 use crate::tui::work_surface::RailPanel;
 
+mod audio;
 mod persistence;
 mod worker;
 use worker::{Command, Notice, Raster, Worker};
@@ -27,11 +29,40 @@ pub struct PetWatch {
     last_tick: Option<Instant>,
     failed: bool,
     exporting: bool,
+    sound_requested: bool,
+    audio: Option<audio::Output>,
     pub(crate) area: Option<Rect>,
     raster: Option<Raster>,
 }
 
 impl PetWatch {
+    pub fn set_sound(&mut self, enabled: bool) {
+        self.sound_requested = enabled;
+        if !enabled {
+            self.audio = None;
+        }
+    }
+
+    pub fn sound_label(&self) -> MessageId {
+        if !self.sound_requested {
+            MessageId::PetWatchSoundOff
+        } else if self.audio.is_some() {
+            MessageId::PetWatchSoundOn
+        } else {
+            MessageId::PetWatchSoundPaused
+        }
+    }
+
+    fn reset(&mut self, session: Option<String>) {
+        // The app-local user preference survives session selection; the old
+        // stream and all of its queued sound are cancelled with this reset.
+        *self = Self {
+            session,
+            sound_requested: self.sound_requested,
+            ..Self::default()
+        };
+    }
+
     pub fn export(&mut self) -> bool {
         if self.worker.is_none() || self.session.is_none() || self.failed || self.exporting {
             return false;
@@ -43,13 +74,13 @@ impl PetWatch {
 
     pub fn retry(&mut self) {
         if self.failed {
-            *self = Self::default();
+            self.reset(self.session.clone());
         }
     }
 
     pub fn observe(&mut self, event: &Event, session: Option<&str>, now: Instant) {
         if self.session.as_deref() != session {
-            *self = Self::default();
+            self.reset(session.map(str::to_owned));
             return;
         }
         if self.worker.is_none() {
@@ -72,6 +103,7 @@ impl PetWatch {
             self.failed = true;
             self.worker = None;
             self.raster = None;
+            self.audio = None;
         }
     }
 }
@@ -150,10 +182,7 @@ pub fn tick(app: &mut App, now: Instant, obscured: bool) {
     let waiting = matches!(phase, ShellPhase::Waiting | ShellPhase::Approval);
     let state = &mut app.pet_watch;
     if state.session != app.current_session_id {
-        *state = PetWatch {
-            session: app.current_session_id.clone(),
-            ..PetWatch::default()
-        };
+        state.reset(app.current_session_id.clone());
     }
     if visible && state.worker.is_none() && !state.failed {
         state.origin = Some(now);
@@ -201,6 +230,34 @@ pub fn tick(app: &mut App, now: Instant, obscured: bool) {
             app.needs_redraw = true;
         }
     }
+    let previous_sound = state.sound_label();
+    let mut audio_failed = state.audio.as_ref().is_some_and(audio::Output::failed);
+    let sound_allowed = visible
+        && state.worker.is_some()
+        && state.raster.is_some()
+        && !state.failed
+        && app.onboarding == crate::tui::app::OnboardingState::None
+        && !app.launch.visible
+        && app.view_stack.is_empty()
+        && !app.notification_settings.quiet
+        && !app.notification_settings.event_sound.quiet;
+    if state.sound_requested && sound_allowed && !audio_failed {
+        if state.audio.is_none() {
+            match audio::Output::start() {
+                Ok(output) => state.audio = Some(output),
+                Err(_) => audio_failed = true,
+            }
+        }
+    } else {
+        state.audio = None;
+    }
+    if audio_failed {
+        state.sound_requested = false;
+        state.audio = None;
+    }
+    if visible && previous_sound != state.sound_label() {
+        app.needs_redraw = true;
+    }
     if state.worker.is_some()
         && state.last_tick.is_none_or(|last| {
             now.duration_since(last) >= Duration::from_millis(if motion { 33 } else { 400 })
@@ -216,6 +273,7 @@ pub fn tick(app: &mut App, now: Instant, obscured: bool) {
             waiting,
             width: area.width.clamp(1, 512),
             height: area.height.saturating_sub(1).clamp(1, 512),
+            audio: state.audio.as_ref().map(audio::Output::target),
         });
         state.last_tick = Some(now);
     }
@@ -224,6 +282,14 @@ pub fn tick(app: &mut App, now: Instant, obscured: bool) {
             tr(app.ui_locale, MessageId::PetWatchUnavailable).into_owned(),
             StatusToastLevel::Warning,
             Some(8_000),
+        );
+        app.needs_redraw = true;
+    }
+    if audio_failed {
+        app.push_status_toast(
+            tr(app.ui_locale, MessageId::PetWatchSoundUnavailable).into_owned(),
+            StatusToastLevel::Warning,
+            Some(12_000),
         );
         app.needs_redraw = true;
     }
@@ -281,7 +347,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
         .and_then(|r| ChannelId::from_key(&r.channel))
         .unwrap_or(ChannelId::Other);
     let arch = raster.map_or("drift", |r| r.arch.as_str());
-    let label = format!(
+    let mut label = format!(
         "{channel} · {arch}{}",
         if hollow {
             format!(" · {}", tr(app.ui_locale, MessageId::PetUnobserved))
@@ -291,6 +357,12 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
             String::new()
         }
     );
+    let sound = tr(app.ui_locale, app.pet_watch.sound_label());
+    // Keep the semantic/uncertainty cue before spending narrow cells on controls.
+    if label.width() + sound.width() + 3 <= usize::from(area.width) {
+        label.push_str(" · ");
+        label.push_str(&sound);
+    }
     let ink = if hollow {
         ChromeInk::Metadata
     } else {

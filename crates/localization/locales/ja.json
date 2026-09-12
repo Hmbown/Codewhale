@@ -1,4 +1,8 @@
 {
+  "PetWatchSoundOn": "サウンド有効",
+  "PetWatchSoundOff": "サウンド無効",
+  "PetWatchSoundPaused": "サウンド一時停止",
+  "PetWatchSoundUnavailable": "Codewhaleのサウンドが停止しました。FFmpeg (ffplay) とオーディオ出力を確認し、サウンドを再度有効にしてください。",
   "PetWatchRestored": "Watch がこのセッションの生息環境を復元しました。新しいテレメトリを待っています。",
   "PetWatchStorageUnavailable": "Watch はこの生息環境を復元または保存できませんでした。既存のファイルは保持されています。{command} で今回の記録をエクスポートできます。",
   "PetWatchExported": "Watch の記録を保存しました: {path}",

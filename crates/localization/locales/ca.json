@@ -1,4 +1,8 @@
 {
+  "PetWatchSoundOn": "So activat",
+  "PetWatchSoundOff": "So desactivat",
+  "PetWatchSoundPaused": "So en pausa",
+  "PetWatchSoundUnavailable": "El so de Codewhale s’ha aturat. Comprova l’FFmpeg (ffplay) i la sortida d’àudio i torna a activar el so.",
   "PetWatchRestored": "Watch ha restaurat l’hàbitat d’aquesta sessió. S’espera telemetria nova.",
   "PetWatchStorageUnavailable": "Watch no ha pogut restaurar ni desar aquest hàbitat. S’han conservat els fitxers existents. Fes servir {command} per exportar aquesta execució.",
   "PetWatchExported": "Reproducció de Watch desada: {path}",

@@ -1,4 +1,8 @@
 {
+  "PetWatchSoundOn": "Suara aktif",
+  "PetWatchSoundOff": "Suara nonaktif",
+  "PetWatchSoundPaused": "Suara dijeda",
+  "PetWatchSoundUnavailable": "Suara Codewhale berhenti. Periksa FFmpeg (ffplay) dan keluaran audio, lalu aktifkan suara kembali.",
   "PetWatchRestored": "Watch memulihkan habitat sesi ini. Menunggu telemetri baru.",
   "PetWatchStorageUnavailable": "Watch tidak dapat memulihkan atau menyimpan habitat ini. Berkas yang ada tetap disimpan. Gunakan {command} untuk mengekspor proses ini.",
   "PetWatchExported": "Rekaman Watch disimpan: {path}",

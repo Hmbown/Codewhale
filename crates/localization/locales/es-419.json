@@ -1,4 +1,8 @@
 {
+  "PetWatchSoundOn": "Sonido activado",
+  "PetWatchSoundOff": "Sonido desactivado",
+  "PetWatchSoundPaused": "Sonido en pausa",
+  "PetWatchSoundUnavailable": "El sonido de Codewhale se detuvo. Revisa FFmpeg (ffplay) y la salida de audio, y vuelve a activar el sonido.",
   "PetWatchRestored": "Watch restauró el hábitat de esta sesión. Esperando telemetría nueva.",
   "PetWatchStorageUnavailable": "Watch no pudo restaurar ni guardar este hábitat. Se conservaron los archivos existentes. Usa {command} para exportar esta ejecución.",
   "PetWatchExported": "Reproducción de Watch guardada: {path}",

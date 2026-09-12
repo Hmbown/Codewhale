@@ -40,6 +40,13 @@ save/reopen, immutable `/workbar watch export`, and import that exported JSON in
 the browser. Unknown must remain legible; stale approvals must not resurrect.
 Use a disposable session and synthetic/loopback telemetry for this assignment.
 
+With FFmpeg's `ffplay` on PATH, explicitly enable `/workbar watch sound on`.
+Check sound off/on, switching away from Watch and back, quiet mode, and a missing
+or failed player. These must not stop the world or its checkpoint. No historical
+sound should play after resuming. Unit tests use a capture sink or a disposable
+child process; they never open an audio device. Actual output and listening
+quality need separate manual evidence.
+
 ## Apple and Kotlin
 
 ```sh
@@ -78,8 +85,9 @@ open junctions; the same particle identities return to the whale at rest.
 - Actual TUI: bounded worker, persistence/export/reopen/corruption and two-hour
   continuation exercised in a PTY. Five persistence, eleven paste and nine artifact
   guard tests passed in the product. The initial hosted macOS suite ran 15,418
-  tests with one outdated Watch-tab golden; that header is corrected in this update.
-  A fresh hosted verdict is still required.
+  tests with one outdated Watch-tab golden; that header was corrected. Subsequent
+  hosted product CI on `e69e99b` passed Linux, macOS and Windows tests, Rust lint
+  and the applicable safety/security checks. Each later commit needs its own verdict.
 - Apple: eight checkpoint workflows passed; iOS Simulator exercised two-hour
   restoration and visible corruption recovery without overwriting the damaged file.
 - The updated Apple checkpoint workflows and iOS Simulator build pass. Earlier

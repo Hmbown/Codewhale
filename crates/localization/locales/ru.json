@@ -1,4 +1,8 @@
 {
+  "PetWatchSoundOn": "Звук включён",
+  "PetWatchSoundOff": "Звук выключен",
+  "PetWatchSoundPaused": "Звук приостановлен",
+  "PetWatchSoundUnavailable": "Звук Codewhale остановлен. Проверьте FFmpeg (ffplay) и аудиовыход, затем снова включите звук.",
   "PetWatchRestored": "Watch восстановил среду этой сессии. Ожидание новой телеметрии.",
   "PetWatchStorageUnavailable": "Watch не удалось восстановить или сохранить эту среду. Существующие файлы сохранены. Используйте {command}, чтобы экспортировать этот запуск.",
   "PetWatchExported": "Запись Watch сохранена: {path}",

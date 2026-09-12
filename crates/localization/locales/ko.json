@@ -1,4 +1,8 @@
 {
+  "PetWatchSoundOn": "소리 켜짐",
+  "PetWatchSoundOff": "소리 꺼짐",
+  "PetWatchSoundPaused": "소리 일시 중지",
+  "PetWatchSoundUnavailable": "Codewhale 소리가 멈췄습니다. FFmpeg (ffplay)와 오디오 출력을 확인한 후 소리를 다시 켜세요.",
   "PetWatchRestored": "Watch가 이 세션의 서식지를 복원했습니다. 새 원격 측정 데이터를 기다립니다.",
   "PetWatchStorageUnavailable": "Watch가 이 서식지를 복원하거나 저장하지 못했습니다. 기존 파일은 유지되었습니다. {command}로 이번 실행을 내보내세요.",
   "PetWatchExported": "Watch 기록 저장됨: {path}",

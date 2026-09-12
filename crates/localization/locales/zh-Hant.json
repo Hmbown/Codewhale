@@ -1,4 +1,8 @@
 {
+  "PetWatchSoundOn": "聲音已開啟",
+  "PetWatchSoundOff": "聲音已關閉",
+  "PetWatchSoundPaused": "聲音已暫停",
+  "PetWatchSoundUnavailable": "Codewhale 聲音已停止。請檢查 FFmpeg (ffplay) 和音訊輸出，然後重新開啟聲音。",
   "PetWatchRestored": "Watch 已還原此工作階段的棲息地，正在等待新的遙測資料。",
   "PetWatchStorageUnavailable": "Watch 無法還原或儲存此棲息地。現有檔案已保留。使用 {command} 匯出本次執行。",
   "PetWatchExported": "Watch 重播已儲存：{path}",

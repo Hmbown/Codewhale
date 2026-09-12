@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 use rquickjs::{Context, Runtime};
 use serde::Deserialize;
 
+use super::audio::{self, Target};
 use super::persistence::{self, Store};
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -52,6 +53,7 @@ pub enum Command {
         waiting: bool,
         width: u16,
         height: u16,
+        audio: Option<Target>,
     },
 }
 
@@ -66,6 +68,70 @@ pub struct Worker {
     pub tx: mpsc::SyncSender<Command>,
     pub latest: Arc<Mutex<Option<Result<Raster, ()>>>>,
     pub notices: mpsc::Receiver<Notice>,
+}
+
+/// Presentation retains only the voices that can still contribute samples.
+/// Their identities, timestamps and PCM all come from the existing JS core.
+struct AudioCursor {
+    target: Target,
+    sample: usize,
+    voices: Vec<serde_json::Value>,
+}
+
+impl AudioCursor {
+    fn present(
+        &mut self,
+        ctx: &rquickjs::Ctx<'_>,
+        target: &Target,
+        time_ms: f64,
+    ) -> rquickjs::Result<()> {
+        let end = (time_ms * audio::SAMPLE_RATE as f64 / 1000.0).floor() as usize;
+        if !target.current() {
+            self.sample = end;
+            self.voices.clear();
+            return Ok(());
+        }
+        // A pause, new output or delayed catch-up cannot play historical sound.
+        if end < self.sample || end - self.sample > audio::MAX_FRAMES {
+            self.sample = end;
+            self.voices.clear();
+        }
+        let json: String = ctx.eval("JSON.stringify(JSON.parse(pet.snapshot()).voices)")?;
+        let voices: Vec<serde_json::Value> =
+            serde_json::from_str(&json).map_err(|_| rquickjs::Error::Unknown)?;
+        let start = self.sample as f64 / audio::SAMPLE_RATE as f64;
+        self.voices.extend(voices);
+        self.voices.retain(|v| {
+            v["start"]
+                .as_f64()
+                .zip(v["duration"].as_f64())
+                .is_some_and(|(at, duration)| at + duration > start)
+        });
+        if self.voices.len() > 128 {
+            return Err(rquickjs::Error::Unknown);
+        }
+        if end == self.sample {
+            return Ok(());
+        }
+        ctx.globals().set(
+            "petAudioVoices",
+            serde_json::to_string(&self.voices).map_err(|_| rquickjs::Error::Unknown)?,
+        )?;
+        ctx.globals().set("petAudioStart", self.sample)?;
+        ctx.globals().set("petAudioLength", end - self.sample)?;
+        let json: String =
+            ctx.eval("pet.pcm(petAudioVoices, petAudioStart, petAudioLength, 48000)")?;
+        let channels: [Vec<f32>; 2] =
+            serde_json::from_str(&json).map_err(|_| rquickjs::Error::Unknown)?;
+        if channels[0].len() != end - self.sample || channels[1].len() != end - self.sample {
+            return Err(rquickjs::Error::Unknown);
+        }
+        target
+            .send(channels)
+            .map_err(|_| rquickjs::Error::Unknown)?;
+        self.sample = end;
+        Ok(())
+    }
 }
 
 impl Worker {
@@ -160,6 +226,7 @@ fn run(
         }
     }
     let mut saved_at = None;
+    let mut audio_cursor: Option<AudioCursor> = None;
     for command in rx {
         // A delayed host can ask for up to 300 fixed ticks (ten seconds).
         // The worker remains interruptible without treating legitimate catch-up
@@ -198,6 +265,7 @@ fn run(
                         waiting,
                         width,
                         height,
+                        audio,
                     } => {
                         ctx.globals().set("timeMs", time_ms + offset_ms)?;
                         ctx.globals().set("motion", motion)?;
@@ -213,6 +281,37 @@ fn run(
                             return Err(rquickjs::Error::Unknown);
                         }
                         frame.host_time_ms = time_ms;
+                        if let Some(target) = audio.filter(Target::active) {
+                            *deadline.lock().map_err(|_| rquickjs::Error::Unknown)? =
+                                Instant::now() + Duration::from_millis(500);
+                            if audio_cursor
+                                .as_ref()
+                                .is_none_or(|c| !c.target.same_stream(&target))
+                            {
+                                audio_cursor = Some(AudioCursor {
+                                    target: target.clone(),
+                                    sample: (frame.time_ms * audio::SAMPLE_RATE as f64 / 1000.0)
+                                        .floor()
+                                        as usize,
+                                    voices: Vec::new(),
+                                });
+                            }
+                            if audio_cursor
+                                .as_mut()
+                                .expect("initialized audio cursor")
+                                .present(&ctx, &target, frame.time_ms)
+                                .is_err()
+                            {
+                                // Sound failure cannot stop telemetry or its recording.
+                                let _ = ctx.catch();
+                                target.fail();
+                                audio_cursor = None;
+                            }
+                            *deadline.lock().map_err(|_| rquickjs::Error::Unknown)? =
+                                Instant::now() + Duration::from_secs(5);
+                        } else {
+                            audio_cursor = None;
+                        }
                         if let Ok(mut slot) = output.lock() {
                             *slot = Some(Ok(frame));
                         }
@@ -260,6 +359,10 @@ mod tests {
     }
 
     fn frame(worker: &Worker, at: f64) -> Raster {
+        frame_with_audio(worker, at, None)
+    }
+
+    fn frame_with_audio(worker: &Worker, at: f64, audio: Option<Target>) -> Raster {
         worker
             .tx
             .send(Command::Advance {
@@ -268,6 +371,7 @@ mod tests {
                 waiting: true,
                 width: 78,
                 height: 22,
+                audio,
             })
             .unwrap();
         let until = Instant::now() + Duration::from_secs(10);
@@ -289,6 +393,59 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         assert!(!matches!(*output.lock().unwrap(), Some(Err(()))));
+    }
+
+    #[test]
+    fn audio_cursor_preserves_the_shared_score_across_buffer_boundaries() {
+        let runtime = Runtime::new().unwrap();
+        let context = Context::full(&runtime).unwrap();
+        let (sink, packets) = audio::Output::capture();
+        context.with(|ctx| {
+            let points: Vec<Vec<f64>> = include_str!("../ambient_life/whale-points.tsv")
+                .lines()
+                .map(|line| line.split_whitespace().map(|s| s.parse().unwrap()).collect())
+                .collect();
+            ctx.globals().set("points", serde_json::to_string(&points).unwrap()).unwrap();
+            ctx.eval::<(), _>(include_bytes!("pet-native.js").as_slice()).unwrap();
+            ctx.eval::<(), _>(r#"globalThis.pet = new PetNative(points, '', '[]', true);
+                pet.observeEngine('{"event":"approval_required","id":"audio-test"}', 0);
+                globalThis.allVoices = [];"#).unwrap();
+            let mut cursor = AudioCursor { target: sink.target(), sample: 0, voices: Vec::new() };
+            let mut received = Vec::new();
+            for at in [400, 800, 1200, 1600] {
+                ctx.globals().set("timeMs", at).unwrap();
+                ctx.eval::<(), _>("pet.advanceEngine(timeMs,false,true); allVoices.push(...JSON.parse(pet.snapshot()).voices)").unwrap();
+                let time: f64 = ctx.eval("JSON.parse(pet.snapshot()).timeMs").unwrap();
+                cursor.present(&ctx, &sink.target(), time).unwrap();
+                received.extend(packets.try_recv().unwrap().bytes);
+            }
+            let expected: String = ctx.eval(format!("pet.pcm(JSON.stringify(allVoices),0,{},48000)", cursor.sample)).unwrap();
+            let [left, right]: [Vec<f32>; 2] = serde_json::from_str(&expected).unwrap();
+            let interleaved: Vec<_> = left.iter().zip(&right)
+                .flat_map(|(l, r)| [*l, *r]).flat_map(f32::to_le_bytes).collect();
+            assert!(left.iter().any(|s| s.abs() > 0.001), "fixture must exercise actual voices");
+            assert_eq!(received, interleaved, "host chunking changed the shared PCM");
+            // Reopening a stream at the current clock cannot replay its past.
+            let (reopened, packets) = audio::Output::capture();
+            assert!(!sink.target().same_stream(&reopened.target()));
+            cursor.voices.clear();
+            cursor.present(&ctx, &reopened.target(), cursor.sample as f64 / 48.0).unwrap();
+            assert!(packets.try_recv().is_err());
+        });
+    }
+
+    #[test]
+    fn sound_sink_failure_does_not_stop_the_world() {
+        let worker = Worker::start(None).unwrap();
+        let (sink, packets) = audio::Output::capture();
+        drop(packets);
+        frame_with_audio(&worker, 0.0, Some(sink.target()));
+        let before = frame_with_audio(&worker, 400.0, Some(sink.target()));
+        assert!(sink.failed());
+        let after = frame_with_audio(&worker, 800.0, Some(sink.target()));
+        assert!(after.time_ms > before.time_ms);
+        assert!(after.hollow, "sound failure is not observed telemetry");
+        finish(worker);
     }
 
     #[test]

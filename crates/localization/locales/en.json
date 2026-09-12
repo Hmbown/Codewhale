@@ -1,4 +1,8 @@
 {
+  "PetWatchSoundOn": "Sound on",
+  "PetWatchSoundOff": "Sound off",
+  "PetWatchSoundPaused": "Sound paused",
+  "PetWatchSoundUnavailable": "Pet sound stopped. Check FFmpeg (ffplay) and your audio output, then enable sound again.",
   "PetWatchRestored": "Watch restored this session’s habitat. Waiting for fresh telemetry.",
   "PetWatchStorageUnavailable": "Watch could not restore or save this habitat. Existing files were kept. Use {command} to export this run.",
   "PetWatchExported": "Watch replay saved: {path}",

@@ -7,7 +7,7 @@ browser layers, circulating traffic and open decision junctions. Original
 recordings retain version 1 behavior; new habitats use version 2. This slice
 replaces the old `≈≈>` / spray / fluke glyph sequence. The explicit Watch panel
 adds foreground telemetry through the same world and score used by native and
-web hosts. Rust audio output remains unfinished.
+web hosts, with opt-in stereo PCM output through FFmpeg's `ffplay`.
 
 ## Ownership
 
@@ -121,7 +121,24 @@ limit. Full-tape retention is still bounded by the 64 MiB worker and the core's
 `/workbar watch export` writes a new immutable `artifacts/pet/replay-<id>.json`
 and reports its path through the existing toast system and transcript. Import it in the web
 habitat to replay the accepted telemetry and interactions. Export is available
-after opening Watch in a saved session. TUI audio output remains unfinished.
+after opening Watch in a saved session.
+
+`/workbar watch sound on|off` controls app-local, default-off sound. The existing
+QuickJS worker retains current score voices and calls the shared `PetNative.pcm`
+renderer at 48 kHz. A single `ffplay` child receives bounded Float32LE stereo
+packets through a four-slot queue. There is no second score, clock or event
+interpreter. PCM rendering has a separate 500 ms interrupt budget; sound failure
+does not invalidate the world or its recording. Muting, obscuring Watch, quiet
+mode, stale frames and session changes stop the child and queued sound. The
+audio thread reaps it; the UI never waits for playback or a pipe write. Delayed
+and excess packets are discarded. A slow player cannot build an unbounded
+backlog or turn a temporary stall into a permanently muted session. Reopening
+begins at the current creature clock.
+
+FFmpeg is optional and is never downloaded by the application. Missing `ffplay`,
+or device failure mutes sound with a translated warning;
+Watch remains usable. Sound status shares the existing caption only when it
+fits after the full semantic and unknown-coverage cues.
 
 The live Runtime SSE adapter and this foreground protocol adapter consume
 different existing input contracts; they share event-v1 projection semantics,
@@ -135,7 +152,8 @@ passes, and the real PTY walkthrough covers Watch selection, keyboard, mouse
 and resizing down to 40x12. Receipts and source hashes are in
 `CW/artifacts/pet-review-20260912/`. Hosted macOS testing on the initial branch ran 15,418 tests with one Watch-tab
 golden mismatch; its header is corrected in the transformation update. The
-updated head still needs its own hosted verdict.
+subsequent `e69e99b` passed the applicable Linux, macOS and Windows product tests,
+lint and security checks. Later changes require their own hosted verdict.
 
 Local render fixtures exercise the actual ocean, glyph and ambient-life modules
 with literal shell enums extracted from `underwater.rs`; they do not run an

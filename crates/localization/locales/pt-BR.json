@@ -1,4 +1,8 @@
 {
+  "PetWatchSoundOn": "Som ligado",
+  "PetWatchSoundOff": "Som desligado",
+  "PetWatchSoundPaused": "Som pausado",
+  "PetWatchSoundUnavailable": "O som do Codewhale parou. Verifique o FFmpeg (ffplay) e a saída de áudio e ligue o som novamente.",
   "PetWatchRestored": "O Watch restaurou o habitat desta sessão. Aguardando nova telemetria.",
   "PetWatchStorageUnavailable": "O Watch não conseguiu restaurar ou salvar este habitat. Os arquivos existentes foram mantidos. Use {command} para exportar esta execução.",
   "PetWatchExported": "Gravação do Watch salva: {path}",
