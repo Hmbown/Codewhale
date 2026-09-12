@@ -191,7 +191,9 @@ test('the actual CLI resumes after process death at the same path without reclai
   await writeFile(input, JSON.stringify({ schemaVersion: 1, id: 'old', traceId: 'fixture', name: 'bash', category: 'code', startTime: 0, endTime: 1, attributes: {} }));
   const args = [`--input=${input}`, `--output=${path}`, '--watch'];
   const launch = extra => {
-    const child = spawnRecorder([...args, ...extra]);
+    // Exercise the Windows IPC harness on every platform; it must not keep
+    // a correctly rejected startup alive after the CLI sets its exit code.
+    const child = spawnRecorder([...args, ...extra], process.env, true);
     child.log = ''; child.stdout.on('data', b => child.log += b); child.stderr.on('data', b => child.log += b);
     child.exited = once(child, 'exit');
     t.after(() => { if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL'); });
@@ -209,14 +211,16 @@ test('the actual CLI resumes after process death at the same path without reclai
   first.kill('SIGKILL'); await first.exited;
   const previous = await readFile(path, 'utf8');
   const second = launch(['--resume']);
-  await waitFor(async () => (await stat(part(path, 1))).size && decodePetJSONL(await readFile(path, 'utf8')).length >= 2);
+  // The archive link can exist before replacement and handler installation.
+  // Wait for CLI readiness as well as the new tape before requesting shutdown.
+  await waitFor(async () => second.log.includes('Recording local live pet states.') && (await stat(part(path, 1))).size && decodePetJSONL(await readFile(path, 'utf8')).length >= 2);
   second.stopRecorder(); assert.equal((await second.exited)[0], 0, second.log);
   assert.equal(await readFile(part(path, 1), 'utf8'), previous);
   const buckets = decodePetJSONL(await readFile(path, 'utf8'));
   assert.equal(buckets[0].observed, 0); assert.equal(buckets[0].waiting, false); assert.equal(buckets[0].errors, 0);
   assert.ok(buckets[0].onsets.every(n => n === 0));
   const third = launch(['--resume']);
-  await waitFor(async () => (await stat(part(path, 2))).size && decodePetJSONL(await readFile(path, 'utf8')).length >= 2);
+  await waitFor(async () => third.log.includes('Recording local live pet states.') && (await stat(part(path, 2))).size && decodePetJSONL(await readFile(path, 'utf8')).length >= 2);
   third.stopRecorder(); assert.equal((await third.exited)[0], 0, third.log);
   assert.equal(decodePetJSONL(await readFile(part(path, 2), 'utf8')).length, buckets.length);
 });

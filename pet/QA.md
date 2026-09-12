@@ -209,3 +209,16 @@ TUI and native bundle bytes are unchanged from the previously verified build.
 Grokbot review and current-head Windows/macOS recorder CI are separate receipts.
 Native active-session delivery, current macOS popover inspection and device
 transport remain open. No release or deployment is implied.
+
+
+The first restart commit `11c6fbfc` passed all 61 tests independently in
+Codewhalebot on Node 22.19.0 with no remaining concrete source finding. macOS
+recorder CI also passed. Windows passed 60 tests and canceled one on timeout:
+the test-only IPC message listener kept a correctly rejected startup alive.
+The same preload reproduced the hang locally; unreferencing its IPC channel
+lets the rejected CLI exit with code 1. The process-death/restart test now uses
+that IPC path on every host, while other POSIX cases still use actual SIGINT.
+The fixture also waits for CLI readiness before shutdown: the archive link may
+appear before replacement and before the signal handler is installed. A broad
+local run exposed this early-stop race after the IPC fix. Production recorder
+and native bundle bytes are unchanged in this follow-up.
