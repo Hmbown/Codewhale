@@ -17,11 +17,11 @@ npm test
 npm run check:web
 ```
 
-The pet suite currently contains 42 tests: event occupancy/unknown coverage,
+The pet suite currently contains 44 tests: event occupancy/unknown coverage,
 late failures, human request pairing, read-only local SSE reconnect/cursor
 recovery and cancellation after garbage collection, deterministic world/score/PCM,
 checkpoint integrity and continuation, immutable segment boundaries, pending input
-retention, expression-version validation and legacy replay.
+retention, browser saves overlapping source changes, expression-version validation and legacy replay.
 The standalone verifier compares 380 checkpoints across baseline and edge tapes,
 each animated and still, under expression versions 1 and 2. Version 1 must also
 match pinned pre-transformation golden digests. Omission of Swift is explicit in its output.
@@ -75,7 +75,7 @@ cd pet/android
 ```
 
 Use JDK 17 and Android SDK 35; connect a device/emulator for the second command.
-The eight instrumentation tests run the real QuickJS binding, Kotlin renderer,
+The nine instrumentation tests run the real QuickJS binding, Kotlin renderer,
 PCM cursor, storage/recovery, immutable segments and Compose lifecycle. See [Android](android/README.md).
 
 ## Review direction
@@ -89,7 +89,7 @@ open junctions; the same particle identities return to the whale at rest.
 
 ## Local evidence before publication (2026-09-12)
 
-- Packaged pet: 42 tests passed; existing Whalesong consumers: 306 passed after
+- Packaged pet: 44 tests passed; existing Whalesong consumers: 306 passed after
   canonical source relocation. These are overlapping suites, not additive coverage.
 - Product Node gate: 66 package, 12 SDK and 446 web tests passed; production web
   check subsequently passed with the GitHub release fetch available.
@@ -103,7 +103,7 @@ open junctions; the same particle identities return to the whale at rest.
   and the applicable safety/security checks. Each later commit needs its own verdict.
 - Apple: ten checkpoint workflows passed; iOS Simulator exercised two-hour
   restoration and visible corruption recovery without overwriting the damaged file.
-- Android: debug APK and lint build pass; eight instrumentation tests pass on
+- Android: debug APK and lint build pass; nine instrumentation tests pass on
   Android 15 ARM64, including 4,800 frames, checkpoint continuation, exact PCM,
   lifecycle and storage recovery. The emulator audio sink runs without host
   speaker output; this does not establish physical listening or power quality.
@@ -122,11 +122,17 @@ open junctions; the same particle identities return to the whale at rest.
   5.64 MB and continues from a 0.31 MB active habitat; a failed save keeps the
   live world intact. Android rotates 4,096 applied inputs, rejects a competing
   writer, restores exact continuation and detects a changed archive.
+  A constructed long-clock checkpoint also checks the Android renderer's
+  phase/clock/jitter bounds against the shared core and continues in both engines.
 - Browser: changing sources and reopening an earlier imported recording restores
   its pose and full future timeline. Earlier recordings remain available after
   reload. A 30-hour segment seeks from its retained origin through its final
   checkpoint with Still enabled. iOS Simulator exports an earlier recording
   through Files and reports a successful save.
+- Browser save ordering: controller tests defer storage completion while changing
+  worlds and accepting an input. The previous `5c70db4` controller fails by
+  treating the pending save as a failure; the correction waits, archives the new
+  input, and still preserves the source when a real failed save is canceled.
 - Authenticated read-only attachment to an existing local Runtime 0.9.13 session
   journal passed. An 18-second recorder run produced 45 contiguous unknown buckets
   and stopped cleanly in 41 ms after Ctrl+C, without treating historical work as

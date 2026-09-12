@@ -96,6 +96,24 @@ class PetNativeTest {
         }
     }
 
+    @Test fun longParticleClocksRestoreAndContinueInBothEngines() {
+        // Construct a long-clock boundary fixture; this is not a 30-hour device run.
+        core().use { original ->
+            val saved = JSONObject(original.recording())
+            val particle = saved.getJSONObject("checkpoint").getJSONObject("sim")
+            particle.put("clock", 108_000.0).put("phase", 108_000.0)
+            particle.getJSONArray("particles").getJSONArray(0).put(4, 1_000_001.0)
+            core(saved.toString()).use { restored ->
+                repeat(60) { assertEquals(restored.tick(true).digest, petDigest(restored.sim)) }
+                core(restored.recording()).use { again ->
+                    repeat(60) { assertEquals(restored.tick(true).digest, again.tick(true).digest) }
+                }
+            }
+            particle.put("clock", 100.0 * 365.0 * 86_400.0 + 1.0)
+            assertThrows(Exception::class.java) { core(saved.toString()).close() }
+        }
+    }
+
     @Test fun exportRetainsTheExactUnsavedVisitAfterAStoreConflict() {
         val directory = File(context.cacheDir, "pet-export-${java.util.UUID.randomUUID()}").apply { mkdirs() }
         try {

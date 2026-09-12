@@ -51,10 +51,11 @@ cover that binding's older runtime. There are no Java host bindings or remote
 script loads. Gradle packages `../ios/Resources/pet-native.js` and its demo
 directly; run `npm --prefix pet run sync` after changing the canonical core.
 
-Eight instrumentation tests exercise the real embedded engine, 4,800 shared
+Nine instrumentation tests exercise the real embedded engine, 4,800 shared
 world frames and Kotlin digests, 3,000 additional checkpoint continuation
 frames, version/import boundaries, sample-exact PCM, atomic storage/recovery,
 the Compose pause/still/audio/background lifecycle, and recovery export after
 a store conflict or with 90,000 pending interactions beyond the autosave limit.
-They also check segment publication, exact continuation and archive corruption. The separate
+They also check segment publication, exact continuation, archive corruption and
+native restoration of long particle clocks beyond the former 24-hour limit. The separate
 `verify.sh` retains all 380 pure Kotlin conformance checkpoints.

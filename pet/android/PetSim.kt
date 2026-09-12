@@ -57,6 +57,8 @@ fun archOf(key: String) = when (key) {
 
 private val UNKNOWN_RGB = doubleArrayOf(115.0, 132.0, 146.0)
 private val REST_RGB = doubleArrayOf(122.0, 214.0, 240.0)
+// Keep the native checkpoint boundary aligned with the shared world clock.
+private const val PET_MAX_SECONDS = 100.0 * 365.0 * 86_400.0
 
 private fun lerp(a: Double, b: Double, t: Double) = a + (b - a) * t
 private fun clamp(v: Double, lo: Double = 0.0, hi: Double = 1.0) = min(hi, max(lo, v))
@@ -277,9 +279,9 @@ class PetSim(points: List<Pair<Double, Double>>, seed: Int = 0xC0FFEE.toInt(), e
         require(c.version == 1 && c.expressionVersion in 1..2 && c.body.size == p.size && c.particles.size == p.size)
         require(c.body.withIndex().all { (i, b) -> b == listOf(p[i].hx, p[i].hy, p[i].s) })
         require(c.particles.all { row -> row.size == 8 && row.withIndex().all { (i, v) ->
-            finite(v, if (i == 4 || i == 5) 0.0 else -8.0, if (i == 4 || i == 5) 1_000_000.0 else 8.0)
+            finite(v, if (i == 4 || i == 5) 0.0 else -8.0, if (i == 4 || i == 5) 2 * PET_MAX_SECONDS else 8.0)
         } })
-        require(finite(c.phase, 0.0, 100_000.0) && finite(c.clock, 0.0, 86_400.0) && finite(c.tear, 0.0, 1.0))
+        require(finite(c.phase, 0.0, PET_MAX_SECONDS) && finite(c.clock, 0.0, PET_MAX_SECONDS) && finite(c.tear, 0.0, 1.0))
         require(c.previous in CHANNELS.indices && c.current in CHANNELS.indices && c.color.size == 3 && c.color.all { finite(it, 0.0, 255.0) })
         require(listOf(c.frame.r, c.frame.g, c.frame.b).all { finite(it, 0.0, 255.0) } && finite(c.frame.alpha, 0.0, 1.0) && finite(c.frame.work, 0.0, 1.0))
         require(c.frame.channel == CHANNELS[c.current].key && c.frame.arch == CHANNELS[c.current].arch)

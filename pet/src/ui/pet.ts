@@ -19,11 +19,14 @@ let world: PetWorld, seconds = 0, last = 0, accumulator = 0, paused = false;
 let restoring = false, generation = 0, liveGeneration = 0, liveTimer = 0;
 let imported: { world: PetWorld; name: string } | undefined;
 const library = new TraceLibrary();
-let savedRevision: number | undefined, saving = false, persistenceReady = false, persistenceFailed = false;
+let savedRevision: number | undefined, saving: Promise<boolean> | undefined, persistenceReady = false, persistenceFailed = false;
 let audio: AudioContext | undefined, anchor = 0, sound = false;
 const playing = new Set<AudioBufferSourceNode>();
 const duration = () => Number(seek.max);
-const timeLabel = (n: number) => `${Math.floor(n / 60)}:${String(Math.floor(n % 60)).padStart(2, '0')}`;
+const timeLabel = (n: number) => {
+  const minutes = Math.floor(n / 60), seconds = String(Math.floor(n % 60)).padStart(2, '0');
+  return minutes < 60 ? `${minutes}:${seconds}` : `${Math.floor(minutes / 60)}:${String(minutes % 60).padStart(2, '0')}:${seconds}`;
+};
 
 function silence() { for (const node of playing) { try { node.stop(); } catch { /* Already ended. */ } } playing.clear(); }
 function play(voices: readonly PetVoice[]) {
@@ -74,8 +77,17 @@ async function refreshArchives() {
   for (const entry of entries) list.add(new Option(`${entry.name} · ${timeLabel(entry.startSeconds)}–${timeLabel(entry.seconds)}`, String(entry.key)));
 }
 async function persist(archiveCurrent = false): Promise<boolean> {
-  if (!world || restoring || saving || !persistenceReady || persistenceFailed) return false;
-  saving = true;
+  if (saving) {
+    if (!archiveCurrent) return saving;
+    await saving;
+    return persist(true);
+  }
+  if (!world || restoring || !persistenceReady || persistenceFailed) return false;
+  const task = saveCurrent(archiveCurrent); saving = task;
+  try { return await task; }
+  finally { if (saving === task) saving = undefined; }
+}
+async function saveCurrent(archiveCurrent: boolean): Promise<boolean> {
   try {
     const owner = world;
     const snapshot: SavedHabitat = { petPersistenceVersion: 1, seconds: owner.frame.timeMs / 1000,
@@ -94,7 +106,6 @@ async function persist(archiveCurrent = false): Promise<boolean> {
     return true;
   }
   catch (error) { persistenceFailed = true; get('persistence').textContent = error instanceof Error ? error.message : 'Unable to save the habitat. Save a replay file to keep it.'; return false; }
-  finally { saving = false; }
 }
 async function mayLeave(): Promise<boolean> {
   return await persist(true) || window.confirm('This visit could not be saved. Cancel to keep it and export a replay, or leave without saving its latest progress.');

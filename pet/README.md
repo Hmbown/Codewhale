@@ -105,6 +105,8 @@ holes are rejected; reconnects resume from the last accepted Runtime cursor.
 The recorder seals the preceding observation interval against a fixed clock.
 It retains request lifetimes and counts a delayed error once at receipt time.
 Raw prompts, arguments, results and tokens do not enter the pet recording.
+The standalone recorder currently stops after 24 hours per JSONL file; its
+continuous native-companion handoff remains part of the live-attachment work.
 
 The thin wire is JSONL, one flat version-1 `PetBucket` per line: PetState plus
 `sequence`, `simTimeMs`, `durationMs`, thirteen-element `onsets` and `activeMs`,
