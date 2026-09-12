@@ -577,6 +577,7 @@ mod tests {
     #[test]
     fn subagent_state_is_derived_from_runtime_facts_only() {
         let mut agent = SubAgentResult {
+            usage: None,
             name: "child-1".into(),
             agent_id: "child-1".into(),
             context_mode: "fresh".into(),

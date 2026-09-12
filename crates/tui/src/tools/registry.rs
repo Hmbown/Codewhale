@@ -234,7 +234,17 @@ impl ToolRegistry {
                 Tool {
                     tool_type: None,
                     name: tool.name().to_string(),
-                    description: tool.description().to_string(),
+                    description: if evidence_only
+                        && matches!(tool.name(), "bash" | "Bash" | "exec_shell")
+                    {
+                        format!(
+                            "{} {}",
+                            tool.description(),
+                            codewhale_execpolicy::command_safety::readonly_command_help()
+                        )
+                    } else {
+                        tool.description().to_string()
+                    },
                     input_schema: schema,
                     allowed_callers: Some(vec!["direct".to_string()]),
                     defer_loading: Some(tool.defer_loading()),
@@ -562,8 +572,9 @@ fn enforce_tool_authority(
             return Ok(());
         }
         return Err(ToolError::permission_denied(format!(
-            "worker '{}' cannot run {name}: arbitrary command execution is outside its machine-readable authority envelope",
-            authority.owner
+            "worker '{}' cannot run {name}: arbitrary command execution is outside its machine-readable authority envelope. {}",
+            authority.owner,
+            codewhale_execpolicy::command_safety::readonly_command_help()
         )));
     }
     if name == "Run" {
@@ -583,8 +594,9 @@ fn enforce_tool_authority(
             )));
         }
         return Err(ToolError::permission_denied(format!(
-            "worker '{}' cannot run {name}: arbitrary command execution is outside its machine-readable authority envelope",
-            authority.owner
+            "worker '{}' cannot run {name}: arbitrary command execution is outside its machine-readable authority envelope. {}",
+            authority.owner,
+            codewhale_execpolicy::command_safety::readonly_command_help()
         )));
     }
     if name == "Git" || name.starts_with("git_") || name == "review" {

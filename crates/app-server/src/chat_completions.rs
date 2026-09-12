@@ -1058,61 +1058,45 @@ api_key = {provider_api_key:?}
     }
 
     #[test]
-    fn opencode_go_app_route_cannot_cross_route_or_bypass_chat_allowlist() {
+    fn opencode_go_app_route_uses_model_protocol_without_cross_provider_fallback() {
         let registry = ModelRegistry::default();
-        let messages_models = [
-            "minimax-m3",
-            "minimax-m2.7",
-            "minimax-m2.5",
-            "qwen3.7-max",
-            "qwen3.7-plus",
-            "qwen3.6-plus",
-        ];
-
-        for model in messages_models {
+        for (model, wire) in [
+            ("grok-4.5", WireFormat::ChatCompletions),
+            ("kimi-k3", WireFormat::ChatCompletions),
+            ("grok-4.6", WireFormat::Responses),
+            ("gpt-5.6-luna", WireFormat::Responses),
+            ("minimax-m3", WireFormat::AnthropicMessages),
+            ("qwen3.8-max", WireFormat::AnthropicMessages),
+        ] {
             for requested in [model.to_string(), format!("opencode-go/{model}")] {
-                let mut config = ConfigToml {
-                    provider: ProviderKind::OpencodeGo,
-                    ..ConfigToml::default()
-                };
-                config.providers.opencode_go.model = Some(requested.clone());
-                assert!(
-                    matches!(
-                        resolve_endpoint(&config, &registry, None),
-                        Err(RouteError::ForeignModelForDirectProvider { .. })
-                    ),
-                    "static {requested} must be rejected"
-                );
-                assert!(
-                    matches!(
-                        resolve_endpoint(&config, &registry, Some(&requested)),
-                        Err(RouteError::ForeignModelForDirectProvider { .. })
-                    ),
-                    "request {requested} must not cross-route"
-                );
-
-                config.providers.opencode_go.base_url =
-                    Some("https://go-gateway.example.test/v1".to_string());
-                assert!(
-                    matches!(
-                        resolve_endpoint(&config, &registry, Some(&requested)),
-                        Err(RouteError::ForeignModelForDirectProvider { .. })
-                    ),
-                    "custom-base {requested} must still be rejected"
-                );
+                for base_url in [None, Some("https://go-gateway.example.test/v1".into())] {
+                    let mut config = ConfigToml {
+                        provider: ProviderKind::OpencodeGo,
+                        ..ConfigToml::default()
+                    };
+                    config.providers.opencode_go.model = Some(requested.clone());
+                    config.providers.opencode_go.base_url = base_url;
+                    for selection in [None, Some(requested.as_str())] {
+                        let endpoint = resolve_endpoint(&config, &registry, selection)
+                            .expect("documented Go route");
+                        assert_eq!(endpoint.provider, ProviderKind::OpencodeGo);
+                        assert_eq!(endpoint.model, model);
+                        assert_eq!(endpoint.wire_format, wire);
+                    }
+                }
             }
         }
-
-        for model in ["grok-4.5", "kimi-k3"] {
-            let mut valid = ConfigToml {
+        for model in ["claude-unproven", "gpt-unlisted", "openai/gpt-5.6-luna"] {
+            let mut config = ConfigToml {
                 provider: ProviderKind::OpencodeGo,
                 ..ConfigToml::default()
             };
-            valid.providers.opencode_go.model = Some(format!("opencode-go/{model}"));
-            let endpoint = resolve_endpoint(&valid, &registry, None).expect("valid Go route");
-            assert_eq!(endpoint.provider, ProviderKind::OpencodeGo);
-            assert_eq!(endpoint.model, model);
-            assert_eq!(endpoint.wire_format, WireFormat::ChatCompletions);
+            config.providers.opencode_go.model = Some(model.into());
+            assert!(resolve_endpoint(&config, &registry, None).is_err());
+            assert!(resolve_endpoint(&config, &registry, Some(model)).is_err());
+            config.providers.opencode_go.base_url =
+                Some("https://go-gateway.example.test/v1".into());
+            assert!(resolve_endpoint(&config, &registry, Some(model)).is_err());
         }
     }
 

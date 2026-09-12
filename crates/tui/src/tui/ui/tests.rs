@@ -8173,7 +8173,11 @@ async fn apply_loaded_session_resets_workspace_runtime_state() {
     let old_context_cell = app.workspace_context_cell.clone();
     app.workspace_context = Some("old workspace context".to_string());
     if let Ok(mut cell) = old_context_cell.lock() {
-        *cell = Some("old workspace context".to_string());
+        *cell = Some(crate::tui::workspace_context::WorkspaceContextSnapshot {
+            workspace: app.workspace.clone(),
+            context: Some("old workspace context".to_string()),
+            is_linked_worktree: false,
+        });
     }
     app.workspace_context_refreshed_at = Some(Instant::now());
     app.file_tree = Some(crate::tui::file_tree::FileTreeState::new(
@@ -13720,6 +13724,7 @@ fn make_subagent(
     status: crate::tools::subagent::SubAgentStatus,
 ) -> crate::tools::subagent::SubAgentResult {
     crate::tools::subagent::SubAgentResult {
+        usage: None,
         name: id.to_string(),
         agent_id: id.to_string(),
         context_mode: "fresh".to_string(),
@@ -16538,6 +16543,37 @@ fn completed_subagent_shell_tool_refreshes_workspace_context_before_ttl() {
 }
 
 #[test]
+fn workspace_context_discards_old_workspace_results_and_clears_missing_git() {
+    let mut app = create_test_app();
+    app.workspace_context = Some("feature/current | clean".into());
+    app.workspace_is_linked_worktree = true;
+    app.workspace_context_refreshed_at = Some(Instant::now());
+    *app.workspace_context_cell.lock().unwrap() =
+        Some(crate::tui::workspace_context::WorkspaceContextSnapshot {
+            workspace: app.workspace.join("old-workspace"),
+            context: Some("stale | clean".into()),
+            is_linked_worktree: false,
+        });
+    crate::tui::workspace_context::refresh_if_needed(&mut app, Instant::now(), false);
+    assert_eq!(
+        app.workspace_context.as_deref(),
+        Some("feature/current | clean")
+    );
+    assert!(app.workspace_is_linked_worktree);
+    app.needs_redraw = false;
+    *app.workspace_context_cell.lock().unwrap() =
+        Some(crate::tui::workspace_context::WorkspaceContextSnapshot {
+            workspace: app.workspace.clone(),
+            context: None,
+            is_linked_worktree: false,
+        });
+    crate::tui::workspace_context::refresh_if_needed(&mut app, Instant::now(), false);
+    assert!(app.workspace_context.is_none());
+    assert!(!app.workspace_is_linked_worktree);
+    assert!(app.needs_redraw);
+}
+
+#[test]
 fn workspace_context_drain_requests_redraw_when_context_changes() {
     let mut app = create_test_app();
     app.workspace_context = Some("feature/old | clean".to_string());
@@ -16545,7 +16581,11 @@ fn workspace_context_drain_requests_redraw_when_context_changes() {
     app.needs_redraw = false;
     {
         let mut cell = app.workspace_context_cell.lock().expect("context cell");
-        *cell = Some("feature/new | clean".to_string());
+        *cell = Some(crate::tui::workspace_context::WorkspaceContextSnapshot {
+            workspace: app.workspace.clone(),
+            context: Some("feature/new | clean".to_string()),
+            is_linked_worktree: false,
+        });
     }
 
     crate::tui::workspace_context::refresh_if_needed(&mut app, Instant::now(), false);

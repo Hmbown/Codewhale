@@ -10,6 +10,8 @@ pub mod external_credentials;
 pub mod model_reference;
 pub mod models_dev;
 pub mod notifications;
+mod opencode_go;
+pub use opencode_go::{opencode_go_endpoint_key, opencode_go_model_id, opencode_go_models};
 pub mod persistence;
 pub mod pricing;
 pub mod provider;
@@ -4378,11 +4380,11 @@ pub fn known_foreign_model_owner(
 
 fn normalize_model_for_provider(provider: ProviderKind, model: &str) -> String {
     if matches!(provider, ProviderKind::OpencodeGo) {
-        // Canonicalize known Chat Completions ids. Unknown / Messages-only ids
+        // Canonicalize documented model ids. Unknown ids
         // must never be rewritten to the provider default — substituting a
         // different model is worse than letting the route layer reject the
         // request by the name the user actually configured.
-        return opencode_go_chat_model_id(model)
+        return opencode_go_model_id(model)
             .map(str::to_string)
             .unwrap_or_else(|| model.trim().to_string());
     }
@@ -4544,66 +4546,6 @@ fn normalize_model_for_provider(provider: ProviderKind, model: &str) -> String {
         ) => DEFAULT_DEEPINFRA_FLASH_MODEL.to_string(),
         _ => model.to_string(),
     }
-}
-
-/// OpenCode Go models reviewed for its OpenAI Chat Completions endpoint.
-///
-/// Keep config validation, picker/catalog projections, and live-roster
-/// sanitization on this one protocol-scoped contract. The provider's combined
-/// `/models` roster also contains Messages and Responses models, which are
-/// deliberately absent from this Chat-only route.
-///
-/// Reviewed against <https://opencode.ai/docs/go/#endpoints> on 2026-09-08.
-/// Previously reviewed IDs remain compatible absent explicit deprecation;
-/// live availability is established separately by the provider catalog.
-pub const OPENCODE_GO_CHAT_MODELS: &[&str] = &[
-    DEFAULT_OPENCODE_GO_MODEL,
-    OPENCODE_GO_GROK_4_5_MODEL,
-    OPENCODE_GO_GLM_5_2_MODEL,
-    OPENCODE_GO_GLM_5_1_MODEL,
-    OPENCODE_GO_KIMI_K3_MODEL,
-    OPENCODE_GO_KIMI_K2_7_CODE_MODEL,
-    OPENCODE_GO_KIMI_K2_6_MODEL,
-    OPENCODE_GO_DEEPSEEK_V4_FLASH_MODEL,
-    OPENCODE_GO_MIMO_V2_5_MODEL,
-    OPENCODE_GO_MIMO_V2_5_PRO_MODEL,
-    "glm-5.3-flash",
-    "glm-5.3",
-    "longcat-2.0",
-    "deepseek-v4-flash-vision-exp",
-    "hy4-preview",
-    "hy3",
-    "omen-alpha",
-];
-
-/// Canonicalize an OpenCode Go model that is documented for the OpenAI Chat
-/// Completions endpoint. The live `/models` roster also contains
-/// Messages and Responses models; returning `None` for those is the protocol
-/// cutline shared by config and the TUI live-catalog paths.
-#[must_use]
-pub fn opencode_go_chat_model_id(model: &str) -> Option<&'static str> {
-    let normalized = model.trim().to_ascii_lowercase().replace(['_', ' '], "-");
-    let normalized = normalized
-        .strip_prefix("opencode-go/")
-        .unwrap_or(&normalized);
-    let familiar_alias = match normalized {
-        "grok-4-5" => Some(OPENCODE_GO_GROK_4_5_MODEL),
-        "glm-5-2" => Some(OPENCODE_GO_GLM_5_2_MODEL),
-        "glm-5-1" => Some(OPENCODE_GO_GLM_5_1_MODEL),
-        "kimi-k2-7-code" => Some(OPENCODE_GO_KIMI_K2_7_CODE_MODEL),
-        "kimi-k2-6" => Some(OPENCODE_GO_KIMI_K2_6_MODEL),
-        "deepseek-v4pro" => Some(DEFAULT_OPENCODE_GO_MODEL),
-        "deepseek-v4flash" => Some(OPENCODE_GO_DEEPSEEK_V4_FLASH_MODEL),
-        "mimo-v2-5" => Some(OPENCODE_GO_MIMO_V2_5_MODEL),
-        "mimo-v2-5-pro" => Some(OPENCODE_GO_MIMO_V2_5_PRO_MODEL),
-        _ => None,
-    };
-    familiar_alias.or_else(|| {
-        OPENCODE_GO_CHAT_MODELS
-            .iter()
-            .copied()
-            .find(|candidate| *candidate == normalized)
-    })
 }
 
 fn canonical_xiaomi_mimo_model_id(model: &str) -> Option<&'static str> {

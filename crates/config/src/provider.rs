@@ -684,6 +684,7 @@ macro_rules! provider {
         [$($env_var:literal),* $(,)?],
         $config_key:literal,
         aliases: [$($alias:literal),* $(,)?]
+        $(, wire_policy: $wire_policy:expr)?
     ) => {
         /// Zero-sized metadata entry for this built-in provider.
         pub struct $struct_name;
@@ -720,6 +721,10 @@ macro_rules! provider {
             fn aliases(&self) -> &'static [&'static str] {
                 &[$($alias),*]
             }
+
+            $(fn wire_policy(&self) -> WirePolicy {
+                $wire_policy
+            })?
         }
     };
 }
@@ -1376,7 +1381,8 @@ provider!(
     DEFAULT_OPENCODE_GO_MODEL,
     ["OPENCODE_GO_API_KEY"],
     "opencode_go",
-    aliases: ["opencode_go", "opencodego"]
+    aliases: ["opencode_go", "opencodego"],
+    wire_policy: WirePolicy::ModelAware
 );
 
 /// OpenCode Zen gateway with a model-scoped wire protocol.

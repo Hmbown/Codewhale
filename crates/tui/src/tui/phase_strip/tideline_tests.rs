@@ -423,6 +423,7 @@ fn enter_again_hint_shows_at_zero_and_one_use_and_clears_at_two() {
 
 fn completed_subagent(id: &str) -> crate::tools::subagent::SubAgentResult {
     crate::tools::subagent::SubAgentResult {
+        usage: None,
         name: id.to_string(),
         agent_id: id.to_string(),
         context_mode: "fresh".to_string(),

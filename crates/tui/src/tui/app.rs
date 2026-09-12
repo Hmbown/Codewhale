@@ -2349,8 +2349,12 @@ pub struct App {
 
     /// Cached git context snapshot for the footer.
     pub workspace_context: Option<String>,
+    /// Cached linked-worktree identity, refreshed with the branch off the draw path.
+    pub workspace_is_linked_worktree: bool,
     /// Shared cell for async git context updates (#399 S1).
-    pub workspace_context_cell: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+    pub workspace_context_cell: std::sync::Arc<
+        std::sync::Mutex<Option<crate::tui::workspace_context::WorkspaceContextSnapshot>>,
+    >,
     /// Timestamp for cached workspace context.
     pub workspace_context_refreshed_at: Option<Instant>,
     /// Cached size of the memory file, formatted for the Session sidebar.

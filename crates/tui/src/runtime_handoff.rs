@@ -1104,6 +1104,7 @@ mod tests {
 
     fn topology_snapshot(agent_id: &str, name: &str, status: SubAgentStatus) -> SubAgentResult {
         SubAgentResult {
+            usage: None,
             name: name.to_string(),
             agent_id: agent_id.to_string(),
             context_mode: "fresh".to_string(),

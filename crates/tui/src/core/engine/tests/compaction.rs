@@ -121,8 +121,13 @@ struct BlockingEmergencyCompactionModelClient {
 #[tokio::test]
 async fn failed_emergency_compaction_preserves_history_instead_of_trimming() {
     use crate::llm_client::mock::MockLlmClient;
+    let _env_lock = lock_test_env();
     let workspace = tempdir().unwrap();
-    let (mut engine, _handle) = Engine::new(
+    // Emergency compaction persists a checkpoint before calling the model.
+    // Keep that prerequisite away from other tests' shared state fixtures so
+    // this exercises a summary failure, rather than an unrelated write failure.
+    let _home = EnvVarGuard::set("CODEWHALE_HOME", workspace.path());
+    let (mut engine, handle) = Engine::new(
         deterministic_engine_config(workspace.path()),
         &Config::default(),
     );
@@ -160,10 +165,12 @@ async fn failed_emergency_compaction_preserves_history_instead_of_trimming() {
     );
     assert_eq!(engine.session.messages.as_slice(), before.as_slice());
     assert_eq!(engine.session.compaction_summary_prompt, summary);
+    let mut events = handle.rx_event.write().await;
+    let drained = std::iter::from_fn(|| events.try_recv().ok()).collect::<Vec<_>>();
     assert_eq!(
         client.call_count(),
         1,
-        "a deterministic summary failure is not retried unchanged"
+        "a deterministic summary failure is not retried unchanged: {drained:?}"
     );
     let requests = client.captured_requests();
     assert_eq!(requests[0].tools.as_deref(), Some(tools.as_slice()));

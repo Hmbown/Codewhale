@@ -3051,9 +3051,15 @@ impl DeepSeekClient {
                 .map(|model| CatalogOffering {
                     cost_source: None,
                     provider: provider.clone(),
+                    endpoint_key: if self.api_provider == ApiProvider::OpencodeGo {
+                        codewhale_config::opencode_go_endpoint_key(&model.id)
+                            .expect("filtered Go roster")
+                    } else {
+                        "chat"
+                    }
+                    .to_string(),
                     wire_model_id: model.id,
                     canonical_model: None,
-                    endpoint_key: "chat".to_string(),
                     default_for_provider: false,
                     family: None,
                     limit: None,
@@ -3974,11 +3980,8 @@ pub(super) fn parse_models_response(payload: &str) -> Result<Vec<AvailableModel>
     Ok(models)
 }
 
-/// Apply provider-owned protocol cutlines to a live `/models` response.
-///
-/// OpenCode Go mixes OpenAI Chat Completions and Anthropic Messages models in
-/// one roster. Codewhale's `OpencodeGo` route is intentionally Chat-only, so
-/// both `/models` consumers must share this filter before publishing choices.
+/// Keep both live-model consumers on Go's documented three-protocol roster.
+/// Unknown models remain hidden until their wire contract is known.
 fn apply_provider_model_cutline(
     provider: ApiProvider,
     models: Vec<AvailableModel>,
@@ -3990,7 +3993,7 @@ fn apply_provider_model_cutline(
     let mut models: Vec<_> = models
         .into_iter()
         .filter_map(|mut model| {
-            let canonical = crate::config::opencode_go_chat_model_id(&model.id)?;
+            let canonical = crate::config::opencode_go_model_id(&model.id)?;
             model.id = canonical.to_string();
             Some(model)
         })
@@ -7767,6 +7770,125 @@ mod tests {
                 request.headers.get(forbidden).is_none(),
                 "Zen request must not include {forbidden}"
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn opencode_go_dispatches_all_three_wires_with_gateway_auth_and_stable_session() {
+        let mut session = None;
+        for (model, wire, endpoint) in [
+            (
+                "deepseek-v4-pro",
+                WireFormat::ChatCompletions,
+                "/zen/go/v1/chat/completions",
+            ),
+            ("grok-4.6", WireFormat::Responses, "/zen/go/v1/responses"),
+            (
+                "minimax-m3",
+                WireFormat::AnthropicMessages,
+                "/zen/go/v1/messages",
+            ),
+        ] {
+            let server = MockServer::start().await;
+            let response = match wire {
+                WireFormat::Responses => ResponseTemplate::new(200)
+                    .insert_header("Content-Type", "text/event-stream")
+                    .set_body_string("data: [DONE]\n\n"),
+                WireFormat::AnthropicMessages => ResponseTemplate::new(200).set_body_json(json!({
+                    "id":"msg_go", "type":"message", "role":"assistant",
+                    "content":[{"type":"text", "text":"ok"}], "model":model,
+                    "stop_reason":"end_turn", "stop_sequence":null,
+                    "usage":{"input_tokens":3,"output_tokens":1}
+                })),
+                WireFormat::ChatCompletions => ResponseTemplate::new(200).set_body_json(json!({
+                    "id":"chat_go", "object":"chat.completion", "created":1, "model":model,
+                    "choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],
+                    "usage":{"prompt_tokens":3,"completion_tokens":1,"total_tokens":4}
+                })),
+            };
+            Mock::given(method("POST"))
+                .and(path(endpoint))
+                .respond_with(response)
+                .expect(1)
+                .mount(&server)
+                .await;
+            let mut client = DeepSeekClient::new(&Config {
+                provider: Some("opencode-go".into()),
+                providers: Some(ProvidersConfig {
+                    opencode_go: ProviderConfig {
+                        api_key: Some("go-test-key".into()),
+                        base_url: Some(format!("{}/zen/go/v1", server.uri())),
+                        model: Some(format!("opencode-go/{model}")),
+                        ..ProviderConfig::default()
+                    },
+                    ..ProvidersConfig::default()
+                }),
+                ..Config::default()
+            })
+            .expect("Go client resolves the model protocol");
+            client.retry.enabled = false;
+            assert_eq!(client.wire_format, wire);
+            if wire == WireFormat::Responses {
+                let mut stream = client
+                    .create_message_stream(minimal_zen_request(model))
+                    .await
+                    .unwrap();
+                while let Some(event) = stream.next().await {
+                    event.unwrap();
+                }
+                assert!(
+                    client
+                        .prepare_outbound_request(minimal_zen_request("minimax-m3"), false)
+                        .is_err(),
+                    "a request cannot silently change an existing client's protocol"
+                );
+            } else {
+                client
+                    .create_message(minimal_zen_request(model))
+                    .await
+                    .unwrap();
+            }
+            let requests = server.received_requests().await.unwrap();
+            assert_eq!(requests.len(), 1);
+            let request = &requests[0];
+            let header = |name: &str| {
+                request
+                    .headers
+                    .get(name)
+                    .and_then(|value| value.to_str().ok())
+            };
+            let observed_session = header("x-opencode-session").expect("stable session header");
+            assert!(!observed_session.is_empty());
+            if let Some(previous) = &session {
+                assert_eq!(observed_session, previous);
+            }
+            session = Some(observed_session.to_string());
+            assert!(header("user-agent").is_some_and(|value| value.contains("Codewhale") || value.contains("codewhale")));
+            for forbidden in ["openai-beta", "originator", "chatgpt-account-id"] {
+                assert!(
+                    header(forbidden).is_none(),
+                    "gateway requests cannot carry {forbidden}"
+                );
+            }
+            let body: Value = serde_json::from_slice(&request.body).unwrap();
+            assert_eq!(body["model"], model);
+            if wire == WireFormat::AnthropicMessages {
+                assert_eq!(header("x-api-key"), Some("go-test-key"));
+                assert_eq!(header("anthropic-version"), Some("2023-06-01"));
+                assert!(header("authorization").is_none());
+                assert!(body.get("messages").is_some());
+            } else {
+                assert_eq!(header("authorization"), Some("Bearer go-test-key"));
+                assert!(header("x-api-key").is_none());
+                assert!(
+                    body.get(if wire == WireFormat::Responses {
+                        "input"
+                    } else {
+                        "messages"
+                    })
+                    .is_some()
+                );
+            }
         }
     }
 
@@ -11797,16 +11919,9 @@ mod tests {
     }
 
     #[test]
-    fn opencode_go_client_rejects_messages_only_config_models() {
+    fn opencode_go_client_rejects_unknown_protocol_models() {
         let _ = rustls::crypto::ring::default_provider().install_default();
-        for model in [
-            "minimax-m3",
-            "minimax-m2.7",
-            "minimax-m2.5",
-            "qwen3.7-max",
-            "qwen3.7-plus",
-            "qwen3.6-plus",
-        ] {
+        for model in ["claude-unproven", "gpt-unlisted"] {
             let config = Config {
                 provider: Some("opencode-go".to_string()),
                 providers: Some(ProvidersConfig {
@@ -11821,15 +11936,15 @@ mod tests {
             };
             let err = DeepSeekClient::new(&config)
                 .err()
-                .expect("Messages-only model must fail before client construction");
-            assert!(err.to_string().contains("Chat Completions"), "{err:#}");
+                .expect("unknown protocol must fail before client construction");
+            assert!(err.to_string().contains(model), "{err:#}");
         }
     }
 
     #[tokio::test]
-    async fn opencode_go_live_model_paths_keep_only_chat_completions_rows() {
+    async fn opencode_go_live_model_paths_keep_documented_protocol_rows() {
         let server = MockServer::start().await;
-        let mut rows: Vec<_> = crate::config::OPENCODE_GO_CHAT_MODELS
+        let mut rows: Vec<_> = crate::config::opencode_go_models()
             .iter()
             .map(|id| json!({"id": id}))
             .collect();
@@ -11847,7 +11962,7 @@ mod tests {
         let listed = client.list_models().await.expect("filtered model list");
         let listed: std::collections::BTreeSet<_> =
             listed.into_iter().map(|model| model.id).collect();
-        let expected: std::collections::BTreeSet<_> = crate::config::OPENCODE_GO_CHAT_MODELS
+        let expected: std::collections::BTreeSet<_> = crate::config::opencode_go_models()
             .iter()
             .map(|model| (*model).to_string())
             .collect();
@@ -11865,7 +11980,8 @@ mod tests {
             delta
                 .offerings
                 .iter()
-                .all(|offering| offering.endpoint_key == "chat")
+                .all(|offering| Some(offering.endpoint_key.as_str())
+                    == codewhale_config::opencode_go_endpoint_key(&offering.wire_model_id))
         );
     }
 

@@ -161,6 +161,7 @@ fn make_assignment() -> SubAgentAssignment {
 
 fn make_snapshot(status: SubAgentStatus) -> SubAgentResult {
     SubAgentResult {
+        usage: None,
         name: "agent_test".to_string(),
         agent_id: "agent_test".to_string(),
         context_mode: "fresh".to_string(),
@@ -409,6 +410,89 @@ fn headless_worker_record_tracks_lifecycle_without_tui_projection() {
             .events
             .iter()
             .any(|event| event.tool_name.as_deref() == Some("read_file"))
+    );
+}
+
+#[test]
+fn parent_worker_usage_projection_survives_restart_without_inventing_cost() {
+    let tmp = tempdir().unwrap();
+    let state_path = tmp.path().join("subagents.v1.json");
+    let mut manager =
+        SubAgentManager::new(tmp.path().to_path_buf(), 4).with_state_path(state_path.clone());
+    let id = "agent_usage_projection";
+    let (input_tx, _input_rx) = mpsc::unbounded_channel();
+    let mut agent = SubAgent::new(
+        id.into(),
+        FleetRole::Reviewer,
+        "review".into(),
+        make_assignment(),
+        "custom-model".into(),
+        None,
+        None,
+        input_tx,
+        tmp.path().to_path_buf(),
+        manager.session_boot_id().into(),
+    );
+    agent.status = SubAgentStatus::Completed;
+    manager.agents.insert(id.into(), agent);
+    manager.register_worker(make_worker_spec(id, tmp.path().to_path_buf()));
+    manager.assign_test_session_owner(id, "usage-owner");
+    manager.record_worker_usage(
+        id,
+        "response:1",
+        &Usage {
+            input_tokens: 120,
+            output_tokens: 30,
+            prompt_cache_hit_tokens: Some(80),
+            ..Usage::default()
+        },
+        None,
+    );
+    manager.record_worker_usage(
+        id,
+        "response:1",
+        &Usage {
+            input_tokens: 120,
+            output_tokens: 30,
+            ..Usage::default()
+        },
+        None,
+    );
+    manager.record_worker_usage(id, "response:missing", &Usage::default(), None);
+    let result = manager
+        .get_result_by_ref_for_session("usage-owner", id)
+        .unwrap();
+    let usage = result.usage.as_ref().unwrap();
+    assert_eq!(usage.input_tokens, Some(120));
+    assert_eq!(usage.output_tokens, Some(30));
+    assert_eq!(usage.total_tokens, Some(150));
+    assert_eq!(
+        usage.cost_microusd, None,
+        "unpriced provider usage must not claim free work"
+    );
+    let json = serde_json::to_value(&result).unwrap();
+    assert_eq!(json["usage"]["total_tokens"], 150);
+    assert!(json["usage"].get("cost_microusd").is_none());
+    assert!(
+        manager
+            .get_result_by_ref_for_session("foreign-owner", id)
+            .is_err()
+    );
+    manager.persist_state().unwrap().join().unwrap();
+    let mut loaded = SubAgentManager::new(tmp.path().to_path_buf(), 4).with_state_path(state_path);
+    loaded.load_state().unwrap();
+    let restored = loaded
+        .get_result_by_ref_for_session("usage-owner", id)
+        .unwrap();
+    assert_eq!(restored.usage, result.usage);
+    let listed = loaded.list_filtered_for_session("usage-owner", true);
+    assert_eq!(
+        listed
+            .iter()
+            .find(|agent| agent.agent_id == id)
+            .unwrap()
+            .usage,
+        result.usage
     );
 }
 
@@ -2611,7 +2695,7 @@ async fn provider_success_without_usage_records_one_route_aware_gap_and_no_zero_
         .get_worker_record("agent_missing_usage")
         .expect("missing-usage worker record")
         .clone();
-    assert_eq!(worker.usage.total_tokens, Some(0));
+    assert_eq!(worker.usage.total_tokens, None);
     assert_eq!(worker.usage.cost_microusd, None);
     assert_eq!(worker.usage_source_fingerprints, [fingerprint].into());
 }
@@ -22024,7 +22108,7 @@ mod child_permission_gate {
             .get_worker_record("agent_gate")
             .expect("guardian missing usage reaches the worker ledger")
             .clone();
-        assert_eq!(worker.usage.total_tokens, Some(0));
+        assert_eq!(worker.usage.total_tokens, None);
         assert_eq!(worker.usage.cost_microusd, None);
         assert_eq!(worker.usage_source_fingerprints.len(), 1);
 

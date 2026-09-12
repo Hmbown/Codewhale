@@ -482,6 +482,10 @@ pub struct SubAgentNeedsInput {
 /// Snapshot of sub-agent state for tool results.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubAgentResult {
+    /// Provider-reported worker usage from the existing durable ledger. Missing
+    /// pricing remains absent; this is never an estimate of a provider charge.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<AgentRunUsage>,
     pub name: String,
     pub agent_id: String,
     pub context_mode: String,
@@ -3197,6 +3201,7 @@ impl SubAgent {
     #[must_use]
     pub fn snapshot(&self) -> SubAgentResult {
         SubAgentResult {
+            usage: None,
             name: self.session_name.clone(),
             agent_id: self.id.clone(),
             context_mode: if self.fork_context { "forked" } else { "fresh" }.to_string(),
@@ -5378,6 +5383,12 @@ impl SubAgentManager {
             return;
         }
         record.updated_at_ms = now_ms;
+        // An omitted provider usage payload is not a measured zero. Keep its
+        // receipt identity for deduplication, but leave token totals unknown.
+        if !usage_has_reported_data(usage) {
+            self.persist_state_debounced();
+            return;
+        }
         record.usage.input_tokens = Some(
             record
                 .usage
@@ -5561,16 +5572,16 @@ impl SubAgentManager {
                 .get(&agent_id)
                 .ok_or_else(|| anyhow!("Agent {agent_id} not found"))?;
             if agent.status != SubAgentStatus::Running {
-                let snapshot = agent.snapshot();
+                let snapshot = self.snapshot_for_listing(agent);
                 return Ok(self.terminalize_settled_worker_on_cancel(&agent_id, snapshot));
             }
             if agent.completion_claimed {
                 // Still running, with its terminal transition already claimed:
                 // mid-flight, not settled. Stealing it here would record a
                 // second terminal outcome for one child.
-                return Ok(agent.snapshot());
+                return Ok(self.snapshot_for_listing(agent));
             }
-            agent.snapshot()
+            self.snapshot_for_listing(agent)
         };
         terminal.status = SubAgentStatus::Cancelled;
         terminal.result = Some("Cancelled by parent request.".to_string());
@@ -5620,7 +5631,7 @@ impl SubAgentManager {
         self.persist_state_best_effort();
         self.agents
             .get(agent_id)
-            .map_or(snapshot, |agent| agent.snapshot())
+            .map_or(snapshot, |agent| self.snapshot_for_listing(agent))
     }
 
     pub(crate) fn cancel_agent_for_session(
@@ -7213,6 +7224,7 @@ impl SubAgentManager {
         snap.started_at = Some(agent.started_at);
         snap.from_prior_session = self.is_from_prior_session(agent);
         if let Some(record) = self.worker_records.get(&agent.id) {
+            snap.usage = Some(record.usage.clone());
             snap.worker_status = Some(record.status);
             snap.runtime_permissions = Some(crate::fleet::role::fleet_effective_permissions(
                 &record.spec.agent_type,
@@ -11536,6 +11548,7 @@ async fn cancelled_subagent_result(
     )
     .await;
     SubAgentResult {
+        usage: None,
         name: agent_id.to_string(),
         agent_id: agent_id.to_string(),
         context_mode: if fork_context_enabled {
@@ -11991,6 +12004,7 @@ async fn run_subagent(
                             ),
                         );
                         return Ok(SubAgentResult {
+                            usage: None,
                             name: agent_id.clone(),
                             agent_id: agent_id.clone(),
                             context_mode: if fork_context_enabled {
@@ -12172,6 +12186,7 @@ async fn run_subagent(
             )
             .await;
             return Ok(SubAgentResult {
+                usage: None,
                 name: agent_id.clone(),
                 agent_id: agent_id.clone(),
                 context_mode: if fork_context_enabled {
@@ -12460,6 +12475,7 @@ async fn run_subagent(
     .await;
 
     Ok(SubAgentResult {
+        usage: None,
         name: agent_id.clone(),
         agent_id,
         context_mode: if fork_context_enabled {
@@ -16216,8 +16232,9 @@ impl SubAgentToolRegistry {
         if !self.posture_permits_tool(name, Some(&input)) {
             if self.allows_bounded_readonly_bash(name) {
                 return Err(anyhow!(
-                    "[shell.readonly.command] Tool {name} input did not match the bounded read-only shell grammar for Fleet role `{role}`. Use read-only inspection commands, or an `implement`/`general` role for mutation or arbitrary execution.",
-                    role = self.agent_type.as_str()
+                    "[shell.readonly.command] Tool {name} input did not match the bounded read-only shell grammar for Fleet role `{role}`. {guidance}",
+                    role = self.agent_type.as_str(),
+                    guidance = codewhale_execpolicy::command_safety::readonly_command_help()
                 ));
             }
             return Err(anyhow!(

@@ -2672,6 +2672,7 @@ pub(crate) fn apply_workspace_runtime_state(app: &mut App, config: &Config, work
     app.project_context_pack_enabled = config.project_context_pack_enabled();
     app.refresh_skill_cache();
     app.workspace_context = None;
+    app.workspace_is_linked_worktree = false;
     if let Ok(mut cell) = app.workspace_context_cell.lock() {
         *cell = None;
     }
@@ -3804,6 +3805,7 @@ pub(crate) fn apply_loaded_session_with_goal(
     app.session_title = Some(session.metadata.title.clone());
     app.window_title = session.window_title.clone();
     app.workspace_context = None;
+    app.workspace_is_linked_worktree = false;
     app.workspace_context_refreshed_at = None;
     if let Some(sp) = session.system_prompt.as_ref() {
         app.system_prompt = Some(SystemPrompt::Text(sp.clone()));

@@ -789,7 +789,7 @@
       "family": "opencode-go",
       "label": "OpenCode Go",
       "endpoint": "https://opencode.ai/zen/go/v1",
-      "wire": "chat-completions",
+      "wire": "model-aware",
       "defaultModel": "deepseek-v4-pro",
       "envVars": [
         "OPENCODE_GO_API_KEY"
@@ -800,7 +800,7 @@
           "label": "API key"
         }
       ],
-      "transport": "chat-completions"
+      "transport": "model-aware"
     },
     {
       "id": "opencode-zen",

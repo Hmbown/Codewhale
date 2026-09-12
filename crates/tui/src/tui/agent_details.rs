@@ -569,6 +569,7 @@ mod tests {
 
     fn agent(agent_id: &str, status: SubAgentStatus) -> SubAgentResult {
         SubAgentResult {
+            usage: None,
             name: agent_id.to_string(),
             agent_id: agent_id.to_string(),
             context_mode: "isolated".to_string(),

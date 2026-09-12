@@ -17,20 +17,66 @@ use crate::tui::app::App;
 /// re-query git. Exposed for tests that exercise the TTL.
 pub(crate) const REFRESH_SECS: u64 = 15;
 
+/// One completed background refresh, including an unavailable Git result.
+#[derive(Debug)]
+pub(crate) struct WorkspaceContextSnapshot {
+    pub workspace: std::path::PathBuf,
+    pub context: Option<String>,
+    pub is_linked_worktree: bool,
+}
+
+fn collect_snapshot(workspace: &Path) -> WorkspaceContextSnapshot {
+    let context = collect(workspace);
+    let is_linked_worktree = context.is_some()
+        && run_git(
+            workspace,
+            &[
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-dir",
+                "--git-common-dir",
+            ],
+        )
+        .ok()
+        .is_some_and(|paths| {
+            let mut paths = paths.lines();
+            matches!((paths.next(), paths.next(), paths.next()),
+                (Some(git_dir), Some(common_dir), None) if git_dir != common_dir)
+        });
+    WorkspaceContextSnapshot {
+        workspace: workspace.to_path_buf(),
+        context,
+        is_linked_worktree,
+    }
+}
+
+fn apply_snapshot(app: &mut App, snapshot: WorkspaceContextSnapshot) {
+    if snapshot.workspace != app.workspace {
+        return;
+    }
+    if app.workspace_context != snapshot.context
+        || app.workspace_is_linked_worktree != snapshot.is_linked_worktree
+    {
+        app.needs_redraw = true;
+    }
+    app.workspace_context = snapshot.context;
+    app.workspace_is_linked_worktree = snapshot.is_linked_worktree;
+}
+
 /// Pull a fresh workspace context from disk if the cached value is
 /// older than [`REFRESH_SECS`] and `allow_refresh` is true. Always
 /// drains any pending async result into `app.workspace_context` first
 /// so the render pass sees the latest value (#399 S1).
 pub(super) fn refresh_if_needed(app: &mut App, now: Instant, allow_refresh: bool) {
-    // Drain the async cell result into the live field first, so the render
-    // path always reads the latest value (#399 S1).
-    if let Ok(mut cell) = app.workspace_context_cell.lock()
-        && let Some(ctx) = cell.take()
-    {
-        if app.workspace_context.as_deref() != Some(ctx.as_str()) {
-            app.needs_redraw = true;
-        }
-        app.workspace_context = Some(ctx);
+    // Completion is distinct from a missing result: losing a repository must
+    // clear a stale branch, and an old workspace's refresh must not replace it.
+    let completed = app
+        .workspace_context_cell
+        .lock()
+        .ok()
+        .and_then(|mut cell| cell.take());
+    if let Some(snapshot) = completed {
+        apply_snapshot(app, snapshot);
     }
 
     if app
@@ -60,15 +106,16 @@ pub(super) fn refresh_if_needed(app: &mut App, now: Instant, allow_refresh: bool
         let ctx = app.workspace_context_cell.clone();
         let workspace = app.workspace.clone();
         handle.spawn_blocking(move || {
-            let result = collect(&workspace);
+            let result = collect_snapshot(&workspace);
             if let Ok(mut guard) = ctx.lock() {
-                *guard = result;
+                *guard = Some(result);
             }
         });
     } else {
         // No runtime — run synchronously so tests and one-shot callers
         // still get a result immediately.
-        app.workspace_context = collect(&app.workspace);
+        let snapshot = collect_snapshot(&app.workspace);
+        apply_snapshot(app, snapshot);
     }
     app.workspace_context_refreshed_at = Some(now);
 }
@@ -204,6 +251,49 @@ pub(crate) fn identity_from_context(workspace: &Path, context: Option<&str>) -> 
     }
 }
 
+/// Hard display-column cap for the opt-in `workspace` / `git_branch`
+/// metrics-line chips (#6112): the only status items whose value is
+/// arbitrary-length text, so they are the ones that could reflow the row.
+/// The full path stays in `/status` and the empty-state caption.
+pub(crate) const STATUS_CHIP_MAX_WIDTH: usize = 24;
+
+/// Left-truncate `text` to `max_width` display columns, keeping the tail —
+/// the discriminating part of a directory name or branch — and marking the
+/// cut with a leading `…`. Unicode-safe: widths come from `unicode_width`
+/// and the cut never splits a `char`.
+pub(crate) fn truncate_left(text: &str, max_width: usize) -> String {
+    use unicode_segmentation::UnicodeSegmentation;
+    use unicode_width::UnicodeWidthStr;
+    if max_width == 0 {
+        return String::new();
+    }
+    let text: String = text.chars().filter(|ch| !ch.is_control()).collect();
+    if text.width() <= max_width {
+        return text;
+    }
+    let mut width = 1; // ellipsis
+    let mut start = text.len();
+    for (index, grapheme) in text.grapheme_indices(true).rev() {
+        let next = width + grapheme.width();
+        if next > max_width {
+            break;
+        }
+        width = next;
+        start = index;
+    }
+    format!("…{}", &text[start..])
+}
+
+/// Linked worktrees often repeat a repository leaf name. Include their parent
+/// directory as a disambiguator, without reading the filesystem during draw.
+pub(crate) fn status_workspace_name(workspace: &Path, is_linked_worktree: bool) -> String {
+    let leaf = workspace_basename(workspace);
+    if is_linked_worktree && let Some(parent) = workspace.parent().and_then(Path::file_name) {
+        return format!("{}/{leaf}", parent.to_string_lossy());
+    }
+    leaf
+}
+
 pub(super) fn branch(workspace: &Path) -> Option<String> {
     let branch = run_git(workspace, &["rev-parse", "--abbrev-ref", "HEAD"]).ok()?;
     let branch = branch.trim().to_string();
@@ -315,5 +405,106 @@ mod tests {
     fn workspace_basename_handles_root_path() {
         assert_eq!(workspace_basename(Path::new("/")), "(root)");
         assert_eq!(workspace_basename(Path::new("/a/b/project")), "project");
+    }
+
+    #[test]
+    fn truncate_left_keeps_the_tail_within_budget() {
+        // Short values pass through untouched.
+        assert_eq!(truncate_left("codewhale", 24), "codewhale");
+        // Exactly at the cap is not a truncation.
+        assert_eq!(truncate_left("abcdefghij", 10), "abcdefghij");
+        // Long values keep the tail behind a one-column ellipsis.
+        let cut = truncate_left("very-long-workspace-name", 10);
+        assert_eq!(cut, "\u{2026}pace-name");
+        assert_eq!(
+            unicode_width::UnicodeWidthStr::width(cut.as_str()),
+            10,
+            "{cut}"
+        );
+        // Wide chars count by display columns and are never split.
+        let cut = truncate_left("workspace-作業ディレクトリ", 10);
+        assert!(cut.starts_with('\u{2026}'), "{cut}");
+        assert!(
+            unicode_width::UnicodeWidthStr::width(cut.as_str()) <= 10,
+            "{cut}"
+        );
+    }
+    #[test]
+    fn workspace_chip_respects_zero_width_graphemes_and_terminal_controls() {
+        use unicode_width::UnicodeWidthStr;
+        for text in ["e\u{301}-family-👨‍👩‍👧‍👦", "作業-directory", "\x1b[31mname\n"]
+        {
+            for budget in 0..25 {
+                let result = truncate_left(text, budget);
+                assert!(result.width() <= budget, "{result:?} exceeds {budget}");
+                assert!(!result.chars().any(char::is_control));
+            }
+        }
+        assert_eq!(truncate_left("prefix-👨‍👩‍👧‍👦", 3), "…👨‍👩‍👧‍👦");
+        assert_eq!(
+            status_workspace_name(Path::new("/trees/feature/codewhale"), true),
+            "feature/codewhale"
+        );
+        assert_eq!(
+            status_workspace_name(Path::new("/trees/feature/codewhale"), false),
+            "codewhale"
+        );
+    }
+
+    #[test]
+    fn workspace_snapshot_detects_linked_worktrees_and_detached_heads() {
+        let root = tempfile::tempdir().unwrap();
+        let main = root.path().join("main");
+        let linked = root.path().join("feature");
+        std::fs::create_dir(&main).unwrap();
+        run_git(&main, &["init", "--initial-branch=main"]).unwrap();
+        run_git(
+            &main,
+            &[
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "fixture",
+            ],
+        )
+        .unwrap();
+        run_git(
+            &main,
+            &["worktree", "add", "-b", "feature", linked.to_str().unwrap()],
+        )
+        .unwrap();
+        let ordinary = collect_snapshot(&main);
+        assert!(!ordinary.is_linked_worktree);
+        let linked_snapshot = collect_snapshot(&linked);
+        assert!(linked_snapshot.is_linked_worktree);
+        assert_eq!(
+            linked_snapshot
+                .context
+                .as_deref()
+                .and_then(branch_from_context),
+            Some("feature")
+        );
+        run_git(&linked, &["checkout", "--detach"]).unwrap();
+        let detached = collect_snapshot(&linked);
+        assert!(detached.is_linked_worktree);
+        assert!(
+            detached
+                .context
+                .as_deref()
+                .and_then(branch_from_context)
+                .unwrap()
+                .starts_with("detached:")
+        );
+        let outside = root.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        let missing = collect_snapshot(&outside);
+        assert!(missing.context.is_none());
+        assert!(!missing.is_linked_worktree);
     }
 }

@@ -1074,6 +1074,7 @@ impl App {
             turn_counter: 0,
             dispatch_started_at: None,
             workspace_context: None,
+            workspace_is_linked_worktree: false,
             workspace_context_cell: std::sync::Arc::new(std::sync::Mutex::new(None)),
             workspace_context_refreshed_at: None,
             memory_size_hint: None,

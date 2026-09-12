@@ -236,16 +236,24 @@ visible, or set `[tui].status_items` in `config.toml`. Each key owns exactly
 one thing on screen: `mode` is the posture bar's plan/act/operate chip, and
 `model`, `context_percent`, `cost`, `balance` (prepaid providers only:
 DeepSeek, DeepSeekCN, OpenRouter, SiliconFlow), `cache`, `tokens` and
-`session_metrics` are segments of the metrics line below it. Omit
+`session_metrics`, `workspace` and `git_branch` are segments of the metrics line below it. Omit
 `status_items` to keep the built-in default; set it to `[]` to strip the
 metrics line down to the help hint.
+
+`workspace` and `git_branch` are opt-in. The workspace chip shows the folder
+name; linked worktrees include its parent to distinguish repeated names. The
+branch chip shows the current branch or a short detached HEAD SHA, with `(wt)`
+for linked worktrees. Both keep the last 24 display columns when long. Git
+metadata refreshes in the background on the existing 15-second cadence and
+when a refresh is requested; unavailable Git data removes the branch chip.
+These identify the active session workspace. The full path remains in `/status`.
 
 `context_percent` is on by default and shows `ctx NN%` at every fullness —
 0.9.12 went silent below 50% and left most of a session with no context
 signal at all. The reading keeps its warning colour from 80% up.
 
 The keys `status`, `agents`, `reasoning_replay`, `prefix_stability`,
-`git_branch`, `last_tool_elapsed` and `rate_limit` were retired in 0.9.13:
+`last_tool_elapsed` and `rate_limit` were retired in 0.9.13:
 they drove nothing. Old configuration files still load — the retired keys are
 ignored with a warning in the log.
 

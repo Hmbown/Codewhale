@@ -5517,6 +5517,7 @@ fn live_subagent_result(
     nickname: Option<String>,
 ) -> SubAgentResult {
     SubAgentResult {
+        usage: None,
         name: agent_id.to_string(),
         agent_id: agent_id.to_string(),
         context_mode: "fresh".to_string(),
@@ -6989,6 +6990,7 @@ mod tests {
 
     fn manager_agent(id: &str, status: SubAgentStatus) -> SubAgentResult {
         SubAgentResult {
+            usage: None,
             name: id.to_string(),
             agent_id: id.to_string(),
             context_mode: "fresh".to_string(),

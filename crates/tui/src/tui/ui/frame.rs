@@ -66,6 +66,49 @@ pub(crate) fn info_segments(app: &App, width: u16) -> Vec<InfoSegment> {
     let tier = crate::tui::underwater::ShellTier::for_chrome_width(width);
     let shows = |item: StatusItem| app.status_items.contains(&item);
 
+    // Where this session writes (#6112): the workspace leaf and the branch
+    // the next commit lands on. Both read cached state only — the branch
+    // comes from `app.workspace_context`, refreshed off the render path on
+    // the workspace-context TTL, so neither chip costs IO per frame. They
+    // lead the row: identity of place before identity of route. The branch
+    // chip degrades to absent outside a repository rather than printing a
+    // permanent dash.
+    if shows(StatusItem::Workspace) {
+        let name = crate::tui::workspace_context::status_workspace_name(
+            &app.workspace,
+            app.workspace_is_linked_worktree,
+        );
+        segments.push(InfoSegment::new(
+            InfoSegmentId::Workspace,
+            "",
+            crate::tui::workspace_context::truncate_left(
+                &name,
+                crate::tui::workspace_context::STATUS_CHIP_MAX_WIDTH,
+            ),
+            ChromeInk::MetadataValue,
+        ));
+    }
+    if shows(StatusItem::GitBranch)
+        && let Some(branch) = app
+            .workspace_context
+            .as_deref()
+            .and_then(crate::tui::workspace_context::branch_from_context)
+    {
+        segments.push(InfoSegment::new(
+            InfoSegmentId::GitBranch,
+            "",
+            crate::tui::workspace_context::truncate_left(
+                &if app.workspace_is_linked_worktree {
+                    format!("{branch} (wt)")
+                } else {
+                    branch.to_string()
+                },
+                crate::tui::workspace_context::STATUS_CHIP_MAX_WIDTH,
+            ),
+            ChromeInk::MetadataValue,
+        ));
+    }
+
     // Route identity — the old identity band's fact, same shed discipline:
     // provider first, then effort, whole names or none. When no model is
     // configured the segment says so and waits.
@@ -353,7 +396,12 @@ fn render_info_row(
     }
     let mut segments = info_segments(app, area.width);
     if identity_only {
-        segments.retain(|segment| segment.id == InfoSegmentId::Model);
+        segments.retain(|segment| {
+            matches!(
+                segment.id,
+                InfoSegmentId::Model | InfoSegmentId::Workspace | InfoSegmentId::GitBranch
+            )
+        });
     }
     let hovered = app.last_mouse_pos.and_then(|(mx, my)| {
         app.viewport
@@ -2591,6 +2639,7 @@ mod tests {
             granted_balance: String::new(),
         });
         app.status_items = StatusItem::all().to_vec();
+        app.workspace_context = Some("main | clean".to_string());
 
         let ids: Vec<InfoSegmentId> = super::info_segments(&app, 200)
             .iter()
@@ -2603,6 +2652,8 @@ mod tests {
             InfoSegmentId::Ttft,
             InfoSegmentId::Rate,
             InfoSegmentId::OutputTokens,
+            InfoSegmentId::Workspace,
+            InfoSegmentId::GitBranch,
         ] {
             assert!(ids.contains(&expected), "{expected:?} missing from {ids:?}");
         }
@@ -2612,6 +2663,78 @@ mod tests {
             super::info_segments(&app, 200).is_empty(),
             "an empty status list leaves the metrics line empty"
         );
+    }
+
+    #[test]
+    fn empty_session_keeps_opted_in_workspace_identity_visible() {
+        let mut app = app_with_context_percent(0);
+        app.workspace = std::path::PathBuf::from("/fixture/checkout");
+        app.workspace_context = Some("feature-6112 | clean".to_string());
+        app.status_items = vec![StatusItem::Workspace, StatusItem::GitBranch];
+        app.metrics_line = crate::config::ChromeRowPreset::Compact;
+        let backend = ratatui::backend::TestBackend::new(100, 1);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                super::render_info_row(frame, &mut app, area, true);
+            })
+            .unwrap();
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(rendered.contains("checkout"), "{rendered}");
+        assert!(rendered.contains("feature-6112"), "{rendered}");
+    }
+
+    /// #6112: the opt-in workspace and branch chips read cached state only —
+    /// the workspace path and the TTL-refreshed `workspace_context` string —
+    /// so neither costs IO per frame. Outside a repository the branch chip
+    /// degrades to absent rather than pinning a placeholder dash.
+    #[test]
+    fn workspace_and_git_branch_chips_follow_cached_workspace_context() {
+        let mut app = app_with_context_percent(60);
+        app.status_items = vec![StatusItem::Workspace, StatusItem::GitBranch];
+
+        let segments = super::info_segments(&app, 200);
+        let workspace = segments
+            .iter()
+            .find(|segment| segment.id == InfoSegmentId::Workspace)
+            .expect("workspace chip renders from the workspace path alone");
+        assert_eq!(
+            workspace.value,
+            crate::tui::workspace_context::workspace_basename(&app.workspace)
+        );
+        assert!(
+            segments
+                .iter()
+                .all(|segment| segment.id != InfoSegmentId::GitBranch),
+            "outside a repository the branch chip is absent"
+        );
+
+        // A detached HEAD reads in its recorded short-SHA form.
+        app.workspace_context = Some("detached:abc1234 | clean".to_string());
+        let branch = super::info_segments(&app, 200)
+            .into_iter()
+            .find(|segment| segment.id == InfoSegmentId::GitBranch)
+            .expect("branch chip renders from cached context");
+        assert_eq!(branch.value, "detached:abc1234");
+        app.workspace_is_linked_worktree = true;
+        let linked = super::info_segments(&app, 200)
+            .into_iter()
+            .find(|segment| segment.id == InfoSegmentId::GitBranch)
+            .unwrap();
+        assert_eq!(linked.value, "detached:abc1234 (wt)");
+        assert!(!StatusItem::default_footer().contains(&StatusItem::Workspace));
+        assert!(!StatusItem::default_footer().contains(&StatusItem::GitBranch));
+
+        // Off means off.
+        app.status_items = Vec::new();
+        assert!(super::info_segments(&app, 200).is_empty());
     }
 }
 

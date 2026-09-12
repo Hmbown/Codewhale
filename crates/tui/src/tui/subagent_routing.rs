@@ -1151,6 +1151,7 @@ mod tests {
 
     fn subagent_result(id: &str, status: SubAgentStatus) -> SubAgentResult {
         SubAgentResult {
+            usage: None,
             name: id.to_string(),
             agent_id: id.to_string(),
             context_mode: "fresh".to_string(),

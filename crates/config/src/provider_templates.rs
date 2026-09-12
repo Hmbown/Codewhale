@@ -20,7 +20,7 @@
 //! A `/models` 2xx from Test Connection is reachability only. It is not
 //! model readiness.
 
-use crate::OPENCODE_GO_CHAT_MODELS;
+use crate::opencode_go_models;
 use crate::provider::{credential_help, provider_for_kind};
 use crate::provider_kind::ProviderKind;
 
@@ -115,9 +115,7 @@ impl ProviderSetupTemplate {
             ProviderSetupApply::FirstClass(ProviderKind::OpencodeZen) => {
                 crate::route::opencode_zen_picker_models()
             }
-            ProviderSetupApply::FirstClass(ProviderKind::OpencodeGo) => {
-                OPENCODE_GO_CHAT_MODELS.to_vec()
-            }
+            ProviderSetupApply::FirstClass(ProviderKind::OpencodeGo) => opencode_go_models(),
             ProviderSetupApply::FirstClass(_) | ProviderSetupApply::Compatible => self
                 .default_model()
                 .map(|model| vec![model])
@@ -453,7 +451,7 @@ mod tests {
             ProviderSetupApply::FirstClass(ProviderKind::OpencodeGo)
         );
         assert_eq!(go.base_url(), Some(DEFAULT_OPENCODE_GO_BASE_URL));
-        assert_eq!(go.picker_models(), OPENCODE_GO_CHAT_MODELS);
+        assert_eq!(go.picker_models(), opencode_go_models());
         assert_eq!(go.docs_url(), Some("https://opencode.ai/docs/go/"));
     }
 

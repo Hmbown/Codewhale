@@ -166,9 +166,8 @@ pub(crate) const DEFAULT_SAKANA_BASE_URL: &str = "https://api.sakana.ai/v1";
 // Meituan LongCat defaults
 pub(crate) const DEFAULT_LONGCAT_MODEL: &str = "LongCat-2.0";
 pub(crate) const DEFAULT_LONGCAT_BASE_URL: &str = "https://api.longcat.chat/openai/v1";
-// OpenCode Go Chat Completions defaults. The Go catalog also contains models
-// served only through Anthropic Messages; those are deliberately not listed by
-// this provider until Codewhale can route wire formats per model.
+// OpenCode Go keeps its Chat default and resolves other model protocols from
+// the shared opencode_go roster.
 pub(crate) const DEFAULT_OPENCODE_GO_MODEL: &str = "deepseek-v4-pro";
 pub(crate) const DEFAULT_OPENCODE_GO_BASE_URL: &str = "https://opencode.ai/zen/go/v1";
 pub(crate) const OPENCODE_GO_GROK_4_5_MODEL: &str = "grok-4.5";

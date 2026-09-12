@@ -51,6 +51,7 @@ fn subagent(
     status: crate::tools::subagent::SubAgentStatus,
 ) -> crate::tools::subagent::SubAgentResult {
     crate::tools::subagent::SubAgentResult {
+        usage: None,
         name: id.to_string(),
         agent_id: id.to_string(),
         context_mode: "fresh".to_string(),

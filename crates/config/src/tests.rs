@@ -5115,7 +5115,7 @@ model = "mistral-large-latest"
 }
 
 #[test]
-fn opencode_go_resolves_current_chat_completions_route() {
+fn opencode_go_resolves_model_aware_route() {
     let _lock = env_lock();
     let _env = EnvGuard::without_deepseek_runtime_overrides();
 
@@ -5134,10 +5134,7 @@ fn opencode_go_resolves_current_chat_completions_route() {
     assert_eq!(metadata.default_base_url(), DEFAULT_OPENCODE_GO_BASE_URL);
     assert_eq!(metadata.default_model(), DEFAULT_OPENCODE_GO_MODEL);
     assert_eq!(metadata.env_vars(), &["OPENCODE_GO_API_KEY"]);
-    assert_eq!(
-        metadata.wire_policy().fixed(),
-        Some(provider::WireFormat::ChatCompletions)
-    );
+    assert_eq!(metadata.wire_policy(), provider::WirePolicy::ModelAware);
 
     let config: ConfigToml = toml::from_str(
         r#"
@@ -5160,7 +5157,7 @@ model = "opencode-go/glm-5.2"
     );
 
     // Provider-specific environment overrides remain available, but model ids
-    // stay inside the Chat Completions allowlist.
+    // stay inside the documented protocol roster.
     unsafe {
         std::env::set_var("OPENCODE_GO_API_KEY", "go-env-key");
         std::env::set_var("OPENCODE_GO_MODEL", "opencode-go/mimo-v2.5-pro");
@@ -5174,23 +5171,20 @@ model = "opencode-go/glm-5.2"
     assert_eq!(resolved.model, OPENCODE_GO_MIMO_V2_5_PRO_MODEL);
 
     for model in [OPENCODE_GO_GROK_4_5_MODEL, OPENCODE_GO_KIMI_K3_MODEL] {
-        assert_eq!(opencode_go_chat_model_id(model), Some(model));
+        assert_eq!(opencode_go_model_id(model), Some(model));
         assert_eq!(
-            opencode_go_chat_model_id(&format!("opencode-go/{model}")),
+            opencode_go_model_id(&format!("opencode-go/{model}")),
             Some(model)
         );
     }
 
-    // The Go roster also includes Messages-only models. Even a custom base URL
-    // cannot make one safe for this Chat Completions provider. Resolution must
-    // keep the configured id (so diagnostics name it) rather than silently
-    // substituting the Chat Completions default; the route layer rejects it.
+    // A custom endpoint preserves the configured Messages model; no fallback.
     unsafe {
         std::env::set_var("OPENCODE_GO_BASE_URL", "https://go-gateway.example/v1");
         std::env::set_var("OPENCODE_GO_MODEL", "minimax-m3");
     }
-    assert!(opencode_go_chat_model_id("minimax-m3").is_none());
-    assert!(opencode_go_chat_model_id("qwen3.7-max").is_none());
+    assert_eq!(opencode_go_model_id("minimax-m3"), Some("minimax-m3"));
+    assert_eq!(opencode_go_model_id("qwen3.7-max"), Some("qwen3.7-max"));
     let resolved = config.resolve_runtime_options(&CliRuntimeOverrides::default());
     assert_eq!(resolved.base_url, "https://go-gateway.example/v1");
     assert_eq!(resolved.model, "minimax-m3");
@@ -5679,12 +5673,15 @@ fn provider_metadata_defaults_match_runtime_helpers() {
             assert!(!provider.env_vars().is_empty());
         }
         // OpenAI Codex (ChatGPT) speaks the Responses API; DeepSeek,
-        // OpenCode Zen, and the Codewhale API select a protocol per exact
+        // OpenCode Zen, OpenCode Go, and the Codewhale API select a protocol per exact
         // model offering; Anthropic
         // and the Anthropic-compatible routes speak native Messages; every
         // other built-in provider is OpenAI-compatible Chat Completions.
         let expected_wire = match kind {
-            ProviderKind::Deepseek | ProviderKind::OpencodeZen | ProviderKind::Codewhale => None,
+            ProviderKind::Deepseek
+            | ProviderKind::OpencodeZen
+            | ProviderKind::OpencodeGo
+            | ProviderKind::Codewhale => None,
             ProviderKind::OpenaiCodex | ProviderKind::Concentrate => {
                 Some(provider::WireFormat::Responses)
             }
