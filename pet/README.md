@@ -45,6 +45,10 @@ cd pet
 three ports. The script fails for a missing tool or failed build; it does not
 silently call an omitted platform verified. See [QA.md](QA.md) for native builds.
 
+The [Android application](android/README.md) builds with its Gradle wrapper and
+JDK 17. Compose, native audio, checkpoint import/export and lifecycle behavior
+are exercised on an Android 15 emulator; CI uploads the debug APK and test reports.
+
 In the full terminal, `/workbar watch sound on` enables the shared score and
 `/workbar watch sound off` mutes it. Sound starts off each time the application
 opens. Install FFmpeg with `ffplay` on PATH to use this optional output; Watch
@@ -67,7 +71,7 @@ It journals accepted telemetry, interactions, behaviors and persistent pod slots
 `pet-audio.ts` schedules voices from that same clock. Noise uses absolute sample
 positions, so buffer partitioning cannot change the score. Audio mixing is a
 host concern. `pet-native.ts` exposes this exact core to QuickJS/JavaScriptCore.
-The TUI and Apple hosts do not carry their own event bucketers or score schedulers.
+The TUI, Apple and Android hosts do not carry their own event bucketers or score schedulers.
 
 The Rust particle implementation lives in the product's
 `crates/tui/src/tui/ambient_life/pet_sim.rs`; this package's runner imports it.
@@ -124,6 +128,7 @@ The browser commits checkpoint and recording together with an optimistic
 IndexedDB revision. A saved live source reopens as Replay until explicitly
 reattached. TUI Watch saves under the owning session's `artifacts/pet/habitat.json`;
 Apple hosts keep source-specific files in Application Support/CodewhalePet.
+Android keeps separate wild/demo/recording habitats in private app storage.
 Native writes are private and atomic, use a writer lock and content revision,
 and preserve corrupt files or external edits. Recovery is visible in the UI.
 
@@ -135,6 +140,6 @@ seconds, so a crash may lose work since the last successful save.
 Native habitats are limited to 8 MiB; the QuickJS worker has a 64 MiB memory
 limit. Two-hour restoration has been exercised, but serializing full long tapes
 still costs seconds in QuickJS. History rotation and long-session performance
-remain open. Android Compose/app/audio, macOS popover inspection,
+remain open. Physical Android device acceptance, macOS popover inspection,
 authenticated Runtime attachment, content-driven forms and final listening/power quality
 are unfinished. This branch is a reviewable prototype, not a release candidate.

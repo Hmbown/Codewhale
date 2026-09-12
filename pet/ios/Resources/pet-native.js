@@ -47,13 +47,14 @@ class PetNative {
             throw new Error('Invalid native habitat.');
         if (r.expressionVersion !== undefined && ![1, 2].includes(r.expressionVersion))
             throw new Error('Unsupported pet expression version.');
-        if ((r.expressionVersion ?? 1) !== (r.checkpoint?.sim?.expressionVersion ?? 1))
+        if (r.checkpoint !== undefined && (r.expressionVersion ?? 1) !== (r.checkpoint?.sim?.expressionVersion ?? 1))
             throw new Error('Pet expression version does not match its checkpoint.');
-        this.restoreHistory(r.tape, r.interactions, r.checkpoint);
+        this.restoreHistory(r.tape, r.interactions, r.checkpoint, r.expressionVersion ?? 1);
     }
-    restoreHistory(tape, interactions, checkpoint) {
+    restoreHistory(tape, interactions, checkpoint, expressionVersion = 2) {
         const points = this.world.sim.p.map(p => [p.hx, p.hy]);
-        this.world = pet_world_js_1.PetWorld.restore(points, tape, interactions, checkpoint);
+        this.world = checkpoint === undefined ? new pet_world_js_1.PetWorld(points, tape, interactions, expressionVersion)
+            : pet_world_js_1.PetWorld.restore(points, tape, interactions, checkpoint);
         this.engineTick = Math.round(this.world.frame.timeMs * 30 / 1000);
         // A restored creature does not prove an Engine operation is still active.
         this.engine = new pet_engine_js_1.PetEngineTelemetry();
@@ -880,8 +881,16 @@ function digest(sim) {
             grid[cy * W + cx] = Math.min(255, grid[cy * W + cx] + 1);
     }
     // FNV-1a 64 over the grid plus the frame encoding (rgb, hollow, alpha byte)
-    let h = 0xcbf29ce484222325n;
-    const mix = (b) => { h ^= BigInt(b & 0xff); h = BigInt.asUintN(64, h * 0x100000001b3n); };
+    // Two unsigned halves also work in embedded engines without BigInt.
+    // FNV's prime is (256 << 32) + 435; these products stay below 2^42,
+    // so every intermediate integer is exactly representable by a JS number.
+    let hi = 0xcbf29ce4, lo = 0x84222325;
+    const mix = (b) => {
+        lo = (lo ^ (b & 0xff)) >>> 0;
+        const product = lo * 435;
+        hi = (hi * 435 + lo * 256 + Math.floor(product / 4294967296)) >>> 0;
+        lo = product >>> 0;
+    };
     for (const v of grid)
         mix(v);
     mix(Math.round(sim.frame.r));
@@ -889,10 +898,7 @@ function digest(sim) {
     mix(Math.round(sim.frame.b));
     mix(Math.round(sim.frame.alpha * 255));
     mix(sim.frame.hollow ? 1 : 0);
-    // Format unsigned halves explicitly. The embedded QuickJS build can expose
-    // asUintN(64)'s high-bit result as signed when formatting the whole BigInt.
-    return Number((h >> 32n) & 0xffffffffn).toString(16).padStart(8, '0')
-        + Number(h & 0xffffffffn).toString(16).padStart(8, '0');
+    return hi.toString(16).padStart(8, '0') + lo.toString(16).padStart(8, '0');
 }
 /** Shared tape runner. `rows` are parsed tape.tsv lines. */
 function runTape(sim, rows, opts) {

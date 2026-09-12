@@ -17,7 +17,7 @@ npm test
 npm run check:web
 ```
 
-The pet suite currently contains 37 tests: event occupancy/unknown coverage,
+The pet suite currently contains 38 tests: event occupancy/unknown coverage,
 late failures, human request pairing, read-only local SSE reconnect/cursor
 recovery, deterministic world/score/PCM, checkpoint integrity and continuation, expression-version validation and legacy replay.
 The standalone verifier compares 380 checkpoints across baseline and edge tapes,
@@ -63,7 +63,17 @@ source, without first building macOS. Open `pet/ios/CodewhalePet.xcodeproj` to r
 workflows, including a generated two-hour synthetic unknown recording. It writes
 only disposable fixtures under ignored conformance results and temporary storage.
 Kotlin 2.3.0 can instead be on PATH; its verifier builds only the particle core
-and conformance runner. The Compose view and Android application remain unverified.
+and conformance runner. The actual Compose application is a separate Gradle build:
+
+```sh
+cd pet/android
+./gradlew --no-daemon assembleDebug lintDebug
+./gradlew --no-daemon connectedDebugAndroidTest
+```
+
+Use JDK 17 and Android SDK 35; connect a device/emulator for the second command.
+The five instrumentation tests run the real QuickJS binding, Kotlin renderer,
+PCM cursor, storage/recovery and Compose lifecycle. See [Android](android/README.md).
 
 ## Review direction
 
@@ -76,7 +86,7 @@ open junctions; the same particle identities return to the whale at rest.
 
 ## Local evidence before publication (2026-09-12)
 
-- Packaged pet: 37 tests passed; existing Whalesong consumers: 306 passed after
+- Packaged pet: 38 tests passed; existing Whalesong consumers: 306 passed after
   canonical source relocation. These are overlapping suites, not additive coverage.
 - Product Node gate: 66 package, 12 SDK and 446 web tests passed; production web
   check subsequently passed with the GitHub release fetch available.
@@ -90,9 +100,10 @@ open junctions; the same particle identities return to the whale at rest.
   and the applicable safety/security checks. Each later commit needs its own verdict.
 - Apple: eight checkpoint workflows passed; iOS Simulator exercised two-hour
   restoration and visible corruption recovery without overwriting the damaged file.
-- The updated Apple checkpoint workflows and iOS Simulator build pass. Earlier
-  browser workflows and synthetic audio receipts do not establish Android app
-  or listening quality.
+- Android: debug APK and lint build pass; five instrumentation tests pass on
+  Android 15 ARM64, including 4,800 frames, checkpoint continuation, exact PCM,
+  lifecycle and storage recovery. The emulator audio sink runs without host
+  speaker output; this does not establish physical listening or power quality.
 
 Hosted CI and Grokbot findings are separate evidence. Their actual results belong
 on the pull request. Open implementation gaps are listed in [README.md](README.md).

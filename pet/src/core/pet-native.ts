@@ -33,12 +33,13 @@ export class PetNative {
     const r = JSON.parse(text);
     if (!r || r.petReplayVersion !== 1 || !Array.isArray(r.tape) || !Array.isArray(r.interactions)) throw new Error('Invalid native habitat.');
     if (r.expressionVersion !== undefined && ![1, 2].includes(r.expressionVersion)) throw new Error('Unsupported pet expression version.');
-    if ((r.expressionVersion ?? 1) !== (r.checkpoint?.sim?.expressionVersion ?? 1)) throw new Error('Pet expression version does not match its checkpoint.');
-    this.restoreHistory(r.tape, r.interactions, r.checkpoint);
+    if (r.checkpoint !== undefined && (r.expressionVersion ?? 1) !== (r.checkpoint?.sim?.expressionVersion ?? 1)) throw new Error('Pet expression version does not match its checkpoint.');
+    this.restoreHistory(r.tape, r.interactions, r.checkpoint, r.expressionVersion ?? 1);
   }
-  private restoreHistory(tape: PetWorld['tape'], interactions: PetWorld['interactions'], checkpoint: unknown): void {
+  private restoreHistory(tape: PetWorld['tape'], interactions: PetWorld['interactions'], checkpoint: unknown, expressionVersion: 1 | 2 = 2): void {
     const points = this.world.sim.p.map(p => [p.hx, p.hy] as [number, number]);
-    this.world = PetWorld.restore(points, tape, interactions, checkpoint);
+    this.world = checkpoint === undefined ? new PetWorld(points, tape, interactions, expressionVersion)
+      : PetWorld.restore(points, tape, interactions, checkpoint);
     this.engineTick = Math.round(this.world.frame.timeMs * 30 / 1000);
     // A restored creature does not prove an Engine operation is still active.
     this.engine = new PetEngineTelemetry();

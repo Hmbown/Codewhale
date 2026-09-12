@@ -1,70 +1,57 @@
-// CodewhalePet.kt — the Jetpack Compose renderer for the pet.
-//
-// The composable owns no simulation: the caller steps `sim` (e.g. from a
-// `withFrameNanos` loop in a LaunchedEffect) and passes the `PetState` that
-// produced the frame — the same contract as the ratatui widget and the
-// SwiftUI view. One Canvas pass:
-//
-//   * filled circle per particle, colour and alpha from sim.frame
-//   * hollow frames stroke the circles instead of filling them
-//   * the caption row carries the non-colour cue ("tool · strike · unobserved")
-//
-// Reduced motion: honour the system's animator-duration-scale / accessibility
-// setting by stepping the sim with motion = false — same contract as every
-// other port. TalkBack gets petContentDescription(), not "a whale animation".
-//
-// NOT COMPILE-VERIFIED: the Kotlin core passes offline conformance, but the
-// required Compose dependencies are not available in the inspected local cache.
-
 package codewhale.pet
 
 import androidx.compose.foundation.Canvas
-import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
+import kotlin.math.sin
 
+/** Only places the worker's immutable dots. No clock, world or score here. */
 @Composable
-fun CodewhalePet(sim: PetSim, state: PetState, modifier: Modifier = Modifier) {
-    val f = sim.frame
-    val color = Color(f.r.toInt() and 0xff, f.g.toInt() and 0xff, f.b.toInt() and 0xff)
-    Column(modifier = modifier.semantics { contentDescription = petContentDescription(sim, state) }) {
-        Canvas(modifier = Modifier.weight(1f).fillMaxSize()) {
-            val lay = petLayout(size.width.toDouble(), size.height.toDouble(), state)
-            val d = lay.dot.toFloat()
-            for (q in sim.p) {
-                val px = (lay.ox + q.x * lay.scale * lay.flipX).toFloat()
-                val py = (lay.oy + q.y * lay.scale).toFloat()
-                if (f.hollow) {
-                    drawCircle(color, radius = d / 2, center = Offset(px, py),
-                        alpha = f.alpha.toFloat(), style = Stroke(width = 1f))
-                } else {
-                    drawCircle(color, radius = d / 2, center = Offset(px, py),
-                        alpha = f.alpha.toFloat())
-                }
+fun CodewhalePet(scene: PetScene, modifier: Modifier = Modifier) {
+    Canvas(modifier = modifier.fillMaxSize().semantics { contentDescription = petContentDescription(scene) }) {
+        val w = size.width; val h = size.height
+        drawRect(Brush.verticalGradient(listOf(Color(0xff0b2029), Color(0xff071319))))
+        val surfaceY = h * (1 + scene.surface) / 2
+        val surface = Path().apply {
+            moveTo(0f, surfaceY)
+            for (i in 1..80) {
+                val x = i * w / 80
+                lineTo(x, surfaceY + sin(i * 0.10).toFloat() * h * 0.008f)
             }
         }
-        Text(
-            "${f.channel} · ${f.arch}${if (f.hollow) " · unobserved" else ""}",
-            style = MaterialTheme.typography.labelSmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-        )
+        drawPath(surface, Color(0xff709f9b), alpha = 0.22f, style = Stroke(1f))
+        drawRect(Brush.verticalGradient(listOf(Color(0xff73c9b5).copy(alpha = scene.caustic * 0.025f), Color.Transparent)),
+            topLeft = Offset(0f, surfaceY))
+        drawLine(Color(0xff264048), Offset(0f, h * 0.93f), Offset(w, h * 0.93f), 1f)
+        scene.food?.let { food ->
+            drawCircle(Color(0xffc2b787), 3f, Offset(w * (0.5f + food.x * 0.3f), h * (0.5f + food.y * 0.3f)),
+                alpha = food.life.coerceIn(0f, 1f))
+        }
+        val f = scene.style
+        val color = Color(f.r.toInt().coerceIn(0, 255), f.g.toInt().coerceIn(0, 255), f.b.toInt().coerceIn(0, 255))
+        val lay = petLayout(w.toDouble(), h.toDouble(), scene.state)
+        val dot = lay.dot.toFloat()
+        for (i in scene.dots.indices step 2) {
+            val center = Offset((lay.ox + scene.dots[i] * lay.scale * lay.flipX).toFloat(),
+                (lay.oy + scene.dots[i + 1] * lay.scale).toFloat())
+            if (f.hollow) drawCircle(color, dot / 2, center, f.alpha.toFloat(), style = Stroke(1f))
+            else drawCircle(color, dot / 2, center, f.alpha.toFloat())
+        }
     }
 }
 
-fun petContentDescription(sim: PetSim, state: PetState): String {
-    val f = sim.frame
-    return buildList {
-        add("Codewhale pet"); add(f.channel); add(f.arch)
-        if (f.hollow) add("unobserved")
-        if (state.lit < 0.5) add("dozing")
-        if (f.channel == "human" && !f.hollow && state.attention > 0.5) add("awaiting input")
-    }.joinToString(", ")
-}
+fun petContentDescription(scene: PetScene): String = buildList {
+    add("Codewhale"); add(scene.style.channel); add(scene.style.arch)
+    if (scene.style.hollow) add("unobserved")
+    add(scene.behaviour)
+    if (scene.needs != "none") add("input pending")
+    if (scene.peers >= 3) add("${scene.peers} pod members")
+}.joinToString(", ")

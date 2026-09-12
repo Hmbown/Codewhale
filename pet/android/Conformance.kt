@@ -1,24 +1,6 @@
 package codewhale.pet
 
 import java.io.File
-import kotlin.math.floor
-import kotlin.math.min
-import kotlin.math.roundToInt
-
-fun petDigest(sim: PetSim): String {
-    val grid = IntArray(64 * 32)
-    for (p in sim.p) {
-        val x = floor((p.x + 0.66) / 1.32 * 64).toInt()
-        val y = floor((p.y + 0.66) / 1.32 * 32).toInt()
-        if (x in 0..63 && y in 0..31) grid[y * 64 + x] = min(255, grid[y * 64 + x] + 1)
-    }
-    var hash = 0xcbf29ce484222325UL.toLong()
-    fun mix(n: Int) { hash = (hash xor (n and 255).toLong()) * 0x100000001b3L }
-    for (n in grid) mix(n)
-    mix(sim.frame.r.roundToInt()); mix(sim.frame.g.roundToInt()); mix(sim.frame.b.roundToInt())
-    mix((sim.frame.alpha * 255).roundToInt()); mix(if (sim.frame.hollow) 1 else 0)
-    return hash.toULong().toString(16).padStart(16, '0')
-}
 
 fun main(args: Array<String>) {
     require(args.isNotEmpty()) { "Usage: points.tsv [--reduced-motion]; tape on stdin" }

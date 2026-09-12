@@ -122,7 +122,8 @@ private fun fieldTarget(q: Particle, t: Double, act: Double, att: Double, key: S
 
 /** Version 1 is retained for saved recordings. */
 private fun gaitTarget(q: Particle, t: Double, act: Double, coh: Double,
-                       att: Double, key: String, work: Double, expressionVersion: Int = 1): Pair<Double, Double> {
+                       att: Double, key: String, work: Double, expressionVersion: Int = 1,
+                       podSlots: List<Pair<Int, Double>>? = null): Pair<Double, Double> {
     val omega = lerp(4.6, 5.2 + act * 2.8, work)
     val breath = 1 + sin(t * 1.85) * lerp(0.048, 0.018, work)
     val flex = sin(q.ang * 2.05 + t * omega) * lerp(0.042, 0.016 + act * 0.028, work) * (0.18 + 0.82 * q.tail)
@@ -184,14 +185,15 @@ private fun gaitTarget(q: Particle, t: Double, act: Double, coh: Double,
         }
         "pod" -> {
             val n = 6
-            val k = q.pod % n
+            val member = podSlots?.takeIf { it.isNotEmpty() }?.let { it[q.pod % it.size] }
+            val k = member?.first ?: (q.pod % n)
             val hub = key == "orchestration" && k == 0
             val spread = 0.30 + act * 0.11
             val orbit = t * (0.55 + act * 0.28)
             if (hub) { gx = px * 0.70; gy = py * 0.70 }
             else {
                 val slots = if (key == "orchestration") n - 1 else n
-                val a = (if (key == "orchestration") k - 1 else k) * (PI * 2 / slots) + orbit
+                val a = (if (key == "orchestration") k - 1 else k) * (PI * 2 / slots) + orbit + (member?.second ?: 0.0) * 0.04
                 val sc = 0.34
                 gx = q.hx * sc + cos(a) * spread * 1.28
                 gy = q.hy * sc + sin(a) * spread * 0.80
@@ -233,7 +235,14 @@ private fun stillT(key: String) = when (key) {
     "error" -> 0.35; "human" -> 0.05; "other" -> 0.90; else -> 0.4
 }
 
-class PetSim(points: List<Pair<Double, Double>>, seed: Int = 0xC0FFEE.toInt(), val expressionVersion: Int = 2) {
+data class PetParticleCheckpoint(
+    val version: Int, val expressionVersion: Int, val body: List<List<Double>>,
+    val particles: List<List<Double>>, val phase: Double, val clock: Double,
+    val tear: Double, val previous: Int, val current: Int, val color: List<Double>, val frame: Frame,
+)
+
+class PetSim(points: List<Pair<Double, Double>>, seed: Int = 0xC0FFEE.toInt(), expressionVersion: Int = 2) {
+    var expressionVersion = expressionVersion; private set
     val p: List<Particle>
     private var phase = 0.0
     private var clock = 0.0
@@ -261,8 +270,32 @@ class PetSim(points: List<Pair<Double, Double>>, seed: Int = 0xC0FFEE.toInt(), v
         prev = cur
     }
 
+    /** The shared world validates the complete recording first. This projection
+     * also checks body identity and bounds before changing any native particle. */
+    fun restoreValidated(c: PetParticleCheckpoint) {
+        fun finite(v: Double, lo: Double, hi: Double) = v.isFinite() && v in lo..hi
+        require(c.version == 1 && c.expressionVersion in 1..2 && c.body.size == p.size && c.particles.size == p.size)
+        require(c.body.withIndex().all { (i, b) -> b == listOf(p[i].hx, p[i].hy, p[i].s) })
+        require(c.particles.all { row -> row.size == 8 && row.withIndex().all { (i, v) ->
+            finite(v, if (i == 4 || i == 5) 0.0 else -8.0, if (i == 4 || i == 5) 1_000_000.0 else 8.0)
+        } })
+        require(finite(c.phase, 0.0, 100_000.0) && finite(c.clock, 0.0, 86_400.0) && finite(c.tear, 0.0, 1.0))
+        require(c.previous in CHANNELS.indices && c.current in CHANNELS.indices && c.color.size == 3 && c.color.all { finite(it, 0.0, 255.0) })
+        require(listOf(c.frame.r, c.frame.g, c.frame.b).all { finite(it, 0.0, 255.0) } && finite(c.frame.alpha, 0.0, 1.0) && finite(c.frame.work, 0.0, 1.0))
+        require(c.frame.channel == CHANNELS[c.current].key && c.frame.arch == CHANNELS[c.current].arch)
+        expressionVersion = c.expressionVersion
+        phase = c.phase; clock = c.clock; tear = c.tear; prev = c.previous; cur = c.current
+        c.color.forEachIndexed { i, v -> col[i] = v }; frame = c.frame.copy()
+        p.forEachIndexed { i, q ->
+            val v = c.particles[i]
+            q.x = v[0]; q.y = v[1]; q.vx = v[2]; q.vy = v[3]
+            q.jx = v[4]; q.jy = v[5]; q.tx = v[6]; q.ty = v[7]
+        }
+    }
+
     /** Advance the sim by dt seconds under `state`. Identical math to PetSim.ts. */
-    fun step(dt: Double, state: PetState, motion: Boolean = true, sensitivity: Double = 1.0) {
+    fun step(dt: Double, state: PetState, motion: Boolean = true, sensitivity: Double = 1.0,
+             podSlots: List<Pair<Int, Double>>? = null) {
         fun s(v: Double) = lerp(0.5, v, sensitivity)
         val act = s(state.activity); val coh = s(state.coherence); val att = s(state.attention)
         val seen = s(state.observed)
@@ -292,7 +325,7 @@ class PetSim(points: List<Pair<Double, Double>>, seed: Int = 0xC0FFEE.toInt(), v
                 q.jx += dt * (0.40 + act * 1.1)
                 q.jy += dt * (0.34 + act * 0.9)
             }
-            val (gx, gy) = gaitTarget(q, tGait, act, coh, att, ch.key, work, expressionVersion)
+            val (gx, gy) = gaitTarget(q, tGait, act, coh, att, ch.key, work, expressionVersion, podSlots)
             val podAng = q.pod * 1.047 + phase * 0.22
             val tx = gx + sin(q.jx + q.s * 9) * blur * wander + cos(podAng) * split
             val ty = gy + cos(q.jy + q.s * 7) * blur * wander + sin(podAng) * split * 0.55
@@ -318,6 +351,21 @@ class PetSim(points: List<Pair<Double, Double>>, seed: Int = 0xC0FFEE.toInt(), v
             hollow = seen < 0.92,
             channel = ch.key, arch = ch.arch, work = work)
     }
+}
+
+fun petDigest(sim: PetSim): String {
+    val grid = IntArray(64 * 32)
+    for (p in sim.p) {
+        val x = floor((p.x + 0.66) / 1.32 * 64).toInt()
+        val y = floor((p.y + 0.66) / 1.32 * 32).toInt()
+        if (x in 0..63 && y in 0..31) grid[y * 64 + x] = min(255, grid[y * 64 + x] + 1)
+    }
+    var hash = 0xcbf29ce484222325UL.toLong()
+    fun mix(n: Int) { hash = (hash xor (n and 255).toLong()) * 0x100000001b3L }
+    for (n in grid) mix(n)
+    mix(sim.frame.r.roundToInt()); mix(sim.frame.g.roundToInt()); mix(sim.frame.b.roundToInt())
+    mix((sim.frame.alpha * 255).roundToInt()); mix(if (sim.frame.hollow) 1 else 0)
+    return hash.toULong().toString(16).padStart(16, '0')
 }
 
 /** Body-space → renderer-space, same as PetSim.ts layout(). */

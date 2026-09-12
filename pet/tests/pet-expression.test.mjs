@@ -10,6 +10,25 @@ import { petDemoEvents } from '../dist/core/pet-demo.js';
 const points = readFileSync(new URL('../public/whale-points.tsv', import.meta.url), 'utf8').trim().split('\n').map(row => row.split(/\s+/).map(Number));
 const tape = compilePetTelemetry(petDemoEvents(), 80_000);
 
+test('native hosts replay checkpoint-free exports from the beginning in their recorded expression version', () => {
+  for (const version of [1, 2]) {
+    const source = new PetNative(JSON.stringify(points), encodePetJSONL(tape), '[]', false, version);
+    for (let i = 0; i < 540; i++) source.step(1 / 30, true);
+    const recording = JSON.parse(source.recording());
+    if (version === 1) delete recording.expressionVersion;
+    const restored = new PetNative(JSON.stringify(points));
+    restored.restoreRecording(JSON.stringify(recording));
+    assert.equal(JSON.parse(restored.snapshot()).timeMs, 0);
+    assert.equal(JSON.parse(restored.recording()).expressionVersion, version);
+    const expected = new PetNative(JSON.stringify(points), encodePetJSONL(tape), '[]', false, version);
+    for (let i = 0; i < 720; i++) assert.equal(restored.step(1 / 30, true), expected.step(1 / 30, true));
+    const before = restored.recording(true);
+    recording.checkpoint = null;
+    assert.throws(() => restored.restoreRecording(JSON.stringify(recording)));
+    assert.equal(restored.recording(true), before);
+  }
+});
+
 test('recordings without an expression version retain v1 after checkpoint hydration and subsequent work', () => {
   const legacy = new PetNative(JSON.stringify(points), encodePetJSONL(tape), '[]', false, 1);
   for (let i = 0; i < 540; i++) legacy.step(1 / 30, true);

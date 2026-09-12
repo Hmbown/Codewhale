@@ -412,7 +412,11 @@ mod tests {
                 globalThis.allVoices = [];"#).unwrap();
             let mut cursor = AudioCursor { target: sink.target(), sample: 0, voices: Vec::new() };
             let mut received = Vec::new();
-            for at in [400, 800, 1200, 1600] {
+            // Use world-sized buffers: a 400 ms PCM render can legitimately
+            // expire the 500 ms presentation deadline on a loaded CI runner.
+            // The expiry policy is covered separately by the audio sink tests.
+            for tick in 1..=48 {
+                let at = f64::from(tick) * 1000.0 / 30.0;
                 ctx.globals().set("timeMs", at).unwrap();
                 ctx.eval::<(), _>("pet.advanceEngine(timeMs,false,true); allVoices.push(...JSON.parse(pet.snapshot()).voices)").unwrap();
                 let time: f64 = ctx.eval("JSON.parse(pet.snapshot()).timeMs").unwrap();
