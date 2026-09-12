@@ -1,6 +1,6 @@
 //! Bounded provider-native/configured web search with explicit fallback receipts.
 //! Adapters include Firecrawl, Tavily, Bocha, Metaso, SearXNG, Baidu,
-//! Volcengine, and Sofya; browsing remains a separate `web.run` workflow.
+//! Volcengine, Sofya, and Serply; browsing remains a separate `web.run` workflow.
 //! `[search]` example:
 //!   provider = "firecrawl"  # keyless on Firecrawl Cloud; optional api_key
 //!   base_url = `"https://search.example/"`  # DDG-compatible URL or SearXNG instance
@@ -40,6 +40,7 @@ const METASO_ENDPOINT: &str = "https://metaso.cn/api/v1";
 const BAIDU_ENDPOINT: &str = "https://qianfan.baidubce.com/v2/ai_search/web_search";
 const VOLCENGINE_RESPONSES_ENDPOINT: &str = "https://ark.cn-beijing.volces.com/api/v3/responses";
 const SOFYA_ENDPOINT: &str = "https://sofya.co/v1/search";
+const SERPLY_ENDPOINT: &str = "https://api.serply.io/v1/search";
 const ERROR_BODY_PREVIEW_BYTES: usize = 512;
 const PROVIDER_NATIVE_MIN_TIMEOUT_MS: u64 = 45_000;
 const KIMI_K3_FORMULA_MIN_TIMEOUT_MS: u64 = 180_000;
@@ -103,6 +104,7 @@ pub(crate) fn search_probe_target(
         SearchProvider::Baidu => (BAIDU_ENDPOINT, false),
         SearchProvider::Volcengine => (VOLCENGINE_RESPONSES_ENDPOINT, false),
         SearchProvider::Sofya => (SOFYA_ENDPOINT, false),
+        SearchProvider::Serply => (SERPLY_ENDPOINT, false),
     };
 
     let mut url = reqwest::Url::parse(raw).map_err(|_| SearchProbeTargetError::Invalid)?;
@@ -178,7 +180,7 @@ impl ToolSpec for WebSearchTool {
     }
 
     fn description(&self) -> &'static str {
-        "Search the web and return ranked results with URLs, snippets, session-scoped ref_ids, and an execution receipt. Open a result ref_id with `web.run` when the short summary is not enough; fetch only the few sources needed. When the exact active route reports a documented first-party server-side search tool, it is tried first; otherwise keyless Firecrawl is the default. Configured API backends visibly degrade through DuckDuckGo then Bing when unavailable, and every hop is recorded. Configuration and network-policy errors fail closed. Explicit Bing and private DuckDuckGo-compatible routes do not cross providers. Set `[search] provider = \"firecrawl\" | \"bing\" | \"tavily\" | \"bocha\" | \"metaso\" | \"searxng\" | \"baidu\" | \"volcengine\" | \"sofya\"` in config.toml. Firecrawl Cloud works keyless with a bounded quota. For a known canonical URL, prefer `fetch_url` directly."
+        "Search the web and return ranked results with URLs, snippets, session-scoped ref_ids, and an execution receipt. Open a result ref_id with `web.run` when the short summary is not enough; fetch only the few sources needed. When the exact active route reports a documented first-party server-side search tool, it is tried first; otherwise keyless Firecrawl is the default. Configured API backends visibly degrade through DuckDuckGo then Bing when unavailable, and every hop is recorded. Configuration and network-policy errors fail closed. Explicit Bing and private DuckDuckGo-compatible routes do not cross providers. Set `[search] provider = \"firecrawl\" | \"bing\" | \"tavily\" | \"bocha\" | \"metaso\" | \"searxng\" | \"baidu\" | \"volcengine\" | \"sofya\" | \"serply\"` in config.toml. Firecrawl Cloud works keyless with a bounded quota. For a known canonical URL, prefer `fetch_url` directly."
     }
 
     fn input_schema(&self) -> Value {
@@ -523,6 +525,63 @@ impl WebSearchTool {
         })?;
 
         Ok(parse_sofya_results(&parsed, max_results))
+    }
+
+    /// Search Serply (<https://serply.io>); it returns Google organic results and
+    /// accepts `SERPLY_API_KEY`.
+    async fn run_serply_search(
+        &self,
+        query: &str,
+        max_results: usize,
+        timeout_ms: u64,
+        context: &ToolContext,
+    ) -> Result<Vec<WebSearchEntry>, ToolError> {
+        let env_key = std::env::var("SERPLY_API_KEY").ok();
+        let api_key = context
+            .search_api_key
+            .as_deref()
+            .or(env_key.as_deref())
+            .ok_or_else(|| {
+                ToolError::invalid_input(
+                    "Serply search requires an API key. Set `[search] api_key` in config.toml or the SERPLY_API_KEY env var.",
+                )
+            })?;
+
+        let client = crate::tls::reqwest_client_builder()
+            .timeout(Duration::from_millis(timeout_ms))
+            .build()
+            .map_err(|e| {
+                ToolError::execution_failed(format!("Failed to build HTTP client: {e}"))
+            })?;
+
+        let resp = client
+            .get(serply_search_url(query, max_results)?)
+            .header("X-Api-Key", api_key)
+            .header("Accept", "application/json")
+            .send()
+            .await
+            .map_err(|e| {
+                ToolError::execution_failed(format!("Serply search request failed: {e}"))
+            })?;
+
+        let status = resp.status();
+        let body = resp.text().await.map_err(|e| {
+            ToolError::execution_failed(format!("Failed to read Serply response: {e}"))
+        })?;
+
+        if !status.is_success() {
+            let truncated = truncate_error_body(&body);
+            return Err(ToolError::execution_failed(format!(
+                "Serply search failed: HTTP {}: {truncated}",
+                status.as_u16()
+            )));
+        }
+
+        let parsed: serde_json::Value = serde_json::from_str(&body).map_err(|e| {
+            ToolError::execution_failed(format!("Failed to parse Serply response: {e}"))
+        })?;
+
+        Ok(parse_serply_results(&parsed, max_results))
     }
 
     /// Search via Bocha AI Search API (<https://bochaai.com>).
@@ -1048,6 +1107,9 @@ fn preflight_search_provider(context: &ToolContext) -> Result<(), ToolError> {
         SearchProvider::Sofya if !configured_key && !env_key("SOFYA_API_KEY") => not_configured(
             "Sofya search is not configured: it requires an API key. Set `[search] api_key = \"ay_live_...\"` in config.toml or the SOFYA_API_KEY env var.",
         ),
+        SearchProvider::Serply if !configured_key && !env_key("SERPLY_API_KEY") => not_configured(
+            "Serply search is not configured: it requires an API key. Set `[search] api_key` in config.toml or the SERPLY_API_KEY env var.",
+        ),
         SearchProvider::Searxng
             if configured_search_base_url(context.search_base_url.as_deref()).is_none() =>
         {
@@ -1096,6 +1158,7 @@ const fn default_backend_host(backend: BackendId) -> Option<&'static str> {
         BackendId::Baidu => Some("qianfan.baidubce.com"),
         BackendId::Volcengine => Some("ark.cn-beijing.volces.com"),
         BackendId::Sofya => Some("sofya.co"),
+        BackendId::Serply => Some("api.serply.io"),
     }
 }
 
@@ -1314,6 +1377,14 @@ pub(crate) async fn run_backend_search(
             Ok(simple(
                 BackendId::Sofya,
                 tool.run_sofya_search(&query.query, max_results, timeout_ms, context)
+                    .await?,
+            ))
+        }
+        SearchProvider::Serply => {
+            check_policy(context.network_policy.as_ref(), "api.serply.io")?;
+            Ok(simple(
+                BackendId::Serply,
+                tool.run_serply_search(&query.query, max_results, timeout_ms, context)
                     .await?,
             ))
         }
@@ -1787,6 +1858,39 @@ fn parse_sofya_results(parsed: &Value, max_results: usize) -> Vec<WebSearchEntry
         .collect()
 }
 
+/// Build the Serply `/v1/search` URL; `num` is the number of organic results.
+fn serply_search_url(query: &str, max_results: usize) -> Result<reqwest::Url, ToolError> {
+    let mut url = reqwest::Url::parse(SERPLY_ENDPOINT)
+        .map_err(|error| ToolError::invalid_input(format!("Invalid Serply endpoint: {error}")))?;
+    url.query_pairs_mut()
+        .append_pair("q", query)
+        .append_pair("num", &max_results.to_string());
+    Ok(url)
+}
+
+/// Parse Serply `/v1/search` output: `results[]` rows carry `title`, `link`, and
+/// a `description` snippet; ads, knowledge graph, and related questions are
+/// top-level siblings and are ignored.
+fn parse_serply_results(parsed: &Value, max_results: usize) -> Vec<WebSearchEntry> {
+    parsed
+        .get("results")
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flat_map(|arr| arr.iter())
+        .filter_map(|item| {
+            let title = item.get("title")?.as_str()?.to_string();
+            let url = item.get("link")?.as_str()?.to_string();
+            let snippet = first_non_empty_string(item, &["description", "snippet"]);
+            Some(WebSearchEntry {
+                title,
+                url,
+                snippet,
+            })
+        })
+        .take(max_results)
+        .collect()
+}
+
 fn first_non_empty_string(item: &Value, keys: &[&str]) -> Option<String> {
     keys.iter().find_map(|key| {
         item.get(*key)
@@ -2163,10 +2267,10 @@ mod tests {
         baidu_search_payload, bocha_error_message, domain_matches, duckduckgo_search_url,
         extract_search_query, finalize_search_response, optional_search_max_results,
         parse_baidu_results, parse_bocha_results, parse_metaso_results, parse_searxng_results,
-        parse_sofya_results, parse_tavily_results, parse_volcengine_results,
+        parse_serply_results, parse_sofya_results, parse_tavily_results, parse_volcengine_results,
         register_search_citations, rerank, run_scrape_search_with_endpoints, sanitize_error_body,
-        search_probe_target, search_timeout_budgets, searxng_search_url, truncate_error_body,
-        volcengine_extract_text,
+        search_probe_target, search_timeout_budgets, searxng_search_url, serply_search_url,
+        truncate_error_body, volcengine_extract_text,
     };
     use crate::config::SearchProvider;
     use crate::tools::web::contract::{
@@ -2224,6 +2328,7 @@ mod tests {
                 "https://ark.cn-beijing.volces.com/api/v3/responses",
             ),
             (SearchProvider::Sofya, "https://sofya.co/v1/search"),
+            (SearchProvider::Serply, "https://api.serply.io/v1/search"),
         ];
 
         for (provider, expected) in cases {
@@ -2570,6 +2675,72 @@ mod tests {
     }
 
     #[test]
+    fn serply_search_url_encodes_query_and_result_count() {
+        let url = serply_search_url("rust tui & ratatui", 7).expect("serply url");
+
+        assert_eq!(url.host_str(), Some("api.serply.io"));
+        assert_eq!(url.path(), "/v1/search");
+        let pairs: Vec<(String, String)> = url
+            .query_pairs()
+            .map(|(k, v)| (k.into_owned(), v.into_owned()))
+            .collect();
+        assert_eq!(
+            pairs,
+            vec![
+                ("q".to_string(), "rust tui & ratatui".to_string()),
+                ("num".to_string(), "7".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_serply_results_reads_link_and_description_and_skips_malformed_rows() {
+        let body = json!({
+            "results": [
+                {
+                    "title": "Ratatui",
+                    "link": "https://ratatui.rs/",
+                    "description": "Cook up delicious terminal user interfaces in Rust.",
+                    "position": 1,
+                    "realPosition": 1
+                },
+                {
+                    "title": "No description",
+                    "link": "https://example.com/plain",
+                    "description": ""
+                },
+                {
+                    "title": "Missing link",
+                    "description": "dropped because there is no link"
+                },
+                "not an object",
+                {
+                    "title": "Fourth",
+                    "link": "https://example.com/fourth",
+                    "description": "beyond max_results"
+                }
+            ],
+            "knowledge_graph": {"title": "ignored sidebar"},
+            "related_questions": [{"question": "ignored"}],
+            "ads": [{"title": "ignored ad", "link": "https://ads.example.com"}]
+        });
+
+        let results = parse_serply_results(&body, 2);
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].title, "Ratatui");
+        assert_eq!(results[0].url, "https://ratatui.rs/");
+        assert_eq!(
+            results[0].snippet.as_deref(),
+            Some("Cook up delicious terminal user interfaces in Rust.")
+        );
+        assert_eq!(results[1].url, "https://example.com/plain");
+        assert_eq!(results[1].snippet, None);
+
+        assert!(parse_serply_results(&json!({"total": 0}), 5).is_empty());
+    }
+
+    #[test]
     fn parse_sofya_results_falls_back_to_description_for_empty_content() {
         let body = json!({
             "results": [
@@ -2793,6 +2964,67 @@ mod tests {
         let msg = err.to_string();
         assert!(
             msg.contains("Baidu") && msg.contains("API key"),
+            "error must name the provider and missing key; got `{msg}`"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn serply_missing_key_is_fail_closed_inside_the_backend_chain() {
+        use crate::tools::spec::ToolContext;
+
+        let _guard = crate::test_support::lock_test_env();
+        let prev = std::env::var_os("SERPLY_API_KEY");
+        unsafe { std::env::remove_var("SERPLY_API_KEY") };
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut ctx = ToolContext::new(tmp.path().to_path_buf());
+        ctx.search_api_key = None;
+        let err = WebSearchTool
+            .run_serply_search("anything", 5, 1_000, &ctx)
+            .await
+            .expect_err("missing api_key must be an error");
+
+        match prev {
+            Some(value) => unsafe { std::env::set_var("SERPLY_API_KEY", value) },
+            None => unsafe { std::env::remove_var("SERPLY_API_KEY") },
+        }
+
+        // A configured Serply route that reaches the adapter after a failed
+        // provider-native attempt must stop the chain, not degrade to DuckDuckGo.
+        assert!(
+            matches!(err, crate::tools::spec::ToolError::InvalidInput { .. }),
+            "missing key must be classified fail-closed; got `{err:?}`"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn serply_provider_without_api_key_surfaces_clear_error_not_silent_fallback() {
+        use crate::config::SearchProvider;
+        use crate::tools::spec::{ToolContext, ToolSpec};
+
+        let _guard = crate::test_support::lock_test_env();
+        let prev = std::env::var_os("SERPLY_API_KEY");
+        unsafe { std::env::remove_var("SERPLY_API_KEY") };
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut ctx = ToolContext::new(tmp.path().to_path_buf());
+        ctx.search_provider = SearchProvider::Serply;
+        ctx.search_api_key = None;
+        let err = WebSearchTool
+            .execute(json!({"query": "anything"}), &ctx)
+            .await
+            .expect_err("missing api_key must surface as ToolError");
+
+        match prev {
+            Some(value) => unsafe { std::env::set_var("SERPLY_API_KEY", value) },
+            None => unsafe { std::env::remove_var("SERPLY_API_KEY") },
+        }
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Serply") && msg.contains("API key"),
             "error must name the provider and missing key; got `{msg}`"
         );
     }
