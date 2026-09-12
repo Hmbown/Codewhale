@@ -119,7 +119,10 @@ export class PetWorld {
       this.tapeHashes[i] = stableHash((i ? ',' : '') + JSON.stringify(this.tapeLog[i]), this.tapeHashes[i - 1] ?? stableHash('[['));
   }
   private historyDigest(): number {
-    return stableHash('],' + JSON.stringify(this.interactionLog) + ']', this.tapeHashes.at(-1) ?? stableHash('[['));
+    let hash = stableHash('],[', this.tapeHashes.at(-1) ?? stableHash('[['));
+    for (let i = 0; i < this.interactionLog.length; i++)
+      hash = stableHash((i ? ',' : '') + JSON.stringify(this.interactionLog[i]), hash);
+    return stableHash(']]', hash);
   }
 
   /** Hydrate a new world without stepping history. Validation finishes before

@@ -217,7 +217,10 @@ class PetWorld {
             this.tapeHashes[i] = (0, model_js_1.stableHash)((i ? ',' : '') + JSON.stringify(this.tapeLog[i]), this.tapeHashes[i - 1] ?? (0, model_js_1.stableHash)('[['));
     }
     historyDigest() {
-        return (0, model_js_1.stableHash)('],' + JSON.stringify(this.interactionLog) + ']', this.tapeHashes.at(-1) ?? (0, model_js_1.stableHash)('[['));
+        let hash = (0, model_js_1.stableHash)('],[', this.tapeHashes.at(-1) ?? (0, model_js_1.stableHash)('[['));
+        for (let i = 0; i < this.interactionLog.length; i++)
+            hash = (0, model_js_1.stableHash)((i ? ',' : '') + JSON.stringify(this.interactionLog[i]), hash);
+        return (0, model_js_1.stableHash)(']]', hash);
     }
     /** Hydrate a new world without stepping history. Validation finishes before
      * the caller receives it, so a corrupt checkpoint never mutates a live pet. */

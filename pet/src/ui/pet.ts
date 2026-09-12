@@ -16,7 +16,7 @@ let points: [number, number][] = [], tape: readonly PetBucket[] = [], interactio
 let expressionVersion: 1 | 2 = 2;
 let world: PetWorld, seconds = 0, last = 0, accumulator = 0, paused = false;
 let restoring = false, generation = 0, liveGeneration = 0, liveTimer = 0;
-let imported: { tape: readonly PetBucket[]; interactions: PetInteraction[]; name: string; expressionVersion: 1 | 2 } | undefined;
+let imported: { world: PetWorld; name: string } | undefined;
 const library = new TraceLibrary();
 let savedRevision: number | undefined, saving = false, persistenceReady = false, persistenceFailed = false;
 let audio: AudioContext | undefined, anchor = 0, sound = false;
@@ -41,20 +41,25 @@ function play(voices: readonly PetVoice[]) {
 }
 async function rebuild(to = 0, checkpoint?: import('../core/pet-world.js').PetWorldCheckpoint) {
   const ticket = ++generation;
-  silence(); const next = checkpoint ? PetWorld.restore(points, tape, interactions, checkpoint) : new PetWorld(points, tape, interactions, expressionVersion); restoring = true;
-  canvas.setAttribute('aria-busy', 'true');
-  for (const id of ['save', 'attention', 'feed']) get<HTMLButtonElement>(id).disabled = true;
+  const next = checkpoint ? PetWorld.restore(points, tape, interactions, checkpoint) : new PetWorld(points, tape, interactions, expressionVersion);
   const ticks = Math.round(Math.max(0, Math.min(86_400, to)) * 30);
   if (checkpoint && checkpoint.tick !== ticks) throw new Error('Saved pet clock does not match its checkpoint.');
+  silence(); restoring = true;
+  canvas.setAttribute('aria-busy', 'true');
+  for (const id of ['save', 'attention', 'feed']) get<HTMLButtonElement>(id).disabled = true;
   for (let i = checkpoint?.tick ?? 0; i < ticks; i++) {
     next.step(1 / 30, { motion: !motion.checked, sensitivity: 1 });
     if (i > 0 && i % 600 === 0) { await new Promise(resolve => setTimeout(resolve, 0)); if (ticket !== generation) return; }
   }
   if (ticket !== generation) return;
+  adoptWorld(next);
+}
+function adoptWorld(next: PetWorld) {
   world = next; expressionVersion = next.sim.expressionVersion; restoring = false;
+  if (mode.value === 'replay') imported = { world: next, name: imported?.name ?? source.textContent ?? 'Imported replay' };
   canvas.setAttribute('aria-busy', 'false');
   for (const id of ['save', 'attention', 'feed']) get<HTMLButtonElement>(id).disabled = false;
-  seconds = ticks / 30; accumulator = 0; last = 0;
+  seconds = next.frame.timeMs / 1000; accumulator = 0; last = 0;
   if (audio) anchor = audio.currentTime - seconds + .08;
   draw();
 }
@@ -99,7 +104,6 @@ function draw() {
 function interact(kind: PetInteraction['kind'], x = .2, y = -.15) {
   if (restoring) return;
   world.interact(kind, x, y); interactions = [...world.interactions];
-  if (mode.value === 'replay' && imported) imported.interactions = [...interactions];
 }
 canvas.addEventListener('pointerdown', event => { const r = canvas.getBoundingClientRect(); interact('attention', Math.max(-1, Math.min(1, (event.clientX - r.left) / r.width * 2 - 1)), Math.max(-1, Math.min(1, (event.clientY - r.top) / r.height * 2 - 1))); });
 get('attention').onclick = () => interact('attention'); get('feed').onclick = () => interact('food');
@@ -113,8 +117,10 @@ motion.onchange = () => rebuild(seconds); seek.oninput = () => rebuild(Number(se
 mode.onchange = () => {
   stopFollowing();
   if (mode.value === 'replay' && imported) {
-    expressionVersion = imported.expressionVersion; tape = imported.tape; interactions = [...imported.interactions]; source.textContent = imported.name;
-    seek.max = String(Math.max(90, tape.length * .4)); rebuild(); return;
+    tape = imported.world.tape; interactions = [...imported.world.interactions]; source.textContent = imported.name;
+    seek.max = String(Math.max(90, tape.length * .4, imported.world.frame.timeMs / 1000));
+    ++generation; silence(); adoptWorld(imported.world);
+    message.textContent = 'Returned to the imported world at its current pose.'; return;
   }
   expressionVersion = 2;
   tape = mode.value === 'demo' ? compilePetTelemetry(petDemoEvents(), 80_000) : [];
@@ -138,7 +144,6 @@ get<HTMLInputElement>('file').onchange = async event => {
       nextTape = decodePetJSONL(r.tape.map(b => JSON.stringify(b)).join('\n')); nextInteractions = r.interactions;
       if (r.checkpoint !== undefined) {
         if ((r.checkpoint?.sim?.expressionVersion ?? 1) !== nextExpressionVersion) throw new Error('Pet expression version does not match its checkpoint.');
-        PetWorld.restore(points, nextTape, nextInteractions, r.checkpoint);
         nextCheckpoint = r.checkpoint;
       }
     } else {
@@ -149,13 +154,14 @@ get<HTMLInputElement>('file').onchange = async event => {
         nextTape = compilePetTelemetry(traces[0].events, traces[0].duration); }
     }
     // Validate before replacing the currently playing world.
-    new PetWorld(points, nextTape, nextInteractions, nextExpressionVersion);
+    const next = nextCheckpoint === undefined ? new PetWorld(points, nextTape, nextInteractions, nextExpressionVersion)
+      : PetWorld.restore(points, nextTape, nextInteractions, nextCheckpoint);
     stopFollowing();
     expressionVersion = nextExpressionVersion; tape = nextTape; interactions = nextInteractions; mode.value = 'replay'; seek.max = String(Math.max(90, tape.length * .4, (nextCheckpoint?.frame.timeMs ?? 0) / 1000));
-    imported = { tape, interactions: [...interactions], name: `Local replay · ${file.name}`, expressionVersion };
+    imported = { world: next, name: `Local replay · ${file.name}` };
     mode.querySelector<HTMLOptionElement>('[value="replay"]')!.disabled = false;
     source.textContent = `Local replay · ${file.name}`; message.textContent = 'Recording loaded locally. The saved world includes interactions, its current pose and audio onsets.';
-    await rebuild((nextCheckpoint?.frame.timeMs ?? 0) / 1000, nextCheckpoint);
+    ++generation; silence(); adoptWorld(next);
   } catch (error) { message.textContent = error instanceof Error ? error.message : 'Unable to import this file.'; }
 };
 get('save').onclick = () => {
@@ -234,7 +240,7 @@ try {
       source.textContent = h.sourceName;
       seek.max = h.source === 'demo' ? '80' : String(Math.max(h.source === 'replay' ? 90 : 120, h.seconds, tape.length * .4));
       if (h.source === 'replay') {
-        imported = { tape, interactions, name: h.sourceName, expressionVersion }; mode.querySelector<HTMLOptionElement>('[value="replay"]')!.disabled = false;
+        mode.querySelector<HTMLOptionElement>('[value="replay"]')!.disabled = false;
       }
       message.textContent = 'Restoring the saved habitat…';
       await rebuild(h.seconds, h.still === motion.checked ? h.checkpoint : undefined);

@@ -70,10 +70,15 @@ private fun PetScreen(model: PetViewModel) {
     val export = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/json")) { it?.let(model::exportRecording) }
     val recovery = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/json")) { it?.let(model::exportRecovery) }
     var restart by remember { mutableStateOf(false) }
+    var reload by remember { mutableStateOf(false) }
     if (restart) AlertDialog(onDismissRequest = { restart = false }, title = { Text("Start a fresh habitat?") },
-        text = { Text("The current saved world will be kept as a recovery copy. You can export it from More.") },
+        text = { Text("The saved world will be kept as a recovery copy. Unsaved changes are discarded. Export the recording first to keep the current visit.") },
         confirmButton = { TextButton(onClick = { restart = false; model.restart() }) { Text("Start fresh") } },
         dismissButton = { TextButton(onClick = { restart = false }) { Text("Cancel") } })
+    if (reload) AlertDialog(onDismissRequest = { reload = false }, title = { Text("Reopen the saved habitat?") },
+        text = { Text("Unsaved changes will be discarded. Export the recording first to keep the current visit.") },
+        confirmButton = { TextButton(onClick = { reload = false; model.reload() }) { Text("Reopen saved") } },
+        dismissButton = { TextButton(onClick = { reload = false }) { Text("Cancel") } })
     Column(Modifier.safeDrawingPadding().fillMaxSize()) {
         Row(Modifier.fillMaxWidth().padding(horizontal = 22.dp, vertical = 12.dp), verticalAlignment = Alignment.CenterVertically) {
             Text("Codewhale", style = MaterialTheme.typography.headlineSmall, modifier = Modifier.weight(1f))
@@ -83,7 +88,7 @@ private fun PetScreen(model: PetViewModel) {
                 DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
                     DropdownMenuItem(text = { Text("Import recording") }, onClick = { menu = false; import.launch(arrayOf("application/json", "text/plain", "application/octet-stream")) })
                     DropdownMenuItem(text = { Text("Export recording") }, enabled = ui.scene != null, onClick = { menu = false; export.launch("codewhale-pet.json") })
-                    DropdownMenuItem(text = { Text("Reopen saved habitat") }, onClick = { menu = false; model.reload() })
+                    DropdownMenuItem(text = { Text("Reopen saved habitat") }, onClick = { menu = false; reload = true })
                     DropdownMenuItem(text = { Text("Start fresh habitat") }, enabled = ui.scene != null, onClick = { menu = false; restart = true })
                     DropdownMenuItem(text = { Text("Export previous world") }, enabled = ui.canExportRecovery,
                         onClick = { menu = false; recovery.launch("codewhale-pet-recovery.json") })
