@@ -5163,6 +5163,140 @@ fn patch_undo_helper_restores_only_the_bound_session() -> Result<()> {
     Ok(())
 }
 
+/// The acceptance criterion for per-file revert: restoring one file must not
+/// roll back any other file's turn changes.
+#[test]
+fn revert_file_helper_restores_only_the_named_file() -> Result<()> {
+    let _lock = lock_test_env();
+    let root = tempfile::tempdir()?;
+    let home = root.path().join("home");
+    fs::create_dir_all(&home)?;
+    let _home = EnvVarGuard::set("HOME", &home);
+
+    let workspace = root.path().join("workspace");
+    fs::create_dir_all(&workspace)?;
+    let repo = crate::snapshot::SnapshotRepo::open_or_init(&workspace)?;
+    let wanted = workspace.join("wanted.txt");
+    let other = workspace.join("other.txt");
+
+    fs::write(&wanted, "wanted-before")?;
+    fs::write(&other, "other-before")?;
+    repo.snapshot_with_session("pre-turn:1", Some("session-a"))?;
+
+    fs::write(&wanted, "wanted-after")?;
+    fs::write(&other, "other-after")?;
+
+    let reverted = revert_file_from_snapshot(&workspace, "session-a", "wanted.txt")
+        .expect("scoped revert should succeed");
+    assert_eq!(reverted.path, "wanted.txt");
+    assert_eq!(reverted.action, "modified");
+    assert_eq!(reverted.snapshot_label, "pre-turn:1");
+    assert_eq!(fs::read_to_string(&wanted)?, "wanted-before");
+    assert_eq!(
+        fs::read_to_string(&other)?,
+        "other-after",
+        "reverting one file must leave every other file's changes in place"
+    );
+    Ok(())
+}
+
+#[test]
+fn revert_file_helper_accepts_an_absolute_path_inside_the_workspace() -> Result<()> {
+    let _lock = lock_test_env();
+    let root = tempfile::tempdir()?;
+    let home = root.path().join("home");
+    fs::create_dir_all(&home)?;
+    let _home = EnvVarGuard::set("HOME", &home);
+
+    let workspace = root.path().join("workspace");
+    fs::create_dir_all(&workspace)?;
+    let repo = crate::snapshot::SnapshotRepo::open_or_init(&workspace)?;
+    let file = workspace.join("a.txt");
+
+    fs::write(&file, "v1")?;
+    repo.snapshot_with_session("pre-turn:1", Some("session-a"))?;
+    fs::write(&file, "v2")?;
+
+    // A recorded path may arrive absolute; normalization reports it back
+    // workspace-relative so the GUI's change record stays consistent.
+    let reverted = revert_file_from_snapshot(&workspace, "session-a", &file.to_string_lossy())
+        .expect("scoped revert should accept an in-workspace absolute path");
+    assert_eq!(reverted.path, "a.txt");
+    assert_eq!(fs::read_to_string(&file)?, "v1");
+    Ok(())
+}
+
+#[test]
+fn revert_file_helper_refuses_foreign_sessions_and_paths_outside_the_workspace() -> Result<()> {
+    let _lock = lock_test_env();
+    let root = tempfile::tempdir()?;
+    let home = root.path().join("home");
+    fs::create_dir_all(&home)?;
+    let _home = EnvVarGuard::set("HOME", &home);
+
+    let workspace = root.path().join("workspace");
+    fs::create_dir_all(&workspace)?;
+    let repo = crate::snapshot::SnapshotRepo::open_or_init(&workspace)?;
+    let file = workspace.join("a.txt");
+
+    // Only another session owns a snapshot, so this session has nothing it is
+    // allowed to revert.
+    fs::write(&file, "foreign-before")?;
+    repo.snapshot_with_session("pre-turn:1", Some("session-b"))?;
+    fs::write(&file, "foreign-after")?;
+
+    let err = revert_file_from_snapshot(&workspace, "session-a", "a.txt")
+        .expect_err("a foreign session's snapshot must not be restorable");
+    assert_eq!(err.status, StatusCode::CONFLICT);
+    assert!(
+        err.message.contains("nothing to revert"),
+        "got: {}",
+        err.message
+    );
+    assert_eq!(fs::read_to_string(&file)?, "foreign-after");
+
+    let traversal = revert_file_from_snapshot(&workspace, "session-a", "../escape.txt")
+        .expect_err("traversal must be refused");
+    assert_eq!(traversal.status, StatusCode::BAD_REQUEST);
+    Ok(())
+}
+
+/// The GUI decides whether to show the per-file Revert button from a `GET`
+/// probe of this route: 405 ("route exists, wrong method") means available,
+/// 404 means an older engine that must degrade with an explanation. Assert the
+/// wire contract, not just the Rust helper.
+#[tokio::test]
+async fn file_revert_route_probes_as_available_and_404s_unknown_threads() -> Result<()> {
+    let root = std::env::temp_dir().join(format!("deepseek-file-revert-route-{}", Uuid::new_v4()));
+    let sessions_dir = root.join("sessions");
+    let Some((addr, _runtime_threads, handle)) =
+        spawn_test_server_with_root(root.clone(), sessions_dir).await?
+    else {
+        return Ok(());
+    };
+    let client = crate::tls::reqwest_client();
+
+    let probe = client
+        .get(format!("http://{addr}/v1/threads/__probe__/file-revert"))
+        .send()
+        .await?;
+    assert_eq!(
+        probe.status(),
+        StatusCode::METHOD_NOT_ALLOWED,
+        "the capability probe reads any non-404 as 'endpoint available'"
+    );
+
+    let missing = client
+        .post(format!("http://{addr}/v1/threads/thr_missing/file-revert"))
+        .json(&json!({ "path": "a.txt" }))
+        .send()
+        .await?;
+    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+
+    handle.abort();
+    Ok(())
+}
+
 #[tokio::test]
 async fn retry_endpoint_reuses_dropped_user_text_to_start_a_turn() -> Result<()> {
     let root = std::env::temp_dir().join(format!("deepseek-retry-endpoint-{}", Uuid::new_v4()));

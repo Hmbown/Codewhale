@@ -1145,6 +1145,7 @@ pub fn build_router(state: RuntimeApiState) -> Router {
         .route("/v1/threads/{id}/fork", post(fork_thread))
         .route("/v1/threads/{id}/undo", post(undo_thread_turn))
         .route("/v1/threads/{id}/patch-undo", post(patch_undo_thread_turn))
+        .route("/v1/threads/{id}/file-revert", post(revert_thread_file))
         .route("/v1/threads/{id}/retry", post(retry_thread_turn))
         .route(
             "/v1/threads/{id}/turn-operations/{operation_key}",
@@ -4602,6 +4603,134 @@ fn patch_undo_workspace_files(
         summary: Some(summary),
         snapshot_label: Some(target.label.clone()),
     }
+}
+
+#[derive(Debug, Deserialize)]
+struct RevertThreadFileRequest {
+    /// The single file to restore, relative to the thread's workspace.
+    /// Absolute paths inside the workspace are accepted and normalized.
+    path: String,
+}
+
+#[derive(Debug, Serialize)]
+struct RevertThreadFileResponse {
+    /// Workspace-relative path that was restored.
+    path: String,
+    /// What the restore did to the working tree: `modified`, `recreated`, or
+    /// `removed`.
+    action: String,
+    /// Snapshot the file came from.
+    snapshot_id: String,
+    snapshot_label: String,
+}
+
+/// Restore one file from the newest snapshot that still owns it.
+///
+/// The file-scoped counterpart of `patch-undo`. Where `patch-undo` checks out
+/// a whole snapshot tree, this restores exactly one path, so unrelated
+/// working-tree changes are never rolled back. Snapshot ownership follows the
+/// same rule the TUI's `/undo` applies before it touches files: only
+/// `tool:`/`pre-turn:` snapshots tagged with this thread's own session are
+/// candidates, so a revert cannot reach into another conversation's work.
+///
+/// Nothing to revert is a `409`, not a silent success: the GUI needs to tell
+/// the user *why* the button did nothing.
+async fn revert_thread_file(
+    State(state): State<RuntimeApiState>,
+    Path(id): Path<String>,
+    Json(req): Json<RevertThreadFileRequest>,
+) -> Result<Json<RevertThreadFileResponse>, ApiError> {
+    let thread = state
+        .runtime_threads
+        .get_thread(&id)
+        .await
+        .map_err(map_thread_err)?;
+    let workspace = thread.workspace.clone();
+    let Some(session_id) = thread.session_id.clone() else {
+        return Err(ApiError::conflict(
+            "Thread has no bound session, so no snapshot can be proven to own this file.",
+        ));
+    };
+    let raw_path = req.path;
+
+    // Snapshot listing, diffing and checkout all shell out to git; keep that
+    // off the async runtime's worker threads.
+    let response = tokio::task::spawn_blocking(move || {
+        revert_file_from_snapshot(&workspace, &session_id, &raw_path)
+    })
+    .await
+    .map_err(|e| ApiError::internal(format!("file revert task failed: {e}")))??;
+
+    Ok(Json(response))
+}
+
+fn revert_file_from_snapshot(
+    workspace: &FsPath,
+    session_id: &str,
+    raw_path: &str,
+) -> Result<RevertThreadFileResponse, ApiError> {
+    // Every caller-supplied path passes through this one gate. It accepts a
+    // workspace-relative path or an absolute path inside the workspace and
+    // rejects everything else (`..`, empty, or outside the work tree) before
+    // anything is compared or checked out.
+    let Some(rel) = crate::snapshot::workspace_relative_path(workspace, raw_path) else {
+        return Err(ApiError::bad_request(format!(
+            "path must name a file inside the thread workspace {}; got '{}'",
+            workspace.display(),
+            raw_path
+        )));
+    };
+
+    let repo = crate::snapshot::SnapshotRepo::open_or_init(workspace)
+        .map_err(|e| ApiError::internal(format!("Snapshot repo unavailable: {e}")))?;
+    let snapshots = repo
+        .list(100)
+        .map_err(|e| ApiError::internal(format!("Failed to list snapshots: {e}")))?;
+
+    // Walk newest-first and stop at the first snapshot this session owns whose
+    // copy of this one file differs from the working tree — the file-scoped
+    // analogue of the whole-tree "first snapshot that differs" cursor.
+    let mut target = None;
+    for snapshot in snapshots
+        .iter()
+        .filter(|s| s.label.starts_with("tool:") || s.label.starts_with("pre-turn:"))
+        .filter(|s| s.session_id.as_deref() == Some(session_id))
+    {
+        let differs = repo
+            .path_differs_from_snapshot(&snapshot.id, &rel)
+            .map_err(|e| ApiError::internal(format!("Failed to inspect snapshots: {e}")))?;
+        if differs {
+            target = Some(snapshot);
+            break;
+        }
+    }
+
+    let Some(target) = target else {
+        return Err(ApiError::conflict(format!(
+            "No snapshot owned by this session differs from '{}' — there is nothing to revert.",
+            rel.display()
+        )));
+    };
+
+    let paths = [rel.clone()];
+    let outcomes = repo
+        .restore_paths(&target.id, &paths)
+        .map_err(|e| ApiError::internal(format!("File restore failed: {e}")))?;
+
+    let Some(outcome) = outcomes.into_iter().next() else {
+        return Err(ApiError::conflict(format!(
+            "Snapshot '{}' already matches '{}' — nothing was reverted.",
+            target.label,
+            rel.display()
+        )));
+    };
+
+    Ok(RevertThreadFileResponse {
+        path: outcome.path.to_string_lossy().into_owned(),
+        action: outcome.action.as_str().to_string(),
+        snapshot_id: target.id.as_str().to_string(),
+        snapshot_label: target.label.clone(),
+    })
 }
 
 #[derive(Debug, Deserialize)]
