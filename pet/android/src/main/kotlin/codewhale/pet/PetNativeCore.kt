@@ -18,7 +18,7 @@ data class PetScene(
 /** Confined to one worker. QuickJS runs the committed world, validation and
  * score; Kotlin only projects its state into the existing particle renderer. */
 @OptIn(EngineApi::class)
-class PetNativeCore(bundle: String, pointsText: String, tape: String = "", saved: String? = null) : AutoCloseable {
+class PetNativeCore(bundle: String, pointsText: String, tape: String = "", saved: String? = null, live: Boolean = false) : AutoCloseable {
     private val js = QuickJs.create()
     private var deadline = Long.MAX_VALUE
     val sim: PetSim
@@ -44,18 +44,15 @@ class PetNativeCore(bundle: String, pointsText: String, tape: String = "", saved
             }.toList()
             require(points.size == 980)
             val body = JSONArray(points.map { listOf(it.first, it.second) }).toString()
-            evaluate("globalThis.pet = new PetNative(${quote(body)}, ${quote(tape)}); undefined")
+            evaluate("globalThis.pet = new PetNative(${quote(body)}, ${quote(tape)}, '[]', $live); undefined")
             if (saved != null) {
                 require(saved.toByteArray(Charsets.UTF_8).size <= MAX_HABITAT_BYTES) { "Habitat exceeds 8 MiB." }
                 evaluate("pet.restoreRecording(${quote(saved)})", 10_000)
+                if (live) evaluate("pet.resetLiveInput()")
             }
             frame = JSONObject(string("pet.snapshot()"))
             sim = PetSim(points)
-            if (saved != null) {
-                val c = JSONObject(string("pet.checkpoint()")).getJSONObject("sim")
-                sim.restoreValidated(decodeCheckpoint(c))
-                check(petDigest(sim) == frame.getString("digest")) { "Restored particles differ from the shared world." }
-            }
+            if (saved != null) restoreProjection()
         } catch (error: Throwable) {
             js.close()
             throw error
@@ -87,6 +84,15 @@ class PetNativeCore(bundle: String, pointsText: String, tape: String = "", saved
     }
 
     fun interact(food: Boolean) { evaluate("pet.interact('${if (food) "food" else "attention"}', 0.2, -0.15)") }
+    fun acceptLiveTail(text: String): Boolean = evaluate("pet.acceptLiveTail(${quote(text)})") == true
+    fun resumeLiveInput() {
+        evaluate("pet.resetLiveInput()")
+        frame = JSONObject(string("pet.snapshot()")); restoreProjection()
+    }
+    private fun restoreProjection() {
+        sim.restoreValidated(decodeCheckpoint(JSONObject(string("pet.checkpoint()")).getJSONObject("sim")))
+        check(petDigest(sim) == frame.getString("digest")) { "Restored particles differ from the shared world." }
+    }
     fun recording(): String = string("pet.recording(true)").also {
         require(it.toByteArray(Charsets.UTF_8).size <= MAX_HABITAT_BYTES) { "Habitat exceeds 8 MiB; export the recording." }
     }

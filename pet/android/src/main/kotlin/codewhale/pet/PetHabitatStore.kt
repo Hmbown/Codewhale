@@ -11,7 +11,7 @@ import java.security.MessageDigest
 /** Private, bounded, atomic recordings. The revision check also protects a
  * second window/process from silently overwriting a newer habitat. */
 class PetHabitatStore(private val directory: File, private val name: String) {
-    init { require(name in setOf("wild", "demo", "recording")) }
+    init { require(name in setOf("wild", "demo", "recording", "live")) }
     private val file = AtomicFile(File(directory, "pet-$name.json"))
     private val lockFile = File(directory, "pet-$name.lock")
     var revision: String? = null; private set

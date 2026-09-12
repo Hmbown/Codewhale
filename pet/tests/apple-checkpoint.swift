@@ -13,6 +13,13 @@ import Darwin
         let left = try JSONSerialization.jsonObject(with: a) as! NSDictionary
         return try left.isEqual(JSONSerialization.jsonObject(with: b))
     }
+    @MainActor static func eventually(_ message: String, _ condition: () throws -> Bool) async throws {
+        for _ in 0..<100 {
+            if try condition() { return }
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        throw PetCoreError.invalid(message)
+    }
     @MainActor static func main() async throws {
         let args = CommandLine.arguments
         let pet = URL(fileURLWithPath: args[1]), out = URL(fileURLWithPath: args[2])
@@ -60,6 +67,57 @@ import Darwin
 
         let root = out.appendingPathComponent("apple-checkpoint-fixture-" + UUID().uuidString, isDirectory: true)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let liveSuite = "dev.shannonlabs.pet-live-test." + UUID().uuidString
+        let liveDefaults = UserDefaults(suiteName: liveSuite)!
+        defer { liveDefaults.removePersistentDomain(forName: liveSuite) }
+        liveDefaults.set("live", forKey: "pet.source")
+        let liveFile = root.appendingPathComponent("local.jsonl")
+        func packet(_ sequence: Int) throws -> Data {
+            var value = try JSONSerialization.jsonObject(with: Data(human.utf8)) as! [String: Any]
+            value["sequence"] = sequence; value["simTimeMs"] = sequence * 400
+            return try JSONSerialization.data(withJSONObject: value) + Data("\n".utf8)
+        }
+        func append(_ sequence: Int) throws {
+            let handle = try FileHandle(forWritingTo: liveFile); defer { try? handle.close() }
+            try handle.seekToEnd(); try handle.write(contentsOf: packet(sequence))
+        }
+        try packet(40).write(to: liveFile)
+        let following = PetHost(points: points, bundle: bundle, defaults: liveDefaults, storageDirectory: root.appendingPathComponent("live-host"))
+        defer { following.suspend(true) }
+        following.setLiveFile(liveFile)
+        func observations() throws -> Int {
+            let recording = try JSONSerialization.jsonObject(with: following.core!.recording()) as! [String: Any]
+            return (recording["tape"] as! [[String: Any]]).filter { ($0["observed"] as? Double ?? 0) > 0 }.count
+        }
+        try require(observations() == 0, "Existing live file replayed an old request")
+        try append(41)
+        try await eventually("File append was not delivered to the actual Apple host") { try observations() == 1 }
+        for _ in 0..<12 { try following.core!.tick(motion: true) }
+        try require(following.core!.frame.state.channel == "human", "Fresh file input did not reach the visible world")
+        following.suspend(true); try append(42); following.suspend(false)
+        try require(following.core!.frame.needs == "none" && following.core!.frame.state.observed == 0, "Suspended request survived resume")
+        try require(petDigest(following.core!.sim) == following.core!.frame.digest, "Resume did not update native geometry")
+        try require(observations() == 1, "Background bytes became a fresh observation")
+        try append(43)
+        try await eventually("Resumed file did not continue") { try observations() == 2 }
+        for _ in 0..<12 { try following.core!.tick(motion: true) }
+        let truncated = try FileHandle(forWritingTo: liveFile)
+        try truncated.truncate(atOffset: 0); try truncated.write(contentsOf: packet(0)); try truncated.close()
+        try await Task.sleep(for: .milliseconds(150))
+        try require(observations() == 2, "Producer restart replayed its baseline")
+        try packet(1).write(to: liveFile, options: .atomic)
+        try await eventually("In-place restart followed by atomic replacement was ignored") { try observations() == 3 }
+        for _ in 0..<12 { try following.core!.tick(motion: true) }
+        try FileManager.default.removeItem(at: liveFile)
+        try await eventually("Missing file was not reported") { following.message.contains("unavailable") }
+        try packet(100).write(to: liveFile)
+        try await Task.sleep(for: .milliseconds(150))
+        try require(observations() == 3, "Recreated file did not establish a baseline")
+        try append(101)
+        try await eventually("Recreated producer did not continue") { try observations() == 4 }
+        following.suspend(true)
+        print("PASS actual Apple live file: stale attachment, append, pause/resume, in-place restart, atomic replacement and deletion/recreation")
+
         let files = try PetHabitatStore(directory: root, source: "wild")
         let stale = try PetHabitatStore(directory: root, source: "wild")
         try require(files.load() == nil && stale.load() == nil, "Fixture was not empty")
@@ -186,6 +244,6 @@ import Darwin
         try require(same(beforeConflict, conflict.core!.recording(checkpoint: true)), "Failed archive retired live history")
         try require(Data(contentsOf: conflictDir.appendingPathComponent("live.json")) == external, "Archiving replaced another writer")
         print("PASS actual Apple host: archive conflict preserves all live history and the other writer's file")
-        print("PASS 10 Apple checkpoint workflows; fixtures retained at \(root.path)")
+        print("PASS 11 Apple checkpoint workflows; fixtures retained at \(root.path)")
     }
 }

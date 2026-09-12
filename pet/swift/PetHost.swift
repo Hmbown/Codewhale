@@ -37,9 +37,6 @@ public func petArchiveLabel(_ name: String) -> String {
     private var timer: Timer?
     private var monitor: DispatchSourceFileSystemObject?
     private var fileMonitor: DispatchSourceFileSystemObject?
-    private var lastPacket: String?
-    private var lastSourceSequence = -1
-    private var fileIdentity: UInt64?
     private var count = 0
     private var stateURL: URL?
     private var paused = false
@@ -56,7 +53,18 @@ public func petArchiveLabel(_ name: String) -> String {
             Task { @MainActor in self?.tick() }
         }
     }
-    public func suspend(_ value: Bool) { paused = value; if value { save(); audio.stop() } else { configureSound() } }
+    public func suspend(_ value: Bool) {
+        let wasPaused = paused; paused = value
+        if value {
+            save(); audio.stop(); monitor?.cancel(); fileMonitor?.cancel(); monitor = nil; fileMonitor = nil
+        } else {
+            if wasPaused && source == .live {
+                do { try core?.resumeLiveInput(); if let stateURL { watch(stateURL) }; objectWillChange.send() }
+                catch { message = error.localizedDescription }
+            }
+            configureSound()
+        }
+    }
     @discardableResult public func selectSource(_ next: PetSource, discardingUnsaved: Bool = false) -> Bool {
         guard next != source else { return true }
         guard discardingUnsaved || save() else { return false }
@@ -64,7 +72,7 @@ public func petArchiveLabel(_ name: String) -> String {
         return true
     }
     private func restart() {
-        audio.stop(); restoring = false; failed = false; monitor?.cancel(); fileMonitor?.cancel(); monitor = nil; fileMonitor = nil; lastPacket = nil; lastSourceSequence = -1; fileIdentity = nil
+        audio.stop(); restoring = false; failed = false; monitor?.cancel(); fileMonitor?.cancel(); monitor = nil; fileMonitor = nil
         store = nil; archiveStore = nil; archives = []; persistenceMessage = ""; migratingLegacy = false; count = 0
         do {
             guard let script = bundle.url(forResource: "pet-native", withExtension: "js") else { throw PetCoreError.invalid("The shared pet core is missing from this app.") }
@@ -118,7 +126,14 @@ public func petArchiveLabel(_ name: String) -> String {
             if !restoring { configureSound() }
         } catch { core = nil; message = error.localizedDescription }
     }
-    public func setLiveFile(_ url: URL) { stateURL = url; if source == .live { monitor?.cancel(); fileMonitor?.cancel(); watch(url) } }
+    public func setLiveFile(_ url: URL) {
+        let changed = stateURL != url; stateURL = url
+        if source == .live && !paused {
+            monitor?.cancel(); fileMonitor?.cancel()
+            do { if changed { try core?.resumeLiveInput() }; watch(url) }
+            catch { message = error.localizedDescription }
+        }
+    }
     public func interact(food: Bool) {
         do { try core?.interact(food: food); save() } catch { message = error.localizedDescription }
     }
@@ -166,6 +181,7 @@ public func petArchiveLabel(_ name: String) -> String {
         }
     }
     private func watch(_ url: URL) {
+        guard source == .live, stateURL == url, !paused else { return }
         // Watch the directory so atomic file replacement and initial creation work.
         let descriptor = open(url.deletingLastPathComponent().path, O_EVTONLY)
         guard descriptor >= 0 else { message = "Create the telemetry directory, then select Live again."; return }
@@ -174,28 +190,23 @@ public func petArchiveLabel(_ name: String) -> String {
         source.setCancelHandler { close(descriptor) }; monitor = source; source.resume(); watchContents(url)
     }
     private func watchContents(_ url: URL) {
-        guard source == .live, stateURL == url else { return }
+        guard source == .live, stateURL == url, !paused else { return }
         fileMonitor?.cancel(); fileMonitor = nil
-        let identity = (try? FileManager.default.attributesOfItem(atPath: url.path)[.systemFileNumber] as? NSNumber)?.uint64Value
-        if identity != fileIdentity { lastSourceSequence = -1; lastPacket = nil; fileIdentity = identity }
         let descriptor = open(url.path, O_EVTONLY)
-        guard descriptor >= 0 else { message = "Telemetry unavailable · unobserved"; return }
+        guard descriptor >= 0 else { _ = try? core?.acceptLiveTail(""); message = "Telemetry unavailable · unobserved"; return }
         let source = DispatchSource.makeFileSystemObjectSource(fileDescriptor: descriptor, eventMask: [.write, .rename, .delete], queue: .main)
         source.setEventHandler { [weak self] in Task { @MainActor in self?.readPacket(url) } }
         source.setCancelHandler { close(descriptor) }; fileMonitor = source; source.resume(); readPacket(url)
     }
     private func readPacket(_ url: URL) {
-        guard source == .live, stateURL == url else { return }
+        guard source == .live, stateURL == url, !paused else { return }
         do {
             let handle = try FileHandle(forReadingFrom: url); defer { try? handle.close() }
             let size = try handle.seekToEnd(); try handle.seek(toOffset: size > 262_144 ? size - 262_144 : 0)
-            let data = try handle.readToEnd() ?? Data()
-            guard data.last == 10, let text = String(data: data, encoding: .utf8), let last = text.split(separator: "\n").last else { return }
-            let packet = String(last); if packet == lastPacket { return }
-            guard let value = try JSONSerialization.jsonObject(with: Data(packet.utf8)) as? [String: Any], let sequence = value["sequence"] as? Int else { throw PetCoreError.invalid("Invalid telemetry packet.") }
-            if sequence <= lastSourceSequence { return }
-            try core?.accept(packet: packet); lastPacket = packet; lastSourceSequence = sequence; message = "Local telemetry connected"
-        } catch { message = "Telemetry unavailable · unobserved" }
+            let data = try handle.read(upToCount: 262_144) ?? Data()
+            try core?.acceptLiveTail(String(decoding: data, as: UTF8.self))
+            message = "Following local telemetry"
+        } catch { _ = try? core?.acceptLiveTail(""); message = "Telemetry unavailable · unobserved" }
         // Missing/unchanged input never falls back to a demo. The recorded 400ms
         // packet expires in the core and subsequent ticks are visibly unobserved.
     }

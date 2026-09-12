@@ -1,5 +1,5 @@
 import { PetWorld, type PetInteraction, type PetSegment } from './pet-world.js';
-import { compilePetTelemetry, decodePetJSONL } from './pet-telemetry.js';
+import { compilePetTelemetry, decodePetJSONL, PetLiveTape } from './pet-telemetry.js';
 import { ARCH_OF, digest, layout } from './pet-sim.js';
 import { renderPetPCM, type PetVoice } from './pet-audio.js';
 import { PetEngineTelemetry } from './pet-engine.js';
@@ -11,6 +11,7 @@ export class PetNative {
   private engine = new PetEngineTelemetry();
   private engineTick = 0;
   private segment?: PetSegment;
+  private liveTape = new PetLiveTape();
   constructor(pointsJSON: string, tapeJSONL = '', interactionsJSON = '[]', live = false, expressionVersion: 1 | 2 = 2) {
     const points = JSON.parse(pointsJSON) as [number, number][];
     if (!Array.isArray(points) || points.length !== 980 || points.some(p => !Array.isArray(p) || p.length !== 2 || !p.every(n => Number.isFinite(n) && Math.abs(n) <= 1)))
@@ -22,6 +23,11 @@ export class PetNative {
   interact(kind: PetInteraction['kind'], x: number, y: number): void { this.world.interact(kind, x, y); }
   interactions(): string { return JSON.stringify(this.world.interactions); }
   accept(packet: string): void { this.world.acceptTelemetry(JSON.parse(packet)); }
+  acceptLiveTail(text: string): boolean {
+    const packet = this.liveTape.readTail(text); if (!packet) return false;
+    this.world.acceptTelemetry(packet); return true;
+  }
+  resetLiveInput(): number { this.liveTape.reset(); return this.resumeEngine(); }
   recording(withCheckpoint = false): string { return JSON.stringify(this.world.recording(withCheckpoint)); }
   needsSegment(): boolean { return this.world.needsSegment; }
   prepareSegment(): string { this.segment = this.world.prepareSegment(); return JSON.stringify(this.segment.recording); }
@@ -36,15 +42,14 @@ export class PetNative {
     if (text.length > 8 * 1024 * 1024) throw new Error('Native habitat exceeds 8 MiB.');
     const points = this.world.sim.p.map(p => [p.hx, p.hy] as [number, number]);
     this.world = PetWorld.fromRecording(points, JSON.parse(text));
+    this.liveTape.reset();
     this.segment = undefined; this.engineTick = Math.round(this.world.frame.timeMs * 30 / 1000); this.engine = new PetEngineTelemetry();
   }
   /** Resume a live host at the first unrecorded bucket. Keep every accepted
    * interval, but never present its last observed frame as current evidence. */
   resumeEngine(): number {
-    const last = this.world.tape.at(-1);
-    const end = last ? (last.sequence + 1) * 12 : 0;
-    if (!end || end - this.engineTick > 24) throw new Error('Only a live recording can resume Engine observation.');
-    while (this.engineTick < end) { this.world.step(1 / 30, { motion: false, sensitivity: 1 }); this.engineTick++; }
+    this.world.resumeObservation();
+    this.engineTick = Math.round(this.world.frame.timeMs * 30 / 1000);
     this.engine = new PetEngineTelemetry();
     this.world.voices = [];
     return this.world.frame.timeMs;

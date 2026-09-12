@@ -19,6 +19,7 @@ class PetNative {
     engine = new pet_engine_js_1.PetEngineTelemetry();
     engineTick = 0;
     segment;
+    liveTape = new pet_telemetry_js_1.PetLiveTape();
     constructor(pointsJSON, tapeJSONL = '', interactionsJSON = '[]', live = false, expressionVersion = 2) {
         const points = JSON.parse(pointsJSON);
         if (!Array.isArray(points) || points.length !== 980 || points.some(p => !Array.isArray(p) || p.length !== 2 || !p.every(n => Number.isFinite(n) && Math.abs(n) <= 1)))
@@ -30,6 +31,14 @@ class PetNative {
     interact(kind, x, y) { this.world.interact(kind, x, y); }
     interactions() { return JSON.stringify(this.world.interactions); }
     accept(packet) { this.world.acceptTelemetry(JSON.parse(packet)); }
+    acceptLiveTail(text) {
+        const packet = this.liveTape.readTail(text);
+        if (!packet)
+            return false;
+        this.world.acceptTelemetry(packet);
+        return true;
+    }
+    resetLiveInput() { this.liveTape.reset(); return this.resumeEngine(); }
     recording(withCheckpoint = false) { return JSON.stringify(this.world.recording(withCheckpoint)); }
     needsSegment() { return this.world.needsSegment; }
     prepareSegment() { this.segment = this.world.prepareSegment(); return JSON.stringify(this.segment.recording); }
@@ -47,6 +56,7 @@ class PetNative {
             throw new Error('Native habitat exceeds 8 MiB.');
         const points = this.world.sim.p.map(p => [p.hx, p.hy]);
         this.world = pet_world_js_1.PetWorld.fromRecording(points, JSON.parse(text));
+        this.liveTape.reset();
         this.segment = undefined;
         this.engineTick = Math.round(this.world.frame.timeMs * 30 / 1000);
         this.engine = new pet_engine_js_1.PetEngineTelemetry();
@@ -54,14 +64,8 @@ class PetNative {
     /** Resume a live host at the first unrecorded bucket. Keep every accepted
      * interval, but never present its last observed frame as current evidence. */
     resumeEngine() {
-        const last = this.world.tape.at(-1);
-        const end = last ? (last.sequence + 1) * 12 : 0;
-        if (!end || end - this.engineTick > 24)
-            throw new Error('Only a live recording can resume Engine observation.');
-        while (this.engineTick < end) {
-            this.world.step(1 / 30, { motion: false, sensitivity: 1 });
-            this.engineTick++;
-        }
+        this.world.resumeObservation();
+        this.engineTick = Math.round(this.world.frame.timeMs * 30 / 1000);
         this.engine = new pet_engine_js_1.PetEngineTelemetry();
         this.world.voices = [];
         return this.world.frame.timeMs;
@@ -374,6 +378,16 @@ class PetWorld {
         world.frame = { ...structuredClone(c.frame), telemetry: telemetry ? structuredClone(telemetry) : undefined };
         world.voices = structuredClone(c.voices);
         return world;
+    }
+    /** Resume observation beyond all already accepted live packets, without
+     * replaying their sound or exposing a stale request as current work. */
+    resumeObservation() {
+        const last = this.tapeLog.at(-1), end = last ? (last.sequence + 1) * 12 : 0;
+        if (!end || end - this.tick > 24)
+            throw new Error('Only a live recording can resume observation.');
+        while (this.tick < end)
+            this.step(1 / 30, { motion: false, sensitivity: 1 });
+        this.voices = [];
     }
     /** Branch at the current playhead; input is journalled for the next fixed tick.
      * A live touch never needs to re-simulate the creature's entire lifetime. */
@@ -1040,7 +1054,7 @@ function runTape(sim, rows, opts) {
 factories["pet-telemetry"]=function(exports,require){
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.PET_BIN_MS = void 0;
+exports.PetLiveTape = exports.PET_BIN_MS = void 0;
 exports.validatePetBucket = validatePetBucket;
 exports.decodePetJSONL = decodePetJSONL;
 exports.compilePetTelemetry = compilePetTelemetry;
@@ -1073,6 +1087,44 @@ function decodePetJSONL(text) {
     return rows.map((row, i) => { validatePetBucket(row); if (row.sequence !== i)
         throw new Error('Non-contiguous pet tape.'); return row; });
 }
+/** A live file must advance before its contents count as a new observation.
+ * Existing bytes, duplicate samples and a restarted sequence establish a
+ * baseline; they never replay an old onset or human request. Drivers supply a
+ * bounded tail and reset this cursor after suspension or a new attachment. */
+class PetLiveTape {
+    sequence;
+    reset() { this.sequence = undefined; }
+    readTail(text) {
+        if (!text) {
+            this.reset();
+            return;
+        }
+        if (text.length > 262_144) {
+            this.reset();
+            throw new Error('Live pet input exceeds its tail limit.');
+        }
+        if (!text.endsWith('\n'))
+            return;
+        const line = text.trimEnd().split('\n').at(-1);
+        if (!line)
+            return;
+        let packet;
+        try {
+            packet = JSON.parse(line);
+            validatePetBucket(packet);
+        }
+        catch (error) {
+            this.reset();
+            throw error;
+        }
+        const previous = this.sequence;
+        this.sequence = packet.sequence;
+        if (previous === undefined || packet.sequence <= previous)
+            return;
+        return packet;
+    }
+}
+exports.PetLiveTape = PetLiveTape;
 const order = (a, b) => a < b ? -1 : a > b ? 1 : 0;
 const keyOf = (e) => JSON.stringify([e.traceId, e.id]);
 const isContainer = (e) => e.attributes['whalesong.container'] === true

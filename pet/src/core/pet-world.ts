@@ -266,6 +266,15 @@ export class PetWorld {
     return world;
   }
 
+  /** Resume observation beyond all already accepted live packets, without
+   * replaying their sound or exposing a stale request as current work. */
+  resumeObservation(): void {
+    const last = this.tapeLog.at(-1), end = last ? (last.sequence + 1) * 12 : 0;
+    if (!end || end - this.tick > 24) throw new Error('Only a live recording can resume observation.');
+    while (this.tick < end) this.step(1 / 30, { motion: false, sensitivity: 1 });
+    this.voices = [];
+  }
+
   /** Branch at the current playhead; input is journalled for the next fixed tick.
    * A live touch never needs to re-simulate the creature's entire lifetime. */
   interact(kind: PetInteraction['kind'], x: number, y: number): void {

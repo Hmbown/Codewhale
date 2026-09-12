@@ -121,7 +121,18 @@ old saved habitats replayable while letting new worlds change their visual form.
 The older TSV is a particle conformance tape and cannot preserve audio onsets.
 
 macOS watches `~/.codewhale/pet-state`. iOS watches `pet-state` in Documents.
-File replacement and source restart are handled by the existing host watchers.
+Android uses More → Follow local tape to select a seekable device document.
+The browser's Follow local tape uses a user-granted File System Access handle.
+All three file readers use the same shared live cursor: the first complete packet
+establishes a baseline, and only an advancing sequence becomes an observation.
+Duplicate input, a restarted sequence, or bytes read during suspension cannot
+replay an old onset or human request. Missing/invalid input expires to unknown;
+resuming advances beyond already accepted input without replaying its sound.
+Apple watches appends and directory replacement. Android reads a bounded 256 KiB
+tail on an IO worker, closes it on pause/background, and discards delayed delivery.
+The file must be updated by a producer; selecting a completed tape does not make
+it live. Use Import to replay that tape. Device files are not automatically synced
+from the desktop recorder.
 Authenticated read-only attachment has been exercised against a running local
 Runtime 0.9.13 and an existing session journal. Old completed work remains unknown
 at the recorder's current clock. The recorder also closes an idle stream after
@@ -134,7 +145,7 @@ The browser commits checkpoint and recording together with an optimistic
 IndexedDB revision. A saved live source reopens as Replay until explicitly
 reattached. TUI Watch saves under the owning session's `artifacts/pet/habitat.json`;
 Apple hosts keep source-specific files in Application Support/CodewhalePet.
-Android keeps separate wild/demo/recording habitats in private app storage.
+Android keeps separate wild/demo/recording/live habitats in private app storage.
 Native writes are private and atomic, use a writer lock and content revision,
 and preserve corrupt files or external edits. Recovery is visible in the UI.
 

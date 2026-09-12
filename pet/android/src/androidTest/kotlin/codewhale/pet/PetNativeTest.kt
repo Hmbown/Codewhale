@@ -17,6 +17,35 @@ class PetNativeTest {
     private fun asset(name: String) = context.assets.open(name).bufferedReader().use { it.readText() }
     private fun core(saved: String? = null) = PetNativeCore(asset("pet-native.js"), asset("whale-points.tsv"), asset("demo.jsonl"), saved)
 
+    @Test fun liveResumeKeepsNativeGeometryAlignedAndDoesNotReplayHumanInput() {
+        val human = asset("demo.jsonl").lineSequence().filter { it.isNotBlank() }.map(::JSONObject)
+            .first { it.getString("channel") == "human" && it.getBoolean("waiting") }.toString()
+        fun packet(sequence: Int) = JSONObject(human).put("sequence", sequence).put("simTimeMs", sequence * 400).toString() + "\n"
+        PetNativeCore(asset("pet-native.js"), asset("whale-points.tsv"), live = true).use { world ->
+            repeat(90) { world.tick(true) }
+            assertFalse(world.acceptLiveTail(packet(10)))
+            assertTrue(world.acceptLiveTail(packet(11)))
+            repeat(12) { world.tick(true) }
+            assertEquals("human", world.scene().state.channel)
+            val before = world.timeMs
+            world.resumeLiveInput()
+            assertTrue(world.timeMs - before in 0.0..800.0)
+            assertEquals(0.0, world.scene().state.observed, 0.0)
+            assertEquals("none", world.scene().needs)
+            assertEquals(0, world.voices.length())
+            assertEquals(world.scene().digest, petDigest(world.sim))
+            assertFalse(world.acceptLiveTail(packet(12)))
+            assertTrue(world.acceptLiveTail(packet(13)))
+            repeat(12) { assertEquals(world.tick(true).digest, petDigest(world.sim)) }
+            assertEquals("human", world.scene().state.channel)
+            PetNativeCore(asset("pet-native.js"), asset("whale-points.tsv"), saved = world.recording(), live = true).use { restored ->
+                assertEquals(0.0, restored.scene().state.observed, 0.0)
+                assertEquals(restored.scene().digest, petDigest(restored.sim))
+                assertFalse(restored.acceptLiveTail(packet(14)))
+            }
+        }
+    }
+
     @Test fun nativeRendererMatchesEverySharedWorldFrameAndResumesCheckpoint() {
         for (motion in listOf(true, false)) {
             core().use { world ->

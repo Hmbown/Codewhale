@@ -70,6 +70,7 @@ class PetActivity : ComponentActivity() {
 private fun PetScreen(model: PetViewModel) {
     val ui by model.ui.collectAsStateWithLifecycle()
     val import = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { it?.let(model::importRecording) }
+    val follow = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { it?.let(model::followLocalTape) }
     val export = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/json")) { it?.let(model::exportRecording) }
     val recovery = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/json")) { it?.let(model::exportRecovery) }
     var selectedArchive by rememberSaveable { mutableStateOf<String?>(null) }
@@ -106,6 +107,7 @@ private fun PetScreen(model: PetViewModel) {
                 TextButton(onClick = { menu = true }) { Text("More") }
                 DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
                     DropdownMenuItem(text = { Text("Import recording") }, onClick = { menu = false; import.launch(arrayOf("application/json", "text/plain", "application/octet-stream")) })
+                    DropdownMenuItem(text = { Text("Follow local tape") }, onClick = { menu = false; follow.launch(arrayOf("*/*")) })
                     DropdownMenuItem(text = { Text("Export recording") }, enabled = ui.scene != null, onClick = { menu = false; export.launch("codewhale-pet.json") })
                     DropdownMenuItem(text = { Text("Earlier recordings") }, enabled = ui.archives.isNotEmpty(), onClick = { menu = false; showArchives = true })
                     DropdownMenuItem(text = { Text("Reopen saved habitat") }, onClick = { menu = false; reload = true })
@@ -152,7 +154,7 @@ private fun Habitat(ui: PetUiState, modifier: Modifier) {
 private fun Controls(ui: PetUiState, model: PetViewModel, modifier: Modifier) {
     Column(modifier.padding(horizontal = 18.dp, vertical = 8.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
         FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            listOf(PetMode.WILD, PetMode.DEMO).forEach { mode ->
+            (listOf(PetMode.WILD, PetMode.DEMO) + if (ui.canFollowLive) listOf(PetMode.LIVE) else emptyList()).forEach { mode ->
                 FilterChip(selected = ui.mode == mode, onClick = { model.mode(mode) }, label = { Text(mode.label) })
             }
             if (ui.mode == PetMode.RECORDING) FilterChip(selected = true, onClick = {}, label = { Text("Recording") })

@@ -1,5 +1,5 @@
 import { PetWorld, PET_MAX_SECONDS, type PetInteraction, type PetWorldCheckpoint } from '../core/pet-world.js';
-import { compilePetTelemetry, decodePetJSONL, validatePetBucket, type PetBucket } from '../core/pet-telemetry.js';
+import { compilePetTelemetry, decodePetJSONL, PetLiveTape, type PetBucket } from '../core/pet-telemetry.js';
 import { petDemoEvents } from '../core/pet-demo.js';
 import { importTrace } from '../core/ingest.js';
 import { layout } from '../core/pet-sim.js';
@@ -19,6 +19,8 @@ let world: PetWorld, seconds = 0, last = 0, accumulator = 0, paused = false;
 let restoring = false, generation = 0, liveGeneration = 0, liveTimer = 0;
 let imported: { world: PetWorld; name: string } | undefined;
 const library = new TraceLibrary();
+const liveTape = new PetLiveTape();
+let liveObservation = 0;
 let savedRevision: number | undefined, saving: Promise<boolean> | undefined, persistenceReady = false, persistenceFailed = false;
 let audio: AudioContext | undefined, anchor = 0, sound = false;
 const playing = new Set<AudioBufferSourceNode>();
@@ -69,7 +71,7 @@ function adoptWorld(next: PetWorld) {
   if (audio) anchor = audio.currentTime - seconds + .08;
   draw();
 }
-function stopFollowing() { liveGeneration++; clearTimeout(liveTimer); get<HTMLButtonElement>('pause').disabled = false; seek.disabled = false; }
+function stopFollowing() { liveGeneration++; clearTimeout(liveTimer); liveTape.reset(); get<HTMLButtonElement>('pause').disabled = false; seek.disabled = false; }
 async function refreshArchives() {
   const list = get<HTMLSelectElement>('archive');
   const entries = await library.petArchives();
@@ -233,28 +235,33 @@ get('follow').onclick = async () => {
     get<HTMLButtonElement>('pause').disabled = true; seek.disabled = true;
     expressionVersion = 2; tape = compilePetTelemetry([]); interactions = []; seek.max = '120';
     source.textContent = `Live local tape · ${file.name}`; await rebuild();
-    let lastSequence = -1, lastSize = -1;
     const poll = async () => {
       if (ticket !== liveGeneration) return;
+      if (document.hidden) { liveTimer = window.setTimeout(poll, 400); return; }
+      const observation = liveObservation;
       try {
         const current = await handle.getFile();
         const tail = await current.slice(Math.max(0, current.size - 262_144)).text();
         if (ticket !== liveGeneration) return;
-        if (restoring) { liveTimer = window.setTimeout(poll, 400); return; }
-        if (current.size < lastSize) lastSequence = -1;
-        lastSize = current.size;
-        if (tail.endsWith('\n')) {
-          const packet = JSON.parse(tail.trimEnd().split('\n').at(-1) ?? '{}'); validatePetBucket(packet);
-          if (packet.sequence > lastSequence) { world.acceptTelemetry(packet); tape = world.tape; lastSequence = packet.sequence; }
-          message.textContent = 'Following local telemetry. Unchanged or unavailable input becomes an unobserved gap.';
-        }
-      } catch { if (ticket === liveGeneration) message.textContent = 'Local tape unavailable or invalid · unobserved. Select the file again if it was replaced.'; }
+        if (restoring || document.hidden || observation !== liveObservation) { liveTimer = window.setTimeout(poll, 400); return; }
+        const packet = liveTape.readTail(tail);
+        if (packet) { world.acceptTelemetry(packet); tape = world.tape; }
+        message.textContent = 'Following local telemetry. Existing or unchanged input stays unobserved until new packets arrive.';
+      } catch { if (ticket === liveGeneration && observation === liveObservation) { liveTape.reset(); message.textContent = 'Local tape unavailable or invalid · unobserved. Select the file again if it was replaced.'; } }
       if (ticket === liveGeneration) liveTimer = window.setTimeout(poll, 400);
     };
     await poll();
   } catch (error) { if (!(error instanceof DOMException && error.name === 'AbortError')) message.textContent = 'Unable to open this local tape.'; }
 };
-document.addEventListener('visibilitychange', () => { last = 0; silence(); void persist(); if (audio) anchor = audio.currentTime - seconds + .08; });
+document.addEventListener('visibilitychange', () => {
+  last = 0; silence();
+  if (worldMode === 'live') {
+    liveObservation++;
+    liveTape.reset();
+    if (!document.hidden && world && !restoring) { world.resumeObservation(); seconds = world.frame.timeMs / 1000; }
+  }
+  void persist(); if (audio) anchor = audio.currentTime - seconds + .08;
+});
 window.addEventListener('pagehide', () => { void persist(); });
 function animate(now: number) {
   if (world && !restoring && !paused && !document.hidden) {

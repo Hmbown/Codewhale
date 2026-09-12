@@ -37,6 +37,28 @@ export function decodePetJSONL(text: string): PetBucket[] {
   return rows.map((row, i) => { validatePetBucket(row); if (row.sequence !== i) throw new Error('Non-contiguous pet tape.'); return row; });
 }
 
+/** A live file must advance before its contents count as a new observation.
+ * Existing bytes, duplicate samples and a restarted sequence establish a
+ * baseline; they never replay an old onset or human request. Drivers supply a
+ * bounded tail and reset this cursor after suspension or a new attachment. */
+export class PetLiveTape {
+  private sequence: number | undefined;
+  reset(): void { this.sequence = undefined; }
+  readTail(text: string): PetBucket | undefined {
+    if (!text) { this.reset(); return; }
+    if (text.length > 262_144) { this.reset(); throw new Error('Live pet input exceeds its tail limit.'); }
+    if (!text.endsWith('\n')) return;
+    const line = text.trimEnd().split('\n').at(-1);
+    if (!line) return;
+    let packet: unknown;
+    try { packet = JSON.parse(line); validatePetBucket(packet); }
+    catch (error) { this.reset(); throw error; }
+    const previous = this.sequence; this.sequence = packet.sequence;
+    if (previous === undefined || packet.sequence <= previous) return;
+    return packet;
+  }
+}
+
 const order = (a: string, b: string) => a < b ? -1 : a > b ? 1 : 0;
 const keyOf = (e: WhaleEvent) => JSON.stringify([e.traceId, e.id]);
 const isContainer = (e: WhaleEvent) => e.attributes['whalesong.container'] === true

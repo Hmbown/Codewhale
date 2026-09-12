@@ -28,7 +28,19 @@ Checkpoint-bearing recordings resume their exact world; exports without a
 checkpoint replay from the segment's start (or time zero for version 1). Missing expression versions retain v1.
 Both kinds can be exported again. Autosave and native import are bounded to
 8 MiB. Export includes the current checkpoint and writes small chunks through a
-private staging file, up to 64 MiB; larger-than-autosave files open in the browser. There is no live companion connection yet.
+private staging file, up to 64 MiB; larger-than-autosave files open in the browser.
+
+More → Follow local tape selects a seekable document through Android's file
+picker. A local producer must keep appending canonical PetBucket JSONL to it;
+desktop recorder output is not automatically transferred to the device. The
+first complete packet establishes a baseline. Only later sequence advancement
+is observed, so selecting an old file cannot resurrect its last human request.
+The shared cursor also handles sequence restarts, invalid input and duplicates.
+Polling reads at most 256 KiB every 400 ms on an IO worker. Pause/background
+closes the reader; resume establishes a fresh baseline and discards old sound.
+Unavailable, non-seekable or delayed files leave the live world unobserved.
+The selected document's read grant and URI are retained when its provider permits;
+use Follow again if access expires. This adds no network permission.
 
 Sound starts off on each process launch. One native AudioTrack receives the
 core's stereo 48 kHz float PCM. A bounded queue drops late output. Pause,
@@ -51,11 +63,15 @@ cover that binding's older runtime. There are no Java host bindings or remote
 script loads. Gradle packages `../ios/Resources/pet-native.js` and its demo
 directly; run `npm --prefix pet run sync` after changing the canonical core.
 
-Nine instrumentation tests exercise the real embedded engine, 4,800 shared
+Eleven instrumentation tests exercise the real embedded engine, 4,800 shared
 world frames and Kotlin digests, 3,000 additional checkpoint continuation
 frames, version/import boundaries, sample-exact PCM, atomic storage/recovery,
 the Compose pause/still/audio/background lifecycle, and recovery export after
 a store conflict or with 90,000 pending interactions beyond the autosave limit.
 They also check segment publication, exact continuation, archive corruption and
-native restoration of long particle clocks beyond the former 24-hour limit. The separate
+native restoration of long particle clocks beyond the former 24-hour limit.
+Live tests use an instrumentation-only document provider to exercise actual
+ContentResolver/descriptor reads, the ViewModel and Compose lifecycle, producer
+restart and malformed input. The native live-resume test checks Kotlin geometry
+against the resumed shared checkpoint and verifies that old requests stay unknown. The separate
 `verify.sh` retains all 380 pure Kotlin conformance checkpoints.

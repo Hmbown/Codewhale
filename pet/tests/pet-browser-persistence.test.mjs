@@ -10,10 +10,10 @@ import * as sim from '../dist/core/pet-sim.js';
 import * as audio from '../dist/core/pet-audio.js';
 
 /** Run the compiled browser controller and real world with minimal DOM sinks.
- * Only storage completion is controlled: this tests the async caller contract,
- * not IndexedDB's transaction implementation or browser rendering. */
-async function browser() {
-  const nodes = new Map(), saves = [], intervals = [];
+ * Storage and file-read completion are controlled: this tests async caller
+ * contracts, not IndexedDB transactions, file-picker grants or rendering. */
+async function browser({ deferFirstSave = true, handle } = {}) {
+  const nodes = new Map(), saves = [], intervals = [], timers = [], listeners = new Map();
   let complete, fail, confirmations = 0;
   const context = new Proxy({}, { get: (object, key) => object[key] ?? (() => {}) });
   const node = id => {
@@ -28,7 +28,7 @@ async function browser() {
     async petArchives() { return []; }
     saveHabitat(habitat, revision, archive) {
       saves.push(structuredClone({ habitat, revision, archive }));
-      if (saves.length === 1) return new Promise((resolve, reject) => { complete = resolve; fail = reject; });
+      if (deferFirstSave && saves.length === 1) return new Promise((resolve, reject) => { complete = resolve; fail = reject; });
       return Promise.resolve(saves.length);
     }
   }
@@ -36,16 +36,20 @@ async function browser() {
   // Imports bind to the real core above, while the controller body stays intact.
   const controller = (await readFile(new URL('../dist/ui/pet.js', import.meta.url), 'utf8')).replace(/^import .*;\r?\n/gm, '');
   const environment = { ...world, ...telemetry, ...demo, ...ingest, ...sim, ...audio, TraceLibrary,
-    document: { hidden: false, getElementById: node, addEventListener() {} },
-    window: { addEventListener() {}, confirm() { confirmations++; return false; } },
+    document: { hidden: false, getElementById: node, addEventListener: (name, callback) => listeners.set(name, callback) },
+    window: { addEventListener() {}, confirm() { confirmations++; return false; },
+      showOpenFilePicker: handle ? async () => [handle] : undefined,
+      setTimeout: callback => timers.push(callback) },
     matchMedia: () => ({ matches: false, addEventListener() {} }),
     fetch: async () => ({ ok: true, text: async () => points }),
     Option: class {}, requestAnimationFrame() {}, setInterval: callback => intervals.push(callback),
     setTimeout, clearTimeout, structuredClone, TextEncoder, devicePixelRatio: 1 };
-  await vm.runInNewContext(`(async () => { ${controller}\n })()`, environment);
+  const inspect = await vm.runInNewContext(`(async () => { ${controller}\n return () => world.recording(true); })()`, environment);
   assert.equal(intervals.length, 1, 'Controller starts its autosave after loading');
   return { node, saves, autosave: intervals[0], complete: () => complete(1), fail: () => fail(new Error('Disk unavailable')),
-    confirmations: () => confirmations };
+    confirmations: () => confirmations, recording: () => structuredClone(inspect()),
+    poll: () => { assert.ok(timers.length); return timers.shift()(); },
+    visibility: hidden => { environment.document.hidden = hidden; listeners.get('visibilitychange')(); } };
 }
 
 test('browser source change waits for autosave and archives inputs accepted during that save', async () => {
@@ -77,4 +81,29 @@ test('browser failed autosave asks before leaving and cancel preserves the curre
   assert.equal(page.confirmations(), 1);
   assert.equal(page.node('mode').value, 'wild');
   assert.equal(page.saves.length, 1, 'No archive or replacement after the failed write');
+});
+
+test('browser live follow discards a read crossing suspension and primes the resumed file', async () => {
+  const human = telemetry.compilePetTelemetry(demo.petDemoEvents()).find(b => b.waiting);
+  const file = sequence => {
+    const text = telemetry.encodePetJSONL([{ ...human, sequence, simTimeMs: sequence * 400 }]);
+    return { name: 'local.jsonl', size: text.length, slice: () => ({ text: async () => text }) };
+  };
+  let current = file(10), pending;
+  const handle = { getFile: async () => current };
+  const page = await browser({ deferFirstSave: false, handle });
+  await page.node('follow').onclick();
+  assert.equal(page.recording().tape.length, 1, 'Existing file is not a live observation');
+  handle.getFile = () => new Promise(resolve => { pending = resolve; });
+  const reading = page.poll();
+  page.visibility(true); page.visibility(false);
+  pending(file(11)); await reading;
+  assert.equal(page.recording().tape.length, 1, 'Do not prime from a read started before suspension');
+  handle.getFile = async () => current;
+  current = file(12); await page.poll();
+  assert.equal(page.recording().tape.length, 1, 'The first resumed read establishes the new baseline');
+  current = file(13); await page.poll();
+  assert.equal(page.recording().tape.at(-1).channel, 'human');
+  assert.equal(page.recording().tape.length, 2);
+  await page.poll(); assert.equal(page.recording().tape.length, 2, 'Duplicate reads add no onsets');
 });

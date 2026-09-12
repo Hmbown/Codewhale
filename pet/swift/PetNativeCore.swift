@@ -52,11 +52,7 @@ public enum PetCoreError: Error, LocalizedError {
         self.frame = try JSONDecoder().decode(PetWorldFrame.self, from: Data(text.utf8))
         self.sim = PetSim(points: points, expressionVersion: expressionVersion)
         if saved != nil {
-            struct Projection: Decodable { let sim: PetParticleCheckpoint }
-            guard let text = world.invokeMethod("checkpoint", withArguments: [])?.toString(), context.exception == nil
-            else { throw PetCoreError.invalid(context.exception?.toString() ?? "Unable to restore the particle renderer.") }
-            try sim.restoreValidated(JSONDecoder().decode(Projection.self, from: Data(text.utf8)).sim)
-            guard petDigest(sim) == frame.digest else { throw PetCoreError.invalid("The restored particle renderer differs from the shared world.") }
+            try restoreProjection()
         }
         context.exceptionHandler = { [weak self] _, error in self?.failure = error?.toString() ?? "Pet runtime failed." }
     }
@@ -86,6 +82,25 @@ public enum PetCoreError: Error, LocalizedError {
         failure = nil
         world.invokeMethod("accept", withArguments: [packet])
         if let failure { throw PetCoreError.invalid(failure) }
+    }
+    @discardableResult public func acceptLiveTail(_ text: String) throws -> Bool {
+        failure = nil
+        guard let value = world.invokeMethod("acceptLiveTail", withArguments: [text]), failure == nil else { throw PetCoreError.invalid(failure ?? "Unable to read local telemetry.") }
+        return value.toBool()
+    }
+    public func resumeLiveInput() throws {
+        failure = nil
+        world.invokeMethod("resetLiveInput", withArguments: [])
+        guard failure == nil, let text = world.invokeMethod("snapshot", withArguments: [])?.toString(), failure == nil else { throw PetCoreError.invalid(failure ?? "Unable to resume live telemetry.") }
+        frame = try JSONDecoder().decode(PetWorldFrame.self, from: Data(text.utf8))
+        try restoreProjection()
+    }
+    private func restoreProjection() throws {
+        struct Projection: Decodable { let sim: PetParticleCheckpoint }
+        guard let text = world.invokeMethod("checkpoint", withArguments: [])?.toString(), context.exception == nil
+        else { throw PetCoreError.invalid(context.exception?.toString() ?? "Unable to restore the particle renderer.") }
+        try sim.restoreValidated(JSONDecoder().decode(Projection.self, from: Data(text.utf8)).sim)
+        guard petDigest(sim) == frame.digest else { throw PetCoreError.invalid("The restored particle renderer differs from the shared world.") }
     }
     public func recording(checkpoint: Bool = false) throws -> Data {
         failure = nil

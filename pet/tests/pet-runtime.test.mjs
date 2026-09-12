@@ -109,8 +109,8 @@ test('the CLI follows real Runtime SSE envelopes through disconnect and cursor r
   assert.doesNotMatch(text + log, /fixture-private-text|fixture-token/);
 });
 
-test('live Runtime recording retains human waits and a brief late failure exactly once between timer ticks', { timeout: 12_000 }, async t => {
-  let sequence = 0, response;
+test('live Runtime recording retains human waits and a brief late failure exactly once between timer ticks', { timeout: 15_000 }, async t => {
+  let sequence = 0, response, answer;
   const timers = [], requests = [];
   const server = createServer((req, res) => {
     requests.push({ method: req.method, url: req.url }); response = res;
@@ -123,7 +123,7 @@ test('live Runtime recording retains human waits and a brief late failure exactl
     emit('item.started', { item: { id: 'old-work', kind: 'tool_call', status: 'running', started_at: oldStart }, tool: 'bash' });
     timers.push(setTimeout(() => emit('user_input.required', { id: 'question', request: { questions: ['fixture-private-question'] } }), 110));
     timers.push(setTimeout(() => emit('item.completed', { item: { id: 'old-work', kind: 'tool_call', status: 'failed', started_at: oldStart, ended_at: oldEnd, detail: 'fixture-private-result' }, tool: 'bash' }), 650));
-    timers.push(setTimeout(() => emit('user_input.answered', { input_id: 'question', answers: ['fixture-private-answer'] }), 1900));
+    answer = () => emit('user_input.answered', { input_id: 'question', answers: ['fixture-private-answer'] });
   });
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   const dir = await mkdtemp(join(tmpdir(), 'pet-runtime-lifecycle-')), output = join(dir, 'pet.jsonl');
@@ -133,7 +133,22 @@ test('live Runtime recording retains human waits and a brief late failure exactl
   child.stdout.on('data', b => log += b); child.stderr.on('data', b => log += b);
   t.after(async () => { timers.forEach(clearTimeout); if (child.exitCode === null) child.kill('SIGTERM'); response?.destroy(); server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); });
   for (let i = 0; !response && i < 100; i++) await delay(20);
-  assert.ok(response, log); await delay(3300);
+  assert.ok(response, log);
+  const waitForTape = async (condition, message) => {
+    for (let i = 0; i < 125; i++) {
+      let text = '';
+      try { text = await readFile(output, 'utf8'); } catch (error) { if (error.code !== 'ENOENT') throw error; }
+      const rows = decodePetJSONL(text.slice(0, text.lastIndexOf('\n') + 1));
+      if (condition(rows)) return;
+      await delay(40);
+    }
+    assert.fail(message + '\n' + log);
+  };
+  // Drive the answer after actual recorded coverage. Wall-clock sleeps alone
+  // can stop the child before it seals the final unknown bins on a busy runner.
+  await waitForTape(rows => rows.filter(b => b.waiting).length >= 3 && rows.some(b => b.errors), 'Waiting/error receipts were not recorded');
+  answer();
+  await waitForTape(rows => rows.length >= 2 && rows.slice(-2).every(b => !b.waiting && !b.observed), 'Answered input did not expire to unknown');
   child.kill('SIGINT'); const [code] = await exited; assert.equal(code, 0, log);
   const text = await readFile(output, 'utf8'), tape = decodePetJSONL(text);
   assert.equal(tape.reduce((sum, b) => sum + b.errors, 0), 1);

@@ -17,11 +17,12 @@ npm test
 npm run check:web
 ```
 
-The pet suite currently contains 44 tests: event occupancy/unknown coverage,
+The pet suite currently contains 48 tests: event occupancy/unknown coverage,
 late failures, human request pairing, read-only local SSE reconnect/cursor
 recovery and cancellation after garbage collection, deterministic world/score/PCM,
 checkpoint integrity and continuation, immutable segment boundaries, pending input
-retention, browser saves overlapping source changes, expression-version validation and legacy replay.
+retention, browser saves overlapping source changes, live-file freshness/restarts,
+delayed browser reads crossing suspension, expression-version validation and legacy replay.
 The standalone verifier compares 380 checkpoints across baseline and edge tapes,
 each animated and still, under expression versions 1 and 2. Version 1 must also
 match pinned pre-transformation golden digests. Omission of Swift is explicit in its output.
@@ -63,7 +64,8 @@ script generates and builds the Simulator project directly from the shared
 source, without first building macOS. Open `pet/ios/CodewhalePet.xcodeproj` to run.
 `check-apple.sh` compiles the actual host and runs checkpoint/storage/recovery
 workflows, including a generated two-hour synthetic unknown recording, segment
-publication and a save conflict that must preserve the running world. It writes
+publication, a save conflict that must preserve the running world, and actual
+live-file appends, pause/resume, in-place restarts, replacement and recreation. It writes
 only disposable fixtures under ignored conformance results and temporary storage.
 Kotlin 2.3.0 can instead be on PATH; its verifier builds only the particle core
 and conformance runner. The actual Compose application is a separate Gradle build:
@@ -75,8 +77,10 @@ cd pet/android
 ```
 
 Use JDK 17 and Android SDK 35; connect a device/emulator for the second command.
-The nine instrumentation tests run the real QuickJS binding, Kotlin renderer,
-PCM cursor, storage/recovery, immutable segments and Compose lifecycle. See [Android](android/README.md).
+The eleven instrumentation tests run the real QuickJS binding, Kotlin renderer,
+PCM cursor, storage/recovery, immutable segments and Compose lifecycle. A test-only
+document provider delivers synthetic bytes through real descriptor IO; live pause,
+background, restart and malformed input reach the actual ViewModel. See [Android](android/README.md).
 
 ## Review direction
 
@@ -89,7 +93,7 @@ open junctions; the same particle identities return to the whale at rest.
 
 ## Local evidence before publication (2026-09-12)
 
-- Packaged pet: 44 tests passed; existing Whalesong consumers: 306 passed after
+- Packaged pet: 48 tests passed; existing Whalesong consumers: 306 passed after
   canonical source relocation. These are overlapping suites, not additive coverage.
 - Product Node gate: 66 package, 12 SDK and 446 web tests passed; production web
   check subsequently passed with the GitHub release fetch available.
@@ -101,9 +105,10 @@ open junctions; the same particle identities return to the whale at rest.
   tests with one outdated Watch-tab golden; that header was corrected. Subsequent
   hosted product CI on `e69e99b` passed Linux, macOS and Windows tests, Rust lint
   and the applicable safety/security checks. Each later commit needs its own verdict.
-- Apple: ten checkpoint workflows passed; iOS Simulator exercised two-hour
+- Apple: eleven checkpoint/live-file workflows passed; iOS Simulator exercised two-hour
   restoration and visible corruption recovery without overwriting the damaged file.
-- Android: debug APK and lint build pass; nine instrumentation tests pass on
+- Android: debug APK and lint build pass; nine native tests and both Compose
+  lifecycle tests pass on
   Android 15 ARM64, including 4,800 frames, checkpoint continuation, exact PCM,
   lifecycle and storage recovery. The emulator audio sink runs without host
   speaker output; this does not establish physical listening or power quality.
@@ -133,6 +138,16 @@ open junctions; the same particle identities return to the whale at rest.
   worlds and accepting an input. The previous `5c70db4` controller fails by
   treating the pending save as a failure; the correction waits, archives the new
   input, and still preserves the source when a real failed save is canceled.
+- Live freshness: the previous `45a1130` browser controller fails the stale-file
+  attachment regression. Its native core also throws on live resume after normal
+  host ticking because the Engine-only clock has not advanced. The shared resume
+  path now uses the world clock, drops old voices and retains an exact checkpoint.
+  Browser tests also discard a read started before suspension; this is controller
+  evidence, not a claim about a physical device or browser file-picker support.
+- Runtime fixture timing: the HTTP test now waits for recorded waiting/error
+  coverage before answering, and for two sealed unknown bins before stopping.
+  Its former fixed sleep occasionally stopped the child before those final bins
+  on a busy runner. The receipt assertions and privacy checks remain unchanged.
 - Authenticated read-only attachment to an existing local Runtime 0.9.13 session
   journal passed. An 18-second recorder run produced 45 contiguous unknown buckets
   and stopped cleanly in 41 ms after Ctrl+C, without treating historical work as
