@@ -15,17 +15,106 @@ import { describe, expect, it } from "vitest";
 
 import {
   NO_TARGET,
+  acknowledgeDraft,
   canReply,
   collectProviderModelPages,
+  filterModels,
+  messageBlocks,
+  persistDrafts,
+  readDrafts,
   refusalMessage,
   receiptPresentation,
   resolveApprovalTarget,
   resolveReplyTarget,
   sessionTarget,
+  saveDraft,
   streamCursor,
   threadTarget,
   workflowReceiptPresentation,
 } from "./app.mjs";
+
+describe("tab-scoped drafts", () => {
+  function storage() {
+    const values = new Map();
+    return {
+      getItem: (key) => values.get(key),
+      setItem: (key, value) => values.set(key, value),
+      removeItem: (key) => values.delete(key),
+    };
+  }
+
+  it("restores separate drafts after a reload and keeps recently edited threads", () => {
+    const cache = storage();
+    const drafts = new Map();
+    for (let index = 0; index < 55; index++) saveDraft(drafts, `thread-${index}`, `draft ${index}`);
+    saveDraft(drafts, "thread-0", "newer draft");
+    expect(persistDrafts(cache, drafts)).toBe(true);
+    const restored = readDrafts(cache);
+    expect(restored.size).toBe(50);
+    expect(restored.get("thread-0")).toBe("newer draft");
+    expect(restored.get("thread-54")).toBe("draft 54");
+    expect(restored.has("thread-1")).toBe(false);
+  });
+
+  it("does not erase a different thread or newer text when a send completes", () => {
+    const drafts = new Map([["a", "submitted"], ["b", "still writing"]]);
+    expect(acknowledgeDraft(drafts, "a", "submitted")).toBe(true);
+    expect(drafts.get("b")).toBe("still writing");
+    saveDraft(drafts, "a", "a newer draft");
+    expect(acknowledgeDraft(drafts, "a", "submitted")).toBe(false);
+    expect(drafts.get("a")).toBe("a newer draft");
+  });
+
+  it("rejects malformed storage and safely falls back when storage is unavailable", () => {
+    for (const value of ["not json", "{}", "null", '[["a",{}],[null,"b"]]', "x".repeat(200_001)]) {
+      expect(readDrafts({ getItem: () => value }).size).toBe(0);
+    }
+    expect(readDrafts({ getItem: () => { throw new Error("blocked"); } }).size).toBe(0);
+    expect(persistDrafts(null, new Map([["a", "draft"]]))).toBe(false);
+    const cache = storage();
+    persistDrafts(cache, new Map([["a", "old draft"]]));
+    cache.setItem = () => { throw new Error("quota"); };
+    expect(persistDrafts(cache, new Map([["a", "new draft"]]))).toBe(false);
+    expect(readDrafts(cache).size).toBe(0);
+  });
+
+  it("does not claim an oversized draft was backed up or restore an outdated backup", () => {
+    const cache = storage();
+    persistDrafts(cache, new Map([["a", "old draft"]]));
+    const draft = "a".repeat(100_001);
+    const drafts = new Map([["a", draft]]);
+    expect(persistDrafts(cache, drafts)).toBe(false);
+    expect(readDrafts(cache).size).toBe(0);
+    expect(drafts.get("a")).toBe(draft);
+  });
+});
+
+describe("readable model output", () => {
+  it("separates fenced code while preserving literal hostile text and URLs", () => {
+    const hostile = '<img src=x onerror=alert(1)>';
+    expect(messageBlocks(`${hostile}\n\n\`\`\`html\n${hostile}\n\`\`\`\nhttps://example.test`)).toEqual([
+      { kind: "text", text: `${hostile}\n`, language: "" },
+      { kind: "code", text: hostile, language: "html" },
+      { kind: "text", text: "https://example.test", language: "" },
+    ]);
+  });
+
+  it("preserves nested shorter fences and unfinished code", () => {
+    expect(messageBlocks('````md\n```js\nlet x = 1;\n```\n````')).toEqual([
+      { kind: "code", text: '```js\nlet x = 1;\n```', language: "md" },
+    ]);
+    expect(messageBlocks("~~~python\nprint('hello')")).toEqual([
+      { kind: "code", text: "print('hello')", language: "python" },
+    ]);
+  });
+
+  it("searches model IDs and capability labels without reordering the catalog", () => {
+    const models = [{ id: "model-a", image_input: "supported" }, { id: "model-b", image_input: "unsupported" }];
+    expect(filterModels(models, "MODEL-A vision")).toEqual([models[0]]);
+    expect(filterModels(models, "unknown")).toEqual([]);
+    expect(filterModels(models, " ")).toEqual(models);
+  });
+});
 
 describe("collectProviderModelPages", () => {
   it("loads a 600-model catalog through every opaque page", async () => {

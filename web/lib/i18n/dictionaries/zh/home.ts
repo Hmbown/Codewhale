@@ -12,9 +12,9 @@ export const home: HomeDict = {
   metaTitle: "Codewhale — 用你选择的模型，完成开发和自动化任务",
   metaDescription:
     "借助开源智能体和你选择的云端或本地 AI 模型，开发软件、处理文件，并自动完成日常任务。",
-  heroTitle: "用你选择的模型，完成开发和自动化任务",
+  heroTitle: "让你的模型，真正动手。",
   heroIntro:
-    "{brand} 是一个开源智能体，能够读取文件、编辑代码、运行命令并检查结果。在终端或本地浏览器中使用它，连接你选择的云端或本地模型。工具和权限由你决定；对话与工具执行结果保存在会话中。",
+    "{brand} 将任务变成看得见的工作：读取文件、修改代码、运行命令、检查结果。连接你选择的云端或本地模型，在终端或浏览器中工作，自己掌握工具与权限。",
   getCodewhale: "获取 Codewhale",
   exploreProduct: "了解产品",
   shotPreview: "终端预览",

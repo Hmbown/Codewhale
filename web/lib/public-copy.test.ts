@@ -20,8 +20,12 @@ describe("public website copy contracts", () => {
     expect(layout).not.toContain("Section 02");
     expect(layout).not.toContain("How Codewhale works: ego");
     expect(layout).not.toContain("<Seal");
-    expect(layout.indexOf('<article className="docs-content')).toBeLessThan(
-      layout.indexOf("<DocsSidebar"),
+    // The mobile index precedes the article visually; keyboard and reading
+    // order must follow it rather than relying on CSS to reorder the tree.
+    const sidebarIndex = layout.indexOf("<DocsSidebar");
+    expect(sidebarIndex).toBeGreaterThan(-1);
+    expect(sidebarIndex).toBeLessThan(
+      layout.indexOf('<article className="docs-content'),
     );
     expect(search).toContain("docs-topic-row");
     expect(search).not.toContain("40+ Markdown documents");

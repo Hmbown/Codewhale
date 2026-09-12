@@ -15,9 +15,9 @@ export const home: HomeDict = {
   metaDescription:
     "Build software, work with your files, and automate everyday tasks using open-source agents and your choice of hosted or local AI models.",
 
-  heroTitle: "Build and automate with the models you choose",
+  heroTitle: "Put your models to work.",
   heroIntro:
-    "{brand} is an open-source agent that reads files, edits code, runs commands, and checks its work. Use it in your terminal or local browser with a hosted or local model. You choose the tools and permissions; the session keeps the conversation and tool results.",
+    "{brand} turns a task into work you can follow: files read, code changed, commands run, results checked. Bring your choice of hosted or local model. Work in your terminal or browser, with tools and permissions under your control.",
   getCodewhale: "Get Codewhale",
   exploreProduct: "Explore the product",
 

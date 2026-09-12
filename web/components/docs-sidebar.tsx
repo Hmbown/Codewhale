@@ -1,6 +1,7 @@
 "use client";
 
 import Link from "next/link";
+import { useState } from "react";
 import { usePathname } from "next/navigation";
 import { docsTopicIsCurrent } from "@/lib/docs-navigation";
 import {
@@ -20,10 +21,21 @@ export function DocsSidebar({ locale }: { locale: string }) {
   const t = getDocsShell(locale);
   const pathname = usePathname();
   const byCategory = getTopicsByCategory();
+  const [expanded, setExpanded] = useState(false);
 
   return (
     <aside className="docs-sidebar min-w-0">
-      <div className="lg:sticky lg:top-24">
+      <button
+        className="docs-sidebar-toggle"
+        type="button"
+        aria-expanded={expanded}
+        aria-controls="docs-topic-navigation"
+        onClick={() => setExpanded(!expanded)}
+      >
+        {t.sidebarHeading}
+        <svg aria-hidden="true" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5"><path d="m6 9 6 6 6-6" /></svg>
+      </button>
+      <div id="docs-topic-navigation" className="docs-sidebar-body lg:sticky lg:top-24" data-expanded={expanded}>
         <div className="docs-sidebar-heading">
           <Link href={`/${locale}/docs`}>
             <span>{t.sidebarHeading}</span>
@@ -47,6 +59,7 @@ export function DocsSidebar({ locale }: { locale: string }) {
                         target={isExternal ? "_blank" : undefined}
                         rel={isExternal ? "noreferrer" : undefined}
                         aria-current={isCurrent ? "page" : undefined}
+                        onClick={() => setExpanded(false)}
                         className={
                           isCurrent
                             ? "docs-sidebar-link docs-sidebar-link-current"

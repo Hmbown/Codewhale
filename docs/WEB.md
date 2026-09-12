@@ -37,6 +37,26 @@ The browser is another view of the same local Runtime. It does not create a
 second cloud account, copy provider credentials into browser storage, or
 weaken the configured approval and sandbox policies.
 
+## Working in the browser
+
+Search recent threads or preview saved sessions from the history rail. Saved
+previews are read-only until you choose to resume. When creating a thread, use
+the searchable provider and model picker; it selects from the Runtime's catalog
+and does not configure provider credentials. Starter prompts fill the composer
+for review before you send. Finished fenced code blocks have a Copy button;
+other message text remains literal. The sidebar also switches light and dark
+themes, and Latest returns to the newest message after you scroll back.
+
+Unsent drafts are kept per thread in this tab's session storage so they survive
+a reload. Storage is bounded and best effort; when unavailable or full, drafts
+remain in memory and cannot be guaranteed after a reload. The theme preference
+uses local storage. The client does not put Runtime tokens or configured
+provider credentials in either store.
+
+Use `Cmd/Ctrl+K` to search, `Cmd/Ctrl+N` to create a thread, `Enter` to send,
+and `Shift+Enter` for a new line. Keyboard composition with an input method
+does not send a partially composed message.
+
 ## Authentication boundary
 
 The browser-launch URL contains a random, short-lived, one-time bootstrap
@@ -78,6 +98,9 @@ before operating either one, especially before selecting a non-loopback bind.
   credentials.
 - If a session expired, stop and restart `codewhale web` to mint a new
   process-local session. Reusing an old bootstrap URL is expected to fail.
+- For a temporary connection failure while the Runtime is still running,
+  choose **Reconnect**. It reloads the Runtime state while keeping your draft;
+  it cannot renew an expired browser session.
 
 For integration endpoints, headers, events, and the complete web-session
 contract, see [RUNTIME_API.md](RUNTIME_API.md).

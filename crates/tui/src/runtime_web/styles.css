@@ -3,10 +3,10 @@
   /* CWC Ocean is the dark Blue Stage view. Keep semantic roles here so this
      dependency-free client shares the product grammar without importing the
      managed app or its component runtime. */
-  --bg: #020711;
-  --sidebar: #050b16;
-  --surface: #0e1a30;
-  --surface-raised: #172945;
+  --bg: #070c1d;
+  --sidebar: #0c1531;
+  --surface: #101c40;
+  --surface-raised: #1a2c63;
   --hover: rgba(106, 174, 242, 0.09);
   --selected: rgba(106, 174, 242, 0.15);
   --scrim: rgba(0, 2, 8, 0.7);
@@ -18,7 +18,7 @@
   --text-soft: #b6c0d4;
   --text-muted: #93a0b8;
   --text-faint: #8491aa;
-  --action: #6aaef2;
+  --action: #6aa6dc;
   --action-strong: #4f8fe8;
   --action-contrast: #03070d;
   --action-soft: rgba(106, 174, 242, 0.13);
@@ -31,11 +31,11 @@
   --status-human-soft: rgba(246, 196, 83, 0.11);
   --status-warning-soft: rgba(255, 122, 89, 0.11);
   --status-danger-soft: rgba(255, 134, 178, 0.11);
-  --stage-surface: #142747;
+  --stage-surface: #070c1d;
   --stage-shallows: #0d1b33;
   --stage-depth: #061226;
   --stage-abyss: #020711;
-  --plate: rgba(18, 34, 60, 0.9);
+  --plate: #142352;
   --well: #06111f;
   --well-deep: #020711;
   --rim: rgba(209, 235, 244, 0.13);
@@ -69,7 +69,7 @@
   --dur-fast: 120ms;
   --dur-med: 200ms;
   --ease-out: cubic-bezier(0.22, 1, 0.36, 1);
-  --rail: 256px;
+  --rail: 280px;
   --content: 760px;
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Helvetica Neue", Arial, sans-serif;
   font-synthesis: none;
@@ -133,12 +133,12 @@ summary:focus-visible {
   position: relative;
   z-index: 20;
   display: grid;
-  grid-template-rows: 52px auto auto minmax(144px, 1fr) minmax(0, 34%) auto;
+  grid-template-rows: 60px auto auto minmax(0, 1fr) auto auto;
   gap: var(--space-2);
   min-width: 0;
   min-height: 0;
   overflow: hidden;
-  padding: 10px 10px 12px;
+  padding: 12px 14px 16px;
   border-right: 1px solid var(--line);
   background: var(--sidebar);
 }
@@ -168,13 +168,13 @@ summary:focus-visible {
   flex: 0 0 34px;
   width: 34px;
   height: 34px;
-  border-radius: 9px;
+  border-radius: 0;
 }
 
 .eyebrow {
   margin: 0;
   color: var(--text-dim);
-  font-size: 11px;
+  font-size: 12px;
   font-weight: 700;
   letter-spacing: 0.11em;
   line-height: 1.3;
@@ -353,7 +353,7 @@ textarea::placeholder {
   border-color: transparent;
   background: var(--selected);
   color: var(--text);
-  box-shadow: inset 2px 0 0 var(--action);
+  border-color: var(--line-strong);
 }
 
 .thread-title-row {
@@ -376,7 +376,7 @@ textarea::placeholder {
   border-radius: 999px;
   background: rgba(246, 196, 83, 0.12);
   color: var(--status-human);
-  font-size: 10px;
+  font-size: 12px;
   font-weight: 750;
   line-height: 1.3;
   text-align: center;
@@ -405,8 +405,7 @@ textarea::placeholder {
   margin-top: 5px;
   overflow: hidden;
   color: var(--text-dim);
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 10px;
+  font-size: 12px;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -454,7 +453,7 @@ textarea::placeholder {
 .peek-kind {
   min-width: 84px;
   color: var(--text-dim);
-  font-size: 11px;
+  font-size: 12px;
   text-transform: uppercase;
   letter-spacing: 0.06em;
 }
@@ -472,7 +471,7 @@ textarea::placeholder {
 .peek-flag,
 .peek-omitted {
   color: var(--text-dim);
-  font-size: 11px;
+  font-size: 12px;
 }
 
 /* Narrow viewports: the peek must not force horizontal scrolling, and the
@@ -515,7 +514,7 @@ textarea::placeholder {
 .rail-section-title {
   margin: 0 8px 8px;
   color: var(--text-dim);
-  font-size: 11px;
+  font-size: 12px;
   font-weight: 700;
   letter-spacing: 0.08em;
   text-transform: uppercase;
@@ -549,8 +548,7 @@ textarea::placeholder {
 .runtime-provenance {
   overflow: hidden;
   color: var(--text-faint);
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 10px;
+  font-size: 12px;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -571,7 +569,7 @@ textarea::placeholder {
     "transcript"
     "attention"
     "composer";
-  grid-template-rows: 64px auto minmax(0, 1fr) auto auto;
+  grid-template-rows: auto auto minmax(0, 1fr) auto auto;
   min-width: 0;
   min-height: 0;
   background: var(--stage-surface);
@@ -580,17 +578,15 @@ textarea::placeholder {
 .session-header {
   display: grid;
   grid-area: header;
-  grid-template-areas: "heading facts actions";
-  grid-template-columns: minmax(180px, 1fr) minmax(0, auto) auto;
+  grid-template-areas: "heading actions" "facts facts";
+  grid-template-columns: minmax(0, 1fr) auto;
   align-items: center;
   gap: 16px;
   min-width: 0;
   overflow: hidden;
-  padding: 0 20px;
+  padding: 16px 28px;
   border-bottom: 1px solid var(--line);
-  background: rgba(14, 26, 48, 0.95);
-  box-shadow: inset 0 -1px 0 var(--edge);
-  backdrop-filter: blur(14px) saturate(1.08);
+  background: var(--bg);
 }
 
 .session-heading {
@@ -622,17 +618,12 @@ textarea::placeholder {
 
 .session-facts {
   display: flex;
-  flex-wrap: nowrap;
+  flex-wrap: wrap;
   grid-area: facts;
   min-width: 0;
-  gap: 6px;
-  overflow-x: auto;
-  overflow-y: hidden;
-  scrollbar-width: none;
-}
-
-.session-facts::-webkit-scrollbar {
-  display: none;
+  column-gap: 16px;
+  row-gap: 0;
+  overflow: visible;
 }
 
 .fact-chip {
@@ -644,13 +635,16 @@ textarea::placeholder {
   border-radius: var(--radius-control);
   background: rgba(2, 7, 17, 0.18);
   color: var(--text-dim);
-  font-size: 11px;
+  font-size: 12px;
   white-space: nowrap;
+  max-width: min(280px, 100%);
 }
 
 .fact-chip strong {
   color: var(--text-soft);
-  font-weight: 650;
+  font-weight: 500;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .rail-open,
@@ -689,7 +683,7 @@ textarea::placeholder {
   min-height: 100%;
   place-content: center;
   justify-items: center;
-  padding: 32px;
+  padding: 32px 0;
   color: var(--text-dim);
   text-align: center;
 }
@@ -697,7 +691,7 @@ textarea::placeholder {
 .empty-state h2 {
   margin: 18px 0 8px;
   color: var(--text);
-  font-size: 22px;
+  font-size: 30px;
   letter-spacing: -0.02em;
 }
 
@@ -710,9 +704,9 @@ textarea::placeholder {
 
 .empty-mark {
   display: block;
-  width: 52px;
-  height: 52px;
-  border-radius: var(--radius-card);
+  width: 64px;
+  height: 64px;
+  border-radius: 0;
   opacity: 0.9;
 }
 
@@ -751,10 +745,9 @@ textarea::placeholder {
   margin-left: auto;
   padding: 11px 15px;
   border: 1px solid var(--line);
-  border-radius: 18px 18px 6px 18px;
+  border-radius: 12px;
   background: var(--plate);
-  box-shadow: inset 0 1px 0 var(--rim);
-  font-size: 14.5px;
+  font-size: 15px;
 }
 
 .message.user .message-label { display: none; }
@@ -857,7 +850,7 @@ textarea::placeholder {
 
 .reasoning {
   padding-left: 16px;
-  border-left: 2px solid var(--line);
+  border-left: 1px solid var(--line);
 }
 
 .attention {
@@ -948,7 +941,8 @@ textarea::placeholder {
 .composer-wrap {
   grid-area: composer;
   padding: 0 max(20px, calc((100% - var(--content)) / 2)) 20px;
-  background: linear-gradient(transparent, var(--stage-surface) 28%);
+  position: relative;
+  background: var(--stage-surface);
 }
 
 .composer {
@@ -956,12 +950,12 @@ textarea::placeholder {
   border: 1px solid var(--line);
   border-radius: var(--radius-composer);
   background: var(--plate);
-  box-shadow: inset 0 1px 0 var(--rim), 0 18px 48px rgba(0, 2, 8, 0.2);
+  box-shadow: none;
 }
 
 .composer:focus-within {
   border-color: rgba(106, 174, 242, 0.46);
-  box-shadow: inset 0 1px 0 var(--rim), 0 0 0 3px rgba(106, 174, 242, 0.1);
+  outline: 1px solid var(--action);
 }
 
 .composer textarea {
@@ -988,7 +982,7 @@ textarea::placeholder {
 
 .composer-hint {
   color: var(--text-dim);
-  font-size: 11px;
+  font-size: 12px;
 }
 
 .composer-actions {
@@ -1003,9 +997,11 @@ textarea::placeholder {
 .rename-dialog {
   width: min(420px, calc(100% - 28px));
   padding: 0;
+  max-height: calc(100dvh - 40px);
+  overflow-y: auto;
   border: 1px solid var(--line-strong);
   border-radius: var(--radius-card);
-  background: var(--surface-raised);
+  background: var(--sidebar);
   color: var(--text);
   box-shadow: 0 24px 80px rgba(0, 0, 0, 0.55);
 }
@@ -1289,14 +1285,6 @@ noscript {
     padding-right: 0;
   }
 
-  .session-facts {
-    display: flex;
-    flex-wrap: nowrap;
-    overflow-x: auto;
-    scrollbar-width: none;
-  }
-
-  .session-facts .fact-chip[data-fact="workspace"],
   .session-facts .fact-chip[data-fact="branch"] {
     display: none;
   }
@@ -1304,7 +1292,7 @@ noscript {
   .fact-chip {
     min-height: 26px;
     padding: 0 8px;
-    font-size: 10.5px;
+    font-size: 12px;
   }
 
   .composer-hint {
@@ -1385,4 +1373,75 @@ noscript {
     animation-duration: 0.01ms !important;
     animation-iteration-count: 1 !important;
   }
+}
+
+/* Local workbench: one history column, a readable conversation and a fixed composer. */
+.rail-history { min-height: 0; overflow-y: auto; overscroll-behavior: contain; scrollbar-color: var(--surface-raised) transparent; }
+.rail-history .thread-list { overflow: visible; }
+.rail-history .saved-sessions { max-height: none; margin-top: 20px; }
+.rail-tools { display: flex; align-items: center; justify-content: space-between; padding-top: 10px; }
+.rail-tools a { display: flex; align-items: center; gap: 16px; min-height: 44px; padding-inline: 10px; color: var(--text-soft); font-size: 13px; text-decoration: none; }
+.rail-tools a:hover { color: var(--action); }
+.rail-footer { align-items: center; padding-top: 14px; }
+.rail-footer .connection-copy { flex: 1; }
+.rail-footer .connection-dot { margin-top: 0; }
+.rail-footer .icon-button { flex-shrink: 0; background: transparent; }
+.ui-icon { flex-shrink: 0; width: 18px; height: 18px; stroke-linecap: round; stroke-linejoin: round; }
+.new-thread { gap: 10px; min-height: 44px; }
+.new-thread kbd { margin-inline-start: auto; color: var(--text-muted); font-size: 12px; font-weight: 400; }
+.search-field { height: 44px; }
+.search-field input { font-size: 13px; }
+.rail-section-title { text-transform: none; letter-spacing: 0; font-weight: 500; padding-block: 12px 6px; }
+.eyebrow { letter-spacing: 0; text-transform: none; font-weight: 400; }
+.session-header h1 { font-size: 18px; font-weight: 600; }
+.session-facts:empty { display: none; }
+.fact-chip { background: transparent; border: 0; padding: 0; gap: 5px; }
+.fact-chip + .fact-chip::before { content: "·"; margin-inline: 6px; color: var(--text-muted); }
+.session-peek { grid-area: transcript; max-height: none; }
+.is-peeking .composer-wrap { display: none; }
+.task-starters { display: flex; flex-wrap: wrap; justify-content: center; gap: 10px; margin-top: 28px; }
+.starter-button { min-height: 44px; padding: 10px 14px; border: 1px solid var(--line-strong); border-radius: 8px; background: transparent; color: var(--text-soft); font-size: 13px; }
+.starter-button:hover { background: var(--hover); border-color: var(--action); color: var(--text); }
+.composer-footnote { display: flex; justify-content: space-between; gap: 12px; margin-top: 10px; color: var(--text-muted); font-size: 12px; line-height: 1.5; }
+.composer-context { max-width: 60%; }
+.composer-hint { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.jump-latest { position: absolute; inset: auto auto calc(100% + 12px) 50%; transform: translateX(-50%); padding-inline: 14px; background: var(--sidebar); }
+.message-code { margin: 16px 0; overflow: hidden; border: 1px solid var(--line-strong); border-radius: 8px; background: var(--sidebar); white-space: normal; }
+.message-code-bar { display: flex; align-items: center; justify-content: space-between; padding: 6px 14px; border-bottom: 1px solid var(--line); color: var(--text-soft); font-size: 12px; }
+.message-code-bar .quiet-button { min-height: 32px; border: 0; background: transparent; font-size: 12px; }
+.message-code pre { margin: 0; padding: 16px; overflow-x: auto; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; line-height: 1.65; white-space: pre; }
+.message-prose:empty { display: none; }
+#new-thread-model-search { margin-top: 0; }
+button:active:not(:disabled) { transform: translateY(1px); }
+.jump-latest:active:not(:disabled) { transform: translate(-50%, 1px); }
+a:focus-visible, select:focus-visible { outline: 3px solid var(--action); outline-offset: 3px; }
+::selection { background: var(--action); color: var(--action-contrast); }
+textarea, input { caret-color: var(--action); }
+.skip-link { position: fixed; inset: 8px auto auto 8px; z-index: 100; padding: 12px 16px; background: var(--action); color: var(--action-contrast); transform: translateY(-200%); border-radius: 6px; }
+.skip-link:focus { transform: translateY(0); }
+html[data-theme="light"] {
+  color-scheme: light;
+  --bg: #fffdf8; --sidebar: #f6f2e8; --surface: #e8eef8; --surface-raised: #d8e4f3;
+  --stage-surface: #fffdf8; --plate: #e8eef8; --well: #eeeae1; --well-deep: #f6f2e8;
+  --text: #14213a; --text-soft: #455168; --text-muted: #5b6780; --text-faint: #5b6780;
+  --action: #1535b2; --action-strong: #142352; --action-contrast: #fffdf8;
+  --line: rgba(20, 33, 58, .14); --line-strong: rgba(20, 33, 58, .26);
+  --hover: rgba(21, 53, 178, .05); --selected: rgba(21, 53, 178, .09); --action-soft: rgba(21, 53, 178, .08);
+  --status-human: #7a5500; --status-live: #08766d; --status-warning: #984211; --status-danger: #b12455; --ok: #08766d;
+}
+@media (max-width: 800px) {
+  .empty-state h2 { font-size: 26px; }
+  .fact-chip + .fact-chip::before { content: none; }
+  .empty-state p { font-size: 14px; }
+  .task-starters { gap: 8px; margin-top: 22px; }
+  .starter-button { font-size: 12px; padding-inline: 10px; }
+  .composer-footnote { font-size: 12px; }
+  .composer-footnote > span:last-child { display: none; }
+  .composer-footnote:has(#draft-status:empty) { display: none; }
+  .session-header { gap: 10px; min-height: 64px; }
+  .session-facts .fact-chip { font-size: 12px; }
+  .rail-footer .icon-button, .header-actions .quiet-button { min-height: 44px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation: none !important; transition: none !important; scroll-behavior: auto !important; }
 }

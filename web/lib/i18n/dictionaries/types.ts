@@ -752,6 +752,10 @@ export interface DocsWebDict {
   overviewTitle: string;
   overviewLead: string;
   overviewBody: string;
+  workflowTitle: string;
+  workflowLead: string;
+  draftsBody: string;
+  shortcutsBody: string;
   authTitle: string;
   authLead: string;
   localTitle: string;

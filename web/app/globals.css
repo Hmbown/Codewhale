@@ -2644,6 +2644,8 @@ pre.gs-step-commands {
   padding-block: clamp(2.25rem, 5vw, 4rem);
 }
 
+.docs-sidebar-toggle { display: none; }
+
 .docs-sidebar {
   grid-area: sidebar;
   border-top: 1px solid var(--hairline);
@@ -2912,12 +2914,27 @@ pre.gs-step-commands {
   .docs-shell {
     grid-template-columns: 1fr;
     grid-template-areas:
-      "content"
-      "sidebar";
+      "sidebar"
+      "content";
+    gap: 1.5rem;
   }
 
-  /* The one docs nav stays reachable below the article: the groups reflow
-     into columns so 23 topics read as an index, not a scroll of links. */
+  .docs-sidebar-toggle {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    width: 100%;
+    min-height: 48px;
+    color: var(--ink);
+    font-weight: 600;
+    border-bottom: 1px solid var(--hairline);
+  }
+  .docs-sidebar-toggle[aria-expanded="true"] svg { transform: rotate(180deg); }
+  .docs-sidebar-body { display: none; }
+  .docs-sidebar-body[data-expanded="true"] { display: block; }
+  .docs-sidebar-link { min-height: 44px; }
+
+  /* One navigation tree, disclosed above the article on smaller screens. */
   .docs-sidebar nav {
     display: grid;
     grid-template-columns: repeat(auto-fill, minmax(13rem, 1fr));
@@ -3740,17 +3757,81 @@ html[data-theme="dark"] .docs-theme {
   font-size: 1.4rem;
 }
 
-/* Keep the terminal centered and compact beneath the introductory copy. */
-.folio-hero-grid { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto auto auto; row-gap: 2rem; }
-.folio-hero-copy { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); column-gap: clamp(2rem, 5vw, 5rem); max-width: none; grid-column: 1; grid-row: 1; padding-bottom: 0; }
-.folio-hero-copy h1 { grid-column: 1; grid-row: 1 / 3; max-width: none; font-size: clamp(2.75rem, 5vw, 4.5rem); line-height: 1.06; text-wrap: balance; }
-.folio-hero-copy .folio-lede { grid-column: 2; grid-row: 1; margin-top: 0; align-self: end; }
-.folio-hero-copy .folio-actions { grid-column: 2; grid-row: 2; align-self: start; margin-top: 1.25rem; }
-.folio-shot { grid-column: 1; grid-row: 2; width: min(100%, 56rem); justify-self: center; margin-top: 0; }
-.folio-chapter { grid-column: 1; grid-row: 3; justify-self: start; }
+/* The first screen pairs the product promise with a real capture. */
+.folio-hero-grid {
+  grid-template-columns: minmax(0, .85fr) minmax(0, 1.15fr);
+  grid-template-rows: auto auto;
+  align-items: center;
+  gap: clamp(2rem, 4vw, 4rem);
+  padding-bottom: 0;
+}
+.folio-hero-copy { grid-column: 1; grid-row: 1; max-width: 34rem; padding-block: 1rem 3rem; }
+.folio-hero-copy::before { display: none; }
+.folio-hero-copy h1 { max-width: 11ch; font-size: clamp(3.5rem, 5.6vw, 5.75rem); line-height: 1.02; text-wrap: balance; }
+.folio-lede { max-width: 34ch; font-size: 1.08rem; line-height: 1.7; }
+.folio-actions { margin-top: 1.75rem; }
+.folio-shot { grid-column: 2; grid-row: 1; width: 100%; margin: 0; align-self: center; }
+.folio-shot figcaption { gap: .65rem; padding: 1rem 1.2rem; }
+.folio-launcher { grid-column: 1 / -1; grid-row: 2; position: relative; }
+.work-launcher { background: var(--paper-card); border: 1px solid var(--hairline); border-radius: 8px; overflow: hidden; }
+.work-launcher-tabs { display: flex; gap: 1.75rem; padding-inline: 2rem; border-bottom: 1px solid var(--hairline); }
+.work-launcher-tabs button { position: relative; min-height: 3.5rem; padding: .75rem 0; color: var(--ink-soft); font-size: .92rem; font-weight: 500; }
+.work-launcher-tabs button:hover { color: var(--indigo); }
+.work-launcher-tabs button[aria-selected="true"] { color: var(--indigo); }
+.work-launcher-tabs button[aria-selected="true"]::after { content: ""; position: absolute; height: 2px; inset: auto 0 -1px; background: currentColor; }
+.work-launcher-panel { display: grid; grid-template-columns: 1fr 1fr; gap: 2.5rem; padding: 2rem; align-items: center; min-height: 14rem; }
+.work-launcher-panel h2 { margin: 0 0 .65rem; font-size: 1.75rem; line-height: 1.2; }
+.work-launcher-panel p { color: var(--ink-soft); font-size: .94rem; line-height: 1.65; max-width: 52ch; }
+.work-launcher-panel .folio-link { margin-top: .85rem; }
+.work-launcher-command { min-width: 0; }
+.work-launcher-command .code-block { padding-block: 1.6rem; font-size: .88rem; }
+.work-launcher-command > p { margin: .8rem 0 0; font-size: .8rem; }
+.work-launcher-command a { color: var(--indigo); text-decoration: underline; text-underline-offset: 3px; }
+.product-launcher { padding-top: 2.5rem; }
 .product-install-grid > div, .product-composer, .product-composer > div { min-width: 0; }
+/* Shared chrome and reading surfaces use the same quiet control grammar. */
+.paper-nav-inner { min-height: 4.5rem; }
+.paper-auth-signin, .paper-auth-register, .paper-install-cta, .portal-button {
+  font-family: var(--font-body), system-ui, sans-serif;
+  font-size: .86rem;
+  text-transform: none;
+  letter-spacing: 0;
+  min-height: 2.75rem;
+}
+.site-github-link { gap: .4rem; min-height: 2.75rem; }
+.paper-wordmark-mark { width: 30px; height: 30px; }
+.site-nav-actions select { min-height: 2.75rem; }
+.folio-section { padding-block: clamp(3.5rem, 7vw, 6rem); }
+.folio-section + .folio-section { border-top: 1px solid var(--hairline); }
+.folio-section-lede { max-width: 62ch; }
+.folio-gain-grid { margin-top: 2.5rem; }
+.folio-gain-grid h3 { font-size: 1.55rem; }
+.portal-button { border-radius: 5px; }
+.hero h1, .community-welcome-inner h1 { max-width: 20ch; text-wrap: balance; }
+.copy-btn { min-height: 2.5rem; font-family: var(--font-body), system-ui, sans-serif; text-transform: none; letter-spacing: 0; font-size: .8rem; }
+.mm-panel button { min-width: 44px; min-height: 44px; }
+::selection { background: var(--indigo); color: var(--paper); }
+input, textarea { caret-color: var(--indigo); }
+@media (max-width: 1024px) {
+  .folio-hero-grid { grid-template-columns: minmax(0, 1fr); gap: 2rem; }
+  .folio-hero-copy { padding-bottom: 0; max-width: 44rem; }
+  .folio-hero-copy h1 { max-width: 16ch; }
+  .folio-lede { max-width: 58ch; }
+  .folio-shot { grid-column: 1; grid-row: 2; width: min(100%, 44rem); justify-self: center; }
+  .folio-launcher { grid-row: 3; }
+}
 @media (max-width: 760px) {
-  .folio-hero-copy { display: block; }
-  .folio-hero-copy .folio-lede { margin-top: 1.25rem; }
-  .folio-shot { width: 100%; }
+  .work-launcher-panel { grid-template-columns: minmax(0, 1fr); gap: 1.5rem; padding: 1.25rem; }
+  .work-launcher-tabs { gap: 1.25rem; padding-inline: 1.25rem; }
+  .work-launcher-tabs button { font-size: .85rem; }
+  .folio-hero-copy h1 { font-size: 3.5rem; }
+  .folio-lede { font-size: 1rem; }
+  .folio-shot figcaption { padding: .85rem; }
+  .folio-shot .dotline { font-size: .75rem; }
+  .folio-actions { flex-direction: row; }
+  .folio-actions .folio-button { flex: 1 1 auto; }
+}
+@media (max-width: 380px) {
+  .folio-hero-copy h1 { font-size: 3rem; }
+  .work-launcher-tabs { gap: 1rem; padding-inline: 1rem; }
 }

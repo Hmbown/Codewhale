@@ -74,20 +74,20 @@ function cssDeclarations(styles, selectorPattern) {
   return match[1];
 }
 
-test("embedded web client uses the Ocean Blue Stage semantic palette", async () => {
+test("embedded web client uses the Tideline semantic palette", async () => {
   const [styles, html] = await Promise.all([
     readFile(new URL("../src/runtime_web/styles.css", import.meta.url), "utf8"),
     readFile(new URL("../src/runtime_web/index.html", import.meta.url), "utf8"),
   ]);
 
   for (const token of [
-    "--bg: #020711",
-    "--sidebar: #050b16",
-    "--surface: #0e1a30",
-    "--surface-raised: #172945",
-    "--stage-surface: #142747",
+    "--bg: #070c1d",
+    "--sidebar: #0c1531",
+    "--surface: #101c40",
+    "--surface-raised: #1a2c63",
+    "--stage-surface: #070c1d",
     "--text: #f6f2e8",
-    "--action: #6aaef2",
+    "--action: #6aa6dc",
     "--status-human: #f6c453",
     "--status-live: #4fd1c5",
     "--status-warning: #ff7a59",
@@ -96,7 +96,7 @@ test("embedded web client uses the Ocean Blue Stage semantic palette", async () 
     "--radius-control: 6px",
     "--radius-card: 12px",
     "--radius-composer: 16px",
-    "--rail: 256px",
+    "--rail: 280px",
   ]) {
     assert.match(styles, new RegExp(token.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
   }
@@ -124,7 +124,7 @@ test("embedded web client uses the Ocean Blue Stage semantic palette", async () 
     cssDeclarations(styles, "\\.connection-dot\\.ready"),
     /background: var\(--ok\)/,
   );
-  assert.match(html, /name="theme-color" content="#020711"/);
+  assert.match(html, /name="theme-color" content="#070c1d"/);
 });
 
 test("embedded web client keeps the CWC stage, transcript, and receipt hierarchy quiet", async () => {
@@ -190,7 +190,7 @@ test("mobile drawer owns focus and background interaction while it is open", asy
   assert.match(source, /function closeRail[\s\S]*returnTarget\.focus[\s\S]*applyClosedMobileRailAccessibility/);
   assert.match(source, /function trapFocusWithin[\s\S]*event\.key !== "Tab"[\s\S]*first\.focus/);
   assert.match(source, /function trapRailFocus[\s\S]*trapFocusWithin\(event, dom\.rail\)/);
-  assert.match(source, /document\.addEventListener\("keydown", \(event\) => \{\s+if \(dom\.newThreadDialog\.open\) return;\s+if \(trapRailFocus\(event\)\) return;/);
+  assert.match(source, /document\.addEventListener\("keydown", \(event\) => \{\s+if \(dom\.newThreadDialog\.open \|\| dom\.renameDialog\.open \|\| event\.isComposing\) return;[\s\S]*if \(trapRailFocus\(event\)\) return;/);
   assert.match(source, /event\.key === "Escape"[\s\S]*closeRail\(\)/);
 });
 
@@ -207,8 +207,9 @@ test("mobile viewport and truth controls survive the software keyboard and coars
     styles,
     /@media \(max-width: 800px\)[\s\S]*\.composer textarea,[\s\S]*font-size: 16px/,
   );
-  assert.match(styles, /@media \(max-width: 430px\)[\s\S]*\.session-facts \{[\s\S]*display: flex/);
-  assert.match(styles, /\.session-facts \.fact-chip\[data-fact="workspace"\][\s\S]*display: none/);
+  assert.match(cssDeclarations(styles, "\\.session-facts"), /flex-wrap: wrap/);
+  assert.match(cssDeclarations(styles, "\\.session-facts"), /overflow: visible/);
+  assert.match(styles, /\.session-facts \.fact-chip\[data-fact="branch"\][\s\S]*display: none/);
   assert.match(source, /chip\.dataset\.fact = String\(label \|\| ""\)\.toLowerCase\(\)/);
 });
 
@@ -272,7 +273,6 @@ test("rail New thread cannot paint over the session fact chips", async () => {
   assert.match(cssDeclarations(styles, "\\.rail"), /overflow:\s*hidden/);
   assert.match(cssDeclarations(styles, "\\.new-thread"), /max-width:\s*100%/);
   assert.match(cssDeclarations(styles, "\\.session-header"), /overflow:\s*hidden/);
-  assert.match(cssDeclarations(styles, "\\.session-facts"), /flex-wrap:\s*nowrap/);
 });
 
 test("production shell keeps readable type, controls, focus, and motion contracts", async () => {
@@ -298,7 +298,7 @@ test("production shell keeps readable type, controls, focus, and motion contract
     styles,
     /@media \(prefers-reduced-motion: reduce\)[\s\S]*scroll-behavior: auto !important/,
   );
-  assert.match(html, /Enter send · Shift\+Enter newline/);
+  assert.match(html, /Enter to send · Shift\+Enter for a new line/);
 });
 
 test("composer Enter sends without interrupting newlines or IME composition", () => {
@@ -1056,6 +1056,8 @@ test("renders hostile Runtime text only through the textContent sink", async () 
   const source = await readFile(new URL("../src/runtime_web/app.mjs", import.meta.url), "utf8");
   assert.equal(source.includes("inner" + "HTML"), false);
   assert.equal(source.includes("insertAdjacent" + "HTML"), false);
-  assert.equal(source.includes("local" + "Storage"), false);
-  assert.equal(source.includes("session" + "Storage"), false);
+  // Only the non-sensitive theme choice belongs in persistent storage.
+  assert.match(source, /localStorage\.setItem\("codewhale\.web\.theme", theme\)/);
+  assert.equal((source.match(/localStorage\.setItem/g) || []).length, 1);
+  assert.match(source, /draftStorage = globalThis\.sessionStorage/);
 });

@@ -41,9 +41,9 @@ colors:
 typography:
   display:
     fontFamily: "Newsreader, Georgia, 'Times New Roman', serif"
-    fontSize: "clamp(2.75rem, 6.4vw, 5.75rem)"
+    fontSize: "clamp(3.5rem, 5.6vw, 5.75rem)"
     fontWeight: 500
-    lineHeight: 0.98
+    lineHeight: 1.02
     letterSpacing: "-0.022em"
   heading:
     fontFamily: "Newsreader, Georgia, 'Times New Roman', serif"
@@ -71,6 +71,16 @@ typography:
     fontSize: "0.85rem"
     fontWeight: 400
     lineHeight: 1.55
+  runtime-body:
+    fontFamily: "-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif"
+    fontSize: "15.5px"
+    fontWeight: 400
+    lineHeight: 1.7
+  runtime-code:
+    fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace"
+    fontSize: "13px"
+    fontWeight: 400
+    lineHeight: 1.65
 rounded:
   none: "0px"
   sm: "5px"
@@ -104,7 +114,7 @@ components:
   nav:
     backgroundColor: "rgb(246 242 232 / 0.94)"
     textColor: "{colors.ink}"
-    height: "62px"
+    height: "4.5rem"
 ---
 
 ## Overview
@@ -142,13 +152,12 @@ Hard rules, not taste notes.
 4. **No generic SaaS scaffolding.** No icon-card grids, logo walls,
    testimonials, hero metrics, or badge soup. Sections are ruled columns and
    fact lists on paper.
-5. **No fabricated evidence.** The one screenshot is the founder's own capture
-   of the v0.9.12 development build, captioned as exactly that. No invented
-   transcripts, benchmarks, or mockups; pending media stays `pending`.
-6. **No cloud claims.** Availability is stated per surface as it is today —
-   terminal released, web app account sign-in available with the workbench a
-   development preview, desktop a development build, cloud computers not
-   available yet — and the page changes when the state does.
+5. **No fabricated evidence.** Captures retain the build identity recorded in
+   `web/lib/media-manifest.ts`. No invented transcripts, benchmarks, or mockups;
+   pending media stays `pending`. Test fixtures remain visibly labeled.
+6. **Availability is specific.** The local browser client and the signed-in
+   web app are distinct entry points. Describe each surface using the current
+   public surface facts; a local preview does not prove hosted availability.
 7. **Two dials, exact names.** Plan / Work / Operate and Ask / Auto-Review /
    Full Access are typeset literally and never ranked; Full Access is a
    choice, never described as a default.
@@ -190,9 +199,13 @@ Three faces with distinct roles:
   `--font-body` and the historic `--font-display`/condensed role share one local
   upright face; their existing weights and scale distinguish the roles. Measure
   ≤ 70ch. The font and its OFL notice live in `web/public/brand/fonts/`.
-- **JetBrains Mono 400/500** — code, the `cw` dot chain, the plate's rubric
-  (`AGENTIC COMPUTING, ON YOUR TERMS`), the running heads (`02 / YOUR MODELS`).
-  These rubrics are the only tracked uppercase on the site.
+- **JetBrains Mono 400/500** — commands, code, build captions, and compact
+  metadata. Navigation and action buttons use sentence case in the body face.
+
+The dependency-free embedded client intentionally uses the platform sans stack
+for its workbench and `ui-monospace, SFMono-Regular, Menlo, monospace` for code.
+These are established runtime roles, not website font replacements. Functional
+text stays at least 12px; assistant text is 15.5px and fenced code is 13px.
 
 Han locales drop the tracking and set the serif slots in the CJK serif stack.
 
@@ -200,19 +213,24 @@ Han locales drop the tracking and set the serif slots in the CJK serif stack.
 
 - One container (`--container: min(100% - 2rem, 76rem)`); every gutter aligns
   with the nav.
-- **The plate** (`.folio-hero`): two columns at ≥ 1050px — copy left, water
-  right; the terminal spans the left column's second row, the chapter marker
-  sits on the water bottom-right. Below 1050px it stacks: copy, terminal,
-  marker; the water still rises from the plate's floor.
+- **The plate** (`.folio-hero`): above 1024px, copy occupies the left column
+  and the real terminal capture the right, with a shared command launcher
+  spanning the second row. At 1024px and below it stacks: copy, capture,
+  launcher. The serif headline balances within 11ch on desktop.
 - **Reading sections** (`.folio-section`): serif `h2` (max 24ch), an optional
-  lede (max 40rem), then either three ruled columns (`.folio-gain-grid`) or a
+  lede (max 62ch), then either three ruled columns (`.folio-gain-grid`) or a
   two-column chapter (`.folio-chapter-grid`) with a fact list on the right.
 - **The waterline** (`.folio-waterline`, and `.site-footer-waterline` on every
   other page): a band of the water, paper above, deep below.
 - **The ocean column**: the surfaces list, the composer install band (bracketed
   by Signal Gold and Operate violet, as in the TUI), community, footer.
-- Breakpoints: 1050px (plate stacks), 760px (columns stack), 520px (compact
-  nav, full-width buttons). No horizontal overflow at 390px, ever.
+- Breakpoints: 1024px (hero stacks), 900px (docs index becomes a disclosure),
+  760px (launcher and reading columns stack), 520px (compact navigation).
+  No page-level horizontal overflow at 390px.
+- **Local workbench**: a 280px history rail, a roughly 760px conversation
+  measure, and a fixed composer. Below 800px the rail becomes an accessible
+  drawer. Session facts wrap; Model, Mode, and Permission remain visible on
+  phones. Saved-session previews are read-only until explicitly resumed.
 
 ## Motion
 
@@ -228,12 +246,22 @@ gated on `prefers-reduced-motion: no-preference`. No scroll-reveal.
   only), locale, stars, Sign in / Create account, one filled Install button.
   The compact sheet adds Start · Install · FAQ · Community · Contribute.
 - **Buttons**: `.folio-button` — brand-navy fill (primary) or navy outline
-  (secondary), body face, sentence case. Portal buttons on secondary pages
-  keep their mono meta style but use the same inks.
+  (secondary), body face, sentence case. Portal and navigation actions share
+  that control language and have a 44px minimum height.
+- **Command launcher**: one shared Terminal / Local browser / Scripts & CI
+  tab set on home and product pages, with roving keyboard focus, a copyable
+  command, and a related docs link. On phones the copy follows its explanation.
+- **Docs index**: one navigation tree, placed before the article in both DOM
+  and visual order. The mobile Documentation disclosure reports its expanded
+  state and closes on navigation.
 - **Fact lists** (`.folio-fact-list`, `.folio-availability-list`): hairline
   rows, mono term on paper / serif term in the water, body description.
-- **Terminal plate**: the screenshot at native 1136×698 with a chrome-navy
-  caption carrying the build line and the `cw` dot chain.
+- **Terminal plate**: a real capture at its manifest aspect ratio with a
+  chrome-navy caption carrying the build line and the `cw` dot chain.
+- **Local browser client**: canonical navy surfaces by default and an ivory
+  light theme, with labeled session facts, a searchable model picker, code-copy
+  controls, a latest-message action, and explicit reconnect feedback. Drafts
+  belong to their thread; a starter fills the composer without sending it.
 - **Footer**: the waterline band, then the seabed with the inverted wordmark.
 
 ## Do's and Don'ts

@@ -1,5 +1,6 @@
 import Link from "next/link";
 import { getFacts } from "@/lib/facts";
+import { WorkSurfaceLauncher } from "@/components/work-surface-launcher";
 import { PRODUCT_COPY } from "@/lib/content/product";
 import { fill, getHome, pickText } from "@/lib/i18n/dictionaries";
 import { buildPageMetadata } from "@/lib/page-meta";
@@ -45,6 +46,8 @@ export default async function ProductPage({ params }: { params: Promise<{ locale
           </div>
         </div>
       </section>
+
+      <div className="product-container product-launcher"><WorkSurfaceLauncher locale={locale} /></div>
 
       <section className="folio-section">
         <div className="product-container">

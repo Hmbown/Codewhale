@@ -3,6 +3,7 @@ import Image from "next/image";
 import Link from "next/link";
 import { GettingStartedSteps } from "@/components/getting-started-steps";
 import { InstallCodeBlock } from "@/components/install-code-block";
+import { WorkSurfaceLauncher } from "@/components/work-surface-launcher";
 import { Strata } from "@/components/strata";
 import { getFacts } from "@/lib/facts";
 import { GETTING_STARTED_STEPS } from "@/lib/content/getting-started";
@@ -93,7 +94,7 @@ export default async function HomePage({ params }: { params: Promise<{ locale: s
               alt={d.screenshotAlt}
               width={TERMINAL_SCREENSHOT.width}
               height={TERMINAL_SCREENSHOT.height}
-              sizes="(max-width: 58rem) calc(100vw - 2rem), 56rem"
+              sizes="(max-width: 64rem) calc(100vw - 2rem), 52vw"
               unoptimized
               priority
             />
@@ -127,10 +128,7 @@ export default async function HomePage({ params }: { params: Promise<{ locale: s
             </figcaption>
           </figure>
 
-          <aside className="folio-chapter">
-            <span className="folio-chapter-num">01 / {d.chapterTerminal}</span>
-            <p className="folio-chapter-title">{d.chapterTerminalTitle}</p>
-          </aside>
+          <div className="folio-launcher"><WorkSurfaceLauncher locale={locale} /></div>
         </div>
       </section>
 
@@ -172,7 +170,7 @@ export default async function HomePage({ params }: { params: Promise<{ locale: s
       <section className="folio-section">
         <div className="product-container folio-chapter-grid">
           <div>
-            <span className="folio-running-head">02 / {d.chapterModels}</span>
+
             <h2>{d.modelsHeading}</h2>
             <p className="folio-section-lede">{d.modelsBody}</p>
             <Link href={`/${locale}/models`} className="folio-link">
@@ -197,7 +195,7 @@ export default async function HomePage({ params }: { params: Promise<{ locale: s
       {/* 03 — START */}
       <section className="product-start">
         <div className="product-container">
-          <span className="folio-running-head">03 / {d.startHeading}</span>
+
           <h2>{d.startHeading}</h2>
           <p className="product-start-lede">{d.startLede}</p>
           <GettingStartedSteps locale={locale} />
@@ -218,7 +216,7 @@ export default async function HomePage({ params }: { params: Promise<{ locale: s
         {/* 04 — WHERE IT RUNS TODAY */}
         <section className="folio-availability">
           <div className="product-container">
-            <span className="folio-running-head">04 / {d.chapterAccount}</span>
+
             <h2>{d.availabilityHeading}</h2>
             <p className="folio-section-lede">{d.availabilityLede}</p>
             <dl className="folio-availability-list">

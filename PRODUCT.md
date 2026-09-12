@@ -4,24 +4,25 @@
 
 ## Platform
 
-web (the public site and docs in `web/`), documenting a terminal application
-(the Rust TUI in `crates/tui`). Paths below are relative to the repository
-root.
+The public site and docs in `web/`, and the local browser client served by
+`codewhale web` in `crates/tui/src/runtime_web/`. Both describe or connect to
+Codewhale's canonical Engine and Runtime; neither owns a second agent loop.
+Paths below are relative to the repository root.
 
 ## Users
 
-Developers who run a coding agent in their own terminal against their own
-repositories: solo maintainers, small teams, and open-source contributors. They
+Developers who work with an agent in their terminal or local browser against
+their own repositories: solo maintainers, small teams, and open-source contributors. They
 arrive at the site to decide whether to install, to install, and then to look up
 how a command, mode, or concept works. Many already use a competing agent and
 compare on model choice, cost, and control.
 
 ## Product Purpose
 
-Codewhale is an open-source (MIT) coding agent and terminal UI written in Rust
-(Ratatui + Tokio; sandboxed tools via Bubblewrap/Seatbelt). Given a model and a
-task it reads the repository, edits files, runs the checks, and stops when the
-job is done or it needs a human. The site exists to (1) get a developer from
+Codewhale is an open-source, provider-neutral agentic computing system. One
+Engine owns task execution and session state across its interfaces. Given a
+model and a task, it reads the repository, edits files, runs checks, and asks
+for human input when needed. The site exists to (1) get a developer from
 "what is this" to a working install in one screen, and (2) be the canonical,
 current documentation for the shipped release. Success is an install that works
 and a docs answer found without leaving the page.
@@ -32,8 +33,10 @@ Bring your own model. Codewhale is provider-neutral: any hosted, gateway, or
 local model, and a different model per role. The user's model inventory is the
 **Fleet** (`codewhale fleet`, `/fleet`; `pod` remains a compatibility alias).
 Modes are Plan, Work, Operate; permission levels are Ask, Auto-Review, Full
-Access. The agent runs on the user's machine, in the user's terminal — there is
-no hosted runtime to sell.
+Access. The terminal and `codewhale web` work with the local Runtime. The
+signed-in web app, desktop, cloud computers, and connected apps are part of the
+broader product; their availability must come from the current public surface
+facts rather than be inferred from the local client's capabilities.
 
 ## Operating Context
 
@@ -50,10 +53,9 @@ no hosted runtime to sell.
   `web/lib/content/vocabulary.ts` and `docs/public-surface-facts.json`.
 - Localised through shared dictionaries in `web/lib/i18n/dictionaries/` with
   locale-key parity enforced; no page-local copy forks.
-- The 0.9.12 shell (on the integration branch): transcript first, composer
-  plate, one info line, and a bottom dock with tabs Tasks / Agents / Context /
-  Pinned (+ ×). There is no top bar; docs that describe the shell describe the
-  dock.
+- The embedded browser client ships inside the binary. Its thread list, saved
+  session previews, transcript, approvals, and composer use the Runtime API.
+  `docs/WEB.md` owns its launch, storage, and authentication contract.
 
 ## Capabilities and Constraints
 
@@ -61,12 +63,10 @@ no hosted runtime to sell.
   compatibility identifiers (GitHub org/repo, package scopes).
 - Provider and model names are first-class and neutral; never rank providers
   in copy.
-- The 0.9.12 shell is not yet released. `web/lib/media-manifest.ts` marks
-  session video `pending`; the site must not ship mockups as screenshots. The
-  one real screenshot on hand is `web/public/codewhale-tui.png` — the
-  founder's 2026-09-04 capture of the v0.9.12 development build (new session,
-  braille C-curl whale, Work mode, Full Access). It is captioned as a
-  development build, never as a release.
+- `web/lib/media-manifest.ts` owns real capture paths, dimensions, build
+  identity, and video availability. A capture's build is independent of the
+  latest source or published release. Preserve its caption and provenance;
+  never substitute a mockup for product evidence.
 - `/context-window` does not exist on the current base; do not document it.
 - Subagent role identifiers are those the code accepts (`general`, `explore`,
   `planner`, `reviewer`, `implement`, `test`, `advisor`, `custom`); the older
@@ -78,12 +78,10 @@ no hosted runtime to sell.
 - Voice: quiet, dense, factual. Terminal vocabulary, no marketing superlatives,
   no fabricated transcripts or reasoning traces.
 - "It doesn't need to look special — it needs to look like Codewhale."
-- Assets: the founder's whale mark traced to `brand/mark.svg` (with
-  `brand/mark-navy.svg`, `brand/mark-gradient.svg`) and the founder's rounded
-  monoline wordmark traced from `brand/wordmark0901.png` (`brand/wordmark.svg`
-  navy #142352, `brand/wordmark-inverted.svg` white; regenerated with the site
-  icons by `scripts/brand/trace-brand.py`). Web copies live in
-  `web/public/brand/`.
+- Assets: retain the approved transparent whale in
+  `web/public/brand/mark-gradient.svg` and the existing wordmark SVGs in that
+  directory. The embedded client uses the same whale artwork. Do not redraw
+  or regenerate brand art as part of a layout change.
 - Palette, type, shell direction, and the anti-slop rules are recorded in
   `DESIGN.md`; the colour tokens are owned by `crates/tui/src/palette/tokens.rs`
   and exported to `web/app/tokens.css`.
@@ -91,9 +89,10 @@ no hosted runtime to sell.
 ## Evidence on Hand
 
 - Real: GitHub stars (live), release version and changelog (generated),
-  provider/tool counts (generated), the v0.9.12 development-build screenshot.
-- Absent, do not fabricate: testimonials, customer logos, benchmarks,
-  pricing, session video, or media of a published 0.9.12 release.
+  provider/tool counts (generated), and captures declared in the media manifest.
+- Use the canonical public content for pricing and surface availability.
+  Testimonials, customer logos, benchmarks, and session video require their own
+  evidence; a local UI fixture is not a real provider session or release proof.
 
 ## Product Principles
 

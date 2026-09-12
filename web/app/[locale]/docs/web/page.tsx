@@ -53,6 +53,13 @@ export default async function WebClientPage({ params }: { params: Promise<{ loca
         <p className={`${t.bodyClassName} mt-3`}>{t.overviewBody}</p>
       </section>
 
+      <section id="workflow" className="scroll-mt-32">
+        <h2 className="font-display text-2xl mb-1">{t.workflowTitle}</h2>
+        <p className={`${t.bodyClassName} mt-3`}>{t.workflowLead}</p>
+        <p className={`${t.bodyClassName} mt-3`}>{t.draftsBody}</p>
+        <p className={`${t.bodyClassName} mt-3`}>{t.shortcutsBody}</p>
+      </section>
+
       <section id="auth" className="scroll-mt-32">
         <h2 className="font-display text-2xl mb-1">{t.authTitle}</h2>
         <p className={`${t.bodyClassName} mt-3`}>{t.authLead}</p>

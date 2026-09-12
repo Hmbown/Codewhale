@@ -481,12 +481,82 @@ export function eventStreamUrl(threadId, latestSeq) {
 
 export function saveDraft(drafts, threadId, value) {
   if (!threadId) return;
+  drafts.delete(threadId);
   if (value) drafts.set(threadId, value);
-  else drafts.delete(threadId);
 }
 
 export function restoreDraft(drafts, threadId) {
   return drafts.get(threadId) || "";
+}
+
+const DRAFT_STORAGE_KEY = "codewhale.web.drafts.v1";
+
+export function readDrafts(storage) {
+  try {
+    const raw = storage?.getItem(DRAFT_STORAGE_KEY);
+    if (!raw || raw.length > 200_000) return new Map();
+    const entries = JSON.parse(raw);
+    if (!Array.isArray(entries)) return new Map();
+    return new Map(entries.slice(-50).filter((entry) => Array.isArray(entry)
+      && entry.length === 2 && typeof entry[0] === "string" && entry[0].length <= 200
+      && typeof entry[1] === "string" && entry[1].length <= 100_000));
+  } catch {
+    return new Map();
+  }
+}
+
+export function persistDrafts(storage, drafts) {
+  try {
+    if (!storage) return false;
+    const entries = [...drafts].slice(-50);
+    const value = JSON.stringify(entries);
+    if (value.length > 200_000 || entries.some(([id, draft]) => id.length > 200 || draft.length > 100_000)) {
+      storage.removeItem(DRAFT_STORAGE_KEY);
+      return false;
+    }
+    storage.setItem(DRAFT_STORAGE_KEY, value);
+    return true;
+  } catch {
+    // An outdated backup is worse than an honest memory-only draft.
+    try { storage?.removeItem(DRAFT_STORAGE_KEY); } catch { /* Storage is unavailable. */ }
+    return false;
+  }
+}
+
+// An acknowledgement belongs to the submitted draft, never to another thread
+// selected while the request was in flight or to text written afterward.
+export function acknowledgeDraft(drafts, threadId, submitted) {
+  if (restoreDraft(drafts, threadId) !== submitted) return false;
+  drafts.delete(threadId);
+  return true;
+}
+
+export function filterModels(models, query) {
+  const words = String(query || "").trim().toLowerCase().split(/\s+/).filter(Boolean);
+  return models.filter((model) => words.every((word) => modelOptionLabel(model).toLowerCase().includes(word)));
+}
+
+// Recognize fenced code without treating model text as HTML. Everything else
+// stays literal, including links and raw HTML; no remote content is loaded.
+export function messageBlocks(text) {
+  const blocks = [];
+  let lines = [];
+  let fence = "";
+  let language = "";
+  const flush = () => {
+    if (lines.length) blocks.push({ kind: fence ? "code" : "text", text: lines.join("\n"), language });
+    lines = [];
+  };
+  for (const line of String(text || "").split("\n")) {
+    const match = line.match(/^ {0,3}(`{3,}|~{3,})([^`~]*)$/);
+    if (!fence && match) {
+      flush(); fence = match[1]; language = match[2].trim();
+    } else if (fence && match && match[1][0] === fence[0] && match[1].length >= fence.length && !match[2].trim()) {
+      flush(); fence = ""; language = "";
+    } else lines.push(line);
+  }
+  flush();
+  return blocks;
 }
 
 export function pendingAttentionCount(summary) {
@@ -717,6 +787,8 @@ function startBrowserClient() {
     newThreadForm: document.querySelector("#new-thread-form"),
     newThreadProvider: document.querySelector("#new-thread-provider"),
     newThreadModel: document.querySelector("#new-thread-model"),
+    modelSearch: document.querySelector("#new-thread-model-search"),
+    modelSearchField: document.querySelector("#new-thread-model-search-field"),
     newThreadModelSelectField: document.querySelector("#new-thread-model-select-field"),
     newThreadModelInput: document.querySelector("#new-thread-model-input"),
     newThreadModelInputField: document.querySelector("#new-thread-model-input-field"),
@@ -727,7 +799,6 @@ function startBrowserClient() {
     connectionDot: document.querySelector("#connection-dot"),
     connectionLabel: document.querySelector("#connection-label"),
     runtimeProvenance: document.querySelector("#runtime-provenance"),
-    kicker: document.querySelector("#session-kicker"),
     title: document.querySelector("#session-title"),
     facts: document.querySelector("#session-facts"),
     rename: document.querySelector("#rename-thread"),
@@ -746,7 +817,15 @@ function startBrowserClient() {
     savedSessions: document.querySelector("#saved-sessions"),
     sessionList: document.querySelector("#session-list"),
     session: document.querySelector(".session"),
+    retry: document.querySelector("#retry-connection"),
+    theme: document.querySelector("#theme-toggle"),
+    jumpLatest: document.querySelector("#jump-latest"),
+    composerContext: document.querySelector("#composer-context"),
+    draftStatus: document.querySelector("#draft-status"),
   };
+
+  let draftStorage;
+  try { draftStorage = globalThis.sessionStorage; } catch { /* Private browsing can disable storage. */ }
 
   const app = {
     summaries: [],
@@ -763,7 +842,7 @@ function startBrowserClient() {
     threadState: createThreadState(),
     workspace: null,
     runtimeInfo: null,
-    drafts: new Map(),
+    drafts: readDrafts(draftStorage),
     stream: null,
     streamOpenCancel: null,
     reconnectTimer: null,
@@ -776,7 +855,28 @@ function startBrowserClient() {
     newThreadGeneration: 0,
     newThreadLoading: false,
     creatingThread: false,
+    pendingPrompt: "",
+    threadSearchGeneration: 0,
+    sessionSearchGeneration: 0,
   };
+
+  function rememberDraft() {
+    saveDraft(app.drafts, app.selectedThreadId, dom.composerInput.value);
+    const persisted = persistDrafts(draftStorage, app.drafts);
+    setSafeText(dom.draftStatus, dom.composerInput.value && app.selectedThreadId
+      ? persisted ? "Draft saved in this tab" : "Draft kept until this page closes" : "");
+  }
+
+  function setTheme(theme) {
+    document.documentElement.dataset.theme = theme;
+    const light = theme === "light";
+    setSafeText(dom.theme, light ? "Dark" : "Light");
+    dom.theme.setAttribute("aria-label", light ? "Use dark theme" : "Use light theme");
+    try { globalThis.localStorage.setItem("codewhale.web.theme", theme); } catch { /* Theme still applies. */ }
+  }
+  let theme = "dark";
+  try { if (globalThis.localStorage.getItem("codewhale.web.theme") === "light") theme = "light"; } catch { /* Default dark. */ }
+  setTheme(theme);
 
   const narrowRail = globalThis.matchMedia("(max-width: 800px)");
   const composerSendAction = "composer-send";
@@ -962,7 +1062,7 @@ function startBrowserClient() {
   function renderThreadList() {
     dom.threadList.replaceChildren();
     if (app.summaries.length === 0) {
-      const empty = element("p", "thread-preview", "No matching threads");
+      const empty = element("p", "thread-preview", dom.search.value.trim() ? "No threads match your search." : "Your work will appear here. Start a new thread to begin.");
       empty.style.padding = "8px 10px";
       dom.threadList.append(empty);
       return;
@@ -1014,9 +1114,12 @@ function startBrowserClient() {
   }
 
   async function loadThreads(search = dom.search.value.trim()) {
+    const generation = ++app.threadSearchGeneration;
     const query = new URLSearchParams({ limit: "100" });
     if (search) query.set("search", search);
-    app.summaries = await api(`/v1/threads/summary?${query.toString()}`);
+    const summaries = await api(`/v1/threads/summary?${query.toString()}`);
+    if (generation !== app.threadSearchGeneration) return app.summaries;
+    app.summaries = summaries;
     renderThreadList();
     return app.summaries;
   }
@@ -1060,11 +1163,15 @@ function startBrowserClient() {
   }
 
   async function loadSessions(search = dom.search.value.trim()) {
+    const generation = ++app.sessionSearchGeneration;
     const query = new URLSearchParams({ limit: "50" });
     if (search) query.set("search", search);
     try {
-      app.sessionSummaries = await api(`/v1/sessions/summary?${query.toString()}`);
+      const summaries = await api(`/v1/sessions/summary?${query.toString()}`);
+      if (generation !== app.sessionSearchGeneration) return app.sessionSummaries;
+      app.sessionSummaries = summaries;
     } catch (_error) {
+      if (generation !== app.sessionSearchGeneration) return app.sessionSummaries;
       // A runtime without a readable session store is not a broken dashboard;
       // hide the section rather than blocking the thread view behind an error.
       app.sessionSummaries = [];
@@ -1079,21 +1186,30 @@ function startBrowserClient() {
   // resuming spawns a real thread and an engine, which must be a deliberate
   // act, not a side effect of clicking a row to see what it was about.
   async function peekSession(sessionId) {
+    rememberDraft();
+    const generation = ++app.generation;
     stopStream();
     app.selectedThreadId = "";
     app.threadState = createThreadState();
     app.target = sessionTarget(sessionId);
+    app.peek = null;
+    dom.composerInput.value = "";
+    closeRailIfNarrow();
     showStatus("");
     renderThreadList();
     renderSessionList();
+    renderAll();
     try {
       // `?peek=true` returns a bounded, redacted projection — twelve entries,
       // tool payloads summarised — so the browser never receives the full
       // transcript in order to display a preview of it.
-      app.peek = await api(
+      const peek = await api(
         `/v1/sessions/${encodeURIComponent(sessionId)}?peek=true&entries=12`,
       );
+      if (generation !== app.generation) return;
+      app.peek = peek;
     } catch (error) {
+      if (generation !== app.generation) return;
       app.peek = null;
       showStatus(error.message);
     }
@@ -1176,7 +1292,7 @@ function startBrowserClient() {
 
   async function selectThread(threadId) {
     if (!threadId) return;
-    saveDraft(app.drafts, app.selectedThreadId, dom.composerInput.value);
+    rememberDraft();
     stopStream();
     app.selectedThreadId = threadId;
     // A live thread is now the target: from here the composer and approvals
@@ -1372,9 +1488,9 @@ function startBrowserClient() {
   function renderHeader() {
     const thread = app.threadState.thread;
     const summary = app.summaries.find((item) => item.id === app.selectedThreadId);
-    const title = thread?.title || summary?.title || (thread ? "New thread" : "Choose a thread");
+    const title = thread?.title || summary?.title || (app.target.kind === "session" ? "Saved session" : "Your workspace");
     setSafeText(dom.title, title);
-    setSafeText(dom.kicker, thread ? "Local Runtime thread" : "Local Runtime");
+    dom.rename.parentElement.hidden = !thread;
     dom.rename.disabled = !thread;
     dom.archive.disabled = !thread;
     dom.facts.replaceChildren();
@@ -1400,20 +1516,23 @@ function startBrowserClient() {
   }
 
   function renderTranscript(preserveScroll) {
+    dom.transcript.hidden = app.target.kind === "session";
+    dom.session.classList.toggle("is-peeking", app.target.kind === "session");
+    if (app.target.kind === "session") return;
     const wasNearBottom = dom.transcript.scrollHeight - dom.transcript.scrollTop - dom.transcript.clientHeight < 120;
     if (!app.threadState.thread) {
       renderTranscriptEmpty(
         "choose-thread",
-        "Your local agent, in the browser.",
-        "Create a thread or choose one from the rail. This client uses the same Runtime as the terminal.",
+        "What would you like to work on?",
+        "Start a thread in your workspace. Choose a model, set a direction, and follow the work as it happens.",
       );
       return;
     }
     if (app.threadState.itemOrder.length === 0) {
       renderTranscriptEmpty(
         "ready",
-        "Ready for a task.",
-        "Send a message below. Model, mode, and permission posture come from the Runtime and are shown read-only above.",
+        "A fresh thread. Your next idea.",
+        "Describe what you want to accomplish, or use a starting point below. Review the model and permissions above before you send.",
       );
       return;
     }
@@ -1437,8 +1556,10 @@ function startBrowserClient() {
     if (!preserveScroll || wasNearBottom) {
       requestAnimationFrame(() => {
         dom.transcript.scrollTop = dom.transcript.scrollHeight;
+        syncJumpLatest();
       });
     }
+    syncJumpLatest();
   }
 
   function renderTranscriptEmpty(kind, title, description) {
@@ -1470,12 +1591,62 @@ function startBrowserClient() {
     const empty = element("div", "empty-state");
     const mark = document.createElement("img");
     mark.className = "empty-mark";
-    mark.src = "/assets/codewhale-192.png";
+    mark.src = document.querySelector(".brand-mark").src;
     mark.alt = "";
     empty.append(mark);
     empty.append(element("h2", "", title));
     empty.append(element("p", "", description));
+    const starters = element("div", "task-starters");
+    for (const [label, prompt] of [
+      ["Explore a project", "Explain this project's structure and the most important parts to understand."],
+      ["Make a change", "Help me plan a change to this project. First, ask me what I want to build."],
+      ["Review my work", "Review the current changes for bugs, security concerns, and missing validation."],
+    ]) {
+      const button = element("button", "starter-button", label);
+      button.type = "button";
+      button.addEventListener("click", () => {
+        if (!app.threadState.thread) {
+          app.pendingPrompt = prompt;
+          void openNewThreadDialog();
+        } else {
+          dom.composerInput.value = dom.composerInput.value || prompt;
+          rememberDraft(); resizeComposer(); renderComposer(); dom.composerInput.focus();
+        }
+      });
+      starters.append(button);
+    }
+    empty.append(starters);
     return empty;
+  }
+
+  function syncJumpLatest() {
+    dom.jumpLatest.hidden = app.target.kind !== "thread" || dom.transcript.scrollHeight - dom.transcript.scrollTop - dom.transcript.clientHeight < 160;
+  }
+
+  function renderMessageBody(body, text, streaming) {
+    if (body.dataset.content === text && body.dataset.streaming === String(streaming)) return;
+    body.dataset.content = text;
+    body.dataset.streaming = String(streaming);
+    if (streaming) { setSafeText(body, text); return; }
+    const nodes = messageBlocks(text).map((block) => {
+      if (block.kind === "text") return element("div", "message-prose", block.text);
+      const figure = element("div", "message-code");
+      const bar = element("div", "message-code-bar");
+      bar.append(element("span", "", block.language || "Code"));
+      const copy = element("button", "quiet-button", "Copy code");
+      copy.type = "button";
+      copy.addEventListener("click", async () => {
+        try {
+          await navigator.clipboard.writeText(block.text);
+          setSafeText(copy, "Copied");
+          setTimeout(() => { if (copy.isConnected) setSafeText(copy, "Copy code"); }, 1600);
+        } catch { showStatus("Clipboard unavailable. Select the code and copy it manually."); }
+      });
+      bar.append(copy);
+      figure.append(bar, element("pre", "", block.text));
+      return figure;
+    });
+    body.replaceChildren(...nodes);
   }
 
   function renderItem(item) {
@@ -1521,7 +1692,9 @@ function startBrowserClient() {
       const role = item.kind === "user_message" ? "user" : "agent";
       card.className = `message ${role} ${item.status === "in_progress" ? "in-progress" : ""}`.trim();
       setTextIfChanged(card.querySelector('[data-item-part="label"]'), role === "user" ? "You" : "Codewhale");
-      setTextIfChanged(card.querySelector('[data-item-part="body"]'), detail);
+      const body = card.querySelector('[data-item-part="body"]');
+      if (role === "user") setTextIfChanged(body, detail);
+      else renderMessageBody(body, detail, item.status === "in_progress");
       return true;
     }
     if (item.kind === "agent_reasoning") {
@@ -1844,6 +2017,9 @@ function startBrowserClient() {
     dom.composer.setAttribute("aria-busy", sending ? "true" : "false");
     dom.interrupt.hidden = !active;
     setSafeText(dom.send, sending ? (active ? "Steering…" : "Sending…") : active ? "Steer" : "Send");
+    setSafeText(dom.composerContext, ready ? active ? "Add direction to the running task" : app.threadState.thread.model || "Runtime default" : "Choose a thread to start");
+    dom.composerInput.placeholder = active ? "Add a correction or the next instruction…" : "Describe a task, ask a question, or share an idea…";
+    if (!ready || !dom.composerInput.value) setSafeText(dom.draftStatus, "");
   }
 
   function selectedNewThreadProvider() {
@@ -1888,6 +2064,7 @@ function startBrowserClient() {
     const busy = app.newThreadLoading || app.creatingThread;
     dom.newThreadProvider.disabled = app.creatingThread || !app.providerCatalog?.providers?.length;
     dom.newThreadModel.disabled = busy || !hasCatalog || app.newThreadModels.length === 0;
+    dom.modelSearch.disabled = busy || !hasCatalog;
     dom.newThreadModelInput.disabled = busy || !provider || hasCatalog;
     dom.newThreadCancel.disabled = app.creatingThread;
     dom.newThreadCreate.disabled = busy || !provider || !selectedNewThreadModel();
@@ -1898,12 +2075,28 @@ function startBrowserClient() {
     const hasCatalog = Boolean(provider?.has_model_catalog);
     dom.newThreadModelSelectField.hidden = !hasCatalog;
     dom.newThreadModelInputField.hidden = hasCatalog;
+    dom.modelSearchField.hidden = !hasCatalog;
+  }
+
+  function renderModelOptions(preferred = dom.newThreadModel.value) {
+    const models = filterModels(app.newThreadModels, dom.modelSearch.value);
+    dom.newThreadModel.replaceChildren();
+    for (const model of models) {
+      const option = document.createElement("option");
+      option.value = model.id;
+      setSafeText(option, modelOptionLabel(model));
+      dom.newThreadModel.append(option);
+    }
+    if (models.some((model) => model.id === preferred)) dom.newThreadModel.value = preferred;
+    setNewThreadStatus(models.length ? `${models.length} ${models.length === 1 ? "model" : "models"} available` : "No matching models. Try another search.");
+    syncNewThreadControls();
   }
 
   async function loadNewThreadModels(providerId, preferredModel, generation) {
     if (generation !== app.newThreadGeneration || !dom.newThreadDialog.open) return;
     const provider = app.providerCatalog?.providers?.find((entry) => entry.id === providerId);
     app.newThreadModels = [];
+    dom.modelSearch.value = "";
     dom.newThreadModel.replaceChildren();
     dom.newThreadModelInput.value = "";
     setNewThreadModelSurface(provider);
@@ -1953,17 +2146,11 @@ function startBrowserClient() {
         models.unshift({ id: modelDefault, image_input: "unknown" });
       }
       app.newThreadModels = models;
-      for (const model of models) {
-        const option = document.createElement("option");
-        option.value = model.id;
-        setSafeText(option, modelOptionLabel(model));
-        dom.newThreadModel.append(option);
-      }
       const selectedDefault = models.find(
         (model) => model.id.toLowerCase() === modelDefault.toLowerCase(),
       );
-      if (selectedDefault) dom.newThreadModel.value = selectedDefault.id;
       app.newThreadLoading = false;
+      renderModelOptions(selectedDefault?.id);
       setNewThreadStatus(
         models.length ? "" : "No models are available for this provider.",
         models.length ? "" : "error",
@@ -2042,6 +2229,10 @@ function startBrowserClient() {
     );
     app.creatingThread = false;
     if (thread) {
+      if (app.pendingPrompt) {
+        dom.composerInput.value = app.pendingPrompt;
+        rememberDraft(); resizeComposer(); renderComposer();
+      }
       dom.newThreadDialog.close();
       dom.composerInput.focus();
       return;
@@ -2069,7 +2260,8 @@ function startBrowserClient() {
   }
 
   async function sendMessage() {
-    const prompt = dom.composerInput.value.trim();
+    const submitted = dom.composerInput.value;
+    const prompt = submitted.trim();
     if (!prompt) return;
     // A reply goes to a live thread or nowhere. A saved-session peek must not
     // silently resume-and-send: that would attach the user's message to a
@@ -2106,8 +2298,9 @@ function startBrowserClient() {
           body: JSON.stringify({ prompt }),
         });
       }
-      saveDraft(app.drafts, threadId, "");
-      dom.composerInput.value = "";
+      acknowledgeDraft(app.drafts, threadId, submitted);
+      persistDrafts(draftStorage, app.drafts);
+      if (app.selectedThreadId === threadId && dom.composerInput.value === submitted) dom.composerInput.value = "";
       resizeComposer();
       renderComposer();
       loadThreads().catch((error) => showStatus(error.message));
@@ -2143,6 +2336,10 @@ function startBrowserClient() {
       saveDraft(app.drafts, app.selectedThreadId, "");
       stopStream();
       app.selectedThreadId = "";
+      app.target = NO_TARGET;
+      app.generation += 1;
+      dom.composerInput.value = "";
+      persistDrafts(draftStorage, app.drafts);
       app.threadState = createThreadState();
       await loadThreads();
       if (app.summaries[0]) await selectThread(app.summaries[0].id);
@@ -2207,6 +2404,7 @@ function startBrowserClient() {
     );
   });
   dom.newThreadModel.addEventListener("change", syncNewThreadControls);
+  dom.modelSearch.addEventListener("input", () => renderModelOptions());
   dom.newThreadModelInput.addEventListener("input", syncNewThreadControls);
   dom.newThreadCancel.addEventListener("click", () => {
     if (!app.creatingThread) dom.newThreadDialog.close();
@@ -2218,6 +2416,7 @@ function startBrowserClient() {
     trapFocusWithin(event, dom.newThreadDialog);
   });
   dom.newThreadDialog.addEventListener("close", () => {
+    app.pendingPrompt = "";
     app.newThreadGeneration += 1;
     app.newThreadLoading = false;
     setNewThreadStatus("");
@@ -2231,7 +2430,7 @@ function startBrowserClient() {
     sendMessage();
   });
   dom.composerInput.addEventListener("input", () => {
-    saveDraft(app.drafts, app.selectedThreadId, dom.composerInput.value);
+    rememberDraft();
     resizeComposer();
     renderComposer();
   });
@@ -2248,7 +2447,13 @@ function startBrowserClient() {
     }, 180);
   });
   document.addEventListener("keydown", (event) => {
-    if (dom.newThreadDialog.open) return;
+    if (dom.newThreadDialog.open || dom.renameDialog.open || event.isComposing) return;
+    if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") {
+      event.preventDefault(); openRail(); dom.search.focus(); dom.search.select(); return;
+    }
+    if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "n") {
+      event.preventDefault(); void openNewThreadDialog(); return;
+    }
     if (trapRailFocus(event)) return;
     if (event.key === "Escape" && narrowRail.matches && dom.shell.classList.contains("rail-visible")) {
       event.preventDefault();
@@ -2260,8 +2465,19 @@ function startBrowserClient() {
   globalThis.visualViewport?.addEventListener("scroll", syncVisualViewport);
   globalThis.addEventListener("resize", syncVisualViewport);
   globalThis.addEventListener("beforeunload", stopStream);
+  dom.theme.addEventListener("click", () => setTheme(document.documentElement.dataset.theme === "light" ? "dark" : "light"));
+  dom.retry.addEventListener("click", () => void initialize());
+  dom.transcript.addEventListener("scroll", syncJumpLatest, { passive: true });
+  dom.jumpLatest.addEventListener("click", () => { dom.transcript.scrollTop = dom.transcript.scrollHeight; syncJumpLatest(); });
 
   async function initialize() {
+    if (dom.retry.disabled) return;
+    dom.retry.disabled = true;
+    rememberDraft();
+    stopStream();
+    app.generation += 1;
+    const previousThread = app.selectedThreadId;
+    showStatus("");
     syncVisualViewport();
     syncRailAccessibility();
     try {
@@ -2273,12 +2489,15 @@ function startBrowserClient() {
       setConnection("ready", "Local runtime connected");
       await loadThreads();
       await loadSessions();
-      if (app.summaries[0]) await selectThread(app.summaries[0].id);
+      if (app.summaries.some((thread) => thread.id === previousThread)) await selectThread(previousThread);
+      else if (app.summaries[0]) await selectThread(app.summaries[0].id);
       else renderAll();
     } catch (error) {
       setConnection("error", "Runtime connection failed");
       showStatus(error.message);
       renderAll();
+    } finally {
+      dom.retry.disabled = false;
     }
   }
 

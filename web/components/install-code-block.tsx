@@ -7,9 +7,10 @@ interface Props {
   cmd: string;
   copyLabel?: string;
   copiedLabel?: string;
+  trackInstall?: boolean;
 }
 
-export function InstallCodeBlock({ cmd, copyLabel = "Copy", copiedLabel = "Copied ✓" }: Props) {
+export function InstallCodeBlock({ cmd, copyLabel = "Copy", copiedLabel = "Copied ✓", trackInstall = true }: Props) {
   const [copied, setCopied] = useState(false);
 
   const copy = async () => {
@@ -17,7 +18,7 @@ export function InstallCodeBlock({ cmd, copyLabel = "Copy", copiedLabel = "Copie
     try {
       await navigator.clipboard.writeText(cmd);
       setCopied(true);
-      recordUsage("install_copy");
+      if (trackInstall) recordUsage("install_copy");
       setTimeout(() => setCopied(false), 1400);
     } catch {
       // Clipboard write failed (permissions, non-secure context, or a focused
