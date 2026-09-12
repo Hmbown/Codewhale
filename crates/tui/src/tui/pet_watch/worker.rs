@@ -85,12 +85,25 @@ impl AudioCursor {
         target: &Target,
         time_ms: f64,
     ) -> rquickjs::Result<()> {
-        let end = (time_ms * audio::SAMPLE_RATE as f64 / 1000.0).floor() as usize;
         if !target.current() {
-            self.sample = end;
+            self.sample = (time_ms * audio::SAMPLE_RATE as f64 / 1000.0).floor() as usize;
             self.voices.clear();
             return Ok(());
         }
+        if let Some(channels) = self.render_samples(ctx, time_ms)? {
+            target
+                .send(channels)
+                .map_err(|_| rquickjs::Error::Unknown)?;
+        }
+        Ok(())
+    }
+
+    fn render_samples(
+        &mut self,
+        ctx: &rquickjs::Ctx<'_>,
+        time_ms: f64,
+    ) -> rquickjs::Result<Option<[Vec<f32>; 2]>> {
+        let end = (time_ms * audio::SAMPLE_RATE as f64 / 1000.0).floor() as usize;
         // A pause, new output or delayed catch-up cannot play historical sound.
         if end < self.sample || end - self.sample > audio::MAX_FRAMES {
             self.sample = end;
@@ -111,7 +124,7 @@ impl AudioCursor {
             return Err(rquickjs::Error::Unknown);
         }
         if end == self.sample {
-            return Ok(());
+            return Ok(None);
         }
         ctx.globals().set(
             "petAudioVoices",
@@ -126,11 +139,8 @@ impl AudioCursor {
         if channels[0].len() != end - self.sample || channels[1].len() != end - self.sample {
             return Err(rquickjs::Error::Unknown);
         }
-        target
-            .send(channels)
-            .map_err(|_| rquickjs::Error::Unknown)?;
         self.sample = end;
-        Ok(())
+        Ok(Some(channels))
     }
 }
 
@@ -399,7 +409,7 @@ mod tests {
     fn audio_cursor_preserves_the_shared_score_across_buffer_boundaries() {
         let runtime = Runtime::new().unwrap();
         let context = Context::full(&runtime).unwrap();
-        let (sink, packets) = audio::Output::capture();
+        let (sink, _packets) = audio::Output::capture();
         context.with(|ctx| {
             let points: Vec<Vec<f64>> = include_str!("../ambient_life/whale-points.tsv")
                 .lines()
@@ -412,16 +422,16 @@ mod tests {
                 globalThis.allVoices = [];"#).unwrap();
             let mut cursor = AudioCursor { target: sink.target(), sample: 0, voices: Vec::new() };
             let mut received = Vec::new();
-            // Use world-sized buffers: a 400 ms PCM render can legitimately
-            // expire the 500 ms presentation deadline on a loaded CI runner.
-            // The expiry policy is covered separately by the audio sink tests.
+            // Compare the actual cursor's samples without a wall-clock delivery
+            // deadline. The sink tests cover expiry, queue bounds and interleaving.
             for tick in 1..=48 {
                 let at = f64::from(tick) * 1000.0 / 30.0;
                 ctx.globals().set("timeMs", at).unwrap();
                 ctx.eval::<(), _>("pet.advanceEngine(timeMs,false,true); allVoices.push(...JSON.parse(pet.snapshot()).voices)").unwrap();
                 let time: f64 = ctx.eval("JSON.parse(pet.snapshot()).timeMs").unwrap();
-                cursor.present(&ctx, &sink.target(), time).unwrap();
-                received.extend(packets.try_recv().unwrap().bytes);
+                let [left, right] = cursor.render_samples(&ctx, time).unwrap().unwrap();
+                received.extend(left.iter().zip(&right)
+                    .flat_map(|(l, r)| [*l, *r]).flat_map(f32::to_le_bytes));
             }
             let expected: String = ctx.eval(format!("pet.pcm(JSON.stringify(allVoices),0,{},48000)", cursor.sample)).unwrap();
             let [left, right]: [Vec<f32>; 2] = serde_json::from_str(&expected).unwrap();

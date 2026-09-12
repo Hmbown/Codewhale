@@ -120,7 +120,11 @@ The older TSV is a particle conformance tape and cannot preserve audio onsets.
 
 macOS watches `~/.codewhale/pet-state`. iOS watches `pet-state` in Documents.
 File replacement and source restart are handled by the existing host watchers.
-Authenticated attachment to a real running session still needs acceptance QA.
+Authenticated read-only attachment has been exercised against a running local
+Runtime 0.9.13 and an existing session journal. Old completed work remains unknown
+at the recorder's current clock. The recorder also closes an idle stream after
+garbage collection. Receiving new active-session work through native companion
+surfaces still needs acceptance QA.
 
 ## Persistence and current limits
 
@@ -141,5 +145,5 @@ Native habitats are limited to 8 MiB; the QuickJS worker has a 64 MiB memory
 limit. Two-hour restoration has been exercised, but serializing full long tapes
 still costs seconds in QuickJS. History rotation and long-session performance
 remain open. Physical Android device acceptance, macOS popover inspection,
-authenticated Runtime attachment, content-driven forms and final listening/power quality
+active-session companion acceptance, content-driven forms and final listening/power quality
 are unfinished. This branch is a reviewable prototype, not a release candidate.

@@ -36,7 +36,9 @@ export async function followRuntime({ baseUrl, threadId, token, report = () => {
       client.fetchImpl = async (input, init) => {
         const response = await fetchImpl(input, init);
         if (!response.body || !response.ok) return response;
-        const body = response.body.pipeThrough(new TransformStream({ transform(chunk, controller) { refresh(); controller.enqueue(chunk); } }));
+        // Cancel the wrapped pipeline too: the original Response can be collected
+        // while its idle body is still being read through the replacement below.
+        const body = response.body.pipeThrough(new TransformStream({ transform(chunk, controller) { refresh(); controller.enqueue(chunk); } }), { signal });
         return new Response(body, { status: response.status, headers: response.headers });
       };
       try {

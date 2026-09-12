@@ -17,9 +17,10 @@ npm test
 npm run check:web
 ```
 
-The pet suite currently contains 38 tests: event occupancy/unknown coverage,
+The pet suite currently contains 39 tests: event occupancy/unknown coverage,
 late failures, human request pairing, read-only local SSE reconnect/cursor
-recovery, deterministic world/score/PCM, checkpoint integrity and continuation, expression-version validation and legacy replay.
+recovery and cancellation after garbage collection, deterministic world/score/PCM,
+checkpoint integrity and continuation, expression-version validation and legacy replay.
 The standalone verifier compares 380 checkpoints across baseline and edge tapes,
 each animated and still, under expression versions 1 and 2. Version 1 must also
 match pinned pre-transformation golden digests. Omission of Swift is explicit in its output.
@@ -86,7 +87,7 @@ open junctions; the same particle identities return to the whale at rest.
 
 ## Local evidence before publication (2026-09-12)
 
-- Packaged pet: 38 tests passed; existing Whalesong consumers: 306 passed after
+- Packaged pet: 39 tests passed; existing Whalesong consumers: 306 passed after
   canonical source relocation. These are overlapping suites, not additive coverage.
 - Product Node gate: 66 package, 12 SDK and 446 web tests passed; production web
   check subsequently passed with the GitHub release fetch available.
@@ -104,6 +105,12 @@ open junctions; the same particle identities return to the whale at rest.
   Android 15 ARM64, including 4,800 frames, checkpoint continuation, exact PCM,
   lifecycle and storage recovery. The emulator audio sink runs without host
   speaker output; this does not establish physical listening or power quality.
+- Authenticated read-only attachment to an existing local Runtime 0.9.13 session
+  journal passed. An 18-second recorder run produced 45 contiguous unknown buckets
+  and stopped cleanly in 41 ms after Ctrl+C, without treating historical work as
+  current activity. This does not establish a new active provider turn or native
+  companion acceptance. The old idle-stream shutdown failure is covered by a
+  real HTTP regression fixture that forces garbage collection before closing.
 
 Hosted CI and Grokbot findings are separate evidence. Their actual results belong
 on the pull request. Open implementation gaps are listed in [README.md](README.md).

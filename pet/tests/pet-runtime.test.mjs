@@ -16,6 +16,42 @@ test('Runtime pet input refuses remote hosts, credentials, paths and missing thr
   await assert.rejects(followRuntime({ baseUrl: 'http://127.0.0.1:1', threadId: '' }), /thread/);
 });
 
+test('Runtime shutdown closes an idle SSE body after garbage collection', { timeout: 10_000 }, async t => {
+  let response, closed = false;
+  const server = createServer((req, res) => {
+    response = res;
+    res.once('close', () => { closed = true; });
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.write(`data: ${JSON.stringify({ seq: 1, previous_seq: 0, event: 'thread.updated',
+      thread_id: 'fixture', timestamp: new Date().toISOString(), payload: {} })}\n\n`);
+    // Stay open without new chunks: cancellation must wake the idle reader.
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  const script = `
+    import assert from 'node:assert/strict';
+    import { setTimeout as delay } from 'node:timers/promises';
+    import { followRuntime } from './scripts/lib/pet-runtime.mjs';
+    const input = await followRuntime({ baseUrl: 'http://127.0.0.1:${server.address().port}', threadId: 'fixture' });
+    for (let i = 0; !input.connected && i < 200; i++) await delay(10);
+    assert.equal(input.cursor, 1);
+    globalThis.gc(); await delay(20); globalThis.gc();
+    const deadline = setTimeout(() => { console.error('Idle Runtime reader did not stop'); process.exit(2); }, 2_000);
+    await input.close(); clearTimeout(deadline);
+    assert.equal(input.connected, false);
+  `;
+  const child = spawn(process.execPath, ['--expose-gc', '--input-type=module', '-e', script],
+    { cwd: new URL('../', import.meta.url), stdio: ['ignore', 'pipe', 'pipe'] });
+  const exited = once(child, 'exit'); let log = '';
+  child.stdout.on('data', b => log += b); child.stderr.on('data', b => log += b);
+  t.after(async () => {
+    if (child.exitCode === null) child.kill('SIGKILL');
+    response?.destroy(); server.closeAllConnections();
+    await new Promise(resolve => server.close(resolve));
+  });
+  const [code] = await exited;
+  assert.equal(code, 0, log); assert.ok(closed, 'The server must see the reader disconnect');
+});
+
 test('the CLI follows real Runtime SSE envelopes through disconnect and cursor recovery, recording no prompt content', { timeout: 15_000 }, async t => {
   let sequence = 0, connections = 0, stream, pulse;
   const requests = [], responses = new Set();
