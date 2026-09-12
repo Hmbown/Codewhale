@@ -28,7 +28,7 @@ enum class PetMode(val key: String, val label: String, val detail: String) {
 data class PetUiState(val scene: PetScene? = null, val mode: PetMode = PetMode.WILD,
     val paused: Boolean = false, val sound: Boolean = false, val still: Boolean = false,
     val systemStill: Boolean = false, val message: String? = null, val savedAtMs: Double? = null,
-    val canExportRecovery: Boolean = false)
+    val canExportRecovery: Boolean = false, val running: Boolean = false)
 
 /** A single actor owns core, audio cursor and save revision. Compose receives
  * immutable projections and never reads a particle while it is being stepped. */
@@ -80,10 +80,17 @@ class PetViewModel(application: Application) : AndroidViewModel(application) {
                                 val command = commands.tryReceive().getOrNull() ?: break
                                 try { handle(command) } catch (e: Exception) { message(e) }
                             }
-                            val playing = active && !paused
+                            val framePaused = paused
+                            val frameStill = still
+                            val frameSystemStill = systemStill
+                            val playing = active && !framePaused
                             if (!playing) {
                                 stopAudio()
                                 if (wasPlaying) save()
+                                // Acknowledge Pause only after the in-flight frame,
+                                // output and save have settled on their owning worker.
+                                mutable.update { it.copy(paused = framePaused, running = false,
+                                    still = frameStill, systemStill = frameSystemStill) }
                             } else {
                                 val pet = checkNotNull(core)
                                 if (!sound) stopAudio()
@@ -93,12 +100,14 @@ class PetViewModel(application: Application) : AndroidViewModel(application) {
                                         cursor = PetAudioCursor(pet.timeMs)
                                     } catch (e: Exception) { audioFailed(e) }
                                 }
-                                val scene = pet.tick(!still && !systemStill)
+                                val scene = pet.tick(!frameStill && !frameSystemStill)
+                                if (!active || paused || !sound) stopAudio()
                                 if (output != null) {
                                     try { cursor?.next(pet)?.let { output?.offer(it) } }
                                     catch (e: Exception) { audioFailed(e) }
                                 }
-                                mutable.update { it.copy(scene = scene) }
+                                mutable.update { it.copy(scene = scene, paused = false, running = true,
+                                    still = frameStill, systemStill = frameSystemStill) }
                                 if (began - lastSave >= 5_000) save()
                             }
                             wasPlaying = playing
@@ -123,10 +132,10 @@ class PetViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun setActive(value: Boolean) { active = value }
-    fun setPaused(value: Boolean) { paused = value; mutable.update { it.copy(paused = value) } }
+    fun setPaused(value: Boolean) { paused = value }
     fun setSound(value: Boolean) { sound = value; mutable.update { it.copy(sound = value) } }
-    fun setStill(value: Boolean) { still = value; prefs.edit().putBoolean("still", value).apply(); mutable.update { it.copy(still = value) } }
-    fun setSystemStill(value: Boolean) { systemStill = value; mutable.update { it.copy(systemStill = value) } }
+    fun setStill(value: Boolean) { still = value; prefs.edit().putBoolean("still", value).apply() }
+    fun setSystemStill(value: Boolean) { systemStill = value }
     fun mode(value: PetMode) = enqueue(Command.Mode(value))
     fun interact(food: Boolean) = enqueue(Command.Interact(food))
     fun importRecording(uri: Uri) = enqueue(Command.Import(uri))

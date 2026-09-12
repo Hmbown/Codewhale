@@ -18,7 +18,7 @@ class PetLifecycleTest {
         assertFalse(model.ui.value.sound)
         compose.runOnIdle { model.setStill(false); model.setPaused(false) }
         compose.onNodeWithText("Pause").performClick()
-        Thread.sleep(200)
+        compose.waitUntil(5_000) { model.ui.value.paused && !model.ui.value.running }
         val paused = model.ui.value.scene!!
         Thread.sleep(300)
         assertEquals(paused.timeMs, model.ui.value.scene!!.timeMs, 0.0)
@@ -26,14 +26,14 @@ class PetLifecycleTest {
         compose.onNodeWithText("Still off").performClick()
         compose.onNodeWithText("Sound off").performClick()
         compose.onNodeWithText("Resume").performClick()
-        compose.waitUntil(5_000) { model.ui.value.scene!!.timeMs > paused.timeMs + 200 }
+        compose.waitUntil(5_000) { model.ui.value.still && model.ui.value.scene!!.timeMs > paused.timeMs + 200 }
         assertTrue(model.ui.value.sound)
         Thread.sleep(100)
         val still = model.ui.value.scene!!
         Thread.sleep(200)
         assertArrayEquals(still.dots, model.ui.value.scene!!.dots, 0f)
         compose.activityRule.scenario.moveToState(Lifecycle.State.CREATED)
-        Thread.sleep(250)
+        compose.waitUntil(5_000) { !model.ui.value.running && model.ui.value.savedAtMs == model.ui.value.scene!!.timeMs }
         val hidden = model.ui.value.scene!!
         Thread.sleep(300)
         assertEquals(hidden.timeMs, model.ui.value.scene!!.timeMs, 0.0)

@@ -52,6 +52,7 @@ fun petContentDescription(scene: PetScene): String = buildList {
     add("Codewhale"); add(scene.style.channel); add(scene.style.arch)
     if (scene.style.hollow) add("unobserved")
     add(scene.behaviour)
-    if (scene.needs != "none") add("input pending")
+    if (scene.needs != "none" && scene.style.channel == "human" && !scene.style.hollow && scene.state.attention > 0.5)
+        add("input pending")
     if (scene.peers >= 3) add("${scene.peers} pod members")
 }.joinToString(", ")
