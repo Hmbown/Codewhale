@@ -49,13 +49,14 @@ export function redact(value: unknown, path = '', hook?: ImportOptions['redactor
   if (value && typeof value === 'object') seen.delete(value);
   return hook ? hook(out, path) : out;
 }
-function privacyEvent(e: WhaleEvent, mode: PrivacyMode): WhaleEvent {
+export function privacyEvent(e: WhaleEvent, mode: PrivacyMode): WhaleEvent {
   if (mode === 'metadata') {
     const { payload: _payload, raw: _raw, ...rest } = e;
     return { ...rest, links: e.links?.map(link=>({traceId:link.traceId,spanId:link.spanId})), attributes: Object.fromEntries(Object.entries(e.attributes).filter(([k, v]) =>
       SAFE_META.test(k) && (typeof v !== 'object' || v === null)
       || ['whalesong.container', 'codewhale.container', 'whalesong.waiting'].includes(k) && typeof v === 'boolean'
-      || k === 'whalesong.error_onset_ms' && typeof v === 'number' && Number.isFinite(v) && v >= 0)) };
+      // Relative timestamps can be negative before the importer rebases them.
+      || k === 'whalesong.error_onset_ms' && typeof v === 'number' && Number.isFinite(v))) };
   }
   return e;
 }

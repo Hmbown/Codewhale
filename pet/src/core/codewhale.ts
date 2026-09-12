@@ -301,193 +301,252 @@ function itemCategory(kind: string, tool?: string): Category {
   return classify(kind);
 }
 
-export function fromCodewhaleRuntime(records: unknown[], filename = 'Codewhale runtime', maxEvents = 250_000): Trace {
-  if (!records.length) throw new Error('Codewhale runtime event file is empty.');
-  const first = obj(records[0]);
-  const threadId = str(first.thread_id) ?? filename;
-  const warnings: string[] = [];
-  let skippedDeltas = 0;
-  const open = new Map<string, { index: number; startWall: number }>();
-  const requests = new Map<string, WhaleEvent>();
-  const events: WhaleEvent[] = [];
-  let origin: number | undefined;
-  let model: string | undefined;
-  let threadName = threadId;
-
-  const stamp = (rec: Obj): number => {
-    const t = parseTime(rec.timestamp);
-    if (t === undefined) throw new Error(`Runtime event seq ${rec.seq} is missing a usable timestamp.`);
-    if (origin === undefined) origin = t;
-    return t - origin;
-  };
-
-  for (const raw of records) {
-    if (!isCodewhaleRuntimeRecord(raw)) throw new Error('Runtime import cancelled: a line is not a Codewhale runtime event record. No rows were skipped.');
-    const rec = obj(raw);
-    if (rec.thread_id !== threadId) throw new Error('Runtime import contains multiple threads. Export one thread before importing.');
-    const eventName = rec.event as string;
-    if (eventName === 'item.delta') { skippedDeltas++; continue; }
-    if (events.length >= maxEvents) throw new Error(`Import exceeds the ${maxEvents.toLocaleString()} event limit.`);
-    const payload = obj(rec.payload);
-    const item = obj(payload.item);
-    const turn = obj(payload.turn);
-    const thread = obj(payload.thread);
-    const relative = stamp(rec);
-    const turnId = str(rec.turn_id) ?? str(payload.turn_id);
-    const itemId = str(rec.item_id) ?? str(item.id);
-    const agentId = 'parent';
-    if (str(thread.model)) model = str(thread.model);
-    if (str(turn.model)) model = str(turn.model) ?? model;
-
-    if (eventName === 'thread.started') {
-      model = str(thread.model) ?? model;
-      threadName = str(thread.id) ?? threadId;
-      pushEvent(events, {
-        schemaVersion: 1, id: `thread:${threadId}`, traceId: threadId,
-        startTime: relative, endTime: relative, openEnded: true,
-        agentId, name: 'thread', category: 'orchestration', model, status: 'running',
-        attributes: { 'codewhale.seq': rec.seq, 'whalesong.container': true }, raw: rec,
-      });
-      continue;
+/** Incremental form of the existing Runtime importer. File imports and live
+ * recording share this exact lifecycle parser; only a live driver retires old
+ * completed events after it has recorded their projection. */
+export class CodewhaleRuntimeTrace {
+  private readonly events: WhaleEvent[] = [];
+  private readonly open = new Map<string, WhaleEvent>();
+  private readonly requests = new Map<string, WhaleEvent>();
+  private readonly sizes = new Map<WhaleEvent, number>();
+  private bytes = 0;
+  private recordCount = 0;
+  private skippedDeltas = 0;
+  private origin: number | undefined;
+  private model: string | undefined;
+  private threadId: string | undefined;
+  private threadName: string | undefined;
+  constructor(private readonly filename = 'Codewhale runtime', private readonly maxEvents = 250_000,
+    private readonly project: (event: WhaleEvent) => WhaleEvent = event => event,
+    private readonly maxBytes = Infinity) {}
+  get retainedEvents(): number { return this.events.length; }
+  get retainedBytes(): number { return this.bytes; }
+  private measure(event: WhaleEvent, proposed = event): void {
+    const safe = this.project(proposed);
+    if (this.maxBytes !== Infinity) {
+      const size = new TextEncoder().encode(JSON.stringify(safe)).length;
+      const total = this.bytes - (this.sizes.get(event) ?? 0) + size;
+      if (total > this.maxBytes) throw new Error('Runtime observation exceeds its retained input limit.');
+      this.bytes = total; this.sizes.set(event, size);
     }
-    if (eventName === 'turn.started' || eventName === 'turn.completed') {
-      const id = `turn:${turnId ?? rec.seq}`;
-      if (eventName === 'turn.completed') for (const [key, request] of requests) {
-        if (request.parentId !== id) continue;
-        request.endTime = Math.max(request.startTime, relative);
-        request.openEnded = false; request.status = 'unknown'; requests.delete(key);
+    for (const key of Object.keys(event)) if (!Object.hasOwn(safe, key)) delete (event as unknown as Obj)[key];
+    Object.assign(event, safe);
+  }
+  private push(event: WhaleEvent): void {
+    if (this.events.length >= this.maxEvents) throw new Error(`Import exceeds the ${this.maxEvents.toLocaleString()} event limit.`);
+    this.measure(event); pushEvent(this.events, event);
+  }
+  /** Keep unfinished lifetimes plus the recent window needed by the bucketer's
+   * 12-second recurrence measure. A completion may still arrive for any open item. */
+  prune(beforeWall: number): void {
+    if (!Number.isFinite(beforeWall)) throw new Error('Invalid Runtime retention horizon.');
+    if (this.origin === undefined) return;
+    const cutoff = beforeWall - this.origin;
+    let keep = 0;
+    for (const event of this.events) {
+      if (event.openEnded || Math.max(event.endTime, errorOnsetOf(event)) >= cutoff) this.events[keep++] = event;
+      else {
+        this.bytes -= this.sizes.get(event) ?? 0; this.sizes.delete(event);
+        if (this.open.get(event.id) === event) this.open.delete(event.id);
       }
-      const startWall = parseTime(turn.started_at) ?? parseTime(turn.created_at);
-      const endWall = parseTime(turn.ended_at);
-      const start = startWall !== undefined && origin !== undefined ? startWall - origin : relative;
-      const end = eventName === 'turn.completed' && endWall !== undefined && origin !== undefined ? endWall - origin : relative;
-      const usage = obj(turn.usage);
-      const existing = events.findIndex(e => e.id === id);
-      const next: WhaleEvent = {
-        schemaVersion: 1, id, traceId: threadId, parentId: `thread:${threadId}`,
-        startTime: start, endTime: Math.max(start, end), openEnded: eventName !== 'turn.completed',
-        agentId, name: 'turn', category: 'orchestration', model,
-        inputTokens: num(usage.input_tokens), outputTokens: num(usage.output_tokens),
-        status: statusOf(turn.status ?? payload.status), latency: num(turn.duration_ms),
-        attributes: { 'codewhale.seq': rec.seq, 'codewhale.turn_id': turnId, 'whalesong.container': true,
-          ...(statusOf(turn.status ?? payload.status) === 'error' ? { 'whalesong.error_onset_ms': relative } : {}) },
-        payload: { input_summary: clip(turn.input_summary) }, raw: rec,
-      };
-      if (existing >= 0) events[existing] = { ...events[existing]!, ...next, startTime: events[existing]!.startTime };
-      else pushEvent(events, next);
-      continue;
     }
-    if (eventName === 'turn.lifecycle') continue;
-    if (['approval.required', 'approval.decided', 'approval.timeout', 'user_input.required', 'user_input.answered', 'user_input.canceled'].includes(eventName)) {
-      const kind = eventName.startsWith('approval.') ? 'approval' : 'user_input';
-      const requestId = str(payload[kind === 'approval' ? 'approval_id' : 'input_id']) ?? str(payload.id);
-      if (!requestId) throw new Error(`Runtime ${eventName} is missing its request identity.`);
-      const key = JSON.stringify([turnId ?? '', kind, requestId]);
-      const prior = requests.get(key), required = eventName.endsWith('.required');
-      if (required && prior) continue;
-      if (!required && prior) {
-        prior.endTime = Math.max(prior.startTime, relative); prior.openEnded = false;
-        prior.status = eventName === 'approval.decided' || eventName === 'user_input.answered' ? 'success' : 'unknown';
-        if (payload.auto === true) {
-          // Automatic consent has a receipt, but never asked the human to wait.
-          prior.category = 'orchestration'; delete prior.attributes['whalesong.waiting'];
-          prior.attributes['whalesong.container'] = true;
-        }
-        requests.delete(key); continue;
-      }
-      const automatic = payload.auto === true;
-      const event: WhaleEvent = {
-        schemaVersion: 1, id: `request:${key}:${rec.seq}`, traceId: threadId,
-        parentId: turnId ? `turn:${turnId}` : undefined, startTime: relative, endTime: relative,
-        openEnded: required, agentId, name: eventName, category: automatic ? 'orchestration' : 'human',
-        status: required ? 'pending' : 'success', model,
-        attributes: { 'codewhale.seq': rec.seq, 'whalesong.waiting': required, 'whalesong.container': automatic }, raw: rec,
-      };
-      if (required) requests.set(key, event);
-      pushEvent(events, event); continue;
-    }
-    if (eventName === 'tool_call.requested' || eventName === 'tool_call.canceled') {
-      const callId = str(payload.call_id) ?? `call:${rec.seq}`;
-      const tool = str(payload.tool);
-      const canceled = eventName === 'tool_call.canceled';
-      pushEvent(events, {
-        schemaVersion: 1, id: `${eventName}:${callId}`, traceId: threadId, parentId: turnId ? `turn:${turnId}` : undefined,
-        startTime: relative, endTime: relative, agentId, name: tool ?? eventName, tool,
-        category: tool ? toolCategory(tool) : 'tool', model, status: canceled ? 'error' : 'pending',
-        attributes: { 'codewhale.seq': rec.seq, 'codewhale.turn_id': turnId, 'codewhale.call_id': callId, reason: payload.reason },
-        payload: { arguments: clip(payload.arguments) }, raw: rec,
-      });
-      continue;
-    }
-    if (eventName === 'item.started' || eventName === 'item.completed') {
-      const kind = str(item.kind) ?? 'item';
-      const tool = itemToolName(item, payload);
-      const id = itemId ?? `item:${rec.seq}`;
-      const startWall = parseTime(item.started_at);
-      const endWall = parseTime(item.ended_at);
-      const start = startWall !== undefined && origin !== undefined ? startWall - origin : relative;
-      const end = eventName === 'item.completed' && endWall !== undefined && origin !== undefined ? endWall - origin : relative;
-      const openEnded = eventName === 'item.started' && endWall === undefined;
-      const existing = open.get(id);
-      if (existing && eventName === 'item.completed') {
-        const prior = events[existing.index]!;
-        prior.endTime = Math.max(prior.startTime, end);
-        prior.openEnded = false;
-        prior.status = statusOf(item.status);
-        if (prior.status === 'error') prior.attributes['whalesong.error_onset_ms'] = relative;
-        prior.payload = { summary: clip(item.summary), detail: clip(item.detail) };
-        open.delete(id);
+    this.events.length = keep;
+  }
+  append(records: unknown[]): void {
+    if (!records.length) return;
+    const { events, open, requests } = this;
+    const threadId = this.threadId ?? str(obj(records[0]).thread_id) ?? this.filename;
+    this.threadId = threadId;
+    let { origin, model, skippedDeltas } = this;
+    let threadName = this.threadName ?? threadId;
+    const stamp = (rec: Obj): number => {
+      const t = parseTime(rec.timestamp);
+      if (t === undefined) throw new Error(`Runtime event seq ${rec.seq} is missing a usable timestamp.`);
+      if (origin === undefined) origin = t;
+      return t - origin;
+    };
+    for (const raw of records) {
+      if (!isCodewhaleRuntimeRecord(raw)) throw new Error('Runtime import cancelled: a line is not a Codewhale runtime event record. No rows were skipped.');
+      this.recordCount++;
+      const rec = obj(raw);
+      if (rec.thread_id !== threadId) throw new Error('Runtime import contains multiple threads. Export one thread before importing.');
+      const eventName = rec.event as string;
+      if (eventName === 'item.delta') { skippedDeltas++; continue; }
+      const payload = obj(rec.payload);
+      const item = obj(payload.item);
+      const turn = obj(payload.turn);
+      const thread = obj(payload.thread);
+      const relative = stamp(rec);
+      const turnId = str(rec.turn_id) ?? str(payload.turn_id);
+      const itemId = str(rec.item_id) ?? str(item.id);
+      const agentId = 'parent';
+      if (str(thread.model)) model = str(thread.model);
+      if (str(turn.model)) model = str(turn.model) ?? model;
+
+      if (eventName === 'thread.started') {
+        model = str(thread.model) ?? model;
+        threadName = str(thread.id) ?? threadId;
+        this.push({
+          schemaVersion: 1, id: `thread:${threadId}`, traceId: threadId,
+          startTime: relative, endTime: relative, openEnded: true,
+          agentId, name: 'thread', category: 'orchestration', model, status: 'running',
+          attributes: { 'codewhale.seq': rec.seq, 'whalesong.container': true }, raw: rec,
+        });
         continue;
       }
-      const event: WhaleEvent = {
-        schemaVersion: 1, id, traceId: threadId, parentId: turnId ? `turn:${turnId}` : undefined,
-        startTime: start, endTime: Math.max(start, end), openEnded,
-        agentId, name: tool ?? kind, tool, category: itemCategory(kind, tool), model,
-        status: statusOf(item.status ?? (eventName === 'item.started' ? 'running' : undefined)),
-        attributes: { 'codewhale.seq': rec.seq, 'codewhale.turn_id': turnId, 'codewhale.item_kind': kind,
-          ...(statusOf(item.status) === 'error' ? { 'whalesong.error_onset_ms': relative } : {}) },
-        payload: { summary: clip(item.summary), detail: clip(item.detail) }, raw: rec,
-      };
-      if (eventName === 'item.started') open.set(id, { index: events.length, startWall: (origin ?? 0) + start });
-      pushEvent(events, event);
-      continue;
+      if (eventName === 'turn.started' || eventName === 'turn.completed') {
+        const id = `turn:${turnId ?? rec.seq}`;
+        if (eventName === 'turn.completed') for (const [key, request] of requests) {
+          if (request.parentId !== id) continue;
+          this.measure(request, { ...request, endTime: Math.max(request.startTime, relative), openEnded: false, status: 'unknown' });
+          requests.delete(key);
+        }
+        const startWall = parseTime(turn.started_at) ?? parseTime(turn.created_at);
+        const endWall = parseTime(turn.ended_at);
+        const start = startWall !== undefined && origin !== undefined ? startWall - origin : relative;
+        const end = eventName === 'turn.completed' && endWall !== undefined && origin !== undefined ? endWall - origin : relative;
+        const usage = obj(turn.usage);
+        const existing = events.findIndex(e => e.id === id);
+        const next: WhaleEvent = {
+          schemaVersion: 1, id, traceId: threadId, parentId: `thread:${threadId}`,
+          startTime: start, endTime: Math.max(start, end), openEnded: eventName !== 'turn.completed',
+          agentId, name: 'turn', category: 'orchestration', model,
+          inputTokens: num(usage.input_tokens), outputTokens: num(usage.output_tokens),
+          status: statusOf(turn.status ?? payload.status), latency: num(turn.duration_ms),
+          attributes: { 'codewhale.seq': rec.seq, 'codewhale.turn_id': turnId, 'whalesong.container': true,
+            ...(statusOf(turn.status ?? payload.status) === 'error' ? { 'whalesong.error_onset_ms': relative } : {}) },
+          payload: { input_summary: clip(turn.input_summary) }, raw: rec,
+        };
+        if (existing >= 0) {
+          const prior = events[existing]!; this.measure(prior, { ...next, startTime: prior.startTime });
+        }
+        else this.push(next);
+        continue;
+      }
+      if (eventName === 'turn.lifecycle') continue;
+      if (['approval.required', 'approval.decided', 'approval.timeout', 'user_input.required', 'user_input.answered', 'user_input.canceled'].includes(eventName)) {
+        const kind = eventName.startsWith('approval.') ? 'approval' : 'user_input';
+        const requestId = str(payload[kind === 'approval' ? 'approval_id' : 'input_id']) ?? str(payload.id);
+        if (!requestId) throw new Error(`Runtime ${eventName} is missing its request identity.`);
+        const key = JSON.stringify([turnId ?? '', kind, requestId]);
+        const prior = requests.get(key), required = eventName.endsWith('.required');
+        if (required && prior) continue;
+        if (!required && prior) {
+          const next: WhaleEvent = { ...prior, attributes: { ...prior.attributes },
+            endTime: Math.max(prior.startTime, relative), openEnded: false,
+            status: eventName === 'approval.decided' || eventName === 'user_input.answered' ? 'success' : 'unknown' };
+          if (payload.auto === true) {
+            // Automatic consent has a receipt, but never asked the human to wait.
+            next.category = 'orchestration'; delete next.attributes['whalesong.waiting'];
+            next.attributes['whalesong.container'] = true;
+          }
+          this.measure(prior, next); requests.delete(key); continue;
+        }
+        const automatic = payload.auto === true;
+        const event: WhaleEvent = {
+          schemaVersion: 1, id: `request:${key}:${rec.seq}`, traceId: threadId,
+          parentId: turnId ? `turn:${turnId}` : undefined, startTime: relative, endTime: relative,
+          openEnded: required, agentId, name: eventName, category: automatic ? 'orchestration' : 'human',
+          status: required ? 'pending' : 'success', model,
+          attributes: { 'codewhale.seq': rec.seq, 'whalesong.waiting': required, 'whalesong.container': automatic }, raw: rec,
+        };
+        this.push(event);
+        if (required) requests.set(key, event);
+        continue;
+      }
+      if (eventName === 'tool_call.requested' || eventName === 'tool_call.canceled') {
+        const callId = str(payload.call_id) ?? `call:${rec.seq}`;
+        const tool = str(payload.tool);
+        const canceled = eventName === 'tool_call.canceled';
+        this.push({
+          schemaVersion: 1, id: `${eventName}:${callId}`, traceId: threadId, parentId: turnId ? `turn:${turnId}` : undefined,
+          startTime: relative, endTime: relative, agentId, name: tool ?? eventName, tool,
+          category: tool ? toolCategory(tool) : 'tool', model, status: canceled ? 'error' : 'pending',
+          attributes: { 'codewhale.seq': rec.seq, 'codewhale.turn_id': turnId, 'codewhale.call_id': callId, reason: payload.reason },
+          payload: { arguments: clip(payload.arguments) }, raw: rec,
+        });
+        continue;
+      }
+      if (eventName === 'item.started' || eventName === 'item.completed') {
+        const kind = str(item.kind) ?? 'item';
+        const tool = itemToolName(item, payload);
+        const id = itemId ?? `item:${rec.seq}`;
+        const startWall = parseTime(item.started_at);
+        const endWall = parseTime(item.ended_at);
+        const start = startWall !== undefined && origin !== undefined ? startWall - origin : relative;
+        const end = eventName === 'item.completed' && endWall !== undefined && origin !== undefined ? endWall - origin : relative;
+        const openEnded = eventName === 'item.started' && endWall === undefined;
+        const existing = open.get(id);
+        if (existing && eventName === 'item.completed') {
+          const prior = existing;
+          const status = statusOf(item.status);
+          this.measure(prior, { ...prior, endTime: Math.max(prior.startTime, end), openEnded: false, status,
+            attributes: { ...prior.attributes, ...(status === 'error' ? { 'whalesong.error_onset_ms': relative } : {}) },
+            payload: { summary: clip(item.summary), detail: clip(item.detail) } });
+          open.delete(id);
+          continue;
+        }
+        const event: WhaleEvent = {
+          schemaVersion: 1, id, traceId: threadId, parentId: turnId ? `turn:${turnId}` : undefined,
+          startTime: start, endTime: Math.max(start, end), openEnded,
+          agentId, name: tool ?? kind, tool, category: itemCategory(kind, tool), model,
+          status: statusOf(item.status ?? (eventName === 'item.started' ? 'running' : undefined)),
+          attributes: { 'codewhale.seq': rec.seq, 'codewhale.turn_id': turnId, 'codewhale.item_kind': kind,
+            ...(statusOf(item.status) === 'error' ? { 'whalesong.error_onset_ms': relative } : {}) },
+          payload: { summary: clip(item.summary), detail: clip(item.detail) }, raw: rec,
+        };
+        this.push(event);
+        if (eventName === 'item.started') open.set(id, event);
+        continue;
+      }
+      this.push({
+        schemaVersion: 1, id: `${eventName}:${rec.seq}`, traceId: threadId, parentId: turnId ? `turn:${turnId}` : undefined,
+        startTime: relative, endTime: relative, agentId, name: eventName, category: classify(eventName),
+        model, status: 'unknown', attributes: { 'codewhale.seq': rec.seq }, raw: rec,
+      });
     }
-    pushEvent(events, {
-      schemaVersion: 1, id: `${eventName}:${rec.seq}`, traceId: threadId, parentId: turnId ? `turn:${turnId}` : undefined,
-      startTime: relative, endTime: relative, agentId, name: eventName, category: classify(eventName),
-      model, status: 'unknown', attributes: { 'codewhale.seq': rec.seq }, raw: rec,
-    });
-  }
 
-  if (skippedDeltas) warnings.push(`Dropped ${skippedDeltas.toLocaleString()} item.delta records; they are token stream fragments, not spans. Item start/end remain the source of duration.`);
-  for (const [id] of open) warnings.push(`Item ${id} started and never completed in this file; duration remains unknown.`);
-  for (const request of requests.values()) warnings.push(`Request ${request.id} has no terminal receipt; its duration remains unknown in this file.`);
-  if (!events.length) throw new Error('Codewhale runtime file contained only stream deltas or unreadable records.');
-  const base = events.reduce((m, e) => Math.min(m, e.startTime), events[0]!.startTime);
-  for (const event of events) {
-    if (event.attributes['whalesong.error_onset_ms'] !== undefined) event.attributes['whalesong.error_onset_ms'] = errorOnsetOf(event) - base;
-    event.startTime -= base; event.endTime -= base;
+    this.origin = origin; this.model = model; this.threadName = threadName; this.skippedDeltas = skippedDeltas;
   }
-  return {
-    id: threadId,
-    name: `Codewhale runtime · ${threadName}`,
-    events,
-    duration: Math.max(1, events.reduce((m, e) => Math.max(m, e.endTime, e.startTime, e.status === 'error' ? errorOnsetOf(e) : 0), 0)),
-    originTime: origin !== undefined ? new Date(origin + base).toISOString() : '0 ms',
-    source: 'codewhale',
-    privacy: 'redact',
-    warnings: [...new Set(warnings)],
-    metadata: {
-      sourceFormat: 'codewhale.runtime-events/v2',
-      timeBasis: 'wall-clock',
-      sourceFilename: filename,
-      threadId,
-      model,
-      skippedDeltas,
-      recordCount: records.length,
-      timeUnit: 'ms',
-    },
-  };
+  snapshot(): Trace {
+    const { events, open, requests, origin, model, skippedDeltas, filename } = this;
+    const threadId = this.threadId ?? filename, threadName = this.threadName ?? threadId;
+    const warnings: string[] = [];
+    if (skippedDeltas) warnings.push(`Dropped ${skippedDeltas.toLocaleString()} item.delta records; they are token stream fragments, not spans. Item start/end remain the source of duration.`);
+    for (const [id] of open) warnings.push(`Item ${id} started and never completed in this file; duration remains unknown.`);
+    for (const request of requests.values()) warnings.push(`Request ${request.id} has no terminal receipt; its duration remains unknown in this file.`);
+    if (!events.length) throw new Error('Codewhale runtime file contained only stream deltas or unreadable records.');
+    const base = events.reduce((m, e) => Math.min(m, e.startTime), events[0]!.startTime);
+    const normalized = events.map(event => ({ ...event, startTime: event.startTime - base, endTime: event.endTime - base,
+      attributes: { ...event.attributes, ...(event.attributes['whalesong.error_onset_ms'] !== undefined
+        ? { 'whalesong.error_onset_ms': errorOnsetOf(event) - base } : {}) } }));
+    return {
+      id: threadId,
+      name: `Codewhale runtime · ${threadName}`,
+      events: normalized,
+      duration: Math.max(1, normalized.reduce((m, e) => Math.max(m, e.endTime, e.startTime, e.status === 'error' ? errorOnsetOf(e) : 0), 0)),
+      originTime: origin !== undefined ? new Date(origin + base).toISOString() : '0 ms',
+      source: 'codewhale',
+      privacy: 'redact',
+      warnings: [...new Set(warnings)],
+      metadata: {
+        sourceFormat: 'codewhale.runtime-events/v2',
+        timeBasis: 'wall-clock',
+        sourceFilename: filename,
+        threadId,
+        model,
+        skippedDeltas,
+        recordCount: this.recordCount,
+        timeUnit: 'ms',
+      },
+    };
+  }
+}
+
+export function fromCodewhaleRuntime(records: unknown[], filename = 'Codewhale runtime', maxEvents = 250_000): Trace {
+  if (!records.length) throw new Error('Codewhale runtime event file is empty.');
+  const trace = new CodewhaleRuntimeTrace(filename, maxEvents);
+  trace.append(records); return trace.snapshot();
 }
 
 /** The journal owns request state until a matching terminal receipt. A live

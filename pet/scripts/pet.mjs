@@ -7,20 +7,21 @@ import { importTrace } from '../dist/core/ingest.js';
 import { compilePetTelemetry, encodePetJSONL, encodePetTSV } from '../dist/core/pet-telemetry.js';
 import { petDemoEvents } from '../dist/core/pet-demo.js';
 import { followRuntime } from './lib/pet-runtime.mjs';
+import { createPetRecorder } from './lib/pet-recorder.mjs';
 
 const args = process.argv.slice(2);
 const option = name => args.find(a => a.startsWith(`--${name}=`))?.slice(name.length + 3);
 if (args.includes('--help')) {
-  console.log('node scripts/pet.mjs --input=trace.jsonl --output=pet.jsonl [--trace=ID] [--format=jsonl|tsv] [--watch]\nnode scripts/pet.mjs --runtime=http://127.0.0.1:7878 --thread=ID --output=pet.jsonl\nUse --demo instead of --input for synthetic telemetry. Output must not already exist.\nRuntime reads only the existing local event journal. Optional authentication comes from CODEWHALE_RUNTIME_TOKEN; never put a token in the URL. No agent or provider is started.');
+  console.log('node scripts/pet.mjs --input=trace.jsonl --output=pet.jsonl [--trace=ID] [--format=jsonl|tsv] [--watch]\nnode scripts/pet.mjs --runtime=http://127.0.0.1:7878 --thread=ID --output=pet.jsonl [--segment-buckets=216000]\nUse --demo instead of --input for synthetic telemetry. Output must not already exist.\nLive recording rotates at 216000 buckets or 64 MiB into OUTPUT.segment-NNNNNN.jsonl and continues at the same live path. All archives are retained.\nRuntime reads only the existing local event journal. Optional authentication comes from CODEWHALE_RUNTIME_TOKEN; never put a token in the URL. No agent or provider is started.');
   process.exit(0);
 }
-let output, monitor, timer, runtime;
+let output, recorder, monitor, timer, runtime;
 try {
-  for (const a of args) if (!['--demo', '--watch'].includes(a) && !/^--(input|output|trace|format|runtime|thread)=.+/.test(a)) throw new Error('Unknown or empty option. Use --help.');
+  for (const a of args) if (!['--demo', '--watch'].includes(a) && !/^--(input|output|trace|format|runtime|thread|segment-buckets)=.+/.test(a)) throw new Error('Unknown or empty option. Use --help.');
   const input = option('input'), runtimeURL = option('runtime'), path = option('output'), format = option('format') ?? 'jsonl', live = args.includes('--watch') || !!runtimeURL;
   if (!path || [!!input, args.includes('--demo'), !!runtimeURL].filter(Boolean).length !== 1
     || !['jsonl', 'tsv'].includes(format) || live && format !== 'jsonl' || args.includes('--watch') && !input
-    || !!runtimeURL !== !!option('thread') || option('trace') && !input)
+    || !!runtimeURL !== !!option('thread') || option('trace') && !input || option('segment-buckets') && !live)
     throw new Error('Choose one input source, an unused --output path, and JSONL for live recording. Runtime requires --thread.');
   const load = async () => {
     if (!input) return { events: petDemoEvents(), duration: 80_000 };
@@ -31,7 +32,8 @@ try {
     return trace;
   };
   let trace = runtimeURL ? undefined : await load(), buckets = compilePetTelemetry(trace?.events ?? [], trace?.duration ?? 0);
-  output = await open(path, 'wx', 0o600);
+  if (live) recorder = await createPetRecorder(path, { maxBuckets: option('segment-buckets') === undefined ? 216_000 : Number(option('segment-buckets')), report: text => console.error(text) });
+  else output = await open(path, 'wx', 0o600);
   if (runtimeURL) runtime = await followRuntime({ baseUrl: runtimeURL, threadId: option('thread'),
     token: process.env.CODEWHALE_RUNTIME_TOKEN, report: text => console.error(text) });
   if (!live) {
@@ -55,7 +57,6 @@ try {
       try {
         const elapsed = performance.now() - started, target = Math.floor(elapsed / 400);
         if (sequence > target) return;
-        if (target >= 216_000) throw new Error('Start a new pet recording after 24 hours.');
         if (runtime) {
           failed = !runtime.connected;
           if (!failed) {
@@ -71,9 +72,10 @@ try {
         }
         // A stalled host records skipped intervals as unknown instead of silently
         // compressing time. Never repeat onsets when timer jitter hits a source bin twice.
-        while (sequence < target) {
-          await output.write(encodePetJSONL([{ ...empty, sequence, simTimeMs: sequence * 400 }])); sequence++;
+        while (sequence < target && !stopping) {
+          await recorder.append({ ...empty, sequence, simTimeMs: sequence * 400 }); sequence++;
         }
+        if (stopping) return;
         let state = empty;
         if (runtime) {
           // Seal the preceding observation interval before recording its state.
@@ -90,7 +92,7 @@ try {
           if (bin === lastBin) state = { ...state, onsets: Array(13).fill(0), errors: 0 };
           lastBin = bin;
         }
-        await output.write(encodePetJSONL([{ ...state, sequence, simTimeMs: sequence * 400 }]));
+        await recorder.append({ ...state, sequence, simTimeMs: sequence * 400 });
         sequence++;
       } finally { running = false; }
     };
@@ -99,12 +101,12 @@ try {
     const stop = async () => {
       stopping = true; clearInterval(timer); monitor?.close(); await runtime?.close();
       while (running) await new Promise(resolve => setTimeout(resolve, 5));
-      if (output) { await output.sync(); await output.close(); output = undefined; }
+      await recorder.close();
     };
     process.once('SIGINT', stop); process.once('SIGTERM', stop);
     console.log('Recording local live pet states. Ctrl+C to stop.');
   }
 } catch (error) {
   console.error(error.message); process.exitCode = 1;
-  clearInterval(timer); monitor?.close(); await runtime?.close(); if (output) await output.close();
+  clearInterval(timer); monitor?.close(); await runtime?.close(); await recorder?.close(); if (output) await output.close();
 }

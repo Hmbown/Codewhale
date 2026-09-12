@@ -105,8 +105,21 @@ holes are rejected; reconnects resume from the last accepted Runtime cursor.
 The recorder seals the preceding observation interval against a fixed clock.
 It retains request lifetimes and counts a delayed error once at receipt time.
 Raw prompts, arguments, results and tokens do not enter the pet recording.
-The standalone recorder currently stops after 24 hours per JSONL file; its
-continuous native-companion handoff remains part of the live-attachment work.
+Live recording continues in segments. At 216,000 buckets (24 hours) or 64 MiB,
+the recorder syncs the completed file, preserves it as
+`OUTPUT.segment-000001.jsonl` (then `000002`, etc.), and atomically replaces the
+same live pathname. Each segment starts at sequence zero and replays independently.
+Use `--segment-buckets=N` to rotate sooner. Followers establish a new baseline
+after replacement, then accept subsequent appends as current observations.
+
+The live importer retains unfinished lifetimes and 16 seconds of completed
+events for the bucketer's recurrence window. It removes raw payloads immediately;
+250,000 events and 64 MiB bound retained metadata, not total session history.
+Completed output segments remain on disk, so disk use grows with recorded history.
+Rotation requires same-directory hard links and atomic replacement. Unsupported
+storage, an archive-name collision or an external replacement stops recording
+without overwriting the existing files. Restart the recorder with a new unused
+output path; it does not resume a previous process's recording.
 
 The thin wire is JSONL, one flat version-1 `PetBucket` per line: PetState plus
 `sequence`, `simTimeMs`, `durationMs`, thirteen-element `onsets` and `activeMs`,

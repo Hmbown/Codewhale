@@ -38,6 +38,23 @@ jobs:
       - run: cargo fetch --locked --manifest-path pet/tui/Cargo.toml
       - name: TypeScript and Rust parity, including reduced motion
         run: ./pet/verify.sh --no-swift
+  recorder:
+    name: recorder (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: pet/package-lock.json
+      - run: npm --prefix pet ci --ignore-scripts
+      - run: npm --prefix pet run check
   android:
     runs-on: ubuntu-latest
     timeout-minutes: 25

@@ -1,6 +1,6 @@
 import { setTimeout as delay } from 'node:timers/promises';
-import { importTrace } from '../../dist/core/ingest.js';
-import { isCodewhaleRuntimeRecord, observeRuntimeRequests } from '../../dist/core/codewhale.js';
+import { privacyEvent, redact } from '../../dist/core/ingest.js';
+import { CodewhaleRuntimeTrace, isCodewhaleRuntimeRecord, observeRuntimeRequests } from '../../dist/core/codewhale.js';
 
 /** A read-only transport for the existing Runtime journal. All event meaning
  * remains in Whalesong's importer and canonical pet bucketer. No raw journal,
@@ -19,9 +19,9 @@ export async function followRuntime({ baseUrl, threadId, token, report = () => {
     throw new Error('The local Runtime SDK needs threadEvents support.');
   const client = new sdk.CodeWhaleRuntimeClient({ baseUrl: url.href, token });
   const shutdown = new AbortController();
-  const records = [];
-  let cursor = 0, bytes = 0, revision = 0, connected = false, fatal = false;
-  let cachedRevision = -1, cachedTrace;
+  const trace = new CodewhaleRuntimeTrace('Codewhale Runtime', 250_000,
+    event => privacyEvent(event, 'metadata'), 64 * 1024 * 1024);
+  let cursor = 0, revision = 0, connected = false, fatal = false;
   const done = (async () => {
     let backoff = 250;
     while (!shutdown.signal.aborted && !fatal) {
@@ -51,18 +51,19 @@ export async function followRuntime({ baseUrl, threadId, token, report = () => {
           if (record.previous_seq !== undefined && record.previous_seq !== cursor)
             throw new Error('Runtime predecessor cursor does not match.');
           if (record.event !== 'item.delta') {
-            const size = Buffer.byteLength(JSON.stringify(record));
-            if (records.length >= 250_000 || bytes + size > 64 * 1024 * 1024) {
-              fatal = true; throw new Error('Runtime recording reached its input limit.');
-            }
-            records.push(record); bytes += size; revision++;
+            // The existing importer retains unfinished lifetimes and a recent
+            // recurrence window, not a second copy of the entire raw journal.
+            if (revision % 256 === 0) trace.prune(Date.now() - 16_000);
+            try { trace.append([redact(record)]); }
+            catch (error) { fatal = true; throw error; }
+            revision++;
           }
           cursor = record.seq; connected = true; backoff = 250;
         }
       } catch (error) {
         if ([400, 401, 403, 404, 405, 501].includes(error.status)) fatal = true;
         if (!shutdown.signal.aborted) report(fatal
-          ? 'Runtime input stopped: check the thread, authentication, SDK support, or recording size. Recording remains unobserved.'
+          ? 'Runtime input stopped: check the thread, authentication, SDK support, or retained input limit. Recording remains unobserved.'
           : 'Runtime input interrupted; recording unobserved gaps while reconnecting from the last cursor.');
       } finally {
         connected = false; clearTimeout(idleTimer); client.fetchImpl = fetchImpl;
@@ -77,14 +78,13 @@ export async function followRuntime({ baseUrl, threadId, token, report = () => {
     get connected() { return connected; },
     get revision() { return revision; },
     get cursor() { return cursor; },
+    get retainedEvents() { return trace.retainedEvents; },
+    get retainedBytes() { return trace.retainedBytes; },
     snapshot(observedThrough = Date.now()) {
-      if (!connected || !records.length) return undefined;
-      if (cachedRevision !== revision) {
-        // Reuse the same validated, metadata-only import path as file replay.
-        cachedTrace = importTrace(JSON.stringify(records), 'Codewhale Runtime', { privacy: 'metadata' })[0];
-        cachedRevision = revision;
-      }
-      return observeRuntimeRequests(cachedTrace, observedThrough);
+      if (!connected) return undefined;
+      trace.prune(observedThrough - 16_000);
+      if (!trace.retainedEvents) return undefined;
+      return observeRuntimeRequests({ ...trace.snapshot(), privacy: 'metadata' }, observedThrough);
     },
     async close() { shutdown.abort(); await done; },
   };

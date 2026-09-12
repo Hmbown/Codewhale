@@ -93,8 +93,9 @@ open junctions; the same particle identities return to the whale at rest.
 
 ## Local evidence before publication (2026-09-12)
 
-- Packaged pet: 48 tests passed; existing Whalesong consumers: 306 passed after
-  canonical source relocation. These are overlapping suites, not additive coverage.
+- Packaged pet: 56 tests passed; existing Whalesong consumers: 310 passed after
+  the incremental Runtime importer change. These are overlapping suites, not
+  additive coverage.
 - Product Node gate: 66 package, 12 SDK and 446 web tests passed; production web
   check subsequently passed with the GitHub release fetch available.
 - TypeScript/Rust/Swift/Kotlin: 380 identical checkpoints across both expression
@@ -148,6 +149,19 @@ open junctions; the same particle identities return to the whale at rest.
   coverage before answering, and for two sealed unknown bins before stopping.
   Its former fixed sleep occasionally stopped the child before those final bins
   on a busy runner. The receipt assertions and privacy checks remain unchanged.
+- Continuous recording: the actual watch CLI rotates three replayable files and
+  continues at the original live pathname. File tests cross the 24-hour sequence,
+  count UTF-8 bytes, follow replacement with the real cursor, and preserve
+  existing files on an archive collision or external replacement. History is
+  retained on disk; this does not resume a recorder after process restart.
+- Bounded Runtime input: a real local HTTP/SSE fixture supplies 260,001 records
+  spanning nearly 29 hours of event timestamps. The importer retains fewer than
+  512 events and 256 KiB of metadata, including a still-open human request. The
+  published `43e6f02` transport fails the same fixture at record 155,859 when its
+  cumulative raw journal reaches the old limit. These are synthetic timestamps,
+  not a 29-hour provider or native companion run. Smaller fixtures compare recent
+  buckets with full imports through pruning, late failures, shifted origins,
+  request answers, automatic consent and turn completion.
 - Authenticated read-only attachment to an existing local Runtime 0.9.13 session
   journal passed. An 18-second recorder run produced 45 contiguous unknown buckets
   and stopped cleanly in 41 ms after Ctrl+C, without treating historical work as

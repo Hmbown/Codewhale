@@ -115,8 +115,12 @@ advisory writer lock. A content revision rejects stale writers and external
 edits. Invalid files, changed locks, unavailable storage and the 8 MiB native
 habitat limit stop persistence with a localized warning; existing files remain
 intact and the current in-memory recording can still be exported within that
-limit. Full-tape retention is still bounded by the 64 MiB worker and the core's
-24-hour recording limit; history rotation remains future work.
+limit. The host archives consumed history after 1,024 buckets or 4,096 applied
+inputs before replacing the active habitat. Each archive starts with an exact
+checkpoint, and the running world retires history only after storage succeeds.
+The active QuickJS worker remains limited to 64 MiB; retained archives grow on
+disk. The standalone live recorder separately rotates bounded JSONL segments at
+the same watched pathname; see `pet/README.md` for its limits and recovery.
 
 `/workbar watch export` writes a new immutable `artifacts/pet/replay-<id>.json`
 and reports its path through the existing toast system and transcript. Import it in the web
