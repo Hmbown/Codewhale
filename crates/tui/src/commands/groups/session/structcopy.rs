@@ -10,9 +10,9 @@
 //! - Human-only. This is a slash command, never a model-visible tool, event,
 //!   or authority, and it writes nothing back into App/session/plan/workflow
 //!   state (see the registry/catalog contract test).
-//! - Read-only projection over existing state. Redaction reuses the
-//!   transcript/export seams (`export::redact_json` for values,
-//!   `export::sanitize_text` for keys and status labels, which
+//! - Read-only projection over existing state. Redaction reuses the shared
+//!   sanitizer seams in `codewhale_secrets::sanitize` (`redact_json` for
+//!   values, `sanitize_text` for keys and status labels, which
 //!   `redact_json` does not reach) plus a strict pass that strips URL
 //!   userinfo/query/fragment entirely and folds the workspace and home
 //!   prefixes to labels, removes other absolute paths, and handles generic
@@ -28,8 +28,8 @@
 //! - It is not a general PII scrubber. Workspace/home paths retain a useful
 //!   labelled suffix; other absolute POSIX, drive-letter, and UNC paths are
 //!   replaced outright.
-//! - Redaction is pattern-based (the export seam's private-key/bearer/JWT/
-//!   URL/secret regexes plus this module's strict URL pass). A secret that
+//! - Redaction is pattern-based (the shared sanitizer's private-key/bearer/
+//!   JWT/URL/secret regexes plus this module's strict URL pass). A secret that
 //!   matches none of those patterns and sits under a non-sensitive key is
 //!   copied as-is.
 //! - Delivery to the clipboard is not confirmed. Terminal-client transports
@@ -49,7 +49,10 @@ use codewhale_localization::{Locale, MessageId, tr};
 use codewhale_models::{ContentBlock, Message};
 
 use super::CommandResult;
-use super::export::{is_internal_role, is_sensitive_key, redact_json, sanitize_text};
+// FEAT-025 D4: the sanitizer helpers moved to the single shared portable
+// implementation in `codewhale-secrets`; `/structcopy` stays legacy until
+// FEAT-026 and only rewires its import.
+use codewhale_secrets::sanitize::{is_internal_role, is_sensitive_key, redact_json, sanitize_text};
 
 pub(in crate::commands) const COMMAND_INFO: CommandInfo = CommandInfo {
     name: "structcopy",
@@ -720,7 +723,7 @@ fn scrub_string(text: &str, labels: &PathLabels) -> String {
     scrub_paths(&scrub_urls(&labelled))
 }
 
-/// Convert the prose placeholders owned by the shared export seam into stable
+/// Convert the prose placeholders owned by the shared sanitizer into stable
 /// language-neutral codes. Structural JSON is a machine artifact and must not
 /// change with the UI locale.
 fn normalize_redaction_codes(value: &mut Value) {
@@ -783,7 +786,7 @@ const URL_TRAILING_PUNCTUATION: &[char] = &[
 /// Strip URL userinfo, query, and fragment entirely, leaving a
 /// `scheme://host[:port]/path` label.
 ///
-/// The export seam has already masked credentials in URLs it recognised;
+/// The shared sanitizer has already masked credentials in URLs it recognised;
 /// this pass enforces the stricter structural-copy contract that no
 /// userinfo, query string, or fragment may survive at all — including for
 /// URLs that are punctuation-wrapped (`(https://…)`, `<https://…>`,

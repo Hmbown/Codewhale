@@ -4,7 +4,6 @@
 mod branch;
 mod compact;
 mod export;
-pub(crate) use export::write_last_copy;
 mod fork;
 mod load;
 mod new;
@@ -88,10 +87,10 @@ impl CommandGroup for SessionCommands {
                 ContextualCommand::from_contract::<remote_env::RemoteEnvCmd>()
                     .expect("remote_env registration")
             ),
-            Box::new(FunctionCommand::new(
-                export::ExportCmd::info(),
-                export::ExportCmd::execute,
-            )),
+            Box::new(
+                ContextualCommand::from_contract::<export::ExportCmd>()
+                    .expect("export registration")
+            ),
             Box::new(FunctionCommand::new(
                 structcopy::StructcopyCmd::info(),
                 structcopy::StructcopyCmd::execute,

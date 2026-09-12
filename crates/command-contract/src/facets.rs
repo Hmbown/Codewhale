@@ -8,6 +8,7 @@
 use std::path::{Path, PathBuf};
 
 use codewhale_core::request::{Message, SystemPrompt};
+use serde_json::Value;
 
 use crate::types::{
     CommandApprovalMode, CommandCurrency, CommandMode, CommandProviderId, CommandReasoningEffort,
@@ -1367,4 +1368,224 @@ pub trait CommandSessionControlContext {
     /// the unavailable-target error. Credentials never appear in values or
     /// errors.
     fn resolve_hosted_work_target(&self) -> Option<HostedWorkTarget>;
+}
+
+// ---------------------------------------------------------------------------
+// FEAT-025: session export slice (D1-D9).
+//
+// One independently optional session-export authority covering exactly the
+// host work `/export` (and its `/daochu` alias) consumes. The shared
+// `CommandSessionContext`, `CommandSessionLifecycleContext`, and
+// `CommandSessionControlContext` facets are deliberately not widened: export
+// authority exists only on this facet, and every delegate is an atomic host
+// operation or a semantic projection so the portable handler keeps
+// byte-identical composition. Hidden payloads are excluded while projections
+// are built (D9), so internal reasoning, reasoning signatures, and inline or
+// local image bytes never enter these DTOs. No `App`, clipboard handler,
+// snapshot repository, history cell, session manager, configuration, client,
+// filesystem handle, or host callback crosses this boundary (D1/D3/D5/D7).
+// ---------------------------------------------------------------------------
+
+/// Portable conversation metadata for the export header (D3).
+///
+/// Values that already have an authoritative host derivation keep it
+/// (session-label truncation, provider identity, model label, mode display,
+/// workspace basename, message count, clock); portable rendering adds only
+/// export formatting and sanitization (D10).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExportMetadata {
+    /// Host-truncated session id, or the baseline `unsaved` fallback.
+    pub session_label: String,
+    pub provider: String,
+    pub model: String,
+    pub mode: String,
+    /// Workspace directory basename, or the baseline `workspace` fallback.
+    pub workspace_name: String,
+    /// `api_messages.len()` when authoritative, otherwise `history.len()`.
+    pub message_count: usize,
+    pub exported_at_unix: i64,
+}
+
+/// One tool-call caller projection (D3). Only the fields the baseline export
+/// renders cross the boundary.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ToolCallerProjection {
+    pub caller_type: String,
+    pub tool_id: Option<String>,
+}
+
+/// One projected content block (D3/D9).
+///
+/// Visible text and structured content cross as portable data; internal
+/// reasoning bodies, reasoning signatures, and inline or local image payloads
+/// are replaced by typed omission markers at projection time and never cross.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ExportBlock {
+    /// Visible text block; portable rendering sanitizes it.
+    Text {
+        text: String,
+    },
+    /// External image reference (`http`/`https` only); portable rendering
+    /// redacts credential-bearing URLs.
+    ImageReference {
+        url: String,
+    },
+    /// Inline or local image payload excluded at projection time (D9).
+    ImageOmitted,
+    /// Internal reasoning body and reasoning signature excluded (D9).
+    InternalReasoning,
+    ToolCall {
+        id: String,
+        name: String,
+        caller: Option<ToolCallerProjection>,
+        input: Value,
+    },
+    ToolResult {
+        tool_use_id: String,
+        content: String,
+        is_error: bool,
+        /// `Some` when the host message carried structured result blocks; the
+        /// host has already applied the safe-result filter (D9).
+        structured: Option<Value>,
+    },
+    ServerToolCall {
+        id: String,
+        name: String,
+        input: Value,
+    },
+    ToolSearchResult {
+        tool_use_id: String,
+        content: Value,
+    },
+    CodeExecutionResult {
+        tool_use_id: String,
+        content: Value,
+    },
+}
+
+/// One projected authoritative message (D3).
+///
+/// `prompt_snippet` is the host-computed `snapshot_label_prompt_snippet` of
+/// the first visible text block. The parser and snippet algorithm stay
+/// TUI-owned (D8), so correlation compares authoritative values instead of
+/// re-deriving them portably.
+///
+/// `is_user_role` carries the host's exact `Role::User` comparison. `role` is
+/// the rendered wire string, and comparing it textually would also match a
+/// `Role::Unrecognized("user")`, which the baseline never treated as a user
+/// turn. The flag keeps restore-point correlation faithful to the baseline.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ExportMessage {
+    pub role: String,
+    /// Exact `message.role == Role::User`, not a string comparison.
+    pub is_user_role: bool,
+    pub blocks: Vec<ExportBlock>,
+    pub prompt_snippet: Option<String>,
+}
+
+/// One projected visible-history fallback entry (D3).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HistoryEntry {
+    /// Visible host content that portable rendering must still sanitize.
+    Sanitized { role: String, body: String },
+    /// An already-final baseline marker line that must not be sanitized again.
+    Literal { role: String, body: String },
+}
+
+/// Transcript source precedence (D3): authoritative API messages when
+/// present, otherwise the sanitized visible-history fallback.
+#[derive(Clone, Debug, PartialEq)]
+pub enum TranscriptProjection {
+    Authoritative(Vec<ExportMessage>),
+    HistoryFallback(Vec<HistoryEntry>),
+}
+
+/// One snapshot projected to semantic fields (D8).
+///
+/// `kind`, `sequence`, and `prompt_snippet` are the host-parsed label fields;
+/// the raw `label` is kept only for the human-readable table column. No
+/// preformatted correlation line crosses the boundary.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RestoreSnapshot {
+    pub id: String,
+    pub label: String,
+    pub timestamp_unix: i64,
+    pub kind: String,
+    pub sequence: Option<u64>,
+    pub prompt_snippet: Option<String>,
+}
+
+/// Restore-point projection with distinct baseline states (D3/D8).
+///
+/// `None` means no snapshot repository exists, `Unreadable` preserves the host
+/// failure reason, and `Recorded` distinguishes an existing-but-empty
+/// repository from one with snapshots by the vector length.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RestorePointProjection {
+    None,
+    Unreadable { reason: String },
+    Recorded { snapshots: Vec<RestoreSnapshot> },
+}
+
+/// Full conversation projection (D3/D8/D9).
+#[derive(Clone, Debug, PartialEq)]
+pub struct ConversationExportProjection {
+    pub metadata: ExportMetadata,
+    pub transcript: TranscriptProjection,
+    pub restore_points: RestorePointProjection,
+}
+
+/// Turn-handoff projection (D2).
+///
+/// `markdown` is the unmodified shared TUI renderer output and
+/// `workspace_path` is the value the portable handler replaces with `.` after
+/// sanitizing; the renderer itself is neither moved nor duplicated.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TurnHandoffProjection {
+    pub markdown: String,
+    pub workspace_path: String,
+}
+
+/// Session-export authority for the `/export` slice (FEAT-025 D1-D9).
+///
+/// Operation-granular synchronous delegates over the exact minimum host work
+/// the command consumes. The portable handler parses the request first, renders
+/// the selected scope second, and then uses these delegates in baseline order:
+/// clipboard exports call terminal-paste detection, recovery write, and
+/// clipboard delivery exactly once each with the same Markdown; file exports
+/// resolve the destination before writing it. A recovery-write `None` never
+/// prevents the clipboard attempt, and a turn-only export never requests the
+/// conversation projection (D6/D7).
+pub trait CommandSessionExportContext {
+    /// Conversation export projection: metadata, authoritative-or-fallback
+    /// transcript, and restore-point state. Read-only; opens only an existing
+    /// snapshot repository and never creates one (D8).
+    fn conversation_projection(&self) -> ConversationExportProjection;
+
+    /// Turn-handoff projection: unmodified shared renderer Markdown plus the
+    /// workspace path value (D2).
+    fn turn_handoff_projection(&self) -> TurnHandoffProjection;
+
+    /// Whether clipboard delivery goes through the terminal-client (SSH/OSC 52
+    /// via tmux) path (D6).
+    fn clipboard_requires_terminal_paste(&self) -> bool;
+
+    /// Write the shared `last-copy.md` recovery file. `None` reproduces the
+    /// baseline silent failure; recovery writing never falls through to an
+    /// error (D5/D6).
+    fn write_recovery_copy(&self, markdown: &str) -> Option<PathBuf>;
+
+    /// Attempt clipboard delivery. `Err` carries the raw host clipboard error
+    /// text; the handler composes the exact failure wording (D6).
+    fn write_clipboard(&self, markdown: &str) -> Result<(), String>;
+
+    /// Resolve a file destination exactly as the baseline does (trim, empty
+    /// check, `..` rejection, workspace canonicalization and rebasing, filename
+    /// requirement). Errors are returned unwrapped (D7).
+    fn resolve_export_path(&self, raw: &str) -> Result<PathBuf, String>;
+
+    /// Write the rendered export to a resolved destination with the baseline
+    /// protection checks. Errors are returned unwrapped; the handler wraps them
+    /// in `Failed to export {label} to {path}: {err}` (D7).
+    fn write_export_file(&self, path: &Path, contents: &[u8], force: bool) -> Result<(), String>;
 }

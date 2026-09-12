@@ -12,3 +12,7 @@ workspace = true
 
 [dependencies]
 codewhale-core = { path = "../core", version = "0.9.13" }
+# FEAT-025 export projections carry JSON tool payloads. The workspace already
+# pins serde_json with `preserve_order` (crates/core and crates/tui), so this
+# adds no new external dependency to the graph.
+serde_json = { workspace = true, features = ["preserve_order"] }

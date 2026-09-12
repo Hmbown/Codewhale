@@ -7,9 +7,9 @@
 use crate::facets::{
     CommandCostContext, CommandMediaContext, CommandMemoryContext, CommandModePolicyContext,
     CommandModelContext, CommandPluginContext, CommandPresentationContext, CommandProjectContext,
-    CommandSessionContext, CommandSessionControlContext, CommandSessionLifecycleContext,
-    CommandSkillGroupContext, CommandSkillsContext, CommandSystemPromptContext,
-    CommandWorkspaceContext,
+    CommandSessionContext, CommandSessionControlContext, CommandSessionExportContext,
+    CommandSessionLifecycleContext, CommandSkillGroupContext, CommandSkillsContext,
+    CommandSystemPromptContext, CommandWorkspaceContext,
 };
 
 /// Exact host capabilities exposed to one contextual command handler.
@@ -51,6 +51,30 @@ impl CommandCapabilities {
     /// storage remains `u16` per the resolved maintainer review on FEAT-023 PR
     /// #5902 — bit 14 is available, so no speculative widening is performed.
     pub const SESSION_CONTROL: Self = Self(1 << 14);
+    /// Session-export host data (FEAT-025 D1), the next non-conflicting bit
+    /// after `SESSION_CONTROL`. Required only by the host-dependent `/export`
+    /// command and its `/daochu` alias; every concrete App, snapshot, clipboard,
+    /// filesystem, history, and turn-handoff access stays behind the TUI export
+    /// adapter.
+    ///
+    /// **Capacity: this is the last free bit.** Bits 0-15 are now fully
+    /// allocated, so another capability cannot be added without widening the
+    /// backing storage to `u32`. FEAT-026 (session structcopy) needs its own
+    /// exact-minimum facet and therefore owns that widening decision; reusing
+    /// `SESSION_EXPORT` for it would break the least-capability invariant.
+    /// The `export_capability_space_is_exactly_full` test pins the capacity so
+    /// the next author gets a deliberate decision instead of a compile error
+    /// with no context.
+    pub const SESSION_EXPORT: Self = Self(1 << 15);
+
+    /// Raw bit pattern, for tests that pin the capability-space capacity.
+    ///
+    /// Kept `#[cfg(test)]` so the `u16` backing stays an implementation detail
+    /// and nothing can widen it accidentally through a public accessor.
+    #[cfg(test)]
+    pub(crate) const fn bits_for_test(self) -> u16 {
+        self.0
+    }
 
     pub const fn union(self, other: Self) -> Self {
         Self(self.0 | other.0)
@@ -100,6 +124,7 @@ pub struct CommandContexts<'a> {
     plugin: Option<&'a mut dyn CommandPluginContext>,
     lifecycle: Option<&'a mut dyn CommandSessionLifecycleContext>,
     control: Option<&'a mut dyn CommandSessionControlContext>,
+    export: Option<&'a mut dyn CommandSessionExportContext>,
 }
 
 /// Consumed envelope used when one handler needs several independent facets.
@@ -119,6 +144,7 @@ pub struct ContextParts<'a> {
     pub plugin: Option<&'a mut dyn CommandPluginContext>,
     pub lifecycle: Option<&'a mut dyn CommandSessionLifecycleContext>,
     pub control: Option<&'a mut dyn CommandSessionControlContext>,
+    pub export: Option<&'a mut dyn CommandSessionExportContext>,
 }
 
 impl<'a> CommandContexts<'a> {
@@ -139,6 +165,7 @@ impl<'a> CommandContexts<'a> {
             plugin: None,
             lifecycle: None,
             control: None,
+            export: None,
         }
     }
 
@@ -159,6 +186,7 @@ impl<'a> CommandContexts<'a> {
             plugin: self.plugin,
             lifecycle: self.lifecycle,
             control: self.control,
+            export: self.export,
         }
     }
 
@@ -275,6 +303,14 @@ impl<'a> CommandContexts<'a> {
         assert!(
             self.control.replace(value).is_none(),
             "control facet already set"
+        );
+        self
+    }
+
+    pub fn with_export(mut self, value: &'a mut dyn CommandSessionExportContext) -> Self {
+        assert!(
+            self.export.replace(value).is_none(),
+            "export facet already set"
         );
         self
     }

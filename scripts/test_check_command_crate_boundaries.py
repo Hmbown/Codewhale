@@ -21,6 +21,8 @@ def valid_graph() -> dict[str, set[str]]:
     return {
         "codewhale-command-contract": {"codewhale-core"},
         "codewhale-core": set(),
+        "codewhale-secrets": {"codewhale-paths"},
+        "codewhale-paths": set(),
         "codewhale-tui": set(),
     }
 
@@ -46,6 +48,28 @@ class DependencyTests(unittest.TestCase):
         self.assertEqual(len(violations), 1)
         self.assertIn("missing", str(violations[0]))
 
+    def test_missing_sanitizer_fails(self) -> None:
+        graph = valid_graph()
+        del graph["codewhale-secrets"]
+        violations = mod.check_dependency_graph(graph)
+        self.assertEqual(len(violations), 1)
+        self.assertIn("codewhale-secrets", str(violations[0]))
+
+    def test_sanitizer_reaching_tui_fails(self) -> None:
+        # The shared sanitizer is consumed by portable command helpers, so a TUI
+        # edge would pull the whole TUI into the extracted command crate.
+        graph = valid_graph()
+        graph["codewhale-paths"].add("codewhale-tui")
+        violations = mod.check_dependency_graph(graph)
+        self.assertEqual(len(violations), 1)
+        self.assertIn("codewhale-secrets", str(violations[0]))
+
+    def test_both_packages_reaching_tui_fails_twice(self) -> None:
+        graph = valid_graph()
+        graph["codewhale-core"].add("codewhale-tui")
+        graph["codewhale-paths"].add("codewhale-tui")
+        self.assertEqual(len(mod.check_dependency_graph(graph)), 2)
+
     def test_dev_dependency_is_not_a_normal_edge(self) -> None:
         metadata = {"packages": [
             {"name": "codewhale-command-contract", "dependencies": [
@@ -53,6 +77,7 @@ class DependencyTests(unittest.TestCase):
                 {"name": "codewhale-core", "kind": None},
             ]},
             {"name": "codewhale-core", "dependencies": []},
+            {"name": "codewhale-secrets", "dependencies": []},
             {"name": "codewhale-tui", "dependencies": []},
         ]}
         graph = mod.dependency_graph(metadata)

@@ -14,7 +14,7 @@
 //!
 //! ## Authoritative host-proxy design (D1)
 //!
-//! `CommandContexts` holds fifteen independently borrowed facet objects, while
+//! `CommandContexts` holds sixteen independently borrowed facet objects, while
 //! important behavior (mode transitions, model invalidation, cost accounting,
 //! skill refresh) is authoritative on `App`. The adapters therefore share a
 //! synchronous TUI-owned host proxy. Each trait call borrows `App` only for the
@@ -54,6 +54,11 @@ use codewhale_command_contract::facets::{
     SkillSourceKind, SkillSyncEntry, SkillSyncOutcome, SkillTargetScope, SnapshotEntry,
     TitleReport, TitleSource, TodoProjection, TreeBodyProjection,
 };
+use codewhale_command_contract::facets::{
+    CommandSessionExportContext, ConversationExportProjection, ExportBlock, ExportMessage,
+    ExportMetadata, HistoryEntry, RestorePointProjection, RestoreSnapshot, ToolCallerProjection,
+    TranscriptProjection, TurnHandoffProjection,
+};
 #[cfg(test)]
 use codewhale_command_contract::handler::ContextParts;
 use codewhale_command_contract::handler::{CommandCapabilities, CommandContexts};
@@ -61,7 +66,7 @@ use codewhale_command_contract::types::{
     CommandApprovalMode, CommandCurrency, CommandMode, CommandProviderId, CommandReasoningEffort,
 };
 use codewhale_config::AppMode;
-use codewhale_core::request::{Message, SystemPrompt};
+use codewhale_core::request::{ContentBlock, Message, SystemPrompt};
 use codewhale_execpolicy::ApprovalMode;
 
 use crate::commands::groups::plugins::plugin_network_policy;
@@ -274,7 +279,7 @@ pub(crate) fn key_to_message_id(key: &'static str) -> Option<MessageId> {
 
 /// Shared TUI host hidden behind the portable command facets.
 ///
-/// The envelope needs fifteen independently borrowed facet objects, while the
+/// The envelope needs sixteen independently borrowed facet objects, while the
 /// authoritative mutation methods live on `App`. Each adapter therefore owns
 /// an `Rc` clone of this synchronous host proxy. Trait calls borrow `App` only
 /// for the duration of one method, delegate to the real TUI authority, and
@@ -1475,6 +1480,317 @@ fn import_session_container(
             .unwrap_or(0),
         leaf_display: imported.leaf_id.as_deref().unwrap_or("(none)").to_string(),
     })
+}
+
+// ---------------------------------------------------------------------------
+// Session export adapter (FEAT-025 D1/D2/D3/D5/D7/D8/D9)
+//
+// Sole host owner of concrete export machinery for `/export` and `/daochu`:
+// metadata derivation, authoritative/visible-history projection, semantic
+// restore-point projection, the shared `turn_handoff_markdown` renderer,
+// clipboard mode/recovery/delivery, and protected destination resolution/
+// writing. Every delegate reproduces the baseline order and returns portable
+// data or the exact host-error text; no concrete `App`, clipboard, snapshot,
+// history, filesystem, or turn-handoff type crosses the boundary. Hidden
+// reasoning bodies, signatures, and inline/local image payloads are excluded
+// while the projection is built (D9). The shared recovery writer and protected
+// file services live in `commands::session_export_host` (outside the future
+// portable group) so `/copy` and `/export` reuse one implementation (D5).
+// ---------------------------------------------------------------------------
+pub(crate) struct SessionExportAdapter<'a> {
+    host: SharedCommandHost<'a>,
+}
+
+impl CommandSessionExportContext for SessionExportAdapter<'_> {
+    /// Conversation export projection: metadata, transcript, and restore-point
+    /// state.
+    ///
+    /// Memory note (FEAT-025 audit, finding F3): the projection is an *owned*
+    /// copy of the transcript, so peak use is roughly the live `api_messages`
+    /// plus this projection for the duration of one render. That copy is
+    /// structural, not an oversight: the facet must return owned data because
+    /// `SharedCommandHost` hands out `App` through a `RefCell`, so no borrow can
+    /// outlive this method, and a `dyn` facet cannot lend a projection tied to a
+    /// temporary `Ref`. The baseline rendered straight from `App` and cloned one
+    /// block at a time, so this is a deliberate D3 cost accepted for the
+    /// capability boundary. Removing it needs a host proxy that can lend a
+    /// borrowed projection (tracked with the FEAT-043/046 extraction work); it is
+    /// not something this slice can fix locally.
+    fn conversation_projection(&self) -> ConversationExportProjection {
+        let app = self.host.app.borrow();
+        ConversationExportProjection {
+            metadata: export_metadata(&app),
+            transcript: project_transcript(&app),
+            restore_points: project_restore_points(&app.workspace),
+        }
+    }
+
+    fn turn_handoff_projection(&self) -> TurnHandoffProjection {
+        let app = self.host.app.borrow();
+        TurnHandoffProjection {
+            markdown: crate::tui::ui::turn_handoff_markdown(&app),
+            workspace_path: app.workspace.to_string_lossy().into_owned(),
+        }
+    }
+
+    fn clipboard_requires_terminal_paste(&self) -> bool {
+        self.host.app.borrow().clipboard.requires_terminal_paste()
+    }
+
+    fn write_recovery_copy(&self, markdown: &str) -> Option<PathBuf> {
+        crate::commands::session_export_host::write_last_copy(markdown)
+    }
+
+    fn write_clipboard(&self, markdown: &str) -> Result<(), String> {
+        self.host
+            .app
+            .borrow_mut()
+            .clipboard
+            .write_text(markdown)
+            .map_err(|err| err.to_string())
+    }
+
+    fn resolve_export_path(&self, raw: &str) -> Result<PathBuf, String> {
+        let app = self.host.app.borrow();
+        crate::commands::session_export_host::resolve_export_path(&app.workspace, raw)
+    }
+
+    fn write_export_file(&self, path: &Path, contents: &[u8], force: bool) -> Result<(), String> {
+        crate::commands::session_export_host::write_export_file(path, contents, force)
+    }
+}
+
+/// Maximum restore points listed in the export summary (baseline bound).
+const RESTORE_POINT_SUMMARY_MAX: usize = 100;
+
+/// Authoritative export metadata, reusing the baseline host derivations.
+fn export_metadata(app: &App) -> ExportMetadata {
+    let message_count = if app.api_messages.is_empty() {
+        app.history.len()
+    } else {
+        app.api_messages.len()
+    };
+    let session_label = app
+        .current_session_id
+        .as_deref()
+        .map(crate::session_manager::truncate_id)
+        .unwrap_or("unsaved")
+        .to_string();
+    let workspace_name = app
+        .workspace
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("workspace")
+        .to_string();
+    ExportMetadata {
+        session_label,
+        provider: app.provider_identity_for_persistence().to_string(),
+        model: app.model_display_label(),
+        mode: app.mode.display_name().to_string(),
+        workspace_name,
+        message_count,
+        exported_at_unix: chrono::Utc::now().timestamp(),
+    }
+}
+
+/// Authoritative transcript when API messages exist, otherwise the visible
+/// history fallback (D3 precedence).
+fn project_transcript(app: &App) -> TranscriptProjection {
+    if app.api_messages.is_empty() {
+        TranscriptProjection::HistoryFallback(
+            app.history.iter().map(project_history_cell).collect(),
+        )
+    } else {
+        TranscriptProjection::Authoritative(app.api_messages.iter().map(project_message).collect())
+    }
+}
+
+fn project_message(message: &Message) -> ExportMessage {
+    ExportMessage {
+        role: message.role.as_str().to_string(),
+        // Exact enum identity, not a string comparison: `Role::Unrecognized("user")`
+        // must not be treated as a user turn (baseline parity, F6).
+        is_user_role: message.role == codewhale_models::Role::User,
+        blocks: message.content.iter().map(project_block).collect(),
+        prompt_snippet: first_text_block(message)
+            .and_then(crate::core::turn::snapshot_label_prompt_snippet),
+    }
+}
+
+fn first_text_block(message: &Message) -> Option<&str> {
+    message.content.iter().find_map(|block| match block {
+        ContentBlock::Text { text, .. } => Some(text.as_str()),
+        _ => None,
+    })
+}
+
+/// Project one content block; hidden payloads become typed omission markers
+/// (D9) and never cross the boundary.
+fn project_block(block: &ContentBlock) -> ExportBlock {
+    match block {
+        ContentBlock::Text { text, .. } => ExportBlock::Text { text: text.clone() },
+        ContentBlock::ImageUrl { image_url } => {
+            if image_url.url.starts_with("http://") || image_url.url.starts_with("https://") {
+                ExportBlock::ImageReference {
+                    url: image_url.url.clone(),
+                }
+            } else {
+                ExportBlock::ImageOmitted
+            }
+        }
+        ContentBlock::Thinking { .. } => ExportBlock::InternalReasoning,
+        ContentBlock::ToolUse {
+            id,
+            name,
+            input,
+            caller,
+            ..
+        } => ExportBlock::ToolCall {
+            id: id.clone(),
+            name: name.clone(),
+            caller: caller.as_ref().map(|caller| ToolCallerProjection {
+                caller_type: caller.caller_type.clone(),
+                tool_id: caller.tool_id.clone(),
+            }),
+            input: input.clone(),
+        },
+        ContentBlock::ToolResult {
+            tool_use_id,
+            content,
+            is_error,
+            content_blocks,
+        } => ExportBlock::ToolResult {
+            tool_use_id: tool_use_id.clone(),
+            content: content.clone(),
+            is_error: is_error.unwrap_or(false),
+            structured: content_blocks.as_deref().map(|blocks| {
+                serde_json::Value::Array(
+                    crate::image_attach::safe_tool_result_content_blocks(Some(blocks))
+                        .unwrap_or_default(),
+                )
+            }),
+        },
+        ContentBlock::ServerToolUse { id, name, input } => ExportBlock::ServerToolCall {
+            id: id.clone(),
+            name: name.clone(),
+            input: input.clone(),
+        },
+        ContentBlock::ToolSearchToolResult {
+            tool_use_id,
+            content,
+        } => ExportBlock::ToolSearchResult {
+            tool_use_id: tool_use_id.clone(),
+            content: content.clone(),
+        },
+        ContentBlock::CodeExecutionToolResult {
+            tool_use_id,
+            content,
+        } => ExportBlock::CodeExecutionResult {
+            tool_use_id: tool_use_id.clone(),
+            content: content.clone(),
+        },
+    }
+}
+
+fn project_history_cell(cell: &HistoryCell) -> HistoryEntry {
+    match cell {
+        HistoryCell::User { content } => HistoryEntry::Sanitized {
+            role: "user".to_string(),
+            body: content.clone(),
+        },
+        HistoryCell::Assistant { content, .. } => HistoryEntry::Sanitized {
+            role: "assistant".to_string(),
+            body: content.clone(),
+        },
+        HistoryCell::System { .. } => HistoryEntry::Literal {
+            role: "system".to_string(),
+            body: "[internal context omitted]".to_string(),
+        },
+        HistoryCell::Error { message, severity } => HistoryEntry::Sanitized {
+            role: error_severity_role(*severity).to_string(),
+            body: message.clone(),
+        },
+        HistoryCell::Thinking { .. } => HistoryEntry::Literal {
+            role: "internal reasoning".to_string(),
+            body: "[internal reasoning omitted]".to_string(),
+        },
+        HistoryCell::Tool(tool) => HistoryEntry::Sanitized {
+            role: "tool".to_string(),
+            body: flatten_history_lines(tool.lines(120)),
+        },
+        HistoryCell::SubAgent(subagent) => HistoryEntry::Sanitized {
+            role: "sub-agent".to_string(),
+            body: flatten_history_lines(subagent.lines(120)),
+        },
+        HistoryCell::Automation(cell) => HistoryEntry::Sanitized {
+            role: "automation".to_string(),
+            body: flatten_history_lines(cell.render(120)),
+        },
+        HistoryCell::ArchivedContext {
+            level,
+            range,
+            summary,
+            ..
+        } => HistoryEntry::Sanitized {
+            role: "archived context".to_string(),
+            body: format!("L{level} [{range}]: {summary}"),
+        },
+    }
+}
+
+fn error_severity_role(severity: crate::error_taxonomy::ErrorSeverity) -> &'static str {
+    match severity {
+        crate::error_taxonomy::ErrorSeverity::Info => "info",
+        crate::error_taxonomy::ErrorSeverity::Warning => "warning",
+        crate::error_taxonomy::ErrorSeverity::Error => "error",
+        crate::error_taxonomy::ErrorSeverity::Critical => "critical error",
+    }
+}
+
+/// Flatten host UI lines/spans to plain text, preserving the baseline width
+/// and joining behavior (D3). UI rendering stays behind the adapter.
+fn flatten_history_lines(lines: Vec<ratatui::text::Line<'static>>) -> String {
+    lines
+        .into_iter()
+        .map(|line| {
+            line.spans
+                .into_iter()
+                .map(|span| span.content.to_string())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Read the workspace snapshot repository read-only and project its state
+/// (D8): only an existing repo is opened, never created.
+fn project_restore_points(workspace: &Path) -> RestorePointProjection {
+    match crate::snapshot::SnapshotRepo::open_existing(workspace) {
+        Ok(None) => RestorePointProjection::None,
+        Err(err) => RestorePointProjection::Unreadable {
+            reason: err.to_string(),
+        },
+        Ok(Some(repo)) => match repo.list(RESTORE_POINT_SUMMARY_MAX) {
+            Ok(snapshots) => RestorePointProjection::Recorded {
+                snapshots: snapshots.iter().map(project_restore_snapshot).collect(),
+            },
+            Err(err) => RestorePointProjection::Unreadable {
+                reason: err.to_string(),
+            },
+        },
+    }
+}
+
+fn project_restore_snapshot(snapshot: &crate::snapshot::Snapshot) -> RestoreSnapshot {
+    let parsed = crate::core::turn::parse_snapshot_label(&snapshot.label);
+    RestoreSnapshot {
+        id: snapshot.id.as_str().to_string(),
+        label: snapshot.label.clone(),
+        timestamp_unix: snapshot.timestamp,
+        kind: parsed.kind,
+        sequence: parsed.seq,
+        prompt_snippet: parsed.prompt_snippet,
+    }
 }
 
 /// Session identity, messages, queue operations, and token totals.
@@ -3922,7 +4238,7 @@ fn default_codewhale_tools_dir() -> Option<PathBuf> {
 // Envelope construction (D1)
 // ---------------------------------------------------------------------------
 
-/// Owns fifteen facet objects sharing one synchronous TUI host proxy.
+/// Owns sixteen facet objects sharing one synchronous TUI host proxy.
 ///
 /// Handlers borrow only these adapters. Every method delegates to the real App
 /// authority and releases its `RefCell` borrow before returning, so facets can
@@ -3943,6 +4259,7 @@ pub(crate) struct CommandContextBundle<'a> {
     plugin: PluginAdapter<'a>,
     lifecycle: SessionLifecycleAdapter<'a>,
     control: SessionControlAdapter<'a>,
+    export: SessionExportAdapter<'a>,
 }
 
 impl<'a> CommandContextBundle<'a> {
@@ -3994,6 +4311,9 @@ impl<'a> CommandContextBundle<'a> {
         if capabilities.contains(CommandCapabilities::SESSION_CONTROL) {
             contexts = contexts.with_control(&mut self.control);
         }
+        if capabilities.contains(CommandCapabilities::SESSION_EXPORT) {
+            contexts = contexts.with_export(&mut self.export);
+        }
         contexts
     }
 
@@ -4014,7 +4334,8 @@ impl<'a> CommandContextBundle<'a> {
             .union(CommandCapabilities::SKILL_GROUP)
             .union(CommandCapabilities::PLUGIN)
             .union(CommandCapabilities::SESSION_LIFECYCLE)
-            .union(CommandCapabilities::SESSION_CONTROL);
+            .union(CommandCapabilities::SESSION_CONTROL)
+            .union(CommandCapabilities::SESSION_EXPORT);
         self.contexts(all_test_capabilities).into_parts()
     }
 }
@@ -4041,7 +4362,8 @@ impl App {
             skill_group: SkillGroupAdapter { host: host.clone() },
             plugin: PluginAdapter { host: host.clone() },
             lifecycle: SessionLifecycleAdapter { host: host.clone() },
-            control: SessionControlAdapter { host },
+            control: SessionControlAdapter { host: host.clone() },
+            export: SessionExportAdapter { host },
         }
     }
 }
