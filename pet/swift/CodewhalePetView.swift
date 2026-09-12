@@ -60,6 +60,6 @@ public func petA11yLabel(sim: PetSim, state: PetState) -> String {
     var parts = ["Codewhale pet", f.channel, f.arch]
     if f.hollow { parts.append("unobserved") }
     if state.lit < 0.5 { parts.append("dozing") }
-    if state.attention > 0.5 { parts.append("needs you") }
+    if f.channel == "human" && !f.hollow && state.attention > 0.5 { parts.append("awaiting input") }
     return parts.joined(separator: ", ")
 }

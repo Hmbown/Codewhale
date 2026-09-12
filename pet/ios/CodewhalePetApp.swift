@@ -9,7 +9,7 @@ import AVFoundation
             VStack(alignment: .leading, spacing: 22) {
                 Text("CODEWHALE / WHALESONG").font(.caption.monospaced()).foregroundStyle(.secondary)
                 Text("A living field.").font(.largeTitle.weight(.medium))
-                Text("Activity sets the pace. Coherence holds the figure together. When it needs you, it turns toward you.").font(.subheadline).foregroundStyle(.secondary)
+                Text("A whale at rest. Knots, strands and branching paths as it works. The dots make the activity visible.").font(.subheadline).foregroundStyle(.secondary)
                 PetHabitatView(host: host).frame(minHeight: 300, maxHeight: .infinity)
                 Picker("World", selection: $host.source) { ForEach(PetSource.allCases) { Text($0.label).tag($0) } }.pickerStyle(.segmented)
                 Toggle("Still", isOn: $host.still)

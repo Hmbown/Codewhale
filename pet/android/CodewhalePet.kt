@@ -65,6 +65,6 @@ fun petContentDescription(sim: PetSim, state: PetState): String {
         add("Codewhale pet"); add(f.channel); add(f.arch)
         if (f.hollow) add("unobserved")
         if (state.lit < 0.5) add("dozing")
-        if (state.attention > 0.5) add("needs you")
+        if (f.channel == "human" && !f.hollow && state.attention > 0.5) add("awaiting input")
     }.joinToString(", ")
 }
