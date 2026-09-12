@@ -55,6 +55,18 @@ jobs:
           cache-dependency-path: pet/package-lock.json
       - run: npm --prefix pet ci --ignore-scripts
       - run: npm --prefix pet run check
+      - name: Build and exercise the Apple host and PCM boundary
+        if: runner.os == 'macOS'
+        run: ./pet/scripts/check-apple.sh
+      - name: Package the locally signed macOS app
+        if: runner.os == 'macOS'
+        run: ditto -c -k --keepParent pet/macos/CodewhalePet.app codewhale-pet-macos.zip
+      - uses: actions/upload-artifact@v7
+        if: runner.os == 'macOS'
+        with:
+          name: codewhale-pet-macos
+          path: codewhale-pet-macos.zip
+          if-no-files-found: error
   android:
     runs-on: ubuntu-latest
     timeout-minutes: 25

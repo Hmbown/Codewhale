@@ -60,6 +60,10 @@ quality need separate manual evidence.
 PET_KOTLIN_LIB=/path/to/gradle/lib ./pet/android/verify.sh
 ```
 
+The macOS recorder job also runs `check-apple.sh` and uploads the resulting
+locally signed app as `codewhale-pet-macos`. Android uploads its debug APK and
+reports separately. These are CI review artifacts, not notarized releases.
+
 Apple requires macOS, Xcode command-line tools, and XcodeGen for iOS. The iOS
 script generates and builds the Simulator project directly from the shared
 source, without first building macOS. Open `pet/ios/CodewhalePet.xcodeproj` to run.
