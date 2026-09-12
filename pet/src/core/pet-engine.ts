@@ -1,3 +1,4 @@
+import { PET_MAX_SECONDS } from './pet-sim.js';
 import type { Category, WhaleEvent } from './model.js';
 import { toolCategory } from './codewhale.js';
 import { compilePetTelemetry, PET_BIN_MS, type PetBucket } from './pet-telemetry.js';
@@ -31,7 +32,7 @@ export class PetEngineTelemetry {
   }
 
   observe(value: unknown, at: number): void {
-    if (!Number.isFinite(at) || at < this.lastTime || at > 86_400_000) throw new Error('Invalid Engine pet clock.');
+    if (!Number.isFinite(at) || at < this.lastTime || at > PET_MAX_SECONDS * 1000) throw new Error('Invalid Engine pet clock.');
     if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Invalid Engine pet metadata.');
     const e = value as Record<string, unknown>;
     const allowed = ['event', 'index', 'channel', 'tool_call_id', 'tool_name', 'id', 'worker_status', 'failed'];

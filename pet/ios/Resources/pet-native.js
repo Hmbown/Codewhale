@@ -18,52 +18,44 @@ class PetNative {
     world;
     engine = new pet_engine_js_1.PetEngineTelemetry();
     engineTick = 0;
+    segment;
     constructor(pointsJSON, tapeJSONL = '', interactionsJSON = '[]', live = false, expressionVersion = 2) {
         const points = JSON.parse(pointsJSON);
         if (!Array.isArray(points) || points.length !== 980 || points.some(p => !Array.isArray(p) || p.length !== 2 || !p.every(n => Number.isFinite(n) && Math.abs(n) <= 1)))
             throw new Error('Invalid native whale body.');
-        this.world = new pet_world_js_1.PetWorld(points, live ? (0, pet_telemetry_js_1.compilePetTelemetry)([]) : (0, pet_telemetry_js_1.decodePetJSONL)(tapeJSONL), JSON.parse(interactionsJSON), expressionVersion);
+        this.world = new pet_world_js_1.PetWorld(points, live ? (0, pet_telemetry_js_1.compilePetTelemetry)([]) : (0, pet_telemetry_js_1.decodePetJSONL)(tapeJSONL), JSON.parse(interactionsJSON), expressionVersion, true);
     }
     step(dt, motion) { this.world.step(dt, { motion, sensitivity: 1 }); return this.snapshot(); }
     snapshot() { return JSON.stringify({ ...this.world.frame, voices: this.world.voices, digest: (0, pet_sim_js_1.digest)(this.world.sim) }); }
     interact(kind, x, y) { this.world.interact(kind, x, y); }
     interactions() { return JSON.stringify(this.world.interactions); }
     accept(packet) { this.world.acceptTelemetry(JSON.parse(packet)); }
-    recording(withCheckpoint = false) {
-        return JSON.stringify({ petReplayVersion: 1, expressionVersion: this.world.sim.expressionVersion, tape: this.world.tape,
-            interactions: this.world.interactions, ...(withCheckpoint ? { checkpoint: this.world.checkpoint() } : {}) });
-    }
+    recording(withCheckpoint = false) { return JSON.stringify(this.world.recording(withCheckpoint)); }
+    needsSegment() { return this.world.needsSegment; }
+    prepareSegment() { this.segment = this.world.prepareSegment(); return JSON.stringify(this.segment.recording); }
+    commitSegment() { if (!this.segment)
+        throw new Error('No pet segment was prepared.'); this.segment.commit(); this.segment = undefined; }
     checkpoint() { return JSON.stringify(this.world.checkpoint()); }
-    recordingChunk(index) { return this.world.recordingChunk(index); }
+    recordingChunk(index, completed = false) { return this.world.recordingChunk(index, completed); }
     restoreCheckpoint(text) {
         if (text.length > 512 * 1024)
             throw new Error('Pet checkpoint exceeds its size limit.');
-        this.restoreHistory(this.world.tape, this.world.interactions, JSON.parse(text));
+        this.restoreRecording(JSON.stringify({ ...this.world.recording(false), checkpoint: JSON.parse(text) }));
     }
     restoreRecording(text) {
         if (text.length > 8 * 1024 * 1024)
             throw new Error('Native habitat exceeds 8 MiB.');
-        const r = JSON.parse(text);
-        if (!r || r.petReplayVersion !== 1 || !Array.isArray(r.tape) || !Array.isArray(r.interactions))
-            throw new Error('Invalid native habitat.');
-        if (r.expressionVersion !== undefined && ![1, 2].includes(r.expressionVersion))
-            throw new Error('Unsupported pet expression version.');
-        if (r.checkpoint !== undefined && (r.expressionVersion ?? 1) !== (r.checkpoint?.sim?.expressionVersion ?? 1))
-            throw new Error('Pet expression version does not match its checkpoint.');
-        this.restoreHistory(r.tape, r.interactions, r.checkpoint, r.expressionVersion ?? 1);
-    }
-    restoreHistory(tape, interactions, checkpoint, expressionVersion = 2) {
         const points = this.world.sim.p.map(p => [p.hx, p.hy]);
-        this.world = checkpoint === undefined ? new pet_world_js_1.PetWorld(points, tape, interactions, expressionVersion)
-            : pet_world_js_1.PetWorld.restore(points, tape, interactions, checkpoint);
+        this.world = pet_world_js_1.PetWorld.fromRecording(points, JSON.parse(text));
+        this.segment = undefined;
         this.engineTick = Math.round(this.world.frame.timeMs * 30 / 1000);
-        // A restored creature does not prove an Engine operation is still active.
         this.engine = new pet_engine_js_1.PetEngineTelemetry();
     }
     /** Resume a live host at the first unrecorded bucket. Keep every accepted
      * interval, but never present its last observed frame as current evidence. */
     resumeEngine() {
-        const end = this.world.tape.length * 12;
+        const last = this.world.tape.at(-1);
+        const end = last ? (last.sequence + 1) * 12 : 0;
         if (!end || end - this.engineTick > 24)
             throw new Error('Only a live recording can resume Engine observation.');
         while (this.engineTick < end) {
@@ -116,12 +108,14 @@ exports.PetNative = PetNative;
 factories["pet-world"]=function(exports,require){
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.PetWorld = void 0;
+exports.PetWorld = exports.PET_MAX_SECONDS = void 0;
 const model_js_1 = require("./model.js");
 const pet_sim_js_1 = require("./pet-sim.js");
 const pet_telemetry_js_1 = require("./pet-telemetry.js");
 const pet_audio_js_1 = require("./pet-audio.js");
 const HZ = 30;
+var pet_sim_js_2 = require("./pet-sim.js");
+Object.defineProperty(exports, "PET_MAX_SECONDS", { enumerable: true, get: function () { return pet_sim_js_2.PET_MAX_SECONDS; } });
 const seedFor = (name) => (0xC0FFEE ^ (0, model_js_1.stableHash)(name)) >>> 0;
 /** Fixed-tick creature controller. Wall clocks and pointer APIs belong to drivers.
  * Reconstructing with the same tape and interactions is also the seek operation.
@@ -156,16 +150,27 @@ class PetWorld {
     food = null;
     members = new Map();
     lastStill = '';
-    constructor(points, tape = [], interactions = [], expressionVersion = 2) {
+    origin;
+    segmented = false;
+    hasTelemetry = false;
+    get startTimeMs() { return this.origin?.frame.timeMs ?? 0; }
+    get endTimeMs() { return Math.max(this.frame.timeMs, (this.tapeLog.at(-1)?.simTimeMs ?? 0) + 400); }
+    get needsSegment() {
+        return !this.segmented && this.tapeLog.length < 1024 && this.interactionLog.length < 4096
+            || this.bucketIndex >= 1024 || this.interactionIndex >= 4096;
+    }
+    constructor(points, tape = [], interactions = [], expressionVersion = 2, segmented = false) {
         if (tape.length > 216_000 || interactions.length > 100_000)
             throw new Error('Pet recording exceeds its input limit.');
         this.sim = new pet_sim_js_1.PetSim(points, 0xC0FFEE, expressionVersion);
+        this.segmented = segmented;
+        this.hasTelemetry = tape.length > 0;
         this.tapeLog = structuredClone([...tape]);
         this.interactionLog = structuredClone([...interactions]);
         for (let i = 0; i < this.tape.length; i++) {
             const b = this.tape[i];
             (0, pet_telemetry_js_1.validatePetBucket)(b);
-            if (b.version !== 1 || b.sequence !== i || b.simTimeMs !== i * 400 || b.durationMs !== 400)
+            if (segmented ? i > 0 && b.sequence <= this.tape[i - 1].sequence : b.sequence !== i)
                 throw new Error('World requires contiguous version 1 pet buckets.');
         }
         for (let i = 0; i < this.interactionLog.length; i++) {
@@ -178,9 +183,12 @@ class PetWorld {
         this.hashTape(0);
         this.frame = this.makeFrame(0);
         this.voices = this.score.voices(this.frame);
+        if (segmented)
+            this.origin = this.checkpoint();
     }
     checkpoint() {
-        return structuredClone({ petCheckpointVersion: 1, history: this.historyDigest(),
+        return structuredClone({ petCheckpointVersion: this.segmented ? 2 : 1,
+            ...(this.segmented ? { historyStart: (this.origin?.tick ?? this.tick), hasTelemetry: this.hasTelemetry } : {}), history: this.historyDigest(),
             sim: this.sim.checkpoint(), score: this.score.checkpoint(), accumulator: this.accumulator,
             tick: this.tick, bucketIndex: this.bucketIndex, interactionIndex: this.interactionIndex, branchTick: this.branchTick,
             random: this.random.state(), behaviour: this.behaviour, until: this.until,
@@ -189,24 +197,92 @@ class PetWorld {
             waitSince: this.waitSince, food: this.food, members: [...this.members.values()], lastStill: this.lastStill,
             frame: this.frame, voices: this.voices });
     }
+    recording(withCheckpoint = true, completed = false) {
+        const tapeEnd = completed ? this.bucketIndex + 1 : this.tapeLog.length;
+        const inputEnd = completed ? this.interactionIndex : this.interactionLog.length;
+        const history = this.historyDigest(tapeEnd, inputEnd);
+        return { petReplayVersion: this.segmented ? 2 : 1, expressionVersion: this.sim.expressionVersion,
+            tape: this.tapeLog.slice(0, tapeEnd), interactions: this.interactionLog.slice(0, inputEnd).map(e => ({ ...e })),
+            ...(this.origin ? { start: { ...structuredClone(this.origin), hasTelemetry: this.hasTelemetry, history } } : {}),
+            ...(withCheckpoint ? { checkpoint: { ...this.checkpoint(), history } } : {}) };
+    }
+    static fromRecording(points, value) {
+        const r = value;
+        if (!r || ![1, 2].includes(r.petReplayVersion) || !Array.isArray(r.tape) || !Array.isArray(r.interactions))
+            throw new Error('Invalid pet recording.');
+        const version = r.expressionVersion === undefined ? 1 : r.expressionVersion;
+        if (![1, 2].includes(version))
+            throw new Error('Unsupported pet expression version.');
+        if (r.checkpoint !== undefined && !r.checkpoint || r.start !== undefined && !r.start)
+            throw new Error('Invalid pet checkpoint.');
+        for (const c of [r.start, r.checkpoint])
+            if (c && (c.sim?.expressionVersion ?? 1) !== version)
+                throw new Error('Pet expression version does not match its checkpoint.');
+        if (r.petReplayVersion === 1 && (r.start || r.checkpoint && r.checkpoint.petCheckpointVersion !== 1))
+            throw new Error('Invalid legacy pet recording.');
+        if (r.petReplayVersion === 2 && (!r.start || r.start.petCheckpointVersion !== 2 || r.start.historyStart !== r.start.tick))
+            throw new Error('The recording segment is missing its starting checkpoint.');
+        const first = r.start && PetWorld.restore(points, r.tape, r.interactions, r.start);
+        const world = r.checkpoint ? PetWorld.restore(points, r.tape, r.interactions, r.checkpoint) : first ?? new PetWorld(points, r.tape, r.interactions, version);
+        if (first) {
+            if (!world.segmented || world.tick < first.tick || r.checkpoint && r.checkpoint.historyStart !== first.tick)
+                throw new Error('Pet segment checkpoints do not agree.');
+            world.origin = first.checkpoint();
+        }
+        return world;
+    }
+    /** Retire only consumed input. The exact origin makes each archived segment
+     * independently replayable; no particle, random stream or score is reset. */
+    prepareSegment() {
+        const dropTape = Math.max(0, this.bucketIndex), dropInputs = this.interactionIndex, previous = this.origin;
+        const tape = this.tapeLog.slice(dropTape), interactions = this.interactionLog.slice(dropInputs);
+        const points = this.sim.p.map(p => [p.hx, p.hy]);
+        const c = this.checkpoint();
+        c.petCheckpointVersion = 2;
+        c.historyStart = this.tick;
+        c.hasTelemetry = this.hasTelemetry;
+        c.bucketIndex -= dropTape;
+        c.interactionIndex = 0;
+        c.history = new PetWorld(points, tape, interactions, this.sim.expressionVersion, true).historyDigest();
+        const next = PetWorld.restore(points, tape, interactions, c);
+        next.origin = next.checkpoint();
+        let committed = false;
+        return { recording: next.recording(), archive: this.recording(true, true), commit: () => {
+                if (committed || this.origin !== previous || this.tick < c.tick)
+                    throw new Error('The pet recording segment has changed.');
+                this.tapeLog.splice(0, dropTape);
+                this.interactionLog.splice(0, dropInputs);
+                this.bucketIndex -= dropTape;
+                this.interactionIndex -= dropInputs;
+                this.tapeHashes = [];
+                this.hashTape(0);
+                this.segmented = true;
+                this.origin = next.origin;
+                committed = true;
+            } };
+    }
     /** Lossless version 1 export, including the current pose and score. Drivers
      * consume all chunks synchronously on the world's owner before another tick.
      * Only a small slice is serialized inside an embedded runtime at a time. */
-    recordingChunk(index) {
+    recordingChunk(index, completed = false) {
         if (!Number.isSafeInteger(index) || index < 0)
             throw new Error('Invalid pet export cursor.');
-        const size = 16, tapes = Math.ceil(this.tapeLog.length / size), inputs = Math.ceil(this.interactionLog.length / size);
+        const size = 16, tapeEnd = completed ? this.bucketIndex + 1 : this.tapeLog.length;
+        const inputEnd = completed ? this.interactionIndex : this.interactionLog.length;
+        const tapes = Math.ceil(tapeEnd / size), inputs = Math.ceil(inputEnd / size);
         if (index === 0)
-            return `{"petReplayVersion":1,"expressionVersion":${this.sim.expressionVersion},"tape":[`;
+            return `{"petReplayVersion":${this.segmented ? 2 : 1},"expressionVersion":${this.sim.expressionVersion},"tape":[`;
         if (index <= tapes)
-            return (index === 1 ? '' : ',') + JSON.stringify(this.tapeLog.slice((index - 1) * size, index * size)).slice(1, -1);
+            return (index === 1 ? '' : ',') + JSON.stringify(this.tapeLog.slice((index - 1) * size, Math.min(tapeEnd, index * size))).slice(1, -1);
         if (index === tapes + 1)
             return '],"interactions":[';
         const part = index - tapes - 2;
         if (part < inputs)
-            return (part === 0 ? '' : ',') + JSON.stringify(this.interactionLog.slice(part * size, (part + 1) * size)).slice(1, -1);
-        if (part === inputs)
-            return `],"checkpoint":${JSON.stringify(this.checkpoint())}}`;
+            return (part === 0 ? '' : ',') + JSON.stringify(this.interactionLog.slice(part * size, Math.min(inputEnd, (part + 1) * size))).slice(1, -1);
+        if (part === inputs) {
+            const history = this.historyDigest(tapeEnd, inputEnd);
+            return `]${this.origin ? ',"start":' + JSON.stringify({ ...this.origin, hasTelemetry: this.hasTelemetry, history }) : ''},"checkpoint":${JSON.stringify({ ...this.checkpoint(), history })}}`;
+        }
         return null;
     }
     /** Prefix states preserve the original FNV checksum byte for byte. Live
@@ -216,9 +292,9 @@ class PetWorld {
         for (let i = from; i < this.tapeLog.length; i++)
             this.tapeHashes[i] = (0, model_js_1.stableHash)((i ? ',' : '') + JSON.stringify(this.tapeLog[i]), this.tapeHashes[i - 1] ?? (0, model_js_1.stableHash)('[['));
     }
-    historyDigest() {
-        let hash = (0, model_js_1.stableHash)('],[', this.tapeHashes.at(-1) ?? (0, model_js_1.stableHash)('[['));
-        for (let i = 0; i < this.interactionLog.length; i++)
+    historyDigest(tapeEnd = this.tapeLog.length, inputEnd = this.interactionLog.length) {
+        let hash = (0, model_js_1.stableHash)('],[', this.tapeHashes[tapeEnd - 1] ?? (0, model_js_1.stableHash)('[['));
+        for (let i = 0; i < inputEnd; i++)
             hash = (0, model_js_1.stableHash)((i ? ',' : '') + JSON.stringify(this.interactionLog[i]), hash);
         return (0, model_js_1.stableHash)(']]', hash);
     }
@@ -228,12 +304,13 @@ class PetWorld {
         const c = value;
         const range = (n, low, high) => Number.isFinite(n) && n >= low && n <= high;
         const integer = (n, low, high) => Number.isSafeInteger(n) && range(n, low, high);
-        if (!c || c.petCheckpointVersion !== 1 || JSON.stringify(c).length > 512 * 1024
-            || !integer(c.tick, 0, 2_592_000) || !range(c.accumulator, -1e-8, 1 / HZ + 1e-8)
+        if (!c || ![1, 2].includes(c.petCheckpointVersion) || JSON.stringify(c).length > 512 * 1024
+            || c.petCheckpointVersion === 2 && (!integer(c.historyStart, 0, c.tick) || typeof c.hasTelemetry !== 'boolean')
+            || !integer(c.tick, 0, pet_sim_js_1.PET_MAX_SECONDS * HZ) || !range(c.accumulator, -1e-8, 1 / HZ + 1e-8)
             || !integer(c.bucketIndex, -1, tape.length - 1) || !integer(c.interactionIndex, 0, interactions.length)
             || !integer(c.branchTick, -1, c.tick) || !integer(c.random, 0, 0xffffffff)
             || !['swim', 'dive', 'roll', 'breathe', 'drift', 'doze', 'wake'].includes(c.behaviour)
-            || !range(c.until, 0, 86_410) || ![c.targetX, c.targetY, c.x, c.y, c.flip].every(n => range(n, -1, 1))
+            || !range(c.until, 0, pet_sim_js_1.PET_MAX_SECONDS + 10) || ![c.targetX, c.targetY, c.x, c.y, c.flip].every(n => range(n, -1, 1))
             || !range(c.lit, 0, 1) || !range(c.lastActivity, 0, c.tick / HZ)
             || c.addressedAt !== null && !range(c.addressedAt, 0, c.tick / HZ)
             || !range(c.waitSince, -1, c.tick / HZ) || typeof c.lastStill !== 'string' || c.lastStill.length > 2048
@@ -252,7 +329,11 @@ class PetWorld {
             throw new Error('Invalid pet world checkpoint.');
         (0, pet_sim_js_1.validatePetState)(c.frame.state);
         (0, pet_audio_js_1.renderPetPCM)(c.voices, 0, 0);
-        const world = new PetWorld(points, tape, interactions, c.sim?.expressionVersion ?? 1);
+        const world = new PetWorld(points, tape, interactions, c.sim?.expressionVersion ?? 1, c.petCheckpointVersion === 2);
+        if (c.petCheckpointVersion === 2) {
+            world.hasTelemetry = c.hasTelemetry;
+            world.origin = structuredClone(c);
+        }
         if (c.history !== world.historyDigest()
             || c.bucketIndex >= 0 && world.tape[c.bucketIndex].simTimeMs > c.frame.timeMs + 1e-7
             // acceptTelemetry may fill past gaps after the most recent fixed tick.
@@ -309,8 +390,18 @@ class PetWorld {
     acceptTelemetry(input) {
         (0, pet_telemetry_js_1.validatePetBucket)(input);
         const sequence = Math.floor(this.tick / 12) + 1;
+        if (this.tapeLog.length >= 216_000)
+            throw new Error('Archive this pet recording before accepting more telemetry.');
+        this.hasTelemetry = true;
+        if (this.segmented) {
+            const at = this.tapeLog.findIndex(b => b.sequence >= sequence);
+            const index = at < 0 ? this.tapeLog.length : at;
+            this.tapeLog.splice(index, at >= 0 && this.tapeLog[at].sequence === sequence ? 1 : 0, { ...structuredClone(input), sequence, simTimeMs: sequence * 400 });
+            this.hashTape(index);
+            return;
+        }
         if (sequence >= 216_000)
-            throw new Error('Start a new pet recording after 24 hours.');
+            throw new Error('Archive the legacy recording before accepting more telemetry.');
         const changedFrom = Math.min(sequence, this.tapeLog.length);
         while (this.tapeLog.length <= sequence) {
             const at = this.tapeLog.length;
@@ -403,7 +494,7 @@ class PetWorld {
         this.y += (this.targetY - this.y) * move;
         this.flip += ((Math.abs(dx) < .015 ? this.flip < 0 ? -1 : 1 : dx < 0 ? -1 : 1) - this.flip) * .035;
         this.lit += ((sleeping ? .18 : 1) - this.lit) * .03;
-        const wild = !this.tape.length;
+        const wild = !this.hasTelemetry;
         const state = {
             activity: telemetry?.activity ?? (wild ? sleeping ? .05 : .18 : .12),
             coherence: telemetry?.coherence ?? (wild ? .94 : .25),
@@ -530,12 +621,13 @@ factories["pet-sim"]=function(exports,require){
 // Positions stay normalized in body space (roughly [-0.5, 0.5]²). A renderer
 // maps them through layout() to its own medium.
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.PetSim = exports.CHANNEL_INDEX = exports.CHANNELS = exports.ARCH_OF = exports.REST_STATE = void 0;
+exports.PetSim = exports.CHANNEL_INDEX = exports.CHANNELS = exports.ARCH_OF = exports.REST_STATE = exports.PET_MAX_SECONDS = void 0;
 exports.validatePetState = validatePetState;
 exports.mulberry32 = mulberry32;
 exports.layout = layout;
 exports.digest = digest;
 exports.runTape = runTape;
+exports.PET_MAX_SECONDS = 100 * 365 * 86_400;
 exports.REST_STATE = {
     activity: 0.35, coherence: 0.8, attention: 0, channel: 'reasoning',
     observed: 1, roamX: 0, roamY: 0, flip: 1, lit: 1,
@@ -797,8 +889,8 @@ class PetSim {
         if (!c || c.version !== 1 || c.expressionVersion !== undefined && ![1, 2].includes(c.expressionVersion) || (c.expressionVersion ?? 1) !== this.expressionVersion || !Array.isArray(c.body) || c.body.length !== this.p.length
             || c.body.some((v, i) => !Array.isArray(v) || v.length !== 3 || v[0] !== this.p[i].hx || v[1] !== this.p[i].hy || v[2] !== this.p[i].s)
             || !Array.isArray(c.particles) || c.particles.length !== this.p.length
-            || c.particles.some(v => !Array.isArray(v) || v.length !== 8 || v.some((n, i) => !inRange(n, i === 4 || i === 5 ? 0 : -8, i === 4 || i === 5 ? 1_000_000 : 8)))
-            || !inRange(c.phase, 0, 100_000) || !inRange(c.clock, 0, 86_400) || !inRange(c.tear, 0, 1)
+            || c.particles.some(v => !Array.isArray(v) || v.length !== 8 || v.some((n, i) => !inRange(n, i === 4 || i === 5 ? 0 : -8, i === 4 || i === 5 ? 2 * exports.PET_MAX_SECONDS : 8)))
+            || !inRange(c.phase, 0, exports.PET_MAX_SECONDS) || !inRange(c.clock, 0, exports.PET_MAX_SECONDS) || !inRange(c.tear, 0, 1)
             || ![c.previous, c.current].every(n => Number.isInteger(n) && n >= 0 && n < exports.CHANNELS.length)
             || !Array.isArray(c.color) || c.color.length !== 3 || c.color.some(n => !inRange(n, 0, 255))
             || !c.frame || ![c.frame.r, c.frame.g, c.frame.b].every(n => inRange(n, 0, 255))
@@ -963,7 +1055,7 @@ exports.PET_BIN_MS = 400;
 function validatePetBucket(value) {
     (0, pet_sim_js_1.validatePetState)(value);
     const b = value;
-    if (!b || typeof b !== 'object' || b.version !== 1 || !Number.isSafeInteger(b.sequence) || b.sequence < 0
+    if (!b || typeof b !== 'object' || b.version !== 1 || !Number.isSafeInteger(b.sequence) || b.sequence < 0 || b.sequence > pet_sim_js_1.PET_MAX_SECONDS * 2.5
         || b.simTimeMs !== b.sequence * exports.PET_BIN_MS || b.durationMs !== exports.PET_BIN_MS
         || !model_js_1.CATEGORIES.includes(b.channel) || typeof b.waiting !== 'boolean'
         || !Array.isArray(b.agentIds) || b.agentIds.length > 250_000 || b.agentIds.some(id => typeof id !== 'string' || !id || id.length > 4096)
@@ -1026,7 +1118,7 @@ function compilePetTelemetry(input, durationMs = 0, firstSequence = 0, originMs 
     if (failures.length)
         lastOnset = Math.max(lastOnset, failures[failures.length - 1]);
     const count = Math.max(1, Math.ceil(durationMs / exports.PET_BIN_MS), Math.floor(lastOnset / exports.PET_BIN_MS) + 1);
-    if (count > 216_000)
+    if (count - firstSequence > 216_000 || count > pet_sim_js_1.PET_MAX_SECONDS * 2.5)
         throw new Error('Pet replay exceeds 24 hours; select a shorter trace.');
     const index = new signal_js_1.IntervalIndex(events), result = [];
     const recent = [], names = new Map();
@@ -1387,7 +1479,7 @@ class PetScore {
     checkpoint() { return [this.lastWindow, this.lastSequence, this.lastAddress]; }
     restore(value) {
         if (!Array.isArray(value) || value.length !== 3
-            || !value.slice(0, 2).every(n => Number.isSafeInteger(n) && n >= -1 && n <= 216_000) || typeof value[2] !== 'boolean')
+            || !value.slice(0, 2).every(n => Number.isSafeInteger(n) && n >= -1 && n <= pet_sim_js_1.PET_MAX_SECONDS * 2.5) || typeof value[2] !== 'boolean')
             throw new Error('Invalid pet score checkpoint.');
         [this.lastWindow, this.lastSequence, this.lastAddress] = value;
     }
@@ -1478,6 +1570,7 @@ factories["pet-engine"]=function(exports,require){
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.PetEngineTelemetry = void 0;
+const pet_sim_js_1 = require("./pet-sim.js");
 const codewhale_js_1 = require("./codewhale.js");
 const pet_telemetry_js_1 = require("./pet-telemetry.js");
 /** Read-only adapter for codewhale_protocol::EventMsg metadata. The foreground
@@ -1511,7 +1604,7 @@ class PetEngineTelemetry {
             e.endTime = at;
     }
     observe(value, at) {
-        if (!Number.isFinite(at) || at < this.lastTime || at > 86_400_000)
+        if (!Number.isFinite(at) || at < this.lastTime || at > pet_sim_js_1.PET_MAX_SECONDS * 1000)
             throw new Error('Invalid Engine pet clock.');
         if (!value || typeof value !== 'object' || Array.isArray(value))
             throw new Error('Invalid Engine pet metadata.');

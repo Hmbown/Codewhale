@@ -21,6 +21,14 @@ import UniformTypeIdentifiers
                     if !host.selectSource(next) { pendingSource = next; confirmLeave = true }
                 })) { ForEach(PetSource.allCases) { Text($0.label).tag($0) } }.pickerStyle(.segmented)
                 Toggle("Still", isOn: $host.still)
+                Menu("Earlier recordings") {
+                    ForEach(host.archives, id: \.self) { name in
+                        Button(petArchiveLabel(name)) {
+                            do { recording = PetRecordingDocument(data: try host.archivedRecording(name)); exporting = true }
+                            catch { notice = error.localizedDescription }
+                        }
+                    }
+                }.disabled(host.archives.isEmpty)
                 Button("Save recording…") {
                     do { recording = PetRecordingDocument(data: try host.recordingForExport()); exporting = true }
                     catch { notice = error.localizedDescription }
@@ -37,7 +45,7 @@ import UniformTypeIdentifiers
                 .onChange(of: phase) { _, value in host.suspend(value != .active) }
                 .fileExporter(isPresented: $exporting, document: recording, contentType: .json, defaultFilename: "codewhale-pet.json") { result in
                     switch result {
-                    case .success: notice = "Recording saved, including this world’s current state. Files over 8 MiB open in the browser."
+                    case .success: notice = "Recording saved. Files over 8 MiB open in the browser."
                     case .failure(let error): notice = error.localizedDescription
                     }
                     recording = nil

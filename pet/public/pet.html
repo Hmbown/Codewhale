@@ -8,7 +8,7 @@
 <div class="readout"><strong id="channel">other · drift</strong><span id="behaviour">swim</span></div><span class="depth">CODE, MADE VISIBLE.</span></section>
 <nav aria-label="Habitat controls"><label>World <select id="mode"><option value="wild">Wild</option><option value="demo">Event demo</option><option value="replay" disabled>Imported replay</option><option value="live" disabled>Live local tape</option></select></label>
 <button id="pause" aria-pressed="false">Pause</button><button id="attention">Focus</button><button id="feed">Pulse</button><button id="sound" aria-pressed="false">Sound off</button>
-<label class="toggle"><input id="motion" type="checkbox"> Still</label><label class="file">Import trace / tape<input id="file" type="file" accept=".json,.jsonl,.ndjson"></label><button id="follow">Follow local tape</button><button id="save">Save replay</button></nav>
+<label class="toggle"><input id="motion" type="checkbox"> Still</label><label class="file">Import trace / tape<input id="file" type="file" accept=".json,.jsonl,.ndjson"></label><button id="follow">Follow local tape</button><button id="save">Save replay</button><select id="archive" aria-label="Earlier recordings"><option value="">Earlier recordings…</option></select></nav>
 <div class="timeline"><output id="clock">0:00</output><input id="seek" type="range" min="0" max="90" step="0.1" value="0" aria-label="Replay time"><output id="end">1:30</output></div>
 <p id="message" role="status">Wild mode is a simulated creature. Import event-v1, OTLP, or Codewhale telemetry to see work.</p>
 <p id="persistence" role="status">The habitat saves on this device.</p>

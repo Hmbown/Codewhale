@@ -72,11 +72,11 @@ pub struct Worker {
 
 /// One command owns the world until export completes. Keep the large buffer in
 /// the host, outside QuickJS's 64 MiB heap, and retain the exact checkpoint.
-fn export_recording(ctx: &rquickjs::Ctx<'_>) -> rquickjs::Result<Vec<u8>> {
+fn export_recording(ctx: &rquickjs::Ctx<'_>, completed: bool) -> rquickjs::Result<Vec<u8>> {
     let mut bytes = Vec::new();
     let mut index = 0usize;
     loop {
-        let chunk: Option<String> = ctx.eval(format!("pet.recordingChunk({index})"))?;
+        let chunk: Option<String> = ctx.eval(format!("pet.recordingChunk({index},{completed})"))?;
         let Some(chunk) = chunk else { return Ok(bytes) };
         if bytes.len() + chunk.len() > persistence::MAX_EXPORT_BYTES {
             return Err(rquickjs::Error::Unknown);
@@ -273,7 +273,7 @@ fn run(
                         let result = session
                             .ok_or_else(|| std::io::Error::other("No saved session"))
                             .and_then(|id| {
-                                let bytes = export_recording(&ctx).map_err(|_| {
+                                let bytes = export_recording(&ctx, false).map_err(|_| {
                                     let _ = ctx.catch();
                                     std::io::Error::other("Pet recording could not be exported")
                                 })?;
@@ -367,10 +367,27 @@ fn save(
     notices: &mpsc::SyncSender<Notice>,
 ) -> Result<(), ()> {
     if let Some(files) = store {
-        let text: String = context
-            .with(|ctx| ctx.eval("pet.recording(true)"))
-            .map_err(|_| ())?;
-        if files.save(&text).is_err() {
+        let saved = context.with(|ctx| -> rquickjs::Result<()> {
+            let segment: Option<String> =
+                ctx.eval("pet.needsSegment() ? pet.prepareSegment() : null")?;
+            if let Some(text) = segment {
+                let archive = export_recording(&ctx, true)?;
+                let tick: u64 =
+                    ctx.eval("Math.round(JSON.parse(pet.snapshot()).timeMs * 30 / 1000)")?;
+                files
+                    .save_archived(&text, Some((&archive, tick)))
+                    .map_err(|_| rquickjs::Error::Unknown)?;
+                ctx.eval::<(), _>("pet.commitSegment()")?;
+            } else {
+                let text: String = ctx.eval("pet.recording(true)")?;
+                files.save(&text).map_err(|_| rquickjs::Error::Unknown)?;
+            }
+            Ok(())
+        });
+        if saved.is_err() {
+            context.with(|ctx| {
+                let _ = ctx.catch();
+            });
             *store = None;
             let _ = notices.try_send(Notice::StorageUnavailable);
         }

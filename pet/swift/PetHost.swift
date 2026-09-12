@@ -9,6 +9,12 @@ public enum PetSource: String, CaseIterable, Identifiable {
     public var label: String { switch self { case .wild: return "Wild"; case .demo: return "Event demo"; case .live: return "Live" } }
 }
 
+public func petArchiveLabel(_ name: String) -> String {
+    let tick = Double(name.split(separator: "-").dropLast().last ?? "") ?? 0
+    let seconds = Int(tick / 30)
+    return String(format: "Through %d:%02d:%02d", seconds / 3600, seconds / 60 % 60, seconds % 60)
+}
+
 /// Thin host: settings, fixed-rate ticks, lifecycle and file delivery. The shared
 /// world owns behaviour, accepted telemetry, interactions and score scheduling.
 @MainActor public final class PetHost: ObservableObject {
@@ -16,6 +22,7 @@ public enum PetSource: String, CaseIterable, Identifiable {
     @Published public private(set) var message = ""
     @Published public private(set) var persistenceMessage = ""
     @Published public private(set) var source: PetSource = .wild
+    @Published public private(set) var archives: [String] = []
     @Published public var still = false { didSet { defaults.set(still, forKey: "pet.still") } }
     @Published public var sound = false { didSet { defaults.set(sound, forKey: "pet.sound"); configureSound() } }
     public var systemReducedMotion = false
@@ -24,6 +31,7 @@ public enum PetSource: String, CaseIterable, Identifiable {
     private let defaults: UserDefaults
     private let storageDirectory: URL
     private var store: PetHabitatStore?
+    private var archiveStore: PetHabitatStore?
     private var migratingLegacy = false
     private let audio = PetAudioOutput()
     private var timer: Timer?
@@ -57,7 +65,7 @@ public enum PetSource: String, CaseIterable, Identifiable {
     }
     private func restart() {
         audio.stop(); restoring = false; failed = false; monitor?.cancel(); fileMonitor?.cancel(); monitor = nil; fileMonitor = nil; lastPacket = nil; lastSourceSequence = -1; fileIdentity = nil
-        store = nil; persistenceMessage = ""; migratingLegacy = false; count = 0
+        store = nil; archiveStore = nil; archives = []; persistenceMessage = ""; migratingLegacy = false; count = 0
         do {
             guard let script = bundle.url(forResource: "pet-native", withExtension: "js") else { throw PetCoreError.invalid("The shared pet core is missing from this app.") }
             var tape = ""
@@ -68,6 +76,7 @@ public enum PetSource: String, CaseIterable, Identifiable {
             var saved: Data?
             do {
                 let files = try PetHabitatStore(directory: storageDirectory, source: source.rawValue)
+                archiveStore = files; archives = (try? files.archives()) ?? []
                 saved = try files.load(); store = files
             } catch { persistenceMessage = "Habitat storage is unavailable. Existing files were kept. This visit stays in memory." }
             let legacy = source == .wild && saved == nil && store != nil
@@ -120,6 +129,10 @@ public enum PetSource: String, CaseIterable, Identifiable {
         guard !restoring, let core else { throw PetCoreError.invalid("Wait for the habitat to finish opening before exporting.") }
         return try core.exportRecording()
     }
+    public func archivedRecording(_ name: String) throws -> Data {
+        guard let archiveStore else { throw PetCoreError.invalid("Habitat storage is unavailable.") }
+        return try archiveStore.archivedRecording(name)
+    }
     private func configureSound() {
         do { try audio.setEnabled(sound && !paused && !failed && !restoring, simulationTime: (core?.frame.timeMs ?? 0) / 1000) }
         catch { message = "Sound unavailable: \(error.localizedDescription)" }
@@ -137,7 +150,11 @@ public enum PetSource: String, CaseIterable, Identifiable {
         guard let core else { return true }
         guard let store, !restoring, !failed else { return false }
         do {
-            try store.save(core.recording(checkpoint: true))
+            if let next = try core.prepareSegment() {
+                let archive = try core.exportRecording(completed: true)
+                try store.save(next, archive: archive, tick: Int((core.frame.timeMs * 30 / 1000).rounded()))
+                try core.commitSegment(); archives = (try? store.archives()) ?? archives
+            } else { try store.save(core.recording(checkpoint: true)) }
             if migratingLegacy {
                 defaults.removeObject(forKey: "pet.interactions"); defaults.removeObject(forKey: "pet.elapsed"); migratingLegacy = false
             }

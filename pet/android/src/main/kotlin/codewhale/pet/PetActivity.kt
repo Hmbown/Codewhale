@@ -18,10 +18,13 @@ import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -69,6 +72,22 @@ private fun PetScreen(model: PetViewModel) {
     val import = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { it?.let(model::importRecording) }
     val export = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/json")) { it?.let(model::exportRecording) }
     val recovery = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/json")) { it?.let(model::exportRecovery) }
+    var selectedArchive by rememberSaveable { mutableStateOf<String?>(null) }
+    val archived = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/json")) { uri ->
+        val name = selectedArchive
+        if (uri != null && name != null) model.exportArchive(uri, name)
+        selectedArchive = null
+    }
+    var showArchives by remember { mutableStateOf(false) }
+    if (showArchives) AlertDialog(onDismissRequest = { showArchives = false }, title = { Text("Earlier recordings") },
+        text = { LazyColumn(Modifier.heightIn(max = 320.dp)) {
+            items(ui.archives, key = { it }) { name ->
+                val seconds = (name.split('-').dropLast(1).lastOrNull()?.toLongOrNull() ?: 0) / 30
+                TextButton(onClick = { selectedArchive = name; showArchives = false; archived.launch("codewhale-pet-earlier.json") }) {
+                    Text("Through ${seconds / 3600}:${"%02d".format(seconds / 60 % 60)}:${"%02d".format(seconds % 60)}")
+                }
+            }
+        } }, confirmButton = { TextButton(onClick = { showArchives = false }) { Text("Close") } })
     var restart by remember { mutableStateOf(false) }
     var reload by remember { mutableStateOf(false) }
     if (restart) AlertDialog(onDismissRequest = { restart = false }, title = { Text("Start a fresh habitat?") },
@@ -88,6 +107,7 @@ private fun PetScreen(model: PetViewModel) {
                 DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
                     DropdownMenuItem(text = { Text("Import recording") }, onClick = { menu = false; import.launch(arrayOf("application/json", "text/plain", "application/octet-stream")) })
                     DropdownMenuItem(text = { Text("Export recording") }, enabled = ui.scene != null, onClick = { menu = false; export.launch("codewhale-pet.json") })
+                    DropdownMenuItem(text = { Text("Earlier recordings") }, enabled = ui.archives.isNotEmpty(), onClick = { menu = false; showArchives = true })
                     DropdownMenuItem(text = { Text("Reopen saved habitat") }, onClick = { menu = false; reload = true })
                     DropdownMenuItem(text = { Text("Start fresh habitat") }, enabled = ui.scene != null, onClick = { menu = false; restart = true })
                     DropdownMenuItem(text = { Text("Export previous world") }, enabled = ui.canExportRecovery,

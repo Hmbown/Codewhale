@@ -1,4 +1,4 @@
-import { CHANNELS } from './pet-sim.js';
+import { CHANNELS, PET_MAX_SECONDS } from './pet-sim.js';
 import { clamp, stableHash } from './model.js';
 import type { WorldFrame } from './pet-world.js';
 
@@ -17,7 +17,7 @@ export class PetScore {
   checkpoint(): [number, number, boolean] { return [this.lastWindow, this.lastSequence, this.lastAddress]; }
   restore(value: unknown): void {
     if (!Array.isArray(value) || value.length !== 3
-      || !value.slice(0, 2).every(n => Number.isSafeInteger(n) && n >= -1 && n <= 216_000) || typeof value[2] !== 'boolean')
+      || !value.slice(0, 2).every(n => Number.isSafeInteger(n) && n >= -1 && n <= PET_MAX_SECONDS * 2.5) || typeof value[2] !== 'boolean')
       throw new Error('Invalid pet score checkpoint.');
     [this.lastWindow, this.lastSequence, this.lastAddress] = value as [number, number, boolean];
   }

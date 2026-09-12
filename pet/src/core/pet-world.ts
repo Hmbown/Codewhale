@@ -1,5 +1,5 @@
 import { clamp, stableHash } from './model.js';
-import { PetSim, mulberry32, validatePetState, type PetOpts, type PetState, type PetSimCheckpoint } from './pet-sim.js';
+import { PetSim, PET_MAX_SECONDS, mulberry32, validatePetState, type PetOpts, type PetState, type PetSimCheckpoint } from './pet-sim.js';
 import { validatePetBucket, type PetBucket } from './pet-telemetry.js';
 import { PetScore, renderPetPCM, type PetVoice } from './pet-audio.js';
 
@@ -12,7 +12,9 @@ export interface WorldFrame {
   surface: number; caustic: number; food: { x: number; y: number; life: number } | null;
 }
 export interface PetWorldCheckpoint {
-  petCheckpointVersion: 1;
+  petCheckpointVersion: 1 | 2;
+  historyStart?: number;
+  hasTelemetry?: boolean;
   /** Detects accidentally pairing a checkpoint with another recording. This
    * is a consistency checksum, not authentication of imported telemetry. */
   history: number;
@@ -26,7 +28,20 @@ export interface PetWorldCheckpoint {
   members: PodMember[]; lastStill: string;
   frame: WorldFrame; voices: PetVoice[];
 }
+export interface PetRecording {
+  petReplayVersion: 1 | 2; expressionVersion?: 1 | 2;
+  tape: readonly PetBucket[]; interactions: readonly PetInteraction[];
+  start?: PetWorldCheckpoint; checkpoint?: PetWorldCheckpoint;
+}
+export interface PetSegment {
+  recording: PetRecording;
+  archive: PetRecording;
+  /** Call only after the outgoing recording and new habitat commit together.
+   * Ticks/inputs accepted while a browser transaction waits remain in memory. */
+  commit(): void;
+}
 const HZ = 30;
+export { PET_MAX_SECONDS } from './pet-sim.js';
 const seedFor = (name: string) => (0xC0FFEE ^ stableHash(name)) >>> 0;
 
 /** Fixed-tick creature controller. Wall clocks and pointer APIs belong to drivers.
@@ -62,16 +77,26 @@ export class PetWorld {
   private food: { time: number; x: number; y: number } | null = null;
   private members = new Map<string, PodMember>();
   private lastStill = '';
+  private origin?: PetWorldCheckpoint;
+  private segmented = false;
+  private hasTelemetry = false;
+  get startTimeMs(): number { return this.origin?.frame.timeMs ?? 0; }
+  get endTimeMs(): number { return Math.max(this.frame.timeMs, (this.tapeLog.at(-1)?.simTimeMs ?? 0) + 400); }
+  get needsSegment(): boolean {
+    return !this.segmented && this.tapeLog.length < 1024 && this.interactionLog.length < 4096
+      || this.bucketIndex >= 1024 || this.interactionIndex >= 4096;
+  }
 
-  constructor(points: [number, number][], tape: readonly PetBucket[] = [], interactions: readonly PetInteraction[] = [], expressionVersion: 1 | 2 = 2) {
+  constructor(points: [number, number][], tape: readonly PetBucket[] = [], interactions: readonly PetInteraction[] = [], expressionVersion: 1 | 2 = 2, segmented = false) {
     if (tape.length > 216_000 || interactions.length > 100_000) throw new Error('Pet recording exceeds its input limit.');
     this.sim = new PetSim(points, 0xC0FFEE, expressionVersion);
+    this.segmented = segmented; this.hasTelemetry = tape.length > 0;
     this.tapeLog = structuredClone([...tape]);
     this.interactionLog = structuredClone([...interactions]);
     for (let i = 0; i < this.tape.length; i++) {
       const b = this.tape[i];
       validatePetBucket(b);
-      if (b.version !== 1 || b.sequence !== i || b.simTimeMs !== i * 400 || b.durationMs !== 400)
+      if (segmented ? i > 0 && b.sequence <= this.tape[i - 1].sequence : b.sequence !== i)
         throw new Error('World requires contiguous version 1 pet buckets.');
     }
     for (let i = 0; i < this.interactionLog.length; i++) {
@@ -83,10 +108,12 @@ export class PetWorld {
     this.hashTape(0);
     this.frame = this.makeFrame(0);
     this.voices = this.score.voices(this.frame);
+    if (segmented) this.origin = this.checkpoint();
   }
 
   checkpoint(): PetWorldCheckpoint {
-    return structuredClone({ petCheckpointVersion: 1, history: this.historyDigest(),
+    return structuredClone({ petCheckpointVersion: this.segmented ? 2 : 1,
+      ...(this.segmented ? { historyStart: (this.origin?.tick ?? this.tick), hasTelemetry: this.hasTelemetry } : {}), history: this.historyDigest(),
       sim: this.sim.checkpoint(), score: this.score.checkpoint(), accumulator: this.accumulator,
       tick: this.tick, bucketIndex: this.bucketIndex, interactionIndex: this.interactionIndex, branchTick: this.branchTick,
       random: this.random.state(), behaviour: this.behaviour, until: this.until,
@@ -96,18 +123,72 @@ export class PetWorld {
       frame: this.frame, voices: this.voices });
   }
 
+  recording(withCheckpoint = true, completed = false): PetRecording {
+    const tapeEnd = completed ? this.bucketIndex + 1 : this.tapeLog.length;
+    const inputEnd = completed ? this.interactionIndex : this.interactionLog.length;
+    const history = this.historyDigest(tapeEnd, inputEnd);
+    return { petReplayVersion: this.segmented ? 2 : 1, expressionVersion: this.sim.expressionVersion,
+      tape: this.tapeLog.slice(0, tapeEnd), interactions: this.interactionLog.slice(0, inputEnd).map(e => ({ ...e })),
+      ...(this.origin ? { start: { ...structuredClone(this.origin), hasTelemetry: this.hasTelemetry, history } } : {}),
+      ...(withCheckpoint ? { checkpoint: { ...this.checkpoint(), history } } : {}) };
+  }
+
+  static fromRecording(points: [number, number][], value: unknown): PetWorld {
+    const r = value as PetRecording;
+    if (!r || ![1, 2].includes(r.petReplayVersion) || !Array.isArray(r.tape) || !Array.isArray(r.interactions)) throw new Error('Invalid pet recording.');
+    const version = r.expressionVersion === undefined ? 1 : r.expressionVersion;
+    if (![1, 2].includes(version)) throw new Error('Unsupported pet expression version.');
+    if (r.checkpoint !== undefined && !r.checkpoint || r.start !== undefined && !r.start) throw new Error('Invalid pet checkpoint.');
+    for (const c of [r.start, r.checkpoint]) if (c && (c.sim?.expressionVersion ?? 1) !== version) throw new Error('Pet expression version does not match its checkpoint.');
+    if (r.petReplayVersion === 1 && (r.start || r.checkpoint && r.checkpoint.petCheckpointVersion !== 1)) throw new Error('Invalid legacy pet recording.');
+    if (r.petReplayVersion === 2 && (!r.start || r.start.petCheckpointVersion !== 2 || r.start.historyStart !== r.start.tick)) throw new Error('The recording segment is missing its starting checkpoint.');
+    const first = r.start && PetWorld.restore(points, r.tape, r.interactions, r.start);
+    const world = r.checkpoint ? PetWorld.restore(points, r.tape, r.interactions, r.checkpoint) : first ?? new PetWorld(points, r.tape, r.interactions, version);
+    if (first) {
+      if (!world.segmented || world.tick < first.tick || r.checkpoint && r.checkpoint.historyStart !== first.tick) throw new Error('Pet segment checkpoints do not agree.');
+      world.origin = first.checkpoint();
+    }
+    return world;
+  }
+
+  /** Retire only consumed input. The exact origin makes each archived segment
+   * independently replayable; no particle, random stream or score is reset. */
+  prepareSegment(): PetSegment {
+    const dropTape = Math.max(0, this.bucketIndex), dropInputs = this.interactionIndex, previous = this.origin;
+    const tape = this.tapeLog.slice(dropTape), interactions = this.interactionLog.slice(dropInputs);
+    const points = this.sim.p.map(p => [p.hx, p.hy] as [number, number]);
+    const c = this.checkpoint();
+    c.petCheckpointVersion = 2; c.historyStart = this.tick; c.hasTelemetry = this.hasTelemetry;
+    c.bucketIndex -= dropTape; c.interactionIndex = 0;
+    c.history = new PetWorld(points, tape, interactions, this.sim.expressionVersion, true).historyDigest();
+    const next = PetWorld.restore(points, tape, interactions, c); next.origin = next.checkpoint();
+    let committed = false;
+    return { recording: next.recording(), archive: this.recording(true, true), commit: () => {
+      if (committed || this.origin !== previous || this.tick < c.tick) throw new Error('The pet recording segment has changed.');
+      this.tapeLog.splice(0, dropTape); this.interactionLog.splice(0, dropInputs);
+      this.bucketIndex -= dropTape; this.interactionIndex -= dropInputs;
+      this.tapeHashes = []; this.hashTape(0); this.segmented = true; this.origin = next.origin;
+      committed = true;
+    } };
+  }
+
   /** Lossless version 1 export, including the current pose and score. Drivers
    * consume all chunks synchronously on the world's owner before another tick.
    * Only a small slice is serialized inside an embedded runtime at a time. */
-  recordingChunk(index: number): string | null {
+  recordingChunk(index: number, completed = false): string | null {
     if (!Number.isSafeInteger(index) || index < 0) throw new Error('Invalid pet export cursor.');
-    const size = 16, tapes = Math.ceil(this.tapeLog.length / size), inputs = Math.ceil(this.interactionLog.length / size);
-    if (index === 0) return `{"petReplayVersion":1,"expressionVersion":${this.sim.expressionVersion},"tape":[`;
-    if (index <= tapes) return (index === 1 ? '' : ',') + JSON.stringify(this.tapeLog.slice((index - 1) * size, index * size)).slice(1, -1);
+    const size = 16, tapeEnd = completed ? this.bucketIndex + 1 : this.tapeLog.length;
+    const inputEnd = completed ? this.interactionIndex : this.interactionLog.length;
+    const tapes = Math.ceil(tapeEnd / size), inputs = Math.ceil(inputEnd / size);
+    if (index === 0) return `{"petReplayVersion":${this.segmented ? 2 : 1},"expressionVersion":${this.sim.expressionVersion},"tape":[`;
+    if (index <= tapes) return (index === 1 ? '' : ',') + JSON.stringify(this.tapeLog.slice((index - 1) * size, Math.min(tapeEnd, index * size))).slice(1, -1);
     if (index === tapes + 1) return '],"interactions":[';
     const part = index - tapes - 2;
-    if (part < inputs) return (part === 0 ? '' : ',') + JSON.stringify(this.interactionLog.slice(part * size, (part + 1) * size)).slice(1, -1);
-    if (part === inputs) return `],"checkpoint":${JSON.stringify(this.checkpoint())}}`;
+    if (part < inputs) return (part === 0 ? '' : ',') + JSON.stringify(this.interactionLog.slice(part * size, Math.min(inputEnd, (part + 1) * size))).slice(1, -1);
+    if (part === inputs) {
+      const history = this.historyDigest(tapeEnd, inputEnd);
+      return `]${this.origin ? ',"start":' + JSON.stringify({ ...this.origin, hasTelemetry: this.hasTelemetry, history }) : ''},"checkpoint":${JSON.stringify({ ...this.checkpoint(), history })}}`;
+    }
     return null;
   }
 
@@ -118,9 +199,9 @@ export class PetWorld {
     for (let i = from; i < this.tapeLog.length; i++)
       this.tapeHashes[i] = stableHash((i ? ',' : '') + JSON.stringify(this.tapeLog[i]), this.tapeHashes[i - 1] ?? stableHash('[['));
   }
-  private historyDigest(): number {
-    let hash = stableHash('],[', this.tapeHashes.at(-1) ?? stableHash('[['));
-    for (let i = 0; i < this.interactionLog.length; i++)
+  private historyDigest(tapeEnd = this.tapeLog.length, inputEnd = this.interactionLog.length): number {
+    let hash = stableHash('],[', this.tapeHashes[tapeEnd - 1] ?? stableHash('[['));
+    for (let i = 0; i < inputEnd; i++)
       hash = stableHash((i ? ',' : '') + JSON.stringify(this.interactionLog[i]), hash);
     return stableHash(']]', hash);
   }
@@ -131,12 +212,13 @@ export class PetWorld {
     const c = value as PetWorldCheckpoint;
     const range = (n: number, low: number, high: number) => Number.isFinite(n) && n >= low && n <= high;
     const integer = (n: number, low: number, high: number) => Number.isSafeInteger(n) && range(n, low, high);
-    if (!c || c.petCheckpointVersion !== 1 || JSON.stringify(c).length > 512 * 1024
-      || !integer(c.tick, 0, 2_592_000) || !range(c.accumulator, -1e-8, 1 / HZ + 1e-8)
+    if (!c || ![1, 2].includes(c.petCheckpointVersion) || JSON.stringify(c).length > 512 * 1024
+      || c.petCheckpointVersion === 2 && (!integer(c.historyStart!, 0, c.tick) || typeof c.hasTelemetry !== 'boolean')
+      || !integer(c.tick, 0, PET_MAX_SECONDS * HZ) || !range(c.accumulator, -1e-8, 1 / HZ + 1e-8)
       || !integer(c.bucketIndex, -1, tape.length - 1) || !integer(c.interactionIndex, 0, interactions.length)
       || !integer(c.branchTick, -1, c.tick) || !integer(c.random, 0, 0xffffffff)
       || !['swim', 'dive', 'roll', 'breathe', 'drift', 'doze', 'wake'].includes(c.behaviour)
-      || !range(c.until, 0, 86_410) || ![c.targetX, c.targetY, c.x, c.y, c.flip].every(n => range(n, -1, 1))
+      || !range(c.until, 0, PET_MAX_SECONDS + 10) || ![c.targetX, c.targetY, c.x, c.y, c.flip].every(n => range(n, -1, 1))
       || !range(c.lit, 0, 1) || !range(c.lastActivity, 0, c.tick / HZ)
       || c.addressedAt !== null && !range(c.addressedAt, 0, c.tick / HZ)
       || !range(c.waitSince, -1, c.tick / HZ) || typeof c.lastStill !== 'string' || c.lastStill.length > 2048
@@ -155,7 +237,8 @@ export class PetWorld {
       throw new Error('Invalid pet world checkpoint.');
     validatePetState(c.frame.state);
     renderPetPCM(c.voices, 0, 0);
-    const world = new PetWorld(points, tape, interactions, c.sim?.expressionVersion ?? 1);
+    const world = new PetWorld(points, tape, interactions, c.sim?.expressionVersion ?? 1, c.petCheckpointVersion === 2);
+    if (c.petCheckpointVersion === 2) { world.hasTelemetry = c.hasTelemetry!; world.origin = structuredClone(c); }
     if (c.history !== world.historyDigest()
       || c.bucketIndex >= 0 && world.tape[c.bucketIndex].simTimeMs > c.frame.timeMs + 1e-7
       // acceptTelemetry may fill past gaps after the most recent fixed tick.
@@ -198,7 +281,16 @@ export class PetWorld {
   acceptTelemetry(input: PetBucket): void {
     validatePetBucket(input);
     const sequence = Math.floor(this.tick / 12) + 1;
-    if (sequence >= 216_000) throw new Error('Start a new pet recording after 24 hours.');
+    if (this.tapeLog.length >= 216_000) throw new Error('Archive this pet recording before accepting more telemetry.');
+    this.hasTelemetry = true;
+    if (this.segmented) {
+      const at = this.tapeLog.findIndex(b => b.sequence >= sequence);
+      const index = at < 0 ? this.tapeLog.length : at;
+      this.tapeLog.splice(index, at >= 0 && this.tapeLog[at].sequence === sequence ? 1 : 0,
+        { ...structuredClone(input), sequence, simTimeMs: sequence * 400 });
+      this.hashTape(index); return;
+    }
+    if (sequence >= 216_000) throw new Error('Archive the legacy recording before accepting more telemetry.');
     const changedFrom = Math.min(sequence, this.tapeLog.length);
     while (this.tapeLog.length <= sequence) {
       const at = this.tapeLog.length;
@@ -270,7 +362,7 @@ export class PetWorld {
     this.x += dx * move; this.y += (this.targetY - this.y) * move;
     this.flip += ((Math.abs(dx) < .015 ? this.flip < 0 ? -1 : 1 : dx < 0 ? -1 : 1) - this.flip) * .035;
     this.lit += ((sleeping ? .18 : 1) - this.lit) * .03;
-    const wild = !this.tape.length;
+    const wild = !this.hasTelemetry;
     const state: PetState = {
       activity: telemetry?.activity ?? (wild ? sleeping ? .05 : .18 : .12),
       coherence: telemetry?.coherence ?? (wild ? .94 : .25),

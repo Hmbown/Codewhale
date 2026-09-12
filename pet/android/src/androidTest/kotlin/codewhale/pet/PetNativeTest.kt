@@ -60,8 +60,12 @@ class PetNativeTest {
             }
             // At t=0 both expression versions have the identical home body.
             val legacy = JSONObject(before).apply {
+                put("petReplayVersion", 1); remove("start")
                 remove("expressionVersion")
-                getJSONObject("checkpoint").getJSONObject("sim").remove("expressionVersion")
+                getJSONObject("checkpoint").apply {
+                    put("petCheckpointVersion", 1); remove("historyStart"); remove("hasTelemetry")
+                    getJSONObject("sim").remove("expressionVersion")
+                }
             }
             core(legacy.toString()).use { restored ->
                 assertEquals(1, restored.sim.expressionVersion)
@@ -171,6 +175,40 @@ class PetNativeTest {
                 PetHabitatStore.boundedRead(ByteArrayInputStream(byteArrayOf(0xc3.toByte(), 0x28)))
             }
             assertEquals("second", a.read())
+        } finally { directory.deleteRecursively() }
+    }
+
+    @Test fun rotationArchivesBeforeRetiringHistoryAndKeepsTheWorldOnAStorageConflict() {
+        val directory = File(context.cacheDir, "pet-segment-${java.util.UUID.randomUUID()}").apply { mkdirs() }
+        val seeded = asset("pet-native.js") + "\nconst SegmentBase = PetNative; PetNative = class extends SegmentBase { constructor(...args) { super(...args); for(let i=0;i<4096;i++) this.interact('food', .2, -.15); } };"
+        try {
+            PetNativeCore(seeded, asset("whale-points.tsv")).use { world ->
+                world.tick(false)
+                val original = world.recording(); val before = world.scene()
+                val next = world.prepareSegment()!!
+                val staged = File(directory, "staged.json")
+                staged.outputStream().use { world.exportRecording(it, completed = true) }
+                val store = PetHabitatStore(directory, "wild")
+                assertNull(store.read()); store.save(original)
+                val habitat = File(directory, "pet-wild.json")
+                habitat.writeText("another writer")
+                assertThrows(IllegalStateException::class.java) { store.save(next, staged, 1) }
+                assertEquals(original, world.recording()); assertTrue(store.archives().isEmpty())
+                assertEquals("another writer", habitat.readText())
+                habitat.writeText(original)
+                store.save(next, staged, 1); world.commitSegment()
+                assertEquals(before.digest, world.scene().digest)
+                assertTrue(world.recording().length < original.length)
+                assertEquals(1, store.archives().size)
+                assertEquals(original, store.archive(store.archives().single()).readText())
+                core(store.read()).use { restored ->
+                    assertEquals(before.digest, restored.scene().digest)
+                    repeat(60) { assertEquals(world.tick(true).digest, restored.tick(true).digest) }
+                }
+                val archive = store.archive(store.archives().single()); archive.writeText("damaged")
+                assertThrows(IllegalStateException::class.java) { store.archive(store.archives().single()) }
+                assertEquals("damaged", archive.readText())
+            }
         } finally { directory.deleteRecursively() }
     }
 }

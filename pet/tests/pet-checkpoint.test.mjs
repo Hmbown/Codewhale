@@ -16,6 +16,72 @@ const equal = (a, b) => {
   assert.deepEqual(a.voices, b.voices);
 };
 
+test('recording segments preserve exact continuation and replay while retiring only durably archived input', () => {
+  const reference = new PetWorld(points, tape), world = new PetWorld(points, tape, [], 2, true);
+  let prepared, archive, archivedEnd;
+  for (let tick = 0; tick < 1400; tick++) {
+    if (tick % 97 === 0) { reference.interact('food', .2, -.15); world.interact('food', .2, -.15); }
+    if (tick === 600) {
+      archive = JSON.parse(JSON.stringify(world.recording())); archivedEnd = JSON.parse(JSON.stringify(world.checkpoint()));
+      const before = JSON.stringify(world.recording()); prepared = world.prepareSegment();
+      assert.equal(JSON.stringify(world.recording()), before, 'preparation cannot retire history before storage succeeds');
+      archive = structuredClone(prepared.archive);
+      assert.ok(archive.tape.every(b => b.simTimeMs <= world.frame.timeMs), 'future telemetry belongs to the active segment, not every archive');
+      assert.ok(archive.interactions.every(e => e.timeMs <= world.frame.timeMs));
+      const pieces = []; for (let i = 0; ; i++) { const part = world.recordingChunk(i, true); if (part === null) break; pieces.push(part); }
+      assert.equal(pieces.join(''), JSON.stringify(archive));
+      equal(PetWorld.fromRecording(points, prepared.recording), world);
+    }
+    if (tick === 609) {
+      prepared.commit(); equal(world, reference);
+      assert.ok(world.tape[0].sequence > 0); assert.ok(world.interactions.length < reference.interactions.length);
+      assert.throws(() => prepared.commit(), /changed/);
+      const restored = PetWorld.fromRecording(points, JSON.parse(JSON.stringify(world.recording())));
+      equal(restored, world);
+    }
+    const opts = { motion: motion(tick), sensitivity: 1 };
+    reference.step(1 / 30, opts); world.step(1 / 30, opts); equal(world, reference);
+  }
+  const replay = PetWorld.fromRecording(points, { ...world.recording(), checkpoint: undefined });
+  for (let tick = Math.round(replay.frame.timeMs * 30 / 1000); tick < 1400; tick++) replay.step(1 / 30, { motion: motion(tick), sensitivity: 1 });
+  equal(replay, world);
+  const earlier = PetWorld.fromRecording(points, archive);
+  assert.deepEqual(earlier.sim.checkpoint(), archivedEnd.sim);
+  assert.equal(earlier.frame.timeMs, 20_000);
+  const chunks = []; for (let i = 0; ; i++) { const chunk = world.recordingChunk(i); if (chunk === null) break; chunks.push(chunk); }
+  assert.equal(chunks.join(''), JSON.stringify(world.recording()));
+  for (const edit of [r => delete r.start, r => r.start.history++, r => r.start.historyStart++,
+    r => r.checkpoint.historyStart++, r => r.petReplayVersion = 1, r => r.start.sim.expressionVersion = 1]) {
+    const corrupt = structuredClone(world.recording()); edit(corrupt);
+    assert.throws(() => PetWorld.fromRecording(points, corrupt));
+  }
+});
+
+test('native rotation retains a bounded active history and does not retrigger old approval or score state', () => {
+  const live = new PetNative(JSON.stringify(points), '', '[]', true);
+  let archived = 0, largest = 0;
+  for (let step = 0; step < 180; step++) {
+    const at = step * 5000;
+    live.observeEngine(JSON.stringify({ event: 'tool_call_started', tool_call_id: String(step), tool_name: 'exec_command' }), at);
+    live.advanceEngine(at + 5000, false, false);
+    largest = Math.max(largest, JSON.parse(live.recording()).tape.length);
+    if (live.needsSegment()) {
+      const before = live.snapshot(), outgoing = live.recording(true), next = live.prepareSegment();
+      assert.equal(live.recording(true), outgoing);
+      const restored = new PetNative(JSON.stringify(points)); restored.restoreRecording(next);
+      assert.equal(restored.snapshot(), before);
+      live.commitSegment(); assert.equal(live.snapshot(), before); archived++;
+    }
+  }
+  assert.equal(archived, 2); assert.ok(largest <= 1040);
+  const resumed = new PetNative(JSON.stringify(points)); resumed.restoreRecording(live.recording(true));
+  assert.equal(resumed.snapshot(), live.snapshot());
+  const offset = resumed.resumeEngine(); resumed.advanceEngine(offset + 800, false, true);
+  assert.equal(JSON.parse(resumed.snapshot()).state.observed, 0);
+  assert.equal(JSON.parse(resumed.snapshot()).needs, 'none');
+  assert.ok(Buffer.byteLength(resumed.recording(true)) < 1024 * 1024);
+});
+
 test('chunked exports preserve the complete versioned recording and exact checkpoint beyond the autosave bound', () => {
   for (const count of [0, 1, 16, 17, 32_000]) {
     const tape = count ? compilePetTelemetry([], count * 400) : [];

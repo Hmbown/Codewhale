@@ -17,6 +17,8 @@
 // Positions stay normalized in body space (roughly [-0.5, 0.5]²). A renderer
 // maps them through layout() to its own medium.
 
+export const PET_MAX_SECONDS = 100 * 365 * 86_400;
+
 export interface PetState {
   activity: number;    // how much work 0..1
   coherence: number;   // converging school vs thrashing 0..1
@@ -312,8 +314,8 @@ export class PetSim {
     if (!c || c.version !== 1 || c.expressionVersion !== undefined && ![1, 2].includes(c.expressionVersion) || (c.expressionVersion ?? 1) !== this.expressionVersion || !Array.isArray(c.body) || c.body.length !== this.p.length
       || c.body.some((v, i) => !Array.isArray(v) || v.length !== 3 || v[0] !== this.p[i].hx || v[1] !== this.p[i].hy || v[2] !== this.p[i].s)
       || !Array.isArray(c.particles) || c.particles.length !== this.p.length
-      || c.particles.some(v => !Array.isArray(v) || v.length !== 8 || v.some((n, i) => !inRange(n, i === 4 || i === 5 ? 0 : -8, i === 4 || i === 5 ? 1_000_000 : 8)))
-      || !inRange(c.phase, 0, 100_000) || !inRange(c.clock, 0, 86_400) || !inRange(c.tear, 0, 1)
+      || c.particles.some(v => !Array.isArray(v) || v.length !== 8 || v.some((n, i) => !inRange(n, i === 4 || i === 5 ? 0 : -8, i === 4 || i === 5 ? 2 * PET_MAX_SECONDS : 8)))
+      || !inRange(c.phase, 0, PET_MAX_SECONDS) || !inRange(c.clock, 0, PET_MAX_SECONDS) || !inRange(c.tear, 0, 1)
       || ![c.previous, c.current].every(n => Number.isInteger(n) && n >= 0 && n < CHANNELS.length)
       || !Array.isArray(c.color) || c.color.length !== 3 || c.color.some(n => !inRange(n, 0, 255))
       || !c.frame || ![c.frame.r, c.frame.g, c.frame.b].every(n => inRange(n, 0, 255))

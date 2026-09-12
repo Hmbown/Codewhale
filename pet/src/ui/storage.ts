@@ -5,7 +5,9 @@ export interface SavedHabitat {
   petPersistenceVersion: 1; seconds: number; source: 'wild' | 'demo' | 'replay';
   sourceName: string; still: boolean; tape: readonly PetBucket[]; interactions: readonly PetInteraction[];
   checkpoint?: PetWorldCheckpoint; expressionVersion?: 1 | 2;
+  petReplayVersion?: 1 | 2; start?: PetWorldCheckpoint;
 }
+export interface PetArchive { key: number; name: string; seconds: number; startSeconds: number }
 export interface HabitatEntry { revision: number; habitat: SavedHabitat }
 export interface SavedReference { key: string; savedAt: string }
 export interface SavedSummary extends SavedReference { name: string; events: number; privacy: Trace['privacy']; source: Trace['source'] }
@@ -133,10 +135,11 @@ export class TraceLibrary {
       const request = habitats.get('pet'); request.onsuccess = () => done(request.result);
     });
   }
-  async saveHabitat(habitat: SavedHabitat, expectedRevision?: number): Promise<number> {
+  async saveHabitat(habitat: SavedHabitat, expectedRevision?: number, archive?: SavedHabitat): Promise<number> {
     // Freeze the whole recording/checkpoint together before the first IDB await.
     // A live world's arrays may otherwise advance while the transaction opens.
     habitat = structuredClone(habitat);
+    if (archive) archive = structuredClone(archive);
     return this.transaction('readwrite', (_traces, _metas, done, fail, habitats) => {
       const request = habitats.get('pet');
       request.onsuccess = () => {
@@ -145,8 +148,26 @@ export class TraceLibrary {
           fail(new Error('Another pet tab saved this habitat. Save a replay file to keep this version, or reload the saved habitat.')); return;
         }
         const revision = (previous?.revision ?? 0) + 1;
+        if (archive) {
+          habitats.add(archive, `pet-archive-${revision}`);
+          habitats.add({ key: revision, name: archive.sourceName, seconds: archive.seconds,
+            startSeconds: (archive.start?.frame.timeMs ?? 0) / 1000 }, `pet-archive-meta-${revision}`);
+        }
         habitats.put({ revision, habitat }, 'pet'); done(revision);
       };
+    });
+  }
+  async petArchives(): Promise<PetArchive[]> {
+    return this.transaction('readonly', (_traces, _metas, done, _fail, habitats) => {
+      const request = habitats.getAll(IDBKeyRange.bound('pet-archive-meta-', 'pet-archive-meta-\uffff'));
+      request.onsuccess = () => done((request.result as PetArchive[]).sort((a, b) => b.key - a.key));
+    });
+  }
+  async petArchive(key: number): Promise<SavedHabitat> {
+    if (!Number.isSafeInteger(key) || key < 1) throw new Error('Invalid recording archive.');
+    return this.transaction('readonly', (_traces, _metas, done, fail, habitats) => {
+      const request = habitats.get(`pet-archive-${key}`);
+      request.onsuccess = () => request.result ? done(request.result) : fail(new Error('This recording is unavailable.'));
     });
   }
 }

@@ -90,13 +90,18 @@ class PetNativeCore(bundle: String, pointsText: String, tape: String = "", saved
     fun recording(): String = string("pet.recording(true)").also {
         require(it.toByteArray(Charsets.UTF_8).size <= MAX_HABITAT_BYTES) { "Habitat exceeds 8 MiB; export the recording." }
     }
+    fun prepareSegment(): String? {
+        if (evaluate("pet.needsSegment()") != true) return null
+        return string("pet.prepareSegment()").also { require(it.toByteArray(Charsets.UTF_8).size <= MAX_HABITAT_BYTES) { "The active recording exceeds 8 MiB." } }
+    }
+    fun commitSegment() { evaluate("pet.commitSegment()") }
     /** Called synchronously on the world worker, so the chunks share one clock.
      * A larger recovery export never materializes one giant string in QuickJS. */
-    fun exportRecording(output: OutputStream): Long {
+    fun exportRecording(output: OutputStream, completed: Boolean = false): Long {
         var size = 0L
         var index = 0
         while (true) {
-            val value = evaluate("pet.recordingChunk(${index++})") ?: return size
+            val value = evaluate("pet.recordingChunk(${index++}, $completed)") ?: return size
             val bytes = (value as? String ?: error("Invalid pet export chunk.")).toByteArray(Charsets.UTF_8)
             check(size + bytes.size <= 64L * 1024 * 1024) { "Recording exceeds the 64 MiB export limit. The current world was kept." }
             output.write(bytes); size += bytes.size

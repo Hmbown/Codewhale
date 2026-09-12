@@ -27,6 +27,17 @@ struct CodewhalePetApp: App {
                 if host.source == .live { Text("Local source: ~/.codewhale/pet-state").font(.caption2).textSelection(.enabled) }
                 if !notice.isEmpty { Text(notice).font(.caption).foregroundStyle(.secondary) }
                 HStack {
+                    Menu("Earlier recordings") {
+                        ForEach(host.archives, id: \.self) { name in
+                            Button(petArchiveLabel(name)) {
+                                do {
+                                    let data = try host.archivedRecording(name)
+                                    let panel = NSSavePanel(); panel.nameFieldStringValue = "codewhale-pet-earlier.json"
+                                    if panel.runModal() == .OK, let url = panel.url { try data.write(to: url, options: .atomic); notice = "Earlier recording saved." }
+                                } catch { notice = error.localizedDescription }
+                            }
+                        }
+                    }.disabled(host.archives.isEmpty)
                     Button("Save recording…") {
                         let panel = NSSavePanel(); panel.nameFieldStringValue = "codewhale-pet-replay.json"
                         if panel.runModal() == .OK, let url = panel.url {

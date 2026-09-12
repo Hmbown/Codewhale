@@ -10,7 +10,7 @@ import java.security.MessageDigest
 
 /** Private, bounded, atomic recordings. The revision check also protects a
  * second window/process from silently overwriting a newer habitat. */
-class PetHabitatStore(directory: File, name: String) {
+class PetHabitatStore(private val directory: File, private val name: String) {
     init { require(name in setOf("wild", "demo", "recording")) }
     private val file = AtomicFile(File(directory, "pet-$name.json"))
     private val lockFile = File(directory, "pet-$name.lock")
@@ -21,10 +21,22 @@ class PetHabitatStore(directory: File, name: String) {
         if (revision == null) null else file.openRead().use { boundedRead(it) }
     }
 
-    fun save(text: String) = locked {
+    fun save(text: String, archive: File? = null, tick: Long = 0) = locked {
         val bytes = text.toByteArray(Charsets.UTF_8)
         require(bytes.size <= PetNativeCore.MAX_HABITAT_BYTES) { "Habitat exceeds 8 MiB." }
         check(currentRevision() == revision) { "Another window changed this habitat. Reopen it before saving." }
+        if (archive != null) {
+            require(archive.length() <= 64L * 1024 * 1024 && tick >= 0)
+            val digest = archive.inputStream().use(::hashInput)
+            val target = File(directory, "pet-$name-segment-${"%012d".format(java.util.Locale.ROOT, tick)}-$digest.json")
+            if (target.exists()) check(target.inputStream().use(::hashInput) == digest) { "An archived recording was changed." }
+            else {
+                val atomic = AtomicFile(target)
+                val output = atomic.startWrite()
+                try { archive.inputStream().use { it.copyTo(output) }; atomic.finishWrite(output) }
+                catch (e: Throwable) { atomic.failWrite(output); throw e }
+            }
+        }
         write(bytes)
         revision = hash(text)
     }
@@ -43,6 +55,22 @@ class PetHabitatStore(directory: File, name: String) {
             throw e
         }
         backup
+    }
+
+    fun archives(): List<String> = directory.list()?.filter { validArchive(it) }?.sortedDescending() ?: emptyList()
+    fun archive(key: String): File {
+        require(validArchive(key)) { "Invalid recording archive." }
+        val saved = File(directory, key)
+        require(saved.isFile && saved.length() <= 64L * 1024 * 1024) { "This recording is unavailable." }
+        val digest = saved.inputStream().use(::hashInput)
+        check(key.endsWith("-$digest.json")) { "The archived recording was changed. Its file was kept." }
+        return saved
+    }
+    private fun validArchive(key: String) = key.matches(Regex("pet-$name-segment-[0-9]{12}-[a-f0-9]{64}\\.json"))
+    private fun hashInput(input: InputStream): String {
+        val digest = MessageDigest.getInstance("SHA-256"); val buffer = ByteArray(8192)
+        while (true) { val count = input.read(buffer); if (count < 0) break; digest.update(buffer, 0, count) }
+        return digest.digest().joinToString("") { "%02x".format(it) }
     }
 
     private fun currentRevision(): String? {

@@ -28,7 +28,7 @@ enum class PetMode(val key: String, val label: String, val detail: String) {
 data class PetUiState(val scene: PetScene? = null, val mode: PetMode = PetMode.WILD,
     val paused: Boolean = false, val sound: Boolean = false, val still: Boolean = false,
     val systemStill: Boolean = false, val message: String? = null, val savedAtMs: Double? = null,
-    val canExportRecovery: Boolean = false, val running: Boolean = false)
+    val archives: List<String> = emptyList(), val canExportRecovery: Boolean = false, val running: Boolean = false)
 
 /** A single actor owns core, audio cursor and save revision. Compose receives
  * immutable projections and never reads a particle while it is being stepped. */
@@ -39,6 +39,7 @@ class PetViewModel(application: Application) : AndroidViewModel(application) {
         data class Import(val uri: Uri) : Command
         data class Export(val uri: Uri) : Command
         data class ExportRecovery(val uri: Uri) : Command
+        data class ExportArchive(val uri: Uri, val name: String) : Command
         data object Restart : Command
         data object Reload : Command
     }
@@ -141,6 +142,7 @@ class PetViewModel(application: Application) : AndroidViewModel(application) {
     fun importRecording(uri: Uri) = enqueue(Command.Import(uri))
     fun exportRecording(uri: Uri) = enqueue(Command.Export(uri))
     fun exportRecovery(uri: Uri) = enqueue(Command.ExportRecovery(uri))
+    fun exportArchive(uri: Uri, name: String) = enqueue(Command.ExportArchive(uri, name))
     fun restart() = enqueue(Command.Restart)
     fun reload() = enqueue(Command.Reload)
     fun dismissMessage() { mutable.update { it.copy(message = null) } }
@@ -155,8 +157,17 @@ class PetViewModel(application: Application) : AndroidViewModel(application) {
         if (saveBlocked) return false
         val pet = core ?: return true
         try {
-            checkNotNull(store) { "Habitat storage is unavailable." }.save(pet.recording())
-            mutable.update { it.copy(savedAtMs = pet.timeMs) }
+            val files = checkNotNull(store) { "Habitat storage is unavailable." }
+            val next = pet.prepareSegment()
+            if (next != null) {
+                val staged = File.createTempFile("pet-segment-", ".json", getApplication<Application>().cacheDir)
+                try {
+                    staged.outputStream().buffered().use { pet.exportRecording(it, completed = true) }
+                    files.save(next, staged, kotlin.math.round(pet.timeMs * 30 / 1000).toLong())
+                    pet.commitSegment()
+                } finally { staged.delete() }
+            } else files.save(pet.recording())
+            mutable.update { it.copy(savedAtMs = pet.timeMs, archives = if (next != null) files.archives() else it.archives) }
             return true
         } catch (e: Exception) {
             saveBlocked = true
@@ -176,7 +187,7 @@ class PetViewModel(application: Application) : AndroidViewModel(application) {
         stopAudio(); core?.close(); core = next; store = nextStore; saveBlocked = blocked; mode = nextMode
         prefs.edit().putString("mode", nextMode.key).apply()
         mutable.update { it.copy(scene = next.scene(), mode = nextMode, savedAtMs = if (saved != null && !blocked) next.timeMs else null,
-            canExportRecovery = recoveryFile() != null) }
+            canExportRecovery = recoveryFile() != null, archives = nextStore.archives()) }
         lastSave = SystemClock.elapsedRealtime()
     }
     private fun handle(command: Command) {
@@ -195,7 +206,7 @@ class PetViewModel(application: Application) : AndroidViewModel(application) {
                     val backup = checkNotNull(store).restart(next.recording())
                     if (backup != null) prefs.edit().putString("recovery-${mode.key}", backup.name).apply()
                     stopAudio(); core?.close(); core = next; saveBlocked = false
-                    mutable.update { it.copy(scene = next.scene(), savedAtMs = 0.0, canExportRecovery = recoveryFile() != null,
+                    mutable.update { it.copy(scene = next.scene(), savedAtMs = next.timeMs, canExportRecovery = recoveryFile() != null,
                         message = "Fresh habitat started. You can export the previous saved world from More.") }
                     lastSave = SystemClock.elapsedRealtime()
                 } catch (e: Exception) { next.close(); throw e }
@@ -228,6 +239,13 @@ class PetViewModel(application: Application) : AndroidViewModel(application) {
                         "Recording exported. Open files over 8 MiB in the browser."
                         else "Recording exported, including the current world state.") }
                 } finally { staged.delete() }
+            }
+            is Command.ExportArchive -> {
+                val file = checkNotNull(store).archive(command.name)
+                val out = getApplication<Application>().contentResolver.openOutputStream(command.uri, "wt")
+                    ?: error("Could not open the selected export file.")
+                out.use { output -> file.inputStream().use { it.copyTo(output) } }
+                mutable.update { it.copy(message = "Earlier recording exported.") }
             }
             is Command.ExportRecovery -> {
                 val file = recoveryFile() ?: error("No previous world is available.")

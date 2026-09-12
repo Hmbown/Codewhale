@@ -94,13 +94,26 @@ public enum PetCoreError: Error, LocalizedError {
         }
         return Data(value.utf8)
     }
+    public func prepareSegment() throws -> Data? {
+        failure = nil
+        guard let needed = world.invokeMethod("needsSegment", withArguments: []), failure == nil else { throw PetCoreError.invalid(failure ?? "Unable to inspect recording history.") }
+        if !needed.toBool() { return nil }
+        guard let text = world.invokeMethod("prepareSegment", withArguments: [])?.toString(), failure == nil else { throw PetCoreError.invalid(failure ?? "Unable to prepare recording history.") }
+        let data = Data(text.utf8)
+        guard data.count <= 8 * 1024 * 1024 else { throw PetCoreError.invalid("The active recording exceeds 8 MiB.") }
+        return data
+    }
+    public func commitSegment() throws {
+        failure = nil; world.invokeMethod("commitSegment", withArguments: [])
+        if let failure { throw PetCoreError.invalid(failure) }
+    }
     /// The host owns the world for this entire export. The private autosave and
     /// native import remain bounded to 8 MiB; larger exports open in the browser.
-    public func exportRecording() throws -> Data {
+    public func exportRecording(completed: Bool = false) throws -> Data {
         var data = Data(), index = 0
         while true {
             failure = nil
-            guard let value = world.invokeMethod("recordingChunk", withArguments: [index]), failure == nil else {
+            guard let value = world.invokeMethod("recordingChunk", withArguments: [index, completed]), failure == nil else {
                 throw PetCoreError.invalid(failure ?? "Unable to export the pet recording.")
             }
             if value.isNull { return data }

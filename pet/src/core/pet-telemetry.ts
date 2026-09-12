@@ -1,6 +1,6 @@
 import { CATEGORIES, clamp, errorOnsetOf, type Category, type WhaleEvent } from './model.js';
 import { IntervalIndex } from './signal.js';
-import { validatePetState, type PetState } from './pet-sim.js';
+import { PET_MAX_SECONDS, validatePetState, type PetState } from './pet-sim.js';
 
 /** One projection for imports, demos and recorded live snapshots. Times are ms.
  * These are aesthetic encodings of measured events, never model confidence. */
@@ -20,7 +20,7 @@ export interface PetBucket extends PetState {
 export function validatePetBucket(value: unknown): asserts value is PetBucket {
   validatePetState(value);
   const b = value as PetBucket;
-  if (!b || typeof b !== 'object' || b.version !== 1 || !Number.isSafeInteger(b.sequence) || b.sequence < 0
+  if (!b || typeof b !== 'object' || b.version !== 1 || !Number.isSafeInteger(b.sequence) || b.sequence < 0 || b.sequence > PET_MAX_SECONDS * 2.5
     || b.simTimeMs !== b.sequence * PET_BIN_MS || b.durationMs !== PET_BIN_MS
     || !CATEGORIES.includes(b.channel as Category) || typeof b.waiting !== 'boolean'
     || !Array.isArray(b.agentIds) || b.agentIds.length > 250_000 || b.agentIds.some(id => typeof id !== 'string' || !id || id.length > 4096)
@@ -73,7 +73,7 @@ export function compilePetTelemetry(input: readonly WhaleEvent[], durationMs = 0
   const failures = events.filter(e => e.category === 'error' || e.status === 'error').map(errorOnsetOf).sort((a, b) => a - b);
   if (failures.length) lastOnset = Math.max(lastOnset, failures[failures.length - 1]);
   const count = Math.max(1, Math.ceil(durationMs / PET_BIN_MS), Math.floor(lastOnset / PET_BIN_MS) + 1);
-  if (count > 216_000) throw new Error('Pet replay exceeds 24 hours; select a shorter trace.');
+  if (count - firstSequence > 216_000 || count > PET_MAX_SECONDS * 2.5) throw new Error('Pet replay exceeds 24 hours; select a shorter trace.');
   const index = new IntervalIndex(events), result: PetBucket[] = [];
   const recent: WhaleEvent[] = [], names = new Map<string, number>();
   let next = 0, expired = 0, nextFailure = 0;

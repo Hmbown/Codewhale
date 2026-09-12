@@ -166,7 +166,26 @@ import Darwin
         long.suspend(true)
         try require(long.core!.frame.timeMs >= 7_200_000 && long.core!.frame.state.observed == 0, "Large native habitat did not resume unknown")
         try require(long.persistenceMessage.isEmpty, "Large native habitat failed to save")
-        print("PASS actual Apple host: two-hour 5.54 MB synthetic unknown habitat restored and saved in \(start.duration(to: .now))")
-        print("PASS 9 Apple checkpoint workflows; fixtures retained at \(root.path)")
+        let activeData = try Data(contentsOf: longDir.appendingPathComponent("live.json"))
+        try require(activeData.count < 1024 * 1024 && long.archives.count == 1, "Long history was not archived before compacting the active habitat")
+        let archived = try long.archivedRecording(long.archives[0])
+        try require(archived.count > 5 * 1024 * 1024, "Earlier telemetry was not retained")
+        let compact = try PetNativeCore(points: points, bundle: script, saved: activeData)
+        try require(compact.frame.digest == long.core!.frame.digest && compact.frame.timeMs == long.core!.frame.timeMs, "Compaction changed the current world")
+        for _ in 0..<60 { try require(compact.tick(motion: false).digest == long.core!.tick(motion: false).digest, "Compacted continuation diverged") }
+        print("PASS actual Apple host: two-hour history archived (\(archived.count) bytes), active habitat \(activeData.count) bytes, exact continuation; \(start.duration(to: .now))")
+
+        let conflictDir = root.appendingPathComponent("archive-conflict")
+        try FileManager.default.createDirectory(at: conflictDir, withIntermediateDirectories: true)
+        try FileManager.default.copyItem(at: out.appendingPathComponent("long-habitat.json"), to: conflictDir.appendingPathComponent("live.json"))
+        let conflict = PetHost(points: points, bundle: bundle, defaults: defaults, storageDirectory: conflictDir)
+        let beforeConflict = try conflict.core!.recording(checkpoint: true)
+        try external.write(to: conflictDir.appendingPathComponent("live.json"))
+        conflict.suspend(true)
+        try require(!conflict.persistenceMessage.isEmpty && conflict.archives.isEmpty, "A conflicted archive was committed")
+        try require(same(beforeConflict, conflict.core!.recording(checkpoint: true)), "Failed archive retired live history")
+        try require(Data(contentsOf: conflictDir.appendingPathComponent("live.json")) == external, "Archiving replaced another writer")
+        print("PASS actual Apple host: archive conflict preserves all live history and the other writer's file")
+        print("PASS 10 Apple checkpoint workflows; fixtures retained at \(root.path)")
     }
 }

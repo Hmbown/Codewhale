@@ -1,4 +1,4 @@
-import { PetWorld, type PetInteraction } from './pet-world.js';
+import { PetWorld, type PetInteraction, type PetSegment } from './pet-world.js';
 import { compilePetTelemetry, decodePetJSONL } from './pet-telemetry.js';
 import { ARCH_OF, digest, layout } from './pet-sim.js';
 import { renderPetPCM, type PetVoice } from './pet-audio.js';
@@ -10,45 +10,39 @@ export class PetNative {
   private world: PetWorld;
   private engine = new PetEngineTelemetry();
   private engineTick = 0;
+  private segment?: PetSegment;
   constructor(pointsJSON: string, tapeJSONL = '', interactionsJSON = '[]', live = false, expressionVersion: 1 | 2 = 2) {
     const points = JSON.parse(pointsJSON) as [number, number][];
     if (!Array.isArray(points) || points.length !== 980 || points.some(p => !Array.isArray(p) || p.length !== 2 || !p.every(n => Number.isFinite(n) && Math.abs(n) <= 1)))
       throw new Error('Invalid native whale body.');
-    this.world = new PetWorld(points, live ? compilePetTelemetry([]) : decodePetJSONL(tapeJSONL), JSON.parse(interactionsJSON) as PetInteraction[], expressionVersion);
+    this.world = new PetWorld(points, live ? compilePetTelemetry([]) : decodePetJSONL(tapeJSONL), JSON.parse(interactionsJSON) as PetInteraction[], expressionVersion, true);
   }
   step(dt: number, motion: boolean): string { this.world.step(dt, { motion, sensitivity: 1 }); return this.snapshot(); }
   snapshot(): string { return JSON.stringify({ ...this.world.frame, voices: this.world.voices, digest: digest(this.world.sim) }); }
   interact(kind: PetInteraction['kind'], x: number, y: number): void { this.world.interact(kind, x, y); }
   interactions(): string { return JSON.stringify(this.world.interactions); }
   accept(packet: string): void { this.world.acceptTelemetry(JSON.parse(packet)); }
-  recording(withCheckpoint = false): string { return JSON.stringify({ petReplayVersion: 1, expressionVersion: this.world.sim.expressionVersion, tape: this.world.tape,
-    interactions: this.world.interactions, ...(withCheckpoint ? { checkpoint: this.world.checkpoint() } : {}) }); }
+  recording(withCheckpoint = false): string { return JSON.stringify(this.world.recording(withCheckpoint)); }
+  needsSegment(): boolean { return this.world.needsSegment; }
+  prepareSegment(): string { this.segment = this.world.prepareSegment(); return JSON.stringify(this.segment.recording); }
+  commitSegment(): void { if (!this.segment) throw new Error('No pet segment was prepared.'); this.segment.commit(); this.segment = undefined; }
   checkpoint(): string { return JSON.stringify(this.world.checkpoint()); }
-  recordingChunk(index: number): string | null { return this.world.recordingChunk(index); }
+  recordingChunk(index: number, completed = false): string | null { return this.world.recordingChunk(index, completed); }
   restoreCheckpoint(text: string): void {
     if (text.length > 512 * 1024) throw new Error('Pet checkpoint exceeds its size limit.');
-    this.restoreHistory(this.world.tape, this.world.interactions, JSON.parse(text));
+    this.restoreRecording(JSON.stringify({ ...this.world.recording(false), checkpoint: JSON.parse(text) }));
   }
   restoreRecording(text: string): void {
     if (text.length > 8 * 1024 * 1024) throw new Error('Native habitat exceeds 8 MiB.');
-    const r = JSON.parse(text);
-    if (!r || r.petReplayVersion !== 1 || !Array.isArray(r.tape) || !Array.isArray(r.interactions)) throw new Error('Invalid native habitat.');
-    if (r.expressionVersion !== undefined && ![1, 2].includes(r.expressionVersion)) throw new Error('Unsupported pet expression version.');
-    if (r.checkpoint !== undefined && (r.expressionVersion ?? 1) !== (r.checkpoint?.sim?.expressionVersion ?? 1)) throw new Error('Pet expression version does not match its checkpoint.');
-    this.restoreHistory(r.tape, r.interactions, r.checkpoint, r.expressionVersion ?? 1);
-  }
-  private restoreHistory(tape: PetWorld['tape'], interactions: PetWorld['interactions'], checkpoint: unknown, expressionVersion: 1 | 2 = 2): void {
     const points = this.world.sim.p.map(p => [p.hx, p.hy] as [number, number]);
-    this.world = checkpoint === undefined ? new PetWorld(points, tape, interactions, expressionVersion)
-      : PetWorld.restore(points, tape, interactions, checkpoint);
-    this.engineTick = Math.round(this.world.frame.timeMs * 30 / 1000);
-    // A restored creature does not prove an Engine operation is still active.
-    this.engine = new PetEngineTelemetry();
+    this.world = PetWorld.fromRecording(points, JSON.parse(text));
+    this.segment = undefined; this.engineTick = Math.round(this.world.frame.timeMs * 30 / 1000); this.engine = new PetEngineTelemetry();
   }
   /** Resume a live host at the first unrecorded bucket. Keep every accepted
    * interval, but never present its last observed frame as current evidence. */
   resumeEngine(): number {
-    const end = this.world.tape.length * 12;
+    const last = this.world.tape.at(-1);
+    const end = last ? (last.sequence + 1) * 12 : 0;
     if (!end || end - this.engineTick > 24) throw new Error('Only a live recording can resume Engine observation.');
     while (this.engineTick < end) { this.world.step(1 / 30, { motion: false, sensitivity: 1 }); this.engineTick++; }
     this.engine = new PetEngineTelemetry();

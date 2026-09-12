@@ -23,9 +23,9 @@ Android 15/API 35 ARM64 emulator. This does not establish physical-device sound,
 battery use, or acceptance on all supported Android versions.
 
 Wild is a simulated creature. Event demo is synthetic telemetry. More → Import
-recording opens the same `petReplayVersion: 1` exports as the other hosts.
+recording opens the same version 1 and 2 exports as the other hosts.
 Checkpoint-bearing recordings resume their exact world; exports without a
-checkpoint replay from the beginning. Missing expression versions retain v1.
+checkpoint replay from the segment's start (or time zero for version 1). Missing expression versions retain v1.
 Both kinds can be exported again. Autosave and native import are bounded to
 8 MiB. Export includes the current checkpoint and writes small chunks through a
 private staging file, up to 64 MiB; larger-than-autosave files open in the browser. There is no live companion connection yet.
@@ -41,6 +41,9 @@ Each mode has a separate private, atomic recording, saved every five seconds
 and on suspension. Revision checks reject competing writers. Invalid files are
 retained. More → Start fresh habitat preserves the previous file as a recovery
 copy; More → Export previous world makes that copy available outside the app.
+Completed history rotates into immutable segments before the active file advances.
+More → Earlier recordings exports those segments; each includes its own starting
+checkpoint. Active memory stays bounded while archived history grows in storage.
 
 QuickJS is provided by `app.cash.zipline:zipline:1.27.0`. It runs on one worker,
 with a 64 MiB heap and evaluation deadlines. Two standard ES2022 method shims
@@ -48,9 +51,10 @@ cover that binding's older runtime. There are no Java host bindings or remote
 script loads. Gradle packages `../ios/Resources/pet-native.js` and its demo
 directly; run `npm --prefix pet run sync` after changing the canonical core.
 
-Seven instrumentation tests exercise the real embedded engine, 4,800 shared
+Eight instrumentation tests exercise the real embedded engine, 4,800 shared
 world frames and Kotlin digests, 3,000 additional checkpoint continuation
 frames, version/import boundaries, sample-exact PCM, atomic storage/recovery,
 the Compose pause/still/audio/background lifecycle, and recovery export after
-a store conflict or with 90,000 pending interactions beyond the autosave limit. The separate
+a store conflict or with 90,000 pending interactions beyond the autosave limit.
+They also check segment publication, exact continuation and archive corruption. The separate
 `verify.sh` retains all 380 pure Kotlin conformance checkpoints.

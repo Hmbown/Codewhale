@@ -72,6 +72,10 @@ impl Store {
     }
 
     pub fn save(&mut self, text: &str) -> io::Result<()> {
+        self.save_archived(text, None)
+    }
+
+    pub fn save_archived(&mut self, text: &str, archive: Option<(&[u8], u64)>) -> io::Result<()> {
         if text.len() > MAX_BYTES {
             return Err(io::Error::other("Pet habitat exceeds 8 MiB"));
         }
@@ -79,6 +83,31 @@ impl Store {
             let current = self.read()?.map(|b| <[u8; 32]>::from(Sha256::digest(b)));
             if current != self.expected {
                 return Err(io::Error::other("Another writer changed the pet habitat"));
+            }
+            if let Some((bytes, tick)) = archive {
+                if bytes.len() > MAX_EXPORT_BYTES {
+                    return Err(io::Error::other("Pet recording exceeds 64 MiB"));
+                }
+                let hash: String = Sha256::digest(bytes)
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect();
+                let archived = self
+                    .data
+                    .sibling(&format!("segment-{tick:012}-{hash}.json"))?;
+                if let Err(error) = archived.publish(bytes) {
+                    if error.kind() != io::ErrorKind::AlreadyExists {
+                        return Err(error);
+                    }
+                    let mut existing = Vec::new();
+                    archived
+                        .open_file()?
+                        .take(MAX_EXPORT_BYTES as u64 + 1)
+                        .read_to_end(&mut existing)?;
+                    if existing != bytes {
+                        return Err(io::Error::other("An archived recording was changed"));
+                    }
+                }
             }
             self.data.replace(text.as_bytes())
         })?;
@@ -148,6 +177,41 @@ mod tests {
             std::fs::metadata(&path).unwrap().len(),
             MAX_BYTES as u64 + 1
         );
+    }
+
+    #[test]
+    fn segments_are_immutable_and_must_publish_before_the_habitat_advances() {
+        let root = tempfile::tempdir().unwrap();
+        let mut files = store(root.path());
+        files.load().unwrap();
+        files.save("before").unwrap();
+        files
+            .save_archived("after", Some((b"complete history", 123)))
+            .unwrap();
+        let name = "segment-000000000123-42fcd454bac01f468e693701bf88157cd7a540556f85d26be0009392e43ecbd4.json";
+        let archive = root.path().join(name);
+        assert_eq!(std::fs::read(&archive).unwrap(), b"complete history");
+        std::fs::write(&archive, "damaged archive").unwrap();
+        assert!(
+            files
+                .save_archived("lost", Some((b"complete history", 123)))
+                .is_err()
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("habitat.json")).unwrap(),
+            "after"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&archive).unwrap(),
+            "damaged archive"
+        );
+        std::fs::write(root.path().join("habitat.json"), "another writer").unwrap();
+        assert!(
+            files
+                .save_archived("lost", Some((b"new history", 124)))
+                .is_err()
+        );
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 3);
     }
 
     #[cfg(unix)]

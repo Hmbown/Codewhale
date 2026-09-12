@@ -141,14 +141,33 @@ starts unknown and drops old human requests. Apple legacy wild preferences
 migrate only after a successful checkpoint save. Native autosave is every five
 seconds, so a crash may lose work since the last successful save.
 
+New worlds use version 2 recordings with an exact starting checkpoint and
+absolute telemetry sequences. After 1,024 consumed buckets or 4,096 applied
+inputs, the host saves completed history as an immutable segment before replacing
+the active habitat. Only then does the running world retire that history. Its
+particles, random streams and score continue without a reset. Gaps remain unknown;
+future imported events stay in the active segment. Version 1 imports still work.
+
+Earlier recordings opens saved segments in the browser and exports them on Apple
+and Android. TUI segments are JSON files beside `habitat.json` in the session's
+`artifacts/pet` directory. Each segment replays independently from its starting
+checkpoint; seeking cannot precede that point. Browser source changes archive
+the entire outgoing recording, including unplayed imported events. Archived files
+are retained, so disk use grows with recorded history even though active history
+is bounded.
+
 Native autosaves and native imports are limited to 8 MiB; the QuickJS worker
-has a 64 MiB memory limit. All four hosts export the same version 1 recording
-in chunks, including the exact checkpoint, with a 64 MiB file limit. Files over
-8 MiB can be recovered in the browser. Android finishes the export in a private
-staging file before opening the user-selected destination. Apple source changes
-keep the current visit when saving fails; leaving without saving requires an
-explicit choice. iOS and macOS both offer Save recording. Two-hour restoration has been exercised, but serializing full long tapes
-still costs seconds in QuickJS. History rotation and long-session performance
-remain open. Physical Android device acceptance, macOS popover inspection,
-active-session companion acceptance, content-driven forms and final listening/power quality
-are unfinished. This branch is a reviewable prototype, not a release candidate.
+has a 64 MiB memory limit. All four hosts export recordings in chunks, including
+the exact checkpoint, with a 64 MiB file limit. Files over 8 MiB can be recovered
+in the browser. Android finishes the export in a private staging file before
+opening the user-selected destination. Apple source changes keep the current
+visit when saving fails; leaving without saving requires an explicit choice.
+
+A 30-hour synthetic Still run of the shared core rotated 263 segments and kept
+the active file below 0.45 MB, with exact checkpoint continuation after every
+rotation. Apple and Android separately exercise archive publication, failed saves
+and continued execution in their actual embedded engines. This is not 30 hours
+of animated native-device or power testing. Physical Android device acceptance,
+macOS popover inspection, active-session companion acceptance and final
+listening/power quality remain unfinished. This branch is a reviewable prototype,
+not a release candidate.

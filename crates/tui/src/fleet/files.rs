@@ -90,7 +90,7 @@ impl WorkspaceFile {
         })
     }
 
-    pub(super) fn sibling(&self, name: &str) -> io::Result<Self> {
+    pub(crate) fn sibling(&self, name: &str) -> io::Result<Self> {
         if !path_is_confined(Path::new(name)) || Path::new(name).components().count() != 1 {
             return Err(invalid_path());
         }
@@ -268,7 +268,7 @@ impl WorkspaceFile {
         })
     }
 
-    pub(super) fn sibling(&self, name: &str) -> io::Result<Self> {
+    pub(crate) fn sibling(&self, name: &str) -> io::Result<Self> {
         if !path_is_confined(Path::new(name)) || Path::new(name).components().count() != 1 {
             return Err(invalid_path());
         }
@@ -508,7 +508,7 @@ impl WorkspaceFile {
             "Confined Fleet artifact I/O is unavailable on this platform",
         ))
     }
-    pub(super) fn sibling(&self, _: &str) -> io::Result<Self> {
+    pub(crate) fn sibling(&self, _: &str) -> io::Result<Self> {
         unreachable!()
     }
     pub(crate) fn open_update(&self, _: bool, _: bool) -> io::Result<File> {
