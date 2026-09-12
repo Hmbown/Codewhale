@@ -129,12 +129,18 @@ get<HTMLInputElement>('file').onchange = async event => {
     const text = await file.text(); let replay: unknown;
     try { replay = JSON.parse(text); } catch { /* JSONL is decoded below. */ }
     let nextInteractions: PetInteraction[] = [], nextTape: PetBucket[], nextExpressionVersion: 1 | 2 = 2;
+    let nextCheckpoint: import('../core/pet-world.js').PetWorldCheckpoint | undefined;
     if (replay && typeof replay === 'object' && 'petReplayVersion' in replay) {
-      const r = replay as { petReplayVersion: number; expressionVersion?: 1 | 2; tape: unknown; interactions: PetInteraction[] };
+      const r = replay as { petReplayVersion: number; expressionVersion?: 1 | 2; tape: unknown; interactions: PetInteraction[]; checkpoint?: import('../core/pet-world.js').PetWorldCheckpoint };
       if (r.petReplayVersion !== 1 || !Array.isArray(r.tape) || !Array.isArray(r.interactions)) throw new Error('Invalid pet replay.');
       nextExpressionVersion = r.expressionVersion === undefined ? 1 : r.expressionVersion;
       if (![1, 2].includes(nextExpressionVersion)) throw new Error('Unsupported pet expression version.');
       nextTape = decodePetJSONL(r.tape.map(b => JSON.stringify(b)).join('\n')); nextInteractions = r.interactions;
+      if (r.checkpoint !== undefined) {
+        if ((r.checkpoint?.sim?.expressionVersion ?? 1) !== nextExpressionVersion) throw new Error('Pet expression version does not match its checkpoint.');
+        PetWorld.restore(points, nextTape, nextInteractions, r.checkpoint);
+        nextCheckpoint = r.checkpoint;
+      }
     } else {
       const first = replay ?? JSON.parse(text.split(/\r?\n/).find(line => line.trim()) || '{}');
       if (first && typeof first === 'object' && 'version' in first && first.version === 1 && 'simTimeMs' in first) nextTape = decodePetJSONL(text);
@@ -145,15 +151,25 @@ get<HTMLInputElement>('file').onchange = async event => {
     // Validate before replacing the currently playing world.
     new PetWorld(points, nextTape, nextInteractions, nextExpressionVersion);
     stopFollowing();
-    expressionVersion = nextExpressionVersion; tape = nextTape; interactions = nextInteractions; mode.value = 'replay'; seek.max = String(Math.max(90, tape.length * .4));
+    expressionVersion = nextExpressionVersion; tape = nextTape; interactions = nextInteractions; mode.value = 'replay'; seek.max = String(Math.max(90, tape.length * .4, (nextCheckpoint?.frame.timeMs ?? 0) / 1000));
     imported = { tape, interactions: [...interactions], name: `Local replay · ${file.name}`, expressionVersion };
     mode.querySelector<HTMLOptionElement>('[value="replay"]')!.disabled = false;
-    source.textContent = `Local replay · ${file.name}`; message.textContent = 'Replay loaded locally. Saved replays include interactions and audio onsets.'; rebuild();
+    source.textContent = `Local replay · ${file.name}`; message.textContent = 'Recording loaded locally. The saved world includes interactions, its current pose and audio onsets.';
+    await rebuild((nextCheckpoint?.frame.timeMs ?? 0) / 1000, nextCheckpoint);
   } catch (error) { message.textContent = error instanceof Error ? error.message : 'Unable to import this file.'; }
 };
 get('save').onclick = () => {
-  const blob = new Blob([JSON.stringify({ petReplayVersion: 1, expressionVersion: world.sim.expressionVersion, source: mode.value, tape: world.tape, interactions: world.interactions })], { type: 'application/json' });
-  const url = URL.createObjectURL(blob), a = document.createElement('a'); a.href = url; a.download = 'codewhale-pet-replay.json'; a.click(); setTimeout(() => URL.revokeObjectURL(url), 1000);
+  try {
+    const chunks: string[] = []; let bytes = 0;
+    for (let index = 0; ; index++) {
+      const chunk = world.recordingChunk(index); if (chunk === null) break;
+      bytes += new TextEncoder().encode(chunk).length;
+      if (bytes > 64 * 1024 * 1024) throw new Error('Recording exceeds the 64 MiB export limit. The current world was kept.');
+      chunks.push(chunk);
+    }
+    const blob = new Blob(chunks, { type: 'application/json' });
+    const url = URL.createObjectURL(blob), a = document.createElement('a'); a.href = url; a.download = 'codewhale-pet-replay.json'; a.click(); setTimeout(() => URL.revokeObjectURL(url), 1000);
+  } catch (error) { message.textContent = error instanceof Error ? error.message : 'Unable to export the recording. The current world was kept.'; }
 };
 get('follow').onclick = async () => {
   // A browser-granted read handle is the same local JSONL seam native hosts use.

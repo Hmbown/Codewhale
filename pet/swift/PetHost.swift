@@ -15,7 +15,7 @@ public enum PetSource: String, CaseIterable, Identifiable {
     @Published public private(set) var core: PetNativeCore?
     @Published public private(set) var message = ""
     @Published public private(set) var persistenceMessage = ""
-    @Published public var source: PetSource = .wild { didSet { if source != oldValue { save(); defaults.set(source.rawValue, forKey: "pet.source"); restart() } } }
+    @Published public private(set) var source: PetSource = .wild
     @Published public var still = false { didSet { defaults.set(still, forKey: "pet.still") } }
     @Published public var sound = false { didSet { defaults.set(sound, forKey: "pet.sound"); configureSound() } }
     public var systemReducedMotion = false
@@ -49,7 +49,13 @@ public enum PetSource: String, CaseIterable, Identifiable {
         }
     }
     public func suspend(_ value: Bool) { paused = value; if value { save(); audio.stop() } else { configureSound() } }
-    public func restart() {
+    @discardableResult public func selectSource(_ next: PetSource, discardingUnsaved: Bool = false) -> Bool {
+        guard next != source else { return true }
+        guard discardingUnsaved || save() else { return false }
+        source = next; defaults.set(next.rawValue, forKey: "pet.source"); restart()
+        return true
+    }
+    private func restart() {
         audio.stop(); restoring = false; failed = false; monitor?.cancel(); fileMonitor?.cancel(); monitor = nil; fileMonitor = nil; lastPacket = nil; lastSourceSequence = -1; fileIdentity = nil
         store = nil; persistenceMessage = ""; migratingLegacy = false; count = 0
         do {
@@ -108,8 +114,11 @@ public enum PetSource: String, CaseIterable, Identifiable {
         do { try core?.interact(food: food); save() } catch { message = error.localizedDescription }
     }
     public func exportRecording(to url: URL) throws {
-        guard let core else { throw PetCoreError.invalid("No pet recording is available.") }
-        try core.recording().write(to: url, options: .atomic)
+        try recordingForExport().write(to: url, options: .atomic)
+    }
+    public func recordingForExport() throws -> Data {
+        guard !restoring, let core else { throw PetCoreError.invalid("Wait for the habitat to finish opening before exporting.") }
+        return try core.exportRecording()
     }
     private func configureSound() {
         do { try audio.setEnabled(sound && !paused && !failed && !restoring, simulationTime: (core?.frame.timeMs ?? 0) / 1000) }
@@ -124,16 +133,19 @@ public enum PetSource: String, CaseIterable, Identifiable {
             objectWillChange.send()
         } catch { audio.stop(); failed = true; message = error.localizedDescription }
     }
-    private func save() {
-        guard let core, let store, !restoring, !failed else { return }
+    @discardableResult private func save() -> Bool {
+        guard let core else { return true }
+        guard let store, !restoring, !failed else { return false }
         do {
             try store.save(core.recording(checkpoint: true))
             if migratingLegacy {
                 defaults.removeObject(forKey: "pet.interactions"); defaults.removeObject(forKey: "pet.elapsed"); migratingLegacy = false
             }
+            persistenceMessage = ""
+            return true
         } catch {
-            self.store = nil
             persistenceMessage = "The habitat could not be saved. Its previous file was kept. This visit stays in memory."
+            return false
         }
     }
     private func watch(_ url: URL) {

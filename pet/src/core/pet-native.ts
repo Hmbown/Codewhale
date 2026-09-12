@@ -24,6 +24,7 @@ export class PetNative {
   recording(withCheckpoint = false): string { return JSON.stringify({ petReplayVersion: 1, expressionVersion: this.world.sim.expressionVersion, tape: this.world.tape,
     interactions: this.world.interactions, ...(withCheckpoint ? { checkpoint: this.world.checkpoint() } : {}) }); }
   checkpoint(): string { return JSON.stringify(this.world.checkpoint()); }
+  recordingChunk(index: number): string | null { return this.world.recordingChunk(index); }
   restoreCheckpoint(text: string): void {
     if (text.length > 512 * 1024) throw new Error('Pet checkpoint exceeds its size limit.');
     this.restoreHistory(this.world.tape, this.world.interactions, JSON.parse(text));

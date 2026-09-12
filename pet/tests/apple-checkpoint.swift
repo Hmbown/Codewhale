@@ -100,18 +100,39 @@ import Darwin
         host.suspend(true)
         for _ in 0..<180 { try host.core!.tick(motion: true) }
         let wildTime = host.core!.frame.timeMs, wildDigest = petDigest(host.core!.sim)
-        host.source = .demo
+        try require(host.selectSource(.demo), "Saved world could not switch")
         for _ in 0..<120 { try host.core!.tick(motion: false) }
         let demoTime = host.core!.frame.timeMs
-        host.source = .wild
+        try require(host.selectSource(.wild), "Saved world could not switch")
         try require(host.core!.frame.timeMs == wildTime && petDigest(host.core!.sim) == wildDigest, "Source switch reset the wild habitat")
-        host.source = .demo
+        try require(host.selectSource(.demo), "Saved world could not switch")
         try require(host.core!.frame.timeMs == demoTime, "Source switch reset the demo habitat")
         host.suspend(true)
         let reopened = PetHost(points: points, bundle: bundle, defaults: defaults, storageDirectory: hostDir)
         reopened.suspend(true)
         try require(reopened.core!.frame.timeMs == demoTime, "New host did not reopen its selected source")
         print("PASS actual Apple host: separate wild/demo checkpoints survive source switching and a new host")
+
+        // Force a real optimistic-revision failure while the visit has newer
+        // in-memory progress, then exercise the actual host export/recovery path.
+        for _ in 0..<30 { try reopened.core!.tick(motion: true) }
+        reopened.interact(food: true)
+        let current = reopened.core!, currentData = try current.recording(checkpoint: true)
+        let external = Data("external writer kept".utf8)
+        try external.write(to: hostDir.appendingPathComponent("demo.json"))
+        try require(!reopened.selectSource(.wild), "Failed save allowed source switching")
+        try require(reopened.source == .demo && defaults.string(forKey: "pet.source") == "demo", "Failed switch changed the source or preference")
+        try require(reopened.core === current && same(currentData, current.recording(checkpoint: true)), "Failed switch lost the current world")
+        let exported = root.appendingPathComponent("unsaved-visit.json")
+        try reopened.exportRecording(to: exported)
+        let exportedData = try Data(contentsOf: exported)
+        try require(same(exportedData, currentData), "Export lost the current pose, score or pending input")
+        let retained = try PetNativeCore(points: points, bundle: script, saved: exportedData)
+        try require(retained.frame.timeMs == current.frame.timeMs && retained.frame.digest == current.frame.digest, "Export did not restore the unsaved visit")
+        try require(Data(contentsOf: hostDir.appendingPathComponent("demo.json")) == external, "Recovery changed the other writer's file")
+        try require(reopened.selectSource(.wild, discardingUnsaved: true), "Explicit leave could not open another world")
+        print("PASS actual Apple host: save conflict blocks source/preference replacement; export restores the exact unsaved visit; explicit leave works")
+        defaults.set("demo", forKey: "pet.source")
 
         let corruptDir = root.appendingPathComponent("corrupt")
         try FileManager.default.createDirectory(at: corruptDir, withIntermediateDirectories: true)
@@ -146,6 +167,6 @@ import Darwin
         try require(long.core!.frame.timeMs >= 7_200_000 && long.core!.frame.state.observed == 0, "Large native habitat did not resume unknown")
         try require(long.persistenceMessage.isEmpty, "Large native habitat failed to save")
         print("PASS actual Apple host: two-hour 5.54 MB synthetic unknown habitat restored and saved in \(start.duration(to: .now))")
-        print("PASS 8 Apple checkpoint workflows; fixtures retained at \(root.path)")
+        print("PASS 9 Apple checkpoint workflows; fixtures retained at \(root.path)")
     }
 }

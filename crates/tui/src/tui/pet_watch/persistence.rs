@@ -10,6 +10,7 @@ use crate::artifacts::{open_session_relative, write_session_relative_immutable};
 use crate::fleet::files::{WorkspaceFile, same_file};
 
 const MAX_BYTES: usize = 8 * 1024 * 1024;
+pub(super) const MAX_EXPORT_BYTES: usize = 64 * 1024 * 1024;
 const HABITAT: &str = "artifacts/pet/habitat.json";
 
 pub struct Store {
@@ -86,15 +87,15 @@ impl Store {
     }
 }
 
-pub fn export(session: &str, text: &str) -> io::Result<PathBuf> {
-    if text.len() > MAX_BYTES {
-        return Err(io::Error::other("Pet replay exceeds 8 MiB"));
+pub fn export(session: &str, bytes: &[u8]) -> io::Result<PathBuf> {
+    if bytes.len() > MAX_EXPORT_BYTES {
+        return Err(io::Error::other("Pet recording exceeds 64 MiB"));
     }
     let relative = PathBuf::from(format!(
         "artifacts/pet/replay-{}.json",
         uuid::Uuid::new_v4()
     ));
-    write_session_relative_immutable(session, &relative, text.as_bytes())
+    write_session_relative_immutable(session, &relative, bytes)
 }
 
 #[cfg(test)]

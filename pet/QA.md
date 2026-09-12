@@ -17,7 +17,7 @@ npm test
 npm run check:web
 ```
 
-The pet suite currently contains 39 tests: event occupancy/unknown coverage,
+The pet suite currently contains 40 tests: event occupancy/unknown coverage,
 late failures, human request pairing, read-only local SSE reconnect/cursor
 recovery and cancellation after garbage collection, deterministic world/score/PCM,
 checkpoint integrity and continuation, expression-version validation and legacy replay.
@@ -73,7 +73,7 @@ cd pet/android
 ```
 
 Use JDK 17 and Android SDK 35; connect a device/emulator for the second command.
-The five instrumentation tests run the real QuickJS binding, Kotlin renderer,
+The seven instrumentation tests run the real QuickJS binding, Kotlin renderer,
 PCM cursor, storage/recovery and Compose lifecycle. See [Android](android/README.md).
 
 ## Review direction
@@ -87,7 +87,7 @@ open junctions; the same particle identities return to the whale at rest.
 
 ## Local evidence before publication (2026-09-12)
 
-- Packaged pet: 39 tests passed; existing Whalesong consumers: 306 passed after
+- Packaged pet: 40 tests passed; existing Whalesong consumers: 306 passed after
   canonical source relocation. These are overlapping suites, not additive coverage.
 - Product Node gate: 66 package, 12 SDK and 446 web tests passed; production web
   check subsequently passed with the GitHub release fetch available.
@@ -99,12 +99,17 @@ open junctions; the same particle identities return to the whale at rest.
   tests with one outdated Watch-tab golden; that header was corrected. Subsequent
   hosted product CI on `e69e99b` passed Linux, macOS and Windows tests, Rust lint
   and the applicable safety/security checks. Each later commit needs its own verdict.
-- Apple: eight checkpoint workflows passed; iOS Simulator exercised two-hour
+- Apple: nine checkpoint workflows passed; iOS Simulator exercised two-hour
   restoration and visible corruption recovery without overwriting the damaged file.
-- Android: debug APK and lint build pass; five instrumentation tests pass on
+- Android: debug APK and lint build pass; seven instrumentation tests pass on
   Android 15 ARM64, including 4,800 frames, checkpoint continuation, exact PCM,
   lifecycle and storage recovery. The emulator audio sink runs without host
   speaker output; this does not establish physical listening or power quality.
+- Recovery exports: the shared 32,000-bucket fixture exceeds the native autosave
+  bound and restores its exact checkpoint. Android also exports 90,000 pending
+  interactions from its real 64 MiB QuickJS heap after the 8 MiB autosave path
+  rejects them. Apple save-conflict recovery preserves the live core, selected
+  source and preference; its exported pose/score restores exactly.
 - Authenticated read-only attachment to an existing local Runtime 0.9.13 session
   journal passed. An 18-second recorder run produced 45 contiguous unknown buckets
   and stopped cleanly in 41 ms after Ctrl+C, without treating historical work as

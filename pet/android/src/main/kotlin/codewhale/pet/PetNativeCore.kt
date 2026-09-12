@@ -6,6 +6,7 @@ import app.cash.zipline.QuickJs
 import org.json.JSONArray
 import org.json.JSONObject
 import kotlin.math.roundToLong
+import java.io.OutputStream
 
 data class PetFood(val x: Float, val y: Float, val life: Float)
 data class PetScene(
@@ -88,6 +89,18 @@ class PetNativeCore(bundle: String, pointsText: String, tape: String = "", saved
     fun interact(food: Boolean) { evaluate("pet.interact('${if (food) "food" else "attention"}', 0.2, -0.15)") }
     fun recording(): String = string("pet.recording(true)").also {
         require(it.toByteArray(Charsets.UTF_8).size <= MAX_HABITAT_BYTES) { "Habitat exceeds 8 MiB; export the recording." }
+    }
+    /** Called synchronously on the world worker, so the chunks share one clock.
+     * A larger recovery export never materializes one giant string in QuickJS. */
+    fun exportRecording(output: OutputStream): Long {
+        var size = 0L
+        var index = 0
+        while (true) {
+            val value = evaluate("pet.recordingChunk(${index++})") ?: return size
+            val bytes = (value as? String ?: error("Invalid pet export chunk.")).toByteArray(Charsets.UTF_8)
+            check(size + bytes.size <= 64L * 1024 * 1024) { "Recording exceeds the 64 MiB export limit. The current world was kept." }
+            output.write(bytes); size += bytes.size
+        }
     }
     fun pcm(voices: JSONArray, start: Long, length: Int): FloatArray {
         require(start >= 0 && length in 1..24_000 && voices.length() <= 128)

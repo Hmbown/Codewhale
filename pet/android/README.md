@@ -26,7 +26,9 @@ Wild is a simulated creature. Event demo is synthetic telemetry. More → Import
 recording opens the same `petReplayVersion: 1` exports as the other hosts.
 Checkpoint-bearing recordings resume their exact world; exports without a
 checkpoint replay from the beginning. Missing expression versions retain v1.
-Both kinds can be exported again. There is no live companion connection yet.
+Both kinds can be exported again. Autosave and native import are bounded to
+8 MiB. Export includes the current checkpoint and writes small chunks through a
+private staging file, up to 64 MiB; larger-than-autosave files open in the browser. There is no live companion connection yet.
 
 Sound starts off on each process launch. One native AudioTrack receives the
 core's stereo 48 kHz float PCM. A bounded queue drops late output. Pause,
@@ -46,8 +48,9 @@ cover that binding's older runtime. There are no Java host bindings or remote
 script loads. Gradle packages `../ios/Resources/pet-native.js` and its demo
 directly; run `npm --prefix pet run sync` after changing the canonical core.
 
-Five instrumentation tests exercise the real embedded engine, 4,800 shared
+Seven instrumentation tests exercise the real embedded engine, 4,800 shared
 world frames and Kotlin digests, 3,000 additional checkpoint continuation
 frames, version/import boundaries, sample-exact PCM, atomic storage/recovery,
-and the Compose pause/still/audio/background lifecycle. The separate
+the Compose pause/still/audio/background lifecycle, and recovery export after
+a store conflict or with 90,000 pending interactions beyond the autosave limit. The separate
 `verify.sh` retains all 380 pure Kotlin conformance checkpoints.

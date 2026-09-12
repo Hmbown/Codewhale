@@ -70,6 +70,22 @@ pub struct Worker {
     pub notices: mpsc::Receiver<Notice>,
 }
 
+/// One command owns the world until export completes. Keep the large buffer in
+/// the host, outside QuickJS's 64 MiB heap, and retain the exact checkpoint.
+fn export_recording(ctx: &rquickjs::Ctx<'_>) -> rquickjs::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    let mut index = 0usize;
+    loop {
+        let chunk: Option<String> = ctx.eval(format!("pet.recordingChunk({index})"))?;
+        let Some(chunk) = chunk else { return Ok(bytes) };
+        if bytes.len() + chunk.len() > persistence::MAX_EXPORT_BYTES {
+            return Err(rquickjs::Error::Unknown);
+        }
+        bytes.extend_from_slice(chunk.as_bytes());
+        index += 1;
+    }
+}
+
 /// Presentation retains only the voices that can still contribute samples.
 /// Their identities, timestamps and PCM all come from the existing JS core.
 struct AudioCursor {
@@ -254,10 +270,15 @@ fn run(
             .with(|ctx| -> rquickjs::Result<()> {
                 match command {
                     Command::Export => {
-                        let json: String = ctx.eval("pet.recording()")?;
                         let result = session
                             .ok_or_else(|| std::io::Error::other("No saved session"))
-                            .and_then(|id| persistence::export(id, &json));
+                            .and_then(|id| {
+                                let bytes = export_recording(&ctx).map_err(|_| {
+                                    let _ = ctx.catch();
+                                    std::io::Error::other("Pet recording could not be exported")
+                                })?;
+                                persistence::export(id, &bytes)
+                            });
                         let notice = match result {
                             Ok(path) => Notice::Exported(path),
                             Err(_) => Notice::ExportFailed,
@@ -449,13 +470,21 @@ mod tests {
     }
 
     #[test]
-    fn sound_sink_failure_does_not_stop_the_world() {
+    fn output_failures_do_not_stop_the_world() {
         let worker = Worker::start(None).unwrap();
         let (sink, packets) = audio::Output::capture();
         drop(packets);
         frame_with_audio(&worker, 0.0, Some(sink.target()));
         let before = frame_with_audio(&worker, 400.0, Some(sink.target()));
         assert!(sink.failed());
+        worker.tx.send(Command::Export).unwrap();
+        assert!(matches!(
+            worker
+                .notices
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap(),
+            Notice::ExportFailed
+        ));
         let after = frame_with_audio(&worker, 800.0, Some(sink.target()));
         assert!(after.time_ms > before.time_ms);
         assert!(after.hollow, "sound failure is not observed telemetry");
@@ -481,12 +510,29 @@ mod tests {
             .unwrap();
         let before = frame(&worker, 5_000.0);
         assert_eq!(before.channel, "human");
+        worker.tx.send(Command::Export).unwrap();
+        let export = match worker
+            .notices
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap()
+        {
+            Notice::Exported(path) => path,
+            _ => panic!("The live world did not export"),
+        };
+        let exported: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(export).unwrap()).unwrap();
+        assert_eq!(exported["checkpoint"]["frame"]["timeMs"], before.time_ms);
+        assert!(exported["checkpoint"]["sim"]["particles"].is_array());
         finish(worker);
         let path = root
             .path()
             .join("pet-worker-test/artifacts/pet/habitat.json");
         let saved: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            exported, saved,
+            "Export omitted the current pose, score or history"
+        );
         let worker = Worker::start(Some("pet-worker-test".into())).unwrap();
         let after = frame(&worker, 800.0);
         assert!(after.hollow);

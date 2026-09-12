@@ -94,6 +94,22 @@ public enum PetCoreError: Error, LocalizedError {
         }
         return Data(value.utf8)
     }
+    /// The host owns the world for this entire export. The private autosave and
+    /// native import remain bounded to 8 MiB; larger exports open in the browser.
+    public func exportRecording() throws -> Data {
+        var data = Data(), index = 0
+        while true {
+            failure = nil
+            guard let value = world.invokeMethod("recordingChunk", withArguments: [index]), failure == nil else {
+                throw PetCoreError.invalid(failure ?? "Unable to export the pet recording.")
+            }
+            if value.isNull { return data }
+            guard value.isString, let text = value.toString() else { throw PetCoreError.invalid("Invalid pet export chunk.") }
+            let bytes = Data(text.utf8)
+            guard data.count + bytes.count <= 64 * 1024 * 1024 else { throw PetCoreError.invalid("Recording exceeds the 64 MiB export limit. The current world was kept.") }
+            data.append(bytes); index += 1
+        }
+    }
     public func pcm(voice: PetVoice, startSample: Int, length: Int, rate: Int) throws -> [[Float]] {
         let voices = String(decoding: try JSONEncoder().encode([voice]), as: UTF8.self)
         failure = nil

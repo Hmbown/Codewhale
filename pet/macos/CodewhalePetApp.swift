@@ -7,12 +7,16 @@ struct CodewhalePetApp: App {
     @StateObject private var host = PetHost(points: WHALE_POINTS)
     @State private var login = SMAppService.mainApp.status == .enabled
     @State private var notice = ""
+    @State private var pendingSource: PetSource?
+    @State private var confirmLeave = false
     var body: some Scene {
         MenuBarExtra {
             VStack(spacing: 12) {
                 HStack { Text("Codewhale").font(.headline); Spacer(); Text("A living field").font(.caption).foregroundStyle(.secondary) }
                 PetHabitatView(host: host).frame(height: 250)
-                Picker("World", selection: $host.source) { ForEach(PetSource.allCases) { Text($0.label).tag($0) } }.pickerStyle(.segmented)
+                Picker("World", selection: Binding(get: { host.source }, set: { next in
+                    if !host.selectSource(next) { pendingSource = next; confirmLeave = true }
+                })) { ForEach(PetSource.allCases) { Text($0.label).tag($0) } }.pickerStyle(.segmented)
                 HStack {
                     Toggle("Still", isOn: $host.still)
                     Toggle("Launch at login", isOn: $login).onChange(of: login) { _, value in
@@ -23,15 +27,22 @@ struct CodewhalePetApp: App {
                 if host.source == .live { Text("Local source: ~/.codewhale/pet-state").font(.caption2).textSelection(.enabled) }
                 if !notice.isEmpty { Text(notice).font(.caption).foregroundStyle(.secondary) }
                 HStack {
-                    Button("Save replay…") {
+                    Button("Save recording…") {
                         let panel = NSSavePanel(); panel.nameFieldStringValue = "codewhale-pet-replay.json"
                         if panel.runModal() == .OK, let url = panel.url {
-                            do { try host.exportRecording(to: url); notice = "Replay saved" } catch { notice = error.localizedDescription }
+                            do { try host.exportRecording(to: url); notice = "Recording saved, including this world’s current state. Files over 8 MiB open in the browser." } catch { notice = error.localizedDescription }
                         }
                     }
                     Spacer(); Button("Quit") { host.suspend(true); NSApplication.shared.terminate(nil) }
                 }
             }.padding(16).frame(width: 390)
+                .alert("This world has not been saved", isPresented: $confirmLeave) {
+                    Button("Keep this world", role: .cancel) { pendingSource = nil }
+                    Button("Leave without saving", role: .destructive) {
+                        if let next = pendingSource { host.selectSource(next, discardingUnsaved: true) }
+                        pendingSource = nil
+                    }
+                } message: { Text("Keep this world and use Save recording to retain the current visit. Leaving opens the other world and discards this visit’s unsaved progress.") }
         } label: {
             PetMenuIcon(host: host)
                 .onAppear { host.setLiveFile(URL(fileURLWithPath: NSHomeDirectory() + "/.codewhale/pet-state")) }

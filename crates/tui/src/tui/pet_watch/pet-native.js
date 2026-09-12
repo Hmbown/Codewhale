@@ -34,6 +34,7 @@ class PetNative {
             interactions: this.world.interactions, ...(withCheckpoint ? { checkpoint: this.world.checkpoint() } : {}) });
     }
     checkpoint() { return JSON.stringify(this.world.checkpoint()); }
+    recordingChunk(index) { return this.world.recordingChunk(index); }
     restoreCheckpoint(text) {
         if (text.length > 512 * 1024)
             throw new Error('Pet checkpoint exceeds its size limit.');
@@ -187,6 +188,26 @@ class PetWorld {
             lastActivity: this.lastActivity, addressedAt: Number.isFinite(this.addressedAt) ? this.addressedAt : null,
             waitSince: this.waitSince, food: this.food, members: [...this.members.values()], lastStill: this.lastStill,
             frame: this.frame, voices: this.voices });
+    }
+    /** Lossless version 1 export, including the current pose and score. Drivers
+     * consume all chunks synchronously on the world's owner before another tick.
+     * Only a small slice is serialized inside an embedded runtime at a time. */
+    recordingChunk(index) {
+        if (!Number.isSafeInteger(index) || index < 0)
+            throw new Error('Invalid pet export cursor.');
+        const size = 16, tapes = Math.ceil(this.tapeLog.length / size), inputs = Math.ceil(this.interactionLog.length / size);
+        if (index === 0)
+            return `{"petReplayVersion":1,"expressionVersion":${this.sim.expressionVersion},"tape":[`;
+        if (index <= tapes)
+            return (index === 1 ? '' : ',') + JSON.stringify(this.tapeLog.slice((index - 1) * size, index * size)).slice(1, -1);
+        if (index === tapes + 1)
+            return '],"interactions":[';
+        const part = index - tapes - 2;
+        if (part < inputs)
+            return (part === 0 ? '' : ',') + JSON.stringify(this.interactionLog.slice(part * size, (part + 1) * size)).slice(1, -1);
+        if (part === inputs)
+            return `],"checkpoint":${JSON.stringify(this.checkpoint())}}`;
+        return null;
     }
     /** Prefix states preserve the original FNV checksum byte for byte. Live
      * appends and replacements hash only the changed suffix, so checkpointing

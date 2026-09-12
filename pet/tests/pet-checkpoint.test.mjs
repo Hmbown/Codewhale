@@ -16,6 +16,36 @@ const equal = (a, b) => {
   assert.deepEqual(a.voices, b.voices);
 };
 
+test('chunked exports preserve the complete versioned recording and exact checkpoint beyond the autosave bound', () => {
+  for (const count of [0, 1, 16, 17, 32_000]) {
+    const tape = count ? compilePetTelemetry([], count * 400) : [];
+    const world = new PetWorld(points, tape);
+    // Cross both kinds of chunk boundary, including pending interactions.
+    for (let i = 0; i < 17; i++) world.interact('food', i / 20, -.2);
+    world.step(.1); world.interact('attention', -.2, .3);
+    const chunks = [];
+    for (let i = 0; ; i++) {
+      const chunk = world.recordingChunk(i); if (chunk === null) break;
+      chunks.push(chunk);
+    }
+    const text = chunks.join(''), recording = JSON.parse(text);
+    assert.equal(text, JSON.stringify({ petReplayVersion: 1, expressionVersion: 2, tape: world.tape,
+      interactions: world.interactions, checkpoint: world.checkpoint() }));
+    const restored = PetWorld.restore(points, recording.tape, recording.interactions, recording.checkpoint);
+    equal(world, restored); world.step(.1); restored.step(.1); equal(world, restored);
+    if (count === 32_000) {
+      assert.ok(Buffer.byteLength(text) > 8 * 1024 * 1024);
+      assert.ok(Math.max(...chunks.map(c => Buffer.byteLength(c))) < 512 * 1024);
+    }
+    assert.throws(() => world.recordingChunk(-1));
+    assert.throws(() => world.recordingChunk(.5));
+  }
+  const native = new PetNative(JSON.stringify(points), encodePetJSONL(tape));
+  const chunks = [];
+  for (let i = 0; ; i++) { const part = native.recordingChunk(i); if (part === null) break; chunks.push(part); }
+  assert.equal(chunks.join(''), native.recording(true));
+});
+
 test('JSON checkpoints continue exact particles, seeded behaviour, pod identities, interactions and score across motion changes', () => {
   for (const input of [[], tape]) {
     const world = new PetWorld(points, input);

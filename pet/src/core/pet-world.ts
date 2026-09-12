@@ -96,6 +96,21 @@ export class PetWorld {
       frame: this.frame, voices: this.voices });
   }
 
+  /** Lossless version 1 export, including the current pose and score. Drivers
+   * consume all chunks synchronously on the world's owner before another tick.
+   * Only a small slice is serialized inside an embedded runtime at a time. */
+  recordingChunk(index: number): string | null {
+    if (!Number.isSafeInteger(index) || index < 0) throw new Error('Invalid pet export cursor.');
+    const size = 16, tapes = Math.ceil(this.tapeLog.length / size), inputs = Math.ceil(this.interactionLog.length / size);
+    if (index === 0) return `{"petReplayVersion":1,"expressionVersion":${this.sim.expressionVersion},"tape":[`;
+    if (index <= tapes) return (index === 1 ? '' : ',') + JSON.stringify(this.tapeLog.slice((index - 1) * size, index * size)).slice(1, -1);
+    if (index === tapes + 1) return '],"interactions":[';
+    const part = index - tapes - 2;
+    if (part < inputs) return (part === 0 ? '' : ',') + JSON.stringify(this.interactionLog.slice(part * size, (part + 1) * size)).slice(1, -1);
+    if (part === inputs) return `],"checkpoint":${JSON.stringify(this.checkpoint())}}`;
+    return null;
+  }
+
   /** Prefix states preserve the original FNV checksum byte for byte. Live
    * appends and replacements hash only the changed suffix, so checkpointing
    * does not rescan hours of accepted telemetry on the world worker. */

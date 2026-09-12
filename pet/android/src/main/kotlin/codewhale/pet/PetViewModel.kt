@@ -155,7 +155,7 @@ class PetViewModel(application: Application) : AndroidViewModel(application) {
         if (saveBlocked) return false
         val pet = core ?: return true
         try {
-            store?.save(pet.recording())
+            checkNotNull(store) { "Habitat storage is unavailable." }.save(pet.recording())
             mutable.update { it.copy(savedAtMs = pet.timeMs) }
             return true
         } catch (e: Exception) {
@@ -216,11 +216,18 @@ class PetViewModel(application: Application) : AndroidViewModel(application) {
                 } catch (e: Exception) { next.close(); throw e }
             }
             is Command.Export -> {
-                val data = checkNotNull(core).recording()
-                val resolver = getApplication<Application>().contentResolver
-                val out = resolver.openOutputStream(command.uri, "wt") ?: error("Could not open the selected export file.")
-                out.bufferedWriter(Charsets.UTF_8).use { it.write(data) }
-                mutable.update { it.copy(message = "Recording exported.") }
+                val app = getApplication<Application>()
+                val staged = File.createTempFile("pet-export-", ".json", app.cacheDir)
+                try {
+                    val bytes = staged.outputStream().buffered().use { checkNotNull(core).exportRecording(it) }
+                    // Finish and validate the snapshot before opening the user's
+                    // destination. A core/size failure cannot truncate that file.
+                    val out = app.contentResolver.openOutputStream(command.uri, "wt") ?: error("Could not open the selected export file.")
+                    out.use { output -> staged.inputStream().use { it.copyTo(output) } }
+                    mutable.update { it.copy(message = if (bytes > PetNativeCore.MAX_HABITAT_BYTES)
+                        "Recording exported. Open files over 8 MiB in the browser."
+                        else "Recording exported, including the current world state.") }
+                } finally { staged.delete() }
             }
             is Command.ExportRecovery -> {
                 val file = recoveryFile() ?: error("No previous world is available.")

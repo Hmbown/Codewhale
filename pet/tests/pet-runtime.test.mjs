@@ -52,7 +52,7 @@ test('Runtime shutdown closes an idle SSE body after garbage collection', { time
   assert.equal(code, 0, log); assert.ok(closed, 'The server must see the reader disconnect');
 });
 
-test('the CLI follows real Runtime SSE envelopes through disconnect and cursor recovery, recording no prompt content', { timeout: 15_000 }, async t => {
+test('the CLI follows real Runtime SSE envelopes through disconnect and cursor recovery, recording no prompt content', { timeout: 20_000 }, async t => {
   let sequence = 0, connections = 0, stream, pulse;
   const requests = [], responses = new Set();
   const emit = (res, tool) => {
@@ -84,8 +84,22 @@ test('the CLI follows real Runtime SSE envelopes through disconnect and cursor r
   child.stdout.on('data', b => log += b); child.stderr.on('data', b => log += b);
   t.after(async () => { clearInterval(pulse); if (child.exitCode === null) child.kill('SIGTERM'); for (const res of responses) res.destroy(); server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); });
   for (let i = 0; !stream && i < 60; i++) await delay(25);
-  assert.ok(stream, log); await delay(1050); clearInterval(pulse); stream.destroy();
-  await delay(2200); child.kill('SIGINT'); const [code] = await exited; assert.equal(code, 0, log); clearInterval(pulse);
+  assert.ok(stream, log);
+  const waitForRecordedChannel = async channel => {
+    const until = Date.now() + 6_000;
+    while (Date.now() < until) {
+      try {
+        const tape = decodePetJSONL(await readFile(output, 'utf8'));
+        if (tape.some(b => b.channel === channel && b.observed === 1)) return;
+      } catch { /* The first file or an in-flight final line is not ready. */ }
+      await delay(40);
+    }
+    assert.fail(`The recorder did not persist observed ${channel} work. ${log}`);
+  };
+  // Assert actual recorder output before moving the fixture to its next phase.
+  // A fixed sleep can expire before reconnect + a complete bin on a busy runner.
+  await waitForRecordedChannel('code'); clearInterval(pulse); stream.destroy();
+  await waitForRecordedChannel('browser'); child.kill('SIGINT'); const [code] = await exited; assert.equal(code, 0, log); clearInterval(pulse);
   const text = await readFile(output, 'utf8'), tape = decodePetJSONL(text);
   assert.ok(tape.some(b => b.channel === 'code' && b.observed === 1));
   assert.ok(tape.some(b => b.sequence > 1 && b.observed === 0));

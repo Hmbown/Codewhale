@@ -141,8 +141,13 @@ starts unknown and drops old human requests. Apple legacy wild preferences
 migrate only after a successful checkpoint save. Native autosave is every five
 seconds, so a crash may lose work since the last successful save.
 
-Native habitats are limited to 8 MiB; the QuickJS worker has a 64 MiB memory
-limit. Two-hour restoration has been exercised, but serializing full long tapes
+Native autosaves and native imports are limited to 8 MiB; the QuickJS worker
+has a 64 MiB memory limit. All four hosts export the same version 1 recording
+in chunks, including the exact checkpoint, with a 64 MiB file limit. Files over
+8 MiB can be recovered in the browser. Android finishes the export in a private
+staging file before opening the user-selected destination. Apple source changes
+keep the current visit when saving fails; leaving without saving requires an
+explicit choice. iOS and macOS both offer Save recording. Two-hour restoration has been exercised, but serializing full long tapes
 still costs seconds in QuickJS. History rotation and long-session performance
 remain open. Physical Android device acceptance, macOS popover inspection,
 active-session companion acceptance, content-driven forms and final listening/power quality

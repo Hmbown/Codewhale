@@ -3,6 +3,7 @@ package codewhale.pet
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import java.io.ByteArrayInputStream
+import java.io.ByteArrayOutputStream
 import java.io.File
 import org.json.JSONArray
 import org.json.JSONObject
@@ -88,6 +89,57 @@ class PetNativeTest {
             assertNull(PetAudioCursor(world.timeMs).next(world))
             assertThrows(IllegalArgumentException::class.java) { world.pcm(all, -1, 100) }
             assertThrows(IllegalArgumentException::class.java) { world.pcm(all, 0, 24_001) }
+        }
+    }
+
+    @Test fun exportRetainsTheExactUnsavedVisitAfterAStoreConflict() {
+        val directory = File(context.cacheDir, "pet-export-${java.util.UUID.randomUUID()}").apply { mkdirs() }
+        try {
+            core().use { world ->
+                val store = PetHabitatStore(directory, "wild")
+                assertNull(store.read()); store.save(world.recording())
+                repeat(31) { world.tick(true) }
+                world.interact(true)
+                File(directory, "pet-wild.json").writeText("other writer")
+                assertThrows(IllegalStateException::class.java) { store.save(world.recording()) }
+                val output = ByteArrayOutputStream()
+                assertEquals(world.exportRecording(output), output.size().toLong())
+                val saved = output.toString("UTF-8")
+                assertEquals(world.recording(), saved)
+                core(saved).use { restored ->
+                    assertEquals(world.timeMs, restored.timeMs, 0.0)
+                    repeat(60) { assertEquals(world.tick(true).digest, restored.tick(true).digest) }
+                }
+                assertEquals("other writer", File(directory, "pet-wild.json").readText())
+            }
+        } finally { directory.deleteRecursively() }
+    }
+
+    @Test fun aRecordingBeyondTheAutosaveLimitCanStillBeExportedInChunks() {
+        // Populate through the actual public interaction API, inside the same
+        // 64 MiB QuickJS heap. The subclass only seeds this large input fixture.
+        val fixture = asset("pet-native.js") + """
+            globalThis.PetNative = class extends globalThis.PetNative {
+                constructor(...args) {
+                    super(...args);
+                    for (let i = 0; i < 90000; i++) this.interact('attention', 0.3141592653589793, -0.2718281828459045);
+                }
+            };
+        """.trimIndent()
+        PetNativeCore(fixture, asset("whale-points.tsv")).use { world ->
+            assertThrows(IllegalArgumentException::class.java) { world.recording() }
+            val file = File.createTempFile("pet-large-export-", ".json", context.cacheDir)
+            try {
+                val size = file.outputStream().buffered().use { world.exportRecording(it) }
+                assertEquals(size, file.length())
+                assertTrue(size > PetNativeCore.MAX_HABITAT_BYTES)
+                val recording = JSONObject(file.readText())
+                assertEquals(90000, recording.getJSONArray("interactions").length())
+                assertEquals(0, recording.getJSONObject("checkpoint").getInt("tick"))
+                assertEquals(2, recording.getInt("expressionVersion"))
+                // Export has not advanced or discarded the in-memory visit.
+                assertEquals(0.0, world.timeMs, 0.0)
+            } finally { file.delete() }
         }
     }
 
