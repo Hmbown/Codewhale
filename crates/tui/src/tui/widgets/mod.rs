@@ -7285,7 +7285,8 @@ mod tests {
         let mut app = create_test_app();
         app.low_motion = false;
         app.fancy_animations = true;
-        app.ocean_completion_started_at = Some(Instant::now() - std::time::Duration::from_millis(900));
+        app.ocean_completion_started_at =
+            Some(Instant::now() - std::time::Duration::from_millis(900));
         let widget = ChatWidget::new(&mut app, Rect::new(0, 0, 100, 24));
         let age = widget
             .ocean_column
