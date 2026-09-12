@@ -60,7 +60,7 @@ PET_KOTLIN_LIB=/path/to/gradle/lib ./pet/android/verify.sh
 Apple requires macOS, Xcode command-line tools, and XcodeGen for iOS. The iOS
 script generates and builds the Simulator project directly from the shared
 source, without first building macOS. Open `pet/ios/CodewhalePet.xcodeproj` to run.
-`check-apple.sh` compiles the actual host and runs eight checkpoint/storage/recovery
+`check-apple.sh` compiles the actual host and runs checkpoint/storage/recovery
 workflows, including a generated two-hour synthetic unknown recording. It writes
 only disposable fixtures under ignored conformance results and temporary storage.
 Kotlin 2.3.0 can instead be on PATH; its verifier builds only the particle core
