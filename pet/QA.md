@@ -93,7 +93,7 @@ open junctions; the same particle identities return to the whale at rest.
 
 ## Local evidence before publication (2026-09-12)
 
-- Packaged pet: 56 tests passed; existing Whalesong consumers: 310 passed after
+- Packaged pet: 57 tests passed; existing Whalesong consumers: 310 passed after
   the incremental Runtime importer change. These are overlapping suites, not
   additive coverage.
 - Product Node gate: 66 package, 12 SDK and 446 web tests passed; production web
@@ -154,6 +154,16 @@ open junctions; the same particle identities return to the whale at rest.
   count UTF-8 bytes, follow replacement with the real cursor, and preserve
   existing files on an archive collision or external replacement. History is
   retained on disk; this does not resume a recorder after process restart.
+  A Grokbot finding also covers errors after successful publication: row/byte
+  accounting now advances at replacement, before fallible cleanup or reporting.
+  The previous `e71be2c` writer fails the new post-publication continuation test.
+  Its first Windows CI run also found open handles preventing file replacement
+  and CRLF point data rejecting the whale body. Rotation now closes both writer
+  handles before replacement; point readers trim each row. The browser controller
+  tests now use CRLF assets and fail against the previous controller. CLI tests
+  use a test-only IPC preload for Windows shutdown-handler coverage because
+  `child.kill('SIGINT')` forcibly terminates a Windows process; POSIX tests retain
+  the real signal. Current Windows CI is required to verify the platform fix.
 - Bounded Runtime input: a real local HTTP/SSE fixture supplies 260,001 records
   spanning nearly 29 hours of event timestamps. The importer retains fewer than
   512 events and 256 KiB of metadata, including a still-open human request. The

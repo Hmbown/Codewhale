@@ -9,6 +9,7 @@ import { once } from 'node:events';
 import { setTimeout as delay } from 'node:timers/promises';
 import { followRuntime } from '../scripts/lib/pet-runtime.mjs';
 import { decodePetJSONL } from '../dist/core/pet-telemetry.js';
+import { spawnRecorder } from './helpers/recorder-process.mjs';
 
 test('Runtime pet input refuses remote hosts, credentials, paths and missing thread selection before connecting', async () => {
   for (const baseUrl of ['https://127.0.0.1:1', 'http://example.com', 'http://localhost:1', 'http://user:secret@127.0.0.1:1', 'http://127.0.0.1:1/private', 'http://127.0.0.1:1/?token=secret'])
@@ -78,8 +79,8 @@ test('the CLI follows real Runtime SSE envelopes through disconnect and cursor r
   });
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   const dir = await mkdtemp(join(tmpdir(), 'pet-runtime-')), output = join(dir, 'pet.jsonl');
-  const child = spawn(process.execPath, ['scripts/pet.mjs', `--runtime=http://127.0.0.1:${server.address().port}`, '--thread=fixture-thread', `--output=${output}`],
-    { cwd: new URL('../', import.meta.url), env: { ...process.env, CODEWHALE_RUNTIME_TOKEN: 'fixture-token' }, stdio: ['ignore', 'pipe', 'pipe'] });
+  const child = spawnRecorder([`--runtime=http://127.0.0.1:${server.address().port}`, '--thread=fixture-thread', `--output=${output}`],
+    { ...process.env, CODEWHALE_RUNTIME_TOKEN: 'fixture-token' });
   const exited = once(child, 'exit'); let log = '';
   child.stdout.on('data', b => log += b); child.stderr.on('data', b => log += b);
   t.after(async () => { clearInterval(pulse); if (child.exitCode === null) child.kill('SIGTERM'); for (const res of responses) res.destroy(); server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); });
@@ -99,7 +100,7 @@ test('the CLI follows real Runtime SSE envelopes through disconnect and cursor r
   // Assert actual recorder output before moving the fixture to its next phase.
   // A fixed sleep can expire before reconnect + a complete bin on a busy runner.
   await waitForRecordedChannel('code'); clearInterval(pulse); stream.destroy();
-  await waitForRecordedChannel('browser'); child.kill('SIGINT'); const [code] = await exited; assert.equal(code, 0, log); clearInterval(pulse);
+  await waitForRecordedChannel('browser'); child.stopRecorder(); const [code] = await exited; assert.equal(code, 0, log); clearInterval(pulse);
   const text = await readFile(output, 'utf8'), tape = decodePetJSONL(text);
   assert.ok(tape.some(b => b.channel === 'code' && b.observed === 1));
   assert.ok(tape.some(b => b.sequence > 1 && b.observed === 0));
@@ -127,8 +128,7 @@ test('live Runtime recording retains human waits and a brief late failure exactl
   });
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   const dir = await mkdtemp(join(tmpdir(), 'pet-runtime-lifecycle-')), output = join(dir, 'pet.jsonl');
-  const child = spawn(process.execPath, ['scripts/pet.mjs', `--runtime=http://127.0.0.1:${server.address().port}`, '--thread=fixture-thread', `--output=${output}`],
-    { cwd: new URL('../', import.meta.url), stdio: ['ignore', 'pipe', 'pipe'] });
+  const child = spawnRecorder([`--runtime=http://127.0.0.1:${server.address().port}`, '--thread=fixture-thread', `--output=${output}`]);
   const exited = once(child, 'exit'); let log = '';
   child.stdout.on('data', b => log += b); child.stderr.on('data', b => log += b);
   t.after(async () => { timers.forEach(clearTimeout); if (child.exitCode === null) child.kill('SIGTERM'); response?.destroy(); server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); });
@@ -149,7 +149,7 @@ test('live Runtime recording retains human waits and a brief late failure exactl
   await waitForTape(rows => rows.filter(b => b.waiting).length >= 3 && rows.some(b => b.errors), 'Waiting/error receipts were not recorded');
   answer();
   await waitForTape(rows => rows.length >= 2 && rows.slice(-2).every(b => !b.waiting && !b.observed), 'Answered input did not expire to unknown');
-  child.kill('SIGINT'); const [code] = await exited; assert.equal(code, 0, log);
+  child.stopRecorder(); const [code] = await exited; assert.equal(code, 0, log);
   const text = await readFile(output, 'utf8'), tape = decodePetJSONL(text);
   assert.equal(tape.reduce((sum, b) => sum + b.errors, 0), 1);
   assert.ok(tape.some(b => b.channel === 'error' && b.observed === 1));

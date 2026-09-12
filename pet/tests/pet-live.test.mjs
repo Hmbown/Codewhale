@@ -5,7 +5,7 @@ import { PetNative } from '../dist/core/pet-native.js';
 import { PetLiveTape, compilePetTelemetry } from '../dist/core/pet-telemetry.js';
 import { petDemoEvents } from '../dist/core/pet-demo.js';
 
-const points = JSON.stringify(readFileSync(new URL('../public/whale-points.tsv', import.meta.url), 'utf8').trim().split('\n').map(row => row.split(/\s+/).map(Number)));
+const points = JSON.stringify(readFileSync(new URL('../public/whale-points.tsv', import.meta.url), 'utf8').trim().split('\n').map(row => row.trim().split(/\s+/).map(Number)));
 const human = compilePetTelemetry(petDemoEvents()).find(b => b.channel === 'human' && b.waiting);
 const packet = sequence => ({ ...human, sequence, simTimeMs: sequence * 400 });
 const line = sequence => JSON.stringify(packet(sequence)) + '\n';

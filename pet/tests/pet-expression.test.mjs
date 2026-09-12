@@ -7,7 +7,7 @@ import { PetSim, digest } from '../dist/core/pet-sim.js';
 import { compilePetTelemetry, encodePetJSONL } from '../dist/core/pet-telemetry.js';
 import { petDemoEvents } from '../dist/core/pet-demo.js';
 
-const points = readFileSync(new URL('../public/whale-points.tsv', import.meta.url), 'utf8').trim().split('\n').map(row => row.split(/\s+/).map(Number));
+const points = readFileSync(new URL('../public/whale-points.tsv', import.meta.url), 'utf8').trim().split('\n').map(row => row.trim().split(/\s+/).map(Number));
 const tape = compilePetTelemetry(petDemoEvents(), 80_000);
 
 test('native hosts replay checkpoint-free exports from the beginning in their recorded expression version', () => {

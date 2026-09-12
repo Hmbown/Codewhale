@@ -7,7 +7,7 @@ import { compilePetTelemetry, encodePetJSONL } from '../dist/core/pet-telemetry.
 import { petDemoEvents } from '../dist/core/pet-demo.js';
 import { stableHash } from '../dist/core/model.js';
 
-const points = readFileSync(new URL('../public/whale-points.tsv', import.meta.url), 'utf8').trim().split('\n').map(row => row.split(/\s+/).map(Number));
+const points = readFileSync(new URL('../public/whale-points.tsv', import.meta.url), 'utf8').trim().split('\n').map(row => row.trim().split(/\s+/).map(Number));
 const tape = compilePetTelemetry(petDemoEvents(), 80_000);
 const motion = tick => tick % 107 < 71;
 const equal = (a, b) => {

@@ -276,7 +276,7 @@ function animate(now: number) {
 }
 try {
   const response = await fetch('./whale-points.tsv'); if (!response.ok) throw new Error('Whale point asset is unavailable.');
-  points = (await response.text()).trim().split('\n').map(row => row.split(/\s+/).map(Number) as [number, number]);
+  points = (await response.text()).trim().split('\n').map(row => row.trim().split(/\s+/).map(Number) as [number, number]);
   if (points.length !== 980 || points.some(p => p.length !== 2 || !p.every(Number.isFinite))) throw new Error('Invalid whale point asset.');
   try {
     const saved = await library.getHabitat();

@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { createPetRecorder } from '../scripts/lib/pet-recorder.mjs';
 import { compilePetTelemetry, encodePetJSONL, decodePetJSONL, PetLiveTape } from '../dist/core/pet-telemetry.js';
+import { spawnRecorder } from './helpers/recorder-process.mjs';
 
 const empty = compilePetTelemetry([])[0];
 const destination = async () => join(await mkdtemp(join(tmpdir(), 'pet-segment-')), 'pet-state');
@@ -74,13 +75,11 @@ test('ordinary appends refuse an externally replaced live path without overwriti
 });
 
 test('the actual watch CLI keeps recording at one pathname through several rotations and exits cleanly', { timeout: 15_000 }, async t => {
-  const { spawn } = await import('node:child_process');
   const { once } = await import('node:events');
   const { setTimeout: delay } = await import('node:timers/promises');
   const path = await destination(), input = `${path}.source.json`;
   await writeFile(input, JSON.stringify({ schemaVersion: 1, id: 'old', traceId: 'fixture', name: 'bash', category: 'code', startTime: 0, endTime: 1, attributes: {} }));
-  const child = spawn(process.execPath, ['scripts/pet.mjs', `--input=${input}`, `--output=${path}`, '--watch', '--segment-buckets=2'],
-    { cwd: new URL('../', import.meta.url), stdio: ['ignore', 'pipe', 'pipe'] });
+  const child = spawnRecorder([`--input=${input}`, `--output=${path}`, '--watch', '--segment-buckets=2']);
   let log = ''; child.stdout.on('data', b => log += b); child.stderr.on('data', b => log += b);
   const exited = once(child, 'exit');
   t.after(() => { if (child.exitCode === null) child.kill('SIGTERM'); });
@@ -89,8 +88,22 @@ test('the actual watch CLI keeps recording at one pathname through several rotat
     try { if (decodePetJSONL(await readFile(path, 'utf8')).length >= 1 && (await stat(part(path, 3))).size) break; } catch { /* Wait for the next complete segment. */ }
     await delay(25);
   }
-  child.kill('SIGINT'); const [code] = await exited; assert.equal(code, 0, log);
+  child.stopRecorder(); const [code] = await exited; assert.equal(code, 0, log);
   for (let i = 1; i <= 3; i++) assert.equal(decodePetJSONL(await readFile(part(path, i), 'utf8')).length, 2);
   assert.ok(decodePetJSONL(await readFile(path, 'utf8')).length >= 1);
   assert.match(log, /Archived pet recording:/);
+});
+
+test('a post-publication error preserves correct row accounting and allows the next distinct append', async () => {
+  const path = await destination(); let reports = 0;
+  const writer = await createPetRecorder(path, { maxBuckets: 1, report: () => { if (++reports === 1) throw new Error('report boom'); } });
+  try {
+    await writer.append(empty);
+    await assert.rejects(writer.append({ ...empty, channel: 'code' }), /report boom/);
+    assert.equal(decodePetJSONL(await readFile(path, 'utf8'))[0].channel, 'code', 'The new row was already durably published');
+    await writer.append({ ...empty, channel: 'human' });
+    assert.equal(decodePetJSONL(await readFile(part(path, 1), 'utf8'))[0].channel, 'other');
+    assert.equal(decodePetJSONL(await readFile(part(path, 2), 'utf8'))[0].channel, 'code');
+    assert.equal(decodePetJSONL(await readFile(path, 'utf8'))[0].channel, 'human');
+  } finally { await writer.close(); }
 });

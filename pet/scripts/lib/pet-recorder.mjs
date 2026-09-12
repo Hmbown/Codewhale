@@ -1,4 +1,5 @@
 import { open, link, rename, unlink, lstat } from 'node:fs/promises';
+import { constants } from 'node:fs';
 import { dirname, basename, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { PET_BIN_MS, validatePetBucket, encodePetJSONL } from '../../dist/core/pet-telemetry.js';
@@ -40,19 +41,31 @@ export async function createPetRecorder(path, { maxBuckets = 216_000, maxBytes =
           let next, installed = false, created = false;
           try {
             next = await open(temporary, 'wx', 0o600); created = true;
-            await next.writeFile(row); await next.sync(); await output.sync();
+            await next.writeFile(row); await next.sync();
+            const nextIdentity = await next.stat({ bigint: true });
+            await next.close(); next = undefined;
+            await output.sync();
             // link is exclusive: a collision never replaces someone else's
             // archive. Persist this name before replacing the live pathname.
             await link(path, archive); await syncDirectory(dirname(path));
+            // Windows can reject replacement while either writer handle is
+            // open. Both files are synced and the old file is archived first.
+            await output.close(); output = undefined;
             await rename(temporary, path); installed = true;
-            const previous = output; output = next; next = undefined;
-            sequence = 0; bytes = 0; segment++;
-            await previous.close(); await syncDirectory(dirname(path));
+            // The first row is already published. Account for it before any
+            // fallible cleanup/report so a later append sees the actual file.
+            sequence = 1; bytes = size; segment++;
+            output = await open(path, constants.O_WRONLY | constants.O_APPEND);
+            const reopened = await output.stat({ bigint: true });
+            if (reopened.dev !== nextIdentity.dev || reopened.ino !== nextIdentity.ino)
+              throw new Error('The live pet recording was replaced externally after rotation.');
+            await syncDirectory(dirname(path));
             report(`Archived pet recording: ${archive}`);
           } finally {
             await next?.close();
             if (created && !installed) await unlink(temporary);
           }
+          return;
         } else {
           await output.writeFile(row);
         }

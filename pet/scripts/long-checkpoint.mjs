@@ -1,7 +1,7 @@
 import { readFileSync, writeFileSync } from 'node:fs';
 import { PetNative } from '../dist/core/pet-native.js';
 import { compilePetTelemetry, encodePetJSONL } from '../dist/core/pet-telemetry.js';
-const points = readFileSync(new URL('../public/whale-points.tsv', import.meta.url), 'utf8').trim().split('\n').map(l=>l.split(/\s+/).map(Number));
+const points = readFileSync(new URL('../public/whale-points.tsv', import.meta.url), 'utf8').trim().split('\n').map(l=>l.trim().split(/\s+/).map(Number));
 const started = performance.now();
 const tape = compilePetTelemetry([], 7_200_000);
 const pet = new PetNative(JSON.stringify(points), encodePetJSONL(tape));

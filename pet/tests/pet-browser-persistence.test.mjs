@@ -32,7 +32,8 @@ async function browser({ deferFirstSave = true, handle } = {}) {
       return Promise.resolve(saves.length);
     }
   }
-  const points = await readFile(new URL('../public/whale-points.tsv', import.meta.url), 'utf8');
+  // Windows checkouts can use CRLF; exercise that asset in the actual controller.
+  const points = (await readFile(new URL('../public/whale-points.tsv', import.meta.url), 'utf8')).replace(/\r?\n/g, '\r\n');
   // Imports bind to the real core above, while the controller body stays intact.
   const controller = (await readFile(new URL('../dist/ui/pet.js', import.meta.url), 'utf8')).replace(/^import .*;\r?\n/gm, '');
   const environment = { ...world, ...telemetry, ...demo, ...ingest, ...sim, ...audio, TraceLibrary,

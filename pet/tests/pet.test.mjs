@@ -8,7 +8,7 @@ import { renderPetPCM } from '../dist/core/pet-audio.js';
 import { petDemoEvents } from '../dist/core/pet-demo.js';
 import { importTrace } from '../dist/core/ingest.js';
 
-const points = readFileSync(new URL('../public/whale-points.tsv', import.meta.url), 'utf8').trim().split('\n').map(row => row.split(/\s+/).map(Number));
+const points = readFileSync(new URL('../public/whale-points.tsv', import.meta.url), 'utf8').trim().split('\n').map(row => row.trim().split(/\s+/).map(Number));
 const event = (overrides = {}) => ({ schemaVersion: 1, id: 'e', traceId: 't', startTime: 0, endTime: 400,
   agentId: 'parent', category: 'tool', name: 'work', status: 'success', attributes: {}, ...overrides });
 

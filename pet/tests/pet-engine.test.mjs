@@ -6,7 +6,7 @@ import { PetNative } from '../dist/core/pet-native.js';
 import { compilePetTelemetry, encodePetJSONL } from '../dist/core/pet-telemetry.js';
 import { petDemoEvents } from '../dist/core/pet-demo.js';
 
-const points = JSON.stringify(readFileSync(new URL('../public/whale-points.tsv', import.meta.url), 'utf8').trim().split('\n').map(row => row.split(/\s+/).map(Number)));
+const points = JSON.stringify(readFileSync(new URL('../public/whale-points.tsv', import.meta.url), 'utf8').trim().split('\n').map(row => row.trim().split(/\s+/).map(Number)));
 test('the incremental bucket range uses the same measured projection as full replay', () => {
   const events = petDemoEvents(), full = compilePetTelemetry(events, 80_000);
   for (let i = 0; i < full.length; i++) assert.deepEqual(compilePetTelemetry(events, 80_000, i)[0], full[i]);
