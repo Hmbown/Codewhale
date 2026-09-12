@@ -16,6 +16,7 @@ pub(crate) mod agent_details;
 pub(crate) mod agent_focus;
 pub(crate) mod agent_roster;
 pub mod ambient_life;
+pub mod pet_watch;
 pub mod app;
 pub mod approval;
 pub mod auto_review;

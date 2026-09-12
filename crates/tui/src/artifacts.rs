@@ -163,14 +163,7 @@ pub fn write_session_relative_immutable(
         session_artifact_absolute_path(session_id, relative_path).ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "invalid session artifact path")
         })?;
-    let root = artifact_sessions_root()
-        .ok_or_else(|| io::Error::other("session artifact root unavailable"))?;
-    std::fs::create_dir_all(&root)?;
-    let destination = crate::fleet::files::WorkspaceFile::open(
-        &root,
-        &PathBuf::from(session_id).join(relative_path),
-        true,
-    )?;
+    let destination = open_session_relative(session_id, relative_path, true)?;
     match destination.publish(content) {
         Ok(()) => {}
         Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
@@ -190,6 +183,28 @@ pub fn write_session_relative_immutable(
         Err(err) => return Err(err),
     }
     Ok(absolute_path)
+}
+
+/// The same confined session directory for mutable sidecars and immutable
+/// artifacts. The saved-session owner remains responsible for session state.
+pub(crate) fn open_session_relative(
+    session_id: &str,
+    relative_path: &Path,
+    create: bool,
+) -> io::Result<crate::fleet::files::WorkspaceFile> {
+    session_artifact_absolute_path(session_id, relative_path).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "invalid session artifact path")
+    })?;
+    let root = artifact_sessions_root()
+        .ok_or_else(|| io::Error::other("session artifact root unavailable"))?;
+    if create {
+        std::fs::create_dir_all(&root)?;
+    }
+    crate::fleet::files::WorkspaceFile::open(
+        &root,
+        &PathBuf::from(session_id).join(relative_path),
+        create,
+    )
 }
 
 pub fn write_session_artifact_immutable(

@@ -67,3 +67,16 @@ caller-assigned `worker_specs` because worker controls address IDs globally.
 Older runtimes that do not expose one of these endpoints produce a
 `RuntimeCapabilityError` with a stable capability string instead of a generic
 fetch failure.
+
+## Read a thread journal
+
+`threadEvents(threadId, { sinceSeq, replayLimit, signal })` reads the existing
+`GET /v1/threads/{id}/events` SSE endpoint. It never creates a thread or starts
+a turn. Pass an `AbortSignal` to close the subscription. Redirects are refused,
+and incomplete or oversized frames fail instead of producing partial records.
+
+The returned `seq` and `previous_seq` belong to Runtime. Keep the last accepted
+`seq` for reconnects; sequence numbers need not be consecutive. Consumers should
+validate the selected thread and predecessor cursor before advancing their own
+read position. Authentication uses the client constructor's existing `token`
+option and stays in the Authorization header.

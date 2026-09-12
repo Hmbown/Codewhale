@@ -721,6 +721,20 @@ fn focus_test_app() -> App {
     app
 }
 
+#[test]
+fn bracketed_paste_returns_watch_focus_to_the_visible_composer() {
+    let mut app = focus_test_app();
+    crate::tui::work_surface::select_dock_panel(
+        &mut app,
+        crate::tui::work_surface::RailPanel::Watch,
+    );
+    assert!(app.work_surface.focused);
+    handle_bracketed_paste(&mut app, "/workbar watch export");
+    assert_eq!(app.input, "/workbar watch export");
+    assert!(!app.work_surface.focused);
+    assert!(app.composer_enter_would_submit());
+}
+
 /// One representative terminal encoding per shell binding.
 fn shell_binding_probe(id: ShellBindingId) -> KeyEvent {
     match id {

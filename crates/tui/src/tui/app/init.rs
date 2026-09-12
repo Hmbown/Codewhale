@@ -731,6 +731,7 @@ impl App {
                 startup_input_unproven: false,
             },
             viewport: ViewportState::default(),
+            pet_watch: crate::tui::pet_watch::PetWatch::default(),
             work_surface: {
                 let mut state = crate::tui::work_surface::WorkSurfaceState::with_layout(
                     work_surface_placement,

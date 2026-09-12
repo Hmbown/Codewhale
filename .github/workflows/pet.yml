@@ -1,0 +1,40 @@
+name: Pet conformance
+
+on:
+  pull_request:
+    paths:
+      - 'pet/**'
+      - 'crates/tui/src/tui/pet_watch/**'
+      - 'crates/tui/src/tui/ambient_life/pet_*'
+      - 'crates/tui/src/tui/ambient_life/whale-points.tsv'
+      - 'npm/runtime-sdk/**'
+      - '.github/workflows/pet.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pet-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  portable:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: pet/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+      - run: npm --prefix pet ci --ignore-scripts
+      - run: npm --prefix pet run check
+      - run: npm --prefix pet run sync
+      - name: Embedded sources match canonical core
+        run: git diff --exit-code -- crates/tui/src/tui/pet_watch/pet-native.js pet/ios/Resources
+      - run: cargo fetch --locked --manifest-path pet/tui/Cargo.toml
+      - name: TypeScript and Rust parity, including reduced motion
+        run: ./pet/verify.sh --no-swift

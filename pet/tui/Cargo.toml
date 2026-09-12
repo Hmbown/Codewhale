@@ -1,0 +1,15 @@
+[package]
+name = "codewhale-pet-tui"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ratatui = "=0.30.2"
+unicode-width = "=0.2.2"
+
+# unicode-width isn't in the offline registry cache; codewhale already vendors
+# a patched 0.2.2, so reuse it verbatim rather than vendoring a second copy.
+[patch.crates-io]
+unicode-width = { path = "../../patches/unicode-width-0.2.2" }
+
+[workspace]

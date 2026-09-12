@@ -1173,6 +1173,7 @@ dependencies = [
  "reqwest 0.13.4",
  "rio-vt",
  "rmcp",
+ "rquickjs",
  "rusqlite",
  "rustls",
  "rusty_alloc-api",

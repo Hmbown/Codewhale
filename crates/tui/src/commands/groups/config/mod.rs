@@ -76,7 +76,7 @@ static RAIL_INFO: CommandInfo = CommandInfo {
     // /rail and /sidebar are the names users already know; both now drive
     // the one workbar.
     aliases: &["rail", "sidebar"],
-    usage: "/workbar [bottom|top|left|right|off|tasks|agents|context|pinned] [--save]",
+    usage: "/workbar [bottom|top|left|right|off|tasks|agents|context|watch|pinned] [--save]",
     description_id: MessageId::CmdSidebarDescription,
 };
 static SETTINGS_INFO: CommandInfo = CommandInfo {

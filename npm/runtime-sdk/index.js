@@ -124,6 +124,26 @@ export class CodeWhaleRuntimeClient {
     }
   }
 
+  /** Read the existing durable thread journal. This never starts a turn. */
+  async *threadEvents(threadId, options = {}) {
+    const query = new URLSearchParams();
+    for (const [key, value] of [["since_seq", options.sinceSeq], ["replay_limit", options.replayLimit]]) {
+      if (value === undefined) continue;
+      if (!Number.isSafeInteger(value) || value < 0) throw new TypeError(`${key} must be a nonnegative safe integer`);
+      query.set(key, String(value));
+    }
+    const path = `/v1/threads/${segment(threadId)}/events?${query}`;
+    const response = await this.#rawRequest(path, {
+      method: "GET", capability: "thread_event_stream", accept: "text/event-stream",
+      signal: options.signal, redirect: "error",
+    });
+    if (!response.body || !/^text\/event-stream(?:;|$)/i.test(response.headers.get("content-type") ?? "")) {
+      await response.body?.cancel();
+      throw new RuntimeApiError("Runtime thread response is not an event stream", { method: "GET", path });
+    }
+    yield* parseEventStream(response.body, { maxFrameChars: 2 * 1024 * 1024, requireBoundary: true });
+  }
+
   async #jsonRequest(path, options = {}) {
     const response = await this.#rawRequest(path, options);
     if (response.status === 204) {
@@ -140,6 +160,8 @@ export class CodeWhaleRuntimeClient {
       headers.set("authorization", `Bearer ${this.token}`);
     }
     const init = { method, headers };
+    if (options.signal) init.signal = options.signal;
+    if (options.redirect) init.redirect = options.redirect;
     if (options.body !== undefined) {
       headers.set("content-type", "application/json");
       init.body = JSON.stringify(options.body);
@@ -205,13 +227,14 @@ async function readErrorBody(response) {
   }
 }
 
-async function* parseEventStream(body) {
-  const decoder = new TextDecoder();
+async function* parseEventStream(body, { maxFrameChars = Infinity, requireBoundary = false } = {}) {
+  const decoder = new TextDecoder("utf-8", { fatal: requireBoundary });
   let buffer = "";
   for await (const chunk of body) {
     buffer += decoder.decode(chunk, { stream: true });
     let boundary;
     while ((boundary = eventStreamBoundary(buffer)) !== null) {
+      if (boundary.index > maxFrameChars) throw new Error("Runtime event frame exceeds the size limit");
       const frame = buffer.slice(0, boundary.index);
       buffer = buffer.slice(boundary.index + boundary.length);
       const event = parseSseFrame(frame);
@@ -219,8 +242,10 @@ async function* parseEventStream(body) {
         yield event;
       }
     }
+    if (buffer.length > maxFrameChars) throw new Error("Runtime event frame exceeds the size limit");
   }
   buffer += decoder.decode();
+  if (requireBoundary && buffer.trim()) throw new Error("Runtime event stream ended inside a frame");
   const event = parseSseFrame(buffer);
   if (event !== undefined) {
     yield event;

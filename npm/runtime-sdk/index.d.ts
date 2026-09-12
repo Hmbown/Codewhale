@@ -299,6 +299,24 @@ export interface RuntimeClientOptions {
   fetch?: typeof fetch;
 }
 
+export interface ThreadRuntimeEvent {
+  schema_version?: number;
+  seq: number;
+  previous_seq?: number;
+  event: string;
+  thread_id: string;
+  turn_id?: string | null;
+  item_id?: string | null;
+  timestamp: string;
+  payload: Record<string, unknown>;
+}
+
+export interface ThreadEventOptions {
+  sinceSeq?: number;
+  replayLimit?: number;
+  signal?: AbortSignal;
+}
+
 export class RuntimeApiError extends Error {
   status?: number;
   method?: string;
@@ -327,6 +345,7 @@ export class CodeWhaleRuntimeClient {
     runId: FleetRunId,
     options?: FleetEventOptions & { path?: string },
   ): AsyncIterable<FleetStreamEvent>;
+  threadEvents(threadId: string, options?: ThreadEventOptions): AsyncIterable<ThreadRuntimeEvent>;
 }
 
 export function createRuntimeClient(options?: RuntimeClientOptions): CodeWhaleRuntimeClient;

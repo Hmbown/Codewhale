@@ -83,6 +83,15 @@ pub fn height(app: &mut App, width: u16, terminal_height: u16, rail_budget: u16)
     let strip = app.work_surface.effective_placement.is_strip();
     let goal_rows = u16::from(strip && top_goal_title(app).is_some());
     let explicit = app.work_surface.explicit_view;
+    if explicit && app.work_surface.panel == RailPanel::Watch && strip {
+        // The selected tank uses the same resize/terminal/transcript budget.
+        let cap = top_cap(app, terminal_height, rail_budget);
+        if cap < 3 {
+            collapse_strip(app);
+            return 0;
+        }
+        return cap;
+    }
     if rows.is_empty() && !explicit {
         // A live goal alone still deserves a strip: title + divider.
         if goal_rows == 0 {

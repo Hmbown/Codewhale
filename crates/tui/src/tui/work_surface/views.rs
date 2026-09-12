@@ -14,7 +14,7 @@ use super::model::{RailPanel, WorkRow, WorkRowId, WorkTone};
 pub(super) const fn view_always_has_content(panel: RailPanel) -> bool {
     matches!(
         panel,
-        RailPanel::Context | RailPanel::Git | RailPanel::Price
+        RailPanel::Context | RailPanel::Git | RailPanel::Price | RailPanel::Watch
     )
 }
 

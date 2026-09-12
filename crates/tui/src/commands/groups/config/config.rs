@@ -613,8 +613,15 @@ pub fn screen(app: &mut App, target: ScreenMode, arg: Option<&str>) -> CommandRe
 /// claim about a surface that cannot render.
 pub fn sidebar(app: &mut App, arg: Option<&str>) -> CommandResult {
     const USAGE: &str =
-        "Usage: /workbar [bottom|top|left|right|off|tasks|agents|context|pinned] [--save]";
+        "Usage: /workbar [bottom|top|left|right|off|tasks|agents|context|watch|pinned] [--save]";
     let raw = arg.map(str::trim).unwrap_or("");
+    if raw.eq_ignore_ascii_case("watch export") {
+        return if app.pet_watch.export() {
+            CommandResult::message(tr(app.ui_locale, MessageId::PetWatchExportQueued))
+        } else {
+            CommandResult::error(tr(app.ui_locale, MessageId::PetWatchExportUnavailable))
+        };
+    }
     let mut tokens = raw.split_whitespace().collect::<Vec<_>>();
     let persist = matches!(tokens.last(), Some(&"--save" | &"-s"));
     if persist {
@@ -654,6 +661,7 @@ pub fn sidebar(app: &mut App, arg: Option<&str>) -> CommandResult {
                 "context" | "session" => Some(crate::tui::work_surface::RailPanel::Context),
                 "git" | "branch" => Some(crate::tui::work_surface::RailPanel::Git),
                 "price" | "cost" => Some(crate::tui::work_surface::RailPanel::Price),
+                "watch" => Some(crate::tui::work_surface::RailPanel::Watch),
                 _ => None,
             };
             match (placement, panel) {

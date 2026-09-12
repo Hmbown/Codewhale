@@ -112,7 +112,9 @@ pub(crate) fn handle_bracketed_paste(app: &mut App, text: &str) {
     } else if !app.view_stack.is_empty() {
         // A non-consumed modal is open — don't leak paste into composer.
     } else {
-        // Paste into main input.
+        // Main-input paste takes the same keyboard ownership as typed text.
+        // Otherwise the visible composer command's Enter stays with the dock.
+        crate::tui::work_surface::release_focus(app);
         app.insert_paste_text(text);
     }
 }

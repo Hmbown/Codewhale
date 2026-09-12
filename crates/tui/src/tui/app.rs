@@ -1457,6 +1457,7 @@ pub struct App {
     /// Ocean work-surface state. Kept separate from transcript/sidebar state
     /// so the replacement shell can be removed or promoted as one unit.
     pub work_surface: crate::tui::work_surface::WorkSurfaceState,
+    pub pet_watch: crate::tui::pet_watch::PetWatch,
     /// Goal sub-state.
     pub goal: HostGoalState,
     /// Session sub-state (cost, tokens, telemetry).

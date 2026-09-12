@@ -1894,6 +1894,46 @@ pub(crate) async fn run_event_loop(
                             .upload_resync_snapshot(&resync_run, &app.api_messages);
                     }
                 }
+                let pet_event_applies = match &event {
+                    EngineEvent::AgentSpawned {
+                        owner_session_id, ..
+                    }
+                    | EngineEvent::AgentProgress {
+                        owner_session_id, ..
+                    }
+                    | EngineEvent::AgentComplete {
+                        owner_session_id, ..
+                    } => event_owner_is_active(app.current_session_id.as_deref(), owner_session_id),
+                    EngineEvent::UserInputRequired { .. } => {
+                        !should_suppress_user_input_prompt(app)
+                    }
+                    EngineEvent::ApprovalRequired {
+                        tool_name,
+                        approval_grouping_key,
+                        approval_key,
+                        approval_force_prompt,
+                        ..
+                    } => {
+                        matches!(
+                            resolve_ui_approval_disposition(
+                                app,
+                                tool_name,
+                                approval_grouping_key,
+                                approval_key,
+                                *approval_force_prompt
+                            ),
+                            crate::core::authority::ApprovalRequestDisposition::Prompt
+                        )
+                    }
+                    _ => true,
+                };
+                if pet_event_applies {
+                    app.pet_watch.observe(
+                        &event,
+                        app.current_session_id.as_deref(),
+                        Instant::now(),
+                    );
+                }
                 record_turn_activity(app, &event, Instant::now());
                 match event {
                     EngineEvent::MessageStarted { .. } => {
@@ -4174,6 +4214,7 @@ pub(crate) async fn run_event_loop(
         }
         maybe_throttled_recovery_snapshot(app, Instant::now(), &mut last_recovery_snapshot_at);
         let history_has_live_motion = history_has_live_motion(&app.history);
+        crate::tui::pet_watch::tick(app, Instant::now(), event_broker.is_paused());
         let active_cell_has_live_motion = active_cell_has_live_motion(app);
         let translation_placeholder_has_live_motion = app.translation_enabled
             && (pending_thinking_translations > 0 || app.streaming_thinking_active_entry.is_some());

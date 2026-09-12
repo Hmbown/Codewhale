@@ -73,11 +73,13 @@ pub enum RailPanel {
     Git,
     /// Session cost, per-agent cost, cache hit %, model rate.
     Price,
+    /// The dot whale, observing the foreground Engine without starting work.
+    Watch,
 }
 
 impl RailPanel {
     /// Cycle order — also the tab order in the dock strip.
-    pub const ORDER: [RailPanel; 8] = [
+    pub const ORDER: [RailPanel; 9] = [
         Self::Tasks,
         Self::Agents,
         Self::Background,
@@ -86,6 +88,7 @@ impl RailPanel {
         Self::Context,
         Self::Git,
         Self::Price,
+        Self::Watch,
     ];
 
     /// Views the dock opens on its own when they have content and the user
@@ -131,6 +134,7 @@ impl RailPanel {
             "context" | "session" => Self::Context,
             "git" | "branch" => Self::Git,
             "price" | "cost" => Self::Price,
+            "watch" => Self::Watch,
             _ => Self::Tasks,
         }
     }
@@ -146,6 +150,7 @@ impl RailPanel {
             Self::Context => "context",
             Self::Git => "git",
             Self::Price => "price",
+            Self::Watch => "watch",
         }
     }
 
@@ -166,6 +171,7 @@ impl RailPanel {
             Self::Context => "CONTEXT",
             Self::Git => "GIT",
             Self::Price => "PRICE",
+            Self::Watch => "WATCH",
         }
     }
 }
@@ -870,7 +876,8 @@ fn view_has_work(app: &mut App, panel: RailPanel) -> bool {
         | RailPanel::Notepad
         | RailPanel::Context
         | RailPanel::Git
-        | RailPanel::Price => false,
+        | RailPanel::Price
+        | RailPanel::Watch => false,
     }
 }
 
@@ -993,6 +1000,7 @@ pub(super) fn visible_rows_for(app: &mut App, panel: RailPanel) -> Vec<WorkRow> 
         RailPanel::Context => super::views::context_rows(app),
         RailPanel::Git => super::views::git_rows(app),
         RailPanel::Price => super::views::price_rows(app),
+        RailPanel::Watch => Vec::new(),
     }
 }
 
