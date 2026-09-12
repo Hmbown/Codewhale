@@ -5152,14 +5152,87 @@ fn patch_undo_helper_restores_only_the_bound_session() -> Result<()> {
     repo.snapshot_with_session("pre-turn:foreign", Some("session-foreign"))?;
     fs::write(&file, "current-after")?;
 
-    let restored = patch_undo_workspace_files(&workspace, Some("session-current"));
+    let restored = patch_undo_workspace_files(&workspace, Some("session-current"), true)
+        .expect("a trusted rollback should succeed");
     assert!(restored.files_restored, "{:?}", restored.summary);
     assert_eq!(fs::read_to_string(&file)?, "current-before");
 
     fs::write(&file, "must-stay")?;
-    let unbound = patch_undo_workspace_files(&workspace, None);
+    let unbound = patch_undo_workspace_files(&workspace, None, true)
+        .expect("an unbound thread has nothing to roll back, which is not a refusal");
     assert!(!unbound.files_restored);
     assert_eq!(fs::read_to_string(&file)?, "must-stay");
+    Ok(())
+}
+
+/// The gate the TUI's `/undo` applies, stated as a contract: an untrusted
+/// thread may not roll files back. When there *is* something to roll back the
+/// whole undo aborts — nothing is changed, and the caller must not fork the
+/// conversation either.
+#[test]
+fn patch_undo_helper_refuses_an_untrusted_rollback_and_touches_nothing() -> Result<()> {
+    let _lock = lock_test_env();
+    let root = tempfile::tempdir()?;
+    let home = root.path().join("home");
+    fs::create_dir_all(&home)?;
+    let _home = EnvVarGuard::set("HOME", &home);
+
+    let workspace = root.path().join("workspace");
+    fs::create_dir_all(&workspace)?;
+    let repo = crate::snapshot::SnapshotRepo::open_or_init(&workspace)?;
+    let file = workspace.join("a.txt");
+
+    fs::write(&file, "before")?;
+    repo.snapshot_with_session("pre-turn:1", Some("session-a"))?;
+    fs::write(&file, "after")?;
+
+    let err = patch_undo_workspace_files(&workspace, Some("session-a"), false)
+        .expect_err("an untrusted rollback must be refused");
+    assert_eq!(err.status, StatusCode::CONFLICT);
+    assert!(
+        err.message.contains("outside trusted mode"),
+        "got: {}",
+        err.message
+    );
+    assert_eq!(
+        fs::read_to_string(&file)?,
+        "after",
+        "a refusal must leave the workspace exactly as it was"
+    );
+
+    // The identical call once trusted performs the rollback.
+    let restored = patch_undo_workspace_files(&workspace, Some("session-a"), true)
+        .expect("a trusted rollback should succeed");
+    assert!(restored.files_restored, "{:?}", restored.summary);
+    assert_eq!(fs::read_to_string(&file)?, "before");
+    Ok(())
+}
+
+/// ...but with provably nothing to roll back, an untrusted undo is still
+/// allowed: the conversation half needs no trust, and skipping it would make
+/// Undo useless in Ask / Auto-Review for no safety gain.
+#[test]
+fn patch_undo_helper_allows_an_untrusted_undo_with_nothing_to_roll_back() -> Result<()> {
+    let _lock = lock_test_env();
+    let root = tempfile::tempdir()?;
+    let home = root.path().join("home");
+    fs::create_dir_all(&home)?;
+    let _home = EnvVarGuard::set("HOME", &home);
+
+    let workspace = root.path().join("workspace");
+    fs::create_dir_all(&workspace)?;
+    let repo = crate::snapshot::SnapshotRepo::open_or_init(&workspace)?;
+    let file = workspace.join("a.txt");
+
+    fs::write(&file, "only-state")?;
+    repo.snapshot_with_session("pre-turn:1", Some("session-a"))?;
+    // Nothing changed after the snapshot, so no target exists.
+
+    let result = patch_undo_workspace_files(&workspace, Some("session-a"), false)
+        .expect("nothing to roll back is not a refusal");
+    assert!(!result.files_restored);
+    assert!(result.summary.is_some());
+    assert_eq!(fs::read_to_string(&file)?, "only-state");
     Ok(())
 }
 
