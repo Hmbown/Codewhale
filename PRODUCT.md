@@ -83,7 +83,7 @@ facts rather than be inferred from the local client's capabilities.
   directory. The embedded client uses the same whale artwork. Do not redraw
   or regenerate brand art as part of a layout change.
 - Palette, type, shell direction, and the anti-slop rules are recorded in
-  `DESIGN.md`; the colour tokens are owned by `crates/tui/src/palette/tokens.rs`
+  `DESIGN.md`; the colour tokens are owned by `crates/palette/src/tokens.rs`
   and exported to `web/app/tokens.css`.
 
 ## Evidence on Hand

@@ -13,7 +13,9 @@ colors:
   brand-cyan: "#78bce8"
   ombre-start: "#1535B2"
   ombre-end: "#6AA6DC"
-  # the sheet — crates/tui/src/palette/tokens.rs, exported to web/app/tokens.css (generated, never hand-edit)
+  mark-start: "#264CBA"
+  mark-end: "#4F83CE"
+  # the sheet — crates/palette/src/tokens.rs, exported to web/app/tokens.css (generated, never hand-edit)
   paper: "#f6f2e8"          # WHALE_TEXT_BODY, Whale Ivory — the page above the waterline
   paper-deep: "#e8eef8"     # LIGHT_ELEVATED — the shallows; cards and code-adjacent plates
   paper-card: "#fffdf8"     # LIGHT_PANEL — a raised sheet on the paper
@@ -99,18 +101,15 @@ components:
     backgroundColor: "{colors.action-deep}"
     textColor: "{colors.paper}"
     rounded: "{rounded.sm}"
-    padding: "12px 22px"
+    padding: "0.7rem 1.35rem"
     typography: "{typography.body}"
   button-secondary:
     backgroundColor: "transparent"
     textColor: "{colors.action-deep}"
-    border: "1px solid {colors.action-deep}"
     rounded: "{rounded.sm}"
   terminal-plate:
     backgroundColor: "{colors.bg}"
-    border: "1px solid rgb(221 238 249 / 0.22)"
     rounded: "{rounded.plate}"
-    shadow: "0 30px 60px -24px rgb(7 12 29 / 0.75)"
   nav:
     backgroundColor: "rgb(246 242 232 / 0.94)"
     textColor: "{colors.ink}"
@@ -143,8 +142,9 @@ Hard rules, not taste notes.
    like an ink wash, with a few fine current lines. No photographs of water,
    no stock imagery, no second illustration, no turbulence or grain filters.
    The strata are geometry drawn from tokens — never a hex of their own.
-2. **No gradients as decoration elsewhere.** The ombre `#1535B2 → #6AA6DC`
-   lives in the mark, the wordmark, and the water. The ocean column's field is
+2. **No gradients as decoration elsewhere.** Preserve approved brand art:
+   the transparent mark uses `#264CBA → #4F83CE`; the water's palette runs
+   from cobalt `#1535B2` to blue `#6AA6DC`. The ocean column's field is
    the TUI's own chrome → bg descent; no spotlight glows, gradient text, or
    gradient rules on paper.
 3. **One shadow.** The terminal plate at the waterline casts one soft, offset,
@@ -166,7 +166,7 @@ Hard rules, not taste notes.
 
 ## Colors
 
-One palette, owned by `crates/tui/src/palette/tokens.rs` and exported to
+One palette, owned by `crates/palette/src/tokens.rs` and exported to
 `web/app/tokens.css` by `scripts/export-design-tokens.py` — both the
 `WHALE_*` dark tokens (`--whale-*`) and the Blue Stage light preset's
 `LIGHT_*` tokens (`--light-*`). `web/app/globals.css` maps them to the site's
@@ -192,7 +192,7 @@ semantic names and never repeats a hex:
 Three faces with distinct roles:
 
 - **Newsreader 400/500 (+ italic)** — the display voice: `h1`, `h2`, the
-  gain columns' titles, the chapter title on the water. Book weight, tracking
+  gain columns' titles, and section titles on the water. Book weight, tracking
   −0.022em, `text-wrap: balance`. Loaded through `next/font/google` as
   `--font-serif`. Never used below 1.3rem.
 - **Shannon Sans variable 100–900** — body, buttons, links and small headings.
@@ -241,7 +241,7 @@ gated on `prefers-reduced-motion: no-preference`. No scroll-reveal.
 
 ## Components
 
-- **Nav**: paper at 94%, hairline below. Left: navy mark + navy wordmark as
+- **Nav**: paper at 94%, hairline below. Left: transparent gradient mark + navy wordmark as
   one link. Centre: Product · Models · Pricing · Docs. Right: theme (docs
   only), locale, stars, Sign in / Create account, one filled Install button.
   The compact sheet adds Start · Install · FAQ · Community · Contribute.

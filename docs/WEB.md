@@ -40,16 +40,17 @@ weaken the configured approval and sandbox policies.
 ## Working in the browser
 
 Search recent threads or preview saved sessions from the history rail. Saved
-previews are read-only until you choose to resume. When creating a thread, use
-the searchable provider and model picker; it selects from the Runtime's catalog
-and does not configure provider credentials. Starter prompts fill the composer
+previews are read-only until you choose to resume. When creating a thread,
+choose a provider, then search its model catalog. This does not configure
+provider credentials. Starter prompts fill the composer
 for review before you send. Finished fenced code blocks have a Copy button;
 other message text remains literal. The sidebar also switches light and dark
-themes, and Latest returns to the newest message after you scroll back.
+themes, and **Back to latest** returns to the newest message after you scroll back.
 
 Unsent drafts are kept per thread in this tab's session storage so they survive
-a reload. Storage is bounded and best effort; when unavailable or full, drafts
-remain in memory and cannot be guaranteed after a reload. The theme preference
+a reload. Storage retains at most the 50 most recent drafts and is best effort;
+when unavailable, full, or given an oversized draft payload, drafts remain in
+memory and cannot be guaranteed after a reload. The theme preference
 uses local storage. The client does not put Runtime tokens or configured
 provider credentials in either store.
 
