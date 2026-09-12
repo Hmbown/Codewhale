@@ -761,6 +761,8 @@ struct AutomationRunsQuery {
 struct ThreadEventsQuery {
     since_seq: Option<u64>,
     replay_limit: Option<usize>,
+    #[serde(default)]
+    progress: bool,
 }
 
 const DEFAULT_FLEET_EVENT_REPLAY_LIMIT: usize = 250;
@@ -5140,7 +5142,7 @@ async fn stream_thread_events(
     State(state): State<RuntimeApiState>,
     Path(id): Path<String>,
     Query(query): Query<ThreadEventsQuery>,
-) -> Result<Sse<impl futures_util::Stream<Item = Result<SseEvent, Infallible>>>, ApiError> {
+) -> Result<Response, ApiError> {
     let _ = state
         .runtime_threads
         .get_thread(&id)
@@ -5171,13 +5173,32 @@ async fn stream_thread_events(
         replay.base_seq,
         replay.batches,
         live,
+        query.progress,
     );
 
-    Ok(Sse::new(stream).keep_alive(
-        KeepAlive::new()
-            .interval(Duration::from_secs(15))
-            .text("keepalive"),
-    ))
+    let mut response = Sse::new(stream)
+        .keep_alive(
+            KeepAlive::new()
+                .interval(Duration::from_secs(15))
+                .text("keepalive"),
+        )
+        .into_response();
+    if query.progress {
+        response
+            .headers_mut()
+            .insert("x-codewhale-event-progress", HeaderValue::from_static("1"));
+    }
+    Ok(response)
+}
+
+fn thread_stream_progress(thread_id: &str, seq: u64, live: bool) -> SseEvent {
+    sse_json(
+        "stream.progress",
+        json!({
+            "event": "stream.progress", "thread_id": thread_id, "seq": seq,
+            "state": if live { "live" } else { "replaying" },
+        }),
+    )
 }
 
 fn replay_live_thread_events(
@@ -5188,8 +5209,10 @@ fn replay_live_thread_events(
         std::result::Result<Vec<crate::runtime_threads::RuntimeEventRecord>, String>,
     >,
     mut live: tokio::sync::broadcast::Receiver<crate::runtime_threads::RuntimeEventRecord>,
+    progress: bool,
 ) -> impl futures_util::Stream<Item = Result<SseEvent, Infallible>> {
     stream! {
+        if progress { yield Ok(thread_stream_progress(&thread_id, last_seq, false)); }
         while let Some(batch) = backlog.recv().await {
             let events = match batch {
                 Ok(events) => events,
@@ -5217,8 +5240,26 @@ fn replay_live_thread_events(
             }
         }
 
+        // Backlog completion alone is insufficient: a request may have been
+        // answered while history was read. Drain the already-queued live tail
+        // before declaring the observation current. These opt-in frames carry
+        // transport progress, never new journal events or sequence numbers.
+        let mut replaying = progress;
         'live: loop {
-            match live.recv().await {
+            let next = if replaying {
+                use tokio::sync::broadcast::error::{RecvError, TryRecvError};
+                match live.try_recv() {
+                    Ok(event) => Ok(event),
+                    Err(TryRecvError::Empty) => {
+                        yield Ok(thread_stream_progress(&thread_id, last_seq, true));
+                        replaying = false;
+                        continue;
+                    }
+                    Err(TryRecvError::Lagged(skipped)) => Err(RecvError::Lagged(skipped)),
+                    Err(TryRecvError::Closed) => Err(RecvError::Closed),
+                }
+            } else { live.recv().await };
+            match next {
                 Ok(event) => {
                     if event.thread_id != thread_id || event.seq <= last_seq {
                         continue;
@@ -5232,6 +5273,10 @@ fn replay_live_thread_events(
                     ));
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                    if progress {
+                        yield Ok(thread_stream_progress(&thread_id, last_seq, false));
+                        replaying = true;
+                    }
                     // Broadcast is only a wake-up path; durable history remains
                     // authoritative. Catch up from the last delivered cursor so
                     // receiver pressure cannot turn into a silent prompt loss.

@@ -14,7 +14,8 @@ test('Runtime consumes more than 250000 records across a day while retaining cur
   const server = createServer(async (_req, res) => {
     response = res;
     const closed = new AbortController(); res.once('close', () => closed.abort());
-    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.writeHead(200, { 'content-type': 'text/event-stream', 'x-codewhale-event-progress': '1' });
+    res.write(`data: ${JSON.stringify({ event: 'stream.progress', state: 'replaying', thread_id: 'long-fixture', seq: 0 })}\n\n`);
     try {
       for (let first = 1; first <= total; first += 128) {
         let block = '';
@@ -25,6 +26,7 @@ test('Runtime consumes more than 250000 records across a day while retaining cur
         }
         if (!res.write(block)) await once(res, 'drain', { signal: closed.signal });
       }
+      res.write(`data: ${JSON.stringify({ event: 'stream.progress', state: 'live', thread_id: 'long-fixture', seq: total })}\n\n`);
     } catch (error) { if (!closed.signal.aborted) serverError = error; }
     // Keep the final cursor healthy, including the still-open human request.
   });
@@ -35,7 +37,7 @@ test('Runtime consumes more than 250000 records across a day while retaining cur
   });
   transport = await followRuntime({ baseUrl: `http://127.0.0.1:${server.address().port}`, threadId: 'long-fixture', report: text => reports.push(text) });
   const deadline = Date.now() + 50_000;
-  while (transport.cursor < total && Date.now() < deadline && !reports.some(text => text.includes('stopped'))) await delay(20);
+  while ((transport.cursor < total || !transport.connected) && Date.now() < deadline && !reports.some(text => text.includes('stopped'))) await delay(20);
   assert.equal(serverError, undefined);
   assert.equal(transport.cursor, total, reports.join('\n'));
   assert.equal(transport.connected, true);

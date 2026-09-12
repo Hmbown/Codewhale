@@ -311,6 +311,14 @@ export interface ThreadRuntimeEvent {
   payload: Record<string, unknown>;
 }
 
+/** Transport progress at the existing journal cursor; never a new event. */
+export interface ThreadStreamProgress {
+  event: "stream.progress";
+  thread_id: string;
+  seq: number;
+  state: "replaying" | "live";
+}
+
 export interface ThreadEventOptions {
   sinceSeq?: number;
   replayLimit?: number;
@@ -345,7 +353,9 @@ export class CodeWhaleRuntimeClient {
     runId: FleetRunId,
     options?: FleetEventOptions & { path?: string },
   ): AsyncIterable<FleetStreamEvent>;
-  threadEvents(threadId: string, options?: ThreadEventOptions): AsyncIterable<ThreadRuntimeEvent>;
+  threadEvents(threadId: string, options: ThreadEventOptions & { includeProgress: true }): AsyncIterable<ThreadRuntimeEvent | ThreadStreamProgress>;
+  threadEvents(threadId: string, options?: ThreadEventOptions & { includeProgress?: false }): AsyncIterable<ThreadRuntimeEvent>;
+  threadEvents(threadId: string, options: ThreadEventOptions & { includeProgress: boolean }): AsyncIterable<ThreadRuntimeEvent | ThreadStreamProgress>;
 }
 
 export function createRuntimeClient(options?: RuntimeClientOptions): CodeWhaleRuntimeClient;

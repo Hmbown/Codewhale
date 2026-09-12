@@ -105,6 +105,12 @@ a stopped live recorder at its existing path. Optional authentication
 comes from `CODEWHALE_RUNTIME_TOKEN`; tokens are rejected in URLs. Only plain
 HTTP loopback IP origins are accepted. Redirects, invalid envelopes and cursor
 holes are rejected; reconnects resume from the last accepted Runtime cursor.
+The recorder requests the Runtime stream's opt-in replay-progress capability.
+It remains unknown until durable replay and the queued live tail have drained;
+receiving the first historical event does not make it current. Broadcast-lag
+recovery returns the stream to replaying. Older Runtime/SDK combinations without
+this capability stop input explicitly and leave the recording unobserved; use
+the Runtime built from this source alongside the recorder.
 The recorder seals the preceding observation interval against a fixed clock.
 It retains request lifetimes and counts a delayed error once at receipt time.
 Raw prompts, arguments, results and tokens do not enter the pet recording.

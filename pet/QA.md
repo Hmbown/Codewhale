@@ -222,3 +222,38 @@ The fixture also waits for CLI readiness before shutdown: the archive link may
 appear before replacement and before the signal handler is installed. A broad
 local run exposed this early-stop race after the IPC fix. Production recorder
 and native bundle bytes are unchanged in this follow-up.
+
+
+## Runtime replay-to-live handoff — September 12, 2026
+
+An old human request must stay unknown while its journal answer is still in the
+replay backlog. The Runtime event endpoint now offers opt-in `stream.progress`
+frames and advertises that capability. It declares live observation only after
+both durable replay and the queued live tail have drained; broadcast lag returns
+the stream to replaying while durable history catches up. These frames are
+transport metadata, not journal events, and allocate no new sequence numbers.
+Default SDK callers keep the existing event-only stream.
+
+The pet requires that explicit handoff. Journal packets alone cannot establish
+current observation. An older Runtime or SDK without progress support stops
+input with a clear diagnostic and leaves the recorder unknown. In particular,
+the earlier read-only Runtime 0.9.13 receipt above is historical evidence, not
+compatibility evidence for this new live transport.
+
+The local pet check passed 63 tests, with zero failures or cancellations. The
+required `npm test && npm run check:web` gate passed 66 package, 14 SDK and 446
+web tests; web checks reported zero errors and two existing warnings. Three
+actual Runtime Rust tests passed for opt-in endpoint negotiation, queued answers
+at handoff, and broadcast-lag recovery; the existing event-only handoff test also
+passed. The TypeScript SDK declarations passed their compiler check.
+
+A real loopback HTTP fixture delays a 60-second-old request's answer. The
+published `c342329f` transport marks that pending historical request current;
+the corrected transport keeps it unknown. Further fixtures verify that the old
+answer arrives before readiness, a fresh request becomes visible, replay reentry
+suppresses observation, and unsupported streams cancel before accepting input.
+The 260,001-record bounded-input fixture still passes with readiness markers.
+These are synthetic event fixtures with real transports, not provider calls.
+
+World, score and native bundle bytes are unchanged. Hosted CI, independent
+Codewhalebot QA, and active-session native delivery remain separate evidence.

@@ -132,6 +132,9 @@ export class CodeWhaleRuntimeClient {
       if (!Number.isSafeInteger(value) || value < 0) throw new TypeError(`${key} must be a nonnegative safe integer`);
       query.set(key, String(value));
     }
+    if (options.includeProgress !== undefined && typeof options.includeProgress !== "boolean")
+      throw new TypeError("includeProgress must be a boolean");
+    if (options.includeProgress) query.set("progress", "true");
     const path = `/v1/threads/${segment(threadId)}/events?${query}`;
     const response = await this.#rawRequest(path, {
       method: "GET", capability: "thread_event_stream", accept: "text/event-stream",
@@ -140,6 +143,10 @@ export class CodeWhaleRuntimeClient {
     if (!response.body || !/^text\/event-stream(?:;|$)/i.test(response.headers.get("content-type") ?? "")) {
       await response.body?.cancel();
       throw new RuntimeApiError("Runtime thread response is not an event stream", { method: "GET", path });
+    }
+    if (options.includeProgress && response.headers.get("x-codewhale-event-progress") !== "1") {
+      await response.body.cancel();
+      throw new RuntimeCapabilityError("thread_event_progress", "Runtime does not support thread replay progress", { method: "GET", path, status: 501 });
     }
     yield* parseEventStream(response.body, { maxFrameChars: 2 * 1024 * 1024, requireBoundary: true });
   }

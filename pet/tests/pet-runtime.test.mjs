@@ -22,9 +22,10 @@ test('Runtime shutdown closes an idle SSE body after garbage collection', { time
   const server = createServer((req, res) => {
     response = res;
     res.once('close', () => { closed = true; });
-    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.writeHead(200, { 'content-type': 'text/event-stream', 'x-codewhale-event-progress': '1' });
     res.write(`data: ${JSON.stringify({ seq: 1, previous_seq: 0, event: 'thread.updated',
       thread_id: 'fixture', timestamp: new Date().toISOString(), payload: {} })}\n\n`);
+    res.write(`data: ${JSON.stringify({ event: 'stream.progress', state: 'live', thread_id: 'fixture', seq: 1 })}\n\n`);
     // Stay open without new chunks: cancellation must wake the idle reader.
   });
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
@@ -65,9 +66,10 @@ test('the CLI follows real Runtime SSE envelopes through disconnect and cursor r
   };
   const server = createServer((req, res) => {
     requests.push({ method: req.method, url: req.url, authorization: req.headers.authorization });
-    res.writeHead(200, { 'content-type': 'text/event-stream' }); res.flushHeaders(); responses.add(res);
+    res.writeHead(200, { 'content-type': 'text/event-stream', 'x-codewhale-event-progress': '1' }); res.flushHeaders(); responses.add(res);
     res.on('close', () => responses.delete(res));
     const connection = ++connections;
+    res.write(`data: ${JSON.stringify({ event: 'stream.progress', state: 'live', thread_id: 'fixture-thread', seq: Number(new URL(req.url, 'http://local').searchParams.get('since_seq')) })}\n\n`);
     if (connection === 1) { stream = res; emit(res, 'bash'); pulse = setInterval(() => emit(res, 'bash'), 120); }
     else if (connection === 2) {
       // Reject a hole; the next reconnect must request the same last cursor.
@@ -115,7 +117,8 @@ test('live Runtime recording retains human waits and a brief late failure exactl
   const timers = [], requests = [];
   const server = createServer((req, res) => {
     requests.push({ method: req.method, url: req.url }); response = res;
-    res.writeHead(200, { 'content-type': 'text/event-stream' }); res.flushHeaders();
+    res.writeHead(200, { 'content-type': 'text/event-stream', 'x-codewhale-event-progress': '1' }); res.flushHeaders();
+    res.write(`data: ${JSON.stringify({ event: 'stream.progress', state: 'live', thread_id: 'fixture-thread', seq: 0 })}\n\n`);
     const oldStart = new Date(Date.now() - 20_000).toISOString(), oldEnd = new Date(Date.now() - 16_000).toISOString();
     const emit = (event, payload) => {
       const previous_seq = sequence; sequence++;
@@ -157,4 +160,64 @@ test('live Runtime recording retains human waits and a brief late failure exactl
   assert.ok(tape.slice(-2).every(b => !b.waiting && !b.observed));
   assert.doesNotMatch(text + log, /fixture-private-question|fixture-private-result|fixture-private-answer/);
   assert.ok(requests.every(r => r.method === 'GET' && r.url.startsWith('/v1/threads/fixture-thread/events?')));
+});
+
+
+test('replayed requests remain unknown until catch-up, including reentry to replay after a live connection', { timeout: 10_000 }, async t => {
+  let response, input, sequence = 0;
+  const requests = [], reports = [];
+  const server = createServer((req, res) => {
+    requests.push(req.url); response = res;
+    res.writeHead(200, { 'content-type': 'text/event-stream', 'x-codewhale-event-progress': '1' }); res.flushHeaders();
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  t.after(async () => { await input?.close(); response?.destroy(); server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); });
+  input = await followRuntime({ baseUrl: `http://127.0.0.1:${server.address().port}`, threadId: 'fixture', report: text => reports.push(text) });
+  const wait = async predicate => {
+    for (let n = 0; n < 250 && !predicate(); n++) await delay(10);
+    assert.ok(predicate(), reports.join('\n'));
+  };
+  await wait(() => response);
+  const write = packet => response.write('data: ' + JSON.stringify(packet) + '\n\n');
+  const progress = state => write({ event: 'stream.progress', thread_id: 'fixture', seq: sequence, state });
+  const event = (event, payload, age = 0) => write({ seq: ++sequence, previous_seq: sequence - 1,
+    event, thread_id: 'fixture', turn_id: 'turn-a', timestamp: new Date(Date.now() - age).toISOString(), payload });
+  progress('replaying'); event('user_input.required', { id: 'settled-old-request' }, 60_000);
+  await wait(() => input.cursor === 1);
+  assert.equal(input.connected, false); assert.equal(input.snapshot(), undefined);
+  // Simulate a slow backlog while the 400 ms recorder clock could run.
+  await delay(450); assert.equal(input.snapshot(), undefined);
+  event('user_input.answered', { id: 'settled-old-request' }, 50_000); progress('live');
+  await wait(() => input.connected);
+  assert.equal(input.snapshot(), undefined, 'A historical answer must arrive before old pending input can become current');
+  event('user_input.required', { id: 'fresh-request' }); await wait(() => input.cursor === 3);
+  const { compilePetTelemetry } = await import('../dist/core/pet-telemetry.js');
+  let snapshot = input.snapshot(Date.now() + 400);
+  assert.ok(compilePetTelemetry(snapshot.events, snapshot.duration).some(b => b.waiting && b.observed === 1));
+  progress('replaying'); await wait(() => !input.connected); assert.equal(input.snapshot(), undefined);
+  event('user_input.answered', { id: 'fresh-request' }); await wait(() => input.cursor === 4);
+  assert.equal(input.snapshot(), undefined, 'Journal data alone cannot establish readiness');
+  progress('live'); await wait(() => input.connected);
+  snapshot = input.snapshot(Date.now() + 800);
+  assert.ok(!snapshot || !compilePetTelemetry(snapshot.events, snapshot.duration).at(-1).waiting);
+  assert.equal(requests.length, 1); assert.equal(new URL(requests[0], 'http://local').searchParams.get('progress'), 'true');
+  assert.deepEqual(reports, []);
+});
+
+test('a Runtime without replay progress stops explicitly before any old request becomes current', { timeout: 5000 }, async t => {
+  let response, input, closed = false;
+  const reports = [];
+  const server = createServer((_req, res) => {
+    response = res; res.once('close', () => { closed = true; });
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.write('data: ' + JSON.stringify({ seq: 1, event: 'user_input.required', thread_id: 'fixture', timestamp: new Date().toISOString(), payload: { id: 'old' } }) + '\n\n');
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  t.after(async () => { await input?.close(); response?.destroy(); server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); });
+  input = await followRuntime({ baseUrl: `http://127.0.0.1:${server.address().port}`, threadId: 'fixture', report: text => reports.push(text) });
+  for (let n = 0; n < 200 && !reports.length; n++) await delay(10);
+  assert.match(reports.join('\n'), /stopped.*replay-progress support/);
+  assert.equal(input.connected, false); assert.equal(input.cursor, 0); assert.equal(input.snapshot(), undefined);
+  for (let n = 0; n < 100 && !closed; n++) await delay(10);
+  assert.ok(closed);
 });

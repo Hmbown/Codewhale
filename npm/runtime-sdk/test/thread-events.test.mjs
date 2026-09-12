@@ -2,13 +2,13 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { CodeWhaleRuntimeClient } from '../index.js';
 
-function clientFor(chunks, inspect = () => {}) {
+function clientFor(chunks, inspect = () => {}, headers = {}) {
   return new CodeWhaleRuntimeClient({ token: 'fixture-token', fetch: async (url, init) => {
     inspect(url, init);
     return new Response(new ReadableStream({ start(controller) {
       for (const chunk of chunks) controller.enqueue(new TextEncoder().encode(chunk));
       controller.close();
-    } }), { headers: { 'content-type': 'text/event-stream; charset=utf-8' } });
+    } }), { headers: { 'content-type': 'text/event-stream; charset=utf-8', ...headers } });
   } });
 }
 const collect = async stream => { const out = []; for await (const value of stream) out.push(value); return out; };
@@ -35,4 +35,21 @@ test('thread stream rejects invalid cursor arguments and a JSON response', async
     await assert.rejects(collect(clientFor([]).threadEvents('t', { sinceSeq })), /safe integer/);
   const client = new CodeWhaleRuntimeClient({ fetch: async () => new Response('{}', { headers: { 'content-type': 'application/json' } }) });
   await assert.rejects(collect(client.threadEvents('t')), /not an event stream/);
+});
+
+
+test('thread progress is explicitly requested and remains separate from journal records at the same cursor', async () => {
+  const progress = { event: 'stream.progress', state: 'live', thread_id: 't', seq: 9 };
+  const client = clientFor([`data: ${JSON.stringify(progress)}\n\n`], (url) => {
+    assert.equal(url.searchParams.get('progress'), 'true');
+  }, { 'x-codewhale-event-progress': '1' });
+  assert.deepEqual(await collect(client.threadEvents('t', { sinceSeq: 9, includeProgress: true })), [progress]);
+  await assert.rejects(collect(client.threadEvents('t', { includeProgress: 'yes' })), /boolean/);
+});
+
+test('thread progress fails explicitly and closes the stream when an older Runtime does not advertise it', async () => {
+  let canceled = false;
+  const client = new CodeWhaleRuntimeClient({ fetch: async () => new Response(new ReadableStream({ cancel() { canceled = true; } }), { headers: { 'content-type': 'text/event-stream' } }) });
+  await assert.rejects(collect(client.threadEvents('t', { includeProgress: true })), error => error.capability === 'thread_event_progress' && error.status === 501);
+  assert.equal(canceled, true);
 });

@@ -80,3 +80,19 @@ The returned `seq` and `previous_seq` belong to Runtime. Keep the last accepted
 validate the selected thread and predecessor cursor before advancing their own
 read position. Authentication uses the client constructor's existing `token`
 option and stays in the Authorization header.
+
+
+Consumers that present **current** activity can pass `includeProgress: true`.
+The same endpoint adds `progress=true` and advertises support with
+`x-codewhale-event-progress: 1`. A Runtime without that capability fails
+explicitly; a historical event is not a readiness signal.
+
+Opt-in streams include `{ event: "stream.progress", thread_id, seq, state }`,
+where `state` is `replaying` or `live`. These are transport frames at the existing
+journal cursor, not journal events or new sequence numbers. Initial replay and
+broadcast-lag recovery are `replaying`. The stream becomes `live` only after
+both durable history and the already queued live tail have been drained. A
+request answered during replay therefore settles before readiness is reported.
+Later lag can return the same connection to `replaying`. Consumers should stop
+extending activity while replaying or disconnected and validate the thread and
+cursor. Default streams retain the original event-only contract.

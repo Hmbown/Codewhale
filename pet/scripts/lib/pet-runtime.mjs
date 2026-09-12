@@ -36,13 +36,25 @@ export async function followRuntime({ baseUrl, threadId, token, report = () => {
       client.fetchImpl = async (input, init) => {
         const response = await fetchImpl(input, init);
         if (!response.body || !response.ok) return response;
+        // Also reject an older installed SDK that silently omits the requested
+        // progress option; it must not turn historical packets into live state.
+        if (response.headers.get('x-codewhale-event-progress') !== '1') {
+          await response.body.cancel();
+          const error = new Error('Runtime replay progress is unavailable.'); error.status = 501; throw error;
+        }
         // Cancel the wrapped pipeline too: the original Response can be collected
         // while its idle body is still being read through the replacement below.
         const body = response.body.pipeThrough(new TransformStream({ transform(chunk, controller) { refresh(); controller.enqueue(chunk); } }), { signal });
         return new Response(body, { status: response.status, headers: response.headers });
       };
       try {
-        for await (const record of client.threadEvents(threadId, { sinceSeq: cursor, signal })) {
+        for await (const record of client.threadEvents(threadId, { sinceSeq: cursor, signal, includeProgress: true })) {
+          if (record?.event === 'stream.progress') {
+            if (record.thread_id !== threadId || record.seq !== cursor || !['live', 'replaying'].includes(record.state))
+              throw new Error('Invalid Runtime replay progress.');
+            connected = record.state === 'live';
+            continue;
+          }
           if (!isCodewhaleRuntimeRecord(record) || record.thread_id !== threadId || !Number.isSafeInteger(record.seq) || record.seq < 0)
             throw new Error('Invalid Runtime envelope.');
           if (record.seq <= cursor) continue;
@@ -58,12 +70,12 @@ export async function followRuntime({ baseUrl, threadId, token, report = () => {
             catch (error) { fatal = true; throw error; }
             revision++;
           }
-          cursor = record.seq; connected = true; backoff = 250;
+          cursor = record.seq; backoff = 250;
         }
       } catch (error) {
         if ([400, 401, 403, 404, 405, 501].includes(error.status)) fatal = true;
         if (!shutdown.signal.aborted) report(fatal
-          ? 'Runtime input stopped: check the thread, authentication, SDK support, or retained input limit. Recording remains unobserved.'
+          ? 'Runtime input stopped: check the thread, authentication, SDK/Runtime replay-progress support, or retained input limit. Recording remains unobserved.'
           : 'Runtime input interrupted; recording unobserved gaps while reconnecting from the last cursor.');
       } finally {
         connected = false; clearTimeout(idleTimer); client.fetchImpl = fetchImpl;

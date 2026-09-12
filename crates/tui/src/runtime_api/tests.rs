@@ -4032,6 +4032,7 @@ async fn event_handoff_replays_and_dedupes_interaction_prompts_without_a_gap() -
         initial_seq,
         backlog_rx,
         live,
+        false,
     )
     .take(2);
     let body =
@@ -4054,6 +4055,200 @@ async fn event_handoff_replays_and_dedupes_interaction_prompts_without_a_gap() -
     assert_eq!(rendered.matches("approval-handoff").count(), 1);
     assert_eq!(rendered.matches("input-handoff").count(), 1);
 
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn pet_stream_progress_drains_queued_answers_before_becoming_live() -> Result<()> {
+    let (_addr, runtime_threads, handle) = spawn_test_server()
+        .await?
+        .context("Runtime socket unavailable for pet progress acceptance")?;
+    let thread = runtime_threads
+        .create_thread(CreateThreadRequest::default())
+        .await?;
+    let initial = runtime_threads
+        .events_since(&thread.id, None)?
+        .last()
+        .unwrap()
+        .seq;
+    let live = runtime_threads.subscribe_events();
+    let required = runtime_threads
+        .emit_event_for_test(
+            &thread.id,
+            None,
+            "user_input.required",
+            json!({"id":"old-request"}),
+        )
+        .await?;
+    let backlog = runtime_threads.events_since(&thread.id, Some(initial))?;
+    let (tx, rx) = mpsc::channel(1);
+    tx.send(Ok(backlog)).await?;
+    drop(tx);
+    let answered = runtime_threads
+        .emit_event_for_test(
+            &thread.id,
+            None,
+            "user_input.answered",
+            json!({"id":"old-request"}),
+        )
+        .await?;
+    let stream = replay_live_thread_events(
+        runtime_threads.clone(),
+        thread.id.clone(),
+        initial,
+        rx,
+        live,
+        true,
+    )
+    .take(4);
+    let body = tokio::time::timeout(
+        ci_scaled(Duration::from_secs(2)),
+        axum::body::to_bytes(Sse::new(stream).into_response().into_body(), 64 * 1024),
+    )
+    .await??;
+    let rendered = String::from_utf8(body.to_vec())?;
+    let frames = rendered
+        .split("\n\n")
+        .filter(|s| !s.trim().is_empty())
+        .map(parse_sse_frame)
+        .collect::<Result<Vec<_>>>()?;
+    assert_eq!(frames.len(), 4);
+    assert_eq!(
+        frames[0].1,
+        json!({"event":"stream.progress","thread_id":thread.id,"seq":initial,"state":"replaying"})
+    );
+    assert_eq!(frames[1].1["seq"], required.seq);
+    assert_eq!(frames[2].1["seq"], answered.seq);
+    assert_eq!(
+        frames[3].1,
+        json!({"event":"stream.progress","thread_id":thread.id,"seq":answered.seq,"state":"live"})
+    );
+    assert_eq!(
+        runtime_threads
+            .events_since(&thread.id, Some(initial))?
+            .len(),
+        2,
+        "Progress is not journal data"
+    );
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn pet_stream_progress_is_opt_in_and_advertised_by_the_actual_endpoint() -> Result<()> {
+    let (addr, runtime_threads, handle) = spawn_test_server()
+        .await?
+        .context("Runtime socket unavailable for pet progress acceptance")?;
+    let thread = runtime_threads
+        .create_thread(CreateThreadRequest::default())
+        .await?;
+    let client = crate::tls::reqwest_client();
+    let response = client
+        .get(format!(
+            "http://{addr}/v1/threads/{}/events?progress=true",
+            thread.id
+        ))
+        .send()
+        .await?
+        .error_for_status()?;
+    assert_eq!(
+        response
+            .headers()
+            .get("x-codewhale-event-progress")
+            .unwrap(),
+        "1"
+    );
+    let frame = parse_sse_frame(&read_first_sse_frame(response).await?)?;
+    assert_eq!(frame.0, "stream.progress");
+    assert_eq!(frame.1["state"], "replaying");
+    let response = client
+        .get(format!("http://{addr}/v1/threads/{}/events", thread.id))
+        .send()
+        .await?
+        .error_for_status()?;
+    assert!(
+        response
+            .headers()
+            .get("x-codewhale-event-progress")
+            .is_none()
+    );
+    let frame = parse_sse_frame(&read_first_sse_frame(response).await?)?;
+    assert_eq!(frame.0, "thread.started");
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn pet_stream_progress_returns_to_replay_while_recovering_broadcast_lag() -> Result<()> {
+    let (_addr, runtime_threads, handle) = spawn_test_server()
+        .await?
+        .context("Runtime socket unavailable for pet progress acceptance")?;
+    let thread = runtime_threads
+        .create_thread(CreateThreadRequest::default())
+        .await?;
+    let initial = runtime_threads
+        .events_since(&thread.id, None)?
+        .last()
+        .unwrap()
+        .seq;
+    let (backlog_tx, backlog) = mpsc::channel(1);
+    drop(backlog_tx);
+    let (tx, live) = tokio::sync::broadcast::channel(1);
+    let mut stream = Box::pin(replay_live_thread_events(
+        runtime_threads.clone(),
+        thread.id.clone(),
+        initial,
+        backlog,
+        live,
+        true,
+    ));
+    assert_eq!(
+        sse_frame_payload(stream.next().await.unwrap().unwrap()).await?["state"],
+        "replaying"
+    );
+    assert_eq!(
+        sse_frame_payload(stream.next().await.unwrap().unwrap()).await?["state"],
+        "live"
+    );
+    let required = runtime_threads
+        .emit_event_for_test(
+            &thread.id,
+            None,
+            "user_input.required",
+            json!({"id":"queued-request"}),
+        )
+        .await?;
+    let answered = runtime_threads
+        .emit_event_for_test(
+            &thread.id,
+            None,
+            "user_input.answered",
+            json!({"id":"queued-request"}),
+        )
+        .await?;
+    tx.send(required.clone())?;
+    tx.send(answered.clone())?;
+    let frames = tokio::time::timeout(ci_scaled(Duration::from_secs(2)), async {
+        let mut frames = Vec::new();
+        for _ in 0..4 {
+            frames.push(sse_frame_payload(stream.next().await.unwrap().unwrap()).await?);
+        }
+        Ok::<_, anyhow::Error>(frames)
+    })
+    .await??;
+    assert_eq!(frames[0]["state"], "replaying");
+    assert_eq!(frames[0]["seq"], initial);
+    assert_eq!(frames[1]["seq"], required.seq);
+    assert_eq!(frames[2]["seq"], answered.seq);
+    assert_eq!(frames[3]["state"], "live");
+    assert_eq!(frames[3]["seq"], answered.seq);
+    assert_eq!(
+        runtime_threads
+            .events_since(&thread.id, Some(initial))?
+            .len(),
+        2
+    );
     handle.abort();
     Ok(())
 }
