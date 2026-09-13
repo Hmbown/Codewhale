@@ -672,7 +672,8 @@ accept an empty string to clear a previously-set value. Added in v0.8.10 (#562):
 - `POST /v1/threads/{id}/turns/{turn_id}/interrupt`
 - `POST /v1/threads/{id}/compact` (manual compaction)
 - `POST /v1/threads/{id}/undo` - fork the thread with the last N turns removed (`{"depth": N}`, default 0 = last turn only); returns the forked thread plus `original_user_text` so a GUI can pre-populate the input box
-- `POST /v1/threads/{id}/patch-undo` - snapshot-based file rollback followed by the same fork (`{"depth": N}`); returns `patch_result` (`files_restored`, `summary`, `snapshot_label`) alongside the forked thread
+- `POST /v1/threads/{id}/patch-undo` - snapshot-based whole-workspace rollback followed by the same fork (`{"depth": N}`); returns `patch_result` (`files_restored`, `summary`, `snapshot_label`) alongside the forked thread. See [Workspace restore endpoints](#workspace-restore-endpoints) for the trust, admission and abort rules.
+- `POST /v1/threads/{id}/file-revert` - restore exactly one file from one named snapshot (`{"path", "snapshot_id", "expected_hash"}`); never forks the conversation. See [Workspace restore endpoints](#workspace-restore-endpoints).
 - `POST /v1/threads/{id}/retry` - fork with the last N turns removed and immediately start a new turn (`{"depth": N, "prompt": "..."}`; `prompt` overrides the original user text, which is re-used when omitted)
 
 `POST /v1/threads/{id}/turns` accepts the same optional
@@ -859,7 +860,11 @@ the first returned event advances past exactly the omitted history.
 `/v1/snapshots` lists recent side-git restore points for the runtime workspace.
 `limit` defaults to `20` and must be between `1` and `100`. `POST
 /v1/snapshots/{id}/restore` restores workspace files from the snapshot and
-returns `{"restored": "<snapshot-id>"}`.
+returns `{"restored": "<snapshot-id>"}`. It is the direct operator surface for
+the server's own workspace (the same action as the TUI's `/restore <N>`): it is
+gated by the Runtime API bearer token, not by any thread's trust flag, and it
+is refused with `409` while a turn is active in an overlapping workspace (see
+below). A `pre-restore:` safety snapshot is taken first.
 
 ```json
 [
@@ -870,6 +875,92 @@ returns `{"restored": "<snapshot-id>"}`.
   }
 ]
 ```
+
+### Workspace restore endpoints
+
+Three routes mutate workspace files from side-git snapshots. They share one
+admission rule and one safety net, and they differ in scope and trust.
+
+| Route | Scope | Trust | Forks the thread |
+| --- | --- | --- | --- |
+| `POST /v1/snapshots/{id}/restore` | whole server workspace | bearer token only (operator action) | no |
+| `POST /v1/threads/{id}/patch-undo` | whole thread workspace | thread `trust_mode` or `auto_approve` when files would change | yes |
+| `POST /v1/threads/{id}/file-revert` | exactly one regular file | thread `trust_mode` or `auto_approve`, always | no |
+
+**Admission.** A restore reserves the same admission the Runtime uses for
+config reloads and session checkpoints, so no new turn starts and no saved
+history changes while files are being rewritten. If any thread already has an
+active turn in the same workspace, a nested checkout of it, or a parent of it,
+the request is refused with `409` and the message `already has an active turn`.
+The reservation is owned by the worker performing the Git mutation, so a client
+that disconnects mid-request cannot release it early; the operation completes
+or fails as a whole. Concurrent restores serialize.
+
+**Safety net.** Every restore first records a `pre-restore:<target>` snapshot
+of the current workspace. That label is never a `/undo`, `patch-undo` or
+`file-revert` candidate, so the net does not change what later undos select.
+For `file-revert` the backup is mandatory: if it cannot be written, or the
+requested file is excluded from it (for example by `.gitignore`), the request
+fails and nothing is changed.
+
+**`patch-undo`.** Selects the newest `tool:`/`pre-turn:` snapshot owned by the
+thread's own session whose tree differs from the workspace, restores the whole
+tree from it, then forks the conversation exactly as `/undo` does. `Ok` means
+either files were restored or there was provably nothing to restore (no bound
+session, or no differing session-owned snapshot); `files_restored` says which.
+When there is something to restore and the thread is not trusted, the whole
+undo aborts with `409` and neither files nor conversation change. Snapshot
+repository, listing or comparison failures abort with `500` and preserve the
+conversation, so a turn is never dropped while its file changes stay on disk.
+Depth and history are validated before any file changes. If the fork cannot be
+persisted after files were restored, the response is a `500` that names the
+restored snapshot; the original thread still holds the turn and the
+`pre-restore:` snapshot holds the previous files.
+
+**`file-revert`.** Request body:
+
+```json
+{
+  "path": "src/lib.rs",
+  "snapshot_id": "3f2a…40-or-64 hex…",
+  "expected_hash": "sha256:<64 lowercase hex digits>"
+}
+```
+
+- `path`: workspace-relative, or absolute inside the thread workspace. The
+  name is literal (brackets, spaces and glob characters are filename bytes;
+  Git runs with `--literal-pathspecs`). It must name a regular file: directories,
+  symlinks anywhere in the path, and `.git` components are `400`.
+- `snapshot_id`: the exact `tool:<call_id>` or `pre-turn:<n>` snapshot from the
+  change the user selected. Clients obtain ids from `GET /v1/snapshots` (labels
+  carry the tool call id) and must keep the selected change's identity; the
+  server never picks "the newest snapshot that differs", because an unrelated
+  newer snapshot can erase later user edits while leaving the tool's change.
+- `expected_hash`: `sha256:` of the current file bytes the client displayed,
+  or `absent` when the client saw the file as deleted. It is checked before the
+  safety backup and again immediately before the mutation.
+
+Responses:
+
+- `200 {"path", "action", "snapshot_id", "snapshot_label"}` — `action` is
+  `modified`, `recreated` (file was missing) or `removed` (the snapshot does
+  not contain the file, so the file the tool created is deleted).
+- `400`: malformed `snapshot_id`/`expected_hash`, path outside the workspace,
+  or a path that is not a regular file on either side.
+- `404`: unknown thread.
+- `409`: thread not in trusted mode or Full Access; no bound session; active
+  turn in an overlapping workspace; snapshot unknown, owned by another session
+  or not a restore point (refresh the change record); file already matches the
+  snapshot (nothing to revert); or the file changed after the reviewed
+  `expected_hash` (refresh and review again). Nothing is changed in any of
+  these cases.
+- `422`: missing or mistyped body fields.
+- `500`: Git or filesystem failure; the message says whether the backup was
+  taken.
+
+Capability probe: `GET` on the route returns `405` where the endpoint exists
+and `404` on an older engine; clients treat any non-`404` as available and
+degrade with an explanation otherwise.
 
 **Receipts** (future read-only audit export)
 - Proposed only: `GET /v1/threads/{thread_id}/turns/{turn_id}/receipt`

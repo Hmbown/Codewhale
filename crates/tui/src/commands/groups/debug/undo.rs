@@ -203,10 +203,19 @@ pub fn patch_undo(app: &mut App) -> CommandResult {
     // Pick the newest current-session candidate whose tree differs from the
     // workspace. Skipping identical snapshots makes repeated `/undo` walk
     // backward only inside the proven session boundary.
-    let differs = |s: &&crate::snapshot::Snapshot| {
-        matches!(repo.work_tree_matches_snapshot(&s.id), Ok(false))
-    };
-    let target = candidates.iter().find(differs);
+    let mut target = None;
+    for snapshot in &candidates {
+        match repo.work_tree_matches_snapshot(&snapshot.id) {
+            Ok(false) => {
+                target = Some(snapshot);
+                break;
+            }
+            Ok(true) => {}
+            Err(error) => {
+                return CommandResult::error(format!("Failed to compare snapshot: {error}"));
+            }
+        }
+    }
 
     let Some(target) = target else {
         return CommandResult::message(

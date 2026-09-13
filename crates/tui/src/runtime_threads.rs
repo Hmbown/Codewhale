@@ -4036,6 +4036,17 @@ struct ActiveThreads {
     lru: VecDeque<String>,
 }
 
+pub(crate) struct PreparedThreadFork {
+    source_id: String,
+    target_turn_id: String,
+    depth_from_tail: usize,
+    thread: ThreadRecord,
+    records: Vec<(TurnRecord, Vec<TurnItemRecord>)>,
+    original_user_text: Option<String>,
+    original_images: Vec<codewhale_protocol::runtime::RuntimeImageInput>,
+    max_output_tokens: Option<std::num::NonZeroU32>,
+}
+
 /// Shared ownership of an existing task's join. A canceled drain drops only
 /// its await/lock guard; the unfinished join stays available to the next drain.
 type RuntimeCompletion = Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>;
@@ -7399,6 +7410,58 @@ impl RuntimeThreadManager {
         Arc::clone(&self.config_admission).write_owned().await
     }
 
+    /// Exclude new turns and saved-history/config changes while a restore
+    /// mutates files. Active turns in any overlapping workspace (the same
+    /// tree, a parent or a nested checkout) are rejected instead of raced.
+    /// Callers move the owned guard into the worker that performs the Git
+    /// mutation so client cancellation cannot release it early.
+    pub(crate) async fn workspace_restore_guard(
+        &self,
+        workspace: &Path,
+    ) -> Result<tokio::sync::OwnedRwLockWriteGuard<()>> {
+        let admission = self.session_checkpoint_guard().await;
+        self.reject_active_turns_in_workspace(workspace).await?;
+        Ok(admission)
+    }
+
+    /// Same reservation as [`Self::workspace_restore_guard`], but the thread
+    /// record is read *under* admission so trust, session binding and
+    /// workspace are the values that hold while the restore runs.
+    pub(crate) async fn thread_restore_guard(
+        &self,
+        id: &str,
+    ) -> Result<(tokio::sync::OwnedRwLockWriteGuard<()>, ThreadRecord)> {
+        let admission = self.session_checkpoint_guard().await;
+        let thread = self.get_thread(id).await?;
+        self.reject_active_turns_in_workspace(&thread.workspace)
+            .await?;
+        Ok((admission, thread))
+    }
+
+    /// Lock order: `config_admission` (held by the caller) before `active`,
+    /// matching turn admission and config reload.
+    async fn reject_active_turns_in_workspace(&self, workspace: &Path) -> Result<()> {
+        // A workspace directory that no longer exists cannot host a running
+        // tool; compare the recorded path as-is in that case.
+        let workspace = workspace
+            .canonicalize()
+            .unwrap_or_else(|_| workspace.to_path_buf());
+        let active = self.active.lock().await;
+        for (id, state) in &active.engines {
+            if state.active_turn.is_none() {
+                continue;
+            }
+            let other = self.store.load_thread(id)?.workspace;
+            let other = other.canonicalize().unwrap_or(other);
+            if workspace.starts_with(&other) || other.starts_with(&workspace) {
+                bail!(
+                    "Workspace already has an active turn (thread {id}); wait for it to finish before restoring files"
+                );
+            }
+        }
+        Ok(())
+    }
+
     /// Bind full-fidelity saved history to the exact prefix it covers. Callers
     /// hold session_checkpoint_guard across the snapshot, save and this write.
     pub(crate) async fn set_thread_session_checkpoint(
@@ -7592,6 +7655,17 @@ impl RuntimeThreadManager {
         Vec<codewhale_protocol::runtime::RuntimeImageInput>,
         Option<std::num::NonZeroU32>,
     )> {
+        let prepared = self
+            .prepare_fork_at_user_message(id, depth_from_tail)
+            .await?;
+        self.publish_prepared_fork(prepared).await
+    }
+
+    pub(crate) async fn prepare_fork_at_user_message(
+        &self,
+        id: &str,
+        depth_from_tail: usize,
+    ) -> Result<PreparedThreadFork> {
         let source = self.get_thread(id).await?;
         let source_turns = self.store.list_turns_for_thread(&source.id)?;
 
@@ -7700,26 +7774,46 @@ impl RuntimeThreadManager {
             forked.updated_at = now;
             cloned_records.push((cloned_turn, cloned_items));
         }
-        self.publish_fork(&forked, &cloned_records)?;
+        Ok(PreparedThreadFork {
+            source_id: source.id,
+            target_turn_id,
+            depth_from_tail,
+            thread: forked,
+            records: cloned_records,
+            original_user_text,
+            original_images,
+            max_output_tokens: source_turns[target_turn_idx].max_output_tokens,
+        })
+    }
 
+    pub(crate) async fn publish_prepared_fork(
+        &self,
+        prepared: PreparedThreadFork,
+    ) -> Result<(
+        ThreadRecord,
+        Option<String>,
+        Vec<codewhale_protocol::runtime::RuntimeImageInput>,
+        Option<std::num::NonZeroU32>,
+    )> {
+        self.publish_fork(&prepared.thread, &prepared.records)?;
         self.emit_event(
-            &forked.id,
+            &prepared.thread.id,
             None,
             None,
             "thread.forked",
             json!({
-                "thread": forked,
-                "source_thread_id": source.id,
-                "backtrack_depth_from_tail": depth_from_tail,
-                "dropped_turn_id": target_turn_id,
+                "thread": prepared.thread,
+                "source_thread_id": prepared.source_id,
+                "backtrack_depth_from_tail": prepared.depth_from_tail,
+                "dropped_turn_id": prepared.target_turn_id,
             }),
         )
         .await?;
         Ok((
-            forked,
-            original_user_text,
-            original_images,
-            source_turns[target_turn_idx].max_output_tokens,
+            prepared.thread,
+            prepared.original_user_text,
+            prepared.original_images,
+            prepared.max_output_tokens,
         ))
     }
 

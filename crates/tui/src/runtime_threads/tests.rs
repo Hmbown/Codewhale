@@ -8415,6 +8415,80 @@ async fn update_thread_workspace_rejects_empty_path() -> Result<()> {
     Ok(())
 }
 
+/// Restore admission rejects any active turn whose workspace overlaps the
+/// one about to be mutated: the same tree, a nested checkout, or a parent.
+/// Unrelated workspaces are unaffected, and the thread-scoped guard reads the
+/// record under admission.
+#[tokio::test]
+async fn workspace_restore_guard_rejects_overlapping_active_turns() -> Result<()> {
+    let manager = test_manager(test_runtime_dir())?;
+    let root = std::env::temp_dir().join(format!("codewhale-restore-guard-{}", Uuid::new_v4()));
+    let busy = root.join("busy");
+    let nested = busy.join("nested");
+    let idle = root.join("idle");
+    std::fs::create_dir_all(&nested)?;
+    std::fs::create_dir_all(&idle)?;
+    let thread = manager
+        .create_thread(CreateThreadRequest {
+            workspace: Some(busy.clone()),
+            ..Default::default()
+        })
+        .await?;
+
+    // Nothing is running: both guards are granted and released.
+    drop(manager.workspace_restore_guard(&busy).await?);
+    let (guard, record) = manager.thread_restore_guard(&thread.id).await?;
+    assert_eq!(record.id, thread.id);
+    drop(guard);
+
+    let _harness = install_mock_engine(&manager, &thread.id).await;
+    {
+        let mut active = manager.active.lock().await;
+        let state = active.engines.get_mut(&thread.id).expect("mock engine");
+        state.active_turn = Some(ActiveTurnState {
+            goal_id: None,
+            turn_id: "turn_live".to_string(),
+            interrupt_requested: false,
+            compaction_id: None,
+        });
+    }
+    for workspace in [&busy, &nested, &root] {
+        let err = manager
+            .workspace_restore_guard(workspace)
+            .await
+            .expect_err("overlapping active turn must be rejected");
+        assert!(
+            format!("{err:#}").contains("already has an active turn"),
+            "{}: {err:#}",
+            workspace.display()
+        );
+    }
+    let err = manager
+        .thread_restore_guard(&thread.id)
+        .await
+        .expect_err("the busy thread itself must be rejected");
+    assert!(format!("{err:#}").contains("already has an active turn"));
+    // An unrelated workspace is not blocked by someone else's turn.
+    drop(manager.workspace_restore_guard(&idle).await?);
+    let err = manager
+        .thread_restore_guard("thr_missing")
+        .await
+        .expect_err("unknown thread");
+    assert!(format!("{err:#}").contains("Thread not found"));
+
+    {
+        let mut active = manager.active.lock().await;
+        active
+            .engines
+            .get_mut(&thread.id)
+            .expect("mock engine")
+            .active_turn = None;
+    }
+    drop(manager.workspace_restore_guard(&busy).await?);
+    let _ = std::fs::remove_dir_all(&root);
+    Ok(())
+}
+
 #[tokio::test]
 async fn update_thread_workspace_rejects_active_turn() -> Result<()> {
     let manager = test_manager(test_runtime_dir())?;

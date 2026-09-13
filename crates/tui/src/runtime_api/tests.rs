@@ -5236,6 +5236,21 @@ fn patch_undo_helper_allows_an_untrusted_undo_with_nothing_to_roll_back() -> Res
     Ok(())
 }
 
+fn sha256_of(path: &FsPath) -> String {
+    format!(
+        "sha256:{}",
+        crate::hashing::sha256_hex(fs::read(path).unwrap())
+    )
+}
+
+fn revert_request(path: &str, snapshot_id: &str, expected_hash: &str) -> RevertThreadFileRequest {
+    RevertThreadFileRequest {
+        path: path.to_string(),
+        snapshot_id: snapshot_id.to_string(),
+        expected_hash: expected_hash.to_string(),
+    }
+}
+
 /// The acceptance criterion for per-file revert: restoring one file must not
 /// roll back any other file's turn changes.
 #[test]
@@ -5259,11 +5274,17 @@ fn revert_file_helper_restores_only_the_named_file() -> Result<()> {
     fs::write(&wanted, "wanted-after")?;
     fs::write(&other, "other-after")?;
 
-    let reverted = revert_file_from_snapshot(&workspace, "session-a", "wanted.txt")
-        .expect("scoped revert should succeed");
+    let snapshot = repo.list(10)?.remove(0);
+    let reverted = revert_file_from_snapshot(
+        &workspace,
+        "session-a",
+        &revert_request("wanted.txt", snapshot.id.as_str(), &sha256_of(&wanted)),
+    )
+    .expect("scoped revert should succeed");
     assert_eq!(reverted.path, "wanted.txt");
     assert_eq!(reverted.action, "modified");
     assert_eq!(reverted.snapshot_label, "pre-turn:1");
+    assert_eq!(reverted.snapshot_id, snapshot.id.as_str());
     assert_eq!(fs::read_to_string(&wanted)?, "wanted-before");
     assert_eq!(
         fs::read_to_string(&other)?,
@@ -5292,10 +5313,130 @@ fn revert_file_helper_accepts_an_absolute_path_inside_the_workspace() -> Result<
 
     // A recorded path may arrive absolute; normalization reports it back
     // workspace-relative so the GUI's change record stays consistent.
-    let reverted = revert_file_from_snapshot(&workspace, "session-a", &file.to_string_lossy())
-        .expect("scoped revert should accept an in-workspace absolute path");
+    let snapshot = repo.list(10)?.remove(0);
+    let reverted = revert_file_from_snapshot(
+        &workspace,
+        "session-a",
+        &revert_request(
+            &file.to_string_lossy(),
+            snapshot.id.as_str(),
+            &sha256_of(&file),
+        ),
+    )
+    .expect("scoped revert should accept an in-workspace absolute path");
     assert_eq!(reverted.path, "a.txt");
     assert_eq!(fs::read_to_string(&file)?, "v1");
+    Ok(())
+}
+
+/// The client names the exact snapshot from its change record. A newer
+/// unrelated snapshot must not be selected for it, and a stale hash means
+/// the user edited the file after the record was captured: refuse and leave
+/// the workspace untouched.
+#[test]
+fn revert_file_helper_requires_exact_snapshot_identity_and_reviewed_hash() -> Result<()> {
+    let _lock = lock_test_env();
+    let root = tempfile::tempdir()?;
+    let home = root.path().join("home");
+    fs::create_dir_all(&home)?;
+    let _home = EnvVarGuard::set("HOME", &home);
+
+    let workspace = root.path().join("workspace");
+    fs::create_dir_all(&workspace)?;
+    let repo = crate::snapshot::SnapshotRepo::open_or_init(&workspace)?;
+    let a = workspace.join("a.txt");
+    let b = workspace.join("b.txt");
+
+    // Tool A edits a.txt; tool B snapshots before editing only b.txt; the user
+    // then edits a.txt by hand.
+    fs::write(&a, "a-before")?;
+    fs::write(&b, "b-before")?;
+    let tool_a = repo.snapshot_with_session("tool:call-a", Some("session-a"))?;
+    fs::write(&a, "a-after-tool")?;
+    let tool_b = repo.snapshot_with_session("tool:call-b", Some("session-a"))?;
+    fs::write(&b, "b-after-tool")?;
+    fs::write(&a, "a-user-edit")?;
+
+    // Restoring a.txt from tool B's snapshot would erase only the user edit;
+    // the client must ask for tool A's snapshot and gets back a-before.
+    let err = revert_file_from_snapshot(
+        &workspace,
+        "session-a",
+        &revert_request("a.txt", tool_a.as_str(), &sha256_of(&b)),
+    )
+    .expect_err("a hash from different bytes must refuse");
+    assert_eq!(err.status, StatusCode::CONFLICT);
+    assert!(
+        err.message.contains("changed after"),
+        "got: {}",
+        err.message
+    );
+    assert_eq!(fs::read_to_string(&a)?, "a-user-edit");
+
+    let reverted = revert_file_from_snapshot(
+        &workspace,
+        "session-a",
+        &revert_request("a.txt", tool_a.as_str(), &sha256_of(&a)),
+    )
+    .expect("exact identity restores");
+    assert_eq!(reverted.snapshot_label, "tool:call-a");
+    assert_eq!(fs::read_to_string(&a)?, "a-before");
+    assert_eq!(
+        fs::read_to_string(&b)?,
+        "b-after-tool",
+        "b.txt is untouched"
+    );
+
+    // Already matching: 409, nothing changed.
+    let err = revert_file_from_snapshot(
+        &workspace,
+        "session-a",
+        &revert_request("a.txt", tool_a.as_str(), &sha256_of(&a)),
+    )
+    .expect_err("nothing to revert");
+    assert_eq!(err.status, StatusCode::CONFLICT);
+    assert!(
+        err.message.contains("nothing to revert"),
+        "got: {}",
+        err.message
+    );
+
+    // A snapshot owned by another session, an unknown id, or a non-restore
+    // label are all refused with a refresh hint.
+    let foreign = repo.snapshot_with_session("tool:foreign", Some("session-b"))?;
+    let post = repo.snapshot_with_session("post-turn:1", Some("session-a"))?;
+    for id in [
+        foreign.as_str(),
+        post.as_str(),
+        "0123456789abcdef0123456789abcdef01234567",
+    ] {
+        let err = revert_file_from_snapshot(
+            &workspace,
+            "session-a",
+            &revert_request("b.txt", id, &sha256_of(&b)),
+        )
+        .expect_err(id);
+        assert_eq!(err.status, StatusCode::CONFLICT, "{id}");
+        assert!(
+            err.message.contains("refresh the change record"),
+            "{id}: {}",
+            err.message
+        );
+    }
+    assert_eq!(fs::read_to_string(&b)?, "b-after-tool");
+    let _ = tool_b;
+
+    // Directories and Git metadata are 400s before anything is compared.
+    for path in ["", "src", ".git/config", "../escape.txt"] {
+        fs::create_dir_all(workspace.join("src"))?;
+        let err = revert_file_from_snapshot(
+            &workspace,
+            "session-a",
+            &revert_request(path, tool_a.as_str(), "absent"),
+        )
+        .expect_err(path);
+        assert_eq!(err.status, StatusCode::BAD_REQUEST, "{path}");
+    }
     Ok(())
 }
 
@@ -5318,18 +5459,27 @@ fn revert_file_helper_refuses_foreign_sessions_and_paths_outside_the_workspace()
     repo.snapshot_with_session("pre-turn:1", Some("session-b"))?;
     fs::write(&file, "foreign-after")?;
 
-    let err = revert_file_from_snapshot(&workspace, "session-a", "a.txt")
-        .expect_err("a foreign session's snapshot must not be restorable");
+    let foreign = repo.list(10)?.remove(0);
+    let err = revert_file_from_snapshot(
+        &workspace,
+        "session-a",
+        &revert_request("a.txt", foreign.id.as_str(), &sha256_of(&file)),
+    )
+    .expect_err("a foreign session's snapshot must not be restorable");
     assert_eq!(err.status, StatusCode::CONFLICT);
     assert!(
-        err.message.contains("nothing to revert"),
+        err.message.contains("another session"),
         "got: {}",
         err.message
     );
     assert_eq!(fs::read_to_string(&file)?, "foreign-after");
 
-    let traversal = revert_file_from_snapshot(&workspace, "session-a", "../escape.txt")
-        .expect_err("traversal must be refused");
+    let traversal = revert_file_from_snapshot(
+        &workspace,
+        "session-a",
+        &revert_request("../escape.txt", foreign.id.as_str(), "absent"),
+    )
+    .expect_err("traversal must be refused");
     assert_eq!(traversal.status, StatusCode::BAD_REQUEST);
     Ok(())
 }
@@ -5359,12 +5509,82 @@ async fn file_revert_route_probes_as_available_and_404s_unknown_threads() -> Res
         "the capability probe reads any non-404 as 'endpoint available'"
     );
 
+    let body = json!({
+        "path": "a.txt",
+        "snapshot_id": "0123456789abcdef0123456789abcdef01234567",
+        "expected_hash": "absent"
+    });
     let missing = client
         .post(format!("http://{addr}/v1/threads/thr_missing/file-revert"))
-        .json(&json!({ "path": "a.txt" }))
+        .json(&body)
         .send()
         .await?;
     assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+
+    handle.abort();
+    Ok(())
+}
+
+/// Route-level contract for the new destructive endpoint: malformed bodies
+/// are 422/400 before any thread state is read, an untrusted thread is a 409
+/// even with a well-formed request, and a trusted thread without a bound
+/// session is a 409 that names the reason. No file is touched in any case.
+#[tokio::test]
+async fn file_revert_route_validates_body_then_trust_then_session_binding() -> Result<()> {
+    let root = std::env::temp_dir().join(format!("deepseek-file-revert-gates-{}", Uuid::new_v4()));
+    let sessions_dir = root.join("sessions");
+    let Some((addr, runtime_threads, handle)) =
+        spawn_test_server_with_root(root.clone(), sessions_dir).await?
+    else {
+        return Ok(());
+    };
+    let thread_id = create_seeded_thread(&addr, &runtime_threads, &root, "Edit a.txt").await?;
+    let workspace = root.join("workspace");
+    fs::create_dir_all(&workspace)?;
+    let file = workspace.join("a.txt");
+    fs::write(&file, "keep")?;
+    let client = crate::tls::reqwest_client();
+    let url = format!("http://{addr}/v1/threads/{thread_id}/file-revert");
+    let well_formed = json!({
+        "path": "a.txt",
+        "snapshot_id": "0123456789abcdef0123456789abcdef01234567",
+        "expected_hash": format!("sha256:{}", "a".repeat(64))
+    });
+
+    // Missing required fields: rejected by the JSON extractor.
+    let resp = client
+        .post(&url)
+        .json(&json!({ "path": "a.txt" }))
+        .send()
+        .await?;
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    // Malformed identity/hash: 400 with the expected format.
+    for bad in [
+        json!({ "path": "a.txt", "snapshot_id": "not-hex", "expected_hash": "absent" }),
+        json!({ "path": "a.txt", "snapshot_id": "0123456789abcdef0123456789abcdef01234567", "expected_hash": "md5:abc" }),
+        json!({ "path": "a.txt", "snapshot_id": "0123456789abcdef0123456789abcdef01234567", "expected_hash": format!("sha256:{}", "A".repeat(64)) }),
+    ] {
+        let resp = client.post(&url).json(&bad).send().await?;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{bad}");
+    }
+    // Untrusted thread: 409 that says how to proceed.
+    let resp = client.post(&url).json(&well_formed).send().await?;
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let text = resp.text().await?;
+    assert!(text.contains("trusted mode"), "got: {text}");
+
+    // Trusted, but no bound session: still a 409 with the reason.
+    client
+        .patch(format!("http://{addr}/v1/threads/{thread_id}"))
+        .json(&json!({ "trust_mode": true }))
+        .send()
+        .await?
+        .error_for_status()?;
+    let resp = client.post(&url).json(&well_formed).send().await?;
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let text = resp.text().await?;
+    assert!(text.contains("no bound session"), "got: {text}");
+    assert_eq!(fs::read_to_string(&file)?, "keep");
 
     handle.abort();
     Ok(())
