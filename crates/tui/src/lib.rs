@@ -8477,12 +8477,11 @@ async fn run_review(config: &Config, args: ReviewArgs) -> Result<()> {
             crate::tools::review::plan_pr_review(&diff, view, args.max_chars, args.max_passes)
         })
         .transpose()?;
+    let review_workspace = std::env::current_dir()?;
     let (prompts, system) = if let (Some((number, view)), Some(plan)) = (&pr_view, &pr_plan) {
         (
-            plan.passes
-                .iter()
-                .map(|pass| crate::tools::review::build_pr_pass_prompt(*number, view, plan, pass))
-                .collect::<Vec<_>>(),
+            crate::tools::review::build_pr_review_prompts(*number, view, plan, &review_workspace)
+                .await?,
             SystemPrompt::Text(crate::tools::review::review_system_prompt().to_string()),
         )
     } else {
