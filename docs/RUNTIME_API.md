@@ -894,7 +894,13 @@ active turn in the same workspace, a nested checkout of it, or a parent of it,
 the request is refused with `409` and the message `already has an active turn`.
 The reservation is owned by the worker performing the Git mutation, so a client
 that disconnects mid-request cannot release it early; the operation completes
-or fails as a whole. Concurrent restores serialize.
+or fails as a whole. Concurrent restores serialize. The reservation is
+runtime-wide: while a restore's safety snapshot and checkout run, new turns,
+steering, compaction and user-input delivery on every thread wait for it to
+finish, so a large workspace can add seconds of latency elsewhere during a
+restore. A thread whose workspace directory is not available (unmounted
+volume, disconnected share, missing directory) is refused with `409` rather
+than treated as having nothing to restore.
 
 **Safety net.** Every restore first records a `pre-restore:<target>` snapshot
 of the current workspace. That label is never a `/undo`, `patch-undo` or
@@ -910,8 +916,9 @@ either files were restored or there was provably nothing to restore (no bound
 session, or no differing session-owned snapshot); `files_restored` says which.
 When there is something to restore and the thread is not trusted, the whole
 undo aborts with `409` and neither files nor conversation change. Snapshot
-repository, listing or comparison failures abort with `500` and preserve the
-conversation, so a turn is never dropped while its file changes stay on disk.
+repository, listing or comparison failures abort with `500`, and an unavailable
+workspace directory aborts with `409`; both preserve the conversation, so a
+turn is never dropped while its file changes stay on disk.
 Depth and history are validated before any file changes. If the fork cannot be
 persisted after files were restored, the response is a `500` that names the
 restored snapshot; the original thread still holds the turn and the
@@ -944,19 +951,22 @@ Responses:
 
 - `200 {"path", "action", "snapshot_id", "snapshot_label"}` — `action` is
   `modified`, `recreated` (file was missing) or `removed` (the snapshot does
-  not contain the file, so the file the tool created is deleted).
+  not contain the file, so the file the tool created is deleted; its parent
+  directories are left in place).
 - `400`: malformed `snapshot_id`/`expected_hash`, path outside the workspace,
   or a path that is not a regular file on either side.
 - `404`: unknown thread.
 - `409`: thread not in trusted mode or Full Access; no bound session; active
-  turn in an overlapping workspace; snapshot unknown, owned by another session
+  turn in an overlapping workspace; workspace directory not available;
+  snapshot unknown, owned by another session
   or not a restore point (refresh the change record); file already matches the
   snapshot (nothing to revert); or the file changed after the reviewed
   `expected_hash` (refresh and review again). Nothing is changed in any of
   these cases.
 - `422`: missing or mistyped body fields.
-- `500`: Git or filesystem failure; the message says whether the backup was
-  taken.
+- `500`: Git or filesystem failure; a failure after the safety snapshot names
+  that snapshot so the previous bytes can be recovered with
+  `POST /v1/snapshots/{id}/restore` or `/restore`.
 
 Capability probe: `GET` on the route returns `405` where the endpoint exists
 and `404` on an older engine; clients treat any non-`404` as available and

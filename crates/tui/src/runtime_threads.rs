@@ -7446,12 +7446,19 @@ impl RuntimeThreadManager {
         let workspace = workspace
             .canonicalize()
             .unwrap_or_else(|_| workspace.to_path_buf());
-        let active = self.active.lock().await;
-        for (id, state) in &active.engines {
-            if state.active_turn.is_none() {
-                continue;
-            }
-            let other = self.store.load_thread(id)?.workspace;
+        // Collect ids under the async lock, then do filesystem and store
+        // I/O without holding it.
+        let busy: Vec<String> = {
+            let active = self.active.lock().await;
+            active
+                .engines
+                .iter()
+                .filter(|(_, state)| state.active_turn.is_some())
+                .map(|(id, _)| id.clone())
+                .collect()
+        };
+        for id in busy {
+            let other = self.store.load_thread(&id)?.workspace;
             let other = other.canonicalize().unwrap_or(other);
             if workspace.starts_with(&other) || other.starts_with(&workspace) {
                 bail!(
@@ -7459,6 +7466,28 @@ impl RuntimeThreadManager {
                 );
             }
         }
+        Ok(())
+    }
+
+    /// Test seam: mark or clear an active turn on an installed test engine so
+    /// route-level tests can exercise restore admission.
+    #[cfg(test)]
+    pub(crate) async fn set_active_turn_for_test(
+        &self,
+        thread_id: &str,
+        turn_id: Option<&str>,
+    ) -> Result<()> {
+        let mut active = self.active.lock().await;
+        let state = active
+            .engines
+            .get_mut(thread_id)
+            .ok_or_else(|| anyhow!("no engine installed for {thread_id}"))?;
+        state.active_turn = turn_id.map(|turn_id| ActiveTurnState {
+            turn_id: turn_id.to_string(),
+            goal_id: None,
+            interrupt_requested: false,
+            compaction_id: None,
+        });
         Ok(())
     }
 
@@ -7796,19 +7825,30 @@ impl RuntimeThreadManager {
         Option<std::num::NonZeroU32>,
     )> {
         self.publish_fork(&prepared.thread, &prepared.records)?;
-        self.emit_event(
-            &prepared.thread.id,
-            None,
-            None,
-            "thread.forked",
-            json!({
-                "thread": prepared.thread,
-                "source_thread_id": prepared.source_id,
-                "backtrack_depth_from_tail": prepared.depth_from_tail,
-                "dropped_turn_id": prepared.target_turn_id,
-            }),
-        )
-        .await?;
+        // The fork is durable once publish_fork returns. A failed event
+        // append must not report the fork as unsaved: the caller already
+        // holds the forked record and clients can reload it.
+        if let Err(error) = self
+            .emit_event(
+                &prepared.thread.id,
+                None,
+                None,
+                "thread.forked",
+                json!({
+                    "thread": prepared.thread,
+                    "source_thread_id": prepared.source_id,
+                    "backtrack_depth_from_tail": prepared.depth_from_tail,
+                    "dropped_turn_id": prepared.target_turn_id,
+                }),
+            )
+            .await
+        {
+            tracing::warn!(
+                thread_id = %prepared.thread.id,
+                "fork {} was saved but its thread.forked event failed: {error:#}",
+                prepared.thread.id
+            );
+        }
         Ok((
             prepared.thread,
             prepared.original_user_text,

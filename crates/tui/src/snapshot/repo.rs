@@ -834,8 +834,9 @@ impl SnapshotRepo {
             let checkout = run_git(&self.git_dir, &self.work_tree, &arg_refs)?;
             if !checkout.status.success() {
                 return Err(io_other(format!(
-                    "git checkout failed: {}",
-                    String::from_utf8_lossy(&checkout.stderr).trim()
+                    "git checkout failed: {} (safety snapshot {} holds the previous files)",
+                    String::from_utf8_lossy(&checkout.stderr).trim(),
+                    backup.as_str()
                 )));
             }
         }
@@ -854,8 +855,16 @@ impl SnapshotRepo {
                 (false, true) => {
                     let path = self.work_tree.join(&rel);
                     self.validate_restore_file(&rel)?;
-                    std::fs::remove_file(&path)?;
-                    self.prune_empty_parent_dirs(path.parent());
+                    // Only the requested file goes; its parent directories
+                    // stay even when emptied, because the request named a
+                    // file, not a tree.
+                    std::fs::remove_file(&path).map_err(|error| {
+                        io_other(format!(
+                            "removing '{}' failed: {error} (safety snapshot {} holds the previous files)",
+                            rel.display(),
+                            backup.as_str()
+                        ))
+                    })?;
                     outcomes.push(PathRestoreOutcome {
                         path: rel,
                         action: PathRestoreAction::Removed,
@@ -1979,6 +1988,18 @@ mod tests {
             .expect("remove");
         assert_eq!(outcomes[0].action, PathRestoreAction::Removed);
         assert!(!created.exists());
+        // A created file inside a new directory is removed alone; the
+        // directory the user made stays.
+        let nested_dir = repo.work_tree().join("newdir");
+        std::fs::create_dir_all(&nested_dir).unwrap();
+        let nested = nested_dir.join("only.txt");
+        std::fs::write(&nested, b"n").unwrap();
+        let outcomes = repo
+            .restore_file_if_unchanged(&id, Path::new("newdir/only.txt"), &sha256_hash(&nested))
+            .expect("remove nested");
+        assert_eq!(outcomes[0].action, PathRestoreAction::Removed);
+        assert!(!nested.exists());
+        assert!(nested_dir.is_dir(), "the parent directory is not pruned");
         // A path missing on both sides is not a change and reports nothing.
         assert!(
             !repo

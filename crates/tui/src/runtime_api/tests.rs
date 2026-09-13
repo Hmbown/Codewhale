@@ -5112,6 +5112,18 @@ async fn patch_undo_endpoint_forks_and_reports_file_rollback_state() -> Result<(
         create_seeded_thread(&addr, &runtime_threads, &root, "Roll back the patch").await?;
     let client = crate::tls::reqwest_client();
 
+    // A workspace directory that is not available proves nothing about the
+    // files a turn changed: the undo is refused instead of forking the
+    // conversation away from them.
+    let resp = client
+        .post(format!("http://{addr}/v1/threads/{thread_id}/patch-undo"))
+        .json(&json!({}))
+        .send()
+        .await?;
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    assert!(resp.text().await?.contains("not available"));
+
+    fs::create_dir_all(root.join("workspace"))?;
     let resp = client
         .post(format!("http://{addr}/v1/threads/{thread_id}/patch-undo"))
         .json(&json!({}))
@@ -5120,8 +5132,8 @@ async fn patch_undo_endpoint_forks_and_reports_file_rollback_state() -> Result<(
     assert_eq!(resp.status(), StatusCode::CREATED);
     let undone: serde_json::Value = resp.json().await?;
     // The fresh workspace has no tool/pre-turn snapshots to roll back to,
-    // so the file-restore step reports failure while the conversation
-    // undo still forks the thread.
+    // so the file-restore step reports nothing restored while the
+    // conversation undo still forks the thread.
     assert_eq!(undone["patch_result"]["files_restored"], false);
     assert!(undone["patch_result"]["summary"].is_string());
     assert_eq!(undone["original_user_text"], "Roll back the patch");
@@ -5585,6 +5597,89 @@ async fn file_revert_route_validates_body_then_trust_then_session_binding() -> R
     let text = resp.text().await?;
     assert!(text.contains("no bound session"), "got: {text}");
     assert_eq!(fs::read_to_string(&file)?, "keep");
+
+    handle.abort();
+    Ok(())
+}
+
+/// All three restore routes refuse while a turn is active in an overlapping
+/// workspace, and admit again once it settles. Nothing is changed on refusal.
+#[tokio::test]
+async fn restore_routes_refuse_an_active_turn_in_the_workspace() -> Result<()> {
+    let root = std::env::temp_dir().join(format!("deepseek-restore-active-{}", Uuid::new_v4()));
+    let sessions_dir = root.join("sessions");
+    let Some((addr, runtime_threads, handle)) =
+        spawn_test_server_with_root(root.clone(), sessions_dir).await?
+    else {
+        return Ok(());
+    };
+    let thread_id = create_seeded_thread(&addr, &runtime_threads, &root, "Keep working").await?;
+    let workspace = root.join("workspace");
+    fs::create_dir_all(&workspace)?;
+    let file = workspace.join("a.txt");
+    fs::write(&file, "live")?;
+    let client = crate::tls::reqwest_client();
+    client
+        .patch(format!("http://{addr}/v1/threads/{thread_id}"))
+        .json(&json!({ "trust_mode": true }))
+        .send()
+        .await?
+        .error_for_status()?;
+    let harness = crate::core::engine::mock_engine_handle();
+    runtime_threads
+        .install_test_engine(&thread_id, harness.handle.clone())
+        .await?;
+    runtime_threads
+        .set_active_turn_for_test(&thread_id, Some("turn_live"))
+        .await?;
+
+    let revert_body = json!({
+        "path": "a.txt",
+        "snapshot_id": "0123456789abcdef0123456789abcdef01234567",
+        "expected_hash": "absent"
+    });
+    let refusals = [
+        client
+            .post(format!("http://{addr}/v1/threads/{thread_id}/file-revert"))
+            .json(&revert_body)
+            .send()
+            .await?,
+        client
+            .post(format!("http://{addr}/v1/threads/{thread_id}/patch-undo"))
+            .json(&json!({}))
+            .send()
+            .await?,
+    ];
+    for resp in refusals {
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let text = resp.text().await?;
+        assert!(text.contains("already has an active turn"), "got: {text}");
+    }
+    assert_eq!(fs::read_to_string(&file)?, "live");
+    // The server-wide snapshot route validates its id first, then admission.
+    let resp = client
+        .post(format!("http://{addr}/v1/snapshots/not-hex/restore"))
+        .send()
+        .await?;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    runtime_threads
+        .set_active_turn_for_test(&thread_id, None)
+        .await?;
+    // Admitted again: the revert now fails on the unknown snapshot id, past
+    // the admission and trust gates, without touching the file.
+    let resp = client
+        .post(format!("http://{addr}/v1/threads/{thread_id}/file-revert"))
+        .json(&revert_body)
+        .send()
+        .await?;
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let text = resp.text().await?;
+    assert!(
+        text.contains("no bound session") || text.contains("refresh the change record"),
+        "got: {text}"
+    );
+    assert_eq!(fs::read_to_string(&file)?, "live");
 
     handle.abort();
     Ok(())

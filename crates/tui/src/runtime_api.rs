@@ -4488,19 +4488,22 @@ async fn patch_undo_thread_turn(
     Json(req): Json<UndoTurnRequest>,
 ) -> Result<(StatusCode, Json<PatchUndoResponse>), ApiError> {
     let depth = req.depth.unwrap_or(0);
-    // Own the operation after admission even when its HTTP caller
-    // disconnects. The reservation must outlive both the file mutation and
-    // the fork publication, so a dropped connection cannot release it while
-    // Git is still changing files.
+    // Admission first, then the thread record under it: trust, session
+    // binding and workspace are the values that hold while files change.
+    // Active turns in an overlapping workspace are rejected (409). The wait
+    // for admission stays on the request so a client that gives up while
+    // queued cancels its undo instead of leaving it queued behind the next
+    // one and walking the workspace back twice.
+    let (reservation, thread) = state
+        .runtime_threads
+        .thread_restore_guard(&id)
+        .await
+        .map_err(map_thread_err)?;
+    // Once admitted, own the operation even when the HTTP caller disconnects:
+    // the reservation must outlive both the file mutation and the fork
+    // publication, so a dropped connection cannot release it mid-Git.
     tokio::spawn(async move {
-        // Admission first, then the thread record under it: trust, session
-        // binding and workspace are the values that hold while files change.
-        // Active turns in an overlapping workspace are rejected (409).
-        let (reservation, thread) = state
-            .runtime_threads
-            .thread_restore_guard(&id)
-            .await
-            .map_err(map_thread_err)?;
+        let reservation = reservation;
         // Validate depth/history before touching any file, so an invalid
         // undo request cannot leave a half-applied workspace.
         let prepared = state
@@ -4575,19 +4578,16 @@ fn patch_undo_workspace_files(
     current_session_id: Option<&str>,
     trusted: bool,
 ) -> Result<PatchUndoResult, ApiError> {
-    // A workspace directory that does not exist holds no files a turn could
-    // have changed, so the conversation-only undo may proceed. Every other
-    // repository failure is operational and must abort, because "no
-    // snapshots" cannot be proven while Git is unavailable.
+    // An unreadable workspace directory (unmounted volume, disconnected
+    // share, permissions) proves nothing about the files a turn changed, so
+    // the conversation is not forked away from them. Every repository
+    // failure is operational and aborts for the same reason: "no snapshots"
+    // cannot be proven while Git is unavailable.
     if !workspace.is_dir() {
-        return Ok(PatchUndoResult {
-            files_restored: false,
-            summary: Some(format!(
-                "Workspace directory {} does not exist; no files to revert.",
-                workspace.display()
-            )),
-            snapshot_label: None,
-        });
+        return Err(ApiError::conflict(format!(
+            "Workspace directory {} is not available; mount or restore it before undoing files, or use /undo for a conversation-only undo.",
+            workspace.display()
+        )));
     }
     let repo = crate::snapshot::SnapshotRepo::open_or_init(workspace).map_err(|e| {
         ApiError::internal(format!(
@@ -4794,7 +4794,7 @@ fn revert_file_from_snapshot(
     })?;
     if !workspace.is_dir() {
         return Err(ApiError::conflict(format!(
-            "Workspace directory {} does not exist; nothing can be restored.",
+            "Workspace directory {} is not available; mount or restore it before restoring files.",
             workspace.display()
         )));
     }
@@ -6239,6 +6239,11 @@ async fn restore_snapshot(
     State(state): State<RuntimeApiState>,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
+    if !snapshot_id_is_well_formed(&id) {
+        return Err(ApiError::bad_request(
+            "snapshot id must be the exact hexadecimal id reported by GET /v1/snapshots",
+        ));
+    }
     let reservation = state
         .runtime_threads
         .workspace_restore_guard(&state.workspace)
