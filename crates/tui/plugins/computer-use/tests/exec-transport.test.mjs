@@ -4,8 +4,30 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import net from "node:net";
 import { run, runOk, runInputLease, ExecError, have, trim, withSignal } from "../src/exec.mjs";
-import { safeRemotePath, b64, localExec, hdcExec } from "../src/transport.mjs";
+import { safeRemotePath, b64, localExec, hdcExec, executorFor } from "../src/transport.mjs";
+
+test("macOS refuses a helper that lacks the background-control contract before any input", {skip:process.platform!=="darwin"}, async t => {
+  const dir=fs.mkdtempSync(path.join(os.tmpdir(),"cu-old-helper-"));
+  const savedSocket=process.env.CODEWHALE_CU_APP_SOCKET, savedApp=process.env.CODEWHALE_CU_APP;
+  process.env.CODEWHALE_CU_APP_SOCKET=path.join(dir,"app.sock");
+  delete process.env.CODEWHALE_CU_APP;
+  const requests=[];
+  const server=net.createServer(socket=>socket.once("data",data=>{
+    requests.push(JSON.parse(data));
+    socket.end(JSON.stringify({ok:true,app:{id:"old-fixture",sessionProtocol:2}})+"\n");
+  }));
+  t.after(async()=>{
+    await new Promise(resolve=>server.close(resolve));
+    if(savedSocket===undefined) delete process.env.CODEWHALE_CU_APP_SOCKET; else process.env.CODEWHALE_CU_APP_SOCKET=savedSocket;
+    if(savedApp===undefined) delete process.env.CODEWHALE_CU_APP; else process.env.CODEWHALE_CU_APP=savedApp;
+    fs.rmSync(dir,{recursive:true,force:true});
+  });
+  await new Promise(resolve=>server.listen(process.env.CODEWHALE_CU_APP_SOCKET,resolve));
+  await assert.rejects(executorFor({id:"local",transport:"local"}),error=>error.code==="app_upgrade_required" && /background/.test(error.message));
+  assert.deepEqual(requests.map(request=>request.tool),["hello"]);
+});
 
 test("run captures stdout/stderr and exit codes without a shell", async () => {
   const r = await run("node", ["-e", "console.log('hello'); console.error('boo')"]);

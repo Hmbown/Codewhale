@@ -89,18 +89,24 @@ Observe once, act once, then verify.
   processes share a bundle id. Then the two halves behave differently:
   - **Keyboard and element actions are quiet.** `type`, `key`, `set_value`,
     `select_text` and `perform_action` reach the bound process without moving
-    the pointer or changing the foreground. Prefer them.
+    the pointer or changing the foreground. Prefer them. Text entry uses writable
+    accessibility selection when available; verify the resulting value.
+    `get_app_state`, `list_windows` and `screenshot` default to the selected app.
   - **Background mode never takes the shared pointer.** A coordinate
-    `left_click` first tries the bound application's accessibility press.
-    Without one, or for raw double/triple/right/middle click, drag, hover or
-    scroll, it fails with `shared_pointer_required` before moving the cursor.
+    `left_click` first tries the bound application's accessibility action,
+    including field focus and row selection. `right_click` uses advertised
+    context-menu actions. `scroll` uses the target's accessibility scrollbar;
+    prefer a scroll-area element and read the receipt's unit and value change.
+    Raw double/triple/middle click, drag and hover fail with
+    `shared_pointer_required` before moving the cursor. Missing semantic
+    scrolling or context-menu support is a refusal, never permission to activate.
     Use another advertised accessibility action or a separate computer.
   - Shared-desktop gestures and foreground keyboard delivery require explicit
     user authorization for exclusive desktop use, followed by
     `open_application(activate:true)`. Do not select it merely to work around a
     background refusal. Receipts identify `input_scope: "shared-desktop"`;
     pointer gestures use the physical cursor, even if it is restored afterward.
-    Keys are `foreground-guarded` and stop when another app takes focus. Never
+    Keys and raw pointer gestures stop when another app takes focus. Never
     keep reactivating after the user takes control; return to `activate:false`
     when the shared-desktop step ends.
   - Menus appear in `get_app_state`. Use the advertised action (often

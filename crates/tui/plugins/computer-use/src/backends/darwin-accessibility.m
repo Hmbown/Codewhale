@@ -94,6 +94,7 @@ static void cuWaitForLease(void) {
       if([message[@"release"] boolValue]) break;
       cuCheckCancelled();
       if(!cuLeaseButtons[0] || !point) break;
+      cuRequireForeground(cuLeaseApp);
       CGEventSourceRef source=CGEventSourceCreate(kCGEventSourceStateHIDSystemState);
       CGEventRef event=CGEventCreateMouseEvent(source,kCGEventLeftMouseDragged,cuLeasePoint,kCGMouseButtonLeft);
       CGEventSetIntegerValueField(event,kCGMouseEventClickState,1);
@@ -206,12 +207,78 @@ static NSDictionary *capturableWindow(NSArray *windows, pid_t pid, NSString *nam
   if(!matched) @throw [NSException exceptionWithName:@"window" reason:@"the selected app window is not capturable; observe the app windows again" userInfo:nil];
   return matched;
 }
-static BOOL cuPressable(AXUIElementRef el) {
+static NSArray *cuActions(AXUIElementRef el) {
   CFArrayRef names=NULL;
-  NSArray *actions=AXUIElementCopyActionNames(el,&names)==kAXErrorSuccess?CFBridgingRelease(names):@[];
-  if(![actions containsObject:@"AXPress"]) return NO;
+#ifdef CU_TEST
+  if([(__bridge id)el isKindOfClass:NSDictionary.class]) return attr(el,@"actions")?:@[];
+#endif
+  return AXUIElementCopyActionNames(el,&names)==kAXErrorSuccess?CFBridgingRelease(names):@[];
+}
+static BOOL cuSettable(AXUIElementRef el, NSString *name) {
+#ifdef CU_TEST
+  if([(__bridge id)el isKindOfClass:NSDictionary.class]) return [attr(el,@"settable") containsObject:name];
+#endif
+  Boolean settable=false;
+  return AXUIElementIsAttributeSettable(el,(__bridge CFStringRef)name,&settable)==kAXErrorSuccess && settable;
+}
+static NSString *cuClickAction(AXUIElementRef el, BOOL context) {
   id enabled=attr(el,@"AXEnabled");
-  return ![enabled isKindOfClass:NSNumber.class] || [enabled boolValue];
+  if([enabled isKindOfClass:NSNumber.class] && ![enabled boolValue]) return nil;
+  NSArray *actions=cuActions(el);
+  if(context) return [actions containsObject:@"AXShowMenu"]?@"AXShowMenu":nil;
+  NSString *role=attr(el,@"AXRole");
+  // Pressing a text field is toolkit-dependent; focus its insertion point directly.
+  if([@[@"AXTextField",@"AXTextArea",@"AXComboBox"] containsObject:role] && cuSettable(el,@"AXFocused")) return @"AXFocused";
+  if([actions containsObject:@"AXPress"]) return @"AXPress";
+  if([role isEqual:@"AXMenuItem"] && [actions containsObject:@"AXPick"]) return @"AXPick";
+  if([@[@"AXRow",@"AXCell"] containsObject:role] && cuSettable(el,@"AXSelected")) return @"AXSelected";
+  return nil;
+}
+static NSDictionary *cuClick(AXUIElementRef el, BOOL context) {
+  NSString *action=cuClickAction(el,context);
+  if(!action) @throw [NSException exceptionWithName:@"background_action_unavailable" reason:@"this control has no supported accessibility click; observe its advertised actions or use a separate computer" userInfo:nil];
+  cuCheckCancelled();
+  BOOL attribute=[action isEqual:@"AXFocused"] || [action isEqual:@"AXSelected"];
+  AXError error=attribute?AXUIElementSetAttributeValue(el,(__bridge CFStringRef)action,kCFBooleanTrue):AXUIElementPerformAction(el,(__bridge CFStringRef)action);
+  if(error!=kAXErrorSuccess) @throw [NSException exceptionWithName:@"action" reason:[NSString stringWithFormat:@"accessibility %@ failed: %d; no pointer fallback was sent",action,error] userInfo:nil];
+  return @{@"action_sent":@YES,@"strategy":@"a11y",@"action":action,@"pointer_moved":@NO,
+           @"verified":@(attribute && [attr(el,action) boolValue])};
+}
+static id cuScrollBar(AXUIElementRef el, BOOL horizontal) {
+  id enabled=attr(el,@"AXEnabled");
+  if([enabled isKindOfClass:NSNumber.class] && ![enabled boolValue]) return nil;
+  return attr(el,horizontal?@"AXHorizontalScrollBar":@"AXVerticalScrollBar");
+}
+static NSDictionary *cuScroll(AXUIElementRef el, NSDictionary *args) {
+  BOOL horizontal=[@[@"left",@"right"] containsObject:args[@"direction"]];
+  id bar=nil;
+  for(id cur=(__bridge id)el;cur && !bar;) {
+    AXUIElementRef node=(__bridge AXUIElementRef)cur;
+    bar=cuScrollBar(node,horizontal);
+    if([attr(node,@"AXRole") isEqual:@"AXWindow"]) break;
+    cur=attr(node,@"AXParent");
+  }
+  if(!bar) @throw [NSException exceptionWithName:@"background_scroll_unavailable" reason:@"no accessibility scrollbar at this target; choose an observed scroll area or a separate computer" userInfo:nil];
+  AXUIElementRef control=(__bridge AXUIElementRef)bar;
+  BOOL forward=[@[@"down",@"right"] containsObject:args[@"direction"]];
+  NSString *action=forward?@"AXIncrement":@"AXDecrement";
+  NSInteger count=MAX(1,MIN(100,[args[@"amount"] integerValue]));
+  id before=attr(control,@"AXValue");
+  BOOL advertised=[cuActions(control) containsObject:action];
+  // Native scrollbars commonly expose a normalized value instead of actions.
+  // Report that unit explicitly: it is not a claim about a toolkit's line size.
+  BOOL normalized=!advertised && [before isKindOfClass:NSNumber.class] && [before doubleValue]>=0 && [before doubleValue]<=1 && cuSettable(control,@"AXValue");
+  if(!advertised && !normalized) @throw [NSException exceptionWithName:@"background_scroll_unavailable" reason:@"the accessibility scrollbar has no supported action or writable normalized value" userInfo:nil];
+  for(NSInteger i=0;i<(advertised?count:1);i++) {
+    cuCheckCancelled();
+    NSNumber *value=@(MAX(0,MIN(1,[before doubleValue]+(forward?1:-1)*0.05*count)));
+    AXError error=advertised?AXUIElementPerformAction(control,(__bridge CFStringRef)action):AXUIElementSetAttributeValue(control,kAXValueAttribute,(__bridge CFTypeRef)value);
+    if(error!=kAXErrorSuccess) @throw [NSException exceptionWithName:@"action" reason:[NSString stringWithFormat:@"accessibility scroll failed: %d; no pointer fallback was sent",error] userInfo:nil];
+  }
+  id after=attr(control,@"AXValue");
+  return @{@"action_sent":@YES,@"strategy":@"a11y",@"pointer_moved":@NO,@"action":advertised?action:@"AXValue",
+           @"unit":advertised?@"accessibility_increment":@"normalized_scrollbar",@"before":before?:NSNull.null,@"after":after?:NSNull.null,
+           @"verified":@(before && after && ![before isEqual:after])};
 }
 /**
  * Smallest pressable element whose frame contains p.
@@ -223,7 +290,7 @@ static BOOL cuPressable(AXUIElementRef el) {
  * "smallest containing" is what picks the button instead of its group. Bounded
  * so a huge tree cannot stall an action.
  */
-static void cuSearch(AXUIElementRef el, CGPoint p, int depth, int *budget, id *best, double *bestArea) {
+static void cuSearch(AXUIElementRef el, CGPoint p, int depth, int *budget, id *best, double *bestArea, NSString *operation) {
   if(depth>24 || (*budget)--<=0) return;
   CGRect frame;
   if(cuFrame(el,&frame)) {
@@ -231,9 +298,10 @@ static void cuSearch(AXUIElementRef el, CGPoint p, int depth, int *budget, id *b
     // not), so a frame that misses the point prunes the whole subtree.
     if(!CGRectContainsPoint(frame,p)) return;
     double area=frame.size.width*frame.size.height;
-    if(cuPressable(el) && (!*best || area<=*bestArea)) { *best=(__bridge id)el; *bestArea=area; }
+    BOOL suitable=[operation hasPrefix:@"scroll"]?cuScrollBar(el,[operation isEqual:@"scroll-horizontal"])!=nil:cuClickAction(el,[operation isEqual:@"context"])!=nil;
+    if(suitable && (!*best || area<=*bestArea)) { *best=(__bridge id)el; *bestArea=area; }
   }
-  for(id kid in attr(el,@"AXChildren")) cuSearch((__bridge AXUIElementRef)kid,p,depth+1,budget,best,bestArea);
+  for(id kid in attr(el,@"AXChildren")) cuSearch((__bridge AXUIElementRef)kid,p,depth+1,budget,best,bestArea,operation);
 }
 /**
  * Every key an app_ref supplies must match. Matching any one of them would let
@@ -293,11 +361,10 @@ static CGEventRef textEvent(NSString *text, BOOL down) {
 static BOOL cuTextRole(NSString *role) {
   return [@[@"AXTextField",@"AXTextArea",@"AXComboBox",@"AXSearchField",@"AXSecureTextField",@"AXWebArea"] containsObject:role];
 }
-// NSString lengths are UTF-16 unit counts on both sides, so emoji compare
-// consistently. The length check survives autocorrect/IME transforms that
-// defeat the suffix check, as long as the character count is preserved.
+// Without a readable selection range only an exact append can be verified.
+// Matching length or an already-present suffix is not evidence of delivery.
 static BOOL cuTypeVerified(NSString *before, NSString *after, NSString *text) {
-  return after && ([after hasSuffix:text] || (before && after.length==before.length+text.length));
+  return before && after && [after isEqual:[before stringByAppendingString:text]];
 }
 static id cuFocusedElement(pid_t pid) {
   AXUIElementRef appEl=AXUIElementCreateApplication(pid);
@@ -327,11 +394,24 @@ static NSDictionary *cuType(NSDictionary *args, NSRunningApplication *inputApp, 
   // some apps take process-directed keys without reporting AX focus.
   if(focused && !cuTextRole(role) && !before)
     @throw [NSException exceptionWithName:@"focus" reason:[NSString stringWithFormat:@"focused element is a %@, not a text control — click or focus a text field first",role?:@"unknown element"] userInfo:nil];
+  NSString *expected=nil;
+  if(before && focused) {
+    id range=attr((__bridge AXUIElementRef)focused,@"AXSelectedTextRange"); CFRange selected;
+    if(range && CFGetTypeID((__bridge CFTypeRef)range)==AXValueGetTypeID() && AXValueGetValue((__bridge AXValueRef)range,kAXValueCFRangeType,&selected)
+       && selected.location>=0 && selected.length>=0 && selected.location<=before.length && selected.length<=before.length-selected.location)
+      expected=[before stringByReplacingCharactersInRange:NSMakeRange(selected.location,selected.length) withString:text];
+  }
+  BOOL semantic=!simulated && focused && ![args[@"foreground_input"] boolValue] && cuSettable((__bridge AXUIElementRef)focused,@"AXSelectedText");
+  if(semantic) {
+    cuCheckCancelled();
+    AXError error=AXUIElementSetAttributeValue((__bridge AXUIElementRef)focused,kAXSelectedTextAttribute,(__bridge CFStringRef)text);
+    if(error!=kAXErrorSuccess) @throw [NSException exceptionWithName:@"action" reason:[NSString stringWithFormat:@"accessibility text insertion failed: %d; observe before retrying; no keyboard fallback was sent",error] userInfo:nil];
+  }
   // One grapheme per event, the way a keyboard delivers them. Batching
   // several into one CGEventKeyboardSetUnicodeString is faster but Electron
   // apps coalesce the pending payload and keep only the final batch, so a
   // typed string silently arrives truncated to its tail.
-  for(NSUInteger i=0;i<text.length && !cuCancelled;) {
+  for(NSUInteger i=0;!semantic && i<text.length && !cuCancelled;) {
     if([args[@"foreground_input"] boolValue]) cuRequireForeground(inputApp);
     cuCheckCancelled();
     NSRange range=[text rangeOfComposedCharacterSequencesForRange:NSMakeRange(i,1)];
@@ -350,9 +430,9 @@ static NSDictionary *cuType(NSDictionary *args, NSRunningApplication *inputApp, 
     id v=attr((__bridge AXUIElementRef)focused,@"AXValue");
     if([v isKindOfClass:NSString.class]) after=v;
   }
-  BOOL verified=cuTypeVerified(before,after,text);
-  NSMutableDictionary *receipt=[@{@"action_sent":@YES,@"chars":@(text.length),@"strategy":@"unicode-events",
-                                  @"keyboard_delivery":[args[@"foreground_input"] boolValue]?@"foreground-guarded":@"process",
+  BOOL verified=expected?[after isEqual:expected]:cuTypeVerified(before,after,text);
+  NSMutableDictionary *receipt=[@{@"action_sent":@YES,@"chars":@(text.length),@"strategy":semantic?@"a11y-selected-text":@"unicode-events",
+                                  @"keyboard_delivery":semantic?@"accessibility":[args[@"foreground_input"] boolValue]?@"foreground-guarded":@"process",
                                   @"verified":@(verified),@"focused_role":role?:[NSNull null]} mutableCopy];
   if(!verified) receipt[@"verification_required"]=@"screenshot";
   return receipt;
@@ -380,7 +460,7 @@ static id execute(NSDictionary *p) {
   if([tool isEqual:@"pointer_sequence"] && ![args[@"foreground_input"] boolValue])
     @throw [NSException exceptionWithName:@"shared_pointer_required" reason:@"shared macOS pointer input is unavailable in background mode; use an accessibility action or a separate computer" userInfo:nil];
   cuOwnerPipe=[args[@"owner_pipe"] boolValue];
-  BOOL mutates=[@[@"type",@"key_event",@"mouse_event",@"scroll",@"pointer_sequence",@"release_input",@"set_value",@"select_text",@"perform_action"] containsObject:tool]
+  BOOL mutates=[@[@"type",@"key_event",@"mouse_event",@"scroll",@"pointer_sequence",@"release_input",@"set_value",@"select_text",@"perform_action",@"click_element",@"scroll_element"] containsObject:tool]
     || ([tool isEqual:@"hit_test"] && [args[@"perform"] boolValue])
     || ([tool isEqual:@"app_info"] && [args[@"activate"] boolValue]);
   if([tool isEqual:@"release_input"]) {
@@ -401,10 +481,11 @@ static id execute(NSDictionary *p) {
     return cuPostKey(args,[args[@"input_app_ref"][@"pid"] intValue]);
   }
   cuCheckCancelled();
-  if([tool isEqual:@"input_capabilities"]) return @{@"input_lease":@1,@"owner_pipe":@YES,@"record_owner_pipe":@1,@"window_ocr":@1,@"element_identity":@1};
+  if([tool isEqual:@"input_capabilities"]) return @{@"input_lease":@1,@"owner_pipe":@YES,@"record_owner_pipe":@1,@"window_ocr":@1,@"element_identity":@1,@"background_actions":@1};
   if([tool isEqual:@"record"]) return cuRecord(args);
   if([tool isEqual:@"recognize_text"]) return cuRecognizeText(args[@"file"]);
 #ifdef CU_TEST
+  if([tool isEqual:@"inspect_click_action"]) return @{@"action":cuClickAction((__bridge AXUIElementRef)args[@"element"],[args[@"context"] boolValue])?:NSNull.null};
   if([tool isEqual:@"inspect_element_identity"]) {
     cuValidateElementIdentity((__bridge AXUIElementRef)args[@"element"],args[@"target"]);
     return @{@"identity_matches":@YES};
@@ -490,6 +571,11 @@ static id execute(NSDictionary *p) {
     if([args[@"activate"] boolValue]) cuLockInput();
     cuCheckCancelled();
     if([args[@"activate"] boolValue] && !axActivate(a.processIdentifier)) [a activateWithOptions:0];
+    if([args[@"activate"] boolValue]) for(int i=0;i<120;i++) {
+      cuCheckCancelled();
+      if(NSWorkspace.sharedWorkspace.frontmostApplication.processIdentifier==a.processIdentifier) break;
+      usleep(25000);
+    }
     return @{@"found":@YES,@"name":a.localizedName?:@"",@"pid":@(a.processIdentifier),@"bundle_id":a.bundleIdentifier?:@"",@"frontmost":@(a.active)};
   }
   NSRunningApplication *inputApp=nil;
@@ -537,11 +623,13 @@ static id execute(NSDictionary *p) {
     if(err==kAXErrorSuccess && raw) {
       pid_t owner=0;
       if(AXUIElementGetPid(raw,&owner)==kAXErrorSuccess && owner==inputApp.processIdentifier) hit=CFBridgingRelease(raw);
-      else { CFRelease(raw); CFRelease(appEl); return @{@"found":@NO,@"reason":@"point_owned_by_another_process"}; }
+      else CFRelease(raw); // Another app may cover a background window. Search only our own tree below.
     }
 
     id chosen=nil;
     BOOL insideSheet=NO;
+    NSString *operation=args[@"operation"]?:@"click";
+    BOOL scrolling=[operation hasPrefix:@"scroll"];
     // 1. The element under the point, or the nearest ancestor that can be
     //    pressed — a label inside a button is the common case.
     for(id cur=hit; cur && !chosen;) {
@@ -549,14 +637,24 @@ static id execute(NSDictionary *p) {
       id role=attr(el,@"AXRole");
       if([role isEqual:@"AXSheet"]) insideSheet=YES;
       if([role isEqual:@"AXWindow"] || [role isEqual:@"AXApplication"]) break;
-      if(cuPressable(el)) { chosen=cur; break; }
+      if(scrolling?cuScrollBar(el,[operation isEqual:@"scroll-horizontal"])!=nil:cuClickAction(el,[operation isEqual:@"context"])!=nil) { chosen=cur; break; }
       cur=attr(el,@"AXParent");
     }
     // 2. Otherwise search downward for the smallest control covering the point.
     if(!chosen) {
       int budget=1500; double area=0; id best=nil;
-      if(hit) cuSearch((__bridge AXUIElementRef)hit,p,0,&budget,&best,&area);
-      else for(id w in attr(appEl,@"AXWindows")) cuSearch((__bridge AXUIElementRef)w,p,0,&budget,&best,&area);
+      if(hit) cuSearch((__bridge AXUIElementRef)hit,p,0,&budget,&best,&area,operation);
+      else for(id w in attr(appEl,@"AXWindows")) {
+        CGRect frame;
+        if(!cuFrame((__bridge AXUIElementRef)w,&frame) || !CGRectContainsPoint(frame,p)) continue;
+        // A sheet owns the window's interaction, even when the sheet does not cover p.
+        NSArray *sheets=attr((__bridge AXUIElementRef)w,@"AXSheets");
+        if(sheets.count) {
+          for(id sheet in sheets) cuSearch((__bridge AXUIElementRef)sheet,p,0,&budget,&best,&area,operation);
+          insideSheet=YES;
+        } else cuSearch((__bridge AXUIElementRef)w,p,0,&budget,&best,&area,operation);
+        break; // Never click through another window of the same app.
+      }
       chosen=best;
     }
     CFRelease(appEl);
@@ -583,11 +681,10 @@ static id execute(NSDictionary *p) {
     }
 
     NSDictionary *element=info((__bridge AXUIElementRef)chosen,0,0,@[]);
-    if(![args[@"perform"] boolValue]) return @{@"found":@YES,@"element":element,@"action":@"AXPress",@"action_sent":@NO};
+    if(![args[@"perform"] boolValue]) return @{@"found":@YES,@"element":element,@"action_sent":@NO};
     cuCheckCancelled();
-    AXError pe=AXUIElementPerformAction((__bridge AXUIElementRef)chosen,CFSTR("AXPress"));
-    if(pe!=kAXErrorSuccess) return @{@"found":@YES,@"element":element,@"action":@"AXPress",@"action_sent":@NO,@"reason":[NSString stringWithFormat:@"press_failed_%d",pe]};
-    return @{@"found":@YES,@"element":element,@"action":@"AXPress",@"action_sent":@YES};
+    NSMutableDictionary *receipt=[(scrolling?cuScroll((__bridge AXUIElementRef)chosen,args):cuClick((__bridge AXUIElementRef)chosen,[operation isEqual:@"context"])) mutableCopy];
+    receipt[@"found"]=@YES; receipt[@"element"]=element; return receipt;
   }
   /**
    * One pointer gesture, posted to the window server.
@@ -600,30 +697,15 @@ static id execute(NSDictionary *p) {
    */
   if([tool isEqual:@"pointer_sequence"]) {
     CGEventRef probe=CGEventCreate(NULL); CGPoint home=CGEventGetLocation(probe); CFRelease(probe);
-    // A global pointer event landing in an inactive application activates it,
-    // and AppKit swallows that first mouse-down instead of delivering it — a
-    // drag would silently lose its press. So the foreground is taken up front,
-    // deliberately. It cannot be handed back: macOS 14+ ignores activation
-    // requests from a process that is not itself frontmost (measured for both
-    // -[NSRunningApplication activateWithOptions:] and AXFrontmost), and the
-    // request only lands here because the click is about to arrive anyway.
-    // The cost is reported in the receipt, never hidden.
+    // Shared input is allowed only while the explicitly selected app remains
+    // foreground. A new gesture never reactivates it after the user switches.
     NSRunningApplication *front=NSWorkspace.sharedWorkspace.frontmostApplication;
     NSString *before=front.localizedName?:@"";
-    // A gesture into an application that is not already frontmost brings it
-    // forward — by our own request when that is permitted, and by the click
-    // itself when it is not. Either way the foreground is taken, so say so
-    // from the fact that decides it rather than from a frontmost read that
-    // the window server may not have caught up with yet.
     BOOL takes=front.processIdentifier!=inputApp.processIdentifier;
     cuCheckCancelled();
-    if(takes) {
-      axActivate(inputApp.processIdentifier);
-      for(int i=0;i<20;i++) {
-        if(cuCancelled || NSWorkspace.sharedWorkspace.frontmostApplication.processIdentifier==inputApp.processIdentifier) break;
-        usleep(25000);
-      }
-    }
+    // Activation is a separate, explicit operation. A stale foreground mode
+    // must never reclaim focus after the user has switched applications.
+    cuRequireForeground(inputApp);
     // AppKit only assembles a drag out of events that look like they came from
     // the input hardware; a NULL-source stream delivers down and up but drops
     // every mouseDragged in between.
@@ -631,7 +713,7 @@ static id execute(NSDictionary *p) {
     BOOL held[3]={NO,NO,NO};
     CGPoint last=home;
     for(NSDictionary *step in args[@"steps"]) {
-      @try { cuCheckCancelled(); } @catch(NSException *e) { break; }
+      @try { cuCheckCancelled(); cuRequireForeground(inputApp); } @catch(NSException *e) { cuCancelled=1; break; }
       CGEventRef event;
       if(step[@"scroll"]) {
         NSArray *d=step[@"scroll"];
@@ -654,13 +736,14 @@ static id execute(NSDictionary *p) {
     if([args[@"input_lease"] boolValue] && !cuCancelled) {
       for(int button=0;button<3;button++) cuLeaseButtons[button]=held[button];
       cuLeasePoint=last;
+      cuLeaseApp=inputApp;
     }
     if(cuCancelled || ![args[@"input_lease"] boolValue]) for(int button=0;button<3;button++) if(held[button]) {
       CGEventType up=button==0?kCGEventLeftMouseUp:button==1?kCGEventRightMouseUp:kCGEventOtherMouseUp;
       CGEventRef event=CGEventCreateMouseEvent(source,up,last,button);
       CGEventPost(kCGHIDEventTap,event); CFRelease(event);
     }
-    BOOL restore=[args[@"restore"] boolValue];
+    BOOL restore=[args[@"restore"] boolValue] && !cuCancelled;
     if(restore) {
       usleep(60000);
       CGEventRef back=CGEventCreateMouseEvent(source,kCGEventMouseMoved,home,kCGMouseButtonLeft);
@@ -719,6 +802,8 @@ static id execute(NSDictionary *p) {
     }
     cuCheckCancelled();
     if([t[@"type"] isEqual:@"element"]) cuValidateElementIdentity((__bridge AXUIElementRef)el,t);
+    if([tool isEqual:@"click_element"]) return cuClick((__bridge AXUIElementRef)el,[args[@"context"] boolValue]);
+    if([tool isEqual:@"scroll_element"]) return cuScroll((__bridge AXUIElementRef)el,args);
     AXError e=kAXErrorFailure;
     if([tool isEqual:@"set_value"]) e=AXUIElementSetAttributeValue((__bridge AXUIElementRef)el,kAXValueAttribute,(__bridge CFTypeRef)args[@"value"]);
     else if([tool isEqual:@"select_text"]){ NSArray *r=args[@"text_range"]?:@[@0,@0]; if(r.count!=2 || [r[0] longValue]<0 || [r[1] longValue]<0) @throw [NSException exceptionWithName:@"range" reason:@"text_range must be [start, length], both nonnegative" userInfo:nil]; CFRange range=CFRangeMake([r[0] longValue],[r[1] longValue]); AXValueRef v=AXValueCreate(kAXValueCFRangeType,&range); e=AXUIElementSetAttributeValue((__bridge AXUIElementRef)el,kAXSelectedTextRangeAttribute,v); CFRelease(v); }

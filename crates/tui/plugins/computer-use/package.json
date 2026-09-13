@@ -1,6 +1,6 @@
 {
   "name": "codewhale-cu",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Codewhale's included Computer Use plugin: accessibility, screenshots, keyboard and pointer control, and recording through the Engine's reviewed plugin authority.",
   "license": "MIT",
   "type": "module",

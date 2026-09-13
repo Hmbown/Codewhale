@@ -76,3 +76,10 @@ click in the user's applications. `npm run smoke` is a separate legacy live
 check: it captures and records the selected display, so run it only when that
 capture is intended. The upstream parity suite contains scoped application
 fixtures for interactive verification.
+
+On macOS, ordinary observations follow the selected background app. Field
+focus, selection, context menus and scrolling use supported accessibility
+operations; raw mouse gestures stop if the user changes foreground apps.
+Arbitrary background dragging remains unavailable. Rebuild Core to include
+the updated native helper; updating a separate marketplace checkout alone
+does not update an already-installed Core binary.

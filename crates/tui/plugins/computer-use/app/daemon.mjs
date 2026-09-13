@@ -25,7 +25,7 @@ const bundle = process.env.CODEWHALE_CU_APP_BUNDLE || null;
 const log = (msg) => process.stderr.write(`${new Date().toISOString()} ${APP_NAME}: ${msg}\n`);
 
 function appInfo() {
-  return { id: APP_ID, name: APP_NAME, version: APP_VERSION, sessionProtocol: 2, pid: process.pid, platform: process.platform, node: process.version, bundle, startedAt, socket: socketPath() };
+  return { id: APP_ID, name: APP_NAME, version: APP_VERSION, sessionProtocol: 2, backgroundProtocol: 1, pid: process.pid, platform: process.platform, node: process.version, bundle, startedAt, socket: socketPath() };
 }
 
 if (await hello({ timeoutMs: 1_500 })) {
