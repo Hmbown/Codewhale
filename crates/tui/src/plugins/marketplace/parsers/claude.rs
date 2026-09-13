@@ -326,6 +326,7 @@ fn parse_claude_entry(
     Some(MarketplaceCandidate {
         id: MarketplaceCandidateId::new(catalog_id, &name),
         catalog_id: catalog_id.clone(),
+        icon: None,
         name,
         display_name,
         description: description.map(ToString::to_string),

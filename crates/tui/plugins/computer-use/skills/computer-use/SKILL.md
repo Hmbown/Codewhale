@@ -19,6 +19,18 @@ computer unless given `computer`.
 - Every receipt names the computer it happened on. Read it before continuing —
   never assume the action landed on the machine you meant.
 
+## Human controls
+
+When the local helper is installed, it owns the input route even when the
+host also includes a native binary. A disconnected helper is an error, never
+permission to bypass it with direct input. `control_paused` and
+`control_stopped` mean the person paused or stopped Computer Use. Stop acting
+and wait for them; do not change environment variables, restart the helper,
+create another session or use another tool to defeat their choice. After Stop,
+the old session remains invalid even when the person allows new sessions.
+The helper's own setup, permission and safety controls belong to the person.
+Do not operate them or approve the host's pending authorization yourself.
+
 ## Core loop
 
 Observe once, act once, then verify.

@@ -88,12 +88,19 @@ test("cancelling a later pointer command closes its original input owner promptl
 
 test("an exited input owner rejects later movement immediately", async () => {
   const lease=await runInputLease(process.execPath,["-e",`
-    console.log(JSON.stringify({action_sent:true,input_lease:true}));
+    console.log(JSON.stringify({action_sent:true,input_lease:true,pid:process.pid}));
     setTimeout(()=>process.kill(process.pid,'SIGTERM'),20);
   `]);
-  await new Promise(resolve=>setTimeout(resolve,100));
+  const deadline=Date.now()+5000;
+  while(true) {
+    try { process.kill(lease.receipt.pid,0); }
+    catch(error) { if(error.code==='ESRCH') break; throw error; }
+    assert.ok(Date.now()<deadline,'the fixture owner must exit');
+    await new Promise(resolve=>setTimeout(resolve,20));
+  }
+  await new Promise(resolve=>setImmediate(resolve));
   const started=Date.now();
-  await assert.rejects(lease.send({point:{x:1,y:2}}),/owner is closed/);
+  await assert.rejects(lease.send({point:{x:1,y:2}}),error=>error.code==='input_owner_closed');
   assert.ok(Date.now()-started<500);
 });
 

@@ -92,8 +92,8 @@ describe("sitemap and hreflang preservation", () => {
   it("keeps sitemap and hreflang output aligned with real translation coverage", () => {
     // 18 home locales + 10 guide locales + (en, zh) for every other route
     // (including /product and /changelog, whose bodies ship en/zh only).
-    expect(sitemapEntries).toHaveLength(98);
-    for (const path of ["/product", "/pricing", "/signin", "/signup", "/legal/terms", "/legal/privacy"]) {
+    expect(sitemapEntries).toHaveLength(100);
+    for (const path of ["/product", "/computer-use", "/pricing", "/signin", "/signup", "/legal/terms", "/legal/privacy"]) {
       expect(
         sitemapEntries.some((entry) => entry.url === `${SITE_URL}/en${path}`),
         path,

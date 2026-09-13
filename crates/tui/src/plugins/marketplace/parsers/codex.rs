@@ -264,6 +264,7 @@ fn parse_codex_entry(
     Some(MarketplaceCandidate {
         id: MarketplaceCandidateId::new(catalog_id, &name),
         catalog_id: catalog_id.clone(),
+        icon: None,
         name,
         display_name: None,
         description: None,

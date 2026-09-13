@@ -156,9 +156,6 @@ let lastLaunchAt = 0;
  */
 export async function ensureApp({ launch = true } = {}) {
   if (process.env.CODEWHALE_CU_APP === "off") return { via: "direct", reason: "CODEWHALE_CU_APP=off" };
-  if (process.platform === "darwin" && fs.existsSync(path.join(PLUGIN_ROOT, "bin", "darwin", "accessibility"))) {
-    return { via: "direct", reason: "Using the Computer Use helper included with Codewhale. Grant Accessibility and Screen Recording to the host app in macOS System Settings when requested." };
-  }
   let app = await hello();
   throwIfAborted();
   if (app) return { via: "app", app };
@@ -171,7 +168,7 @@ export async function ensureApp({ launch = true } = {}) {
 
   }
   if (!launch || Date.now() - lastLaunchAt < 15_000) {
-    return { via: "direct", reason: `${APP_NAME} is installed at ${reg.path} but not running (last launch attempt did not come up)` };
+    throw Object.assign(new ExecError(`${APP_NAME} is installed but not responding. Open it from Applications and retry; its controls must remain in charge of input.`), { code: "app_unavailable" });
   }
   lastLaunchAt = Date.now();
   launchApp(reg);
@@ -182,5 +179,5 @@ export async function ensureApp({ launch = true } = {}) {
     throwIfAborted();
     if (app) return { via: "app", app, launched: true };
   }
-  return { via: "direct", reason: `${APP_NAME} at ${reg.path} did not answer within 8s of launch; open it manually and check ${runInfoPath()}` };
+  throw Object.assign(new ExecError(`${APP_NAME} did not answer within 8s. Open it from Applications and check its status before retrying.`), { code: "app_unavailable" });
 }

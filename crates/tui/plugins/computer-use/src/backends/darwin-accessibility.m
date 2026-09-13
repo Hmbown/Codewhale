@@ -568,6 +568,7 @@ static id execute(NSDictionary *p) {
   if([tool isEqual:@"app_info"]) {
     NSRunningApplication *a=resolve(args[@"app_ref"]);
     if(!a) @throw [NSException exceptionWithName:@"app" reason:@"application not found" userInfo:nil];
+    if([a.bundleIdentifier isEqual:@"net.codewhale.computer-use"] && [args[@"activate"] boolValue]) @throw [NSException exceptionWithName:@"protected" reason:@"Computer Use safety controls belong to the user." userInfo:nil];
     if([args[@"activate"] boolValue]) cuLockInput();
     cuCheckCancelled();
     if([args[@"activate"] boolValue] && !axActivate(a.processIdentifier)) [a activateWithOptions:0];
@@ -583,6 +584,7 @@ static id execute(NSDictionary *p) {
     if(![args[@"input_app_ref"] isKindOfClass:NSDictionary.class]) @throw [NSException exceptionWithName:@"focus" reason:@"open_application first to bind the input destination" userInfo:nil];
     inputApp=resolve(args[@"input_app_ref"]);
     if(!inputApp || inputApp.terminated) @throw [NSException exceptionWithName:@"focus" reason:@"input application is no longer running; open_application again" userInfo:nil];
+    if([inputApp.bundleIdentifier isEqual:@"net.codewhale.computer-use"]) @throw [NSException exceptionWithName:@"protected" reason:@"Computer Use safety controls belong to the user." userInfo:nil];
   }
   if(mutates) { cuCheckCancelled(); cuLockInput(); }
   if(!AXIsProcessTrusted()) @throw [NSException exceptionWithName:@"permission" reason:@"Accessibility permission is missing for Codewhale Computer Use (or the direct host)." userInfo:nil];
@@ -767,6 +769,7 @@ static id execute(NSDictionary *p) {
   }
   NSRunningApplication *a=resolve(args[@"app_ref"]?:args[@"target"][@"app_ref"]);
   if(!a) @throw [NSException exceptionWithName:@"app" reason:@"application not found" userInfo:nil];
+  if(mutates && [a.bundleIdentifier isEqual:@"net.codewhale.computer-use"]) @throw [NSException exceptionWithName:@"protected" reason:@"Computer Use safety controls belong to the user." userInfo:nil];
   AXUIElementRef app=AXUIElementCreateApplication(a.processIdentifier);
   AXUIElementSetMessagingTimeout(app,2.0);
   @try {

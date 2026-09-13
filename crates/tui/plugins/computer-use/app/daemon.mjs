@@ -16,7 +16,10 @@
 import fs from "node:fs";
 import net from "node:net";
 import crypto from "node:crypto";
-import { handle, closeSession, closeAllSessions, releaseSessionInput, reopenSession, ALLOWED } from "../src/app-handler.mjs";
+import path from "node:path";
+import { handle, closeSession, closeAllSessions, releaseSessionInput, reopenSession, ALLOWED, controlStatus, setControlMode } from "../src/app-handler.mjs";
+import { runBackgroundCheck } from "./background-check.mjs";
+import { checkForUpdate, prepareUpdate, restartWithUpdate } from "./updates.mjs";
 import { APP_ID, APP_NAME, APP_VERSION, socketPath, runInfoPath, writeRegistration, defaultLaunch, hello } from "../src/app-socket.mjs";
 import { stateDir } from "../src/registry.mjs";
 
@@ -25,7 +28,7 @@ const bundle = process.env.CODEWHALE_CU_APP_BUNDLE || null;
 const log = (msg) => process.stderr.write(`${new Date().toISOString()} ${APP_NAME}: ${msg}\n`);
 
 function appInfo() {
-  return { id: APP_ID, name: APP_NAME, version: APP_VERSION, sessionProtocol: 2, backgroundProtocol: 1, pid: process.pid, platform: process.platform, node: process.version, bundle, startedAt, socket: socketPath() };
+  return { id: APP_ID, name: APP_NAME, version: APP_VERSION, sessionProtocol: 2, backgroundProtocol: 1, controlProtocol: 1, pid: process.pid, platform: process.platform, node: process.version, bundle, startedAt, socket: socketPath() };
 }
 
 if (await hello({ timeoutMs: 1_500 })) {
@@ -41,6 +44,87 @@ if (process.platform !== "win32") {
 
 const leases = new Map();
 let shuttingDown = false;
+let backgroundCheck = null;
+let checking = false;
+let update = null;
+let updating = false;
+let controlError = null;
+const controlFile = path.join(stateDir(), "control.json");
+async function userControl(mode) {
+  const work = setControlMode(mode);
+  if (mode === "ready") await work;
+  const temporary = `${controlFile}.${process.pid}.tmp`;
+  let storageError;
+  try {
+    fs.writeFileSync(temporary, JSON.stringify({ mode }), { mode: 0o600 });
+    fs.renameSync(temporary, controlFile);
+  } catch (error) { storageError = error; }
+  const result = await work;
+  if (storageError) throw new Error("Control changed, but its restart preference could not be saved. Check disk space before reopening the app.");
+  return result;
+}
+try {
+  const saved = JSON.parse(fs.readFileSync(controlFile, "utf8"));
+  if (saved.mode !== "ready") await setControlMode(["paused", "stopped"].includes(saved.mode) ? saved.mode : "stopped");
+} catch (error) { if (error.code !== "ENOENT") await setControlMode("stopped"); }
+
+// An inherited socketpair joins the menu-bar owner and its child. This has
+// no filesystem endpoint, no reusable credential and no MCP equivalent.
+// Losing the human control process fails closed before accepting more work.
+if (process.env.CODEWHALE_CU_CONTROL_FD === "3") {
+  const control = new net.Socket({ fd: 3, readable: true, writable: true });
+  delete process.env.CODEWHALE_CU_CONTROL_FD;
+  let input = "";
+  control.setEncoding("utf8");
+  const status = () => ({ ...controlStatus(), version: APP_VERSION, checking, backgroundCheck, error: controlError,
+    update: update ? { available: update.available, version: update.version, message: update.message, busy: updating } : null });
+  const send = (id, error) => {
+    if (error) controlError = String(error.message ?? error).slice(0, 400);
+    if (!control.destroyed) control.write(JSON.stringify({ id, ...status() }) + "\n");
+  };
+  control.on("data", chunk => {
+    input += chunk;
+    if (input.length > 8192) { control.destroy(); return; }
+    let newline;
+    while ((newline = input.indexOf("\n")) >= 0) {
+      const line = input.slice(0, newline); input = input.slice(newline + 1);
+      let request;
+      try { request = JSON.parse(line); } catch { continue; }
+      const { id, command } = request;
+      if (command === "status") send(id);
+      else if (["pause", "resume", "stop"].includes(command)) {
+        const mode = { pause: "paused", resume: "ready", stop: "stopped" }[command];
+        userControl(mode).then(() => {
+          controlError = null;
+          if (mode === "stopped") {
+            // Keep old owner sockets alive but invalidate their leases. An
+            // already queued request can never silently obtain a fresh one.
+            for (const lease of leases.values()) lease.stopped = true;
+          }
+          send(id);
+        }).catch(error => send(id, error));
+      } else if (command === "check") {
+        if (checking || controlStatus().sessions.some(s => s.action)) { send(id, new Error("Wait for the current action to finish before running the check.")); continue; }
+        checking = true; backgroundCheck = null; send(id);
+        runBackgroundCheck({ bundle }).then(result => { backgroundCheck = result; }).catch(error => {
+          backgroundCheck = { ok: false, message: error.message };
+        }).finally(() => { checking = false; send(id); });
+      } else if (command === "updates" && !updating) {
+        updating = true; update = { available: false, message: "Checking for updates…" }; send(id);
+        checkForUpdate().then(result => { update = result; }).catch(error => { update = { available: false, message: error.message }; }).finally(() => { updating = false; send(id); });
+      } else if (command === "install_update" && update?.available && !updating && bundle) {
+        updating = true; update.message = "Downloading and verifying the update…"; send(id);
+        prepareUpdate(update).then(async prepared => {
+          await userControl("stopped");
+          await restartWithUpdate(prepared, bundle);
+          update.message = "Restarting Computer Use…"; send(id);
+        }).catch(error => { updating = false; update.message = error.message; send(id); });
+      } else send(id, new Error("Unknown or unavailable control command"));
+    }
+  });
+  control.on("error", () => {});
+  control.on("close", () => { userControl("stopped").catch(error => log(`control owner cleanup: ${error.message}`)); });
+}
 async function serve(conn) {
   let buf = "";
   let chain = Promise.resolve();
@@ -85,6 +169,8 @@ async function serve(conn) {
           }
         } else if (!leases.has(req.sessionId) || leases.get(req.sessionId).token !== req.leaseToken) {
           reply = { ok: false, error: { code: "session_owner_required", message: "Computer request needs its live session owner lease; update or restart the MCP server" } };
+        } else if (leases.get(req.sessionId).stopped && !["close_session", "release_session_input"].includes(req.tool)) {
+          reply = { ok: false, error: { code: "control_stopped", message: "The user stopped this computer session. Start a new task after they allow control in the menu bar." } };
         } else if (["close_session", "release_session_input"].includes(req.tool)) {
           try {
             if (req.tool === "close_session") await closeSession(req.sessionId);
@@ -114,21 +200,7 @@ server.listen(sock, () => {
     } catch (err) { log(`could not record launch command: ${err.message}`); }
   }
   log(`v${APP_VERSION} listening on ${sock}${bundle ? ` (bundle ${bundle})` : " (bare, no bundle identity)"}`);
-  if (bundle && process.env.CODEWHALE_CU_APP_WARM !== "off") warmPermissions();
 });
-
-/**
- * Touch every permission-gated capability once so the OS asks for the grants
- * under the app's own name and icon (macOS: Automation → System Events,
- * Accessibility, Screen Recording). Failures are logged, never fatal: the
- * probe fails closed and names the missing grant, which is the point.
- */
-async function warmPermissions() {
-  for (const tool of ["probe", "list_apps"]) {
-    const r = await handle({ tool }, { computerId: "local" });
-    log(`warm-up ${tool}: ${r.ok ? JSON.stringify(r.data?.permissions ?? "ok") : `${r.error?.code}: ${r.error?.message}`}`);
-  }
-}
 
 async function shutdown(signal) {
   if (shuttingDown) return;

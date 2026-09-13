@@ -558,6 +558,7 @@ export function create({ exec }) {
       p = await native("app_info", { app_ref: find, activate });
     }
     if (activate && p?.frontmost === false) throw Object.assign(new ExecError("The selected application did not become frontmost; no input mode was enabled. Continue with background control or wait for the user."), { code: "activation_not_confirmed" });
+    if (p?.bundle_id === "net.codewhale.computer-use") throw Object.assign(new ExecError("The Computer Use setup and safety controls belong to the user and cannot be operated by this plugin."), { code: "protected_application" });
     // A bare executable has no bundle id; carrying an empty one would make the
     // identity unmatchable.
     state.inputApp = { pid: p.pid, ...(p.bundle_id ? { bundle_id: p.bundle_id } : {}) };
