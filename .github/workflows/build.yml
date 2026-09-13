@@ -1,0 +1,47 @@
+name: Build AsBudy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-linux-x64:
+    name: Build linux-x64
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          targets: x86_64-unknown-linux-musl
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install musl toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y binutils musl-tools
+
+      - name: Build
+        run: cargo build --profile dist --locked --target x86_64-unknown-linux-musl -p codewhale-cli
+
+      - name: Stage binary
+        run: |
+          cp target/x86_64-unknown-linux-musl/dist/codewhale asbudy-linux-x64
+          ls -la asbudy-linux-x64
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: asbudy-linux-x64
+          path: asbudy-linux-x64
+          retention-days: 30
