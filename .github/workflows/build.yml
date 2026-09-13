@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   build-linux-x64:
@@ -45,3 +45,10 @@ jobs:
           name: asbudy-linux-x64
           path: asbudy-linux-x64
           retention-days: 30
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: asbudy-linux-x64
+          tag_name: v0.1.0
+          name: AsBudy v0.1.0
