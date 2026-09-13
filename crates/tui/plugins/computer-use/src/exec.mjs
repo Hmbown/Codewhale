@@ -131,7 +131,7 @@ export async function runInputLease(cmd, args = [], opts = {}) {
       let commandTimer, abort;
       try {
         throwIfAborted(signal);
-        if (closed || stopped || child?.exitCode !== null || child?.signalCode) throw new ExecError("Native input owner is closed");
+        if (closed || stopped || child?.exitCode !== null || child?.signalCode) throw Object.assign(new ExecError("Native input owner is closed"), { code: "input_owner_closed" });
         const next = reply();
         const cancelled = new Promise((_, reject) => {
           abort = () => reject(Object.assign(new ExecError("computer request cancelled"), { code: "cancelled" }));

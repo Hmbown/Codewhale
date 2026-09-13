@@ -37,6 +37,39 @@ async function backend(computerId, sessionId, persistentInputOwner) {
 }
 
 const sessions = new Map();
+let controlMode = "ready";
+let controlGeneration = 0;
+let cleanupPending = false;
+
+/** Human-facing state contains app identity and action names, never task text. */
+export function controlStatus() {
+  return { mode: controlMode, cleanupPending, sessions: [...sessions.values()]
+    .filter((s) => !s.closed && s.target)
+    .map((s) => ({ target: s.target, mode: s.mode, action: s.action ?? null })) };
+}
+
+// Called only by the launcher's inherited control channel, never an MCP tool.
+// Abort before queuing cleanup so even a held gesture yields to the person.
+export async function setControlMode(mode) {
+  if (!["ready", "paused", "stopped"].includes(mode)) throw new Error("Unknown control mode");
+  if (mode === "ready") {
+    if (cleanupPending) throw new Error("Input is still being released; try again in a moment.");
+    controlMode = mode;
+    return controlStatus();
+  }
+  controlMode = mode;
+  const generation = ++controlGeneration;
+  cleanupPending = true;
+  const results = await Promise.allSettled([...sessions.keys()].map((key) => {
+    const colon = key.indexOf(":");
+    return releaseSessionInput(key.slice(colon + 1), key.slice(0, colon), { close: mode === "stopped" });
+  }));
+  const failure = results.find((r) => r.status === "rejected");
+  // A cleanup failure stays blocked. Resume cannot hide owned input.
+  if (failure) throw failure.reason;
+  if (generation === controlGeneration) cleanupPending = false;
+  return controlStatus();
+}
 
 function enqueue(fn) {
   const next = queue.then(fn);
@@ -97,6 +130,8 @@ export async function handle(req, { computerId = "local", sessionId = "direct", 
     return { ok: false, error: { code: "tool_not_allowed", message: `tool "${tool}" is not in the remote allow-list` } };
   }
   if (tool === "platform") return { ok: true, platform: process.platform };
+  if (controlMode !== "ready") return { ok: false, error: { code: `control_${controlMode}`, message: `Computer Use is ${controlMode} by the user. Wait for them to resume it in the menu bar.` } };
+  const generation = controlGeneration;
   const key = `${computerId}:${sessionId}`;
   let session = sessions.get(key);
   if (!session) {
@@ -125,8 +160,11 @@ export async function handle(req, { computerId = "local", sessionId = "direct", 
   try {
     return await enqueue(() => withSignal(controller.signal, async () => {
       throwIfAborted();
+      if (generation !== controlGeneration || controlMode !== "ready") throw Object.assign(new Error("Computer control was interrupted by the user."), { code: "cancelled" });
       const instance = await backend(computerId, sessionId, persistentInputOwner);
       throwIfAborted();
+      session.action = tool;
+      if (tool === "open_application") { session.target = null; session.mode = null; }
       if (INPUT_MUTATIONS.has(tool) && heldPointers.has(computerId) && heldPointers.get(computerId) !== key) {
         return { ok: false, error: { code: "input_busy", message: "Another computer session owns a held pointer; release it or close that session before sending input." } };
       }
@@ -147,6 +185,10 @@ export async function handle(req, { computerId = "local", sessionId = "direct", 
         throw error;
       }
       if (tool === "left_mouse_up" && heldPointers.get(computerId) === key) heldPointers.delete(computerId);
+      if (tool === "open_application" && data?.resolved) {
+        session.target = { name: String(data.resolved.name ?? "Application").slice(0, 128), pid: data.resolved.pid };
+        session.mode = data.shared_pointer || data.activate ? "foreground" : "background";
+      }
       return { ok: true, platform: process.platform, tool, data };
     }));
   } catch (err) {
@@ -154,6 +196,7 @@ export async function handle(req, { computerId = "local", sessionId = "direct", 
   } finally {
     signal?.removeEventListener("abort", abort);
     session.requests.delete(controller);
+    session.action = null;
     session.touched = Date.now();
   }
 }

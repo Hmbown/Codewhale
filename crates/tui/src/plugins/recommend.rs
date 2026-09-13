@@ -509,6 +509,7 @@ mod tests {
             catalog_id: MarketplaceCatalogId::new(catalog),
             name: name.to_string(),
             display_name: Some(format!("{name} plugin")),
+            icon: None,
             description: Some(format!("{name} integration")),
             version: None,
             author: None,

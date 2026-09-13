@@ -72,6 +72,9 @@ pub struct PluginMeta {
     /// slugified to satisfy the Agent Plugins name rule.
     #[serde(default)]
     pub display_name: Option<String>,
+    /// Bounded inline PNG artwork. Never a remote fetch or executable SVG.
+    #[serde(default)]
+    pub icon: Option<String>,
     #[serde(default)]
     pub homepage: Option<String>,
     #[serde(default)]
@@ -602,6 +605,9 @@ impl PluginManifest {
         validate_optional_text("description", self.plugin.description.as_deref(), 1_024)?;
         validate_optional_text("author", self.plugin.author.as_deref(), 256)?;
         validate_optional_text("display name", self.plugin.display_name.as_deref(), 128)?;
+        if let Some(icon) = &self.plugin.icon {
+            validate_icon(icon)?;
+        }
         validate_optional_text("homepage", self.plugin.homepage.as_deref(), 2_048)?;
         validate_optional_text("repository", self.plugin.repository.as_deref(), 2_048)?;
         validate_optional_text("license", self.plugin.license.as_deref(), 128)?;
@@ -1719,6 +1725,29 @@ pub(crate) fn capability_hash_v1(inventory: &PluginInventory) -> String {
 /// Historical v2 capability digest. Kept only to prove that receipts from the
 /// Skills/MCP-only activation policy fail closed when v3 enables additional
 /// declarative adapters.
+/// Catalog and manifest artwork follows one inert, bounded wire format.
+pub fn validate_icon(value: &str) -> Result<(), String> {
+    use base64::Engine;
+    if value.len() > 32_768 {
+        return Err("plugin icon exceeds 32 KiB".into());
+    }
+    let encoded = value
+        .strip_prefix("data:image/png;base64,")
+        .ok_or("plugin icon must be an inline PNG")?;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .map_err(|_| "plugin icon has invalid base64")?;
+    if bytes.len() < 33 || &bytes[..8] != b"\x89PNG\r\n\x1a\n" || &bytes[12..16] != b"IHDR" {
+        return Err("plugin icon has an invalid PNG header".into());
+    }
+    let width = u32::from_be_bytes(bytes[16..20].try_into().map_err(|_| "invalid PNG width")?);
+    let height = u32::from_be_bytes(bytes[20..24].try_into().map_err(|_| "invalid PNG height")?);
+    if width == 0 || height == 0 || width > 256 || height > 256 {
+        return Err("plugin icon must fit within 256 by 256 pixels".into());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 pub(crate) fn capability_hash_v2(inventory: &PluginInventory) -> String {
     let mut hasher = Sha256::new();
@@ -2364,5 +2393,40 @@ args = ["server.js", "--mode=worker", "-e", "console.log('ready')"]
             );
             assert!(root.join(arg).is_file(), "{arg} must exist in the bundle");
         }
+    }
+}
+
+#[cfg(test)]
+mod icon_tests {
+    use super::validate_icon;
+    use base64::Engine;
+
+    #[test]
+    fn artwork_is_inline_bounded_png_only() {
+        let manifest: serde_json::Value =
+            serde_json::from_str(include_str!("../../plugins/computer-use/plugin.json")).unwrap();
+        let icon = manifest["extensions"]["net.codewhale"]["icon"]
+            .as_str()
+            .unwrap();
+        assert!(validate_icon(icon).is_ok());
+        for invalid in [
+            "https://publisher.example/tracker.png",
+            "data:image/svg+xml,<svg/>",
+            "data:image/png;base64,invalid",
+        ] {
+            assert!(validate_icon(invalid).is_err());
+        }
+        let mut png = base64::engine::general_purpose::STANDARD
+            .decode(icon.strip_prefix("data:image/png;base64,").unwrap())
+            .unwrap();
+        png[16..20].copy_from_slice(&100_000_u32.to_be_bytes());
+        assert!(
+            validate_icon(&format!(
+                "data:image/png;base64,{}",
+                base64::engine::general_purpose::STANDARD.encode(png)
+            ))
+            .is_err()
+        );
+        assert!(validate_icon(&"x".repeat(32_769)).is_err());
     }
 }

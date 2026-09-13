@@ -552,6 +552,7 @@ pub fn parse_kimi_plugin_json(text: &str, root: &Path) -> Result<PluginManifest,
             license: kimi.license,
             keywords: kimi.keywords,
             display_name,
+            icon: None,
         },
         skills,
         commands,
@@ -633,6 +634,8 @@ pub struct CodewhalePluginExtension {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub skills: Option<PluginPathSpec>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub commands: Option<PluginPathSpec>,
@@ -654,6 +657,7 @@ impl CodewhalePluginExtension {
     #[must_use]
     fn is_empty(&self) -> bool {
         self.display_name.is_none()
+            && self.icon.is_none()
             && self.skills.is_none()
             && self.commands.is_none()
             && self.agents.is_none()
@@ -931,6 +935,7 @@ pub fn standard_to_manifest(
             license: standard.license,
             keywords: standard.keywords,
             display_name: extension.display_name,
+            icon: extension.icon,
         },
         skills,
         commands: extension.commands,
@@ -1016,6 +1021,7 @@ pub fn manifest_to_standard(
 
     let extension = CodewhalePluginExtension {
         display_name: display_name.clone(),
+        icon: manifest.plugin.icon.clone(),
         skills: manifest
             .skills
             .clone()

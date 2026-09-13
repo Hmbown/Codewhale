@@ -24,6 +24,14 @@ and Screen Recording grants remain controlled by the user in System Settings.
 Use `request_access` to inspect readiness; a loaded plugin alone does not prove
 its OS permissions work.
 
+When the standalone Computer Use helper is registered, it owns local input
+even when Codewhale carries an embedded native helper. Version 0.3.0 adds its
+whale menu, permission setup, a disposable background check and human
+Pause/Stop controls. A registered helper that cannot start causes a clear
+error; the client does not silently bypass its controls. Without a registered
+standalone app, the included helper remains available under the host's
+permission identity.
+
 The MCP server requires Node.js 20 or newer. Codewhale Apps packages its own
 Node runtime; the CLI uses Node on PATH. Homebrew declares the dependency;
 Cargo and direct binary users can install Node from <https://nodejs.org/>.
