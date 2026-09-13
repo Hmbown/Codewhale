@@ -465,10 +465,10 @@ export function workflowReceiptPresentation(item, detail, raw) {
     : rejected > 1
       ? `${rejected} task dispatches were rejected`
       : status === "failed"
-        ? "The workflow did not complete"
-        : "The workflow completed with degraded results";
+        ? "工作流未完成"
+        : "工作流完成，但结果降级";
   return {
-    label: status === "failed" ? "Workflow · Failed" : "Workflow · Needs attention",
+    label: status === "failed" ? "Workflow · Failed" : "工作流 · 需要处理",
     summary,
     raw,
     failed: true,
@@ -544,13 +544,13 @@ export function imageInputPresentation(value) {
   if (value === "unsupported") {
     return {
       state: "unsupported",
-      label: "Text only",
+      label: "仅文本",
       description: "This exact provider route does not support image input.",
     };
   }
   return {
     state: "unknown",
-    label: "Image support unverified",
+    label: "图像支持未验证",
     description: "Image-input support is not verified for this exact provider route.",
   };
 }
@@ -950,7 +950,7 @@ function startBrowserClient() {
         // The status line is enough when the response is not JSON.
       }
       if (response.status === 401) {
-        message = "This browser session is not authenticated. Restart `codewhale web` to open a fresh one-time session.";
+        message = "此浏览器会话未通过认证。重启 `codewhale web` 以打开一个新的临时会话。";
       }
       throw new Error(message);
     }
@@ -962,7 +962,7 @@ function startBrowserClient() {
   function renderThreadList() {
     dom.threadList.replaceChildren();
     if (app.summaries.length === 0) {
-      const empty = element("p", "thread-preview", "No matching threads");
+      const empty = element("p", "thread-preview", "没有匹配的会话");
       empty.style.padding = "8px 10px";
       dom.threadList.append(empty);
       return;
@@ -970,7 +970,7 @@ function startBrowserClient() {
 
     const groups = groupThreadSummaries(app.summaries);
     if (groups.needsYou.length > 0) {
-      appendThreadGroup("Needs you", "needs-you", groups.needsYou);
+      appendThreadGroup("需要你处理", "needs-you", groups.needsYou);
     }
     if (groups.recent.length > 0) {
       appendThreadGroup("Recent", "recent", groups.recent);
@@ -991,7 +991,7 @@ function startBrowserClient() {
       row.dataset.threadId = summary.id;
       row.setAttribute("aria-current", summary.id === app.selectedThreadId ? "true" : "false");
       const titleRow = element("span", "thread-title-row");
-      titleRow.append(element("span", "thread-title", summary.title || "New thread"));
+      titleRow.append(element("span", "thread-title", summary.title || "新建会话"));
       const indicators = element("span", "thread-row-indicators");
       const attentionCount = pendingAttentionCount(summary);
       if (attentionCount > 0) {
@@ -1004,7 +1004,7 @@ function startBrowserClient() {
       indicators.append(status);
       titleRow.append(indicators);
       row.append(titleRow);
-      row.append(element("span", "thread-preview", summary.preview || "No messages yet"));
+      row.append(element("span", "thread-preview", summary.preview || "还没有消息"));
       const branch = summary.branch || basename(summary.workspace) || "local";
       row.append(element("span", "thread-meta", `${branch} · ${relativeTime(summary.updated_at)}`));
       row.addEventListener("click", () => selectThread(summary.id));
@@ -1038,7 +1038,7 @@ function startBrowserClient() {
       row.type = "button";
       row.dataset.sessionId = summary.id;
       const titleRow = element("span", "thread-title-row");
-      titleRow.append(element("span", "thread-title", summary.title || "Untitled session"));
+      titleRow.append(element("span", "thread-title", summary.title || "未命名会话"));
       row.append(titleRow);
       row.append(element("span", "thread-preview", summary.preview || summary.title));
       const scope = basename(summary.workspace) || "local";
@@ -1131,8 +1131,8 @@ function startBrowserClient() {
     dom.peek.replaceChildren();
 
     const header = element("div", "peek-header");
-    header.append(element("p", "eyebrow", "Saved session — read only"));
-    header.append(element("h2", "", peek.title || "Untitled session"));
+    header.append(element("p", "eyebrow", "已保存的会话 — 只读"));
+    header.append(element("h2", "", peek.title || "未命名会话"));
     header.append(
       element(
         "p",
@@ -1159,7 +1159,7 @@ function startBrowserClient() {
       dom.peek.append(row);
     }
 
-    const resume = element("button", "primary-button", "Resume into a live thread");
+    const resume = element("button", "primary-button", "恢复为进行中的会话");
     resume.type = "button";
     resume.addEventListener("click", () => resumeSession(peek.session_id));
     dom.peek.append(resume);
@@ -1208,11 +1208,11 @@ function startBrowserClient() {
       });
       if (!subscribed) return;
       renderAll();
-      setConnection("ready", "Local runtime connected");
+      setConnection("ready", "本地引擎已连接");
     } catch (error) {
       if (generation !== app.generation) return;
       showStatus(error.message);
-      setConnection("error", "Runtime connection failed");
+      setConnection("error", "引擎连接失败");
     }
   }
 
@@ -1237,7 +1237,7 @@ function startBrowserClient() {
       const reject = rejectOpen;
       resolveOpen = null;
       rejectOpen = null;
-      reject(new Error("Runtime event stream open was cancelled"));
+      reject(new Error("引擎事件流打开被取消"));
     };
     if (waitForOpen) app.streamOpenCancel = cancelOpen;
     const clearOpenHandshake = () => {
@@ -1245,7 +1245,7 @@ function startBrowserClient() {
     };
     stream.onopen = () => {
       opened = true;
-      setConnection("ready", "Local runtime connected");
+      setConnection("ready", "本地引擎已连接");
       clearOpenHandshake();
       if (resolveOpen) resolveOpen();
       resolveOpen = null;
@@ -1298,7 +1298,7 @@ function startBrowserClient() {
         const reject = rejectOpen;
         resolveOpen = null;
         rejectOpen = null;
-        reject?.(new Error("Runtime event stream did not reopen"));
+        reject?.(new Error("引擎事件流未重新打开"));
         return;
       }
       setConnection("", "Reconnecting to local runtime…");
@@ -1338,11 +1338,11 @@ function startBrowserClient() {
       if (!subscribed) return;
       renderAll();
       showStatus("");
-      setConnection("ready", "Local runtime connected");
+      setConnection("ready", "本地引擎已连接");
     } catch (error) {
       if (generation !== app.generation || threadId !== app.selectedThreadId) return;
       showStatus(`Could not refresh the thread snapshot: ${error.message}`);
-      setConnection("error", "Runtime recovery failed");
+      setConnection("error", "引擎恢复失败");
       app.reconnectTimer = setTimeout(
         () => recoverProjection(threadId, generation),
         900,
@@ -1372,9 +1372,9 @@ function startBrowserClient() {
   function renderHeader() {
     const thread = app.threadState.thread;
     const summary = app.summaries.find((item) => item.id === app.selectedThreadId);
-    const title = thread?.title || summary?.title || (thread ? "New thread" : "Choose a thread");
+    const title = thread?.title || summary?.title || (thread ? "新建会话" : "选择一个会话");
     setSafeText(dom.title, title);
-    setSafeText(dom.kicker, thread ? "Local Runtime thread" : "Local Runtime");
+    setSafeText(dom.kicker, thread ? "本地引擎会话" : "本地引擎");
     dom.rename.disabled = !thread;
     dom.archive.disabled = !thread;
     dom.facts.replaceChildren();
@@ -1386,7 +1386,7 @@ function startBrowserClient() {
     if (branch) dom.facts.append(factChip("Branch", branch));
     const provider = threadProviderLabel(thread);
     if (provider) dom.facts.append(factChip("Provider", provider));
-    dom.facts.append(factChip("Model", thread.model || "Runtime default"));
+    dom.facts.append(factChip("Model", thread.model || "引擎默认"));
     dom.facts.append(factChip("Mode", modeLabel(thread.mode)));
     dom.facts.append(factChip("Permission", permissionLabel(thread)));
   }
@@ -1542,7 +1542,7 @@ function startBrowserClient() {
     if (presentation.raw && presentation.raw !== presentation.summary) {
       if (!disclosure) {
         disclosure = element("details");
-        const summary = element("summary", "", "Show receipt");
+        const summary = element("summary", "", "查看回执");
         const raw = element("pre");
         raw.dataset.itemPart = "raw";
         disclosure.append(summary, raw);
@@ -1665,8 +1665,8 @@ function startBrowserClient() {
     const titleId = `attention-approval-${safeDomId(approvalId)}`;
     card.setAttribute("role", "group");
     card.setAttribute("aria-labelledby", titleId);
-    card.append(element("p", "eyebrow", "Approval required"));
-    const title = element("h2", "", approval.tool_name || "Tool request");
+    card.append(element("p", "eyebrow", "需要审批"));
+    const title = element("h2", "", approval.tool_name || "工具请求");
     title.id = titleId;
     card.append(title);
     card.append(element("p", "", approval.intent_summary || approval.description || "Codewhale is waiting for permission."));
@@ -1674,7 +1674,7 @@ function startBrowserClient() {
     const rememberLabel = element("label", "remember-field");
     const remember = document.createElement("input");
     remember.type = "checkbox";
-    rememberLabel.append(remember, document.createTextNode("Remember for this thread"));
+    rememberLabel.append(remember, document.createTextNode("本会话记住此选择"));
     const deny = element("button", "quiet-button danger", "Deny");
     deny.type = "button";
     deny.addEventListener("click", () => resolveApproval(approvalId, "deny", remember.checked));
@@ -1721,15 +1721,15 @@ function startBrowserClient() {
     const titleId = `attention-input-${safeDomId(inputId)}`;
     card.setAttribute("role", "group");
     card.setAttribute("aria-labelledby", titleId);
-    card.append(element("p", "eyebrow", "Input required"));
-    const title = element("h2", "", "Codewhale has a question");
+    card.append(element("p", "eyebrow", "需要输入"));
+    const title = element("h2", "", "AsBudy 有个问题");
     title.id = titleId;
     card.append(title);
     const questions = Array.isArray(envelope.request?.questions) ? envelope.request.questions : [];
     const groups = [];
     for (const question of questions) {
       const fieldset = element("fieldset", "question-fieldset");
-      fieldset.append(element("legend", "", question.question || question.header || "Choose an option"));
+      fieldset.append(element("legend", "", question.question || question.header || "选择一个选项"));
       const controls = [];
       for (const option of Array.isArray(question.options) ? question.options : []) {
         const label = element("label", "answer-option");
@@ -1749,7 +1749,7 @@ function startBrowserClient() {
       const other = document.createElement("input");
       other.className = "other-answer";
       other.type = "text";
-      other.placeholder = "Other response";
+      other.placeholder = "其他回答";
       other.setAttribute("aria-label", `${question.header || "Question"} other response`);
       if (!question.multi_select) {
         other.addEventListener("input", () => {
@@ -1768,7 +1768,7 @@ function startBrowserClient() {
       groups.push({ question, controls, other });
     }
     const actions = element("div", "attention-actions");
-    const submit = element("button", "primary-button", "Submit answers");
+    const submit = element("button", "primary-button", "提交回答");
     submit.type = "submit";
     actions.append(submit);
     card.append(actions);
@@ -2270,13 +2270,13 @@ function startBrowserClient() {
         api("/v1/workspace/status"),
       ]);
       renderRuntimeProvenance(dom.runtimeProvenance, app.runtimeInfo);
-      setConnection("ready", "Local runtime connected");
+      setConnection("ready", "本地引擎已连接");
       await loadThreads();
       await loadSessions();
       if (app.summaries[0]) await selectThread(app.summaries[0].id);
       else renderAll();
     } catch (error) {
-      setConnection("error", "Runtime connection failed");
+      setConnection("error", "引擎连接失败");
       showStatus(error.message);
       renderAll();
     }
@@ -2302,17 +2302,17 @@ export function modeLabel(mode) {
   if (mode === "agent") return "Work";
   if (mode === "plan") return "Plan";
   if (mode === "operate") return "Operate";
-  return humanize(mode || "Runtime default");
+  return humanize(mode || "引擎默认");
 }
 
 export function formatRuntimeProvenance(runtimeInfo) {
   const version = String(
     runtimeInfo?.codewhale_version || runtimeInfo?.version || "",
-  ).trim() || "version unknown";
+  ).trim() || "版本未知";
   const commit = String(runtimeInfo?.codewhale_commit || "").trim();
   const source = /^[0-9a-f]{40}$/i.test(commit)
     ? commit.slice(0, 12)
-    : "source unknown";
+    : "来源未知";
   return `${version} · ${source}`;
 }
 
@@ -2321,7 +2321,7 @@ export function renderRuntimeProvenance(element, runtimeInfo) {
 }
 
 function permissionLabel(thread) {
-  if (thread.trust_mode) return "Full Access";
+  if (thread.trust_mode) return "完全访问";
   if (thread.auto_approve) return "Auto-Review";
   return "Ask";
 }

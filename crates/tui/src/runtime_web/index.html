@@ -1,37 +1,37 @@
 <!doctype html>
-<html lang="en">
+<html lang="zh-CN">
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="color-scheme" content="dark">
     <meta name="theme-color" content="#020711">
-    <title>Codewhale</title>
+    <title>AsBudy</title>
     <link rel="icon" href="data:,">
     <link rel="stylesheet" href="/assets/codewhale-web.css">
     <script type="module" src="/assets/codewhale-web.js"></script>
   </head>
   <body>
     <div class="shell" id="app-shell">
-      <aside class="rail" id="thread-rail" aria-label="Threads" tabindex="-1">
+      <aside class="rail" id="thread-rail" aria-label="会话" tabindex="-1">
         <div class="rail-brand">
           <img class="brand-mark" src="/assets/codewhale-192.png" alt="">
           <div>
-            <p class="brand-name">Codewhale</p>
-            <p class="brand-context">Local runtime</p>
+            <p class="brand-name">AsBudy</p>
+            <p class="brand-context">本地引擎</p>
           </div>
-          <button class="quiet-button rail-close" id="rail-close" type="button" aria-label="Close threads">Close</button>
+          <button class="quiet-button rail-close" id="rail-close" type="button" aria-label="关闭会话栏">关闭</button>
         </div>
 
         <button class="primary-button new-thread" id="new-thread" type="button">
-          New thread
+          新建会话
         </button>
 
         <label class="search-field">
-          <span class="sr-only">Search threads</span>
-          <input id="thread-search" type="search" autocomplete="off" placeholder="Search threads">
+          <span class="sr-only">搜索会话</span>
+          <input id="thread-search" type="search" autocomplete="off" placeholder="搜索会话">
         </label>
 
-        <nav class="thread-list" id="thread-list" aria-label="Live threads"></nav>
+        <nav class="thread-list" id="thread-list" aria-label="进行中的会话"></nav>
 
         <!-- Read-only peek for a selected saved session. Bounded and redacted
              server-side by GET /v1/sessions/{id}?peek=true; this pane never
@@ -43,60 +43,60 @@
              through POST /v1/sessions/{id}/resume-thread, so the dashboard
              never gets a second session backend. -->
         <section class="saved-sessions" id="saved-sessions" hidden>
-          <h2 class="rail-section-title" id="saved-sessions-title">Saved sessions</h2>
+          <h2 class="rail-section-title" id="saved-sessions-title">已保存的会话</h2>
           <nav class="thread-list" id="session-list" aria-labelledby="saved-sessions-title"></nav>
         </section>
 
         <div class="rail-footer">
           <span class="connection-dot" id="connection-dot" aria-hidden="true"></span>
           <span class="connection-copy">
-            <span id="connection-label">Connecting to local runtime…</span>
-            <span class="runtime-provenance" id="runtime-provenance">version unknown · source unknown</span>
+            <span id="connection-label">正在连接本地引擎…</span>
+            <span class="runtime-provenance" id="runtime-provenance">版本未知 · 来源未知</span>
           </span>
         </div>
       </aside>
 
-      <button class="rail-scrim" id="rail-scrim" type="button" aria-label="Close threads" tabindex="-1" hidden></button>
+      <button class="rail-scrim" id="rail-scrim" type="button" aria-label="关闭会话栏" tabindex="-1" hidden></button>
 
       <main class="session">
         <header class="session-header">
           <div class="session-heading">
-            <button class="quiet-button rail-open" id="rail-open" type="button" aria-controls="thread-rail" aria-expanded="false">Threads</button>
+            <button class="quiet-button rail-open" id="rail-open" type="button" aria-controls="thread-rail" aria-expanded="false">会话</button>
             <div class="title-stack">
-              <p class="eyebrow" id="session-kicker">Local runtime</p>
-              <h1 id="session-title">Choose a thread</h1>
+              <p class="eyebrow" id="session-kicker">本地引擎</p>
+              <h1 id="session-title">选择一个会话</h1>
             </div>
           </div>
           <div class="header-actions">
-            <button class="quiet-button" id="rename-thread" type="button" disabled>Rename</button>
-            <button class="quiet-button danger" id="archive-thread" type="button" disabled>Archive</button>
+            <button class="quiet-button" id="rename-thread" type="button" disabled>重命名</button>
+            <button class="quiet-button danger" id="archive-thread" type="button" disabled>归档</button>
           </div>
-          <div class="session-facts" id="session-facts" aria-label="Session details"></div>
+          <div class="session-facts" id="session-facts" aria-label="会话详情"></div>
         </header>
 
         <div class="status-banner" id="status-banner" role="status" aria-live="polite" hidden></div>
 
-        <section class="session-peek" id="session-peek" aria-label="Saved session preview" hidden></section>
+        <section class="session-peek" id="session-peek" aria-label="已保存会话预览" hidden></section>
 
-        <section class="transcript" id="transcript" role="log" aria-label="Conversation" aria-live="polite" aria-relevant="additions" aria-atomic="false">
+        <section class="transcript" id="transcript" role="log" aria-label="对话" aria-live="polite" aria-relevant="additions" aria-atomic="false">
           <div class="empty-state">
             <img class="empty-mark" src="/assets/codewhale-192.png" alt="">
-            <h2>Your local agent, in the browser.</h2>
-            <p>Create a thread or choose one from the rail. This client uses the same Runtime as the terminal.</p>
+            <h2>你的本地智能体，就在浏览器里。</h2>
+            <p>新建一个会话，或从侧栏选择一个。此客户端与终端使用同一个运行时。</p>
           </div>
         </section>
 
-        <section class="attention" id="attention" role="region" aria-label="Items requiring attention" aria-live="assertive" aria-relevant="additions" aria-atomic="false" hidden></section>
+        <section class="attention" id="attention" role="region" aria-label="需要处理的事项" aria-live="assertive" aria-relevant="additions" aria-atomic="false" hidden></section>
 
         <footer class="composer-wrap">
           <form class="composer" id="composer">
-            <label class="sr-only" for="composer-input">Message Codewhale</label>
-            <textarea id="composer-input" rows="1" placeholder="Ask Codewhale to work in this repository…" disabled></textarea>
+            <label class="sr-only" for="composer-input">给 AsBudy 发消息</label>
+            <textarea id="composer-input" rows="1" placeholder="让 AsBudy 在这个仓库里工作…" disabled></textarea>
             <div class="composer-bar">
-              <span class="composer-hint">Enter send · Shift+Enter newline</span>
+              <span class="composer-hint">回车发送 · Shift+回车换行</span>
               <div class="composer-actions">
-                <button class="quiet-button" id="interrupt-turn" type="button" hidden>Stop</button>
-                <button class="send-button" id="send-message" type="submit" disabled>Send</button>
+                <button class="quiet-button" id="interrupt-turn" type="button" hidden>停止</button>
+                <button class="send-button" id="send-message" type="submit" disabled>发送</button>
               </div>
             </div>
           </form>
@@ -106,22 +106,22 @@
 
     <dialog class="rename-dialog new-thread-dialog" id="new-thread-dialog" tabindex="-1" aria-labelledby="new-thread-title" aria-describedby="new-thread-help">
       <form id="new-thread-form">
-        <p class="eyebrow">New thread</p>
-        <h2 id="new-thread-title">Choose a provider and model</h2>
-        <p class="dialog-copy" id="new-thread-help">This choice applies only to the new thread. It does not change your Runtime defaults.</p>
+        <p class="eyebrow">新建会话</p>
+        <h2 id="new-thread-title">选择提供商和模型</h2>
+        <p class="dialog-copy" id="new-thread-help">此选择仅对当前新会话生效，不会改变运行时的默认设置。</p>
 
         <label class="dialog-field">
-          <span class="dialog-label">Provider</span>
+          <span class="dialog-label">提供商</span>
           <select id="new-thread-provider" required disabled></select>
         </label>
 
         <label class="dialog-field" id="new-thread-model-select-field">
-          <span class="dialog-label">Model</span>
+          <span class="dialog-label">模型</span>
           <select id="new-thread-model" required disabled></select>
         </label>
 
         <label class="dialog-field" id="new-thread-model-input-field" hidden>
-          <span class="dialog-label">Model</span>
+          <span class="dialog-label">模型</span>
           <input id="new-thread-model-input" type="text" autocomplete="off" spellcheck="false" required disabled>
         </label>
 
@@ -129,27 +129,27 @@
         <p class="dialog-status" id="new-thread-status" role="status" aria-live="polite"></p>
 
         <div class="dialog-actions">
-          <button class="quiet-button" id="new-thread-cancel" type="button" autofocus>Cancel</button>
-          <button class="primary-button" id="new-thread-create" type="submit" disabled>Create thread</button>
+          <button class="quiet-button" id="new-thread-cancel" type="button" autofocus>取消</button>
+          <button class="primary-button" id="new-thread-create" type="submit" disabled>创建会话</button>
         </div>
       </form>
     </dialog>
 
     <dialog class="rename-dialog" id="rename-dialog">
       <form method="dialog" id="rename-form">
-        <p class="eyebrow">Thread title</p>
-        <h2>Rename this thread</h2>
+        <p class="eyebrow">会话标题</p>
+        <h2>重命名此会话</h2>
         <label>
-          <span class="sr-only">New thread title</span>
+          <span class="sr-only">新的会话标题</span>
           <input id="rename-input" type="text" maxlength="160" required autocomplete="off">
         </label>
         <div class="dialog-actions">
-          <button class="quiet-button" value="cancel" type="submit">Cancel</button>
-          <button class="primary-button" value="save" type="submit">Save title</button>
+          <button class="quiet-button" value="cancel" type="submit">取消</button>
+          <button class="primary-button" value="save" type="submit">保存标题</button>
         </div>
       </form>
     </dialog>
 
-    <noscript>Codewhale web requires JavaScript to connect to the local Runtime API.</noscript>
+    <noscript>AsBudy 网页版需要 JavaScript 才能连接本地运行时。</noscript>
   </body>
 </html>
