@@ -1,6 +1,6 @@
 {
   "repository": "https://github.com/Hmbown/codewhale-plugin-marketplace",
-  "revision": "4d8c77122983ef5ae3c48f6e7e771085ccb893c2",
+  "revision": "27b14d9136cf8a3527f4e70db1a8953185387c52",
   "catalog": {
     "name": "codewhale",
     "description": "First-party Codewhale extensions: the plugins and skills Codewhale ships, maintained in the open so anyone can propose a change.",
@@ -8,7 +8,7 @@
     "plugins": [
       {
         "name": "computer-use",
-        "source": "https://codeload.github.com/Hmbown/codewhale-plugin-marketplace/tar.gz/4d8c77122983ef5ae3c48f6e7e771085ccb893c2#path=plugins/computer-use",
+        "source": "https://codeload.github.com/Hmbown/codewhale-plugin-marketplace/tar.gz/27b14d9136cf8a3527f4e70db1a8953185387c52#path=plugins/computer-use",
         "version": "0.3.0",
         "description": "Let Codewhale see and operate your apps.",
         "homepage": "https://codewhale.net/computer-use",
@@ -23,21 +23,21 @@
       },
       {
         "name": "whalewiki",
-        "source": "https://codeload.github.com/Hmbown/codewhale-plugin-marketplace/tar.gz/4d8c77122983ef5ae3c48f6e7e771085ccb893c2#path=plugins/whalewiki",
+        "source": "https://codeload.github.com/Hmbown/codewhale-plugin-marketplace/tar.gz/27b14d9136cf8a3527f4e70db1a8953185387c52#path=plugins/whalewiki",
         "version": "0.1.0",
         "description": "An evidence-bound wiki for the repo: generated pages sealed against the source files they were written from, computed staleness, a zero-install CI drift gate, and a read-only MCP surface.",
         "homepage": "https://github.com/Hmbown/codewhale-plugin-marketplace"
       },
       {
         "name": "cloudflare-docs",
-        "source": "https://codeload.github.com/Hmbown/codewhale-plugin-marketplace/tar.gz/4d8c77122983ef5ae3c48f6e7e771085ccb893c2#path=plugins/cloudflare-docs",
+        "source": "https://codeload.github.com/Hmbown/codewhale-plugin-marketplace/tar.gz/27b14d9136cf8a3527f4e70db1a8953185387c52#path=plugins/cloudflare-docs",
         "version": "0.1.0",
         "description": "Cloudflare's official remote docs MCP: current Workers/Pages/storage/platform documentation search. No credentials required.",
         "homepage": "https://github.com/Hmbown/codewhale-plugin-marketplace"
       },
       {
         "name": "codewhale-skills",
-        "source": "https://codeload.github.com/Hmbown/codewhale-plugin-marketplace/tar.gz/4d8c77122983ef5ae3c48f6e7e771085ccb893c2#path=skills",
+        "source": "https://codeload.github.com/Hmbown/codewhale-plugin-marketplace/tar.gz/27b14d9136cf8a3527f4e70db1a8953185387c52#path=skills",
         "version": "1.0.0",
         "description": "The Codewhale skill set as one reviewed plugin: implement, debug, test, review, verify, webapp-testing, release, handoff, research and the rest of the bundled workflow skills. Each arrives namespaced as codewhale-skills:<name>. These skills also ship inside the Codewhale binary; install this bundle to carry a reviewed copy to a host that only loads plugins.",
         "homepage": "https://github.com/Hmbown/codewhale-plugin-marketplace"

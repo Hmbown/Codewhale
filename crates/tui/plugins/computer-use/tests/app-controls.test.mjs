@@ -12,16 +12,21 @@ const root = fileURLToPath(new URL("../", import.meta.url));
 test("human Pause cancels queued input; Stop invalidates owners; MCP cannot resume", async t => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cu-control-"));
   const log = path.join(dir, "calls.jsonl");
+  const endpoint = process.platform === "win32"
+    ? `\\\\.\\pipe\\cu-control-${process.pid}-${path.basename(dir)}`
+    : path.join(dir, "app.sock");
   const daemon = spawn(process.execPath, [path.join(root, "app/daemon.mjs")], { env: { ...process.env,
-    CODEWHALE_CU_STATE_DIR: dir, CODEWHALE_CU_APP_SOCKET: path.join(dir, "app.sock"), CODEWHALE_CU_APP_WARM: "off",
+    CODEWHALE_CU_STATE_DIR: dir, CODEWHALE_CU_APP_SOCKET: endpoint, CODEWHALE_CU_APP_WARM: "off",
     CODEWHALE_CU_TEST_BACKEND: path.join(root, "tests/fixtures/session-backend.mjs"), CU_SESSION_CALLS: log, CODEWHALE_CU_CONTROL_FD: "3" }, stdio: ["ignore", "ignore", "pipe", "pipe"] });
   let errors = ""; daemon.stderr.on("data", chunk => { errors += chunk; });
   const sockets = [];
-  t.after(async () => { sockets.forEach(socket => socket.destroy()); daemon.kill("SIGTERM"); await new Promise(resolve => daemon.once("exit", resolve)); fs.rmSync(dir, { recursive: true, force: true }); });
+  t.after(async () => { sockets.forEach(socket => socket.destroy()); if(daemon.exitCode === null && daemon.signalCode === null) { daemon.kill("SIGTERM"); await new Promise(resolve => daemon.once("exit", resolve)); } fs.rmSync(dir, { recursive: true, force: true }); });
   async function until(predicate) { for(let i=0;i<250;i++) { if(predicate()) return; await delay(20); } throw new Error(`Timed out: ${errors}`); }
-  await until(() => fs.existsSync(path.join(dir, "app.sock")));
+  // Named pipes on Windows have no filesystem entry; both transports publish
+  // the same run receipt only after the listener is ready.
+  await until(() => fs.existsSync(path.join(dir, "app-run.json")));
   function request(payload, keepOpen = false) {
-    const socket = net.connect(path.join(dir, "app.sock")); sockets.push(socket);
+    const socket = net.connect(endpoint); sockets.push(socket);
     return new Promise((resolve, reject) => {
       socket.on("error", reject); socket.on("connect", () => socket.write(JSON.stringify(payload)+"\n"));
       let buffer=""; socket.on("data", chunk => { buffer += chunk; if(!buffer.includes("\n")) return; if(!keepOpen) socket.destroy(); resolve(JSON.parse(buffer.split("\n")[0])); });
