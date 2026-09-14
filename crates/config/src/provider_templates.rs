@@ -6,7 +6,7 @@
 //! - first-class gateways users still treat as "paste a Base URL"
 //!   (OpenCode Zen / Go), and
 //! - named OpenAI-compatible custom routes that are not `ProviderKind`
-//!   variants (SenseNova, Baseten, Groq, Cerebras, Command Code). Hosted
+//!   variants (SenseNova, Baseten, Groq, Cerebras, Command Code, AICraft). Hosted
 //!   Chat Completions backends are descriptor rows — not new enum variants
 //!   and not compiled model rosters. Live `GET /v1/models` and the
 //!   Codewhale catalog are the offering list. Distinct *wires*
@@ -30,6 +30,12 @@ pub const SENSENOVA_TEMPLATE_ID: &str = "sensenova";
 pub const SENSENOVA_BASE_URL: &str = "https://token.sensenova.cn/v1";
 pub const SENSENOVA_DEFAULT_MODEL: &str = "deepseek-v4-flash";
 pub const SENSENOVA_API_KEY_ENV: &str = "SENSENOVA_API_KEY";
+
+/// AICraft — OpenAI-compatible MaaS gateway (aicraftapi.com).
+pub const AICRAFT_TEMPLATE_ID: &str = "aicraft";
+pub const AICRAFT_BASE_URL: &str = "https://aicraftapi.com/v1";
+pub const AICRAFT_DEFAULT_MODEL: &str = "claude-4.6-sonnet";
+pub const AICRAFT_API_KEY_ENV: &str = "AICRAFT_API_KEY";
 
 /// Agnes is requested by #5350 but has no published OpenAI-compatible
 /// host in this repository.
@@ -283,6 +289,17 @@ const TEMPLATES: &[ProviderSetupTemplate] = &[
         guidance: "Published Provider API. Live GET /v1/models is the roster. Do not import the Command Code CLI login. Store COMMAND_CODE_API_KEY, not a raw key.",
     },
     ProviderSetupTemplate {
+        id: AICRAFT_TEMPLATE_ID,
+        display_name: "AICraft",
+        apply: ProviderSetupApply::Compatible,
+        base_url: Some(AICRAFT_BASE_URL),
+        default_model: Some(AICRAFT_DEFAULT_MODEL),
+        api_key_env: Some(AICRAFT_API_KEY_ENV),
+        docs_url: Some("https://aicraftapi.com"),
+        credential_url: Some("https://aicraftapi.com"),
+        guidance: "AICraft MaaS gateway. OpenAI Chat Completions at aicraftapi.com. Store AICRAFT_API_KEY, not a raw key.",
+    },
+    ProviderSetupTemplate {
         id: AGNES_TEMPLATE_ID,
         display_name: "Agnes",
         apply: ProviderSetupApply::Unpublished,
@@ -484,7 +501,7 @@ mod tests {
     fn settings_value_names_fillable_then_unpublished() {
         assert_eq!(
             ProviderSetupTemplate::settings_value(),
-            "opencode-zen, opencode-go, sensenova, baseten, groq, cerebras, command-code; agnes unpublished"
+            "opencode-zen, opencode-go, sensenova, baseten, groq, cerebras, command-code, aicraft; agnes unpublished"
         );
     }
 
@@ -528,6 +545,7 @@ mod tests {
                 "https://api.commandcode.ai/provider/v1",
                 "COMMAND_CODE_API_KEY",
             ),
+            ("aicraft", AICRAFT_TEMPLATE_ID, AICRAFT_BASE_URL, AICRAFT_API_KEY_ENV),
         ] {
             let template = provider_setup_template(alias).unwrap_or_else(|| panic!("{alias}"));
             assert_eq!(template.id, id);
