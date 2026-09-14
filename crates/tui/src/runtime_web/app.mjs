@@ -461,7 +461,7 @@ export function workflowReceiptPresentation(item, detail, raw) {
   if (rejected === 0 && status !== "degraded" && status !== "failed") return null;
 
   const summary = rejected === 1
-    ? "1 task dispatch was rejected"
+    ? "有 1 个任务派发被拒绝了"
     : rejected > 1
       ? `${rejected} 个任务派发被拒绝`
       : status === "failed"
@@ -663,14 +663,14 @@ export async function collectProviderModelPages(providerId, fetchPage) {
       `/v1/providers/${encodeURIComponent(provider)}/models?${query.toString()}`,
     );
     if (String(response?.provider || "") !== provider) {
-      throw new Error("The Runtime returned a model page for a different provider.");
+      throw new Error("引擎返回了另一个提供商的模型页。");
     }
     if (!Array.isArray(response?.models)
       || response.models.length > PROVIDER_MODELS_PAGE_SIZE
       || !Number.isSafeInteger(response.total)
       || response.total < 0
       || response.total > MAX_PROVIDER_MODELS) {
-      throw new Error("The Runtime returned an invalid provider model page.");
+      throw new Error("引擎返回了无效的模型页。");
     }
     if (expectedTotal !== undefined && expectedTotal !== response.total) {
       throw new Error("The provider catalog changed; restart loading its models.");
@@ -687,15 +687,15 @@ export async function collectProviderModelPages(providerId, fetchPage) {
       : "";
     if (!nextCursor) {
       if (entries.length !== expectedTotal) {
-        throw new Error("The Runtime returned an incomplete provider model catalog.");
+        throw new Error("引擎返回的模型目录不完整。");
       }
       return entries;
     }
     if (pageEntries.length === 0 || seenCursors.has(nextCursor)) {
-      throw new Error("The Runtime returned a non-progressing model cursor.");
+      throw new Error("引擎返回的模型游标没有前进。");
     }
     if (entries.length >= expectedTotal) {
-      throw new Error("The Runtime returned a cursor beyond its provider model catalog.");
+      throw new Error("引擎返回的模型游标超出目录范围。");
     }
     seenCursors.add(nextCursor);
     cursor = nextCursor;
@@ -979,7 +979,7 @@ function startBrowserClient() {
       appendThreadGroup("需要你处理", "needs-you", groups.needsYou);
     }
     if (groups.recent.length > 0) {
-      appendThreadGroup("Recent", "recent", groups.recent);
+      appendThreadGroup("最近", "recent", groups.recent);
     }
   }
 
@@ -997,7 +997,7 @@ function startBrowserClient() {
       row.dataset.threadId = summary.id;
       row.setAttribute("aria-current", summary.id === app.selectedThreadId ? "true" : "false");
       const titleRow = element("span", "thread-title-row");
-      titleRow.append(element("span", "thread-title", summary.title || "新建会话"));
+      titleRow.append(element("span", "thread-title", displayTitle(summary.title)));
       const indicators = element("span", "thread-row-indicators");
       const attentionCount = pendingAttentionCount(summary);
       if (attentionCount > 0) {
@@ -1044,7 +1044,7 @@ function startBrowserClient() {
       row.type = "button";
       row.dataset.sessionId = summary.id;
       const titleRow = element("span", "thread-title-row");
-      titleRow.append(element("span", "thread-title", summary.title || "未命名会话"));
+      titleRow.append(element("span", "thread-title", displayTitle(summary.title)));
       row.append(titleRow);
       row.append(element("span", "thread-preview", summary.preview || summary.title));
       const scope = basename(summary.workspace) || "本地";
@@ -1138,7 +1138,7 @@ function startBrowserClient() {
 
     const header = element("div", "peek-header");
     header.append(element("p", "eyebrow", "已保存的会话 — 只读"));
-    header.append(element("h2", "", peek.title || "未命名会话"));
+    header.append(element("h2", "", displayTitle(peek.title)));
     header.append(
       element(
         "p",
@@ -1150,7 +1150,7 @@ function startBrowserClient() {
 
     if (peek.omitted_before > 0) {
       dom.peek.append(
-        element("p", "peek-omitted", `${peek.omitted_before} earlier messages not shown`),
+        element("p", "peek-omitted", `还有 ${peek.omitted_before} 条更早的消息未显示`),
       );
     }
 
@@ -1378,7 +1378,7 @@ function startBrowserClient() {
   function renderHeader() {
     const thread = app.threadState.thread;
     const summary = app.summaries.find((item) => item.id === app.selectedThreadId);
-    const title = thread?.title || summary?.title || (thread ? "新建会话" : "选择一个会话");
+    const title = displayTitle(thread?.title || summary?.title) || (thread ? "新建会话" : "选择一个会话");
     setSafeText(dom.title, title);
     setSafeText(dom.kicker, thread ? "AsBudy 会话" : "AsBudy");
     dom.rename.disabled = !thread;
@@ -1850,7 +1850,7 @@ function startBrowserClient() {
     dom.send.disabled = sending || !ready || !dom.composerInput.value.trim();
     dom.composer.setAttribute("aria-busy", sending ? "true" : "false");
     dom.interrupt.hidden = !active;
-    setSafeText(dom.send, sending ? (active ? "Steering…" : "Sending…") : active ? "Steer" : "Send");
+    setSafeText(dom.send, sending ? (active ? "插话中…" : "发送中…") : active ? "插话" : "发送");
   }
 
   function selectedNewThreadProvider() {
@@ -1972,7 +1972,7 @@ function startBrowserClient() {
       if (selectedDefault) dom.newThreadModel.value = selectedDefault.id;
       app.newThreadLoading = false;
       setNewThreadStatus(
-        models.length ? "" : "No models are available for this provider.",
+        models.length ? "" : "这个提供商下面没有可用模型。",
         models.length ? "" : "error",
       );
       syncNewThreadControls();
@@ -1982,6 +1982,29 @@ function startBrowserClient() {
       setNewThreadStatus(`加载模型失败：${error.message}`, "error");
       syncNewThreadControls();
     }
+  }
+
+  // 老板 2026-09-14（待修复清单第 5 条）：不懂编程的客户看到「选提供商/模型」
+  // 技术对话框全是噪音 → 直接建好，用运行时默认。失败（如默认没配）才退回老对话框，
+  // 不把路堵死。想换模型 → 对话顶部「模型」标签随点随换。
+  async function quickNewThread() {
+    if (app.creatingThread) return;
+    app.creatingThread = true;
+    showStatus("");
+    const thread = await createThread({}, (message) => showStatus(message));
+    app.creatingThread = false;
+    if (thread) {
+      dom.composerInput.focus();
+      return;
+    }
+    await openNewThreadDialog();
+  }
+
+  // 引擎侧默认标题是英文 "New Thread"（runtime_api.rs:1683，改它要编译）→ 显示层兜底翻中文。
+  function displayTitle(value) {
+    const text = String(value ?? "").trim();
+    if (!text || text === "New Thread" || text === "Untitled") return "新会话";
+    return text;
   }
 
   async function openNewThreadDialog() {
@@ -2004,7 +2027,7 @@ function startBrowserClient() {
       const providers = Array.isArray(catalog?.providers)
         ? catalog.providers.filter((provider) => String(provider?.id || "").trim())
         : [];
-      if (providers.length === 0) throw new Error("The Runtime returned no providers.");
+      if (providers.length === 0) throw new Error("引擎没有返回任何提供商。");
       app.providerCatalog = { ...catalog, providers };
       for (const provider of providers) {
         const option = document.createElement("option");
@@ -2040,7 +2063,7 @@ function startBrowserClient() {
       return;
     }
     app.creatingThread = true;
-    setNewThreadStatus("Creating thread…");
+    setNewThreadStatus("正在创建会话…");
     dom.newThreadDialog.focus({ preventScroll: true });
     syncNewThreadControls();
     const thread = await createThread(
@@ -2161,7 +2184,7 @@ function startBrowserClient() {
 
   function openRenameDialog() {
     if (!app.threadState.thread) return;
-    dom.renameInput.value = app.threadState.thread.title || "";
+    dom.renameInput.value = app.threadState.thread.title === "New Thread" ? "" : app.threadState.thread.title || "";
     dom.renameDialog.showModal();
     dom.renameInput.focus();
     dom.renameInput.select();
@@ -2186,7 +2209,7 @@ function startBrowserClient() {
     if (rows.length) dom.archivedToggle.textContent = `已归档（${rows.length}）`;
     for (const s of rows) {
       const row = element("div", "archived-row");
-      const title = element("span", "thread-title", s.title || "未命名会话");
+      const title = element("span", "thread-title", displayTitle(s.title));
       const meta = element("span", "thread-meta", relativeTime(s.updated_at));
       const restore = element("button", "quiet-button", "恢复");
       restore.type = "button";
@@ -2245,7 +2268,7 @@ function startBrowserClient() {
   dom.railOpen.addEventListener("click", openRail);
   dom.railClose.addEventListener("click", closeRail);
   dom.railScrim.addEventListener("click", closeRail);
-  dom.newThread.addEventListener("click", () => void openNewThreadDialog());
+  dom.newThread.addEventListener("click", () => void quickNewThread());
   dom.newThreadForm.addEventListener("submit", submitNewThread);
   dom.newThreadProvider.addEventListener("change", () => {
     const provider = selectedNewThreadProvider();
@@ -2389,12 +2412,12 @@ function fmtDateTime(value) {
 
 function relativeTime(value) {
   const timestamp = Date.parse(value);
-  if (!Number.isFinite(timestamp)) return "recent";
+  if (!Number.isFinite(timestamp)) return "最近";
   const seconds = Math.max(0, Math.round((Date.now() - timestamp) / 1000));
-  if (seconds < 60) return "now";
-  if (seconds < 3600) return `${Math.floor(seconds / 60)}m`;
-  if (seconds < 86400) return `${Math.floor(seconds / 3600)}h`;
-  return `${Math.floor(seconds / 86400)}d`;
+  if (seconds < 60) return "刚刚";
+  if (seconds < 3600) return `${Math.floor(seconds / 60)} 分钟前`;
+  if (seconds < 86400) return `${Math.floor(seconds / 3600)} 小时前`;
+  return `${Math.floor(seconds / 86400)} 天前`;
 }
 
 if (typeof document !== "undefined") {

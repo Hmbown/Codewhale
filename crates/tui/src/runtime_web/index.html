@@ -103,6 +103,30 @@
           </form>
         </footer>
       </main>
+
+      <!-- 预览栏（三栏右侧）—— 门卫脚本按当前项目决定是否显示；窄屏时变全屏层 -->
+      <section class="preview-pane" id="preview-pane" aria-label="预览">
+        <div class="preview-grip" id="preview-grip" title="拖动调宽度"></div>
+        <div class="preview-head">
+          <span class="preview-title">预览</span>
+          <span class="preview-acts">
+            <button class="quiet-button" id="preview-reload" type="button" title="重新加载">刷新</button>
+            <button class="quiet-button" id="preview-close" type="button" title="收起预览">收起</button>
+          </span>
+        </div>
+        <iframe id="preview-frame" title="项目实时预览" src="about:blank"></iframe>
+        <div class="preview-file" id="preview-file" hidden></div>
+      </section>
+
+      <!-- 预览栏收起后的「展开」按钮（与侧栏的 «☰ 侧栏» 对称，在右上角） -->
+      <button class="preview-reveal" id="preview-reveal" type="button" title="展开预览">👁 预览</button>
+
+      <!-- 手机底部三格（宽屏不显示）—— 跟它说 / 文件 / 预览 -->
+      <nav class="mbar-mobile" id="asbudy-mbar" aria-label="视图切换">
+        <button type="button" data-mtab="chat"><i>💬</i>跟它说</button>
+        <button type="button" data-mtab="files"><i>🗂</i>文件</button>
+        <button type="button" data-mtab="view"><i>👁</i>预览</button>
+      </nav>
     </div>
 
     <dialog class="rename-dialog new-thread-dialog" id="new-thread-dialog" tabindex="-1" aria-labelledby="new-thread-title" aria-describedby="new-thread-help">

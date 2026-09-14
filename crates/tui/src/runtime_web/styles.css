@@ -129,6 +129,212 @@ summary:focus-visible {
   background: var(--bg);
 }
 
+/* ── 预览栏（三栏右侧）── 门卫脚本给 .shell 加 has-preview 才出现（官方独立跑时不受影响） */
+.shell.has-preview {
+  grid-template-columns: var(--rail) minmax(0, 1fr) minmax(280px, var(--preview-width, 34vw));
+}
+
+.preview-pane {
+  display: none;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  position: relative;
+  border-left: 1px solid var(--border);
+  background: var(--bg);
+}
+
+/* 分栏拖手：拽它调预览宽度 */
+.preview-grip {
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 6px;
+  cursor: col-resize;
+  z-index: 2;
+}
+
+.preview-grip:hover {
+  background: #58a6ff33;
+}
+
+/* 工作台类项目：右栏直接看文件内容 */
+.preview-file {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 0 0 18px;
+  background: var(--bg);
+  color: var(--text);
+}
+
+.pv-file-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--border);
+  position: sticky;
+  top: 0;
+  background: var(--bg);
+  z-index: 1;
+}
+
+.pv-file-name {
+  font-size: 13px;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pv-dl {
+  flex: none;
+  border: 1px solid var(--border);
+  color: var(--text-dim);
+  font-size: 12px;
+  border-radius: 6px;
+  padding: 3px 10px;
+  text-decoration: none;
+}
+
+.pv-dl:hover {
+  color: var(--text);
+}
+
+.pv-file-body {
+  padding: 16px 18px;
+}
+
+.shell.has-preview .preview-pane {
+  display: flex;
+}
+
+.preview-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
+  flex: none;
+}
+
+.preview-title {
+  font-size: 13px;
+  color: var(--text-dim);
+}
+
+.preview-acts {
+  display: flex;
+  gap: 6px;
+}
+
+.preview-acts .quiet-button {
+  padding: 3px 10px;
+  font-size: 12px;
+}
+
+#preview-frame {
+  flex: 1;
+  min-height: 0;
+  width: 100%;
+  border: 0;
+  background: #fff;
+}
+
+/* 手机底部三格（宽屏隐藏） */
+.mbar-mobile {
+  display: none;
+}
+
+/* ── PC 侧栏可隐藏（官方只在窄屏给了开关，宽屏没有）── */
+.shell.rail-hidden {
+  --rail: 0px;
+}
+
+.shell.rail-hidden .rail {
+  display: none;
+}
+
+/* 预览栏收起后的展开按钮（右上角；窄屏不显示，用底部三格） */
+.preview-reveal {
+  display: none;
+  position: fixed;
+  top: 10px;
+  right: 10px;
+  z-index: 30;
+  padding: 5px 11px;
+  font: inherit;
+  font-size: 12px;
+  color: var(--text-dim);
+  background: var(--surface, #161b22);
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  cursor: pointer;
+}
+
+.preview-reveal:hover {
+  color: var(--text);
+}
+
+@media (min-width: 801px) {
+  .shell:not(.has-preview) .preview-reveal {
+    display: block;
+  }
+}
+
+/* 收起后的「展开」悬浮小按钮（仅宽屏、且侧栏收起时出现） */
+.rail-reveal {
+  display: none;
+  position: fixed;
+  top: 10px;
+  left: 10px;
+  z-index: 30;
+  padding: 5px 11px;
+  font: inherit;
+  font-size: 12px;
+  color: var(--text-dim);
+  background: var(--surface, #161b22);
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  cursor: pointer;
+}
+
+.rail-reveal:hover {
+  color: var(--text);
+}
+
+.shell.rail-hidden .rail-reveal {
+  display: block;
+}
+
+.rail-hide {
+  display: none;
+  margin-left: auto;
+  padding: 3px 10px;
+  font: inherit;
+  font-size: 12px;
+  color: var(--text-dim);
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.rail-hide:hover {
+  color: var(--text);
+}
+
+/* 只在宽屏显示（窄屏有官方自带的抽屉开关） */
+@media (min-width: 801px) {
+  .rail-hide {
+    display: inline-block;
+  }
+}
+
 .rail {
   position: relative;
   z-index: 20;
@@ -1163,8 +1369,58 @@ noscript {
 }
 
 @media (max-width: 800px) {
-  .shell {
+  .shell,
+  .shell.has-preview {
     grid-template-columns: minmax(0, 1fr);
+  }
+
+  /* 底栏占一行：内容 + 三格 */
+  .shell {
+    grid-template-rows: minmax(0, 1fr) auto;
+  }
+
+  .mbar-mobile {
+    display: flex;
+    grid-column: 1;
+    /* 浮在最上层（侧栏遮罩 z15 / 侧栏 z20 / 预览全屏层 z40）——
+       保证不管当前在哪一格，底栏总能点 */
+    position: relative;
+    z-index: 50;
+    border-top: 1px solid var(--border);
+    background: var(--bg);
+  }
+
+  .mbar-mobile button {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 2px;
+    padding: 7px 0 9px;
+    border: 0;
+    background: none;
+    font: inherit;
+    font-size: 11.5px;
+    color: var(--text-faint);
+    cursor: pointer;
+  }
+
+  .mbar-mobile button i {
+    font-style: normal;
+    font-size: 17px;
+    line-height: 1.15;
+  }
+
+  .mbar-mobile button.on {
+    color: var(--text);
+  }
+
+  /* 窄屏：预览栏变全屏覆盖层（点「预览」开、点「隐藏」关） */
+  .shell.has-preview .preview-pane {
+    position: fixed;
+    inset: 0;
+    z-index: 40;
+    border-left: 0;
   }
 
   .rail {
