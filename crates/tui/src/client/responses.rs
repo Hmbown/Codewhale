@@ -109,11 +109,6 @@ pub(super) fn build_responses_body_for_provider(
     }
     body["input"] = json!(input);
 
-    // ── 临时诊断：无条件 dump 请求体（用后删）──
-    if let Ok(s) = serde_json::to_string_pretty(&body) {
-        let _ = std::fs::write("/tmp/asbudy-request-body.json", s);
-    }
-
     // Convert tools to Responses function tools.
     if let Some(tools) = request.tools.as_ref() {
         let responses_tools: Vec<Value> = tools.iter().map(tool_to_responses_function).collect();

@@ -2423,6 +2423,10 @@ impl DeepSeekClient {
                     &self.base_url,
                     stream,
                 )?;
+                // ── 临时诊断：dump Chat 请求体（用后删）──
+                if let Ok(s) = serde_json::to_string_pretty(&wire.body) {
+                    let _ = std::fs::write("/tmp/asbudy-request-body.json", s);
+                }
                 if let Some(model) = &declared_wire_model {
                     wire.model.clone_from(model);
                     wire.body["model"] = json!(model);
