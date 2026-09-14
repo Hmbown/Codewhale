@@ -962,16 +962,23 @@
       b2.id = 'asbudy-undo-turn';   // 注意：不能叫 asbudy-undo —— 那是退回面板容器的 id（重复 id 会让 getElementById 拿到错的）
       b2.textContent = '↩ 撤销这轮';
       b2.title = '撤回上一轮（含它改的文件）';
+      var b3 = document.createElement('button');
+      b3.type = 'button';
+      b3.id = 'asbudy-compact';
+      b3.textContent = '🗜 压缩';
+      b3.title = '把这段长对话压短，省 token（要点保留）';
       el.appendChild(b1);
       el.appendChild(b2);
+      el.appendChild(b3);
       wrap.parentNode.insertBefore(el, wrap);
       return el;
     }
 
     async function fire(kind) {
-      if (!LAST_THREAD) { alert('先在右边说一句，才有可重试的对话'); return; }
-      var labels = { retry: '重试', undo: '撤销' };
+      if (!LAST_THREAD) { alert('先在右边说一句，才有可操作的对话'); return; }
+      var labels = { retry: '重试', undo: '撤销', compact: '压缩' };
       if (kind === 'undo' && !confirm('撤销上一轮？AI 这一轮改的文件也会回退。')) return;
+      if (kind === 'compact' && !confirm('把当前对话压短？\n\n要点会保留，超长的历史会被 AI 总结掉 —— 能省 token，但细节会丢。')) return;
       try {
         var r = await fetch('/v1/threads/' + encodeURIComponent(LAST_THREAD) + '/' + kind, {
           method: 'POST',
@@ -984,7 +991,8 @@
           alert(labels[kind] + '失败：' + (j.error || r.status));
           return;
         }
-        setTimeout(function () { location.reload(); }, 600);
+        // 压缩是后台跑一个 turn，给久一点再刷新（其余操作很快）
+        setTimeout(function () { location.reload(); }, kind === 'compact' ? 5000 : 600);
       } catch (e) {
         alert(labels[kind] + '失败：' + e.message);
       }
@@ -995,6 +1003,7 @@
       if (!t || !t.id) return;
       if (t.id === 'asbudy-retry') fire('retry');
       else if (t.id === 'asbudy-undo-turn') fire('undo');
+      else if (t.id === 'asbudy-compact') fire('compact');
     });
 
     if (!ensure()) {
