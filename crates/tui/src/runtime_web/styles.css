@@ -1377,6 +1377,14 @@ noscript {
   /* 手机端无底栏：单行占满 */
   .shell {
     grid-template-rows: minmax(0, 1fr);
+    /* iOS 键盘弹出时 Safari 会强制滚动 document（html/body 的 overflow:hidden 拦不住），
+       static 元素会被一起滚出可视区 → 输入框看不见。这里照 .rail 已有的模式固定定位，
+       用 visualViewport.offsetTop 抵消 iOS 的滚动偏移，使 .shell 始终覆盖真实可视区。 */
+    position: fixed;
+    top: var(--visual-viewport-offset-top);
+    bottom: auto;
+    left: 0;
+    width: 100%;
   }
 
   /* 窄屏：预览栏变全屏覆盖层（点「预览」开、点「隐藏」关） */
