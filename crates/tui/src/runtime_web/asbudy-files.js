@@ -275,9 +275,11 @@
       if (!r.ok) { alert('读不到这个文件'); return; }
       var d = await r.json();
       if (d.kind === 'office') showPanel(f.name, htmlBody(d.html || ''), d.download);
-      else if (d.kind === 'text' || d.kind === 'svg') showPanel(f.name, textBody(d.text || ''), d.download);
+      else if (d.kind === 'table') showPanel(f.name, tableBody(d), d.download);
+      else if (d.kind === 'text' || d.kind === 'svg' || d.kind === 'code') showPanel(f.name, textBody(d.text || d.content || ''), d.download);
       else if (d.kind === 'image') showPanel(f.name, imgBody(d.url), d.download);
       else if (d.kind === 'pdf') showPanel(f.name, pdfBody(d.url), d.download);
+      else if (d.kind === 'unsupported') showPanel(f.name, textBody(d.note || '这种格式暂时只能下下来看'), d.download);
       else showPanel(f.name, textBody('这种格式暂时只能下下来看'), d.download);
     } catch (e) { alert('读不到这个文件'); }
   }
@@ -290,9 +292,11 @@
       if (!r.ok) { alert('读不到这个文件'); return; }
       var d = await r.json();
       if (d.kind === 'office') showPanel(name, htmlBody(d.html || ''), d.download);
-      else if (d.kind === 'text' || d.kind === 'svg') showPanel(name, textBody(d.text || ''), d.download);
+      else if (d.kind === 'table') showPanel(name, tableBody(d), d.download);
+      else if (d.kind === 'text' || d.kind === 'svg' || d.kind === 'code') showPanel(name, textBody(d.text || d.content || ''), d.download);
       else if (d.kind === 'image') showPanel(name, imgBody(d.url), d.download);
       else if (d.kind === 'pdf') showPanel(name, pdfBody(d.url), d.download);
+      else if (d.kind === 'unsupported') showPanel(name, textBody(d.note || '这种格式暂时只能下下来看'), d.download);
       else showPanel(name, textBody('这种格式暂时只能下下来看'), d.download);
     } catch (e) { alert('读不到这个文件'); }
   }
@@ -319,13 +323,49 @@
     f.src = url; f.style.cssText = 'width:100%;height:70vh;border:0';
     return f;
   }
+  function tableBody(d) {
+    var wrap = document.createElement('div');
+    wrap.style.cssText = 'margin:0;padding:16px;overflow:auto;color:#e6edf3;font-size:13px;line-height:1.6';
+    if (d.sheet) {
+      var sh = document.createElement('div');
+      sh.style.cssText = 'margin-bottom:8px;color:#8b949e;font-size:12px';
+      sh.textContent = '工作表：' + d.sheet;
+      wrap.appendChild(sh);
+    }
+    var rows = d.rows || [];
+    if (!rows.length) { wrap.textContent = '（这个表格是空的）'; return wrap; }
+    var maxCols = 0;
+    for (var i = 0; i < rows.length; i++) if (rows[i].length > maxCols) maxCols = rows[i].length;
+    var tb = document.createElement('table');
+    tb.style.cssText = 'border-collapse:collapse;width:100%;font-size:12px';
+    for (var r = 0; r < rows.length; r++) {
+      var tr = document.createElement('tr');
+      for (var c = 0; c < maxCols; c++) {
+        var cell = document.createElement(r === 0 ? 'th' : 'td');
+        cell.style.cssText = 'border:1px solid #30363d;padding:4px 8px;text-align:left;white-space:nowrap;' + (r === 0 ? 'background:#161b22;font-weight:600' : '');
+        cell.textContent = (rows[r][c] == null ? '' : rows[r][c]);
+        tr.appendChild(cell);
+      }
+      tb.appendChild(tr);
+    }
+    wrap.appendChild(tb);
+    return wrap;
+  }
 
   function showPanel(name, bodyEl, download) {
-    // 有右栏（且是工作台这类「看文件」的项目）→ 直接显示在右栏，不弹浮层
+    // 有右栏就显示在右栏（工作台看文件、客户项目也能点文件在右栏看，不弹浮层）
     var fileBox = document.getElementById('preview-file');
     var sh = shellEl();
-    if (fileBox && sh && projKind !== 'proxy') {
+    if (fileBox && sh) {
       showPreview();
+      // 客户项目：右栏默认跑系统页面，点文件就切到「文件预览」（隐藏 iframe，给「看系统」入口切回）
+      if (projKind === 'proxy') {
+        var fr = frameEl();
+        if (fr) fr.hidden = true;
+        var sysBtn = document.getElementById('preview-sys');
+        if (sysBtn) sysBtn.hidden = false;
+      }
+      fileBox.hidden = false;
       fileBox.innerHTML = '';
       var fh = document.createElement('div');
       fh.className = 'pv-file-head';
@@ -402,6 +442,27 @@
   }
   function hidePreview() { var s = shellEl(); if (s) s.classList.remove('has-preview'); }
 
+  // 客户项目：右栏从「文件预览」切回「看系统页面」（iframe）
+  function showSysPreview() {
+    var shell = shellEl();
+    var pane = document.getElementById('preview-pane');
+    if (!shell || !pane) return;
+    var frame = frameEl();
+    var fileBox = document.getElementById('preview-file');
+    if (projKind === 'proxy' && frame) {
+      var want = '/_pv/' + encodeURIComponent(pkey) + '/';
+      if (frame.getAttribute('data-pkey') !== pkey) {
+        frame.src = want;
+        frame.setAttribute('data-pkey', pkey);
+      }
+      frame.hidden = false;
+    }
+    if (fileBox) fileBox.hidden = true;
+    var sysBtn = document.getElementById('preview-sys');
+    if (sysBtn) sysBtn.hidden = true;
+    shell.classList.add('has-preview');
+  }
+
   // 分栏拖手：拽它调预览宽度（存在 .shell 的 --preview-width 上）
   document.addEventListener('mousedown', function (e) {
     var t = e.target;
@@ -457,6 +518,7 @@
     }
     if (!t.id) return;
     if (t.id === 'preview-close') { hidePreview(); mbarSet('chat'); }
+    else if (t.id === 'preview-sys') { showSysPreview(); }
     else if (t.id === 'preview-reveal') { showPreview(); }
     else if (t.id === 'preview-reload') { var f = frameEl(); if (f) f.src = f.src; }
     else if (t.id === 'asbudy-files-upload') { showUpMenu(t); }
