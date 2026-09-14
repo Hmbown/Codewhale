@@ -60,7 +60,10 @@ pub(super) fn build_responses_body_for_provider(
         "model": model,
         "stream": true,
     });
-    if !is_deepseek && !is_concentrate {
+    // DeepSeek 也走无状态：不存服务端历史。否则工具执行失败留下的孤儿 call
+    // 会卡在服务端历史里，之后每轮都 400「No tool output found」（实测 2026-09-14，
+    // 见 ARCHIVE §8.7 ③：坏会话 thr_6e572fac 的孤儿 call_00_7EYs8HeiLLukIsZjC4Ta3980）。
+    if !is_concentrate {
         body["store"] = json!(false);
     }
     // Every Responses route receives the same resolved request envelope as
