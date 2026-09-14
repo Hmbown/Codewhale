@@ -1669,3 +1669,10 @@ noscript {
 .quiet-button, .primary-button, .send-button, .icon-button { font-size: 14px; }
 .fact-chip { font-size: 12px; }
 .composer textarea { font-size: 16px; }
+
+/* ── AsBudy 扩展布局（2026-09-14 从门卫注入搬进这里）──
+   侧栏多一行，容纳「项目文件 / 我的资料」两张卡片（官方原本是 6 行） */
+.rail { grid-template-rows: 52px auto auto auto auto minmax(144px, 1fr) auto; }
+.new-thread { min-height: 34px; }
+.empty-mark { width: 104px; height: 104px; }
+.rail-open { place-items: center; }

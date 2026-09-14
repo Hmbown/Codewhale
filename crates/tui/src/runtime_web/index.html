@@ -9,6 +9,9 @@
     <link rel="icon" href="data:,">
     <link rel="stylesheet" href="/assets/codewhale-web.css">
     <script type="module" src="/assets/codewhale-web.js"></script>
+    <!-- AsBudy 扩展：目录树 / 退回 / 「我的」菜单（真身在 runtime_web/，由 gate 提供数据） -->
+    <script defer src="/assets/asbudy-files.js"></script>
+    <script defer src="/assets/asbudy-my.js"></script>
   </head>
   <body>
     <div class="shell" id="app-shell">
@@ -30,6 +33,23 @@
           <span class="sr-only">搜索会话</span>
           <input id="thread-search" type="search" autocomplete="off" placeholder="搜索会话">
         </label>
+
+        <!-- AsBudy 扩展骨架（2026-09-14 从门卫注入搬进这里）：目录树两张卡片 + 退回面板。
+             动态数据（data-pkey / data-kind / 项目名）由 asbudy-files.js / asbudy-my.js 自取。 -->
+        <div id="asbudy-files" data-pkey="" data-kind="proxy" hidden>
+          <div class="asb-card" id="asb-card-proj">
+            <div class="asb-hd"><span class="asb-fold" id="asb-fold-proj" title="折叠 / 展开">▾</span><span class="asb-title">项目文件</span><span class="asb-tools"><span id="asbudy-files-refresh">刷新</span></span></div>
+            <div class="asb-bd" id="asbudy-files-body"><span class="f-empty">加载中…</span></div>
+          </div>
+          <div class="asb-card" id="asb-card-mine">
+            <div class="asb-hd"><span class="asb-fold" id="asb-fold-mine" title="折叠 / 展开">▾</span><span class="asb-title">我的资料<span id="asb-mine-count"></span></span><span class="asb-tools"><span id="asbudy-files-upload" title="传资料 —— 存到「我的资料」，AI 直接能读">+ 传资料</span></span></div>
+            <div class="asb-bd" id="asbudy-mine-body"><span class="f-empty">加载中…</span></div>
+          </div>
+        </div>
+        <div id="asbudy-undo" hidden>
+          <div class="f-head"><span>退回</span><span id="asbudy-undo-refresh">刷新</span></div>
+          <div id="asbudy-undo-body"><span class="f-empty">加载中…</span></div>
+        </div>
 
         <nav class="thread-list" id="thread-list" aria-label="进行中的会话"></nav>
 
