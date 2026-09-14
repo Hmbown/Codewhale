@@ -1428,7 +1428,7 @@ noscript {
     top: var(--visual-viewport-offset-top);
     bottom: auto;
     left: 0;
-    width: min(88vw, 288px);
+    width: 100%;
     height: var(--visual-viewport-height);
     transform: translateX(-102%);
     box-shadow: 24px 0 70px var(--shadow-color);
