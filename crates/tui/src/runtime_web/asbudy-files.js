@@ -486,36 +486,17 @@
     document.addEventListener('mouseup', up);
   });
 
-  // 「所见即所得」：有预览能力的项目，进来**默认就分栏**（可点「隐藏」收起）
-  // 原来靠「侧栏有没有『预览』按钮」判断 → 按钮已删，改成无条件；
-  // showPreview() 内部对 preview-pane 不存在会直接 return，安全。
-  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', function () { showPreview(); });
-  else setTimeout(function () { showPreview(); }, 0);
-  // 手机底部三格：跟它说 / 文件 / 预览
-  // 复用官方的侧栏开关按钮（#rail-open / #rail-close），不自己改它的 transform
-  function mbarSet(t) {
-    var bar = document.getElementById('asbudy-mbar');
-    if (!bar) return;
-    var btns = bar.querySelectorAll('button[data-mtab]');
-    for (var i = 0; i < btns.length; i++) {
-      if (btns[i].getAttribute('data-mtab') === t) btns[i].classList.add('on');
-      else btns[i].classList.remove('on');
-    }
+  // 所见即所得：PC（宽屏）进来默认分栏；手机（窄屏）默认对话，点文件才开预览
+  if (window.matchMedia && window.matchMedia('(min-width: 801px)').matches) {
+    if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', function () { showPreview(); });
+    else setTimeout(function () { showPreview(); }, 0);
   }
-  function railClick(id) { var b = document.getElementById(id); if (b) b.click(); }
 
   document.addEventListener('click', function (e) {
     var t = e.target;
     if (!t) return;
-    var mb = t.closest ? t.closest('button[data-mtab]') : null;
-    if (mb) {
-      // 底部只剩「跟它说」一个：作用 = 回到对话（收起预览 + 收起侧栏）
-      hidePreview(); railClick('rail-close');
-      mbarSet('chat');
-      return;
-    }
     if (!t.id) return;
-    if (t.id === 'preview-close') { hidePreview(); mbarSet('chat'); }
+    if (t.id === 'preview-close') { hidePreview(); }
     else if (t.id === 'preview-sys') { showSysPreview(); }
     else if (t.id === 'preview-reveal') { showPreview(); }
     else if (t.id === 'preview-reload') { var f = frameEl(); if (f) f.src = f.src; }
@@ -523,12 +504,6 @@
     else if (t.id === 'asb-fold-proj') { setFold('proj', !isFolded('proj')); }
     else if (t.id === 'asb-fold-mine') { setFold('mine', !isFolded('mine')); }
   });
-  // ⚠️ 本脚本注在侧栏里，#asbudy-mbar 在 .shell 末尾、解析更晚 → 初始高亮要等 DOM 就绪
-  if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', function () { mbarSet('chat'); });
-  } else {
-    setTimeout(function () { mbarSet('chat'); }, 0);
-  }
 
   // ── 上传到「当前项目」（目录树立刻能看到、AI 直接能读） ──
   // 两个隐藏 input：选文件（可多选）/ 选整个文件夹（保留层级）

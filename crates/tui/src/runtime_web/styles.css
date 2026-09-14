@@ -1374,45 +1374,9 @@ noscript {
     grid-template-columns: minmax(0, 1fr);
   }
 
-  /* 底栏占一行：内容 + 三格 */
+  /* 手机端无底栏：单行占满 */
   .shell {
-    grid-template-rows: minmax(0, 1fr) auto;
-  }
-
-  .mbar-mobile {
-    display: flex;
-    grid-column: 1;
-    /* 浮在最上层（侧栏遮罩 z15 / 侧栏 z20 / 预览全屏层 z40）——
-       保证不管当前在哪一格，底栏总能点 */
-    position: relative;
-    z-index: 50;
-    border-top: 1px solid var(--border);
-    background: var(--bg);
-  }
-
-  .mbar-mobile button {
-    flex: 1;
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    gap: 2px;
-    padding: 7px 0 9px;
-    border: 0;
-    background: none;
-    font: inherit;
-    font-size: 11.5px;
-    color: var(--text-faint);
-    cursor: pointer;
-  }
-
-  .mbar-mobile button i {
-    font-style: normal;
-    font-size: 17px;
-    line-height: 1.15;
-  }
-
-  .mbar-mobile button.on {
-    color: var(--text);
+    grid-template-rows: minmax(0, 1fr);
   }
 
   /* 窄屏：预览栏变全屏覆盖层（点「预览」开、点「隐藏」关） */
