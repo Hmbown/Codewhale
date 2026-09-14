@@ -895,6 +895,47 @@ pub(super) fn convert_messages_to_responses_input(
         }
     }
 
+    // ── 兜底：给「没有结果」的 function_call 补一条合成输出 ──
+    // 工具执行失败 / 被取消 / 权限姿态变更时，上游可能没能配上 ToolResult。
+    // Responses API 会直接拒掉这种历史：
+    //   400 "No tool output found for tool call …"（DeepSeek 实测撞过，
+    //   一旦撞上，该会话后续每次发言都失败）。
+    // Chat / Anthropic 链路由 tool_history_repair 兜；这里补上 Responses 这一层。
+    {
+        use std::collections::HashSet;
+        let mut answered: HashSet<String> = items
+            .iter()
+            .filter(|i| i.get("type").and_then(Value::as_str) == Some("function_call_output"))
+            .filter_map(|i| {
+                i.get("call_id")
+                    .and_then(Value::as_str)
+                    .map(|s| s.to_string())
+            })
+            .collect();
+        let mut patched: Vec<Value> = Vec::with_capacity(items.len() + 2);
+        for item in items.drain(..) {
+            let is_call = item.get("type").and_then(Value::as_str) == Some("function_call");
+            let call_id = item
+                .get("call_id")
+                .and_then(Value::as_str)
+                .map(|s| s.to_string());
+            patched.push(item);
+            if is_call {
+                if let Some(cid) = call_id {
+                    if !answered.contains(&cid) {
+                        answered.insert(cid.clone());
+                        patched.push(json!({
+                            "type": "function_call_output",
+                            "call_id": cid,
+                            "output": "(tool returned no result — the call failed or was cancelled)",
+                        }));
+                    }
+                }
+            }
+        }
+        items = patched;
+    }
+
     items
 }
 
