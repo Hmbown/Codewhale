@@ -53,6 +53,7 @@
             <span id="connection-label">正在连接本地引擎…</span>
             <span class="runtime-provenance" id="runtime-provenance">版本未知 · 来源未知</span>
           </span>
+          <button class="quiet-button" id="archived-toggle" type="button" style="margin-left:auto;flex:0 0 auto;padding:0 8px;min-height:26px;font-size:11px" hidden>已归档</button>
         </div>
       </aside>
 
@@ -63,7 +64,7 @@
           <div class="session-heading">
             <button class="quiet-button rail-open" id="rail-open" type="button" aria-controls="thread-rail" aria-expanded="false">会话</button>
             <div class="title-stack">
-              <p class="eyebrow" id="session-kicker">本地引擎</p>
+              <p class="eyebrow" id="session-kicker">AsBudy</p>
               <h1 id="session-title">选择一个会话</h1>
             </div>
           </div>
@@ -144,10 +145,20 @@
           <input id="rename-input" type="text" maxlength="160" required autocomplete="off">
         </label>
         <div class="dialog-actions">
-          <button class="quiet-button" value="cancel" type="submit">取消</button>
+          <button class="quiet-button" value="cancel" type="submit" formnovalidate>取消</button>
           <button class="primary-button" value="save" type="submit">保存标题</button>
         </div>
       </form>
+    </dialog>
+
+    <dialog class="rename-dialog" id="archived-dialog">
+      <div class="dialog-head">
+        <p class="eyebrow">会话管理</p>
+        <h2>已归档的会话</h2>
+        <button class="quiet-button" id="archived-close" type="button" style="position:absolute;top:12px;right:12px">✕</button>
+      </div>
+      <nav class="thread-list" id="archived-list"></nav>
+      <p class="mut" id="archived-empty" hidden>还没有归档的会话。</p>
     </dialog>
 
     <noscript>AsBudy 网页版需要 JavaScript 才能连接本地运行时。</noscript>

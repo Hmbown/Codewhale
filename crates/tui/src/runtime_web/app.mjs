@@ -375,19 +375,19 @@ export function answersForUserInput(request, selections = {}, freeText = {}) {
 export function refusalMessage(reason) {
   switch (reason) {
     case "session-not-live":
-      return "This is a saved session, not a live thread — nothing was sent. Resume it first to reply.";
+      return "这是已保存的会话，不是进行中的对话——没有发送。先恢复它才能回复。";
     case "stale-target":
-      return "That thread is no longer the selected one — nothing was sent.";
+      return "那条会话已不是当前选中的——没有发送。";
     case "stale-approval":
-      return "That request was already answered or has expired — nothing was sent.";
+      return "那个请求已被处理或已过期——没有发送。";
     case "no-approval":
-      return "No approval was identified — nothing was sent.";
+      return "没有找到待审批的请求——没有发送。";
     case "stale-user-input":
-      return "That question was already answered or has expired — nothing was sent.";
+      return "那个问题已被回答或已过期——没有发送。";
     case "no-user-input":
-      return "No user-input request was identified — nothing was sent.";
+      return "没有找到待输入的问题——没有发送。";
     default:
-      return "Select a live thread first — nothing was sent.";
+      return "先选一个进行中的会话——没有发送。";
   }
 }
 
@@ -403,10 +403,10 @@ export function streamCursor(state, { gap = false, connected = true } = {}) {
     gap: Boolean(gap),
     connected: Boolean(connected),
     label: !connected
-      ? `Reconnecting — resuming from #${seq}`
+      ? `重新连接中——从 #${seq} 续上`
       : gap
-        ? `Gap detected — re-syncing from #${seq}`
-        : `Live — event #${seq}`,
+        ? `检测到断档——从 #${seq} 重新同步`
+        : `实时——事件 #${seq}`,
   };
 }
 
@@ -423,8 +423,8 @@ export function receiptPresentation(item = {}) {
   if (mcpFailure) {
     const server = mcpFailure[1] || "server";
     return {
-      label: "MCP · Unavailable",
-      summary: `${server} could not connect`,
+      label: "MCP · 不可用",
+      summary: `${server} 连不上`,
       raw,
       failed: true,
     };
@@ -463,12 +463,12 @@ export function workflowReceiptPresentation(item, detail, raw) {
   const summary = rejected === 1
     ? "1 task dispatch was rejected"
     : rejected > 1
-      ? `${rejected} task dispatches were rejected`
+      ? `${rejected} 个任务派发被拒绝`
       : status === "failed"
         ? "工作流未完成"
         : "工作流完成，但结果降级";
   return {
-    label: status === "failed" ? "Workflow · Failed" : "工作流 · 需要处理",
+    label: status === "failed" ? "工作流 · 失败" : "工作流 · 需要处理",
     summary,
     raw,
     failed: true,
@@ -509,8 +509,8 @@ export function groupThreadSummaries(summaries) {
 export function pendingAttentionLabel(summary) {
   const count = pendingAttentionCount(summary);
   return count === 1
-    ? "1 item needs your attention"
-    : `${count} items need your attention`;
+    ? "有 1 项需要你处理"
+    : `有 ${count} 项需要你处理`;
 }
 
 // Match the CWC composer grammar while keeping the embedded client free of a
@@ -537,27 +537,27 @@ export function imageInputPresentation(value) {
   if (value === "supported") {
     return {
       state: "supported",
-      label: "Vision",
-      description: "This exact provider route supports image input. Browser attachments are not enabled yet.",
+      label: "支持图片",
+      description: "这个模型支持图片输入。浏览器附件功能尚未开启。",
     };
   }
   if (value === "unsupported") {
     return {
       state: "unsupported",
       label: "仅文本",
-      description: "This exact provider route does not support image input.",
+      description: "这个模型不支持图片输入。",
     };
   }
   return {
     state: "unknown",
     label: "图像支持未验证",
-    description: "Image-input support is not verified for this exact provider route.",
+    description: "这个模型的图片支持未验证。",
   };
 }
 
 export function modelOptionLabel(model) {
   const id = String(model?.id || "").trim();
-  return model?.image_input === "supported" ? `${id} · Vision` : id;
+  return model?.image_input === "supported" ? `${id} · 支持图片` : id;
 }
 
 export function providerOptionLabel(provider) {
@@ -572,7 +572,7 @@ export function buildCreateThreadRequest(providerId, model, modelProviderId = ""
   const exactProviderId = String(modelProviderId || "").trim();
   const selectedModel = String(model || "").trim();
   if (!modelProvider || !selectedModel) {
-    throw new Error("Choose both a provider and a model.");
+    throw new Error("请选择提供商和模型。");
   }
   const request = { model_provider: modelProvider, model: selectedModel };
   if (exactProviderId) request.model_provider_id = exactProviderId;
@@ -742,6 +742,11 @@ function startBrowserClient() {
     renameDialog: document.querySelector("#rename-dialog"),
     renameForm: document.querySelector("#rename-form"),
     renameInput: document.querySelector("#rename-input"),
+    archivedToggle: document.querySelector("#archived-toggle"),
+    archivedDialog: document.querySelector("#archived-dialog"),
+    archivedList: document.querySelector("#archived-list"),
+    archivedClose: document.querySelector("#archived-close"),
+    archivedEmpty: document.querySelector("#archived-empty"),
     peek: document.querySelector("#session-peek"),
     savedSessions: document.querySelector("#saved-sessions"),
     sessionList: document.querySelector("#session-list"),
@@ -751,6 +756,7 @@ function startBrowserClient() {
   const app = {
     summaries: [],
     sessionSummaries: [],
+    archivedSummaries: [],
     // Typed selection: `none`, a read-only `session`, or a live `thread`.
     // Every reply/approval authority check reads this, not a loose id.
     target: NO_TARGET,
@@ -1005,7 +1011,7 @@ function startBrowserClient() {
       titleRow.append(indicators);
       row.append(titleRow);
       row.append(element("span", "thread-preview", summary.preview || "还没有消息"));
-      const branch = summary.branch || basename(summary.workspace) || "local";
+      const branch = summary.branch || basename(summary.workspace) || "本地";
       row.append(element("span", "thread-meta", `${branch} · ${relativeTime(summary.updated_at)}`));
       row.addEventListener("click", () => selectThread(summary.id));
       group.append(row);
@@ -1041,7 +1047,7 @@ function startBrowserClient() {
       titleRow.append(element("span", "thread-title", summary.title || "未命名会话"));
       row.append(titleRow);
       row.append(element("span", "thread-preview", summary.preview || summary.title));
-      const scope = basename(summary.workspace) || "local";
+      const scope = basename(summary.workspace) || "本地";
       row.append(
         element(
           "span",
@@ -1137,7 +1143,7 @@ function startBrowserClient() {
       element(
         "p",
         "thread-meta",
-        `${basename(peek.workspace) || "local"} · ${peek.message_count} messages · ${relativeTime(peek.updated_at)}${peek.archived ? " · archived" : ""}`,
+        `${basename(peek.workspace) || "本地"} · ${peek.message_count} 条消息 · ${relativeTime(peek.updated_at)}${peek.archived ? " · 已归档" : ""}`,
       ),
     );
     dom.peek.append(header);
@@ -1193,7 +1199,7 @@ function startBrowserClient() {
     renderSessionList();
     renderAll();
     closeRailIfNarrow();
-    setConnection("", "Loading thread snapshot…");
+    setConnection("", "正在加载会话…");
     showStatus("");
 
     try {
@@ -1262,7 +1268,7 @@ function startBrowserClient() {
         if (runtimeEventContinuity(app.threadState, envelope) === "gap") {
           app.streamGap = true;
           renderStreamCursor();
-          showStatus("Runtime event continuity changed; refreshing the thread snapshot…");
+          showStatus("运行事件连续性变化，正在刷新会话…");
           void recoverProjection(threadId, generation, stream);
           return;
         }
@@ -1281,7 +1287,7 @@ function startBrowserClient() {
           loadThreads().catch((error) => showStatus(error.message));
         }
       } catch (error) {
-        showStatus(`Could not read a Runtime event: ${error.message}`);
+        showStatus(`读取运行事件失败：${error.message}`);
       }
     };
     for (const name of STREAM_EVENT_NAMES) stream.addEventListener(name, receive);
@@ -1301,7 +1307,7 @@ function startBrowserClient() {
         reject?.(new Error("引擎事件流未重新打开"));
         return;
       }
-      setConnection("", "Reconnecting to local runtime…");
+      setConnection("", "正在重新连接本地引擎…");
       app.reconnectTimer = setTimeout(
         () => connectStream(threadId, app.threadState.latestSeq, generation),
         900,
@@ -1321,7 +1327,7 @@ function startBrowserClient() {
     app.stream = null;
     if (app.reconnectTimer) clearTimeout(app.reconnectTimer);
     app.reconnectTimer = null;
-    setConnection("", "Refreshing thread snapshot…");
+    setConnection("", "正在刷新会话…");
 
     try {
       const subscribed = await recoverSnapshotAndSubscribe({
@@ -1341,7 +1347,7 @@ function startBrowserClient() {
       setConnection("ready", "本地引擎已连接");
     } catch (error) {
       if (generation !== app.generation || threadId !== app.selectedThreadId) return;
-      showStatus(`Could not refresh the thread snapshot: ${error.message}`);
+      showStatus(`刷新会话失败：${error.message}`);
       setConnection("error", "引擎恢复失败");
       app.reconnectTimer = setTimeout(
         () => recoverProjection(threadId, generation),
@@ -1374,7 +1380,7 @@ function startBrowserClient() {
     const summary = app.summaries.find((item) => item.id === app.selectedThreadId);
     const title = thread?.title || summary?.title || (thread ? "新建会话" : "选择一个会话");
     setSafeText(dom.title, title);
-    setSafeText(dom.kicker, thread ? "本地引擎会话" : "本地引擎");
+    setSafeText(dom.kicker, thread ? "AsBudy 会话" : "AsBudy");
     dom.rename.disabled = !thread;
     dom.archive.disabled = !thread;
     dom.facts.replaceChildren();
@@ -1382,12 +1388,12 @@ function startBrowserClient() {
 
     const workspace = summary?.workspace || thread.workspace || app.workspace?.workspace;
     const branch = summary?.branch || app.workspace?.branch;
-    dom.facts.append(factChip("Workspace", basename(workspace) || "local"));
+    dom.facts.append(factChip("工作区", basename(workspace) || "本地"));
     if (branch) dom.facts.append(factChip("Branch", branch));
     const provider = threadProviderLabel(thread);
     if (provider) dom.facts.append(factChip("Provider", provider));
-    dom.facts.append(factChip("Model", thread.model || "引擎默认"));
-    dom.facts.append(factChip("Mode", modeLabel(thread.mode)));
+    dom.facts.append(factChip("模型", thread.model || "引擎默认"));
+    dom.facts.append(factChip("模式", modeLabel(thread.mode)));
     dom.facts.append(factChip("Permission", permissionLabel(thread)));
   }
 
@@ -1404,16 +1410,16 @@ function startBrowserClient() {
     if (!app.threadState.thread) {
       renderTranscriptEmpty(
         "choose-thread",
-        "Your local agent, in the browser.",
-        "Create a thread or choose one from the rail. This client uses the same Runtime as the terminal.",
+        "你的本地智能体，就在浏览器里。",
+        "新建一个会话，或从侧栏选择一个。此客户端与终端使用同一个运行时。",
       );
       return;
     }
     if (app.threadState.itemOrder.length === 0) {
       renderTranscriptEmpty(
         "ready",
-        "Ready for a task.",
-        "Send a message below. Model, mode, and permission posture come from the Runtime and are shown read-only above.",
+        "准备好了，随时可以开工。",
+        "在下方发消息。模型、模式和权限姿态来自运行时，只读显示在上方。",
       );
       return;
     }
@@ -1520,14 +1526,15 @@ function startBrowserClient() {
     if (item.kind === "user_message" || item.kind === "agent_message") {
       const role = item.kind === "user_message" ? "user" : "agent";
       card.className = `message ${role} ${item.status === "in_progress" ? "in-progress" : ""}`.trim();
-      setTextIfChanged(card.querySelector('[data-item-part="label"]'), role === "user" ? "You" : "Codewhale");
+      const time = item.started_at ? fmtDateTime(item.started_at) : "";
+      setTextIfChanged(card.querySelector('[data-item-part="label"]'), role === "user" ? time : ("AsBudy" + (time ? " · " + time : "")));
       setTextIfChanged(card.querySelector('[data-item-part="body"]'), detail);
       return true;
     }
     if (item.kind === "agent_reasoning") {
       setTextIfChanged(
         card.querySelector('[data-item-part="summary"]'),
-        item.status === "in_progress" ? "Reasoning…" : "Reasoning",
+        item.status === "in_progress" ? "思考中…" : "思考过程",
       );
       setTextIfChanged(card.querySelector('[data-item-part="detail"]'), detail);
       return true;
@@ -1793,10 +1800,10 @@ function startBrowserClient() {
       const built = answersForUserInput(envelope.request, selections, freeText);
       if (!built.ok) {
         const message = built.reason === "missing-answer"
-          ? `Choose an answer for ${built.question}.`
+          ? `为 ${built.question} 选择一个答案。`
           : built.reason === "multiple-answers"
-            ? `Choose one answer for ${built.question}.`
-            : `That question changed before it could be submitted — nothing was sent.`;
+            ? `为 ${built.question} 选择一个答案。`
+            : `那个问题在提交前发生了变化——没有发送。`;
         showStatus(message);
         return;
       }
@@ -1909,7 +1916,7 @@ function startBrowserClient() {
     setNewThreadModelSurface(provider);
     if (!provider) {
       app.newThreadLoading = false;
-      setNewThreadStatus("Choose a provider.", "error");
+      setNewThreadStatus("请选择提供商。", "error");
       syncNewThreadControls();
       return;
     }
@@ -1924,7 +1931,7 @@ function startBrowserClient() {
     }
 
     app.newThreadLoading = true;
-    setNewThreadStatus("Loading models…");
+    setNewThreadStatus("正在加载模型…");
     syncNewThreadControls();
     try {
       const modelEntries = await collectProviderModelPages(provider.id, async (path) => {
@@ -1972,7 +1979,7 @@ function startBrowserClient() {
     } catch (error) {
       if (generation !== app.newThreadGeneration || !dom.newThreadDialog.open) return;
       app.newThreadLoading = false;
-      setNewThreadStatus(`Could not load models: ${error.message}`, "error");
+      setNewThreadStatus(`加载模型失败：${error.message}`, "error");
       syncNewThreadControls();
     }
   }
@@ -1988,7 +1995,7 @@ function startBrowserClient() {
     dom.newThreadProvider.replaceChildren();
     dom.newThreadModel.replaceChildren();
     dom.newThreadModelInput.value = "";
-    setNewThreadStatus("Loading providers…");
+    setNewThreadStatus("正在加载提供商…");
     renderNewThreadCapability();
     syncNewThreadControls();
     try {
@@ -2013,7 +2020,7 @@ function startBrowserClient() {
     } catch (error) {
       if (generation !== app.newThreadGeneration || !dom.newThreadDialog.open) return;
       app.newThreadLoading = false;
-      setNewThreadStatus(`Could not load providers: ${error.message}`, "error");
+      setNewThreadStatus(`加载提供商失败：${error.message}`, "error");
       syncNewThreadControls();
     }
   }
@@ -2134,7 +2141,7 @@ function startBrowserClient() {
 
   async function archiveThread() {
     if (!app.selectedThreadId) return;
-    if (!globalThis.confirm("Archive this thread? You can still access it through the Runtime API.")) return;
+    if (!globalThis.confirm("要归档这条会话吗？归档后可在「已归档」列表里找回。")) return;
     try {
       await api(`/v1/threads/${encodeURIComponent(app.selectedThreadId)}`, {
         method: "PATCH",
@@ -2158,6 +2165,49 @@ function startBrowserClient() {
     dom.renameDialog.showModal();
     dom.renameInput.focus();
     dom.renameInput.select();
+  }
+
+  // ── 已归档列表（找回入口）──
+  async function loadArchivedList() {
+    try {
+      const list = await api("/v1/threads/summary?include_archived=true&limit=100");
+      app.archivedSummaries = Array.isArray(list) ? list.filter((s) => s && s.archived) : [];
+    } catch (e) {
+      app.archivedSummaries = [];
+    }
+    renderArchivedList();
+  }
+
+  function renderArchivedList() {
+    dom.archivedList.replaceChildren();
+    const rows = app.archivedSummaries || [];
+    dom.archivedEmpty.hidden = rows.length !== 0;
+    dom.archivedToggle.hidden = rows.length === 0;
+    if (rows.length) dom.archivedToggle.textContent = `已归档（${rows.length}）`;
+    for (const s of rows) {
+      const row = element("div", "archived-row");
+      const title = element("span", "thread-title", s.title || "未命名会话");
+      const meta = element("span", "thread-meta", relativeTime(s.updated_at));
+      const restore = element("button", "quiet-button", "恢复");
+      restore.type = "button";
+      restore.addEventListener("click", async () => {
+        try {
+          await api(`/v1/threads/${encodeURIComponent(s.id)}`, {
+            method: "PATCH",
+            body: JSON.stringify({ archived: false }),
+          });
+          await loadArchivedList();
+          await loadThreads();
+        } catch (e) { showStatus(e.message); }
+      });
+      row.append(title, meta, restore);
+      dom.archivedList.append(row);
+    }
+  }
+
+  function openArchivedDialog() {
+    loadArchivedList();
+    dom.archivedDialog.showModal();
   }
 
   async function submitRename(event) {
@@ -2224,6 +2274,8 @@ function startBrowserClient() {
   });
   dom.rename.addEventListener("click", openRenameDialog);
   dom.archive.addEventListener("click", archiveThread);
+  dom.archivedToggle.addEventListener("click", openArchivedDialog);
+  dom.archivedClose.addEventListener("click", () => dom.archivedDialog.close());
   dom.renameForm.addEventListener("submit", submitRename);
   dom.interrupt.addEventListener("click", interruptTurn);
   dom.composer.addEventListener("submit", (event) => {
@@ -2273,6 +2325,7 @@ function startBrowserClient() {
       setConnection("ready", "本地引擎已连接");
       await loadThreads();
       await loadSessions();
+      loadArchivedList().catch(() => {});
       if (app.summaries[0]) await selectThread(app.summaries[0].id);
       else renderAll();
     } catch (error) {
@@ -2292,16 +2345,16 @@ function basename(path) {
 }
 
 function humanize(value) {
-  if (!value) return "Status";
+  if (!value) return "状态";
   return String(value)
     .replaceAll("_", " ")
     .replace(/\b\w/g, (letter) => letter.toUpperCase());
 }
 
 export function modeLabel(mode) {
-  if (mode === "agent") return "Work";
-  if (mode === "plan") return "Plan";
-  if (mode === "operate") return "Operate";
+  if (mode === "agent") return "工作";
+  if (mode === "plan") return "计划";
+  if (mode === "operate") return "运维";
   return humanize(mode || "引擎默认");
 }
 
@@ -2322,8 +2375,16 @@ export function renderRuntimeProvenance(element, runtimeInfo) {
 
 function permissionLabel(thread) {
   if (thread.trust_mode) return "完全访问";
-  if (thread.auto_approve) return "Auto-Review";
-  return "Ask";
+  if (thread.auto_approve) return "自动审核";
+  return "每次询问";
+}
+
+function fmtDateTime(value) {
+  const ts = Date.parse(value);
+  if (!Number.isFinite(ts)) return "";
+  const d = new Date(ts);
+  const p = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
 }
 
 function relativeTime(value) {

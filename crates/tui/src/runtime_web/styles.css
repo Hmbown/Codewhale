@@ -757,7 +757,7 @@ textarea::placeholder {
   font-size: 14.5px;
 }
 
-.message.user .message-label { display: none; }
+.message.user .message-label { display: block; text-align: right; }
 
 .message.in-progress .message-body::after {
   content: "";
@@ -1386,3 +1386,30 @@ noscript {
     animation-iteration-count: 1 !important;
   }
 }
+
+/* ── 已归档列表（门卫加，找回入口）── */
+#archived-dialog { width: min(460px, calc(100% - 28px)); padding: 18px 18px 14px; }
+#archived-dialog .dialog-head { position: relative; margin-bottom: 14px; }
+#archived-dialog .dialog-head .eyebrow { margin: 0 0 4px; }
+#archived-dialog .dialog-head h2 { margin: 0; font-size: 18px; font-weight: 650; }
+#archived-dialog #archived-list { display: block; max-height: 52vh; overflow-y: auto; }
+.archived-row { display: flex; align-items: center; gap: 10px; padding: 10px 2px; border-bottom: 1px solid var(--line); }
+.archived-row:last-child { border-bottom: 0; }
+.archived-row .thread-title { flex: 1 1 auto; min-width: 0; font-size: 13.5px; }
+.archived-row .thread-meta { flex: 0 0 auto; margin: 0; font-size: 10px; }
+.archived-row .quiet-button { flex: 0 0 auto; min-height: 28px; padding: 0 10px; font-size: 12px; }
+#archived-empty { margin: 10px 0 4px; color: var(--text-dim); font-size: 13px; }
+
+/* ── AsBudy 界面专有化（同步自门卫，2026-09-14）── */
+:root { --rail: 384px; }
+.empty-mark { width: 104px; height: 104px; }
+.rail-open { place-items: center; }
+.thread-title { font-size: 15px; }
+.thread-preview { font-size: 13px; }
+.thread-meta { font-size: 11px; }
+.message-body { font-size: 16.5px; }
+.message.user .message-body { font-size: 15.5px; }
+.message-label { font-size: 13px; }
+.quiet-button, .primary-button, .send-button, .icon-button { font-size: 14px; }
+.fact-chip { font-size: 12px; }
+.composer textarea { font-size: 16px; }
