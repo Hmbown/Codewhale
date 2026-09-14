@@ -509,11 +509,9 @@
     if (!t) return;
     var mb = t.closest ? t.closest('button[data-mtab]') : null;
     if (mb) {
-      var which = mb.getAttribute('data-mtab');
-      if (which === 'chat') { hidePreview(); railClick('rail-close'); }
-      else if (which === 'files') { hidePreview(); railClick('rail-open'); }
-      else if (which === 'view') { railClick('rail-close'); showPreview(); }
-      mbarSet(which);
+      // 底部只剩「跟它说」一个：作用 = 回到对话（收起预览 + 收起侧栏）
+      hidePreview(); railClick('rail-close');
+      mbarSet('chat');
       return;
     }
     if (!t.id) return;
