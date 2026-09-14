@@ -590,10 +590,10 @@ fn render_divider(frame: &mut Frame, area: Rect, placement: WorkSurfacePlacement
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct DockTab {
     target: DockTabTarget,
-    label: &'static str,
+    label: std::borrow::Cow<'static, str>,
     count: usize,
 }
 
@@ -607,7 +607,7 @@ fn render_dock_tabs(frame: &mut Frame, area: Rect, app: &mut App) {
         if useful || panel == app.work_surface.panel {
             entries.push(DockTab {
                 target: DockTabTarget::Panel(panel),
-                label: panel.title(),
+                label: panel.title().into(),
                 count: count.unwrap_or(0),
             });
         }
@@ -622,7 +622,7 @@ fn render_dock_tabs(frame: &mut Frame, area: Rect, app: &mut App) {
     let fits = |tabs: &[DockTab], counts: bool| {
         tabs.iter()
             .map(|tab| {
-                UnicodeWidthStr::width(tab.label)
+                UnicodeWidthStr::width(tab.label.as_ref())
                     + if counts && tab.count > 0 {
                         1 + tab.count.to_string().len()
                     } else {

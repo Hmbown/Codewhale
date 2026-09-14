@@ -166,3 +166,7 @@ CODEWHALE_0_9_0_CUTOVER.md
 
 # computer-use plugin smoke receipts (per-run local evidence)
 crates/tui/plugins/computer-use/receipts/
+
+# Portable pet build entry points are source.
+!pet/**/*.sh
+!pet/verify.sh

@@ -5,10 +5,10 @@ description: Scaffold a local Codewhale plugin bundle with a versioned manifest,
 
 # Plugin Creator
 
-Use this skill when a user wants a local Codewhale plugin bundle. Codewhale
-v0.9.1 has a deliberately bounded loader: trusted and enabled bundles may add
-declarative Skills and MCP servers through the existing engines. Other
-component kinds are inventory-only.
+Use this skill when a user wants a local Codewhale plugin bundle. Trusted and
+enabled bundles may add declarative Skills, commands, agents, hooks, and MCP
+servers (stdio and remote) through the existing engines. LSP, native
+extensions, filesystem roots, and lifecycle mutation are inventory-only.
 
 ## Workflow
 
@@ -39,11 +39,12 @@ path = "skills"
    use only environment-backed headers or bearer tokens, and declare the exact
    normalized endpoint host set in `[capabilities].network_hosts`. Never place
    credentials in the manifest.
-6. Declare commands, agents, hooks, LSP, native extensions, filesystem roots,
-   or lifecycle mutation only when inventorying future work. Codewhale shows
-   them as inactive and still activates reviewed Skills and MCP from the same
-   bundle. A bundle that only declares those unsupported surfaces cannot be
-   enabled.
+6. Commands (`commands/*.md`), agents (`agents/*.toml`), and hooks
+   (`hooks/*.toml`) activate under the current policy — workspace bundles win
+   same-name collisions over user and built-in bundles. LSP, native
+   extensions, filesystem roots, and lifecycle mutation are inventory-only:
+   declare them only when inventorying future work. A bundle that declares
+   only unsupported surfaces cannot be enabled.
 7. Validate and review without executing bundle content:
    - `/plugin validate <plugin-name>`
    - `/plugin show <plugin-name>`

@@ -652,7 +652,7 @@ fn start_background_gates(
         "completion_surface": "task_status",
         "background_policy": "nonblocking",
         "task_ids": task_ids,
-        "poll_with": ["exec_shell_wait", "task_shell_wait"]
+        "poll_with": ["task_shell_wait"]
     })))
 }
 

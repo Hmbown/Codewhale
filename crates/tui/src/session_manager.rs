@@ -1006,6 +1006,28 @@ impl SavedSession {
             .map(|j| j.root_to_leaf().into_iter().cloned().collect())
             .unwrap_or_default()
     }
+    /// `created_at` of the active branch's message entries, in order — the
+    /// stamps a resumed session hands back to the live message log so the
+    /// next save preserves append times instead of rewriting them to resume
+    /// time.
+    pub fn journal_message_stamps(&self) -> Vec<DateTime<Utc>> {
+        self.journal
+            .as_ref()
+            .map(|journal| {
+                journal
+                    .root_to_leaf()
+                    .iter()
+                    .filter(|entry| {
+                        matches!(
+                            entry.kind,
+                            crate::session_tree::SessionEntryKind::Message { .. }
+                        )
+                    })
+                    .map(|entry| entry.created_at)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
     pub fn export_container(&self, source: &str) -> SessionImportContainer {
         let journal = self.journal.clone().unwrap_or_else(|| {
             SessionJournal::from_messages(self.messages.clone(), self.metadata.spawn_depth)
@@ -1095,6 +1117,33 @@ pub struct OfflineQueueLease {
 impl OfflineQueueLease {
     pub fn session_id(&self) -> &str {
         &self.session_id
+    }
+}
+
+impl Drop for OfflineQueueLease {
+    fn drop(&mut self) {
+        // A forked child can briefly retain the same open-file description.
+        // Release the editor's lock now, rather than waiting for every inherited
+        // descriptor to close, as RuntimeProcessOwnerLock does on shutdown.
+        #[cfg(all(unix, not(target_os = "solaris")))]
+        {
+            use std::os::fd::AsRawFd as _;
+            // SAFETY: the lease still owns this descriptor throughout Drop.
+            unsafe {
+                libc::flock(self._file.as_raw_fd(), libc::LOCK_UN);
+            }
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsRawHandle as _;
+            use windows_sys::Win32::Storage::FileSystem::UnlockFile;
+            // SAFETY: the lease owns the handle; fd-lock locks byte 0 only.
+            unsafe {
+                UnlockFile(self._file.as_raw_handle() as _, 0, 0, 1, 0);
+            }
+        }
+        // fd-lock uses process-associated fcntl locks on Solaris. They are not
+        // inherited by fork and closing this descriptor releases the lock.
     }
 }
 
@@ -1686,6 +1735,29 @@ impl SessionManager {
         Ok(Some(goal))
     }
 
+    fn hydrate_recovered_runtime_binding(&self, session: &mut SavedSession) -> std::io::Result<()> {
+        // Compare under the session write lock. A stale process may neither
+        // resurrect a missing binding nor replace a different recovered owner.
+        if let Some(incoming) = session.metadata.runtime_store.as_ref()
+            && let Ok(persisted) =
+                Self::load_session_metadata(&self.validated_session_path(&session.metadata.id)?)
+            && let Some(binding) = persisted.runtime_store
+            && incoming != &binding
+        {
+            if incoming.is_missing_session_store().unwrap_or(false)
+                && binding.validate_existing_store().is_ok()
+            {
+                session.metadata.runtime_store = Some(binding);
+            } else if !binding.is_missing_session_store().unwrap_or(false) {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "Session Runtime ownership changed; reopen the session before saving",
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Save a session to disk using atomic write (temp file + fsync + rename).
     pub fn save_session(&self, session: &SavedSession) -> std::io::Result<PathBuf> {
         let path = self.validated_session_path(&session.metadata.id)?;
@@ -1698,6 +1770,7 @@ impl SessionManager {
             self.archive_before_first_graph_write(session, &path)?;
 
             let mut durable_session = session.clone();
+            self.hydrate_recovered_runtime_binding(&mut durable_session)?;
             self.hydrate_approval_receipts(&mut durable_session)?;
             let content = serialize_saved_session(&durable_session)?;
 
@@ -1727,6 +1800,7 @@ impl SessionManager {
             fs::create_dir_all(self.checkpoints_dir())?;
             let already_persisted = path.exists() || session_path.exists();
             let mut durable_session = session.clone();
+            self.hydrate_recovered_runtime_binding(&mut durable_session)?;
             self.hydrate_approval_receipts(&mut durable_session)?;
             let content = serialize_saved_session(&durable_session)?;
             write_atomic(&path, content.as_bytes())?;
@@ -2040,8 +2114,8 @@ impl SessionManager {
         })?;
         // fd-lock's guard borrows its owner. Retain the underlying descriptor
         // instead so this lease can travel with asynchronous writes. Forgetting
-        // this non-owning guard keeps the OS lock held; closing the final Arc's
-        // file releases it on both Unix and Windows, including process crashes.
+        // this non-owning guard keeps the OS lock held; the final Arc explicitly
+        // unlocks in Drop. The OS also releases it when the process crashes.
         std::mem::forget(guard);
         Ok(std::sync::Arc::new(OfflineQueueLease {
             session_id,
@@ -2243,6 +2317,11 @@ impl SessionManager {
 
     /// Load a session by partial ID prefix
     pub fn load_session_by_prefix(&self, prefix: &str) -> std::io::Result<SavedSession> {
+        self.load_session(&self.resolve_session_id_prefix(prefix)?)
+    }
+
+    /// Resolve a unique ID without applying resume-time repair to its record.
+    pub(crate) fn resolve_session_id_prefix(&self, prefix: &str) -> std::io::Result<String> {
         let sessions = self.list_sessions()?;
 
         let matches: Vec<_> = sessions
@@ -2255,7 +2334,7 @@ impl SessionManager {
                 std::io::ErrorKind::NotFound,
                 format!("No session found with prefix: {prefix}"),
             )),
-            1 => self.load_session(&matches[0].id),
+            1 => Ok(matches[0].id.clone()),
             _ => Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 format!(
@@ -2882,6 +2961,32 @@ pub fn create_saved_session_with_id_and_mode(
     system_prompt: Option<&SystemPrompt>,
     mode: Option<&str>,
 ) -> SavedSession {
+    create_saved_session_with_id_mode_and_stamps(
+        id,
+        messages,
+        &[],
+        model,
+        workspace,
+        total_tokens,
+        system_prompt,
+        mode,
+    )
+}
+
+/// Create a new `SavedSession` whose journal entries keep the time each
+/// message actually landed. `message_stamps[i]` is the append time of
+/// `messages[i]`; a missing stamp falls back to now. Callers without a
+/// live stamp log pass `&[]` and get the historical save-time behavior.
+pub fn create_saved_session_with_id_mode_and_stamps(
+    id: String,
+    messages: &[Message],
+    message_stamps: &[DateTime<Utc>],
+    model: &str,
+    workspace: &Path,
+    total_tokens: u64,
+    system_prompt: Option<&SystemPrompt>,
+    mode: Option<&str>,
+) -> SavedSession {
     let now = Utc::now();
 
     // Generate title from the first real user message (runtime-owned control
@@ -2890,7 +2995,7 @@ pub fn create_saved_session_with_id_and_mode(
     let title =
         conversation_derived_title(messages).unwrap_or_else(|| DEFAULT_SESSION_TITLE.to_string());
 
-    let journal = SessionJournal::from_messages(messages.to_vec(), 0);
+    let journal = SessionJournal::from_messages_stamped(messages.to_vec(), message_stamps, 0);
     let leaf_id = journal.leaf_id.clone();
     SavedSession {
         schema_version: CURRENT_SESSION_SCHEMA_VERSION,
@@ -3374,6 +3479,59 @@ mod tests {
                 cache_control: None,
             }],
         }
+    }
+
+    /// The journal is the session's timeline: an entry's `created_at` is when
+    /// the message landed, not when a save ran. A rebuilt journal must not
+    /// collapse 90 minutes of appends into the save instant — an inspector
+    /// reading the file needs "this loop is 12 seconds" to be true.
+    #[test]
+    fn journal_entries_keep_append_stamps_across_saves() {
+        let tmp = tempdir().expect("tempdir");
+        let messages = vec![
+            make_test_message("user", "first"),
+            make_test_message("assistant", "answer"),
+        ];
+        let t0 = Utc::now() - chrono::Duration::minutes(90);
+        let t1 = t0 + chrono::Duration::seconds(12);
+        let session = create_saved_session_with_id_mode_and_stamps(
+            "stamped".to_string(),
+            &messages,
+            &[t0, t1],
+            "deepseek-v4-flash",
+            tmp.path(),
+            0,
+            None,
+            None,
+        );
+        let journal = session.journal.as_ref().expect("journal");
+        assert_eq!(journal.entries[0].created_at, t0);
+        assert_eq!(journal.entries[1].created_at, t1);
+        assert_ne!(
+            journal.entries[0].created_at, session.metadata.updated_at,
+            "an append 90 minutes before save must not read as save time"
+        );
+        // Resume hands the same stamps back to the live log.
+        assert_eq!(session.journal_message_stamps(), vec![t0, t1]);
+        // A save with no stamps keeps the old behavior: entries collapse to
+        // save time rather than inventing times.
+        let unstamped = create_saved_session_with_id_and_mode(
+            "unstamped".to_string(),
+            &messages,
+            "deepseek-v4-flash",
+            tmp.path(),
+            0,
+            None,
+            None,
+        );
+        let journal = unstamped.journal.as_ref().expect("journal");
+        assert!(
+            journal
+                .entries
+                .iter()
+                .all(|entry| entry.created_at >= unstamped.metadata.created_at),
+            "without stamps, entries stamp at save as before"
+        );
     }
 
     fn save_late_usage_test_session(manager: &SessionManager, id: &str) -> SavedSession {
@@ -6952,6 +7110,48 @@ mod tests {
         );
         assert!(legacy.exists(), "unreadable legacy queue is left in place");
     }
+    #[cfg(all(unix, not(target_os = "solaris")))]
+    #[test]
+    fn offline_queue_lease_releases_while_an_inherited_descriptor_remains_open() {
+        let directory = tempfile::tempdir().expect("queue fixture");
+        let manager = SessionManager::new(directory.path().join("sessions")).expect("manager");
+        let editor = manager
+            .acquire_offline_queue_lease("shared-session")
+            .expect("first editor");
+        // dup and fork share the same open-file description. Keep it alive
+        // without a timing race or forking the multithreaded test process.
+        let inherited = editor._file.try_clone().expect("inherited descriptor");
+        let pending_write = std::sync::Arc::clone(&editor);
+        drop(editor);
+        assert_eq!(
+            manager
+                .acquire_offline_queue_lease("shared-session")
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::WouldBlock,
+            "pending writes retain the exclusive editor lease"
+        );
+        drop(pending_write);
+        let next_editor = manager
+            .acquire_offline_queue_lease("shared-session")
+            .expect("completed editor releases even while a child retains its descriptor");
+        drop(inherited);
+        assert_eq!(
+            manager
+                .acquire_offline_queue_lease("shared-session")
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::WouldBlock,
+            "closing the old descriptor must not release the next editor's lock"
+        );
+        drop(next_editor);
+        assert!(
+            manager
+                .acquire_offline_queue_lease("shared-session")
+                .is_ok()
+        );
+    }
+
     #[test]
     fn offline_queue_lease_excludes_another_process_and_releases() {
         const PROBE: &str = "CODEWHALE_QUEUE_LEASE_PROBE_DIR";

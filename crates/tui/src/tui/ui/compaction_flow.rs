@@ -225,13 +225,10 @@ pub(crate) fn apply_compaction_started(app: &mut App, id: String, auto: bool) {
     }
     app.active_compaction = Some(ActiveCompaction { id, auto });
     app.is_compacting = true;
-    let message_id = if auto {
-        MessageId::ContextAutoCompacting
-    } else {
-        MessageId::ContextManualCompacting
-    };
-    let text = app.tr(message_id).into_owned();
-    set_explicit_compaction_status(app, text, StatusToastLevel::Info, false);
+    if !auto {
+        let text = app.tr(MessageId::ContextManualCompacting).into_owned();
+        set_explicit_compaction_status(app, text, StatusToastLevel::Info, false);
+    }
 }
 
 /// Clear the compaction-in-flight state for a terminal lifecycle event.
@@ -332,8 +329,12 @@ pub(crate) fn apply_compaction_completed(
             messages_before: before,
             messages_after: after,
         });
-        add_compaction_receipt(app, &message);
-        set_explicit_compaction_status(app, message, StatusToastLevel::Success, false);
+        // Automatic maintenance stays in the context inspector and event
+        // receipts; it does not insert a ceremony into the user's task.
+        if !auto {
+            add_compaction_receipt(app, &message);
+            set_explicit_compaction_status(app, message, StatusToastLevel::Success, false);
+        }
     }
 }
 
@@ -349,6 +350,15 @@ pub(crate) fn apply_compaction_cancelled(app: &mut App, id: &str, auto: bool, me
         add_compaction_receipt(app, &message);
         set_explicit_compaction_status(app, message, StatusToastLevel::Info, false);
     }
+}
+
+/// Esc/Ctrl+C during a compact that is serving an in-flight turn must stop
+/// the turn. Compact-only (manual `/compact` with no model request) still
+/// cancels just the pass.
+#[must_use]
+pub(crate) fn compact_interrupt_should_stop_turn(app: &App) -> bool {
+    (app.is_compacting || app.manual_compaction_queued)
+        && (app.is_loading || matches!(app.runtime_turn_status.as_deref(), Some("in_progress")))
 }
 
 /// Cancel the exact queued or running pass without cancelling an unrelated
@@ -406,6 +416,11 @@ pub(crate) fn maybe_warn_context_pressure_for_config(
     app: &mut App,
     config: &crate::compaction::CompactionConfig,
 ) {
+    if config.enabled {
+        app.dismiss_context_pressure_warning();
+        app.context_pressure_warning_dismissed = None;
+        return;
+    }
     let max = config.effective_context_window.unwrap_or_else(|| {
         crate::route_budget::route_context_window_tokens(
             app.api_provider,
@@ -419,8 +434,7 @@ pub(crate) fn maybe_warn_context_pressure_for_config(
 
     let configured_threshold = app.auto_compact_threshold_percent.clamp(10.0, 100.0);
     let warning_threshold = CONTEXT_SUGGEST_COMPACT_THRESHOLD_PERCENT.min(configured_threshold);
-    let will_auto_compact = config.enabled && used.max(0) as usize >= config.token_threshold;
-    if percent < warning_threshold && !will_auto_compact {
+    if percent < warning_threshold {
         app.context_pressure_warning_dismissed = None;
         if app.sticky_status.as_ref().is_some_and(|status| {
             matches!(
@@ -455,13 +469,7 @@ pub(crate) fn maybe_warn_context_pressure_for_config(
         ", unverified window"
     };
 
-    let recommendation = if !config.enabled {
-        "Consider enabling auto_compact or use /compact."
-    } else if will_auto_compact {
-        "Auto-compaction will run before the next send."
-    } else {
-        "Auto-compaction is enabled."
-    };
+    let recommendation = "Automatic compaction is disabled. Enable auto_compact or use /compact.";
 
     if percent >= CONTEXT_CRITICAL_THRESHOLD_PERCENT {
         set_context_pressure_status(

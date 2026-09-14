@@ -289,9 +289,6 @@ mod tests {
 
     #[tokio::test]
     async fn header_stall_on_dual_policy_retries_exactly_once_on_h1() {
-        let server = ok_server().await;
-        let _ = rustls::crypto::ring::default_provider().install_default();
-        let client = reqwest::Client::new();
         let attempts = Arc::new(AtomicUsize::new(0));
         let response = open_sse_response(
             &open_req(
@@ -300,8 +297,6 @@ mod tests {
             ),
             |policy| {
                 let attempts = Arc::clone(&attempts);
-                let client = client.clone();
-                let url = server.uri();
                 async move {
                     let attempt = attempts.fetch_add(1, Ordering::SeqCst);
                     if attempt == 0 {
@@ -310,7 +305,12 @@ mod tests {
                         std::future::pending::<()>().await;
                     }
                     assert_eq!(policy, StreamHttpPolicy::Http1Only);
-                    Ok(client.post(url).send().await?)
+                    // This test exercises retry policy, not loopback scheduling.
+                    // A ready response keeps the 150 ms first-attempt timeout
+                    // from also imposing a network deadline under suite load.
+                    Ok(reqwest::Response::from(
+                        axum::http::Response::builder().status(200).body("")?,
+                    ))
                 }
             },
         )

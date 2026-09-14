@@ -1,0 +1,69 @@
+name: Marketplace connection
+
+on:
+  pull_request:
+    paths:
+      - 'crates/tui/assets/first-party-marketplace.json'
+      - 'scripts/sync-marketplace.py'
+      - '.github/workflows/marketplace-sync.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'crates/tui/assets/first-party-marketplace.json'
+      - 'scripts/sync-marketplace.py'
+      - '.github/workflows/marketplace-sync.yml'
+  schedule:
+    - cron: '23 10 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  catalog:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          path: core
+          persist-credentials: false
+      - name: Select catalog revision
+        id: source
+        working-directory: core
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          python3 - <<'PY'
+          import json, os, re
+          snapshot = json.load(open('crates/tui/assets/first-party-marketplace.json'))
+          revision = snapshot['revision']
+          assert re.fullmatch(r'[0-9a-f]{40}', revision), 'Invalid marketplace revision'
+          if os.environ['EVENT_NAME'] in ('schedule', 'workflow_dispatch'):
+              revision = 'main'
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write(f'revision={revision}\n')
+          PY
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          repository: Hmbown/codewhale-plugin-marketplace
+          ref: ${{ steps.source.outputs.revision }}
+          path: marketplace
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22'
+          package-manager-cache: false
+      - name: Check catalog and real bundle manifests
+        run: node marketplace/scripts/check-marketplace.mjs
+      - name: Check bundled catalog snapshot
+        run: python3 core/scripts/sync-marketplace.py --marketplace marketplace --check
+      - name: Check current skill and Computer Use mirrors
+        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+        run: |
+          node marketplace/scripts/check-marketplace.mjs --core core
+          node marketplace/scripts/check-cu-sync.mjs --core core
+      - name: Explain a drift failure
+        if: failure()
+        run: |
+          echo 'Review upstream changes using docs/PLUGIN_MARKETPLACE.md. Sync source-owned mirrors, rerun checks, regenerate the catalog, and rebuild. This workflow never installs, trusts, enables, or publishes plugins.' >> "$GITHUB_STEP_SUMMARY"

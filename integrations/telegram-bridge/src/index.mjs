@@ -211,7 +211,14 @@ async function handleIncomingUpdate(update) {
   }
 
   const command = parseCommand(scoped.text);
+  await rememberAuthorizedIdentity(identity);
   await handleCommand(identity.chatId, command);
+}
+
+async function rememberAuthorizedIdentity({ chatId, chatType, userId, username, isBot }) {
+  await threadStore.patchChat(chatId, {
+    authorizedIdentity: { chatId, chatType, userId, username, isBot }
+  });
 }
 
 async function isReplayCallbackUpdate(update) {
@@ -293,6 +300,7 @@ async function handleCallbackQuery(query) {
     return;
   }
 
+  await rememberAuthorizedIdentity(identity);
   answerCallback(query.id, "Working...").catch((error) => {
     console.warn("failed to acknowledge Telegram callback", error);
   });
@@ -528,6 +536,13 @@ async function runPrompt(chatId, prompt, options = {}) {
 async function reattachActiveTurns() {
   for (const [chatId, state] of threadStore.listChats()) {
     if (!state?.threadId || !state.activeTurnId) continue;
+    const identity = state.authorizedIdentity;
+    // Legacy state has no verified sender provenance. Never recover delivery
+    // under a previous allowlist or group policy, even to report completion.
+    if (!identity || identity.chatId !== chatId || identity.isBot ||
+        !["private", "group", "supergroup"].includes(identity.chatType) ||
+        (isGroupChat(identity.chatType) && !config.allowGroups) ||
+        !isAllowed(identity, config.allowlist, config.allowUnlisted)) continue;
 
     const detail = await runtimeJson(`/v1/threads/${encodeURIComponent(state.threadId)}`);
     const runningTurn = latestRunningTurn(detail);

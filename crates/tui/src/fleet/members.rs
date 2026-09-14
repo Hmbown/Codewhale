@@ -35,11 +35,11 @@ pub struct FleetModel {
 }
 
 impl FleetModel {
-    /// Saved wire IDs are exact. Alias convenience belongs to the bound
-    /// resolver, never to membership mutation or the active-row marker.
+    /// Model wire IDs and custom provider keys are exact. Only known built-in
+    /// provider aliases are interchangeable for membership and row markers.
     #[must_use]
     pub fn matches(&self, provider: &str, model: &str) -> bool {
-        self.provider.eq_ignore_ascii_case(provider.trim()) && self.model == model.trim()
+        provider_ids_match(&self.provider, provider) && self.model == model.trim()
     }
 
     /// `roles` joined for a one-line label, or `member` when none.
@@ -191,11 +191,22 @@ pub fn models_of(fleet: &FleetFile) -> Vec<FleetModel> {
     models
 }
 
+/// Provider kinds have documented aliases; named custom routes have exact
+/// keys. Treating every provider name as case-insensitive merges distinct
+/// endpoints before the configured route binder can resolve them.
+fn provider_ids_match(saved: &str, requested: &str) -> bool {
+    use crate::config::ApiProvider;
+    saved.trim() == requested.trim()
+        || ApiProvider::parse(saved)
+            .filter(|provider| *provider != ApiProvider::Custom)
+            .is_some_and(|provider| Some(provider) == ApiProvider::parse(requested))
+}
+
 fn member_pins(member: &FleetMember, provider: &str, model: &str) -> bool {
     member
         .provider
         .as_deref()
-        .is_some_and(|p| p.eq_ignore_ascii_case(provider))
+        .is_some_and(|p| provider_ids_match(p, provider))
         && member.model.as_deref().is_some_and(|id| id == model)
 }
 
@@ -388,9 +399,10 @@ pub fn toggle_fleet_model(
 }
 
 fn is_operator_route(fleet: &FleetFile, provider: &str, model: &str) -> bool {
-    fleet.operator.as_ref().is_some_and(|op| {
-        op.provider.eq_ignore_ascii_case(provider.trim()) && op.model == model.trim()
-    })
+    fleet
+        .operator
+        .as_ref()
+        .is_some_and(|op| provider_ids_match(&op.provider, provider) && op.model == model.trim())
 }
 
 /// One-line receipt for a membership change, shared by `/fleet add|remove`
@@ -587,6 +599,152 @@ mod tests {
         assert_eq!(models[0].roles, ["operator", "planner"]);
         assert_eq!(models[1].roles, ["scout", "verifier"]);
         assert_eq!(models[1].roles_label(), "explore · test");
+    }
+
+    #[test]
+    fn case_distinct_custom_providers_with_one_model_remain_separate() {
+        let _lock = crate::test_support::lock_test_env();
+        let (_temp, _home, workspace) = isolated_workspace();
+        let model = "shared-wire-model";
+        for provider in ["TeamA", "teama"] {
+            for roles in [Vec::new(), vec!["reviewer".into()]] {
+                assert!(matches!(
+                    add_fleet_model(&workspace, provider, model, &roles).unwrap(),
+                    FleetModelChange::Added { .. }
+                ));
+            }
+        }
+        let (before, path) = selected_file(&workspace);
+        assert_eq!(before.members.len(), 4);
+        let lower_rows = before
+            .members
+            .iter()
+            .filter(|member| member.provider.as_deref() == Some("teama"))
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(lower_rows.len(), 2);
+        let models = fleet_models(&workspace).unwrap();
+        assert_eq!(
+            models.len(),
+            2,
+            "both endpoints must remain available to routing"
+        );
+        assert_eq!(models[0].provider, "TeamA");
+        assert_eq!(models[1].provider, "teama");
+        for (index, provider) in ["TeamA", "teama"].into_iter().enumerate() {
+            assert!(models[index].matches(provider, model));
+            assert!(!models[1 - index].matches(provider, model));
+            assert_eq!(models[index].roles, ["reviewer"]);
+        }
+        let bytes = std::fs::read(&path).unwrap();
+        assert!(matches!(
+            remove_fleet_model(&workspace, "TEAMA", model),
+            Err(FleetModelError::NotInFleet { .. })
+        ));
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+
+        // Toggle only the upper provider's choice; its role and both lower
+        // provider rows remain. Removal then removes only that upper role.
+        assert!(matches!(
+            toggle_fleet_model(&workspace, "TeamA", model).unwrap(),
+            FleetModelChange::Unchanged {
+                reason: UnchangedReason::AlreadyPresent,
+                ..
+            }
+        ));
+        let after_toggle = selected_file(&workspace).0;
+        assert_eq!(after_toggle.members.len(), 3);
+        assert_eq!(
+            after_toggle
+                .members
+                .iter()
+                .filter(|member| member.provider.as_deref() == Some("teama"))
+                .cloned()
+                .collect::<Vec<_>>(),
+            lower_rows
+        );
+        assert!(matches!(
+            remove_fleet_model(&workspace, "TeamA", model).unwrap(),
+            FleetModelChange::Removed { .. }
+        ));
+        assert_eq!(selected_file(&workspace).0.members, lower_rows);
+        assert!(matches!(
+            toggle_fleet_model(&workspace, "TeamA", model).unwrap(),
+            FleetModelChange::Added { .. }
+        ));
+        assert!(matches!(
+            toggle_fleet_model(&workspace, "TeamA", model).unwrap(),
+            FleetModelChange::Removed { .. }
+        ));
+        assert_eq!(selected_file(&workspace).0.members, lower_rows);
+    }
+
+    #[test]
+    fn custom_provider_case_does_not_alias_the_operator_with_the_same_model() {
+        let _lock = crate::test_support::lock_test_env();
+        let (_temp, _home, workspace) = isolated_workspace();
+        let model = "shared-wire-model";
+        let fleet = fleet_with(Some(("TeamA", model)), &[]);
+        save_fleet(&fleet, FleetScope::Workspace, &workspace).unwrap();
+        set_selected(&fleet.name, FleetScope::Workspace, &workspace).unwrap();
+        assert!(matches!(
+            add_fleet_model(&workspace, "teama", model, &[]).unwrap(),
+            FleetModelChange::Added { .. }
+        ));
+        let models = fleet_models(&workspace).unwrap();
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[0].roles, ["operator"]);
+        assert!(models[1].roles.is_empty());
+        assert!(matches!(
+            toggle_fleet_model(&workspace, "teama", model).unwrap(),
+            FleetModelChange::Removed { .. }
+        ));
+        assert_eq!(selected_file(&workspace).0, fleet);
+        assert!(matches!(
+            add_fleet_model(&workspace, "TeamA", model, &[]).unwrap(),
+            FleetModelChange::Unchanged {
+                reason: UnchangedReason::OperatorRoute,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn built_in_provider_aliases_share_membership_and_operator_pins() {
+        let _lock = crate::test_support::lock_test_env();
+        let (_temp, _home, workspace) = isolated_workspace();
+        let fleet = fleet_with(Some(("meta", "muse-spark-1.3")), &[]);
+        save_fleet(&fleet, FleetScope::Workspace, &workspace).unwrap();
+        set_selected(&fleet.name, FleetScope::Workspace, &workspace).unwrap();
+        assert!(matches!(
+            add_fleet_model(&workspace, "MUSE", "muse-spark-1.3", &[]).unwrap(),
+            FleetModelChange::Unchanged {
+                reason: UnchangedReason::OperatorRoute,
+                ..
+            }
+        ));
+        assert!(matches!(
+            add_fleet_model(&workspace, "meta", "muse-spark-1.2", &[]).unwrap(),
+            FleetModelChange::Added { .. }
+        ));
+        let (_, path) = selected_file(&workspace);
+        let bytes = std::fs::read(&path).unwrap();
+        assert!(matches!(
+            add_fleet_model(&workspace, "muse", "muse-spark-1.2", &[]).unwrap(),
+            FleetModelChange::Unchanged {
+                reason: UnchangedReason::AlreadyPresent,
+                ..
+            }
+        ));
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        let models = fleet_models(&workspace).unwrap();
+        assert_eq!(models.len(), 2);
+        assert!(models[1].matches("MUSE", "muse-spark-1.2"));
+        assert!(matches!(
+            toggle_fleet_model(&workspace, "MUSE", "muse-spark-1.2").unwrap(),
+            FleetModelChange::Removed { .. }
+        ));
+        assert_eq!(selected_file(&workspace).0, fleet);
     }
 
     #[test]

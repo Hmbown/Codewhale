@@ -615,6 +615,11 @@ pub struct LaunchState {
     /// All workspace sessions behind the inline list; when this exceeds
     /// `recent.len()` the card paints the see-all overflow row.
     pub total_workspace_sessions: usize,
+    /// Whether this workspace has any sessions at all — including the
+    /// empty auto-created shells `recent` deliberately drops. The card
+    /// must not say "no recent sessions yet" while `/resume` lists them;
+    /// when they exist it shows the see-all row instead of the lie.
+    pub has_scoped_sessions: bool,
     /// Whether launch keys type into the pre-session composer. The composer
     /// is the launch screen's one focus owner, so this is `true` from first
     /// paint. The composer itself is the session `App`'s own
@@ -641,21 +646,6 @@ pub struct LaunchState {
     /// Claude Code config was detected on this host (probed once at
     /// construction); drives the launch card's migration notice line.
     pub claude_code_detected: bool,
-    /// Sixel-tier plumbing (`MarkTier::Sixel`), all `None` until used:
-    /// - `sixel_cell_px`: the terminal's cell size in pixels, measured once
-    ///   at startup so the raster encodes to the block's exact pixels.
-    /// - `sixel_terminal_bg`: the probed terminal background, for
-    ///   transparent (`Reset`) theme stages whose ground the terminal owns.
-    /// - `sixel_mark_area`: the block the last launch render reserved, in
-    ///   stage coordinates; reset every frame by the frame renderer.
-    /// - `sixel_emitted`: the live image's block, in the same stage
-    ///   coordinates (identical to screen cells in fullscreen), or `None`
-    ///   when nothing is drawn. Compared against the reservation so the
-    ///   event loop re-emits only on moves and clears on tier exit.
-    pub sixel_cell_px: Option<(u16, u16)>,
-    pub sixel_terminal_bg: Option<Color>,
-    pub sixel_mark_area: Option<Rect>,
-    pub sixel_emitted: Option<Rect>,
 }
 
 /// The launch card's dissolve motion budget. One bounded motion; reduced
@@ -664,13 +654,19 @@ pub(crate) const LAUNCH_CARD_DISSOLVE_MS: u128 = 240;
 
 /// Load the startup card's recent-work list: the workspace's own sessions,
 /// most recent first (`list_sessions` already sorts that way), skipping
-/// archived sessions and empty auto-created ones exactly like the resume
-/// picker and `--continue` do. Returns the inline-capped list plus the
-/// total behind it for the see-all overflow.
-fn load_launch_recent(workspace: &std::path::Path) -> (Vec<LaunchRecentSession>, usize) {
+/// archived sessions and — unlike the resume picker, which lists them —
+/// empty auto-created shells. Returns the inline-capped list, the total
+/// behind it for the see-all overflow, and whether any scoped sessions
+/// exist at all so the card never claims "no recent sessions" while
+/// `/resume` has some.
+fn load_launch_recent(workspace: &std::path::Path) -> (Vec<LaunchRecentSession>, usize, bool) {
     let sessions = crate::session_manager::SessionManager::default_location()
         .and_then(|manager| manager.list_sessions())
         .unwrap_or_default();
+    let any_scoped = sessions.iter().any(|session| {
+        !session.archived
+            && crate::session_manager::workspace_scope_matches(&session.workspace, workspace)
+    });
     let mut scoped: Vec<LaunchRecentSession> = sessions
         .into_iter()
         .filter(|session| {
@@ -687,13 +683,13 @@ fn load_launch_recent(workspace: &std::path::Path) -> (Vec<LaunchRecentSession>,
         .collect();
     let total = scoped.len();
     scoped.truncate(LAUNCH_RECENT_INLINE_LIMIT);
-    (scoped, total)
+    (scoped, total, any_scoped)
 }
 
 impl LaunchState {
     #[must_use]
     pub fn new(visible: bool, workspace: &std::path::Path) -> Self {
-        let (recent, total_workspace_sessions) = load_launch_recent(workspace);
+        let (recent, total_workspace_sessions, has_scoped_sessions) = load_launch_recent(workspace);
         // The migration notice answers a question you have exactly once:
         // "I have Claude Code, what comes over?". It used to key on
         // `~/.claude/projects` alone, so anyone who keeps Claude Code
@@ -725,16 +721,13 @@ impl LaunchState {
             workspace: workspace.to_path_buf(),
             recent,
             total_workspace_sessions,
+            has_scoped_sessions,
             composer_focus: true,
             row_hitboxes: Vec::new(),
             hovered_row: None,
             menu_selected: None,
             dissolve_started_ms: None,
             claude_code_detected,
-            sixel_cell_px: None,
-            sixel_terminal_bg: None,
-            sixel_mark_area: None,
-            sixel_emitted: None,
         }
     }
 
@@ -742,9 +735,10 @@ impl LaunchState {
     /// construction). Called when the card is restored after a picker
     /// closes so a session created or renamed behind the picker shows up.
     pub fn refresh_recent(&mut self) {
-        let (recent, total) = load_launch_recent(&self.workspace.clone());
+        let (recent, total, any_scoped) = load_launch_recent(&self.workspace.clone());
         self.recent = recent;
         self.total_workspace_sessions = total;
+        self.has_scoped_sessions = any_scoped;
     }
 
     /// Begin the card dissolve once (idempotent). The first keystroke or a
@@ -766,6 +760,14 @@ impl LaunchState {
         self.hovered_row = None;
         self.status = None;
         self.refresh_recent();
+    }
+
+    /// True while the card is still painting — visible and not fully
+    /// dissolved. Hitboxes and clicks follow the paint, so a dissolved card
+    /// owns no rows.
+    #[must_use]
+    pub fn card_paintable(&self, now_ms: u128, motion_allowed: bool) -> bool {
+        self.visible && self.card_dissolve_progress(now_ms, motion_allowed) < 1.0
     }
 
     /// How far the card has dissolved, `[0.0 intact ..= 1.0 gone]`. Reduced
@@ -938,9 +940,9 @@ pub struct ViewportState {
     /// Last left-click trace over the composer, for double/triple-click
     /// word/line selection (crossterm does not decode click counts).
     pub composer_click_trace: Option<crate::tui::mouse_ui::ComposerClickTrace>,
-    /// Painted band occupied by the active inline approval. Stored so wheel
-    /// routing can prefer the visible card over side surfaces underneath it.
-    pub last_approval_area: Option<Rect>,
+    /// Painted band occupied by the active approval or question sheet. Stored
+    /// so wheel routing can prefer the prompt over side surfaces underneath it.
+    pub last_prompt_area: Option<Rect>,
     /// WorkflowPanel rect above the composer (#4121), for mouse toggle/cancel.
     pub last_workflow_panel_area: Option<Rect>,
     pub last_workflow_cancel_area: Option<Rect>,
@@ -987,7 +989,7 @@ impl Default for ViewportState {
             last_composer_area: None,
             interaction_targets: crate::tui::tideline::InteractionRegistry::default(),
             composer_click_trace: None,
-            last_approval_area: None,
+            last_prompt_area: None,
             last_workflow_panel_area: None,
             last_workflow_cancel_area: None,
             last_infoline_hitboxes: Vec::new(),
@@ -1455,6 +1457,7 @@ pub struct App {
     /// Ocean work-surface state. Kept separate from transcript/sidebar state
     /// so the replacement shell can be removed or promoted as one unit.
     pub work_surface: crate::tui::work_surface::WorkSurfaceState,
+    pub pet_watch: crate::tui::pet_watch::PetWatch,
     /// Goal sub-state.
     pub goal: HostGoalState,
     /// Session sub-state (cost, tokens, telemetry).
@@ -1486,6 +1489,14 @@ pub struct App {
     /// Monotonic counter used to issue fresh per-cell revisions.
     pub next_history_revision: u64,
     pub api_messages: Vec<Message>,
+    /// When each `api_messages` entry landed, index-aligned. The persisted
+    /// journal's `created_at` reads from these stamps, so a save rewrites
+    /// neither an entry's content nor its time — appends during a turn stay
+    /// spread across the session's real timeline instead of collapsing to
+    /// the save instant. Maintained by the `*_api_messages` helpers; a
+    /// length-mismatched site degrades to save-time stamps, never to a
+    /// dropped message.
+    pub api_message_stamps: Vec<DateTime<Utc>>,
     /// User-visible assistant text that crossed typed completion boundaries.
     /// Receipts are aligned to transcript cells because provider context can
     /// be compacted or purged without changing what remains visible.
@@ -1630,6 +1641,10 @@ pub struct App {
     pub active_context_window_source: crate::route_runtime::ContextWindowSource,
     /// User-configured provider context-window override for the active route.
     pub active_context_window_override: Option<u32>,
+    /// `[providers.<id>.model_context_windows]` for the active provider
+    /// identity, keyed by exact wire model id (#6108). A hit wins over
+    /// `active_context_window_override` for that model only.
+    pub active_model_context_windows: Option<std::collections::BTreeMap<String, u32>>,
     /// Pending provider transition for transactional rollback when the next
     /// auth failure indicates the new provider cannot be used.
     pub pending_provider_switch: Option<PendingProviderSwitch>,
@@ -2335,8 +2350,12 @@ pub struct App {
 
     /// Cached git context snapshot for the footer.
     pub workspace_context: Option<String>,
+    /// Cached linked-worktree identity, refreshed with the branch off the draw path.
+    pub workspace_is_linked_worktree: bool,
     /// Shared cell for async git context updates (#399 S1).
-    pub workspace_context_cell: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+    pub workspace_context_cell: std::sync::Arc<
+        std::sync::Mutex<Option<crate::tui::workspace_context::WorkspaceContextSnapshot>>,
+    >,
     /// Timestamp for cached workspace context.
     pub workspace_context_refreshed_at: Option<Instant>,
     /// Cached size of the memory file, formatted for the Session sidebar.
@@ -4800,6 +4819,87 @@ impl App {
         self.collapsed_cell_map.clear();
     }
 
+    /// Append a message and stamp when it landed — the persisted journal's
+    /// `created_at` reads this stamp, so an entry's time is append time, not
+    /// save time.
+    pub fn push_api_message(&mut self, message: Message) {
+        self.api_message_stamps
+            .resize_with(self.api_messages.len(), Utc::now);
+        self.api_messages.push(message);
+        self.api_message_stamps.push(Utc::now());
+    }
+
+    /// Mirror an engine `SessionUpdated` projection into `api_messages`. The
+    /// unchanged prefix keeps the stamps it already earned — the engine
+    /// mirrors the same messages back in the same order — and only entries
+    /// that are new or were rewritten (compaction) are stamped now, which
+    /// lands within a turn-event of the real append.
+    pub fn set_api_messages(&mut self, messages: Vec<Message>) {
+        let keep = self
+            .api_messages
+            .iter()
+            .zip(messages.iter())
+            .take_while(|(old, new)| old == new)
+            .count()
+            .min(self.api_message_stamps.len());
+        self.api_message_stamps.truncate(keep);
+        self.api_message_stamps
+            .resize_with(messages.len(), Utc::now);
+        self.api_messages = messages;
+    }
+
+    /// Install a resumed conversation, reusing the persisted journal's
+    /// per-entry `created_at` as the stamps so a next save does not rewrite
+    /// history to resume time. Entries without a matching stamp fall back to
+    /// now.
+    pub fn restore_api_messages(&mut self, messages: Vec<Message>, stamps: &[DateTime<Utc>]) {
+        self.api_message_stamps.clear();
+        self.api_message_stamps.extend_from_slice(stamps);
+        self.api_message_stamps
+            .resize_with(messages.len(), Utc::now);
+        self.api_messages = messages;
+    }
+
+    /// Append a message with the stamp it earned earlier — used when an
+    /// undo prune re-inserts preserved tool results that were already in the
+    /// log.
+    pub fn push_api_message_stamped(&mut self, message: Message, stamp: DateTime<Utc>) {
+        self.api_message_stamps
+            .resize_with(self.api_messages.len(), Utc::now);
+        self.api_messages.push(message);
+        self.api_message_stamps.push(stamp);
+    }
+
+    pub fn pop_api_message(&mut self) -> Option<Message> {
+        self.api_message_stamps
+            .resize_with(self.api_messages.len(), Utc::now);
+        self.api_message_stamps.pop();
+        self.api_messages.pop()
+    }
+
+    /// `created_at` of each `api_messages` entry, paired positionally.
+    /// Preserve messages even if older state lacks a stamp; missing times
+    /// fall back to observation time, as they do when restoring a session.
+    pub fn api_messages_stamped(&self) -> impl Iterator<Item = (&Message, DateTime<Utc>)> {
+        self.api_messages.iter().zip(
+            self.api_message_stamps
+                .iter()
+                .copied()
+                .chain(std::iter::repeat_with(Utc::now)),
+        )
+    }
+
+    pub fn truncate_api_messages(&mut self, new_len: usize) {
+        self.api_messages.truncate(new_len);
+        self.api_message_stamps
+            .resize_with(self.api_messages.len(), Utc::now);
+    }
+
+    pub fn clear_api_messages(&mut self) {
+        self.api_messages.clear();
+        self.api_message_stamps.clear();
+    }
+
     #[must_use]
     pub fn tool_collapse_active(&self) -> bool {
         self.tool_collapse_threshold > 0 && self.tool_collapse_mode.is_active(self.calm_mode)
@@ -5487,7 +5587,7 @@ impl App {
         self.viewport.transcript_selection.clear();
 
         self.viewport.last_transcript_area = None;
-        self.viewport.last_approval_area = None;
+        self.viewport.last_prompt_area = None;
         self.viewport.last_transcript_top = 0;
         // Seed visible height from the resize event so paging keys use a
         // useful page size immediately, before the next render updates it.
@@ -5951,21 +6051,52 @@ impl App {
         self.active_context_window_source = context_window_source;
     }
 
-    pub fn set_active_context_window_override(&mut self, context_window: Option<u32>) {
-        self.active_context_window_override = context_window;
-        if context_window.is_some() {
-            self.active_context_window_source =
-                crate::route_runtime::ContextWindowSource::Configured;
+    /// Refresh the operator-configured windows for the active provider
+    /// identity: the provider-level default plus its per-model table (#6108).
+    pub fn set_active_context_window_override(
+        &mut self,
+        config: &crate::config::Config,
+        provider: ApiProvider,
+    ) {
+        self.active_context_window_override = config.context_window_for_provider_config(provider);
+        self.active_model_context_windows = config.model_context_windows_for(provider).cloned();
+        if let Some(resolution) = self.configured_context_window_for(&self.model.clone()) {
+            self.active_context_window_source = resolution.source;
         }
         if self.active_route_limits.is_none() {
             self.active_route_limits = self.context_window_override_limits();
         }
     }
 
+    /// Effective operator-configured window for an exact wire model id on the
+    /// active provider: a `model_context_windows` hit wins over the provider
+    /// default (#6108). `None` when the operator configured neither rung.
+    pub(crate) fn configured_context_window_for(
+        &self,
+        model: &str,
+    ) -> Option<crate::route_runtime::ContextWindowResolution> {
+        self.active_model_context_windows
+            .as_ref()
+            .and_then(|table| table.get(model).copied())
+            .filter(|window| *window > 0)
+            .map(|tokens| crate::route_runtime::ContextWindowResolution {
+                tokens,
+                source: crate::route_runtime::ContextWindowSource::ConfiguredModel,
+            })
+            .or_else(|| {
+                self.active_context_window_override
+                    .filter(|window| *window > 0)
+                    .map(|tokens| crate::route_runtime::ContextWindowResolution {
+                        tokens,
+                        source: crate::route_runtime::ContextWindowSource::Configured,
+                    })
+            })
+    }
+
     pub fn context_window_override_limits(&self) -> Option<RouteLimits> {
-        self.active_context_window_override
-            .map(|window| RouteLimits {
-                context_tokens: Some(u64::from(window)),
+        self.configured_context_window_for(&self.model)
+            .map(|resolution| RouteLimits {
+                context_tokens: Some(u64::from(resolution.tokens)),
                 ..RouteLimits::default()
             })
     }

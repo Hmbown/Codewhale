@@ -12,6 +12,81 @@ import { fileURLToPath } from "node:url";
 import { spawn } from "node:child_process";
 import { run, runOk, ExecError, tryJson, have, withSignal, wait, throwIfAborted, currentSignal } from "../exec.mjs";
 
+/** Base64 expands 3 bytes to 4, padded to a multiple of 4. */
+const encodedSize = (bytes) => Math.ceil(bytes / 3) * 4;
+
+/**
+ * Largest base64 payload a single JSON-RPC message may carry. Stdio hosts cap
+ * what a server may write between message boundaries (Claude Code disconnects
+ * at 16MB) and model image APIs cap well below that. Mirrors
+ * CODEWHALE_CU_MAX_IMAGE_BYTES in mcp/server.mjs, which keeps the hard guard.
+ */
+const rasterByteBudget = () => (Number(process.env.CODEWHALE_CU_MAX_IMAGE_BYTES) > 0
+  ? Number(process.env.CODEWHALE_CU_MAX_IMAGE_BYTES)
+  : 5_000_000);
+
+/**
+ * Pixel dimensions from a PNG IHDR or a JPEG frame header, reading only the
+ * bytes that carry them rather than the whole raster.
+ */
+function imagePixels(file) {
+  const fd = fs.openSync(file, "r");
+  try {
+    const head = Buffer.alloc(24);
+    fs.readSync(fd, head, 0, 24, 0);
+    if (head[0] === 0x89 && head.toString("ascii", 1, 4) === "PNG") {
+      return { w: head.readUInt32BE(16), h: head.readUInt32BE(20) };
+    }
+    if (head[0] !== 0xff || head[1] !== 0xd8) throw new ExecError(`unrecognized raster format: ${file}`);
+    // Walk JPEG segments to the frame header. SOF0/1/2/3/5..7/9..11/13..15
+    // carry the dimensions; DHT/DQT and the rest are skipped by their length.
+    const size = fs.fstatSync(fd).size;
+    const seg = Buffer.alloc(9);
+    for (let at = 2; at + 9 <= size; ) {
+      fs.readSync(fd, seg, 0, 9, at);
+      if (seg[0] !== 0xff) throw new ExecError(`malformed JPEG at byte ${at}: ${file}`);
+      const marker = seg[1];
+      if (marker >= 0xc0 && marker <= 0xcf && marker !== 0xc4 && marker !== 0xc8 && marker !== 0xcc) {
+        return { w: seg.readUInt16BE(7), h: seg.readUInt16BE(5) };
+      }
+      if (marker === 0xd8 || (marker >= 0xd0 && marker <= 0xd9)) { at += 2; continue; }
+      at += 2 + seg.readUInt16BE(2);
+    }
+    throw new ExecError(`JPEG carries no frame header: ${file}`);
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+/**
+ * Shrink a raster until it fits the single-message budget.
+ *
+ * A 5K display captures to ~22MB of PNG, which is ~29MB of base64 — past every
+ * host limit, so the alternative is handing back a receipt with no picture and
+ * a screenshot tool that never shows anything. Downscaling here, before the
+ * caller reads the PNG header, keeps coordinates exact by construction:
+ * `pixels` comes from the header, `points` stays in screen points, and `scale`
+ * is derived from the two, so raster-to-point conversion follows automatically.
+ *
+ * PNG bytes track pixel count, so the long edge shrinks by the square root of
+ * the overshoot. The estimate is verified rather than trusted — screen content
+ * compresses unevenly — and gives up rather than shrinking past legibility.
+ */
+async function fitRasterToBudget(file) {
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    const budget = rasterByteBudget();
+    const size = fs.statSync(file).size;
+    if (encodedSize(size) <= budget) return;
+    const { w, h } = imagePixels(file);
+    const longest = Math.max(w, h);
+    if (longest <= 640) return;
+    const overshoot = encodedSize(size) / budget;
+    const target = Math.max(640, Math.floor((longest / Math.sqrt(overshoot)) * 0.9));
+    if (target >= longest) return;
+    await runOk("sips", ["-Z", String(target), file], { timeoutMs: 20_000 });
+  }
+}
+
 const KEY_CODES = {
   return: 36, enter: 36, tab: 48, space: 49, escape: 53, esc: 53, delete: 51,
   backspace: 51, forwarddelete: 117, home: 115, end: 119, pageup: 116, pagedown: 121,
@@ -75,8 +150,9 @@ export function create({ exec }) {
       if (r.aborted) error.code = "cancelled";
       // A deterministic native refusal sent no input. A killed/timed-out
       // helper may have posted the press before losing its response.
-      const postsPress = (tool === "key_event" && args.down) || (tool === "perform_action" && args.action === "AXPress") || (tool === "pointer_sequence" && args.steps?.some((step) => [1, 3, 25].includes(step.type)));
+      const postsPress = (tool === "key_event" && args.down) || ["type", "perform_action", "click_element", "scroll_element", "set_value", "select_text"].includes(tool) || (tool === "hit_test" && args.perform) || (tool === "pointer_sequence" && args.steps?.some((step) => [1, 3, 25].includes(step.type)));
       error.inputMayHaveBeenSent = postsPress && r.spawned === true && (r.aborted || r.timedOut);
+      if (error.inputMayHaveBeenSent) error.message += "; input may already have been sent — observe the target before doing anything else";
       throw error;
     }
     const result = tryJson(r.stdout, null);
@@ -84,6 +160,17 @@ export function create({ exec }) {
       try { await updatePreview(); } catch (error) { result.preview_error = error.message; }
     }
     return result;
+  }
+
+  async function requireBackgroundActions() {
+    if ((await native("input_capabilities"))?.background_actions !== 1) {
+      throw Object.assign(new ExecError("Update the Computer Use helper to use background focus, selection, context menus and scrolling."), { code: "app_upgrade_required" });
+    }
+  }
+
+  function assertBoundElement(target) {
+    if (!state.inputApp || target.app_ref?.pid !== state.inputApp.pid) throw new ExecError("element does not belong to the bound application — open_application and observe again");
+    if (!Array.isArray(target.path) || !Number.isInteger(target.windowIndex) || !target.role) throw new ExecError("element has no resolved accessibility identity");
   }
 
   async function nativeLease(tool, args) {
@@ -134,7 +221,7 @@ export function create({ exec }) {
     const w = await native("window_at_point", { x, y });
     if (!w?.found) throw new ExecError(`no window at (${x}, ${y}) — take a fresh screenshot and choose a point inside the target window`);
     if (w.owner_pid !== state.inputApp.pid) {
-      throw new ExecError(`(${x}, ${y}) is covered by a window owned by ${w.owner_name || "another application"} (pid ${w.owner_pid}), not the application input is bound to — raise the window you meant with open_application(activate:true), observe again, or use an element target`);
+      throw new ExecError(`(${x}, ${y}) is covered by a window owned by ${w.owner_name || "another application"} (pid ${w.owner_pid}) — use an accessibility element target or a separate computer; no pointer input was sent`);
     }
     return w;
   }
@@ -181,15 +268,16 @@ export function create({ exec }) {
     assertInScreen(x, y);
     if (!["auto", "a11y", "event"].includes(strategy)) throw new ExecError(`strategy must be auto, a11y or event (got ${JSON.stringify(strategy)})`);
     let a11yReason = null;
-    if (strategy !== "event" && button === "left" && clicks === 1) {
-      const hit = await native("hit_test", { x, y, perform: true });
+    if (strategy !== "event" && ["left", "right"].includes(button) && clicks === 1) {
+      if (button === "right") await requireBackgroundActions();
+      const hit = await native("hit_test", { x, y, perform: true, ...(button === "right" ? { operation: "context" } : {}) });
       if (hit?.action_sent) {
         return { action_sent: true, strategy: "a11y", action: hit.action, pointer_moved: false, at: { x, y }, button, clicks,
                  element: { role: hit.element?.role ?? null, label: hit.element?.label ?? null } };
       }
       a11yReason = hit?.reason ?? "not_found";
       if (strategy === "a11y") {
-        throw new ExecError(`no pressable accessibility element at (${x}, ${y}) in the bound application (${a11yReason}) — observe again or use strategy "event"`);
+        throw new ExecError(`no supported accessibility click at (${x}, ${y}) in the bound application (${a11yReason}) — observe the available actions or use a separate computer`);
       }
     } else if (strategy === "a11y") {
       throw new ExecError(`strategy "a11y" is only available for a left single click on this backend; ${mouseName(button)} x${clicks} has no accessibility equivalent`);
@@ -231,14 +319,36 @@ export function create({ exec }) {
   }
 
   async function screenshot({ display, region, app_ref, window_id, path: outPath } = {}) {
+    // Once an app is selected, ordinary observations follow it behind the
+    // user's work. An explicit display/region remains a deliberate desktop capture.
+    if (app_ref === undefined && display === undefined && region === undefined) app_ref = state.inputApp ?? undefined;
     const dir = recordingsDir();
     fs.mkdirSync(dir, { recursive: true });
-    const file = outPath || path.join(dir, `shot-${new Date().toISOString().replace(/[:.]/g, "-")}-${crypto.randomBytes(3).toString("hex")}.png`);
-    if (!/\.png$/.test(file)) throw new ExecError("screenshot path must end in .png");
-    const args = ["-x", "-t", "png"];
+    // JPEG, not PNG. A screen is photographic content — gradients, wallpaper,
+    // antialiased text — and lossless compression of it is enormous: the same
+    // 5760x3240 frame is 21.8MB as PNG and 2.1MB as JPEG, at full resolution
+    // and with terminal text still crisp. PNG stays available by asking for a
+    // `.png` path, which is what a pixel-exact comparison wants.
+    const file = outPath || path.join(dir, `shot-${new Date().toISOString().replace(/[:.]/g, "-")}-${crypto.randomBytes(3).toString("hex")}.jpg`);
+    if (!/\.(png|jpe?g)$/i.test(file)) throw new ExecError("screenshot path must end in .png, .jpg or .jpeg");
+    const args = ["-x", "-t", /\.png$/i.test(file) ? "png" : "jpg"];
     const disp = display ?? state.activeDisplay;
+    // An explicit app reference resolves first and alone: nothing may run
+    // before it and redirect the capture to another target.
     const window = app_ref !== undefined ? await native("window_info", { app_ref, window_id }) : null;
     if (window && region) throw new ExecError("choose app_ref or region, not both");
+    // On the display path, resolve displays before capturing so an unknown
+    // index is a clean error instead of a raster silently labelled with another
+    // display's geometry — list_displays reports `index` and `id` separately,
+    // and a caller passing the id would otherwise get points and scale that
+    // mis-target every later coordinate. A window capture ignores `display`.
+    let displays = null;
+    if (!window) {
+      displays = await displayInfo();
+      if (disp != null && disp !== "all" && !displays.some((x) => x.index === disp)) {
+        throw new ExecError(`no display ${disp}; have [${displays.map((x) => x.index).join(", ")}] — screenshot takes the display index from list_displays, not its id`);
+      }
+    }
     if (window) args.push("-o", "-l", String(window.window_id));
     else if (disp && disp !== "all") args.push("-D", String(disp));
     if (region) {
@@ -250,19 +360,21 @@ export function create({ exec }) {
     args.push(file);
     const r = await runL("screencapture", args, { timeoutMs: 20_000 });
     if (r.code !== 0) throw new ExecError(`screencapture exited ${r.code}: ${r.stderr.trim().slice(0, 300)}`, r);
+    await fitRasterToBudget(file);
     const stat = fs.statSync(file);
-    const displays = await displayInfo();
+    displays ??= await displayInfo();
     const d = displays.find((x) => x.index === (disp === "all" ? 1 : disp)) ?? displays[0];
     const scale = d?.scale ?? 1;
     state.lastRaster = {
       file,
+      ...(window ? { app_ref, window_index: window_id ?? 0 } : {}),
       bytes: stat.size,
       display: disp ?? 1,
       // Region and window rasters describe that rect, not the whole display.
       // The PNG header is the pixel ground truth; scale is derived from
       // pixels/points below so Retina and mixed-DPI stay exact.
       points: window?.points ?? (region ? { x: region[0], y: region[1], w: region[2], h: region[3] } : d?.points ?? null),
-      pixels: (() => { const header = fs.readFileSync(file); return { w: header.readUInt32BE(16), h: header.readUInt32BE(20) }; })(),
+      pixels: imagePixels(file),
       scale: d?.scale ?? 1,
       capturedAt: new Date().toISOString(),
     };
@@ -413,10 +525,13 @@ export function create({ exec }) {
   // ---------- apps / windows ----------
   async function listApps() { return native("list_apps"); }
 
-  async function listWindows({ app_ref } = {}) { return native("list_windows", { app_ref }); }
+  async function listWindows({ app_ref } = {}) { return native("list_windows", { app_ref: app_ref === undefined ? state.inputApp ?? undefined : app_ref }); }
 
   async function openApplication({ name, bundle_id: bid, pid, url: urlArg, activate = false } = {}) {
     if (!name && !bid && !pid) throw new ExecError("open_application needs name, bundle_id or pid");
+    // Failed selection must not leave an earlier app armed for shared input.
+    state.foregroundInput = false;
+    state.inputApp = null;
     // pid is the most specific identity and the only one that separates two
     // processes of the same bundle (e.g. a second Chrome on its own profile),
     // so it wins when given.
@@ -442,6 +557,8 @@ export function create({ exec }) {
       await new Promise((res) => setTimeout(res, 600));
       p = await native("app_info", { app_ref: find, activate });
     }
+    if (activate && p?.frontmost === false) throw Object.assign(new ExecError("The selected application did not become frontmost; no input mode was enabled. Continue with background control or wait for the user."), { code: "activation_not_confirmed" });
+    if (p?.bundle_id === "net.codewhale.computer-use") throw Object.assign(new ExecError("The Computer Use setup and safety controls belong to the user and cannot be operated by this plugin."), { code: "protected_application" });
     // A bare executable has no bundle id; carrying an empty one would make the
     // identity unmatchable.
     state.inputApp = { pid: p.pid, ...(p.bundle_id ? { bundle_id: p.bundle_id } : {}) };
@@ -497,7 +614,7 @@ export function create({ exec }) {
     list_windows: listWindows,
     open_application: openApplication,
     get_app_state: async ({ app_ref, detail, depth, window_id, include_ocr = false }) => {
-      const t = await native("get_app_state", { app_ref, detail, window_id });
+      const t = await native("get_app_state", { app_ref: app_ref === undefined ? state.inputApp ?? undefined : app_ref, detail, window_id });
       if (!t.found) throw new ExecError("application not found — call list_apps for exact names/pids");
       if (include_ocr) {
         // Resolve once through AX, then capture only that exact application's
@@ -506,7 +623,17 @@ export function create({ exec }) {
         try {
           if (!Number.isSafeInteger(t.pid) || t.pid <= 0) throw new ExecError("The observed application did not provide an exact process identity for OCR");
           if ((await native("input_capabilities"))?.window_ocr !== 1) throw new ExecError("The native helper needs an update for selected-window text recognition");
-          raster = await screenshot({ app_ref: { pid: t.pid, ...(t.bundle_id ? { bundle_id: t.bundle_id } : {}) }, window_id });
+          // PNG here, against the JPEG default: this raster is fed to text
+          // recognition, not to a viewer, and lossless glyph edges are what
+          // Vision reads. A single window is small enough that the size the
+          // JPEG default exists to solve does not arise.
+          const ocrDir = path.join(recordingsDir(), "captures");
+          fs.mkdirSync(ocrDir, { recursive: true });
+          raster = await screenshot({
+            app_ref: { pid: t.pid, ...(t.bundle_id ? { bundle_id: t.bundle_id } : {}) },
+            window_id,
+            path: path.join(ocrDir, `ocr-${crypto.randomBytes(4).toString("hex")}.png`),
+          });
           const ocr = await native("recognize_text", { file: raster.file });
           if (ocr?.status === "ok" && ocr.pixels?.w === raster.pixels.w && ocr.pixels?.h === raster.pixels.h && Array.isArray(ocr.blocks)) {
             t.ocr = { ...ocr, raster, blocks: ocr.blocks.map(block => ({ ...block, target: {
@@ -539,23 +666,29 @@ export function create({ exec }) {
       if (target.type !== "element" || strategy === "event") return pointerClick("left", target.x, target.y, 1, strategy);
       if (!["auto", "a11y"].includes(strategy)) throw new ExecError(`strategy must be auto, a11y or event (got ${JSON.stringify(strategy)})`);
       try {
-        if (!state.inputApp || target.app_ref?.pid !== state.inputApp.pid) throw new ExecError("element does not belong to the bound application — open_application and observe again");
-        if (!Array.isArray(target.path) || !Number.isInteger(target.windowIndex) || !target.role) throw new ExecError("element has no resolved accessibility identity");
+        assertBoundElement(target);
         if ((await native("input_capabilities"))?.element_identity !== 1) throw new ExecError("native helper needs an update for element identity validation");
-        const receipt = await native("perform_action", { target, action: "AXPress" });
+        const semantic = ["AXTextField", "AXTextArea", "AXComboBox", "AXRow", "AXCell", "AXMenuItem"].includes(target.role);
+        if (semantic) await requireBackgroundActions();
+        const receipt = await native(semantic ? "click_element" : "perform_action", { target, action: "AXPress" });
         if (!receipt?.action_sent) throw new ExecError("element press was not acknowledged");
-        return { ...receipt, action: "AXPress", strategy: "a11y", pointer_moved: false,
-          element: { role: target.role, label: target.label ?? null }, verified: false, verification_required: "screenshot" };
+        return { ...receipt, action: receipt.action ?? "AXPress", strategy: "a11y", pointer_moved: false,
+          element: { role: target.role, label: target.label ?? null }, verified: receipt.verified ?? false, verification_required: "observation" };
       } catch (error) {
         // An AX frame can cover other controls. Never turn a refused or
         // ambiguous element press into another element's press or a raw click.
-        error.message += ' — no coordinate fallback was sent; take a fresh screenshot or OCR observation before choosing a coordinate with strategy "event"';
+        error.message += ' — no coordinate fallback was sent; take a fresh screenshot or OCR observation and choose an advertised action or a separate computer';
         throw error;
       }
     },
     double_click: ({ target }) => pointerClick("left", target.x, target.y, 2),
     triple_click: ({ target }) => pointerClick("left", target.x, target.y, 3),
-    right_click: ({ target }) => pointerClick("right", target.x, target.y, 1),
+    right_click: async ({ target }) => {
+      if (target.type !== "element") return pointerClick("right", target.x, target.y, 1);
+      assertBoundElement(target);
+      await requireBackgroundActions();
+      return native("click_element", { target, context: true });
+    },
     middle_click: ({ target }) => pointerClick("middle", target.x, target.y, 1),
     mouse_move: async ({ target }) => {
       assertInScreen(target.x, target.y);
@@ -611,6 +744,17 @@ export function create({ exec }) {
     },
     scroll: async ({ target, direction = "down", amount = 5 }) => {
       assertInScreen(target.x, target.y);
+      if (!state.foregroundInput) {
+        await requireBackgroundActions();
+        if (target.type === "element") {
+          assertBoundElement(target);
+          return native("scroll_element", { target, direction, amount });
+        }
+        const receipt = await native("hit_test", { x: target.x, y: target.y, perform: true, direction, amount,
+          operation: ["left", "right"].includes(direction) ? "scroll-horizontal" : "scroll-vertical" });
+        if (!receipt?.action_sent) throw Object.assign(new ExecError(`No background scrollbar at this point (${receipt?.reason ?? "not_found"}); choose an observed scroll area or a separate computer.`), { code: "background_scroll_unavailable" });
+        return receipt;
+      }
       const dx = direction === "left" ? -amount : direction === "right" ? amount : 0;
       const dy = direction === "up" ? amount : direction === "down" ? -amount : 0;
       // A wheel sends one notch at a time. One event carrying the whole amount

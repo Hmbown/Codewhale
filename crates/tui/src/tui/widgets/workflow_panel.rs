@@ -149,7 +149,10 @@ impl WorkflowRowStatus {
         match self {
             Self::Pending => palette::TEXT_MUTED,
             Self::Running => palette::STATUS_WARNING,
-            Self::Waiting => palette::STATUS_ERROR,
+            // Waiting is a healthy state — `is_running` says so, and `is_failure`
+            // excludes it. Failure red is reserved for actual failure, so a row
+            // queued behind a dependency must not read like a crashed one.
+            Self::Waiting => palette::STATUS_WARNING,
             Self::Succeeded => palette::STATUS_SUCCESS,
             Self::Failed | Self::SchemaFailed => palette::STATUS_ERROR,
             Self::Cancelled => palette::TEXT_MUTED,

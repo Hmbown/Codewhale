@@ -41,6 +41,24 @@ pub struct ProviderRuntimeStatus {
     pub active_provider_requests: usize,
 }
 
+/// Idle Engine snapshot used by a one-shot host before shutting down.
+/// The completion inbox belongs to the Engine; a terminal worker alone does
+/// not prove that its parent has consumed the handback.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SubAgentSettlement {
+    pub running_children: usize,
+    /// A Workflow can still be coordinating between child phases.
+    pub running_workflows: usize,
+    pub pending_completions: usize,
+}
+
+impl SubAgentSettlement {
+    #[must_use]
+    pub fn is_settled(self) -> bool {
+        self.running_children == 0 && self.running_workflows == 0 && self.pending_completions == 0
+    }
+}
+
 /// Engine-owned MCP snapshot plus the exact event generation it supersedes.
 /// The TUI uses the receipt to reject already-queued boot events even when it
 /// had not rendered that generation before the direct `/mcp` action.
@@ -222,6 +240,14 @@ pub enum Op {
     /// List current sub-agents and their status
     ListSubAgents,
 
+    /// Inspect child settlement at the Engine's idle operation boundary.
+    /// This does not drain the completion inbox or dispatch a second loop.
+    GetSubAgentSettlement {
+        tx: std::sync::Arc<
+            std::sync::Mutex<Option<tokio::sync::oneshot::Sender<SubAgentSettlement>>>,
+        >,
+    },
+
     /// Cancel a running sub-agent by id or session name.
     CancelSubAgent { agent_id: String },
 
@@ -252,12 +278,6 @@ pub enum Op {
 
     /// Update auto-compaction settings
     SetCompaction { config: CompactionConfig },
-
-    /// Replace the live user permission rules without clearing session-only
-    /// approvals.
-    SetPermissionRuleset {
-        ruleset: codewhale_execpolicy::Ruleset,
-    },
 
     /// Update the SSE idle timeout used for subsequent streamed turns.
     SetStreamChunkTimeout { timeout_secs: u64 },

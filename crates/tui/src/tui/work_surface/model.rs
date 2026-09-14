@@ -61,7 +61,7 @@ pub enum RailPanel {
     /// The to-do list: plan-step rows from the work graph.
     #[default]
     Tasks,
-    /// Background shells, durable tasks, and scheduled automations.
+    /// Background shells and durable tasks. Scheduled work has its own manager.
     Background,
     /// Files edited this session (`+/−`) and files read into context.
     Files,
@@ -201,7 +201,11 @@ pub struct WorkRowId(pub String);
 pub(super) enum WorkTone {
     Heading,
     Live,
+    /// Consequential and waiting on someone — Cognition, not Failure. A to-do
+    /// blocked on your answer has not failed.
     Attention,
+    /// Something actually failed. The only tone that spends Failure red.
+    Failure,
     Success,
     Muted,
 }
@@ -549,7 +553,9 @@ impl WorkSurfaceState {
         if !established_selection {
             let preferred = selectable
                 .iter()
-                .find(|row| row.tone == WorkTone::Attention)
+                // Both halves of the old `Attention` tone: splitting Failure out
+                // of it changed what red means, not what deserves focus first.
+                .find(|row| matches!(row.tone, WorkTone::Attention | WorkTone::Failure))
                 .or_else(|| selectable.iter().find(|row| row.tone == WorkTone::Live))
                 .copied()
                 .unwrap_or(selectable[0]);
@@ -858,7 +864,7 @@ fn view_has_work(app: &mut App, panel: RailPanel) -> bool {
         // Scheduled automations that are not running are a fact about the
         // account, not work in this session: they must not open the dock
         // before the first prompt (0.9.12 defect #10). Live shells, durable
-        // tasks, and a running automation are work.
+        // tasks are work. Scheduled automation configuration belongs in /automation.
         RailPanel::Background => background_has_live_work(app),
         RailPanel::Files
         | RailPanel::Notepad
@@ -889,22 +895,17 @@ pub(super) fn live_agent_row_count(app: &mut App) -> usize {
 }
 
 /// Whether the background view holds anything actually running: a live
-/// shell, a durable task, or an automation run in flight.
+/// shell or a durable task.
 pub(super) fn background_has_live_work(app: &mut App) -> bool {
-    app.automation_panel.live_runs > 0
-        || !shell_work_rows(app).is_empty()
-        || !durable_task_rows(app).is_empty()
+    !shell_work_rows(app).is_empty() || !durable_task_rows(app).is_empty()
 }
 
-/// The background view: live shells, other durable background tasks, and
-/// scheduled automations — whatever the shell already tracks off the turn.
+/// The background view: live shells and durable background tasks.
+/// The scheduled count opens the existing automations manager directly.
 fn background_view_rows(app: &mut App) -> Vec<WorkRow> {
     let mut out = Vec::new();
     push_shell_group(&mut out, shell_work_rows(app));
     out.extend(durable_task_rows(app));
-    if let Some(row) = automation_row(app) {
-        out.push(row);
-    }
     app.work_surface.latest_rows = out.clone();
     out
 }
@@ -934,30 +935,6 @@ fn durable_task_rows(app: &App) -> Vec<WorkRow> {
             }
         })
         .collect()
-}
-
-fn automation_row(app: &App) -> Option<WorkRow> {
-    let state = &app.automation_panel;
-    if state.active_automations == 0 && state.live_runs == 0 {
-        return None;
-    }
-    Some(WorkRow {
-        id: WorkRowId("automations".to_string()),
-        mark: if state.live_runs > 0 { "●" } else { "○" },
-        label: format!(
-            "automations · {} active · {} running",
-            state.active_automations, state.live_runs
-        ),
-        detail: "Scheduled work the host runs off the turn".to_string(),
-        tone: if state.live_runs > 0 {
-            WorkTone::Live
-        } else {
-            WorkTone::Muted
-        },
-        selectable: true,
-        primary_action: Some(SidebarRowAction::Command("/automation".to_string())),
-        agent: None,
-    })
 }
 
 /// Row ids of the plan-step (to-do) nodes in the cached graph.
@@ -1638,6 +1615,17 @@ fn agent_rows(app: &App) -> Vec<RankedWorkRow> {
                 .map(|activity| current_activity_status_bucket(activity.status))
                 .or_else(|| agent.worker_status.map(worker_status_bucket))
                 .unwrap_or_else(|| subagent_status_bucket(&agent.status));
+            // Read failure from the same source the bucket came from, so the
+            // tone can never disagree with the row it is painting.
+            let failed = current_activity.map_or_else(
+                || {
+                    agent.worker_status.map_or_else(
+                        || matches!(agent.status, SubAgentStatus::Failed(_)),
+                        |status| matches!(status, AgentWorkerStatus::Failed),
+                    )
+                },
+                |activity| matches!(activity.status, AgentCurrentActivityStatus::Failed),
+            );
             let resolved_profile = agent
                 .child_route
                 .as_ref()
@@ -1710,7 +1698,7 @@ fn agent_rows(app: &App) -> Vec<RankedWorkRow> {
                         // depth (and therefore the indent) is known.
                         label: String::new(),
                         detail: facts.join(" · "),
-                        tone: bucket_tone(bucket),
+                        tone: agent_tone(bucket, failed),
                         selectable: true,
                         // One agent, one destination (v0.9.7): activation
                         // opens the agent's transcript directly; Agent
@@ -1755,6 +1743,8 @@ fn agent_rows(app: &App) -> Vec<RankedWorkRow> {
                 let bucket = current_activity
                     .map(|activity| current_activity_status_bucket(activity.status))
                     .unwrap_or(WorkBucket::Active);
+                let failed = current_activity
+                    .is_some_and(|a| matches!(a.status, AgentCurrentActivityStatus::Failed));
                 let name = app.agent_label_map.get(id).cloned();
                 let mut facts = vec![status.to_string()];
                 if let Some(detail) =
@@ -1792,7 +1782,7 @@ fn agent_rows(app: &App) -> Vec<RankedWorkRow> {
                             mark: agent_mark(bucket),
                             label: String::new(),
                             detail: facts.join(" · "),
-                            tone: bucket_tone(bucket),
+                            tone: agent_tone(bucket, failed),
                             selectable: true,
                             // Same destination as the cached-seed rows above.
                             primary_action: Some(SidebarRowAction::OpenAgentTranscript {
@@ -2014,6 +2004,16 @@ fn subagent_status_label(status: &SubAgentStatus) -> &'static str {
         SubAgentStatus::Failed(_) => "failed",
         SubAgentStatus::Cancelled => "cancelled",
         SubAgentStatus::BudgetExhausted => "budget exhausted",
+    }
+}
+
+/// `WorkBucket::Attention` deliberately groups a wait with a failure so they
+/// sort together — both need you. Tone must not follow it that far: only an
+/// actual failure spends Failure red.
+const fn agent_tone(bucket: WorkBucket, failed: bool) -> WorkTone {
+    match bucket {
+        WorkBucket::Attention if failed => WorkTone::Failure,
+        other => bucket_tone(other),
     }
 }
 
@@ -2470,7 +2470,7 @@ fn graph_node_row(snapshot: &WorkGraphSnapshot, node: &WorkNode) -> WorkRow {
         NodeState::Verified => (status_mark(StatusKind::Done).glyph, WorkTone::Success),
         NodeState::Stale => ("?", WorkTone::Attention),
         NodeState::Superseded | NodeState::Cancelled => ("−", WorkTone::Muted),
-        NodeState::Failed => (crate::tui::glyphs::FAILED, WorkTone::Attention),
+        NodeState::Failed => (crate::tui::glyphs::FAILED, WorkTone::Failure),
     };
     let state = state_label(node);
     let kind = kind_label(node.kind);
@@ -2941,6 +2941,7 @@ mod tests {
 
     fn running_agent(agent_id: &str) -> SubAgentResult {
         SubAgentResult {
+            usage: None,
             name: agent_id.to_string(),
             agent_id: agent_id.to_string(),
             context_mode: "fresh".to_string(),

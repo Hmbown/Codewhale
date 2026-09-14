@@ -72,6 +72,9 @@ pub struct PluginMeta {
     /// slugified to satisfy the Agent Plugins name rule.
     #[serde(default)]
     pub display_name: Option<String>,
+    /// Bounded inline PNG artwork. Never a remote fetch or executable SVG.
+    #[serde(default)]
+    pub icon: Option<String>,
     #[serde(default)]
     pub homepage: Option<String>,
     #[serde(default)]
@@ -365,12 +368,21 @@ pub struct ValidatedManifest {
 enum ManifestFormat {
     Json,
     KimiJson,
+    ClaudeJson,
     Toml,
 }
 
 impl ManifestFormat {
     fn from_path(path: &Path) -> Result<Self, String> {
         match path.file_name().and_then(|name| name.to_str()) {
+            Some(super::agent_plugin::PLUGIN_JSON_NAME)
+                if path
+                    .parent()
+                    .and_then(Path::file_name)
+                    .is_some_and(|name| name == ".claude-plugin") =>
+            {
+                Ok(Self::ClaudeJson)
+            }
             Some(super::agent_plugin::PLUGIN_JSON_NAME) => Ok(Self::Json),
             Some(super::agent_plugin::KIMI_PLUGIN_JSON_NAME) => Ok(Self::KimiJson),
             Some(super::agent_plugin::PLUGIN_TOML_NAME) => Ok(Self::Toml),
@@ -385,6 +397,7 @@ impl ManifestFormat {
         match self {
             Self::Json => super::agent_plugin::PLUGIN_JSON_NAME,
             Self::KimiJson => super::agent_plugin::KIMI_PLUGIN_JSON_NAME,
+            Self::ClaudeJson => ".claude-plugin/plugin.json",
             Self::Toml => super::agent_plugin::PLUGIN_TOML_NAME,
         }
     }
@@ -407,7 +420,7 @@ fn parse_manifest(
         }
         ManifestFormat::Json => {
             let standard = super::agent_plugin::parse_plugin_json(text)?;
-            let mcp_bytes = read_sibling_mcp_json(root)?;
+            let mcp_bytes = read_sibling_mcp_json(root, super::agent_plugin::MCP_JSON_NAME)?;
             let mcp_servers = match &mcp_bytes {
                 Some(bytes) => {
                     let text = std::str::from_utf8(bytes)
@@ -419,6 +432,12 @@ fn parse_manifest(
             let manifest = super::agent_plugin::standard_to_manifest(standard, mcp_servers, root)?;
             Ok((manifest, mcp_bytes))
         }
+        ManifestFormat::ClaudeJson => {
+            let bytes = read_sibling_mcp_json(root, ".mcp.json")?;
+            let manifest =
+                super::agent_plugin::parse_claude_plugin_json(text, root, bytes.as_deref())?;
+            Ok((manifest, bytes))
+        }
         ManifestFormat::KimiJson => Ok((
             super::agent_plugin::parse_kimi_plugin_json(text, root)?,
             None,
@@ -428,8 +447,8 @@ fn parse_manifest(
 
 /// Read a `plugin.json` bundle's sibling `mcp.json` under the same rules as
 /// the manifest itself: a regular file, never a link, size-bounded.
-fn read_sibling_mcp_json(root: &Path) -> Result<Option<Vec<u8>>, String> {
-    let path = root.join(super::agent_plugin::MCP_JSON_NAME);
+fn read_sibling_mcp_json(root: &Path, name: &str) -> Result<Option<Vec<u8>>, String> {
+    let path = root.join(name);
     let metadata = match fs::symlink_metadata(&path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -464,8 +483,7 @@ impl PluginManifest {
         let bytes = read_manifest_bytes(path, label)?;
         let content =
             std::str::from_utf8(&bytes).map_err(|_| format!("{label} must be valid UTF-8"))?;
-        let root = path
-            .parent()
+        let root = super::agent_plugin::plugin_root_for_manifest(path)
             .ok_or_else(|| format!("{label} has no parent directory"))?;
         Ok(parse_manifest(format, content, root)?.0)
     }
@@ -480,8 +498,7 @@ impl PluginManifest {
                 "{label} must be a regular file, not a symbolic link"
             ));
         }
-        let root = path
-            .parent()
+        let root = super::agent_plugin::plugin_root_for_manifest(path)
             .ok_or_else(|| format!("{label} has no parent directory"))?;
         let root_metadata = fs::symlink_metadata(root)
             .map_err(|e| format!("failed to inspect plugin root: {e}"))?;
@@ -527,7 +544,14 @@ impl PluginManifest {
                 "{label} changed while it was being validated; retry discovery"
             ));
         }
-        if format == ManifestFormat::Json && read_sibling_mcp_json(&canonical_root)? != mcp_bytes {
+        let mcp_name = match format {
+            ManifestFormat::Json => Some(super::agent_plugin::MCP_JSON_NAME),
+            ManifestFormat::ClaudeJson => Some(".mcp.json"),
+            _ => None,
+        };
+        if let Some(name) = mcp_name
+            && read_sibling_mcp_json(&canonical_root, name)? != mcp_bytes
+        {
             return Err(
                 "mcp.json changed while it was being validated; retry discovery".to_string(),
             );
@@ -554,7 +578,7 @@ impl PluginManifest {
             ));
         }
         match format {
-            ManifestFormat::Json => {
+            ManifestFormat::Json | ManifestFormat::ClaudeJson => {
                 if !super::agent_plugin::is_standard_plugin_name(&self.plugin.name) {
                     return Err(format!(
                         "plugin name `{}` violates the Agent Plugins name rule (1-{MAX_PLUGIN_NAME_CHARS} lowercase ASCII letters, digits, or internal single hyphens or dots; never `--` or `..`)",
@@ -581,6 +605,9 @@ impl PluginManifest {
         validate_optional_text("description", self.plugin.description.as_deref(), 1_024)?;
         validate_optional_text("author", self.plugin.author.as_deref(), 256)?;
         validate_optional_text("display name", self.plugin.display_name.as_deref(), 128)?;
+        if let Some(icon) = &self.plugin.icon {
+            validate_icon(icon)?;
+        }
         validate_optional_text("homepage", self.plugin.homepage.as_deref(), 2_048)?;
         validate_optional_text("repository", self.plugin.repository.as_deref(), 2_048)?;
         validate_optional_text("license", self.plugin.license.as_deref(), 128)?;
@@ -1213,7 +1240,7 @@ fn validate_environment_name(field: &str, value: &str) -> Result<(), String> {
     }
 }
 
-fn exact_environment_placeholder(value: &str) -> Option<&str> {
+pub(super) fn exact_environment_placeholder(value: &str) -> Option<&str> {
     value.strip_prefix("${")?.strip_suffix('}')
 }
 
@@ -1698,6 +1725,29 @@ pub(crate) fn capability_hash_v1(inventory: &PluginInventory) -> String {
 /// Historical v2 capability digest. Kept only to prove that receipts from the
 /// Skills/MCP-only activation policy fail closed when v3 enables additional
 /// declarative adapters.
+/// Catalog and manifest artwork follows one inert, bounded wire format.
+pub fn validate_icon(value: &str) -> Result<(), String> {
+    use base64::Engine;
+    if value.len() > 32_768 {
+        return Err("plugin icon exceeds 32 KiB".into());
+    }
+    let encoded = value
+        .strip_prefix("data:image/png;base64,")
+        .ok_or("plugin icon must be an inline PNG")?;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .map_err(|_| "plugin icon has invalid base64")?;
+    if bytes.len() < 33 || &bytes[..8] != b"\x89PNG\r\n\x1a\n" || &bytes[12..16] != b"IHDR" {
+        return Err("plugin icon has an invalid PNG header".into());
+    }
+    let width = u32::from_be_bytes(bytes[16..20].try_into().map_err(|_| "invalid PNG width")?);
+    let height = u32::from_be_bytes(bytes[20..24].try_into().map_err(|_| "invalid PNG height")?);
+    if width == 0 || height == 0 || width > 256 || height > 256 {
+        return Err("plugin icon must fit within 256 by 256 pixels".into());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 pub(crate) fn capability_hash_v2(inventory: &PluginInventory) -> String {
     let mut hasher = Sha256::new();
@@ -2343,5 +2393,40 @@ args = ["server.js", "--mode=worker", "-e", "console.log('ready')"]
             );
             assert!(root.join(arg).is_file(), "{arg} must exist in the bundle");
         }
+    }
+}
+
+#[cfg(test)]
+mod icon_tests {
+    use super::validate_icon;
+    use base64::Engine;
+
+    #[test]
+    fn artwork_is_inline_bounded_png_only() {
+        let manifest: serde_json::Value =
+            serde_json::from_str(include_str!("../../plugins/computer-use/plugin.json")).unwrap();
+        let icon = manifest["extensions"]["net.codewhale"]["icon"]
+            .as_str()
+            .unwrap();
+        assert!(validate_icon(icon).is_ok());
+        for invalid in [
+            "https://publisher.example/tracker.png",
+            "data:image/svg+xml,<svg/>",
+            "data:image/png;base64,invalid",
+        ] {
+            assert!(validate_icon(invalid).is_err());
+        }
+        let mut png = base64::engine::general_purpose::STANDARD
+            .decode(icon.strip_prefix("data:image/png;base64,").unwrap())
+            .unwrap();
+        png[16..20].copy_from_slice(&100_000_u32.to_be_bytes());
+        assert!(
+            validate_icon(&format!(
+                "data:image/png;base64,{}",
+                base64::engine::general_purpose::STANDARD.encode(png)
+            ))
+            .is_err()
+        );
+        assert!(validate_icon(&"x".repeat(32_769)).is_err());
     }
 }

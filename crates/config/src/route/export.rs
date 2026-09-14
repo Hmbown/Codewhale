@@ -259,9 +259,18 @@ mod tests {
         assert_eq!(parse_route_kind("not-a-provider"), None);
     }
 
+    /// Runtime version stamped into every golden fixture.
+    ///
+    /// `codewhale providers export --json` stamps the real build version
+    /// (`env!("CODEWHALE_BUILD_VERSION")` at the call site in `crates/cli`).
+    /// The fixture tracks this crate's version so the committed golden can
+    /// never disagree with the tree it ships in. The route ids are the
+    /// contract; the stamped version only has to be true.
+    const GOLDEN_RUNTIME_VERSION: &str = env!("CARGO_PKG_VERSION");
+
     #[test]
     fn golden_route_ids_are_stable() {
-        let export = ProvidersExport::from_registry("0.9.12");
+        let export = ProvidersExport::from_registry(GOLDEN_RUNTIME_VERSION);
         let actual: Vec<&str> = export.route_ids();
         let expected: Vec<&str> = include_str!("golden_route_ids.txt")
             .lines()
@@ -280,7 +289,7 @@ mod tests {
         if std::env::var("WRITE_GOLDEN").ok().as_deref() != Some("1") {
             return;
         }
-        let export = ProvidersExport::from_registry("0.9.12");
+        let export = ProvidersExport::from_registry(GOLDEN_RUNTIME_VERSION);
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/src/route/providers-export.golden.json"
@@ -294,13 +303,22 @@ mod tests {
 
     #[test]
     fn golden_providers_export_matches_registry() {
-        let export = ProvidersExport::from_registry("0.9.12");
+        let export = ProvidersExport::from_registry(GOLDEN_RUNTIME_VERSION);
         let golden: ProvidersExport =
             serde_json::from_str(include_str!("providers-export.golden.json"))
                 .expect("providers-export.golden.json must parse");
         assert_eq!(
             export.routes, golden.routes,
             "update providers-export.golden.json from ProvidersExport::from_registry"
+        );
+        // The route rows are the contract, but a golden stamped with a version
+        // the tree has moved past is a stale artifact nothing else catches.
+        assert_eq!(
+            golden.runtime_version, GOLDEN_RUNTIME_VERSION,
+            "providers-export.golden.json is stamped {}; regenerate with: \
+             WRITE_GOLDEN=1 cargo test -p codewhale-config --lib -- --ignored \
+             write_golden_providers_export_when_requested",
+            golden.runtime_version
         );
         assert!(
             !serde_json::to_string(&export)

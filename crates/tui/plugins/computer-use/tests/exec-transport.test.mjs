@@ -4,8 +4,45 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import net from "node:net";
 import { run, runOk, runInputLease, ExecError, have, trim, withSignal } from "../src/exec.mjs";
-import { safeRemotePath, b64, localExec, hdcExec } from "../src/transport.mjs";
+import { safeRemotePath, b64, localExec, hdcExec, executorFor } from "../src/transport.mjs";
+import { ensureApp, writeRegistration } from "../src/app-socket.mjs";
+
+test("a missing registered bundle gives a repair path without falling back to host input",async t=>{
+  const directory=fs.mkdtempSync(path.join(os.tmpdir(),"cu-missing-app-"));
+  const keys=["CODEWHALE_CU_STATE_DIR","CODEWHALE_CU_APP_SOCKET","CODEWHALE_CU_APP"];
+  const previous=keys.map(key=>process.env[key]);
+  process.env.CODEWHALE_CU_STATE_DIR=directory;
+  delete process.env.CODEWHALE_CU_APP_SOCKET; delete process.env.CODEWHALE_CU_APP;
+  t.after(()=>{
+    keys.forEach((key,index)=>{if(previous[index]===undefined) delete process.env[key]; else process.env[key]=previous[index];});
+    fs.rmSync(directory,{recursive:true,force:true});
+  });
+  writeRegistration({path:path.join(directory,"missing.app"),launch:["must-not-launch"]});
+  await assert.rejects(ensureApp({launch:false}),error=>error.code==="app_missing"&&/Reinstall/.test(error.message)&&/app\.json/.test(error.message));
+});
+
+test("macOS refuses a helper that lacks the background-control contract before any input", {skip:process.platform!=="darwin"}, async t => {
+  const dir=fs.mkdtempSync(path.join(os.tmpdir(),"cu-old-helper-"));
+  const savedSocket=process.env.CODEWHALE_CU_APP_SOCKET, savedApp=process.env.CODEWHALE_CU_APP;
+  process.env.CODEWHALE_CU_APP_SOCKET=path.join(dir,"app.sock");
+  delete process.env.CODEWHALE_CU_APP;
+  const requests=[];
+  const server=net.createServer(socket=>socket.once("data",data=>{
+    requests.push(JSON.parse(data));
+    socket.end(JSON.stringify({ok:true,app:{id:"old-fixture",sessionProtocol:2}})+"\n");
+  }));
+  t.after(async()=>{
+    await new Promise(resolve=>server.close(resolve));
+    if(savedSocket===undefined) delete process.env.CODEWHALE_CU_APP_SOCKET; else process.env.CODEWHALE_CU_APP_SOCKET=savedSocket;
+    if(savedApp===undefined) delete process.env.CODEWHALE_CU_APP; else process.env.CODEWHALE_CU_APP=savedApp;
+    fs.rmSync(dir,{recursive:true,force:true});
+  });
+  await new Promise(resolve=>server.listen(process.env.CODEWHALE_CU_APP_SOCKET,resolve));
+  await assert.rejects(executorFor({id:"local",transport:"local"}),error=>error.code==="app_upgrade_required" && /background/.test(error.message));
+  assert.deepEqual(requests.map(request=>request.tool),["hello"]);
+});
 
 test("run captures stdout/stderr and exit codes without a shell", async () => {
   const r = await run("node", ["-e", "console.log('hello'); console.error('boo')"]);
@@ -66,12 +103,19 @@ test("cancelling a later pointer command closes its original input owner promptl
 
 test("an exited input owner rejects later movement immediately", async () => {
   const lease=await runInputLease(process.execPath,["-e",`
-    console.log(JSON.stringify({action_sent:true,input_lease:true}));
+    console.log(JSON.stringify({action_sent:true,input_lease:true,pid:process.pid}));
     setTimeout(()=>process.kill(process.pid,'SIGTERM'),20);
   `]);
-  await new Promise(resolve=>setTimeout(resolve,100));
+  const deadline=Date.now()+5000;
+  while(true) {
+    try { process.kill(lease.receipt.pid,0); }
+    catch(error) { if(error.code==='ESRCH') break; throw error; }
+    assert.ok(Date.now()<deadline,'the fixture owner must exit');
+    await new Promise(resolve=>setTimeout(resolve,20));
+  }
+  await new Promise(resolve=>setImmediate(resolve));
   const started=Date.now();
-  await assert.rejects(lease.send({point:{x:1,y:2}}),/owner is closed/);
+  await assert.rejects(lease.send({point:{x:1,y:2}}),error=>error.code==='input_owner_closed');
   assert.ok(Date.now()-started<500);
 });
 

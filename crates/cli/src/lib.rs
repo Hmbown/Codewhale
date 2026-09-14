@@ -4797,29 +4797,16 @@ fn apply_per_run_overrides(store: &mut ConfigStore, specs: &[String]) -> Result<
     Ok(())
 }
 
-/// Read-only config check. Unknown keys warn (the loader preserves them,
-/// never applies them); empty secrets and non-HTTP endpoints fail. Never
-/// prints a credential — presence and shape only.
+/// Read-only credential and endpoint check. The dispatcher's extras also
+/// contain settings owned by runtime readers; they are not unknown keys.
+/// Never prints a credential — presence and shape only.
 fn run_config_doctor(store: &ConfigStore) -> Result<()> {
     println!("# {}", store.path().display());
-    let mut warnings = 0;
     let mut errors: Vec<String> = Vec::new();
-
-    let mut unknown: Vec<&String> = store
-        .config
-        .extras
-        .keys()
-        .filter(|key| {
-            !matches!(
-                key.as_str(),
-                "route_preferences_version" | "route_preferences_migration"
-            )
-        })
-        .collect();
-    unknown.sort();
-    for key in unknown {
-        println!("warning: unrecognized key `{key}` (preserved, never applied)");
-        warnings += 1;
+    if !store.config.extras.is_empty() {
+        println!(
+            "note: additional settings are preserved for runtime readers; this check does not classify their support"
+        );
     }
 
     let mut secrets: Vec<(String, Option<String>)> =
@@ -4852,17 +4839,9 @@ fn run_config_doctor(store: &ConfigStore) -> Result<()> {
         for error in &errors {
             println!("error: {error}");
         }
-        bail!(
-            "doctor: {} error(s), {warnings} warning(s): {}",
-            errors.len(),
-            errors.join("; ")
-        );
+        bail!("doctor: {} error(s): {}", errors.len(), errors.join("; "));
     }
-    if warnings == 0 {
-        println!("doctor: clean");
-    } else {
-        println!("doctor: {warnings} warning(s)");
-    }
+    println!("doctor: credentials and endpoints clean");
     Ok(())
 }
 
@@ -6114,13 +6093,13 @@ mod tests {
     }
 
     #[test]
-    fn config_doctor_warns_on_unknown_keys_but_passes() {
+    fn config_doctor_preserves_keys_owned_by_other_readers() {
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("config.toml");
         write_config_fixture(&path, "zzz_unknown = 1\n");
         let store = ConfigStore::load(Some(path)).expect("load fixture");
         assert!(!store.config.extras.is_empty());
-        run_config_doctor(&store).expect("unknown keys warn, not fail");
+        run_config_doctor(&store).expect("extras do not establish unsupported settings");
     }
 
     #[test]
@@ -6156,6 +6135,28 @@ mod tests {
         // Nothing was saved: a reload sees the file, not the overlay.
         let reloaded = ConfigStore::load(Some(path)).expect("reload");
         assert_eq!(reloaded.config.verbosity.as_deref(), Some("normal"));
+    }
+
+    #[test]
+    fn unsupported_nested_config_set_preserves_original_file_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("config.toml");
+        let original =
+            "# Keep this comment and spacing\n[tools]\nuser_input_timeout_seconds = 7 # fixture\n";
+        write_config_fixture(&path, original);
+        let mut store = ConfigStore::load(Some(path.clone())).unwrap();
+        let err = run_config_command(
+            &mut store,
+            ConfigCommand::Set {
+                key: "tools.user_input_timeout_seconds".into(),
+                value: "0".into(),
+            },
+            false,
+            &[],
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("[tools]"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
     }
 
     #[test]

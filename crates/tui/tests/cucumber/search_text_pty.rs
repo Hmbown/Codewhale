@@ -79,7 +79,8 @@ fn search_text_stays_in_modal_and_out_of_composer() {
             .split("[↑]")
             .next()
             .unwrap()
-            .trim();
+            .trim_end();
+        let content = content.strip_suffix('│').unwrap_or(content).trim();
         assert_eq!(content, draft, "{title} leaked query {query:?}");
     }
     tui.shutdown();

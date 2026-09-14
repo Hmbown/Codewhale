@@ -67,3 +67,14 @@ The `/menu`, `/status`, `/threads`, active-turn, and approval messages include
 tap targets for common actions. Approval buttons map to the same runtime API as
 `/allow` and `/deny`; they do not enable blanket auto-approval unless you tap
 the explicit "Allow + remember" button.
+
+
+## Restart access checks
+
+Recovered deliveries require a saved, previously admitted sender identity that
+still matches the current allowlist and group policy. Removing access and
+restarting the bridge also stops recovery messages to that chat. Legacy state
+without this identity stays detached; it does not cancel the runtime turn.
+Use an authorized chat to inspect or interrupt that turn. A fresh admitted
+message records identity for subsequent restart recovery. Keep allow-unlisted
+mode off when operating with private workspace or runtime data.

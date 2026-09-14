@@ -11,6 +11,9 @@
 //! Copy falls back to OSC 52 (or tmux `load-buffer -w`), paste arrives through
 //! terminal input, and image clipboard reads are unavailable.
 
+#[cfg(all(target_os = "linux", not(target_env = "ohos"), not(test)))]
+mod primary;
+
 use std::ffi::OsStr;
 #[cfg(any(not(test), all(test, unix)))]
 use std::io::Write;
@@ -42,6 +45,45 @@ use base64::Engine as _;
 use image::{ImageBuffer, Rgba};
 
 const OSC52_MAX_BYTES: usize = 100 * 1024;
+const PRIMARY_MAX_BYTES: usize = 1024 * 1024;
+#[cfg(any(
+    test,
+    target_os = "macos",
+    target_os = "windows",
+    all(target_os = "linux", not(target_env = "ohos"))
+))]
+const MAX_CLIPBOARD_HTML_BYTES: usize = 1024 * 1024;
+
+/// Convert rich clipboard content without loading its linked resources. Keep
+/// the plain representation as a lossless fallback for empty/oversized HTML.
+#[cfg(any(
+    test,
+    target_os = "macos",
+    target_os = "windows",
+    all(target_os = "linux", not(target_env = "ohos"))
+))]
+fn clipboard_markdown(html: &str) -> Option<String> {
+    if html.len() > MAX_CLIPBOARD_HTML_BYTES {
+        return None;
+    }
+    let mut markdown = htmd::HtmlToMarkdown::builder()
+        .options(htmd::options::Options {
+            preformatted_code: true,
+            ..Default::default()
+        })
+        .skip_tags(vec!["script", "style", "head", "iframe", "object"])
+        .build()
+        .convert(html)
+        .ok()?;
+    // A standalone H1 must not become the `# note` memory shortcut. Setext
+    // is equivalent Markdown and remains multi-line after composer trimming.
+    if let Some(heading) = markdown.trim().strip_prefix("# ")
+        && !heading.contains('\n')
+    {
+        markdown = format!("{heading}\n===");
+    }
+    (!markdown.trim().is_empty() && markdown.len() <= MAX_CLIPBOARD_HTML_BYTES).then_some(markdown)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ClipboardEndpoint {
@@ -260,6 +302,12 @@ impl TerminalClipboardWriter {
 pub struct ClipboardHandler {
     terminal_context: TerminalClipboardContext,
     terminal_writer: Option<TerminalClipboardWriter>,
+    #[cfg(all(target_os = "linux", not(target_env = "ohos"), not(test)))]
+    primary: Option<primary::PrimarySelection>,
+    #[cfg(test)]
+    primary_enabled: bool,
+    #[cfg(test)]
+    primary_text: Option<String>,
     #[cfg(any(
         target_os = "macos",
         target_os = "windows",
@@ -292,6 +340,12 @@ impl ClipboardHandler {
         Self {
             terminal_context,
             terminal_writer: None,
+            #[cfg(all(target_os = "linux", not(target_env = "ohos"), not(test)))]
+            primary: None,
+            #[cfg(test)]
+            primary_enabled: false,
+            #[cfg(test)]
+            primary_text: None,
             #[cfg(any(
                 target_os = "macos",
                 target_os = "windows",
@@ -339,6 +393,80 @@ impl ClipboardHandler {
         self.terminal_context.requires_terminal_paste()
     }
 
+    pub(crate) fn uses_primary_selection(&self) -> bool {
+        #[cfg(test)]
+        {
+            self.primary_enabled
+        }
+        #[cfg(not(test))]
+        {
+            cfg!(all(target_os = "linux", not(target_env = "ohos")))
+        }
+    }
+
+    /// Automatic selection never writes CLIPBOARD or sends OSC 52. A remote
+    /// terminal without a forwarded display owns its own selection and paste.
+    pub(crate) fn write_primary_text(&mut self, text: &str) -> Result<()> {
+        if !self.uses_primary_selection()
+            || !self.terminal_context.permits_native_read()
+            || text.is_empty()
+            || text.len() > PRIMARY_MAX_BYTES
+        {
+            bail!("PRIMARY selection unavailable");
+        }
+        #[cfg(test)]
+        {
+            if self.fail_text_writes {
+                bail!("test PRIMARY unavailable");
+            }
+            self.primary_text = Some(text.to_string());
+            Ok(())
+        }
+        #[cfg(all(target_os = "linux", not(target_env = "ohos"), not(test)))]
+        {
+            self.primary_selection()?.write(text)
+        }
+        #[cfg(all(not(test), not(all(target_os = "linux", not(target_env = "ohos")))))]
+        {
+            bail!("PRIMARY selection unavailable")
+        }
+    }
+
+    pub(crate) fn read_primary_text(&mut self) -> Option<String> {
+        if !self.uses_primary_selection() || !self.terminal_context.permits_native_read() {
+            return None;
+        }
+        #[cfg(test)]
+        {
+            if self.fail_text_writes {
+                None
+            } else {
+                self.primary_text.clone()
+            }
+        }
+        #[cfg(all(target_os = "linux", not(target_env = "ohos"), not(test)))]
+        {
+            self.primary_selection().ok()?.read()
+        }
+        #[cfg(all(not(test), not(all(target_os = "linux", not(target_env = "ohos")))))]
+        {
+            None
+        }
+    }
+
+    #[cfg(all(target_os = "linux", not(target_env = "ohos"), not(test)))]
+    fn primary_selection(&mut self) -> Result<&primary::PrimarySelection> {
+        if self.primary.is_none() {
+            self.primary = Some(primary::PrimarySelection::spawn()?);
+        }
+        Ok(self.primary.as_ref().expect("PRIMARY worker initialized"))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn enable_primary_for_test(&mut self) {
+        self.primary_enabled = true;
+    }
+
     /// Try to connect to the system clipboard, bounded by a short timeout.
     ///
     /// On Linux, `arboard::Clipboard::new()` opens a blocking X11 connection.
@@ -373,6 +501,21 @@ impl ClipboardHandler {
     /// `workspace` is used as a fallback location when `~/.codewhale/` cannot
     /// be resolved (e.g. running with a stripped HOME in CI sandboxes).
     pub fn read(&mut self, workspace: &Path) -> Option<ClipboardContent> {
+        self.read_content(workspace, false)
+    }
+
+    /// Composer paste preserves headings, lists, links, tables and code from
+    /// rich applications. Credentials and configuration fields use `read` so
+    /// their literal text is never interpreted as Markdown.
+    pub fn read_markdown(&mut self, workspace: &Path) -> Option<ClipboardContent> {
+        self.read_content(workspace, true)
+    }
+
+    fn read_content(
+        &mut self,
+        workspace: &Path,
+        prefer_markdown: bool,
+    ) -> Option<ClipboardContent> {
         // With no display exported over SSH there is no synchronously readable
         // clipboard endpoint. A forwarded X11/Wayland display is explicit and
         // remains readable, including its image clipboard.
@@ -381,7 +524,7 @@ impl ClipboardHandler {
         }
 
         #[cfg(all(target_os = "linux", not(target_env = "ohos"), not(test)))]
-        if let Ok(text) = read_text_with_wlpaste() {
+        if !prefer_markdown && let Ok(text) = read_text_with_wlpaste() {
             return Some(ClipboardContent::Text(text));
         }
 
@@ -392,19 +535,31 @@ impl ClipboardHandler {
         ))]
         {
             self.ensure_clipboard();
-            let clipboard = self.clipboard.as_mut()?;
-            if let Ok(text) = clipboard.get_text() {
-                return Some(ClipboardContent::Text(text));
-            }
+            if let Some(clipboard) = self.clipboard.as_mut() {
+                if prefer_markdown
+                    && let Ok(html) = clipboard.get().html()
+                    && let Some(markdown) = clipboard_markdown(&html)
+                {
+                    return Some(ClipboardContent::Text(markdown));
+                }
+                if let Ok(text) = clipboard.get_text() {
+                    return Some(ClipboardContent::Text(text));
+                }
 
-            if let Ok(image) = clipboard.get_image()
-                && let Ok(pasted) = save_image_as_png(workspace, &image)
-            {
-                return Some(ClipboardContent::Image(pasted));
+                if let Ok(image) = clipboard.get_image()
+                    && let Ok(pasted) = save_image_as_png(workspace, &image)
+                {
+                    return Some(ClipboardContent::Image(pasted));
+                }
             }
         }
 
-        let _ = workspace;
+        #[cfg(all(target_os = "linux", not(target_env = "ohos"), not(test)))]
+        if prefer_markdown && let Ok(text) = read_text_with_wlpaste() {
+            return Some(ClipboardContent::Text(text));
+        }
+
+        let _ = (workspace, prefer_markdown);
         None
     }
 
@@ -753,6 +908,78 @@ fn save_image_as_png_in(dir: &Path, image: &ImageData) -> Result<PastedImage> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn primary_transport_is_distinct_bounded_and_never_uses_ssh_host_clipboard() {
+        let mut clipboard = ClipboardHandler::for_test(false, false);
+        clipboard.enable_primary_for_test();
+        clipboard.write_text("regular").unwrap();
+        clipboard.write_primary_text("selected").unwrap();
+        assert_eq!(clipboard.last_written_text(), Some("regular"));
+        assert_eq!(clipboard.read_primary_text().as_deref(), Some("selected"));
+        assert!(clipboard.write_primary_text("").is_err());
+        assert!(
+            clipboard
+                .write_primary_text(&"x".repeat(PRIMARY_MAX_BYTES + 1))
+                .is_err()
+        );
+        assert_eq!(clipboard.read_primary_text().as_deref(), Some("selected"));
+        let mut remote = ClipboardHandler::for_test(true, false);
+        remote.enable_primary_for_test();
+        assert!(remote.write_primary_text("private").is_err());
+        assert!(remote.read_primary_text().is_none());
+        assert!(remote.last_written_text().is_none());
+        let mut forwarded = ClipboardHandler::with_terminal_context(TerminalClipboardContext {
+            endpoint: ClipboardEndpoint::ForwardedDisplay,
+            in_tmux: false,
+        });
+        forwarded.enable_primary_for_test();
+        forwarded.write_primary_text("forwarded").unwrap();
+        assert_eq!(forwarded.read_primary_text().as_deref(), Some("forwarded"));
+    }
+
+    #[test]
+    fn clipboard_markdown_preserves_rich_structure_and_code() {
+        let html = r#"<h1>Release plan</h1><p>Keep <strong>authorship</strong> and
+<a href="https://example.com/review">review</a>.</p>
+<ul><li>Run gates</li><li>Dogfood</li></ul>
+<pre><code>fn main() {
+    println!("&lt;ready&gt;");
+}</code></pre>
+<table><tr><th>Gate</th><th>Result</th></tr><tr><td>Tests</td><td>Pass</td></tr></table>"#;
+        let markdown = clipboard_markdown(html).expect("rich text converts");
+        assert!(markdown.contains("# Release plan"), "{markdown}");
+        assert!(markdown.contains("**authorship**"), "{markdown}");
+        assert!(
+            markdown.contains("[review](https://example.com/review)"),
+            "{markdown}"
+        );
+        assert!(markdown.contains("Run gates") && markdown.contains("Dogfood"));
+        assert!(markdown.contains("```"), "{markdown}");
+        assert!(markdown.contains("println!(\"<ready>\");"), "{markdown}");
+        assert!(
+            markdown
+                .lines()
+                .any(|line| line.split('|').map(str::trim).collect::<Vec<_>>()
+                    == ["", "Gate", "Result", ""]),
+            "{markdown}"
+        );
+    }
+
+    #[test]
+    fn clipboard_markdown_omits_executable_markup_and_falls_back_losslessly() {
+        assert_eq!(
+            clipboard_markdown("<script>secret()</script><style>secret</style>"),
+            None
+        );
+        assert_eq!(
+            clipboard_markdown(&"x".repeat(MAX_CLIPBOARD_HTML_BYTES + 1)),
+            None
+        );
+        let markdown = clipboard_markdown("<h1>Release plan</h1>").unwrap();
+        assert_eq!(markdown.trim(), "Release plan\n===");
+        assert!(markdown.trim().contains('\n'), "not a memory quick-add");
+    }
     // ImageData from arboard is only available on these platforms.
     #[cfg(any(
         target_os = "macos",
@@ -1096,6 +1323,10 @@ exit 42
     fn tmux_load_buffer_w_reaches_attached_client_with_default_passthrough_disabled() {
         use std::io::Read as _;
 
+        // Every subprocess must inherit the same terminal environment, not
+        // another fixture's transient PATH/TERM/multiplexer overrides.
+        let _env = crate::test_support::lock_test_env();
+
         let version = match Command::new("tmux").arg("-V").output() {
             Ok(output) if output.status.success() => output,
             _ => return,
@@ -1206,6 +1437,12 @@ exit 42
             );
             std::thread::sleep(std::time::Duration::from_millis(25));
         }
+        // A listed client can precede its terminal startup. tmux discards
+        // clipboard requests before TTY_STARTED; actual PTY output establishes
+        // that startup reached the terminal before the one request we verify.
+        output_rx
+            .recv_timeout(attach_deadline.saturating_duration_since(std::time::Instant::now()))
+            .expect("attached tmux client should produce terminal startup output");
         while output_rx.try_recv().is_ok() {}
 
         let copied_text = "copy through default tmux";

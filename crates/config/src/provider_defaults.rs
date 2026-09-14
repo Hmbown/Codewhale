@@ -5,13 +5,8 @@
 //! are unchanged. Re-exported `pub(crate)` at the crate root so existing
 //! `crate::DEFAULT_*` references keep resolving.
 
-// V4.1 Flash, shipped as the unversioned id `deepseek-flash` and verified live
-// on api.deepseek.com /v1/models 2026-09-10. It replaces `deepseek-v4-pro` as
-// the default because the vendor stops serving Pro at 12:00 Beijing on
-// 2026-09-14 and routes it here anyway — and because their own notice puts
-// V4.1 Flash above V4 Pro on performance, cost, speed and task completion.
-// Defaulting to a model that is about to be silently rerouted would leave new
-// users on a route whose price and identity both change under them.
+// V4.1 Flash remains the selected default. The September 11 vendor reversal
+// keeps V4 Pro available with unchanged billing; explicit Pro selections stay Pro.
 pub(crate) const DEFAULT_DEEPSEEK_MODEL: &str = "deepseek-flash";
 pub(crate) const DEFAULT_DEEPSEEK_ANTHROPIC_MODEL: &str = DEFAULT_DEEPSEEK_MODEL;
 pub(crate) const DEFAULT_NVIDIA_NIM_MODEL: &str = "deepseek-ai/deepseek-v4-pro";
@@ -171,9 +166,8 @@ pub(crate) const DEFAULT_SAKANA_BASE_URL: &str = "https://api.sakana.ai/v1";
 // Meituan LongCat defaults
 pub(crate) const DEFAULT_LONGCAT_MODEL: &str = "LongCat-2.0";
 pub(crate) const DEFAULT_LONGCAT_BASE_URL: &str = "https://api.longcat.chat/openai/v1";
-// OpenCode Go Chat Completions defaults. The Go catalog also contains models
-// served only through Anthropic Messages; those are deliberately not listed by
-// this provider until Codewhale can route wire formats per model.
+// OpenCode Go keeps its Chat default and resolves other model protocols from
+// the shared opencode_go roster.
 pub(crate) const DEFAULT_OPENCODE_GO_MODEL: &str = "deepseek-v4-pro";
 pub(crate) const DEFAULT_OPENCODE_GO_BASE_URL: &str = "https://opencode.ai/zen/go/v1";
 pub(crate) const OPENCODE_GO_GROK_4_5_MODEL: &str = "grok-4.5";

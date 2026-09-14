@@ -51,6 +51,7 @@ pub enum Focus {
 /// is exclusive and sits outside that shell hierarchy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FocusScope {
+    PetHabitat,
     /// Only the model-bound redaction consent gate.
     RedactionGate,
     /// A live session: the composer, or a rail/workflow panel that has taken
@@ -70,6 +71,7 @@ impl FocusScope {
     #[must_use]
     pub fn admits(self, focus: Focus) -> bool {
         match self {
+            Self::PetHabitat => focus == Focus::Modal(ModalKind::PetHabitat),
             Self::RedactionGate => focus == Focus::RedactionGate,
             Self::SessionShell => matches!(focus, Focus::Composer | Focus::Panel),
             Self::AnyShell => matches!(focus, Focus::Composer | Focus::Panel | Focus::Launch),
@@ -85,6 +87,14 @@ impl FocusScope {
 /// Stable binding ids shared by handlers, footer hints, and help catalog.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShellBindingId {
+    PetResultUp,
+    PetResultDown,
+    PetResultPageUp,
+    PetResultPageDown,
+    PetBack,
+    PetSound,
+    PetBrowser,
+    PetWindow,
     RedactionGateConfirm,
     RedactionGateKeepOrBack,
     RedactionGateQuit,
@@ -123,6 +133,19 @@ impl ShellBinding {
     #[must_use]
     pub fn matches(&self, key: &KeyEvent) -> bool {
         match self.id {
+            ShellBindingId::PetResultUp => key.code == KeyCode::Up && key.modifiers.is_empty(),
+            ShellBindingId::PetResultDown => key.code == KeyCode::Down && key.modifiers.is_empty(),
+            ShellBindingId::PetResultPageUp => {
+                key.code == KeyCode::PageUp && key.modifiers.is_empty()
+            }
+            ShellBindingId::PetResultPageDown => {
+                key.code == KeyCode::PageDown && key.modifiers.is_empty()
+            }
+            ShellBindingId::PetBack => key.code == KeyCode::Esc && key.modifiers.is_empty(),
+            ShellBindingId::PetSound => key.code == KeyCode::F(6) && key.modifiers.is_empty(),
+            ShellBindingId::PetBrowser => key.code == KeyCode::F(8) && key.modifiers.is_empty(),
+            ShellBindingId::PetWindow => key.code == KeyCode::F(9) && key.modifiers.is_empty(),
+
             ShellBindingId::RedactionGateConfirm => is_redaction_gate_choice(key, '1', 'y'),
             ShellBindingId::RedactionGateKeepOrBack => is_redaction_gate_choice(key, '2', 'u'),
             ShellBindingId::RedactionGateQuit => is_redaction_gate_choice(key, '3', 'n'),
@@ -162,6 +185,54 @@ pub fn route(focus: Focus, key: &KeyEvent) -> Option<ShellBindingId> {
 
 /// Canonical shell bindings. Handlers and chrome read from here.
 pub const SHELL_BINDINGS: &[ShellBinding] = &[
+    ShellBinding {
+        id: ShellBindingId::PetResultUp,
+        catalog_chord: "Up",
+        footer_chord: "↑",
+        focus: FocusScope::PetHabitat,
+    },
+    ShellBinding {
+        id: ShellBindingId::PetResultDown,
+        catalog_chord: "Down",
+        footer_chord: "↓",
+        focus: FocusScope::PetHabitat,
+    },
+    ShellBinding {
+        id: ShellBindingId::PetResultPageUp,
+        catalog_chord: "PgUp",
+        footer_chord: "PgUp",
+        focus: FocusScope::PetHabitat,
+    },
+    ShellBinding {
+        id: ShellBindingId::PetResultPageDown,
+        catalog_chord: "PgDn",
+        footer_chord: "PgDn",
+        focus: FocusScope::PetHabitat,
+    },
+    ShellBinding {
+        id: ShellBindingId::PetBack,
+        catalog_chord: "Esc",
+        footer_chord: "Esc",
+        focus: FocusScope::PetHabitat,
+    },
+    ShellBinding {
+        id: ShellBindingId::PetSound,
+        catalog_chord: "F6",
+        footer_chord: "F6",
+        focus: FocusScope::PetHabitat,
+    },
+    ShellBinding {
+        id: ShellBindingId::PetBrowser,
+        catalog_chord: "F8",
+        footer_chord: "F8",
+        focus: FocusScope::PetHabitat,
+    },
+    ShellBinding {
+        id: ShellBindingId::PetWindow,
+        catalog_chord: "F9",
+        footer_chord: "F9",
+        focus: FocusScope::PetHabitat,
+    },
     ShellBinding {
         id: ShellBindingId::RedactionGateConfirm,
         catalog_chord: "1/Y",

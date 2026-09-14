@@ -9,7 +9,8 @@
 # package and lock, the root npm lock workspace records, the remote-smoke default
 # tag, README*.md install-tag examples when present, the public fact matrix's
 # source-candidate version, Cargo.lock, crates/tui/CHANGELOG.md (via
-# sync-changelog.sh), and web/lib/facts.generated.ts (via derive-facts.mjs).
+# sync-changelog.sh), web/lib/facts.generated.ts (via derive-facts.mjs), and
+# web/lib/changelog.generated.ts (via derive-changelog.mjs).
 #
 # It does NOT write the CHANGELOG entry — add the `## [X.Y.Z] - YYYY-MM-DD`
 # section first (see docs/RELEASE_CHECKLIST.md), then run this script, then
@@ -54,6 +55,7 @@ transaction_paths=(
   README.ko-KR.md
   crates/tui/CHANGELOG.md
   web/lib/facts.generated.ts
+  web/lib/changelog.generated.ts
 )
 for manifest in crates/*/Cargo.toml; do
   transaction_paths+=("${manifest}")
@@ -350,6 +352,13 @@ echo "Regenerating crates/tui/CHANGELOG.md slice..."
 
 echo "Regenerating web/lib/facts.generated.ts..."
 node web/scripts/derive-facts.mjs
+
+# Release prep always edits CHANGELOG.md, and derive-changelog.mjs is the only
+# thing that turns it into the file the /changelog route reads. Leaving this
+# out reddened CI on 2026-09-10 twice, because the drift gate only fires after
+# a push. Keep it beside the other regenerators.
+echo "Regenerating web/lib/changelog.generated.ts..."
+node web/scripts/derive-changelog.mjs
 
 echo "Validating..."
 ./scripts/release/check-versions.sh

@@ -47,8 +47,8 @@ pub(crate) fn is_tool_search_tool(name: &str) -> bool {
 // Crate-visible so the hook gate tests the real eager names instead of a copy.
 #[rustfmt::skip]
 pub(crate) const DEFAULT_ACTIVE_NATIVE_TOOLS: &[&str] = &[
-    // Specialized native, MCP, plugin, and durable-work tools stay searchable.
-    "read", "write", "edit", "bash", "agent", "todo_write",
+    // Core work controls are eager; specialized tools stay searchable.
+    "read", "write", "edit", "bash", "agent", "workflow", "todo_write",
     // Continuation instructions require these controls. Hiding them behind
     // discovery leaves a model unable to stop the work it was asked to run.
     "create_goal", "get_goal", "update_goal",

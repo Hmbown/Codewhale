@@ -1,7 +1,7 @@
 //! In-context plugin reminders: prompt matching, live composer CTA, and idle
 //! catalog polling.
 
-use std::collections::HashSet;
+use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
 
 use ratatui::buffer::Buffer;
@@ -12,8 +12,7 @@ use ratatui::widgets::{Block, Widget};
 use unicode_width::UnicodeWidthStr;
 
 use crate::plugins::recommend::{
-    PluginNextStep, RecommendOptions, load_marketplace_candidates, match_plugin_for_draft,
-    recommend_plugins_for_task,
+    PluginNextStep, load_marketplace_candidates, match_plugin_for_draft,
 };
 use crate::tui::app::{App, StatusToast, StatusToastKind, StatusToastLevel};
 use codewhale_localization::{MessageId, tr};
@@ -45,7 +44,8 @@ impl PluginCtaPhase {
 #[derive(Debug, Clone)]
 pub struct PluginCtaState {
     pub phase: PluginCtaPhase,
-    pub dismissed: HashSet<String>,
+    pub dismissed: BTreeSet<String>,
+    matched_term: Option<String>,
     debounce_at: Option<Instant>,
     last_draft: String,
 }
@@ -54,9 +54,23 @@ impl Default for PluginCtaState {
     fn default() -> Self {
         Self {
             phase: PluginCtaPhase::Hidden,
-            dismissed: HashSet::new(),
+            dismissed: BTreeSet::new(),
+            matched_term: None,
             debounce_at: None,
             last_draft: String::new(),
+        }
+    }
+}
+
+impl PluginCtaState {
+    pub(crate) fn from_settings(settings: &crate::settings::Settings) -> Self {
+        Self {
+            dismissed: settings
+                .dismissed_plugin_suggestions
+                .iter()
+                .map(|name| name.to_ascii_lowercase())
+                .collect(),
+            ..Self::default()
         }
     }
 }
@@ -70,13 +84,12 @@ impl App {
             return false;
         }
         let marketplace = load_marketplace_candidates(self.plugin_registry.state_path());
-        let recommendations = recommend_plugins_for_task(
+        let Some(recommendation) = match_plugin_for_draft(
             input,
             self.plugin_registry.as_ref(),
             &marketplace,
-            RecommendOptions::proactive(),
-        );
-        let Some(recommendation) = recommendations.into_iter().next() else {
+            &self.plugin_cta.dismissed,
+        ) else {
             return false;
         };
         let message_id = match recommendation.next_step {
@@ -90,6 +103,12 @@ impl App {
         let mut message = tr(self.ui_locale, message_id).replace("{name}", &recommendation.name);
         if let PluginNextStep::MarketplaceInstall { catalog_id } = &recommendation.next_step {
             message = message.replace("{catalog}", catalog_id);
+        }
+        if let Some(term) = recommendation.matched_term {
+            message.push_str(" · ");
+            message.push_str(
+                &tr(self.ui_locale, MessageId::PluginSuggestionReason).replace("{trigger}", &term),
+            );
         }
         self.behavioral_tips.record_guidance_impression();
         let mut toast = StatusToast::new(message, StatusToastLevel::Info, Some(8_000));
@@ -129,37 +148,32 @@ impl App {
 
     /// Recompute the live CTA after the debounce window. One match at a
     /// time; already-active plugins stay hidden; a dismissed name stays
-    /// dismissed for the rest of this session. Never auto-installs.
+    /// dismissed across sessions. Never auto-installs.
     pub fn handle_plugin_cta_debounce_expired(&mut self) {
         self.plugin_cta.debounce_at = None;
         self.plugin_cta.last_draft = self.input.clone();
         let marketplace = load_marketplace_candidates(self.plugin_registry.state_path());
-        let Some(matched) =
-            match_plugin_for_draft(&self.input, self.plugin_registry.as_ref(), &marketplace)
-        else {
+        let Some(matched) = match_plugin_for_draft(
+            &self.input,
+            self.plugin_registry.as_ref(),
+            &marketplace,
+            &self.plugin_cta.dismissed,
+        ) else {
             if self.plugin_cta.phase.is_visible() {
                 self.plugin_cta.phase = PluginCtaPhase::Hidden;
                 self.needs_redraw = true;
             }
             return;
         };
-        if self
-            .plugin_cta
-            .dismissed
-            .contains(&matched.name.to_ascii_lowercase())
-        {
-            if self.plugin_cta.phase.is_visible() {
-                self.plugin_cta.phase = PluginCtaPhase::Hidden;
-                self.needs_redraw = true;
-            }
-            return;
-        }
         let command = matched.command();
         let new_phase = PluginCtaPhase::Matched {
             name: matched.name,
             command,
         };
-        if self.plugin_cta.phase != new_phase {
+        if self.plugin_cta.phase != new_phase
+            || self.plugin_cta.matched_term != matched.matched_term
+        {
+            self.plugin_cta.matched_term = matched.matched_term;
             self.plugin_cta.phase = new_phase;
             self.needs_redraw = true;
         }
@@ -183,14 +197,28 @@ impl App {
         u16::from(self.plugin_cta.phase.is_visible())
     }
 
-    /// Hide the CTA for this plugin name for the rest of the session.
+    /// Persist an explicit dismissal while hiding it immediately this session.
     pub fn dismiss_plugin_cta(&mut self) -> bool {
         let Some(name) = self.plugin_cta.phase.matched_name().map(str::to_string) else {
             return false;
         };
-        self.plugin_cta.dismissed.insert(name.to_ascii_lowercase());
+        let name = name.to_ascii_lowercase();
+        self.plugin_cta.dismissed.insert(name.clone());
         self.plugin_cta.phase = PluginCtaPhase::Hidden;
         self.needs_redraw = true;
+        if let Err(error) = crate::settings::Settings::transact_opt(|settings| {
+            Ok(settings
+                .dismissed_plugin_suggestions
+                .insert(name)
+                .then_some(()))
+        }) {
+            tracing::warn!(%error, "could not persist plugin suggestion dismissal");
+            self.push_status_toast(
+                tr(self.ui_locale, MessageId::PluginCtaDismissSaveFailed).into_owned(),
+                StatusToastLevel::Warning,
+                Some(8_000),
+            );
+        }
         true
     }
 
@@ -212,9 +240,16 @@ impl App {
     /// Model-requested review: show the live CTA and a toast. Does not run
     /// the command, so nothing is installed, trusted, or enabled.
     pub fn surface_plugin_review_request(&mut self, name: &str, command: &str) {
-        if name.trim().is_empty() || command.trim().is_empty() {
+        if name.trim().is_empty()
+            || command.trim().is_empty()
+            || self
+                .plugin_cta
+                .dismissed
+                .contains(&name.to_ascii_lowercase())
+        {
             return;
         }
+        self.plugin_cta.matched_term = None;
         self.plugin_cta.phase = PluginCtaPhase::Matched {
             name: name.to_string(),
             command: command.to_string(),
@@ -236,7 +271,13 @@ pub fn draw_plugin_cta(app: &mut App, area: Rect, buf: &mut Buffer) {
     if area.height == 0 || area.width == 0 {
         return;
     }
-    let prompt = tr(app.ui_locale, MessageId::PluginCtaInstallPrompt).replace("{name}", &name);
+    let mut prompt = tr(app.ui_locale, MessageId::PluginCtaInstallPrompt).replace("{name}", &name);
+    if let Some(term) = &app.plugin_cta.matched_term {
+        prompt.push_str(" · ");
+        prompt.push_str(
+            &tr(app.ui_locale, MessageId::PluginSuggestionReason).replace("{trigger}", term),
+        );
+    }
     let review = tr(app.ui_locale, MessageId::PluginCtaReview);
     let dismiss = tr(app.ui_locale, MessageId::PluginCtaDismiss);
     let review_label = format!("[{review}]");
@@ -396,6 +437,16 @@ mod tests {
             app.plugin_cta.phase
         );
         assert_eq!(app.plugin_cta_row_height(), 1);
+        assert_eq!(app.plugin_cta.matched_term.as_deref(), Some("supabase"));
+        let area = Rect::new(0, 0, 140, 1);
+        let mut buffer = Buffer::empty(area);
+        draw_plugin_cta(&mut app, area, &mut buffer);
+        let row = buffer
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(row.contains("Matched “supabase”"), "{row}");
     }
 
     #[test]
@@ -428,5 +479,69 @@ mod tests {
             "dismissed names must not reappear this session: {:?}",
             app.plugin_cta.phase
         );
+    }
+
+    #[test]
+    fn dismissal_survives_restart_and_all_proactive_paths_preserving_settings() {
+        use crate::settings::Settings;
+        let _lock = crate::test_support::lock_test_env();
+        let (mut app, root, _home) = app_with_supabase_plugin();
+        Settings::transact(|settings| settings.set("max_history", "321")).unwrap();
+        app.input = "add supabase auth to login".into();
+        app.handle_plugin_cta_debounce_expired();
+        assert!(app.dismiss_plugin_cta());
+        let saved = Settings::load_read_only().unwrap();
+        assert_eq!(saved.max_input_history, 321);
+        assert!(saved.dismissed_plugin_suggestions.contains("supabase"));
+        // A freshly initialized App must hydrate the persisted preference.
+        let mut restarted = App::new_with_plugin_registry(
+            crate::test_support::test_tui_options(root.path()),
+            &Config::default(),
+            app.plugin_registry.clone(),
+        );
+        restarted.input = app.input.clone();
+        restarted.handle_plugin_cta_debounce_expired();
+        assert!(!restarted.plugin_cta.phase.is_visible());
+        assert!(!restarted.maybe_nudge_plugin_for_prompt(&app.input));
+        restarted.surface_plugin_review_request("supabase", "/plugin trust supabase");
+        assert!(!restarted.plugin_cta.phase.is_visible());
+        assert!(
+            crate::plugins::recommend::recommended_plugins_user_fragment(
+                &app.input,
+                restarted.plugin_registry.as_ref(),
+                &[],
+            )
+            .is_none()
+        );
+        assert!(
+            crate::plugins::recommend::lookup_reviewable_plugin(
+                "supabase",
+                restarted.plugin_registry.as_ref(),
+                &[],
+            )
+            .is_some(),
+            "manual plugin commands remain available"
+        );
+    }
+
+    #[test]
+    fn failed_dismissal_save_preserves_malformed_preferences_and_hides_this_session() {
+        let _lock = crate::test_support::lock_test_env();
+        let (mut app, root, _home) = app_with_supabase_plugin();
+        app.input = "add supabase auth".into();
+        app.handle_plugin_cta_debounce_expired();
+        let path = crate::settings::Settings::path().unwrap();
+        assert!(path.starts_with(root.path()));
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let malformed = "theme = [private_fixture_payload\n";
+        fs::write(&path, malformed).unwrap();
+        assert!(app.dismiss_plugin_cta());
+        assert_eq!(fs::read_to_string(&path).unwrap(), malformed);
+        app.handle_plugin_cta_debounce_expired();
+        assert!(!app.plugin_cta.phase.is_visible());
+        assert!(!app.maybe_nudge_plugin_for_prompt("add supabase auth"));
+        let toast = app.status_toasts.back().expect("save failure receipt");
+        assert!(toast.text.contains("could not save"));
+        assert!(!toast.text.contains("private_fixture_payload"));
     }
 }

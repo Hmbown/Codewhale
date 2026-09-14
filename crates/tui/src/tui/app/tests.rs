@@ -23,6 +23,39 @@ fn test_options(yolo: bool) -> TuiOptions {
 }
 
 #[test]
+fn missing_api_stamps_never_drop_messages_or_shift_preserved_times() {
+    let mut app = App::new(test_options(false), &Config::default());
+    let message = |text: &str| Message {
+        role: codewhale_models::Role::User,
+        content: vec![codewhale_models::ContentBlock::Text {
+            text: text.to_string(),
+            cache_control: None,
+        }],
+    };
+    let first = DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap();
+    let third = first + chrono::Duration::minutes(2);
+    // Reproduce partial legacy/test state without going through restoration,
+    // which already fills missing stamps. Reading it must preserve both rows.
+    app.api_messages = vec![message("first"), message("unstamped")];
+    app.api_message_stamps = vec![first];
+    let observed = app.api_messages_stamped().collect::<Vec<_>>();
+    assert_eq!(observed.len(), 2);
+    assert_eq!(observed[0].1, first);
+    assert_eq!(observed[1].0, &message("unstamped"));
+
+    app.push_api_message_stamped(message("third"), third);
+    assert_eq!(app.api_message_stamps.len(), 3);
+    assert_eq!(app.api_message_stamps[0], first);
+    assert_eq!(app.api_message_stamps[2], third);
+    app.pop_api_message();
+    assert_eq!(app.api_messages.len(), 2);
+    assert_eq!(app.api_message_stamps.len(), 2);
+    app.truncate_api_messages(1);
+    assert_eq!(app.api_messages.len(), 1);
+    assert_eq!(app.api_message_stamps, vec![first]);
+}
+
+#[test]
 fn app_motion_policy_and_transcript_bridge_cover_every_settings_mode() {
     let mut app = App::new(test_options(false), &Config::default());
     app.constrained_frame_rate = false;

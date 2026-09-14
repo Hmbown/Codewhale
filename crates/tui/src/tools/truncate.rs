@@ -462,15 +462,16 @@ fn truncated_preview(
 /// would just hide the error from the model's reasoning.
 #[allow(dead_code)]
 pub fn apply_spillover(result: &mut ToolResult, tool_id: &str) -> Option<PathBuf> {
-    apply_spillover_inner(result, tool_id, None)
+    apply_spillover_inner(result, tool_id, None, false)
 }
 
-/// Apply adaptive routing and publish session-scoped exact evidence.
+/// Apply spillover and publish session-scoped exact evidence.
 ///
-/// The default path writes one immutable payload under the origin session and
-/// replaces non-inline content with a bounded preview whose footer names the
-/// artifact path and how to read the omitted range back. The legacy dual
-/// spillover behavior is reachable only through the classic rollback switch.
+/// The default (classic) path writes the full bytes under the origin session
+/// and replaces oversized content with a bounded head/tail preview whose
+/// footer names the artifact path and how to read the omitted range back.
+/// The adaptive evidence lane is reachable only through the explicit
+/// `CODEWHALE_ADAPTIVE_OUTPUT_ROUTING` opt-in.
 pub fn apply_spillover_with_artifact(
     result: &mut ToolResult,
     tool_id: &str,
@@ -484,6 +485,28 @@ pub fn apply_spillover_with_artifact(
             tool_name,
             session_id,
         }),
+        false,
+    )
+}
+
+/// [`apply_spillover_with_artifact`] for callers whose error payloads are
+/// routinely as large as their successes — sub-agent tool output is often a
+/// full build log, so the root loop's pass-errors-through rationale does not
+/// hold there.
+pub(crate) fn apply_spillover_with_artifact_including_errors(
+    result: &mut ToolResult,
+    tool_id: &str,
+    tool_name: &str,
+    session_id: &str,
+) -> Option<PathBuf> {
+    apply_spillover_inner(
+        result,
+        tool_id,
+        Some(ArtifactSpilloverContext {
+            tool_name,
+            session_id,
+        }),
+        true,
     )
 }
 
@@ -497,13 +520,14 @@ fn apply_spillover_inner(
     result: &mut ToolResult,
     tool_id: &str,
     artifact_context: Option<ArtifactSpilloverContext<'_>>,
+    bound_errors: bool,
 ) -> Option<PathBuf> {
-    if !crate::tools::large_output_router::classic_output_routing_enabled()
+    if crate::tools::large_output_router::adaptive_output_routing_enabled()
         && let Some(context) = artifact_context
     {
         return apply_adaptive_evidence_inner(result, tool_id, context);
     }
-    if !result.success {
+    if !result.success && !bound_errors {
         return None;
     }
     if result.content.len() <= SPILLOVER_THRESHOLD_BYTES {
@@ -952,6 +976,25 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner())
     }
 
+    /// Run the adaptive evidence lane directly. These cases exercise it
+    /// without the `CODEWHALE_ADAPTIVE_OUTPUT_ROUTING` process opt-in so
+    /// parallel tests keep a deterministic routing decision.
+    fn adaptive_spillover(
+        result: &mut ToolResult,
+        tool_id: &str,
+        tool_name: &str,
+        session_id: &str,
+    ) -> Option<PathBuf> {
+        apply_adaptive_evidence_inner(
+            result,
+            tool_id,
+            ArtifactSpilloverContext {
+                tool_name,
+                session_id,
+            },
+        )
+    }
+
     /// The old hint named `read_file`, which is not registered for the model
     /// at all, and otherwise pointed at routes that only reach the artifact
     /// under trust mode (see [`spillover_recovery_instruction`]), while never
@@ -1289,9 +1332,8 @@ mod tests {
         with_test_home(tmp.path(), || {
             let big = "checking crate ... error[E0425]: cannot find value\n".repeat(4_000);
             let mut result = ToolResult::success(big.clone());
-            let path =
-                apply_spillover_with_artifact(&mut result, "call-big", "exec_shell", "session-123")
-                    .expect("should spill");
+            let path = adaptive_spillover(&mut result, "call-big", "exec_shell", "session-123")
+                .expect("should spill");
 
             let session_artifact = tmp
                 .path()
@@ -1379,20 +1421,12 @@ mod tests {
             let mut success = ToolResult::success(success_raw.clone());
             let mut failure = ToolResult::error(failure_raw.clone());
 
-            let success_path = apply_spillover_with_artifact(
-                &mut success,
-                "call-success",
-                "exec_shell",
-                "session-a",
-            )
-            .expect("success evidence");
-            let failure_path = apply_spillover_with_artifact(
-                &mut failure,
-                "call-failure",
-                "mcp_fixture",
-                "session-a",
-            )
-            .expect("failure evidence");
+            let success_path =
+                adaptive_spillover(&mut success, "call-success", "exec_shell", "session-a")
+                    .expect("success evidence");
+            let failure_path =
+                adaptive_spillover(&mut failure, "call-failure", "mcp_fixture", "session-a")
+                    .expect("failure evidence");
 
             assert_ne!(success_path, failure_path);
             assert_eq!(
@@ -1416,13 +1450,9 @@ mod tests {
             assert_eq!(failure_meta["artifact_session_id"], "session-a");
 
             let mut replay = ToolResult::success(success_raw);
-            let replay_path = apply_spillover_with_artifact(
-                &mut replay,
-                "call-success",
-                "exec_shell",
-                "session-a",
-            )
-            .expect("idempotent replay");
+            let replay_path =
+                adaptive_spillover(&mut replay, "call-success", "exec_shell", "session-a")
+                    .expect("idempotent replay");
             assert_eq!(replay_path, success_path);
         });
     }
@@ -1447,7 +1477,7 @@ mod tests {
                 "publication failure tail\n".repeat(1_500),
             );
             let mut result = ToolResult::error(raw.clone());
-            let path = apply_spillover_with_artifact(
+            let path = adaptive_spillover(
                 &mut result,
                 "call-failed-publish",
                 "mcp_fixture",
@@ -1494,7 +1524,7 @@ mod tests {
                 "metadata failure tail\n".repeat(1_500),
             );
             let mut result = ToolResult::success(raw.clone());
-            let path = apply_spillover_with_artifact(
+            let path = adaptive_spillover(
                 &mut result,
                 "call-failed-metadata",
                 "exec_shell",
@@ -1647,12 +1677,8 @@ mod tests {
             let raw = "mid\n".repeat(7_500);
             assert_eq!(raw.len(), 30_000);
             let mut result = ToolResult::success(raw.clone());
-            let path = apply_spillover_with_artifact(
-                &mut result,
-                "call-covered",
-                "exec_shell",
-                "session-covered",
-            );
+            let path =
+                adaptive_spillover(&mut result, "call-covered", "exec_shell", "session-covered");
             assert!(path.is_none(), "no artifact when nothing is omitted");
             assert_eq!(result.content, raw);
             assert!(!result.content.contains("of output omitted"));
@@ -1673,13 +1699,9 @@ mod tests {
             let raw = "entry\n".repeat(20_000);
             assert_eq!(raw.len(), 120_000);
             let mut result = ToolResult::success(raw);
-            let path = apply_spillover_with_artifact(
-                &mut result,
-                "call-honest",
-                "exec_shell",
-                "session-honest",
-            )
-            .expect("should spill");
+            let path =
+                adaptive_spillover(&mut result, "call-honest", "exec_shell", "session-honest")
+                    .expect("should spill");
 
             // Footer: omitted size + line count, artifact path, recovery line.
             assert!(result.content.contains("of output omitted ("));
@@ -1698,6 +1720,42 @@ mod tests {
             let metadata = result.metadata.expect("metadata stamped");
             assert_eq!(metadata["retained_head_bytes"], 16 * 1024);
             assert_eq!(metadata["retained_tail_bytes"], 4 * 1024);
+        });
+    }
+
+    #[test]
+    fn apply_spillover_with_artifact_defaults_to_classic_head_tail_spillover() {
+        // 120_000 bytes exceeds the 100 KiB classic threshold. Without the
+        // `CODEWHALE_ADAPTIVE_OUTPUT_ROUTING` opt-in the public entry point
+        // keeps a 32 KiB head + 8 KiB tail and writes the session artifact —
+        // the adaptive handle-only windows and evidence metadata are opt-in.
+        let _g = setup();
+        let tmp = tempdir().unwrap();
+        with_test_home(tmp.path(), || {
+            let raw = "entry\n".repeat(20_000);
+            assert_eq!(raw.len(), 120_000);
+            let mut result = ToolResult::success(raw.clone());
+            let path = apply_spillover_with_artifact(
+                &mut result,
+                "call-classic",
+                "exec_shell",
+                "session-classic",
+            )
+            .expect("should spill");
+
+            let metadata = result.metadata.expect("metadata stamped");
+            assert_eq!(metadata["retained_head_bytes"], 32 * 1024);
+            assert_eq!(metadata["retained_tail_bytes"], 8 * 1024);
+            assert!(result.content.contains(SPILLOVER_RECOVERY_HINT));
+            assert!(
+                !tmp.path()
+                    .join(
+                        ".codewhale/sessions/session-classic/artifacts/art_call-classic.evidence.json"
+                    )
+                    .exists(),
+                "classic lane publishes no adaptive evidence metadata"
+            );
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), raw);
         });
     }
 }

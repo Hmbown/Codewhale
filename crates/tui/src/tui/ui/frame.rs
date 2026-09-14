@@ -33,6 +33,30 @@ pub(crate) fn session_cost_label(app: &App) -> String {
     .unwrap_or_default()
 }
 
+/// The clock-dependent billing tier of the active route, when the route has
+/// one: DeepSeek's V4 Pro/Flash and Flash halve their rates off-peak. `None`
+/// for flat-priced routes, for other vendors, and while auto routing has not
+/// pinned a concrete model.
+pub(crate) fn billing_tier_label(app: &App, now: chrono::DateTime<chrono::Utc>) -> Option<String> {
+    use crate::config::ApiProvider;
+    use codewhale_localization::{MessageId, tr};
+    if app.auto_model
+        || !matches!(
+            app.api_provider.catalog_identity(),
+            ApiProvider::Deepseek | ApiProvider::DeepseekCN
+        )
+    {
+        return None;
+    }
+    let peak = crate::pricing::deepseek_time_tier(&app.model, now)?;
+    let id = if peak {
+        MessageId::InfoLinePeak
+    } else {
+        MessageId::InfoLineOffPeak
+    };
+    Some(tr(app.ui_locale, id).into_owned())
+}
+
 /// Output tokens for the metrics line: the live stream's running estimate,
 /// else the last turn's provider receipt. Request throughput is independently
 /// sourced from SessionMetrics, so a long tool call cannot lower that rate.
@@ -65,6 +89,49 @@ pub(crate) fn info_segments(app: &App, width: u16) -> Vec<InfoSegment> {
     let mut segments = Vec::new();
     let tier = crate::tui::underwater::ShellTier::for_chrome_width(width);
     let shows = |item: StatusItem| app.status_items.contains(&item);
+
+    // Where this session writes (#6112): the workspace leaf and the branch
+    // the next commit lands on. Both read cached state only — the branch
+    // comes from `app.workspace_context`, refreshed off the render path on
+    // the workspace-context TTL, so neither chip costs IO per frame. They
+    // lead the row: identity of place before identity of route. The branch
+    // chip degrades to absent outside a repository rather than printing a
+    // permanent dash.
+    if shows(StatusItem::Workspace) {
+        let name = crate::tui::workspace_context::status_workspace_name(
+            &app.workspace,
+            app.workspace_is_linked_worktree,
+        );
+        segments.push(InfoSegment::new(
+            InfoSegmentId::Workspace,
+            "",
+            crate::tui::workspace_context::truncate_left(
+                &name,
+                crate::tui::workspace_context::STATUS_CHIP_MAX_WIDTH,
+            ),
+            ChromeInk::MetadataValue,
+        ));
+    }
+    if shows(StatusItem::GitBranch)
+        && let Some(branch) = app
+            .workspace_context
+            .as_deref()
+            .and_then(crate::tui::workspace_context::branch_from_context)
+    {
+        segments.push(InfoSegment::new(
+            InfoSegmentId::GitBranch,
+            "",
+            crate::tui::workspace_context::truncate_left(
+                &if app.workspace_is_linked_worktree {
+                    format!("{branch} (wt)")
+                } else {
+                    branch.to_string()
+                },
+                crate::tui::workspace_context::STATUS_CHIP_MAX_WIDTH,
+            ),
+            ChromeInk::MetadataValue,
+        ));
+    }
 
     // Route identity — the old identity band's fact, same shed discipline:
     // provider first, then effort, whole names or none. When no model is
@@ -116,8 +183,12 @@ pub(crate) fn info_segments(app: &App, width: u16) -> Vec<InfoSegment> {
             InfoSegmentId::Context,
             app.tr(MessageId::InfoLineContext).as_ref(),
             format!("{pct}%"),
+            // The posture bar one row above calls this exact threshold
+            // `ChromeInk::Attention` (`phase_strip::at_context_cap`, also >= 80).
+            // One condition, one family: a full context is consequential, not a
+            // failure — the next turn still runs and `/compact` is the remedy.
             if pct >= 80 {
-                ChromeInk::Failure
+                ChromeInk::Attention
             } else {
                 ChromeInk::Info
             },
@@ -160,6 +231,21 @@ pub(crate) fn info_segments(app: &App, width: u16) -> Vec<InfoSegment> {
             InfoSegmentId::Cost,
             "",
             cost,
+            ChromeInk::MetadataValue,
+        ));
+    }
+
+    // DeepSeek bills by the clock: the same flag that halves the rates
+    // off-peak is painted beside the cost, so the operator can see which tier
+    // the next turn buys without opening /cost. Gated on the cost item, whose
+    // owner asked for price readings by name.
+    if shows(StatusItem::Cost)
+        && let Some(tier) = billing_tier_label(app, chrono::Utc::now())
+    {
+        segments.push(InfoSegment::new(
+            InfoSegmentId::BillingTier,
+            "",
+            tier,
             ChromeInk::MetadataValue,
         ));
     }
@@ -337,12 +423,25 @@ fn split_route_hitbox(
 /// recorded for hover (this frame's highlight resolves against the previous
 /// frame's rects, the standard one-frame-lag registry pattern) and for typed
 /// click routing.
-fn render_info_row(f: &mut Frame, app: &mut App, area: Rect) -> InfoLineInteractionHitboxes {
+fn render_info_row(
+    f: &mut Frame,
+    app: &mut App,
+    area: Rect,
+    identity_only: bool,
+) -> InfoLineInteractionHitboxes {
     if area.height == 0 {
         app.viewport.last_infoline_hitboxes.clear();
         return InfoLineInteractionHitboxes::default();
     }
-    let segments = info_segments(app, area.width);
+    let mut segments = info_segments(app, area.width);
+    if identity_only {
+        segments.retain(|segment| {
+            matches!(
+                segment.id,
+                InfoSegmentId::Model | InfoSegmentId::Workspace | InfoSegmentId::GitBranch
+            )
+        });
+    }
     let hovered = app.last_mouse_pos.and_then(|(mx, my)| {
         app.viewport
             .last_infoline_hitboxes
@@ -547,6 +646,9 @@ fn register_info_interaction_targets(app: &mut App, hitboxes: InfoLineInteractio
             Some(crate::tui::tideline::InteractionAction::ShowDockPanel(panel)) => {
                 panel.title().to_string()
             }
+            Some(crate::tui::tideline::InteractionAction::OpenAutomations) => {
+                "/automation".to_string()
+            }
             Some(crate::tui::tideline::InteractionAction::DismissDock) => {
                 codewhale_localization::tr(
                     app.ui_locale,
@@ -567,18 +669,17 @@ fn register_info_interaction_targets(app: &mut App, hitboxes: InfoLineInteractio
 
 /// The posture bar's live counts are the bottom-of-screen way into the
 /// dock: each one opens the view it counts (agents → AGENTS, shells / tasks
-/// / automations → BACKGROUND, the idle `todo` word → TODO). Same
-/// `ShowDockPanel` action the strip's own tabs use.
+/// → BACKGROUND, automations → their own view, the idle `todo` word → TODO).
+/// Dock destinations use the same `ShowDockPanel` action as the strip's tabs.
 fn register_footer_count_targets(
     app: &mut App,
     facts: &crate::tui::phase_strip::TidelineFooterFacts,
     count_rects: &[(usize, Rect)],
 ) {
     for (index, area) in count_rects {
-        let Some(panel) = facts.count_panels.get(*index).copied() else {
+        let Some(action) = facts.count_actions.get(*index).copied() else {
             continue;
         };
-        let action = crate::tui::tideline::InteractionAction::ShowDockPanel(panel);
         app.viewport
             .interaction_targets
             .register(crate::tui::tideline::InteractionTarget {
@@ -965,9 +1066,10 @@ pub(crate) fn build_session_snapshot(
         })?,
     };
     let mut session = if let Some(existing_id) = app.current_session_id.as_ref() {
-        create_saved_session_with_id_and_mode(
+        crate::session_manager::create_saved_session_with_id_mode_and_stamps(
             existing_id.clone(),
             &app.api_messages,
+            &app.api_message_stamps,
             &model,
             &app.workspace,
             u64::from(app.session.total_tokens),
@@ -975,8 +1077,10 @@ pub(crate) fn build_session_snapshot(
             Some(app.mode.as_setting()),
         )
     } else {
-        create_saved_session_with_mode(
+        crate::session_manager::create_saved_session_with_id_mode_and_stamps(
+            uuid::Uuid::new_v4().to_string(),
             &app.api_messages,
+            &app.api_message_stamps,
             &model,
             &app.workspace,
             u64::from(app.session.total_tokens),
@@ -1017,7 +1121,9 @@ pub(crate) fn build_session_snapshot(
             .metadata
             .runtime_store
             .as_ref()
-            .is_some_and(|saved| saved != &binding)
+            .is_some_and(|saved| {
+                saved != &binding && !saved.is_missing_session_store().unwrap_or(false)
+            })
         {
             return Err(
                 "session snapshot refused to replace its saved Runtime store ownership".into(),
@@ -1299,14 +1405,10 @@ pub(crate) fn build_pending_input_preview(app: &App) -> PendingInputPreview {
 
 pub(crate) fn render(f: &mut Frame, app: &mut App, _config: &Config) -> Option<(u16, u16)> {
     let size = f.area();
-    // The sixel block is re-reserved by the launch paint below when the
-    // sixel tier is active; resetting first means any other screen (or a
-    // dissolved card) reads as "no block" and the reconciler clears a
-    // stranded image instead of re-emitting it.
-    app.launch.sixel_mark_area = None;
     // Hover targets belong to the whole composed frame. Resetting inside the
     // transcript erased targets registered later by the composer and modals.
     crate::tui::hover_layer::begin_frame();
+    app.pet_watch.prepare_frame();
     let shell_area = session_shell_area(size);
     // Keep the view stack's focus-context texture prototype (#4823) in step
     // with the parsed setting each frame: a plain enum/theme copy, no
@@ -1314,7 +1416,7 @@ pub(crate) fn render(f: &mut Frame, app: &mut App, _config: &Config) -> Option<(
     app.view_stack
         .set_focus_texture(app.focus_texture, app.ui_theme);
     app.sidebar_hover = crate::tui::app::SidebarHoverState::default();
-    app.viewport.last_approval_area = None;
+    app.viewport.last_prompt_area = None;
     app.viewport.interaction_targets.clear();
     // Keep the OSC-0 whale title truthful to the current shell phase so
     // alt-tabbed sessions communicate state without a second in-app spinner.
@@ -1353,6 +1455,10 @@ pub(crate) fn render(f: &mut Frame, app: &mut App, _config: &Config) -> Option<(
         crate::tui::redaction_gate::render(f, size, app);
         return None;
     }
+    if app.view_stack.top_kind() == Some(crate::tui::views::ModalKind::PetHabitat) {
+        crate::tui::pet_watch::render_full(f, app);
+        return None;
+    }
 
     // Mini-window mode: when the host terminal window is pinned into its
     // small always-on-top form, hide the shell chrome and keep only what the
@@ -1365,7 +1471,14 @@ pub(crate) fn render(f: &mut Frame, app: &mut App, _config: &Config) -> Option<(
     // it to the bottom (SHELL-DESIGN-20260901 §2.0) so scrolling up reads as
     // intentional. `keep_header` still governs it in mini mode — the row it
     // names moved, not the preference.
+    // Evaluate the fully-idle predicate exactly once per frame. It decides
+    // how many rows the rail may reserve and whether the idle ocean draws
+    // its brand mark (in ChatWidget); calling it twice would let the
+    // reservation and the render disagree inside a single frame.
+    let idle_empty = crate::tui::widgets::should_render_empty_state(app);
     // `tui.metrics_line = "hidden"` gives the row to the transcript (#5950).
+    // The empty shell keeps route identity visible; render_info_row omits
+    // session readings until a conversation exists.
     let info_height = if (mini && !mini_cfg.keep_header)
         || app.metrics_line == crate::config::ChromeRowPreset::Hidden
     {
@@ -1373,11 +1486,6 @@ pub(crate) fn render(f: &mut Frame, app: &mut App, _config: &Config) -> Option<(
     } else {
         info_row_height_for(size.height)
     };
-    // Evaluate the fully-idle predicate exactly once per frame. It decides
-    // how many rows the rail may reserve and whether the idle ocean draws
-    // its brand mark (in ChatWidget); calling it twice would let the
-    // reservation and the render disagree inside a single frame.
-    let idle_empty = crate::tui::widgets::should_render_empty_state(app);
     // The merged Tideline footer is the single bottom row (spec §3: slots
     // 6+8 collapsed; §5b `Constraint::Length(1)`): phase·cost·posture on the
     // left, depth·keys on the right. It hides with the rest of the footer
@@ -1533,12 +1641,31 @@ pub(crate) fn render(f: &mut Frame, app: &mut App, _config: &Config) -> Option<(
     let footer_slot = 6;
     let info_slot = 7;
 
+    if matches!(
+        app.view_stack.top_kind(),
+        Some(ModalKind::Approval | ModalKind::UserInput)
+    ) {
+        app.viewport.last_prompt_area = app.view_stack.top_occupied_region(size);
+    }
+    // Bottom prompts cover part of the ordinary chat slot. Resolve scrolling
+    // against the rows that remain visible, or End leaves the newest content
+    // underneath the prompt and PageUp counts rows the user cannot see.
+    let mut visible_chat_area = body_chunks[1];
+    if let Some(prompt) = app.viewport.last_prompt_area {
+        visible_chat_area.height = visible_chat_area
+            .height
+            .min(prompt.y.saturating_sub(visible_chat_area.y));
+    }
     let (work_chat_area, side_work_area) = if mini && !mini_cfg.keep_sidebar {
         // Mini mode without the side rail: the transcript takes the whole
         // chat row. split_chat is skipped so the rail never reserves columns.
-        (body_chunks[1], None)
+        (visible_chat_area, None)
     } else {
-        crate::tui::work_surface::split_chat(app, body_chunks[1], rail_min_chat_width(idle_empty))
+        crate::tui::work_surface::split_chat(
+            app,
+            visible_chat_area,
+            rail_min_chat_width(idle_empty),
+        )
     };
 
     if top_work_strip_height > 0 {
@@ -1615,8 +1742,13 @@ pub(crate) fn render(f: &mut Frame, app: &mut App, _config: &Config) -> Option<(
         }
         // The launch card's rows are clickable where they painted. The row
         // offsets come from the same builder that produced the lines, so a
-        // hitbox cannot describe a row the transcript did not draw.
-        if app.launch.visible {
+        // hitbox cannot describe a row the transcript did not draw — and a
+        // fully dissolved card painted nothing this frame, so it owns no
+        // rows either.
+        if app.launch.card_paintable(
+            app.ambient_clock_ms,
+            app.motion_policy().allows_decorative(),
+        ) {
             crate::tui::underwater::refresh_launch_row_hitboxes(app, chat_area);
         } else if !app.launch.row_hitboxes.is_empty() {
             app.launch.row_hitboxes.clear();
@@ -1747,7 +1879,7 @@ pub(crate) fn render(f: &mut Frame, app: &mut App, _config: &Config) -> Option<(
     // cost · ttft · tok/s · ↓ tokens, with the help hint pinned right.
     let mut info_interactions = InfoLineInteractionHitboxes::default();
     if info_height > 0 {
-        info_interactions = render_info_row(f, app, body_chunks[info_slot]);
+        info_interactions = render_info_row(f, app, body_chunks[info_slot], idle_empty);
     } else {
         app.viewport.last_infoline_hitboxes.clear();
     }
@@ -1813,9 +1945,6 @@ pub(crate) fn render(f: &mut Frame, app: &mut App, _config: &Config) -> Option<(
         } else if app.view_stack.top_kind() == Some(ModalKind::ContextInspector) {
             refresh_context_inspector_overlay(app);
         }
-        if app.view_stack.top_kind() == Some(ModalKind::Approval) {
-            app.viewport.last_approval_area = app.view_stack.top_occupied_region(size);
-        }
         let buf = f.buffer_mut();
         app.view_stack.render(size, buf);
     }
@@ -1864,63 +1993,6 @@ pub(super) fn finish_frame_cursor<B: ratatui::backend::Backend>(
 ///
 /// When `full_repaint` is false, only the diff from the previous draw is
 /// written (normal incremental update path).
-/// Reconcile the sixel tier's live image with this frame's reservation, in
-/// the frame's own synchronized update so the pixels land atomically with
-/// the cells around them. Steady state (same block as last frame) emits no
-/// bytes at all: ratatui never rewrites the reserved blank cells, so the
-/// image survives redraws untouched. A move clears the old block first;
-/// a tier exit clears and stops. Write errors are logged, never fatal —
-/// the blank block simply stays blank until the next frame retries.
-pub(crate) fn reconcile_launch_sixel(writer: &mut impl std::io::Write, app: &mut App) {
-    use crate::tui::mark;
-    let field_bg = mark::sixel_field_bg(&app.ui_theme, app.launch.sixel_terminal_bg);
-    // Fullscreen stage coordinates already are screen cells (both 0-based;
-    // the 1-based CUP shift happens in the sequence builders). Inline
-    // viewports have no stable origin, so the tier never reserves there
-    // and this maps nothing.
-    let want = if mark::sixel_graphics_supported() && app.use_alt_screen() && field_bg.is_some() {
-        app.launch.sixel_mark_area
-    } else {
-        None
-    };
-    if want == app.launch.sixel_emitted {
-        return;
-    }
-    let Some(bg) = field_bg else {
-        // No exact field colour to paint with: hold the current image and
-        // retry next frame rather than flashing a wrong background.
-        tracing::debug!(target: "sixel_graphics", "no RGB field; holding sixel state");
-        return;
-    };
-    if let Some(old) = app.launch.sixel_emitted {
-        let bytes = mark::sixel_clear_sequence(old, bg);
-        if writer.write_all(&bytes).is_err() {
-            tracing::debug!(target: "sixel_graphics", "sixel clear failed");
-            return;
-        }
-        app.launch.sixel_emitted = None;
-    }
-    if let Some(block) = want {
-        let sequence = app
-            .launch
-            .sixel_cell_px
-            .and_then(|cell_px| mark::sixel_mark_sequence(bg, cell_px));
-        if let Some(sequence) = sequence {
-            let bytes = mark::sixel_positioned_sequence(block, &sequence);
-            if writer.write_all(&bytes).is_err() {
-                tracing::debug!(target: "sixel_graphics", "sixel emission failed");
-                return;
-            }
-            app.launch.sixel_emitted = Some(block);
-        } else {
-            tracing::debug!(
-                target: "sixel_graphics",
-                "sixel raster unavailable; the blank block holds"
-            );
-        }
-    }
-}
-
 pub(crate) fn draw_app_frame_inner(
     terminal: &mut AppTerminal,
     app: &mut App,
@@ -1951,16 +2023,11 @@ pub(crate) fn draw_app_frame_inner(
         if full_repaint {
             terminal.backend_mut().write_all(TERMINAL_ORIGIN_RESET)?;
             terminal.clear()?;
-            // A repaint wipes sixel pixels with everything else; forget the
-            // live image so the reconciler below re-emits it this frame.
-            app.launch.sixel_emitted = None;
         }
         let mut cursor_pos = None;
         terminal.draw(|f| cursor_pos = render(f, app, config))?;
+        app.pet_watch.present(terminal.backend_mut())?;
         finish_frame_cursor(terminal, cursor_pos)?;
-        // Inside the synchronized update: the pixels land atomically with
-        // the cells. Steady state emits nothing.
-        reconcile_launch_sixel(terminal.backend_mut(), app);
         Ok(())
     })();
 
@@ -2214,7 +2281,7 @@ mod tests {
         terminal
             .draw(|frame| {
                 let area = frame.area();
-                let hitboxes = render_info_row(frame, &mut app, area);
+                let hitboxes = render_info_row(frame, &mut app, area, false);
                 register_info_interaction_targets(&mut app, hitboxes);
             })
             .expect("info line should render");
@@ -2394,7 +2461,7 @@ mod tests {
         for (pct, expected) in [
             (10u8, codewhale_palette::ChromeInk::Info),
             (79, codewhale_palette::ChromeInk::Info),
-            (80, codewhale_palette::ChromeInk::Failure),
+            (80, codewhale_palette::ChromeInk::Attention),
         ] {
             let app = app_with_context_percent(pct);
             let segment = super::info_segments(&app, 160)
@@ -2501,6 +2568,56 @@ mod tests {
                 .any(|field| field.kind == RouteFieldKind::Effort && field.text == label),
             "{fields:?}"
         );
+    }
+
+    /// DeepSeek's clock-tiered routes show which tier the next turn buys,
+    /// beside the cost; flat routes and other vendors show nothing.
+    #[test]
+    fn deepseek_tiered_routes_paint_the_billing_tier_beside_the_cost() {
+        use crate::config::ApiProvider;
+        use chrono::TimeZone as _;
+        let mut app = app_with_context_percent(10);
+        app.auto_model = false;
+        app.api_provider = ApiProvider::Deepseek;
+        app.model = "deepseek-v4-flash".to_string();
+        // Wednesday 2026-09-16: 02:00Z is inside the 01:00-04:00 peak
+        // window, 12:00Z outside every window.
+        let peak = chrono::Utc.with_ymd_and_hms(2026, 9, 16, 2, 0, 0).unwrap();
+        let off = chrono::Utc.with_ymd_and_hms(2026, 9, 16, 12, 0, 0).unwrap();
+        assert_eq!(
+            super::billing_tier_label(&app, peak).as_deref(),
+            Some("peak")
+        );
+        assert_eq!(
+            super::billing_tier_label(&app, off).as_deref(),
+            Some("off-peak")
+        );
+        let ids: Vec<InfoSegmentId> = super::info_segments(&app, 200)
+            .iter()
+            .map(|segment| segment.id)
+            .collect();
+        assert!(ids.contains(&InfoSegmentId::BillingTier), "{ids:?}");
+        let row = metrics_row(&app, 200);
+        assert!(row.contains("peak"), "the tier reads in the row: {row:?}");
+
+        // A flat-priced DeepSeek model has no tier to show.
+        app.model = "deepseek-chat".to_string();
+        assert_eq!(super::billing_tier_label(&app, peak), None);
+        let ids: Vec<InfoSegmentId> = super::info_segments(&app, 200)
+            .iter()
+            .map(|segment| segment.id)
+            .collect();
+        assert!(!ids.contains(&InfoSegmentId::BillingTier), "{ids:?}");
+
+        // Another vendor serving a DeepSeek id is priced on its own terms.
+        app.model = "deepseek-v4-flash".to_string();
+        app.api_provider = ApiProvider::Openai;
+        assert_eq!(super::billing_tier_label(&app, peak), None);
+
+        // Auto routing has not pinned a model, so there is nothing to claim.
+        app.api_provider = ApiProvider::Deepseek;
+        app.auto_model = true;
+        assert_eq!(super::billing_tier_label(&app, peak), None);
     }
 
     /// A provider switch must not hide missing historical coverage.
@@ -2617,6 +2734,7 @@ mod tests {
             granted_balance: String::new(),
         });
         app.status_items = StatusItem::all().to_vec();
+        app.workspace_context = Some("main | clean".to_string());
 
         let ids: Vec<InfoSegmentId> = super::info_segments(&app, 200)
             .iter()
@@ -2629,6 +2747,8 @@ mod tests {
             InfoSegmentId::Ttft,
             InfoSegmentId::Rate,
             InfoSegmentId::OutputTokens,
+            InfoSegmentId::Workspace,
+            InfoSegmentId::GitBranch,
         ] {
             assert!(ids.contains(&expected), "{expected:?} missing from {ids:?}");
         }
@@ -2638,6 +2758,78 @@ mod tests {
             super::info_segments(&app, 200).is_empty(),
             "an empty status list leaves the metrics line empty"
         );
+    }
+
+    #[test]
+    fn empty_session_keeps_opted_in_workspace_identity_visible() {
+        let mut app = app_with_context_percent(0);
+        app.workspace = std::path::PathBuf::from("/fixture/checkout");
+        app.workspace_context = Some("feature-6112 | clean".to_string());
+        app.status_items = vec![StatusItem::Workspace, StatusItem::GitBranch];
+        app.metrics_line = crate::config::ChromeRowPreset::Compact;
+        let backend = ratatui::backend::TestBackend::new(100, 1);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                super::render_info_row(frame, &mut app, area, true);
+            })
+            .unwrap();
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(rendered.contains("checkout"), "{rendered}");
+        assert!(rendered.contains("feature-6112"), "{rendered}");
+    }
+
+    /// #6112: the opt-in workspace and branch chips read cached state only —
+    /// the workspace path and the TTL-refreshed `workspace_context` string —
+    /// so neither costs IO per frame. Outside a repository the branch chip
+    /// degrades to absent rather than pinning a placeholder dash.
+    #[test]
+    fn workspace_and_git_branch_chips_follow_cached_workspace_context() {
+        let mut app = app_with_context_percent(60);
+        app.status_items = vec![StatusItem::Workspace, StatusItem::GitBranch];
+
+        let segments = super::info_segments(&app, 200);
+        let workspace = segments
+            .iter()
+            .find(|segment| segment.id == InfoSegmentId::Workspace)
+            .expect("workspace chip renders from the workspace path alone");
+        assert_eq!(
+            workspace.value,
+            crate::tui::workspace_context::workspace_basename(&app.workspace)
+        );
+        assert!(
+            segments
+                .iter()
+                .all(|segment| segment.id != InfoSegmentId::GitBranch),
+            "outside a repository the branch chip is absent"
+        );
+
+        // A detached HEAD reads in its recorded short-SHA form.
+        app.workspace_context = Some("detached:abc1234 | clean".to_string());
+        let branch = super::info_segments(&app, 200)
+            .into_iter()
+            .find(|segment| segment.id == InfoSegmentId::GitBranch)
+            .expect("branch chip renders from cached context");
+        assert_eq!(branch.value, "detached:abc1234");
+        app.workspace_is_linked_worktree = true;
+        let linked = super::info_segments(&app, 200)
+            .into_iter()
+            .find(|segment| segment.id == InfoSegmentId::GitBranch)
+            .unwrap();
+        assert_eq!(linked.value, "detached:abc1234 (wt)");
+        assert!(!StatusItem::default_footer().contains(&StatusItem::Workspace));
+        assert!(!StatusItem::default_footer().contains(&StatusItem::GitBranch));
+
+        // Off means off.
+        app.status_items = Vec::new();
+        assert!(super::info_segments(&app, 200).is_empty());
     }
 }
 

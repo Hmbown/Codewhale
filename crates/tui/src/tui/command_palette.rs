@@ -14,7 +14,6 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Padding, Paragraph, Widget},
 };
-use unicode_width::UnicodeWidthStr;
 
 use crate::commands;
 use crate::skills;
@@ -726,10 +725,16 @@ impl CommandPaletteView {
             let entry = &self.entries[*idx];
             (section_rank(entry.section), *score, &entry.label)
         });
+        // Follow the highlighted entry across the refilter instead of leaving a
+        // raw index pointing into a freshly re-sorted list. Every keystroke
+        // refilters, so a clamp alone silently slides the highlight onto an
+        // unrelated row — and Enter runs whatever it landed on. `filtered` holds
+        // indices into the stable `entries`, so the entry is its own identity.
+        let keep = self.filtered.get(self.selected).copied();
         self.filtered = filtered.into_iter().map(|(idx, _)| idx).collect();
-        if self.selected >= self.filtered.len() {
-            self.selected = 0;
-        }
+        self.selected = keep
+            .and_then(|entry| self.filtered.iter().position(|idx| *idx == entry))
+            .unwrap_or(0);
         self.hovered.set(None);
     }
 
@@ -991,20 +996,19 @@ impl ModalView for CommandPaletteView {
                 };
 
                 let pointer = crate::tui::glyphs::selection_marker(is_selected);
-                let mut line = format!("{pointer} {:<label_width$}", entry.label);
-                let desc_capacity = popup_width as usize - (label_width + 4);
-                let desc = if entry.description.width() > desc_capacity {
-                    let mut shortened = String::new();
-                    for ch in entry.description.chars() {
-                        if shortened.width() >= desc_capacity.saturating_sub(3) {
-                            break;
-                        }
-                        shortened.push(ch);
-                    }
-                    format!("{shortened}...")
-                } else {
-                    entry.description.clone()
-                };
+                // `{:<width$}` pads but never truncates, so a long label — every
+                // `mcp:server:tool` row — ran past the column and pushed the
+                // description off the card entirely. Truncate first, then pad, so
+                // the description column stays on one axis.
+                let label = crate::tui::ui_text::truncate_line_to_width(&entry.label, label_width);
+                let mut line = format!("{pointer} {label:<label_width$}");
+                // The rows are drawn into `content`, which is the popup less its
+                // borders and padding — measuring against `popup_width` overstated
+                // the room by four columns.
+                let content_width = (popup_width as usize).saturating_sub(4);
+                let desc_capacity = content_width.saturating_sub(label_width + 4);
+                let desc =
+                    crate::tui::ui_text::truncate_line_to_width(&entry.description, desc_capacity);
                 line.push_str("  ");
                 line.push_str(&desc);
                 entry_line_indices.push((lines.len(), absolute));
@@ -1032,6 +1036,49 @@ mod tests {
     use super::*;
     use std::path::Path;
     use tempfile::TempDir;
+    use unicode_width::UnicodeWidthStr;
+
+    #[test]
+    fn refilter_keeps_the_highlight_on_the_entry_the_user_was_looking_at() {
+        // Every keystroke refilters and re-sorts. The index used to be clamped
+        // but never re-anchored, so refining a query could slide the highlight
+        // onto an unrelated row — and Enter runs whatever is highlighted.
+        let entries = vec![
+            palette_entry(PaletteSection::Tool, "tool:one", "alpha", "one"),
+            palette_entry(PaletteSection::Tool, "tool:two", "shared", "two"),
+            palette_entry(PaletteSection::Tool, "tool:three", "shared", "three"),
+        ];
+        let mut view = CommandPaletteView::new(entries);
+
+        view.query = "tool".to_string();
+        view.refilter();
+        view.selected = view
+            .filtered
+            .iter()
+            .position(|idx| view.entries[*idx].label == "tool:three")
+            .expect("tool:three is listed");
+
+        // Narrowing to a query `tool:three` still matches. It moves to a lower
+        // index in the shorter list, which is exactly the case a clamp gets
+        // wrong: the old code reset to 0 and highlighted `tool:two`.
+        view.query = "shared".to_string();
+        view.refilter();
+        assert_eq!(
+            view.selected_entry().map(|entry| entry.label.as_str()),
+            Some("tool:three"),
+            "the highlight jumped to another row: {:?}",
+            view.selected_entry().map(|entry| entry.label.clone())
+        );
+
+        // When the highlighted entry filters out entirely, fall back to the top
+        // rather than to a stale index.
+        view.query = "alpha".to_string();
+        view.refilter();
+        assert_eq!(
+            view.selected_entry().map(|entry| entry.label.as_str()),
+            Some("tool:one")
+        );
+    }
 
     #[test]
     fn visible_window_keeps_selection_in_view_and_fits() {

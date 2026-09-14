@@ -1952,12 +1952,6 @@ impl FleetSetupView {
         // Compact tier: keep the choice, the file, and the consequence; drop
         // the long explanation rather than clip the file line off-screen.
         let compact = area.height < 12;
-        let workspace_name = self
-            .snapshot
-            .workspace
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| self.snapshot.workspace.display().to_string());
         let choices: Vec<Choice> = DESTINATION_ORDER
             .iter()
             .map(|scope| {
@@ -1983,7 +1977,7 @@ impl FleetSetupView {
                     description: if compact {
                         Cow::Borrowed("")
                     } else {
-                        Cow::Owned(tr(locale, description).replace("{workspace}", &workspace_name))
+                        tr(locale, description)
                     },
                 }
             })

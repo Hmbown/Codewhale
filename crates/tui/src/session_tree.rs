@@ -149,7 +149,15 @@ impl SessionJournal {
         }
     }
     pub fn append(&mut self, kind: SessionEntryKind) -> EntryId {
-        let entry = SessionEntry::new(kind, self.leaf_id.clone(), self.spawn_depth);
+        self.append_stamped(kind, Utc::now())
+    }
+    /// Append an entry carrying the time the underlying event happened, not
+    /// the time the save ran. `created_at` is the journal's timeline; stamping
+    /// it at append is what keeps a rebuilt journal honest — a save must never
+    /// rewrite an entry's time to the moment it was written.
+    pub fn append_stamped(&mut self, kind: SessionEntryKind, created_at: DateTime<Utc>) -> EntryId {
+        let mut entry = SessionEntry::new(kind, self.leaf_id.clone(), self.spawn_depth);
+        entry.created_at = created_at;
         let id = entry.id.clone();
         self.entries.push(entry);
         self.leaf_id = Some(id.clone());
@@ -293,6 +301,22 @@ impl SessionJournal {
         let mut j = Self::with_spawn_depth(spawn_depth);
         for msg in messages {
             j.append(SessionEntryKind::Message { message: msg });
+        }
+        j
+    }
+    /// Build the journal honoring a per-message append stamp. `stamps[i]` is
+    /// the time `messages[i]` entered the conversation; a missing stamp falls
+    /// back to now, so a drifted caller degrades to save-time ordering rather
+    /// than dropping the message.
+    pub fn from_messages_stamped(
+        messages: Vec<Message>,
+        stamps: &[DateTime<Utc>],
+        spawn_depth: u32,
+    ) -> Self {
+        let mut j = Self::with_spawn_depth(spawn_depth);
+        for (index, msg) in messages.into_iter().enumerate() {
+            let created_at = stamps.get(index).copied().unwrap_or_else(Utc::now);
+            j.append_stamped(SessionEntryKind::Message { message: msg }, created_at);
         }
         j
     }

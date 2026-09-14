@@ -3,6 +3,10 @@
 //! The JS VM stays in `codewhale-workflow-js`; this module supplies the TUI
 //! driver that turns each `task(...)` call into a real `SubAgentManager` spawn.
 
+mod plan_schema;
+#[cfg(test)]
+mod shortlist_tests;
+
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -14,23 +18,24 @@ use codewhale_workflow::{
     AgentType, BranchResult, BranchSpec, BudgetSpec, ControlNodeKind, ControlNodeResult,
     FleetRoleMap, GateKind, GateOn, GateOutcome, GateSpec, GateState, GateStatusLine,
     HandoffArtifact, LaneGateBoard, LeafResult, LeafSpec, ReduceSpec, SequenceSpec, TaskMode,
-    WorkflowExecution as IrWorkflowExecution, WorkflowMemoUsage, WorkflowNode,
+    WorkflowExecution as IrWorkflowExecution, WorkflowFleetLimits, WorkflowMemoUsage, WorkflowNode,
     WorkflowRunStatus as IrWorkflowRunStatus, WorkflowSpec, WorkflowUsage,
     compile_javascript_workflow, compile_typescript_workflow, leaf_wants_worktree,
     resolve_workflow_agent,
 };
 use codewhale_workflow_js::{
     BudgetSnapshot, DriverError, ProgressEvent, SCHEMA_RAW_PREVIEW_CHARS, SpawnedTask,
-    TaskCompletion, TaskRequest, WORKFLOW_MAX_CONCURRENT, WorkflowDriver, WorkflowRunCancel,
-    WorkflowVm,
+    TaskCompletion, TaskRequest, WORKFLOW_LIFETIME_CAP, WORKFLOW_MAX_CONCURRENT, WorkflowDriver,
+    WorkflowRunCancel, WorkflowVm,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::core::events::Event;
-use crate::fleet::role::public_role_label;
+use crate::fleet::role::{FleetRole, public_role_label};
 use crate::tools::spec::{
     ApprovalRequirement, ToolCapability, ToolContext, ToolError, ToolResult, ToolSpec,
     optional_bool, optional_str, optional_u64,
@@ -74,6 +79,7 @@ const WORKFLOW_RESULT_VALUE_MAX_CHARS: usize = 4_000;
 /// receipt; full child output stays retrievable via the worker ledger and
 /// the journal.
 const WORKFLOW_RESULT_LEAF_OUTPUT_MAX_CHARS: usize = 500;
+const WORKFLOW_COMPLETION_MAX_BYTES: usize = 8 * 1024;
 /// Stated upper bound for a bounded model-facing run-record payload; the
 /// payload tests assert every `start`/`run`/`status` result stays below it.
 const WORKFLOW_RESULT_MAX_CHARS: usize = 24_000;
@@ -249,6 +255,8 @@ struct WorkflowRunController {
     driver: Arc<SubAgentWorkflowDriver>,
     vm_cancel: WorkflowRunCancel,
     run_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Only detached starts wake the parent; `run` already returns the result.
+    parent_completion_tx: Option<mpsc::UnboundedSender<SubAgentCompletion>>,
 }
 
 impl WorkflowRunController {
@@ -257,7 +265,15 @@ impl WorkflowRunController {
             driver,
             vm_cancel,
             run_handle: Mutex::new(None),
+            parent_completion_tx: None,
         }
+    }
+
+    fn with_parent_completion(mut self, detached: bool) -> Self {
+        if detached {
+            self.parent_completion_tx = self.driver.runtime.parent_completion_tx.clone();
+        }
+        self
     }
 
     fn set_run_handle(&self, handle: tokio::task::JoinHandle<()>) {
@@ -276,6 +292,85 @@ impl WorkflowRunController {
             handle.abort();
         }
     }
+}
+
+/// Queue the terminal receipt before releasing the live controller. The
+/// headless settlement probe observes this same map, so it cannot see an idle
+/// Workflow before the receipt is in the existing Engine completion inbox.
+fn finish_workflow_controller(state: &WorkflowWorkspaceState, record: &WorkflowRunRecord) {
+    let mut controllers = state
+        .controllers
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    if let Some(controller) = controllers.get(&record.run_id)
+        && let Some(tx) = &controller.parent_completion_tx
+    {
+        // A racing explicit cancel is authoritative even if the VM captured
+        // its successful snapshot just before the cancellation was recorded.
+        let cancelled = state
+            .runs
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .get(&record.run_id)
+            .filter(|current| current.status == WorkflowRunStatus::Cancelled)
+            .cloned();
+        let record = cancelled.as_ref().unwrap_or(record);
+        let receipt = json!({
+            "event": if record.status == WorkflowRunStatus::Completed {
+                "workflow.completed"
+            } else {
+                "workflow.failed"
+            },
+            "agent_id": truncate_chars(&record.run_id, 64),
+            "agent_type": "workflow",
+            "run_id": truncate_chars(&record.run_id, 64),
+            "status": record.status,
+            "child_count": record.child_ids.len(),
+            "detail": { "tool": "workflow", "action": "status", "run_id": truncate_chars(&record.run_id, 64) },
+        });
+        let mut summary = format!(
+            "Workflow {} ended {:?}.",
+            truncate_chars(&record.run_id, 64),
+            record.status
+        );
+        if let Some(goal) = &record.workflow_goal {
+            summary.push_str(&format!("\nGoal: {}", truncate_chars(goal, 160)));
+        }
+        if let Some(error) = &record.error {
+            summary.push_str(&format!("\nError: {}", truncate_chars(error, 512)));
+        }
+        if let Some(result) = &record.result {
+            summary.push_str(&format!(
+                "\nResult preview: {}",
+                truncate_chars(&result.to_string(), 512)
+            ));
+        }
+        summary.push_str("\nInspect the recorded result and evidence before summarizing the outcome and remaining work.");
+        let payload =
+            format!("{summary}\n<codewhale:subagent.done>{receipt}</codewhale:subagent.done>");
+        debug_assert!(payload.len() <= WORKFLOW_COMPLETION_MAX_BYTES);
+        let _ = tx.send(SubAgentCompletion {
+            owner_session_id: controller.driver.owner_session_id.clone(),
+            agent_id: record.run_id.clone(),
+            payload,
+        });
+    }
+    controllers.remove(&record.run_id);
+}
+
+/// Active controllers, including gaps between child phases. This reads only
+/// existing live state and never hydrates a journal or creates a workspace.
+pub(crate) fn live_workflow_count(workspace: &Path, owner_session_id: &str) -> usize {
+    let Some(state) = peek_shared_workflow_state(workspace) else {
+        return 0;
+    };
+    state
+        .controllers
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .values()
+        .filter(|controller| controller.driver.owner_session_id == owner_session_id)
+        .count()
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -972,9 +1067,9 @@ impl ToolSpec for WorkflowTool {
 
     fn description(&self) -> &'static str {
         concat!(
-            "Start, run, inspect, or cancel a Workflow. Workflows execute deterministic JS with args, phase/log progress, and task(...) calls that dispatch real sub-agents through Fleet/sub-agent scheduling. ",
-            "For parallel fan-out, pass an array of zero-argument thunks exactly like `await parallel([() => task({...}), () => task({...})])`; do not pass task promises as variadic arguments. ",
-            "Provide exactly one of script, source_path, or plan (structured planner JSON). ",
+            "Run named steps through the existing sub-agents with a structured plan, ordered phases, shared budgets and result handoffs. Fleet configures those same sub-agents and roles. ",
+            "Inspect agent(action=\"roster\") before assigning steps; choose saved models or role/profile assignments and respect unavailable routes. ",
+            "Prefer plan for multi-step work. Saved or advanced workflows can use script/source_path; provide exactly one input form. ",
             "Use action=start for detached orchestration and action=status with run_id to inspect progress. Use action=run when the model needs the final result before continuing. ",
             "Start a workflow on your own only for broad or staged work (the session [workflow].automatic table, default on). An explicit /workflow invocation is authorization. Do not start a workflow for one-file edits or simple questions."
         )
@@ -1005,10 +1100,7 @@ impl ToolSpec for WorkflowTool {
                     "type": "string",
                     "description": "Named Fleet from $CODEWHALE_HOME/fleets/ or workspace fleets/; qualified origin/name accepted. Exact Fleets freeze member identity, route, and reasoning. Runtime derives authority from role and live parent; per-task route/authority overrides are rejected."
                 },
-                "plan": {
-                    "type": "object",
-                    "description": "Structured planner plan JSON (#4124). Alternative to script/source_path. Accepts goal, risk, max_children, token_budget, phases[], and/or children[] (or IR nodes). risk must be exactly read_only, writes, or elevated. For a child, prefer role/profile without an explicit type; do not combine a role/profile with a conflicting type. Lowered to Workflow JS with parallel() partial-success semantics."
-                },
+                "plan": plan_schema::structured_plan_schema(),
                 "args": {
                     "anyOf": [
                         { "type": "null" },
@@ -1187,10 +1279,46 @@ async fn start_workflow(
     wait: bool,
     approval_decision: &str,
 ) -> Result<ToolResult, ToolError> {
-    let source = workflow_source(&input, context)?;
+    if runtime.cancel_token.is_cancelled() {
+        return Err(ToolError::execution_failed(
+            "Workflow parent session is cancelled",
+        ));
+    }
+    let mut source = workflow_source(&input, context)?;
+    let workflow_cfg = workflow_config_for(&runtime);
+    for (name, value) in [
+        ("max_children", workflow_cfg.max_children),
+        ("max_depth", workflow_cfg.max_depth),
+        ("max_concurrent", workflow_cfg.max_concurrent),
+    ] {
+        if value == 0 {
+            return Err(ToolError::invalid_input(format!(
+                "workflow.{name} must be greater than zero"
+            )));
+        }
+    }
+    if let Some(spec) = source.spec.as_mut() {
+        validate_runtime_gates(&mut spec.gates)?;
+        spec.validate_for_fleet_with_limits(WorkflowFleetLimits {
+            max_total_agents: (workflow_cfg.max_children as usize)
+                .min(codewhale_workflow::DEFAULT_FLEET_WORKFLOW_MAX_AGENTS),
+            max_depth: (workflow_cfg.max_depth as usize)
+                .min(codewhale_workflow::DEFAULT_FLEET_WORKFLOW_MAX_DEPTH),
+        })
+        .map_err(|err| ToolError::invalid_input(format!(
+            "Workflow plan exceeds workflow.max_children or workflow.max_depth, or is invalid: {err}"
+        )))?;
+    }
     let args = input.get("args").cloned().unwrap_or(Value::Null);
     let token_budget = optional_u64(&input, "token_budget", 0)?;
-    let token_budget = (token_budget > 0).then_some(token_budget);
+    let token_budget = [
+        (token_budget > 0).then_some(token_budget),
+        source.spec.as_ref().and_then(|spec| spec.budget.max_tokens),
+    ]
+    .into_iter()
+    .flatten()
+    .min()
+    .or((workflow_cfg.default_token_budget > 0).then_some(workflow_cfg.default_token_budget));
     let verify_on_complete = optional_bool(&input, "verify", false)?;
     let fleet = workflow_fleet_binding(&input, context, runtime.api_config.as_deref())?;
     let run_id = format!("workflow_{}", &Uuid::new_v4().to_string()[..8]);
@@ -1202,7 +1330,6 @@ async fn start_workflow(
 
     // Capture the approved plan envelope for audit/receipt (#4126). Reaching
     // execute means the approval gate already passed (or YOLO/auto-start).
-    let workflow_cfg = workflow_config_for(&runtime);
     let summary = source
         .spec
         .as_ref()
@@ -1286,10 +1413,8 @@ async fn start_workflow(
         state.attach_lifecycle(&run_id, lifecycle);
     }
 
-    // Role-only dispatch: workflow children resolve roles, never saved
-    // members. The exact Fleet's run-scoped roster stays inside its own
-    // driver (`fleet.exact()`); it is no longer installed on the spawn
-    // runtime.
+    // Children share the spawn runtime; the driver keeps the exact Fleet
+    // binding frozen for this run, including native model selectors.
     let driver = SubAgentWorkflowDriver::new(
         run_id.clone(),
         context.state_namespace.clone(),
@@ -1302,10 +1427,9 @@ async fn start_workflow(
         context.workspace.clone(),
     );
     let vm_cancel = WorkflowRunCancel::new();
-    let controller = Arc::new(WorkflowRunController::new(
-        driver.clone(),
-        vm_cancel.clone(),
-    ));
+    let controller = Arc::new(
+        WorkflowRunController::new(driver.clone(), vm_cancel.clone()).with_parent_completion(!wait),
+    );
     if let Err(err) = lock_mutex(&state.controllers).map(|mut controllers_guard| {
         controllers_guard.insert(run_id.clone(), controller.clone());
     }) {
@@ -1423,20 +1547,25 @@ fn cancel_workflow_run(
     // Resolve ownership before touching the controller map or disclosing
     // status. Foreign and legacy-ownerless ids are indistinguishable from an
     // unknown run.
-    let current_status = {
+    {
         let runs_guard = lock_mutex(&state.runs)?;
         let record = runs_guard
             .get(run_id)
             .filter(|record| record.owner_session_id.as_deref() == Some(owner_session_id));
-        record.map(|record| record.status).ok_or_else(|| {
+        record.ok_or_else(|| {
             ToolError::invalid_input(format!("Unknown workflow run_id '{run_id}'"))
-        })?
+        })?;
     };
-    let controller = {
-        let mut controllers_guard = lock_mutex(&state.controllers)?;
-        controllers_guard.remove(run_id)
-    };
-    if current_status != WorkflowRunStatus::Running {
+    // Terminal publication and a cancel claim share this lock. If cancellation
+    // claims a live controller first, no success receipt can pass that claim.
+    let controllers_guard = lock_mutex(&state.controllers)?;
+    let controller = controllers_guard.get(run_id).cloned();
+    let current_status = lock_mutex(&state.runs)?
+        .get(run_id)
+        .map(|record| record.status)
+        .ok_or_else(|| ToolError::invalid_input(format!("Unknown workflow run_id '{run_id}'")))?;
+    if current_status != WorkflowRunStatus::Running && controller.is_none() {
+        drop(controllers_guard);
         state.reconcile_cancel(run_id, CancelOutcome::AlreadyFinished);
         if let Ok(runs_guard) = state.runs.lock()
             && let Some(record) = runs_guard.get(run_id)
@@ -1446,18 +1575,6 @@ fn cancel_workflow_run(
         return workflow_result_for(run_id, state, owner_session_id);
     }
     let live = controller.is_some();
-    state.reconcile_cancel(
-        run_id,
-        if live {
-            CancelOutcome::Requested
-        } else {
-            // Nothing live to signal; the journal cancel below is the receipt.
-            CancelOutcome::Acknowledged
-        },
-    );
-    if let Some(controller) = controller.as_ref() {
-        controller.cancel();
-    }
     let reason = if live {
         "cancelled by workflow tool"
     } else {
@@ -1482,8 +1599,23 @@ fn cancel_workflow_run(
         record.push_event(cancelled_event.clone());
         record.clone()
     };
+    drop(controllers_guard);
+    state.reconcile_cancel(
+        run_id,
+        if live {
+            CancelOutcome::Requested
+        } else {
+            CancelOutcome::Acknowledged
+        },
+    );
+    if let Some(controller) = controller.as_ref() {
+        controller.cancel();
+    }
     if let Err(err) = state.try_record_snapshot(&snapshot) {
         state.mark_owner_missing(run_id);
+        let mut failed = snapshot;
+        failed.error = Some(format!("workflow cancellation journal failed: {err}"));
+        finish_workflow_controller(&state, &failed);
         return Err(ToolError::execution_failed(format!(
             "workflow cancellation journal failed: {err}"
         )));
@@ -1495,6 +1627,7 @@ fn cancel_workflow_run(
     if let Some(controller) = controller {
         controller.driver.emit_ui_event(&cancelled_event);
     }
+    finish_workflow_controller(&state, &snapshot);
     workflow_result_for(run_id, state, owner_session_id)
 }
 
@@ -1637,16 +1770,13 @@ fn bind_exact_fleet_task_request(
 
     // The exact Fleet owns member identity, route, and reasoning. Runtime owns
     // authority: after selection it derives the closed role posture and
-    // intersects it with the live parent. A task may override neither side of
-    // that boundary; `subagent_type`, tool lists, and write authority would
-    // otherwise substitute a different Runtime posture per task.
+    // intersects it with the live parent. Tasks may narrow that authority, as
+    // native read-only plans do, but cannot replace identity or widen posture.
     for (field, present) in [
         ("model", request.model.is_some()),
         ("model_strength", request.model_strength.is_some()),
         ("thinking", request.thinking.is_some()),
         ("subagent_type", request.subagent_type.is_some()),
-        ("allowed_tools", request.allowed_tools.is_some()),
-        ("write_authority", request.write_authority.is_some()),
     ] {
         if present {
             return Err(DriverError::Rejected(format!(
@@ -1659,8 +1789,21 @@ fn bind_exact_fleet_task_request(
         }
     }
 
-    let binding = operation
+    let mut binding = operation
         .bind_member(request.profile.as_deref(), request.role.as_deref(), session)
+        .map_err(|err| DriverError::Rejected(format!("Fleet `{fleet}`: {err}")))?;
+    if request.write_authority.as_deref() == Some("worktree_write") && !request.worktree {
+        return Err(DriverError::Rejected(format!(
+            "Fleet `{fleet}`: worktree_write requires worktree isolation"
+        )));
+    }
+    binding
+        .narrow_for_task(
+            request.write_authority.as_deref(),
+            request.allowed_tools.as_deref(),
+            &request.disallowed_tools,
+            request.max_depth,
+        )
         .map_err(|err| DriverError::Rejected(format!("Fleet `{fleet}`: {err}")))?;
 
     // Id and role are stamped **separately and semantically**. The member id
@@ -1867,9 +2010,22 @@ async fn run_workflow_vm(
     context: ToolContext,
     vm_cancel: WorkflowRunCancel,
 ) {
-    let result = WorkflowVm::new()
-        .run_script_with_cancel(&source, args, driver.clone(), vm_cancel)
-        .await;
+    let vm = WorkflowVm::new();
+    let run = vm.run_script_with_cancel(&source, args, driver.clone(), vm_cancel.clone());
+    tokio::pin!(run);
+    // The VM closes its local driver during normal teardown too. Observe the
+    // original caller token here, so that teardown cannot masquerade as a stop.
+    let result = tokio::select! {
+        biased;
+        () = driver.parent_cancel_token.cancelled() => {
+            vm_cancel.cancel();
+            driver.force_cancel_all();
+            // Dropping the run future signals its existing guard too. Do not
+            // wait behind another VM's admission permit after an explicit stop.
+            Err(codewhale_workflow_js::WorkflowJsError::Cancelled)
+        }
+        result = &mut run => result,
+    };
     let mut status = WorkflowRunStatus::Completed;
     let mut output = None;
     let mut error = None;
@@ -1886,6 +2042,12 @@ async fn run_workflow_vm(
             status = WorkflowRunStatus::Failed;
             error = Some(err.to_string());
         }
+    }
+    if driver.parent_cancel_token.is_cancelled() {
+        driver.finalize_running_tasks_cancelled();
+        status = WorkflowRunStatus::Cancelled;
+        output = None;
+        error = Some("Workflow cancelled by its parent session".to_string());
     }
     let snapshot = {
         let mut runs_guard = match state.runs.lock() {
@@ -1933,6 +2095,18 @@ async fn run_workflow_vm(
             record.status = status;
             record.result = output;
             record.error = error.clone();
+            if status == WorkflowRunStatus::Cancelled {
+                let cancelled = WorkflowUiEvent::new(
+                    &driver.owner_session_id,
+                    WorkflowUiEventKind::RunCancelled {
+                        reason: error
+                            .clone()
+                            .unwrap_or_else(|| "Workflow cancelled".to_string()),
+                    },
+                );
+                record.push_event(cancelled.clone());
+                driver.emit_ui_event(&cancelled);
+            }
             record.execution = spec.as_ref().map(|spec| {
                 execution_from_declarative_spec(spec, driver.task_records_snapshot(), status)
             });
@@ -1946,23 +2120,39 @@ async fn run_workflow_vm(
         .ok()
         .and_then(|guard| guard.get(&run_id).map(|record| record.verify_on_complete))
         .unwrap_or(false);
-    if status == WorkflowRunStatus::Completed && verify_on_complete {
-        match run_workflow_completion_gates(&context).await {
-            Ok(verification) => {
+    if snapshot.status == WorkflowRunStatus::Completed && verify_on_complete {
+        let verification = tokio::select! {
+            biased;
+            () = driver.parent_cancel_token.cancelled() => {
                 if let Ok(mut runs_guard) = state.runs.lock()
                     && let Some(record) = runs_guard.get_mut(&run_id)
+                {
+                    record.status = WorkflowRunStatus::Cancelled;
+                    record.error = Some("Workflow cancelled during completion verification".to_string());
+                }
+                None
+            }
+            verification = run_workflow_completion_gates(&context) => Some(verification),
+        };
+        match verification {
+            Some(Ok(verification)) => {
+                if let Ok(mut runs_guard) = state.runs.lock()
+                    && let Some(record) = runs_guard.get_mut(&run_id)
+                    && record.status != WorkflowRunStatus::Cancelled
                 {
                     record.verification = Some(verification);
                 }
             }
-            Err(err) => {
+            Some(Err(err)) => {
                 if let Ok(mut runs_guard) = state.runs.lock()
                     && let Some(record) = runs_guard.get_mut(&run_id)
+                    && record.status != WorkflowRunStatus::Cancelled
                 {
                     record.status = WorkflowRunStatus::Failed;
                     record.error = Some(format!("verification gates failed: {err}"));
                 }
             }
+            None => {}
         }
     }
     let final_budget = driver.current_budget_snapshot();
@@ -1999,15 +2189,57 @@ async fn run_workflow_vm(
             Some(record.clone())
         })
         .unwrap_or(snapshot);
-    if state.try_record_snapshot(&snapshot).is_ok() {
-        state.reconcile_snapshot(&snapshot);
-    } else {
+    let mut terminal = snapshot;
+    if let Err(err) = state.try_record_snapshot(&terminal) {
+        // Status reads and the parent receipt must agree when the final
+        // journal append fails. Keep completed child output as evidence and
+        // preserve any cancellation recorded while the append was attempted.
+        terminal = {
+            let mut runs = state
+                .runs
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            let record = runs.entry(run_id.clone()).or_insert(terminal);
+            if record.status != WorkflowRunStatus::Cancelled {
+                record.status = WorkflowRunStatus::Failed;
+            }
+            let persistence_error =
+                format!("workflow terminal journal snapshot could not be persisted: {err}");
+            let error = match record.error.take() {
+                Some(error) => format!("{persistence_error}; prior outcome: {error}"),
+                None => persistence_error,
+            };
+            record.error = Some(error.clone());
+            record.lifecycle_seq = record.lifecycle_seq.saturating_add(1);
+            if let Some(execution) = record.execution.as_mut() {
+                if record.status == WorkflowRunStatus::Cancelled {
+                    execution.mark_cancelled();
+                } else {
+                    execution.mark_failed();
+                }
+            }
+            let event = WorkflowUiEvent::new(
+                &driver.owner_session_id,
+                if record.status == WorkflowRunStatus::Cancelled {
+                    WorkflowUiEventKind::RunCancelled { reason: error }
+                } else {
+                    WorkflowUiEventKind::RunCompleted {
+                        status: record.status,
+                        error: record.error.clone(),
+                        usage: record.usage.clone(),
+                    }
+                },
+            );
+            record.push_event(event.clone());
+            driver.emit_ui_event(&event);
+            record.clone()
+        };
         state.mark_owner_missing(&run_id);
+    } else {
+        state.reconcile_snapshot(&terminal);
     }
-    write_run_report_artifact(&context.workspace, &snapshot);
-    if let Ok(mut controllers_guard) = state.controllers.lock() {
-        controllers_guard.remove(&run_id);
-    }
+    write_run_report_artifact(&context.workspace, &terminal);
+    finish_workflow_controller(&state, &terminal);
 }
 
 mod report;
@@ -2429,6 +2661,9 @@ struct StructuredPlanChild {
     role: Option<String>,
     #[serde(default)]
     profile: Option<String>,
+    /// Saved Fleet shortlist selector, resolved by the existing task binder.
+    #[serde(default)]
+    model: Option<String>,
     #[serde(default)]
     mode: Option<String>,
     #[serde(default)]
@@ -2482,6 +2717,7 @@ fn structured_plan_to_workflow_spec(plan_value: &Value) -> Result<WorkflowSpec, 
     let mut nodes = Vec::new();
 
     if !plan.phases.is_empty() {
+        let mut prior_results = Vec::new();
         for (phase_index, phase) in plan.phases.iter().enumerate() {
             let phase_id = phase
                 .id
@@ -2491,7 +2727,7 @@ fn structured_plan_to_workflow_spec(plan_value: &Value) -> Result<WorkflowSpec, 
                 .filter(|id| !id.is_empty())
                 .map(str::to_string)
                 .unwrap_or_else(|| format!("phase-{}", phase_index + 1));
-            let children = plan_children_to_leaves(
+            let mut children = plan_children_to_leaves(
                 &phase.children,
                 default_mode,
                 plan.token_budget,
@@ -2503,6 +2739,16 @@ fn structured_plan_to_workflow_spec(plan_value: &Value) -> Result<WorkflowSpec, 
                 )));
             }
             let parallel = phase.parallel.unwrap_or(children.len() > 1);
+            // Phases are a data handoff as well as an ordering boundary.
+            // Reuse the IR's dependency field so ordinary structured plans
+            // get the same result forwarding as authored Workflow nodes.
+            for child in &mut children {
+                child.depends_on_results = prior_results.clone();
+                if !parallel {
+                    prior_results.push(child.id.clone());
+                }
+            }
+            prior_results = children.iter().map(|child| child.id.clone()).collect();
             if parallel && children.len() > 1 {
                 nodes.push(WorkflowNode::BranchSet(BranchSpec {
                     id: phase_id,
@@ -2516,11 +2762,10 @@ fn structured_plan_to_workflow_spec(plan_value: &Value) -> Result<WorkflowSpec, 
                     model_policy: Default::default(),
                     children: children.into_iter().map(WorkflowNode::Leaf).collect(),
                 }));
-            } else if children.len() == 1 {
-                nodes.push(WorkflowNode::Leaf(
-                    children.into_iter().next().expect("one child"),
-                ));
             } else {
+                // A one-child phase still owns a visible phase and task
+                // grouping; flattening it loses the usual inspect/build/test
+                // progression from the shared activity view.
                 nodes.push(WorkflowNode::Sequence(SequenceSpec {
                     id: phase_id,
                     children: children.into_iter().map(WorkflowNode::Leaf).collect(),
@@ -2564,7 +2809,7 @@ fn structured_plan_to_workflow_spec(plan_value: &Value) -> Result<WorkflowSpec, 
         )));
     }
 
-    Ok(WorkflowSpec {
+    let spec = WorkflowSpec {
         id: None,
         goal: goal.to_string(),
         description: plan.risk.clone(),
@@ -2577,7 +2822,11 @@ fn structured_plan_to_workflow_spec(plan_value: &Value) -> Result<WorkflowSpec, 
         promotion_policy: Default::default(),
         gates: plan.gates,
         nodes,
-    })
+    };
+    spec.validate_for_fleet().map_err(|error| {
+        ToolError::invalid_input(format!("Invalid structured Workflow plan: {error}"))
+    })?;
+    Ok(spec)
 }
 
 fn plan_risk_to_mode(risk: Option<&str>) -> Result<TaskMode, ToolError> {
@@ -2649,6 +2898,12 @@ fn plan_children_to_leaves(
             .map(str::trim)
             .filter(|p| !p.is_empty())
             .map(|p| p.to_ascii_lowercase());
+        let model = child.model.as_deref().map(str::trim);
+        if model == Some("") {
+            return Err(ToolError::invalid_input(format!(
+                "Workflow plan child '{id}' model must not be empty"
+            )));
+        }
         leaves.push(LeafSpec {
             id,
             prompt: prompt.to_string(),
@@ -2664,7 +2919,10 @@ fn plan_children_to_leaves(
                 ..BudgetSpec::default()
             },
             permissions: Default::default(),
-            model_policy: Default::default(),
+            model_policy: codewhale_workflow::ModelPolicy {
+                model: model.map(str::to_string),
+                ..Default::default()
+            },
         });
     }
     Ok(leaves)
@@ -2679,26 +2937,65 @@ fn parse_plan_agent_type(raw: Option<&str>) -> Result<AgentType, ToolError> {
     let Some(kind) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
         return Ok(AgentType::General);
     };
-    match kind.to_ascii_lowercase().as_str() {
-        "general" | "worker" | "delegate" => Ok(AgentType::General),
-        "explore" | "explorer" | "scout" => Ok(AgentType::Explore),
-        "plan" | "planner" | "awaiter" => Ok(AgentType::Plan),
-        // Consultant/oracle/advisor are the Agent tool's read-only advisory
-        // roles; Review is the workflow IR's read-only advisory posture.
-        "review" | "reviewer" | "consultant" | "oracle" | "advisor" => Ok(AgentType::Review),
-        "implementer" | "implement" | "builder" => Ok(AgentType::Implementer),
-        "verifier" | "verify" => Ok(AgentType::Verifier),
-        "custom" => Err(ToolError::invalid_input(
+    // `delegate` is a Workflow-only legacy alias. Every shared spelling uses
+    // the same parser as direct sub-agent launches and Fleet configuration.
+    let role = if kind.eq_ignore_ascii_case("delegate") {
+        Some(FleetRole::Worker)
+    } else {
+        FleetRole::from_str(kind)
+    };
+    match role {
+        Some(FleetRole::Worker) => Ok(AgentType::General),
+        Some(FleetRole::Scout) => Ok(AgentType::Explore),
+        Some(FleetRole::Planner) => Ok(AgentType::Plan),
+        Some(FleetRole::Reviewer | FleetRole::Consultant) => Ok(AgentType::Review),
+        Some(FleetRole::Builder) => Ok(AgentType::Implementer),
+        Some(FleetRole::Verifier) => Ok(AgentType::Verifier),
+        Some(FleetRole::Custom) => Err(ToolError::invalid_input(
             "Invalid sub-agent type 'custom' for a Workflow plan child: custom requires an \
              explicit allowed_tools list, which plan children cannot declare. Use role/profile \
              or another type.",
         )),
-        _ => Err(ToolError::invalid_input(format!(
+        None => Err(ToolError::invalid_input(format!(
             "Invalid sub-agent type '{kind}'. Use: worker, scout, planner, reviewer, builder, \
              verifier (legacy aliases remain accepted: general, explore/explorer, plan/awaiter, \
              review, implementer, consultant/oracle/advisor)."
         ))),
     }
+}
+
+/// Gate identity is runtime input, including for structured plans that do not
+/// pass through the JavaScript author's normalization path.
+fn validate_runtime_gates(gates: &mut [GateSpec]) -> Result<(), ToolError> {
+    let mut ids = HashSet::new();
+    for gate in gates {
+        gate.id = gate.id.trim().to_string();
+        if gate.id.is_empty() || !ids.insert(gate.id.clone()) {
+            return Err(ToolError::invalid_input(
+                "Workflow gates require non-empty, unique ids",
+            ));
+        }
+        gate.role = gate.role.trim().to_lowercase();
+        if gate.role.is_empty() {
+            return Err(ToolError::invalid_input(
+                "Workflow gate role must not be empty",
+            ));
+        }
+        if let Some(role) = gate.blocks_role.as_mut() {
+            *role = role.trim().to_lowercase();
+            if role.is_empty() {
+                return Err(ToolError::invalid_input(
+                    "Workflow gate blocks_role must not be empty",
+                ));
+            }
+        }
+        if gate.on != GateOn::RoleComplete {
+            return Err(ToolError::invalid_input(
+                "Workflow role_start gates are not supported; use role_complete with an explicit prerequisite role",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn count_plan_leaves(nodes: &[WorkflowNode], total: &mut usize) {
@@ -2829,7 +3126,7 @@ fn looks_like_declarative_workflow(source: &str) -> bool {
 fn lower_declarative_workflow_to_imperative_js(spec: &WorkflowSpec) -> Result<String, ToolError> {
     let mut lowerer = DeclarativeWorkflowLowerer::default();
     lowerer.line("\"use strict\";");
-    lowerer.line("const __results = {};");
+    lowerer.line("const __results = Object.create(null);");
     lowerer.line(format!(
         "phase({});",
         js_string(&format!("workflow: {}", spec.goal))
@@ -2952,6 +3249,7 @@ impl DeclarativeWorkflowLowerer {
                 Some("plan"),
                 None,
                 None,
+                spec.model_policy.model.as_deref(),
                 false,
                 None,
                 None,
@@ -3041,6 +3339,7 @@ fn leaf_task_options_expression(
         leaf_subagent_type(spec),
         spec.role.as_deref(),
         spec.profile.as_deref(),
+        spec.model_policy.model.as_deref(),
         // Parallel write-capable children default to worktree isolation (#4120).
         // Explicit isolation: shared is the approved same-worktree override.
         worktree,
@@ -3121,7 +3420,14 @@ fn leaf_description_expression(spec: &LeafSpec) -> String {
         return description;
     }
     let inputs = result_inputs_expression(&spec.depends_on_results);
-    format!("{description} + \"\\n\\nInputs:\\n\" + {inputs}")
+    // parallel() retains null for a failed slot. A dependent worker must
+    // not start with an empty stand-in for that result; reducers can still
+    // inspect partial fan-out through their separate input projection.
+    let required =
+        serde_json::to_string(&spec.depends_on_results).expect("dependency IDs serialize to JSON");
+    format!(
+        "({required}.forEach(id => {{ if (__results[id] == null) throw new Error('Required Workflow result unavailable: ' + id); }}), {description} + \"\\n\\nInputs:\\n\" + {inputs})"
+    )
 }
 
 fn result_inputs_expression(inputs: &[String]) -> String {
@@ -3202,6 +3508,7 @@ fn task_options_expression(
     subagent_type: Option<&str>,
     role: Option<&str>,
     profile: Option<&str>,
+    model: Option<&str>,
     worktree: bool,
     token_budget: Option<u64>,
     max_steps: Option<u32>,
@@ -3226,13 +3533,19 @@ fn task_options_expression(
     if let Some(profile) = profile {
         fields.push(format!("profile: {}", js_string(profile)));
     }
+    if let Some(model) = model {
+        fields.push(format!("model: {}", js_string(model)));
+    }
     if worktree {
         fields.push("worktree: true".to_string());
     }
     if let Some(token_budget) = token_budget {
         fields.push(format!("tokenBudget: {token_budget}"));
     }
-    if let Some(max_steps) = max_steps {
+    // Workflow's saved budget uses zero for no additional step cap. Omit
+    // that sentinel at the Agent boundary, where an explicit cap must be
+    // positive and may only narrow inherited authority.
+    if let Some(max_steps) = max_steps.filter(|steps| *steps > 0) {
         fields.push(format!("maxSteps: {max_steps}"));
     }
     if let Some(wall_time_secs) = wall_time_secs {
@@ -3402,12 +3715,14 @@ struct SubAgentWorkflowDriver {
     owner_session_id: String,
     manager: SharedSubAgentManager,
     runtime: SubAgentRuntime,
+    parent_cancel_token: CancellationToken,
     state: Arc<WorkflowWorkspaceState>,
     completion_tx: mpsc::UnboundedSender<SubAgentCompletion>,
     completion_state: Arc<Mutex<CompletionState>>,
     child_ids: Arc<Mutex<Vec<String>>>,
     /// Monotonic 0-based child admission counter for `workflow_child_index`.
     child_counter: AtomicU32,
+    max_children: u32,
     /// Latest `phase(...)` title observed on this run (used when a task omits
     /// an explicit `phase` option).
     current_phase: Mutex<Option<String>>,
@@ -3438,13 +3753,43 @@ struct SubAgentWorkflowDriver {
     workspace: PathBuf,
 }
 
+/// A single-consumer handoff remains reserved during admission. If routing,
+/// spawning, or cancellation drops that admission, the same board retains the
+/// evidence for the next attempt.
+struct WorkflowHandoffReservation {
+    board: Arc<Mutex<LaneGateBoard>>,
+    artifacts: Vec<HandoffArtifact>,
+}
+
+impl WorkflowHandoffReservation {
+    fn commit(mut self) -> Vec<HandoffArtifact> {
+        std::mem::take(&mut self.artifacts)
+    }
+}
+
+impl Drop for WorkflowHandoffReservation {
+    fn drop(&mut self) {
+        if self.artifacts.is_empty() {
+            return;
+        }
+        let mut board = self
+            .board
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        // Consumption is newest-first; restore original chronological order.
+        for artifact in self.artifacts.drain(..).rev() {
+            board.artifacts.push(artifact);
+        }
+    }
+}
+
 impl SubAgentWorkflowDriver {
     #[allow(clippy::too_many_arguments)]
     fn new(
         run_id: String,
         owner_session_id: String,
         manager: SharedSubAgentManager,
-        runtime: SubAgentRuntime,
+        mut runtime: SubAgentRuntime,
         state: Arc<WorkflowWorkspaceState>,
         total_budget: Option<u64>,
         fleet: WorkflowFleetBinding,
@@ -3452,6 +3797,12 @@ impl SubAgentWorkflowDriver {
         workspace: PathBuf,
     ) -> Arc<Self> {
         let fleet_name = fleet.name();
+        let workflow_cfg = workflow_config_for(&runtime);
+        let parent_cancel_token = runtime.cancel_token.clone();
+        // Workflow cancellation owns only this token subtree, never the
+        // caller's token or its unrelated direct children.
+        runtime.cancel_token = runtime.cancel_token.child_token();
+        runtime.context.cancel_token = Some(runtime.cancel_token.clone());
         let (completion_tx, completion_rx) = mpsc::unbounded_channel();
         let mut gate_board = LaneGateBoard::new(run_id.clone());
         gate_board.install_gates(&gate_specs);
@@ -3460,11 +3811,13 @@ impl SubAgentWorkflowDriver {
             owner_session_id,
             manager,
             runtime,
+            parent_cancel_token,
             state,
             completion_tx,
             completion_state: Arc::new(Mutex::new(CompletionState::default())),
             child_ids: Arc::new(Mutex::new(Vec::new())),
             child_counter: AtomicU32::new(0),
+            max_children: workflow_cfg.max_children.min(WORKFLOW_LIFETIME_CAP as u32),
             current_phase: Mutex::new(None),
             task_records: Arc::new(Mutex::new(HashMap::new())),
             dead_fanouts: AtomicU32::new(0),
@@ -3473,7 +3826,9 @@ impl SubAgentWorkflowDriver {
             last_budget_event: Arc::new(Mutex::new(None)),
             gate_specs: Arc::new(gate_specs),
             gate_board: Arc::new(Mutex::new(gate_board)),
-            concurrent_gate: Arc::new(Semaphore::new(WORKFLOW_MAX_CONCURRENT.max(1))),
+            concurrent_gate: Arc::new(Semaphore::new(
+                (workflow_cfg.max_concurrent as usize).min(WORKFLOW_MAX_CONCURRENT),
+            )),
             spawn_permits: Mutex::new(HashMap::new()),
             fleet_name,
             fleet,
@@ -3484,6 +3839,8 @@ impl SubAgentWorkflowDriver {
     }
 
     fn force_cancel_all(&self) {
+        self.concurrent_gate.close();
+        self.runtime.cancel_token.cancel();
         let ids = self
             .child_ids
             .lock()
@@ -3497,6 +3854,14 @@ impl SubAgentWorkflowDriver {
             for (_, waiter) in state.waiters.drain() {
                 let _ = waiter.send(TaskCompletion::Cancelled);
             }
+        }
+    }
+
+    fn ensure_admission_open(&self) -> Result<(), DriverError> {
+        if self.concurrent_gate.is_closed() || self.runtime.cancel_token.is_cancelled() {
+            Err(DriverError::Rejected("workflow admission cancelled".into()))
+        } else {
+            Ok(())
         }
     }
 
@@ -3552,8 +3917,8 @@ impl SubAgentWorkflowDriver {
             }
         };
         self.gate_specs.iter().find_map(|spec| {
-            let state = board.gates.get(&spec.id)?;
-            state.is_blocking().then(|| {
+            let state = board.gates.get(&spec.id).unwrap_or(&GateState::Pending);
+            (!matches!(state, GateState::Passed)).then(|| {
                 format!(
                     "workflow gate `{}` ended {}: {}",
                     spec.id,
@@ -3887,9 +4252,9 @@ impl SubAgentWorkflowDriver {
 
     fn record_task_request(&self, agent_id: &str, request: &TaskRequest) {
         if let Ok(mut records) = self.task_records.lock() {
-            records.insert(
-                agent_id.to_string(),
-                RuntimeTaskRecord {
+            records
+                .entry(agent_id.to_string())
+                .or_insert_with(|| RuntimeTaskRecord {
                     agent_id: agent_id.to_string(),
                     label: request.label.clone(),
                     role: request.role.clone(),
@@ -3897,8 +4262,7 @@ impl SubAgentWorkflowDriver {
                     output: None,
                     schema_error: None,
                     usage: None,
-                },
-            );
+                });
         }
         let pending_completion = self
             .completion_state
@@ -3907,6 +4271,8 @@ impl SubAgentWorkflowDriver {
             .and_then(|state| state.pending.get(agent_id).cloned());
         if let Some(completion) = pending_completion {
             self.record_task_completion(agent_id, &completion.completion, completion.usage);
+        } else if self.runtime.cancel_token.is_cancelled() {
+            self.record_task_completion(agent_id, &TaskCompletion::Cancelled, None);
         }
     }
 
@@ -3921,14 +4287,13 @@ impl SubAgentWorkflowDriver {
         if let Ok(mut records) = self.task_records.lock()
             && let Some(record) = records.get_mut(agent_id)
         {
-            let was_running = record.status == IrWorkflowRunStatus::Running;
-            let (status, output) = task_completion_status(completion);
-            record.status = status;
-            record.output = output;
             if usage.is_some() {
                 record.usage = usage;
             }
-            if was_running {
+            if record.status == IrWorkflowRunStatus::Running {
+                let (status, output) = task_completion_status(completion);
+                record.status = status;
+                record.output = output;
                 terminal_event = Some(WorkflowUiEvent::new(
                     &self.owner_session_id,
                     WorkflowUiEventKind::TaskCompleted {
@@ -4059,7 +4424,22 @@ impl SubAgentWorkflowDriver {
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
         if let Some(completion) = state.pending.remove(&agent_id) {
+            drop(state);
+            // The child may have completed before its permit was registered.
+            // Consume that receipt and release the late-installed permit too.
+            if let Ok(mut permits) = self.spawn_permits.lock() {
+                permits.remove(&agent_id);
+            }
+            // Its receipt may also have arrived just after record_task_request
+            // checked pending state. Replaying here closes that same race for
+            // the durable task status; terminal transitions are idempotent.
+            self.record_task_completion(&agent_id, &completion.completion, completion.usage);
             let _ = waiter.send(completion.completion);
+        } else if self.runtime.cancel_token.is_cancelled() {
+            if let Ok(mut permits) = self.spawn_permits.lock() {
+                permits.remove(&agent_id);
+            }
+            let _ = waiter.send(TaskCompletion::Cancelled);
         } else {
             state.waiters.insert(agent_id, waiter);
         }
@@ -4108,6 +4488,7 @@ impl SubAgentWorkflowDriver {
         &self,
         mut request: TaskRequest,
     ) -> Result<SpawnedTask, DriverError> {
+        self.ensure_admission_open()?;
         // Exact fleets resolve from the frozen snapshot; legacy role maps keep
         // their previous path unchanged.
         //
@@ -4152,7 +4533,6 @@ impl SubAgentWorkflowDriver {
             )?;
             None
         };
-        let consumed_handoffs = self.prepare_request_for_gates(&mut request)?;
         // Wait for a concurrent slot (max 16 live children per run).
         let permit = self
             .concurrent_gate
@@ -4160,11 +4540,25 @@ impl SubAgentWorkflowDriver {
             .acquire_owned()
             .await
             .map_err(|_| DriverError::Rejected("workflow concurrent admission closed".into()))?;
+        self.ensure_admission_open()?;
+        let workflow_child_index = self
+            .child_counter
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
+                (count < self.max_children).then_some(count + 1)
+            })
+            .map_err(|_| DriverError::Rejected(format!(
+                "workflow.max_children limit ({}) reached; reduce remaining work or start a new reviewed plan",
+                self.max_children
+            )))?;
+        let handoffs = WorkflowHandoffReservation {
+            board: self.gate_board.clone(),
+            artifacts: self.prepare_request_for_gates(&mut request)?,
+        };
 
         // Admitted. Only now may the reasoning router be consulted.
-        let fleet_receipt = match (self.fleet.exact(), exact_binding) {
+        let fleet_receipt = match (self.fleet.exact(), exact_binding.as_ref()) {
             (Some(operation), Some(binding)) => {
-                match route_admitted_exact_task(operation, &binding, &mut request).await {
+                match route_admitted_exact_task(operation, binding, &mut request).await {
                     Ok(receipt) => Some(receipt),
                     Err(err) => {
                         drop(permit);
@@ -4174,13 +4568,18 @@ impl SubAgentWorkflowDriver {
             }
             _ => None,
         };
+        if let Err(err) = self.ensure_admission_open() {
+            if let Some(receipt) = &fleet_receipt {
+                self.record_orphaned_fleet_receipt(receipt, &err.to_string());
+            }
+            return Err(err);
+        }
 
         let runtime = self
             .runtime
             .clone()
             .with_parent_completion_tx(self.completion_tx.clone());
         let request_record = request.clone();
-        let workflow_child_index = self.child_counter.fetch_add(1, Ordering::SeqCst);
         let workflow_phase_id = request
             .phase
             .as_ref()
@@ -4201,9 +4600,11 @@ impl SubAgentWorkflowDriver {
             .map(str::to_string);
         let identity = WorkflowTaskSpawnIdentity {
             workflow_run_id: self.run_id.clone(),
+            shared_token_budget: self.total_budget,
             workflow_phase_id,
             workflow_task_label,
             workflow_child_index,
+            exact_fleet_binding: exact_binding.clone(),
             // The Fleet decision travels to the spawn boundary as a value that
             // boundary re-checks, rather than as trust in the caller.
             fleet_authority_fingerprint: fleet_receipt
@@ -4227,6 +4628,13 @@ impl SubAgentWorkflowDriver {
                 }
             };
         let task_id = result.result.agent_id.clone();
+        if let Err(err) = self.ensure_admission_open() {
+            let _ = self.manager.write().await.cancel_agent(&task_id);
+            if let Some(receipt) = &fleet_receipt {
+                self.record_orphaned_fleet_receipt(receipt, &err.to_string());
+            }
+            return Err(err);
+        }
         if let Ok(mut permits) = self.spawn_permits.lock() {
             permits.insert(task_id.clone(), permit);
         }
@@ -4238,7 +4646,7 @@ impl SubAgentWorkflowDriver {
             &result.result,
             fleet_receipt,
         );
-        for artifact in consumed_handoffs {
+        for artifact in handoffs.commit() {
             self.record_run_event(WorkflowUiEvent::new(
                 &self.owner_session_id,
                 WorkflowUiEventKind::HandoffConsumed {
@@ -4251,10 +4659,6 @@ impl SubAgentWorkflowDriver {
             ));
         }
         self.record_task_request(&task_id, &request_record);
-        if let Some(limit) = self.total_budget {
-            let mut manager = self.manager.write().await;
-            manager.attach_shared_budget_scope(&task_id, &self.run_id, limit);
-        }
         let (tx, rx) = oneshot::channel();
         self.add_waiter_or_complete(task_id.clone(), tx);
         Ok(SpawnedTask {
@@ -4792,7 +5196,15 @@ fn spawn_completion_pump(
         "workflow-completion-pump",
         std::panic::Location::caller(),
         async move {
-            while let Some(completion) = rx.recv().await {
+            loop {
+                let completion = tokio::select! {
+                    biased;
+                    _ = driver.runtime.cancel_token.cancelled() => break,
+                    completion = rx.recv() => completion,
+                };
+                let Some(completion) = completion else {
+                    break;
+                };
                 let agent_id = completion.agent_id.clone();
                 let (task_completion, usage) =
                     completion_from_manager(driver.manager.clone(), &agent_id, completion.payload)
@@ -4816,12 +5228,33 @@ async fn completion_from_manager(
                 .as_ref()
                 .filter(|snapshot| snapshot.status != SubAgentStatus::Running)
                 .map(|snapshot| task_usage_from_manager(&manager, agent_id, snapshot));
-            (snapshot, usage)
+            let verification = manager
+                .get_worker_record(agent_id)
+                .map(|record| record.verification);
+            (snapshot, usage, verification)
         };
-        if let (Some(snapshot), usage) = snapshot_and_usage
+        if let (Some(snapshot), usage, verification) = snapshot_and_usage
             && snapshot.status != SubAgentStatus::Running
         {
             let completion = match snapshot.status {
+                SubAgentStatus::Completed
+                    if verification.as_ref().is_some_and(|receipt| {
+                        matches!(
+                            receipt.status.as_str(),
+                            "deliverable_missing" | "claim_mismatch"
+                        )
+                    }) =>
+                {
+                    TaskCompletion::Failed {
+                        message: format!(
+                            "Sub-agent delivery verification failed: {}",
+                            truncate_chars(
+                                &verification.expect("matched failed receipt").summary,
+                                1_000
+                            )
+                        ),
+                    }
+                }
                 SubAgentStatus::Completed => TaskCompletion::Completed {
                     text: snapshot.result.clone().unwrap_or(fallback_payload),
                 },
@@ -6389,9 +6822,6 @@ permissions = "read_only"
                     request.subagent_type = Some("general".to_string());
                 }) as fn(&mut TaskRequest),
             ),
-            ("allowed_tools", |request: &mut TaskRequest| {
-                request.allowed_tools = Some(vec!["shell".to_string()]);
-            }),
             ("write_authority", |request: &mut TaskRequest| {
                 request.write_authority = Some("workspace_write".to_string());
             }),
@@ -6403,7 +6833,7 @@ permissions = "read_only"
                 .expect_err("Runtime authority must win over a task option");
             let message = format!("{err:?}");
             assert!(
-                message.contains(field) && message.contains("not allowed"),
+                message.contains(field),
                 "{field} must be rejected: {message}"
             );
         }
@@ -6414,6 +6844,18 @@ permissions = "read_only"
             .expect("clean launch");
         assert_eq!(clean.write_authority.as_deref(), Some("read_only"));
         assert_eq!(clean.subagent_type, None);
+        // A task allowlist can only narrow; it never removes Runtime denials.
+        let mut narrowed = exact_task_request("reviewer");
+        narrowed.allowed_tools = Some(vec!["exec_shell".to_string()]);
+        bind_exact_fleet_task_request(&operation, exact_session(), &mut narrowed)
+            .expect("allowlist narrows without overriding the Runtime denylist");
+        assert_eq!(narrowed.write_authority.as_deref(), Some("read_only"));
+        assert!(
+            narrowed
+                .disallowed_tools
+                .iter()
+                .any(|tool| tool.eq_ignore_ascii_case("exec_shell"))
+        );
     }
 
     /// Runtime's reviewer posture becomes a real tool policy, and the legacy
@@ -8634,6 +9076,92 @@ reviewer = "reviewer"
             calls.load(Ordering::SeqCst) >= 1,
             "the healthy slot still ran"
         );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn structured_plan_phases_forward_results_and_stop_on_missing_dependencies() {
+        let _retry_guard = workflow_test_retry_guard();
+        for fail_upstream in [false, true] {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let ctx = ToolContext::new(tmp.path().to_path_buf());
+            let manager = new_shared_subagent_manager(tmp.path().to_path_buf(), 2);
+            let (client, calls, bodies) = fake_chat_client_capturing("upstream-output").await;
+            let runtime = SubAgentRuntime::new(
+                client,
+                "deepseek-v4-flash".to_string(),
+                ctx.clone(),
+                true,
+                None,
+                manager,
+            );
+            let tool = WorkflowTool::new(runtime.manager.clone(), runtime);
+            let mut upstream = vec![json!({
+                "id": "__proto__", "prompt": "Produce the upstream finding.", "role": "reviewer"
+            })];
+            if fail_upstream {
+                upstream.push(json!({
+                    "id": "missing", "prompt": "This profile does not exist.",
+                    "profile": "required-profile-does-not-exist"
+                }));
+            }
+            let result = tool.execute(json!({
+                "action": "run",
+                "plan": {
+                    "goal": "Carry evidence through native workflow phases",
+                    "risk": "read_only",
+                    "token_budget": 1_000,
+                    "phases": [
+                        {"id": "inspect", "children": upstream},
+                        {"id": "finish", "children": [{
+                            "id": "second", "prompt": "Use the upstream finding.", "role": "reviewer"
+                        }]}
+                    ]
+                }
+            }), &ctx).await.expect("workflow returns its run receipt");
+            let payload: Value = serde_json::from_str(&result.content).expect("json result");
+            assert_eq!(payload["token_budget"], 1_000, "{payload}");
+            if fail_upstream {
+                assert_ne!(payload["status"], "completed", "{payload}");
+                assert_eq!(
+                    calls.load(Ordering::SeqCst),
+                    1,
+                    "dependent child must not run: {payload}"
+                );
+                assert!(
+                    payload
+                        .to_string()
+                        .contains("Required Workflow result unavailable: missing"),
+                    "{payload}"
+                );
+            } else {
+                assert_eq!(payload["status"], "completed", "{payload}");
+                assert_eq!(calls.load(Ordering::SeqCst), 2);
+                let bodies = bodies.lock().expect("captured bodies");
+                let downstream = bodies.get(1).expect("dependent provider call").to_string();
+                assert!(downstream.contains("--- __proto__ ---"), "{downstream}");
+                assert!(downstream.contains("upstream-output"), "{downstream}");
+                let phases = payload["events"]
+                    .as_array()
+                    .expect("events")
+                    .iter()
+                    .filter(|event| event["type"] == "phase_started")
+                    .filter_map(|event| event["title"].as_str())
+                    .collect::<Vec<_>>();
+                assert!(
+                    phases.contains(&"inspect") && phases.contains(&"finish"),
+                    "{phases:?}"
+                );
+                let task_phases = payload["events"]
+                    .as_array()
+                    .expect("events")
+                    .iter()
+                    .filter(|event| event["type"] == "task_started")
+                    .filter_map(|event| event["workflow_phase_id"].as_str())
+                    .collect::<Vec<_>>();
+                assert_eq!(task_phases, ["inspect", "finish"]);
+            }
+        }
     }
 
     #[tokio::test]
@@ -11065,7 +11593,7 @@ FINAL RECEIPT
         let tmp = tempfile::tempdir().expect("tempdir");
         let ctx = ToolContext::new(tmp.path().to_path_buf());
         let manager = new_shared_subagent_manager(tmp.path().to_path_buf(), 2);
-        let (client, _calls) = fake_chat_client("budgeted").await;
+        let (client, calls, bodies) = fake_chat_client_capturing("budgeted").await;
         let runtime = SubAgentRuntime::new(
             client,
             "deepseek-v4-flash".to_string(),
@@ -11096,6 +11624,16 @@ FINAL RECEIPT
         assert_eq!(payload["result"]["spent"], 2);
         assert_eq!(payload["result"]["total"], 1000);
         assert_eq!(payload["result"]["remaining"], 998);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let bodies = bodies.lock().expect("captured first request");
+        assert_eq!(
+            bodies[0]
+                .get("max_tokens")
+                .or_else(|| bodies[0].get("max_completion_tokens"))
+                .and_then(Value::as_u64),
+            Some(1000),
+            "the host Workflow ceiling must reach the first provider request"
+        );
     }
 
     #[tokio::test]
@@ -11166,6 +11704,800 @@ FINAL RECEIPT
         assert_eq!(recorded, 1, "heartbeat must not grow the durable journal");
     }
 
+    fn native_lifecycle_tool(
+        workspace: &Path,
+    ) -> (
+        WorkflowTool,
+        ToolContext,
+        mpsc::UnboundedReceiver<SubAgentCompletion>,
+    ) {
+        let context = ToolContext::new(workspace.to_path_buf());
+        let manager = new_shared_subagent_manager(workspace.to_path_buf(), 2);
+        let (tx, rx) = mpsc::unbounded_channel();
+        let runtime = SubAgentRuntime::new(
+            stub_client(),
+            "deepseek-v4-flash".to_string(),
+            context.clone(),
+            true,
+            None,
+            manager.clone(),
+        )
+        .with_parent_completion_tx(tx);
+        (WorkflowTool::new(manager, runtime), context, rx)
+    }
+
+    fn native_lifecycle_driver(
+        workspace: &Path,
+        gates: Vec<GateSpec>,
+    ) -> Arc<SubAgentWorkflowDriver> {
+        let (tool, context, _rx) = native_lifecycle_tool(workspace);
+        let state = shared_workflow_state(workspace);
+        let run_id = "workflow_native_fixture".to_string();
+        state.runs.lock().expect("runs").insert(
+            run_id.clone(),
+            WorkflowRunRecord::new(
+                run_id.clone(),
+                Some(context.state_namespace.clone()),
+                None,
+                None,
+                None,
+            ),
+        );
+        SubAgentWorkflowDriver::new(
+            run_id,
+            context.state_namespace.clone(),
+            tool.manager,
+            tool.runtime,
+            state,
+            None,
+            WorkflowFleetBinding::None,
+            gates,
+            workspace.to_path_buf(),
+        )
+    }
+
+    fn terminal_workflow_receipt(payload: &str) -> Value {
+        let (_, receipt) = payload
+            .rsplit_once("<codewhale:subagent.done>")
+            .expect("terminal envelope");
+        serde_json::from_str(
+            receipt
+                .strip_suffix("</codewhale:subagent.done>")
+                .expect("closing envelope"),
+        )
+        .expect("terminal metadata")
+    }
+
+    #[tokio::test]
+    async fn native_detached_workflow_wakes_once_and_foreground_does_not() {
+        for (action, script, event) in [
+            ("start", "return {ok: true};", "workflow.completed"),
+            (
+                "start",
+                "throw new Error('failed native step');",
+                "workflow.failed",
+            ),
+            ("run", "return {ok: true};", "workflow.completed"),
+        ] {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let (tool, context, mut rx) = native_lifecycle_tool(tmp.path());
+            let result = tool
+                .execute(json!({"action": action, "script": script}), &context)
+                .await
+                .expect("run receipt");
+            let result: Value = serde_json::from_str(&result.content).expect("run json");
+            let run_id = result["run_id"].as_str().expect("run id");
+            if action == "start" {
+                let completion = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+                    .await
+                    .expect("detached completion")
+                    .expect("parent inbox open");
+                assert_eq!(completion.owner_session_id, context.state_namespace);
+                assert_eq!(completion.agent_id, run_id);
+                assert_eq!(
+                    terminal_workflow_receipt(&completion.payload)["event"],
+                    event
+                );
+                assert!(completion.payload.len() <= WORKFLOW_COMPLETION_MAX_BYTES);
+                assert_eq!(live_workflow_count(tmp.path(), &context.state_namespace), 0);
+                tool.execute(json!({"action":"status", "run_id":run_id}), &context)
+                    .await
+                    .expect("status remains addressable");
+                tool.execute(json!({"action":"cancel", "run_id":run_id}), &context)
+                    .await
+                    .expect("terminal cancel is idempotent");
+            } else {
+                assert_eq!(result["status"], "completed");
+            }
+            assert!(rx.try_recv().is_err(), "no duplicate or foreground fan-in");
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn native_terminal_journal_failure_agrees_across_status_event_and_parent_receipt() {
+        let _retry_guard = workflow_test_retry_guard();
+        for cancelled in [false, true] {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let requested = Arc::new(tokio::sync::Notify::new());
+            let release = Arc::new(tokio::sync::Notify::new());
+            let calls = Arc::new(AtomicUsize::new(0));
+            let app = Router::new().route(
+                "/{*path}",
+                post({
+                    let requested = Arc::clone(&requested);
+                    let release = Arc::clone(&release);
+                    let calls = Arc::clone(&calls);
+                    move |Json(_body): Json<Value>| {
+                        let requested = Arc::clone(&requested);
+                        let release = Arc::clone(&release);
+                        let calls = Arc::clone(&calls);
+                        async move {
+                            calls.fetch_add(1, Ordering::SeqCst);
+                            requested.notify_one();
+                            release.notified().await;
+                            Json(json!({
+                                "id": "chatcmpl-journal-probe",
+                                "model": "deepseek-v4-flash",
+                                "choices": [{
+                                    "index": 0,
+                                    "message": {
+                                        "role": "assistant",
+                                        "content": "JOURNAL_CHILD_COMPLETED"
+                                    },
+                                    "finish_reason": "stop"
+                                }],
+                                "usage": {
+                                    "prompt_tokens": 1,
+                                    "completion_tokens": 1,
+                                    "total_tokens": 2
+                                }
+                            }))
+                        }
+                    }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind journal probe");
+            let address = listener.local_addr().expect("journal probe address");
+            let server = tokio::spawn(async move {
+                let _ = axum::serve(listener, app).await;
+            });
+            let config = crate::config::Config {
+                api_key: Some("test-key".to_string()),
+                base_url: Some(format!("http://{address}/v1")),
+                ..crate::config::Config::default()
+            };
+            let context = ToolContext::new(tmp.path().to_path_buf());
+            let manager = new_shared_subagent_manager(tmp.path().to_path_buf(), 2);
+            let (completion_tx, mut completion_rx) = mpsc::unbounded_channel();
+            let (event_tx, mut event_rx) = mpsc::channel(128);
+            let runtime = SubAgentRuntime::new(
+                DeepSeekClient::new(&config).expect("journal probe client"),
+                "deepseek-v4-flash".to_string(),
+                context.clone(),
+                true,
+                Some(event_tx),
+                manager.clone(),
+            )
+            .with_parent_completion_tx(completion_tx);
+            let parent_cancel = runtime.cancel_token.clone();
+            let tool = WorkflowTool::new(manager, runtime);
+            let started = tool
+                .execute(
+                    json!({
+                        "action": "start",
+                        "plan": {
+                            "goal": "Retain truthful terminal evidence when the journal fails",
+                            "phases": [{
+                                "id": "journal-phase",
+                                "title": "Journal probe",
+                                "children": [{
+                                    "id": "journal-child",
+                                    "prompt": "Return the read-only probe result.",
+                                    "type": "explore",
+                                    "mode": "read_only"
+                                }]
+                            }]
+                        }
+                    }),
+                    &context,
+                )
+                .await
+                .expect("launch succeeds while the journal is writable");
+            let started: Value = serde_json::from_str(&started.content).expect("start json");
+            let run_id = started["run_id"].as_str().expect("run id");
+            tokio::time::timeout(std::time::Duration::from_secs(10), requested.notified())
+                .await
+                .expect("real workflow child reaches the loopback provider");
+            assert_eq!(live_workflow_count(tmp.path(), &context.state_namespace), 1);
+            let state = shared_workflow_state(tmp.path());
+            let journal = state.journal_path();
+            assert!(
+                std::fs::read_to_string(journal)
+                    .expect("launch persisted")
+                    .contains(run_id)
+            );
+            // A directory at the append path fails even when tests run with
+            // permissions that would bypass a read-only file's mode bits.
+            std::fs::rename(journal, journal.with_extension("before-failure.jsonl"))
+                .expect("preserve the successful launch journal");
+            std::fs::create_dir(journal).expect("inject append failure after launch");
+            if cancelled {
+                parent_cancel.cancel();
+            }
+            release.notify_one();
+
+            let completion =
+                tokio::time::timeout(std::time::Duration::from_secs(10), completion_rx.recv())
+                    .await
+                    .expect("workflow settles despite the failed append")
+                    .expect("parent receipt");
+            server.abort();
+            let expected_status = if cancelled { "cancelled" } else { "failed" };
+            let receipt = terminal_workflow_receipt(&completion.payload);
+            assert_eq!(receipt["status"], expected_status);
+            assert_eq!(receipt["event"], "workflow.failed");
+            assert!(completion.payload.contains("could not be persisted"));
+            assert!(completion.payload.len() <= WORKFLOW_COMPLETION_MAX_BYTES);
+            assert_eq!(live_workflow_count(tmp.path(), &context.state_namespace), 0);
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert!(completion_rx.try_recv().is_err(), "only one parent receipt");
+
+            // Tool rebuilds share the same authoritative run cache.
+            let rebuilt = WorkflowTool::new(tool.manager.clone(), tool.runtime.clone());
+            let status = rebuilt
+                .execute(json!({"action":"status", "run_id":run_id}), &context)
+                .await
+                .expect("status remains addressable after the failed append");
+            let status: Value = serde_json::from_str(&status.content).expect("status json");
+            assert_eq!(status["status"], expected_status);
+            assert_eq!(status["execution"]["status"], expected_status);
+            assert!(
+                status["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("could not be persisted")
+            );
+            let expected_event = if cancelled {
+                "run_cancelled"
+            } else {
+                "run_completed"
+            };
+            let mut final_event = None;
+            while let Ok(event) = event_rx.try_recv() {
+                if let Event::WorkflowUi { event, .. } = event
+                    && matches!(
+                        event["type"].as_str(),
+                        Some("run_completed" | "run_cancelled")
+                    )
+                {
+                    final_event = Some(event);
+                }
+            }
+            let final_event = final_event.expect("terminal UI event");
+            assert_eq!(final_event["type"], expected_event);
+            assert!(final_event.to_string().contains("could not be persisted"));
+            let recorded_terminal = status["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .rev()
+                .find(|event| {
+                    matches!(
+                        event["type"].as_str(),
+                        Some("run_completed" | "run_cancelled")
+                    )
+                })
+                .expect("recorded terminal event");
+            assert_eq!(recorded_terminal["type"], expected_event);
+            assert!(
+                recorded_terminal
+                    .to_string()
+                    .contains("could not be persisted")
+            );
+            let report = std::fs::read_to_string(
+                tmp.path()
+                    .join(".codewhale/reports")
+                    .join(format!("{run_id}.md")),
+            )
+            .expect("best-effort report remains writable");
+            assert!(report.contains(if cancelled {
+                "- status: Cancelled"
+            } else {
+                "- status: Failed"
+            }));
+            assert!(report.contains("could not be persisted"));
+            if cancelled {
+                assert!(
+                    status["error"]
+                        .as_str()
+                        .unwrap()
+                        .contains("cancelled by its parent")
+                );
+            } else {
+                assert_eq!(status["result"]["journal-child"], "JOURNAL_CHILD_COMPLETED");
+                assert!(completion.payload.contains("JOURNAL_CHILD_COMPLETED"));
+                assert!(report.contains("JOURNAL_CHILD_COMPLETED"));
+                assert_eq!(final_event["status"], "failed");
+                assert_eq!(
+                    status["execution"]["leaf_results"][0]["status"],
+                    "succeeded"
+                );
+            }
+            assert!(
+                journal.is_dir(),
+                "no terminal durability is claimed after the failed append"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn native_completion_is_enqueued_before_live_count_zero_and_bounded() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (tool, context, mut rx) = native_lifecycle_tool(tmp.path());
+        let state = shared_workflow_state(tmp.path());
+        let run_id = "workflow_bounded".to_string();
+        let driver = SubAgentWorkflowDriver::new(
+            run_id.clone(),
+            context.state_namespace.clone(),
+            tool.manager,
+            tool.runtime,
+            state.clone(),
+            None,
+            WorkflowFleetBinding::None,
+            Vec::new(),
+            tmp.path().to_path_buf(),
+        );
+        state.controllers.lock().expect("controllers").insert(
+            run_id.clone(),
+            Arc::new(
+                WorkflowRunController::new(driver, WorkflowRunCancel::new())
+                    .with_parent_completion(true),
+            ),
+        );
+        let mut record = WorkflowRunRecord::new(
+            run_id,
+            Some(context.state_namespace.clone()),
+            None,
+            None,
+            None,
+        );
+        record.status = WorkflowRunStatus::Failed;
+        record.workflow_goal = Some("🦀\u{0001}".repeat(10_000));
+        record.error = Some("🦀\u{0001}".repeat(10_000));
+        record.result = Some(json!({"preview":"🦀\u{0001}".repeat(10_000)}));
+        assert_eq!(live_workflow_count(tmp.path(), &context.state_namespace), 1);
+        assert_eq!(live_workflow_count(tmp.path(), "other-session"), 0);
+        finish_workflow_controller(&state, &record);
+        assert_eq!(live_workflow_count(tmp.path(), &context.state_namespace), 0);
+        let completion = rx
+            .try_recv()
+            .expect("receipt already enqueued when idle is observable");
+        assert!(
+            completion.payload.len() <= WORKFLOW_COMPLETION_MAX_BYTES,
+            "{} bytes",
+            completion.payload.len()
+        );
+        assert_eq!(
+            terminal_workflow_receipt(&completion.payload)["status"],
+            "failed"
+        );
+        finish_workflow_controller(&state, &record);
+        assert!(rx.try_recv().is_err(), "terminalization is exactly once");
+    }
+
+    #[tokio::test]
+    async fn native_parent_cancellation_between_children_settles_the_vm() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (mut tool, context, mut completion_rx) = native_lifecycle_tool(tmp.path());
+        let parent_cancel = tool.runtime.cancel_token.clone();
+        let (event_tx, mut event_rx) = mpsc::channel(32);
+        tool.runtime.event_tx = Some(event_tx);
+        tool.execute(
+            json!({"action":"start", "script":"phase('between-children'); while (true) {}"}),
+            &context,
+        )
+        .await
+        .expect("detached start");
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Event::WorkflowUi { event, .. } =
+                    event_rx.recv().await.expect("event channel")
+                    && event["type"] == "phase_started"
+                {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("VM entered a phase with no child provider in flight");
+        assert_eq!(live_workflow_count(tmp.path(), &context.state_namespace), 1);
+        parent_cancel.cancel();
+        let completion =
+            tokio::time::timeout(std::time::Duration::from_secs(5), completion_rx.recv())
+                .await
+                .expect("cancel stops VM bytecode")
+                .expect("cancel receipt");
+        assert_eq!(
+            terminal_workflow_receipt(&completion.payload)["status"],
+            "cancelled"
+        );
+        assert_eq!(live_workflow_count(tmp.path(), &context.state_namespace), 0);
+        assert_eq!(tool.manager.read().await.active_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn native_cancel_closes_queued_admission_without_cancelling_parent() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        set_session_workflow_config(
+            tmp.path(),
+            codewhale_config::WorkflowConfigToml {
+                max_concurrent: 1,
+                ..Default::default()
+            },
+        );
+        let driver = native_lifecycle_driver(tmp.path(), Vec::new());
+        assert_eq!(driver.concurrent_gate.available_permits(), 1);
+        let held = driver
+            .concurrent_gate
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("hold capacity");
+        let mut queued = Box::pin(driver.spawn_task(exact_task_request("reviewer")));
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(queued.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        driver.force_cancel_all();
+        drop(held);
+        let error = match queued.await {
+            Ok(_) => panic!("cancelled admission spawned"),
+            Err(err) => err,
+        };
+        assert!(error.to_string().contains("admission closed"), "{error}");
+        assert_eq!(driver.child_counter.load(Ordering::SeqCst), 0);
+        assert!(driver.child_ids.lock().expect("children").is_empty());
+        assert!(
+            !driver.parent_cancel_token.is_cancelled(),
+            "workflow stop is scoped to its subtree"
+        );
+    }
+
+    #[tokio::test]
+    async fn native_handoff_survives_rejected_spawn_and_pending_gates_block_completion() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let gate: GateSpec = serde_json::from_value(json!({
+            "id":"findings", "role":"scout", "on":"role_complete", "gate":"approve", "on_fail":"block",
+            "blocks_role":"reviewer", "artifact_kind":"findings"
+        })).expect("gate fixture");
+        let driver = native_lifecycle_driver(tmp.path(), vec![gate]);
+        assert!(
+            driver.terminal_gate_failure().is_some(),
+            "unevaluated prerequisite blocks terminal success"
+        );
+        driver.gate_board.lock().expect("board").gates.clear();
+        assert!(
+            driver.terminal_gate_failure().is_some(),
+            "missing persisted gate also blocks success"
+        );
+        driver.evaluate_gates_for_completed_role(&RuntimeTaskRecord {
+            agent_id: "scout-1".to_string(),
+            label: None,
+            role: Some("scout".to_string()),
+            status: IrWorkflowRunStatus::Succeeded,
+            output: Some("evidence to retain".to_string()),
+            schema_error: None,
+            usage: None,
+        });
+        assert!(
+            driver.terminal_gate_failure().is_none(),
+            "passed prerequisite releases the run"
+        );
+        let mut rejected = exact_task_request("reviewer");
+        rejected.profile = Some("native-fixture-missing-profile".to_string());
+        let error = match driver.spawn_task(rejected).await {
+            Ok(_) => panic!("missing profile spawned"),
+            Err(err) => err,
+        };
+        assert!(
+            error.to_string().contains("native-fixture-missing-profile"),
+            "{error}"
+        );
+        assert_eq!(driver.gate_board.lock().expect("board").artifacts.len(), 1);
+        let mut retry = exact_task_request("reviewer");
+        let handoffs = driver
+            .prepare_request_for_gates(&mut retry)
+            .expect("retry retains evidence");
+        assert_eq!(handoffs.len(), 1);
+        assert!(retry.description.contains("evidence to retain"));
+        assert!(
+            driver.state.runs.lock().expect("runs")[&driver.run_id]
+                .events
+                .iter()
+                .all(|event| event.event_type() != "handoff_consumed")
+        );
+    }
+
+    #[tokio::test]
+    async fn native_configured_shape_and_admission_limits_are_enforced() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (tool, context, _rx) = native_lifecycle_tool(tmp.path());
+        set_session_workflow_config(
+            tmp.path(),
+            codewhale_config::WorkflowConfigToml {
+                max_children: 2,
+                max_depth: 1,
+                max_concurrent: 1,
+                ..Default::default()
+            },
+        );
+        for children in [
+            json!([{"prompt":"one"},{"prompt":"two"},{"prompt":"three"}]),
+            json!([{"prompt":"one"},{"prompt":"two"}]),
+        ] {
+            let error = tool
+                .execute(
+                    json!({"action":"start", "plan":{"goal":"bounded", "children":children}}),
+                    &context,
+                )
+                .await
+                .expect_err("configured total or structural depth rejects before launch");
+            assert!(error.to_string().contains("workflow.max_"), "{error}");
+        }
+        assert!(
+            shared_workflow_state(tmp.path())
+                .runs
+                .lock()
+                .expect("runs")
+                .is_empty()
+        );
+        let initial_spawn_depth = tool.runtime.spawn_depth;
+        let accepted = tool.execute(json!({"action":"run", "plan":{
+            "goal":"two sequential leaves fit structural depth one", "phases":[
+                {"id":"first", "children":[{"prompt":"one", "profile":"missing-boundary-profile"}]},
+                {"id":"second", "children":[{"prompt":"two", "profile":"missing-boundary-profile"}]}
+            ]
+        }}), &context).await.expect("sequence wrappers do not increase structural depth");
+        let accepted: Value = serde_json::from_str(&accepted.content).expect("accepted run");
+        assert_eq!(
+            accepted["status"], "failed",
+            "admitted plan, then deliberate missing-profile rejection"
+        );
+        assert_eq!(
+            tool.runtime.spawn_depth, initial_spawn_depth,
+            "plan shape never rewrites delegation depth"
+        );
+        set_session_workflow_config(
+            tmp.path(),
+            codewhale_config::WorkflowConfigToml {
+                max_children: 1,
+                max_concurrent: 1,
+                ..Default::default()
+            },
+        );
+        let driver = native_lifecycle_driver(tmp.path(), Vec::new());
+        let mut invalid = exact_task_request("reviewer");
+        invalid.profile = Some("missing-first-attempt-profile".to_string());
+        let first = driver.spawn_task(invalid.clone()).await;
+        assert!(first.is_err());
+        let second = match driver.spawn_task(invalid).await {
+            Ok(_) => panic!("cap bypassed"),
+            Err(err) => err,
+        };
+        assert!(
+            second
+                .to_string()
+                .contains("workflow.max_children limit (1)"),
+            "{second}"
+        );
+        assert_eq!(driver.child_counter.load(Ordering::SeqCst), 1);
+        assert!(driver.child_ids.lock().expect("children").is_empty());
+        for name in ["max_children", "max_concurrent", "max_depth"] {
+            let mut config = serde_json::to_value(codewhale_config::WorkflowConfigToml::default())
+                .expect("config");
+            config[name] = json!(0);
+            set_session_workflow_config(
+                tmp.path(),
+                serde_json::from_value(config).expect("zero config"),
+            );
+            let error = tool
+                .execute(json!({"action":"start", "script":"return 1;"}), &context)
+                .await
+                .expect_err("zero ceiling fails without waiting on a semaphore");
+            assert!(
+                error.to_string().contains(&format!("workflow.{name}")),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn native_gate_identity_is_normalized_and_unsupported_or_duplicate_gates_reject() {
+        let gate = json!({"id":" check ","role":" Scout ","on":"role_complete", "gate":"approve", "on_fail":"block", "blocks_role":" Reviewer "});
+        let mut gates: Vec<GateSpec> = serde_json::from_value(json!([gate])).expect("gates");
+        validate_runtime_gates(&mut gates).expect("normalize gate");
+        assert_eq!(gates[0].id, "check");
+        assert_eq!(gates[0].role, "scout");
+        assert_eq!(gates[0].blocks_role.as_deref(), Some("reviewer"));
+        let mut duplicate = vec![gates[0].clone(), gates[0].clone()];
+        assert!(validate_runtime_gates(&mut duplicate).is_err());
+        for (field, value) in [
+            ("id", " "),
+            ("role", " "),
+            ("blocks_role", " "),
+            ("on", "role_start"),
+        ] {
+            let mut candidate = serde_json::to_value(&gates[0]).expect("gate json");
+            candidate[field] = json!(value);
+            let mut candidate =
+                [serde_json::from_value(candidate).expect("syntactically valid gate")];
+            assert!(validate_runtime_gates(&mut candidate).is_err(), "{field}");
+        }
+    }
+
+    #[tokio::test]
+    async fn native_default_shared_budget_applies_only_without_an_explicit_budget() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (tool, context, _rx) = native_lifecycle_tool(tmp.path());
+        set_session_workflow_config(
+            tmp.path(),
+            codewhale_config::WorkflowConfigToml {
+                default_token_budget: 123,
+                ..Default::default()
+            },
+        );
+        for (explicit, expected) in [(None, 123), (Some(17), 17), (Some(246), 246)] {
+            let mut input = json!({"action":"run", "script":"return budget.remaining();"});
+            if let Some(explicit) = explicit {
+                input["token_budget"] = json!(explicit);
+            }
+            let receipt = tool.execute(input, &context).await.expect("budget run");
+            let receipt: Value = serde_json::from_str(&receipt.content).expect("budget receipt");
+            assert_eq!(receipt["token_budget"], expected);
+            assert_eq!(
+                receipt["result"], expected,
+                "the same effective cap reaches the VM"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn native_cancel_preserves_completed_outputs_and_late_completion_cannot_reverse_it() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let driver = native_lifecycle_driver(tmp.path(), Vec::new());
+        for id in ["completed-child", "running-child"] {
+            driver.record_child(id);
+            driver.task_records.lock().expect("records").insert(
+                id.to_string(),
+                RuntimeTaskRecord {
+                    agent_id: id.to_string(),
+                    label: None,
+                    role: None,
+                    status: IrWorkflowRunStatus::Running,
+                    output: None,
+                    schema_error: None,
+                    usage: None,
+                },
+            );
+        }
+        driver.record_task_completion(
+            "completed-child",
+            &TaskCompletion::Completed {
+                text: "completed evidence must survive".to_string(),
+            },
+            None,
+        );
+        driver.finalize_running_tasks_cancelled();
+        driver.record_task_completion(
+            "running-child",
+            &TaskCompletion::Completed {
+                text: "late completion after cancellation".to_string(),
+            },
+            None,
+        );
+        let records = driver.task_records.lock().expect("records");
+        assert_eq!(
+            records["completed-child"].status,
+            IrWorkflowRunStatus::Succeeded
+        );
+        assert_eq!(
+            records["completed-child"].output.as_deref(),
+            Some("completed evidence must survive")
+        );
+        assert_eq!(
+            records["running-child"].status,
+            IrWorkflowRunStatus::Cancelled
+        );
+        assert!(records["running-child"].output.is_none());
+    }
+
+    #[tokio::test]
+    async fn native_completion_before_registration_releases_capacity_and_cancelled_waiters() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        set_session_workflow_config(
+            tmp.path(),
+            codewhale_config::WorkflowConfigToml {
+                max_concurrent: 1,
+                ..Default::default()
+            },
+        );
+        let driver = native_lifecycle_driver(tmp.path(), Vec::new());
+        let held = driver
+            .concurrent_gate
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("capacity");
+        driver.deliver_completion(
+            "instant".to_string(),
+            TaskCompletion::Completed {
+                text: "ready".to_string(),
+            },
+            None,
+        );
+        driver
+            .spawn_permits
+            .lock()
+            .expect("permits")
+            .insert("instant".to_string(), held);
+        driver.record_task_request("instant", &exact_task_request("reviewer"));
+        let (tx, rx) = oneshot::channel();
+        driver.add_waiter_or_complete("instant".to_string(), tx);
+        assert!(
+            matches!(rx.await.expect("early completion delivered"), TaskCompletion::Completed {text} if text == "ready")
+        );
+        assert_eq!(
+            driver.concurrent_gate.available_permits(),
+            1,
+            "instant completion must not leak the sole permit"
+        );
+        // Reproduce the other interleaving: the completion checked records
+        // before registration, but published pending after its first peek.
+        driver.record_task_request("pending-after-peek", &exact_task_request("reviewer"));
+        driver
+            .completion_state
+            .lock()
+            .expect("completion state")
+            .pending
+            .insert(
+                "pending-after-peek".to_string(),
+                PendingCompletion {
+                    completion: TaskCompletion::Completed {
+                        text: "preserved receipt".to_string(),
+                    },
+                    usage: None,
+                },
+            );
+        let (tx, rx) = oneshot::channel();
+        driver.add_waiter_or_complete("pending-after-peek".to_string(), tx);
+        assert!(matches!(
+            rx.await.expect("completion"),
+            TaskCompletion::Completed { .. }
+        ));
+        assert_eq!(
+            driver.task_records.lock().expect("records")["pending-after-peek"]
+                .output
+                .as_deref(),
+            Some("preserved receipt")
+        );
+        driver.force_cancel_all();
+        driver.record_task_request("late-registration", &exact_task_request("reviewer"));
+        let (tx, rx) = oneshot::channel();
+        driver.add_waiter_or_complete("late-registration".to_string(), tx);
+        assert!(matches!(
+            rx.await.expect("late waiter released"),
+            TaskCompletion::Cancelled
+        ));
+        assert_eq!(
+            driver.task_records.lock().expect("records")["late-registration"].status,
+            IrWorkflowRunStatus::Cancelled
+        );
+    }
+
     fn stub_client() -> DeepSeekClient {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let config = crate::config::Config {
@@ -11187,7 +12519,7 @@ FINAL RECEIPT
         (client, calls)
     }
 
-    async fn fake_chat_client_capturing(
+    pub(super) async fn fake_chat_client_capturing(
         response_text: &str,
     ) -> (DeepSeekClient, Arc<AtomicUsize>, Arc<Mutex<Vec<Value>>>) {
         fake_chat_client_capturing_responses(&[response_text]).await
@@ -11276,7 +12608,7 @@ FINAL RECEIPT
         )
     }
 
-    fn workflow_test_retry_guard() -> std::sync::MutexGuard<'static, ()> {
+    pub(super) fn workflow_test_retry_guard() -> std::sync::MutexGuard<'static, ()> {
         let guard = crate::retry_status::test_guard();
         crate::retry_status::clear();
         crate::retry_status::clear_rate_limit();

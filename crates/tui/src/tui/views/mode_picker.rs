@@ -177,12 +177,17 @@ impl ModalView for ModePickerView {
             // Pad by terminal columns, not scalar count, so wide (CJK) mode
             // names keep the hint column aligned.
             let pad = " ".repeat(8usize.saturating_sub(UnicodeWidthStr::width(&*name)));
+            let prefix = format!("{pointer} {}. {name}{pad}", mode.number());
+            // A hint is prose: the pane edge used to cut it mid-word
+            // (`ask f`, `before ac`). Truncate at a word joint instead —
+            // a clipped clause reads as a sentence, a clipped word reads
+            // as a bug.
+            let hint_width =
+                usize::from(content.width).saturating_sub(UnicodeWidthStr::width(prefix.as_str()));
+            let hint = crate::tui::ui_text::semantic_truncate(hint.as_ref(), hint_width);
 
             lines.push(Line::from(vec![
-                Span::styled(
-                    format!("{pointer} {}. {name}{pad}", mode.number()),
-                    row_style,
-                ),
+                Span::styled(prefix, row_style),
                 Span::styled(hint, hint_style),
             ]));
             self.row_hitboxes.borrow_mut().push(Rect::new(

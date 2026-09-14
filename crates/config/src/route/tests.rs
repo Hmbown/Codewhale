@@ -315,7 +315,10 @@ fn descriptor_protocol_matches_provider_wire() {
         let d = ProviderDescriptor::for_kind(kind);
         if matches!(
             kind,
-            ProviderKind::Deepseek | ProviderKind::OpencodeZen | ProviderKind::Codewhale
+            ProviderKind::Deepseek
+                | ProviderKind::OpencodeZen
+                | ProviderKind::OpencodeGo
+                | ProviderKind::Codewhale
         ) {
             assert_eq!(d.wire_policy(), crate::provider::WirePolicy::ModelAware);
             assert_eq!(
@@ -1127,7 +1130,7 @@ fn openrouter_custom_endpoint_preserves_qwen37_alias() {
 }
 
 #[test]
-fn opencode_go_resolver_accepts_only_chat_completions_models() {
+fn opencode_go_resolver_preserves_documented_chat_routes() {
     let resolver = RouteResolver::new();
     // Literal review fixture: the 2026-09-08 endpoint table plus previously
     // accepted IDs retained for compatibility. Do not derive from the contract.
@@ -1150,7 +1153,11 @@ fn opencode_go_resolver_accepts_only_chat_completions_models() {
         "hy3",
         "omen-alpha",
     ];
-    assert_eq!(crate::OPENCODE_GO_CHAT_MODELS, &chat_models);
+    assert!(
+        chat_models
+            .iter()
+            .all(|id| crate::opencode_go_models().contains(id))
+    );
 
     for model in chat_models {
         for requested in [model.to_string(), format!("opencode-go/{model}")] {
@@ -1174,44 +1181,80 @@ fn opencode_go_resolver_accepts_only_chat_completions_models() {
 }
 
 #[test]
-fn opencode_go_resolver_rejects_non_chat_models_even_on_custom_base_urls() {
+fn opencode_go_resolver_uses_documented_protocols_and_refuses_unknown_models() {
     let resolver = RouteResolver::new();
-    let non_chat_models = [
-        "minimax-m3",
-        "minimax-m2.7",
-        "minimax-m2.5",
-        "qwen3.7-max",
-        "qwen3.7-plus",
-        "qwen3.6-plus",
-        "qwen3.8-max",
-        "qwen3.8-flash",
-        "grok-4.6",
-        "gpt-5.6-luna",
-        "muse-spark-1.3-contributor",
-        "muse-spark-1.2-contributor",
+    let fixtures = [
+        ("deepseek-v4.1-flash", RequestProtocol::ChatCompletions),
+        ("grok-4.6", RequestProtocol::Responses),
+        ("gpt-5.6-luna", RequestProtocol::Responses),
+        ("muse-spark-1.3-contributor", RequestProtocol::Responses),
+        ("muse-spark-1.2-contributor", RequestProtocol::Responses),
+        ("minimax-m3", RequestProtocol::AnthropicMessages),
+        ("minimax-m2.7", RequestProtocol::AnthropicMessages),
+        ("minimax-m2.5", RequestProtocol::AnthropicMessages),
+        ("qwen3.8-max", RequestProtocol::AnthropicMessages),
+        ("qwen3.8-flash", RequestProtocol::AnthropicMessages),
+        ("qwen3.7-max", RequestProtocol::AnthropicMessages),
+        ("qwen3.7-plus", RequestProtocol::AnthropicMessages),
+        ("qwen3.6-plus", RequestProtocol::AnthropicMessages),
     ];
-
-    for model in non_chat_models {
+    for (model, protocol) in fixtures {
         for requested in [model.to_string(), format!("opencode-go/{model}")] {
             for base_url_override in [None, Some("https://go-gateway.example.test/v1".to_string())]
             {
                 let request = RouteRequest {
                     explicit_provider: Some(ProviderKind::OpencodeGo),
                     model_selector: Some(LogicalModelRef::from(requested.as_str())),
-                    saved_provider_model: None,
                     base_url_override,
-                    limit_overrides: Vec::new(),
+                    ..RouteRequest::default()
                 };
-                assert!(
-                    matches!(
-                        resolver.resolve(&request),
-                        Err(RouteError::ForeignModelForDirectProvider { .. })
-                    ),
-                    "{requested} must not reach OpenCode Go Chat Completions"
-                );
+                let route = resolver.resolve(&request).expect("documented Go route");
+                assert_eq!(route.wire_model_id().as_str(), model);
+                assert_eq!(route.protocol(), protocol, "{requested}");
+                if request.base_url_override.is_some() {
+                    assert!(
+                        !route.limits().has_known_limit(),
+                        "custom endpoint has no sourced limits"
+                    );
+                }
             }
         }
     }
+    for model in [
+        "claude-unproven",
+        "opencode-go/unknown",
+        "openai/gpt-5.6-luna",
+    ] {
+        for base_url_override in [None, Some("https://go-gateway.example.test/v1".into())] {
+            assert!(
+                resolver
+                    .resolve(&RouteRequest {
+                        explicit_provider: Some(ProviderKind::OpencodeGo),
+                        model_selector: Some(LogicalModelRef::from(model)),
+                        base_url_override,
+                        ..RouteRequest::default()
+                    })
+                    .is_err(),
+                "unknown {model} must not select a default or another wire"
+            );
+        }
+    }
+}
+
+#[test]
+fn opencode_go_protocol_cannot_be_downgraded_by_stale_catalog_metadata() {
+    let mut offerings = super::offering::bundled_offerings();
+    let row = offerings
+        .iter_mut()
+        .find(|row| {
+            row.provider.as_str() == "opencode-go" && row.wire_model_id.as_str() == "minimax-m3"
+        })
+        .unwrap();
+    row.endpoint_key = "chat".into();
+    let route = RouteResolver::from_offerings(offerings)
+        .resolve(&req(Some(ProviderKind::OpencodeGo), Some("minimax-m3")))
+        .unwrap();
+    assert_eq!(route.protocol(), RequestProtocol::AnthropicMessages);
 }
 
 #[test]

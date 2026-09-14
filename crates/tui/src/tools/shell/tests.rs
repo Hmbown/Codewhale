@@ -104,10 +104,16 @@ fn lowercase_bash_schema_is_small_contract() {
             .keys()
             .cloned()
             .collect::<std::collections::BTreeSet<_>>(),
-        ["command", "justification", "sandbox_permissions", "timeout"]
-            .into_iter()
-            .map(str::to_string)
-            .collect()
+        [
+            "command",
+            "justification",
+            "read_only",
+            "sandbox_permissions",
+            "timeout"
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
     );
     assert!(!BashTool::new("Bash").model_visible());
 }

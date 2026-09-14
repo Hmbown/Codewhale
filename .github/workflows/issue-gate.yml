@@ -1,0 +1,84 @@
+name: Contribution intake - issues
+
+on:
+  issues:
+    types: [opened, reopened]
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Welcome new external issue reporters
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const issue = context.payload.issue;
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const privileged = new Set(['OWNER', 'MEMBER', 'COLLABORATOR']);
+
+            if (privileged.has(issue.author_association)) return;
+            if (issue.user.login === 'github-actions[bot]') return;
+
+            function parseAllowlist(content) {
+              return new Set(
+                content
+                  .split(/\r?\n/)
+                  .map(line => line.replace(/#.*/, '').trim().toLowerCase())
+                  .filter(Boolean)
+              );
+            }
+
+            async function readAllowlist() {
+              try {
+                const { data } = await github.rest.repos.getContent({
+                  owner,
+                  repo,
+                  path: '.github/APPROVED_CONTRIBUTORS',
+                  ref: context.payload.repository.default_branch,
+                });
+                if (Array.isArray(data) || data.type !== 'file') return new Set();
+                return parseAllowlist(
+                  Buffer.from(data.content, data.encoding || 'base64').toString('utf8')
+                );
+              } catch (error) {
+                if (error.status === 404) return new Set();
+                throw error;
+              }
+            }
+
+            const allowlist = await readAllowlist();
+            const login = issue.user.login.toLowerCase();
+            if (
+              allowlist.has(`all:${login}`) ||
+              allowlist.has(`issue:${login}`)
+            ) {
+              return;
+            }
+
+            const marker = '<!-- codewhale-issue-intake -->';
+            const { data: comments } = await github.rest.issues.listComments({
+              owner,
+              repo,
+              issue_number: issue.number,
+              per_page: 100,
+            });
+            if (comments.some(comment => (comment.body || '').includes(marker))) return;
+
+            await github.rest.issues.createComment({
+              owner,
+              repo,
+              issue_number: issue.number,
+              body: [
+                marker,
+                `Thanks @${issue.user.login} for the report.`,
+                '',
+                'This issue is staying open for maintainer triage. CodeWhale gets better because people bring us real edge cases from real machines, providers, regions, and workflows.',
+                '',
+                'If you can add a reproduction, logs, version output, screenshots, or the provider/model involved, that makes it much easier for us to verify and harvest the fix. Maintainers may comment `/lgtmi` to mark recurring issue reporters as approved so this intake note is skipped next time.',
+              ].join('\n'),
+            });

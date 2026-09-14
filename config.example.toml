@@ -79,7 +79,7 @@ base_url = "https://api.deepseek.com/beta"
 #   auto                         — auto-select between flash and pro based on task complexity.
 #                                  Complex tasks (debugging, refactoring, architecture) → pro;
 #                                  simple tasks (lookups, formatting, Q&A) → flash.
-default_text_model = "deepseek-v4-pro"
+default_text_model = "deepseek-flash"
 
 # ─────────────────────────────────────────────────────────────────────────────────
 # Thinking Mode (DeepSeek V4 reasoning effort)
@@ -260,12 +260,13 @@ memory_path = "~/.codewhale/memory.md"
 # user_input_timeout_seconds = 300
 
 # ─────────────────────────────────────────────────────────────────────────────────
-# Product telemetry — opt-in, off by default
+# Product telemetry — optional, enabled by default with a startup disclosure
 # ─────────────────────────────────────────────────────────────────────────────────
-# Nothing is collected unless BOTH of these are true: `telemetry = true` here,
-# and the first-run notice has been answered with "Enable" on this machine. A
-# `telemetry = true` written before 0.9.4 is therefore inert — the key existed
-# and did nothing for a long time, and setting it was never consent.
+# Anonymous usage analytics are enabled when this key is omitted, unless an
+# existing opt-out or a run-scoped kill switch disables them. No first-run
+# affirmative opt-in is required. See docs/TELEMETRY.md for the complete schema.
+# Local session history and usage diagnostics work with telemetry disabled;
+# they require no account or hosted analytics service.
 #
 # Setting it to `false` here is an answer, not just a flag: it deletes the
 # random install id, truncates every buffered event, and leaves a tombstone
@@ -995,12 +996,12 @@ max_subagents = 10 # optional (default 64, clamped to 1-128)
 # Choose which backend the Web tool's search uses. Default is keyless Firecrawl
 # (bounded per-IP quota; `[search] api_key` or FIRECRAWL_API_KEY raises it).
 # Bing and DuckDuckGo HTML scraping need no API key. Tavily, Bocha, Metaso,
-# Baidu, Volcengine and Sofya need an api_key; SearXNG needs base_url.
+# Baidu, Volcengine, Sofya and Serply need an api_key; SearXNG needs base_url.
 # API runtime failures and empty responses visibly degrade through DuckDuckGo
 # then Bing. Missing configuration and network-policy denials fail closed.
 #
 # [search]
-# provider = "firecrawl"   # firecrawl | bing | duckduckgo | tavily | bocha | metaso | searxng | baidu | volcengine | sofya
+# provider = "firecrawl"   # firecrawl | bing | duckduckgo | tavily | bocha | metaso | searxng | baidu | volcengine | sofya | serply
 #                            # firecrawl:  Firecrawl Cloud search, keyless with a bounded per-IP quota
 #                            # duckduckgo: HTML scrape with Bing fallback
 #                            # bing:       HTML scrape, no API key
@@ -1016,9 +1017,12 @@ max_subagents = 10 # optional (default 64, clamped to 1-128)
 #                            # sofya:      https://sofya.co — AI search returning full page
 #                            #             content (not snippets), needs api_key (ay_live_...);
 #                            #             also falls back to the SOFYA_API_KEY env var
+#                            # serply:     https://serply.io Google organic results with
+#                            #             snippets, needs api_key;
+#                            #             also falls back to the SERPLY_API_KEY env var
 # base_url = "https://search.example/" # optional DuckDuckGo-compatible HTML endpoint;
 #                                      # required SearXNG root or /search endpoint
-# api_key = "YOUR_SEARCH_KEY" # required for tavily, bocha, metaso, baidu, volcengine, and sofya; optional for firecrawl (raises the keyless quota); unused by searxng
+# api_key = "YOUR_SEARCH_KEY" # required for tavily, bocha, metaso, baidu, volcengine, sofya, and serply; optional for firecrawl (raises the keyless quota); unused by searxng
 #                             # WARNING: treat config.toml like a secret file when
 #                             # storing API keys. Prefer env vars for local smoke tests.
 #
@@ -1034,6 +1038,7 @@ max_subagents = 10 # optional (default 64, clamped to 1-128)
 #   BAIDU_SEARCH_API_KEY     → baidu key fallback
 #   VOLCENGINE_API_KEY / VOLCENGINE_ARK_API_KEY / ARK_API_KEY → volcengine key fallback
 #   SOFYA_API_KEY            → sofya key fallback
+#   SERPLY_API_KEY           → serply key fallback
 
 # ─────────────────────────────────────────────────────────────────────────────────
 # Network Policy (#135)
@@ -1156,7 +1161,7 @@ osc8_links = true            # emit OSC 8 escapes around URLs (Cmd+click in iTer
 #                               # compact keeps the posture chips (and the cap
 #                               # warning) and drops the clocks, counts and hint;
 #                               # hidden gives the row to the transcript.
-# metrics_line = "full"         # full | compact | hidden (default full)
+# metrics_line = "compact"      # full | compact | hidden (default compact)
 #                               # compact keeps the route, context reading, cost
 #                               # and balance and drops the telemetry and the
 #                               # help hint; hidden gives the row to the transcript.

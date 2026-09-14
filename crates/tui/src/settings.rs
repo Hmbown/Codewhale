@@ -495,6 +495,10 @@ pub struct Settings {
     /// behavioral-tip engine and omitted entirely before the first sighting.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub behavioral_tip_impressions: std::collections::BTreeMap<String, u8>,
+    /// Plugin names explicitly dismissed from proactive suggestions. Manual
+    /// plugin commands remain available. Names are stored in lowercase.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
+    pub dismissed_plugin_suggestions: std::collections::BTreeSet<String>,
     /// Persisted use counts for the Tideline footer key hints. Keys are the
     /// stable hint identifiers in `crate::tui::footer_hints`; a hint retires
     /// to its bare state once its binding has been used enough times.
@@ -600,6 +604,7 @@ impl Default for Settings {
             yolo_deprecation_shown: false,
             work_surface_bottom_migrated: false,
             behavioral_tip_impressions: std::collections::BTreeMap::new(),
+            dismissed_plugin_suggestions: std::collections::BTreeSet::new(),
             footer_hint_uses: std::collections::BTreeMap::new(),
             legacy_yolo_default: false,
             tui_prefs_migration: None,
@@ -645,6 +650,7 @@ fn normalize_rail_panel(value: &str) -> &'static str {
         "context" => "context",
         "git" => "git",
         "price" => "price",
+        "watch" => "watch",
         // `pinned` folded into the tasks view (2026-09-02 dock views).
         _ => "tasks",
     }
@@ -1506,6 +1512,7 @@ impl Settings {
                         | "context"
                         | "git"
                         | "price"
+                        | "watch"
                         | "pinned"
                 ) {
                     anyhow::bail!(
@@ -3641,6 +3648,20 @@ mod tests {
         let error = settings.save_to_path(&path).unwrap_err().to_string();
         assert_eq!(std::fs::read_to_string(path).unwrap(), malformed);
         assert!(!error.contains("private_fixture_payload"));
+    }
+
+    #[test]
+    fn plugin_dismissals_are_additive_and_omitted_until_used() {
+        let old = toml::to_string_pretty(&Settings::default()).unwrap();
+        assert!(!old.contains("dismissed_plugin_suggestions"));
+        let mut settings: Settings = toml::from_str(&old).unwrap();
+        assert!(settings.dismissed_plugin_suggestions.is_empty());
+        settings
+            .dismissed_plugin_suggestions
+            .insert("supabase".into());
+        let encoded = toml::to_string_pretty(&settings).unwrap();
+        let decoded: Settings = toml::from_str(&encoded).unwrap();
+        assert!(decoded.dismissed_plugin_suggestions.contains("supabase"));
     }
 
     #[test]

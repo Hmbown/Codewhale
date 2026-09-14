@@ -63,6 +63,7 @@ mod integrations;
 mod lane_control;
 mod llm_client;
 mod llm_response_cache;
+mod local_ollama;
 mod logging;
 mod lsp;
 mod mcp;
@@ -79,7 +80,6 @@ mod network_policy;
 mod oauth;
 mod operate;
 mod plugins;
-mod prefix_cache;
 mod pricing;
 mod project_context;
 mod project_context_cache;
@@ -124,6 +124,7 @@ mod session_diagnostics;
 mod doctor_loader_tests;
 #[cfg(test)]
 mod session_control_acceptance;
+mod session_export;
 #[allow(dead_code)]
 mod session_manager;
 mod session_peek;
@@ -149,6 +150,9 @@ mod tool_inspection;
 mod tool_output_receipts;
 mod tools;
 mod tui;
+/// Portable, dependency-free dot-whale core and conformance helpers.
+/// The terminal and external renderers share this implementation.
+pub use tui::ambient_life::pet_sim as pet;
 mod turn_route_plan;
 mod utils;
 mod vision;
@@ -287,7 +291,7 @@ enum Commands {
         #[arg(value_enum)]
         shell: Shell,
     },
-    /// List saved sessions
+    /// List saved sessions, or export one as a full-fidelity archive
     Sessions {
         /// Maximum number of sessions to display
         #[arg(short, long, default_value = "20")]
@@ -295,6 +299,8 @@ enum Commands {
         /// Search sessions by title
         #[arg(short, long)]
         search: Option<String>,
+        #[command(subcommand)]
+        command: Option<SessionsCommand>,
     },
     /// Create default AGENTS.md in current directory
     Init,
@@ -377,6 +383,40 @@ enum Commands {
         /// Fork the most recent session in this workspace without a picker
         #[arg(long = "last", default_value_t = false, conflicts_with = "session_id")]
         last: bool,
+    },
+}
+
+/// Subcommands of `codewhale sessions`. Without one, the command falls back
+/// to listing sessions.
+#[derive(Subcommand, Debug, Clone)]
+enum SessionsCommand {
+    /// List saved sessions (default when no subcommand is given)
+    List {
+        /// Maximum number of sessions to display
+        #[arg(short, long, default_value = "20")]
+        limit: usize,
+        /// Search sessions by title
+        #[arg(short, long)]
+        search: Option<String>,
+    },
+    /// Export a session as a full-fidelity tar.xz archive (complete context:
+    /// system prompt, messages, tool calls and results, plus artifacts)
+    Export {
+        /// Session id (or unambiguous id prefix) to export
+        #[arg(value_name = "SESSION_ID")]
+        id: String,
+        /// Destination .tar.xz path (default: codewhale-session-<id>.tar.xz)
+        #[arg(short, long, value_name = "PATH")]
+        output: Option<PathBuf>,
+        /// Exclude the session artifacts directory from the archive
+        #[arg(long, default_value_t = false)]
+        skip_artifacts: bool,
+        /// xz compression preset, 0 (fastest) through 9 (smallest)
+        #[arg(long, default_value_t = session_export::DEFAULT_XZ_COMPRESSION_LEVEL)]
+        compression: u32,
+        /// Overwrite the destination file if it already exists
+        #[arg(long, default_value_t = false)]
+        force: bool,
     },
 }
 
@@ -1684,6 +1724,23 @@ fn run_with_args(args: Vec<String>) -> Result<()> {
     let startup_sandbox_mode = resolve_startup_sandbox_mode_for_hardening();
     crate::sandbox::process_hardening::apply_process_hardening(startup_sandbox_mode.as_deref());
 
+    if args.get(1).is_some_and(|arg| arg == "pet") {
+        let root = crate::tui::pet_watch::owner::directory()?;
+        match args.get(2).map(String::as_str) {
+            Some("serve") if args.len() == 3 => {
+                return crate::tui::pet_watch::owner::serve(
+                    root,
+                    std::env::var("CODEWHALE_PET_PORT")
+                        .ok()
+                        .map(|p| p.parse::<u16>())
+                        .transpose()?
+                        .unwrap_or(4633),
+                );
+            }
+            _ => anyhow::bail!("Usage: codewhale pet serve"),
+        }
+    }
+
     // ── Fatal-signal terminal guard (#5424) ───────────────────────────────
     // Abort-class deaths (stack overflow, allocation failure, double panic)
     // skip the panic hook AND every Drop guard, leaving mouse capture and
@@ -1941,6 +1998,8 @@ fn telemetry_session_source(command: Option<&Commands>) -> codewhale_telemetry::
 }
 
 /// Read-only commands must not create telemetry state as a side effect.
+// Sessions export only projects local records to an explicit output. Like
+// listing, it must not initialize telemetry or interactive session state.
 fn telemetry_command_is_read_only(command: Option<&Commands>) -> bool {
     matches!(
         command,
@@ -2213,7 +2272,23 @@ async fn run_async_main_dispatch(
                 generate_completions(shell);
                 Ok(())
             }
-            Commands::Sessions { limit, search } => list_sessions(limit, search),
+            Commands::Sessions {
+                command,
+                limit,
+                search,
+            } => match command {
+                None => list_sessions(limit, search),
+                Some(SessionsCommand::List { limit, search }) => list_sessions(limit, search),
+                Some(SessionsCommand::Export {
+                    id,
+                    output,
+                    skip_artifacts,
+                    compression,
+                    force,
+                }) => {
+                    run_sessions_export(&id, output.as_deref(), skip_artifacts, compression, force)
+                }
+            },
             Commands::Init => init_project(),
             Commands::Login { api_key } => run_login(api_key),
             Commands::Logout => run_logout(),
@@ -2776,6 +2851,7 @@ fn is_workspace_dotenv_credential_key(key: &str) -> bool {
             key,
             "DEEPSEEK_SEARCH_API_KEY"
                 | "SOFYA_API_KEY"
+                | "SERPLY_API_KEY"
                 | "METASO_API_KEY"
                 | "BAIDU_SEARCH_API_KEY"
                 | "DEEPSEEK_SANDBOX_API_KEY"
@@ -7899,6 +7975,77 @@ fn list_sessions(limit: usize, search: Option<String>) -> Result<()> {
     );
 
     Ok(())
+}
+
+/// Export one saved session as a full-fidelity `tar.xz` archive
+/// (`session_export`). Prefers an exact session id; falls back to an
+/// unambiguous id prefix like the resume flow.
+fn run_sessions_export(
+    id: &str,
+    output: Option<&Path>,
+    skip_artifacts: bool,
+    compression: u32,
+    force: bool,
+) -> Result<()> {
+    use session_export::{SessionArchiveOptions, default_archive_file_name, write_session_archive};
+
+    let manager = SessionManager::default_location()?;
+    let session = match manager.load_session_snapshot(id) {
+        Ok(session) => session,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            manager.load_session_snapshot(&manager.resolve_session_id_prefix(id)?)?
+        }
+        Err(error) => return Err(error.into()),
+    };
+
+    let output_path = output.map_or_else(
+        || PathBuf::from(default_archive_file_name(&session.metadata)),
+        Path::to_path_buf,
+    );
+    let summary = write_session_archive(
+        &session,
+        Some(manager.sessions_dir()),
+        &output_path,
+        SessionArchiveOptions {
+            include_artifacts: !skip_artifacts,
+            compression_level: compression,
+            overwrite: force,
+        },
+    )?;
+
+    use codewhale_localization::{MessageId, resolve_locale, tr};
+    let settings = crate::settings::Settings::load_read_only().unwrap_or_default();
+    let locale = resolve_locale(&settings.locale);
+    println!(
+        "{} {} → {}",
+        tr(locale, MessageId::SessionArchiveExported),
+        truncate_id(&session.metadata.id),
+        summary.output.display()
+    );
+    println!(
+        "  {}: {} / {} / {}",
+        tr(locale, MessageId::SessionArchiveSizes),
+        summary.members.len(),
+        format_bytes(summary.total_member_bytes()),
+        format_bytes(summary.compressed_bytes())
+    );
+    if !summary.includes_artifacts && !skip_artifacts {
+        println!("  {}", tr(locale, MessageId::SessionArchiveNoArtifacts));
+    }
+    println!("  {}", tr(locale, MessageId::SessionArchiveRestoreHint));
+    Ok(())
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const KIB: f64 = 1024.0;
+    let bytes = bytes as f64;
+    if bytes >= KIB * KIB {
+        format!("{:.1} MiB", bytes / (KIB * KIB))
+    } else if bytes >= KIB {
+        format!("{:.1} KiB", bytes / KIB)
+    } else {
+        format!("{bytes} B")
+    }
 }
 
 /// Initialize a new project with AGENTS.md
@@ -14167,6 +14314,45 @@ mod doctor_endpoint_tests {
         assert!(report["alias_deprecation"].is_null());
     }
 
+    /// The vendor reversed the planned retirement; Pro remains its own route.
+    #[test]
+    fn provider_capability_report_preserves_v4_pro_without_retirement() {
+        let mut config = Config {
+            base_url: Some(crate::config::DEFAULT_DEEPSEEK_BASE_URL.to_string()),
+            default_text_model: Some("deepseek-v4-pro".to_string()),
+            ..Default::default()
+        };
+        crate::config::normalize_model_config_for_test(&mut config);
+        let report = provider_capability_report(&config);
+        assert_eq!(report["resolved_model"], "deepseek-v4-pro");
+        assert!(report["alias_deprecation"].is_null());
+        assert!(
+            crate::config::provider_capability(
+                crate::config::ApiProvider::Deepseek,
+                "deepseek-v4-pro"
+            )
+            .alias_deprecation
+            .is_none()
+        );
+    }
+
+    /// A custom endpoint owns the same model strings; DeepSeek's retirement is
+    /// not a claim CodeWhale may make about someone else's host.
+    #[test]
+    fn provider_capability_report_leaves_custom_v4_pro_namespace_untouched() {
+        let mut config = Config {
+            base_url: Some("https://models.example/v1".to_string()),
+            default_text_model: Some("deepseek-v4-pro".to_string()),
+            ..Default::default()
+        };
+        crate::config::normalize_model_config_for_test(&mut config);
+
+        let report = provider_capability_report(&config);
+
+        assert_eq!(report["resolved_model"], "deepseek-v4-pro");
+        assert!(report["alias_deprecation"].is_null());
+    }
+
     #[test]
     fn doctor_route_report_exposes_tokenhub_openai_compatible_route_without_secret() {
         let mut providers = crate::config::ProvidersConfig::default();
@@ -14459,6 +14645,37 @@ mod terminal_mode_tests {
 
     fn parse_cli(args: &[&str]) -> Cli {
         Cli::try_parse_from(args).expect("CLI args should parse")
+    }
+
+    #[test]
+    fn sessions_archive_cli_keeps_legacy_listing_and_export_options() {
+        let legacy = parse_cli(&["codewhale", "sessions", "--limit", "7", "--search", "work"]);
+        assert!(
+            matches!(legacy.command, Some(Commands::Sessions { limit: 7, search: Some(ref s), command: None }) if s == "work")
+        );
+        let list = parse_cli(&["codewhale", "sessions", "list", "--limit", "4"]);
+        assert!(matches!(
+            list.command,
+            Some(Commands::Sessions {
+                command: Some(SessionsCommand::List { limit: 4, .. }),
+                ..
+            })
+        ));
+        let export = parse_cli(&[
+            "codewhale",
+            "sessions",
+            "export",
+            "abc123",
+            "--output",
+            "session.tar.xz",
+            "--skip-artifacts",
+            "--force",
+            "--compression",
+            "0",
+        ]);
+        assert!(
+            matches!(export.command, Some(Commands::Sessions { command: Some(SessionsCommand::Export { ref id, output: Some(ref output), skip_artifacts: true, compression: 0, force: true }), .. }) if id == "abc123" && output == Path::new("session.tar.xz"))
+        );
     }
 
     #[test]

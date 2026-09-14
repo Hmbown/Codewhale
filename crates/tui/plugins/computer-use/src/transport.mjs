@@ -181,6 +181,7 @@ export async function executorFor(computer) {
     const status = await ensureApp();
     if (status.via === "app") {
       if (status.app.sessionProtocol !== 2) throw Object.assign(new ExecError("The installed Computer Use helper needs an update for isolated sessions and disconnect cleanup. Rebuild/reinstall it, then retry."), { code: "app_upgrade_required" });
+      if (process.platform === "darwin" && status.app.backgroundProtocol !== 1) throw Object.assign(new ExecError("The installed Computer Use app predates background scrolling, scoped observations and foreground preemption. Update and restart the helper before using it."), { code: "app_upgrade_required" });
       return appExec(status.app);
     }
     return { ...localExec(), appReason: status.reason };

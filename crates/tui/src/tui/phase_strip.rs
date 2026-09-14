@@ -140,6 +140,16 @@ fn notice_clauses<'a>(text: &'a str, marks: &[char]) -> Vec<&'a str> {
         if !breaks {
             continue;
         }
+        // `1.` opening a numbered step is a list ordinal, not a sentence
+        // stop — breaking there leaves the toast ending on a bare `1.`
+        // (the send-blocked clip: `…not found. 1.`). Only the pure
+        // number-and-stop shape is exempt; `Version 1.` still ends a clause.
+        if ch == '.'
+            && text[start..idx].trim().bytes().all(|b| b.is_ascii_digit())
+            && !text[start..idx].trim().is_empty()
+        {
+            continue;
+        }
         let end = idx + ch.len_utf8();
         let clause = text[start..end].trim();
         if !clause.is_empty() {
@@ -794,11 +804,16 @@ struct PostureItem {
 /// can open, the hint names a chord you can press right now (`Esc to
 /// interrupt`, `Enter again to send now`). An 80-column row carrying the
 /// filesystem-scope notice cannot hold all of it, and losing the affordance
-/// to keep the stopwatch is the wrong trade. The turn half goes before the
-/// session half: the transcript's active row and the spinner also show the
-/// turn is alive, while the session total is stated nowhere else. Above
-/// them the context-cap warning, which is not a hint but the reason the
-/// next turn will not start at all.
+/// to keep the stopwatch is the wrong trade. When both halves would paint,
+/// the turn half goes before the session half: the transcript's active row
+/// and the spinner also show the turn is alive, while the session total is
+/// stated nowhere else. When the session half is suppressed (#6041) or
+/// otherwise absent, the turn half sheds at the session-clock rung instead
+/// so the ladder does not abandon the only clock at the turn-only rung
+/// while a both-clocks row would still be stating a stopwatch (#6084).
+/// The hint and counts still outrank it (#5914). Above them the
+/// context-cap warning, which is not a hint but the reason the next turn
+/// will not start at all.
 const SHED_TURN_CLOCK: u8 = 1;
 const SHED_SESSION_CLOCK: u8 = 2;
 const SHED_HINT: u8 = 3;
@@ -844,7 +859,17 @@ fn posture_items(footer: &TidelineFooter<'_>, shed: u8) -> Vec<PostureItem> {
             count_index: None,
         });
     }
-    if let Some((clock, ink)) = footer.turn_clock.filter(|_| shed < SHED_TURN_CLOCK) {
+    // When no session half will paint, shed the turn clock at the session
+    // rung so a width that would keep the session half (and drop the turn)
+    // still keeps the only informative clock (#6084). Hint and counts still
+    // outrank it (#5914). With both halves present the turn half still goes
+    // first.
+    let turn_shed = if footer.session_clock.is_none() {
+        SHED_SESSION_CLOCK
+    } else {
+        SHED_TURN_CLOCK
+    };
+    if let Some((clock, ink)) = footer.turn_clock.filter(|_| shed < turn_shed) {
         items.push(PostureItem {
             text: footer.sym(clock),
             ink,
@@ -943,7 +968,10 @@ pub fn render_tideline_footer(
     let floor = left_run_width(&mark, &posture_items(footer, MAX_SHED));
     let right = footer.right.map(|(text, ink)| {
         let budget = width.saturating_sub(floor + 1);
-        (truncate_owned(&footer.sym(text), budget), ink)
+        (
+            crate::tui::ui_text::truncate_line_to_width(&footer.sym(text), budget),
+            ink,
+        )
     });
     let right_width = right
         .as_ref()
@@ -958,7 +986,10 @@ pub fn render_tideline_footer(
     let permission_ink = footer.permission_chip.1;
     let mut x = usize::from(area.x);
     let clip = |x: usize, text: &str| -> String {
-        truncate_owned(text, (usize::from(area.x) + left_budget).saturating_sub(x))
+        crate::tui::ui_text::truncate_line_to_width(
+            text,
+            (usize::from(area.x) + left_budget).saturating_sub(x),
+        )
     };
     tput(
         buf,
@@ -1010,20 +1041,6 @@ pub fn render_tideline_footer(
     count_rects
 }
 
-fn truncate_owned(text: &str, width: usize) -> String {
-    let mut out = String::new();
-    let mut used = 0;
-    for ch in text.chars() {
-        let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
-        if used + w > width {
-            break;
-        }
-        out.push(ch);
-        used += w;
-    }
-    out
-}
-
 /// Owned posture facts, built from real `App` state at render time and lent
 /// to [`TidelineFooter`] for painting.
 pub(crate) struct TidelineFooterFacts {
@@ -1034,9 +1051,9 @@ pub(crate) struct TidelineFooterFacts {
     pub turn_clock: ClockReading,
     pub counts: Vec<(String, ChromeInk)>,
     pub session_clock: ClockReading,
-    /// The dock view each entry of `counts` opens when clicked — same
+    /// The action each entry of `counts` runs when clicked — same
     /// length, same order.
-    pub count_panels: Vec<crate::tui::work_surface::RailPanel>,
+    pub count_actions: Vec<crate::tui::tideline::InteractionAction>,
     pub hint: Option<(String, codewhale_palette::ChromeInk)>,
     pub context_percent: u8,
     pub right: Option<(String, codewhale_palette::ChromeInk)>,
@@ -1157,9 +1174,10 @@ fn live_counts(
     tier: ShellTier,
 ) -> (
     Vec<(String, ChromeInk)>,
-    Vec<crate::tui::work_surface::RailPanel>,
+    Vec<crate::tui::tideline::InteractionAction>,
 ) {
     use crate::tui::background_indicator::{PendingItemKind, pending_work_from_app};
+    use crate::tui::tideline::InteractionAction;
     use crate::tui::work_surface::RailPanel;
     let mut counts = Vec::new();
     let mut panels = Vec::new();
@@ -1171,14 +1189,14 @@ fn live_counts(
                 tr(app.ui_locale, MessageId::FooterAgentSingular).into_owned(),
                 ChromeInk::Active,
             ));
-            panels.push(RailPanel::Agents);
+            panels.push(InteractionAction::ShowDockPanel(RailPanel::Agents));
         }
         n => {
             counts.push((
                 tr(app.ui_locale, MessageId::FooterAgentsPlural).replace("{count}", &n.to_string()),
                 ChromeInk::Active,
             ));
-            panels.push(RailPanel::Agents);
+            panels.push(InteractionAction::ShowDockPanel(RailPanel::Agents));
         }
     }
     let shells = app
@@ -1191,7 +1209,7 @@ fn live_counts(
             format!("{shells} {}", PendingItemKind::Shell.plural_noun(shells)),
             ChromeInk::Active,
         ));
-        panels.push(RailPanel::Background);
+        panels.push(InteractionAction::ShowDockPanel(RailPanel::Background));
     }
     let tasks = pending_work_from_app(app).count(PendingItemKind::Task);
     if tasks > 0 {
@@ -1199,7 +1217,7 @@ fn live_counts(
             format!("{tasks} {}", PendingItemKind::Task.plural_noun(tasks)),
             ChromeInk::Active,
         ));
-        panels.push(RailPanel::Background);
+        panels.push(InteractionAction::ShowDockPanel(RailPanel::Background));
     }
     // Scheduled automation: the `AutomationPanelState` projection stays the
     // single owner; Compact keeps the abbreviated count (chrome sheds
@@ -1211,7 +1229,7 @@ fn live_counts(
     };
     if let Some(automation) = automation {
         counts.push((automation, app.automation_panel.activity_ink()));
-        panels.push(RailPanel::Background);
+        panels.push(InteractionAction::OpenAutomations);
     }
     // With nothing live there is still one bottom affordance that opens the
     // dock (founder, 2026-09-03: the bar opens when used, or when you click
@@ -1242,7 +1260,7 @@ fn live_counts(
             format!("{label} ({chord})")
         };
         counts.push((label, ChromeInk::MetadataValue));
-        panels.push(RailPanel::Tasks);
+        panels.push(InteractionAction::ShowDockPanel(RailPanel::Tasks));
     }
     (counts, panels)
 }
@@ -1337,7 +1355,7 @@ pub(crate) fn tideline_footer_from_app(app: &mut App, width: u16) -> TidelineFoo
         });
 
     let (turn_clock, session_clock) = working_clock(app, phase, &phase_label);
-    let (counts, count_panels) = live_counts(app, tier);
+    let (counts, count_actions) = live_counts(app, tier);
     TidelineFooterFacts {
         permission_chip,
         permission_key: live_chord(ShellBindingId::PermissionCycle).filter(|_| {
@@ -1356,7 +1374,7 @@ pub(crate) fn tideline_footer_from_app(app: &mut App, width: u16) -> TidelineFoo
         turn_clock,
         counts,
         session_clock,
-        count_panels,
+        count_actions,
         hint,
         context_percent: context_percent_from_app(app),
         right,

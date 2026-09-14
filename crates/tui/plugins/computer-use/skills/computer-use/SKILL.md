@@ -1,6 +1,6 @@
 ---
 name: computer-use
-description: Full desktop control on macOS, Windows, Linux, and HarmonyOS — accessibility-first observation and actions with pixel fallback, screenshots, zoom, screen recording, and switching between registered computers as a default.
+description: Desktop control with accessibility-first observation and actions, pixel fallback, screenshots, zoom, screen recording, and switching between registered computers. Qualified on macOS; Windows, Linux and HarmonyOS backends are experimental.
 ---
 
 # Codewhale Computer Use
@@ -18,6 +18,18 @@ computer unless given `computer`.
   HarmonyOS devices driven over hdc.
 - Every receipt names the computer it happened on. Read it before continuing —
   never assume the action landed on the machine you meant.
+
+## Human controls
+
+When the local helper is installed, it owns the input route even when the
+host also includes a native binary. A disconnected helper is an error, never
+permission to bypass it with direct input. `control_paused` and
+`control_stopped` mean the person paused or stopped Computer Use. Stop acting
+and wait for them; do not change environment variables, restart the helper,
+create another session or use another tool to defeat their choice. After Stop,
+the old session remains invalid even when the person allows new sessions.
+The helper's own setup, permission and safety controls belong to the person.
+Do not operate them or approve the host's pending authorization yourself.
 
 ## Core loop
 
@@ -42,7 +54,10 @@ Observe once, act once, then verify.
    or values mean unknown content, not something to guess.
 4. If the tree contains the target, act on the element: `perform_action`
    (AXPress/Invoke/click…), `set_value` for editable fields, element click.
-   The element path is background-safe on macOS and UIA platforms.
+   macOS provides background element actions; Linux AT-SPI support depends
+   on the control. Windows currently refuses scoped semantic mutations.
+   Windows and Linux are development backends: do not assume their raw
+   input is background-safe or that native Pause/Stop controls are available.
 5. When accessibility cannot read visible text, macOS supports
    `get_app_state({app_ref, include_ocr:true})`. This explicitly captures the
    selected app window and recognizes text locally, without a vision model or
@@ -89,18 +104,24 @@ Observe once, act once, then verify.
   processes share a bundle id. Then the two halves behave differently:
   - **Keyboard and element actions are quiet.** `type`, `key`, `set_value`,
     `select_text` and `perform_action` reach the bound process without moving
-    the pointer or changing the foreground. Prefer them.
+    the pointer or changing the foreground. Prefer them. Text entry uses writable
+    accessibility selection when available; verify the resulting value.
+    `get_app_state`, `list_windows` and `screenshot` default to the selected app.
   - **Background mode never takes the shared pointer.** A coordinate
-    `left_click` first tries the bound application's accessibility press.
-    Without one, or for raw double/triple/right/middle click, drag, hover or
-    scroll, it fails with `shared_pointer_required` before moving the cursor.
+    `left_click` first tries the bound application's accessibility action,
+    including field focus and row selection. `right_click` uses advertised
+    context-menu actions. `scroll` uses the target's accessibility scrollbar;
+    prefer a scroll-area element and read the receipt's unit and value change.
+    Raw double/triple/middle click, drag and hover fail with
+    `shared_pointer_required` before moving the cursor. Missing semantic
+    scrolling or context-menu support is a refusal, never permission to activate.
     Use another advertised accessibility action or a separate computer.
   - Shared-desktop gestures and foreground keyboard delivery require explicit
     user authorization for exclusive desktop use, followed by
     `open_application(activate:true)`. Do not select it merely to work around a
     background refusal. Receipts identify `input_scope: "shared-desktop"`;
     pointer gestures use the physical cursor, even if it is restored afterward.
-    Keys are `foreground-guarded` and stop when another app takes focus. Never
+    Keys and raw pointer gestures stop when another app takes focus. Never
     keep reactivating after the user takes control; return to `activate:false`
     when the shared-desktop step ends.
   - Menus appear in `get_app_state`. Use the advertised action (often

@@ -6,19 +6,21 @@ Codewhale has three related concepts:
 
 - **TUI mode**: what kind of visible interaction you're in (Plan/Work/Operate).
 - **Permission posture**: how aggressively the UI asks before executing tools.
-- **Workflow overlay**: optional long-running orchestration that can
-  run on top of any TUI mode when a task needs many coordinated workers.
+- **Workflow**: named steps that coordinate sub-agents, with dependencies and
+  results, available in any TUI mode.
 
 Model selection is separate. `--model auto` and `/model auto` route each turn to
 a concrete model and thinking level; they are not TUI modes and are not part of
 the `Tab` cycle.
 
-Workflow is also separate from the mode itself. It is the visible ordered
-orchestration layer for repeatable workflows and fleet workers. High fan-out
-routes through durable fleet-backed workers instead of prompt-only sub-agent
-fanout. The active mode
-still controls permissions; Workflow controls whether a large task is planned
-into a resumable workflow with its own progress view.
+Workflow runs named steps through the same sub-agent runtime; Fleet manages
+their saved roles and model assignments. A workflow adds ordering, result
+handoffs, gates and a progress view. The active mode and permission posture
+still control what each step may execute.
+
+Before assigning steps, query `agent(action="roster")` for the saved Fleet
+models and roles. A plan child can select a listed model with `model`, or use
+the saved `role`/`profile` assignment. An Exact Fleet fixes each member's route.
 
 ## TUI Modes
 
@@ -31,8 +33,8 @@ Run `/mode` to open the mode picker, or switch directly with `/mode work`,
 `/mode plan`, or `/mode operate`.
 
 - **Plan**: design-first prompting. The stable primitive names remain familiar, but the runtime centrally refuses file mutation and shell execution. Read-only inspection and policy-allowed research, including deferred Web search/fetch, remain available.
-- **Work** (internally `agent`): ordinary multi-step execution. The first-turn toolbox includes `read`, `write`, `edit`, `bash`, `agent`, and `todo_write`, plus `create_goal`, `get_goal`, and `update_goal` so goal controls are available without discovery. Goals still require an explicit user request; approval, sandbox, repository law, and managed policy decide what may execute.
-- **Operate**: multitask conductor posture. Operate can turn a direct work instruction into a goal and work it in parallel: background workers for separable streams, verified before it stops. It has the same primitive identities and execution authority as Work. When no unfinished goal exists, a direct work instruction (not a greeting, acknowledgement, question, quoted command, conversational followup, or request declining goal tracking) becomes the session goal automatically, with continuation on; the transcript shows `◆ goal set · Operate keeps working until it is verified · /goal to edit`. An explicit `/goal` declaration still wins, `/goal` still edits it, and an existing goal is never replaced. The parent session is the **operator**: dispatching background workers is the default for independent or parallel work. Handle small or tightly coupled tasks in the parent; use background `agent` workers for separable streams, and use Workflow when order, phases, gates, shared budgets, or deterministic fan-in matter. **Dispatch is not completion** — write-capable children must return real verification evidence. The first Operate turn of a session appends this contract once as a user-role runtime message (append-only history, never the pinned system prompt), so Plan, Work, and Operate keep one shared prompt prefix.
+- **Work** (internally `agent`): ordinary multi-step execution. The first-turn toolbox includes `read`, `write`, `edit`, `bash`, `agent`, `workflow`, and `todo_write`, plus `create_goal`, `get_goal`, and `update_goal` so goal controls are available without discovery. Goals still require an explicit user request; approval, sandbox, repository law, and managed policy decide what may execute.
+- **Operate**: manage a goal through planned steps and verified results. Fleet configures the same sub-agents and roles that execute those steps. It has the same primitive identities and execution authority as Work. When no unfinished goal exists, a direct work instruction (not a greeting, acknowledgement, question, quoted command, conversational followup, or request declining goal tracking) becomes the session goal automatically, with continuation on; the transcript shows `◆ goal set · Operate keeps working until it is verified · /goal to edit`. An explicit `/goal` declaration still wins, `/goal` still edits it, and an existing goal is never replaced. The parent session is the **operator**: handle small or tightly coupled tasks directly. Before multi-step delegation, state a compact plan with named steps, dependencies, bounded file scopes and a completion check, then run it through the existing Workflow tool. Parallelize independent steps; each phase receives the previous phase's results, and a dependent step cannot start when a required result is missing. A single bounded independent task can use a direct `agent` call. Reuse a worker with followup for corrections and report completed, blocked and next steps. **Dispatch is not completion** — write-capable children must return real verification evidence. The first Operate turn of a session appends this contract once as a user-role runtime message (append-only history, never the pinned system prompt), so Plan, Work, and Operate keep one shared prompt prefix.
 
 `Act` and `/mode act` remain compatibility aliases for Work. Saved settings
 still normalize to the internal value `agent`.
@@ -60,11 +62,12 @@ authority difference does not require a different primitive vocabulary.
 ```text
 User message
   → small / chat / one-file?  → parent does it (Work-equivalent tools)
-  → real / multi-stream work? → goal (set from the prompt) → dispatch background workers
-       → each write child: implement → VERDICT PASS/FAIL with evidence
-       → ordered / gated fan-in? → Workflow (operate_* starters)
-       → high-stakes ambiguous? → best-of-n (N worktrees + reviewer; apply on PASS)
-  → parent synthesizes receipts; stays free for the next ask
+  → multi-step work? → goal → named steps + dependencies + completion checks
+       → Workflow phases → independent sub-agents in parallel
+       → collect results → check evidence → hand off to the next phase
+       → missing required result? → stop dependent work and repair the step
+       → one independent task? → one direct sub-agent
+  → parent integrates results and reports completed, blocked and next steps
 ```
 
 Lifecycle claims stay exact: dispatched ≠ settled ≠ verified.

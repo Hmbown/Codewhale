@@ -168,6 +168,12 @@ import { writeFileSync } from "node:fs";
 writeFileSync(`${process.env.PREPARE_RELEASE_TEST_MARKERS}/derive-facts`, "");
 EOF
 
+  cat >"${root}/web/scripts/derive-changelog.mjs" <<'EOF'
+import { writeFileSync } from "node:fs";
+
+writeFileSync(`${process.env.PREPARE_RELEASE_TEST_MARKERS}/derive-changelog`, "");
+EOF
+
   chmod +x \
     "${root}/bin/cargo" \
     "${root}/scripts/release/prepare-release.sh" \
@@ -214,7 +220,7 @@ if grep -R -E -- '--tag v[0-9]+\.[0-9]+\.[0-9]+' \
   echo "tag-free localized README unexpectedly gained a release tag" >&2
   exit 1
 fi
-for marker in cargo sync-changelog derive-facts check-versions check-ohos-deps; do
+for marker in cargo sync-changelog derive-facts derive-changelog check-versions check-ohos-deps; do
   [[ -f "${success_markers}/${marker}" ]] || {
     echo "prepare-release did not reach ${marker}" >&2
     exit 1
@@ -244,7 +250,7 @@ PREPARE_RELEASE_TEST_MARKERS="${same_markers}" \
 grep -Fq \
   'Workspace is already at 0.8.68; refreshing generated release state and rerunning gates.' \
   "${same_log}"
-for marker in sync-changelog derive-facts check-versions check-ohos-deps; do
+for marker in sync-changelog derive-facts derive-changelog check-versions check-ohos-deps; do
   [[ -f "${same_markers}/${marker}" ]] || {
     echo "same-version prepare-release did not reach ${marker}" >&2
     exit 1

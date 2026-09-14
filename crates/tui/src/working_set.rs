@@ -613,7 +613,9 @@ fn walk_always_discoverable_dirs(
             break;
         }
         let dot_dir = walk_root.join(dir_name);
-        if !dot_dir.is_dir() {
+        // A walker follows a symlink passed as its root even when ordinary
+        // symlink following is off. Keep that opt-out for the extra roots too.
+        if !dot_dir.is_dir() || (!follow_links && dot_dir.is_symlink()) {
             continue;
         }
         let mut builder = WalkBuilder::new(&dot_dir);
@@ -1592,6 +1594,28 @@ mod tests {
     use super::*;
     use codewhale_models::Role;
     use tempfile::TempDir;
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_file_search_discovery_respects_symlink_opt_out_for_ai_directories() {
+        let workspace = TempDir::new().unwrap();
+        let external = TempDir::new().unwrap();
+        fs::write(external.path().join("outside.rs"), "").unwrap();
+        std::os::unix::fs::symlink(external.path(), workspace.path().join(".agents")).unwrap();
+        for follow_links in [false, true] {
+            let resolver = Workspace::with_cwd_depth_and_follow_links(
+                workspace.path().to_path_buf(),
+                None,
+                DEFAULT_COMPLETIONS_WALK_DEPTH,
+                follow_links,
+            );
+            let candidates = resolver.completion_discovery_candidates(100, &|| false);
+            assert_eq!(
+                candidates.iter().any(|path| path == ".agents/outside.rs"),
+                follow_links
+            );
+        }
+    }
 
     fn make_message(role: &str, text: &str) -> Message {
         Message {

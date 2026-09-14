@@ -37,6 +37,45 @@ fn sniffing_ignores_the_extension_and_believes_the_bytes() {
 }
 
 #[test]
+fn rich_tool_images_reject_corruption_mime_spoofing_and_decode_bombs() {
+    use crate::tools::spec::{RichToolResult, ToolResult};
+    use codewhale_tools::ToolResultContentBlock;
+    let mut oversized_header = PNG_1X1.to_vec();
+    oversized_header[16..20].copy_from_slice(&(MAX_IMAGE_DIMENSION + 1).to_be_bytes());
+    for (mime, bytes) in [
+        ("image/png", &PNG_1X1[..8]),
+        ("image/jpeg", PNG_1X1),
+        ("image/png", oversized_header.as_slice()),
+    ] {
+        assert!(prepare_tool_image_bytes(bytes, mime).block.is_none());
+        let rich = bound_rich_tool_result(RichToolResult::with_content_blocks(
+            ToolResult::success("capture receipt"),
+            vec![ToolResultContentBlock::Image {
+                mime_type: mime.into(),
+                data: STANDARD.encode(bytes),
+            }],
+        ));
+        assert!(rich.result.success);
+        assert!(rich.content_blocks.is_empty());
+        assert!(rich.result.content.starts_with("capture receipt"));
+        assert!(
+            rich.result
+                .content
+                .contains("1 tool-result image block(s) omitted")
+        );
+        let stored = vec![
+            serde_json::json!({"type":"image","mime_type":mime,"data":STANDARD.encode(bytes)}),
+        ];
+        let (image, omitted) = provider_tool_result_image_refs(Some(&stored));
+        assert!(
+            image.is_none(),
+            "restored history must not bypass validation"
+        );
+        assert_eq!(omitted, 1);
+    }
+}
+
+#[test]
 fn lowercase_read_image_preparation_is_typed_and_bounded() {
     let prepared = prepare_tool_image_bytes(PNG_1X1, "image/png");
     assert_eq!(prepared.note, "Read image file [image/png]");

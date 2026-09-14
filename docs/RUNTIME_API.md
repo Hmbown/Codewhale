@@ -65,6 +65,42 @@ The legacy in-process `codewhale app-server` also requires an explicit
 `--auth-token` or `CODEWHALE_APP_SERVER_TOKEN` before binding a non-loopback
 host; its generated one-time `cwapp_*` token is loopback-only.
 
+### Workspace file suggestions
+
+`GET /v1/workspace/files/search?query=runtime&limit=20` returns
+`{"paths":["src/runtime.rs"]}` through the existing authenticated `/v1/*`
+router. It searches only the server's configured workspace, not a thread's
+workspace or the process's current directory. No workspace/path override is
+accepted. The response contains workspace-relative file paths with `/`
+separators, never file contents, absolute paths, or directories.
+
+- `query` is a literal partial filename/path, without an `@` prefix, at most
+  256 UTF-8 bytes. Missing, empty, or whitespace-only queries return an empty
+  list without walking the filesystem. No match also returns an empty list.
+- `limit` defaults to 20; accepted values are 1–100. Invalid limits, oversized
+  queries, and unknown query parameters return HTTP 400.
+- Matching reuses TUI fuzzy `@file` discovery/ranking: case-insensitive path
+  prefix matches first, then substring matches, alphabetically within each
+  group. This is not glob, subsequence, content, or semantic search, and does
+  not apply the TUI's personal frecency boosts.
+- Discovery shares the composer's ignore policy, including `.ignore` and
+  `.deepseekignore`, always-discoverable AI directories, and the bounded
+  hidden/gitignored local-reference fallback. The special `.agents`, `.claude`,
+  `.cursor`, and `.deepseek` walks intentionally bypass ignore rules, as in
+  the TUI. Ignore files are not confidentiality boundaries.
+- Directory symlinks are not traversed. Files are canonicalized and filtered
+  for containment in the workspace before applying the result limit; external
+  and broken file symlinks are omitted. In-workspace file symlinks may appear
+  by their relative names. Suggestions are a filesystem snapshot, not
+  authorization to read a file later; consumers must revalidate when opening it.
+
+Discovery runs off the async executor, with the shared default depth of 10,
+at most 20,000 candidates, and a cooperative two-second discovery budget.
+Results are best-effort, not an exhaustive listing; a slow filesystem operation
+can finish after that budget. Each request scans anew; there is no new index or
+cache. This read-only endpoint does not alter sessions or the pinned model
+prompt/tool prefix.
+
 ### Runtime and account identity
 
 `GET /v1/runtime/info` reports `codewhale_version` plus the full 40-character
@@ -672,7 +708,8 @@ accept an empty string to clear a previously-set value. Added in v0.8.10 (#562):
 - `POST /v1/threads/{id}/turns/{turn_id}/interrupt`
 - `POST /v1/threads/{id}/compact` (manual compaction)
 - `POST /v1/threads/{id}/undo` - fork the thread with the last N turns removed (`{"depth": N}`, default 0 = last turn only); returns the forked thread plus `original_user_text` so a GUI can pre-populate the input box
-- `POST /v1/threads/{id}/patch-undo` - snapshot-based file rollback followed by the same fork (`{"depth": N}`); returns `patch_result` (`files_restored`, `summary`, `snapshot_label`) alongside the forked thread
+- `POST /v1/threads/{id}/patch-undo` - snapshot-based whole-workspace rollback followed by the same fork (`{"depth": N}`); returns `patch_result` (`files_restored`, `summary`, `snapshot_label`) alongside the forked thread. See [Workspace restore endpoints](#workspace-restore-endpoints) for the trust, admission and abort rules.
+- `POST /v1/threads/{id}/file-revert` - restore exactly one file from one named snapshot (`{"path", "snapshot_id", "expected_hash"}`); never forks the conversation. See [Workspace restore endpoints](#workspace-restore-endpoints).
 - `POST /v1/threads/{id}/retry` - fork with the last N turns removed and immediately start a new turn (`{"depth": N, "prompt": "..."}`; `prompt` overrides the original user text, which is re-used when omitted)
 
 `POST /v1/threads/{id}/turns` accepts the same optional
@@ -859,7 +896,11 @@ the first returned event advances past exactly the omitted history.
 `/v1/snapshots` lists recent side-git restore points for the runtime workspace.
 `limit` defaults to `20` and must be between `1` and `100`. `POST
 /v1/snapshots/{id}/restore` restores workspace files from the snapshot and
-returns `{"restored": "<snapshot-id>"}`.
+returns `{"restored": "<snapshot-id>"}`. It is the direct operator surface for
+the server's own workspace (the same action as the TUI's `/restore <N>`): it is
+gated by the Runtime API bearer token, not by any thread's trust flag, and it
+is refused with `409` while a turn is active in an overlapping workspace (see
+below). A `pre-restore:` safety snapshot is taken first.
 
 ```json
 [
@@ -870,6 +911,102 @@ returns `{"restored": "<snapshot-id>"}`.
   }
 ]
 ```
+
+### Workspace restore endpoints
+
+Three routes mutate workspace files from side-git snapshots. They share one
+admission rule and one safety net, and they differ in scope and trust.
+
+| Route | Scope | Trust | Forks the thread |
+| --- | --- | --- | --- |
+| `POST /v1/snapshots/{id}/restore` | whole server workspace | bearer token only (operator action) | no |
+| `POST /v1/threads/{id}/patch-undo` | whole thread workspace | thread `trust_mode` or `auto_approve` when files would change | yes |
+| `POST /v1/threads/{id}/file-revert` | exactly one regular file | thread `trust_mode` or `auto_approve`, always | no |
+
+**Admission.** A restore reserves the same admission the Runtime uses for
+config reloads and session checkpoints, so no new turn starts and no saved
+history changes while files are being rewritten. If any thread already has an
+active turn in the same workspace, a nested checkout of it, or a parent of it,
+the request is refused with `409` and the message `already has an active turn`.
+The reservation is owned by the worker performing the Git mutation, so a client
+that disconnects mid-request cannot release it early; the operation completes
+or fails as a whole. Concurrent restores serialize. The reservation is
+runtime-wide: while a restore's safety snapshot and checkout run, new turns,
+steering, compaction and user-input delivery on every thread wait for it to
+finish, so a large workspace can add seconds of latency elsewhere during a
+restore. A thread whose workspace directory is not available (unmounted
+volume, disconnected share, missing directory) is refused with `409` rather
+than treated as having nothing to restore.
+
+**Safety net.** Every restore first records a `pre-restore:<target>` snapshot
+of the current workspace. That label is never a `/undo`, `patch-undo` or
+`file-revert` candidate, so the net does not change what later undos select.
+For `file-revert` the backup is mandatory: if it cannot be written, or the
+requested file is excluded from it (for example by `.gitignore`), the request
+fails and nothing is changed.
+
+**`patch-undo`.** Selects the newest `tool:`/`pre-turn:` snapshot owned by the
+thread's own session whose tree differs from the workspace, restores the whole
+tree from it, then forks the conversation exactly as `/undo` does. `Ok` means
+either files were restored or there was provably nothing to restore (no bound
+session, or no differing session-owned snapshot); `files_restored` says which.
+When there is something to restore and the thread is not trusted, the whole
+undo aborts with `409` and neither files nor conversation change. Snapshot
+repository, listing or comparison failures abort with `500`, and an unavailable
+workspace directory aborts with `409`; both preserve the conversation, so a
+turn is never dropped while its file changes stay on disk.
+Depth and history are validated before any file changes. If the fork cannot be
+persisted after files were restored, the response is a `500` that names the
+restored snapshot; the original thread still holds the turn and the
+`pre-restore:` snapshot holds the previous files.
+
+**`file-revert`.** Request body:
+
+```json
+{
+  "path": "src/lib.rs",
+  "snapshot_id": "3f2a…40-or-64 hex…",
+  "expected_hash": "sha256:<64 lowercase hex digits>"
+}
+```
+
+- `path`: workspace-relative, or absolute inside the thread workspace. The
+  name is literal (brackets, spaces and glob characters are filename bytes;
+  Git runs with `--literal-pathspecs`). It must name a regular file: directories,
+  symlinks anywhere in the path, and `.git` components are `400`.
+- `snapshot_id`: the exact `tool:<call_id>` or `pre-turn:<n>` snapshot from the
+  change the user selected. Clients obtain ids from `GET /v1/snapshots` (labels
+  carry the tool call id) and must keep the selected change's identity; the
+  server never picks "the newest snapshot that differs", because an unrelated
+  newer snapshot can erase later user edits while leaving the tool's change.
+- `expected_hash`: `sha256:` of the current file bytes the client displayed,
+  or `absent` when the client saw the file as deleted. It is checked before the
+  safety backup and again immediately before the mutation.
+
+Responses:
+
+- `200 {"path", "action", "snapshot_id", "snapshot_label"}` — `action` is
+  `modified`, `recreated` (file was missing) or `removed` (the snapshot does
+  not contain the file, so the file the tool created is deleted; its parent
+  directories are left in place).
+- `400`: malformed `snapshot_id`/`expected_hash`, path outside the workspace,
+  or a path that is not a regular file on either side.
+- `404`: unknown thread.
+- `409`: thread not in trusted mode or Full Access; no bound session; active
+  turn in an overlapping workspace; workspace directory not available;
+  snapshot unknown, owned by another session
+  or not a restore point (refresh the change record); file already matches the
+  snapshot (nothing to revert); or the file changed after the reviewed
+  `expected_hash` (refresh and review again). Nothing is changed in any of
+  these cases.
+- `422`: missing or mistyped body fields.
+- `500`: Git or filesystem failure; a failure after the safety snapshot names
+  that snapshot so the previous bytes can be recovered with
+  `POST /v1/snapshots/{id}/restore` or `/restore`.
+
+Capability probe: `GET` on the route returns `405` where the endpoint exists
+and `404` on an older engine; clients treat any non-`404` as available and
+degrade with an explanation otherwise.
 
 **Receipts** (future read-only audit export)
 - Proposed only: `GET /v1/threads/{thread_id}/turns/{turn_id}/receipt`
@@ -934,6 +1071,7 @@ human gate. Auto-merge is `scripts/check-auto-merge.py --repo … --pr …
 
 **Introspection**
 - `GET /v1/workspace/status`
+- `GET /v1/workspace/files/search?query=<partial>&limit=<1-100>` (see workspace file suggestions above)
 - `GET /v1/skills`
 - `GET /v1/apps/mcp/servers`
 - `GET /v1/apps/mcp/tools?server=<optional>`

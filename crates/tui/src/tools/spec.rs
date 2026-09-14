@@ -682,10 +682,11 @@ pub struct ToolExecutionState {
     /// result when this is present and the manager is enabled.
     pub lsp_manager: Option<Arc<LspManager>>,
 
-    /// Large-output router (#548). When `Some`, tool results that exceed the
-    /// configured token threshold are routed through a V4-Flash synthesis
-    /// sub-agent before being returned to the parent context. `None` disables
-    /// routing (e.g. in sub-agents and test contexts to avoid recursion).
+    /// Adaptive evidence router (#4619). Consulted only when
+    /// `CODEWHALE_ADAPTIVE_OUTPUT_ROUTING` opts the process in; under the
+    /// default classic lane this field is inert and bounding happens at the
+    /// engine/subagent completion boundary. `None` in sub-agents and test
+    /// contexts.
     pub large_output_router: Option<crate::tools::large_output_router::LargeOutputRouter>,
 
     /// Which search backend `web_search` should use. Default: Firecrawl. Set via
@@ -703,13 +704,6 @@ pub struct ToolExecutionState {
     pub(crate) provider_native_search: Option<crate::client::ProviderNativeSearchClient>,
     /// Exact active route capability facts. Unknown stays fail-closed.
     pub(crate) route_capabilities: codewhale_config::route::RouteCapabilities,
-
-    /// Per-session workshop variable store (#548). Holds the raw content of
-    /// the most recent large-tool routing event so the parent can call
-    /// `promote_to_context` later. `None` when the router is disabled.
-    pub workshop_vars: Option<
-        std::sync::Arc<tokio::sync::Mutex<crate::tools::large_output_router::WorkshopVariables>>,
-    >,
 }
 
 impl std::ops::Deref for ToolContext {
@@ -809,7 +803,6 @@ impl ToolContext {
                 search_base_url: None,
                 provider_native_search: None,
                 route_capabilities: codewhale_config::route::RouteCapabilities::default(),
-                workshop_vars: None,
             }),
         }
     }
@@ -1268,19 +1261,14 @@ impl ToolContext {
         self
     }
 
-    /// Attach the large-output router (#548). When set, tool results that
-    /// exceed the configured token threshold are synthesised by a V4-Flash
-    /// sub-agent before being returned to the parent context.
+    /// Attach the adaptive evidence router (#4619). Consulted only under the
+    /// `CODEWHALE_ADAPTIVE_OUTPUT_ROUTING` opt-in.
     #[must_use]
     pub fn with_large_output_router(
         mut self,
         router: crate::tools::large_output_router::LargeOutputRouter,
-        vars: std::sync::Arc<
-            tokio::sync::Mutex<crate::tools::large_output_router::WorkshopVariables>,
-        >,
     ) -> Self {
         self.large_output_router = Some(router);
-        self.workshop_vars = Some(vars);
         self
     }
 }

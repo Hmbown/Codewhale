@@ -652,6 +652,13 @@ pub enum AppAction {
         title: String,
         content: String,
     },
+    /// Review a host-generated command; the pager carries its exact token
+    /// through explicit confirmation and the normal command dispatcher.
+    OpenCommandReview {
+        title: String,
+        content: String,
+        command: String,
+    },
     /// Live remaining-credit lookup for prepaid providers (`/balance`).
     FetchBalance,
     FetchModels,

@@ -298,6 +298,14 @@ mod tests {
     }
 
     #[test]
+    fn scheduled_automations_do_not_create_background_work() {
+        let mut app =
+            crate::test_support::test_app_with_options(crate::test_support::test_tui_options("."));
+        app.automation_panel.active_automations = 2;
+        assert!(!super::model::background_has_live_work(&mut app));
+    }
+
+    #[test]
     fn projection_keeps_every_legacy_todo_as_a_graph_row() {
         let mut app = app();
         add_todos(&mut app, 4);
@@ -992,6 +1000,7 @@ mod tests {
         let mut app = app();
         app.current_session_id = Some(SESSION.to_string());
         app.subagent_cache.push(SubAgentResult {
+            usage: None,
             name: "agent_worker".to_string(),
             agent_id: "agent_worker".to_string(),
             context_mode: "fresh".to_string(),
@@ -1073,6 +1082,7 @@ mod tests {
         SubAgentResult {
             // `name` is the raw session id in production snapshots — the
             // strip must never render it (#36).
+            usage: None,
             name: id.to_string(),
             agent_id: id.to_string(),
             context_mode: "fresh".to_string(),
@@ -1932,6 +1942,7 @@ mod tests {
         fn add_worker(app: &mut App) {
             app.current_session_id = Some(SESSION.to_string());
             app.subagent_cache.push(SubAgentResult {
+                usage: None,
                 name: "agent_converge".to_string(),
                 agent_id: "agent_converge".to_string(),
                 context_mode: "fresh".to_string(),
@@ -2932,6 +2943,20 @@ mod tests {
         assert!(first_row.contains("CONTEXT"), "{first_row:?}");
         // Shed from the right: price goes before any work view.
         assert!(!first_row.contains("PRICE"), "{first_row:?}");
+    }
+
+    #[test]
+    fn empty_panel_releases_plain_y_before_composer_dispatch() {
+        let mut app = app();
+        app.work_surface.last_area = Some(ratatui::layout::Rect::new(0, 0, 80, 8));
+        app.work_surface.focused = true;
+        app.work_surface.explicit_view = false;
+        let outcome = super::handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+        );
+        assert!(outcome.is_none());
+        assert!(!app.work_surface.focused);
     }
 
     #[test]

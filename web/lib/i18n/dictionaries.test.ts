@@ -58,7 +58,6 @@ const CHROME_PROSE_KEYS = [
   "skipToContent",
   "navDocs",
   "navProduct",
-  "navPricing",
   "navCommunity",
   "navPrimaryAria",
   "navHomeAria",

@@ -107,10 +107,12 @@ fn open_server_manager(config: &Config, root: &Path) -> Result<SharedRuntimeThre
 
 #[test]
 fn headless_startup_publishes_cold_endpoint_catalog_capabilities() -> Result<()> {
+    // Lock order: WORKSHOP before ENV (matches workshop-budget tests). ENV then
+    // WORKSHOP ABBA-deadlocks the full libtest suite with the workshop test (#6049).
+    let _workshop = crate::tools::large_output_router::active_workshop_test_guard();
     let _env = lock_test_env();
     let _offline = EnvVarGuard::set("CODEWHALE_DISABLE_CLOUD_FACTS", "1");
     let _live = crate::provider_lake::lock_live_snapshot();
-    let _workshop = crate::tools::large_output_router::active_workshop_test_guard();
     let home = tempfile::tempdir()?;
     let _home = EnvVarGuard::set("CODEWHALE_HOME", home.path());
     let _reset = CatalogReset;
@@ -136,10 +138,11 @@ fn headless_startup_publishes_cold_endpoint_catalog_capabilities() -> Result<()>
 
 #[tokio::test(flavor = "current_thread")]
 async fn headless_reload_publishes_only_the_accepted_identity_and_endpoint() -> Result<()> {
+    // Lock order: WORKSHOP before ENV — see headless_startup twin and #6049.
+    let _workshop = crate::tools::large_output_router::active_workshop_test_guard();
     let _env = lock_test_env();
     let _offline = EnvVarGuard::set("CODEWHALE_DISABLE_CLOUD_FACTS", "1");
     let _live = crate::provider_lake::lock_live_snapshot();
-    let _workshop = crate::tools::large_output_router::active_workshop_test_guard();
     let home = tempfile::tempdir()?;
     let _home = EnvVarGuard::set("CODEWHALE_HOME", home.path());
     let _reset = CatalogReset;

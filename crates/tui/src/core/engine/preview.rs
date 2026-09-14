@@ -424,7 +424,8 @@ impl Engine {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = previewed_git_snapshot;
         // Classification input for the provenance section: the prompt this
         // request actually carries, not the session's current one.
-        let system_prompt_text = crate::prefix_cache::system_prompt_text(system_prompt.as_ref());
+        let system_prompt_text =
+            codewhale_core::prefix_cache::system_prompt_text(system_prompt.as_ref());
 
         let mut messages = self.messages_with_turn_metadata();
         messages.push(hypothetical_user_message);

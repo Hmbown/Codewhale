@@ -447,6 +447,9 @@ fn context_window_source_label(
             | crate::route_runtime::ContextWindowSource::UserDeclared => {
                 MessageId::StatusContextSourceConfigured
             }
+            crate::route_runtime::ContextWindowSource::ConfiguredModel => {
+                MessageId::StatusContextSourceConfiguredModel
+            }
             crate::route_runtime::ContextWindowSource::ProviderReported => {
                 MessageId::StatusContextSourceProviderReported
             }
@@ -469,7 +472,11 @@ fn context_window_source_label(
 /// The exact key that changes the window, or `None` when the user already set
 /// it and the row would be naming a key they have already used.
 fn context_window_override_key(app: &App, locale: Locale) -> Option<String> {
-    if app.active_context_window_source == crate::route_runtime::ContextWindowSource::Configured {
+    if matches!(
+        app.active_context_window_source,
+        crate::route_runtime::ContextWindowSource::Configured
+            | crate::route_runtime::ContextWindowSource::ConfiguredModel
+    ) {
         return None;
     }
     let table = app

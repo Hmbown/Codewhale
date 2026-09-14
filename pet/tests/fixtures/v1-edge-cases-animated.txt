@@ -1,0 +1,27 @@
+f0000 eae73abf53557423 reasoning
+f0030 d534bfd1dbc8786f tool
+f0060 629ac9b36c36b618 memory
+f0090 60172bca4d28371d code
+f0120 da166008444f09da filesystem
+f0150 fb7b03b5266a15ec network
+f0180 308e0dab384b31f7 browser
+f0210 d93eabab7147b4e0 communication
+f0240 4a53c481622865f5 agent
+f0270 c3f06b6f7caa2ffc orchestration
+f0300 3e498b7d83829a1a error
+f0330 20b461a6568178cd human
+f0360 b99f2e55b73b7be7 other
+f0390 41b1d7231005fb22 error
+f0420 16c81664f485dfe8 error
+f0450 f86e802dfe49c2da error
+f0480 0ba904513e0880e6 error
+f0510 fd7cf62e80514015 other
+f0540 6697b9234ac01e7c other
+f0570 bb178cad0830a369 other
+f0600 2ddfda450370e340 other
+f0630 6b962f31f39e00ca other
+f0660 bcaf5cff3c7e7498 human
+f0690 7bc0a09e8c510244 human
+f0720 955129fd569cfde5 reasoning
+f0750 57a0e20c82b25c0c reasoning
+final 7638a24c22454490

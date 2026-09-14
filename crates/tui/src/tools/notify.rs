@@ -6,7 +6,9 @@
 //! the tool is intended for "long task done, come back" beats and
 //! sub-agent-completion pings, not chatter.
 //!
-//! Auto-suppresses when `[notifications].method = "off"`. Output messages
+//! Honors the user's `[notifications]` config: `method = "off"` silences
+//! the tool entirely, and `quiet` / `events.model-notify = false` gate the
+//! category through the process-wide [`NotificationGate`]. Output messages
 //! are length-capped so a runaway model can't paint a paragraph into the
 //! terminal title bar.
 
@@ -124,6 +126,10 @@ impl ToolSpec for NotifyTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tui::notifications::{
+        Method, configured_method, current_notification_gate, install_configured_method,
+        notify_done_to,
+    };
     use std::path::Path;
 
     fn ctx() -> ToolContext {
@@ -192,5 +198,61 @@ mod tests {
         let required = schema.get("required").unwrap().as_array().unwrap();
         assert!(required.iter().any(|v| v.as_str() == Some("title")));
         assert!(!required.iter().any(|v| v.as_str() == Some("body")));
+    }
+
+    /// Restores the process-wide configured method after a test mutates it,
+    /// mirroring `NotificationGateRestore` in `tui::notifications`.
+    struct ConfiguredMethodRestore(Method);
+
+    impl ConfiguredMethodRestore {
+        fn capture() -> Self {
+            Self(configured_method())
+        }
+    }
+
+    impl Drop for ConfiguredMethodRestore {
+        fn drop(&mut self) {
+            install_configured_method(self.0);
+        }
+    }
+
+    #[test]
+    fn configured_method_off_silences_the_tool_emission() {
+        let _restore = ConfiguredMethodRestore::capture();
+        install_configured_method(Method::Off);
+
+        // The emission chain `execute` drives: the installed method decides
+        // suppression before any sink write, with the gate loaded from the
+        // process-wide state.
+        let payload = NotificationPayload::model_notify("done", None);
+        let mut sink = Vec::new();
+        notify_done_to(
+            configured_method(),
+            false,
+            &payload,
+            std::time::Duration::ZERO,
+            std::time::Duration::from_secs(1),
+            current_notification_gate(),
+            &mut sink,
+        );
+        assert!(
+            sink.is_empty(),
+            "configured method=off must silence the notify tool path"
+        );
+    }
+
+    #[tokio::test]
+    async fn configured_method_off_still_reports_success_to_the_model() {
+        // The description promises a *silent* no-op: the model sees success
+        // (nothing to retry), the user's desktop stays quiet.
+        let _restore = ConfiguredMethodRestore::capture();
+        install_configured_method(Method::Off);
+
+        let result = NotifyTool
+            .execute(json!({"title": "done"}), &ctx())
+            .await
+            .expect("ok");
+        assert!(result.success);
+        assert!(result.content.contains("done"));
     }
 }

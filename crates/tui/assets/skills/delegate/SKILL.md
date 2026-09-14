@@ -86,5 +86,5 @@ Fix the settings bug.
 Strong prompt:
 
 ```text
-Own only crates/tui/src/settings.rs and its tests. Preserve existing config key names. Add a regression test showing that provider-specific API key changes do not restart DeepSeek onboarding. Return the changed paths and test command output.
+Own only crates/tui/src/settings.rs and its tests. Preserve existing config key names. Add a regression test showing that provider-specific API key changes do not restart provider onboarding. Return the changed paths and test command output.
 ```

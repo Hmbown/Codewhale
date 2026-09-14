@@ -257,6 +257,9 @@ fn run_exec(workspace: &Path, home: &Path, server: &MockServer) -> std::process:
         .env("CODEWHALE_BASE_URL", server.uri())
         .env("DEEPSEEK_MODEL", MODEL)
         .env("CODEWHALE_MODEL", MODEL)
+        // The adaptive evidence lane is an explicit opt-in; this test exists
+        // to prove it end to end, so the spawned binary runs opted in.
+        .env("CODEWHALE_ADAPTIVE_OUTPUT_ROUTING", "1")
         .env("RUST_LOG", "warn")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());

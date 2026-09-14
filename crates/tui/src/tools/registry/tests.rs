@@ -139,7 +139,7 @@ fn mcp_iserror_result_maps_to_tool_error_preserving_text() {
 
 #[test]
 fn mcp_image_result_uses_typed_block_without_base64_in_text() {
-    let image_data = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAACklEQVR4nGMAAQAABQABDQotsAAAAABJRU5ErkJggg==";
+    let image_data = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==";
     let payload = json!({
         "content": [
             {"type": "text", "text": "screenshot captured"},
@@ -192,7 +192,7 @@ fn mcp_invalid_image_is_removed_with_a_visible_receipt() {
 
 #[test]
 fn mcp_malformed_images_are_removed_with_a_visible_receipt() {
-    let image_data = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAACklEQVR4nGMAAQAABQABDQotsAAAAABJRU5ErkJggg==";
+    let image_data = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==";
     let payload = json!({
         "content": [
             {"type": "image", "data": image_data},
@@ -214,7 +214,7 @@ fn mcp_malformed_images_are_removed_with_a_visible_receipt() {
 
 #[test]
 fn mcp_image_limits_keep_one_valid_block_and_report_the_rest() {
-    let image_data = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAACklEQVR4nGMAAQAABQABDQotsAAAAABJRU5ErkJggg==";
+    let image_data = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==";
     let oversized = "A".repeat(crate::image_attach::MAX_IMAGE_BYTES.div_ceil(3) * 4 + 4);
     let payload = json!({
         "content": [
@@ -243,7 +243,7 @@ fn mcp_image_limits_keep_one_valid_block_and_report_the_rest() {
 
 #[test]
 fn mcp_error_text_and_typed_image_are_both_preserved() {
-    let image_data = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAACklEQVR4nGMAAQAABQABDQotsAAAAABJRU5ErkJggg==";
+    let image_data = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==";
     let payload = json!({
         "content": [
             {"type": "text", "text": "capture failed after partial screenshot"},
@@ -1656,10 +1656,16 @@ fn agent_tools_with_shell_policy_readonly_exposes_only_run_only_bash() {
             .keys()
             .cloned()
             .collect::<std::collections::BTreeSet<_>>(),
-        ["command", "justification", "sandbox_permissions", "timeout"]
-            .into_iter()
-            .map(str::to_string)
-            .collect()
+        [
+            "command",
+            "justification",
+            "read_only",
+            "sandbox_permissions",
+            "timeout"
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
     );
     for hidden in ["action", "background", "tty", "stdin", "task_id", "wait"] {
         assert!(bash.input_schema["properties"].get(hidden).is_none());
@@ -1719,6 +1725,29 @@ fn machine_readonly_catalog_is_exactly_the_evidence_profile() {
     assert!(registry.contains("Bash"));
     assert!(tools.iter().all(|tool| tool.name != "File"));
     assert!(tools.iter().all(|tool| tool.name != "Bash"));
+    let shell = tools.iter().find(|tool| tool.name == "bash").unwrap();
+    assert!(shell.description.contains("cwd field"));
+    assert!(shell.description.contains("git log"));
+    assert!(shell.description.contains("cannot change its own role"));
+    let bash = registry.get("bash").unwrap();
+    for command in [
+        "git branch -a",
+        "cd src && git status",
+        "git rev-parse HEAD",
+    ] {
+        let error = enforce_tool_authority(
+            "bash",
+            &json!({"command":command}),
+            bash.as_ref(),
+            registry.context(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("cwd field") && error.contains("git log"),
+            "{error}"
+        );
+    }
     let web = tools.iter().find(|tool| tool.name == "Web").unwrap();
     assert_eq!(
         web.input_schema["properties"]["action"]["enum"],

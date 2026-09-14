@@ -4503,7 +4503,8 @@ impl McpPool {
         if self.config.servers.contains_key(&name) {
             return Err(format!(
                 "MCP server '{}' already exists in the config file. \
-                 Remove it from the config first, or choose a different name.",
+                 Reconnect with start_mcp_server using only its exact name (omit server), \
+                 or run /mcp retry with that name. This preserves its stored credentials.",
                 name
             ));
         }
@@ -4511,7 +4512,7 @@ impl McpPool {
         if dynamic.contains_key(&name) {
             return Err(format!(
                 "MCP server '{}' was already started earlier in this session. \
-                 Choose a different name.",
+                 Reconnect with start_mcp_server using only its exact name (omit server).",
                 name
             ));
         }
@@ -4696,6 +4697,17 @@ impl McpRecoveryKind {
     pub fn slash_command(self, name: &str) -> String {
         match self {
             Self::Enable => format!("/mcp enable {name}"),
+            // Reconnect one server, not all of them. A row that reads
+            // `[reconnect] aws` and then reloads all 23 configured servers is
+            // not the action it advertised: it takes ~40 s, it disturbs every
+            // healthy connection, and the row the user aimed at is still
+            // pending when the list comes back. `/mcp retry <name>` reaches
+            // `retry_mcp_server`, which reconnects exactly that server.
+            Self::Connect | Self::Reconnect if mcp_name_is_command_safe(name) => {
+                format!("/mcp retry {name}")
+            }
+            // A name the command line cannot carry safely still gets the
+            // blunt instrument rather than a quoted-argument hazard.
             Self::Connect | Self::Reconnect => "/mcp reload".to_string(),
             Self::Reauth => format!("/mcp login {name}"),
             Self::Diagnose if mcp_name_is_command_safe(name) => format!("/mcp validate {name}"),

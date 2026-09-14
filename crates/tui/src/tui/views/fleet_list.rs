@@ -345,6 +345,15 @@ impl ModalView for FleetListView {
                 self.hovered_row.set(self.hit_row(mouse));
                 ViewAction::None
             }
+            // The wheel moves this list, not the transcript behind it.
+            MouseEventKind::ScrollUp => {
+                self.move_row(-1);
+                ViewAction::None
+            }
+            MouseEventKind::ScrollDown => {
+                self.move_row(1);
+                ViewAction::None
+            }
             MouseEventKind::Down(MouseButton::Left) => {
                 if self.pending_delete.is_some() {
                     self.pending_delete = None;

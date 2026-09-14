@@ -323,6 +323,7 @@ pub fn build_headless_context_report(config: &Config, workspace: &Path) -> Promp
                 &model,
                 None,
                 config.context_window_for_provider_config(provider),
+                config.model_context_windows_for(provider),
             )
         },
         |route| route.context_window,
@@ -1394,6 +1395,7 @@ mod tests {
             ApiProvider::Deepseek,
             "deepseek-v4-pro",
             Some(limits),
+            None,
             None,
         );
         assert_eq!(resolved.source, ContextWindowSource::Catalog);

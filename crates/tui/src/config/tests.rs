@@ -775,6 +775,69 @@ fn provider_context_scenario() -> Result<()> {
 }
 
 #[test]
+fn model_context_windows_load_isolate_and_validate() -> Result<()> {
+    // A gateway fronting heterogeneous models: slash and dotted wire ids both
+    // land as exact keys of the provider's own table (#6108).
+    let config: Config = toml::from_str(
+        r#"
+provider = "command_code"
+
+[providers.command_code]
+kind = "openai-compatible"
+base_url = "https://gateway.example/v1"
+model = "qwen3.5-flash"
+context_window = 204800
+
+[providers.command_code.model_context_windows]
+"qwen3.5-flash" = 131072
+"MiniMaxAI/MiniMax-M2.5" = 1000000
+
+[providers.openai.model_context_windows]
+"qwen3.5-flash" = 64000
+"#,
+    )?;
+
+    config.validate()?;
+
+    let custom = config
+        .model_context_windows_for(ApiProvider::Custom)
+        .expect("custom provider table resolves by selected provider name");
+    assert_eq!(custom.get("qwen3.5-flash"), Some(&131_072));
+    assert_eq!(custom.get("MiniMaxAI/MiniMax-M2.5"), Some(&1_000_000));
+
+    // Per-provider isolation: the same wire id under another provider is a
+    // different override, and untouched providers have no table at all.
+    assert_eq!(
+        config
+            .model_context_windows_for(ApiProvider::Openai)
+            .and_then(|table| table.get("qwen3.5-flash").copied()),
+        Some(64_000)
+    );
+    assert!(
+        config
+            .model_context_windows_for(ApiProvider::Moonshot)
+            .is_none()
+    );
+
+    // A zero entry fails validation with the full key path in the error.
+    let zeroed: Config = toml::from_str(
+        r#"
+[providers.openai.model_context_windows]
+"qwen3.5-flash" = 0
+"#,
+    )
+    .expect("zero is syntactically valid TOML");
+    let err = zeroed
+        .validate()
+        .expect_err("zero per-model context window must be rejected");
+    assert!(
+        err.to_string().contains("model_context_windows"),
+        "unexpected error: {err}"
+    );
+    Ok(())
+}
+
+#[test]
 fn opencode_go_context_window_zero_is_invalid() {
     let config: Config = toml::from_str(
         r#"
@@ -2006,6 +2069,35 @@ fn sofya_search_provider_parses_and_round_trips() {
     assert_eq!(SearchProvider::parse("sofya"), Some(SearchProvider::Sofya));
     assert_eq!(SearchProvider::parse("Sofya"), Some(SearchProvider::Sofya));
     assert_eq!(SearchProvider::Sofya.as_str(), "sofya");
+}
+
+#[test]
+fn explicit_serply_search_provider_is_preserved() {
+    let config: Config = toml::from_str(
+        r#"
+        [search]
+        provider = "serply"
+        "#,
+    )
+    .expect("serply search config");
+
+    assert_eq!(
+        config.search.and_then(|search| search.provider),
+        Some(SearchProvider::Serply)
+    );
+}
+
+#[test]
+fn serply_search_provider_parses_and_round_trips() {
+    assert_eq!(
+        SearchProvider::parse("serply"),
+        Some(SearchProvider::Serply)
+    );
+    assert_eq!(
+        SearchProvider::parse("Serply"),
+        Some(SearchProvider::Serply)
+    );
+    assert_eq!(SearchProvider::Serply.as_str(), "serply");
 }
 
 #[test]
@@ -3898,7 +3990,7 @@ fn ensure_config_file_exists_creates_first_run_template() -> Result<()> {
     let content = fs::read_to_string(&created)?;
 
     assert_eq!(created, temp_root.join(".deepseek").join("config.toml"));
-    assert!(content.contains("default_text_model = \"deepseek-v4-pro\""));
+    assert!(content.contains(&format!("default_text_model = \"{DEFAULT_TEXT_MODEL}\"")));
     assert!(content.contains("reasoning_effort = \"auto\""));
     assert!(!content.contains("api_key ="));
     assert!(ensure_config_file_exists(None)?.is_none());
@@ -7179,7 +7271,9 @@ fn deepseek_default_model_canonicalizes_provider_prefixed_ids() {
         default_text_model: Some(DEFAULT_OPENROUTER_MODEL.to_string()),
         ..Default::default()
     };
-    assert_eq!(config.default_model(), DEFAULT_TEXT_MODEL);
+    // The prefixed id canonicalizes to the deepseek-native PRO spelling; it is
+    // not the default constant (that is deepseek-flash), it is that model.
+    assert_eq!(config.default_model(), "deepseek-v4-pro");
 
     let config = Config {
         provider: Some("deepseek".to_string()),
@@ -7192,7 +7286,7 @@ fn deepseek_default_model_canonicalizes_provider_prefixed_ids() {
         }),
         ..Default::default()
     };
-    assert_eq!(config.default_model(), DEFAULT_TEXT_MODEL);
+    assert_eq!(config.default_model(), "deepseek-v4-pro");
 }
 
 #[test]
@@ -7256,18 +7350,18 @@ fn validate_route_rejects_mismatched_provider_model_tuple() {
 fn wire_model_for_provider_matches_active_provider_shape() {
     assert_eq!(
         wire_model_for_provider(ApiProvider::Deepseek, DEFAULT_OPENROUTER_MODEL),
-        DEFAULT_TEXT_MODEL
+        "deepseek-v4-pro"
     );
     assert_eq!(
-        wire_model_for_provider(ApiProvider::Openrouter, DEFAULT_TEXT_MODEL),
+        wire_model_for_provider(ApiProvider::Openrouter, "deepseek-v4-pro"),
         DEFAULT_OPENROUTER_MODEL
     );
     assert_eq!(
-        wire_model_for_provider(ApiProvider::NvidiaNim, DEFAULT_TEXT_MODEL),
+        wire_model_for_provider(ApiProvider::NvidiaNim, "deepseek-v4-pro"),
         DEFAULT_NVIDIA_NIM_MODEL
     );
     assert_eq!(
-        wire_model_for_provider(ApiProvider::Together, DEFAULT_TEXT_MODEL),
+        wire_model_for_provider(ApiProvider::Together, "deepseek-v4-pro"),
         DEFAULT_TOGETHER_MODEL
     );
     assert_eq!(
@@ -7681,7 +7775,7 @@ fn normalize_model_name_for_zai_canonicalizes_current_glm_models() {
 }
 
 #[test]
-fn opencode_go_config_uses_only_current_chat_completions_models() -> Result<()> {
+fn opencode_go_config_uses_documented_model_protocols() -> Result<()> {
     let _lock = lock_test_env();
     let _api_key = EnvVarGuard::remove("OPENCODE_GO_API_KEY");
     let _base_url = EnvVarGuard::remove("OPENCODE_GO_BASE_URL");
@@ -7707,26 +7801,19 @@ model = "opencode-go/glm-5.2"
     );
     assert_eq!(
         model_completion_names_for_provider(ApiProvider::OpencodeGo),
-        OPENCODE_GO_CHAT_MODELS.to_vec()
+        opencode_go_models()
     );
-    for chat_model in OPENCODE_GO_CHAT_MODELS {
+    for chat_model in opencode_go_models() {
         assert_eq!(
             canonical_model_id_for_provider(ApiProvider::OpencodeGo, chat_model).as_deref(),
-            Some(*chat_model)
+            Some(chat_model)
         );
         assert!(validate_route(ApiProvider::OpencodeGo, chat_model).is_ok());
     }
-    for messages_only in [
-        "minimax-m3",
-        "minimax-m2.7",
-        "minimax-m2.5",
-        "qwen3.7-max",
-        "qwen3.7-plus",
-        "qwen3.6-plus",
-    ] {
+    for messages_only in ["claude-unproven", "gpt-unlisted"] {
         assert!(
             !model_completion_names_for_provider(ApiProvider::OpencodeGo).contains(&messages_only),
-            "{messages_only} uses the Messages endpoint and must not be advertised"
+            "{messages_only} has no documented Go protocol and must not be advertised"
         );
         assert!(
             canonical_model_id_for_provider(ApiProvider::OpencodeGo, messages_only).is_none(),
@@ -7739,7 +7826,7 @@ model = "opencode-go/glm-5.2"
         assert!(validate_route(ApiProvider::OpencodeGo, messages_only).is_err());
         // Never substitute a different model. Keep the caller's spelling so
         // validate_route / the route resolver can reject by name. A base URL
-        // override still cannot promote a Messages-only id onto Chat Completions.
+        // override still cannot grant an unknown ID a protocol.
         assert_eq!(
             wire_model_for_provider(ApiProvider::OpencodeGo, messages_only),
             messages_only,
@@ -12098,7 +12185,7 @@ fn status_items_scenario() {
     // the retired keys are skipped, the live ones survive in order.
     {
         let toml_str = r#"
-            status_items = ["mode", "status", "model", "git_branch", "rate_limit", "tokens"]
+            status_items = ["mode", "status", "model", "agents", "rate_limit", "tokens"]
         "#;
         let tui: TuiConfig = toml::from_str(toml_str).expect("legacy items should parse");
         let items = tui.status_items.expect("status_items should be Some");
@@ -12107,6 +12194,18 @@ fn status_items_scenario() {
             vec![StatusItem::Mode, StatusItem::Model, StatusItem::Tokens],
             "retired keys should drop out without failing the whole file"
         );
+    }
+    // #6112 revived `git_branch` and added `workspace`: both parse again and
+    // round-trip through their canonical keys.
+    {
+        let toml_str = r#"
+            status_items = ["workspace", "git_branch"]
+        "#;
+        let tui: TuiConfig = toml::from_str(toml_str).expect("revived items should parse");
+        let items = tui.status_items.expect("status_items should be Some");
+        assert_eq!(items, vec![StatusItem::Workspace, StatusItem::GitBranch]);
+        assert_eq!(StatusItem::Workspace.key(), "workspace");
+        assert_eq!(StatusItem::GitBranch.key(), "git_branch");
     }
     // from status_items_deser_allows_missing_field
     {

@@ -4939,7 +4939,7 @@ async fn stdio_transport_drop_allows_child_cleanup() {
     let config: McpServerConfig = serde_json::from_value(serde_json::json!({
         "args": [
             "-c",
-            "trap 'sleep 0.1; printf cleaned > \"$1\"; exit 0' TERM; printf 'ready\\n'; while :; do sleep 0.05; done",
+            "trap 'sleep 0.1; printf cleaned > \"$1.tmp\"; mv \"$1.tmp\" \"$1\"; exit 0' TERM; printf 'ready\\n'; while :; do sleep 0.05; done",
             "cleanup-test",
             receipt.display().to_string(),
         ],
@@ -6336,8 +6336,20 @@ fn mcp_recovery_kind_names_real_login_and_reload_commands() {
         McpRecoveryKind::Reauth.slash_command("github"),
         "/mcp login github"
     );
+    // One row, one server. A `[reconnect] github` row that reloads every
+    // configured server is not the action it named.
     assert_eq!(
         McpRecoveryKind::Connect.slash_command("github"),
+        "/mcp retry github"
+    );
+    assert_eq!(
+        McpRecoveryKind::Reconnect.slash_command("github"),
+        "/mcp retry github"
+    );
+    // A name the command line cannot carry safely falls back to the blunt
+    // reload rather than emitting an argument that would not survive parsing.
+    assert_eq!(
+        McpRecoveryKind::Reconnect.slash_command("name with spaces"),
         "/mcp reload"
     );
     assert_eq!(
@@ -6614,6 +6626,101 @@ fn millis_from_now(offset_ms: u64) -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_millis() as u64
+}
+
+#[tokio::test]
+async fn model_reconnect_reuses_configured_credentials_without_restarting_siblings() {
+    use crate::tools::runtime_mcp::StartRuntimeMcpServer;
+    use crate::tools::spec::{ToolContext, ToolSpec};
+
+    let _env = crate::test_support::lock_test_env();
+    let dir = tempfile::tempdir().unwrap();
+    let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", dir.path());
+    let _backend = crate::test_support::EnvVarGuard::set("CODEWHALE_SECRET_BACKEND", "file");
+    let _loopback = lock_mcp_loopback_tests().await;
+    let mock = OAuthMcpMock::spawn().await;
+    let name = "existing_server";
+    let mut config = McpConfig::default();
+    config
+        .servers
+        .insert(name.into(), mock_oauth_server_config(mock.addr));
+    config
+        .servers
+        .insert("healthy".into(), mock_oauth_server_config(mock.addr));
+    seed_oauth_tokens(
+        "healthy",
+        &mock.url(),
+        "cw-test-access",
+        "rt-fresh",
+        Some(millis_from_now(3_600_000)),
+    );
+    let mut pool = McpPool::new(config);
+    pool.get_or_connect("healthy").await.unwrap();
+    let sibling_cancel = pool.connections["healthy"].cancel_token.clone();
+    assert!(
+        pool.get_or_connect(name).await.is_err(),
+        "boot before login must require auth"
+    );
+    let pool = Arc::new(tokio::sync::Mutex::new(pool));
+    let tool = StartRuntimeMcpServer::new(Arc::clone(&pool));
+    let mut context = ToolContext::new(dir.path());
+
+    // Credentials arrive from the separate login process under the original key.
+    seed_oauth_tokens(
+        name,
+        &mock.url(),
+        "cw-test-access",
+        "rt-fresh",
+        Some(millis_from_now(3_600_000)),
+    );
+    context.disallowed_tools = vec![format!("mcp_{name}_*")];
+    assert!(
+        tool.execute(serde_json::json!({"name": name}), &context)
+            .await
+            .is_err()
+    );
+    assert!(!pool.lock().await.connected_servers().contains(&name));
+    context.disallowed_tools.clear();
+    let result = tool
+        .execute(serde_json::json!({"name": name}), &context)
+        .await
+        .unwrap();
+    assert_eq!(
+        result.metadata,
+        Some(serde_json::json!({"mcp_catalog_changed": true}))
+    );
+    let mut lock = pool.lock().await;
+    assert!(lock.connected_servers().contains(&name));
+    assert!(
+        lock.all_tools()
+            .iter()
+            .any(|(tool, _)| tool == "mcp_existing_server_wiki_lookup")
+    );
+    assert!(
+        lock.dynamic_servers.read().is_empty(),
+        "reconnect cannot add an alias"
+    );
+    assert!(
+        !sibling_cancel.is_cancelled(),
+        "healthy sibling was restarted"
+    );
+    lock.call_tool("mcp_existing_server_wiki_lookup", serde_json::json!({}))
+        .await
+        .unwrap();
+    drop(lock);
+    assert!(
+        tool.execute(serde_json::json!({"name": "absent"}), &context)
+            .await
+            .is_err()
+    );
+    assert!(pool.lock().await.dynamic_servers.read().is_empty());
+    assert!(
+        oauth::load_oauth_tokens("existing-server", &mock.url())
+            .unwrap()
+            .is_none(),
+        "name must not be sanitized into another credential key"
+    );
+    mock.task.abort();
 }
 
 #[tokio::test]
@@ -7231,6 +7338,9 @@ async fn mid_session_revocation_lands_in_the_same_auth_required_state() {
     // reactive refresh is rejected with invalid_grant, and the failure must
     // land in the same typed state a failed connect produces — not a dead
     // transport error on a connection the pool still calls "ready".
+    // Cross a whole second: reloading the same durable credential now has a
+    // smaller derived expires_in, which must not look like a peer rotation.
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
     mock.revoke_all_grants();
     let err = pool
         .call_tool("mcp_wikiserver_wiki_lookup", serde_json::json!({}))
@@ -7244,7 +7354,9 @@ async fn mid_session_revocation_lands_in_the_same_auth_required_state() {
         oauth::load_oauth_tokens("wikiserver", &url)
             .unwrap()
             .is_none(),
-        "the definitively rejected credential is invalidated"
+        "the definitively rejected credential is invalidated; refresh requests: {}; failure: {text}",
+        mock.token_requests
+            .load(std::sync::atomic::Ordering::SeqCst)
     );
     let catalog = pool.to_api_tools();
     assert!(

@@ -272,6 +272,14 @@ pub enum FleetSelectorError {
     #[error("Fleet member selector cannot be blank")]
     Blank,
     #[error(
+        "Saved {origin} agent profile `{profile}` is invalid or unreadable: {path}. Fix the profile using docs/SUBAGENTS.md and retry; its route was not replaced with a default."
+    )]
+    Unavailable {
+        profile: String,
+        origin: String,
+        path: String,
+    },
+    #[error(
         "Fleet member selector `{selector}` is ambiguous; choose one member explicitly: {candidates}"
     )]
     Ambiguous {

@@ -1,6 +1,8 @@
 //! `/feedback` picker for GitHub feedback destinations.
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use std::cell::RefCell;
+
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
@@ -47,12 +49,19 @@ const OPTIONS: &[FeedbackOption] = &[
 
 pub struct FeedbackPickerView {
     selected: usize,
+    /// Screen row of each option row, recorded as it is painted. Keyboard and
+    /// mouse must reach the same rows; without this the view inherits the
+    /// no-op `handle_mouse` and silently swallows every click.
+    row_hitboxes: RefCell<Vec<Rect>>,
 }
 
 impl FeedbackPickerView {
     #[must_use]
     pub fn new() -> Self {
-        Self { selected: 0 }
+        Self {
+            selected: 0,
+            row_hitboxes: RefCell::new(Vec::new()),
+        }
     }
 
     fn move_up(&mut self) {
@@ -150,8 +159,18 @@ impl ModalView for FeedbackPickerView {
 
         let mut lines = Vec::with_capacity(OPTIONS.len() + 2);
         lines.push(Line::from(""));
+        // `lines` opens with a blank row, so option `idx` paints one row lower.
+        let mut hitboxes = self.row_hitboxes.borrow_mut();
+        hitboxes.clear();
 
         for (idx, option) in OPTIONS.iter().enumerate() {
+            let row = content
+                .y
+                .saturating_add(u16::try_from(idx).unwrap_or(u16::MAX))
+                + 1;
+            if row < content.bottom() {
+                hitboxes.push(Rect::new(content.x, row, content.width, 1));
+            }
             let is_selected = idx == self.selected;
             let row_style = if is_selected {
                 menu_style::selected_row_style()
@@ -173,13 +192,110 @@ impl ModalView for FeedbackPickerView {
             ]));
         }
 
+        drop(hitboxes);
         Paragraph::new(lines).render(content, buf);
+    }
+
+    fn handle_mouse(&mut self, mouse: MouseEvent) -> ViewAction {
+        match mouse.kind {
+            MouseEventKind::ScrollUp => {
+                self.move_up();
+                ViewAction::None
+            }
+            MouseEventKind::ScrollDown => {
+                self.move_down();
+                ViewAction::None
+            }
+            MouseEventKind::Moved => {
+                let hovered = self
+                    .row_hitboxes
+                    .borrow()
+                    .iter()
+                    .position(|rect| rect.y == mouse.row);
+                if let Some(index) = hovered {
+                    self.selected = index;
+                }
+                ViewAction::None
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                let clicked = self
+                    .row_hitboxes
+                    .borrow()
+                    .iter()
+                    .position(|rect| rect.y == mouse.row);
+                match clicked {
+                    // Click to focus, click again to open — the same two-step
+                    // the session picker uses, so a stray click never opens a
+                    // browser tab the user did not choose.
+                    Some(index) if index == self.selected => self.selected_action(),
+                    Some(index) => {
+                        self.selected = index;
+                        ViewAction::None
+                    }
+                    None => ViewAction::None,
+                }
+            }
+            _ => ViewAction::None,
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn mouse(kind: MouseEventKind, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column: 2,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    /// Selectable rows need keyboard and mouse parity. This view overrode no
+    /// `handle_mouse`, so it inherited the no-op default and the view stack
+    /// swallowed every click on it — the only list in the picker family that
+    /// could not be used with a pointer.
+    #[test]
+    fn feedback_rows_are_clickable_and_land_on_the_row_under_the_pointer() {
+        use ratatui::{Terminal, backend::TestBackend};
+        let mut view = FeedbackPickerView::new();
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).expect("terminal");
+        terminal
+            .draw(|frame| view.render(frame.area(), frame.buffer_mut()))
+            .expect("draw");
+
+        let rows: Vec<u16> = view.row_hitboxes.borrow().iter().map(|r| r.y).collect();
+        assert_eq!(rows.len(), OPTIONS.len(), "every option needs a hitbox");
+        assert!(
+            rows.windows(2).all(|w| w[1] == w[0] + 1),
+            "option hitboxes must be consecutive rows, got {rows:?}"
+        );
+
+        // A click on the last option must select that option — an off-by-one
+        // against the leading blank row would put it on its neighbour or drop it.
+        let last = *rows.last().expect("a row");
+        assert!(matches!(
+            view.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), last)),
+            ViewAction::None
+        ));
+        assert_eq!(view.selected, OPTIONS.len() - 1);
+
+        // Clicking the already-selected row opens it; a single stray click
+        // never does, so a misplaced pointer cannot open a browser tab.
+        assert_eq!(
+            emitted_command(
+                view.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), last))
+            ),
+            OPTIONS[OPTIONS.len() - 1].command
+        );
+
+        assert!(matches!(
+            view.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 0)),
+            ViewAction::None
+        ));
+    }
 
     fn emitted_command(action: ViewAction) -> String {
         match action {

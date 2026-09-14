@@ -24,10 +24,8 @@ export const chrome: ChromeDict = {
 
   navProduct: "产品",
   navModels: "模型",
-  navPricing: "价格",
   navProductSecondary: "Product",
   navModelsSecondary: "Models",
-  navPricingSecondary: "Pricing",
 
   skipToContent: "跳转到主要内容",
 
@@ -85,7 +83,6 @@ export const chrome: ChromeDict = {
   footerIssues: "议题",
   footerContribute: "参与贡献",
   footerLicense: "MIT 许可证",
-  footerPricing: "价格",
   footerTerms: "服务条款",
   footerPrivacy: "隐私政策",
   footerChangelog: "更新日志",

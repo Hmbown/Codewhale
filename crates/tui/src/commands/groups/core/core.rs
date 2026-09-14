@@ -212,7 +212,7 @@ pub(crate) fn reset_conversation_state(app: &mut App) -> bool {
     let _settled_old_cost_scope = crate::cost_status::close_current_scope();
     app.clear_history();
     app.mark_history_updated();
-    app.api_messages.clear();
+    app.clear_api_messages();
     app.system_prompt = None;
     app.viewport.transcript_selection.clear();
     app.queued_messages.clear();
@@ -343,6 +343,7 @@ pub fn model(app: &mut App, model_name: Option<&str>) -> CommandResult {
                 &model_id,
                 &app.active_route_base_url,
                 app.active_context_window_override,
+                app.active_model_context_windows.as_ref(),
                 &app.configured_models,
             ) {
                 Ok(resolution) => Some(resolution),
@@ -371,6 +372,7 @@ pub fn model(app: &mut App, model_name: Option<&str>) -> CommandResult {
                 None,
                 route_base_url,
                 app.active_context_window_override,
+                app.active_model_context_windows.as_ref(),
                 None,
             ) {
                 Ok(resolution) => Some(resolution),
@@ -388,11 +390,10 @@ pub fn model(app: &mut App, model_name: Option<&str>) -> CommandResult {
             );
         } else {
             app.active_route_limits = app.context_window_override_limits();
-            app.active_context_window_source = if app.active_context_window_override.is_some() {
-                crate::route_runtime::ContextWindowSource::Configured
-            } else {
-                crate::route_runtime::ContextWindowSource::Fallback
-            };
+            app.active_context_window_source = app
+                .configured_context_window_for(&app.model)
+                .map(|resolution| resolution.source)
+                .unwrap_or(crate::route_runtime::ContextWindowSource::Fallback);
         }
         app.update_model_compaction_budget();
         if model_changed {

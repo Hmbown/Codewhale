@@ -1,4 +1,4 @@
-//! One owner per fact: the default shell paints each session fact in exactly
+//! One owner per fact: the full metrics preset paints each session fact in exactly
 //! one chrome row (SHELL-DESIGN-20260901 §2.0 item 3, §2.2, §2.3, §2.3b).
 //!
 //! Under the composer: row 1 is the posture bar (permission, mode, live
@@ -33,6 +33,7 @@ fn frame_app() -> App {
     app.onboarding = crate::tui::app::OnboardingState::None;
     app.launch.visible = false;
     app.ui_locale = codewhale_localization::Locale::En;
+    app.metrics_line = crate::config::ChromeRowPreset::Full;
     // The posture bar's permission chip carries the filesystem-scope notice
     // (`files: workspace (unenforced)`) whenever no sandbox backend can
     // actually enforce the policy — true on default Linux and all Windows,
@@ -50,6 +51,7 @@ fn subagent(
     status: crate::tools::subagent::SubAgentStatus,
 ) -> crate::tools::subagent::SubAgentResult {
     crate::tools::subagent::SubAgentResult {
+        usage: None,
         name: id.to_string(),
         agent_id: id.to_string(),
         context_mode: "fresh".to_string(),
@@ -136,9 +138,12 @@ fn count_rows_containing(rows: &[String], needle: &str) -> usize {
 /// frame: the context reading, the mode and permission chips, the model,
 /// the cost, the agent count, and the help hint.
 ///
-/// 160 columns joins the blocker sizes so the working clock's two halves
-/// are asserted at a width that holds both; at 80 and 120 they shed by
-/// design (#5914) and the row is asserted for what it does keep.
+/// 160 columns joins the blocker sizes so both working-clock halves can
+/// paint together when the session half is present; at 80 and 120 the
+/// clocks shed by design (#5914) against the pinned scope notice. The
+/// #6084 shed-order fix (sole turn clock uses the session rung) is pinned
+/// in `phase_strip::tideline_tests`, where the narrower permission chip
+/// exposes the width band the one-owner fixture's notice collapses.
 #[test]
 fn composed_frame_paints_each_fact_in_exactly_one_row() {
     for (width, height) in [(80u16, 24u16), (120, 32), (160, 40)] {
@@ -161,10 +166,15 @@ fn composed_frame_paints_each_fact_in_exactly_one_row() {
                 "help hint",
                 crate::tui::shell_key_routing::info_help_hint(app.ui_locale),
             ),
-            ("output rate", "40 avg tok/s".to_string()),
             ("ttft", "ttft 400ms".to_string()),
         ];
         facts.push(("context reading", format!("ctx {pct}%")));
+        if width >= 120 {
+            facts.push(("output rate", "40 avg tok/s".to_string()));
+        } else {
+            // The billing tier takes priority over rate at narrow widths.
+            assert_eq!(count_rows_containing(&rows, "40 avg tok/s"), 0);
+        }
         for (name, needle) in facts {
             if needle.is_empty() {
                 continue;
@@ -184,7 +194,7 @@ fn composed_frame_paints_each_fact_in_exactly_one_row() {
             .expect("posture bar");
         let metrics = rows
             .iter()
-            .position(|row| row.contains("tok/s"))
+            .position(|row| row.contains("ctx "))
             .expect("metrics line");
         let composer = app
             .viewport
@@ -207,23 +217,50 @@ fn composed_frame_paints_each_fact_in_exactly_one_row() {
         // The bar carries the working clock (#5914) — how long the current
         // turn has been doing what it is doing, and how long the session has
         // worked. Both halves shed before the hint and the counts, so a
-        // narrow row keeps the affordances and drops the stopwatch: the
-        // session half needs 120 columns here, the turn half 160. Each
-        // paints in exactly one row wherever it paints. The metrics line
-        // carries no repository, branch or provider.
-        let clock_facts: &[(u16, &str)] =
-            &[(120, "worked 1m 15s"), (160, "sub-agents underway 1m 15s")];
-        for (needs, needle) in clock_facts {
-            if width < *needs {
-                continue;
-            }
-            assert!(rows[posture].contains(needle), "{}", rows[posture]);
+        // narrow row keeps the affordances and drops the stopwatch. When
+        // both would paint, the session half needs ~120 columns here and
+        // the turn half ~160; each paints in exactly one row wherever it
+        // paints. The metrics line carries no repository, branch or provider.
+        // First turn: the turn half names the phase and stays; the session
+        // reading is the identical duration, so it is suppressed rather than
+        // stated twice (#6041). With no session half to paint, the turn
+        // clock sheds at the session rung (#6084) rather than first — but
+        // against this fixture's pinned scope notice, turn+counts+hint is
+        // still just over a 120-column budget, so the hint wins here and
+        // the turn half needs ~160. The shed-order contract itself lives
+        // in tideline_tests.
+        let turn_needle = "sub-agents underway 1m 15s";
+        if width >= 160 {
+            assert!(rows[posture].contains(turn_needle), "{}", rows[posture]);
             assert_eq!(
-                count_rows_containing(&rows, needle),
+                count_rows_containing(&rows, turn_needle),
                 1,
-                "{width}x{height}: {needle:?} paints in exactly one row:\n{}",
+                "{width}x{height}: {turn_needle:?} paints in exactly one row:\n{}",
                 rows.join("\n")
             );
+        }
+        assert!(
+            !rows[posture].contains("worked 1m 15s"),
+            "{width}x{height}: the duplicate session reading must not be stated: {}",
+            rows[posture]
+        );
+        // After a finished turn the totals differ and the worked chip
+        // returns: 1m of finished turns plus the live 1m 15s reads 2m 15s.
+        let mut worked = working_app();
+        worked.cumulative_turn_duration = Duration::from_secs(60);
+        let rows = draw(&mut worked, width, height);
+        if width >= 120 {
+            let worked_needle = "worked 2m 15s";
+            assert!(rows[posture].contains(worked_needle), "{}", rows[posture]);
+            assert_eq!(
+                count_rows_containing(&rows, worked_needle),
+                1,
+                "{width}x{height}: {worked_needle:?} paints in exactly one row:\n{}",
+                rows.join("\n")
+            );
+        }
+        if width >= 160 {
+            assert!(rows[posture].contains(turn_needle), "{}", rows[posture]);
         }
         assert!(!rows[metrics].contains('⑂'), "{}", rows[metrics]);
         // No dead key hints anywhere in the frame.
@@ -835,13 +872,15 @@ fn statusline_full_frame_context_reading_updates_below_and_at_warning() {
                 .find(|target| target.id == InteractionTargetId::HEADER_CONTEXT)
                 .expect("the visible reading stays inspectable");
             assert_eq!(context.area.y, height - 1, "{evidence}");
+            // Attention, not Failure: the posture bar calls this same >= 80
+            // threshold Attention, and the two must not disagree one row apart.
             let value_ink = if pct >= 80 {
-                ChromeInk::Failure
+                ChromeInk::Attention
             } else {
                 ChromeInk::Info
             };
             let label_ink = if pct >= 80 {
-                ChromeInk::Failure
+                ChromeInk::Attention
             } else {
                 ChromeInk::Metadata
             };

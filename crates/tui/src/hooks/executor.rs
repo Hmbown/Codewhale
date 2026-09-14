@@ -5875,6 +5875,7 @@ command = "echo project"
             ("bash", "shell"),
             // The router itself touches nothing a hook needs to gate.
             ("agent", "other"),
+            ("workflow", "other"),
             ("todo_write", "safe"),
             // Goal controls retain their existing hook classification when
             // promoted from deferred discovery to the eager catalog.

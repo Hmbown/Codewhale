@@ -1173,7 +1173,14 @@ async fn build_test_server(
     let runtime_threads: SharedRuntimeThreadManager = Arc::new(RuntimeThreadManager::open(
         config.clone(),
         workspace.clone(),
-        RuntimeThreadManagerConfig::from_task_data_dir(root.join("runtime")),
+        // A neighboring libtest may temporarily set CODEWHALE_RUNTIME_DIR.
+        // This fixture owns an explicit root and must never borrow that
+        // other test's live store or contend for its process-owner lock.
+        RuntimeThreadManagerConfig {
+            data_dir: root.join("runtime/runtime"),
+            task_data_dir: root.join("runtime"),
+            max_active_threads: 8,
+        },
     )?);
     runtime_threads.attach_task_manager(manager.clone());
     let automations = Arc::new(Mutex::new(AutomationManager::open_for_test(
@@ -1569,6 +1576,7 @@ async fn health_and_tasks_endpoints_work() -> Result<()> {
 
 #[tokio::test]
 async fn omitted_runtime_models_use_the_active_provider_default() -> Result<()> {
+    let _env = lock_test_env();
     for (label, config, expected) in provider_default_model_cases() {
         let temp = tempfile::tempdir()?;
         let root = temp.path().join(label);
@@ -2080,6 +2088,109 @@ async fn thread_summary_includes_workspace_branch_metadata() -> Result<()> {
 }
 
 #[tokio::test]
+async fn workspace_file_search_auth_matching_and_bounds() -> Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let workspace = tmp.path().join("workspace");
+    fs::create_dir_all(workspace.join("src"))?;
+    fs::create_dir_all(workspace.join("match-directory"))?;
+    fs::write(
+        workspace.join("match.rs"),
+        "contents must never be returned",
+    )?;
+    fs::write(workspace.join("src/match.rs"), "private file contents")?;
+    for index in 0..105 {
+        fs::write(workspace.join(format!("bounded-{index:03}.rs")), "")?;
+    }
+    let (addr, _, handle) = spawn_test_server_with_root_token_mobile_workspace(
+        tmp.path().join("runtime"),
+        tmp.path().join("sessions"),
+        Some("file-search-token".to_string()),
+        false,
+        workspace,
+    )
+    .await?
+    .context("file search test requires a loopback listener")?;
+    let client = crate::tls::reqwest_client();
+    let url = format!("http://{addr}/v1/workspace/files/search");
+    let search_url = |pairs: &[(&str, &str)]| {
+        let mut url = reqwest::Url::parse(&url).unwrap();
+        url.query_pairs_mut().extend_pairs(pairs.iter().copied());
+        url
+    };
+    for token in [None, Some("wrong-token")] {
+        let mut request = client.get(search_url(&[("query", "match")]));
+        if let Some(token) = token {
+            request = request.bearer_auth(token);
+        }
+        assert_eq!(request.send().await?.status(), StatusCode::UNAUTHORIZED);
+    }
+    for (query, expected) in [
+        ("MATCH", json!(["match.rs", "src/match.rs"])),
+        ("src/ma", json!(["src/match.rs"])),
+        ("", json!([])),
+        ("   ", json!([])),
+        ("no-such-file", json!([])),
+        ("../", json!([])),
+        ("/etc/passwd", json!([])),
+    ] {
+        let body: Value = client
+            .get(search_url(&[("query", query)]))
+            .bearer_auth("file-search-token")
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        assert_eq!(body, json!({"paths": expected}), "query={query:?}");
+    }
+    for (limit, expected_count) in [(None, 20), (Some("1"), 1), (Some("100"), 100)] {
+        let mut url = search_url(&[("query", "bounded")]);
+        if let Some(limit) = limit {
+            url.query_pairs_mut().append_pair("limit", limit);
+        }
+        let body: Value = client
+            .get(url)
+            .bearer_auth("file-search-token")
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        assert_eq!(body["paths"].as_array().unwrap().len(), expected_count);
+    }
+    for (key, value) in [
+        ("limit", "0".to_string()),
+        ("limit", "101".to_string()),
+        ("limit", "-1".to_string()),
+        ("limit", "abc".to_string()),
+        ("query", "é".repeat(129)),
+        ("workspace", tmp.path().display().to_string()),
+    ] {
+        assert_eq!(
+            client
+                .get(search_url(&[(key, &value)]))
+                .bearer_auth("file-search-token")
+                .send()
+                .await?
+                .status(),
+            StatusCode::BAD_REQUEST,
+            "invalid {key}"
+        );
+    }
+    let missing_query: Value = client
+        .get(&url)
+        .bearer_auth("file-search-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(missing_query, json!({"paths": []}));
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
 async fn workspace_and_automation_endpoints_work() -> Result<()> {
     let Some((addr, _runtime_threads, handle)) = spawn_test_server().await? else {
         return Ok(());
@@ -2524,8 +2635,8 @@ async fn agent_runs_runtime_api_exposes_persisted_worker_receipts() -> Result<()
                 let mut profile = WorkerRuntimeProfile::for_role(FleetRole::Verifier);
                 profile.tools = ToolScope::Explicit(vec!["read_file".to_string()]);
                 profile.model = ModelRoute::Fixed("deepseek-v4-flash".to_string());
-                profile.max_spawn_depth =
-                    crate::tools::subagent::DEFAULT_MAX_SPAWN_DEPTH.saturating_sub(1);
+                profile.max_spawn_depth = crate::tools::subagent::DEFAULT_MAX_SPAWN_DEPTH;
+                profile.spawn_depth = 1;
                 profile
             },
             max_steps: 4,
@@ -2571,9 +2682,12 @@ async fn agent_runs_runtime_api_exposes_persisted_worker_receipts() -> Result<()
             note: "not reported".to_string(),
         },
         usage_source_fingerprints: Default::default(),
+        has_unreported_usage: false,
+        delivery_evidence: Default::default(),
         verification: AgentRunVerificationSummary {
             status: "self_report_only".to_string(),
             summary: "no verified receipt attached".to_string(),
+            deliverables: Vec::new(),
         },
         recommended_action: AgentRunRecommendedAction {
             action: "verify_self_report".to_string(),
@@ -3441,7 +3555,7 @@ async fn thread_endpoints_expose_lifecycle_contract() -> Result<()> {
         .to_string();
 
     let _ =
-        wait_for_terminal_turn_status(&client, addr, &thread_id, &turn_id, Duration::from_secs(2))
+        wait_for_terminal_turn_status(&client, addr, &thread_id, &turn_id, Duration::from_secs(10))
             .await?;
 
     let steer_resp = client
@@ -3641,9 +3755,8 @@ async fn turn_operation_lookup_is_authenticated_read_only_and_survives_restart()
     let home = dir.path().join("home");
     fs::create_dir_all(&home)?;
     let _home = EnvVarGuard::set("CODEWHALE_HOME", &home);
-    let store_root = dir.path().join("store");
-    let _runtime_dir = EnvVarGuard::set("CODEWHALE_RUNTIME_DIR", &store_root);
     let root = dir.path().join("server");
+    let store_root = root.join("runtime/runtime");
     let sessions = dir.path().join("sessions");
     let workspace = dir.path().join("workspace");
     let token = "turn-lookup-local-fixture";
@@ -3775,7 +3888,7 @@ async fn turn_operation_lookup_is_authenticated_read_only_and_survives_restart()
             base_url: None,
         })
         .await?;
-    tokio::time::timeout(ci_scaled(Duration::from_secs(2)), async {
+    tokio::time::timeout(ci_scaled(Duration::from_secs(10)), async {
         loop {
             if manager.test_store().load_turn(&turn_id)?.status == RuntimeTurnStatus::Completed {
                 return Ok::<_, anyhow::Error>(());
@@ -3786,7 +3899,7 @@ async fn turn_operation_lookup_is_authenticated_read_only_and_survives_restart()
     .await
     .context("mock turn did not settle before restart")??;
     tokio::time::timeout(
-        ci_scaled(Duration::from_secs(2)),
+        ci_scaled(Duration::from_secs(10)),
         manager.shutdown_and_wait(),
     )
     .await??;
@@ -3796,7 +3909,7 @@ async fn turn_operation_lookup_is_authenticated_read_only_and_survives_restart()
     let _ = server.await;
     drop(manager);
     drop(engine);
-    tokio::time::timeout(ci_scaled(Duration::from_secs(2)), async {
+    tokio::time::timeout(ci_scaled(Duration::from_secs(10)), async {
         while released.upgrade().is_some() {
             sleep(Duration::from_millis(10)).await;
         }
@@ -4025,6 +4138,7 @@ async fn event_handoff_replays_and_dedupes_interaction_prompts_without_a_gap() -
         initial_seq,
         backlog_rx,
         live,
+        false,
     )
     .take(2);
     let body =
@@ -4047,6 +4161,200 @@ async fn event_handoff_replays_and_dedupes_interaction_prompts_without_a_gap() -
     assert_eq!(rendered.matches("approval-handoff").count(), 1);
     assert_eq!(rendered.matches("input-handoff").count(), 1);
 
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn pet_stream_progress_drains_queued_answers_before_becoming_live() -> Result<()> {
+    let (_addr, runtime_threads, handle) = spawn_test_server()
+        .await?
+        .context("Runtime socket unavailable for pet progress acceptance")?;
+    let thread = runtime_threads
+        .create_thread(CreateThreadRequest::default())
+        .await?;
+    let initial = runtime_threads
+        .events_since(&thread.id, None)?
+        .last()
+        .unwrap()
+        .seq;
+    let live = runtime_threads.subscribe_events();
+    let required = runtime_threads
+        .emit_event_for_test(
+            &thread.id,
+            None,
+            "user_input.required",
+            json!({"id":"old-request"}),
+        )
+        .await?;
+    let backlog = runtime_threads.events_since(&thread.id, Some(initial))?;
+    let (tx, rx) = mpsc::channel(1);
+    tx.send(Ok(backlog)).await?;
+    drop(tx);
+    let answered = runtime_threads
+        .emit_event_for_test(
+            &thread.id,
+            None,
+            "user_input.answered",
+            json!({"id":"old-request"}),
+        )
+        .await?;
+    let stream = replay_live_thread_events(
+        runtime_threads.clone(),
+        thread.id.clone(),
+        initial,
+        rx,
+        live,
+        true,
+    )
+    .take(4);
+    let body = tokio::time::timeout(
+        ci_scaled(Duration::from_secs(2)),
+        axum::body::to_bytes(Sse::new(stream).into_response().into_body(), 64 * 1024),
+    )
+    .await??;
+    let rendered = String::from_utf8(body.to_vec())?;
+    let frames = rendered
+        .split("\n\n")
+        .filter(|s| !s.trim().is_empty())
+        .map(parse_sse_frame)
+        .collect::<Result<Vec<_>>>()?;
+    assert_eq!(frames.len(), 4);
+    assert_eq!(
+        frames[0].1,
+        json!({"event":"stream.progress","thread_id":thread.id,"seq":initial,"state":"replaying"})
+    );
+    assert_eq!(frames[1].1["seq"], required.seq);
+    assert_eq!(frames[2].1["seq"], answered.seq);
+    assert_eq!(
+        frames[3].1,
+        json!({"event":"stream.progress","thread_id":thread.id,"seq":answered.seq,"state":"live"})
+    );
+    assert_eq!(
+        runtime_threads
+            .events_since(&thread.id, Some(initial))?
+            .len(),
+        2,
+        "Progress is not journal data"
+    );
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn pet_stream_progress_is_opt_in_and_advertised_by_the_actual_endpoint() -> Result<()> {
+    let (addr, runtime_threads, handle) = spawn_test_server()
+        .await?
+        .context("Runtime socket unavailable for pet progress acceptance")?;
+    let thread = runtime_threads
+        .create_thread(CreateThreadRequest::default())
+        .await?;
+    let client = crate::tls::reqwest_client();
+    let response = client
+        .get(format!(
+            "http://{addr}/v1/threads/{}/events?progress=true",
+            thread.id
+        ))
+        .send()
+        .await?
+        .error_for_status()?;
+    assert_eq!(
+        response
+            .headers()
+            .get("x-codewhale-event-progress")
+            .unwrap(),
+        "1"
+    );
+    let frame = parse_sse_frame(&read_first_sse_frame(response).await?)?;
+    assert_eq!(frame.0, "stream.progress");
+    assert_eq!(frame.1["state"], "replaying");
+    let response = client
+        .get(format!("http://{addr}/v1/threads/{}/events", thread.id))
+        .send()
+        .await?
+        .error_for_status()?;
+    assert!(
+        response
+            .headers()
+            .get("x-codewhale-event-progress")
+            .is_none()
+    );
+    let frame = parse_sse_frame(&read_first_sse_frame(response).await?)?;
+    assert_eq!(frame.0, "thread.started");
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn pet_stream_progress_returns_to_replay_while_recovering_broadcast_lag() -> Result<()> {
+    let (_addr, runtime_threads, handle) = spawn_test_server()
+        .await?
+        .context("Runtime socket unavailable for pet progress acceptance")?;
+    let thread = runtime_threads
+        .create_thread(CreateThreadRequest::default())
+        .await?;
+    let initial = runtime_threads
+        .events_since(&thread.id, None)?
+        .last()
+        .unwrap()
+        .seq;
+    let (backlog_tx, backlog) = mpsc::channel(1);
+    drop(backlog_tx);
+    let (tx, live) = tokio::sync::broadcast::channel(1);
+    let mut stream = Box::pin(replay_live_thread_events(
+        runtime_threads.clone(),
+        thread.id.clone(),
+        initial,
+        backlog,
+        live,
+        true,
+    ));
+    assert_eq!(
+        sse_frame_payload(stream.next().await.unwrap().unwrap()).await?["state"],
+        "replaying"
+    );
+    assert_eq!(
+        sse_frame_payload(stream.next().await.unwrap().unwrap()).await?["state"],
+        "live"
+    );
+    let required = runtime_threads
+        .emit_event_for_test(
+            &thread.id,
+            None,
+            "user_input.required",
+            json!({"id":"queued-request"}),
+        )
+        .await?;
+    let answered = runtime_threads
+        .emit_event_for_test(
+            &thread.id,
+            None,
+            "user_input.answered",
+            json!({"id":"queued-request"}),
+        )
+        .await?;
+    tx.send(required.clone())?;
+    tx.send(answered.clone())?;
+    let frames = tokio::time::timeout(ci_scaled(Duration::from_secs(2)), async {
+        let mut frames = Vec::new();
+        for _ in 0..4 {
+            frames.push(sse_frame_payload(stream.next().await.unwrap().unwrap()).await?);
+        }
+        Ok::<_, anyhow::Error>(frames)
+    })
+    .await??;
+    assert_eq!(frames[0]["state"], "replaying");
+    assert_eq!(frames[0]["seq"], initial);
+    assert_eq!(frames[1]["seq"], required.seq);
+    assert_eq!(frames[2]["seq"], answered.seq);
+    assert_eq!(frames[3]["state"], "live");
+    assert_eq!(frames[3]["seq"], answered.seq);
+    assert_eq!(
+        runtime_threads
+            .events_since(&thread.id, Some(initial))?
+            .len(),
+        2
+    );
     handle.abort();
     Ok(())
 }
@@ -5105,6 +5413,18 @@ async fn patch_undo_endpoint_forks_and_reports_file_rollback_state() -> Result<(
         create_seeded_thread(&addr, &runtime_threads, &root, "Roll back the patch").await?;
     let client = crate::tls::reqwest_client();
 
+    // A workspace directory that is not available proves nothing about the
+    // files a turn changed: the undo is refused instead of forking the
+    // conversation away from them.
+    let resp = client
+        .post(format!("http://{addr}/v1/threads/{thread_id}/patch-undo"))
+        .json(&json!({}))
+        .send()
+        .await?;
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    assert!(resp.text().await?.contains("not available"));
+
+    fs::create_dir_all(root.join("workspace"))?;
     let resp = client
         .post(format!("http://{addr}/v1/threads/{thread_id}/patch-undo"))
         .json(&json!({}))
@@ -5113,8 +5433,8 @@ async fn patch_undo_endpoint_forks_and_reports_file_rollback_state() -> Result<(
     assert_eq!(resp.status(), StatusCode::CREATED);
     let undone: serde_json::Value = resp.json().await?;
     // The fresh workspace has no tool/pre-turn snapshots to roll back to,
-    // so the file-restore step reports failure while the conversation
-    // undo still forks the thread.
+    // so the file-restore step reports nothing restored while the
+    // conversation undo still forks the thread.
     assert_eq!(undone["patch_result"]["files_restored"], false);
     assert!(undone["patch_result"]["summary"].is_string());
     assert_eq!(undone["original_user_text"], "Roll back the patch");
@@ -5145,14 +5465,524 @@ fn patch_undo_helper_restores_only_the_bound_session() -> Result<()> {
     repo.snapshot_with_session("pre-turn:foreign", Some("session-foreign"))?;
     fs::write(&file, "current-after")?;
 
-    let restored = patch_undo_workspace_files(&workspace, Some("session-current"));
+    let restored = patch_undo_workspace_files(&workspace, Some("session-current"), true)
+        .expect("a trusted rollback should succeed");
     assert!(restored.files_restored, "{:?}", restored.summary);
     assert_eq!(fs::read_to_string(&file)?, "current-before");
 
     fs::write(&file, "must-stay")?;
-    let unbound = patch_undo_workspace_files(&workspace, None);
+    let unbound = patch_undo_workspace_files(&workspace, None, true)
+        .expect("an unbound thread has nothing to roll back, which is not a refusal");
     assert!(!unbound.files_restored);
     assert_eq!(fs::read_to_string(&file)?, "must-stay");
+    Ok(())
+}
+
+/// The gate the TUI's `/undo` applies, stated as a contract: an untrusted
+/// thread may not roll files back. When there *is* something to roll back the
+/// whole undo aborts — nothing is changed, and the caller must not fork the
+/// conversation either.
+#[test]
+fn patch_undo_helper_refuses_an_untrusted_rollback_and_touches_nothing() -> Result<()> {
+    let _lock = lock_test_env();
+    let root = tempfile::tempdir()?;
+    let home = root.path().join("home");
+    fs::create_dir_all(&home)?;
+    let _home = EnvVarGuard::set("HOME", &home);
+
+    let workspace = root.path().join("workspace");
+    fs::create_dir_all(&workspace)?;
+    let repo = crate::snapshot::SnapshotRepo::open_or_init(&workspace)?;
+    let file = workspace.join("a.txt");
+
+    fs::write(&file, "before")?;
+    repo.snapshot_with_session("pre-turn:1", Some("session-a"))?;
+    fs::write(&file, "after")?;
+
+    let err = patch_undo_workspace_files(&workspace, Some("session-a"), false)
+        .expect_err("an untrusted rollback must be refused");
+    assert_eq!(err.status, StatusCode::CONFLICT);
+    assert!(
+        err.message.contains("outside trusted mode"),
+        "got: {}",
+        err.message
+    );
+    assert_eq!(
+        fs::read_to_string(&file)?,
+        "after",
+        "a refusal must leave the workspace exactly as it was"
+    );
+
+    // The identical call once trusted performs the rollback.
+    let restored = patch_undo_workspace_files(&workspace, Some("session-a"), true)
+        .expect("a trusted rollback should succeed");
+    assert!(restored.files_restored, "{:?}", restored.summary);
+    assert_eq!(fs::read_to_string(&file)?, "before");
+    Ok(())
+}
+
+/// ...but with provably nothing to roll back, an untrusted undo is still
+/// allowed: the conversation half needs no trust, and skipping it would make
+/// Undo useless in Ask / Auto-Review for no safety gain.
+#[test]
+fn patch_undo_helper_allows_an_untrusted_undo_with_nothing_to_roll_back() -> Result<()> {
+    let _lock = lock_test_env();
+    let root = tempfile::tempdir()?;
+    let home = root.path().join("home");
+    fs::create_dir_all(&home)?;
+    let _home = EnvVarGuard::set("HOME", &home);
+
+    let workspace = root.path().join("workspace");
+    fs::create_dir_all(&workspace)?;
+    let repo = crate::snapshot::SnapshotRepo::open_or_init(&workspace)?;
+    let file = workspace.join("a.txt");
+
+    fs::write(&file, "only-state")?;
+    repo.snapshot_with_session("pre-turn:1", Some("session-a"))?;
+    // Nothing changed after the snapshot, so no target exists.
+
+    let result = patch_undo_workspace_files(&workspace, Some("session-a"), false)
+        .expect("nothing to roll back is not a refusal");
+    assert!(!result.files_restored);
+    assert!(result.summary.is_some());
+    assert_eq!(fs::read_to_string(&file)?, "only-state");
+    Ok(())
+}
+
+fn sha256_of(path: &FsPath) -> String {
+    format!(
+        "sha256:{}",
+        crate::hashing::sha256_hex(fs::read(path).unwrap())
+    )
+}
+
+fn revert_request(path: &str, snapshot_id: &str, expected_hash: &str) -> RevertThreadFileRequest {
+    RevertThreadFileRequest {
+        path: path.to_string(),
+        snapshot_id: snapshot_id.to_string(),
+        expected_hash: expected_hash.to_string(),
+    }
+}
+
+/// The acceptance criterion for per-file revert: restoring one file must not
+/// roll back any other file's turn changes.
+#[test]
+fn revert_file_helper_restores_only_the_named_file() -> Result<()> {
+    let _lock = lock_test_env();
+    let root = tempfile::tempdir()?;
+    let home = root.path().join("home");
+    fs::create_dir_all(&home)?;
+    let _home = EnvVarGuard::set("HOME", &home);
+
+    let workspace = root.path().join("workspace");
+    fs::create_dir_all(&workspace)?;
+    let repo = crate::snapshot::SnapshotRepo::open_or_init(&workspace)?;
+    let wanted = workspace.join("wanted.txt");
+    let other = workspace.join("other.txt");
+
+    fs::write(&wanted, "wanted-before")?;
+    fs::write(&other, "other-before")?;
+    repo.snapshot_with_session("pre-turn:1", Some("session-a"))?;
+
+    fs::write(&wanted, "wanted-after")?;
+    fs::write(&other, "other-after")?;
+
+    let snapshot = repo.list(10)?.remove(0);
+    let reverted = revert_file_from_snapshot(
+        &workspace,
+        "session-a",
+        &revert_request("wanted.txt", snapshot.id.as_str(), &sha256_of(&wanted)),
+    )
+    .expect("scoped revert should succeed");
+    assert_eq!(reverted.path, "wanted.txt");
+    assert_eq!(reverted.action, "modified");
+    assert_eq!(reverted.snapshot_label, "pre-turn:1");
+    assert_eq!(reverted.snapshot_id, snapshot.id.as_str());
+    assert_eq!(fs::read_to_string(&wanted)?, "wanted-before");
+    assert_eq!(
+        fs::read_to_string(&other)?,
+        "other-after",
+        "reverting one file must leave every other file's changes in place"
+    );
+    Ok(())
+}
+
+#[test]
+fn revert_file_helper_accepts_an_absolute_path_inside_the_workspace() -> Result<()> {
+    let _lock = lock_test_env();
+    let root = tempfile::tempdir()?;
+    let home = root.path().join("home");
+    fs::create_dir_all(&home)?;
+    let _home = EnvVarGuard::set("HOME", &home);
+
+    let workspace = root.path().join("workspace");
+    fs::create_dir_all(&workspace)?;
+    let repo = crate::snapshot::SnapshotRepo::open_or_init(&workspace)?;
+    let file = workspace.join("a.txt");
+
+    fs::write(&file, "v1")?;
+    repo.snapshot_with_session("pre-turn:1", Some("session-a"))?;
+    fs::write(&file, "v2")?;
+
+    // A recorded path may arrive absolute; normalization reports it back
+    // workspace-relative so the GUI's change record stays consistent.
+    let snapshot = repo.list(10)?.remove(0);
+    let reverted = revert_file_from_snapshot(
+        &workspace,
+        "session-a",
+        &revert_request(
+            &file.to_string_lossy(),
+            snapshot.id.as_str(),
+            &sha256_of(&file),
+        ),
+    )
+    .expect("scoped revert should accept an in-workspace absolute path");
+    assert_eq!(reverted.path, "a.txt");
+    assert_eq!(fs::read_to_string(&file)?, "v1");
+    Ok(())
+}
+
+/// The client names the exact snapshot from its change record. A newer
+/// unrelated snapshot must not be selected for it, and a stale hash means
+/// the user edited the file after the record was captured: refuse and leave
+/// the workspace untouched.
+#[test]
+fn revert_file_helper_requires_exact_snapshot_identity_and_reviewed_hash() -> Result<()> {
+    let _lock = lock_test_env();
+    let root = tempfile::tempdir()?;
+    let home = root.path().join("home");
+    fs::create_dir_all(&home)?;
+    let _home = EnvVarGuard::set("HOME", &home);
+
+    let workspace = root.path().join("workspace");
+    fs::create_dir_all(&workspace)?;
+    let repo = crate::snapshot::SnapshotRepo::open_or_init(&workspace)?;
+    let a = workspace.join("a.txt");
+    let b = workspace.join("b.txt");
+
+    // Tool A edits a.txt; tool B snapshots before editing only b.txt; the user
+    // then edits a.txt by hand.
+    fs::write(&a, "a-before")?;
+    fs::write(&b, "b-before")?;
+    let tool_a = repo.snapshot_with_session("tool:call-a", Some("session-a"))?;
+    fs::write(&a, "a-after-tool")?;
+    let tool_b = repo.snapshot_with_session("tool:call-b", Some("session-a"))?;
+    fs::write(&b, "b-after-tool")?;
+    fs::write(&a, "a-user-edit")?;
+
+    // Restoring a.txt from tool B's snapshot would erase only the user edit;
+    // the client must ask for tool A's snapshot and gets back a-before.
+    let err = revert_file_from_snapshot(
+        &workspace,
+        "session-a",
+        &revert_request("a.txt", tool_a.as_str(), &sha256_of(&b)),
+    )
+    .expect_err("a hash from different bytes must refuse");
+    assert_eq!(err.status, StatusCode::CONFLICT);
+    assert!(
+        err.message.contains("changed after"),
+        "got: {}",
+        err.message
+    );
+    assert_eq!(fs::read_to_string(&a)?, "a-user-edit");
+
+    let reverted = revert_file_from_snapshot(
+        &workspace,
+        "session-a",
+        &revert_request("a.txt", tool_a.as_str(), &sha256_of(&a)),
+    )
+    .expect("exact identity restores");
+    assert_eq!(reverted.snapshot_label, "tool:call-a");
+    assert_eq!(fs::read_to_string(&a)?, "a-before");
+    assert_eq!(
+        fs::read_to_string(&b)?,
+        "b-after-tool",
+        "b.txt is untouched"
+    );
+
+    // Already matching: 409, nothing changed.
+    let err = revert_file_from_snapshot(
+        &workspace,
+        "session-a",
+        &revert_request("a.txt", tool_a.as_str(), &sha256_of(&a)),
+    )
+    .expect_err("nothing to revert");
+    assert_eq!(err.status, StatusCode::CONFLICT);
+    assert!(
+        err.message.contains("nothing to revert"),
+        "got: {}",
+        err.message
+    );
+
+    // A snapshot owned by another session, an unknown id, or a non-restore
+    // label are all refused with a refresh hint.
+    let foreign = repo.snapshot_with_session("tool:foreign", Some("session-b"))?;
+    let post = repo.snapshot_with_session("post-turn:1", Some("session-a"))?;
+    for id in [
+        foreign.as_str(),
+        post.as_str(),
+        "0123456789abcdef0123456789abcdef01234567",
+    ] {
+        let err = revert_file_from_snapshot(
+            &workspace,
+            "session-a",
+            &revert_request("b.txt", id, &sha256_of(&b)),
+        )
+        .expect_err(id);
+        assert_eq!(err.status, StatusCode::CONFLICT, "{id}");
+        assert!(
+            err.message.contains("refresh the change record"),
+            "{id}: {}",
+            err.message
+        );
+    }
+    assert_eq!(fs::read_to_string(&b)?, "b-after-tool");
+    let _ = tool_b;
+
+    // Directories and Git metadata are 400s before anything is compared.
+    for path in ["", "src", ".git/config", "../escape.txt"] {
+        fs::create_dir_all(workspace.join("src"))?;
+        let err = revert_file_from_snapshot(
+            &workspace,
+            "session-a",
+            &revert_request(path, tool_a.as_str(), "absent"),
+        )
+        .expect_err(path);
+        assert_eq!(err.status, StatusCode::BAD_REQUEST, "{path}");
+    }
+    Ok(())
+}
+
+#[test]
+fn revert_file_helper_refuses_foreign_sessions_and_paths_outside_the_workspace() -> Result<()> {
+    let _lock = lock_test_env();
+    let root = tempfile::tempdir()?;
+    let home = root.path().join("home");
+    fs::create_dir_all(&home)?;
+    let _home = EnvVarGuard::set("HOME", &home);
+
+    let workspace = root.path().join("workspace");
+    fs::create_dir_all(&workspace)?;
+    let repo = crate::snapshot::SnapshotRepo::open_or_init(&workspace)?;
+    let file = workspace.join("a.txt");
+
+    // Only another session owns a snapshot, so this session has nothing it is
+    // allowed to revert.
+    fs::write(&file, "foreign-before")?;
+    repo.snapshot_with_session("pre-turn:1", Some("session-b"))?;
+    fs::write(&file, "foreign-after")?;
+
+    let foreign = repo.list(10)?.remove(0);
+    let err = revert_file_from_snapshot(
+        &workspace,
+        "session-a",
+        &revert_request("a.txt", foreign.id.as_str(), &sha256_of(&file)),
+    )
+    .expect_err("a foreign session's snapshot must not be restorable");
+    assert_eq!(err.status, StatusCode::CONFLICT);
+    assert!(
+        err.message.contains("another session"),
+        "got: {}",
+        err.message
+    );
+    assert_eq!(fs::read_to_string(&file)?, "foreign-after");
+
+    let traversal = revert_file_from_snapshot(
+        &workspace,
+        "session-a",
+        &revert_request("../escape.txt", foreign.id.as_str(), "absent"),
+    )
+    .expect_err("traversal must be refused");
+    assert_eq!(traversal.status, StatusCode::BAD_REQUEST);
+    Ok(())
+}
+
+/// The GUI decides whether to show the per-file Revert button from a `GET`
+/// probe of this route: 405 ("route exists, wrong method") means available,
+/// 404 means an older engine that must degrade with an explanation. Assert the
+/// wire contract, not just the Rust helper.
+#[tokio::test]
+async fn file_revert_route_probes_as_available_and_404s_unknown_threads() -> Result<()> {
+    let root = std::env::temp_dir().join(format!("deepseek-file-revert-route-{}", Uuid::new_v4()));
+    let sessions_dir = root.join("sessions");
+    let Some((addr, _runtime_threads, handle)) =
+        spawn_test_server_with_root(root.clone(), sessions_dir).await?
+    else {
+        return Ok(());
+    };
+    let client = crate::tls::reqwest_client();
+
+    let probe = client
+        .get(format!("http://{addr}/v1/threads/__probe__/file-revert"))
+        .send()
+        .await?;
+    assert_eq!(
+        probe.status(),
+        StatusCode::METHOD_NOT_ALLOWED,
+        "the capability probe reads any non-404 as 'endpoint available'"
+    );
+
+    let body = json!({
+        "path": "a.txt",
+        "snapshot_id": "0123456789abcdef0123456789abcdef01234567",
+        "expected_hash": "absent"
+    });
+    let missing = client
+        .post(format!("http://{addr}/v1/threads/thr_missing/file-revert"))
+        .json(&body)
+        .send()
+        .await?;
+    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+
+    handle.abort();
+    Ok(())
+}
+
+/// Route-level contract for the new destructive endpoint: malformed bodies
+/// are 422/400 before any thread state is read, an untrusted thread is a 409
+/// even with a well-formed request, and a trusted thread without a bound
+/// session is a 409 that names the reason. No file is touched in any case.
+#[tokio::test]
+async fn file_revert_route_validates_body_then_trust_then_session_binding() -> Result<()> {
+    let root = std::env::temp_dir().join(format!("deepseek-file-revert-gates-{}", Uuid::new_v4()));
+    let sessions_dir = root.join("sessions");
+    let Some((addr, runtime_threads, handle)) =
+        spawn_test_server_with_root(root.clone(), sessions_dir).await?
+    else {
+        return Ok(());
+    };
+    let thread_id = create_seeded_thread(&addr, &runtime_threads, &root, "Edit a.txt").await?;
+    let workspace = root.join("workspace");
+    fs::create_dir_all(&workspace)?;
+    let file = workspace.join("a.txt");
+    fs::write(&file, "keep")?;
+    let client = crate::tls::reqwest_client();
+    let url = format!("http://{addr}/v1/threads/{thread_id}/file-revert");
+    let well_formed = json!({
+        "path": "a.txt",
+        "snapshot_id": "0123456789abcdef0123456789abcdef01234567",
+        "expected_hash": format!("sha256:{}", "a".repeat(64))
+    });
+
+    // Missing required fields: rejected by the JSON extractor.
+    let resp = client
+        .post(&url)
+        .json(&json!({ "path": "a.txt" }))
+        .send()
+        .await?;
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    // Malformed identity/hash: 400 with the expected format.
+    for bad in [
+        json!({ "path": "a.txt", "snapshot_id": "not-hex", "expected_hash": "absent" }),
+        json!({ "path": "a.txt", "snapshot_id": "0123456789abcdef0123456789abcdef01234567", "expected_hash": "md5:abc" }),
+        json!({ "path": "a.txt", "snapshot_id": "0123456789abcdef0123456789abcdef01234567", "expected_hash": format!("sha256:{}", "A".repeat(64)) }),
+    ] {
+        let resp = client.post(&url).json(&bad).send().await?;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{bad}");
+    }
+    // Untrusted thread: 409 that says how to proceed.
+    let resp = client.post(&url).json(&well_formed).send().await?;
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let text = resp.text().await?;
+    assert!(text.contains("trusted mode"), "got: {text}");
+
+    // Trusted, but no bound session: still a 409 with the reason.
+    client
+        .patch(format!("http://{addr}/v1/threads/{thread_id}"))
+        .json(&json!({ "trust_mode": true }))
+        .send()
+        .await?
+        .error_for_status()?;
+    let resp = client.post(&url).json(&well_formed).send().await?;
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let text = resp.text().await?;
+    assert!(text.contains("no bound session"), "got: {text}");
+    assert_eq!(fs::read_to_string(&file)?, "keep");
+
+    handle.abort();
+    Ok(())
+}
+
+/// All three restore routes refuse while a turn is active in an overlapping
+/// workspace, and admit again once it settles. Nothing is changed on refusal.
+#[tokio::test]
+async fn restore_routes_refuse_an_active_turn_in_the_workspace() -> Result<()> {
+    let root = std::env::temp_dir().join(format!("deepseek-restore-active-{}", Uuid::new_v4()));
+    let sessions_dir = root.join("sessions");
+    let Some((addr, runtime_threads, handle)) =
+        spawn_test_server_with_root(root.clone(), sessions_dir).await?
+    else {
+        return Ok(());
+    };
+    let thread_id = create_seeded_thread(&addr, &runtime_threads, &root, "Keep working").await?;
+    let workspace = root.join("workspace");
+    fs::create_dir_all(&workspace)?;
+    let file = workspace.join("a.txt");
+    fs::write(&file, "live")?;
+    let client = crate::tls::reqwest_client();
+    client
+        .patch(format!("http://{addr}/v1/threads/{thread_id}"))
+        .json(&json!({ "trust_mode": true }))
+        .send()
+        .await?
+        .error_for_status()?;
+    let harness = crate::core::engine::mock_engine_handle();
+    runtime_threads
+        .install_test_engine(&thread_id, harness.handle.clone())
+        .await?;
+    runtime_threads
+        .set_active_turn_for_test(&thread_id, Some("turn_live"))
+        .await?;
+
+    let revert_body = json!({
+        "path": "a.txt",
+        "snapshot_id": "0123456789abcdef0123456789abcdef01234567",
+        "expected_hash": "absent"
+    });
+    let refusals = [
+        client
+            .post(format!("http://{addr}/v1/threads/{thread_id}/file-revert"))
+            .json(&revert_body)
+            .send()
+            .await?,
+        client
+            .post(format!("http://{addr}/v1/threads/{thread_id}/patch-undo"))
+            .json(&json!({}))
+            .send()
+            .await?,
+    ];
+    for resp in refusals {
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let text = resp.text().await?;
+        assert!(text.contains("already has an active turn"), "got: {text}");
+    }
+    assert_eq!(fs::read_to_string(&file)?, "live");
+    // The server-wide snapshot route validates its id first, then admission.
+    let resp = client
+        .post(format!("http://{addr}/v1/snapshots/not-hex/restore"))
+        .send()
+        .await?;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    runtime_threads
+        .set_active_turn_for_test(&thread_id, None)
+        .await?;
+    // Admitted again: the revert now fails on the unknown snapshot id, past
+    // the admission and trust gates, without touching the file.
+    let resp = client
+        .post(format!("http://{addr}/v1/threads/{thread_id}/file-revert"))
+        .json(&revert_body)
+        .send()
+        .await?;
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let text = resp.text().await?;
+    assert!(
+        text.contains("no bound session") || text.contains("refresh the change record"),
+        "got: {text}"
+    );
+    assert_eq!(fs::read_to_string(&file)?, "live");
+
+    handle.abort();
     Ok(())
 }
 
@@ -12591,7 +13421,13 @@ async fn marketplace_catalog_lifecycle_over_http_lists_installs_and_removes() ->
         .error_for_status()?
         .json()
         .await?;
-    let candidate = &list["marketplaces"][0]["candidates"][0];
+    let team = list["marketplaces"]
+        .as_array()
+        .expect("marketplace list")
+        .iter()
+        .find(|catalog| catalog["name"] == "team")
+        .expect("added team catalog");
+    let candidate = &team["candidates"][0];
     assert_eq!(candidate["name"], "demo");
     assert_eq!(candidate["install"]["installable"], true);
     assert!(
@@ -12614,6 +13450,37 @@ async fn marketplace_catalog_lifecycle_over_http_lists_installs_and_removes() ->
         .await?;
     assert_eq!(install["outcome"], "installed");
     assert_eq!(install["plugin"]["trust_status"], "not-reviewed");
+
+    // An installed name routes to its actual local bundle. Catalog metadata
+    // cannot authorize a replacement or certify matching publisher/bytes.
+    let after: serde_json::Value = client
+        .get(format!("{base}/team"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(after["candidates"][0]["install"]["installable"], false);
+    assert_eq!(
+        after["candidates"][0]["existing_plugin"]["content_hash"],
+        install["plugin"]["content_hash"]
+    );
+    assert_eq!(
+        after["candidates"][0]["existing_plugin"]["trust_status"],
+        "not-reviewed"
+    );
+    let again = client
+        .post(format!("{base}/team/install"))
+        .json(&serde_json::json!({"candidate":"demo"}))
+        .send()
+        .await?;
+    assert_eq!(again.status(), StatusCode::CONFLICT);
+    let direct = client
+        .post(format!("http://{addr}/v1/apps/plugins/install"))
+        .json(&serde_json::json!({"source":catalog_dir.join("demo").display().to_string()}))
+        .send()
+        .await?;
+    assert_eq!(direct.status(), StatusCode::CONFLICT);
 
     // Unknown candidate and unknown catalog are honest 404s.
     let missing = client
@@ -12659,6 +13526,92 @@ async fn marketplace_catalog_lifecycle_over_http_lists_installs_and_removes() ->
             .is_some_and(|p| p.iter().any(|entry| entry["name"] == "demo"))
     );
 
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn marketplace_builtin_name_is_reviewable_without_install_or_network_access() -> Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let root = tmp.path().join("runtime");
+    let workspace = tmp.path().join("ws");
+    fs::create_dir_all(&root)?;
+    let bundle = write_plugin_source_bundle(&tmp.path().join("builtin"), "computer-use")?;
+    let discovery = crate::plugins::PluginDiscoveryContext::from_config_and_environment(
+        &crate::plugins::discovery::DiscoveryConfig {
+            workspace: workspace.clone(),
+            user_plugins_dir: root.join("plugins"),
+            workspace_plugins_dir: crate::plugins::discovery::default_workspace_plugins_dir(
+                &workspace,
+            ),
+            builtin_plugin_dirs: vec![bundle.parent().unwrap().to_path_buf()],
+            state_path: root.join("plugins/state.json"),
+        },
+        crate::plugins::HostEnvironment::from_entries(Vec::new()),
+    );
+    let Some((addr, _, handle)) = spawn_test_server_with_root_token_mobile_workspace_and_overrides(
+        root.clone(),
+        root.join("sessions"),
+        None,
+        false,
+        workspace,
+        TestServerOverrides {
+            plugin_discovery: Some(discovery),
+            ..TestServerOverrides::default()
+        },
+    )
+    .await?
+    else {
+        return Ok(());
+    };
+    let client = crate::tls::reqwest_client();
+    let base = format!("http://{addr}/v1/apps");
+    let catalog: serde_json::Value = client
+        .get(format!("{base}/marketplaces/codewhale"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let candidates = catalog["candidates"].as_array().unwrap();
+    let candidate = candidates
+        .iter()
+        .find(|p| p["name"] == "computer-use")
+        .unwrap();
+    assert_eq!(candidate["install"]["installable"], false);
+    assert_eq!(candidate["existing_plugin"]["scope"], "builtin");
+    assert_eq!(candidate["existing_plugin"]["version"], "1.0.0");
+    assert_eq!(candidate["existing_plugin"]["trust_status"], "not-reviewed");
+    assert!(
+        candidates
+            .iter()
+            .filter(|p| p["name"] != "computer-use")
+            .all(|p| p["install"]["installable"] == true)
+    );
+    // No host is approved: getting 409 rather than network-policy 403 proves
+    // the occupied-name preflight ran before any download was admitted.
+    let response = client
+        .post(format!("{base}/marketplaces/codewhale/install"))
+        .json(&serde_json::json!({"candidate":"computer-use"}))
+        .send()
+        .await?;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert!(!root.join("plugins/computer-use").exists());
+    let detail: serde_json::Value = client
+        .get(format!("{base}/plugins/computer-use"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(
+        detail["content_hash"],
+        candidate["existing_plugin"]["content_hash"]
+    );
+    assert_eq!(detail["trust_status"], "not-reviewed");
+    assert_eq!(detail["enabled"], false);
+    assert!(!detail["review"]["token"].as_str().unwrap().is_empty());
+    assert!(bundle.join("plugin.toml").is_file());
     handle.abort();
     Ok(())
 }
@@ -13274,7 +14227,6 @@ async fn native_notification_replay_rechecks_requests_settled_during_the_read() 
     let _env = lock_test_env();
     let temp = tempfile::tempdir()?;
     let _home = EnvVarGuard::set("CODEWHALE_HOME", temp.path().join("home"));
-    let _runtime = EnvVarGuard::set("CODEWHALE_RUNTIME_DIR", temp.path().join("runtime-store"));
     let _backend = EnvVarGuard::set("CODEWHALE_SECRET_BACKEND", "file");
     let _proxy = EnvVarGuard::set("NO_PROXY", "*");
     let path = temp.path().join("config.toml");

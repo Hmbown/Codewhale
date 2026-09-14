@@ -96,6 +96,11 @@ pub struct HotbarSetupView {
     query: String,
     filter_focused: bool,
     help_visible: bool,
+    /// `d` arms this instead of persisting `hotbar = []` straight away.
+    /// Disabling rewrites every slot binding on disk and the setup view invites
+    /// bare typing as its filter, so a stray keystroke must not be able to
+    /// destroy the bindings. Mirrors `SessionPickerView::confirm_delete`.
+    confirm_disable: bool,
 }
 
 impl HotbarSetupView {
@@ -170,6 +175,7 @@ impl HotbarSetupView {
             original_bindings,
             recommended_action_ids,
             validation_errors: Vec::new(),
+            confirm_disable: false,
             query: String::new(),
             filter_focused: false,
             help_visible: false,
@@ -239,8 +245,25 @@ impl HotbarSetupView {
         &self.query
     }
 
+    /// The status row, styled. An armed disable confirmation outranks every
+    /// other status because it is the only one asking for an answer.
+    fn status_line(&self) -> Line<'static> {
+        if self.confirm_disable {
+            return Line::from(Span::styled(
+                tr(self.locale, MessageId::HotbarSetupConfirmDisable).into_owned(),
+                Style::default()
+                    .fg(palette::STATUS_WARNING)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+        Line::from(self.status_text())
+    }
+
     #[must_use]
     pub fn status_text(&self) -> String {
+        if self.confirm_disable {
+            return tr(self.locale, MessageId::HotbarSetupConfirmDisable).into_owned();
+        }
         if let Some(error) = self.validation_errors.last() {
             return error.clone();
         }
@@ -465,11 +488,25 @@ impl HotbarSetupView {
 
         lines.push(Line::from(""));
         lines.push(self.slots_line());
-        lines.push(Line::from(self.status_text()));
+        lines.push(self.status_line());
         lines
     }
 
     fn header_lines(&self) -> Vec<Line<'static>> {
+        // The header is painted into `content.height.min(5)` rows with
+        // `Wrap { trim: true }`, and the intro wraps to two rows at ordinary
+        // widths — which is the whole budget once the slots, tabs and filter
+        // rows follow. An armed confirmation must never be the line that falls
+        // off the bottom, so it takes the intro's place instead of queueing
+        // behind it. Chrome yields to the question; the question is the content.
+        if self.confirm_disable {
+            return vec![
+                self.status_line(),
+                self.slots_line(),
+                self.source_tabs_line(),
+                self.filter_line(),
+            ];
+        }
         let alt_prefix = crate::tui::widgets::key_hint::alt_prefix();
         vec![
             Line::from(Span::styled(
@@ -484,7 +521,7 @@ impl HotbarSetupView {
             self.slots_line(),
             self.source_tabs_line(),
             self.filter_line(),
-            Line::from(self.status_text()),
+            self.status_line(),
         ]
     }
 
@@ -743,6 +780,21 @@ impl ModalView for HotbarSetupView {
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> ViewAction {
+        // The disable confirmation owns every key while it is armed, so the
+        // filter cannot swallow the answer and no other action can fire under it.
+        if self.confirm_disable {
+            return match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    self.confirm_disable = false;
+                    ViewAction::EmitAndClose(ViewEvent::HotbarDisableRequested)
+                }
+                _ => {
+                    self.confirm_disable = false;
+                    ViewAction::None
+                }
+            };
+        }
+
         match key.code {
             KeyCode::Esc if self.filter_focused || !self.query.is_empty() => {
                 self.query.clear();
@@ -846,8 +898,10 @@ impl ModalView for HotbarSetupView {
                 if key.modifiers.is_empty() && !self.filter_focused =>
             {
                 // "Disable Hotbar" from inside the setup flow: hide it and
-                // persist `hotbar = []`. Mirrors `/hotbar off`.
-                ViewAction::EmitAndClose(ViewEvent::HotbarDisableRequested)
+                // persist `hotbar = []`. Mirrors `/hotbar off`. Arm the
+                // confirmation rather than writing; `y` commits.
+                self.confirm_disable = true;
+                ViewAction::None
             }
             KeyCode::Char('/') if key.modifiers.is_empty() => {
                 self.filter_focused = true;
@@ -1286,17 +1340,79 @@ mod tests {
     fn wizard_disable_key_emits_disable_request_and_intro_mentions_it() {
         let app = test_app();
 
-        // 'd' and 'D' hide the Hotbar from inside the setup flow (mirrors /hotbar off).
+        // 'd' and 'D' hide the Hotbar from inside the setup flow (mirrors /hotbar
+        // off), but only after the confirmation is answered. Disabling rewrites
+        // every slot binding on disk, and this view takes bare letters as its
+        // filter, so the first keystroke must never be the destructive one.
+        for ch in ['d', 'D'] {
+            let mut view = HotbarSetupView::new(&app, &Config::default());
+            assert!(
+                matches!(view.handle_key(key(KeyCode::Char(ch))), ViewAction::None),
+                "{ch} must arm the confirmation, not disable the Hotbar"
+            );
+            assert!(
+                view.status_text().contains("(y/n)"),
+                "the armed confirmation must be visible, got {:?}",
+                view.status_text()
+            );
+            assert!(matches!(
+                view.handle_key(key(KeyCode::Char('y'))),
+                ViewAction::EmitAndClose(ViewEvent::HotbarDisableRequested)
+            ));
+        }
+
+        // The armed confirmation must survive the header's five-row budget at a
+        // real terminal width. `status_text()` returning it is not enough: the
+        // intro wraps to two rows, and the confirmation used to be the sixth
+        // line into a five-line region, so `d` armed a question the user never
+        // saw. Assert the painted buffer, not the string.
+        {
+            use ratatui::{Terminal, backend::TestBackend};
+            let mut view = HotbarSetupView::new(&app, &Config::default());
+            assert!(matches!(
+                view.handle_key(key(KeyCode::Char('d'))),
+                ViewAction::None
+            ));
+            for (w, h) in [(100u16, 32u16), (80, 24), (140, 40)] {
+                let mut terminal = Terminal::new(TestBackend::new(w, h)).expect("terminal");
+                terminal
+                    .draw(|frame| {
+                        let area = frame.area();
+                        view.render(area, frame.buffer_mut());
+                    })
+                    .expect("draw");
+                let painted = terminal
+                    .backend()
+                    .buffer()
+                    .content()
+                    .iter()
+                    .map(|cell| cell.symbol())
+                    .collect::<String>();
+                assert!(
+                    painted.contains("(y/n)"),
+                    "{w}x{h}: the armed disable confirmation is not on screen"
+                );
+            }
+        }
+
+        // Anything other than y dismisses it, and the keystroke is spent on the
+        // dismissal rather than falling through to whatever it normally does.
         let mut view = HotbarSetupView::new(&app, &Config::default());
         assert!(matches!(
             view.handle_key(key(KeyCode::Char('d'))),
-            ViewAction::EmitAndClose(ViewEvent::HotbarDisableRequested)
+            ViewAction::None
         ));
-        let mut view = HotbarSetupView::new(&app, &Config::default());
         assert!(matches!(
-            view.handle_key(key(KeyCode::Char('D'))),
-            ViewAction::EmitAndClose(ViewEvent::HotbarDisableRequested)
+            view.handle_key(key(KeyCode::Char('n'))),
+            ViewAction::None
         ));
+        assert!(!view.status_text().contains("(y/n)"));
+        assert!(
+            matches!(view.handle_key(key(KeyCode::Esc)), ViewAction::Close),
+            "a dismissed confirmation returns the view to its ordinary key table"
+        );
+
+        let view = HotbarSetupView::new(&app, &Config::default());
 
         // The always-visible intro explains what Hotbar is and the disable path.
         let joined: String = view

@@ -1,11 +1,6 @@
 ---
 name: handoff
-description: >-
-  Write a compact, decision-ready handoff so the next session (or the user)
-  can continue without reconstructing the current one. Use when the session
-  is ending, context is running low, the user asks for a handoff / "pass the
-  baton" / "hand off", or a long-running operation needs a durable state
-  checkpoint.
+description: "Write a compact, decision-ready handoff so the next session (or the user) can continue without reconstructing the current one. Use when the session is ending, context is running low, the user asks for a handoff / 'pass the baton' / 'hand off', or a long-running operation needs a durable state checkpoint."
 invocation: model+user
 ---
 

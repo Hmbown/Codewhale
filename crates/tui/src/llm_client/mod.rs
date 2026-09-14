@@ -648,7 +648,31 @@ pub(crate) fn sanitize_http_error_body(
     status: u16,
     body: &str,
 ) -> String {
-    if let Some(message) = extract_json_error_message(body) {
+    let json_message = extract_json_error_message(body);
+    let message = json_message.as_deref().unwrap_or(body);
+    // Gate on Google's actual rejection, not the selected provider or model:
+    // compatible gateways may manage signatures themselves (#6048). This
+    // shared boundary covers both streaming and non-streaming HTTP failures.
+    const SIGNATURE_HINT: &str = "Gemini rejected tool-call replay because a thought signature is missing. \
+        Use the built-in `google` provider with its default endpoint, or a gateway that preserves \
+        Google thought signatures, then start a new session before using tools. \
+        Changing reasoning settings will not restore missing signatures.";
+    if status == 400
+        && !is_probably_html(message)
+        && explicit_quota_code(body).is_none()
+        && !message.contains(SIGNATURE_HINT)
+    {
+        let lower = collapse_whitespace(message).to_ascii_lowercase();
+        if lower.contains("missing a thought_signature")
+            || lower.contains("missing thought_signature")
+            || lower.contains("thought_signature is missing")
+        {
+            let detail = truncate_for_error(&collapse_whitespace(message), 900);
+            return format!("{SIGNATURE_HINT} Provider error: {detail}");
+        }
+    }
+
+    if let Some(message) = json_message {
         let message = truncate_for_error(&collapse_whitespace(&message), 2_000);
         if let Some(code) = explicit_quota_code(body) {
             return format!("{message} (provider error code: {code})");

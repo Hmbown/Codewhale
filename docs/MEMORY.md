@@ -71,6 +71,11 @@ wrapped to mark it as **untrusted user data**, not a second
 instruction layer. For depth beyond the injected head, the model can
 call the `memory_search` / `memory_get` tools against the FTS5 index.
 
+The initial memory snapshot belongs to the session's frozen prompt prefix.
+Changes discovered during the session are appended as history, as described
+in [CACHE.md](CACHE.md); neither a native note update nor an external recall
+may rewrite the system prompt or tool catalog on every turn.
+
 ## Three ways to add to memory
 
 ### 1. The `# ` composer prefix (#492)
@@ -166,11 +171,30 @@ Memory is for **durable** signal. Things that should NOT live there:
 
 ## Privacy and scope
 
-The store lives entirely on your machine. It is never uploaded to any
-cloud service — the TUI only ever includes entries inline in the
-system prompt that the LLM provider receives, and only when memory is
-enabled. Workspace-scoped memory is keyed by a hash of the repo's git
+The native store lives on your machine and does not synchronize itself to
+a cloud memory service. Recalled entries are sent to the selected model
+provider as prompt context when memory is enabled. Keep secrets out of it.
+Workspace-scoped memory is keyed by a hash of the repo's git
 origin, so notes from one repo never leak into another repo's prompt.
+
+## External memory services
+
+Persistent memory already works through the native store. First-class backend
+selection currently accepts only `native` and `off`; there is no supported
+`external`, `mem0`, or `memcode` backend setting.
+
+A third-party memory service can expose tools through the existing
+[MCP](MCP.md) or [plugin](PLUGINS.md) integration. Those are the service's own
+tools: they do not replace `remember`, `memory_search`, `/memory native`, or
+the `#` quick-add path. Review the plugin's permissions and the service's data
+destination before enabling it. An unavailable external service must report
+its failure rather than silently send notes to another backend.
+
+A future first-class backend must cover capture, search, correction, deletion,
+scope and error reporting across every memory entry point. It must also keep
+volatile recall in append-only history under the cache contract above. That
+complete migration is tracked in [#6050](https://github.com/Hmbown/CodeWhale/issues/6050);
+0.9.13 does not claim that migration or a commercial memory integration.
 
 ## Configuration reference
 

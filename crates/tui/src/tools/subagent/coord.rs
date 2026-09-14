@@ -307,6 +307,76 @@ impl AgentsFollowupTool {
     }
 }
 
+impl AgentsFollowupTool {
+    async fn followup_one(
+        &self,
+        agent_ref: &str,
+        message: &str,
+        context: &ToolContext,
+    ) -> Result<Value, ToolError> {
+        let mut manager = self.manager.write().await;
+        let (source, target) = manager
+            .continuation_target_for_caller(
+                &context.state_namespace,
+                agent_ref,
+                self.caller_agent_id.as_deref(),
+                "agents/followup",
+            )
+            .map_err(|error| ToolError::invalid_input(error.to_string()))?;
+        let snapshot = manager
+            .get_result(&target)
+            .map_err(|error| ToolError::invalid_input(error.to_string()))?;
+        let resumed_already = source != target;
+        let receipt = if super::subagent_checkpoint_is_continuable(&snapshot)
+            && self.runtime.is_some()
+        {
+            let snapshot = manager
+                .resume_from_checkpoint_for_session(
+                    &context.state_namespace,
+                    Arc::clone(&self.manager),
+                    self.runtime.clone().expect("runtime checked"),
+                    &target,
+                    message,
+                )
+                .map_err(|error| ToolError::execution_failed(error.to_string()))?;
+            ParentMailReceipt {
+                agent_id: snapshot.agent_id.clone(),
+                status: subagent_status_name(&snapshot.status).to_string(),
+                queue_depth: 0,
+                woke: true,
+                continued_from_checkpoint: true,
+                continuation_handle: None,
+                note: format!(
+                    "resumed from checkpoint {source} as {}; original receipt retained",
+                    snapshot.agent_id
+                ),
+            }
+        } else if resumed_already && snapshot.status != SubAgentStatus::Running {
+            ParentMailReceipt {
+                agent_id: target, status: subagent_status_name(&snapshot.status).to_string(),
+                queue_depth: 0, woke: false, continued_from_checkpoint: true,
+                continuation_handle: None,
+                note: "Existing continuation has settled; no duplicate worker was started and no message was delivered.".to_string(),
+            }
+        } else {
+            manager
+                .followup_child_for_session(&context.state_namespace, &target, message.to_string())
+                .map_err(|error| ToolError::invalid_input(error.to_string()))?
+        };
+        let child_route = manager
+            .get_worker_record_for_session(&context.state_namespace, &receipt.agent_id)
+            .and_then(|record| record.spec.child_route);
+        Ok(json!({
+            "action": "followup", "from": source, "to": receipt.agent_id,
+            "agent_id": receipt.agent_id, "queued": receipt.woke || receipt.queue_depth > 0,
+            "woke": receipt.woke, "queue_depth": receipt.queue_depth, "status": receipt.status,
+            "continued_from_checkpoint": receipt.continued_from_checkpoint || resumed_already,
+            "continuation_handle": receipt.continuation_handle, "note": receipt.note,
+            "child_route": child_route,
+        }))
+    }
+}
+
 #[async_trait]
 impl ToolSpec for AgentsFollowupTool {
     fn model_visible(&self) -> bool {
@@ -330,16 +400,13 @@ impl ToolSpec for AgentsFollowupTool {
         json!({
             "type": "object",
             "properties": {
-                "agent_id": {
-                    "type": "string",
-                    "description": "Target child agent id or session name."
-                },
-                "message": {
-                    "type": "string",
-                    "description": "Follow-up message text."
-                }
+                "agent_id": {"type": "string"},
+                "agent_ids": {"type": "array", "items": {"type": "string", "minLength": 1}, "minItems": 1, "maxItems": 32},
+                "all_parked": {"type": "boolean", "description": "Continue every owned parked child, up to 32."},
+                "message": {"type": "string", "minLength": 1}
             },
-            "required": ["agent_id", "message"]
+            "required": ["message"],
+            "oneOf": [{"required": ["agent_id"]}, {"required": ["agent_ids"]}, {"required": ["all_parked"]}]
         })
     }
 
@@ -352,114 +419,98 @@ impl ToolSpec for AgentsFollowupTool {
     }
 
     async fn execute(&self, input: Value, context: &ToolContext) -> Result<ToolResult, ToolError> {
-        let agent_ref =
-            parse_agent_ref(&input)?.ok_or_else(|| ToolError::missing_field("agent_id"))?;
         let message = input
             .get("message")
             .or_else(|| input.get("text"))
             .and_then(Value::as_str)
             .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| ToolError::missing_field("message"))?
-            .to_string();
-
-        // Enforce the caller hierarchy, then decide between checkpoint resume
-        // (interrupted_continuable with a runtime attached) and queue-only
-        // followup while holding only the read lock. The resume path takes
-        // the write lock itself via the manager method.
-        let should_resume = {
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| ToolError::missing_field("message"))?;
+        let single = parse_agent_ref(&input)?;
+        let all_parked = super::parse_optional_bool(&input, &["all_parked"])?.unwrap_or(false);
+        let batch = input.get("agent_ids");
+        if usize::from(single.is_some()) + usize::from(batch.is_some()) + usize::from(all_parked)
+            != 1
+        {
+            return Err(ToolError::invalid_input(
+                "followup requires exactly one of agent_id, agent_ids, or all_parked=true",
+            ));
+        }
+        let mut targets = if let Some(ids) = batch {
+            let ids = ids
+                .as_array()
+                .filter(|ids| !ids.is_empty() && ids.len() <= 32)
+                .ok_or_else(|| {
+                    ToolError::invalid_input("agent_ids must contain 1..32 nonempty strings")
+                })?;
+            ids.iter()
+                .map(|id| {
+                    id.as_str()
+                        .map(str::trim)
+                        .filter(|id| !id.is_empty())
+                        .map(str::to_string)
+                        .ok_or_else(|| {
+                            ToolError::invalid_input("agent_ids must contain nonempty strings")
+                        })
+                })
+                .collect::<Result<Vec<_>, _>>()?
+        } else if let Some(id) = single.as_ref() {
+            vec![id.clone()]
+        } else {
             let manager = self.manager.read().await;
-            manager
-                .ensure_caller_controls_descendant_for_session(
-                    &context.state_namespace,
-                    &agent_ref,
-                    self.caller_agent_id.as_deref(),
-                    "agents/followup",
-                )
-                .map_err(|err| ToolError::invalid_input(err.to_string()))?;
-            manager
-                .get_result_by_ref_for_session(&context.state_namespace, &agent_ref)
-                .ok()
-                .is_some_and(|snapshot| {
-                    matches!(snapshot.status, SubAgentStatus::Interrupted(_))
-                        && snapshot
+            let mut ids = manager
+                .agents
+                .values()
+                .filter(|agent| {
+                    manager.agent_is_owned_by_session(agent, &context.state_namespace)
+                        && agent
                             .checkpoint
                             .as_ref()
-                            .is_some_and(|cp| cp.continuable && !cp.messages.is_empty())
+                            .is_some_and(|checkpoint| checkpoint.parked_at_turn_end)
+                        && matches!(agent.status, SubAgentStatus::Interrupted(_))
+                        && manager
+                            .ensure_caller_controls_descendant(
+                                &agent.id,
+                                self.caller_agent_id.as_deref(),
+                                "agents/followup",
+                            )
+                            .is_ok()
+                        && manager
+                            .continuation_target(&agent.id)
+                            .is_ok_and(|target| target == agent.id)
                 })
-        };
-
-        let receipt = if should_resume {
-            match self.runtime.clone() {
-                Some(runtime) => {
-                    let mut manager = self.manager.write().await;
-                    let snapshot = manager
-                        .resume_from_checkpoint_for_session(
-                            &context.state_namespace,
-                            Arc::clone(&self.manager),
-                            runtime,
-                            &agent_ref,
-                            &message,
-                        )
-                        .map_err(|err| ToolError::execution_failed(err.to_string()))?;
-                    ParentMailReceipt {
-                        agent_id: snapshot.agent_id.clone(),
-                        status: subagent_status_name(&snapshot.status).to_string(),
-                        queue_depth: 0,
-                        woke: true,
-                        continued_from_checkpoint: true,
-                        continuation_handle: None,
-                        note: format!(
-                            "resumed from checkpoint as new agent {} ({}); prior terminal record {} stays intact",
-                            snapshot.agent_id, snapshot.model, agent_ref
-                        ),
-                    }
-                }
-                None => {
-                    let mut manager = self.manager.write().await;
-                    manager
-                        .followup_child_for_session(&context.state_namespace, &agent_ref, message)
-                        .map_err(|err| ToolError::invalid_input(err.to_string()))?
-                }
+                .map(|agent| agent.id.clone())
+                .collect::<Vec<_>>();
+            ids.sort();
+            if ids.len() > 32 {
+                return Err(ToolError::invalid_input(
+                    "More than 32 parked children; use explicit agent_ids batches",
+                ));
             }
-        } else {
-            let mut manager = self.manager.write().await;
-            manager
-                .followup_child_for_session(&context.state_namespace, &agent_ref, message)
-                .map_err(|err| ToolError::invalid_input(err.to_string()))?
+            ids
         };
-
-        let payload = json!({
-            "action": "followup",
-            "agent_id": receipt.agent_id,
-            "queued": true,
-            "woke": receipt.woke,
-            "queue_depth": receipt.queue_depth,
-            "status": receipt.status,
-            "continued_from_checkpoint": receipt.continued_from_checkpoint,
-            "continuation_handle": receipt.continuation_handle,
-            "note": receipt.note,
-            "child_route": self.manager.read().await.get_worker_record_for_session(
-                &context.state_namespace,
-                &receipt.agent_id,
-            )
-                .and_then(|record| record.spec.child_route),
-        });
-        let mut tool_result = ToolResult::json(&payload)
-            .map_err(|err| ToolError::execution_failed(err.to_string()))?;
-        tool_result.metadata = Some(json!({
-            "action": "followup",
-            "agent_id": receipt.agent_id,
-            "woke": receipt.woke,
-            "continued_from_checkpoint": receipt.continued_from_checkpoint,
-            "continuation_handle": receipt.continuation_handle,
-            "child_route": self.manager.read().await.get_worker_record_for_session(
-                &context.state_namespace,
-                &receipt.agent_id,
-            )
-                .and_then(|record| record.spec.child_route),
-        }));
-        Ok(tool_result)
+        let mut seen = std::collections::HashSet::new();
+        targets.retain(|target| seen.insert(target.clone()));
+        let mut results = Vec::new();
+        let mut errors = Vec::new();
+        // Each mutation and both hierarchy checks share the manager write lock.
+        // A target failure cannot erase successful results from another target.
+        for target in targets {
+            match self.followup_one(&target, message, context).await {
+                Ok(payload) => results.push(payload),
+                Err(error) if single.is_some() => return Err(error),
+                Err(error) => errors.push(json!({"from": target, "error": error.to_string()})),
+            }
+        }
+        let payload = if single.is_some() {
+            results.pop().expect("single target returned a result")
+        } else {
+            json!({"action": "followup", "results": results, "errors": errors})
+        };
+        let mut result = ToolResult::json(&payload)
+            .map_err(|error| ToolError::execution_failed(error.to_string()))?;
+        result.metadata = Some(payload.clone());
+        Ok(result)
     }
 }
 
@@ -833,7 +884,7 @@ fn wait_all_payload(
     timed_out: bool,
 ) -> Result<ToolResult, ToolError> {
     let note = if timed_out {
-        "Timed out with children still running. Do not poll — wait again (until=all), or end your turn; results arrive as <codewhale:subagent.done> sentinels."
+        "The wait interval ended; the children are still running. You may answer the user or continue other work. Ordinary turn completion keeps them running; results arrive as <codewhale:subagent.done> sentinels. Use followup only when a child actually needs continuation."
     } else if settled.is_empty() {
         "No sub-agents were running; nothing to join."
     } else {
@@ -1001,7 +1052,7 @@ async fn wait_for_activity(
                 "running": outcome.2,
                 "elapsed_ms": started.elapsed().as_millis(),
                 "timed_out": true,
-                "note": "Timed out before child activity or completion.",
+                "note": "The wait interval ended without new child activity. Children keep running after ordinary turn completion and report through <codewhale:subagent.done> sentinels.",
             });
             let mut tool_result = ToolResult::json(&payload)
                 .map_err(|err| ToolError::execution_failed(err.to_string()))?;
@@ -2244,20 +2295,18 @@ mod tests {
             )
         };
 
-        let flip = Arc::clone(&manager);
-        let done_id = done.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            settle(&flip, &done_id, SubAgentStatus::Completed).await;
-        });
+        let request = json!({ "until": "all", "timeout_secs": 1 });
+        let context = ToolContext::new(tmp.path());
+        let wait = dispatch_wait(&request, Arc::clone(&manager), &context);
+        tokio::pin!(wait);
+        // Capture both running children before completing one. The timeout
+        // receipt must not depend on a background task winning a 50ms race.
+        assert!(futures_util::poll!(wait.as_mut()).is_pending());
+        settle(&manager, &done, SubAgentStatus::Completed).await;
 
-        let result = dispatch_wait(
-            &json!({ "until": "all", "timeout_secs": 1 }),
-            Arc::clone(&manager),
-            &ToolContext::new(tmp.path()),
-        )
-        .await
-        .expect("a timeout is a partial receipt, not an error");
+        let result = wait
+            .await
+            .expect("a timeout is a partial receipt, not an error");
         let body: Value = serde_json::from_str(&result.content).unwrap();
         assert_eq!(body["timed_out"], json!(true), "{body}");
         assert_eq!(body["all_settled"], json!(false), "{body}");

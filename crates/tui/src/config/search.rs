@@ -60,6 +60,10 @@ pub enum SearchProvider {
     /// snippets; falls back to the `SOFYA_API_KEY` env var when
     /// `[search] api_key` is not set.
     Sofya,
+    /// Serply Google search API (<https://serply.io>). Requires api_key;
+    /// returns Google organic results with snippets. Falls back to the
+    /// `SERPLY_API_KEY` env var when `[search] api_key` is not set.
+    Serply,
 }
 
 impl SearchProvider {
@@ -78,6 +82,7 @@ impl SearchProvider {
             }
             "volcengine" | "ark" | "volc" | "volcengine-ark" => Some(Self::Volcengine),
             "sofya" => Some(Self::Sofya),
+            "serply" => Some(Self::Serply),
             _ => None,
         }
     }
@@ -95,12 +100,13 @@ impl SearchProvider {
             Self::Baidu => "baidu",
             Self::Volcengine => "volcengine",
             Self::Sofya => "sofya",
+            Self::Serply => "serply",
         }
     }
 
     #[must_use]
     pub fn names_hint() -> &'static str {
-        "bing, duckduckgo, firecrawl, tavily, bocha, metaso, searxng, baidu, volcengine, sofya"
+        "bing, duckduckgo, firecrawl, tavily, bocha, metaso, searxng, baidu, volcengine, sofya, serply"
     }
 }
 
@@ -139,9 +145,10 @@ pub struct SearchConfig {
     /// SearXNG instance root or `/search` endpoint.
     #[serde(default)]
     pub base_url: Option<String>,
-    /// Optional for Firecrawl; required for Tavily, Bocha, Metaso, Baidu, Volcengine, or Sofya.
+    /// Optional for Firecrawl; required for Tavily, Bocha, Metaso, Baidu, Volcengine, Sofya, or Serply.
     /// Metaso also falls back to the `METASO_API_KEY` env var.
     /// Baidu also falls back to `BAIDU_SEARCH_API_KEY` env var.
+    /// Serply also falls back to the `SERPLY_API_KEY` env var.
     /// Volcengine also falls back to `VOLCENGINE_API_KEY` / `VOLCENGINE_ARK_API_KEY` / `ARK_API_KEY` env vars.
     #[serde(default)]
     pub api_key: Option<String>,

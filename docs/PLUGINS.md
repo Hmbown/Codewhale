@@ -5,8 +5,8 @@ and its runnable Skills example.
 
 This is the walkthrough for the `/plugin install` on-ramp (v0.9.4, #5182).
 [PLUGIN_BUNDLES.md](PLUGIN_BUNDLES.md) remains the contract for the bundle
-format (`plugin.json`, compatible `kimi.plugin.json`, or legacy
-`plugin.toml`), discovery, validation, and
+format (`plugin.json`, compatible `kimi.plugin.json` or
+`.claude-plugin/plugin.json`, or legacy `plugin.toml`), discovery, validation, and
 the trust/enable lifecycle — this document covers how bits get onto disk in
 the first place.
 
@@ -47,12 +47,31 @@ gated by the per-domain network policy: an unknown host returns a
 a denied host aborts without touching disk.
 
 The fetched tree must contain **exactly one** bundle root — a directory
-holding a `plugin.json`, compatible `kimi.plugin.json`, or legacy `plugin.toml`
-manifest. Kimi bundles are accepted when they use Codewhale-compatible Skills,
+holding a `plugin.json`, compatible `kimi.plugin.json`,
+`.claude-plugin/plugin.json`, or legacy `plugin.toml` manifest. Kimi bundles are accepted when they use Codewhale-compatible Skills,
 commands, agents, and MCP declarations; unsupported Kimi runtime fields fail
 closed instead of being silently ignored. Bundles land in
 the user plugins root at `~/.codewhale/plugins/<name>/`, where `<name>` is the
 manifest's plugin name.
+
+Claude bundles keep their metadata in `.claude-plugin/plugin.json` and their
+components at the bundle root. The importer supports skills, commands, agents,
+and MCP servers declared inline or in root `.mcp.json` (flat server map or an
+`mcpServers` wrapper). Claude `http` transport maps to Streamable HTTP. Relative
+sources in a `.claude-plugin/marketplace.json` catalog resolve from the marketplace
+repository root. The whole bundle remains subject to the same review hashes and
+path checks as native plugins.
+
+Remote MCP headers can name credentials without embedding them: exact
+`Bearer ${ENV_NAME}` authorization values become `bearer_token_env_var`, and
+exact `${ENV_NAME}` header values become `env_headers`. Import reads no credential
+values. Literal credentials and compound templates are rejected.
+
+This is a compatible subset: hooks, LSP declarations, custom MCP file paths, and
+`${CLAUDE_PLUGIN_ROOT}` expansion are rejected with an explanation; no partial
+plugin is installed. Installing a remote MCP declaration does not complete its
+authentication. Plugin-contributed remote servers retain the existing explicit
+credential requirements; this importer does not enable plugin OAuth.
 
 ## The guided flow
 

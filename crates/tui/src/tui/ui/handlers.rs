@@ -112,7 +112,9 @@ pub(crate) fn handle_bracketed_paste(app: &mut App, text: &str) {
     } else if !app.view_stack.is_empty() {
         // A non-consumed modal is open — don't leak paste into composer.
     } else {
-        // Paste into main input.
+        // Main-input paste takes the same keyboard ownership as typed text.
+        // Otherwise the visible composer command's Enter stays with the dock.
+        crate::tui::work_surface::release_focus(app);
         app.insert_paste_text(text);
     }
 }
@@ -154,9 +156,12 @@ pub(crate) fn handle_reasoning_effort_key(app: &mut App, key: &event::KeyEvent) 
     true
 }
 
-/// Let the transcript remain reviewable while an approval card owns focus.
-pub(crate) fn handle_approval_transcript_key(app: &mut App, key: &event::KeyEvent) -> bool {
-    if app.view_stack.top_kind() != Some(ModalKind::Approval) {
+/// Let the transcript remain reviewable while a decision prompt owns focus.
+pub(crate) fn handle_prompt_transcript_key(app: &mut App, key: &event::KeyEvent) -> bool {
+    if !matches!(
+        app.view_stack.top_kind(),
+        Some(ModalKind::Approval | ModalKind::UserInput)
+    ) {
         return false;
     }
 
@@ -636,6 +641,16 @@ pub(crate) async fn handle_mcp_ui_action(
     let mut changed = false;
     let mut message = None;
     let is_reload = matches!(&action, crate::tui::app::McpUiAction::Reload);
+    // A reload already running owns the live surface, and starting a second
+    // pass restarts every server the first one is still connecting. `Extensions`
+    // rows read `[connecting]` while that happens and answer no key, so a user
+    // who presses Enter again gets another full reconnect and another receipt —
+    // four presses became four overlapping 12-server reloads and a wall of
+    // duplicate notes. The flag was already tracked; nothing ever read it.
+    if is_reload && app.mcp_reload_in_flight {
+        add_mcp_message(app, app.tr(MessageId::McpReloadAlreadyRunning).into_owned());
+        return;
+    }
     let retry_name = match &action {
         crate::tui::app::McpUiAction::Retry { name } => Some(name.clone()),
         _ => None,
@@ -1192,6 +1207,48 @@ pub(crate) async fn handle_view_events(
                     open_text_pager(app, title, content);
                 }
             },
+            ViewEvent::ExecutePanelCommand {
+                command,
+                pager_title,
+            } => {
+                // The Extensions panel stays open for this command. Inspect
+                // rows divert their text output into a pager stacked on the
+                // panel instead of a transcript dump; mutations keep their
+                // transcript receipt either way.
+                let mut result = crate::commands::execute(&command, app);
+                if let Some(title) = pager_title
+                    && let Some(text) = result.message.take()
+                {
+                    open_text_pager(app, title, text);
+                }
+                if apply_command_result(terminal, app, engine_handle, task_manager, config, result)
+                    .await?
+                {
+                    return Ok(true);
+                }
+                // The row the user just changed re-reads live state, and so
+                // does every sibling — a plugin enable, an MCP retry, or an
+                // install lands on the still-open list instead of leaving it
+                // stale until reopen.
+                let snapshot = crate::tui::views::extensions::ExtensionsSnapshot::from_app(app);
+                app.view_stack.refresh_extensions(snapshot);
+            }
+            ViewEvent::RefreshExtensions {
+                mcp_generation,
+                mcp_initializing,
+            } => {
+                // Bounded poll from the open panel: rebuild only when the
+                // MCP generation or the initializing flag moved past what
+                // the panel's snapshot last saw.
+                if app.view_stack.extensions_is_top()
+                    && (mcp_generation != app.mcp_snapshot_generation
+                        || app.mcp_snapshot_generation_invalidated
+                        || mcp_initializing != app.mcp_initializing)
+                {
+                    let snapshot = crate::tui::views::extensions::ExtensionsSnapshot::from_app(app);
+                    app.view_stack.refresh_extensions(snapshot);
+                }
+            }
             ViewEvent::OpenTextPager { title, content } => {
                 open_text_pager(app, title, content);
             }
@@ -1573,6 +1630,87 @@ pub(crate) async fn handle_view_events(
                         );
                     }
                 }
+            }
+            // Enter on a Fleet editor row: the standard `/model` picker opens
+            // on top of the editor, and its pick comes back below as
+            // `FleetRoutePicked` to land on the editor still on the stack.
+            ViewEvent::FleetDetailRoutePickRequested { target, editor_id } => {
+                let selection = if app.view_stack.top_kind() == Some(ModalKind::FleetDetail)
+                    && let Some(mut editor) = app.view_stack.pop()
+                {
+                    let selection = editor
+                        .as_any_mut()
+                        .downcast_mut::<crate::tui::views::fleet_detail::FleetDetailView>()
+                        .and_then(|view| view.route_selection(editor_id, target));
+                    app.view_stack.push_boxed(editor);
+                    selection
+                } else {
+                    None
+                };
+                if let Some(selection) = selection {
+                    app.view_stack.push(
+                        crate::tui::model_picker::ModelPickerView::new_for_fleet_route(
+                            app, config, target, editor_id, selection,
+                        ),
+                    );
+                }
+            }
+            ViewEvent::FleetRoutePicked {
+                target,
+                editor_id,
+                provider,
+                provider_id,
+                model,
+                reasoning,
+            } => {
+                let provider_key = provider_id.unwrap_or_else(|| provider.as_str().to_string());
+                // The picker's `auto` row is "inherit": the Fleet row follows
+                // the session route again.
+                let pin = (model != "auto").then_some((provider_key, model));
+                if let Some((provider_key, _)) = &pin
+                    && let Some(rejection) =
+                        crate::commands::fleet_provider_rejection(app, config, provider_key)
+                {
+                    // Same gate as `/fleet add` and ⇧F: an unconfigured route
+                    // never enters a team from the picker.
+                    app.set_sticky_status(rejection, StatusToastLevel::Error, None);
+                } else if app.view_stack.top_kind() == Some(ModalKind::FleetDetail)
+                    && let Some(mut boxed) = app.view_stack.pop()
+                {
+                    let outcome = boxed
+                        .as_any_mut()
+                        .downcast_mut::<crate::tui::views::fleet_detail::FleetDetailView>()
+                        .map(|view| {
+                            let (provider, model) = match pin {
+                                Some((provider, model)) => (Some(provider), Some(model)),
+                                None => (None, None),
+                            };
+                            view.apply_picked_route(editor_id, target, provider, model, reasoning)
+                        });
+                    app.view_stack.push_boxed(boxed);
+                    match outcome {
+                        Some(Ok(message)) => {
+                            app.push_status_toast(message, StatusToastLevel::Success, Some(8_000));
+                            sync_fleet_roster(app, config, engine_handle);
+                            refresh_parked_fleet_roster(app, config);
+                        }
+                        Some(Err(reason)) => {
+                            app.set_sticky_status(reason, StatusToastLevel::Error, None);
+                        }
+                        None => {}
+                    }
+                } else {
+                    app.set_sticky_status(
+                        codewhale_localization::tr(
+                            app.ui_locale,
+                            codewhale_localization::MessageId::FleetRoutePickUnavailable,
+                        )
+                        .into_owned(),
+                        StatusToastLevel::Error,
+                        None,
+                    );
+                }
+                app.needs_redraw = true;
             }
             ViewEvent::FleetStoreChanged { message } => {
                 app.status_message = Some(message);

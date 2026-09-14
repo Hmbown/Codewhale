@@ -293,6 +293,23 @@ pub fn bundled_offerings() -> Vec<ProviderModelOffering> {
         },
     ];
 
+    offerings.extend(
+        crate::opencode_go::MODEL_GROUPS
+            .iter()
+            .flat_map(|(endpoint_key, models)| {
+                models.iter().map(move |model| ProviderModelOffering {
+                    provider: ProviderId::from("opencode-go"),
+                    canonical_model: None,
+                    wire_model_id: WireModelId::from(*model),
+                    endpoint_key: (*endpoint_key).to_string(),
+                    default_for_provider: *model == crate::DEFAULT_OPENCODE_GO_MODEL,
+                    limits: RouteLimits::default(),
+                    capabilities: RouteCapabilities::default(),
+                    pricing: PricingSku::UnknownOrStale,
+                })
+            }),
+    );
+
     let provider = ProviderId::from("opencode-zen");
     let groups = [
         ("responses", OPENCODE_ZEN_RESPONSES_MODELS),

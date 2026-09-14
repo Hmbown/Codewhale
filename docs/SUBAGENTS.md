@@ -1,11 +1,18 @@
-# Fleet workers and sub-agent compatibility
+# Fleet and sub-agents
 
 > 阅读简体中文版：[zh_hans/SUBAGENTS.md](zh_hans/SUBAGENTS.md)
 
+Fleet manages saved models and role assignments for these same sub-agents.
+Use `agent` for an individual assignment and `workflow` for phases with
+dependencies and completion checks. See [Workflow authoring](WORKFLOW_AUTHORING.md)
+for plans that use the Fleet model shortlist.
+
 Fleet roles are the user-facing vocabulary for delegated work: a parent
 launches a focused `general`, `explore`, `planner`, `reviewer`, `implement`,
-`test`, or `advisor` through `agent` and gets back an `agent_id` plus transcript handle
-while the worker runs. The internal runtime type is `FleetRole` (formerly
+`test`, or `advisor` through `agent` and gets back an `agent_id`, declared
+deliverables, and effective limits while the worker runs. The default receipt is
+compact; request addressed detail when you need the transcript handle or ledger.
+The internal runtime type is `FleetRole` (formerly
 `SubAgentType`); the older role spellings (`worker`, `scout`, `plan`,
 `review`, `builder`, `verifier`, `consultant`, `oracle`, …) remain accepted only as a persisted/deserialize
 compatibility adapter during v0.9.x. New prompts and config should use fleet
@@ -27,22 +34,23 @@ continuation handle instead of leaving the parent to infer what happened. For
 work that must survive process restarts, sleep, or remote execution, prefer
 fleet or a Workflow-backed fleet run.
 
-Sub-agents inherit the parent's tool registry by default, and that includes
-`agent` itself: children are built with `with_full_agent_surface_options`
-(`crates/tui/src/tools/subagent/mod.rs:12164`) so they can recurse. `agent` is
-filtered out of a child's catalog only when the depth budget is spent —
-`can_spawn_child = !runtime.would_exceed_depth()` (`mod.rs:12145`), enforced at
-`mod.rs:12324` and `:12469`. With the default depth of 3
-(`DEFAULT_SPAWN_DEPTH`, `crates/config/src/lib.rs:1671`) a child can spawn
-grandchildren. The removed `agent_open`/`agent_eval`/`agent_close` lifecycle
-tools are gone from every registry, parent and child alike.
+Sub-agents inherit the parent's permitted tool registry, including `agent`
+coordination. Spawning obeys one absolute depth ceiling: the root is depth 0,
+its child is depth 1, and a child at `max_spawn_depth` cannot spawn again.
+The operator default is 3, with a hard ceiling of 8. A role, saved profile, or
+compatibility request can only narrow that ceiling. Recovery and transcript
+forking retain the source's position and bounds; they do not buy another
+generation. The removed `agent_open`/`agent_eval`/`agent_close` lifecycle tools
+are absent from every registry.
 
-`agent` children are owned by the current parent turn by default. Ending or
-cancelling that turn parks its foreground descendants. Explicit `detached=true`
-starts background work with an independent cancellation token.
+Healthy children continue after an ordinary parent response. Their completion
+returns through the existing Engine inbox and can wake the parent for another
+normal turn. Explicit interruption or cancellation remains authoritative.
+`detached: true` additionally opts a subtree out of parent-turn cancellation;
+it does not remove child budgets or the headless host's deadline.
 
-This doc covers the role taxonomy and current compatibility controls. The active
-orchestration surface is `agent`; see the sub-agent guidance in
+This doc covers roles and individual worker controls. Use `workflow` to coordinate
+multiple assignments through the same worker runtime; see the sub-agent guidance in
 `crates/tui/src/prompts/text.rs` (`AGENT_MODE`) and the in-line
 tool description.
 
@@ -85,21 +93,17 @@ its explicit tool list or the spawning call. The focused worker's header
 states the effective posture (`scout · read-only · network · read-only
 shell`) from the runtime's own permission snapshot.
 
-**Delegation moves work, never authority** (the containment answer for
-#5426). A read-only role delegating to a write-capable role (scout →
-builder) is a supported escape hatch for *work capacity* — the child brings
-its own model, route, and step budget — but the child's authority is clamped
-against the delegating parent's live posture, not the operator's: a scout's
-builder child lands read-only with raw shell and mutating tools denied, and
-canonical `Bash` is denied to it too (only bounded-inspection roles keep the
-classified read-only shell). Delegating to obtain shell is therefore
-mechanically useless — the scout's own bounded shell (`git -C … log`,
-`find … | head`, `npm view …`, classifier-gated) is the only shell path a
-read-only parent has. Read-only is transitive through any delegation chain:
-the clamp (`ChildAuthority::clamp` in `fleet/exact.rs`) intersects every
-field with the narrower side, the deny-list union means a descendant can
-never drop an ancestor's restriction, and `inherit_disallowed_tools: false`
-cannot drop any operator or ancestor denial. This is pinned by
+**Delegation moves work, never authority.** A read-only parent may delegate
+to `implement`, but the child's effective write, network, shell, and tool
+permissions remain within the parent's live posture. Inspection roles can use
+the classified read-only shell surface and, where native enforcement is
+available, the explicit read-only analysis mode described below. A different
+role name or `read_only` flag cannot grant a shell tool the caller lacks.
+The clamp (`ChildAuthority::clamp` in `fleet/exact.rs`) intersects every field
+with the narrower side. Deny lists are unioned, so
+`inherit_disallowed_tools: false` cannot drop any operator or ancestor denial.
+Resuming a saved worker intersects its saved posture with the current caller's
+posture again. This containment is pinned by
 `a_read_only_parents_delegation_never_widens_authority` in
 `crates/tui/src/fleet/exact.rs` tests.
 
@@ -125,7 +129,7 @@ turn's user message.
 `agent` starts fresh by default: the child gets its role prompt plus the
 task you pass. Use `fork_context: true` when the child should continue from
 the parent's current request prefix instead. (`fork_context` is not in the
-advertised v0.9.9 schema — it stays parse-accepted for compat callers, and
+advertised schema — it stays parse-accepted for compat callers, and
 auto-forking for read-only roles continues unchanged.) In fork mode the runtime keeps the
 parent prefill/prompt prefix byte-identical where available, appends a
 structured state snapshot, then adds the sub-agent role instructions and task
@@ -182,11 +186,22 @@ session projection and worker record. By default the branch is
 `codex/agent-<name>-<id>` and the checkout lives beside the parent repo under
 `.codewhale-worktrees/`, so the parent checkout stays clean.
 
-Isolation is not write authority. A prompt-only worker starts read-only.
-A writer also declares `write_authority: "workspace_write"` or
-`"worktree_write"` and at least one normalized repo-relative `write_roots`,
-`exact_files`, or `coordination_contracts` value. Active overlapping shared
-claims fail before mutation; a real isolated worktree may proceed in parallel.
+Isolation is not write authority. A prompt-only start with no role/profile or
+write declaration remains read-only, and read-only roles need no write scope.
+Explicitly selected write-capable roles such as `general` and `implement`
+inherit the parent's write ceiling and default to the workspace
+(`write_roots: ["."]`) unless narrowed. Prefer explicit, disjoint `exact_files`
+or `write_roots` for parallel work; `coordination_contracts` can reserve named
+shared contracts. If only `deliverables` supplies a writer's scope, those files
+become the exact-file scope.
+
+`write_authority` is optional typed narrowing: `read_only` admits no write
+scope, `workspace_write` uses the shared checkout, and `worktree_write`
+requires actual worktree isolation. Incompatible role/scope declarations fail
+before admission. Active overlapping shared claims fail before mutation; a
+real isolated worktree may proceed in parallel. A `custom` role requires
+explicit write-capable authority to claim writes; otherwise it starts
+read-only.
 
 Optional fields:
 
@@ -197,6 +212,72 @@ Optional fields:
 
 Do not combine `cwd` with `worktree`; `cwd` remains the manual escape hatch for
 an already-created directory inside the parent workspace.
+
+### File deliverables and edit claims
+
+Put required files in `deliverables`; keep the human outcome in
+`expected_artifact`. For example, call `agent` with:
+
+```json
+{
+  "action": "start",
+  "type": "implement",
+  "prompt": "Summarize the local routing evidence in reports/routing.md.",
+  "exact_files": ["reports/routing.md"],
+  "deliverables": ["reports/routing.md"],
+  "expected_artifact": "A concise report with source references and open gaps"
+}
+```
+
+At most 16 repo-relative file paths are accepted. Absolute paths, traversal,
+repository metadata paths, and symlink traversal are refused. Completion checks
+each file against the admitted scope and reports its path, status, and byte
+count where available. The terminal statuses are `present`, `missing`, `empty`,
+`not_file`, `out_of_scope`, `invalid_path`, and `unreadable`.
+`present` means a nonempty regular file exists; it does not prove the report is
+correct or that tests passed.
+
+A missing or invalid required file sets `verification.status` to
+`deliverable_missing` with the individual verdicts. Successful file checks can
+produce `deliverables_present`; they do not turn a child self-report into an
+independent quality gate. The completion notice includes the actual verdicts,
+including when a worker fails or exhausts a budget.
+
+Edit claims are checked separately against the spawn-time git HEAD and dirty
+file contents. Explicit changed-file declarations can produce
+`claim_mismatch` when a claimed file did not change, or when a successful
+bounded write receipt changed a file the child did not declare. A peer's
+change inside a worker's broad scope is not enough to attribute that write to
+the worker. `path:LINE` and `path:LINE-LINE` evidence citations, including
+sentence punctuation and Markdown links, never count as edit claims.
+
+### Reading beside a writer
+
+Read-only tools and classifier-approved shell reads can run while a peer owns
+a shared write claim. For arbitrary analysis code, call `bash` with explicit
+`read_only: true`:
+
+```json
+{
+  "action": "run",
+  "read_only": true,
+  "command": "python3 -c \"import sqlite3; db = sqlite3.connect('file:cache/index.db?mode=ro', uri=True); print(db.execute('SELECT name FROM sqlite_schema').fetchall())\""
+}
+```
+
+This mode requires native filesystem read-only isolation and denies network
+access. It accepts only foreground `run` with `command`, optional `cwd`, and
+`timeout_ms`. Background or interactive modes, stdin, sandbox escalation, and
+external execution backends are incompatible. If native enforcement is absent
+or cannot be prepared, the call refuses before executing the command; the flag
+never falls back to trusting a promise that the code only reads. Existing role,
+tool, and ancestor policy restrictions still apply.
+
+For a write refusal outside your own scope, `agent(action="claim", ...)` can
+add permitted paths to your claim. It cannot take a live peer's claim. Wait for
+that peer, choose disjoint bounded writes, or use a separate worktree for code
+that needs writes. `action="release"` only clears claims whose owners are no
+longer live; it is not a way to unlock another running worker's files.
 
 ## Delegation briefs
 
@@ -283,7 +364,7 @@ OUTPUT: VERDICT, EVIDENCE, GAPS, NEXT.
 - **`advisor`** — when the operator wants a high-leverage second opinion
   before cheaper execution continues. Consultants read enough to ground a
   recommendation, but cannot write or run shell commands. `oracle` and
-  `advisor` remain accepted only when loading older requests or persisted
+  `consultant` remain accepted only when loading older requests or persisted
   records; new prompts, receipts, and UI use `advisor`.
 - **`custom`** — only when the parent needs to constrain the tool
   set explicitly. Pass the allowlist via the `allowed_tools` field
@@ -383,20 +464,23 @@ max_admitted = 12
 Use `/config subagents status` to see both the global values and the active
 provider's resolved fanout, depth, and timeout profile.
 
-## Advertised agent-tool fields (v0.9.9)
+## Advertised agent-tool fields
 
-The model-facing `agent` tool schema includes lifecycle, scope and per-task
-routing controls (#5915, #5955):
+The model-facing `agent` schema exposes these controls:
 
-`action`, `prompt`, `type`, `profile`, `name`, `agent_id`, `message`,
-`until`, `detached`, `worktree`, `write_roots`, `resume_from`, `model`,
-`model_strength`, `thinking`
+| Purpose | Fields |
+| --- | --- |
+| Launch and route | `action`, `prompt`, `type`, `profile`, `name`, `model`, `model_strength`, `thinking` |
+| Scope and outputs | `worktree`, `write_authority`, `write_roots`, `exact_files`, `coordination_contracts`, `deliverables`, `expected_artifact` |
+| Narrow run limits | `token_budget`, `max_steps`, `wall_time_secs` |
+| Coordinate and recover | `agent_id`, `agent_ids`, `all_parked`, `message`, `until`, `detached`, `resume_from` |
+| Inspect | `detail`, `offset`, `limit` |
 
-plus the action-discriminated `dependentSchemas` tree (`start` requires
-`prompt`; `message`/`followup` require a target and `message`; `peek`/
-`interrupt`/`cancel` require a target). The schema change is part of the
-pinned prompt prefix, so upgrading re-fills the provider KV prefix once per
-session (docs/CACHE.md; accepted at the v0.9.9 boundary).
+`start` requires `prompt`. `message` requires a target and message;
+`followup` requires a message and exactly one target form: `agent_id`/`name`,
+`agent_ids`, or `all_parked: true`. `peek`, `interrupt`, and `cancel` require a
+target. `claim` requires scope entries. These action requirements are validated
+before execution.
 
 `agent(action="roster")` reports each built-in role's resolved provider, model,
 reasoning effort, known route limits and capability provenance. It uses the
@@ -427,67 +511,101 @@ price of a future task. Missing or routing-dependent prices remain unknown;
 subscription/local routes are labelled not money metered. Discovery makes no
 provider request and reports reachability as unverified.
 
-**Parse-accepted but unadvertised (compat).** The following inputs were
-removed from the advertised schema but remain accepted for saved transcripts,
-ACP/MCP clients, fleet execution data, and internal/operator compatibility.
-They are never advertised to the model; Runtime still validates, clamps, and
-intersects them with live policy:
+**Parse-accepted but unadvertised (compat).** Other inputs remain accepted
+for saved transcripts, ACP/MCP clients, fleet execution data, and
+internal/operator compatibility. Runtime validates and intersects them with
+live policy:
 
-- budgets: `max_steps`, `wall_time_secs` (see
-  [Child budgets](#child-budgets-steps-wall-time) for their defaults)
 - delegation compatibility: `max_depth`, `maxDepth`, or `max_spawn_depth`;
-  values are restricted to 0 through the Runtime hard ceiling of 8. New
-  model-authored calls inherit the operator's `[subagents] max_depth` instead.
-- workspace/isolation: `workspace_policy`, `write_authority`, `fork_context`,
+  values are restricted to 0 through the Runtime hard ceiling of 8 and only
+  narrow the inherited absolute ceiling. Model-facing calls inherit depth
+  from the operator and selected profile.
+- workspace/isolation: `workspace_policy`, `fork_context`,
   `cwd`, `worktree_path`, `worktree_branch`, `worktree_base`
-- spawn contract: `deliberate`, `dependencies`, `acceptance`,
-  `expected_artifact`, `exact_files`, `coordination_contracts`
+- spawn contract: `deliberate`, `dependencies`, `acceptance`, `allowed_tools`
 - lifecycle extras: `timeout_secs` (wait), `reason` (interrupt),
-  `include_archived` (status), and `token_budget`
+  `include_archived` (status)
 
-Authority never widens: the #5426/#5435 containment clamps are unchanged —
-`write_authority` moves to roles/profiles, and delegation can only narrow
-inherited authority.
+Compatibility input is not a way to widen inherited authority or remove a
+finite budget.
 
-## Child budgets (steps, wall time)
+## Child budgets (steps, wall time, tokens)
 
-Per-child run budgets are no longer per-call schema fields (#5324). They come
-from, in order:
+`max_steps`, `wall_time_secs`, and `token_budget` are optional per-call limits.
+Each can only narrow the applicable role, operator, parent, and saved-run
+limits. Omission inherits those limits; explicit zero, null, negative, or
+out-of-range values are rejected by the tool parser.
 
-1. an explicit parse-accepted `max_steps` / `wall_time_secs` on the call
-   (replay compat),
-2. the operator defaults `[subagents] default_max_steps` and
-   `[subagents] default_wall_time_secs`,
-3. fleet role defaults: **unbounded model turns** for every role
-   (`WorkerRuntimeProfile::default_max_steps` returns zero), plus a **1800 s**
-   wall-clock default.
+`max_steps` counts model turns and accepts 1 through 2000. All roles default
+to no model-turn cap unless an operator or ancestor supplies one; the internal
+zero representation for that default never cancels a finite inherited cap.
+`wall_time_secs` accepts 1 through 86400, with an operator-configurable
+1800-second default. It includes admission queue time, model requests, and
+tools. The effective absolute deadline is persisted.
 
-Omitted or zero `max_steps` remains unbounded even when an operator default is
-configured; positive step values clamp to the 2000-turn hard ceiling.
-Wall-time values clamp to 1..=86400 s.
+For example, a focused review can request:
 
-## Token budget governor
+```json
+{
+  "action": "start",
+  "type": "reviewer",
+  "prompt": "Review the parser diff and report concrete regressions.",
+  "max_steps": 12,
+  "wall_time_secs": 300,
+  "token_budget": 20000
+}
+```
 
-Set `[subagents].token_budget` to give each root `agent` run an aggregate
-token ceiling shared by that child and all of its descendants. When no budget
-is configured, behavior is unchanged.
+The receipt's `effective_limits` is authoritative; a request for 300 seconds
+cannot extend a parent's earlier deadline. A continuation keeps the source's
+remaining steps, original deadline, and token history. A new ID, role, or
+`resume_from` fork cannot reset those bounds.
 
-`token_budget` is **not** a field on the model-facing `agent` schema, and its
-absence is deliberate — `crates/tui/src/tools/subagent/tests.rs:4260-4263`
-asserts it, on the grounds that "ad-hoc children should inherit the generous
-runtime budget; exposing an optional cap invites accidental micromanagement."
-The parser still accepts the key (plus the `tokenBudget`/`max_tokens` aliases,
-`mod.rs:10620`) so Workflow-shaped callers that construct the call themselves
-can scope a budget, but the model is never told the field exists. Configure it
-through `[subagents].token_budget` instead. Since v0.9.9 it is one entry in
-the wider parse-accepted-but-unadvertised compat list above.
+### Token accounting and partial results
 
-Provider-reported input and output tokens are folded into the worker record as
-each child model call completes. The persisted `usage` object shows the
-worker's own totals plus aggregate `budget_spent_tokens` and
-`budget_remaining_tokens` for the shared scope. Once the shared scope is
-exhausted, further descendant spawns are rejected with an actionable message
-instead of opening more agents into a spent pool.
+`[subagents].token_budget` sets an aggregate allowance for a root child and
+its descendants. An explicit child `token_budget` may add a smaller scope;
+usage still counts toward every applicable ancestor scope. Continuations and
+transcript forks retain their source accounting as well as the current
+parent's scope. Shared descendants are counted once per scope.
+
+The governor uses provider-reported input plus output tokens, not a local
+estimate presented as a bill. Request output is capped to the remaining
+allowance. Unknown prompt usage and requests already in flight can overshoot;
+receipts retain the full reported usage. Missing usage remains unknown.
+Worker records distinguish the worker's own token totals from shared
+`budget_spent_tokens` and `budget_remaining_tokens`; do not sum a shared
+pool once for every descendant.
+
+The worker reserves room for one final report inside these limits: up to 10%
+of a token allowance (at most 8192 tokens, only when at least 1024 can be
+reserved), one turn when the step cap permits at least two, and up to 10% of
+wall time (at most 10 seconds). Ordinary task execution stops before using
+that reserve. Shared scopes hold back one token reserve for the scope;
+reporting workers atomically claim remaining headroom so siblings cannot
+independently reuse it. Continuation never refunds measured usage or resets
+the original deadline.
+
+The final reporting turn uses the worker's existing resolved provider and
+model, with tools disabled and at most 1024 output tokens. It consolidates
+bounded assistant notes and tool results into findings, evidence, produced
+files, unfinished work and next steps. Estimated input cost counts against
+its allowance. Provider transport retries remain inside the one logical
+turn and its original wall-time deadline; no worker summary retry loop is
+added. Token estimates are not billing receipts: unknown provider input and
+requests already in flight can still overshoot, and actual usage is recorded.
+
+The outcome stays `BudgetExhausted`, even when a useful report is obtained,
+with the specific cause, checkpoint, measured usage and normal deliverable
+verdicts. If the allowance is too small or already spent, earlier bounded
+usage is unknown, the provider fails, or time expires, the worker returns
+recorded partial text and says why a model report was unavailable.
+Known missing response usage and attempts interrupted by timeout or cancellation
+stay recorded across continuations and shared siblings; later known usage remains a
+subtotal and cannot restore reporting headroom in that bounded scope.
+Cancellation wins over reporting. Missing usage stays unknown. Exhausted
+scopes reject further spawns or continuations; a partial report is not
+successful completion.
 
 ## Per-role models (#3018)
 
@@ -644,13 +762,30 @@ its own request timeout can fire.
 Each opened session produces a record that progresses through:
 
 ```
-Pending → Running → (Completed | Failed(reason) | Cancelled | Interrupted(reason))
+Pending → Running → (Completed | Failed(reason) | Cancelled | Interrupted(reason) | BudgetExhausted)
 ```
 
-`Interrupted` fires when the manager detects a `Running` agent whose task
-handle is gone — typically after a process restart that loaded the workspace's
-persisted state from `.codewhale/state/subagents.v1.json`. The parent can open a
-replacement session with the same assignment or treat it as a terminal state.
+An explicit interrupt, exhausted provider retries, or recovery of an orphaned
+running record can leave an `Interrupted` worker with a checkpoint. Inspect
+`needs_continuation` and the recorded reason; use `followup` for continuable
+work. `BudgetExhausted` includes the specific token, step, or wall-time cause;
+continuation cannot replenish an exhausted allowance.
+
+`wait` observes workers. A timeout returns current outcomes and never parks,
+cancels, or resumes them. `until: "completion"` returns when one child settles;
+`until: "all"` joins the workers running when that call starts;
+`until: "activity"` can return on progress. A later spawn is not silently added to an
+earlier join.
+
+An ordinary parent response leaves healthy children running. The same Engine
+turn loop consumes their completion notices and can continue the parent.
+Headless `codewhale exec` defers a successful final receipt until its existing
+Engine reports no live children and no queued child completions. Its original
+wall-clock deadline still bounds that settlement, including autonomous parent
+turns. Cancellation, deadline exhaustion, a fatal event, or a lost Engine
+channel stops settlement and returns the appropriate interrupted or failed
+receipt with recorded partial usage. It does not report successful child
+completion merely because the parent's first response ended.
 
 ### Session boundaries (#405)
 
@@ -678,22 +813,89 @@ ledger: it stores `run_id`, objective, role/model,
 workspace/branch, lifecycle events, artifact refs, follow-up target, takeover
 target, usage provenance, and verification provenance.
 
-`agent` returns a session projection with these fields at the top level and
-inside `worker_record`. The normal parent contract is not polling: keep working
-and consume the completion event when the child finishes. If audit detail is
-needed, inspect the returned `transcript_handle` with `handle_read`.
+The normal parent flow is to keep working and consume the completion event.
+Default start and status receipts are compact; full snapshots and worker
+records are diagnostic detail, not repeated in every response.
 
-Legacy follow-up delivery is retained only for old transcripts and internal
-recovery. If a message was delivered, the worker record stores a bounded preview
-and timestamp. New model-facing flows should open a replacement `agent` when a
-child's assignment no longer fits.
+### Continue an existing worker
 
-Artifacts are symbolic refs. Use `handle_read` on the returned
-`transcript_handle` for transcript details, and treat `result_summary` as a
-child self-report unless `verification.status` points to a separate gate or
-receipt. `usage.status` is `unknown` until provider usage is reported; then it
-switches to `reported`, or `budget_exhausted` when a configured shared token
-budget has no remaining tokens.
+`message` queues a note without waking the child. `followup` wakes a running
+child or resumes a continuable checkpoint:
+
+```json
+{"action":"followup","agent_id":"child-previous-id","message":"Continue the assignment using the recorded evidence."}
+```
+
+Use the returned `agent_id` for subsequent waits and messages. The receipt's
+`from` and `to` identify the original target and its current continuation.
+The original receipt is retained. Retrying through an old ID follows the
+persisted continuation chain and does not create a duplicate worker. If the
+current successor is running, the follow-up is delivered there; if it has
+already settled and cannot continue, the response says no message was
+delivered. Duplicate workers are prevented, but repeated messages to a running
+worker are still repeated messages.
+
+For a batch, choose exactly one target form:
+
+```json
+{"action":"followup","agent_ids":["child-a","child-b"],"message":"Continue the remaining checks."}
+```
+
+```json
+{"action":"followup","all_parked":true,"message":"Continue the parked assignments."}
+```
+
+Explicit batches accept up to 32 distinct IDs. `all_parked` selects parked
+children you control and refuses more than 32 so you can choose explicit
+batches. Bulk responses return separate `results` and `errors`; a failing
+target does not roll back a successful continuation. Parent/descendant control
+checks apply to both the addressed record and its current successor.
+
+Use `start` with `resume_from` only to create a separate worker from a settled
+child's transcript, for example to assign a new review. Each such start is a
+new worker. Missing, running, or cross-workspace sources are refused; the
+source's authority and budget bounds still apply. This is distinct from
+continuing parked work with `followup`.
+
+### Compact status and full transcript retrieval
+
+Unscoped `agent(action="status")` returns a session-scoped page bounded to
+8 KiB. `offset` and `limit` page the roster; the default and maximum limit is
+20. Follow `next_offset`, since the byte bound can return fewer rows than
+requested. The model-facing roster wire uses one stable `columns` header and
+an array of values per entry in `agents`; pair each row with the header instead
+of reading it as an object. `null` means absent or unreported, and a measured
+zero stays numeric `0`. The header is present even on an empty page.
+Rows include worker and parent IDs, current depth, state,
+elapsed time, own token total, recent activity, pending input, and continuation
+lineage (`resumed_from` / `resumed_as`). Verification includes the verdict,
+nonempty deliverable counts and a short warning when needed. Names, steps,
+routes, effective limits (including maximum depth), and token breakdowns remain
+available in the unchanged object projection when addressing one `agent_id`.
+Aggregate usage counts each worker's own reported tokens once and reports its
+coverage. Completion receipts additionally report measured descendant usage,
+deduplicate continuation lineage, and distinguish unknown usage from zero. A worker's
+`has_unreported_usage` and the descendant/subtree `unreported_usage_workers`
+counts identify missing responses even when later responses provide a measured subtotal.
+
+Request one worker's detail when investigating a failure:
+
+```json
+{"action":"status","agent_id":"child-a","detail":true,"offset":0,"limit":20}
+```
+
+Addressed `peek` also accepts `detail: true`. Detail remains bounded to 32 KiB;
+message/event archives and deliverable verdicts are paged, and omission fields
+identify truncated detail. Use the returned typed `transcript_handle` with
+`handle_read` for the complete retained transcript. The handle's lookup
+coordinates are preserved even when diagnostic prose is omitted. Unscoped
+`detail: true` does not expand the entire roster into transcripts.
+
+Artifacts are symbolic refs. Treat `result_summary` as a child self-report and
+inspect the specific `verification.status` and its evidence before relying on
+it. `usage.status` remains `unknown` until provider usage is reported, then
+becomes `reported` or `budget_exhausted` for a spent token scope. Neither a
+file's `present` verdict nor a completed lifecycle state proves a test gate.
 
 ## Output contract
 
@@ -707,8 +909,14 @@ Non-scout sub-agents end with five Markdown headings, in this order:
 ### BLOCKERS   what stopped you; "None." if you finished cleanly
 ```
 
-They are `### HEADING` lines, not `HEADING:` labels, and `EVIDENCE` comes
-before `CHANGES`. That five-heading contract is `SUBAGENT_OUTPUT_FORMAT` in
+Use `### HEADING` lines, with `EVIDENCE` before `CHANGES`. List edited
+repo-relative file paths under `### CHANGES`; blank lines before the bullets
+are allowed. Begin each bullet with its file path, followed by a description;
+quote paths containing spaces or literal trailing punctuation. The verifier
+also accepts older explicit `CHANGES:`,
+`Changed files:`, and `Files changed:` declarations. Evidence citations and
+paths under `RISKS` are not declarations of edits. The five-heading prompt
+contract is `SUBAGENT_OUTPUT_FORMAT` in
 `crates/tui/src/prompts/text.rs`. `prompt_documents_structured_subagent_briefs`
 in `crates/tui/src/prompts.rs` asserts every heading against it.
 
@@ -744,11 +952,12 @@ removed in v0.9.4 (remember.rs:165); see `docs/MEMORY.md` for the full layout.
 - Persisted state: `<workspace>/.codewhale/state/subagents.v1.json`. Schema
   version `1` (forward-compatible — new optional fields use
   `#[serde(default)]`).
-- Worker records are pruned by time: completed / failed / cancelled /
-  interrupted records are evicted after the same retention window used for
-  finished agents (default 1h, `COMPLETED_AGENT_RETENTION`). Running /
-  starting / waiting records are preserved. The hard cap of 256 records
-  remains as a safety bound (#4217).
+- Settled records normally expire after `COMPLETED_AGENT_RETENTION`
+  (default 1h), with a normal retained-record target of 256. Running /
+  starting / waiting workers and the continuation identities and budget
+  lineage needed by live work are preserved. Cleanup cannot discard an old
+  ID while its continuation is still active or erase usage history needed
+  to enforce an active scope.
 - `SubAgentRuntime::background_runtime()` starts from `child_runtime()` but
   replaces the turn-scoped child token with a fresh cancellation token, so
   parent turn cancellation does not stop detached background sessions.
@@ -758,3 +967,39 @@ removed in v0.9.4 (remember.rs:165); see `docs/MEMORY.md` for the full layout.
 - `SharedSubAgentManager` is `Arc<RwLock<...>>` — read paths use
   read locks so `/agents` and the workbar projection don't block
   the main loop during multi-agent fan-out (#510).
+
+Personal profiles use the same format at
+`$CODEWHALE_HOME/agents/<id>.toml` (normally `~/.codewhale/agents/`). For example:
+
+```toml
+# ~/.codewhale/agents/reasoner.toml
+base_role = "explore"
+provider = "openrouter"
+model = "qwen/qwen3.7-plus"
+reasoning_effort = "high"
+
+[permissions]
+allow_shell = false
+trust = false
+```
+
+Select it with `agent(action: "start", profile: "reasoner", prompt: "...")`.
+The provider must also be configured in `config.toml`. The receipt names the
+resolved profile, its personal/project origin, provider/model and effective
+reasoning effort. Effort is normalized to the selected model's supported tiers;
+an explicit `thinking` request overrides the saved preference.
+
+`allow_shell` and `trust` belong under `[permissions]`, not at the top level.
+A profile cannot grant `allow_shell = true`, `trust = true`, or disable approval.
+Use the appropriate `base_role` for the task; the parent session's live policy
+remains the authority ceiling. These profile fields are not a way to grant
+additional access.
+
+A malformed, unreadable or duplicate profile now causes an explicit selection
+error, including when its name matches a built-in role. It never silently
+substitutes a lower roster layer. Repair the file and retry; profiles are reloaded
+for each launch. `agent(action: "roster")` reports affected profile identities and
+paths in `profile_load_issues` without exposing parser excerpts. Other valid
+profiles remain available, and a valid project override still wins over a broken
+personal definition. Fleet run creation performs the same check before storing
+a run or launching workers.

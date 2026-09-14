@@ -60,7 +60,7 @@ pub(super) fn apply_engine_session_projection(
         surface_goal_persistence_failure(app, &error);
     }
     app.context_token_cache.borrow_mut().clear();
-    app.api_messages = messages;
+    app.set_api_messages(messages);
     app.system_prompt = system_prompt;
     if app.auto_model {
         app.last_effective_model = Some(model);
@@ -414,23 +414,6 @@ pub(super) fn handle_plain_key_before_composer(
     crate::tui::paste::handle_paste_burst_key(app, key, now)
 }
 
-/// Handle transcript actions after the paste-burst ambiguity window has
-/// resolved a typed character. The real transcript selection is required;
-/// `detail_target_cell_index` alone falls back to the latest cell and would
-/// arm these shortcuts while the composer is simply being typed into.
-fn handle_focused_transcript_action_char(app: &mut App, ch: char) -> bool {
-    if !app.input.is_empty() || !app.viewport.transcript_selection.is_active() {
-        return false;
-    }
-    match ch {
-        'y' => copy_focused_cell(app),
-        'Y' => copy_focused_cell_metadata(app),
-        'r' => detail_target_cell_index(app)
-            .is_some_and(|index| open_details_pager_for_cell(app, index)),
-        _ => false,
-    }
-}
-
 /// Flush a raw-paste ambiguity window without losing a leading Space.
 ///
 /// `FlushResult::Paste` is always composer payload. A lone typed Space is a
@@ -446,11 +429,6 @@ pub(super) fn flush_paste_burst_before_composer(app: &mut App, now: Instant) -> 
     match app.take_paste_burst_flush_if_enabled(now) {
         crate::tui::paste_burst::FlushResult::Paste(text) => {
             app.insert_str(&text);
-            true
-        }
-        crate::tui::paste_burst::FlushResult::Typed(ch)
-            if handle_focused_transcript_action_char(app, ch) =>
-        {
             true
         }
         crate::tui::paste_burst::FlushResult::Typed(' ')
@@ -472,15 +450,6 @@ pub(super) fn flush_paste_burst_before_composer(app: &mut App, now: Instant) -> 
 /// Every seam below calls this instead of re-deriving focus from
 /// `view_stack`, `launch.visible`, or — the bug this replaces — whether the
 /// composer happens to hold text.
-pub(crate) fn tasks_panel_owns_bare_yank(app: &App) -> bool {
-    app.view_stack.is_empty()
-        && app.work_surface.panel == crate::tui::work_surface::RailPanel::Tasks
-        && app.work_surface.last_area.is_some()
-        && app.work_surface.focused
-        && app.input.is_empty()
-        && !app.runtime_turn_id.as_deref().unwrap_or("").is_empty()
-}
-
 pub(crate) fn shell_binding_for_key(app: &App, key: &KeyEvent) -> Option<ShellBindingId> {
     crate::tui::shell_key_routing::route(app.focus(), key)
 }
@@ -658,48 +627,10 @@ pub async fn run_tui(
     require_interactive_terminal(io::stdin().is_terminal(), io::stdout().is_terminal())?;
     require_foreground_terminal_owner()?;
 
-    // Terminal probe with timeout to prevent hanging on unresponsive terminals.
-    //
-    // The blocking task cannot be cancelled once the timeout fires, so a slow
-    // `enable_raw_mode` may still succeed *after* we've bailed out, leaking
-    // raw mode. Both sides run `raw_mode_probe_handshake`; whichever observes
-    // the other's flag disables raw mode again.
-    let probe_timeout = terminal_probe_timeout(config);
-    let probe_abandoned = Arc::new(AtomicBool::new(false));
-    let probe_enabled = Arc::new(AtomicBool::new(false));
-    let task_abandoned = Arc::clone(&probe_abandoned);
-    let task_enabled = Arc::clone(&probe_enabled);
-    let enable_raw = tokio::task::spawn_blocking(move || {
-        let result =
-            enable_raw_mode().map_err(|e| anyhow::anyhow!("Failed to enable raw mode: {e}"));
-        if result.is_ok() && raw_mode_probe_handshake(&task_enabled, &task_abandoned) {
-            // The probe timed out while we were blocked; the caller already
-            // gave up, so undo the late enable instead of leaking raw mode.
-            let _ = disable_raw_mode();
-        }
-        result
-    });
-
-    match tokio::time::timeout(probe_timeout, enable_raw).await {
-        Ok(inner_result) => {
-            inner_result??; // propagate both join and raw-mode errors
-        }
-        Err(_) => {
-            if raw_mode_probe_handshake(&probe_abandoned, &probe_enabled) {
-                // The blocking task finished enabling raw mode right as the
-                // timeout fired and may have missed the abandoned flag.
-                let _ = disable_raw_mode();
-            }
-            tracing::warn!(
-                "Terminal probe timed out after {}ms - terminal may be unresponsive",
-                probe_timeout.as_millis()
-            );
-            return Err(anyhow::anyhow!(
-                "Terminal probe timed out after {}ms",
-                probe_timeout.as_millis()
-            ));
-        }
-    }
+    // This sets local terminal attributes; it is not a terminal-response probe.
+    // Do it on the owning thread, as on resume, so blocking-pool scheduling
+    // cannot abort startup or leave a detached worker enabling raw mode later.
+    enable_raw_mode().context("Failed to enable raw mode")?;
 
     #[cfg(target_os = "windows")]
     enable_windows_ime_console_mode();
@@ -775,8 +706,7 @@ pub async fn run_tui(
     // on stdin, so it is asked before the input pump exists.
     let kitty_graphics = crate::tui::mark::probe_kitty_graphics();
     // Same window again: the sixel probe is a primary-DA query whose reply
-    // also arrives on stdin. Asked only after kitty — a kitty "yes" means
-    // the launch header never needs the sixel tier.
+    // also arrives on stdin. Keep both capability receipts before input starts.
     let sixel_graphics = crate::tui::mark::probe_sixel_graphics();
     let palette_mode = background.mode();
     tracing::debug!(
@@ -803,30 +733,6 @@ pub async fn run_tui(
     let sync_output_at_init = !crate::settings::detected_ptyxis_terminal()
         && !crate::settings::detected_legacy_windows_console_host();
     reset_terminal_viewport(&mut terminal, sync_output_at_init)?;
-    // The launch mark's image tier: transmit the PNG once; the launch header
-    // then places it through ordinary placeholder cells (`tui::mark`).
-    let cell_height_px = ratatui::backend::Backend::window_size(terminal.backend_mut())
-        .ok()
-        .filter(|size| size.columns_rows.height > 0 && size.pixels.height > 0)
-        .map(|size| size.pixels.height / size.columns_rows.height);
-    crate::tui::mark::transmit_kitty_mark(terminal.backend_mut(), cell_height_px);
-    // Sixel needs both cell dimensions (its pixels are sized to the mark
-    // block exactly). Measured once: cell geometry survives resizes.
-    let sixel_cell_px = ratatui::backend::Backend::window_size(terminal.backend_mut())
-        .ok()
-        .filter(|size| {
-            size.columns_rows.width > 0
-                && size.columns_rows.height > 0
-                && size.pixels.width > 0
-                && size.pixels.height > 0
-        })
-        .map(|size| {
-            (
-                size.pixels.width / size.columns_rows.width,
-                size.pixels.height / size.columns_rows.height,
-            )
-        })
-        .filter(|(cell_w, cell_h)| *cell_w > 0 && *cell_h > 0);
     let event_broker = EventBroker::new();
 
     // Local mutable copy so runtime config flips (e.g. `/provider` switch)
@@ -834,11 +740,6 @@ pub async fn run_tui(
     let mut config = config.clone();
     let config = &mut config;
     let mut app = App::new_with_plugin_registry(options.clone(), config, plugin_registry);
-    // Without a measured cell the sixel tier cannot size its raster, so an
-    // unmeasured terminal keeps the braille tier by construction. The
-    // probed background grounds transparent theme stages the same way.
-    app.launch.sixel_cell_px = sixel_cell_px;
-    app.launch.sixel_terminal_bg = background.color();
     let _cursor_accent_guard = crate::tui::cursor_accent::CursorAccentGuard::install(
         app.low_motion || !app.fancy_animations,
         app.ui_theme.accent_primary,
@@ -944,6 +845,21 @@ pub async fn run_tui(
             .and_then(|metadata| metadata.runtime_store.as_ref()),
     )
     .await?;
+    if let Some(saved) = app
+        .current_session_metadata
+        .as_ref()
+        .and_then(|meta| meta.runtime_store.as_ref())
+        && task_manager
+            .session_store_binding()
+            .as_ref()
+            .is_some_and(|current| current != saved)
+    {
+        app.push_status_toast(
+            app.tr(MessageId::RuntimeStoreRecovered).into_owned(),
+            StatusToastLevel::Warning,
+            None,
+        );
+    }
     let _task_shutdown = task_manager.shutdown_guard();
     let mut automation_service = AutomationManager::default_location()?;
     automation_service.bind_task_manager(&task_manager)?;
@@ -1210,12 +1126,6 @@ pub async fn run_tui(
 
     cleanup_guard.defused = true;
     crate::tui::cursor_accent::restore_cursor_accent();
-    crate::tui::mark::delete_kitty_mark(terminal.backend_mut());
-    // Sixel has no image registry: leaving the alternate screen drops the
-    // pixels anyway, but a stranded block (tier exited on the last frame)
-    // is still wiped first so nothing lingers into the teardown draws.
-    app.launch.sixel_mark_area = None;
-    crate::tui::ui::frame::reconcile_launch_sixel(terminal.backend_mut(), &mut app);
     pop_keyboard_enhancement_flags(terminal.backend_mut());
     disable_alternate_scroll_mode(terminal.backend_mut());
     execute!(terminal.backend_mut(), DisableFocusChange)?;
@@ -1547,6 +1457,14 @@ pub(crate) async fn run_event_loop(
     // without replacing the user's configured footer/status-line chips.
     let mut version_check: Option<tokio::task::JoinHandle<Option<UpdateNotice>>> =
         spawn_startup_version_check(config.update_config());
+    // First-run / missing-key: if a live local Ollama catalog answers, adopt a
+    // real /api/tags model into chrome instead of leaving the DeepSeek costume.
+    let mut local_ollama_probe: Option<
+        tokio::task::JoinHandle<Option<crate::local_ollama::LiveLocalOllamaCatalog>>,
+    > = crate::local_ollama::spawn_local_ollama_adoption_probe(
+        config,
+        crate::local_ollama::should_adopt_live_local_ollama(app),
+    );
 
     // Startup version-change hint: once per version, never on first run.
     // `record_launch` owns the semantics (strict semver forward move, corrupt
@@ -1662,6 +1580,18 @@ pub(crate) async fn run_event_loop(
             app.add_message(HistoryCell::System {
                 content: notice.notice_block(install),
             });
+        }
+
+        // Adopt a live local Ollama tag into first-run / missing-key chrome.
+        let mut local_done = false;
+        if let Some(ref handle) = local_ollama_probe {
+            local_done = handle.is_finished();
+        }
+        if local_done
+            && let Ok(Some(catalog)) = local_ollama_probe.take().unwrap().await
+            && crate::local_ollama::should_adopt_live_local_ollama(app)
+        {
+            adopt_live_local_ollama_catalog(app, &mut engine_handle, config, catalog).await;
         }
 
         // Non-blocking startup-default writes (mode / thinking) report their
@@ -1945,6 +1875,42 @@ pub(crate) async fn run_event_loop(
                         app.remote_control
                             .upload_resync_snapshot(&resync_run, &app.api_messages);
                     }
+                }
+                let pet_event_applies = match &event {
+                    EngineEvent::AgentSpawned {
+                        owner_session_id, ..
+                    }
+                    | EngineEvent::AgentProgress {
+                        owner_session_id, ..
+                    }
+                    | EngineEvent::AgentComplete {
+                        owner_session_id, ..
+                    } => event_owner_is_active(app.current_session_id.as_deref(), owner_session_id),
+                    EngineEvent::UserInputRequired { .. } => {
+                        !should_suppress_user_input_prompt(app)
+                    }
+                    EngineEvent::ApprovalRequired {
+                        tool_name,
+                        approval_grouping_key,
+                        approval_key,
+                        approval_force_prompt,
+                        ..
+                    } => {
+                        matches!(
+                            resolve_ui_approval_disposition(
+                                app,
+                                tool_name,
+                                approval_grouping_key,
+                                approval_key,
+                                *approval_force_prompt
+                            ),
+                            crate::core::authority::ApprovalRequestDisposition::Prompt
+                        )
+                    }
+                    _ => true,
+                };
+                if pet_event_applies {
+                    crate::tui::pet_watch::observe(app, &event, Instant::now());
                 }
                 record_turn_activity(app, &event, Instant::now());
                 match event {
@@ -2242,7 +2208,7 @@ pub(crate) async fn run_event_loop(
                                 ),
                                 Err(err) => sanitize_stream_chunk(&format!("Error: {err}")),
                             };
-                            app.api_messages.push(Message {
+                            app.push_api_message(Message {
                                 role: Role::User,
                                 content: vec![ContentBlock::ToolResult {
                                     tool_use_id: id.clone(),
@@ -4137,6 +4103,13 @@ pub(crate) async fn run_event_loop(
             app.mark_history_updated();
         }
         if received_engine_event {
+            // ListSubAgents can wait behind the parent's active turn. The
+            // open register must also reflect the already-received, session-
+            // scoped lifecycle events, using the same projection as opening it.
+            if app.view_stack.contains_kind(ModalKind::SubAgents) {
+                let agents = subagent_view_agents(app, &app.subagent_cache);
+                app.view_stack.update_subagents(&agents);
+            }
             app.needs_redraw = true;
         }
         if subagent_list_refresh_requested {
@@ -4219,6 +4192,7 @@ pub(crate) async fn run_event_loop(
         }
         maybe_throttled_recovery_snapshot(app, Instant::now(), &mut last_recovery_snapshot_at);
         let history_has_live_motion = history_has_live_motion(&app.history);
+        crate::tui::pet_watch::tick(app, Instant::now());
         let active_cell_has_live_motion = active_cell_has_live_motion(app);
         let translation_placeholder_has_live_motion = app.translation_enabled
             && (pending_thinking_translations > 0 || app.streaming_thinking_active_entry.is_some());
@@ -4552,15 +4526,7 @@ pub(crate) async fn run_event_loop(
                 );
                 match terminal_input.restart_detached() {
                     Ok(()) => {
-                        app.push_status_toast(
-                            if cfg!(target_os = "windows") {
-                                "Recovered terminal input after a stalled Windows console poll."
-                            } else {
-                                "Recovered terminal input after a stalled terminal read."
-                            },
-                            StatusToastLevel::Warning,
-                            None,
-                        );
+                        tracing::info!("terminal input pump recovered");
                     }
                     Err(err) => {
                         tracing::warn!(error = %err, "failed to restart terminal input pump");
@@ -5018,11 +4984,10 @@ pub(crate) async fn run_event_loop(
             // types exactly what it types, and plain typing can never trigger
             // a fleet write by accident.
 
-            // Approval is a decision boundary, not a viewport lock. Keep the
-            // card focused for its ordinary selection keys while letting the
-            // same transcript navigation used by the main shell review the
-            // evidence above it (#4371).
-            if handle_approval_transcript_key(app, &key) {
+            // Decision prompts keep their ordinary option/typing keys while
+            // explicit transcript navigation reviews the evidence above them
+            // (#4371, #6045). Bare arrows still belong to the question sheet.
+            if handle_prompt_transcript_key(app, &key) {
                 continue;
             }
 
@@ -5529,35 +5494,6 @@ pub(crate) async fn run_event_loop(
                 continue;
             }
 
-            // y / Y in the rail's Tasks panel: yank the current turn id (y)
-            // or copy full task detail (Y) to the system clipboard.
-            // Only when the work surface owns keyboard focus, so an ambiently
-            // visible Tasks panel cannot swallow the first keystroke of typed
-            // input (an empty composer used to be enough to steal "y").
-            if tasks_panel_owns_bare_yank(app) {
-                if key.code == KeyCode::Char('y') && key.modifiers == KeyModifiers::NONE {
-                    if let Some(turn_id) = app.runtime_turn_id.as_ref()
-                        && app.clipboard.write_text(turn_id).is_ok()
-                    {
-                        app.status_message = Some(format!("Copied turn id {turn_id}"));
-                    }
-                    continue;
-                }
-                if key.code == KeyCode::Char('Y') && key.modifiers == KeyModifiers::NONE {
-                    let mut detail = String::new();
-                    if let Some(turn_id) = app.runtime_turn_id.as_ref() {
-                        let _ = write!(detail, "turn {turn_id}");
-                    }
-                    if let Some(status) = app.runtime_turn_status.as_deref() {
-                        let _ = write!(detail, "  status={status}");
-                    }
-                    if !detail.is_empty() && app.clipboard.write_text(&detail).is_ok() {
-                        app.status_message = Some(format!("Copied {detail}"));
-                    }
-                    continue;
-                }
-            }
-
             // Shifted shortcuts toggle the file-tree pane. Keep plain Ctrl+E
             // reserved for the composer end-of-line binding used by shells.
             if key_shortcuts::is_file_tree_toggle_shortcut(&key) {
@@ -6004,9 +5940,13 @@ pub(crate) async fn run_event_loop(
                             clear_transcript_selection(app);
                         }
                         CtrlCDisposition::CancelTurn => {
-                            if try_cancel_compaction(app, &engine_handle) {
-                                app.disarm_quit();
-                                continue;
+                            let compacting = app.is_compacting || app.manual_compaction_queued;
+                            if compacting {
+                                try_cancel_compaction(app, &engine_handle);
+                                if !compact_interrupt_should_stop_turn(app) {
+                                    app.disarm_quit();
+                                    continue;
+                                }
                             }
                             let was_waiting = app.goal_continuation_waiting;
                             engine_handle.cancel();
@@ -6852,6 +6792,34 @@ pub(crate) async fn run_cache_warmup(app: &App, config: &Config) -> Result<Cache
         base_url,
         inspection,
     })
+}
+
+/// Switch a first-run / missing-key session onto a live local Ollama tag.
+async fn adopt_live_local_ollama_catalog(
+    app: &mut App,
+    engine_handle: &mut EngineHandle,
+    config: &mut Config,
+    catalog: crate::local_ollama::LiveLocalOllamaCatalog,
+) {
+    let Some(tag) = catalog.preferred_tag().map(str::to_string) else {
+        return;
+    };
+    // switch_provider resolves against the lake we just refreshed.
+    let switched = switch_provider(
+        app,
+        engine_handle,
+        config,
+        ApiProvider::Ollama,
+        Some(tag.clone()),
+    )
+    .await;
+    if !switched {
+        return;
+    }
+    app.onboarding_needs_api_key = false;
+    app.onboarding_missing_key_recovery = false;
+    app.status_message = Some(format!("Local Ollama ready · {tag} (from GET /api/tags)"));
+    app.needs_redraw = true;
 }
 
 pub(crate) async fn run_prepared_dispatch(

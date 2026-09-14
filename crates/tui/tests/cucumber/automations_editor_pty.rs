@@ -223,8 +223,146 @@ completion_sound = "off"
         .unwrap();
         send(&mut reopened, key::esc());
         assert_eq!(record(&store).1, edited);
+        send(&mut reopened, "d");
+        wait(&mut reopened, "Confirm");
+        assert_eq!(record(&store).1, edited, "opening review cannot delete");
+        send(&mut reopened, "y");
+        wait(&mut reopened, "y/Enter");
+        send(&mut reopened, key::esc()); // disarm
+        send(&mut reopened, key::esc()); // leave review
+        assert_eq!(
+            record(&store).1,
+            edited,
+            "cancel keeps the exact definition"
+        );
+        send(&mut reopened, "d");
+        wait(&mut reopened, "Confirm");
+        std::fs::write(
+            format!("/tmp/cw-automation-delete-review-{cols}x{rows}.txt"),
+            reopened.frame().text(),
+        )
+        .unwrap();
+        click(&mut reopened, "Confirm");
+        wait(&mut reopened, "y/Enter");
+        click(&mut reopened, "Confirm");
+        wait(&mut reopened, "deleted");
+        assert!(
+            !path.exists(),
+            "confirmed mouse control deletes the reviewed definition"
+        );
         println!(
-            "PASS {cols}x{rows}: create, multiline paste, time/day/model mouse+keyboard, explicit save, cancel unchanged, edit, paused persistence, process restart"
+            "PASS {cols}x{rows}: create, multiline paste, time/day/model mouse+keyboard, explicit save, cancel unchanged, edit, paused persistence, restart, deletion cancel and mouse confirmation"
+        );
+    }
+}
+
+#[test]
+fn plugin_review_control_keeps_trust_pinned_and_separate_from_enable() {
+    for (rows, cols) in [(12, 40), (24, 80), (40, 140)] {
+        let workspace = make_sealed_workspace().unwrap();
+        let state_root = workspace.home().join(".codewhale");
+        std::fs::write(state_root.join(".onboarded"), "").unwrap();
+        let trust = workspace.workspace().join(".deepseek");
+        std::fs::create_dir_all(&trust).unwrap();
+        std::fs::write(trust.join("trusted"), "").unwrap();
+        std::fs::write(
+            state_root.join("config.toml"),
+            r#"
+provider = "first"
+[providers.first]
+kind = "openai-compatible"
+base_url = "http://127.0.0.1:9/v1"
+api_key = "fixture-only"
+model = "private-first"
+[notifications]
+method = "off"
+completion_sound = "off"
+"#,
+        )
+        .unwrap();
+        let bundle = workspace.workspace().join(".codewhale/plugins/fixture");
+        let skill = bundle.join("skills/example/SKILL.md");
+        std::fs::create_dir_all(skill.parent().unwrap()).unwrap();
+        std::fs::write(bundle.join("plugin.toml"), "schema_version = 1\n[plugin]\nname = \"fixture\"\nversion = \"1.0.0\"\ndescription = \"Local review fixture\"\n[skills]\npath = \"skills\"\n").unwrap();
+        std::fs::write(
+            &skill,
+            "---\nname: example\ndescription: local fixture\n---\nKeep receipts.\n",
+        )
+        .unwrap();
+        let state_path = state_root.join("plugins/state.json");
+        let trusted_entries = || -> Vec<serde_json::Value> {
+            let Ok(bytes) = std::fs::read(&state_path) else {
+                return Vec::new();
+            };
+            let state: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            state["plugins"]
+                .as_object()
+                .unwrap()
+                .values()
+                .filter(|entry| entry["trust"].is_object())
+                .cloned()
+                .collect()
+        };
+        let mut tui = open(
+            &workspace,
+            &workspace.home().join("qa-automations"),
+            rows,
+            cols,
+        );
+        send(&mut tui, key::esc());
+        send(&mut tui, "/plugin trust fixture");
+        send(&mut tui, key::enter());
+        wait(&mut tui, "Confirm");
+        assert!(trusted_entries().is_empty());
+        send(&mut tui, "y");
+        send(&mut tui, key::esc());
+        send(&mut tui, key::esc());
+        assert!(
+            trusted_entries().is_empty(),
+            "canceled review cannot grant trust"
+        );
+
+        send(&mut tui, "/plugin trust fixture");
+        send(&mut tui, key::enter());
+        wait(&mut tui, "Confirm");
+        std::fs::write(
+            &skill,
+            "---\nname: example\ndescription: changed fixture\n---\nNew bytes need review.\n",
+        )
+        .unwrap();
+        send(&mut tui, "y");
+        send(&mut tui, key::enter());
+        assert!(
+            trusted_entries().is_empty(),
+            "changed content cannot consume an old review"
+        );
+
+        send(&mut tui, "/plugin reload");
+        send(&mut tui, key::enter());
+        send(&mut tui, "/plugin trust fixture");
+        send(&mut tui, key::enter());
+        wait(&mut tui, "Confirm");
+        std::fs::write(
+            format!("/tmp/cw-plugin-review-{cols}x{rows}.txt"),
+            tui.frame().text(),
+        )
+        .unwrap();
+        click(&mut tui, "Confirm");
+        wait(&mut tui, "y/Enter");
+        click(&mut tui, "Confirm");
+        let deadline = std::time::Instant::now() + WAIT;
+        while trusted_entries().is_empty() && std::time::Instant::now() < deadline {
+            tui.pump();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let entries = trusted_entries();
+        assert_eq!(entries.len(), 1, "{}", tui.diagnostics());
+        assert_eq!(
+            entries[0]["enabled"], false,
+            "trust never enables the plugin"
+        );
+        println!(
+            "PASS {cols}x{rows}: plugin review cancel, changed-content refusal, exact mouse confirmation, trust without enable"
         );
     }
 }

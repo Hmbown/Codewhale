@@ -98,7 +98,7 @@ export const TOOLS = [
   },
   {
     name: "list_windows",
-    description: "List application windows. On macOS, app_ref selects the app; omission selects the frontmost app. Other platforms list all windows and reject app_ref selectors.",
+    description: "List application windows. On macOS, app_ref selects the app; omission follows the app selected by open_application, or the frontmost app before a selection. Other platforms list all windows and reject app_ref selectors.",
     inputSchema: {
       type: "object",
       properties: {
@@ -215,7 +215,7 @@ export const TOOLS = [
     inputSchema: { type: "object", properties: { computer: computerParam }, additionalProperties: false },
   },
   {
-    name: "scroll", description: "Scroll at a target: direction up/down/left/right, amount in lines/notches.",
+    name: "scroll", description: "Scroll up/down/left/right at a target. macOS background mode uses the target's accessibility scrollbar without moving the cursor; amount counts native increments or 5% normalized steps, named in the receipt. Other raw routes use lines/notches. Prefer an observed scroll-area element.",
     inputSchema: { type: "object", required: ["target"], properties: { target: targetSchema, direction: { enum: ["up", "down", "left", "right"] }, amount: { type: "integer", minimum: 1, maximum: 100 }, computer: computerParam }, additionalProperties: false },
   },
   // ---- text & keyboard ----

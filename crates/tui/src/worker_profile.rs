@@ -161,10 +161,21 @@ pub struct WorkerRuntimeProfile {
     /// false` input remains accepted but cannot remove this ceiling.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub denied_tools: Vec<String>,
-    /// Remaining nested-delegation budget. A worker may spawn children while
-    /// `max_spawn_depth > 0`; each level decrements it. Clamped to the workspace
-    /// ceiling.
+    /// Absolute recursion ceiling. Older profiles stored a remaining allowance;
+    /// interpreting that smaller value as absolute fails closed on recovery.
+    /// `spawn_depth` records this worker's position on the same axis.
     pub max_spawn_depth: u32,
+    #[serde(default)]
+    pub spawn_depth: u32,
+    /// Measured input plus output tokens for this worker and its descendants.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_budget: Option<u64>,
+    /// Whole-run wall time, including queued, model and tool work.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wall_time_secs: Option<u64>,
+    /// Persisted wall-clock deadline; continuations cannot restart the clock.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wall_deadline_ms: Option<u64>,
     /// Optional model-turn cap. Zero means unbounded, matching the normal
     /// Codex and GrokBuild agent loop; an operator may still set a cap.
     #[serde(default = "default_general_max_steps")]
@@ -249,6 +260,10 @@ impl WorkerRuntimeProfile {
             reasoning_effort: matches!(role, FleetRole::Consultant).then(|| "high".to_string()),
             denied_tools: Vec::new(),
             max_spawn_depth: codewhale_config::DEFAULT_SPAWN_DEPTH,
+            spawn_depth: 0,
+            token_budget: None,
+            wall_time_secs: None,
+            wall_deadline_ms: None,
             max_steps: Self::default_max_steps(role.clone()),
             background: true,
         }
@@ -295,11 +310,11 @@ impl WorkerRuntimeProfile {
             // Parent inherits the full surface → the child's request stands.
             (ToolScope::Inherit, child) => child.clone(),
         };
-        // The child gets at most one level less budget than the parent, and never
-        // more than it requested, clamped to the hard ceiling.
+        // Depth stays absolute; only the current position increments. Every
+        // authority projection compares the position against this same ceiling.
         let max_spawn_depth = requested
             .max_spawn_depth
-            .min(self.max_spawn_depth.saturating_sub(1))
+            .min(self.max_spawn_depth)
             .min(codewhale_config::MAX_SPAWN_DEPTH_CEILING);
         WorkerRuntimeProfile {
             role: requested.role.clone(),
@@ -314,16 +329,48 @@ impl WorkerRuntimeProfile {
                 .or_else(|| self.reasoning_effort.clone()),
             denied_tools,
             max_spawn_depth,
-            max_steps: requested.max_steps,
+            spawn_depth: self.spawn_depth.saturating_add(1),
+            token_budget: narrow_optional_limit(self.token_budget, requested.token_budget),
+            wall_time_secs: narrow_optional_limit(self.wall_time_secs, requested.wall_time_secs),
+            wall_deadline_ms: narrow_optional_limit(
+                self.wall_deadline_ms,
+                requested.wall_deadline_ms,
+            ),
+            max_steps: narrow_model_steps(self.max_steps, requested.max_steps),
             background: requested.background,
         }
     }
 
-    /// Whether this worker may still spawn a child (budget remaining).
+    /// Remaining generations, projected from the one absolute ceiling.
+    #[must_use]
+    pub fn remaining_spawn_depth(&self) -> u32 {
+        self.max_spawn_depth.saturating_sub(self.spawn_depth)
+    }
+
     #[must_use]
     pub fn can_spawn_child(&self) -> bool {
-        self.max_spawn_depth > 0
+        self.spawn_depth < self.max_spawn_depth
     }
+}
+
+/// Omission inherits; neither a child request nor a replay can widen a cap.
+pub(crate) fn narrow_optional_limit<T: Ord>(
+    inherited: Option<T>,
+    requested: Option<T>,
+) -> Option<T> {
+    match (inherited, requested) {
+        (Some(inherited), Some(requested)) => Some(inherited.min(requested)),
+        (inherited, requested) => inherited.or(requested),
+    }
+}
+
+/// Zero is the operator/internal unbounded sentinel, never a widening request.
+pub(crate) fn narrow_model_steps(inherited: u32, requested: u32) -> u32 {
+    narrow_optional_limit(
+        (inherited > 0).then_some(inherited),
+        (requested > 0).then_some(requested),
+    )
+    .unwrap_or(0)
 }
 
 const fn default_general_max_steps() -> u32 {
@@ -356,6 +403,8 @@ pub struct ChildLaunchManifest {
     pub coordination_contracts: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_artifact: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deliverables: Vec<String>,
     pub token_budget: Option<u64>,
     pub resume_identity: Option<String>,
     #[serde(default)]
@@ -540,22 +589,24 @@ mod tests {
     }
 
     #[test]
-    fn spawn_depth_decrements_and_clamps() {
+    fn absolute_spawn_depth_is_preserved_and_position_increments() {
         let mut parent = WorkerRuntimeProfile::for_role(FleetRole::Worker);
         parent.max_spawn_depth = 2;
         let mut requested = WorkerRuntimeProfile::for_role(FleetRole::Worker);
         requested.max_spawn_depth = 99; // tries to grab more than the parent has
         let child = parent.derive_child(&requested);
         assert_eq!(
-            child.max_spawn_depth, 1,
-            "child budget is at most parent-1, never the requested 99"
+            child.max_spawn_depth, 2,
+            "the absolute ceiling is unchanged, never the requested 99"
         );
+        assert_eq!(child.spawn_depth, 1);
         assert!(child.can_spawn_child());
 
         let mut leaf_parent = WorkerRuntimeProfile::for_role(FleetRole::Worker);
         leaf_parent.max_spawn_depth = 1;
         let grandchild = leaf_parent.derive_child(&requested);
-        assert_eq!(grandchild.max_spawn_depth, 0);
+        assert_eq!(grandchild.max_spawn_depth, 1);
+        assert_eq!(grandchild.spawn_depth, 1);
         assert!(
             !grandchild.can_spawn_child(),
             "budget exhausted at the leaf"

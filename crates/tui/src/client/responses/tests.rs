@@ -1390,7 +1390,7 @@ fn tool_result_image_becomes_native_function_output_content() {
                 content_blocks: Some(vec![serde_json::json!({
                     "type": "image",
                     "mime_type": "image/png",
-                    "data": "QUJD",
+                    "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==",
                 })]),
             }],
         },
@@ -1411,7 +1411,10 @@ fn tool_result_image_becomes_native_function_output_content() {
         })
     );
     assert_eq!(content[1]["type"], "input_image");
-    assert_eq!(content[1]["image_url"], "data:image/png;base64,QUJD");
+    assert_eq!(
+        content[1]["image_url"],
+        "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg=="
+    );
 }
 
 /// A `system`-role history message — the shape a compaction summary, a branch

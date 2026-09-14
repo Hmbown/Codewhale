@@ -933,9 +933,7 @@ pub(crate) async fn apply_model_picker_choice(
                 resolved_model = resolution.candidate.wire_model_id().as_str().to_string();
                 route_base_url = resolution.candidate.endpoint().base_url.clone();
                 if model_changed {
-                    app.set_active_context_window_override(
-                        config.context_window_for_provider_config(app.api_provider),
-                    );
+                    app.set_active_context_window_override(config, app.api_provider);
                     app.set_active_route_resolution(
                         route_base_url.clone(),
                         resolution.candidate.limits(),
@@ -950,16 +948,13 @@ pub(crate) async fn apply_model_picker_choice(
             }
         }
     } else if model_changed {
-        app.set_active_context_window_override(
-            config.context_window_for_provider_config(app.api_provider),
-        );
+        app.set_active_context_window_override(config, app.api_provider);
         app.active_route_limits = app.context_window_override_limits();
         app.active_route_base_url = route_base_url.clone();
-        app.active_context_window_source = if app.active_context_window_override.is_some() {
-            crate::route_runtime::ContextWindowSource::Configured
-        } else {
-            crate::route_runtime::ContextWindowSource::Fallback
-        };
+        app.active_context_window_source = app
+            .configured_context_window_for(&app.model)
+            .map(|resolution| resolution.source)
+            .unwrap_or(crate::route_runtime::ContextWindowSource::Fallback);
     }
 
     let effective_effort = if model_is_auto {
@@ -1188,7 +1183,7 @@ pub(crate) async fn apply_provider_fallback_switch(
     app.model_ids_passthrough = config.model_ids_pass_through();
     app.set_model_selection(new_model.clone());
     app.apply_provider_switch_reasoning_effort(target, &new_base_url, None);
-    app.set_active_context_window_override(config.context_window_for_provider_config(target));
+    app.set_active_context_window_override(config, target);
     app.set_active_route_resolution(
         new_base_url.clone(),
         resolved_route.candidate.limits(),
@@ -1302,7 +1297,9 @@ pub(crate) async fn apply_command_result(
     if reject_inline_inference_while_runtime_chat_owns_run(app, &result) {
         return Ok(false);
     }
-    if let Some(msg) = result.message {
+    if let Some(msg) = result.message
+        && !matches!(result.action, Some(AppAction::OpenCommandReview { .. }))
+    {
         app.add_message(HistoryCell::System { content: msg });
     }
 
@@ -1493,16 +1490,10 @@ pub(crate) async fn apply_command_result(
                 match codewhale_config::load_permissions_snapshot(app.config_path.clone()) {
                     Ok(snapshot) => {
                         let ruleset = snapshot.permissions().ruleset();
-                        config.exec_policy_engine.set_ruleset(ruleset.clone());
-                        if let Err(error) = engine_handle
-                            .send(Op::SetPermissionRuleset { ruleset })
-                            .await
-                        {
-                            app.status_message = Some(
-                                tr(app.ui_locale, MessageId::PermissionsOperationFailed)
-                                    .replace("{error}", &error.to_string()),
-                            );
-                        }
+                        // Config and every running EngineConfig share this
+                        // policy store. Publish once: replaying an older Op
+                        // after a later edit would roll the live policy back.
+                        config.exec_policy_engine.set_ruleset(ruleset);
                     }
                     Err(error) => {
                         app.status_message = Some(
@@ -1601,6 +1592,25 @@ pub(crate) async fn apply_command_result(
             }
             AppAction::OpenTextPager { title, content } => {
                 open_text_pager(app, title, content);
+            }
+            AppAction::OpenCommandReview {
+                title,
+                content,
+                command,
+            } => {
+                let width = app
+                    .viewport
+                    .last_transcript_area
+                    .map_or(80, |area| area.width);
+                app.view_stack
+                    .push(crate::tui::pager::PagerView::command_review(
+                        title,
+                        &content,
+                        width.saturating_sub(2),
+                        command,
+                        app.ui_locale,
+                    ));
+                app.needs_redraw = true;
             }
             AppAction::VoiceCapture => {
                 use commands::voice::VoiceCaptureOutcome;
@@ -2518,9 +2528,7 @@ fn apply_validated_profile_config(
     app.set_provider_identity_record(route.identity.clone());
     app.billing_presentation = crate::route_billing::for_route(config, app.api_provider);
     app.set_model_selection(route.model.clone());
-    app.set_active_context_window_override(
-        config.context_window_for_provider_config(app.api_provider),
-    );
+    app.set_active_context_window_override(config, app.api_provider);
     app.set_active_route_resolution(
         route.candidate.endpoint().base_url.clone(),
         route.candidate.limits(),
@@ -2664,6 +2672,7 @@ pub(crate) fn apply_workspace_runtime_state(app: &mut App, config: &Config, work
     app.project_context_pack_enabled = config.project_context_pack_enabled();
     app.refresh_skill_cache();
     app.workspace_context = None;
+    app.workspace_is_linked_worktree = false;
     if let Ok(mut cell) = app.workspace_context_cell.lock() {
         *cell = None;
     }
@@ -2973,7 +2982,7 @@ pub(crate) fn apply_backtrack(app: &mut App, depth: usize) {
     // rejects. Count only messages that actually yield a User cell, the same
     // predicate `apply_loaded_session` uses.
     if let Some(idx) = backtrack_api_cut_index(&app.api_messages, depth) {
-        app.api_messages.truncate(idx);
+        app.truncate_api_messages(idx);
     }
 
     // Hand the dropped text back to the user so they can edit + resend.
@@ -3539,11 +3548,20 @@ pub(crate) fn apply_loaded_session_with_goal(
     session: &SavedSession,
     goal: Option<&crate::session_manager::SessionGoalState>,
 ) -> Result<(), String> {
+    let mut recovered_binding = None;
     if let Some(binding) = session.metadata.runtime_store.as_ref()
         && let Some(tasks) = app.runtime_services.task_manager.as_ref()
         && tasks.session_store_binding().as_ref() != Some(binding)
     {
-        return Err("This session belongs to another Runtime host. Resume it in a new Codewhale process to reopen its saved store.".into());
+        if binding
+            .is_missing_session_store()
+            .map_err(|error| error.to_string())?
+        {
+            recovered_binding = tasks.session_store_binding();
+        }
+        if recovered_binding.is_none() {
+            return Err("This session belongs to another Runtime host. Resume it in a new Codewhale process to reopen its saved store.".into());
+        }
     }
     if app.session_transition_blocked() {
         return Err(
@@ -3573,6 +3591,18 @@ pub(crate) fn apply_loaded_session_with_goal(
     // workspace fields. A failed session switch must leave the current session
     // wholly intact.
     let queue_transition = prepare_offline_queue_transition(app, &session.metadata.id)?;
+    if let Some(binding) = recovered_binding.as_ref() {
+        // Only the conversation is recovered into this idle host. Its missing
+        // runtime's tasks and approvals are never imported or re-admitted.
+        // Repair its binding before changing live Work state. If Work restore
+        // is contended, the current conversation stays intact and a retry can
+        // use this durably repaired binding to the same host.
+        let mut recovered = session.clone();
+        recovered.metadata.runtime_store = Some(binding.clone());
+        SessionManager::default_location()
+            .and_then(|manager| manager.save_session(&recovered))
+            .map_err(|error| format!("Session recovery could not be saved: {error}"))?;
+    }
     app.restore_work_state(
         &session.metadata.id,
         &session.metadata.workspace,
@@ -3585,7 +3615,10 @@ pub(crate) fn apply_loaded_session_with_goal(
     let _settled_old_cost_scope = crate::cost_status::close_current_scope();
     *config = *restored_route.config;
     app.refresh_notification_settings(config);
-    app.api_messages = crate::runtime_handoff::project_messages_for_restore(&session.messages);
+    app.restore_api_messages(
+        crate::runtime_handoff::project_messages_for_restore(&session.messages),
+        &session.journal_message_stamps(),
+    );
     app.clear_history();
     app.tool_cells.clear();
     app.tool_details_by_cell.clear();
@@ -3758,10 +3791,21 @@ pub(crate) fn apply_loaded_session_with_goal(
         std::time::Duration::from_secs(session.metadata.cumulative_turn_secs);
     app.current_session_id = Some(session.metadata.id.clone());
     app.current_session_metadata = Some(session.metadata.clone());
+    if let Some(binding) = recovered_binding {
+        if let Some(metadata) = app.current_session_metadata.as_mut() {
+            metadata.runtime_store = Some(binding);
+        }
+        app.push_status_toast(
+            app.tr(MessageId::RuntimeStoreRecovered).into_owned(),
+            StatusToastLevel::Warning,
+            None,
+        );
+    }
     app.session_artifacts = session.artifacts.clone();
     app.session_title = Some(session.metadata.title.clone());
     app.window_title = session.window_title.clone();
     app.workspace_context = None;
+    app.workspace_is_linked_worktree = false;
     app.workspace_context_refreshed_at = None;
     if let Some(sp) = session.system_prompt.as_ref() {
         app.system_prompt = Some(SystemPrompt::Text(sp.clone()));

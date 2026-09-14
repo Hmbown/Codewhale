@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use chrono::{DateTime, Duration, Utc};
 use codewhale_config::route::{
     LimitField, LogicalModelRef, OverrideSource, ReadyRouteCandidate, RouteLimits, RouteRequest,
@@ -22,6 +24,9 @@ use codewhale_models::DIRECT_KIMI_K3_MAX_OUTPUT_TOKENS;
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ContextWindowSource {
     Configured,
+    /// `[providers.<id>.model_context_windows]` hit for this exact wire model
+    /// id — outranks the provider-level `Configured` rung (#6108).
+    ConfiguredModel,
     UserDeclared,
     ProviderReported,
     StaticKimiCodeSafeFloor,
@@ -38,7 +43,8 @@ impl ContextWindowSource {
     /// Every rung, in precedence order. The name-suffix hint sits between
     /// catalog data and the conservative fallback: any concrete fact about
     /// the route beats a naming convention.
-    pub(crate) const ALL: [Self; 7] = [
+    pub(crate) const ALL: [Self; 8] = [
+        Self::ConfiguredModel,
         Self::Configured,
         Self::UserDeclared,
         Self::ProviderReported,
@@ -52,6 +58,7 @@ impl ContextWindowSource {
     pub(crate) const fn label(self) -> &'static str {
         match self {
             Self::Configured => "configured",
+            Self::ConfiguredModel => "configured (per-model)",
             Self::UserDeclared => "user declared",
             Self::ProviderReported => "provider-reported",
             Self::StaticKimiCodeSafeFloor => "static Kimi Code safe floor",
@@ -127,7 +134,17 @@ pub(crate) fn resolve_context_window(
     model: &str,
     route_limits: Option<RouteLimits>,
     context_window_override: Option<u32>,
+    model_context_windows: Option<&BTreeMap<String, u32>>,
 ) -> ContextWindowResolution {
+    if let Some(tokens) = model_context_windows
+        .and_then(|table| table.get(model).copied())
+        .filter(|tokens| *tokens > 0)
+    {
+        return ContextWindowResolution {
+            tokens,
+            source: ContextWindowSource::ConfiguredModel,
+        };
+    }
     if let Some(tokens) = context_window_override.filter(|tokens| *tokens > 0) {
         return ContextWindowResolution {
             tokens,
@@ -367,6 +384,7 @@ pub(crate) fn resolve_route_candidate(
     saved_provider_model: Option<&str>,
     base_url_override: Option<String>,
     context_window_override: Option<u32>,
+    model_context_windows: Option<&BTreeMap<String, u32>>,
 ) -> Result<ReadyRouteCandidate, String> {
     resolve_route_candidate_with_context_metadata(
         provider,
@@ -374,6 +392,7 @@ pub(crate) fn resolve_route_candidate(
         saved_provider_model,
         base_url_override,
         context_window_override,
+        model_context_windows,
         None,
     )
     .map(|resolution| resolution.candidate)
@@ -417,6 +436,7 @@ pub(crate) fn resolve_unpinned_model_candidate(
         None,
         Some(base_url.to_string()),
         None,
+        None,
     )
 }
 
@@ -434,6 +454,7 @@ pub(crate) fn resolve_declared_model_candidate(
     model: &str,
     base_url: &str,
     context_window: Option<u32>,
+    model_context_windows: Option<&BTreeMap<String, u32>>,
     models: &[codewhale_config::catalog::configured::ConfiguredModel],
 ) -> Result<RouteCandidateResolution, String> {
     let resolver = RouteResolver::new().with_configured_models(
@@ -448,6 +469,7 @@ pub(crate) fn resolve_declared_model_candidate(
         None,
         Some(base_url.into()),
         context_window,
+        model_context_windows,
         None,
         &resolver,
         false,
@@ -460,6 +482,7 @@ pub(crate) fn resolve_route_candidate_with_context_metadata(
     saved_provider_model: Option<&str>,
     base_url_override: Option<String>,
     context_window_override: Option<u32>,
+    model_context_windows: Option<&BTreeMap<String, u32>>,
     provider_reported_context: Option<ProviderReportedKimiCodeContext>,
 ) -> Result<RouteCandidateResolution, String> {
     resolve_route_candidate_with_catalog_resolver(
@@ -468,6 +491,7 @@ pub(crate) fn resolve_route_candidate_with_context_metadata(
         saved_provider_model,
         base_url_override,
         context_window_override,
+        model_context_windows,
         provider_reported_context,
         &RouteResolver::new(),
         false,
@@ -480,6 +504,7 @@ fn resolve_route_candidate_with_catalog_resolver(
     saved_provider_model: Option<&str>,
     base_url_override: Option<String>,
     context_window_override: Option<u32>,
+    model_context_windows: Option<&BTreeMap<String, u32>>,
     provider_reported_context: Option<ProviderReportedKimiCodeContext>,
     resolver: &RouteResolver,
     endpoint_catalog_authoritative: bool,
@@ -516,6 +541,7 @@ fn resolve_route_candidate_with_catalog_resolver(
         provider,
         &resolved,
         context_window_override,
+        model_context_windows,
         provider_reported_context,
     );
     let candidate = if plan.overrides.is_empty() {
@@ -551,6 +577,7 @@ fn plan_limit_overrides(
     provider: ApiProvider,
     resolved: &ReadyRouteCandidate,
     context_window_override: Option<u32>,
+    model_context_windows: Option<&BTreeMap<String, u32>>,
     provider_reported_context: Option<ProviderReportedKimiCodeContext>,
 ) -> LimitOverridePlan {
     let mut overrides = Vec::new();
@@ -562,7 +589,13 @@ fn plan_limit_overrides(
             .find(|entry| entry.field == field)
             .is_some_and(|entry| entry.source == OverrideSource::UserModelMetadata)
     };
-    let configured = context_window_override.filter(|window| *window > 0);
+    // An exact wire-id hit in `model_context_windows` is a sharper operator
+    // declaration than the provider default, so it wins (#6108).
+    let model_configured = model_context_windows
+        .and_then(|table| table.get(resolved.wire_model_id().as_str()).copied())
+        .filter(|window| *window > 0);
+    let configured =
+        model_configured.or_else(|| context_window_override.filter(|window| *window > 0));
     let mut effective_context = resolved.limits().context_tokens;
     if !declared_field(LimitField::OutputTokens)
         && is_exact_direct_moonshot_k3_route(
@@ -611,16 +644,25 @@ fn plan_limit_overrides(
     }
 
     if let Some(context_window) = configured {
+        let per_model = model_configured.is_some();
         overrides.push(SourcedLimitOverride {
             field: LimitField::ContextTokens,
             value: Some(u64::from(context_window)),
-            source: OverrideSource::UserContextWindow,
+            source: if per_model {
+                OverrideSource::UserModelContextWindow
+            } else {
+                OverrideSource::UserContextWindow
+            },
         });
         return LimitOverridePlan {
             overrides,
             context_window: ContextWindowResolution {
                 tokens: context_window,
-                source: ContextWindowSource::Configured,
+                source: if per_model {
+                    ContextWindowSource::ConfiguredModel
+                } else {
+                    ContextWindowSource::Configured
+                },
             },
         };
     }
@@ -748,7 +790,19 @@ pub(crate) fn resolve_runtime_route_for_identity(
     )?;
     let provider = identity.provider;
     let mut route_config = prepared_route_config(config, &identity, model_selector);
-    let saved_provider_model = configured_model_for_route(&route_config, provider);
+    // The operator's effective default for the active provider is the
+    // route's default too; mirror `provider_default_model` precedence so a
+    // configured choice is not displaced by the provider catalog's default
+    // (deepseek-flash). `auto` stays the resolver's sentinel.
+    let configured_default = (provider == config.api_provider()
+        && config.default_text_model.is_some())
+    .then(|| config.default_model())
+    .filter(|model| {
+        let model = model.trim();
+        !model.is_empty() && !model.eq_ignore_ascii_case("auto")
+    });
+    let saved_provider_model =
+        configured_model_for_route(&route_config, provider).or(configured_default.as_deref());
     // #5034: with no explicit selector and no saved model, a Codex route
     // would fall back to the resolver's static seed offering. Prefer the
     // live Codex roster head so a provider switch lands on the current
@@ -809,6 +863,7 @@ pub(crate) fn resolve_runtime_route_for_identity(
             saved_provider_model.filter(|_| !needs_local_default),
             Some(base_url),
             route_config.context_window_for_provider_config(provider),
+            route_config.model_context_windows_for(provider),
             None,
             &catalog.resolver,
             catalog.endpoint_catalog_authoritative,
@@ -820,6 +875,7 @@ pub(crate) fn resolve_runtime_route_for_identity(
             saved_provider_model,
             Some(base_url),
             route_config.context_window_for_provider_config(provider),
+            route_config.model_context_windows_for(provider),
             None,
         )?
     };
@@ -1006,7 +1062,8 @@ mod tests {
     /// any concrete fact about the route still beats it.
     #[test]
     fn name_suffix_hint_is_its_own_unverified_rung_below_catalog() {
-        let resolved = resolve_context_window(ApiProvider::Custom, "qwen3-32b-256k", None, None);
+        let resolved =
+            resolve_context_window(ApiProvider::Custom, "qwen3-32b-256k", None, None, None);
 
         assert_eq!(resolved.tokens, 256_000);
         assert_eq!(resolved.source, ContextWindowSource::NameSuffixHint);
@@ -1023,7 +1080,8 @@ mod tests {
             context_tokens: Some(131_072),
             ..RouteLimits::default()
         });
-        let catalog = resolve_context_window(ApiProvider::Custom, "qwen3-32b-256k", offering, None);
+        let catalog =
+            resolve_context_window(ApiProvider::Custom, "qwen3-32b-256k", offering, None, None);
         assert_eq!(catalog.tokens, 131_072);
         assert_eq!(catalog.source, ContextWindowSource::Catalog);
         assert!(catalog.source.is_verified());
@@ -1034,6 +1092,7 @@ mod tests {
             "qwen3-32b-256k",
             offering,
             Some(1_048_576),
+            None,
         );
         assert_eq!(configured.source, ContextWindowSource::Configured);
     }
@@ -1042,8 +1101,13 @@ mod tests {
     /// so, rather than borrowing the configured rung's authority for a guess.
     #[test]
     fn unknown_model_resolves_to_the_honest_fallback_rung() {
-        let resolved =
-            resolve_context_window(ApiProvider::Custom, "private-1m-deployment-v9", None, None);
+        let resolved = resolve_context_window(
+            ApiProvider::Custom,
+            "private-1m-deployment-v9",
+            None,
+            None,
+            None,
+        );
 
         assert_eq!(resolved.source, ContextWindowSource::Fallback);
         assert_eq!(resolved.source.label(), "fallback");
@@ -1073,6 +1137,7 @@ mod tests {
                 "private-1m-deployment-v9",
                 limits,
                 Some(1_048_576),
+                None,
             );
             assert_eq!(resolved.tokens, 1_048_576);
             assert_eq!(resolved.source, ContextWindowSource::Configured);
@@ -1082,6 +1147,7 @@ mod tests {
             ApiProvider::Custom,
             "private-1m-deployment-v9",
             offering,
+            None,
             None,
         );
         assert_eq!(catalog.tokens, 131_072);
@@ -1107,7 +1173,8 @@ mod tests {
                     ApiProvider::Custom,
                     "private-1m-deployment-v9",
                     limits,
-                    over
+                    over,
+                    None,
                 )
                 .source,
                 ContextWindowSource::Fallback
@@ -1204,6 +1271,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .expect("Codex route");
 
@@ -1265,9 +1333,15 @@ mod tests {
         assert_eq!(cap.max_output, Some(131_072));
         assert_ne!(Some(cap.context_window), cap.max_output);
 
-        let candidate =
-            resolve_route_candidate(ApiProvider::OpencodeGo, Some("kimi-k3"), None, None, None)
-                .expect("OpenCode Go Kimi K3 route");
+        let candidate = resolve_route_candidate(
+            ApiProvider::OpencodeGo,
+            Some("kimi-k3"),
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("OpenCode Go Kimi K3 route");
         assert_eq!(candidate.wire_model_id().as_str(), "kimi-k3");
         // Prefer catalog/route limits when present; otherwise the capability
         // path above is the source of truth for picker/budget display.
@@ -1287,9 +1361,15 @@ mod tests {
 
     #[test]
     fn direct_moonshot_k3_route_uses_documented_1m_limits_with_provenance() {
-        let candidate =
-            resolve_route_candidate(ApiProvider::Moonshot, Some("kimi-k3"), None, None, None)
-                .expect("Moonshot Kimi K3 route");
+        let candidate = resolve_route_candidate(
+            ApiProvider::Moonshot,
+            Some("kimi-k3"),
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("Moonshot Kimi K3 route");
 
         assert_eq!(candidate.wire_model_id().as_str(), "kimi-k3");
         assert_eq!(candidate.limits().context_tokens, Some(1_048_576));
@@ -1333,6 +1413,7 @@ mod tests {
             None,
             Some(crate::config::DEFAULT_KIMI_CODE_BASE_URL.to_string()),
             None,
+            None,
         )
         .expect("Kimi Code K3 route");
 
@@ -1366,6 +1447,7 @@ mod tests {
             base.clone(),
             None,
             None,
+            None,
         )
         .expect("Kimi Code route");
         assert_eq!(static_floor.context_window.tokens, 262_144);
@@ -1380,6 +1462,7 @@ mod tests {
             None,
             base.clone(),
             Some(1_048_576),
+            None,
             Some(ProviderReportedKimiCodeContext {
                 context_tokens: 1_048_576,
                 observed_at: Utc::now(),
@@ -1397,6 +1480,7 @@ mod tests {
             Some("k3"),
             None,
             base.clone(),
+            None,
             None,
             Some(ProviderReportedKimiCodeContext {
                 context_tokens: 1_048_576,
@@ -1416,6 +1500,7 @@ mod tests {
             None,
             base,
             None,
+            None,
             Some(ProviderReportedKimiCodeContext {
                 context_tokens: 1_048_576,
                 observed_at: Utc::now() - Duration::hours(25),
@@ -1432,6 +1517,7 @@ mod tests {
             Some("k3"),
             None,
             Some(crate::config::DEFAULT_MOONSHOT_BASE_URL.to_string()),
+            None,
             None,
             Some(ProviderReportedKimiCodeContext {
                 context_tokens: 1_048_576,
@@ -1453,6 +1539,7 @@ mod tests {
             None,
             Some(crate::config::DEFAULT_KIMI_CODE_BASE_URL.to_string()),
             Some(1_048_576),
+            None,
         )
         .expect("Kimi Code K3 route");
 
@@ -1470,6 +1557,109 @@ mod tests {
     }
 
     #[test]
+    fn model_context_windows_exact_hit_wins_over_provider_default() {
+        let windows = BTreeMap::from([
+            ("kimi-k3".to_string(), 512_000u32),
+            ("MiniMaxAI/MiniMax-M2.5".to_string(), 204_800),
+        ]);
+        let resolution = resolve_route_candidate_with_context_metadata(
+            ApiProvider::Moonshot,
+            Some("kimi-k3"),
+            None,
+            None,
+            Some(1_048_576),
+            Some(&windows),
+            None,
+        )
+        .expect("Moonshot route with a per-model override");
+
+        assert_eq!(resolution.context_window.tokens, 512_000);
+        assert_eq!(
+            resolution.context_window.source,
+            ContextWindowSource::ConfiguredModel
+        );
+        assert_eq!(resolution.candidate.limits().context_tokens, Some(512_000));
+        assert!(
+            resolution
+                .candidate
+                .applied_limit_overrides()
+                .iter()
+                .any(|entry| entry.field == LimitField::ContextTokens
+                    && entry.value == Some(512_000)
+                    && entry.source == OverrideSource::UserModelContextWindow),
+            "candidate provenance must name the per-model override source"
+        );
+    }
+
+    #[test]
+    fn model_context_windows_miss_falls_back_to_provider_default() {
+        let windows = BTreeMap::from([("unrelated-model".to_string(), 512_000u32)]);
+        let resolution = resolve_route_candidate_with_context_metadata(
+            ApiProvider::Moonshot,
+            Some("kimi-k3"),
+            None,
+            None,
+            Some(1_048_576),
+            Some(&windows),
+            None,
+        )
+        .expect("provider default applies when no model key matches");
+
+        assert_eq!(resolution.context_window.tokens, 1_048_576);
+        assert_eq!(
+            resolution.context_window.source,
+            ContextWindowSource::Configured
+        );
+        assert!(
+            resolution
+                .candidate
+                .applied_limit_overrides()
+                .iter()
+                .any(|entry| entry.field == LimitField::ContextTokens
+                    && entry.source == OverrideSource::UserContextWindow),
+            "a table miss must stay on the provider-level provenance"
+        );
+    }
+
+    #[test]
+    fn resolve_context_window_per_model_rung_precedes_provider_override() {
+        let windows = BTreeMap::from([("qwen3-32b-256k".to_string(), 100_000u32)]);
+        let hit = resolve_context_window(
+            ApiProvider::Custom,
+            "qwen3-32b-256k",
+            None,
+            Some(999_999),
+            Some(&windows),
+        );
+        assert_eq!(hit.tokens, 100_000);
+        assert_eq!(hit.source, ContextWindowSource::ConfiguredModel);
+        assert_eq!(hit.source.label(), "configured (per-model)");
+
+        // A miss on the exact wire id falls through to the provider default.
+        let miss = resolve_context_window(
+            ApiProvider::Custom,
+            "unrelated-model",
+            None,
+            Some(999_999),
+            Some(&windows),
+        );
+        assert_eq!(miss.tokens, 999_999);
+        assert_eq!(miss.source, ContextWindowSource::Configured);
+
+        // A zero entry is ignored, never treated as a configured window.
+        let zeroed = BTreeMap::from([("qwen3-32b-256k".to_string(), 0u32)]);
+        let fallback = resolve_context_window(
+            ApiProvider::Custom,
+            "qwen3-32b-256k",
+            None,
+            Some(999_999),
+            Some(&zeroed),
+        );
+        assert_eq!(fallback.tokens, 999_999);
+        assert_eq!(fallback.source, ContextWindowSource::Configured);
+    }
+
+    #[test]
     fn kimi_code_rejects_claude_only_k3_1m_alias_for_selected_and_saved_models() {
         for (selected, saved) in [(Some("k3[1m]"), None), (None, Some("k3[1m]"))] {
             let error = resolve_route_candidate(
@@ -1477,6 +1667,7 @@ mod tests {
                 selected,
                 saved,
                 Some(crate::config::DEFAULT_KIMI_CODE_BASE_URL.to_string()),
+                None,
                 None,
             )
             .expect_err("Claude Code's context hint is not a Kimi Code API model id");
@@ -1549,6 +1740,7 @@ mod tests {
             None,
             Some(DEFAULT_KIMI_CODE_BASE_URL.to_string()),
             None,
+            None,
         )
         .expect_err("resolve kimi code + kimi-k3");
         assert!(err.contains("k3"), "{err}");
@@ -1558,6 +1750,7 @@ mod tests {
             Some("k3"),
             None,
             Some(DEFAULT_MOONSHOT_BASE_URL.to_string()),
+            None,
             None,
         )
         .expect_err("resolve direct + k3");
@@ -1582,6 +1775,7 @@ mod tests {
             None,
             Some(crate::config::DEFAULT_MOONSHOT_BASE_URL.to_string()),
             None,
+            None,
         )
         .expect("direct Moonshot K3 route");
         assert_eq!(direct_moonshot.limits().context_tokens, Some(1_048_576));
@@ -1592,6 +1786,7 @@ mod tests {
             Some("k3"),
             None,
             Some(crate::config::DEFAULT_MOONSHOT_BASE_URL.to_string()),
+            None,
             None,
         )
         .expect_err("bare k3 on direct Moonshot must fail closed");
@@ -1604,6 +1799,7 @@ mod tests {
             None,
             Some(crate::config::DEFAULT_MOONSHOT_BASE_URL.to_string()),
             None,
+            None,
         )
         .expect("generic Moonshot route");
         assert_ne!(generic_moonshot.limits().context_tokens, Some(262_144));
@@ -1613,6 +1809,7 @@ mod tests {
             Some(crate::config::DEFAULT_KIMI_CODE_MODEL),
             None,
             kimi_code_endpoint,
+            None,
             None,
         )
         .expect("Kimi Code default route");

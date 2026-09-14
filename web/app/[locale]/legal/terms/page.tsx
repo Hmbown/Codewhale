@@ -39,7 +39,6 @@ export default async function TermsPage({ params }: { params: Promise<{ locale: 
         ))}
         <p className="legal-doc-nav">
           <Link href={`/${locale}/legal/privacy`}>{isZh ? "隐私政策" : "Privacy policy"}</Link>
-          <Link href={`/${locale}/pricing`}>{isZh ? "价格" : "Pricing"}</Link>
           <Link href={`/${locale}`}>{isZh ? "返回首页" : "Back home"}</Link>
         </p>
       </article>

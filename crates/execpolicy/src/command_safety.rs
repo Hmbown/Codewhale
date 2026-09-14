@@ -382,6 +382,16 @@ const PARALLEL_READONLY_PREFIXES: &[&str] = &[
     "fd",
 ];
 
+/// Discoverable guidance from the same local command families used by the
+/// strict classifier. Options, paths and the caller's envelope still apply.
+#[must_use]
+pub fn readonly_command_help() -> String {
+    format!(
+        "Use a single inspection command with the tool's cwd field instead of cd or shell chaining. Local command families: {}. Options and workspace path checks still apply. Avoid pipes, redirects, substitutions, inline environment assignments and shell operators. For branches or revisions use git status, git log or git show; git branch and git rev-parse are outside this subset. If an essential probe remains blocked, return the findings and the blocked probe to the parent; this worker cannot change its own role.",
+        PARALLEL_READONLY_PREFIXES.join(", ")
+    )
+}
+
 /// GitHub CLI operations that inspect remote state without mutating it.
 ///
 /// Keep this as an allowlist of the complete command prefix. `gh issue` is

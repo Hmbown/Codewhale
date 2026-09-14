@@ -270,8 +270,17 @@ Write-Output ('{"windows": ' + $json + '}');`, { timeoutMs: 25_000 });
     },
     open_application: async ({ name, bundle_id: bid, url: urlArg, activate } = {}) => {
       const target = name ?? bid;
-      if (!target || !/^[A-Za-z0-9][A-Za-z0-9 .:_-]*$/.test(target)) throw new ExecError("open_application needs a plain app or executable name");
-      const r = await ps(`Start-Process -FilePath "${target.replace(/"/g, "")}"${urlArg ? ` -ArgumentList "${urlArg.replace(/"/g, "")}"` : ""}; Write-Output '{"launched": true}'`, { timeoutMs: 20_000 });
+      if (typeof target !== "string" || !/^[A-Za-z0-9][A-Za-z0-9 .:_-]*$/.test(target)) throw new ExecError("open_application needs a plain app or executable name");
+      let argumentsScript = "";
+      if (urlArg != null) {
+        if (typeof urlArg !== "string" || !URL.canParse(urlArg) || /[\0\r\n]/.test(urlArg)) throw new ExecError("open_application url must be an absolute URL");
+        // Start-Process joins ArgumentList into a Windows command line. Quote
+        // one argument there, and transport that string as data into PowerShell.
+        const quoted = '"' + urlArg.replace(/(\\*)"/g, '$1$1\\"').replace(/(\\+)$/g, '$1$1') + '"';
+        const encoded = Buffer.from(quoted, "utf16le").toString("base64");
+        argumentsScript = `$launchArg = [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String('${encoded}')); `;
+      }
+      const r = await ps(`${argumentsScript}Start-Process -FilePath "${target}"${urlArg != null ? " -ArgumentList $launchArg" : ""}; Write-Output '{"launched": true}'`, { timeoutMs: 20_000 });
       if (r.code !== 0) throw new ExecError(`Start-Process failed: ${r.stderr.trim().slice(0, 200)}`, r);
       return { launched: true, name: target, url: urlArg ?? null, activate };
     },

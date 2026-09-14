@@ -1,8 +1,10 @@
 import Link from "next/link";
+import Image from "next/image";
 import { InstallCodeBlock } from "@/components/install-code-block";
 import { InstallBinary } from "@/components/install-binary";
 import { GETTING_STARTED_STEPS } from "@/lib/content/getting-started";
 import { INSTALL_COPY } from "@/lib/content/install";
+import { COMPUTER_USE_COPY } from "@/lib/content/computer-use";
 import type { LocalizedText } from "@/lib/content/vocabulary";
 import { fill, getHome, pickText } from "@/lib/i18n/dictionaries";
 import { getFacts } from "@/lib/facts";
@@ -79,9 +81,21 @@ export default async function InstallPage({ params }: { params: Promise<{ locale
           <div className="mt-6 max-w-3xl"><InstallCodeBlock cmd={SHELL_INSTALL} {...copyProps} /></div>
           <p className="text-sm">{t(INSTALL_COPY.installer)}</p>
           <div className="portal-actions">
+            <Link href={`/${locale}/computer-use`} className="body-link">{t(COMPUTER_USE_COPY.installLink)}</Link>
             <a href="#other-ways" className="body-link">{t(INSTALL_COPY.other)}</a>
             <a href="/install.sh" className="body-link">{t(INSTALL_COPY.inspect)}</a>
           </div>
+        </div>
+      </section>
+
+      <section id="computer-use" className="portal-section portal-section-muted scroll-mt-24">
+        <div className="portal-container">
+          <div className="flex items-center gap-4 mb-4">
+            <Image src="/brand/computer-use.png" width={48} height={48} alt="" className="shrink-0" />
+            <h2>{t(COMPUTER_USE_COPY.installTitle)}</h2>
+          </div>
+          <p className="max-w-3xl text-ink-soft leading-relaxed">{t(COMPUTER_USE_COPY.installLead)}</p>
+          <Link href={`/${locale}/computer-use`} className="portal-button portal-button-primary mt-5">{t(COMPUTER_USE_COPY.installLink)}</Link>
         </div>
       </section>
 

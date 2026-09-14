@@ -50,6 +50,11 @@ function assertAppRootWindow(index, windowId) {
   if (windowId !== undefined || (index !== undefined && index !== 0)) throw Object.assign(new ExecError("Linux accessibility paths start at the app root; window selectors are unavailable"), { code: "unsupported_selector" });
 }
 
+function outputPath(file) {
+  if (typeof file !== "string" || !path.isAbsolute(file) || file.includes("\0")) throw new ExecError("output path must be an absolute filename");
+  return file;
+}
+
 export function create({ exec } = {}) {
   const run = exec?.run ?? nativeRun;
   const have = exec?.have ?? nativeHave;
@@ -119,6 +124,7 @@ export function create({ exec } = {}) {
 
   /** Capture a PNG to `file`, optionally cropped to region [x,y,w,h] points. */
   async function takeShot(file, region) {
+    outputPath(file);
     const { cmd, base } = await shotTool();
     let args = [...base];
     if (cmd === "grim") {
@@ -136,7 +142,7 @@ export function create({ exec } = {}) {
   }
 
   function recordingsDir() {
-    return process.env.CODEWHALE_CU_RECORDINGS_DIR || path.join(os.homedir(), ".codewhale-cu", "recordings");
+    return path.resolve(process.env.CODEWHALE_CU_RECORDINGS_DIR || path.join(os.homedir(), ".codewhale-cu", "recordings"));
   }
 
   async function xdotool(args, opts = {}) {
@@ -462,6 +468,7 @@ except Exception as e:
     screenshot: async (args = {}) => {
       rejectWindowSelectors(args);
       const { display, region, path: outPath } = args;
+      if (outPath != null) outputPath(outPath);
       await probeSession();
       const dir = recordingsDir();
       fs.mkdirSync(dir, { recursive: true });
@@ -526,7 +533,7 @@ print(json.dumps({"found": True, "reason": None, "element": {
       need("ffmpeg", "zoom/crop");
       const src = source ?? lastRaster?.file;
       if (!src) throw new ExecError("no screenshot taken yet on this computer — call screenshot first");
-      const out = outPath || path.join(recordingsDir(), `zoom-${crypto.randomBytes(4).toString("hex")}.png`);
+      const out = outputPath(outPath ?? path.join(recordingsDir(), `zoom-${crypto.randomBytes(4).toString("hex")}.png`));
       await runOk("ffmpeg", ["-y", "-loglevel", "error", "-i", src, "-vf", `crop=${Math.round(region[2])}:${Math.round(region[3])}:${Math.round(region[0])}:${Math.round(region[1])}`, out], { timeoutMs: 20_000 });
       return { file: out, bytes: fs.statSync(out).size, region, source: src };
     },

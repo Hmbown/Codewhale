@@ -288,7 +288,9 @@ pub struct PreparedToolImage {
 #[must_use]
 pub fn prepare_tool_image_bytes(bytes: &[u8], mime_type: &str) -> PreparedToolImage {
     let mime_type = mime_type.split(';').next().unwrap_or(mime_type).trim();
-    let valid = sniff_media_type(bytes) == Some(mime_type) && bytes.len() <= MAX_IMAGE_BYTES;
+    let valid = bytes.len() <= MAX_IMAGE_BYTES
+        && sniff_media_type(bytes) == Some(mime_type)
+        && decode_and_guard_image(bytes).is_ok();
     if !valid {
         return PreparedToolImage {
             block: None,
@@ -311,7 +313,11 @@ fn valid_tool_image(mime_type: &str, data: &str) -> bool {
         mime_type,
         "image/png" | "image/jpeg" | "image/gif" | "image/webp"
     ) && data.len() <= MAX_IMAGE_BYTES.div_ceil(3) * 4
-        && STANDARD.decode(data).is_ok()
+        && STANDARD.decode(data).is_ok_and(|bytes| {
+            bytes.len() <= MAX_IMAGE_BYTES
+                && sniff_media_type(&bytes) == Some(mime_type)
+                && decode_and_guard_image(&bytes).is_ok()
+        })
 }
 
 /// Enforce the same one-image limit at the tool execution boundary so plugin

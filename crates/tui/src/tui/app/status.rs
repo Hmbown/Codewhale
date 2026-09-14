@@ -113,7 +113,13 @@ impl App {
 
     /// Coalesce a still-visible duplicate without renewing its first expiry.
     /// Decision identities keep otherwise identical requests independent.
-    pub(crate) fn push_status_toast_record(&mut self, toast: StatusToast) {
+    pub(crate) fn push_status_toast_record(&mut self, mut toast: StatusToast) {
+        // An omitted lifetime used to leave routine notices in the queue
+        // forever, resurfacing after newer notices expired. Pending actions
+        // and safety gates have explicit kinds and keep their own lifecycle.
+        if toast.kind == StatusToastKind::Ordinary && toast.ttl_ms.is_none() {
+            toast.ttl_ms = Some(Self::STICKY_ERROR_TTL_MS);
+        }
         self.prune_expired_status_toasts(toast.created_at);
         if self.status_toasts.iter().any(|existing| {
             existing.level == toast.level
@@ -177,7 +183,7 @@ impl App {
                     .unwrap_or(Self::STICKY_ERROR_TTL_MS)
                     .min(Self::STICKY_ERROR_TTL_MS),
             ),
-            _ => ttl_ms,
+            _ => ttl_ms.or(Some(Self::STICKY_ERROR_TTL_MS)),
         };
         self.sticky_status = Some(StatusToast::new(text, level, ttl_ms));
         self.needs_redraw = true;
@@ -197,6 +203,11 @@ impl App {
             .as_ref()
             .is_some_and(|status| matches!(status.kind, StatusToastKind::ContextPressure(_)));
         if is_context_pressure {
+            if self.status_message.as_ref() == self.sticky_status.as_ref().map(|toast| &toast.text)
+            {
+                self.status_message = None;
+                self.last_status_message_seen = None;
+            }
             if let Some(StatusToastKind::ContextPressure(level)) =
                 self.sticky_status.as_ref().map(|status| status.kind)
             {
@@ -408,6 +419,31 @@ mod tests {
         assert_eq!(
             app.status_toasts.back().unwrap().created_at,
             now + Duration::from_millis(2_000)
+        );
+    }
+
+    #[test]
+    fn routine_notices_expire_without_dismissing_pending_actions_or_safety_gates() {
+        let mut app = app();
+        let now = Instant::now();
+        app.push_status_toast("Temporary warning", StatusToastLevel::Warning, None);
+        app.push_status_toast("Copied", StatusToastLevel::Info, None);
+        app.set_sticky_status("Offline mode", StatusToastLevel::Warning, None);
+        app.push_status_toast_record(
+            StatusToast::new("Review request", StatusToastLevel::Warning, None)
+                .for_action("pending"),
+        );
+        app.push_status_toast_record(
+            StatusToast::new("Review redaction", StatusToastLevel::Warning, None)
+                .for_redaction_gate(RedactionGateNotice::WriteFailure),
+        );
+        app.prune_expired_status_toasts(now + Duration::from_secs(10));
+        assert!(app.sticky_status.is_none());
+        assert_eq!(app.status_toasts.len(), 2);
+        assert_eq!(app.status_toasts[0].kind, StatusToastKind::ActionRequired);
+        assert_eq!(
+            app.status_toasts[1].kind,
+            StatusToastKind::RedactionGate(RedactionGateNotice::WriteFailure)
         );
     }
 

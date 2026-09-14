@@ -41,12 +41,13 @@ use std::hash::{Hash, Hasher};
 
 use serde::{Deserialize, Serialize};
 
-use codewhale_models::{SystemPrompt, Tool};
+use crate::request::{SystemPrompt, Tool};
 
 /// A snapshot of the immutable prefix's fingerprint.
 ///
-/// Two snapshots with the same `combined` hash are guaranteed to
-/// produce the same byte prefix when serialized for the API.
+/// Matching hashes show stable system text and the normalized OpenAI-style
+/// tool catalog. They do not measure provider cache hits or fingerprint every
+/// provider-specific wire transformation; request replay tests cover those.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PrefixFingerprint {
     /// SHA-256 of the system prompt text.
@@ -730,7 +731,13 @@ fn tool_to_api_json(tool: &Tool) -> Option<String> {
 
 /// Compute the SHA-256 hex digest of a byte slice.
 fn sha256_hex(bytes: &[u8]) -> String {
-    crate::hashing::sha256_hex(bytes)
+    use sha2::{Digest, Sha256};
+    use std::fmt::Write;
+    let mut hex = String::with_capacity(64);
+    for byte in Sha256::digest(bytes) {
+        let _ = write!(&mut hex, "{byte:02x}");
+    }
+    hex
 }
 
 /// Bounded line delta between the session context the model last saw and a

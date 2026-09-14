@@ -1079,7 +1079,7 @@ mod tests {
         drop(lease); // The old window changed session before the actor ran.
         assert!(manager.acquire_offline_queue_lease("session-A").is_err());
         let report = flush_inner(&manager, &mut pending);
-        assert!(report.failures.is_empty());
+        assert!(report.failures.is_empty(), "draft write failed: {report:?}");
         assert_eq!(report.completed, 1);
         let _next_editor = manager
             .acquire_offline_queue_lease("session-A")

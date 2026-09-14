@@ -82,6 +82,52 @@ fn marketplace_state_path(codewhale_home: &Path) -> std::path::PathBuf {
 }
 
 #[test]
+fn marketplace_builtin_candidate_routes_to_existing_bundle_review() {
+    let _lock = crate::test_support::lock_test_env();
+    let root = TempDir::new().unwrap();
+    let codewhale_home = root.path().join("home");
+    fs::create_dir_all(&codewhale_home).unwrap();
+    let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", &codewhale_home);
+    let (mut app, _temp) = create_test_app(root.path());
+    let original = app
+        .plugin_registry
+        .get("computer-use")
+        .expect("shipped bundle")
+        .clone();
+    let result =
+        plugins_with_kimi_home_override(&mut app, Some("marketplace show codewhale"), None);
+    assert!(!result.is_error);
+    let text = result.message.unwrap();
+    assert!(
+        !text.contains(r"/plugin marketplace install codewhale computer\-use"),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!(
+            "/plugin show {}",
+            escape_review_text(original.id.as_str())
+        )),
+        "{text}"
+    );
+    assert!(
+        text.contains("/plugin marketplace install codewhale whalewiki"),
+        "{text}"
+    );
+    let result = plugins_with_kimi_home_override(
+        &mut app,
+        Some("marketplace install codewhale computer-use"),
+        None,
+    );
+    assert!(result.is_error);
+    assert!(result.message.unwrap().contains("already exists"));
+    let retained = app.plugin_registry.get("computer-use").unwrap();
+    assert_eq!(retained.content_hash, original.content_hash);
+    assert_eq!(retained.trust_status, original.trust_status);
+    assert_eq!(retained.enabled, original.enabled);
+    assert!(!codewhale_home.join("plugins/computer-use").exists());
+}
+
+#[test]
 fn marketplace_add_list_show_remove_roundtrip() {
     let _lock = crate::test_support::lock_test_env();
     let root = TempDir::new().unwrap();
@@ -174,7 +220,10 @@ fn marketplace_add_list_show_remove_roundtrip() {
     let empty = plugins_with_kimi_home_override(&mut app, Some("marketplace list"), None)
         .message
         .unwrap();
-    assert!(empty.contains("No marketplace catalogs"), "{empty}");
+    assert!(
+        empty.contains("codewhale") && empty.contains("whalewiki"),
+        "{empty}"
+    );
 }
 
 #[test]
@@ -261,7 +310,7 @@ fn marketplace_add_rejects_symlinks_and_bad_documents() {
         plugins_with_kimi_home_override(&mut app, Some("marketplace list"), None)
             .message
             .unwrap()
-            .contains("No marketplace catalogs")
+            .contains("codewhale")
     );
 
     // corrupt stored state fails closed and is never rewritten

@@ -12,8 +12,10 @@ Implementation exists for macOS, Windows, Linux and HarmonyOS target devices;
 platform support still depends on the tools, OS grants and actual device
 verification described by the upstream project. A source build is not a
 published or certified release.
-Current launch qualification covers the local macOS candidate. Windows,
-Wayland, HarmonyOS and SSH require separate device and workflow evidence.
+The bundled plugin is enabled on macOS only while Windows and Linux ports
+are being qualified. Their raw input uses the shared desktop; they do not
+yet provide equivalent background control or qualified native installers.
+HarmonyOS and SSH also require separate device and workflow evidence.
 
 ## Included runtime
 
@@ -23,6 +25,14 @@ permission identity of its hosting Codewhale app or terminal. Accessibility
 and Screen Recording grants remain controlled by the user in System Settings.
 Use `request_access` to inspect readiness; a loaded plugin alone does not prove
 its OS permissions work.
+
+When the standalone Computer Use helper is registered, it owns local input
+even when Codewhale carries an embedded native helper. Version 0.3.1 keeps its
+whale menu, permission setup, disposable background check and human
+Pause/Stop controls, and retires the daemon when its native owner disappears. A registered helper that cannot start causes a clear
+error; the client does not silently bypass its controls. Without a registered
+standalone app, the included helper remains available under the host's
+permission identity.
 
 The MCP server requires Node.js 20 or newer. Codewhale Apps packages its own
 Node runtime; the CLI uses Node on PATH. Homebrew declares the dependency;
@@ -76,3 +86,10 @@ click in the user's applications. `npm run smoke` is a separate legacy live
 check: it captures and records the selected display, so run it only when that
 capture is intended. The upstream parity suite contains scoped application
 fixtures for interactive verification.
+
+On macOS, ordinary observations follow the selected background app. Field
+focus, selection, context menus and scrolling use supported accessibility
+operations; raw mouse gestures stop if the user changes foreground apps.
+Arbitrary background dragging remains unavailable. Rebuild Core to include
+the updated native helper; updating a separate marketplace checkout alone
+does not update an already-installed Core binary.

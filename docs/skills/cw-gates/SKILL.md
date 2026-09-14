@@ -99,9 +99,7 @@ of them in test targets.
 ### Rung 5 — website, when `web/` changed
 
 ```bash
-cd web && npm ci && npm run prebuild && npm run check:facts \
-  && npm run check:docs && npm run check:tokens && npm test \
-  && npm run lint && npx tsc --noEmit && npm run build
+cd web && npm ci && npm test && npm run check
 ```
 
 ## Claiming a test passed

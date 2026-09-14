@@ -4,6 +4,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
+import zlib from 'node:zlib';
+import crypto from 'node:crypto';
 import { create } from '../src/backends/darwin.mjs';
 import { withSignal, currentSignal, runInputLease } from '../src/exec.mjs';
 
@@ -40,6 +42,19 @@ test('native summary keeps text and top-level menus without spending the UI budg
   const binary=path.join(dir,'native');
   const build=spawnSync('clang',['-DCU_TEST=1','-fobjc-arc','-Os','-framework','Cocoa','-framework','ApplicationServices','-framework','ScreenCaptureKit','-framework','AVFoundation','-framework','CoreMedia','-framework','Vision','src/backends/darwin-accessibility.m','-o',binary],{encoding:'utf8'});
   assert.equal(build.status,0,build.stderr);
+
+  for(const [element,context,action] of [
+    [{AXRole:'AXTextField',actions:['AXPress'],settable:['AXFocused']},false,'AXFocused'],
+    [{AXRole:'AXRow',settable:['AXSelected']},false,'AXSelected'],
+    [{AXRole:'AXMenuItem',actions:['AXPick']},false,'AXPick'],
+    [{AXRole:'AXButton',actions:['AXShowMenu']},true,'AXShowMenu'],
+    [{AXRole:'AXButton',AXEnabled:false,actions:['AXPress']},false,null],
+    [{AXRole:'AXGroup',settable:['AXFocused']},false,null],
+  ]) {
+    const r=spawnSync(binary,[JSON.stringify({tool:'inspect_click_action',args:{element,context}})],{encoding:'utf8'});
+    assert.equal(r.status,0,r.stderr);
+    assert.equal(JSON.parse(r.stdout).action,action);
+  }
   const node=(role,label,children=[])=>({AXRole:role,AXTitle:label,AXChildren:children,actions:['AXPress']});
   const app={AXMenuBar:node('AXMenuBar','Menu bar',[node('AXMenuBarItem','File',[node('AXMenu','File menu',Array.from({length:150},(_,i)=>node('AXMenuItem',`Command ${i}`)))])]),AXChildren:[node('AXMenu','Popup',[node('AXMenuItem','Choose')])]};
   const windows=[node('AXWindow','Fixture',Array.from({length:350},(_,i)=>({...node('AXTextField',`Field ${i}`),AXValue:`Value ${i}`,AXFocused:i===349})))];
@@ -108,6 +123,18 @@ test('native window matching refuses another process, mismatched geometry and am
   assert.equal(missing.status,1);assert.match(missing.stderr,/selected app window is not capturable/);
   const ambiguous=query([selected,{...selected,kCGWindowNumber:45}]);
   assert.equal(ambiguous.status,1);assert.match(ambiguous.stderr,/selected window is ambiguous/);
+  const owner=windows=>{
+    const result=spawnSync(binary,[JSON.stringify({tool:'inspect_window_at_point',args:{x:50,y:50,input_app_ref:{pid:123},windows}})],{encoding:'utf8'});
+    assert.equal(result.status,0,result.stderr);return JSON.parse(result.stdout);
+  };
+  for(const layer of [0,3,8,25,1000]) {
+    const floating={...wrongProcess,kCGWindowLayer:layer,kCGWindowAlpha:1};
+    assert.equal(owner([floating,selected]).owner_pid,999,'visible foreign windows own the point at every layer');
+    assert.equal(owner([{...floating,kCGWindowAlpha:0.001},selected]).owner_pid,999,'faint foreign windows remain occluders');
+    assert.equal(owner([{...floating,kCGWindowAlpha:0},selected]).owner_pid,123,'transparent overlays do not intercept');
+  }
+  assert.equal(owner([{...selected,kCGWindowLayer:8}]).owner_pid,123,'the bound app can target its own floating panels');
+
 });
 
 test('native owner pipe survives forced MCP exit, releases promptly and excludes competing input', {skip:process.platform!=='darwin'}, async t=>{
@@ -212,8 +239,53 @@ const NOT_PRESSABLE = { found: false, reason: 'no_pressable_element' };
 const FILES_TARGET = { type:'element', app_ref:{pid:321,bundle_id:'test.app'}, windowIndex:0, path:[0,4,2],
   role:'AXMenuItem', label:'Files', x:1607, y:692 };
 
+test('macOS background scroll and context menus keep the selected element without a global gesture', async t => {
+  const {backend,calls}=stubBackend(t,r=>r.tool==='input_capabilities'?{input_lease:1,background_actions:1}:null);
+  await backend.open_application({name:'Fixture'});
+  const area={...FILES_TARGET,role:'AXScrollArea'};
+  await backend.scroll({target:area,direction:'down',amount:4});
+  assert.deepEqual(calls.find(r=>r.tool==='scroll_element').args.target,area);
+  await backend.right_click({target:FILES_TARGET});
+  assert.equal(calls.find(r=>r.tool==='click_element').args.context,true);
+  assert.ok(!calls.some(r=>['pointer_sequence','window_at_point','mouse_event'].includes(r.tool)));
+});
+
+test('macOS scroll cannot retry an ambiguous semantic dispatch or downgrade an old helper', async t => {
+  let supported=false;
+  const {backend,calls}=stubBackend(t,r=>r.tool==='input_capabilities'?{input_lease:1,background_actions:supported?1:0}
+    :r.tool==='scroll_element'?{nativeResult:{code:null,spawned:true,timedOut:true,stdout:'',stderr:''}}:null);
+  await backend.open_application({name:'Fixture'});
+  await assert.rejects(backend.scroll({target:FILES_TARGET}),e=>e.code==='app_upgrade_required');
+  assert.equal(calls.filter(r=>r.tool==='scroll_element').length,0);
+  supported=true;
+  await assert.rejects(backend.scroll({target:FILES_TARGET}),e=>e.inputMayHaveBeenSent===true);
+  assert.equal(calls.filter(r=>r.tool==='scroll_element').length,1);
+  assert.ok(!calls.some(r=>r.tool==='pointer_sequence'));
+});
+
+test('macOS unqualified observations stay bound; malformed explicit targets never select the foreground', async t => {
+  const {backend,calls}=stubBackend(t, r=>r.tool==='get_app_state'?{found:true,pid:321,elements:[]}:null);
+  await backend.open_application({name:'Fixture'});
+  for(const tool of ['get_app_state','list_windows']) {
+    await backend[tool]({});
+    assert.equal(calls.at(-1).args.app_ref.pid,321);
+    await backend[tool]({app_ref:null});
+    assert.equal(calls.at(-1).args.app_ref,null);
+  }
+});
+
+test('macOS failed activation cannot leave a previous shared-desktop binding armed', async t => {
+  let frontmost=true;
+  const {backend,calls}=stubBackend(t,r=>r.tool==='app_info'?{found:true,pid:321,bundle_id:'test.app',frontmost}:null);
+  await backend.open_application({name:'Fixture',activate:true});
+  frontmost=false;
+  await assert.rejects(backend.open_application({name:'Fixture',activate:true}),e=>e.code==='activation_not_confirmed');
+  await assert.rejects(backend.mouse_move({target:{x:10,y:10}}),e=>e.code==='shared_pointer_required');
+  assert.ok(!calls.some(r=>r.tool==='pointer_sequence'));
+});
+
 test('macOS background control never escalates an unavailable semantic action to shared pointer input', async t => {
-  const {backend,calls}=stubBackend(t,r=>r.tool==='hit_test'?NOT_PRESSABLE:null);
+  const {backend,calls}=stubBackend(t,r=>r.tool==='input_capabilities'?{input_lease:1,element_identity:1,background_actions:1}:r.tool==='hit_test'?NOT_PRESSABLE:null);
   const binding=await backend.open_application({name:'Fixture'});
   assert.equal(binding.input_scope,'application');
   assert.equal(binding.shared_pointer,false);
@@ -224,7 +296,7 @@ test('macOS background control never escalates an unavailable semantic action to
     ['double_click',{target}], ['triple_click',{target}], ['right_click',{target}],
     ['middle_click',{target}], ['mouse_move',{target}], ['left_mouse_down',{target}],
     ['left_click_drag',{from_target:target,to:{x:90,y:100}}], ['scroll',{target}],
-  ]) await assert.rejects(backend[tool](args),error=>error.code==='shared_pointer_required');
+  ]) await assert.rejects(backend[tool](args),error=>error.code===(tool==='scroll'?'background_scroll_unavailable':'shared_pointer_required'));
   assert.ok(!calls.some(r=>['pointer_sequence','release_input','window_at_point'].includes(r.tool)));
   await backend.type({text:'Background typing'});
   assert.equal(calls.at(-1).tool,'type');
@@ -248,14 +320,14 @@ test('macOS returning to background stops held-pointer movement while preserving
 });
 
 test('macOS element click preserves the observed path despite an oversized frame center', async t => {
-  const {backend,calls}=stubBackend(t,r=>r.tool==='input_capabilities'?{input_lease:1,element_identity:1}:r.tool==='hit_test'?PRESSABLE:null);
+  const {backend,calls}=stubBackend(t,r=>r.tool==='input_capabilities'?{input_lease:1,element_identity:1,background_actions:1}:r.tool==='hit_test'?PRESSABLE:null);
   await backend.open_application({name:'Fixture'});
   const receipt=await backend.left_click({target:FILES_TARGET});
   assert.equal(receipt.action_sent,true);
   assert.equal(receipt.element.label,'Files');
   assert.equal(receipt.verified,false);
-  assert.equal(receipt.verification_required,'screenshot');
-  const presses=calls.filter(r=>r.tool==='perform_action');
+  assert.equal(receipt.verification_required,'observation');
+  const presses=calls.filter(r=>r.tool==='click_element');
   assert.equal(presses.length,1,'one dispatch, even when the app does not report a changed state');
   assert.deepEqual(presses[0].args.target,FILES_TARGET);
   assert.equal(presses[0].args.action,'AXPress');
@@ -264,20 +336,20 @@ test('macOS element click preserves the observed path despite an oversized frame
 
 for(const reason of ['action is not advertised by this element','element changed label; observe again','window blocked by modal sheet'])
 test(`macOS element click does not fall back after ${reason}`, async t => {
-  const {backend,calls}=stubBackend(t,r=>r.tool==='input_capabilities'?{input_lease:1,element_identity:1}
-    :r.tool==='perform_action'?{nativeResult:{code:1,stdout:'',stderr:reason}}:null);
+  const {backend,calls}=stubBackend(t,r=>r.tool==='input_capabilities'?{input_lease:1,element_identity:1,background_actions:1}
+    :r.tool==='click_element'?{nativeResult:{code:1,stdout:'',stderr:reason}}:null);
   await backend.open_application({name:'Fixture'});
   await assert.rejects(backend.left_click({target:FILES_TARGET,strategy:'a11y'}),error=>error.message.includes(reason)&&/fresh screenshot or OCR/.test(error.message));
-  assert.equal(calls.filter(r=>r.tool==='perform_action').length,1);
+  assert.equal(calls.filter(r=>r.tool==='click_element').length,1);
   assert.ok(!calls.some(r=>['hit_test','pointer_sequence'].includes(r.tool)));
 });
 
 test('macOS ambiguous element press is never retried or converted to pointer input', async t => {
-  const {backend,calls}=stubBackend(t,r=>r.tool==='input_capabilities'?{input_lease:1,element_identity:1}
-    :r.tool==='perform_action'?{nativeResult:{code:null,spawned:true,timedOut:true,stdout:'',stderr:''}}:null);
+  const {backend,calls}=stubBackend(t,r=>r.tool==='input_capabilities'?{input_lease:1,element_identity:1,background_actions:1}
+    :r.tool==='click_element'?{nativeResult:{code:null,spawned:true,timedOut:true,stdout:'',stderr:''}}:null);
   await backend.open_application({name:'Fixture'});
   await assert.rejects(backend.left_click({target:FILES_TARGET}),error=>error.inputMayHaveBeenSent===true&&/timed out/.test(error.message));
-  assert.equal(calls.filter(r=>r.tool==='perform_action').length,1);
+  assert.equal(calls.filter(r=>r.tool==='click_element').length,1);
   assert.ok(!calls.some(r=>['hit_test','pointer_sequence'].includes(r.tool)));
 });
 
@@ -429,7 +501,7 @@ test('macOS coordinate left_click prefers the accessibility element under the po
 });
 
 test('macOS coordinate left_click falls back to a guarded global gesture when no element is pressable', async (t) => {
-  const { backend, calls } = stubBackend(t, (r) => (r.tool === 'hit_test' ? NOT_PRESSABLE : null));
+  const { backend, calls } = stubBackend(t, (r) => (r.tool === 'input_capabilities' ? {input_lease:1,background_actions:1} : r.tool === 'hit_test' ? NOT_PRESSABLE : null));
   await backend.open_application({ name: 'TextEdit', activate:true });
   const receipt = await backend.left_click({ target: { x: 40, y: 90 } });
   assert.equal(receipt.strategy, 'event');
@@ -452,15 +524,15 @@ test('macOS refuses a global gesture whose landing point belongs to another appl
   assert.ok(!calls.some((c) => c.tool === 'pointer_sequence'), 'nothing is posted into the other application');
 });
 
-test('macOS left_click strategies: event skips the tree, a11y fails closed, other clicks stay pointer-driven', async (t) => {
-  const { backend, calls } = stubBackend(t, (r) => (r.tool === 'hit_test' ? NOT_PRESSABLE : null));
+test('macOS click strategies: event skips the tree and a11y fails closed', async (t) => {
+  const { backend, calls } = stubBackend(t, (r) => (r.tool === 'input_capabilities' ? {input_lease:1,background_actions:1} : r.tool === 'hit_test' ? NOT_PRESSABLE : null));
   await backend.open_application({ name: 'TextEdit', activate:true });
 
   const forced = await backend.left_click({ target: { x: 10, y: 20 }, strategy: 'event' });
   assert.equal(forced.strategy, 'event');
   assert.ok(!calls.some((c) => c.tool === 'hit_test'), 'strategy=event never hit-tests');
 
-  await assert.rejects(backend.left_click({ target: { x: 10, y: 20 }, strategy: 'a11y' }), /no pressable accessibility element/);
+  await assert.rejects(backend.left_click({ target: { x: 10, y: 20 }, strategy: 'a11y' }), /no supported accessibility click/);
   await assert.rejects(backend.left_click({ target: { x: 10, y: 20 }, strategy: 'sideways' }), /strategy must be auto, a11y or event/);
 
   calls.length = 0;
@@ -468,7 +540,7 @@ test('macOS left_click strategies: event skips the tree, a11y fails closed, othe
   assert.equal(dbl.strategy, 'event');
   assert.deepEqual(calls.find((c) => c.tool === 'pointer_sequence').args.steps.map((s) => s.clickState), [0, 1, 1, 2, 2]);
   assert.equal((await backend.right_click({ target: { x: 10, y: 20 } })).strategy, 'event');
-  assert.ok(!calls.some((c) => c.tool === 'hit_test'), 'only a left single click has an accessibility equivalent');
+  assert.equal(calls.find(c => c.tool === 'hit_test').args.operation, 'context');
 });
 
 test('macOS drag and scroll travel as one gesture that puts the pointer back', async (t) => {
@@ -521,7 +593,9 @@ test('native type verifies delivery against the focused control and fails closed
   assert.ok(!('verification_required' in receipt));
 
   r = type({ text: 'their', focused: { AXRole: 'AXTextArea', AXValue: 'I love ', after: 'I love thier' } });
-  assert.equal(JSON.parse(r.stdout).verified, true, 'the length check survives an autocorrect transform');
+  assert.equal(JSON.parse(r.stdout).verified, false, 'matching length does not establish that the requested text landed');
+  r = type({ text: 'world', focused: { AXRole: 'AXTextField', AXValue: 'Hello world', after: 'Hello world' } });
+  assert.equal(JSON.parse(r.stdout).verified, false, 'an existing suffix must not verify a dropped insertion');
 
   r = type({ text: 'x', focused: { AXRole: 'AXButton', AXTitle: 'Save' } });
   assert.equal(r.status, 1, 'a clearly non-text focus refuses before any event is posted');
@@ -543,4 +617,188 @@ test('macOS type passes the native verification receipt through untouched', asyn
   const { backend } = stubBackend(t, (r) => (r.tool === 'type' ? nativeReceipt : null));
   await backend.open_application({ name: 'TextEdit' });
   assert.deepEqual(await backend.type({ text: 'hello' }), nativeReceipt);
+});
+
+// A 1x1 PNG is enough: screenshot reads its IHDR for the pixel ground truth.
+const PNG_1X1 = Buffer.from(
+  'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==',
+  'base64',
+);
+
+// list_displays reports `index` and `id` separately (a lone main display is
+// commonly index 1 / id 3). Passing the id where the index belongs must be a
+// clean refusal, never a capture labelled with another display's geometry:
+// those points/scale feed every later coordinate target.
+function displayBackend(t, { displays }) {
+  const bundle = fs.mkdtempSync(path.join(os.tmpdir(), 'cu-display-test-'));
+  const old = process.env.CODEWHALE_CU_APP_BUNDLE;
+  t.after(() => { if (old === undefined) delete process.env.CODEWHALE_CU_APP_BUNDLE; else process.env.CODEWHALE_CU_APP_BUNDLE = old; fs.rmSync(bundle, { recursive: true, force: true }); });
+  fs.mkdirSync(path.join(bundle, 'Contents', 'MacOS'), { recursive: true });
+  fs.writeFileSync(path.join(bundle, 'Contents', 'MacOS', 'accessibility'), '');
+  process.env.CODEWHALE_CU_APP_BUNDLE = bundle;
+  const captures = [];
+  const backend = create({ exec: leaseExecutor(async (cmd, args) => {
+    if (cmd === 'screencapture') {
+      captures.push(args);
+      fs.writeFileSync(args.at(-1), PNG_1X1);
+      return { code: 0, stdout: '', stderr: '' };
+    }
+    const request = JSON.parse(args[0]);
+    return { code: 0, stderr: '', stdout: JSON.stringify(request.tool === 'displays' ? displays : { action_sent: true }) };
+  }) });
+  return { backend, captures };
+}
+
+test('macOS screenshot rejects a display id used as an index instead of mislabelling the raster', async (t) => {
+  const displays = [{ index: 1, id: 3, main: true, points: { x: 0, y: 0, w: 2880, h: 1620 }, scale: 2 }];
+  const { backend, captures } = displayBackend(t, { displays });
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cu-display-shot-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+
+  await assert.rejects(
+    backend.screenshot({ display: 3, path: path.join(dir, 'a.png') }),
+    (err) => /no display 3/.test(err.message) && /index/.test(err.message),
+  );
+  assert.equal(captures.length, 0, 'a rejected display must not reach screencapture');
+
+  const ok = await backend.screenshot({ display: 1, path: path.join(dir, 'b.png') });
+  assert.equal(ok.display, 1);
+  assert.deepEqual(ok.points, displays[0].points);
+  assert.deepEqual(captures.at(-1).slice(0, 5), ['-x', '-t', 'png', '-D', '1']);
+});
+
+// A 5K display captures to ~22MB of PNG, which is ~29MB of base64 — past the
+// 16MB a stdio host will accept in one message. That once dropped the whole
+// transport and every other tool with it. The raster is shrunk to fit instead,
+// and the geometry must follow it: `pixels` is the PNG's, `points` stays in
+// screen points, and `scale` is derived from the two, so raster-to-point
+// conversion stays exact at the smaller size.
+// A real PNG of `w`x`h` random pixels — incompressible, like a busy screen.
+function noisePng(w, h) {
+  const chunk = (type, body) => {
+    const len = Buffer.alloc(4); len.writeUInt32BE(body.length);
+    const tag = Buffer.concat([Buffer.from(type, 'ascii'), body]);
+    const crc = Buffer.alloc(4); crc.writeUInt32BE(zlib.crc32 ? zlib.crc32(tag) : crc32(tag));
+    return Buffer.concat([len, tag, crc]);
+  };
+  const ihdr = Buffer.alloc(13);
+  ihdr.writeUInt32BE(w, 0); ihdr.writeUInt32BE(h, 4);
+  ihdr[8] = 8; ihdr[9] = 2; // 8-bit RGB
+  const rows = Buffer.alloc(h * (1 + w * 3));
+  crypto.randomFillSync(rows);
+  for (let y = 0; y < h; y += 1) rows[y * (1 + w * 3)] = 0; // filter: none
+  return Buffer.concat([
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    chunk('IHDR', ihdr), chunk('IDAT', zlib.deflateSync(rows)), chunk('IEND', Buffer.alloc(0)),
+  ]);
+}
+function crc32(buf) {
+  let c = ~0;
+  for (const b of buf) { c ^= b; for (let k = 0; k < 8; k += 1) c = (c >>> 1) ^ (0xedb88320 & -(c & 1)); }
+  return (~c) >>> 0;
+}
+
+// A 5K display captures to ~22MB of PNG, which is ~29MB of base64 — past the
+// 16MB a stdio host will accept in one message. That once dropped the whole
+// transport and every other tool with it. The raster is shrunk to fit instead,
+// and the geometry must follow it: `pixels` is the PNG's, `points` stays in
+// screen points, and `scale` is derived from the two, so raster-to-point
+// conversion stays exact at the smaller size.
+// This integration test exercises the real macOS sips resizer.
+test('macOS screenshot shrinks an over-budget raster and keeps its geometry exact', { skip: process.platform !== 'darwin' }, async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cu-budget-shot-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const big = path.join(dir, 'big.png');
+  fs.writeFileSync(big, noisePng(1600, 900));
+
+  const oldBudget = process.env.CODEWHALE_CU_MAX_IMAGE_BYTES;
+  process.env.CODEWHALE_CU_MAX_IMAGE_BYTES = '1500000';
+  t.after(() => { if (oldBudget === undefined) delete process.env.CODEWHALE_CU_MAX_IMAGE_BYTES; else process.env.CODEWHALE_CU_MAX_IMAGE_BYTES = oldBudget; });
+  assert.ok(Math.ceil(fs.statSync(big).size / 3) * 4 > 1_500_000, 'fixture must start over budget');
+
+  const displays = [{ index: 1, id: 3, main: true, points: { x: 0, y: 0, w: 800, h: 450 }, scale: 2 }];
+  const bundle = fs.mkdtempSync(path.join(os.tmpdir(), 'cu-budget-bundle-'));
+  const oldBundle = process.env.CODEWHALE_CU_APP_BUNDLE;
+  t.after(() => { if (oldBundle === undefined) delete process.env.CODEWHALE_CU_APP_BUNDLE; else process.env.CODEWHALE_CU_APP_BUNDLE = oldBundle; fs.rmSync(bundle, { recursive: true, force: true }); });
+  fs.mkdirSync(path.join(bundle, 'Contents', 'MacOS'), { recursive: true });
+  fs.writeFileSync(path.join(bundle, 'Contents', 'MacOS', 'accessibility'), '');
+  process.env.CODEWHALE_CU_APP_BUNDLE = bundle;
+
+  const backend = create({ exec: leaseExecutor(async (cmd, args) => {
+    if (cmd === 'screencapture') {
+      fs.copyFileSync(big, args.at(-1));
+      return { code: 0, stdout: '', stderr: '' };
+    }
+    const request = JSON.parse(args[0]);
+    return { code: 0, stderr: '', stdout: JSON.stringify(request.tool === 'displays' ? displays : { action_sent: true }) };
+  }) });
+
+  const out = path.join(dir, 'shot.png');
+  const shot = await backend.screenshot({ display: 1, path: out });
+
+  assert.ok(Math.ceil(fs.statSync(out).size / 3) * 4 <= 1_500_000, 'raster still over budget');
+  assert.ok(shot.pixels.w < 1600, 'an over-budget raster must actually shrink');
+
+  // The invariant that matters: the raster centre still resolves to the centre
+  // of the display in screen points.
+  assert.equal(shot.points.w, 800, 'points stay in screen points');
+  const centreX = Math.round((shot.pixels.w / 2) / shot.scale) + (shot.points.x ?? 0);
+  assert.ok(Math.abs(centreX - 400) <= 2, `raster centre maps to ${centreX}, expected ~400`);
+});
+
+// A screen is photographic content, and lossless compression of it is enormous:
+// the same 5760x3240 frame measures 21.8MB as PNG and 2.1MB as JPEG at full
+// resolution. The PNG default is what made a single screenshot exceed the
+// 16MB a stdio host accepts in one message and drop the whole session.
+test('macOS screenshot captures JPEG by default and honours an explicit .png path', async (t) => {
+  const displays = [{ index: 1, id: 3, main: true, points: { x: 0, y: 0, w: 2880, h: 1620 }, scale: 2 }];
+  const { backend, captures } = displayBackend(t, { displays });
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cu-format-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+
+  const dflt = await backend.screenshot({ display: 1 });
+  assert.deepEqual(captures.at(-1).slice(0, 3), ['-x', '-t', 'jpg'], 'the default capture is JPEG');
+  assert.match(dflt.path, /\.jpg$/);
+
+  await backend.screenshot({ display: 1, path: path.join(dir, 'exact.png') });
+  assert.deepEqual(captures.at(-1).slice(0, 3), ['-x', '-t', 'png'], 'an explicit .png path stays lossless');
+
+  await backend.screenshot({ display: 1, path: path.join(dir, 'shot.jpeg') });
+  assert.deepEqual(captures.at(-1).slice(0, 3), ['-x', '-t', 'jpg']);
+
+  await assert.rejects(
+    backend.screenshot({ display: 1, path: path.join(dir, 'shot.gif') }),
+    /must end in \.png, \.jpg or \.jpeg/,
+  );
+});
+
+// Dimensions come from the raster's own header. A JPEG carries them in a frame
+// marker rather than at a fixed offset, and reading the wrong bytes would
+// mis-scale every coordinate target derived from the capture.
+test('macOS raster dimensions are read from both PNG and JPEG headers', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cu-dims-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const png = path.join(dir, 'a.png');
+  fs.writeFileSync(png, noisePng(321, 123));
+  const jpg = path.join(dir, 'a.jpg');
+  spawnSync('sips', ['-s', 'format', 'jpeg', png, '--out', jpg], { stdio: 'ignore' });
+  if (!fs.existsSync(jpg)) { t.skip('sips unavailable'); return; }
+
+  const displays = [{ index: 1, id: 3, main: true, points: { x: 0, y: 0, w: 321, h: 123 }, scale: 1 }];
+  for (const [fixture, name] of [[png, 'shot.png'], [jpg, 'shot.jpg']]) {
+    const bundle = fs.mkdtempSync(path.join(os.tmpdir(), 'cu-dims-bundle-'));
+    const old = process.env.CODEWHALE_CU_APP_BUNDLE;
+    fs.mkdirSync(path.join(bundle, 'Contents', 'MacOS'), { recursive: true });
+    fs.writeFileSync(path.join(bundle, 'Contents', 'MacOS', 'accessibility'), '');
+    process.env.CODEWHALE_CU_APP_BUNDLE = bundle;
+    const backend = create({ exec: leaseExecutor(async (cmd, args) => {
+      if (cmd === 'screencapture') { fs.copyFileSync(fixture, args.at(-1)); return { code: 0, stdout: '', stderr: '' }; }
+      const request = JSON.parse(args[0]);
+      return { code: 0, stderr: '', stdout: JSON.stringify(request.tool === 'displays' ? displays : { action_sent: true }) };
+    }) });
+    const shot = await backend.screenshot({ display: 1, path: path.join(dir, name) });
+    assert.deepEqual(shot.pixels, { w: 321, h: 123 }, `${name} dimensions`);
+    if (old === undefined) delete process.env.CODEWHALE_CU_APP_BUNDLE; else process.env.CODEWHALE_CU_APP_BUNDLE = old;
+    fs.rmSync(bundle, { recursive: true, force: true });
+  }
 });

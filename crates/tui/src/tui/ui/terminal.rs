@@ -154,30 +154,6 @@ pub(crate) fn validate_foreground_process_group(
     ))
 }
 
-/// One side of the raw-mode probe abandonment handshake between the startup
-/// probe timeout and the blocking `enable_raw_mode` task finishing late.
-///
-/// Each side publishes its own flag (`publish`), then checks whether the
-/// other side's flag (`check`) is already up; a `true` return means this
-/// side must disable raw mode again. `SeqCst` ordering guarantees that when
-/// both sides run, at least one observes the other's flag, so a raw-mode
-/// enable landing after the probe timeout is always undone. Both sides
-/// observing each other is fine — a duplicate `disable_raw_mode` is a no-op.
-pub(crate) fn raw_mode_probe_handshake(publish: &AtomicBool, check: &AtomicBool) -> bool {
-    publish.store(true, Ordering::SeqCst);
-    check.load(Ordering::SeqCst)
-}
-
-pub(crate) fn terminal_probe_timeout(config: &Config) -> Duration {
-    let timeout_ms = config
-        .tui
-        .as_ref()
-        .and_then(|tui| tui.terminal_probe_timeout_ms)
-        .unwrap_or(DEFAULT_TERMINAL_PROBE_TIMEOUT_MS)
-        .clamp(100, 5_000);
-    Duration::from_millis(timeout_ms)
-}
-
 pub(crate) fn subagent_terminal_projection_from_mailbox(
     message: &MailboxMessage,
 ) -> Option<(&str, SubAgentStatus, Option<String>)> {
@@ -243,6 +219,9 @@ pub(crate) fn enter_alt_screen<W: Write>(writer: &mut W) -> io::Result<()> {
 
 /// Leave the alternate screen; the counterpart of [`enter_alt_screen`].
 pub(crate) fn leave_alt_screen<W: Write>(writer: &mut W) -> io::Result<()> {
+    if crate::tui::mark::kitty_graphics_supported() {
+        crate::tui::pet_watch::clear_images(writer)?;
+    }
     execute!(writer, LeaveAlternateScreen)?;
     set_live_alt_screen(false);
     Ok(())
@@ -361,9 +340,6 @@ pub(crate) fn switch_screen_mode(
 
     // Either way the screen changed underneath the app: repaint.
     app.needs_redraw = true;
-    // A rebuilt terminal drops sixel pixels with the old screen; forget the
-    // live image so the reconciler re-emits it onto the new one.
-    app.launch.sixel_emitted = None;
     if outcome.is_ok() {
         app.screen_mode = target;
         // Mouse capture is a per-screen answer (inline leaves selection to
@@ -640,6 +616,9 @@ pub(crate) fn disable_alternate_scroll_mode<W: Write>(writer: &mut W) {
 /// raw mode + kitty keyboard flags cleared, which is what causes the
 /// `^[[>5u` shell pollution reported in #1583.
 pub fn emergency_restore_terminal() {
+    if crate::tui::mark::kitty_graphics_supported() {
+        let _ = crate::tui::pet_watch::clear_images(&mut std::io::stdout());
+    }
     let mut stdout = std::io::stdout();
     crate::tui::cursor_accent::restore_cursor_accent();
     pop_keyboard_enhancement_flags(&mut stdout);

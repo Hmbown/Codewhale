@@ -551,6 +551,110 @@
         "reasoning"
       ],
       "supports_reasoning": true
+    },
+    "kimi-for-coding": {
+      "id": "kimi-for-coding",
+      "provenance": "bundled",
+      "supports_reasoning": true,
+      "supported_parameters": [
+        "reasoning"
+      ]
+    },
+    "kimi-for-coding-highspeed": {
+      "id": "kimi-for-coding-highspeed",
+      "provenance": "bundled",
+      "supports_reasoning": true,
+      "supported_parameters": [
+        "reasoning"
+      ]
+    },
+    "kimi-k2.5": {
+      "id": "kimi-k2.5",
+      "provenance": "bundled",
+      "supports_reasoning": true,
+      "supported_parameters": [
+        "reasoning"
+      ]
+    },
+    "kimi-k2.6": {
+      "id": "kimi-k2.6",
+      "provenance": "bundled",
+      "supports_reasoning": true,
+      "supported_parameters": [
+        "reasoning"
+      ]
+    },
+    "qwen3.5-flash": {
+      "id": "qwen3.5-flash",
+      "provenance": "bundled",
+      "supports_reasoning": true,
+      "supported_parameters": [
+        "reasoning"
+      ]
+    },
+    "qwen3.5-plus": {
+      "id": "qwen3.5-plus",
+      "provenance": "bundled",
+      "supports_reasoning": true,
+      "supported_parameters": [
+        "reasoning"
+      ]
+    },
+    "qwen3.6-flash": {
+      "id": "qwen3.6-flash",
+      "provenance": "bundled",
+      "supports_reasoning": true,
+      "supported_parameters": [
+        "reasoning"
+      ]
+    },
+    "qwen3.6-plus": {
+      "id": "qwen3.6-plus",
+      "provenance": "bundled",
+      "supports_reasoning": true,
+      "supported_parameters": [
+        "reasoning"
+      ]
+    },
+    "qwen3.7-max": {
+      "id": "qwen3.7-max",
+      "provenance": "bundled",
+      "supports_reasoning": true,
+      "supported_parameters": [
+        "reasoning"
+      ]
+    },
+    "qwen3.7-plus": {
+      "id": "qwen3.7-plus",
+      "provenance": "bundled",
+      "supports_reasoning": true,
+      "supported_parameters": [
+        "reasoning"
+      ]
+    },
+    "qwen3.8-flash": {
+      "id": "qwen3.8-flash",
+      "provenance": "bundled",
+      "supports_reasoning": true,
+      "supported_parameters": [
+        "reasoning"
+      ]
+    },
+    "qwen3.8-max": {
+      "id": "qwen3.8-max",
+      "provenance": "bundled",
+      "supports_reasoning": true,
+      "supported_parameters": [
+        "reasoning"
+      ]
+    },
+    "qwen3.8-max-preview": {
+      "id": "qwen3.8-max-preview",
+      "provenance": "bundled",
+      "supports_reasoning": true,
+      "supported_parameters": [
+        "reasoning"
+      ]
     }
   },
   "fetched_at": "2026-07-06T00:00:00Z",

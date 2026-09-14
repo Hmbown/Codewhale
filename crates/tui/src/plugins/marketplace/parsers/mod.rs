@@ -169,18 +169,24 @@ fn detect_format(root: &Value) -> Result<MarketplaceFormat, MarketplaceDiagnosti
     }
 
     // Kimi: `id`-keyed entries with string sources.
-    if entry_markers
-        .iter()
-        .any(|m| m.has_id && matches!(m.source_kind, Some(SourceMarker::String)))
-    {
+    if entry_markers.iter().any(|m| {
+        m.has_id
+            && matches!(
+                m.source_kind,
+                Some(SourceMarker::String | SourceMarker::UrlString)
+            )
+    }) {
         return Ok(MarketplaceFormat::Kimi);
     }
 
     // Codewhale: `name` entries with install-spec string sources.
-    if entry_markers
-        .iter()
-        .any(|m| m.has_name && matches!(m.source_kind, Some(SourceMarker::InstallSpec)))
-    {
+    if entry_markers.iter().any(|m| {
+        m.has_name
+            && matches!(
+                m.source_kind,
+                Some(SourceMarker::InstallSpec | SourceMarker::UrlString)
+            )
+    }) {
         return Ok(MarketplaceFormat::Codewhale);
     }
 
@@ -202,6 +208,7 @@ struct MapMarker {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SourceMarker {
     String,
+    UrlString,
     InstallSpec,
     Github,
     Url,
@@ -218,6 +225,8 @@ fn source_marker(source: &Value) -> SourceMarker {
         Value::String(s) => {
             if s.starts_with("github:") || s.starts_with("path:") {
                 SourceMarker::InstallSpec
+            } else if s.starts_with("https://") || s.starts_with("http://") {
+                SourceMarker::UrlString
             } else {
                 SourceMarker::String
             }

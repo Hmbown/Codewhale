@@ -452,55 +452,44 @@ pub fn max_output_tokens_for_model(model: &str) -> Option<u32> {
     }
 }
 
+/// Catalog-first reasoning capability. `None` means no catalog row and no
+/// remaining cited fallback — unknown, not "not a reasoning model".
+///
+/// Prefer this over [`model_supports_reasoning`] when the caller can surface
+/// unknown the way unknown cost already is. The bool wrapper still defaults
+/// unknown to `false` for existing stream/UI gates.
 #[must_use]
-pub fn model_supports_reasoning(model: &str) -> bool {
+pub fn model_reasoning_capability(model: &str) -> Option<bool> {
     if let Some(supports_reasoning) = crate::model_catalog::resolved_supports_reasoning(model) {
-        return supports_reasoning;
+        return Some(supports_reasoning);
     }
     let lower = model.to_lowercase();
     if canonical_official_deepseek_model_id(&lower).is_some() {
-        return true;
+        return Some(true);
     }
-    // #3016 plus the 2026 Kimi Code K2.7 update: Moonshot-native Kimi IDs,
-    // including the stable `kimi-for-coding` coding route, emit
-    // reasoning_content that must stay out of answer prose.
+    // Remaining prefix/list arms have no catalog row yet. They stay until
+    // each family is fully sourced (#6032 part 2). Do not invent rows.
     if lower.starts_with("kimi-") {
-        return true;
+        return Some(true);
     }
     if lower.starts_with("mistral-medium")
         || lower.starts_with("mistral-small")
         || lower.starts_with("magistral")
     {
-        return true;
+        return Some(true);
     }
-    matches!(
+    let listed = matches!(
         lower.as_str(),
-        "claude-opus-4-8"
-            | "claude-opus-5"
-            | "claude-sonnet-4-6"
-            | "claude-sonnet-5"
-            | "claude-fable-5"
-            | "gpt-5-codex"
-            | "gpt-5.3-codex"
-            | "trinity-mini"
-            | "arcee-ai/trinity-large-thinking"
-            | "trinity-large-thinking"
+        "arcee-ai/trinity-large-thinking"
             | "thinkingmachines/inkling"
             | "google/gemma-4-31b-it"
             | "google/gemma-4-31b-it:free"
             | "google/gemma-4-26b-a4b-it"
             | "google/gemma-4-26b-a4b-it:free"
-            | "moonshotai/kimi-k2.7-code"
             | "moonshotai/kimi-k2.7-code-highspeed"
             | "moonshotai/kimi-k2.6"
             | "moonshotai/kimi-k2.6:free"
-            | "kimi-k2.7-code"
-            | "kimi-k2.6"
-            | "kimi-for-coding"
-            | "minimax/minimax-m3"
-            | "minimax/minimax-m2.7"
             | "minimax-m3"
-            | "minimax-m2.7"
             | "minimax-m2.7-highspeed"
             | "minimax-m2.5"
             | "minimax-m2.5-highspeed"
@@ -511,56 +500,32 @@ pub fn model_supports_reasoning(model: &str) -> bool {
             | "nvidia/nemotron-3-ultra-550b-a55b"
             | "nvidia/nemotron-3-ultra-550b-a55b:free"
             | "qwen/qwen3.8-flash"
-            | "qwen/qwen3.6-flash"
             | "qwen/qwen3.6-35b-a3b"
             | "qwen/qwen3.6-max-preview"
             | "qwen/qwen3.6-27b"
             | "qwen/qwen3.6-plus"
             | "qwen/qwen3.7-plus"
-            // Bare qwen3.x ids are Alibaba Cloud Model Studio's own model ids
-            // (Token Plan / Coding Plan catalogs). Per Model Studio's
-            // deep-thinking docs these are hybrid-thinking models that stream
-            // `reasoning_content` (OpenAI dialect) or thinking blocks
-            // (Anthropic dialect); qwen3.7/3.6/3.5 families default thinking
-            // ON server-side. Bare `qwen3.8-flash` is the OpenRouter short
-            // id (reasoning: true on models.dev 2026-08-26), not a Model
-            // Studio family default.
-            | "qwen3.8-max"
-            | "qwen3.8-max-preview"
-            | "qwen3.8-flash"
-            | "qwen3.7-max"
-            | "qwen3.7-plus"
-            | "qwen3.6-plus"
-            | "qwen3.6-flash"
-            | "qwen3.5-plus"
-            | "qwen3.5-flash"
             | "tencent/hy3-preview"
             | "xiaomi/mimo-v2.5-pro"
             | "xiaomi/mimo-v2.5"
-            | "mimo-v2.5-pro"
-            | "mimo-v2.5-pro-ultraspeed"
-            | "mimo-v2.5"
             | "z-ai/glm-5.1"
-            | "z-ai/glm-5.2"
-            | "z-ai/glm-5.3"
-            | "z-ai/glm-5.3-flash"
             | "z-ai/glm-5-turbo"
             | "glm-5.1"
-            | "glm-5.2"
-            | "glm-5.3"
-            | "glm-5.3-flash"
             | "glm-5-turbo"
             | "grok-4.6"
             | "grok-4.5"
             | "grok-4.3"
             | "grok-build"
             | "grok-4.20-0309-reasoning"
-            | "muse-spark-1.1"
-            | "muse-spark-1.2"
-            | "muse-spark-1.2-contributor"
     ) || is_openai_gpt_55_api_model(&lower)
         || is_openai_gpt_56_api_model(&lower)
-        || is_openai_codex_model(&lower)
+        || is_openai_codex_model(&lower);
+    listed.then_some(true)
+}
+
+#[must_use]
+pub fn model_supports_reasoning(model: &str) -> bool {
+    model_reasoning_capability(model).unwrap_or(false)
 }
 
 /// Contributor tier of Muse Spark 1.2 is a distinct selectable id with
@@ -627,7 +592,7 @@ pub fn has_date_snapshot_suffix(model_lower: &str, prefix: &str) -> bool {
 /// The context window a model name's `_Nk` suffix advertises, when the
 /// catalog does not already describe the model (#5441).
 ///
-/// Exposed separately from [`explicit_context_window_hint`] because the
+/// Exposed separately from `explicit_context_window_hint` because the
 /// honesty surfaces need to know *whether the number they are holding came
 /// from the name* — a naming convention the serving engine may ignore is not
 /// a fact about the route, and every surface that shows such a window must
@@ -805,6 +770,88 @@ mod tests {
     use super::*;
     use std::any::TypeId;
     use std::collections::BTreeMap;
+
+    /// #6032: `model_supports_reasoning` consults the catalog before its
+    /// hand-maintained pile, so a literal arm that duplicates a catalog row is
+    /// unreachable. These 27 arms were exactly that and were deleted. They must
+    /// keep answering `true` from the catalog *alone* — if a row is ever
+    /// dropped, this fails loudly here rather than silently reverting them to
+    /// "reasoning not expected", which leaks their `reasoning_content` into
+    /// ordinary prose (#6044).
+    #[test]
+    fn unknown_reasoning_capability_is_observable() {
+        assert_eq!(
+            model_reasoning_capability("not-a-real-model-xyz"),
+            None,
+            "unknown must not collapse to false at this layer"
+        );
+        assert!(
+            !model_supports_reasoning("not-a-real-model-xyz"),
+            "legacy bool wrapper still defaults unknown to false"
+        );
+        assert_eq!(model_reasoning_capability("kimi-for-coding"), Some(true));
+    }
+
+    #[test]
+    fn catalog_alone_covers_the_models_removed_from_the_heuristic_pile() {
+        let removed = [
+            "claude-opus-4-8",
+            "claude-opus-5",
+            "claude-sonnet-4-6",
+            "claude-sonnet-5",
+            "claude-fable-5",
+            "gpt-5-codex",
+            "gpt-5.3-codex",
+            "trinity-mini",
+            "trinity-large-thinking",
+            "moonshotai/kimi-k2.7-code",
+            "kimi-k2.7-code",
+            "minimax/minimax-m3",
+            "minimax/minimax-m2.7",
+            "minimax-m2.7",
+            "qwen/qwen3.6-flash",
+            "mimo-v2.5",
+            "mimo-v2.5-pro",
+            "mimo-v2.5-pro-ultraspeed",
+            "z-ai/glm-5.2",
+            "z-ai/glm-5.3",
+            "z-ai/glm-5.3-flash",
+            "glm-5.2",
+            "glm-5.3",
+            "glm-5.3-flash",
+            "muse-spark-1.1",
+            "muse-spark-1.2",
+            "muse-spark-1.2-contributor",
+            // Part 2: cited qwen3.x / Kimi coding-route arms moved into the
+            // bundled catalog (Alibaba Cloud Model Studio deep-thinking docs;
+            // #3016 plus the 2026 K2.7 update).
+            "kimi-for-coding",
+            "kimi-for-coding-highspeed",
+            "kimi-k2.5",
+            "kimi-k2.6",
+            "qwen3.5-flash",
+            "qwen3.5-plus",
+            "qwen3.6-flash",
+            "qwen3.6-plus",
+            "qwen3.7-max",
+            "qwen3.7-plus",
+            "qwen3.8-flash",
+            "qwen3.8-max",
+            "qwen3.8-max-preview",
+        ];
+        for model in removed {
+            assert_eq!(
+                crate::model_catalog::resolved_supports_reasoning(model),
+                Some(true),
+                "{model} no longer has a catalog row, but its heuristic arm was \
+                 deleted in #6032 — restore the row, or put the arm back"
+            );
+            assert!(
+                model_supports_reasoning(model),
+                "{model} must still classify as reasoning-capable"
+            );
+        }
+    }
 
     #[test]
     fn output_limit_stop_reason_accepts_provider_aliases_only() {

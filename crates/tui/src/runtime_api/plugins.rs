@@ -64,6 +64,10 @@ pub(super) struct PluginSummaryEntry {
     pub(super) id: String,
     pub(super) name: String,
     pub(super) display_name: Option<String>,
+    pub(super) icon: Option<String>,
+    pub(super) author: Option<String>,
+    pub(super) homepage: Option<String>,
+    pub(super) platforms: Vec<String>,
     pub(super) version: String,
     pub(super) description: Option<String>,
     pub(super) scope: &'static str,
@@ -133,8 +137,6 @@ pub(super) struct PluginReviewPayload {
 pub(super) struct PluginDetailResponse {
     #[serde(flatten)]
     pub(super) summary: PluginSummaryEntry,
-    pub(super) author: Option<String>,
-    pub(super) homepage: Option<String>,
     pub(super) repository: Option<String>,
     pub(super) license: Option<String>,
     pub(super) keywords: Vec<String>,
@@ -242,6 +244,15 @@ fn plugin_summary(plugin: &LoadedPlugin) -> PluginSummaryEntry {
         id: plugin.id.as_str().to_string(),
         name: plugin.name().to_string(),
         display_name: plugin.manifest.plugin.display_name.clone(),
+        icon: plugin.manifest.plugin.icon.clone(),
+        author: plugin.manifest.plugin.author.clone(),
+        homepage: plugin.manifest.plugin.homepage.clone(),
+        platforms: plugin
+            .manifest
+            .when
+            .as_ref()
+            .and_then(|when| when.os.clone())
+            .unwrap_or_default(),
         version: plugin.manifest.plugin.version.clone(),
         description: plugin.manifest.plugin.description.clone(),
         scope: plugin.scope.as_str(),
@@ -347,8 +358,6 @@ fn review_payload(plugin: &LoadedPlugin) -> PluginReviewPayload {
 fn plugin_detail(plugin: &LoadedPlugin) -> PluginDetailResponse {
     PluginDetailResponse {
         summary: plugin_summary(plugin),
-        author: plugin.manifest.plugin.author.clone(),
-        homepage: plugin.manifest.plugin.homepage.clone(),
         repository: plugin.manifest.plugin.repository.clone(),
         license: plugin.manifest.plugin.license.clone(),
         keywords: plugin.manifest.plugin.keywords.clone(),
@@ -386,7 +395,16 @@ async fn run_plugin_mutation(
     let mut registry = (*registry_for_state(state)).clone();
     let receipt = crate::plugins::mutation::execute(request, &ctx, &mut registry)
         .await
-        .map_err(|error| ApiError::internal(format!("plugin mutation failed: {error:#}")))?;
+        .map_err(|error| {
+            if error
+                .downcast_ref::<crate::plugins::install::PluginNameConflict>()
+                .is_some()
+            {
+                ApiError::conflict(format!("plugin mutation failed: {error:#}"))
+            } else {
+                ApiError::internal(format!("plugin mutation failed: {error:#}"))
+            }
+        })?;
 
     // Policy outcomes are not server errors: report the blocked host with
     // the same wording the skill lifecycle API uses.
@@ -553,6 +571,8 @@ pub(super) struct MarketplaceInstallPlanEntry {
 pub(super) struct MarketplaceCandidateEntry {
     pub(super) name: String,
     pub(super) display_name: Option<String>,
+    pub(super) icon: Option<String>,
+    pub(super) platforms: Vec<String>,
     pub(super) description: Option<String>,
     pub(super) version: Option<String>,
     pub(super) author: Option<String>,
@@ -564,6 +584,8 @@ pub(super) struct MarketplaceCandidateEntry {
     pub(super) tier: String,
     pub(super) compatibility: Option<&'static str>,
     pub(super) install: MarketplaceInstallPlanEntry,
+    /// Name occupancy, not an assertion that the catalog and local bytes match.
+    pub(super) existing_plugin: Option<PluginSummaryEntry>,
     pub(super) diagnostics: Vec<PluginDiagnosticEntry>,
 }
 
@@ -599,14 +621,25 @@ pub(super) struct MarketplaceActionResponse {
 fn marketplace_candidate_entry(
     entry: &crate::plugins::marketplace::store::StoredMarketplaceCatalog,
     candidate: &crate::plugins::marketplace::types::MarketplaceCandidate,
+    registry: &crate::plugins::PluginRegistry,
 ) -> MarketplaceCandidateEntry {
-    let install = match resolve_candidate_install(entry, candidate) {
+    let mut existing_plugin = None;
+    let install = match resolve_candidate_install(entry, candidate, registry) {
         CatalogInstallResolution::Supported { spec, source_kind } => MarketplaceInstallPlanEntry {
             installable: true,
             spec: Some(spec),
             source_kind: Some(source_kind),
             reason: None,
         },
+        CatalogInstallResolution::AlreadyPresent { plugin, reason } => {
+            existing_plugin = Some(plugin_summary(plugin));
+            MarketplaceInstallPlanEntry {
+                installable: false,
+                spec: None,
+                source_kind: None,
+                reason: Some(reason),
+            }
+        }
         CatalogInstallResolution::Unsupported { reason } => MarketplaceInstallPlanEntry {
             installable: false,
             spec: None,
@@ -623,6 +656,12 @@ fn marketplace_candidate_entry(
     MarketplaceCandidateEntry {
         name: candidate.name.clone(),
         display_name: candidate.display_name.clone(),
+        icon: candidate.icon.clone(),
+        platforms: candidate
+            .when
+            .as_ref()
+            .and_then(|when| when.os.clone())
+            .unwrap_or_default(),
         description: candidate.description.clone(),
         version: candidate.version.clone(),
         author: candidate.author.clone(),
@@ -634,6 +673,7 @@ fn marketplace_candidate_entry(
         tier: candidate.provenance.tier.to_string(),
         compatibility: candidate.compatibility.as_ref().map(|c| c.as_str()),
         install,
+        existing_plugin,
         diagnostics: candidate
             .diagnostics
             .iter()
@@ -653,6 +693,7 @@ fn marketplace_candidate_entry(
 fn marketplace_catalog_entry(
     name: &str,
     entry: &crate::plugins::marketplace::store::StoredMarketplaceCatalog,
+    registry: &crate::plugins::PluginRegistry,
 ) -> MarketplaceCatalogEntry {
     MarketplaceCatalogEntry {
         name: name.to_string(),
@@ -683,7 +724,7 @@ fn marketplace_catalog_entry(
             .catalog
             .candidates
             .iter()
-            .map(|candidate| marketplace_candidate_entry(entry, candidate))
+            .map(|candidate| marketplace_candidate_entry(entry, candidate, registry))
             .collect(),
     }
 }
@@ -831,11 +872,12 @@ pub(super) async fn list_marketplaces(
 ) -> Result<Json<MarketplacesResponse>, ApiError> {
     let store = open_marketplace_store(&state)?;
     let marketplace_state = load_marketplace_state(&store)?;
+    let registry = registry_for_state(&state);
     Ok(Json(MarketplacesResponse {
         marketplaces: marketplace_state
             .catalogs()
             .iter()
-            .map(|(name, entry)| marketplace_catalog_entry(name, entry))
+            .map(|(name, entry)| marketplace_catalog_entry(name, entry, &registry))
             .collect(),
     }))
 }
@@ -850,7 +892,11 @@ pub(super) async fn get_marketplace(
     let entry = marketplace_state
         .get(&name)
         .ok_or_else(|| ApiError::not_found(format!("marketplace '{name}' not found")))?;
-    Ok(Json(marketplace_catalog_entry(&name, entry)))
+    Ok(Json(marketplace_catalog_entry(
+        &name,
+        entry,
+        &registry_for_state(&state),
+    )))
 }
 
 /// `POST /v1/apps/marketplaces`
@@ -921,7 +967,8 @@ pub(super) async fn install_marketplace_candidate_api(
                 req.candidate
             ))
         })?;
-    match resolve_candidate_install(entry, candidate) {
+    let registry = registry_for_state(&state);
+    match resolve_candidate_install(entry, candidate, &registry) {
         CatalogInstallResolution::Supported { spec, .. } => {
             let response = run_plugin_mutation(
                 &state,
@@ -938,6 +985,7 @@ pub(super) async fn install_marketplace_candidate_api(
             .await?;
             Ok((StatusCode::CREATED, Json(response)))
         }
+        CatalogInstallResolution::AlreadyPresent { reason, .. } => Err(ApiError::conflict(reason)),
         CatalogInstallResolution::Unsupported { reason } => Err(ApiError::conflict(format!(
             "candidate '{}' cannot be installed by Codewhale: {reason}",
             req.candidate

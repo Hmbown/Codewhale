@@ -1,0 +1,115 @@
+name: Web Frontend
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Lint & Type Check
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: 'npm'
+          cache-dependency-path: web/package-lock.json
+      - name: Install dependencies
+        run: npm ci
+      - name: Run tests
+        run: npm test
+      - name: Check web surface
+        # The shared gate checks committed facts before generating build inputs.
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: npm run check
+
+  deploy-reminder:
+    name: Deployment approval needed
+    runs-on: ubuntu-latest
+    needs: lint
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    steps:
+      - name: Surface the manual deployment gate
+        env:
+          REVISION: ${{ github.sha }}
+        run: |
+          echo "::notice title=Web deployment approval needed::Revision ${REVISION} passed the web gates but is not deployed. Dispatch web.yml on main to publish it."
+          {
+            echo "## Web deployment approval needed"
+            echo
+            echo "Revision \`${REVISION}\` passed the web gates but has **not** been deployed."
+            echo
+            echo "A maintainer can publish it with \`gh workflow run web.yml --repo Hmbown/CodeWhale --ref main\`."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  deploy:
+    name: Deploy to Cloudflare
+    runs-on: ubuntu-latest
+    needs: lint
+    # Deploy is MANUAL ONLY: a human dispatches this workflow on main. Pushes
+    # and pull requests still run `lint` above, but they never reach Cloudflare.
+    # This mirrors scripts/check-cloudflare-deploy-env.mjs, which fails closed
+    # unless GITHUB_EVENT_NAME is workflow_dispatch, GITHUB_REF is
+    # refs/heads/main, and GITHUB_SHA is an exact 40-hex revision — a push
+    # trigger here would only produce a red job after `lint` had already run.
+    # lib/deploy-preflight.test.ts asserts both halves of that contract.
+    # `needs: lint` is the gate: facts drift, docs parity, tests, ESLint, tsc,
+    # and a production build all pass before anything reaches Cloudflare.
+    if: >-
+      github.event_name == 'workflow_dispatch'
+      && github.ref == 'refs/heads/main'
+    # Serialize deploys so two dispatches landing close together cannot race and
+    # leave Cloudflare serving the older bundle. Never cancel in progress: a
+    # half-finished OpenNext upload is worse than a queued one.
+    concurrency:
+      group: deploy-codewhale-web
+      cancel-in-progress: false
+    defaults:
+      run:
+        working-directory: web
+    env:
+      CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+    steps:
+      - uses: actions/checkout@v7
+        # Pin the checkout to the exact revision this dispatch resolved, so the
+        # SHA reported to compare:deployed-facts and asserted on the public
+        # receipt below is the SHA that was actually built, even if main moves
+        # while the run is queued behind the concurrency group.
+        with:
+          ref: ${{ github.sha }}
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: 'npm'
+          cache-dependency-path: web/package-lock.json
+      - name: Install dependencies
+        run: npm ci
+      - name: Record deployed/source drift
+        # Read-only and credential-free. A mismatch is the normal state here —
+        # it is the gap this run is about to close — so this step reports
+        # without gating. The real assertion is the post-deploy verification
+        # below, which must observe this exact revision on the public receipt.
+        run: npm run compare:deployed-facts -- --expected-revision "$GITHUB_SHA"
+      - name: Check Cloudflare deploy environment
+        run: npm run check:deploy-env
+      # npm's deploy script performs one OpenNext build, then deploys that exact
+      # bundle. Wrangler must not run a custom post-cache build: OpenNext
+      # populates the remote cache before it hands the bundle to Wrangler.
+      - name: Build and deploy exact OpenNext bundle
+        run: npm run deploy
+      - name: Verify exact deployed revision
+        # The public /api/facts receipt must identify this workflow's exact
+        # checkout before the manual deployment run can finish green.
+        run: npm run check:deployed-facts -- --expected-revision "$GITHUB_SHA" --attempts 10 --retry-delay-ms 3000

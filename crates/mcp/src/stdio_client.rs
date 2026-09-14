@@ -1622,12 +1622,8 @@ while IFS= read -r line; do
   esac
 done
 "#;
-        let client = ChildProcessMcpClient::spawn_with_timeouts(
-            &config("/bin/sh", &["-c", script]),
-            Duration::from_secs(2),
-            Duration::from_millis(250),
-        )
-        .expect("handshake");
+        let client =
+            ChildProcessMcpClient::spawn(&config("/bin/sh", &["-c", script])).expect("handshake");
 
         let tools_error = client.list_tools().unwrap_err();
         assert!(

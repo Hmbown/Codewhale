@@ -10,6 +10,8 @@ pub mod external_credentials;
 pub mod model_reference;
 pub mod models_dev;
 pub mod notifications;
+mod opencode_go;
+pub use opencode_go::{opencode_go_endpoint_key, opencode_go_model_id, opencode_go_models};
 pub mod persistence;
 pub mod pricing;
 pub mod provider;
@@ -193,6 +195,16 @@ pub struct ProviderConfigToml {
         alias = "contextLength"
     )]
     pub context_window: Option<u32>,
+    /// Per-model context-window overrides keyed by exact wire model id
+    /// (`[providers.<id>.model_context_windows]`, #6108). A matching entry
+    /// wins over this provider's `context_window` for that model only, so one
+    /// gateway can front models with heterogeneous windows.
+    #[serde(
+        default,
+        skip_serializing_if = "BTreeMap::is_empty",
+        alias = "modelContextWindows"
+    )]
+    pub model_context_windows: BTreeMap<String, u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<String>,
     /// Wire dialect preference for dual-protocol vendors (DeepSeek, MiniMax,
@@ -249,6 +261,7 @@ impl ProviderConfigToml {
             && blank(self.base_url.as_ref())
             && blank(self.model.as_ref())
             && self.context_window.is_none()
+            && self.model_context_windows.is_empty()
             && blank(self.mode.as_ref())
             && blank(self.wire.as_ref())
             && blank(self.auth_mode.as_ref())
@@ -1068,6 +1081,21 @@ fn is_builtin_provider_config_id(provider_id: &str) -> bool {
         .any(|p| p.provider_config_key() == provider_id)
 }
 
+fn builtin_provider_kind_for_config_id(provider_id: &str) -> Option<ProviderKind> {
+    provider::all_providers()
+        .iter()
+        .map(|p| p.kind())
+        .find(|kind| kind.provider().provider_config_key() == provider_id)
+}
+
+/// Split `providers.<id>.model_context_windows.<model>` (#6108). The model leg
+/// is the whole remainder, so dotted wire ids like `qwen3.5` stay intact.
+fn parse_model_context_window_key(key: &str) -> Option<(&str, &str)> {
+    let (provider_id, field_key) = parse_custom_provider_config_key(key)?;
+    let model = field_key.strip_prefix("model_context_windows.")?;
+    (!model.is_empty()).then_some((provider_id, model))
+}
+
 /// Field legs a `[providers.<id>]` custom table accepts through
 /// `config set`, including the required `kind` marker.
 const CUSTOM_PROVIDER_FIELD_HINT: &str = "api_key, base_url, model, context_window, mode, wire, auth_mode, \
@@ -1753,6 +1781,10 @@ pub struct ToolsToml {
     /// Native tool names to keep loaded outside the default core catalog.
     #[serde(default)]
     pub always_load: Vec<String>,
+    /// Runtime-owned tool settings must survive dispatcher reads and saves.
+    /// Their validation belongs to the runtime's ToolsConfig, not this facade.
+    #[serde(flatten)]
+    pub extras: BTreeMap<String, toml::Value>,
 }
 
 /// On-disk schema for the `[snapshots]` table (#137). See
@@ -2910,6 +2942,84 @@ impl ConfigToml {
         table.remove(leg);
     }
 
+    /// Write one `[providers.<id>.model_context_windows]` entry (#6108),
+    /// whether `<id>` is a built-in provider key or a named custom table.
+    fn set_model_context_window(
+        &mut self,
+        provider_id: &str,
+        model: &str,
+        value: &str,
+    ) -> Result<()> {
+        if model.eq_ignore_ascii_case("auto")
+            || model.chars().any(|c| c.is_whitespace() || c.is_control())
+        {
+            bail!("invalid model id for `model_context_windows`");
+        }
+        let window = parse_context_window(value)?;
+        if let Some(kind) = builtin_provider_kind_for_config_id(provider_id) {
+            self.providers
+                .for_provider_mut(kind)
+                .model_context_windows
+                .insert(model.to_string(), window);
+            return Ok(());
+        }
+        let table = self.custom_provider_table_mut(provider_id)?;
+        let windows = table
+            .entry("model_context_windows".to_string())
+            .or_insert_with(|| toml::Value::Table(toml::value::Table::new()));
+        windows
+            .as_table_mut()
+            .with_context(|| {
+                format!("providers.{provider_id}.model_context_windows must be a table")
+            })?
+            .insert(model.to_string(), toml::Value::Integer(i64::from(window)));
+        Ok(())
+    }
+
+    fn model_context_window_value(&self, provider_id: &str, model: &str) -> Option<String> {
+        if let Some(kind) = builtin_provider_kind_for_config_id(provider_id) {
+            return self
+                .providers
+                .for_provider(kind)
+                .model_context_windows
+                .get(model)
+                .map(u32::to_string);
+        }
+        self.providers
+            .extras
+            .get(provider_id)?
+            .as_table()?
+            .get("model_context_windows")?
+            .as_table()?
+            .get(model)?
+            .as_integer()
+            .map(|value| value.to_string())
+    }
+
+    fn unset_model_context_window(&mut self, provider_id: &str, model: &str) {
+        if let Some(kind) = builtin_provider_kind_for_config_id(provider_id) {
+            self.providers
+                .for_provider_mut(kind)
+                .model_context_windows
+                .remove(model);
+            return;
+        }
+        if let Some(table) = self
+            .providers
+            .extras
+            .get_mut(provider_id)
+            .and_then(toml::Value::as_table_mut)
+            && let Some(windows) = table
+                .get_mut("model_context_windows")
+                .and_then(toml::Value::as_table_mut)
+        {
+            windows.remove(model);
+            if windows.is_empty() {
+                table.remove("model_context_windows");
+            }
+        }
+    }
+
     /// Bind the raw selector after deserializing a document. Exact custom
     /// tables take precedence over built-in aliases, and regional spellings
     /// survive later typed saves. This does not apply environment overrides.
@@ -2999,6 +3109,9 @@ impl ConfigToml {
                     .display(setting),
             );
         }
+        if let Some((provider_id, model)) = parse_model_context_window_key(key) {
+            return self.model_context_window_value(provider_id, model);
+        }
         if let Some((provider, field)) = parse_provider_config_key(key) {
             return get_provider_config_value(self.providers.for_provider(provider), field);
         }
@@ -3034,7 +3147,14 @@ impl ConfigToml {
                 .as_ref()
                 .and_then(|sinks| sinks.unix_socket_path.as_ref())
                 .map(|path| path.display().to_string()),
-            _ => self.extras.get(key).map(toml::Value::to_string),
+            _ => self
+                .extras
+                .get(key)
+                .map(toml::Value::to_string)
+                .or_else(|| {
+                    let document = toml::Value::try_from(self).ok()?;
+                    config_value_at_path(&document, key).map(toml::Value::to_string)
+                }),
         }
     }
 
@@ -3055,6 +3175,9 @@ impl ConfigToml {
     pub fn get_display_value(&self, key: &str) -> Option<String> {
         if notifications::in_namespace(key) {
             return self.get_value(key);
+        }
+        if let Some((provider_id, model)) = parse_model_context_window_key(key) {
+            return self.model_context_window_value(provider_id, model);
         }
         if let Some((provider, field)) = parse_provider_config_key(key) {
             return get_provider_config_display_value(self.providers.for_provider(provider), field);
@@ -3085,6 +3208,22 @@ impl ConfigToml {
 
         if let Some(value) = self.extras.get(key) {
             return Some(redact_toml_value_for_display(key, value));
+        }
+
+        // Table and nested lookups use the same recursively redacted tree as
+        // `config dump`; a parent such as `credentials` must keep its children
+        // secret even when the requested leaf itself has an innocuous name.
+        let document = self.redacted_toml_value();
+        if let Some(value) = config_value_at_path(&document, key)
+            && (value.is_table() || value.is_array() || key.contains('.'))
+            && !matches!(key, "tui.stream_chunk_timeout_secs")
+        {
+            return Some(
+                value
+                    .as_str()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| value.to_string()),
+            );
         }
 
         self.get_value(key).map(|value| {
@@ -3133,6 +3272,9 @@ impl ConfigToml {
         }) {
             bail!(LEGACY_ANTIGRAVITY_TOMBSTONE_MESSAGE);
         }
+        if let Some((provider_id, model)) = parse_model_context_window_key(key) {
+            return self.set_model_context_window(provider_id, model, value);
+        }
         if let Some((provider, field)) = parse_provider_config_key(key) {
             return set_provider_config_value(self, provider, field, value);
         }
@@ -3175,6 +3317,14 @@ impl ConfigToml {
                     .get_or_insert_with(HookSinksToml::default)
                     .unix_socket_path = Some(PathBuf::from(value));
             }
+            // The MCP stdio dispatcher persists this established literal key
+            // as JSON text; it is not a nested TOML setting.
+            _ if key.contains('.') && key != "mcp.server_definitions" => {
+                let (table, field) = key.rsplit_once('.').expect("dotted key");
+                bail!(
+                    "`config set` does not support nested key `{key}`; edit `{field}` in the [{table}] table of config.toml instead (use a TOML value of the documented type). No value was changed."
+                );
+            }
             _ => {
                 self.extras
                     .insert(key.to_string(), toml::Value::String(value.to_string()));
@@ -3187,6 +3337,10 @@ impl ConfigToml {
         if notifications::in_namespace(key) {
             let setting = notifications::NotificationSetting::required(key)?;
             return notifications::edit_extras(&mut self.extras, setting, None);
+        }
+        if let Some((provider_id, model)) = parse_model_context_window_key(key) {
+            self.unset_model_context_window(provider_id, model);
+            return Ok(());
         }
         if let Some((provider, field)) = parse_provider_config_key(key) {
             unset_provider_config_value(self, provider, field);
@@ -4226,11 +4380,11 @@ pub fn known_foreign_model_owner(
 
 fn normalize_model_for_provider(provider: ProviderKind, model: &str) -> String {
     if matches!(provider, ProviderKind::OpencodeGo) {
-        // Canonicalize known Chat Completions ids. Unknown / Messages-only ids
+        // Canonicalize documented model ids. Unknown ids
         // must never be rewritten to the provider default — substituting a
         // different model is worse than letting the route layer reject the
         // request by the name the user actually configured.
-        return opencode_go_chat_model_id(model)
+        return opencode_go_model_id(model)
             .map(str::to_string)
             .unwrap_or_else(|| model.trim().to_string());
     }
@@ -4392,66 +4546,6 @@ fn normalize_model_for_provider(provider: ProviderKind, model: &str) -> String {
         ) => DEFAULT_DEEPINFRA_FLASH_MODEL.to_string(),
         _ => model.to_string(),
     }
-}
-
-/// OpenCode Go models reviewed for its OpenAI Chat Completions endpoint.
-///
-/// Keep config validation, picker/catalog projections, and live-roster
-/// sanitization on this one protocol-scoped contract. The provider's combined
-/// `/models` roster also contains Messages and Responses models, which are
-/// deliberately absent from this Chat-only route.
-///
-/// Reviewed against <https://opencode.ai/docs/go/#endpoints> on 2026-09-08.
-/// Previously reviewed IDs remain compatible absent explicit deprecation;
-/// live availability is established separately by the provider catalog.
-pub const OPENCODE_GO_CHAT_MODELS: &[&str] = &[
-    DEFAULT_OPENCODE_GO_MODEL,
-    OPENCODE_GO_GROK_4_5_MODEL,
-    OPENCODE_GO_GLM_5_2_MODEL,
-    OPENCODE_GO_GLM_5_1_MODEL,
-    OPENCODE_GO_KIMI_K3_MODEL,
-    OPENCODE_GO_KIMI_K2_7_CODE_MODEL,
-    OPENCODE_GO_KIMI_K2_6_MODEL,
-    OPENCODE_GO_DEEPSEEK_V4_FLASH_MODEL,
-    OPENCODE_GO_MIMO_V2_5_MODEL,
-    OPENCODE_GO_MIMO_V2_5_PRO_MODEL,
-    "glm-5.3-flash",
-    "glm-5.3",
-    "longcat-2.0",
-    "deepseek-v4-flash-vision-exp",
-    "hy4-preview",
-    "hy3",
-    "omen-alpha",
-];
-
-/// Canonicalize an OpenCode Go model that is documented for the OpenAI Chat
-/// Completions endpoint. The live `/models` roster also contains
-/// Messages and Responses models; returning `None` for those is the protocol
-/// cutline shared by config and the TUI live-catalog paths.
-#[must_use]
-pub fn opencode_go_chat_model_id(model: &str) -> Option<&'static str> {
-    let normalized = model.trim().to_ascii_lowercase().replace(['_', ' '], "-");
-    let normalized = normalized
-        .strip_prefix("opencode-go/")
-        .unwrap_or(&normalized);
-    let familiar_alias = match normalized {
-        "grok-4-5" => Some(OPENCODE_GO_GROK_4_5_MODEL),
-        "glm-5-2" => Some(OPENCODE_GO_GLM_5_2_MODEL),
-        "glm-5-1" => Some(OPENCODE_GO_GLM_5_1_MODEL),
-        "kimi-k2-7-code" => Some(OPENCODE_GO_KIMI_K2_7_CODE_MODEL),
-        "kimi-k2-6" => Some(OPENCODE_GO_KIMI_K2_6_MODEL),
-        "deepseek-v4pro" => Some(DEFAULT_OPENCODE_GO_MODEL),
-        "deepseek-v4flash" => Some(OPENCODE_GO_DEEPSEEK_V4_FLASH_MODEL),
-        "mimo-v2-5" => Some(OPENCODE_GO_MIMO_V2_5_MODEL),
-        "mimo-v2-5-pro" => Some(OPENCODE_GO_MIMO_V2_5_PRO_MODEL),
-        _ => None,
-    };
-    familiar_alias.or_else(|| {
-        OPENCODE_GO_CHAT_MODELS
-            .iter()
-            .copied()
-            .find(|candidate| *candidate == normalized)
-    })
 }
 
 fn canonical_xiaomi_mimo_model_id(model: &str) -> Option<&'static str> {
@@ -6934,6 +7028,12 @@ pub fn is_sensitive_config_key(key: &str) -> bool {
         || normalized.ends_with("_password")
         || normalized.ends_with("_secret")
         || normalized.ends_with("_token")
+}
+
+/// Resolve dotted paths without treating a dotted key as a top-level literal.
+fn config_value_at_path<'a>(value: &'a toml::Value, key: &str) -> Option<&'a toml::Value> {
+    key.split('.')
+        .try_fold(value, |value, part| value.get(part))
 }
 
 fn redact_toml_value_for_display(key: &str, value: &toml::Value) -> String {

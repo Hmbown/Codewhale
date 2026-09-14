@@ -41,6 +41,8 @@ pub struct StoredMarketplaceCatalog {
 pub struct MarketplaceState {
     schema_version: u32,
     #[serde(default)]
+    first_party_removed: bool,
+    #[serde(default)]
     catalogs: BTreeMap<String, StoredMarketplaceCatalog>,
 }
 
@@ -48,6 +50,7 @@ impl Default for MarketplaceState {
     fn default() -> Self {
         Self {
             schema_version: MARKETPLACE_SCHEMA_VERSION,
+            first_party_removed: false,
             catalogs: BTreeMap::new(),
         }
     }
@@ -90,15 +93,25 @@ impl MarketplaceStore {
     pub fn load(&self) -> Result<MarketplaceState, String> {
         validate_existing_plugin_state_parent(&self.path)?;
         let lock_path = state_lock_path(&self.path);
-        if path_entry_exists(&lock_path)? {
+        let mut state = if path_entry_exists(&lock_path)? {
             let lock_file = open_state_lock(&lock_path, false)?;
             let lock = fd_lock::RwLock::new(lock_file);
             let _guard = lock
                 .read()
                 .map_err(|e| format!("failed to read-lock marketplace state: {e}"))?;
-            return self.load_unlocked();
+            self.load_unlocked()?
+        } else {
+            self.load_unlocked()?
+        };
+        // Every surface consumes this same projection. Browsing is offline
+        // and read-only; installation and updates use the reviewed installer.
+        // A user's local catalog or removal always takes precedence.
+        if !state.first_party_removed && !state.catalogs.contains_key("codewhale") {
+            state
+                .catalogs
+                .insert("codewhale".into(), first_party_catalog()?);
         }
-        self.load_unlocked()
+        Ok(state)
     }
 
     fn load_unlocked(&self) -> Result<MarketplaceState, String> {
@@ -141,7 +154,14 @@ impl MarketplaceStore {
 
     /// Remove a catalog by name. `Ok(false)` means it was not stored.
     pub fn remove(&self, name: &str) -> Result<bool, String> {
-        self.mutate(|state| Ok(state.catalogs.remove(name).is_some()))
+        self.mutate(|state| {
+            let removed = state.catalogs.remove(name).is_some();
+            let bundled = name == "codewhale" && !state.first_party_removed;
+            if name == "codewhale" {
+                state.first_party_removed = true;
+            }
+            Ok(removed || bundled)
+        })
     }
 
     fn mutate<R>(
@@ -161,5 +181,98 @@ impl MarketplaceStore {
         let result = mutate(&mut next)?;
         save_state_with_hardener(&self.path, &next, harden_plugin_state_file)?;
         Ok(result)
+    }
+}
+
+fn first_party_catalog() -> Result<StoredMarketplaceCatalog, String> {
+    #[derive(Deserialize)]
+    struct Snapshot {
+        repository: String,
+        revision: String,
+        catalog: serde_json::Value,
+    }
+    let snapshot: Snapshot =
+        serde_json::from_str(include_str!("../../../assets/first-party-marketplace.json"))
+            .map_err(|error| format!("invalid bundled marketplace: {error}"))?;
+    let source = format!("{}/tree/{}", snapshot.repository, snapshot.revision);
+    let mut catalog = super::parsers::parse_catalog(super::parsers::MarketplaceDocument {
+        catalog_id: MarketplaceCatalogId::new("codewhale"),
+        format: super::types::MarketplaceFormat::Codewhale,
+        root: snapshot.catalog,
+        base: Some(source.clone()),
+    });
+    if catalog.error_count() > 0 {
+        return Err("bundled marketplace contains invalid entries".into());
+    }
+    catalog.provenance.tier = super::types::CatalogTier::Official;
+    catalog.provenance.source_url = Some(source.clone());
+    for candidate in &mut catalog.candidates {
+        candidate.provenance = catalog.provenance.clone();
+    }
+    Ok(StoredMarketplaceCatalog {
+        added_at: String::new(),
+        source_path: source,
+        catalog,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn bundled_catalog_is_offline_installable_and_removable_without_rewriting_plugin_state() {
+        let root = tempfile::tempdir().unwrap();
+        let state_path = root.path().join("plugins/state.json");
+        let store = MarketplaceStore::open(Some(&state_path)).unwrap();
+        let initial = store.load().unwrap();
+        let catalog = initial.get("codewhale").expect("first-party catalog");
+        assert_eq!(catalog.catalog.total_candidates(), 4);
+        assert_eq!(catalog.catalog.error_count(), 0);
+        assert_eq!(catalog.catalog.warning_count(), 0);
+        assert!(!catalog.catalog.provenance.grants_trust());
+        let registry = crate::plugins::PluginRegistry::empty(root.path());
+        for candidate in &catalog.catalog.candidates {
+            assert!(candidate.install_plan.is_supported());
+            assert!(!candidate.provenance.grants_trust());
+            let super::super::document::CatalogInstallResolution::Supported { spec, .. } =
+                super::super::document::resolve_candidate_install(catalog, candidate, &registry)
+            else {
+                panic!("uninstallable candidate")
+            };
+            assert!(
+                spec.starts_with(
+                    "https://codeload.github.com/Hmbown/codewhale-plugin-marketplace/"
+                )
+            );
+            assert!(spec.contains("#path="));
+        }
+        assert!(!store.path().exists(), "browsing must not write or fetch");
+        assert!(store.remove("codewhale").unwrap());
+        assert!(!store.remove("codewhale").unwrap());
+        assert!(store.load().unwrap().catalogs().is_empty());
+        assert!(
+            !state_path.exists(),
+            "catalog removal must not change plugin trust state"
+        );
+        let mut local = first_party_catalog().unwrap();
+        local.source_path = "/reviewed/local/marketplace.json".into();
+        store
+            .add(&MarketplaceCatalogId::new("codewhale"), local)
+            .unwrap();
+        assert_eq!(
+            store.load().unwrap().get("codewhale").unwrap().source_path,
+            "/reviewed/local/marketplace.json"
+        );
+    }
+
+    #[test]
+    fn malformed_store_is_not_hidden_by_bundled_catalog() {
+        let root = tempfile::tempdir().unwrap();
+        let store = MarketplaceStore::open(Some(&root.path().join("state.json"))).unwrap();
+        fs::write(store.path(), "broken").unwrap();
+        assert!(store.load().is_err());
+        assert_eq!(fs::read_to_string(store.path()).unwrap(), "broken");
     }
 }

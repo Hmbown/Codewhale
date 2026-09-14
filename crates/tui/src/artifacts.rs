@@ -4,7 +4,6 @@
 //! sessions keep a durable metadata index for resume/listing flows.
 
 use std::io;
-use std::io::Write;
 use std::path::Component;
 use std::path::Path;
 use std::path::PathBuf;
@@ -53,7 +52,7 @@ fn sanitize_id_component(input: &str) -> String {
         .collect()
 }
 
-fn is_valid_session_id(session_id: &str) -> bool {
+pub(crate) fn is_valid_session_id(session_id: &str) -> bool {
     !session_id.is_empty()
         && session_id
             .chars()
@@ -164,53 +163,48 @@ pub fn write_session_relative_immutable(
         session_artifact_absolute_path(session_id, relative_path).ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "invalid session artifact path")
         })?;
-    if let Some(parent) = absolute_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    if absolute_path.exists() {
-        return if std::fs::read(&absolute_path)? == content {
-            Ok(absolute_path)
-        } else {
-            Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                "immutable artifact handle already contains different bytes",
-            ))
-        };
-    }
-    let file_name = absolute_path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("artifact");
-    let temp_path = absolute_path.with_file_name(format!(
-        ".{file_name}.{}.{}.tmp",
-        std::process::id(),
-        uuid::Uuid::new_v4()
-    ));
-    let publish = (|| -> io::Result<()> {
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temp_path)?;
-        file.write_all(content)?;
-        file.sync_all()?;
-        match std::fs::hard_link(&temp_path, &absolute_path) {
-            Ok(()) => Ok(()),
-            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
-                if std::fs::read(&absolute_path)? == content {
-                    Ok(())
-                } else {
-                    Err(io::Error::new(
-                        io::ErrorKind::AlreadyExists,
-                        "immutable artifact handle raced with different bytes",
-                    ))
-                }
+    let destination = open_session_relative(session_id, relative_path, true)?;
+    match destination.publish(content) {
+        Ok(()) => {}
+        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+            use std::io::Read;
+            let mut existing = Vec::new();
+            destination
+                .open_file()?
+                .take(content.len() as u64 + 1)
+                .read_to_end(&mut existing)?;
+            if existing != content {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "immutable artifact handle already contains different bytes",
+                ));
             }
-            Err(err) => Err(err),
         }
-    })();
-    let _ = std::fs::remove_file(&temp_path);
-    publish?;
+        Err(err) => return Err(err),
+    }
     Ok(absolute_path)
+}
+
+/// The same confined session directory for mutable sidecars and immutable
+/// artifacts. The saved-session owner remains responsible for session state.
+pub(crate) fn open_session_relative(
+    session_id: &str,
+    relative_path: &Path,
+    create: bool,
+) -> io::Result<crate::fleet::files::WorkspaceFile> {
+    session_artifact_absolute_path(session_id, relative_path).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "invalid session artifact path")
+    })?;
+    let root = artifact_sessions_root()
+        .ok_or_else(|| io::Error::other("session artifact root unavailable"))?;
+    if create {
+        std::fs::create_dir_all(&root)?;
+    }
+    crate::fleet::files::WorkspaceFile::open(
+        &root,
+        &PathBuf::from(session_id).join(relative_path),
+        create,
+    )
 }
 
 pub fn write_session_artifact_immutable(
@@ -393,6 +387,29 @@ mod tests {
             .expect_err("handle aliasing must fail");
         assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
         assert_eq!(std::fs::read(first).unwrap(), bytes);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn immutable_session_artifact_rejects_symlinked_parent() {
+        let _guard = TEST_ARTIFACT_SESSIONS_GUARD
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let sessions = tmp.path().join("sessions");
+        let _root = set_test_sessions_root(sessions.clone());
+        std::fs::create_dir_all(&sessions).unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), sessions.join("session-a")).unwrap();
+        assert!(
+            write_session_relative_immutable(
+                "session-a",
+                Path::new("artifacts/handoff.json"),
+                b"private"
+            )
+            .is_err()
+        );
+        assert!(!outside.path().join("artifacts").exists());
     }
 
     #[test]

@@ -13,13 +13,16 @@ pub struct KeywordCandidate<'a> {
     pub keywords: &'a [String],
 }
 
-/// Return the index of the single candidate whose keyword matches `draft`.
+/// Return the candidate index and exact term that matched `draft`.
 ///
 /// Returns `None` when `draft` has fewer than 3 characters or nothing matches.
 /// Longer keywords take precedence; a keyword matches only when the occurrence
 /// is flanked by ASCII word boundaries.
-pub fn match_plugin_keyword(draft: &str, candidates: &[KeywordCandidate<'_>]) -> Option<usize> {
-    if draft.chars().count() < 3 {
+pub fn match_plugin_keyword(
+    draft: &str,
+    candidates: &[KeywordCandidate<'_>],
+) -> Option<(usize, String)> {
+    if draft.trim_start().starts_with('/') || draft.chars().count() < 3 {
         return None;
     }
     let draft_lc = draft.to_ascii_lowercase();
@@ -36,27 +39,58 @@ pub fn match_plugin_keyword(draft: &str, candidates: &[KeywordCandidate<'_>]) ->
     pairs
         .iter()
         .find(|(keyword, _)| keyword_matches(haystack, keyword.as_bytes()))
-        .map(|(_, idx)| *idx)
+        .map(|(keyword, idx)| (*idx, keyword.clone()))
 }
 
 fn effective_keywords(candidate: &KeywordCandidate<'_>) -> Vec<String> {
     let mut keywords = Vec::new();
     for keyword in candidate.keywords {
         let normalized = keyword.trim().to_ascii_lowercase();
-        if !normalized.is_empty() {
+        if is_specific_term(&normalized) {
             keywords.push(normalized);
         }
     }
     for domain in candidate.domains {
-        if let Some(normalized) = normalize_domain(domain) {
+        if let Some(normalized) = normalize_domain(domain)
+            && is_specific_term(&normalized)
+            && !matches!(
+                normalized.as_str(),
+                "github.com" | "gitlab.com" | "bitbucket.org"
+            )
+        {
             keywords.push(normalized);
         }
     }
     let name = candidate.name.trim().to_ascii_lowercase();
-    if !name.is_empty() {
+    if is_specific_term(&name) {
         keywords.push(name);
     }
     keywords
+}
+
+// Core vocabulary is not evidence that a user needs an integration. A
+// specific product name, phrase or domain is still eligible.
+fn is_specific_term(term: &str) -> bool {
+    term.chars().count() >= 3
+        && !term.chars().any(char::is_control)
+        && !matches!(
+            term,
+            "mcp"
+                | "plugin"
+                | "plugins"
+                | "skill"
+                | "skills"
+                | "agent"
+                | "agents"
+                | "tool"
+                | "tools"
+                | "data"
+                | "code"
+                | "model"
+                | "models"
+                | "session"
+                | "sessions"
+        )
 }
 
 pub(crate) fn normalize_domain(domain: &str) -> Option<String> {
@@ -104,6 +138,26 @@ fn is_word(byte: u8) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Existing selection tests assert the index; the receipt test below also
+    // checks the matched term carried through to the UI.
+    fn match_plugin_keyword(draft: &str, candidates: &[KeywordCandidate<'_>]) -> Option<usize> {
+        super::match_plugin_keyword(draft, candidates).map(|(index, _)| index)
+    }
+
+    #[test]
+    fn match_receipt_names_the_exact_trigger() {
+        let keywords = vec!["finance".to_string(), "mcp".to_string()];
+        let candidates = [candidate("kimi-datasource", &[], &keywords)];
+        assert_eq!(
+            super::match_plugin_keyword("help with finance", &candidates),
+            Some((0, "finance".into()))
+        );
+        assert_eq!(
+            super::match_plugin_keyword("help with mcp", &candidates),
+            None
+        );
+    }
 
     fn candidate<'a>(
         name: &'a str,
@@ -180,5 +234,38 @@ mod tests {
         let git = vec!["git".to_string()];
         let candidates = [candidate("git", &[], &git)];
         assert_eq!(match_plugin_keyword("git", &candidates), Some(0));
+    }
+
+    #[test]
+    fn core_vocabulary_short_claims_and_commands_do_not_trigger_suggestions() {
+        let words = [
+            "mcp", "plugin", "plugins", "skill", "skills", "agent", "agents", "tool", "tools",
+            "code", "data", "model", "models", "session", "sessions", "go", "ai",
+        ];
+        let keywords = words
+            .iter()
+            .map(|word| word.to_string())
+            .collect::<Vec<_>>();
+        let candidates = [candidate("mcp", &[], &keywords)];
+        for word in words {
+            assert_eq!(
+                match_plugin_keyword(&format!("please help with {word}"), &candidates),
+                None,
+                "{word}"
+            );
+        }
+        let shared_host = vec!["https://github.com/example/plugin".to_string()];
+        let candidates = [candidate("supabase", &shared_host, &[])];
+        assert_eq!(
+            match_plugin_keyword("open github.com/example/repo", &candidates),
+            None
+        );
+        for command in ["/mcp", "  /plugin show supabase", "/skills supabase"] {
+            assert_eq!(match_plugin_keyword(command, &candidates), None);
+        }
+        assert_eq!(
+            match_plugin_keyword("add supabase auth", &candidates),
+            Some(0)
+        );
     }
 }

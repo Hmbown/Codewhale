@@ -5,6 +5,7 @@
 //! bounded, or the pass is refused. See [`SURVIVAL_CONTRACT.md`].
 
 use anyhow::Result;
+use std::collections::HashSet;
 
 use codewhale_models::{ContentBlock, Message, SystemPrompt};
 
@@ -14,7 +15,6 @@ use super::{
 };
 
 const LAST_ROUND_TOOL_RESULT_MAX_CHARS: usize = 8 * 1024;
-const LAST_ROUND_THINKING_MAX_CHARS: usize = 4 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CompactionPath {
@@ -167,10 +167,14 @@ pub(crate) fn last_round_start(messages: &[Message]) -> usize {
 #[must_use]
 pub(crate) fn last_round_range(messages: &[Message]) -> (usize, usize) {
     let start = last_round_start(messages).min(messages.len());
-    let end = messages[start..]
-        .iter()
-        .position(is_compaction_checkpoint_message)
-        .map_or(messages.len(), |rel| start + rel);
+    // A previous checkpoint can sit in the middle of an uninterrupted task.
+    // Stopping at that marker hid every tool step after the first compact
+    // from the next pass's survival checks.
+    let end = messages.len().saturating_sub(usize::from(
+        messages
+            .last()
+            .is_some_and(is_compaction_checkpoint_message),
+    ));
     (start, end)
 }
 
@@ -192,36 +196,67 @@ fn last_round_slice(messages: &[Message]) -> &[Message] {
     &messages[start..end]
 }
 
+/// Retain the current user instructions and the two most recent tool
+/// exchanges. A user round can contain thousands of steps: retaining that
+/// entire round forever makes a continuous task impossible to compact.
+/// Older completed exchanges are covered by the summary and durable history.
+/// A split is legal only when all preceding tool calls have their results.
+fn protected_last_round(messages: &[Message]) -> Vec<&Message> {
+    let round = last_round_slice(messages);
+    let mut pending = HashSet::new();
+    let mut boundaries = Vec::new();
+    for (idx, message) in round.iter().enumerate() {
+        let calls = tool_use_ids(message);
+        if !calls.is_empty() && pending.is_empty() {
+            boundaries.push(idx);
+        }
+        pending.extend(calls);
+        for id in tool_result_ids(message) {
+            pending.remove(&id);
+        }
+    }
+    let start = if boundaries.len() > 2 {
+        boundaries[boundaries.len() - 2]
+    } else {
+        0
+    };
+    round
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, message)| {
+            (!is_compaction_checkpoint_message(message)
+                && (idx >= start || is_plain_user_text(message)))
+            .then_some(message)
+        })
+        .collect()
+}
+
+pub(super) fn replacement_messages(
+    messages: &[Message],
+    retained_user_message_tokens: usize,
+) -> Vec<Message> {
+    let (start, _) = last_round_range(messages);
+    let mut retained = retained_user_messages(&messages[..start], retained_user_message_tokens);
+    let round = protected_last_round(messages)
+        .into_iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    retained.extend(bound_last_round(&round));
+    retained
+}
+
 pub(super) fn bound_last_round(messages: &[Message]) -> Vec<Message> {
     let mut round = messages.to_vec();
     for message in &mut round {
         for block in &mut message.content {
-            match block {
-                ContentBlock::ToolResult {
-                    content,
-                    content_blocks,
-                    ..
-                } => {
-                    if truncate_retained_block(
-                        "tool result",
-                        content,
-                        LAST_ROUND_TOOL_RESULT_MAX_CHARS,
-                    ) {
-                        *content_blocks = None;
-                    }
-                }
-                ContentBlock::Thinking {
-                    thinking,
-                    signature,
-                    ..
-                } if signature.is_none() => {
-                    truncate_retained_block(
-                        "thinking block",
-                        thinking,
-                        LAST_ROUND_THINKING_MAX_CHARS,
-                    );
-                }
-                _ => {}
+            if let ContentBlock::ToolResult {
+                content,
+                content_blocks,
+                ..
+            } = block
+                && truncate_retained_block("tool result", content, LAST_ROUND_TOOL_RESULT_MAX_CHARS)
+            {
+                *content_blocks = None;
             }
         }
     }
@@ -298,7 +333,7 @@ pub(crate) fn validate_last_round_coverage(
     original: &[Message],
     replacement: &[Message],
 ) -> Result<()> {
-    let last_round = last_round_slice(original);
+    let last_round = protected_last_round(original);
     if last_round.is_empty() {
         return Ok(());
     }
@@ -307,14 +342,14 @@ pub(crate) fn validate_last_round_coverage(
     // tool-bearing turn, so the round routinely spans two user messages -- and
     // checking only the earliest let a rewrite drop the *latest* one, which is
     // the turn this whole contract exists to keep.
-    for text in last_round.iter().filter_map(user_text_of) {
+    for text in last_round.iter().copied().filter_map(user_text_of) {
         if !survives(&text, replacement, user_text_of) {
             anyhow::bail!(
                 "Compaction coverage floor: a last-round user message was dropped; history was not replaced."
             );
         }
     }
-    for id in last_round.iter().flat_map(tool_result_ids) {
+    for id in last_round.iter().copied().flat_map(tool_result_ids) {
         if !replacement
             .iter()
             .any(|message| has_tool_result_id(message, &id))
@@ -326,7 +361,7 @@ pub(crate) fn validate_last_round_coverage(
     }
     // The call, not just its result. Keeping a tool_result whose tool_use was
     // summarized away leaves an orphaned result that providers reject outright.
-    for id in last_round.iter().flat_map(tool_use_ids) {
+    for id in last_round.iter().copied().flat_map(tool_use_ids) {
         if !replacement
             .iter()
             .any(|message| has_tool_use_id(message, &id))
@@ -339,7 +374,7 @@ pub(crate) fn validate_last_round_coverage(
     // Match the assistant's actual output. An existential "some assistant
     // message survived" check passed on a replacement whose only assistant
     // message was the summary the rewrite had just written.
-    for text in last_round.iter().filter_map(assistant_text_of) {
+    for text in last_round.iter().copied().filter_map(assistant_text_of) {
         if !survives(&text, replacement, assistant_text_of) {
             anyhow::bail!(
                 "Compaction coverage floor: last-round assistant output was dropped; history was not replaced."
@@ -441,9 +476,7 @@ pub(super) fn build_replacement_history(
     anchors: Option<&str>,
     retained_user_message_tokens: usize,
 ) -> Result<Vec<Message>> {
-    let (start, end) = last_round_range(messages);
-    let mut retained = retained_user_messages(&messages[..start], retained_user_message_tokens);
-    retained.extend(bound_last_round(&messages[start..end]));
+    let mut retained = replacement_messages(messages, retained_user_message_tokens);
     retained.push(compaction_checkpoint_message(&SystemPrompt::Text(
         checkpoint_text.to_string(),
     )));
@@ -703,7 +736,7 @@ mod tests {
     fn fixture_matrix_enforces_survival_contract() {
         let matrix: FixtureMatrix =
             serde_json::from_str(include_str!("fixtures/matrix.json")).expect("matrix.json");
-        assert_eq!(matrix.schema_version, 1);
+        assert_eq!(matrix.schema_version, 2);
         assert!(
             matrix.cases.len() >= 8,
             "fixture matrix must cover last-round, toolless-tail, chat-only, anchor, and receipt cases"

@@ -16,9 +16,10 @@ use tokio::time::timeout as tokio_timeout;
 
 use crate::config::{
     TOGETHER_INKLING_MODEL, is_exact_direct_moonshot_k3_route, is_exact_kimi_code_k3_route,
-    is_exact_xai_grok_4_6_route, is_exact_zai_chat_route, is_exact_zai_tiered_effort_route,
-    is_kimi_code_membership_model, minimax_m3_route_uses_max_completion_tokens,
-    moonshot_base_url_is_exact_kimi_code, wire_model_for_provider_route,
+    is_exact_xai_grok_4_6_route, is_exact_zai_chat_route, is_exact_zai_forced_thinking_route,
+    is_exact_zai_tiered_effort_route, is_kimi_code_membership_model,
+    minimax_m3_route_uses_max_completion_tokens, moonshot_base_url_is_exact_kimi_code,
+    wire_model_for_provider_route,
 };
 
 // The bounded response-header wait (`stream_open_timeout`) and its env
@@ -253,9 +254,9 @@ fn apply_direct_moonshot_k3_reasoning_effort(
 }
 
 /// Keep Z.ai controls on exact first-party routes only. The tiered-effort GLM
-/// models (5.2, and 5.3 which inherits its reasoning options) receive the
-/// documented top-level effort, GLM-5.1 and GLM-5-Turbo keep only the generic
-/// thinking toggle, and compatible gateways receive neither field because their
+/// models (5.2, and the forced-thinking 5.3 family) receive the documented
+/// top-level effort, GLM-5.1 and GLM-5-Turbo keep only the generic thinking
+/// toggle, and compatible gateways receive neither field because their
 /// request dialect is not known from provider/model selection alone.
 fn apply_zai_route_reasoning_controls(
     body: &mut Value,
@@ -289,6 +290,10 @@ fn apply_zai_route_reasoning_controls(
         // enabled/disabled thinking control.
         return;
     }
+    if is_exact_zai_forced_thinking_route(provider, base_url, model) {
+        apply_zai_forced_thinking_effort(body, effort);
+        return;
+    }
     match effort
         .map(|value| value.trim().to_ascii_lowercase())
         .as_deref()
@@ -301,6 +306,38 @@ fn apply_zai_route_reasoning_controls(
         // only the generic Z.ai thinking control.
         _ => {}
     }
+}
+
+/// GLM-5.3 and GLM-5.3-Flash are forced-thinking on the exact first-party
+/// Z.ai route: `thinking.type: "disabled"` is rejected with an error and
+/// `reasoning_effort` accepts only low/high/max. The generic Z.ai layer emits
+/// `disabled` for `off`, so a request that was valid for GLM-5.2 fails on
+/// 5.3. Rewrite that payload the way the vendor migration note prescribes —
+/// keep thinking enabled and send the lowest tier — and map the remaining
+/// aliases onto the three documented values, leaving unknown legacy values
+/// omitted so the API owns its documented default (`max`).
+fn apply_zai_forced_thinking_effort(body: &mut Value, effort: Option<&str>) {
+    let thinking_disabled = body
+        .get("thinking")
+        .and_then(|thinking| thinking.get("type"))
+        .and_then(Value::as_str)
+        == Some("disabled");
+    if thinking_disabled {
+        body["thinking"] = json!({
+            "type": "enabled",
+            "clear_thinking": false,
+        });
+    }
+    let Some(effort) = effort else {
+        return;
+    };
+    let wire_effort = match effort.trim().to_ascii_lowercase().as_str() {
+        "off" | "none" | "disabled" | "false" | "low" | "minimum" | "minimal" | "light" => "low",
+        "medium" | "mid" | "high" => "high",
+        "xhigh" | "max" | "highest" | "ultra" | "ultracode" => "max",
+        _ => return,
+    };
+    body["reasoning_effort"] = json!(wire_effort);
 }
 
 /// Add MiniMax's Chat-only reasoning controls only when endpoint and model
@@ -557,7 +594,7 @@ pub(super) fn apply_route_reasoning_controls(
     apply_kimi_code_k3_reasoning_effort(body, provider, base_url, model, effort);
     apply_zai_route_reasoning_controls(body, provider, base_url, model, effort);
     apply_mistral_route_reasoning_controls(body, provider, base_url, model, effort);
-    apply_google_thinking_level(body, provider, base_url, model, effort);
+    apply_google_reasoning_effort(body, base_url, model, effort);
 }
 
 /// Mistral's polymorphic reasoning-content contract is only proven on its
@@ -611,6 +648,12 @@ fn is_google_openai_compat_chat_route(base_url: &str) -> bool {
 /// instead of failing the turn.
 fn google_model_requires_thought_signatures(model: &str) -> bool {
     let model = model.trim().to_ascii_lowercase();
+    // Google names the same model both ways on this endpoint, and a route
+    // configured as `models/gemini-3-pro` matched none of the prefixes below:
+    // the model that most needs a signature looked like one that needs none,
+    // so the fail-closed check waved it through and Google rejected the replay
+    // instead (#6018).
+    let model = model.strip_prefix("models/").unwrap_or(&model);
     if model.starts_with("gemini-3") {
         return true;
     }
@@ -620,29 +663,37 @@ fn google_model_requires_thought_signatures(model: &str) -> bool {
     model.starts_with("gemini-2.5-flash") && !model.starts_with("gemini-2.5-flash-lite")
 }
 
-/// Thinking level for the OpenAI-compat route rides the documented
-/// `google.thinking_config.thinking_level` body field (low/high; Gemini 3
-/// cannot disable thinking).
-fn apply_google_thinking_level(
+/// Google's compatibility endpoint accepts the ordinary `reasoning_effort`
+/// field across Gemini 2.5 and 3. A top-level `google` object is rejected;
+/// native thinking controls would require `extra_body.google` instead.
+/// Use one control, since the endpoint rejects overlapping effort and native
+/// thinking settings. https://ai.google.dev/gemini-api/docs/openai#thinking
+fn apply_google_reasoning_effort(
     body: &mut serde_json::Value,
-    _provider: ApiProvider,
     base_url: &str,
-    _model: &str,
+    model: &str,
     effort: Option<&str>,
 ) {
-    if !is_google_openai_compat_chat_route(base_url) || effort.is_none() {
+    if !is_google_openai_compat_chat_route(base_url) {
         return;
     }
-    let level = match effort
-        .unwrap_or_default()
-        .trim()
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "off" | "disabled" | "none" | "false" | "" | "low" | "minimal" | "medium" | "mid" => "low",
-        _ => "high",
+    let Some(effort) = effort else {
+        return;
     };
-    body["google"]["thinking_config"]["thinking_level"] = json!(level);
+    let model = model.trim().to_ascii_lowercase();
+    let model = model.strip_prefix("models/").unwrap_or(&model);
+    let can_disable = model.starts_with("gemini-2.5-") && !model.starts_with("gemini-2.5-pro");
+    let effort = match effort.trim().to_ascii_lowercase().as_str() {
+        "off" | "disabled" | "none" | "false" if can_disable => "none",
+        // Gemini 3 and 2.5 Pro cannot disable thinking. The compatibility
+        // layer maps minimal to the selected model's lowest supported level.
+        "off" | "disabled" | "none" | "false" | "minimal" => "minimal",
+        "low" => "low",
+        "medium" | "mid" | "" => "medium",
+        "high" | "xhigh" | "max" | "highest" | "ultra" | "ultracode" => "high",
+        _ => return,
+    };
+    body["reasoning_effort"] = json!(effort);
 }
 
 /// Fail closed before transport when Google's OpenAI-compat route would
@@ -6155,6 +6206,144 @@ mod alias_thinking_detection_tests {
     }
 
     #[test]
+    fn zai_forced_thinking_models_never_send_thinking_disabled() {
+        // BigModel and Z.ai document GLM-5.3 / GLM-5.3-Flash as forced-thinking:
+        // `thinking.type: "disabled"` errors, effort accepts only low/high/max,
+        // and the migration note for a former `disabled` payload is
+        // `enabled` + `reasoning_effort: "low"`. Both hosts of the first-party
+        // open platform — api.z.ai and open.bigmodel.cn — get the rewrite.
+        for zai in [
+            crate::config::DEFAULT_ZAI_BASE_URL,
+            "https://open.bigmodel.cn/api/paas/v4",
+        ] {
+            for model in [
+                crate::config::ZAI_GLM_5_3_MODEL,
+                crate::config::ZAI_GLM_5_3_FLASH_MODEL,
+            ] {
+                let mut body = json!({});
+                apply_route_reasoning_controls(
+                    &mut body,
+                    ApiProvider::Zai,
+                    zai,
+                    model,
+                    Some("off"),
+                );
+                assert_eq!(
+                    body["thinking"]["type"],
+                    json!("enabled"),
+                    "{model} must not send the rejected disabled toggle"
+                );
+                assert_eq!(
+                    body["reasoning_effort"],
+                    json!("low"),
+                    "{model} off becomes low"
+                );
+
+                let mut body = json!({});
+                apply_route_reasoning_controls(
+                    &mut body,
+                    ApiProvider::Zai,
+                    zai,
+                    model,
+                    Some("low"),
+                );
+                assert_eq!(
+                    body["reasoning_effort"],
+                    json!("low"),
+                    "{model} low is native"
+                );
+
+                let mut body = json!({});
+                apply_route_reasoning_controls(
+                    &mut body,
+                    ApiProvider::Zai,
+                    zai,
+                    model,
+                    Some("medium"),
+                );
+                assert_eq!(
+                    body["reasoning_effort"],
+                    json!("high"),
+                    "{model} medium maps to high"
+                );
+
+                let mut body = json!({});
+                apply_route_reasoning_controls(
+                    &mut body,
+                    ApiProvider::Zai,
+                    zai,
+                    model,
+                    Some("max"),
+                );
+                assert_eq!(
+                    body["reasoning_effort"],
+                    json!("max"),
+                    "{model} max stays max"
+                );
+
+                // Unknown legacy values leave the field omitted so the API keeps
+                // its documented default; nothing may reintroduce `disabled`.
+                let mut body = json!({});
+                apply_route_reasoning_controls(
+                    &mut body,
+                    ApiProvider::Zai,
+                    zai,
+                    model,
+                    Some("auto"),
+                );
+                assert!(
+                    body.get("reasoning_effort").is_none(),
+                    "{model} auto stays omitted"
+                );
+                assert_ne!(body["thinking"]["type"], json!("disabled"));
+            }
+
+            // GLM-5.2 honours the generic disabled toggle on both hosts. On
+            // BigModel that toggle now reaches the API (its docs still list
+            // `disabled` for GLM-5.2) instead of being stripped by the
+            // fail-closed gateway path.
+            let mut body = json!({});
+            apply_route_reasoning_controls(
+                &mut body,
+                ApiProvider::Zai,
+                zai,
+                crate::config::ZAI_GLM_5_2_MODEL,
+                Some("off"),
+            );
+            assert_eq!(body["thinking"]["type"], json!("disabled"));
+            assert!(body.get("reasoning_effort").is_none());
+        }
+    }
+
+    #[test]
+    fn zai_bigmodel_adjacent_routes_stay_fail_closed() {
+        // BigModel's `/preview` product and a plain-http neighbor are not the
+        // documented Chat dialect, so they keep the gateway treatment: no
+        // Z.ai reasoning fields, including on a forced-thinking model.
+        for neighboring_route in [
+            "https://open.bigmodel.cn/api/paas/v4/preview",
+            "http://open.bigmodel.cn/api/paas/v4",
+        ] {
+            let mut body = json!({"thinking": {"type": "enabled"}});
+            apply_route_reasoning_controls(
+                &mut body,
+                ApiProvider::Zai,
+                neighboring_route,
+                crate::config::ZAI_GLM_5_3_MODEL,
+                Some("max"),
+            );
+            assert!(
+                body.get("reasoning_effort").is_none(),
+                "{neighboring_route} must not gain tiered effort"
+            );
+            assert!(
+                body.get("thinking").is_none(),
+                "{neighboring_route} must not keep the Z.ai thinking object"
+            );
+        }
+    }
+
+    #[test]
     fn stream_classifies_known_large_reasoning_models_as_reasoning() {
         // Xiaomi MiMo and OpenRouter/Qwen/Trinity can stream private reasoning through a
         // `reasoning` delta without using a DeepSeek-looking model name. The
@@ -6416,7 +6605,7 @@ mod image_block_wire_tests {
                     content_blocks: Some(vec![serde_json::json!({
                         "type": "image",
                         "mime_type": "image/png",
-                        "data": "QUJD",
+                        "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==",
                     })]),
                 }],
             },
@@ -6441,7 +6630,10 @@ mod image_block_wire_tests {
         assert_eq!(image_message["role"], "user");
         let parts = image_message["content"].as_array().expect("image parts");
         assert_eq!(parts[1]["type"], "image_url");
-        assert_eq!(parts[1]["image_url"]["url"], "data:image/png;base64,QUJD");
+        assert_eq!(
+            parts[1]["image_url"]["url"],
+            "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg=="
+        );
         assert!(
             parts[0]["text"]
                 .as_str()
@@ -6481,7 +6673,7 @@ mod image_block_wire_tests {
                     content_blocks: Some(vec![serde_json::json!({
                         "type": "image",
                         "mime_type": "image/png",
-                        "data": "QUJD",
+                        "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==",
                     })]),
                 }],
             },
@@ -6494,7 +6686,7 @@ mod image_block_wire_tests {
                     content_blocks: Some(vec![serde_json::json!({
                         "type": "image",
                         "mime_type": "image/png",
-                        "data": "REVG",
+                        "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNgYPj/HwADAgH/5ncLrgAAAABJRU5ErkJggg==",
                     })]),
                 }],
             },
@@ -6520,11 +6712,11 @@ mod image_block_wire_tests {
         assert_eq!(image_parts.len(), 4);
         assert_eq!(
             image_parts[1]["image_url"]["url"],
-            "data:image/png;base64,QUJD"
+            "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg=="
         );
         assert_eq!(
             image_parts[3]["image_url"]["url"],
-            "data:image/png;base64,REVG"
+            "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNgYPj/HwADAgH/5ncLrgAAAABJRU5ErkJggg=="
         );
     }
 
@@ -6605,7 +6797,7 @@ mod image_block_wire_tests {
                     content_blocks: Some(vec![serde_json::json!({
                         "type": "image",
                         "mime_type": "image/png",
-                        "data": "QUJD",
+                        "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==",
                     })]),
                 }],
             },
@@ -6623,7 +6815,7 @@ mod image_block_wire_tests {
                         content_blocks: Some(vec![serde_json::json!({
                             "type": "image",
                             "mime_type": "image/png",
-                            "data": "REVG",
+                            "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==",
                         })]),
                     },
                 ],
@@ -6686,7 +6878,7 @@ mod image_block_wire_tests {
                     content_blocks: Some(vec![serde_json::json!({
                         "type": "image",
                         "mime_type": "image/png",
-                        "data": "QUJD",
+                        "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==",
                     })]),
                 }],
             },
@@ -7205,6 +7397,87 @@ mod google_thought_signature_tests {
         request_from(signed_history(signature, true))
     }
 
+    #[tokio::test]
+    async fn gateway_thought_signature_rejection_explains_recovery_after_transport() {
+        use crate::llm_client::LlmClient;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        // An unsigned replay must reach the gateway: it may manage Google's
+        // signatures itself. Only an actual rejection warrants recovery advice.
+        for streaming in [false, true] {
+            for status in [200, 400] {
+                let server = MockServer::start().await;
+                let response = if status == 400 {
+                    ResponseTemplate::new(status).set_body_json(json!({
+                        "error": {
+                            "code": 400,
+                            "message": "Function call is missing a thought_signature in functionCall parts."
+                        }
+                    }))
+                } else if streaming {
+                    ResponseTemplate::new(status)
+                        .insert_header("content-type", "text/event-stream")
+                        .set_body_string("data: [DONE]\n\n")
+                } else {
+                    ResponseTemplate::new(status).set_body_json(json!({
+                        "id": "gateway-replay",
+                        "model": "gemini-3.1-pro-preview",
+                        "choices": [{
+                            "message": {"role": "assistant", "content": "Done."},
+                            "finish_reason": "stop"
+                        }]
+                    }))
+                };
+                Mock::given(method("POST"))
+                    .and(path("/v1/chat/completions"))
+                    .respond_with(response)
+                    .expect(1)
+                    .mount(&server)
+                    .await;
+
+                let mut client = DeepSeekClient::new(&crate::config::Config {
+                    provider: Some("openai".to_string()),
+                    providers: Some(crate::config::ProvidersConfig {
+                        openai: crate::config::ProviderConfig {
+                            api_key: Some("gateway-test-key".to_string()),
+                            base_url: Some(format!("{}/v1", server.uri())),
+                            model: Some("gemini-3.1-pro-preview".to_string()),
+                            ..crate::config::ProviderConfig::default()
+                        },
+                        ..crate::config::ProvidersConfig::default()
+                    }),
+                    ..crate::config::Config::default()
+                })
+                .expect("gateway client");
+                client.isolated_request_state = true;
+                let request = google_request_with_signed_tool(None);
+                let result = if streaming {
+                    client.create_message_stream(request).await.map(|_| ())
+                } else {
+                    client
+                        .create_message_without_response_cache(request)
+                        .await
+                        .map(|_| ())
+                };
+                if status == 400 {
+                    let error = result.expect_err("gateway rejects unsigned replay");
+                    let message = error.to_string();
+                    assert!(message.contains("built-in `google` provider"), "{message}");
+                    assert!(message.contains("start a new session"), "{message}");
+                    assert!(matches!(
+                        error.downcast_ref::<crate::llm_client::LlmError>(),
+                        Some(crate::llm_client::LlmError::InvalidRequest { status: 400, .. })
+                    ));
+                } else {
+                    result.expect("gateway-managed signatures must still work");
+                }
+                server.verify().await;
+            }
+        }
+    }
+
     #[test]
     fn google_route_round_trips_thought_signatures_on_replayed_tool_calls() {
         let request = google_request_with_signed_tool(Some("SIG-abc123"));
@@ -7234,6 +7507,28 @@ mod google_thought_signature_tests {
         )
         .err()
         .expect("missing signature must fail closed before transport");
+        assert!(
+            error.to_string().contains("thought signature"),
+            "error must name the missing signature: {error}"
+        );
+    }
+
+    /// Google names the same model `gemini-3-pro` and `models/gemini-3-pro` on
+    /// this endpoint. The prefixed spelling used to match none of the thinking
+    /// families, so the model that most needs a signature was treated as one
+    /// that needs none and the replay reached Google unsigned (#6018).
+    #[test]
+    fn google_route_fails_closed_for_a_models_prefixed_thinking_id() {
+        let mut request = google_request_with_signed_tool(None);
+        request.model = "models/gemini-3-pro-preview".to_string();
+        let error = build_chat_wire_body(
+            &request,
+            ApiProvider::Google,
+            DEFAULT_GOOGLE_BASE_URL,
+            false,
+        )
+        .err()
+        .expect("a models/-prefixed thinking id must fail closed like its bare spelling");
         assert!(
             error.to_string().contains("thought signature"),
             "error must name the missing signature: {error}"
@@ -7424,33 +7719,57 @@ mod google_thought_signature_tests {
     }
 
     #[test]
-    fn google_thinking_level_maps_effort_onto_documented_body_field() {
-        let mut request = google_request_with_signed_tool(Some("SIG"));
-        request.reasoning_effort = Some("high".to_string());
-        let body = build_chat_wire_body(
-            &request,
-            ApiProvider::Google,
-            DEFAULT_GOOGLE_BASE_URL,
-            false,
-        )
-        .expect("valid google body");
-        assert_eq!(
-            body.body
-                .pointer("/google/thinking_config/thinking_level")
-                .and_then(serde_json::Value::as_str),
-            Some("high")
-        );
+    fn google_reasoning_uses_compatible_effort_without_rejected_native_fields() {
+        // Wire examples and model limits from Google's compatibility docs.
+        // Cover the actual request builder, both transport modes and both
+        // ways a fresh install can configure the official endpoint (#6018).
+        for (model, effort, expected) in [
+            ("gemini-3.1-pro-preview", Some("low"), Some("low")),
+            ("gemini-3.1-pro-preview", Some("medium"), Some("medium")),
+            ("gemini-3.1-pro-preview", Some("high"), Some("high")),
+            ("gemini-3.1-pro-preview", Some("max"), Some("high")),
+            ("gemini-3.5-flash-lite", Some("off"), Some("minimal")),
+            ("gemini-2.5-flash", Some("off"), Some("none")),
+            ("models/gemini-2.5-flash-lite", Some("off"), Some("none")),
+            ("gemini-2.5-pro", Some("off"), Some("minimal")),
+            ("gemini-3.1-pro-preview", None, None),
+        ] {
+            for provider in [ApiProvider::Google, ApiProvider::Custom] {
+                for streaming in [false, true] {
+                    let mut request = google_request_with_signed_tool(Some("SIG"));
+                    request.model = model.to_string();
+                    request.reasoning_effort = effort.map(str::to_string);
+                    let wire = build_chat_wire_body(
+                        &request,
+                        provider,
+                        DEFAULT_GOOGLE_BASE_URL,
+                        streaming,
+                    )
+                    .expect("valid signed Google request");
+                    assert_eq!(
+                        wire.body.get("reasoning_effort").and_then(Value::as_str),
+                        expected,
+                        "{model}: {effort:?}, {provider:?}, streaming={streaming}"
+                    );
+                    assert!(wire.body.get("google").is_none());
+                    assert!(wire.body.get("extra_body").is_none());
+                    assert!(wire.body.get("thinking").is_none());
+                }
+            }
+        }
+    }
 
-        let mut low = google_request_with_signed_tool(Some("SIG"));
-        low.reasoning_effort = Some("low".to_string());
-        let body = build_chat_wire_body(&low, ApiProvider::Google, DEFAULT_GOOGLE_BASE_URL, false)
-            .expect("valid google body");
-        assert_eq!(
-            body.body
-                .pointer("/google/thinking_config/thinking_level")
-                .and_then(serde_json::Value::as_str),
-            Some("low")
-        );
+    #[test]
+    fn google_reasoning_control_does_not_rewrite_other_endpoints() {
+        for provider in [ApiProvider::Google, ApiProvider::Custom] {
+            let request = google_request_with_signed_tool(Some("SIG"));
+            let wire =
+                build_chat_wire_body(&request, provider, "https://gateway.example.com/v1", false)
+                    .expect("valid gateway request");
+            assert!(wire.body.get("reasoning_effort").is_none());
+            assert!(wire.body.get("google").is_none());
+            assert!(wire.body.get("extra_body").is_none());
+        }
     }
 
     #[test]

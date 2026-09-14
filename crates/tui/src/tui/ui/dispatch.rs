@@ -148,7 +148,7 @@ pub(crate) fn push_assistant_message(
         )
     });
     if has_sendable_content {
-        app.api_messages.push(Message {
+        app.push_api_message(Message {
             role: Role::Assistant,
             content: blocks,
         });
@@ -644,7 +644,7 @@ pub(crate) fn prepare_user_dispatch(
     // the async dispatch completion (which can lag by a route plan). The
     // failure path restores the pre-send timestamp from the snapshot.
     app.last_send_at = Some(Instant::now());
-    app.api_messages.push(Message {
+    app.push_api_message(Message {
         role: Role::User,
         content: vec![ContentBlock::Text {
             text: content.clone(),
@@ -988,6 +988,20 @@ pub(crate) fn build_dispatch_success_closure(
     )
 }
 
+/// Missing-credential / auth preflight failures must keep the transcript echo.
+/// The user already submitted; rolling the HistoryCell::User back and restoring
+/// the composer hides the turn and makes first-run feel broken.
+pub(crate) fn is_missing_credential_dispatch_error(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    lower.contains("api key not found")
+        || lower.contains("access token")
+        || (lower.contains("credential")
+            && (lower.contains("not found")
+                || lower.contains("missing")
+                || lower.contains("unavailable")
+                || lower.contains("unsupported")))
+}
+
 pub(crate) fn build_dispatch_error_closure(
     prepare: UserDispatchPrepare,
     recovery: DispatchRecovery,
@@ -1015,22 +1029,34 @@ pub(crate) fn build_dispatch_error_closure(
             app.receipt_text = prepare.snapshot.receipt_text.clone();
             app.receipt_started_at = prepare.snapshot.receipt_started_at;
             app.tool_evidence = prepare.snapshot.tool_evidence.clone();
-            app.history.truncate(prepare.snapshot.history_len);
-            app.prune_transcript_index_state(prepare.snapshot.history_len);
-            app.history_revisions
-                .truncate(prepare.snapshot.history_revisions_len);
-            app.history_version = prepare.snapshot.history_version;
-            app.api_messages.truncate(prepare.snapshot.api_messages_len);
-            app.last_send_at = prepare.snapshot.last_send_at;
+            let keep_user_echo = is_missing_credential_dispatch_error(&error);
+            if keep_user_echo {
+                // Echo first: keep HistoryCell::User painted in prepare. Drop only
+                // the unsent api_messages append and loading chrome.
+                app.truncate_api_messages(prepare.snapshot.api_messages_len);
+                app.last_send_at = prepare.snapshot.last_send_at;
+            } else {
+                app.history.truncate(prepare.snapshot.history_len);
+                app.prune_transcript_index_state(prepare.snapshot.history_len);
+                app.history_revisions
+                    .truncate(prepare.snapshot.history_revisions_len);
+                app.history_version = prepare.snapshot.history_version;
+                app.truncate_api_messages(prepare.snapshot.api_messages_len);
+                app.last_send_at = prepare.snapshot.last_send_at;
+            }
             app.needs_redraw = true;
 
             match recovery {
                 DispatchRecovery::Immediate => {
-                    restore_failed_immediate_submit(
-                        app,
-                        prepare.message,
-                        &anyhow::Error::msg(error.clone()),
-                    );
+                    if keep_user_echo {
+                        keep_failed_immediate_submit_echo(app, prepare.message, &error);
+                    } else {
+                        restore_failed_immediate_submit(
+                            app,
+                            prepare.message,
+                            &anyhow::Error::msg(error.clone()),
+                        );
+                    }
                 }
                 DispatchRecovery::Queued { restore_index } => {
                     restore_queued_message(app, restore_index, prepare.message);
@@ -1047,14 +1073,18 @@ pub(crate) fn build_dispatch_error_closure(
                     ));
                 }
                 DispatchRecovery::Initial => {
-                    let initial_error = app
-                        .tr(MessageId::DispatchFailedInitial)
-                        .replace("{error}", &error);
-                    restore_failed_immediate_submit(
-                        app,
-                        prepare.message,
-                        &anyhow::Error::msg(initial_error),
-                    );
+                    if keep_user_echo {
+                        keep_failed_immediate_submit_echo(app, prepare.message, &error);
+                    } else {
+                        let initial_error = app
+                            .tr(MessageId::DispatchFailedInitial)
+                            .replace("{error}", &error);
+                        restore_failed_immediate_submit(
+                            app,
+                            prepare.message,
+                            &anyhow::Error::msg(initial_error),
+                        );
+                    }
                 }
             }
 
@@ -1193,7 +1223,7 @@ pub(crate) async fn steer_user_message(
     // steer form instead of painting a second bubble.
     let history_cell = paint_user_turn_cell(app, &message, format!("+ {}", message.display));
     app.record_context_references(history_cell, message_index, references);
-    app.api_messages.push(Message {
+    app.push_api_message(Message {
         role: Role::User,
         content: vec![ContentBlock::Text {
             text: content.clone(),

@@ -973,9 +973,8 @@ pub(crate) fn normalize_custom_model_id(model: &str) -> Option<String> {
 /// Validate a user-requested model id against the active provider (#3018).
 ///
 /// DeepSeek providers use the strict `normalize_model_name` gate (the official
-/// API only accepts DeepSeek IDs). OpenCode Go uses its documented Chat
-/// Completions allowlist because the shared Go roster also contains
-/// Messages-only models. Other providers pass any non-empty,
+/// API only accepts DeepSeek IDs). OpenCode Go uses its documented model-scoped
+/// protocol roster. Other providers pass any non-empty,
 /// non-control-character string through — the provider API is the authority.
 #[must_use]
 pub fn requested_model_for_provider(provider: ApiProvider, model: &str) -> Option<String> {
@@ -983,7 +982,7 @@ pub fn requested_model_for_provider(provider: ApiProvider, model: &str) -> Optio
         ApiProvider::Deepseek | ApiProvider::DeepseekCN | ApiProvider::DeepseekAnthropic => {
             normalize_model_name(model)
         }
-        ApiProvider::OpencodeGo => opencode_go_chat_model_id(model).map(str::to_string),
+        ApiProvider::OpencodeGo => opencode_go_model_id(model).map(str::to_string),
         _ => normalize_custom_model_id(model),
     }
 }
@@ -1007,8 +1006,8 @@ pub fn requested_model_for_provider(provider: ApiProvider, model: &str) -> Optio
 ///    "foreign to a direct provider" classification the model resolver uses,
 ///    so DeepSeek aggregators (NVIDIA NIM, OpenRouter, Fireworks, …) stay
 ///    permissive.
-/// 3. OpenCode Go accepts only models documented for its Chat Completions
-///    endpoint; models served only over Anthropic Messages are rejected.
+/// 3. OpenCode Go accepts models with a documented Chat, Responses, or
+///    Messages protocol; unknown wire contracts are rejected.
 ///
 /// Returns `Ok(())` for any tuple we cannot confidently reject (the provider
 /// API remains the final authority for those).
@@ -1025,13 +1024,13 @@ pub fn validate_route(provider: ApiProvider, model: &str) -> Result<(), String> 
     }
 
     if provider == ApiProvider::OpencodeGo {
-        return if opencode_go_chat_model_id(trimmed).is_some() {
+        return if opencode_go_model_id(trimmed).is_some() {
             Ok(())
         } else {
             Err(format!(
-                "Model '{trimmed}' is not available through OpenCode Go Chat Completions. \
+                "Model '{trimmed}' is not in OpenCode Go's documented protocol roster. \
                  Choose one of: {}.",
-                OPENCODE_GO_CHAT_MODELS.join(", ")
+                opencode_go_models().join(", ")
             ))
         };
     }
@@ -1203,8 +1202,8 @@ fn canonical_openrouter_recent_model_id(model: &str) -> Option<&'static str> {
     }
 }
 
-pub(crate) fn opencode_go_chat_model_id(model: &str) -> Option<&'static str> {
-    codewhale_config::opencode_go_chat_model_id(model)
+pub(crate) fn opencode_go_model_id(model: &str) -> Option<&'static str> {
+    codewhale_config::opencode_go_model_id(model)
 }
 
 fn canonical_xiaomi_mimo_model_id(model: &str) -> Option<&'static str> {
@@ -1358,7 +1357,7 @@ fn canonical_minimax_model_id(model: &str) -> Option<&'static str> {
 /// deliberately kept out of here.
 ///
 /// Returns `None` for empty or control-character input and for ids outside the
-/// OpenCode Go Chat Completions allowlist. Other provider ids pass through so a
+/// OpenCode Go documented protocol roster. Other provider ids pass through so a
 /// custom/self-hosted endpoint is never wrongly rejected.
 #[must_use]
 pub fn canonical_model_id_for_provider(provider: ApiProvider, model: &str) -> Option<String> {
@@ -1367,12 +1366,9 @@ pub fn canonical_model_id_for_provider(provider: ApiProvider, model: &str) -> Op
         return None;
     }
 
-    // OpenCode Go is a strict protocol slice: its live `/models` response also
-    // advertises Anthropic-Messages-only models, but this provider sends OpenAI
-    // Chat Completions. Unknown and Messages-only ids must stop here rather
-    // than falling through to the generic pass-through path below.
+    // Go resolves aliases only within its documented protocol roster.
     if provider == ApiProvider::OpencodeGo {
-        return opencode_go_chat_model_id(trimmed).map(str::to_string);
+        return opencode_go_model_id(trimmed).map(str::to_string);
     }
 
     // Provider-owned model families resolve through their own canonical map,
@@ -1466,11 +1462,8 @@ pub fn wire_model_for_provider(provider: ApiProvider, model: &str) -> String {
         return trimmed.to_string();
     }
     if provider == ApiProvider::OpencodeGo {
-        // Canonicalize known Chat Completions ids only. Never substitute a
-        // different model for an unknown/Messages-only id — that silently
-        // changes the request. Keep the caller's spelling so validate_route /
-        // the route resolver can reject it by name.
-        return opencode_go_chat_model_id(trimmed)
+        // Keep an unknown ID unchanged so validation can reject it by name.
+        return opencode_go_model_id(trimmed)
             .map(str::to_string)
             .unwrap_or_else(|| trimmed.to_string());
     }
@@ -1495,9 +1488,7 @@ pub fn wire_model_for_provider_route(provider: ApiProvider, base_url: &str, mode
     if trimmed.is_empty() {
         return trimmed.to_string();
     }
-    // OpenCode Go's provider identity is the Chat Completions protocol
-    // boundary even when its base URL is overridden. Do not let the generic
-    // custom-endpoint passthrough re-admit a Messages-only model.
+    // A custom endpoint still uses the documented Go model and wire contract.
     if provider == ApiProvider::OpencodeGo {
         return wire_model_for_provider(provider, trimmed);
     }
@@ -1643,7 +1634,7 @@ pub fn model_completion_names_for_provider(provider: ApiProvider) -> Vec<&'stati
         ],
         ApiProvider::Sakana => vec![DEFAULT_SAKANA_MODEL, SAKANA_FUGU_ULTRA_MODEL],
         ApiProvider::LongCat => vec![DEFAULT_LONGCAT_MODEL],
-        ApiProvider::OpencodeGo => OPENCODE_GO_CHAT_MODELS.to_vec(),
+        ApiProvider::OpencodeGo => opencode_go_models(),
         ApiProvider::OpencodeZen => codewhale_config::route::opencode_zen_picker_models(),
         ApiProvider::Meta => vec![
             DEFAULT_META_MODEL,
@@ -1786,8 +1777,8 @@ where
 pub struct TuiConfig {
     pub alternate_screen: Option<String>,
     pub mouse_capture: Option<bool>,
-    /// Timeout for startup terminal mode/probe calls in milliseconds.
-    /// Defaults to 500ms when omitted.
+    /// Legacy setting retained for config compatibility. Raw mode is set
+    /// directly on the terminal-owning thread; this value has no effect.
     pub terminal_probe_timeout_ms: Option<u64>,
     /// Per-SSE-chunk idle timeout in seconds. Defaults to 900 seconds when
     /// omitted. `0` maps to the default; values clamp to `1..=3600`.
@@ -1827,7 +1818,7 @@ pub struct TuiConfig {
     #[serde(default)]
     pub posture_bar: Option<ChromeRowPreset>,
     /// The same three settings for the metrics line under the posture bar.
-    /// `compact` keeps the route, the context reading, the cost and the
+    /// `compact` is the default: it keeps the route, the context reading, the cost and the
     /// balance and drops the telemetry and the help hint (#5950).
     #[serde(default)]
     pub metrics_line: Option<ChromeRowPreset>,
@@ -2130,16 +2121,20 @@ pub struct ReasoningOnlyConfig {
 /// | `Cache` | the metrics line's `cache NN%` |
 /// | `Tokens` | the metrics line's `↓ NNN` output tokens |
 /// | `Balance` | the metrics line's prepaid-credit reading (also gates the fetch) |
+/// | `Workspace` | the metrics line's workspace leaf-directory chip |
+/// | `GitBranch` | the metrics line's current-branch chip (short SHA when detached) |
 ///
 /// A variant that paints nothing does not belong here. Eight variants were
 /// retired in #5950 because the 0.9.12 shell gave their facts to a surface
 /// `/statusline` does not own — the posture bar's clock and live counts
 /// (`Status`, `Agents`), the launch header and git dock (`GitBranch`) — or
 /// because they were never wired at all (`ReasoningReplay`,
-/// `PrefixStability`, `LastToolElapsed`, `RateLimit`). Their keys still
-/// parse out of an old `config.toml`: [`StatusItem::from_key`] returns
-/// `None` and `deser_status_items` skips them with a warning, so an
-/// upgrader's file keeps loading.
+/// `PrefixStability`, `LastToolElapsed`, `RateLimit`). #6112 revived
+/// `GitBranch` (and added `Workspace`) as opt-in metrics-line chips fed by
+/// the cached workspace context, not by a per-frame git call. The other
+/// retired keys still parse out of an old `config.toml`:
+/// [`StatusItem::from_key`] returns `None` and `deser_status_items` skips
+/// them with a warning, so an upgrader's file keeps loading.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum StatusItem {
@@ -2160,6 +2155,13 @@ pub enum StatusItem {
     /// The metrics line's latency pair: `ttft NNNms` and `NN tok/s`, from
     /// the same engine timings and provider usage `/status` prints in full.
     SessionMetrics,
+    /// Leaf directory of the session workspace, left-truncated when long.
+    /// Opt-in (#6112); off the default footer.
+    Workspace,
+    /// Current git branch from the cached workspace context — the short SHA
+    /// when HEAD is detached, absent outside a repository. Opt-in (#6112);
+    /// off the default footer.
+    GitBranch,
 }
 
 impl StatusItem {
@@ -2192,6 +2194,8 @@ impl StatusItem {
             StatusItem::Tokens => "tokens",
             StatusItem::Balance => "balance",
             StatusItem::SessionMetrics => "session_metrics",
+            StatusItem::Workspace => "workspace",
+            StatusItem::GitBranch => "git_branch",
         }
     }
 
@@ -2209,10 +2213,15 @@ impl StatusItem {
             "tokens" => Some(Self::Tokens),
             // Retired in #5950; skipped rather than rejected so an old
             // `config.toml` still parses. See the type's doc comment.
-            "status" | "agents" | "reasoning_replay" | "prefix_stability" | "git_branch"
-            | "last_tool_elapsed" | "rate_limit" => None,
+            "status" | "agents" | "reasoning_replay" | "prefix_stability" | "last_tool_elapsed"
+            | "rate_limit" => None,
             "balance" => Some(Self::Balance),
             "session_metrics" => Some(Self::SessionMetrics),
+            "workspace" => Some(Self::Workspace),
+            // Revived in #6112 as an opt-in metrics-line chip; it parses
+            // again, so a config written between its #5950 retirement and
+            // the revival simply gets the chip back.
+            "git_branch" => Some(Self::GitBranch),
             _ => None,
         }
     }
@@ -2229,6 +2238,8 @@ impl StatusItem {
             StatusItem::Tokens => "Output tokens",
             StatusItem::Balance => "Account balance",
             StatusItem::SessionMetrics => "Session metrics",
+            StatusItem::Workspace => "Workspace",
+            StatusItem::GitBranch => "Git branch",
         }
     }
 
@@ -2245,6 +2256,8 @@ impl StatusItem {
             StatusItem::Tokens => "output tokens of the live or last turn",
             StatusItem::Balance => "remaining prepaid credit from the active provider",
             StatusItem::SessionMetrics => "time to first token and output rate",
+            StatusItem::Workspace => "directory this session writes to",
+            StatusItem::GitBranch => "branch the next commit lands on",
         }
     }
 
@@ -2260,6 +2273,8 @@ impl StatusItem {
             StatusItem::Cache,
             StatusItem::Tokens,
             StatusItem::SessionMetrics,
+            StatusItem::Workspace,
+            StatusItem::GitBranch,
         ]
     }
 
@@ -3712,6 +3727,12 @@ pub struct ProviderConfig {
         alias = "contextLength"
     )]
     pub context_window: Option<u32>,
+    /// Per-model context-window overrides keyed by exact wire model id
+    /// (`[providers.<name>.model_context_windows]`, #6108). A matching entry
+    /// wins over this provider's `context_window` for that model only, so one
+    /// gateway can front models with heterogeneous windows.
+    #[serde(default, alias = "modelContextWindows")]
+    pub model_context_windows: Option<std::collections::BTreeMap<String, u32>>,
     pub mode: Option<String>,
     /// Dual-wire dialect toggle: `openai` (default) or `anthropic`.
     /// Not a separate catalog provider — config only (DeepSeek / MiniMax /
@@ -4039,9 +4060,12 @@ impl ProvidersConfig {
         ];
         for (name, config) in builtins {
             validate_provider_context_window(name, config.context_window)?;
+            validate_model_context_windows(name, config.model_context_windows.as_ref())?;
         }
         for (name, config) in &self.custom {
-            validate_provider_context_window(&format!("providers.{name}"), config.context_window)?;
+            let name = format!("providers.{name}");
+            validate_provider_context_window(&name, config.context_window)?;
+            validate_model_context_windows(&name, config.model_context_windows.as_ref())?;
         }
         Ok(())
     }
@@ -4050,6 +4074,20 @@ impl ProvidersConfig {
 fn validate_provider_context_window(name: &str, value: Option<u32>) -> Result<()> {
     if value == Some(0) {
         anyhow::bail!("{name}.context_window must be greater than 0");
+    }
+    Ok(())
+}
+
+fn validate_model_context_windows(
+    name: &str,
+    table: Option<&std::collections::BTreeMap<String, u32>>,
+) -> Result<()> {
+    if let Some(table) = table {
+        for (model, window) in table {
+            if *window == 0 {
+                anyhow::bail!("{name}.model_context_windows.{model} must be greater than 0");
+            }
+        }
     }
     Ok(())
 }
@@ -6119,6 +6157,30 @@ impl Config {
         None
     }
 
+    /// `[providers.<id>.model_context_windows]` for this provider, keyed by
+    /// exact wire model id (#6108). Follows the same SiliconFlow CN sibling
+    /// fallback as [`Self::context_window_for_provider_config`].
+    #[must_use]
+    pub(crate) fn model_context_windows_for(
+        &self,
+        provider: ApiProvider,
+    ) -> Option<&std::collections::BTreeMap<String, u32>> {
+        let table = self
+            .provider_config_for(provider)
+            .and_then(|entry| entry.model_context_windows.as_ref())
+            .filter(|table| !table.is_empty());
+        if table.is_some() {
+            return table;
+        }
+        if provider == ApiProvider::SiliconflowCn {
+            return self
+                .provider_config_for(ApiProvider::Siliconflow)
+                .and_then(|entry| entry.model_context_windows.as_ref())
+                .filter(|table| !table.is_empty());
+        }
+        None
+    }
+
     #[must_use]
     pub fn http_headers(&self) -> HashMap<String, String> {
         let provider = self.api_provider();
@@ -6167,8 +6229,13 @@ impl Config {
             .or_else(|| self.active_configured_model_id())?
             .trim()
             .to_ascii_lowercase();
+        // A custom endpoint owns the same model strings, so DeepSeek's
+        // retirement claim must not travel to it. Ask that question directly:
+        // the previous proxy for it — "the wire id was rewritten" — also
+        // excluded every id DeepSeek retires while still accepting, which is
+        // exactly the V4 Pro case.
         let base_url = self.deepseek_base_url();
-        if wire_model_for_provider_route(provider, &base_url, &alias) == alias {
+        if base_url_is_custom_for_provider(provider, &base_url) {
             return None;
         }
 
@@ -10370,8 +10437,8 @@ pub(crate) fn is_exact_zai_chat_route(provider: ApiProvider, base_url: &str) -> 
 ///
 /// GLM-5.2 is the verified member. GLM-5.3 and GLM-5.3-Flash inherit it
 /// because their catalog rows inherit GLM-5.2's `reasoning_options`
-/// wholesale. If Z.ai publishes different reasoning controls, this
-/// predicate is where they split.
+/// wholesale. Where the 5.3 family does diverge — forced thinking — is
+/// captured by [`is_exact_zai_forced_thinking_route`].
 #[must_use]
 pub(crate) fn is_exact_zai_tiered_effort_route(
     provider: ApiProvider,
@@ -10380,7 +10447,26 @@ pub(crate) fn is_exact_zai_tiered_effort_route(
 ) -> bool {
     is_exact_zai_chat_route(provider, base_url)
         && (model.trim().eq_ignore_ascii_case(ZAI_GLM_5_2_MODEL)
-            || model.trim().eq_ignore_ascii_case(ZAI_GLM_5_3_MODEL)
+            || is_exact_zai_forced_thinking_route(provider, base_url, model))
+}
+
+/// Whether a route is exactly first-party Z.ai GLM-5.3 or GLM-5.3-Flash.
+///
+/// Both BigModel (`docs.bigmodel.cn/cn/guide/capabilities/thinking`) and
+/// Z.ai (`docs.z.ai/guides/capabilities/thinking`) document the 5.3 family
+/// as forced-thinking: `thinking.type: "disabled"` is rejected with an error
+/// and `reasoning_effort` accepts only `low` / `high` / `max`. The migration
+/// note for a former `disabled` payload is `enabled` + `reasoning_effort:
+/// "low"`. GLM-5.2 stays outside this predicate because it still honours
+/// the generic disabled toggle.
+#[must_use]
+pub(crate) fn is_exact_zai_forced_thinking_route(
+    provider: ApiProvider,
+    base_url: &str,
+    model: &str,
+) -> bool {
+    is_exact_zai_chat_route(provider, base_url)
+        && (model.trim().eq_ignore_ascii_case(ZAI_GLM_5_3_MODEL)
             || model.trim().eq_ignore_ascii_case(ZAI_GLM_5_3_FLASH_MODEL))
 }
 
@@ -11141,6 +11227,9 @@ fn merge_provider_config(base: ProviderConfig, override_cfg: ProviderConfig) -> 
         base_url: override_cfg.base_url.or(base.base_url),
         model: override_cfg.model.or(base.model),
         context_window: override_cfg.context_window.or(base.context_window),
+        model_context_windows: override_cfg
+            .model_context_windows
+            .or(base.model_context_windows),
         mode: override_cfg.mode.or(base.mode),
         wire: override_cfg.wire.or(base.wire),
         auth_mode: override_cfg.auth_mode.or(base.auth_mode),
@@ -12153,6 +12242,10 @@ fn provider_config_is_explicit(entry: &ProviderConfig) -> bool {
             .as_ref()
             .is_some_and(|auth| auth.validate().is_ok())
         || entry.context_window.is_some()
+        || entry
+            .model_context_windows
+            .as_ref()
+            .is_some_and(|table| !table.is_empty())
         || non_empty(entry.mode.as_ref())
         || entry.max_concurrency.is_some()
         || entry.http_headers.as_ref().is_some_and(|headers| {

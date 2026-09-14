@@ -181,11 +181,13 @@ export function create({ exec }) {
     },
     open_application: async ({ bundle_id: bid, ability, name } = {}) => {
       const bundle = bid ?? name;
-      if (!bundle) throw new ExecError("open_application needs bundle_id (harmony bundle name)");
-      const candidates = ability ? [ability] : ["EntryAbility", "MainAbility"];
+      const identifier = (value) => typeof value === "string" && value.length <= 256 && /^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*$/.test(value);
+      if (!identifier(bundle)) throw new ExecError("open_application needs a valid Harmony bundle identifier");
+      if (ability != null && !identifier(ability)) throw new ExecError("open_application needs a valid Harmony ability identifier");
+      const candidates = ability != null ? [ability] : ["EntryAbility", "MainAbility"];
       let last = null;
       for (const a of candidates) {
-        const r = await shell(["aa", "start", "-b", bundle, "-a", a]);
+        const r = await shell(["aa", "start", "-b", escDeviceText(bundle), "-a", escDeviceText(a)]);
         if (r.code === 0 && !/Error|error/.test(r.stdout + r.stderr)) {
           return { launched: true, bundle, ability: a };
         }

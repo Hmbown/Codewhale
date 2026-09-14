@@ -102,6 +102,7 @@ const MAX_RECOMMENDED_PLUGINS: usize = 8;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PluginKeywordMatch {
     pub name: String,
+    pub matched_term: Option<String>,
     pub id: String,
     pub next_step: PluginNextStep,
     keywords: Vec<String>,
@@ -131,8 +132,8 @@ impl PluginKeywordMatch {
     }
 }
 
-/// Load marketplace catalogs the user added locally. Never invents a remote
-/// official marketplace URL.
+/// Load the bundled first-party catalog and user-added catalogs from the
+/// shared store. Browsing never fetches or installs plugin content.
 #[must_use]
 pub fn load_marketplace_candidates(
     state_path: Option<&std::path::Path>,
@@ -177,6 +178,7 @@ pub fn idle_and_catalog_keyword_matches(
         let mut keywords = plugin.manifest.plugin.keywords.clone();
         keywords.push(plugin.name().to_string());
         out.push(PluginKeywordMatch {
+            matched_term: None,
             name: plugin.name().to_string(),
             id: plugin.id.as_str().to_string(),
             next_step,
@@ -201,9 +203,6 @@ pub fn idle_and_catalog_keyword_matches(
         if let Some(homepage) = &candidate.homepage {
             domains.push(homepage.clone());
         }
-        if let Some(repository) = &candidate.repository {
-            domains.push(repository.clone());
-        }
         let next_step = match &candidate.install_plan {
             crate::plugins::marketplace::types::MarketplaceInstallPlan::Supported {
                 spec, ..
@@ -215,6 +214,7 @@ pub fn idle_and_catalog_keyword_matches(
             },
         };
         out.push(PluginKeywordMatch {
+            matched_term: None,
             name: candidate.name.clone(),
             id: candidate.id.as_str().to_string(),
             next_step,
@@ -233,8 +233,10 @@ pub fn match_plugin_for_draft(
     draft: &str,
     registry: &PluginRegistry,
     marketplace: &[MarketplaceCandidate],
+    dismissed: &BTreeSet<String>,
 ) -> Option<PluginKeywordMatch> {
-    let candidates = idle_and_catalog_keyword_matches(registry, marketplace);
+    let mut candidates = idle_and_catalog_keyword_matches(registry, marketplace);
+    candidates.retain(|candidate| !dismissed.contains(&candidate.name.to_ascii_lowercase()));
     match_plugin_for_draft_among(draft, &candidates)
 }
 
@@ -251,8 +253,10 @@ pub fn match_plugin_for_draft_among(
             keywords: &candidate.keywords,
         })
         .collect::<Vec<_>>();
-    let idx = crate::plugins::matcher::match_plugin_keyword(draft, &keyword_candidates)?;
-    candidates.get(idx).cloned()
+    let (idx, term) = crate::plugins::matcher::match_plugin_keyword(draft, &keyword_candidates)?;
+    let mut matched = candidates.get(idx)?.clone();
+    matched.matched_term = Some(term);
+    Some(matched)
 }
 
 /// Append-only user-turn fragment. Never part of the pinned system prefix.
@@ -263,11 +267,16 @@ pub fn recommended_plugins_user_fragment(
     registry: &PluginRegistry,
     marketplace: &[MarketplaceCandidate],
 ) -> Option<String> {
-    let candidates = idle_and_catalog_keyword_matches(registry, marketplace);
-    if candidates.is_empty() {
-        return None;
-    }
-    let matched = match_plugin_for_draft_among(draft, &candidates)?;
+    // Called once when composing a user turn, never from the render loop.
+    // Read the shared preference so headless and long-lived Engines also
+    // honor dismissals recorded by a TUI after Engine startup.
+    let settings = crate::settings::Settings::load_read_only().unwrap_or_default();
+    let matched = match_plugin_for_draft(
+        draft,
+        registry,
+        marketplace,
+        &settings.dismissed_plugin_suggestions,
+    )?;
     let mut listed = vec![matched];
     listed.truncate(MAX_RECOMMENDED_PLUGINS);
     let body = listed
@@ -500,6 +509,7 @@ mod tests {
             catalog_id: MarketplaceCatalogId::new(catalog),
             name: name.to_string(),
             display_name: Some(format!("{name} plugin")),
+            icon: None,
             description: Some(format!("{name} integration")),
             version: None,
             author: None,
@@ -665,7 +675,7 @@ mod tests {
         registry.enable("supabase").unwrap();
 
         assert!(
-            match_plugin_for_draft("add supabase auth", &registry, &[]).is_none(),
+            match_plugin_for_draft("add supabase auth", &registry, &[], &BTreeSet::new()).is_none(),
             "active plugins must not produce a live CTA"
         );
     }

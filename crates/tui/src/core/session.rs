@@ -2,10 +2,10 @@
 //!
 //! Tracks conversation history, token usage, and session metadata.
 
-use crate::prefix_cache::PrefixStabilityManager;
 use crate::project_context::{ProjectContext, load_project_context_with_parents};
 use crate::prompt_zones::{AppendLog, FrozenPrefix};
 use crate::working_set::WorkingSet;
+use codewhale_core::prefix_cache::PrefixStabilityManager;
 use codewhale_execpolicy::ApprovalMode;
 use codewhale_models::{Message, SystemPrompt, Usage};
 use std::collections::{HashSet, VecDeque};

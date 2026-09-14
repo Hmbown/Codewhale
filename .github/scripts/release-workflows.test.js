@@ -193,18 +193,23 @@ assert.doesNotMatch(
 assert.match(candidate, /cache-dependency-path: web\/package-lock\.json/);
 assert.match(candidate, /package-manager-cache: false/);
 assert.match(candidate, /working-directory: web/);
-for (const command of [
-  "npm ci",
+for (const workflow of [candidate, read(".github/workflows/web.yml")]) {
+  for (const command of ["npm ci", "npm test", "npm run check"]) {
+    assert.ok(workflow.includes(`run: ${command}\n`), `missing web gate: ${command}`);
+  }
+}
+// Both workflows use this gate. Preserve every check and its order: checking
+// committed facts after prebuild could silently repair drift before testing it.
+assert.deepEqual(JSON.parse(read("web/package.json")).scripts.check.split(" && "), [
   "npm run check:facts",
+  "npm run check:latest-release",
   "npm run prebuild",
   "npm run check:docs",
-  "npm test",
+  "npm run check:tokens",
   "npm run lint",
-  "npx tsc --noEmit",
+  "tsc --noEmit",
   "npm run build",
-]) {
-  assert.match(candidate, new RegExp(`run: ${command.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`));
-}
+]);
 assert.match(candidate, /^    needs: \[resolve, web\]$/m);
 assert.match(candidate, /needs\.web\.result == 'success'/);
 

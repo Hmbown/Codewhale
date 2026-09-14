@@ -2,6 +2,7 @@ pub mod context_reference;
 pub mod fragments;
 pub mod ids;
 pub mod journal;
+pub mod prefix_cache;
 pub mod request;
 pub mod role;
 pub mod session;

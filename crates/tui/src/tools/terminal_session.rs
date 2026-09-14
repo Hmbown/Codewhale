@@ -1065,10 +1065,33 @@ mod tests {
     #[cfg(unix)]
     fn cancel_interrupts_sleep_and_session_survives() {
         let session = fresh("test-cancel");
+        // Prove the interactive shell is initialized before interrupting it.
+        // A SIGINT delivered while `sh -i` is still starting can kill the
+        // shell itself, which later surfaces as EIO on the next PTY write
+        // (hosted macOS run 34716492759 under load).
+        assert!(
+            run(&session, "printf ready", Duration::from_secs(10))
+                .content
+                .contains("ready")
+        );
         let worker = Arc::clone(&session);
         {
             let mut guard = worker.lock().unwrap();
-            start_command(&mut guard, "sleep 10").unwrap();
+            // The quoted split keeps the marker out of the echoed command
+            // line, so seeing it proves the shell reached this command.
+            start_command(&mut guard, "printf 'st''arted'; sleep 10").unwrap();
+        }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let started = output_snapshot(&session.lock().unwrap()).contains("started");
+            if started {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "shell never reached the sleep command"
+            );
+            std::thread::sleep(Duration::from_millis(25));
         }
         let handle = std::thread::spawn(move || {
             let (done, timed_out) = wait_shared_session(&worker, Duration::from_secs(30)).unwrap();

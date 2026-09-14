@@ -282,9 +282,14 @@ async fn contract_read_uses_magic_not_extension_for_images() {
     std::fs::write(temporary.path().join("plain.png"), "ordinary text").expect("text fixture");
     std::fs::write(
         temporary.path().join("renamed.data"),
-        [b"\x89PNG\r\n\x1a\n".as_slice(), b"\0\0\0\rIHDR".as_slice()].concat(),
+        crate::image_attach::tests::PNG_1X1,
     )
     .expect("image fixture");
+    std::fs::write(
+        temporary.path().join("truncated.png"),
+        [b"\x89PNG\r\n\x1a\n".as_slice(), b"\0\0\0\rIHDR".as_slice()].concat(),
+    )
+    .expect("truncated image fixture");
     let context = ToolContext::new(temporary.path());
 
     let text = ReadFileTool::execute_contract_read(json!({"path": "plain.png"}), &context)
@@ -300,6 +305,11 @@ async fn contract_read_uses_magic_not_extension_for_images() {
         codewhale_tools::ToolResultContentBlock::Image { mime_type, .. }
             if mime_type == "image/png"
     ));
+    let truncated = ReadFileTool::execute_contract_read(json!({"path": "truncated.png"}), &context)
+        .await
+        .expect("invalid image retains an omission receipt");
+    assert!(truncated.content_blocks.is_empty());
+    assert!(truncated.content.contains("Image omitted"));
 }
 
 #[test]

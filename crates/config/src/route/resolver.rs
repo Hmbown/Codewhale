@@ -41,7 +41,7 @@ use super::ids::{LogicalModelRef, ModelId, ProviderId, WireModelId};
 use super::offering::{ProviderModelOffering, RouteLimits, bundled_offerings};
 use crate::catalog::{CatalogOffering, bundled_catalog_offerings};
 use crate::provider::WirePolicy;
-use crate::{ProviderKind, opencode_go_chat_model_id, provider_preserves_custom_base_url_model};
+use crate::{ProviderKind, opencode_go_model_id, provider_preserves_custom_base_url_model};
 
 /// A request to resolve into an executable route.
 ///
@@ -360,6 +360,16 @@ impl RouteResolver {
                 require_catalog_match,
             )?
         };
+        if provider_kind == ProviderKind::OpencodeGo {
+            selected.endpoint_key =
+                crate::opencode_go_endpoint_key(selected.wire_model_id.as_str())
+                    .ok_or_else(|| RouteError::UnsupportedModelProtocol {
+                        provider: provider_id.clone(),
+                        model: selected.wire_model_id.as_str().to_string(),
+                        endpoint_key: "unproven".to_string(),
+                    })?
+                    .to_string();
+        }
         if provider_kind == ProviderKind::Deepseek && custom_endpoint {
             selected.endpoint_key = "chat".to_string();
         }
@@ -514,16 +524,14 @@ impl RouteResolver {
         class: ProviderClass,
         require_catalog_match: bool,
     ) -> Result<ResolvedOffering, RouteError> {
-        // OpenCode Go publishes one combined model roster across two wire
-        // protocols. Codewhale's provider is deliberately Chat Completions
-        // only, so this allowlist must sit at the sole route-candidate seam.
-        // In particular, a custom base URL must not reopen generic
-        // LocalOrCustom pass-through for Messages-only model ids.
+        // Go's provider roster owns each model's protocol, including when a
+        // custom base URL is configured. Unknown IDs must not fall through.
         let raw = if provider_kind == ProviderKind::OpencodeGo {
-            opencode_go_chat_model_id(logical_model.raw()).ok_or_else(|| {
-                RouteError::ForeignModelForDirectProvider {
+            opencode_go_model_id(logical_model.raw()).ok_or_else(|| {
+                RouteError::UnsupportedModelProtocol {
                     provider: provider_id.clone(),
                     model: logical_model.raw().to_string(),
+                    endpoint_key: "unproven".to_string(),
                 }
             })?
         } else if provider_kind == ProviderKind::OpencodeZen {
@@ -751,7 +759,26 @@ fn default_offerings() -> Vec<ProviderModelOffering> {
         .map(CatalogOffering::to_offering)
         .collect::<Vec<_>>();
     // Seam first so it wins identity collisions, then asset-only rows follow.
-    for offering in bundled_offerings().into_iter().chain(asset_rows) {
+    let go_metadata: std::collections::HashMap<_, _> = asset_rows
+        .iter()
+        .filter(|row| row.provider.as_str() == "opencode-go")
+        .map(|row| (row.wire_model_id.as_str(), row))
+        .collect();
+    for mut offering in bundled_offerings()
+        .into_iter()
+        .chain(asset_rows.iter().cloned())
+    {
+        // The transport seam must not erase already sourced Go limits/prices.
+        if offering.provider.as_str() == "opencode-go"
+            && let Some(metadata) = go_metadata.get(offering.wire_model_id.as_str())
+        {
+            offering
+                .canonical_model
+                .clone_from(&metadata.canonical_model);
+            offering.limits = metadata.limits;
+            offering.capabilities = metadata.capabilities;
+            offering.pricing.clone_from(&metadata.pricing);
+        }
         let key = (
             offering.provider.as_str().to_string(),
             offering.wire_model_id.as_str().to_string(),

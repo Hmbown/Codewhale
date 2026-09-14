@@ -20,7 +20,7 @@
 //! A `/models` 2xx from Test Connection is reachability only. It is not
 //! model readiness.
 
-use crate::OPENCODE_GO_CHAT_MODELS;
+use crate::opencode_go_models;
 use crate::provider::{credential_help, provider_for_kind};
 use crate::provider_kind::ProviderKind;
 
@@ -115,9 +115,7 @@ impl ProviderSetupTemplate {
             ProviderSetupApply::FirstClass(ProviderKind::OpencodeZen) => {
                 crate::route::opencode_zen_picker_models()
             }
-            ProviderSetupApply::FirstClass(ProviderKind::OpencodeGo) => {
-                OPENCODE_GO_CHAT_MODELS.to_vec()
-            }
+            ProviderSetupApply::FirstClass(ProviderKind::OpencodeGo) => opencode_go_models(),
             ProviderSetupApply::FirstClass(_) | ProviderSetupApply::Compatible => self
                 .default_model()
                 .map(|model| vec![model])
@@ -385,6 +383,43 @@ mod tests {
         }
     }
 
+    /// A host nobody can find is not support. `docs/PROVIDERS.md` is where
+    /// people look to answer "do you have X", and it silently lagged four
+    /// shipped templates — Baseten, Groq, Cerebras and Command Code — until
+    /// someone asked why Baseten was missing. It was not missing; it was
+    /// undocumented, which reads the same from outside.
+    #[test]
+    fn every_compatible_template_is_documented_for_operators() {
+        const DOC: &str = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../docs/PROVIDERS.md"
+        ));
+        let doc = DOC.to_ascii_lowercase();
+        for template in compatible_provider_setup_templates() {
+            assert!(
+                doc.contains(&template.display_name.to_ascii_lowercase()),
+                "{} ships as a setup template but PROVIDERS.md never names it",
+                template.display_name
+            );
+            let url = template
+                .base_url()
+                .expect("a compatible template names its host");
+            assert!(
+                doc.contains(&url.to_ascii_lowercase()),
+                "{} is documented without its base URL, so nobody can configure it",
+                template.display_name
+            );
+            let env = template
+                .api_key_env()
+                .expect("a compatible template names its key env");
+            assert!(
+                doc.contains(&env.to_ascii_lowercase()),
+                "{} is documented without {env}, so nobody can authenticate it",
+                template.display_name
+            );
+        }
+    }
+
     #[test]
     fn compatible_template_ids_do_not_shadow_built_ins() {
         for template in compatible_provider_setup_templates() {
@@ -416,7 +451,7 @@ mod tests {
             ProviderSetupApply::FirstClass(ProviderKind::OpencodeGo)
         );
         assert_eq!(go.base_url(), Some(DEFAULT_OPENCODE_GO_BASE_URL));
-        assert_eq!(go.picker_models(), OPENCODE_GO_CHAT_MODELS);
+        assert_eq!(go.picker_models(), opencode_go_models());
         assert_eq!(go.docs_url(), Some("https://opencode.ai/docs/go/"));
     }
 

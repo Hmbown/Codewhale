@@ -552,7 +552,7 @@ def validate_baseline_transition(current: dict, previous: dict | None) -> list[M
 
 
 def detect_local_baseline_ref(root: Path = REPO_ROOT) -> str | None:
-    """Use the local feature-branch merge-base when available."""
+    """Use the feature-branch merge-base, or the first parent on main."""
     process = subprocess.run(
         ["git", "merge-base", "HEAD", "origin/main"],
         cwd=root,
@@ -560,9 +560,7 @@ def detect_local_baseline_ref(root: Path = REPO_ROOT) -> str | None:
         text=True,
         check=False,
     )
-    if process.returncode != 0:
-        return None
-    baseline = process.stdout.strip()
+    baseline = process.stdout.strip() if process.returncode == 0 else None
     head = subprocess.run(
         ["git", "rev-parse", "HEAD"],
         cwd=root,
@@ -570,7 +568,18 @@ def detect_local_baseline_ref(root: Path = REPO_ROOT) -> str | None:
         text=True,
         check=False,
     ).stdout.strip()
-    return baseline if baseline and baseline != head else None
+    if baseline and baseline != head:
+        return baseline
+    # A main checkout aligned with origin/main still has migration history.
+    # Comparing its parent preserves the ratchet after push and in manual CI.
+    parent = subprocess.run(
+        ["git", "rev-parse", "--verify", "HEAD^"],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return parent.stdout.strip() if parent.returncode == 0 else None
 
 
 # ---------------------------------------------------------------------------

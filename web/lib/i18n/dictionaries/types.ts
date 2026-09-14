@@ -48,16 +48,14 @@ export interface ChromeDict {
   navContributeSecondary: string;
 
   /**
-   * The primary strip: Product / Models / Pricing / Docs. The older six
+   * The primary strip: Product / Models / Docs. The older six
    * (Start, Install, FAQ, Community, Contribute) stay in the dictionary for
    * the compact sheet's second group and the footer.
    */
   navProduct: string;
   navModels: string;
-  navPricing: string;
   navProductSecondary: string;
   navModelsSecondary: string;
-  navPricingSecondary: string;
 
   /**
    * Skip-to-content link rendered before the nav in app/[locale]/layout.tsx.
@@ -165,8 +163,6 @@ export interface ChromeDict {
   footerIssues: string;
   footerContribute: string;
   footerLicense: string;
-  /** Footer link to the pricing page, e.g. "Pricing". */
-  footerPricing: string;
   /** Footer link to the terms route, e.g. "Terms". */
   footerTerms: string;
   /** Footer link to the privacy route, e.g. "Privacy". */

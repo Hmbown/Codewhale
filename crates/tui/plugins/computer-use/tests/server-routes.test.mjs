@@ -13,6 +13,15 @@ import { routeFingerprint } from "../src/transport.mjs";
 
 const ROOT = path.resolve(import.meta.dirname, "..");
 
+// Every control/catalog write the child or server reads must be atomic:
+// a plain writeFileSync is observable mid-write by the polling readers and
+// surfaces as "Unexpected end of JSON input" instead of the fixture's error.
+function writeJsonAtomic(file, value) {
+  const tmp = `${file}.${process.pid}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(value));
+  fs.renameSync(tmp, file);
+}
+
 function fixture(t, backendSource, sshSource) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cu-route-"));
   const log = path.join(dir, "calls.jsonl");
@@ -32,7 +41,9 @@ if (args[0] === 'file' && args[1] === 'recv') {
     const file = process.env.CODEWHALE_CU_STATE_DIR + '/computers.json';
     const catalog = JSON.parse(fs.readFileSync(file));
     catalog.computers.pad.target = control.changeTo;
-    fs.writeFileSync(file, JSON.stringify(catalog));
+    const tmp = file + '.' + process.pid + '.tmp';
+    fs.writeFileSync(tmp, JSON.stringify(catalog));
+    fs.renameSync(tmp, file);
   }
   const layout = { attributes: { bundleName: target, type: 'Button', text: 'OK', bounds: '[0,0][20,20]' } };
   const jpeg = Buffer.from([255,216,255,192,0,11,8,0,120,0,168,1,1,17,0,255,217]);
@@ -68,7 +79,7 @@ if (args[0] === 'file' && args[1] === 'recv') {
   });
   return {
     dir, env,
-    control(value) { fs.writeFileSync(control, JSON.stringify(value)); },
+    control(value) { writeJsonAtomic(control, value); },
     calls() { return fs.existsSync(log) ? fs.readFileSync(log, "utf8").trim().split("\n").filter(Boolean).map(JSON.parse) : []; },
     async tool(name, args = {}) {
       const id = ++nextId;
@@ -236,7 +247,7 @@ test("failed cleanup and catalog rollback cannot resurrect the retired backend",
   const file = path.join(f.dir, "computers.json");
   const catalog = JSON.parse(fs.readFileSync(file));
   catalog.computers.pad = { id: "pad", transport: "local" };
-  fs.writeFileSync(file, JSON.stringify(catalog));
+  writeJsonAtomic(file, catalog);
   assert.equal((await f.tool("key", { text: "ENTER" })).error.code, "cleanup_failed");
   assert.equal(f.calls().filter(call => call.method === "key").length, 0);
   f.control({ failCleanup: false });
@@ -258,7 +269,9 @@ test("a route change during element revalidation refuses dispatch to the old bac
           const file = process.env.CODEWHALE_CU_STATE_DIR + '/computers.json';
           const catalog = JSON.parse(fs.readFileSync(file));
           catalog.computers.pad = {id:'pad',transport:'hdc',target:'B'};
-          fs.writeFileSync(file, JSON.stringify(catalog));
+          const tmp = file + '.' + process.pid + '.tmp';
+          fs.writeFileSync(tmp, JSON.stringify(catalog));
+          fs.renameSync(tmp, file);
           return {found:true,element};
         },
         perform_action: async () => { throw new Error('must never dispatch stale action'); }
@@ -340,7 +353,7 @@ for (const mode of ["backend", "reply", "connection"]) {
           if (local) catalog.computers.pad = { id: "pad", transport: "hdc", target: "B" };
           else catalog.computers.pad.host = "fixture-b.test";
         }
-        fs.writeFileSync(file, JSON.stringify(catalog));
+        writeJsonAtomic(file, catalog);
         f.control({ release: true, failure: mode, failCleanup: change === "cleanup-failed" });
         failed = await pending;
         const expected = mode === "connection"

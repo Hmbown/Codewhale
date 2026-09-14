@@ -347,7 +347,10 @@ impl CommandSessionLifecycleContext for SessionLifecycleAdapter<'_> {
                 if let Err(e) = manager.save_session(&session) {
                     return Err(format!("branch saved but persist failed: {e}"));
                 }
-                app.api_messages = session.messages.clone();
+                app.restore_api_messages(
+                    session.messages.clone(),
+                    &session.journal_message_stamps(),
+                );
                 let leaf_display = session
                     .leaf_id
                     .clone()
@@ -1453,7 +1456,10 @@ fn import_session_container(
     crate::tui::ui::install_offline_queue_transition(app, queue_transition);
     app.current_session_id = Some(new_id.clone());
     app.current_session_metadata = Some(imported.metadata.clone());
-    app.api_messages = imported.messages.clone();
+    app.restore_api_messages(
+        imported.messages.clone(),
+        &imported.journal_message_stamps(),
+    );
     let picker = crate::tui::session_picker::SessionPickerView::new_selecting(
         &app.workspace,
         app.ui_locale,
@@ -1486,7 +1492,7 @@ impl CommandSessionContext for SessionAdapter<'_> {
     }
 
     fn add_message(&mut self, message: Message) {
-        self.host.app.borrow_mut().api_messages.push(message);
+        self.host.app.borrow_mut().push_api_message(message);
     }
 
     fn queued_message_count(&self) -> usize {
@@ -2834,8 +2840,8 @@ impl CommandSkillGroupContext for SkillGroupAdapter<'_> {
 /// Owns every concrete plugin service the live `/plugin` branch closure
 /// consumes: registry reads/mutations, the async mutation/network-policy
 /// bridge (D11), export, legacy executable-tool scan, Kimi managed import,
-/// and the marketplace store. Current main has no invented remote or built-in
-/// `official` catalog; an optional host catalog remains representable.
+/// and the marketplace store. That store projects the bundled first-party
+/// catalog alongside locally added catalogs for every host surface.
 /// Every method borrows `App` only for the duration of one call and converts
 /// host values to portable contract values before returning. Handlers receive
 /// only the portable facet and never name `PluginRegistry`, `LoadedPlugin`,
@@ -3054,21 +3060,31 @@ fn portable_legacy_tool(
 
 /// Convert one TUI marketplace candidate into the portable value.
 fn portable_marketplace_candidate(
+    entry: &crate::plugins::marketplace::store::StoredMarketplaceCatalog,
     candidate: &crate::plugins::marketplace::types::MarketplaceCandidate,
+    registry: &crate::plugins::PluginRegistry,
 ) -> PluginMarketplaceCandidate {
-    let install_plan = match &candidate.install_plan {
-        crate::plugins::marketplace::types::MarketplaceInstallPlan::Supported {
-            spec,
-            source_kind,
-        } => PluginMarketplaceInstallPlan::Supported {
-            spec: spec.clone(),
-            source_kind: source_kind.clone(),
-        },
-        crate::plugins::marketplace::types::MarketplaceInstallPlan::Unsupported {
-            reason, ..
-        } => PluginMarketplaceInstallPlan::Unsupported {
-            reason: reason.clone(),
-        },
+    use crate::plugins::marketplace::document::{
+        CatalogInstallResolution, resolve_candidate_install,
+    };
+    let install_plan = match resolve_candidate_install(entry, candidate, registry) {
+        CatalogInstallResolution::Supported { spec, source_kind } => {
+            PluginMarketplaceInstallPlan::Supported { spec, source_kind }
+        }
+        CatalogInstallResolution::AlreadyPresent { plugin, reason } => {
+            PluginMarketplaceInstallPlan::AlreadyPresent {
+                selector: plugin.id.as_str().to_string(),
+                reason,
+            }
+        }
+        CatalogInstallResolution::Unsupported { reason } => {
+            PluginMarketplaceInstallPlan::Unsupported { reason }
+        }
+        CatalogInstallResolution::HasErrors { diagnostics } => {
+            PluginMarketplaceInstallPlan::Unsupported {
+                reason: diagnostics,
+            }
+        }
     };
     PluginMarketplaceCandidate {
         name: candidate.name.clone(),
@@ -3098,12 +3114,13 @@ fn portable_marketplace_candidate(
 
 /// Convert one stored TUI marketplace catalog (with its source path).
 fn portable_marketplace_catalog_with_source(
-    catalog: &crate::plugins::marketplace::types::MarketplaceCatalog,
-    source_path: Option<&str>,
+    entry: &crate::plugins::marketplace::store::StoredMarketplaceCatalog,
+    registry: &crate::plugins::PluginRegistry,
 ) -> PluginMarketplaceCatalog {
+    let catalog = &entry.catalog;
     PluginMarketplaceCatalog {
         id: catalog.id.as_str().to_string(),
-        source_path: source_path.map(str::to_string),
+        source_path: Some(entry.source_path.clone()),
         display_name: catalog.display_name.clone(),
         description: catalog.description.clone(),
         format: catalog.format.as_str().to_string(),
@@ -3114,7 +3131,7 @@ fn portable_marketplace_catalog_with_source(
         candidates: catalog
             .candidates
             .iter()
-            .map(portable_marketplace_candidate)
+            .map(|candidate| portable_marketplace_candidate(entry, candidate, registry))
             .collect(),
         diagnostics: catalog
             .diagnostics
@@ -3791,12 +3808,7 @@ impl CommandPluginContext for PluginAdapter<'_> {
         let stored = state
             .catalogs()
             .values()
-            .map(|entry| {
-                portable_marketplace_catalog_with_source(
-                    &entry.catalog,
-                    Some(entry.source_path.as_str()),
-                )
-            })
+            .map(|entry| portable_marketplace_catalog_with_source(entry, &app.plugin_registry))
             .collect();
         Ok(PluginMarketplaceState {
             official: None,
@@ -3825,10 +3837,8 @@ impl CommandPluginContext for PluginAdapter<'_> {
         )?;
         let candidate_count = loaded.candidate_count;
         let warning_count = loaded.warning_count;
-        let portable_catalog = portable_marketplace_catalog_with_source(
-            &loaded.entry.catalog,
-            Some(loaded.entry.source_path.as_str()),
-        );
+        let portable_catalog =
+            portable_marketplace_catalog_with_source(&loaded.entry, &app.plugin_registry);
         store.add(&loaded.entry.catalog.id.clone(), loaded.entry)?;
         Ok(PluginMarketplaceAddReceipt {
             name: name.to_string(),
@@ -3875,11 +3885,18 @@ impl CommandPluginContext for PluginAdapter<'_> {
         let spec = match crate::plugins::marketplace::document::resolve_candidate_install(
             &entry,
             candidate_entry,
+            &app.plugin_registry,
         ) {
             crate::plugins::marketplace::document::CatalogInstallResolution::Supported {
                 spec,
                 ..
             } => spec,
+            crate::plugins::marketplace::document::CatalogInstallResolution::AlreadyPresent {
+                reason,
+                ..
+            } => {
+                return Err(escape_review_text(&reason));
+            }
             crate::plugins::marketplace::document::CatalogInstallResolution::Unsupported {
                 reason,
             } => {

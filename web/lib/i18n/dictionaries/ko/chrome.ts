@@ -36,10 +36,8 @@ export const chrome: ChromeDict = {
 
   navProduct: "제품",
   navModels: "모델",
-  navPricing: "요금",
   navProductSecondary: "Product",
   navModelsSecondary: "Models",
-  navPricingSecondary: "Pricing",
 
   skipToContent: "본문으로 건너뛰기",
 
@@ -99,7 +97,6 @@ export const chrome: ChromeDict = {
   footerIssues: "이슈",
   footerContribute: "기여",
   footerLicense: "MIT 라이선스",
-  footerPricing: "가격",
   footerTerms: "이용약관",
   footerPrivacy: "개인정보처리방침",
   footerChangelog: "변경 로그",

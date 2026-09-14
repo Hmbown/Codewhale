@@ -12,7 +12,7 @@
 //! and a rail that prints `0` for the second one is lying in the direction that
 //! makes Codewhale look cheap. Nothing here estimates, derives a token count
 //! from text, or back-fills a missing receipt — values come from
-//! [`AgentRunUsage`], which is populated from immutable per-response route
+//! `AgentRunUsage`, which is populated from immutable per-response route
 //! audits, or they are absent.
 //!
 //! A finished agent keeps the numbers it finished with: rows are built from the
@@ -24,7 +24,7 @@ use crate::tools::subagent::{AgentWorkerRecord, AgentWorkerStatus};
 
 /// What a row is doing, collapsed to one glanceable state.
 ///
-/// Deliberately coarser than [`AgentWorkerStatus`]: the rail needs a glyph and
+/// Deliberately coarser than `AgentWorkerStatus`: the rail needs a glyph and
 /// a sort rank, not the full lifecycle. The precise status stays on the row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

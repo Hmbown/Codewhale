@@ -471,7 +471,7 @@ pub(crate) fn load_staged_skill_snapshots(
     expected_capability_hash: &str,
 ) -> Result<Vec<PluginSkillSnapshot>, String> {
     let staged_manifest = resolve_manifest_path(staged_root)
-        .ok_or_else(|| "staged plugin has no plugin.json or plugin.toml".to_string())?;
+        .ok_or_else(|| "staged plugin has no plugin.json, .claude-plugin/plugin.json, kimi.plugin.json, or plugin.toml".to_string())?;
     let validated = PluginManifest::validate_from_path(&staged_manifest)?;
     if validated.canonical_root != staged_root
         || validated.content_hash != expected_content_hash

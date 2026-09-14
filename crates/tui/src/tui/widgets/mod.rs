@@ -201,14 +201,14 @@ impl ChatWidget {
         // The completion breath is authored decorative motion, so it rides the
         // same motion gate as everything else in the water. Both the column's
         // settle flourish and ambient life's presence read this one clock:
-        // presence needs the settle tail past the breath, the column does not.
+        // the pet needs the settle tail too; the column clips only its light pulse.
         let completion_life_clock = (underwater_atmosphere
             && app.motion_policy().allows_decorative())
         .then_some(())
         .and(app.ocean_completion_started_at)
         .map(|started| started.elapsed().as_millis());
         let completion_elapsed_ms = completion_life_clock
-            .filter(|elapsed| *elapsed < crate::tui::ocean::COMPLETION_BREATH_MS);
+            .filter(|elapsed| *elapsed < crate::tui::ocean::COMPLETION_SETTLE_MS);
         let completion_life_active = completion_life_clock
             .is_some_and(|elapsed| elapsed < crate::tui::ocean::COMPLETION_SETTLE_MS);
         let render_empty_state = should_render_empty_state(app);
@@ -2520,7 +2520,7 @@ fn inline_region_for(area: Rect, body: &[Line<'static>], controls: &[Line<'stati
 /// Terminal rows `lines` occupy under the exact ratatui word-wrap used by the
 /// renderer. Exact measurement keeps localized controls and their mouse
 /// hitboxes aligned without padding the compact approval band.
-fn measure_wrapped_rows(lines: &[Line<'static>], width: u16) -> u16 {
+fn measure_wrapped_rows(lines: &[Line<'_>], width: u16) -> u16 {
     if width == 0 {
         return lines.len() as u16;
     }
@@ -3149,15 +3149,6 @@ impl Renderable for ElevationWidget<'_> {
         use codewhale_localization::tr;
 
         let popup_width = 70.min(area.width.saturating_sub(4));
-        let popup_height = 22.min(area.height.saturating_sub(4));
-        let popup_area = Rect {
-            x: (area.width.saturating_sub(popup_width)) / 2,
-            y: (area.height.saturating_sub(popup_height)) / 2,
-            width: popup_width,
-            height: popup_height,
-        };
-
-        Clear.render(popup_area, buf);
 
         let mut lines = vec![
             Line::from(""),
@@ -3289,6 +3280,74 @@ impl Renderable for ElevationWidget<'_> {
             ]));
         }
 
+        // Reserve the options before the explanation. `Abort` is the last row of
+        // that list, so a card sized to its preamble hides the safe exit with no
+        // scroll rail and no hint that anything is missing. The denial detail is
+        // what gets shortened; the choices never do.
+        //
+        // `Padding::uniform(1)` inside `Borders::ALL` costs two rows and two
+        // columns on each axis.
+        const CHROME: u16 = 4;
+        let inner_width = popup_width.saturating_sub(CHROME);
+        let max_inner_height = area.height.saturating_sub(2).saturating_sub(CHROME);
+
+        let mut option_lines = lines.split_off(option_start);
+        // Each option is a label row followed by a description row. On a terminal
+        // too small for both, the description is chrome and the choice is
+        // content, so the descriptions go first and every option keeps its row.
+        let mut rows_per_option = 2usize;
+        if measure_wrapped_rows(&option_lines, inner_width) > max_inner_height {
+            option_lines = option_lines
+                .into_iter()
+                .enumerate()
+                .filter_map(|(idx, line)| (idx % 2 == 0).then_some(line))
+                .collect();
+            rows_per_option = 1;
+        }
+        let option_rows = measure_wrapped_rows(&option_lines, inner_width);
+        // Trim the denial detail down to the title rather than the option list.
+        let mut truncated = false;
+        while lines.len() > 2
+            && measure_wrapped_rows(&lines, inner_width).saturating_add(option_rows)
+                > max_inner_height
+        {
+            lines.pop();
+            truncated = true;
+        }
+        if truncated {
+            lines.push(Line::from(Span::styled(
+                approval_truncation_hint(self.locale),
+                Style::default().fg(palette::TEXT_MUTED),
+            )));
+        }
+
+        // Row offsets are measured after wrapping, not counted in source lines:
+        // a description that wraps used to push every hitbox below it out of
+        // step with the row the pointer was actually over.
+        let option_row_offsets = {
+            let mut offsets = Vec::with_capacity(self.request.options.len());
+            let mut row = measure_wrapped_rows(&lines, inner_width);
+            for pair in option_lines.chunks(rows_per_option) {
+                let height = measure_wrapped_rows(pair, inner_width);
+                offsets.push((row, height));
+                row = row.saturating_add(height);
+            }
+            offsets
+        };
+        lines.extend(option_lines);
+
+        let popup_height = measure_wrapped_rows(&lines, inner_width)
+            .saturating_add(CHROME)
+            .min(area.height.saturating_sub(2));
+        let popup_area = Rect {
+            x: (area.width.saturating_sub(popup_width)) / 2,
+            y: (area.height.saturating_sub(popup_height)) / 2,
+            width: popup_width,
+            height: popup_height,
+        };
+
+        Clear.render(popup_area, buf);
+
         let title = tr(self.locale, MessageId::ElevationTitleRequired);
         let block = Block::default()
             .title(title)
@@ -3300,11 +3359,10 @@ impl Renderable for ElevationWidget<'_> {
         if let Some(hitboxes) = self.hitboxes {
             hitboxes.borrow_mut().clear();
             let content = block.inner(popup_area);
-            for i in 0..self.request.options.len() {
-                let y = content
-                    .y
-                    .saturating_add(u16::try_from(option_start + i * 2).unwrap_or(u16::MAX));
-                let height = 2u16.min(content.y.saturating_add(content.height).saturating_sub(y));
+            let content_bottom = content.y.saturating_add(content.height);
+            for (offset, rows) in option_row_offsets {
+                let y = content.y.saturating_add(offset);
+                let height = rows.min(content_bottom.saturating_sub(y));
                 if height > 0 {
                     hitboxes
                         .borrow_mut()
@@ -6278,7 +6336,7 @@ mod tests {
     #[test]
     fn composer_height_prefers_panel_shape_when_space_allows() {
         let height = composer_height("", 40, 8, 0, ComposerDensity::Comfortable, true);
-        assert_eq!(height, 3);
+        assert_eq!(height, 4);
     }
 
     #[test]
@@ -6291,7 +6349,7 @@ mod tests {
         let widget = ComposerWidget::new(&app, 8, &slash_menu_entries, &mention_menu_entries);
 
         for (width, expected_panel, expected_height) in
-            [(11, false, 2), (12, true, 3), (13, true, 3), (14, true, 3)]
+            [(11, false, 3), (12, true, 4), (13, true, 4), (14, true, 4)]
         {
             let height = widget.desired_height(width);
             let area = Rect::new(0, 0, width, height);
@@ -6300,8 +6358,8 @@ mod tests {
             assert_eq!(widget.has_panel(area), expected_panel, "width={width}");
             assert_eq!(
                 widget.inner_area(area).height,
-                1,
-                "width={width} auto-fit composer reserves one input row plus \
+                2,
+                "width={width} comfortable composer reserves two input rows plus \
                  every rendered border row"
             );
 
@@ -6316,7 +6374,7 @@ mod tests {
                 let shell = crate::tui::composer_chrome::tideline_composer_geometry(area);
                 assert_eq!(
                     widget.inner_area(area),
-                    Rect::new(1, 1, shell.content.right().saturating_sub(1), 1,),
+                    Rect::new(1, 1, shell.content.right().saturating_sub(1), 2,),
                     "width={width} panel input area must reserve the send control and breathing cell"
                 );
                 assert_eq!(buf[(area.left(), area.top())].symbol(), "\u{256d}");
@@ -6347,7 +6405,7 @@ mod tests {
             } else {
                 assert_eq!(
                     widget.inner_area(area),
-                    Rect::new(area.x, area.y.saturating_add(1), area.width, 1),
+                    Rect::new(area.x, area.y.saturating_add(1), area.width, 2),
                     "width={width} compact fallback must keep its full input width"
                 );
                 assert_ne!(buf[(area.left(), area.top())].symbol(), "\u{256d}");
@@ -6381,8 +6439,8 @@ mod tests {
         let expanded = height_for("one\ntwo\nthree\nfour\nfive\nsix");
         let collapsed_again = height_for("short");
 
-        // Auto-fit: one input row + top/bottom panel borders.
-        assert_eq!(collapsed, 3);
+        // Comfortable: two input rows + top/bottom panel borders.
+        assert_eq!(collapsed, 4);
         // Six content rows + two borders, still under the Comfortable cap of 9.
         assert_eq!(expanded, 8);
         assert!(expanded > collapsed);
@@ -6393,7 +6451,7 @@ mod tests {
     /// real widget path — typed input, `submit_input`, `clear_input` — not just
     /// through the pure height helper.
     #[test]
-    fn composer_auto_fits_typed_lines_and_returns_to_one_row_on_submit_or_clear() {
+    fn composer_auto_fits_typed_lines_and_returns_to_density_floor_on_submit_or_clear() {
         const WIDTH: u16 = 40;
         const AVAILABLE: u16 = 24;
 
@@ -6411,11 +6469,11 @@ mod tests {
         app.composer_border = true;
         app.composer_density = ComposerDensity::Comfortable;
 
-        // Empty composer: one input row inside the panel borders.
-        assert_eq!(measure(&app), (3, 1), "empty composer");
+        // Empty composer: one input row and one quiet row inside the borders.
+        assert_eq!(measure(&app), (4, 2), "empty composer");
 
         app.insert_str("one line");
-        assert_eq!(measure(&app), (3, 1), "single-line composer");
+        assert_eq!(measure(&app), (4, 2), "single-line composer");
 
         // Typing N lines grows the composer to N input rows while N is under
         // the Comfortable cap of 9 total rows (7 input rows + 2 borders).
@@ -6435,15 +6493,15 @@ mod tests {
         let cap = composer_max_height(ComposerDensity::Comfortable);
         assert_eq!(measure(&app), (cap, cap - 2), "content beyond the cap");
 
-        // Submitting returns the composer to a single input row.
+        // Submitting returns the composer to its stable density floor.
         assert!(app.submit_input().is_some());
-        assert_eq!(measure(&app), (3, 1), "after submit");
+        assert_eq!(measure(&app), (4, 2), "after submit");
 
         // So does clearing a fresh multi-line draft.
         app.insert_str("a\nb\nc\nd");
         assert_eq!(measure(&app), (6, 4), "four-line draft");
         app.clear_input();
-        assert_eq!(measure(&app), (3, 1), "after clear");
+        assert_eq!(measure(&app), (4, 2), "after clear");
     }
 
     #[test]
@@ -6451,10 +6509,10 @@ mod tests {
         let with_border = composer_height("", 40, 8, 0, ComposerDensity::Comfortable, true);
         let without_border = composer_height("", 40, 8, 0, ComposerDensity::Comfortable, false);
 
-        // Quiet composer keeps a single top rule over the one auto-fit
-        // input row; the panel shape adds its bottom border.
-        assert_eq!(with_border, 3);
-        assert_eq!(without_border, 2);
+        // Quiet composer keeps a single top rule over the comfortable
+        // input floor; the panel shape adds its bottom border.
+        assert_eq!(with_border, 4);
+        assert_eq!(without_border, 3);
         assert!(without_border < with_border);
     }
 
@@ -7068,7 +7126,7 @@ mod tests {
             height: 3,
         };
 
-        assert_eq!(widget.cursor_pos(area), Some((2, 2)));
+        assert_eq!(widget.cursor_pos(area), Some((2, 1)));
     }
 
     #[test]
@@ -7220,6 +7278,34 @@ mod tests {
             widget.life_presence_fixed > 0,
             "full motion should still get the completion breath"
         );
+    }
+
+    #[test]
+    fn dot_whale_gets_the_motion_gated_completion_settle_clock() {
+        let mut app = create_test_app();
+        app.low_motion = false;
+        app.fancy_animations = true;
+        app.ocean_completion_started_at =
+            Some(Instant::now() - std::time::Duration::from_millis(900));
+        let widget = ChatWidget::new(&mut app, Rect::new(0, 0, 100, 24));
+        let age = widget
+            .ocean_column
+            .and_then(|column| column.completion_elapsed_ms());
+        assert!(
+            age.is_some_and(|age| (800..1_400).contains(&age)),
+            "{age:?}"
+        );
+        assert!(widget.life_presence_fixed > 0 && widget.life_presence_fixed < 1_000);
+
+        app.low_motion = true;
+        let still = ChatWidget::new(&mut app, Rect::new(0, 0, 100, 24));
+        assert_eq!(
+            still
+                .ocean_column
+                .and_then(|column| column.completion_elapsed_ms()),
+            None
+        );
+        assert_eq!(still.life_presence_fixed, 0);
     }
 
     #[test]

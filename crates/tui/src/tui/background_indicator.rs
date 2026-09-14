@@ -463,6 +463,7 @@ mod tests {
         let options = crate::test_support::test_tui_options(std::path::PathBuf::from("."));
         let mut app = crate::test_support::test_app_with_options(options);
         let running = |agent_id: &str, name: &str| SubAgentResult {
+            usage: None,
             name: name.to_string(),
             agent_id: agent_id.to_string(),
             context_mode: "fresh".to_string(),

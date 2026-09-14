@@ -373,6 +373,13 @@ impl FleetManager {
         if let Some(error) = roster.load_error() {
             bail!("cannot create Fleet run: {error}");
         }
+        for task in &doc.tasks {
+            if let Some(worker) = &task.worker
+                && let Some(selector) = worker.agent_profile.as_deref().or(worker.role.as_deref())
+            {
+                roster.resolve_member(selector)?;
+            }
+        }
         worker_runtime::freeze_fleet_task_members(
             &mut doc.tasks,
             roster.members(),
@@ -3696,6 +3703,45 @@ mod tests {
     }
 
     #[test]
+    fn issue_6117_fleet_rejects_invalid_personal_override_before_journal_creation() {
+        let _env = crate::test_support::lock_test_env();
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("state");
+        let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", &home);
+        std::fs::create_dir_all(home.join("agents")).unwrap();
+        std::fs::write(
+            home.join("agents/scout.toml"),
+            "allow_shell = true\ntrust = true\n",
+        )
+        .unwrap();
+        let manager = test_manager(tmp.path()).unwrap();
+        for (profile, role) in [(Some("scout"), None), (None, Some("explore"))] {
+            let mut task = task("task-a");
+            task.worker = Some(FleetTaskWorkerProfile {
+                agent_profile: profile.map(str::to_string),
+                role: role.map(str::to_string),
+                loadout: None,
+                model_class: None,
+                model: None,
+                tool_profile: None,
+                tools: Vec::new(),
+                capabilities: Vec::new(),
+            });
+            let doc = FleetTaskSpecDocument {
+                name: None,
+                labels: BTreeMap::new(),
+                security_policy: None,
+                workers: Vec::new(),
+                tasks: vec![task],
+                usage_ceiling: None,
+            };
+            let error = manager.create_queued_run(doc, 1).unwrap_err().to_string();
+            assert!(error.contains("scout.toml"), "{error}");
+            assert!(manager.ledger.rebuild_state().unwrap().runs.is_empty());
+        }
+    }
+
+    #[test]
     fn fleet_manager_inspect_exposes_heartbeat_artifacts_and_errors() {
         let tmp = TempDir::new().unwrap();
         let manager = test_manager(tmp.path()).unwrap();
@@ -4123,7 +4169,18 @@ exit 0
         {
             let mut guard = coordination.try_write().unwrap();
             let mut corrupt = guard.get_worker_record(&worker_id).unwrap().spec;
-            corrupt.max_spawn_depth = corrupt.max_spawn_depth.saturating_add(1);
+            assert_eq!(corrupt.max_spawn_depth, 0, "Fleet workers are leaves");
+            // Reload intersects the outer cap with the runtime profile. Widen
+            // every persisted ceiling so the actual corruption survives that
+            // safety clamp and reaches the exact task-lease validation.
+            corrupt.max_spawn_depth = 1;
+            corrupt.runtime_profile.max_spawn_depth = 1;
+            corrupt
+                .launch_manifest
+                .as_mut()
+                .unwrap()
+                .profile
+                .max_spawn_depth = 1;
             guard
                 .replace_registered_worker_spec_for_test(corrupt)
                 .unwrap();
@@ -4133,6 +4190,24 @@ exit 0
 
         let reloaded_coordination =
             crate::tools::subagent::new_shared_subagent_manager(tmp.path().to_path_buf(), 2);
+        let corrupt = reloaded_coordination
+            .try_read()
+            .unwrap()
+            .get_worker_record(&worker_id)
+            .unwrap()
+            .spec;
+        assert_eq!(corrupt.max_spawn_depth, 1);
+        assert_eq!(corrupt.runtime_profile.max_spawn_depth, 1);
+        assert_eq!(
+            corrupt
+                .launch_manifest
+                .as_ref()
+                .unwrap()
+                .profile
+                .max_spawn_depth,
+            1
+        );
+        assert!(corrupt.runtime_profile.can_spawn_child());
         let reloaded = test_manager(tmp.path())
             .unwrap()
             .with_sub_agent_manager(reloaded_coordination);
@@ -4152,6 +4227,75 @@ exit 0
             1
         );
         assert!(state.restarted_events.is_empty());
+    }
+
+    #[test]
+    fn prepared_restart_clamps_outer_only_depth_inflation_after_reload() {
+        let tmp = TempDir::new().unwrap();
+        let coordination =
+            crate::tools::subagent::new_shared_subagent_manager(tmp.path().to_path_buf(), 2);
+        let manager = test_manager(tmp.path())
+            .unwrap()
+            .with_sub_agent_manager(coordination.clone());
+        let path = task_spec_file(&tmp, vec![task("task-a")]);
+        let report = manager.create_run_from_task_spec_path(&path, 1).unwrap();
+        let worker_id = report.worker_ids[0].clone();
+        manager.ledger.fail_next_restart_append_after_callback();
+        manager
+            .restart_worker(&worker_id)
+            .expect_err("failpoint leaves generation two prepared");
+        {
+            let mut guard = coordination.try_write().unwrap();
+            let mut inflated = guard.get_worker_record(&worker_id).unwrap().spec;
+            assert_eq!(inflated.max_spawn_depth, 0);
+            assert_eq!(inflated.runtime_profile.max_spawn_depth, 0);
+            inflated.max_spawn_depth = 1;
+            guard
+                .replace_registered_worker_spec_for_test(inflated)
+                .unwrap();
+        }
+        drop(manager);
+        drop(coordination);
+
+        let reloaded_coordination =
+            crate::tools::subagent::new_shared_subagent_manager(tmp.path().to_path_buf(), 2);
+        let narrowed = reloaded_coordination
+            .try_read()
+            .unwrap()
+            .get_worker_record(&worker_id)
+            .unwrap()
+            .spec;
+        assert_eq!(narrowed.max_spawn_depth, 0);
+        assert_eq!(narrowed.runtime_profile.max_spawn_depth, 0);
+        let manifest = narrowed.launch_manifest.as_ref().unwrap();
+        assert_eq!(manifest.profile.max_spawn_depth, 0);
+        assert_eq!(manifest.generation, 2);
+        assert!(!narrowed.runtime_profile.can_spawn_child());
+        assert!(!manifest.profile.can_spawn_child());
+
+        let reloaded = test_manager(tmp.path())
+            .unwrap()
+            .with_sub_agent_manager(reloaded_coordination.clone());
+        reloaded
+            .restart_worker(&worker_id)
+            .expect("a reload-narrowed leaf still matches the exact prepared lease");
+        let committed = reloaded_coordination
+            .try_read()
+            .unwrap()
+            .get_worker_record(&worker_id)
+            .unwrap()
+            .spec;
+        assert_eq!(
+            committed, narrowed,
+            "restart must not restore the inflated cap"
+        );
+        let state = reloaded.rebuild_state().unwrap();
+        assert_eq!(
+            state.tasks[&task_key(&report.run_id.0, "task-a")]
+                .entry
+                .attempts,
+            2
+        );
     }
 
     #[cfg(unix)]

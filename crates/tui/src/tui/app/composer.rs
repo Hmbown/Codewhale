@@ -896,7 +896,7 @@ impl App {
             self.status_message = Some(self.tr(MessageId::ClipboardSshPasteHint).into_owned());
             return false;
         }
-        if let Some(content) = self.clipboard.read(self.workspace.as_path()) {
+        if let Some(content) = self.clipboard.read_markdown(self.workspace.as_path()) {
             self.apply_clipboard_content(content);
             return true;
         }

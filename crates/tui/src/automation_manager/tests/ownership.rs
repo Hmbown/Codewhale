@@ -71,6 +71,7 @@ async fn explicit_run_now_adopts_expired_legacy_once_but_does_not_rebind_old_adm
         task.id
     );
     scheduler_tick_shared(&shared, &tasks).await?;
+    reconcile_run_statuses_shared(&shared, &tasks).await?;
     assert_eq!(fixture_executions(&receipts), vec![id]);
     assert_eq!(
         fs::read(old_path)?,
@@ -116,6 +117,102 @@ async fn foreign_scoped_automation_and_unbound_trigger_never_dispatch_through_cu
     assert!(fixture_executions(&receipts).is_empty());
     assert!(tasks.list_tasks(None).await?.is_empty());
     assert_eq!(fs::read(path)?, before);
+    tasks.shutdown_and_wait().await?;
+    Ok(())
+}
+
+/// Two runtimes sharing a store must not reconcile each other's receipts: a
+/// foreign-scope pending run stays byte-identical and its binding is never
+/// probed by the local process.
+#[tokio::test]
+async fn reconcile_leaves_foreign_scope_run_receipts_untouched() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let receipts = root.path().join("executions");
+    let tasks = fixture_tasks(&root.path().join("tasks"), &receipts).await?;
+    let manager = AutomationManager::open_for_test(root.path().join("automations"))?;
+    let automation = fixture_due_automation(&manager, "owned", 1);
+    let mut foreign = queued_run_for(&automation);
+    bind_run_dispatch(&mut foreign, &automation, &tasks.data_dir(), false)?;
+    foreign
+        .dispatch
+        .as_mut()
+        .context("bound dispatch")?
+        .execution_scope = Some(crate::task_manager::test_execution_scope("foreign"));
+    manager.save_run(&foreign)?;
+    let path = manager.run_path(&foreign)?;
+    let before = fs::read(&path)?;
+
+    let shared = Arc::new(Mutex::new(manager));
+    reconcile_run_statuses_shared(&shared, &tasks).await?;
+
+    assert_eq!(
+        fs::read(&path)?,
+        before,
+        "a foreign-scope receipt is not touched by local reconciliation"
+    );
+    let stored = shared
+        .lock()
+        .await
+        .list_runs(&automation.id, None)?
+        .into_iter()
+        .find(|run| run.id == foreign.id)
+        .context("foreign receipt still listed")?;
+    assert_eq!(stored.status, AutomationRunStatus::Queued);
+    assert!(stored.error.is_none());
+    tasks.shutdown_and_wait().await?;
+    Ok(())
+}
+
+/// An accepted run whose bound task vanished from the store is a finished
+/// fact: the receipt goes terminally Failed once instead of being retried
+/// every tick forever.
+#[tokio::test]
+async fn accepted_run_with_missing_bound_task_settles_failed() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let receipts = root.path().join("executions");
+    let tasks = fixture_tasks(&root.path().join("tasks"), &receipts).await?;
+    let manager = AutomationManager::open_for_test(root.path().join("automations"))?;
+    let automation = fixture_due_automation(&manager, "orphan", 1);
+    let mut run = queued_run_for(&automation);
+    bind_run_dispatch(&mut run, &automation, &tasks.data_dir(), false)?;
+    run.dispatch.as_mut().context("bound dispatch")?.accepted = true;
+    manager.save_run(&run)?;
+
+    let shared = Arc::new(Mutex::new(manager));
+    reconcile_run_statuses_shared(&shared, &tasks).await?;
+
+    let stored = shared
+        .lock()
+        .await
+        .list_runs(&automation.id, None)?
+        .into_iter()
+        .find(|row| row.id == run.id)
+        .context("settled receipt still listed")?;
+    assert_eq!(stored.status, AutomationRunStatus::Failed);
+    assert!(stored.ended_at.is_some());
+    assert!(
+        stored
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("missing"),
+        "terminal receipt names the cause: {:?}",
+        stored.error
+    );
+    let failed_at = stored.ended_at.context("ended_at set")?;
+    reconcile_run_statuses_shared(&shared, &tasks).await?;
+    let settled = shared
+        .lock()
+        .await
+        .list_runs(&automation.id, None)?
+        .into_iter()
+        .find(|row| row.id == run.id)
+        .context("settled receipt still listed")?;
+    assert_eq!(
+        settled.ended_at,
+        Some(failed_at),
+        "settled once, idempotent"
+    );
     tasks.shutdown_and_wait().await?;
     Ok(())
 }

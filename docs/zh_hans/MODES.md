@@ -6,11 +6,13 @@ Codewhale 有三个相关概念:
 
 - **TUI 模式**:你当前处于哪种可见交互(Plan/Work/Operate)。
 - **权限姿态(permission posture)**:UI 在执行工具前主动询问的激进程度。
-- **工作流叠加(workflow overlay)**:可选的长时间运行编排，当任务需要许多协调的 worker 时，可以在任何 TUI 模式之上运行。
+- **工作流(Workflow)**:通过命名步骤、依赖和结果协调子智能体，可在任何 TUI 模式中使用。
 
 模型选择是独立的。`--model auto` 和 `/model auto` 把每一轮路由到具体的模型与思考级别；它们不是 TUI 模式，也不属于 `Tab` 循环。
 
-工作流也独立于模式本身。它是可重复工作流和 Fleet worker 的可见的有序编排层。高扇出通过持久的 Fleet-backed worker 路由，而不是纯提示词的子智能体扇出。活动的模式仍然控制权限；工作流控制一个大型任务是否被规划成带自有进度视图的可恢复工作流。
+Workflow 通过同一个子智能体运行时执行命名步骤；Fleet 管理这些子智能体的角色和模型配置。工作流提供顺序、结果交接、验证关卡和进度视图。当前模式和权限设置仍然决定每一步可以执行什么。
+
+分配步骤前，先通过 `agent(action="roster")` 查看已保存的 Fleet 模型和角色。计划中的子任务可以用 `model` 选择列表中的模型，也可以使用已保存的 `role`/`profile` 配置。Exact Fleet 会固定每个成员的路由。
 
 ## TUI 模式
 
@@ -18,7 +20,7 @@ Codewhale 有三个相关概念:
 
 - **Plan**:设计优先的提示方式。稳定的原语名称保持熟悉，但运行时集中拒绝文件修改和 shell 执行。只读检查与策略允许的研究(包括延迟的 Web 搜索/抓取)仍然可用。
 - **Work**(内部为 `agent`):普通的多步执行。第一回合的工具箱包含 `read`、`write`、`edit`、`bash`、`agent` 和 `todo_write`，以及无需搜索即可使用的目标控制工具 `create_goal`、`get_goal` 和 `update_goal`。创建目标仍须用户明确要求；审批、沙箱、仓库法和托管策略决定什么可以执行。
-- **Operate**:多任务指挥姿态。它与 Work 拥有相同的原语身份和执行权限。父会话是 **operator**:派发后台 worker 是独立或并行工作的默认方式。小而紧密耦合的任务在父会话中处理；可分离的流用后台 `agent` worker,当顺序、阶段、门、共享预算或确定性汇入重要时使用 Workflow。**派发不等于完成** — 有写权限的子智能体必须返回真实的验证证据。
+- **Operate**:通过计划中的步骤和已验证的结果推进目标。它与 Work 使用相同的工具和执行权限，Fleet 管理执行这些步骤的子智能体及其角色。小任务或紧密耦合的工作由父会话直接完成。多步骤委派先列出步骤、依赖、明确的文件范围和完成检查，再通过现有 Workflow 执行。独立步骤可以并行；下一阶段接收上一阶段的结果，缺少必要结果时不会启动依赖它的工作。单个独立任务可以直接调用 `agent`；修改应通过 followup 复用已有子智能体。进度按已完成、受阻和下一步汇报。**派发不等于完成** — 有写权限的子智能体必须返回真实的验证证据。
 
 `Act` 和 `/mode act` 仍然是 Work 的兼容别名。保存的设置仍然规范化为内部值 `agent`。
 
@@ -39,13 +41,14 @@ Operate 改变的是调度重点，而不是权限。它既不增加特定于模
 ### Operate 循环(一屏)
 
 ```text
-User message
-  → small / chat / one-file?  → parent does it (Work-equivalent tools)
-  → real / multi-stream work? → goal (if needed) → dispatch background workers
-       → each write child: implement → VERDICT PASS/FAIL with evidence
-       → ordered / gated fan-in? → Workflow (operate_* starters)
-       → high-stakes ambiguous? → best-of-n (N worktrees + reviewer; apply on PASS)
-  → parent synthesizes receipts; stays free for the next ask
+用户消息
+  → 小任务 / 对话 / 单文件？ → 父会话直接处理
+  → 多步骤工作？ → 目标 → 命名步骤 + 依赖 + 完成检查
+       → Workflow 阶段 → 独立子智能体并行执行
+       → 收集结果 → 检查证据 → 交给下一阶段
+       → 缺少必要结果？ → 停止依赖工作并修复该步骤
+       → 单个独立任务？ → 直接委派一个子智能体
+  → 父会话整合结果，汇报已完成、受阻和下一步
 ```
 
 生命周期声明保持精确：已派发 ≠ 已定案 ≠ 已验证。

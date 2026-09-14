@@ -128,6 +128,15 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> Option<Option<SidebarRowActio
         }
     }
 
+    if matches!(key.code, KeyCode::Char(_))
+        && !key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
+    {
+        release_focus(app);
+        return None;
+    }
+
     // Keyboard and mouse share one row source per panel: Enter on the
     // selected row must open the same world a click would. An explicitly
     // opened empty view still owns Esc (close) so cycling into "no files
@@ -143,15 +152,6 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> Option<Option<SidebarRowActio
             app.needs_redraw = true;
             return Some(None);
         }
-        return None;
-    }
-
-    if matches!(key.code, KeyCode::Char(_))
-        && !key
-            .modifiers
-            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
-    {
-        release_focus(app);
         return None;
     }
 
@@ -537,12 +537,23 @@ fn move_selection(app: &mut App, rows: &[WorkRow], delta: isize) {
     if ids.is_empty() {
         return;
     }
-    let current = app
+    let Some(current) = app
         .work_surface
         .selected
         .as_ref()
         .and_then(|selected| ids.iter().position(|id| id == selected))
-        .unwrap_or_default();
+    else {
+        // Nothing selected — the dock opens this way, and a stale id lands here
+        // too. `unwrap_or_default()` called that row 0, so the first Down moved
+        // to row 1 and the first row could never be reached by pressing Down.
+        // The first move lands on the edge it came from.
+        app.work_surface.selected = Some(if delta.is_negative() {
+            ids[ids.len().saturating_sub(1)].clone()
+        } else {
+            ids[0].clone()
+        });
+        return;
+    };
     let next = if delta.is_negative() {
         current.saturating_sub(delta.unsigned_abs())
     } else {
@@ -560,4 +571,59 @@ fn select_edge(app: &mut App, rows: &[WorkRow], end: bool) {
     } else {
         ids.first().cloned()
     };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{App, WorkRow, move_selection};
+    use crate::tui::work_surface::model::{WorkRowId, WorkTone};
+
+    fn row(id: &str) -> WorkRow {
+        WorkRow {
+            id: WorkRowId(id.to_string()),
+            mark: "·",
+            label: id.to_string(),
+            detail: String::new(),
+            tone: WorkTone::Muted,
+            selectable: true,
+            primary_action: None,
+            agent: None,
+        }
+    }
+
+    fn app() -> App {
+        App::new(
+            crate::test_support::test_tui_options(std::path::PathBuf::from(".")),
+            &crate::config::Config::default(),
+        )
+    }
+
+    /// The dock opens with nothing selected (`select_dock_panel` sets
+    /// `selected = None`). Resolving that to index 0 meant the first Down
+    /// landed on the *second* row and the first row could never be reached by
+    /// pressing Down at all. The same path catches a stale id that is no
+    /// longer in the list.
+    #[test]
+    fn first_move_lands_on_the_edge_it_came_from() {
+        let rows = [row("a"), row("b"), row("c")];
+
+        for (start, delta, expected) in [
+            (None, 1isize, "a"),
+            (None, -1, "c"),
+            (Some("gone"), 1, "a"),
+            (Some("gone"), -1, "c"),
+            // An established selection still moves by the delta.
+            (Some("a"), 1, "b"),
+            (Some("b"), -1, "a"),
+        ] {
+            let mut app = app();
+            app.work_surface.selected = start.map(|id| WorkRowId(id.to_string()));
+            move_selection(&mut app, &rows, delta);
+            assert_eq!(
+                app.work_surface.selected.as_ref().map(|id| id.0.as_str()),
+                Some(expected),
+                "start={start:?} delta={delta}"
+            );
+        }
+    }
 }

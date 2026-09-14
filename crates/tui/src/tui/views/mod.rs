@@ -44,6 +44,7 @@ pub mod workflows_manager;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModalKind {
+    PetHabitat,
     Approval,
     Elevation,
     UserInput,
@@ -789,6 +790,26 @@ pub enum ViewEvent {
         provider_id: Option<String>,
         model: String,
     },
+    /// Enter on a Fleet editor row: open the standard `/model` picker for
+    /// that row (the editor stays underneath) instead of the editor's own
+    /// inline route list.
+    FleetDetailRoutePickRequested {
+        target: crate::tui::views::fleet_detail::FleetRouteTarget,
+        editor_id: uuid::Uuid,
+    },
+    /// The `/model` picker, opened for a Fleet editor row, resolved a route.
+    /// Carries the row's absolute route — never a diff against the session —
+    /// and the host applies and saves it on the editor still on the stack.
+    /// The picker's `auto` row means "inherit the session route".
+    FleetRoutePicked {
+        target: crate::tui::views::fleet_detail::FleetRouteTarget,
+        editor_id: uuid::Uuid,
+        provider: crate::config::ApiProvider,
+        /// Exact named route for `Custom`; built-in providers leave this unset.
+        provider_id: Option<String>,
+        model: String,
+        reasoning: Option<crate::reasoning_preference::ReasoningEffort>,
+    },
     ModelPickerNeedsAuth {
         provider: crate::config::ApiProvider,
         model: String,
@@ -1067,6 +1088,22 @@ pub enum ViewEvent {
     LaunchResumeConfirmed {
         session_id: String,
     },
+    /// A slash command an Extensions row activated in place: the panel stays
+    /// open, the host runs the command through the normal command path, then
+    /// hands the panel a fresh snapshot so every row re-reads live state.
+    /// When `pager_title` is set, the command's text output renders in a
+    /// pager stacked on the panel rather than landing in the transcript.
+    ExecutePanelCommand {
+        command: String,
+        pager_title: Option<String>,
+    },
+    /// The open Extensions panel's bounded poll: the host rebuilds the read
+    /// model only when the MCP snapshot generation or the initializing flag
+    /// moved past what the panel's snapshot last saw.
+    RefreshExtensions {
+        mcp_generation: u64,
+        mcp_initializing: bool,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -1245,10 +1282,11 @@ impl ViewStack {
     }
 
     pub fn update_subagents(&mut self, agents: &[SubAgentResult]) -> bool {
-        self.views
-            .last_mut()
-            .map(|view| view.update_subagents(agents))
-            .unwrap_or(false)
+        let mut updated = false;
+        for view in &mut self.views {
+            updated |= view.update_subagents(agents);
+        }
+        updated
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> Vec<ViewEvent> {
@@ -1305,6 +1343,27 @@ impl ViewStack {
             }
         }
         events
+    }
+
+    /// Whether the Extensions panel is the top view.
+    pub fn extensions_is_top(&self) -> bool {
+        self.views
+            .last()
+            .is_some_and(|view| view.kind() == ModalKind::Extensions)
+    }
+
+    /// Hand a freshly-built read model to the open Extensions panel, when it
+    /// is on top. A pager or another modal stacked above it means the user is
+    /// looking at something else — the rebuild is skipped and the next poll
+    /// retries.
+    pub fn refresh_extensions(&mut self, snapshot: extensions::ExtensionsSnapshot) {
+        if let Some(view) = self.views.last_mut()
+            && let Some(panel) = view
+                .as_any_mut()
+                .downcast_mut::<extensions::ExtensionsView>()
+        {
+            panel.refresh_snapshot(snapshot);
+        }
     }
 }
 
@@ -5479,6 +5538,7 @@ fn live_subagent_result(
     nickname: Option<String>,
 ) -> SubAgentResult {
     SubAgentResult {
+        usage: None,
         name: agent_id.to_string(),
         agent_id: agent_id.to_string(),
         context_mode: "fresh".to_string(),
@@ -5723,10 +5783,17 @@ impl ModalView for SubAgentsView {
     }
 
     fn update_subagents(&mut self, agents: &[SubAgentResult]) -> bool {
+        let selected_id = self.ordered_agent_ids().get(self.selected).cloned();
         self.agents = agents.to_vec();
         let last = self.agents.len().saturating_sub(1);
         self.scroll = self.scroll.min(last);
-        self.selected = self.selected.min(last);
+        self.selected = selected_id
+            .and_then(|id| {
+                self.ordered_agent_ids()
+                    .iter()
+                    .position(|candidate| candidate == &id)
+            })
+            .unwrap_or_else(|| self.selected.min(last));
         true
     }
 
@@ -6944,6 +7011,7 @@ mod tests {
 
     fn manager_agent(id: &str, status: SubAgentStatus) -> SubAgentResult {
         SubAgentResult {
+            usage: None,
             name: id.to_string(),
             agent_id: id.to_string(),
             context_mode: "fresh".to_string(),
@@ -6971,6 +7039,21 @@ mod tests {
             started_at: None,
             from_prior_session: false,
         }
+    }
+
+    #[test]
+    fn worker_register_update_preserves_selected_agent_across_new_spawns() {
+        let mut view = SubAgentsView::new(vec![manager_agent("b", SubAgentStatus::Running)]);
+        view.update_subagents(&[
+            manager_agent("a", SubAgentStatus::Running),
+            manager_agent("b", SubAgentStatus::Running),
+        ]);
+        assert_eq!(view.ordered_agent_ids()[view.selected], "b");
+        view.update_subagents(&[
+            manager_agent("a", SubAgentStatus::Running),
+            manager_agent("b", SubAgentStatus::Completed),
+        ]);
+        assert_eq!(view.ordered_agent_ids()[view.selected], "b");
     }
 
     #[test]

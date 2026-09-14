@@ -36,6 +36,21 @@ pub enum KeybindingSection {
 }
 
 impl KeybindingSection {
+    /// Every section, in declaration order. Callers that need to walk the set —
+    /// the help overlay's fold defaults, its rank lookup — read this instead of
+    /// restating the list, which is how `Pointer` came to be missing from one
+    /// of them and not the other.
+    pub const ALL: [Self; 8] = [
+        Self::Navigation,
+        Self::Editing,
+        Self::Submission,
+        Self::Modes,
+        Self::Sessions,
+        Self::Clipboard,
+        Self::Pointer,
+        Self::Help,
+    ];
+
     pub fn label(self, locale: codewhale_localization::Locale) -> Cow<'static, str> {
         use codewhale_localization::{MessageId, tr};
         let id = match self {

@@ -977,7 +977,7 @@ fn load_global_agents_context(workspace: &Path, home_dir: Option<&Path>) -> Opti
         let path = join_relative_components(home, candidate);
 
         if context_candidate_exists(&path) {
-            match load_context_file(&path) {
+            match load_global_context_file(&path) {
                 Ok(content) => {
                     let mut ctx = ProjectContext::empty(workspace.to_path_buf());
                     ctx.instructions = Some(content);
@@ -1014,6 +1014,48 @@ fn generate_ephemeral_context(workspace: &Path) -> Option<String> {
 
 /// Load a context file with size checking
 fn load_context_file(path: &Path) -> Result<String, ProjectContextError> {
+    load_context_file_with_symlink_policy(path, false)
+}
+
+/// Load a user-level context file, following a symlink to its target.
+///
+/// The refusal in [`load_context_file`] protects checkouts: a link planted in
+/// an untrusted repository could point the loader at anything on the machine.
+/// The user-level layer is the operator's own file in `$HOME`, where that
+/// escape does not apply and a symlink is the ordinary way to share one
+/// instruction set between agents (`~/.deepseek/AGENTS.md` -> `~/AGENTS.md`).
+/// Refusing it there failed silently: the refusal is collected as a warning,
+/// so the whole user-level layer was dropped without any visible error.
+fn load_global_context_file(path: &Path) -> Result<String, ProjectContextError> {
+    load_context_file_with_symlink_policy(path, true)
+}
+
+/// Resolve a symlinked context file to its target.
+///
+/// `open_context_file` opens with `O_NOFOLLOW`, so the resolved target is what
+/// must be opened, never the link itself.
+fn resolve_symlinked_context_path(path: &Path) -> Result<PathBuf, ProjectContextError> {
+    let metadata = fs::symlink_metadata(path).map_err(|source| ProjectContextError::Metadata {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if !metadata.file_type().is_symlink() {
+        return Ok(path.to_path_buf());
+    }
+    fs::canonicalize(path).map_err(|source| ProjectContextError::Metadata {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+fn load_context_file_with_symlink_policy(
+    path: &Path,
+    follow_symlinks: bool,
+) -> Result<String, ProjectContextError> {
+    let resolved = follow_symlinks
+        .then(|| resolve_symlinked_context_path(path))
+        .transpose()?;
+    let path = resolved.as_deref().unwrap_or(path);
     let metadata = fs::symlink_metadata(path).map_err(|source| ProjectContextError::Metadata {
         path: path.to_path_buf(),
         source,
@@ -1995,6 +2037,61 @@ mod tests {
                 .contains("Vendor-neutral instructions")
         );
         assert_eq!(ctx.source_path, Some(global_agents));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_symlinked_global_agents_is_followed() {
+        let workspace = tempdir().expect("workspace tempdir");
+        let home = tempdir().expect("home tempdir");
+        let shared = home.path().join("AGENTS.md");
+        fs::write(&shared, "Shared global instructions").expect("write shared agents");
+        let global_dir = home.path().join(".deepseek");
+        fs::create_dir(&global_dir).expect("mkdir .deepseek");
+        let link = global_dir.join("AGENTS.md");
+        std::os::unix::fs::symlink(&shared, &link).expect("symlink global agents");
+
+        let ctx = load_project_context_with_parents_and_home(workspace.path(), Some(home.path()));
+
+        assert!(ctx.has_instructions());
+        assert!(
+            ctx.instructions
+                .as_ref()
+                .unwrap()
+                .contains("Shared global instructions"),
+            "a symlinked user-level AGENTS.md must be read: {:?}",
+            ctx.warnings
+        );
+        assert_eq!(ctx.source_path, Some(link));
+        assert!(
+            !ctx.warnings.iter().any(|w| w.contains("symlink")),
+            "following the user-level link must not warn: {:?}",
+            ctx.warnings
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_symlinked_workspace_agents_is_still_refused() {
+        let workspace = tempdir().expect("workspace tempdir");
+        let home = tempdir().expect("home tempdir");
+        let outside = tempdir().expect("outside tempdir");
+        let secret = outside.path().join("secret.md");
+        fs::write(&secret, "outside content").expect("write outside file");
+        std::os::unix::fs::symlink(&secret, workspace.path().join("AGENTS.md"))
+            .expect("symlink workspace agents");
+
+        let ctx = load_project_context_with_parents_and_home(workspace.path(), Some(home.path()));
+
+        assert!(
+            ctx.instructions.is_none()
+                || !ctx
+                    .instructions
+                    .as_ref()
+                    .unwrap()
+                    .contains("outside content"),
+            "a workspace AGENTS.md symlink must not be followed"
+        );
     }
 
     #[test]

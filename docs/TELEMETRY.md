@@ -2,7 +2,7 @@
 
 > 阅读简体中文版：[zh_hans/TELEMETRY.md](zh_hans/TELEMETRY.md)
 
-**Usage analytics are on by default in the current 0.9.12 source.** The first
+**Usage analytics are on by default in the current source.** The first
 interactive launch gives a localized, nonblocking disclosure naming **Codewhale
 and PostHog**, with a direct route to turn counting off. Notice version `5`
 describes this policy; displaying it is not recorded as human acceptance.
@@ -45,6 +45,10 @@ This document is the schema. It is not a summary of the schema: a test in
 `crates/telemetry` parses the field names out of this file and asserts set
 equality against the structs the serializer actually uses, so a field that is
 here and not in the code — or in the code and not here — fails the build.
+
+Local saved sessions and `codewhale metrics` remain available with telemetry
+disabled and require no account or hosted reporting service. Disabling telemetry
+does not disable local usage receipts.
 
 ## Turning it off
 

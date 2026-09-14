@@ -1,6 +1,6 @@
 //! Two-pass tarball reader for remote bundles.
 //!
-//! Pass one ([`scan_tarball`]) writes nothing: it rejects traversal and
+//! Pass one ([`scan_tarball_for_bundle`]) writes nothing: it rejects traversal and
 //! absolute paths, enforces the uncompressed size cap from the headers, and
 //! locates the single bundle root — the directory holding the bundle's
 //! manifest (`plugin.json`, `kimi.plugin.json`, or the legacy `plugin.toml`). Pass two
@@ -26,8 +26,9 @@ pub(super) fn stage_tarball(
     bytes: &[u8],
     user_plugins_dir: &Path,
     max_size: u64,
+    bundle_path: Option<&str>,
 ) -> Result<StagedPlugin> {
-    let scan = scan_tarball(bytes, max_size)?;
+    let scan = scan_tarball_for_bundle(bytes, max_size, bundle_path)?;
     let staged_path = fresh_staging_dir(user_plugins_dir)?;
     let result = extract_into(&scan, bytes, &staged_path, max_size)
         .and_then(|()| validate_staged(&staged_path));
@@ -53,7 +54,16 @@ pub(super) struct TarballScan {
 
 /// First pass: validate entry paths, enforce the uncompressed size cap, and
 /// locate the single bundle root. Nothing is written in this pass.
+#[cfg(test)]
 pub(super) fn scan_tarball(bytes: &[u8], max_size: u64) -> Result<TarballScan> {
+    scan_tarball_for_bundle(bytes, max_size, None)
+}
+
+fn scan_tarball_for_bundle(
+    bytes: &[u8],
+    max_size: u64,
+    bundle_path: Option<&str>,
+) -> Result<TarballScan> {
     let cursor = std::io::Cursor::new(bytes);
     let gz = GzDecoder::new(cursor);
     let mut archive = tar::Archive::new(gz);
@@ -99,10 +109,17 @@ pub(super) fn scan_tarball(bytes: &[u8], max_size: u64) -> Result<TarballScan> {
     let roots: BTreeSet<String> = manifest_paths
         .iter()
         .map(|manifest| {
-            manifest
-                .rsplit_once('/')
-                .map(|(dir, _)| dir.to_string())
+            crate::plugins::agent_plugin::plugin_root_for_manifest(Path::new(manifest))
+                .map(|root| root.to_string_lossy().into_owned())
                 .unwrap_or_default()
+        })
+        .filter(|root| {
+            bundle_path.is_none_or(|wanted| {
+                root == wanted
+                    || root
+                        .split_once('/')
+                        .is_some_and(|(_, relative)| relative == wanted)
+            })
         })
         .collect();
     if roots.len() != 1 {

@@ -2076,6 +2076,13 @@ impl ShellManager {
         };
         let spec = spec.with_policy(policy).with_env(extra_env);
         let exec_env = self.sandbox_manager.prepare(&spec);
+        if matches!(spec.sandbox_policy, ExecutionSandboxPolicy::ReadOnly)
+            && readonly_workspace.is_none()
+        {
+            // Arbitrary code with a read-only policy needs kernel enforcement;
+            // only the separately hardened argv subset may run without it.
+            require_native_readonly_execution(&exec_env)?;
+        }
 
         if background {
             let bounded_output = timeout_bounds_ms == (1, BASH_MAX_TIMEOUT_MS);
@@ -3707,12 +3714,60 @@ fn enforce_readonly_github_network_policy(
     }
 }
 
+/// This is a request for mandatory filesystem/network isolation, not a claim
+/// about what the command does. The executor refuses it without a native
+/// enforcing sandbox and checks the prepared environment again before spawn.
+fn enforced_readonly_input(input: &serde_json::Value) -> bool {
+    let Some(fields) = input.as_object() else {
+        return false;
+    };
+    fields.get("read_only").and_then(serde_json::Value::as_bool) == Some(true)
+        && fields.keys().all(|key| {
+            matches!(
+                key.as_str(),
+                "action" | "command" | "cwd" | "timeout_ms" | "read_only"
+            )
+        })
+        && fields
+            .get("action")
+            .is_none_or(|action| action.as_str() == Some("run"))
+        && fields
+            .get("command")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|command| !command.trim().is_empty())
+}
+
+fn is_native_readonly_sandbox(sandbox_type: SandboxType) -> bool {
+    match sandbox_type {
+        #[cfg(target_os = "macos")]
+        SandboxType::MacosSeatbelt => true,
+        #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+        SandboxType::LinuxBubblewrap => true,
+        _ => false,
+    }
+}
+
+fn require_native_readonly_execution(exec_env: &ExecEnv) -> Result<()> {
+    if matches!(exec_env.policy, ExecutionSandboxPolicy::ReadOnly)
+        && is_native_readonly_sandbox(exec_env.sandbox_type)
+    {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "read_only execution requires an enforcing native read-only sandbox; nothing was run"
+        ))
+    }
+}
+
 /// `exec_shell_input_is_parallel_readonly` with the agent-posture classifier:
 /// same input-shape restrictions (run action only, no background/tty/stdin),
 /// but commands are judged by [`is_agent_readonly_shell_command`] so
 /// `ShellPolicy::ReadOnly` agents keep a usable inspection surface
 /// (pipelines, globs, `git -C`, `find`, `sed -n`, `npm view`).
 fn exec_shell_input_agent_readonly(input: &serde_json::Value) -> bool {
+    if enforced_readonly_input(input) {
+        return true;
+    }
     if !exec_shell_input_is_parallel_readonly_shape(input) {
         return false;
     }
@@ -3740,6 +3795,9 @@ pub(crate) fn agent_readonly_bash_input(input: &serde_json::Value) -> bool {
 }
 
 fn exec_shell_input_is_parallel_readonly(input: &serde_json::Value) -> bool {
+    if enforced_readonly_input(input) {
+        return true;
+    }
     if !exec_shell_input_is_parallel_readonly_shape(input) {
         return false;
     }
@@ -4454,6 +4512,7 @@ impl ToolSpec for LowercaseBashTool {
             "properties": {
                 "command": { "type": "string", "description": guidance::runtime_command_guidance() },
                 "timeout": { "type": "number", "description": "Optional timeout in seconds; when omitted the command is killed after 120 seconds." },
+                "read_only": { "type": "boolean", "description": "Set true to run analysis code (including Python/SQLite) with mandatory native filesystem read-only isolation and no network. Available during peer writes. Refused when native enforcement is unavailable; no background, stdin, external backend, or sandbox escalation." },
                 "sandbox_permissions": {
                     "type": "string",
                     "enum": ["workspace-write", "danger-full-access"],
@@ -4512,7 +4571,7 @@ fn contract_bash_legacy_input(input: &serde_json::Value) -> Result<serde_json::V
         .filter(|key| {
             !matches!(
                 key.as_str(),
-                "command" | "timeout" | "sandbox_permissions" | "justification"
+                "command" | "timeout" | "read_only" | "sandbox_permissions" | "justification"
             )
         })
         .cloned()
@@ -4543,6 +4602,12 @@ fn contract_bash_legacy_input(input: &serde_json::Value) -> Result<serde_json::V
         }
         translated["timeout_ms"] = json!((millis as u64).max(1));
     }
+    if let Some(value) = input.get("read_only") {
+        if !value.is_boolean() {
+            return Err(type_mismatch("read_only", value, "a boolean"));
+        }
+        translated["read_only"] = value.clone();
+    }
     for field in ["sandbox_permissions", "justification"] {
         if let Some(value) = input.get(field) {
             translated[field] = value.clone();
@@ -4565,7 +4630,8 @@ pub(crate) fn readonly_bash_input_schema() -> serde_json::Value {
         "type": "object",
         "properties": {
             "action": { "type": "string", "enum": ["run"] },
-            "command": { "type": "string", "description": "A classifier-approved read command" },
+            "command": { "type": "string", "description": "A classifier-approved read command, or analysis code with read_only=true" },
+            "read_only": { "type": "boolean", "description": "Require native filesystem read-only and no-network enforcement for analysis code; unavailable sandboxes fail closed." },
             "cwd": { "type": "string", "description": "Workspace-relative working directory" },
             "timeout_ms": { "type": "integer", "description": "Timeout in milliseconds (1000-600000)" }
         },
@@ -4624,7 +4690,7 @@ impl ToolSpec for BashTool {
 
     fn description(&self) -> &'static str {
         if self.read_only {
-            "Inspect the workspace with the bounded read-only command subset. Commands run directly as argv, never through a shell; only action=run plus command, cwd, and timeout_ms are accepted."
+            "Inspect with classifier-bounded commands run directly as argv, never through a shell. For analysis code, read_only=true instead requires a native filesystem read-only and no-network sandbox. Only foreground action=run with command, cwd, timeout_ms, and read_only is accepted."
         } else {
             guidance::description()
         }
@@ -4646,13 +4712,14 @@ impl ToolSpec for BashTool {
                     "type": "string",
                     "description": guidance::runtime_command_guidance()
                 },
+                "read_only": { "type": "boolean", "description": "Set true to require native filesystem read-only and no-network execution. Only foreground run with command, cwd and timeout_ms; unavailable enforcement fails closed." },
                 "timeout_ms": {
                     "type": "integer",
                     "description": "Timeout in milliseconds. The default depends on the action: action=run 120000 (the standalone Bash tool caps it at 600000), action=wait 30000, action=interact 1000. A foreground action=run that omits this is bounded by that default and killed with a background-rerun hint; pass an explicit value for longer foreground work, or background=true. For action=wait, `timeout_secs` (seconds) and `timeout` (milliseconds) are accepted aliases."
                 },
                 "background": {
                     "type": "boolean",
-                    "description": "Temporary background; killed at session exit. Surviving headless services need background:true,persist:true."
+                    "description": "Temporary background; killed at session exit. Surviving headless services need background:true,persist:true. It is not killed at timeout_ms; plan to poll it with action=wait or stop it with action=cancel."
                 },
                 "interactive": {
                     "type": "boolean",
@@ -4799,6 +4866,35 @@ impl ToolSpec for BashTool {
             Some(forced) => forced,
             None => optional_str(&input, "action")?.unwrap_or("run"),
         };
+        let enforced_readonly = match input.get("read_only") {
+            None => false,
+            Some(serde_json::Value::Bool(enabled)) => *enabled,
+            Some(value) => return Err(type_mismatch("read_only", value, "a boolean")),
+        };
+        if enforced_readonly && (!enforced_readonly_input(&input) || action != "run") {
+            return Err(ToolError::invalid_input(
+                "read_only=true accepts only foreground run with command, cwd and timeout_ms; background, input, interactive modes and sandbox escalation are incompatible",
+            ));
+        }
+        if enforced_readonly {
+            if context.sandbox_backend.is_some() {
+                return Err(ToolError::permission_denied(
+                    "read_only execution requires a native enforcing sandbox; external backends cannot attest this policy",
+                ));
+            }
+            let manager = context
+                .shell_manager
+                .lock()
+                .map_err(|_| ToolError::execution_failed("shell manager lock poisoned"))?;
+            if !manager
+                .configured_sandbox_type()
+                .is_some_and(is_native_readonly_sandbox)
+            {
+                return Err(ToolError::not_available(
+                    "read_only execution requires native read-only enforcement (macOS Seatbelt or configured Linux bubblewrap); nothing was run",
+                ));
+            }
+        }
         let mut policy_input = input.clone();
         if let Some(object) = policy_input.as_object_mut() {
             object.insert("action".into(), json!(action));
@@ -4975,7 +5071,13 @@ impl ToolSpec for BashTool {
             }
         }
 
-        let policy_override = context.elevated_sandbox_policy.clone();
+        // This explicit mode only narrows the caller's posture. No approval or
+        // inherited full-access override can disable the required sandbox.
+        let policy_override = if enforced_readonly {
+            Some(ExecutionSandboxPolicy::ReadOnly)
+        } else {
+            context.elevated_sandbox_policy.clone()
+        };
         // Strict types: a non-string cwd used to silently run the command in
         // the workspace default instead of erroring (2026-08-04 review).
         let working_dir = match first_present_field(&input, &["cwd", "working_dir"])
@@ -4996,7 +5098,7 @@ impl ToolSpec for BashTool {
             // shared ShellManager's parent-workspace default_workspace.
             None => Some(context.workspace.display().to_string()),
         };
-        if matches!(context.shell_policy, ShellPolicy::ReadOnly) {
+        if matches!(context.shell_policy, ShellPolicy::ReadOnly) && !enforced_readonly {
             let effective_cwd = working_dir
                 .as_deref()
                 .map(std::path::Path::new)
@@ -5008,7 +5110,8 @@ impl ToolSpec for BashTool {
         // synchronously, captures stdout, parses `KEY=VAL` lines, audit-logs
         // the keys (never the values). Empty / no-op when no hook is
         // configured.
-        let read_only_shell = matches!(context.shell_policy, ShellPolicy::ReadOnly);
+        let read_only_shell =
+            matches!(context.shell_policy, ShellPolicy::ReadOnly) || enforced_readonly;
         let mut extra_env = if read_only_shell {
             // shell_env hooks are arbitrary operator-configured processes.
             // They cannot run inside the evidence-only execution boundary.
@@ -5292,7 +5395,7 @@ impl ToolSpec for BashTool {
                 combined_output,
                 policy_override,
                 extra_env,
-                matches!(context.shell_policy, ShellPolicy::ReadOnly),
+                matches!(context.shell_policy, ShellPolicy::ReadOnly) && !enforced_readonly,
                 if self.optional_timeout {
                     (1, BASH_MAX_TIMEOUT_MS)
                 } else {
@@ -6260,5 +6363,8 @@ impl ToolSpec for NoteTool {
     }
 }
 
+#[cfg(test)]
+#[path = "shell/tests/enforced_readonly.rs"]
+mod enforced_readonly_tests;
 #[cfg(test)]
 mod tests;

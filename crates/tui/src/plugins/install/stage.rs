@@ -70,7 +70,7 @@ fn ensure_plugins_dir(user_plugins_dir: &Path) -> Result<()> {
 pub(super) fn validate_staged(staged_path: &Path) -> Result<(String, String)> {
     let manifest_path = crate::plugins::agent_plugin::resolve_manifest_path(staged_path)
         .ok_or_else(|| {
-            anyhow::anyhow!("staged bundle has no plugin.json, kimi.plugin.json, or plugin.toml")
+            anyhow::anyhow!("staged bundle has no plugin.json, .claude-plugin/plugin.json, kimi.plugin.json, or plugin.toml")
         })?;
     let validated = PluginManifest::validate_from_path(&manifest_path)
         .map_err(|error| anyhow::anyhow!("staged plugin manifest failed validation: {error}"))?;
@@ -93,7 +93,7 @@ pub(super) fn stage_local_copy(
     let manifest_path =
         crate::plugins::agent_plugin::resolve_manifest_path(source).ok_or_else(|| {
             anyhow::anyhow!(
-                "source is not a valid plugin bundle: no plugin.json, kimi.plugin.json, or plugin.toml"
+                "source is not a valid plugin bundle: no plugin.json, .claude-plugin/plugin.json, kimi.plugin.json, or plugin.toml"
             )
         })?;
     PluginManifest::validate_from_path(&manifest_path)

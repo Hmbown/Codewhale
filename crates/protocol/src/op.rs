@@ -15,7 +15,7 @@
 //!
 //! What is deliberately stripped at this boundary:
 //!
-//! - `mpsc` / `oneshot` reply channels (`GetSessionSnapshot`,
+//! - `mpsc` / `oneshot` reply channels (`GetSubAgentSettlement`, `GetSessionSnapshot`,
 //!   `GetProviderRuntimeStatus`, `BootstrapMcp`, `RetryMcpServer`,
 //!   `ReloadMcp`). Over the wire the reply is an `EventMsg` or a response
 //!   frame, not a channel.
@@ -285,6 +285,9 @@ pub enum Op {
     },
 
     ListSubAgents,
+    /// Inspect live children and pending handbacks at the Engine's idle
+    /// boundary. The host owns the response channel; it is not wire input.
+    GetSubAgentSettlement,
     CancelSubAgent {
         agent_id: String,
     },
@@ -320,7 +323,9 @@ pub enum Op {
         config: CompactionPolicy,
     },
 
-    /// Replace the live user permission rules (`Ruleset` serialized).
+    /// Legacy serialized permission-update operation, retained for wire
+    /// compatibility. The in-process runtime now publishes directly through
+    /// its shared policy store instead of queuing a second replacement.
     SetPermissionRuleset {
         ruleset: Value,
     },
@@ -431,6 +436,7 @@ pub const OP_KINDS: &[&str] = &[
     "shutdown",
     "preview_outbound_request",
     "list_sub_agents",
+    "get_sub_agent_settlement",
     "cancel_sub_agent",
     "follow_up_sub_agent",
     "change_mode",
@@ -473,6 +479,7 @@ impl Op {
             Self::Shutdown => "shutdown",
             Self::PreviewOutboundRequest { .. } => "preview_outbound_request",
             Self::ListSubAgents => "list_sub_agents",
+            Self::GetSubAgentSettlement => "get_sub_agent_settlement",
             Self::CancelSubAgent { .. } => "cancel_sub_agent",
             Self::FollowUpSubAgent { .. } => "follow_up_sub_agent",
             Self::ChangeMode { .. } => "change_mode",
@@ -605,6 +612,7 @@ mod tests {
                 unresolved: None,
             },
             Op::ListSubAgents,
+            Op::GetSubAgentSettlement,
             Op::CancelSubAgent {
                 agent_id: "a1".into(),
             },

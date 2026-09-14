@@ -30,6 +30,11 @@ git status --short                 # working tree should be clean
 cargo fmt --all --check
 git diff --check
 
+# Core npm workspace tests plus the shared web gate (install web dependencies first).
+# check:web checks committed facts before regeneration, then docs, design tokens,
+# lint, TypeScript and the production build. These do not replace the Rust gates.
+npm test && npm run check:web
+
 # 2. Library/protocol/cli/flow/state tests, locked
 cargo test -p codewhale-config -p codewhale-protocol -p codewhale-cli \
   -p codewhale-workflow -p codewhale-state --locked

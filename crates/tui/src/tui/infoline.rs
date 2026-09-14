@@ -76,6 +76,10 @@ pub enum InfoSegmentId {
     Context,
     /// Session cost, the one price number (`$0.14`).
     Cost,
+    /// The clock-dependent billing tier of the active route (`peak` /
+    /// `off-peak`), painted beside the cost only for routes whose rates move
+    /// with the clock (DeepSeek V4 Pro/Flash and Flash).
+    BillingTier,
     /// Output tokens of the live or last turn (`↓ 1.2K`).
     OutputTokens,
     /// Time to first token (`ttft 400ms`).
@@ -91,6 +95,13 @@ pub enum InfoSegmentId {
     /// Active goal with elapsed time and the model's reported progress
     /// (`Goal (9m) 12% ▓▓░░░░░░`). Painted only while a goal is active.
     Goal,
+    /// Session workspace leaf directory, left-truncated (`…atch/codewhale`).
+    /// Opt-in via `/statusline` (#6112).
+    Workspace,
+    /// Current git branch from the cached workspace context, or the short
+    /// SHA when HEAD is detached. Absent outside a repository. Opt-in via
+    /// `/statusline` (#6112).
+    GitBranch,
 }
 
 impl InfoSegmentId {
@@ -105,6 +116,9 @@ impl InfoSegmentId {
             Self::Cache => 8,
             Self::Ttft => 8,
             Self::OutputTokens => 7,
+            // The tier is a reading about the cost, not the cost: it sheds
+            // with the telemetry, ahead of the number it annotates.
+            Self::BillingTier => 7,
             Self::Cost => 6,
             // The balance outlives the cost: it is off by default, so a row
             // that shows one is a row whose owner asked for it by name.
@@ -113,6 +127,10 @@ impl InfoSegmentId {
             // its reading outlives every telemetry segment and sheds only
             // ahead of the route and context readings.
             Self::Goal => 4,
+            // Workspace and branch are opt-in like the balance: a row that
+            // shows them is a row whose owner asked by name, so they shed
+            // with it, ahead of telemetry but behind the goal.
+            Self::Workspace | Self::GitBranch => 5,
             Self::Model | Self::Context => 0,
         }
     }

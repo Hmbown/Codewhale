@@ -134,6 +134,11 @@ pub struct ToolResult {
 }
 
 /// Provider-neutral non-text content returned alongside a tool result.
+/// Image-producing tools return owned base64 bytes here (MCP uses its standard
+/// `content` image blocks). A path in `ToolResult.metadata` is descriptive
+/// metadata, never permission for the engine to read another host file.
+/// The runtime validates format, full decode and size, retains one image per
+/// result, and keeps omitted-image receipts with the text result.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ToolResultContentBlock {

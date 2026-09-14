@@ -268,6 +268,11 @@ fn render_candidates(
     for candidate in &catalog.candidates {
         let status = if candidate.has_errors {
             "unusable"
+        } else if matches!(
+            candidate.install_plan,
+            PluginMarketplaceInstallPlan::AlreadyPresent { .. }
+        ) {
+            "name already present"
         } else {
             "candidate"
         };
@@ -304,6 +309,14 @@ fn render_candidates(
                     "    installable via {source_kind}: /plugin marketplace install {} {}",
                     escape_review_text(&catalog.id),
                     escape_review_text(&candidate.name)
+                );
+            }
+            PluginMarketplaceInstallPlan::AlreadyPresent { selector, reason } => {
+                let _ = writeln!(out, "    {}", escape_review_text(reason));
+                let _ = writeln!(
+                    out,
+                    "    manage: /plugin show {}",
+                    escape_review_text(selector)
                 );
             }
             PluginMarketplaceInstallPlan::Unsupported { reason } => {

@@ -96,6 +96,7 @@ before(async () => {
   });
   const init = await rpc("initialize", { protocolVersion: "2025-06-18" });
   assert.equal(init.result.serverInfo.name, "codewhale-cu");
+  assert.equal(init.result.serverInfo.version, JSON.parse(fs.readFileSync(new URL("../plugin.json", import.meta.url), "utf8")).version);
 });
 
 after(() => {

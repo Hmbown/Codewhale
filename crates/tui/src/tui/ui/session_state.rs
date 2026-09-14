@@ -730,6 +730,30 @@ pub(crate) async fn switch_workspace(
     app.status_message = Some(format!("Workspace: {}", workspace.display()));
 }
 
+/// Auth / missing-key failures: keep the transcript user bubble and clear the
+/// composer (the turn was submitted). Surface the error without "restored to
+/// composer" — the echo already owns the text.
+pub(crate) fn keep_failed_immediate_submit_echo(
+    app: &mut App,
+    message: QueuedMessage,
+    error: &str,
+) {
+    tracing::warn!(
+        error = %error,
+        "immediate user message dispatch failed auth; keeping transcript echo"
+    );
+    // Composer stays empty — HistoryCell::User already holds the turn.
+    let _ = message;
+    let status = format!("Message not sent ({error})");
+    app.status_message = Some(status.clone());
+    app.set_sticky_status(
+        status,
+        StatusToastLevel::Error,
+        Some(App::STICKY_ERROR_TTL_MS),
+    );
+    app.needs_redraw = true;
+}
+
 pub(crate) fn restore_failed_immediate_submit(
     app: &mut App,
     message: QueuedMessage,
@@ -797,7 +821,9 @@ pub(crate) fn persist_rules_from_approval(
             None => 0,
         };
         let permissions_path = store.permissions_path();
-        config.exec_policy_engine = store.exec_policy_engine();
+        config
+            .exec_policy_engine
+            .set_ruleset(store.permissions().ruleset());
         Ok((added, permissions_path))
     }) {
         Ok((added, path)) if added > 0 => {
@@ -989,27 +1015,24 @@ pub(crate) fn restore_loaded_session_provider(
         app.reasoning_effort =
             requested.normalize_for_route(provider, &config.deepseek_base_url(), &app.model);
     }
-    app.set_active_context_window_override(config.context_window_for_provider_config(provider));
+    app.set_active_context_window_override(config, provider);
     app.active_route_limits = app.context_window_override_limits();
     app.active_route_base_url = config.deepseek_base_url();
-    app.active_context_window_source = if app.active_context_window_override.is_some() {
-        crate::route_runtime::ContextWindowSource::Configured
-    } else {
-        crate::route_runtime::ContextWindowSource::Fallback
-    };
+    app.active_context_window_source = app
+        .configured_context_window_for(&app.model)
+        .map(|resolution| resolution.source)
+        .unwrap_or(crate::route_runtime::ContextWindowSource::Fallback);
 }
 
 pub(crate) fn resolve_loaded_session_route(app: &mut App, config: &Config) {
-    let context_override = config.context_window_for_provider_config(app.api_provider);
-    app.set_active_context_window_override(context_override);
+    app.set_active_context_window_override(config, app.api_provider);
     if app.auto_model {
         app.active_route_limits = app.context_window_override_limits();
         app.active_route_base_url = config.deepseek_base_url();
-        app.active_context_window_source = if context_override.is_some() {
-            crate::route_runtime::ContextWindowSource::Configured
-        } else {
-            crate::route_runtime::ContextWindowSource::Fallback
-        };
+        app.active_context_window_source = app
+            .configured_context_window_for(&app.model)
+            .map(|resolution| resolution.source)
+            .unwrap_or(crate::route_runtime::ContextWindowSource::Fallback);
         return;
     }
 
@@ -1024,11 +1047,10 @@ pub(crate) fn resolve_loaded_session_route(app: &mut App, config: &Config) {
         Err(_) => {
             app.active_route_limits = app.context_window_override_limits();
             app.active_route_base_url = config.deepseek_base_url();
-            app.active_context_window_source = if context_override.is_some() {
-                crate::route_runtime::ContextWindowSource::Configured
-            } else {
-                crate::route_runtime::ContextWindowSource::Fallback
-            };
+            app.active_context_window_source = app
+                .configured_context_window_for(&app.model)
+                .map(|resolution| resolution.source)
+                .unwrap_or(crate::route_runtime::ContextWindowSource::Fallback);
         }
     }
 }

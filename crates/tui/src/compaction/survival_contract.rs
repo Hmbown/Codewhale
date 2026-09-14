@@ -8,7 +8,7 @@
 
 /// Documented schema version. Bump when a survive/summarize/prune rule
 /// changes; TS/Go strategies pin this number.
-pub const SURVIVAL_CONTRACT_VERSION: u32 = 1;
+pub const SURVIVAL_CONTRACT_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SurvivalRule {

@@ -17,7 +17,9 @@
 
 use std::cell::Cell;
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
+use crossterm::event::{
+    KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
@@ -28,8 +30,8 @@ use ratatui::{
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::tui::views::{
-    ActionHint, ModalKind, ModalView, ViewAction, ViewEvent, render_modal_footer,
-    render_panel_scroll_rail, render_underwater_surface,
+    ActionHint, ModalKind, ModalView, ViewAction, ViewEvent, action_footer_lines,
+    render_modal_footer, render_panel_scroll_rail, render_underwater_surface,
 };
 use codewhale_palette as palette;
 
@@ -114,6 +116,7 @@ pub struct PagerView {
     /// Optional inspector-owned destructive action. It requires two presses
     /// (or key then Enter); Esc disarms before it closes the pager.
     destructive_action: Option<PagerDestructiveAction>,
+    action_area: Cell<Option<Rect>>,
 }
 
 impl PagerView {
@@ -137,6 +140,7 @@ impl PagerView {
             pending_g: false,
             last_visible_height: Cell::new(0),
             destructive_action: None,
+            action_area: Cell::new(None),
         }
     }
 
@@ -156,6 +160,7 @@ impl PagerView {
             pending_g: false,
             last_visible_height: Cell::new(0),
             destructive_action: None,
+            action_area: Cell::new(None),
         }
     }
 
@@ -204,6 +209,45 @@ impl PagerView {
 
     pub fn from_text(title: impl Into<String>, text: &str, width: u16) -> Self {
         Self::from_pages(vec![PagerPage::from_text(title, text, width)], 0)
+    }
+
+    /// Reuse the inspector confirmation control for token-bound commands.
+    /// Copy exposes the exact command; confirmation dispatches it unchanged.
+    pub(crate) fn command_review(
+        title: impl Into<String>,
+        text: &str,
+        width: u16,
+        command: String,
+        locale: codewhale_localization::Locale,
+    ) -> Self {
+        let confirm = codewhale_localization::tr(
+            locale,
+            codewhale_localization::MessageId::PagerActionConfirm,
+        )
+        .into_owned();
+        Self::from_text(title, text, width)
+            .with_copy_text(command.clone())
+            .with_destructive_action(
+                'y',
+                confirm.clone(),
+                confirm,
+                ViewEvent::CommandPaletteSelected {
+                    action: crate::tui::views::CommandPaletteAction::ExecuteCommand { command },
+                },
+            )
+    }
+
+    fn activate_destructive_action(&mut self) -> ViewAction {
+        self.pending_g = false;
+        let Some(action) = self.destructive_action.as_mut() else {
+            return ViewAction::None;
+        };
+        if action.armed {
+            ViewAction::EmitAndClose(action.event.clone())
+        } else {
+            action.armed = true;
+            ViewAction::None
+        }
     }
 
     fn current_page(&self) -> &PagerPage {
@@ -409,12 +453,12 @@ impl ModalView for PagerView {
             let matching_key =
                 matches!(key.code, KeyCode::Char(ch) if ch.eq_ignore_ascii_case(&action.key));
             if matching_key || (key.code == KeyCode::Enter && action.armed) {
-                self.pending_g = false;
-                if action.armed {
-                    return ViewAction::EmitAndClose(action.event.clone());
+                if key.kind != KeyEventKind::Press
+                    || !key.modifiers.difference(KeyModifiers::SHIFT).is_empty()
+                {
+                    return ViewAction::None;
                 }
-                action.armed = true;
-                return ViewAction::None;
+                return self.activate_destructive_action();
             }
         }
 
@@ -585,6 +629,15 @@ impl ModalView for PagerView {
     }
 
     fn handle_mouse(&mut self, mouse: MouseEvent) -> ViewAction {
+        if mouse.kind == MouseEventKind::Down(MouseButton::Left)
+            && mouse.modifiers.is_empty()
+            && self
+                .action_area
+                .get()
+                .is_some_and(|area| area.contains((mouse.column, mouse.row).into()))
+        {
+            return self.activate_destructive_action();
+        }
         match mouse.kind {
             MouseEventKind::ScrollUp => {
                 self.scroll_up(3);
@@ -631,14 +684,36 @@ impl ModalView for PagerView {
         if page.answer_text.is_some() {
             hints.push(ActionHint::new("a", "copy answer"));
         }
+        self.action_area.set(None);
         if let Some(action) = self.destructive_action.as_ref() {
-            let key = action.key.to_string();
+            let key = if action.armed {
+                format!("{}/Enter", action.key)
+            } else {
+                action.key.to_string()
+            };
             let label = if action.armed {
                 action.confirm_label.clone()
             } else {
                 action.label.clone()
             };
+            let action_width = key.width() + 2 + label.width();
             hints.push(ActionHint::new(key, label));
+            let footer_lines = action_footer_lines(&hints, inner.width);
+            if footer_lines.len() <= usize::from(inner.height)
+                && inner.width > 0
+                && let Some(last) = footer_lines.last()
+            {
+                let offset = last
+                    .width()
+                    .saturating_sub(action_width)
+                    .min(usize::from(inner.width));
+                self.action_area.set(Some(Rect::new(
+                    inner.x.saturating_add(offset as u16),
+                    inner.bottom().saturating_sub(1),
+                    (action_width.min(usize::from(inner.width).saturating_sub(offset))) as u16,
+                    1,
+                )));
+            }
         }
         let content = render_modal_footer(inner, buf, &hints);
 
@@ -851,6 +926,91 @@ mod tests {
             ViewAction::EmitAndClose(ViewEvent::SidebarAgentCancel { agent_id })
                 if agent_id == "agent_1"
         ));
+    }
+
+    #[test]
+    fn command_review_confirms_the_pinned_command_with_keys_or_painted_mouse_control() {
+        let command = format!(
+            "/plugin trust fixture {}.{}",
+            "a".repeat(64),
+            "b".repeat(64)
+        );
+        for (width, height) in [(40, 12), (80, 24), (140, 40)] {
+            let mut pager = PagerView::command_review(
+                "Review fixture",
+                "Exact reviewed capabilities",
+                width - 2,
+                command.clone(),
+                codewhale_localization::Locale::En,
+            );
+            for modifiers in [
+                KeyModifiers::CONTROL,
+                KeyModifiers::ALT,
+                KeyModifiers::SUPER,
+            ] {
+                assert!(matches!(
+                    pager.handle_key(KeyEvent::new(KeyCode::Char('y'), modifiers)),
+                    ViewAction::None
+                ));
+                assert!(!pager.destructive_action.as_ref().unwrap().armed);
+            }
+            assert!(matches!(
+                pager.handle_key(KeyEvent::new_with_kind(
+                    KeyCode::Char('y'),
+                    KeyModifiers::NONE,
+                    KeyEventKind::Repeat
+                )),
+                ViewAction::None
+            ));
+            assert!(!pager.destructive_action.as_ref().unwrap().armed);
+            let ViewAction::Emit(ViewEvent::CopyToClipboard { text, .. }) =
+                pager.handle_key(key(KeyCode::Char('c')))
+            else {
+                panic!("copy exposes the pinned command");
+            };
+            assert_eq!(text, command);
+            let area = Rect::new(0, 0, width, height);
+            let mut buffer = Buffer::empty(area);
+            pager.render(area, &mut buffer);
+            let rendered: String = buffer.content.iter().map(|cell| cell.symbol()).collect();
+            assert!(rendered.contains("Confirm"), "{rendered}");
+            assert!(
+                !rendered.contains("disable"),
+                "generic review must not describe an unrelated action"
+            );
+            let button = pager
+                .action_area
+                .get()
+                .expect("visible confirmation control");
+            assert!(button.width > 0 && button.bottom() <= height);
+            let click = |button: Rect| MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: button.x,
+                row: button.y,
+                modifiers: KeyModifiers::NONE,
+            };
+            assert!(matches!(
+                pager.handle_mouse(click(button)),
+                ViewAction::None
+            ));
+            assert!(pager.destructive_action.as_ref().unwrap().armed);
+            assert!(matches!(
+                pager.handle_key(KeyEvent::new_with_kind(
+                    KeyCode::Enter,
+                    KeyModifiers::NONE,
+                    KeyEventKind::Repeat
+                )),
+                ViewAction::None
+            ));
+            pager.render(area, &mut buffer);
+            let ViewAction::EmitAndClose(ViewEvent::CommandPaletteSelected {
+                action: crate::tui::views::CommandPaletteAction::ExecuteCommand { command: actual },
+            }) = pager.handle_mouse(click(pager.action_area.get().unwrap()))
+            else {
+                panic!("second click confirms the reviewed command");
+            };
+            assert_eq!(actual, command);
+        }
     }
 
     /// Drive a render once so `last_visible_height` is populated and paging

@@ -524,9 +524,9 @@ fn build_entries(
         );
         entries.push(HelpEntry {
             section: HelpSection::Command,
-            // Commands have no inherent ordering — fall back to alphabetical
-            // by leaning on `label.clone()` in the final sort_by_key tuple.
-            sub_rank: 0,
+            // Curated commands first, then the catalog; alphabetical within
+            // each by leaning on `label.clone()` in the final sort_by_key tuple.
+            sub_rank: command_sub_rank(&label),
             usage: stated_usage(command.usage, &label),
             label,
             description,
@@ -638,9 +638,46 @@ fn stated_usage(usage: &str, label: &str) -> Option<String> {
     })
 }
 
+/// The commands Help opens on. Everything else stays one keystroke away under
+/// *All commands* — 103 rows sorted alphabetically is a catalog, not an answer,
+/// and it buried the handful of commands people actually reach for.
+///
+/// Membership is a product judgement, not a usage metric: these are the ones a
+/// session needs to steer itself. The first five agree with the composer's own
+/// curated slash menu on purpose, so the two surfaces teach the same thing.
+const COMMON_COMMANDS: [&str; 12] = [
+    "/setup",
+    "/model",
+    "/settings",
+    "/resume",
+    "/clear",
+    "/compact",
+    "/context",
+    "/cost",
+    "/diff",
+    "/mcp",
+    "/theme",
+    "/exit",
+];
+
+/// Sort rank that also selects the group: curated commands sort and group ahead
+/// of the full catalog, because `filtered` is ordered by
+/// `(section_rank, sub_rank, label)` and `group_key` reads the same field.
+const COMMAND_RANK_COMMON: u8 = 0;
+const COMMAND_RANK_ALL: u8 = 1;
+
+fn command_sub_rank(label: &str) -> u8 {
+    if COMMON_COMMANDS.contains(&label) {
+        COMMAND_RANK_COMMON
+    } else {
+        COMMAND_RANK_ALL
+    }
+}
+
 fn group_key(entry: &HelpEntry) -> String {
     match entry.section {
-        HelpSection::Command => "cmd".into(),
+        HelpSection::Command if entry.sub_rank == COMMAND_RANK_COMMON => "cmd:common".into(),
+        HelpSection::Command => "cmd:all".into(),
         HelpSection::UserCommand => "usercmd".into(),
         HelpSection::Skill => "skill".into(),
         HelpSection::Keybinding => format!("kb:{}", entry.sub_rank),
@@ -649,6 +686,10 @@ fn group_key(entry: &HelpEntry) -> String {
 
 fn group_label(entry: &HelpEntry, locale: Locale) -> String {
     match entry.section {
+        HelpSection::Command if entry.sub_rank == COMMAND_RANK_COMMON => {
+            tr(locale, MessageId::HelpGroupCommonCommands).into_owned()
+        }
+        HelpSection::Command => tr(locale, MessageId::HelpGroupAllCommands).into_owned(),
         HelpSection::Keybinding => keybinding_section_for_rank(entry.sub_rank)
             .map(|section| section.label(locale).into_owned())
             .unwrap_or_else(|| entry.section.label(locale).into_owned()),
@@ -657,46 +698,39 @@ fn group_label(entry: &HelpEntry, locale: Locale) -> String {
 }
 
 fn keybinding_section_for_rank(rank: u8) -> Option<crate::tui::keybindings::KeybindingSection> {
-    use crate::tui::keybindings::KeybindingSection;
-    [
-        KeybindingSection::Navigation,
-        KeybindingSection::Editing,
-        KeybindingSection::Submission,
-        KeybindingSection::Modes,
-        KeybindingSection::Sessions,
-        KeybindingSection::Clipboard,
-        KeybindingSection::Help,
-    ]
-    .into_iter()
-    .find(|section| section.rank() == rank)
+    crate::tui::keybindings::KeybindingSection::ALL
+        .into_iter()
+        .find(|section| section.rank() == rank)
 }
 
 fn default_collapsed(ordering: HelpOrdering) -> HashSet<String> {
     use crate::tui::keybindings::KeybindingSection;
-    let kb_keys = [
-        KeybindingSection::Navigation,
-        KeybindingSection::Editing,
-        KeybindingSection::Submission,
-        KeybindingSection::Modes,
-        KeybindingSection::Sessions,
-        KeybindingSection::Clipboard,
-        KeybindingSection::Help,
-    ]
-    .into_iter()
-    .map(|section| format!("kb:{}", section.rank()));
+    let kb_keys = KeybindingSection::ALL
+        .into_iter()
+        .map(|section| format!("kb:{}", section.rank()));
 
     match ordering {
         HelpOrdering::KeybindingsFirst => {
             // Show Navigation only — the rest is a long tail the user
             // expands or searches. Slash/skill catalogs stay folded.
-            let mut set: HashSet<String> = ["cmd", "usercmd", "skill"]
+            let mut set: HashSet<String> = ["cmd:common", "cmd:all", "usercmd", "skill"]
                 .into_iter()
                 .map(str::to_string)
                 .collect();
             set.extend(kb_keys.filter(|key| key != "kb:0"));
             set
         }
-        HelpOrdering::CommandsFirst => kb_keys.collect(),
+        HelpOrdering::CommandsFirst => {
+            // Open on the curated commands with everything else folded. The
+            // catalogs are still one keystroke — or one keystroke of typing,
+            // since a query ignores collapse entirely — away.
+            let mut set: HashSet<String> = ["cmd:all", "usercmd", "skill"]
+                .into_iter()
+                .map(str::to_string)
+                .collect();
+            set.extend(kb_keys);
+            set
+        }
     }
 }
 
@@ -1587,9 +1621,84 @@ mod tests {
         assert_eq!(view.focus, Some(HelpHit::Entry(slot)));
     }
 
+    /// `/help` used to open on all 103 slash commands sorted alphabetically —
+    /// a catalog, not an answer, and it buried the handful of commands a
+    /// session actually steers itself with. It opens on the curated group now,
+    /// with the catalog one keystroke below it.
+    #[test]
+    fn help_opens_on_the_curated_commands_with_the_catalog_folded() {
+        let view = HelpView::new();
+        assert!(
+            !view.group_is_collapsed("cmd:common"),
+            "the curated commands are the point of opening Help"
+        );
+        assert!(
+            view.group_is_collapsed("cmd:all"),
+            "the full catalog stays folded until asked for"
+        );
+
+        let rows = view.render_rows();
+        let entries = rows
+            .iter()
+            .filter(|row| matches!(row, HelpRenderRow::Entry { .. }))
+            .count();
+        assert!(
+            entries <= COMMON_COMMANDS.len(),
+            "Help opened with {entries} rows; only the curated set should be expanded: {:?}",
+            rows.iter()
+                .filter_map(|row| match row {
+                    HelpRenderRow::Entry { entry_idx, .. } =>
+                        Some(view.entries[*entry_idx].label.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        );
+
+        // Every curated command is a real registered command, and each is on
+        // screen. A typo here would silently shrink the opening view.
+        // Distinct labels: a workspace command may share a built-in's name,
+        // and that is a naming collision, not a missing curated entry.
+        let shown: std::collections::BTreeSet<&str> = view
+            .filtered
+            .iter()
+            .map(|idx| view.entries[*idx].label.as_str())
+            .filter(|label| COMMON_COMMANDS.contains(label))
+            .collect();
+        assert_eq!(
+            shown.len(),
+            COMMON_COMMANDS.len(),
+            "curated commands missing from the registry: {:?}",
+            COMMON_COMMANDS
+                .iter()
+                .filter(|name| !shown.contains(*name))
+                .collect::<Vec<_>>()
+        );
+
+        // Typing reaches the folded catalog without expanding anything by hand.
+        let mut view = view;
+        type_filter(&mut view, "/advisor");
+        assert!(
+            view.filtered
+                .iter()
+                .any(|idx| view.entries[*idx].label == "/advisor"),
+            "a query must reach commands inside the folded catalog"
+        );
+    }
+
+    /// Help opens with the full command catalog folded. Tests about layout,
+    /// scrolling or a specific catalog command open it first — what they
+    /// exercise is the rendering of those rows, not the default fold state,
+    /// which `help_opens_on_the_curated_commands` covers on its own.
+    fn view_with_catalog_open() -> HelpView {
+        let mut view = HelpView::new();
+        view.toggle_group("cmd:all");
+        view.focus = None;
+        view
+    }
+
     #[test]
     fn visible_window_keeps_selected_entry_visible_after_scroll() {
-        let mut view = HelpView::new();
+        let mut view = view_with_catalog_open();
         let selected = view
             .filtered
             .iter()
@@ -1676,11 +1785,13 @@ mod tests {
     /// the renderer ignores proves nothing.
     #[test]
     fn label_column_is_measured_from_the_group_not_fixed() {
-        let view = HelpView::new();
+        let view = view_with_catalog_open();
         let widest = view
             .entries
             .iter()
-            .filter(|entry| entry.section == HelpSection::Command)
+            .filter(|entry| {
+                entry.section == HelpSection::Command && entry.sub_rank == COMMAND_RANK_ALL
+            })
             .map(|entry| entry.label.width())
             .max()
             .expect("commands exist");
@@ -1688,9 +1799,10 @@ mod tests {
             widest < 28,
             "slash command labels are short; the fixture assumes it"
         );
-        assert_eq!(view.label_widths(28).get("cmd").copied(), Some(widest));
+        assert_eq!(view.label_widths(28).get("cmd:all").copied(), Some(widest));
 
-        let rows = rows_at(&view, 60, 20);
+        // Tall enough to reach past the curated group into the catalog.
+        let rows = rows_at(&view, 60, 60);
         let row = rows
             .iter()
             .find(|row| row.contains("/advisor"))
@@ -1713,8 +1825,8 @@ mod tests {
     /// without the noun that says what is being managed.
     #[test]
     fn sixty_column_help_keeps_the_automation_noun() {
-        let view = HelpView::new();
-        let rows = rows_at(&view, 60, 20);
+        let view = view_with_catalog_open();
+        let rows = rows_at(&view, 60, 60);
         let row = rows
             .iter()
             .find(|row| row.contains("/automation"))
@@ -1730,13 +1842,13 @@ mod tests {
     /// — one glyph, twice, for two different facts.
     #[test]
     fn a_group_header_spends_one_glyph_on_one_meaning() {
-        let mut view = HelpView::new();
-        view.toggle_group("cmd");
-        assert_eq!(view.focus, Some(HelpHit::Group("cmd".to_string())));
-        let rows = rows_at(&view, 96, 24);
+        let mut view = view_with_catalog_open();
+        view.toggle_group("cmd:all");
+        assert_eq!(view.focus, Some(HelpHit::Group("cmd:all".to_string())));
+        let rows = rows_at(&view, 96, 60);
         let header = rows
             .iter()
-            .find(|row| row.contains("Slash commands"))
+            .find(|row| row.contains("All commands"))
             .expect("group header row");
         assert!(!header.contains("▸ ▸"), "{header:?}");
         assert!(
@@ -1750,7 +1862,7 @@ mod tests {
     /// line alone rather than printing the same sentence twice on one screen.
     #[test]
     fn the_detail_row_repairs_a_shed_and_never_repeats_one() {
-        let mut view = HelpView::new();
+        let mut view = view_with_catalog_open();
         let slot = view
             .filtered
             .iter()
@@ -1971,7 +2083,7 @@ mod tests {
 
     #[test]
     fn render_includes_help_chrome_for_empty_filter() {
-        let view = HelpView::new();
+        let view = view_with_catalog_open();
         let area = Rect::new(0, 0, 96, 32);
         let mut buf = Buffer::empty(area);
         view.render(area, &mut buf);
@@ -1983,9 +2095,15 @@ mod tests {
             dump.contains("Type to filter"),
             "missing filter prompt:\n{dump}"
         );
+        // Help opens on the curated set with the catalog folded beneath it,
+        // so both group headings are part of the chrome a user always sees.
         assert!(
-            dump.contains("Slash commands"),
-            "missing slash-command section heading:\n{dump}"
+            dump.contains("Common commands"),
+            "missing curated-command heading:\n{dump}"
+        );
+        assert!(
+            dump.contains("All commands"),
+            "missing command-catalog heading:\n{dump}"
         );
         // Footer hint should advertise close key on the bottom border.
         assert!(
@@ -2262,7 +2380,7 @@ mod tests {
     #[test]
     fn right_expands_and_left_collapses_a_focused_header() {
         let mut view = HelpView::new_with_ordering(Locale::En, HelpOrdering::KeybindingsFirst);
-        let group_key = "cmd".to_string();
+        let group_key = "cmd:all".to_string();
         assert!(view.group_is_collapsed(&group_key));
         view.focus = Some(HelpHit::Group(group_key.clone()));
 
@@ -2306,12 +2424,12 @@ mod tests {
     fn search_unfolds_collapsed_groups() {
         let mut view = HelpView::new_with_ordering(Locale::En, HelpOrdering::KeybindingsFirst);
         assert!(
-            view.group_is_collapsed("cmd"),
+            view.group_is_collapsed("cmd:all"),
             "slash commands start collapsed on the shortcuts surface"
         );
         type_filter(&mut view, "/mode");
         assert!(
-            !view.group_is_collapsed("cmd"),
+            !view.group_is_collapsed("cmd:all"),
             "a search query must reveal matching groups"
         );
         assert!(
@@ -2326,7 +2444,7 @@ mod tests {
         let view = HelpView::new_with_ordering(Locale::En, HelpOrdering::KeybindingsFirst)
             .with_groups_expanded(true);
         assert!(
-            !view.group_is_collapsed("cmd"),
+            !view.group_is_collapsed("cmd:all"),
             "help_expand_groups must start with slash commands visible"
         );
         assert!(

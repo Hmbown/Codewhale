@@ -15,26 +15,36 @@ plain `SKILL.md` directories. It does not run Claude Code plugin runtimes.
   `examples/`, or scripts that are only used after the skill is explicitly
   loaded and trusted.
 
-## Not Supported As A Plugin Runtime
+## Compatible plugin bundles
 
-Claude Code plugin features remain outside the compatibility boundary:
+Since v0.9.13, `/plugin install` accepts the declarative subset described in
+[Installing plugins](PLUGINS.md): nested `.claude-plugin/plugin.json` metadata,
+root skills, commands and agent profiles, plus inline MCP declarations or
+`.mcp.json`. Local sources in Claude marketplace catalogs resolve from the
+repository root outside `.claude-plugin`.
 
-- `.claude-plugin/plugin.json` metadata and activation semantics.
-- Custom slash-command bundles.
-- Plugin build steps, compiled TypeScript agents, dashboard servers, shared
-  plugin state, or token-gated service processes.
-- Frontmatter fields that require Claude-specific runtime behavior, such as
-  `model: inherit`.
+Exact `${ENV_NAME}` MCP header references map to Codewhale's environment-backed
+credentials, including `Authorization: Bearer ${ENV_NAME}`. Literal credential
+values and compound header templates are rejected; importing never reads the
+referenced environment variables.
 
-If a Claude Code plugin repository contains multiple skills, install or migrate
-one `skills/<name>` directory at a time. `/skill install` rejects multi-skill
-plugin archives with a clear message so it never silently chooses one skill and
-drops the plugin runtime behavior.
+The importer uses Codewhale's existing adapters, review hashes and enablement.
+A Claude marketplace's labels or defaults grant no authority. Bundles are not
+scanned from another application's plugin roots or activated automatically.
 
-For richer integrations, wrap the plugin's executable surface as MCP, hooks, or
-a Codewhale skill that names the external command explicitly.
+## Unsupported runtime features
 
-Codewhale's own versioned plugin bundles are a different, explicitly trusted
-format. v0.9.1 can activate namespaced Skills and MCP configuration from
-`plugin.toml`, but it does not scan, convert, install, or trust Claude bundles
-automatically. See [PLUGIN_BUNDLES.md](PLUGIN_BUNDLES.md).
+The importer rejects hooks, LSP declarations, custom MCP file paths, and
+`${CLAUDE_PLUGIN_ROOT}` expansion. It does not run plugin build steps,
+TypeScript agents, dashboard servers, shared plugin state, or token-gated
+service processes. Claude-specific frontmatter behavior such as `model: inherit`
+is not an additional runtime contract. Remote MCP authentication still follows
+Codewhale's existing plugin credential boundary; installation does not complete
+OAuth or borrow another application's credentials.
+
+`/skill install` remains a separate one-skill operation: it rejects multi-skill
+plugin archives rather than silently selecting one directory and dropping other
+components. Use `/plugin install` for supported bundles, or migrate one explicit
+skill directory when the repository depends on unsupported runtime behavior.
+
+See [PLUGIN_BUNDLES.md](PLUGIN_BUNDLES.md) for discovery, review and activation.

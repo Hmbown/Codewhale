@@ -165,6 +165,8 @@ impl PluginProduct {
                 ],
             ),
             action: None,
+            toggle: None,
+            remove: None,
         }
     }
 }
@@ -211,14 +213,48 @@ pub struct ExtensionItem {
     pub tone: ExtensionTone,
     pub detail: String,
     pub action: Option<ExtensionAction>,
+    /// Reversible on/off toggle for the row (`e`): enable or disable a
+    /// plugin or MCP server without leaving the panel.
+    pub toggle: Option<ExtensionAction>,
+    /// Destructive removal for the row (`d` / Delete / right-click, armed and
+    /// confirmed in two steps). Only MCP servers offer it today; plugins keep
+    /// their reviewed uninstall flow.
+    pub remove: Option<ExtensionAction>,
+}
+
+/// Where a row's command lands when the user activates it.
+///
+/// Every row used to close the panel and drop a slash command into the
+/// transcript — inspecting a plugin closed the list and pasted its detail
+/// into chat, and a mutation left every other row reading open-time state.
+/// Only the row knows which its command is, so the disposition lives on the
+/// action: mutations and inspects act in place, and flows that own a
+/// different surface (an editor, OAuth login, a composer-bound trust token)
+/// still yield the panel to them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowActionDisposition {
+    /// Run the command with the panel open; the host refreshes the snapshot
+    /// afterwards so every row re-reads live state.
+    InPlace,
+    /// In place, and the command's text output renders in a pager stacked on
+    /// the panel — the inspect path that keeps detail out of the transcript.
+    InPlacePager,
+    /// The command owns a different surface; the panel yields to it.
+    LeavePanel,
 }
 
 /// A row affordance. Executable actions route back through the existing slash
 /// command controller; status-only actions explain why Enter will not mutate.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExtensionAction {
-    Command { label: String, command: String },
-    Status { label: String },
+    Command {
+        label: String,
+        command: String,
+        disposition: RowActionDisposition,
+    },
+    Status {
+        label: String,
+    },
 }
 
 impl ExtensionAction {
@@ -254,12 +290,21 @@ pub struct ExtensionsTabModel {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ExtensionsSnapshot {
     tabs: [ExtensionsTabModel; 5],
+    /// MCP manager generation and initializing flag at capture time. The
+    /// open panel reports these on its bounded poll so the host rebuilds the
+    /// model only when live state actually moved.
+    pub mcp_generation: u64,
+    pub mcp_initializing: bool,
 }
 
 impl ExtensionsSnapshot {
     #[must_use]
     pub fn from_app(app: &App) -> Self {
-        let mut snapshot = Self::default();
+        let mut snapshot = Self {
+            mcp_generation: app.mcp_snapshot_generation,
+            mcp_initializing: app.mcp_initializing,
+            ..Self::default()
+        };
         snapshot.tabs[ExtensionsTab::Hooks.index()] = hooks_model(app, app.ui_locale);
         snapshot.tabs[ExtensionsTab::Plugins.index()] = plugins_model(app, app.ui_locale);
         snapshot.tabs[ExtensionsTab::Marketplace.index()] = marketplace_model(app, app.ui_locale);
@@ -351,6 +396,7 @@ impl ExtensionsSnapshot {
                         item.action = Some(ExtensionAction::Command {
                             label: tr(app.ui_locale, MessageId::ExtensionsActionAdd).into_owned(),
                             command: format!("/mcp add recommended {recommendation_id}"),
+                            disposition: RowActionDisposition::InPlace,
                         });
                     }
                     Some(server) if !server.is_enabled() => {
@@ -360,6 +406,7 @@ impl ExtensionsSnapshot {
                             label: tr(app.ui_locale, MessageId::ExtensionsActionEnable)
                                 .into_owned(),
                             command: format!("/mcp enable {server_name}"),
+                            disposition: RowActionDisposition::InPlace,
                         });
                     }
                     Some(_) => {
@@ -538,7 +585,10 @@ fn hooks_model(app: &App, locale: Locale) -> ExtensionsTabModel {
             action: Some(ExtensionAction::Command {
                 label: tr(locale, MessageId::ExtensionsActionEdit).into_owned(),
                 command: "/hooks edit".into(),
+                disposition: RowActionDisposition::LeavePanel,
             }),
+            toggle: None,
+            remove: None,
         })
         .collect::<Vec<_>>();
     let problems = config
@@ -566,7 +616,10 @@ fn hooks_model(app: &App, locale: Locale) -> ExtensionsTabModel {
             action: Some(ExtensionAction::Command {
                 label: tr(locale, MessageId::ExtensionsActionEdit).into_owned(),
                 command: "/hooks edit".into(),
+                disposition: RowActionDisposition::LeavePanel,
             }),
+            toggle: None,
+            remove: None,
         })
         .collect::<Vec<_>>();
     let mut groups = Vec::new();
@@ -601,7 +654,10 @@ fn hooks_model(app: &App, locale: Locale) -> ExtensionsTabModel {
                 action: Some(ExtensionAction::Command {
                     label: tr(locale, MessageId::ExtensionsActionEdit).into_owned(),
                     command: "/hooks edit".into(),
+                    disposition: RowActionDisposition::LeavePanel,
                 }),
+                toggle: None,
+                remove: None,
             }],
         });
     }
@@ -766,23 +822,56 @@ fn plugin_row_action(
         ExtensionAction::Command {
             label: tr(locale, MessageId::ExtensionsActionDiagnose).into_owned(),
             command: format!("/plugin validate {}", plugin.name()),
+            disposition: RowActionDisposition::InPlacePager,
         }
     } else if plugin.active() {
         ExtensionAction::Command {
             label: tr(locale, MessageId::LaunchHintOpen).into_owned(),
             command: format!("/plugin show {}", plugin.name()),
+            disposition: RowActionDisposition::InPlacePager,
         }
     } else if plugin.trusted() && !plugin.enabled {
         ExtensionAction::Command {
             label: tr(locale, MessageId::ExtensionsActionEnable).into_owned(),
             command: format!("/plugin enable {}", plugin.name()),
+            disposition: RowActionDisposition::InPlace,
         }
     } else {
+        // The command opens the exact-content review with its confirmation
+        // control, so this panel yields to that review.
         ExtensionAction::Command {
             label: tr(locale, MessageId::AutomationActionInspect).into_owned(),
             command: format!("/plugin trust {}", plugin.name()),
+            disposition: RowActionDisposition::LeavePanel,
         }
     }
+}
+
+/// The reversible on/off control for a plugin row. A trusted plugin can be
+/// switched off and on from the panel; an untrusted one still goes through
+/// its reviewed trust flow first, so no toggle is offered.
+fn plugin_row_toggle(
+    locale: Locale,
+    plugin: &crate::plugins::types::LoadedPlugin,
+) -> Option<ExtensionAction> {
+    if !plugin.trusted() {
+        return None;
+    }
+    Some(if plugin.enabled {
+        ExtensionAction::Command {
+            // English fallback until the Extensions vocabulary gains a
+            // localized "disable" (#3167 tracks the panel's localization).
+            label: "disable".into(),
+            command: format!("/plugin disable {}", plugin.name()),
+            disposition: RowActionDisposition::InPlace,
+        }
+    } else {
+        ExtensionAction::Command {
+            label: tr(locale, MessageId::ExtensionsActionEnable).into_owned(),
+            command: format!("/plugin enable {}", plugin.name()),
+            disposition: RowActionDisposition::InPlace,
+        }
+    })
 }
 
 /// How a plugin row reads, using the same ladder as [`plugin_row_action`].
@@ -814,6 +903,7 @@ fn plugins_model(app: &App, locale: Locale) -> ExtensionsTabModel {
         };
         let diagnostic_count = plugin.diagnostics.len();
         let action = plugin_row_action(locale, plugin);
+        let toggle = plugin_row_toggle(locale, plugin);
         by_scope[scope].push(ExtensionItem {
             id: plugin.id.as_str().to_string(),
             tone: plugin_row_tone(plugin),
@@ -842,6 +932,8 @@ fn plugins_model(app: &App, locale: Locale) -> ExtensionsTabModel {
                 ],
             ),
             action: Some(action),
+            toggle,
+            remove: None,
         });
     }
     let labels = [
@@ -892,7 +984,10 @@ fn plugins_model(app: &App, locale: Locale) -> ExtensionsTabModel {
             action: Some(ExtensionAction::Command {
                 label: tr(locale, MessageId::ExtensionsActionDiagnose).into_owned(),
                 command: "/plugin validate".into(),
+                disposition: RowActionDisposition::InPlacePager,
             }),
+            toggle: None,
+            remove: None,
         })
         .collect::<Vec<_>>();
     if !problems.is_empty() {
@@ -909,6 +1004,9 @@ fn plugins_model(app: &App, locale: Locale) -> ExtensionsTabModel {
 }
 
 fn marketplace_model(app: &App, locale: Locale) -> ExtensionsTabModel {
+    use crate::plugins::marketplace::document::{
+        CatalogInstallResolution, resolve_candidate_install,
+    };
     let Some(store) = crate::plugins::marketplace::store::MarketplaceStore::open(
         app.plugin_registry.state_path(),
     ) else {
@@ -940,65 +1038,98 @@ fn marketplace_model(app: &App, locale: Locale) -> ExtensionsTabModel {
                 items: catalog
                     .candidates
                     .iter()
-                    .map(|candidate| ExtensionItem {
-                        id: candidate.id.as_str().to_string(),
-                        tone: ExtensionTone::Attention,
-                        label: candidate
-                            .display_name
-                            .clone()
-                            .unwrap_or_else(|| candidate.name.clone()),
-                        description: candidate.description.clone().unwrap_or_default(),
-                        state: if candidate.has_errors() {
-                            tr(locale, MessageId::ExtensionsStateInvalid)
-                        } else if candidate.install_plan.is_supported() {
-                            tr(locale, MessageId::ExtensionsStateAvailable)
-                        } else {
-                            tr(locale, MessageId::AutomationActionInspect)
-                        }
-                        .into_owned(),
-                        detail: {
-                            let unknown = tr(locale, MessageId::CmdCostUnknownValue);
-                            localize(
-                                locale,
-                                MessageId::ExtensionsMarketplaceDetail,
-                                &[
-                                    (
-                                        "publisher",
-                                        candidate
-                                            .provenance
-                                            .publisher
-                                            .as_deref()
-                                            .unwrap_or(unknown.as_ref()),
-                                    ),
-                                    (
-                                        "tier",
-                                        &localized_tier(locale, candidate.provenance.tier.as_str()),
-                                    ),
-                                    (
-                                        "installable",
-                                        &localized_bool(
-                                            locale,
-                                            candidate.install_plan.is_supported(),
-                                        ),
-                                    ),
-                                ],
-                            )
-                        },
-                        action: if !candidate.has_errors() && candidate.install_plan.is_supported()
+                    .map(|candidate| {
+                        let resolution =
+                            resolve_candidate_install(stored, candidate, &app.plugin_registry);
+                        if let CatalogInstallResolution::AlreadyPresent { plugin, .. } = &resolution
                         {
-                            Some(ExtensionAction::Command {
-                                label: tr(locale, MessageId::ExtensionsActionAdd).into_owned(),
-                                command: format!(
-                                    "/plugin marketplace install {} {}",
-                                    catalog.id.as_str(),
-                                    candidate.name
-                                ),
-                            })
-                        } else {
-                            Some(ExtensionAction::Status {
-                                label: tr(locale, MessageId::PickerActionUnavailable).into_owned(),
-                            })
-                        },
+                            // A catalog name match is only occupancy. Show and
+                            // review the actual local bundle, not catalog claims.
+                            return ExtensionItem {
+                                id: candidate.id.as_str().to_string(),
+                                tone: plugin_row_tone(plugin),
+                                label: plugin.name().to_string(),
+                                description: plugin
+                                    .manifest
+                                    .plugin
+                                    .description
+                                    .clone()
+                                    .unwrap_or_default(),
+                                state: if plugin.scope
+                                    == crate::plugins::types::PluginScope::Builtin
+                                {
+                                    tr(locale, MessageId::ExtensionsStateFirstParty).into_owned()
+                                } else {
+                                    localized_plugin_state(locale, plugin.state_label())
+                                },
+                                detail: plugin.canonical_root.display().to_string(),
+                                action: Some(plugin_row_action(locale, plugin)),
+                                toggle: None,
+                                remove: None,
+                            };
+                        }
+                        let installable =
+                            matches!(resolution, CatalogInstallResolution::Supported { .. });
+                        ExtensionItem {
+                            id: candidate.id.as_str().to_string(),
+                            tone: ExtensionTone::Attention,
+                            label: candidate
+                                .display_name
+                                .clone()
+                                .unwrap_or_else(|| candidate.name.clone()),
+                            description: candidate.description.clone().unwrap_or_default(),
+                            state: if candidate.has_errors() {
+                                tr(locale, MessageId::ExtensionsStateInvalid)
+                            } else if installable {
+                                tr(locale, MessageId::ExtensionsStateAvailable)
+                            } else {
+                                tr(locale, MessageId::AutomationActionInspect)
+                            }
+                            .into_owned(),
+                            detail: {
+                                let unknown = tr(locale, MessageId::CmdCostUnknownValue);
+                                localize(
+                                    locale,
+                                    MessageId::ExtensionsMarketplaceDetail,
+                                    &[
+                                        (
+                                            "publisher",
+                                            candidate
+                                                .provenance
+                                                .publisher
+                                                .as_deref()
+                                                .unwrap_or(unknown.as_ref()),
+                                        ),
+                                        (
+                                            "tier",
+                                            &localized_tier(
+                                                locale,
+                                                candidate.provenance.tier.as_str(),
+                                            ),
+                                        ),
+                                        ("installable", &localized_bool(locale, installable)),
+                                    ],
+                                )
+                            },
+                            action: if installable {
+                                Some(ExtensionAction::Command {
+                                    label: tr(locale, MessageId::ExtensionsActionAdd).into_owned(),
+                                    command: format!(
+                                        "/plugin marketplace install {} {}",
+                                        catalog.id.as_str(),
+                                        candidate.name
+                                    ),
+                                    disposition: RowActionDisposition::InPlace,
+                                })
+                            } else {
+                                Some(ExtensionAction::Status {
+                                    label: tr(locale, MessageId::PickerActionUnavailable)
+                                        .into_owned(),
+                                })
+                            },
+                            toggle: None,
+                            remove: None,
+                        }
                     })
                     .collect(),
             }
@@ -1050,7 +1181,10 @@ fn skills_model(app: &App, locale: Locale) -> ExtensionsTabModel {
             action: Some(ExtensionAction::Command {
                 label: tr(locale, MessageId::ExtensionsActionManage).into_owned(),
                 command: "/skills".into(),
+                disposition: RowActionDisposition::LeavePanel,
             }),
+            toggle: None,
+            remove: None,
         };
         if let Some(position) = position {
             groups[position].items.push(item);
@@ -1147,13 +1281,42 @@ fn mcp_model(app: &App, locale: Locale) -> ExtensionsTabModel {
                     ExtensionAction::Command {
                         label: tr(locale, recovery.label_key()).into_owned(),
                         command: recovery.slash_command(&name),
+                        // Re-auth hands off to the OAuth login flow; every
+                        // other recovery runs against live state the panel
+                        // re-reads when it lands.
+                        disposition: match recovery {
+                            crate::mcp::McpRecoveryKind::Reauth => RowActionDisposition::LeavePanel,
+                            _ => RowActionDisposition::InPlace,
+                        },
                     }
                 }
                 (false, Some(_)) => ExtensionAction::Command {
                     label: tr(locale, MessageId::ExtensionsActionDiagnose).into_owned(),
                     command: "/mcp validate".into(),
+                    disposition: RowActionDisposition::InPlace,
                 },
             };
+            let command_safe = crate::mcp::mcp_name_is_command_safe(&name);
+            let toggle = command_safe.then(|| {
+                if enabled {
+                    ExtensionAction::Command {
+                        label: "disable".into(),
+                        command: format!("/mcp disable {name}"),
+                        disposition: RowActionDisposition::InPlace,
+                    }
+                } else {
+                    ExtensionAction::Command {
+                        label: tr(locale, MessageId::ExtensionsActionEnable).into_owned(),
+                        command: format!("/mcp enable {name}"),
+                        disposition: RowActionDisposition::InPlace,
+                    }
+                }
+            });
+            let remove = command_safe.then(|| ExtensionAction::Command {
+                label: "remove".into(),
+                command: format!("/mcp remove {name}"),
+                disposition: RowActionDisposition::InPlace,
+            });
             ExtensionItem {
                 id: name.clone(),
                 tone: match (enabled, initializing, recovery) {
@@ -1199,6 +1362,8 @@ fn mcp_model(app: &App, locale: Locale) -> ExtensionsTabModel {
                     },
                 ),
                 action: Some(action),
+                toggle,
+                remove,
             }
         })
         .collect();
@@ -1297,6 +1462,12 @@ pub struct ExtensionsView {
     /// grammar the rest of the chrome uses instead of raw palette constants.
     theme: codewhale_palette::UiTheme,
     hits: RefCell<HitAreas>,
+    /// Last time `tick` asked the host for a fresh snapshot. Bounds the poll
+    /// so a per-frame tick cannot turn into a rebuild every frame.
+    last_poll: std::time::Instant,
+    /// Row id whose removal is armed. A second `d` / Delete / right-click on
+    /// the same row confirms; any navigation or Esc disarms.
+    pending_remove: Option<String>,
 }
 
 impl ExtensionsView {
@@ -1324,6 +1495,8 @@ impl ExtensionsView {
             folded_groups: BTreeSet::new(),
             theme: codewhale_palette::UI_THEME,
             hits: RefCell::new(HitAreas::default()),
+            last_poll: std::time::Instant::now(),
+            pending_remove: None,
         };
         // `/mcp` opens on the first server that needs a login, not on that
         // group's heading, so the one key the screen advertises — Enter —
@@ -1389,6 +1562,7 @@ impl ExtensionsView {
     }
 
     fn move_selection(&mut self, delta: isize) {
+        self.pending_remove = None;
         let len = self.visible_entries().len();
         if len == 0 {
             return;
@@ -1396,6 +1570,52 @@ impl ExtensionsView {
         let index = self.active_tab.index();
         self.selected[index] =
             (self.selected[index] as isize + delta).rem_euclid(len as isize) as usize;
+    }
+
+    fn selected_item(&self) -> Option<&ExtensionItem> {
+        let selected = self.selected[self.active_tab.index()];
+        match self.visible_entries().get(selected).copied() {
+            Some(VisibleEntry::Item(_, item)) => Some(item),
+            _ => None,
+        }
+    }
+
+    /// `e`: run the row's reversible on/off command in place.
+    fn toggle_selected(&mut self) -> ViewAction {
+        self.pending_remove = None;
+        match self.selected_item().and_then(|item| item.toggle.as_ref()) {
+            Some(ExtensionAction::Command { command, .. }) => {
+                ViewAction::Emit(ViewEvent::ExecutePanelCommand {
+                    command: command.clone(),
+                    pager_title: None,
+                })
+            }
+            _ => ViewAction::None,
+        }
+    }
+
+    /// `d` / Delete / right-click: arm removal on the first gesture, run the
+    /// row's remove command on the second. Rows without a remove command
+    /// ignore the gesture.
+    fn remove_selected(&mut self) -> ViewAction {
+        let Some((id, command)) = self.selected_item().and_then(|item| match &item.remove {
+            Some(ExtensionAction::Command { command, .. }) => {
+                Some((item.id.clone(), command.clone()))
+            }
+            _ => None,
+        }) else {
+            self.pending_remove = None;
+            return ViewAction::None;
+        };
+        if self.pending_remove.as_deref() == Some(id.as_str()) {
+            self.pending_remove = None;
+            return ViewAction::Emit(ViewEvent::ExecutePanelCommand {
+                command,
+                pager_title: None,
+            });
+        }
+        self.pending_remove = Some(id);
+        ViewAction::None
     }
 
     fn activate_selected(&mut self) -> ViewAction {
@@ -1410,27 +1630,62 @@ impl ExtensionsView {
                 self.clamp_selection();
                 ViewAction::None
             }
-            Some(VisibleEntry::Item(_, item)) => item
-                .action
-                .as_ref()
-                .and_then(ExtensionAction::command)
-                .map_or(ViewAction::None, |command| {
-                    ViewAction::EmitAndClose(ViewEvent::CommandPaletteSelected {
-                        action: CommandPaletteAction::ExecuteCommand {
-                            command: command.to_string(),
-                        },
-                    })
-                }),
+            Some(VisibleEntry::Item(_, item)) => match item.action.as_ref() {
+                Some(ExtensionAction::Command {
+                    command,
+                    disposition,
+                    ..
+                }) => match disposition {
+                    RowActionDisposition::LeavePanel => {
+                        ViewAction::EmitAndClose(ViewEvent::CommandPaletteSelected {
+                            action: CommandPaletteAction::ExecuteCommand {
+                                command: command.clone(),
+                            },
+                        })
+                    }
+                    RowActionDisposition::InPlace => {
+                        ViewAction::Emit(ViewEvent::ExecutePanelCommand {
+                            command: command.clone(),
+                            pager_title: None,
+                        })
+                    }
+                    RowActionDisposition::InPlacePager => {
+                        ViewAction::Emit(ViewEvent::ExecutePanelCommand {
+                            command: command.clone(),
+                            pager_title: Some(item.label.clone()),
+                        })
+                    }
+                },
+                _ => ViewAction::None,
+            },
             _ => ViewAction::None,
         }
     }
 
+    /// Swap in a fresh read model while keeping everything the user is doing:
+    /// active tab, focus, search query, selection, scroll, and folded groups
+    /// all survive; the selection only moves when the refreshed list no
+    /// longer reaches it.
+    pub fn refresh_snapshot(&mut self, snapshot: ExtensionsSnapshot) {
+        self.snapshot = snapshot;
+        self.clamp_selection();
+    }
+
     fn set_tab(&mut self, tab: ExtensionsTab) {
+        self.pending_remove = None;
         self.active_tab = tab;
         self.clamp_selection();
     }
 
     fn selected_status(&self) -> String {
+        if let Some(item) = self.selected_item()
+            && self.pending_remove.as_deref() == Some(item.id.as_str())
+        {
+            return format!(
+                "Remove {}? Press d, Enter or right-click again to confirm · Esc cancels",
+                item.label
+            );
+        }
         let index = self.selected[self.active_tab.index()];
         match self.visible_entries().get(index).copied() {
             Some(VisibleEntry::Group(group)) => localize(
@@ -1512,11 +1767,34 @@ impl ModalView for ExtensionsView {
             }
             return ViewAction::None;
         }
+        if self.pending_remove.is_some()
+            && !matches!(
+                key.code,
+                KeyCode::Char('d') | KeyCode::Delete | KeyCode::Enter | KeyCode::Char('y')
+            )
+        {
+            // Anything but the confirming key disarms a pending removal.
+            self.pending_remove = None;
+            if key.code == KeyCode::Esc {
+                return ViewAction::None;
+            }
+        }
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => ViewAction::Close,
             KeyCode::Char('/') => {
                 self.focus = ExtensionsFocus::Search;
                 ViewAction::None
+            }
+            KeyCode::Char('e') => {
+                self.focus = ExtensionsFocus::List;
+                self.toggle_selected()
+            }
+            KeyCode::Char('d') | KeyCode::Delete => {
+                self.focus = ExtensionsFocus::List;
+                self.remove_selected()
+            }
+            KeyCode::Char('y') | KeyCode::Enter if self.pending_remove.is_some() => {
+                self.remove_selected()
             }
             // Left/Right and `[`/`]` are the same move for hands that reach
             // for them; the advertised chord is Tab.
@@ -1547,8 +1825,43 @@ impl ModalView for ExtensionsView {
     }
 
     fn handle_mouse(&mut self, mouse: MouseEvent) -> ViewAction {
-        if mouse.kind != MouseEventKind::Down(MouseButton::Left) {
-            return ViewAction::None;
+        match mouse.kind {
+            // The wheel moves this list, not the transcript behind it.
+            MouseEventKind::ScrollUp => {
+                self.pending_remove = None;
+                self.focus = ExtensionsFocus::List;
+                self.move_selection(-1);
+                return ViewAction::None;
+            }
+            MouseEventKind::ScrollDown => {
+                self.pending_remove = None;
+                self.focus = ExtensionsFocus::List;
+                self.move_selection(1);
+                return ViewAction::None;
+            }
+            // Right-click on a row selects it and arms (then confirms) its
+            // removal, the same two-step gesture as `d`.
+            MouseEventKind::Down(MouseButton::Right) => {
+                let row = self
+                    .hits
+                    .borrow()
+                    .rows
+                    .iter()
+                    .find(|(rect, _)| rect.contains((mouse.column, mouse.row).into()))
+                    .map(|(_, row)| *row);
+                let Some(row) = row else {
+                    self.pending_remove = None;
+                    return ViewAction::None;
+                };
+                self.focus = ExtensionsFocus::List;
+                if self.selected[self.active_tab.index()] != row {
+                    self.pending_remove = None;
+                    self.selected[self.active_tab.index()] = row;
+                }
+                return self.remove_selected();
+            }
+            MouseEventKind::Down(MouseButton::Left) => {}
+            _ => return ViewAction::None,
         }
         let hits = self.hits.borrow();
         if let Some((_, tab)) = hits
@@ -1794,23 +2107,41 @@ impl ModalView for ExtensionsView {
             super::ActionHint::new("/", tr(self.locale, MessageId::SessionsActionSearch)),
             super::ActionHint::new("Esc", tr(self.locale, MessageId::SessionsActionClose)),
         ];
+        // Only advertise Enter when Enter does something. A `Status` action is
+        // a state, not a verb: a row mid-connect labelled `connecting` produced
+        // the hint "Enter connecting", and pressing it did nothing — which is
+        // what makes a user press it again.
         let enter_label = match entries.get(selected).copied() {
             Some(VisibleEntry::Item(_, item)) => item
                 .action
                 .as_ref()
-                .map(|action| action.label().to_string())
-                .unwrap_or_else(|| {
-                    tr(self.locale, MessageId::AutomationActionInspect).into_owned()
-                }),
-            _ => tr(self.locale, MessageId::ExtensionsActionFold).into_owned(),
+                .filter(|action| action.command().is_some())
+                .map(|action| action.label().to_string()),
+            _ => Some(tr(self.locale, MessageId::ExtensionsActionFold).into_owned()),
         };
-        let full_hints = [
+        let mut full_hints = vec![
             super::ActionHint::new("Tab", tr(self.locale, MessageId::ExtensionsActionTabs)),
             super::ActionHint::new("↑↓", tr(self.locale, MessageId::LaunchHintMove)),
-            super::ActionHint::new("Enter", enter_label),
-            super::ActionHint::new("/", tr(self.locale, MessageId::SessionsActionSearch)),
-            super::ActionHint::new("Esc", tr(self.locale, MessageId::SessionsActionClose)),
         ];
+        if let Some(label) = enter_label {
+            full_hints.push(super::ActionHint::new("Enter", label));
+        }
+        if let Some(item) = self.selected_item() {
+            if let Some(toggle) = item.toggle.as_ref() {
+                full_hints.push(super::ActionHint::new("e", toggle.label().to_string()));
+            }
+            if let Some(remove) = item.remove.as_ref() {
+                full_hints.push(super::ActionHint::new("d", remove.label().to_string()));
+            }
+        }
+        full_hints.push(super::ActionHint::new(
+            "/",
+            tr(self.locale, MessageId::SessionsActionSearch),
+        ));
+        full_hints.push(super::ActionHint::new(
+            "Esc",
+            tr(self.locale, MessageId::SessionsActionClose),
+        ));
         render_modal_footer(
             rows[4],
             buf,
@@ -1823,6 +2154,22 @@ impl ModalView for ExtensionsView {
         *self.hits.borrow_mut() = hits;
     }
 
+    fn tick(&mut self) -> ViewAction {
+        // MCP rows go live while the panel is open — a retry lands, a login
+        // finishes, a diagnosis resolves — and the open-time capture would
+        // read stale until reopen. Ask the host for a fresh model at a
+        // bounded cadence; it rebuilds only when the generation or the
+        // initializing flag actually moved.
+        if self.last_poll.elapsed() < std::time::Duration::from_millis(750) {
+            return ViewAction::None;
+        }
+        self.last_poll = std::time::Instant::now();
+        ViewAction::Emit(ViewEvent::RefreshExtensions {
+            mcp_generation: self.snapshot.mcp_generation,
+            mcp_initializing: self.snapshot.mcp_initializing,
+        })
+    }
+
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
         self
     }
@@ -1832,6 +2179,51 @@ impl ModalView for ExtensionsView {
 mod tests {
     use super::*;
     use crate::mcp::McpRecoveryKind;
+
+    #[test]
+    fn marketplace_shipped_bundle_uses_local_metadata_and_review_action() {
+        let _env = crate::test_support::lock_test_env();
+        let root = tempfile::tempdir().unwrap();
+        let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", root.path());
+        let registry = crate::plugins::PluginDiscoveryContext::capture_pre_dotenv()
+            .registry_for_workspace(root.path());
+        let app = App::new_with_plugin_registry(
+            crate::test_support::test_tui_options(root.path()),
+            &crate::config::Config::default(),
+            registry,
+        );
+        let model = marketplace_model(&app, Locale::En);
+        let group = model
+            .groups
+            .iter()
+            .find(|group| group.id == "codewhale")
+            .unwrap();
+        let row = group
+            .items
+            .iter()
+            .find(|row| row.label == "computer-use")
+            .unwrap();
+        let builtin = app.plugin_registry.get("computer-use").unwrap();
+        assert_eq!(
+            row.description,
+            builtin
+                .manifest
+                .plugin
+                .description
+                .clone()
+                .unwrap_or_default()
+        );
+        assert_eq!(
+            row.state,
+            tr(Locale::En, MessageId::ExtensionsStateFirstParty)
+        );
+        assert!(
+            matches!(&row.action, Some(ExtensionAction::Command { command, disposition: RowActionDisposition::LeavePanel, .. }) if command == "/plugin trust computer-use")
+        );
+        assert!(!builtin.trusted());
+        assert!(!builtin.enabled);
+        assert_eq!(group.items.iter().filter(|row| matches!(&row.action, Some(ExtensionAction::Command { command, .. }) if command.starts_with("/plugin marketplace install "))).count(), 3);
+    }
 
     #[test]
     fn mcp_item_action_for_stale_oauth_is_login() {
@@ -1859,7 +2251,13 @@ mod tests {
         let recovery = crate::mcp::mcp_recovery_kind(true, true, false, None, false)
             .expect("a disconnected server needs recovery");
         assert_eq!(recovery, McpRecoveryKind::Reconnect);
-        assert_eq!(recovery.slash_command("playwright"), "/mcp reload");
+        // The row names one server, so the command it runs must name it too:
+        // reloading all of them leaves the row the user aimed at still pending
+        // when the list returns, which reads as the key doing nothing.
+        assert_eq!(
+            recovery.slash_command("playwright"),
+            "/mcp retry playwright"
+        );
         assert_eq!(tr(Locale::En, recovery.label_key()).as_ref(), "reconnect");
     }
 
@@ -1930,6 +2328,8 @@ mod tests {
             tone: ExtensionTone::Attention,
             detail: detail.into(),
             action: Some(action),
+            toggle: None,
+            remove: None,
         }
     }
 
@@ -1941,6 +2341,7 @@ mod tests {
             ExtensionAction::Command {
                 label: "re-auth".into(),
                 command: McpRecoveryKind::Reauth.slash_command(name),
+                disposition: RowActionDisposition::LeavePanel,
             },
         )
     }
@@ -1967,6 +2368,7 @@ mod tests {
                 ExtensionAction::Command {
                     label: "diagnose".into(),
                     command: McpRecoveryKind::Diagnose.slash_command("supabase"),
+                    disposition: RowActionDisposition::InPlace,
                 },
             ),
             login_row("slack"),
@@ -2039,5 +2441,138 @@ mod tests {
             Locale::En,
         );
         assert_eq!(plain.selected[ExtensionsTab::Mcp.index()], 0);
+    }
+
+    fn item_with_action(action: ExtensionAction) -> ExtensionItem {
+        ExtensionItem {
+            id: "row".into(),
+            label: "row".into(),
+            description: String::new(),
+            state: "state".into(),
+            tone: ExtensionTone::Idle,
+            detail: "detail".into(),
+            action: Some(action),
+            toggle: None,
+            remove: None,
+        }
+    }
+
+    fn view_on_item(action: ExtensionAction) -> ExtensionsView {
+        let mut snapshot = ExtensionsSnapshot::default();
+        snapshot.tabs[ExtensionsTab::Plugins.index()] = ExtensionsTabModel {
+            groups: vec![ExtensionGroup {
+                id: "g".into(),
+                label: "g".into(),
+                items: vec![item_with_action(action)],
+            }],
+            problem: None,
+        };
+        let mut view =
+            ExtensionsView::from_snapshot_with_locale(snapshot, ExtensionsTab::Plugins, Locale::En);
+        // Land on the item, not its group heading.
+        view.selected[ExtensionsTab::Plugins.index()] = 1;
+        view
+    }
+
+    /// The defect: every row closed the panel and dropped its command into
+    /// the transcript. A mutation runs in place — the event carries the
+    /// command, and `Emit` (not `EmitAndClose`) is what keeps the panel.
+    #[test]
+    fn in_place_row_action_emits_without_closing() {
+        let mut view = view_on_item(ExtensionAction::Command {
+            label: "enable".into(),
+            command: "/plugin enable demo".into(),
+            disposition: RowActionDisposition::InPlace,
+        });
+        match view.activate_selected() {
+            ViewAction::Emit(ViewEvent::ExecutePanelCommand {
+                command,
+                pager_title,
+            }) => {
+                assert_eq!(command, "/plugin enable demo");
+                assert_eq!(pager_title, None);
+            }
+            other => panic!("expected an in-place command, got {other:?}"),
+        }
+    }
+
+    /// An inspect row keeps the panel open and asks for its text output in a
+    /// pager stacked on the panel — the detail belongs to the row, not to a
+    /// transcript dump behind the modal.
+    #[test]
+    fn inspect_row_action_pages_its_output_in_place() {
+        let mut view = view_on_item(ExtensionAction::Command {
+            label: "open".into(),
+            command: "/plugin show demo".into(),
+            disposition: RowActionDisposition::InPlacePager,
+        });
+        match view.activate_selected() {
+            ViewAction::Emit(ViewEvent::ExecutePanelCommand {
+                command,
+                pager_title,
+            }) => {
+                assert_eq!(command, "/plugin show demo");
+                assert_eq!(pager_title.as_deref(), Some("row"));
+            }
+            other => panic!("expected a paged inspect, got {other:?}"),
+        }
+    }
+
+    /// A flow that owns another surface — a login, an editor, the composer's
+    /// trust token — still yields the panel.
+    #[test]
+    fn leave_panel_row_action_still_closes() {
+        let mut view = view_on_item(ExtensionAction::Command {
+            label: "re-auth".into(),
+            command: "/mcp login github".into(),
+            disposition: RowActionDisposition::LeavePanel,
+        });
+        match view.activate_selected() {
+            ViewAction::EmitAndClose(ViewEvent::CommandPaletteSelected {
+                action: CommandPaletteAction::ExecuteCommand { command },
+            }) => assert_eq!(command, "/mcp login github"),
+            other => panic!("expected the panel to yield, got {other:?}"),
+        }
+    }
+
+    /// A refresh swaps the read model without disturbing the session: tab,
+    /// query, selection, and folds all survive, and the new MCP generation
+    /// the poll compares against rides along.
+    #[test]
+    fn refresh_preserves_view_state_and_tracks_generation() {
+        let mut view = view_on_item(ExtensionAction::Command {
+            label: "enable".into(),
+            command: "/plugin enable demo".into(),
+            disposition: RowActionDisposition::InPlace,
+        });
+        view.query = "de".into();
+        let mut fresh = ExtensionsSnapshot {
+            mcp_generation: 7,
+            mcp_initializing: true,
+            ..ExtensionsSnapshot::default()
+        };
+        fresh.tabs[ExtensionsTab::Plugins.index()] = ExtensionsTabModel {
+            groups: vec![ExtensionGroup {
+                id: "g".into(),
+                label: "g".into(),
+                items: vec![item_with_action(ExtensionAction::Status {
+                    label: "enabled".into(),
+                })],
+            }],
+            problem: None,
+        };
+        view.refresh_snapshot(fresh);
+        assert_eq!(view.active_tab, ExtensionsTab::Plugins);
+        assert_eq!(view.query, "de");
+        assert_eq!(view.snapshot.mcp_generation, 7);
+        assert!(view.snapshot.mcp_initializing);
+        // The refreshed row's action is the new model's, not the stale one.
+        let entries = view.visible_entries();
+        match entries[view.selected[ExtensionsTab::Plugins.index()]] {
+            VisibleEntry::Item(_, item) => {
+                assert!(matches!(item.action, Some(ExtensionAction::Status { .. })));
+            }
+            other => panic!("expected the refreshed item, got {other:?}"),
+        }
     }
 }

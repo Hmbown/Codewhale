@@ -38,7 +38,6 @@ const DEFAULT_AUTOMATION_DELIVERY_MODE: AutomationDeliveryMode = AutomationDeliv
 pub const AUTOMATION_WATCHER_NO_REPORT_SENTINEL: &str = "NOTHING_TO_REPORT";
 const MAX_HOURLY_SEARCH_STEPS: usize = 24 * 21;
 const MAX_CRON_SEARCH_MINUTES: usize = 60 * 24 * 366 * 5;
-
 const fn default_automation_schema_version() -> u32 {
     CURRENT_AUTOMATION_SCHEMA_VERSION
 }
@@ -617,6 +616,50 @@ impl AutomationSchedule {
                 .map(Some),
         }
     }
+
+    /// First slot after `slot` that is still in the future at `now`.
+    ///
+    /// Missed slots coalesce: downtime, a paused window, or an in-flight
+    /// occurrence earn one receipt for the oldest owed slot, then the
+    /// schedule resumes on its own grid instead of replaying one stale slot
+    /// per tick. Calendar-anchored schedules (anchored HOURLY, WEEKLY, CRON)
+    /// live on a fixed wall-clock grid, so the first slot after `now` is
+    /// exactly the slot plain chaining would converge to; computing from
+    /// `now` directly skips the whole backlog in one step. Unanchored HOURLY
+    /// is a relative cadence with no calendar grid — hop along its
+    /// established `slot + k * interval` chain so a late recovery does not
+    /// re-phase the schedule to the recovery instant.
+    fn next_unskipped_slot(
+        &self,
+        slot: DateTime<Utc>,
+        now: DateTime<Utc>,
+        anchor_reference: DateTime<Utc>,
+    ) -> Result<Option<DateTime<Utc>>> {
+        if let Self::Hourly {
+            interval_hours,
+            anchor_hour: None,
+            anchor_minute: None,
+            ..
+        } = self
+        {
+            let first = self.next_after_with_anchor(slot, anchor_reference)?;
+            if first > now {
+                return Ok(Some(first));
+            }
+            // Jump whole intervals on the established UTC grid, then reuse
+            // the schedule's weekday filter for the next eligible slot.
+            // Minute normalization happens in the first advance above.
+            let interval_seconds = i64::from(*interval_hours) * 60 * 60;
+            let elapsed = (now - first).num_seconds();
+            let delta = Duration::seconds(elapsed / interval_seconds * interval_seconds);
+            let previous = first
+                .checked_add_signed(delta)
+                .context("HOURLY catch-up exceeded its range")?;
+            self.next_after_slot(previous, anchor_reference)
+        } else {
+            self.next_after_slot(slot.max(now), anchor_reference)
+        }
+    }
 }
 
 /// Resolve one calendar-local schedule slot.
@@ -1185,18 +1228,7 @@ impl AutomationManager {
 
     pub fn get_automation(&self, id: &str) -> Result<AutomationRecord> {
         let path = self.automation_path(id)?;
-        let raw = fs::read_to_string(&path)
-            .with_context(|| format!("Failed to read automation {}", path.display()))?;
-        let record: AutomationRecord = serde_json::from_str(&raw)
-            .with_context(|| format!("Failed to parse automation {}", path.display()))?;
-        if record.schema_version > CURRENT_AUTOMATION_SCHEMA_VERSION {
-            bail!(
-                "Automation schema v{} is newer than supported v{}",
-                record.schema_version,
-                CURRENT_AUTOMATION_SCHEMA_VERSION
-            );
-        }
-        Ok(record)
+        read_automation_file(&path)
     }
 
     pub fn save_automation(&self, record: &AutomationRecord) -> Result<()> {
@@ -1229,17 +1261,7 @@ impl AutomationManager {
             if path.extension().is_none_or(|ext| ext != "json") {
                 continue;
             }
-            let raw = fs::read_to_string(&path)
-                .with_context(|| format!("Failed to read {}", path.display()))?;
-            let record: AutomationRecord = serde_json::from_str(&raw)
-                .with_context(|| format!("Failed to parse {}", path.display()))?;
-            if record.schema_version > CURRENT_AUTOMATION_SCHEMA_VERSION {
-                bail!(
-                    "Automation schema v{} is newer than supported v{}",
-                    record.schema_version,
-                    CURRENT_AUTOMATION_SCHEMA_VERSION
-                );
-            }
+            let record = read_automation_file(&path)?;
             out.push(record);
         }
         out.sort_by_key(|r| std::cmp::Reverse(r.updated_at));
@@ -1564,6 +1586,33 @@ impl AutomationManager {
         Ok(())
     }
 
+    /// Definitions this build can read, in `list_automations` order.
+    ///
+    /// One corrupt, unreadable, or newer-schema file is quarantined in place:
+    /// its bytes stay on disk and every pass logs the path, but it cannot
+    /// starve collection of the healthy definitions behind it, and it is never
+    /// rewritten or adopted by a runtime that does not understand it.
+    fn readable_automations(&self) -> Result<Vec<AutomationRecord>> {
+        let mut out = Vec::new();
+        for entry in fs::read_dir(&self.automations_dir)
+            .with_context(|| format!("Failed to read {}", self.automations_dir.display()))?
+        {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().is_none_or(|ext| ext != "json") {
+                continue;
+            }
+            match read_automation_file(&path) {
+                Ok(record) => out.push(record),
+                Err(error) => {
+                    tracing::warn!("Skipping damaged automation file: {error:#}");
+                }
+            }
+        }
+        out.sort_by_key(|r| std::cmp::Reverse(r.updated_at));
+        Ok(out)
+    }
+
     /// List proposals only. Every proposal is revalidated and durably claimed
     /// immediately before dispatch, not when an earlier batch item is awaited.
     fn collect_due_runs(
@@ -1572,13 +1621,27 @@ impl AutomationManager {
     ) -> Result<Vec<(AutomationRecord, AutomationRunRecord)>> {
         self.with_transaction(|| {
             let mut due = Vec::new();
-            for mut automation in self.list_automations()? {
+            for mut automation in self.readable_automations()? {
                 if automation.status != AutomationStatus::Active
                     || !self.eligible_scope(automation.execution_scope.as_deref())
                 {
                     continue;
                 }
-                let schedule = AutomationSchedule::parse_rrule(&automation.rrule)?;
+                // An owned definition whose schedule cannot be evaluated is
+                // quarantined like a damaged file: left untouched (a newer
+                // build may understand it), diagnosed every pass, and never
+                // allowed to take down the rest of the collection.
+                let schedule = match AutomationSchedule::parse_rrule(&automation.rrule) {
+                    Ok(schedule) => schedule,
+                    Err(error) => {
+                        tracing::warn!(
+                            "Skipping automation {} with unevaluable schedule {:?}: {error:#}",
+                            automation.id,
+                            automation.rrule
+                        );
+                        continue;
+                    }
+                };
                 let Some(due_at) = automation.next_run_at else {
                     automation.next_run_at =
                         match schedule.next_after_with_anchor(now, automation.created_at) {
@@ -1592,7 +1655,13 @@ impl AutomationManager {
                                 automation.status = AutomationStatus::Paused;
                                 None
                             }
-                            Err(error) => return Err(error),
+                            Err(error) => {
+                                tracing::warn!(
+                                    "Skipping automation {} whose schedule cannot produce a slot: {error:#}",
+                                    automation.id
+                                );
+                                continue;
+                            }
                         };
                     automation.updated_at = now;
                     self.save_automation_unlocked(&automation)?;
@@ -1627,13 +1696,13 @@ impl AutomationManager {
             {
                 return Ok(None);
             }
+            let schedule = AutomationSchedule::parse_rrule(&current.rrule)?;
             // Include the complete history, including legacy occurrence ids.
-            if self
-                .list_runs_with_visibility(&current.id, None, true)?
+            let history = self.list_runs_with_visibility(&current.id, None, true)?;
+            if history
                 .iter()
                 .any(|existing| existing.scheduled_for == run.scheduled_for)
             {
-                let schedule = AutomationSchedule::parse_rrule(&current.rrule)?;
                 self.advance_automation_after_slot(
                     &mut current,
                     &schedule,
@@ -1642,12 +1711,23 @@ impl AutomationManager {
                 )?;
                 return Ok(None);
             }
+            // Keep the owed slot until the earlier run settles. Its eventual
+            // catch-up coalesces the backlog without overlapping executions
+            // or inventing cancellation receipts. Explicit run-now requests
+            // remain operator intent and stay ungated.
+            if history.iter().any(|existing| {
+                matches!(
+                    existing.status,
+                    AutomationRunStatus::Queued | AutomationRunStatus::Running
+                )
+            }) {
+                return Ok(None);
+            }
             bind_run_dispatch(&mut run, &current, task_data_dir, true)?;
             self.save_run(&run)?;
             // The durable claim is the point of no return. Pause/delete after
             // this point affects future occurrences, not this admitted work.
             // No task can start before the binding above is durable.
-            let schedule = AutomationSchedule::parse_rrule(&current.rrule)?;
             self.advance_automation_after_slot(
                 &mut current,
                 &schedule,
@@ -1729,7 +1809,7 @@ impl AutomationManager {
         now: DateTime<Utc>,
     ) -> Result<()> {
         automation.updated_at = now;
-        automation.next_run_at = schedule.next_after_slot(slot, automation.created_at)?;
+        automation.next_run_at = schedule.next_unskipped_slot(slot, now, automation.created_at)?;
         if automation.next_run_at.is_none() {
             automation.status = AutomationStatus::Paused;
         }
@@ -1748,7 +1828,17 @@ impl AutomationManager {
             let Some(id) = entry.file_name().to_str().map(str::to_owned) else {
                 continue;
             };
-            for run in self.list_runs_with_visibility(&id, None, true)? {
+            // A damaged receipt quarantines only its own automation: the bytes
+            // stay on disk and the diagnostic is logged every pass, but one
+            // corrupt file must not block recovery of every other pending run.
+            let runs = match self.list_runs_with_visibility(&id, None, true) {
+                Ok(runs) => runs,
+                Err(error) => {
+                    tracing::warn!("Skipping damaged run history for automation {id}: {error:#}");
+                    continue;
+                }
+            };
+            for run in runs {
                 if matches!(
                     run.status,
                     AutomationRunStatus::Queued | AutomationRunStatus::Running
@@ -2162,12 +2252,26 @@ where
         ) {
             continue;
         }
-        automations.lock().await.recover_schedule_advance(&run)?;
+        // A single damaged admission is quarantined to its diagnostic; it must
+        // not take down recovery of every pending run behind it.
+        if let Err(error) = automations.lock().await.recover_schedule_advance(&run) {
+            tracing::warn!(
+                "automation schedule recovery failed for run {}: {error:#}",
+                run.id
+            );
+            continue;
+        }
         let run = enqueue(run).await;
-        automations
+        if let Err(error) = automations
             .lock()
             .await
-            .finish_scheduled_run(&run, Utc::now())?;
+            .finish_scheduled_run(&run, Utc::now())
+        {
+            tracing::warn!(
+                "automation run {} receipt could not be persisted: {error:#}",
+                run.id
+            );
+        }
     }
     let now = Utc::now();
     let due = automations.lock().await.collect_due_runs(now)?;
@@ -2180,15 +2284,33 @@ where
             continue;
         }
         let run =
-            automations
+            match automations
                 .lock()
                 .await
-                .claim_scheduled_run(&observed, proposed, task_data_dir)?;
+                .claim_scheduled_run(&observed, proposed, task_data_dir)
+            {
+                Ok(run) => run,
+                Err(error) => {
+                    // One automation's claim failure (for example a corrupt
+                    // receipt in its own dedup history) quarantines that
+                    // automation, not the tick: later due work still dispatches.
+                    tracing::warn!(
+                        "automation {} occurrence claim failed: {error:#}",
+                        observed.id
+                    );
+                    continue;
+                }
+            };
         let Some(run) = run else {
             continue;
         };
         let run = enqueue(run).await;
-        automations.lock().await.finish_scheduled_run(&run, now)?;
+        if let Err(error) = automations.lock().await.finish_scheduled_run(&run, now) {
+            tracing::warn!(
+                "automation run {} receipt could not be persisted: {error:#}",
+                run.id
+            );
+        }
     }
     Ok(())
 }
@@ -2268,7 +2390,7 @@ where
         }
         let claimed = {
             let manager = automations.lock().await;
-            manager.with_transaction(|| {
+            match manager.with_transaction(|| {
                 let mut current = manager.get_trigger(&candidate.trigger_id)?;
                 if current.status == DelayedTriggerStatus::Dispatching {
                     if !manager.eligible_scope(
@@ -2316,13 +2438,38 @@ where
                 });
                 manager.save_trigger_unlocked(&current)?;
                 Ok(Some(current))
-            })?
+            }) {
+                Ok(claimed) => claimed,
+                Err(error) => {
+                    // One damaged trigger record quarantines to a diagnostic;
+                    // the remaining due triggers still fire this pass.
+                    tracing::warn!(
+                        "delayed trigger {} claim failed: {error:#}",
+                        candidate.trigger_id
+                    );
+                    continue;
+                }
+            }
         };
         let Some(trigger) = claimed else {
             continue;
         };
-        let trigger = enqueue(trigger).await?;
-        automations.lock().await.save_trigger(&trigger)?;
+        let trigger = match enqueue(trigger).await {
+            Ok(trigger) => trigger,
+            Err(error) => {
+                tracing::warn!(
+                    "delayed trigger {} enqueue failed: {error:#}",
+                    candidate.trigger_id
+                );
+                continue;
+            }
+        };
+        if let Err(error) = automations.lock().await.save_trigger(&trigger) {
+            tracing::warn!(
+                "delayed trigger {} receipt could not be persisted: {error:#}",
+                trigger.trigger_id
+            );
+        }
     }
     Ok(())
 }
@@ -2381,6 +2528,7 @@ async fn reconcile_run_statuses_shared(
     automations: &SharedAutomationManager,
     task_manager: &SharedTaskManager,
 ) -> Result<()> {
+    automations.lock().await.bind_task_manager(task_manager)?;
     let mut lock = automations.lock().await.open_lock("dispatch.lock")?;
     let _dispatch = match lock.try_write() {
         Ok(guard) => guard,
@@ -2389,6 +2537,18 @@ async fn reconcile_run_statuses_shared(
     };
     let pending = automations.lock().await.collect_pending_runs()?;
     for mut run in pending {
+        // Shared storage is not shared ownership. A receipt admitted under
+        // another execution scope is reconciled by that scope's owner; this
+        // process must not stamp errors onto it or rewrite it from a bound
+        // task record it cannot see.
+        if run
+            .dispatch
+            .as_ref()
+            .and_then(|dispatch| dispatch.execution_scope.as_deref())
+            != Some(task_manager.execution_scope())
+        {
+            continue;
+        }
         let Some(task_id) = run.task_id.clone() else {
             continue;
         };
@@ -2396,25 +2556,71 @@ async fn reconcile_run_statuses_shared(
             if let Some(dispatch) = &run.dispatch {
                 check_dispatch_store(dispatch, task_manager)?;
             }
-            let task = task_manager
-                .read_bound_task(&task_id)?
-                .context("Bound automation task is missing; recovery unavailable")?;
-            if let Some(dispatch) = &run.dispatch {
-                crate::task_manager::validate_bound_task_request(&task, &dispatch.request)?;
+            let task = task_manager.read_bound_task(&task_id)?;
+            if let Some(task) = &task
+                && let Some(dispatch) = &run.dispatch
+            {
+                crate::task_manager::validate_bound_task_request(task, &dispatch.request)?;
             }
             Ok::<_, anyhow::Error>(task)
         })();
         let task = match lookup {
-            Ok(task) => task,
-            Err(error) => {
-                run.error = Some(format!("Automation reconciliation unavailable: {error:#}"));
-                automations
+            Ok(Some(task)) => task,
+            Ok(None) => {
+                if run
+                    .dispatch
+                    .as_ref()
+                    .is_some_and(|dispatch| dispatch.accepted)
+                {
+                    // The admission was durably accepted but the bound task
+                    // record is gone: this occurrence can never be replayed
+                    // or reconciled. Settle it terminally instead of retrying
+                    // the same lookup every pass and starving the schedule
+                    // behind it.
+                    run.status = AutomationRunStatus::Failed;
+                    run.ended_at = Some(run.ended_at.unwrap_or_else(Utc::now));
+                    run.error = Some(format!(
+                        "Bound automation task {task_id} is missing after durable acceptance"
+                    ));
+                } else {
+                    // Unaccepted admissions are the scheduler's recovery path:
+                    // the next tick reuses the durable binding or recreates
+                    // the task; reconcile only records the uncertainty.
+                    run.error = Some(format!(
+                        "Automation reconciliation unavailable: bound task {task_id} is missing"
+                    ));
+                }
+                if let Err(error) = automations
                     .lock()
                     .await
-                    .finish_scheduled_run(&run, Utc::now())?;
+                    .finish_scheduled_run(&run, Utc::now())
+                {
+                    tracing::warn!(
+                        "automation run {} receipt could not be persisted: {error:#}",
+                        run.id
+                    );
+                }
+                continue;
+            }
+            Err(error) => {
+                run.error = Some(format!("Automation reconciliation unavailable: {error:#}"));
+                if let Err(error) = automations
+                    .lock()
+                    .await
+                    .finish_scheduled_run(&run, Utc::now())
+                {
+                    tracing::warn!(
+                        "automation run {} receipt could not be persisted: {error:#}",
+                        run.id
+                    );
+                }
                 continue;
             }
         };
+        // The bound task itself belongs to another Runtime — hands off.
+        if task.execution_scope.as_deref() != Some(task_manager.execution_scope()) {
+            continue;
+        }
         let watcher = run
             .dispatch
             .as_ref()
@@ -2453,10 +2659,16 @@ async fn reconcile_run_statuses_shared(
         run.schema_version = CURRENT_RUN_SCHEMA_VERSION;
         dispatch.accepted = true;
         dispatch.suppress_report = watcher_noop;
-        automations
+        if let Err(error) = automations
             .lock()
             .await
-            .finish_scheduled_run(&run, Utc::now())?;
+            .finish_scheduled_run(&run, Utc::now())
+        {
+            tracing::warn!(
+                "automation run {} receipt could not be persisted: {error:#}",
+                run.id
+            );
+        }
     }
     Ok(())
 }
@@ -2486,6 +2698,21 @@ fn has_sortable_run_stem(stem: &str) -> bool {
         18 => ch == 'Z',
         _ => ch.is_ascii_digit(),
     })
+}
+
+fn read_automation_file(path: &Path) -> Result<AutomationRecord> {
+    let raw = fs::read_to_string(path)
+        .with_context(|| format!("Failed to read automation {}", path.display()))?;
+    let record: AutomationRecord = serde_json::from_str(&raw)
+        .with_context(|| format!("Failed to parse automation {}", path.display()))?;
+    if record.schema_version > CURRENT_AUTOMATION_SCHEMA_VERSION {
+        bail!(
+            "Automation schema v{} is newer than supported v{}",
+            record.schema_version,
+            CURRENT_AUTOMATION_SCHEMA_VERSION
+        );
+    }
+    Ok(record)
 }
 
 fn read_run_file(path: &Path) -> Result<AutomationRunRecord> {
@@ -4701,4 +4928,5 @@ model = "private-model"
         }
     }
     mod ownership;
+    mod recovery;
 }

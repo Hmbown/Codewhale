@@ -2715,6 +2715,154 @@ fn custom_provider_set_rejects_unknown_field_with_corrective_error() {
 }
 
 #[test]
+fn model_context_windows_set_get_unset_round_trip() -> Result<()> {
+    let mut config = ConfigToml::default();
+
+    // Built-in provider, bare wire id — plus slash and dotted spellings,
+    // which stay intact because the model leg is the whole remainder.
+    config.set_value("providers.moonshot.model_context_windows.k3", "262144")?;
+    config.set_value(
+        "providers.moonshot.model_context_windows.MiniMaxAI/MiniMax-M2.5",
+        "204800",
+    )?;
+    config.set_value(
+        "providers.openrouter.model_context_windows.qwen3.5-flash",
+        "131072",
+    )?;
+
+    assert_eq!(
+        config
+            .get_value("providers.moonshot.model_context_windows.k3")
+            .as_deref(),
+        Some("262144")
+    );
+    assert_eq!(
+        config
+            .get_value("providers.moonshot.model_context_windows.MiniMaxAI/MiniMax-M2.5")
+            .as_deref(),
+        Some("204800")
+    );
+    assert_eq!(
+        config
+            .get_value("providers.openrouter.model_context_windows.qwen3.5-flash")
+            .as_deref(),
+        Some("131072")
+    );
+
+    // Per-provider isolation: another provider's table never answers.
+    assert_eq!(
+        config.get_value("providers.openai.model_context_windows.k3"),
+        None
+    );
+
+    // The typed field round-trips through TOML as a real subtable.
+    let serialized = toml::to_string(&config)?;
+    assert!(
+        serialized.contains("model_context_windows"),
+        "per-model windows must serialize as a providers subtable, got:\n{serialized}"
+    );
+    let reparsed: ConfigToml = toml::from_str(&serialized)?;
+    assert_eq!(
+        reparsed
+            .get_value("providers.moonshot.model_context_windows.k3")
+            .as_deref(),
+        Some("262144")
+    );
+
+    config.unset_value("providers.moonshot.model_context_windows.k3")?;
+    assert_eq!(
+        config.get_value("providers.moonshot.model_context_windows.k3"),
+        None
+    );
+    assert_eq!(
+        config
+            .get_value("providers.moonshot.model_context_windows.MiniMaxAI/MiniMax-M2.5")
+            .as_deref(),
+        Some("204800")
+    );
+    Ok(())
+}
+
+#[test]
+fn model_context_windows_custom_gateway_round_trip() -> Result<()> {
+    let mut config = ConfigToml::default();
+
+    config.set_value("providers.command_code.kind", "openai-compatible")?;
+    config.set_value(
+        "providers.command_code.base_url",
+        "https://gateway.example/v1",
+    )?;
+    config.set_value(
+        "providers.command_code.model_context_windows.google/gemini-3.1-flash-lite",
+        "1000000",
+    )?;
+
+    assert_eq!(
+        config
+            .get_value("providers.command_code.model_context_windows.google/gemini-3.1-flash-lite")
+            .as_deref(),
+        Some("1000000")
+    );
+
+    let serialized = toml::to_string(&config)?;
+    assert!(
+        serialized.contains("[providers.command_code.model_context_windows]")
+            || serialized.contains("model_context_windows"),
+        "custom provider windows must serialize under the providers table, got:\n{serialized}"
+    );
+
+    config
+        .unset_value("providers.command_code.model_context_windows.google/gemini-3.1-flash-lite")?;
+    assert_eq!(
+        config
+            .get_value("providers.command_code.model_context_windows.google/gemini-3.1-flash-lite"),
+        None
+    );
+    Ok(())
+}
+
+#[test]
+fn model_context_windows_rejects_zero_and_bad_model_ids() {
+    let mut config = ConfigToml::default();
+
+    let err = config
+        .set_value("providers.moonshot.model_context_windows.k3", "0")
+        .expect_err("zero per-model window must be rejected");
+    assert!(
+        format!("{err:#}").contains("greater than 0"),
+        "unexpected error: {err:#}"
+    );
+
+    let err = config
+        .set_value("providers.moonshot.model_context_windows.auto", "204800")
+        .expect_err("`auto` is a selector, not a wire model id");
+    assert!(
+        format!("{err:#}").contains("model_context_windows"),
+        "unexpected error: {err:#}"
+    );
+
+    let err = config
+        .set_value(
+            "providers.moonshot.model_context_windows.bad model",
+            "204800",
+        )
+        .expect_err("whitespace model ids must be rejected");
+    assert!(
+        format!("{err:#}").contains("model_context_windows"),
+        "unexpected error: {err:#}"
+    );
+
+    // Rejected writes leave no residue on the typed field.
+    assert!(
+        config
+            .providers
+            .for_provider(ProviderKind::Moonshot)
+            .model_context_windows
+            .is_empty()
+    );
+}
+
+#[test]
 fn builtin_provider_set_rejects_unknown_field_with_corrective_error() {
     let mut config = ConfigToml::default();
 
@@ -4967,7 +5115,7 @@ model = "mistral-large-latest"
 }
 
 #[test]
-fn opencode_go_resolves_current_chat_completions_route() {
+fn opencode_go_resolves_model_aware_route() {
     let _lock = env_lock();
     let _env = EnvGuard::without_deepseek_runtime_overrides();
 
@@ -4986,10 +5134,7 @@ fn opencode_go_resolves_current_chat_completions_route() {
     assert_eq!(metadata.default_base_url(), DEFAULT_OPENCODE_GO_BASE_URL);
     assert_eq!(metadata.default_model(), DEFAULT_OPENCODE_GO_MODEL);
     assert_eq!(metadata.env_vars(), &["OPENCODE_GO_API_KEY"]);
-    assert_eq!(
-        metadata.wire_policy().fixed(),
-        Some(provider::WireFormat::ChatCompletions)
-    );
+    assert_eq!(metadata.wire_policy(), provider::WirePolicy::ModelAware);
 
     let config: ConfigToml = toml::from_str(
         r#"
@@ -5012,7 +5157,7 @@ model = "opencode-go/glm-5.2"
     );
 
     // Provider-specific environment overrides remain available, but model ids
-    // stay inside the Chat Completions allowlist.
+    // stay inside the documented protocol roster.
     unsafe {
         std::env::set_var("OPENCODE_GO_API_KEY", "go-env-key");
         std::env::set_var("OPENCODE_GO_MODEL", "opencode-go/mimo-v2.5-pro");
@@ -5026,23 +5171,20 @@ model = "opencode-go/glm-5.2"
     assert_eq!(resolved.model, OPENCODE_GO_MIMO_V2_5_PRO_MODEL);
 
     for model in [OPENCODE_GO_GROK_4_5_MODEL, OPENCODE_GO_KIMI_K3_MODEL] {
-        assert_eq!(opencode_go_chat_model_id(model), Some(model));
+        assert_eq!(opencode_go_model_id(model), Some(model));
         assert_eq!(
-            opencode_go_chat_model_id(&format!("opencode-go/{model}")),
+            opencode_go_model_id(&format!("opencode-go/{model}")),
             Some(model)
         );
     }
 
-    // The Go roster also includes Messages-only models. Even a custom base URL
-    // cannot make one safe for this Chat Completions provider. Resolution must
-    // keep the configured id (so diagnostics name it) rather than silently
-    // substituting the Chat Completions default; the route layer rejects it.
+    // A custom endpoint preserves the configured Messages model; no fallback.
     unsafe {
         std::env::set_var("OPENCODE_GO_BASE_URL", "https://go-gateway.example/v1");
         std::env::set_var("OPENCODE_GO_MODEL", "minimax-m3");
     }
-    assert!(opencode_go_chat_model_id("minimax-m3").is_none());
-    assert!(opencode_go_chat_model_id("qwen3.7-max").is_none());
+    assert_eq!(opencode_go_model_id("minimax-m3"), Some("minimax-m3"));
+    assert_eq!(opencode_go_model_id("qwen3.7-max"), Some("qwen3.7-max"));
     let resolved = config.resolve_runtime_options(&CliRuntimeOverrides::default());
     assert_eq!(resolved.base_url, "https://go-gateway.example/v1");
     assert_eq!(resolved.model, "minimax-m3");
@@ -5531,12 +5673,15 @@ fn provider_metadata_defaults_match_runtime_helpers() {
             assert!(!provider.env_vars().is_empty());
         }
         // OpenAI Codex (ChatGPT) speaks the Responses API; DeepSeek,
-        // OpenCode Zen, and the Codewhale API select a protocol per exact
+        // OpenCode Zen, OpenCode Go, and the Codewhale API select a protocol per exact
         // model offering; Anthropic
         // and the Anthropic-compatible routes speak native Messages; every
         // other built-in provider is OpenAI-compatible Chat Completions.
         let expected_wire = match kind {
-            ProviderKind::Deepseek | ProviderKind::OpencodeZen | ProviderKind::Codewhale => None,
+            ProviderKind::Deepseek
+            | ProviderKind::OpencodeZen
+            | ProviderKind::OpencodeGo
+            | ProviderKind::Codewhale => None,
             ProviderKind::OpenaiCodex | ProviderKind::Concentrate => {
                 Some(provider::WireFormat::Responses)
             }
@@ -9715,5 +9860,61 @@ fn notifications_malformed_parent_and_unknown_root_cannot_erase_config() {
             .set_value("notifications.events.input-needed", "false")
             .is_err()
     );
+    assert_eq!(toml::to_string(&config).unwrap(), before);
+}
+
+#[test]
+fn config_table_and_nested_reads_share_redacted_document() {
+    let config: ConfigToml = toml::from_str(
+        r#"
+[tools]
+user_input_timeout_seconds = 7
+[hooks]
+enabled = true
+[credentials.service]
+value = "fixture-secret-never-display"
+[providers.openai]
+api_key = "fixture-provider-secret"
+"#,
+    )
+    .unwrap();
+    assert!(
+        config
+            .get_value("tools")
+            .unwrap()
+            .contains("user_input_timeout_seconds = 7")
+    );
+    assert_eq!(
+        config
+            .get_value("tools.user_input_timeout_seconds")
+            .as_deref(),
+        Some("7")
+    );
+    assert_eq!(
+        config.get_display_value("hooks.enabled").as_deref(),
+        Some("true")
+    );
+    for key in [
+        "credentials",
+        "credentials.service",
+        "credentials.service.value",
+        "providers",
+    ] {
+        let shown = config.get_display_value(key).expect(key);
+        assert!(!shown.contains("fixture-secret-never-display"), "{key}");
+        assert!(!shown.contains("fixture-provider-secret"), "{key}");
+    }
+}
+
+#[test]
+fn unsupported_nested_config_write_fails_without_mutation() {
+    let mut config: ConfigToml =
+        toml::from_str("[tools]\nuser_input_timeout_seconds = 7\n").unwrap();
+    let before = toml::to_string(&config).unwrap();
+    let err = config
+        .set_value("tools.user_input_timeout_seconds", "0")
+        .unwrap_err();
+    assert!(err.to_string().contains("[tools]"));
+    assert!(err.to_string().contains("user_input_timeout_seconds"));
     assert_eq!(toml::to_string(&config).unwrap(), before);
 }

@@ -305,8 +305,7 @@ impl AutomationsView {
         }
     }
 
-    /// Delete starts the two-step confirmation the command already owns: the
-    /// preview names the exact confirm command.
+    /// Delete opens the shared review control with the exact snapshot token.
     fn delete(&self) -> ViewAction {
         match self.selected() {
             Some(row) => Self::command(format!("/automation delete {}", row.record.id)),
@@ -705,6 +704,18 @@ impl ModalView for AutomationsView {
         if let Some(editor) = self.editor.as_mut() {
             let action = editor.mouse(mouse);
             return self.editor_action(action);
+        }
+        // The wheel moves this list, not the transcript behind it.
+        match mouse.kind {
+            MouseEventKind::ScrollUp => {
+                self.move_row(-1);
+                return ViewAction::None;
+            }
+            MouseEventKind::ScrollDown => {
+                self.move_row(1);
+                return ViewAction::None;
+            }
+            _ => {}
         }
         if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
             let point = (mouse.column, mouse.row).into();

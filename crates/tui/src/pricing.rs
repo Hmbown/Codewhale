@@ -1015,27 +1015,23 @@ fn deepseek_is_peak(now: DateTime<Utc>) -> bool {
     !deepseek_weekend_off_peak(now) && deepseek_peak_hour(now.hour())
 }
 
-/// 12:00 Beijing on 2026-09-14, when DeepSeek stops serving V4 Pro.
-///
-/// The vendor's 2026-09-10 notice: "we plan to postpone the discontinuation of
-/// the V4 Pro service to 12:00 Beijing Time on September 14, 2026. At that
-/// time, all requests to the Pro model will be routed to V4.1 Flash and billed
-/// at Flash's price."
-const DEEPSEEK_V4_PRO_SUNSET: &str = "2026-09-14T04:00:00Z";
+/// The clock-dependent tier a DeepSeek route bills at right now: `Some(true)`
+/// at peak, `Some(false)` off-peak, `None` for a model whose rates do not move
+/// with the clock. The model set is exactly the time-aware arm of
+/// [`pricing_for_model_at`], so the chip that shows this and the receipt that
+/// prices the turn can never disagree about which routes are tiered.
+#[must_use]
+pub(crate) fn deepseek_time_tier(model: &str, now: DateTime<Utc>) -> Option<bool> {
+    let lower = model.trim().to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "deepseek-v4-pro" | "deepseek-v4-flash" | "deepseek-flash"
+    )
+    .then(|| deepseek_is_peak(now))
+}
 
 fn deepseek_v4_pro_pricing(now: DateTime<Utc>) -> ModelPricing {
-    // After the sunset a `deepseek-v4-pro` request is served by V4.1 Flash and
-    // billed at Flash's rates. Reporting Pro's rates past that instant would
-    // overstate what the user is actually charged by more than 3x — a
-    // fabricated receipt, which is the one thing cost reporting must never do.
-    // This is what the `now` parameter was always for.
-    if now
-        >= DEEPSEEK_V4_PRO_SUNSET
-            .parse::<DateTime<Utc>>()
-            .expect("valid sunset timestamp")
-    {
-        return deepseek_flash_pricing(now);
-    }
+    // September 11 vendor reversal: Pro remains available at its own rates.
     let peak = deepseek_is_peak(now);
     let (hit, miss, out) = if peak {
         (0.044, 1.32, 3.96)
@@ -1067,9 +1063,8 @@ fn deepseek_v4_pro_pricing(now: DateTime<Utc>) -> ModelPricing {
 ///
 /// Rates and effective time are the vendor's own 2026-09-10 notice, not a
 /// relay: cache hit $0.003, cache miss $0.15, output $0.60 per 1M off-peak,
-/// doubling at peak, effective 04:00 UTC on 2026-09-10. The same notice
-/// postponed the V4 Pro shutdown to 12:00 Beijing on 2026-09-14, after which
-/// Pro requests are served by this model and billed at these rates.
+/// doubling at peak, effective 04:00 UTC on 2026-09-10.
+/// V4 Pro remains available at its own rates after the September 11 reversal.
 ///
 /// CNY rates are the vendor's own Chinese-language notice: cache hit 0.02 元,
 /// cache miss 1 元, output 4 元 off-peak, doubling at peak. Taken from the
@@ -4252,6 +4247,31 @@ mod tests {
     }
 
     #[test]
+    fn deepseek_time_tier_names_the_window_for_tiered_models_only() {
+        // Wednesday 2026-09-16: 02:00Z sits inside the 01:00-04:00 peak
+        // window, 12:00Z outside every window.
+        let peak = Utc.with_ymd_and_hms(2026, 9, 16, 2, 0, 0).unwrap();
+        let off = Utc.with_ymd_and_hms(2026, 9, 16, 12, 0, 0).unwrap();
+        // Saturday 02:00 Beijing time (Friday 18:00Z) bills off-peak even
+        // inside a weekday peak hour.
+        let weekend = Utc.with_ymd_and_hms(2026, 9, 18, 18, 0, 0).unwrap();
+        for model in ["deepseek-v4-pro", "deepseek-v4-flash", "deepseek-flash"] {
+            assert_eq!(deepseek_time_tier(model, peak), Some(true), "{model}");
+            assert_eq!(deepseek_time_tier(model, off), Some(false), "{model}");
+            assert_eq!(deepseek_time_tier(model, weekend), Some(false), "{model}");
+        }
+        assert_eq!(deepseek_time_tier(" DeepSeek-V4-Flash ", peak), Some(true));
+        for flat in [
+            "deepseek-chat",
+            "deepseek-reasoner",
+            "deepseek-ai/deepseek-v4-flash",
+            "",
+        ] {
+            assert_eq!(deepseek_time_tier(flat, peak), None, "{flat}");
+        }
+    }
+
+    #[test]
     fn deepseek_pricing_requires_exact_ids_or_explicit_route_aliases() {
         let _lock = codewhale_models::model_catalog::test_catalog_lock();
         let at = utc_hm(2, 0);
@@ -4828,6 +4848,17 @@ mod tests {
         ];
         for (at, weekend) in cases {
             assert_eq!(deepseek_weekend_off_peak(at), weekend, "weekend at {at}");
+        }
+    }
+
+    #[test]
+    fn deepseek_v4_pro_keeps_pro_rates_after_cancelled_retirement() {
+        for day in [13, 14, 15, 21] {
+            let at = utc_ymd_h(2026, 9, day, 12);
+            let pro = pricing_for_model_at("deepseek-v4-pro", at).unwrap();
+            let flash = pricing_for_model_at("deepseek-flash", at).unwrap();
+            assert_eq!(pro.usd.output_per_million, 1.98);
+            assert_ne!(pro.usd.output_per_million, flash.usd.output_per_million);
         }
     }
 

@@ -102,7 +102,17 @@ function survives(text, replacement, of) {
 
 export function validateSurvivalContract(original, replacement, anchors) {
   const start = lastRoundStart(original);
-  const lastRound = original.slice(start);
+  const round = original.slice(start);
+  const pending = new Set();
+  const boundaries = [];
+  for (const [idx, message] of round.entries()) {
+    const calls = toolUseIds(message);
+    if (calls.length && pending.size === 0) boundaries.push(idx);
+    for (const id of calls) pending.add(id);
+    for (const id of toolResultIds(message)) pending.delete(id);
+  }
+  const tail = boundaries.length > 2 ? boundaries.at(-2) : 0;
+  const lastRound = round.filter((message, idx) => !isCheckpoint(message) && (idx >= tail || isPlainUserText(message)));
   // Every user turn in the round, not the first one `find` reaches: the round
   // spans a tool-bearing turn plus the toolless tail after it, so checking one
   // let a rewrite drop the latest turn.
@@ -164,7 +174,7 @@ export function validateSurvivalContract(original, replacement, anchors) {
 }
 
 function main() {
-  if (matrix.schema_version !== 1) {
+  if (matrix.schema_version !== 2) {
     throw new Error(`unexpected schema_version ${matrix.schema_version}`);
   }
   let failed = 0;

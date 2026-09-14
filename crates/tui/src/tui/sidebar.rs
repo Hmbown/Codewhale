@@ -485,6 +485,7 @@ mod tests {
         nickname: Option<&str>,
     ) -> crate::tools::subagent::SubAgentResult {
         crate::tools::subagent::SubAgentResult {
+            usage: None,
             // An unnamed dispatch: the manager seeds `name` with the agent id
             // and only replaces it when the caller supplied one.
             name: agent_id.to_string(),

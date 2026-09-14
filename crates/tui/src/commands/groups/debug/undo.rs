@@ -41,10 +41,10 @@ pub fn undo_conversation(app: &mut App) -> CommandResult {
     // Remove from API messages
     while let Some(last) = app.api_messages.last() {
         if last.role == "user" {
-            app.api_messages.pop();
+            app.pop_api_message();
             break;
         }
-        app.api_messages.pop();
+        app.pop_api_message();
     }
 
     if removed_count > 0 {
@@ -91,14 +91,15 @@ pub(crate) fn prune_undone_tool_context(app: &mut App, tool_id: &str) {
         .collect();
 
     if kept_blocks.is_empty() {
-        app.api_messages.truncate(msg_idx);
+        app.truncate_api_messages(msg_idx);
         return;
     }
+    // Re-inserted tool results keep the stamp they earned, so the journal's
+    // timeline survives the prune.
     let preserved_tool_results: Vec<_> =
-        app.api_messages
-            .iter()
+        app.api_messages_stamped()
             .skip(msg_idx + 1)
-            .take_while(|msg| {
+            .take_while(|(msg, _)| {
                 msg.role == "user"
                     && !msg.content.is_empty()
                     && msg
@@ -106,18 +107,20 @@ pub(crate) fn prune_undone_tool_context(app: &mut App, tool_id: &str) {
                         .iter()
                         .all(|block| tool_result_id(block).is_some())
             })
-            .filter(|msg| {
+            .filter(|(msg, _)| {
                 msg.role == "user"
                     && !msg.content.is_empty()
                     && msg.content.iter().all(|block| {
                         tool_result_id(block).is_some_and(|id| kept_tool_ids.contains(id))
                     })
             })
-            .cloned()
+            .map(|(msg, stamp)| (msg.clone(), stamp))
             .collect();
-    app.api_messages.truncate(msg_idx + 1);
+    app.truncate_api_messages(msg_idx + 1);
     app.api_messages[msg_idx].content = kept_blocks;
-    app.api_messages.extend(preserved_tool_results);
+    for (message, stamp) in preserved_tool_results {
+        app.push_api_message_stamped(message, stamp);
+    }
 }
 
 fn prune_undone_turn_context(app: &mut App) {
@@ -130,7 +133,7 @@ fn prune_undone_turn_context(app: &mut App) {
     }
 
     if let Some(api_idx) = app.api_messages.iter().rposition(|msg| msg.role == "user") {
-        app.api_messages.truncate(api_idx);
+        app.truncate_api_messages(api_idx);
     }
 }
 
@@ -200,10 +203,19 @@ pub fn patch_undo(app: &mut App) -> CommandResult {
     // Pick the newest current-session candidate whose tree differs from the
     // workspace. Skipping identical snapshots makes repeated `/undo` walk
     // backward only inside the proven session boundary.
-    let differs = |s: &&crate::snapshot::Snapshot| {
-        matches!(repo.work_tree_matches_snapshot(&s.id), Ok(false))
-    };
-    let target = candidates.iter().find(differs);
+    let mut target = None;
+    for snapshot in &candidates {
+        match repo.work_tree_matches_snapshot(&snapshot.id) {
+            Ok(false) => {
+                target = Some(snapshot);
+                break;
+            }
+            Ok(true) => {}
+            Err(error) => {
+                return CommandResult::error(format!("Failed to compare snapshot: {error}"));
+            }
+        }
+    }
 
     let Some(target) = target else {
         return CommandResult::message(
@@ -221,6 +233,19 @@ pub fn patch_undo(app: &mut App) -> CommandResult {
         );
     }
 
+    // Capture what this restore is about to change *before* it runs: after the
+    // checkout the work tree matches the snapshot and the diff is empty by
+    // construction. Computed in the side repo, not the user's — the user's
+    // `git diff --stat` reports their own uncommitted work, which is not what
+    // the undo changed.
+    let diff_stat = match repo.snapshot_diff_stat(&target.id) {
+        Ok(stat) => stat,
+        Err(e) => {
+            tracing::warn!(target: "snapshot", "diff stat for the undo summary failed: {e}");
+            None
+        }
+    };
+
     if let Err(e) = repo.restore(&target.id) {
         return CommandResult::error(format!("Restore failed: {e}"));
     }
@@ -230,20 +255,6 @@ pub fn patch_undo(app: &mut App) -> CommandResult {
     } else if target.label.starts_with("pre-turn:") {
         prune_undone_turn_context(app);
     }
-
-    // Show diff stat so the user knows what changed.
-    let diff_stat = Git::command()
-        .map(|mut git| {
-            git.args(["diff", "--stat"])
-                .current_dir(&workspace)
-                .output()
-                .ok()
-                .and_then(|o| {
-                    let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
-                    if s.is_empty() { None } else { Some(s) }
-                })
-        })
-        .unwrap_or(None);
 
     let short = &target.id.as_str()[..target.id.as_str().len().min(8)];
     let summary = match diff_stat {

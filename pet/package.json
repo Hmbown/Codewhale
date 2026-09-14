@@ -1,0 +1,21 @@
+{
+  "name": "@codewhale/pet",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "license": "Apache-2.0",
+  "engines": {
+    "node": ">=22.13"
+  },
+  "scripts": {
+    "build": "node scripts/build-pet.mjs",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "node --test tests/*.test.mjs",
+    "check": "npm run typecheck && npm run build && npm test",
+    "start": "python3 -m http.server 4632 --bind 127.0.0.1 --directory dist",
+    "sync": "node scripts/build-pet.mjs --tui --apple --study"
+  },
+  "devDependencies": {
+    "typescript": "5.8.3"
+  }
+}

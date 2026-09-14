@@ -1777,7 +1777,7 @@ mod tests {
             Some(&[json!({
                 "type": "image",
                 "mime_type": "image/png",
-                "data": "QUJD",
+                "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==",
             })]),
         );
         let blocks = content.as_array().expect("rich tool_result content");
@@ -1789,7 +1789,10 @@ mod tests {
         assert_eq!(blocks[1]["type"], "image");
         assert_eq!(blocks[1]["source"]["type"], "base64");
         assert_eq!(blocks[1]["source"]["media_type"], "image/png");
-        assert_eq!(blocks[1]["source"]["data"], "QUJD");
+        assert_eq!(
+            blocks[1]["source"]["data"],
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg=="
+        );
     }
 
     #[test]

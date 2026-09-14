@@ -8,8 +8,8 @@ import * as registry from "../src/registry.mjs";
 import { backendFor, installRemoteAgent, executorFor, closeAppSession, routeFingerprint } from "../src/transport.mjs";
 import { TOOLS, TOOL_NAMES, READ_ONLY_TOOLS, REMOTE_TOOLS, BACKEND_METHOD } from "../src/tools.mjs";
 import { tryJson, withSignal, throwIfAborted, wait } from "../src/exec.mjs";
+import { APP_VERSION } from "../src/app-socket.mjs";
 
-const VERSION = "0.2.1";
 const SERVER_NAME = "codewhale-cu";
 
 // ---------- per-session runtime state ----------
@@ -33,6 +33,18 @@ const ROUTE_INSPECTION_TOOLS = new Set([
   "request_access", "list_displays", "list_apps", "list_windows", "get_app_state", "screenshot",
   "cursor_position", "read_clipboard", "recording_list", "recording_status",
 ]);
+/**
+ * Largest base64 image payload we will put in one JSON-RPC message. Hosts cap
+ * how much a stdio server may write between message boundaries (Claude Code
+ * disconnects at 16MB) and model APIs cap image bytes well below that, so a
+ * full-screen 5K PNG must degrade rather than take the transport down.
+ */
+const INLINE_IMAGE_MAX_BYTES = Number(process.env.CODEWHALE_CU_MAX_IMAGE_BYTES) > 0
+  ? Number(process.env.CODEWHALE_CU_MAX_IMAGE_BYTES)
+  : 5_000_000;
+
+/** Base64 expands 3 bytes to 4, padded to a multiple of 4. */
+const encodedSize = (bytes) => Math.ceil(bytes / 3) * 4;
 
 function receipt(computer, extra) {
   return {
@@ -441,11 +453,30 @@ async function callTool(params) {
       data.ocr.note = "Recognized text may be imperfect. These coordinate targets belong to this captured image, not to accessibility elements; observe again after the UI changes.";
     }
 
-    const content = [{ type: "text", text: JSON.stringify(receipt(computer, { ok: true, tool: name, switched, ...(sink.reacquired ? { target_reacquired: true } : {}), ...data })) }];
+    // Inline the raster only when it fits the budget. One oversized JSON-RPC
+    // message drops the whole stdio transport and every other tool with it, so
+    // an over-budget capture degrades to its text receipt: the file is still on
+    // disk and still bound, so zoom or a narrower capture returns a viewable
+    // image. Never trade the session for one screenshot.
+    let imageBlock = null;
     if ((name === "screenshot" || name === "zoom") && computer.transport === "local" && (data.file || data.path)) {
-      const bytes = fs.readFileSync(data.file || data.path);
-      content.push({ type: "image", mimeType: bytes[0] === 0xff ? "image/jpeg" : "image/png", data: bytes.toString("base64") });
+      const file = data.file || data.path;
+      const size = fs.statSync(file).size;
+      if (encodedSize(size) > INLINE_IMAGE_MAX_BYTES) {
+        data.image_omitted = {
+          reason: "raster_too_large",
+          bytes: size,
+          encoded_bytes: encodedSize(size),
+          limit_bytes: INLINE_IMAGE_MAX_BYTES,
+          note: "The capture is on disk at the returned path, but inlining it would exceed this host's single-message budget and drop the connection. Capture one display, a region, or an app window, or zoom into part of this raster to get a viewable image.",
+        };
+      } else {
+        const bytes = fs.readFileSync(file);
+        imageBlock = { type: "image", mimeType: bytes[0] === 0xff ? "image/jpeg" : "image/png", data: bytes.toString("base64") };
+      }
     }
+    const content = [{ type: "text", text: JSON.stringify(receipt(computer, { ok: true, tool: name, switched, ...(sink.reacquired ? { target_reacquired: true } : {}), ...data })) }];
+    if (imageBlock) content.push(imageBlock);
     if ((name === "screenshot" && (data?.file || data?.path) && data?.pixels?.w > 0 && data?.pixels?.h > 0) ||
         (name === "get_app_state" && data?.found !== false && Array.isArray(data?.elements))) {
       binding.needsObservation = false;
@@ -510,7 +541,7 @@ const HANDLERS = {
     return {
       protocolVersion: params?.protocolVersion ?? "2025-06-18",
       capabilities: { tools: { listChanged: false } },
-      serverInfo: { name: SERVER_NAME, version: VERSION, platforms: ["darwin", "win32", "linux", "harmonyos"], transports: ["local", "ssh", "hdc"] },
+      serverInfo: { name: SERVER_NAME, version: APP_VERSION, platforms: ["darwin", "win32", "linux", "harmonyos"], transports: ["local", "ssh", "hdc"] },
     };
   },
   "tools/list"() {

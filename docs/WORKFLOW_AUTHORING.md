@@ -1,10 +1,11 @@
 # Workflow Authoring
 
 > **Ordinary multi-agent work does not require this file.** In Operate, send
-> normal messages; Codewhale can work directly or prefer background workers
-> when parallelism, isolation, or duration makes delegation useful. Use Workflow
-> when ordered phases, gates, shared budgets, replay, or deterministic fan-in
-> matter; Act/Agent may also use optional soft-auto launch. See
+> normal messages. Small work stays direct; multiple delegated steps use a
+> compact Workflow plan with dependencies, bounded scopes, and completion
+> evidence. Fleet manages the same sub-agents and roles. One bounded,
+> independent task can use a direct agent, with `followup` for continued work.
+> Act/Agent may also use optional soft-auto launch. See
 > [Automatic Workflows](AUTOMATIC_WORKFLOWS.md).
 
 Workflow has one runtime boundary: authored source lowers to typed
@@ -19,6 +20,11 @@ Compatibility launch paths on the `workflow` tool:
 | `plan` | Structured goal / phases / children (preferred agent path) |
 | `script` | Short inline JS the model owns |
 | `source_path` | Checked-in `.workflow.js` / `.workflow.ts` in the workspace |
+
+Use `agent(action="roster")` to inspect the saved Fleet models and roles before
+assigning children. Native plan children accept `model` for a saved shortlist
+selector, or `role`/`profile` for a saved assignment. Named Exact Fleets keep
+their member routes fixed and reject per-step model overrides.
 
 For a guided walkthrough from fleet task specs to Workflow authoring and
 monitoring, see [fleet + Workflow Tutorial](FLEET_WORKFLOW_TUTORIAL.md).
@@ -39,6 +45,7 @@ its own. Real work happens in sub-agents the script launches.
 
 - Up to **16 concurrent** live agents in one run (additional spawns wait for a slot).
 - Up to **1_000 agents per run** (VM lifetime spawn cap).
+- Configured `max_children` and `max_concurrent` can narrow these limits.
 - Soft auto-launch still uses a lower child soft-cap (`auto_start_child_limit`).
 
 See the Workflow JS sandbox tests for the fail-closed host surface inventory.

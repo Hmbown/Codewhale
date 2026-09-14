@@ -1,7 +1,7 @@
 use super::activity_detail::*;
 use super::compaction_flow::{
-    apply_compaction_started, maybe_warn_context_pressure, should_auto_compact_before_send,
-    should_auto_compact_before_send_with_config,
+    apply_compaction_started, compact_interrupt_should_stop_turn, maybe_warn_context_pressure,
+    should_auto_compact_before_send, should_auto_compact_before_send_with_config,
 };
 use super::event_loop::{TabDispatch, dispatch_tab_key, shell_binding_for_key};
 use super::observer_hooks::{
@@ -227,7 +227,8 @@ fn frame_cursor_is_hidden_during_diff_then_positioned_before_reveal() {
 #[test]
 fn composer_rows_stay_pinned_across_turn_state_transitions() {
     // The Tideline shell: the stage, one merged footer row, and the info line
-    // footer row (slots 6+8 collapsed, spec §3). Sending a prompt must not
+    // footer row (slots 6+8 collapsed, spec §3). In an established session,
+    // sending a prompt must not
     // displace the composer, relocate the route into the footer, or drop
     // the phase verb from the footer's left half.
     fn frame_app() -> App {
@@ -239,6 +240,11 @@ fn composer_rows_stay_pinned_across_turn_state_transitions() {
         app.onboarding = crate::tui::app::OnboardingState::None;
         app.launch.visible = false;
         app.ui_locale = codewhale_localization::Locale::En;
+        // The empty launch shell intentionally hides session metrics. This
+        // fixture covers stable geometry once a conversation exists.
+        app.history.push(HistoryCell::User {
+            content: "Established conversation".to_string(),
+        });
         app
     }
 
@@ -715,9 +721,32 @@ fn focus_test_app() -> App {
     app
 }
 
+#[test]
+fn bracketed_paste_returns_dock_focus_to_the_visible_composer() {
+    let mut app = focus_test_app();
+    crate::tui::work_surface::select_dock_panel(
+        &mut app,
+        crate::tui::work_surface::RailPanel::Context,
+    );
+    assert!(app.work_surface.focused);
+    handle_bracketed_paste(&mut app, "/pet status");
+    assert_eq!(app.input, "/pet status");
+    assert!(!app.work_surface.focused);
+    assert!(app.composer_enter_would_submit());
+}
+
 /// One representative terminal encoding per shell binding.
 fn shell_binding_probe(id: ShellBindingId) -> KeyEvent {
     match id {
+        ShellBindingId::PetResultUp => KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
+        ShellBindingId::PetResultDown => KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+        ShellBindingId::PetResultPageUp => KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE),
+        ShellBindingId::PetResultPageDown => KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE),
+        ShellBindingId::PetBack => KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+        ShellBindingId::PetSound => KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE),
+        ShellBindingId::PetBrowser => KeyEvent::new(KeyCode::F(8), KeyModifiers::NONE),
+        ShellBindingId::PetWindow => KeyEvent::new(KeyCode::F(9), KeyModifiers::NONE),
+
         ShellBindingId::RedactionGateConfirm => {
             KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE)
         }
@@ -777,8 +806,14 @@ fn no_shell_binding_changes_meaning_once_the_composer_has_text() {
             "{:?} changed meaning because the composer has text",
             binding.id
         );
-        if binding.focus == crate::tui::shell_key_routing::FocusScope::RedactionGate {
-            assert_eq!(on_typed, None, "consent keys must not act on a draft");
+        if !binding
+            .focus
+            .admits(crate::tui::shell_key_routing::Focus::Composer)
+        {
+            assert_eq!(
+                on_typed, None,
+                "exclusive view keys must not act on a draft"
+            );
             continue;
         }
         assert_eq!(
@@ -1545,40 +1580,40 @@ fn approval_prompt_keeps_transcript_page_navigation_live() {
         "approval-scroll-key",
     )));
 
-    assert!(handle_approval_transcript_key(
+    assert!(handle_prompt_transcript_key(
         &mut app,
         &KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE),
     ));
     assert_eq!(app.viewport.pending_scroll_delta, -12);
     assert_eq!(app.view_stack.top_kind(), Some(ModalKind::Approval));
 
-    assert!(handle_approval_transcript_key(
+    assert!(handle_prompt_transcript_key(
         &mut app,
         &KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE),
     ));
     assert_eq!(app.viewport.pending_scroll_delta, 0);
 
-    assert!(handle_approval_transcript_key(
+    assert!(handle_prompt_transcript_key(
         &mut app,
         &KeyEvent::new(KeyCode::Up, KeyModifiers::CONTROL),
     ));
     assert_eq!(app.viewport.pending_scroll_delta, -3);
 
-    assert!(handle_approval_transcript_key(
+    assert!(handle_prompt_transcript_key(
         &mut app,
         &KeyEvent::new(KeyCode::Home, KeyModifiers::NONE),
     ));
     assert!(app.viewport.pending_scroll_delta < -1_000_000);
     assert!(app.user_scrolled_during_stream);
 
-    assert!(handle_approval_transcript_key(
+    assert!(handle_prompt_transcript_key(
         &mut app,
         &KeyEvent::new(KeyCode::End, KeyModifiers::NONE),
     ));
     assert_eq!(app.viewport.pending_scroll_delta, 0);
     assert!(!app.user_scrolled_during_stream);
 
-    assert!(handle_approval_transcript_key(
+    assert!(handle_prompt_transcript_key(
         &mut app,
         &KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT),
     ));
@@ -1586,7 +1621,7 @@ fn approval_prompt_keeps_transcript_page_navigation_live() {
     assert!(app.user_scrolled_during_stream);
 
     assert!(
-        !handle_approval_transcript_key(
+        !handle_prompt_transcript_key(
             &mut app,
             &KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE),
         ),
@@ -1599,11 +1634,236 @@ fn transcript_navigation_does_not_capture_keys_for_other_modals() {
     let mut app = create_test_app();
     app.view_stack.push(HelpView::new_for_locale(app.ui_locale));
 
-    assert!(!handle_approval_transcript_key(
+    assert!(!handle_prompt_transcript_key(
         &mut app,
         &KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE),
     ));
     assert_eq!(app.viewport.pending_scroll_delta, 0);
+}
+
+fn scroll_test_question_view() -> UserInputView {
+    use crate::tools::user_input::{UserInputOption, UserInputQuestion, UserInputRequest};
+
+    UserInputView::new(
+        "question-scroll",
+        UserInputRequest {
+            questions: vec![UserInputQuestion {
+                header: "Choose".into(),
+                id: "choice".into(),
+                question: "Review the transcript before choosing a path.".into(),
+                options: (1..=8)
+                    .map(|n| UserInputOption {
+                        label: format!("Option {n}"),
+                        description: "A detailed option description that must stay readable while reviewing the transcript and choosing an answer. ".repeat(2),
+                    })
+                    .collect(),
+                allow_free_text: true,
+                multi_select: false,
+            }],
+        },
+    )
+}
+
+#[test]
+fn user_input_prompt_keeps_transcript_navigation_and_answer_keys_separate() {
+    let mut app = create_test_app();
+    app.viewport.last_transcript_visible = 12;
+    app.view_stack.push(scroll_test_question_view());
+
+    for (code, modifiers, expected) in [
+        (KeyCode::PageUp, KeyModifiers::NONE, -12),
+        (KeyCode::PageDown, KeyModifiers::NONE, 0),
+        (KeyCode::Up, KeyModifiers::CONTROL, -3),
+        (KeyCode::Down, KeyModifiers::ALT, 0),
+        (KeyCode::Up, KeyModifiers::SHIFT, -3),
+    ] {
+        assert!(handle_prompt_transcript_key(
+            &mut app,
+            &KeyEvent::new(code, modifiers),
+        ));
+        assert_eq!(app.viewport.pending_scroll_delta, expected);
+        assert_eq!(app.view_stack.top_kind(), Some(ModalKind::UserInput));
+    }
+    assert!(handle_prompt_transcript_key(
+        &mut app,
+        &KeyEvent::from(KeyCode::Home),
+    ));
+    assert!(app.viewport.pending_scroll_delta < -1_000_000);
+    assert!(handle_prompt_transcript_key(
+        &mut app,
+        &KeyEvent::from(KeyCode::End),
+    ));
+    assert_eq!(app.viewport.pending_scroll_delta, 0);
+
+    for code in [
+        KeyCode::Up,
+        KeyCode::Down,
+        KeyCode::Left,
+        KeyCode::Char('h'),
+    ] {
+        assert!(!handle_prompt_transcript_key(
+            &mut app,
+            &KeyEvent::from(code),
+        ));
+    }
+    app.view_stack.handle_key(KeyEvent::from(KeyCode::Down));
+    let events = app.view_stack.handle_key(KeyEvent::from(KeyCode::Enter));
+    assert!(
+        matches!(events.as_slice(), [ViewEvent::UserInputSubmitted { response, .. }]
+        if response.answers.len() == 1 && response.answers[0].value == "Option 2")
+    );
+
+    app.view_stack.push(scroll_test_question_view());
+    app.view_stack
+        .handle_key(KeyEvent::from(KeyCode::Char('9')));
+    for ch in "custom answer".chars() {
+        let key = KeyEvent::from(KeyCode::Char(ch));
+        assert!(!handle_prompt_transcript_key(&mut app, &key));
+        app.view_stack.handle_key(key);
+    }
+    assert!(handle_prompt_transcript_key(
+        &mut app,
+        &KeyEvent::from(KeyCode::PageUp),
+    ));
+    let events = app.view_stack.handle_key(KeyEvent::from(KeyCode::Enter));
+    assert!(
+        matches!(events.as_slice(), [ViewEvent::UserInputSubmitted { response, .. }]
+        if response.answers.len() == 1 && response.answers[0].value == "custom answer")
+    );
+}
+
+#[test]
+fn bottom_prompts_keep_transcript_tail_visible_through_resize_and_navigation() {
+    for kind in [ModalKind::UserInput, ModalKind::Approval] {
+        let mut app = create_test_app();
+        app.history.push(HistoryCell::Assistant {
+            content: format!(
+                "```text\n{}\nTRANSCRIPT_TAIL_VISIBLE\n```",
+                (1..=60)
+                    .map(|row| format!("Transcript row {row}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ),
+            streaming: false,
+        });
+        match kind {
+            ModalKind::UserInput => app.view_stack.push(scroll_test_question_view()),
+            ModalKind::Approval => app.view_stack.push(ApprovalView::new(ApprovalRequest::new(
+                "approval-tail",
+                "exec_shell",
+                "Review command",
+                &serde_json::json!({"command": "git status"}),
+                "approval-tail-key",
+            ))),
+            _ => unreachable!(),
+        }
+        let config = Config::default();
+        for (width, height) in [(141, 38), (80, 24), (40, 12), (80, 24), (141, 38)] {
+            let surface = render_test_app(&mut app, &config, width, height);
+            let prompt = app.viewport.last_prompt_area.expect("painted prompt");
+            let transcript = app
+                .viewport
+                .last_transcript_area
+                .expect("transcript viewport");
+            assert!(
+                transcript.bottom() <= prompt.y,
+                "{kind:?} at {width}x{height}: scroll viewport extends under the prompt"
+            );
+            if transcript.height == 0 {
+                continue;
+            }
+            let above_prompt: String = surface
+                .chars()
+                .take(usize::from(prompt.y) * usize::from(width))
+                .collect();
+            assert!(
+                above_prompt.contains("TRANSCRIPT_TAIL_VISIBLE"),
+                "{kind:?} at {width}x{height}: latest content is covered: {above_prompt}"
+            );
+            let tail_top = app.viewport.last_transcript_top;
+            assert_eq!(
+                tail_top + app.viewport.last_transcript_visible,
+                app.viewport.last_transcript_total
+            );
+            assert!(handle_prompt_transcript_key(
+                &mut app,
+                &KeyEvent::from(KeyCode::PageUp),
+            ));
+            render_test_app(&mut app, &config, width, height);
+            assert!(app.viewport.last_transcript_top < tail_top);
+            assert!(handle_prompt_transcript_key(
+                &mut app,
+                &KeyEvent::from(KeyCode::End),
+            ));
+            let surface = render_test_app(&mut app, &config, width, height);
+            let above_prompt: String = surface
+                .chars()
+                .take(usize::from(prompt.y) * usize::from(width))
+                .collect();
+            assert!(above_prompt.contains("TRANSCRIPT_TAIL_VISIBLE"));
+        }
+        let covered_top = app.viewport.last_prompt_area.unwrap().y;
+        app.view_stack.pop();
+        let surface = render_test_app(&mut app, &config, 141, 38);
+        assert!(app.viewport.last_prompt_area.is_none());
+        assert!(app.viewport.last_transcript_area.unwrap().bottom() > covered_top);
+        assert!(surface.contains("TRANSCRIPT_TAIL_VISIBLE"));
+    }
+}
+
+#[test]
+fn user_input_wheel_routes_by_painted_sheet_and_preserves_side_surface_ownership() {
+    for (width, height) in [(40, 12), (80, 24), (100, 32), (141, 38)] {
+        let mut app = create_test_app();
+        app.view_stack.push(scroll_test_question_view());
+        let config = Config::default();
+        let before = render_test_app(&mut app, &config, width, height);
+        let area = Rect::new(0, 0, width, height);
+        let sheet = app
+            .viewport
+            .last_prompt_area
+            .expect("painted question sheet");
+        assert_eq!(Some(sheet), app.view_stack.top_occupied_region(area));
+
+        // The visible sheet outranks any work surface painted beneath it.
+        app.work_surface.last_area = Some(area);
+        let events = handle_mouse_event(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column: sheet.x + sheet.width / 2,
+                row: sheet.y + sheet.height / 2,
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+        assert!(events.is_empty());
+        assert_eq!(app.viewport.pending_scroll_delta, 0);
+        let after = render_test_app(&mut app, &config, width, height);
+        let sheet_start = usize::from(sheet.y) * usize::from(width);
+        let before_sheet: String = before.chars().skip(sheet_start).collect();
+        let after_sheet: String = after.chars().skip(sheet_start).collect();
+        assert_ne!(
+            before_sheet, after_sheet,
+            "wheel must move sheet content at {width}x{height}"
+        );
+        assert_eq!(app.view_stack.top_kind(), Some(ModalKind::UserInput));
+
+        if sheet.y > 0 {
+            app.work_surface.last_area = Some(Rect::new(0, 0, width / 2, sheet.y));
+            for (column, expected) in [(1, 0), (width - 1, -3)] {
+                handle_mouse_event(
+                    &mut app,
+                    MouseEvent {
+                        kind: MouseEventKind::ScrollUp,
+                        column,
+                        row: 0,
+                        modifiers: KeyModifiers::NONE,
+                    },
+                );
+                assert_eq!(app.viewport.pending_scroll_delta, expected);
+            }
+        }
+    }
 }
 
 #[test]
@@ -1812,7 +2072,7 @@ fn approval_wheel_preserves_work_surface_ownership() {
         "approval-scroll-key",
     )));
     app.work_surface.last_area = Some(Rect::new(0, 0, 30, 20));
-    app.viewport.last_approval_area = Some(Rect::new(0, 12, 80, 8));
+    app.viewport.last_prompt_area = Some(Rect::new(0, 12, 80, 8));
 
     for (column, row) in [(10, 4), (20, 4)] {
         let events = handle_mouse_event(
@@ -5557,6 +5817,85 @@ fn active_raw_paste_keeps_space_as_payload_over_reasoning_action() {
 }
 
 #[test]
+fn empty_shell_keeps_model_identity_without_session_metrics() {
+    for (width, height) in [(40, 12), (60, 16), (100, 32), (140, 40)] {
+        let mut app = create_test_app();
+        app.model = "gpt-4.1".into();
+        app.history.clear();
+        app.resync_history_revisions();
+        assert!(crate::tui::widgets::should_render_empty_state(&app));
+        let body = render_underwater_test_app(&mut app, width, height);
+        assert!(body.contains("gpt-4.1"), "{width}x{height}: {body}");
+        assert!(
+            !body.contains("ctx 0%"),
+            "empty metrics must stay quiet: {body}"
+        );
+        assert!(
+            app.viewport
+                .last_infoline_hitboxes
+                .iter()
+                .any(|hitbox| hitbox.id == crate::tui::infoline::InfoSegmentId::Model)
+        );
+    }
+}
+
+#[test]
+fn lone_letters_remain_composer_input_after_transcript_selection() {
+    for ch in ['y', 'Y', 'r'] {
+        let mut app = create_test_app();
+        app.use_paste_burst_detection = true;
+        app.bracketed_paste_seen = false;
+        app.history = vec![HistoryCell::Assistant {
+            content: "previous answer".to_string(),
+            streaming: false,
+        }];
+        app.resync_history_revisions();
+        let _ = render_underwater_test_app(&mut app, 60, 16);
+        select_original_cell(&mut app, 0);
+        assert!(app.viewport.transcript_selection.is_active());
+        let now = Instant::now();
+        assert!(handle_plain_key_before_composer(
+            &mut app,
+            &KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+            now,
+        ));
+        assert!(flush_paste_burst_before_composer(
+            &mut app,
+            now + Duration::from_millis(500)
+        ));
+        assert_eq!(app.input, ch.to_string());
+        assert!(app.view_stack.is_empty());
+        assert!(app.composer_enter_would_submit());
+    }
+}
+
+#[test]
+fn clicking_composer_releases_transcript_and_work_surface_focus() {
+    use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+    let mut app = create_test_app();
+    app.history = vec![HistoryCell::Assistant {
+        content: "previous answer".into(),
+        streaming: false,
+    }];
+    app.resync_history_revisions();
+    let _ = render_underwater_test_app(&mut app, 60, 16);
+    select_original_cell(&mut app, 0);
+    app.work_surface.focused = true;
+    let composer = app.viewport.last_composer_area.unwrap();
+    assert!(crate::tui::mouse_ui::handle_composer_mouse(
+        &mut app,
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: composer.x + 3,
+            row: composer.y + 1,
+            modifiers: KeyModifiers::NONE,
+        }
+    ));
+    assert!(!app.viewport.transcript_selection.is_active());
+    assert!(!app.work_surface.focused);
+}
+
+#[test]
 fn typed_command_burst_keeps_r_and_y_out_of_transcript_actions() {
     let mut app = create_test_app();
     app.use_paste_burst_detection = true;
@@ -7863,7 +8202,11 @@ async fn apply_loaded_session_resets_workspace_runtime_state() {
     let old_context_cell = app.workspace_context_cell.clone();
     app.workspace_context = Some("old workspace context".to_string());
     if let Ok(mut cell) = old_context_cell.lock() {
-        *cell = Some("old workspace context".to_string());
+        *cell = Some(crate::tui::workspace_context::WorkspaceContextSnapshot {
+            workspace: app.workspace.clone(),
+            context: Some("old workspace context".to_string()),
+            is_linked_worktree: false,
+        });
     }
     app.workspace_context_refreshed_at = Some(Instant::now());
     app.file_tree = Some(crate::tui::file_tree::FileTreeState::new(
@@ -8346,56 +8689,6 @@ fn shell_live_output_update_skips_finalized_exec_cell() {
     );
 
     assert!(shell_exec_live_update(&app, 0, &jobs).is_none());
-}
-
-#[test]
-fn terminal_probe_timeout_defaults_to_500ms() {
-    let config = Config::default();
-
-    assert_eq!(terminal_probe_timeout(&config), Duration::from_millis(500));
-}
-
-#[test]
-fn terminal_probe_timeout_uses_tui_config_and_clamps() {
-    let mut config = Config {
-        tui: Some(crate::config::TuiConfig {
-            alternate_screen: None,
-            mouse_capture: None,
-            terminal_probe_timeout_ms: Some(750),
-            stream_chunk_timeout_secs: None,
-            max_model_steps: None,
-            turn_wall_clock_secs: None,
-            stream_max_content_mb: None,
-            stream_max_duration_secs: None,
-            status_items: None,
-            posture_bar: None,
-            metrics_line: None,
-            header_items: None,
-            osc8_links: None,
-            notification_condition: None,
-            composer_arrows_scroll: None,
-        }),
-        ..Config::default()
-    };
-
-    assert_eq!(terminal_probe_timeout(&config), Duration::from_millis(750));
-
-    config
-        .tui
-        .as_mut()
-        .expect("tui config")
-        .terminal_probe_timeout_ms = Some(0);
-    assert_eq!(terminal_probe_timeout(&config), Duration::from_millis(100));
-
-    config
-        .tui
-        .as_mut()
-        .expect("tui config")
-        .terminal_probe_timeout_ms = Some(60_000);
-    assert_eq!(
-        terminal_probe_timeout(&config),
-        Duration::from_millis(5_000)
-    );
 }
 
 #[test]
@@ -10238,20 +10531,38 @@ async fn immediate_submit_custom_provider_missing_key_preflight_shows_auth_next_
     .await
     .expect("provider preflight failures must remain inside the TUI");
 
-    assert_eq!(app.input, "preserve 用户 input");
-    assert_eq!(app.cursor_position, app.input.chars().count());
+    // Echo first: missing-key must paint HistoryCell::User, not restore the
+    // composer as the only place the turn exists.
+    assert!(
+        app.input.is_empty(),
+        "auth failure must not restore the composer when the echo landed: {:?}",
+        app.input
+    );
     assert!(app.api_messages.is_empty());
-    assert!(app.history.is_empty());
+    assert_eq!(
+        app.history
+            .iter()
+            .filter(|cell| matches!(cell, HistoryCell::User { content } if content == "preserve 用户 input"))
+            .count(),
+        1,
+        "missing-key submit must keep exactly one user echo: {:?}",
+        app.history
+    );
     assert!(app.last_submitted_prompt.is_none());
     let status = app
         .status_message
         .as_deref()
         .expect("missing-key preflight should set status");
+    assert!(status.contains("Message not sent"));
     assert!(status.contains("Failed to configure provider route lm-studio / local-model."));
     assert!(
         status.contains(
             "Next step: Run /auth or /provider setup lm-studio to configure credentials."
         )
+    );
+    assert!(
+        !status.contains("restored to composer"),
+        "auth keep-echo must not claim composer restore: {status}"
     );
 }
 
@@ -10702,15 +11013,12 @@ fn closed_engine_mailbox_reports_manual_compaction_unavailable() {
 }
 
 #[test]
-fn compaction_lifecycle_keeps_truthful_auto_label_until_matching_completion() {
+fn automatic_compaction_stays_quiet_until_a_real_failure() {
     let mut app = create_test_app();
 
     apply_compaction_started(&mut app, "compact-new".to_string(), true);
     assert!(app.is_compacting);
-    assert_eq!(
-        app.status_message.as_deref(),
-        Some("Auto-compacting context…")
-    );
+    assert!(app.status_message.is_none());
     assert_eq!(
         app.active_compaction
             .as_ref()
@@ -10728,10 +11036,7 @@ fn compaction_lifecycle_keeps_truthful_auto_label_until_matching_completion() {
         None,
     );
     assert!(app.is_compacting, "stale id must not clear newer activity");
-    assert_eq!(
-        app.status_message.as_deref(),
-        Some("Auto-compacting context…")
-    );
+    assert!(app.status_message.is_none());
 
     apply_compaction_completed(
         &mut app,
@@ -10744,9 +11049,21 @@ fn compaction_lifecycle_keeps_truthful_auto_label_until_matching_completion() {
     );
     assert!(!app.is_compacting);
     assert!(app.active_compaction.is_none());
-    assert!(app.status_toasts.back().is_some_and(|toast| {
-        toast.level == StatusToastLevel::Success
-            && toast.text.starts_with("Auto-compaction complete")
+    assert!(app.status_toasts.is_empty());
+    assert!(app.status_message.is_none());
+    assert!(
+        app.last_compaction
+            .as_ref()
+            .is_some_and(|receipt| receipt.auto)
+    );
+    apply_compaction_failed(
+        &mut app,
+        "compact-failure",
+        true,
+        "Summary failed; conversation preserved".into(),
+    );
+    assert!(app.sticky_status.as_ref().is_some_and(|toast| {
+        toast.level == StatusToastLevel::Error && toast.text.contains("conversation preserved")
     }));
 }
 
@@ -10869,6 +11186,7 @@ fn compaction_trigger_meter_and_ladder_share_the_resolved_window() {
         "qwen3-32b-256k",
         None,
         None,
+        None,
     );
     assert_eq!(ladder.tokens, 256_000);
     assert_eq!(
@@ -10891,7 +11209,7 @@ fn compaction_trigger_meter_and_ladder_share_the_resolved_window() {
     app.api_messages = vec![Message {
         role: Role::User,
         content: vec![ContentBlock::Text {
-            text: "context ".repeat(2_000),
+            text: "context ".repeat(100_000),
             cache_control: None,
         }],
     }];
@@ -10899,7 +11217,7 @@ fn compaction_trigger_meter_and_ladder_share_the_resolved_window() {
     assert_eq!(meter_window, ladder.tokens);
 
     // The unverified rung must also reach the pressure message the user sees.
-    app.auto_compact = true;
+    app.auto_compact = false;
     app.compact_threshold = usize::try_from(used).expect("non-negative context estimate");
     maybe_warn_context_pressure(&mut app);
     let pressure = app.status_message.as_deref().expect("pressure message");
@@ -10976,7 +11294,10 @@ printf '%s\n' '{"text":"off-loop replacement"}'
     assert!(app.dispatch_in_flight);
     assert!(app.api_messages.is_empty(), "gate has not answered yet");
 
-    let apply_hook = tokio::time::timeout(std::time::Duration::from_secs(3), completion_rx.recv())
+    // Hook itself sleeps 1s; give macOS CI runners headroom under load. The
+    // invariant under test is that terminal dispatch returned in <250ms above,
+    // not that the off-loop hook finishes within a tight 3s budget.
+    let apply_hook = tokio::time::timeout(std::time::Duration::from_secs(15), completion_rx.recv())
         .await
         .expect("hook result timed out")
         .expect("hook result channel closed");
@@ -10987,7 +11308,7 @@ printf '%s\n' '{"text":"off-loop replacement"}'
     ));
 
     let apply_dispatch =
-        tokio::time::timeout(std::time::Duration::from_secs(3), completion_rx.recv())
+        tokio::time::timeout(std::time::Duration::from_secs(15), completion_rx.recv())
             .await
             .expect("dispatch result timed out")
             .expect("dispatch result channel closed");
@@ -13453,6 +13774,7 @@ fn make_subagent(
     status: crate::tools::subagent::SubAgentStatus,
 ) -> crate::tools::subagent::SubAgentResult {
     crate::tools::subagent::SubAgentResult {
+        usage: None,
         name: id.to_string(),
         agent_id: id.to_string(),
         context_mode: "fresh".to_string(),
@@ -14814,7 +15136,7 @@ fn should_auto_compact_before_send_uses_shared_token_threshold() {
 }
 
 #[test]
-fn context_pressure_warning_reflects_auto_compact_threshold_state() {
+fn automatic_compaction_does_not_warn_at_its_threshold() {
     let mut app = create_test_app();
     app.api_messages = vec![Message {
         role: Role::User,
@@ -14834,17 +15156,8 @@ fn context_pressure_warning_reflects_auto_compact_threshold_state() {
 
     maybe_warn_context_pressure(&mut app);
 
-    let status = app.status_message.as_deref().expect("context warning");
-    assert!(
-        status.contains("Auto-compaction will run before the next send."),
-        "unexpected status: {status}"
-    );
-    assert!(
-        app.sticky_status
-            .as_ref()
-            .is_some_and(|toast| toast.text == status),
-        "context pressure must remain visible in sticky status: {status}"
-    );
+    assert!(app.status_message.is_none());
+    assert!(app.sticky_status.is_none());
 }
 
 #[test]
@@ -14857,7 +15170,7 @@ fn context_pressure_warning_survives_later_status_and_can_be_dismissed() {
             cache_control: None,
         }],
     }];
-    app.auto_compact = true;
+    app.auto_compact = false;
     app.auto_compact_threshold_percent = 100.0;
     let (used, _, _) = context_usage_snapshot(&app).expect("context snapshot");
     app.compact_threshold = usize::try_from(used).expect("non-negative context estimate");
@@ -14899,7 +15212,7 @@ fn context_pressure_warning_clears_when_compaction_starts() {
             cache_control: None,
         }],
     }];
-    app.auto_compact = true;
+    app.auto_compact = false;
     app.auto_compact_threshold_percent = 100.0;
     let (used, _, _) = context_usage_snapshot(&app).expect("context snapshot");
     app.compact_threshold = usize::try_from(used).expect("non-negative context estimate");
@@ -15640,6 +15953,27 @@ fn test_esc_priority_order_matches_cancel_stack() {
 }
 
 #[test]
+fn compact_interrupt_stops_the_turn_not_just_the_pass() {
+    let mut app = create_test_app();
+    app.is_compacting = true;
+    app.is_loading = true;
+    assert!(
+        compact_interrupt_should_stop_turn(&app),
+        "Esc during mid-turn compact must stop the turn"
+    );
+
+    app.is_loading = false;
+    app.runtime_turn_status = None;
+    assert!(
+        !compact_interrupt_should_stop_turn(&app),
+        "manual compact with no turn still cancels only the pass"
+    );
+
+    app.runtime_turn_status = Some("in_progress".to_string());
+    assert!(compact_interrupt_should_stop_turn(&app));
+}
+
+#[test]
 fn next_escape_action_pauses_then_cancels_pausable_command() {
     let mut app = create_test_app();
     app.is_loading = true;
@@ -16259,6 +16593,37 @@ fn completed_subagent_shell_tool_refreshes_workspace_context_before_ttl() {
 }
 
 #[test]
+fn workspace_context_discards_old_workspace_results_and_clears_missing_git() {
+    let mut app = create_test_app();
+    app.workspace_context = Some("feature/current | clean".into());
+    app.workspace_is_linked_worktree = true;
+    app.workspace_context_refreshed_at = Some(Instant::now());
+    *app.workspace_context_cell.lock().unwrap() =
+        Some(crate::tui::workspace_context::WorkspaceContextSnapshot {
+            workspace: app.workspace.join("old-workspace"),
+            context: Some("stale | clean".into()),
+            is_linked_worktree: false,
+        });
+    crate::tui::workspace_context::refresh_if_needed(&mut app, Instant::now(), false);
+    assert_eq!(
+        app.workspace_context.as_deref(),
+        Some("feature/current | clean")
+    );
+    assert!(app.workspace_is_linked_worktree);
+    app.needs_redraw = false;
+    *app.workspace_context_cell.lock().unwrap() =
+        Some(crate::tui::workspace_context::WorkspaceContextSnapshot {
+            workspace: app.workspace.clone(),
+            context: None,
+            is_linked_worktree: false,
+        });
+    crate::tui::workspace_context::refresh_if_needed(&mut app, Instant::now(), false);
+    assert!(app.workspace_context.is_none());
+    assert!(!app.workspace_is_linked_worktree);
+    assert!(app.needs_redraw);
+}
+
+#[test]
 fn workspace_context_drain_requests_redraw_when_context_changes() {
     let mut app = create_test_app();
     app.workspace_context = Some("feature/old | clean".to_string());
@@ -16266,7 +16631,11 @@ fn workspace_context_drain_requests_redraw_when_context_changes() {
     app.needs_redraw = false;
     {
         let mut cell = app.workspace_context_cell.lock().expect("context cell");
-        *cell = Some("feature/new | clean".to_string());
+        *cell = Some(crate::tui::workspace_context::WorkspaceContextSnapshot {
+            workspace: app.workspace.clone(),
+            context: Some("feature/new | clean".to_string()),
+            is_linked_worktree: false,
+        });
     }
 
     crate::tui::workspace_context::refresh_if_needed(&mut app, Instant::now(), false);
@@ -16835,26 +17204,6 @@ fn steer_reuses_queued_echo_cell_instead_of_doubling() {
         "steer must rewrite the queued cell, not paint a second bubble"
     );
     assert_eq!(idx, 0, "the rewritten cell keeps the queue-time index");
-}
-
-#[test]
-fn bare_y_yank_requires_work_surface_focus() {
-    let mut app = create_test_app();
-    app.runtime_turn_id = Some("turn_123".to_string());
-    app.work_surface.panel = crate::tui::work_surface::RailPanel::Tasks;
-    app.work_surface.last_area = Some(Rect::new(0, 0, 80, 24));
-    app.input.clear();
-
-    assert!(
-        !super::event_loop::tasks_panel_owns_bare_yank(&app),
-        "an ambient Tasks panel must not swallow the first typed character"
-    );
-
-    app.work_surface.focused = true;
-    assert!(
-        super::event_loop::tasks_panel_owns_bare_yank(&app),
-        "a focused Tasks panel owns the bare-y yank"
-    );
 }
 
 #[test]
@@ -22439,6 +22788,7 @@ async fn approval_decision_persists_ask_rules_to_permissions_file() {
     let mut app = create_test_app();
     app.config_path = Some(config_path.clone());
     let mut config = Config::default();
+    let running_policy = config.exec_policy_engine.clone();
     let mut engine = mock_engine_handle();
     let rule = codewhale_config::ToolAskRule::exec_shell("cargo test");
 
@@ -22472,8 +22822,7 @@ async fn approval_decision_persists_ask_rules_to_permissions_file() {
             .is_some_and(|message| message.contains("Saved 1 ask permission rule"))
     );
 
-    let decision = config
-        .exec_policy_engine
+    let decision = running_policy
         .check(codewhale_execpolicy::ExecPolicyContext {
             command: "cargo test --workspace",
             cwd: tmp.path().to_string_lossy().as_ref(),
@@ -22494,6 +22843,7 @@ async fn approval_decision_persists_exact_workspace_allow_rule() {
     app.workspace = tmp.path().to_path_buf();
     app.config_path = Some(config_path.clone());
     let mut config = Config::default();
+    let running_policy = config.exec_policy_engine.clone();
     let mut engine = mock_engine_handle();
     let rule = codewhale_config::ToolAskRule::exec_shell("cargo test")
         .into_exact_workspace_allow(tmp.path().to_string_lossy());
@@ -22528,8 +22878,7 @@ async fn approval_decision_persists_exact_workspace_allow_rule() {
             .is_some_and(|message| message.contains("Saved 1 allow permission rule"))
     );
 
-    let exact = config
-        .exec_policy_engine
+    let exact = running_policy
         .check(codewhale_execpolicy::ExecPolicyContext {
             command: "cargo test",
             cwd: tmp.path().to_string_lossy().as_ref(),
@@ -22545,8 +22894,7 @@ async fn approval_decision_persists_exact_workspace_allow_rule() {
     );
     assert!(!exact.requires_approval);
 
-    let expanded = config
-        .exec_policy_engine
+    let expanded = running_policy
         .check(codewhale_execpolicy::ExecPolicyContext {
             command: "cargo test --workspace",
             cwd: tmp.path().to_string_lossy().as_ref(),
@@ -25465,53 +25813,6 @@ fn input_pump_restart_detaches_wedged_thread_and_installs_fresh_parts() {
 }
 
 #[test]
-fn raw_mode_probe_handshake_elects_exactly_one_side_sequentially() {
-    // Task enables raw mode first, probe timeout fires second: the timeout
-    // side sees `enabled` and takes responsibility for disabling.
-    let enabled = std::sync::atomic::AtomicBool::new(false);
-    let abandoned = std::sync::atomic::AtomicBool::new(false);
-    let task_disables = raw_mode_probe_handshake(&enabled, &abandoned);
-    let caller_disables = raw_mode_probe_handshake(&abandoned, &enabled);
-    assert!(!task_disables, "task ran first, so it must not disable");
-    assert!(
-        caller_disables,
-        "timed-out caller must undo the late enable"
-    );
-
-    // Probe timeout fires first, task finishes enabling second: the task
-    // side sees `abandoned` and disables its own late enable.
-    let enabled = std::sync::atomic::AtomicBool::new(false);
-    let abandoned = std::sync::atomic::AtomicBool::new(false);
-    let caller_disables = raw_mode_probe_handshake(&abandoned, &enabled);
-    let task_disables = raw_mode_probe_handshake(&enabled, &abandoned);
-    assert!(!caller_disables, "caller ran first, so it must not disable");
-    assert!(
-        task_disables,
-        "late-finishing task must undo its own enable"
-    );
-}
-
-#[test]
-fn raw_mode_probe_handshake_never_leaks_under_concurrent_race() {
-    // Race both sides on real threads: no interleaving may leave raw mode
-    // leaked, i.e. at least one side must observe the other's flag.
-    for _ in 0..200 {
-        let enabled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let abandoned = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let task_enabled = std::sync::Arc::clone(&enabled);
-        let task_abandoned = std::sync::Arc::clone(&abandoned);
-        let task =
-            std::thread::spawn(move || raw_mode_probe_handshake(&task_enabled, &task_abandoned));
-        let caller_disables = raw_mode_probe_handshake(&abandoned, &enabled);
-        let task_disables = task.join().expect("handshake task side");
-        assert!(
-            task_disables || caller_disables,
-            "at least one side must take responsibility for disabling raw mode"
-        );
-    }
-}
-
-#[test]
 fn backtrack_cut_index_skips_tool_result_user_messages() {
     use codewhale_models::{ContentBlock, Message};
     // A turn with tools: user prompt, assistant tool_use, tool_result (role=user),
@@ -25596,6 +25897,7 @@ mod work_surface {
         // real settings.toml, and a host with `composer_border = false` would
         // shift every threshold below by a row.
         app.composer_border = true;
+        app.composer_density = crate::tui::app::ComposerDensity::Comfortable;
         // Same reason, and it bites harder: `work_surface_top_height` is
         // user-settable over 5..=16 and drag-resizing the divider persists it. A
         // developer whose settings.toml carries a short strip asks for a short
@@ -25770,32 +26072,32 @@ mod work_surface {
             );
         }
 
-        // 21 rows now seats the ocean floor exactly — the merged footer
-        // returned the activity band's row to the stage (info line 1 + footer 1
-        // + composer floor 3 + the 16-row ambient floor = 21). 20 rows
+        // 22 rows seats the ocean floor exactly: the idle shell keeps model
+        // identity visible (model 1 + footer 1 + composer 4 + ambient 16).
+        // 21 rows
         // cannot seat the ocean at any strip height. That is pre-rail
         // behavior and the yield rule must not pretend otherwise.
         let mut app = busy_rail_app(panel);
         assert_eq!(
-            strip_height(&mut app, 80, 21),
+            strip_height(&mut app, 80, 22),
             0,
-            "80x21 seats the ocean floor but has no spare rows for a strip"
+            "80x22 seats the ocean floor but has no spare rows for a strip"
         );
-        let rendered = render_underwater_test_app(&mut app, 80, 21);
+        let rendered = render_underwater_test_app(&mut app, 80, 22);
         assert!(
             idle_ocean_visible(&app),
-            "80x21 is exactly the ocean floor under the Tideline shell:\n{rendered}"
+            "80x22 is exactly the ocean floor under the idle shell:\n{rendered}"
         );
         let mut app = busy_rail_app(panel);
         assert_eq!(
-            strip_height(&mut app, 80, 20),
+            strip_height(&mut app, 80, 21),
             0,
-            "80x20 has no spare rows for a strip at all"
+            "80x21 has no spare rows for a strip at all"
         );
-        let rendered = render_underwater_test_app(&mut app, 80, 20);
+        let rendered = render_underwater_test_app(&mut app, 80, 21);
         assert!(
             !idle_ocean_visible(&app),
-            "80x20 has no room for the ocean even with no strip at all\n{rendered}"
+            "80x21 has no room for the ocean even with no strip at all\n{rendered}"
         );
     }
 
@@ -26619,60 +26921,6 @@ fn resumed_launch_keeps_the_loaded_session_id_for_the_engine() {
     let (engine, _handle) =
         crate::core::engine::Engine::new(build_engine_config(&app, &config), &config);
     assert_eq!(engine.session_id(), "800596e6-56fd-477c-9a0f-13ada7846194");
-}
-
-#[test]
-fn sixel_reconciler_emits_moves_and_clears() {
-    crate::tui::mark::set_sixel_supported_for_tests(true);
-    let mut app = create_test_app();
-    app.launch.sixel_cell_px = Some((10, 20));
-    // Force the transparent-stage branch: the raster composites onto the
-    // probed terminal background, and the clear below must repaint exactly
-    // that colour.
-    app.ui_theme.surface_bg = ratatui::style::Color::Reset;
-    app.launch.sixel_terminal_bg = Some(ratatui::style::Color::Rgb(3, 7, 13));
-    let mut writer: Vec<u8> = Vec::new();
-    // No reservation: silent, nothing tracked.
-    super::frame::reconcile_launch_sixel(&mut writer, &mut app);
-    assert!(writer.is_empty());
-    assert_eq!(app.launch.sixel_emitted, None);
-    // New block: one positioned emission, tracked in stage coordinates
-    // (stage cells are screen cells in fullscreen; CUP is 1-based, so
-    // stage (2,1) draws at row 2, column 3).
-    app.launch.sixel_mark_area = Some(Rect::new(2, 1, 6, 3));
-    super::frame::reconcile_launch_sixel(&mut writer, &mut app);
-    let text = String::from_utf8(writer.clone()).expect("ASCII stream");
-    assert!(text.contains("\x1b[2;3H"), "{text:?}");
-    assert!(text.contains("\x1bPq"), "{text:?}");
-    assert_eq!(app.launch.sixel_emitted, Some(Rect::new(2, 1, 6, 3)));
-    // Steady state: silent.
-    let settled = writer.len();
-    super::frame::reconcile_launch_sixel(&mut writer, &mut app);
-    assert_eq!(writer.len(), settled, "steady frame emits nothing");
-    // Moved block: the old screen block is wiped with the field colour,
-    // then the new block draws (stage (4,1) -> CUP row 3, column 6).
-    app.launch.sixel_mark_area = Some(Rect::new(4, 1, 6, 3));
-    super::frame::reconcile_launch_sixel(&mut writer, &mut app);
-    let text = String::from_utf8(writer.clone()).expect("ASCII stream");
-    let delta = &text[settled..];
-    assert!(delta.contains("48;2;"), "move clears the old block first");
-    assert!(
-        delta.contains("48;2;3;7;13m"),
-        "clear repaints the probed field: {delta:?}"
-    );
-    assert!(delta.contains("\x1b[2;5H"), "{delta:?}");
-    assert_eq!(app.launch.sixel_emitted, Some(Rect::new(4, 1, 6, 3)));
-    // Tier exit: the live block is wiped and tracking stops.
-    let moved = writer.len();
-    app.launch.sixel_mark_area = None;
-    super::frame::reconcile_launch_sixel(&mut writer, &mut app);
-    let text = String::from_utf8(writer.clone()).expect("ASCII stream");
-    assert!(
-        text[moved..].contains("48;2;"),
-        "exit clears the live block"
-    );
-    assert_eq!(app.launch.sixel_emitted, None);
-    crate::tui::mark::set_sixel_supported_for_tests(false);
 }
 
 /// A wheel gesture is one frame, not one frame per tick.

@@ -683,35 +683,6 @@ fn submit_tui_command(tui: &mut Harness, text: &str) {
 }
 
 #[cfg(all(unix, feature = "long-running-tests"))]
-fn visible_review_confirmation(tui: &mut Harness) -> Option<String> {
-    tui.pump();
-    review_confirmation_in_text(&tui.frame().text())
-}
-
-#[cfg(all(unix, feature = "long-running-tests"))]
-fn review_confirmation_in_text(text: &str) -> Option<String> {
-    // The confirmation is `/plugin trust demo <64-hex>.<64-hex>` (129 chars).
-    // Transcript cards wrap well before that, so a single rendered line no
-    // longer holds the token. Join trimmed lines and recover the two digests.
-    // The transcript may also retain an earlier partial command, so scan every
-    // marker instead of rejecting after the first malformed candidate.
-    let joined: String = text.lines().map(str::trim).collect();
-    let marker = "/plugin trust demo ";
-    joined.match_indices(marker).find_map(|(start, _)| {
-        let token: String = joined[start + marker.len()..]
-            .chars()
-            .take_while(|ch| ch.is_ascii_hexdigit() || *ch == '.')
-            .collect();
-        let (content, capability) = token.split_once('.')?;
-        (content.len() == 64
-            && capability.len() == 64
-            && content.chars().all(|ch| ch.is_ascii_hexdigit())
-            && capability.chars().all(|ch| ch.is_ascii_hexdigit()))
-        .then(|| format!("{marker}{content}.{capability}"))
-    })
-}
-
-#[cfg(all(unix, feature = "long-running-tests"))]
 fn sanitize_diag_line(line: &str) -> String {
     line.chars()
         .map(|ch| {
@@ -783,9 +754,9 @@ fn wait_for_composer_ready(tui: &mut Harness) {
         .wait_for(
             |frame| {
                 let (row, _) = frame.cursor();
-                // The composer's cursor row sits above its bottom rule, the
-                // posture row, and the info line — four rows from the end.
-                frame.any_visible_text() && row >= frame.rows().saturating_sub(4)
+                // Density and user drafts change the composer's height. Its
+                // prompt owns the focused row, not a fixed bottom offset.
+                frame.any_visible_text() && frame.row(row).contains('❯')
             },
             BINARY_ACCEPTANCE_TIMEOUT,
         )
@@ -942,26 +913,11 @@ async fn plugin_toml_binary_lifecycle_skill_and_stdio_mcp_acceptance() {
     );
 
     submit_tui_command(&mut tui, "/plugin trust demo");
-    if tui
-        .wait_for(
-            |frame| review_confirmation_in_text(&frame.text()).is_some(),
-            BINARY_ACCEPTANCE_TIMEOUT,
-        )
-        .is_err()
-    {
-        panic!(
-            "review confirmation not visible within {:?}\n{}",
-            qa_harness::harness::ci_scaled(BINARY_ACCEPTANCE_TIMEOUT),
-            short_diagnostics(&mut tui, None)
-        );
-    }
-    let confirmation = visible_review_confirmation(&mut tui).unwrap_or_else(|| {
-        panic!(
-            "review confirmation not visible\n{}",
-            short_diagnostics(&mut tui, None)
-        )
-    });
-    submit_tui_command(&mut tui, &confirmation);
+    expect_visible(&mut tui, "Confirm", "token-bound plugin review control");
+    tui.send(keys::key::ch('y')).expect("arm reviewed trust");
+    expect_visible(&mut tui, "y/Enter", "armed review control");
+    tui.send(keys::key::enter())
+        .expect("confirm reviewed trust");
     expect_visible(&mut tui, "Plugin bundle 'demo': trusted.", "trust receipt");
 
     submit_tui_command(&mut tui, "/plugin enable demo");
@@ -1024,23 +980,6 @@ async fn plugin_toml_binary_lifecycle_skill_and_stdio_mcp_acceptance() {
     let _ = tui.shutdown();
     let _ = shutdown_tx.send(());
     let _ = model_thread.join();
-}
-
-#[cfg(all(unix, feature = "long-running-tests"))]
-#[test]
-fn review_confirmation_skips_partial_candidates_and_survives_transcript_wrap() {
-    let content = "a".repeat(64);
-    let capability = "b".repeat(64);
-    let wrapped = format!(
-        "/plugin trust demo partial\n  /plugin trust demo {head}\n  {mid}\n  {tail}\n",
-        head = &format!("{content}.{capability}")[..40],
-        mid = &format!("{content}.{capability}")[40..90],
-        tail = &format!("{content}.{capability}")[90..],
-    );
-    assert_eq!(
-        review_confirmation_in_text(&wrapped),
-        Some(format!("/plugin trust demo {content}.{capability}"))
-    );
 }
 
 #[cfg(unix)]

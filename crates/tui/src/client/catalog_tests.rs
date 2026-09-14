@@ -181,7 +181,7 @@ async fn anthropic_after_id_completes_both_public_consumers_with_frozen_headers(
 async fn unpaginated_rosters_stay_single_request_and_unknown_continuation_refuses() {
     for go in [false, true] {
         let server = MockServer::start().await;
-        let id = crate::config::OPENCODE_GO_CHAT_MODELS[0];
+        let id = crate::config::opencode_go_models()[0];
         mount_models_json(&server, 200, json!({"data":[{"id":id}]})).await;
         let mut client = if go {
             opencode_go_client_for(&server)
@@ -219,7 +219,7 @@ async fn unpaginated_rosters_stay_single_request_and_unknown_continuation_refuse
 }
 
 #[tokio::test]
-async fn opencode_go_published_unpaginated_roster_keeps_new_chat_ids_only() {
+async fn opencode_go_published_unpaginated_roster_keeps_documented_protocols() {
     let server = MockServer::start().await;
     let base_url = format!("{}/zen/go/v1", server.uri());
     // Literal additions from the pinned Go documentation plus retained routes:
@@ -234,8 +234,6 @@ async fn opencode_go_published_unpaginated_roster_keeps_new_chat_ids_only() {
         "omen-alpha",
         "deepseek-v4-pro",
         "grok-4.5",
-    ];
-    let negatives = [
         "qwen3.8-max",
         "qwen3.8-flash",
         "minimax-m3",
@@ -244,6 +242,7 @@ async fn opencode_go_published_unpaginated_roster_keeps_new_chat_ids_only() {
         "muse-spark-1.3-contributor",
         "muse-spark-1.2-contributor",
     ];
+    let negatives = ["gpt-unlisted", "claude-unproven"];
     let rows: Vec<_> = positives
         .iter()
         .chain(negatives.iter())
@@ -299,7 +298,10 @@ async fn opencode_go_published_unpaginated_roster_keeps_new_chat_ids_only() {
     assert_eq!(delta.offerings.len(), expected.len());
     for row in &delta.offerings {
         assert_eq!(row.provider, "opencode-go");
-        assert_eq!(row.endpoint_key, "chat");
+        assert_eq!(
+            Some(row.endpoint_key.as_str()),
+            codewhale_config::opencode_go_endpoint_key(&row.wire_model_id)
+        );
         assert_eq!(row.canonical_model, None);
         assert_eq!(row.family, None);
         assert_eq!(row.limit, None);

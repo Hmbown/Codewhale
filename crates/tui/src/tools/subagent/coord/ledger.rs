@@ -584,12 +584,14 @@ impl CoordinationLedger {
             self.contentions.push(receipt);
             trim_front(&mut self.contentions, COORDINATION_RECORD_LIMIT);
             return Err(format!(
-                "write-scope contention with {} (roots: {:?}, files: {:?}, contracts: {:?}); serialize the work, narrow the claim, use worktree isolation, or — if that owner has already settled — clear its claim with agent(action=\"release\", agent_id=\"{}\")",
+                "write-scope contention with {}: requested roots {:?}, files {:?}, contracts {:?} overlap its writable roots {:?}, files {:?}, contracts {:?}. Claim disjoint sibling write_roots (for example tmp/scan/worker-a and tmp/scan/worker-b) or exact_files for each output. A read-only worker uses write_authority=read_only without a write claim. Otherwise serialize the writers or use worktree isolation; a nested path inside an existing writable root still overlaps.",
                 existing.claim.owner,
+                claim.roots,
+                claim.exact_files,
+                claim.contracts,
                 existing.claim.roots,
                 existing.claim.exact_files,
-                existing.claim.contracts,
-                existing.claim.owner
+                existing.claim.contracts
             ));
         }
         self.write_claims

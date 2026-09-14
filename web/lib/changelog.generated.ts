@@ -30,31 +30,41 @@ export const CHANGELOG: ChangelogRelease[] = [
   },
   {
     "version": "0.9.13",
-    "date": null,
+    "date": "2026-09-13",
     "unreleased": false,
-    "compareUrl": "https://github.com/Hmbown/CodeWhale/compare/v0.9.12...HEAD",
+    "compareUrl": "https://github.com/Hmbown/CodeWhale/compare/v0.9.12...v0.9.13",
     "sections": [
+      {
+        "heading": "Added",
+        "items": [
+          "/pet turns the terminal over to the Codewhale pet. /pet on (or bare /pet) gives the habitat the whole content viewport now and on every accepted turn, reveals the actual answer or error when the turn completes, and Escape returns to the composer without cancelling anything. /pet off closes the view and stops automatic entry while the durable companion keeps the pet alive; /pet appearance|window|source|sound|export|status address the shared companion. The pet no longer lives…"
+        ],
+        "itemCount": 1
+      },
       {
         "heading": "Fixed",
         "items": [
-          "Cancelling a foreground shell wait stops its owned process group even when the tool future is dropped. Explicitly backgrounded jobs retain their ownership. Interrupted tool receipts distinguish work that started from calls skipped before execution, and returned tool failures remain errors in the next model request.",
-          "Saved Fleet model identifiers retain exact spelling through selection, role pins, and roster changes, so changing one saved model does not modify another identifier that differs only in letter case.",
-          "Chat wrapping reserves its scrollbar gutter consistently, keeping long identifiers readable when the viewport changes.",
-          "The Engine keeps large send-message futures off the event loop's stack, preventing stack exhaustion when a restored session starts a provider turn.",
-          "New, imported, and live session titles skip runtime handoffs and use the first real user prompt. Explicitly renamed titles retain priority (#6012, thanks @SparkofSpike).",
-          "UI dispatch acceptance now precedes Engine execution, so a delayed acceptance callback cannot overwrite a turn that has already started or completed. Cancelling before acceptance preserves the prompt and leaves the next dispatch usable.",
-          "Bottom-chrome effort is omitted when the route cannot prove an effective tier; /status retains the full explanation. Cost remains visible when known, and cost: unknown remains on metered routes lacking a reading (#5950).",
-          "Pasting multiline text is one paste again. 0.9.12 gated the paste-burst heuristic off whenever bracketed paste was *requested*, but a terminal can accept EnableBracketedPaste and still deliver a paste as individual keystrokes — on those terminals (observed on Windows 11) every pasted line was submitted as its own message. The heuristic is again armed whenever tui.paste_burst_detection is on, and the existing bracketed_paste_seen guard still disarms it for the rest of the…",
-          "serve --acp no longer breaks strict JetBrains clients: the initialize response advertised sessionCapabilities.list as a boolean and carried an undefined nested load capability; it now sends {\"list\": {}} with no load key, per the ACP schema (#5969, reported by @Lujc0523).",
-          "Concurrent Codewhale instances no longer destroy each other's queued, unsent text. The offline input queue was one global file that boot cleared on session-id mismatch, so a second instance deleted the first's parked messages. Queues are now keyed per session (mirroring per-session checkpoints), an existing global file is adopted by its owning session rather than discarded, and the adoption race between two instances of the same session tolerates the loser's cleanup.",
-          "A tool call truncated at the provider's output limit can no longer be repaired into valid JSON and executed: repairs that had to synthesize structure (append or discard closers) are routed to the existing malformed-arguments path so the model is asked to re-issue — including when the stream is cut before the closing content-block event (#5986).",
-          "codewhale metrics reads Codewhale's own receipts again: the deepseek-home fallback resolved $HOME/.deepseek unconditionally, so the rollup reported all zeros from a directory nothing has written since 2024. The Codewhale audit log is primary, with a checked legacy fallback."
+          "The website's Computer Use download page resolves its state without the GitHub API (using GITHUB_TOKEN only when bound), and every page regenerates on the Worker again: the Open Graph image route read brand SVGs at import time, which the Workers runtime cannot do, so codewhale.net had been serving its build-time snapshot.",
+          "Operate can run structured workflows directly, with named phases, model assignments from Fleet, prerequisite results and shared budgets. Independent steps run together; dependent work waits for its required results and gates. Detached runs return their outcome to the owning conversation, and headless sessions stay alive between phases until the final handback is consumed.",
+          "Computer Use 0.3.1: mouse actions no longer steal focus or reclaim the foreground when the user switches apps mid-action; background typing, scrolling and selection use semantic input, and screenshots stay scoped to the targeted app. The bundled plugin and the first-party marketplace pin carry the same 0.3.1 sources. A registered macOS helper stays in charge of input through its Pause and Stop controls; an unavailable registered helper produces an error instead of silently…",
+          "The Fleet editor uses the standard model picker to manage sub-agent model and thinking assignments. Enter edits the selected row without changing the running session's model. Unconfigured providers are refused, failed saves retain the previous assignment, and a changed or removed team file must be reopened before a pick can overwrite it.",
+          "The provider catalog includes Baseten and the other compatible-provider templates as selectable rows, opening their existing prefilled setup forms. DeepSeek routes with clock-based pricing show the current peak or off-peak tier beside session cost, with translated labels.",
+          "Extensions, teams, workflows and automations support mouse-wheel scrolling. Plugin and MCP rows have keyboard enable/disable controls and two-step removal; MCP OAuth can retry with narrower scopes after a scope rejection.",
+          "Healthy sub-agents continue after an ordinary parent reply. Headless runs keep the existing Engine alive for child results within the run deadline. Explicit cancellation remains authoritative when result queues are full or a completion starts a followup turn.",
+          "Sub-agent followup supports multiple targets and all parked children, keeps old IDs connected to their current continuation, and saves continuation identity before starting work. Repeated followup does not fork duplicates.",
+          "Sub-agents validate declared output files and distinguish real edit claims from file citations and unrelated workspace changes. Disjoint file claims can run together; overlapping writers receive the actual conflict and remedies. Explicit read-only shell analysis requires an enforcing native sandbox and refuses execution when that protection is unavailable.",
+          "Delegation depth stays absolute through saved profiles, nested workers and continuations. Per-call token, step and time limits narrow inherited limits; continuation retains ancestor usage and deadlines. Workers reserve room for one tools-disabled partial report inside those limits, then run the declared- output checks. Missing usage or unavailable reporting room produces an explicit fallback; partial work is never marked complete.",
+          "Agent rosters and detail pages have bounded output, visible continuation and descendant relationships, and usable handles for full diagnostic evidence. Completion receipts include measured worker and descendant token usage, count each continuation once, and distinguish unreported usage from zero.",
+          "Localization and native helper builds resolve the active checkout when the build script runs, so a shared Cargo target keeps working after a worktree moves or is removed."
         ],
-        "itemCount": 31
+        "itemCount": 90
       },
       {
         "heading": "Changed",
         "items": [
+          "How long Codewhale waits for a human is configurable. [tools] user_input_timeout_seconds governs the wait for an approval decision or a request_user_input answer; it was a hardcoded 300 seconds, which silently cancelled the work of anyone who stepped away mid-task. An explicit 0 waits indefinitely, the value is clamped to 24 hours, and omitting the key keeps the previous 300-second default. Documented in docs/CONFIGURATION.md (#6003).",
+          "docs/PROVIDERS.md lists every beginner setup template, not the four it happened to mention when the page was written. Baseten, Groq, Cerebras and Command Code have shipped as supported OpenAI-compatible hosts for a while and appeared nowhere in the provider documentation, which reads from outside exactly like not supporting them. The page now carries the full table — host, default model and key env for each — and states the rule it follows: a plain Chat Completions backend…",
+          "Reasoning capability for the Kimi coding routes and the qwen3.x Model Studio deep-thinking ids is catalog data now rather than hardcoded match arms, and model_reasoning_capability reports a model nothing knows about as unknown instead of silently not reasoning-capable. model_supports_reasoning keeps its bool shape for existing callers, where unknown still reads as false. The ids that have no cited source yet keep their literal arms (#6032).",
           "The website uses Shannon Sans with versioned local font assets and retained serif, monospace, and language fallbacks. Terminal fonts are unchanged.",
           "codewhale metrics reports recorded model requests and stream recovery separately from provider-reported token usage, with coverage for missing and duplicate receipts. Status messages and cumulative snapshots do not add requests or count tokens again.",
           "Runtime turn receipts retain the Engine's terminal model-request, stream-retry, and resume counters separately from displayed status and provider-reported usage. These counters do not count HTTP retries inside a provider client or establish provider billing.",
@@ -63,10 +73,9 @@ export const CHANGELOG: ChangelogRelease[] = [
           "/statusline drives the bottom chrome again. Since the 0.9.12 shell redesign the posture bar and the metrics line were built independently of tui.status_items, so every toggle in the picker except the balance fetch was decoration. Each remaining item now shows or hides exactly one thing: model, context_percent, cost, balance, cache, tokens and session_metrics are metrics-line segments, and mode is the posture bar's plan/act/operate chip. The status, agents, reasoning_replay,…",
           "The context reading is back on screen at every fullness. 0.9.12 painted ctx NN% only from 50% up, which left most of a session with no context signal at all; it now paints from 0% and keeps its warning colour from 80% up (#5950).",
           "A child agent parked because its parent's turn ended is shown as parked in the Agents panel, the sidebar and Agent Details, with resume_from / cancel as the recovery, instead of wearing the same \"waiting for input\" label as a child that asked a question. Parked work sorts below live and answerable work and no longer inflates the blocked chip; the receipts roster and the wire state gain parked (#5906, #5921).",
-          "codewhale account keys set|remove|list no longer carry a hardcoded eight-provider list. Provider ids come from the control plane's public catalog (GET /api/model-providers), are validated locally against ^[a-z0-9][a-z0-9-]{0,63}$ before they reach a URL path, and list shows every catalog provider with its label and stored-key state. --from-local maps a catalog row onto the local runtime provider through the catalog's own runtimeProvider field, so a newly supported provider…",
-          "/mcp lists the servers that need a login first, as their own Needs login group above Needs attention, and opens with the cursor already on the first such row so the Enter the screen advertises runs /mcp login <server> straight away; translated in all 15 packs. A snapshot test pins the footer shape the chip landed with (MCP · N connected · N ◆ auth required · N failed) so an expired login never regresses into the failed count (#5926)."
+          "codewhale account keys set|remove|list no longer carry a hardcoded eight-provider list. Provider ids come from the control plane's public catalog (GET /api/model-providers), are validated locally against ^[a-z0-9][a-z0-9-]{0,63}$ before they reach a URL path, and list shows every catalog provider with its label and stored-key state. --from-local maps a catalog row onto the local runtime provider through the catalog's own runtimeProvider field, so a newly supported provider…"
         ],
-        "itemCount": 10
+        "itemCount": 13
       },
       {
         "heading": "Fixed",
@@ -81,46 +90,47 @@ export const CHANGELOG: ChangelogRelease[] = [
       {
         "heading": "Added",
         "items": [
+          "POST /v1/threads/{id}/file-revert restores exactly one file from the exact tool:/pre-turn: snapshot the client selected, checking the reviewed file hash before and after the mandatory safety snapshot. Literal file names, regular files only, thread trust and active-turn admission are enforced, and patch-undo no longer forks a conversation whose file rollback failed (#6111, thanks @gaord; engine half of HengQuWorld/CodeWhale-VSCode#3).",
+          "Authenticated Runtime API workspace file suggestions reuse TUI @file matching and discovery, with bounded queries/results and workspace-contained relative paths only (GET /v1/workspace/files/search, #6095, #6120, thanks @wuisabel-gif; reported by @LmeSzinc). Shared discovery now honors disabled symlink following for AI-tool directory scan roots too.",
+          "Serply is available as an opt-in [search] provider for the Web tool (provider = \"serply\", key from [search] api_key or SERPLY_API_KEY). Preflight fails closed without a key; Firecrawl remains the default and existing configurations are unchanged (#6100, thanks @googio).",
+          "Linux terminals: finishing a transcript or composer mouse selection copies the text to the PRIMARY selection without touching the regular clipboard, and middle-click inside the composer pastes PRIMARY at the pointer without submitting. Native X11 and Wayland data control are used through one bounded background worker; SSH sessions without a forwarded display keep their terminal's own selection behavior (#6116, thanks @dmt4).",
+          "codewhale sessions export <id-or-unique-prefix> saves a .tar.xz archive with the durable record, portable session container, manifest and artifacts. Prefix exports preserve unfinished tool calls; confined reads reject linked artifact roots, and existing outputs require --force. Archives retain unredacted content; /load opens the extracted record without installing extracted artifacts (#6056, thanks @h3c-hexin and @asto18089).",
+          "deepseek-flash (DeepSeek V4.1 Flash: 1M-token context, reasoning and tool calls) joins the catalog as DeepSeek's declared default, and the offline catalog seed matches it; the DeepSeek Pro listing no longer overstates the published price (#6025).",
+          "DeepSeek's September 11 reversal is reflected in provider notices and cost estimates: V4 Pro remains available after September 14 at Pro rates. Explicit Pro selections remain unchanged; Flash remains the default (#6025, thanks @ronohara).",
           "Native plugin authoring guides now cover English and Chinese. The explicit offline converter supports selected portable Skills and static Streamable HTTP MCP declarations from OpenCode and DSH. Unsupported executable hooks, automatic OAuth and policy-bearing configurations are refused; generated bundles still require native installation, review and trust. Legacy SSE fallback is not reproduced (#5827, requested by @giancarlocp).",
           "Signed cloud model facts can refresh provider capabilities and prices while preserving verified cached data when a refresh fails. A dispatched request keeps its selected price snapshot so later catalog updates cannot change its recorded cost (#5752).",
           "Saved sessions preserve exact provider routes. Auxiliary model calls settle their usage once against the route and price snapshot that executed them, including recovery, rather than resolving a new price at completion (#5726, #5848).",
           "[tui].posture_bar and [tui].metrics_line accept full, compact, or hidden, also available through /config. Compact preserves the existing rows' essential fields; hidden returns their space to the transcript (#5973).",
-          "Optional model-bound tool-output redaction opt-out, with two explicit startup confirmations and a receipt bound to the readable config contents and modification time. Unconfirmed requests keep masking enabled; routing and stored goal summaries remain redacted (#5982, thanks @SparkofSpike).",
-          "The rusty-alloc cargo feature on codewhale-tui and codewhale-cli opts the binaries into the rusty_alloc global allocator (the mimalloc v2.4.5 architecture remade in pure Rust — no C compiler or build script on that path) instead of the default mimalloc. It is off by default and the default build is unchanged; build with cargo build -p codewhale-tui --features rusty-alloc (#5872).",
-          "The /theme picker now discovers valid user-authored custom:<name> overlays, previews their colors, highlights the active overlay, and preserves it when the picker is opened and committed without navigation (#5901).",
-          "Compaction has two standing knobs next to [context] in config.toml: [compaction] summary_instructions (appended to the summarizer prompt on every manual and automatic pass; /compact <focus> still composes after it) and [compaction] retained_user_message_tokens (default 20 000, clamped 2 000..=200 000) for the verbatim user-message budget. Both are absent by default and absent means the pre-existing behavior. The /compact receipt names the effective budget and whether…",
-          "[tools] user_input_max_questions (default 6, 1..=10) and [tools] user_input_max_options (default 4, 2..=10) replace the hard-coded request_user_input limits; the validator, the tool schema and its description read one value, spawned children inherit the parent's ceilings, and a rejected payload names the ceiling it hit and the key to raise (#5949).",
-          "The slash menu shows a command's usage line and its subcommands as soon as a space is typed after the verb, filtered by what follows, so Tab completes /workspace wor to /workspace worktrees; /help states the focused command's usage in its detail slot (#5952).",
-          "The three /fleet views (roster, live workers, saved teams) are one back-navigable stack: Esc in workers or saved teams returns to the roster with its cursor intact and still closes the window at the root or on direct entry; the Esc footer hint says back or close accordingly (#5954).",
-          "/fleet presents its prioritized core (members, setup, teams, workers, help); every other verb stays dispatchable and is documented under explicit groups in /fleet help. The roster no longer shows the untouched built-in general alias next to worker (#5888)."
+          "Optional model-bound tool-output redaction opt-out, with two explicit startup confirmations and a receipt bound to the readable config contents and modification time. Unconfirmed requests keep masking enabled; routing and stored goal summaries remain redacted (#5982, thanks @SparkofSpike)."
         ],
-        "itemCount": 15
+        "itemCount": 22
       },
       {
         "heading": "Contributors",
         "items": [
-          "@gaord — contributed Fleet schema inspection, role precedence and worker deliverable receipts, and linked the community VS Code frontend (#5944, #5945, #5946, #5992).",
+          "@LmeSzinc — requested Runtime API access to the TUI's fuzzy file search (#6095).",
+          "@googio — added the Serply web-search provider (#6100).",
+          "@dmt4 — requested Linux copy-on-select and middle-click paste (#6116).",
+          "@Gabriel-Degret — reported that saved agent profiles were silently ignored when spawning sub-agents (#6117).",
+          "@nightt5879 — Gemini signature recovery guidance and transport regressions (#6081).",
+          "@c020627 — Chinese documentation link repairs (#6080).",
+          "@h3c-hexin and @asto18089 — GLM-5.3 reasoning controls and tool-gating/documentation fixes (#6051, #6052).",
+          "@Hmbown — dependency updates (#6057) and the Gemini signature recovery report (#6048).",
+          "@gaord — contributed the file-scoped restore endpoint and the trust-gated whole-tree rollback (#6111), Fleet schema inspection, role precedence and worker deliverable receipts, and linked the community VS Code frontend (#5944, #5945, #5946, #5992).",
           "@goransh-walia — contributed the propose-only commit-planning rework (#5870).",
           "@7jrxt42BxFZo4iAnN4CX — documented turn budgets and goal configuration, and reported gaps in command discovery, Fleet navigation, human waits, state hooks, history and provider routing (#5996, #5952, #5954, #6003, #6004, #6006, #6007).",
-          "@SparkofSpike — contributed two-stage consent for opting out of model-bound credential redaction (#5982).",
-          "@aboimpinto — moved session lifecycle and session-control commands onto shared command contracts (#5902, #5951).",
-          "@EvanProgramming — reported Windows input and CRLF-write defects, and contributed CRLF preservation and an injectable Windows input runner (#5908, #5909, #5910, #5911, #5912).",
-          "@wuisabel-gif — added custom-theme discovery, preview and selection in the theme picker (#5907).",
-          "@zhuowp — matched model-visible shell guidance to the interpreter selected for execution (#5900).",
-          "@nsfoxer — reported the multiline-paste regression and incomplete provider model lists (#5981, #6009).",
-          "@Nefelibata1024 — confirmed the multiline-paste regression's impact (#5981).",
-          "@Gabriel-Degret — reported the loss of the allow_insecure_http provider setting (#5991).",
-          "@Lujc0523 — reported the ACP initialize schema violation affecting strict IDE clients (#5969)."
+          "@SparkofSpike — contributed two-stage consent for opting out of model-bound credential redaction (#5982)."
         ],
-        "itemCount": 15
+        "itemCount": 23
       },
       {
         "heading": "Notes",
         "items": [
+          "DeepSeek V4 Pro continues after September 14. The vendor reversed its earlier retirement notice. Codewhale preserves Pro selections and Pro pricing; deepseek-flash remains the default for new direct DeepSeek configurations.",
           "Upgrading from 0.9.12 with Computer Use trusted and enabled: the bundle's content hash changes with the 0.2.1 refresh, so the plugin deactivates and asks for a fresh review — that is the designed fail-closed path for a desktop-driving plugin. Re-trust it from the Plugins page.",
           "The multiline-paste fix restores v9.11 behavior on terminals that accept EnableBracketedPaste but deliver pastes as keystrokes (reported on Windows 11 / PowerShell). Verified at the input-contract level and in CI; a manual paste check on a real Windows terminal is still welcome — please comment on #5981 with your terminal if anything still misbehaves."
         ],
-        "itemCount": 2
+        "itemCount": 3
       }
     ]
   },

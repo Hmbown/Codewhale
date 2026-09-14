@@ -473,6 +473,18 @@ impl ModalView for WorkflowsManagerView {
         if self.detail_open {
             return ViewAction::None;
         }
+        // The wheel moves this list, not the transcript behind it.
+        match mouse.kind {
+            MouseEventKind::ScrollUp => {
+                self.move_row(-1);
+                return ViewAction::None;
+            }
+            MouseEventKind::ScrollDown => {
+                self.move_row(1);
+                return ViewAction::None;
+            }
+            _ => {}
+        }
         if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
             let body = self.list_body.get();
             if body.width > 0

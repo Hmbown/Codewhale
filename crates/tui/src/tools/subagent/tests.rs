@@ -159,8 +159,9 @@ fn make_assignment() -> SubAgentAssignment {
     SubAgentAssignment::new("prompt".to_string(), Some("worker".to_string()))
 }
 
-fn make_snapshot(status: SubAgentStatus) -> SubAgentResult {
+pub(super) fn make_snapshot(status: SubAgentStatus) -> SubAgentResult {
     SubAgentResult {
+        usage: None,
         name: "agent_test".to_string(),
         agent_id: "agent_test".to_string(),
         context_mode: "fresh".to_string(),
@@ -187,14 +188,15 @@ fn make_snapshot(status: SubAgentStatus) -> SubAgentResult {
     }
 }
 
-fn make_worker_spec(worker_id: &str, workspace: PathBuf) -> AgentWorkerSpec {
+pub(super) fn make_worker_spec(worker_id: &str, workspace: PathBuf) -> AgentWorkerSpec {
     let tool_profile =
         AgentWorkerToolProfile::Explicit(vec!["read_file".to_string(), "grep_files".to_string()]);
     let mut runtime_profile = WorkerRuntimeProfile::for_role(FleetRole::Scout);
     runtime_profile.tools =
         ToolScope::Explicit(vec!["read_file".to_string(), "grep_files".to_string()]);
     runtime_profile.model = ModelRoute::Fixed("deepseek-v4-flash".to_string());
-    runtime_profile.max_spawn_depth = DEFAULT_MAX_SPAWN_DEPTH.saturating_sub(1);
+    runtime_profile.max_spawn_depth = DEFAULT_MAX_SPAWN_DEPTH;
+    runtime_profile.spawn_depth = 1;
     AgentWorkerSpec {
         worker_id: worker_id.to_string(),
         run_id: worker_id.to_string(),
@@ -234,6 +236,7 @@ fn make_write_worker_spec(worker_id: &str, workspace: PathBuf, root: &str) -> Ag
         writable_files: Vec::new(),
         coordination_contracts: Vec::new(),
         expected_artifact: Some("tested patch".to_string()),
+        deliverables: Vec::new(),
         token_budget: None,
         resume_identity: Some(worker_id.to_string()),
         generation: 1,
@@ -413,6 +416,89 @@ fn headless_worker_record_tracks_lifecycle_without_tui_projection() {
 }
 
 #[test]
+fn parent_worker_usage_projection_survives_restart_without_inventing_cost() {
+    let tmp = tempdir().unwrap();
+    let state_path = tmp.path().join("subagents.v1.json");
+    let mut manager =
+        SubAgentManager::new(tmp.path().to_path_buf(), 4).with_state_path(state_path.clone());
+    let id = "agent_usage_projection";
+    let (input_tx, _input_rx) = mpsc::unbounded_channel();
+    let mut agent = SubAgent::new(
+        id.into(),
+        FleetRole::Reviewer,
+        "review".into(),
+        make_assignment(),
+        "custom-model".into(),
+        None,
+        None,
+        input_tx,
+        tmp.path().to_path_buf(),
+        manager.session_boot_id().into(),
+    );
+    agent.status = SubAgentStatus::Completed;
+    manager.agents.insert(id.into(), agent);
+    manager.register_worker(make_worker_spec(id, tmp.path().to_path_buf()));
+    manager.assign_test_session_owner(id, "usage-owner");
+    manager.record_worker_usage(
+        id,
+        "response:1",
+        &Usage {
+            input_tokens: 120,
+            output_tokens: 30,
+            prompt_cache_hit_tokens: Some(80),
+            ..Usage::default()
+        },
+        None,
+    );
+    manager.record_worker_usage(
+        id,
+        "response:1",
+        &Usage {
+            input_tokens: 120,
+            output_tokens: 30,
+            ..Usage::default()
+        },
+        None,
+    );
+    manager.record_worker_usage(id, "response:missing", &Usage::default(), None);
+    let result = manager
+        .get_result_by_ref_for_session("usage-owner", id)
+        .unwrap();
+    let usage = result.usage.as_ref().unwrap();
+    assert_eq!(usage.input_tokens, Some(120));
+    assert_eq!(usage.output_tokens, Some(30));
+    assert_eq!(usage.total_tokens, Some(150));
+    assert_eq!(
+        usage.cost_microusd, None,
+        "unpriced provider usage must not claim free work"
+    );
+    let json = serde_json::to_value(&result).unwrap();
+    assert_eq!(json["usage"]["total_tokens"], 150);
+    assert!(json["usage"].get("cost_microusd").is_none());
+    assert!(
+        manager
+            .get_result_by_ref_for_session("foreign-owner", id)
+            .is_err()
+    );
+    manager.persist_state().unwrap().join().unwrap();
+    let mut loaded = SubAgentManager::new(tmp.path().to_path_buf(), 4).with_state_path(state_path);
+    loaded.load_state().unwrap();
+    let restored = loaded
+        .get_result_by_ref_for_session("usage-owner", id)
+        .unwrap();
+    assert_eq!(restored.usage, result.usage);
+    let listed = loaded.list_filtered_for_session("usage-owner", true);
+    assert_eq!(
+        listed
+            .iter()
+            .find(|agent| agent.agent_id == id)
+            .unwrap()
+            .usage,
+        result.usage
+    );
+}
+
+#[test]
 fn worker_record_usage_accumulates_provider_tokens() {
     let tmp = tempdir().expect("tempdir");
     let mut manager = SubAgentManager::new(tmp.path().to_path_buf(), 4);
@@ -508,6 +594,22 @@ fn token_budget_scope_is_shared_across_nested_workers_and_blocks_when_spent() {
     assert_eq!(child_scope.scope_id, "agent_root");
     assert_eq!(child_scope.limit, 100);
     assert_eq!(child_scope.spent, 50);
+    for request in [20, 1_000] {
+        let scope = manager
+            .resolve_spawn_budget_scope("agent_override", Some("agent_root"), Some(request))
+            .expect("a remaining inherited pool still permits a narrowed child")
+            .expect("inherited pool remains present");
+        assert_eq!(
+            scope.scope_id, "agent_root",
+            "a per-call cap cannot reset accounting"
+        );
+        assert_eq!(
+            scope.limit, 100,
+            "the local cap does not replace the aggregate ceiling"
+        );
+        assert_eq!(scope.spent, 50);
+        assert_eq!(scope.remaining, 50);
+    }
     manager.register_worker(child_spec);
     manager.attach_budget_scope("agent_child", child_scope);
     manager.record_worker_usage(
@@ -537,13 +639,15 @@ fn token_budget_scope_is_shared_across_nested_workers_and_blocks_when_spent() {
         "actionable exhaustion error: {err}"
     );
 
-    let override_scope = manager
-        .resolve_spawn_budget_scope("agent_override", Some("agent_child"), Some(20))
-        .expect("explicit override starts new scope")
-        .expect("override budget present");
-    assert_eq!(override_scope.scope_id, "agent_override");
-    assert_eq!(override_scope.limit, 20);
-    assert_eq!(override_scope.spent, 0);
+    for request in [20, 1_000] {
+        let error = manager
+            .resolve_spawn_budget_scope("agent_override", Some("agent_child"), Some(request))
+            .expect_err("neither a lower nor a higher local cap can escape an exhausted pool");
+        assert!(
+            error.to_string().contains("scope agent_root: 100/100"),
+            "{error}"
+        );
+    }
 }
 
 #[test]
@@ -576,7 +680,8 @@ fn agent_worker_profile_derives_from_parent_without_escalation() {
          surface + network); children inherit the full-shell authority \
          without gaining write"
     );
-    assert_eq!(profile.max_spawn_depth, DEFAULT_MAX_SPAWN_DEPTH - 1);
+    assert_eq!(profile.max_spawn_depth, DEFAULT_MAX_SPAWN_DEPTH);
+    assert_eq!(profile.spawn_depth, runtime.spawn_depth);
     assert_eq!(
         profile.model,
         ModelRoute::Fixed("deepseek-v4-pro".to_string())
@@ -1058,6 +1163,7 @@ fn headless_worker_registration_enforces_live_claims_and_projects_context() {
             writable_files: Vec::new(),
             coordination_contracts: Vec::new(),
             expected_artifact: None,
+            deliverables: Vec::new(),
             token_budget: None,
             resume_identity: Some(format!("fleet-{id}")),
             generation: 1,
@@ -2021,7 +2127,7 @@ fn message_text(message: &Message) -> &str {
     }
 }
 
-async fn delayed_chat_client(
+pub(super) async fn delayed_chat_client(
     first_delay: Duration,
     response_text: &str,
 ) -> (
@@ -2611,7 +2717,7 @@ async fn provider_success_without_usage_records_one_route_aware_gap_and_no_zero_
         .get_worker_record("agent_missing_usage")
         .expect("missing-usage worker record")
         .clone();
-    assert_eq!(worker.usage.total_tokens, Some(0));
+    assert_eq!(worker.usage.total_tokens, None);
     assert_eq!(worker.usage.cost_microusd, None);
     assert_eq!(worker.usage_source_fingerprints, [fingerprint].into());
 }
@@ -3224,8 +3330,12 @@ fn agent_definition_explains_background_child_and_wait() {
     assert!(until.contains("every child running at call time has settled"));
     assert!(until.contains("activity also returns on progress"));
     let detached = schema_property_description(&schema, "detached");
-    assert!(detached.contains("False (default): the turn owns"));
-    assert!(detached.contains("true: detached work outlives the turn"));
+    assert!(detached.contains("continue after ordinary parent turn completion"));
+    assert!(detached.contains("remain explicitly cancellable"));
+    assert!(
+        detached.contains("true additionally opts this subtree out of parent-turn cancellation")
+    );
+    assert!(detached.contains("its own budgets still apply"));
     assert!(description.contains("action=claim"));
     assert!(description.contains("Fleet role"));
     assert!(
@@ -5228,7 +5338,9 @@ fn spawn_request_parses_token_budget_override() {
     }))
     .expect_err("zero budget is invalid in tool input");
     assert!(
-        err.to_string().contains("must be greater than zero"),
+        err.to_string()
+            .contains("token_budget must be an integer greater than zero")
+            && err.to_string().contains("omit it to inherit"),
         "clear token budget error: {err}"
     );
 }
@@ -5340,9 +5452,10 @@ fn test_parse_spawn_request_accepts_fleet_role_token_for_runtime_resolution() {
 
 #[test]
 fn test_parse_spawn_request_accepts_full_role_vocabulary() {
-    // Regression for #2649: roles that `FleetRole::from_str` accepts must
-    // also pass the second `normalize_role_alias` validation pass instead of
-    // being rejected with a stale hint.
+    // Regression for #2649: every token `FleetRole::from_str` accepts must
+    // pass the spawn boundary through `role` *and* `type`, in any case and
+    // with surrounding whitespace, land on the canonical serialized role,
+    // never become a profile key, and conflict with a different type.
     for (role, expected_type, expected_role) in [
         ("general", FleetRole::Worker, "general"),
         ("general-purpose", FleetRole::Worker, "general"),
@@ -5365,6 +5478,7 @@ fn test_parse_spawn_request_accepts_full_role_vocabulary() {
         ("implement", FleetRole::Builder, "implement"),
         ("implementation", FleetRole::Builder, "implement"),
         ("builder", FleetRole::Builder, "implement"),
+        ("test", FleetRole::Verifier, "test"),
         ("verifier", FleetRole::Verifier, "test"),
         ("verify", FleetRole::Verifier, "test"),
         ("verification", FleetRole::Verifier, "test"),
@@ -5375,38 +5489,63 @@ fn test_parse_spawn_request_accepts_full_role_vocabulary() {
         ("advisor", FleetRole::Consultant, "advisor"),
         ("custom", FleetRole::Custom, "custom"),
     ] {
-        assert_eq!(
-            FleetRole::from_str(role),
-            Some(expected_type.clone()),
-            "from_str should accept role alias {role:?}"
-        );
-        assert_eq!(
-            normalize_role_alias(role),
-            Some(expected_role),
-            "normalize_role_alias should accept role alias {role:?}"
-        );
-
-        let mut input = json!({ "prompt": "do work", "role": role });
-        if matches!(&expected_type, FleetRole::Worker | FleetRole::Builder) {
-            input["write_roots"] = json!(["."]);
-        } else if expected_type == FleetRole::Custom {
-            input["write_authority"] = json!("workspace_write");
-            input["write_roots"] = json!(["."]);
+        let shouted = format!("  {} ", role.to_ascii_uppercase());
+        for (key, spelling) in [
+            ("role", role.to_string()),
+            ("role", shouted.clone()),
+            ("type", role.to_string()),
+            ("type", shouted),
+        ] {
+            let mut input = json!({ "prompt": "do work", key: spelling });
+            if matches!(&expected_type, FleetRole::Worker | FleetRole::Builder) {
+                input["write_roots"] = json!(["."]);
+            } else if expected_type == FleetRole::Custom {
+                input["write_authority"] = json!("workspace_write");
+                input["write_roots"] = json!(["."]);
+            }
+            let mut parsed = parse_spawn_request(&input)
+                .unwrap_or_else(|e| panic!("{key}={spelling:?} should parse, got {e}"));
+            assert_eq!(
+                parsed.agent_type, expected_type,
+                "type for {key}={spelling:?}"
+            );
+            assert_eq!(
+                parsed.assignment.role.as_deref(),
+                Some(expected_role),
+                "canonical role for {key}={spelling:?}"
+            );
+            assert_eq!(
+                serde_json::to_string(&parsed.agent_type).expect("serialize role"),
+                format!("\"{expected_role}\""),
+                "serialized role for {key}={spelling:?} must be canonical"
+            );
+            assert!(
+                parsed.profile.is_none(),
+                "descriptive alias {key}={spelling:?} must not become a role profile"
+            );
+            resolve_spawn_role(&mut parsed).unwrap_or_else(|e| {
+                panic!("{key}={spelling:?} should resolve without a profile: {e}")
+            });
         }
-        let mut parsed = parse_spawn_request(&input)
-            .unwrap_or_else(|e| panic!("role {role:?} should parse, got {e}"));
-        assert_eq!(parsed.agent_type, expected_type, "type for role {role:?}");
-        assert_eq!(
-            parsed.assignment.role.as_deref(),
-            Some(expected_role),
-            "canonical role for {role:?}"
-        );
+
+        // The same alias paired with a different explicit type is a conflict,
+        // not a silent pick of either side.
+        let other = if expected_type == FleetRole::Scout {
+            "general"
+        } else {
+            "explore"
+        };
+        let err = parse_spawn_request(&json!({
+            "prompt": "do work",
+            "type": other,
+            "role": role,
+        }))
+        .expect_err("conflicting type and role alias must fail");
         assert!(
-            parsed.profile.is_none(),
-            "descriptive role alias {role:?} must not become a role profile"
+            err.to_string()
+                .contains("Fleet role conflicts with the explicit legacy agent type"),
+            "conflict error for role {role:?} with type {other:?}: {err}"
         );
-        resolve_spawn_role(&mut parsed)
-            .unwrap_or_else(|e| panic!("role {role:?} should resolve without a profile: {e}"));
     }
 }
 
@@ -5531,18 +5670,31 @@ fn subagent_tool_schemas_advertise_real_type_and_role_vocabulary() {
     let mut expected = [
         "action",
         "agent_id",
+        "agent_ids",
+        "all_parked",
+        "coordination_contracts",
+        "deliverables",
+        "detail",
         "detached",
+        "exact_files",
+        "expected_artifact",
+        "limit",
+        "max_steps",
         "message",
         "model",
         "model_strength",
         "name",
+        "offset",
         "profile",
         "prompt",
         "resume_from",
         "thinking",
+        "token_budget",
         "type",
         "until",
+        "wall_time_secs",
         "worktree",
+        "write_authority",
         "write_roots",
     ];
     expected.sort_unstable();
@@ -5553,11 +5705,8 @@ fn subagent_tool_schemas_advertise_real_type_and_role_vocabulary() {
     );
     for unadvertised in [
         "max_depth",
-        "max_steps",
-        "wall_time_secs",
         "fork_context",
         "workspace_policy",
-        "write_authority",
         "worktree_base",
         "worktree_branch",
         "worktree_path",
@@ -5565,14 +5714,10 @@ fn subagent_tool_schemas_advertise_real_type_and_role_vocabulary() {
         "deliberate",
         "dependencies",
         "acceptance",
-        "expected_artifact",
-        "exact_files",
-        "coordination_contracts",
         "timeout_secs",
         "reason",
         "include_archived",
         // Pre-#5324 precedent: parse-accepted but never advertised.
-        "token_budget",
     ] {
         assert!(
             agent_schema["properties"].get(unadvertised).is_none(),
@@ -5869,7 +6014,7 @@ fn agent_tool_schema_bounds_fields_by_explicit_action() {
     for action in ["message", "followup"] {
         assert_eq!(branch(action)["required"], json!(["message"]));
     }
-    for action in ["peek", "message", "followup", "interrupt", "cancel"] {
+    for action in ["peek", "message", "interrupt", "cancel"] {
         assert_eq!(
             branch(action)["anyOf"],
             json!([
@@ -5887,6 +6032,50 @@ fn agent_tool_schema_bounds_fields_by_explicit_action() {
     for action in ["roster", "status", "wait"] {
         assert!(branch(action).get("required").is_none());
         assert!(branch(action).get("anyOf").is_none());
+    }
+
+    // Followup now has three mutually exclusive target forms. Exercise the
+    // actual contract both before and after the generic provider sanitizer;
+    // required-only `not` branches used to be pruned into an impossible schema.
+    let mut generic = agent_schema.clone();
+    crate::tools::schema_sanitize::sanitize(&mut generic);
+    for (provider, schema) in [("canonical", agent_schema), ("generic", generic)] {
+        let validator = draft_2020_validator(&schema);
+        for target in [
+            json!({"agent_id": "child-a"}),
+            json!({"name": "researcher"}),
+            json!({"agent_ids": ["child-a", "child-b"]}),
+            json!({"all_parked": true}),
+        ] {
+            let mut input = json!({"action": "followup", "message": "continue"});
+            input
+                .as_object_mut()
+                .unwrap()
+                .extend(target.as_object().unwrap().clone());
+            assert!(
+                validator.is_valid(&input),
+                "{provider} rejected valid followup: {input}"
+            );
+        }
+        for target in [
+            json!({}),
+            json!({"all_parked": false}),
+            json!({"agent_ids": []}),
+            json!({"agent_ids": ["child-a", "child-a"]}),
+            json!({"agent_id": "child-a", "agent_ids": ["child-b"]}),
+            json!({"name": "researcher", "all_parked": true}),
+            json!({"agent_ids": ["child-a"], "all_parked": true}),
+        ] {
+            let mut input = json!({"action": "followup", "message": "continue"});
+            input
+                .as_object_mut()
+                .unwrap()
+                .extend(target.as_object().unwrap().clone());
+            assert!(
+                !validator.is_valid(&input),
+                "{provider} accepted invalid followup: {input}"
+            );
+        }
     }
 }
 
@@ -5951,6 +6140,26 @@ fn agent_tool_schema_rejects_empty_input_across_provider_forms() {
         assert!(
             validator.is_valid(&json!({"action": "start", "prompt": "inspect this"})),
             "{provider} agent schema must retain an ordinary explicit start"
+        );
+        for target in [
+            json!({"agent_id": "child-a"}),
+            json!({"agent_ids": ["child-a", "child-b"]}),
+            json!({"all_parked": true}),
+        ] {
+            let mut input = json!({"action": "followup", "message": "continue"});
+            input
+                .as_object_mut()
+                .unwrap()
+                .extend(target.as_object().unwrap().clone());
+            assert!(
+                validator.is_valid(&input),
+                "{provider} must retain followup: {input}"
+            );
+        }
+        assert!(
+            !validator
+                .is_valid(&json!({"action": "followup", "message": "continue", "agent_ids": []})),
+            "{provider} must preserve the lower bound on batch targets"
         );
     }
     assert!(
@@ -6103,9 +6312,43 @@ async fn agent_tool_status_returns_running_child_projection() {
         .expect("status action succeeds");
 
     assert_eq!(result.metadata.as_ref().unwrap()["action"], json!("status"));
-    assert!(result.content.contains("agent_status_probe"));
-    assert!(result.content.contains("running"));
-    assert!(result.content.contains("transcript_handle"));
+    let compact: Value = serde_json::from_str(&result.content).expect("compact status");
+    assert_eq!(compact["agent_id"], agent_id);
+    assert_eq!(compact["status"], "model_wait");
+    assert_eq!(compact["terminal"], false);
+    assert_eq!(
+        result.metadata.as_ref().unwrap()["status"],
+        compact["status"]
+    );
+    assert!(compact.get("transcript_handle").is_none());
+    assert!(
+        compact["detail_hint"]
+            .as_str()
+            .unwrap()
+            .contains("detail=true")
+    );
+    assert!(result.content.len() <= lifecycle::COMPACT_STATUS_BYTES);
+
+    let detail = tool
+        .execute(
+            json!({"action": "status", "agent_id": agent_id, "detail": true}),
+            &context,
+        )
+        .await
+        .expect("addressed diagnostic page");
+    let detail_json: Value = serde_json::from_str(&detail.content).expect("detail status");
+    let handle: VarHandle = serde_json::from_value(detail_json["transcript_handle"].clone())
+        .expect("typed transcript handle");
+    assert!(
+        context
+            .runtime
+            .handle_store
+            .lock()
+            .await
+            .get(&handle)
+            .is_some()
+    );
+    assert_eq!(detail.metadata.as_ref().unwrap()["agent_id"], agent_id);
 }
 
 #[tokio::test]
@@ -6368,6 +6611,19 @@ async fn coordination_interrupt_fans_in_once_and_preserves_checkpoint() {
     let mut child_spec = make_worker_spec(&agent_id, tmp.path().to_path_buf());
     child_spec.parent_run_id = Some("agent_parent".to_string());
     manager.register_worker(child_spec);
+    manager.register_worker(make_worker_spec(
+        "agent_unrelated",
+        tmp.path().to_path_buf(),
+    ));
+    // A real headless parent has only a ledger row. Unknown, unrelated and
+    // self identities must still fail before any terminal delivery occurs.
+    for caller in ["agent_missing", "agent_unrelated", agent_id.as_str()] {
+        assert!(
+            manager
+                .interrupt_child(&agent_id, Some(caller), "forbidden".into())
+                .is_err()
+        );
+    }
     manager.record_worker_event(
         &agent_id,
         AgentWorkerStatus::RunningTool,
@@ -6699,6 +6955,27 @@ fn test_build_assignment_prompt_includes_metadata() {
     assert!(prompt.contains("Assignment metadata"));
     assert!(prompt.contains("resolved_type: explore"));
     assert!(prompt.contains("role: explore"));
+
+    // Free-form saved roles retain their exact prompt label; consolidating
+    // the canonical parser must not turn display cleanup into a migration.
+    for role in [
+        None,
+        Some("  release_lead  "),
+        Some("custom"),
+        Some(" TEST "),
+    ] {
+        let assignment = SubAgentAssignment::new("Inspect".into(), role.map(str::to_string));
+        let prompt = build_assignment_prompt("Inspect", &assignment, &FleetRole::Scout);
+        let expected = match role {
+            None => "default",
+            Some(" TEST ") => "test",
+            Some(role) => role,
+        };
+        assert!(
+            prompt.contains(&format!("\n- role: {expected}\n")),
+            "{prompt}"
+        );
+    }
 }
 
 #[test]
@@ -7422,6 +7699,7 @@ fn small_surface_starts_with_core_tools_and_read_only_goal_control() {
             "read",
             "todo_write",
             "tool_search",
+            "workflow",
             "write",
         ]
         .into_iter()
@@ -7689,6 +7967,7 @@ fn small_surface_depth_cap_removes_only_agent() {
             "read",
             "todo_write",
             "tool_search",
+            "workflow",
             "write"
         ]
         .into_iter()
@@ -9261,6 +9540,7 @@ async fn shared_write_claim_is_registered_before_parallel_launch_and_manifested(
             contracts: vec!["public-api".into()],
         }),
         expected_artifact: Some("tested patch".into()),
+        deliverables: Vec::new(),
         ..Default::default()
     };
     let (first_id, contention) = {
@@ -9700,18 +9980,18 @@ async fn status_projection_reconciles_stale_running_agent() {
             .expect("status projection should succeed");
     let payload: serde_json::Value =
         serde_json::from_str(&result.content).expect("status payload should be json");
-    let agent = payload["agents"]
-        .as_array()
-        .and_then(|agents| agents.first())
+    let rows = lifecycle_tests::status_rows(&payload);
+    let agent = rows
+        .first()
         .expect("stale current-session agent should remain inspectable");
 
     assert_eq!(payload["count"], 1);
     assert_eq!(agent["agent_id"], "test_agent_status_stale");
     assert_eq!(agent["status"], "cancelled");
-    assert_eq!(agent["terminal"], true);
-    assert_eq!(agent["snapshot"]["status"], "Cancelled");
+    assert_eq!(payload["status_counts"]["cancelled"], 1);
+    assert!(agent.get("snapshot").is_none());
     assert!(
-        agent["snapshot"]["result"]
+        agent["summary"]
             .as_str()
             .unwrap_or_default()
             .contains("Auto-cancelled")
@@ -10910,6 +11190,28 @@ fn budget_exhaustion_is_a_high_priority_failure_event() {
 }
 
 #[test]
+fn completion_priority_uses_the_terminal_receipt_not_quoted_report_text() {
+    let mut result = make_snapshot(SubAgentStatus::Completed);
+    result.result = Some(
+        "The regression quotes {\"event\":\"subagent.failed\"} and {\"event\":\"workflow.failed\"}."
+            .to_string(),
+    );
+    assert!(!subagent_completion_from_result(&result).is_high_priority_failure());
+
+    for (event, expected) in [("workflow.completed", false), ("workflow.failed", true)] {
+        let completion = SubAgentCompletion {
+            owner_session_id: "owner".to_string(),
+            agent_id: "workflow_1".to_string(),
+            payload: format!(
+                "Workflow result\n<codewhale:subagent.done>{}</codewhale:subagent.done>",
+                serde_json::json!({"event": event, "agent_id": "workflow_1"})
+            ),
+        };
+        assert_eq!(completion.is_high_priority_failure(), expected);
+    }
+}
+
+#[test]
 fn stamp_subagent_summary_appends_note_when_short() {
     // issue #2652: a short (complete) summary gets the soft self-report note
     // and is NOT marked truncated.
@@ -11232,6 +11534,7 @@ async fn rate_limit_pause_blocks_subagent_spawn() {
         Arc::clone(&manager),
         runtime,
         false,
+        None,
     )
     .await
     .expect_err("active provider rate-limit pause must refuse new sub-agent work");
@@ -12091,24 +12394,9 @@ async fn contended_shared_writer_refusal_names_blocking_peer_and_remediation() {
         err.contains("agent_b"),
         "refusal must name the blocking peer: {err}"
     );
-    // #5906: the remediation must name a surface that exists from here.
-    // `agents/coordinate` left the catalog, so the refusal pointed at a tool
-    // the refused child could not reach.
     assert!(
-        err.contains(r#"agent(action="release")"#) && err.contains("worktree isolation"),
-        "refusal must state concrete remediation: {err}"
-    );
-    assert!(
-        AgentTool::new(
-            new_shared_subagent_manager(tmp.path().to_path_buf(), 1),
-            stub_runtime(),
-        )
-        .input_schema()["properties"]["action"]["enum"]
-            .as_array()
-            .expect("action enum")
-            .iter()
-            .any(|action| action == "release"),
-        "the remediation the refusal names must be a real action on this tool"
+        err.contains("bounded write tool") && err.contains("worktree isolation"),
+        "refusal must state concrete remediation without telling a writer to remove a live peer: {err}"
     );
     assert!(
         !tmp.path().join("src/a2.txt").exists(),
@@ -13129,7 +13417,7 @@ async fn foreground_registration_releases_when_the_child_future_returns_or_unwin
     let registry = Arc::new(ForegroundChildRegistry::new());
 
     let completed = registry
-        .register("agent_completed_registration", CancellationToken::new())
+        .register(CancellationToken::new())
         .expect("registry open");
     let result: Result<(), ()> = async move {
         let _registration = completed;
@@ -13139,7 +13427,7 @@ async fn foreground_registration_releases_when_the_child_future_returns_or_unwin
     assert!(result.is_err());
 
     let panicked = registry
-        .register("agent_panicked_registration", CancellationToken::new())
+        .register(CancellationToken::new())
         .expect("registry open");
     let task = tokio::spawn(async move {
         let _registration = panicked;
@@ -13175,13 +13463,6 @@ async fn turn_owned_descendants_join_and_park_with_the_same_foreground_registry(
         .expect("a turn-owned descendant must register with the root turn barrier");
     let grandchild_parking = grandchild_registration.parking_signal();
     assert_eq!(registry.active_count(), 2);
-    assert_eq!(
-        registry.active_agent_ids(),
-        vec![
-            "agent_owned_child".to_string(),
-            "agent_owned_grandchild".to_string()
-        ]
-    );
 
     let child_task = tokio::spawn(async move {
         child_token.cancelled().await;
@@ -15323,7 +15604,9 @@ fn summarize_subagent_result_budget_exhaustion_is_actionable_not_raw_done() {
     let empty = make_snapshot(SubAgentStatus::BudgetExhausted);
     let summary = summarize_subagent_result(&empty);
     assert!(
-        summary.contains("retry with a smaller scoped task"),
+        summary.starts_with("Child budget exhausted")
+            && summary.contains("inspect the checkpoint")
+            && summary.contains("split the work"),
         "{summary}"
     );
 }
@@ -15952,7 +16235,7 @@ fn format_step_counter_keeps_concrete_budgets() {
 #[test]
 fn child_step_override_wins_and_clamps_to_hard_ceiling() {
     assert_eq!(resolve_max_steps(FleetRole::Scout, None, None), 0);
-    assert_eq!(resolve_max_steps(FleetRole::Scout, Some(0), Some(90)), 0);
+    assert_eq!(resolve_max_steps(FleetRole::Scout, Some(0), Some(90)), 90);
     assert_eq!(resolve_max_steps(FleetRole::Builder, Some(7), None), 7);
     assert_eq!(
         resolve_max_steps(FleetRole::Worker, Some(u32::MAX), None),
@@ -15974,8 +16257,8 @@ fn child_wall_timeout_reason_is_typed_and_actionable() {
     let reason = child_wall_time_exhausted_reason(Duration::from_millis(1));
     assert!(reason.contains("wall-time budget exhausted"), "{reason}");
     assert!(reason.contains("limit: 0s"), "{reason}");
-    assert!(reason.contains("wall_time_secs"), "{reason}");
-    assert!(reason.contains("smaller independent tasks"), "{reason}");
+    assert!(reason.contains("operator"), "{reason}");
+    assert!(reason.contains("partial work is preserved"), "{reason}");
     assert!(!reason.contains("token_budget"), "{reason}");
 }
 
@@ -16190,7 +16473,7 @@ async fn queued_turn_owned_child_parks_without_a_false_start_transition() {
 
     let foreground_children = Arc::new(ForegroundChildRegistry::new());
     let registration = foreground_children
-        .register(&agent_id, runtime.cancel_token.clone())
+        .register(runtime.cancel_token.clone())
         .expect("turn-owned queued child registers before settlement");
     let gate = Arc::new(Semaphore::new(1));
     let held_launch_permit = Arc::clone(&gate)
@@ -16407,9 +16690,12 @@ async fn launch_gate_wait_counts_against_child_wall_timeout() {
     let snapshot = manager
         .get_result(&agent_id)
         .expect("timed-out child remains inspectable");
-    let SubAgentStatus::Failed(error) = &snapshot.status else {
-        panic!("wall timeout must be a typed child failure: {snapshot:?}");
-    };
+    assert_eq!(snapshot.status, SubAgentStatus::BudgetExhausted);
+    let error = &snapshot
+        .checkpoint
+        .as_ref()
+        .expect("wall-budget checkpoint")
+        .reason;
     assert!(
         error.contains("child wall-time budget exhausted"),
         "{error}"
@@ -16574,7 +16860,7 @@ async fn incomplete_then_complete_chat_client(
     (client, calls)
 }
 
-async fn run_incomplete_response_worker(
+pub(super) async fn run_incomplete_response_worker(
     workspace: &Path,
     stop_reason: &str,
     max_steps: u32,
@@ -16709,18 +16995,21 @@ async fn output_limit_cause_wins_over_generic_token_budget() {
         run_incomplete_response_worker(tmp.path(), "max_tokens", 4, Some(10)).await;
 
     assert_eq!(calls.load(Ordering::SeqCst), 1);
-    let SubAgentStatus::Failed(reason) = &result.status else {
-        panic!(
-            "expected exact output-limit failure, got {:?}",
-            result.status
-        );
-    };
+    assert_eq!(result.status, SubAgentStatus::BudgetExhausted);
+    let reason = &result
+        .checkpoint
+        .as_ref()
+        .expect("budget checkpoint")
+        .reason;
     assert!(reason.contains("output was truncated"), "{reason}");
     assert!(reason.contains("`max_tokens`"), "{reason}");
-    assert!(!reason.contains("token budget exhausted ("), "{reason}");
-    assert_eq!(
-        result.result.as_deref(),
-        Some("partial response diagnostics")
+    assert!(reason.contains("token budget exhausted"), "{reason}");
+    assert!(
+        result
+            .result
+            .as_deref()
+            .unwrap()
+            .contains("partial response diagnostics")
     );
     assert_eq!(total_tokens, Some(15), "usage must still be recorded");
     assert_partial_tool_was_not_executed(&mailbox);
@@ -16733,15 +17022,21 @@ async fn non_output_incomplete_cause_wins_over_generic_token_budget() {
         run_incomplete_response_worker(tmp.path(), "incomplete:content_filter", 4, Some(10)).await;
 
     assert_eq!(calls.load(Ordering::SeqCst), 1);
-    let SubAgentStatus::Failed(reason) = &result.status else {
-        panic!("expected exact incomplete failure, got {:?}", result.status);
-    };
+    assert_eq!(result.status, SubAgentStatus::BudgetExhausted);
+    let reason = &result
+        .checkpoint
+        .as_ref()
+        .expect("budget checkpoint")
+        .reason;
     assert!(reason.contains("response was incomplete"), "{reason}");
     assert!(reason.contains("`content_filter`"), "{reason}");
-    assert!(!reason.contains("token budget exhausted"), "{reason}");
-    assert_eq!(
-        result.result.as_deref(),
-        Some("partial response diagnostics")
+    assert!(reason.contains("token budget exhausted"), "{reason}");
+    assert!(
+        result
+            .result
+            .as_deref()
+            .unwrap()
+            .contains("partial response diagnostics")
     );
     assert_eq!(total_tokens, Some(15), "usage must still be recorded");
     assert_partial_tool_was_not_executed(&mailbox);
@@ -16851,14 +17146,15 @@ async fn worker_stops_with_typed_wall_time_reason() {
         .await
         .get_result(&agent_id)
         .expect("agent registered");
-    match result.status {
-        SubAgentStatus::Failed(reason) => {
-            assert!(reason.contains("wall-time budget exhausted"), "{reason}");
-            assert!(reason.contains("limit:"), "{reason}");
-            assert!(reason.contains("wall_time_secs"), "{reason}");
-        }
-        other => panic!("expected typed wall-time failure, got {other:?}"),
-    }
+    assert_eq!(result.status, SubAgentStatus::BudgetExhausted);
+    let reason = &result
+        .checkpoint
+        .as_ref()
+        .expect("wall-budget checkpoint")
+        .reason;
+    assert!(reason.contains("wall-time budget exhausted"), "{reason}");
+    assert!(reason.contains("limit:"), "{reason}");
+    assert!(reason.contains("operator"), "{reason}");
 }
 
 #[tokio::test]
@@ -17551,7 +17847,8 @@ fn subagent_tool_results_spill_to_disk_and_stay_bounded_inline() {
         // `apply_spillover_with_artifact`, so the bytes land in a session
         // artifact that `retrieve_tool_result` resolves — withholding the
         // handle only cost the model the turn it spent rediscovering it.
-        assert!(inline.len() <= 21 * 1024);
+        // Classic lane: 32 KiB head + 8 KiB tail + footer.
+        assert!(inline.len() <= 42 * 1024);
         assert!(!inline.contains(crate::tools::truncate::SPILLOVER_PREVIEW_HINT));
         assert!(inline.contains("of output omitted"));
         assert!(inline.contains("full output at"));
@@ -17587,7 +17884,7 @@ fn subagent_tool_results_spill_to_disk_and_stay_bounded_inline() {
             format!("Error: {raw}"),
         );
         assert!(spilled.is_some());
-        assert!(bounded_err.len() <= 21 * 1024);
+        assert!(bounded_err.len() <= 42 * 1024);
         assert!(bounded_err.contains("of output omitted"));
         assert!(bounded_err.contains(crate::tools::truncate::SPILLOVER_RECOVERY_HINT));
         assert!(!bounded_err.contains("Exact evidence retained"));
@@ -19778,8 +20075,9 @@ fn the_launched_authority_is_the_one_the_spawn_boundary_accepts() {
 /// superseded by these tests.
 /// Measured 80,856B on 2026-08-02 (commit body has the receipt); +10%.
 const READ_ONLY_CHILD_ENVELOPE_BYTE_CEILING: usize = 89_000;
-/// Measured 72,679B on 2026-08-02 (commit body has the receipt); +10%.
-const PARENT_SURFACE_BYTE_CEILING: usize = 80_000;
+/// Measured 84,804B on 2026-09-13 with the native Workflow plan schema.
+/// Keep the next increase visible instead of adding another broad margin.
+const PARENT_SURFACE_BYTE_CEILING: usize = 85_000;
 
 #[tokio::test]
 async fn read_only_child_envelope_stays_within_measured_ceiling() {
@@ -19885,13 +20183,15 @@ fn completed_claim_of_untouched_file_taints_verification() {
     let tmp = tempdir().expect("tempdir");
     init_claim_repo(tmp.path());
     let mut manager = SubAgentManager::new(tmp.path().to_path_buf(), 2);
-    manager.register_worker(make_worker_spec("agent_claims", tmp.path().to_path_buf()));
+    let mut spec = make_worker_spec("agent_claims", tmp.path().to_path_buf());
+    spec.runtime_profile.permissions.write = true;
+    manager.register_worker(spec);
 
     let mut snapshot = make_snapshot(SubAgentStatus::Completed);
     snapshot.agent_id = "agent_claims".to_string();
     snapshot.name = "agent_claims".to_string();
     snapshot.workspace = Some(tmp.path().to_path_buf());
-    snapshot.result = Some("Fixed the bug: updated src/lib.rs and verified the fix.".to_string());
+    snapshot.result = Some("CHANGES: src/lib.rs".to_string());
     manager.complete_worker_from_result("agent_claims", &snapshot);
 
     let record = manager
@@ -20245,7 +20545,7 @@ async fn spawn_receipt_route_survives_compaction_for_a_type_only_spawn() {
 }
 
 #[tokio::test]
-async fn unscoped_status_compacts_running_children_and_keeps_terminal_full() {
+async fn unscoped_status_compacts_every_state_even_with_verbose() {
     // Morning-report issue #4: one unscoped status poll returned 203KB
     // because every RUNNING child carried its full projection (launch
     // manifest, event ring, checkpoint payloads). Supervision needs the
@@ -20286,17 +20586,18 @@ async fn unscoped_status_compacts_running_children_and_keeps_terminal_full() {
     .expect("status projection should succeed");
     let payload: serde_json::Value =
         serde_json::from_str(&result.content).expect("status payload should be json");
-    let agent_row = payload["agents"]
-        .as_array()
-        .and_then(|agents| agents.first())
-        .expect("running agent row");
+    let rows = lifecycle_tests::status_rows(&payload);
+    let agent_row = rows.first().expect("running agent row");
     assert_eq!(agent_row["status"], "running", "{agent_row}");
-    assert_eq!(agent_row["compact"], true, "{agent_row}");
+    assert_eq!(payload["compact"], true, "{payload}");
     assert!(agent_row.get("snapshot").is_none(), "{agent_row}");
     assert!(agent_row.get("worker_record").is_none(), "{agent_row}");
-    assert!(agent_row["usage"].is_object(), "supervision keeps usage");
+    assert!(
+        agent_row["total_tokens"].is_null(),
+        "unknown usage stays unknown"
+    );
 
-    // verbose: true restores the full projection for the same running child.
+    // Unscoped verbose cannot restore every worker archive.
     let verbose = inspect_agent_from_input(
         &json!({"action": "status", "verbose": true}),
         manager,
@@ -20308,12 +20609,10 @@ async fn unscoped_status_compacts_running_children_and_keeps_terminal_full() {
     .expect("verbose status should succeed");
     let verbose_payload: serde_json::Value =
         serde_json::from_str(&verbose.content).expect("verbose payload json");
-    let verbose_row = verbose_payload["agents"]
-        .as_array()
-        .and_then(|agents| agents.first())
-        .expect("verbose agent row");
-    assert!(verbose_row.get("snapshot").is_some(), "{verbose_row}");
-    assert!(verbose_row.get("compact").is_none(), "{verbose_row}");
+    let rows = lifecycle_tests::status_rows(&verbose_payload);
+    let verbose_row = rows.first().expect("verbose agent row");
+    assert!(verbose_row.get("snapshot").is_none(), "{verbose_row}");
+    assert_eq!(verbose_payload["compact"], true, "{verbose_payload}");
 }
 
 #[test]
@@ -20727,6 +21026,191 @@ async fn parked_followup_reuses_successor_and_preserves_route_authority_and_line
 }
 
 #[tokio::test]
+async fn parked_followup_executes_on_the_saved_cross_provider_route() {
+    // #6046: a parked child pinned to a provider other than the session's
+    // active one must resume on that provider. The resume runtime derives
+    // from the caller (DeepSeek here), so without rebinding the saved pin the
+    // successor validates its saved model against the caller's provider and
+    // fails instantly with `ForeignModelForDirectProvider` — never reaching a
+    // model step. The fixture pins zai/glm-5 (different from the stub
+    // runtime's default deepseek) and points both provider tables at a local
+    // loopback endpoint, so the test can only pass if the resumed child's
+    // own model request goes out through the saved provider's client.
+    let tmp = tempdir().unwrap();
+    let manager = new_shared_subagent_manager(tmp.path().to_path_buf(), 4);
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let bodies: Arc<std::sync::Mutex<Vec<Value>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let app = Router::new().route(
+        "/{*path}",
+        post({
+            let calls = Arc::clone(&calls);
+            let bodies = Arc::clone(&bodies);
+            move |Json(body): Json<Value>| {
+                let calls = Arc::clone(&calls);
+                let bodies = Arc::clone(&bodies);
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    bodies
+                        .lock()
+                        .expect("request body recorder mutex poisoned")
+                        .push(body);
+                    Json(json!({
+                        "id": "chatcmpl-cross-provider-resume",
+                        "model": "glm-5",
+                        "choices": [{
+                            "index": 0,
+                            "message": {"role": "assistant", "content": "done"},
+                            "finish_reason": "stop"
+                        }],
+                        "usage": {
+                            "prompt_tokens": 1,
+                            "completion_tokens": 1,
+                            "total_tokens": 2
+                        }
+                    }))
+                }
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind loopback chat endpoint");
+    let addr = listener.local_addr().expect("loopback chat endpoint addr");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    // Session stays on direct deepseek (its default endpoint — the exact
+    // #6046 shape: a direct provider rejects foreign models). The pinned zai
+    // table carries the loopback endpoint so a zai-scoped client is fully
+    // hermetic. No code path can reach a real provider: the broken path fails
+    // at model resolution before any request, and the fixed path only ever
+    // builds the zai client.
+    let providers = crate::config::ProvidersConfig {
+        deepseek: crate::config::ProviderConfig {
+            api_key: Some("session-key".to_string()),
+            ..Default::default()
+        },
+        zai: crate::config::ProviderConfig {
+            api_key: Some("pinned-key".to_string()),
+            base_url: Some(format!("http://{addr}/v1")),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let config = crate::config::Config {
+        provider: Some("deepseek".to_string()),
+        providers: Some(providers),
+        ..Default::default()
+    };
+    let mut runtime = stub_runtime().with_api_config(config.clone());
+    runtime.client = DeepSeekClient::new(&config).expect("session client builds");
+    runtime.manager = Arc::clone(&manager);
+    assert_eq!(
+        runtime.client.api_provider(),
+        ApiProvider::Deepseek,
+        "precondition: the session is on a different provider than the pin"
+    );
+
+    let saved_route = ChildRouteReceipt {
+        requested_type: "explore".into(),
+        requested_profile: None,
+        resolved_profile_id: None,
+        profile_origin: None,
+        canonical_role: "explore".into(),
+        provider_id: "zai".into(),
+        model_id: "glm-5".into(),
+        route_source: "role.pin".into(),
+        requested_reasoning: "inherit".into(),
+        effective_reasoning: None,
+        runtime_version: "fixture".into(),
+        runtime_build_sha: "fixture".into(),
+    };
+    let agent_id = {
+        let mut guard = manager.write().await;
+        let id = guard.insert_test_running_agent("parked-cross-provider", tmp.path());
+        let agent = guard.agents.get_mut(&id).unwrap();
+        agent.agent_type = FleetRole::Scout;
+        agent.model = saved_route.model_id.clone();
+        agent.allowed_tools = Some(Vec::new());
+        let spec = &mut guard.worker_records.get_mut(&id).unwrap().spec;
+        spec.agent_type = FleetRole::Scout;
+        spec.model = saved_route.model_id.clone();
+        spec.runtime_profile = WorkerRuntimeProfile::for_role(FleetRole::Scout);
+        spec.child_route = Some(saved_route.clone());
+        park_child_at_turn_end(&mut guard, &id);
+        id
+    };
+
+    let tool = AgentTool::new(Arc::clone(&manager), runtime);
+    let context = ToolContext::new(tmp.path());
+    let result = tool
+        .execute(
+            json!({"action": "followup", "agent_id": agent_id, "message": "Continue."}),
+            &context,
+        )
+        .await
+        .expect("the emitted recovery action must execute");
+    let receipt: Value = serde_json::from_str(&result.content).unwrap();
+    assert_eq!(receipt["continued_from_checkpoint"], true);
+    let successor = receipt["agent_id"].as_str().unwrap().to_string();
+
+    // Assert the route the resumed child actually executes with: it must run
+    // a real model step on the saved provider and settle Completed. On the
+    // broken path (caller's provider kept) the successor fails fast with the
+    // foreign-model error and never issues a request.
+    let settled = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let snapshot = manager.read().await.get_result(&successor).unwrap();
+            if !matches!(snapshot.status, SubAgentStatus::Running) {
+                return snapshot;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("resumed child must settle within 10s");
+    assert_eq!(
+        settled.status,
+        SubAgentStatus::Completed,
+        "resumed child must execute on its saved zai route, got {:?} ({:?})",
+        settled.status,
+        settled.result.as_deref()
+    );
+
+    let (call_count, executed_snapshot) = {
+        let executed = bodies.lock().expect("request body recorder mutex poisoned");
+        (
+            calls.load(Ordering::SeqCst),
+            executed
+                .iter()
+                .filter_map(|body| body.get("model").and_then(Value::as_str))
+                .map(str::to_string)
+                .collect::<Vec<_>>(),
+        )
+    };
+    let executed_on_saved_provider = executed_snapshot
+        .iter()
+        .any(|model| model.to_ascii_lowercase().contains("glm"));
+    assert!(
+        executed_on_saved_provider && call_count >= 1,
+        "the resumed child must issue its model request through the saved provider's client; saw {call_count} call(s) with models {executed_snapshot:?}"
+    );
+
+    // The receipt half keeps working too.
+    let mut guard = manager.write().await;
+    let spec = &guard.worker_records.get(&successor).unwrap().spec;
+    assert_eq!(
+        spec.child_route
+            .as_ref()
+            .map(|route| route.provider_id.as_str()),
+        Some("zai")
+    );
+    let _ = guard.cancel_agent(&successor);
+}
+
+#[tokio::test]
 async fn resume_from_checkpoint_is_idempotent_across_repeated_followups() {
     let tmp = tempdir().unwrap();
     let manager = new_shared_subagent_manager(tmp.path().to_path_buf(), 4);
@@ -21028,6 +21512,7 @@ mod child_permission_gate {
     use super::*;
     use crate::approval_log::{ApprovalOutcome, ApprovalReceipt, ApprovalReceiptStore};
     use crate::core::events::{Event, ToolGate, ToolGateVerdict};
+    use codewhale_execpolicy::{ExecPolicyEngine, PermissionAction, Ruleset, ToolAskRule};
 
     /// A Worker registry with `bash` available, the given posture installed,
     /// and an event channel so gate receipts and prompts can be observed.
@@ -21215,6 +21700,213 @@ mod child_permission_gate {
             ..crate::config::Config::default()
         };
         DeepSeekClient::new(&config).expect("unreachable client")
+    }
+
+    fn typed_deny_rules(rules: Vec<ToolAskRule>) -> Ruleset {
+        Ruleset::user(vec![], vec![]).with_ask_rules(
+            rules
+                .into_iter()
+                .map(|mut rule| {
+                    rule.action = PermissionAction::Deny;
+                    rule
+                })
+                .collect(),
+        )
+    }
+
+    #[tokio::test]
+    async fn typed_shell_denies_hold_for_every_child_posture_and_alias() {
+        for mode in [
+            ApprovalMode::Bypass,
+            ApprovalMode::Suggest,
+            ApprovalMode::Auto,
+            ApprovalMode::Never,
+        ] {
+            let (mut registry, mut rx, _) = worker_registry(
+                mode,
+                mode == ApprovalMode::Bypass,
+                false,
+                Some(unreachable_client()),
+            );
+            Arc::make_mut(registry.gate_runtime.api_config.as_mut().unwrap()).exec_policy_engine =
+                ExecPolicyEngine::with_rulesets(vec![typed_deny_rules(vec![
+                    ToolAskRule::exec_shell("touch"),
+                ])]);
+            for name in ["bash", "Bash", "exec_shell"] {
+                let err = registry
+                    .execute(
+                        "agent_gate",
+                        name,
+                        json!({"action": "run", "command": "touch policy-sentinel"}),
+                    )
+                    .await
+                    .expect_err("typed deny must stop child execution before ordinary approval");
+                assert!(
+                    err.to_string().contains("explicitly denies"),
+                    "{mode:?} {name}: {err}"
+                );
+                assert!(
+                    !registry
+                        .gate_runtime
+                        .context
+                        .workspace
+                        .join("policy-sentinel")
+                        .exists()
+                );
+            }
+            assert!(
+                rx.try_recv().is_err(),
+                "a typed deny must not ask a human or guardian"
+            );
+            if mode == ApprovalMode::Bypass {
+                let output = registry
+                    .execute(
+                        "agent_gate",
+                        "bash",
+                        json!({"command": "echo allowed-control"}),
+                    )
+                    .await
+                    .expect("a nonmatching command still runs in Full Access");
+                assert!(output.contains("allowed-control"), "{output}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn typed_file_denies_stop_aliases_and_whole_patches_before_side_effects() {
+        for mode in [
+            ApprovalMode::Bypass,
+            ApprovalMode::Suggest,
+            ApprovalMode::Auto,
+            ApprovalMode::Never,
+        ] {
+            let (base, _rx, _) = worker_registry(
+                mode,
+                mode == ApprovalMode::Bypass,
+                false,
+                Some(unreachable_client()),
+            );
+            // Delegated file edits also have to honor operator denies.
+            let mut runtime = base.gate_runtime;
+            runtime.accept_edits = true;
+            runtime.agent_tool_surface_options.apply_patch_enabled = true;
+            Arc::make_mut(runtime.api_config.as_mut().unwrap()).exec_policy_engine =
+                ExecPolicyEngine::with_rulesets(vec![typed_deny_rules(
+                    ["read_file", "write_file", "edit_file", "apply_patch"]
+                        .into_iter()
+                        .map(|tool| ToolAskRule::file_path(tool, "protected.txt"))
+                        .collect(),
+                )]);
+            let registry = SubAgentToolRegistry::new(
+                runtime,
+                FleetRole::Worker,
+                None,
+                Arc::new(Mutex::new(TodoList::new())),
+                Arc::new(Mutex::new(PlanState::default())),
+            );
+            let workspace = &registry.gate_runtime.context.workspace;
+            std::fs::write(workspace.join("protected.txt"), "original").unwrap();
+            for (name, action) in [
+                ("read", "read"),
+                ("read_file", "read"),
+                ("File", "read"),
+                ("write", "write"),
+                ("write_file", "write"),
+                ("File", "write"),
+                ("edit", "edit"),
+                ("edit_file", "edit"),
+                ("File", "edit"),
+            ] {
+                let err = registry
+                    .execute(
+                        "agent_gate",
+                        name,
+                        json!({
+                            "action": action, "path": "protected.txt", "content": "changed",
+                            "old_string": "original", "new_string": "changed"
+                        }),
+                    )
+                    .await
+                    .expect_err("typed path deny applies to every file alias");
+                assert!(
+                    err.to_string().contains("explicitly denies"),
+                    "{mode:?} {name} {action}: {err}"
+                );
+                assert_eq!(
+                    std::fs::read_to_string(workspace.join("protected.txt")).unwrap(),
+                    "original"
+                );
+            }
+            for name in ["apply_patch", "File"] {
+                let err = registry.execute("agent_gate", name, json!({
+                    "action": "patch",
+                    "patch": "--- /dev/null\n+++ b/allowed.txt\n@@ -0,0 +1 @@\n+allowed\n--- a/protected.txt\n+++ b/protected.txt\n@@ -1 +1 @@\n-original\n+changed\n"
+                })).await.expect_err("one denied target blocks the entire patch");
+                assert!(
+                    err.to_string().contains("explicitly denies"),
+                    "{mode:?} {name}: {err}"
+                );
+                assert!(!workspace.join("allowed.txt").exists());
+                assert_eq!(
+                    std::fs::read_to_string(workspace.join("protected.txt")).unwrap(),
+                    "original"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn typed_denies_updated_after_spawn_reach_children_grandchildren_and_background() {
+        let (mut root, _rx, _) = worker_registry(
+            ApprovalMode::Bypass,
+            true,
+            false,
+            Some(unreachable_client()),
+        );
+        let mut parent_policy = ExecPolicyEngine::with_rulesets(vec![]);
+        Arc::make_mut(root.gate_runtime.api_config.as_mut().unwrap()).exec_policy_engine =
+            parent_policy.clone();
+        let child_runtime = root.gate_runtime.child_runtime();
+        let registries = [
+            child_runtime.child_runtime(),
+            root.gate_runtime.background_runtime(),
+            child_runtime,
+        ]
+        .map(|runtime| {
+            SubAgentToolRegistry::new(
+                runtime,
+                FleetRole::Worker,
+                None,
+                Arc::new(Mutex::new(TodoList::new())),
+                Arc::new(Mutex::new(PlanState::default())),
+            )
+        });
+        for registry in &registries {
+            let output = registry
+                .execute("agent_gate", "bash", json!({"command": "echo live-policy"}))
+                .await
+                .expect("the command starts allowed");
+            assert!(output.contains("live-policy"), "{output}");
+        }
+        parent_policy.set_ruleset(typed_deny_rules(vec![ToolAskRule::exec_shell(
+            "echo live-policy",
+        )]));
+        for registry in &registries {
+            let err = registry
+                .execute("agent_gate", "bash", json!({"command": "echo live-policy"}))
+                .await
+                .expect_err("already-created descendants observe the updated parent policy");
+            assert!(err.to_string().contains("explicitly denies"), "{err}");
+            let output = registry
+                .execute(
+                    "agent_gate",
+                    "bash",
+                    json!({"command": "echo still-allowed"}),
+                )
+                .await
+                .expect("updating one deny does not block a nonmatching command");
+            assert!(output.contains("still-allowed"), "{output}");
+        }
     }
 
     #[tokio::test]
@@ -21630,7 +22322,7 @@ mod child_permission_gate {
             .get_worker_record("agent_gate")
             .expect("guardian missing usage reaches the worker ledger")
             .clone();
-        assert_eq!(worker.usage.total_tokens, Some(0));
+        assert_eq!(worker.usage.total_tokens, None);
         assert_eq!(worker.usage.cost_microusd, None);
         assert_eq!(worker.usage_source_fingerprints.len(), 1);
 
@@ -22145,7 +22837,7 @@ fn agent_tool_description_names_only_schema_roles() {
         .into_iter()
         .collect();
     let texts = [
-        super::AGENT_TOOL_DESCRIPTION,
+        super::AGENT_TOOL_DESCRIPTION.as_str(),
         super::SUBAGENT_TYPE_DESCRIPTION,
     ];
     let mut seen = 0;

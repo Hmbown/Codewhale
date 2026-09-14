@@ -2,7 +2,7 @@
 name: skill-creator
 description: Create or improve codewhale skills. Use when the user wants a new skill, wants to update an existing skill, or needs guidance on when a skill should be a skill versus MCP, hooks, tools, or a plugin scaffold.
 metadata:
-  short-description: Create DeepSeek skills
+  short-description: Create Codewhale skills
 aliases-for: create-skill
 ---
 
@@ -13,7 +13,7 @@ runtime this repository actually ships.
 
 ## What A Skill Is
 
-A skill is a local folder with a `SKILL.md` file. DeepSeek reads the skill name
+A skill is a local folder with a `SKILL.md` file. Codewhale reads the skill name
 and description during discovery, then loads the body only when the user or task
 matches the skill.
 
@@ -28,12 +28,15 @@ Discovery paths, in precedence order:
 - `~/.agents/skills`
 - `~/.claude/skills`
 - `~/.codewhale/skills`
-- `~/.deepseek/skills` (legacy fallback)
 
 Use skills for model instructions, workflows, and lightweight conventions. Use
 MCP for live external APIs or durable tools. Use hooks for automatic local
-events. Use plugin folders only as packaging/scaffolding until a real plugin
-loader exists.
+events. To distribute a skill through a plugin bundle, give the bundle a
+`plugin.json` whose `net.codewhale` extension points `skills.path` at a
+directory holding `<name>/SKILL.md` folders; each skill then loads namespaced
+as `<plugin>:<skill>` after review, trust, and enablement. A bare `SKILL.md`
+directory is discoverable on the skills paths above but is not a plugin
+bundle and cannot be installed through `/plugin install`.
 
 ## Minimum Shape
 
@@ -59,7 +62,7 @@ plain single-line values. Use lower-case hyphen-case names.
 ## Writing Rules
 
 - Make the `description` action-oriented and trigger-specific. It is the main
-  signal DeepSeek sees before loading the body.
+  signal Codewhale sees before loading the body.
 - Keep the body operational. Include what to do, what to avoid, and how to
   verify the result.
 - Do not include general programming advice, marketing copy, or long background

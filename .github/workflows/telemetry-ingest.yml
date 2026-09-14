@@ -1,0 +1,57 @@
+name: Telemetry Ingest
+
+# The ingest Worker's guards are only worth anything if they run. Two of them
+# are welds to files outside this directory — `docs/TELEMETRY.md` (the published
+# schema) and `crates/telemetry/tests/golden/v1.json` (the client's pinned wire
+# form) — so this workflow triggers on changes to those as well. A doc edit that
+# the endpoint would reject fails here.
+#
+# There is deliberately NO deploy job. Publishing this Worker is the owner's
+# action, run by hand, and `telemetry_endpoint` stays unset until he has
+# deployed and verified. See telemetry-ingest/README.md.
+
+on:
+  push:
+    branches: [master, main]
+    paths:
+      - 'telemetry-ingest/**'
+      - 'docs/TELEMETRY.md'
+      - 'crates/telemetry/**'
+      - '.github/workflows/telemetry-ingest.yml'
+  pull_request:
+    branches: [master, main]
+    paths:
+      - 'telemetry-ingest/**'
+      - 'docs/TELEMETRY.md'
+      - 'crates/telemetry/**'
+      - '.github/workflows/telemetry-ingest.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Schema weld, IP guard, and types
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: telemetry-ingest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: 'npm'
+          cache-dependency-path: telemetry-ingest/package-lock.json
+      - name: Install dependencies
+        run: npm ci
+      - name: Run tests
+        run: npm test
+      - name: TypeScript type check
+        run: npm run typecheck
+      - name: Bundle check
+        # `--dry-run` builds the Worker and resolves its bindings without
+        # touching a Cloudflare account. It is the step that would have caught
+        # the entrypoint exporting a non-callable named export.
+        run: npm run check

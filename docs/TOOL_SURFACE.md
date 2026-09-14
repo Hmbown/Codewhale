@@ -118,8 +118,11 @@ Modes and permission postures are separate controls:
 - **Plan** keeps the stable primitive vocabulary but centrally refuses shell
   execution and file mutation.
 - **Work** is ordinary interactive execution.
-- **Operate** uses the same direct-tool authority as Work while preferring Fleet
-  workers for independent, parallel, isolated, background, or long-running work.
+- **Operate** uses the same direct-tool authority as Work. Small work stays
+  direct; multi-step delegation uses a compact Workflow plan with dependencies,
+  bounded scopes, and completion evidence. Fleet manages the same sub-agents
+  and roles. One bounded, independent task can use a direct agent; `followup`
+  reuses that agent for continued work.
 - **Ask**, **Auto-Review**, and **Full Access** control approval behavior within
   an action-capable mode. They never widen Plan into write or shell access.
 

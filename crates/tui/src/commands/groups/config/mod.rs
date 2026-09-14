@@ -25,6 +25,7 @@ impl CommandGroup for ConfigCommands {
             Box::new(FunctionCommand::new(&LOGIN_INFO, run_login)),
             Box::new(FunctionCommand::new(&AUTH_INFO, run_auth)),
             Box::new(FunctionCommand::new(&RAIL_INFO, run_rail)),
+            Box::new(FunctionCommand::new(&PET_INFO, run_pet)),
             Box::new(FunctionCommand::new(&SETTINGS_INFO, run_settings)),
             Box::new(FunctionCommand::new(&STATUS_INFO, run_status)),
             Box::new(FunctionCommand::new(&STATUSLINE_INFO, run_statusline)),
@@ -78,6 +79,12 @@ static RAIL_INFO: CommandInfo = CommandInfo {
     aliases: &["rail", "sidebar"],
     usage: "/workbar [bottom|top|left|right|off|tasks|agents|context|pinned] [--save]",
     description_id: MessageId::CmdSidebarDescription,
+};
+static PET_INFO: CommandInfo = CommandInfo {
+    name: "pet",
+    aliases: &[],
+    usage: "/pet [on|off|status|appearance|window|source|export|sound on|off]",
+    description_id: MessageId::CmdPetDescription,
 };
 static SETTINGS_INFO: CommandInfo = CommandInfo {
     name: "settings",
@@ -161,6 +168,9 @@ fn run_auth(app: &mut App, arg: Option<&str>) -> CommandResult {
 fn run_rail(app: &mut App, arg: Option<&str>) -> CommandResult {
     run_registered(app, "workbar", arg)
 }
+fn run_pet(app: &mut App, arg: Option<&str>) -> CommandResult {
+    run_registered(app, "pet", arg)
+}
 fn run_settings(app: &mut App, arg: Option<&str>) -> CommandResult {
     run_registered(app, "settings", arg)
 }
@@ -215,6 +225,7 @@ pub(in crate::commands) fn dispatch(
             _ => CommandResult::error("Usage: /auth xai-device|chatgpt|chatgpt-revoke"),
         },
         "workbar" | "rail" | "sidebar" => config::sidebar(app, arg),
+        "pet" => config::pet(app, arg),
         "settings" => config::settings_command(app, arg),
         "status" => status::status(app),
         "statusline" => config::status_line(app),

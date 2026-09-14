@@ -14,8 +14,8 @@ and leave a ledgered receipt or a safe escalation draft.
 ## Authority Boundary
 
 - Prefer typed fleet surfaces over shell spelunking: `codewhale fleet status`,
-  `inspect`, `logs`, `artifacts`, `interrupt`, `restart`, `stop`, and the
-  Runtime API endpoints.
+  `inspect`, `logs`, `artifacts`, `interrupt`, `restart`, `resume`, `stop`
+  (stop requires `--all`), and the Runtime API endpoints.
 - Do not read `.codewhale/fleet.jsonl`, host logs, or remote files directly
   unless the typed command or API is missing required evidence.
 - Do not send Slack, webhook, PagerDuty, email, or chat messages unless the
@@ -27,11 +27,13 @@ and leave a ledgered receipt or a safe escalation draft.
 
 1. Identify the run and worker from the user request, run receipt, or fleet
    status output. If no worker is named, start with `codewhale fleet status`.
-2. Inspect the worker with `codewhale fleet inspect <worker-id>` or the matching
-   Runtime API worker endpoint.
+2. Inspect the worker with `codewhale fleet inspect <worker-id>` or the
+   matching Runtime API worker endpoint (`GET /v1/fleet/workers/{worker_id}`).
 3. Review bounded evidence with `codewhale fleet logs <worker-id>` and
-   `codewhale fleet artifacts <worker-id>`. Summarize artifact refs, not full
-   payloads.
+   `codewhale fleet artifacts <worker-id>`, or the Runtime API equivalents
+   (`GET /v1/fleet/runs/{run_id}/receipts/{task_id}/evidence` and
+   `GET /v1/fleet/runs/{run_id}/events/replay`). Summarize artifact refs,
+   not full payloads.
 4. Classify the state before acting:
    - `transient failure`: transport error, timeout, stale heartbeat, host
      unavailable, or retryable provider/network failure.
@@ -43,6 +45,8 @@ and leave a ledgered receipt or a safe escalation draft.
      action, repeated restart exhaustion, ambiguous product decision, or
      conflict between artifacts and verifier.
 5. Choose one typed action:
+   - run has orphaned leases after a manager restart:
+     `codewhale fleet resume <run-id>` (idempotent reconcile).
    - transient and retry budget remains: `codewhale fleet restart <worker-id>`.
    - transient but unsafe to retry: draft escalation and mark needs-human.
    - task failure: preserve artifacts, summarize the failure, and avoid restart
@@ -99,7 +103,7 @@ Fleet receipt
 Run: <run-id>
 Workers checked: <count/list>
 Classification: <state>
-Action: <restart/interrupt/stop/escalation draft/no-op>
+Action: <restart/interrupt/stop/resume/escalation draft/no-op>
 Ledger expectation: <typed action should be recorded | draft only, no send>
 Artifacts reviewed: <refs>
 Follow-up owner: <manager | task owner | human>

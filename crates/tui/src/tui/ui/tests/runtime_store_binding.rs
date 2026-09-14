@@ -372,3 +372,183 @@ fn runtime_store_binding_rejects_foreign_missing_or_overridden_store() -> anyhow
     );
     Ok(())
 }
+
+#[test]
+fn missing_runtime_store_recovers_without_reusing_authority_or_resurrecting_stale_binding()
+-> anyhow::Result<()> {
+    let _environment = crate::test_support::lock_test_env();
+    let root = tempfile::tempdir()?;
+    let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", root.path());
+    let _runtime = crate::test_support::EnvVarGuard::remove("CODEWHALE_RUNTIME_DIR");
+    let _legacy = crate::test_support::EnvVarGuard::remove("DEEPSEEK_RUNTIME_DIR");
+    let sessions = SessionManager::default_location()?;
+    let mut saved = crate::session_manager::create_saved_session_with_id_and_mode(
+        "interrupted".into(),
+        &[text_message("user", "retain my work")],
+        "deepseek-v4-pro",
+        root.path(),
+        0,
+        None,
+        None,
+    );
+    let missing = crate::runtime_threads::RuntimeStoreBinding {
+        data_dir: root.path().join("sessions/previous/runtime"),
+        execution_scope: "0".repeat(64),
+    };
+    saved.metadata.runtime_store = Some(missing.clone());
+    sessions.save_session(&saved)?;
+    let stale = saved.clone();
+    let manager = RuntimeThreadManager::open_for_session(
+        fixture_config(),
+        root.path().into(),
+        RuntimeThreadManagerConfig::for_session(root.path().join("tasks"), "interrupted"),
+        Arc::new(crate::plugins::PluginRegistry::empty(root.path())),
+        Some(&missing),
+    )?;
+    let recovered = manager.session_store_binding();
+    assert_ne!(recovered.execution_scope, missing.execution_scope);
+    assert_ne!(recovered.data_dir, missing.data_dir);
+    assert!(!missing.data_dir.exists());
+    assert!(
+        RuntimeThreadManager::open_for_session(
+            fixture_config(),
+            root.path().into(),
+            RuntimeThreadManagerConfig::for_session(root.path().join("tasks"), "interrupted"),
+            Arc::new(crate::plugins::PluginRegistry::empty(root.path())),
+            Some(&missing),
+        )
+        .is_err(),
+        "concurrent recovery cannot mint a second owner"
+    );
+    // Losing the process before the repaired binding is saved must leave a
+    // retryable, session-scoped store, not an orphan or a second authority.
+    drop(manager);
+    let manager = RuntimeThreadManager::open_for_session(
+        fixture_config(),
+        root.path().into(),
+        RuntimeThreadManagerConfig::for_session(root.path().join("tasks"), "interrupted"),
+        Arc::new(crate::plugins::PluginRegistry::empty(root.path())),
+        Some(&missing),
+    )?;
+    assert_eq!(manager.session_store_binding(), recovered);
+    let other_recovery = RuntimeThreadManager::open_for_session(
+        fixture_config(),
+        root.path().into(),
+        RuntimeThreadManagerConfig::for_session(root.path().join("tasks"), "other-interrupted"),
+        Arc::new(crate::plugins::PluginRegistry::empty(root.path())),
+        Some(&missing),
+    )?;
+    assert_ne!(
+        other_recovery.session_store_binding().data_dir,
+        recovered.data_dir
+    );
+    assert_ne!(
+        other_recovery.session_store_binding().execution_scope,
+        recovered.execution_scope
+    );
+    saved.metadata.runtime_store = Some(recovered.clone());
+    sessions.save_session(&saved)?;
+    sessions.save_session(&stale)?;
+    sessions.save_checkpoint(&stale)?;
+    let durable = sessions.load_session("interrupted")?;
+    assert_eq!(durable.metadata.runtime_store, Some(recovered.clone()));
+    assert_eq!(durable.messages, stale.messages);
+    let competing = RuntimeThreadManager::open_for_session(
+        fixture_config(),
+        root.path().into(),
+        RuntimeThreadManagerConfig::for_session(root.path().join("tasks"), "competing"),
+        Arc::new(crate::plugins::PluginRegistry::empty(root.path())),
+        None,
+    )?;
+    let mut competing_snapshot = stale.clone();
+    competing_snapshot.metadata.runtime_store = Some(competing.session_store_binding());
+    assert!(sessions.save_session(&competing_snapshot).is_err());
+    assert!(sessions.save_checkpoint(&competing_snapshot).is_err());
+    assert_eq!(
+        sessions.load_session("interrupted")?.metadata.runtime_store,
+        Some(recovered),
+        "another valid owner cannot overwrite the completed recovery"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn picker_recovers_missing_store_into_the_idle_host_and_persists_before_returning()
+-> anyhow::Result<()> {
+    let _environment = crate::test_support::lock_test_env();
+    let root = tempfile::tempdir()?;
+    let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", root.path());
+    let _runtime = crate::test_support::EnvVarGuard::remove("CODEWHALE_RUNTIME_DIR");
+    let _legacy = crate::test_support::EnvVarGuard::remove("DEEPSEEK_RUNTIME_DIR");
+    let sessions = SessionManager::default_location()?;
+    let mut config = fixture_config();
+    let mut saved = crate::session_manager::create_saved_session_with_id_and_mode(
+        "picker-interrupted".into(),
+        &[text_message("user", "retain my work")],
+        "deepseek-v4-pro",
+        root.path(),
+        0,
+        None,
+        None,
+    );
+    saved.metadata.runtime_store = Some(crate::runtime_threads::RuntimeStoreBinding {
+        data_dir: root.path().join("sessions/previous/runtime"),
+        execution_scope: "0".repeat(64),
+    });
+    sessions.save_session(&saved)?;
+    let mut app = Box::new(create_test_app());
+    let tasks = TaskManager::start(
+        TaskManagerConfig::from_runtime(&config, root.path().into(), None, Some(1)),
+        config.clone(),
+        app.plugin_registry.clone(),
+        "picker-current",
+        None,
+    )
+    .await?;
+    let binding = tasks.session_store_binding().expect("current host");
+    app.runtime_services.task_manager = Some(tasks.clone());
+    app.current_session_id = Some("picker-current".into());
+    app.api_messages
+        .push(text_message("user", "current conversation"));
+    let current_messages = app.api_messages.clone();
+    let plan_state = app.plan_state.clone();
+    let held = plan_state
+        .try_lock()
+        .expect("hold Work state during recovery");
+    assert!(apply_loaded_session_with_goal(&mut app, &mut config, &saved, None).is_err());
+    assert_eq!(app.current_session_id.as_deref(), Some("picker-current"));
+    assert_eq!(app.api_messages, current_messages);
+    assert_eq!(
+        sessions
+            .load_session("picker-interrupted")?
+            .metadata
+            .runtime_store
+            .as_ref(),
+        Some(&binding),
+        "binding repair survives a contended UI restore"
+    );
+    drop(held);
+    apply_loaded_session_with_goal(&mut app, &mut config, &saved, None)
+        .map_err(anyhow::Error::msg)?;
+    assert_eq!(
+        app.current_session_id.as_deref(),
+        Some("picker-interrupted")
+    );
+    let durable = sessions.load_session("picker-interrupted")?;
+    assert_eq!(durable.metadata.runtime_store.as_ref(), Some(&binding));
+    assert_eq!(durable.messages, saved.messages);
+    assert_eq!(
+        app.current_session_metadata.as_ref().unwrap().runtime_store,
+        Some(binding)
+    );
+    sessions.save_session(&saved)?;
+    assert_eq!(
+        sessions
+            .load_session("picker-interrupted")?
+            .metadata
+            .runtime_store,
+        durable.metadata.runtime_store
+    );
+    tasks.shutdown_and_wait().await?;
+    Ok(())
+}

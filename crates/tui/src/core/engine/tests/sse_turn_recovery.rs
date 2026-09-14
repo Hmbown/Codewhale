@@ -213,9 +213,7 @@ fn terminal_diagnostics(events: &[Event]) -> &crate::tool_inspection::TurnStopDi
 fn retry_status_count(events: &[Event]) -> usize {
     events
         .iter()
-        .filter(|event| {
-            matches!(event, Event::Status { message } if message.starts_with("Connection interrupted;"))
-        })
+        .filter(|event| matches!(event, Event::Status { message } if message == "Reconnecting…"))
         .count()
 }
 
@@ -297,8 +295,8 @@ async fn verify_next_user_turn_after_loss(failure: Failure) {
     assert_eq!(first_terminal.transparent_stream_retries, 0);
     assert_eq!(
         retry_status_count(&first),
-        usize::try_from(expected_resumes).unwrap(),
-        "repeated retry status events describe existing resumes; they must not inflate parent requests"
+        usize::from(expected_resumes >= 2),
+        "multiple retries share one progress notice; diagnostics still count every resume"
     );
     assert!(
         !first

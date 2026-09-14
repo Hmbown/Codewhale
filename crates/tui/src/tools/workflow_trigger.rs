@@ -7,8 +7,8 @@
 //! `workflow` / `plan`.
 //!
 //! This remains Act/Agent guidance rather than a prose classifier at the host
-//! boundary. Operate sends ordinary work to direct background workers and
-//! reaches for Workflow only when its stronger orchestration properties help.
+//! boundary. Operate keeps small tasks in the parent and uses the existing
+//! Workflow plan for multi-step delegation through the same sub-agents.
 
 /// Signals the parent can supply without full conversation replay.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -72,8 +72,8 @@ impl WorkflowTriggerDecision {
 ///
 /// Suppression wins over trigger when both could apply (noisy auto-orchestration
 /// is worse than missing a fan-out). Act/Agent soft-auto guidance should stay
-/// aligned with these rules. Operate dispatches direct workers unless stronger
-/// Workflow properties are explicitly useful.
+/// aligned with these rules. Operate uses a direct worker for one bounded
+/// independent task and a Workflow plan for multi-step delegation.
 #[must_use]
 pub fn evaluate_workflow_trigger(
     user_text: &str,

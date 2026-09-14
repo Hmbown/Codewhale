@@ -255,13 +255,23 @@ fn trust_requires_content_and_capability_bound_review_token() {
     );
     assert!(!app.plugin_registry.get("demo").unwrap().trusted());
 
-    let review = plugins_with_kimi_home_override(&mut app, Some("trust demo"), None)
-        .message
-        .unwrap();
+    let review_result = plugins_with_kimi_home_override(&mut app, Some("trust demo"), None);
+    let Some(AppAction::OpenCommandReview {
+        content, command, ..
+    }) = review_result.action
+    else {
+        panic!("trust opens a confirmation control");
+    };
+    assert!(
+        !content.contains("/plugin trust demo "),
+        "the hash belongs to the control"
+    );
+    let review = review_result.message.unwrap();
     let confirmation = review
         .lines()
         .find(|line| line.starts_with("/plugin trust demo "))
         .unwrap();
+    assert_eq!(confirmation, command);
     let token = confirmation
         .split_whitespace()
         .last()

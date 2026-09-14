@@ -54,28 +54,34 @@ const SHELL_NAMES: &[&str] = &[
 
 /// Returns every command line the shell would execute for `command`.
 ///
-/// The raw input is always included first, so callers keep whatever matching
-/// they already did against it. Subsequent entries are the word-split, quote-
-/// stripped command lines drawn from top-level chaining, command substitutions,
-/// process substitutions, grouping, and wrapper payloads. Results are
-/// de-duplicated and order-stable.
+/// Results contain word-split commands, substitutions and wrapper payloads.
+/// Literal data, including quoted heredoc bodies, is not treated as code.
+/// Windows scans retain native path separators as well as POSIX candidates.
 pub fn expanded_commands(command: &str) -> Vec<String> {
+    expanded_commands_for_platform(command, cfg!(windows))
+}
+
+fn expanded_commands_for_platform(command: &str, windows: bool) -> Vec<String> {
     let mut expander = Expander {
         out: Vec::new(),
         seen: HashSet::new(),
+        literal_backslashes: windows,
     };
-    let trimmed = command.trim();
-    if !trimmed.is_empty() {
-        expander.seen.insert(trimmed.to_string());
-        expander.out.push(trimmed.to_string());
-    }
+    // Native Windows shells preserve path separators. Also retain the POSIX
+    // interpretation for Bash/WSL commands. Both passes use the same bounded,
+    // heredoc-aware parser and only contribute deny targets, never grants.
     expander.expand(command, 0);
+    if windows {
+        expander.literal_backslashes = false;
+        expander.expand(command, 0);
+    }
     expander.out
 }
 
 struct Expander {
     out: Vec<String>,
     seen: HashSet<String>,
+    literal_backslashes: bool,
 }
 
 impl Expander {
@@ -103,6 +109,14 @@ impl Expander {
         if depth > MAX_DEPTH || self.out.len() >= MAX_COMMANDS {
             return;
         }
+        // shlex does not implement ANSI-C/localized quoting or shell CR
+        // semantics. Keep the conservative scan for those forms rather than
+        // let an unrecognized heredoc delimiter hide following commands.
+        if input.contains('\r') || input.contains("$'") || input.contains("$\"") {
+            for segment in super::command_segments(input) {
+                self.emit(&[segment]);
+            }
+        }
         let chars: Vec<char> = input.chars().collect();
         let n = chars.len();
         let mut i = 0usize;
@@ -113,13 +127,24 @@ impl Expander {
         let mut quoted = false;
         let mut redirect_operand = false;
         let mut nested: Vec<String> = Vec::new();
+        let mut heredocs = Vec::new();
 
         while i < n {
             let c = chars[i];
             match c {
+                '#' if !started && word.is_empty() => {
+                    while i < n && chars[i] != '\n' {
+                        i += 1;
+                    }
+                }
                 // A backslash outside quotes escapes exactly one character,
                 // including an operator: `echo a\;b` is one word, not two
                 // commands. A backslash-newline is a line continuation.
+                '\\' if self.literal_backslashes => {
+                    word.push('\\');
+                    started = true;
+                    i += 1;
+                }
                 '\\' => {
                     if i + 1 < n {
                         if chars[i + 1] != '\n' {
@@ -150,6 +175,10 @@ impl Expander {
                     i += 1;
                     while i < n && chars[i] != '"' {
                         match chars[i] {
+                            '\\' if self.literal_backslashes => {
+                                word.push('\\');
+                                i += 1;
+                            }
                             '\\' if i + 1 < n => {
                                 word.push(chars[i + 1]);
                                 i += 2;
@@ -223,6 +252,58 @@ impl Expander {
                     nested.push(inner);
                     i = next;
                 }
+                '<' if chars.get(i + 1) == Some(&'<') && chars.get(i + 2) != Some(&'<') => {
+                    if !quoted && is_redirect_descriptor(&word) {
+                        word.clear();
+                        started = false;
+                    }
+                    flush_word(
+                        &mut words,
+                        &mut word,
+                        &mut started,
+                        &mut quoted,
+                        &mut redirect_operand,
+                    );
+                    i += 2;
+                    let strip_tabs = chars.get(i) == Some(&'-');
+                    if strip_tabs {
+                        i += 1;
+                    }
+                    while i < n && matches!(chars[i], ' ' | '\t') {
+                        i += 1;
+                    }
+                    let start = i;
+                    let mut quote = None;
+                    let mut literal = false;
+                    while i < n {
+                        let ch = chars[i];
+                        if quote.is_none()
+                            && matches!(ch, ' ' | '\t' | '\n' | ';' | '|' | '&' | '<' | '>')
+                        {
+                            break;
+                        }
+                        if ch == '\\' && quote != Some('\'') {
+                            literal = true;
+                            i = (i + 2).min(n);
+                            continue;
+                        }
+                        if matches!(ch, '\'' | '"') {
+                            literal = true;
+                            if quote == Some(ch) {
+                                quote = None;
+                            } else if quote.is_none() {
+                                quote = Some(ch);
+                            }
+                        }
+                        i += 1;
+                    }
+                    let raw: String = chars[start..i].iter().collect();
+                    if let Some(delimiter) = shlex::split(&raw)
+                        .and_then(|mut words| (words.len() == 1).then(|| words.remove(0)))
+                    {
+                        heredocs.push((delimiter, literal, strip_tabs));
+                    }
+                }
                 // Unquoted redirections are syntax, even without whitespace.
                 // Keep the command words on both sides together, but omit the
                 // descriptor and next operand. Parse that operand normally so
@@ -280,8 +361,60 @@ impl Expander {
                     end_command(&mut commands, &mut words);
                     redirect_operand = false;
                     i += 1;
-                    while i < n && matches!(chars[i], '\n' | '\r' | ';' | '&' | '|') {
-                        i += 1;
+                    if c == '\n' && !heredocs.is_empty() {
+                        let shell_stdin = commands.iter().any(|tokens| {
+                            find_wrapper_head(tokens).is_some_and(|head| {
+                                let name = basename(&tokens[head]).to_ascii_lowercase();
+                                SHELL_NAMES.contains(&name.as_str())
+                                    || matches!(name.as_str(), "source" | ".")
+                            })
+                        });
+                        for (delimiter, literal, strip_tabs) in heredocs.drain(..) {
+                            let mut body = String::new();
+                            while i < n {
+                                let start = i;
+                                while i < n && chars[i] != '\n' {
+                                    i += 1;
+                                }
+                                let mut line: String = chars[start..i].iter().collect();
+                                if i < n {
+                                    i += 1;
+                                }
+                                // An unquoted heredoc joins escaped newlines
+                                // before checking its delimiter (E\ + OF can
+                                // terminate EOF). Do not swallow later code.
+                                while !literal
+                                    && line.chars().rev().take_while(|c| *c == '\\').count() % 2
+                                        == 1
+                                    && i < n
+                                {
+                                    line.pop();
+                                    let start = i;
+                                    while i < n && chars[i] != '\n' {
+                                        i += 1;
+                                    }
+                                    line.extend(chars[start..i].iter());
+                                    if i < n {
+                                        i += 1;
+                                    }
+                                }
+                                let line = if strip_tabs {
+                                    line.trim_start_matches('\t')
+                                } else {
+                                    &line
+                                };
+                                if line == delimiter {
+                                    break;
+                                }
+                                body.push_str(line);
+                                body.push('\n');
+                            }
+                            if shell_stdin {
+                                nested.push(body);
+                            } else if !literal {
+                                nested.extend(heredoc_substitutions(&body));
+                            }
+                        }
                     }
                 }
                 _ => {
@@ -334,6 +467,35 @@ impl Expander {
             }
         }
     }
+}
+
+/// Unquoted heredocs expand substitutions, but quotes and ordinary lines are data.
+fn heredoc_substitutions(body: &str) -> Vec<String> {
+    let chars: Vec<char> = body.chars().collect();
+    let mut result = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        match chars[i] {
+            '\\' if chars
+                .get(i + 1)
+                .is_some_and(|c| matches!(c, '$' | '`' | '\\' | '\n')) =>
+            {
+                i += 2
+            }
+            '`' => {
+                let (inner, next) = read_backtick(&chars, i);
+                result.push(inner);
+                i = next;
+            }
+            '$' if chars.get(i + 1) == Some(&'(') => {
+                let (inner, next) = read_delimited(&chars, i + 1, '(', ')');
+                result.push(inner);
+                i = next;
+            }
+            _ => i += 1,
+        }
+    }
+    result
 }
 
 fn flush_word(
@@ -566,7 +728,46 @@ mod tests {
     use super::*;
 
     fn expand(command: &str) -> Vec<String> {
-        expanded_commands(command)
+        // Exercise the POSIX grammar consistently on every test host.
+        expanded_commands_for_platform(command, false)
+    }
+
+    #[test]
+    fn windows_scan_retains_native_paths_and_posix_deny_candidates() {
+        for (command, expected) in [
+            (
+                r"C:\Windows\System32\cat.exe ~/.ssh/id_rsa",
+                r"C:\Windows\System32\cat.exe ~/.ssh/id_rsa",
+            ),
+            (r"del /f c:\users\x\file", r"del /f c:\users\x\file"),
+            (
+                r"echo safe & xcopy /e /y c:\src d:\dst",
+                r"xcopy /e /y c:\src d:\dst",
+            ),
+            (
+                r#""C:\Program Files\cat.exe" "c:\path with spaces\file""#,
+                r"C:\Program Files\cat.exe c:\path with spaces\file",
+            ),
+            (r"del relative\file", r"del relative\file"),
+            (
+                r"\\server\share\cat.exe file",
+                r"\\server\share\cat.exe file",
+            ),
+            (r"bash -c 'rm -rf \/'", "rm -rf /"),
+        ] {
+            let targets = expanded_commands_for_platform(command, true);
+            assert!(
+                targets.iter().any(|target| target == expected),
+                "missing {expected:?} from {targets:?}"
+            );
+            assert!(targets.len() <= MAX_COMMANDS);
+        }
+        let targets =
+            expanded_commands_for_platform("cat <<'EOF'\ndel c:\\users\\x\\file\nEOF", true);
+        assert!(
+            !targets.iter().any(|target| target.starts_with("del ")),
+            "literal heredoc data must stay inert: {targets:?}"
+        );
     }
 
     fn contains(command: &str, expected: &str) -> bool {
@@ -613,7 +814,7 @@ mod tests {
     #[test]
     fn escaped_operators_do_not_split() {
         let targets = expand("echo a\\;b");
-        assert_eq!(targets.len(), 2, "{targets:?}");
+        assert_eq!(targets, vec!["echo a;b".to_string()]);
         assert!(targets.contains(&"echo a;b".to_string()), "{targets:?}");
     }
 

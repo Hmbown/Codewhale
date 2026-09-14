@@ -428,13 +428,17 @@ fn review_bundle(
         }
     };
     let mut output = render::render_bundle_detail(presentation, &detail, true);
-    let _ = writeln!(
+    let content = output.clone();
+    let command = format!("/plugin trust {} {}", detail.name, review_token(&detail));
+    let _ = writeln!(output, "\n{command}");
+    CommandResult::with_message_and_action(
         output,
-        "\n/plugin trust {} {}",
-        detail.name,
-        review_token(&detail)
-    );
-    CommandResult::message(output)
+        AppAction::OpenCommandReview {
+            title: escape_review_text(&detail.name),
+            content,
+            command,
+        },
+    )
 }
 
 pub(crate) fn review_token(detail: &PluginDetail) -> String {

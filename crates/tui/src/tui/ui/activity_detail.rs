@@ -10,10 +10,10 @@
 use crate::snapshot::SnapshotRepo;
 use crate::tui::app::App;
 use crate::tui::footer_ui::one_line_summary;
-use crate::tui::history::{HistoryCell, ToolCell, ToolStatus, TranscriptRenderOptions};
+use crate::tui::history::{HistoryCell, ToolCell, ToolStatus};
 use crate::tui::pager::{PagerPage, PagerView};
 use crate::tui::ui_text::{
-    history_cell_to_clipboard_text, history_cell_to_text, line_to_plain, truncate_line_to_width,
+    history_cell_to_clipboard_text, history_cell_to_text, truncate_line_to_width,
 };
 use codewhale_localization::{MessageId, tr};
 
@@ -505,40 +505,6 @@ pub(super) fn copy_focused_cell(app: &mut App) -> bool {
         return false;
     };
     copy_cell_to_clipboard(app, index)
-}
-
-/// Copy the focused cell with the transcript's role/metadata presentation.
-/// Unlike content copy, this retains the metadata prefixes used by the
-/// transcript surface and is useful for sharing a receipt or event record.
-pub(super) fn copy_focused_cell_metadata(app: &mut App) -> bool {
-    let Some(index) = detail_target_cell_index(app) else {
-        return false;
-    };
-    let Some(cell) = app.cell_at_virtual_index(index) else {
-        return false;
-    };
-    let width = app
-        .viewport
-        .last_transcript_area
-        .map(|area| area.width)
-        .unwrap_or(80);
-    let text = cell
-        .lines_with_copy_metadata(width, TranscriptRenderOptions::default())
-        .into_iter()
-        .map(|line| line_to_plain(&line.line))
-        .collect::<Vec<_>>()
-        .join("\n");
-    if text.trim().is_empty() {
-        app.status_message = Some("Message is empty".to_string());
-        return false;
-    }
-    if app.clipboard.write_text(&text).is_ok() {
-        app.status_message = Some("Message metadata copied".to_string());
-        true
-    } else {
-        app.status_message = Some("Copy failed".to_string());
-        false
-    }
 }
 
 pub(crate) fn copy_cell_to_clipboard(app: &mut App, cell_index: usize) -> bool {
@@ -1969,7 +1935,7 @@ mod tests {
     }
 
     #[test]
-    fn focused_pager_and_metadata_copy_use_the_same_cell_target() {
+    fn focused_pager_and_copy_use_the_same_cell_target() {
         let mut app = test_app();
         app.history = vec![HistoryCell::Assistant {
             content: "focused markdown **answer**".to_string(),
@@ -1989,10 +1955,10 @@ mod tests {
             Some(crate::tui::views::ModalKind::Pager)
         );
         app.view_stack.pop();
-        assert!(copy_focused_cell_metadata(&mut app));
+        assert!(copy_focused_cell(&mut app));
         assert_eq!(
             app.clipboard.last_written_text(),
-            Some("● focused markdown answer")
+            Some("focused markdown **answer**")
         );
     }
 

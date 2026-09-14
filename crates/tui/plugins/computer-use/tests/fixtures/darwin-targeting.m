@@ -5,6 +5,7 @@
 @property pid_t processIdentifier;
 @property NSString *localizedName;
 @property NSString *bundleIdentifier;
+@property(getter=isTerminated) BOOL terminated;
 @end
 @implementation CUFixtureApplication
 @end
@@ -24,6 +25,14 @@
 - (NSRunningApplication *)frontmostApplication { return (NSRunningApplication *)self.runningApplications[0]; }
 @end
 #define NSWorkspace CUFixtureWorkspace
+#import <ApplicationServices/ApplicationServices.h>
+static int fixturePosts=0, fixtureActivations=0;
+static void fixturePost(CGEventTapLocation location, CGEventRef event) { fixturePosts++; }
+static AXError fixtureSet(AXUIElementRef element, CFStringRef name, CFTypeRef value) { fixtureActivations++; return kAXErrorSuccess; }
+#define CGEventPost fixturePost
+#define AXUIElementSetAttributeValue fixtureSet
+#define AXIsProcessTrusted() true
+#define CU_TEST 1
 #define main unusedNativeMain
 #include "../../src/backends/darwin-accessibility.m"
 #undef main
@@ -32,6 +41,14 @@
 int main(int argc, const char *argv[]) { @autoreleasepool {
   if(argc!=2) return 2;
   NSDictionary *request=[NSJSONSerialization JSONObjectWithData:[[NSString stringWithUTF8String:argv[1]] dataUsingEncoding:NSUTF8StringEncoding] options:0 error:nil];
+  if([request[@"tool"] isEqual:@"inspect_pointer_guard"]) {
+    cuTestLockDir=request[@"args"][@"lock_dir"];
+    NSString *refusal=nil;
+    @try { execute(@{@"tool":@"pointer_sequence",@"args":@{@"foreground_input":@YES,@"input_app_ref":@{@"pid":@123},@"steps":@[@{@"type":@1,@"x":@10,@"y":@10,@"button":@0}]}}); }
+    @catch(NSException *error) { refusal=error.reason; }
+    cuPrint(@{@"refusal":refusal?:NSNull.null,@"posts":@(fixturePosts),@"activations":@(fixtureActivations)});
+    return 0;
+  }
   if(![@[@"list_windows",@"get_app_state",@"resolve_element",@"window_info"] containsObject:request[@"tool"]]) return 2;
   NSRunningApplication *app=resolve(request[@"args"][@"app_ref"]);
   if(!app) { fputs("application not found\n",stderr); return 1; }

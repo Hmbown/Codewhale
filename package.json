@@ -1,6 +1,10 @@
 {
   "name": "codewhale",
   "private": true,
+  "scripts": {
+    "test": "npm test --workspaces --if-present && npm --prefix web test",
+    "check:web": "npm --prefix web run check"
+  },
   "workspaces": [
     "npm/codewhale",
     "npm/deepseek-tui",
@@ -11,7 +15,7 @@
   },
   "overrides": {
     "esbuild": "0.28.1",
-    "sharp": "0.35.3",
+    "sharp": "0.35.4",
     "ws": "8.21.0",
     "undici": "7.29.0"
   }

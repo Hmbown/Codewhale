@@ -160,6 +160,15 @@ pub(crate) fn constrained_effective_reasoning_for_route(
         if !crate::config::is_exact_zai_chat_route(provider, endpoint_identity) {
             return Some(Unavailable);
         }
+        if crate::config::is_exact_zai_forced_thinking_route(provider, endpoint_identity, model) {
+            // GLM-5.3 / GLM-5.3-Flash cannot disable thinking; the wire sends
+            // `off` as the lowest documented tier and honours `low` natively.
+            return Some(match requested {
+                Off => Low,
+                Medium => High,
+                other => other,
+            });
+        }
         if crate::config::is_exact_zai_tiered_effort_route(provider, endpoint_identity, model) {
             return Some(match requested {
                 Low | Medium => High,

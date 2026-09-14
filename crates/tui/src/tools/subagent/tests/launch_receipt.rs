@@ -15,6 +15,13 @@ fn consultant_runtime(
         },
         openai_codex: crate::config::ProviderConfig {
             api_key: Some("codex-test-key".to_string()),
+            // A custom endpoint lets a pinned codex client construct from the
+            // table key alone (see the codex_credentials fallback in
+            // DeepSeekClient::new) instead of requiring machine-local OAuth
+            // consent. The endpoint is never contacted: these fixtures cancel
+            // their children before a model step, and 127.0.0.1:9 refuses
+            // instantly if one ever races.
+            base_url: Some("http://127.0.0.1:9/v1".to_string()),
             ..Default::default()
         },
         ..Default::default()
@@ -94,7 +101,11 @@ async fn issue_5305_role_only_receipt_precedes_status_poll() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
 
     let (manager, _context, start) = start_consultant(workspace.path()).await;
-    assert!(start.content.len() < 1024, "receipt must remain compact");
+    assert!(
+        start.content.len() < 1024,
+        "receipt must remain compact: {} bytes",
+        start.content.len()
+    );
     let receipt = receipt_from(&start);
     assert_eq!(receipt["requested_type"], json!("advisor"));
     assert_eq!(receipt["requested_profile"], serde_json::Value::Null);
@@ -142,7 +153,45 @@ async fn issue_5305_receipt_survives_status_peek() {
         .expect("peek");
     let peek_json: serde_json::Value = serde_json::from_str(&peek.content).expect("peek json");
     assert_eq!(peek_json["child_route"], receipt);
+    assert_eq!(peek.metadata.as_ref().unwrap()["child_route"], receipt);
+    assert!(status.content.len() <= lifecycle::COMPACT_STATUS_BYTES);
+    assert!(peek.content.len() <= lifecycle::COMPACT_STATUS_BYTES);
     cancel_started(&manager, &start).await;
+}
+
+#[test]
+fn compact_receipt_bounds_long_labels_and_declared_outputs_without_hiding_limits() {
+    let metadata = spawn_route_metadata("deepseek", &"🐋\\\"".repeat(4000), "run.model");
+    let paths = (0..32)
+        .map(|index| format!("reports/{index}-{}.md", "長".repeat(4000)))
+        .collect::<Vec<_>>();
+    let mut receipt = json!({
+        "agent_id": "agent_bounded_receipt", "run_id": "agent_bounded_receipt",
+        "name": "🐋".repeat(4000), "status": "starting", "terminal": false,
+        "context_mode": "fresh", "child_route": metadata.child_route,
+        "follow_up": {"tool": "agent", "agent_id": "agent_bounded_receipt", "session_name": "🐋".repeat(4000)},
+        "usage": {"status": "unknown", "note": "No provider receipt yet"},
+        "worker_record": {"spec": {
+            "runtime_profile": {"spawn_depth": 1, "max_spawn_depth": 2, "max_steps": 8, "token_budget": 500, "wall_time_secs": 30, "wall_deadline_ms": 10000},
+            "launch_manifest": {"deliverables": paths}
+        }}
+    });
+    compact_spawn_receipt(&mut receipt, false);
+    assert!(serde_json::to_vec(&receipt).unwrap().len() <= lifecycle::COMPACT_SPAWN_BYTES);
+    assert_eq!(receipt["effective_limits"]["token_budget"], 500);
+    assert_eq!(receipt["effective_limits"]["wall_deadline_ms"], 10000);
+    assert_eq!(receipt["child_route"]["truncated"], true);
+    let shown = receipt["deliverables"].as_array().unwrap();
+    assert_eq!(
+        shown.len() + receipt["deliverables_omitted"].as_u64().unwrap() as usize,
+        paths.len()
+    );
+    for (path, original) in shown.iter().zip(&paths) {
+        assert_eq!(
+            path, original,
+            "declared paths must remain exact when shown"
+        );
+    }
 }
 
 #[tokio::test]
@@ -338,8 +387,11 @@ async fn issue_5305_receipt_survives_ledger_interruption_completion_and_resume()
     let completion = subagent_completion_from_result(&interrupted);
     assert!(completion.payload.contains("gpt-5.6-sol"));
 
-    let mut runtime = stub_runtime();
-    runtime.manager = manager.clone();
+    // #6046: resume rebinds the receipt's provider pin, so the runtime must
+    // carry a config the pinned openai-codex client can be built from
+    // hermetically (api-key table, no machine-local OAuth consent), exactly
+    // like the fresh-spawn fixtures in this file.
+    let runtime = consultant_runtime(workspace.path(), manager.clone());
     let resumed = {
         let mut guard = manager.write().await;
         guard

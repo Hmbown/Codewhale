@@ -88,6 +88,9 @@ pub enum LimitField {
 pub enum OverrideSource {
     /// Operator-configured context window.
     UserContextWindow,
+    /// Operator-configured context window for one exact wire model id
+    /// (`[providers.<id>.model_context_windows]`, #6108).
+    UserModelContextWindow,
     /// Limits declared by the operator for an exact model and endpoint.
     UserModelMetadata,
     /// Catalog limits describe the public API offering, not the account-scoped

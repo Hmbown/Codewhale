@@ -193,6 +193,8 @@ pub enum InteractionAction {
     /// Open the existing `/model` picker. Same discipline as the provider
     /// entry: an entry point, never a second catalog.
     OpenModelPicker,
+    /// Open the existing automations manager.
+    OpenAutomations,
     ShowDockPanel(crate::tui::work_surface::RailPanel),
     DismissDock,
 }

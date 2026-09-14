@@ -27,7 +27,7 @@ export interface RepoFacts {
 }
 
 export const FACTS: RepoFacts = {
-  "generatedAt": "2026-09-10T08:06:52.778Z",
+  "generatedAt": "2026-09-10T21:22:50.540Z",
   "sourceRevision": null,
   "sourceCommittedAt": null,
   "version": "0.9.13",
@@ -299,7 +299,7 @@ export const FACTS: RepoFacts = {
       "env": "MODELSTUDIO_API_KEY"
     }
   ],
-  "defaultModel": "deepseek-v4-pro",
+  "defaultModel": "deepseek-flash",
   "nodeEngines": ">=18",
   "toolCount": 76,
   "license": "MIT",

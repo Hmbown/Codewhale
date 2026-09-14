@@ -415,6 +415,19 @@ impl EngineHandle {
             .map_err(|_| anyhow::anyhow!("Engine dropped session snapshot oneshot"))
     }
 
+    /// Query after the active turn settles, without competing with events.
+    /// The caller must keep draining events and bound this future: an active
+    /// turn can be awaiting provider/tool work or a full event channel.
+    pub(crate) async fn get_subagent_settlement(
+        &self,
+    ) -> Result<crate::core::ops::SubAgentSettlement> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let tx = Arc::new(StdMutex::new(Some(tx)));
+        self.send(Op::GetSubAgentSettlement { tx }).await?;
+        rx.await
+            .map_err(|_| anyhow::anyhow!("Engine dropped child settlement receipt"))
+    }
+
     /// Request active provider request concurrency state.
     pub async fn get_provider_runtime_status(
         &self,

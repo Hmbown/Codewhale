@@ -26,7 +26,12 @@ function fixture(t, options = {}) {
     if (cmd === 'screencapture') {
       calls.push({ tool: 'screencapture', args });
       if (options.captureFailure) return { code: 1, stderr: 'Screen Recording permission denied', stdout: '' };
+      // A real PNG signature and IHDR: the backend identifies the raster
+      // format before trusting its dimensions, so a headerless stub is not a
+      // faithful stand-in for what screencapture writes.
       const header = Buffer.alloc(24);
+      Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]).copy(header, 0);
+      header.writeUInt32BE(13, 8); header.write('IHDR', 12, 'ascii');
       header.writeUInt32BE(200, 16); header.writeUInt32BE(100, 20);
       fs.writeFileSync(args.at(-1), header);
       return { code: 0, stdout: '', stderr: '' };

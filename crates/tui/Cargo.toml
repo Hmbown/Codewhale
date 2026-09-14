@@ -72,6 +72,7 @@ ratatui = { version = "=0.30.2", features = ["unstable-rendered-line-info"] }
 regex = "1.11"
 reqwest = { workspace = true, features = ["blocking", "stream", "form", "http2"] }
 rusqlite.workspace = true
+rquickjs.workspace = true
 rmcp = { version = "3.2.0", default-features = false, features = ["auth", "client"] }
 rustls.workspace = true
 qrcode = { version = "0.14", default-features = false }
@@ -109,6 +110,10 @@ htmd = "0.5.4"
 lru = "0.18"
 parking_lot = "0.12"
 tar = "0.4"
+# Vendored static liblzma keeps the full-fidelity session archive export
+# (`session_export`) hermetic on every release target; no system xz headers.
+# liblzma is the maintained, API-compatible continuation of xz2.
+liblzma = { version = "0.4", features = ["static"] }
 flate2 = "1.1"
 sha2.workspace = true
 semver.workspace = true
@@ -138,7 +143,7 @@ libc = "0.2"
 windows-sys = { version = "0.61.2", features = ["Wdk_Storage_FileSystem", "Win32_System_IO", "Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Pipes", "Win32_System_Threading"] }
 
 [target.'cfg(any(target_os = "macos", target_os = "windows", all(target_os = "linux", not(target_env = "ohos"))))'.dependencies]
-arboard = "3.4"
+arboard = { version = "3.4", features = ["wayland-data-control"] }
 
 [target.'cfg(not(target_env = "ohos"))'.dependencies]
 portable-pty = "0.9"

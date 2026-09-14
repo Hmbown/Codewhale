@@ -2145,6 +2145,29 @@ fn test_elevation_render_en_has_expected_strings() {
 }
 
 #[test]
+fn elevation_always_paints_every_option_including_the_safe_exit() {
+    // The card used to be a fixed 22 rows centred on the frame, with no scroll
+    // rail and no truncation hint, so the option list ran off the bottom and
+    // `Abort` — the only choice that grants nothing — was unreachable by sight
+    // at every terminal size. Options are reserved now; the denial detail is
+    // what shortens.
+    let view = ElevationView::new(elevation_shell_request(), Locale::En);
+    for (w, h) in [(70, 22), (80, 24), (100, 32), (140, 40), (60, 16)] {
+        let joined = compact_elevation_text(&render_elevation_lines(&view, w, h));
+        for option in ["Abort", "Fullaccess", "Allowoutboundnetwork"] {
+            assert!(
+                joined.contains(option),
+                "{w}x{h}: option '{option}' is not on screen:\n{joined}"
+            );
+        }
+        assert!(
+            joined.contains("SandboxDenied"),
+            "{w}x{h}: the card lost its title:\n{joined}"
+        );
+    }
+}
+
+#[test]
 fn test_elevation_render_zh_hans_localizes_copy() {
     let view = ElevationView::new(elevation_shell_request(), Locale::ZhHans);
     let lines = render_elevation_lines(&view, 70, 22);

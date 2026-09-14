@@ -506,6 +506,7 @@ pub struct PluginManagedScan {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PluginMarketplaceInstallPlan {
     Supported { spec: String, source_kind: String },
+    AlreadyPresent { selector: String, reason: String },
     Unsupported { reason: String },
 }
 

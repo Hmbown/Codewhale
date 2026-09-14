@@ -133,83 +133,39 @@ impl ToolRegistry {
         );
         let result = &mut rich.result;
 
-        // Adaptive evidence routing (#4619) is storage-free here because this
-        // layer does not own a call id. The engine/subagent completion boundary
-        // publishes the exact artifact. Classic workshop previews remain an
-        // explicit local rollback path.
-        let raw_bypass = input.get("raw").and_then(|v| v.as_bool()).unwrap_or(false);
-
-        if let Some(router) = ctx.large_output_router.as_ref() {
-            use crate::tools::large_output_router::{
-                EvidenceRouting, LargeOutputRouter, RouteDecision, classic_output_routing_enabled,
-            };
-            if !classic_output_routing_enabled() {
-                let (estimated_routing, estimated_tokens, threshold) =
-                    router.evidence_routing(name, result, raw_bypass);
-                let metadata = result.metadata.get_or_insert_with(|| serde_json::json!({}));
-                if let Some(object) = metadata.as_object_mut() {
-                    // A tool that self-bounds its output behind its own
-                    // recovery contract (e.g. read_file's `next_start_line`
-                    // paging) declares its routing itself; the size estimate
-                    // must not override that and double-wrap the result.
-                    let routing = object
-                        .get("evidence_routing")
-                        .cloned()
-                        .and_then(|value| serde_json::from_value::<EvidenceRouting>(value).ok())
-                        .unwrap_or(estimated_routing);
-                    object.insert(
-                        "evidence_routing".to_string(),
-                        serde_json::to_value(routing)
-                            .unwrap_or_else(|_| serde_json::json!("inline")),
-                    );
-                    object.insert(
-                        "evidence_estimated_tokens".to_string(),
-                        estimated_tokens.into(),
-                    );
-                    object.insert("evidence_threshold_tokens".to_string(), threshold.into());
-                }
-                return Ok(rich);
-            }
-            match router.route(name, result, raw_bypass) {
-                RouteDecision::PassThrough => {}
-                RouteDecision::Synthesise {
-                    estimated_tokens,
-                    threshold,
-                } => {
-                    // Store the raw output in the workshop variable store.
-                    if let Some(vars_arc) = ctx.workshop_vars.as_ref() {
-                        let mut vars = vars_arc.lock().await;
-                        vars.store_raw(name, &result.content);
-                    }
-
-                    // Build a terse synthesis using the same model the registry
-                    // was constructed for (workshop Flash model). For now we
-                    // produce a structured header + truncated preview without
-                    // a live API call so the engine stays dependency-free at
-                    // the registry layer. A follow-up can wire in the Flash
-                    // client when the async LLM call is safe here.
-                    let preview_chars = 1_200usize;
-                    let preview: String = result.content.chars().take(preview_chars).collect();
-                    let ellipsis = if result.content.chars().count() > preview_chars {
-                        "\n… [output truncated — full text in workshop variable `last_tool_result`]"
-                    } else {
-                        ""
-                    };
-                    let synthesis = format!("{preview}{ellipsis}");
-                    let wrapped = LargeOutputRouter::wrap_synthesis(
-                        name,
-                        &synthesis,
-                        estimated_tokens,
-                        threshold,
-                    );
-                    tracing::debug!(
-                        tool = name,
-                        estimated_tokens,
-                        threshold,
-                        "large-output routed through workshop"
-                    );
-                    return Ok(RichToolResult::plain(ToolResult::success(wrapped)));
-                }
+        // Adaptive evidence routing (#4619) is an explicit opt-in
+        // (`CODEWHALE_ADAPTIVE_OUTPUT_ROUTING`) and is storage-free here
+        // because this layer does not own a call id. The engine/subagent
+        // completion boundary publishes the exact artifact. Under the default
+        // classic lane nothing happens at this layer — the same boundary owns
+        // the bounded spillover preview.
+        if crate::tools::large_output_router::adaptive_output_routing_enabled()
+            && let Some(router) = ctx.large_output_router.as_ref()
+        {
+            use crate::tools::large_output_router::EvidenceRouting;
+            let raw_bypass = input.get("raw").and_then(|v| v.as_bool()).unwrap_or(false);
+            let (estimated_routing, estimated_tokens, threshold) =
+                router.evidence_routing(name, result, raw_bypass);
+            let metadata = result.metadata.get_or_insert_with(|| serde_json::json!({}));
+            if let Some(object) = metadata.as_object_mut() {
+                // A tool that self-bounds its output behind its own
+                // recovery contract (e.g. read_file's `next_start_line`
+                // paging) declares its routing itself; the size estimate
+                // must not override that and double-wrap the result.
+                let routing = object
+                    .get("evidence_routing")
+                    .cloned()
+                    .and_then(|value| serde_json::from_value::<EvidenceRouting>(value).ok())
+                    .unwrap_or(estimated_routing);
+                object.insert(
+                    "evidence_routing".to_string(),
+                    serde_json::to_value(routing).unwrap_or_else(|_| serde_json::json!("inline")),
+                );
+                object.insert(
+                    "evidence_estimated_tokens".to_string(),
+                    estimated_tokens.into(),
+                );
+                object.insert("evidence_threshold_tokens".to_string(), threshold.into());
             }
         }
 
@@ -278,7 +234,17 @@ impl ToolRegistry {
                 Tool {
                     tool_type: None,
                     name: tool.name().to_string(),
-                    description: tool.description().to_string(),
+                    description: if evidence_only
+                        && matches!(tool.name(), "bash" | "Bash" | "exec_shell")
+                    {
+                        format!(
+                            "{} {}",
+                            tool.description(),
+                            codewhale_execpolicy::command_safety::readonly_command_help()
+                        )
+                    } else {
+                        tool.description().to_string()
+                    },
                     input_schema: schema,
                     allowed_callers: Some(vec!["direct".to_string()]),
                     defer_loading: Some(tool.defer_loading()),
@@ -606,8 +572,9 @@ fn enforce_tool_authority(
             return Ok(());
         }
         return Err(ToolError::permission_denied(format!(
-            "worker '{}' cannot run {name}: arbitrary command execution is outside its machine-readable authority envelope",
-            authority.owner
+            "worker '{}' cannot run {name}: arbitrary command execution is outside its machine-readable authority envelope. {}",
+            authority.owner,
+            codewhale_execpolicy::command_safety::readonly_command_help()
         )));
     }
     if name == "Run" {
@@ -627,8 +594,9 @@ fn enforce_tool_authority(
             )));
         }
         return Err(ToolError::permission_denied(format!(
-            "worker '{}' cannot run {name}: arbitrary command execution is outside its machine-readable authority envelope",
-            authority.owner
+            "worker '{}' cannot run {name}: arbitrary command execution is outside its machine-readable authority envelope. {}",
+            authority.owner,
+            codewhale_execpolicy::command_safety::readonly_command_help()
         )));
     }
     if name == "Git" || name.starts_with("git_") || name == "review" {

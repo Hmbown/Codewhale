@@ -67,9 +67,10 @@ use crate::hooks::{HookEvent, HookExecutor, TurnEndPayloadInput, TurnEndTotals};
 use crate::llm_client::LlmClient;
 use crate::prompts;
 use crate::route_runtime::{resolve_runtime_route, resolve_runtime_route_for_identity};
+#[cfg(test)]
+use crate::session_manager::create_saved_session_with_id_and_mode;
 use crate::session_manager::{
     OfflineQueueState, QueuedSessionMessage, SavedSession, SessionManager,
-    create_saved_session_with_id_and_mode, create_saved_session_with_mode,
 };
 use crate::settings::Settings;
 use crate::task_manager::{
@@ -169,9 +170,8 @@ pub(crate) use self::activity_detail::{
     open_details_pager_for_cell, open_focused_cell_pager, turn_handoff_markdown,
 };
 use self::activity_detail::{
-    copy_focused_cell, copy_focused_cell_metadata, detail_target_cell_index,
-    extract_reasoning_header, open_reasoning_detail_pager, open_tool_details_pager,
-    open_turn_inspector_pager,
+    copy_focused_cell, detail_target_cell_index, extract_reasoning_header,
+    open_reasoning_detail_pager, open_tool_details_pager, open_turn_inspector_pager,
 };
 // Ctrl+O now opens the full recorded Reasoning Detail for the selected or
 // current reasoning block. The whole-turn Turn Inspector moved to Ctrl+Alt+O
@@ -230,7 +230,6 @@ pub(crate) const UI_GHOSTTY_UNDERWATER_ANIMATION_MS: u64 = 34;
 // transcript under 40 columns. (Named for the file tree — the legacy sidebar
 // this constant once described no longer gates on it.)
 pub(crate) const FILE_TREE_MIN_HOST_WIDTH: u16 = 60;
-const DEFAULT_TERMINAL_PROBE_TIMEOUT_MS: u64 = 500;
 const SESSION_TITLE_MAX_CHARS: usize = 32;
 const VERSION_HINT_TOAST_TTL_MS: u64 = 12_000;
 
@@ -1082,8 +1081,14 @@ pub(crate) fn escape_cancel_request(
     current_streaming_text: &mut String,
     stream_display_clock: &mut StreamDisplayClock,
 ) -> bool {
-    if try_cancel_compaction(app, engine_handle) {
-        return true;
+    let compacting = app.is_compacting || app.manual_compaction_queued;
+    if compacting {
+        try_cancel_compaction(app, engine_handle);
+        if !compact_interrupt_should_stop_turn(app) {
+            return true;
+        }
+        // Mid-turn compact is collateral. Esc/interrupt stops the turn
+        // (Codex/GrokBuild): cancel_compaction alone continues the loop.
     }
     if app.paused || app.paused_goal_objective.is_some() {
         clear_paused_command_state(app, engine_handle);

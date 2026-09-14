@@ -36,7 +36,7 @@ Global key chords are not yet user-configurable — tracked for a future release
 | `Alt-L`              | Open the pager for the last message (composer empty)             |
 | `Alt-P` / `Alt-A` / `Alt-Y` | Jump to Plan / Work, or request Full Access (`Alt-Y` is the legacy permission channel — Work + Full Access — not a separate mode; it honors a locked approval policy) |
 | `Ctrl-X` (Activity workbar) | Cancel all running background shell jobs                  |
-| `Esc`                | Close topmost modal · cancel slash menu · dismiss toast        |
+| `Esc`                | Close topmost modal · cancel slash menu · dismiss toast. During a compact that is serving an in-flight turn, Esc stops the turn (the compact is collateral). |
 
 ## Composer
 
@@ -62,7 +62,7 @@ Editing the message you're about to send.
 | `Ctrl-Shift-U`           | Run `/update install` from the keyboard: check for and install the latest Codewhale release without leaving the TUI. Managed installs (Homebrew/npm/cargo) keep their package-manager gate; when already current the updater's "Already up to date." result is shown and nothing changes |
 | Mouse drag                  | Select composer text; click moves the cursor            |
 | `Cmd-V` / `Ctrl-Shift-V`    | Terminal-local paste (arrives as bracketed paste when supported) |
-| `Ctrl-V`                    | Direct clipboard paste in a local or forwarded graphical session |
+| `Ctrl-V`                    | Direct graphical clipboard paste; rich composer content becomes Markdown |
 | `Ctrl-Y`                    | Yank (paste) from kill buffer                           |
 | `↑` / `↓`                   | Cycle composer history (also selects popup/attachment items) |
 | `Shift-↑` / `Shift-↓`       | Browse conversation history                              |
@@ -72,6 +72,13 @@ Editing the message you're about to send.
 | `Tab`                       | Slash-command / `@`-mention completion (popup-aware)    |
 | `Ctrl-Shift-O` / `F4`       | Open the composer draft in `$VISUAL` / `$EDITOR`; F4 works when the terminal cannot distinguish Ctrl-Shift-O from Ctrl-O |
 | `! command`                 | Run a shell command through normal approval, sandbox, and output surfaces |
+
+Direct composer paste preserves headings, lists, links, tables and code from
+HTML clipboard content. Plain text stays literal, and configuration fields
+always paste literal text. SSH without a forwarded graphical display uses the
+terminal's text paste. Copying a whole answer preserves its original Markdown,
+without terminal wrapping or decorative rails; the destination app decides how
+to render it. Empty or oversized HTML falls back to plain text.
 
 Set `composer_multiline_mode = true` to swap the portable `Enter` and
 `Shift-Enter` behaviors: `Enter` inserts a newline and `Shift-Enter` sends.
@@ -237,6 +244,39 @@ Archive (`e`) is undestructive and needs no confirmation: the session stays on
 disk and stays loadable, it just leaves the default list and stops being an
 auto-resume candidate. Press `e` again to bring it back. Delete (`d`) is the
 destructive one and keeps its confirmation.
+
+## Question sheet (`request_user_input`)
+
+When the model asks a question, a **bottom-anchored sheet** opens over the
+transcript. The conversation stays visible above it. The sheet grows with the
+question and options; if they still do not fit, it scrolls so the highlighted
+option and any typed custom response stay on screen. Resize is not required to
+reveal content.
+
+| Chord | Action |
+|-------|--------|
+| `↑` / `↓` / `k` / `j` | Move the highlight |
+| `1`–`9` | Quick-pick that option |
+| `Enter` | Confirm the highlight (or enter custom-response typing) |
+| `Space` | Toggle a multi-select option |
+| `←` / `h` | Previous question — change that answer. Esc is not back; it cancels the whole request. |
+| `Esc` | Cancel the whole question request |
+| `PageUp` / `PageDown` | Scroll the transcript while keeping the sheet open |
+| `Home` / `End` | Go to the start / latest part of the transcript |
+| `Alt+↑` / `Alt+↓` | Scroll the transcript three lines |
+| Mouse wheel above the sheet | Scroll the transcript; side work surfaces keep their own input |
+| Mouse wheel over the sheet | Browse the question content without changing the answer or highlight |
+
+While the question sheet is open, `Ctrl+↑` / `Ctrl+↓` and `Shift+↑` / `Shift+↓`
+also scroll the transcript three lines. Plain arrows continue to move the option
+highlight.
+
+After wheel browsing, option navigation or typing brings the highlighted option
+or custom-response text back into view. Transcript scroll keys work in both
+option selection and custom-response typing.
+
+**Custom response.** Every question includes an "Other" row. Enter it, type,
+then `Enter` to submit or `Esc` to return to the options without sending.
 
 ## Approval modal (when a tool requests approval)
 

@@ -88,7 +88,7 @@ export function commandAction(command) {
 }
 
 export function preservedChatStateFields(state = {}) {
-  return corePreservedChatStateFields(state, ["model", "replyToMessageId"]);
+  return corePreservedChatStateFields(state, ["model", "replyToMessageId", "authorizedIdentity"]);
 }
 
 export function validateBridgeConfig(env, options = {}) {

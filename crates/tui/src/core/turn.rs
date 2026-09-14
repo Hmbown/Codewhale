@@ -92,6 +92,12 @@ pub struct TurnContext {
     /// parent step and programmatic child call for billing.
     pub(crate) latest_parent_input_tokens: Option<u32>,
 
+    /// `session.messages.len()` at the parent request whose billed prompt is
+    /// in `latest_parent_input_tokens`. Tool results appended after that
+    /// request are not in the bill; GrokBuild's pre-sampling gate adds a
+    /// byte-estimate of that suffix so auto-compact can fire mid-turn.
+    pub(crate) messages_len_at_last_parent_prompt: Option<usize>,
+
     /// One-shot latch: an automatic-compaction refusal has already been
     /// surfaced this turn. Pressure is re-checked every step, and repeating
     /// the same refusal on each of a long turn's steps would be noise.
@@ -133,6 +139,7 @@ impl TurnContext {
             parent_route_usage: Usage::default(),
             routed_usage_dropped_records: 0,
             latest_parent_input_tokens: None,
+            messages_len_at_last_parent_prompt: None,
             compaction_refusal_notified: false,
             pending_route: None,
         }
@@ -276,10 +283,57 @@ impl TurnContext {
             .map(u64::from)
     }
 
+    /// Record how long the transcript was when the latest parent prompt was
+    /// billed. Call immediately after `add_parent_usage`, before this
+    /// response's assistant/tool messages are appended.
+    pub(crate) fn note_parent_prompt_len(&mut self, message_count: usize) {
+        self.messages_len_at_last_parent_prompt = Some(message_count);
+    }
+
+    /// Live context for the auto-compact gate: last billed prompt plus a
+    /// /4 estimate of messages appended since that prompt (tool results,
+    /// the assistant reply that will be replayed on the next request).
+    ///
+    /// `max(billed, estimate(full list))` hides mid-turn growth when the
+    /// estimator undercounts the whole transcript below the last bill —
+    /// which is why auto-compact never fired even with the UI meter above
+    /// 80%. GrokBuild's `check_auto_compact_needed` uses the same split:
+    /// exact prior count + byte-estimate of items since last response.
+    #[must_use]
+    pub(crate) fn live_input_tokens_for_compaction(
+        &self,
+        messages: &[codewhale_models::Message],
+        system_prompt: Option<&codewhale_models::SystemPrompt>,
+        session_billed: Option<u32>,
+    ) -> Option<u64> {
+        let billed = self.billed_input_tokens_for_compaction(session_billed);
+        let suffix_start = self
+            .messages_len_at_last_parent_prompt
+            .unwrap_or(messages.len())
+            .min(messages.len());
+        let suffix = &messages[suffix_start..];
+        let growth = if suffix.is_empty() {
+            0
+        } else {
+            u64::try_from(crate::compaction::estimate_input_tokens_for_pressure(
+                suffix, None,
+            ))
+            .unwrap_or(u64::MAX)
+        };
+        let estimated = u64::try_from(crate::compaction::estimate_input_tokens_for_pressure(
+            messages,
+            system_prompt,
+        ))
+        .unwrap_or(u64::MAX);
+        let live = estimated.max(billed.unwrap_or(0).saturating_add(growth));
+        (live > 0).then_some(live)
+    }
+
     /// Drop the turn-local billed receipt after history is rewritten so the
     /// next step cannot compact again on the pre-compaction prompt.
     pub(crate) fn clear_parent_input_tokens(&mut self) {
         self.latest_parent_input_tokens = None;
+        self.messages_len_at_last_parent_prompt = None;
     }
 }
 
@@ -395,10 +449,71 @@ mod usage_tests {
         );
         turn.clear_parent_input_tokens();
         assert_eq!(turn.latest_parent_input_tokens, None);
+        assert_eq!(turn.messages_len_at_last_parent_prompt, None);
         assert_eq!(
             turn.billed_input_tokens_for_compaction(Some(842_000)),
             Some(842_000)
         );
+    }
+
+    #[test]
+    fn live_compaction_tokens_include_tool_results_after_the_billed_prompt() {
+        // GrokBuild/Codex: last billed prompt + items since that request.
+        // A 70k bill plus a large tool result must cross an 80k trigger even
+        // when the full-list /4 estimate stays below the bill (the failure
+        // mode that kept auto-compact from firing mid-turn above 80%).
+        let mut turn = TurnContext::new(4);
+        turn.add_parent_usage(&Usage {
+            input_tokens: 70_000,
+            ..Usage::default()
+        });
+        let prompt = vec![codewhale_models::Message {
+            role: codewhale_models::Role::User,
+            content: vec![codewhale_models::ContentBlock::Text {
+                text: "do the work".to_string(),
+                cache_control: None,
+            }],
+        }];
+        turn.note_parent_prompt_len(prompt.len());
+
+        let mut with_tool = prompt;
+        with_tool.push(codewhale_models::Message {
+            role: codewhale_models::Role::User,
+            content: vec![codewhale_models::ContentBlock::ToolResult {
+                tool_use_id: "call-1".to_string(),
+                content: "x".repeat(80_000),
+                is_error: None,
+                content_blocks: None,
+            }],
+        });
+
+        let config = crate::compaction::CompactionConfig {
+            enabled: true,
+            token_threshold: 80_000,
+            ..Default::default()
+        };
+        assert!(
+            !crate::compaction::compaction_pressure_reached_with_billed(
+                &with_tool,
+                None,
+                &config,
+                turn.billed_input_tokens_for_compaction(None),
+            ),
+            "stale billed prompt alone must not be the live gate"
+        );
+        let live = turn
+            .live_input_tokens_for_compaction(&with_tool, None, None)
+            .expect("live tokens");
+        assert!(
+            live >= 80_000,
+            "tool-result suffix must lift live tokens over the trigger, got {live}"
+        );
+        assert!(crate::compaction::compaction_pressure_reached_with_billed(
+            &with_tool,
+            None,
+            &config,
+            Some(live),
+        ));
     }
 }
 

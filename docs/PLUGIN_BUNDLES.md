@@ -7,11 +7,10 @@ and Hooks through Codewhale's existing engines. Unsupported declarations stay
 inventoried instead of disabling a mixed bundle. Discovery alone never
 executes, enables, trusts, downloads, updates, or installs anything.
 
-This document owns the bundle format (both manifest encodings), discovery,
+This document owns the bundle formats, discovery,
 validation, and the trust/enable/runtime contract. [PLUGINS.md](PLUGINS.md)
 owns how bits get onto and off disk — the `/plugin install`, `update`,
-`uninstall`, and `suggest` on-ramp added in v0.9.4 (#5182). Claude Code
-plugin repositories are a different, unconverted format; that boundary is
+`uninstall`, and `suggest` on-ramp added in v0.9.4 (#5182). Compatible Claude Code bundles use the same native adapters; their supported subset is
 [CLAUDE_PLUGIN_COMPAT.md](CLAUDE_PLUGIN_COMPAT.md).
 For a runnable native example and explicit OpenCode/DSH data conversion, see
 [Write your first plugin](PLUGIN_AUTHORING.md).
@@ -21,13 +20,15 @@ For a runnable native example and explicit OpenCode/DSH data conversion, see
 Codewhale scans only its own roots, looking in each `<name>/` directory for a
 manifest named `plugin.json` (the native Agent Plugins v1.0.0 format, since
 v0.9.4), `kimi.plugin.json` (the compatible Kimi Skills/MCP subset, since
-v0.9.8), or `plugin.toml` (the legacy Codewhale format, still fully readable):
+v0.9.8), `plugin.toml` (the legacy Codewhale format, still fully readable), or
+`.claude-plugin/plugin.json` (the compatible Claude subset, since v0.9.13):
 
 - User: `~/.codewhale/plugins/<name>/`
 - Workspace: `<workspace>/.codewhale/plugins/<name>/`
 
 A bundle that publishes multiple formats is read through `plugin.json` first,
-then `kimi.plugin.json`, then the legacy `plugin.toml`.
+then `kimi.plugin.json`, then the legacy `plugin.toml`, then
+`.claude-plugin/plugin.json`.
 Computer Use ships as a built-in bundle; it still requires review and
 enablement before activation. The internal precedence order is
 built-in, user, then workspace; the first bundle with a given name wins. This
@@ -65,7 +66,7 @@ trust; every bundle activates only through the content-hash and
 
 ## Manifest
 
-Both encodings parse into the same internal manifest, so validation, hashing,
+All supported encodings parse into the same internal manifest, so validation, hashing,
 review, and runtime behavior are identical downstream. On-disk auto-migration
 between them is deliberately not performed; `/plugin export <name>
 <target-dir>` publishes a loaded bundle as a spec-valid Agent Plugins v1.0.0

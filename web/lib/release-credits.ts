@@ -20,6 +20,11 @@
 
 /** Contributors whose PRs were merged or harvested into this release. */
 export const RELEASE_CONTRIBUTORS: string[] = [
+  "@nightt5879",
+  "@c020627",
+  "@h3c-hexin",
+  "@asto18089",
+  "@Hmbown",
   "@gaord",
   "@goransh-walia",
   "@7jrxt42BxFZo4iAnN4CX",
@@ -28,6 +33,7 @@ export const RELEASE_CONTRIBUTORS: string[] = [
   "@EvanProgramming",
   "@wuisabel-gif",
   "@zhuowp",
+  "@googio",
 ];
 
 /**
@@ -42,4 +48,6 @@ export const RELEASE_HELPERS: string[] = [
   "@mo-vic",
   "@giancarlocp",
   "@hxfhd",
+  "@dmt4",
+  "@LmeSzinc",
 ];

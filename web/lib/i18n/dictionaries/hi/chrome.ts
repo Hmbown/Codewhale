@@ -32,10 +32,8 @@ export const chrome: ChromeDict = {
 
   navProduct: "उत्पाद",
   navModels: "मॉडल",
-  navPricing: "मूल्य",
   navProductSecondary: "Product",
   navModelsSecondary: "Models",
-  navPricingSecondary: "Pricing",
 
   skipToContent: "मुख्य सामग्री पर जाएँ",
 
@@ -92,7 +90,6 @@ export const chrome: ChromeDict = {
   footerIssues: "Issues",
   footerContribute: "योगदान दें",
   footerLicense: "MIT लाइसेंस",
-  footerPricing: "मूल्य",
   footerTerms: "सेवा की शर्तें",
   footerPrivacy: "गोपनीयता",
   footerChangelog: "परिवर्तन लॉग",

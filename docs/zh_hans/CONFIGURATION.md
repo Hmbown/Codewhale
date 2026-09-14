@@ -1143,7 +1143,7 @@ DeepSeek V4 前缀缓存让 token 标签变得重要。这些数量保持分离�
 - `[notifications.event_sound]`(表，可选)：选择加入、确定性的逐事件声音提示。键：`enabled`(bool，默认 `false`)、`events`(kebab-case 事件名数组，默认 `["turn-complete", "approval-needed"]`)、`min_interval_ms`(int，默认 `2000`)、`quiet`(bool，默认 `false`)。见下方"事件声音提示"。
 - `tui.alternate_screen`(字符串，可选，默认 `auto`)：交互式会话启动时使用哪个屏幕。`auto` 和 `always` 在 TUI 拥有的备用屏幕上启动；`never` 以内联模式启动——与终端等高、不使用备用屏幕的 ratatui 视口，因此 shell 的回滚缓冲在会话期间保持完好，退出后仍可滚动。`/fullscreen` 与 `/inline` 在进程内切换；终端拒绝的切换会回滚并说明原因。内联模式在其视口内绘制整个转录——会话运行期间不会向宿主回滚缓冲写入任何内容。
 - `tui.mouse_capture`(bool，可选，非 Windows 终端和备用屏幕活动时的 Windows Terminal/ConEmu/Cmder 上默认 `true`；旧 Windows 控制台和 JetBrains JediTerm 内部——PyCharm/IDEA/CLion 等——为 `false`，那里鼠标事件转义作为乱码文本漏进输入流，见 #878 / #898)：启用内部鼠标滚动、转录选择、右键上下文动作和转录滚动条拖动。TUI 拥有的拖拽选择只复制转录文本，从段落中移除视觉换行列断点，保持选择限于转录窗格。设为 `false` 或带 `--no-mouse-capture` 运行使用原始终端选择；设为 `true` 或带 `--mouse-capture` 运行可在任何默认关闭处选择加入。在原始终端选择上，尤其是旧 Windows 控制台或鼠标捕获禁用时，选择可能跨越右侧栏并包含视觉换行，因为选择由终端而不是 TUI 拥有。
-- `tui.terminal_probe_timeout_ms`(int，可选，默认 `500`)：启动终端模式探测超时毫秒。值钳制到 `100..=5000`；超时发出警告并中止启动，而不是无限挂起。
+- `tui.terminal_probe_timeout_ms`(int，可选)：兼容旧配置而保留的设置，现已不再使用。启动时在检查终端所有权后直接设置原始模式，不再因工作线程调度延迟而中止启动。
 - `tui.stream_chunk_timeout_secs`(int，可选，默认 `900`)：流式模型响应的每 SSE 块空闲超时。慢的本地或兼容服务器可以用 `/config stream_chunk_timeout_secs <seconds>` 提高；`0` 映射到默认，显式值必须 `1..=3600`。省略该键时旧 `DEEPSEEK_STREAM_IDLE_TIMEOUT_SECS` 环境变量仍被遵循。
 - `tui.header_items`(字符串数组，可选，默认 `[]`)：选择加入的头部芯片。在 `[tui]` 下设置 `header_items = ["tokens"]` 显示会话输入、缓存命中和输出 token 数。窄终端省略可选芯片；宽终端把它与上下文利用率并排显示。
 - `tui.osc8_links`(bool，可选，macOS/Linux 默认开启，Windows 默认关闭)：在转录输出的 URL 周围发出 OSC 8 转义序列，这样支持的终端(iTerm2、Terminal.app 13+、Ghostty、Kitty、WezTerm、Alacritty、较新的 gnome-terminal/konsole)可以用终端的链接手势打开它们——通常是 macOS 上的 Cmd-click,Linux/Windows 上的 Ctrl-click。没有 OSC 8 支持的终端渲染普通标签并忽略转义。转义带外发出(不在缓冲区单元格内)，所以列损坏不是问题；只在终端错误渲染 OSC 8 终止符本身时设 `false`。Windows 旧控制台默认关闭；用 `true` 选择加入。
@@ -1338,9 +1338,11 @@ exec_policy = true
 
 **Sofya**([sofya.co](https://sofya.co))返回完整提取页面内容而不是片段。把 `[search] api_key` 设为你的 `ay_live_...` key，或用 `SOFYA_API_KEY` 环境变量。这只是搜索工具后端；它不添加 Sofya 模型 provider。
 
+**Serply**([serply.io](https://serply.io))返回 Google 自然搜索结果，包含标题、URL 和摘要片段。把 `[search] api_key` 设为你的 Serply key，或用 `SERPLY_API_KEY` 环境变量。这只是搜索工具后端；它不添加 Serply 模型 provider。
+
 ```toml
 [search]
-provider = "firecrawl" # 也 duckduckgo | bing | tavily | bocha | metaso | searxng | baidu | volcengine | sofya
+provider = "firecrawl" # 也 duckduckgo | bing | tavily | bocha | metaso | searxng | baidu | volcengine | sofya | serply
 # base_url = "https://search.example/" # provider = "duckduckgo" 时可选;"searxng" 时必填
 # api_key = "YOUR_KEY" # firecrawl 可选;其他 API 提供商必填
 ```

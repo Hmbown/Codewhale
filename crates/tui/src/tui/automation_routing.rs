@@ -1,9 +1,8 @@
 //! Durable automation formatting and operator actions.
 //!
 //! Receipts for run/definition events are typed `HistoryCell::Automation`
-//! cards (AUTOMATION-VISIBILITY-SPEC §2.2); query responses (list/show) and
-//! the delete preview stay `System` text until the Slice-2 panel replaces
-//! them.
+//! cards (AUTOMATION-VISIBILITY-SPEC §2.2). Deletion uses the shared pager
+//! review control; query responses (list/show) retain their text receipts.
 
 use crate::automation_manager::{
     AutomationRecord, AutomationRunRecord, AutomationRunStatus, AutomationStatus,
@@ -58,7 +57,26 @@ pub(super) async fn handle_action(
         AutomationAction::Pause(id) => mutate(locale, &automations, &id, Mutation::Pause).await,
         AutomationAction::Resume(id) => mutate(locale, &automations, &id, Mutation::Resume).await,
         AutomationAction::Delete { id, confirmation } => {
-            delete(locale, &automations, &id, confirmation.as_deref()).await
+            let (cell, command) = delete(locale, &automations, &id, confirmation.as_deref()).await;
+            if let Some(command) = command {
+                if let HistoryCell::System { content } = cell {
+                    let width = app
+                        .viewport
+                        .last_transcript_area
+                        .map_or(80, |area| area.width);
+                    app.view_stack
+                        .push(crate::tui::pager::PagerView::command_review(
+                            tr(locale, MessageId::AutomationActionDelete),
+                            &content,
+                            width.saturating_sub(2),
+                            command,
+                            locale,
+                        ));
+                    app.needs_redraw = true;
+                }
+                return;
+            }
+            cell
         }
         AutomationAction::Run(id) => run_now(locale, &automations, &id, task_manager).await,
     };
@@ -158,39 +176,48 @@ async fn delete(
     automations: &SharedAutomationManager,
     id: &str,
     confirmation: Option<&str>,
-) -> HistoryCell {
+) -> (HistoryCell, Option<String>) {
     let manager = automations.lock().await;
     let record = match manager.get_automation(id) {
         Ok(record) => record,
         Err(error) => {
-            return system(action_failed(
-                locale,
-                MessageId::AutomationActionDelete,
-                id,
-                &error,
-            ));
+            return (
+                system(action_failed(
+                    locale,
+                    MessageId::AutomationActionDelete,
+                    id,
+                    &error,
+                )),
+                None,
+            );
         }
     };
     let runs = match manager.list_runs(id, None) {
         Ok(runs) => runs,
         Err(error) => {
-            return system(action_failed(
-                locale,
-                MessageId::AutomationActionDelete,
-                id,
-                &error,
-            ));
+            return (
+                system(action_failed(
+                    locale,
+                    MessageId::AutomationActionDelete,
+                    id,
+                    &error,
+                )),
+                None,
+            );
         }
     };
     let token = match deletion_token(&record, &runs) {
         Ok(token) => token,
         Err(error) => {
-            return system(action_failed(
-                locale,
-                MessageId::AutomationActionDelete,
-                id,
-                &error,
-            ));
+            return (
+                system(action_failed(
+                    locale,
+                    MessageId::AutomationActionDelete,
+                    id,
+                    &error,
+                )),
+                None,
+            );
         }
     };
 
@@ -202,20 +229,23 @@ async fn delete(
             .replace("{id}", id)
             .replace("{name}", &display_text(&record.name))
             .replace("{run_count}", &runs.len().to_string())
-            .replace("{command}", &command);
-        return system(format!("{detail}\n\n{preview}"));
+            .replace("{command}", "y → Enter");
+        return (system(format!("{detail}\n\n{preview}")), Some(command));
     };
 
     if confirmation != token {
         let command = format!("/automation delete {id}");
-        return system(
-            tr(locale, MessageId::AutomationDeleteConfirmationStale)
-                .replace("{id}", id)
-                .replace("{command}", &command),
+        return (
+            system(
+                tr(locale, MessageId::AutomationDeleteConfirmationStale)
+                    .replace("{id}", id)
+                    .replace("{command}", &command),
+            ),
+            None,
         );
     }
 
-    match manager.delete_automation(id) {
+    let receipt = match manager.delete_automation(id) {
         Ok(record) => HistoryCell::Automation(
             AutomationCell::mutated(
                 display_text(&record.name),
@@ -232,7 +262,8 @@ async fn delete(
             id,
             &error,
         )),
-    }
+    };
+    (receipt, None)
 }
 
 fn system(content: String) -> HistoryCell {
@@ -890,13 +921,17 @@ mod tests {
         .expect("write run");
         let manager = Arc::new(Mutex::new(manager));
 
-        let HistoryCell::System { content: preview } =
+        let (HistoryCell::System { content: preview }, Some(command)) =
             delete(Locale::En, &manager, &automation.id, None).await
         else {
-            panic!("delete preview stays a System text report");
+            panic!("delete preview carries a separate confirmation command");
         };
         assert!(preview.contains("Nothing was deleted"), "{preview}");
         assert!(preview.contains("Recorded runs: 1"), "{preview}");
+        assert!(
+            !preview.contains("--confirm"),
+            "the token stays in the control"
+        );
         assert!(
             manager.lock().await.get_automation(&automation.id).is_ok(),
             "preview must preserve the definition"
@@ -912,7 +947,7 @@ mod tests {
             "preview must preserve run history"
         );
 
-        let HistoryCell::System { content: stale } =
+        let (HistoryCell::System { content: stale }, None) =
             delete(Locale::En, &manager, &automation.id, Some("wrong-receipt")).await
         else {
             panic!("stale confirmation stays a System text report");
@@ -923,12 +958,44 @@ mod tests {
             "a mismatched receipt must not delete"
         );
 
-        let token = preview
-            .lines()
-            .find(|line| line.starts_with("/automation delete "))
-            .and_then(|line| line.split_whitespace().last())
-            .expect("preview confirmation receipt");
-        let HistoryCell::Automation(deleted) =
+        let token = command.split_whitespace().last().expect("reviewed token");
+        manager
+            .lock()
+            .await
+            .resume_automation(&automation.id)
+            .unwrap();
+        let (HistoryCell::System { content: changed }, None) =
+            delete(Locale::En, &manager, &automation.id, Some(token)).await
+        else {
+            panic!("changed definition refuses the old confirmation");
+        };
+        assert!(changed.contains("no longer matches"));
+        assert!(manager.lock().await.get_automation(&automation.id).is_ok());
+        let (_, Some(command)) = delete(Locale::En, &manager, &automation.id, None).await else {
+            panic!("fresh review");
+        };
+        use crate::tui::views::{CommandPaletteAction, ModalView, ViewAction, ViewEvent};
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut pager = crate::tui::pager::PagerView::command_review(
+            "Delete",
+            &preview,
+            78,
+            command.clone(),
+            Locale::En,
+        );
+        assert!(matches!(
+            pager.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE)),
+            ViewAction::None
+        ));
+        let ViewAction::EmitAndClose(ViewEvent::CommandPaletteSelected {
+            action: CommandPaletteAction::ExecuteCommand { command: confirmed },
+        }) = pager.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        else {
+            panic!("confirmed control dispatches the exact reviewed command");
+        };
+        assert_eq!(confirmed, command);
+        let token = confirmed.split_whitespace().last().unwrap();
+        let (HistoryCell::Automation(deleted), None) =
             delete(Locale::En, &manager, &automation.id, Some(token)).await
         else {
             panic!("confirmed deletion is a typed Automation receipt");

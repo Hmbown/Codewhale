@@ -372,6 +372,7 @@ impl App {
         }
         push_enabled_provider_model(&mut enabled_provider_models, &provider_identity, &model);
         let active_context_window_override = config.context_window_for_provider_config(provider);
+        let active_model_context_windows = config.model_context_windows_for(provider).cloned();
         let configured_route_base_url = effective_auth_config.deepseek_base_url();
         let (active_route_limits, active_route_base_url, active_context_window_source) =
             if auto_model {
@@ -730,6 +731,7 @@ impl App {
                 startup_input_unproven: false,
             },
             viewport: ViewportState::default(),
+            pet_watch: crate::tui::pet_watch::PetWatch::default(),
             work_surface: {
                 let mut state = crate::tui::work_surface::WorkSurfaceState::with_layout(
                     work_surface_placement,
@@ -755,6 +757,7 @@ impl App {
             tool_run_cache: ToolRunCache::default(),
             next_history_revision: 1,
             api_messages: Vec::new(),
+            api_message_stamps: Vec::new(),
             completed_assistant_outputs: Vec::new(),
             context_token_cache: std::cell::RefCell::new(Default::default()),
             remote_control: crate::remote_control::RemoteControlController::default(),
@@ -782,7 +785,7 @@ impl App {
             context_pressure_warning_dismissed: None,
             plugin_reload_nudge_stamp: None,
             last_plugin_catalog_poll: None,
-            plugin_cta: crate::tui::plugin_suggestions::PluginCtaState::default(),
+            plugin_cta: crate::tui::plugin_suggestions::PluginCtaState::from_settings(&settings),
             model,
             provider_models,
             enabled_provider_models,
@@ -808,6 +811,7 @@ impl App {
             active_route_base_url,
             active_context_window_source,
             active_context_window_override,
+            active_model_context_windows,
             pending_provider_switch: None,
             reasoning_effort,
             reasoning_effort_preference,
@@ -983,7 +987,7 @@ impl App {
                 .tui
                 .as_ref()
                 .and_then(|tui| tui.metrics_line)
-                .unwrap_or_default(),
+                .unwrap_or(crate::config::ChromeRowPreset::Compact),
             // Prose wrap cap (`[transcript] prose_measure`, #5436). Resolved
             // once here so every render pass — main cache and full-screen
             // overlay — shares one effective width; `None` = full width.
@@ -1071,6 +1075,7 @@ impl App {
             turn_counter: 0,
             dispatch_started_at: None,
             workspace_context: None,
+            workspace_is_linked_worktree: false,
             workspace_context_cell: std::sync::Arc::new(std::sync::Mutex::new(None)),
             workspace_context_refreshed_at: None,
             memory_size_hint: None,

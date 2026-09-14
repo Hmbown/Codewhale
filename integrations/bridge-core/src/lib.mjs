@@ -333,7 +333,7 @@ export function commandAction(command, options = {}) {
   };
 }
 
-export function preservedChatStateFields(state = {}, fields = ["model"]) {
+export function preservedChatStateFields(state = {}, fields = ["model", "authorizedIdentity"]) {
   const preserved = {};
   for (const field of fields) {
     if (Object.prototype.hasOwnProperty.call(state || {}, field)) {

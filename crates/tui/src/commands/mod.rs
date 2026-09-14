@@ -606,6 +606,21 @@ mod tests {
     }
 
     #[test]
+    fn pet_command_is_registered_and_the_workbar_no_longer_advertises_watch() {
+        let pet = command_infos()
+            .into_iter()
+            .find(|cmd| cmd.name == "pet")
+            .expect("pet command should exist");
+        assert_eq!(pet.description_id, MessageId::CmdPetDescription);
+        assert!(pet.usage.starts_with("/pet"));
+        let rail = command_infos()
+            .into_iter()
+            .find(|cmd| cmd.name == "workbar")
+            .expect("workbar command should exist");
+        assert!(!rail.usage.contains("watch"), "{}", rail.usage);
+    }
+
+    #[test]
     fn links_command_has_dashboard_and_api_aliases() {
         let links = command_infos()
             .into_iter()
@@ -1001,9 +1016,9 @@ mod tests {
                 has_config = true;
                 assert_eq!(
                     commands.len(),
-                    16,
+                    17,
                     "config group (group-local metadata exception) expected \
-                     exactly 16 commands, got {}",
+                     exactly 17 commands, got {}",
                     commands.len()
                 );
             }

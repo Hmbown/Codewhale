@@ -37,6 +37,7 @@ pub(crate) enum ConfiguredSearchBackend<'a> {
     Baidu(BackendContext<'a>),
     Volcengine(BackendContext<'a>),
     Sofya(BackendContext<'a>),
+    Serply(BackendContext<'a>),
 }
 
 #[derive(Clone, Copy)]
@@ -61,6 +62,7 @@ impl<'a> ConfiguredSearchBackend<'a> {
             SearchProvider::Baidu => Self::Baidu(backend),
             SearchProvider::Volcengine => Self::Volcengine(backend),
             SearchProvider::Sofya => Self::Sofya(backend),
+            SearchProvider::Serply => Self::Serply(backend),
         }
     }
 
@@ -76,6 +78,7 @@ impl<'a> ConfiguredSearchBackend<'a> {
             Self::Baidu(_) => SearchProvider::Baidu,
             Self::Volcengine(_) => SearchProvider::Volcengine,
             Self::Sofya(_) => SearchProvider::Sofya,
+            Self::Serply(_) => SearchProvider::Serply,
         }
     }
 
@@ -90,7 +93,8 @@ impl<'a> ConfiguredSearchBackend<'a> {
             | Self::Searxng(context)
             | Self::Baidu(context)
             | Self::Volcengine(context)
-            | Self::Sofya(context) => context,
+            | Self::Sofya(context)
+            | Self::Serply(context) => context,
         }
     }
 }
@@ -288,6 +292,7 @@ impl SearchBackend for ConfiguredSearchBackend<'_> {
             SearchProvider::Baidu => BackendId::Baidu,
             SearchProvider::Volcengine => BackendId::Volcengine,
             SearchProvider::Sofya => BackendId::Sofya,
+            SearchProvider::Serply => BackendId::Serply,
         }
     }
 
@@ -516,6 +521,7 @@ mod tests {
             (SearchProvider::Baidu, BackendId::Baidu),
             (SearchProvider::Volcengine, BackendId::Volcengine),
             (SearchProvider::Sofya, BackendId::Sofya),
+            (SearchProvider::Serply, BackendId::Serply),
         ];
 
         for (provider, expected) in cases {
