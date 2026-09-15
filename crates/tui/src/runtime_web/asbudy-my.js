@@ -189,6 +189,32 @@
       });
     });
   }
+  /* ── Provider 小标签：官方显示的是厂商 id（anthropic / moonshot…），换成官方给的友好名 ── */
+  var PROVIDER_NAMES = null;
+  function loadProviderNames() {
+    if (PROVIDER_NAMES) return Promise.resolve(PROVIDER_NAMES);
+    return api('/v1/providers').then(function (r) {
+      var m = {};
+      ((r.body && r.body.providers) || []).forEach(function (p) {
+        if (p && p.id) m[p.id] = p.display_name || p.id;
+      });
+      PROVIDER_NAMES = m;
+      return m;
+    }).catch(function () { PROVIDER_NAMES = {}; return PROVIDER_NAMES; });
+  }
+  function bindProviderChip() {
+    var chip = document.querySelector('#session-facts .fact-chip[data-fact="provider"] strong');
+    if (!chip) return;
+    var id = String(chip.textContent || '').trim();
+    if (!id) return;
+    loadProviderNames().then(function (m) {
+      var nice = m[id];
+      if (nice && nice !== id && chip.textContent !== nice) {
+        chip.title = id;
+        chip.textContent = nice;
+      }
+    });
+  }
   function bindModelChip() {
     var chips = document.querySelectorAll('#session-facts .fact-chip');
     for (var i = 0; i < chips.length; i++) {
@@ -206,7 +232,8 @@
       var facts = document.getElementById('session-facts');
       if (!facts) return false;
       bindModelChip();
-      new MutationObserver(bindModelChip).observe(facts, { childList: true, subtree: true });
+      bindProviderChip();
+      new MutationObserver(function () { bindModelChip(); bindProviderChip(); }).observe(facts, { childList: true, subtree: true });
       return true;
     }
     if (!watch()) {
@@ -878,7 +905,8 @@
         '<div class="ab-row"><label>自己的密钥</label><input class="ab-input" id="mk-key" type="password" autocomplete="new-password" placeholder="留空 = 不改（密钥不会回显）"></div>' +
         '<div class="ab-row"><label>模型名</label><input class="ab-input" id="mk-model" placeholder="留空用这家的默认"></div>' +
         '<div style="display:flex;gap:8px;margin-top:16px"><button class="ab-btn" id="mk-save" type="button">保存</button>' +
-        '<button class="ab-btn ghost" id="mk-cancel" type="button">取消</button></div><div class="ab-msg" id="mk-msg"></div>';
+        '<button class="ab-btn ghost" id="mk-cancel" type="button">取消</button>' +
+        '<button class="ab-btn danger" id="mk-clear" type="button" style="margin-left:auto">清除这家的配置</button></div><div class="ab-msg" id="mk-msg"></div>';
       var msgEl = body.querySelector('#mk-msg');
       body.querySelector('#mk-cancel').onclick = closeLayer;
       var sel = body.querySelector('#mk-provider');
@@ -888,6 +916,21 @@
       }
       sel.onchange = refreshHint;
       refreshHint();
+      body.querySelector('#mk-clear').onclick = function () {
+        var pid = sel.value;
+        var nm = (ps.filter(function (x) { return x.id === pid; })[0] || {}).name || pid;
+        if (!confirm('把「' + nm + '」的配置（密钥 / 端点 / 模型名）全删掉？\n如果当前用的就是它，会自动回退到 DeepSeek。')) return;
+        msg(msgEl, '正在清除…', true);
+        api('/_gate/model-key', { method: 'POST', body: JSON.stringify({ provider: pid, clear: true }) }).then(function (r) {
+          var b = r.body || {};
+          if (!r.ok || b.ok === false) {
+            msg(msgEl, (b.error || '清除失败') + '（若提示帮手是旧版，让管理员重装一下）', false);
+            return;
+          }
+          body.querySelector('#mk-key').value = '';
+          msg(msgEl, '已清除「' + nm + '」的配置', true);
+        });
+      };
       body.querySelector('#mk-save').onclick = function () {
         var payload = {
           provider: sel.value,
