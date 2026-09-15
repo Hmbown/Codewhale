@@ -12,19 +12,27 @@
 
   // 样式（动态注入，避免改官方 stylesheet）
   var css = [
-    '#asbudy-files{margin:12px 12px 0;display:flex;flex-direction:column;gap:8px;font-size:13.5px}',
-    '.asb-card{border:1px solid var(--line);border-radius:8px;background:var(--surface);overflow:hidden}',
-    '.asb-hd{display:flex;align-items:center;gap:6px;padding:7px 9px;font-size:13.5px;color:var(--text)}',
+    // 以下四块（项目文件 / 我的资料 / 回收站 / 退回）对齐官方侧栏控件语言
+    // （2026-09-15 老板：「样式渲染明显跟官方的新建会话、搜索会话、最近会话不一致」）：
+    //   ① 左右不缩进 —— 官方的按钮/搜索框都是贴 .rail 的 10px padding（x=10），
+    //      我们原来 margin 12px 导致 x=22，左边缘和官方对不齐；
+    //   ② 圆角用官方令牌 --radius-control（6px），不是自定的 8px；
+    //   ③ 底色用 --well（官方搜索框同款深底）、边框透明（官方控件们就是 transparent，
+    //      只靠底色区分）—— 原来我们用 --surface 亮底 + --line 实边框，像另一个系统；
+    //   ④ 标题排版抄官方 .rail-section-title（13px / 700 / --text-dim / 字距 0.08em）。
+    '#asbudy-files{margin:0;display:flex;flex-direction:column;gap:8px;font-size:13.5px}',
+    '.asb-card{border:1px solid transparent;border-radius:var(--radius-control);background:var(--well);overflow:hidden}',
+    '.asb-hd{display:flex;align-items:center;gap:6px;padding:8px 10px;font-size:13px;color:var(--text-dim)}',
     '.asb-fold{cursor:pointer;color:var(--text-faint);width:12px;text-align:center;user-select:none;flex:none}',
     '.asb-fold:hover{color:var(--text)}',
-    '.asb-title{flex:1;min-width:0;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
-    '.asb-title #asb-mine-count{font-weight:400;color:var(--text-faint)}',
+    '.asb-title{flex:1;min-width:0;font-weight:700;letter-spacing:0.08em;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
+    '.asb-title #asb-mine-count{font-weight:400;letter-spacing:0;color:var(--text-faint)}',
     '.asb-tools{flex:none;color:var(--text-dim);display:flex;gap:10px;align-items:center}',
-    '.asb-bd{padding:0 9px 9px;max-height:30vh;overflow-y:auto}',
+    '.asb-bd{padding:0 10px 10px;max-height:30vh;overflow-y:auto}',
     '.asb-card.folded .asb-bd{display:none}',
     '#asbudy-files-upload{cursor:pointer;color:var(--text-dim)}#asbudy-files-upload:hover{color:var(--text)}',
     '#asbudy-files-refresh{cursor:pointer;color:var(--text-faint)}#asbudy-files-refresh:hover{color:var(--text)}',
-    '.f-node{display:flex;align-items:center;gap:6px;cursor:pointer;font-size:13.5px;line-height:1.7;white-space:nowrap;color:var(--text);padding:0 4px;border-radius:4px}',
+    '.f-node{display:flex;align-items:center;gap:6px;cursor:pointer;font-size:13.5px;line-height:1.7;white-space:nowrap;color:var(--text);padding:0 4px;border-radius:var(--radius-control)}',
     '.f-node .f-ic{flex:none;color:var(--text-soft);width:13px;text-align:center}',
     '.f-node .f-nm{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis}',
     '.f-node .f-sz{flex:none;color:var(--text-faint);font-size:12.5px}',
@@ -35,7 +43,7 @@
     '.f-node.dir{color:var(--text-soft)}',
     '.f-kids{margin-left:12px;border-left:1px solid var(--line);padding-left:6px}',
     '.f-empty{font-size:13.5px;color:var(--text-faint);padding:0 4px}',
-    '#asbudy-undo{margin:8px 12px 0;border:1px solid var(--line);border-radius:8px;padding:8px;background:var(--surface);font-size:13.5px}',
+    '#asbudy-undo{margin:0;border:1px solid transparent;border-radius:var(--radius-control);padding:8px 10px;background:var(--well);font-size:13.5px}',
     '#asbudy-undo-body{max-height:22vh;overflow-y:auto}',
     '#asbudy-arts{margin:8px 12px 0;border:1px solid var(--line);border-radius:8px;padding:8px;background:var(--surface);font-size:13.5px}',
     '.a-head{font-size:13.5px;color:var(--text);font-weight:600;display:flex;justify-content:space-between;align-items:center;margin-bottom:6px}',
@@ -48,14 +56,14 @@
     '.a-meta{flex:none;color:var(--text-faint);font-size:12.5px}',
     '.a-del{flex:none;color:#c9ccd0;padding:0 3px}',
     '.a-del:hover{color:#f85149}',
-    '.u-item{font-size:13.5px;color:var(--text);padding:4px 6px;border-radius:4px;cursor:pointer;line-height:1.5}',
+    '.u-item{font-size:13.5px;color:var(--text);padding:4px 6px;border-radius:var(--radius-control);cursor:pointer;line-height:1.5}',
     '.u-item:hover{background:var(--hover)}',
     '.u-time{color:var(--text-faint);font-size:12.5px}',
     // 回收站卡片（老板 2026-09-15：从「我的资料」卡里搬出来，排在「最近会话」下面）——
     // 现在是侧栏的直接子元素，边距得自己带（以前靠 #asbudy-files 容器的边距）
-    '#asbudy-recycle{margin:8px 12px 0}',
-    // 「退回」面板头部：折叠箭头 + 标题 + （靠右的）刷新；折叠时只留头部
-    '#asbudy-undo .f-head{display:flex;align-items:center;gap:6px}',
+    '#asbudy-recycle{margin:0}',
+    // 「退回」面板头部：折叠箭头 + 标题（官方 .rail-section-title 的排版）+ （靠右的）刷新；折叠时只留头部
+    '#asbudy-undo .f-head{display:flex;align-items:center;gap:6px;font-size:13px;font-weight:700;letter-spacing:0.08em;color:var(--text-dim)}',
     '#asbudy-undo .f-head #asbudy-undo-refresh{margin-left:auto;cursor:pointer;color:var(--text-faint)}',
     '#asbudy-undo.folded > #asbudy-undo-body{display:none}',
     // 手机（窄屏）：侧栏要一屏装得下。2026-09-15 实测 iPhone 视口（390×844）下
