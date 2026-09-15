@@ -1654,6 +1654,8 @@ noscript {
   background: rgba(106, 174, 242, 0.24);
   box-shadow: inset 0 0 0 1px rgba(106, 174, 242, 0.7), 0 2px 8px rgba(0, 2, 8, 0.5);
   transition: background var(--dur-fast) var(--ease-out), box-shadow var(--dur-fast) var(--ease-out), transform var(--dur-fast) var(--ease-out);
+  /* 图是 630×578（略宽），别被 34×34 的框压扁 */
+  object-fit: contain;
   -webkit-user-select: none;
   user-select: none;
   touch-action: manipulation;
@@ -1693,6 +1695,62 @@ noscript {
 .brand-context a.proj-switch:hover {
   background: var(--hover);
   color: var(--text);
+}
+
+/* 「✦ 项目名 ⇄」里的图标（2026-09-15 换成内联 SVG，老板：「符号不够厚重稳重」）
+   原来用的字库符号 ✦/▣/⇄ 各系统渲染粗细不一、还带像素质感；SVG 线条统一、颜色跟文字走。 */
+.brand-context .pj-ico {
+  width: 13.5px;
+  height: 13.5px;
+  vertical-align: -2.5px;
+  fill: none;
+  /* 颜色比文字亮一档 —— 与 13.5px 的字并排时才不显灰（视觉复核：图标发虚） */
+  color: var(--text-soft);
+  stroke: currentColor;
+  /* 1.5 → 1.8 → 2 → 2.2：三版视觉复核都说“线条偏细、分量不足”，逐次加粗 */
+  stroke-width: 2.2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+.brand-context .pj-ico:first-of-type {
+  margin-right: 5px;
+}
+.brand-context .pj-swap {
+  margin-left: 5px;
+  opacity: 0.75;
+}
+.brand-context .pj-name {
+  white-space: nowrap;
+}
+
+/* 「关闭」按钮：手机上太抢眼（真视觉复核两次提到）—— 去掉常驻描边、字色降一档，
+   触摸高度保持 44px（可用性不降），悬停/按下时才显示边框。 */
+.quiet-button.rail-close {
+  border-color: transparent;
+  background: transparent;
+  /* 不要 dim（视觉复核：灰得过头、窄屏上认不出是按钮）—— 用 soft，比正文淡一档刚好 */
+  color: var(--text-soft);
+  font-size: 13px;
+}
+.quiet-button.rail-close:hover {
+  border-color: var(--line);
+  background: transparent;
+  color: var(--text);
+}
+
+/* ⚠️ 手机上「关闭」看着抢眼，其实不是边框 —— 是**焦点环**：
+   官方打开抽屉时会把焦点移到它（无障碍上是对的，键盘用户才能接着操作），
+   于是 `:focus-visible` 命中，套上全站通用的 3px 实心蓝 outline（实测
+   `outline: rgb(106,174,242) solid 3px`，桌面上没焦点所以看不见）。
+   触摸设备上这个环对用户没信息量（他们不是用键盘导航），调淡到只剩提示。 */
+@media (pointer: coarse) {
+  .quiet-button.rail-close:focus-visible {
+    /* 触摸设备上用户不是用键盘导航 —— 这个环对他没有信息量，纯干扰。
+       实测：官方打开抽屉时会 focus() 它，Chrome 把这判成 focus-visible，
+       于是手机上每次拉开抽屉「关闭」都套着蓝框。（键盘用户仍靠按钮本身的
+       hover/按下反馈定位；真要键盘导航，焦点环在桌面端照旧。） */
+    outline: none;
+  }
 }
 .empty-mark { width: 104px; height: 104px; }
 .rail-open { place-items: center; }
