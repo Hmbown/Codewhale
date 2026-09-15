@@ -308,7 +308,6 @@
       html += '<button class="ab-menu-item" id="ab-m-new">新建项目<small>从零开始（带示例 / 空白）</small></button>';
       html += '<button class="ab-menu-item" id="ab-m-import">导入已有项目<small>我已经有一套代码 / 系统，搬进来</small></button>';
       html += '<button class="ab-menu-item" id="ab-m-proj">项目管理<small>暂停（停引擎、省内存）/ 恢复 / 删除</small></button>';
-      html += '<button class="ab-menu-item" id="ab-m-files">我的文件<small>传资料（Excel / 合同 / 代码），不绑项目</small></button>';
       html += '<button class="ab-menu-item" id="ab-m-space">空间<small>磁盘用量、每个项目占多少 / 上限多少</small></button>';
       html += '<button class="ab-menu-item" id="ab-m-adv">高级设置<small>代码存哪里（git）/ 过程显示多详细 / 只看不改 / 花了多少</small></button>';
       if (role === 'customer') {
@@ -327,8 +326,6 @@
       var bImp = body.querySelector('#ab-m-import');
       if (bImp) bImp.onclick = openImportProject;
       body.querySelector('#ab-m-proj').onclick = openProjects;
-      var bFiles = body.querySelector('#ab-m-files');
-      if (bFiles) bFiles.onclick = openFiles;
       var bSpace = body.querySelector('#ab-m-space');
       if (bSpace) bSpace.onclick = openSpace;
       var bAdv = body.querySelector('#ab-m-adv');
@@ -594,7 +591,7 @@
             ? '<select class="ab-input" id="imp-src">' + dirs.map(function (d) { return '<option value="' + esc(d.path) + '">' + esc(d.name) + '</option>'; }).join('') + '</select>'
             : '<span style="color:#d29922;font-size:13.5px">还没有上传过文件夹</span>') +
           '</div>' +
-          (dirs.length ? '' : '<div class="ab-tip">先去侧栏「项目文件」面板 →「我的文件」→「+ 上传」→「选整个文件夹」，传完再回来。</div>') +
+          (dirs.length ? '' : '<div class="ab-tip">先去侧栏「我的资料」卡片 →「+ 传资料」→「选整个文件夹」，传完再回来。</div>') +
           '<div style="display:flex;gap:8px;margin-top:16px">' +
           '<button class="ab-btn" id="imp-go" type="button"' + (dirs.length ? '' : ' disabled') + '>导入</button>' +
           '<button class="ab-btn ghost" id="imp-cancel" type="button">取消</button></div>' +
@@ -758,103 +755,6 @@
     });
   }
 
-  /* ── 我的文件（文件池：上传的资料；不绑项目） ── */
-  function openFiles() {
-    openLayer('我的文件', function (body) {
-      body.innerHTML =
-        '<div class="ab-tip">传上来的资料（Excel / 合同 / 代码）。不绑项目，随手放着；要让 AI 用某份，在左侧「项目文件」里点它。</div>' +
-        '<div style="display:flex;gap:8px;margin-bottom:12px">' +
-        '<button class="ab-btn" id="ab-up-file" type="button">+ 传文件</button>' +
-        '<button class="ab-btn ghost" id="ab-up-dir" type="button">+ 传文件夹</button>' +
-        '</div>' +
-        '<div id="ab-flist" style="margin-top:6px"></div>' +
-        '<input type="file" id="ab-file-input" multiple style="display:none">' +
-        '<input type="file" id="ab-dir-input" webkitdirectory style="display:none">' +
-        '<div class="ab-msg" id="ab-fmsg"></div>';
-      var listEl = body.querySelector('#ab-flist');
-      var msgEl = body.querySelector('#ab-fmsg');
-      var fileInput = body.querySelector('#ab-file-input');
-      var dirInput = body.querySelector('#ab-dir-input');
-
-      function renderTree(nodes, container) {
-        (nodes || []).forEach(function (n) {
-          if (n.isDir) {
-            var d = document.createElement('div');
-            d.className = 'ab-card';
-            d.style.cursor = 'pointer';
-            d.innerHTML = '<div class="ab-n">▸ ' + esc(n.name) + '</div>';
-            var kids = document.createElement('div');
-            kids.style.display = 'none';
-            kids.style.marginLeft = '12px';
-            d.onclick = function (ev) {
-              if (ev.target && ev.target.tagName === 'BUTTON') return;
-              var open = kids.style.display !== 'none';
-              kids.style.display = open ? 'none' : 'block';
-              d.querySelector('.ab-n').textContent = (open ? '▸ ' : '▾ ') + n.name;
-            };
-            d.appendChild(kids);
-            renderTree(n.children, kids);
-            container.appendChild(d);
-          } else {
-            var f = document.createElement('div');
-            f.className = 'ab-card';
-            f.style.display = 'flex';
-            f.style.alignItems = 'center';
-            f.style.justifyContent = 'space-between';
-            f.innerHTML = '<span class="ab-n">' + esc(n.name) + '</span>' +
-              '<button class="ab-btn danger sm" type="button">删除</button>';
-            f.querySelector('button').onclick = function () {
-              if (!confirm('删掉「' + n.name + '」？')) return;
-              api('/_gate/file?name=' + encodeURIComponent(n.path), { method: 'DELETE' }).then(function (r) {
-                if (r.ok) { msg(msgEl, '已删除', true); load(); } else { msg(msgEl, (r.body && r.body.error) || '删不掉', false); }
-              });
-            };
-            container.appendChild(f);
-          }
-        });
-      }
-      function load() {
-        api('/_gate/files').then(function (r) {
-          var files = (r.body && r.body.files) || [];
-          listEl.innerHTML = '';
-          if (!files.length) { listEl.innerHTML = '<div class="ab-tip">还没有文件。</div>'; return; }
-          renderTree(files, listEl);
-        });
-      }
-      function upload(files, input) {
-        var arr = Array.prototype.slice.call(files || []);
-        if (!arr.length) return;
-        msg(msgEl, '正在上传 ' + arr.length + ' 个…', true);
-        var done = 0;
-        var failed = 0;
-        var chain = Promise.resolve();
-        arr.forEach(function (f) {
-          chain = chain.then(function () {
-            var rel = f.webkitRelativePath || f.name;
-            return fetch('/_gate/upload', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/octet-stream', 'X-Filename': encodeURIComponent(rel) },
-              body: f,
-            }).then(function (res) {
-              if (res.ok) { done++; return; }
-              failed++;
-              return res.json().catch(function () { return {}; }).then(function (j) { if (j.error) msg(msgEl, '传不上去：' + j.error, false); });
-            }).catch(function () { failed++; });
-          });
-        });
-        chain.then(function () {
-          msg(msgEl, '传完：成功 ' + done + (failed ? '，失败 ' + failed : ''), !failed);
-          input.value = '';
-          load();
-        });
-      }
-      body.querySelector('#ab-up-file').onclick = function () { fileInput.click(); };
-      body.querySelector('#ab-up-dir').onclick = function () { dirInput.click(); };
-      fileInput.onchange = function () { upload(fileInput.files, fileInput); };
-      dirInput.onchange = function () { upload(dirInput.files, dirInput); };
-      load();
-    });
-  }
 
   /* ── 空间（用量 / 配额 / 整盘） ── */
   function fmtMb(mb) {
