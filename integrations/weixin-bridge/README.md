@@ -1,11 +1,62 @@
 # Weixin Bot Bridge
 
 此 bridge 让微信个人账号通过扫码登录控制本地 `codewhale serve --http` runtime。
-使用腾讯 iLink Bot 协议（参考 `@tencent-weixin/openclaw-weixin`），
-无需公众号注册即可工作。
+使用腾讯 iLink Bot 协议（参考 `@tencent-weixin/openclaw-weixin`）。
 
-与现有的 `integrations/wechat-bridge`（公众号客服消息模式）不同，
-此 bridge 直接登录**个人微信账号**，通过长轮询 `getUpdates` 收发消息。
+此 bridge 直接使用**个人微信账号**扫码登录授权，通过长轮询 `getUpdates` 收发消息。
+
+
+## Quick Start
+
+### 终端发起
+
+#### 方式一、双终端启动
+
+第一个终端启动 runtime：
+
+```bash
+export CODEWHALE_RUNTIME_TOKEN="$(openssl rand -hex 32)"
+codewhale serve --http --host 127.0.0.1 --port 7878 --auth-token "$CODEWHALE_RUNTIME_TOKEN"
+```
+
+第二个终端启动 bridge：
+
+```bash
+cd integrations/weixin-bridge
+export CODEWHALE_RUNTIME_TOKEN="<与上面相同的 token>"
+export WEIXIN_ALLOW_UNLISTED=true
+npm start
+```
+
+
+
+#### 方式二、单终端启动
+
+一条命令同时启动 runtime 和 bridge，自动生成并共用 token：
+
+```bash
+cd integrations/weixin-bridge
+npm run bridge
+```
+
+按 `Ctrl-C` 同时停止两者。
+
+### 微信端扫码接应
+
+首次启动会打印文本二维码，用微信扫码登录：
+
+![终端打印的登录二维码](../../docs/assets/weixin-bridge-qr-login.png)
+
+二维码下方同时打印原始 URL，二维码显示异常时可手动打开。扫码窗口 5 分钟。
+
+### 微信端验证信道效果
+
+登录成功后，在微信里给这个 bot 发一条 `/status`。收到任何回复即表示链路已打通。
+
+![微信端 /status 验证](../../docs/assets/weixin-bridge-status-verify.jpg)
+
+
+
 
 ## 安全模型
 
@@ -16,18 +67,24 @@
 - 工具审批通过文本命令：`/allow <approval_id>` 或 `/deny <approval_id>`。
 - bridge 主动向微信服务器发起长轮询请求，无需公网端口。
 
+
 ## 设置
 
+登录凭证保存在 `WEIXIN_STATE_DIR`，再次启动无需重新扫码。线程映射与长轮询游标
+写入同一目录，启动时会自动创建并探测可写性 —— 不可写则立即报错退出。
+
+注意：bridge **不读取 `.env` 文件**，手动运行时环境变量必须通过 `export` 传入，
+或使用 `node --env-file=.env src/index.mjs`。
+
+systemd 部署时把变量写入 env 文件并由单元引用：
+
 ```bash
-cd /opt/codewhale/weixin-bot-bridge
+cd integrations/weixin-bridge
 npm install --omit=dev
-cp .env.example /etc/codewhale/weixin-bot-bridge.env
-sudoedit /etc/codewhale/weixin-bot-bridge.env
+cp .env.example /etc/codewhale/weixin-bridge.env
+sudoedit /etc/codewhale/weixin-bridge.env
 node src/index.mjs
 ```
-
-首次启动时会显示一个二维码，用微信扫描以完成登录授权。
-登录凭证会自动保存，后续启动无需重新扫码。
 
 ## 命令
 
@@ -47,7 +104,7 @@ node src/index.mjs
 
 1. 设置 `WEIXIN_ALLOW_UNLISTED=true` 启动 bridge。
 2. 扫码登录后，在微信中发送 `/status`。
-3. Bridge 会将你的 `user_id` 返回给你（若白名单为空则显示在拒绝消息中）。
+3. Bridge 返回 runtime 状态；若你不在白名单，则返回拒绝消息，其中带有你的 `user_id`。
 4. 将 `user_id` 加入 `WEIXIN_CHAT_ALLOWLIST`。
 5. 将 `WEIXIN_ALLOW_UNLISTED` 改回 `false` 并重启 bridge。
 
@@ -62,8 +119,8 @@ node src/index.mjs
 | `CODEWHALE_MODE` | 否 | 运行模式（默认 `agent`） |
 | `WEIXIN_CHAT_ALLOWLIST` | 否 | 逗号分隔的允许用户 ID |
 | `WEIXIN_ALLOW_UNLISTED` | 否 | 首次配对模式（默认 `false`） |
-| `WEIXIN_STATE_DIR` | 否 | 状态持久化目录 |
-| `WEIXIN_THREAD_MAP_PATH` | 否 | 线程映射文件路径 |
+| `WEIXIN_STATE_DIR` | 否 | 状态持久化目录（默认 `/var/lib/codewhale-weixin-bot-bridge`） |
+| `WEIXIN_THREAD_MAP_PATH` | 否 | 线程映射文件路径（默认 `<WEIXIN_STATE_DIR>/thread-map.json`） |
 | `WEIXIN_MAX_REPLY_CHARS` | 否 | 单条回复最大字符数（默认 `3500`） |
 | `CODEWHALE_TURN_TIMEOUT_MS` | 否 | Turn 超时（默认 `900000`） |
 | `WEIXIN_LONGPOLL_TIMEOUT_MS` | 否 | 长轮询超时（默认 `35000`） |
