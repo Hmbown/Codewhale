@@ -199,7 +199,9 @@
       var d = await r.json();
       var files = (d && d.files) || [];
       var cnt = document.getElementById('asb-mine-count');
-      if (cnt) cnt.textContent = files.length ? '（' + files.length + ' 份）' : '';
+      var u = d.usage || null;
+      var quotaTxt = (u && !u.unlimited) ? ' · 已用 ' + u.totalMb + 'M / ' + u.quotaMb + 'M' : '';
+      if (cnt) cnt.textContent = files.length ? ('（' + files.length + ' 份' + quotaTxt + '）') : '';
       mineBody.innerHTML = '';
       if (!files.length) { mineBody.innerHTML = '<span class="f-empty">还没传过资料 —— 点右边「+ 传资料」</span>'; return; }
       for (var i = 0; i < files.length; i++) mineBody.appendChild(render(files[i], true));
