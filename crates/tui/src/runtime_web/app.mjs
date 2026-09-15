@@ -1426,7 +1426,7 @@ function startBrowserClient() {
       renderTranscriptEmpty(
         "ready",
         "准备好了，随时可以开工。",
-        "在下方发消息。模型、模式和权限姿态来自运行时，只读显示在上方。",
+        "AI Builder, As Your Buddy",
       );
       return;
     }
