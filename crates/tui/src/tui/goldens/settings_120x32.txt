@@ -1,10 +1,12 @@
 ▸ Appearance          System                                              PREVIEW · Blue Stage
   Models & providers  Terminal                                            ▎ restyle the work stage
-  Work                Underwater                                           ├── whale-1 · footer band
-  Tools & MCP         Underwater Retro                                     └── whale-2 · goldens
-  Trust             [ ✓ Blue Stage ]                                      ● working whale-1 editing · 14:41:02 ×12
-  Motion              Blue Stage Light                                    ✓ done whale-2 surfaced ✓ · 14:39:02 ×34
-  Advanced            Grayscale                                              done: stage restyled
+  Work                Shoreline                                            ├── whale-1 · footer band
+  Tools & MCP         Shoreline Light                                      └── whale-2 · goldens
+  Trust               Underwater                                          ● working whale-1 editing · 14:41:02 ×12
+  Motion              Underwater Retro                                    ✓ done whale-2 surfaced ✓ · 14:39:02 ×34
+  Advanced          [ ✓ Blue Stage ]                                         done: stage restyled
+                      Blue Stage Light
+                      Grayscale
                       Catppuccin Mocha
                       Tokyo Night
                       Dracula
@@ -16,8 +18,6 @@
                     MOTION (OPTIONAL)
                      ○ low motion
                      ◉ ambient life
-
-
 
 
                                                                           ● working   ○ ready   ✓ done   ! caution   ✗ f

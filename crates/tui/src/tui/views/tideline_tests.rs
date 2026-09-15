@@ -29,7 +29,9 @@ fn draw_stage(width: u16, height: u16) -> String {
             ascii_safe: false,
             locale: Locale::En,
         };
-        let theme_list = TidelineThemeList::new(&UI_THEME, 4).motion(false, true);
+        // Index 6 is Blue Stage (Blue Stage follows Shoreline, Shoreline
+        // Light, Underwater and Underwater Retro), matching `candidate_name`.
+        let theme_list = TidelineThemeList::new(&UI_THEME, 6).motion(false, true);
         let preview = TidelineSettingsPreview {
             active_theme: &UI_THEME,
             candidate: &UI_THEME,

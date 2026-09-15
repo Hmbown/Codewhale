@@ -1,6 +1,8 @@
  Appearance   Models & providers   Work   Tools & MCP   Trust   Motion         ›
   System
   Terminal
+  Shoreline
+  Shoreline Light
   Underwater
   Underwater Retro
 [ ✓ Blue Stage ]
