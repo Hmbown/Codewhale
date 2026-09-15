@@ -173,17 +173,21 @@
   }
 
   // 卡片一：项目里的文件（只读目录树）
-  async function loadProj() {
+  var projSig = null;   // 目录树内容签名：没变化就不重绘（不闪、不丢展开状态）
+
+  async function loadProj(force) {
     if (!body) return;
-    body.innerHTML = '<span class="f-empty">加载中…</span>';
     try {
       var r = await fetch('/_gate/projfiles?project=' + encodeURIComponent(pkey), { credentials: 'same-origin' });
       if (!r.ok) throw 0;
       var d = await r.json();
+      var sig = JSON.stringify(d.files || []);
+      if (!force && sig === projSig) return;   // 内容没变 → 什么都不做（点「刷新」走 force）
+      projSig = sig;
       body.innerHTML = '';
       if (!d.files || !d.files.length) { body.innerHTML = '<span class="f-empty">（空目录）</span>'; return; }
       for (var i = 0; i < d.files.length; i++) body.appendChild(render(d.files[i], false));
-    } catch (e) { body.innerHTML = '<span class="f-empty">加载失败</span>'; }
+    } catch (e) { if (projSig === null) body.innerHTML = '<span class="f-empty">加载失败</span>'; }
   }
 
   // 卡片二：我的资料（文件池，跨项目）
@@ -403,11 +407,23 @@
     d.onclick = function (e) { if (e.target === d) d.remove(); };
   }
 
-  if (refresh) refresh.onclick = function () { loadProj(); loadMine(); };
+  if (refresh) refresh.onclick = function () { loadProj(true); loadMine(); };   // 手动刷新 = 强制重绘
   setFold('proj', isFolded('proj'));      // 恢复上次的折叠状态
   setFold('mine', isFolded('mine'));
   loadProj();
   loadMine();
+
+  // 对话产出后「立即出现」（2026-09-15）：老板反馈——以前要刷新整个页面才看得到。
+  // 事件由 app.mjs 广播（item.completed = 某个工具刚干完，turn.completed = 这一轮干完）。
+  // 节流 700ms：一轮里工具调用很密，不节流会把 /_gate/projfiles 打密；
+  // loadProj 内部还有内容签名比对 —— 没变化就不重绘，不会闪、不会丢展开状态。
+  var autoRefreshTimer = null;
+  window.addEventListener('asbudy:activity', function (e) {
+    var ev = e && e.detail && e.detail.event;
+    if (ev !== 'item.completed' && ev !== 'turn.completed') return;
+    clearTimeout(autoRefreshTimer);
+    autoRefreshTimer = setTimeout(function () { loadProj(); }, 700);
+  });
 
   // 右侧「预览」栏（三栏右侧；窄屏变全屏层）
   // 布局由官方前端的 .preview-pane 提供，门卫只负责：按当前项目填 iframe + 切换显隐。

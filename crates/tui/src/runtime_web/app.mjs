@@ -1274,6 +1274,13 @@ function startBrowserClient() {
         }
         if (!applyRuntimeEvent(app.threadState, envelope)) return;
         renderAll(true);
+        // AsBudy：对话可能在项目目录里产出文件 —— 广播给侧栏「项目文件」树
+        // （监听见 asbudy-files.js；官方 web 没有文件树，这是我们的扩展点）
+        if (envelope.event === "item.completed" || envelope.event === "turn.completed") {
+          try {
+            window.dispatchEvent(new CustomEvent("asbudy:activity", { detail: { event: envelope.event } }));
+          } catch { /* 无 window 的环境（如测试）忽略 */ }
+        }
         if (
           envelope.event === "turn.completed"
           || envelope.event === "thread.updated"
