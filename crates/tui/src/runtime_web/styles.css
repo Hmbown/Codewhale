@@ -1665,6 +1665,37 @@ noscript {
 .empty-mark { width: 104px; height: 104px; }
 .rail-open { place-items: center; }
 
+/* ── 「搜索会话」：显式的可搜索样式（2026-09-15 老板）──
+   四块自绘容器统一用官方 --well 底之后，搜索框跟它们（以及侧栏底）糊在一起、
+   分不清哪个能输入。老板给的解法：别折腾那四块，把搜索框本身做成"一眼是输入框"——
+   放大镜图标 + 可见边框 + 更深的底（凹陷感）。
+   图标用 CSS mask 上色（跟着 --text-faint 走，不写死颜色），也不改官方 DOM。 */
+.search-field {
+  position: relative;
+  border-color: var(--line-strong);
+  background: var(--well-deep);
+  padding-left: 34px;
+}
+.search-field::before {
+  content: "";
+  position: absolute;
+  left: 11px;
+  top: 50%;
+  width: 14px;
+  height: 14px;
+  margin-top: -7px;
+  background-color: var(--text-faint);
+  -webkit-mask: url("data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2016%2016'%20fill='none'%20stroke='black'%20stroke-width='1.7'%20stroke-linecap='round'%3E%3Ccircle%20cx='7'%20cy='7'%20r='4.6'/%3E%3Cpath%20d='M10.6%2010.6L14%2014'/%3E%3C/svg%3E") center / contain no-repeat;
+  mask: url("data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2016%2016'%20fill='none'%20stroke='black'%20stroke-width='1.7'%20stroke-linecap='round'%3E%3Ccircle%20cx='7'%20cy='7'%20r='4.6'/%3E%3Cpath%20d='M10.6%2010.6L14%2014'/%3E%3C/svg%3E") center / contain no-repeat;
+  pointer-events: none;
+}
+.search-field:hover {
+  border-color: rgba(106, 174, 242, 0.4);
+}
+.search-field:focus-within {
+  border-color: rgba(106, 174, 242, 0.6);
+}
+
 /* ─────────────────────────────────────────────────────────────
    AsBudy：字号放大（2026-09-15 · 老板：「官方原来的很多地方字号太小了」）
 
