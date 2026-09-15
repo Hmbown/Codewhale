@@ -1322,6 +1322,34 @@
   }
 
   api('/_gate/whoami').then(function (r) { if (r.ok) ME = r.body; });
+
+  /* 进了别人的视角 → 弹一次提示（附三 §13：替别人操作是敏感事，得让你清楚自己在谁的界面里） */
+  (function () {
+    var box = document.getElementById('asbudy-files');
+    var vw = box ? (box.getAttribute('data-viewas') || '') : '';
+    var nm = box ? (box.getAttribute('data-viewasname') || vw) : '';
+    if (!vw) { try { sessionStorage.removeItem('ab-viewas-notice'); } catch (e) {} return; }
+    try {
+      if (sessionStorage.getItem('ab-viewas-notice') === vw) return;   // 同一个视角只提示一次
+      sessionStorage.setItem('ab-viewas-notice', vw);
+    } catch (e) { /* 隐私模式等存不了：不记住，照弹 */ }
+    setTimeout(function () {
+      openLayer('你正在替别人操作', function (body) {
+        body.innerHTML =
+          '<div style="display:flex;gap:12px;align-items:flex-start">' +
+            '<span style="font-size:22px;line-height:1.1;color:#d29922">⚠️</span>' +
+            '<div>' +
+              '<div style="color:#d29922;font-weight:600;margin-bottom:6px">当前视角：' + esc(nm) + '（' + esc(vw) + '）</div>' +
+              '<div style="color:#c9d1d9;font-size:14px;line-height:1.65">' +
+                '你现在看到和操作的，都是<b>这个人的东西</b>；每一步都会留痕。' +
+                '<div style="color:#8b949e;margin-top:8px">回到自己的界面：点侧栏项目名旁的 <b>⇄</b> → 「退出，回到我自己的」。</div>' +
+              '</div>' +
+            '</div>' +
+          '</div>';
+      });
+    }, 700);
+  })();
+
   if (!bindLogo()) {
     var tries = 0;
     var t = setInterval(function () { if (bindLogo() || ++tries > 60) clearInterval(t); }, 400);
