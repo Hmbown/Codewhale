@@ -65,6 +65,9 @@ pub enum SettingKind {
     /// on/off labels; a non-empty one overrides them per value.
     Bool(&'static [SettingOption]),
     Int,
+    /// A fractional number such as a percent threshold. Values are served and
+    /// accepted in plain decimal form; bounds live in the write validator.
+    Float,
     Enum(&'static [SettingOption]),
     String,
 }
@@ -115,7 +118,7 @@ impl SettingDef {
         match self.kind {
             SettingKind::Bool(_) => Some(vec!["false", "true"]),
             SettingKind::Enum(options) => Some(options.iter().map(|o| o.value).collect()),
-            SettingKind::Int | SettingKind::String => None,
+            SettingKind::Int | SettingKind::String | SettingKind::Float => None,
         }
     }
 
@@ -123,7 +126,7 @@ impl SettingDef {
     pub fn option(&self, value: &str) -> Option<&'static SettingOption> {
         let options = match self.kind {
             SettingKind::Bool(options) | SettingKind::Enum(options) => options,
-            SettingKind::Int | SettingKind::String => return None,
+            SettingKind::Int | SettingKind::String | SettingKind::Float => return None,
         };
         options.iter().find(|option| option.value == value)
     }
@@ -850,7 +853,7 @@ pub const SETTINGS_SCHEMA: &[SettingDef] = &[
     ),
     def(
         "auto_compact_threshold_percent",
-        SettingKind::Int,
+        SettingKind::Float,
         "80",
         ui(
             TAB_WORK,

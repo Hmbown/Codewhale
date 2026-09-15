@@ -8581,7 +8581,9 @@ base_url = "https://api.xiaomimimo.com/v1"
             let options = match def.kind {
                 codewhale_config::SettingKind::Bool(options) => options,
                 codewhale_config::SettingKind::Enum(options) => options,
-                codewhale_config::SettingKind::Int | codewhale_config::SettingKind::String => &[],
+                codewhale_config::SettingKind::Int
+                | codewhale_config::SettingKind::String
+                | codewhale_config::SettingKind::Float => &[],
             };
             for option in options {
                 if !option.label.is_empty() {

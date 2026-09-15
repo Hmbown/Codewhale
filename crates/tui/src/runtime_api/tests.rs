@@ -8542,7 +8542,7 @@ async fn settings_schema_serves_every_declared_row_with_runtime_state() -> Resul
     for entry in rows {
         let kind = entry["kind"].as_str().expect("kind");
         assert!(
-            matches!(kind, "bool" | "int" | "enum" | "string"),
+            matches!(kind, "bool" | "int" | "float" | "enum" | "string"),
             "unknown kind {kind}"
         );
         assert!(

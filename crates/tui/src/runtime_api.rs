@@ -7603,6 +7603,7 @@ async fn get_settings_schema(
             let kind = match def.kind {
                 SettingKind::Bool(_) => "bool",
                 SettingKind::Int => "int",
+                SettingKind::Float => "float",
                 SettingKind::Enum(_) => "enum",
                 SettingKind::String => "string",
             };
@@ -7629,7 +7630,7 @@ async fn get_settings_schema(
                         },
                     })
                     .collect(),
-                SettingKind::Int | SettingKind::String => Vec::new(),
+                SettingKind::Int | SettingKind::String | SettingKind::Float => Vec::new(),
             };
             // Bool rows with an empty option slice carry the surface's
             // default on/off labels — emit the bare values so clients can
