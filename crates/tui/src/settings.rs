@@ -4070,22 +4070,22 @@ mod tests {
     }
 
     #[test]
-    fn default_settings_resolve_to_the_underwater_theme() {
-        // Slice C: the fresh-install default is the underwater theme, end to
-        // end from `Settings::default()` through theme resolution.
+    fn default_settings_resolve_to_the_shoreline_theme() {
+        // The fresh-install default is the Shoreline theme, end to end from
+        // `Settings::default()` through theme resolution.
         let settings = Settings::default();
-        assert_eq!(settings.theme, "underwater");
+        assert_eq!(settings.theme, "shoreline");
         let (name, id, theme) = codewhale_palette::resolve_theme_setting(&settings.theme, None)
             .expect("default resolves");
-        assert_eq!(id, codewhale_palette::ThemeId::Underwater);
-        assert_eq!(name, "underwater");
-        assert_eq!(theme.name, "underwater");
+        assert_eq!(id, codewhale_palette::ThemeId::Shoreline);
+        assert_eq!(name, "shoreline");
+        assert_eq!(theme.name, "shoreline");
     }
 
     #[test]
     fn theme_normalizes_supported_values_and_rejects_unknowns() {
         let mut settings = Settings::default();
-        assert_eq!(settings.theme, "underwater");
+        assert_eq!(settings.theme, "shoreline");
 
         settings.set("theme", "grayscale").expect("set grayscale");
         assert_eq!(settings.theme, "grayscale");
@@ -5520,7 +5520,7 @@ mod tests {
         let loaded = Settings::load().expect("load settings");
 
         assert_eq!(
-            loaded.theme, "underwater",
+            loaded.theme, "shoreline",
             "explicit CODEWHALE_HOME must not inherit ambient legacy settings"
         );
         assert_eq!(

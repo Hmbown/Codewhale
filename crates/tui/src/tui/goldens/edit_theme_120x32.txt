@@ -4,26 +4,26 @@
   Edit Theme [theme]
 
   Scope: SAVED
-  Current: underwater
+  Current: shoreline
 
   Choose:
        1. system
        2. terminal
-    ▸  3. underwater
-       4. underwater-retro
-       5. dark
-       6. light
-       7. grayscale
-       8. catppuccin-mocha
-       9. tokyo-night
-      10. dracula
-      11. gruvbox-dark
-      12. claude
-      13. matrix
-      14. solarized-light
-      15. uwu
-
-
+    ▸  3. shoreline
+       4. shoreline-light
+       5. underwater
+       6. underwater-retro
+       7. dark
+       8. light
+       9. grayscale
+      10. catppuccin-mocha
+      11. tokyo-night
+      12. dracula
+      13. gruvbox-dark
+      14. claude
+      15. matrix
+      16. solarized-light
+      17. uwu
 
   [ Apply ]  [ Cancel ]
   ↑/↓ or click choose · Enter/Apply · Esc/Cancel · 1-9 jump
