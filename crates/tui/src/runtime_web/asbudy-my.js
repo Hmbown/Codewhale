@@ -308,6 +308,7 @@
       }
       html += '<button class="ab-menu-item" id="ab-m-proj">项目管理<small>暂停（停引擎、省内存）/ 恢复 / 删除</small></button>';
       html += '<button class="ab-menu-item" id="ab-m-auto">定时任务<small>让 AI 按点自己干活（每天 / 每周 / 每月）</small></button>';
+      html += '<button class="ab-menu-item" id="ab-m-mem">AI 的记忆<small>它自己记下来的事 —— 你能看，也能清空</small></button>';
       html += '<button class="ab-menu-item" id="ab-m-space">空间<small>磁盘用量、每个项目占多少 / 上限多少</small></button>';
       html += '<button class="ab-menu-item" id="ab-m-adv">高级设置<small>代码存哪里（git）/ 过程显示多详细 / 只看不改 / 花了多少</small></button>';
       if (role === 'customer') {
@@ -323,6 +324,7 @@
       if (bUsers) bUsers.onclick = openUsers;
       body.querySelector('#ab-m-proj').onclick = openProjects;
       body.querySelector('#ab-m-auto').onclick = openAuto;
+      body.querySelector('#ab-m-mem').onclick = openMemory;
       var bSpace = body.querySelector('#ab-m-space');
       if (bSpace) bSpace.onclick = openSpace;
       var bAdv = body.querySelector('#ab-m-adv');
@@ -338,6 +340,29 @@
           .then(function () { location.replace('/login.html'); })
           .catch(function () { location.replace('/login.html'); });
       };
+
+      // 定时任务：有跑完还没看过的新结果 → 直接在菜单项上提醒
+      // （老板 2026-09-16：「跑完提醒就在定时任务界面提醒即可」—— 不往外发通知）
+      api('/v1/automations').then(function (r) {
+        var list = Array.isArray(r.body) ? r.body : [];
+        if (!list.length) return;
+        var seen = abSeen(), fresh = 0, left = list.length;
+        list.forEach(function (a) {
+          api('/v1/automations/' + encodeURIComponent(a.id) + '/runs').then(function (rr) {
+            var runs = abRunsOf(rr).slice().sort(abByNewest);
+            var last = runs[runs.length - 1];
+            if (last && last.created_at && (!seen[a.id] || String(last.created_at) > String(seen[a.id]))) fresh++;
+            if (--left === 0 && fresh) {
+              var it = body.querySelector('#ab-m-auto');
+              if (it) {
+                var s = it.querySelector('small');
+                if (s) s.textContent = '有 ' + fresh + ' 条跑完还没看的结果';
+                it.style.borderColor = '#3fb950';
+              }
+            }
+          });
+        });
+      });
     });
   }
 
@@ -771,6 +796,55 @@
     return { completed: '跑成了', failed: '失败了', queued: '排队中', running: '正在跑', canceled: '已取消' }[s] || s || '';
   }
 
+  /* 跑完的提醒「看一次就消」—— 记在本机 localStorage，按任务 id 存「我上次看到的最新一次运行」。
+   * 老板 2026-09-16 定：「跑完提醒就在定时任务界面提醒即可」—— 不往外发通知，就在这个界面里看。
+   * ⚠️ 放本机（不是服务端）：它只是「我还没翻过」的提示，不是审计记录；换设备重新看过一次无妨。
+   */
+  var AB_SEEN_KEY = 'ab-auto-seen';
+  function abSeen() {
+    try { return JSON.parse(localStorage.getItem(AB_SEEN_KEY) || '{}') || {}; } catch (e) { return {}; }
+  }
+  function abSeenSave(m) { try { localStorage.setItem(AB_SEEN_KEY, JSON.stringify(m)); } catch (e) {} }
+  function abByNewest(x, y) { return String(x.created_at || '').localeCompare(String(y.created_at || '')); }
+  function abRunsOf(r) { return Array.isArray(r.body) ? r.body : ((r.body && r.body.runs) || []); }
+
+  /* 一行状态：时间 + 结果 + 没看过的标「新结果」；失败额外说一句 */
+  function abPaintRun(box, run, seenIso) {
+    var st = run.status || '';
+    var fresh = run.created_at && (!seenIso || String(run.created_at) > String(seenIso));
+    var html = '上次：' + esc(abLocal(run.created_at)) + ' ' + esc(abRunState(st));
+    if (fresh) html += ' <span style="color:#3fb950">● 新结果</span>';
+    if (st === 'failed') html += ' <span style="color:#f85149">—— 没干成，进去看一眼</span>';
+    else if (fresh && st === 'completed') html += ' <span style="color:#8b949e">—— 干完了</span>';
+    box.innerHTML = html;
+  }
+
+  /* 结果一句话：把跑出来的那个会话的开头拿出来（看不到就不显示，不编内容）
+   * ⚠️ 2026-09-16 踩过：`GET /v1/threads/{id}` 返回的是 `{thread,turns,items}`，**没有 preview/title**；
+   *   摘要只在 `GET /v1/threads/summary` 里 —— 拿 {id} 取 preview 永远是 undefined。
+   *   多条卡片共用一次 summary（5 秒缓存），避免 N 条主 N 次请求。
+   */
+  var AB_SUM_CACHE = { at: 0, list: [] };
+  function abThreadSummary(cb) {
+    if (AB_SUM_CACHE.at && Date.now() - AB_SUM_CACHE.at < 5000) return cb(AB_SUM_CACHE.list);
+    api('/v1/threads/summary?limit=50').then(function (r) {
+      var list = Array.isArray(r.body) ? r.body : ((r.body && r.body.threads) || []);
+      AB_SUM_CACHE = { at: Date.now(), list: list };
+      cb(list);
+    });
+  }
+
+  function abPaintResult(card, id, threadId) {
+    if (!card || !threadId) return;
+    var box = card.querySelector('#au-res-' + id);
+    if (!box) return;
+    abThreadSummary(function (list) {
+      var hit = list.filter(function (t) { return t.id === threadId; })[0];
+      var pv = hit && (hit.preview || hit.title);
+      if (pv) box.textContent = '它说：' + String(pv).replace(/\s+/g, ' ').slice(0, 92);
+    });
+  }
+
   /* ── 定时任务：列表 ── */
   function openAuto() {
     openLayer('定时任务', function (body) {
@@ -809,6 +883,7 @@
             '<div class="ab-s">' + esc(abRruleHuman(a.rrule)) +
             (a.next_run_at ? ' · 下次 ' + esc(abLocal(a.next_run_at)) : '') + '</div>' +
             '<div class="ab-s" id="au-run-' + esc(a.id) + '">上次：查中…</div>' +
+            '<div class="ab-s" id="au-res-' + esc(a.id) + '" style="color:#8b949e"></div>' +
             '<div class="ab-s" style="color:#8b949e">要它做的：' + esc((a.prompt || '').slice(0, 110)) +
             ((a.prompt || '').length > 110 ? '…' : '') + '</div>' +
             '<div style="display:flex;gap:8px;margin-top:9px;flex-wrap:wrap">' +
@@ -818,19 +893,23 @@
             '<button class="ab-btn danger sm" data-act="del" data-id="' + esc(a.id) + '">删除</button></div></div>';
         }).join('');
 
-        // 每条拉最近一次运行（引擎返回整段历史，取时间最新那条）
+        // 每条：拉最近一次运行 + 结果一句话 + 「跑完还没看过」的标
+        var seenBefore = abSeen(), seenAfter = Object.assign({}, seenBefore);
         list.forEach(function (a) {
+          var card = body.querySelector('#au-' + a.id);
           api('/v1/automations/' + encodeURIComponent(a.id) + '/runs').then(function (r) {
             var box = body.querySelector('#au-run-' + a.id);
             if (!box) return;
-            var runs = Array.isArray(r.body) ? r.body : ((r.body && r.body.runs) || []);
+            var runs = abRunsOf(r).slice().sort(abByNewest);
             if (!runs.length) { box.textContent = '上次：还没跑过'; return; }
-            var last = runs.slice().sort(function (x, y) {
-              return String(x.created_at || '').localeCompare(String(y.created_at || ''));
-            }).pop();
-            box.textContent = '上次：' + abLocal(last.created_at) + ' ' + abRunState(last.status);
+            var last = runs[runs.length - 1];
+            if (last.created_at) seenAfter[a.id] = last.created_at;
+            abPaintRun(box, last, seenBefore[a.id]);
+            if (last.status === 'completed') abPaintResult(card, a.id, last.thread_id);
           });
         });
+        // 「新结果」标本次仍显示（让客户至少看见一次），两秒后再记成「看过了」
+        setTimeout(function () { abSeenSave(seenAfter); }, 2000);
 
         holder.onclick = function (e) {
           var b = e.target.closest ? e.target.closest('button[data-act]') : null;
@@ -848,22 +927,34 @@
             api('/v1/automations/' + encodeURIComponent(id) + '/' + act2, { method: 'POST' }).then(function () { openAuto(); });
             return;
           }
-          // 立刻跑一次
-          b.disabled = true; b.textContent = '已排队…';
+          // 立刻跑一次 —— 排上队后轮询到跑完（老板 2026-09-16：结果就在这个界面里给）
+          b.disabled = true; b.textContent = '正在跑…';
           api('/v1/automations/' + encodeURIComponent(id) + '/run', { method: 'POST' }).then(function (r) {
             if (!r.ok) { b.disabled = false; b.textContent = '立刻跑一次'; alert('没跑起来：' + ((r.body && r.body.error) || ('HTTP ' + r.code))); return; }
-            b.textContent = '已排上队';
-            setTimeout(function () {
+            var runId = (r.body && r.body.id) || '';
+            var card = body.querySelector('#au-' + id);
+            var tries = 0;
+            var box0 = body.querySelector('#au-run-' + id);
+            if (box0) box0.textContent = '正在跑…（干完这里会自己更新）';
+            var timer = setInterval(function () {
+              tries++;
               api('/v1/automations/' + encodeURIComponent(id) + '/runs').then(function (rr) {
-                var runs = Array.isArray(rr.body) ? rr.body : [];
-                var last = runs.slice().sort(function (x, y) {
-                  return String(x.created_at || '').localeCompare(String(y.created_at || ''));
-                }).pop();
+                var runs = abRunsOf(rr).slice().sort(abByNewest);
+                var cur = runs.filter(function (x) { return !runId || x.id === runId; }).pop() || runs[runs.length - 1];
                 var box = body.querySelector('#au-run-' + id);
-                if (box && last) box.textContent = '上次：' + abLocal(last.created_at) + ' ' + abRunState(last.status);
-                b.disabled = false; b.textContent = '立刻跑一次';
+                if (!cur || !box) return;
+                abPaintRun(box, cur, null);          // 刚发生的，按「新」显示
+                var done = cur.status === 'completed' || cur.status === 'failed' || cur.status === 'canceled';
+                if (cur.status === 'completed') abPaintResult(card, id, cur.thread_id);
+                if (done || tries >= 40) {
+                  clearInterval(timer);
+                  b.disabled = false; b.textContent = '立刻跑一次';
+                  if (cur.created_at) {
+                    var m = abSeen(); m[id] = cur.created_at; abSeenSave(m);   // 就在眼前发生的，不用再标「新」
+                  }
+                }
               });
-            }, 6000);
+            }, 3000);
           });
         };
       });
@@ -931,6 +1022,107 @@
           if (onDone) onDone();
         });
       };
+    });
+  }
+
+  /* ── AI 的记忆（搬表：官方 /v1/memory，官方 web 没界面）──
+   * 2026-09-16。引擎侧先实测走通一整条：写一条 → 列出来 → 起一轮对话问它，
+   * 它照着记忆回答（问「我们习惯怎么说客户」，答「客户，不说『顾客』」）→ 清空。
+   * ⚠️ 官方只有**整批清空**（`DELETE /v1/memory?scope=all|global|workspace`），**没有单条删除**
+   *   （路由表里就 GET/POST/DELETE 在集合上）—— 界面上得如实说，并给替代办法。
+   * ⚠️ 我们的架构是**一项目一引擎一 HOME** → 这里的记忆只作用于当前项目，不会串到别的项目。
+   */
+  function abScopeName(s) { return s === 'workspace' ? '本项目' : '通用'; }
+
+  function openMemory() {
+    openLayer('AI 的记忆', function (body) {
+      body.innerHTML = '<div id="ab-mem">加载中…</div>';
+      var q = '';
+      var entries = [];
+      var debounce = null;
+
+      /* ⚠️ 搜索在前端做子串过滤，**不用引擎的 q**：2026-09-16 实测，引擎的 FTS 对中文
+       * 基本搜不出来 —— 文本里明明有「人民币」，`?q=人民币` → 0 条；ASCII 的 `?q=RMB` → 1 条。
+       * 所以整批拉下来（上限 200）在浏览器里过滤，中文才搜得到。 */
+      function renderList() {
+        var box = body.querySelector('#mem-list');
+        if (!box) return;
+        var key = q.trim().toLowerCase();
+        var list = key ? entries.filter(function (e) {
+          return String(e.summary || '').toLowerCase().indexOf(key) >= 0;
+        }) : entries;
+        box.innerHTML = list.length ? list.map(function (e) {
+          return '<div class="ab-card">' +
+            '<div class="ab-n">' + esc(e.summary || '（空白）') + '</div>' +
+            '<div class="ab-s">' + esc(abScopeName(e.scope)) +
+            (e.line_start != null ? ' · 出自 MEMORY.md 第 ' + esc(e.line_start) + ' 行' : '') +
+            (e.stale ? ' · <span style="color:#d29922">来源文件改过了，可能过期</span>' : '') +
+            '</div></div>';
+        }).join('') : ('<div class="ab-tip">' + (key ? '没搜到。' : '还是空的 —— 它在对话里学到东西时会自己记下来。') + '</div>');
+      }
+
+      function load() {
+        Promise.all([
+          api('/v1/config'),
+          api('/v1/memory?scope=all&limit=200'),
+        ]).then(function (rs) {
+          var el = body.querySelector('#ab-mem');
+          if (!el) return;
+          var cfg = rs[0].body || {};
+          var mem = rs[1].body || {};
+          entries = mem.entries || [];
+          if (!rs[1].ok) {
+            el.innerHTML = '<div class="ab-tip" style="color:#f85149">读不到记忆：' +
+              esc(mem.error || ('HTTP ' + rs[1].code)) + '</div>';
+            return;
+          }
+          if (cfg.memory_enabled === false) {
+            el.innerHTML = '<div class="ab-tip">这个项目的「记忆」功能还没打开 —— ' +
+              '让平台的管理员开一下（开启后 AI 会把你在对话里说过的习惯自己记下来，下次自动想起来）。</div>';
+            return;
+          }
+          var html =
+            '<div class="ab-tip">它自己攒下来、下次对话会想起来的事（最近 32 条会带进对话，所以别拿它当资料库）。' +
+            '这些只作用于<b>本项目</b>。</div>' +
+            '<div class="ab-row"><input class="ab-input" id="mem-q" placeholder="搜一搜（比如「客户」）" value="' + esc(q) + '"></div>';
+          html += '<div id="mem-list"></div>';
+          html += '<div class="ab-tip" style="margin-top:12px">这里只能<b>整批清空</b>，官方没给「只删这一条」的口子。' +
+            '想让它忘掉某一件事，直接在对话里说一声就行（比如「忘掉关于报表格式的偏好」）。</div>';
+          html += '<div style="display:flex;gap:8px;flex-wrap:wrap">' +
+            '<button class="ab-btn danger sm" id="mem-clear-ws" type="button">清空「本项目」的记忆</button>' +
+            '<button class="ab-btn danger sm" id="mem-clear-global" type="button">清空「通用」的记忆</button>' +
+            '<button class="ab-btn ghost sm" id="mem-reload" type="button">刷新</button></div>' +
+            '<div class="ab-msg" id="mem-msg"></div>';
+          el.innerHTML = html;
+
+          var qi = body.querySelector('#mem-q');
+          // 只重渲染列表，输入框本身不重建（否则一边打字一边失焦）
+          qi.oninput = function () {
+            clearTimeout(debounce);
+            var v = qi.value;
+            debounce = setTimeout(function () { q = v.trim(); renderList(); }, 150);
+          };
+          renderList();
+          body.querySelector('#mem-reload').onclick = load;
+          function clearOne(scope, label) {
+            var n = (scope === 'workspace')
+              ? entries.filter(function (e) { return e.scope === 'workspace'; }).length
+              : entries.filter(function (e) { return e.scope !== 'workspace'; }).length;
+            if (!n) { msg(body.querySelector('#mem-msg'), '「' + label + '」里本来就没有东西。', false); return; }
+            if (!confirm('清空「' + label + '」的记忆？\n共 ' + n + ' 条 —— 清掉之后 AI 就不再记得这些了。\n（不影响你的文件、代码和对话记录）')) return;
+            var m = body.querySelector('#mem-msg');
+            msg(m, '正在清…', true);
+            api('/v1/memory?scope=' + scope, { method: 'DELETE' }).then(function (r) {
+              if (!r.ok) { msg(m, '没清成：' + ((r.body && r.body.error) || ('HTTP ' + r.code)), false); return; }
+              msg(m, '已清空「' + label + '」', true);
+              load();
+            });
+          }
+          body.querySelector('#mem-clear-ws').onclick = function () { clearOne('workspace', '本项目'); };
+          body.querySelector('#mem-clear-global').onclick = function () { clearOne('global', '通用'); };
+        });
+      }
+      load();
     });
   }
 
