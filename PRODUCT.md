@@ -78,11 +78,14 @@ no hosted runtime to sell.
 - Voice: quiet, dense, factual. Terminal vocabulary, no marketing superlatives,
   no fabricated transcripts or reasoning traces.
 - "It doesn't need to look special — it needs to look like Codewhale."
-- Assets: the founder's whale mark traced to `brand/mark.svg` (with
-  `brand/mark-navy.svg`, `brand/mark-gradient.svg`) and the founder's rounded
-  monoline wordmark traced from `brand/wordmark0901.png` (`brand/wordmark.svg`
-  navy #142352, `brand/wordmark-inverted.svg` white; regenerated with the site
-  icons by `scripts/brand/trace-brand.py`). Web copies live in
+- Assets: the canonical vector family lives in the CWC repo at
+  `codewhale-apps/packages/brand/svg/` (mark, mark-gradient, mark-mono,
+  mark-reversed, wordmark, wordmark-inverted); `brand/` and
+  `web/public/brand/` carry byte-identical copies — sync from there, never
+  re-trace. The founder's brand sheet `brand/codewhalemarkfinal.png` remains
+  the source `scripts/brand/braille-mark.py` derives TUI launch art from. The
+  earlier local trace and `scripts/brand/trace-brand.py` were retired
+  2026-09-15 in favor of the canonical family. Web copies live in
   `web/public/brand/`.
 - Palette, type, shell direction, and the anti-slop rules are recorded in
   `DESIGN.md`; the colour tokens are owned by `crates/tui/src/palette/tokens.rs`
