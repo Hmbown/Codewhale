@@ -299,6 +299,7 @@
     var role = ME ? ME.role : 'customer';
     openLayer('我的', function (body) {
       var html = '<div class="ab-tip">' + esc(ME ? (ME.name || ME.user) : '') +
+        (ME && ME.user ? ' · ' + esc(ME.user) : '') +
         '（' + (role === 'admin' ? '管理员' : role === 'staff' ? '员工' : '客户老板') + '）</div>';
       if (role === 'admin' || role === 'customer') {
         html += '<button class="ab-menu-item" id="ab-m-staff">员工管理<small>给员工建账号、分配可看项目、设项目额度</small></button>';
@@ -314,6 +315,7 @@
       if (role === 'customer') {
         html += '<button class="ab-menu-item" id="ab-m-consent">平台协助<small>让 AsBudy 平台协助你排查问题（只有你能开，随时可关）</small></button>';
       }
+      html += '<button class="ab-menu-item" id="ab-m-account">我的账号<small>我自己的名字、登录账号和归属</small></button>';
       html += '<button class="ab-menu-item" id="ab-m-pw">修改密码<small>改自己的登录密码</small></button>';
       html += '<button class="ab-menu-item" id="ab-m-logout">退出登录<small>退出当前账号</small></button>';
       if (installEvt) html += '<button class="ab-menu-item" id="ab-m-install">装到桌面<small>把这个页面装成桌面应用</small></button>';
@@ -331,6 +333,7 @@
       if (bAdv) bAdv.onclick = openAdvanced;
       var bConsent = body.querySelector('#ab-m-consent');
       if (bConsent) bConsent.onclick = openConsent;
+      body.querySelector('#ab-m-account').onclick = openAccount;
       body.querySelector('#ab-m-pw').onclick = openPassword;
       var bIns = body.querySelector('#ab-m-install');
       if (bIns) bIns.onclick = function () { if (installEvt) { installEvt.prompt(); installEvt = null; closeLayer(); } };
@@ -423,13 +426,13 @@
               bEdit.onclick = function () { openStaffForm(s, owner, projects, staff, reopen); };
               var bDel = document.createElement('button'); bDel.className = 'ab-btn danger sm'; bDel.type = 'button'; bDel.textContent = '删除';
               bDel.onclick = function () {
-                if (!confirm('删掉员工「' + (s.name || s.user) + '」？\n他建的项目会转回你名下（项目本身不删）。')) return;
+                if (!confirm('删掉员工「' + (s.name || s.user) + '」？\nta 建的项目会转回你名下（项目本身不删）。')) return;
                 api('/_gate/staff', { method: 'DELETE', body: JSON.stringify({ user: s.user }) }).then(function (r) {
                   if (r.ok) { refresh(); } else { alert(r.body.error || '删除失败'); }
                 });
               };
-              // 「进他的视角」—— 下级的东西不并排铺在我这儿（附三 §13 原则④）
-              var bView = document.createElement('button'); bView.className = 'ab-btn ghost sm'; bView.type = 'button'; bView.textContent = '进他的视角';
+              // 「进 ta 的视角」—— 下级的东西不并排铺在我这儿（附三 §13 原则④）
+              var bView = document.createElement('button'); bView.className = 'ab-btn ghost sm'; bView.type = 'button'; bView.textContent = '进 ta 的视角';
               bView.onclick = function () { location.href = '/view-as?as=' + encodeURIComponent(s.user); };
               acts.appendChild(bView);
               acts.appendChild(bEdit); acts.appendChild(bDel);
@@ -453,7 +456,7 @@
         '<div class="ab-row"><label>名字</label><input class="ab-input" id="f-name" placeholder="显示用，如「小王」" value="' + (isNew ? '' : esc(rec.name || '')) + '"></div>' +
         '<div class="ab-row"><label>密码</label><input class="ab-input" id="f-pw" type="password" placeholder="' + (isNew ? '至少 8 位' : '留空 = 不改') + '"></div>' +
         '<div class="ab-row"><label>项目额度</label><input class="ab-input" id="f-quota" type="number" min="0" max="50" value="' + (isNew ? 2 : esc(rec.quota)) + '" style="max-width:110px"><span style="color:#8b949e;font-size:13.5px">最多能自己建几个项目</span></div>' +
-        '<div class="ab-row"><label>资料空间</label><input class="ab-input" id="f-quotamb" type="number" min="0" placeholder="MB，留空 = 默认" value="' + (isNew || !rec.quotaMb ? '' : esc(rec.quotaMb)) + '" style="max-width:130px"><span style="color:#8b949e;font-size:13.5px">他能上传多少资料（不能超过你自己的）</span></div>' +
+        '<div class="ab-row"><label>资料空间</label><input class="ab-input" id="f-quotamb" type="number" min="0" placeholder="MB，留空 = 默认" value="' + (isNew || !rec.quotaMb ? '' : esc(rec.quotaMb)) + '" style="max-width:130px"><span style="color:#8b949e;font-size:13.5px">ta 能上传多少资料（不能超过你自己的）</span></div>' +
         '<div style="margin:12px 0 6px;color:#e6edf3;font-size:14px">能看能操作的项目' + (isNew ? '（建完再分配也行）' : '') + '</div>' +
         '<div id="f-projs">' + (projects.length
           ? projects.map(function (p) {
@@ -1282,6 +1285,40 @@
   }
 
   /* ── 修改密码 ── */
+  /* ── 我的账号（2026-09-16 老板问：用户自己的账号和名字在哪里能看到？）──
+   * 只读面板：名字 / 登录账号 / 角色 / 归属 / 项目额度。
+   * 正在别人的视角里时，额外写明「真实登录的是谁」+ 一个退出口（不要让人困在别人的界面里）。
+   * 数据来自 /_gate/whoami（视角下返回的就是被切那个账号的信息）。 */
+  function openAccount() {
+    openLayer('我的账号', function (body) {
+      var me = ME || {};
+      var roleTxt = me.role === 'admin' ? '管理员（平台）' : me.role === 'staff' ? '员工' : '客户老板';
+      var opRoleTxt = me.operatorRole === 'admin' ? '管理员' : me.operatorRole === 'staff' ? '员工' : '客户老板';
+      function row(k, v) {
+        return '<div class="ab-row"><label>' + k + '</label>' +
+          '<span class="ab-input" style="cursor:default;color:#e6edf3;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc(v) + '</span></div>';
+      }
+      var html = '<div class="ab-tip">你登录进来用的就是这个账号 —— 名字只是显示用，登录时填的是「登录账号」。</div>';
+      html += row('名字', me.name || me.user || '—');
+      html += row('登录账号', me.user || '—');
+      html += row('角色', roleTxt);
+      if (me.role === 'staff') html += row('归属', me.ownerName ? ('归「' + me.ownerName + '」管') : '平台直接管');
+      if (typeof me.quota === 'number') html += row('能建几个项目', me.quota + ' 个');
+      if (me.viewAs) {
+        html += '<div class="ab-tip" style="color:#d29922;border-color:#d2992255">' +
+          '⚠️ 你现在是以「' + esc(me.name || me.viewAs) + '」的视角在看；真实登录的是 ' +
+          esc(me.operator || '') + '（' + opRoleTxt + '）。</div>' +
+          '<div style="display:flex;gap:8px;margin-top:12px">' +
+          '<button class="ab-btn ghost" id="ac-exit" type="button">退出视角，回到我自己</button></div>';
+      }
+      body.innerHTML = html;
+      var bExit = body.querySelector('#ac-exit');
+      if (bExit) bExit.onclick = function () {
+        api('/_gate/view-as', { method: 'POST', body: JSON.stringify({ as: '' }) }).then(function () { location.href = '/'; });
+      };
+    });
+  }
+
   function openPassword() {
     openLayer('修改密码', function (body) {
       body.innerHTML =
