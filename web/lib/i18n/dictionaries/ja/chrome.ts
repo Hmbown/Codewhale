@@ -33,9 +33,11 @@ export const chrome: ChromeDict = {
 
   navProduct: "製品",
   navModels: "モデル",
+  navPlugins: "プラグイン",
   navPricing: "料金",
   navProductSecondary: "Product",
   navModelsSecondary: "Models",
+  navPluginsSecondary: "Plugins",
   navPricingSecondary: "Pricing",
 
   skipToContent: "メインコンテンツへスキップ",

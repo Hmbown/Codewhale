@@ -1327,7 +1327,8 @@ a.body-link:hover { background-size: 100% 6px; color: var(--ink); }
   border-top: 1px solid var(--hairline);
 }
 
-.portal-topic-list > a {
+.portal-topic-list > a,
+.portal-topic-list > div {
   display: grid;
   grid-template-columns: minmax(8rem, 0.42fr) minmax(0, 1fr) auto;
   gap: 1.25rem;
@@ -1617,16 +1618,20 @@ a.body-link:hover { background-size: 100% 6px; color: var(--ink); }
   }
 
   .portal-topic-list > a,
-  .portal-doc-groups .portal-topic-list > a {
+  .portal-topic-list > div,
+  .portal-doc-groups .portal-topic-list > a,
+  .portal-doc-groups .portal-topic-list > div {
     grid-template-columns: 1fr auto;
     gap: 0.45rem 1rem;
   }
 
-  .portal-topic-list > a span:nth-child(2) {
+  .portal-topic-list > a span:nth-child(2),
+  .portal-topic-list > div span:nth-child(2) {
     grid-column: 1 / -1;
   }
 
-  .portal-topic-list > a span:last-child {
+  .portal-topic-list > a span:last-child,
+  .portal-topic-list > div span:last-child {
     grid-column: 2;
     grid-row: 1;
   }

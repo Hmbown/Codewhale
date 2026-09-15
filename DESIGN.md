@@ -224,7 +224,7 @@ gated on `prefers-reduced-motion: no-preference`. No scroll-reveal.
 ## Components
 
 - **Nav**: paper at 94%, hairline below. Left: navy mark + navy wordmark as
-  one link. Centre: Product · Models · Pricing · Docs. Right: theme (docs
+  one link. Centre: Product · Models · Plugins · Pricing · Docs. Right: theme (docs
   only), locale, stars, Sign in / Create account, one filled Install button.
   The compact sheet adds Start · Install · FAQ · Community · Contribute.
 - **Buttons**: `.folio-button` — brand-navy fill (primary) or navy outline

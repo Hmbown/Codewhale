@@ -32,9 +32,11 @@ export const chrome: ChromeDict = {
 
   navProduct: "Produk",
   navModels: "Model",
+  navPlugins: "Plugin",
   navPricing: "Harga",
   navProductSecondary: "Product",
   navModelsSecondary: "Models",
+  navPluginsSecondary: "Plugins",
   navPricingSecondary: "Pricing",
 
   skipToContent: "Lewati ke konten utama",

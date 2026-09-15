@@ -48,15 +48,17 @@ export interface ChromeDict {
   navContributeSecondary: string;
 
   /**
-   * The primary strip: Product / Models / Pricing / Docs. The older six
-   * (Start, Install, FAQ, Community, Contribute) stay in the dictionary for
-   * the compact sheet's second group and the footer.
+   * The primary strip: Product / Models / Plugins / Pricing / Docs. The
+   * older six (Start, Install, FAQ, Community, Contribute) stay in the
+   * dictionary for the compact sheet's second group and the footer.
    */
   navProduct: string;
   navModels: string;
+  navPlugins: string;
   navPricing: string;
   navProductSecondary: string;
   navModelsSecondary: string;
+  navPluginsSecondary: string;
   navPricingSecondary: string;
 
   /**

@@ -36,9 +36,11 @@ export const chrome: ChromeDict = {
 
   navProduct: "제품",
   navModels: "모델",
+  navPlugins: "플러그인",
   navPricing: "요금",
   navProductSecondary: "Product",
   navModelsSecondary: "Models",
+  navPluginsSecondary: "Plugins",
   navPricingSecondary: "Pricing",
 
   skipToContent: "본문으로 건너뛰기",
