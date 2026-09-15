@@ -88,29 +88,103 @@
     el.textContent = text;
   }
 
-  /* ── 模型小标签可点（对话区上方的「模型: xxx」——比藏在菜单里好找）── */
+  /* 当前会话 id —— 自己猴补 fetch 捕获（官方每次选中/新建会话都会 GET /v1/threads/{id}）。
+   * ⚠️ 不能复用文件后面那个 LAST_THREAD：它在**另一个 IIFE** 里，作用域不共享（2026-09-15 踩过）。 */
+  var MODEL_THREAD = '';
+  (function () {
+    var prev = window.fetch;
+    window.fetch = function (url, opt) {
+      try {
+        var u = typeof url === 'string' ? url : ((url && url.url) || '');
+        var m = u.match(/\/v1\/threads\/([^\/?]+)/);
+        if (m && m[1] && m[1] !== 'summary') MODEL_THREAD = m[1];
+      } catch (e) {}
+      return prev.apply(this, arguments);
+    };
+  })();
+
+  /* ── 模型小标签可点（对话区上方的「模型: xxx」——比藏在菜单里好找）──
+   * ⚠️ 2026-09-15 重写：以前写死三个名字写进 m0/.env，而**没有任何在跑的代码读那份 .env**
+   *（读它的 currentModel() → runChange() → /_gate/change，只有已下线的旧界面在调）→ 假按钮。
+   * 现在走官方两条：① 目录 `GET /v1/providers` + `/v1/providers/{id}/models`（分页字段 nextCursor）
+   * ② 换模型 `PATCH /v1/threads/{id} {model}` —— **线程级，当前会话下一轮就生效**
+   *（实测：PATCH 成 deepseek-v4-pro 后发消息，引擎回 effective_model=deepseek-v4-pro）。
+   * 列表**不写死**：只列引擎里配了密钥的提供商（credentialState=configured），
+   * 以后配了 claude / kimi 的 key 就自动出现在这里。
+   */
+  function loadProviderModels(pid) {
+    var out = [];
+    function step(cursor) {
+      var q = '?limit=100' + (cursor ? '&cursor=' + encodeURIComponent(cursor) : '');
+      return api('/v1/providers/' + encodeURIComponent(pid) + '/models' + q).then(function (r) {
+        var b = r.body || {};
+        if (String(b.provider || '') !== pid || !Array.isArray(b.models)) return out;
+        out = out.concat(b.models);
+        var next = typeof b.nextCursor === 'string' ? b.nextCursor.trim() : '';
+        if (next && out.length < 500) return step(next);
+        return out;
+      });
+    }
+    return step('');
+  }
+  /** 换完把顶部那个「模型」小标签就地改掉（官方那块是只读渲染的，不会自己刷） */
+  function paintModelChip(model) {
+    var chips = document.querySelectorAll('#session-facts .fact-chip[data-asbudy-model] strong');
+    for (var i = 0; i < chips.length; i++) chips[i].textContent = model;
+  }
   function openModelPicker() {
-    api('/_gate/model').then(function (r) {
-      var models = (r.body && r.body.models) || [];
+    var tid = MODEL_THREAD;
+    if (!tid) { alert('先在左边点开一个会话，再换模型'); return; }
+    api('/v1/providers').then(function (r) {
+      var all = (r.body && r.body.providers) || [];
+      var ready = all.filter(function (p) { return p && p.id && p.credentialState === 'configured'; });
       var cur = (r.body && r.body.current) || '';
-      if (!models.length) { alert('读不到模型列表'); return; }
-      openLayer('换个模型', function (body) {
-        body.innerHTML = '<div class="ab-tip">当前项目用的模型。换完下一轮对话生效。</div>' +
-          models.map(function (m) {
-            var on = m.id === cur;
-            return '<button class="ab-menu-item" data-m="' + esc(m.id) + '" style="' + (on ? 'border-color:#58a6ff' : '') + '">' +
-              esc(m.name) + (on ? '（当前）' : '') + '<small>' + esc(m.note || '') + '</small></button>';
-          }).join('') +
-          '<div class="ab-msg" id="mp-msg"></div>';
-        var msgEl = body.querySelector('#mp-msg');
-        body.querySelectorAll('button[data-m]').forEach(function (b) {
-          b.onclick = function () {
-            api('/_gate/model', { method: 'POST', body: JSON.stringify({ model: b.getAttribute('data-m') }) }).then(function (r2) {
-              if (!r2.ok) { msg(msgEl, (r2.body && r2.body.error) || '换不了', false); return; }
-              msg(msgEl, '换好了，下一轮生效', true);
-              setTimeout(closeLayer, 900);
+      if (!ready.length) { alert('引擎里还没有配好密钥的模型提供商'); return; }
+      api('/v1/threads/' + encodeURIComponent(tid)).then(function (tr) {
+        var body = tr.body || {};
+        var th = body.thread || body;          // ⚠️ 详情接口把 thread 包在 .thread 里（列表才是裸数组）
+        var thProvider = String(th.model_provider_id || th.model_provider || '');
+        var thModel = String(th.model || '');
+        openLayer('换个模型', function (body) {
+          body.innerHTML = '<div class="ab-tip" id="mp-tip">选中的模型，这一轮对话就开始用。</div>' +
+            '<div id="mp-list"><div class="ab-tip">正在读模型目录…</div></div>' +
+            '<div class="ab-msg" id="mp-msg"></div>';
+          var list = body.querySelector('#mp-list');
+          var msgEl = body.querySelector('#mp-msg');
+          Promise.all(ready.map(function (p) {
+            return loadProviderModels(p.id).then(function (models) { return { p: p, models: models }; });
+          })).then(function (groups) {
+            groups.sort(function (a, b) { return (b.p.id === cur ? 1 : 0) - (a.p.id === cur ? 1 : 0); });
+            list.innerHTML = groups.map(function (g) {
+              var same = !thProvider || g.p.id === thProvider;
+              var head = '<div style="color:#8b949e;font-size:13px;margin:12px 0 6px">' +
+                esc(g.p.display_name || g.p.id) + (g.p.id === cur ? '（默认）' : '') + '</div>';
+              if (!g.models.length) return head + '<div class="ab-tip">这个提供商没有模型目录</div>';
+              return head + g.models.map(function (m) {
+                var on = m.id === thModel;
+                var sub = [];
+                if (!same) sub.push('换提供商要新建会话');
+                if (m.image_input === 'supported') sub.push('可看图');
+                return '<button class="ab-menu-item" data-m="' + esc(m.id) + '" data-p="' + esc(g.p.id) + '"' +
+                  (same ? '' : ' style="opacity:.6"') + '>' + esc(m.id) + (on ? '（当前）' : '') +
+                  '<small style="' + (on ? 'color:#58a6ff' : '') + '">' + esc(sub.join(' · ')) + '</small></button>';
+              }).join('');
+            }).join('');
+            list.querySelectorAll('button[data-m]').forEach(function (b) {
+              b.onclick = function () {
+                var mid = b.getAttribute('data-m');
+                var pid = b.getAttribute('data-p');
+                if (thProvider && pid !== thProvider) { msg(msgEl, '换提供商要新建会话（当前会话在 ' + thProvider + '）', false); return; }
+                api('/v1/threads/' + encodeURIComponent(tid), { method: 'PATCH', body: JSON.stringify({ model: mid }) })
+                  .then(function (r2) {
+                    if (!r2.ok) { msg(msgEl, (r2.body && r2.body.error) || '换不了', false); return; }
+                    paintModelChip(mid);
+                    msg(msgEl, '换好了 —— 这一轮就用「' + mid + '」', true);
+                    setTimeout(closeLayer, 900);
+                  });
+              };
             });
-          };
+          }).catch(function (e) { msg(msgEl, '读模型目录失败：' + ((e && e.message) || e), false); });
         });
       });
     });
