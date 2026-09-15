@@ -197,11 +197,7 @@
       .then(function (r) { return r.ok ? r.json() : null; })
       .then(function (d) {
         if (!d) { alert('读不到这个文件'); return; }
-        if (d.kind === 'office') showPanel(a.name, htmlBody(d.html || ''), d.download);
-        else if (d.kind === 'text' || d.kind === 'svg') showPanel(a.name, textBody(d.text || ''), d.download);
-        else if (d.kind === 'image') showPanel(a.name, imgBody(d.url), d.download);
-        else if (d.kind === 'pdf') showPanel(a.name, pdfBody(d.url), d.download);
-        else showPanel(a.name, textBody('这种格式暂时只能下下来看'), d.download);
+        showData(a.name, d);      // 跟另外两条链同一套渲染（2026-09-16）
       })
       .catch(function () { alert('读不到这个文件'); });
   }
@@ -410,13 +406,7 @@
       var r = await fetch(url, { credentials: 'same-origin' });
       if (!r.ok) { alert('读不到这个文件'); return; }
       var d = await r.json();
-      if (d.kind === 'office') showPanel(f.name, htmlBody(d.html || ''), d.download);
-      else if (d.kind === 'table') showPanel(f.name, tableBody(d), d.download);
-      else if (d.kind === 'text' || d.kind === 'svg' || d.kind === 'code') showPanel(f.name, textBody(d.text || d.content || ''), d.download);
-      else if (d.kind === 'image') showPanel(f.name, imgBody(d.url), d.download);
-      else if (d.kind === 'pdf') showPanel(f.name, pdfBody(d.url), d.download);
-      else if (d.kind === 'unsupported') showPanel(f.name, textBody(d.note || '这种格式暂时只能下下来看'), d.download);
-      else showPanel(f.name, textBody('这种格式暂时只能下下来看'), d.download);
+      showData(f.name, d);
     } catch (e) { alert('读不到这个文件'); }
   }
 
@@ -427,14 +417,53 @@
       var r = await fetch('/_gate/artifact/view?project=' + encodeURIComponent(pkey) + '&path=' + encodeURIComponent(fp), { credentials: 'same-origin' });
       if (!r.ok) { alert('读不到这个文件'); return; }
       var d = await r.json();
-      if (d.kind === 'office') showPanel(name, htmlBody(d.html || ''), d.download);
-      else if (d.kind === 'table') showPanel(name, tableBody(d), d.download);
-      else if (d.kind === 'text' || d.kind === 'svg' || d.kind === 'code') showPanel(name, textBody(d.text || d.content || ''), d.download);
-      else if (d.kind === 'image') showPanel(name, imgBody(d.url), d.download);
-      else if (d.kind === 'pdf') showPanel(name, pdfBody(d.url), d.download);
-      else if (d.kind === 'unsupported') showPanel(name, textBody(d.note || '这种格式暂时只能下下来看'), d.download);
-      else showPanel(name, textBody('这种格式暂时只能下下来看'), d.download);
+      showData(name, d);
     } catch (e) { alert('读不到这个文件'); }
+  }
+
+  // ── 预览分派：所有链（产出物 / 我的资料 / 目录树里的成品）只走这里 ──
+  // 后端两条链现在返回同一套 kind，所以渲染只写一份 —— 以前三处各写一遍 if，改一个格式要改三处。
+  function showData(name, d) {
+    var k = (d && d.kind) || '';
+    if (k === 'office' || k === 'html' || k === 'markdown') return showPanel(name, htmlBody(d.html || ''), d.download);
+    if (k === 'table') return showPanel(name, tableBody(d), d.download);        // 后端不再发这个 kind 了，留着兼容
+    if (k === 'text' || k === 'svg' || k === 'code') return showPanel(name, textBody(d.text || d.content || ''), d.download);
+    if (k === 'image') return showPanel(name, imgBody(d.url), d.download);
+    if (k === 'pdf') return showPanel(name, pdfBody(d.url), d.download);
+    if (k === 'unsupported') return showPanel(name, textBody(d.note || '这种格式暂时只能下下来看'), d.download);
+    return showPanel(name, textBody((d && d.note) || '这种格式暂时只能下下来看'), d.download);   // 没得预览也要说清楚，别给空面板
+  }
+
+  // 提取出来的内容（docx 表格 / xlsx / pptx / csv / markdown）得看得像个正经文档 ——
+  // 后端给的是没样式的 HTML 片段，这些规则只作用于预览里的 .pv-html，不碰官方界面。只注一次。
+  function ensurePreviewCss() {
+    if (document.getElementById('asbudy-preview-css')) return;
+    var s = document.createElement('style');
+    s.id = 'asbudy-preview-css';
+    s.textContent = [
+      '.pv-html h1{font-size:20px;margin:16px 0 8px;line-height:1.3}',
+      '.pv-html h2{font-size:17px;margin:14px 0 6px;line-height:1.3}',
+      '.pv-html h3{font-size:15px;margin:12px 0 6px;line-height:1.4}',
+      '.pv-html h4,.pv-html h5,.pv-html h6{font-size:14px;margin:10px 0 4px}',
+      '.pv-html p{margin:6px 0}',
+      '.pv-html ul,.pv-html ol{margin:6px 0;padding-left:22px}',
+      '.pv-html li{margin:2px 0}',
+      '.pv-html a{color:#58a6ff}',
+      '.pv-html code{background:#161b22;border-radius:3px;padding:1px 4px;font-size:12.5px;font-family:ui-monospace,monospace}',
+      '.pv-html pre{background:#0b0f14;border:1px solid #30363d;border-radius:6px;padding:10px 12px;margin:8px 0;overflow:auto}',
+      '.pv-html pre code{background:none;padding:0}',
+      '.pv-html table{border-collapse:collapse;margin:10px 0;font-size:13px;max-width:100%}',
+      '.pv-html th,.pv-html td{border:1px solid #30363d;padding:4px 8px;text-align:left;vertical-align:top}',
+      '.pv-html th{background:#161b22;font-weight:600}',
+      '.pv-html blockquote{border-left:3px solid #30363d;margin:8px 0;padding:2px 12px;color:#8b949e}',
+      '.pv-html hr{border:0;border-top:1px solid #30363d;margin:14px 0}',
+      '.pv-html img{max-width:100%}',
+      // extract.py 里的提示文字（.x-mut = 说明/截断提示；.slide = pptx 的一页）
+      '.pv-html .x-mut{color:#8b949e;font-size:13px}',
+      '.pv-html .slide{border:1px solid #30363d;border-radius:8px;padding:10px 14px;margin:10px 0}',
+      '.pv-html .slide-no{color:#8b949e;font-size:12px;margin-bottom:6px}'
+    ].join('\n');
+    document.head.appendChild(s);
   }
 
   function textBody(text) {
@@ -444,19 +473,43 @@
     return pre;
   }
   function htmlBody(html) {
+    ensurePreviewCss();
     var div = document.createElement('div');
+    div.className = 'pv-html';
     div.style.cssText = 'margin:0;padding:16px;overflow:auto;color:#e6edf3;font-size:14px;line-height:1.6';
+    // 内容是后端 extract.py 生成的，里面所有文字都先 html.escape 过（markdown 也一样），
+    // 所以客户文件里就算写了 <script> 也只会原样显示成文字
     div.innerHTML = html;
     return div;
   }
   function imgBody(url) {
+    if (!url) return textBody('这个文件没有能内嵌预览的地址。');
+    var wrap = document.createElement('div');
+    wrap.style.cssText = 'display:flex;align-items:center;justify-content:center;min-height:160px';
     var img = document.createElement('img');
-    img.src = url; img.style.cssText = 'max-width:100%;max-height:70vh;object-fit:contain';
-    return img;
+    img.src = url;
+    img.alt = '';
+    img.style.cssText = 'max-width:100%;max-height:70vh;object-fit:contain';
+    // 图坏了/格式不认时说一句人话，不然用户只看到一个裂图标
+    img.onerror = function () {
+      wrap.innerHTML = '';
+      var p = document.createElement('div');
+      p.style.cssText = 'color:#8b949e;font-size:13px';
+      p.textContent = '这张图显示不出来（文件可能坏了，或者这个格式浏览器不认）。点右上角「下载」拿下来看。';
+      wrap.appendChild(p);
+    };
+    wrap.appendChild(img);
+    return wrap;
   }
   function pdfBody(url) {
+    // 浏览器不带 PDF 阅读器时嵌进去只会是空白（navigator.pdfViewerEnabled=false）——
+    // 那就别装样子，直接说清楚让他下载
+    if (!url || navigator.pdfViewerEnabled === false) {
+      return textBody('这个浏览器不带 PDF 阅读器，嵌不进来 —— 点右上角「下载」拿下来看。');
+    }
     var f = document.createElement('iframe');
-    f.src = url; f.style.cssText = 'width:100%;height:70vh;border:0';
+    f.src = url; f.title = 'PDF 预览';
+    f.style.cssText = 'width:100%;height:70vh;border:0;background:#fff';
     return f;
   }
   function tableBody(d) {
