@@ -305,8 +305,6 @@
       if (role === 'admin') {
         html += '<button class="ab-menu-item" id="ab-m-users">客户管理<small>建客户账号、把项目转给客户</small></button>';
       }
-      html += '<button class="ab-menu-item" id="ab-m-new">新建项目<small>从零开始（带示例 / 空白）</small></button>';
-      html += '<button class="ab-menu-item" id="ab-m-import">导入已有项目<small>我已经有一套代码 / 系统，搬进来</small></button>';
       html += '<button class="ab-menu-item" id="ab-m-proj">项目管理<small>暂停（停引擎、省内存）/ 恢复 / 删除</small></button>';
       html += '<button class="ab-menu-item" id="ab-m-space">空间<small>磁盘用量、每个项目占多少 / 上限多少</small></button>';
       html += '<button class="ab-menu-item" id="ab-m-adv">高级设置<small>代码存哪里（git）/ 过程显示多详细 / 只看不改 / 花了多少</small></button>';
@@ -321,10 +319,6 @@
       if (bStaff) bStaff.onclick = function () { openStaff(role === 'admin' ? null : ME.user); };
       var bUsers = body.querySelector('#ab-m-users');
       if (bUsers) bUsers.onclick = openUsers;
-      var bNew = body.querySelector('#ab-m-new');
-      if (bNew) bNew.onclick = openNewProject;
-      var bImp = body.querySelector('#ab-m-import');
-      if (bImp) bImp.onclick = openImportProject;
       body.querySelector('#ab-m-proj').onclick = openProjects;
       var bSpace = body.querySelector('#ab-m-space');
       if (bSpace) bSpace.onclick = openSpace;
@@ -566,107 +560,8 @@
   }
 
   /* ── 导入已有项目（把客户现有的代码 / 系统搬进来）── */
-  function openImportProject() {
-    api('/_gate/files').then(function (r) {
-      var files = (r.body && r.body.files) || [];
-      var dirs = files.filter(function (n) { return n.isDir; });
-      openLayer('导入已有项目', function (body) {
-        var helpHtml =
-          '<div class="ab-tip" id="imp-help" hidden style="border:1px solid #30363d;border-radius:8px;padding:10px 12px;background:#161b22">' +
-          '<b style="color:#e6edf3">这是干什么的</b><br>' +
-          '把你现有的代码 / 系统搬进来，AI 就能在上面干活。<br><br>' +
-          '<b style="color:#e6edf3">自动跳过的</b><br>' +
-          'node_modules、.git、venv、__pycache__、dist 这些「装出来的」目录 —— 不用传，来了自己装。<br><br>' +
-          '<b style="color:#e6edf3">搬完之后</b><br>' +
-          '建议跟 AI 说一句：「帮我把环境装好，跑起来」——它会自己看代码、装依赖、起服务。' +
-          '</div>';
-        body.innerHTML =
-          '<div style="display:flex;align-items:center;gap:8px;margin-bottom:10px">' +
-          '<span class="ab-tip" style="margin:0">把已上传的文件夹搬成一个新项目</span>' +
-          '<span id="imp-q" title="这是干什么的" style="cursor:pointer;width:18px;height:18px;line-height:18px;text-align:center;border:1px solid #30363d;border-radius:50%;color:#8b949e;font-size:13.5px;flex:none">?</span>' +
-          '</div>' + helpHtml +
-          '<div class="ab-row"><label>名字</label><input class="ab-input" id="imp-name" placeholder="如：我原来的客户系统"></div>' +
-          '<div class="ab-row"><label>从哪导</label>' +
-          (dirs.length
-            ? '<select class="ab-input" id="imp-src">' + dirs.map(function (d) { return '<option value="' + esc(d.path) + '">' + esc(d.name) + '</option>'; }).join('') + '</select>'
-            : '<span style="color:#d29922;font-size:13.5px">还没有上传过文件夹</span>') +
-          '</div>' +
-          (dirs.length ? '' : '<div class="ab-tip">先去侧栏「我的资料」卡片 →「+ 传资料」→「选整个文件夹」，传完再回来。</div>') +
-          '<div style="display:flex;gap:8px;margin-top:16px">' +
-          '<button class="ab-btn" id="imp-go" type="button"' + (dirs.length ? '' : ' disabled') + '>导入</button>' +
-          '<button class="ab-btn ghost" id="imp-cancel" type="button">取消</button></div>' +
-          '<div class="ab-msg" id="imp-msg"></div>';
-        var msgEl = body.querySelector('#imp-msg');
-        body.querySelector('#imp-q').onclick = function () {
-          var h = body.querySelector('#imp-help');
-          h.hidden = !h.hidden;
-        };
-        body.querySelector('#imp-cancel').onclick = closeLayer;
-        body.querySelector('#imp-go').onclick = function () {
-          var name = body.querySelector('#imp-name').value.trim();
-          var srcEl = body.querySelector('#imp-src');
-          if (!name) { msg(msgEl, '起个名字吧', false); return; }
-          if (!srcEl) return;
-          var go = body.querySelector('#imp-go');
-          go.disabled = true;
-          msg(msgEl, '正在搬，约 30~60 秒…', true);
-          api('/_gate/projects/create', { method: 'POST', body: JSON.stringify({ name: name, template: 'blank', from: srcEl.value }) })
-            .then(function (r2) {
-              go.disabled = false;
-              if (!r2.ok) { msg(msgEl, (r2.body && r2.body.error) || '没导进来', false); return; }
-              // 搬完的引导：告诉用户下一步让 AI 装环境
-              body.querySelector('.ab-body, body') && null;
-              openLayer('导入好了', function (b2) {
-                b2.innerHTML =
-                  '<div style="color:#3fb950;font-size:15px;margin-bottom:10px">「' + esc(name) + '」已导入。</div>' +
-                  '<div class="ab-tip">代码已经搬进来了，但环境（依赖、启动）还没装。<br><br>' +
-                  '<b style="color:#e6edf3">下一步：</b>切到这个项目，跟它说一句 ——<br>' +
-                  '<span style="display:block;margin:8px 0;padding:8px 12px;background:#161b22;border:1px solid #30363d;border-radius:8px;color:#58a6ff">' +
-                  '帮我把环境装好，跑起来</span>' +
-                  '它会自己看代码、装依赖、起服务。</div>' +
-                  '<div style="display:flex;gap:8px;margin-top:14px"><button class="ab-btn" id="imp-done" type="button">去看看</button></div>';
-                b2.querySelector('#imp-done').onclick = function () { location.reload(); };
-              });
-            });
-        };
-      });
-    });
-  }
 
   /* ── 新建项目 ── */
-  function openNewProject() {
-    openLayer('新建项目', function (body) {
-      body.innerHTML =
-        '<div class="ab-tip">每个项目是一套独立系统（自己的引擎 + 自己的工作区）。建一个约 30~60 秒。</div>' +
-        '<div class="ab-row"><label>名字</label><input class="ab-input" id="np-name" placeholder="如：客户管理系统"></div>' +
-        '<div class="ab-row"><label>一句话说</label><input class="ab-input" id="np-note" placeholder="可选，这个系统干什么用"></div>' +
-        '<div style="margin:12px 0 6px;color:#e6edf3;font-size:14px">从哪开始</div>' +
-        '<label class="ab-chk"><input type="radio" name="np-tpl" value="example" checked> 带示例（有客户 / 跟进 / 订单三张样例表）</label>' +
-        '<label class="ab-chk"><input type="radio" name="np-tpl" value="blank"> 空白（从零开始）</label>' +
-        '<div style="display:flex;gap:8px;margin-top:16px"><button class="ab-btn" id="np-go" type="button">建</button>' +
-        '<button class="ab-btn ghost" id="np-cancel" type="button">取消</button></div>' +
-        '<div class="ab-msg" id="np-msg"></div>';
-      var msgEl = body.querySelector('#np-msg');
-      body.querySelector('#np-cancel').onclick = closeLayer;
-      body.querySelector('#np-go').onclick = function () {
-        var nameEl = body.querySelector('#np-name');
-        var name = nameEl.value.trim();
-        var note = body.querySelector('#np-note').value.trim();
-        var tplEl = body.querySelector('input[name=np-tpl]:checked');
-        if (!name) { msg(msgEl, '起个名字吧', false); return; }
-        var go = body.querySelector('#np-go');
-        go.disabled = true;
-        msg(msgEl, '正在建，约 30~60 秒…', true);
-        api('/_gate/projects/create', { method: 'POST', body: JSON.stringify({ name: name, note: note, template: tplEl ? tplEl.value : 'example' }) })
-          .then(function (r) {
-            go.disabled = false;
-            if (!r.ok) { msg(msgEl, (r.body && r.body.error) || '没建成', false); return; }
-            msg(msgEl, '建好了：' + name + '，正在刷新…', true);
-            setTimeout(function () { location.reload(); }, 1200);
-          });
-      };
-    });
-  }
 
   /* ── 项目管理（暂停 / 恢复：停引擎 = 释放内存） ── */
   function openProjects() {
