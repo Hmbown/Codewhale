@@ -251,6 +251,48 @@
   var installEvt = null;
   window.addEventListener('beforeinstallprompt', function (e) { e.preventDefault(); installEvt = e; });
 
+  /* ── 平台协助授权（2026-09-15 · 档案附三 §13 原则②）──
+     客户本人的开关：开了，平台管理员才能「以你的视角」进来看 / 干活；随时可关。
+     为什么必须由客户点：原则是「可见默认关、要有授权」—— 管理员不能自己给自己授权。 */
+  function openConsent() {
+    api('/_gate/consent').then(function (r) {
+      var st = r.body || {};
+      openLayer('平台协助', function (body) {
+        var on = !!st.granted;
+        var html = '<div class="ab-tip">平台要替你排查问题时，需要先「以你的视角」进来（看到的就是你这个界面）。<br>' +
+          '<b>只有你能开这个开关，管理员不能替你开</b>；开了随时可以关。</div>';
+        html += '<div style="margin:12px 0 14px;padding:10px 12px;border:1px solid ' + (on ? '#3fb950' : '#30363d') +
+          ';border-radius:8px">当前状态：<b style="color:' + (on ? '#3fb950' : '#8b949e') + '">' +
+          (on ? '已开启' : '未开启') + '</b>' +
+          (on && st.until ? '<div style="color:#8b949e;font-size:13.5px;margin-top:4px">有效期到 ' +
+            esc(new Date(st.until).toLocaleString()) + '</div>' : '') + '</div>';
+        if (on) {
+          html += '<button class="ab-menu-item" id="ab-c-off">关闭平台协助<small>关掉后，平台管理员立刻进不来</small></button>';
+        } else {
+          html += '<button class="ab-menu-item" id="ab-c-on24">开启 24 小时<small>够排查一次问题</small></button>' +
+                  '<button class="ab-menu-item" id="ab-c-on168">开启 7 天<small>长期协助（随时可关）</small></button>';
+        }
+        html += '<div class="ab-tip" id="ab-c-msg" style="margin-top:10px"></div>';
+        body.innerHTML = html;
+        var m = body.querySelector('#ab-c-msg');
+        function post(data) {
+          m.textContent = '正在提交…';
+          api('/_gate/consent', { method: 'POST', body: JSON.stringify(data) }).then(function (rr) {
+            if (!rr.ok) { m.textContent = (rr.body && rr.body.error) || '没成功，再试一次'; return; }
+            m.textContent = data.revoke ? '已关闭。' : '已开启。';
+            setTimeout(openConsent, 500);   // 重开一层刷新状态（openLayer 会先关旧的）
+          });
+        }
+        var b24 = body.querySelector('#ab-c-on24');
+        if (b24) b24.onclick = function () { post({ hours: 24 }); };
+        var b168 = body.querySelector('#ab-c-on168');
+        if (b168) b168.onclick = function () { post({ hours: 168 }); };
+        var bOff = body.querySelector('#ab-c-off');
+        if (bOff) bOff.onclick = function () { post({ revoke: true }); };
+      });
+    });
+  }
+
   /* ── 「我的」菜单 ── */
   function openMyMenu() {
     var role = ME ? ME.role : 'customer';
@@ -269,6 +311,9 @@
       html += '<button class="ab-menu-item" id="ab-m-files">我的文件<small>传资料（Excel / 合同 / 代码），不绑项目</small></button>';
       html += '<button class="ab-menu-item" id="ab-m-space">空间<small>磁盘用量、每个项目占多少 / 上限多少</small></button>';
       html += '<button class="ab-menu-item" id="ab-m-adv">高级设置<small>代码存哪里（git）/ 过程显示多详细 / 只看不改 / 花了多少</small></button>';
+      if (role === 'customer') {
+        html += '<button class="ab-menu-item" id="ab-m-consent">平台协助<small>让 AsBudy 平台协助你排查问题（只有你能开，随时可关）</small></button>';
+      }
       html += '<button class="ab-menu-item" id="ab-m-pw">修改密码<small>改自己的登录密码</small></button>';
       html += '<button class="ab-menu-item" id="ab-m-logout">退出登录<small>退出当前账号</small></button>';
       if (installEvt) html += '<button class="ab-menu-item" id="ab-m-install">装到桌面<small>把这个页面装成桌面应用</small></button>';
@@ -288,6 +333,8 @@
       if (bSpace) bSpace.onclick = openSpace;
       var bAdv = body.querySelector('#ab-m-adv');
       if (bAdv) bAdv.onclick = openAdvanced;
+      var bConsent = body.querySelector('#ab-m-consent');
+      if (bConsent) bConsent.onclick = openConsent;
       body.querySelector('#ab-m-pw').onclick = openPassword;
       var bIns = body.querySelector('#ab-m-install');
       if (bIns) bIns.onclick = function () { if (installEvt) { installEvt.prompt(); installEvt = null; closeLayer(); } };
