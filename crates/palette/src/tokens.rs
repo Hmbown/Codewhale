@@ -222,6 +222,84 @@ pub const MATRIX_TEXT_SOFT_RGB: (u8, u8, u8) = (221, 255, 221); // #DDFFDD
 pub const MATRIX_TEXT_DIM_RGB: (u8, u8, u8) = (0, 108, 0); // #006C00, lifted for 3:1
 pub const MATRIX_BORDER_RGB: (u8, u8, u8) = (0, 204, 0); // #00CC00
 
+// Shoreline — the product-client palette, shared with the GPUI desktop.
+//
+// Warm charcoal ground and warm paper sheet, one restrained blue, and the
+// whale's ivory ink on both sides. This is the default shell from 0.9.14:
+// the navy "Underwater" water column remains a selectable theme, it is no
+// longer the ground the product opens on. Values are the GPUI client's
+// `Theme` slots (`codehwhale-gpui/src/workspace/mod.rs`), so the terminal
+// and the desktop window are one product rather than two visual systems.
+//
+// Every pair audited by `contrast::theme_contrast_violations` clears its
+// floor: body roles clear 4.5:1 on all four surfaces, hint/dim and the
+// status roles clear 3:1.
+pub const SHORELINE_SURFACE_RGB: (u8, u8, u8) = (33, 31, 35); // #211F23 warm charcoal field
+pub const SHORELINE_PANEL_RGB: (u8, u8, u8) = (43, 40, 46); // #2B282E raised plate
+pub const SHORELINE_ELEVATED_RGB: (u8, u8, u8) = (53, 49, 58); // #35313A
+pub const SHORELINE_COMPOSER_RGB: (u8, u8, u8) = (43, 40, 46); // #2B282E
+pub const SHORELINE_CHROME_RGB: (u8, u8, u8) = (26, 24, 28); // #1A181C recessed chrome
+pub const SHORELINE_SELECTION_RGB: (u8, u8, u8) = (53, 73, 103); // #354967
+pub const SHORELINE_TEXT_BODY_RGB: (u8, u8, u8) = (242, 236, 229); // #F2ECE5
+pub const SHORELINE_TEXT_SOFT_RGB: (u8, u8, u8) = (217, 210, 220); // #D9D2DC
+pub const SHORELINE_TEXT_MUTED_RGB: (u8, u8, u8) = (176, 167, 178); // #B0A7B2
+pub const SHORELINE_TEXT_HINT_RGB: (u8, u8, u8) = (154, 145, 159); // #9A919F
+pub const SHORELINE_TEXT_DIM_RGB: (u8, u8, u8) = (126, 117, 131); // #7E7583
+pub const SHORELINE_BORDER_RGB: (u8, u8, u8) = (73, 66, 77); // #49424D
+pub const SHORELINE_ACTION_RGB: (u8, u8, u8) = (144, 185, 255); // #90B9FF the one blue
+pub const SHORELINE_LIVE_RGB: (u8, u8, u8) = (127, 214, 198); // #7FD6C6 the live lane
+pub const SHORELINE_HUMAN_RGB: (u8, u8, u8) = (246, 196, 83); // #F6C453 Signal Gold, the human lane
+pub const SHORELINE_ERROR_RGB: (u8, u8, u8) = (255, 143, 168); // #FF8FA8
+pub const SHORELINE_ERROR_HOVER_RGB: (u8, u8, u8) = (255, 166, 187); // #FFA6BB
+pub const SHORELINE_ERROR_SURFACE_RGB: (u8, u8, u8) = (58, 32, 41); // #3A2029
+pub const SHORELINE_ERROR_TEXT_RGB: (u8, u8, u8) = (255, 220, 230); // #FFDCE6
+pub const SHORELINE_WARNING_RGB: (u8, u8, u8) = (240, 168, 104); // #F0A868
+pub const SHORELINE_SUCCESS_RGB: (u8, u8, u8) = (163, 217, 119); // #A3D977
+pub const SHORELINE_STATUS_WORKING_RGB: (u8, u8, u8) = SHORELINE_LIVE_RGB;
+// Mode badges keep the shipped mode ramp: these four are proof-tested distinct
+// from one another and from every semantic lane, and a mode badge is identity,
+// not decoration. `mode_agent` must differ from `accent_primary` or
+// `adapt::theme_semantic_foreground_role` resolves the action lane to a mode
+// role (`ModeAgent`) before it ever reaches `Action`.
+pub const SHORELINE_MODE_AGENT_RGB: (u8, u8, u8) = (126, 180, 232); // #7EB4E8
+pub const SHORELINE_MODE_YOLO_RGB: (u8, u8, u8) = (255, 112, 160); // #FF70A0
+pub const SHORELINE_MODE_PLAN_RGB: (u8, u8, u8) = (185, 220, 236); // #B9DCEC
+pub const SHORELINE_MODE_OPERATE_RGB: (u8, u8, u8) = (173, 136, 255); // #AD88FF
+pub const SHORELINE_DIFF_ADDED_FG_RGB: (u8, u8, u8) = (127, 214, 160); // #7FD6A0
+pub const SHORELINE_DIFF_ADDED_BG_RGB: (u8, u8, u8) = (30, 44, 37); // #1E2C25
+pub const SHORELINE_DIFF_DELETED_FG_RGB: (u8, u8, u8) = (255, 154, 171); // #FF9AAB
+pub const SHORELINE_DIFF_DELETED_BG_RGB: (u8, u8, u8) = (51, 32, 42); // #33202A
+
+// Shoreline Light — the same system on warm paper.
+pub const SHORELINE_LIGHT_SURFACE_RGB: (u8, u8, u8) = (245, 240, 233); // #F5F0E9
+pub const SHORELINE_LIGHT_PANEL_RGB: (u8, u8, u8) = (236, 229, 224); // #ECE5E0
+pub const SHORELINE_LIGHT_ELEVATED_RGB: (u8, u8, u8) = (255, 252, 247); // #FFFCF7
+pub const SHORELINE_LIGHT_COMPOSER_RGB: (u8, u8, u8) = (251, 247, 241); // #FBF7F1
+pub const SHORELINE_LIGHT_CHROME_RGB: (u8, u8, u8) = (237, 231, 224); // #EDE7E0
+pub const SHORELINE_LIGHT_SELECTION_RGB: (u8, u8, u8) = (200, 217, 249); // #C8D9F9
+pub const SHORELINE_LIGHT_TEXT_BODY_RGB: (u8, u8, u8) = (48, 40, 50); // #302832
+pub const SHORELINE_LIGHT_TEXT_SOFT_RGB: (u8, u8, u8) = (74, 65, 76); // #4A414C
+pub const SHORELINE_LIGHT_TEXT_MUTED_RGB: (u8, u8, u8) = (107, 96, 110); // #6B606E
+pub const SHORELINE_LIGHT_TEXT_HINT_RGB: (u8, u8, u8) = (117, 112, 128); // #757080
+pub const SHORELINE_LIGHT_TEXT_DIM_RGB: (u8, u8, u8) = (138, 130, 144); // #8A8290
+pub const SHORELINE_LIGHT_BORDER_RGB: (u8, u8, u8) = (215, 206, 213); // #D7CED5
+pub const SHORELINE_LIGHT_ACTION_RGB: (u8, u8, u8) = (36, 91, 199); // #245BC7
+pub const SHORELINE_LIGHT_LIVE_RGB: (u8, u8, u8) = (31, 122, 107); // #1F7A6B
+pub const SHORELINE_LIGHT_HUMAN_RGB: (u8, u8, u8) = (122, 85, 0); // #7A5500 Signal Gold at AA on paper
+pub const SHORELINE_LIGHT_ERROR_RGB: (u8, u8, u8) = (180, 35, 90); // #B4235A
+pub const SHORELINE_LIGHT_ERROR_SURFACE_RGB: (u8, u8, u8) = (251, 228, 236); // #FBE4EC
+pub const SHORELINE_LIGHT_ERROR_TEXT_RGB: (u8, u8, u8) = (122, 18, 53); // #7A1235
+pub const SHORELINE_LIGHT_WARNING_RGB: (u8, u8, u8) = (143, 85, 20); // #8F5514
+pub const SHORELINE_LIGHT_SUCCESS_RGB: (u8, u8, u8) = (47, 107, 58); // #2F6B3A
+pub const SHORELINE_LIGHT_MODE_AGENT_RGB: (u8, u8, u8) = (22, 54, 178); // #1636B2 distinct from LIGHT action
+pub const SHORELINE_LIGHT_MODE_YOLO_RGB: (u8, u8, u8) = (181, 35, 90); // #B5235A
+pub const SHORELINE_LIGHT_MODE_PLAN_RGB: (u8, u8, u8) = (52, 92, 128); // #345C80
+pub const SHORELINE_LIGHT_MODE_OPERATE_RGB: (u8, u8, u8) = (112, 71, 184); // #7047B8
+pub const SHORELINE_LIGHT_DIFF_ADDED_FG_RGB: (u8, u8, u8) = (31, 107, 69); // #1F6B45
+pub const SHORELINE_LIGHT_DIFF_ADDED_BG_RGB: (u8, u8, u8) = (226, 242, 230); // #E2F2E6
+pub const SHORELINE_LIGHT_DIFF_DELETED_FG_RGB: (u8, u8, u8) = (168, 40, 80); // #A82850
+pub const SHORELINE_LIGHT_DIFF_DELETED_BG_RGB: (u8, u8, u8) = (251, 230, 236); // #FBE6EC
+
 // Semantic colors
 pub const BORDER_COLOR_RGB: (u8, u8, u8) = WHALE_BORDER_RGB;
 

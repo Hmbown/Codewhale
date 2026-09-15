@@ -226,9 +226,9 @@ fn theme_options_with_custom(
                 .help("Pick a theme with live preview")
                 .values(SettingValues::new(
                     Cow::Owned(current.clone()),
-                    // A reset returns to the underwater default, not a
+                    // A reset returns to the Shoreline default, not a
                     // detected palette that can repaint it.
-                    Cow::Borrowed("underwater"),
+                    Cow::Borrowed("shoreline"),
                     Cow::Borrowed(name),
                 ))
                 .availability(SettingAvailability::Available)
@@ -255,7 +255,7 @@ fn theme_options_with_custom(
                 .help("Pick a user-authored theme overlay")
                 .values(SettingValues::new(
                     Cow::Owned(current.clone()),
-                    Cow::Borrowed("underwater"),
+                    Cow::Borrowed("shoreline"),
                     Cow::Owned(custom.selector.clone()),
                 ))
                 .availability(SettingAvailability::Available)

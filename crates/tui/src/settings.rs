@@ -345,13 +345,14 @@ pub struct Settings {
     /// ca, de, fr, id, hi, ru, uk.
     /// Every shipped pack holds full `en.json` parity; nothing falls back.
     pub locale: String,
-    /// Named UI theme. `"underwater"` is the fresh-install default and paints
-    /// the ocean field. `"terminal"` fully inherits the host terminal's
-    /// foreground/background. `"system"`, `"dark"`, `"light"`,
-    /// `"grayscale"`, and the community presets: `"catppuccin-mocha"`,
-    /// `"tokyo-night"`, `"dracula"`, `"gruvbox-dark"`. The
-    /// `background_color` setting still overrides the surface color on top
-    /// of the resolved theme.
+    /// Named UI theme. `"shoreline"` is the fresh-install default: the warm
+    /// charcoal and restrained blue the desktop client paints too.
+    /// `"underwater"` paints the ocean field. `"terminal"` fully inherits the
+    /// host terminal's foreground/background. `"system"`, `"dark"`,
+    /// `"light"`, `"grayscale"`, and the community presets:
+    /// `"catppuccin-mocha"`, `"tokyo-night"`, `"dracula"`,
+    /// `"gruvbox-dark"`. The `background_color` setting still overrides the
+    /// surface color on top of the resolved theme.
     pub theme: String,
     /// Optional main TUI background color as a 6-digit hex RGB value.
     pub background_color: Option<String>,
@@ -571,7 +572,7 @@ impl Default for Settings {
             show_tool_details: false,
             inline_diffs: "full".to_string(),
             locale: "auto".to_string(),
-            theme: "underwater".to_string(),
+            theme: "shoreline".to_string(),
             background_color: None,
             composer_density: "comfortable".to_string(),
             composer_border: true,
@@ -2923,9 +2924,9 @@ fn normalize_synchronized_output(value: &str) -> &str {
 
 fn normalize_settings_theme(value: &str) -> String {
     // A malformed persisted selector must not turn into a painted application
-    // background. Falling back to the underwater default keeps a single
-    // compiled first-party theme until the user picks an explicit palette.
-    normalize_theme_setting(value).unwrap_or_else(|_| "underwater".to_string())
+    // background. Falling back to the compiled default keeps a single
+    // first-party theme until the user picks an explicit palette.
+    normalize_theme_setting(value).unwrap_or_else(|_| "shoreline".to_string())
 }
 
 /// Returns `true` when the active terminal is Ptyxis (the new default

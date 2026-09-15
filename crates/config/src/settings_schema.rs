@@ -476,7 +476,7 @@ pub const SETTINGS_SCHEMA: &[SettingDef] = &[
     def(
         "theme",
         SettingKind::String,
-        "underwater",
+        "shoreline",
         ui(
             TAB_APPEARANCE,
             "display",

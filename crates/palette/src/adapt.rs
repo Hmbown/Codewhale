@@ -199,13 +199,18 @@ const fn theme_diff_deleted_bg(ui: &UiTheme) -> Color {
 
 /// Returns `true` if the preset participates in the cell-level remap. The
 /// default Whale and System themes pass through unchanged so this whole
-/// stage compiles down to a single load+compare on the hot path.
+/// stage compiles down to a single load+compare on the hot path. Shoreline is
+/// listed because it is a full re-ink — warm charcoal instead of the navy the
+/// direct terminal constants were tuned for — so every one of those call
+/// sites has to land on the preset's slots.
 #[inline]
 #[must_use]
 pub const fn theme_remap_active(theme: ThemeId) -> bool {
     matches!(
         theme,
         ThemeId::Terminal
+            | ThemeId::Shoreline
+            | ThemeId::ShorelineLight
             | ThemeId::CatppuccinMocha
             | ThemeId::TokyoNight
             | ThemeId::Dracula
