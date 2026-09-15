@@ -356,7 +356,7 @@
         openLayer('员工管理 · 先选归属', function (body) {
           body.innerHTML = '<div class="ab-tip">员工归谁？平台自己（内部）或某个客户。</div>' +
             '<button class="ab-menu-item" data-u="admin">平台自己的员工<small>归平台（你直接管）</small></button>' +
-            users.map(function (u) {
+            users.filter(function (u) { return (u.role || 'customer') === 'customer'; }).map(function (u) {
               return '<button class="ab-menu-item" data-u="' + esc(u.user) + '">' + esc(u.name || u.user) + '<small>' + esc(u.user) + '</small></button>';
             }).join('');
           body.querySelectorAll('button[data-u]').forEach(function (b) {
@@ -505,7 +505,8 @@
   function openUsers() {
     api('/_gate/users').then(function (r) {
       if (!r.ok) { alert(r.body.error || '打不开'); return; }
-      var users = (r.body && r.body.users) || [];
+      // 只列客户（员工不是“客户”，归到员工管理里看）—— 2026-09-15 P2
+      var users = ((r.body && r.body.users) || []).filter(function (u) { return (u.role || 'customer') === 'customer'; });
       openLayer('客户管理', function (body) {
         body.innerHTML =
           '<div class="ab-tip">客户账号 = 一个客户公司。客户老板登录后能自己给员工建账号、分项目。<br>把项目转给客户：在项目上设归属（管理员）。</div>' +
