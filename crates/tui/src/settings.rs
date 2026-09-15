@@ -650,6 +650,7 @@ fn normalize_rail_panel(value: &str) -> &'static str {
         "context" => "context",
         "git" => "git",
         "price" => "price",
+        "watch" => "watch",
         // `pinned` folded into the tasks view (2026-09-02 dock views).
         _ => "tasks",
     }
@@ -1055,6 +1056,43 @@ impl Settings {
             .get(canonical)
             .copied()
             .unwrap_or(Layer::Default)
+    }
+
+    /// The persisted field name behind a canonical schema key. Two schema
+    /// keys predate their persisted names and cannot be renamed without a
+    /// settings.toml migration.
+    fn persisted_field_name(canonical: &str) -> &str {
+        match canonical {
+            "tool_collapse" => "tool_collapse_mode",
+            "max_history" => "max_input_history",
+            other => other,
+        }
+    }
+
+    /// The value `key` currently holds in this store, in its written-to-disk
+    /// string form — `None` when the key is not a field of this store.
+    ///
+    /// `Settings` serializes field-for-field to settings.toml, so a document
+    /// lookup on the serialized form shares `set`'s key vocabulary instead
+    /// of growing a second hand-keyed reader beside it.
+    pub fn value(&self, key: &str) -> Option<String> {
+        let canonical = Self::canonical_key(key).unwrap_or(key);
+        let field = Self::persisted_field_name(canonical);
+        let document = toml::Value::try_from(self).ok()?;
+        let value = document.as_table()?.get(field)?;
+        Some(match value {
+            toml::Value::String(text) => text.clone(),
+            other => other.to_string(),
+        })
+    }
+
+    /// Whether the loaded settings document explicitly named `key` — a
+    /// persisted user choice rather than an inherited default.
+    pub fn is_set(&self, key: &str) -> bool {
+        let canonical = Self::canonical_key(key).unwrap_or(key);
+        self.provenance
+            .get(Self::persisted_field_name(canonical))
+            .is_some_and(|layer| *layer == Layer::UserConfig)
     }
 
     /// Whether the user explicitly persisted an auto-compaction preference.
@@ -1511,6 +1549,7 @@ impl Settings {
                         | "context"
                         | "git"
                         | "price"
+                        | "watch"
                         | "pinned"
                 ) {
                     anyhow::bail!(

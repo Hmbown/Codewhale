@@ -69,6 +69,19 @@ pub enum SettingKind {
     String,
 }
 
+/// What a declared settings row is. `Setting` is a writable preference;
+/// `Action` opens another surface (the provider/model pickers, module
+/// links); `Diagnostic` is a read-only receipt or managed-policy fact;
+/// `Session` is editable for the running session but does not persist
+/// through the config store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingRowKind {
+    Setting,
+    Action,
+    Diagnostic,
+    Session,
+}
+
 /// Where a setting appears, and what it says. Absent ⇒ no row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SettingUi {
@@ -78,6 +91,11 @@ pub struct SettingUi {
     pub label: &'static str,
     /// Message key for the row's description sentence.
     pub description: &'static str,
+    /// Whether the row is a writable preference, a link to another surface,
+    /// a read-only receipt, or a session-scoped override. Surfaces that
+    /// cannot open the target or scope the write render non-`Setting` rows
+    /// read-only instead of guessing.
+    pub row: SettingRowKind,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -381,6 +399,57 @@ const fn ui(
         group,
         label,
         description,
+        row: SettingRowKind::Setting,
+    })
+}
+
+/// A row that opens another surface rather than editing a value in place.
+const fn ui_action(
+    tab: &'static str,
+    group: &'static str,
+    label: &'static str,
+    description: &'static str,
+) -> Option<SettingUi> {
+    Some(SettingUi {
+        tab,
+        group,
+        label,
+        description,
+        row: SettingRowKind::Action,
+    })
+}
+
+/// A read-only receipt row — a managed-policy fact, live route value, or
+/// descriptive pointer, never a writable control.
+const fn ui_diagnostic(
+    tab: &'static str,
+    group: &'static str,
+    label: &'static str,
+    description: &'static str,
+) -> Option<SettingUi> {
+    Some(SettingUi {
+        tab,
+        group,
+        label,
+        description,
+        row: SettingRowKind::Diagnostic,
+    })
+}
+
+/// A row editable for the running session only; it does not persist through
+/// the config store.
+const fn ui_session(
+    tab: &'static str,
+    group: &'static str,
+    label: &'static str,
+    description: &'static str,
+) -> Option<SettingUi> {
+    Some(SettingUi {
+        tab,
+        group,
+        label,
+        description,
+        row: SettingRowKind::Session,
     })
 }
 
@@ -600,7 +669,7 @@ pub const SETTINGS_SCHEMA: &[SettingDef] = &[
         "provider",
         SettingKind::String,
         "",
-        ui(
+        ui_action(
             TAB_MODELS,
             "provider",
             "ConfigLabelProvider",
@@ -611,7 +680,7 @@ pub const SETTINGS_SCHEMA: &[SettingDef] = &[
         "provider_templates",
         SettingKind::String,
         "",
-        ui(
+        ui_action(
             TAB_MODELS,
             "provider",
             "ConfigLabelProviderTemplates",
@@ -622,7 +691,7 @@ pub const SETTINGS_SCHEMA: &[SettingDef] = &[
         "model",
         SettingKind::String,
         "",
-        ui(TAB_MODELS, "model", "ConfigLabelModel", "ConfigHintModel"),
+        ui_action(TAB_MODELS, "model", "ConfigLabelModel", "ConfigHintModel"),
     ),
     def(
         "reasoning_effort",
@@ -642,7 +711,7 @@ pub const SETTINGS_SCHEMA: &[SettingDef] = &[
         "fleet.exec.max_spawn_depth",
         SettingKind::Int,
         "3",
-        ui(
+        ui_diagnostic(
             TAB_MODELS,
             "model",
             "ConfigLabelFleetSpawnDepth",
@@ -807,7 +876,7 @@ pub const SETTINGS_SCHEMA: &[SettingDef] = &[
         "goal_command",
         SettingKind::String,
         "",
-        ui(
+        ui_diagnostic(
             TAB_WORK,
             "session",
             "ConfigLabelGoalCommand",
@@ -818,7 +887,7 @@ pub const SETTINGS_SCHEMA: &[SettingDef] = &[
         "workflow",
         SettingKind::String,
         "",
-        ui(
+        ui_diagnostic(
             TAB_WORK,
             "workflow",
             "ConfigLabelWorkflow",
@@ -1039,13 +1108,13 @@ pub const SETTINGS_SCHEMA: &[SettingDef] = &[
         "mcp_open",
         SettingKind::String,
         "",
-        ui(TAB_TOOLS, "mcp", "ConfigLabelMcpOpen", "ConfigHintMcpOpen"),
+        ui_action(TAB_TOOLS, "mcp", "ConfigLabelMcpOpen", "ConfigHintMcpOpen"),
     ),
     def(
         "mcp_reconnect",
         SettingKind::String,
         "",
-        ui(
+        ui_action(
             TAB_TOOLS,
             "mcp",
             "ConfigLabelMcpReconnect",
@@ -1056,7 +1125,7 @@ pub const SETTINGS_SCHEMA: &[SettingDef] = &[
         "mcp_diagnose",
         SettingKind::String,
         "",
-        ui(
+        ui_action(
             TAB_TOOLS,
             "mcp",
             "ConfigLabelMcpDiagnose",
@@ -1067,7 +1136,7 @@ pub const SETTINGS_SCHEMA: &[SettingDef] = &[
         "plugins_open",
         SettingKind::String,
         "",
-        ui(
+        ui_action(
             TAB_TOOLS,
             "mcp",
             "ConfigLabelPluginsOpen",
@@ -1090,7 +1159,7 @@ pub const SETTINGS_SCHEMA: &[SettingDef] = &[
         "approval_mode",
         SettingKind::Enum(APPROVAL_MODE),
         "",
-        ui(
+        ui_session(
             TAB_TRUST,
             "permissions",
             "ConfigLabelApprovalMode",
@@ -1123,7 +1192,7 @@ pub const SETTINGS_SCHEMA: &[SettingDef] = &[
         "managed_approval_policy",
         SettingKind::String,
         "",
-        ui(
+        ui_diagnostic(
             TAB_TRUST,
             "permissions",
             "ConfigLabelManagedApprovalPolicy",
@@ -1156,7 +1225,7 @@ pub const SETTINGS_SCHEMA: &[SettingDef] = &[
         "managed_allow_shell",
         SettingKind::String,
         "",
-        ui(
+        ui_diagnostic(
             TAB_TRUST,
             "permissions",
             "ConfigLabelManagedAllowShell",
@@ -1202,7 +1271,7 @@ pub const SETTINGS_SCHEMA: &[SettingDef] = &[
         "base_url",
         SettingKind::String,
         "",
-        ui(
+        ui_diagnostic(
             TAB_ADVANCED,
             "provider",
             "ConfigLabelBaseUrlDeepseek",
@@ -1213,7 +1282,7 @@ pub const SETTINGS_SCHEMA: &[SettingDef] = &[
         "provider_url",
         SettingKind::String,
         "",
-        ui(
+        ui_diagnostic(
             TAB_ADVANCED,
             "provider",
             "ConfigLabelProviderUrl",
@@ -1224,13 +1293,13 @@ pub const SETTINGS_SCHEMA: &[SettingDef] = &[
         "context_window",
         SettingKind::Int,
         "",
-        ui(TAB_ADVANCED, "provider", "", "ConfigHintContextWindow"),
+        ui_diagnostic(TAB_ADVANCED, "provider", "", "ConfigHintContextWindow"),
     ),
     def(
         "effective_context_window",
         SettingKind::String,
         "",
-        ui(
+        ui_diagnostic(
             TAB_ADVANCED,
             "provider",
             "",
@@ -1243,7 +1312,7 @@ pub const SETTINGS_SCHEMA: &[SettingDef] = &[
         "external_credentials.openai-codex",
         SettingKind::String,
         "",
-        ui(
+        ui_diagnostic(
             TAB_ADVANCED,
             "provider",
             "",
@@ -1254,7 +1323,7 @@ pub const SETTINGS_SCHEMA: &[SettingDef] = &[
         "external_credentials.xai",
         SettingKind::String,
         "",
-        ui(
+        ui_diagnostic(
             TAB_ADVANCED,
             "provider",
             "",
@@ -1277,7 +1346,7 @@ pub const SETTINGS_SCHEMA: &[SettingDef] = &[
         "features.subagents",
         SettingKind::String,
         "",
-        ui(
+        ui_diagnostic(
             TAB_ADVANCED,
             "experimental",
             "",
@@ -1288,7 +1357,7 @@ pub const SETTINGS_SCHEMA: &[SettingDef] = &[
         "features.web_search",
         SettingKind::String,
         "",
-        ui(
+        ui_diagnostic(
             TAB_ADVANCED,
             "experimental",
             "",
@@ -1299,7 +1368,7 @@ pub const SETTINGS_SCHEMA: &[SettingDef] = &[
         "features.apply_patch",
         SettingKind::String,
         "",
-        ui(
+        ui_diagnostic(
             TAB_ADVANCED,
             "experimental",
             "",
@@ -1310,13 +1379,13 @@ pub const SETTINGS_SCHEMA: &[SettingDef] = &[
         "features.mcp",
         SettingKind::String,
         "",
-        ui(TAB_ADVANCED, "experimental", "", "ConfigHintFeatureMcp"),
+        ui_diagnostic(TAB_ADVANCED, "experimental", "", "ConfigHintFeatureMcp"),
     ),
     def(
         "features.exec_policy",
         SettingKind::String,
         "",
-        ui(
+        ui_diagnostic(
             TAB_ADVANCED,
             "experimental",
             "",

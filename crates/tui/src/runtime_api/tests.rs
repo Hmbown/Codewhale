@@ -4032,6 +4032,7 @@ async fn event_handoff_replays_and_dedupes_interaction_prompts_without_a_gap() -
         initial_seq,
         backlog_rx,
         live,
+        false,
     )
     .take(2);
     let body =
@@ -4054,6 +4055,200 @@ async fn event_handoff_replays_and_dedupes_interaction_prompts_without_a_gap() -
     assert_eq!(rendered.matches("approval-handoff").count(), 1);
     assert_eq!(rendered.matches("input-handoff").count(), 1);
 
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn pet_stream_progress_drains_queued_answers_before_becoming_live() -> Result<()> {
+    let (_addr, runtime_threads, handle) = spawn_test_server()
+        .await?
+        .context("Runtime socket unavailable for pet progress acceptance")?;
+    let thread = runtime_threads
+        .create_thread(CreateThreadRequest::default())
+        .await?;
+    let initial = runtime_threads
+        .events_since(&thread.id, None)?
+        .last()
+        .unwrap()
+        .seq;
+    let live = runtime_threads.subscribe_events();
+    let required = runtime_threads
+        .emit_event_for_test(
+            &thread.id,
+            None,
+            "user_input.required",
+            json!({"id":"old-request"}),
+        )
+        .await?;
+    let backlog = runtime_threads.events_since(&thread.id, Some(initial))?;
+    let (tx, rx) = mpsc::channel(1);
+    tx.send(Ok(backlog)).await?;
+    drop(tx);
+    let answered = runtime_threads
+        .emit_event_for_test(
+            &thread.id,
+            None,
+            "user_input.answered",
+            json!({"id":"old-request"}),
+        )
+        .await?;
+    let stream = replay_live_thread_events(
+        runtime_threads.clone(),
+        thread.id.clone(),
+        initial,
+        rx,
+        live,
+        true,
+    )
+    .take(4);
+    let body = tokio::time::timeout(
+        ci_scaled(Duration::from_secs(2)),
+        axum::body::to_bytes(Sse::new(stream).into_response().into_body(), 64 * 1024),
+    )
+    .await??;
+    let rendered = String::from_utf8(body.to_vec())?;
+    let frames = rendered
+        .split("\n\n")
+        .filter(|s| !s.trim().is_empty())
+        .map(parse_sse_frame)
+        .collect::<Result<Vec<_>>>()?;
+    assert_eq!(frames.len(), 4);
+    assert_eq!(
+        frames[0].1,
+        json!({"event":"stream.progress","thread_id":thread.id,"seq":initial,"state":"replaying"})
+    );
+    assert_eq!(frames[1].1["seq"], required.seq);
+    assert_eq!(frames[2].1["seq"], answered.seq);
+    assert_eq!(
+        frames[3].1,
+        json!({"event":"stream.progress","thread_id":thread.id,"seq":answered.seq,"state":"live"})
+    );
+    assert_eq!(
+        runtime_threads
+            .events_since(&thread.id, Some(initial))?
+            .len(),
+        2,
+        "Progress is not journal data"
+    );
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn pet_stream_progress_is_opt_in_and_advertised_by_the_actual_endpoint() -> Result<()> {
+    let (addr, runtime_threads, handle) = spawn_test_server()
+        .await?
+        .context("Runtime socket unavailable for pet progress acceptance")?;
+    let thread = runtime_threads
+        .create_thread(CreateThreadRequest::default())
+        .await?;
+    let client = crate::tls::reqwest_client();
+    let response = client
+        .get(format!(
+            "http://{addr}/v1/threads/{}/events?progress=true",
+            thread.id
+        ))
+        .send()
+        .await?
+        .error_for_status()?;
+    assert_eq!(
+        response
+            .headers()
+            .get("x-codewhale-event-progress")
+            .unwrap(),
+        "1"
+    );
+    let frame = parse_sse_frame(&read_first_sse_frame(response).await?)?;
+    assert_eq!(frame.0, "stream.progress");
+    assert_eq!(frame.1["state"], "replaying");
+    let response = client
+        .get(format!("http://{addr}/v1/threads/{}/events", thread.id))
+        .send()
+        .await?
+        .error_for_status()?;
+    assert!(
+        response
+            .headers()
+            .get("x-codewhale-event-progress")
+            .is_none()
+    );
+    let frame = parse_sse_frame(&read_first_sse_frame(response).await?)?;
+    assert_eq!(frame.0, "thread.started");
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn pet_stream_progress_returns_to_replay_while_recovering_broadcast_lag() -> Result<()> {
+    let (_addr, runtime_threads, handle) = spawn_test_server()
+        .await?
+        .context("Runtime socket unavailable for pet progress acceptance")?;
+    let thread = runtime_threads
+        .create_thread(CreateThreadRequest::default())
+        .await?;
+    let initial = runtime_threads
+        .events_since(&thread.id, None)?
+        .last()
+        .unwrap()
+        .seq;
+    let (backlog_tx, backlog) = mpsc::channel(1);
+    drop(backlog_tx);
+    let (tx, live) = tokio::sync::broadcast::channel(1);
+    let mut stream = Box::pin(replay_live_thread_events(
+        runtime_threads.clone(),
+        thread.id.clone(),
+        initial,
+        backlog,
+        live,
+        true,
+    ));
+    assert_eq!(
+        sse_frame_payload(stream.next().await.unwrap().unwrap()).await?["state"],
+        "replaying"
+    );
+    assert_eq!(
+        sse_frame_payload(stream.next().await.unwrap().unwrap()).await?["state"],
+        "live"
+    );
+    let required = runtime_threads
+        .emit_event_for_test(
+            &thread.id,
+            None,
+            "user_input.required",
+            json!({"id":"queued-request"}),
+        )
+        .await?;
+    let answered = runtime_threads
+        .emit_event_for_test(
+            &thread.id,
+            None,
+            "user_input.answered",
+            json!({"id":"queued-request"}),
+        )
+        .await?;
+    tx.send(required.clone())?;
+    tx.send(answered.clone())?;
+    let frames = tokio::time::timeout(ci_scaled(Duration::from_secs(2)), async {
+        let mut frames = Vec::new();
+        for _ in 0..4 {
+            frames.push(sse_frame_payload(stream.next().await.unwrap().unwrap()).await?);
+        }
+        Ok::<_, anyhow::Error>(frames)
+    })
+    .await??;
+    assert_eq!(frames[0]["state"], "replaying");
+    assert_eq!(frames[0]["seq"], initial);
+    assert_eq!(frames[1]["seq"], required.seq);
+    assert_eq!(frames[2]["seq"], answered.seq);
+    assert_eq!(frames[3]["state"], "live");
+    assert_eq!(frames[3]["seq"], answered.seq);
+    assert_eq!(
+        runtime_threads
+            .events_since(&thread.id, Some(initial))?
+            .len(),
+        2
+    );
     handle.abort();
     Ok(())
 }
@@ -8287,6 +8482,179 @@ async fn get_provider_models(
         .json()
         .await
         .expect("GET /v1/providers/{id}/models should return valid JSON")
+}
+
+/// Helper: GET `/v1/settings/schema` and return the parsed response body.
+async fn get_settings_schema(client: &reqwest::Client, addr: &SocketAddr) -> serde_json::Value {
+    client
+        .get(format!("http://{addr}/v1/settings/schema"))
+        .send()
+        .await
+        .expect("GET /v1/settings/schema should not fail at transport level")
+        .error_for_status()
+        .expect("GET /v1/settings/schema should return 200")
+        .json()
+        .await
+        .expect("GET /v1/settings/schema should return valid JSON")
+}
+
+#[tokio::test]
+async fn settings_schema_serves_every_declared_row_with_runtime_state() -> Result<()> {
+    let _lock = lock_test_env();
+    let root = tempfile::tempdir()?;
+    let config_file = root.path().join("config.toml");
+    fs::write(
+        &config_file,
+        "provider = \"deepseek\"\napi_key = \"runtime-api-test-key\"\nbase_url = \"http://127.0.0.1:1/v1\"\ntelemetry = false\n\n[notifications]\ncondition = \"always\"\n",
+    )?;
+    fs::write(root.path().join("settings.toml"), "calm_mode = true\n")?;
+    let _config = EnvVarGuard::set("CODEWHALE_CONFIG_PATH", &config_file);
+    let Some((addr, _runtime_threads, handle)) =
+        spawn_test_server_with_config_path(config_file.clone()).await?
+    else {
+        return Ok(());
+    };
+    let client = crate::tls::reqwest_client();
+    let body = get_settings_schema(&client, &addr).await;
+    handle.abort();
+
+    assert_eq!(body["version"], 1);
+    let tabs = body["tabs"].as_array().expect("tabs array");
+    let tab_ids: Vec<_> = tabs.iter().filter_map(|t| t["id"].as_str()).collect();
+    assert_eq!(
+        tab_ids,
+        codewhale_config::settings_schema::schema_tabs(),
+        "tabs project the schema declaration order"
+    );
+
+    let rows = body["settings"].as_array().expect("settings array");
+    assert_eq!(
+        rows.len(),
+        codewhale_config::settings_schema::schema_rows().count(),
+        "every declared UI row is served"
+    );
+    let row = |key: &str| {
+        rows.iter()
+            .find(|row| row["key"] == key)
+            .unwrap_or_else(|| panic!("schema row {key} missing"))
+    };
+
+    for entry in rows {
+        let kind = entry["kind"].as_str().expect("kind");
+        assert!(
+            matches!(kind, "bool" | "int" | "enum" | "string"),
+            "unknown kind {kind}"
+        );
+        assert!(
+            matches!(
+                entry["row"].as_str(),
+                Some("setting" | "action" | "diagnostic" | "session")
+            ),
+            "unknown row kind for {}",
+            entry["key"]
+        );
+        let label = entry["label"].as_str().expect("label");
+        assert!(
+            !label.is_empty() && !label.starts_with("Config"),
+            "label must be resolved prose, not a message key: {label}"
+        );
+        assert!(entry["visible"].is_boolean());
+        assert!(entry["editable"].is_boolean());
+        if kind == "enum" {
+            assert!(
+                !entry["options"]
+                    .as_array()
+                    .expect("enum options")
+                    .is_empty(),
+                "enum row {} must serve its closed value set",
+                entry["key"]
+            );
+        }
+    }
+
+    // Values resolve from the owning store, not a decorated guess.
+    assert_eq!(row("calm_mode")["value"], "true");
+    assert_eq!(row("calm_mode")["persisted"], true);
+    assert_eq!(row("notifications.condition")["value"], "always");
+    assert_eq!(row("notifications.condition")["persisted"], true);
+    assert_eq!(row("telemetry")["value"], "false");
+
+    // Row kinds and editability agree with the TUI's own semantics:
+    // model/provider open pickers (actions), approval_mode is the
+    // session-scoped writable, endpoint rows are read-only receipts.
+    assert_eq!(row("model")["row"], "action");
+    assert_eq!(row("model")["editable"], false);
+    assert_eq!(row("approval_mode")["row"], "session");
+    assert_eq!(row("approval_mode")["editable"], true);
+    assert_eq!(row("provider_url")["editable"], false);
+    assert_eq!(row("telemetry")["editable"], false);
+    for action in ["provider_templates", "mcp_open", "plugins_open"] {
+        assert_eq!(row(action)["row"], "action");
+        assert_eq!(row(action)["editable"], false);
+    }
+
+    // The conditional triple resolves to exactly one visible member for a
+    // config with no managed policy: the editable TUI posture row.
+    assert_eq!(row("permission_posture")["visible"], true);
+    assert_eq!(row("approval_policy")["visible"], false);
+    assert_eq!(row("managed_approval_policy")["visible"], false);
+    Ok(())
+}
+
+#[tokio::test]
+async fn settings_schema_write_fallthrough_persists_declared_settings_keys() -> Result<()> {
+    let _lock = lock_test_env();
+    let root = tempfile::tempdir()?;
+    let config_file = root.path().join("config.toml");
+    fs::write(
+        &config_file,
+        "provider = \"deepseek\"\napi_key = \"runtime-api-test-key\"\nbase_url = \"http://127.0.0.1:1/v1\"\n",
+    )?;
+    let _config = EnvVarGuard::set("CODEWHALE_CONFIG_PATH", &config_file);
+    let Some((addr, _runtime_threads, handle)) =
+        spawn_test_server_with_config_path(config_file.clone()).await?
+    else {
+        return Ok(());
+    };
+    let client = crate::tls::reqwest_client();
+
+    // A schema-declared settings.toml key outside the curated arm list must
+    // persist through the shared validator rather than 400.
+    let response = client
+        .post(format!("http://{addr}/v1/config"))
+        .json(&json!({"key": "composer_density", "value": "compact", "persist": true}))
+        .send()
+        .await?
+        .error_for_status()
+        .expect("composer_density is a declared settings key")
+        .json::<serde_json::Value>()
+        .await?;
+    assert_eq!(response["persisted"], true);
+    assert_eq!(
+        crate::settings::Settings::load_persisted()?.composer_density,
+        "compact"
+    );
+    let body = get_settings_schema(&client, &addr).await;
+    let row = body["settings"]
+        .as_array()
+        .expect("settings array")
+        .iter()
+        .find(|row| row["key"] == "composer_density")
+        .expect("composer_density row");
+    assert_eq!(row["value"], "compact");
+    assert_eq!(row["persisted"], true);
+
+    // A key the schema does not declare still fails closed.
+    let status = client
+        .post(format!("http://{addr}/v1/config"))
+        .json(&json!({"key": "not_a_real_setting", "value": "x", "persist": true}))
+        .send()
+        .await?
+        .status();
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    handle.abort();
+    Ok(())
 }
 
 #[test]

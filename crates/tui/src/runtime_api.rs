@@ -761,6 +761,8 @@ struct AutomationRunsQuery {
 struct ThreadEventsQuery {
     since_seq: Option<u64>,
     replay_limit: Option<usize>,
+    #[serde(default)]
+    progress: bool,
 }
 
 const DEFAULT_FLEET_EVENT_REPLAY_LIMIT: usize = 250;
@@ -1304,6 +1306,7 @@ pub fn build_router(state: RuntimeApiState) -> Router {
         .route("/v1/providers/{id}/switch", post(switch_provider))
         .route("/v1/config", get(get_config).post(set_config))
         .route("/v1/config/reload", post(reload_config))
+        .route("/v1/settings/schema", get(get_settings_schema))
         .route(
             "/v1/threads/{id}/notifications/prepare",
             post(notification_delivery::prepare),
@@ -5140,7 +5143,7 @@ async fn stream_thread_events(
     State(state): State<RuntimeApiState>,
     Path(id): Path<String>,
     Query(query): Query<ThreadEventsQuery>,
-) -> Result<Sse<impl futures_util::Stream<Item = Result<SseEvent, Infallible>>>, ApiError> {
+) -> Result<Response, ApiError> {
     let _ = state
         .runtime_threads
         .get_thread(&id)
@@ -5171,13 +5174,32 @@ async fn stream_thread_events(
         replay.base_seq,
         replay.batches,
         live,
+        query.progress,
     );
 
-    Ok(Sse::new(stream).keep_alive(
-        KeepAlive::new()
-            .interval(Duration::from_secs(15))
-            .text("keepalive"),
-    ))
+    let mut response = Sse::new(stream)
+        .keep_alive(
+            KeepAlive::new()
+                .interval(Duration::from_secs(15))
+                .text("keepalive"),
+        )
+        .into_response();
+    if query.progress {
+        response
+            .headers_mut()
+            .insert("x-codewhale-event-progress", HeaderValue::from_static("1"));
+    }
+    Ok(response)
+}
+
+fn thread_stream_progress(thread_id: &str, seq: u64, live: bool) -> SseEvent {
+    sse_json(
+        "stream.progress",
+        json!({
+            "event": "stream.progress", "thread_id": thread_id, "seq": seq,
+            "state": if live { "live" } else { "replaying" },
+        }),
+    )
 }
 
 fn replay_live_thread_events(
@@ -5188,8 +5210,10 @@ fn replay_live_thread_events(
         std::result::Result<Vec<crate::runtime_threads::RuntimeEventRecord>, String>,
     >,
     mut live: tokio::sync::broadcast::Receiver<crate::runtime_threads::RuntimeEventRecord>,
+    progress: bool,
 ) -> impl futures_util::Stream<Item = Result<SseEvent, Infallible>> {
     stream! {
+        if progress { yield Ok(thread_stream_progress(&thread_id, last_seq, false)); }
         while let Some(batch) = backlog.recv().await {
             let events = match batch {
                 Ok(events) => events,
@@ -5217,8 +5241,26 @@ fn replay_live_thread_events(
             }
         }
 
+        // Backlog completion alone is insufficient: a request may have been
+        // answered while history was read. Drain the already-queued live tail
+        // before declaring the observation current. These opt-in frames carry
+        // transport progress, never new journal events or sequence numbers.
+        let mut replaying = progress;
         'live: loop {
-            match live.recv().await {
+            let next = if replaying {
+                use tokio::sync::broadcast::error::{RecvError, TryRecvError};
+                match live.try_recv() {
+                    Ok(event) => Ok(event),
+                    Err(TryRecvError::Empty) => {
+                        yield Ok(thread_stream_progress(&thread_id, last_seq, true));
+                        replaying = false;
+                        continue;
+                    }
+                    Err(TryRecvError::Lagged(skipped)) => Err(RecvError::Lagged(skipped)),
+                    Err(TryRecvError::Closed) => Err(RecvError::Closed),
+                }
+            } else { live.recv().await };
+            match next {
                 Ok(event) => {
                     if event.thread_id != thread_id || event.seq <= last_seq {
                         continue;
@@ -5232,6 +5274,10 @@ fn replay_live_thread_events(
                     ));
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                    if progress {
+                        yield Ok(thread_stream_progress(&thread_id, last_seq, false));
+                        replaying = true;
+                    }
                     // Broadcast is only a wake-up path; durable history remains
                     // authoritative. Catch up from the last delivered cursor so
                     // receiver pressure cannot turn into a silent prompt loss.
@@ -7313,9 +7359,18 @@ async fn set_config(
                 config_persistence::persist_root_bool_key(config_path, "prompt_suggestion", enabled)
             }
             _ => {
-                return Err(ApiError::bad_request(format!(
-                    "Unknown config key '{key}'. Supported keys: model, default_model, reasoning_effort, approval_mode, base_url, provider, provider_url, cost_currency, default_mode, auto_compact, allow_shell, mcp_config_path, show_thinking, thinking_default_expanded, thinking_highlight, show_tool_details, inline_diffs, locale, max_history, calm_mode, workspace_follow_symlinks, subagents_enabled, subagents_max_depth, sandbox_mode, strict_tool_mode, memory_enabled, search_provider, prompt_suggestion"
-                )));
+                // Every other declared settings.toml key persists through the
+                // shared validator rather than a curated list — the schema
+                // route advertises them, so a known setting must not die
+                // here. Unknown keys still 400 through `Settings::set`.
+                persist_runtime_tui_setting(&key, &value)?;
+                return Ok(Json(SetConfigResponse {
+                    key,
+                    value,
+                    message: "Config persisted. Call /v1/config/reload to apply.".to_string(),
+                    persisted: true,
+                    requires_reload,
+                }));
             }
         };
 
@@ -7337,6 +7392,410 @@ async fn set_config(
         persisted: persist,
         requires_reload,
     }))
+}
+
+/// `GET /v1/settings/schema` — the Engine-declared settings surface.
+///
+/// `codewhale_config::SETTINGS_SCHEMA` is the single declaration table: one
+/// entry per setting with kind, closed value set, default, and placement.
+/// This route projects it for HTTP clients — current values resolved from
+/// the owning store (settings.toml via [`crate::settings::Settings`],
+/// config.toml, or the notifications table), labels and descriptions
+/// resolved through the locale pack. Writes stay on `POST /v1/config`;
+/// this route never invents a value, an option, or a validator.
+#[derive(Debug, Serialize)]
+struct SettingsSchemaResponse {
+    /// Payload version. Additive fields may appear without a bump; clients
+    /// must ignore fields and `kind`/`row` values they do not know.
+    version: u32,
+    tabs: Vec<SettingsSchemaTab>,
+    settings: Vec<SettingsSchemaRow>,
+}
+
+#[derive(Debug, Serialize)]
+struct SettingsSchemaTab {
+    id: String,
+    /// Humanized tab id — tab labels have no message keys in the schema.
+    label: String,
+}
+
+#[derive(Debug, Serialize)]
+struct SettingsSchemaRow {
+    key: &'static str,
+    /// `bool` | `int` | `enum` | `string`. Unknown kinds degrade to a text
+    /// field on the client; writes still validate server-side.
+    kind: &'static str,
+    tab: &'static str,
+    group: &'static str,
+    label: String,
+    description: String,
+    default: &'static str,
+    /// `setting` | `action` | `diagnostic` | `session` — from
+    /// [`codewhale_config::SettingRowKind`].
+    row: &'static str,
+    /// Current value in written-to-disk string form, when a store resolves
+    /// it. Absent for actions, unresolvable diagnostics, and session rows
+    /// the headless runtime cannot read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    value: Option<String>,
+    /// Whether the value is a persisted user choice rather than an
+    /// inherited default. Absent where no store can prove either way.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    persisted: Option<bool>,
+    /// Whether a generic client may offer a write control. Action,
+    /// diagnostic and session rows are never editable through this surface;
+    /// conditional rows (managed policy wins) report false.
+    editable: bool,
+    /// False for the hidden member of a conditional pair — e.g. a
+    /// `managed_*` row when no managed policy applies, or `base_url` when
+    /// the active route reads `provider_url`. Clients should not render
+    /// invisible rows.
+    visible: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    options: Vec<SettingsSchemaOption>,
+}
+
+#[derive(Debug, Serialize)]
+struct SettingsSchemaOption {
+    value: &'static str,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    label: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    description: String,
+}
+
+/// "Turn a schema key or tab id into a title-case label" — the same
+/// humanization the TUI applies to rows declared without a label message.
+fn humanize_schema_key(key: &str) -> String {
+    key.split(['.', '_', '-'])
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            let mut chars = part.chars();
+            let Some(first) = chars.next() else {
+                return String::new();
+            };
+            let mut word = first.to_uppercase().collect::<String>();
+            word.push_str(chars.as_str());
+            word
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// config.toml-owned keys `POST /v1/config` persists through curated arms.
+/// Kept beside `set_config`'s match: a schema Setting row outside this list
+/// and outside `Settings` has no write path and reports `editable: false`.
+const RUNTIME_CONFIG_KEYS: &[&str] = &[
+    "model",
+    "default_model",
+    "reasoning_effort",
+    "approval_mode",
+    "approval_policy",
+    "base_url",
+    "provider",
+    "provider_url",
+    "provider_base_url",
+    "cost_currency",
+    "max_history",
+    "allow_shell",
+    "mcp_config_path",
+    "subagents_enabled",
+    "subagents_max_depth",
+    "sandbox_mode",
+    "strict_tool_mode",
+    "memory_enabled",
+    "search_provider",
+    "prompt_suggestion",
+];
+
+/// A dotted-path lookup over a TOML document — used to decide `persisted`
+/// for config.toml-owned rows without trusting a decorated display string.
+fn toml_value_at_path<'a>(document: &'a toml::Value, segments: &[&str]) -> Option<&'a toml::Value> {
+    let mut current = document;
+    for segment in segments {
+        current = current.as_table()?.get(*segment)?;
+    }
+    Some(current)
+}
+
+async fn get_settings_schema(
+    State(state): State<RuntimeApiState>,
+) -> Result<Json<SettingsSchemaResponse>, ApiError> {
+    use codewhale_config::notifications::NotificationSetting;
+    use codewhale_config::settings_schema::{
+        SettingKind, SettingRowKind, schema_rows, schema_tabs,
+    };
+    use codewhale_localization::{MessageId, resolve_locale, tr, tr_key};
+
+    let config = state.config.read().clone();
+    let settings = crate::settings::Settings::load_persisted().unwrap_or_default();
+    let locale = resolve_locale(&settings.locale);
+    let notifications = config.notifications_config();
+
+    // Conditional pairs share the TUI's rule: exactly one member is shown,
+    // chosen by which store or policy owns the fact right now.
+    let permission_control = config.approval_policy_control(
+        state.config_path.as_deref(),
+        state.config_profile.as_deref(),
+        &state.workspace,
+    );
+    let shell_control = config.allow_shell_control(
+        state.config_path.as_deref(),
+        state.config_profile.as_deref(),
+        &state.workspace,
+    );
+    let base_url_row_key = match config.api_provider() {
+        ApiProvider::Deepseek | ApiProvider::DeepseekCN => "base_url",
+        _ => "provider_url",
+    };
+    let visible = |key: &str| -> bool {
+        match key {
+            "permission_posture" => matches!(
+                permission_control,
+                crate::config::ApprovalPolicyControl::Unset
+            ),
+            "approval_policy" => matches!(
+                permission_control,
+                crate::config::ApprovalPolicyControl::RootConfig
+            ),
+            "managed_approval_policy" => !matches!(
+                permission_control,
+                crate::config::ApprovalPolicyControl::Unset
+                    | crate::config::ApprovalPolicyControl::RootConfig
+            ),
+            "allow_shell" => shell_control.editable_root(),
+            "managed_allow_shell" => !shell_control.editable_root(),
+            "base_url" | "provider_url" => key == base_url_row_key,
+            _ => true,
+        }
+    };
+
+    // Raw config.toml for `persisted` on config-owned rows. A missing or
+    // unparsable file means nothing was persisted there — the live config
+    // still serves defaults through `value`.
+    let config_document = state
+        .config_path
+        .as_deref()
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .and_then(|body| toml::from_str::<toml::Value>(&body).ok());
+    let notifications_persisted = |key: &str| -> Option<bool> {
+        let setting = NotificationSetting::parse(key)?;
+        let document = config_document.as_ref()?;
+        Some(
+            toml_value_at_path(document, &setting.segments()).is_some()
+                // Legacy location the loader still honors.
+                || (matches!(setting, NotificationSetting::Condition)
+                    && toml_value_at_path(document, &["tui", "notification_condition"]).is_some()),
+        )
+    };
+
+    let tabs = schema_tabs()
+        .into_iter()
+        .map(|id| SettingsSchemaTab {
+            id: id.to_string(),
+            label: humanize_schema_key(id),
+        })
+        .collect();
+
+    let settings_rows = schema_rows()
+        .map(|def| {
+            let ui = def.ui.as_ref().expect("schema_rows filters on ui");
+            let kind = match def.kind {
+                SettingKind::Bool(_) => "bool",
+                SettingKind::Int => "int",
+                SettingKind::Enum(_) => "enum",
+                SettingKind::String => "string",
+            };
+            let row = match ui.row {
+                SettingRowKind::Setting => "setting",
+                SettingRowKind::Action => "action",
+                SettingRowKind::Diagnostic => "diagnostic",
+                SettingRowKind::Session => "session",
+            };
+            let options = match def.kind {
+                SettingKind::Bool(options) | SettingKind::Enum(options) => options
+                    .iter()
+                    .map(|option| SettingsSchemaOption {
+                        value: option.value,
+                        label: if option.label.is_empty() {
+                            String::new()
+                        } else {
+                            tr_key(locale, option.label).into_owned()
+                        },
+                        description: if option.description.is_empty() {
+                            String::new()
+                        } else {
+                            tr_key(locale, option.description).into_owned()
+                        },
+                    })
+                    .collect(),
+                SettingKind::Int | SettingKind::String => Vec::new(),
+            };
+            // Bool rows with an empty option slice carry the surface's
+            // default on/off labels — emit the bare values so clients can
+            // still build a labeled control.
+            let options = if options.is_empty() && matches!(def.kind, SettingKind::Bool(_)) {
+                vec![
+                    SettingsSchemaOption {
+                        value: "false",
+                        label: tr_key(locale, "ConfigValueOff").into_owned(),
+                        description: String::new(),
+                    },
+                    SettingsSchemaOption {
+                        value: "true",
+                        label: tr_key(locale, "ConfigValueOn").into_owned(),
+                        description: String::new(),
+                    },
+                ]
+            } else {
+                options
+            };
+
+            let notification_owned = NotificationSetting::parse(def.key).is_some();
+            // `Settings::set` is the authority on which keys settings.toml
+            // owns — including `Option` fields whose unset value serializes
+            // to nothing (e.g. permission_posture). The probe reuses the
+            // write validator on the declared default, so `editable` cannot
+            // claim a key the real write path would reject.
+            let settings_writable = crate::settings::Settings::default()
+                .set(def.key, def.default)
+                .is_ok();
+            let (value, persisted) = if notification_owned {
+                let setting = NotificationSetting::parse(def.key).expect("checked above");
+                (
+                    Some(notifications.display(setting)),
+                    notifications_persisted(def.key),
+                )
+            } else if settings_writable {
+                // Effective = the persisted value or the declared default;
+                // `is_set` says which.
+                (
+                    Some(
+                        settings
+                            .value(def.key)
+                            .unwrap_or_else(|| def.default.to_string()),
+                    ),
+                    Some(settings.is_set(def.key)),
+                )
+            } else if let Some(feature_key) = def.key.strip_prefix("features.") {
+                // Feature rows are diagnostics: the effective flag state plus
+                // whether config.toml names the leaf — no decorated phrasing,
+                // the client owns presentation of default-vs-configured.
+                let value = crate::features::FEATURES
+                    .iter()
+                    .find(|spec| spec.key == feature_key)
+                    .map(|spec| config.features().enabled(spec.id).to_string());
+                let persisted = config_document.as_ref().map(|document| {
+                    toml_value_at_path(document, &["features", feature_key]).is_some()
+                });
+                (value, persisted)
+            } else {
+                // Managed-policy receipts name the winning source rather than
+                // a writable value; everything else resolves from config.toml
+                // or stays absent for a diagnostic the runtime cannot read.
+                let managed_value = match def.key {
+                    "managed_approval_policy" => match permission_control {
+                        crate::config::ApprovalPolicyControl::Unset
+                        | crate::config::ApprovalPolicyControl::RootConfig => None,
+                        source => Some(source.label().to_string()),
+                    },
+                    "managed_allow_shell" if !shell_control.editable_root() => Some(format!(
+                        "{} · {}",
+                        config.allow_shell(),
+                        shell_control.label()
+                    )),
+                    _ => None,
+                };
+                (
+                    managed_value.or_else(|| config_schema_value(def.key, &config)),
+                    None,
+                )
+            };
+
+            // `editable` means POST /v1/config accepts the key today:
+            // notifications.* through the namespace branch, settings.toml
+            // keys through the Settings::set fallthrough, and the curated
+            // config.toml arm list. A Setting row without a write path
+            // (e.g. telemetry, which persists through its own notice
+            // module) renders read-only rather than promising a 400. The
+            // endpoint rows stay receipts: writing a live route's base URL
+            // cannot mutate an already-running client, so the TUI marks
+            // them read-only and the schema agrees.
+            let endpoint_receipt = matches!(def.key, "base_url" | "provider_url");
+            // A managed or profile-owned approval policy freezes the
+            // session-level mode switch too, not just the saved row.
+            let session_locked = def.key == "approval_mode"
+                && !matches!(
+                    permission_control,
+                    crate::config::ApprovalPolicyControl::Unset
+                );
+            let editable = !endpoint_receipt
+                && !session_locked
+                && matches!(ui.row, SettingRowKind::Setting | SettingRowKind::Session)
+                && visible(def.key)
+                && (notification_owned
+                    || settings_writable
+                    || RUNTIME_CONFIG_KEYS.contains(&def.key));
+
+            SettingsSchemaRow {
+                key: def.key,
+                kind,
+                tab: ui.tab,
+                group: ui.group,
+                label: if !ui.label.is_empty() {
+                    tr_key(locale, ui.label).into_owned()
+                } else if def.key.starts_with("features.") {
+                    tr(locale, MessageId::ConfigLabelFeaturePrefix).replace(
+                        "{name}",
+                        &humanize_schema_key(def.key.rsplit('.').next().unwrap_or(def.key)),
+                    )
+                } else {
+                    humanize_schema_key(def.key.rsplit('.').next().unwrap_or(def.key))
+                },
+                description: if ui.description.is_empty() {
+                    String::new()
+                } else {
+                    tr_key(locale, ui.description).into_owned()
+                },
+                default: def.default,
+                row,
+                value,
+                persisted,
+                editable,
+                visible: visible(def.key),
+                options,
+            }
+        })
+        .collect();
+
+    Ok(Json(SettingsSchemaResponse {
+        version: 1,
+        tabs,
+        settings: settings_rows,
+    }))
+}
+
+/// Current value of a config.toml-owned schema row, when one resolves
+/// cheaply. Diagnostics that need per-route or credential computation are
+/// omitted rather than approximated.
+fn config_schema_value(key: &str, config: &Config) -> Option<String> {
+    match key {
+        "provider" => Some(config.provider_identity_for(config.api_provider())),
+        "model" => runtime_request_model(config, None).ok(),
+        "approval_policy" => config
+            .approval_policy
+            .clone()
+            .or_else(|| Some("suggest".to_string())),
+        "telemetry" => Some(crate::telemetry_notice::saved_preference_enabled(config).to_string()),
+        "allow_shell" => Some(config.allow_shell().to_string()),
+        "base_url" => Some(config.base_url_for_route(config.api_provider())),
+        "provider_url" => Some(config.base_url_for_route(config.api_provider())),
+        "mcp_config_path" => Some(config.mcp_config_path().display().to_string()),
+        "sandbox_mode" => config.sandbox_mode.clone(),
+        "fleet.exec.max_spawn_depth" => Some(config.subagent_max_spawn_depth().to_string()),
+        "reasoning_effort" => Some(config.reasoning_effort().unwrap_or("auto").to_string()),
+        _ => None,
+    }
 }
 
 fn normalize_runtime_config_model(
