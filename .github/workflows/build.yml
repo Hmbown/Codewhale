@@ -45,7 +45,11 @@ jobs:
         # （本地对应工具：m0/scripts/fork-manifest.sh verify-bin）
         run: |
           fail=0
-          for m in "asbudy-files.js" "asbudy-my.js" "asbudy:activity" "asbudy-recycle" "查看回执" "思考过程" "AsBudy"; do
+          # ⚠️ 只查「真正被编进二进制」的东西：crates/tui/src/runtime_api/web.rs 里
+          #    include_str! 的只有 index.html / styles.css / app.mjs（+ 图标）。
+          #    asbudy-files.js / asbudy-my.js 是门卫现读的，不在二进制里 ——
+          #    那两个文件的检查走本地 m0/scripts/fork-manifest.sh verify（2026-09-15 踩过）。
+          for m in "asbudy-files.js" "asbudy-my.js" "asbudy:activity" "asbudy-files" "asbudy-undo" "查看回执" "思考过程" "AsBudy"; do
             if grep -a -q -- "$m" asbudy-linux-x64; then
               echo "✅ $m"
             else
