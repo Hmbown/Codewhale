@@ -39,6 +39,22 @@ jobs:
           cp target/x86_64-unknown-linux-musl/dist/codewhale asbudy-linux-x64
           ls -la asbudy-linux-x64
 
+      - name: Verify our frontend made it in
+        # 2026-09-15：防「编译漏功能」—— 我们的改动集中在界面几个文件里，
+        # 编译完先拿标记 grep 一遍产物；缺任何一个就失败，别把残的二进制发出去。
+        # （本地对应工具：m0/scripts/fork-manifest.sh verify-bin）
+        run: |
+          fail=0
+          for m in "asbudy-files.js" "asbudy-my.js" "asbudy:activity" "asbudy-recycle" "查看回执" "思考过程" "AsBudy"; do
+            if grep -a -q -- "$m" asbudy-linux-x64; then
+              echo "✅ $m"
+            else
+              echo "❌ $m 没编进去"
+              fail=1
+            fi
+          done
+          exit $fail
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
@@ -47,8 +63,10 @@ jobs:
           retention-days: 30
 
       - name: Publish release
+        # tag 以前写死 v0.1.0 → 每次编译都往同一个 Release 上盖，等于没发新版
+        # （2026-09-15 发现：Release 停在 09-13）。改成按构建号发，每次都有得下。
         uses: softprops/action-gh-release@v2
         with:
           files: asbudy-linux-x64
-          tag_name: v0.1.0
-          name: AsBudy v0.1.0
+          tag_name: build-${{ github.run_number }}
+          name: AsBudy build ${{ github.run_number }} · ${{ github.sha }}
