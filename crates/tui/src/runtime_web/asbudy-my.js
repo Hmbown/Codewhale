@@ -21,8 +21,11 @@
   /* ── 样式 ── */
   var st = document.createElement('style');
   st.textContent = [
-    '.brand-mark{cursor:pointer}',
-    '.brand-mark:hover{opacity:.85}',
+    // 「我的」入口 = 侧栏左上角那个 logo。它的按钮化样式写在 styles.css 里
+    // （带 [data-asbudy-my] 前缀，只有脚本真绑上点击才生效）。
+    // 2026-09-15 试过在 logo 右下角挂下拉角标 —— 两轮视觉复核都判它"与蓝色图标糊在一起"，已拿掉。
+    // 只靠图标样式，复核结论一直是"手机没 hover，看不出能点"（触屏上确实如此）——
+    // 所以另挂一个写着「我的」的小鲍鱼膏在旁边（见下面 bindMyLabel）。
     '#asbudy-layer{position:fixed;inset:0;background:rgba(2,7,17,.72);z-index:99999;display:flex;align-items:center;justify-content:center}',
     '.ab-box{background:#0d1117;border:1px solid #30363d;border-radius:12px;width:420px;max-width:90vw;max-height:86vh;display:flex;flex-direction:column;overflow:hidden;box-shadow:0 12px 48px rgba(0,0,0,.6)}',
     '.ab-head{display:flex;justify-content:space-between;align-items:center;padding:12px 18px;border-bottom:1px solid #30363d;gap:14px}',
@@ -1115,9 +1118,31 @@
     var logo = document.querySelector('.brand-mark');
     if (!logo || logo.dataset.asbudyMy === '1') return false;
     logo.dataset.asbudyMy = '1';
-    logo.title = '我的';
+    logo.title = '我的（账号、空间、设置）';
+    logo.setAttribute('role', 'button');
+    logo.setAttribute('tabindex', '0');
     logo.addEventListener('click', openMyMenu);
+    logo.addEventListener('keydown', function (e) {
+      if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openMyMenu(); }
+    });
+    bindMyLabel(logo);
     return true;
+  }
+
+  /** 品牌区里挂一个写着「我的」的小鲍鱼膏 —— 触屏没有 hover，光靠图标看不出能点 */
+  function bindMyLabel(logo) {
+    var railBrand = document.querySelector('.rail-brand');
+    if (!railBrand || document.getElementById('my-label')) return;
+    var lbl = document.createElement('button');
+    lbl.type = 'button';
+    lbl.id = 'my-label';
+    lbl.className = 'my-label';
+    lbl.textContent = '我的';
+    lbl.title = '账号、空间、设置';
+    lbl.addEventListener('click', openMyMenu);
+    var closeBtn = document.getElementById('rail-close');
+    if (closeBtn && closeBtn.parentNode === railBrand) railBrand.insertBefore(lbl, closeBtn);
+    else railBrand.appendChild(lbl);
   }
 
   api('/_gate/whoami').then(function (r) { if (r.ok) ME = r.body; });

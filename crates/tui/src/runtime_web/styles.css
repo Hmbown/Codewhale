@@ -1630,6 +1630,69 @@ noscript {
 
 /* ── AsBudy 界面专有化（同步自门卫，2026-09-14）── */
 :root { --rail: 384px; }
+
+/* ── 「我的」入口：侧栏左上角那个 logo（2026-09-15 老板：要显著的可点击样式）──
+   以前只有 cursor:pointer + hover 变淡（看着反倒像禁用），静态下就是个图，
+   客户根本不知道点它能开「我的」菜单。
+   做法：把它做成一个明确的按钮 —— 常驻可见描边 + 深色底 + 投影，
+   hover 描边加深并轻微上浮，按下微缩。
+   选择器带 [data-asbudy-my] —— 那是脚本绑上点击后才设的属性，
+   脚本没跑（比如门卫原生的「选项目」页）时 logo 不会假装能点。
+   （试过在右下角挂一个下拉角标，两轮视觉复核都说它跟蓝色图标糊在一起，已拿掉） */
+.brand-mark[data-asbudy-my="1"] {
+  cursor: pointer;
+  border-radius: 10px;
+  /* 底色用"淡蓝块"而不是深色井 —— 深底在深色侧栏里等于没有，
+     淡蓝块才能让人一眼看出"这是个按钮"（视觉复核反复强调这点） */
+  background: var(--action-soft);
+  box-shadow: inset 0 0 0 1px rgba(106, 174, 242, 0.55), 0 2px 8px rgba(0, 2, 8, 0.5);
+  transition: background var(--dur-fast) var(--ease-out), box-shadow var(--dur-fast) var(--ease-out), transform var(--dur-fast) var(--ease-out);
+  -webkit-user-select: none;
+  user-select: none;
+  touch-action: manipulation;
+}
+.brand-mark[data-asbudy-my="1"]:hover {
+  background: rgba(106, 174, 242, 0.22);
+  box-shadow: inset 0 0 0 2px var(--action), 0 6px 16px rgba(0, 2, 8, 0.55);
+  transform: translateY(-1px);
+}
+.brand-mark[data-asbudy-my="1"]:active {
+  transform: translateY(0) scale(0.96);
+}
+.brand-mark[data-asbudy-my="1"]:focus-visible {
+  outline: 3px solid var(--action);
+  outline-offset: 2px;
+}
+
+/* 「我的」文字入口（2026-09-15 补）：光把 logo 做成按钮，视觉复核反复指出
+   “手机没有 hover，用户看不出能点”。所以在品牌区挂一个淡蓝胶囊，
+   明确写着「我的」；跟它并排的「✦ 项目名 ⇄」是切换项目（虚线下划线），两者一眼分得开。 */
+.my-label {
+  flex: none;
+  margin-left: auto;
+  padding: 0 10px;
+  min-height: 26px;
+  border: 1px solid rgba(106, 174, 242, 0.55);
+  border-radius: 999px;
+  background: var(--action-soft);
+  color: var(--action);
+  font: inherit;
+  font-size: 12.5px;
+  font-weight: 650;
+  line-height: 1;
+  cursor: pointer;
+  white-space: nowrap;
+  touch-action: manipulation;
+  transition: background var(--dur-fast) var(--ease-out), border-color var(--dur-fast) var(--ease-out), color var(--dur-fast) var(--ease-out);
+}
+.my-label:hover {
+  background: rgba(106, 174, 242, 0.22);
+  border-color: var(--action);
+  color: var(--text);
+}
+.my-label:active {
+  transform: scale(0.96);
+}
 .empty-mark { width: 104px; height: 104px; }
 .rail-open { place-items: center; }
 .thread-title { font-size: 15px; }
