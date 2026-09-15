@@ -12,9 +12,9 @@
 
   // 样式（动态注入，避免改官方 stylesheet）
   var css = [
-    '#asbudy-files{margin:12px 12px 0;display:flex;flex-direction:column;gap:8px;font-size:12px}',
+    '#asbudy-files{margin:12px 12px 0;display:flex;flex-direction:column;gap:8px;font-size:13.5px}',
     '.asb-card{border:1px solid var(--line);border-radius:8px;background:var(--surface);overflow:hidden}',
-    '.asb-hd{display:flex;align-items:center;gap:6px;padding:7px 9px;font-size:12px;color:var(--text)}',
+    '.asb-hd{display:flex;align-items:center;gap:6px;padding:7px 9px;font-size:13.5px;color:var(--text)}',
     '.asb-fold{cursor:pointer;color:var(--text-faint);width:12px;text-align:center;user-select:none;flex:none}',
     '.asb-fold:hover{color:var(--text)}',
     '.asb-title{flex:1;min-width:0;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
@@ -24,33 +24,33 @@
     '.asb-card.folded .asb-bd{display:none}',
     '#asbudy-files-upload{cursor:pointer;color:var(--text-dim)}#asbudy-files-upload:hover{color:var(--text)}',
     '#asbudy-files-refresh{cursor:pointer;color:var(--text-faint)}#asbudy-files-refresh:hover{color:var(--text)}',
-    '.f-node{display:flex;align-items:center;gap:6px;cursor:pointer;font-size:12px;line-height:1.7;white-space:nowrap;color:var(--text);padding:0 4px;border-radius:4px}',
+    '.f-node{display:flex;align-items:center;gap:6px;cursor:pointer;font-size:13.5px;line-height:1.7;white-space:nowrap;color:var(--text);padding:0 4px;border-radius:4px}',
     '.f-node .f-ic{flex:none;color:var(--text-soft);width:13px;text-align:center}',
     '.f-node .f-nm{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis}',
-    '.f-node .f-sz{flex:none;color:var(--text-faint);font-size:10.5px}',
-    '.f-node .f-tag{flex:none;color:var(--text-faint);font-size:10px;border:1px solid var(--line);border-radius:3px;padding:0 3px;line-height:1.5}',
+    '.f-node .f-sz{flex:none;color:var(--text-faint);font-size:12.5px}',
+    '.f-node .f-tag{flex:none;color:var(--text-faint);font-size:12.5px;border:1px solid var(--line);border-radius:3px;padding:0 3px;line-height:1.5}',
     '.f-node .f-del{flex:none;color:#c9ccd0;padding:0 3px}',
     '.f-node .f-del:hover{color:#f85149}',
     '.f-node:hover{background:var(--hover)}',
     '.f-node.dir{color:var(--text-soft)}',
     '.f-kids{margin-left:12px;border-left:1px solid var(--line);padding-left:6px}',
-    '.f-empty{font-size:12px;color:var(--text-faint);padding:0 4px}',
-    '#asbudy-undo{margin:8px 12px 0;border:1px solid var(--line);border-radius:8px;padding:8px;background:var(--surface);font-size:12px}',
+    '.f-empty{font-size:13.5px;color:var(--text-faint);padding:0 4px}',
+    '#asbudy-undo{margin:8px 12px 0;border:1px solid var(--line);border-radius:8px;padding:8px;background:var(--surface);font-size:13.5px}',
     '#asbudy-undo-body{max-height:22vh;overflow-y:auto}',
-    '#asbudy-arts{margin:8px 12px 0;border:1px solid var(--line);border-radius:8px;padding:8px;background:var(--surface);font-size:12px}',
-    '.a-head{font-size:12px;color:var(--text);font-weight:600;display:flex;justify-content:space-between;align-items:center;margin-bottom:6px}',
+    '#asbudy-arts{margin:8px 12px 0;border:1px solid var(--line);border-radius:8px;padding:8px;background:var(--surface);font-size:13.5px}',
+    '.a-head{font-size:13.5px;color:var(--text);font-weight:600;display:flex;justify-content:space-between;align-items:center;margin-bottom:6px}',
     '#asbudy-arts-toggle{cursor:pointer;color:var(--text-faint);font-weight:400}',
     '.a-list{max-height:22vh;overflow-y:auto}',
-    '.a-item{display:flex;align-items:center;gap:8px;padding:5px 6px;border-radius:4px;cursor:pointer;font-size:12px;color:var(--text)}',
+    '.a-item{display:flex;align-items:center;gap:8px;padding:5px 6px;border-radius:4px;cursor:pointer;font-size:13.5px;color:var(--text)}',
     '.a-item:hover{background:var(--hover)}',
     '.a-ic{flex:none;color:var(--text-soft)}',
     '.a-nm{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
-    '.a-meta{flex:none;color:var(--text-faint);font-size:11px}',
+    '.a-meta{flex:none;color:var(--text-faint);font-size:12.5px}',
     '.a-del{flex:none;color:#c9ccd0;padding:0 3px}',
     '.a-del:hover{color:#f85149}',
-    '.u-item{font-size:12px;color:var(--text);padding:4px 6px;border-radius:4px;cursor:pointer;line-height:1.5}',
+    '.u-item{font-size:13.5px;color:var(--text);padding:4px 6px;border-radius:4px;cursor:pointer;line-height:1.5}',
     '.u-item:hover{background:var(--hover)}',
-    '.u-time{color:var(--text-faint);font-size:11px}'
+    '.u-time{color:var(--text-faint);font-size:12.5px}'
   ].join('\n');
   var st = document.createElement('style');
   st.textContent = css;
@@ -405,7 +405,7 @@
   }
   function htmlBody(html) {
     var div = document.createElement('div');
-    div.style.cssText = 'margin:0;padding:16px;overflow:auto;color:#e6edf3;font-size:13px;line-height:1.6';
+    div.style.cssText = 'margin:0;padding:16px;overflow:auto;color:#e6edf3;font-size:14px;line-height:1.6';
     div.innerHTML = html;
     return div;
   }
@@ -421,10 +421,10 @@
   }
   function tableBody(d) {
     var wrap = document.createElement('div');
-    wrap.style.cssText = 'margin:0;padding:16px;overflow:auto;color:#e6edf3;font-size:13px;line-height:1.6';
+    wrap.style.cssText = 'margin:0;padding:16px;overflow:auto;color:#e6edf3;font-size:14px;line-height:1.6';
     if (d.sheet) {
       var sh = document.createElement('div');
-      sh.style.cssText = 'margin-bottom:8px;color:#8b949e;font-size:12px';
+      sh.style.cssText = 'margin-bottom:8px;color:#8b949e;font-size:13px';
       sh.textContent = '工作表：' + d.sheet;
       wrap.appendChild(sh);
     }
@@ -433,7 +433,7 @@
     var maxCols = 0;
     for (var i = 0; i < rows.length; i++) if (rows[i].length > maxCols) maxCols = rows[i].length;
     var tb = document.createElement('table');
-    tb.style.cssText = 'border-collapse:collapse;width:100%;font-size:12px';
+    tb.style.cssText = 'border-collapse:collapse;width:100%;font-size:13px';
     for (var r = 0; r < rows.length; r++) {
       var tr = document.createElement('tr');
       for (var c = 0; c < maxCols; c++) {
@@ -483,14 +483,14 @@
     d.style.cssText = 'position:fixed;inset:0;z-index:10000;background:rgba(0,0,0,.62);display:flex;align-items:center;justify-content:center';
     var box = document.createElement('div'); box.style.cssText = 'background:#0d1117;border:1px solid #30363d;border-radius:12px;max-width:82vw;max-height:86vh;display:flex;flex-direction:column;overflow:hidden';
     var head = document.createElement('div'); head.style.cssText = 'display:flex;justify-content:space-between;align-items:center;padding:10px 16px;border-bottom:1px solid #30363d;gap:12px';
-    var t = document.createElement('span'); t.style.cssText = 'font-size:13px;color:#e6edf3'; t.textContent = name;
+    var t = document.createElement('span'); t.style.cssText = 'font-size:14px;color:#e6edf3'; t.textContent = name;
     var acts = document.createElement('div'); acts.style.cssText = 'display:flex;gap:8px;align-items:center';
     if (download) {
       var dl = document.createElement('a'); dl.textContent = '下载'; dl.href = download;
-      dl.style.cssText = 'border:1px solid #30363d;color:#8b949e;font-size:12px;cursor:pointer;border-radius:6px;padding:3px 10px;text-decoration:none';
+      dl.style.cssText = 'border:1px solid #30363d;color:#8b949e;font-size:13px;cursor:pointer;border-radius:6px;padding:3px 10px;text-decoration:none';
       acts.appendChild(dl);
     }
-    var x = document.createElement('button'); x.textContent = '关闭'; x.style.cssText = 'background:none;border:1px solid #30363d;color:#8b949e;font-size:12px;cursor:pointer;border-radius:6px;padding:3px 10px';
+    var x = document.createElement('button'); x.textContent = '关闭'; x.style.cssText = 'background:none;border:1px solid #30363d;color:#8b949e;font-size:13px;cursor:pointer;border-radius:6px;padding:3px 10px';
     x.onclick = function () { d.remove(); };
     acts.appendChild(x);
     head.appendChild(t); head.appendChild(acts);
@@ -670,7 +670,7 @@
     [['选文件（可多选）', upInput], ['选整个文件夹', dirInput]].forEach(function (it) {
       var d = document.createElement('div');
       d.textContent = it[0];
-      d.style.cssText = 'padding:7px 12px;font-size:12.5px;color:#e6edf3;cursor:pointer;border-radius:5px;white-space:nowrap';
+      d.style.cssText = 'padding:7px 12px;font-size:13.5px;color:#e6edf3;cursor:pointer;border-radius:5px;white-space:nowrap';
       d.onmouseenter = function () { d.style.background = '#21262d'; };
       d.onmouseleave = function () { d.style.background = 'transparent'; };
       d.onclick = function () { m.remove(); it[1].click(); };

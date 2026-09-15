@@ -1648,3 +1648,68 @@ noscript {
 .new-thread { min-height: 34px; }
 .empty-mark { width: 104px; height: 104px; }
 .rail-open { place-items: center; }
+
+/* ─────────────────────────────────────────────────────────────
+   AsBudy：字号放大（2026-09-15 · 老板：「官方原来的很多地方字号太小了」）
+
+   官方最小到 10px（会话元信息 .thread-meta、事实标签 .fact-chip），而且在手机
+   小屏（max-width:430px）里还会再缩到 10.5px —— 面向「不懂编程的中小微企业
+   老板」偏小，中文界面尤其刺眼。这里把小字整体提一档（最小 12.5px）。
+
+   为什么集中写在末尾、而不是逐条改原值：
+     ① 以后调数值只改这一处，不会散在 60 多处规则里；
+     ② 同选择器「后写者胜」—— 所以顺带盖掉手机小屏那两条「越窄越小」的规则；
+     ③ 官方升级 styles.css 时，我们这一整段可以整块搬回，冲突面最小。
+
+   不碰的：官方在媒体查询里放大过的（.session-header h1 17px、表单输入 16px、
+   对话正文 15.5/16.5px）—— 那些本来就够大。
+   ───────────────────────────────────────────────────────────── */
+.thread-meta,
+.archived-row .thread-meta,
+.runtime-provenance,
+.thread-attention-count { font-size: 12.5px; }
+
+.fact-chip,
+.composer-hint,
+.eyebrow,
+.peek-flag,
+.peek-omitted,
+.peek-kind,
+.rail-section-title { font-size: 13px; }
+
+.answer-option small,
+.archived-row .quiet-button,
+.brand-context,
+.dialog-status,
+.header-actions .quiet-button,
+.message-label,
+.receipt-label,
+.model-capability,
+.preview-acts .quiet-button,
+.pv-dl,
+.rail-footer,
+.rail-hide,
+.receipt pre,
+.reasoning pre,
+.receipt summary,
+.reasoning summary,
+.receipt-summary,
+.thread-preview,
+.rail-reveal,
+.preview-reveal { font-size: 13.5px; }
+
+.receipt-copy strong,
+#archived-empty,
+.dialog-copy,
+.dialog-label,
+.new-thread,
+.preview-title,
+.primary-button,
+.quiet-button,
+.send-button,
+.icon-button,
+.pv-file-name,
+.question-fieldset legend,
+.remember-field,
+.answer-option,
+.status-banner { font-size: 14px; }

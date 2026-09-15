@@ -27,40 +27,40 @@
     '.ab-box{background:#0d1117;border:1px solid #30363d;border-radius:12px;width:420px;max-width:90vw;max-height:86vh;display:flex;flex-direction:column;overflow:hidden;box-shadow:0 12px 48px rgba(0,0,0,.6)}',
     '.ab-head{display:flex;justify-content:space-between;align-items:center;padding:12px 18px;border-bottom:1px solid #30363d;gap:14px}',
     '.ab-title{font-size:15px;color:#e6edf3;font-weight:600}',
-    '.ab-x{color:#8b949e;cursor:pointer;font-size:13px;border:1px solid #30363d;border-radius:6px;padding:3px 10px;background:transparent}',
+    '.ab-x{color:#8b949e;cursor:pointer;font-size:14px;border:1px solid #30363d;border-radius:6px;padding:3px 10px;background:transparent}',
     '.ab-x:hover{color:#e6edf3;border-color:#8b949e}',
     '.ab-body{padding:14px 18px;overflow:auto}',
     '.ab-menu-item{display:block;width:100%;text-align:left;padding:12px 14px;border:1px solid #21262d;border-radius:8px;margin-bottom:8px;cursor:pointer;background:transparent;color:#e6edf3;font-size:14px}',
     '.ab-menu-item:hover{border-color:#58a6ff;background:#58a6ff0d}',
-    '.ab-menu-item small{display:block;color:#8b949e;font-size:12px;margin-top:3px}',
+    '.ab-menu-item small{display:block;color:#8b949e;font-size:13.5px;margin-top:3px}',
     '.ab-card{border:1px solid #21262d;border-radius:9px;padding:11px 13px;margin-bottom:9px}',
     '.ab-card-top{display:flex;justify-content:space-between;align-items:center;gap:10px}',
     '.ab-n{color:#e6edf3;font-size:14px}',
-    '.ab-s{color:#8b949e;font-size:12px;margin-top:3px;line-height:1.5}',
-    '.ab-btn{background:#238636;color:#fff;border:none;border-radius:7px;padding:7px 14px;font-size:13px;cursor:pointer}',
+    '.ab-s{color:#8b949e;font-size:13.5px;margin-top:3px;line-height:1.5}',
+    '.ab-btn{background:#238636;color:#fff;border:none;border-radius:7px;padding:7px 14px;font-size:14px;cursor:pointer}',
     '.ab-btn:hover{background:#2ea043}',
     '.ab-btn.ghost{background:transparent;color:#8b949e;border:1px solid #30363d}',
     '.ab-btn.ghost:hover{color:#e6edf3;border-color:#8b949e}',
     '.ab-btn.danger{background:#8b2c2c}.ab-btn.danger:hover{background:#a33}',
-    '.ab-btn.sm{padding:4px 10px;font-size:12px}',
+    '.ab-btn.sm{padding:4px 10px;font-size:13.5px}',
     '.ab-row{display:flex;gap:8px;align-items:center;margin-bottom:10px}',
-    '.ab-row>label{color:#8b949e;font-size:13px;min-width:70px}',
-    '.ab-input{flex:1;background:#010409;border:1px solid #30363d;border-radius:7px;color:#e6edf3;padding:7px 10px;font-size:13px;box-sizing:border-box}',
+    '.ab-row>label{color:#8b949e;font-size:14px;min-width:70px}',
+    '.ab-input{flex:1;background:#010409;border:1px solid #30363d;border-radius:7px;color:#e6edf3;padding:7px 10px;font-size:14px;box-sizing:border-box}',
     '.ab-input:focus{outline:none;border-color:#58a6ff}',
-    '.ab-chk{display:flex;align-items:center;gap:8px;padding:6px 0;color:#e6edf3;font-size:13px;cursor:pointer}',
-    '.ab-tip{color:#8b949e;font-size:12.5px;line-height:1.6;margin-bottom:12px}',
-    '.ab-msg{font-size:13px;margin-top:10px;min-height:16px}',
+    '.ab-chk{display:flex;align-items:center;gap:8px;padding:6px 0;color:#e6edf3;font-size:14px;cursor:pointer}',
+    '.ab-tip{color:#8b949e;font-size:13.5px;line-height:1.6;margin-bottom:12px}',
+    '.ab-msg{font-size:14px;margin-top:10px;min-height:16px}',
     '.ab-msg.err{color:#f85149}.ab-msg.ok{color:#3fb950}',
-    '.ab-chip{display:flex;align-items:center;gap:8px;margin:0 0 8px;padding:6px 10px;border:1px solid #3b7ddd66;background:#3b7ddd14;border-radius:8px;font-size:12.5px;color:#e6edf3;width:fit-content}',
+    '.ab-chip{display:flex;align-items:center;gap:8px;margin:0 0 8px;padding:6px 10px;border:1px solid #3b7ddd66;background:#3b7ddd14;border-radius:8px;font-size:13.5px;color:#e6edf3;width:fit-content}',
     '.ab-chip b{color:#58a6ff;font-weight:600}',
     '.ab-chip-x{cursor:pointer;color:#8b949e;padding:0 4px;font-size:15px;line-height:1}',
     '.ab-chip-x:hover{color:#f85149}',
     '.fact-chip[data-asbudy-model]{cursor:pointer}',
     '.fact-chip[data-asbudy-model] strong{text-decoration:underline;text-underline-offset:2px;text-decoration-style:dotted}',
     '.fact-chip[data-asbudy-model]:hover strong{color:#58a6ff}',
-    '#asbudy-tick{font-size:12.5px;color:#8b949e;padding:0 0 6px 2px}',
+    '#asbudy-tick{font-size:13.5px;color:#8b949e;padding:0 0 6px 2px}',
     '#asbudy-msgbar{display:flex;gap:8px;padding:0 0 6px 2px}',
-    '#asbudy-msgbar button{font:inherit;font-size:12px;color:#8b949e;background:transparent;border:1px solid #30363d;border-radius:6px;padding:3px 10px;cursor:pointer}',
+    '#asbudy-msgbar button{font:inherit;font-size:13.5px;color:#8b949e;background:transparent;border:1px solid #30363d;border-radius:6px;padding:3px 10px;cursor:pointer}',
     '#asbudy-msgbar button:hover{color:#e6edf3}',
   ].join('\n');
   document.head.appendChild(st);
@@ -279,12 +279,12 @@
           : '<div class="ab-row"><label>登录账号</label><input class="ab-input" id="f-user" value="' + esc(rec.user) + '" disabled></div>') +
         '<div class="ab-row"><label>名字</label><input class="ab-input" id="f-name" placeholder="显示用，如「小王」" value="' + (isNew ? '' : esc(rec.name || '')) + '"></div>' +
         '<div class="ab-row"><label>密码</label><input class="ab-input" id="f-pw" type="password" placeholder="' + (isNew ? '至少 8 位' : '留空 = 不改') + '"></div>' +
-        '<div class="ab-row"><label>项目额度</label><input class="ab-input" id="f-quota" type="number" min="0" max="50" value="' + (isNew ? 2 : esc(rec.quota)) + '" style="max-width:110px"><span style="color:#8b949e;font-size:12px">最多能自己建几个项目</span></div>' +
-        '<div style="margin:12px 0 6px;color:#e6edf3;font-size:13px">能看能操作的项目' + (isNew ? '（建完再分配也行）' : '') + '</div>' +
+        '<div class="ab-row"><label>项目额度</label><input class="ab-input" id="f-quota" type="number" min="0" max="50" value="' + (isNew ? 2 : esc(rec.quota)) + '" style="max-width:110px"><span style="color:#8b949e;font-size:13.5px">最多能自己建几个项目</span></div>' +
+        '<div style="margin:12px 0 6px;color:#e6edf3;font-size:14px">能看能操作的项目' + (isNew ? '（建完再分配也行）' : '') + '</div>' +
         '<div id="f-projs">' + (projects.length
           ? projects.map(function (p) {
               var on = !isNew && (rec.grants || []).indexOf(p.key) >= 0;
-              return '<label class="ab-chk"><input type="checkbox" value="' + esc(p.key) + '"' + (on ? ' checked' : '') + '> ' + esc(p.name) + ' <span style="color:#8b949e;font-size:12px">（' + esc(p.key) + '）</span></label>';
+              return '<label class="ab-chk"><input type="checkbox" value="' + esc(p.key) + '"' + (on ? ' checked' : '') + '> ' + esc(p.name) + ' <span style="color:#8b949e;font-size:13.5px">（' + esc(p.key) + '）</span></label>';
             }).join('')
           : '<div class="ab-tip">你名下还没有项目。</div>') + '</div>' +
         '<div style="display:flex;gap:8px;margin-top:16px"><button class="ab-btn" id="f-save" type="button">保存</button>' +
@@ -329,7 +329,7 @@
         '<div class="ab-tip">客户上传的资料、以及他回收站里占的空间，加起来不能超过这个数。<br>填写单位是 G；填 0 = 不限制。</div>' +
         '<div class="ab-row"><label>资料空间</label><input class="ab-input" id="sp-g" type="number" min="0" step="0.5" value="'
           + (u.quotaMb ? (Math.round(u.quotaMb / 1024 * 10) / 10) : 1) + '" style="max-width:110px">'
-          + '<span style="color:#8b949e;font-size:12px">G（当前已用 ' + fmtSpace(u.spaceMb || 0) + '）</span></div>' +
+          + '<span style="color:#8b949e;font-size:13.5px">G（当前已用 ' + fmtSpace(u.spaceMb || 0) + '）</span></div>' +
         '<div style="display:flex;gap:8px;margin-top:16px"><button class="ab-btn" id="sp-save" type="button">保存</button>' +
         '<button class="ab-btn ghost" id="sp-cancel" type="button">取消</button></div><div class="ab-msg" id="sp-msg"></div>';
       var msgEl = body.querySelector('#sp-msg');
@@ -390,7 +390,7 @@
         '<div class="ab-row"><label>登录账号</label><input class="ab-input" id="c-user" placeholder="字母数字，2~32 位"></div>' +
         '<div class="ab-row"><label>公司名</label><input class="ab-input" id="c-name" placeholder="显示用，如「XX 公司」"></div>' +
         '<div class="ab-row"><label>密码</label><input class="ab-input" id="c-pw" type="password" placeholder="至少 8 位"></div>' +
-        '<div class="ab-row"><label>资料空间</label><input class="ab-input" id="c-space" type="number" min="0" step="0.5" value="1" style="max-width:110px"><span style="color:#8b949e;font-size:12px">G，0 = 不限（客户能传多少资料）</span></div>' +
+        '<div class="ab-row"><label>资料空间</label><input class="ab-input" id="c-space" type="number" min="0" step="0.5" value="1" style="max-width:110px"><span style="color:#8b949e;font-size:13.5px">G，0 = 不限（客户能传多少资料）</span></div>' +
         '<div style="display:flex;gap:8px;margin-top:16px"><button class="ab-btn" id="c-save" type="button">保存</button>' +
         '<button class="ab-btn ghost" id="c-cancel" type="button">取消</button></div><div class="ab-msg" id="c-msg"></div>';
       var msgEl = body.querySelector('#c-msg');
@@ -428,13 +428,13 @@
         body.innerHTML =
           '<div style="display:flex;align-items:center;gap:8px;margin-bottom:10px">' +
           '<span class="ab-tip" style="margin:0">把已上传的文件夹搬成一个新项目</span>' +
-          '<span id="imp-q" title="这是干什么的" style="cursor:pointer;width:18px;height:18px;line-height:18px;text-align:center;border:1px solid #30363d;border-radius:50%;color:#8b949e;font-size:12px;flex:none">?</span>' +
+          '<span id="imp-q" title="这是干什么的" style="cursor:pointer;width:18px;height:18px;line-height:18px;text-align:center;border:1px solid #30363d;border-radius:50%;color:#8b949e;font-size:13.5px;flex:none">?</span>' +
           '</div>' + helpHtml +
           '<div class="ab-row"><label>名字</label><input class="ab-input" id="imp-name" placeholder="如：我原来的客户系统"></div>' +
           '<div class="ab-row"><label>从哪导</label>' +
           (dirs.length
             ? '<select class="ab-input" id="imp-src">' + dirs.map(function (d) { return '<option value="' + esc(d.path) + '">' + esc(d.name) + '</option>'; }).join('') + '</select>'
-            : '<span style="color:#d29922;font-size:12.5px">还没有上传过文件夹</span>') +
+            : '<span style="color:#d29922;font-size:13.5px">还没有上传过文件夹</span>') +
           '</div>' +
           (dirs.length ? '' : '<div class="ab-tip">先去侧栏「项目文件」面板 →「我的文件」→「+ 上传」→「选整个文件夹」，传完再回来。</div>') +
           '<div style="display:flex;gap:8px;margin-top:16px">' +
@@ -485,7 +485,7 @@
         '<div class="ab-tip">每个项目是一套独立系统（自己的引擎 + 自己的工作区）。建一个约 30~60 秒。</div>' +
         '<div class="ab-row"><label>名字</label><input class="ab-input" id="np-name" placeholder="如：客户管理系统"></div>' +
         '<div class="ab-row"><label>一句话说</label><input class="ab-input" id="np-note" placeholder="可选，这个系统干什么用"></div>' +
-        '<div style="margin:12px 0 6px;color:#e6edf3;font-size:13px">从哪开始</div>' +
+        '<div style="margin:12px 0 6px;color:#e6edf3;font-size:14px">从哪开始</div>' +
         '<label class="ab-chk"><input type="radio" name="np-tpl" value="example" checked> 带示例（有客户 / 跟进 / 订单三张样例表）</label>' +
         '<label class="ab-chk"><input type="radio" name="np-tpl" value="blank"> 空白（从零开始）</label>' +
         '<div style="display:flex;gap:8px;margin-top:16px"><button class="ab-btn" id="np-go" type="button">建</button>' +
@@ -573,7 +573,7 @@
             if (isAdmin && owners.length) {
               var sel = document.createElement('select');
               sel.className = 'ab-input';
-              sel.style.cssText = 'max-width:150px;padding:5px 8px;font-size:12px';
+              sel.style.cssText = 'max-width:150px;padding:5px 8px;font-size:13.5px';
               sel.title = '把项目转给某个客户';
               owners.forEach(function (o) {
                 var op = document.createElement('option');
@@ -760,10 +760,10 @@
           '<div class="ab-row"><label>用哪个模型</label><select class="ab-input" id="adv-model">' + modelOpts + '</select></div>' +
           '<div class="ab-row"><label>代码存哪</label><input class="ab-input" id="adv-git" placeholder="git@gitee.com:某人/仓库.git" value="' + esc(d.gitRemote || '') + '"></div>' +
           '<div style="display:flex;gap:8px;margin:-2px 0 14px 78px"><button class="ab-btn ghost sm" id="adv-git-save" type="button">保存</button><button class="ab-btn ghost sm" id="adv-git-clear" type="button">清空</button></div>' +
-          '<div class="ab-row"><label>过程多详细</label><input class="ab-input" id="adv-lines" type="number" min="0" max="50" value="' + (d.thinkLines != null ? d.thinkLines : 3) + '" style="max-width:110px"><span style="color:#8b949e;font-size:12px">折叠时显示几行</span></div>' +
+          '<div class="ab-row"><label>过程多详细</label><input class="ab-input" id="adv-lines" type="number" min="0" max="50" value="' + (d.thinkLines != null ? d.thinkLines : 3) + '" style="max-width:110px"><span style="color:#8b949e;font-size:13.5px">折叠时显示几行</span></div>' +
           '<div style="margin:-2px 0 14px 78px"><button class="ab-btn ghost sm" id="adv-lines-save" type="button">保存</button></div>' +
           '<label class="ab-chk"><input type="checkbox" id="adv-ro"' + (d.previewReadOnly ? ' checked' : '') + '> 只看不改（防误删）</label>' +
-          '<div style="margin:14px 0 6px;color:#e6edf3;font-size:13px">花了多少</div>' +
+          '<div style="margin:14px 0 6px;color:#e6edf3;font-size:14px">花了多少</div>' +
           (u
             ? '<div class="ab-card"><div class="ab-s">累计 ￥' + Number(u.costCny || 0).toFixed(2) + ' ｜ 改动 ' + (u.turns || 0) + ' 次<br>进 ' + Math.round((u.inTok || 0) / 1000) + 'K / 出 ' + Math.round((u.outTok || 0) / 1000) + 'K token</div></div>'
             : '<div class="ab-tip">这个项目还没有用量记录。</div>') +
