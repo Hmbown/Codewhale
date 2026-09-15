@@ -36,10 +36,10 @@
     "providerCountDefinition": "Website-derived ApiProvider labels in this source snapshot, excluding Custom, DeepseekCN and retired Antigravity; includes protocol/plan variants. Not a count of distinct vendors, ProviderKind identities, live catalogs, or released v0.9.11 providers."
   },
   "latestPublishedRelease": {
-    "tag": "v0.9.12",
-    "version": "0.9.12",
-    "publishedAt": "2026-09-05T09:59:53Z",
-    "url": "https://github.com/Hmbown/CodeWhale/releases/tag/v0.9.12",
+    "tag": "v0.9.13",
+    "version": "0.9.13",
+    "publishedAt": "2026-09-14T03:48:56Z",
+    "url": "https://github.com/Hmbown/CodeWhale/releases/tag/v0.9.13",
     "sources": [
       "web/data/latest-published-release.json"
     ]

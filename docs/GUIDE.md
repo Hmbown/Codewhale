@@ -728,6 +728,12 @@ lease expires so two controllers never race. Every folder you enroll from one
 terminal shares a single stable device id, so the web app lists one computer
 per machine rather than one per session.
 
+> Note (2026-09-14): the hosted web app at app.codewhale.net sunsets in phases
+> under the 2026-09-14 product-client decision; the native GPUI desktop app
+> (private `codehwhale-gpui` repo, phase map in `docs/TRANSITION.md`) is the
+> successor surface. `/rc` keeps working against the web app while it remains
+> live.
+
 ### What should I do when the model gets confused?
 
 Stop and restate the goal, constraints, and current evidence. If the transcript

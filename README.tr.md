@@ -1,4 +1,4 @@
-<!-- source: README.md sha256:a446e3921085 -->
+<!-- source: README.md sha256:ebf1c69de0dc -->
 # Codewhale
 
 Codewhale, seçtiğiniz barındırılan veya yerel bir modeli kullanarak projenizi okuyan, dosyaları düzenleyen, komutları çalıştıran ve yaptığı işi kontrol eden açık kaynaklı bir ajandır. Terminalde tek bir görevle başlayın. Daha büyük bir işte, işin bölümlerini farklı model ve rollere sahip ajanlara verin.
@@ -53,7 +53,7 @@ Terminal ve grafik istemciler, ajanı ve araçlarını çalıştıran Codewhale 
 
 - **Terminal:** `codewhale` etkileşimli arayüzü açar; `codewhale exec` bir betikten veya CI işinden görev çalıştırır.
 - **Yerel tarayıcı:** `codewhale web`, aynı çalışma zamanı için paketle birlikte gelen [yerel web istemcisini](docs/WEB.md) açar.
-- **Codewhale web ve masaüstü uygulamaları:** geliştirme aşamasındaki grafik çalışma ortamlarıdır. Kullanılabilirlikleri [ürün sayfasında](https://codewhale.net/en/product) belirtilir.
+- **Codewhale masaüstü uygulaması (GPUI):** yerel GPUI masaüstü uygulaması ürün istemcisi yönüdür (2026-09-14 kararı; aşama haritası özel codehwhale-gpui deposundaki docs/TRANSITION.md dosyasındadır). app.codewhale.net'teki barındırılan web uygulaması aşamalı olarak kaldırılır; pazarlama sitesi, oturum açma, faturalandırma, yasal ve indirme sayfaları web'de kalıcı olarak kalır. Kullanılabilirlikleri [ürün sayfasında](https://codewhale.net/en/product) belirtilir.
 
 **Computer Use, diğer uygulamaları gözlemlemek ve onlarla etkileşime girmek için araçlar ekler.** Eklenti mevcut kaynak koduna dahildir. Kullanmadan önce istediği erişimi gözden geçirin ve eklentiyi etkinleştirin; işletim sistemi izinleri ve platform gereksinimleri geçerliliğini korur. Birlikte gelen [Computer Use kılavuzuna](crates/tui/plugins/computer-use/README.md) ve [eklenti kurulumuna](docs/PLUGINS.md) bakın.
 

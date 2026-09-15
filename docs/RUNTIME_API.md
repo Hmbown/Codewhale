@@ -130,6 +130,12 @@ a unix domain socket. The wire is the `--stdio` transport verbatim — the same
 newline-delimited JSON-RPC 2.0 methods, dispatched by the same code — with one
 handshake in front of it.
 
+> Note (2026-09-14): the Tauri desktop shell named above is retiring under the
+> 2026-09-14 product-client transition, and the DESKTOP-APP-BRIEF reference is
+> a dangling pointer (that brief does not exist in this repo). The GPUI client
+> in the private `codehwhale-gpui` repo is the successor daemon consumer over
+> this HTTP runtime API; the socket protocol described here is unchanged.
+
 **Endpoint.** `--socket-path` if given; else `$CODEWHALE_HOME/run/daemon.sock`
 when `CODEWHALE_HOME` is set (an explicit home is an isolation boundary); else
 `$XDG_RUNTIME_DIR/codewhale/daemon.sock`; else
