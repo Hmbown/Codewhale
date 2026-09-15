@@ -50,7 +50,15 @@
     '.a-del:hover{color:#f85149}',
     '.u-item{font-size:13.5px;color:var(--text);padding:4px 6px;border-radius:4px;cursor:pointer;line-height:1.5}',
     '.u-item:hover{background:var(--hover)}',
-    '.u-time{color:var(--text-faint);font-size:12.5px}'
+    '.u-time{color:var(--text-faint);font-size:12.5px}',
+    // 手机（窄屏）：侧栏要一屏装得下。2026-09-15 实测 iPhone 视口（390×844）下
+    // 侧栏内容总高 962px > 一屏 844 —— 会话列表下半截和底部「已连接」状态整块在屏幕外。
+    // 卡片的内容区各自限高（超出在卡片内部滚），配合 styles.css 里窄屏 .rail 可纵向滚动兜底。
+    '@media (max-width:800px){',
+    '.asb-bd{max-height:18vh}',
+    '#asbudy-undo-body{max-height:14vh}',
+    '.a-list{max-height:14vh}',
+    '}'
   ].join('\n');
   var st = document.createElement('style');
   st.textContent = css;

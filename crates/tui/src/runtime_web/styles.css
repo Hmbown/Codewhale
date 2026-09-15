@@ -1645,6 +1645,20 @@ noscript {
 /* ── AsBudy 扩展布局（2026-09-14 从门卫注入搬进这里）──
    侧栏多一行，容纳「项目文件 / 我的资料」两张卡片（官方原本是 6 行） */
 .rail { grid-template-rows: 52px auto auto auto auto minmax(144px, 1fr) auto; }
+/* 侧栏是 grid，列宽默认 auto —— 任何一格的最小内容宽都会把整列撑宽。
+   我们加的卡片里有不可断行的行（回收站：「文件名 + 系统 · 时间 + 还原 ×」），
+   实测把列撑到 470px：宽屏被裁 86px，手机（390px 屏）右侧直接少掉 100px 看不见。
+   2026-09-15：实测手机端 .rail 宽 390 / 内容 470 / scrollWidth 490，
+   隐藏 #asbudy-recycle 后回落 389 —— 就是它。minmax(0,1fr) 让列宽只认容器宽，
+   超长内容交给各卡片自己收缩（见 .f-node 系列的 min-width:0）。 */
+.rail { grid-template-columns: minmax(0, 1fr); }
+.rail > * { min-width: 0; }
+/* 侧栏要装得下：官方 .rail 是 overflow:hidden，内容一旦超过一屏底部的会话列表和
+   「已连接」页脚就永远看不到、也滑不到。2026-09-15 实测：390×844 手机稿内容 962px、
+   1280×900 桌面稿内容 969px，两稿都溢出（PC 上少 69px、手机少 51〜118px）。
+   这里只把纵向改成可滚（横向仍 hidden，不产生页面横滚）；内容不超时不会出现滚动条。
+   卡片自身限高（手机上更矮）见 asbudy-files.js 的注入样式。 */
+.rail { overflow-y: auto; overscroll-behavior: contain; }
 .new-thread { min-height: 34px; }
 .empty-mark { width: 104px; height: 104px; }
 .rail-open { place-items: center; }
