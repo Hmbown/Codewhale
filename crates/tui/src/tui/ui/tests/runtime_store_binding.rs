@@ -281,7 +281,18 @@ async fn runtime_store_binding_survives_launch_snapshot_and_resume() -> anyhow::
     let old_id = other_app.current_session_id.clone();
     let error = apply_loaded_session_with_goal(&mut other_app, &mut resumed_config, &loaded, None)
         .unwrap_err();
-    assert!(error.contains("Resume it in a new Codewhale process"));
+    // The refusal must name the route that actually works. "Resume it in a new
+    // Codewhale process" was true but unactionable: starting a new process and
+    // then picking the session from `/resume` returns here, because that is
+    // this same switch path (#6207, #6225).
+    assert!(
+        error.contains("codewhale resume"),
+        "the refusal must point at the direct-open path: {error}"
+    );
+    assert!(
+        error.contains(&loaded.metadata.id),
+        "the refusal must name the session to open: {error}"
+    );
     assert_eq!(other_app.current_session_id, old_id);
     assert_eq!(other_app.input, "preserve pending input");
     foreign.shutdown_and_wait().await?;
