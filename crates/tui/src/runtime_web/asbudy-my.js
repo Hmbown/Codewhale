@@ -353,8 +353,9 @@
     if (!owner && ME && ME.role === 'admin') {
       api('/_gate/users').then(function (r) {
         var users = (r.body && r.body.users) || [];
-        openLayer('员工管理 · 先选客户', function (body) {
-          body.innerHTML = '<div class="ab-tip">先选一个客户，看它名下的员工。</div>' +
+        openLayer('员工管理 · 先选归属', function (body) {
+          body.innerHTML = '<div class="ab-tip">员工归谁？平台自己（内部）或某个客户。</div>' +
+            '<button class="ab-menu-item" data-u="admin">平台自己的员工<small>归平台（你直接管）</small></button>' +
             users.map(function (u) {
               return '<button class="ab-menu-item" data-u="' + esc(u.user) + '">' + esc(u.name || u.user) + '<small>' + esc(u.user) + '</small></button>';
             }).join('');
@@ -369,7 +370,7 @@
     Promise.all([api('/_gate/projects'), api('/_gate/staff' + q)]).then(function (rs) {
       var projects = (rs[0].body && rs[0].body.projects) || [];
       var staff = (rs[1].body && rs[1].body.staff) || [];
-      openLayer('员工管理' + (owner ? '（' + esc(owner) + '）' : ''), function (body) {
+      openLayer('员工管理' + (owner ? '（' + (owner === 'admin' ? '平台自己的' : esc(owner)) + '）' : ''), function (body) {
         body.innerHTML =
           '<div class="ab-tip">给员工建账号、设「最多能建几个项目」、勾选「能看能操作哪几个项目」。<br>' +
           '员工自己建的项目归<b>客户公司</b>（你可见可管）；删员工时项目转回你名下，<b>不删项目</b>。</div>' +
@@ -394,10 +395,11 @@
               card.innerHTML =
                 '<div class="ab-card-top"><div><div class="ab-n">' + esc(s.name || s.user) + '</div>' +
                 '<div class="ab-s">登录账号：' + esc(s.user) + ' ｜ 项目额度：' + esc(s.quota) + ' 个' +
+                ' ｜ 资料空间：' + (s.quotaMb ? esc(s.quotaMb) + ' MB' : '默认') +
                 (s.projects && s.projects.length ? ' ｜ 已自建：' + esc(s.projects.join('、')) : '') + '<br>' +
                 '可看项目：' + (granted.length ? esc(granted.join('、')) : '<span style="color:#d29922">未分配</span>') + '</div></div></div>';
               var acts = document.createElement('div');
-              acts.style.cssText = 'display:flex;gap:7px;margin-top:10px';
+              acts.style.cssText = 'display:flex;gap:7px;margin-top:10px;flex-wrap:wrap';
               var bEdit = document.createElement('button'); bEdit.className = 'ab-btn ghost sm'; bEdit.type = 'button'; bEdit.textContent = '编辑';
               bEdit.onclick = function () { openStaffForm(s, owner, projects, staff, reopen); };
               var bDel = document.createElement('button'); bDel.className = 'ab-btn danger sm'; bDel.type = 'button'; bDel.textContent = '删除';
@@ -407,6 +409,10 @@
                   if (r.ok) { refresh(); } else { alert(r.body.error || '删除失败'); }
                 });
               };
+              // 「进他的视角」—— 下级的东西不并排铺在我这儿（附三 §13 原则④）
+              var bView = document.createElement('button'); bView.className = 'ab-btn ghost sm'; bView.type = 'button'; bView.textContent = '进他的视角';
+              bView.onclick = function () { location.href = '/view-as?as=' + encodeURIComponent(s.user); };
+              acts.appendChild(bView);
               acts.appendChild(bEdit); acts.appendChild(bDel);
               card.appendChild(acts);
               listEl.appendChild(card);
@@ -428,6 +434,7 @@
         '<div class="ab-row"><label>名字</label><input class="ab-input" id="f-name" placeholder="显示用，如「小王」" value="' + (isNew ? '' : esc(rec.name || '')) + '"></div>' +
         '<div class="ab-row"><label>密码</label><input class="ab-input" id="f-pw" type="password" placeholder="' + (isNew ? '至少 8 位' : '留空 = 不改') + '"></div>' +
         '<div class="ab-row"><label>项目额度</label><input class="ab-input" id="f-quota" type="number" min="0" max="50" value="' + (isNew ? 2 : esc(rec.quota)) + '" style="max-width:110px"><span style="color:#8b949e;font-size:13.5px">最多能自己建几个项目</span></div>' +
+        '<div class="ab-row"><label>资料空间</label><input class="ab-input" id="f-quotamb" type="number" min="0" placeholder="MB，留空 = 默认" value="' + (isNew || !rec.quotaMb ? '' : esc(rec.quotaMb)) + '" style="max-width:130px"><span style="color:#8b949e;font-size:13.5px">他能上传多少资料（不能超过你自己的）</span></div>' +
         '<div style="margin:12px 0 6px;color:#e6edf3;font-size:14px">能看能操作的项目' + (isNew ? '（建完再分配也行）' : '') + '</div>' +
         '<div id="f-projs">' + (projects.length
           ? projects.map(function (p) {
@@ -446,10 +453,12 @@
         var name = body.querySelector('#f-name').value.trim();
         var pw = body.querySelector('#f-pw').value;
         var quota = parseInt(body.querySelector('#f-quota').value, 10);
+        var quotaMbRaw = body.querySelector('#f-quotamb').value.trim();
         var grants = [];
         body.querySelectorAll('#f-projs input[type=checkbox]').forEach(function (c) { if (c.checked) grants.push(c.value); });
         if (!isNew && !pw && !name) { /* 允许只改配额/授权 */ }
         var payload = { user: uname, displayName: name, quota: quota };
+        payload.quotaMb = quotaMbRaw === '' ? 0 : parseInt(quotaMbRaw, 10);   // 0 = 用默认（P2）
         if (owner) payload.owner = owner;
         if (pw) payload.password = pw;
         api('/_gate/staff', { method: 'POST', body: JSON.stringify(payload) }).then(function (r) {
