@@ -979,7 +979,7 @@ function startBrowserClient() {
       appendThreadGroup("需要你处理", "needs-you", groups.needsYou);
     }
     if (groups.recent.length > 0) {
-      appendThreadGroup("最近", "recent", groups.recent);
+      appendThreadGroup("最近会话", "recent", groups.recent);
     }
   }
 

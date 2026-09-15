@@ -1642,9 +1642,11 @@ noscript {
 .fact-chip { font-size: 12px; }
 .composer textarea { font-size: 16px; }
 
-/* ── AsBudy 扩展布局（2026-09-14 从门卫注入搬进这里）──
-   侧栏多一行，容纳「项目文件 / 我的资料」两张卡片（官方原本是 6 行） */
-.rail { grid-template-rows: 52px auto auto auto auto minmax(144px, 1fr) auto; }
+/* ── AsBudy 扩展布局（2026-09-14 从门卫注入搬进这里；2026-09-15 老板要求重排）──
+   侧栏 8 行，从上到下：品牌 / 新建会话 / 搜索 / 项目文件+我的资料 / 最近会话 /
+   回收站 / 退回 / 连接状态（官方原本是 6 行）。
+   2026-09-15 老板：「最近」改叫「最近会话」并移到「我的资料」下方，回收站和退回顺移到它下面。 */
+.rail { grid-template-rows: 52px auto auto auto minmax(144px, 1fr) auto auto auto; }
 /* 侧栏是 grid，列宽默认 auto —— 任何一格的最小内容宽都会把整列撑宽。
    我们加的卡片里有不可断行的行（回收站：「文件名 + 系统 · 时间 + 还原 ×」），
    实测把列撑到 470px：宽屏被裁 86px，手机（390px 屏）右侧直接少掉 100px 看不见。

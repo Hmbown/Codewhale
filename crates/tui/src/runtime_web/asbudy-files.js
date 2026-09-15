@@ -51,6 +51,13 @@
     '.u-item{font-size:13.5px;color:var(--text);padding:4px 6px;border-radius:4px;cursor:pointer;line-height:1.5}',
     '.u-item:hover{background:var(--hover)}',
     '.u-time{color:var(--text-faint);font-size:12.5px}',
+    // 回收站卡片（老板 2026-09-15：从「我的资料」卡里搬出来，排在「最近会话」下面）——
+    // 现在是侧栏的直接子元素，边距得自己带（以前靠 #asbudy-files 容器的边距）
+    '#asbudy-recycle{margin:8px 12px 0}',
+    // 「退回」面板头部：折叠箭头 + 标题 + （靠右的）刷新；折叠时只留头部
+    '#asbudy-undo .f-head{display:flex;align-items:center;gap:6px}',
+    '#asbudy-undo .f-head #asbudy-undo-refresh{margin-left:auto;cursor:pointer;color:var(--text-faint)}',
+    '#asbudy-undo.folded > #asbudy-undo-body{display:none}',
     // 手机（窄屏）：侧栏要一屏装得下。2026-09-15 实测 iPhone 视口（390×844）下
     // 侧栏内容总高 962px > 一屏 844 —— 会话列表下半截和底部「已连接」状态整块在屏幕外。
     // 卡片的内容区各自限高（超出在卡片内部滚），配合 styles.css 里窄屏 .rail 可纵向滚动兜底。
@@ -64,15 +71,26 @@
   st.textContent = css;
   document.head.appendChild(st);
 
-  // ── 两个卡片（不再用 tab 切换）：各自可折叠，折叠状态记在 localStorage（下次进来保持）──
+  // ── 可折叠的块：折叠状态记在 localStorage（下次进来保持）──
+  // 2026-09-15 老板要求：回收站 / 退回**默认折叠**（列表长、常占地方），
+  // 项目文件 / 我的资料仍默认展开。默认值只在「本地没记录」时生效 ——
+  // 老板自己点开过就按他的来。
   function foldKey(which) { return 'asbudy.fold.' + which; }
+  var FOLD_DEFAULT = { proj: false, mine: false, recycle: true, undo: true };
+  var FOLD_CARD = { proj: 'asb-card-proj', mine: 'asb-card-mine', recycle: 'asbudy-recycle', undo: 'asbudy-undo' };
   function isFolded(which) {
-    try { return localStorage.getItem(foldKey(which)) === '1'; } catch (e) { return false; }
+    var dflt = !!FOLD_DEFAULT[which];
+    try { var v = localStorage.getItem(foldKey(which)); return v === null ? dflt : v === '1'; } catch (e) { return dflt; }
   }
   function setFold(which, folded) {
-    var card = document.getElementById('asb-card-' + which);
+    var card = document.getElementById(FOLD_CARD[which] || ('asb-card-' + which));
     var btn = document.getElementById('asb-fold-' + which);
-    if (card) card.className = 'asb-card' + (folded ? ' folded' : '');
+    if (card) {
+      // .asb-card 系的（项目文件 / 我的资料 / 回收站）整串重设，保持原逻辑；
+      // 「退回」面板有自己的 id 样式，只 toggle folded，不碰它其他 class
+      if (card.classList.contains('asb-card')) card.className = 'asb-card' + (folded ? ' folded' : '');
+      else card.classList.toggle('folded', folded);
+    }
     if (btn) btn.textContent = folded ? '\u25b8' : '\u25be';
     try { localStorage.setItem(foldKey(which), folded ? '1' : '0'); } catch (e) {}
   }
@@ -227,10 +245,16 @@
     recycleBox.className = 'asb-card';
     recycleBox.id = 'asbudy-recycle';
     recycleBox.hidden = true;
-    recycleBox.innerHTML = '<div class="asb-hd"><span class="asb-title">回收站<span id="asb-bin-count"></span></span>'
+    recycleBox.innerHTML = '<div class="asb-hd"><span class="asb-fold" id="asb-fold-recycle" title="折叠 / 展开">\u25b8</span>'
+      + '<span class="asb-title">回收站<span id="asb-bin-count"></span></span>'
       + '<span class="asb-tools"><span id="asbudy-recycle-refresh" style="cursor:pointer">刷新</span></span></div>'
       + '<div class="asb-bd" id="asbudy-recycle-body"></div>';
-    mineCard.parentNode.insertBefore(recycleBox, mineCard.nextSibling);
+    // 位置（老板 2026-09-15）：回收站排在「最近会话」下面、「退回」上面 ——
+    // 以前塞在「我的资料」卡片内部，反而把会话列表挤到了最下面
+    var undoAnchor = document.getElementById('asbudy-undo');
+    if (undoAnchor && undoAnchor.parentNode) undoAnchor.parentNode.insertBefore(recycleBox, undoAnchor);
+    else mineCard.parentNode.insertBefore(recycleBox, mineCard.nextSibling);
+    setFold('recycle', isFolded('recycle'));   // 默认折叠（老板 2026-09-15）
     var rf = recycleBox.querySelector('#asbudy-recycle-refresh');
     if (rf) rf.onclick = function () { loadRecycle(); };
     return recycleBox;
@@ -510,6 +534,7 @@
   if (refresh) refresh.onclick = function () { loadProj(true); loadMine(); };   // 手动刷新 = 强制重绘
   setFold('proj', isFolded('proj'));      // 恢复上次的折叠状态
   setFold('mine', isFolded('mine'));
+  setFold('undo', isFolded('undo'));      // 退回面板默认折叠（老板 2026-09-15；回收站在建卡时应用）
   loadProj();
   loadMine();
   loadRecycle();
@@ -620,6 +645,8 @@
     else if (t.id === 'asbudy-files-upload') { showUpMenu(t); }
     else if (t.id === 'asb-fold-proj') { setFold('proj', !isFolded('proj')); }
     else if (t.id === 'asb-fold-mine') { setFold('mine', !isFolded('mine')); }
+    else if (t.id === 'asb-fold-recycle') { setFold('recycle', !isFolded('recycle')); }
+    else if (t.id === 'asb-fold-undo') { setFold('undo', !isFolded('undo')); }
   });
 
   // ── 上传到「当前项目」（目录树立刻能看到、AI 直接能读） ──

@@ -46,12 +46,14 @@
             <div class="asb-bd" id="asbudy-mine-body"><span class="f-empty">加载中…</span></div>
           </div>
         </div>
+        <!-- 会话列表：老板 2026-09-15 定 —— 挪到「我的资料」下方，分组标题改叫「最近会话」
+             （文案在 app.mjs 的 appendThreadGroup 调用处） -->
+        <nav class="thread-list" id="thread-list" aria-label="进行中的会话"></nav>
+
         <div id="asbudy-undo" hidden>
-          <div class="f-head"><span>退回</span><span id="asbudy-undo-refresh">刷新</span></div>
+          <div class="f-head"><span class="asb-fold" id="asb-fold-undo" title="折叠 / 展开">▸</span><span>退回</span><span id="asbudy-undo-refresh">刷新</span></div>
           <div id="asbudy-undo-body"><span class="f-empty">加载中…</span></div>
         </div>
-
-        <nav class="thread-list" id="thread-list" aria-label="进行中的会话"></nav>
 
         <!-- Read-only peek for a selected saved session. Bounded and redacted
              server-side by GET /v1/sessions/{id}?peek=true; this pane never
