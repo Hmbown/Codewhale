@@ -207,6 +207,81 @@
       for (var i = 0; i < files.length; i++) mineBody.appendChild(render(files[i], true));
     } catch (e) { mineBody.innerHTML = '<span class="f-empty">加载失败</span>'; }
   }
+  // ── 回收站（2026-09-15 · 老板要「客户看得见、能自己捞回来」）──
+  // 删掉的东西挪在这儿：资料池的来自「我的资料」，产出物的来自某个项目。
+  // 能还原（挪回原位）、能彻底删（真删）。空的时候整块隐藏，不打扰。
+  var recycleBox = null;
+  function ensureRecycleBox() {
+    if (recycleBox) return recycleBox;
+    var mineCard = mineBody ? mineBody.closest('.asb-card') : null;
+    if (!mineCard || !mineCard.parentNode) return null;
+    recycleBox = document.createElement('div');
+    recycleBox.className = 'asb-card';
+    recycleBox.id = 'asbudy-recycle';
+    recycleBox.hidden = true;
+    recycleBox.innerHTML = '<div class="asb-hd"><span class="asb-title">回收站<span id="asb-bin-count"></span></span>'
+      + '<span class="asb-tools"><span id="asbudy-recycle-refresh" style="cursor:pointer">刷新</span></span></div>'
+      + '<div class="asb-bd" id="asbudy-recycle-body"></div>';
+    mineCard.parentNode.insertBefore(recycleBox, mineCard.nextSibling);
+    var rf = recycleBox.querySelector('#asbudy-recycle-refresh');
+    if (rf) rf.onclick = function () { loadRecycle(); };
+    return recycleBox;
+  }
+  function binTime(ts) {
+    if (!ts) return '';
+    var d = new Date(ts);
+    function p(n) { return String(n).padStart(2, '0'); }
+    return (d.getMonth() + 1) + '月' + d.getDate() + '日 ' + p(d.getHours()) + ':' + p(d.getMinutes());
+  }
+  async function loadRecycle() {
+    var box = ensureRecycleBox();
+    if (!box) return;
+    var binBody = box.querySelector('#asbudy-recycle-body');
+    try {
+      var r = await fetch('/_gate/recycle', { credentials: 'same-origin' });
+      if (!r.ok) throw 0;
+      var d = await r.json();
+      var items = (d && d.items) || [];
+      var cntEl = box.querySelector('#asb-bin-count');
+      if (cntEl) cntEl.textContent = items.length ? '（' + items.length + '）' : '';
+      if (!items.length) { box.hidden = true; binBody.innerHTML = ''; return; }
+      box.hidden = false;
+      binBody.innerHTML = '';
+      items.forEach(function (it) {
+        var row = document.createElement('div');
+        row.className = 'f-node';
+        row.title = it.from ? ('原位置：' + it.from) : '';
+        row.innerHTML = '<span class="f-ic">↩</span>'
+          + '<span class="f-nm">' + aEsc(it.name) + '</span>'
+          + '<span class="f-sz">' + aEsc(it.source || '') + ' · ' + binTime(it.at) + '</span>'
+          + '<span class="f-tag" data-act="restore" style="cursor:pointer" title="放回原来位置">还原</span>'
+          + '<span class="f-del" data-act="purge" title="彻底删掉（找不回了）">×</span>';
+        row.querySelector('[data-act="restore"]').onclick = function (ev) {
+          ev.stopPropagation();
+          fetch('/_gate/recycle/restore', { method: 'POST', credentials: 'same-origin',
+            headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id: it.id }) })
+            .then(function (rr) {
+              if (rr.ok) { loadRecycle(); loadMine(); loadProj(); return; }
+              return rr.json().then(function (j) { alert((j && j.error) || '还原失败'); })
+                .catch(function () { alert('还原失败'); });
+            });
+        };
+        row.querySelector('[data-act="purge"]').onclick = function (ev) {
+          ev.stopPropagation();
+          if (!confirm('彻底删掉「' + it.name + '」？这个就真找不回来了。')) return;
+          fetch('/_gate/recycle', { method: 'DELETE', credentials: 'same-origin',
+            headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id: it.id }) })
+            .then(function (rr) {
+              if (rr.ok) { loadRecycle(); loadMine(); return; }
+              return rr.json().then(function (j) { alert((j && j.error) || '删不掉'); })
+                .catch(function () { alert('删不掉'); });
+            });
+        };
+        binBody.appendChild(row);
+      });
+    } catch (e) { box.hidden = true; }
+  }
+
   function render(f, isMine) {
     var w = document.createElement('div');
     if (f.isDir) {
@@ -227,7 +302,7 @@
           if (!confirm('删掉整个文件夹「' + f.name + '」？（会进回收站，可以让 AI 帮你找回来）')) return;
           fetch('/_gate/file?name=' + encodeURIComponent(f.path), { method: 'DELETE', credentials: 'same-origin' })
             .then(function (r) {
-              if (r.ok) { loadMine(); return; }
+              if (r.ok) { loadMine(); loadRecycle(); return; }
               return r.json().then(function (d) { alert((d && d.error) || '删不掉'); })
                 .catch(function () { alert('删不掉'); });
             });
@@ -264,7 +339,7 @@
           : '/_gate/artifact?project=' + encodeURIComponent(pkey) + '&path=' + encodeURIComponent(f.path);
         fetch(url, { method: 'DELETE', credentials: 'same-origin' })
           .then(function (r) {
-            if (r.ok) { isMine ? loadMine() : loadProj(); return; }
+            if (r.ok) { isMine ? loadMine() : loadProj(); loadRecycle(); return; }
             // 把后端说清楚的原因透出来（比如「文件在隔离区，可以让 AI 帮你删」），别只说「删不掉」
             return r.json().then(function (d) { alert((d && d.error) || '删不掉'); })
               .catch(function () { alert('删不掉'); });
@@ -425,6 +500,7 @@
   setFold('mine', isFolded('mine'));
   loadProj();
   loadMine();
+  loadRecycle();
 
   // 对话产出后「立即出现」（2026-09-15）：老板反馈——以前要刷新整个页面才看得到。
   // 事件由 app.mjs 广播（item.completed = 某个工具刚干完，turn.completed = 这一轮干完）。
@@ -435,7 +511,7 @@
     var ev = e && e.detail && e.detail.event;
     if (ev !== 'item.completed' && ev !== 'turn.completed') return;
     clearTimeout(autoRefreshTimer);
-    autoRefreshTimer = setTimeout(function () { loadProj(); }, 700);
+    autoRefreshTimer = setTimeout(function () { loadProj(); loadRecycle(); }, 700);
   });
 
   // 右侧「预览」栏（三栏右侧；窄屏变全屏层）
