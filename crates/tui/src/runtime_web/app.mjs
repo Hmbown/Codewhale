@@ -1483,7 +1483,7 @@ function startBrowserClient() {
     const empty = element("div", "empty-state");
     const mark = document.createElement("img");
     mark.className = "empty-mark";
-    mark.src = "/assets/codewhale-192.png";
+    mark.src = "/assets/asbudy-empty-mark.png";
     mark.alt = "";
     empty.append(mark);
     empty.append(element("h2", "", title));
