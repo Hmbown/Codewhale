@@ -35,6 +35,7 @@
     '.f-node.dir{color:var(--text-soft)}',
     '.f-kids{margin-left:12px;border-left:1px solid var(--line);padding-left:6px}',
     '.f-empty{font-size:12px;color:var(--text-faint);padding:0 4px}',
+    '.f-hint{font-size:11px;color:var(--text-faint);padding:2px 4px 5px;line-height:1.5}',
     '#asbudy-undo{margin:8px 12px 0;border:1px solid var(--line);border-radius:8px;padding:8px;background:var(--surface)}',
     '#asbudy-undo-body{max-height:22vh;overflow-y:auto}',
     '#asbudy-arts{margin:8px 12px 0;border:1px solid var(--line);border-radius:8px;padding:8px;background:var(--surface)}',
@@ -251,6 +252,10 @@
       if (!items.length) { box.hidden = true; binBody.innerHTML = ''; return; }
       box.hidden = false;
       binBody.innerHTML = '';
+      var hint = document.createElement('div');
+      hint.className = 'f-hint';
+      hint.textContent = '回收站保留 30 天，过期自动清掉（想留就点「还原」）';
+      binBody.appendChild(hint);
       items.forEach(function (it) {
         var row = document.createElement('div');
         row.className = 'f-node';
