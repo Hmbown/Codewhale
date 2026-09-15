@@ -1697,31 +1697,8 @@ noscript {
   color: var(--text);
 }
 
-/* 「✦ 项目名 ⇄」里的图标（2026-09-15 换成内联 SVG，老板：「符号不够厚重稳重」）
-   原来用的字库符号 ✦/▣/⇄ 各系统渲染粗细不一、还带像素质感；SVG 线条统一、颜色跟文字走。 */
-.brand-context .pj-ico {
-  width: 13.5px;
-  height: 13.5px;
-  vertical-align: -2.5px;
-  fill: none;
-  /* 颜色比文字亮一档 —— 与 13.5px 的字并排时才不显灰（视觉复核：图标发虚） */
-  color: var(--text-soft);
-  stroke: currentColor;
-  /* 1.5 → 1.8 → 2 → 2.2：三版视觉复核都说“线条偏细、分量不足”，逐次加粗 */
-  stroke-width: 2.2;
-  stroke-linecap: round;
-  stroke-linejoin: round;
-}
-.brand-context .pj-ico:first-of-type {
-  margin-right: 5px;
-}
-.brand-context .pj-swap {
-  margin-left: 5px;
-  opacity: 0.75;
-}
-.brand-context .pj-name {
-  white-space: nowrap;
-}
+/* .pj-ico / .pj-name：2026-09-15 换过一版内联 SVG 图标，老板说不如原来的字库符号 → 已撤，
+   样式段一并删掉（现在那行只有 .proj-switch 的胶囊 hover）。 */
 
 /* 「关闭」按钮：手机上太抢眼（真视觉复核两次提到）—— 去掉常驻描边、字色降一档，
    触摸高度保持 44px（可用性不降），悬停/按下时才显示边框。 */
