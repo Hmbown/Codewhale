@@ -1041,59 +1041,13 @@ fn validate_base_url_security(base_url: &str, provider_allows_insecure_http: boo
     )
 }
 
+/// Mask credentials in a URL for display.
+///
+/// Delegates to the single shared implementation in
+/// [`codewhale_secrets::sanitize`] (FEAT-025 D4) so command sanitization and
+/// client diagnostics cannot drift.
 pub(crate) fn redact_url_for_display(url: &str) -> String {
-    let Ok(mut parsed) = reqwest::Url::parse(url) else {
-        return url.to_string();
-    };
-    if !parsed.username().is_empty() || parsed.password().is_some() {
-        let _ = parsed.set_username("***");
-        let _ = parsed.set_password(Some("***"));
-    }
-    if parsed.query().is_none() {
-        return parsed.to_string();
-    }
-    let pairs: Vec<(String, String)> = parsed
-        .query_pairs()
-        .map(|(key, value)| {
-            let value = if is_sensitive_url_query_key(&key) {
-                "***".to_string()
-            } else {
-                value.into_owned()
-            };
-            (key.into_owned(), value)
-        })
-        .collect();
-    parsed.set_query(None);
-    let mut query = parsed.query_pairs_mut();
-    for (key, value) in pairs {
-        query.append_pair(&key, &value);
-    }
-    drop(query);
-    parsed.to_string()
-}
-
-fn is_sensitive_url_query_key(key: &str) -> bool {
-    let normalized = key.trim().replace(['-', '.'], "_").to_ascii_lowercase();
-    matches!(
-        normalized.as_str(),
-        "api_key"
-            | "apikey"
-            | "access_token"
-            | "auth_token"
-            | "authorization"
-            | "bearer"
-            | "client_secret"
-            | "credential"
-            | "id_token"
-            | "password"
-            | "refresh_token"
-            | "secret"
-            | "token"
-    ) || normalized.ends_with("_api_key")
-        || normalized.ends_with("_authorization")
-        || normalized.ends_with("_password")
-        || normalized.ends_with("_secret")
-        || normalized.ends_with("_token")
+    codewhale_secrets::sanitize::redact_url_for_display(url)
 }
 
 pub(super) fn versioned_base_url(base_url: &str) -> String {

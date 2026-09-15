@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 
 use codewhale_core::request::{ContentBlock, Message, SystemPrompt};
@@ -258,15 +259,20 @@ fn new_capabilities_are_object_safe_and_independently_transportable() {
     presentation(&Presentation);
     media(&Media);
     digest_workspace(&DigestWorkspace);
+    fn export(_: &dyn CommandSessionExportContext) {}
+    export(&FakeExport::default());
 
     let mut presentation = Presentation;
     let mut media = Media;
+    let mut export = FakeExport::default();
     let parts = CommandContexts::empty()
         .with_presentation(&mut presentation)
         .with_media(&mut media)
+        .with_export(&mut export)
         .into_parts();
     assert!(parts.presentation.is_some());
     assert!(parts.media.is_some());
+    assert!(parts.export.is_some());
     assert!(parts.session.is_none());
 }
 
@@ -2513,4 +2519,542 @@ fn control_surface_does_not_widen_session_or_lifecycle_facets() {
     );
     assert!(!parts.lifecycle.as_deref_mut().unwrap().transition_blocked());
     assert!(parts.control.as_deref_mut().unwrap().transition_blocked());
+}
+
+// ---------------------------------------------------------------------------
+// FEAT-025: session export contract (D1/D3/D5/D6/D7/D8/D9).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn export_capability_is_stable_distinct_and_non_conflicting() {
+    let export = CommandCapabilities::SESSION_EXPORT;
+    let existing = [
+        CommandCapabilities::SESSION,
+        CommandCapabilities::MODEL,
+        CommandCapabilities::COST,
+        CommandCapabilities::MODE_POLICY,
+        CommandCapabilities::SYSTEM_PROMPT,
+        CommandCapabilities::SKILLS,
+        CommandCapabilities::WORKSPACE,
+        CommandCapabilities::PRESENTATION,
+        CommandCapabilities::MEDIA,
+        CommandCapabilities::MEMORY,
+        CommandCapabilities::PROJECT,
+        CommandCapabilities::SKILL_GROUP,
+        CommandCapabilities::PLUGIN,
+        CommandCapabilities::SESSION_LIFECYCLE,
+        CommandCapabilities::SESSION_CONTROL,
+    ];
+    let mut union = CommandCapabilities::NONE;
+    for capability in existing {
+        assert_ne!(
+            export, capability,
+            "SESSION_EXPORT must not collide with an existing capability"
+        );
+        union = union.union(capability);
+    }
+    assert!(
+        !union.contains(export),
+        "SESSION_EXPORT must be a bit outside every existing capability (bits 0-14)"
+    );
+    assert!(!CommandCapabilities::NONE.contains(export));
+    assert!(!CommandCapabilities::NONE.contains(CommandCapabilities::NONE));
+    assert!(export.contains(export));
+    assert!(
+        export
+            .union(CommandCapabilities::SESSION_CONTROL)
+            .contains(export)
+    );
+    assert!(
+        export
+            .union(CommandCapabilities::SESSION_CONTROL)
+            .contains(CommandCapabilities::SESSION_CONTROL)
+    );
+    assert!(!CommandCapabilities::SESSION_CONTROL.contains(export));
+    assert!(!export.contains(CommandCapabilities::SESSION_CONTROL));
+    // Storage remains `u16`-backed: bit 15 (1 << 15 = 32768) fits without the
+    // speculative widening FEAT-023's maintainer review ruled out.
+    assert_eq!(
+        std::mem::size_of::<CommandCapabilities>(),
+        std::mem::size_of::<u16>(),
+        "CommandCapabilities storage must stay u16"
+    );
+}
+
+/// Canary: after FEAT-025 the `u16` capability space is *exactly* full.
+///
+/// This is deliberate capacity documentation, not a health check. When FEAT-026
+/// (session structcopy) adds its own facet it must widen the backing storage to
+/// `u32`, and this test is expected to be updated in that commit. Until then it
+/// guarantees that no capability bit is silently reused, and that anyone who
+/// adds a seventeenth capability is told why `1 << 16` on a `u16` will not do.
+#[test]
+fn export_capability_space_is_exactly_full() {
+    let all = [
+        CommandCapabilities::SESSION,
+        CommandCapabilities::MODEL,
+        CommandCapabilities::COST,
+        CommandCapabilities::MODE_POLICY,
+        CommandCapabilities::SYSTEM_PROMPT,
+        CommandCapabilities::SKILLS,
+        CommandCapabilities::WORKSPACE,
+        CommandCapabilities::PRESENTATION,
+        CommandCapabilities::MEDIA,
+        CommandCapabilities::MEMORY,
+        CommandCapabilities::PROJECT,
+        CommandCapabilities::SKILL_GROUP,
+        CommandCapabilities::PLUGIN,
+        CommandCapabilities::SESSION_LIFECYCLE,
+        CommandCapabilities::SESSION_CONTROL,
+        CommandCapabilities::SESSION_EXPORT,
+    ];
+
+    let mut union = CommandCapabilities::NONE;
+    for (index, capability) in all.iter().enumerate() {
+        assert_eq!(
+            capability.bits_for_test(),
+            1u16 << index,
+            "capability {index} must occupy exactly bit {index}"
+        );
+        union = union.union(*capability);
+    }
+
+    assert_eq!(
+        all.len(),
+        u16::BITS as usize,
+        "the declared capability count must consume the whole u16 space"
+    );
+    assert_eq!(
+        union.bits_for_test(),
+        u16::MAX,
+        "bits 0-15 are fully allocated; FEAT-026 must widen the storage to u32"
+    );
+}
+
+/// Deterministic fake export facet: every delegate returns canned portable
+/// values or host error text, and effectful delegates record their calls so a
+/// later phase can assert sequencing without a real host.
+#[derive(Default)]
+struct FakeExport {
+    projection: Option<ConversationExportProjection>,
+    turn: Option<TurnHandoffProjection>,
+    terminal_paste: bool,
+    recovery: Option<Option<PathBuf>>,
+    clipboard: Option<Result<(), String>>,
+    resolved: Option<Result<PathBuf, String>>,
+    write: Option<Result<(), String>>,
+    calls: RefCell<Vec<String>>,
+}
+
+impl CommandSessionExportContext for FakeExport {
+    fn conversation_projection(&self) -> ConversationExportProjection {
+        self.calls
+            .borrow_mut()
+            .push("conversation_projection".to_string());
+        self.projection
+            .clone()
+            .expect("unexpected conversation_projection() on empty fake")
+    }
+    fn turn_handoff_projection(&self) -> TurnHandoffProjection {
+        self.calls
+            .borrow_mut()
+            .push("turn_handoff_projection".to_string());
+        self.turn
+            .clone()
+            .expect("unexpected turn_handoff_projection() on empty fake")
+    }
+    fn clipboard_requires_terminal_paste(&self) -> bool {
+        self.calls
+            .borrow_mut()
+            .push("clipboard_requires_terminal_paste".to_string());
+        self.terminal_paste
+    }
+    fn write_recovery_copy(&self, markdown: &str) -> Option<PathBuf> {
+        self.calls
+            .borrow_mut()
+            .push(format!("write_recovery_copy:{markdown}"));
+        self.recovery
+            .clone()
+            .expect("unexpected write_recovery_copy() on empty fake")
+    }
+    fn write_clipboard(&self, markdown: &str) -> Result<(), String> {
+        self.calls
+            .borrow_mut()
+            .push(format!("write_clipboard:{markdown}"));
+        self.clipboard
+            .clone()
+            .unwrap_or_else(|| Err("unexpected write_clipboard() on empty fake".to_string()))
+    }
+    fn resolve_export_path(&self, raw: &str) -> Result<PathBuf, String> {
+        self.calls
+            .borrow_mut()
+            .push(format!("resolve_export_path:{raw}"));
+        self.resolved.clone().unwrap_or_else(|| {
+            Err(format!(
+                "unexpected resolve_export_path({raw}) on empty fake"
+            ))
+        })
+    }
+    fn write_export_file(&self, path: &Path, contents: &[u8], force: bool) -> Result<(), String> {
+        self.calls.borrow_mut().push(format!(
+            "write_export_file:{}:{}:{force}",
+            path.display(),
+            contents.len()
+        ));
+        self.write
+            .clone()
+            .unwrap_or_else(|| Err("unexpected write_export_file() on empty fake".to_string()))
+    }
+}
+
+fn export_metadata() -> ExportMetadata {
+    ExportMetadata {
+        session_label: "abc123".to_string(),
+        provider: "deepseek".to_string(),
+        model: "deepseek-chat".to_string(),
+        mode: "ACT".to_string(),
+        workspace_name: "workspace".to_string(),
+        message_count: 2,
+        exported_at_unix: 1_760_000_000,
+    }
+}
+
+fn export_recorded_snapshot() -> RestoreSnapshot {
+    RestoreSnapshot {
+        id: "0123456789abcdef".to_string(),
+        label: "pre-turn:3: fix parser".to_string(),
+        timestamp_unix: 1_759_999_000,
+        kind: "pre-turn".to_string(),
+        sequence: Some(3),
+        prompt_snippet: Some("fix parser".to_string()),
+    }
+}
+
+#[test]
+fn export_facet_is_object_safe_and_transports_every_outcome() {
+    // Object safety: usable behind a single `dyn` reference.
+    fn accepts_dyn(_: &dyn CommandSessionExportContext) {}
+    fn accepts_dyn_mut(_: &mut dyn CommandSessionExportContext) {}
+
+    let mut fake = FakeExport {
+        projection: Some(ConversationExportProjection {
+            metadata: export_metadata(),
+            transcript: TranscriptProjection::Authoritative(vec![ExportMessage {
+                is_user_role: false,
+                role: "assistant".to_string(),
+                prompt_snippet: Some("fix parser".to_string()),
+                blocks: vec![
+                    ExportBlock::Text {
+                        text: "visible".to_string(),
+                    },
+                    ExportBlock::ImageReference {
+                        url: "https://example.test/a.png".to_string(),
+                    },
+                    ExportBlock::ImageOmitted,
+                    ExportBlock::InternalReasoning,
+                    ExportBlock::ToolCall {
+                        id: "tool-1".to_string(),
+                        name: "read".to_string(),
+                        caller: Some(ToolCallerProjection {
+                            caller_type: "direct".to_string(),
+                            tool_id: Some("caller-1".to_string()),
+                        }),
+                        input: serde_json::json!({"path": "a.txt"}),
+                    },
+                    ExportBlock::ToolResult {
+                        tool_use_id: "tool-1".to_string(),
+                        content: "ok".to_string(),
+                        is_error: false,
+                        structured: Some(serde_json::json!([{"type": "text", "text": "ok"}])),
+                    },
+                    ExportBlock::ServerToolCall {
+                        id: "server-1".to_string(),
+                        name: "web_search".to_string(),
+                        input: serde_json::json!({"q": "rust"}),
+                    },
+                    ExportBlock::ToolSearchResult {
+                        tool_use_id: "search-1".to_string(),
+                        content: serde_json::json!({"results": []}),
+                    },
+                    ExportBlock::CodeExecutionResult {
+                        tool_use_id: "code-1".to_string(),
+                        content: serde_json::json!({"stdout": "hi"}),
+                    },
+                ],
+            }]),
+            restore_points: RestorePointProjection::Recorded {
+                snapshots: vec![export_recorded_snapshot()],
+            },
+        }),
+        turn: Some(TurnHandoffProjection {
+            markdown: "# turn handoff".to_string(),
+            workspace_path: "/workspace/example".to_string(),
+        }),
+        terminal_paste: true,
+        recovery: Some(Some(PathBuf::from(
+            "/home/u/.codewhale/exports/last-copy.md",
+        ))),
+        clipboard: Some(Ok(())),
+        resolved: Some(Ok(PathBuf::from("/workspace/example/out.md"))),
+        write: Some(Ok(())),
+        ..FakeExport::default()
+    };
+    accepts_dyn(&fake);
+    accepts_dyn_mut(&mut fake);
+
+    let projection = fake.conversation_projection();
+    assert_eq!(projection.metadata.session_label, "abc123");
+    assert_eq!(projection.metadata.provider, "deepseek");
+    assert_eq!(projection.metadata.model, "deepseek-chat");
+    assert_eq!(projection.metadata.mode, "ACT");
+    assert_eq!(projection.metadata.workspace_name, "workspace");
+    assert_eq!(projection.metadata.message_count, 2);
+    assert_eq!(projection.metadata.exported_at_unix, 1_760_000_000);
+    let TranscriptProjection::Authoritative(messages) = projection.transcript else {
+        panic!("expected authoritative transcript");
+    };
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].role, "assistant");
+    assert_eq!(messages[0].prompt_snippet.as_deref(), Some("fix parser"));
+    assert_eq!(messages[0].blocks.len(), 9);
+    let ExportBlock::ToolCall {
+        caller: Some(caller),
+        input,
+        ..
+    } = &messages[0].blocks[4]
+    else {
+        panic!("expected tool call with caller");
+    };
+    assert_eq!(caller.caller_type, "direct");
+    assert_eq!(caller.tool_id.as_deref(), Some("caller-1"));
+    assert_eq!(input["path"], "a.txt");
+    let ExportBlock::ToolResult {
+        is_error,
+        structured,
+        ..
+    } = &messages[0].blocks[5]
+    else {
+        panic!("expected tool result");
+    };
+    assert!(!is_error);
+    assert!(structured.is_some());
+    let RestorePointProjection::Recorded { snapshots } = projection.restore_points else {
+        panic!("expected recorded restore points");
+    };
+    assert_eq!(snapshots.len(), 1);
+    assert_eq!(snapshots[0].id, "0123456789abcdef");
+    assert_eq!(snapshots[0].label, "pre-turn:3: fix parser");
+    assert_eq!(snapshots[0].timestamp_unix, 1_759_999_000);
+    assert_eq!(snapshots[0].kind, "pre-turn");
+    assert_eq!(snapshots[0].sequence, Some(3));
+    assert_eq!(snapshots[0].prompt_snippet.as_deref(), Some("fix parser"));
+
+    let turn = fake.turn_handoff_projection();
+    assert_eq!(turn.markdown, "# turn handoff");
+    assert_eq!(turn.workspace_path, "/workspace/example");
+
+    assert!(fake.clipboard_requires_terminal_paste());
+    assert_eq!(
+        fake.write_recovery_copy("# md"),
+        Some(PathBuf::from("/home/u/.codewhale/exports/last-copy.md"))
+    );
+    assert!(fake.write_clipboard("# md").is_ok());
+    assert_eq!(
+        fake.resolve_export_path("out.md").expect("resolved"),
+        PathBuf::from("/workspace/example/out.md")
+    );
+    assert!(
+        fake.write_export_file(Path::new("/workspace/example/out.md"), b"# md", false)
+            .is_ok()
+    );
+    // Effectful delegates were exercised exactly once each, in call order.
+    let expected: Vec<String> = [
+        "conversation_projection",
+        "turn_handoff_projection",
+        "clipboard_requires_terminal_paste",
+        "write_recovery_copy:# md",
+        "write_clipboard:# md",
+        "resolve_export_path:out.md",
+        "write_export_file:/workspace/example/out.md:4:false",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect();
+    assert_eq!(fake.calls.borrow().as_slice(), expected.as_slice());
+}
+
+#[test]
+fn export_error_and_empty_states_transport_exactly() {
+    let fake = FakeExport {
+        projection: Some(ConversationExportProjection {
+            metadata: export_metadata(),
+            transcript: TranscriptProjection::HistoryFallback(vec![
+                HistoryEntry::Sanitized {
+                    role: "user".to_string(),
+                    body: "visible history".to_string(),
+                },
+                HistoryEntry::Literal {
+                    role: "system".to_string(),
+                    body: "[internal context omitted]".to_string(),
+                },
+            ]),
+            restore_points: RestorePointProjection::Unreadable {
+                reason: "permission denied".to_string(),
+            },
+        }),
+        recovery: Some(None),
+        clipboard: Some(Err("clipboard unavailable".to_string())),
+        resolved: Some(Err("export paths may not contain `..`".to_string())),
+        write: Some(Err("destination already exists".to_string())),
+        ..FakeExport::default()
+    };
+
+    let projection = fake.conversation_projection();
+    let TranscriptProjection::HistoryFallback(entries) = projection.transcript else {
+        panic!("expected history fallback");
+    };
+    assert_eq!(entries.len(), 2);
+    assert!(matches!(
+        &entries[0],
+        HistoryEntry::Sanitized { role, body }
+            if role == "user" && body == "visible history"
+    ));
+    assert!(matches!(
+        &entries[1],
+        HistoryEntry::Literal { role, body }
+            if role == "system" && body == "[internal context omitted]"
+    ));
+    let RestorePointProjection::Unreadable { reason } = projection.restore_points else {
+        panic!("expected unreadable restore points");
+    };
+    assert_eq!(reason, "permission denied");
+
+    assert!(!fake.clipboard_requires_terminal_paste());
+    assert_eq!(fake.write_recovery_copy("# md"), None);
+    assert_eq!(
+        fake.write_clipboard("# md").unwrap_err(),
+        "clipboard unavailable"
+    );
+    assert_eq!(
+        fake.resolve_export_path("../out.md").unwrap_err(),
+        "export paths may not contain `..`"
+    );
+    assert_eq!(
+        fake.write_export_file(Path::new("/tmp/out.md"), b"x", false)
+            .unwrap_err(),
+        "destination already exists"
+    );
+}
+
+#[test]
+fn export_projection_distinguishes_restore_states() {
+    let states = [
+        RestorePointProjection::None,
+        RestorePointProjection::Unreadable {
+            reason: "boom".to_string(),
+        },
+        RestorePointProjection::Recorded { snapshots: vec![] },
+        RestorePointProjection::Recorded {
+            snapshots: vec![export_recorded_snapshot()],
+        },
+    ];
+    assert!(matches!(&states[0], RestorePointProjection::None));
+    assert!(matches!(
+        &states[1],
+        RestorePointProjection::Unreadable { reason } if reason == "boom"
+    ));
+    let RestorePointProjection::Recorded { snapshots } = &states[2] else {
+        panic!("expected recorded state");
+    };
+    assert!(snapshots.is_empty(), "existing-but-empty stays distinct");
+    let RestorePointProjection::Recorded { snapshots } = &states[3] else {
+        panic!("expected recorded state");
+    };
+    assert_eq!(snapshots.len(), 1);
+}
+
+#[test]
+fn export_projection_omission_markers_carry_no_hidden_payload() {
+    // D9: the projection has no field for a reasoning body, reasoning
+    // signature, or inline/local image payload. Omission markers are data-free
+    // unit variants, so prohibited payloads cannot be transported even by
+    // accident.
+    let block = ExportBlock::InternalReasoning;
+    let ExportBlock::InternalReasoning = block else {
+        panic!("internal reasoning must be a payload-free marker");
+    };
+    let block = ExportBlock::ImageOmitted;
+    let ExportBlock::ImageOmitted = block else {
+        panic!("omitted image must be a payload-free marker");
+    };
+
+    const HIDDEN_REASONING: &str = "signed-thinking-secret-body";
+    const HIDDEN_SIGNATURE: &str = "sig_1234567890";
+    const HIDDEN_IMAGE: &str = "data:image/png;base64,QUJD";
+
+    let projection = ConversationExportProjection {
+        metadata: export_metadata(),
+        transcript: TranscriptProjection::Authoritative(vec![ExportMessage {
+            is_user_role: false,
+            role: "assistant".to_string(),
+            prompt_snippet: None,
+            blocks: vec![ExportBlock::InternalReasoning, ExportBlock::ImageOmitted],
+        }]),
+        restore_points: RestorePointProjection::None,
+    };
+    let rendered = format!("{projection:?}");
+    assert!(!rendered.contains(HIDDEN_REASONING));
+    assert!(!rendered.contains(HIDDEN_SIGNATURE));
+    assert!(!rendered.contains(HIDDEN_IMAGE));
+    assert!(rendered.contains("InternalReasoning"));
+    assert!(rendered.contains("ImageOmitted"));
+}
+
+#[test]
+fn envelope_export_slot_is_independent_and_rejects_duplicates() {
+    let mut first = FakeExport::default();
+    let mut second = FakeExport::default();
+    let mut control = FakeControl::default();
+
+    let parts = CommandContexts::empty()
+        .with_export(&mut first)
+        .with_control(&mut control)
+        .into_parts();
+    assert!(
+        parts.export.is_some(),
+        "export slot must be present when declared"
+    );
+    assert!(
+        parts.control.is_some(),
+        "control slot may coexist with export"
+    );
+    assert!(
+        parts.session.is_none()
+            && parts.lifecycle.is_none()
+            && parts.plugin.is_none()
+            && parts.skill_group.is_none(),
+        "unrelated slots must stay absent (exact exposure)"
+    );
+
+    let bare = CommandContexts::empty().into_parts();
+    assert!(bare.export.is_none(), "undeclared export stays absent");
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        CommandContexts::empty()
+            .with_export(&mut first)
+            .with_export(&mut second);
+    }));
+    assert!(
+        result.is_err(),
+        "duplicate export slot must assert deterministically"
+    );
+
+    // Reading through the dyn facet works after insertion.
+    let mut projection = FakeExport {
+        terminal_paste: true,
+        ..FakeExport::default()
+    };
+    let inserted = CommandContexts::empty().with_export(&mut projection);
+    let export = inserted.into_parts().export.expect("inserted export");
+    assert!(export.clipboard_requires_terminal_paste());
 }

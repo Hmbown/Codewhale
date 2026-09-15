@@ -38,7 +38,7 @@ fn execute_copy(app: &mut App) -> CommandResult {
     // Any native-host attempt may fall through to the asynchronous terminal
     // transport. Preserve /export's durable recovery contract before the
     // write so every optimistic receipt names (or explicitly lacks) a backup.
-    let recovery = crate::commands::groups::session::write_last_copy(&content);
+    let recovery = crate::commands::session_export_host::write_last_copy(&content);
     match app.clipboard.write_text(&content) {
         Ok(()) if terminal_client => match recovery {
             Some(path) => CommandResult::message(
