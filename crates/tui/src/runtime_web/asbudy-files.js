@@ -204,6 +204,7 @@
 
   // 卡片一：项目里的文件（只读目录树）
   var projSig = null;   // 目录树内容签名：没变化就不重绘（不闪、不丢展开状态）
+  var projDirty = false; // 自上次刷新预览以来，项目文件变过没有 —— **累积**标志，不只“这一次”
 
   async function loadProj(force) {
     if (!body) return;
@@ -212,6 +213,11 @@
       if (!r.ok) throw 0;
       var d = await r.json();
       var sig = JSON.stringify(d.files || []);
+      // 签名里含每个文件的 mtime/size —— 变了 = 项目里真有东西被改过。
+      // ⚠️ 变化要**累积**，不能只看“这一次”：一轮里 AI 往往在干到一半就写了文件
+      //   （item.completed 就把签名更新掉了），到这一轮真正结束（turn.completed）再看就“没变化”了
+      //   —— 结果是永远不刷。2026-09-16 真实链路实测踩到这个，换成累积标志。
+      if (projSig !== null && sig !== projSig) projDirty = true;
       if (!force && sig === projSig) return;   // 内容没变 → 什么都不做（点「刷新」走 force）
       projSig = sig;
       body.innerHTML = '';
@@ -394,6 +400,7 @@
   function onPick(f, isMine) {
     // 文件池在项目目录外 → 带绝对路径（AI 能读任意路径）；项目文件用相对路径即可
     var p = isMine ? (f.abs || f.path) : f.path;
+    lastPicked = { f: f, isMine: isMine };   // 右栏现在看的是它 —— 自动刷新时重拉的就是这份
     try { document.dispatchEvent(new CustomEvent('asbudy-file-picked', { detail: { path: p, name: f.name } })); } catch (e0) {}
     openPreviewFor(f, isMine);
   }
@@ -425,6 +432,7 @@
   // 后端两条链现在返回同一套 kind，所以渲染只写一份 —— 以前三处各写一遍 if，改一个格式要改三处。
   function showData(name, d) {
     var k = (d && d.kind) || '';
+    if (k === 'web') return showPanel(name, webBody(d), d.download);   // 网页：默认渲染出页面，可切「看代码」
     if (k === 'office' || k === 'html' || k === 'markdown') return showPanel(name, htmlBody(d.html || ''), d.download);
     if (k === 'table') return showPanel(name, tableBody(d), d.download);        // 后端不再发这个 kind 了，留着兼容
     if (k === 'text' || k === 'svg' || k === 'code') return showPanel(name, textBody(d.text || d.content || ''), d.download);
@@ -481,6 +489,45 @@
     // 所以客户文件里就算写了 <script> 也只会原样显示成文字
     div.innerHTML = html;
     return div;
+  }
+  // 网页（.html）——客户要的是「看到做出来的页面」，不是读源码。
+  // 默认直接渲染（iframe 指 /_gate/raw 的内嵌地址）；想看代码的人切一下就行。
+  // 2026-09-16 老板：对话框里做了个网页，预览里看到的却是一堆 HTML 代码。
+  function webBody(d) {
+    var wrap = document.createElement('div');
+    wrap.style.cssText = 'display:flex;flex-direction:column;height:100%;min-height:0';
+    var bar = document.createElement('div');
+    bar.style.cssText = 'display:flex;gap:6px;padding:7px 12px;border-bottom:1px solid #30363d;flex:0 0 auto';
+    var stage = document.createElement('div');
+    stage.style.cssText = 'flex:1;min-height:0;overflow:auto';
+    function mkBtn(label) {
+      var b = document.createElement('button');
+      b.type = 'button'; b.textContent = label;
+      b.style.cssText = 'border:1px solid #30363d;background:transparent;border-radius:6px;padding:3px 10px;font-size:13px;cursor:pointer;color:#e6edf3';
+      return b;
+    }
+    var bWeb = mkBtn('看网页'), bCode = mkBtn('看代码');
+    function paint(web) {
+      bWeb.style.color = web ? '#e6edf3' : '#8b949e';
+      bCode.style.color = web ? '#8b949e' : '#e6edf3';
+      bWeb.style.borderColor = web ? '#58a6ff' : '#30363d';
+      bCode.style.borderColor = web ? '#30363d' : '#58a6ff';
+      stage.innerHTML = '';
+      if (web) {
+        var f = document.createElement('iframe');
+        f.src = d.url; f.title = '网页预览';
+        f.style.cssText = 'width:100%;height:100%;min-height:70vh;border:0;background:#fff';
+        stage.appendChild(f);
+      } else {
+        stage.appendChild(textBody(d.text || ''));
+      }
+    }
+    bWeb.onclick = function () { paint(true); };
+    bCode.onclick = function () { paint(false); };
+    paint(true);
+    bar.appendChild(bWeb); bar.appendChild(bCode);
+    wrap.appendChild(bar); wrap.appendChild(stage);
+    return wrap;
   }
   function imgBody(url) {
     if (!url) return textBody('这个文件没有能内嵌预览的地址。');
@@ -604,12 +651,61 @@
   // 事件由 app.mjs 广播（item.completed = 某个工具刚干完，turn.completed = 这一轮干完）。
   // 节流 700ms：一轮里工具调用很密，不节流会把 /_gate/projfiles 打密；
   // loadProj 内部还有内容签名比对 —— 没变化就不重绘，不会闪、不会丢展开状态。
+  //
+  // ── 右栏预览的自动刷新（2026-09-16 老板定：**变才刷**）──
+  // 为什么不每轮无脑刷：AI 一轮里会改好几个文件，每改一次就重载，页面会刷花，
+  //   客户正在预览页面里做的事情（填了一半的表单、滚到的位置）也会被冲掉。
+  // 所以三个条件都满足才动：① 这一轮**干完了**（turn.completed）；
+  //   ② **文件真的变了**（projChanged）；③ 客户没正在 iframe 里操作（不然只挂提示）。
+  var lastPicked = null;         // 右栏现在看的是哪个文件（自动刷新时重拉它）
+  var pendingTurnEnd = false;
+
+  /** 在预览栏标题后面闪一句（2.6 秒后自己消失） */
+  function previewNotice(text, color) {
+    var head = document.querySelector('#preview-pane .preview-head');
+    if (!head) return;
+    var old = head.querySelector('#preview-updated');
+    if (old) old.remove();
+    var s = document.createElement('span');
+    s.id = 'preview-updated';
+    s.textContent = text;
+    s.style.cssText = 'margin-left:10px;font-size:12.5px;color:' + (color || '#3fb950');
+    var title = head.querySelector('.preview-title');
+    if (title) title.appendChild(s); else head.appendChild(s);
+    setTimeout(function () { if (s.parentNode) s.remove(); }, 2600);
+  }
+
+  /** 把右栏正在显示的东西重新取一遍（文件预览重拉内容 / 系统页面重载 iframe） */
+  function refreshCurrentPreview() {
+    if (!previewOpen()) return;
+    var fb = document.getElementById('preview-file');
+    if (fb && !fb.hidden) {
+      // 正在看某个文件：重新拉它的内容（「我的资料」在项目目录外，不跟着项目变）
+      if (lastPicked && !lastPicked.isMine) { openPreviewFor(lastPicked.f, lastPicked.isMine); previewNotice('已更新'); }
+      return;
+    }
+    var f = frameEl();
+    if (!f || f.hidden) return;
+    // 客户正在 iframe 里点东西/填表（焦点在页面里）→ 别把页面重载掉，挂个提示让他自己决定
+    if (document.activeElement === f) { previewNotice('有更新 · 点「刷新」看最新的', '#d29922'); return; }
+    f.src = f.src;
+    previewNotice('已更新');
+  }
+
   var autoRefreshTimer = null;
   window.addEventListener('asbudy:activity', function (e) {
     var ev = e && e.detail && e.detail.event;
     if (ev !== 'item.completed' && ev !== 'turn.completed') return;
+    if (ev === 'turn.completed') pendingTurnEnd = true;
     clearTimeout(autoRefreshTimer);
-    autoRefreshTimer = setTimeout(function () { loadProj(); loadRecycle(); }, 700);
+    autoRefreshTimer = setTimeout(function () {
+      var ended = pendingTurnEnd; pendingTurnEnd = false;
+      // loadProj 跑完才知道 projChanged —— 文件真的变了才去动预览
+      Promise.resolve(loadProj()).then(function () {
+        loadRecycle();
+        if (ended && projDirty) { projDirty = false; refreshCurrentPreview(); }
+      });
+    }, 700);
   });
 
   // 右侧「预览」栏（三栏右侧；窄屏变全屏层）
