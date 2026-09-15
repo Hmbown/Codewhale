@@ -12,7 +12,7 @@
 
   // 样式（动态注入，避免改官方 stylesheet）
   var css = [
-    '#asbudy-files{margin:12px 12px 0;display:flex;flex-direction:column;gap:8px}',
+    '#asbudy-files{margin:12px 12px 0;display:flex;flex-direction:column;gap:8px;font-size:12px}',
     '.asb-card{border:1px solid var(--line);border-radius:8px;background:var(--surface);overflow:hidden}',
     '.asb-hd{display:flex;align-items:center;gap:6px;padding:7px 9px;font-size:12px;color:var(--text)}',
     '.asb-fold{cursor:pointer;color:var(--text-faint);width:12px;text-align:center;user-select:none;flex:none}',
@@ -35,9 +35,9 @@
     '.f-node.dir{color:var(--text-soft)}',
     '.f-kids{margin-left:12px;border-left:1px solid var(--line);padding-left:6px}',
     '.f-empty{font-size:12px;color:var(--text-faint);padding:0 4px}',
-    '#asbudy-undo{margin:8px 12px 0;border:1px solid var(--line);border-radius:8px;padding:8px;background:var(--surface)}',
+    '#asbudy-undo{margin:8px 12px 0;border:1px solid var(--line);border-radius:8px;padding:8px;background:var(--surface);font-size:12px}',
     '#asbudy-undo-body{max-height:22vh;overflow-y:auto}',
-    '#asbudy-arts{margin:8px 12px 0;border:1px solid var(--line);border-radius:8px;padding:8px;background:var(--surface)}',
+    '#asbudy-arts{margin:8px 12px 0;border:1px solid var(--line);border-radius:8px;padding:8px;background:var(--surface);font-size:12px}',
     '.a-head{font-size:12px;color:var(--text);font-weight:600;display:flex;justify-content:space-between;align-items:center;margin-bottom:6px}',
     '#asbudy-arts-toggle{cursor:pointer;color:var(--text-faint);font-weight:400}',
     '.a-list{max-height:22vh;overflow-y:auto}',
