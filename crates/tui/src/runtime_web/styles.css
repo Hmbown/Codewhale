@@ -1642,17 +1642,17 @@ noscript {
 .brand-mark[data-asbudy-my="1"] {
   cursor: pointer;
   border-radius: 10px;
-  /* 底色用"淡蓝块"而不是深色井 —— 深底在深色侧栏里等于没有，
-     淡蓝块才能让人一眼看出"这是个按钮"（视觉复核反复强调这点） */
-  background: var(--action-soft);
-  box-shadow: inset 0 0 0 1px rgba(106, 174, 242, 0.55), 0 2px 8px rgba(0, 2, 8, 0.5);
+  /* 底色要看得见：13% 的淡蓝在深色侧栏上几乎与背景融为一体（2026-09-15
+     老板反馈“手机端没什么变化”就是这个原因）—— 加到 24%，描边也提到 0.7 */
+  background: rgba(106, 174, 242, 0.24);
+  box-shadow: inset 0 0 0 1px rgba(106, 174, 242, 0.7), 0 2px 8px rgba(0, 2, 8, 0.5);
   transition: background var(--dur-fast) var(--ease-out), box-shadow var(--dur-fast) var(--ease-out), transform var(--dur-fast) var(--ease-out);
   -webkit-user-select: none;
   user-select: none;
   touch-action: manipulation;
 }
 .brand-mark[data-asbudy-my="1"]:hover {
-  background: rgba(106, 174, 242, 0.22);
+  background: rgba(106, 174, 242, 0.38);
   box-shadow: inset 0 0 0 2px var(--action), 0 6px 16px rgba(0, 2, 8, 0.55);
   transform: translateY(-1px);
 }
@@ -1670,25 +1670,29 @@ noscript {
 .my-label {
   flex: none;
   margin-left: auto;
-  padding: 0 10px;
-  min-height: 26px;
-  border: 1px solid rgba(106, 174, 242, 0.55);
+  padding: 0 12px;
+  min-height: 28px;
+  border: 1px solid var(--action);
   border-radius: 999px;
-  background: var(--action-soft);
-  color: var(--action);
+  /* 实心蓝底 + 白字（原来是淡蓝底蓝字，手机小屏上不够跳）*/
+  background: var(--action);
+  color: var(--action-contrast);
   font: inherit;
-  font-size: 12.5px;
-  font-weight: 650;
+  font-size: 13px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
   line-height: 1;
   cursor: pointer;
   white-space: nowrap;
   touch-action: manipulation;
-  transition: background var(--dur-fast) var(--ease-out), border-color var(--dur-fast) var(--ease-out), color var(--dur-fast) var(--ease-out);
+  box-shadow: 0 2px 8px rgba(0, 2, 8, 0.45);
+  transition: background var(--dur-fast) var(--ease-out), border-color var(--dur-fast) var(--ease-out), color var(--dur-fast) var(--ease-out), transform var(--dur-fast) var(--ease-out);
 }
 .my-label:hover {
-  background: rgba(106, 174, 242, 0.22);
-  border-color: var(--action);
-  color: var(--text);
+  background: var(--action-strong);
+  border-color: var(--action-strong);
+  color: var(--action-contrast);
+  transform: translateY(-1px);
 }
 .my-label:active {
   transform: scale(0.96);
