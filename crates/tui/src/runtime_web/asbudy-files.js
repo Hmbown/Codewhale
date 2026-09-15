@@ -222,9 +222,13 @@
       if (delBtn) {
         delBtn.onclick = function (ev) {
           ev.stopPropagation();
-          if (!confirm('删掉整个文件夹「' + f.name + '」？里面的东西都会没。')) return;
+          if (!confirm('删掉整个文件夹「' + f.name + '」？（会进回收站，可以让 AI 帮你找回来）')) return;
           fetch('/_gate/file?name=' + encodeURIComponent(f.path), { method: 'DELETE', credentials: 'same-origin' })
-            .then(function (r) { if (r.ok) loadMine(); else alert('删不掉'); });
+            .then(function (r) {
+              if (r.ok) { loadMine(); return; }
+              return r.json().then(function (d) { alert((d && d.error) || '删不掉'); })
+                .catch(function () { alert('删不掉'); });
+            });
         };
       }
       for (var i = 0; i < (f.children || []).length; i++) kids.appendChild(render(f.children[i], isMine));
@@ -250,12 +254,19 @@
       var delF = n.querySelector('.f-del');
       if (delF) delF.onclick = function (ev) {
         ev.stopPropagation();
-        if (!confirm('删掉「' + f.name + '」？删了拿不回来。')) return;
+        if (!confirm(isMine
+          ? '删掉「' + f.name + '」？（会进回收站，可以让 AI 帮你找回来）'
+          : '删掉「' + f.name + '」？（删错了可以点「退回」，但会连之后的改动一起回退）')) return;
         var url = isMine
           ? '/_gate/file?name=' + encodeURIComponent(f.path)
           : '/_gate/artifact?project=' + encodeURIComponent(pkey) + '&path=' + encodeURIComponent(f.path);
         fetch(url, { method: 'DELETE', credentials: 'same-origin' })
-          .then(function (r) { if (r.ok) { isMine ? loadMine() : loadProj(); } else alert('删不掉'); });
+          .then(function (r) {
+            if (r.ok) { isMine ? loadMine() : loadProj(); return; }
+            // 把后端说清楚的原因透出来（比如「文件在隔离区，可以让 AI 帮你删」），别只说「删不掉」
+            return r.json().then(function (d) { alert((d && d.error) || '删不掉'); })
+              .catch(function () { alert('删不掉'); });
+          });
       };
       w.appendChild(n);
     }
