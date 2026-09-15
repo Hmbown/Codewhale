@@ -1672,6 +1672,24 @@ noscript {
 }
 
 /* 「我的」文字胶囊：2026-09-15 加过，同日老板说“画蛇添足” → 已删 */
+
+/* 2026-09-15 老板：「在 logo 左边加入灰色的 <」 */
+.my-lt {
+  flex: none;
+  margin-right: 2px;
+  color: var(--text-muted);
+  font-size: 15px;
+  font-weight: 600;
+  line-height: 1;
+  cursor: pointer;
+  -webkit-user-select: none;
+  user-select: none;
+  touch-action: manipulation;
+  transition: color var(--dur-fast) var(--ease-out);
+}
+.my-lt:hover {
+  color: var(--text);
+}
 .empty-mark { width: 104px; height: 104px; }
 .rail-open { place-items: center; }
 .thread-title { font-size: 15px; }

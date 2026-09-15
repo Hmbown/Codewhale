@@ -1123,6 +1123,16 @@
     logo.addEventListener('keydown', function (e) {
       if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openMyMenu(); }
     });
+    // 2026-09-15 老板：「在 logo 左边加入灰色的 <」
+    if (!logo.parentNode.querySelector('.my-lt')) {
+      var lt = document.createElement('span');
+      lt.className = 'my-lt';
+      lt.textContent = '<';          // 用 textContent 赋值，不用 innerHTML（< 在 HTML 里要转义）
+      lt.setAttribute('aria-hidden', 'true');
+      lt.title = '我的';
+      lt.addEventListener('click', openMyMenu);   // 跟 logo 同一个动作，免得点它没反应
+      logo.parentNode.insertBefore(lt, logo);
+    }
     return true;
   }
 
