@@ -1673,21 +1673,25 @@ noscript {
 
 /* 「我的」文字胶囊：2026-09-15 加过，同日老板说“画蛇添足” → 已删 */
 
-/* 2026-09-15 老板：「在 logo 左边加入灰色的 <」 */
-.my-lt {
-  flex: none;
-  margin-right: 2px;
-  color: var(--text-muted);
-  font-size: 15px;
-  font-weight: 600;
-  line-height: 1;
-  cursor: pointer;
-  -webkit-user-select: none;
-  user-select: none;
-  touch-action: manipulation;
-  transition: color var(--dur-fast) var(--ease-out);
+/* .my-lt（logo 左边的灰色 <）：2026-09-15 加过，同日老板要求去掉 → 已删 */
+
+/* 「✦ 项目名 ⇄」——切换项目入口（门卫注入的那行）。
+   2026-09-15 老板：「看着略乱」。根因是门卫原来给它内联了一条虚线下划线，
+   它会从 ✦ 和 ⇄ 两个符号下面穿过去，跟文字挤在一起很碎。
+   现在门卫只挂 class，样式收到这里：胶囊式 hover 反馈，干净也好点。 */
+.brand-context a.proj-switch {
+  /* ⚠️ 必须用 inline，不能用 inline-flex：实测 inline-flex 下 ✦ / ⇄ 这两个符号
+     会把行撑到 36px（原本 inline 时整行只有 18px），品牌区就会被顶出去 */
+  display: inline;
+  padding: 2px 6px;
+  margin: 0 -6px;
+  border-radius: 999px;
+  color: inherit;
+  text-decoration: none;
+  transition: background var(--dur-fast) var(--ease-out), color var(--dur-fast) var(--ease-out);
 }
-.my-lt:hover {
+.brand-context a.proj-switch:hover {
+  background: var(--hover);
   color: var(--text);
 }
 .empty-mark { width: 104px; height: 104px; }
