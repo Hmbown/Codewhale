@@ -1034,6 +1034,26 @@
    */
   function abScopeName(s) { return s === 'workspace' ? '本项目' : '通用'; }
 
+  /* 记忆开关：客户自己控制（老板 2026-09-16：「用户自己不能设置吗？」）
+   * 官方给的就是配置接口，引擎自己有权限写 config.toml —— 不需要平台介入、不需要 sudo：
+   *   POST /v1/config {key:"memory_enabled", value:"true|false", persist:true}
+   *   POST /v1/config/reload     ← 官方说明：新的一轮对话会采用新配置（不影响正在跑的）
+   */
+  function abSetMemory(on, btn, done) {
+    if (btn) { btn.disabled = true; btn.textContent = on ? '正在打开…' : '正在关掉…'; }
+    api('/v1/config', {
+      method: 'POST',
+      body: JSON.stringify({ key: 'memory_enabled', value: on ? 'true' : 'false', persist: true }),
+    }).then(function (r) {
+      if (!r.ok) {
+        if (btn) { btn.disabled = false; btn.textContent = on ? '打开记忆' : '关掉记忆'; }
+        alert('没设置成：' + ((r.body && (r.body.error || r.body.message)) || ('HTTP ' + r.code)));
+        return;
+      }
+      api('/v1/config/reload', { method: 'POST' }).then(function () { if (done) done(); });
+    });
+  }
+
   function openMemory() {
     openLayer('AI 的记忆', function (body) {
       body.innerHTML = '<div id="ab-mem">加载中…</div>';
@@ -1077,8 +1097,16 @@
             return;
           }
           if (cfg.memory_enabled === false) {
-            el.innerHTML = '<div class="ab-tip">这个项目的「记忆」功能还没打开 —— ' +
-              '让平台的管理员开一下（开启后 AI 会把你在对话里说过的习惯自己记下来，下次自动想起来）。</div>';
+            el.innerHTML =
+              '<div class="ab-tip">这个项目的「记忆」<b>还没打开</b>。</div>' +
+              '<div class="ab-tip">打开之后：它会把你在对话里说过的习惯、偏好、常用说法自己记下来，' +
+              '下次对话自动想起来（每次只会带上最近的几十条）。<b>你随时能在这儿看到它们、也能清空，' +
+              '不想用了就关掉 —— 都你自己控制，不用找平台。</b></div>' +
+              '<button class="ab-btn" id="mem-on" type="button">打开记忆</button><div class="ab-msg" id="mem-msg"></div>';
+            body.querySelector('#mem-on').onclick = function () {
+              var btn = this;
+              abSetMemory(true, btn, load);
+            };
             return;
           }
           var html =
@@ -1088,10 +1116,11 @@
           html += '<div id="mem-list"></div>';
           html += '<div class="ab-tip" style="margin-top:12px">这里只能<b>整批清空</b>，官方没给「只删这一条」的口子。' +
             '想让它忘掉某一件事，直接在对话里说一声就行（比如「忘掉关于报表格式的偏好」）。</div>';
-          html += '<div style="display:flex;gap:8px;flex-wrap:wrap">' +
+          html += '<div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">' +
             '<button class="ab-btn danger sm" id="mem-clear-ws" type="button">清空「本项目」的记忆</button>' +
             '<button class="ab-btn danger sm" id="mem-clear-global" type="button">清空「通用」的记忆</button>' +
-            '<button class="ab-btn ghost sm" id="mem-reload" type="button">刷新</button></div>' +
+            '<button class="ab-btn ghost sm" id="mem-reload" type="button">刷新</button>' +
+            '<button class="ab-btn ghost sm" id="mem-off" type="button" style="margin-left:auto">关掉记忆</button></div>' +
             '<div class="ab-msg" id="mem-msg"></div>';
           el.innerHTML = html;
 
@@ -1120,6 +1149,10 @@
           }
           body.querySelector('#mem-clear-ws').onclick = function () { clearOne('workspace', '本项目'); };
           body.querySelector('#mem-clear-global').onclick = function () { clearOne('global', '通用'); };
+          body.querySelector('#mem-off').onclick = function () {
+            if (!confirm('关掉记忆？\n以后它不再记新东西、也不再带进对话。\n（已经记下的还留着，想一并清掉就点上面的「清空」）')) return;
+            abSetMemory(false, this, load);
+          };
         });
       }
       load();
