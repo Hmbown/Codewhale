@@ -13,7 +13,7 @@ colors:
   brand-cyan: "#78bce8"
   ombre-start: "#1535B2"
   ombre-end: "#6AA6DC"
-  # the sheet — crates/tui/src/palette/tokens.rs, exported to web/app/tokens.css (generated, never hand-edit)
+  # the sheet — crates/palette/src/tokens.rs, exported to web/app/tokens.css (generated, never hand-edit)
   paper: "#f6f2e8"          # WHALE_TEXT_BODY, Whale Ivory — the page above the waterline
   paper-deep: "#e8eef8"     # LIGHT_ELEVATED — the shallows; cards and code-adjacent plates
   paper-card: "#fffdf8"     # LIGHT_PANEL — a raised sheet on the paper
@@ -135,8 +135,11 @@ Hard rules, not taste notes.
    The strata are geometry drawn from tokens — never a hex of their own.
 2. **No gradients as decoration elsewhere.** The ombre `#1535B2 → #6AA6DC`
    lives in the mark, the wordmark, and the water. The ocean column's field is
-   the TUI's own chrome → bg descent; no spotlight glows, gradient text, or
-   gradient rules on paper.
+   the site's own chrome → bg descent — the navy water column is the TUI's
+   selectable `underwater` theme, not the ground the terminal opens on. That
+   ground is Shoreline, the warm charcoal and single blue shared with the GPUI
+   client (`docs/design/TUI_REDESIGN.md`). No spotlight glows, gradient text,
+   or gradient rules on paper.
 3. **One shadow.** The terminal plate at the waterline casts one soft, offset,
    blue shadow. Nothing else on the site has a drop shadow.
 4. **No generic SaaS scaffolding.** No icon-card grids, logo walls,
@@ -157,7 +160,7 @@ Hard rules, not taste notes.
 
 ## Colors
 
-One palette, owned by `crates/tui/src/palette/tokens.rs` and exported to
+One palette, owned by `crates/palette/src/tokens.rs` and exported to
 `web/app/tokens.css` by `scripts/export-design-tokens.py` — both the
 `WHALE_*` dark tokens (`--whale-*`) and the Blue Stage light preset's
 `LIGHT_*` tokens (`--light-*`). `web/app/globals.css` maps them to the site's
