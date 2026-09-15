@@ -974,6 +974,11 @@
           var u = String((url && url.url) || url || '');
           var m = u.match(/\/v1\/threads\/([^/?]+)/);
           if (m && m[1] && m[1] !== 'summary') LAST_THREAD = m[1];
+          // 发完一轮（POST .../turns）后晚一点刷新「记性」——那时引擎才算得出本轮用量
+          if (/\/v1\/threads\/[^/]+\/turns\b/.test(u)
+              && String((opt && opt.method) || '').toUpperCase() === 'POST') {
+            setTimeout(function () { try { loadCtx(); } catch (e0) {} }, 4000);
+          }
         } catch (e0) {}
         return origFetch.apply(this, arguments);
       };
@@ -1004,9 +1009,44 @@
       el.appendChild(b1);
       el.appendChild(b2);
       el.appendChild(b3);
+      var ctxEl = document.createElement('span');
+      ctxEl.id = 'asbudy-ctx';
+      ctxEl.setAttribute('aria-live', 'polite');
+      el.appendChild(ctxEl);
       wrap.parentNode.insertBefore(el, wrap);
       return el;
     }
+
+    // ── 「记性 N%」：这次对话用了模型多少「记忆」（2026-09-15 · 老板要求）──
+    // 为什么要门卫算：官方 CLI 状态栏有 `ctx NN%`，但那是引擎**进程内部状态**，web 拿不到；
+    // 门卫复刻了引擎同一套窗口规则（按模型名查表），所以换模型会自动跟着变，不用人工设。
+    // 不猜：门卫拿不到窗口或没数据时返回 available:false，这里就不显示。
+    function fmtK(n) {
+      n = Number(n) || 0;
+      if (n >= 10000) {
+        var w = Math.round(n / 10000 * 10) / 10;
+        return (w % 1 === 0 ? String(w) : w.toFixed(1)) + ' 万';
+      }
+      return String(n);
+    }
+    async function loadCtx() {
+      var el = document.getElementById('asbudy-ctx');
+      if (!el) return;
+      if (!LAST_THREAD) { el.textContent = ''; return; }
+      try {
+        var r = await fetch('/_gate/context?thread=' + encodeURIComponent(LAST_THREAD), { credentials: 'same-origin' });
+        if (!r.ok) { el.textContent = ''; return; }
+        var d = await r.json();
+        if (!d || !d.available) { el.textContent = ''; return; }
+        var hot = d.percent >= 80;
+        el.textContent = '记性 ' + d.percent + '%';
+        el.style.color = hot ? '#f85149' : '#8b949e';
+        el.title = '这次对话占了模型「记忆」的 ' + d.percent + '%（' + fmtK(d.used) + ' / ' + fmtK(d.window) + '）'
+          + (hot ? '\n快满了 —— 开个新对话，AI 会更清醒' : '');
+      } catch (e) { el.textContent = ''; }
+    }
+    setInterval(loadCtx, 15000);
+    setTimeout(loadCtx, 3000);
 
     async function fire(kind) {
       if (!LAST_THREAD) { alert('先在右边说一句，才有可操作的对话'); return; }
