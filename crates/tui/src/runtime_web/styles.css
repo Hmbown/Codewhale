@@ -1641,7 +1641,14 @@ noscript {
    （试过在右下角挂一个下拉角标，两轮视觉复核都说它跟蓝色图标糊在一起，已拿掉） */
 .brand-mark[data-asbudy-my="1"] {
   cursor: pointer;
-  border-radius: 10px;
+  /* 框往外扩一圈（2026-09-15 老板：「logo 四周的线条往外扩一些」）：
+     图标本身仍 34px，外框 42px —— padding 4px + 全局 box-sizing:border-box，
+     所以是「框变大、图不变大」，描边离图标留出 4px 呼吸空间。 */
+  flex: 0 0 42px;
+  width: 42px;
+  height: 42px;
+  padding: 4px;
+  border-radius: 12px;
   /* 底色要看得见：13% 的淡蓝在深色侧栏上几乎与背景融为一体（2026-09-15
      老板反馈“手机端没什么变化”就是这个原因）—— 加到 24%，描边也提到 0.7 */
   background: rgba(106, 174, 242, 0.24);
@@ -1664,39 +1671,7 @@ noscript {
   outline-offset: 2px;
 }
 
-/* 「我的」文字入口（2026-09-15 补）：光把 logo 做成按钮，视觉复核反复指出
-   “手机没有 hover，用户看不出能点”。所以在品牌区挂一个淡蓝胶囊，
-   明确写着「我的」；跟它并排的「✦ 项目名 ⇄」是切换项目（虚线下划线），两者一眼分得开。 */
-.my-label {
-  flex: none;
-  margin-left: auto;
-  padding: 0 12px;
-  min-height: 28px;
-  border: 1px solid var(--action);
-  border-radius: 999px;
-  /* 实心蓝底 + 白字（原来是淡蓝底蓝字，手机小屏上不够跳）*/
-  background: var(--action);
-  color: var(--action-contrast);
-  font: inherit;
-  font-size: 13px;
-  font-weight: 700;
-  letter-spacing: 0.02em;
-  line-height: 1;
-  cursor: pointer;
-  white-space: nowrap;
-  touch-action: manipulation;
-  box-shadow: 0 2px 8px rgba(0, 2, 8, 0.45);
-  transition: background var(--dur-fast) var(--ease-out), border-color var(--dur-fast) var(--ease-out), color var(--dur-fast) var(--ease-out), transform var(--dur-fast) var(--ease-out);
-}
-.my-label:hover {
-  background: var(--action-strong);
-  border-color: var(--action-strong);
-  color: var(--action-contrast);
-  transform: translateY(-1px);
-}
-.my-label:active {
-  transform: scale(0.96);
-}
+/* 「我的」文字胶囊：2026-09-15 加过，同日老板说“画蛇添足” → 已删 */
 .empty-mark { width: 104px; height: 104px; }
 .rail-open { place-items: center; }
 .thread-title { font-size: 15px; }
