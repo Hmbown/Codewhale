@@ -307,6 +307,7 @@
         html += '<button class="ab-menu-item" id="ab-m-users">客户管理<small>建客户账号、把项目转给客户</small></button>';
       }
       html += '<button class="ab-menu-item" id="ab-m-proj">项目管理<small>暂停（停引擎、省内存）/ 恢复 / 删除</small></button>';
+      html += '<button class="ab-menu-item" id="ab-m-auto">定时任务<small>让 AI 按点自己干活（每天 / 每周 / 每月）</small></button>';
       html += '<button class="ab-menu-item" id="ab-m-space">空间<small>磁盘用量、每个项目占多少 / 上限多少</small></button>';
       html += '<button class="ab-menu-item" id="ab-m-adv">高级设置<small>代码存哪里（git）/ 过程显示多详细 / 只看不改 / 花了多少</small></button>';
       if (role === 'customer') {
@@ -321,6 +322,7 @@
       var bUsers = body.querySelector('#ab-m-users');
       if (bUsers) bUsers.onclick = openUsers;
       body.querySelector('#ab-m-proj').onclick = openProjects;
+      body.querySelector('#ab-m-auto').onclick = openAuto;
       var bSpace = body.querySelector('#ab-m-space');
       if (bSpace) bSpace.onclick = openSpace;
       var bAdv = body.querySelector('#ab-m-adv');
@@ -690,6 +692,245 @@
         });
         el.innerHTML = html;
       });
+    });
+  }
+
+  /* ── 定时任务（搬表：官方 /v1/automations 整族，官方 web 没界面）──
+   * 2026-09-16。引擎侧 7 条路由先实测通了一遍（建 → 立刻跑 → 查到 completed → 删）。
+   * 官方 CLI 用 RRULE 表达时间（`FREQ=CRON;EXPR=0 9 * * *`）—— 对不懂编程的老板是天书，
+   * 所以这里做**人话 ↔ RRULE 双向翻译**：界面选「每天 / 每周 / 每月 / 每小时」+ 时间。
+   * 引擎支持的时间格式（读源码 runtime_api/automation_manager）：FREQ=ONCE|HOURLY|WEEKLY|CRON，
+   * CRON 是标准 5 段（分 时 日 月 周），**按本地时间**解释（系统北京时间）。
+   * ⚠️ 自动化 = 到点自己动手、不等你确认（引擎侧 auto_approve）—— 界面上必须明说。
+   */
+  var AB_WEEK = [[1, '一'], [2, '二'], [3, '三'], [4, '四'], [5, '五'], [6, '六'], [0, '日']];
+  var AB_DOW = { 0: '日', 1: '一', 2: '二', 3: '三', 4: '四', 5: '五', 6: '六', 7: '日' };
+
+  function ab2(n) { return String(n).padStart(2, '0'); }
+
+  /* 存的是 UTC、给人看一律本地时间（2026-09-15 ㉔ 定的统一规矩） */
+  function abLocal(iso) {
+    if (!iso) return '';
+    var d = new Date(iso);
+    if (isNaN(d.getTime())) return '';
+    return (d.getMonth() + 1) + '月' + d.getDate() + '日 ' + ab2(d.getHours()) + ':' + ab2(d.getMinutes());
+  }
+
+  /* RRULE → 人话（看不懂的格式就原样显示，不硬编） */
+  function abRruleHuman(s) {
+    var u = String(s || '').toUpperCase().trim();
+    var m = u.match(/^FREQ=CRON\s*;\s*EXPR=(.+)$/);
+    if (m) {
+      var f = m[1].trim().split(/\s+/);
+      if (f.length === 5) {
+        var mi = f[0], hh = f[1], dom = f[2], dow = f[4];
+        var at = (/^\d+$/.test(hh) && /^\d+$/.test(mi)) ? (ab2(+hh) + ':' + ab2(+mi)) : '';
+        var dows = dow === '*' ? '' : dow.split(',').map(function (x) {
+          var n = parseInt(x, 10);
+          return isNaN(n) ? x : '周' + (AB_DOW[n] || x);
+        }).join('、');
+        if (dom === '*' && dow === '*') return hh === '*' ? ('每小时第 ' + mi + ' 分钟') : ('每天 ' + at);
+        if (dom === '*' && dow !== '*') return '每' + dows + (at ? ' ' + at : '');
+        if (dom !== '*' && dow === '*') return '每月 ' + dom + ' 号' + (at ? ' ' + at : '');
+      }
+      return '按计划（' + m[1] + '）';
+    }
+    if (/^FREQ=HOURLY/.test(u)) {
+      var iv = (u.match(/INTERVAL=(\d+)/) || [])[1] || '1';
+      var bm = (u.match(/BYMINUTE=(\d+)/) || [])[1];
+      return '每 ' + iv + ' 小时' + (bm != null ? '（第 ' + bm + ' 分钟）' : '');
+    }
+    if (/^FREQ=ONCE/.test(u)) {
+      var at2 = (u.match(/AT=([^;]+)/) || [])[1];
+      return at2 ? ('只跑一次（' + abLocal(at2) + '）') : '只跑一次';
+    }
+    if (/^FREQ=WEEKLY/.test(u)) {
+      var bd = (u.match(/BYDAY=([^;]+)/) || [])[1] || '';
+      var bh = (u.match(/BYHOUR=(\d+)/) || [])[1];
+      var bmi = (u.match(/BYMINUTE=(\d+)/) || [])[1];
+      var names = { MO: '一', TU: '二', WE: '三', TH: '四', FR: '五', SA: '六', SU: '日' };
+      var ds = bd.split(',').map(function (x) { return names[x] || x; }).join('、');
+      return '每周' + ds + (bh != null ? ' ' + ab2(+bh) + ':' + ab2(+(bmi || 0)) : '');
+    }
+    return s || '';
+  }
+
+  /* 人话表单 → RRULE */
+  function abRrule(freq, time, days, dom) {
+    var t = String(time || '09:00').split(':');
+    var hh = parseInt(t[0], 10); var mi = parseInt(t[1], 10);
+    if (isNaN(hh)) hh = 9;
+    if (isNaN(mi)) mi = 0;
+    if (freq === 'hourly') return 'FREQ=HOURLY;INTERVAL=1;BYMINUTE=' + mi;
+    if (freq === 'weekly') return 'FREQ=CRON;EXPR=' + mi + ' ' + hh + ' * * ' + ((days && days.length) ? days.join(',') : '1');
+    if (freq === 'monthly') return 'FREQ=CRON;EXPR=' + mi + ' ' + hh + ' ' + (parseInt(dom, 10) || 1) + ' * *';
+    return 'FREQ=CRON;EXPR=' + mi + ' ' + hh + ' * * *';
+  }
+
+  function abRunState(s) {
+    return { completed: '跑成了', failed: '失败了', queued: '排队中', running: '正在跑', canceled: '已取消' }[s] || s || '';
+  }
+
+  /* ── 定时任务：列表 ── */
+  function openAuto() {
+    openLayer('定时任务', function (body) {
+      body.innerHTML = '<div id="ab-auto">加载中…</div>';
+      Promise.all([api('/_gate/projects'), api('/v1/automations')]).then(function (rs) {
+        var el = body.querySelector('#ab-auto');
+        if (!el) return;
+        var projs = (rs[0].body && rs[0].body.projects) || [];
+        var act = projs.filter(function (p) { return p.active; })[0] || projs[0] || null;
+        var list = Array.isArray(rs[1].body) ? rs[1].body : ((rs[1].body && rs[1].body.automations) || []);
+        if (!rs[1].ok) {
+          el.innerHTML = '<div class="ab-tip" style="color:#f85149">读不到定时任务：' +
+            esc((rs[1].body && rs[1].body.error) || ('HTTP ' + rs[1].code)) + '</div>';
+          return;
+        }
+        if (!act) {
+          el.innerHTML = '<div class="ab-tip">名下还没有项目，先建一个项目再来。</div>';
+          return;
+        }
+        el.innerHTML =
+          '<div class="ab-tip">到点它会<b>自己动手</b>（改文件、跑命令都不用你确认），干完记在「' +
+          esc(act.name) + '」的会话里。</div>' +
+          '<button class="ab-menu-item" id="ab-au-new">+ 新建定时任务<small>每天 / 每周 / 每月 / 每小时</small></button>' +
+          '<div id="ab-au-list">' + (list.length ? '' : '<div class="ab-tip">还没有定时任务。</div>') + '</div>';
+        el.querySelector('#ab-au-new').onclick = function () {
+          openAutoForm(act.dir, function () { openAuto(); });
+        };
+        if (!list.length) return;
+
+        var holder = el.querySelector('#ab-au-list');
+        holder.innerHTML = list.map(function (a) {
+          return '<div class="ab-card" id="au-' + esc(a.id) + '">' +
+            '<div class="ab-card-top"><span class="ab-n">' + esc(a.name || '（没名字）') + '</span>' +
+            '<span class="ab-s" style="margin:0;color:' + (a.status === 'active' ? '#3fb950' : '#d29922') + '">' +
+            (a.status === 'active' ? '启用中' : '已暂停') + '</span></div>' +
+            '<div class="ab-s">' + esc(abRruleHuman(a.rrule)) +
+            (a.next_run_at ? ' · 下次 ' + esc(abLocal(a.next_run_at)) : '') + '</div>' +
+            '<div class="ab-s" id="au-run-' + esc(a.id) + '">上次：查中…</div>' +
+            '<div class="ab-s" style="color:#8b949e">要它做的：' + esc((a.prompt || '').slice(0, 110)) +
+            ((a.prompt || '').length > 110 ? '…' : '') + '</div>' +
+            '<div style="display:flex;gap:8px;margin-top:9px;flex-wrap:wrap">' +
+            '<button class="ab-btn sm" data-act="run" data-id="' + esc(a.id) + '">立刻跑一次</button>' +
+            '<button class="ab-btn ghost sm" data-act="' + (a.status === 'active' ? 'pause' : 'resume') +
+            '" data-id="' + esc(a.id) + '">' + (a.status === 'active' ? '暂停' : '恢复') + '</button>' +
+            '<button class="ab-btn danger sm" data-act="del" data-id="' + esc(a.id) + '">删除</button></div></div>';
+        }).join('');
+
+        // 每条拉最近一次运行（引擎返回整段历史，取时间最新那条）
+        list.forEach(function (a) {
+          api('/v1/automations/' + encodeURIComponent(a.id) + '/runs').then(function (r) {
+            var box = body.querySelector('#au-run-' + a.id);
+            if (!box) return;
+            var runs = Array.isArray(r.body) ? r.body : ((r.body && r.body.runs) || []);
+            if (!runs.length) { box.textContent = '上次：还没跑过'; return; }
+            var last = runs.slice().sort(function (x, y) {
+              return String(x.created_at || '').localeCompare(String(y.created_at || ''));
+            }).pop();
+            box.textContent = '上次：' + abLocal(last.created_at) + ' ' + abRunState(last.status);
+          });
+        });
+
+        holder.onclick = function (e) {
+          var b = e.target.closest ? e.target.closest('button[data-act]') : null;
+          if (!b) return;
+          var id = b.getAttribute('data-id'); var act2 = b.getAttribute('data-act');
+          var rec = list.filter(function (x) { return x.id === id; })[0] || {};
+          if (act2 === 'del') {
+            if (!confirm('删掉「' + (rec.name || '这个定时任务') + '」？\n（已经记下的历史会话不会删）')) return;
+            b.disabled = true;
+            api('/v1/automations/' + encodeURIComponent(id), { method: 'DELETE' }).then(function () { openAuto(); });
+            return;
+          }
+          if (act2 === 'pause' || act2 === 'resume') {
+            b.disabled = true;
+            api('/v1/automations/' + encodeURIComponent(id) + '/' + act2, { method: 'POST' }).then(function () { openAuto(); });
+            return;
+          }
+          // 立刻跑一次
+          b.disabled = true; b.textContent = '已排队…';
+          api('/v1/automations/' + encodeURIComponent(id) + '/run', { method: 'POST' }).then(function (r) {
+            if (!r.ok) { b.disabled = false; b.textContent = '立刻跑一次'; alert('没跑起来：' + ((r.body && r.body.error) || ('HTTP ' + r.code))); return; }
+            b.textContent = '已排上队';
+            setTimeout(function () {
+              api('/v1/automations/' + encodeURIComponent(id) + '/runs').then(function (rr) {
+                var runs = Array.isArray(rr.body) ? rr.body : [];
+                var last = runs.slice().sort(function (x, y) {
+                  return String(x.created_at || '').localeCompare(String(y.created_at || ''));
+                }).pop();
+                var box = body.querySelector('#au-run-' + id);
+                if (box && last) box.textContent = '上次：' + abLocal(last.created_at) + ' ' + abRunState(last.status);
+                b.disabled = false; b.textContent = '立刻跑一次';
+              });
+            }, 6000);
+          });
+        };
+      });
+    });
+  }
+
+  /* ── 定时任务：新建 ── */
+  function openAutoForm(dir, onDone) {
+    openLayer('新建定时任务', function (body) {
+      var dayBox = AB_WEEK.map(function (w) {
+        return '<label class="ab-chk" style="display:inline-flex;margin:0 12px 0 0"><input type="checkbox" value="' +
+          w[0] + '"' + (w[1] === '一' ? ' checked' : '') + '>周' + w[1] + '</label>';
+      }).join('');
+      body.innerHTML =
+        '<div class="ab-tip">到点它会自己动手 —— <b>改文件、跑命令都不再问你</b>，干完写进这个项目的会话里。' +
+        '拿不准就先写「只看不动」的活（比如「把逾期清单写成报告」）。</div>' +
+        '<div class="ab-row"><label>叫什么</label><input class="ab-input" id="au-name" placeholder="例：每天早上看逾期款"></div>' +
+        '<div class="ab-row"><label>多久一次</label><select class="ab-input" id="au-freq">' +
+        '<option value="daily">每天</option><option value="weekly">每周</option>' +
+        '<option value="monthly">每月</option><option value="hourly">每小时</option></select></div>' +
+        '<div class="ab-row"><label>几点</label><input class="ab-input" id="au-time" type="time" value="09:00"></div>' +
+        '<div class="ab-row" id="au-days" style="display:none"><label>周几</label><div style="flex:1">' + dayBox + '</div></div>' +
+        '<div class="ab-row" id="au-dom" style="display:none"><label>几号</label><input class="ab-input" id="au-domv" type="number" min="1" max="31" value="1"></div>' +
+        '<div class="ab-row" style="align-items:flex-start"><label>要它做什么</label>' +
+        '<textarea class="ab-input" id="au-prompt" rows="4" placeholder="例：看 data/app.db 里逾期没付的订单，把清单写进 reports/逾期.md，并回我一句话总结"></textarea></div>' +
+        '<div style="display:flex;gap:8px;margin-top:14px"><button class="ab-btn" id="au-save" type="button">建好</button>' +
+        '<button class="ab-btn ghost" id="au-cancel" type="button">取消</button></div><div class="ab-msg" id="au-msg"></div>';
+
+      var freqEl = body.querySelector('#au-freq');
+      var msgEl = body.querySelector('#au-msg');
+      function syncRows() {
+        var f = freqEl.value;
+        body.querySelector('#au-days').style.display = f === 'weekly' ? '' : 'none';
+        body.querySelector('#au-dom').style.display = f === 'monthly' ? '' : 'none';
+        body.querySelector('#au-time').parentNode.style.display = f === 'hourly' ? 'none' : '';
+      }
+      freqEl.onchange = syncRows;
+      syncRows();
+      body.querySelector('#au-cancel').onclick = closeLayer;
+      body.querySelector('#au-save').onclick = function () {
+        var prompt = body.querySelector('#au-prompt').value.trim();
+        if (!prompt) { msg(msgEl, '还没写「要它做什么」', false); return; }
+        var days = Array.prototype.slice.call(body.querySelectorAll('#au-days input:checked')).map(function (c) { return c.value; });
+        if (freqEl.value === 'weekly' && !days.length) { msg(msgEl, '每周的至少选一天', false); return; }
+        var name = body.querySelector('#au-name').value.trim() || prompt.slice(0, 20);
+        var payload = {
+          name: name,
+          prompt: prompt,
+          rrule: abRrule(freqEl.value, body.querySelector('#au-time').value, days, body.querySelector('#au-domv').value),
+          cwds: dir ? [dir] : [],
+          mode: 'agent',
+          allow_shell: true,
+          auto_approve: true,
+        };
+        var btn = body.querySelector('#au-save');
+        btn.disabled = true;
+        msg(msgEl, '正在建…', true);
+        api('/v1/automations', { method: 'POST', body: JSON.stringify(payload) }).then(function (r) {
+          if (!r.ok) {
+            btn.disabled = false;
+            msg(msgEl, ((r.body && (r.body.error || r.body.message)) || ('没建成（HTTP ' + r.code + '）')) + '', false);
+            return;
+          }
+          closeLayer();
+          if (onDone) onDone();
+        });
+      };
     });
   }
 
