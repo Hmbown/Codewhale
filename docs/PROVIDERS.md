@@ -36,6 +36,7 @@ where every Chat Completions host belongs.
 | Groq | compatible | `https://api.groq.com/openai/v1` | `llama-3.3-70b-versatile` | `GROQ_API_KEY` |
 | Cerebras | compatible | `https://api.cerebras.ai/v1` | `llama-3.3-70b` | `CEREBRAS_API_KEY` |
 | Command Code | compatible | `https://api.commandcode.ai/provider/v1` | `deepseek/deepseek-v4-flash` | `COMMAND_CODE_API_KEY` |
+| AICraft | compatible | `https://aicraftapi.com/v1` | `claude-4.6-sonnet` | `AICRAFT_API_KEY` |
 | Agnes | unpublished | none in this repository | — | — |
 
 Agnes has no published URL here, so it is catalogued as unpublished rather than
