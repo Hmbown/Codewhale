@@ -200,7 +200,7 @@
       var files = (d && d.files) || [];
       var cnt = document.getElementById('asb-mine-count');
       var u = d.usage || null;
-      var quotaTxt = (u && !u.unlimited) ? ' · 已用 ' + u.totalMb + 'M / ' + u.quotaMb + 'M' : '';
+      var quotaTxt = (u && !u.unlimited) ? ' · 已用 ' + fmtMb(u.totalMb) + ' / ' + fmtMb(u.quotaMb) : '';
       if (cnt) cnt.textContent = files.length ? ('（' + files.length + ' 份' + quotaTxt + '）') : '';
       mineBody.innerHTML = '';
       if (!files.length) { mineBody.innerHTML = '<span class="f-empty">还没传过资料 —— 点右边「+ 传资料」</span>'; return; }
@@ -226,6 +226,10 @@
     var rf = recycleBox.querySelector('#asbudy-recycle-refresh');
     if (rf) rf.onclick = function () { loadRecycle(); };
     return recycleBox;
+  }
+  function fmtMb(v) {   // 小单位用 M，上 G 就用 G —— 别让客户读三位数的 MB
+    v = Number(v) || 0;
+    return v >= 1024 ? (Math.round(v / 1024 * 10) / 10) + 'G' : v + 'M';
   }
   function binTime(ts) {
     if (!ts) return '';

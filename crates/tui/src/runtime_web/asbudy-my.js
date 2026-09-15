@@ -317,6 +317,34 @@
   }
 
   /* ── 客户管理（仅管理员） ── */
+  function fmtSpace(mb) {
+    mb = Number(mb) || 0;
+    if (mb >= 1024) return (Math.round(mb / 1024 * 10) / 10) + 'G';
+    return mb + 'M';
+  }
+  /** 给一个客户设「能传多少资料」（2026-09-15 老板要：管理员要在前端就能分配） */
+  function openSpaceForm(u, onDone) {
+    openLayer('设资料空间 —— ' + (u.name || u.user), function (body) {
+      body.innerHTML =
+        '<div class="ab-tip">客户上传的资料、以及他回收站里占的空间，加起来不能超过这个数。<br>填写单位是 G；填 0 = 不限制。</div>' +
+        '<div class="ab-row"><label>资料空间</label><input class="ab-input" id="sp-g" type="number" min="0" step="0.5" value="'
+          + (u.quotaMb ? (Math.round(u.quotaMb / 1024 * 10) / 10) : 1) + '" style="max-width:110px">'
+          + '<span style="color:#8b949e;font-size:12px">G（当前已用 ' + fmtSpace(u.spaceMb || 0) + '）</span></div>' +
+        '<div style="display:flex;gap:8px;margin-top:16px"><button class="ab-btn" id="sp-save" type="button">保存</button>' +
+        '<button class="ab-btn ghost" id="sp-cancel" type="button">取消</button></div><div class="ab-msg" id="sp-msg"></div>';
+      var msgEl = body.querySelector('#sp-msg');
+      body.querySelector('#sp-cancel').onclick = closeLayer;
+      body.querySelector('#sp-save').onclick = function () {
+        var g = Number(body.querySelector('#sp-g').value || 0);
+        if (!(g >= 0)) { msg('填个 0 或正数', msgEl); return; }
+        api('/_gate/users', { method: 'POST', body: JSON.stringify({ user: u.user, quotaMb: Math.round(g * 1024) }) })
+          .then(function (r) {
+            if (!r.ok) { msg((r.body && r.body.error) || '保存失败', msgEl); return; }
+            closeLayer(); if (onDone) onDone();
+          });
+      };
+    });
+  }
   function openUsers() {
     api('/_gate/users').then(function (r) {
       if (!r.ok) { alert(r.body.error || '打不开'); return; }
@@ -330,8 +358,12 @@
         users.forEach(function (u) {
           var card = document.createElement('div'); card.className = 'ab-card';
           card.innerHTML = '<div class="ab-card-top"><div><div class="ab-n">' + esc(u.name || u.user) + '</div>' +
-            '<div class="ab-s">账号：' + esc(u.user) + ' ｜ 名下项目：' + ((u.projects && u.projects.length) ? esc(u.projects.join('、')) : '无') + '</div></div></div>';
+            '<div class="ab-s">账号：' + esc(u.user) + ' ｜ 名下项目：' + ((u.projects && u.projects.length) ? esc(u.projects.join('、')) : '无')
+              + ' ｜ 资料已用 ' + fmtSpace(u.spaceMb || 0) + ' / ' + (u.quotaMb ? fmtSpace(u.quotaMb) : '默认 1G') + '</div></div></div>';
           var acts = document.createElement('div'); acts.style.cssText = 'display:flex;gap:7px;margin-top:10px';
+          var bSpace = document.createElement('button'); bSpace.className = 'ab-btn ghost sm'; bSpace.type = 'button'; bSpace.textContent = '设资料空间';
+          bSpace.onclick = function () { openSpaceForm(u, openUsers); };
+          acts.appendChild(bSpace);
           var bStaff = document.createElement('button'); bStaff.className = 'ab-btn ghost sm'; bStaff.type = 'button'; bStaff.textContent = '看员工';
           bStaff.onclick = function () { openStaff(u.user); };
           acts.appendChild(bStaff);
@@ -358,6 +390,7 @@
         '<div class="ab-row"><label>登录账号</label><input class="ab-input" id="c-user" placeholder="字母数字，2~32 位"></div>' +
         '<div class="ab-row"><label>公司名</label><input class="ab-input" id="c-name" placeholder="显示用，如「XX 公司」"></div>' +
         '<div class="ab-row"><label>密码</label><input class="ab-input" id="c-pw" type="password" placeholder="至少 8 位"></div>' +
+        '<div class="ab-row"><label>资料空间</label><input class="ab-input" id="c-space" type="number" min="0" step="0.5" value="1" style="max-width:110px"><span style="color:#8b949e;font-size:12px">G，0 = 不限（客户能传多少资料）</span></div>' +
         '<div style="display:flex;gap:8px;margin-top:16px"><button class="ab-btn" id="c-save" type="button">保存</button>' +
         '<button class="ab-btn ghost" id="c-cancel" type="button">取消</button></div><div class="ab-msg" id="c-msg"></div>';
       var msgEl = body.querySelector('#c-msg');
@@ -367,6 +400,7 @@
           user: body.querySelector('#c-user').value.trim(),
           displayName: body.querySelector('#c-name').value.trim(),
           password: body.querySelector('#c-pw').value,
+          quotaMb: Math.round(Number(body.querySelector('#c-space').value || 0) * 1024),
         };
         api('/_gate/users', { method: 'POST', body: JSON.stringify(payload) }).then(function (r) {
           if (!r.ok) { msg(r.body.error || '保存失败', msgEl); return; }
