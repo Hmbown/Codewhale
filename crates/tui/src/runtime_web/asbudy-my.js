@@ -813,9 +813,9 @@
   function openAdvanced() {
     openLayer('高级设置', function (body) {
       body.innerHTML = '<div id="ab-adv">加载中…</div>';
-      Promise.all([api('/_gate/advanced'), api('/_gate/model')]).then(function (rs) {
+      Promise.all([api('/_gate/advanced'), api('/_gate/model-key')]).then(function (rs) {
         var r = rs[0];
-        var mdl = rs[1];
+        var mk = rs[1].body || {};
         var el = body.querySelector('#ab-adv');
         if (!el) return;
         if (!r.ok) {
@@ -824,14 +824,11 @@
         }
         var d = r.body || {};
         var u = d.usage;
-        var models = (mdl.body && mdl.body.models) || [];
-        var curModel = (mdl.body && mdl.body.current) || '';
-        var modelOpts = models.map(function (x) {
-          return '<option value="' + esc(x.id) + '"' + (x.id === curModel ? ' selected' : '') + '>' + esc(x.name) + ' —— ' + esc(x.note || '') + '</option>';
-        }).join('');
         el.innerHTML =
           '<div class="ab-tip">只影响当前项目（' + esc((d.project && d.project.name) || '') + '）。</div>' +
-          '<div class="ab-row"><label>用哪个模型</label><select class="ab-input" id="adv-model">' + modelOpts + '</select></div>' +
+          '<div class="ab-row"><label>模型服务</label><span class="ab-input" style="cursor:default;color:#8b949e;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' +
+            esc(mk.provider || '—') + ' · ' + esc(mk.model || '—') + ' · ' + (mk.hasKey ? '密钥已配好' : '还没配密钥') +
+          '</span><button class="ab-btn ghost sm" id="adv-mk" type="button" style="flex:0 0 auto">改</button></div>' +
           '<div class="ab-row"><label>代码存哪</label><input class="ab-input" id="adv-git" placeholder="git@gitee.com:某人/仓库.git" value="' + esc(d.gitRemote || '') + '"></div>' +
           '<div style="display:flex;gap:8px;margin:-2px 0 14px 78px"><button class="ab-btn ghost sm" id="adv-git-save" type="button">保存</button><button class="ab-btn ghost sm" id="adv-git-clear" type="button">清空</button></div>' +
           '<div class="ab-row"><label>过程多详细</label><input class="ab-input" id="adv-lines" type="number" min="0" max="50" value="' + (d.thinkLines != null ? d.thinkLines : 3) + '" style="max-width:110px"><span style="color:#8b949e;font-size:13.5px">折叠时显示几行</span></div>' +
@@ -848,19 +845,73 @@
             if (r2.ok) msg(msgEl, '已保存', true); else msg(msgEl, (r2.body && r2.body.error) || '保存失败', false);
           });
         }
-        function post2(url, payload) {
-          return api(url, { method: 'POST', body: JSON.stringify(payload) }).then(function (r2) {
-            if (r2.ok) msg(msgEl, '已保存（下轮生效）', true); else msg(msgEl, (r2.body && r2.body.error) || '保存失败', false);
-          });
-        }
-        el.querySelector('#adv-model').onchange = function (e) {
-          post2('/_gate/model', { model: e.target.value });
-        };
+        el.querySelector('#adv-mk').onclick = openModelApiLoader;
         el.querySelector('#adv-git-save').onclick = function () { post({ gitRemote: el.querySelector('#adv-git').value }); };
         el.querySelector('#adv-git-clear').onclick = function () { el.querySelector('#adv-git').value = ''; post({ gitRemote: '' }); };
         el.querySelector('#adv-lines-save').onclick = function () { post({ thinkLines: Number(el.querySelector('#adv-lines').value) }); };
         el.querySelector('#adv-ro').onchange = function (e) { post({ previewReadOnly: e.target.checked }); };
       });
+    });
+  }
+
+  /* ── 模型服务：客户用自己的大模型 API（Claude / Kimi / 自建网关）──
+   * 为什么走门卫而不用官方 API：官方**故意不让 API 写密钥**（POST /v1/config 的允许键里
+   * 没有 api_key），密钥只能落项目自己的 config.toml，而那份属主是 cus-<项目>。
+   * 所以走门卫的 /_gate/model-key → 受限 root 帮手（sudoers 只放行它、且不带参数）。
+   * 提供商列表来自官方目录（48 家），不写死。 */
+  function openModelApiForm(d) {
+    openLayer('模型服务', function (body) {
+      var ps = d.providers || [];
+      // 官方目录里有几家显示名重复（如 Model Studio 的四个变体）→ 同名时带上 id 便于区分
+      var nameCount = {};
+      ps.forEach(function (p) { nameCount[p.name] = (nameCount[p.name] || 0) + 1; });
+      var opts = ps.map(function (p) {
+        var label = p.name + (nameCount[p.name] > 1 ? ' · ' + p.id : '');
+        return '<option value="' + esc(p.id) + '"' + (p.id === d.provider ? ' selected' : '') + '>' +
+          esc(label) + (p.ready ? '（已配好）' : '') + '</option>';
+      }).join('');
+      body.innerHTML =
+        '<div class="ab-tip">用你自己的大模型 API：选一家、填密钥。留空的项就不改（端点 / 模型名 / 密钥都是）。</div>' +
+        (d.helper ? '' : '<div class="ab-tip" style="color:#d29922">⚠️ 服务端还没装「模型密钥」帮手，现在保存不了 —— 让管理员跑一下安装脚本。</div>') +
+        '<div class="ab-row"><label>用哪家</label><select class="ab-input" id="mk-provider">' + opts + '</select></div>' +
+        '<div class="ab-row"><label>端点地址</label><input class="ab-input" id="mk-base" placeholder="留空用这家的官方地址" value="' + esc(d.base_url || '') + '"></div>' +
+        '<div class="ab-row"><label>自己的密钥</label><input class="ab-input" id="mk-key" type="password" autocomplete="new-password" placeholder="留空 = 不改（密钥不会回显）"></div>' +
+        '<div class="ab-row"><label>模型名</label><input class="ab-input" id="mk-model" placeholder="留空用这家的默认"></div>' +
+        '<div style="display:flex;gap:8px;margin-top:16px"><button class="ab-btn" id="mk-save" type="button">保存</button>' +
+        '<button class="ab-btn ghost" id="mk-cancel" type="button">取消</button></div><div class="ab-msg" id="mk-msg"></div>';
+      var msgEl = body.querySelector('#mk-msg');
+      body.querySelector('#mk-cancel').onclick = closeLayer;
+      var sel = body.querySelector('#mk-provider');
+      function refreshHint() {
+        var p = ps.filter(function (x) { return x.id === sel.value; })[0] || {};
+        body.querySelector('#mk-model').placeholder = p.defaultModel ? ('留空用 ' + p.defaultModel) : '留空用这家的默认';
+      }
+      sel.onchange = refreshHint;
+      refreshHint();
+      body.querySelector('#mk-save').onclick = function () {
+        var payload = {
+          provider: sel.value,
+          base_url: body.querySelector('#mk-base').value.trim(),
+          model: body.querySelector('#mk-model').value.trim(),
+        };
+        var k = body.querySelector('#mk-key').value;
+        if (k) payload.api_key = k;
+        msg(msgEl, '正在保存…', true);
+        api('/_gate/model-key', { method: 'POST', body: JSON.stringify(payload) }).then(function (r) {
+          var b = r.body || {};
+          if (!r.ok || b.ok === false) { msg(msgEl, b.error || '保存失败', false); return; }
+          body.querySelector('#mk-key').value = '';
+          var what = (b.changed || []).join(' / ') || '无变化';
+          msg(msgEl, '改好了（' + what + '）' + (b.verified ? ' · 引擎已重读并确认' : ''), true);
+        });
+      };
+    });
+  }
+  function openModelApiLoader() {
+    api('/_gate/model-key').then(function (r) {
+      var d = r.body || {};
+      if (!r.ok) { alert(d.error || '读不到配置'); return; }
+      openModelApiForm(d);
     });
   }
 
