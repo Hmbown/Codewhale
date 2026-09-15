@@ -610,11 +610,15 @@
             var bDel = document.createElement('button');
             bDel.className = 'ab-btn danger sm';
             bDel.type = 'button';
-            bDel.textContent = '删除';
+            bDel.textContent = '彻底删除';
             bDel.onclick = function () {
-              if (!confirm('删掉项目「' + p.name + '」？\n默认只下线（文件不动）；真要连文件一起删，得在服务器上跑 --purge。')) return;
-              api('/_gate/projects/delete', { method: 'POST', body: JSON.stringify({ key: p.key }) }).then(function (r2) {
+              // 2026-09-15：以前这里写的是「默认只下线，要真删得去服务器跑 --purge」——
+              // 客户根本做不到，点了删除文件还在。现在点它就是真删（走后端 purge）。
+              if (!confirm('彻底删掉项目「' + p.name + '」？\n\n· 代码、数据、引擎记录一起删，找不回来\n· 只想先停掉、以后还要用 → 点「暂停」\n\n确定吗？')) return;
+              api('/_gate/projects/delete', { method: 'POST', body: JSON.stringify({ key: p.key, purge: true }) }).then(function (r2) {
                 if (!r2.ok) { alert((r2.body && r2.body.error) || '删不掉'); return; }
+                // 删干净了没有要说清楚 —— 只下线不删文件时不能装作删了
+                if (r2.body && r2.body.note) alert(r2.body.note);
                 refresh();
               });
             };
