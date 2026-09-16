@@ -1392,7 +1392,7 @@ noscript {
   /* 窄屏：预览栏占**上面一块**（不是全屏盖住）——
      2026-09-16 老板：手机进来就要看见自己的项目（自动预览、不要三格）；
      但全屏盖住就没办法跟 AI 说话了 —— 所以改成上下分：上面看系统，下面继续聊。
-     关掉后用右上角的「👁 预览」再打开（就一个按钮）。 */
+     关掉后从左侧栏顶部的「▶ 看我的项目」再打开（手机端不再显示右上角的 👁 眼睛按钮）。 */
   .shell.has-preview .preview-pane {
     position: fixed;
     top: var(--visual-viewport-offset-top, 0px);
@@ -1411,9 +1411,10 @@ noscript {
     padding-top: 44vh;
   }
 
-  /* 窄屏也显示「👁 预览」展开按钮（收起后靠它再打开；就一个按钮，不是底部三格） */
+  /* 手机端不再显示「👁 我的项目」眼睛按钮（2026-09-16 老板要求去掉）；
+     预览收起后想再看，走左侧栏顶部的「▶ 看我的项目」。 */
   .shell:not(.has-preview) .preview-reveal {
-    display: block;
+    display: none;
   }
 
   .rail {
