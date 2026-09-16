@@ -859,6 +859,52 @@ fn assert_no_canaries(error: &anyhow::Error) {
     }
 }
 
+/// #6173: a geo-blocked key produced `Invalid request (400): ` — the colon
+/// that introduces the provider's reason, with nothing after it, because the
+/// catalog path discarded the body wholesale. A geo-block, a bad key and a
+/// wrong endpoint were then indistinguishable, and the reporter had to change
+/// VPN exits to find out which one it was. The reason is the provider's own
+/// words; only this client's secrets have to go.
+#[tokio::test]
+async fn catalog_errors_surface_the_provider_reason_without_client_secrets() {
+    const REASON: &str = "User location is not supported for the API use.";
+
+    let server = MockServer::start().await;
+    mount_page(
+        &server,
+        None,
+        ResponseTemplate::new(400).set_body_json(json!({
+            "error": {"code": 400, "message": REASON, "status": "FAILED_PRECONDITION"}
+        })),
+    )
+    .await;
+    let client = anthropic_client(&server.uri());
+    let error = client.list_models().await.unwrap_err();
+    assert!(
+        format!("{error:#}").contains(REASON),
+        "the provider's reason must reach the user: {error:#}"
+    );
+    assert_no_canaries(&error);
+
+    // The same reason, from an endpoint that also echoes back things only
+    // this client could have sent it. The reason survives; they do not.
+    let echoing = MockServer::start().await;
+    mount_page(
+        &echoing,
+        None,
+        ResponseTemplate::new(400).set_body_json(json!({
+            "error": {"message": format!("{REASON} key={KEY} header=custom-header-canary")}
+        })),
+    )
+    .await;
+    let client = anthropic_client(&echoing.uri());
+    crate::retry_status::clear();
+    let error = client.list_models().await.unwrap_err();
+    assert!(format!("{error:#}").contains(REASON), "{error:#}");
+    assert_no_canaries(&error);
+    crate::retry_status::clear();
+}
+
 #[tokio::test]
 async fn later_page_http_and_transport_errors_do_not_expose_cursor_or_key() {
     for isolated in [false, true] {

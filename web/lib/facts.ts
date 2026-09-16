@@ -3,11 +3,12 @@ import {
   type PublishedReleaseFact,
   type RepoFacts,
   type ProviderFact,
+  type ModelFact,
 } from "./facts.generated";
 
 const KV_KEY = "facts:current";
 
-export type { PublishedReleaseFact, RepoFacts, ProviderFact };
+export type { PublishedReleaseFact, RepoFacts, ProviderFact, ModelFact };
 
 export const BUILD_FACTS: RepoFacts = {
   ...BUILD_TIME_FACTS,
@@ -42,6 +43,18 @@ export interface FactsResolution {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function isModelFact(value: unknown): value is ModelFact {
+  if (!isRecord(value)) return false;
+  return (
+    typeof value.id === "string" &&
+    (value.provider === null || typeof value.provider === "string") &&
+    (value.contextWindow === null || typeof value.contextWindow === "number") &&
+    (value.maxOutput === null || typeof value.maxOutput === "number") &&
+    typeof value.reasoning === "boolean" &&
+    (value.addedAt === null || typeof value.addedAt === "string")
+  );
 }
 
 function isPublishedRelease(value: unknown): value is PublishedReleaseFact {
@@ -84,6 +97,8 @@ export function isRepoFacts(value: unknown): value is RepoFacts {
         typeof provider.label === "string" &&
         typeof provider.env === "string",
     ) &&
+    Array.isArray(value.models) &&
+    value.models.every(isModelFact) &&
     (value.defaultModel === null || typeof value.defaultModel === "string") &&
     (value.nodeEngines === null || typeof value.nodeEngines === "string") &&
     (value.toolCount === null || typeof value.toolCount === "number") &&

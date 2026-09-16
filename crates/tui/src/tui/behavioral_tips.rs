@@ -24,7 +24,7 @@ pub enum BehavioralTip {
     McpValidation,
     RepeatedCommandHotbar,
     DurableStateWritten,
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     TodoWriteHint,
 }
 

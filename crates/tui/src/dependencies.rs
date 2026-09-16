@@ -361,7 +361,7 @@ pub trait ExternalTool {
 
     /// Convenience: run the tool with arguments and return only the
     /// exit status (discards stdout/stderr).
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), expect(dead_code))]
     fn status(args: &[&str], cwd: &std::path::Path) -> std::io::Result<std::process::ExitStatus> {
         let mut cmd = Self::command().ok_or_else(|| {
             std::io::Error::new(

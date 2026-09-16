@@ -122,6 +122,27 @@ across paths and inspect changed media. A file inventory or a passing test
 suite is not evidence that those source reviews completed. This fallback
 does not change repository rules or satisfy a required whole-PR review.
 
+## Review evidence and precision
+
+The Actions-backed GitHub App and the `review` tool use the same PR review
+contract. Findings must explain an introduced defect's trigger, source evidence,
+impact and a useful fix. Generic requests for more tests, style preferences and
+unsupported compiler claims do not qualify as findings. An empty findings list
+is valid; unresolved assumptions belong in the assessment.
+
+When the exact PR head is available locally, each pass also receives numbered
+source excerpts around its changed hunks and nearby module declarations. These
+come from regular Git blobs at the pinned head, never from dirty checkout files
+or symlink targets. Source is not executed and no additional model call is made.
+The excerpts use only the unused portion of `CODEWHALE_REVIEW_MAX_CHARS`, capped
+at 50000 characters and 32 files per pass; individual blobs above 128 KiB are
+omitted. The complete diff remains intact and remains the inline-comment scope.
+
+The request explicitly records unavailable files and omitted context. It does
+not inspect unchanged caller files or run builds/tests, and a completed review
+does not establish either. These source and local-fixture guarantees do not
+establish a model's bug-detection rate or parity with another review product.
+
 ## Output budget
 
 `CODEWHALE_REVIEW_MAX_OUTPUT_TOKENS` optionally sets the CLI's output budget

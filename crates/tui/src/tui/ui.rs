@@ -911,6 +911,9 @@ mod terminal;
 mod terminal_input;
 use remote_control_bridge::*;
 use terminal_input::*;
+// #6165: `external_editor` is a sibling of `ui`, and the pump pause now lives
+// inside its `with_suspended_tui` so no editor entry point can forget it.
+pub(crate) use terminal_input::pause_terminal_input_for_child;
 
 pub(crate) use dispatch::*;
 pub(crate) use motion::*;

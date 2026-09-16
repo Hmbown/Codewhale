@@ -279,6 +279,19 @@ pub struct DeepSeekClient {
     /// this list closes the gap for bare provider tokens with no recognizable
     /// prefix (for example token-plan and provider-specific keys).
     model_bound_secret_values: Arc<Vec<String>>,
+    /// Exact values a catalog endpoint could echo back at us: the active API
+    /// key and every user-configured HTTP header value, plus everything in
+    /// `model_bound_secret_values`.
+    ///
+    /// Deliberately a second, wider list rather than a widening of that one:
+    /// they answer different questions at different trust boundaries. That
+    /// list is "what must never reach a *model*", which is why it covers only
+    /// auth-shaped headers and values of at least
+    /// `MIN_EXACT_SECRET_CHARS`. This one is "what must never come back out
+    /// of an endpoint the user typed during setup" (#6173), where a
+    /// three-character key is still a key and a custom header the user
+    /// configured is still theirs.
+    catalog_error_secret_values: Arc<Vec<String>>,
     /// Whether credential-shaped tool output is masked before it is sent to an
     /// upstream model. The safe default is `true`; it is `false` only after the
     /// user disabled `[redaction] model_bound` and confirmed the opt-out on the
@@ -577,6 +590,7 @@ impl Clone for DeepSeekClient {
             http1_client: self.http1_client.clone(),
             api_key: self.api_key.clone(),
             model_bound_secret_values: Arc::clone(&self.model_bound_secret_values),
+            catalog_error_secret_values: Arc::clone(&self.catalog_error_secret_values),
             model_bound_masking: self.model_bound_masking,
             base_url: self.base_url.clone(),
             api_provider: self.api_provider,
@@ -754,6 +768,58 @@ fn configured_model_bound_secret_values(config: &Config, active_api_key: &str) -
     values
 }
 
+/// Everything a catalog probe could have sent that must not come back.
+///
+/// Longest first, so a value that contains another is masked whole.
+fn catalog_error_secret_values(
+    active_api_key: &str,
+    http_headers: &HashMap<String, String>,
+    model_bound: &[String],
+) -> Vec<String> {
+    let mut values: Vec<String> = Vec::new();
+    let mut push = |value: &str| {
+        let value = value.trim();
+        if !value.is_empty() && !values.iter().any(|existing| existing == value) {
+            values.push(value.to_string());
+        }
+    };
+    // No length floor here, unlike `push_model_bound_secret`: a short key
+    // echoed back by an untrusted endpoint is still a leaked key. The cost of
+    // being wrong is a suppressed message, which is what this path did before.
+    push(active_api_key);
+    for value in http_headers.values() {
+        push(value);
+    }
+    for value in model_bound {
+        push(value);
+    }
+    values.sort_by_key(|value| std::cmp::Reverse(value.len()));
+    values
+}
+
+/// The opaque values in a request's URL query — the pagination cursor.
+///
+/// Collected in both forms: decoded, as a provider that parsed the cursor
+/// would echo it, and raw, as one that quoted the URL back would.
+fn request_query_secret_values(url: &reqwest::Url) -> Vec<String> {
+    let mut values: Vec<String> = Vec::new();
+    let mut push = |value: String| {
+        if !value.trim().is_empty() && !values.contains(&value) {
+            values.push(value);
+        }
+    };
+    for (_, value) in url.query_pairs() {
+        push(value.into_owned());
+    }
+    for pair in url.query().unwrap_or_default().split('&') {
+        if let Some((_, value)) = pair.split_once('=') {
+            push(value.to_string());
+        }
+    }
+    values.sort_by_key(|value| std::cmp::Reverse(value.len()));
+    values
+}
+
 fn redact_model_bound_text(text: &str, exact_secret_values: &[String]) -> String {
     let mut redacted = text.to_string();
     for secret in exact_secret_values {
@@ -769,6 +835,24 @@ fn redact_model_bound_text(text: &str, exact_secret_values: &[String]) -> String
 
 /// Maximum bytes to read from an error response body (64 KB).
 pub(super) const ERROR_BODY_MAX_BYTES: usize = 64 * 1024;
+
+/// How much of a provider's HTTP error body may be shown to the user.
+///
+/// The catalog probe is the one request that contacts a `base_url` the user
+/// typed during setup, and its URL carries an opaque pagination cursor, so a
+/// provider — or anything answering at that URL — can echo a key, a custom
+/// header value or the cursor back inside an error body. #3385 answered that
+/// by discarding the body entirely, and the cost of the blunt version was
+/// #6173: Gemini's real reason ("User location is not supported for the API
+/// use") reached the user as `Invalid request (400): ` with nothing after the
+/// colon, so a geo-block, a bad key and a wrong endpoint were indistinguishable.
+pub(super) enum ErrorBodyDisclosure {
+    /// The endpoint is already established. Surface the provider's message.
+    Full,
+    /// Untrusted endpoint. Surface only what survives redaction — and nothing
+    /// at all if a known secret is still in the result.
+    Guarded { request_secrets: Vec<String> },
+}
 
 /// Read/overall timeout for the shared client's non-streaming requests
 /// (`/models` listing, catalog refresh, health probes). Streaming requests
@@ -1041,59 +1125,13 @@ fn validate_base_url_security(base_url: &str, provider_allows_insecure_http: boo
     )
 }
 
+/// Mask credentials in a URL for display.
+///
+/// Delegates to the single shared implementation in
+/// [`codewhale_secrets::sanitize`] (FEAT-025 D4) so command sanitization and
+/// client diagnostics cannot drift.
 pub(crate) fn redact_url_for_display(url: &str) -> String {
-    let Ok(mut parsed) = reqwest::Url::parse(url) else {
-        return url.to_string();
-    };
-    if !parsed.username().is_empty() || parsed.password().is_some() {
-        let _ = parsed.set_username("***");
-        let _ = parsed.set_password(Some("***"));
-    }
-    if parsed.query().is_none() {
-        return parsed.to_string();
-    }
-    let pairs: Vec<(String, String)> = parsed
-        .query_pairs()
-        .map(|(key, value)| {
-            let value = if is_sensitive_url_query_key(&key) {
-                "***".to_string()
-            } else {
-                value.into_owned()
-            };
-            (key.into_owned(), value)
-        })
-        .collect();
-    parsed.set_query(None);
-    let mut query = parsed.query_pairs_mut();
-    for (key, value) in pairs {
-        query.append_pair(&key, &value);
-    }
-    drop(query);
-    parsed.to_string()
-}
-
-fn is_sensitive_url_query_key(key: &str) -> bool {
-    let normalized = key.trim().replace(['-', '.'], "_").to_ascii_lowercase();
-    matches!(
-        normalized.as_str(),
-        "api_key"
-            | "apikey"
-            | "access_token"
-            | "auth_token"
-            | "authorization"
-            | "bearer"
-            | "client_secret"
-            | "credential"
-            | "id_token"
-            | "password"
-            | "refresh_token"
-            | "secret"
-            | "token"
-    ) || normalized.ends_with("_api_key")
-        || normalized.ends_with("_authorization")
-        || normalized.ends_with("_password")
-        || normalized.ends_with("_secret")
-        || normalized.ends_with("_token")
+    codewhale_secrets::sanitize::redact_url_for_display(url)
 }
 
 pub(super) fn versioned_base_url(base_url: &str) -> String {
@@ -1568,12 +1606,18 @@ impl DeepSeekClient {
         )?
         .build()?;
 
+        let catalog_error_secret_values = Arc::new(catalog_error_secret_values(
+            &api_key,
+            &http_headers,
+            &model_bound_secret_values,
+        ));
         Ok(Self {
             http_client,
             models_http_client,
             http1_client,
             api_key,
             model_bound_secret_values,
+            catalog_error_secret_values,
             model_bound_masking,
             base_url,
             api_provider,
@@ -2910,10 +2954,18 @@ impl DeepSeekClient {
                         .timeout(NON_STREAMING_HTTP_TIMEOUT)
                 };
                 let response = match mode {
-                    ModelsRequestMode::Interactive => self
-                        .send_with_retry_error_body(build, false)
-                        .await
-                        .map_err(ModelsFetchError::Interactive)?,
+                    // #6173: the provider's own words, minus this client's
+                    // secrets and this request's cursor. The endpoint is not
+                    // established here — it is whatever the user typed during
+                    // setup — so the body is guarded rather than trusted.
+                    ModelsRequestMode::Interactive => {
+                        let disclosure = ErrorBodyDisclosure::Guarded {
+                            request_secrets: request_query_secret_values(&url),
+                        };
+                        self.send_with_retry_error_body(build, &disclosure)
+                            .await
+                            .map_err(ModelsFetchError::Interactive)?
+                    }
                     ModelsRequestMode::Refresh => build()
                         .send()
                         .await
@@ -3399,28 +3451,67 @@ impl DeepSeekClient {
         }
     }
 
+    /// Apply `disclosure` to one provider error body.
+    ///
+    /// Redaction runs on the raw bytes, *before* `sanitize_http_error_body`
+    /// truncates them, so a secret can never be split across the truncation
+    /// boundary and survive as a fragment. The result is then checked against
+    /// every value this client knows is secret; if one is still there the
+    /// whole body is dropped, which is exactly the behaviour this path had
+    /// before #6173. The fallback is the old contract, not a weaker one.
+    ///
+    /// Known limitation: this removes what the *client* knows is secret. A
+    /// credential the user configured outside Codewhale — in a proxy, say —
+    /// is not in that set and would pass through, the same limit
+    /// `redact_model_bound_text` has.
+    fn disclosed_http_error_body(
+        &self,
+        disclosure: &ErrorBodyDisclosure,
+        status: u16,
+        raw: &str,
+    ) -> String {
+        let provider = Some(self.api_provider.display_name());
+        let ErrorBodyDisclosure::Guarded { request_secrets } = disclosure else {
+            return sanitize_http_error_body(provider, status, raw);
+        };
+        let mut redacted = raw.to_string();
+        for secret in self
+            .catalog_error_secret_values
+            .iter()
+            .chain(request_secrets.iter())
+        {
+            redacted = redacted.replace(secret.as_str(), codewhale_config::persistence::REDACTED);
+        }
+        let message = sanitize_http_error_body(provider, status, &redacted);
+        let leaked = self
+            .catalog_error_secret_values
+            .iter()
+            .chain(request_secrets.iter())
+            .any(|secret| message.contains(secret.as_str()));
+        if leaked { String::new() } else { message }
+    }
+
     pub(super) async fn send_with_retry<F>(&self, build: F) -> Result<reqwest::Response>
     where
         F: FnMut() -> reqwest::RequestBuilder,
     {
-        self.send_with_retry_error_body(build, true).await
+        self.send_with_retry_error_body(build, &ErrorBodyDisclosure::Full)
+            .await
     }
 
-    // Model-list errors can echo opaque cursors or credentials. Keep status and
-    // Retry-After classification, but suppress their bodies before retry logs
-    // and state updates. Other requests retain their existing error details.
+    /// Model-list errors can echo opaque cursors or credentials. Keep status
+    /// and Retry-After classification either way; `disclosure` decides how
+    /// much of the body reaches retry logs, state updates and the user.
     async fn send_with_retry_error_body<F>(
         &self,
         mut build: F,
-        include_error_body: bool,
+        disclosure: &ErrorBodyDisclosure,
     ) -> Result<reqwest::Response>
     where
         F: FnMut() -> reqwest::RequestBuilder,
     {
         if self.isolated_request_state {
-            return self
-                .send_with_isolated_retry(build, include_error_body)
-                .await;
+            return self.send_with_isolated_retry(build, disclosure).await;
         }
         let retry_cfg: LlmRetryConfig = self.retry.clone().into();
         let request_result = with_retry(
@@ -3446,16 +3537,8 @@ impl DeepSeekClient {
                         return Ok(response);
                     }
                     let retry_after = extract_retry_after(response.headers());
-                    let body = if include_error_body {
-                        let body = bounded_error_text(response, ERROR_BODY_MAX_BYTES).await;
-                        sanitize_http_error_body(
-                            Some(self.api_provider.display_name()),
-                            status.as_u16(),
-                            &body,
-                        )
-                    } else {
-                        String::new()
-                    };
+                    let raw = bounded_error_text(response, ERROR_BODY_MAX_BYTES).await;
+                    let body = self.disclosed_http_error_body(disclosure, status.as_u16(), &raw);
                     Err(LlmError::from_http_response_with_retry_after(
                         status.as_u16(),
                         &body,
@@ -3514,7 +3597,7 @@ impl DeepSeekClient {
     async fn send_with_isolated_retry<F>(
         &self,
         mut build: F,
-        include_error_body: bool,
+        disclosure: &ErrorBodyDisclosure,
     ) -> Result<reqwest::Response>
     where
         F: FnMut() -> reqwest::RequestBuilder,
@@ -3535,16 +3618,8 @@ impl DeepSeekClient {
                         return Ok(response);
                     }
                     let retry_after = extract_retry_after(response.headers());
-                    let body = if include_error_body {
-                        let body = bounded_error_text(response, ERROR_BODY_MAX_BYTES).await;
-                        sanitize_http_error_body(
-                            Some(self.api_provider.display_name()),
-                            status.as_u16(),
-                            &body,
-                        )
-                    } else {
-                        String::new()
-                    };
+                    let raw = bounded_error_text(response, ERROR_BODY_MAX_BYTES).await;
+                    let body = self.disclosed_http_error_body(disclosure, status.as_u16(), &raw);
                     Err(LlmError::from_http_response_with_retry_after(
                         status.as_u16(),
                         &body,
@@ -3812,11 +3887,11 @@ struct OpenRouterModelItem {
     id: String,
     // Captured from OpenRouter for future display/deprecation surfaces. The
     // current CatalogOffering shape has no honest fields for these yet.
-    #[allow(dead_code)]
     #[serde(default)]
+    #[expect(dead_code)]
     name: Option<String>,
-    #[allow(dead_code)]
     #[serde(default)]
+    #[expect(dead_code)]
     created: Option<u64>,
     #[serde(default)]
     context_length: Option<u32>,
@@ -3828,8 +3903,8 @@ struct OpenRouterModelItem {
     supported_parameters: Option<Vec<String>>,
     #[serde(default)]
     architecture: Option<OpenRouterArchitecture>,
-    #[allow(dead_code)]
     #[serde(default)]
+    #[expect(dead_code)]
     expiration_date: Option<String>,
 }
 
@@ -4012,8 +4087,9 @@ fn apply_provider_model_cutline(
 /// The account control plane returns the OpenAI list shape, but every row
 /// carries a `codewhale` block naming the wire protocol Codewhale will use for
 /// that model (`chat-completions` → `{base}/chat/completions`,
-/// `anthropic-messages` → `{base}/messages`). That block is the whole reason
-/// this route is model-aware, so the protocol is read from the response rather
+/// `anthropic-messages` → `{base}/messages`, `responses` →
+/// `{base}/responses`). That block is the whole reason this route is
+/// model-aware, so the protocol is read from the response rather
 /// than inferred — the namespace inference in
 /// [`codewhale_config::route::codewhale_endpoint_key_for_model`] is only the
 /// offline fallback for a row this listing did not describe.
@@ -4058,7 +4134,8 @@ fn codewhale_catalog_offerings_from_body(
         }
         // An unstated or unknown protocol falls back to the namespace rule
         // rather than being dropped: the account already proved it serves this
-        // model by listing it.
+        // model by listing it, and a protocol label this build predates must
+        // not make the row unreachable.
         let endpoint_key = match row
             .codewhale
             .as_ref()
@@ -4067,6 +4144,7 @@ fn codewhale_catalog_offerings_from_body(
         {
             Some("anthropic-messages") => "messages",
             Some("chat-completions") => "chat",
+            Some("responses") => "responses",
             _ => codewhale_config::route::codewhale_endpoint_key_for_model(&id),
         };
         offerings.push(CatalogOffering {
@@ -7711,6 +7789,83 @@ mod tests {
         );
     }
 
+    /// A catalog row stating `codewhale.protocol = "responses"` must dispatch
+    /// to the account API's Responses surface — `{base}/responses` — not the
+    /// Chat Completions default its `openai/` namespace alone would imply.
+    #[tokio::test]
+    async fn codewhale_responses_catalog_row_dispatches_to_responses_endpoint() {
+        let _env = crate::test_support::lock_test_env();
+        let _live = crate::provider_lake::lock_live_snapshot();
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", home.path());
+        crate::provider_catalog_live::reset_cache_for_test();
+        crate::provider_lake::clear_live_snapshot();
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Type", "text/event-stream")
+                    .set_body_string(concat!(
+                        "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"",
+                        ",\"usage\":{\"input_tokens\":3,\"output_tokens\":1}}}\n\n",
+                        "data: [DONE]\n\n"
+                    )),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        // Seed the account catalog through the same refresh seam the runtime
+        // uses, so the wire choice comes from the row's stated protocol.
+        let fingerprint = base_url_fingerprint(&server.uri());
+        let offerings = codewhale_catalog_offerings_from_body(
+            r#"{"object":"list","data":[
+                {"id":"openai/gpt-5.6","object":"model","owned_by":"openai",
+                 "codewhale":{"provider":"openai","model":"gpt-5.6",
+                              "protocol":"responses","endpoint":"/v1/responses",
+                              "default":true,"usable":true}}
+            ]}"#,
+            "codewhale",
+            &fingerprint,
+            now_unix(),
+        )
+        .expect("fixture catalog parses");
+        crate::provider_catalog_live::record_success(ProviderCatalogDelta {
+            provider: "codewhale".to_string(),
+            base_url_fingerprint: fingerprint,
+            fetched_at: now_unix(),
+            offerings,
+        });
+
+        let mut client = codewhale_client(&server, "openai/gpt-5.6");
+        assert_eq!(client.wire_format, WireFormat::Responses);
+        client.retry.enabled = false;
+        let response = client
+            .create_message(minimal_zen_request("openai/gpt-5.6"))
+            .await
+            .expect("Codewhale responses request should succeed");
+
+        // Responses usage arrives on the terminal `response.completed` event —
+        // the dialect's equivalent of chat's `stream_options.include_usage`.
+        assert_eq!(response.usage.input_tokens, 3);
+        assert_eq!(response.usage.output_tokens, 1);
+        let requests = server.received_requests().await.expect("recorded request");
+        assert_eq!(requests.len(), 1);
+        assert_codewhale_bearer(&requests[0]);
+        let body: Value = serde_json::from_slice(&requests[0].body).expect("responses JSON body");
+        assert_eq!(
+            body.get("model").and_then(Value::as_str),
+            Some("openai/gpt-5.6")
+        );
+        assert!(body.get("input").is_some(), "Responses body: {body}");
+        assert!(body.get("messages").is_none(), "Responses body: {body}");
+
+        crate::provider_catalog_live::reset_cache_for_test();
+        crate::provider_lake::clear_live_snapshot();
+    }
+
     fn opencode_zen_client(server: &MockServer, model: &str) -> DeepSeekClient {
         let config = Config {
             provider: Some("opencode-zen".to_string()),
@@ -9506,11 +9661,15 @@ mod tests {
     }
 
     #[test]
-    fn codewhale_authenticates_both_protocols_with_bearer_never_x_api_key() {
+    fn codewhale_authenticates_every_protocol_with_bearer_never_x_api_key() {
         // The Codewhale API is a passthrough: it authenticates the account key
         // with `Authorization: Bearer` on the Anthropic Messages route too, so
         // the usual Messages `x-api-key` default must not apply here.
-        for wire in [WireFormat::ChatCompletions, WireFormat::AnthropicMessages] {
+        for wire in [
+            WireFormat::ChatCompletions,
+            WireFormat::AnthropicMessages,
+            WireFormat::Responses,
+        ] {
             let headers = build_default_headers(
                 "cwc_key_test",
                 &HashMap::new(),
@@ -11677,6 +11836,13 @@ mod tests {
                  "codewhale": {"provider": "anthropic", "model": "claude-sonnet-5",
                                "protocol": "anthropic-messages",
                                "endpoint": "/v1/messages", "usable": true}},
+                {"id": "openai/gpt-5.6", "object": "model", "owned_by": "openai",
+                 "codewhale": {"provider": "openai", "model": "gpt-5.6",
+                               "protocol": "responses",
+                               "endpoint": "/v1/responses", "usable": true}},
+                {"id": "xai/grok-4.6", "object": "model", "owned_by": "xai",
+                 "codewhale": {"provider": "xai", "model": "grok-4.6",
+                               "protocol": "some-future-wire", "usable": true}},
                 {"id": "deepseek/deepseek-v4-pro", "object": "model"},
                 {"id": "   ", "object": "model"},
                 {"id": "anthropic/claude-opus-4-8", "object": "model"}
@@ -11689,12 +11855,17 @@ mod tests {
             .iter()
             .map(|row| (row.wire_model_id.as_str(), row))
             .collect();
-        assert_eq!(rows.len(), 3, "blank and duplicate ids are dropped");
+        assert_eq!(rows.len(), 5, "blank and duplicate ids are dropped");
         // The protocol comes from the response, not from a compiled roster.
         assert_eq!(by_id["deepseek/deepseek-v4-pro"].endpoint_key, "chat");
         assert!(by_id["deepseek/deepseek-v4-pro"].default_for_provider);
         assert_eq!(by_id["anthropic/claude-sonnet-5"].endpoint_key, "messages");
         assert!(!by_id["anthropic/claude-sonnet-5"].default_for_provider);
+        assert_eq!(by_id["openai/gpt-5.6"].endpoint_key, "responses");
+        // A protocol label this build predates is not an error: the row falls
+        // back to the namespace rule so a forward-compatible catalog stays
+        // reachable.
+        assert_eq!(by_id["xai/grok-4.6"].endpoint_key, "chat");
         // A row with no `codewhale` block still resolves through the namespace
         // rule rather than being dropped: the account listed it.
         assert_eq!(by_id["anthropic/claude-opus-4-8"].endpoint_key, "messages");

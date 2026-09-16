@@ -196,22 +196,7 @@ impl FleetRosterView {
             members: roster
                 .members()
                 .iter()
-                .filter(|m| {
-                    !m.id.trim().eq_ignore_ascii_case("operator")
-                        // #5888: `general` is the legacy alias of the `worker`
-                        // posture. The engine roster keeps it dispatchable —
-                        // Agent tool type tokens, saved configs, and replayed
-                        // transcripts resolve `general`, and the identity
-                        // selector maps the alias to the worker member — but
-                        // the default lineup presents one row per posture.
-                        // Only the untouched built-in alias folds away: a
-                        // user-authored `general` (config/personal/project
-                        // origin, including saved-team members, which carry
-                        // Personal/Workspace origin by construction) is the
-                        // user's own member and stays visible.
-                        && !(m.id.eq_ignore_ascii_case("general")
-                            && m.origin == ProfileOrigin::BuiltIn)
-                })
+                .filter(|m| !m.id.trim().eq_ignore_ascii_case("operator"))
                 .cloned()
                 .collect(),
             shadowed: roster.shadowed().to_vec(),

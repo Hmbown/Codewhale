@@ -351,7 +351,7 @@ impl FanoutCard {
     }
 
     /// Pre-seed worker slots when the fanout size is known up front.
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), expect(dead_code))]
     pub fn with_workers<I, S>(mut self, ids: I) -> Self
     where
         I: IntoIterator<Item = S>,

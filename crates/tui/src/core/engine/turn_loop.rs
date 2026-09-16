@@ -6,6 +6,7 @@
 //! checkpoints, and loop termination.
 
 use super::dispatch::{
+    FLEET_FINAL_REPORT_NOTICE, FLEET_NO_PROGRESS_STOP, FLEET_STRATEGY_SWITCH_NOTICE,
     FleetDenialAction, FleetDenialBatch, FleetDenialGuard, normalize_schema_json_containers,
 };
 use super::*;
@@ -44,7 +45,11 @@ struct StreamOutcome {
     pending_message_complete: bool,
     last_text_index: Option<usize>,
     stream_errors: u32,
-    pending_steers: Vec<String>,
+    /// Unsettled steers queued mid-stream. Each is committed into the turn's
+    /// record at a step boundary, or dropped — and dropping one reports
+    /// `SteerOutcome::Dropped` to its sender, so an interrupted or failed
+    /// turn cannot silently swallow user guidance (#6276).
+    pending_steers: Vec<handle::PendingSteer>,
     /// Typed, engine-internal drop-recovery state. `Option` + consume-once
     /// means one drop schedules exactly one resume; see [`StreamResume`].
     pending_resume: Option<StreamResume>,
@@ -391,7 +396,8 @@ impl Engine {
         };
         let (mut universe, mut refreshed) = {
             let pool = pool.lock().await;
-            (pool.model_tool_names(), pool.to_api_tools())
+            let refreshed = pool.to_api_tools();
+            (pool.model_tool_names(&refreshed), refreshed)
         };
         // A config/authority change during handshake can remove a server;
         // its previous names must also leave this turn's catalog.
@@ -805,11 +811,12 @@ impl Engine {
             }
 
             let mut accepted_steer = false;
-            while let Some(steer) = self.next_turn_steer() {
-                let steer = steer.trim().to_string();
-                if steer.is_empty() {
+            while let Some(pending) = self.next_turn_steer() {
+                if pending.content.trim().is_empty() {
+                    // Nothing to deliver; dropping `pending` settles it.
                     continue;
                 }
+                let steer = pending.commit().trim().to_string();
                 accepted_steer = true;
                 self.session
                     .working_set
@@ -2076,7 +2083,8 @@ impl Engine {
                         turn.stop_diagnostics
                             .permission_denial_rounds_without_progress = 0;
                     }
-                    for steer in pending_steers.drain(..) {
+                    for pending in pending_steers.drain(..) {
+                        let steer = pending.commit().trim().to_string();
                         self.session
                             .working_set
                             .observe_user_message(&steer, &self.session.workspace);
@@ -2680,7 +2688,8 @@ impl Engine {
 
             let accepted_steer_after_tools = !pending_steers.is_empty();
             if !pending_steers.is_empty() {
-                for steer in pending_steers.drain(..) {
+                for pending in pending_steers.drain(..) {
+                    let steer = pending.commit().trim().to_string();
                     self.session
                         .working_set
                         .observe_user_message(&steer, &self.session.workspace);
@@ -2712,7 +2721,7 @@ impl Engine {
                     )
                 } else {
                     turn.stop_diagnostics.reason = Some(TurnStopReason::NoProgress);
-                    "Fleet worker stopped after repeated permission denials without new evidence. Work and tool results are retained in the transcript; review the blocker before resuming.".to_string()
+                    FLEET_NO_PROGRESS_STOP.to_string()
                 };
                 let _ = self.tx_event.send(Event::status(error.clone())).await;
                 return (TurnOutcomeStatus::Failed, Some(error));
@@ -2724,15 +2733,11 @@ impl Engine {
                             .stop_diagnostics
                             .permission_strategy_switches
                             .saturating_add(1);
-                        Some(
-                            "Fleet strategy switch required: repeated permission denials produced no new evidence. The rejected action is held. Use another permitted tool from the current catalog to make progress, or report completed work and the blocker. Do not work around permissions or request the same approval again.",
-                        )
+                        Some(FLEET_STRATEGY_SWITCH_NOTICE)
                     }
                     FleetDenialAction::FinalReport => {
                         turn.stop_diagnostics.final_report_requested = true;
-                        Some(
-                            "Fleet no-progress final report: permission denials continued after the strategy switch without new evidence. Your next response is report-only; no tools will execute. Report what you completed, exact evidence, the permission blocker and remaining work. This is the last response unless the user changes direction or authority.",
-                        )
+                        Some(FLEET_FINAL_REPORT_NOTICE)
                     }
                 };
                 if let Some(notice) = notice {
@@ -4466,7 +4471,8 @@ impl Engine {
                     if mcp_catalog_changed && let Some(pool) = self.mcp_pool.as_ref().cloned() {
                         let (universe, refreshed) = {
                             let pool = pool.lock().await;
-                            (pool.model_tool_names(), pool.to_api_tools())
+                            let refreshed = pool.to_api_tools();
+                            (pool.model_tool_names(&refreshed), refreshed)
                         };
                         let surface_budget = self
                             .turn_tool_surface_budget
@@ -4675,7 +4681,7 @@ impl Engine {
         // content-block delta delivered to the consumer).
         let mut any_content_received = false;
         let mut transparent_stream_retries = 0u32;
-        let mut pending_steers: Vec<String> = Vec::new();
+        let mut pending_steers: Vec<handle::PendingSteer> = Vec::new();
         // `stream_start` is reset on a transparent retry so the wall-clock
         // budget restarts with the fresh stream.
         let mut stream_start = Instant::now();
@@ -4732,18 +4738,16 @@ impl Engine {
             let Some(event_result) = poll_outcome else {
                 break;
             };
-            while let Some(steer) = self.next_turn_steer() {
-                let steer = steer.trim().to_string();
-                if steer.is_empty() {
+            while let Some(pending) = self.next_turn_steer() {
+                if pending.content.trim().is_empty() {
+                    // Nothing to deliver; dropping `pending` settles it.
                     continue;
                 }
-                pending_steers.push(steer.clone());
+                let preview = summarize_text(pending.content.trim(), 120);
+                pending_steers.push(pending);
                 let _ = self
                     .tx_event
-                    .send(Event::status(format!(
-                        "Steer input queued: {}",
-                        summarize_text(&steer, 120)
-                    )))
+                    .send(Event::status(format!("Steer input queued: {preview}")))
                     .await;
             }
 
@@ -5121,20 +5125,13 @@ impl Engine {
                                     tool_state.name, partial_json, tool_state.input_buffer
                                 ));
                             }
-                            // Mid-stream mirror of a partial buffer. The
-                            // argument text is *expected* to be incomplete
-                            // here, so `structure_synthesized` is ignored on
-                            // purpose; ContentBlockStop below is where an
-                            // unfinished argument becomes an error.
-                            if let Some(parsed) = parse_tool_input(&tool_state.input_buffer) {
-                                tool_state.input = parsed.value.clone();
-                                if crate::logging::is_verbose() {
-                                    crate::logging::info(format!(
-                                        "Tool '{}' input parsed: {:?}",
-                                        tool_state.name, parsed.value
-                                    ));
-                                }
-                            }
+                            // The buffer is the only mid-stream state: nothing
+                            // reads `tool_state.input` before finalization, so
+                            // there is no mirror parse here. Running the
+                            // `arg_repair` ladder per delta re-scanned the whole
+                            // accumulated buffer O(n²) times per tool call to
+                            // produce a value that `finalize_streamed_tool_input`
+                            // unconditionally overwrote (#6213 T4).
                         }
                     }
                 },
@@ -5177,8 +5174,8 @@ impl Engine {
                         && let Some(tool_state) = tool_uses.get_mut(tool_idx)
                     {
                         crate::logging::info(format!(
-                            "Tool '{}' block stop. Buffer: '{}', Current input: {:?}",
-                            tool_state.name, tool_state.input_buffer, tool_state.input
+                            "Tool '{}' block stop. Buffer: '{}'",
+                            tool_state.name, tool_state.input_buffer
                         ));
                         self.finalize_streamed_tool_input(tool_state).await;
 
@@ -5235,14 +5232,12 @@ impl Engine {
             }
         }
         // A stream cut at the provider's output limit ends without the
-        // closing ContentBlockStop for whatever block was in flight. Those
-        // blocks' inputs still hold the mid-stream mirror's best-effort
-        // parse, which ignores `structure_synthesized` by design — left
-        // as-is, a truncated tool call reaches dispatch through
-        // `tool.input` and executes (#5986). Every block that never
-        // stopped goes through the same finalization gate a normal
-        // ContentBlockStop applies, and is announced with the same
-        // finalized input.
+        // closing ContentBlockStop for whatever block was in flight. Before
+        // this drain existed a truncated tool call reached dispatch through
+        // `tool.input` and executed (#5986). Every block that never stopped
+        // goes through the same finalization gate a normal ContentBlockStop
+        // applies, and is announced with the same finalized input — which is
+        // also why no mid-stream parse is needed (#6213 T4).
         for tool_idx in std::mem::take(&mut current_tool_indices).into_values() {
             let Some(tool_state) = tool_uses.get_mut(tool_idx) else {
                 continue;
@@ -5287,9 +5282,9 @@ impl Engine {
     /// execute a truncated tool call (#5986). Called for a tool block that
     /// closes normally (`ContentBlockStop`) and again after the stream ends
     /// for blocks whose Stop never arrived — a provider cutting the stream
-    /// at its output limit omits the closing event, while the mid-stream
-    /// mirror deliberately ignores `structure_synthesized` because partial
-    /// text is the normal state mid-stream.
+    /// at its output limit omits the closing event. This is the only place
+    /// the accumulated buffer is parsed, and the only place
+    /// `structure_synthesized` is rejected.
     async fn finalize_streamed_tool_input(&self, tool_state: &mut ToolUseState) {
         if tool_state.input_buffer.trim().is_empty() {
             crate::logging::warn(format!(
@@ -5365,6 +5360,7 @@ impl Engine {
             crate::goal_loop::GoalBudget {
                 token_budget: snapshot.token_budget.map(u64::from),
                 time_budget_seconds: None,
+                enforce_token_budget: self.config.goal_enforce_token_budget,
                 max_continuations: self.config.goal_max_continuations,
             },
         );

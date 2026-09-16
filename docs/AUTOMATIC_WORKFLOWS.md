@@ -49,7 +49,7 @@ request orchestration explicitly.
 | `require_approval_for_writes` | `true` | Gates the plan-approval card for writes / elevated starts |
 | `auto_start_child_limit` | `16` | Soft cap on automatic child count |
 | `max_children` / `max_concurrent` / `max_depth` | `1000` / `16` / `5` | Task count, concurrent children, and plan structure ceilings |
-| `default_token_budget` | `120000` | Shared admission hint; not an exact mid-stream cutoff |
+| `default_token_budget` | `0` | Shared admission cap for a run and its children; `0` = none — set it or pass `token_budget` on the call to bound spend |
 | `persist_completed_activity` | `true` | Keep completed panel/history activity |
 
 Elevated work (writes, shell beyond read-only, network, secrets, worktrees, high

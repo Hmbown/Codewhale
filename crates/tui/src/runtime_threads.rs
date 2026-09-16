@@ -31,11 +31,12 @@ use crate::compaction::CompactionConfig;
 #[cfg(test)]
 use crate::config::DEFAULT_TEXT_MODEL;
 use crate::config::{ApiProvider, Config, MAX_SUBAGENTS, ProviderIdentity};
+use crate::core::engine::handle::SteerOutcome;
 use crate::core::engine::{
     EngineConfig, EngineHandle, spawn_engine_with_authoritative_route_config,
 };
 use crate::core::events::{Event as EngineEvent, TurnOutcomeStatus};
-use crate::core::ops::Op;
+use crate::core::ops::{Op, TurnSpec};
 use crate::cost_status::{
     EffectiveRouteEnvelope, EffectiveRouteUsage, RouteBillingMode, RuntimeUsageDropRecord,
     RuntimeUsageRecord,
@@ -50,6 +51,7 @@ use crate::route_runtime::{
 };
 use crate::runtime_policy::RuntimePolicyProjection;
 use crate::tools::plan::new_shared_plan_state;
+use crate::tools::shell::{SharedShellManager, new_shared_shell_manager};
 use crate::tools::subagent::SubAgentStatus;
 use crate::tools::todo::new_shared_todo_list;
 #[cfg(test)]
@@ -78,6 +80,14 @@ const MAX_PENDING_DYNAMIC_TOOL_CALLS: usize = 128;
 const SUMMARY_LIMIT: usize = 280;
 const STREAM_DELTA_BATCH_MAX_LATENCY: Duration = Duration::from_millis(32);
 const STREAM_DELTA_BATCH_MAX_BYTES: usize = 16 * 1024;
+/// How long `steer_turn` observes the engine's verdict before answering with
+/// the honest `Queued` receipt instead. A steer sent into a streaming turn
+/// settles in milliseconds; one sent behind a long tool call cannot, and an
+/// API request must not hang for the length of a tool call (#6276).
+const STEER_SETTLE_WAIT: Duration = Duration::from_secs(2);
+/// Why a steer never reached the model, in the words a client can show.
+const STEER_DROPPED_REASON: &str =
+    "the turn moved on before the engine committed it, so the model never saw it — resend it";
 const EVENT_TRANSACTION_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 const EVENT_TRANSACTION_LOCK_POLL: Duration = Duration::from_millis(5);
 const EVENT_TRANSACTION_LOCK_FILE: &str = "events.lock";
@@ -589,7 +599,7 @@ impl RuntimeThreadManager {
     /// user_input_timeout_seconds` governs (#6003): absent uses the built-in
     /// default, an explicit 0 returns `None` and the decision waits
     /// indefinitely.
-    fn approval_decision_timeout(&self) -> Option<Duration> {
+    pub(crate) fn approval_decision_timeout(&self) -> Option<Duration> {
         #[cfg(test)]
         {
             let ms = TEST_APPROVAL_DECISION_TIMEOUT_MS.load(std::sync::atomic::Ordering::SeqCst);
@@ -4034,6 +4044,11 @@ struct ActiveThreadState {
 struct ActiveThreads {
     engines: HashMap<String, ActiveThreadState>,
     lru: VecDeque<String>,
+    /// Per-thread shell/job authority shared with the thread's loaded engine.
+    /// Entries outlive engine LRU eviction so background jobs keep running and
+    /// stay reachable through the jobs API; an entry is removed only when the
+    /// thread itself is removed, which drops the manager and kills its jobs.
+    shell_managers: HashMap<String, SharedShellManager>,
 }
 
 pub(crate) struct PreparedThreadFork {
@@ -5327,7 +5342,7 @@ impl RuntimeThreadManager {
         ack_rx.await.context("User-input settlement task failed")?
     }
 
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), expect(dead_code))]
     pub async fn cancel_user_input(&self, thread_id: &str, input_id: &str) -> Result<bool> {
         let admission = self.config_admission.read().await;
         self.ensure_accepting_execution()?;
@@ -5457,12 +5472,12 @@ impl RuntimeThreadManager {
         }
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn pending_approvals_count(&self) -> usize {
         self.pending_approvals.lock().len()
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn pending_dynamic_tools_count(&self) -> usize {
         self.pending_dynamic_tools.lock().len()
     }
@@ -5840,6 +5855,21 @@ impl RuntimeThreadManager {
                     goal.continuation_count
                 );
                 goal.status = codewhale_protocol::ThreadGoalStatus::Paused;
+                goal.updated_at = chrono::Utc::now().timestamp();
+            } else if self.read_config().goal_enforce_token_budget()
+                && goal
+                    .token_budget
+                    .is_some_and(|budget| goal.tokens_used >= budget)
+            {
+                // The engine stops its own continuation at an enforced token
+                // budget (#6013); the host mirrors that as a durable pause so
+                // the cross-turn re-arm does not resurrect the spend.
+                tracing::info!(
+                    "goal for {thread_id} reached its enforced token budget ({}); pausing",
+                    goal.tokens_used
+                );
+                goal.status = codewhale_protocol::ThreadGoalStatus::Paused;
+                goal.pause_reason = Some(codewhale_protocol::GoalPauseReason::BudgetLimit);
                 goal.updated_at = chrono::Utc::now().timestamp();
             } else if !update_goal_available {
                 tracing::info!(
@@ -6935,6 +6965,7 @@ impl RuntimeThreadManager {
             )
             .await
         {
+            self.active.lock().await.shell_managers.remove(&thread.id);
             let _ = self.store.remove_thread(&thread.id);
             return Err(error);
         }
@@ -6942,7 +6973,7 @@ impl RuntimeThreadManager {
     }
 
     pub(crate) async fn discard_empty_thread(&self, thread_id: &str) -> Result<()> {
-        let active = self.active.lock().await;
+        let mut active = self.active.lock().await;
         if active.engines.contains_key(thread_id) {
             bail!("cannot discard a loaded Runtime thread");
         }
@@ -6951,6 +6982,10 @@ impl RuntimeThreadManager {
         if thread.latest_turn_id.is_some() {
             bail!("cannot discard a Runtime thread that owns turns");
         }
+        // Drop the thread's shell authority with it: the manager owns any
+        // API-created jobs, and dropping the last handle kills them.
+        active.shell_managers.remove(thread_id);
+        drop(active);
         self.store.remove_thread(thread_id)
     }
 
@@ -8861,58 +8896,133 @@ impl RuntimeThreadManager {
         acceptance_rx
     }
 
-    fn spawn_steer_receipts(
+    /// Settle one steer against the engine's real verdict.
+    ///
+    /// The detached worker — not the API caller — owns `outcome_rx`, so a
+    /// cancelled request or a timed-out caller can never orphan the verdict
+    /// and strand the item in `Queued` (#6276). Exactly one of two
+    /// settlements is written, record first and events after:
+    ///
+    /// - `Accepted`: the item flips to `Completed`, `steer_count` rises, and
+    ///   `turn.steered` + `item.completed` are emitted — the happy path
+    ///   clients already know.
+    /// - `Dropped` (including a closed channel, which means the engine is
+    ///   gone): the item flips to `Canceled` and `turn.steer_dropped` carries
+    ///   the settled item, so a client can requeue the text it was told had
+    ///   been delivered.
+    fn spawn_steer_settlement(
         &self,
         turn: TurnRecord,
         item: TurnItemRecord,
         prompt: String,
-    ) -> oneshot::Receiver<TurnRecord> {
-        let (receipt_tx, receipt_rx) = oneshot::channel();
+        outcome_rx: oneshot::Receiver<SteerOutcome>,
+    ) -> oneshot::Receiver<(SteerOutcome, TurnRecord)> {
+        let (settle_tx, settle_rx) = oneshot::channel();
         let manager = Arc::new(self.clone());
         let worker = tokio::spawn(async move {
             use futures_util::FutureExt;
-            let receipts = std::panic::AssertUnwindSafe(async {
-                if let Err(err) = manager
-                    .emit_event(
-                        &turn.thread_id,
-                        Some(&turn.id),
-                        Some(&item.id),
-                        "turn.steered",
-                        json!({
-                            "thread_id": turn.thread_id.clone(),
-                            "turn_id": turn.id.clone(),
-                            "input": prompt,
-                        }),
-                    )
-                    .await
-                {
-                    tracing::warn!("Failed to persist turn.steered after engine acceptance: {err}");
+            // The engine sends exactly one verdict on every exit path. A
+            // closed channel means the engine itself went away without one,
+            // which is a drop by any honest reading.
+            let outcome = outcome_rx.await.unwrap_or(SteerOutcome::Dropped);
+            let mut item = item;
+            item.status = match outcome {
+                SteerOutcome::Accepted => TurnItemLifecycleStatus::Completed,
+                SteerOutcome::Dropped => TurnItemLifecycleStatus::Canceled,
+            };
+            item.ended_at = Some(Utc::now());
+            let settled_turn = std::panic::AssertUnwindSafe(async {
+                let persisted = {
+                    let _turn_mutation = manager.store.turn_mutation.lock();
+                    (|| -> Result<TurnRecord> {
+                        manager.store.save_item(&item)?;
+                        let mut turn = manager.store.load_turn(&item.turn_id)?;
+                        if outcome == SteerOutcome::Accepted {
+                            turn.steer_count = turn.steer_count.saturating_add(1);
+                        }
+                        manager.store.save_turn(&turn)?;
+                        Ok(turn)
+                    })()
+                };
+                let settled_turn = match persisted {
+                    Ok(turn) => turn,
+                    Err(err) => {
+                        tracing::error!("Failed to settle steer item {}: {err}", item.id);
+                        turn.clone()
+                    }
+                };
+                match outcome {
+                    SteerOutcome::Accepted => {
+                        if let Err(err) = manager
+                            .emit_event(
+                                &turn.thread_id,
+                                Some(&turn.id),
+                                Some(&item.id),
+                                "turn.steered",
+                                json!({
+                                    "thread_id": turn.thread_id.clone(),
+                                    "turn_id": turn.id.clone(),
+                                    "input": prompt,
+                                }),
+                            )
+                            .await
+                        {
+                            tracing::warn!(
+                                "Failed to persist turn.steered after engine acceptance: {err}"
+                            );
+                        }
+                        if let Err(err) = manager
+                            .emit_event(
+                                &turn.thread_id,
+                                Some(&turn.id),
+                                Some(&item.id),
+                                "item.completed",
+                                json!({ "item": item }),
+                            )
+                            .await
+                        {
+                            tracing::warn!("Failed to persist steer item.completed: {err}");
+                        }
+                    }
+                    SteerOutcome::Dropped => {
+                        if let Err(err) = manager
+                            .emit_event(
+                                &turn.thread_id,
+                                Some(&turn.id),
+                                Some(&item.id),
+                                "turn.steer_dropped",
+                                json!({
+                                    "thread_id": turn.thread_id.clone(),
+                                    "turn_id": turn.id.clone(),
+                                    "input": prompt,
+                                    "reason": STEER_DROPPED_REASON,
+                                    "item": item,
+                                }),
+                            )
+                            .await
+                        {
+                            tracing::warn!("Failed to persist turn.steer_dropped: {err}");
+                        }
+                    }
                 }
-                if let Err(err) = manager
-                    .emit_event(
-                        &turn.thread_id,
-                        Some(&turn.id),
-                        Some(&item.id),
-                        "item.completed",
-                        json!({ "item": item }),
-                    )
-                    .await
-                {
-                    tracing::warn!("Failed to persist steer item.completed: {err}");
-                }
+                settled_turn
             })
             .catch_unwind()
             .await;
-            if let Err(payload) = receipts {
-                tracing::error!(
-                    "Steer receipt task panicked after engine acceptance: {}",
-                    panic_payload_message(&*payload)
-                );
-            }
-            let _ = receipt_tx.send(turn);
+            let settled_turn = match settled_turn {
+                Ok(turn) => turn,
+                Err(payload) => {
+                    tracing::error!(
+                        "Steer settlement task panicked: {}",
+                        panic_payload_message(&*payload)
+                    );
+                    turn
+                }
+            };
+            let _ = settle_tx.send((outcome, settled_turn));
         });
         self.track_receipt_worker(worker);
-        receipt_rx
+        settle_rx
     }
 
     pub async fn start_turn(&self, thread_id: &str, req: StartTurnRequest) -> Result<TurnRecord> {
@@ -9349,7 +9459,7 @@ impl RuntimeThreadManager {
             })
             .unwrap_or(crate::tools::goal::GoalStatus::Active);
 
-        let op = Op::SendMessage {
+        let op = Op::SendMessage (TurnSpec {
             max_output_tokens,
             content: prompt,
             images: req.images,
@@ -9373,7 +9483,7 @@ impl RuntimeThreadManager {
             approval_mode: policy.permission,
             verbosity,
             provenance: input_source.provenance(),
-        };
+        });
 
         // Reserve mailbox capacity before claiming or persisting anything.
         // If the caller is cancelled while capacity is unavailable, no
@@ -9586,20 +9696,24 @@ impl RuntimeThreadManager {
             .map_err(|error| anyhow!("Failed to steer turn: {error}"))?;
 
         let now = Utc::now();
+        let queued_turn;
         let item = TurnItemRecord {
             schema_version: CURRENT_RUNTIME_SCHEMA_VERSION,
             id: format!("item_{}", &Uuid::new_v4().to_string()[..8]),
             turn_id: turn_id.to_string(),
             kind: TurnItemKind::UserMessage,
-            status: TurnItemLifecycleStatus::Completed,
+            // Queued, not Completed: the text is in the engine's mailbox, not
+            // yet in the turn's record. `spawn_steer_settlement` flips it once
+            // the engine reports what actually happened (#6276).
+            status: TurnItemLifecycleStatus::Queued,
             summary: summarize_text(&prompt, SUMMARY_LIMIT),
             detail: Some(prompt.clone()),
             metadata: None,
             artifact_refs: Vec::new(),
             started_at: Some(now),
-            ended_at: Some(now),
+            ended_at: None,
         };
-        let receipt_rx = {
+        let settle_rx = {
             let mut active = self.active.lock().await;
             let Some(active_thread) = active.engines.get(thread_id) else {
                 bail!("Thread is not loaded");
@@ -9623,7 +9737,8 @@ impl RuntimeThreadManager {
                     bail!("Turn {turn_id} is no longer in progress and cannot be steered");
                 }
                 self.store.save_item(&item)?;
-                turn.steer_count = turn.steer_count.saturating_add(1);
+                // `steer_count` counts steers the model actually received, so
+                // it rises in the settlement path, not here.
                 if !turn.item_ids.iter().any(|id| id == &item.id) {
                     turn.item_ids.push(item.id.clone());
                 }
@@ -9644,13 +9759,26 @@ impl RuntimeThreadManager {
             };
             // The reserved send has no await/failure point. From here the
             // engine and durable record agree even if the API caller drops.
-            permit.send(prompt.clone());
+            let outcome_rx = permit.send_with_outcome(prompt.clone());
             touch_lru(&mut active.lru, thread_id);
-            self.spawn_steer_receipts(turn, item, prompt)
+            queued_turn = turn.clone();
+            self.spawn_steer_settlement(turn, item, prompt, outcome_rx)
         };
-        receipt_rx
-            .await
-            .map_err(|_| anyhow!("Steer receipt task ended before acknowledgement"))
+
+        // The settler owns the verdict; this is only an observation of it.
+        // Steering a streaming turn settles in milliseconds, so the caller
+        // almost always gets the truth in-band. Behind a long tool call the
+        // engine will not look at its mailbox for minutes, and an API request
+        // must not hang that long — so the wait is bounded and the caller
+        // falls back to the honest `Queued` receipt it already has.
+        match tokio::time::timeout(STEER_SETTLE_WAIT, settle_rx).await {
+            Ok(Ok((SteerOutcome::Accepted, turn))) => Ok(turn),
+            Ok(Ok((SteerOutcome::Dropped, _))) => bail!(
+                "Turn {turn_id} moved on before the steer reached the model; {STEER_DROPPED_REASON}"
+            ),
+            Ok(Err(_)) => bail!("Steer settlement task ended before acknowledgement"),
+            Err(_) => Ok(queued_turn),
+        }
     }
 
     pub async fn compact_thread(
@@ -10039,6 +10167,23 @@ impl RuntimeThreadManager {
                     crate::tools::goal::new_shared_goal_state(),
                 ),
             };
+            // One shell/job authority per thread, shared with the engine so
+            // `GET /v1/jobs` sees the same jobs the model sees and background
+            // work survives engine LRU eviction. The engine applies its
+            // per-thread sandbox settings to the manager on construction.
+            let shell_manager = {
+                let mut active = self.active.lock().await;
+                let manager = active
+                    .shell_managers
+                    .entry(thread.id.clone())
+                    .or_insert_with(|| new_shared_shell_manager(thread.workspace.clone()))
+                    .clone();
+                drop(active);
+                if let Ok(mut guard) = manager.lock() {
+                    guard.set_default_workspace(thread.workspace.clone());
+                }
+                manager
+            };
             let engine_cfg = EngineConfig {
                 model: route_model.clone(),
                 active_route_limits: route_limits,
@@ -10100,7 +10245,7 @@ impl RuntimeThreadManager {
                         Some(Arc::new(self.clone()))
                     },
                     work: None,
-                    shell_manager: None,
+                    shell_manager: Some(shell_manager),
                     persist_services_enabled: false,
                     hook_executor: None,
                     handle_store: crate::tools::handle::new_shared_handle_store(),
@@ -10151,6 +10296,7 @@ impl RuntimeThreadManager {
                 goal_status,
                 goal_max_continuations: cfg.goal_max_continuations(),
                 goal_continuation_delay_seconds: cfg.goal_continuation_delay_seconds(),
+                goal_enforce_token_budget: cfg.goal_enforce_token_budget(),
                 reasoning_only_max_reprompts: cfg.reasoning_only_max_reprompts(),
                 reasoning_only_reprompt_message: Some(
                     cfg.reasoning_only_reprompt_message().to_string(),
@@ -10278,6 +10424,74 @@ impl RuntimeThreadManager {
         self.ensure_engine_loaded(&thread).await
     }
 
+    /// The thread's shared shell/job authority — the same manager its engine
+    /// uses — so `/v1/jobs` and the model see one job set. With `create`, an
+    /// API-created job works before the thread's first engine load; without
+    /// it, `None` means the thread has never run shell work.
+    pub async fn thread_shell_manager(
+        &self,
+        thread_id: &str,
+        create: bool,
+    ) -> Result<Option<SharedShellManager>> {
+        let thread = self.get_thread(thread_id).await?;
+        let mut active = self.active.lock().await;
+        let manager = match active.shell_managers.entry(thread_id.to_string()) {
+            std::collections::hash_map::Entry::Occupied(entry) => Some(entry.get().clone()),
+            std::collections::hash_map::Entry::Vacant(entry) => create.then(|| {
+                entry
+                    .insert(new_shared_shell_manager(thread.workspace.clone()))
+                    .clone()
+            }),
+        };
+        drop(active);
+        if let Some(manager) = &manager
+            && let Ok(mut guard) = manager.lock()
+        {
+            guard.set_default_workspace(thread.workspace.clone());
+        }
+        Ok(manager)
+    }
+
+    /// Every live (thread_id, manager) pair, for the flat `GET /v1/jobs`.
+    pub async fn shell_managers_snapshot(&self) -> Vec<(String, SharedShellManager)> {
+        self.active
+            .lock()
+            .await
+            .shell_managers
+            .iter()
+            .map(|(thread_id, manager)| (thread_id.clone(), manager.clone()))
+            .collect()
+    }
+
+    /// The sandbox policy an API-created job inherits — the same posture
+    /// projection a turn applies to its shell calls, so a client terminal
+    /// cannot run looser than the thread's own tools would.
+    pub(crate) async fn thread_job_sandbox_policy(
+        &self,
+        thread: &ThreadRecord,
+    ) -> crate::sandbox::SandboxPolicy {
+        let policy = RuntimePolicyProjection::from_persisted(
+            &thread.mode,
+            thread.permission_posture.as_deref(),
+            thread.auto_approve,
+        );
+        let authority = crate::core::authority::TurnAuthority::from_effective_fields(
+            policy.mode,
+            thread.allow_shell,
+            thread.trust_mode,
+            policy.auto_approve(),
+            policy.permission,
+        );
+        let config = self.read_config();
+        authority.sandbox_policy(
+            &thread.workspace,
+            config.sandbox_mode.as_deref(),
+            crate::core::authority::SandboxNetworkAccess::from_config(
+                config.sandbox_network_access,
+            ),
+        )
+    }
+
     fn restore_thread_messages(&self, thread: &ThreadRecord) -> Result<Vec<Message>> {
         let turns = self.store.list_turns_for_thread(&thread.id)?;
         let (mut messages, covered) = self
@@ -10297,7 +10511,7 @@ impl RuntimeThreadManager {
         };
         let session = crate::session_manager::default_sessions_dir()
             .and_then(crate::session_manager::SessionManager::new)
-            .and_then(|manager| manager.load_session(session_id))
+            .and_then(|manager| manager.resume_session(session_id).map(|recovery| recovery.session))
             .with_context(|| format!("Cannot read saved session {session_id}; restore that session file before resuming thread {}", thread.id))?;
         let covered = if let Some(checkpoint) = &thread.saved_session_checkpoint {
             if checkpoint.messages_sha256 != session_messages_sha256(&session.messages)? {
@@ -10396,6 +10610,17 @@ impl RuntimeThreadManager {
             for item in items {
                 match item.kind {
                     TurnItemKind::UserMessage => {
+                        // A steer the engine never committed is recorded
+                        // `queued` or `canceled` precisely because the model
+                        // never saw it. Replaying it here would put words into
+                        // the context that the record says were not delivered
+                        // — the record is right, so it stays out (#6276).
+                        if matches!(
+                            item.status,
+                            TurnItemLifecycleStatus::Queued | TurnItemLifecycleStatus::Canceled
+                        ) {
+                            continue;
+                        }
                         flush_assistant(&mut assistant_blocks, &mut messages);
                         user_blocks.extend(item.user_content()?);
                     }
@@ -12559,14 +12784,14 @@ fn tool_kind_for_name(name: &str) -> TurnItemKind {
 /// The helper is the testable contract here — actual TUI wire-up to the
 /// resume flow is a follow-up.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)] // consumed by #128 follow-up TUI resume wiring; tested here.
+#[cfg(test)] // consumed by #128 follow-up TUI resume wiring; tested here.
 pub struct AgentRebindHint {
     pub agent_id: String,
     pub status: AgentRebindStatus,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
+#[cfg(test)]
 pub enum AgentRebindStatus {
     Spawned,
     InProgress,
@@ -12584,7 +12809,7 @@ pub enum AgentRebindStatus {
 /// open to mutation by subsequent live mailbox envelopes (each envelope's
 /// `agent_id` matches one already in the rebind map).
 #[must_use]
-#[allow(dead_code)]
+#[cfg(test)]
 pub fn collect_agent_rebind_hints(events: &[RuntimeEventRecord]) -> Vec<AgentRebindHint> {
     use std::collections::BTreeMap;
     let mut latest: BTreeMap<String, (AgentRebindStatus, u64, bool)> = BTreeMap::new();

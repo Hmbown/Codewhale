@@ -105,6 +105,20 @@ impl DiffHunks {
         self.files.contains_key(path)
     }
 
+    /// Post-image paths and hunk ranges from the same parser used to validate
+    /// comments. Context collection must not invent a second diff parser.
+    pub(crate) fn paths(&self) -> impl Iterator<Item = &str> {
+        self.files.keys().map(String::as_str)
+    }
+
+    pub(crate) fn ranges(&self, path: &str) -> impl Iterator<Item = (u32, u32)> + '_ {
+        self.files.get(path).into_iter().flat_map(|file| {
+            file.commentable
+                .iter()
+                .map(|range| (range.start, range.end))
+        })
+    }
+
     /// True when `line` is a RIGHT-side line GitHub will accept an inline
     /// comment on for `path` — a context line or an added line inside a hunk.
     #[must_use]

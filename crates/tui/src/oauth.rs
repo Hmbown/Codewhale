@@ -1679,7 +1679,7 @@ pub struct OwnedOAuthCredentials {
 
 /// Receipt for a committed Codewhale-owned OAuth generation.
 pub struct OAuthActivation {
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     pub credentials: OwnedOAuthCredentials,
     pub config_path: PathBuf,
     pub auth_path: PathBuf,

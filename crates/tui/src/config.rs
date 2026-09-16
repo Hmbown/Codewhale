@@ -1777,6 +1777,12 @@ where
 pub struct TuiConfig {
     pub alternate_screen: Option<String>,
     pub mouse_capture: Option<bool>,
+    /// Copy a transcript drag selection as Markdown source (`true`, the
+    /// default) instead of rendered terminal text. The payload projects every
+    /// intersected cell through the same canonical serialization Ctrl-Y and
+    /// `/copy` use. Set `false` to restore the rendered-text payload (#6156).
+    /// PRIMARY selection on Linux always keeps rendered text.
+    pub selection_copy_markdown: Option<bool>,
     /// Legacy setting retained for config compatibility. Raw mode is set
     /// directly on the terminal-owning thread; this value has no effect.
     pub terminal_probe_timeout_ms: Option<u64>,
@@ -2085,6 +2091,14 @@ pub struct GoalConfig {
     /// inside a provider turn.
     #[serde(default)]
     pub continuation_delay_seconds: Option<u64>,
+
+    /// Make a goal's `token_budget` a hard stop instead of advisory telemetry
+    /// (#6013). `false`/`None` preserves current behavior: crossing the budget
+    /// logs and continues. `true` stops the run with `BudgetLimit` once
+    /// `tokens_used >= token_budget`; goals created without a token budget
+    /// stay unbounded either way.
+    #[serde(default)]
+    pub enforce_token_budget: Option<bool>,
 }
 
 /// Reasoning-only recovery controls (`[reasoning_only]` table in config.toml).
@@ -2764,6 +2778,13 @@ pub struct ApprovalConfig {
     /// Default: `deny`.
     #[serde(default)]
     pub default_selection: ApprovalDefaultSelection,
+    /// Seconds an interactive approval card may wait before it resolves
+    /// **deny** on its own (#6101). Absent or an explicit `0` waits
+    /// indefinitely — the operator is at the terminal, so the card stays
+    /// unbounded by default. Values above 86,400 (24h) are clamped with a
+    /// warning.
+    #[serde(default)]
+    pub timeout_seconds: Option<u64>,
 }
 
 /// `transcript.prose_measure` exactly as written in `config.toml`.
@@ -7537,6 +7558,16 @@ impl Config {
         }
     }
 
+    /// Whether a goal's `token_budget` is a hard stop (#6013). Default `false`
+    /// keeps the advisory/telemetry behavior.
+    #[must_use]
+    pub fn goal_enforce_token_budget(&self) -> bool {
+        self.goal
+            .as_ref()
+            .and_then(|goal| goal.enforce_token_budget)
+            .unwrap_or(false)
+    }
+
     /// Quiet period between successful interactive goal turns (#5508).
     /// Absent/zero keeps the existing immediate-continuation behavior.
     #[must_use]
@@ -8168,6 +8199,25 @@ impl Config {
     #[must_use]
     pub fn approval_default_selection(&self) -> ApprovalDefaultSelection {
         self.approval.unwrap_or_default().default_selection
+    }
+
+    /// Effective expiry for the interactive approval card (#6101).
+    /// `None` (absent or an explicit `0`) waits indefinitely; a positive
+    /// value bounds the wait and expiry resolves to deny (fail-closed).
+    /// Values above 24h clamp with a warning.
+    #[must_use]
+    pub fn approval_timeout(&self) -> Option<std::time::Duration> {
+        const MAX_SECONDS: u64 = 86_400;
+        let seconds = self.approval.unwrap_or_default().timeout_seconds?;
+        if seconds == 0 {
+            return None;
+        }
+        if seconds > MAX_SECONDS {
+            tracing::warn!(
+                "[approval] timeout_seconds={seconds} exceeds 24h; clamping to {MAX_SECONDS}"
+            );
+        }
+        Some(std::time::Duration::from_secs(seconds.min(MAX_SECONDS)))
     }
 
     /// Resolve workspace side-git snapshot settings with defaults applied.
@@ -11810,12 +11860,12 @@ fn plaintext_credential_fallback_refused(
 /// isolated `CODEWHALE_HOME` and an explicit backend, so unit tests can never
 /// touch the developer's real credential store.
 #[cfg(not(test))]
-fn credential_secret_store() -> Option<codewhale_secrets::Secrets> {
+pub(crate) fn credential_secret_store() -> Option<codewhale_secrets::Secrets> {
     Some(codewhale_secrets::Secrets::auto_detect())
 }
 
 #[cfg(test)]
-fn credential_secret_store() -> Option<codewhale_secrets::Secrets> {
+pub(crate) fn credential_secret_store() -> Option<codewhale_secrets::Secrets> {
     let isolated_home = codewhale_paths::codewhale_home_is_explicit();
     let explicit_backend = std::env::var_os("CODEWHALE_SECRET_BACKEND")
         .or_else(|| std::env::var_os("DEEPSEEK_SECRET_BACKEND"))

@@ -1117,7 +1117,7 @@ pub fn theme_label_for_mode(mode: PaletteMode) -> &'static str {
 }
 
 #[must_use]
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 pub fn ui_theme_from_settings(theme: &str, background_color: Option<&str>) -> UiTheme {
     super::resolve_theme_setting(theme, background_color)
         .map(|(_, _, theme)| theme)

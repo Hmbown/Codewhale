@@ -21,7 +21,7 @@
 # `api_key` / `base_url` are
 # still read as DeepSeek defaults when `[providers.deepseek]` is absent
 # (backward compatibility).
-provider = "deepseek" # deepseek | deepseek-cn | deepseek-anthropic | nvidia-nim | openai | atlascloud | wanjie-ark | volcengine | openrouter | orcarouter | xiaomi-mimo | novita | fireworks | siliconflow | siliconflow-CN | arcee | moonshot | zai | stepfun | minimax | sglang | vllm | ollama | huggingface | together | qianfan | openai-codex | anthropic | openmodel | deepinfra | sakana | longcat | opencode-go | opencode-zen | meta | xai | modelstudio-token-plan | modelstudio-coding-plan
+provider = "deepseek" # deepseek | deepseek-cn | deepseek-anthropic | nvidia-nim | openai | atlascloud | wanjie-ark | volcengine | openrouter | orcarouter | xiaomi-mimo | novita | fireworks | siliconflow | siliconflow-CN | arcee | moonshot | zai | stepfun | minimax | sglang | vllm | ollama | huggingface | together | qianfan | openai-codex | anthropic | openmodel | deepinfra | sakana | longcat | opencode-go | opencode-zen | meta | xai | modelstudio-token-plan | modelstudio-coding-plan | codewhale
 api_key = "YOUR_DEEPSEEK_API_KEY" # must be non-empty
 base_url = "https://api.deepseek.com/beta"
 # provider = "deepseek-cn"                       # legacy alias (official host is still https://api.deepseek.com)
@@ -258,6 +258,12 @@ memory_path = "~/.codewhale/memory.md"
 # Seconds a question or an approval decision waits before it cancels (#6003).
 # 0 disables the timeout entirely; values above 86400 (24h) are clamped.
 # user_input_timeout_seconds = 300
+#
+# Bound an interactive approval card's wait (#6101). When the window elapses
+# the card resolves to deny (fail-closed) and the transcript says the bound
+# denied the call; omitted or 0 waits indefinitely.
+# [approval]
+# timeout_seconds = 300
 
 # ─────────────────────────────────────────────────────────────────────────────────
 # Product telemetry — optional, enabled by default with a startup disclosure
@@ -990,6 +996,21 @@ max_subagents = 10 # optional (default 64, clamped to 1-128)
 # base_url = "https://api.openmodel.ai"
 # model = "deepseek-v4-flash"
 
+# Codewhale API (https://app.codewhale.net/settings?section=api)
+# Account-backed model access over the provider keys connected to the
+# customer's Codewhale account. The account's authenticated `GET /v1/models`
+# listing is the catalog authority: each `provider/model` row states its wire
+# (`chat-completions` → `/v1/chat/completions`, `anthropic-messages` →
+# `/v1/messages`, `responses` → `/v1/responses`). Every protocol authenticates
+# the account key with `Authorization: Bearer`, never `x-api-key`.
+# Provider aliases: codewhale-api, cw-api, codewhale-cloud
+# Env vars: CODEWHALE_API_KEY, CODEWHALE_API_BASE (HTTPS except loopback);
+#           the generic CODEWHALE_MODEL override also applies.
+[providers.codewhale]
+# api_key = "cwc_key_..."                   # or `codewhale account api-keys create --name <name> --use`
+# base_url = "https://api.codewhale.net/v1"
+# model = "deepseek/deepseek-v4-pro"        # provider/model exactly as the account catalog returns it
+
 # ─────────────────────────────────────────────────────────────────────────────────
 # Web Search Provider
 # ─────────────────────────────────────────────────────────────────────────────────
@@ -1131,7 +1152,8 @@ max_subagents = 10 # optional (default 64, clamped to 1-128)
 # ─────────────────────────────────────────────────────────────────────────────────
 [tui]
 alternate_screen = "auto"   # auto/always start on the alternate screen; never starts inline (keeps terminal scrollback). /fullscreen and /inline switch at runtime
-mouse_capture = true        # true copies only transcript user/assistant text; false uses raw terminal selection/copy
+mouse_capture = true        # true: TUI-owned mouse selection (payload set by selection_copy_markdown); false: raw terminal selection/copy
+selection_copy_markdown = true # true: copy transcript drag selections as Markdown source; false: rendered text
 terminal_probe_timeout_ms = 500 # optional startup terminal-mode timeout (100-5000ms)
 stream_chunk_timeout_secs = 900 # optional SSE idle timeout per chunk (0 = default, 1-3600)
 # Model steps are uncapped by default. Uncomment to install an explicit

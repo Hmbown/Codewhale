@@ -4,6 +4,15 @@
 
 export interface ProviderFact { id: string; label: string; env: string }
 
+export interface ModelFact {
+  id: string;
+  provider: string | null;
+  contextWindow: number | null;
+  maxOutput: number | null;
+  reasoning: boolean;
+  addedAt: string | null;
+}
+
 export interface PublishedReleaseFact {
   tag: string;
   version: string;
@@ -19,6 +28,7 @@ export interface RepoFacts {
   crates: string[];
   sandboxBackends: string[];
   providers: ProviderFact[];
+  models: ModelFact[];
   defaultModel: string | null;
   nodeEngines: string | null;
   toolCount: number | null;
@@ -27,10 +37,10 @@ export interface RepoFacts {
 }
 
 export const FACTS: RepoFacts = {
-  "generatedAt": "2026-09-14T04:36:44.112Z",
+  "generatedAt": "2026-09-16T18:38:00.930Z",
   "sourceRevision": null,
   "sourceCommittedAt": null,
-  "version": "0.9.13",
+  "version": "0.9.14",
   "crates": [
     "agent",
     "app-server",
@@ -45,6 +55,7 @@ export const FACTS: RepoFacts = {
     "lane",
     "localization",
     "mcp",
+    "memory",
     "models",
     "palette",
     "paths",
@@ -299,9 +310,603 @@ export const FACTS: RepoFacts = {
       "env": "MODELSTUDIO_API_KEY"
     }
   ],
+  "models": [
+    {
+      "id": "qwen3.5-flash",
+      "provider": "Qwen",
+      "contextWindow": null,
+      "maxOutput": null,
+      "reasoning": true,
+      "addedAt": "2026-09-09"
+    },
+    {
+      "id": "glm-5.3-flash",
+      "provider": "Z.ai",
+      "contextWindow": 1000000,
+      "maxOutput": 131072,
+      "reasoning": true,
+      "addedAt": "2026-08-27"
+    },
+    {
+      "id": "qwen3.8-flash",
+      "provider": "Qwen",
+      "contextWindow": null,
+      "maxOutput": null,
+      "reasoning": true,
+      "addedAt": "2026-08-27"
+    },
+    {
+      "id": "deepseek-v4-flash-vision-exp",
+      "provider": "DeepSeek",
+      "contextWindow": 1000000,
+      "maxOutput": 384000,
+      "reasoning": true,
+      "addedAt": "2026-08-21"
+    },
+    {
+      "id": "claude-opus-5",
+      "provider": "Anthropic",
+      "contextWindow": 1000000,
+      "maxOutput": 128000,
+      "reasoning": true,
+      "addedAt": "2026-08-17"
+    },
+    {
+      "id": "gemini-3.7-flash",
+      "provider": "Google",
+      "contextWindow": null,
+      "maxOutput": null,
+      "reasoning": false,
+      "addedAt": "2026-08-17"
+    },
+    {
+      "id": "kimi-k2.7-code-highspeed",
+      "provider": "Moonshot/Kimi",
+      "contextWindow": null,
+      "maxOutput": null,
+      "reasoning": false,
+      "addedAt": "2026-08-17"
+    },
+    {
+      "id": "gemini-2.5-flash",
+      "provider": "Google",
+      "contextWindow": null,
+      "maxOutput": null,
+      "reasoning": false,
+      "addedAt": "2026-08-14"
+    },
+    {
+      "id": "gemini-2.5-pro",
+      "provider": "Google",
+      "contextWindow": null,
+      "maxOutput": null,
+      "reasoning": false,
+      "addedAt": "2026-08-14"
+    },
+    {
+      "id": "gemini-3-pro-preview",
+      "provider": "Google",
+      "contextWindow": null,
+      "maxOutput": null,
+      "reasoning": false,
+      "addedAt": "2026-08-14"
+    },
+    {
+      "id": "gemini-3.1-pro-preview",
+      "provider": "Google",
+      "contextWindow": null,
+      "maxOutput": null,
+      "reasoning": false,
+      "addedAt": "2026-08-14"
+    },
+    {
+      "id": "gemini-3.5-flash",
+      "provider": "Google",
+      "contextWindow": null,
+      "maxOutput": null,
+      "reasoning": false,
+      "addedAt": "2026-08-14"
+    },
+    {
+      "id": "gemini-3.5-flash-lite",
+      "provider": "Google",
+      "contextWindow": null,
+      "maxOutput": null,
+      "reasoning": false,
+      "addedAt": "2026-08-14"
+    },
+    {
+      "id": "gemini-3.6-flash",
+      "provider": "Google",
+      "contextWindow": null,
+      "maxOutput": null,
+      "reasoning": false,
+      "addedAt": "2026-08-14"
+    },
+    {
+      "id": "grok-4.6",
+      "provider": "xAI",
+      "contextWindow": null,
+      "maxOutput": null,
+      "reasoning": false,
+      "addedAt": "2026-08-12"
+    },
+    {
+      "id": "mistral-code-latest",
+      "provider": "Mistral",
+      "contextWindow": null,
+      "maxOutput": null,
+      "reasoning": false,
+      "addedAt": "2026-08-09"
+    },
+    {
+      "id": "mistral-large-latest",
+      "provider": "Mistral",
+      "contextWindow": null,
+      "maxOutput": null,
+      "reasoning": false,
+      "addedAt": "2026-08-09"
+    },
+    {
+      "id": "mistral-medium-latest",
+      "provider": "Mistral",
+      "contextWindow": null,
+      "maxOutput": null,
+      "reasoning": false,
+      "addedAt": "2026-08-08"
+    },
+    {
+      "id": "mistral-small-latest",
+      "provider": "Mistral",
+      "contextWindow": null,
+      "maxOutput": null,
+      "reasoning": false,
+      "addedAt": "2026-08-08"
+    },
+    {
+      "id": "muse-spark-1.2-contributor",
+      "provider": "Meta",
+      "contextWindow": 1000000,
+      "maxOutput": 32000,
+      "reasoning": true,
+      "addedAt": "2026-08-06"
+    },
+    {
+      "id": "muse-spark-1.2",
+      "provider": "Meta",
+      "contextWindow": 1000000,
+      "maxOutput": 32000,
+      "reasoning": true,
+      "addedAt": "2026-08-05"
+    },
+    {
+      "id": "glm-5.3",
+      "provider": "Z.ai",
+      "contextWindow": 1000000,
+      "maxOutput": 131072,
+      "reasoning": true,
+      "addedAt": "2026-08-03"
+    },
+    {
+      "id": "deepseek-flash",
+      "provider": "DeepSeek",
+      "contextWindow": 1000000,
+      "maxOutput": 384000,
+      "reasoning": true,
+      "addedAt": "2026-08-02"
+    },
+    {
+      "id": "qwen3.8-max",
+      "provider": "Qwen",
+      "contextWindow": null,
+      "maxOutput": null,
+      "reasoning": true,
+      "addedAt": "2026-08-02"
+    },
+    {
+      "id": "qwen3.8-max-preview",
+      "provider": "Qwen",
+      "contextWindow": null,
+      "maxOutput": null,
+      "reasoning": true,
+      "addedAt": "2026-08-02"
+    },
+    {
+      "id": "kimi-for-coding-highspeed",
+      "provider": "Moonshot/Kimi",
+      "contextWindow": null,
+      "maxOutput": null,
+      "reasoning": true,
+      "addedAt": "2026-07-27"
+    },
+    {
+      "id": "qwen3.5-plus",
+      "provider": "Qwen",
+      "contextWindow": null,
+      "maxOutput": null,
+      "reasoning": true,
+      "addedAt": "2026-07-26"
+    },
+    {
+      "id": "kimi-k3",
+      "provider": "Moonshot/Kimi",
+      "contextWindow": 1048576,
+      "maxOutput": 131072,
+      "reasoning": true,
+      "addedAt": "2026-07-17"
+    },
+    {
+      "id": "thinkingmachines/inkling",
+      "provider": "Together",
+      "contextWindow": null,
+      "maxOutput": null,
+      "reasoning": false,
+      "addedAt": "2026-07-15"
+    },
+    {
+      "id": "claude-fable-5",
+      "provider": "Anthropic",
+      "contextWindow": 1000000,
+      "maxOutput": 128000,
+      "reasoning": true,
+      "addedAt": "2026-07-09"
+    },
+    {
+      "id": "claude-sonnet-5",
+      "provider": "Anthropic",
+      "contextWindow": 1000000,
+      "maxOutput": 128000,
+      "reasoning": true,
+      "addedAt": "2026-07-09"
+    },
+    {
+      "id": "gpt-5.6",
+      "provider": "OpenAI",
+      "contextWindow": 1050000,
+      "maxOutput": 128000,
+      "reasoning": true,
+      "addedAt": "2026-07-09"
+    },
+    {
+      "id": "gpt-5.6-luna",
+      "provider": "OpenAI",
+      "contextWindow": 1050000,
+      "maxOutput": 128000,
+      "reasoning": true,
+      "addedAt": "2026-07-09"
+    },
+    {
+      "id": "gpt-5.6-sol",
+      "provider": "OpenAI",
+      "contextWindow": 1050000,
+      "maxOutput": 128000,
+      "reasoning": true,
+      "addedAt": "2026-07-09"
+    },
+    {
+      "id": "gpt-5.6-terra",
+      "provider": "OpenAI",
+      "contextWindow": 1050000,
+      "maxOutput": 128000,
+      "reasoning": true,
+      "addedAt": "2026-07-09"
+    },
+    {
+      "id": "muse-spark-1.1",
+      "provider": "Meta",
+      "contextWindow": 1000000,
+      "maxOutput": 32000,
+      "reasoning": true,
+      "addedAt": "2026-07-09"
+    },
+    {
+      "id": "qwen3.7-plus",
+      "provider": "Qwen",
+      "contextWindow": null,
+      "maxOutput": null,
+      "reasoning": true,
+      "addedAt": "2026-07-09"
+    },
+    {
+      "id": "grok-4.20-0309-non-reasoning",
+      "provider": "xAI",
+      "contextWindow": null,
+      "maxOutput": null,
+      "reasoning": false,
+      "addedAt": "2026-07-08"
+    },
+    {
+      "id": "grok-4.20-0309-reasoning",
+      "provider": "xAI",
+      "contextWindow": null,
+      "maxOutput": null,
+      "reasoning": false,
+      "addedAt": "2026-07-08"
+    },
+    {
+      "id": "grok-4.3",
+      "provider": "xAI",
+      "contextWindow": null,
+      "maxOutput": null,
+      "reasoning": false,
+      "addedAt": "2026-07-08"
+    },
+    {
+      "id": "grok-4.5",
+      "provider": "xAI",
+      "contextWindow": null,
+      "maxOutput": null,
+      "reasoning": false,
+      "addedAt": "2026-07-08"
+    },
+    {
+      "id": "grok-build",
+      "provider": "xAI",
+      "contextWindow": null,
+      "maxOutput": null,
+      "reasoning": false,
+      "addedAt": "2026-07-08"
+    },
+    {
+      "id": "grok-composer-2.5-fast",
+      "provider": "xAI",
+      "contextWindow": null,
+      "maxOutput": null,
+      "reasoning": false,
+      "addedAt": "2026-07-08"
+    },
+    {
+      "id": "fugu-ultra",
+      "provider": null,
+      "contextWindow": 1000000,
+      "maxOutput": 131000,
+      "reasoning": true,
+      "addedAt": "2026-07-06"
+    },
+    {
+      "id": "fugu-ultra-20260615",
+      "provider": null,
+      "contextWindow": 1000000,
+      "maxOutput": 131000,
+      "reasoning": true,
+      "addedAt": "2026-06-28"
+    },
+    {
+      "id": "mimo-v2.5-pro-ultraspeed",
+      "provider": "Xiaomi MiMo",
+      "contextWindow": 1000000,
+      "maxOutput": 131072,
+      "reasoning": true,
+      "addedAt": "2026-06-22"
+    },
+    {
+      "id": "kimi-k2.5",
+      "provider": "Moonshot/Kimi",
+      "contextWindow": null,
+      "maxOutput": null,
+      "reasoning": true,
+      "addedAt": "2026-06-21"
+    },
+    {
+      "id": "claude-haiku-4-5",
+      "provider": "Anthropic",
+      "contextWindow": 200000,
+      "maxOutput": 64000,
+      "reasoning": false,
+      "addedAt": "2026-06-14"
+    },
+    {
+      "id": "claude-opus-4-8",
+      "provider": "Anthropic",
+      "contextWindow": 1000000,
+      "maxOutput": 128000,
+      "reasoning": true,
+      "addedAt": "2026-06-14"
+    },
+    {
+      "id": "gpt-5-codex",
+      "provider": "OpenAI Codex",
+      "contextWindow": 400000,
+      "maxOutput": 128000,
+      "reasoning": true,
+      "addedAt": "2026-06-14"
+    },
+    {
+      "id": "gpt-5.3-codex",
+      "provider": "OpenAI",
+      "contextWindow": 400000,
+      "maxOutput": 128000,
+      "reasoning": true,
+      "addedAt": "2026-06-14"
+    },
+    {
+      "id": "gpt-5.5-pro",
+      "provider": "OpenAI",
+      "contextWindow": null,
+      "maxOutput": null,
+      "reasoning": false,
+      "addedAt": "2026-06-14"
+    },
+    {
+      "id": "glm-5.2",
+      "provider": "Z.ai",
+      "contextWindow": 1000000,
+      "maxOutput": 131072,
+      "reasoning": true,
+      "addedAt": "2026-06-12"
+    },
+    {
+      "id": "kimi-k2.7-code",
+      "provider": "Moonshot/Kimi",
+      "contextWindow": 262144,
+      "maxOutput": 32768,
+      "reasoning": true,
+      "addedAt": "2026-06-12"
+    },
+    {
+      "id": "minimax-m2.7",
+      "provider": "MiniMax",
+      "contextWindow": 204800,
+      "maxOutput": 131072,
+      "reasoning": true,
+      "addedAt": "2026-06-12"
+    },
+    {
+      "id": "minimax-m3",
+      "provider": "MiniMax",
+      "contextWindow": 1000000,
+      "maxOutput": 524288,
+      "reasoning": true,
+      "addedAt": "2026-06-12"
+    },
+    {
+      "id": "step-3.7-flash",
+      "provider": null,
+      "contextWindow": 256000,
+      "maxOutput": 256000,
+      "reasoning": false,
+      "addedAt": "2026-06-12"
+    },
+    {
+      "id": "claude-sonnet-4-6",
+      "provider": "Anthropic",
+      "contextWindow": 1000000,
+      "maxOutput": 128000,
+      "reasoning": true,
+      "addedAt": "2026-06-11"
+    },
+    {
+      "id": "gpt-5.5",
+      "provider": "OpenAI",
+      "contextWindow": null,
+      "maxOutput": null,
+      "reasoning": false,
+      "addedAt": "2026-06-08"
+    },
+    {
+      "id": "qwen3.6-flash",
+      "provider": "Qwen",
+      "contextWindow": 1000000,
+      "maxOutput": 65536,
+      "reasoning": true,
+      "addedAt": "2026-06-02"
+    },
+    {
+      "id": "qwen3.6-plus",
+      "provider": "Qwen",
+      "contextWindow": null,
+      "maxOutput": null,
+      "reasoning": true,
+      "addedAt": "2026-06-02"
+    },
+    {
+      "id": "trinity-mini",
+      "provider": "Arcee",
+      "contextWindow": 128000,
+      "maxOutput": null,
+      "reasoning": true,
+      "addedAt": "2026-06-02"
+    },
+    {
+      "id": "glm-5.1",
+      "provider": "Z.ai",
+      "contextWindow": null,
+      "maxOutput": null,
+      "reasoning": false,
+      "addedAt": "2026-05-31"
+    },
+    {
+      "id": "qwen3.6-35b-a3b",
+      "provider": "Qwen",
+      "contextWindow": null,
+      "maxOutput": null,
+      "reasoning": false,
+      "addedAt": "2026-05-31"
+    },
+    {
+      "id": "qwen3.7-max",
+      "provider": "Qwen",
+      "contextWindow": null,
+      "maxOutput": null,
+      "reasoning": true,
+      "addedAt": "2026-05-31"
+    },
+    {
+      "id": "trinity-large-thinking",
+      "provider": "Arcee",
+      "contextWindow": 262144,
+      "maxOutput": 262144,
+      "reasoning": true,
+      "addedAt": "2026-05-31"
+    },
+    {
+      "id": "mimo-v2.5",
+      "provider": "Xiaomi MiMo",
+      "contextWindow": 1000000,
+      "maxOutput": 131072,
+      "reasoning": true,
+      "addedAt": "2026-05-30"
+    },
+    {
+      "id": "mimo-v2.5-pro",
+      "provider": "Xiaomi MiMo",
+      "contextWindow": 1000000,
+      "maxOutput": 131072,
+      "reasoning": true,
+      "addedAt": "2026-05-30"
+    },
+    {
+      "id": "kimi-for-coding",
+      "provider": "Moonshot/Kimi",
+      "contextWindow": null,
+      "maxOutput": null,
+      "reasoning": true,
+      "addedAt": "2026-05-25"
+    },
+    {
+      "id": "kimi-k2.6",
+      "provider": "Moonshot/Kimi",
+      "contextWindow": null,
+      "maxOutput": null,
+      "reasoning": true,
+      "addedAt": "2026-05-25"
+    },
+    {
+      "id": "deepseek-coder:1.3b",
+      "provider": "DeepSeek",
+      "contextWindow": null,
+      "maxOutput": null,
+      "reasoning": false,
+      "addedAt": "2026-05-06"
+    },
+    {
+      "id": "deepseek-v4-flash",
+      "provider": "DeepSeek",
+      "contextWindow": 1000000,
+      "maxOutput": 384000,
+      "reasoning": true,
+      "addedAt": "2026-04-23"
+    },
+    {
+      "id": "deepseek-v4-pro",
+      "provider": "DeepSeek",
+      "contextWindow": 1000000,
+      "maxOutput": 384000,
+      "reasoning": true,
+      "addedAt": "2026-04-23"
+    },
+    {
+      "id": "deepseek-reasoner",
+      "provider": "DeepSeek",
+      "contextWindow": null,
+      "maxOutput": null,
+      "reasoning": false,
+      "addedAt": "2026-03-02"
+    }
+  ],
   "defaultModel": "deepseek-flash",
   "nodeEngines": ">=18",
-  "toolCount": 76,
+  "toolCount": 78,
   "license": "MIT",
   "latestPublishedRelease": {
     "tag": "v0.9.13",

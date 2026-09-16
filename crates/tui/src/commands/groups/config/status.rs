@@ -115,6 +115,9 @@ fn format_status(app: &App) -> String {
             &[("{count}", &app.mcp_configured_count.to_string())],
         ),
     );
+    if let Some(drift) = fleet_drift_summary(app, locale) {
+        push_row(&mut out, locale, MessageId::StatusLabelFleet, &drift);
+    }
     if let Some(notice) = crate::core::turn::snapshots_disabled_status(
         &app.workspace,
         app.current_session_id.as_deref(),
@@ -339,6 +342,56 @@ fn session_tokens(app: &App) -> String {
 fn push_row(out: &mut String, locale: Locale, label: MessageId, value: &str) {
     let label = format!("{}:", tr(locale, label));
     let _ = writeln!(out, "  {label:<LABEL_WIDTH$} {value}");
+}
+
+/// Selected-Fleet pin drift: saved `(provider, model)` pairs that are no
+/// longer among the routes the Fleet picker can offer — the provider table
+/// was removed, or the model dropped out of the provider's roster. A pin may
+/// still serve upstream, so this reports and never rewrites. `None` when no
+/// Fleet is selected or nothing drifted.
+fn fleet_drift_summary(app: &App, locale: Locale) -> Option<String> {
+    let selected = crate::fleet::store::selected_fleet(&app.workspace)?;
+    let (fleet, _scope) = crate::fleet::store::load_fleet_at(&selected.path).ok()?;
+    let config =
+        crate::config::Config::load(app.config_path.clone(), app.config_profile.as_deref()).ok()?;
+    let active = config
+        .provider
+        .as_deref()
+        .and_then(crate::config::ApiProvider::parse)
+        .unwrap_or(crate::config::ApiProvider::Deepseek);
+    let health = crate::provider_readiness::ProviderReadinessSnapshot::default();
+    let routes =
+        crate::tui::views::fleet_setup::cross_provider_model_routes(&config, active, &health);
+    let offered = |provider: &str, model: &str| {
+        routes
+            .iter()
+            .any(|(p, m, _)| p.eq_ignore_ascii_case(provider) && m.eq_ignore_ascii_case(model))
+    };
+    let mut drifted: Vec<String> = Vec::new();
+    if let Some(operator) = &fleet.operator
+        && !offered(&operator.provider, &operator.model)
+    {
+        drifted.push("operator".to_string());
+    }
+    for member in &fleet.members {
+        if let (Some(provider), Some(model)) = (&member.provider, &member.model)
+            && !offered(provider, model)
+        {
+            drifted.push(member.id.clone());
+        }
+    }
+    if drifted.is_empty() {
+        return None;
+    }
+    Some(localized(
+        locale,
+        MessageId::StatusFleetDrifted,
+        &[
+            ("{fleet}", &fleet.name),
+            ("{count}", &drifted.len().to_string()),
+            ("{ids}", &drifted.join(", ")),
+        ],
+    ))
 }
 
 fn safety_summary(app: &App) -> Cow<'static, str> {

@@ -372,7 +372,7 @@ impl FleetSetupSnapshot {
 /// use their canonical id; named custom routes keep their table key so saved
 /// Fleet profiles can rebuild the same child client.
 /// Callers derive a human-readable label from it for UI text.
-pub(super) fn cross_provider_model_routes(
+pub(crate) fn cross_provider_model_routes(
     config: &Config,
     active: crate::config::ApiProvider,
     health: &crate::provider_readiness::ProviderReadinessSnapshot,

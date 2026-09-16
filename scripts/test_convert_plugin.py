@@ -65,8 +65,9 @@ class ConversionTests(unittest.TestCase):
         (path / "SKILL.md").write_text(text, encoding="utf-8")
         return path
 
-    def args(self, *, config=None, skills=(), dialect="opencode-v1", output=None, name="converted-demo", stdio_roots=()):
-        return argparse.Namespace(config=config, skill=list(skills), format=dialect,
+    def args(self, *, config=None, bundle=None, skills=(), dialect="opencode-v1", output=None,
+             name="converted-demo", stdio_roots=()):
+        return argparse.Namespace(config=config, bundle=bundle, skill=list(skills), format=dialect,
                                   output=output or self.fresh("output"), name=name, stdio_root=list(stdio_roots))
 
     def cli(self, args, *, env=None):
@@ -74,6 +75,8 @@ class ConversionTests(unittest.TestCase):
                    "--name", args.name, "--output", str(args.output)]
         if args.config:
             command += ["--config", str(args.config)]
+        if args.bundle:
+            command += ["--bundle", str(args.bundle)]
         for skill in args.skill:
             command += ["--skill", str(skill)]
         for root in args.stdio_root:
@@ -404,6 +407,125 @@ for await (const line of readline.createInterface({ input: process.stdin })) {
         patches = [{"insert": self.dsh()}, {"id": "docs-entry", "disabled": True,
                     "config": {"url": "https://replacement.example.invalid/mcp"}}]
         self.refuse(self.args(config=self.config(patches), dialect="dsh"))
+
+    def bundle(self, patch_text=None, manifest=None, patch_name="cordis.patch.yml"):
+        directory = self.fresh("dsh-bundle")
+        directory.mkdir()
+        package = {"name": "@demo/tools-dsh", "version": "1.2.3",
+                   "dsh": {"bundle": {"patch": f"./{patch_name}"}}, **(manifest or {})}
+        (directory / "package.json").write_text(json.dumps(package))
+        if patch_text is not None:
+            (directory / patch_name).write_text(patch_text)
+        return directory
+
+    def test_dsh_bundle_evaluates_patches_and_skips_foreign_rows(self):
+        bundle = self.bundle(yaml.safe_dump([
+            {"insert": [
+                {"id": "docs-entry", "name": "@deepseek-ai/dsh-mcp-client", "config": {
+                    "serverName": "docs", "transport": "streamable-http",
+                    "url": "https://docs.example.invalid/mcp", "toolCallTimeoutMs": 19000}},
+                {"id": "skin", "name": "@deepseek-ai/dsh-client-ui-theme", "config": {"hue": 4}},
+            ]},
+            {"id": "docs-entry", "disabled": True},
+            {"id": "ghost", "disabled": True},
+        ]))
+        args = self.args(bundle=bundle, dialect="dsh")
+        result = self.cli(args)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.servers(args.output)["docs"], {
+            "type": "streamable-http", "url": "https://docs.example.invalid/mcp",
+            "extensions": {"net.codewhale": {"disabled": True, "execute_timeout": 19}}})
+        receipt = (args.output / "CONVERSION.md").read_text()
+        self.assertIn("@demo/tools-dsh@1.2.3", receipt)
+        self.assertIn("skin", receipt)
+        self.assertIn("ghost", receipt)
+
+    def test_dsh_bundle_lowers_js_command_and_host_path_arg(self):
+        bundle = self.bundle()
+        server_dir = self.node_source()
+        patch = ("- insert:\n  - id: local-entry\n    name: '@deepseek-ai/dsh-mcp-client'\n"
+                 "    config:\n      serverName: localdocs\n      transport: stdio\n"
+                 "      command: !!js process.execPath\n"
+                 "      args:\n        - !!js process.env.CONVERT_TEST_UNSET_ENTRY_7391 || '"
+                 + str(server_dir / "server.mjs") + "'\n")
+        (bundle / "cordis.patch.yml").write_text(patch)
+        args = self.args(bundle=bundle, dialect="dsh")
+        result = self.cli(args)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.servers(args.output)["localdocs"], {
+            "type": "stdio", "command": "node", "args": ["server.mjs"], "cwd": "mcp/localdocs",
+            "env": {}, "extensions": {"net.codewhale": {}}})
+        self.assertEqual((args.output / "mcp/localdocs/server.mjs").read_bytes(),
+                         (server_dir / "server.mjs").read_bytes())
+
+    def test_dsh_bundle_relative_entry_and_group_children_convert(self):
+        bundle = self.bundle()
+        (bundle / "mcp").mkdir()
+        (bundle / "mcp" / "server.mjs").write_text("// fixture\n")
+        patch = yaml.safe_dump([
+            {"insert": [{"id": "grouped", "group": True, "config": []}]},
+            {"id": "grouped", "insert": [
+                {"id": "in-group", "name": "@deepseek-ai/dsh-mcp-client", "config": {
+                    "serverName": "inner", "transport": "stdio", "command": "node",
+                    "args": ["server.mjs"], "cwd": "mcp"}}]},
+        ])
+        (bundle / "cordis.patch.yml").write_text(patch)
+        args = self.args(bundle=bundle, dialect="dsh")
+        result = self.cli(args)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.servers(args.output)["inner"]["cwd"], "mcp/inner")
+        self.assertTrue((args.output / "mcp/inner/server.mjs").is_file())
+
+    def test_dsh_bundle_imports_custom_skill_dirs(self):
+        bundle = self.bundle()
+        skill = bundle / "pack-skills" / "guide"
+        skill.mkdir(parents=True)
+        (skill / "SKILL.md").write_text("---\nname: guide\ndescription: Bundled skill\n---\nBody.\n")
+        patch = yaml.safe_dump([
+            {"insert": [
+                {"id": "skills-row", "name": "@deepseek-ai/dsh-skill-filesystem",
+                 "config": {"customSkillDirs": ["pack-skills"]}},
+                {"id": "mcp", "name": "@deepseek-ai/dsh-mcp-client", "config": {
+                    "serverName": "docs", "transport": "streamable-http",
+                    "url": "https://docs.example.invalid/mcp"}},
+            ]},
+        ])
+        (bundle / "cordis.patch.yml").write_text(patch)
+        args = self.args(bundle=bundle, dialect="dsh")
+        self.assertEqual(converter.convert(args), (1, 1, 0))
+        self.assertTrue((args.output / "skills/guide/SKILL.md").is_file())
+
+    def test_dsh_bundle_never_executes_js_and_records_unlowerable_rows(self):
+        sentinel = self.root / "expression-ran"
+        bundle = self.bundle()
+        patch = ("- insert:\n  - id: bad\n    name: '@deepseek-ai/dsh-mcp-client'\n"
+                 "    config:\n      serverName: bad\n      transport: streamable-http\n"
+                 "      url: !!js require('node:fs').writeFileSync('" + str(sentinel) + "', 'ran')\n"
+                 "  - id: ok\n    name: '@deepseek-ai/dsh-mcp-client'\n"
+                 "    config:\n      serverName: ok\n      transport: streamable-http\n"
+                 "      url: https://ok.example.invalid/mcp\n")
+        (bundle / "cordis.patch.yml").write_text(patch)
+        args = self.args(bundle=bundle, dialect="dsh")
+        result = self.cli(args)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(sentinel.exists())
+        self.assertEqual(sorted(self.servers(args.output)), ["ok"])
+        self.assertIn("bad", (args.output / "CONVERSION.md").read_text())
+
+    def test_dsh_bundle_requires_manifest_patch_inside_package(self):
+        bundle = self.bundle()
+        self.refuse(self.args(bundle=bundle, dialect="dsh"), message="patch")
+        escaping = self.bundle(manifest={"dsh": {"bundle": {"patch": "../outside.yml"}}})
+        self.refuse(self.args(bundle=escaping, dialect="dsh"))
+        plain = self.fresh("not-a-bundle")
+        plain.mkdir()
+        (plain / "package.json").write_text(json.dumps({"name": "plain"}))
+        self.refuse(self.args(bundle=plain, dialect="dsh"), message="dsh.bundle.patch")
+        self.refuse(self.args(bundle=self.bundle(), dialect="opencode-v1"), message="--format dsh")
+        combined = self.bundle()
+        (combined / "cordis.patch.yml").write_text("[]")
+        self.refuse(self.args(bundle=combined, config=self.config(self.dsh()), dialect="dsh"),
+                    message="not both")
 
     def test_cli_literal_credentials_and_interpolation_never_echo_or_publish(self):
         secret_file = self.write(CANARY, ".txt")

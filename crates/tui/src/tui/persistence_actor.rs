@@ -21,9 +21,13 @@
 //!   never coalesce into (or clear) each other's slot.
 //! - **Durability reporting**: `FlushAndReport` returns accumulated results;
 //!   cycles without a listener log failures instead of discarding them.
-//! - **Unbounded channel** for `try_send` to always succeed. Queued snapshots
-//!   retain only the canonical journal; legacy `messages` are derived at the
-//!   disk boundary instead of doubling every paused request.
+//! - **Bounded command channel with sender-side coalescing** (#6212):
+//!   `try_send` absorbs each request into a shared latest-wins state at send
+//!   time and wakes the actor through a small bounded channel, so a paused
+//!   consumer retains one snapshot per session instead of one per send.
+//!   Queued snapshots retain only the canonical journal; legacy `messages`
+//!   are derived at the disk boundary instead of doubling every paused
+//!   request.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, OnceLock};
@@ -118,16 +122,88 @@ enum PendingOfflineQueue {
 // Handle (held by the TUI)
 // ---------------------------------------------------------------------------
 
-type PersistRequestSender = mpsc::UnboundedSender<PersistRequest>;
-type PersistRequestReceiver = mpsc::UnboundedReceiver<PersistRequest>;
+/// Control commands the actor reacts to. Work itself never crosses the
+/// channel: requests are coalesced into the shared [`PendingState`] at send
+/// time, so a paused consumer retains at most the latest request per session
+/// instead of every snapshot ever sent (#6212).
+enum ActorCommand {
+    /// The shared pending state has work the actor has not taken yet.
+    WorkReady,
+    FlushAndReport {
+        reply: oneshot::Sender<FlushReport>,
+    },
+    Shutdown,
+}
+
+/// Command-channel capacity. `WorkReady` is deduplicated by the `notified`
+/// flag, so only `FlushAndReport`/`Shutdown` can occupy slots unplanned; the
+/// capacity exists so those never observe a full channel in practice.
+const ACTOR_COMMAND_CAPACITY: usize = 8;
+
+/// The coalescing state shared between senders and the actor. Senders absorb
+/// under the lock; the actor `take`s (swap to empty) under the same lock and
+/// flushes outside it, so disk I/O never blocks a sender.
+#[derive(Debug, Default)]
+struct SharedPending {
+    pending: PendingState,
+    /// Whether a `WorkReady` is already queued (or being queued) and no
+    /// `take_pending` has observed it since. Reset only by `take_pending` —
+    /// the receiver side — so the flag always reflects the channel the actor
+    /// drains.
+    notified: bool,
+}
+
+#[derive(Clone)]
+struct PersistRequestSender {
+    shared: Arc<std::sync::Mutex<SharedPending>>,
+    cmd_tx: mpsc::Sender<ActorCommand>,
+}
+
+impl std::fmt::Debug for PersistRequestSender {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PersistRequestSender")
+            .finish_non_exhaustive()
+    }
+}
+
+struct PersistRequestReceiver {
+    shared: Arc<std::sync::Mutex<SharedPending>>,
+    cmd_rx: mpsc::Receiver<ActorCommand>,
+}
 
 /// Single construction seam for the production persistence request channel.
 ///
 /// The ignored backlog measurement uses this same factory with the receiver
-/// deliberately paused, so a later bounded-channel change cannot leave the
-/// baseline measuring an obsolete representation.
+/// deliberately paused, so the measurement always characterizes whatever
+/// representation the seam actually retains.
 fn persistence_request_channel() -> (PersistRequestSender, PersistRequestReceiver) {
-    mpsc::unbounded_channel()
+    let (cmd_tx, cmd_rx) = mpsc::channel(ACTOR_COMMAND_CAPACITY);
+    let shared = Arc::new(std::sync::Mutex::new(SharedPending::default()));
+    (
+        PersistRequestSender {
+            shared: Arc::clone(&shared),
+            cmd_tx,
+        },
+        PersistRequestReceiver { shared, cmd_rx },
+    )
+}
+
+impl PersistRequestReceiver {
+    /// Await the next actor command. `None` means every sender is gone.
+    async fn recv(&mut self) -> Option<ActorCommand> {
+        self.cmd_rx.recv().await
+    }
+
+    /// Atomically take everything coalesced so far. Resets the `notified`
+    /// flag so the next absorbed request queues a fresh `WorkReady`.
+    fn take_pending(&mut self) -> PendingState {
+        let mut guard = self
+            .shared
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.notified = false;
+        std::mem::take(&mut guard.pending)
+    }
 }
 
 /// Lightweight handle that the UI holds to queue persistence work.
@@ -137,8 +213,10 @@ pub struct PersistActorHandle {
 }
 
 impl PersistActorHandle {
-    /// Queue a persistence request without blocking. If the actor's channel is
-    /// closed (shutdown has already happened), return `false`.
+    /// Queue a persistence request without blocking. The request is
+    /// coalesced into the shared pending state immediately (latest-wins per
+    /// session), so repeated snapshots of one session retain only the
+    /// newest. Returns `false` when the actor is already shut down.
     pub fn try_send(&self, mut request: PersistRequest) -> bool {
         match &mut request {
             PersistRequest::SaveCheckpoint { session }
@@ -148,7 +226,52 @@ impl PersistActorHandle {
             }
             _ => {}
         }
-        self.tx.send(request).is_ok()
+        let control = {
+            let mut guard = self
+                .tx
+                .shared
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            guard.pending.absorb(request)
+        };
+        match control {
+            Control::Continue => {
+                // A WorkReady the actor has not taken yet is already queued;
+                // that take will observe this request too. `notified` resets
+                // only when the actor takes, so it always mirrors the
+                // channel the actor drains.
+                {
+                    let mut guard = self
+                        .tx
+                        .shared
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    if guard.notified {
+                        return true;
+                    }
+                    guard.notified = true;
+                }
+                if self.tx.cmd_tx.try_send(ActorCommand::WorkReady).is_ok() {
+                    true
+                } else {
+                    // Roll the flag back so later sends re-attempt (and
+                    // re-fail) honestly instead of riding a dead wake.
+                    let mut guard = self
+                        .tx
+                        .shared
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    guard.notified = false;
+                    false
+                }
+            }
+            Control::Flush(reply) => self
+                .tx
+                .cmd_tx
+                .try_send(ActorCommand::FlushAndReport { reply })
+                .is_ok(),
+            Control::Shutdown => self.tx.cmd_tx.try_send(ActorCommand::Shutdown).is_ok(),
+        }
     }
 }
 
@@ -226,9 +349,6 @@ pub fn spawn_persistence_actor(
         "persistence-actor",
         std::panic::Location::caller(),
         async move {
-            let mut pending = PendingState::default();
-            // Durability results from write cycles that no caller has asked
-            // about yet; drained into the next `FlushAndReport` reply.
             let mut unreported = FlushReport::default();
 
             // Flush pending work, log new failures, and fold the cycle's
@@ -243,45 +363,31 @@ pub fn spawn_persistence_actor(
                 unreported.merge(cycle);
             }
 
-            loop {
-                // Drain everything waiting, keeping only the latest of each kind.
-                while let Ok(req) = rx.try_recv() {
-                    match pending.absorb(req) {
-                        Control::Continue => {}
-                        Control::Flush(reply) => {
+            // Work is coalesced at send time into the shared pending state;
+            // every command handler takes whatever has accumulated and
+            // flushes it outside the sender lock.
+            while let Some(command) = rx.recv().await {
+                let mut pending = rx.take_pending();
+                match command {
+                    ActorCommand::WorkReady => {
+                        if !pending.is_empty() {
                             flush_cycle(&manager, &mut pending, &mut unreported);
-                            let _ = reply.send(std::mem::take(&mut unreported));
-                        }
-                        Control::Shutdown => {
-                            flush_cycle(&manager, &mut pending, &mut unreported);
-                            return;
                         }
                     }
-                }
-
-                // Write coalesced work.
-                flush_cycle(&manager, &mut pending, &mut unreported);
-
-                // Block until the next request arrives.
-                match rx.recv().await {
-                    Some(req) => match pending.absorb(req) {
-                        Control::Continue => {}
-                        Control::Flush(reply) => {
-                            flush_cycle(&manager, &mut pending, &mut unreported);
-                            let _ = reply.send(std::mem::take(&mut unreported));
-                        }
-                        Control::Shutdown => {
-                            flush_cycle(&manager, &mut pending, &mut unreported);
-                            return;
-                        }
-                    },
-                    None => {
-                        // Channel closed — final flush and exit.
+                    ActorCommand::FlushAndReport { reply } => {
+                        flush_cycle(&manager, &mut pending, &mut unreported);
+                        let _ = reply.send(std::mem::take(&mut unreported));
+                    }
+                    ActorCommand::Shutdown => {
                         flush_cycle(&manager, &mut pending, &mut unreported);
                         return;
                     }
                 }
             }
+            // Every sender is gone — final flush and exit. Each absorb
+            // guarantees a queued WorkReady, so this is normally empty.
+            let mut pending = rx.take_pending();
+            flush_cycle(&manager, &mut pending, &mut unreported);
         },
     );
 
@@ -324,6 +430,16 @@ enum Control {
 }
 
 impl PendingState {
+    /// True when nothing coalesced is waiting. An empty `WorkReady` take is
+    /// skipped instead of running a no-op flush cycle.
+    fn is_empty(&self) -> bool {
+        self.checkpoints.is_empty()
+            && self.checkpoint_clears.is_empty()
+            && self.sessions.is_empty()
+            && self.completed_commits.is_empty()
+            && self.offline_queue.is_empty()
+    }
+
     fn absorb(&mut self, req: PersistRequest) -> Control {
         match req {
             PersistRequest::SaveCheckpoint { session } => {
@@ -422,11 +538,11 @@ fn flush_inner(manager: &SessionManager, pending: &mut PendingState) -> FlushRep
     for (session_id, session) in std::mem::take(&mut pending.sessions) {
         record(
             format!("session:{session_id}"),
-            manager.save_session(&session).map(|_| ()),
+            manager.save_session_owned(session).map(|_| ()),
         );
     }
     for (session_id, session) in std::mem::take(&mut pending.completed_commits) {
-        let commit_result = manager.save_session(&session);
+        let commit_result = manager.save_session_owned(session);
         let save_succeeded = commit_result.is_ok();
         record(
             format!("completed-commit:{session_id}"),
@@ -451,7 +567,7 @@ fn flush_inner(manager: &SessionManager, pending: &mut PendingState) -> FlushRep
     for (session_id, session) in std::mem::take(&mut pending.checkpoints) {
         record(
             format!("checkpoint:{session_id}"),
-            manager.save_checkpoint(&session).map(|_| ()),
+            manager.save_checkpoint_owned(session).map(|_| ()),
         );
     }
     for (_, request) in std::mem::take(&mut pending.offline_queue) {

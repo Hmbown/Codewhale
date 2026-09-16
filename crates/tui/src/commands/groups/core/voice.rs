@@ -108,6 +108,12 @@ struct Recorder {
 }
 
 fn detect_recorder() -> Option<Recorder> {
+    // Operator kill-switch: a headless `serve --http` host has no business
+    // opening a microphone; disabling voice here makes `GET /v1/voice`
+    // report `available: false` and every dictate call fail closed.
+    if std::env::var_os("CODEWHALE_DISABLE_VOICE").is_some() {
+        return None;
+    }
     let candidates: &[Recorder] = if cfg!(target_os = "macos") {
         &[
             Recorder {
@@ -194,7 +200,7 @@ fn encode_wav(samples: &[i16]) -> Vec<u8> {
 // --- Recording -------------------------------------------------------------
 
 /// Maximum recording duration in seconds before auto-stopping.
-const MAX_RECORD_SECS: u64 = 10;
+pub const MAX_RECORD_SECS: u64 = 10;
 /// Minimum segment duration in seconds to consider as valid speech.
 const MIN_SEGMENT_SECS: f64 = 0.3;
 
@@ -284,6 +290,10 @@ fn record_audio() -> Option<(Vec<i16>, Duration)> {
 }
 
 // --- Auto-send suffix ------------------------------------------------------
+
+/// Trailing phrases that mean "submit this" — the human-readable form of
+/// `SEND_SUFFIX_RE`; keep in sync with the regex when either changes.
+pub const SEND_PHRASES: &[&str] = &["send it", "发送", "發送"];
 
 /// Matches an explicit send instruction at the end of transcribed text:
 /// "send it" (any spacing/case) or 发送/發送, with trailing punctuation.
@@ -479,10 +489,20 @@ fn detect_free_asr() -> &'static str {
 }
 
 /// Transcribe via local whisper.cpp (free, offline, cross-platform).
+///
+/// The whole body is synchronous — temp-file I/O plus `Command::output()`,
+/// which blocks for the entire subprocess run — so it runs on the blocking
+/// pool rather than a Tokio worker (blocking-call convention, #6149).
 async fn transcribe_local_whisper(audio_samples: &[i16]) -> Result<String, String> {
     let wav = encode_wav(audio_samples);
+    tokio::task::spawn_blocking(move || transcribe_local_whisper_blocking(&wav))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+fn transcribe_local_whisper_blocking(wav: &[u8]) -> Result<String, String> {
     let tmp = std::env::temp_dir().join(format!("cw-voice-{}.wav", std::process::id()));
-    std::fs::write(&tmp, &wav).map_err(|e| e.to_string())?;
+    std::fs::write(&tmp, wav).map_err(|e| e.to_string())?;
     // Try each local binary until one succeeds; whisper.cpp outputs to stdout or file.
     for bin in LOCAL_WHISPER_BINS {
         let output = Command::new(bin)
@@ -729,6 +749,179 @@ pub async fn capture_and_transcribe(
         return Err(tr(locale, MessageId::VoiceErrEmptySend).to_string());
     }
     Ok(VoiceCaptureOutcome::Insert(clean.to_string()))
+}
+
+// --- Headless capture (HTTP/native-client path) ----------------------------
+
+/// What a headless dictation should do with the finished transcript.
+#[derive(Debug, Clone)]
+pub enum DictateMode {
+    /// Transcribe and return the text for insertion into the composer.
+    Insert,
+    /// Transcribe, then apply the "send it" / 发送 suffix contract. The
+    /// outcome's `send` flag tells the client to submit; a bare send
+    /// instruction yields empty `text` so the client submits its own draft.
+    Send,
+    /// AI-assisted dictation that sees the client's composer text — the
+    /// `/voice-control` pipeline. Only provider ASR can see context; free
+    /// ASR kinds degrade to plain transcription with `assisted: false`.
+    Control(String),
+}
+
+/// Machine-readable failure for the headless path so HTTP clients can
+/// localize by `reason` rather than parsing message text.
+#[derive(Debug)]
+pub enum DictateError {
+    /// No supported recorder binary on this host.
+    NoRecorder,
+    /// Recording produced no usable speech segment.
+    NoSpeech,
+    /// The selected/fallback ASR needs a provider key that isn't configured.
+    NoProviderAuth,
+    /// ASR request or transcription failed.
+    Transcription(String),
+}
+
+impl DictateError {
+    pub fn reason(&self) -> &'static str {
+        match self {
+            Self::NoRecorder => "no_recorder",
+            Self::NoSpeech => "no_speech",
+            Self::NoProviderAuth => "no_provider_auth",
+            Self::Transcription(_) => "transcription_failed",
+        }
+    }
+}
+
+impl std::fmt::Display for DictateError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoRecorder => write!(f, "no supported voice recorder on this host"),
+            Self::NoSpeech => write!(f, "no speech detected"),
+            Self::NoProviderAuth => {
+                write!(f, "provider ASR requires a configured API key")
+            }
+            Self::Transcription(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+/// Result of one headless record→transcribe cycle.
+#[derive(Debug)]
+pub struct DictationOutcome {
+    /// Final transcript (send suffix already stripped for `Send` mode).
+    pub text: String,
+    /// `Send` mode only: the transcript ended with an explicit send phrase.
+    pub send: bool,
+    /// `Control` mode only: the composer context reached the model. False
+    /// when a free ASR kind handled the audio and never saw the context.
+    pub assisted: bool,
+    /// Which ASR backend was selected for this capture.
+    pub asr_kind: String,
+    pub asr_model: String,
+}
+
+/// Detected recorder binary name, if any (`"sox"`, `"arecord"`, `"rec"`).
+pub fn recorder_command() -> Option<&'static str> {
+    detect_recorder().map(|r| r.cmd)
+}
+
+/// Resolved ASR selection (`kind`, `model`) for capability reporting.
+pub fn asr_choice(config: &Config) -> (String, String) {
+    resolve_asr_choice(config)
+}
+
+/// One record→transcribe cycle with no UI surface: the HTTP/native-client
+/// equivalent of [`capture_and_transcribe`]. Recording runs on a blocking
+/// thread; transcription follows the same ASR dispatch as the TUI —
+/// explicit `CODEWHALE_ASR_MODEL` > local whisper > Groq > provider —
+/// but resolves the provider key lazily so free ASR kinds work without
+/// provider auth.
+pub async fn dictate_once(
+    config: &Config,
+    mode: DictateMode,
+) -> Result<DictationOutcome, DictateError> {
+    if !is_available() {
+        return Err(DictateError::NoRecorder);
+    }
+    let (samples, _duration) = tokio::task::spawn_blocking(record_audio)
+        .await
+        .ok()
+        .flatten()
+        .ok_or(DictateError::NoSpeech)?;
+
+    let (asr_kind, asr_model) = resolve_asr_choice(config);
+    let base_url = config.deepseek_base_url();
+    let openrouter_vendor = config
+        .openrouter_vendor()
+        .map_err(|e| DictateError::Transcription(e.to_string()))?;
+    let provider_key = || {
+        config
+            .deepseek_api_key()
+            .map_err(|_| DictateError::NoProviderAuth)
+    };
+
+    let mut assisted = false;
+    let text = match asr_kind.as_str() {
+        "local-whisper" => match transcribe_local_whisper(&samples).await {
+            Ok(v) => v,
+            Err(_) => transcribe(
+                &provider_key()?,
+                &base_url,
+                &samples,
+                openrouter_vendor.as_deref(),
+            )
+            .await
+            .map_err(DictateError::Transcription)?,
+        },
+        "groq" => match transcribe_groq(&samples).await {
+            Ok(v) => v,
+            Err(_) => transcribe(
+                &provider_key()?,
+                &base_url,
+                &samples,
+                openrouter_vendor.as_deref(),
+            )
+            .await
+            .map_err(DictateError::Transcription)?,
+        },
+        _ => {
+            let api_key = provider_key()?;
+            match &mode {
+                DictateMode::Control(composer) => {
+                    assisted = true;
+                    process_voice_control(
+                        &api_key,
+                        &base_url,
+                        &samples,
+                        composer,
+                        openrouter_vendor.as_deref(),
+                    )
+                    .await
+                    .map_err(DictateError::Transcription)?
+                }
+                _ => transcribe(&api_key, &base_url, &samples, openrouter_vendor.as_deref())
+                    .await
+                    .map_err(DictateError::Transcription)?,
+            }
+        }
+    };
+
+    let clean = text.trim().to_string();
+    let (text, send) = match mode {
+        DictateMode::Send => {
+            let (remainder, wants_send) = split_send_suffix(&clean);
+            (remainder.to_string(), wants_send)
+        }
+        _ => (clean, false),
+    };
+    Ok(DictationOutcome {
+        text,
+        send,
+        assisted,
+        asr_kind,
+        asr_model,
+    })
 }
 
 // --- Command handlers ------------------------------------------------------

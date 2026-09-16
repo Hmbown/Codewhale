@@ -7,7 +7,7 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use codewhale_models::{ContentBlock, Message};
 use ignore::WalkBuilder;
 use std::io;
@@ -797,12 +797,6 @@ where
             let _ = write_panic_dump(name, location, &msg);
         }
     })
-}
-
-#[allow(dead_code)]
-pub fn ensure_dir(path: &Path) -> Result<()> {
-    fs::create_dir_all(path)
-        .with_context(|| format!("Failed to create directory: {}", path.display()))
 }
 
 /// Truncate a string to a maximum length, adding an ellipsis if truncated.

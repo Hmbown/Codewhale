@@ -174,22 +174,6 @@ impl VerifierVerdict {
             Self::Pass
         }
     }
-
-    fn hunt_verdict(self) -> &'static str {
-        match self {
-            Self::Pass => "hunted",
-            Self::Partial => "wounded",
-            Self::Fail => "escaped",
-        }
-    }
-
-    fn goal_status(self) -> &'static str {
-        match self {
-            Self::Pass => "complete",
-            Self::Partial => "paused",
-            Self::Fail => "blocked",
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -203,8 +187,6 @@ struct RunVerifiersOutput {
     failed: usize,
     skipped: usize,
     verifier_verdict: VerifierVerdict,
-    hunt_verdict: String,
-    goal_status: String,
     summary: String,
     gates: Vec<GateResult>,
 }
@@ -359,8 +341,6 @@ impl ToolSpec for RunVerifiersTool {
                 failed: 0,
                 skipped: 0,
                 verifier_verdict,
-                hunt_verdict: verifier_verdict.hunt_verdict().to_string(),
-                goal_status: verifier_verdict.goal_status().to_string(),
                 summary: "No verifier gates were detected. Provide custom commands or choose a profile that matches this workspace.".to_string(),
                 gates: Vec::new(),
             };
@@ -428,8 +408,6 @@ impl ToolSpec for RunVerifiersTool {
             failed,
             skipped,
             verifier_verdict,
-            hunt_verdict: verifier_verdict.hunt_verdict().to_string(),
-            goal_status: verifier_verdict.goal_status().to_string(),
             summary,
             gates: results,
         };
@@ -525,11 +503,6 @@ fn verifier_tool_result(output: &RunVerifiersOutput) -> Result<ToolResult, ToolE
         .map(|result| {
             result.with_metadata(json!({
                 "verifier_verdict": output.verifier_verdict,
-                "hunt_verdict": output.hunt_verdict,
-                "goal_status": output.goal_status,
-                "task_updates": {
-                    "hunt_verdict": output.hunt_verdict
-                }
             }))
         })
 }
@@ -1421,7 +1394,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_verifiers_emits_hunt_verdict_mapping() {
+    async fn run_verifiers_emits_verdict_mapping() {
         let tmp = tempdir().expect("tempdir");
         let ctx = ToolContext::new(tmp.path());
         let tool = RunVerifiersTool;
@@ -1430,8 +1403,7 @@ mod tests {
             .execute(json!({"profile": "auto"}), &ctx)
             .await
             .expect("execute partial verifier");
-        assert_hunt_mapping(&partial.content, "partial", "wounded", "paused");
-        assert_hunt_metadata(&partial, "partial", "wounded", "paused");
+        assert_verdict(&partial, "partial");
 
         if !crate::dependencies::RustC::available() {
             return;
@@ -1453,8 +1425,7 @@ mod tests {
             )
             .await
             .expect("execute passing verifier");
-        assert_hunt_mapping(&pass.content, "pass", "hunted", "complete");
-        assert_hunt_metadata(&pass, "pass", "hunted", "complete");
+        assert_verdict(&pass, "pass");
 
         let fail = tool
             .execute(
@@ -1472,23 +1443,18 @@ mod tests {
             )
             .await
             .expect("execute failing verifier");
-        assert_hunt_mapping(&fail.content, "fail", "escaped", "blocked");
-        assert_hunt_metadata(&fail, "fail", "escaped", "blocked");
+        assert_verdict(&fail, "fail");
     }
 
-    fn assert_hunt_mapping(content: &str, verifier: &str, hunt: &str, goal: &str) {
-        let parsed: Value = serde_json::from_str(content).expect("verifier output json");
-        assert_eq!(parsed["verifier_verdict"], verifier, "{content}");
-        assert_eq!(parsed["hunt_verdict"], hunt, "{content}");
-        assert_eq!(parsed["goal_status"], goal, "{content}");
-    }
-
-    fn assert_hunt_metadata(result: &ToolResult, verifier: &str, hunt: &str, goal: &str) {
-        let metadata = result.metadata.as_ref().expect("hunt metadata");
+    fn assert_verdict(result: &ToolResult, verifier: &str) {
+        let parsed: Value = serde_json::from_str(&result.content).expect("verifier output json");
+        assert_eq!(parsed["verifier_verdict"], verifier, "{}", result.content);
+        assert!(parsed.get("hunt_verdict").is_none(), "{}", result.content);
+        assert!(parsed.get("goal_status").is_none(), "{}", result.content);
+        let metadata = result.metadata.as_ref().expect("verifier metadata");
         assert_eq!(metadata["verifier_verdict"], verifier, "{metadata}");
-        assert_eq!(metadata["hunt_verdict"], hunt, "{metadata}");
-        assert_eq!(metadata["goal_status"], goal, "{metadata}");
-        assert_eq!(metadata["task_updates"]["hunt_verdict"], hunt, "{metadata}");
+        assert!(metadata.get("hunt_verdict").is_none(), "{metadata}");
+        assert!(metadata.get("task_updates").is_none(), "{metadata}");
     }
 
     #[tokio::test]

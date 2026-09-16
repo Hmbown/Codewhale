@@ -21,6 +21,11 @@ pub(super) struct StreamableHttpTransport {
     /// request so the server can correlate messages within the same
     /// session.
     pub(super) session_id: Option<String>,
+    /// Protocol revision negotiated at `initialize`. Attached as the
+    /// `MCP-Protocol-Version` header on every subsequent outbound request
+    /// per the Streamable HTTP spec (absent means the server assumes
+    /// the 2025-03-26 default, so the negotiated value is always sent).
+    protocol_version: Option<String>,
 }
 
 #[derive(Debug)]
@@ -38,7 +43,12 @@ impl StreamableHttpTransport {
             auth,
             pending_messages: VecDeque::new(),
             session_id: None,
+            protocol_version: None,
         }
+    }
+
+    pub(super) fn set_protocol_version(&mut self, version: &str) {
+        self.protocol_version = Some(version.to_string());
     }
 
     pub(super) async fn send(
@@ -67,6 +77,11 @@ impl StreamableHttpTransport {
             // existing session.
             if let Some(ref sid) = self.session_id {
                 request = request.header("Mcp-Session-Id", sid.as_str());
+            }
+            // Per the Streamable HTTP spec, subsequent requests carry the
+            // negotiated revision; absent means the server assumes 2025-03-26.
+            if let Some(ref version) = self.protocol_version {
+                request = request.header("MCP-Protocol-Version", version.as_str());
             }
             let response = self
                 .client

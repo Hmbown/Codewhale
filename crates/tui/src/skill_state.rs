@@ -67,7 +67,7 @@ impl SkillStateStore {
         Ok(())
     }
 
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), expect(dead_code))]
     pub fn disabled(&self) -> Vec<String> {
         self.disabled.iter().cloned().collect()
     }

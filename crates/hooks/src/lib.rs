@@ -229,7 +229,7 @@ impl WebhookHookSink {
                 .unwrap_or_else(|_| {
                     codewhale_release::platform_http_client_builder()
                         .build()
-                        .unwrap_or_else(|_| reqwest::Client::new())
+                        .unwrap_or_else(|_| codewhale_release::tls::reqwest_client())
                 }),
         }
     }

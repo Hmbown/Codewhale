@@ -101,7 +101,7 @@ use ratatui::layout::Rect;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
-use crate::tui::app::{App, SidebarRowAction};
+use crate::tui::app::{App, SidebarRowAction, StatusToastLevel};
 use crate::tui::command_palette::{
     CommandPaletteView, build_entries as build_command_palette_entries,
 };
@@ -111,7 +111,8 @@ use crate::tui::scrolling::{ScrollDirection, TranscriptScroll};
 use crate::tui::selection::{SelectionAutoscroll, TranscriptSelectionPoint};
 use crate::tui::tideline::InteractionAction;
 use crate::tui::ui_text::{
-    history_cell_to_text, line_to_plain, slice_text, text_display_width, truncate_line_to_width,
+    history_cell_to_clipboard_text, history_cell_to_text, line_to_plain, slice_text,
+    text_display_width, truncate_line_to_width,
 };
 use crate::tui::views::{ContextMenuAction, HelpView, ModalKind, ViewEvent};
 use codewhale_localization::MessageId;
@@ -1600,7 +1601,11 @@ pub(crate) fn transcript_cell_index_from_mouse(app: &App, mouse: MouseEvent) -> 
         .map(|(cell_index, _)| cell_index)
 }
 
-pub(crate) fn handle_context_menu_action(app: &mut App, action: ContextMenuAction) {
+pub(crate) fn handle_context_menu_action(
+    terminal: &mut ratatui::Terminal<crate::tui::color_compat::ColorCompatBackend<std::io::Stdout>>,
+    app: &mut App,
+    action: ContextMenuAction,
+) {
     match action {
         ContextMenuAction::CopySelection => {
             copy_active_selection(app);
@@ -1677,10 +1682,33 @@ pub(crate) fn handle_context_menu_action(app: &mut App, action: ContextMenuActio
                     }),
                 width,
             );
-            if crate::tui::history::try_open_file_at_line(&text, &app.workspace) {
-                app.status_message = Some("Opened file in editor".to_string());
-            } else {
-                app.status_message = Some("No file:line pattern found in selection".to_string());
+            match crate::tui::history::first_file_line_reference(&text, &app.workspace) {
+                // The editor gets the terminal through the same suspend path
+                // the composer and `/hooks edit` use, one at a time, and we
+                // wait for it. It used to be spawned detached while the TUI
+                // still held raw mode, the alt screen and mouse capture (#6235).
+                Some((path, line)) => {
+                    let outcome = crate::tui::external_editor::spawn_editor_for_path(
+                        terminal,
+                        app.use_alt_screen(),
+                        app.use_mouse_capture,
+                        app.use_bracketed_paste,
+                        &path,
+                        Some(line),
+                    );
+                    app.needs_redraw = true;
+                    app.status_message = Some(match outcome {
+                        Ok(crate::tui::external_editor::EditorOutcome::Cancelled) => {
+                            format!("Editor exited without opening {}", path.display())
+                        }
+                        Ok(_) => format!("Closed editor for {}:{line}", path.display()),
+                        Err(error) => format!("Could not open the editor: {error}"),
+                    });
+                }
+                None => {
+                    app.status_message =
+                        Some("No file:line pattern found in selection".to_string());
+                }
             }
         }
         ContextMenuAction::HideCell { cell_index } => {
@@ -1819,9 +1847,31 @@ pub(crate) fn copy_active_selection(app: &mut App) {
     if !app.viewport.transcript_selection.is_active() {
         return;
     }
-    if let Some(text) = selection_to_text(app).filter(|text| !text.is_empty()) {
+    // Markdown source first (#6156): project every intersected cell through
+    // the canonical clean-copy path. Falls back to rendered text when the
+    // `[tui] selection_copy_markdown` key is off or no cell metadata
+    // intersects the range.
+    let payload = if app.viewport.selection_copy_markdown {
+        selection_to_markdown(app).map(|(text, cells)| (text, Some(cells)))
+    } else {
+        None
+    };
+    let payload = payload.or_else(|| {
+        selection_to_text(app)
+            .filter(|text| !text.is_empty())
+            .map(|text| (text, None))
+    });
+    if let Some((text, markdown_cells)) = payload {
         if app.clipboard.write_text(&text).is_ok() {
-            app.status_message = Some("Selection copied".to_string());
+            match markdown_cells {
+                Some(cells) => {
+                    let toast = app
+                        .tr(MessageId::SelectionCopiedAsMarkdown)
+                        .replace("{count}", &cells.to_string());
+                    app.push_status_toast(toast, StatusToastLevel::Info, None);
+                }
+                None => app.status_message = Some("Selection copied".to_string()),
+            }
         } else {
             app.status_message = Some("Copy failed".to_string());
         }
@@ -1829,6 +1879,62 @@ pub(crate) fn copy_active_selection(app: &mut App) {
         clear_transcript_selection(app);
         app.status_message = Some("No selection to copy".to_string());
     }
+}
+
+/// Project a transcript drag selection to Markdown source (#6156).
+///
+/// Collects every history cell intersecting the selection's rendered line
+/// range, in order, and serializes each through
+/// `history_cell_to_clipboard_text` — the same canonical projection Ctrl-Y
+/// and `/copy` use — joined with a blank line. Returns the payload plus the
+/// projected cell count for the toast. A selection that cuts a cell in half
+/// rounds out to the whole cell; the caller says so in the toast.
+///
+/// Returns `None` when no cell metadata intersects the range or every
+/// projection is blank; the caller falls back to [`selection_to_text`].
+pub(crate) fn selection_to_markdown(app: &App) -> Option<(String, usize)> {
+    let (start, end) = app.viewport.transcript_selection.ordered_endpoints()?;
+    let lines = app.viewport.transcript_cache.lines();
+    if lines.is_empty() {
+        return None;
+    }
+    let end_index = end.line_index.min(lines.len().saturating_sub(1));
+    let start_index = start.line_index.min(end_index);
+    let line_meta = app.viewport.transcript_cache.line_meta();
+    let width = app
+        .viewport
+        .last_transcript_area
+        .map(|area| area.width)
+        .unwrap_or(80);
+    let mut rendered = Vec::new();
+    for line_index in start_index..=end_index {
+        if let Some((cell_index, _)) = line_meta.get(line_index).and_then(|meta| meta.cell_line())
+            && !rendered.contains(&cell_index)
+        {
+            rendered.push(cell_index);
+        }
+    }
+    let mut seen_original = Vec::new();
+    let mut parts = Vec::new();
+    for rendered_index in rendered {
+        let original = app.original_cell_index_for_rendered(rendered_index);
+        if seen_original.contains(&original) {
+            continue;
+        }
+        seen_original.push(original);
+        let Some(cell) = app.cell_at_virtual_index(original) else {
+            continue;
+        };
+        let text = history_cell_to_clipboard_text(cell, width);
+        if !text.trim().is_empty() {
+            parts.push(text);
+        }
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    let count = parts.len();
+    Some((parts.join("\n\n"), count))
 }
 pub(crate) fn clear_transcript_selection(app: &mut App) {
     app.needs_redraw |= app.viewport.transcript_selection.is_active();

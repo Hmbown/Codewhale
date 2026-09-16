@@ -116,6 +116,17 @@ struct AppState {
     /// executes a turn — stdio `thread/message`, HTTP `/thread` messages, and
     /// both `/prompt` transports — because there is exactly one turn engine.
     runtime_bridge: Arc<Mutex<Option<SharedRuntimeBridge>>>,
+    /// Client-facing thread key → durable runtime thread id.
+    ///
+    /// Runtime threads are persisted by the child's on-disk store
+    /// (`RuntimeThreadStore` under the session/task data dir), so a mapping
+    /// stays valid across a bridge restart: the next child resolves the same
+    /// thread ids. Keeping this on `AppState` rather than `RuntimeBridge` is
+    /// the point — `invalidate_runtime_bridge` drops the child but must not
+    /// orphan live stdio threads onto silently minted replacements (#6246).
+    /// Callers already serialize on the bridge mutex, so the map needs no
+    /// ordering guarantees of its own.
+    runtime_thread_map: Arc<Mutex<HashMap<String, String>>>,
     stdio_thread_hints: Arc<Mutex<HashMap<String, RuntimeThreadHint>>>,
     /// Turns currently streaming over stdio, keyed by stdio thread id.
     ///
@@ -198,7 +209,10 @@ struct RuntimeBridge {
     client: reqwest::Client,
     auth_token: Option<String>,
     child: Option<Child>,
-    thread_map: HashMap<String, String>,
+    /// Per-child SSE replay cursors, keyed by *runtime* thread id. Event
+    /// sequence numbering is per child process, so this resets with the
+    /// bridge: a replacement child replays from seq 0 and the turn filter
+    /// in `stream_turn_events` drops everything but the live turn.
     last_seq_by_thread: HashMap<String, u64>,
 }
 
@@ -851,6 +865,7 @@ fn build_state_with_transport(
         registry,
         auth_token,
         runtime_bridge: Arc::new(Mutex::new(None)),
+        runtime_thread_map: Arc::new(Mutex::new(HashMap::new())),
         stdio_thread_hints: Arc::new(Mutex::new(HashMap::new())),
         in_flight_turns: Arc::new(Mutex::new(HashMap::new())),
     })
@@ -1183,6 +1198,7 @@ async fn run_bridged_turn<W: AsyncWrite + Unpin>(
     // access. The cache slot itself stays unlocked, so config updates and
     // bridge invalidation are never queued behind a streaming turn.
     let mut bridge = bridge.lock().await;
+    let mut thread_map = state.runtime_thread_map.lock().await;
     if turn.max_output_tokens.is_some() {
         let info = bridge
             .request_json(
@@ -1203,7 +1219,7 @@ async fn run_bridged_turn<W: AsyncWrite + Unpin>(
                 "Runtime does not support maxOutputTokens",
             ));
         }
-        if !bridge.thread_map.contains_key(turn.thread_key) {
+        if !thread_map.contains_key(turn.thread_key) {
             bridge
                 .require_output_limited_model(hint.as_ref().and_then(|hint| hint.model.as_deref()))
                 .await
@@ -1211,9 +1227,12 @@ async fn run_bridged_turn<W: AsyncWrite + Unpin>(
         }
     }
     let runtime_thread_id = bridge
-        .ensure_runtime_thread(turn.thread_key, hint)
+        .ensure_runtime_thread(&mut thread_map, turn.thread_key, hint)
         .await
         .map_err(|err| JsonRpcError::runtime_unavailable(err.to_string()))?;
+    // The mapping is settled for this turn; drop the guard so a long stream
+    // never holds the map hostage. `forget_thread` re-locks below.
+    drop(thread_map);
     let registration = turn
         .interruptible
         .then(|| (state.in_flight_turns.clone(), turn.thread_key.to_string()));
@@ -1229,9 +1248,11 @@ async fn run_bridged_turn<W: AsyncWrite + Unpin>(
         )
         .await;
     if turn.ephemeral {
-        // Drop the mapping while we still hold the lock, so a long-lived
-        // app-server does not accumulate one entry per one-shot prompt.
-        bridge.forget_thread(turn.thread_key);
+        // Drop the mapping while we still hold the bridge lock, so a
+        // long-lived app-server does not accumulate one entry per one-shot
+        // prompt.
+        let mut thread_map = state.runtime_thread_map.lock().await;
+        bridge.forget_thread(&mut thread_map, turn.thread_key);
     }
     result.map_err(|err| JsonRpcError::internal(err.to_string()))
 }
@@ -1461,6 +1482,11 @@ async fn interrupt_stdio_turn(
 /// fresh child that re-reads the persisted config. An in-flight message
 /// keeps its own [`SharedRuntimeBridge`] clone and finishes against the old
 /// child, which is killed when the last clone drops.
+///
+/// The stdio→runtime thread map is deliberately *not* here: it lives on
+/// [`AppState::runtime_thread_map`] because runtime threads are durable —
+/// the fresh child resolves the same ids from its on-disk store (#6246).
+/// Only per-child state (`last_seq_by_thread`) dies with the bridge.
 async fn invalidate_runtime_bridge(state: &AppState) {
     let mut bridge = state.runtime_bridge.lock().await;
     *bridge = None;
@@ -1481,7 +1507,6 @@ impl RuntimeBridge {
                 .context("failed to build runtime API client")?,
             auth_token: Some(auth_token),
             child: Some(child),
-            thread_map: HashMap::new(),
             last_seq_by_thread: HashMap::new(),
         };
         bridge.wait_until_ready().await?;
@@ -1634,27 +1659,31 @@ impl RuntimeBridge {
         }
     }
 
+    /// Resolve `stdio_thread_id` to a runtime thread, minting one only when
+    /// `thread_map` has no entry. The map lives on [`AppState`] and outlives
+    /// this bridge, so a thread created under a previous child keeps its id
+    /// here as long as the store it was persisted to is shared (#6246).
     async fn ensure_runtime_thread(
         &mut self,
+        thread_map: &mut HashMap<String, String>,
         stdio_thread_id: &str,
         hint: Option<RuntimeThreadHint>,
     ) -> Result<String> {
-        if let Some(runtime_thread_id) = self.thread_map.get(stdio_thread_id) {
+        if let Some(runtime_thread_id) = thread_map.get(stdio_thread_id) {
             return Ok(runtime_thread_id.clone());
         }
         let hint = hint.unwrap_or_default();
         let runtime_thread_id = self
             .create_runtime_thread(hint.model, hint.workspace)
             .await?;
-        self.thread_map
-            .insert(stdio_thread_id.to_string(), runtime_thread_id.clone());
+        thread_map.insert(stdio_thread_id.to_string(), runtime_thread_id.clone());
         Ok(runtime_thread_id)
     }
 
     /// Drop a thread mapping (and its seq cursor) once no caller can name
     /// the client-facing key again.
-    fn forget_thread(&mut self, stdio_thread_id: &str) {
-        if let Some(runtime_thread_id) = self.thread_map.remove(stdio_thread_id) {
+    fn forget_thread(&mut self, thread_map: &mut HashMap<String, String>, stdio_thread_id: &str) {
+        if let Some(runtime_thread_id) = thread_map.remove(stdio_thread_id) {
             self.last_seq_by_thread.remove(&runtime_thread_id);
         }
     }
@@ -1931,7 +1960,6 @@ impl RuntimeBridge {
                 .expect("build reqwest test client"),
             auth_token: None,
             child: None,
-            thread_map: HashMap::new(),
             last_seq_by_thread: HashMap::new(),
         }
     }
@@ -2593,7 +2621,10 @@ async fn process_app_request(
 /// optionally persist it to disk, install it in the shared `state.config`,
 /// push it into the live [`Runtime`], and invalidate the cached stdio
 /// bridge so the next stdio request spawns a fresh child that reads the
-/// new on-disk config. Shared by `ConfigSet` / `ConfigUnset` / `ConfigReload`.
+/// new on-disk config. The stdio→runtime thread map survives: runtime
+/// threads are durable, so the fresh child adopts the existing mappings
+/// rather than minting replacements (#6246). Shared by `ConfigSet` /
+/// `ConfigUnset` / `ConfigReload`.
 ///
 /// `exec_policy` is `Some` only on the reload path, which re-reads
 /// `permissions.toml` from disk; set/unset intentionally leave the live
@@ -2965,10 +2996,9 @@ mod tests {
     fn sentinel_bridge() -> SharedRuntimeBridge {
         Arc::new(Mutex::new(RuntimeBridge {
             base_url: "http://127.0.0.1:0".to_string(),
-            client: reqwest::Client::new(),
+            client: codewhale_release::tls::reqwest_client(),
             auth_token: None,
             child: None,
-            thread_map: HashMap::from([("stdio-1".to_string(), "runtime-1".to_string())]),
             last_seq_by_thread: HashMap::new(),
         }))
     }
@@ -2990,6 +3020,11 @@ mod tests {
         fs::write(&config_path, "model = \"deepseek-chat\"\n").expect("write config");
         let state = build_state(Some(config_path.clone()), None).expect("state");
         *state.runtime_bridge.lock().await = Some(sentinel_bridge());
+        state
+            .runtime_thread_map
+            .lock()
+            .await
+            .insert("stdio-1".to_string(), "runtime-1".to_string());
 
         let response = process_app_request(
             &state,
@@ -3002,14 +3037,15 @@ mod tests {
         .await;
         assert!(!response.ok, "invalid value must fail: {response:?}");
 
-        let slot = state.runtime_bridge.lock().await;
-        let kept = slot
-            .as_ref()
-            .expect("bridge must survive a failed config/set");
+        assert!(
+            state.runtime_bridge.lock().await.is_some(),
+            "bridge must survive a failed config/set",
+        );
         assert_eq!(
-            kept.lock()
+            state
+                .runtime_thread_map
+                .lock()
                 .await
-                .thread_map
                 .get("stdio-1")
                 .map(String::as_str),
             Some("runtime-1"),
@@ -3042,6 +3078,125 @@ mod tests {
             state.runtime_bridge.lock().await.is_none(),
             "a successful config change must invalidate the cached bridge",
         );
+    }
+
+    /// A stub runtime that records which thread ids turns ran on and how
+    /// many threads it was asked to mint.
+    #[derive(Clone)]
+    struct RecordingRuntime {
+        created: Arc<std::sync::atomic::AtomicUsize>,
+        turn_threads: Arc<Mutex<Vec<String>>>,
+    }
+
+    async fn spawn_recording_runtime() -> (String, RecordingRuntime, tokio::task::JoinHandle<()>) {
+        async fn create_thread(State(f): State<RecordingRuntime>) -> Json<Value> {
+            f.created.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Json(json!({ "id": "thr_minted" }))
+        }
+        async fn create_turn(
+            State(f): State<RecordingRuntime>,
+            AxumPath(thread_id): AxumPath<String>,
+        ) -> Json<Value> {
+            f.turn_threads.lock().await.push(thread_id);
+            Json(json!({ "turn": { "id": "turn_recorded" } }))
+        }
+        async fn thread_events(
+            AxumPath(_thread_id): AxumPath<String>,
+        ) -> ([(header::HeaderName, &'static str); 1], String) {
+            (
+                [(header::CONTENT_TYPE, "text/event-stream")],
+                sse_frame(
+                    "turn.completed",
+                    json!({
+                        "seq": 1,
+                        "turn_id": "turn_recorded",
+                        "payload": { "turn": { "status": "completed" } }
+                    }),
+                ),
+            )
+        }
+
+        let fixture = RecordingRuntime {
+            created: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            turn_threads: Arc::new(Mutex::new(Vec::new())),
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind recording runtime");
+        let addr = listener.local_addr().expect("listener addr");
+        let app = Router::new()
+            .route("/v1/threads", post(create_thread))
+            .route("/v1/threads/{id}/turns", post(create_turn))
+            .route("/v1/threads/{id}/events", get(thread_events))
+            .with_state(fixture.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve recording runtime");
+        });
+        (format!("http://{addr}"), fixture, server)
+    }
+
+    #[tokio::test]
+    async fn config_update_keeps_the_stdio_thread_mapping() {
+        crate::install_test_crypto_provider();
+        // #6246: `apply_config_update` rebuilds the bridge child, but runtime
+        // threads are durable — the fresh child resolves the same ids. The
+        // bug dropped the stdio→runtime map with the old bridge, so the next
+        // `thread/message` silently minted a new runtime thread instead of
+        // resuming the mapped one.
+        let (base_url, fixture, server) = spawn_recording_runtime().await;
+        let (state, _tmp) = capability_test_state();
+        state
+            .runtime_thread_map
+            .lock()
+            .await
+            .insert("stdio-keep".to_string(), "thr_keep".to_string());
+        seed_bridge_at(&state, base_url.clone()).await;
+
+        // An unrelated config snapshot still rebuilds the bridge child.
+        let snapshot = state.config.read().await.clone();
+        apply_config_update(&state, snapshot, None, false).await;
+        assert!(
+            state.runtime_bridge.lock().await.is_none(),
+            "config update must drop the cached bridge",
+        );
+        assert_eq!(
+            state
+                .runtime_thread_map
+                .lock()
+                .await
+                .get("stdio-keep")
+                .map(String::as_str),
+            Some("thr_keep"),
+            "the thread mapping must survive the bridge rebuild",
+        );
+
+        // The fresh child (seeded here in place of `RuntimeBridge::start`,
+        // which cannot spawn in-process) must resume the mapped thread.
+        seed_bridge_at(&state, base_url).await;
+        let result = dispatch_stdio_request(
+            &state,
+            "thread/message",
+            json!({ "thread_id": "stdio-keep", "input": "next" }),
+        )
+        .await
+        .expect("thread/message on the mapped thread");
+
+        assert_eq!(result.result["status"], json!("accepted"));
+        assert_eq!(
+            fixture.turn_threads.lock().await.as_slice(),
+            ["thr_keep".to_string()],
+            "the turn must run on the pre-existing runtime thread",
+        );
+        assert_eq!(
+            fixture.created.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "no new runtime thread may be minted for a mapped stdio thread",
+        );
+
+        server.abort();
+        let _ = server.await;
     }
 
     #[tokio::test]
@@ -3850,8 +4005,10 @@ mod tests {
         });
 
         let mut bridge = RuntimeBridge::from_base_url_for_test(format!("http://{addr}"));
+        let mut thread_map = HashMap::new();
         let runtime_id = bridge
             .ensure_runtime_thread(
+                &mut thread_map,
                 "legacy_thread",
                 Some(RuntimeThreadHint {
                     model: Some("deepseek-v4".to_string()),
@@ -3865,7 +4022,7 @@ mod tests {
 
         assert_eq!(runtime_id, "thr_runtime");
         assert_eq!(
-            bridge.thread_map.get("legacy_thread").map(String::as_str),
+            thread_map.get("legacy_thread").map(String::as_str),
             Some("thr_runtime")
         );
     }
@@ -3965,7 +4122,7 @@ mod tests {
     async fn prompt_request_executes_a_genuine_model_turn() {
         let (state, _tmp) = capability_test_state();
         let (base_url, prompts, server) = spawn_stub_runtime().await;
-        let bridge = seed_bridge_at(&state, base_url).await;
+        seed_bridge_at(&state, base_url).await;
 
         let (mut reader, mut writer) = tokio::io::duplex(4096);
         let dispatched = dispatch_stdio_request_with_writer(
@@ -4026,8 +4183,8 @@ mod tests {
 
         // A prompt without a thread_id must not leave a mapping behind.
         assert!(
-            bridge.lock().await.thread_map.is_empty(),
-            "one-shot prompt threads must not accumulate in the bridge"
+            state.runtime_thread_map.lock().await.is_empty(),
+            "one-shot prompt threads must not accumulate in the map"
         );
 
         server.abort();

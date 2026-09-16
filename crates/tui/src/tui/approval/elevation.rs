@@ -113,7 +113,7 @@ impl ElevationRequest {
     }
 
     /// Create a generic elevation request.
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), expect(dead_code))]
     pub fn generic(tool_id: &str, tool_name: &str, denial_reason: &str) -> Self {
         Self {
             tool_id: tool_id.to_string(),
@@ -171,13 +171,13 @@ impl ElevationView {
     }
 
     /// Get the request for rendering.
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     pub fn request(&self) -> &ElevationRequest {
         &self.request
     }
 
     /// Get the currently selected index.
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     pub fn selected(&self) -> usize {
         self.selected
     }

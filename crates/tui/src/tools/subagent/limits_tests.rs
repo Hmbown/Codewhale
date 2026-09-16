@@ -118,6 +118,56 @@ fn operator_and_inherited_budgets_only_narrow_including_zero_sentinels() {
 }
 
 #[test]
+fn child_runtime_budget_context_reports_every_resolved_limit() {
+    let mut runtime = stub_runtime();
+    runtime.worker_profile.wall_time_secs = Some(1_800);
+    runtime.worker_profile.wall_deadline_ms = Some(epoch_millis_now() + 1_700_000);
+    let context = child_runtime_budget_context(&runtime, 50, 49, true, Some(120_000));
+    assert!(context.contains("Runtime budget (host-enforced"));
+    assert!(context.contains("wall clock: task work stops about"));
+    assert!(context.contains("total run budget 30m 00s"));
+    assert!(context.contains("49 model turns of task work (limit 50"));
+    assert!(context.contains("about 120000 input+output tokens"));
+    assert!(context.contains("reserved hand-back turn"));
+    assert!(context.contains("Commit or checkpoint work-in-progress early"));
+}
+
+#[test]
+fn child_runtime_budget_context_names_unbounded_limits_honestly() {
+    let runtime = stub_runtime();
+    let context = child_runtime_budget_context(&runtime, 0, 0, false, None);
+    assert!(context.contains("wall clock: no wall-clock limit."));
+    assert!(context.contains("model steps: no per-run step cap."));
+    assert!(context.contains("token allowance: no per-run token cap."));
+    assert!(!context.contains("reserved hand-back turn"));
+}
+
+#[test]
+fn child_budget_pacing_notice_fires_at_three_quarters_of_each_bound() {
+    let started_at = Instant::now() - Duration::from_secs(80);
+    let deadline = started_at + Duration::from_secs(100);
+    let notice =
+        child_budget_pacing_notice(started_at, Some(deadline), 38, 50, Some(20), Some(100))
+            .expect("all three bounds past 75%");
+    assert!(notice.contains("kind=\"budget_pacing\""));
+    assert!(notice.contains("wall clock:"));
+    assert!(notice.contains("model steps: 38 of 50 used"));
+    assert!(notice.contains("token allowance: ~20 of ~100 tokens remain"));
+}
+
+#[test]
+fn child_budget_pacing_notice_stays_silent_with_headroom() {
+    let started_at = Instant::now();
+    let deadline = started_at + Duration::from_secs(100);
+    assert!(
+        child_budget_pacing_notice(started_at, Some(deadline), 10, 50, Some(80), Some(100))
+            .is_none()
+    );
+    // No bound at all means there is nothing to pace against.
+    assert!(child_budget_pacing_notice(started_at, None, 9_999, 0, None, None).is_none());
+}
+
+#[test]
 fn per_call_budget_fields_reject_empty_zero_null_negative_and_oversized_values() {
     for field in ["token_budget", "max_steps", "wall_time_secs"] {
         for invalid in [
@@ -255,7 +305,7 @@ fn cleanup_retains_completed_budget_evidence_while_a_pool_member_runs() {
 fn budget_partial_handback_is_bounded_and_keeps_unknown_usage_honest() {
     let mut snapshot = make_snapshot(SubAgentStatus::Running);
     snapshot.result = Some("partial 🐳 ".repeat(2_000));
-    let result = budget_partial_result(snapshot, "child wall-time budget exhausted");
+    let result = budget_partial_result(snapshot, "child wall-time budget exhausted", None);
     assert_eq!(result.status, SubAgentStatus::BudgetExhausted);
     let summary = result.result.unwrap();
     assert!(summary.chars().count() < 4_500);

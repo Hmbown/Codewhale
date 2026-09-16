@@ -122,7 +122,7 @@ manuscript character, the product's own ocean ombre.
 This replaces the all-dark "Tideline stage" website of 2026-09-01. The TUI
 and the signed-in app keep their dense dark workbench; the website is the
 paper the product is read from. The web-specific product truth is in
-`PRODUCT.md` next to this file.
+`docs/PRODUCT.md`.
 
 ## Anti-slop rules
 

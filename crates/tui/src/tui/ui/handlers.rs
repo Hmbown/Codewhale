@@ -449,17 +449,31 @@ pub(crate) async fn handle_bang_shell_input(
         }
     };
 
-    engine_handle
-        .send(Op::RunShellCommand {
-            command: command.to_string(),
-            mode: app.mode,
-            allow_shell: app.allow_shell,
-            trust_mode: app.trust_mode,
-            auto_approve: app_auto_approve_enabled(app),
-            approval_mode: app.approval_mode,
-        })
-        .await?;
-    app.status_message = Some(format!("Shell command submitted: {command}"));
+    // #6150: composer input never awaits a full op channel — a saturated
+    // engine reports busy instead of freezing the loop.
+    match engine_handle.tx_op.clone().try_reserve_owned() {
+        Ok(permit) => {
+            engine_handle.send_reserved_op(
+                permit,
+                Op::RunShellCommand {
+                    command: command.to_string(),
+                    mode: app.mode,
+                    allow_shell: app.allow_shell,
+                    trust_mode: app.trust_mode,
+                    auto_approve: app_auto_approve_enabled(app),
+                    approval_mode: app.approval_mode,
+                },
+            );
+            app.status_message = Some(format!("Shell command submitted: {command}"));
+        }
+        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+            app.status_message =
+                Some("Engine busy — shell command not sent; try again".to_string());
+        }
+        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+            return Err(anyhow::anyhow!("engine channel closed"));
+        }
+    }
     Ok(true)
 }
 
@@ -743,7 +757,7 @@ pub(crate) async fn handle_mcp_ui_action(
                 changed = deleted;
                 message = Some(if deleted {
                     format!(
-                        "Deleted stored OAuth credentials for MCP server '{name}'. Run /mcp reload to reconnect it."
+                        "Deleted locally stored OAuth credentials for MCP server '{name}'. That clears this machine only — the provider may keep its grant; the next /mcp login re-prompts for consent. Run /mcp reload to reconnect."
                     )
                 } else {
                     format!("No stored OAuth credentials found for MCP server '{name}'.")
@@ -788,6 +802,57 @@ pub(crate) async fn handle_mcp_ui_action(
     }
     if let Some(message) = message {
         add_mcp_message(app, message);
+    }
+
+    // Every branch below is an engine round-trip, and the engine services ops
+    // only between turns (`Engine::run` runs a turn inline and never polls
+    // `rx_op` mid-turn): awaiting one from this UI path parked every keypress
+    // and repaint behind the running turn — a full console freeze (#6159).
+    // While a turn (or its compaction work) owns the engine, serve the last
+    // known snapshot and say so; mutations name the deferral instead of
+    // freezing. `reject_inline_inference_while_runtime_chat_owns_run`
+    // (apply.rs) is the same fail-closed rule for inline inference.
+    let engine_busy = app.is_loading
+        || app.dispatch_in_flight
+        || matches!(app.runtime_turn_status.as_deref(), Some("in_progress"))
+        || app.is_compacting
+        || app.manual_compaction_queued;
+    if engine_busy && (retry_name.is_some() || snapshot_live_pool || is_reload || changed) {
+        if snapshot_live_pool {
+            match app.mcp_snapshot.clone() {
+                Some(snapshot) => {
+                    app.mcp_configured_count = snapshot.servers.len();
+                    app.mcp_snapshot = Some(snapshot);
+                    app.mcp_initializing = false;
+                    app.mcp_connecting.clear();
+                    app.hotbar_actions
+                        .replace_mcp_tools(app.mcp_snapshot.as_ref());
+                    add_mcp_message(
+                        app,
+                        app.tr(MessageId::McpShowCachedWhileTurnRuns).into_owned(),
+                    );
+                    open_mcp_extensions(app);
+                }
+                None => add_mcp_message(
+                    app,
+                    app.tr(MessageId::McpShowUnavailableWhileTurnRuns)
+                        .into_owned(),
+                ),
+            }
+        } else if let Some(name) = retry_name.as_deref() {
+            add_mcp_message(
+                app,
+                app.tr(MessageId::McpRetryDeferredWhileTurnRuns)
+                    .replace("{server}", name),
+            );
+        } else {
+            add_mcp_message(
+                app,
+                app.tr(MessageId::McpLivePoolRefreshDeferredWhileTurnRuns)
+                    .into_owned(),
+            );
+        }
+        return;
     }
 
     // A successful MCP mutation is an explicit request to change the tools
@@ -1288,7 +1353,7 @@ pub(crate) async fn handle_view_events(
 
                 if timed_out {
                     app.add_message(HistoryCell::System {
-                        content: "Approval request timed out - denied".to_string(),
+                        content: app.tr(MessageId::ApprovalTimedOutDenied).into_owned(),
                     });
                 }
             }
@@ -1365,8 +1430,9 @@ pub(crate) async fn handle_view_events(
                     }
                 };
 
-                match manager.load_session(&session_id) {
-                    Ok(session) => {
+                match manager.resume_session(&session_id) {
+                    Ok(recovery) => {
+                        let session = recovery.session;
                         let next_config = config.clone();
                         let respawn = match apply_loaded_session_config_snapshot(
                             app,
@@ -1377,12 +1443,19 @@ pub(crate) async fn handle_view_events(
                         ) {
                             Ok(outcome) => outcome,
                             Err(err) => {
-                                app.status_message =
-                                    Some(format!("Failed to restore session: {err}"));
+                                crate::tui::ui::session_state::surface_session_load_failure(
+                                    app,
+                                    format!("Failed to restore session: {err}"),
+                                );
                                 continue;
                             }
                         };
                         sync_runtime_workspace_state(task_manager, app.workspace.clone()).await;
+                        // #6150 audit: these sends may await a full op channel,
+                        // and that await is load-bearing — the session switch
+                        // is already committed UI-side, so each op must land in
+                        // order (drop = engine/UI desync). A wedge is possible
+                        // only while a saturated engine finishes its turn.
                         if respawn {
                             let _ = engine_handle.send(Op::Shutdown).await;
                             *engine_handle =
@@ -1428,10 +1501,13 @@ pub(crate) async fn handle_view_events(
                         app.launch.status = None;
                     }
                     Err(err) => {
-                        app.status_message = Some(format!(
-                            "Failed to load session {}: {err}",
-                            crate::session_manager::truncate_id(&session_id)
-                        ));
+                        crate::tui::ui::session_state::surface_session_load_failure(
+                            app,
+                            format!(
+                                "Failed to load session {}: {err}",
+                                crate::session_manager::truncate_id(&session_id)
+                            ),
+                        );
                     }
                 }
             }
@@ -2035,11 +2111,12 @@ pub(crate) async fn handle_view_events(
             }
             ViewEvent::SidebarAgentCancel { agent_id } => {
                 app.status_message = Some(format!("Cancelling {agent_id}..."));
+                // #6150: the input path never awaits a full op channel. The
+                // cancel is retryable; a rejected send surfaces immediately.
                 if engine_handle
-                    .send(Op::CancelSubAgent {
+                    .try_send(Op::CancelSubAgent {
                         agent_id: agent_id.clone(),
                     })
-                    .await
                     .is_err()
                 {
                     app.status_message = Some(format!("Could not cancel {agent_id}"));
@@ -2518,18 +2595,39 @@ pub(crate) async fn handle_view_events(
             }
             ViewEvent::BacktrackConfirm => {
                 if let Some(depth) = app.backtrack.confirm() {
-                    apply_backtrack(app, depth);
-                    let _ = engine_handle
-                        .send(Op::SyncSession {
-                            session_id: app.current_session_id.clone(),
-                            messages: app.api_messages.clone(),
-                            system_prompt: app.system_prompt.clone(),
-                            system_prompt_override: false,
-                            model: app.model.clone(),
-                            workspace: app.workspace.clone(),
-                            mode: app.mode,
-                        })
-                        .await;
+                    // Reserve the slot before mutating history (#6150): the
+                    // loop must not await a full op channel, and applying the
+                    // backtrack without delivering SyncSession would desync
+                    // the engine's messages from ours.
+                    match engine_handle.tx_op.clone().try_reserve_owned() {
+                        Ok(permit) => {
+                            apply_backtrack(app, depth);
+                            engine_handle.send_reserved_op(
+                                permit,
+                                Op::SyncSession {
+                                    session_id: app.current_session_id.clone(),
+                                    messages: app.api_messages.clone(),
+                                    system_prompt: app.system_prompt.clone(),
+                                    system_prompt_override: false,
+                                    model: app.model.clone(),
+                                    workspace: app.workspace.clone(),
+                                    mode: app.mode,
+                                },
+                            );
+                        }
+                        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                            app.status_message = Some(
+                                "Engine busy — backtrack not applied; try again in a moment"
+                                    .to_string(),
+                            );
+                            app.needs_redraw = true;
+                        }
+                        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                            app.status_message =
+                                Some("Engine stopped — backtrack not applied".to_string());
+                            app.needs_redraw = true;
+                        }
+                    }
                 }
             }
             ViewEvent::BacktrackCancel => {
@@ -2553,7 +2651,9 @@ pub(crate) async fn handle_view_events(
                     return Ok(true);
                 }
             }
-            ViewEvent::ContextMenuSelected { action } => handle_context_menu_action(app, action),
+            ViewEvent::ContextMenuSelected { action } => {
+                handle_context_menu_action(terminal, app, action)
+            }
             ViewEvent::SkillMutationRequested { request } => {
                 handle_skill_mutation_requested(app, request).await;
             }

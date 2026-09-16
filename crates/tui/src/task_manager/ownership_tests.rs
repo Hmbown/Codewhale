@@ -338,7 +338,12 @@ async fn pending_flush_and_finish_merge_fresh_metadata_and_monotonic_cancel() ->
     other
         .record_tool_metadata(
             &task.id,
-            &serde_json::json!({"task_updates": {"hunt_verdict": "wounded"}}),
+            &serde_json::json!({"task_updates": {"checklist": {
+                "items": [{"id": 1, "content": "merged checklist", "status": "done"}],
+                "completion_pct": 100,
+                "in_progress_id": null,
+                "updated_at": null
+            }}}),
         )
         .await?;
     other.cancel_task(&task.id).await?;
@@ -355,7 +360,8 @@ async fn pending_flush_and_finish_merge_fresh_metadata_and_monotonic_cancel() ->
     let final_task = other.get_task(&task.id).await?;
     assert_eq!(final_task.status, TaskStatus::Canceled);
     assert_eq!(final_task.cancel_requested_seq, seq);
-    assert_eq!(final_task.hunt_verdict.as_deref(), Some("wounded"));
+    assert_eq!(final_task.checklist.items.len(), 1);
+    assert_eq!(final_task.checklist.completion_pct, 100);
     assert_eq!(
         final_task
             .timeline

@@ -1,4 +1,5 @@
 use super::*;
+use crate::core::ops::TurnSpec;
 
 fn tool(name: &str, deferred: bool) -> Tool {
     Tool {
@@ -957,31 +958,31 @@ async fn assert_preview_matches_first_wire_body(
         .clone();
 
     let _ = engine
-        .handle_send_message(
-            prompt.to_string(),
-            AppMode::Agent,
-            production_route,
-            compaction,
-            crate::cost_status::RuntimeUsageBatch::default(),
+        .handle_send_message(TurnSpec {
+            content: prompt.to_string(),
+            mode: AppMode::Agent,
+            route: Box::new(production_route),
+            compaction: Box::new(compaction),
+            initial_routed_usage: Box::new(crate::cost_status::RuntimeUsageBatch::default()),
             goal_objective,
-            None,
+            goal_token_budget: None,
             goal_status,
             reasoning_effort,
             reasoning_effort_auto,
-            false,
-            false,
-            false,
-            false,
-            ApprovalMode::Suggest,
+            auto_model: false,
+            allow_shell: false,
+            trust_mode: false,
+            auto_approve: false,
+            approval_mode: ApprovalMode::Suggest,
             translation_enabled,
-            None,
-            Vec::new(),
-            None,
+            allowed_tools: None,
+            dynamic_tools: Vec::new(),
+            hook_executor: None,
             verbosity,
-            UserInputProvenance::ExternalUser,
-            Vec::new(),
-            None,
-        )
+            provenance: UserInputProvenance::ExternalUser,
+            images: Vec::new(),
+            max_output_tokens: None,
+        })
         .await;
 
     let requests = server
@@ -1924,31 +1925,31 @@ async fn provider_reported_usage_is_unavailable_until_a_response_reports_it() {
     assert_eq!(engine.session.total_usage.output_tokens, 0);
 
     let _ = engine
-        .handle_send_message(
-            prompt.to_string(),
-            AppMode::Agent,
-            production_route,
-            compaction,
-            crate::cost_status::RuntimeUsageBatch::default(),
-            None,
-            None,
-            GoalStatus::Active,
+        .handle_send_message(TurnSpec {
+            content: prompt.to_string(),
+            mode: AppMode::Agent,
+            route: Box::new(production_route),
+            compaction: Box::new(compaction),
+            initial_routed_usage: Box::new(crate::cost_status::RuntimeUsageBatch::default()),
+            goal_objective: None,
+            goal_token_budget: None,
+            goal_status: GoalStatus::Active,
             reasoning_effort,
             reasoning_effort_auto,
-            false,
-            false,
-            false,
-            false,
-            ApprovalMode::Suggest,
-            false,
-            None,
-            Vec::new(),
-            None,
-            None,
-            UserInputProvenance::ExternalUser,
-            Vec::new(),
-            None,
-        )
+            auto_model: false,
+            allow_shell: false,
+            trust_mode: false,
+            auto_approve: false,
+            approval_mode: ApprovalMode::Suggest,
+            translation_enabled: false,
+            allowed_tools: None,
+            dynamic_tools: Vec::new(),
+            hook_executor: None,
+            verbosity: None,
+            provenance: UserInputProvenance::ExternalUser,
+            images: Vec::new(),
+            max_output_tokens: None,
+        })
         .await;
 
     // The completed turn's counts are exactly what `parse_usage` reads off

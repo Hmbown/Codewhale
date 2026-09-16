@@ -7,7 +7,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{OnceLock, RwLock};
-use std::time::{Duration, SystemTime};
+use std::time::SystemTime;
 
 use crate::tools::goal::GoalStatus;
 use crate::tui::app::{App, AppAction};
@@ -512,7 +512,7 @@ fn normalize_configured_name(name: &str) -> Option<String> {
         .then(|| name.to_ascii_lowercase())
 }
 
-fn usage_describes_arguments(name: &str, usage: &str) -> bool {
+pub(crate) fn usage_describes_arguments(name: &str, usage: &str) -> bool {
     let usage = usage.trim();
     if usage.is_empty() {
         return false;
@@ -735,6 +735,9 @@ pub fn try_dispatch(app: &mut App, input: &str) -> Option<CommandResult> {
     app.pausable = false;
     app.paused = false;
     app.paused_goal_objective = None;
+    // These command paths run on the async UI task, so the contention retry
+    // yields instead of parking a worker with `thread::sleep`. The critical
+    // sections are microsecond-scale; a still-contended lock logs below.
     let mut todos_cleared = false;
     for _ in 0..10 {
         if let Ok(mut todos) = app.todos.try_lock() {
@@ -742,7 +745,7 @@ pub fn try_dispatch(app: &mut App, input: &str) -> Option<CommandResult> {
             todos_cleared = true;
             break;
         }
-        std::thread::sleep(Duration::from_millis(1));
+        std::thread::yield_now();
     }
     if !todos_cleared {
         tracing::warn!(target: "commands", "todos lock contended or poisoned — previous todos not cleared");
@@ -755,7 +758,7 @@ pub fn try_dispatch(app: &mut App, input: &str) -> Option<CommandResult> {
             plan_cleared = true;
             break;
         }
-        std::thread::sleep(Duration::from_millis(1));
+        std::thread::yield_now();
     }
     if !plan_cleared {
         tracing::warn!(target: "commands", "plan_state lock contended or poisoned — previous plan not cleared");

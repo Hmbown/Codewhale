@@ -49,7 +49,6 @@ mod dsh_credentials;
 mod elapsed;
 mod error_taxonomy;
 mod eval;
-mod execpolicy;
 mod external_credentials;
 mod fast_hash;
 mod features;
@@ -114,7 +113,6 @@ mod runtime_threads;
 mod safe_label;
 mod sandbox;
 mod scorecard;
-#[allow(dead_code)]
 mod session_diagnostics;
 // Acceptance matrix for #2934 / #4397. Test-only: the table documents the
 // contract for reviewers and is enforced by the tests beside it, so it does
@@ -125,7 +123,6 @@ mod doctor_loader_tests;
 #[cfg(test)]
 mod session_control_acceptance;
 mod session_export;
-#[allow(dead_code)]
 mod session_manager;
 mod session_peek;
 mod session_projection;
@@ -496,6 +493,13 @@ struct ExecArgs {
     /// Internal Fleet worker authority envelope. Non-secret, versioned JSON.
     #[arg(long, value_name = "JSON", hide = true)]
     tool_authority_json: Option<String>,
+    /// Fire the configured hooks in this run (opt-in). On the headless path
+    /// the engine-side events are `tool_call_before` — which may still deny
+    /// a call — and `shell_env`. A hook `ask` resolves fail-closed because
+    /// nothing can prompt headlessly. Fleet worker subprocesses never fire
+    /// operator hooks.
+    #[arg(long, default_value_t = false)]
+    hooks: bool,
     /// Prompt to send to the model
     #[arg(
         value_name = "PROMPT",
@@ -970,7 +974,8 @@ fn load_exec_resume_session(session_id: &str) -> Result<session_manager::SavedSe
     let session_ref = exec_stream_session_ref(session_id);
     SessionManager::default_location()
         .context("could not open session manager for resume")?
-        .load_session_by_prefix(session_id)
+        .resume_session_by_prefix(session_id)
+        .map(|recovery| recovery.session)
         .with_context(|| format!("could not load session {session_ref}"))
 }
 
@@ -2429,6 +2434,7 @@ async fn run_async_main_dispatch(
                     || args.disallowed_tools.is_some()
                     || args.append_system_prompt.is_some()
                     || args.tool_authority_json.is_some()
+                    || args.hooks
                     || args.sandbox.is_some()
                     || args.allow_sandbox_elevation
                     || env_tool_surface.is_some();
@@ -2469,6 +2475,7 @@ async fn run_async_main_dispatch(
                         disallowed_tools,
                         args.append_system_prompt.clone(),
                         args.tool_authority_json.clone(),
+                        args.hooks,
                         std::sync::Arc::clone(&plugin_registry),
                     )
                     .await
@@ -2539,7 +2546,7 @@ async fn run_async_main_dispatch(
                     args.acp,
                 )?;
                 if args.mcp {
-                    tokio::task::block_in_place(|| mcp_server::run_mcp_server(workspace))
+                    mcp_server::run_mcp_server(workspace).await
                 } else if http_selected {
                     let (mut config, config_profile) =
                         load_config_from_cli_with_effective_profile(&cli)?;
@@ -4515,7 +4522,7 @@ async fn run_doctor(
         );
         // Secret hygiene: name the keys, never the values. Plain-text config
         // is not a secret store.
-        if let Ok(raw) = std::fs::read_to_string(config_path) {
+        if let Ok(raw) = tokio::fs::read_to_string(config_path).await {
             let flagged = crate::doctor::config_credential_shaped_keys(&raw);
             if !flagged.is_empty() {
                 println!(
@@ -6476,8 +6483,11 @@ fn doctor_operate_fleet_report_json(config: &Config, workspace: &Path) -> serde_
         })
         .collect();
 
+    let model_pin_drift = doctor_model_pin_drift(config, workspace, &roster);
+
     json!({
         "ready": has_credentials_or_local && runtime_ready && roster_ready,
+        "model_pin_drift": model_pin_drift,
         "provider": {
             "id": config.provider_identity_for(provider),
             "auth": {
@@ -6515,6 +6525,105 @@ fn doctor_operate_fleet_report_json(config: &Config, workspace: &Path) -> serde_
             "max_admitted": max_admitted,
             "plan_limit_probed": false,
         },
+    })
+}
+
+/// Warning-only model-pin drift surfacing (#6035). A pin is flagged only
+/// when a FRESH cached live roster for that provider route exists and does
+/// not list the pinned wire id — stale, failed, or absent rosters cannot
+/// prove drift, and bundled catalog rows say nothing about what the account
+/// currently serves. The id may still answer (soft deprecation) or be served
+/// by other providers on their own routes, so this never rewrites the pin.
+fn doctor_model_pin_drift(
+    config: &Config,
+    workspace: &Path,
+    roster: &crate::fleet::roster::FleetRoster,
+) -> serde_json::Value {
+    use serde_json::json;
+    use std::collections::BTreeMap;
+
+    // One row per affected route: (provider, model) -> pin owners.
+    let mut pins: BTreeMap<(String, String), Vec<String>> = BTreeMap::new();
+
+    for entry in crate::fleet::store::list_fleets(workspace) {
+        if entry.parse_error.is_some() {
+            continue;
+        }
+        let Ok((fleet, scope)) = crate::fleet::store::load_fleet_at(&entry.path) else {
+            continue;
+        };
+        let owner = format!("fleet:{} ({})", fleet.name, scope.label());
+        if let Some(operator) = fleet.operator.as_ref() {
+            pins.entry((operator.provider.clone(), operator.model.clone()))
+                .or_default()
+                .push(format!("{owner} operator"));
+        }
+        for member in &fleet.members {
+            if let (Some(provider), Some(model)) = (member.provider.as_ref(), member.model.as_ref())
+            {
+                pins.entry((provider.clone(), model.clone()))
+                    .or_default()
+                    .push(format!("{owner} member:{}", member.id));
+            }
+        }
+    }
+    for member in roster.members() {
+        if let (Some(provider), Some(model)) = (
+            member.profile.provider.as_ref(),
+            member.profile.model.as_ref(),
+        ) {
+            pins.entry((provider.clone(), model.clone()))
+                .or_default()
+                .push(format!("agent:{}", member.id));
+        }
+    }
+
+    let mut unverifiable = 0usize;
+    let drifted = pins
+        .iter()
+        .filter_map(|((provider, model), owners)| {
+            let kind = crate::config::ApiProvider::parse(provider)
+                .unwrap_or(crate::config::ApiProvider::Custom);
+            let identity = match kind {
+                crate::config::ApiProvider::Custom => provider.clone(),
+                _ => kind.as_str().to_string(),
+            };
+            let base_url = config.base_url_for_route_identity(kind, &identity);
+            if crate::provider_catalog_live::status_for_route(kind, &identity, &base_url)
+                != codewhale_config::catalog::CatalogStatus::Fresh
+            {
+                unverifiable += 1;
+                return None;
+            }
+            let listed =
+                crate::provider_catalog_live::cached_entry_for_route(kind, &identity, &base_url)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|entry| {
+                        entry.offerings.iter().any(|offering| {
+                            offering.wire_model_id == *model
+                                || offering.canonical_model.as_deref() == Some(model.as_str())
+                        })
+                    });
+            (!listed).then(|| {
+                json!({
+                    "provider": provider,
+                    "model": model,
+                    "owners": owners,
+                    "message": format!(
+                        "pinned id `{model}` is absent from {provider}'s current live roster; \
+                         the id may still answer (soft deprecation) or be served by other \
+                         providers on their own routes — the pin is left unchanged"
+                    ),
+                })
+            })
+        })
+        .collect::<Vec<_>>();
+
+    json!({
+        "checked": pins.len(),
+        "unverifiable": unverifiable,
+        "drifted": drifted,
     })
 }
 
@@ -7756,10 +7865,12 @@ async fn run_speech(config: &Config, args: SpeechArgs) -> Result<()> {
         .await?;
 
     if let Some(parent) = output.parent().filter(|path| !path.as_os_str().is_empty()) {
-        std::fs::create_dir_all(parent)
+        tokio::fs::create_dir_all(parent)
+            .await
             .with_context(|| format!("Failed to create output directory {}", parent.display()))?;
     }
-    std::fs::write(&output, &response.audio_bytes)
+    tokio::fs::write(&output, &response.audio_bytes)
+        .await
         .with_context(|| format!("Failed to write audio file {}", output.display()))?;
 
     if json_output {
@@ -8499,12 +8610,11 @@ async fn run_review(config: &Config, args: ReviewArgs) -> Result<()> {
             crate::tools::review::plan_pr_review(&diff, view, args.max_chars, args.max_passes)
         })
         .transpose()?;
+    let review_workspace = std::env::current_dir()?;
     let (prompts, system) = if let (Some((number, view)), Some(plan)) = (&pr_view, &pr_plan) {
         (
-            plan.passes
-                .iter()
-                .map(|pass| crate::tools::review::build_pr_pass_prompt(*number, view, plan, pass))
-                .collect::<Vec<_>>(),
+            crate::tools::review::build_pr_review_prompts(*number, view, plan, &review_workspace)
+                .await?,
             SystemPrompt::Text(crate::tools::review::review_system_prompt().to_string()),
         )
     } else {
@@ -9991,7 +10101,9 @@ async fn run_mcp_command(
                 .get(&name)
                 .ok_or_else(|| anyhow!("MCP server '{name}' not found"))?;
             if crate::mcp::oauth::delete_oauth_tokens_for_server(&name, server)? {
-                println!("Deleted stored OAuth credentials for MCP server '{name}'.");
+                println!(
+                    "Deleted locally stored OAuth credentials for MCP server '{name}'. That clears this machine only; the provider may keep its grant, and the next login forces the consent screen."
+                );
             } else {
                 println!("No stored OAuth credentials found for MCP server '{name}'.");
             }
@@ -14886,6 +14998,84 @@ mod terminal_mode_tests {
         );
     }
 
+    #[test]
+    fn doctor_fleet_report_flags_pins_absent_from_fresh_live_roster() {
+        // #6035: a pin that vanished from the provider's current live roster
+        // is drift the report must name — warning only, never a rewrite.
+        let _env_lock = crate::test_support::lock_test_env();
+        let _live = crate::provider_lake::lock_live_snapshot();
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let home = tmp.path().join("home");
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        let _codewhale_home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", &home);
+        crate::provider_catalog_live::reset_cache_for_test();
+
+        let fleets = home.join("fleets");
+        std::fs::create_dir_all(&fleets).expect("fleets dir");
+        std::fs::write(
+            fleets.join("default.toml"),
+            "schema = \"fleet\"\nschema_revision = 2\nname = \"default\"\n\
+             [operator]\nprovider = \"deepseek\"\nmodel = \"deepseek-flash\"\n\
+             [[members]]\nid = \"builder\"\nprovider = \"deepseek\"\nmodel = \"deepseek-v4-flash\"\n",
+        )
+        .expect("fleet file");
+
+        let config = Config {
+            provider: Some("deepseek".to_string()),
+            ..Default::default()
+        };
+        let kind = crate::config::ApiProvider::Deepseek;
+        let base_url = config.base_url_for_route_identity(kind, "deepseek");
+        let fetched_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_secs();
+        let fingerprint = codewhale_config::catalog::base_url_fingerprint(&base_url);
+        assert_eq!(
+            crate::provider_catalog_live::record_success(
+                codewhale_config::catalog::ProviderCatalogDelta {
+                    provider: "deepseek".to_string(),
+                    base_url_fingerprint: fingerprint.clone(),
+                    fetched_at,
+                    offerings: vec![codewhale_config::catalog::CatalogOffering {
+                        provider: "deepseek".to_string(),
+                        wire_model_id: "deepseek-flash".to_string(),
+                        endpoint_key: "chat".to_string(),
+                        source: codewhale_config::catalog::CatalogSource::Live {
+                            base_url_fingerprint: fingerprint,
+                            fetched_at,
+                        },
+                        ..Default::default()
+                    }],
+                }
+            ),
+            codewhale_config::catalog::CatalogStatus::Fresh
+        );
+
+        let operate = doctor_operate_fleet_report_json(&config, &workspace);
+        let drift = &operate["model_pin_drift"];
+        let drifted = drift["drifted"].as_array().expect("drifted array");
+        let row = drifted
+            .iter()
+            .find(|row| row["model"] == "deepseek-v4-flash")
+            .expect("member pin flagged: {drift}");
+        assert_eq!(row["provider"], "deepseek");
+        assert!(
+            row["owners"]
+                .as_array()
+                .expect("owners")
+                .iter()
+                .any(|owner| owner.as_str().is_some_and(|o| o.contains("member:builder"))),
+            "the fleet member pin is named: {row}"
+        );
+        // The operator pin moved to the listed id — not drift.
+        assert!(
+            !drifted.iter().any(|row| row["model"] == "deepseek-flash"),
+            "listed pin must not be flagged: {drifted:?}"
+        );
+    }
+
     fn saved_exec_session(provider: &str, model: &str) -> session_manager::SavedSession {
         let mut saved = session_manager::create_saved_session_with_mode(
             &[],
@@ -17104,6 +17294,7 @@ api_key = "test-only-key"
         assert_eq!(args.resume.as_deref(), Some("abc123"));
         assert_eq!(args.output_format, ExecOutputFormat::StreamJson);
         assert_eq!(args.prompt, vec!["follow up"]);
+        assert!(!args.hooks, "headless hooks stay opt-in by default");
     }
 
     #[test]
@@ -17135,6 +17326,7 @@ api_key = "test-only-key"
             "extra rules",
             "--tool-authority-json",
             envelope,
+            "--hooks",
             "do the thing",
         ]);
         let Some(Commands::Exec(args)) = cli.command else {
@@ -17153,6 +17345,7 @@ api_key = "test-only-key"
         assert_eq!(args.max_tool_calls, Some(9));
         assert_eq!(args.append_system_prompt.as_deref(), Some("extra rules"));
         assert_eq!(args.tool_authority_json.as_deref(), Some(envelope));
+        assert!(args.hooks);
         assert_eq!(args.prompt, vec!["do the thing"]);
     }
 
@@ -18296,6 +18489,7 @@ api_key = "test-only-key"
             tui: Some(crate::config::TuiConfig {
                 alternate_screen: Some("never".to_string()),
                 mouse_capture: None,
+                selection_copy_markdown: None,
                 terminal_probe_timeout_ms: None,
                 stream_chunk_timeout_secs: None,
                 max_model_steps: None,
@@ -18397,6 +18591,7 @@ api_key = "test-only-key"
             tui: Some(crate::config::TuiConfig {
                 alternate_screen: None,
                 mouse_capture: Some(false),
+                selection_copy_markdown: None,
                 terminal_probe_timeout_ms: None,
                 stream_chunk_timeout_secs: None,
                 max_model_steps: None,
@@ -18436,6 +18631,7 @@ api_key = "test-only-key"
             tui: Some(crate::config::TuiConfig {
                 alternate_screen: None,
                 mouse_capture: Some(true),
+                selection_copy_markdown: None,
                 terminal_probe_timeout_ms: None,
                 stream_chunk_timeout_secs: None,
                 max_model_steps: None,
@@ -18529,6 +18725,7 @@ api_key = "test-only-key"
             tui: Some(crate::config::TuiConfig {
                 alternate_screen: None,
                 mouse_capture: Some(true),
+                selection_copy_markdown: None,
                 terminal_probe_timeout_ms: None,
                 stream_chunk_timeout_secs: None,
                 max_model_steps: None,

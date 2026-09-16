@@ -201,6 +201,7 @@ impl Engine {
                         crate::goal_loop::GoalBudget {
                             token_budget: snapshot.token_budget.map(u64::from),
                             time_budget_seconds: None,
+                            enforce_token_budget: self.config.goal_enforce_token_budget,
                             max_continuations: self.config.goal_max_continuations,
                         },
                     ))

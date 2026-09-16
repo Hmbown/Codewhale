@@ -906,6 +906,22 @@ impl ModalView for FleetDetailView {
 }
 
 impl FleetDetailView {
+    /// A saved route pin is drifted when the `(provider, model)` pair is not
+    /// among the routes the picker can currently offer — the provider table
+    /// was removed, or the model dropped out of the provider's roster. The
+    /// pin may still serve upstream, so this only flags; it never rewrites.
+    fn pin_drifted(&self, provider: &str, model: &str) -> bool {
+        !self.routes.iter().any(|row| {
+            row.provider
+                .as_deref()
+                .is_some_and(|p| p.eq_ignore_ascii_case(provider))
+                && row
+                    .model
+                    .as_deref()
+                    .is_some_and(|m| m.eq_ignore_ascii_case(model))
+        })
+    }
+
     fn render_overview(&self, area: Rect, buf: &mut Buffer) {
         if area.width == 0 || area.height == 0 {
             return;
@@ -932,7 +948,12 @@ impl FleetDetailView {
                 .as_ref()
                 .and_then(|op| op.reasoning.as_deref())
                 .unwrap_or("inherit");
-            lines.push(Line::from(vec![
+            let drifted = self
+                .fleet
+                .operator
+                .as_ref()
+                .is_some_and(|op| self.pin_drifted(&op.provider, &op.model));
+            let mut spans = vec![
                 Span::styled(if selected { "» " } else { "  " }, base),
                 Span::styled("operator", base),
                 Span::styled("  ", Style::default()),
@@ -941,7 +962,14 @@ impl FleetDetailView {
                     format!(" · reasoning: {reasoning}"),
                     Style::default().fg(palette::TEXT_DIM),
                 ),
-            ]));
+            ];
+            if drifted {
+                spans.push(Span::styled(
+                    tr(self.locale, MessageId::FleetRouteNotInCatalog),
+                    Style::default().fg(palette::STATUS_WARNING),
+                ));
+            }
+            lines.push(Line::from(spans));
         }
 
         for (idx, member) in self.fleet.members.iter().enumerate() {
@@ -985,7 +1013,11 @@ impl FleetDetailView {
                         || member.id.clone(),
                         |name| format!("{name} ({})", member.id),
                     );
-                lines.push(Line::from(vec![
+                let drifted = matches!(
+                    (&member.provider, &member.model),
+                    (Some(provider), Some(model)) if self.pin_drifted(provider, model)
+                );
+                let mut spans = vec![
                     Span::styled(if selected { "» " } else { "  " }, base),
                     Span::styled(member_label, base),
                     Span::styled(role, Style::default().fg(palette::TEXT_SECONDARY)),
@@ -999,7 +1031,14 @@ impl FleetDetailView {
                         },
                         Style::default().fg(palette::TEXT_DIM),
                     ),
-                ]));
+                ];
+                if drifted {
+                    spans.push(Span::styled(
+                        tr(self.locale, MessageId::FleetRouteNotInCatalog),
+                        Style::default().fg(palette::STATUS_WARNING),
+                    ));
+                }
+                lines.push(Line::from(spans));
             }
         }
         Paragraph::new(ratatui::text::Text::from(lines)).render(area, buf);
@@ -1656,6 +1695,60 @@ mod tests {
         assert_eq!(
             reloaded, fleet,
             "editing a shortlist preserves the complete route and marker"
+        );
+    }
+
+    #[test]
+    fn overview_flags_a_saved_route_the_picker_can_no_longer_offer() {
+        let ws = tempfile::TempDir::new().unwrap();
+        let mut fleet = sample_fleet("Drifted");
+        fleet.members[0].provider = Some("gone-provider".to_string());
+        fleet.members[0].model = Some("gone-model".to_string());
+        fleet.members.push(FleetMember {
+            id: "kept".to_string(),
+            display_name: None,
+            shortlist: false,
+            role: "reviewer".to_string(),
+            provider: Some("deepseek".to_string()),
+            model: Some("deepseek-v4-pro".to_string()),
+            reasoning: None,
+            instructions: None,
+            requires: Vec::new(),
+        });
+        save_fleet(&fleet, FleetScope::Workspace, ws.path()).unwrap();
+
+        let view = FleetDetailView::open(
+            &app_in(ws.path().to_path_buf()),
+            &Config::default(),
+            "Drifted",
+            FleetScope::Workspace,
+        )
+        .expect("open");
+
+        assert!(view.pin_drifted("gone-provider", "gone-model"));
+        assert!(!view.pin_drifted("deepseek", "deepseek-v4-pro"));
+
+        let area = Rect::new(0, 0, 160, 8);
+        let mut buf = Buffer::empty(area);
+        view.render_overview(area, &mut buf);
+        let rows: Vec<String> = (0..area.height)
+            .map(|y| (0..area.width).map(|x| buf[(x, y)].symbol()).collect())
+            .collect();
+        let drifted_row = rows
+            .iter()
+            .find(|row| row.contains("gone-model"))
+            .expect("drifted member row rendered");
+        assert!(
+            drifted_row.contains("not in current catalog"),
+            "{drifted_row}"
+        );
+        let offered_row = rows
+            .iter()
+            .find(|row| row.contains("deepseek-v4-pro"))
+            .expect("offerable member row rendered");
+        assert!(
+            !offered_row.contains("not in current catalog"),
+            "{offered_row}"
         );
     }
 

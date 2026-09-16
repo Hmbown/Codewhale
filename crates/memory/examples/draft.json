@@ -1,0 +1,13 @@
+{
+  "scope": {"tenant":"local","user":"local","workspace":"codewhale"},
+  "kind":"decision",
+  "title":"Keep volatile recall out of the frozen prompt prefix",
+  "body":"Append new recall as tool/history messages. Do not rewrite the system prompt on every turn.",
+  "key":"context.recall-placement",
+  "tags":["context","cache","architecture"],
+  "confidence":0.8,
+  "importance":0.9,
+  "evidence":[{"kind":"user","uri":"codewhale://session/demo/message/1","locator":"explicit design decision","observed_at":0}],
+  "dependencies":{},
+  "parent_ids":[]
+}

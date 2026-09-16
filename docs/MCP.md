@@ -94,6 +94,12 @@ codewhale mcp remove <name>
 codewhale mcp validate
 ```
 
+`codewhale mcp logout <name>` (and `/mcp logout`) clears locally stored
+OAuth credentials only — the provider may keep its standing grant. The next
+login forces the consent screen, so the authorized account/workspace can
+change; to sever the grant remotely, revoke the app from the provider's
+account settings.
+
 ## In-TUI Manager
 
 Inside the interactive TUI, `/mcp` opens a compact manager for the resolved
@@ -462,6 +468,17 @@ After adding, test the connection:
 codewhale mcp validate
 codewhale mcp tools codewhale
 ```
+
+## Connection Lifecycle
+
+Session boot is lazy (#6033): a configured server is not spawned until
+something asks for it — a turn whose `allowed_tools`/`tools.always_load`
+selection covers its `mcp_<server>_*` names, a model call that resolves to
+one of its tools, or an explicit `/mcp` connect/retry. Servers marked
+`required` still connect eagerly at boot so their failure surfaces before the
+first turn. A configured-but-unstarted server shows as `configured`, never
+`connecting`; the connecting label only describes handshakes actually in
+flight.
 
 ## Server Fields
 

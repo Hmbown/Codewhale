@@ -1,0 +1,32 @@
+[package]
+name = "codewhale-memory"
+version.workspace = true
+edition = "2024"
+rust-version.workspace = true
+description = "Local, scoped, provenance-bearing memory and resumable state for CodeWhale"
+license = "MIT"
+publish = false
+
+[lib]
+name = "codewhale_memory"
+path = "src/lib.rs"
+
+[[bin]]
+name = "cw-memory"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+regex = "1.11"
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.11"
+thiserror = "2.0"
+uuid = { version = "1.11", features = ["v4"] }
+
+[dev-dependencies]
+tempfile = "3.27"
+
+[lints.rust]
+unsafe_code = "forbid"

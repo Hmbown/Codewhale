@@ -50,7 +50,6 @@ pub struct CostEstimate {
 }
 
 impl CostEstimate {
-    #[allow(dead_code)]
     pub fn usd_only(usd: f64) -> Self {
         Self { usd, cny: 0.0 }
     }
@@ -113,7 +112,7 @@ impl CostEstimate {
 /// mapped onto [`BalanceInfo`] at the fetch seam.
 #[derive(Debug, Clone, Default, serde::Deserialize)]
 pub struct BalanceResponse {
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), expect(dead_code))]
     pub is_available: bool,
     pub balance_infos: Vec<BalanceInfo>,
 }

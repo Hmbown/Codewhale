@@ -19,7 +19,6 @@ pub(super) struct SseTransport {
     pub(super) auth: McpHttpAuth,
     pub(super) endpoint_url: Option<String>,
     pub(super) receiver: tokio::sync::mpsc::Receiver<SseInbound>,
-    #[allow(dead_code)]
     pub(super) sse_task: tokio::task::JoinHandle<()>,
 }
 

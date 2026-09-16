@@ -73,6 +73,10 @@ pub struct AutomationPanelState {
 pub enum SettledOutcome {
     Completed,
     Failed,
+    /// The run was canceled — by the operator, a cancel timeout or shutdown
+    /// (#6162). It gets a receipt so a stopped run is never silent, but it
+    /// never lights the failure demand: nothing crashed.
+    Canceled,
 }
 
 /// A run this session saw live that has now settled — surfaced exactly once
@@ -145,9 +149,8 @@ impl AutomationPanelState {
                     let outcome = match run.status {
                         AutomationRunStatus::Completed => SettledOutcome::Completed,
                         AutomationRunStatus::Failed => SettledOutcome::Failed,
-                        AutomationRunStatus::Queued
-                        | AutomationRunStatus::Running
-                        | AutomationRunStatus::Canceled => return None,
+                        AutomationRunStatus::Canceled => SettledOutcome::Canceled,
+                        AutomationRunStatus::Queued | AutomationRunStatus::Running => return None,
                     };
                     Some(SettledRun {
                         automation_id: run.automation_id.clone(),
@@ -637,17 +640,32 @@ mod tests {
         assert_eq!(delta.settled[0].error.as_deref(), Some("provider timeout"));
         assert_eq!(panel.activity_ink(), ChromeInk::Attention);
 
-        // A canceled run leaves the live set without a receipt.
+        // A canceled run leaves the live set with a receipt that names the
+        // cancellation (#6162), without lighting the failure demand.
+        panel.acknowledge_failures();
+        assert!(!panel.has_unacknowledged_failure());
         panel.fold_scan(
             &records,
             &[run("a1", "r2", AutomationRunStatus::Queued, None)],
             session_started_at,
         );
-        let delta = panel.fold_scan(
-            &records,
-            &[run("a1", "r2", AutomationRunStatus::Canceled, None)],
-            session_started_at,
+        let mut canceled = run("a1", "r2", AutomationRunStatus::Canceled, Some(Utc::now()));
+        canceled.error = Some("canceled by request".to_string());
+        let delta = panel.fold_scan(&records, &[canceled.clone()], session_started_at);
+        assert_eq!(delta.settled.len(), 1, "{:?}", delta.settled);
+        assert_eq!(delta.settled[0].outcome, SettledOutcome::Canceled);
+        assert_eq!(delta.settled[0].run_id, "r2");
+        assert_eq!(
+            delta.settled[0].error.as_deref(),
+            Some("canceled by request")
         );
+        assert!(
+            !panel.has_unacknowledged_failure(),
+            "a cancellation is not a failure"
+        );
+
+        // The receipt is posted once: the same picture settles nothing more.
+        let delta = panel.fold_scan(&records, &[canceled], session_started_at);
         assert!(delta.settled.is_empty(), "{:?}", delta.settled);
     }
 

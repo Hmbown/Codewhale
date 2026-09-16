@@ -81,7 +81,7 @@ async fn completion_usage_live_terminal_counts_grandchildren_and_continuations_o
         let dir = tempdir().unwrap();
         let mut manager = SubAgentManager::new(dir.path().to_path_buf(), 8);
         let (root, _, _, _) = family(&mut manager);
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = mpsc::channel(16);
         let (event_tx, mut event_rx) = mpsc::channel(8);
         manager.agents.get_mut(&root).unwrap().terminal_delivery =
             Some(SubAgentTerminalDeliveryContext {

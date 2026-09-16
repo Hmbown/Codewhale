@@ -124,7 +124,7 @@ pub struct Client {
 impl Client {
     pub fn connect() -> io::Result<Self> {
         let root = owner::directory()?;
-        let http = reqwest::blocking::Client::builder()
+        let http = crate::tls::reqwest_blocking_client_builder()
             .no_proxy()
             .connect_timeout(Duration::from_millis(500))
             .timeout(Duration::from_secs(2))

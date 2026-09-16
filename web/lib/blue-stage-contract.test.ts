@@ -3,21 +3,6 @@ import { describe, expect, it } from "vitest";
 import { resolveWhale } from "./whale-tokens";
 
 const CSS = readFileSync(new URL("../app/globals.css", import.meta.url), "utf8");
-const TUI_TOKENS = readFileSync(
-  new URL("../../crates/palette/src/tokens.rs", import.meta.url),
-  "utf8",
-);
-
-function rustRgb(name: string): string {
-  const match = TUI_TOKENS.match(
-    new RegExp(`pub const ${name}_RGB:[^=]+\\= \\((\\d+), (\\d+), (\\d+)\\)`),
-  );
-  if (!match) throw new Error(`Missing Rust RGB token: ${name}_RGB`);
-  return `#${match
-    .slice(1)
-    .map((channel) => Number(channel).toString(16).padStart(2, "0"))
-    .join("")}`;
-}
 
 function selectorBlock(selector: string): string {
   const match = CSS.match(
@@ -27,9 +12,9 @@ function selectorBlock(selector: string): string {
   return match[1];
 }
 
-// globals.css names the palette token (`--paper: var(--whale-text-body)`)
+// globals.css names the palette token (`--paper: var(--gpui-paper)`)
 // rather than repeating its hex; resolve one hop through the generated
-// app/tokens.css.
+// app/tokens.css plus the hand-kept --gpui-* block.
 function cssHexIn(block: string, name: string): string {
   const match = block.match(new RegExp(`--${name}:\\s*([^;]+);`, "i"));
   if (!match) throw new Error(`Missing CSS token in block: --${name}`);
@@ -45,51 +30,51 @@ const BELOW_WATERLINE = selectorBlock(
   '.ocean-column,\n.site-footer,\nhtml[data-theme="dark"] .docs-portal',
 );
 
-describe("Tidal Folio public-surface contract", () => {
-  it("grounds the paper sheet in the TUI's own ivory and light-preset inks", () => {
-    // Above the waterline the field is Whale Ivory — the ink the TUI paints
-    // on its dark stage — and the ink is the Blue Stage light preset's navy.
-    expect(cssHexIn(ROOT, "paper")).toBe(rustRgb("WHALE_TEXT_BODY"));
-    expect(cssHexIn(ROOT, "paper-deep")).toBe(rustRgb("LIGHT_ELEVATED"));
-    expect(cssHexIn(ROOT, "paper-edge")).toBe(rustRgb("LIGHT_BORDER"));
-    expect(cssHexIn(ROOT, "paper-card")).toBe(rustRgb("LIGHT_PANEL"));
-    expect(cssHexIn(ROOT, "ink")).toBe(rustRgb("LIGHT_TEXT_BODY"));
-    expect(cssHexIn(ROOT, "ink-soft")).toBe(rustRgb("LIGHT_TEXT_SOFT"));
-    expect(cssHexIn(ROOT, "ink-mute")).toBe(rustRgb("LIGHT_TEXT_MUTED"));
-    // Action on paper is the ombre's dark end; hover sinks to brand navy.
-    expect(cssHexIn(ROOT, "indigo")).toBe(rustRgb("WHALE_COBALT"));
-    expect(cssHexIn(ROOT, "indigo-deep")).toBe(rustRgb("WHALE_COMPOSER"));
-    expect(cssHexIn(ROOT, "mark-ink")).toBe(rustRgb("WHALE_COMPOSER"));
-    expect(cssHexIn(ROOT, "signal-gold")).toBe(rustRgb("LIGHT_HUMAN"));
-    expect(cssHexIn(ROOT, "jade")).toBe(rustRgb("LIGHT_LIVE"));
-    // The deep field is always the whale's bg, and terminal plates keep the
-    // terminal's own navy on either side of the waterline.
-    expect(cssHexIn(ROOT, "ocean-deep")).toBe(rustRgb("WHALE_BG"));
-    expect(cssHexIn(ROOT, "action-on-dark")).toBe(rustRgb("WHALE_ACTION"));
-    expect(cssHexIn(ROOT, "ocean-current")).toBe(rustRgb("WHALE_ICE"));
-    expect(cssHexIn(ROOT, "code-bg")).toBe(rustRgb("WHALE_CHROME"));
+describe("GPUI public-surface contract", () => {
+  it("grounds the paper sheet in the GPUI light theme's warm paper and inks", () => {
+    // Above the waterline the field is the GPUI light background — warm
+    // paper — and the ink is its plum-charcoal foreground. The literals are
+    // the theme constants in codehwhale-gpui/src/workspace/mod.rs plus the
+    // derived tones in codehwhale-gpui/mockups/style.css.
+    expect(cssHexIn(ROOT, "paper")).toBe("#f5f0e9");
+    expect(cssHexIn(ROOT, "paper-deep")).toBe("#eae3de");
+    expect(cssHexIn(ROOT, "paper-edge")).toBe("#d7ced5");
+    expect(cssHexIn(ROOT, "paper-card")).toBe("#fbf5ee");
+    expect(cssHexIn(ROOT, "ink")).toBe("#302832");
+    expect(cssHexIn(ROOT, "ink-soft")).toBe("#564e58");
+    expect(cssHexIn(ROOT, "ink-mute")).toBe("#6b606e");
+    // Action on paper is the GPUI light primary; hover sinks to its hover.
+    expect(cssHexIn(ROOT, "indigo")).toBe("#245bc7");
+    expect(cssHexIn(ROOT, "indigo-deep")).toBe("#174aa9");
+    expect(cssHexIn(ROOT, "mark-ink")).toBe("#302832");
+    // The deep field is always the stage's darkest, and code plates keep the
+    // stage deep on either side of the waterline.
+    expect(cssHexIn(ROOT, "ocean-deep")).toBe("#171618");
+    expect(cssHexIn(ROOT, "action-on-dark")).toBe("#90b9ff");
+    expect(cssHexIn(ROOT, "ocean-current")).toBe("#90b9ff");
+    expect(cssHexIn(ROOT, "code-bg")).toBe("#171618");
   });
 
-  it("re-inks every dark subtree with the TUI dark whale tokens through one rule", () => {
+  it("re-inks every dark subtree with the GPUI charcoal tokens through one rule", () => {
     // The ocean column, the footer seabed, and the opt-in docs dark sheet
     // share one below-the-waterline rule, so a component never needs to know
     // which side of the surface it is on.
     expect(CSS).toMatch(/\.ocean-column,\s*\.site-footer,\s*html\[data-theme="dark"\] \.docs-portal\s*\{/);
-    expect(cssHexIn(BELOW_WATERLINE, "paper")).toBe(rustRgb("WHALE_BG"));
-    expect(cssHexIn(BELOW_WATERLINE, "paper-deep")).toBe(rustRgb("WHALE_PANEL"));
-    expect(cssHexIn(BELOW_WATERLINE, "paper-edge")).toBe(rustRgb("WHALE_BORDER"));
-    expect(cssHexIn(BELOW_WATERLINE, "ink")).toBe(rustRgb("WHALE_TEXT_BODY"));
-    expect(cssHexIn(BELOW_WATERLINE, "ink-soft")).toBe(rustRgb("WHALE_TEXT_SOFT"));
-    expect(cssHexIn(BELOW_WATERLINE, "ink-mute")).toBe(rustRgb("WHALE_TEXT_MUTED"));
-    expect(cssHexIn(BELOW_WATERLINE, "indigo")).toBe(rustRgb("WHALE_ACTION"));
-    expect(cssHexIn(BELOW_WATERLINE, "jade")).toBe(rustRgb("WHALE_WORKING_GREEN"));
-    expect(cssHexIn(BELOW_WATERLINE, "signal-gold")).toBe(rustRgb("WHALE_HUMAN"));
+    expect(cssHexIn(BELOW_WATERLINE, "paper")).toBe("#211f23");
+    expect(cssHexIn(BELOW_WATERLINE, "paper-deep")).toBe("#2b282e");
+    expect(cssHexIn(BELOW_WATERLINE, "paper-edge")).toBe("#49424d");
+    expect(cssHexIn(BELOW_WATERLINE, "ink")).toBe("#f2ece5");
+    expect(cssHexIn(BELOW_WATERLINE, "ink-soft")).toBe("#b0a7b2");
+    expect(cssHexIn(BELOW_WATERLINE, "ink-mute")).toBe("#8d858f");
+    expect(cssHexIn(BELOW_WATERLINE, "indigo")).toBe("#90b9ff");
+    expect(cssHexIn(BELOW_WATERLINE, "jade")).toBe("#9ec7b2");
+    expect(cssHexIn(BELOW_WATERLINE, "signal-gold")).toBe("#d6c78f");
   });
 
   it("draws the water from palette tokens only, never a hex of its own", () => {
     const strata = readFileSync(new URL("../components/strata.tsx", import.meta.url), "utf8");
     expect(strata).not.toMatch(/#[0-9a-f]{3,8}\b/i);
-    for (const token of ["--whale-action", "--whale-elevated", "--whale-composer", "--whale-bg", "--whale-ice", "--whale-human"]) {
+    for (const token of ["--gpui-primary-dark", "--gpui-stage-raised", "--gpui-stage-muted", "--gpui-stage-deep", "--gpui-tan", "--ink"]) {
       expect(strata, token).toContain(`var(${token})`);
     }
     // Static and decorative: no animation, hidden from assistive technology.

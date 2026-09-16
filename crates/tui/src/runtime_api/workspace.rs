@@ -1,8 +1,12 @@
-use std::path::{Path as FsPath, PathBuf};
+use std::io::Read as _;
+use std::path::{Component, Path as FsPath, PathBuf};
 
 use axum::Json;
 use axum::extract::{Query, State};
+use axum::http::StatusCode;
+use base64::Engine as _;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::dependencies::{ExternalTool as _, Git};
 
@@ -211,6 +215,666 @@ fn current_git_head(workspace: &FsPath) -> Option<String> {
     let head = run_git(workspace, &["rev-parse", "--short", "HEAD"])?;
     let head = head.trim();
     (!head.is_empty()).then(|| head.to_string())
+}
+
+// ---------------------------------------------------------------------------
+// Workspace files (#6163): a bounded directory listing, bounded reads that
+// carry a content revision, and revision-checked writes. The server's
+// configured workspace is the only root and every path is workspace-relative
+// with `/` separators. Symlinks are never followed, `.git` is never served,
+// and there is no second file store: bytes go straight to the workspace
+// through the same confined opener Fleet artifacts use.
+// ---------------------------------------------------------------------------
+
+const FILE_LIST_LIMIT_DEFAULT: usize = 200;
+const FILE_LIST_LIMIT_MAX: usize = 2_000;
+pub(super) const FILE_READ_LIMIT_DEFAULT: usize = 256 * 1024;
+pub(super) const FILE_READ_LIMIT_MAX: usize = 4 * 1024 * 1024;
+/// Files above this size are not served at all: the revision is a digest of
+/// the whole file, and a Files browser should not page through larger blobs.
+const FILE_SERVE_MAX_BYTES: u64 = 16 * 1024 * 1024;
+pub(super) const FILE_WRITE_MAX_BYTES: usize = 4 * 1024 * 1024;
+/// Request-body ceiling for the write route: the content cap plus headroom for
+/// base64 expansion and the JSON envelope, so an oversized `content` reaches
+/// the handler and gets a 413 with a message instead of a dropped connection.
+pub(super) const FILE_WRITE_BODY_LIMIT_BYTES: usize = FILE_WRITE_MAX_BYTES * 4 / 3 + 64 * 1024;
+const FILE_PATH_MAX_BYTES: usize = 4_096;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct WorkspaceFilesListQuery {
+    #[serde(default)]
+    path: String,
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+pub(super) struct WorkspaceFileEntry {
+    name: String,
+    path: String,
+    /// `file`, `directory`, `symlink` (listed by name, never followed) or `other`.
+    kind: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    size: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    modified: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub(super) struct WorkspaceFilesListResponse {
+    path: String,
+    entries: Vec<WorkspaceFileEntry>,
+    truncated: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct WorkspaceFileReadQuery {
+    path: String,
+    offset: Option<usize>,
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+pub(super) struct WorkspaceFileReadResponse {
+    path: String,
+    size: u64,
+    /// SHA-256 of the whole file, not of the returned window.
+    revision: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    modified: Option<String>,
+    offset: usize,
+    bytes: usize,
+    truncated: bool,
+    encoding: &'static str,
+    content: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct WorkspaceFileWriteRequest {
+    path: String,
+    content: String,
+    /// `utf-8` (default) or `base64`.
+    #[serde(default)]
+    encoding: Option<String>,
+    /// Required to overwrite an existing file; must be absent for a new one.
+    #[serde(default)]
+    expected_revision: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub(super) struct WorkspaceFileWriteResponse {
+    path: String,
+    size: u64,
+    revision: String,
+    created: bool,
+    written_at: String,
+}
+
+/// Bytes of one confined file plus the facts a client needs to reason about
+/// them: total size, the whole-file revision and the modification time.
+pub(super) struct ConfinedFileBytes {
+    pub(super) size: u64,
+    pub(super) revision: String,
+    pub(super) modified: Option<String>,
+    pub(super) bytes: Vec<u8>,
+}
+
+pub(super) fn parse_read_window(
+    offset: Option<usize>,
+    limit: Option<usize>,
+) -> Result<(usize, usize), ApiError> {
+    let limit = limit.unwrap_or(FILE_READ_LIMIT_DEFAULT);
+    if !(1..=FILE_READ_LIMIT_MAX).contains(&limit) {
+        return Err(ApiError::bad_request(format!(
+            "limit must be between 1 and {FILE_READ_LIMIT_MAX} bytes"
+        )));
+    }
+    Ok((offset.unwrap_or(0), limit))
+}
+
+/// Byte window `[offset, offset + limit)` clamped to the content.
+pub(super) fn read_window(bytes: &[u8], offset: usize, limit: usize) -> (&[u8], bool) {
+    let start = offset.min(bytes.len());
+    let end = start.saturating_add(limit).min(bytes.len());
+    (&bytes[start..end], end < bytes.len())
+}
+
+/// Text windows come back as UTF-8; anything with a NUL byte, invalid UTF-8,
+/// or a window that splits a multi-byte character comes back as base64.
+pub(super) fn encode_window(window: &[u8]) -> (&'static str, String) {
+    if !window.contains(&0)
+        && let Ok(text) = std::str::from_utf8(window)
+    {
+        return ("utf-8", text.to_string());
+    }
+    (
+        "base64",
+        base64::engine::general_purpose::STANDARD.encode(window),
+    )
+}
+
+pub(super) fn content_revision(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn rfc3339(time: std::time::SystemTime) -> String {
+    chrono::DateTime::<chrono::Utc>::from(time).to_rfc3339()
+}
+
+pub(super) fn map_fs_error(error: std::io::Error, what: &str) -> ApiError {
+    use std::io::ErrorKind;
+    match error.kind() {
+        ErrorKind::NotFound => ApiError::not_found(format!("{what} not found")),
+        ErrorKind::PermissionDenied => ApiError::forbidden(format!("{what} is not readable")),
+        ErrorKind::InvalidInput | ErrorKind::InvalidData => ApiError::forbidden(format!(
+            "{what} must be a regular, non-linked path inside the workspace"
+        )),
+        ErrorKind::Unsupported => {
+            ApiError::not_implemented("confined file access is unavailable on this platform")
+        }
+        _ => ApiError::internal(format!("{what} access failed: {error}")),
+    }
+}
+
+/// A workspace-relative request path. Empty and `.` mean the root, which only
+/// listing accepts. Absolute paths, `..`, backslashes and `.git` are refused.
+pub(super) fn relative_request_path(raw: &str, allow_root: bool) -> Result<PathBuf, ApiError> {
+    let trimmed = raw.trim();
+    if trimmed.len() > FILE_PATH_MAX_BYTES {
+        return Err(ApiError::bad_request(format!(
+            "path must be at most {FILE_PATH_MAX_BYTES} UTF-8 bytes"
+        )));
+    }
+    if trimmed.contains('\\') {
+        return Err(ApiError::bad_request("path must use / separators"));
+    }
+    if trimmed.starts_with('/') || FsPath::new(trimmed).is_absolute() {
+        return Err(ApiError::bad_request("path must be workspace-relative"));
+    }
+    let trimmed = trimmed.trim_end_matches('/');
+    if trimmed.is_empty() || trimmed == "." {
+        return if allow_root {
+            Ok(PathBuf::new())
+        } else {
+            Err(ApiError::bad_request("path is required"))
+        };
+    }
+    let path = PathBuf::from(trimmed);
+    if !crate::fleet::files::path_is_confined(&path) {
+        return Err(ApiError::bad_request(
+            "path must be workspace-relative without . or .. components",
+        ));
+    }
+    if path
+        .components()
+        .any(|component| matches!(component, Component::Normal(name) if name == ".git"))
+    {
+        return Err(ApiError::forbidden("the .git directory is not served"));
+    }
+    Ok(path)
+}
+
+pub(super) fn canonical_workspace(workspace: &FsPath) -> Result<PathBuf, ApiError> {
+    workspace
+        .canonicalize()
+        .map_err(|_| ApiError::internal("workspace is unavailable"))
+}
+
+fn relative_display(path: &FsPath) -> String {
+    path.components()
+        .filter_map(|component| match component {
+            Component::Normal(name) => Some(name.to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// Walk `relative` from the root one component at a time, refusing any link
+/// or reparse point on the way, and confirm the result is a directory that
+/// still resolves inside the root.
+fn confined_directory(root: &FsPath, relative: &FsPath) -> Result<PathBuf, ApiError> {
+    let mut directory = root.to_path_buf();
+    for component in relative.components() {
+        directory.push(component);
+        let metadata = std::fs::symlink_metadata(&directory)
+            .map_err(|error| map_fs_error(error, "directory"))?;
+        if metadata.file_type().is_symlink()
+            || crate::plugins::metadata_is_link_or_reparse(&metadata)
+        {
+            return Err(ApiError::forbidden("symlinks are not followed"));
+        }
+        if !metadata.is_dir() {
+            return Err(ApiError::bad_request("path is not a directory"));
+        }
+    }
+    let resolved = directory
+        .canonicalize()
+        .map_err(|error| map_fs_error(error, "directory"))?;
+    if !resolved.starts_with(root) {
+        return Err(ApiError::forbidden("path resolves outside the workspace"));
+    }
+    Ok(directory)
+}
+
+pub(super) async fn workspace_files_list(
+    State(state): State<RuntimeApiState>,
+    Query(query): Query<WorkspaceFilesListQuery>,
+) -> Result<Json<WorkspaceFilesListResponse>, ApiError> {
+    let relative = relative_request_path(&query.path, true)?;
+    let limit = query.limit.unwrap_or(FILE_LIST_LIMIT_DEFAULT);
+    if !(1..=FILE_LIST_LIMIT_MAX).contains(&limit) {
+        return Err(ApiError::bad_request(format!(
+            "limit must be between 1 and {FILE_LIST_LIMIT_MAX}"
+        )));
+    }
+    let workspace = state.workspace.clone();
+    tokio::task::spawn_blocking(move || list_workspace_directory(&workspace, &relative, limit))
+        .await
+        .map_err(|_| ApiError::internal("workspace listing failed"))?
+        .map(Json)
+}
+
+fn list_workspace_directory(
+    workspace: &FsPath,
+    relative: &FsPath,
+    limit: usize,
+) -> Result<WorkspaceFilesListResponse, ApiError> {
+    let root = canonical_workspace(workspace)?;
+    let directory = confined_directory(&root, relative)?;
+    let mut entries = Vec::new();
+    let read_dir =
+        std::fs::read_dir(&directory).map_err(|error| map_fs_error(error, "directory"))?;
+    for entry in read_dir {
+        let entry = entry.map_err(|error| map_fs_error(error, "directory"))?;
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if name == ".git" {
+            continue;
+        }
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        let metadata = entry.metadata().ok();
+        let is_link = file_type.is_symlink()
+            || metadata
+                .as_ref()
+                .is_some_and(crate::plugins::metadata_is_link_or_reparse);
+        let kind = if is_link {
+            "symlink"
+        } else if file_type.is_dir() {
+            "directory"
+        } else if file_type.is_file() {
+            "file"
+        } else {
+            "other"
+        };
+        let file_metadata = (kind == "file").then_some(metadata).flatten();
+        entries.push(WorkspaceFileEntry {
+            path: relative_display(&relative.join(&name)),
+            name,
+            kind,
+            size: file_metadata.as_ref().map(std::fs::Metadata::len),
+            modified: file_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.modified().ok())
+                .map(rfc3339),
+        });
+    }
+    entries.sort_by(|left, right| {
+        (left.kind != "directory")
+            .cmp(&(right.kind != "directory"))
+            .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    let truncated = entries.len() > limit;
+    entries.truncate(limit);
+    Ok(WorkspaceFilesListResponse {
+        path: relative_display(relative),
+        entries,
+        truncated,
+    })
+}
+
+pub(super) fn open_confined_file(
+    root: &FsPath,
+    relative: &FsPath,
+    create: bool,
+) -> Result<crate::fleet::files::WorkspaceFile, ApiError> {
+    crate::fleet::files::WorkspaceFile::open(root, relative, create)
+        .map_err(|error| map_fs_error(error, "file"))
+}
+
+/// Read one confined file completely (bounded by `FILE_SERVE_MAX_BYTES`) so
+/// the revision always describes the whole file.
+pub(super) fn read_confined_bytes(
+    file: &crate::fleet::files::WorkspaceFile,
+) -> Result<ConfinedFileBytes, ApiError> {
+    let mut handle = file
+        .open_file()
+        .map_err(|error| map_fs_error(error, "file"))?;
+    let metadata = handle
+        .metadata()
+        .map_err(|error| map_fs_error(error, "file"))?;
+    if metadata.len() > FILE_SERVE_MAX_BYTES {
+        return Err(ApiError::payload_too_large(format!(
+            "file is larger than the {FILE_SERVE_MAX_BYTES}-byte serving limit"
+        )));
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    handle
+        .by_ref()
+        .take(FILE_SERVE_MAX_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| map_fs_error(error, "file"))?;
+    if bytes.len() as u64 > FILE_SERVE_MAX_BYTES {
+        return Err(ApiError::payload_too_large(format!(
+            "file grew past the {FILE_SERVE_MAX_BYTES}-byte serving limit while it was read"
+        )));
+    }
+    Ok(ConfinedFileBytes {
+        size: bytes.len() as u64,
+        revision: content_revision(&bytes),
+        modified: metadata.modified().ok().map(rfc3339),
+        bytes,
+    })
+}
+
+/// Refuse links and non-files before the confined opener runs, so a client
+/// sees a precise status instead of a generic confinement error.
+pub(super) fn precheck_file_target(
+    root: &FsPath,
+    relative: &FsPath,
+) -> Result<Option<std::fs::Metadata>, ApiError> {
+    if let Some(parent) = relative
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        // Every directory on the way must be a real directory; a link would
+        // otherwise surface as a confinement error from the opener.
+        confined_directory(root, parent).or_else(|error| {
+            if error.status == StatusCode::NOT_FOUND {
+                Ok(PathBuf::new())
+            } else {
+                Err(error)
+            }
+        })?;
+    }
+    match std::fs::symlink_metadata(root.join(relative)) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink()
+                || crate::plugins::metadata_is_link_or_reparse(&metadata)
+            {
+                return Err(ApiError::forbidden("symlinks are not followed"));
+            }
+            if metadata.is_dir() {
+                return Err(ApiError::bad_request("path is a directory"));
+            }
+            Ok(Some(metadata))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(map_fs_error(error, "file")),
+    }
+}
+
+pub(super) async fn workspace_file_read(
+    State(state): State<RuntimeApiState>,
+    Query(query): Query<WorkspaceFileReadQuery>,
+) -> Result<Json<WorkspaceFileReadResponse>, ApiError> {
+    let relative = relative_request_path(&query.path, false)?;
+    let (offset, limit) = parse_read_window(query.offset, query.limit)?;
+    let workspace = state.workspace.clone();
+    tokio::task::spawn_blocking(move || {
+        let root = canonical_workspace(&workspace)?;
+        if precheck_file_target(&root, &relative)?.is_none() {
+            return Err(ApiError::not_found("file not found"));
+        }
+        let file = open_confined_file(&root, &relative, false)?;
+        let read = read_confined_bytes(&file)?;
+        let (window, truncated) = read_window(&read.bytes, offset, limit);
+        let (encoding, content) = encode_window(window);
+        Ok(WorkspaceFileReadResponse {
+            path: relative_display(&relative),
+            size: read.size,
+            revision: read.revision,
+            modified: read.modified,
+            offset: offset.min(read.bytes.len()),
+            bytes: window.len(),
+            truncated,
+            encoding,
+            content,
+        })
+    })
+    .await
+    .map_err(|_| ApiError::internal("workspace file read failed"))?
+    .map(Json)
+}
+
+pub(super) async fn workspace_file_write(
+    State(state): State<RuntimeApiState>,
+    Json(request): Json<WorkspaceFileWriteRequest>,
+) -> Result<(StatusCode, Json<WorkspaceFileWriteResponse>), ApiError> {
+    let relative = relative_request_path(&request.path, false)?;
+    let bytes = match request.encoding.as_deref().unwrap_or("utf-8") {
+        "utf-8" => request.content.into_bytes(),
+        "base64" => base64::engine::general_purpose::STANDARD
+            .decode(request.content.as_bytes())
+            .map_err(|_| ApiError::bad_request("content is not valid base64"))?,
+        _ => return Err(ApiError::bad_request("encoding must be utf-8 or base64")),
+    };
+    if bytes.len() > FILE_WRITE_MAX_BYTES {
+        return Err(ApiError::payload_too_large(format!(
+            "content must be at most {FILE_WRITE_MAX_BYTES} bytes"
+        )));
+    }
+    let expected_revision = request
+        .expected_revision
+        .map(|revision| revision.trim().to_ascii_lowercase())
+        .filter(|revision| !revision.is_empty());
+    let workspace = state.workspace.clone();
+    tokio::task::spawn_blocking(move || {
+        write_workspace_file(&workspace, &relative, &bytes, expected_revision.as_deref())
+    })
+    .await
+    .map_err(|_| ApiError::internal("workspace file write failed"))?
+}
+
+fn write_workspace_file(
+    workspace: &FsPath,
+    relative: &FsPath,
+    bytes: &[u8],
+    expected_revision: Option<&str>,
+) -> Result<(StatusCode, Json<WorkspaceFileWriteResponse>), ApiError> {
+    let root = canonical_workspace(workspace)?;
+    let created = precheck_file_target(&root, relative)?.is_none();
+    match (created, expected_revision) {
+        (true, Some(_)) => {
+            return Err(ApiError::conflict(
+                "expected_revision was given but the file does not exist",
+            ));
+        }
+        (false, None) => {
+            return Err(ApiError::conflict(
+                "expected_revision is required to overwrite an existing file; read it first",
+            ));
+        }
+        _ => {}
+    }
+    // Parents are created only for a new file, and only through the confined
+    // opener, which refuses links at every component.
+    let file = open_confined_file(&root, relative, created)?;
+    if let Some(expected) = expected_revision {
+        let current = read_confined_bytes(&file)?;
+        if current.revision != expected {
+            return Err(ApiError::conflict(format!(
+                "file changed since it was read; current revision is {}",
+                current.revision
+            )));
+        }
+    }
+    file.replace(bytes)
+        .map_err(|error| map_fs_error(error, "file"))?;
+    Ok((
+        if created {
+            StatusCode::CREATED
+        } else {
+            StatusCode::OK
+        },
+        Json(WorkspaceFileWriteResponse {
+            path: relative_display(relative),
+            size: bytes.len() as u64,
+            revision: content_revision(bytes),
+            created,
+            written_at: chrono::Utc::now().to_rfc3339(),
+        }),
+    ))
+}
+
+// ── Effective instruction sources (#6168) ────────────────────────────────
+
+#[derive(Debug, Serialize)]
+pub(super) struct WorkspaceInstructionSource {
+    /// `project` | `rule` | `global` | `fragment` | `configured` |
+    /// `constitution` | `ignored`.
+    kind: &'static str,
+    /// `loaded` | `shadowed` | `skipped` | `missing`.
+    status: &'static str,
+    scope_dir: PathBuf,
+    path: PathBuf,
+    /// Workspace-relative spelling when the path sits under the workspace.
+    relative_path: Option<String>,
+    exists: bool,
+    bytes: Option<u64>,
+    warning: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub(super) struct WorkspaceInstructionsResponse {
+    workspace: PathBuf,
+    sources: Vec<WorkspaceInstructionSource>,
+    /// Foreign instruction formats the operator opted into.
+    foreign_imports: Vec<String>,
+    /// True when no file-based instructions exist anywhere and the
+    /// prompt carries the ephemeral generated context instead.
+    generated_fallback: bool,
+    /// Aggregate byte ceiling applied across instructions and rules at
+    /// render (`project_context::MAX_PROJECT_INSTRUCTION_BYTES`).
+    aggregate_budget_bytes: usize,
+    /// Warnings from the real load pass — includes assembly-level notices
+    /// (unimported foreign formats, ignored WHALE.md, constitution parse)
+    /// alongside what per-source `warning` fields already carry.
+    warnings: Vec<String>,
+}
+
+fn instruction_source_kind_name(
+    kind: crate::project_context::InstructionSourceKind,
+) -> &'static str {
+    use crate::project_context::InstructionSourceKind as Kind;
+    match kind {
+        Kind::Project => "project",
+        Kind::Rule => "rule",
+        Kind::Global => "global",
+        Kind::Fragment => "fragment",
+        Kind::Configured => "configured",
+        Kind::Constitution => "constitution",
+        Kind::Ignored => "ignored",
+    }
+}
+
+fn instruction_source_status_name(
+    status: crate::project_context::InstructionSourceStatus,
+) -> &'static str {
+    use crate::project_context::InstructionSourceStatus as Status;
+    match status {
+        Status::Loaded => "loaded",
+        Status::Shadowed => "shadowed",
+        Status::Skipped => "skipped",
+        Status::Missing => "missing",
+    }
+}
+
+/// Read-only listing of the effective instruction sources for this
+/// workspace (#6168): repository-root → workspace chain candidates, rules
+/// files, the global fallback layer, opted-in foreign fragments, configured
+/// `instructions = [...]` files, and the constitution — each with the status
+/// the prompt loaders give it. Edits go through the workspace file routes.
+pub(super) async fn workspace_instructions(
+    State(state): State<RuntimeApiState>,
+) -> Result<Json<WorkspaceInstructionsResponse>, ApiError> {
+    let workspace = state.workspace.clone();
+    let home = crate::config::effective_home_dir();
+    let configured = state.config.read().instructions_paths();
+
+    let (sources, generated_fallback, warnings, workspace_root) =
+        tokio::task::spawn_blocking(move || {
+            let sources = crate::project_context::project_instruction_sources(
+                &workspace,
+                home.as_deref(),
+                &configured,
+            );
+            // The real load pass supplies assembly-level warnings and tells us
+            // whether the ephemeral generated context is what the prompt
+            // carries. Cached — this is the same call the engine makes.
+            let ctx = crate::project_context::load_project_context_with_parents(&workspace);
+            let generated_fallback = ctx.instructions.is_some() && ctx.source_path.is_none();
+            // `project_instruction_sources` canonicalizes the workspace (the
+            // `/var` → `/private/var` class of alias), so relative paths must
+            // be computed against the canonical spelling or every strip fails.
+            // It rides this closure rather than the async body because
+            // `canonicalize` is a blocking syscall, and one on a Tokio worker
+            // is one too many (#6149).
+            let workspace_root =
+                std::fs::canonicalize(&workspace).unwrap_or_else(|_| workspace.clone());
+            (sources, generated_fallback, ctx.warnings, workspace_root)
+        })
+        .await
+        .map_err(|_| ApiError::internal("instruction source listing failed"))?;
+    Ok(Json(WorkspaceInstructionsResponse {
+        workspace: workspace_root.clone(),
+        sources: sources
+            .into_iter()
+            .map(|source| WorkspaceInstructionSource {
+                kind: instruction_source_kind_name(source.kind),
+                status: instruction_source_status_name(source.status),
+                // Forward slashes on every platform. `display()` emits the
+                // native separator, which would make a wire field describing a
+                // repo-relative path differ between a Windows and a Unix host
+                // and force every client to branch on the server's OS. The
+                // absolute `path` below stays native, because that one is only
+                // meaningful on the machine that produced it.
+                relative_path: source
+                    .path
+                    .strip_prefix(&workspace_root)
+                    .ok()
+                    .map(|relative| {
+                        relative
+                            .components()
+                            .map(|part| part.as_os_str().to_string_lossy())
+                            .collect::<Vec<_>>()
+                            .join("/")
+                    }),
+                scope_dir: source.scope_dir,
+                path: source.path,
+                exists: source.exists,
+                bytes: source.bytes,
+                warning: source.warning,
+            })
+            .collect(),
+        foreign_imports: crate::project_context::foreign_instruction_imports()
+            .keys()
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+        generated_fallback,
+        aggregate_budget_bytes: crate::project_context::MAX_PROJECT_INSTRUCTION_BYTES,
+        warnings,
+    }))
 }
 
 #[cfg(test)]

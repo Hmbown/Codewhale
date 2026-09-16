@@ -79,13 +79,102 @@ export function appExec(app, sessionId = SESSION_ID) {
   };
 }
 
+/**
+ * A persistent ssh agent channel: one `ssh host node agent.mjs --serve`
+ * process carrying base64-JSON request lines in and JSON receipt lines out.
+ * Unlike the one-shot agent it keeps its backend alive between calls, so an
+ * open_application binding survives into later raw-input calls and held
+ * input/recording can be owned by the session. Requests written before the
+ * channel dies may already have run remotely — their failures are marked
+ * requestDispatched so the server reports outcome_unknown instead of
+ * inviting a blind retry.
+ */
+export function ensureSshChannel(binding, argv) {
+  let ch = binding.sshChannel;
+  if (ch?.alive) return ch;
+  const next = { alive: false, restarted: !!ch, everReplied: false, pending: new Map(), seq: 1, buf: "", proc: null };
+  binding.sshChannel = next;
+  const failAll = (err) => {
+    for (const [, p] of next.pending) { clearTimeout(p.timer); p.reject(err); }
+    next.pending.clear();
+  };
+  let proc;
+  try {
+    proc = spawn(argv[0], argv.slice(1), { stdio: ["pipe", "pipe", "pipe"], windowsHide: true });
+  } catch (err) {
+    next.spawnError = err;
+    return next;
+  }
+  next.proc = proc;
+  next.alive = true;
+  proc.stdin.on("error", () => {});
+  proc.stderr.on("data", () => {}); // drain; stderr is never parsed
+  proc.stdout.setEncoding("utf8");
+  proc.stdout.on("data", (d) => {
+    next.buf += d;
+    let i;
+    while ((i = next.buf.indexOf("\n")) !== -1) {
+      const line = next.buf.slice(0, i).trim();
+      next.buf = next.buf.slice(i + 1);
+      if (!line.startsWith("{")) continue; // MOTD/banner noise
+      let msg;
+      try { msg = JSON.parse(line); } catch { continue; }
+      next.everReplied = true;
+      const p = next.pending.get(msg.id);
+      if (!p) continue; // timed-out or unknown request: drop the late reply
+      next.pending.delete(msg.id);
+      clearTimeout(p.timer);
+      p.resolve(msg);
+    }
+  });
+  const dead = (why) => {
+    if (!next.alive) return;
+    next.alive = false;
+    failAll(Object.assign(new ExecError(`ssh agent channel closed${why ? `: ${why}` : ""}`), { code: "remote_session_lost", requestDispatched: true }));
+  };
+  proc.on("error", (err) => dead(String(err?.message ?? err)));
+  proc.on("close", (code, sig) => dead(code != null ? `exited ${code}` : `signal ${sig}`));
+  return next;
+}
+
+export function closeSshChannel(binding) {
+  const ch = binding.sshChannel;
+  if (!ch) return;
+  binding.sshChannel = null;
+  ch.alive = false;
+  try { ch.proc?.stdin.end(); } catch {}
+  try { ch.proc?.kill("SIGTERM"); } catch {}
+  for (const [, p] of ch.pending ?? []) {
+    clearTimeout(p.timer);
+    p.reject(Object.assign(new ExecError("ssh agent channel closed"), { code: "remote_session_lost", requestDispatched: true }));
+  }
+  ch.pending?.clear();
+}
+
+export function channelRequest(ch, request, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    if (!ch.alive) {
+      reject(Object.assign(new ExecError("ssh agent channel is closed"), { code: "remote_session_lost" }));
+      return;
+    }
+    const id = ch.seq++;
+    const timer = setTimeout(() => {
+      ch.pending.delete(id);
+      // The request was written; the remote may still be executing it.
+      reject(Object.assign(new ExecError(`ssh agent timed out after ${timeoutMs}ms`), { code: "remote_timeout", requestDispatched: true }));
+    }, timeoutMs);
+    ch.pending.set(id, { resolve, reject, timer });
+    ch.proc.stdin.write(b64({ id, tool: request.tool, args: request.args ?? {} }) + "\n");
+  });
+}
+
 /** ssh executor: speaks to the remote agent installed by installRemoteAgent(). */
-export function sshExec(computer) {
+export function sshExec(computer, binding) {
   const userHost = computer.user ? `${computer.user}@${computer.host}` : computer.host;
   const portArgs = computer.port ? ["-p", String(computer.port)] : [];
   const remoteAgent = safeRemotePath(computer.agentPath ?? ".codewhale-cu/agent/agent.mjs");
   const base = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "-o", "StrictHostKeyChecking=accept-new", ...portArgs, userHost];
-  return {
+  const ex = {
     kind: "ssh",
     base,
     userHost,
@@ -108,6 +197,32 @@ export function sshExec(computer) {
       return reply;
     },
   };
+  if (binding) {
+    // Read-only/identity requests may run on a restarted channel; input tools
+    // may not, because the fresh remote agent no longer holds this session's
+    // open_application binding.
+    const SAFE_AFTER_RESTART = new Set([
+      "platform", "probe", "list_displays", "switch_display", "list_apps", "list_windows",
+      "get_app_state", "resolve_element", "screenshot", "zoom", "cursor_position",
+      "read_clipboard", "recordingList", "recordingStatus", "open_application", "preview",
+    ]);
+    ex.persistent = (request, opts = {}) => {
+      const ch = ensureSshChannel(binding, ["ssh", ...base, "node", remoteAgent, "--serve"]);
+      if (ch.spawnError) {
+        return Promise.reject(Object.assign(new ExecError(`ssh agent channel failed to start: ${ch.spawnError.message}`), { code: "remote_session_lost" }));
+      }
+      if (ch.restarted) {
+        ch.restarted = false;
+        binding.needsObservation = true;
+        if (!SAFE_AFTER_RESTART.has(request.tool)) {
+          return Promise.reject(Object.assign(new ExecError("the remote agent session restarted — rebind with open_application and observe before acting"), { code: "remote_session_restarted" }));
+        }
+      }
+      return channelRequest(ch, request, opts.timeoutMs ?? 25_000);
+    };
+    ex.closeChannel = () => closeSshChannel(binding);
+  }
+  return ex;
 }
 
 /** Push the self-contained remote agent + src tree to an ssh computer. */
@@ -170,7 +285,7 @@ export function hdcExec(computer) {
   };
 }
 
-export async function executorFor(computer) {
+export async function executorFor(computer, binding) {
   if (computer.transport === "local") {
     // Test hook: exercise the out-of-process wire path (desktop app / ssh
     // agent) in-process, so wire argument preparation is covered by tests.
@@ -186,7 +301,7 @@ export async function executorFor(computer) {
     }
     return { ...localExec(), appReason: status.reason };
   }
-  if (computer.transport === "ssh") return sshExec(computer);
+  if (computer.transport === "ssh") return sshExec(computer, binding);
   if (computer.transport === "hdc") return hdcExec(computer);
   throw new ExecError(`unknown transport ${computer.transport}`);
 }

@@ -93,9 +93,18 @@ use codewhale_protocol::fleet::{
 };
 
 mod auth;
+mod context;
+mod diagnostics;
+mod git;
+mod jobs;
+mod lsp;
+mod memory_lens;
 mod mobile;
 mod plugins;
+mod secrets;
 mod sessions;
+mod targets;
+mod voice;
 mod web;
 mod workspace;
 #[cfg(test)]
@@ -105,14 +114,18 @@ use self::auth::{
     runtime_request_is_authorized,
 };
 use self::sessions::{
-    create_session_from_thread, delete_session, get_session, list_sessions, list_sessions_summary,
-    patch_session, resume_session_thread, save_current_session,
+    create_session_from_thread, delete_session, get_session, list_session_artifacts, list_sessions,
+    list_sessions_summary, patch_session, read_session_artifact, resume_session_thread,
+    save_current_session,
 };
 #[cfg(test)]
 use self::sessions::{messages_from_thread_detail, session_to_detail};
 #[cfg(test)]
 use self::workspace::collect_workspace_status;
-use self::workspace::{collect_workspace_git_metadata, workspace_file_search, workspace_status};
+use self::workspace::{
+    collect_workspace_git_metadata, workspace_file_read, workspace_file_search,
+    workspace_file_write, workspace_files_list, workspace_instructions, workspace_status,
+};
 
 const RUNTIME_TOKEN_ENV: &str = "CODEWHALE_RUNTIME_TOKEN";
 const LEGACY_RUNTIME_TOKEN_ENV: &str = "DEEPSEEK_RUNTIME_TOKEN";
@@ -189,6 +202,11 @@ pub struct RuntimeApiState {
     /// lazily-initialized slot; slow per-pool work (connect_all) runs under
     /// the inner handle so it cannot block slot reads.
     mcp_pool: Arc<Mutex<Option<Arc<Mutex<McpPool>>>>>,
+    /// Workspace-level LSP client for the HTTP surface (APPS-93): diagnostics
+    /// and semantic queries on files a client views. Engines keep their own
+    /// per-thread managers; this one serves the file view and is built lazily
+    /// so a server without LSP use never spawns a language server.
+    lsp_manager: Arc<std::sync::OnceLock<Arc<crate::lsp::LspManager>>>,
     #[cfg(test)]
     compat_stream_test_hook: Option<tokio::sync::mpsc::UnboundedSender<CompatStreamTestPoint>>,
 }
@@ -942,6 +960,7 @@ pub async fn run_http_server(
         web,
         fleet_codewhale_binary: configured_codewhale_binary(),
         mcp_pool: Arc::new(Mutex::new(None)),
+        lsp_manager: Arc::new(std::sync::OnceLock::new()),
         #[cfg(test)]
         compat_stream_test_hook: None,
     };
@@ -1073,6 +1092,7 @@ fn fallback_sessions_dir() -> PathBuf {
 }
 
 pub fn build_router(state: RuntimeApiState) -> Router {
+    diagnostics::mark_server_started();
     let api_routes = Router::new()
         .route(
             "/v1/sessions",
@@ -1089,8 +1109,23 @@ pub fn build_router(state: RuntimeApiState) -> Router {
             "/v1/sessions/{id}/resume-thread",
             post(resume_session_thread),
         )
+        .route("/v1/sessions/{id}/artifacts", get(list_session_artifacts))
+        .route(
+            "/v1/sessions/{id}/artifacts/{artifact_id}",
+            get(read_session_artifact),
+        )
         .route("/v1/workspace/status", get(workspace_status))
         .route("/v1/workspace/files/search", get(workspace_file_search))
+        .route(
+            "/v1/workspace/files",
+            get(workspace_files_list)
+                .put(workspace_file_write)
+                .layer(DefaultBodyLimit::max(
+                    self::workspace::FILE_WRITE_BODY_LIMIT_BYTES,
+                )),
+        )
+        .route("/v1/workspace/files/read", get(workspace_file_read))
+        .route("/v1/workspace/instructions", get(workspace_instructions))
         .route("/v1/agent-runs", get(list_agent_runs))
         .route("/v1/agent-runs/{run_id}", get(get_agent_run))
         .route("/v1/fleet/profiles", get(list_fleet_profiles))
@@ -1141,9 +1176,70 @@ pub fn build_router(state: RuntimeApiState) -> Router {
                 codewhale_protocol::runtime::MAX_RUNTIME_IMAGE_BODY_BYTES,
             )),
         )
+        .route("/v1/git", get(git::git_status_detail))
+        .route("/v1/changes", get(git::git_changes))
+        .route("/v1/diff", get(git::git_diff))
+        .route("/v1/workspace/diff", get(git::workspace_diff))
+        .route("/v1/git/graph", get(git::git_graph))
+        .route("/v1/git/stage", post(git::git_stage))
+        .route("/v1/git/unstage", post(git::git_unstage))
+        .route("/v1/git/discard", post(git::git_discard))
+        .route("/v1/git/commit", post(git::git_commit))
+        .route("/v1/git/push", post(git::git_push))
+        .route("/v1/git/branch", post(git::git_branch))
+        .route("/v1/logs", get(diagnostics::list_logs))
+        .route("/v1/logs/{name}", get(diagnostics::read_log))
+        .route("/v1/crashes", get(diagnostics::list_crashes))
+        .route("/v1/crashes/{name}", get(diagnostics::read_crash))
+        .route("/v1/process", get(diagnostics::process_info))
+        .route("/v1/jobs", get(jobs::list_jobs))
         .route("/v1/threads", get(list_threads).post(create_thread))
         .route("/v1/threads/summary", get(list_threads_summary))
         .route("/v1/threads/{id}", get(get_thread).patch(update_thread))
+        .route(
+            "/v1/threads/{id}/jobs",
+            get(jobs::list_thread_jobs).post(jobs::create_thread_job),
+        )
+        .route("/v1/threads/{id}/jobs/{job_id}", get(jobs::get_thread_job))
+        .route(
+            "/v1/threads/{id}/jobs/{job_id}/output",
+            get(jobs::get_thread_job_output),
+        )
+        .route(
+            "/v1/threads/{id}/jobs/{job_id}/stdin",
+            post(jobs::write_thread_job_stdin),
+        )
+        .route(
+            "/v1/threads/{id}/jobs/{job_id}/kill",
+            post(jobs::kill_thread_job),
+        )
+        .route("/v1/threads/{id}/context", get(context::get_thread_context))
+        .route(
+            "/v1/targets",
+            get(targets::list_targets).post(targets::create_target),
+        )
+        .route("/v1/targets/switch", post(targets::switch_target))
+        .route("/v1/remote", get(targets::remote_status))
+        .route("/v1/remote/connect", post(targets::remote_connect))
+        .route(
+            "/v1/ssh",
+            get(targets::ssh_status).post(targets::ssh_connect),
+        )
+        .route("/v1/ssh/connect", post(targets::ssh_connect))
+        .route(
+            "/v1/cloud",
+            get(targets::cloud_status).post(targets::cloud_attach),
+        )
+        .route("/v1/cloud/attach", post(targets::cloud_attach))
+        .route("/v1/lsp", get(lsp::lsp_status))
+        .route("/v1/diagnostics", get(lsp::lsp_diagnostics))
+        .route("/v1/definition", get(lsp::lsp_definition))
+        .route("/v1/references", get(lsp::lsp_references))
+        .route("/v1/symbols", get(lsp::lsp_symbols))
+        .route("/v1/voice", get(voice::voice_status))
+        .route("/v1/voice/dictate", post(voice::voice_dictate))
+        .route("/v1/voice/send", post(voice::voice_send))
+        .route("/v1/voice/control", post(voice::voice_control))
         .route("/v1/threads/{id}/resume", post(resume_thread))
         .route("/v1/threads/{id}/fork", post(fork_thread))
         .route("/v1/threads/{id}/undo", post(undo_thread_turn))
@@ -1202,6 +1298,7 @@ pub fn build_router(state: RuntimeApiState) -> Router {
         .route("/v1/tasks/{id}", get(get_task))
         .route("/v1/tasks/{id}/cancel", post(cancel_task))
         .route("/v1/skills", get(list_skills))
+        .route("/v1/commands", get(list_commands))
         .route(
             "/v1/skills/{name}",
             post(set_skill_enabled).delete(uninstall_skill_api),
@@ -1306,6 +1403,14 @@ pub fn build_router(state: RuntimeApiState) -> Router {
         .route("/v1/providers", get(list_providers))
         .route("/v1/providers/{id}/models", get(list_provider_models))
         .route("/v1/providers/{id}/switch", post(switch_provider))
+        .route(
+            "/v1/providers/{id}/key",
+            put(secrets::set_provider_key)
+                .delete(secrets::clear_provider_key)
+                .layer(DefaultBodyLimit::max(
+                    secrets::PROVIDER_KEY_BODY_LIMIT_BYTES,
+                )),
+        )
         .route("/v1/config", get(get_config).post(set_config))
         .route("/v1/config/reload", post(reload_config))
         .route(
@@ -1319,6 +1424,7 @@ pub fn build_router(state: RuntimeApiState) -> Router {
                 .delete(clear_memory),
         )
         .route("/v1/memory/{id}", get(get_memory_entry))
+        .merge(memory_lens::routes())
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             require_runtime_token,
@@ -2853,6 +2959,120 @@ fn fleet_event_label(payload: &FleetWorkerEventPayload) -> String {
             .map(|alert_id| format!("escalated channel={channel} alert_id={alert_id}"))
             .unwrap_or_else(|| format!("escalated channel={channel}")),
     }
+}
+
+/// One entry in the served slash-command catalog (`GET /v1/commands`, #6178).
+///
+/// Clients use this to complete and validate input without duplicating the
+/// registry: a `binding: "host"` row must never be submitted as a model
+/// prompt, and a user command shadowing a builtin name wins that spelling.
+#[derive(Debug, Serialize)]
+struct CommandCatalogEntry {
+    name: String,
+    aliases: Vec<String>,
+    /// English source text; localizing is the client's surface.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    summary: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    usage: Option<String>,
+    /// Literal verbs declared by the usage line (`/goal <block|complete|…>`).
+    subcommands: Vec<String>,
+    takes_arguments: bool,
+    /// `builtin` is registered code; `user` expands a stored template.
+    kind: &'static str,
+    /// `host` runs locally and never reaches the model; `prompt` expands into
+    /// the request the model sees.
+    binding: &'static str,
+    /// `primary` | `advanced` | `compatibility` — builtins only; `hidden`
+    /// covers rows the product does not advertise anywhere.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    discovery: Option<&'static str>,
+    hidden: bool,
+    /// User command holding this builtin's canonical name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    shadowed_by: Option<String>,
+    /// Alias spellings of this builtin taken by user commands.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    shadowed_aliases: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct CommandsResponse {
+    commands: Vec<CommandCatalogEntry>,
+}
+
+fn command_catalog(
+    user_commands: &crate::commands::user_registry::UserCommandRegistry,
+) -> Vec<CommandCatalogEntry> {
+    let mut commands = Vec::new();
+    for info in crate::commands::command_infos() {
+        let shadowed_by = user_commands
+            .get(info.name)
+            .map(|command| command.name.clone());
+        let shadowed_aliases = info
+            .aliases
+            .iter()
+            .filter(|alias| user_commands.get(alias).is_some())
+            .map(|alias| (*alias).to_string())
+            .collect();
+        commands.push(CommandCatalogEntry {
+            name: info.name.to_string(),
+            aliases: info
+                .aliases
+                .iter()
+                .map(|alias| (*alias).to_string())
+                .collect(),
+            summary: Some(
+                info.description_for(codewhale_localization::Locale::En)
+                    .into_owned(),
+            ),
+            usage: Some(info.usage.to_string()),
+            subcommands: crate::commands::traits::usage_subcommands(info.usage)
+                .iter()
+                .map(|token| (*token).to_string())
+                .collect(),
+            takes_arguments: crate::commands::user_registry::usage_describes_arguments(
+                info.name, info.usage,
+            ),
+            kind: "builtin",
+            binding: "host",
+            discovery: Some(match info.discovery() {
+                crate::commands::traits::CommandDiscovery::Primary => "primary",
+                crate::commands::traits::CommandDiscovery::Advanced => "advanced",
+                crate::commands::traits::CommandDiscovery::Compatibility => "compatibility",
+            }),
+            hidden: crate::commands::traits::UNLISTED_COMMANDS.contains(&info.name),
+            shadowed_by,
+            shadowed_aliases,
+        });
+    }
+    for command in user_commands.iter() {
+        commands.push(CommandCatalogEntry {
+            name: command.name.clone(),
+            aliases: command.aliases.clone(),
+            summary: command.description.clone(),
+            usage: command.display_usage().map(str::to_string),
+            subcommands: Vec::new(),
+            takes_arguments: command.takes_arguments(),
+            kind: "user",
+            binding: "prompt",
+            discovery: None,
+            hidden: command.hidden,
+            shadowed_by: None,
+            shadowed_aliases: Vec::new(),
+        });
+    }
+    commands
+}
+
+async fn list_commands(
+    State(state): State<RuntimeApiState>,
+) -> Result<Json<CommandsResponse>, ApiError> {
+    let commands = crate::commands::user_registry::with_registry_for_workspace(
+        Some(state.workspace.as_path()),
+        command_catalog,
+    );
+    Ok(Json(CommandsResponse { commands }))
 }
 
 async fn list_skills(
@@ -6380,6 +6600,24 @@ struct ProviderEntry {
     /// variable, consent-source, or token metadata.
     #[serde(rename = "credentialState")]
     credential_state: ProviderCredentialState,
+    /// Which *class* of source owns this route's credential (#6179). A class,
+    /// never a value, a path, or an environment variable name — the guarantee
+    /// above still holds. Clients need it to tell "you have no key" apart from
+    /// "your key is owned elsewhere and this control cannot change it".
+    #[serde(rename = "credentialSource")]
+    credential_source: secrets::ProviderCredentialSource,
+    /// Whether `PUT`/`DELETE /v1/providers/{id}/key` will act on this route.
+    /// False means the write would be refused, so the control should be
+    /// disabled rather than allowed to fail late.
+    #[serde(rename = "credentialWritable")]
+    credential_writable: bool,
+    /// Why a write is refused, as user-facing copy. Present only when
+    /// `credentialWritable` is false.
+    #[serde(
+        rename = "credentialWritableReason",
+        skip_serializing_if = "Option::is_none"
+    )]
+    credential_writable_reason: Option<&'static str>,
 }
 
 /// Stable, non-secret wire projection of provider readiness.
@@ -6954,6 +7192,7 @@ async fn list_providers(
             &base_url,
         )
         .is_empty();
+        let writeability = secrets::credential_writeability(&config, api_provider);
         providers.push(ProviderEntry {
             id: api_provider.as_str().to_string(),
             model_provider_id: (api_provider == active_provider)
@@ -6967,6 +7206,9 @@ async fn list_providers(
                 api_provider,
             )
             .into(),
+            credential_source: writeability.source,
+            credential_writable: writeability.writable,
+            credential_writable_reason: writeability.reason,
         });
     }
     Ok(Json(ProvidersResponse { current, providers }))
@@ -7779,14 +8021,7 @@ struct ClearMemoryQuery {
 /// Mirrors `native_store()` in `commands/groups/memory/memory.rs`.
 fn native_store_for_state(state: &RuntimeApiState) -> crate::native_memory::NativeMemoryStore {
     let memory_path = state.config.read().memory_path();
-    if let Some(store) = crate::native_memory::NativeMemoryStore::from_global_path(&memory_path) {
-        return store;
-    }
-    let root = memory_path
-        .parent()
-        .unwrap_or_else(|| FsPath::new("."))
-        .join("memory");
-    crate::native_memory::NativeMemoryStore::new(root)
+    crate::native_memory::NativeMemoryStore::from_memory_anchor(&memory_path)
 }
 
 /// Derive a scope label from a source path relative to the store root.
@@ -7971,8 +8206,11 @@ async fn create_memory_entry(
     };
     let store = native_store_for_state(&state);
     let root = store.root().to_path_buf();
+    // This endpoint is an authenticated operator surface: the explicit request
+    // is the review, so the entry lands active — matching the Lens remember
+    // action. Model-reachable capture stays candidate-only.
     let hit = store
-        .remember(scope, workspace_id.as_deref(), &req.text)
+        .remember_reviewed(scope, workspace_id.as_deref(), &req.text)
         .map_err(|e| ApiError::bad_request(format!("memory create error: {e}")))?;
     let entry = memory_hit_to_record(hit, &root);
     Ok((StatusCode::CREATED, Json(json!({ "entry": entry }))))
@@ -8071,6 +8309,10 @@ fn map_thread_err(err: anyhow::Error) -> ApiError {
     } else if message.contains("already has an active turn")
         || message.contains("No active turn")
         || message.contains("is not active")
+        // A steer the engine dropped: the turn moved on before the model saw
+        // it. 409 lets a client keep the text and resend rather than trust a
+        // delivery that never happened (#6276).
+        || message.contains("moved on before the steer")
         || lower.contains("operation_key is already bound")
         || lower.contains("operation_key binding is incomplete")
         || lower.contains("operation_key binding does not match")
@@ -8143,6 +8385,13 @@ impl ApiError {
     fn forbidden(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::FORBIDDEN,
+            message: message.into(),
+        }
+    }
+
+    fn payload_too_large(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::PAYLOAD_TOO_LARGE,
             message: message.into(),
         }
     }
@@ -8277,6 +8526,7 @@ base_url = "http://127.0.0.1:9/v1"
             web: None,
             fleet_codewhale_binary: "unused-test-binary".to_string(),
             mcp_pool: Arc::new(Mutex::new(None)),
+            lsp_manager: Arc::new(std::sync::OnceLock::new()),
             compat_stream_test_hook: None,
         };
         let router = build_router(state.clone());

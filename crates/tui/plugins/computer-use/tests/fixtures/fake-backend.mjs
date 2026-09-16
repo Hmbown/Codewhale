@@ -39,9 +39,23 @@ export function create() {
   const record = (method, args) => {
     try { fs.appendFileSync(callsFile, JSON.stringify({ method, args }) + "\n"); } catch {}
   };
+  // One backend instance owns this binding; serve-mode tests read it back to
+  // prove state survives between requests on the same agent process.
+  let boundApp = null;
 
   return {
     platform: "fake",
+    async open_application(args = {}) {
+      record("open_application", args);
+      boundApp = { name: args.name ?? "FakeApp", pid: args.pid ?? 4242, bundle_id: args.bundle_id ?? "com.fake.app" };
+      return { launched: true, activate: !!args.activate, resolved: boundApp, keyboard_delivery: args.activate ? "foreground-guarded" : "process", input_scope: args.activate ? "shared-desktop" : "application", shared_pointer: !!args.activate };
+    },
+    async list_apps() {
+      record("list_apps", {});
+      return { items: [{ name: boundApp?.name ?? "FakeApp", pid: boundApp?.pid ?? 4242, bundle_id: "com.fake.app" }] };
+    },
+    async left_mouse_down(args = {}) { record("left_mouse_down", args); return { action_sent: true, at: { x: args.target?.x, y: args.target?.y } }; },
+    async left_mouse_up(args = {}) { record("left_mouse_up", args); return { action_sent: true }; },
     async screenshot({ region } = {}) {
       record("screenshot", { region });
       const file = tmpPng("cu-fake-shot-");
@@ -74,7 +88,7 @@ export function create() {
     async mouse_move({ target } = {}) { record("mouse_move", { target }); return { action_sent: true, at: { x: target?.x, y: target?.y } }; },
     async perform_action(args) { record("perform_action", args); return { action_sent: true, strategy: "a11y" }; },
     async set_value(args) { record("set_value", args); return { action_sent: true, strategy: "a11y", verified: true, after: args.value }; },
-    async type(args) { record("type", args); return { action_sent: true, text: args.text, verified: true }; },
+    async type(args) { record("type", args); return { action_sent: true, text: args.text, verified: true, bound_app: boundApp?.name ?? null }; },
     async key(args) { record("key", args); return { action_sent: true, key: args.text ?? "return" }; },
     async focus(args) { record("focus", args); return { action_sent: true, focused: true, strategy: "a11y" }; },
     async get_value(args) { record("get_value", args); return { value: "Fixture text", strategy: "a11y" }; },

@@ -1442,6 +1442,11 @@ fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+// These callers are synchronous methods reached from tool code on the Tokio
+// runtime, so this contention retry must not park the worker with
+// `thread::sleep`. `yield_now` hands the thread to the holder long enough for
+// its microsecond-scale critical section; if the lock is still contended the
+// caller surfaces the existing "state is busy" error instead of stalling.
 fn retry_lock<T>(
     mutex: &tokio::sync::Mutex<T>,
     retries: u32,
@@ -1450,7 +1455,7 @@ fn retry_lock<T>(
         if let Ok(guard) = mutex.try_lock() {
             return Some(guard);
         }
-        std::thread::sleep(std::time::Duration::from_millis(1));
+        std::thread::yield_now();
     }
     None
 }

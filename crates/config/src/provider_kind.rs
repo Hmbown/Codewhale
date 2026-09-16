@@ -239,9 +239,9 @@ pub enum ProviderKind {
     /// One base URL, one `cwc_key_…` account API key with the `models:infer`
     /// scope, and a per-model wire chosen from the account's live catalog:
     /// `GET /v1/models` returns `provider/model` rows carrying
-    /// `codewhale.protocol` (`chat-completions` or `anthropic-messages`).
-    /// Both protocols authenticate with `Authorization: Bearer` — the
-    /// Anthropic passthrough does **not** take `x-api-key`.
+    /// `codewhale.protocol` (`chat-completions`, `anthropic-messages`, or
+    /// `responses`). Every protocol authenticates with `Authorization: Bearer`
+    /// — the Anthropic passthrough does **not** take `x-api-key`.
     #[serde(
         alias = "codewhale-api",
         alias = "codewhale_api",

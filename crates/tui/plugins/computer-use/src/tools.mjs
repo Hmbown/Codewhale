@@ -116,6 +116,25 @@ export const TOOLS = [
     },
   },
   {
+    name: "wait_for",
+    description: "Poll this computer's accessibility state until elements matching query/role appear (state:\"present\", default) or until none remain (state:\"absent\"). Returns the matched elements bound to a fresh state_id, ready to target. Prefer this over a get_app_state/wait loop after actions that load, animate or dismiss UI.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        query: { type: "string", description: "Case-insensitive substring over label, value and role. At least one of query/role is required." },
+        role: { type: "string", description: "Exact accessibility role, e.g. AXButton, AXTextField." },
+        state: { enum: ["present", "absent"], default: "present", description: "present: wait until a match exists. absent: wait until no match remains (dialogs dismissed, loading finished)." },
+        timeout: { type: "number", minimum: 0.5, maximum: 60, description: "Seconds to poll before giving up; default 10." },
+        interval: { type: "integer", minimum: 100, maximum: 5000, description: "Milliseconds between observations; default 400." },
+        limit: { type: "integer", minimum: 1, maximum: 100, description: "Max matched elements to return; default 20." },
+        app_ref: { type: "object", properties: { pid: { type: "integer" }, name: { type: "string" }, bundle_id: { type: "string" } }, additionalProperties: false, description: "Same selector rules as get_app_state; omission follows the app selected by open_application." },
+        window_id: { type: "integer", description: "macOS only: zero-based window index within the app." },
+        computer: computerParam,
+      },
+      additionalProperties: false,
+    },
+  },
+  {
     name: "get_app_state",
     description: "Read an application's text, controls, actions and layout without requiring vision. The default summary keeps app content and top-level menus; full adds nested menus and tree structure. Act using observed state_id/index targets and refresh after UI changes. Missing labels or values are unknown, not an invitation to guess; request a screenshot only when useful.",
     inputSchema: {
@@ -226,12 +245,12 @@ export const TOOLS = [
   },
   // ---- text & keyboard ----
   {
-    name: "type", description: "Type unicode text into the focused control. Newlines in `text` are Return/Enter key presses, not literal characters — never put \\n in a composer by hoping it will send. Focus the field first (click, focus, or set_value). On macOS the receipt carries `verified:true` only when the focused control's value actually reflects the typed text; on `verified:false` the text may have gone nowhere — observe again before relying on it.",
-    inputSchema: { type: "object", required: ["text"], properties: { text: { type: "string" }, press_enter: { type: "boolean", description: "After typing, press Return/Enter once. Prefer this to putting a newline in `text` when you want to send." }, computer: computerParam }, additionalProperties: false },
+    name: "type", description: "Type unicode text into the focused control. Newlines in `text` are Return/Enter key presses, not literal characters — never put \\n in a composer by hoping it will send. Focus the field first (click, focus, or set_value), or pass an element `target` to focus it in the same call. On macOS the receipt carries `verified:true` only when the focused control's value actually reflects the typed text; on `verified:false` the text may have gone nowhere — observe again before relying on it.",
+    inputSchema: { type: "object", required: ["text"], properties: { text: { type: "string" }, press_enter: { type: "boolean", description: "After typing, press Return/Enter once. Prefer this to putting a newline in `text` when you want to send." }, target: { type: "object", description: "Element target from get_app_state; it is accessibility-focused first, then the text is typed. Element targets only.", required: ["type", "state_id", "index"], properties: { type: { const: "element" }, state_id: { type: "string" }, index: { type: "integer", minimum: 0 } }, additionalProperties: false }, computer: computerParam }, additionalProperties: false },
   },
   {
-    name: "key", description: "Press a named key or chord. Examples: return, enter, backspace, tab, escape, cmd+c (macOS), ctrl+c (Linux/Windows). This is the key-press tool; type() cannot send modifiers or Return by itself except via newlines/press_enter. Repeat with `repeat`.",
-    inputSchema: { type: "object", required: ["text"], properties: { text: { type: "string" }, repeat: { type: "integer", minimum: 1, maximum: 100 }, computer: computerParam }, additionalProperties: false },
+    name: "key", description: "Press a named key or chord. Examples: return, enter, backspace, tab, escape, cmd+c (macOS), ctrl+c (Linux/Windows). This is the key-press tool; type() cannot send modifiers or Return by itself except via newlines/press_enter. Repeat with `repeat`. Pass an element `target` to accessibility-focus it first.",
+    inputSchema: { type: "object", required: ["text"], properties: { text: { type: "string" }, repeat: { type: "integer", minimum: 1, maximum: 100 }, target: { type: "object", description: "Element target from get_app_state; it is accessibility-focused first, then the key is sent. Element targets only.", required: ["type", "state_id", "index"], properties: { type: { const: "element" }, state_id: { type: "string" }, index: { type: "integer", minimum: 0 } }, additionalProperties: false }, computer: computerParam }, additionalProperties: false },
   },
   {
     name: "hold_key", description: "Hold a key for `duration` seconds (0.05..30).",
@@ -309,13 +328,15 @@ export const TOOLS = [
   // ---- recording ----
   {
     name: "recording_start",
-    description: "Start screen recording on a computer (mp4/mov). Darwin: ScreenCaptureKit via the native helper (timed or until recording_stop; honors region, no recorder overlay, stops on session exit). Linux and Windows: unavailable pending session-owned recorder cleanup; use screenshots. HarmonyOS: snapshot-series muxed with ffmpeg.",
+    description: "Start screen recording on a computer (mp4/mov). Darwin: ScreenCaptureKit via the native helper (timed or until recording_stop; honors region, no recorder overlay, stops on session exit). Pass app_ref to record only the selected app's window rect — captured at start and not tracked across moves. Linux and Windows: unavailable pending session-owned recorder cleanup; use screenshots. HarmonyOS: snapshot-series muxed with ffmpeg.",
     inputSchema: {
       type: "object",
       properties: {
         display: { type: ["integer", "string"] },
         fps: { type: "integer", minimum: 1, maximum: 60, description: "Linux/Windows/harmony-series only" },
-        region: { type: "array", items: { type: "number" }, minItems: 4, maxItems: 4, description: "Linux/Windows only" },
+        region: { type: "array", items: { type: "number" }, minItems: 4, maxItems: 4, description: "[x, y, w, h] in screen points" },
+        app_ref: { type: "object", properties: { pid: { type: "integer" }, name: { type: "string" }, bundle_id: { type: "string" } }, additionalProperties: false, description: "macOS only: record the rect this app's window occupies at start. Omission follows the app selected by open_application." },
+        window_id: { type: "integer", description: "macOS only: zero-based window index within the app; requires or implies app_ref." },
         durationSec: { type: "number", minimum: 1, maximum: 7200, description: "macOS only: auto-stop after N seconds" },
         intervalMs: { type: "integer", minimum: 150, maximum: 5000, description: "harmony snapshot-series frame interval" },
         computer: computerParam,
@@ -372,7 +393,7 @@ export const REMOTE_TOOLS = new Set([
 
 /** Map public tool name -> backend method name. */
 export const BACKEND_METHOD = Object.fromEntries(
-  TOOLS.filter((t) => !["computer_list", "computer_switch", "computer_register", "computer_remove", "stop_computer_control", "wait", "find_elements", "run_actions"].includes(t.name))
+  TOOLS.filter((t) => !["computer_list", "computer_switch", "computer_register", "computer_remove", "stop_computer_control", "wait", "wait_for", "find_elements", "run_actions"].includes(t.name))
     .map((t) => [t.name, {
       recording_start: "recordingStart",
       recording_stop: "recordingStop",

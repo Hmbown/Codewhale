@@ -26,12 +26,10 @@ use std::os::windows::process::CommandExt;
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
 
-use crate::{McpManagedClient, McpResourceDescriptor, McpServerConfig, McpToolDescriptor};
-
-/// Protocol revision advertised during the handshake. Matches the revision the
-/// TUI's MCP pool negotiates (`crates/tui/src/mcp.rs`), so a server that works
-/// in the TUI works here.
-const PROTOCOL_VERSION: &str = "2024-11-05";
+use crate::{
+    MCP_PROTOCOL_VERSION, MCP_SUPPORTED_PROTOCOL_VERSIONS, McpManagedClient, McpResourceDescriptor,
+    McpServerConfig, McpToolDescriptor,
+};
 
 /// Budget for spawn + `initialize` + `notifications/initialized`. Generous
 /// because a first `npx`/`uvx` launch may download the server package.
@@ -436,9 +434,12 @@ fn validate_initialize_result(
         .with_context(|| {
             format!("MCP server '{server_name}': initialize result omitted protocolVersion")
         })?;
-    if protocol_version != PROTOCOL_VERSION {
+    // Negotiation per spec: we advertise the newest revision and accept any
+    // dated revision we still implement; anything else ends the handshake.
+    if !MCP_SUPPORTED_PROTOCOL_VERSIONS.contains(&protocol_version) {
         bail!(
-            "MCP server '{server_name}': unsupported protocol version '{protocol_version}' (expected {PROTOCOL_VERSION})"
+            "MCP server '{server_name}': unsupported protocol version '{protocol_version}' (supported: {})",
+            MCP_SUPPORTED_PROTOCOL_VERSIONS.join(", ")
         );
     }
 
@@ -626,7 +627,7 @@ impl ChildProcessMcpClient {
             &server_name,
             "initialize",
             json!({
-                "protocolVersion": PROTOCOL_VERSION,
+                "protocolVersion": MCP_PROTOCOL_VERSION,
                 "clientInfo": {
                     "name": "codewhale-mcp-server",
                     "version": env!("CARGO_PKG_VERSION")
@@ -1192,7 +1193,7 @@ mod tests {
     #[test]
     fn initialize_result_requires_supported_protocol_and_server_identity() {
         let valid = json!({
-            "protocolVersion": PROTOCOL_VERSION,
+            "protocolVersion": MCP_PROTOCOL_VERSION,
             "serverInfo": {"name": "fixture", "version": "1"},
             "capabilities": {"tools": {}, "resources": {}}
         });
@@ -1202,6 +1203,20 @@ mod tests {
         assert!(capabilities.tools);
         assert!(capabilities.resources);
 
+        // Negotiation accepts every dated revision still implemented, not only
+        // the newest one advertised at initialize.
+        for version in ["2025-03-26", "2024-11-05"] {
+            let older = json!({
+                "protocolVersion": version,
+                "serverInfo": {"name": "fixture", "version": "1"},
+                "capabilities": {"tools": {}}
+            });
+            assert!(
+                validate_initialize_result("fixture", &older).is_ok(),
+                "supported revision {version} was rejected"
+            );
+        }
+
         for invalid in [
             json!({}),
             json!({
@@ -1209,11 +1224,11 @@ mod tests {
                 "serverInfo": {"name": "fixture", "version": "1"}
             }),
             json!({
-                "protocolVersion": PROTOCOL_VERSION,
+                "protocolVersion": MCP_PROTOCOL_VERSION,
                 "serverInfo": {"name": "fixture"}
             }),
             json!({
-                "protocolVersion": PROTOCOL_VERSION,
+                "protocolVersion": MCP_PROTOCOL_VERSION,
                 "serverInfo": {"name": "fixture", "version": "1"},
                 "capabilities": []
             }),

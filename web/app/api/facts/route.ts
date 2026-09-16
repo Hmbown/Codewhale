@@ -12,6 +12,7 @@ function summary(facts: RepoFacts) {
     sourceCommittedAt: facts.sourceCommittedAt,
     version: facts.version,
     providerCount: facts.providers.length,
+    modelCount: facts.models.length,
     toolCount: facts.toolCount,
   };
 }

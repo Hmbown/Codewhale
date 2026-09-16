@@ -1616,6 +1616,11 @@ impl OauthLoginFlow {
             "resource",
             oauth_resource,
         );
+        // #6040: logout clears this machine's token only — the provider keeps
+        // its standing grant. Without a forced prompt the next login silently
+        // re-grants it (same account/workspace, no picker ever shown), so an
+        // explicit login could never change the authorized workspace.
+        let auth_url = append_query_param(&auth_url, "prompt", Some("consent"));
 
         Ok(Self {
             auth_url,
@@ -2679,6 +2684,49 @@ mod tests {
                 .evaluate("127.0.0.1", "mcp"),
             crate::network_policy::Decision::Deny
         );
+        drop(login);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn interactive_login_forces_the_consent_screen() {
+        use crate::mcp::{AuthenticateToolStart, McpConfig, McpPool};
+        use crate::network_policy::{DecisionToml, NetworkPolicy};
+        let _env = crate::test_support::lock_test_env();
+        let dir = tempfile::tempdir().unwrap();
+        let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", dir.path());
+        let _backend = crate::test_support::EnvVarGuard::set("CODEWHALE_SECRET_BACKEND", "file");
+        let _proxy = crate::test_support::EnvVarGuard::set("NO_PROXY", "*");
+        let (url, _, task) = guarded_oauth_fixture(None, false).await;
+        let server: McpServerConfig =
+            serde_json::from_value(serde_json::json!({"url":url})).unwrap();
+        let allowed = NetworkPolicyDecider::new(
+            NetworkPolicy {
+                default: DecisionToml::Allow,
+                ..NetworkPolicy::default()
+            },
+            None,
+        );
+        let mut config = McpConfig::default();
+        config.servers.insert("consent-probe".to_string(), server);
+        let pool = McpPool::new(config).with_network_policy(allowed);
+        let AuthenticateToolStart::Login(login) =
+            pool.begin_authenticate_tool("consent-probe").await.unwrap()
+        else {
+            panic!("a fresh server must start an interactive login");
+        };
+
+        // #6040: logout only clears this machine's token; the provider keeps
+        // its standing grant, so the login URL must force the consent screen
+        // or the same account/workspace is silently re-granted.
+        // The URL carries the PKCE challenge and state, so the assertion
+        // message reports only the fact that is being checked, never the URL.
+        let forces_consent = login.authorization_url().contains("prompt=consent");
+        assert!(
+            forces_consent,
+            "an interactive login must force consent (prompt=consent is missing from the authorization URL)"
+        );
+
         drop(login);
         task.abort();
     }

@@ -180,7 +180,6 @@ impl ForeignInstructionImports {
     }
 
     /// Enabled format keys, for provenance and diagnostics.
-    #[cfg(test)]
     #[must_use]
     pub fn keys(&self) -> Vec<&'static str> {
         self.enabled.iter().copied().collect()
@@ -1294,6 +1293,417 @@ Use conventional commits: `feat:`, `fix:`, `docs:`, `refactor:`, `test:`, `chore
 
     fs::write(&agents_path, default_content)?;
     Ok(agents_path)
+}
+
+// === Effective instruction-source listing (#6168) ===
+
+/// Which layer of the instruction stack a source belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstructionSourceKind {
+    /// Chain candidate (`AGENTS.md`, `.codewhale/instructions.md`, opted-in
+    /// foreign files) in a repository-root → workspace scope directory.
+    Project,
+    /// `.md` file inside a rules directory (`.codewhale/rules`, opted-in
+    /// foreign rules dirs) at workspace scope.
+    Rule,
+    /// User-level fallback (`~/.codewhale/AGENTS.md` and friends).
+    Global,
+    /// File selected by the bounded foreign-fragment loader
+    /// (`codewhale_core::fragments`) for an opted-in format.
+    Fragment,
+    /// Configured `instructions = [...]` file (#454).
+    Configured,
+    /// `.codewhale/constitution.json` authority policy.
+    Constitution,
+    /// Present but deliberately never loaded (deprecated `WHALE.md`).
+    Ignored,
+}
+
+/// Whether the prompt assembly actually consumed the file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstructionSourceStatus {
+    /// Read and merged into the assembled instructions.
+    Loaded,
+    /// Exists, but a higher-priority candidate in the same scope won.
+    Shadowed,
+    /// Exists but the loader refused, could not read, or skipped it
+    /// (empty, oversized, over the per-directory rules cap).
+    Skipped,
+    /// Candidate path the loader checks; nothing is there.
+    Missing,
+}
+
+/// One instruction-source candidate or loaded file, for the
+/// workspace-instructions listing route.
+#[derive(Debug, Clone)]
+pub struct InstructionSourceInfo {
+    pub kind: InstructionSourceKind,
+    /// Scope directory the candidate belongs to: the chain directory for
+    /// `Project`, the workspace for `Rule`/`Fragment`/`Configured`, the home
+    /// directory for `Global`.
+    pub scope_dir: PathBuf,
+    /// Candidate or actual file path, as the loader resolves it.
+    pub path: PathBuf,
+    /// `symlink_metadata` saw a file or symlink (same check the loader runs).
+    pub exists: bool,
+    pub status: InstructionSourceStatus,
+    /// File size in bytes when it could be stat'd.
+    pub bytes: Option<u64>,
+    /// Loader warning produced for this path, when one exists.
+    pub warning: Option<String>,
+}
+
+fn file_len(path: &Path) -> Option<u64> {
+    fs::metadata(path).ok().map(|m| m.len())
+}
+
+fn push_candidate_entry(
+    sources: &mut Vec<InstructionSourceInfo>,
+    kind: InstructionSourceKind,
+    scope_dir: &Path,
+    path: PathBuf,
+    scope_loaded: &mut bool,
+    load: impl FnOnce(&Path) -> Result<String, ProjectContextError>,
+) {
+    let exists = context_candidate_exists(&path);
+    let (status, warning) = if !exists {
+        (InstructionSourceStatus::Missing, None)
+    } else if *scope_loaded {
+        (InstructionSourceStatus::Shadowed, None)
+    } else {
+        match load(&path) {
+            Ok(_) => {
+                *scope_loaded = true;
+                (InstructionSourceStatus::Loaded, None)
+            }
+            Err(error) => (InstructionSourceStatus::Skipped, Some(error.to_string())),
+        }
+    };
+    sources.push(InstructionSourceInfo {
+        kind,
+        scope_dir: scope_dir.to_path_buf(),
+        exists,
+        bytes: file_len(&path),
+        path,
+        status,
+        warning,
+    });
+}
+
+/// Enumerate the effective instruction sources for `workspace` (#6168).
+///
+/// Mirrors the loaders above — same candidate order, same existence and
+/// readability checks — so the listing reports what prompt assembly actually
+/// picks up: precedence, shadowing, opt-in imports, and refusal warnings.
+/// Read-only; it never creates or modifies files. `configured` is the
+/// resolved `instructions = [...]` array (`Config::instructions_paths`);
+/// `home_dir` gates the global layer exactly as
+/// `load_project_context_with_parents_and_home` does.
+///
+/// Known limit: statuses describe file selection, not the aggregate byte
+/// budget — `enforce_project_instruction_budget` can still trim loaded
+/// content at render time without changing a source's `Loaded` status.
+#[must_use]
+pub fn project_instruction_sources(
+    workspace: &Path,
+    home_dir: Option<&Path>,
+    configured: &[PathBuf],
+) -> Vec<InstructionSourceInfo> {
+    let imports = &foreign_instruction_imports();
+    let workspace = canonicalize_workspace_or_keep(workspace);
+    let mut sources = Vec::new();
+
+    // Repository-root → workspace instruction chain. Same dir order the
+    // loader assembles, so wider scopes list first.
+    for dir in context_chain_dirs(&workspace, home_dir) {
+        let whale = dir.join(DEPRECATED_WHALE_FILENAME);
+        if context_candidate_exists(&whale) {
+            sources.push(InstructionSourceInfo {
+                kind: InstructionSourceKind::Ignored,
+                scope_dir: dir.clone(),
+                path: whale.clone(),
+                exists: true,
+                status: InstructionSourceStatus::Skipped,
+                bytes: file_len(&whale),
+                warning: Some(WHALE_IGNORED_WARNING.to_string()),
+            });
+        }
+        let mut scope_loaded = false;
+        for filename in context_files_for(imports) {
+            push_candidate_entry(
+                &mut sources,
+                InstructionSourceKind::Project,
+                &dir,
+                dir.join(filename),
+                &mut scope_loaded,
+                load_context_file,
+            );
+        }
+    }
+
+    // Workspace-scope rules directories — the chain loader never reads
+    // ancestor rules, so only the workspace contributes them.
+    for rules_dir_name in rules_dirs_for(imports) {
+        let rules_dir = workspace.join(rules_dir_name);
+        if fs::symlink_metadata(&rules_dir)
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(false)
+        {
+            // Same refusal as `load_rules_from_dir`, surfaced rather than
+            // logged-and-dropped.
+            sources.push(InstructionSourceInfo {
+                kind: InstructionSourceKind::Rule,
+                scope_dir: workspace.clone(),
+                path: rules_dir,
+                exists: true,
+                status: InstructionSourceStatus::Skipped,
+                bytes: None,
+                warning: Some("refusing symlinked rules directory".to_string()),
+            });
+            continue;
+        }
+        let Ok(dir_entries) = fs::read_dir(&rules_dir) else {
+            continue;
+        };
+        let mut file_paths: Vec<PathBuf> = dir_entries
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.extension().is_some_and(|ext| ext == "md") && context_candidate_exists(path)
+            })
+            .collect();
+        file_paths.sort_by(|a, b| {
+            a.file_name()
+                .unwrap_or_default()
+                .cmp(b.file_name().unwrap_or_default())
+        });
+        for (index, path) in file_paths.into_iter().enumerate() {
+            let (status, warning) = if index >= MAX_RULES_FILES {
+                (
+                    InstructionSourceStatus::Skipped,
+                    Some(format!(
+                        "beyond the per-directory rules cap of {MAX_RULES_FILES} files"
+                    )),
+                )
+            } else {
+                match load_context_file(&path) {
+                    Ok(_) => (InstructionSourceStatus::Loaded, None),
+                    Err(error) => (InstructionSourceStatus::Skipped, Some(error.to_string())),
+                }
+            };
+            sources.push(InstructionSourceInfo {
+                kind: InstructionSourceKind::Rule,
+                scope_dir: workspace.clone(),
+                path: path.clone(),
+                exists: true,
+                status,
+                bytes: file_len(&path),
+                warning,
+            });
+        }
+    }
+
+    // User-level fallback layer.
+    if let Some(home) = home_dir {
+        for relative in legacy_global_whale_relative_paths() {
+            let path = join_relative_components(home, relative);
+            if context_candidate_exists(&path) {
+                sources.push(InstructionSourceInfo {
+                    kind: InstructionSourceKind::Ignored,
+                    scope_dir: home.to_path_buf(),
+                    path: path.clone(),
+                    exists: true,
+                    status: InstructionSourceStatus::Skipped,
+                    bytes: file_len(&path),
+                    warning: Some(WHALE_IGNORED_WARNING.to_string()),
+                });
+            }
+        }
+        let mut scope_loaded = false;
+        for relative in global_context_relative_paths() {
+            push_candidate_entry(
+                &mut sources,
+                InstructionSourceKind::Global,
+                home,
+                join_relative_components(home, relative),
+                &mut scope_loaded,
+                load_global_context_file,
+            );
+        }
+    }
+
+    // Opted-in foreign fragments — enumerate the declared candidates, then
+    // mark the files the bounded loader's own selection walk picks.
+    let fragment_candidates = fragment_candidates_for(imports);
+    let selected: std::collections::BTreeSet<PathBuf> =
+        codewhale_core::fragments::selected_project_instruction_candidate_files(
+            &workspace,
+            &fragment_candidates,
+        )
+        .into_iter()
+        .collect();
+    let mut emitted = std::collections::BTreeSet::new();
+    for candidate in &fragment_candidates {
+        let path = workspace.join(candidate);
+        if !path.exists() {
+            sources.push(InstructionSourceInfo {
+                kind: InstructionSourceKind::Fragment,
+                scope_dir: workspace.clone(),
+                path,
+                exists: false,
+                status: InstructionSourceStatus::Missing,
+                bytes: None,
+                warning: None,
+            });
+            continue;
+        }
+        // A directory candidate's loadable files are the selected entries
+        // underneath it; report those rather than the directory itself.
+        let members: Vec<PathBuf> = selected
+            .iter()
+            .filter(|file| file.starts_with(&path))
+            .cloned()
+            .collect();
+        if path.is_dir() {
+            if members.is_empty() {
+                sources.push(InstructionSourceInfo {
+                    kind: InstructionSourceKind::Fragment,
+                    scope_dir: workspace.clone(),
+                    path,
+                    exists: true,
+                    status: InstructionSourceStatus::Skipped,
+                    bytes: None,
+                    warning: Some(
+                        "no loadable .md files selected under this directory".to_string(),
+                    ),
+                });
+            }
+            for file in members {
+                emitted.insert(file.clone());
+                let loaded = fs::read_to_string(&file)
+                    .map(|content| !content.trim().is_empty())
+                    .unwrap_or(false);
+                sources.push(InstructionSourceInfo {
+                    kind: InstructionSourceKind::Fragment,
+                    scope_dir: workspace.clone(),
+                    path: file.clone(),
+                    exists: true,
+                    status: if loaded {
+                        InstructionSourceStatus::Loaded
+                    } else {
+                        InstructionSourceStatus::Skipped
+                    },
+                    bytes: file_len(&file),
+                    warning: None,
+                });
+            }
+        } else {
+            emitted.insert(path.clone());
+            let selected_file = selected.contains(&path);
+            let loaded = selected_file
+                && fs::read_to_string(&path)
+                    .map(|content| !content.trim().is_empty())
+                    .unwrap_or(false);
+            sources.push(InstructionSourceInfo {
+                kind: InstructionSourceKind::Fragment,
+                scope_dir: workspace.clone(),
+                path: path.clone(),
+                exists: true,
+                status: if loaded {
+                    InstructionSourceStatus::Loaded
+                } else if selected_file {
+                    InstructionSourceStatus::Skipped
+                } else {
+                    // Exists but not selected — e.g. a symlink the walk refuses.
+                    InstructionSourceStatus::Skipped
+                },
+                bytes: file_len(&path),
+                warning: if selected_file && !loaded {
+                    Some("selected but empty or unreadable".to_string())
+                } else {
+                    None
+                },
+            });
+        }
+    }
+    // Selected files not attributed to a listed candidate (nested rules dir
+    // members) still get reported.
+    for file in selected.iter().filter(|file| !emitted.contains(*file)) {
+        let loaded = fs::read_to_string(file)
+            .map(|content| !content.trim().is_empty())
+            .unwrap_or(false);
+        sources.push(InstructionSourceInfo {
+            kind: InstructionSourceKind::Fragment,
+            scope_dir: workspace.clone(),
+            path: file.clone(),
+            exists: true,
+            status: if loaded {
+                InstructionSourceStatus::Loaded
+            } else {
+                InstructionSourceStatus::Skipped
+            },
+            bytes: file_len(file),
+            warning: None,
+        });
+    }
+
+    // Configured `instructions = [...]` files (#454) — resolved paths, in
+    // declared order. The renderer skips missing/empty files with a warning.
+    for path in configured {
+        let exists = context_candidate_exists(path);
+        let (status, warning) = match fs::read_to_string(path) {
+            Ok(content) if !content.trim().is_empty() => (InstructionSourceStatus::Loaded, None),
+            Ok(_) => (
+                InstructionSourceStatus::Skipped,
+                Some("empty instructions file".to_string()),
+            ),
+            Err(error) => (
+                InstructionSourceStatus::Skipped,
+                Some(format!("unreadable instructions file: {error}")),
+            ),
+        };
+        sources.push(InstructionSourceInfo {
+            kind: InstructionSourceKind::Configured,
+            scope_dir: workspace.clone(),
+            path: path.clone(),
+            exists,
+            status,
+            bytes: file_len(path),
+            warning,
+        });
+    }
+
+    // `.codewhale/constitution.json`, workspace → repository root. The loader
+    // stops at the first existing candidate whether it parses or not, so
+    // later candidates — even ones that exist — are never evaluated.
+    let (_block, constitution_source, _warnings) = load_repo_constitution_block(&workspace);
+    let mut seen_existing = false;
+    for path in repo_constitution_candidate_paths(&workspace) {
+        let exists = context_candidate_exists(&path);
+        let status = if !exists {
+            InstructionSourceStatus::Missing
+        } else if seen_existing {
+            InstructionSourceStatus::Shadowed
+        } else {
+            seen_existing = true;
+            if constitution_source.as_deref() == Some(path.as_path()) {
+                InstructionSourceStatus::Loaded
+            } else {
+                InstructionSourceStatus::Skipped
+            }
+        };
+        sources.push(InstructionSourceInfo {
+            kind: InstructionSourceKind::Constitution,
+            scope_dir: workspace.clone(),
+            path: path.clone(),
+            exists,
+            status,
+            bytes: file_len(&path),
+            warning: None,
+        });
+    }
+
+    sources
 }
 
 // === Unit Tests ===
@@ -2851,5 +3261,108 @@ mod tests {
             "budget not enforced: {}",
             instructions.len()
         );
+    }
+
+    #[test]
+    fn instruction_sources_report_precedence_shadowing_and_ignored_files() {
+        let tmp = tempdir().expect("tempdir");
+        let root = tmp.path();
+        fs::create_dir_all(root.join(".git")).expect("mkdir git");
+        fs::write(root.join(".git").join("HEAD"), "ref: refs/heads/main\n").expect("head");
+        fs::write(root.join("AGENTS.md"), "primary\n").expect("agents");
+        fs::create_dir_all(root.join(".codewhale")).expect("mkdir codewhale");
+        fs::write(
+            root.join(".codewhale").join("instructions.md"),
+            "secondary\n",
+        )
+        .expect("workspace instructions");
+        fs::write(root.join("WHALE.md"), "deprecated\n").expect("whale");
+        fs::create_dir_all(root.join(".codewhale").join("rules")).expect("mkdir rules");
+        fs::write(
+            root.join(".codewhale").join("rules").join("style.md"),
+            "keep it small\n",
+        )
+        .expect("rule");
+
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&home).expect("mkdir home");
+        let configured = vec![root.join("team").join("extra.md")];
+        fs::create_dir_all(root.join("team")).expect("mkdir team");
+        fs::write(root.join("team").join("extra.md"), "configured\n").expect("configured");
+
+        let sources = project_instruction_sources(root, Some(&home), &configured);
+        let find = |path_suffix: &str| {
+            sources
+                .iter()
+                .find(|source| source.path.ends_with(path_suffix))
+                .unwrap_or_else(|| panic!("missing entry for {path_suffix}: {sources:?}"))
+        };
+
+        let agents = find("AGENTS.md");
+        assert_eq!(agents.kind, InstructionSourceKind::Project);
+        assert_eq!(agents.status, InstructionSourceStatus::Loaded);
+        assert_eq!(agents.bytes, Some(8));
+
+        // The lower-priority candidate in the same scope exists but is
+        // shadowed, not loaded.
+        let secondary = find(".codewhale/instructions.md");
+        assert_eq!(secondary.status, InstructionSourceStatus::Shadowed);
+
+        let whale = find("WHALE.md");
+        assert_eq!(whale.kind, InstructionSourceKind::Ignored);
+        assert_eq!(whale.status, InstructionSourceStatus::Skipped);
+        assert!(whale.warning.is_some());
+
+        let rule = find("style.md");
+        assert_eq!(rule.kind, InstructionSourceKind::Rule);
+        assert_eq!(rule.status, InstructionSourceStatus::Loaded);
+
+        let configured_entry = find("extra.md");
+        assert_eq!(configured_entry.kind, InstructionSourceKind::Configured);
+        assert_eq!(configured_entry.status, InstructionSourceStatus::Loaded);
+
+        // Unchecked-but-real candidates are enumerated so clients can render
+        // the full precedence map.
+        assert!(
+            sources
+                .iter()
+                .any(|s| s.status == InstructionSourceStatus::Missing),
+            "missing candidates must appear: {sources:?}"
+        );
+        // Global candidates under the (empty) home are reported as missing.
+        assert!(
+            sources
+                .iter()
+                .any(|s| s.kind == InstructionSourceKind::Global
+                    && s.status == InstructionSourceStatus::Missing),
+            "global candidates must appear: {sources:?}"
+        );
+    }
+
+    #[test]
+    fn instruction_sources_mark_unreadable_winner_as_skipped_not_loaded() {
+        let tmp = tempdir().expect("tempdir");
+        let root = tmp.path();
+        fs::create_dir_all(root.join(".git")).expect("mkdir git");
+        fs::write(root.join(".git").join("HEAD"), "ref: refs/heads/main\n").expect("head");
+        // An empty AGENTS.md fails the load check, so the next candidate wins.
+        fs::write(root.join("AGENTS.md"), "   \n").expect("empty agents");
+        fs::create_dir_all(root.join(".codewhale")).expect("mkdir codewhale");
+        fs::write(root.join(".codewhale").join("instructions.md"), "wins\n")
+            .expect("workspace instructions");
+
+        let sources = project_instruction_sources(root, None, &[]);
+        let agents = sources
+            .iter()
+            .find(|s| s.path.ends_with("AGENTS.md"))
+            .expect("agents entry");
+        assert_eq!(agents.status, InstructionSourceStatus::Skipped);
+        assert!(agents.warning.is_some(), "refusal must carry a warning");
+
+        let winner = sources
+            .iter()
+            .find(|s| s.path.ends_with(".codewhale/instructions.md"))
+            .expect("instructions entry");
+        assert_eq!(winner.status, InstructionSourceStatus::Loaded);
     }
 }

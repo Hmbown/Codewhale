@@ -470,13 +470,6 @@ impl FleetRoster {
                 "Read-only synthesis: merge findings into one coherent report.",
                 None,
             ),
-            (
-                "general",
-                FleetSlot::General,
-                FleetLoadout::Inherit,
-                "Legacy alias of the 'worker' posture: general-purpose worker with full capabilities.",
-                None,
-            ),
             // The eight canonical dispatch postures are seeded roster members
             // (#5285). Every `type`/`role` token the Agent tool accepts maps
             // 1:1 to a named roster profile, so dispatch always resolves
@@ -823,6 +816,52 @@ mod tests {
         std::fs::write(dir.join(filename), contents).unwrap();
     }
 
+    /// Removing the built-in `general` member must not make the name stop
+    /// resolving. #5888 deliberately kept `general` dispatchable because Agent
+    /// tool type tokens, saved configs and replayed transcripts name it; that
+    /// contract still holds, now through the selector rather than through a
+    /// second member — which is what lets the duplicate go (#6244).
+    #[test]
+    fn general_still_resolves_to_the_worker_member_without_its_own_built_in() {
+        use crate::fleet::identity::resolve_member_in_profiles;
+        let members = FleetRoster::built_in_members();
+        assert!(
+            !members.iter().any(|m| m.id == "general"),
+            "this test is only meaningful while `general` has no built-in member"
+        );
+        for selector in ["general", "member:general", "role:general", "default"] {
+            let resolved = resolve_member_in_profiles(&members, selector)
+                .unwrap_or_else(|error| panic!("`{selector}` must resolve, got {error:?}"))
+                .unwrap_or_else(|| panic!("`{selector}` resolved to no member"));
+            assert_eq!(
+                resolved.id, "worker",
+                "`{selector}` must land on the worker posture"
+            );
+        }
+    }
+
+    /// Two built-ins that collapse to the same canonical role make
+    /// `role:<name>` permanently unresolvable: the selector canonicalizes both
+    /// sides, matches both members, and raises `Ambiguous` forever. `general`
+    /// and `worker` both canonicalized to `general`, which is what blocked
+    /// plain agent spawns in production (#6244).
+    #[test]
+    fn built_in_members_have_one_member_per_canonical_role() {
+        use crate::fleet::role::public_role_label;
+        let mut seen: std::collections::BTreeMap<String, String> =
+            std::collections::BTreeMap::new();
+        for member in FleetRoster::built_in_members() {
+            let role = public_role_label(&member.profile.role.name).to_string();
+            if let Some(existing) = seen.insert(role.clone(), member.id.clone()) {
+                panic!(
+                    "built-ins `{existing}` and `{}` both canonicalize to role `{role}`; \
+                     a `role:{role}` selector can never resolve",
+                    member.id
+                );
+            }
+        }
+    }
+
     #[test]
     fn built_in_party_is_complete_with_floor_permissions() {
         let members = FleetRoster::built_in_members();
@@ -838,7 +877,6 @@ mod tests {
                 "verifier",
                 "consultant",
                 "synthesizer",
-                "general",
                 "worker",
                 "planner",
                 "custom"
@@ -952,7 +990,6 @@ mod tests {
                 "verifier",
                 "consultant",
                 "synthesizer",
-                "general",
                 "worker",
                 "planner",
                 "custom",

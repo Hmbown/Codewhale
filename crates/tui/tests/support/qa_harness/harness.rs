@@ -125,7 +125,12 @@ impl HarnessBuilder {
                 .env("XDG_CACHE_HOME", home.join(".cache").to_string_lossy())
                 .env("USERPROFILE", home.to_string_lossy())
                 .env("CODEWHALE_CONFIG_PATH", codewhale_config.to_string_lossy())
-                .env("DEEPSEEK_CONFIG_PATH", deepseek_config.to_string_lossy());
+                .env("DEEPSEEK_CONFIG_PATH", deepseek_config.to_string_lossy())
+                // Sealing the filesystem is not enough on its own: the startup
+                // Ollama probe reaches the developer's machine over loopback,
+                // and adopting a live :11434 catalog rewrites the very launch
+                // screen these suites wait for.
+                .env("CODEWHALE_DISABLE_LOCAL_OLLAMA_PROBE", "1");
         }
         for (k, v) in &self.env {
             builder = builder.env(k, v);

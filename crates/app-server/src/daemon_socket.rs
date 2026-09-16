@@ -258,7 +258,7 @@ fn unsupported_platform() -> DaemonSocketError {
 #[cfg(unix)]
 mod platform {
     use std::collections::HashMap;
-    use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt};
+    use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
@@ -409,7 +409,8 @@ mod platform {
                 shutdown,
             } = self;
             let _socket_file = SocketFileGuard(path.clone());
-            let uid = std::fs::metadata(&path)
+            let uid = tokio::fs::metadata(&path)
+                .await
                 .map_err(|source| DaemonSocketError::Io {
                     context: "failed to stat the daemon socket",
                     path: path.clone(),
@@ -468,7 +469,7 @@ mod platform {
         options: DaemonSocketOptions,
     ) -> Result<DaemonSocket, DaemonSocketError> {
         let path = resolve_socket_path(&SocketPathInputs::from_environment(options.socket_path)?)?;
-        ensure_private_parent_dir(&path)?;
+        ensure_private_parent_dir(&path).await?;
         clear_stale_socket(&path).await?;
 
         let listener = UnixListener::bind(&path).map_err(|source| DaemonSocketError::Io {
@@ -476,13 +477,13 @@ mod platform {
             path: path.clone(),
             source,
         })?;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).map_err(
-            |source| DaemonSocketError::Io {
+        tokio::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .await
+            .map_err(|source| DaemonSocketError::Io {
                 context: "failed to restrict daemon socket permissions to 0600",
                 path: path.clone(),
                 source,
-            },
-        )?;
+            })?;
 
         let state = build_state_with_transport(options.config_path, None, AppTransport::Socket)
             .map_err(DaemonSocketError::State)?;
@@ -496,21 +497,26 @@ mod platform {
     }
 
     /// Create the socket's directory as `0700` when it does not exist. An
-    /// existing directory is left as the operator made it.
-    fn ensure_private_parent_dir(path: &Path) -> Result<(), DaemonSocketError> {
+    /// existing directory is left as the operator made it. Async because the
+    /// caller runs on the Tokio runtime (blocking-call convention, #6149).
+    async fn ensure_private_parent_dir(path: &Path) -> Result<(), DaemonSocketError> {
         let Some(parent) = path
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
         else {
             return Ok(());
         };
-        if parent.is_dir() {
+        if tokio::fs::metadata(parent)
+            .await
+            .is_ok_and(|metadata| metadata.is_dir())
+        {
             return Ok(());
         }
-        std::fs::DirBuilder::new()
+        tokio::fs::DirBuilder::new()
             .recursive(true)
             .mode(0o700)
             .create(parent)
+            .await
             .map_err(|source| DaemonSocketError::Io {
                 context: "failed to create the daemon runtime directory",
                 path: parent.to_path_buf(),
@@ -520,7 +526,7 @@ mod platform {
 
     /// Remove a socket file nobody answers on; refuse to touch anything else.
     async fn clear_stale_socket(path: &Path) -> Result<(), DaemonSocketError> {
-        let metadata = match std::fs::symlink_metadata(path) {
+        let metadata = match tokio::fs::symlink_metadata(path).await {
             Ok(metadata) => metadata,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(source) => {
@@ -541,11 +547,13 @@ mod platform {
                 path: path.to_path_buf(),
             }),
             Ok(Err(_refused)) => {
-                std::fs::remove_file(path).map_err(|source| DaemonSocketError::Io {
-                    context: "failed to remove a stale daemon socket",
-                    path: path.to_path_buf(),
-                    source,
-                })
+                tokio::fs::remove_file(path)
+                    .await
+                    .map_err(|source| DaemonSocketError::Io {
+                        context: "failed to remove a stale daemon socket",
+                        path: path.to_path_buf(),
+                        source,
+                    })
             }
             Err(_elapsed) => Err(DaemonSocketError::ProbeTimedOut {
                 path: path.to_path_buf(),

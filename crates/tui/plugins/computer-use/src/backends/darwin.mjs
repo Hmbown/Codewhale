@@ -437,13 +437,29 @@ export function create({ exec }) {
     } finally { clearTimeout(timer); }
   }
 
-  async function recordingStart({ display, durationSec, region } = {}) {
+  async function recordingStart({ display, durationSec, region, app_ref, window_id } = {}) {
     const dir = recordingsDir();
     fs.mkdirSync(dir, { recursive: true });
     const id = crypto.randomBytes(4).toString("hex");
     const file = path.join(dir, `rec-${id}.mov`);
     const displays = await displayInfo();
-    const disp = display ?? state.activeDisplay;
+    // app_ref scopes the recording to the app's window rect: resolved once at
+    // start through the same window_info the AX path uses, so a background
+    // window records behind the user's work. The rect is fixed at start —
+    // it does not track later moves or resizes.
+    let window = null;
+    if (app_ref !== undefined || window_id != null) {
+      window = await native("window_info", { app_ref: app_ref === undefined ? state.inputApp ?? undefined : app_ref, window_id });
+      if (!window?.points || !(window.points.w > 0) || !(window.points.h > 0)) throw new ExecError("the selected application has no capturable window — call list_windows");
+      if (region) throw new ExecError("choose app_ref or region, not both");
+      region = [window.points.x, window.points.y, window.points.w, window.points.h];
+    }
+    let disp = display ?? state.activeDisplay;
+    if (window && display == null) {
+      const cx = region[0] + region[2] / 2, cy = region[1] + region[3] / 2;
+      const host = displays.find(d => d.points && cx >= d.points.x && cx < d.points.x + d.points.w && cy >= d.points.y && cy < d.points.y + d.points.h);
+      if (host) disp = host.index;
+    }
     const selected = displays.find(d => d.index === disp);
     if (!selected) throw new ExecError("choose one available display for recording");
     if (durationSec != null && (!Number.isFinite(durationSec) || durationSec <= 0)) throw new ExecError("durationSec must be positive");
@@ -481,7 +497,8 @@ export function create({ exec }) {
         completion.then(result => { if (!ready) reject(new ExecError(result.error || "screen recorder exited before capture started")); });
       });
       throwIfAborted();
-      return { id, pid: child.pid, file, display: disp, durationSec: durationSec ?? null, region: region ?? null, fps: 30, mode: "ScreenCaptureKit", startedAt };
+      return { id, pid: child.pid, file, display: disp, durationSec: durationSec ?? null, region: region ?? null, fps: 30, mode: "ScreenCaptureKit", startedAt,
+        ...(window ? { window: { id: window.window_id ?? null, name: window.name ?? null }, note: "Recording the window's rect as it was at start; it does not track moves or resizes." } : {}) };
     } catch (error) {
       requestRecordingStop(recording);
       const result = await waitForRecordingStop(recording, 2_000);
@@ -530,7 +547,7 @@ export function create({ exec }) {
     for (const f of fs.existsSync(dir) ? fs.readdirSync(dir) : []) {
       const full = path.join(dir, f);
       const st = fs.statSync(full);
-      if (st.isFile() && /\.(mov|mp4|png)$/i.test(f)) out.push({ file: full, bytes: st.size, modifiedAt: st.mtime.toISOString() });
+      if (st.isFile() && /\.(mov|mp4|png|jpe?g)$/i.test(f)) out.push({ file: full, bytes: st.size, modifiedAt: st.mtime.toISOString() });
     }
     out.sort((a, b) => b.modifiedAt.localeCompare(a.modifiedAt));
     return { dir, recordings: out.slice(0, 50), running: [...rec.keys()] };

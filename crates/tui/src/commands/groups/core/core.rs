@@ -912,8 +912,10 @@ mod tests {
         let result = help(&mut app, Some("memory"));
         let msg = result.message.expect("help topic should return message");
         assert!(msg.contains("memory"));
-        assert!(msg.contains("persistent user-memory file"));
-        assert!(msg.contains("Usage: /memory [show|path|clear|edit|help]"));
+        assert!(msg.contains("persistent structured user memory"));
+        assert!(msg.contains(
+            "Usage: /memory [status|path|search|get|remember|import|export|reindex|clear|help]"
+        ));
     }
 
     #[test]

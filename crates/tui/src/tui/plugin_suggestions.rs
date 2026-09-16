@@ -510,6 +510,7 @@ mod tests {
                 &app.input,
                 restarted.plugin_registry.as_ref(),
                 &[],
+                &mut crate::plugins::recommend::RecommendedPluginGate::default(),
             )
             .is_none()
         );

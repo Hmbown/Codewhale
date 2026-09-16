@@ -1,6 +1,6 @@
 use super::*;
 use crate::core::events::{Event as EngineEvent, TurnOutcomeStatus};
-use crate::core::ops::Op;
+use crate::core::ops::{Op, TurnSpec};
 use crate::runtime_threads::RuntimeEventRecord;
 use crate::test_support::{EnvVarGuard, lock_test_env};
 use anyhow::{Context, bail};
@@ -14,7 +14,9 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::time::sleep;
 use uuid::Uuid;
 
+mod command_catalog;
 mod headless_catalog;
+mod workspace_instructions;
 
 /// Scale a wait budget for shared CI runners.
 ///
@@ -946,6 +948,8 @@ struct TestServerOverrides {
     web: Option<web::RuntimeWebState>,
     compat_stream_test_hook: Option<mpsc::UnboundedSender<CompatStreamTestPoint>>,
     plugin_discovery: Option<Arc<crate::plugins::PluginDiscoveryContext>>,
+    /// Pre-seeded workspace LSP manager (test transports, disabled configs).
+    lsp_manager: Option<Arc<crate::lsp::LspManager>>,
 }
 
 async fn spawn_test_server_with_root_token_mobile_workspace_and_subagents(
@@ -1237,6 +1241,13 @@ async fn build_test_server(
         fleet_codewhale_binary: overrides
             .fleet_codewhale_binary
             .unwrap_or_else(configured_codewhale_binary),
+        lsp_manager: {
+            let cell = std::sync::OnceLock::new();
+            if let Some(manager) = overrides.lsp_manager {
+                let _ = cell.set(manager);
+            }
+            Arc::new(cell)
+        },
         compat_stream_test_hook: overrides.compat_stream_test_hook,
     };
     let app = build_router(state);
@@ -2856,7 +2867,7 @@ async fn compatibility_stream_closes_losslessly_across_replay_live_handoff() -> 
     let (release_overlap, wait_for_overlap_release) = oneshot::channel();
     let (release_terminal, wait_for_terminal_release) = oneshot::channel();
     let engine_task = tokio::spawn(async move {
-        if !matches!(rx_op.recv().await, Some(Op::SendMessage { .. })) {
+        if !matches!(rx_op.recv().await, Some(Op::SendMessage(TurnSpec { .. }))) {
             return;
         }
         let _ = wait_for_overlap_release.await;
@@ -3059,7 +3070,10 @@ async fn compatibility_stream_exposes_and_resolves_user_input_without_answer_ech
     let (submission_tx, submission_rx) = oneshot::channel();
     let (release_completion, wait_for_completion_release) = oneshot::channel();
     let engine_task = tokio::spawn(async move {
-        if !matches!(harness.rx_op.recv().await, Some(Op::SendMessage { .. })) {
+        if !matches!(
+            harness.rx_op.recv().await,
+            Some(Op::SendMessage(TurnSpec { .. }))
+        ) {
             bail!("compatibility interaction engine did not receive a prompt");
         }
         harness
@@ -3479,7 +3493,7 @@ async fn thread_endpoints_expose_lifecycle_contract() -> Result<()> {
     tokio::spawn(async move {
         while let Some(op) = rx_op.recv().await {
             match op {
-                Op::SendMessage { .. } => {
+                Op::SendMessage(TurnSpec { .. }) => {
                     let _ = tx_event
                         .send(EngineEvent::TurnStarted {
                             turn_id: "mock_lifecycle".to_string(),
@@ -3658,7 +3672,7 @@ async fn turn_endpoint_operation_key_returns_original_and_conflicts_on_mismatch(
     let tx_event = harness.tx_event.clone();
     tokio::spawn(async move {
         while let Some(op) = harness.rx_op.recv().await {
-            if !matches!(op, Op::SendMessage { .. }) {
+            if !matches!(op, Op::SendMessage(TurnSpec { .. })) {
                 continue;
             }
             counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -3797,7 +3811,7 @@ async fn turn_operation_lookup_is_authenticated_read_only_and_survives_restart()
         tokio::time::timeout(ci_scaled(Duration::from_secs(2)), engine.rx_op.recv())
             .await?
             .context("accepted mock Engine operation")?,
-        Op::SendMessage { .. }
+        Op::SendMessage(TurnSpec { .. })
     ));
 
     let endpoint = format!(
@@ -3975,7 +3989,7 @@ async fn events_endpoint_respects_since_seq_cursor() -> Result<()> {
     let mut rx_op = harness.rx_op;
     let tx_event = harness.tx_event;
     tokio::spawn(async move {
-        if !matches!(rx_op.recv().await, Some(Op::SendMessage { .. })) {
+        if !matches!(rx_op.recv().await, Some(Op::SendMessage(TurnSpec { .. }))) {
             return;
         }
         let _ = tx_event
@@ -4388,7 +4402,7 @@ async fn steer_and_interrupt_endpoints_work_on_active_turn() -> Result<()> {
     let tx_event = harness.tx_event;
     let cancel_token = harness.cancel_token;
     tokio::spawn(async move {
-        if !matches!(rx_op.recv().await, Some(Op::SendMessage { .. })) {
+        if !matches!(rx_op.recv().await, Some(Op::SendMessage(TurnSpec { .. }))) {
             return;
         }
         let _ = tx_event
@@ -4401,7 +4415,10 @@ async fn steer_and_interrupt_endpoints_work_on_active_turn() -> Result<()> {
         let _ = tx_event
             .send(EngineEvent::MessageStarted { index: 0 })
             .await;
-        if let Some(steer_text) = rx_steer.recv().await {
+        if let Some(steer) = rx_steer.recv().await {
+            // An engine that uses the steer has committed it; `commit()` is
+            // what reports that acceptance back to `steer_turn`.
+            let steer_text = steer.into_pending().commit();
             let _ = tx_event
                 .send(EngineEvent::MessageDelta {
                     index: 0,
@@ -4851,7 +4868,7 @@ async fn stream_endpoint_remains_backward_compatible() -> Result<()> {
     let mut rx_op = harness.rx_op;
     let tx_event = harness.tx_event;
     tokio::spawn(async move {
-        if !matches!(rx_op.recv().await, Some(Op::SendMessage { .. })) {
+        if !matches!(rx_op.recv().await, Some(Op::SendMessage(TurnSpec { .. }))) {
             return;
         }
         let _ = tx_event
@@ -6066,7 +6083,7 @@ async fn session_create_from_thread_rejects_active_turn() -> Result<()> {
     let (active_tx, active_rx) = oneshot::channel();
     let (finish_tx, finish_rx) = oneshot::channel();
     tokio::spawn(async move {
-        if !matches!(rx_op.recv().await, Some(Op::SendMessage { .. })) {
+        if !matches!(rx_op.recv().await, Some(Op::SendMessage(TurnSpec { .. }))) {
             return;
         }
         let _ = tx_event
@@ -10125,8 +10142,19 @@ model = "local-model"
         );
         assert_eq!(custom["credentialState"], expected_state);
 
+        // An allow-list, not a snapshot: a new field here has to be argued for
+        // in this test before it can reach the wire. `credentialSource` and
+        // `credentialWritable` (#6179) are admissible because they are a
+        // *class* and a boolean — the source is one of four fixed enum
+        // spellings and can never interpolate a value, a path, or an
+        // environment variable name. `credentialWritableReason` is
+        // `skip_serializing_if = Option::is_none`, so it is absent for every
+        // writable route and is asserted separately below when present.
         let allowed_fields: std::collections::BTreeSet<_> = [
+            "credentialSource",
             "credentialState",
+            "credentialWritable",
+            "credentialWritableReason",
             "default_model",
             "display_name",
             "has_model_catalog",
@@ -10135,20 +10163,28 @@ model = "local-model"
         ]
         .into_iter()
         .collect();
+        const CREDENTIAL_SOURCES: [&str; 4] = ["secret_store", "config", "external_auth", "none"];
         for entry in providers["providers"]
             .as_array()
             .context("providers array")?
         {
-            let actual_fields: std::collections::BTreeSet<_> = entry
-                .as_object()
-                .context("provider entry object")?
-                .keys()
-                .map(String::as_str)
-                .collect();
-            assert_eq!(
-                actual_fields, allowed_fields,
-                "provider catalog must remain a non-secret projection"
+            let object = entry.as_object().context("provider entry object")?;
+            let actual_fields: std::collections::BTreeSet<_> =
+                object.keys().map(String::as_str).collect();
+            assert!(
+                actual_fields.is_subset(&allowed_fields),
+                "provider catalog must remain a non-secret projection: {actual_fields:?}"
             );
+            // The source is a closed vocabulary. If it ever stops being one,
+            // it has become a place a value can hide.
+            let source = object["credentialSource"]
+                .as_str()
+                .context("credentialSource must be a string")?;
+            assert!(
+                CREDENTIAL_SOURCES.contains(&source),
+                "credentialSource must stay a fixed class, got {source:?}"
+            );
+            assert!(object["credentialWritable"].is_boolean());
         }
 
         let serialized = serde_json::to_string(&providers)?;
@@ -14453,7 +14489,7 @@ async fn runtime_image_http_rejects_before_dispatch_and_accepts_large_canonical_
     let response = client.post(&url).json(&body).send().await?;
     assert_eq!(response.status(), StatusCode::CREATED);
     let accepted: Value = response.json().await?;
-    let Op::SendMessage { images, .. } =
+    let Op::SendMessage(TurnSpec { images, .. }) =
         harness.rx_op.recv().await.context("accepted Engine op")?
     else {
         bail!("expected SendMessage");
@@ -14844,5 +14880,1884 @@ async fn output_cap_compatibility_stream_rejects_before_thread_creation() -> Res
             .is_empty()
     );
     server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn workspace_files_list_read_write_bounds_and_confinement() -> Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let workspace = tmp.path().join("workspace");
+    fs::create_dir_all(workspace.join("src"))?;
+    fs::create_dir_all(workspace.join("bin"))?;
+    fs::create_dir_all(workspace.join("empty"))?;
+    fs::create_dir_all(workspace.join(".git/hooks"))?;
+    fs::write(workspace.join("src/main.rs"), "fn main() {}\n")?;
+    fs::write(workspace.join("README.md"), "# readme\n")?;
+    fs::write(workspace.join("bin/blob"), [0u8, 1, 2, 255])?;
+    fs::write(workspace.join(".git/config"), "[core]\n")?;
+    let outside = tmp.path().join("outside");
+    fs::create_dir_all(&outside)?;
+    fs::write(outside.join("secret.txt"), "never served")?;
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(&outside, workspace.join("link-dir"))?;
+        std::os::unix::fs::symlink(outside.join("secret.txt"), workspace.join("link-file"))?;
+    }
+    let (addr, _, handle) = spawn_test_server_with_root_token_mobile_workspace(
+        tmp.path().join("runtime"),
+        tmp.path().join("sessions"),
+        Some("files-token".to_string()),
+        false,
+        workspace.clone(),
+    )
+    .await?
+    .context("files test requires a loopback listener")?;
+    let client = crate::tls::reqwest_client();
+    let base = format!("http://{addr}");
+    let url = |route: &str, pairs: &[(&str, &str)]| {
+        let mut url = reqwest::Url::parse(&format!("{base}{route}")).unwrap();
+        url.query_pairs_mut().extend_pairs(pairs.iter().copied());
+        url
+    };
+
+    // Authentication is required on every route.
+    for route in [
+        "/v1/workspace/files",
+        "/v1/workspace/files/read?path=README.md",
+    ] {
+        let status = client.get(format!("{base}{route}")).send().await?.status();
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{route}");
+    }
+
+    // Listing: directories first, `.git` hidden, links named but never followed.
+    let root_listing: Value = client
+        .get(url("/v1/workspace/files", &[]))
+        .bearer_auth("files-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let names: Vec<(String, String)> = root_listing["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| {
+            (
+                entry["name"].as_str().unwrap().to_string(),
+                entry["kind"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+    assert!(!names.iter().any(|(name, _)| name == ".git"));
+    assert!(names.contains(&("bin".to_string(), "directory".to_string())));
+    assert!(names.contains(&("src".to_string(), "directory".to_string())));
+    assert!(names.contains(&("README.md".to_string(), "file".to_string())));
+    #[cfg(unix)]
+    {
+        assert!(names.contains(&("link-dir".to_string(), "symlink".to_string())));
+        assert!(names.contains(&("link-file".to_string(), "symlink".to_string())));
+    }
+    let last_directory = names
+        .iter()
+        .rposition(|(_, kind)| kind == "directory")
+        .unwrap();
+    assert!(
+        names[..=last_directory]
+            .iter()
+            .all(|(_, kind)| kind == "directory"),
+        "directories are listed first: {names:?}"
+    );
+    let readme = root_listing["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["name"] == "README.md")
+        .unwrap();
+    assert_eq!(readme["size"], 9);
+    assert_eq!(readme["path"], "README.md");
+    assert!(readme["modified"].is_string());
+    assert_eq!(root_listing["truncated"], false);
+
+    let src_listing: Value = client
+        .get(url("/v1/workspace/files", &[("path", "src/")]))
+        .bearer_auth("files-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(src_listing["path"], "src");
+    assert_eq!(src_listing["entries"][0]["path"], "src/main.rs");
+    let limited: Value = client
+        .get(url("/v1/workspace/files", &[("limit", "1")]))
+        .bearer_auth("files-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(limited["entries"].as_array().unwrap().len(), 1);
+    assert_eq!(limited["truncated"], true);
+    let mut rejected_listings = vec![
+        ("../", StatusCode::BAD_REQUEST),
+        ("/etc", StatusCode::BAD_REQUEST),
+        ("src/../src", StatusCode::BAD_REQUEST),
+        ("src\\main", StatusCode::BAD_REQUEST),
+        (".git", StatusCode::FORBIDDEN),
+        ("README.md", StatusCode::BAD_REQUEST),
+        ("missing", StatusCode::NOT_FOUND),
+    ];
+    if cfg!(unix) {
+        rejected_listings.push(("link-dir", StatusCode::FORBIDDEN));
+    }
+    for (path, expected) in rejected_listings {
+        let status = client
+            .get(url("/v1/workspace/files", &[("path", path)]))
+            .bearer_auth("files-token")
+            .send()
+            .await?
+            .status();
+        assert_eq!(status, expected, "list path={path:?}");
+    }
+    let status = client
+        .get(url("/v1/workspace/files", &[("limit", "0")]))
+        .bearer_auth("files-token")
+        .send()
+        .await?
+        .status();
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // Reads: whole-file revision, byte windows, binary fallback, confinement.
+    let read: Value = client
+        .get(url("/v1/workspace/files/read", &[("path", "src/main.rs")]))
+        .bearer_auth("files-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let expected_revision = {
+        let digest = sha2::Sha256::digest(b"fn main() {}\n");
+        digest
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    };
+    assert_eq!(read["path"], "src/main.rs");
+    assert_eq!(read["encoding"], "utf-8");
+    assert_eq!(read["content"], "fn main() {}\n");
+    assert_eq!(read["size"], 13);
+    assert_eq!(read["bytes"], 13);
+    assert_eq!(read["truncated"], false);
+    assert_eq!(read["revision"], expected_revision);
+    let window: Value = client
+        .get(url(
+            "/v1/workspace/files/read",
+            &[("path", "src/main.rs"), ("offset", "3"), ("limit", "4")],
+        ))
+        .bearer_auth("files-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(window["content"], "main");
+    assert_eq!(window["offset"], 3);
+    assert_eq!(window["bytes"], 4);
+    assert_eq!(window["truncated"], true);
+    assert_eq!(
+        window["revision"], expected_revision,
+        "revision covers the whole file"
+    );
+    let binary: Value = client
+        .get(url("/v1/workspace/files/read", &[("path", "bin/blob")]))
+        .bearer_auth("files-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(binary["encoding"], "base64");
+    assert_eq!(
+        base64::engine::general_purpose::STANDARD
+            .decode(binary["content"].as_str().unwrap())
+            .unwrap(),
+        vec![0u8, 1, 2, 255]
+    );
+    let mut rejected_reads = vec![
+        ("", StatusCode::BAD_REQUEST),
+        ("../outside/secret.txt", StatusCode::BAD_REQUEST),
+        (".git/config", StatusCode::FORBIDDEN),
+        ("src", StatusCode::BAD_REQUEST),
+        ("missing.txt", StatusCode::NOT_FOUND),
+        ("src/missing.rs", StatusCode::NOT_FOUND),
+    ];
+    if cfg!(unix) {
+        rejected_reads.push(("link-file", StatusCode::FORBIDDEN));
+        rejected_reads.push(("link-dir/secret.txt", StatusCode::FORBIDDEN));
+    }
+    for (path, expected) in rejected_reads {
+        let status = client
+            .get(url("/v1/workspace/files/read", &[("path", path)]))
+            .bearer_auth("files-token")
+            .send()
+            .await?
+            .status();
+        assert_eq!(status, expected, "read path={path:?}");
+    }
+    let status = client
+        .get(url(
+            "/v1/workspace/files/read",
+            &[("path", "README.md"), ("limit", "0")],
+        ))
+        .bearer_auth("files-token")
+        .send()
+        .await?
+        .status();
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // Writes: create, then optimistic concurrency on the whole-file revision.
+    let put = |body: Value| {
+        client
+            .put(format!("{base}/v1/workspace/files"))
+            .bearer_auth("files-token")
+            .json(&body)
+    };
+    let status = client
+        .put(format!("{base}/v1/workspace/files"))
+        .json(&json!({"path": "notes/todo.md", "content": "x"}))
+        .send()
+        .await?
+        .status();
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let created = put(json!({"path": "notes/todo.md", "content": "- first\n"}))
+        .send()
+        .await?;
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let created: Value = created.json().await?;
+    assert_eq!(created["created"], true);
+    assert_eq!(created["path"], "notes/todo.md");
+    assert_eq!(created["size"], 8);
+    assert_eq!(
+        fs::read_to_string(workspace.join("notes/todo.md"))?,
+        "- first\n"
+    );
+    let first_revision = created["revision"].as_str().unwrap().to_string();
+    let read_back: Value = client
+        .get(url(
+            "/v1/workspace/files/read",
+            &[("path", "notes/todo.md")],
+        ))
+        .bearer_auth("files-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(read_back["revision"], first_revision);
+
+    // Overwrites need the revision that was read; a stale one is refused.
+    let status = put(json!({"path": "notes/todo.md", "content": "- second\n"}))
+        .send()
+        .await?
+        .status();
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "overwrite without expected_revision"
+    );
+    let stale = put(json!({
+        "path": "notes/todo.md",
+        "content": "- second\n",
+        "expected_revision": "0".repeat(64),
+    }))
+    .send()
+    .await?;
+    assert_eq!(stale.status(), StatusCode::CONFLICT);
+    let stale: Value = stale.json().await?;
+    assert!(
+        stale["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains(&first_revision),
+        "conflict names the current revision"
+    );
+    assert_eq!(
+        fs::read_to_string(workspace.join("notes/todo.md"))?,
+        "- first\n"
+    );
+    let updated = put(json!({
+        "path": "notes/todo.md",
+        "content": "- second\n",
+        "expected_revision": first_revision,
+    }))
+    .send()
+    .await?;
+    assert_eq!(updated.status(), StatusCode::OK);
+    let updated: Value = updated.json().await?;
+    assert_eq!(updated["created"], false);
+    assert_ne!(updated["revision"], first_revision);
+    assert_eq!(
+        fs::read_to_string(workspace.join("notes/todo.md"))?,
+        "- second\n"
+    );
+    let status = put(json!({
+        "path": "notes/new.md",
+        "content": "x",
+        "expected_revision": first_revision,
+    }))
+    .send()
+    .await?
+    .status();
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "expected_revision on a new file"
+    );
+    assert!(!workspace.join("notes/new.md").exists());
+
+    // Binary payloads, bad encodings, oversized bodies and confinement.
+    let encoded = put(json!({
+        "path": "bin/written.bin",
+        "content": base64::engine::general_purpose::STANDARD.encode([7u8, 0, 9]),
+        "encoding": "base64",
+    }))
+    .send()
+    .await?;
+    assert_eq!(encoded.status(), StatusCode::CREATED);
+    assert_eq!(
+        fs::read(workspace.join("bin/written.bin"))?,
+        vec![7u8, 0, 9]
+    );
+    let status = put(json!({"path": "bin/x", "content": "x", "encoding": "hex"}))
+        .send()
+        .await?
+        .status();
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let status = put(json!({"path": "bin/x", "content": "***", "encoding": "base64"}))
+        .send()
+        .await?
+        .status();
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let status = put(json!({"path": "big.txt", "content": "a".repeat(4 * 1024 * 1024 + 1)}))
+        .send()
+        .await?
+        .status();
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    let mut rejected_writes = vec![
+        ("../outside/x.txt", StatusCode::BAD_REQUEST),
+        ("/tmp/x.txt", StatusCode::BAD_REQUEST),
+        (".git/hooks/pre-commit", StatusCode::FORBIDDEN),
+        ("src", StatusCode::BAD_REQUEST),
+    ];
+    if cfg!(unix) {
+        rejected_writes.push(("link-dir/x.txt", StatusCode::FORBIDDEN));
+        rejected_writes.push(("link-file", StatusCode::FORBIDDEN));
+    }
+    for (path, expected) in rejected_writes {
+        let status = put(json!({"path": path, "content": "x"}))
+            .send()
+            .await?
+            .status();
+        assert_eq!(status, expected, "write path={path:?}");
+    }
+    assert!(!outside.join("x.txt").exists());
+    assert_eq!(
+        fs::read_to_string(outside.join("secret.txt"))?,
+        "never served"
+    );
+    assert!(!workspace.join(".git/hooks/pre-commit").exists());
+
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn session_artifacts_list_and_bounded_read() -> Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let sessions_dir = tmp.path().join("sessions");
+    let workspace = tmp.path().join("workspace");
+    fs::create_dir_all(&workspace)?;
+    let manager = crate::session_manager::SessionManager::new(sessions_dir.clone())?;
+    let session_id = "sess_artifacts_route".to_string();
+    let mut session = crate::session_manager::create_saved_session_with_id_and_mode(
+        session_id.clone(),
+        &[],
+        "deepseek-v4-pro",
+        &workspace,
+        0,
+        None,
+        Some("plan"),
+    );
+    let artifact_dir = sessions_dir.join(&session_id).join("artifacts");
+    fs::create_dir_all(&artifact_dir)?;
+    let body = "line one\nline two\n".repeat(64);
+    fs::write(artifact_dir.join("art_call_1.txt"), &body)?;
+    let served = crate::artifacts::record_tool_output_artifact_with_size(
+        &session_id,
+        "call_1",
+        "bash",
+        PathBuf::from("artifacts/art_call_1.txt"),
+        body.len() as u64,
+        "line one",
+    );
+    let escaping = crate::artifacts::record_tool_output_artifact_with_size(
+        &session_id,
+        "call_2",
+        "bash",
+        PathBuf::from("../../escape.txt"),
+        4,
+        "nope",
+    );
+    fs::write(tmp.path().join("escape.txt"), "nope")?;
+    let missing = crate::artifacts::record_tool_output_artifact_with_size(
+        &session_id,
+        "call_3",
+        "bash",
+        PathBuf::from("artifacts/gone.txt"),
+        4,
+        "gone",
+    );
+    session.artifacts = vec![served.clone(), escaping.clone(), missing.clone()];
+    manager.save_session(&session)?;
+
+    let (addr, _, handle) = spawn_test_server_with_root_token_mobile_workspace(
+        tmp.path().join("runtime"),
+        sessions_dir.clone(),
+        Some("artifacts-token".to_string()),
+        false,
+        workspace,
+    )
+    .await?
+    .context("artifacts test requires a loopback listener")?;
+    let client = crate::tls::reqwest_client();
+    let base = format!("http://{addr}");
+
+    let status = client
+        .get(format!("{base}/v1/sessions/{session_id}/artifacts"))
+        .send()
+        .await?
+        .status();
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let listing: Value = client
+        .get(format!("{base}/v1/sessions/{session_id}/artifacts"))
+        .bearer_auth("artifacts-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(listing["session_id"], session_id);
+    let artifacts = listing["artifacts"].as_array().unwrap();
+    assert_eq!(artifacts.len(), 3);
+    assert_eq!(artifacts[0]["id"], served.id);
+    assert_eq!(artifacts[0]["kind"], "tool_output");
+    assert_eq!(artifacts[0]["tool_name"], "bash");
+    assert_eq!(artifacts[0]["tool_call_id"], "call_1");
+    assert_eq!(artifacts[0]["byte_size"], body.len() as u64);
+    assert_eq!(artifacts[0]["path"], "artifacts/art_call_1.txt");
+    assert_eq!(artifacts[0]["preview"], "line one");
+    assert!(artifacts[0].get("storage_path").is_none());
+
+    let read: Value = client
+        .get(format!(
+            "{base}/v1/sessions/{session_id}/artifacts/{}",
+            served.id
+        ))
+        .bearer_auth("artifacts-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(read["artifact"]["id"], served.id);
+    assert_eq!(read["encoding"], "utf-8");
+    assert_eq!(read["content"], body);
+    assert_eq!(read["size"], body.len() as u64);
+    assert_eq!(read["truncated"], false);
+    let window: Value = client
+        .get(format!(
+            "{base}/v1/sessions/{session_id}/artifacts/{}?offset=5&limit=3",
+            served.id
+        ))
+        .bearer_auth("artifacts-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(window["content"], "one");
+    assert_eq!(window["truncated"], true);
+    assert_eq!(window["revision"], read["revision"]);
+
+    for (artifact_id, expected) in [
+        (escaping.id.as_str(), StatusCode::FORBIDDEN),
+        (missing.id.as_str(), StatusCode::NOT_FOUND),
+        ("art_unknown", StatusCode::NOT_FOUND),
+    ] {
+        let status = client
+            .get(format!(
+                "{base}/v1/sessions/{session_id}/artifacts/{artifact_id}"
+            ))
+            .bearer_auth("artifacts-token")
+            .send()
+            .await?
+            .status();
+        assert_eq!(status, expected, "artifact={artifact_id}");
+    }
+    let status = client
+        .get(format!(
+            "{base}/v1/sessions/{session_id}/artifacts/{}?limit=0",
+            served.id
+        ))
+        .bearer_auth("artifacts-token")
+        .send()
+        .await?
+        .status();
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let status = client
+        .get(format!("{base}/v1/sessions/sess_missing/artifacts"))
+        .bearer_auth("artifacts-token")
+        .send()
+        .await?
+        .status();
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    handle.abort();
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// /v1/jobs: client-owned shell jobs on the thread's shared ShellManager.
+// ---------------------------------------------------------------------------
+
+#[cfg(unix)]
+#[tokio::test]
+async fn jobs_api_lists_creates_streams_stdin_and_kills() -> Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let workspace = tmp.path().join("workspace");
+    fs::create_dir_all(&workspace)?;
+    let (addr, _runtime_threads, handle) = spawn_test_server_with_root_token_mobile_workspace(
+        tmp.path().join("runtime"),
+        tmp.path().join("sessions"),
+        Some("jobs-token".to_string()),
+        false,
+        workspace.clone(),
+    )
+    .await?
+    .context("jobs test requires a loopback listener")?;
+    let client = crate::tls::reqwest_client();
+    let base = format!("http://{addr}");
+
+    // Auth is required on every jobs route.
+    for route in ["/v1/jobs", "/v1/threads/thread-x/jobs"] {
+        let status = client.get(format!("{base}{route}")).send().await?.status();
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{route}");
+    }
+
+    let thread: Value = client
+        .post(format!("{base}/v1/threads"))
+        .bearer_auth("jobs-token")
+        .json(&json!({ "workspace": workspace, "allow_shell": true }))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let thread_id = thread["id"].as_str().unwrap().to_string();
+
+    // A shell-forbidden thread refuses job creation.
+    let no_shell: Value = client
+        .post(format!("{base}/v1/threads"))
+        .bearer_auth("jobs-token")
+        .json(&json!({ "workspace": workspace, "allow_shell": false }))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let no_shell_id = no_shell["id"].as_str().unwrap().to_string();
+    let status = client
+        .post(format!("{base}/v1/threads/{no_shell_id}/jobs"))
+        .bearer_auth("jobs-token")
+        .json(&json!({ "command": "echo never" }))
+        .send()
+        .await?
+        .status();
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // Unknown thread and unknown job are honest 404s, and a thread that never
+    // ran shell work lists empty rather than fabricating a manager.
+    let status = client
+        .get(format!("{base}/v1/threads/thread-missing/jobs"))
+        .bearer_auth("jobs-token")
+        .send()
+        .await?
+        .status();
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let empty: Value = client
+        .get(format!("{base}/v1/threads/{no_shell_id}/jobs"))
+        .bearer_auth("jobs-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(empty["jobs"].as_array().unwrap().len(), 0);
+    let status = client
+        .get(format!(
+            "{base}/v1/threads/{thread_id}/jobs/job-missing/output"
+        ))
+        .bearer_auth("jobs-token")
+        .send()
+        .await?
+        .status();
+    // The thread has no manager yet, so this is a not-found either way.
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // Create a client-owned background job.
+    let created = client
+        .post(format!("{base}/v1/threads/{thread_id}/jobs"))
+        .bearer_auth("jobs-token")
+        .json(&json!({ "command": "echo codewhale-jobs && echo second-line" }))
+        .send()
+        .await?
+        .error_for_status()?;
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let created: Value = created.json().await?;
+    let job_id = created["job"]["id"].as_str().unwrap().to_string();
+    assert_eq!(created["job"]["owner"], "client");
+    assert_eq!(created["job"]["thread_id"], thread_id);
+    assert_eq!(
+        created["job"]["command"],
+        "echo codewhale-jobs && echo second-line"
+    );
+
+    // Poll the byte stream until the job exits; the cursor contract replays
+    // the full stream from 0 for a late reader.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let mut chunk: Value;
+    loop {
+        chunk = client
+            .get(format!(
+                "{base}/v1/threads/{thread_id}/jobs/{job_id}/output?format=text"
+            ))
+            .bearer_auth("jobs-token")
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        if chunk["done"].as_bool().unwrap() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "job did not finish: {chunk}"
+        );
+        sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(chunk["status"], "Completed");
+    assert_eq!(chunk["exit_code"], 0);
+    assert!(chunk["data"].as_str().unwrap().contains("codewhale-jobs"));
+    assert_eq!(chunk["dropped"], 0);
+
+    // A cursor at the end stays put; a mid-stream cursor resumes exactly.
+    let total = chunk["total"].as_u64().unwrap();
+    let tail: Value = client
+        .get(format!(
+            "{base}/v1/threads/{thread_id}/jobs/{job_id}/output?format=text&cursor={total}"
+        ))
+        .bearer_auth("jobs-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(tail["data"], "");
+    assert_eq!(tail["next_cursor"], total);
+    assert_eq!(tail["done"], true);
+
+    // stdin round-trip: a `cat` job echoes what the API writes.
+    let cat: Value = client
+        .post(format!("{base}/v1/threads/{thread_id}/jobs"))
+        .bearer_auth("jobs-token")
+        .json(&json!({ "command": "cat" }))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let cat_id = cat["job"]["id"].as_str().unwrap().to_string();
+    assert_eq!(cat["job"]["stdin_available"], true);
+    let status = client
+        .post(format!("{base}/v1/threads/{thread_id}/jobs/{cat_id}/stdin"))
+        .bearer_auth("jobs-token")
+        .json(&json!({ "data": "typed-by-client\n", "close": true }))
+        .send()
+        .await?
+        .status();
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let echoed = loop {
+        let chunk: Value = client
+            .get(format!(
+                "{base}/v1/threads/{thread_id}/jobs/{cat_id}/output?format=text"
+            ))
+            .bearer_auth("jobs-token")
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        if chunk["done"].as_bool().unwrap() {
+            break chunk;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "cat job did not finish: {chunk}"
+        );
+        sleep(std::time::Duration::from_millis(50)).await;
+    };
+    assert_eq!(echoed["data"], "typed-by-client\n");
+
+    // The flat listing sees both jobs, tagged to this thread.
+    let all: Value = client
+        .get(format!("{base}/v1/jobs"))
+        .bearer_auth("jobs-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let ids: Vec<&str> = all["jobs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|job| job["id"].as_str().unwrap())
+        .collect();
+    assert!(ids.contains(&job_id.as_str()) && ids.contains(&cat_id.as_str()));
+
+    // Kill stops a running job and reports the terminal snapshot.
+    let sleeper: Value = client
+        .post(format!("{base}/v1/threads/{thread_id}/jobs"))
+        .bearer_auth("jobs-token")
+        .json(&json!({ "command": "sleep 60" }))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let sleeper_id = sleeper["job"]["id"].as_str().unwrap().to_string();
+    let killed: Value = client
+        .post(format!(
+            "{base}/v1/threads/{thread_id}/jobs/{sleeper_id}/kill"
+        ))
+        .bearer_auth("jobs-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(killed["job"]["status"], "Killed");
+
+    // A job id from another thread's scope is a scoped 404, not a leak.
+    let other: Value = client
+        .post(format!("{base}/v1/threads"))
+        .bearer_auth("jobs-token")
+        .json(&json!({ "workspace": workspace, "allow_shell": true }))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let other_id = other["id"].as_str().unwrap().to_string();
+    let status = client
+        .get(format!("{base}/v1/threads/{other_id}/jobs/{job_id}"))
+        .bearer_auth("jobs-token")
+        .send()
+        .await?
+        .status();
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn thread_context_reports_live_budget_from_the_engine() -> Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let workspace = tmp.path().join("workspace");
+    fs::create_dir_all(&workspace)?;
+    let (addr, _runtime_threads, handle) = spawn_test_server_with_root_token_mobile_workspace(
+        tmp.path().join("runtime"),
+        tmp.path().join("sessions"),
+        Some("context-token".to_string()),
+        false,
+        workspace.clone(),
+    )
+    .await?
+    .context("context test requires a loopback listener")?;
+    let client = crate::tls::reqwest_client();
+    let base = format!("http://{addr}");
+
+    let status = client
+        .get(format!("{base}/v1/threads/thread-x/context"))
+        .send()
+        .await?
+        .status();
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    let status = client
+        .get(format!("{base}/v1/threads/thread-missing/context"))
+        .bearer_auth("context-token")
+        .send()
+        .await?
+        .status();
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    let thread: Value = client
+        .post(format!("{base}/v1/threads"))
+        .bearer_auth("context-token")
+        .json(&json!({ "workspace": workspace }))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let thread_id = thread["id"].as_str().unwrap().to_string();
+
+    let context: Value = client
+        .get(format!("{base}/v1/threads/{thread_id}/context"))
+        .bearer_auth("context-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(context["thread_id"], thread_id);
+    assert_eq!(context["live"], true);
+    let window = context["window_tokens"].as_u64().unwrap();
+    assert!(window > 0, "a resolved route must report its window");
+    assert!(context["input_tokens"].as_u64().unwrap() > 0);
+    assert!(context["available_input_tokens"].as_u64().unwrap() <= window);
+    assert!(context["compaction_trigger_tokens"].as_u64().unwrap() <= window);
+    let percent = context["usage_percent"].as_f64().unwrap();
+    assert!((0.0..=100.0).contains(&percent));
+    assert!(matches!(
+        context["pressure"].as_str(),
+        Some("low" | "moderate" | "high" | "critical")
+    ));
+    // Fresh thread: no provider-billed count exists yet — null, not zero.
+    assert!(context["billed_input_tokens"].is_null());
+
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn provider_key_write_is_write_only_and_reports_readiness() -> Result<()> {
+    // The credential store is only exposed to tests under an explicit isolated
+    // home plus an explicit backend — both scoped to this test by the env lock.
+    let _env_lock = crate::test_support::lock_test_env();
+    let tmp = tempfile::tempdir()?;
+    let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", tmp.path().join("cwhome"));
+    let _backend = crate::test_support::EnvVarGuard::set("CODEWHALE_SECRET_BACKEND", "file");
+    fs::create_dir_all(tmp.path().join("cwhome"))?;
+    let workspace = tmp.path().join("workspace");
+    fs::create_dir_all(&workspace)?;
+
+    let (addr, _runtime_threads, handle) = spawn_test_server_with_root_token_mobile_workspace(
+        tmp.path().join("runtime"),
+        tmp.path().join("sessions"),
+        Some("keys-token".to_string()),
+        false,
+        workspace.clone(),
+    )
+    .await?
+    .context("secrets test requires a loopback listener")?;
+    let client = crate::tls::reqwest_client();
+    let base = format!("http://{addr}");
+
+    let status = client
+        .put(format!("{base}/v1/providers/openai/key"))
+        .json(&json!({ "key": "sk-test-write-only" }))
+        .send()
+        .await?
+        .status();
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    for (id, want) in [
+        ("not-a-provider", StatusCode::BAD_REQUEST),
+        ("deepseek-cn", StatusCode::BAD_REQUEST),
+    ] {
+        let status = client
+            .put(format!("{base}/v1/providers/{id}/key"))
+            .bearer_auth("keys-token")
+            .json(&json!({ "key": "sk-test" }))
+            .send()
+            .await?
+            .status();
+        assert_eq!(status, want, "{id}");
+    }
+    let status = client
+        .put(format!("{base}/v1/providers/openai/key"))
+        .bearer_auth("keys-token")
+        .json(&json!({ "key": "   " }))
+        .send()
+        .await?
+        .status();
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // A key written for the *active* provider reports configured through the
+    // live store even though the test route is a keyless local endpoint —
+    // saving a key declares the api-key contract, exactly as `auth set` would.
+    let receipt: Value = client
+        .put(format!("{base}/v1/providers/deepseek/key"))
+        .bearer_auth("keys-token")
+        .json(&json!({ "key": "sk-test-active-route-key" }))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(receipt["provider"], "deepseek");
+    assert_eq!(receipt["stored"], true);
+    assert!(!receipt.to_string().contains("sk-test-active-route-key"));
+    assert_eq!(receipt["credentialState"], "configured");
+
+    // A key written for a *non-active* provider is the harder case: the
+    // readiness catalog only probes the secret store for it when the
+    // auth-mode save marker is visible, so the route must mirror the
+    // persisted marker into the live config for the readback to be honest.
+    let receipt: Value = client
+        .put(format!("{base}/v1/providers/openai/key"))
+        .bearer_auth("keys-token")
+        .json(&json!({ "key": "sk-test-write-only-key-material" }))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(receipt["provider"], "openai");
+    assert_eq!(receipt["stored"], true);
+    // The receipt is a redacted receipt: no key bytes, not even the length.
+    let raw = receipt.to_string();
+    assert!(!raw.contains("sk-test-write-only-key-material"));
+    assert_eq!(receipt["credentialState"], "configured");
+
+    // The readiness readback agrees through the providers catalog too.
+    let providers: Value = client
+        .get(format!("{base}/v1/providers"))
+        .bearer_auth("keys-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let openai = providers["providers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["id"] == "openai")
+        .expect("openai is listed");
+    assert_eq!(openai["credentialState"], "configured");
+
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn diagnostics_list_and_read_bounded_windows() -> Result<()> {
+    // Log/crash directories resolve from the codewhale home — isolate it.
+    let _env_lock = crate::test_support::lock_test_env();
+    let tmp = tempfile::tempdir()?;
+    let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", tmp.path().join("cwhome"));
+    // Crash dumps resolve under the user home (`<home>/.codewhale/crashes`),
+    // independent of the codewhale-home override that governs logs.
+    let _user_home = crate::test_support::EnvVarGuard::set("HOME", tmp.path().join("userhome"));
+    let logs = tmp.path().join("cwhome/logs");
+    let crashes = tmp.path().join("userhome/.codewhale/crashes");
+    fs::create_dir_all(&logs)?;
+    fs::create_dir_all(&crashes)?;
+    fs::write(logs.join("tui-20990101-1.log"), "line one\nline two\n")?;
+    fs::write(tmp.path().join("cwhome/audit.log"), "{\"event\":\"x\"}\n")?;
+    fs::write(crashes.join("20990101T000000Z-turn.log"), "Panic: boom\n")?;
+    let workspace = tmp.path().join("workspace");
+    fs::create_dir_all(&workspace)?;
+
+    let (addr, _runtime_threads, handle) = spawn_test_server_with_root_token_mobile_workspace(
+        tmp.path().join("runtime"),
+        tmp.path().join("sessions"),
+        Some("diag-token".to_string()),
+        false,
+        workspace,
+    )
+    .await?
+    .context("diagnostics test requires a loopback listener")?;
+    let client = crate::tls::reqwest_client();
+    let base = format!("http://{addr}");
+
+    let status = client.get(format!("{base}/v1/logs")).send().await?.status();
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    let listed: Value = client
+        .get(format!("{base}/v1/logs"))
+        .bearer_auth("diag-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let names: Vec<&str> = listed["sources"][0]["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|f| f["name"].as_str())
+        .collect();
+    assert!(names.contains(&"tui-20990101-1.log"));
+    assert!(names.contains(&"audit.log"));
+
+    // Tail read returns the last bytes only.
+    let tail: Value = client
+        .get(format!("{base}/v1/logs/tui-20990101-1.log?tail=9"))
+        .bearer_auth("diag-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(tail["content"], "line two\n");
+    assert_eq!(tail["encoding"], "utf-8");
+    // A tail window reaches EOF; the skipped prefix shows up as offset > 0.
+    assert_eq!(tail["offset"], 9);
+    assert_eq!(tail["truncated"], false);
+
+    let crashes_list: Value = client
+        .get(format!("{base}/v1/crashes"))
+        .bearer_auth("diag-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert!(
+        crashes_list["sources"][0]["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["name"] == "20990101T000000Z-turn.log")
+    );
+    let crash: Value = client
+        .get(format!("{base}/v1/crashes/20990101T000000Z-turn.log"))
+        .bearer_auth("diag-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(crash["content"], "Panic: boom\n");
+
+    // Traversal and missing files fail closed.
+    let status = client
+        .get(format!("{base}/v1/logs/..%2Fsecret"))
+        .bearer_auth("diag-token")
+        .send()
+        .await?
+        .status();
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let status = client
+        .get(format!("{base}/v1/logs/missing.log"))
+        .bearer_auth("diag-token")
+        .send()
+        .await?
+        .status();
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let status = client
+        .get(format!("{base}/v1/crashes/missing.log"))
+        .bearer_auth("diag-token")
+        .send()
+        .await?
+        .status();
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    let process: Value = client
+        .get(format!("{base}/v1/process"))
+        .bearer_auth("diag-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(process["pid"], json!(std::process::id()));
+    assert!(process["uptime_seconds"].is_number());
+    assert_eq!(process["version"], env!("CARGO_PKG_VERSION"));
+
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn targets_report_self_and_probe_remote_endpoints() -> Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let workspace = tmp.path().join("workspace");
+    fs::create_dir_all(&workspace)?;
+
+    let (addr, _runtime_threads, handle) = spawn_test_server_with_root_token_mobile_workspace(
+        tmp.path().join("runtime"),
+        tmp.path().join("sessions"),
+        Some("targets-token".to_string()),
+        false,
+        workspace,
+    )
+    .await?
+    .context("targets test requires a loopback listener")?;
+    let client = crate::tls::reqwest_client();
+    let base = format!("http://{addr}");
+
+    let status = client
+        .get(format!("{base}/v1/targets"))
+        .send()
+        .await?
+        .status();
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    let targets: Value = client
+        .get(format!("{base}/v1/targets"))
+        .bearer_auth("targets-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let local = &targets["targets"][0];
+    assert_eq!(local["kind"], "local");
+    assert_eq!(local["current"], true);
+    assert_eq!(local["service"], "codewhale-runtime-api");
+    assert_eq!(local["auth_required"], true);
+    assert_eq!(local["endpoint"], json!(base));
+    // Control-plane-owned surfaces answer honestly instead of 404ing.
+    assert_eq!(targets["ssh"]["supported"], false);
+    assert_eq!(targets["ssh"]["owner"], "codewhale-control-plane");
+    assert_eq!(targets["cloud"]["supported"], false);
+    assert_eq!(targets["remote"]["supported"], true);
+
+    let remote: Value = client
+        .get(format!("{base}/v1/remote"))
+        .bearer_auth("targets-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(remote["loopback_only"], true);
+    assert_eq!(remote["auth_required"], true);
+    assert_eq!(remote["port"], json!(addr.port()));
+
+    // The probe identifies this same server as a Codewhale runtime.
+    let probed: Value = client
+        .post(format!("{base}/v1/remote/connect"))
+        .bearer_auth("targets-token")
+        .json(&json!({"endpoint": base}))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(probed["ok"], true);
+    assert_eq!(probed["remote"]["service"], "codewhale-runtime-api");
+    assert_eq!(probed["remote"]["auth_required"], true);
+    assert_eq!(probed["attach"], "client");
+
+    // A closed port is an honest negative verdict, not a server error.
+    let refused: Value = client
+        .post(format!("{base}/v1/remote/connect"))
+        .bearer_auth("targets-token")
+        .json(&json!({"endpoint": "http://127.0.0.1:1"}))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(refused["ok"], false);
+    assert_eq!(refused["reason"], "unreachable");
+
+    // Malformed, non-http, and credentialed endpoints fail closed at 400.
+    for endpoint in [
+        "not-a-url",
+        "ftp://example.com",
+        "http://user:pass@127.0.0.1:7878",
+    ] {
+        let status = client
+            .post(format!("{base}/v1/remote/connect"))
+            .bearer_auth("targets-token")
+            .json(&json!({"endpoint": endpoint}))
+            .send()
+            .await?
+            .status();
+        assert_eq!(status, StatusCode::BAD_REQUEST, "endpoint {endpoint}");
+    }
+    // A token field is an unknown field — never accepted for forwarding
+    // (axum's JSON extractor answers deserialization failures with 422).
+    let status = client
+        .post(format!("{base}/v1/remote/connect"))
+        .bearer_auth("targets-token")
+        .json(&json!({"endpoint": base, "token": "x"}))
+        .send()
+        .await?
+        .status();
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+
+    // Client-owned registry + control-plane-owned surfaces refuse writes.
+    for (method, path) in [
+        ("POST", "/v1/targets"),
+        ("POST", "/v1/targets/switch"),
+        ("POST", "/v1/ssh/connect"),
+        ("POST", "/v1/cloud/attach"),
+    ] {
+        let status = client
+            .request(method.parse()?, format!("{base}{path}"))
+            .bearer_auth("targets-token")
+            .json(&json!({}))
+            .send()
+            .await?
+            .status();
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{method} {path}");
+    }
+    let ssh: Value = client
+        .get(format!("{base}/v1/ssh"))
+        .bearer_auth("targets-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(ssh["supported"], false);
+    let cloud: Value = client
+        .get(format!("{base}/v1/cloud"))
+        .bearer_auth("targets-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(cloud["supported"], false);
+
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn lsp_routes_serve_workspace_files_through_a_transport() -> Result<()> {
+    use crate::lsp::diagnostics::{Diagnostic, Severity};
+    use crate::lsp::registry::Language;
+    use crate::lsp::tests::FakeTransport;
+
+    let tmp = tempfile::tempdir()?;
+    let workspace = tmp.path().join("workspace");
+    fs::create_dir_all(&workspace)?;
+    fs::write(workspace.join("main.rs"), "fn main() {}\n")?;
+    fs::write(workspace.join("notes.unknownext"), "hi\n")?;
+
+    // Seed the shared manager with a fake Rust transport — no real LSP spawn.
+    let manager = Arc::new(crate::lsp::LspManager::new(
+        crate::lsp::LspConfig::default(),
+        workspace.canonicalize()?,
+    ));
+    manager
+        .install_test_transport(
+            Language::Rust,
+            Arc::new(FakeTransport::new(vec![Diagnostic {
+                line: 1,
+                column: 4,
+                severity: Severity::Error,
+                message: "test diagnostic".to_string(),
+            }])),
+        )
+        .await;
+
+    let (addr, _runtime_threads, handle) =
+        spawn_test_server_with_root_token_mobile_workspace_and_overrides(
+            tmp.path().join("runtime"),
+            tmp.path().join("sessions"),
+            Some("lsp-token".to_string()),
+            false,
+            workspace,
+            TestServerOverrides {
+                lsp_manager: Some(manager),
+                ..TestServerOverrides::default()
+            },
+        )
+        .await?
+        .context("lsp test requires a loopback listener")?;
+    let client = crate::tls::reqwest_client();
+    let base = format!("http://{addr}");
+
+    let status = client.get(format!("{base}/v1/lsp")).send().await?.status();
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    let capability: Value = client
+        .get(format!("{base}/v1/lsp"))
+        .bearer_auth("lsp-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(capability["enabled"], true);
+    assert!(
+        capability["languages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|l| l["language"] == "rust")
+    );
+
+    // Real diagnostics through the fake transport.
+    let diagnostics: Value = client
+        .get(format!("{base}/v1/diagnostics?path=main.rs"))
+        .bearer_auth("lsp-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(diagnostics["ok"], true);
+    assert_eq!(diagnostics["items"][0]["severity"], "error");
+    assert_eq!(diagnostics["items"][0]["message"], "test diagnostic");
+
+    // A language without a server is honest data, not an HTTP error.
+    let none: Value = client
+        .get(format!("{base}/v1/diagnostics?path=notes.unknownext"))
+        .bearer_auth("lsp-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(none["items"].as_array().unwrap().len(), 0);
+
+    // Position routes validate `line` before touching LSP.
+    let status = client
+        .get(format!("{base}/v1/definition?path=main.rs"))
+        .bearer_auth("lsp-token")
+        .send()
+        .await?
+        .status();
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // The fake transport declines request-style ops — surfaced as ok:false.
+    let definition: Value = client
+        .get(format!(
+            "{base}/v1/definition?path=main.rs&line=1&character=5"
+        ))
+        .bearer_auth("lsp-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(definition["ok"], false);
+    assert_eq!(definition["reason"], "lsp_error");
+
+    // Traversal and missing files fail closed.
+    for path in ["../escape.rs", ".git/config", "missing.rs"] {
+        let status = client
+            .get(format!("{base}/v1/diagnostics?path={path}"))
+            .bearer_auth("lsp-token")
+            .send()
+            .await?
+            .status();
+        assert!(
+            matches!(
+                status,
+                StatusCode::BAD_REQUEST | StatusCode::FORBIDDEN | StatusCode::NOT_FOUND
+            ),
+            "path {path} -> {status}"
+        );
+    }
+
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn voice_routes_report_capability_and_fail_closed_without_a_recorder() -> Result<()> {
+    let _lock = lock_test_env();
+    // Deterministic: the operator kill-switch keeps the test off the host mic.
+    let _voice_off = EnvVarGuard::set("CODEWHALE_DISABLE_VOICE", "1");
+
+    let tmp = tempfile::tempdir()?;
+    let workspace = tmp.path().join("workspace");
+    fs::create_dir_all(&workspace)?;
+
+    let (addr, _runtime_threads, handle) =
+        spawn_test_server_with_root_token_mobile_workspace_and_overrides(
+            tmp.path().join("runtime"),
+            tmp.path().join("sessions"),
+            Some("voice-token".to_string()),
+            false,
+            workspace,
+            TestServerOverrides::default(),
+        )
+        .await?
+        .context("voice test requires a loopback listener")?;
+    let client = crate::tls::reqwest_client();
+    let base = format!("http://{addr}");
+
+    let status = client
+        .get(format!("{base}/v1/voice"))
+        .send()
+        .await?
+        .status();
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    for path in ["/v1/voice/dictate", "/v1/voice/send", "/v1/voice/control"] {
+        let status = client.post(format!("{base}{path}")).send().await?.status();
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "POST {path}");
+    }
+
+    let status: Value = client
+        .get(format!("{base}/v1/voice"))
+        .bearer_auth("voice-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(status["available"], false);
+    assert!(status["recorder"].is_null());
+    assert!(!status["asr"]["kind"].as_str().unwrap().is_empty());
+    assert_eq!(status["modes"].as_array().unwrap().len(), 3);
+    assert!(status["send_phrases"].as_array().unwrap().len() >= 3);
+    assert_eq!(status["max_record_seconds"], 10);
+
+    // Dictation with no recorder fails closed as data — never an HTTP 5xx.
+    for path in ["/v1/voice/dictate", "/v1/voice/send"] {
+        let outcome: Value = client
+            .post(format!("{base}{path}"))
+            .bearer_auth("voice-token")
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        assert_eq!(outcome["ok"], false, "{path}");
+        assert_eq!(outcome["reason"], "no_recorder", "{path}");
+    }
+
+    // Control mode takes an optional {"composer"} body; still no recorder.
+    let outcome: Value = client
+        .post(format!("{base}/v1/voice/control"))
+        .bearer_auth("voice-token")
+        .json(&json!({ "composer": "draft text" }))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(outcome["ok"], false);
+    assert_eq!(outcome["reason"], "no_recorder");
+
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn git_routes_drive_a_real_workspace_repo() -> Result<()> {
+    use crate::dependencies::{ExternalTool as _, Git};
+
+    let tmp = tempfile::tempdir()?;
+    let workspace = tmp.path().join("workspace");
+    fs::create_dir_all(&workspace)?;
+    let git = |args: &[&str]| {
+        let output = Git::output(args, &workspace)?;
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Ok::<_, anyhow::Error>(output)
+    };
+    git(&["init", "-b", "main"])?;
+    git(&["config", "user.email", "runtime-api@example.test"])?;
+    git(&["config", "user.name", "Runtime API Test"])?;
+    // Windows git defaults to core.autocrlf=true, so `git checkout` rewrites
+    // LF to CRLF on restore and the discard assertion below reads back
+    // "v1\r\n" instead of "v1\n". Pin the fixture repo's line endings so the
+    // test measures the route rather than the host's git config.
+    git(&["config", "core.autocrlf", "false"])?;
+    fs::write(workspace.join("tracked.txt"), "v1\n")?;
+    git(&["add", "tracked.txt"])?;
+    git(&["commit", "-m", "initial"])?;
+
+    let (addr, _runtime_threads, handle) = spawn_test_server_with_root_token_mobile_workspace(
+        tmp.path().join("runtime"),
+        tmp.path().join("sessions"),
+        Some("git-token".to_string()),
+        false,
+        workspace.clone(),
+    )
+    .await?
+    .context("git test requires a loopback listener")?;
+    let client = crate::tls::reqwest_client();
+    let base = format!("http://{addr}");
+
+    let status = client.get(format!("{base}/v1/git")).send().await?.status();
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    // Untracked file shows up in the detail read.
+    fs::write(workspace.join("new.rs"), "fn main() {}\n")?;
+    let detail: Value = client
+        .get(format!("{base}/v1/git"))
+        .bearer_auth("git-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(detail["git_repo"], true);
+    assert_eq!(detail["branch"], "main");
+    assert!(
+        detail["files"].as_array().unwrap().iter().any(|f| {
+            f["path"] == "new.rs" && f["status"] == "untracked" && f["staged"] == false
+        })
+    );
+    assert_eq!(detail["branches"], json!(["main"]));
+
+    // Stage → status reflects the index; commit lands the change.
+    let staged: Value = client
+        .post(format!("{base}/v1/git/stage"))
+        .bearer_auth("git-token")
+        .json(&json!({ "paths": ["new.rs"] }))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(staged["ok"], true);
+    assert_eq!(staged["status"]["staged"], 1);
+    let committed: Value = client
+        .post(format!("{base}/v1/git/commit"))
+        .bearer_auth("git-token")
+        .json(&json!({ "message": "add new.rs" }))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(committed["ok"], true);
+    assert_eq!(committed["status"]["staged"], 0);
+
+    // Branch create+switch, then the graph reports both commits on it.
+    let switched: Value = client
+        .post(format!("{base}/v1/git/branch"))
+        .bearer_auth("git-token")
+        .json(&json!({ "name": "feature-x", "create": true }))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(switched["ok"], true);
+    assert_eq!(switched["status"]["branch"], "feature-x");
+    let graph: Value = client
+        .get(format!("{base}/v1/git/graph"))
+        .bearer_auth("git-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let commits = graph["commits"].as_array().unwrap();
+    assert_eq!(commits.len(), 2);
+    assert_eq!(commits[0]["subject"], "add new.rs");
+    assert!(commits[1]["id"].as_str().unwrap().len() == 40);
+
+    // Discard restores a tracked file; discarding an untracked path fails
+    // closed with git's own message rather than deleting the file.
+    fs::write(workspace.join("tracked.txt"), "v2\n")?;
+    let detail: Value = client
+        .get(format!("{base}/v1/git"))
+        .bearer_auth("git-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert!(detail["files"].as_array().unwrap().iter().any(|f| {
+        f["path"] == "tracked.txt" && f["status"] == "modified" && f["staged"] == false
+    }));
+
+    // The diff reads serve the same worktree change: a unified patch for one
+    // file, the whole tree with a numstat inventory, and the changes list.
+    let file_diff: Value = client
+        .get(format!("{base}/v1/diff?path=tracked.txt"))
+        .bearer_auth("git-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(file_diff["ok"], true);
+    assert_eq!(file_diff["untracked"], false);
+    let patch = file_diff["diff"].as_str().unwrap();
+    assert!(patch.contains("-v1") && patch.contains("+v2"), "{patch}");
+    assert_eq!(file_diff["truncated"], false);
+
+    // An untracked file is honest data: no diff, flagged for the client.
+    fs::write(workspace.join("scratch.txt"), "loose\n")?;
+    let untracked: Value = client
+        .get(format!("{base}/v1/diff?path=scratch.txt"))
+        .bearer_auth("git-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(untracked["ok"], true);
+    assert_eq!(untracked["untracked"], true);
+    assert_eq!(untracked["diff"], "");
+
+    let changes: Value = client
+        .get(format!("{base}/v1/changes"))
+        .bearer_auth("git-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(changes["git_repo"], true);
+    assert!(
+        changes["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["path"] == "tracked.txt" && f["status"] == "modified")
+    );
+
+    let tree: Value = client
+        .get(format!("{base}/v1/workspace/diff"))
+        .bearer_auth("git-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(tree["ok"], true);
+    assert!(
+        tree["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["path"] == "tracked.txt" && f["added"] == 1 && f["deleted"] == 1)
+    );
+    assert!(tree["diff"].as_str().unwrap().contains("+v2"));
+    assert_eq!(tree["truncated"], false);
+
+    // Diff path validation shares the file-route confinement.
+    for (path, want) in [
+        ("../escape.txt", StatusCode::BAD_REQUEST),
+        (".git/config", StatusCode::FORBIDDEN),
+    ] {
+        let status = client
+            .get(format!("{base}/v1/diff?path={path}"))
+            .bearer_auth("git-token")
+            .send()
+            .await?
+            .status();
+        assert_eq!(status, want, "diff path {path}");
+    }
+    let discarded: Value = client
+        .post(format!("{base}/v1/git/discard"))
+        .bearer_auth("git-token")
+        .json(&json!({ "paths": ["tracked.txt"] }))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(discarded["ok"], true);
+    assert_eq!(fs::read_to_string(workspace.join("tracked.txt"))?, "v1\n");
+    let status = client
+        .post(format!("{base}/v1/git/discard"))
+        .bearer_auth("git-token")
+        .json(&json!({ "paths": ["never-tracked.txt"] }))
+        .send()
+        .await?
+        .status();
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // Whole-tree discard stays refused; invalid refs and escapes are stopped
+    // before git ever sees them (the .git refusal is forbidden, the rest are
+    // bad requests).
+    for (route, body, want) in [
+        (
+            "/v1/git/discard",
+            json!({ "all": true }),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "/v1/git/stage",
+            json!({ "paths": ["../escape.txt"] }),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "/v1/git/stage",
+            json!({ "paths": [".git/config"] }),
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            "/v1/git/branch",
+            json!({ "name": "-f" }),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "/v1/git/commit",
+            json!({ "message": " " }),
+            StatusCode::BAD_REQUEST,
+        ),
+    ] {
+        let status = client
+            .post(format!("{base}{route}"))
+            .bearer_auth("git-token")
+            .json(&body)
+            .send()
+            .await?
+            .status();
+        assert_eq!(status, want, "{route} {body}");
+    }
+
+    handle.abort();
+    Ok(())
+}
+
+/// The half of #6179 the credential route was missing: clear, the metadata a
+/// client needs to decide whether to offer the control at all, and the refusal
+/// for a credential Codewhale does not own.
+#[tokio::test]
+async fn provider_key_clear_round_trips_and_reports_writability() -> Result<()> {
+    let _env_lock = crate::test_support::lock_test_env();
+    let tmp = tempfile::tempdir()?;
+    let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", tmp.path().join("cwhome"));
+    let _backend = crate::test_support::EnvVarGuard::set("CODEWHALE_SECRET_BACKEND", "file");
+    fs::create_dir_all(tmp.path().join("cwhome"))?;
+    let workspace = tmp.path().join("workspace");
+    fs::create_dir_all(&workspace)?;
+
+    let (addr, _runtime_threads, handle) = spawn_test_server_with_root_token_mobile_workspace(
+        tmp.path().join("runtime"),
+        tmp.path().join("sessions"),
+        Some("clear-token".to_string()),
+        false,
+        workspace.clone(),
+    )
+    .await?
+    .context("secrets test requires a loopback listener")?;
+    let client = crate::tls::reqwest_client();
+    let base = format!("http://{addr}");
+
+    // Clearing is a credential operation: it authenticates like the write.
+    let status = client
+        .delete(format!("{base}/v1/providers/openai/key"))
+        .send()
+        .await?
+        .status();
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    // Same id validation as the write, so a client cannot discover providers
+    // through one verb that the other rejects.
+    for (id, want) in [
+        ("not-a-provider", StatusCode::BAD_REQUEST),
+        ("deepseek-cn", StatusCode::BAD_REQUEST),
+    ] {
+        let status = client
+            .delete(format!("{base}/v1/providers/{id}/key"))
+            .bearer_auth("clear-token")
+            .send()
+            .await?
+            .status();
+        assert_eq!(status, want, "{id}");
+    }
+
+    client
+        .put(format!("{base}/v1/providers/openai/key"))
+        .bearer_auth("clear-token")
+        .json(&json!({ "key": "sk-key-that-will-be-cleared" }))
+        .send()
+        .await?
+        .error_for_status()?;
+
+    // Before the clear the catalog says the control is live and names the
+    // source it would write — this is what lets a client enable the control.
+    let providers: Value = client
+        .get(format!("{base}/v1/providers"))
+        .bearer_auth("clear-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let openai = providers["providers"]
+        .as_array()
+        .context("providers array")?
+        .iter()
+        .find(|entry| entry["id"] == "openai")
+        .context("openai entry")?
+        .clone();
+    assert_eq!(openai["credentialState"], "configured");
+    assert_eq!(openai["credentialSource"], "secret_store");
+    assert_eq!(openai["credentialWritable"], true);
+    // A writable route carries no refusal reason to render.
+    assert!(openai["credentialWritableReason"].is_null());
+
+    let receipt: Value = client
+        .delete(format!("{base}/v1/providers/openai/key"))
+        .bearer_auth("clear-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(receipt["provider"], "openai");
+    assert_eq!(receipt["cleared"], true);
+    // A clear receipt echoes no more than a write receipt does.
+    assert!(!receipt.to_string().contains("sk-key-that-will-be-cleared"));
+    assert_eq!(receipt["credentialState"], "missing");
+
+    // And the catalog agrees on the next read, through the live config mirror
+    // rather than only after a restart.
+    let providers: Value = client
+        .get(format!("{base}/v1/providers"))
+        .bearer_auth("clear-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let openai = providers["providers"]
+        .as_array()
+        .context("providers array")?
+        .iter()
+        .find(|entry| entry["id"] == "openai")
+        .context("openai entry")?
+        .clone();
+    assert_eq!(openai["credentialState"], "missing");
+    // Still writable: the key is gone, the control is not.
+    assert_eq!(openai["credentialWritable"], true);
+
+    // Clearing an already-clear route is not an error — a client retrying a
+    // revoke must not be told something went wrong.
+    let receipt: Value = client
+        .delete(format!("{base}/v1/providers/openai/key"))
+        .bearer_auth("clear-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(receipt["cleared"], true);
+
+    handle.abort();
     Ok(())
 }

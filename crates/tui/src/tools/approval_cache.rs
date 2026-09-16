@@ -36,7 +36,6 @@ use std::fmt::Write as _;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use crate::tools::apply_patch::{NormalizedApplyPatchInput, normalize_apply_patch_input};
 use codewhale_execpolicy::command_safety::classify_command;
 
 /// The fingerprint of a tool call — stable enough to match repeated
@@ -129,35 +128,41 @@ fn command_prefix(input: &serde_json::Value) -> String {
 }
 
 /// Hash the sorted set of file paths referenced by a patch input.
+///
+/// The paths come from [`preflight_apply_patch`] — the same resolver the
+/// executor, the permission path (`core/engine.rs`) and auto-review already
+/// use — rather than from a second, weaker parser. That matters because this
+/// string *is* the scope of an "approve for the session" grant: two patches
+/// share a grant exactly when they share this key.
+///
+/// The previous implementation read only `+++ b/` headers and the
+/// `replace`/`changes` array, so it saw no paths at all for the documented
+/// `apply_patch{path, patch}` override, for `--no-prefix` diffs, or for
+/// delete-only diffs — and collapsed all of them to one shared constant.
+/// Approving any one of those pre-approved every later one, to any file
+/// (#6247).
+///
+/// An input the resolver cannot parse gets a digest of the input itself, not
+/// a shared constant: an unparseable patch is its own family and matches
+/// nothing but a byte-identical repeat.
 fn hash_patch_paths(input: &serde_json::Value) -> String {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
 
-    let mut paths: Vec<&str> = Vec::new();
+    let Ok(preflight) = crate::tools::apply_patch::preflight_apply_patch(input) else {
+        return format!("unparsed_{}", hash_json_value(input));
+    };
 
-    match normalize_apply_patch_input(input) {
-        Ok(NormalizedApplyPatchInput::Replacement { entries, .. }) => {
-            for change in entries {
-                if let Some(path) = change.get("path").and_then(|v| v.as_str()) {
-                    paths.push(path);
-                }
-            }
-        }
-        Ok(NormalizedApplyPatchInput::Patch(patch_text)) => {
-            for line in patch_text.lines() {
-                if let Some(rest) = line.strip_prefix("+++ b/") {
-                    paths.push(rest.trim());
-                }
-            }
-        }
-        Err(_) => {}
-    }
+    let mut paths: Vec<&str> = preflight.touched_files.iter().map(String::as_str).collect();
 
-    paths.sort();
+    paths.sort_unstable();
     paths.dedup();
 
     if paths.is_empty() {
-        return "no_files".to_string();
+        // The resolver parsed the input but found no target. Fail closed for
+        // the same reason as the error arm above: a shared key here is a
+        // shared grant.
+        return format!("no_target_{}", hash_json_value(input));
     }
 
     let mut hasher = DefaultHasher::new();
@@ -335,6 +340,73 @@ mod tests {
         let key_a = build_approval_grouping_key("exec_shell", &json!({"command": "git status"}));
         let key_b = build_approval_grouping_key("exec_shell", &json!({"command": "git push"}));
         assert_ne!(key_a, key_b);
+    }
+
+    /// #6247. The `path` override is the documented way to patch without
+    /// diff headers (`apply_patch.rs` tells the model "Ensure the patch
+    /// includes ---/+++ headers or provide `path`"), and a bare hunk has no
+    /// `+++` line at all. Before the fix both of these produced the constant
+    /// `patch:no_files`, so one session grant covered every later one.
+    #[test]
+    fn grouping_key_scopes_a_path_override_to_its_own_file() {
+        let hunk = "@@ -1 +1 @@\n-old\n+new\n";
+        let benign = build_approval_grouping_key(
+            "apply_patch",
+            &json!({"path": ".env.example", "patch": hunk}),
+        );
+        let sensitive = build_approval_grouping_key(
+            "apply_patch",
+            &json!({"path": ".codewhale/settings.json", "patch": hunk}),
+        );
+        assert_ne!(
+            benign, sensitive,
+            "approving a patch to one file must never cover a patch to another"
+        );
+        assert!(
+            !format!("{benign:?}").contains("no_files"),
+            "a resolvable target must never collapse to the shared constant"
+        );
+    }
+
+    /// The executor's `normalize_diff_path` accepts a prefix-less header, so
+    /// the fingerprint must too — otherwise a `--no-prefix` diff is a second
+    /// route to the shared key.
+    #[test]
+    fn grouping_key_reads_prefix_less_diff_headers() {
+        let prefixed = build_approval_grouping_key(
+            "apply_patch",
+            &json!({"patch": "--- a/src/auth.rs\n+++ b/src/auth.rs\n@@ -1 +1 @@\n-a\n+b\n"}),
+        );
+        let bare = build_approval_grouping_key(
+            "apply_patch",
+            &json!({"patch": "--- src/auth.rs\n+++ src/auth.rs\n@@ -1 +1 @@\n-a\n+b\n"}),
+        );
+        assert_eq!(
+            prefixed, bare,
+            "the same target written two legal ways is one approval family"
+        );
+        let other = build_approval_grouping_key(
+            "apply_patch",
+            &json!({"patch": "--- src/billing.rs\n+++ src/billing.rs\n@@ -1 +1 @@\n-a\n+b\n"}),
+        );
+        assert_ne!(bare, other, "different targets are different families");
+    }
+
+    /// Fail closed: an input the resolver cannot parse is its own family, not
+    /// a member of a shared one. Two different unparseable inputs must not
+    /// share a grant.
+    #[test]
+    fn grouping_key_fails_closed_on_an_unresolvable_patch() {
+        let a = build_approval_grouping_key("apply_patch", &json!({"patch": "not a diff at all"}));
+        let b = build_approval_grouping_key("apply_patch", &json!({"patch": "also not a diff"}));
+        assert_ne!(a, b, "unparseable inputs must not share an approval family");
+        for key in [&a, &b] {
+            let rendered = format!("{key:?}");
+            assert!(
+                !rendered.contains("no_files"),
+                "the shared constant must not survive anywhere: {rendered}"
+            );
+        }
     }
 
     #[test]

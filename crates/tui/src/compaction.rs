@@ -1229,6 +1229,18 @@ fn build_compaction_summary_block_text(summary: &str, anchors: &str) -> String {
 /// transcript order. Content boundaries carry runtime provenance and image
 /// turns, so structured messages are retained whole or dropped whole. Only a
 /// single text block can be truncated to fit the remaining budget.
+/// Result blocks answer a tool call that lives in an earlier message. A
+/// retained older turn has already lost that call to the summary, so a kept
+/// result block becomes an orphan providers reject outright (#6119).
+fn is_orphaned_result_block(block: &ContentBlock) -> bool {
+    matches!(
+        block,
+        ContentBlock::ToolResult { .. }
+            | ContentBlock::ToolSearchToolResult { .. }
+            | ContentBlock::CodeExecutionToolResult { .. }
+    )
+}
+
 pub(crate) fn retained_user_messages(messages: &[Message], max_tokens: usize) -> Vec<Message> {
     let mut selected: Vec<Message> = Vec::new();
     let mut remaining = max_tokens;
@@ -1259,6 +1271,11 @@ pub(crate) fn retained_user_messages(messages: &[Message], max_tokens: usize) ->
             .sum();
         let mut retained = msg.clone();
         if tokens <= remaining {
+            // Keep the text and images; never a result block whose call was
+            // summarized away with the region around it (#6119).
+            retained
+                .content
+                .retain(|block| !is_orphaned_result_block(block));
             remaining -= tokens;
         } else {
             let [ContentBlock::Text { text, .. }] = retained.content.as_mut_slice() else {
@@ -2473,6 +2490,36 @@ mod tests {
             user_text_of(&retained_user_messages(&[msg("user", "αβγδεζηθικ")], 2)[0]).as_deref(),
             Some("αβγδεζ"),
         );
+    }
+
+    #[test]
+    fn retained_older_turn_drops_result_blocks_whose_call_was_summarized() {
+        // #6119: a host-supplied user message can mix text with a tool
+        // result; the tool_use it answers lives in the summarized region, so
+        // the retained copy must keep the text and drop the orphaned result.
+        let mut mixed = msg("user", "Please keep this context.");
+        mixed.content.push(ContentBlock::ToolResult {
+            tool_use_id: "toolu_orphan_1".to_string(),
+            content: "{\"ok\":true}".to_string(),
+            is_error: None,
+            content_blocks: None,
+        });
+        let retained = retained_user_messages(std::slice::from_ref(&mixed), usize::MAX);
+        assert_eq!(retained.len(), 1);
+        assert!(
+            !retained[0]
+                .content
+                .iter()
+                .any(|block| matches!(block, ContentBlock::ToolResult { .. })),
+            "the retained copy must not keep an orphaned tool_result"
+        );
+        assert_eq!(
+            user_text_of(&retained[0]).as_deref(),
+            Some("Please keep this context.")
+        );
+        // Insufficient budget still refuses to partially retain a multi-block
+        // turn; the structural-metadata guard is unchanged.
+        assert!(retained_user_messages(std::slice::from_ref(&mixed), 1).is_empty());
     }
 
     #[test]

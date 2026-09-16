@@ -267,8 +267,8 @@ impl WhaleState {
 
     /// State from the operator session phase. Public contract for the shell
     /// header / Fleet setup role pane (no consumer in this lane yet).
-    #[allow(dead_code)]
     #[must_use]
+    #[cfg_attr(not(test), expect(dead_code))]
     pub const fn for_shell_phase(phase: ShellPhase) -> Self {
         match phase {
             ShellPhase::Idle | ShellPhase::Done => Self::Resting,

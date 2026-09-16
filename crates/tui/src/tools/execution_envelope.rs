@@ -83,7 +83,7 @@ impl ExecutionEnvelope {
     /// starting from the widest one. Kept because it is the identity element
     /// [`Self::narrow`] is defined against, and removing it would leave that
     /// invariant untestable.
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), expect(dead_code))]
     pub(crate) const UNRESTRICTED: Self = Self {
         write: true,
         network: true,
@@ -104,7 +104,7 @@ impl ExecutionEnvelope {
     /// Exercised by this module's tests today; the grandchild-derivation path
     /// that consumes it in production lands with the ratification UI.
     #[must_use]
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), expect(dead_code))]
     pub(crate) const fn narrow(self, other: Self) -> Self {
         Self {
             write: self.write && other.write,

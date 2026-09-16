@@ -38,20 +38,30 @@ pub(crate) mod test_env_lock;
 // ---------------------------------------------------------------------------
 
 /// The concrete shell that the dispatcher will use.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ShellKind {
+    // Which variants are live is exactly a platform split: `detect` builds the
+    // four Windows shells under `cfg(windows)` and `Sh`/`Custom` under
+    // `cfg(not(windows))`. So each `expect(dead_code)` has to name the platform
+    // it is dead on, or it fires as unfulfilled on the other one — which is how
+    // the Windows build broke while unix stayed green.
     /// PowerShell 7+ (`pwsh.exe`).
+    #[cfg_attr(all(not(test), not(windows)), expect(dead_code))]
     Pwsh,
     /// Windows PowerShell 5.1 (`powershell.exe`).
+    #[cfg_attr(all(not(test), not(windows)), expect(dead_code))]
     WindowsPowerShell,
     /// Command Prompt (`cmd.exe`).
+    #[cfg_attr(all(not(test), not(windows)), expect(dead_code))]
     Cmd,
     /// Unix `/bin/sh` fallback.
+    #[cfg_attr(all(not(test), windows), expect(dead_code))]
     Sh,
     /// Bash — detected via `$SHELL` on WSL/Git Bash, or constructed explicitly.
+    #[cfg_attr(all(not(test), not(windows)), expect(dead_code))]
     Bash,
     /// The exact shell executable selected by Unix `$SHELL`.
+    #[cfg_attr(all(not(test), windows), expect(dead_code))]
     Custom { binary: String, flag: String },
 }
 
@@ -222,7 +232,6 @@ pub struct ShellDispatcher {
     kind: ShellKind,
 }
 
-#[allow(dead_code)]
 impl ShellDispatcher {
     /// Detect the user's shell from the environment.
     ///
@@ -245,6 +254,7 @@ impl ShellDispatcher {
     }
 
     /// Log a shell execution line when `SHELL_DISPATCHER_LOG` is set.
+    #[cfg_attr(test, allow(dead_code))]
     pub fn log_exec(command: &str) {
         if let Ok(path) = std::env::var("SHELL_DISPATCHER_LOG") {
             let _ = Self::append_log_static(&path, command);
@@ -273,6 +283,7 @@ impl ShellDispatcher {
         file.flush()
     }
 
+    #[cfg_attr(test, allow(dead_code))]
     fn append_log_static(path: &str, command: &str) -> std::io::Result<()> {
         // Resolve kind outside the lock — `global_dispatcher()` may trigger
         // `detect()` which calls `log_startup()` which also acquires the mutex.

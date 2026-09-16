@@ -4,6 +4,7 @@ pub mod auto_model;
 pub mod catalog;
 pub mod cloud_facts;
 mod config_document;
+pub mod credentials;
 pub mod descriptors;
 pub mod device_code;
 pub mod external_credentials;
@@ -2475,6 +2476,8 @@ pub struct WorkflowConfigToml {
     #[serde(default = "default_workflow_max_depth")]
     pub max_depth: u32,
     /// Default shared token budget for a Workflow run and its children.
+    /// `0` applies no shared cap — the run is advisory-only like the parent
+    /// turn loop — while any positive value is enforced across the run.
     #[serde(default = "default_workflow_default_token_budget")]
     pub default_token_budget: u64,
     /// How many parallel write children may share the parent worktree without
@@ -2521,7 +2524,11 @@ fn default_workflow_max_depth() -> u32 {
 }
 
 fn default_workflow_default_token_budget() -> u64 {
-    120_000
+    // Off by default: a cap the caller never asked for must not throttle a
+    // run — a 120k default silently killed real fan-outs mid-task (#6189).
+    // Spend discipline stays available as an explicit opt-in (tool
+    // `token_budget`, spec `budget.max_tokens`, or a configured value here).
+    0
 }
 
 fn default_workflow_max_parallel_writes_without_worktree() -> u32 {

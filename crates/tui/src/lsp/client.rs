@@ -72,7 +72,7 @@ pub trait LspTransport: Send + Sync {
     }
 
     /// Best-effort shutdown. Called via `LspManager::shutdown_all`.
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     async fn shutdown(&self);
 }
 
@@ -82,7 +82,7 @@ pub trait LspTransport: Send + Sync {
 pub struct StdioLspTransport {
     /// JoinHandle for the running server. Held so the child stays alive for
     /// the transport's lifetime; consumed during `shutdown`.
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     child: AsyncMutex<Option<Child>>,
     /// Outgoing message sender to the writer task.
     tx_outbound: mpsc::Sender<Vec<u8>>,

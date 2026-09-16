@@ -490,6 +490,7 @@ pub(crate) fn push_approval_request_view(
     approval_key: &str,
     intent_summary: Option<&str>,
     default_selection: crate::config::ApprovalDefaultSelection,
+    timeout: Option<std::time::Duration>,
 ) {
     let request = ApprovalRequest::new_with_intent(
         id,
@@ -500,12 +501,10 @@ pub(crate) fn push_approval_request_view(
         intent_summary,
         &app.workspace,
     );
-    app.view_stack
-        .push(ApprovalView::new_with_default_selection(
-            request,
-            app.ui_locale,
-            default_selection,
-        ));
+    app.view_stack.push(
+        ApprovalView::new_with_default_selection(request, app.ui_locale, default_selection)
+            .with_timeout(timeout),
+    );
 }
 
 /// Push the new `selected_idx` into the live transcript overlay so the

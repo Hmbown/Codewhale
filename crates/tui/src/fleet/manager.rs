@@ -732,19 +732,28 @@ impl FleetManager {
     ) -> Result<FleetStatusSnapshot> {
         let max_workers = max_workers.clamp(1, 128);
         let manager_lock_path = self.manager_lock_path(run_id);
-        if let Some(parent) = manager_lock_path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("creating Fleet manager lock dir {}", parent.display()))?;
-        }
-        let lock_file = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(&manager_lock_path)
-            .with_context(|| {
-                format!("opening Fleet manager lock {}", manager_lock_path.display())
-            })?;
+        // Directory creation and the lock-file open are blocking filesystem
+        // calls; this fn runs on the Tokio runtime, so they go through the
+        // blocking pool (blocking-call convention, #6149).
+        let lock_file = {
+            let path = manager_lock_path.clone();
+            tokio::task::spawn_blocking(move || -> Result<std::fs::File> {
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent).with_context(|| {
+                        format!("creating Fleet manager lock dir {}", parent.display())
+                    })?;
+                }
+                OpenOptions::new()
+                    .create(true)
+                    .truncate(false)
+                    .read(true)
+                    .write(true)
+                    .open(&path)
+                    .with_context(|| format!("opening Fleet manager lock {}", path.display()))
+            })
+            .await
+            .context("Fleet manager lock setup task failed to join")??
+        };
         let mut manager_lock = fd_lock::RwLock::new(lock_file);
         let standby_interval = tick_interval
             .min(Duration::from_millis(100))

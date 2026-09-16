@@ -4825,6 +4825,64 @@ fn saved_role_ambiguity_fails_unless_a_higher_priority_pin_selects_the_route() {
     assert_eq!(explicit.agent_type, FleetRole::Reviewer);
 }
 
+/// A prompt-only spawn must not be refused over a role the caller never wrote.
+///
+/// `request.agent_type` defaults to `FleetRole::Worker`, whose `as_str()` is
+/// `"general"`, so the route lookup synthesized `role:general` for a call that
+/// named no type, role or profile. Two saved members sharing role `general` then
+/// made every bare `agent(action=start, ...)` fail at the tool boundary (#6244).
+/// The refusal is still correct when the caller *did* ask — that half is pinned
+/// by `saved_role_ambiguity_fails_unless_a_higher_priority_pin_selects_the_route`.
+#[test]
+fn prompt_only_spawn_survives_an_ambiguous_default_role() {
+    let root = tempdir().unwrap();
+    for id in ["general-a", "general-b"] {
+        std::fs::write(
+            root.path().join(format!("{id}.toml")),
+            format!(
+                "id = '{id}'\nbase_role = 'general'\nprovider = 'deepseek'\nmodel = 'deepseek-v4-flash'\n",
+            ),
+        )
+        .unwrap();
+    }
+    let profiles = crate::fleet::profile::load_agent_profiles_from_dir(root.path()).unwrap();
+    assert_eq!(profiles.len(), 2);
+    let roster = FleetRoster::from_members(profiles);
+    let runtime = stub_runtime();
+
+    let mut request = parse_spawn_request(&json!({"prompt":"do the thing"})).unwrap();
+    assert!(
+        !request.agent_type_explicit,
+        "a prompt-only spawn must not report an explicit type"
+    );
+    assert_eq!(request.assignment.role, None);
+
+    let member = resolve_spawn_route_profile(&runtime, &mut request, &roster)
+        .expect("an ambiguous default role must not block a prompt-only spawn");
+    assert!(
+        member.is_none(),
+        "no member is pinned, so the spawn falls through to the session route"
+    );
+    assert_eq!(
+        request.profile, None,
+        "an unusable pin must not stamp a member"
+    );
+
+    // The same roster still refuses when the caller actually named the role.
+    let mut asked = parse_spawn_request(&json!({"prompt":"do the thing", "type":"general"}))
+        .expect("an explicit general type parses");
+    if asked.agent_type_explicit {
+        let error = resolve_spawn_route_profile(&runtime, &mut asked, &roster)
+            .expect_err("an explicitly requested ambiguous role must still refuse");
+        let message = error.to_string();
+        assert!(message.contains("ambiguous"), "{message}");
+        assert!(
+            message.contains("profile"),
+            "the refusal must say how to choose one: {message}"
+        );
+    }
+}
+
 #[test]
 fn providerless_spawn_model_gate_rejects_known_foreign_route_before_spawn() {
     let runtime = stub_runtime_for_provider("moonshot");
@@ -6500,7 +6558,7 @@ async fn model_wait_cancel_fans_in_once_and_preserves_checkpoint() {
         tokio::time::sleep(Duration::from_secs(60)).await;
     }));
 
-    let (completion_tx, mut completion_rx) = mpsc::unbounded_channel::<SubAgentCompletion>();
+    let (completion_tx, mut completion_rx) = mpsc::channel::<SubAgentCompletion>(16);
     let (mailbox, mut mailbox_rx) = Mailbox::new(CancellationToken::new());
     let (event_tx, mut event_rx) = mpsc::channel(8);
     let mut runtime = runtime_with_depth(1, Some(completion_tx));
@@ -6599,7 +6657,7 @@ async fn coordination_interrupt_fans_in_once_and_preserves_checkpoint() {
         tokio::time::sleep(Duration::from_secs(60)).await;
     }));
 
-    let (completion_tx, mut completion_rx) = mpsc::unbounded_channel::<SubAgentCompletion>();
+    let (completion_tx, mut completion_rx) = mpsc::channel::<SubAgentCompletion>(16);
     let (mailbox, mut mailbox_rx) = Mailbox::new(CancellationToken::new());
     let (event_tx, mut event_rx) = mpsc::channel(8);
     let mut runtime = runtime_with_depth(1, Some(completion_tx));
@@ -6791,7 +6849,7 @@ async fn completion_claim_preserves_running_gate_and_excludes_late_cancel() {
         "cancellation after the claim must not steal terminal ownership"
     );
 
-    let (completion_tx, mut completion_rx) = mpsc::unbounded_channel::<SubAgentCompletion>();
+    let (completion_tx, mut completion_rx) = mpsc::channel::<SubAgentCompletion>(16);
     let runtime = runtime_with_depth(1, Some(completion_tx));
     assert!(emit_parent_completion(
         &runtime,
@@ -7277,6 +7335,8 @@ fn every_named_role_has_one_complete_capability_based_surface() {
         "request_plugin_install",
         "request_user_input",
         "retrieve_tool_result",
+        "session_get",
+        "session_search",
         "todo_write",
         "tui_help",
         "validate_data",
@@ -7306,6 +7366,8 @@ fn every_named_role_has_one_complete_capability_based_surface() {
         "request_user_input",
         "retrieve_tool_result",
         "review",
+        "session_get",
+        "session_search",
         "todo_write",
         "tui_help",
         "validate_data",
@@ -7339,6 +7401,8 @@ fn every_named_role_has_one_complete_capability_based_surface() {
         "request_user_input",
         "retrieve_tool_result",
         "review",
+        "session_get",
+        "session_search",
         "tasks",
         "todo_write",
         "tui_help",
@@ -7381,6 +7445,8 @@ fn every_named_role_has_one_complete_capability_based_surface() {
         "revert_turn",
         "review",
         "send_later",
+        "session_get",
+        "session_search",
         "speech",
         "task_shell_start",
         "task_shell_wait",
@@ -8377,6 +8443,8 @@ async fn read_only_roles_expose_and_dispatch_lowercase_bash_only() {
             "request_plugin_install",
             "request_user_input",
             "retrieve_tool_result",
+            "session_get",
+            "session_search",
             "todo_write",
             "tui_help",
             "validate_data",
@@ -9893,7 +9961,7 @@ async fn cleanup_auto_cancels_stale_running_agent_and_releases_slot() {
         tokio::time::sleep(Duration::from_secs(60)).await;
     }));
     let agent_id = agent.id.clone();
-    let (completion_tx, mut completion_rx) = mpsc::unbounded_channel::<SubAgentCompletion>();
+    let (completion_tx, mut completion_rx) = mpsc::channel::<SubAgentCompletion>(16);
     let (mailbox, mut mailbox_rx) = Mailbox::new(CancellationToken::new());
     let (event_tx, mut event_rx) = mpsc::channel(8);
     let mut runtime = runtime_with_depth(1, Some(completion_tx));
@@ -12468,9 +12536,9 @@ async fn panicked_child_task_terminalizes_and_stops_gating_peers() {
 
 /// A headless fleet worker (a worker record with no paired agent entry) that
 /// reaches `WaitingForUser` can never be answered — nothing will resume or
-/// finalize it — so it must not count as a live coordination owner, and the
-/// `agents/coordinate action=release` remediation the gate names must be able
-/// to clear its claim. A *paired* child waiting on the user is untouched.
+/// finalize it — so it must not count as a live coordination owner, and a
+/// claim leaked by a settled headless worker must still be sweepable by
+/// `release`. A *paired* child waiting on the user is untouched.
 #[test]
 fn waiting_for_user_headless_worker_is_not_a_live_coordination_owner() {
     let tmp = tempdir().expect("tempdir");
@@ -12506,7 +12574,7 @@ fn waiting_for_user_headless_worker_is_not_a_live_coordination_owner() {
     assert_eq!(
         released,
         vec!["worker-waiting".to_string()],
-        "the remediation the gate names must actually clear the leaked claim"
+        "release must actually clear the claim a settled headless worker leaks"
     );
 
     // The interactive case is preserved: a paired child waiting on the user
@@ -13417,7 +13485,7 @@ async fn foreground_registration_releases_when_the_child_future_returns_or_unwin
     let registry = Arc::new(ForegroundChildRegistry::new());
 
     let completed = registry
-        .register(CancellationToken::new())
+        .register(CancellationToken::new(), "agent_completed")
         .expect("registry open");
     let result: Result<(), ()> = async move {
         let _registration = completed;
@@ -13427,7 +13495,7 @@ async fn foreground_registration_releases_when_the_child_future_returns_or_unwin
     assert!(result.is_err());
 
     let panicked = registry
-        .register(CancellationToken::new())
+        .register(CancellationToken::new(), "agent_panicked")
         .expect("registry open");
     let task = tokio::spawn(async move {
         let _registration = panicked;
@@ -14851,7 +14919,7 @@ fn persist_round_trip_preserves_session_and_boot_ownership() {
 
 fn runtime_with_depth(
     spawn_depth: u32,
-    parent_completion_tx: Option<mpsc::UnboundedSender<SubAgentCompletion>>,
+    parent_completion_tx: Option<mpsc::Sender<SubAgentCompletion>>,
 ) -> SubAgentRuntime {
     let mut rt = stub_runtime();
     rt.spawn_depth = spawn_depth;
@@ -14861,7 +14929,7 @@ fn runtime_with_depth(
 
 #[test]
 fn emit_parent_completion_fires_for_direct_child() {
-    let (tx, mut rx) = mpsc::unbounded_channel::<SubAgentCompletion>();
+    let (tx, mut rx) = mpsc::channel::<SubAgentCompletion>(16);
     let runtime = runtime_with_depth(1, Some(tx));
 
     let sent = emit_parent_completion(&runtime, "agent_abc", "summary line\n<sentinel/>");
@@ -14890,7 +14958,7 @@ fn child_runtime_inherits_speech_output_dir() {
 
 #[test]
 fn emit_parent_completion_fires_for_nested_child() {
-    let (tx, mut rx) = mpsc::unbounded_channel::<SubAgentCompletion>();
+    let (tx, mut rx) = mpsc::channel::<SubAgentCompletion>(16);
     let runtime = runtime_with_depth(2, Some(tx));
 
     let sent = emit_parent_completion(&runtime, "agent_grandchild", "nested summary");
@@ -14906,7 +14974,7 @@ fn emit_parent_completion_fires_for_nested_child() {
 fn emit_parent_completion_skips_engine_self() {
     // depth 0 is the engine itself — the engine never spawns a task at
     // depth 0, but defend against accidental misuse.
-    let (tx, mut rx) = mpsc::unbounded_channel::<SubAgentCompletion>();
+    let (tx, mut rx) = mpsc::channel::<SubAgentCompletion>(16);
     let runtime = runtime_with_depth(0, Some(tx));
 
     let sent = emit_parent_completion(&runtime, "agent_root", "ignored");
@@ -14932,7 +15000,7 @@ fn emit_parent_completion_no_channel_is_noop() {
 
 #[test]
 fn emit_parent_completion_dropped_receiver_does_not_panic() {
-    let (tx, rx) = mpsc::unbounded_channel::<SubAgentCompletion>();
+    let (tx, rx) = mpsc::channel::<SubAgentCompletion>(16);
     drop(rx);
     let runtime = runtime_with_depth(1, Some(tx));
 
@@ -15041,7 +15109,7 @@ async fn run_subagent_task_claims_before_delivery_and_then_finalizes() {
     );
     agent.status = SubAgentStatus::Running;
 
-    let (completion_tx, mut completion_rx) = mpsc::unbounded_channel::<SubAgentCompletion>();
+    let (completion_tx, mut completion_rx) = mpsc::channel::<SubAgentCompletion>(16);
     let mut runtime = runtime_with_depth(1, Some(completion_tx));
     runtime.manager = Arc::clone(&manager);
     agent.terminal_delivery = Some(SubAgentTerminalDeliveryContext::from_runtime(&runtime));
@@ -15125,7 +15193,7 @@ async fn cancellation_wins_task_race_but_still_fans_in_exactly_once() {
     );
     agent.status = SubAgentStatus::Running;
 
-    let (completion_tx, mut completion_rx) = mpsc::unbounded_channel::<SubAgentCompletion>();
+    let (completion_tx, mut completion_rx) = mpsc::channel::<SubAgentCompletion>(16);
     let (mailbox, mut mailbox_rx) = Mailbox::new(CancellationToken::new());
     let (event_tx, mut event_rx) = mpsc::channel(8);
     let mut runtime = runtime_with_depth(1, Some(completion_tx));
@@ -15470,6 +15538,181 @@ async fn fatal_provider_failure_mid_run_parks_a_continuable_checkpoint() {
     assert_eq!(resumed.result.as_deref(), Some("resumed and finished"));
 }
 
+/// Six responses re-issuing the same role-denied call, then a text report —
+/// the exact stall #6015 guards: three denied rounds trigger the strategy
+/// switch, three held rounds the report-only response.
+async fn denied_call_then_report_chat_client() -> (DeepSeekClient, Arc<AtomicUsize>) {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let app = Router::new().route(
+        "/{*path}",
+        post({
+            let calls = Arc::clone(&calls);
+            move |Json(_body): Json<Value>| {
+                let calls = Arc::clone(&calls);
+                async move {
+                    let attempt = calls.fetch_add(1, Ordering::SeqCst) + 1;
+                    if attempt <= 6 {
+                        Json(json!({
+                            "id": format!("chatcmpl-denied-{attempt}"),
+                            "model": "deepseek-v4-flash",
+                            "choices": [{
+                                "index": 0,
+                                "message": {
+                                    "role": "assistant",
+                                    "content": null,
+                                    "tool_calls": [{
+                                        "id": format!("call_denied_{attempt}"),
+                                        "type": "function",
+                                        "function": {
+                                            "name": "bash",
+                                            "arguments": "{\"command\":\"cargo build\"}"
+                                        }
+                                    }]
+                                },
+                                "finish_reason": "tool_calls"
+                            }],
+                            "usage": {
+                                "prompt_tokens": 10,
+                                "completion_tokens": 5,
+                                "total_tokens": 15
+                            }
+                        }))
+                        .into_response()
+                    } else {
+                        Json(json!({
+                            "id": format!("chatcmpl-report-{attempt}"),
+                            "model": "deepseek-v4-flash",
+                            "choices": [{
+                                "index": 0,
+                                "message": {
+                                    "role": "assistant",
+                                    "content": "Partial report: every bash call was denied."
+                                },
+                                "finish_reason": "stop"
+                            }],
+                            "usage": {
+                                "prompt_tokens": 10,
+                                "completion_tokens": 5,
+                                "total_tokens": 15
+                            }
+                        }))
+                        .into_response()
+                    }
+                }
+            }
+        }),
+    );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind test server");
+    let addr = listener.local_addr().expect("local addr");
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.ok();
+    });
+
+    let config = crate::config::Config {
+        api_key: Some("test-key".to_string()),
+        base_url: Some(format!("http://{addr}/v1")),
+        retry: Some(crate::config::RetryConfig {
+            enabled: Some(false),
+            max_retries: Some(0),
+            initial_delay: Some(0.0),
+            max_delay: Some(0.0),
+            exponential_base: Some(1.0),
+        }),
+        ..crate::config::Config::default()
+    };
+    let client = DeepSeekClient::new(&config).expect("denial-stall chat client");
+    (client, calls)
+}
+
+/// #6015: a read-only worker that keeps re-issuing the same denied action
+/// must terminate as `Failed` — typed no-progress — after the shared
+/// FleetDenialGuard's strategy notice and one report-only response, not spin
+/// to the step/token budget and not misreport `BudgetExhausted`.
+#[tokio::test]
+async fn repeated_typed_denials_stop_worker_as_failed_not_budget() {
+    let tmp = tempdir().expect("tempdir");
+    let manager = Arc::new(RwLock::new(SubAgentManager::new(
+        tmp.path().to_path_buf(),
+        2,
+    )));
+    let agent_id = "agent_denial_stall".to_string();
+    let (task_input_tx, task_input_rx) = mpsc::unbounded_channel();
+    let agent = SubAgent::new(
+        agent_id.clone(),
+        FleetRole::Scout,
+        "List the workspace".to_string(),
+        make_assignment(),
+        "deepseek-v4-flash".to_string(),
+        Some("Stall".to_string()),
+        None,
+        task_input_tx,
+        tmp.path().to_path_buf(),
+        "boot_stall".to_string(),
+    );
+    {
+        let mut manager = manager.write().await;
+        manager.agents.insert(agent_id.clone(), agent);
+        manager.register_worker(make_worker_spec(&agent_id, tmp.path().to_path_buf()));
+    }
+
+    let (client, calls) = denied_call_then_report_chat_client().await;
+    let mut runtime =
+        stub_runtime().with_agent_tool_surface_options(enabled_agent_surface_options());
+    runtime.worker_profile = WorkerRuntimeProfile::for_role(FleetRole::Scout);
+    seed_read_only_role_deny_list(&mut runtime);
+    runtime.client = client;
+    runtime.manager = Arc::clone(&manager);
+    runtime.context = ToolContext::new(tmp.path());
+
+    run_subagent_task(SubAgentTask {
+        manager_handle: Arc::clone(&manager),
+        runtime,
+        agent_id: agent_id.clone(),
+        agent_type: FleetRole::Scout,
+        prompt: "List the workspace".to_string(),
+        assignment: make_assignment(),
+        allowed_tools: None,
+        fork_context: false,
+        started_at: Instant::now(),
+        max_steps: 20,
+        token_budget: None,
+        wall_time: DEFAULT_CHILD_WALL_TIME,
+        input_rx: task_input_rx,
+        launch_gate: None,
+        _foreground_child_registration: None,
+    })
+    .await;
+
+    // Three denied rounds earn the strategy notice; the held re-issues count
+    // three more; the report-only response is the terminal seventh call.
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        7,
+        "the stall must resolve after one report-only response"
+    );
+    let result = manager
+        .read()
+        .await
+        .get_result(&agent_id)
+        .expect("agent registered");
+    let reason = match &result.status {
+        SubAgentStatus::Failed(reason) => reason.clone(),
+        other => panic!("expected Failed, got {other:?}"),
+    };
+    assert!(
+        reason.contains("repeated permission denials"),
+        "the terminal reason must name the no-progress denial stall: {reason}"
+    );
+    assert_eq!(
+        result.result.as_deref(),
+        Some("Partial report: every bash call was denied."),
+        "the report-only response's text is the recorded result"
+    );
+}
+
 #[tokio::test]
 async fn non_retryable_provider_failure_fans_in_to_every_terminal_sink() {
     use tokio_util::sync::CancellationToken;
@@ -15494,7 +15737,7 @@ async fn non_retryable_provider_failure_fans_in_to_every_terminal_sink() {
         "boot_test".to_string(),
     );
 
-    let (completion_tx, mut completion_rx) = mpsc::unbounded_channel::<SubAgentCompletion>();
+    let (completion_tx, mut completion_rx) = mpsc::channel::<SubAgentCompletion>(16);
     let (mailbox, mut mailbox_rx) = Mailbox::new(CancellationToken::new());
     let (event_tx, mut event_rx) = mpsc::channel(8);
     let (client, calls) = always_invalid_request_chat_client().await;
@@ -15616,7 +15859,7 @@ fn child_runtime_propagates_completion_tx_for_gating() {
     // The channel is cloned through `child_runtime()` so descendants carry
     // it. Running sub-agents replace the channel in the runtime handed to
     // their nested tool registry, so this propagation must not strand it.
-    let (tx, _rx) = mpsc::unbounded_channel::<SubAgentCompletion>();
+    let (tx, _rx) = mpsc::channel::<SubAgentCompletion>(16);
     let parent = runtime_with_depth(0, Some(tx));
 
     let child = parent.child_runtime();
@@ -15630,7 +15873,7 @@ fn child_runtime_propagates_completion_tx_for_gating() {
 
 #[test]
 fn nested_tool_runtime_routes_child_completions_to_local_inbox() {
-    let (root_tx, mut root_rx) = mpsc::unbounded_channel::<SubAgentCompletion>();
+    let (root_tx, mut root_rx) = mpsc::channel::<SubAgentCompletion>(16);
     let direct_child_runtime = runtime_with_depth(1, Some(root_tx));
     let fork_context = SubAgentForkContext {
         messages: Vec::new(),
@@ -16473,7 +16716,7 @@ async fn queued_turn_owned_child_parks_without_a_false_start_transition() {
 
     let foreground_children = Arc::new(ForegroundChildRegistry::new());
     let registration = foreground_children
-        .register(runtime.cancel_token.clone())
+        .register(runtime.cancel_token.clone(), &agent_id)
         .expect("turn-owned queued child registers before settlement");
     let gate = Arc::new(Semaphore::new(1));
     let held_launch_permit = Arc::clone(&gate)
@@ -20075,9 +20318,10 @@ fn the_launched_authority_is_the_one_the_spawn_boundary_accepts() {
 /// superseded by these tests.
 /// Measured 80,856B on 2026-08-02 (commit body has the receipt); +10%.
 const READ_ONLY_CHILD_ENVELOPE_BYTE_CEILING: usize = 89_000;
-/// Measured 84,804B on 2026-09-13 with the native Workflow plan schema.
-/// Keep the next increase visible instead of adding another broad margin.
-const PARENT_SURFACE_BYTE_CEILING: usize = 85_000;
+/// Measured 85,913B on 2026-09-15 with the always-on session recall tools
+/// (#5715). Keep the next increase visible instead of adding another broad
+/// margin.
+const PARENT_SURFACE_BYTE_CEILING: usize = 86_000;
 
 #[tokio::test]
 async fn read_only_child_envelope_stays_within_measured_ceiling() {

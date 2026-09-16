@@ -85,7 +85,7 @@ no hosted runtime to sell.
   icons by `scripts/brand/trace-brand.py`). Web copies live in
   `web/public/brand/`.
 - Palette, type, shell direction, and the anti-slop rules are recorded in
-  `DESIGN.md`; the colour tokens are owned by `crates/tui/src/palette/tokens.rs`
+  `docs/design/DESIGN.md`; the colour tokens are owned by `crates/tui/src/palette/tokens.rs`
   and exported to `web/app/tokens.css`.
 
 ## Evidence on Hand

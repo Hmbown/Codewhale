@@ -164,7 +164,7 @@ impl SessionBootSurface {
             snapshot
                 .servers
                 .iter()
-                .map(|server| row_from_snapshot(server, initializing, connecting))
+                .filter_map(|server| row_from_snapshot(server, connecting))
                 .collect()
         } else if initializing {
             let mut names = connecting.to_vec();
@@ -184,11 +184,17 @@ impl SessionBootSurface {
             .iter()
             .filter(|row| row.state == McpServerBootState::Connecting)
             .count();
-        let unnamed_connecting = if connecting_count == 0 && initializing {
-            configured_count
-        } else {
-            0
-        };
+        // The pre-event gap is the only moment the in-flight names are
+        // genuinely unknown: once `connecting` arrives it is the engine's
+        // real in-flight set (#6033), and an empty set under lazy boot means
+        // nothing is connecting — not "names have not arrived yet".
+        let unnamed_connecting =
+            if connecting_count == 0 && initializing && connecting.is_empty() && snapshot.is_none()
+            {
+                configured_count
+            } else {
+                0
+            };
         let phase = if servers.is_empty() && plugins.is_quiet() && unnamed_connecting == 0 {
             SessionBootPhase::Hidden
         } else if initializing || connecting_count > 0 || unnamed_connecting > 0 {
@@ -334,42 +340,41 @@ fn activity_notice_from_candidates(
 
 fn row_from_snapshot(
     server: &McpServerSnapshot,
-    initializing: bool,
     connecting: &[String],
-) -> McpServerBootRow {
+) -> Option<McpServerBootRow> {
     if !server.enabled {
-        return McpServerBootRow {
+        return Some(McpServerBootRow {
             name: server.name.clone(),
             state: McpServerBootState::Disabled,
-        };
+        });
     }
     if server.connected {
-        return McpServerBootRow {
+        return Some(McpServerBootRow {
             name: server.name.clone(),
             state: McpServerBootState::Connected,
-        };
+        });
     }
     if let Some(error) = server.error.as_deref() {
-        if server.auth_required || mcp_error_requires_login(error) {
-            return McpServerBootRow {
-                name: server.name.clone(),
-                state: McpServerBootState::NeedsLogin,
-            };
-        }
-        return McpServerBootRow {
-            name: server.name.clone(),
-            state: McpServerBootState::Failed,
-        };
-    }
-    let connecting_now = initializing || connecting.iter().any(|name| name == &server.name);
-    McpServerBootRow {
-        name: server.name.clone(),
-        state: if connecting_now {
-            McpServerBootState::Connecting
+        let state = if server.auth_required || mcp_error_requires_login(error) {
+            McpServerBootState::NeedsLogin
         } else {
             McpServerBootState::Failed
-        },
+        };
+        return Some(McpServerBootRow {
+            name: server.name.clone(),
+            state,
+        });
     }
+    if connecting.iter().any(|name| name == &server.name) {
+        return Some(McpServerBootRow {
+            name: server.name.clone(),
+            state: McpServerBootState::Connecting,
+        });
+    }
+    // Enabled, unconnected, no diagnosis, not in flight: a lazy server
+    // nobody has asked for yet (#6033). It is not boot activity, so it gets
+    // no row — calling it Failed or Connecting would both be lies.
+    None
 }
 
 /// Text fallback for the typed [`McpServerSnapshot::auth_required`] state:

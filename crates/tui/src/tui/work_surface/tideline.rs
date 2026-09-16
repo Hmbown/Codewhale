@@ -9,9 +9,11 @@
 //! Also hosts the Tideline work-stage composite (`rail │ receipt stream`)
 //! whose golden buffers are `work_{w}x{h}`.
 
+#[cfg(test)]
+use ratatui::layout::{Constraint, Layout};
 use ratatui::{
     buffer::Buffer,
-    layout::{Constraint, Layout, Rect},
+    layout::Rect,
     style::{Modifier, Style},
 };
 use unicode_width::UnicodeWidthStr;
@@ -267,7 +269,7 @@ pub struct TidelineWorkStage<'a> {
 
 /// Paint the work stage: `rail │ main` with the rail width ladder, then the
 /// receipt stream filling `main`.
-#[allow(dead_code)] // translation scaffolding: wired by the landing slice
+#[cfg(test)] // translation scaffolding: wired by the landing slice
 pub fn render_tideline_work_stage(area: Rect, buf: &mut Buffer, stage: &TidelineWorkStage<'_>) {
     if area.width < 10 || area.height < 1 {
         return;
@@ -293,7 +295,7 @@ pub fn render_tideline_work_stage(area: Rect, buf: &mut Buffer, stage: &Tideline
 /// Rail hitboxes (spec §6): the group label rows plus the collapse toggle.
 /// Mirrors the painted rail; reused `WorkHitbox` semantics at the landing
 /// slice.
-#[allow(dead_code)] // translation scaffolding: wired by the landing slice
+#[cfg(test)] // translation scaffolding: wired by the landing slice
 pub fn tideline_rail_hitboxes(area: Rect, rail: &TidelineRail<'_>) -> Vec<Rect> {
     let mut out = Vec::new();
     if area.width < 2 || area.height < 2 || rail.collapsed {

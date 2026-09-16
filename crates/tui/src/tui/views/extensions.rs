@@ -1186,6 +1186,19 @@ fn skills_model(app: &App, locale: Locale) -> ExtensionsTabModel {
     }
 }
 
+/// Whether a listed MCP row belongs to the user's own config, and may
+/// therefore be removed or toggled from the Extensions panel.
+///
+/// `owned` is the set of servers in the user's config without plugin
+/// contributions; `None` means that config could not be read, in which case
+/// ownership is unknown and the gestures are kept rather than silently
+/// withdrawn. Plugin-contributed servers are never in that set: their names are
+/// synthesized and `/mcp remove` resolves against the config file, so offering
+/// the gesture produced a guaranteed "server not found".
+fn mcp_row_is_mutable(owned: Option<&BTreeSet<String>>, name: &str) -> bool {
+    owned.is_none_or(|owned| owned.contains(name))
+}
+
 fn mcp_model(app: &App, locale: Locale) -> ExtensionsTabModel {
     let configured = crate::mcp::load_config_with_workspace_and_plugins(
         &app.mcp_config_path,
@@ -1193,6 +1206,17 @@ fn mcp_model(app: &App, locale: Locale) -> ExtensionsTabModel {
         app.plugin_registry.as_ref(),
     )
     .ok();
+    // The rows above are the union of the user's config and every plugin's
+    // contribution. Only the user's own servers can be removed or toggled: a
+    // plugin server's name is synthesized (`plugin-{len}-{plugin}-{server}`)
+    // and never appears in the config file `/mcp remove` resolves against, so
+    // offering the gesture there was a guaranteed 404. Derive the set by
+    // loading the same config without plugin contributions and taking the
+    // difference, rather than parsing the shape of the synthesized name.
+    let user_owned: Option<BTreeSet<String>> =
+        crate::mcp::load_config_with_workspace(&app.mcp_config_path, &app.workspace)
+            .ok()
+            .map(|config| config.servers.keys().cloned().collect());
     let snapshot = app.mcp_snapshot.as_ref();
     // Configured names are the count authority used by the surrounding shell.
     // Snapshot data enriches those exact rows; it must never independently
@@ -1219,8 +1243,14 @@ fn mcp_model(app: &App, locale: Locale) -> ExtensionsTabModel {
                 .map(|server| server.enabled)
                 .or_else(|| config.map(crate::mcp::McpServerConfig::is_enabled))
                 .unwrap_or(true);
-            let initializing = app.mcp_initializing
-                && enabled
+            // `connecting` is the engine's real in-flight set (#6033): under
+            // lazy boot a configured-but-unstarted server reads "configured",
+            // never "connecting".
+            let initializing = enabled
+                && app
+                    .mcp_connecting
+                    .iter()
+                    .any(|connecting| connecting == &name)
                 && observed.is_none_or(|server| !server.connected && server.error.is_none());
             let state = if !enabled {
                 tr(locale, MessageId::HotbarSetupStatusDisabled)
@@ -1281,7 +1311,8 @@ fn mcp_model(app: &App, locale: Locale) -> ExtensionsTabModel {
                 },
             };
             let command_safe = crate::mcp::mcp_name_is_command_safe(&name);
-            let toggle = command_safe.then(|| {
+            let mutable = command_safe && mcp_row_is_mutable(user_owned.as_ref(), &name);
+            let toggle = mutable.then(|| {
                 if enabled {
                     ExtensionAction::Command {
                         label: "disable".into(),
@@ -1296,7 +1327,7 @@ fn mcp_model(app: &App, locale: Locale) -> ExtensionsTabModel {
                     }
                 }
             });
-            let remove = command_safe.then(|| ExtensionAction::Command {
+            let remove = mutable.then(|| ExtensionAction::Command {
                 label: "remove".into(),
                 command: format!("/mcp remove {name}"),
                 disposition: RowActionDisposition::InPlace,
@@ -2163,6 +2194,23 @@ impl ModalView for ExtensionsView {
 mod tests {
     use super::*;
     use crate::mcp::McpRecoveryKind;
+
+    #[test]
+    fn a_plugin_contributed_server_is_not_mutable_from_this_panel() {
+        // The row's name is synthesized and never appears in the config file
+        // `/mcp remove` resolves against, so the gesture could only ever 404.
+        let owned = BTreeSet::from(["github".to_string(), "playwright".to_string()]);
+        assert!(mcp_row_is_mutable(Some(&owned), "github"));
+        assert!(!mcp_row_is_mutable(
+            Some(&owned),
+            "plugin-25-codewhale-account-plugins-codewhale-plugins"
+        ));
+    }
+
+    #[test]
+    fn an_unreadable_config_keeps_the_gestures_rather_than_withdrawing_them() {
+        assert!(mcp_row_is_mutable(None, "anything"));
+    }
 
     #[test]
     fn marketplace_shipped_bundle_uses_local_metadata_and_review_action() {

@@ -1,28 +1,42 @@
 //! Execpolicy rules loaded from TOML configuration.
+//!
+//! The legacy Starlark policy engine (`PolicyParser`, `Policy`, `Rule`, the
+//! `execpolicy check` CLI verb) was deleted for v0.9.4: the runtime never
+//! enforced it, so a green `check` meant nothing. The live policy surface is
+//! the TOML `execpolicy.toml` rules here plus this crate's permission engine.
+//!
+//! Where the file lives is the caller's business — the TUI resolves
+//! `~/.deepseek/execpolicy.toml` and hands the parsed [`ExecPolicyConfig`]
+//! to its shell tool.
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
-use super::matcher::pattern_matches;
-use codewhale_execpolicy::command_safety::prefix_allow_matches;
+use crate::command_safety::prefix_allow_matches;
+use crate::matcher::pattern_matches;
 
+/// Verdict of evaluating a command against the TOML rule sets.
+///
+/// Distinct from [`crate::ExecPolicyDecision`], which is the permission
+/// engine's structured output; this is the file-rules verdict consumed by
+/// the shell tool.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ExecPolicyDecision {
+pub enum RuleDecision {
     Allow,
     Deny(String),
     AskUser(String),
 }
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Default)]
 pub struct ExecPolicyConfig {
     #[serde(default)]
     pub rules: BTreeMap<String, RuleSet>,
 }
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Default)]
 pub struct RuleSet {
     #[serde(default)]
     pub allow: Vec<String>,
@@ -31,17 +45,17 @@ pub struct RuleSet {
 }
 
 impl ExecPolicyConfig {
-    pub fn from_str(contents: &str) -> Result<Self> {
+    pub fn parse(contents: &str) -> Result<Self> {
         toml::from_str(contents).context("failed to parse execpolicy.toml")
     }
 
     pub fn from_path(path: &Path) -> Result<Self> {
         let contents = std::fs::read_to_string(path)
             .with_context(|| format!("failed to read execpolicy file {}", path.display()))?;
-        Self::from_str(&contents)
+        Self::parse(&contents)
     }
 
-    pub fn evaluate(&self, command: &str) -> ExecPolicyDecision {
+    pub fn evaluate(&self, command: &str) -> RuleDecision {
         // #security: a deny pattern has to be matched against the commands the
         // shell would actually run, not against the text as written. Quoting,
         // command substitution (`` `cmd` ``, `$(cmd)`), grouping, chaining and
@@ -54,16 +68,14 @@ impl ExecPolicyConfig {
         // Only the deny loop is widened. The allow loop below still matches the
         // command as written, so a broader expansion can never turn into a
         // broader auto-approval.
-        let deny_targets = codewhale_execpolicy::shell_expand::expanded_commands(command);
+        let deny_targets = crate::shell_expand::expanded_commands(command);
         for (group, rules) in &self.rules {
             for pattern in &rules.deny {
                 if deny_targets
                     .iter()
                     .any(|target| pattern_matches(pattern, target))
                 {
-                    return ExecPolicyDecision::Deny(format!(
-                        "execpolicy denied by {group}: {pattern}"
-                    ));
+                    return RuleDecision::Deny(format!("execpolicy denied by {group}: {pattern}"));
                 }
             }
         }
@@ -76,27 +88,13 @@ impl ExecPolicyConfig {
                 // `pattern_matches` for wildcard patterns (e.g. `cargo *`).
                 if prefix_allow_matches(pattern, command) || pattern_matches(pattern, command) {
                     let _ = group;
-                    return ExecPolicyDecision::Allow;
+                    return RuleDecision::Allow;
                 }
             }
         }
 
-        ExecPolicyDecision::AskUser("execpolicy: no matching allow rule".to_string())
+        RuleDecision::AskUser("execpolicy: no matching allow rule".to_string())
     }
-}
-
-pub fn default_execpolicy_path() -> Option<PathBuf> {
-    crate::config::effective_home_dir().map(|home| home.join(".deepseek").join("execpolicy.toml"))
-}
-
-pub fn load_default_policy() -> Result<Option<ExecPolicyConfig>> {
-    let Some(path) = default_execpolicy_path() else {
-        return Ok(None);
-    };
-    if !path.exists() {
-        return Ok(None);
-    }
-    ExecPolicyConfig::from_path(&path).map(Some)
 }
 
 #[cfg(test)]
@@ -124,21 +122,18 @@ mod tests {
             ]),
         };
 
-        assert!(matches!(
-            config.evaluate("git status"),
-            ExecPolicyDecision::Allow
-        ));
+        assert!(matches!(config.evaluate("git status"), RuleDecision::Allow));
         assert!(matches!(
             config.evaluate("git log --oneline"),
-            ExecPolicyDecision::Allow
+            RuleDecision::Allow
         ));
         assert!(matches!(
             config.evaluate("git push --force"),
-            ExecPolicyDecision::Deny(_)
+            RuleDecision::Deny(_)
         ));
         assert!(matches!(
             config.evaluate("unknown command"),
-            ExecPolicyDecision::AskUser(_)
+            RuleDecision::AskUser(_)
         ));
     }
 
@@ -157,16 +152,16 @@ mod tests {
 
         assert!(matches!(
             config.evaluate("git status -s"),
-            ExecPolicyDecision::Allow
+            RuleDecision::Allow
         ));
         assert!(matches!(
             config.evaluate("git status --porcelain"),
-            ExecPolicyDecision::Allow
+            RuleDecision::Allow
         ));
         // Push must NOT match the "git status" allow rule.
         assert!(matches!(
             config.evaluate("git push origin main"),
-            ExecPolicyDecision::AskUser(_)
+            RuleDecision::AskUser(_)
         ));
     }
 
@@ -214,7 +209,7 @@ mod tests {
             "timeout 5 rm -rf /",
             "xargs rm -rf /",
         ] {
-            if !matches!(config.evaluate(command), ExecPolicyDecision::Deny(_)) {
+            if !matches!(config.evaluate(command), RuleDecision::Deny(_)) {
                 evaded.push(command);
             }
         }
@@ -234,7 +229,7 @@ mod tests {
             "echo 'rm -rf /'",
         ] {
             assert!(
-                !matches!(config.evaluate(command), ExecPolicyDecision::Deny(_)),
+                !matches!(config.evaluate(command), RuleDecision::Deny(_)),
                 "harmless command wrongly denied: {command:?}"
             );
         }
@@ -254,15 +249,15 @@ mod tests {
 
         assert!(matches!(
             config.evaluate("cargo check"),
-            ExecPolicyDecision::Allow
+            RuleDecision::Allow
         ));
         assert!(matches!(
             config.evaluate("cargo check --workspace"),
-            ExecPolicyDecision::Allow
+            RuleDecision::Allow
         ));
         assert!(matches!(
             config.evaluate("cargo build --release"),
-            ExecPolicyDecision::AskUser(_)
+            RuleDecision::AskUser(_)
         ));
     }
 }

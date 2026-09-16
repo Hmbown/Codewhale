@@ -55,6 +55,11 @@ pub enum LaunchAction {
     ResumeSession(String),
     /// The see-all overflow: open the full session picker.
     BrowseSessions,
+    /// The MCP problems row: type the remedy it prints into the composer
+    /// (`/mcp login <name>` or `/mcp`). Typing beats copying — it works over
+    /// SSH where a clipboard may not exist, and the user sees the command
+    /// before Enter sends it (#6085).
+    McpRemedy,
     Help,
 }
 
@@ -180,7 +185,16 @@ pub fn launch_rows_for_app(app: &App) -> Vec<LaunchCardRow> {
         // Nothing painted yet (first frame): nothing is selected either.
         return launch_card_rows(app.ui_locale, &recent, has_more);
     }
-    let superset = launch_card_rows(app.ui_locale, &recent, true);
+    let mut superset = launch_card_rows(app.ui_locale, &recent, true);
+    // The MCP problems row is painted by the boot block, not the card-row
+    // loop, but it joins the same selection ordering when it painted: the
+    // hitbox intersection below is what keeps it out when it did not.
+    superset.push(LaunchCardRow {
+        id: crate::tui::app::LaunchRowId::McpRemedy,
+        label: String::new(),
+        detail: String::new(),
+        prominent: false,
+    });
     app.launch
         .row_hitboxes
         .iter()
@@ -230,6 +244,7 @@ pub fn launch_row_click_action(id: &crate::tui::app::LaunchRowId) -> LaunchActio
             LaunchAction::ResumeSession(session_id.clone())
         }
         crate::tui::app::LaunchRowId::SeeAll => LaunchAction::BrowseSessions,
+        crate::tui::app::LaunchRowId::McpRemedy => LaunchAction::McpRemedy,
     }
 }
 
@@ -279,6 +294,7 @@ pub fn run_launch_card_row(rows: &[LaunchCardRow], menu_selected: Option<usize>)
             crate::tui::app::LaunchRowId::NewSession => LaunchAction::NewSession,
             crate::tui::app::LaunchRowId::Recent(id) => LaunchAction::ResumeSession(id.clone()),
             crate::tui::app::LaunchRowId::SeeAll => LaunchAction::BrowseSessions,
+            crate::tui::app::LaunchRowId::McpRemedy => LaunchAction::McpRemedy,
         },
     }
 }
@@ -1020,7 +1036,6 @@ fn compact_tokens(tokens: i64) -> String {
     }
 }
 
-#[allow(dead_code)]
 // classic header/band renderer: superseded by the Tideline shell
 // (topbar + merged footer, spec §3, 2026-08-29); deletion is its own slice.
 /// The context meter is one measured fact: an exact percentage for scanning,
@@ -1051,12 +1066,12 @@ fn header_context_meter(app: &App, tier: ShellTier) -> Option<Span<'static>> {
 /// its visible geometry does not depend on optional git/token facts. The
 /// keyboard route remains `Alt+C`; this gives that same inspectable fact a
 /// mouse route without inventing another context screen or state owner.
-#[allow(dead_code)]
 // classic header/band renderer: superseded by the Tideline shell
 // (topbar + merged footer, spec §3, 2026-08-29); deletion is its own slice.
 // Its posture-floor guard (a hitbox never claims overlapped cells) is the
 // discipline `topbar::context_meter_hitbox` carries forward.
 #[must_use]
+#[cfg_attr(not(test), expect(dead_code))]
 pub(crate) fn header_hitboxes(area: Rect, app: &App) -> Vec<HeaderHitbox> {
     if area.width == 0 || area.height == 0 {
         return Vec::new();
@@ -1653,6 +1668,31 @@ pub fn empty_state_lines(app: &App, area: Rect) -> Vec<Line<'static>> {
     lines
 }
 
+/// The remedy the problems row prints, as the command Enter/click types into
+/// the composer (#6085): `/mcp login <name>` when a server wants a login,
+/// else `/mcp` for failures. `None` when nothing is wrong. One helper serves
+/// the row's tail and its action, so what is painted is what runs.
+pub(crate) fn mcp_remedy_command(app: &App) -> Option<String> {
+    use crate::tui::session_boot::{McpServerBootState, PluginBootSummary, SessionBootSurface};
+    let boot = SessionBootSurface::from_parts(
+        app.mcp_snapshot.as_ref(),
+        app.mcp_initializing,
+        &app.mcp_connecting,
+        app.mcp_configured_count,
+        PluginBootSummary::default(),
+    );
+    let first_in = |state: McpServerBootState| -> Option<&str> {
+        boot.servers
+            .iter()
+            .find(|row| row.state == state)
+            .map(|row| row.name.as_str())
+    };
+    if let Some(name) = first_in(McpServerBootState::NeedsLogin) {
+        return Some(format!("/mcp login {name}"));
+    }
+    first_in(McpServerBootState::Failed).map(|_| "/mcp".to_string())
+}
+
 /// The launch screen's MCP block: what actually became of the configured
 /// servers, painted under the recent-work list.
 ///
@@ -1669,12 +1709,17 @@ pub fn empty_state_lines(app: &App, area: Rect) -> Vec<Line<'static>> {
 /// MCP status owner; this is only its launch projection, and it computes
 /// nothing about a server itself.
 ///
-/// The rows are informational, not selectable. A fourth interactive row would
-/// have to join `LaunchRowId` and the paint/click/keyboard ordering the card
-/// shares, and it would buy nothing the block cannot already say: the composer
-/// below has focus from the first frame, so the block simply prints the exact
-/// command to type.
-fn mcp_launch_lines(app: &App, text_width: usize) -> Vec<Line<'static>> {
+/// The problems row is selectable (#6085): `problems_row` is its index within
+/// `lines`, which `launch_empty_state` turns into a hitbox so the row joins
+/// the card's shared paint/click/keyboard ordering. Enter or click types the
+/// printed remedy into the composer — the user sees the command before a
+/// second Enter sends it.
+struct McpLaunchBlock {
+    lines: Vec<Line<'static>>,
+    problems_row: Option<usize>,
+}
+
+fn mcp_launch_lines(app: &App, text_width: usize) -> McpLaunchBlock {
     use crate::tui::session_boot::{
         ITEM_SEPARATOR, McpServerBootState, PluginBootSummary, SessionBootPhase, SessionBootSurface,
     };
@@ -1690,7 +1735,10 @@ fn mcp_launch_lines(app: &App, text_width: usize) -> Vec<Line<'static>> {
         PluginBootSummary::default(),
     );
     if boot.phase == SessionBootPhase::Hidden || text_width == 0 {
-        return Vec::new();
+        return McpLaunchBlock {
+            lines: Vec::new(),
+            problems_row: None,
+        };
     }
     let theme = &app.ui_theme;
     let locale = app.ui_locale;
@@ -1754,6 +1802,7 @@ fn mcp_launch_lines(app: &App, text_width: usize) -> Vec<Line<'static>> {
     // from the tail into `+N`, and finally the row itself — never the
     // summary. Glyph *and* state grouping carry the difference, so it
     // survives a monochrome terminal and a colour-blind reader.
+    let mut problems_row = None;
     if !failed.is_empty() || !needs_login.is_empty() {
         let hint = match (needs_login.first(), failed.is_empty()) {
             (Some(name), true) => format!("/mcp login {name}"),
@@ -1775,10 +1824,14 @@ fn mcp_launch_lines(app: &App, text_width: usize) -> Vec<Line<'static>> {
                     theme.error_fg
                 }),
             ));
+            problems_row = Some(lines.len());
             lines.push(Line::from(spans));
         }
     }
-    lines
+    McpLaunchBlock {
+        lines,
+        problems_row,
+    }
 }
 
 /// One problems row: `✕ alibaba-cloud-ops · aws-mcp · ⚠ slack +4 · /mcp`.
@@ -2005,13 +2058,13 @@ pub fn launch_empty_state(app: &App, area: Rect) -> LaunchEmptyState {
     let had_recent = !entries.is_empty();
     // Built before the fit ladder runs: how many rows the block wants is a
     // fact about this workspace's servers, not about the pane.
-    let mcp_lines = mcp_launch_lines(app, text_width);
+    let mcp_block = mcp_launch_lines(app, text_width);
     let fit = launch_fit(
         height,
         entries.len(),
         has_more,
         app.launch.claude_code_detected,
-        mcp_lines.len(),
+        mcp_block.lines.len(),
     );
     let spacious = fit.blanks == LAUNCH_SEPARATORS;
     let visible: Vec<LaunchRecentEntry> = entries.into_iter().take(fit.shown).collect();
@@ -2147,7 +2200,18 @@ pub fn launch_empty_state(app: &App, area: Rect) -> LaunchEmptyState {
         for _ in 0..fit.gap {
             text.push(None);
         }
-        text.extend(mcp_lines.into_iter().take(fit.mcp).map(Some));
+        for (offset, line) in mcp_block.lines.into_iter().enumerate() {
+            if offset >= fit.mcp {
+                break;
+            }
+            // The problems row gets a hitbox like a card row: it is the
+            // last row in the shared ordering, so Enter/click on it runs
+            // the remedy it prints (#6085).
+            if mcp_block.problems_row == Some(offset) {
+                rows.push((crate::tui::app::LaunchRowId::McpRemedy, text.len()));
+            }
+            text.push(Some(line));
+        }
     }
 
     // The whale still surfaces. It rises by ink rather than by position: at 0
@@ -2196,8 +2260,8 @@ pub fn launch_empty_state(app: &App, area: Rect) -> LaunchEmptyState {
 #[cfg(test)]
 mod launch_card_tests {
     use super::{
-        LAUNCH_CARD_MEASURE, LaunchAction, launch_empty_state, launch_fit, launch_rows_for_app,
-        refresh_launch_row_hitboxes, run_launch_card_row, text_display_width,
+        LAUNCH_CARD_MEASURE, LaunchAction, launch_empty_state, launch_fit, launch_row_click_action,
+        launch_rows_for_app, refresh_launch_row_hitboxes, run_launch_card_row, text_display_width,
     };
     use crate::tui::app::{App, LaunchRecentSession, LaunchRowId};
     use ratatui::layout::Rect;
@@ -2648,6 +2712,60 @@ mod launch_card_tests {
             }
             println!("+{}+", "-".repeat(usize::from(width)));
         }
+    }
+
+    // --- the problems row runs the remedy it prints (#6085) -------------
+
+    #[test]
+    fn mcp_problems_row_joins_the_shared_row_ordering() {
+        let mut app = with_mcp(app_with_recent(&["one", "two"], 9));
+        refresh_launch_row_hitboxes(&mut app, Rect::new(0, 0, 120, 30));
+
+        let ids = row_ids(&app);
+        assert_eq!(
+            ids.last(),
+            Some(&LaunchRowId::McpRemedy),
+            "the problems row is the last row in the painted ordering"
+        );
+
+        // Keyboard: arrowing onto the last row and pressing Enter runs the
+        // remedy action, through the same arm a click reaches.
+        let rows = launch_rows_for_app(&app);
+        assert_eq!(
+            rows.last().map(|row| row.id.clone()),
+            Some(LaunchRowId::McpRemedy),
+            "Up/Down must be able to land on the painted problems row"
+        );
+        assert_eq!(
+            run_launch_card_row(&rows, Some(rows.len() - 1)),
+            LaunchAction::McpRemedy
+        );
+        assert_eq!(
+            launch_row_click_action(&LaunchRowId::McpRemedy),
+            LaunchAction::McpRemedy,
+            "click and Enter share one contract"
+        );
+    }
+
+    #[test]
+    fn mcp_remedy_action_types_the_command_into_the_composer() {
+        let mut app = with_mcp(app_with_recent(&["one"], 9));
+        app.launch.menu_selected = Some(0);
+
+        crate::tui::ui::type_launch_mcp_remedy(&mut app);
+
+        // `slack` is the fixture's first needs-login server; typing the
+        // printed remedy beats copying it — no clipboard to depend on.
+        assert_eq!(app.input, "/mcp login slack");
+        assert_eq!(app.cursor_position, app.input.chars().count());
+        assert_eq!(app.launch.menu_selected, None);
+    }
+
+    #[test]
+    fn mcp_remedy_action_is_a_noop_when_nothing_is_wrong() {
+        let mut app = app_with_recent(&["one"], 9);
+        crate::tui::ui::type_launch_mcp_remedy(&mut app);
+        assert!(app.input.is_empty());
     }
 
     #[test]

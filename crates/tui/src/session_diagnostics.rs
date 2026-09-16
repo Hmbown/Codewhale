@@ -69,6 +69,7 @@ pub(crate) struct SessionFailureSummary {
 
 impl SessionFailureSummary {
     #[must_use]
+    #[cfg_attr(not(test), expect(dead_code))]
     pub(crate) fn count(&self, class: SessionFailureClass) -> usize {
         self.counts.get(&class).copied().unwrap_or(0)
     }

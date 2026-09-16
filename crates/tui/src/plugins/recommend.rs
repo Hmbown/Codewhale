@@ -259,6 +259,51 @@ pub fn match_plugin_for_draft_among(
     Some(matched)
 }
 
+/// Per-Engine gate for the append-only `<recommended_plugins>` fragment.
+///
+/// A plugin id is suggested at most once per Engine lifetime, and a plugin
+/// whose name (or alias) matches a skill in the session's catalogue is never
+/// suggested — the skill already covers the domain, so the nudge is noise
+/// (#6274). Dismissals continue to be honored through `Settings`.
+///
+/// Known limitation: the skill-name set is snapshotted once at Engine
+/// construction (from the same catalogue the system prompt indexes), so a
+/// skill installed mid-session does not suppress its plugin twin until the
+/// next Engine starts.
+#[derive(Debug, Default)]
+pub struct RecommendedPluginGate {
+    shown: BTreeSet<String>,
+    skill_names: BTreeSet<String>,
+}
+
+impl RecommendedPluginGate {
+    /// Engine constructor input and test seam: suppress exactly these
+    /// skill names and aliases (case is normalized here, so callers may
+    /// pass them in any form).
+    #[must_use]
+    pub fn with_skill_names(skill_names: BTreeSet<String>) -> Self {
+        Self {
+            shown: BTreeSet::new(),
+            skill_names: skill_names
+                .into_iter()
+                .map(|name| name.trim().to_ascii_lowercase())
+                .filter(|name| !name.is_empty())
+                .collect(),
+        }
+    }
+
+    /// True when this plugin may be suggested now: not covered by a
+    /// catalogue skill and not already suggested in this Engine's lifetime.
+    /// First admission records the plugin id.
+    fn admits(&mut self, id: &str, name: &str) -> bool {
+        let name_key = name.trim().to_ascii_lowercase();
+        if !name_key.is_empty() && self.skill_names.contains(&name_key) {
+            return false;
+        }
+        self.shown.insert(id.to_string())
+    }
+}
+
 /// Append-only user-turn fragment. Never part of the pinned system prefix.
 /// Bounded, omitted when nothing matches.
 #[must_use]
@@ -266,6 +311,7 @@ pub fn recommended_plugins_user_fragment(
     draft: &str,
     registry: &PluginRegistry,
     marketplace: &[MarketplaceCandidate],
+    gate: &mut RecommendedPluginGate,
 ) -> Option<String> {
     // Called once when composing a user turn, never from the render loop.
     // Read the shared preference so headless and long-lived Engines also
@@ -277,6 +323,11 @@ pub fn recommended_plugins_user_fragment(
         marketplace,
         &settings.dismissed_plugin_suggestions,
     )?;
+    // Once per Engine lifetime per plugin id, and never when a local skill
+    // already covers the plugin's domain (#6274).
+    if !gate.admits(&matched.id, &matched.name) {
+        return None;
+    }
     let mut listed = vec![matched];
     listed.truncate(MAX_RECOMMENDED_PLUGINS);
     let body = listed
@@ -650,14 +701,77 @@ mod tests {
         let registry = crate::plugins::PluginDiscoveryContext::capture_pre_dotenv()
             .registry_for_workspace(root.path());
 
-        let fragment =
-            recommended_plugins_user_fragment("add supabase auth to login", &registry, &[])
-                .expect("idle plugin should produce a fragment");
+        let fragment = recommended_plugins_user_fragment(
+            "add supabase auth to login",
+            &registry,
+            &[],
+            &mut RecommendedPluginGate::default(),
+        )
+        .expect("idle plugin should produce a fragment");
         assert!(fragment.starts_with("<recommended_plugins>"));
         assert!(fragment.contains("- supabase ("));
         assert!(fragment.contains("</recommended_plugins>"));
         assert!(
-            recommended_plugins_user_fragment("fix the failing test", &registry, &[]).is_none()
+            recommended_plugins_user_fragment(
+                "fix the failing test",
+                &registry,
+                &[],
+                &mut RecommendedPluginGate::default(),
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn recommended_plugins_fragment_suggests_a_plugin_once_per_gate() {
+        let _lock = lock_test_env();
+        let root = TempDir::new().unwrap();
+        let _home = EnvVarGuard::set("CODEWHALE_HOME", root.path().join("home"));
+        write_keyword_bundle(root.path(), "supabase", "Hosted Postgres", &["supabase"]);
+        let registry = crate::plugins::PluginDiscoveryContext::capture_pre_dotenv()
+            .registry_for_workspace(root.path());
+
+        let mut gate = RecommendedPluginGate::default();
+        let first = recommended_plugins_user_fragment(
+            "add supabase auth to login",
+            &registry,
+            &[],
+            &mut gate,
+        )
+        .expect("first matching turn suggests the plugin");
+        assert!(first.contains("- supabase ("));
+        assert!(
+            recommended_plugins_user_fragment(
+                "add supabase auth to the signup flow",
+                &registry,
+                &[],
+                &mut gate,
+            )
+            .is_none(),
+            "a plugin id is suggested at most once per Engine lifetime (#6274)"
+        );
+    }
+
+    #[test]
+    fn recommended_plugins_fragment_suppressed_by_local_skill_name() {
+        let _lock = lock_test_env();
+        let root = TempDir::new().unwrap();
+        let _home = EnvVarGuard::set("CODEWHALE_HOME", root.path().join("home"));
+        write_keyword_bundle(root.path(), "supabase", "Hosted Postgres", &["supabase"]);
+        let registry = crate::plugins::PluginDiscoveryContext::capture_pre_dotenv()
+            .registry_for_workspace(root.path());
+
+        let skills: BTreeSet<String> = ["Supabase".to_string()].into_iter().collect();
+        let mut gate = RecommendedPluginGate::with_skill_names(skills);
+        assert!(
+            recommended_plugins_user_fragment(
+                "add supabase auth to login",
+                &registry,
+                &[],
+                &mut gate,
+            )
+            .is_none(),
+            "a loaded local skill covering the plugin name must suppress the suggestion (#6274)"
         );
     }
 

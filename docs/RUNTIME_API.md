@@ -101,6 +101,62 @@ can finish after that budget. Each request scans anew; there is no new index or
 cache. This read-only endpoint does not alter sessions or the pinned model
 prompt/tool prefix.
 
+### Workspace files and session artifacts
+
+Native clients (the GPUI desktop's Files and Preview modules) browse and edit
+the server's configured workspace through three authenticated routes. They
+read and write the workspace directly; there is no second file store, cache
+or index, and no path override: the workspace root is the only root.
+
+- `GET /v1/workspace/files?path=<dir>&limit=<1-2000>` lists one directory.
+  `path` is workspace-relative with `/` separators; empty or `.` is the root.
+  Each entry carries `name`, `path`, `kind` (`file`, `directory`, `symlink`,
+  `other`), and for files `size` and `modified` (RFC 3339). Directories sort
+  first, then names case-insensitively. `limit` defaults to 200; `truncated`
+  reports a cut. `.git` is never listed or served, and symlinks are listed by
+  name only: they are never followed, so `path=<link>` returns 403.
+- `GET /v1/workspace/files/read?path=<file>&offset=<bytes>&limit=<1-4194304>`
+  returns one byte window of a regular file with `size`, `revision` (the
+  SHA-256 hex of the **whole** file, not of the window), `modified`,
+  `offset`, `bytes`, `truncated`, `encoding` and `content`. Text windows are
+  `utf-8`; a window with a NUL byte, invalid UTF-8, or a split multi-byte
+  character is `base64`. `limit` defaults to 256 KiB. Files above 16 MiB are
+  refused with 413; a directory is 400; a link is 403; a missing file is 404.
+- `PUT /v1/workspace/files` with `{"path", "content", "encoding"?,
+  "expected_revision"?}` writes one file atomically through the same confined
+  opener Fleet artifacts use. `encoding` is `utf-8` (default) or `base64`;
+  bodies above 4 MiB are 413. Creating a new file requires **no**
+  `expected_revision` (and creates missing parent directories inside the
+  workspace); overwriting requires the `revision` from the read that the
+  edit was based on, and a stale or missing one is 409 with the current
+  revision in the error message so the client can re-read and merge. This is
+  optimistic concurrency, not a lock: two writers racing between the check and
+  the write can still interleave. The response carries `path`, `size`,
+  `revision`, `created` and `written_at`; 201 for a new file, 200 otherwise.
+  Writes through a link, into `.git`, or to a directory are refused.
+
+Every path is validated before any filesystem access: absolute paths,
+backslashes, `.` or `..` components are 400, and each directory on the way is
+opened without following links (`O_NOFOLLOW` per component on Unix, reparse
+point checks on Windows). These routes use the runtime bearer token like every
+other `/v1/*` route; they do not consult the model's tool permission posture,
+because the caller is the authenticated operator, not the model.
+
+Session artifacts are the oversized tool outputs a session recorded as
+`ArtifactRecord`s (`crates/tui/src/artifacts.rs`), stored under
+`sessions/<id>/artifacts/`:
+
+- `GET /v1/sessions/{id}/artifacts` lists the records a saved session carries:
+  `id`, `kind`, `tool_call_id`, `tool_name`, `created_at`, `byte_size`,
+  `preview` and the session-relative `path`.
+- `GET /v1/sessions/{id}/artifacts/{artifact_id}?offset=&limit=` reads one
+  artifact with the same window, `revision` and `encoding` contract as the
+  workspace file read. A record whose stored path is absolute or leaves the
+  session directory is 403; a record whose file is gone is 404.
+
+Fleet receipt artifacts keep their own route
+(`GET /v1/fleet/runs/{run_id}/receipts/{task_id}/evidence`).
+
 ### Runtime and account identity
 
 `GET /v1/runtime/info` reports `codewhale_version` plus the full 40-character
@@ -563,6 +619,8 @@ a TLS or verified transport boundary.
 - `PATCH /v1/sessions/{id}` (`{ "title"?: string, "archived"?: bool }`)
 - `DELETE /v1/sessions/{id}`
 - `POST /v1/sessions/{id}/resume-thread`
+- `GET /v1/sessions/{id}/artifacts` and `GET /v1/sessions/{id}/artifacts/{artifact_id}?offset=&limit=`
+  (see workspace files and session artifacts above)
 
 Sessions and threads answer the same `include_archived` / `archived_only` pair
 with the same meaning, and `search` is the same fuzzy match (title, id,
@@ -704,7 +762,7 @@ accept an empty string to clear a previously-set value. Added in v0.8.10 (#562):
 
 **Turns** (within a thread)
 - `POST /v1/threads/{id}/turns`
-- `POST /v1/threads/{id}/turns/{turn_id}/steer`
+- `POST /v1/threads/{id}/turns/{turn_id}/steer` - inject guidance into the running turn. The response is a receipt for what actually happened, not for what was attempted; see [Steer delivery](#steer-delivery).
 - `POST /v1/threads/{id}/turns/{turn_id}/interrupt`
 - `POST /v1/threads/{id}/compact` (manual compaction)
 - `POST /v1/threads/{id}/undo` - fork the thread with the last N turns removed (`{"depth": N}`, default 0 = last turn only); returns the forked thread plus `original_user_text` so a GUI can pre-populate the input box
@@ -1072,6 +1130,8 @@ human gate. Auto-merge is `scripts/check-auto-merge.py --repo … --pr …
 **Introspection**
 - `GET /v1/workspace/status`
 - `GET /v1/workspace/files/search?query=<partial>&limit=<1-100>` (see workspace file suggestions above)
+- `GET /v1/workspace/files?path=<dir>&limit=<1-2000>`, `GET /v1/workspace/files/read?path=<file>&offset=&limit=`
+  and `PUT /v1/workspace/files` (see workspace files and session artifacts above)
 - `GET /v1/skills`
 - `GET /v1/apps/mcp/servers`
 - `GET /v1/apps/mcp/tools?server=<optional>`
@@ -1116,6 +1176,207 @@ tokens but `0.0` cost. Added in v0.8.10 (#564).
   ]
 }
 ```
+
+### Native client routes (GPUI desktop)
+
+These families serve the GPUI desktop client over the same bearer-token
+transport. They reuse the runtime's existing authorities — the engine's shell
+manager, the durable thread store, the workspace confinement layer, the
+config's credential plumbing — and add no second runtime, session store,
+scheduler, or credential store.
+
+**Jobs** (operator-scoped shell jobs; the terminal surface)
+- `GET /v1/jobs` — every live and known-stale job across all threads
+- `GET /v1/threads/{id}/jobs` — jobs owned by one thread's manager:
+  model-launched, subagent-launched, and client-launched together
+- `POST /v1/threads/{id}/jobs` — `{ "command", "cwd"?, "timeout_ms"?,
+  "tty"?, "env"? }` → `201 { "job" }`; runs as a background shell under the
+  thread's projected sandbox policy. `tty: true` merges stderr into stdout
+  and gives the command a terminal (required for interactive programs);
+  background jobs are never killed at `timeout_ms`
+- `GET /v1/threads/{id}/jobs/{job_id}` — one job's status + metadata
+- `GET /v1/threads/{id}/jobs/{job_id}/output?stream=<stdout|stderr>&cursor=
+  <bytes>&max_bytes=<1-512KiB>&wait_ms=<0-30s>&format=<base64|text>` — the
+  resumable byte stream. `{job_id, stream, offset, next_cursor, total,
+  dropped, encoding, data, status, exit_code, done}`: pass `next_cursor`
+  back to continue; `wait_ms` long-polls for new bytes on a running job;
+  `done` means a terminal status and nothing left past the cursor
+- `POST /v1/threads/{id}/jobs/{job_id}/stdin` — `{ "data", "encoding"?,
+  "close"? }`: `data` is UTF-8 text by default or `base64`, `close: true`
+  sends EOF; works for PTY and piped jobs → `204`
+- `POST /v1/threads/{id}/jobs/{job_id}/kill` — bounded SIGTERM → SIGKILL
+  escalation on the process group → `{ "job", "result" }` with the final
+  snapshot
+
+Reads are non-consuming: several clients may hold independent cursors, and
+polling never steals output from the engine's own delta consumer. The
+buffer is bounded with exact drop accounting — a reader whose `cursor`
+falls behind the retained window gets `offset` past it and `dropped > 0`,
+and must re-anchor. Evicted jobs keep a tail snapshot which the output
+route serves as the final retained window. Jobs are scoped to the thread
+that created them and are killed when that thread is removed; the engine's
+background commands use the same per-thread manager, so `GET /v1/jobs` is
+also how a client sees model-spawned work.
+
+**Commands** (typed command catalog, APPS-28)
+- `GET /v1/commands` — `{commands: [...]}`: every registered slash command,
+  builtin and user, as the TUI's own registry holds it. Per entry: `name`,
+  `aliases`, `summary` and `usage` (English source text — localizing is the
+  client's surface), `subcommands` (the literal verbs the usage line
+  declares), `takes_arguments`, `kind` (`builtin` registered code, or `user`
+  expanding a stored template), `binding` (`host` runs locally and never
+  reaches the model; `prompt` expands into the request the model sees),
+  `discovery` (`primary` / `advanced` / `compatibility`, builtins only),
+  `hidden` for rows the product does not advertise, and `shadowed_by` /
+  `shadowed_aliases` where a user command has taken a builtin's spelling.
+
+  The same registry the TUI palette reads, so a desktop palette can be
+  checked against it instead of drifting from it. Two rules a client must
+  respect: a `binding: "host"` row is never submitted as a model prompt, and
+  a user command shadowing a builtin name wins that spelling.
+
+**Context** (per-thread context pressure, APPS-90)
+- `GET /v1/threads/{id}/context` — `input_tokens` (the conservative live
+  estimate the visible meter uses), `billed_input_tokens` (last
+  provider-counted prompt size when one exists), `window_tokens`,
+  `output_cap_tokens`, `input_budget_ceiling`, `available_input_tokens`,
+  `compaction_trigger_tokens`, `usage_percent` and `pressure`. Served by the
+  live engine via `Op::GetContextBudget`. Every numeric field is nullable —
+  a route that cannot express a bounded window reports `null` rather than an
+  invented number — and `live: false` marks responses where the engine
+  could not be loaded and only the store-recorded route's static window
+  resolved.
+
+**Git** (workspace repository operations, APPS-106)
+- `GET /v1/git` — status detail: `git_repo`, `branch`, `head`,
+  `ahead`/`behind`, counts, per-file porcelain `files[]`
+  (`{path, index, worktree, staged, status, old_path?}`), `branches`,
+  `remotes`
+- `GET /v1/changes` — the same porcelain `files[]` projection minus repo
+  chrome (branches/remotes): one authority, so the change list can never
+  disagree with the status read
+- `GET /v1/diff?path=` — one file's unified `diff` against `base` (`HEAD`,
+  or the empty tree on an unborn branch — which reads staged adds as new
+  files). Covers staged+unstaged in one patch; `truncated` reports the
+  512 KiB cap. An untracked file answers `untracked: true` with an empty
+  diff — the client reads the file itself rather than mistaking it for
+  unchanged
+- `GET /v1/workspace/diff?limit=` — whole-tree patch (default 256 KiB,
+  max 4 MiB) plus a complete `--numstat` `files[]` inventory
+  (`{path, added, deleted}`) so every changed row renders even when the
+  patch is truncated
+- `GET /v1/git/graph?limit=` — bounded commit rows (`id`, `short`,
+  `parents`, `author`, `timestamp`, `refs`, `subject`); an unborn branch is
+  an empty graph, not an error
+- `POST /v1/git/stage` `{ "paths": [...] }` or `{ "all": true }`;
+  `POST /v1/git/unstage` same; `POST /v1/git/discard` `{ "paths": [...] }`
+  (tracked paths only — no `all`, an untracked path fails closed);
+  `POST /v1/git/commit` `{ "message", "all"? }`; `POST /v1/git/push`
+  `{ "remote"?, "set_upstream"? }`; `POST /v1/git/branch`
+  `{ "name", "create"? }`
+
+Reads run through the hardened review command (filters, fsmonitor, hooks,
+lazy fetches and replace-objects neutralized); writes run through the
+non-interactive command path (`GIT_TERMINAL_PROMPT=0`, BatchMode ssh) so a
+credential or host-key prompt can never hang a request. Path lists are
+workspace-relative under the same confinement as the file routes (traversal
+→ 400, `.git` → 403), passed after `--` with literal pathspecs. Mutations
+answer `{ok, output, status}` with the refreshed status, so a client
+re-reads nothing after an operation. A workspace that is not a repository
+answers `404`.
+
+**Diagnostics** (read-only logs, crashes, process — APPS-103)
+- `GET /v1/logs` → `{sources: [{dir, files: [{name, size, modified}]}]}` —
+  the runtime's log directory plus `audit.log[.1]` from the codewhale home,
+  newest first, capped
+- `GET /v1/logs/{name}?offset=<bytes>&limit=<bytes>&tail=<bytes>` →
+  `{name, size, modified, offset, bytes, truncated, encoding, content}` —
+  one bounded window; `tail` reads from the end and is mutually exclusive
+  with `offset`; `truncated` means bytes remain after the returned window
+  (a tail read at EOF is `false`), `encoding` is `utf-8` or `base64`
+- `GET /v1/crashes`, `GET /v1/crashes/{name}` — the same list/read contract
+  over the crash-dump directories (`~/.codewhale/crashes`, legacy
+  `~/.deepseek/crashes` merged)
+- `GET /v1/process` → `{pid, version, commit, started_at, uptime_seconds,
+  executable, rss_bytes}` — `rss_bytes` only where the platform reports it
+  (Linux `/proc`); absent rather than fabricated elsewhere
+
+These routes package what already exists on disk for a client-side export;
+there is no telemetry upload route and no second log store. Names are
+basename-validated (no separators, no `..`), listings are capped, reads are
+bounded windows, and symlinks are never followed — a client bundles the
+files itself.
+
+**Targets and remote posture** (APPS-50)
+- `GET /v1/targets` → `{targets: [self], remote: {supported: true,
+  attach: "client", probe: "POST /v1/remote/connect"}, ssh: {…},
+  cloud: {…}}` — this runtime's own record as the attachable target plus
+  per-surface ownership; the runtime keeps no persistent target registry,
+  so `POST /v1/targets` and `POST /v1/targets/switch` answer
+  `501 Not Implemented` — target selection is client-owned and a switch
+  must never move a running task server-side
+- `GET /v1/remote` → `{bind_host, port, loopback_only, reachable_from_lan,
+  auth_required, mobile, tls}` — this listener's reachability posture.
+  `tls` is always `false`: the API has no TLS terminator, so non-loopback
+  reachability assumes a verified overlay (VPN/mesh), never plain LAN trust
+- `POST /v1/remote/connect` `{ "endpoint": "http://host:port" }` — probes a
+  candidate remote's unauthenticated `GET /v1/runtime/info` (origin only;
+  any pasted path is discarded). Answers `{ok, remote: {endpoint,
+  runtime_api_version, codewhale_version, auth_required, …}, attach:
+  "client"}` on success, and `{ok: false, reason: "unreachable" |
+  "not a Codewhale runtime" | …}` as data on failure. URLs carrying
+  credentials are refused with 400 — the remote's token is configured
+  client-side, and a connect route that forwarded one would be an
+  exfiltration primitive
+- `GET /v1/ssh`, `GET /v1/cloud` → `{supported: false, owner:
+  "codewhale-control-plane", reason}`; `POST /v1/ssh/connect` and
+  `POST /v1/cloud/attach` → `501`: SSH workspace provisioning and hosted
+  cloud computers belong to the Apps control plane (ASCII Box for Managed
+  Computer), not to a second authority inside Core
+
+A remote Codewhale is a `serve --http` runtime with a token — that is the
+whole attach model. These routes describe and probe it; they never execute
+a remote request on the local machine.
+
+**LSP** (workspace language intelligence, APPS-93)
+- `GET /v1/lsp` — capability: `enabled`, supported `languages` with their
+  server commands, `custom_languages`, operations, poll and diagnostic caps
+- `GET /v1/diagnostics?path=` — file diagnostics
+- `GET /v1/definition?path=&line=&character=` (1-based)
+- `GET /v1/references?path=&line=&character=` (1-based)
+- `GET /v1/symbols?path=&query=` — empty query returns document symbols
+
+One lazily-built workspace-level `LspManager` serves these; engine threads
+keep their own per-thread managers for the post-edit hook, and a server that
+never serves an LSP route never spawns a language server. `path` is
+workspace-relative under the same confinement as the file routes. Normal
+absence is data: no language server, a disabled `[lsp]` config, or a timeout
+answers `200` with `ok: false` and a machine-readable `reason`
+(`no_server`, `lsp_disabled`, `lsp_error`); malformed input is a 400 and a
+missing file a 404.
+
+**Voice** (host dictation, APPS-98)
+- `GET /v1/voice` — capability: `available`, detected `recorder` command,
+  resolved `asr` `{kind, model}`, `modes`, `send_phrases`,
+  `max_record_seconds`
+- `POST /v1/voice/dictate` — record then transcribe → `{ ok, text }`
+- `POST /v1/voice/send` — same capture with the "send it" / 发送/發送
+  suffix contract: `send: true` tells the client to submit (empty `text`
+  with `send: true` means submit the client's current draft)
+- `POST /v1/voice/control` `{ "composer": "draft text" }` — assisted
+  dictation that shows the model the composer text; `assisted: false` in the
+  response means a free ASR backend (local whisper/Groq) handled the audio
+  and the composer context was never seen
+
+The runtime owns the host microphone and the ASR dispatch — the same
+implementation the TUI's `/voice` commands run, headless. Recording is one
+blocking capture per host (requests serialize; the loser gets
+`ok:false`/`no_speech`, not a fought-over device). Provider ASR resolves its
+key lazily so local-whisper and Groq paths work without provider auth.
+Failure is data: `no_recorder`, `no_speech`, `no_provider_auth`,
+`transcription_failed`. `CODEWHALE_DISABLE_VOICE=1` is an operator
+kill-switch — a headless `serve --http` host reports `available: false` and
+every dictate call fails closed.
 
 ## Provider and model selection
 
@@ -1251,6 +1512,75 @@ alongside the selected model. Omit `model_provider_id` when it is null:
 This creates one thread on the exact named custom route without changing the
 Runtime's provider or model defaults.
 
+### `PUT /v1/providers/{id}/key` — write-only credential
+
+```json
+// request
+{ "key": "sk-…" }
+
+// response
+{ "provider": "openai-codex", "stored": true, "backend": "keychain",
+  "credentialState": "configured", "configPath": "/…/config.toml" }
+```
+
+Stores a provider API key through the same transactional write as
+`codewhale auth set --provider <id> --api-key-stdin`: the secret store under
+the provider write lock, plus the `[providers.<id>] auth_mode` metadata
+marker persisted to the config document and mirrored into the live runtime
+config so `GET /v1/providers` reports the new state immediately. `backend`
+names which secret backend holds the key and `configPath` which config
+document carries the marker (the user-global file when the ambient config
+is workspace-scoped).
+
+The key is never returned — there is no read route for credential material,
+and neither the key nor its length appears in the response, errors, or
+logs; the response carries only the readiness projection
+(`credentialState`). An unknown provider id, the `deepseek-cn` legacy
+alias, an empty key, a key over 4 KiB, or one containing control characters
+is `400`. `credentialState: "local"` after a successful write is honest
+output for a keyless local route: the key is stored, but the route
+classifies as not needing one.
+
+### `DELETE /v1/providers/{id}/key` — clear a Codewhale-owned credential
+
+```json
+// response
+{ "provider": "openai", "cleared": true, "credentialState": "missing" }
+```
+
+Clears the credential through the same shared owner as
+`codewhale auth clear`: the config document is snapshotted and restored if
+its save fails, the secret store is only touched once that save has landed,
+and the cleared markers are mirrored into the live runtime config so
+`GET /v1/providers` reports `missing` on the next read rather than after a
+restart.
+
+Clearing an already-clear route returns `cleared: true` — a client retrying
+a revoke must not be told something went wrong. If the config entry is
+cleared but the secret backend refuses the delete, the route answers `500`
+and names the slot: reporting success while the key is still in the keyring
+would be a lie about a security action.
+
+### Credential ownership: `credentialSource` and `credentialWritable`
+
+Both credential verbs refuse a route whose credential Codewhale does not
+own, and `GET /v1/providers` carries the same classification so a client can
+disable its control *before* submitting instead of failing late:
+
+| `credentialSource` | `credentialWritable` | Meaning |
+| --- | --- | --- |
+| `secret_store` | `true` | Codewhale's own durable backend. The only writable source. |
+| `config` | `false` | A literal key in a config file, which still wins at request time. |
+| `external_auth` | `false` | An active external consent (OAuth) owns the credential. |
+| `none` | `false` | The route sends no credential, or has no credential slot. |
+
+When `credentialWritable` is `false`, `credentialWritableReason` carries
+user-facing copy naming the owner, and both `PUT` and `DELETE` answer `409`
+with that same reason. The classification is structural: it reads declared
+auth mode, consent state and the *kind* of any configured `api_key` value,
+and never resolves a secret, an environment value, or an auth command. It is
+a class and never a value, a path, or an environment variable name.
+
 ### `POST /v1/providers/{id}/switch`
 
 ```json
@@ -1367,8 +1697,32 @@ Compatibility notes:
   is an equivalent alias for clients that use `created_at` naming elsewhere; do
   not require both fields to be present.
 
+### Steer delivery
+
+Putting a steer into the engine's mailbox is not the same as the model reading
+it. The engine discards a steer whose turn has already moved on, and an
+interrupted or failed turn drops whatever it had queued. The API reports the
+engine's real verdict rather than the attempt:
+
+- The item is persisted `queued` when the steer is accepted into the mailbox.
+- **Delivered.** The engine committed the text into the turn's record: the item
+  becomes `completed`, `steer_count` rises, and `turn.steered` + `item.completed`
+  are emitted. `POST .../steer` returns `200` with that turn.
+- **Not delivered.** The turn moved on, was interrupted, or failed first: the
+  item becomes `canceled`, `steer_count` does not rise, and `turn.steer_dropped`
+  is emitted carrying `input`, `reason`, and the settled `item`. `POST .../steer`
+  returns `409`, so a client can keep the user's text and resend it rather than
+  clearing a composer over guidance that was never seen.
+- **Still pending.** A steer sent while the engine is inside a long tool call
+  cannot settle until that call returns, and the request does not hang for it.
+  After a short wait `POST .../steer` returns `200` with the item still `queued`;
+  the eventual `turn.steered` or `turn.steer_dropped` event carries the verdict.
+
+A client that treats `200` as "the model saw it" is therefore wrong in the third
+case: read the item's status, or wait for the event.
+
 Common event names: `thread.started`, `thread.forked`, `turn.started`,
-`turn.lifecycle`, `turn.steered`, `turn.interrupt_requested`,
+`turn.lifecycle`, `turn.steered`, `turn.steer_dropped`, `turn.interrupt_requested`,
 `turn.completed`, `item.started`, `item.delta`, `item.completed`,
 `item.failed`, `item.interrupted`, `approval.required`, `approval.decided`,
 `approval.timeout`, `user_input.required`, `user_input.answered`,

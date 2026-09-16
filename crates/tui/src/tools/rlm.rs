@@ -871,7 +871,6 @@ fn preview_output(text: &str) -> String {
     )
 }
 
-#[allow(dead_code)]
 fn _assert_var_handle_shape(_: Option<VarHandle>) {}
 
 #[cfg(test)]

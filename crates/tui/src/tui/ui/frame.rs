@@ -985,6 +985,7 @@ pub(crate) fn build_engine_config(app: &App, config: &Config) -> EngineConfig {
         goal_status: app.goal.status,
         goal_max_continuations: config.goal_max_continuations(),
         goal_continuation_delay_seconds: config.goal_continuation_delay_seconds(),
+        goal_enforce_token_budget: config.goal_enforce_token_budget(),
         reasoning_only_max_reprompts: config.reasoning_only_max_reprompts(),
         reasoning_only_reprompt_message: Some(config.reasoning_only_reprompt_message().to_string()),
         locale_tag: app.ui_locale.tag().to_string(),
@@ -1029,6 +1030,13 @@ pub(crate) fn build_app_system_prompt_with_goal(
         &config.memory_path(),
         &app.workspace,
     );
+    // Keep the previewed/rebuilt prompt identical to the engine's: the
+    // recovery hint is part of the prefix when a prior workspace session
+    // ended mid-turn (#5715).
+    let recovery_hint = crate::session_manager::session_recovery_hint(
+        &app.workspace,
+        app.current_session_id.as_deref(),
+    );
     prompts::system_prompt_for_mode_with_context_skills_and_session(
         &app.workspace,
         None,
@@ -1047,6 +1055,7 @@ pub(crate) fn build_app_system_prompt_with_goal(
                 app.active_route_limits,
             )),
             verbosity: app.verbosity.as_deref(),
+            recovery_hint: recovery_hint.as_deref(),
             skills_scan_codewhale_only: app.skills_scan_codewhale_only,
             plugin_registry: Some(app.plugin_registry.as_ref()),
             mode: app.mode,
@@ -1269,16 +1278,24 @@ pub(crate) fn commit_streaming_display_tick(
         return false;
     }
 
+    // Reveal a bounded slice per beat rather than everything received. The
+    // budget is sized from the beat and the backlog, so the displayed pace is a
+    // function of the clock instead of the provider's chunking.
+    let interval = stream_display_clock.interval();
     let mut updated = false;
     if let Some(index) = app.streaming_message_index {
-        let committed = app.streaming_state.commit_text(0);
+        let budget =
+            crate::tui::streaming::reveal_budget(interval, app.streaming_state.pending_len(0));
+        let committed = app.streaming_state.commit_text(0, budget);
         if !committed.is_empty() {
             append_streaming_text(app, index, &committed);
             accrue_streaming_token_estimate(app, &committed);
             updated = true;
         }
     } else if let Some(entry_idx) = app.streaming_thinking_active_entry {
-        let committed = app.streaming_state.commit_text(0);
+        let budget =
+            crate::tui::streaming::reveal_budget(interval, app.streaming_state.pending_len(0));
+        let committed = app.streaming_state.commit_text(0, budget);
         if !committed.is_empty() {
             if app.translation_enabled {
                 streaming_thinking::set_placeholder(app, entry_idx);
@@ -1382,9 +1399,13 @@ pub(crate) fn build_pending_input_preview(app: &App) -> PendingInputPreview {
             }
         })
         .collect();
+    // #6190: a steer the engine has not recorded yet is exactly what this
+    // bucket's "sending into turn" label describes, so it shares it rather
+    // than growing a fourth bucket and a fifteenth locale string.
     preview.pending_steers = app
         .pending_steers
         .iter()
+        .chain(app.inflight_steers.iter().map(|steer| &steer.message))
         .map(|m| m.display.clone())
         .collect();
     preview.rejected_steers = app.rejected_steers.iter().cloned().collect();

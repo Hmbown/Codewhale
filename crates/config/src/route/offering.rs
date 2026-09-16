@@ -213,7 +213,9 @@ pub const CODEWHALE_FALLBACK_MODELS: &[&str] = &[
 /// this is the offline inference used for the bootstrap rows and for a model
 /// id the local catalog has never seen. Only the `anthropic/` namespace routes
 /// to `{base}/messages`; everything else is OpenAI Chat Completions at
-/// `{base}/chat/completions`.
+/// `{base}/chat/completions`. The id alone carries no signal for the
+/// Responses surface — a `responses` row only ever comes from the catalog's
+/// stated `codewhale.protocol`, never from a model name.
 #[must_use]
 pub fn codewhale_endpoint_key_for_model(model: &str) -> &'static str {
     if model.trim().to_ascii_lowercase().starts_with("anthropic/") {

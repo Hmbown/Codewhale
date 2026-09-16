@@ -290,8 +290,6 @@ pub struct TaskRecord {
     pub started_at: Option<DateTime<Utc>>,
     pub ended_at: Option<DateTime<Utc>>,
     pub duration_ms: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub hunt_verdict: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub result_summary: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -354,8 +352,6 @@ pub struct TaskSummary {
     pub duration_ms: Option<u64>,
     #[serde(default)]
     pub lifecycle_seq: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub hunt_verdict: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -385,7 +381,6 @@ impl From<&TaskRecord> for TaskSummary {
             ended_at: value.ended_at,
             duration_ms: value.duration_ms,
             lifecycle_seq: value.lifecycle_seq,
-            hunt_verdict: value.hunt_verdict.clone(),
             error: value.error.clone(),
             terminal_reason: value.terminal_reason.clone(),
             thread_id: value.thread_id.clone(),
@@ -870,6 +865,9 @@ async fn drive_engine_turn(
     let mut cursor = 0u64;
     let mut terminal_status: Option<RuntimeTurnStatus> = None;
     let mut terminal_error: Option<String> = None;
+    // Approval requests this turn is waiting on, each with the deadline the
+    // runtime bridge will resolve it by (#6118).
+    let mut pending_approvals: HashMap<String, Instant> = HashMap::new();
 
     loop {
         let batch = match runtime_threads
@@ -902,12 +900,47 @@ async fn drive_engine_turn(
             {
                 continue;
             }
+            match event.event.as_str() {
+                // An approval parks the turn on an external decision until
+                // the runtime bridge answers or its own window closes; note
+                // that deadline so the idle watchdog stays off it (#6118).
+                "approval.required" => {
+                    let approval_id = event
+                        .payload
+                        .get("approval_id")
+                        .and_then(Value::as_str)
+                        .map(ToString::to_string)
+                        .unwrap_or_else(|| format!("approval-{}", event.seq));
+                    let until = match runtime_threads.approval_decision_timeout() {
+                        Some(wait) => Instant::now() + wait,
+                        // `0` waits indefinitely by configuration; the wall
+                        // deadline still bounds the run.
+                        None => Instant::now() + limits.wall_time,
+                    };
+                    pending_approvals.insert(approval_id, until);
+                }
+                "approval.decided" => {
+                    if let Some(approval_id) =
+                        event.payload.get("approval_id").and_then(Value::as_str)
+                    {
+                        pending_approvals.remove(approval_id);
+                    }
+                }
+                _ => {}
+            }
             if runtime_event_is_progress(&event) {
                 guard.note_progress(Instant::now());
             }
             if let Some((status, error)) =
                 ingest_runtime_event(&event, &mut final_text, &events).await
             {
+                // The decision window closed on a pending approval: the
+                // runtime already denied the tool, and an unattended run has
+                // no operator to answer, so stop the turn instead of letting
+                // it keep burning under a failure nobody sees (#6118).
+                if event.event.as_str() == "approval.timeout" {
+                    let _ = runtime_threads.interrupt_turn(thread_id, turn_id).await;
+                }
                 terminal_status = Some(status);
                 terminal_error = error;
             }
@@ -917,7 +950,18 @@ async fn drive_engine_turn(
             break;
         }
 
-        match guard.evaluate(Instant::now(), cancel.is_cancelled(), false) {
+        // While an approval is pending the turn is deliberately waiting on an
+        // external decision, not drifting: keep the idle deadline from firing
+        // so the bridge's own window can resolve and record it. Entries expire
+        // with their window, so a decision that never arrives cannot suspend
+        // the watchdog forever (#6118).
+        let now = Instant::now();
+        pending_approvals.retain(|_, until| now < *until);
+        if !pending_approvals.is_empty() {
+            guard.note_progress(now);
+        }
+
+        match guard.evaluate(now, cancel.is_cancelled(), false) {
             GuardAction::Interrupt { reason } => {
                 let _ = runtime_threads.interrupt_turn(thread_id, turn_id).await;
                 emit_task_event(
@@ -1209,6 +1253,14 @@ async fn ingest_runtime_event(
                 .unwrap_or(false)
                 .then_some((RuntimeTurnStatus::Failed, Some(message)))
         }
+
+        "approval.timeout" => Some((
+            RuntimeTurnStatus::Failed,
+            Some(
+                "Tool approval was not answered within the decision window; the runtime denied the tool and the run stopped."
+                    .to_string(),
+            ),
+        )),
         _ => None,
     }
 }
@@ -1635,7 +1687,6 @@ impl TaskManager {
             started_at: None,
             ended_at: None,
             duration_ms: None,
-            hunt_verdict: None,
             result_summary: None,
             result_detail_path: None,
             error: None,
@@ -2789,25 +2840,6 @@ impl TaskManager {
             );
         }
 
-        if let Some(value) = updates.get("hunt_verdict") {
-            let raw = value
-                .as_str()
-                .ok_or_else(|| anyhow!("hunt_verdict task update must be a string"))?;
-            let verdict = normalize_hunt_verdict(raw)?;
-            if task.hunt_verdict.as_deref() != Some(verdict) {
-                task.hunt_verdict = Some(verdict.to_string());
-                push_timeline_entry(
-                    task,
-                    TaskTimelineEntry {
-                        timestamp: now,
-                        kind: "hunt_verdict".to_string(),
-                        summary: format!("Hunt verdict updated: {verdict}"),
-                        detail_path: None,
-                    },
-                );
-            }
-        }
-
         if let Some(value) = updates.get("attempt") {
             let attempt: TaskAttemptRecord = serde_json::from_value(value.clone())
                 .context("Failed to parse attempt task update")?;
@@ -2983,18 +3015,6 @@ impl TaskManager {
     fn persist_task_locked(&self, task: &TaskRecord) -> Result<()> {
         let path = self.tasks_dir.join(format!("{}.json", task.id));
         write_json_atomic(&path, task)
-    }
-}
-
-fn normalize_hunt_verdict(raw: &str) -> Result<&'static str> {
-    match raw.trim() {
-        "hunting" => Ok("hunting"),
-        "hunted" => Ok("hunted"),
-        "wounded" => Ok("wounded"),
-        "escaped" => Ok("escaped"),
-        other => bail!(
-            "unsupported hunt_verdict task update '{other}'. Expected one of: hunting, hunted, wounded, escaped"
-        ),
     }
 }
 
@@ -4182,7 +4202,6 @@ mod tests {
             started_at: Some(started_at),
             ended_at: None,
             duration_ms: None,
-            hunt_verdict: None,
             result_summary: None,
             result_detail_path: None,
             error: None,
@@ -4300,37 +4319,6 @@ mod tests {
 
         assert_eq!(updated.gates.len(), 1);
         assert_eq!(updated.gates[0].classification, "passed");
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn record_tool_metadata_updates_hunt_verdict_summary() -> Result<()> {
-        let root = std::env::temp_dir().join(format!("deepseek-task-test-{}", Uuid::new_v4()));
-        let manager =
-            TaskManager::start_with_executor(test_config(root), Arc::new(MockExecutor)).await?;
-
-        let task = manager
-            .add_task(NewTaskRequest::from_prompt("test verdict metadata"))
-            .await?;
-        let finished = wait_for_terminal_state(&manager, &task.id, Duration::from_secs(10)).await?;
-        let updated = manager
-            .record_tool_metadata(
-                &finished.id,
-                &serde_json::json!({
-                    "task_updates": {
-                        "hunt_verdict": "wounded"
-                    }
-                }),
-            )
-            .await?;
-
-        assert_eq!(updated.hunt_verdict.as_deref(), Some("wounded"));
-        let summaries = manager.list_tasks(Some(10)).await?;
-        let summary = summaries
-            .iter()
-            .find(|summary| summary.id == updated.id)
-            .expect("updated task summary");
-        assert_eq!(summary.hunt_verdict.as_deref(), Some("wounded"));
         Ok(())
     }
 
@@ -4857,7 +4845,6 @@ mod tests {
             started_at: Some(Utc::now()),
             ended_at: None,
             duration_ms: None,
-            hunt_verdict: None,
             result_summary: None,
             result_detail_path: None,
             error: None,
@@ -5594,6 +5581,138 @@ mod tests {
         .await;
         assert_eq!(result.status, TaskStatus::Completed);
         assert_eq!(result.terminal_reason, TaskTerminalReason::Completed);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pending_approval_suspends_idle_and_timeout_denial_settles_failed() -> Result<()> {
+        // #6118: a run that needs a tool approval must not die as a silent
+        // idle-timeout cancel; the pending approval suspends the idle
+        // watchdog, and the bridge's own deadline denial then settles the
+        // run Failed with the reason recorded.
+        let runtime = Arc::new(test_runtime_manager().await?);
+        let thread = runtime
+            .create_thread(CreateThreadRequest::default())
+            .await?;
+        let thread_id = thread.id.clone();
+        runtime
+            .emit_event_for_test(
+                &thread.id,
+                Some("turn_approval"),
+                "approval.required",
+                json!({
+                    "approval_id": "approval_fixture_1",
+                    "tool_call_id": "call_fixture_1",
+                    "tool_name": "shell",
+                }),
+            )
+            .await?;
+        let (tx, mut rx) = mpsc::channel(64);
+        let runtime_for_drive = Arc::clone(&runtime);
+        let drive = tokio::spawn(async move {
+            drive_engine_turn(
+                runtime_for_drive.as_ref(),
+                &thread_id,
+                "turn_approval",
+                tx,
+                CancellationToken::new(),
+                TaskExecutionLimits {
+                    wall_time: Duration::from_secs(5),
+                    idle_progress: Duration::from_millis(120),
+                    cancel_grace: Duration::from_millis(200),
+                    persist_debounce: Duration::from_millis(10),
+                },
+            )
+            .await
+        });
+
+        // Well past the idle window, the pending approval must keep the run
+        // alive; the old behavior killed it here with no receipt.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert!(
+            !drive.is_finished(),
+            "a pending approval must suspend the idle watchdog (#6118)"
+        );
+        while let Ok(event) = rx.try_recv() {
+            if let TaskExecutionEvent::Status { message } = event {
+                assert!(
+                    !message.contains("idle deadline"),
+                    "no idle interrupt may fire while an approval is pending: {message}"
+                );
+            }
+        }
+
+        // The decision window closes: the run settles Failed with the reason.
+        runtime
+            .emit_event_for_test(
+                &thread.id,
+                Some("turn_approval"),
+                "approval.timeout",
+                json!({ "approval_id": "approval_fixture_1", "tool_call_id": "call_fixture_1" }),
+            )
+            .await?;
+        let result = tokio::time::timeout(Duration::from_secs(2), drive)
+            .await
+            .context("the decision-window denial must settle the run promptly")??;
+        assert_eq!(result.status, TaskStatus::Failed);
+        assert_eq!(result.terminal_reason, TaskTerminalReason::Failed);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("Tool approval was not answered")),
+            "the run must record why it stopped, got {:?}",
+            result.error
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn resolved_approval_restores_the_idle_watchdog() -> Result<()> {
+        // #6118 counter-check: the suspension ends with the decision, so a
+        // run that then stops making progress is idle-killed exactly as
+        // before.
+        let runtime = test_runtime_manager().await?;
+        let thread = runtime
+            .create_thread(CreateThreadRequest::default())
+            .await?;
+        runtime
+            .emit_event_for_test(
+                &thread.id,
+                Some("turn_approval_resolved"),
+                "approval.required",
+                json!({
+                    "approval_id": "approval_fixture_2",
+                    "tool_call_id": "call_fixture_2",
+                    "tool_name": "shell",
+                }),
+            )
+            .await?;
+        runtime
+            .emit_event_for_test(
+                &thread.id,
+                Some("turn_approval_resolved"),
+                "approval.decided",
+                json!({
+                    "approval_id": "approval_fixture_2",
+                    "tool_call_id": "call_fixture_2",
+                    "decision": "allow",
+                }),
+            )
+            .await?;
+        let (tx, rx) = mpsc::channel(64);
+        tokio::spawn(drain_task_events(rx));
+        let result = drive_engine_turn(
+            &runtime,
+            &thread.id,
+            "turn_approval_resolved",
+            tx,
+            CancellationToken::new(),
+            TaskExecutionLimits::short_for_tests(),
+        )
+        .await;
+        assert_eq!(result.status, TaskStatus::Failed);
+        assert_eq!(result.terminal_reason, TaskTerminalReason::IdleTimeout);
         Ok(())
     }
 

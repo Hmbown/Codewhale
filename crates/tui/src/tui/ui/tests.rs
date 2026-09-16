@@ -18,6 +18,7 @@ use crate::config::{
     ProviderConfig, ProvidersConfig,
 };
 use crate::core::engine::mock_engine_handle;
+use crate::core::ops::TurnSpec;
 use crate::reasoning_preference::ReasoningEffort;
 use crate::tui::active_cell::ActiveCell;
 use crate::tui::app::ToolDetailRecord;
@@ -1760,7 +1761,12 @@ fn bottom_prompts_keep_transcript_tail_visible_through_resize_and_navigation() {
         let config = Config::default();
         for (width, height) in [(141, 38), (80, 24), (40, 12), (80, 24), (141, 38)] {
             let surface = render_test_app(&mut app, &config, width, height);
-            let prompt = app.viewport.last_prompt_area.expect("painted prompt");
+            let prompt = app.viewport.last_prompt_area.unwrap_or_else(|| {
+                panic!(
+                    "{kind:?} at {width}x{height}: no prompt area painted (onboarding={:?}, redaction_gate={}, top_kind={:?})",
+                    app.onboarding, app.redaction_gate, app.view_stack.top_kind()
+                )
+            });
             let transcript = app
                 .viewport
                 .last_transcript_area
@@ -2225,6 +2231,87 @@ fn workflow_ui_events_apply_only_to_the_active_session_owner() {
 }
 
 #[test]
+fn failed_workflow_run_raises_a_sticky_error() {
+    let mut app = create_test_app();
+    app.current_session_id = Some("session-a".to_string());
+    let started = serde_json::json!({
+        "type": "run_started",
+        "at_ms": 1,
+        "workflow_goal": "Failing workflow"
+    });
+    assert!(apply_owned_workflow_ui_event(
+        &mut app,
+        "session-a",
+        "workflow-fail",
+        &started,
+    ));
+    assert!(
+        app.sticky_status.is_none(),
+        "starting a run must not raise a failure toast"
+    );
+
+    let completed = serde_json::json!({
+        "type": "run_completed",
+        "at_ms": 2,
+        "status": "failed",
+        "error": "task(): invalid options: unknown field `count`"
+    });
+    assert!(apply_owned_workflow_ui_event(
+        &mut app,
+        "session-a",
+        "workflow-fail",
+        &completed,
+    ));
+    let sticky = app
+        .sticky_status
+        .as_ref()
+        .expect("a failed workflow run must be loud (#5528)");
+    assert_eq!(sticky.level, StatusToastLevel::Error);
+    assert_eq!(
+        sticky.ttl_ms,
+        Some(crate::tui::app::App::STICKY_ERROR_TTL_MS)
+    );
+    assert!(
+        sticky.text.contains("Workflow run failed")
+            && sticky.text.contains("unknown field `count`"),
+        "the sticky strip must name the failure and its cause: {:?}",
+        sticky.text
+    );
+}
+
+#[test]
+fn successful_workflow_run_raises_no_failure_toast() {
+    let mut app = create_test_app();
+    app.current_session_id = Some("session-a".to_string());
+    let started = serde_json::json!({
+        "type": "run_started",
+        "at_ms": 1,
+        "workflow_goal": "Healthy workflow"
+    });
+    assert!(apply_owned_workflow_ui_event(
+        &mut app,
+        "session-a",
+        "workflow-ok",
+        &started,
+    ));
+    let succeeded = serde_json::json!({
+        "type": "run_completed",
+        "at_ms": 2,
+        "status": "succeeded"
+    });
+    assert!(apply_owned_workflow_ui_event(
+        &mut app,
+        "session-a",
+        "workflow-ok",
+        &succeeded,
+    ));
+    assert!(
+        app.sticky_status.is_none(),
+        "a successful run must not raise a failure toast"
+    );
+}
+
+#[test]
 fn workflow_panel_plain_letters_return_to_composer() {
     let mut app = create_test_app();
     app.workflow_panel = Some(crate::tui::widgets::workflow_panel::WorkflowPanel::new(
@@ -2459,6 +2546,181 @@ fn plain_mcp_show_refreshes_discovery_counts() {
     assert!(!mcp_ui_action_refreshes_discovery(&McpUiAction::Init {
         force: false,
     }));
+}
+
+#[tokio::test]
+async fn mcp_show_while_turn_running_serves_cached_snapshot_without_engine_roundtrip() {
+    use crate::mcp::{McpManagerSnapshot, McpServerCapabilityMetadata, McpServerSnapshot};
+    use crate::tui::app::McpUiAction;
+
+    let mut app = create_test_app();
+    app.is_loading = true;
+    app.mcp_snapshot = Some(McpManagerSnapshot {
+        config_path: PathBuf::from("mcp.json"),
+        config_exists: true,
+        reload_required: false,
+        servers: vec![McpServerSnapshot {
+            name: "cached".into(),
+            enabled: true,
+            required: false,
+            transport: "stdio".into(),
+            command_or_url: "cached-mcp".into(),
+            connect_timeout: 5,
+            execute_timeout: 5,
+            read_timeout: 5,
+            connected: true,
+            error: None,
+            auth_required: false,
+            capability_metadata: McpServerCapabilityMetadata::LegacyFallback,
+            tools: Vec::new(),
+            resources: Vec::new(),
+            prompts: Vec::new(),
+        }],
+    });
+    let mut mock = mock_engine_handle();
+    tokio::time::timeout(
+        Duration::from_millis(200),
+        handle_mcp_ui_action(
+            &mut app,
+            &mock.handle,
+            &Config::default(),
+            McpUiAction::Show,
+        ),
+    )
+    .await
+    .expect("bare /mcp must return immediately while a turn is in flight (#6159)");
+    assert!(
+        mock.rx_op.try_recv().is_err(),
+        "no engine op may be started while a turn owns the engine loop"
+    );
+    assert_eq!(app.view_stack.top_kind(), Some(ModalKind::Extensions));
+    assert_eq!(app.mcp_configured_count, 1);
+    assert!(
+        app.history.iter().any(|cell| matches!(
+            cell,
+            HistoryCell::System { content }
+                if content.contains("last known MCP snapshot")
+        )),
+        "the receipt must name the cached snapshot the panel is showing"
+    );
+}
+
+#[tokio::test]
+async fn mcp_show_while_turn_running_without_snapshot_fails_closed() {
+    use crate::tui::app::McpUiAction;
+
+    let mut app = create_test_app();
+    app.is_loading = true;
+    assert!(app.mcp_snapshot.is_none());
+    let mut mock = mock_engine_handle();
+    tokio::time::timeout(
+        Duration::from_millis(200),
+        handle_mcp_ui_action(
+            &mut app,
+            &mock.handle,
+            &Config::default(),
+            McpUiAction::Show,
+        ),
+    )
+    .await
+    .expect("bare /mcp must return immediately while a turn is in flight (#6159)");
+    assert!(mock.rx_op.try_recv().is_err());
+    assert_ne!(
+        app.view_stack.top_kind(),
+        Some(ModalKind::Extensions),
+        "without an observed snapshot there is nothing honest to show"
+    );
+    assert!(app.history.iter().any(|cell| matches!(
+        cell,
+        HistoryCell::System { content }
+            if content.contains("no MCP snapshot has been observed")
+    )));
+}
+
+#[tokio::test]
+async fn mcp_mutations_while_turn_running_defer_the_live_pool_refresh() {
+    use crate::tui::app::McpUiAction;
+
+    let temp = tempfile::tempdir().expect("temporary MCP home");
+    let path = temp.path().join("mcp.json");
+    crate::mcp::add_server_config(
+        &path,
+        "fixture".to_string(),
+        Some("fixture-mcp".to_string()),
+        None,
+        Vec::new(),
+        None,
+    )
+    .expect("seed MCP server");
+    crate::mcp::set_server_enabled(&path, "fixture", false).expect("disable MCP server");
+
+    let mut app = create_test_app();
+    app.mcp_config_path = path.clone();
+    app.is_loading = true;
+    let mut mock = mock_engine_handle();
+    tokio::time::timeout(
+        Duration::from_millis(200),
+        handle_mcp_ui_action(
+            &mut app,
+            &mock.handle,
+            &Config::default(),
+            McpUiAction::Enable {
+                name: "fixture".to_string(),
+            },
+        ),
+    )
+    .await
+    .expect("a mutation must not park the UI loop behind the running turn (#6159)");
+    assert!(
+        mock.rx_op.try_recv().is_err(),
+        "the live-pool reload op must not be sent while a turn owns the engine"
+    );
+    assert!(
+        crate::mcp::load_config(&app.mcp_config_path)
+            .expect("persisted MCP config")
+            .servers
+            .get("fixture")
+            .expect("persisted fixture")
+            .is_enabled(),
+        "the durable config still advances while the live pool waits"
+    );
+    assert!(app.mcp_reload_required);
+    assert!(app.history.iter().any(|cell| matches!(
+        cell,
+        HistoryCell::System { content } if content.contains("Enabled MCP server 'fixture'")
+    )));
+    assert!(app.history.iter().any(|cell| matches!(
+        cell,
+        HistoryCell::System { content }
+            if content.contains("live MCP pool refresh is deferred")
+    )));
+}
+
+#[tokio::test]
+async fn mcp_retry_while_turn_running_names_the_deferral_and_never_awaits() {
+    use crate::tui::app::McpUiAction;
+
+    let mut app = create_test_app();
+    app.is_loading = true;
+    let mut mock = mock_engine_handle();
+    tokio::time::timeout(
+        Duration::from_millis(200),
+        handle_mcp_ui_action(
+            &mut app,
+            &mock.handle,
+            &Config::default(),
+            McpUiAction::Retry {
+                name: "flaky".to_string(),
+            },
+        ),
+    )
+    .await
+    .expect("retry must not park the UI loop behind the running turn (#6159)");
+    assert!(mock.rx_op.try_recv().is_err());
+    assert!(app.history.iter().any(|cell| matches!(
+        cell,
+        HistoryCell::System { content } if content.contains("/mcp retry flaky")
+    )));
 }
 
 #[tokio::test]
@@ -2882,6 +3144,28 @@ async fn mcp_reload_failure_keeps_pending_state_and_live_snapshot() {
             if content.contains("live tool pool is unchanged")
                 && content.contains("safe config parse failure")
     )));
+}
+
+#[test]
+fn session_load_failure_is_durable_in_the_transcript() {
+    // #6138: a failed resume must not exist only in the status line, which
+    // the next footer update replaces.
+    let mut app = create_test_app();
+    let before = app.history.len();
+    crate::tui::ui::session_state::surface_session_load_failure(
+        &mut app,
+        "Failed to load session: No session found with prefix: abc".to_string(),
+    );
+    assert_eq!(app.history.len(), before + 1);
+    assert!(matches!(
+        app.history.last(),
+        Some(HistoryCell::Error { message, .. })
+            if message.contains("No session found with prefix")
+    ));
+    assert_eq!(
+        app.status_message.as_deref(),
+        Some("Failed to load session: No session found with prefix: abc")
+    );
 }
 
 #[test]
@@ -3655,7 +3939,19 @@ fn mouse_selection_autocopies_on_release_without_ctrl_c() {
         },
     );
 
-    assert_eq!(app.status_message.as_deref(), Some("Selection copied"));
+    // Drag-release autocopy now takes the Markdown-source path (#6156): the
+    // clipboard holds canonical cell content and the receipt is a toast
+    // naming the projected cell count, not the legacy status sink.
+    assert!(
+        app.status_message.is_none(),
+        "markdown copy must not touch the legacy status sink"
+    );
+    let toast = app.status_toasts.back().expect("markdown copy toast");
+    assert!(
+        toast.text.contains("(1)"),
+        "toast names the projected cell count, got {:?}",
+        toast.text
+    );
     assert!(
         app.clipboard
             .last_written_text()
@@ -10286,11 +10582,11 @@ async fn paused_dispatch_at_compaction_threshold_enqueues_one_atomic_send() {
     .expect("atomic paused dispatch");
 
     match engine.rx_op.recv().await.expect("single send operation") {
-        Op::SendMessage {
+        Op::SendMessage(TurnSpec {
             compaction,
             goal_objective,
             ..
-        } => {
+        }) => {
             assert!(compaction.enabled);
             assert_eq!(goal_objective.as_deref(), Some("finish the paused audit"));
         }
@@ -10609,7 +10905,7 @@ async fn dispatch_uses_app_owned_exact_custom_identity_when_config_selector_drif
     .expect("dispatch exact App-owned route");
 
     match engine.rx_op.recv().await.expect("send message op") {
-        Op::SendMessage { route, .. } => {
+        Op::SendMessage(TurnSpec { route, .. }) => {
             assert_eq!(route.identity.provider, ApiProvider::Custom);
             assert_eq!(route.identity.key, "custom-a");
             assert_eq!(route.identity.exact_id.as_deref(), Some("custom-a"));
@@ -10661,7 +10957,7 @@ async fn dispatch_idless_custom_identity_keeps_legacy_root_over_literal_table() 
     .expect("dispatch idless legacy root route");
 
     match engine.rx_op.recv().await.expect("send message op") {
-        Op::SendMessage { route, .. } => {
+        Op::SendMessage(TurnSpec { route, .. }) => {
             assert_eq!(route.identity.provider, ApiProvider::Custom);
             assert_eq!(route.identity.key, "custom");
             assert_eq!(route.identity.exact_id, None);
@@ -11348,10 +11644,146 @@ async fn live_steer_crosses_message_submit_transform_exactly_once() {
         Some("transformed steer")
     );
     assert_eq!(std::fs::read_to_string(count).expect("hook count"), "x");
-    assert!(app.api_messages.iter().any(|message| matches!(
-        &message.content[0],
-        ContentBlock::Text { text, .. } if text == "transformed steer"
-    )));
+    // #6190: the transform's output is what the engine was handed, and it is
+    // held as in-flight until the engine's own record shows it. Pushing it
+    // into `api_messages` at send time was the reorder this fix removes.
+    assert_eq!(
+        app.inflight_steers
+            .iter()
+            .map(|steer| steer.content.as_str())
+            .collect::<Vec<_>>(),
+        vec!["transformed steer"]
+    );
+    assert!(
+        !app.api_messages.iter().any(|message| matches!(
+            &message.content[0],
+            ContentBlock::Text { text, .. } if text == "transformed steer"
+        )),
+        "a steer the engine has not recorded yet must not be in the local transcript"
+    );
+}
+
+/// #6190: steering did not place the steer as the newest transcript entry —
+/// it was painted at send time, so it sat above assistant work the engine's
+/// record places before it, and the live transcript disagreed with the
+/// replayed one. The steer now becomes a cell when, and where, the engine
+/// records it.
+#[cfg(not(windows))]
+#[tokio::test]
+async fn steer_becomes_the_newest_transcript_entry_only_when_the_engine_records_it() {
+    let _environment = crate::test_support::lock_test_env();
+    let mut app = create_test_app();
+    let session = super::event_loop::ensure_runtime_session_id(&mut app);
+    app.api_messages = vec![text_message("user", "original request")];
+    app.add_message(HistoryCell::Assistant {
+        content: "work produced before the steer arrived".to_string(),
+        streaming: false,
+    });
+    app.is_loading = true;
+    let mut engine = crate::core::engine::mock_engine_handle();
+
+    attempt_steer_with_queue_fallback(
+        &mut app,
+        &Config::default(),
+        &engine.handle,
+        QueuedMessage::new("actually use the other file".to_string(), None),
+        DispatchRecovery::Immediate,
+    )
+    .await;
+    assert_eq!(
+        engine.rx_steer.recv().await.as_deref(),
+        Some("actually use the other file")
+    );
+
+    // The channel took it; the turn has not. Nothing is settled yet.
+    assert!(
+        !app.history
+            .iter()
+            .any(|cell| matches!(cell, HistoryCell::User { .. })),
+        "a steer must not own a transcript cell before the engine records it"
+    );
+    assert_eq!(app.api_messages.len(), 1);
+    assert_eq!(
+        build_pending_input_preview(&app).pending_steers,
+        vec!["actually use the other file".to_string()],
+        "an unaccepted steer is shown as still sending, not as transcript"
+    );
+
+    // The engine commits the steer at its step boundary, after the assistant
+    // message it followed. `is_loading` is cleared first only because the
+    // mid-turn checkpoint branch of the projection is not what this pins.
+    app.is_loading = false;
+    let model = app.model.clone();
+    let workspace = app.workspace.clone();
+    assert!(super::event_loop::apply_engine_session_projection(
+        &mut app,
+        &Config::default(),
+        EngineEvent::SessionUpdated {
+            session_id: session,
+            messages: vec![
+                text_message("user", "original request"),
+                text_message("assistant", "work produced before the steer arrived"),
+                text_message("user", "actually use the other file"),
+            ],
+            system_prompt: None,
+            model,
+            workspace,
+        }
+    ));
+
+    assert!(app.inflight_steers.is_empty(), "the steer was accepted");
+    assert!(build_pending_input_preview(&app).pending_steers.is_empty());
+    assert!(
+        matches!(
+            app.history.last(),
+            Some(HistoryCell::User { content }) if content == "+ actually use the other file"
+        ),
+        "the steer must be the newest transcript entry: {:?}",
+        app.history.last()
+    );
+}
+
+/// #6190 case D: `next_turn_steer` drains and *discards* a steer stamped with
+/// a turn that has already moved on. The toast said "sent into turn" and the
+/// cell stayed in history forever, for input the model never received. The
+/// steer now settles as a "could not send" receipt instead.
+#[cfg(not(windows))]
+#[tokio::test]
+async fn steer_the_turn_never_accepted_is_reported_not_left_in_the_transcript() {
+    let mut app = create_test_app();
+    app.is_loading = true;
+    let mut engine = crate::core::engine::mock_engine_handle();
+
+    attempt_steer_with_queue_fallback(
+        &mut app,
+        &Config::default(),
+        &engine.handle,
+        QueuedMessage::new("too late to matter".to_string(), None),
+        DispatchRecovery::Immediate,
+    )
+    .await;
+    assert_eq!(
+        engine.rx_steer.recv().await.as_deref(),
+        Some("too late to matter")
+    );
+
+    // The turn ends without the engine ever recording it.
+    super::dispatch::settle_unaccepted_steers_at_turn_end(&mut app);
+
+    assert!(app.inflight_steers.is_empty());
+    assert!(
+        !app.history
+            .iter()
+            .any(|cell| matches!(cell, HistoryCell::User { .. })),
+        "a dropped steer must not leave a transcript cell the record never had"
+    );
+    assert!(app.api_messages.is_empty());
+    let preview = build_pending_input_preview(&app);
+    assert!(preview.pending_steers.is_empty());
+    assert_eq!(
+        preview.rejected_steers,
+        vec!["too late to matter".to_string()]
+    );
 }
 
 #[cfg(not(windows))]
@@ -11461,7 +11893,7 @@ async fn lost_strict_message_submit_executor_keeps_dispatch_atomic_and_recoverab
             .expect("production completion mailbox closed");
     apply_dispatch(&mut app, &engine.handle, &Config::default()).expect("apply recovery dispatch");
     match engine.rx_op.recv().await.expect("recovery SendMessage") {
-        crate::core::ops::Op::SendMessage { content, .. } => {
+        crate::core::ops::Op::SendMessage(TurnSpec { content, .. }) => {
             assert_eq!(content, "recover now");
         }
         other => panic!("expected SendMessage, got {other:?}"),
@@ -11507,7 +11939,7 @@ async fn reserved_dispatch_waits_for_ui_acceptance_before_engine_op() {
     assert!(app.pending_turn_route.is_some());
     assert!(matches!(
         engine.rx_op.try_recv(),
-        Ok(crate::core::ops::Op::SendMessage { content, .. })
+        Ok(crate::core::ops::Op::SendMessage (TurnSpec { content, .. }))
             if content == "preserve Engine lifecycle"
     ));
     assert!(engine.rx_op.try_recv().is_err(), "one Engine admission");
@@ -11686,7 +12118,7 @@ async fn reserved_dispatch_cancel_before_acceptance_keeps_prompt_and_next_dispat
             apply(&mut app, &engine.handle, &config).expect("next dispatch");
             assert!(matches!(
                 engine.rx_op.try_recv(),
-                Ok(crate::core::ops::Op::SendMessage { .. })
+                Ok(crate::core::ops::Op::SendMessage(TurnSpec { .. }))
             ));
             assert!(engine.rx_op.try_recv().is_err());
         }
@@ -11869,7 +12301,7 @@ async fn reserved_dispatch_replaced_engine_or_session_leaves_current_state_untou
         };
         assert!(matches!(
             next_op,
-            Ok(crate::core::ops::Op::SendMessage { content, .. })
+            Ok(crate::core::ops::Op::SendMessage (TurnSpec { content, .. }))
                 if content == "new session request"
         ));
     }
@@ -12034,7 +12466,7 @@ printf '%s\n' '{"text":"after timeout"}'
         Some("hook timed out after 1s")
     );
     match engine.rx_op.recv().await.expect("send message op") {
-        crate::core::ops::Op::SendMessage { content, .. } => {
+        crate::core::ops::Op::SendMessage(TurnSpec { content, .. }) => {
             assert_eq!(content, "after timeout");
         }
         other => panic!("expected SendMessage, got {other:?}"),
@@ -12079,7 +12511,7 @@ printf '%s\n' '{"text":"after soft failure"}'
         Some("message_submit hook exited with code 9")
     );
     match engine.rx_op.recv().await.expect("send message op") {
-        crate::core::ops::Op::SendMessage { content, .. } => {
+        crate::core::ops::Op::SendMessage(TurnSpec { content, .. }) => {
             assert_eq!(content, "after soft failure");
         }
         other => panic!("expected SendMessage, got {other:?}"),
@@ -12175,7 +12607,7 @@ printf '%s\n' '{"text":"[hooked] hello"}'
         ContentBlock::Text { text, .. } if text == "[hooked] hello"
     ));
     match engine.rx_op.recv().await.expect("send message op") {
-        crate::core::ops::Op::SendMessage { content, .. } => {
+        crate::core::ops::Op::SendMessage(TurnSpec { content, .. }) => {
             assert_eq!(content, "[hooked] hello");
         }
         other => panic!("expected SendMessage, got {other:?}"),
@@ -12282,11 +12714,11 @@ async fn dispatch_non_resume_message_preserves_paused_command_state() {
     assert!(app.goal.objective.is_none());
     assert!(!engine.handle.is_paused());
     match engine.rx_op.recv().await.expect("send message op") {
-        crate::core::ops::Op::SendMessage {
+        crate::core::ops::Op::SendMessage(TurnSpec {
             content,
             goal_objective,
             ..
-        } => {
+        }) => {
             assert!(goal_objective.is_none());
             assert!(content.contains("Paused custom slash command: Scan nested git repositories"));
             assert!(content.contains("do not continue the paused command"));
@@ -12323,11 +12755,11 @@ async fn dispatch_resume_message_restores_paused_command_goal() {
     );
     assert!(!engine.handle.is_paused());
     match engine.rx_op.recv().await.expect("send message op") {
-        crate::core::ops::Op::SendMessage {
+        crate::core::ops::Op::SendMessage(TurnSpec {
             content,
             goal_objective,
             ..
-        } => {
+        }) => {
             assert_eq!(
                 goal_objective.as_deref(),
                 Some("Scan nested git repositories")
@@ -12372,12 +12804,12 @@ async fn dispatch_user_message_keeps_auto_review_separate_from_bypass() {
         .expect("spawned dispatch should deliver Op within timeout")
         .expect("send message op");
     match op {
-        crate::core::ops::Op::SendMessage {
+        crate::core::ops::Op::SendMessage(TurnSpec {
             mode,
             auto_approve,
             approval_mode,
             ..
-        } => {
+        }) => {
             assert_eq!(mode, AppMode::Agent);
             assert!(!auto_approve);
             assert_eq!(approval_mode, ApprovalMode::Auto);
@@ -16667,7 +17099,7 @@ async fn dispatch_user_message_records_prompt_for_cancel_restore() {
         Some("fix this typo\nthen retry")
     );
     match engine.rx_op.recv().await.expect("send message op") {
-        crate::core::ops::Op::SendMessage { content, .. } => {
+        crate::core::ops::Op::SendMessage(TurnSpec { content, .. }) => {
             assert_eq!(content, "fix this typo\nthen retry");
             assert!(!app.show_thinking, "visibility remains TUI-owned");
         }
@@ -16709,7 +17141,7 @@ async fn startup_prompt_waits_for_onboarding_then_dispatches() {
         Some("阅读项目 and wait")
     );
     match engine.rx_op.recv().await.expect("send message op") {
-        crate::core::ops::Op::SendMessage { content, .. } => {
+        crate::core::ops::Op::SendMessage(TurnSpec { content, .. }) => {
             assert!(content.contains("阅读项目 and wait"));
         }
         other => panic!("expected SendMessage, got {other:?}"),
@@ -16755,7 +17187,9 @@ async fn redaction_gate_preserves_startup_and_external_input_without_dispatch() 
     assert!(!app.auto_submit_initial_input);
     assert!(app.input.is_empty());
     match engine.rx_op.try_recv().unwrap() {
-        Op::SendMessage { content, .. } => assert!(content.contains("review the local fixture")),
+        Op::SendMessage(TurnSpec { content, .. }) => {
+            assert!(content.contains("review the local fixture"))
+        }
         other => panic!("unexpected operation: {other:?}"),
     }
     assert!(engine.rx_op.try_recv().is_err());
@@ -22626,7 +23060,7 @@ fn message_complete_drain_preserves_thinking_when_thinking_complete_lost() {
     app.thinking_started_at = Some(Instant::now());
     app.streaming_state.start_thinking(0);
     app.streaming_state.push_content(0, "deep reasoning text");
-    let _ = app.streaming_state.commit_text(0);
+    let _ = app.streaming_state.commit_text(0, usize::MAX);
     app.reasoning_buffer.push_str("deep reasoning text");
 
     assert!(
@@ -22685,6 +23119,7 @@ fn approval_prompt_uses_event_input_after_message_complete_drain() {
         "approval-key",
         None,
         crate::config::ApprovalDefaultSelection::Deny,
+        None,
     );
 
     let mut view = app.view_stack.pop().expect("approval view");
@@ -22718,6 +23153,7 @@ fn approval_prompt_uses_configured_default_selection() {
         "approval-key",
         None,
         crate::config::ApprovalDefaultSelection::AllowOnce,
+        None,
     );
 
     let mut view = app.view_stack.pop().expect("approval view");
@@ -22753,6 +23189,7 @@ fn patch_approval_modal_does_not_displace_the_active_file_receipt() {
         "approval-key",
         None,
         crate::config::ApprovalDefaultSelection::Deny,
+        None,
     );
 
     assert!(
@@ -22778,6 +23215,41 @@ fn patch_approval_modal_does_not_displace_the_active_file_receipt() {
     assert_eq!(
         cell.receipt.as_ref().map(|receipt| receipt.outcome_label()),
         Some("Updated src/lib.rs".to_string())
+    );
+}
+
+#[tokio::test]
+async fn timed_out_approval_denial_reaches_the_engine_as_a_timeout() {
+    let mut app = create_test_app();
+    let mut config = Config::default();
+    let mut engine = mock_engine_handle();
+
+    apply_approval_decision(
+        &mut app,
+        &mut engine.handle,
+        &mut config,
+        ApprovalDecisionEvent {
+            tool_id: "tool-timeout".to_string(),
+            tool_name: "exec_shell".to_string(),
+            decision: ReviewDecision::Denied,
+            timed_out: true,
+            approval_key: "approval-timeout-key".to_string(),
+            approval_grouping_key: "approval-group".to_string(),
+            persistent_rules: Vec::new(),
+        },
+    )
+    .await;
+
+    assert_eq!(
+        engine.recv_approval_event().await,
+        Some(crate::core::engine::MockApprovalEvent::TimedOut {
+            id: "tool-timeout".to_string()
+        }),
+        "a bound expiry must reach the engine as a timeout, not an operator denial"
+    );
+    assert!(
+        !app.approval_session_denied.contains("approval-timeout-key"),
+        "an expired card must not cache a session denial"
     );
 }
 
@@ -24873,7 +25345,6 @@ mod work_sidebar_projection_tests {
             ended_at,
             duration_ms: ended_at.map(|_| 1_234),
             lifecycle_seq: 1,
-            hunt_verdict: None,
             error: None,
             terminal_reason: None,
             thread_id: None,
@@ -25631,8 +26102,8 @@ fn queued_terminal_events_keep_receipt_gap_for_late_unbracketed_submit() {
     );
 }
 
-#[test]
-fn terminal_input_child_pause_drains_codewhale_events_before_editor_handoff() {
+#[tokio::test]
+async fn terminal_input_child_pause_drains_codewhale_events_before_editor_handoff() {
     let (tx, rx) = std::sync::mpsc::channel();
     tx.send(TerminalInputMessage::Event(ObservedTerminalEvent::new(
         Event::Key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)),
@@ -25662,6 +26133,7 @@ fn terminal_input_child_pause_drains_codewhale_events_before_editor_handoff() {
 
     input
         .pause_for_child_terminal()
+        .await
         .expect("synthetic pump can pause");
     assert!(
         prepare_terminal_input_handoff(&input, &mut pending_terminal_events)
@@ -25682,8 +26154,8 @@ fn terminal_input_child_pause_drains_codewhale_events_before_editor_handoff() {
     assert!(!input.paused_ack.load(std::sync::atomic::Ordering::Acquire));
 }
 
-#[test]
-fn terminal_input_handoff_preserves_pending_cancellation_keys() {
+#[tokio::test]
+async fn terminal_input_handoff_preserves_pending_cancellation_keys() {
     let (tx, rx) = std::sync::mpsc::channel();
     tx.send(TerminalInputMessage::Event(ObservedTerminalEvent::new(
         Event::Key(KeyEvent::new(KeyCode::Char('\u{3}'), KeyModifiers::NONE)),
@@ -25712,6 +26184,7 @@ fn terminal_input_handoff_preserves_pending_cancellation_keys() {
 
     input
         .pause_for_child_terminal()
+        .await
         .expect("synthetic pump can pause");
     assert!(
         !prepare_terminal_input_handoff(&input, &mut pending_terminal_events)
@@ -25729,8 +26202,104 @@ fn terminal_input_handoff_preserves_pending_cancellation_keys() {
     input.resume_after_child_terminal();
 }
 
+/// `CHILD_TERMINAL_GATE` is process-global — one stdin, one pump. Any test
+/// that publishes or reads it must hold this, including the restart test,
+/// which publishes through `install_parts`.
+static CHILD_TERMINAL_GATE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// #6165: `/hooks edit` handed the terminal to `$EDITOR` with the pump still
+/// reading stdin, so `Esc` and `Enter` were eaten by the composer while `:`
+/// and `!` reached `vi`. The pause now lives inside `with_suspended_tui`, so
+/// this pins what that guard must do to the pump: stop it reading for the
+/// whole handoff, and start it again on the way out.
+#[test]
+fn child_terminal_pause_stops_the_pump_reading_and_resumes_it_on_drop() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    let _serialized = CHILD_TERMINAL_GATE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    let paused = std::sync::Arc::new(AtomicBool::new(false));
+    let paused_ack = std::sync::Arc::new(AtomicBool::new(false));
+    let stop = std::sync::Arc::new(AtomicBool::new(false));
+    let reads = std::sync::Arc::new(AtomicUsize::new(0));
+    // Mirrors the real pump loop's pause handling: acknowledge and stop
+    // reading while paused, read otherwise. Spawning the crossterm pump here
+    // would need an interactive terminal.
+    let worker = {
+        let (paused, paused_ack, stop, reads) = (
+            std::sync::Arc::clone(&paused),
+            std::sync::Arc::clone(&paused_ack),
+            std::sync::Arc::clone(&stop),
+            std::sync::Arc::clone(&reads),
+        );
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::Acquire) {
+                if paused.load(Ordering::Acquire) {
+                    paused_ack.store(true, Ordering::Release);
+                } else {
+                    paused_ack.store(false, Ordering::Release);
+                    reads.fetch_add(1, Ordering::Release);
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        })
+    };
+    super::terminal_input::publish_child_terminal_gate(&paused, &paused_ack);
+
+    let guard = pause_terminal_input_for_child().expect("the pump acknowledges the pause");
+    assert!(paused.load(Ordering::Acquire));
+    let while_child_owns_it = reads.load(Ordering::Acquire);
+    std::thread::sleep(Duration::from_millis(30));
+    assert_eq!(
+        reads.load(Ordering::Acquire),
+        while_child_owns_it,
+        "the pump must not read the tty while a child owns the terminal"
+    );
+
+    drop(guard);
+    assert!(!paused.load(Ordering::Acquire));
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while reads.load(Ordering::Acquire) == while_child_owns_it {
+        assert!(
+            Instant::now() < deadline,
+            "the pump must read again once the child releases the terminal"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+
+    stop.store(true, Ordering::Release);
+    let _ = worker.join();
+}
+
+/// A pump that will not stop means the handoff would reproduce #6165, so the
+/// editor must not run — and the refusal must leave the pump reading.
+#[test]
+fn child_terminal_pause_refuses_the_handoff_when_the_pump_never_acknowledges() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let _serialized = CHILD_TERMINAL_GATE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    let paused = std::sync::Arc::new(AtomicBool::new(false));
+    let paused_ack = std::sync::Arc::new(AtomicBool::new(false));
+    super::terminal_input::publish_child_terminal_gate(&paused, &paused_ack);
+
+    let error = pause_terminal_input_for_child()
+        .err()
+        .expect("an unacknowledged pause must fail the handoff");
+    assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+    assert!(
+        !paused.load(Ordering::Acquire),
+        "a refused handoff must leave the pump reading, not wedged paused"
+    );
+}
+
 #[test]
 fn input_pump_restart_detaches_wedged_thread_and_installs_fresh_parts() {
+    let _serialized = CHILD_TERMINAL_GATE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     // A "wedged" pump thread blocked forever on a channel recv stands in for
     // a crossterm `event::read` that never returns (stalled Windows console
     // poll, or a Unix tty that stopped delivering bytes). Joining it would

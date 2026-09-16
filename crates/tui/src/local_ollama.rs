@@ -205,12 +205,27 @@ pub(crate) async fn probe_live_local_ollama_catalog(
     Some(LiveLocalOllamaCatalog { endpoint_v1, tags })
 }
 
+/// Env opt-out for harnesses that must not see the developer's machine.
+///
+/// `spawn_local_ollama_adoption_probe` is already inert under `cfg(test)`, but
+/// the PTY suites spawn the real binary, so that guard never reaches them. A
+/// developer running Ollama on :11434 therefore gets the launch screen replaced
+/// by a "Provider switched: deepseek -> ollama" notice, and the PTY tests that
+/// wait for launch text fail on their machine while CI stays green. Sealing the
+/// HOME is not enough, because this leak arrives over the loopback network
+/// rather than through the filesystem.
+pub(crate) const DISABLE_LOCAL_OLLAMA_PROBE_ENV: &str = "CODEWHALE_DISABLE_LOCAL_OLLAMA_PROBE";
+
+fn local_ollama_probe_disabled() -> bool {
+    std::env::var_os(DISABLE_LOCAL_OLLAMA_PROBE_ENV).is_some_and(|value| !value.is_empty())
+}
+
 /// Background probe used by the event loop (mirrors `spawn_startup_version_check`).
 pub(crate) fn spawn_local_ollama_adoption_probe(
     config: &Config,
     should_probe: bool,
 ) -> Option<tokio::task::JoinHandle<Option<LiveLocalOllamaCatalog>>> {
-    if !should_probe {
+    if !should_probe || local_ollama_probe_disabled() {
         return None;
     }
     #[cfg(test)]

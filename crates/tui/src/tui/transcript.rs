@@ -188,7 +188,7 @@ impl TranscriptViewCache {
     }
 
     /// Convenience entry point; the live path uses shards to avoid cloning.
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), expect(dead_code))]
     pub fn ensure(
         &mut self,
         cells: &[HistoryCell],

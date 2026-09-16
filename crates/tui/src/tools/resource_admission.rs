@@ -179,7 +179,8 @@ async fn acquire_heavy_command_permit_at(
     cancel: Option<&CancellationToken>,
     probe: &dyn MemoryProbe,
 ) -> Result<HeavyCommandPermit> {
-    std::fs::create_dir_all(root)
+    tokio::fs::create_dir_all(root)
+        .await
         .with_context(|| format!("creating resource admission directory {}", root.display()))?;
     let started = Instant::now();
 

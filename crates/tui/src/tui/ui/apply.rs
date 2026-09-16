@@ -1310,26 +1310,55 @@ pub(crate) async fn apply_command_result(
                 return Ok(true);
             }
             AppAction::LoadSession(path) => {
-                let session: SavedSession = match std::fs::read_to_string(&path)
+                // Session files can be large; this is the UI action path, so
+                // the read must not park a Tokio worker (blocking-call
+                // convention, #6149).
+                let parsed: SavedSession = match tokio::fs::read_to_string(&path)
+                    .await
                     .map_err(|err| err.to_string())
                     .and_then(|raw| serde_json::from_str(&raw).map_err(|err| err.to_string()))
                 {
                     Ok(session) => session,
                     Err(err) => {
-                        app.status_message = Some(format!(
-                            "Failed to load session from {}: {err}",
-                            path.display()
-                        ));
+                        crate::tui::ui::session_state::surface_session_load_failure(
+                            app,
+                            format!("Failed to load session from {}: {err}", path.display()),
+                        );
                         return Ok(false);
+                    }
+                };
+                // A managed record resumes through the manager so its repair is
+                // hydrated, applied, and persisted in place. A foreign `/load`
+                // file is not ours to rewrite: hydrate its journal projection
+                // and repair in memory only.
+                let session = match SessionManager::default_location() {
+                    Ok(manager) if manager.owns_session_path(&parsed.metadata.id, &path) => {
+                        match manager.resume_session(&parsed.metadata.id) {
+                            Ok(recovery) => recovery.session,
+                            Err(err) => {
+                                crate::tui::ui::session_state::surface_session_load_failure(
+                                    app,
+                                    format!("Failed to resume session {}: {err}", path.display()),
+                                );
+                                return Ok(false);
+                            }
+                        }
+                    }
+                    _ => {
+                        let mut session = parsed;
+                        session.ensure_journal();
+                        crate::session_manager::repair_recovered_session(&mut session);
+                        session
                     }
                 };
                 let fresh_config =
                     match Config::load(app.config_path.clone(), app.config_profile.as_deref()) {
                         Ok(config) => config,
                         Err(err) => {
-                            app.status_message = Some(format!(
-                                "Failed to load live config for session restore: {err}"
-                            ));
+                            crate::tui::ui::session_state::surface_session_load_failure(
+                                app,
+                                format!("Failed to load live config for session restore: {err}"),
+                            );
                             return Ok(false);
                         }
                     };
@@ -1342,7 +1371,10 @@ pub(crate) async fn apply_command_result(
                 ) {
                     Ok(outcome) => outcome,
                     Err(err) => {
-                        app.status_message = Some(format!("Failed to restore session: {err}"));
+                        crate::tui::ui::session_state::surface_session_load_failure(
+                            app,
+                            format!("Failed to restore session: {err}"),
+                        );
                         return Ok(false);
                     }
                 };
@@ -1659,24 +1691,22 @@ pub(crate) async fn apply_command_result(
                 let inputs =
                     build_preview_request_inputs(app, config, engine_handle, hypothetical_prompt)
                         .await;
-                if let Err(err) = engine_handle
-                    .send(Op::PreviewOutboundRequest {
-                        inputs: Box::new(inputs),
-                        json,
-                        base_prompt_only,
-                    })
-                    .await
-                {
+                // #6150: the input path never awaits a full op channel; a
+                // rejected preview is reported and retryable.
+                if let Err(err) = engine_handle.try_send(Op::PreviewOutboundRequest {
+                    inputs: Box::new(inputs),
+                    json,
+                    base_prompt_only,
+                }) {
                     app.status_message = Some(format!("Cannot preview request: {err}"));
                 }
             }
             AppAction::CancelSubAgent { agent_id } => {
                 app.status_message = Some(format!("Cancelling {agent_id}..."));
                 if engine_handle
-                    .send(Op::CancelSubAgent {
+                    .try_send(Op::CancelSubAgent {
                         agent_id: agent_id.clone(),
                     })
-                    .await
                     .is_err()
                 {
                     app.status_message = Some(format!("Could not cancel {agent_id}"));
@@ -1913,9 +1943,14 @@ pub(crate) async fn apply_command_result(
                 }
             }
             AppAction::UpdateStreamChunkTimeout(timeout_secs) => {
-                let _ = engine_handle
-                    .send(Op::SetStreamChunkTimeout { timeout_secs })
-                    .await;
+                // #6150: the input path never awaits a full op channel.
+                if engine_handle
+                    .try_send(Op::SetStreamChunkTimeout { timeout_secs })
+                    .is_err()
+                {
+                    app.status_message =
+                        Some("Engine busy — setting not applied; try again".to_string());
+                }
             }
             AppAction::UpdateSubagentRuntimeConfig {
                 enabled,
@@ -1925,8 +1960,8 @@ pub(crate) async fn apply_command_result(
                 api_timeout_secs,
                 heartbeat_timeout_secs,
             } => {
-                let _ = engine_handle
-                    .send(Op::SetSubagentRuntimeConfig {
+                if engine_handle
+                    .try_send(Op::SetSubagentRuntimeConfig {
                         enabled,
                         max_subagents,
                         launch_concurrency,
@@ -1934,15 +1969,30 @@ pub(crate) async fn apply_command_result(
                         api_timeout_secs,
                         heartbeat_timeout_secs,
                     })
-                    .await;
+                    .is_err()
+                {
+                    app.status_message =
+                        Some("Engine busy — setting not applied; try again".to_string());
+                }
             }
             AppAction::UpdateSearchProvider { provider } => {
-                let effective_provider = config.set_search_provider(provider);
-                let _ = engine_handle
-                    .send(Op::SetSearchProvider {
-                        provider: effective_provider,
-                    })
-                    .await;
+                // Reserve before committing the config change so a full
+                // channel cannot desync the engine from it.
+                match engine_handle.tx_op.clone().try_reserve_owned() {
+                    Ok(permit) => {
+                        let effective_provider = config.set_search_provider(provider);
+                        engine_handle.send_reserved_op(
+                            permit,
+                            Op::SetSearchProvider {
+                                provider: effective_provider,
+                            },
+                        );
+                    }
+                    Err(_) => {
+                        app.status_message =
+                            Some("Engine busy — provider not applied; try again".to_string());
+                    }
+                }
             }
             AppAction::UpdatePromptSuggestion { enabled } => {
                 config.prompt_suggestion = Some(enabled);
@@ -1953,7 +2003,13 @@ pub(crate) async fn apply_command_result(
                 }
             }
             AppAction::SetAdvisorEnabled { enabled } => {
-                let _ = engine_handle.send(Op::SetAdvisorEnabled { enabled }).await;
+                if engine_handle
+                    .try_send(Op::SetAdvisorEnabled { enabled })
+                    .is_err()
+                {
+                    app.status_message =
+                        Some("Engine busy — setting not applied; try again".to_string());
+                }
             }
             AppAction::OpenConfigView => {
                 if app.view_stack.top_kind() != Some(ModalKind::Config) {
@@ -2305,8 +2361,12 @@ pub(crate) async fn apply_command_result(
                 try_queue_manual_compaction(app, config, engine_handle, focus);
             }
             AppAction::PurgeContext => {
-                app.status_message = Some("Agent purging context...".to_string());
-                let _ = engine_handle.send(Op::PurgeContext).await;
+                if engine_handle.try_send(Op::PurgeContext).is_err() {
+                    app.status_message =
+                        Some("Engine busy — purge not sent; try again".to_string());
+                } else {
+                    app.status_message = Some("Agent purging context...".to_string());
+                }
             }
             AppAction::TaskAdd { prompt } => {
                 let owner_session_id = app
@@ -2568,6 +2628,8 @@ fn edit_project_hooks_from_tui(terminal: &mut AppTerminal, app: &mut App, config
         app.use_mouse_capture,
         app.use_bracketed_paste,
         &path,
+        // Open the file, not a position in it: this edits hooks.toml whole.
+        None,
     );
     app.needs_redraw = true;
 
@@ -2798,11 +2860,17 @@ pub(crate) async fn apply_approval_decision(
             }
             app.remote_control
                 .resolve_pending_approval(&event.tool_id, false);
-            if engine_handle
-                .deny_tool_call(event.tool_id.clone())
-                .await
-                .is_ok()
-            {
+            // A bound expiry carries its own outcome (#6101) so the receipt
+            // distinguishes "no answer within the window" from an operator
+            // denial.
+            let denied = if event.timed_out {
+                engine_handle
+                    .deny_tool_call_timed_out(event.tool_id.clone())
+                    .await
+            } else {
+                engine_handle.deny_tool_call(event.tool_id.clone()).await
+            };
+            if denied.is_ok() {
                 app.retire_action_notices(Some(&event.tool_id));
             }
         }

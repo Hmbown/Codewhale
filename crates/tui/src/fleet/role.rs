@@ -390,7 +390,7 @@ pub(crate) const RAW_SHELL_DENYLIST: &[&str] = &[
 /// deliberately *not* what the execution envelope consults for shell
 /// authority — see [`SHELL_AUTHORITY_SENTINEL`] for why those are two
 /// different questions.
-#[allow(dead_code)]
+#[cfg_attr(not(test), expect(dead_code))]
 pub(crate) const RAW_SHELL_SENTINEL: &str = "exec_shell";
 
 /// The built-in verification surface: the workspace's own configured checks.

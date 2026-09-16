@@ -4,6 +4,7 @@
 //! Moved verbatim out of `ui.rs`.
 
 use super::*;
+use crate::core::ops::TurnSpec;
 use codewhale_models::Role;
 
 pub(crate) fn dispatch_hotbar_slot(
@@ -812,7 +813,7 @@ pub(crate) async fn spawned_dispatch_inner(
         scope: prepare.cost_scope,
         batch: Some(initial_routed_usage.clone()),
     };
-    let op = Op::SendMessage {
+    let op = Op::SendMessage(TurnSpec {
         max_output_tokens: None,
         content: prepare.content.clone(),
         images: Vec::new(),
@@ -836,7 +837,7 @@ pub(crate) async fn spawned_dispatch_inner(
         hook_executor: prepare.hook_executor.clone(),
         verbosity: prepare.verbosity.clone(),
         provenance: prepare.provenance,
-    };
+    });
     // Reserve capacity off the render thread, but do not let Engine start
     // until the completion callback has installed the UI's acceptance state.
     // Separate completion/event mailboxes otherwise allow TurnStarted (or
@@ -1213,26 +1214,93 @@ pub(crate) async fn steer_user_message(
     }
     app.last_submitted_prompt = Some(message.display.clone());
 
-    // Flush any streaming thinking/tool content into history before
-    // inserting the steer message, so the steer appears after (below)
-    // the content that chronologically preceded it.
-    app.flush_active_cell();
-
-    // Mirror steer input in local transcript/session state. A message echoed
-    // at queue time already owns a transcript cell; rewrite that cell into the
-    // steer form instead of painting a second bubble.
-    let history_cell = paint_user_turn_cell(app, &message, format!("+ {}", message.display));
-    app.record_context_references(history_cell, message_index, references);
-    app.push_api_message(Message {
-        role: Role::User,
-        content: vec![ContentBlock::Text {
-            text: content.clone(),
-            cache_control: None,
-        }],
-    });
+    // #6190: the steer channel accepting the text is not the turn accepting
+    // it. The engine commits a steer at the next step boundary and discards
+    // one whose turn has already moved on, so painting a settled cell and
+    // pushing `api_messages` here produced two defects at once: the cell sat
+    // above the assistant content the record places before it, and a dropped
+    // steer left a transcript entry the model never saw. Hold it as in-flight
+    // instead — it renders in the "sending into turn" preview until the
+    // engine's own `SessionUpdated` shows it, which is also where it learns
+    // its real message index.
+    app.inflight_steers
+        .push_back(crate::tui::app::InflightSteer {
+            message,
+            content,
+            sent_after_index: message_index,
+            references,
+        });
+    app.needs_redraw = true;
 
     app.status_message = Some("Steering current turn...".to_string());
     Ok(true)
+}
+
+/// Promote every in-flight steer the engine's record now contains.
+///
+/// Called from `apply_engine_session_projection` after the projection lands,
+/// so the transcript cell is appended in the position the record gives it:
+/// below the assistant work that preceded the steer, as the newest entry.
+/// Matching is on the exact text handed to `EngineHandle::steer`, which the
+/// engine stores as the accepted user message's first text block, searched
+/// from the index the steer was sent after so an identical earlier message
+/// cannot claim it.
+pub(crate) fn settle_accepted_steers(app: &mut App) {
+    if app.inflight_steers.is_empty() {
+        return;
+    }
+    let mut claimed: Vec<usize> = Vec::new();
+    let mut unsettled = VecDeque::new();
+    for steer in std::mem::take(&mut app.inflight_steers) {
+        let Some(index) = accepted_steer_index(app, &steer, &claimed) else {
+            unsettled.push_back(steer);
+            continue;
+        };
+        claimed.push(index);
+        // Settle the streaming thinking/tool content that chronologically
+        // preceded the steer before the steer's own cell is appended.
+        app.flush_active_cell();
+        let display = format!("+ {}", steer.message.display);
+        let history_cell = paint_user_turn_cell(app, &steer.message, display);
+        app.record_context_references(history_cell, index, steer.references);
+        app.needs_redraw = true;
+    }
+    app.inflight_steers = unsettled;
+}
+
+fn accepted_steer_index(
+    app: &App,
+    steer: &crate::tui::app::InflightSteer,
+    claimed: &[usize],
+) -> Option<usize> {
+    let start = steer.sent_after_index.min(app.api_messages.len());
+    app.api_messages
+        .iter()
+        .enumerate()
+        .skip(start)
+        .find(|(index, message)| {
+            !claimed.contains(index)
+                && message.role == Role::User
+                && matches!(
+                    message.content.first(),
+                    Some(ContentBlock::Text { text, .. }) if text == &steer.content
+                )
+        })
+        .map(|(index, _)| index)
+}
+
+/// A turn that ended without accepting a steer dropped it. Say so where the
+/// steer was already being shown, instead of leaving it "sending" forever or
+/// — as before #6190 — leaving a transcript cell for input the model never
+/// received.
+pub(crate) fn settle_unaccepted_steers_at_turn_end(app: &mut App) {
+    if app.inflight_steers.is_empty() {
+        return;
+    }
+    for steer in std::mem::take(&mut app.inflight_steers) {
+        app.rejected_steers.push_back(steer.message.display);
+    }
+    app.needs_redraw = true;
 }
 
 pub(crate) fn snapshot_steer_paused_state(app: &App) -> SteerPausedSnapshot {
@@ -1356,18 +1424,24 @@ pub(crate) async fn dispatch_composer_message(
             .tr(codewhale_localization::MessageId::AgentFocusFollowUpQueued)
             .replace("{agent}", &label);
         app.push_history_cell(crate::tui::history::HistoryCell::System { content: receipt });
-        if engine_handle
-            .send(crate::core::ops::Op::FollowUpSubAgent {
-                agent_id: agent_id.clone(),
-                text,
-            })
-            .await
-            .is_err()
-        {
+        // #6150: the input path never awaits a full op channel. The follow-up
+        // is retryable; a rejected send surfaces immediately.
+        if let Err(err) = engine_handle.try_send(crate::core::ops::Op::FollowUpSubAgent {
+            agent_id: agent_id.clone(),
+            text,
+        }) {
+            let reason = if err
+                .downcast_ref::<tokio::sync::mpsc::error::TrySendError<crate::core::ops::Op>>()
+                .is_some_and(|e| matches!(e, tokio::sync::mpsc::error::TrySendError::Full(_)))
+            {
+                "engine busy"
+            } else {
+                "engine unavailable"
+            };
             let failed = app
                 .tr(codewhale_localization::MessageId::AgentFocusFollowUpFailed)
                 .replace("{agent}", &label)
-                .replace("{reason}", "engine unavailable");
+                .replace("{reason}", reason);
             app.status_message = Some(failed.clone());
             app.push_status_toast(failed, StatusToastLevel::Warning, Some(5_000));
         }

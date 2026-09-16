@@ -52,9 +52,9 @@ pub enum RetryState {
     /// pass can age it out automatically; today the engine clears it on
     /// `TurnStarted`.
     Failed {
-        #[allow(dead_code)]
+        #[cfg_attr(not(test), expect(dead_code))]
         reason: String,
-        #[allow(dead_code)]
+        #[expect(dead_code)]
         since: Instant,
     },
 }

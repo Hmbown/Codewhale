@@ -2059,11 +2059,11 @@ impl HookExecutor {
         if !pattern.contains('*') {
             return tool_name == pattern;
         }
-        // Escape regex metacharacters except `*`, which becomes `.*`.
-        let escaped = regex::escape(pattern);
-        let regex_pattern = escaped.replace(r"\*", ".*");
-        let anchored = format!("^{regex_pattern}$");
-        regex::Regex::new(&anchored).is_ok_and(|re| re.is_match(tool_name))
+        // #6208: the pattern is fixed by configuration while this runs once per
+        // hook per tool-call/stop event, so compile it once and reuse it rather
+        // than building a fresh `Regex` on every event.
+        codewhale_execpolicy::matcher::compiled_glob(pattern)
+            .is_some_and(|re| re.is_match(tool_name))
     }
 
     /// Check if a hook's condition matches the context

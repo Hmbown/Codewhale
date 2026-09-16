@@ -12,13 +12,13 @@ workspace = true
 
 [dependencies]
 anyhow.workspace = true
-base64 = "0.22.1"
+base64 = "0.23.1"
 chrono.workspace = true
 ring = "0.17.14"
 semver.workspace = true
-codewhale-execpolicy = { path = "../execpolicy", version = "0.9.13" }
-codewhale-paths = { path = "../paths", version = "0.9.13" }
-codewhale-secrets = { path = "../secrets", version = "0.9.13" }
+codewhale-execpolicy = { path = "../execpolicy", version = "0.9.14" }
+codewhale-paths = { path = "../paths", version = "0.9.14" }
+codewhale-secrets = { path = "../secrets", version = "0.9.14" }
 fd-lock = "4.0.4"
 libc = "0.2"
 serde.workspace = true

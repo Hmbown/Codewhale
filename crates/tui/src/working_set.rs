@@ -537,7 +537,7 @@ impl Workspace {
             entries.push(candidate);
         }
 
-        entries.sort_by_key(|entry| entry.to_lowercase());
+        entries.sort_by_cached_key(|entry| entry.to_lowercase());
         entries
     }
 }

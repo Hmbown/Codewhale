@@ -19,6 +19,13 @@ jobs:
         working-directory: web
     steps:
       - uses: actions/checkout@v7
+        with:
+          # `check:facts` derives each model's `addedAt` from the commit date on
+          # which its id first appeared in the model declaration paths
+          # (web/scripts/facts-lib.mjs). A shallow checkout cannot see that
+          # history, so every date collapses to the tip commit and the committed
+          # facts always read as stale. ci.yml pins depth 0 for the same reason.
+          fetch-depth: 0
       - uses: actions/setup-node@v7
         with:
           node-version: 22

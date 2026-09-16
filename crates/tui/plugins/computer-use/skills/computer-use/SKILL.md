@@ -57,10 +57,12 @@ Observe once, act once, then verify.
    labels or values mean unknown content, not something to guess. `get_value`
    reads one field live.
 4. If the tree contains the target, act on the element: `focus` then `type`
-   or `key` for composers, `set_value` for ordinary fields, `perform_action`
-   (AXPress/Invoke/click…) for advertised actions, element click. Newlines in
-   `type` are Return/Enter; `press_enter:true` sends after the text. Never
-   expect `\\n` to send a chat message. `run_actions` batches up to 8 steps
+   or `key` for composers (or pass the element `target` straight to
+   `type`/`key` — it focuses first, in the same call), `set_value` for
+   ordinary fields, `perform_action` (AXPress/Invoke/click…) for advertised
+   actions, element click. Newlines in `type` are Return/Enter;
+   `press_enter:true` sends after the text. Never expect `\\n` to send a
+   chat message. `run_actions` batches up to 8 steps
    (click → type → key return → get_value).
    macOS provides background element actions; Linux AT-SPI support depends
    on the control. Windows currently refuses scoped semantic mutations.
@@ -84,6 +86,14 @@ Observe once, act once, then verify.
    If the host reports an omitted or oversized image, capture a smaller app
    window/region or zoom, then use that returned raster. Do not guess from a
    file path or reuse coordinates from an image the model never received.
+5b. When the UI needs time — a page loading, a dialog appearing or
+   dismissing, a spinner finishing — call `wait_for` instead of looping
+   `get_app_state` + `wait` by hand: it polls the accessibility tree until
+   a `query`/`role` match appears (`state:"present"`) or disappears
+   (`state:"absent"`), then returns the matched elements bound to a fresh
+   `state_id` you can target immediately. A `timed_out:true` receipt means
+   the condition never held — observe and reconsider rather than repeating
+   the same wait.
 6. Verify with a fresh observation or a task oracle before claiming success.
    `action_sent: true` means it may already have happened — never replay.
    On macOS `type` also reports `verified`: `false` (with

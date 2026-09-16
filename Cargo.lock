@@ -767,7 +767,7 @@ dependencies = [
 
 [[package]]
 name = "codewhale-agent"
-version = "0.9.13"
+version = "0.9.14"
 dependencies = [
  "codewhale-config",
  "serde",
@@ -775,7 +775,7 @@ dependencies = [
 
 [[package]]
 name = "codewhale-app-server"
-version = "0.9.13"
+version = "0.9.14"
 dependencies = [
  "anyhow",
  "axum",
@@ -805,14 +805,14 @@ dependencies = [
 
 [[package]]
 name = "codewhale-build-support"
-version = "0.9.13"
+version = "0.9.14"
 dependencies = [
  "tempfile",
 ]
 
 [[package]]
 name = "codewhale-cli"
-version = "0.9.13"
+version = "0.9.14"
 dependencies = [
  "anyhow",
  "chrono",
@@ -854,7 +854,7 @@ dependencies = [
 
 [[package]]
 name = "codewhale-cloud-facts"
-version = "0.9.13"
+version = "0.9.14"
 dependencies = [
  "codewhale-config",
  "codewhale-release",
@@ -871,17 +871,18 @@ dependencies = [
 
 [[package]]
 name = "codewhale-command-contract"
-version = "0.9.13"
+version = "0.9.14"
 dependencies = [
  "codewhale-core",
+ "serde_json",
 ]
 
 [[package]]
 name = "codewhale-config"
-version = "0.9.13"
+version = "0.9.14"
 dependencies = [
  "anyhow",
- "base64 0.22.1",
+ "base64 0.23.1",
  "chrono",
  "codewhale-execpolicy",
  "codewhale-paths",
@@ -902,7 +903,7 @@ dependencies = [
 
 [[package]]
 name = "codewhale-core"
-version = "0.9.13"
+version = "0.9.14"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -927,17 +928,19 @@ dependencies = [
 
 [[package]]
 name = "codewhale-execpolicy"
-version = "0.9.13"
+version = "0.9.14"
 dependencies = [
  "anyhow",
  "codewhale-protocol",
+ "regex",
  "serde",
- "shlex 1.3.0",
+ "shlex 2.0.1",
+ "toml 1.1.4+spec-1.1.0",
 ]
 
 [[package]]
 name = "codewhale-hooks"
-version = "0.9.13"
+version = "0.9.14"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -955,7 +958,7 @@ dependencies = [
 
 [[package]]
 name = "codewhale-lane"
-version = "0.9.13"
+version = "0.9.14"
 dependencies = [
  "anyhow",
  "chrono",
@@ -970,7 +973,7 @@ dependencies = [
 
 [[package]]
 name = "codewhale-localization"
-version = "0.9.13"
+version = "0.9.14"
 dependencies = [
  "codewhale-build-support",
  "ratatui",
@@ -983,7 +986,7 @@ dependencies = [
 
 [[package]]
 name = "codewhale-mcp"
-version = "0.9.13"
+version = "0.9.14"
 dependencies = [
  "anyhow",
  "libc",
@@ -994,8 +997,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "codewhale-memory"
+version = "0.9.14"
+dependencies = [
+ "clap",
+ "regex",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
+ "thiserror 2.0.20",
+ "uuid",
+]
+
+[[package]]
 name = "codewhale-models"
-version = "0.9.13"
+version = "0.9.14"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1007,7 +1025,7 @@ dependencies = [
 
 [[package]]
 name = "codewhale-palette"
-version = "0.9.13"
+version = "0.9.14"
 dependencies = [
  "codewhale-config",
  "libc",
@@ -1019,14 +1037,14 @@ dependencies = [
 
 [[package]]
 name = "codewhale-paths"
-version = "0.9.13"
+version = "0.9.14"
 dependencies = [
  "dirs 7.0.0",
 ]
 
 [[package]]
 name = "codewhale-protocol"
-version = "0.9.13"
+version = "0.9.14"
 dependencies = [
  "chrono",
  "serde",
@@ -1036,7 +1054,7 @@ dependencies = [
 
 [[package]]
 name = "codewhale-release"
-version = "0.9.13"
+version = "0.9.14"
 dependencies = [
  "anyhow",
  "reqwest 0.13.4",
@@ -1050,22 +1068,24 @@ dependencies = [
 
 [[package]]
 name = "codewhale-secrets"
-version = "0.9.13"
+version = "0.9.14"
 dependencies = [
  "chrono",
  "codewhale-paths",
  "keyring",
+ "regex",
  "serde",
  "serde_json",
  "sha2 0.11.0",
  "tempfile",
  "thiserror 2.0.20",
  "tracing",
+ "url",
 ]
 
 [[package]]
 name = "codewhale-state"
-version = "0.9.13"
+version = "0.9.14"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1080,7 +1100,7 @@ dependencies = [
 
 [[package]]
 name = "codewhale-telemetry"
-version = "0.9.13"
+version = "0.9.14"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1100,7 +1120,7 @@ dependencies = [
 
 [[package]]
 name = "codewhale-tools"
-version = "0.9.13"
+version = "0.9.14"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1114,7 +1134,7 @@ dependencies = [
 
 [[package]]
 name = "codewhale-tui"
-version = "0.9.13"
+version = "0.9.14"
 dependencies = [
  "ahash",
  "ansi-to-tui",
@@ -1136,6 +1156,7 @@ dependencies = [
  "codewhale-hooks",
  "codewhale-lane",
  "codewhale-localization",
+ "codewhale-memory",
  "codewhale-models",
  "codewhale-palette",
  "codewhale-paths",
@@ -1171,6 +1192,7 @@ dependencies = [
  "parking_lot",
  "portable-pty",
  "pretty_assertions",
+ "proc-macro2",
  "qrcode",
  "ratatui",
  "regex",
@@ -1188,8 +1210,9 @@ dependencies = [
  "sha2 0.11.0",
  "shell-words",
  "shellexpand",
- "shlex 1.3.0",
+ "shlex 2.0.1",
  "similar",
+ "syn 3.0.3",
  "syntect",
  "tar",
  "tempfile",
@@ -1217,7 +1240,7 @@ dependencies = [
 
 [[package]]
 name = "codewhale-workflow"
-version = "0.9.13"
+version = "0.9.14"
 dependencies = [
  "serde",
  "serde_json",
@@ -1229,7 +1252,7 @@ dependencies = [
 
 [[package]]
 name = "codewhale-workflow-js"
-version = "0.9.13"
+version = "0.9.14"
 dependencies = [
  "async-trait",
  "jsonschema",
@@ -4772,9 +4795,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.43"
+version = "0.23.45"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0283386ce02abc0151e1761d08802dfe86c173b0b494af5cbc086574e453da06"
+checksum = "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634"
 dependencies = [
  "once_cell",
  "ring",
@@ -4835,9 +4858,9 @@ checksum = "f87165f0995f63a9fbeea62b64d10b4d9d8e78ec6d7d51fb2125fda7bb36788f"
 
 [[package]]
 name = "rustls-webpki"
-version = "0.103.13"
+version = "0.103.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "61c429a8649f110dddef65e2a5ad240f747e85f7758a6bccc7e5777bd33f756e"
+checksum = "f3c3cf1d8b1e7d4927e2d154c3fcb02979afb9939629c62cd9048d4f07b60ac2"
 dependencies = [
  "ring",
  "rustls-pki-types",
@@ -5560,7 +5583,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",

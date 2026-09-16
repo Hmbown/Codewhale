@@ -409,7 +409,7 @@ fn paint_sep(buf: &mut Buffer, ledger: &TidelinePodLedger<'_>, theme: &UiTheme, 
 
 /// Row hitboxes → inspector (spec §6): one rect per visible row.
 #[must_use]
-#[allow(dead_code)] // translation scaffolding: wired by the landing slice
+#[cfg(test)] // translation scaffolding: wired by the landing slice
 pub fn tideline_ledger_hitboxes(area: Rect, ledger: &TidelinePodLedger<'_>) -> Vec<Rect> {
     let mut out = Vec::new();
     if area.width < 30 || area.height < 2 {

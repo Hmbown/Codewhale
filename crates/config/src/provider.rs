@@ -1432,8 +1432,9 @@ impl Provider for OpencodeZen {
 /// scope. The account's authenticated `GET {base}/models` is the catalog
 /// authority: each row is `provider/model` and carries the protocol
 /// (`chat-completions` → `{base}/chat/completions`, `anthropic-messages` →
-/// `{base}/messages`). Both protocols authenticate with `Authorization:
-/// Bearer`; the Anthropic passthrough deliberately does not take `x-api-key`.
+/// `{base}/messages`, `responses` → `{base}/responses`). Every protocol
+/// authenticates with `Authorization: Bearer`; the Anthropic passthrough
+/// deliberately does not take `x-api-key`.
 pub struct Codewhale;
 
 impl Provider for Codewhale {

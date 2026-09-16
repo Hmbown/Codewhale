@@ -31,7 +31,7 @@ pub(crate) struct ModeSessionPrefs {
 /// The permission policy a given [`AppMode`] resolves to (#3386).
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct EffectiveModePolicy {
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), expect(dead_code))]
     pub(crate) mode: AppMode,
     pub(crate) allow_shell: bool,
     pub(crate) trust_mode: bool,

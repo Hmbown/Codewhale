@@ -56,9 +56,11 @@ base prompt". Two more corollaries earned here:
   lane is obsolete, preserve its intent and evidence rather than merging stale
   code mechanically.
 - A small coherent change may be committed directly to `main` when that checkout
-  is current, clean, and owns the affected files. A worktree remains the right
-  safety boundary for conflicting, dirty, stale, or independent work. Local
-  commit permission never implies push, merge, tag, release, or deploy permission.
+  is current, clean, and owns the affected files. Do not create worktrees: work
+  in the checkout that already exists, and when several agents share it,
+  partition by file, stage only the paths your slice touched, and retry a commit
+  that fails on `index.lock`. Local commit permission never implies push, merge,
+  tag, release, or deploy permission.
 - When the task is local-only, stay fully offline: no browsing, GitHub or remote
   Git operations, downloads, dependency installation, provider calls, or
   source/diff transmission. Record the missing external receipt and keep working
@@ -69,6 +71,16 @@ base prompt". Two more corollaries earned here:
 - Keep providers and models first-class and provider-neutral.
 - Never rewrite published history, retag a release, force-push a shared ref, or
   publish without explicit authorization. Preserve human contributor credit.
+- **Model-visible means logged.** Anything that reaches a model request must be
+  reconstructable from the session log, and a new model-visible input needs a
+  session event. Live presentation and the persisted record must agree; when they
+  disagree the record is right.
+- **Misconfiguration fails loud**, at load when it is self-contained, otherwise
+  at the earliest point it can be resolved. Never silently skip a missing
+  referent.
+- **Write down what a design does not do**, beside the behaviour it owns — a
+  short known-limitations note in the owning module. A stated limit stops the
+  next reader from assuming a capability that was never built.
 
 ## Landing other people's work
 
@@ -120,6 +132,10 @@ because they did anything wrong. Treat their time as more expensive than ours.
 - Audit any harness before trusting its score. `ok = ok and X or True` parses
   as `(ok and X) or True` and silently reported twelve unevaluated rows as
   passing.
+- Match the evidence to the surface. Run the tests that cover the change, not the
+  whole suite, and do not repeat a check that already passed in order to commit.
+  CI owns exhaustive coverage; a full local run is for CI diagnosis or for an
+  irreducibly repository-wide change.
 
 ## Current contracts
 
@@ -143,6 +159,18 @@ because they did anything wrong. Treat their time as more expensive than ours.
   `config/src/route/`. Native memory lives in `tui/src/native_memory.rs`;
   `tools/remember.rs` is its capture path.
 - Environment-specific behavior belongs in `docs/ENVIRONMENTS.md`, not here.
+- Blocking-call convention (#6149): code on the Tokio runtime — tool
+  handlers, engine tasks, the UI event loop, anything reached through an
+  `async` call chain — must not run blocking operations inline.
+  `std::fs`/`std::process` calls inside `async` code use `tokio::fs`/
+  `tokio::process`, or move the synchronous work into
+  `tokio::task::spawn_blocking` (`utils::spawn_blocking_supervised` for
+  fire-and-forget). `thread::sleep` is for dedicated `std::thread`s and
+  bounded contention retries in synchronous APIs that are only reachable
+  from blocking scopes — an async-path wait uses `tokio::time`. A sync
+  helper containing blocking calls must only be called under
+  `spawn_blocking` or from a dedicated thread; `scripts/
+  check-blocking-calls-budget.py` ratchets the unprotected-site count.
 
 ## Code, migrations, and evidence
 

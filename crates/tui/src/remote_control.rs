@@ -3184,7 +3184,7 @@ async fn relay_worker(
     phase: &mut RelayPhase,
 ) -> Result<(), String> {
     let base = runner_control_plane_base()?;
-    let client = Client::builder()
+    let client = crate::tls::reqwest_client_builder()
         .https_only(!cfg!(debug_assertions))
         .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(20))
@@ -5757,7 +5757,6 @@ mod tests {
         if !cfg!(debug_assertions) {
             return;
         }
-        crate::tls::ensure_rustls_crypto_provider();
         let _env = crate::test_support::lock_test_env();
         let secrets_root = tempfile::tempdir().expect("isolated remote-control secrets");
         let _codewhale_home =
@@ -5991,7 +5990,6 @@ mod tests {
 
     #[tokio::test]
     async fn connect_request_opts_into_runtime_chat_without_exposing_local_state() {
-        crate::tls::ensure_rustls_crypto_provider();
         let server = MockServer::start().await;
         let enrollment = fixture_enrollment(&format!("{}/", server.uri()));
         let start = fixture_start();
@@ -6026,7 +6024,7 @@ mod tests {
             .expect(1)
             .mount(&server)
             .await;
-        let client = Client::builder()
+        let client = crate::tls::reqwest_client_builder()
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .expect("fixture client");
@@ -6731,7 +6729,6 @@ mod tests {
 
     #[tokio::test]
     async fn ambiguous_success_retries_the_identical_runtime_event_until_cursor_acceptance() {
-        crate::tls::ensure_rustls_crypto_provider();
         let server = MockServer::start().await;
         let responder = AmbiguousRuntimeResponder::default();
         Mock::given(method("POST"))
@@ -6743,7 +6740,7 @@ mod tests {
             .mount(&server)
             .await;
         let enrollment = fixture_enrollment(&format!("{}/", server.uri()));
-        let client = Client::builder()
+        let client = crate::tls::reqwest_client_builder()
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .expect("fixture client");
@@ -7441,7 +7438,6 @@ mod tests {
 
     #[tokio::test]
     async fn enrollment_rejection_carries_a_sanitized_actionable_reason() {
-        crate::tls::ensure_rustls_crypto_provider();
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/oauth/device"))
@@ -7451,7 +7447,7 @@ mod tests {
             })))
             .mount(&server)
             .await;
-        let client = Client::builder()
+        let client = crate::tls::reqwest_client_builder()
             .https_only(false)
             .redirect(reqwest::redirect::Policy::none())
             .timeout(Duration::from_secs(5))
@@ -7582,7 +7578,6 @@ mod tests {
 
     #[tokio::test]
     async fn cwc_runner_wire_contract_preserves_pending_and_recovery_commands() {
-        crate::tls::ensure_rustls_crypto_provider();
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/api/local-runners/runner-1/runs/run-1/commands"))
@@ -7648,7 +7643,7 @@ mod tests {
             },
             access_token: "fixture-runner-access-token".to_string(),
         };
-        let client = Client::builder()
+        let client = crate::tls::reqwest_client_builder()
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .expect("fixture client");
@@ -7840,7 +7835,6 @@ mod tests {
 
     #[tokio::test]
     async fn stop_drain_flushes_runtime_outbox_with_byte_identical_retries() {
-        crate::tls::ensure_rustls_crypto_provider();
         let server = MockServer::start().await;
         let responder = AmbiguousRuntimeResponder::default();
         Mock::given(method("POST"))
@@ -7853,7 +7847,7 @@ mod tests {
             .await;
         let mut enrollment = fixture_enrollment(&format!("{}/", server.uri()));
         let mut runner_id = "runner_fixture".to_string();
-        let client = Client::builder()
+        let client = crate::tls::reqwest_client_builder()
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .expect("fixture client");
@@ -7900,7 +7894,6 @@ mod tests {
 
     #[tokio::test]
     async fn stop_drain_deadline_failure_refuses_to_confirm_stop() {
-        crate::tls::ensure_rustls_crypto_provider();
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path(
@@ -7911,7 +7904,7 @@ mod tests {
             .await;
         let mut enrollment = fixture_enrollment(&format!("{}/", server.uri()));
         let mut runner_id = "runner_fixture".to_string();
-        let client = Client::builder()
+        let client = crate::tls::reqwest_client_builder()
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .expect("fixture client");

@@ -35,6 +35,19 @@ jobs:
       - run: npm --prefix pet run sync
       - name: Embedded sources match canonical core
         run: git diff --exit-code -- crates/tui/src/tui/pet_watch/pet-native.js pet/ios/Resources
+      # The authored body is checked in five times and nothing kept the copies
+      # in step, so the Rust core silently carried a different whale from every
+      # other surface and conformance never passed. Compare them directly: no
+      # sync step produces these, so `git diff` cannot catch the drift.
+      - name: One whale body across every surface
+        run: |
+          canonical=crates/tui/src/tui/ambient_life/whale-points.tsv
+          for copy in pet/whale-points.tsv pet/public/whale-points.tsv pet/rs/whale-points.tsv; do
+            diff -q "$canonical" "$copy" || {
+              echo "::error file=$copy::diverged from $canonical; the Rust core is canonical"
+              exit 1
+            }
+          done
       - run: cargo fetch --locked --manifest-path pet/tui/Cargo.toml
       - name: TypeScript and Rust parity, including reduced motion
         run: ./pet/verify.sh --no-swift

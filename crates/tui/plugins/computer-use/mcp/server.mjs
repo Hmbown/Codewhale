@@ -5,7 +5,7 @@
 // computer id switches the sticky active computer.
 import fs from "node:fs";
 import * as registry from "../src/registry.mjs";
-import { backendFor, installRemoteAgent, executorFor, closeAppSession, routeFingerprint } from "../src/transport.mjs";
+import { backendFor, installRemoteAgent, executorFor, closeAppSession, routeFingerprint, closeSshChannel } from "../src/transport.mjs";
 import { TOOLS, TOOL_NAMES, READ_ONLY_TOOLS, REMOTE_TOOLS, BACKEND_METHOD } from "../src/tools.mjs";
 import { tryJson, withSignal, throwIfAborted, wait } from "../src/exec.mjs";
 import { APP_VERSION } from "../src/app-socket.mjs";
@@ -32,7 +32,7 @@ const backendCache = new Map();
 const ROUTE_INSPECTION_TOOLS = new Set([
   "request_access", "list_displays", "list_apps", "list_windows", "get_app_state", "screenshot",
   "cursor_position", "read_clipboard", "recording_list", "recording_status",
-  "find_elements", "get_value",
+  "find_elements", "get_value", "wait_for",
 ]);
 const STATE_CHAR_BUDGET = Number(process.env.CODEWHALE_CU_MAX_STATE_CHARS) > 0
   ? Number(process.env.CODEWHALE_CU_MAX_STATE_CHARS)
@@ -73,6 +73,7 @@ async function retireBinding(id) {
   const binding = backendCache.get(id);
   invalidateObservations(id);
   if (!binding) return;
+  closeSshChannel(binding);
   // Mark unusable before awaiting cleanup. A failure, or a catalog rollback,
   // must never resurrect this backend or its observations.
   binding.retired = true;
@@ -326,7 +327,10 @@ function observeState(computer, app_ref, result, args = {}) {
   // Cache the complete backend records before making the model-facing view.
   // Public indices still address those records, including their private AX
   // paths; a compact response must never weaken live target revalidation.
-  const state_id = rememberState(computer, app_ref, result);
+  // Ephemeral polls (wait_for) share the filter math without churning the
+  // state cache: only the observation a caller can act on earns a state_id.
+  const ephemeral = args.ephemeral === true;
+  const state_id = ephemeral ? null : rememberState(computer, app_ref, result);
   const compact = args.detail === "compact" || args.compact === true;
   const detail = args.detail === "full" ? "full" : compact ? "compact" : "summary";
   const filtered = filterElements(result.elements, {
@@ -346,10 +350,75 @@ function observeState(computer, app_ref, result, args = {}) {
     offset: filtered.offset,
     returned: filtered.returned,
     truncated: filtered.truncated,
-    note: "Target observed elements with {type:'element', state_id, index}. Indices address the cached tree, including rows omitted from this page. Filter with query/role/limit/offset instead of requesting a larger dump. Missing labels or values are unknown; do not guess.",
+    note: ephemeral
+      ? "Ephemeral poll: elements are not bound to a state_id."
+      : "Target observed elements with {type:'element', state_id, index}. Indices address the cached tree, including rows omitted from this page. Filter with query/role/limit/offset instead of requesting a larger dump. Missing labels or values are unknown; do not guess.",
   };
   if (compact && data.ocr && args.include_ocr !== true) delete data.ocr;
   return fitStatePayload(data, STATE_CHAR_BUDGET);
+}
+
+/**
+ * Poll get_app_state until the query/role predicate holds or the deadline
+ * passes. Intermediate polls are ephemeral — they share the filter math but
+ * never churn the state cache; the observation that satisfies the predicate
+ * is read once more, bound, and its state_id is what the caller targets.
+ * Errors that can resolve themselves (app not launched yet) count as "no
+ * match yet"; errors that cannot (stopped, route changed) abort the wait.
+ */
+async function waitFor(computer, args, switched) {
+  const { query, role } = args;
+  if (query == null && role == null) throw new ServerError("bad_args", "wait_for needs a query and/or role to watch for");
+  if (query != null && typeof query !== "string") throw new ServerError("bad_args", "query must be a string");
+  if (role != null && typeof role !== "string") throw new ServerError("bad_args", "role must be a string");
+  const state = args.state ?? "present";
+  if (state !== "present" && state !== "absent") throw new ServerError("bad_args", 'state must be "present" or "absent"');
+  const timeoutSec = Number(args.timeout ?? 10);
+  if (!Number.isFinite(timeoutSec) || timeoutSec < 0.5 || timeoutSec > 60) throw new ServerError("bad_args", "timeout must be 0.5..60 seconds");
+  const intervalMs = Number(args.interval ?? 400);
+  if (!Number.isInteger(intervalMs) || intervalMs < 100 || intervalMs > 5000) throw new ServerError("bad_args", "interval must be an integer 100..5000 ms");
+  const limit = args.limit ?? 20;
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) throw new ServerError("bad_args", "limit must be an integer 1..100");
+
+  const FATAL = new Set(["cancelled", "control_stopped", "computer_route_changed", "app_upgrade_required"]);
+  const observe = (ephemeral) => callTool({ name: "get_app_state", arguments: {
+    app_ref: args.app_ref, window_id: args.window_id, query, role,
+    limit, detail: "compact", ephemeral, computer: computer.id,
+  }});
+  const started = Date.now();
+  const deadline = started + timeoutSec * 1000;
+  let polls = 0, lastError = null, everObserved = false;
+  while (true) {
+    const res = await observe(true);
+    polls++;
+    const body = JSON.parse(res.content[0].text);
+    let usable = false, matchedCount = 0;
+    if (!res.isError && body.ok !== false) { usable = true; matchedCount = body.matched ?? 0; }
+    else if (FATAL.has(body?.error?.code)) {
+      return { content: [{ type: "text", text: JSON.stringify(fail(computer, body.error.code, body.error.message, { tool: "wait_for", switched, polls })) }], isError: true };
+    } else if (body?.found === false || /application not found/.test(body?.error?.message ?? "")) {
+      usable = true; // not running yet, or gone: zero matches either way
+    } else {
+      lastError = body?.error ?? { code: "observe_failed", message: "observation failed" };
+    }
+    if (usable) { everObserved = true; lastError = null; }
+    if (usable && (state === "absent" ? matchedCount === 0 : matchedCount > 0)) {
+      const bound = await observe(false);
+      polls++;
+      const b = JSON.parse(bound.content[0].text);
+      if (bound.isError || b.ok === false) {
+        return { content: [{ type: "text", text: JSON.stringify(receipt(computer, { ok: true, tool: "wait_for", switched, matched: true, state, polls, elapsed_ms: Date.now() - started, note: "Condition held but the follow-up observation failed — call get_app_state before targeting." })) }] };
+      }
+      return { content: [{ type: "text", text: JSON.stringify(receipt(computer, { ok: true, tool: "wait_for", switched, matched: true, state, polls, elapsed_ms: Date.now() - started, state_id: b.state_id, matched_count: b.matched ?? 0, elements: b.elements, app: { name: b.name ?? null, pid: b.pid ?? null, bundle_id: b.bundle_id ?? null }, note: "Elements are bound to state_id — target them with {type:'element', state_id, index}. Re-observe if the UI changes again." })) }] };
+    }
+    if (Date.now() >= deadline) break;
+    await wait(Math.min(intervalMs, Math.max(1, deadline - Date.now())));
+    throwIfAborted();
+  }
+  if (!everObserved && lastError) {
+    return { content: [{ type: "text", text: JSON.stringify(fail(computer, lastError.code ?? "observe_failed", lastError.message ?? "observation failed", { tool: "wait_for", switched, polls, elapsed_ms: Date.now() - started })) }], isError: true };
+  }
+  return { content: [{ type: "text", text: JSON.stringify(receipt(computer, { ok: true, tool: "wait_for", switched, matched: false, timed_out: true, state, polls, elapsed_ms: Date.now() - started, ...(lastError ? { last_error: lastError } : {}), note: state === "absent" ? "Matches remained until the deadline." : "No match appeared before the deadline. Observe the app or widen the query." })) }] };
 }
 
 // ---------- tool dispatch ----------
@@ -358,7 +427,7 @@ async function callTool(params) {
   if (!TOOL_NAMES.has(name)) {
     return { content: [{ type: "text", text: JSON.stringify({ ok: false, error: { code: "unknown_tool", message: `unknown tool "${name}"` } }) }], isError: true };
   }
-  const args = params.arguments ?? {};
+  let args = params.arguments ?? {};
 
   if (name === "stop_computer_control") {
     controlStopped = true;
@@ -488,11 +557,29 @@ async function callTool(params) {
       }
       return callTool({ name: "get_app_state", arguments: { ...args, detail: "compact", limit: args.limit ?? 20, computer: computer.id } });
     }
+    if (name === "wait_for") {
+      return waitFor(computer, args, switched);
+    }
+    // type/key with an element target run the documented focus-then-act idiom
+    // in one call: the element is revalidated and accessibility-focused first,
+    // through the same routed path a separate focus call would take.
+    if ((name === "type" || name === "key") && args.target != null) {
+      if (args.target.type !== "element") {
+        throw new ServerError("bad_target", `${name} accepts element targets only — use left_click for a coordinate, then ${name}`);
+      }
+      const focused = await callTool({ name: "focus", arguments: { target: args.target, computer: computer.id } });
+      const focusBody = JSON.parse(focused.content[0].text);
+      if (focused.isError || focusBody.ok === false) {
+        return { content: [{ type: "text", text: JSON.stringify(fail(computer, focusBody.error?.code ?? "focus_failed", focusBody.error?.message ?? "element could not be focused", { tool: name, stage: "focus" })) }], isError: true };
+      }
+      args = { ...args };
+      delete args.target;
+    }
     // Out-of-process runners (the desktop app for the local computer, the
     // remote agent for ssh computers) get the request over the wire.
     const backendMethod = BACKEND_METHOD[name] === "request_access" ? "probe" : BACKEND_METHOD[name];
     let data;
-    const ex = computer.transport === "local" || computer.transport === "ssh" ? await executorFor(computer) : null;
+    const ex = computer.transport === "local" || computer.transport === "ssh" ? await executorFor(computer, binding) : null;
     if (ex?.kind === "app") binding.usedApp = true;
     // Zoom needs the bound parent raster up front (server-side check too, not
     // only the backend) so it can bind the child raster after success.
@@ -505,8 +592,27 @@ async function callTool(params) {
     const sink = { reacquired: false };
 
     if (typeof ex?.remote === "function" && REMOTE_TOOLS.has(backendMethod)) {
+      // ssh rides the persistent agent channel when the remote supports
+      // --serve; a channel that never produced a reply means an old agent,
+      // so fall back to one-shot for that binding rather than failing.
+      const remoteCall = async (request, opts = {}) => {
+        if (typeof ex.persistent === "function" && binding.sshServe !== false) {
+          try {
+            return await ex.persistent(request, opts);
+          } catch (err) {
+            const ch = binding.sshChannel;
+            if (err?.code === "remote_session_lost" && ch && !ch.everReplied) {
+              binding.sshServe = false;
+              ex.closeChannel?.();
+              return ex.remote(request, opts);
+            }
+            throw err;
+          }
+        }
+        return ex.remote(request, opts);
+      };
       const resolve = async (req) => {
-        const rep = await ex.remote({ tool: "resolve_element", args: req }, { timeoutMs: 30_000 });
+        const rep = await remoteCall({ tool: "resolve_element", args: req }, { timeoutMs: 30_000 });
         if (!rep?.ok) return { found: false, element: null, reason: rep?.error?.code ?? "remote_error" };
         return rep.data;
       };
@@ -521,7 +627,7 @@ async function callTool(params) {
         dispatched = true;
         const timeoutMs = backendMethod.startsWith("recording") || backendMethod === "get_app_state" ? 60_000 : 30_000;
         const invoke = async (tool, a) => {
-          const r = await ex.remote({ tool, args: a }, { timeoutMs });
+          const r = await remoteCall({ tool, args: a }, { timeoutMs });
           if (!r.ok) throw new ServerError(r.error?.code ?? "remote_error", r.error?.message ?? "remote agent failed");
           return r.data;
         };
@@ -644,6 +750,7 @@ async function callTool(params) {
 async function prepareArgs(computer, name, args, resolve, sink) {
   const out = { ...args };
   delete out.computer;
+  delete out.ephemeral; // server-internal: never reaches a backend
   const semantic = new Set(["set_value", "select_text", "perform_action", "focus", "get_value"]);
   for (const key of ["target", "from_target", "to"]) {
     const given = out[key];

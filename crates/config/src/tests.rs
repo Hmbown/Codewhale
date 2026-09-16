@@ -8252,7 +8252,9 @@ fn workflow_config_defaults_match_product_surface() {
     assert_eq!(defaults.max_children, 1000);
     assert_eq!(defaults.max_concurrent, 16);
     assert_eq!(defaults.max_depth, 5);
-    assert_eq!(defaults.default_token_budget, 120_000);
+    // 0 = no shared cap; budgets are opt-in, matching the parent turn loop's
+    // advisory policy (#6189).
+    assert_eq!(defaults.default_token_budget, 0);
     assert_eq!(defaults.max_parallel_writes_without_worktree, 0);
     assert!(defaults.persist_completed_activity);
     assert!(defaults.persist_completed_across_restarts);

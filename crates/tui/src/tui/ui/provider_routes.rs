@@ -576,16 +576,17 @@ pub(crate) fn reasoning_effort_receipt_for_route(
 }
 
 pub(crate) async fn sync_mode_update(app: &App, engine_handle: &EngineHandle) {
-    let _ = engine_handle
-        .send(Op::ChangeMode {
-            mode: app.mode,
-            allow_shell: app.allow_shell,
-            trust_mode: app.trust_mode,
-            auto_approve: app_auto_approve_enabled(app),
-            approval_mode: app.approval_mode,
-            configured_sandbox_mode: app.configured_sandbox_mode.clone(),
-        })
-        .await;
+    // #6150: non-blocking send on the input path. ChangeMode is safe to drop
+    // on a full channel — `try_send` still publishes the live authority
+    // snapshot, which the drain applies before the next queued op.
+    let _ = engine_handle.try_send(Op::ChangeMode {
+        mode: app.mode,
+        allow_shell: app.allow_shell,
+        trust_mode: app.trust_mode,
+        auto_approve: app_auto_approve_enabled(app),
+        approval_mode: app.approval_mode,
+        configured_sandbox_mode: app.configured_sandbox_mode.clone(),
+    });
 }
 
 /// Apply a `/provider` switch by resolving a complete route candidate before

@@ -163,10 +163,11 @@ pub(super) fn history_cell_to_text(cell: &HistoryCell, width: u16) -> String {
 ///
 /// User and assistant cells have canonical source text. Returning it directly
 /// preserves authored Markdown and hard line breaks while keeping role glyphs,
-/// continuation rails, and visual wrapping out of the clipboard. Selection
-/// copy cannot provide that contract: it serializes the rendered live cache,
-/// where Markdown has already been transformed and user-message soft wraps do
-/// not carry join metadata.
+/// continuation rails, and visual wrapping out of the clipboard. Transcript
+/// drag selections reuse this same projection per intersected cell
+/// (`selection_to_markdown`, #6156); only the rendered-text fallback still
+/// serializes the live cache, where Markdown has already been transformed and
+/// user-message soft wraps do not carry join metadata.
 ///
 /// Complex cells intentionally retain the full-transcript representation.
 /// Tool and thinking transcript renderers include semantic headers and complete

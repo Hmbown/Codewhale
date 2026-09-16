@@ -294,8 +294,9 @@ pub(super) async fn resume_session_thread(
     let manager = SessionManager::new(state.sessions_dir.clone())
         .map_err(|e| ApiError::internal(format!("Failed to open sessions dir: {e}")))?;
     let session = manager
-        .load_session(&id)
-        .map_err(|e| map_session_err(&id, e, "read"))?;
+        .resume_session(&id)
+        .map_err(|e| map_session_err(&id, e, "read"))?
+        .session;
 
     // Validate imported image bytes before allocating a Runtime thread. This
     // retains local history's existing bounds; invalid content cannot leave an
@@ -1102,4 +1103,126 @@ mod resume_thread_error_tests {
         ));
         assert_eq!(storage.status, StatusCode::INTERNAL_SERVER_ERROR);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Session artifacts (#6163): the oversized tool outputs a session recorded as
+// `ArtifactRecord`s live under `sessions/<id>/artifacts/`. These routes list
+// the records a saved session carries and read one artifact through the same
+// confined opener the workspace file routes use. Nothing is copied anywhere.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Serialize)]
+pub(super) struct SessionArtifactSummary {
+    id: String,
+    kind: crate::artifacts::ArtifactKind,
+    tool_call_id: String,
+    tool_name: String,
+    created_at: chrono::DateTime<chrono::Utc>,
+    byte_size: u64,
+    preview: String,
+    /// Session-relative storage path with `/` separators.
+    path: String,
+}
+
+#[derive(Debug, Serialize)]
+pub(super) struct SessionArtifactsResponse {
+    session_id: String,
+    artifacts: Vec<SessionArtifactSummary>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct SessionArtifactReadQuery {
+    offset: Option<usize>,
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+pub(super) struct SessionArtifactReadResponse {
+    artifact: SessionArtifactSummary,
+    size: u64,
+    revision: String,
+    offset: usize,
+    bytes: usize,
+    truncated: bool,
+    encoding: &'static str,
+    content: String,
+}
+
+fn artifact_summary(record: &crate::artifacts::ArtifactRecord) -> SessionArtifactSummary {
+    SessionArtifactSummary {
+        id: record.id.clone(),
+        kind: record.kind.clone(),
+        tool_call_id: record.tool_call_id.clone(),
+        tool_name: record.tool_name.clone(),
+        created_at: record.created_at,
+        byte_size: record.byte_size,
+        preview: record.preview.clone(),
+        path: crate::artifacts::format_artifact_relative_path(&record.storage_path),
+    }
+}
+
+pub(super) async fn list_session_artifacts(
+    State(state): State<RuntimeApiState>,
+    Path(id): Path<String>,
+) -> Result<Json<SessionArtifactsResponse>, ApiError> {
+    let manager = SessionManager::new(state.sessions_dir.clone())
+        .map_err(|e| ApiError::internal(format!("Failed to open sessions dir: {e}")))?;
+    let session = manager
+        .load_session(&id)
+        .map_err(|e| map_session_err(&id, e, "read"))?;
+    Ok(Json(SessionArtifactsResponse {
+        session_id: session.metadata.id.clone(),
+        artifacts: session.artifacts.iter().map(artifact_summary).collect(),
+    }))
+}
+
+pub(super) async fn read_session_artifact(
+    State(state): State<RuntimeApiState>,
+    Path((id, artifact_id)): Path<(String, String)>,
+    Query(query): Query<SessionArtifactReadQuery>,
+) -> Result<Json<SessionArtifactReadResponse>, ApiError> {
+    let (offset, limit) = super::workspace::parse_read_window(query.offset, query.limit)?;
+    let manager = SessionManager::new(state.sessions_dir.clone())
+        .map_err(|e| ApiError::internal(format!("Failed to open sessions dir: {e}")))?;
+    let session = manager
+        .load_session(&id)
+        .map_err(|e| map_session_err(&id, e, "read"))?;
+    let record = session
+        .artifacts
+        .iter()
+        .find(|record| record.id == artifact_id)
+        .cloned()
+        .ok_or_else(|| ApiError::not_found(format!("artifact '{artifact_id}' not found")))?;
+    if record.storage_path.is_absolute()
+        || !crate::fleet::files::path_is_confined(&record.storage_path)
+        || !crate::artifacts::is_valid_session_id(&session.metadata.id)
+    {
+        return Err(ApiError::forbidden(
+            "artifact record is not confined to the session directory",
+        ));
+    }
+    let sessions_dir = state.sessions_dir.clone();
+    let relative = PathBuf::from(&session.metadata.id).join(&record.storage_path);
+    let summary = artifact_summary(&record);
+    tokio::task::spawn_blocking(move || {
+        let file = super::workspace::open_confined_file(&sessions_dir, &relative, false)?;
+        let read = super::workspace::read_confined_bytes(&file)?;
+        let (window, truncated) = super::workspace::read_window(&read.bytes, offset, limit);
+        let (encoding, content) = super::workspace::encode_window(window);
+        Ok(SessionArtifactReadResponse {
+            artifact: summary,
+            size: read.size,
+            revision: read.revision,
+            offset: offset.min(read.bytes.len()),
+            bytes: window.len(),
+            truncated,
+            encoding,
+            content,
+        })
+    })
+    .await
+    .map_err(|_| ApiError::internal("session artifact read failed"))?
+    .map(Json)
 }

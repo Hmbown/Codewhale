@@ -734,13 +734,56 @@ pub(crate) fn active_tools_for_request(
     Some(tools)
 }
 
-fn tool_search_haystack(tool: &Tool) -> String {
-    format!(
-        "{}\n{}\n{}",
-        tool.name.to_lowercase(),
-        tool.description.to_lowercase(),
-        tool.input_schema.to_string().to_lowercase()
-    )
+/// Reusable scratch for one `tool_search` catalog scan.
+///
+/// Each deferred tool needs a lowercased `name\ndescription\ninput_schema` blob
+/// that is compared once and dropped. Building it with `format!` also copied all
+/// three pieces a second time into the concatenation, and the bm25 scorer then
+/// re-lowered `tool.name` once per query term for a value that does not vary
+/// across terms. Reusing one set of buffers across the scan removes the
+/// concatenation copy and the per-term lowering, and keeps the buffers' capacity
+/// instead of reallocating per tool (#6213 T5).
+///
+/// This is the same precomputed-index idiom `CachedFallback` already uses for
+/// the static core-action fallbacks in this file; it is not a new pattern.
+///
+/// Lowercasing deliberately stays `str::to_lowercase`, matching the original
+/// exactly. A per-`char` fold would allocate less but is not the same function —
+/// it differs on Greek final sigma — and this path runs a handful of times per
+/// turn beside a multi-second provider call, so it is not worth a semantic
+/// change.
+#[derive(Default)]
+struct ToolSearchScratch {
+    /// `tool.name`, lowercased. Loop-invariant across query terms, so the bm25
+    /// scorer reads this instead of re-lowering the name once per term.
+    name_lower: String,
+    /// Compact JSON of `tool.input_schema`, before lowercasing.
+    schema_json: String,
+    /// The match target: `name\ndescription\nschema`, all lowercased.
+    hay: String,
+}
+
+impl ToolSearchScratch {
+    fn load(&mut self, tool: &Tool) {
+        use std::fmt::Write as _;
+
+        self.name_lower.clear();
+        self.name_lower.push_str(&tool.name.to_lowercase());
+
+        self.schema_json.clear();
+        // `Value`'s `Display` is what `to_string()` calls, so this is the same
+        // text without materializing an owned copy first. Infallible for a
+        // `String` sink; a formatting error could only shorten the schema,
+        // which weakens matching and never breaks correctness.
+        let _ = write!(self.schema_json, "{}", tool.input_schema);
+
+        self.hay.clear();
+        self.hay.push_str(&self.name_lower);
+        self.hay.push('\n');
+        self.hay.push_str(&tool.description.to_lowercase());
+        self.hay.push('\n');
+        self.hay.push_str(&self.schema_json.to_lowercase());
+    }
 }
 
 fn catalog_contains_tool(catalog: &[Tool], name: &str) -> bool {
@@ -820,6 +863,7 @@ fn discover_tools_with_regex(
         .map_err(|err| ToolError::invalid_input(format!("Invalid regex query: {err}")))?;
 
     let mut matches = Vec::new();
+    let mut scratch = ToolSearchScratch::default();
     for tool in catalog {
         // tool_search loads definitions omitted from the current request. An
         // eager tool is already present, so returning it as a cache candidate
@@ -828,8 +872,8 @@ fn discover_tools_with_regex(
         if !tool.defer_loading.unwrap_or(false) || is_tool_search_tool(&tool.name) {
             continue;
         }
-        let hay = tool_search_haystack(tool);
-        if regex.is_match(&hay) {
+        scratch.load(tool);
+        if regex.is_match(&scratch.hay) {
             matches.push(tool.name.clone());
         }
         if matches.len() >= max_results {
@@ -850,17 +894,19 @@ fn discover_tools_with_bm25_like(catalog: &[Tool], query: &str, max_results: usi
     }
 
     let mut scored: Vec<(i64, String)> = Vec::new();
+    let mut scratch = ToolSearchScratch::default();
     for tool in catalog {
         if !tool.defer_loading.unwrap_or(false) || is_tool_search_tool(&tool.name) {
             continue;
         }
-        let hay = tool_search_haystack(tool);
+        scratch.load(tool);
         let mut score = 0i64;
         for term in &terms {
-            if hay.contains(term) {
+            if scratch.hay.contains(term) {
                 score += 1;
             }
-            if tool.name.to_lowercase().contains(term) {
+            // Loop-invariant: lowered once by `load`, not once per term.
+            if scratch.name_lower.contains(term) {
                 score += 2;
             }
         }

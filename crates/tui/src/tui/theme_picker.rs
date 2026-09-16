@@ -898,6 +898,7 @@ mod tests {
     }
 }
 
+#[cfg(test)]
 use unicode_width::UnicodeWidthStr as _TidelineWidth;
 
 // ---------------------------------------------------------------------------
@@ -909,13 +910,13 @@ use unicode_width::UnicodeWidthStr as _TidelineWidth;
 // wired into `ui/frame.rs` (#5698 gate).
 
 /// The 14 themes in display order: 4 mode rows then 10 presets.
-#[allow(dead_code)] // translation scaffolding: wired by the landing slice
+#[cfg(test)] // translation scaffolding: wired by the landing slice
 pub fn tideline_theme_rows() -> Vec<codewhale_palette::ThemeId> {
     codewhale_palette::SELECTABLE_THEMES.to_vec()
 }
 
 /// What the caller owes the theme-list render.
-#[allow(dead_code)] // translation scaffolding: wired by the landing slice
+#[cfg(test)] // translation scaffolding: wired by the landing slice
 pub struct TidelineThemeList<'a> {
     pub theme: &'a UiTheme,
     /// Selected row index into the 14-theme display order.
@@ -927,9 +928,8 @@ pub struct TidelineThemeList<'a> {
     pub ascii_safe: bool,
 }
 
-#[allow(dead_code)] // translation scaffolding: builder methods feed tests + the landing slice
+#[cfg(test)] // translation scaffolding: builder methods feed tests + the landing slice
 impl<'a> TidelineThemeList<'a> {
-    #[allow(dead_code)] // translation scaffolding: wired by the landing slice
     #[must_use]
     pub fn new(theme: &'a UiTheme, selected: usize) -> Self {
         Self {
@@ -972,17 +972,19 @@ impl<'a> TidelineThemeList<'a> {
     }
 }
 
+#[cfg(test)]
 fn tput(buf: &mut Buffer, x: u16, y: u16, text: &str, style: Style) {
     buf.set_stringn(x, y, text, _TidelineWidth::width(text), style);
 }
 
+#[cfg(test)]
 fn tchrome(theme: &UiTheme, ink: codewhale_palette::ChromeInk) -> Style {
     codewhale_palette::chrome_style(theme, ink)
 }
 
 /// Paint the theme list: 14 rows (4 modes + 10 presets) with the selected
 /// row boxed `[ ✓ Name ]`, then the MOTION (OPTIONAL) toggle rows.
-#[allow(dead_code)] // translation scaffolding: wired by the landing slice
+#[cfg(test)] // translation scaffolding: wired by the landing slice
 pub fn render_tideline_theme_list(area: Rect, buf: &mut Buffer, list: &TidelineThemeList<'_>) {
     if area.width < 8 || area.height < 3 {
         return;
@@ -1045,7 +1047,7 @@ pub fn render_tideline_theme_list(area: Rect, buf: &mut Buffer, list: &TidelineT
 
 /// Row hitboxes for the theme list (spec §6): 13 theme rects + 2 toggles.
 #[must_use]
-#[allow(dead_code)] // translation scaffolding: wired by the landing slice
+#[cfg(test)] // translation scaffolding: wired by the landing slice
 pub fn tideline_theme_list_hitboxes(area: Rect, _list: &TidelineThemeList<'_>) -> Vec<Rect> {
     let mut out = Vec::new();
     if area.width < 8 || area.height < 3 {

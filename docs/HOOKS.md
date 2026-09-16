@@ -19,7 +19,7 @@ interactive TUI and in the engine turn loop it drives.
 | Surface | Fires hooks |
 | --- | --- |
 | `codewhale` / `codew` interactive TUI | yes |
-| `codewhale exec` (headless one-shot) | no |
+| `codewhale exec` (headless one-shot) | opt-in: `--hooks` fires `tool_call_before` and `shell_env` |
 | the `codewhale` CLI dispatcher and its subcommands | no |
 | app-server / ACP | no |
 | the `workflow` tool and sub-agent *internals* | no — but the TUI fires `subagent_spawn` / `subagent_complete` around them |
@@ -28,6 +28,19 @@ interactive TUI and in the engine turn loop it drives.
 The `crates/hooks` event-sink crate in this repository is an unrelated
 internal mechanism. It shares no configuration, no event names, and no
 contract with the hooks described here.
+
+### `codewhale exec --hooks`
+
+Headless runs fire no hooks by default — a CI job should not start paging an
+on-call rotation merely because a config exists. `codewhale exec --hooks`
+opts the run in. The engine-side events are `tool_call_before` (exit code 2
+still denies the call; `ask` resolves fail-closed because nothing can prompt
+headlessly) and `shell_env`. UI-driven events such as `session_start`,
+`message_submit`, and `turn_end` do not fire — they live in the interactive
+shell, not the turn loop. Fleet worker subprocesses never fire operator
+hooks. Independently of this flag, `permissions.toml` typed rules already
+apply to `exec` — the run drives the same turn loop, and a `deny` blocks in
+every mode.
 
 ## Quick start
 

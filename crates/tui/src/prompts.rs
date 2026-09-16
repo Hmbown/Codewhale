@@ -45,6 +45,12 @@ pub struct PromptSessionContext<'a> {
     /// Optional output-verbosity mode. `concise` appends a short output
     /// discipline block; unset keeps the normal conversational prompt.
     pub verbosity: Option<&'a str>,
+    /// One-line notice that a prior session in this workspace left a
+    /// recovery checkpoint (#5715). KV effect: frozen-prefix contributor —
+    /// computed at engine construction and stable for the session; absent
+    /// entirely when no interrupted session exists, so clean sessions share
+    /// the same prefix bytes.
+    pub recovery_hint: Option<&'a str>,
     /// Restrict skill discovery to Codewhale-owned roots plus explicit
     /// `skills_dir` configuration.
     pub skills_scan_codewhale_only: bool,
@@ -68,6 +74,7 @@ impl Default for PromptSessionContext<'_> {
             model_id: "codewhale",
             context_window_override: None,
             verbosity: None,
+            recovery_hint: None,
             skills_scan_codewhale_only: false,
             plugin_registry: None,
             mode: AppMode::Agent,
@@ -1019,6 +1026,7 @@ pub fn system_prompt_for_mode_with_context_and_skills(
             model_id: "codewhale",
             context_window_override: None,
             verbosity: None,
+            recovery_hint: None,
             skills_scan_codewhale_only: false,
             plugin_registry: None,
             mode: AppMode::Agent,
@@ -1231,6 +1239,17 @@ pub(crate) fn system_prompt_for_mode_with_context_skills_session_and_approval_fo
         workspace_parts.push(format!(
             "## Current Goal\n\n<session_goal>\n{}\n</session_goal>",
             goal_objective.trim()
+        ));
+    }
+    // #5715: name an interrupted prior workspace session so the model can
+    // offer recovery. Session-pinned: absent entirely on clean sessions so
+    // they share identical prefix bytes.
+    if let Some(hint) = session_context.recovery_hint
+        && !hint.trim().is_empty()
+    {
+        workspace_parts.push(format!(
+            "## Prior Session\n\n<session_recovery>\n{}\n</session_recovery>",
+            hint.trim()
         ));
     }
     let workspace_body = workspace_parts.join("\n\n");
@@ -1716,6 +1735,7 @@ mod tests {
                     verbosity: None,
                     skills_scan_codewhale_only: false,
                     plugin_registry: None,
+                    recovery_hint: None,
                     mode: AppMode::Agent,
                 },
             ),
@@ -2139,6 +2159,7 @@ mod tests {
                     verbosity: None,
                     skills_scan_codewhale_only: false,
                     plugin_registry: None,
+                    recovery_hint: None,
                     mode: AppMode::Agent,
                 },
             ),
@@ -2264,6 +2285,7 @@ mod tests {
                     verbosity: None,
                     skills_scan_codewhale_only: false,
                     plugin_registry: None,
+                    recovery_hint: None,
                     mode: AppMode::Agent,
                 },
             ),
@@ -2311,6 +2333,7 @@ mod tests {
                     verbosity: None,
                     skills_scan_codewhale_only: false,
                     plugin_registry: None,
+                    recovery_hint: None,
                     mode: AppMode::Agent,
                 },
             ),
@@ -2404,6 +2427,7 @@ mod tests {
                     verbosity: None,
                     skills_scan_codewhale_only: false,
                     plugin_registry: None,
+                    recovery_hint: None,
                     mode: AppMode::Agent,
                 },
             ));
@@ -2585,6 +2609,7 @@ mod tests {
                     verbosity: None,
                     skills_scan_codewhale_only: false,
                     plugin_registry: None,
+                    recovery_hint: None,
                     mode: AppMode::Agent,
                 },
             ));
@@ -2615,6 +2640,7 @@ mod tests {
                     verbosity: None,
                     skills_scan_codewhale_only: false,
                     plugin_registry: None,
+                    recovery_hint: None,
                     mode: AppMode::Agent,
                 },
             ));
@@ -2659,6 +2685,7 @@ mod tests {
                     verbosity: None,
                     skills_scan_codewhale_only: false,
                     plugin_registry: None,
+                    recovery_hint: None,
                     mode: AppMode::Agent,
                 },
             ));
@@ -2789,6 +2816,7 @@ mod tests {
                     verbosity: None,
                     skills_scan_codewhale_only: false,
                     plugin_registry: None,
+                    recovery_hint: None,
                     mode: AppMode::Agent,
                 },
             ));
@@ -2820,6 +2848,7 @@ mod tests {
                     verbosity: None,
                     skills_scan_codewhale_only: false,
                     plugin_registry: None,
+                    recovery_hint: None,
                     mode: AppMode::Agent,
                 },
             ));
@@ -3042,6 +3071,7 @@ mod tests {
                     verbosity: None,
                     skills_scan_codewhale_only: false,
                     plugin_registry: None,
+                    recovery_hint: None,
                     mode: AppMode::Agent,
                 },
             ));
@@ -3076,12 +3106,65 @@ mod tests {
                     verbosity: None,
                     skills_scan_codewhale_only: false,
                     plugin_registry: None,
+                    recovery_hint: None,
                     mode: AppMode::Agent,
                 },
             ));
 
         assert!(!prompt.contains("<session_goal>"));
         assert!(!prompt.contains("## Current Goal"));
+    }
+
+    #[test]
+    fn recovery_hint_renders_only_when_present() {
+        // Prompt assembly reads env-dependent paths (skills, memory, session
+        // state); the byte-equality check must serialize against env-guard
+        // tests in the same binary.
+        let _env_guard = crate::test_support::lock_test_env();
+        let tmp = tempdir().expect("tempdir");
+        let build = |recovery_hint: Option<&str>| {
+            system_prompt_flat_text(&system_prompt_for_mode_with_context_skills_and_session(
+                tmp.path(),
+                None,
+                None,
+                None,
+                PromptSessionContext {
+                    user_memory_block: None,
+                    goal_objective: None,
+                    project_context_pack_enabled: false,
+                    locale_tag: "en",
+                    translation_enabled: false,
+                    model_id: "codewhale",
+                    context_window_override: None,
+                    verbosity: None,
+                    recovery_hint,
+                    skills_scan_codewhale_only: false,
+                    plugin_registry: None,
+                    mode: AppMode::Agent,
+                },
+            ))
+        };
+
+        let hinted = build(Some(
+            "A previous session (\"fix\", id abc12345) has a recovery checkpoint",
+        ));
+        assert!(hinted.contains("## Prior Session"));
+        assert!(hinted.contains("<session_recovery>"));
+        assert!(hinted.contains("recovery checkpoint"));
+
+        // Clean sessions share identical prefix bytes: no block, no heading.
+        let clean = build(None);
+        assert!(!clean.contains("## Prior Session"));
+        assert!(!clean.contains("session_recovery"));
+        let blank = build(Some("   "));
+        for (i, (a, b)) in clean.lines().zip(blank.lines()).enumerate() {
+            assert_eq!(a, b, "line {i} differs");
+        }
+        assert_eq!(
+            clean.lines().count(),
+            blank.lines().count(),
+            "line counts differ"
+        );
     }
 
     #[test]
@@ -3167,6 +3250,7 @@ mod tests {
                     verbosity: None,
                     skills_scan_codewhale_only: false,
                     plugin_registry: None,
+                    recovery_hint: None,
                     mode: AppMode::Agent,
                 },
             ));
@@ -3690,6 +3774,7 @@ mod tests {
                     verbosity: Some(" Concise "),
                     skills_scan_codewhale_only: false,
                     plugin_registry: None,
+                    recovery_hint: None,
                     mode: AppMode::Agent,
                 },
             ),
@@ -3734,6 +3819,7 @@ mod tests {
                 verbosity: Some("concise"),
                 skills_scan_codewhale_only: false,
                 plugin_registry: None,
+                recovery_hint: None,
                 mode: AppMode::Agent,
             },
         );
@@ -3787,6 +3873,7 @@ mod tests {
             verbosity: None,
             skills_scan_codewhale_only: false,
             plugin_registry: None,
+            recovery_hint: None,
             mode: AppMode::Agent,
         };
         let first = system_prompt_for_mode_with_context_skills_session_and_approval(

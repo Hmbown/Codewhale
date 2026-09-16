@@ -27,10 +27,20 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
 use std::io;
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 use uuid::Uuid;
 
-/// Maximum number of sessions to retain
+/// Maximum number of active (non-archived) transcripts to retain.
+///
+/// A transcript that falls out of this window is archived, never unlinked
+/// (#6136); archived records sit outside the cap until the user prunes them,
+/// and empty auto-created stubs are capped separately (#6137).
 const MAX_SESSIONS: usize = 50;
+/// Maximum empty auto-created stubs ("New Session", zero messages) to keep.
+///
+/// The product writes one per boot; they are junk that must never occupy a
+/// transcript's slot in the cap (#6137).
+const MAX_EMPTY_SESSION_STUBS: usize = 10;
 /// Maximum session title length, in `char`s. Matches the bound the session
 /// picker's rename prompt has always enforced.
 pub const MAX_SESSION_TITLE_CHARS: usize = 100;
@@ -272,8 +282,11 @@ pub struct OfflineQueueState {
 pub struct SessionRecovery {
     pub session: SavedSession,
     pub changed: bool,
+    #[cfg_attr(not(test), expect(dead_code))]
     pub repaired_call_count: usize,
+    #[cfg_attr(not(test), expect(dead_code))]
     pub duplicate_result_count: usize,
+    #[cfg_attr(not(test), expect(dead_code))]
     pub orphan_result_count: usize,
 }
 
@@ -674,7 +687,6 @@ impl SessionCostSnapshot {
 
 impl SessionMetadata {
     /// Copy cost fields from another metadata (used when forking a session).
-    #[allow(dead_code)]
     pub fn copy_cost_from(&mut self, other: &SessionMetadata) {
         self.cost = other.cost.clone();
     }
@@ -943,21 +955,40 @@ impl SavedSession {
         }
     }
 
-    fn storage_compatible_copy(&self) -> Option<Self> {
-        let journal = self.journal.as_ref()?;
-        let active_messages = journal.to_messages();
-        if !self.messages.is_empty() && self.messages == active_messages {
-            return None;
+    /// Bring `messages` and the journal into the shape the on-disk schema
+    /// expects, in place.
+    ///
+    /// This used to be `storage_compatible_copy`, which cloned the whole
+    /// session to do it. On the debounced persistence path the caller already
+    /// owns the value and `compact_for_persistence_queue` has already emptied
+    /// `messages`, so the clone was pure waste — two full deep copies of the
+    /// history per write (#6214 T3).
+    ///
+    /// The no-op cases are load-bearing and must stay no-ops: with no journal,
+    /// or with `messages` already equal to the journal's active branch, the
+    /// session serializes exactly as it arrived — including a
+    /// `metadata.message_count` that disagrees with `messages.len()`. Rewriting
+    /// that count here would silently edit live data on every save.
+    pub(crate) fn make_storage_compatible(&mut self) {
+        let Some(journal) = self.journal.as_ref() else {
+            return;
+        };
+        if self.messages.is_empty() {
+            self.messages = journal.to_messages();
+        } else {
+            if self.messages == journal.to_messages() {
+                return;
+            }
+            // Split the `journal` / `messages` borrows; the take is returned
+            // before this function ends, so the session is never left short.
+            let messages = std::mem::take(&mut self.messages);
+            if let Some(journal) = self.journal.as_mut() {
+                journal.rebranch_active_messages(&messages);
+                self.leaf_id = journal.leaf_id.clone();
+            }
+            self.messages = messages;
         }
-        let mut copy = self.clone();
-        if copy.messages.is_empty() {
-            copy.messages = active_messages;
-        } else if let Some(journal) = copy.journal.as_mut() {
-            journal.rebranch_active_messages(&copy.messages);
-            copy.leaf_id = journal.leaf_id.clone();
-        }
-        copy.metadata.message_count = copy.messages.len();
-        Some(copy)
+        self.metadata.message_count = self.messages.len();
     }
 
     pub fn ensure_journal(&mut self) {
@@ -981,6 +1012,7 @@ impl SavedSession {
         self.leaf_id = journal.leaf_id.clone();
         self.journal = Some(journal);
     }
+    #[expect(dead_code)]
     pub fn journal_append_message(&mut self, message: Message) -> String {
         self.ensure_journal();
         let journal = self.journal.as_mut().expect("journal ensured");
@@ -1000,6 +1032,7 @@ impl SavedSession {
         self.metadata.updated_at = Utc::now();
         Ok(())
     }
+    #[expect(dead_code)]
     pub fn active_entries(&self) -> Vec<SessionEntry> {
         self.journal
             .as_ref()
@@ -1092,10 +1125,35 @@ impl SavedSession {
     }
 }
 
-fn serialize_saved_session(session: &SavedSession) -> io::Result<String> {
-    let compatible = session.storage_compatible_copy();
-    serde_json::to_string_pretty(compatible.as_ref().unwrap_or(session))
+fn serialize_saved_session(mut session: SavedSession) -> io::Result<String> {
+    session.make_storage_compatible();
+    serde_json::to_string_pretty(&session)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+}
+
+/// Repair dangling tool-call/result pairs in an already-loaded session and
+/// rebranch its journal to the repaired messages. Returns the repair receipt;
+/// callers decide whether the result gets persisted (`SessionManager::resume_*`
+/// does, foreign `/load` files do not).
+pub(crate) fn repair_recovered_session(
+    session: &mut SavedSession,
+) -> crate::tool_history_repair::ToolRepairReceipt {
+    let repair = crate::tool_history_repair::repair_tool_call_pairs(&mut session.messages);
+    if !repair.is_empty() {
+        if let Some(journal) = session.journal.as_mut() {
+            journal.rebranch_active_messages(&session.messages);
+            session.leaf_id = journal.leaf_id.clone();
+        }
+        session.metadata.message_count = session.messages.len();
+        tracing::warn!(
+            session_id = %session.metadata.id,
+            repaired_call_ids = ?repair.repaired_call_ids,
+            duplicate_result_ids = ?repair.duplicate_result_ids,
+            orphan_result_ids = ?repair.orphan_result_ids,
+            "repaired persisted tool call/result history"
+        );
+    }
+    repair
 }
 
 /// Manager for session persistence operations
@@ -1103,6 +1161,10 @@ fn serialize_saved_session(session: &SavedSession) -> io::Result<String> {
 pub struct SessionManager {
     /// Directory where sessions are stored
     sessions_dir: PathBuf,
+    /// Re-entrancy guard: archiving a record saves it, and every save runs
+    /// retention. Without this, a backlog past the cap would nest one
+    /// cleanup per archived transcript instead of draining in one pass.
+    retention_in_progress: AtomicBool,
 }
 
 /// One interactive editor owns a session's unsent text until its last queued
@@ -1161,6 +1223,7 @@ pub enum CheckpointSource {
 #[derive(Debug, Clone)]
 pub struct CheckpointRef {
     pub source: CheckpointSource,
+    #[cfg_attr(not(test), expect(dead_code))]
     pub path: PathBuf,
     pub modified: std::time::SystemTime,
 }
@@ -1193,6 +1256,7 @@ impl SessionManager {
 
     /// Reconstruct completed approvals and interrupted unmatched asks for one
     /// session without consulting the model transcript.
+    #[cfg_attr(not(test), expect(dead_code))]
     pub(crate) fn replay_approvals(&self, session_id: &str) -> io::Result<ApprovalReplay> {
         self.approval_receipt_store().replay(session_id)
     }
@@ -1313,7 +1377,10 @@ impl SessionManager {
         let sessions_dir = normalize_managed_dir(sessions_dir)?;
         // Ensure the sessions directory exists
         fs::create_dir_all(&sessions_dir)?;
-        Ok(Self { sessions_dir })
+        Ok(Self {
+            sessions_dir,
+            retention_in_progress: AtomicBool::new(false),
+        })
     }
 
     /// Create a `SessionManager` using the default location.
@@ -1759,24 +1826,38 @@ impl SessionManager {
     }
 
     /// Save a session to disk using atomic write (temp file + fsync + rename).
+    ///
+    /// Borrowing form: clones once so the ~150 existing `&session` call sites
+    /// keep working. The debounced persistence path already owns its value and
+    /// calls [`Self::save_session_owned`] instead (#6214 T3).
     pub fn save_session(&self, session: &SavedSession) -> std::io::Result<PathBuf> {
-        let path = self.validated_session_path(&session.metadata.id)?;
-        self.with_session_write_admission(&session.metadata.id, || {
+        self.save_session_owned(session.clone())
+    }
+
+    /// Save a session to disk, consuming it.
+    pub(crate) fn save_session_owned(&self, session: SavedSession) -> std::io::Result<PathBuf> {
+        let session_id = session.metadata.id.clone();
+        let path = self.validated_session_path(&session_id)?;
+        // Not a `move` closure: `session` is consumed inside, so inference
+        // captures it by value while `path` and `session_id` stay borrowed for
+        // the caller to use after the write.
+        self.with_session_write_admission(&session_id, || {
             let already_persisted = path.exists()
                 || self
-                    .validated_checkpoint_path(&session.metadata.id)
+                    .validated_checkpoint_path(&session_id)
                     .is_ok_and(|checkpoint| checkpoint.exists());
 
-            self.archive_before_first_graph_write(session, &path)?;
+            // Still the pre-hydration value, and still before write_atomic.
+            self.archive_before_first_graph_write(&session, &path)?;
 
-            let mut durable_session = session.clone();
+            let mut durable_session = session;
             self.hydrate_recovered_runtime_binding(&mut durable_session)?;
             self.hydrate_approval_receipts(&mut durable_session)?;
-            let content = serialize_saved_session(&durable_session)?;
+            let content = serialize_saved_session(durable_session)?;
 
             // Atomic write via write_atomic (NamedTempFile + fsync + persist)
             write_atomic(&path, content.as_bytes())?;
-            self.stamp_session_boot_owner_for_new_record(&session.metadata.id, already_persisted);
+            self.stamp_session_boot_owner_for_new_record(&session_id, already_persisted);
             Ok(())
         })?
         .ok_or_else(Self::retired_session_write_error)?;
@@ -1793,18 +1874,24 @@ impl SessionManager {
     /// Checkpoints are keyed per session (`checkpoints/<session_id>.json`) so
     /// concurrent sessions never overwrite each other's crash-recovery state.
     pub fn save_checkpoint(&self, session: &SavedSession) -> std::io::Result<PathBuf> {
-        let path = self.validated_checkpoint_path(&session.metadata.id)?;
-        self.with_session_write_admission(&session.metadata.id, || {
-            let session_path = self.validated_session_path(&session.metadata.id)?;
-            self.archive_before_first_graph_write(session, &session_path)?;
+        self.save_checkpoint_owned(session.clone())
+    }
+
+    /// Save a crash-recovery checkpoint, consuming the session.
+    pub(crate) fn save_checkpoint_owned(&self, session: SavedSession) -> std::io::Result<PathBuf> {
+        let session_id = session.metadata.id.clone();
+        let path = self.validated_checkpoint_path(&session_id)?;
+        self.with_session_write_admission(&session_id, || {
+            let session_path = self.validated_session_path(&session_id)?;
+            self.archive_before_first_graph_write(&session, &session_path)?;
             fs::create_dir_all(self.checkpoints_dir())?;
             let already_persisted = path.exists() || session_path.exists();
-            let mut durable_session = session.clone();
+            let mut durable_session = session;
             self.hydrate_recovered_runtime_binding(&mut durable_session)?;
             self.hydrate_approval_receipts(&mut durable_session)?;
-            let content = serialize_saved_session(&durable_session)?;
+            let content = serialize_saved_session(durable_session)?;
             write_atomic(&path, content.as_bytes())?;
-            self.stamp_session_boot_owner_for_new_record(&session.metadata.id, already_persisted);
+            self.stamp_session_boot_owner_for_new_record(&session_id, already_persisted);
             Ok(())
         })?
         .ok_or_else(Self::retired_session_write_error)?;
@@ -2071,6 +2158,49 @@ impl SessionManager {
         Ok(refs)
     }
 
+    /// Does `session_id` still hold a crash-recovery checkpoint — the
+    /// durable sign the session ended mid-turn (#5715)?
+    #[must_use]
+    pub fn session_has_checkpoint(&self, session_id: &str) -> bool {
+        self.validated_checkpoint_path(session_id)
+            .is_ok_and(|path| path.exists())
+    }
+
+    /// The most recent workspace-scoped session that still holds a
+    /// crash-recovery checkpoint — durable evidence a prior session in this
+    /// workspace ended mid-turn (#5715). Metadata only; the transcript is
+    /// never read. `exclude` is the live session's own id: its in-flight
+    /// checkpoint is current work, not prior work, and engine respawns
+    /// inside one session must not report the session's own checkpoint.
+    /// Sessions this process instance created are likewise excluded.
+    pub fn interrupted_workspace_session(
+        &self,
+        workspace: &Path,
+        exclude: Option<&str>,
+    ) -> Option<SessionMetadata> {
+        // Newest-first already; a checkpoint file only survives a session
+        // that never reached a settled save.
+        for checkpoint in self.list_checkpoints().ok()? {
+            let CheckpointSource::Session(id) = checkpoint.source else {
+                continue;
+            };
+            if Some(id.as_str()) == exclude || !self.session_from_prior_instance(&id) {
+                continue;
+            }
+            // One malformed id or unreadable record must not hide a later
+            // valid checkpoint — skip and keep scanning.
+            let Ok(path) = self.validated_session_path(&id) else {
+                continue;
+            };
+            if let Ok(meta) = Self::load_session_metadata(&path)
+                && workspace_scope_matches(&meta.workspace, workspace)
+            {
+                return Some(meta);
+            }
+        }
+        None
+    }
+
     /// Migrate a session recovered from the legacy single-slot checkpoint to
     /// a per-session checkpoint file. Never overwrites an existing
     /// per-session file and leaves the legacy file in place (older binaries
@@ -2278,31 +2408,54 @@ impl SessionManager {
     /// serialize recovery with their own transcript mutation lock.
     pub fn recover_session_for_resume(&self, id: &str) -> std::io::Result<SessionRecovery> {
         let mut session = self.load_session_snapshot(id)?;
-
-        let repair = crate::tool_history_repair::repair_tool_call_pairs(&mut session.messages);
-        let changed = !repair.is_empty();
-        if changed {
-            if let Some(journal) = session.journal.as_mut() {
-                journal.rebranch_active_messages(&session.messages);
-                session.leaf_id = journal.leaf_id.clone();
-            }
-            session.metadata.message_count = session.messages.len();
-            tracing::warn!(
-                session_id = %session.metadata.id,
-                repaired_call_ids = ?repair.repaired_call_ids,
-                duplicate_result_ids = ?repair.duplicate_result_ids,
-                orphan_result_ids = ?repair.orphan_result_ids,
-                "repaired persisted tool call/result history"
-            );
-        }
+        let repair = repair_recovered_session(&mut session);
 
         Ok(SessionRecovery {
             session,
-            changed,
+            changed: !repair.is_empty(),
             repaired_call_count: repair.repaired_call_ids.len(),
             duplicate_result_count: repair.duplicate_result_ids.len(),
             orphan_result_count: repair.orphan_result_ids.len(),
         })
+    }
+
+    /// Load, repair, and durably persist a session being resumed.
+    ///
+    /// Resume is where a crash-repaired history becomes durable: the repaired
+    /// record replaces the interrupted one so the same repair does not re-run
+    /// on every later load. A persist failure is logged and the repaired
+    /// in-memory session is still returned — a failed write-back must not
+    /// strand the resume.
+    pub fn resume_session(&self, id: &str) -> std::io::Result<SessionRecovery> {
+        let recovery = self.recover_session_for_resume(id)?;
+        if recovery.changed
+            && let Err(error) = self.save_session(&recovery.session)
+        {
+            tracing::warn!(
+                session_id = %recovery.session.metadata.id,
+                %error,
+                "repaired session history could not be persisted; the repair will re-run on the next load"
+            );
+        }
+        Ok(recovery)
+    }
+
+    /// [`Self::resume_session`] with a partial-ID prefix.
+    pub fn resume_session_by_prefix(&self, prefix: &str) -> std::io::Result<SessionRecovery> {
+        self.resume_session(&self.resolve_session_id_prefix(prefix)?)
+    }
+
+    /// True when `path` is this store's durable record for `id`. File-based
+    /// session loads use it to decide whether a repair may be written back in
+    /// place or must stay in memory (a foreign file is not ours to rewrite).
+    pub(crate) fn owns_session_path(&self, id: &str, path: &Path) -> bool {
+        let Ok(managed) = self.validated_session_path(id) else {
+            return false;
+        };
+        managed == path
+            || managed
+                .canonicalize()
+                .is_ok_and(|managed| path.canonicalize().is_ok_and(|path| managed == path))
     }
 
     /// Load a session by ID for the standalone CodeWhale resume flow.
@@ -2602,30 +2755,93 @@ impl SessionManager {
         Ok(())
     }
 
-    /// Clean up old sessions to stay within `MAX_SESSIONS` limit.
+    /// Clean up old sessions to stay within the active cap.
     pub fn cleanup_old_sessions(&self) -> std::io::Result<()> {
         self.cleanup_old_sessions_keeping(None)
     }
 
-    /// As [`Self::cleanup_old_sessions`], but never deletes `keep` — the
+    /// As [`Self::cleanup_old_sessions`], but never touches `keep` — the
     /// session being resumed at boot. Without this, a background cleanup that
-    /// races session restore can prune the just-resumed session when 50+
+    /// races session restore can retire the just-resumed session when 50+
     /// newer records exist (its `updated_at` is not bumped until first save).
+    ///
+    /// The cap counts *active* transcripts: archived records sit outside it
+    /// until the user prunes them, and empty auto-created stubs get their own
+    /// small cap so they can never push a real transcript out (#6136, #6137).
+    /// A transcript past the cap is archived, never unlinked; the store's
+    /// destructive paths stay the explicit user actions.
     pub fn cleanup_old_sessions_keeping(&self, keep: Option<&str>) -> std::io::Result<()> {
+        // Archiving saves the record, and every save runs retention again.
+        // Drain a backlog in one pass here instead of nesting one cleanup per
+        // archived transcript.
+        if self
+            .retention_in_progress
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Ok(());
+        }
+        let result = self.cleanup_old_sessions_inner(keep);
+        self.retention_in_progress
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        result
+    }
+
+    fn cleanup_old_sessions_inner(&self, keep: Option<&str>) -> std::io::Result<()> {
         let sessions = self.list_sessions()?;
 
-        if sessions.len() > MAX_SESSIONS {
-            for session in sessions.iter().skip(MAX_SESSIONS) {
-                if keep.is_some_and(|id| id == session.id) {
-                    continue;
-                }
-                let _ = self.remove_session(&session.id, SessionRemoval::Retention);
+        // What retention owes each class (#6136/#6137): archived records are
+        // already outside the cap; empty auto-created stubs are junk the
+        // product writes on every boot and are capped apart so they can never
+        // occupy a transcript's slot; everything else carries the
+        // MAX_SESSIONS window.
+        let mut active: Vec<&SessionMetadata> = Vec::new();
+        let mut stubs: Vec<&SessionMetadata> = Vec::new();
+        for session in &sessions {
+            if session.archived {
+                continue;
+            }
+            if is_empty_auto_created_session(session) {
+                stubs.push(session);
+            } else {
+                active.push(session);
             }
         }
+
+        for session in active.iter().skip(MAX_SESSIONS) {
+            if keep.is_some_and(|id| id == session.id) {
+                continue;
+            }
+            // `External` keeps the live-session guard honest: a record
+            // another process is driving is not ours to retire.
+            if let Err(err) = self.set_session_archived(&session.id, true, SessionMutator::External)
+            {
+                tracing::warn!(
+                    target: "session",
+                    session = session.id,
+                    ?err,
+                    "retention could not archive a transcript past the cap; it stays active"
+                );
+            }
+        }
+
+        for session in stubs.iter().skip(MAX_EMPTY_SESSION_STUBS) {
+            if keep.is_some_and(|id| id == session.id) {
+                continue;
+            }
+            if let Err(err) = self.remove_session(&session.id, SessionRemoval::Retention) {
+                tracing::warn!(
+                    target: "session",
+                    session = session.id,
+                    ?err,
+                    "retention could not remove an empty session stub"
+                );
+            }
+        }
+
         // A directory without a top-level session snapshot is not proof of an
         // orphan: runtime threads and automations own independent durable stores,
         // including in other processes and before their first snapshot. Retention
-        // only removes records it listed above; never infer authority to delete
+        // only retires records it listed above; never infer authority to delete
         // other directories from an absent transcript or process-local claim.
 
         Ok(())
@@ -2648,6 +2864,7 @@ impl SessionManager {
     /// timestamp embedded in the JSON, not the filesystem mtime — the
     /// user may have rsynced their `~/.deepseek` between machines and
     /// fs mtimes can lie.
+    #[cfg_attr(not(test), expect(dead_code))]
     pub fn prune_sessions_older_than(
         &self,
         max_age: std::time::Duration,
@@ -2734,6 +2951,24 @@ pub(crate) fn is_title_format_char(ch: char) -> bool {
             | '\u{2066}'..='\u{2069}'
             | '\u{feff}'
     )
+}
+
+/// One-line notice that a prior session in `workspace` ended mid-turn
+/// (#5715), for the session-pinned prompt prefix. `current_session_id` is
+/// excluded: an in-flight checkpoint of the live session is current work,
+/// not prior work. Returns `None` when no interrupted session exists.
+pub(crate) fn session_recovery_hint(
+    workspace: &Path,
+    current_session_id: Option<&str>,
+) -> Option<String> {
+    let manager = SessionManager::default_location().ok()?;
+    let meta = manager.interrupted_workspace_session(workspace, current_session_id)?;
+    Some(format!(
+        "A previous Codewhale session in this workspace (\"{}\", id {}, last active {}) has a recovery checkpoint — it likely ended mid-task. Use session_search/session_get to inspect it and offer to summarize or continue the work; resuming is the user's decision (e.g. /resume).",
+        meta.title,
+        truncate_id(&meta.id),
+        meta.updated_at.format("%Y-%m-%d %H:%M UTC"),
+    ))
 }
 
 /// Drop control and bidi/zero-width format characters from a title.
@@ -3474,7 +3709,7 @@ mod tests {
     fn make_test_message(role: &str, text: &str) -> Message {
         Message {
             role: Role::from(role),
-            content: vec![ContentBlock::Text {
+            content: vec![codewhale_models::ContentBlock::Text {
                 text: text.to_string(),
                 cache_control: None,
             }],
@@ -3596,7 +3831,7 @@ mod tests {
             &imported
                 .validated_session_path(&saved.metadata.id)
                 .expect("imported path"),
-            serialize_saved_session(&saved)
+            serialize_saved_session(saved.clone())
                 .expect("snapshot bytes")
                 .as_bytes(),
         )
@@ -3865,7 +4100,7 @@ mod tests {
         let legacy_path = manager.checkpoints_dir().join(LEGACY_CHECKPOINT_FILE);
         write_atomic(
             &legacy_path,
-            serialize_saved_session(&retired)
+            serialize_saved_session(retired.clone())
                 .expect("legacy bytes")
                 .as_bytes(),
         )
@@ -3931,7 +4166,7 @@ mod tests {
                     fs::create_dir_all(manager.checkpoints_dir()).expect("checkpoints");
                     write_atomic(
                         &manager.checkpoints_dir().join(LEGACY_CHECKPOINT_FILE),
-                        serialize_saved_session(&old)
+                        serialize_saved_session(old.clone())
                             .expect("legacy bytes")
                             .as_bytes(),
                     )
@@ -3947,6 +4182,13 @@ mod tests {
                             .expect("age prune"),
                         1
                     );
+                    assert!(
+                        !manager
+                            .validated_session_path(id)
+                            .expect("snapshot path")
+                            .exists(),
+                        "an explicit age prune still unlinks"
+                    );
                 } else {
                     for index in 0..MAX_SESSIONS {
                         write_session_with_updated_at(
@@ -3956,17 +4198,28 @@ mod tests {
                         );
                     }
                     manager.cleanup_old_sessions().expect("size cleanup");
+                    let listed = manager.list_sessions().expect("sessions");
                     assert_eq!(
-                        manager.list_sessions().expect("sessions").len(),
-                        MAX_SESSIONS
+                        listed.len(),
+                        MAX_SESSIONS + 1,
+                        "the archived record stays listed outside the active cap"
+                    );
+                    let retained = listed
+                        .iter()
+                        .find(|session| session.id == id)
+                        .expect("archived record remains on disk");
+                    assert!(
+                        retained.archived,
+                        "a transcript past the cap is archived, never unlinked (#6136)"
+                    );
+                    assert!(
+                        manager
+                            .validated_session_path(id)
+                            .expect("snapshot path")
+                            .exists(),
+                        "the transcript file survives retention"
                     );
                 }
-                assert!(
-                    !manager
-                        .validated_session_path(id)
-                        .expect("snapshot path")
-                        .exists()
-                );
                 let (ledger, _) = manager.late_usage_paths(id).expect("ledger paths");
                 assert!(!SessionManager::late_usage_is_deleted(&ledger).expect("origin retained"));
                 assert!(ledger.exists(), "recovery must retain accounting");
@@ -4019,7 +4272,7 @@ mod tests {
             .expect("checkpoint before deletion");
         write_atomic(
             &manager.checkpoints_dir().join(LEGACY_CHECKPOINT_FILE),
-            serialize_saved_session(&saved)
+            serialize_saved_session(saved.clone())
                 .expect("legacy bytes")
                 .as_bytes(),
         )
@@ -5250,6 +5503,36 @@ mod tests {
         assert!(!second.changed);
         assert_eq!(second.repaired_call_count, 0);
         assert_eq!(second.session.messages, recovered.session.messages);
+    }
+
+    #[test]
+    fn resume_session_persists_repair_once() {
+        let tmp = tempdir().expect("tempdir");
+        let manager = SessionManager::new(tmp.path().join("sessions")).expect("new");
+        let messages = vec![Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::ToolUse {
+                id: "call-crashed".to_string(),
+                name: "read_file".to_string(),
+                input: serde_json::json!({"path": "README.md"}),
+                caller: None,
+                thought_signature: None,
+            }],
+        }];
+        let session = create_saved_session(&messages, "test-model", tmp.path(), 0, None);
+        let session_id = session.metadata.id.clone();
+        manager.save_session(&session).expect("save");
+
+        let first = manager.resume_session(&session_id).expect("first resume");
+        assert!(first.changed);
+        assert_eq!(first.repaired_call_count, 1);
+
+        // The repair is already durable: a second resume finds a clean record
+        // instead of re-running and re-logging the same repair on every load.
+        let second = manager.resume_session(&session_id).expect("second resume");
+        assert!(!second.changed);
+        assert_eq!(second.repaired_call_count, 0);
+        assert_eq!(second.session.messages, first.session.messages);
     }
 
     #[test]
@@ -6487,6 +6770,140 @@ mod tests {
         assert!(refs.iter().any(|r| r.source == CheckpointSource::Legacy));
     }
 
+    /// A session owned by a *prior* process instance with a crash-recovery
+    /// checkpoint on disk: the foreign boot-owner stamp keeps
+    /// `session_from_prior_instance` true (the save keeps the original
+    /// owner), and the checkpoint is the durable interrupted sign.
+    fn write_prior_interrupted_session(
+        manager: &SessionManager,
+        id: &str,
+        workspace: &Path,
+    ) -> SavedSession {
+        let mut session = create_saved_session(
+            &[make_test_message("user", "still working")],
+            "test-model",
+            workspace,
+            0,
+            None,
+        );
+        session.metadata.id = id.to_string();
+        session.metadata.title = format!("prior-{id}");
+        manager
+            .record_session_boot_owner(id, "boot_other_instance")
+            .expect("stamp foreign owner");
+        manager.save_session(&session).expect("save session");
+        manager.save_checkpoint(&session).expect("save checkpoint");
+        session
+    }
+
+    #[test]
+    fn interrupted_workspace_session_returns_newest_prior_checkpoint() {
+        let tmp = tempdir().expect("tempdir");
+        let manager = SessionManager::new(tmp.path().join("sessions")).expect("manager");
+        let workspace = tmp.path().join("ws");
+        fs::create_dir_all(&workspace).expect("workspace");
+
+        write_prior_interrupted_session(&manager, "sess-old", &workspace);
+        // Distinct checkpoint mtimes make newest-first deterministic.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        write_prior_interrupted_session(&manager, "sess-new", &workspace);
+
+        // A checkpointed session this instance created is current work, not
+        // prior work: `save_session` stamps the current boot id, and the
+        // checkpoint write keeps it because the record already exists.
+        let own = create_saved_session(
+            &[make_test_message("user", "mine")],
+            "test-model",
+            &workspace,
+            0,
+            None,
+        );
+        manager.save_session(&own).expect("save own");
+        manager.save_checkpoint(&own).expect("checkpoint own");
+
+        // A checkpointed session in another workspace stays invisible.
+        let other_workspace = tmp.path().join("other-ws");
+        fs::create_dir_all(&other_workspace).expect("other workspace");
+        write_prior_interrupted_session(&manager, "sess-elsewhere", &other_workspace);
+
+        assert_eq!(
+            manager
+                .interrupted_workspace_session(&workspace, Some(own.metadata.id.as_str()))
+                .map(|meta| meta.id),
+            Some("sess-new".to_string())
+        );
+        // Excluding the newest surfaces the next interrupted session.
+        assert_eq!(
+            manager
+                .interrupted_workspace_session(&workspace, Some("sess-new"))
+                .map(|meta| meta.id),
+            Some("sess-old".to_string())
+        );
+        assert_eq!(
+            manager
+                .interrupted_workspace_session(&other_workspace, None)
+                .map(|meta| meta.id),
+            Some("sess-elsewhere".to_string())
+        );
+    }
+
+    #[test]
+    fn interrupted_workspace_session_ignores_settled_sessions() {
+        let tmp = tempdir().expect("tempdir");
+        let manager = SessionManager::new(tmp.path().join("sessions")).expect("manager");
+        let workspace = tmp.path().join("ws");
+        fs::create_dir_all(&workspace).expect("workspace");
+
+        // Prior-instance session that settled cleanly: no checkpoint, so it
+        // is not interrupted even though it is prior work.
+        manager
+            .record_session_boot_owner("sess-done", "boot_other_instance")
+            .expect("stamp foreign owner");
+        write_session_record(&manager, "sess-done", &workspace, Utc::now());
+
+        assert!(
+            manager
+                .interrupted_workspace_session(&workspace, None)
+                .is_none()
+        );
+
+        // Excluding the only interrupted session leaves nothing to report.
+        write_prior_interrupted_session(&manager, "sess-prior", &workspace);
+        assert!(
+            manager
+                .interrupted_workspace_session(&workspace, Some("sess-prior"))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn session_recovery_hint_names_the_interrupted_prior_session() {
+        let _lock = crate::test_support::lock_test_env();
+        let tmp = tempdir().expect("tempdir");
+        let home = tmp.path().join("home");
+        let _home = crate::test_support::EnvVarGuard::set("HOME", &home);
+        let _codewhale_home =
+            crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", home.join("codewhale"));
+        let workspace = tmp.path().join("ws");
+        fs::create_dir_all(&workspace).expect("workspace");
+
+        let manager = SessionManager::default_location().expect("default manager");
+        assert!(
+            session_recovery_hint(&workspace, None).is_none(),
+            "clean store must leave the prompt untouched"
+        );
+
+        write_prior_interrupted_session(&manager, "sess-prior", &workspace);
+        let hint = session_recovery_hint(&workspace, Some("sess-live"))
+            .expect("hint for interrupted prior session");
+        assert!(hint.contains("prior-sess-prior"), "{hint}");
+        assert!(hint.contains("session_search"), "{hint}");
+        assert!(hint.contains("/resume"), "{hint}");
+
+        // The live session's own checkpoint is never reported as prior work.
+        assert!(session_recovery_hint(&workspace, Some("sess-prior")).is_none());
+    }
+
     #[test]
     fn legacy_migration_never_overwrites_existing_per_session_checkpoint() {
         let tmp = tempdir().expect("tempdir");
@@ -6984,6 +7401,116 @@ mod tests {
     }
 
     #[test]
+    fn retention_archives_past_the_cap_and_never_unlinks_transcripts() {
+        // #6136: the cap retires transcripts into the archive; it must not
+        // delete what the user never asked to delete.
+        let tmp = tempdir().expect("tempdir");
+        let manager = SessionManager::new(tmp.path().join("sessions")).expect("manager");
+        let mut ids = Vec::new();
+        for index in 0..(MAX_SESSIONS + 3) {
+            let id = Uuid::new_v4().to_string();
+            write_session_with_updated_at(
+                &manager,
+                &id,
+                Utc::now() - chrono::Duration::minutes((MAX_SESSIONS + 3 - index) as i64),
+            );
+            ids.push(id);
+        }
+        manager.cleanup_old_sessions().expect("retention");
+
+        let listed = manager.list_sessions().expect("sessions");
+        assert_eq!(listed.len(), MAX_SESSIONS + 3, "nothing is unlinked");
+        let archived: Vec<&str> = listed
+            .iter()
+            .filter(|session| session.archived)
+            .map(|session| session.id.as_str())
+            .collect();
+        assert_eq!(
+            archived.len(),
+            3,
+            "exactly the overflow is archived: {archived:?}"
+        );
+        for id in &ids[..3] {
+            assert!(archived.contains(&id.as_str()), "{id} must be archived");
+            assert!(
+                manager.validated_session_path(id).expect("path").exists(),
+                "the transcript file survives retention"
+            );
+        }
+        for id in &ids[3..] {
+            assert!(
+                !archived.contains(&id.as_str()),
+                "{id} is inside the cap and must stay active"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_stubs_are_capped_apart_and_never_evict_transcripts() {
+        // #6137: auto-created "New Session" stubs must not occupy (or evict
+        // from) the transcript cap.
+        let tmp = tempdir().expect("tempdir");
+        let manager = SessionManager::new(tmp.path().join("sessions")).expect("manager");
+        for index in 0..MAX_SESSIONS {
+            write_session_with_updated_at(
+                &manager,
+                &Uuid::new_v4().to_string(),
+                Utc::now() - chrono::Duration::minutes((MAX_SESSIONS + 20 - index) as i64),
+            );
+        }
+        let mut stub_ids = Vec::new();
+        for index in 0..(MAX_EMPTY_SESSION_STUBS + 4) {
+            let id = Uuid::new_v4().to_string();
+            write_empty_session_record(
+                &manager,
+                &id,
+                Path::new("/tmp"),
+                Utc::now()
+                    - chrono::Duration::minutes((MAX_EMPTY_SESSION_STUBS + 4 - index) as i64),
+            );
+            stub_ids.push(id);
+        }
+        manager.cleanup_old_sessions().expect("retention");
+
+        let listed = manager.list_sessions().expect("sessions");
+        assert_eq!(
+            listed
+                .iter()
+                .filter(|session| !is_empty_auto_created_session(session) && !session.archived)
+                .count(),
+            MAX_SESSIONS,
+            "stubs never push a transcript out of the cap"
+        );
+        assert!(
+            listed
+                .iter()
+                .filter(|session| !is_empty_auto_created_session(session))
+                .all(|session| !session.archived),
+            "no transcript is archived while only stubs are over their cap"
+        );
+        assert_eq!(
+            listed
+                .iter()
+                .filter(|session| is_empty_auto_created_session(session))
+                .count(),
+            MAX_EMPTY_SESSION_STUBS,
+            "stub retention keeps only the newest stubs"
+        );
+        for id in &stub_ids[..4] {
+            assert!(
+                !manager.validated_session_path(id).expect("path").exists(),
+                "{id} is an old stub and must be removed"
+            );
+        }
+        for id in &stub_ids[4..] {
+            assert!(
+                manager.validated_session_path(id).expect("path").exists(),
+                "{id} is among the newest stubs and must stay"
+            );
+        }
+    }
+
+    #[test]
     fn prune_sessions_older_than_returns_zero_for_empty_dir() {
         let tmp = tempdir().expect("tempdir");
         let manager = SessionManager::new(tmp.path().join("sessions")).expect("new");
@@ -7209,5 +7736,98 @@ mod tests {
                 io::ErrorKind::InvalidInput
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod storage_compatible_tests {
+    use super::*;
+
+    fn user(text: &str) -> Message {
+        Message {
+            role: codewhale_models::Role::from("user"),
+            content: vec![codewhale_models::ContentBlock::Text {
+                text: text.to_string(),
+                cache_control: None,
+            }],
+        }
+    }
+
+    /// The no-op cases must stay no-ops, byte for byte.
+    ///
+    /// `make_storage_compatible` replaced a clone-and-return-`Option` helper
+    /// (#6214 T3). Two of that helper's paths returned `None`, and the caller
+    /// then serialized the *original* — so a `metadata.message_count` that
+    /// disagrees with `messages.len()` survived untouched. Rewriting it in
+    /// place would silently edit live data on every save, and nothing else in
+    /// the suite catches that.
+    #[test]
+    fn make_storage_compatible_leaves_the_no_op_cases_byte_identical() {
+        let workspace = std::env::temp_dir();
+        let messages = vec![user("one"), user("two")];
+
+        // 1. No journal at all (legacy, pre-journal files): untouched.
+        let mut legacy = create_saved_session(&messages, "test-model", &workspace, 0, None);
+        legacy.journal = None;
+        legacy.metadata.message_count = 99; // deliberately disagrees
+        let before = serde_json::to_string_pretty(&legacy).expect("legacy json");
+        let mut after_session = legacy.clone();
+        after_session.make_storage_compatible();
+        assert_eq!(
+            serde_json::to_string_pretty(&after_session).expect("legacy json"),
+            before,
+            "a session with no journal must serialize exactly as it arrived"
+        );
+        assert_eq!(after_session.metadata.message_count, 99);
+
+        // 2. Journal present and `messages` already equals its active branch:
+        //    still untouched, including the disagreeing count.
+        let mut settled = create_saved_session(&messages, "test-model", &workspace, 0, None);
+        assert!(settled.journal.is_some(), "fixture must carry a journal");
+        settled.messages = settled
+            .journal
+            .as_ref()
+            .expect("journal present")
+            .to_messages();
+        settled.metadata.message_count = 99;
+        let before = serde_json::to_string_pretty(&settled).expect("settled json");
+        let mut after_session = settled.clone();
+        after_session.make_storage_compatible();
+        assert_eq!(
+            serde_json::to_string_pretty(&after_session).expect("settled json"),
+            before,
+            "an already-consistent session must not be rewritten"
+        );
+        assert_eq!(
+            after_session.metadata.message_count, 99,
+            "the early return must happen before message_count is recomputed"
+        );
+    }
+
+    /// The queued (journal-only) path is what the debounced flush actually
+    /// writes: `compact_for_persistence_queue` empties `messages` first.
+    #[test]
+    fn make_storage_compatible_rehydrates_a_compacted_queue_snapshot() {
+        let workspace = std::env::temp_dir();
+        let messages = vec![user("one"), user("two"), user("three")];
+        let mut session = create_saved_session(&messages, "test-model", &workspace, 0, None);
+        let expected = session
+            .journal
+            .as_ref()
+            .expect("journal present")
+            .to_messages();
+
+        session.compact_for_persistence_queue();
+        assert!(
+            session.messages.is_empty(),
+            "the queued snapshot is journal-only"
+        );
+
+        session.make_storage_compatible();
+        assert_eq!(
+            session.messages, expected,
+            "the compat projection is rebuilt from the journal"
+        );
+        assert_eq!(session.metadata.message_count, expected.len());
     }
 }

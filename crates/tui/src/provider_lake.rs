@@ -287,7 +287,7 @@ fn replace_provider_live_snapshot_for_owner(owner: LivePartitionOwner, snapshot:
 
 /// Clear all live snapshots (both Models.dev and per-provider partitions).
 /// Used by tests and shutdown paths that need a full reset.
-#[allow(dead_code)]
+#[cfg_attr(not(test), expect(dead_code))]
 pub fn clear_live_snapshot() {
     if let Ok(mut guard) = LIVE_SNAPSHOT.write() {
         guard.models_dev = None;

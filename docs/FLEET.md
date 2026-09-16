@@ -123,6 +123,10 @@ requirements belong on executable role members and are refused on shortlist rows
 - `/fleet add <provider> <model> [role…]` adds a model (one member row per
   role, or one `shortlist = true` row for a role-less add). The provider must be one you configured
   and, when the catalog knows the provider, must serve that exact id.
+  A role member asked to run the fleet's own operator route inherits it
+  instead of pinning — the role follows when the operator moves; a pin on
+  any other route is the deliberate opt-out. Files that already pin the
+  operator route are read as inheritance.
   With no fleet selected, a user-global fleet named `My fleet` is created and
   selected first. `/fleet remove <provider> <model>` drops every row that pins
   the route; the operator route is changed with `/fleet save`, not removed.

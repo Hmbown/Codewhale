@@ -71,6 +71,32 @@ impl ModelsDevCatalog {
         self.provider(provider_id)?.models.get(wire_model_id.trim())
     }
 
+    /// Resolve the sourced `reasoning` fact for a model id, wherever the
+    /// catalog carries the row: the provider-agnostic `models` map, or any
+    /// provider's scoped rows (OpenRouter-style rows are keyed by the full
+    /// `vendor/model` id, so compound ids match verbatim). The id must match
+    /// exactly — no provider aliasing, no prefix inference (#6032).
+    ///
+    /// Returns `None` when no row for the id states the fact, or when rows
+    /// disagree across providers — a conflict stays unknown rather than
+    /// guessed.
+    #[must_use]
+    pub fn reasoning_support(&self, model_id: &str) -> Option<bool> {
+        let key = model_id.trim();
+        let mut sourced = self.models.get(key).and_then(|model| model.reasoning);
+        for provider in self.providers.values() {
+            let Some(reasoning) = provider.models.get(key).and_then(|row| row.reasoning) else {
+                continue;
+            };
+            match sourced {
+                None => sourced = Some(reasoning),
+                Some(known) if known == reasoning => {}
+                Some(_) => return None,
+            }
+        }
+        sourced
+    }
+
     /// Build a route offering from a provider-scoped Models.dev row.
     ///
     /// The canonical model is set only when the row carries an explicit
@@ -599,6 +625,47 @@ mod tests {
             Some("zhipuai/glm-5.2")
         );
         assert_eq!(offering.wire_model_id.as_str(), "z-ai/glm-5.2");
+    }
+
+    #[test]
+    fn reasoning_support_reads_top_level_and_provider_rows_exactly() {
+        let catalog = ModelsDevCatalog::parse_json(GLM_FIXTURE).expect("fixture parses");
+        // Compound canonical id (top-level map) and bare provider ids.
+        assert_eq!(catalog.reasoning_support("zhipuai/glm-5.2"), Some(true));
+        assert_eq!(catalog.reasoning_support("glm-5.2"), Some(true));
+        // Unknown id stays unknown; no prefix or alias inference.
+        assert_eq!(catalog.reasoning_support("glm-5.1"), None);
+        assert_eq!(catalog.reasoning_support("zai/glm-5.2"), None);
+        // Ids must match exactly, not after provider splitting.
+        assert_eq!(catalog.reasoning_support("zhipuai/glm-5.2 "), Some(true));
+    }
+
+    #[test]
+    fn reasoning_support_stays_unknown_on_disagreeing_rows() {
+        let raw = r#"{
+          "providers": {
+            "one": {
+              "models": {
+                "split-fact": { "id": "split-fact", "reasoning": true }
+              }
+            },
+            "two": {
+              "models": {
+                "split-fact": { "id": "split-fact", "reasoning": false }
+              }
+            },
+            "three": {
+              "models": {
+                "silent-fact": { "id": "silent-fact" }
+              }
+            }
+          }
+        }"#;
+        let catalog = ModelsDevCatalog::parse_json(raw).expect("fixture parses");
+        // A row that states nothing is not a vote; one sourced row resolves.
+        assert_eq!(catalog.reasoning_support("silent-fact"), None);
+        // Providers disagreeing on the fact stays unknown — never guessed (#6032).
+        assert_eq!(catalog.reasoning_support("split-fact"), None);
     }
 
     #[test]

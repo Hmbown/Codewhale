@@ -14,7 +14,7 @@ struct Fixture {
     release_report: Arc<Notify>,
     cancel: CancellationToken,
     resume_runtime: SubAgentRuntime,
-    completions: mpsc::UnboundedReceiver<SubAgentCompletion>,
+    completions: mpsc::Receiver<SubAgentCompletion>,
     mailbox: MailboxReceiver,
 }
 
@@ -161,7 +161,7 @@ async fn fixture(
         Duration::from_secs(2)
     };
     let cancel = runtime.cancel_token.clone();
-    let (parent_tx, completions) = mpsc::unbounded_channel();
+    let (parent_tx, completions) = mpsc::channel(16);
     runtime.parent_completion_tx = Some(parent_tx);
     let (mailbox, mailbox_rx) = Mailbox::new(CancellationToken::new());
     runtime.mailbox = Some(mailbox);
@@ -870,4 +870,88 @@ async fn budget_handback_expired_original_deadline_refuses_the_model_call() {
             .handback_reservations
             .is_empty()
     );
+}
+
+fn git(root: &Path, args: &[&str]) {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .output()
+        .expect("git");
+    assert!(
+        output.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// #5529: a budget death must name the work the worker left on disk. The
+/// spawn-time delivery baseline is what makes the inventory attributable to
+/// this worker rather than the parent's own dirty files.
+#[tokio::test]
+async fn budget_death_preservation_note_names_surviving_workspace_changes() {
+    let tmp = tempdir().unwrap();
+    let root = tmp.path();
+    git(root, &["init", "--quiet"]);
+    git(root, &["config", "user.name", "Budget test"]);
+    git(root, &["config", "user.email", "budget@example.invalid"]);
+    fs::write(root.join("src.rs"), "baseline\n").unwrap();
+    git(root, &["add", "--", "src.rs"]);
+    git(root, &["commit", "--quiet", "-m", "baseline"]);
+
+    let manager = Arc::new(RwLock::new(SubAgentManager::new(root.to_path_buf(), 2)));
+    let mut spec = make_worker_spec("preserve-worker", root.to_path_buf());
+    spec.runtime_profile.permissions.write = true;
+    manager.write().await.register_worker(spec);
+
+    // The worker's unfinished work lands after the baseline was captured.
+    fs::create_dir_all(root.join("scratch")).unwrap();
+    fs::write(root.join("scratch/leftover.rs"), "wip\n").unwrap();
+
+    let mut runtime = stub_runtime();
+    runtime.manager = Arc::clone(&manager);
+
+    let note = budget_work_preservation_note(&runtime, "preserve-worker")
+        .await
+        .expect("write-scoped worker has a baseline");
+    assert!(
+        note.contains("scratch/leftover.rs"),
+        "note should name the surviving path: {note}"
+    );
+    assert!(note.contains(&root.display().to_string()), "{note}");
+
+    // A read-only worker captured no baseline — there is no file work to
+    // inventory and the note stays absent rather than lying.
+    let mut scout_spec = make_worker_spec("scout-worker", root.to_path_buf());
+    scout_spec.runtime_profile.permissions.write = false;
+    manager.write().await.register_worker(scout_spec);
+    assert!(
+        budget_work_preservation_note(&runtime, "scout-worker")
+            .await
+            .is_none()
+    );
+
+    // A write-scoped worker that changed nothing still gets an explicit
+    // "no changes" receipt instead of silence.
+    let mut clean_spec = make_worker_spec("clean-worker", root.to_path_buf());
+    clean_spec.runtime_profile.permissions.write = true;
+    clean_spec.workspace = root.to_path_buf();
+    let clean_root = tempdir().unwrap();
+    let clean_path = clean_root.path();
+    git(clean_path, &["init", "--quiet"]);
+    git(clean_path, &["config", "user.name", "Budget test"]);
+    git(
+        clean_path,
+        &["config", "user.email", "budget@example.invalid"],
+    );
+    fs::write(clean_path.join("src.rs"), "baseline\n").unwrap();
+    git(clean_path, &["add", "--", "src.rs"]);
+    git(clean_path, &["commit", "--quiet", "-m", "baseline"]);
+    clean_spec.workspace = clean_path.to_path_buf();
+    manager.write().await.register_worker(clean_spec);
+    let note = budget_work_preservation_note(&runtime, "clean-worker")
+        .await
+        .expect("baseline exists");
+    assert!(note.contains("No workspace changes"), "{note}");
 }

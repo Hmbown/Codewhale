@@ -338,13 +338,21 @@ pub fn summarize_mcp_output(output: &str) -> McpOutputSummary {
 
 #[must_use]
 pub fn output_is_image(output: &str) -> bool {
-    let lower = output.to_lowercase();
-
-    [
+    // Sniff the extensions case-insensitively over the raw bytes. Lowercasing
+    // the whole output first copied every byte of a payload that can run to
+    // hundreds of kilobytes, once per MCP completion, to answer a question
+    // about eight ASCII suffixes.
+    const IMAGE_EXTENSIONS: [&str; 8] = [
         ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tiff", ".ppm",
-    ]
-    .iter()
-    .any(|ext| lower.contains(ext))
+    ];
+
+    let bytes = output.as_bytes();
+    IMAGE_EXTENSIONS.iter().any(|ext| {
+        let needle = ext.as_bytes();
+        bytes
+            .windows(needle.len())
+            .any(|window| window.eq_ignore_ascii_case(needle))
+    })
 }
 
 fn render_preserved_output_mode(
@@ -636,7 +644,7 @@ fn is_path_or_url_like(line: &str) -> bool {
 }
 
 /// Detect whether a line contains a `path:line` pattern that could be
-/// opened by `try_open_file_at_line`. Returns a distinctive style
+/// opened by `first_file_line_reference`. Returns a distinctive style
 /// (underline + blue) when the pattern matches, or `None` otherwise.
 /// The style is applied over the existing value style so the line
 /// remains readable.
@@ -902,5 +910,19 @@ mod ansi_colour_tests {
         let rows = output_rows("done\x1b[0m", 80);
         assert_eq!(rows[0].text, "done");
         assert!(rows[0].styled.is_none());
+    }
+
+    #[test]
+    fn image_sniffing_is_case_insensitive_over_the_raw_bytes() {
+        assert!(output_is_image("saved to /tmp/Chart.PNG"));
+        assert!(output_is_image("shot.jpeg"));
+        assert!(output_is_image(".WEBP"));
+        assert!(!output_is_image("no image here"));
+        // The historical `contains` contract is preserved: a name that merely
+        // embeds an extension still counts.
+        assert!(output_is_image("weird.pngx"));
+        // A byte-window scan must not panic on multi-byte text.
+        assert!(!output_is_image("日本語のテキストのみ"));
+        assert!(!output_is_image(""));
     }
 }

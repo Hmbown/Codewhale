@@ -470,7 +470,7 @@ async fn run_now(
                     AutomationCellKind::Started
                 }
                 AutomationRunStatus::Completed => AutomationCellKind::Completed,
-                AutomationRunStatus::Canceled => AutomationCellKind::Mutated,
+                AutomationRunStatus::Canceled => AutomationCellKind::Canceled,
             };
             // The operator asked for this run by hand: echo its full id so
             // it can be copied straight from the receipt.
@@ -486,16 +486,9 @@ async fn run_now(
                 detail.push_str(&display_text(error));
             }
             let name = name.unwrap_or_else(|| id.to_string());
-            let cell = if run.status == AutomationRunStatus::Canceled {
-                AutomationCell::mutated(
-                    name,
-                    tr(locale, MessageId::AutomationRunStatusCanceled).into_owned(),
-                )
-                .with_detail(Some(detail))
-            } else {
-                AutomationCell::event(kind, name, locale).with_detail(Some(detail))
-            };
-            HistoryCell::Automation(cell)
+            HistoryCell::Automation(
+                AutomationCell::event(kind, name, locale).with_detail(Some(detail)),
+            )
         }
         Err(error) => system(action_failed(
             locale,
@@ -510,10 +503,13 @@ async fn run_now(
 /// `Documentation completed in background  42s · run r-8f19`). `Completed`
 /// wears Outcome ink; a genuinely failed run is the one receipt that wears
 /// Failure, and its detail leads with the (redacted) error.
+/// A canceled run (#6162) wears Attention ink and its detail leads with the
+/// cancellation reason, so a stopped run is never silent and never red.
 pub(super) fn settled_run_receipt(locale: Locale, run: &SettledRun) -> HistoryCell {
     let kind = match run.outcome {
         SettledOutcome::Completed => AutomationCellKind::Completed,
         SettledOutcome::Failed => AutomationCellKind::Failed,
+        SettledOutcome::Canceled => AutomationCellKind::Canceled,
     };
     let mut parts = Vec::new();
     if let Some(error) = run
@@ -774,6 +770,38 @@ mod tests {
                 assert_ne!(tr(*locale, id).as_ref(), format!("{id:?}"), "{locale:?}");
             }
         }
+    }
+
+    /// #6162: a canceled run gets a receipt of its own — attention ink, the
+    /// `canceled` verb, and the cancellation reason leading the detail — so a
+    /// stopped run is never silent and never dressed as a crash.
+    #[test]
+    fn a_canceled_run_settles_with_a_canceled_receipt() {
+        let canceled = settled_run_receipt(
+            Locale::En,
+            &SettledRun {
+                automation_id: "auto_1".to_string(),
+                automation_name: "Documentation".to_string(),
+                run_id: "r-8f21deadbeef-0000".to_string(),
+                outcome: SettledOutcome::Canceled,
+                duration_ms: Some(3_000),
+                error: Some("canceled by request".to_string()),
+            },
+        );
+        let HistoryCell::Automation(cell) = canceled else {
+            panic!("a settled run is a typed Automation receipt");
+        };
+        assert_eq!(cell.kind, AutomationCellKind::Canceled);
+        assert_eq!(
+            cell.kind.chrome_ink(),
+            codewhale_palette::ChromeInk::Attention
+        );
+        assert_eq!(cell.name, "Documentation");
+        assert_eq!(cell.verb, "canceled");
+        assert_eq!(
+            cell.detail.as_deref(),
+            Some("canceled by request · 3s · run r-8f21deadbe")
+        );
     }
 
     #[test]

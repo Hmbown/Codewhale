@@ -211,7 +211,9 @@ async fn terminal_barrier_keeps_healthy_child_and_late_completion_alive() {
     let (mailbox, _receiver) = Mailbox::new(turn_token.clone());
     let children = Arc::new(ForegroundChildRegistry::new());
     let child_token = turn_token.child_token();
-    let registration = children.register(child_token.clone()).unwrap();
+    let registration = children
+        .register(child_token.clone(), "agent_healthy")
+        .unwrap();
     let parking = registration.parking_signal();
     let (complete_tx, mut complete_rx) = tokio::sync::mpsc::unbounded_channel();
     let (release_tx, release_rx) = tokio::sync::oneshot::channel();
@@ -231,6 +233,7 @@ async fn terminal_barrier_keeps_healthy_child_and_late_completion_alive() {
         foreground_children: Arc::clone(&children),
         flush_tx,
         drain_handle,
+        settle_grace: Duration::from_secs(1),
     };
     tokio::time::timeout(Duration::from_secs(1), barrier.continue_and_flush())
         .await
@@ -250,7 +253,9 @@ async fn terminal_barrier_explicit_cancel_still_joins_owned_child() {
     let (mailbox, _receiver) = Mailbox::new(turn_token.clone());
     let children = Arc::new(ForegroundChildRegistry::new());
     let child_token = turn_token.child_token();
-    let registration = children.register(child_token.clone()).unwrap();
+    let registration = children
+        .register(child_token.clone(), "agent_owned")
+        .unwrap();
     let child = tokio::spawn(async move {
         child_token.cancelled().await;
         drop(registration);
@@ -265,12 +270,96 @@ async fn terminal_barrier_explicit_cancel_still_joins_owned_child() {
         foreground_children: Arc::clone(&children),
         flush_tx,
         drain_handle,
+        settle_grace: Duration::from_secs(1),
     };
-    tokio::time::timeout(Duration::from_secs(1), barrier.cancel_and_flush())
+    let unsettled = tokio::time::timeout(Duration::from_secs(1), barrier.cancel_and_flush())
         .await
         .unwrap();
+    assert!(unsettled.is_empty(), "cooperative children join cleanly");
     child.await.unwrap();
     assert_eq!(children.active_count(), 0);
+}
+
+/// Regression for #6184: a foreground child parked on an await that never
+/// observes its cancel token must not withhold the terminal turn event. The
+/// join gives up at `settle_grace` and names the child it left behind.
+#[tokio::test]
+async fn terminal_barrier_cancel_names_child_that_ignores_cancellation() {
+    let turn_token = CancellationToken::new();
+    let (mailbox, _receiver) = Mailbox::new(turn_token.clone());
+    let children = Arc::new(ForegroundChildRegistry::new());
+    let child_token = turn_token.child_token();
+    // The fake child keeps its registration for the whole test — it never
+    // observes the cancel token, like a task parked on a blocking await.
+    let registration = children
+        .register(child_token.clone(), "agent_stuck")
+        .unwrap();
+    let (flush_tx, flush_rx) = tokio::sync::oneshot::channel();
+    let drain_handle = tokio::spawn(async {
+        let _ = flush_rx.await;
+    });
+    let barrier = TurnMailboxBarrier {
+        mailbox,
+        cancel_token: turn_token.clone(),
+        foreground_children: Arc::clone(&children),
+        flush_tx,
+        drain_handle,
+        settle_grace: Duration::from_millis(50),
+    };
+    // Esc latches the turn token before the barrier runs, so the grace
+    // window — not the token — is the bound under test.
+    turn_token.cancel();
+    let unsettled = tokio::time::timeout(Duration::from_secs(1), barrier.cancel_and_flush())
+        .await
+        .expect("the bounded join must not wait on a parked child");
+    assert_eq!(unsettled, vec!["agent_stuck".to_string()]);
+    assert!(
+        child_token.is_cancelled(),
+        "the bounded join still cancels the child's token"
+    );
+    assert_eq!(
+        children.active_count(),
+        1,
+        "the stuck child is left registered — leaked, not awaited"
+    );
+    drop(registration);
+    assert_eq!(children.active_count(), 0);
+}
+
+/// A turn that fails without user cancellation runs the same barrier with a
+/// live turn token: Esc during the join must still break it rather than sit
+/// out the whole grace period (#6184).
+#[tokio::test]
+async fn terminal_barrier_cancel_join_breaks_on_fresh_esc() {
+    let turn_token = CancellationToken::new();
+    let (mailbox, _receiver) = Mailbox::new(turn_token.clone());
+    let children = Arc::new(ForegroundChildRegistry::new());
+    let registration = children
+        .register(turn_token.child_token(), "agent_stuck")
+        .unwrap();
+    let (flush_tx, flush_rx) = tokio::sync::oneshot::channel();
+    let drain_handle = tokio::spawn(async {
+        let _ = flush_rx.await;
+    });
+    let barrier = TurnMailboxBarrier {
+        mailbox,
+        cancel_token: turn_token.clone(),
+        foreground_children: Arc::clone(&children),
+        flush_tx,
+        drain_handle,
+        settle_grace: Duration::from_secs(30),
+    };
+    let esc = turn_token.clone();
+    let esc_task = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        esc.cancel();
+    });
+    let unsettled = tokio::time::timeout(Duration::from_secs(1), barrier.cancel_and_flush())
+        .await
+        .expect("a fresh Esc must break the join before its grace expires");
+    assert_eq!(unsettled, vec!["agent_stuck".to_string()]);
+    esc_task.await.unwrap();
+    drop(registration);
 }
 
 mod compaction;
@@ -599,7 +688,7 @@ async fn exact_turn_snapshot_restores_custom_endpoint_and_turn_receipt_after_bui
 
     let run_task = tokio::spawn(engine.run());
     handle
-        .send(Op::SendMessage {
+        .send(Op::SendMessage(TurnSpec {
             max_output_tokens: None,
             content: "verify exact route".to_string(),
             images: Vec::new(),
@@ -626,7 +715,7 @@ async fn exact_turn_snapshot_restores_custom_endpoint_and_turn_receipt_after_bui
             hook_executor: None,
             verbosity: None,
             provenance: UserInputProvenance::ExternalUser,
-        })
+        }))
         .await
         .expect("send exact custom turn");
 
@@ -975,7 +1064,7 @@ async fn goal_continuation_preserves_goal_and_resolves_updated_authoritative_rou
     let goal_state = engine.config.goal_state.clone();
 
     handle
-        .send(Op::SendMessage {
+        .send(Op::SendMessage(TurnSpec {
             max_output_tokens: None,
             content: "first turn".to_string(),
             images: Vec::new(),
@@ -999,7 +1088,7 @@ async fn goal_continuation_preserves_goal_and_resolves_updated_authoritative_rou
             hook_executor: None,
             verbosity: None,
             provenance: UserInputProvenance::ExternalUser,
-        })
+        }))
         .await
         .expect("send first goal turn");
 
@@ -1257,7 +1346,7 @@ async fn saturated_mailbox_does_not_deadlock_goal_continuation_self_dispatch() {
     let run_task = tokio::spawn(engine.run());
 
     handle
-        .send(Op::SendMessage {
+        .send(Op::SendMessage(TurnSpec {
             max_output_tokens: None,
             content: "start the saturated goal turn".to_string(),
             images: Vec::new(),
@@ -1281,7 +1370,7 @@ async fn saturated_mailbox_does_not_deadlock_goal_continuation_self_dispatch() {
             hook_executor: None,
             verbosity: None,
             provenance: UserInputProvenance::ExternalUser,
-        })
+        }))
         .await
         .expect("send saturated goal turn");
     tokio::time::timeout(model_turn_event_timeout(), request_entered.notified())
@@ -1388,30 +1477,32 @@ async fn queued_ordinary_turn_does_not_multiply_engine_goal_continuations() {
     let (engine, handle) = Engine::new_with_model_client(engine_config, &config, client);
     let goal_state = engine.config.goal_state.clone();
     let run_task = tokio::spawn(engine.run());
-    let send_message = |content: &str| Op::SendMessage {
-        max_output_tokens: None,
-        content: content.to_string(),
-        images: Vec::new(),
-        mode: AppMode::Agent,
-        route: resolved_route_for_test(&config, "local-model"),
-        compaction: Box::new(CompactionConfig::default()),
-        initial_routed_usage: Box::default(),
-        goal_objective: Some("coalesce queued goal turns".to_string()),
-        goal_token_budget: None,
-        goal_status: crate::tools::goal::GoalStatus::Active,
-        reasoning_effort: None,
-        reasoning_effort_auto: false,
-        auto_model: false,
-        allow_shell: false,
-        trust_mode: false,
-        auto_approve: false,
-        approval_mode: ApprovalMode::Suggest,
-        translation_enabled: false,
-        allowed_tools: None,
-        dynamic_tools: Vec::new(),
-        hook_executor: None,
-        verbosity: None,
-        provenance: UserInputProvenance::ExternalUser,
+    let send_message = |content: &str| {
+        Op::SendMessage(TurnSpec {
+            max_output_tokens: None,
+            content: content.to_string(),
+            images: Vec::new(),
+            mode: AppMode::Agent,
+            route: resolved_route_for_test(&config, "local-model"),
+            compaction: Box::new(CompactionConfig::default()),
+            initial_routed_usage: Box::default(),
+            goal_objective: Some("coalesce queued goal turns".to_string()),
+            goal_token_budget: None,
+            goal_status: crate::tools::goal::GoalStatus::Active,
+            reasoning_effort: None,
+            reasoning_effort_auto: false,
+            auto_model: false,
+            allow_shell: false,
+            trust_mode: false,
+            auto_approve: false,
+            approval_mode: ApprovalMode::Suggest,
+            translation_enabled: false,
+            allowed_tools: None,
+            dynamic_tools: Vec::new(),
+            hook_executor: None,
+            verbosity: None,
+            provenance: UserInputProvenance::ExternalUser,
+        })
     };
 
     handle
@@ -2393,7 +2484,7 @@ async fn saturated_goal_controls_run_before_ready_idle_child_completion() {
     assert_eq!(handle.tx_op.capacity(), 0, "fixture must saturate mailbox");
     engine
         .tx_subagent_completion
-        .send(SubAgentCompletion {
+        .try_send(SubAgentCompletion {
             owner_session_id: engine.session.id.clone(),
             agent_id: "agent_ready_during_backpressure".to_string(),
             payload: "ready child completion".to_string(),
@@ -2491,7 +2582,7 @@ async fn unsaturated_goal_control_runs_before_ready_idle_child_completion() {
         .expect("queue unsaturated pause");
     engine
         .tx_subagent_completion
-        .send(SubAgentCompletion {
+        .try_send(SubAgentCompletion {
             owner_session_id: engine.session.id.clone(),
             agent_id: "agent_ready_without_backpressure".to_string(),
             payload: "ready child completion".to_string(),
@@ -2588,7 +2679,7 @@ async fn cross_turn_token_budget_exhaustion_does_not_pause_goal() {
     let run_task = tokio::spawn(engine.run());
 
     handle
-        .send(Op::SendMessage {
+        .send(Op::SendMessage(TurnSpec {
             max_output_tokens: None,
             content: "start budgeted goal".to_string(),
             images: Vec::new(),
@@ -2612,7 +2703,7 @@ async fn cross_turn_token_budget_exhaustion_does_not_pause_goal() {
             hook_executor: None,
             verbosity: None,
             provenance: UserInputProvenance::ExternalUser,
-        })
+        }))
         .await
         .expect("send budgeted goal turn");
 
@@ -3048,7 +3139,7 @@ async fn explicit_natural_goal_activates_before_provider_request() {
     let run_task = tokio::spawn(engine.run());
 
     handle
-        .send(Op::SendMessage {
+        .send(Op::SendMessage(TurnSpec {
             max_output_tokens: None,
             content: "hello - take over and make it your /goal to solve navier stokes".to_string(),
             images: Vec::new(),
@@ -3072,7 +3163,7 @@ async fn explicit_natural_goal_activates_before_provider_request() {
             hook_executor: None,
             verbosity: None,
             provenance: UserInputProvenance::ExternalUser,
-        })
+        }))
         .await
         .expect("send explicit natural goal turn");
 
@@ -3161,7 +3252,7 @@ async fn operate_goal_probe(mode: AppMode, prompt: &str) -> (Option<String>, boo
     let run_task = tokio::spawn(engine.run());
 
     handle
-        .send(Op::SendMessage {
+        .send(Op::SendMessage(TurnSpec {
             max_output_tokens: None,
             content: prompt.to_string(),
             images: Vec::new(),
@@ -3185,7 +3276,7 @@ async fn operate_goal_probe(mode: AppMode, prompt: &str) -> (Option<String>, boo
             hook_executor: None,
             verbosity: None,
             provenance: UserInputProvenance::ExternalUser,
-        })
+        }))
         .await
         .expect("send probe turn");
 
@@ -3337,30 +3428,32 @@ async fn operate_contract_is_appended_once_and_an_existing_goal_is_never_replace
     let goal_state = engine.config.goal_state.clone();
     let run_task = tokio::spawn(engine.run());
 
-    let send = |content: &str, goal_objective: Option<String>, goal_status| Op::SendMessage {
-        max_output_tokens: None,
-        content: content.to_string(),
-        images: Vec::new(),
-        mode: AppMode::Operate,
-        route: resolved_route_for_test(&config, "local-model"),
-        compaction: Box::new(CompactionConfig::default()),
-        initial_routed_usage: Box::default(),
-        goal_objective,
-        goal_token_budget: None,
-        goal_status,
-        reasoning_effort: None,
-        reasoning_effort_auto: false,
-        auto_model: false,
-        allow_shell: false,
-        trust_mode: false,
-        auto_approve: false,
-        approval_mode: ApprovalMode::Suggest,
-        translation_enabled: false,
-        allowed_tools: None,
-        dynamic_tools: Vec::new(),
-        hook_executor: None,
-        verbosity: None,
-        provenance: UserInputProvenance::ExternalUser,
+    let send = |content: &str, goal_objective: Option<String>, goal_status| {
+        Op::SendMessage(TurnSpec {
+            max_output_tokens: None,
+            content: content.to_string(),
+            images: Vec::new(),
+            mode: AppMode::Operate,
+            route: resolved_route_for_test(&config, "local-model"),
+            compaction: Box::new(CompactionConfig::default()),
+            initial_routed_usage: Box::default(),
+            goal_objective,
+            goal_token_budget: None,
+            goal_status,
+            reasoning_effort: None,
+            reasoning_effort_auto: false,
+            auto_model: false,
+            allow_shell: false,
+            trust_mode: false,
+            auto_approve: false,
+            approval_mode: ApprovalMode::Suggest,
+            translation_enabled: false,
+            allowed_tools: None,
+            dynamic_tools: Vec::new(),
+            hook_executor: None,
+            verbosity: None,
+            provenance: UserInputProvenance::ExternalUser,
+        })
     };
 
     let first =
@@ -4018,7 +4111,7 @@ async fn headless_host_drains_existing_engine_completion_inbox_before_exit() {
         .unwrap();
     engine
         .tx_subagent_completion
-        .send(SubAgentCompletion {
+        .try_send(SubAgentCompletion {
             owner_session_id: engine.session.id.clone(),
             agent_id: "headless-settled-child".into(),
             payload: "bounded local fixture evidence".into(),
@@ -4108,7 +4201,7 @@ async fn host_managed_engine_does_not_self_dispatch_goal_continuation() {
     let run_task = tokio::spawn(engine.run());
 
     handle
-        .send(Op::SendMessage {
+        .send(Op::SendMessage(TurnSpec {
             max_output_tokens: None,
             content: "one host-owned turn".to_string(),
             images: Vec::new(),
@@ -4132,7 +4225,7 @@ async fn host_managed_engine_does_not_self_dispatch_goal_continuation() {
             hook_executor: None,
             verbosity: None,
             provenance: UserInputProvenance::ExternalUser,
-        })
+        }))
         .await
         .expect("send host-owned goal turn");
 
@@ -4368,7 +4461,7 @@ async fn host_managed_engine_defers_idle_subagent_completion_to_explicit_turn() 
     let run_task = tokio::spawn(engine.run());
 
     tx_subagent_completion
-        .send(SubAgentCompletion {
+        .try_send(SubAgentCompletion {
             owner_session_id,
             agent_id: "agent_deferred".to_string(),
             payload: "deferred child result".to_string(),
@@ -4384,7 +4477,7 @@ async fn host_managed_engine_defers_idle_subagent_completion_to_explicit_turn() 
     );
 
     handle
-        .send(Op::SendMessage {
+        .send(Op::SendMessage(TurnSpec {
             max_output_tokens: None,
             content: "claim the next turn".to_string(),
             images: Vec::new(),
@@ -4408,7 +4501,7 @@ async fn host_managed_engine_defers_idle_subagent_completion_to_explicit_turn() 
             hook_executor: None,
             verbosity: None,
             provenance: UserInputProvenance::ExternalUser,
-        })
+        }))
         .await
         .expect("send explicit host turn");
 
@@ -5075,7 +5168,7 @@ async fn healthy_owned_children_do_not_force_another_parent_model_turn() {
         let children = Arc::new(ForegroundChildRegistry::new());
         let child_cancel = CancellationToken::new();
         let registration = children
-            .register(child_cancel.clone())
+            .register(child_cancel.clone(), "agent_child")
             .expect("child registered");
         let mut turn = crate::core::turn::TurnContext::new(max_steps);
 
@@ -5124,6 +5217,7 @@ async fn user_steer_during_parent_answer_still_gets_a_reply_with_healthy_childre
             .try_send(handle::SteerInput {
                 turn_id,
                 content: "Also read state.txt and include its evidence.".to_string(),
+                outcome: None,
             })
             .expect("steer channel open");
         canned::simple_text_turn("The workflow is still running.")
@@ -5145,7 +5239,7 @@ async fn user_steer_during_parent_answer_still_gets_a_reply_with_healthy_childre
     let children = Arc::new(ForegroundChildRegistry::new());
     let child_cancel = CancellationToken::new();
     let registration = children
-        .register(child_cancel.clone())
+        .register(child_cancel.clone(), "agent_child")
         .expect("child registered");
     let mut turn = crate::core::turn::TurnContext::new(8);
 
@@ -5806,7 +5900,7 @@ fn active_goal_message_op(
     objective: &str,
     token_budget: Option<u32>,
 ) -> Op {
-    Op::SendMessage {
+    Op::SendMessage(TurnSpec {
         max_output_tokens: None,
         content: content.to_string(),
         images: Vec::new(),
@@ -5830,7 +5924,7 @@ fn active_goal_message_op(
         hook_executor: None,
         verbosity: None,
         provenance: UserInputProvenance::ExternalUser,
-    }
+    })
 }
 
 fn system_prompt_text(prompt: SystemPrompt) -> String {
@@ -5845,7 +5939,7 @@ fn system_prompt_text(prompt: SystemPrompt) -> String {
 }
 
 fn external_user_message_op(content: &str, mode: AppMode, config: &Config) -> Op {
-    Op::SendMessage {
+    Op::SendMessage(TurnSpec {
         max_output_tokens: None,
         content: content.to_string(),
         images: Vec::new(),
@@ -5869,11 +5963,11 @@ fn external_user_message_op(content: &str, mode: AppMode, config: &Config) -> Op
         hook_executor: None,
         verbosity: None,
         provenance: UserInputProvenance::ExternalUser,
-    }
+    })
 }
 
 fn auto_review_message_op(content: &str, config: &Config) -> Op {
-    Op::SendMessage {
+    Op::SendMessage(TurnSpec {
         max_output_tokens: None,
         content: content.to_string(),
         images: Vec::new(),
@@ -5897,7 +5991,7 @@ fn auto_review_message_op(content: &str, config: &Config) -> Op {
         hook_executor: None,
         verbosity: None,
         provenance: UserInputProvenance::ExternalUser,
-    }
+    })
 }
 
 struct DropSignal(std::sync::Arc<std::sync::atomic::AtomicBool>);
@@ -6656,142 +6750,160 @@ fn deterministic_engine_config(workspace: &Path) -> EngineConfig {
     }
 }
 
-#[tokio::test]
-async fn automatic_compaction_continues_one_task_and_suppresses_failed_passes() {
-    use crate::llm_client::mock::{MockLlmClient, canned};
-    for fail_summary in [false, true] {
-        let workspace = tempdir().unwrap();
-        fs::write(
-            workspace.path().join("README.md"),
-            "verified fixture evidence",
-        )
+/// The compaction budget is measured against the real system prompt, and the
+/// skills block in that prompt is discovered from the developer's home as well
+/// as from the workspace. Left ambient, this test counts whatever skills the
+/// machine happens to have installed into its token budget: 39 of them trip a
+/// seventh compaction pass on a developer box while CI, with an empty home,
+/// sees six and passes. That is the #5359 leak class, and the isolated home is
+/// what makes `deterministic_engine_config` actually deterministic here.
+#[test]
+fn automatic_compaction_continues_one_task_and_suppresses_failed_passes() {
+    let _env = lock_test_env();
+    let home = tempdir().unwrap();
+    let _codewhale_home = EnvVarGuard::set("CODEWHALE_HOME", home.path());
+    let _user_home = EnvVarGuard::set("HOME", home.path());
+    let _user_profile = EnvVarGuard::set("USERPROFILE", home.path());
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
         .unwrap();
-        let mock = std::sync::Arc::new(MockLlmClient::new(Vec::new()));
-        for step in 0..16 {
-            mock.push_turn(vec![
-                canned::message_start(&format!("response-{step}")),
-                canned::text_block_start(0),
-                canned::text_delta(0, &format!("Step {step}: {}", "x".repeat(32_000))),
-                canned::block_stop(0),
-                canned::tool_use_block_start(1, &format!("read-{step}"), "File"),
-                canned::tool_input_delta(1, r#"{"action":"read","path":"README.md"}"#),
-                canned::block_stop(1),
-                canned::message_delta("tool_use", None),
-                canned::message_stop(),
-            ]);
-        }
-        mock.push_turn(canned::simple_text_turn(
-            "All sixteen reads verified; task complete.",
-        ));
-        for checkpoint in 0..8 {
-            let content = if fail_summary {
-                json!([{"type":"tool_use","id":"unexpected","name":"File","input":{}}])
-            } else {
-                json!([{"type":"text","text":format!("Current objective: complete all sixteen reads. Checkpoint {checkpoint}: earlier reads verified. Preserve the user's no-publication constraint. Continue the remaining File reads, then report the observed evidence.")}])
-            };
-            mock.push_message_response(serde_json::from_value(json!({
-                "id":format!("summary-{checkpoint}"), "type":"message", "role":"assistant",
-                "content":content, "model":"mock-model", "usage":{"input_tokens":0,"output_tokens":0}
-            })).unwrap());
-        }
-        let config = Config::default();
-        let (engine, handle) = Engine::new_with_model_client(
-            deterministic_engine_config(workspace.path()),
-            &config,
-            mock.clone(),
-        );
-        let task = tokio::spawn(engine.run());
-        let mut op = external_user_message_op(
-            "Complete all sixteen reads; do not publish.",
-            AppMode::Agent,
-            &config,
-        );
-        if let Op::SendMessage {
-            compaction,
-            auto_approve,
-            ..
-        } = &mut op
-        {
-            compaction.token_threshold = 40_000;
-            *auto_approve = true;
-        }
-        handle.send(op).await.unwrap();
-        let mut completed = 0;
-        let mut failed = 0;
-        {
-            let mut rx = handle.rx_event.write().await;
-            loop {
-                match tokio::time::timeout(Duration::from_secs(30), rx.recv())
-                    .await
-                    .unwrap()
-                    .unwrap()
-                {
-                    Event::CompactionCompleted { auto: true, .. } => completed += 1,
-                    Event::CompactionFailed { auto: true, .. } => failed += 1,
-                    Event::TurnComplete { status, error, .. } => {
-                        assert_eq!(status, TurnOutcomeStatus::Completed, "{error:?}");
-                        break;
-                    }
-                    _ => {}
-                }
+    runtime.block_on(async {
+        use crate::llm_client::mock::{MockLlmClient, canned};
+        for fail_summary in [false, true] {
+            let workspace = tempdir().unwrap();
+            fs::write(
+                workspace.path().join("README.md"),
+                "verified fixture evidence",
+            )
+            .unwrap();
+            let mock = std::sync::Arc::new(MockLlmClient::new(Vec::new()));
+            for step in 0..16 {
+                mock.push_turn(vec![
+                    canned::message_start(&format!("response-{step}")),
+                    canned::text_block_start(0),
+                    canned::text_delta(0, &format!("Step {step}: {}", "x".repeat(32_000))),
+                    canned::block_stop(0),
+                    canned::tool_use_block_start(1, &format!("read-{step}"), "File"),
+                    canned::tool_input_delta(1, r#"{"action":"read","path":"README.md"}"#),
+                    canned::block_stop(1),
+                    canned::message_delta("tool_use", None),
+                    canned::message_stop(),
+                ]);
             }
-        }
-        let requests = mock.captured_requests();
-        let streaming = requests
-            .iter()
-            .filter(|r| r.stream == Some(true))
-            .collect::<Vec<_>>();
-        assert_eq!(
-            streaming.len(),
-            17,
-            "one user request must continue through all tool steps"
-        );
-        if fail_summary {
-            assert_eq!(
-                (completed, failed),
-                (0, 1),
-                "failed compaction must not loop at every tool boundary"
-            );
-        } else {
-            assert!(
-                (2..=6).contains(&completed),
-                "expected repeated useful compaction: {completed}"
-            );
-            assert_eq!(failed, 0);
-        }
-        for request in &requests {
-            assert_eq!(
-                request.system, streaming[0].system,
-                "the stable system prefix must survive every pass"
-            );
-            assert_eq!(
-                request.tools, streaming[0].tools,
-                "summarizing must reuse the tool prefix"
-            );
-            if request.stream == Some(false) {
-                assert_eq!(request.tool_choice, Some(json!("none")));
+            mock.push_turn(canned::simple_text_turn(
+                "All sixteen reads verified; task complete.",
+            ));
+            for checkpoint in 0..8 {
+                let content = if fail_summary {
+                    json!([{"type":"tool_use","id":"unexpected","name":"File","input":{}}])
+                } else {
+                    json!([{"type":"text","text":format!("Current objective: complete all sixteen reads. Checkpoint {checkpoint}: earlier reads verified. Preserve the user's no-publication constraint. Continue the remaining File reads, then report the observed evidence.")}])
+                };
+                mock.push_message_response(serde_json::from_value(json!({
+                    "id":format!("summary-{checkpoint}"), "type":"message", "role":"assistant",
+                    "content":content, "model":"mock-model", "usage":{"input_tokens":0,"output_tokens":0}
+                })).unwrap());
             }
-            let mut calls = HashSet::new();
-            for message in &request.messages {
-                for block in &message.content {
-                    match block {
-                        ContentBlock::ToolUse { id, .. } => {
-                            calls.insert(id);
+            let config = Config::default();
+            let (engine, handle) = Engine::new_with_model_client(
+                deterministic_engine_config(workspace.path()),
+                &config,
+                mock.clone(),
+            );
+            let task = tokio::spawn(engine.run());
+            let mut op = external_user_message_op(
+                "Complete all sixteen reads; do not publish.",
+                AppMode::Agent,
+                &config,
+            );
+            if let Op::SendMessage(TurnSpec {
+                compaction,
+                auto_approve,
+                ..
+            }) = &mut op
+            {
+                compaction.token_threshold = 40_000;
+                *auto_approve = true;
+            }
+            handle.send(op).await.unwrap();
+            let mut completed = 0;
+            let mut failed = 0;
+            {
+                let mut rx = handle.rx_event.write().await;
+                loop {
+                    match tokio::time::timeout(Duration::from_secs(30), rx.recv())
+                        .await
+                        .unwrap()
+                        .unwrap()
+                    {
+                        Event::CompactionCompleted { auto: true, .. } => completed += 1,
+                        Event::CompactionFailed { auto: true, .. } => failed += 1,
+                        Event::TurnComplete { status, error, .. } => {
+                            assert_eq!(status, TurnOutcomeStatus::Completed, "{error:?}");
+                            break;
                         }
-                        ContentBlock::ToolResult { tool_use_id, .. } => assert!(
-                            calls.contains(tool_use_id),
-                            "orphan tool result after compaction"
-                        ),
                         _ => {}
                     }
                 }
             }
+            let requests = mock.captured_requests();
+            let streaming = requests
+                .iter()
+                .filter(|r| r.stream == Some(true))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                streaming.len(),
+                17,
+                "one user request must continue through all tool steps"
+            );
+            if fail_summary {
+                assert_eq!(
+                    (completed, failed),
+                    (0, 1),
+                    "failed compaction must not loop at every tool boundary"
+                );
+            } else {
+                assert!(
+                    (2..=6).contains(&completed),
+                    "expected repeated useful compaction: {completed}"
+                );
+                assert_eq!(failed, 0);
+            }
+            for request in &requests {
+                assert_eq!(
+                    request.system, streaming[0].system,
+                    "the stable system prefix must survive every pass"
+                );
+                assert_eq!(
+                    request.tools, streaming[0].tools,
+                    "summarizing must reuse the tool prefix"
+                );
+                if request.stream == Some(false) {
+                    assert_eq!(request.tool_choice, Some(json!("none")));
+                }
+                let mut calls = HashSet::new();
+                for message in &request.messages {
+                    for block in &message.content {
+                        match block {
+                            ContentBlock::ToolUse { id, .. } => {
+                                calls.insert(id);
+                            }
+                            ContentBlock::ToolResult { tool_use_id, .. } => assert!(
+                                calls.contains(tool_use_id),
+                                "orphan tool result after compaction"
+                            ),
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            let snapshot = handle.get_session_snapshot().await.unwrap();
+            assert!(snapshot.messages.iter().any(|m| m.content.iter().any(|b| matches!(b, ContentBlock::Text {text,..} if text.contains("All sixteen reads verified")))));
+            handle.send(Op::Shutdown).await.unwrap();
+            task.await.unwrap();
         }
-        let snapshot = handle.get_session_snapshot().await.unwrap();
-        assert!(snapshot.messages.iter().any(|m| m.content.iter().any(|b| matches!(b, ContentBlock::Text {text,..} if text.contains("All sixteen reads verified")))));
-        handle.send(Op::Shutdown).await.unwrap();
-        task.await.unwrap();
-    }
+    });
 }
 
 #[tokio::test]
@@ -6828,10 +6940,10 @@ async fn initial_routed_usage_is_total_only_emitted_once_and_keeps_parent_route_
     let task = tokio::spawn(engine.run());
 
     let mut op = external_user_message_op("account for classifier", AppMode::Agent, &api_config);
-    let Op::SendMessage {
+    let Op::SendMessage(TurnSpec {
         initial_routed_usage,
         ..
-    } = &mut op
+    }) = &mut op
     else {
         unreachable!("external_user_message_op always builds SendMessage");
     };
@@ -7258,11 +7370,11 @@ async fn sandbox_escalation_fails_closed_when_the_posture_cannot_prompt() {
             AppMode::Agent,
             &config,
         );
-        let Op::SendMessage {
+        let Op::SendMessage(TurnSpec {
             approval_mode: op_approval_mode,
             auto_approve: op_auto_approve,
             ..
-        } = &mut op
+        }) = &mut op
         else {
             panic!("user message op")
         };
@@ -12296,7 +12408,7 @@ async fn operate_model_shell_uses_normal_approval_and_workspace_sandbox() {
     let run_task = tokio::spawn(engine.run());
 
     handle
-        .send(Op::SendMessage {
+        .send(Op::SendMessage(TurnSpec {
             max_output_tokens: None,
             content: "write the requested local fixture".to_string(),
             images: Vec::new(),
@@ -12320,7 +12432,7 @@ async fn operate_model_shell_uses_normal_approval_and_workspace_sandbox() {
             hook_executor: None,
             verbosity: None,
             provenance: UserInputProvenance::ExternalUser,
-        })
+        }))
         .await
         .expect("send Operate model turn");
 
@@ -12465,7 +12577,7 @@ async fn full_access_subagent_handoff_keeps_model_shell_free_of_approval_prompts
     let run_task = tokio::spawn(engine.run());
 
     handle
-        .send(Op::SendMessage {
+        .send(Op::SendMessage(TurnSpec {
             max_output_tokens: None,
             content: "continue from the completed child".to_string(),
             images: Vec::new(),
@@ -12491,7 +12603,7 @@ async fn full_access_subagent_handoff_keeps_model_shell_free_of_approval_prompts
             hook_executor: None,
             verbosity: None,
             provenance: UserInputProvenance::SubAgentHandoff,
-        })
+        }))
         .await
         .expect("send model turn");
 
@@ -12604,7 +12716,7 @@ async fn assert_full_access_model_tool_batch_is_blocked(
     let run_task = tokio::spawn(engine.run());
 
     handle
-        .send(Op::SendMessage {
+        .send(Op::SendMessage(TurnSpec {
             max_output_tokens: None,
             content: "exercise the Full Access execution boundary".to_string(),
             images: Vec::new(),
@@ -12628,7 +12740,7 @@ async fn assert_full_access_model_tool_batch_is_blocked(
             hook_executor: None,
             verbosity: None,
             provenance: UserInputProvenance::ExternalUser,
-        })
+        }))
         .await
         .expect("send Full Access model turn");
 
@@ -12812,7 +12924,7 @@ async fn assert_full_access_model_tool_batch_runs(
     let run_task = tokio::spawn(engine.run());
 
     handle
-        .send(Op::SendMessage {
+        .send(Op::SendMessage(TurnSpec {
             max_output_tokens: None,
             content: "exercise the Full Access auto-approval boundary".to_string(),
             images: Vec::new(),
@@ -12836,7 +12948,7 @@ async fn assert_full_access_model_tool_batch_runs(
             hook_executor: None,
             verbosity: None,
             provenance: UserInputProvenance::ExternalUser,
-        })
+        }))
         .await
         .expect("send Full Access model turn");
 
@@ -13091,7 +13203,7 @@ async fn auto_review_auto_resolves_hallucinated_question_without_prompting() {
     let run_task = tokio::spawn(engine.run());
 
     handle
-        .send(Op::SendMessage {
+        .send(Op::SendMessage(TurnSpec {
             max_output_tokens: None,
             content: "continue autonomously".to_string(),
             images: Vec::new(),
@@ -13115,7 +13227,7 @@ async fn auto_review_auto_resolves_hallucinated_question_without_prompting() {
             hook_executor: None,
             verbosity: None,
             provenance: UserInputProvenance::ExternalUser,
-        })
+        }))
         .await
         .expect("send Auto-Review model turn");
 
@@ -13280,7 +13392,7 @@ async fn full_access_permission_allow_cannot_bypass_background_catastrophic_floo
     let run_task = tokio::spawn(engine.run());
 
     handle
-        .send(Op::SendMessage {
+        .send(Op::SendMessage(TurnSpec {
             max_output_tokens: None,
             content: "please run a background shell".to_string(),
             images: Vec::new(),
@@ -13304,7 +13416,7 @@ async fn full_access_permission_allow_cannot_bypass_background_catastrophic_floo
             hook_executor: None,
             verbosity: None,
             provenance: UserInputProvenance::ExternalUser,
-        })
+        }))
         .await
         .expect("send model turn");
 
@@ -13423,7 +13535,7 @@ async fn yolo_mode_does_not_prompt_for_background_shell() {
     let run_task = tokio::spawn(engine.run());
 
     handle
-        .send(Op::SendMessage {
+        .send(Op::SendMessage(TurnSpec {
             max_output_tokens: None,
             content: "please run a background shell".to_string(),
             images: Vec::new(),
@@ -13447,7 +13559,7 @@ async fn yolo_mode_does_not_prompt_for_background_shell() {
             hook_executor: None,
             verbosity: None,
             provenance: UserInputProvenance::ExternalUser,
-        })
+        }))
         .await
         .expect("send model turn");
 
@@ -13562,7 +13674,7 @@ async fn yolo_mode_executes_publish_like_shell_without_prompt() {
     let run_task = tokio::spawn(engine.run());
 
     handle
-        .send(Op::SendMessage {
+        .send(Op::SendMessage(TurnSpec {
             max_output_tokens: None,
             content: "please publish this crate".to_string(),
             images: Vec::new(),
@@ -13586,7 +13698,7 @@ async fn yolo_mode_executes_publish_like_shell_without_prompt() {
             hook_executor: None,
             verbosity: None,
             provenance: UserInputProvenance::ExternalUser,
-        })
+        }))
         .await
         .expect("send model turn");
 
@@ -13705,7 +13817,7 @@ async fn yolo_mode_does_not_prompt_for_mcp_action() {
     let run_task = tokio::spawn(engine.run());
 
     handle
-        .send(Op::SendMessage {
+        .send(Op::SendMessage(TurnSpec {
             max_output_tokens: None,
             content: "please open the PR".to_string(),
             images: Vec::new(),
@@ -13729,7 +13841,7 @@ async fn yolo_mode_does_not_prompt_for_mcp_action() {
             hook_executor: None,
             verbosity: None,
             provenance: UserInputProvenance::ExternalUser,
-        })
+        }))
         .await
         .expect("send model turn");
 
@@ -20150,7 +20262,7 @@ async fn run_headless_turn_with_flaky_network(
     let run_task = tokio::spawn(engine.run());
 
     handle
-        .send(Op::SendMessage {
+        .send(Op::SendMessage(TurnSpec {
             max_output_tokens: None,
             content: "solve the task".to_string(),
             images: Vec::new(),
@@ -20174,7 +20286,7 @@ async fn run_headless_turn_with_flaky_network(
             hook_executor: None,
             verbosity: None,
             provenance: UserInputProvenance::ExternalUser,
-        })
+        }))
         .await
         .expect("send flaky-network turn");
 
@@ -20331,7 +20443,7 @@ async fn terminal_output_limit_followed_by_stream_error_is_charged_and_not_retri
     let run_task = tokio::spawn(engine.run());
 
     handle
-        .send(Op::SendMessage {
+        .send(Op::SendMessage(TurnSpec {
             max_output_tokens: None,
             content: "solve the task".to_string(),
             images: Vec::new(),
@@ -20355,7 +20467,7 @@ async fn terminal_output_limit_followed_by_stream_error_is_charged_and_not_retri
             hook_executor: None,
             verbosity: None,
             provenance: UserInputProvenance::ExternalUser,
-        })
+        }))
         .await
         .expect("send terminal-then-drop turn");
 
@@ -20438,7 +20550,7 @@ async fn midstream_error_frame_stops_the_stream_and_drops_trailing_deltas() {
     let run_task = tokio::spawn(engine.run());
 
     handle
-        .send(Op::SendMessage {
+        .send(Op::SendMessage(TurnSpec {
             max_output_tokens: None,
             content: "solve the task".to_string(),
             images: Vec::new(),
@@ -20462,7 +20574,7 @@ async fn midstream_error_frame_stops_the_stream_and_drops_trailing_deltas() {
             hook_executor: None,
             verbosity: None,
             provenance: UserInputProvenance::ExternalUser,
-        })
+        }))
         .await
         .expect("send midstream-error turn");
 
@@ -20689,7 +20801,7 @@ async fn run_interactive_turn_with_flaky_network(
     let run_task = tokio::spawn(engine.run());
 
     handle
-        .send(Op::SendMessage {
+        .send(Op::SendMessage(TurnSpec {
             max_output_tokens: None,
             content: "solve the task".to_string(),
             images: Vec::new(),
@@ -20713,7 +20825,7 @@ async fn run_interactive_turn_with_flaky_network(
             hook_executor: None,
             verbosity: None,
             provenance: UserInputProvenance::ExternalUser,
-        })
+        }))
         .await
         .expect("send interactive flaky-network turn");
 
@@ -20920,7 +21032,7 @@ async fn interactive_thinking_only_drop_preserves_nothing_and_never_claims_it_di
     let run_task = tokio::spawn(engine.run());
 
     handle
-        .send(Op::SendMessage {
+        .send(Op::SendMessage(TurnSpec {
             max_output_tokens: None,
             content: "solve the task".to_string(),
             images: Vec::new(),
@@ -20944,7 +21056,7 @@ async fn interactive_thinking_only_drop_preserves_nothing_and_never_claims_it_di
             hook_executor: None,
             verbosity: None,
             provenance: UserInputProvenance::ExternalUser,
-        })
+        }))
         .await
         .expect("send thinking-only drop turn");
 
@@ -21150,7 +21262,7 @@ async fn run_reasoning_only_turn_with_reprompts(
     let (engine, handle) = Engine::new_with_model_client(engine_config, &config, client);
     let run_task = tokio::spawn(engine.run());
     handle
-        .send(Op::SendMessage {
+        .send(Op::SendMessage(TurnSpec {
             max_output_tokens: None,
             content: "solve the task".to_string(),
             images: Vec::new(),
@@ -21174,7 +21286,7 @@ async fn run_reasoning_only_turn_with_reprompts(
             hook_executor: None,
             verbosity: None,
             provenance: UserInputProvenance::ExternalUser,
-        })
+        }))
         .await
         .expect("send reasoning-only turn");
     let mut events = Vec::new();
@@ -21933,7 +22045,10 @@ readline.createInterface({ input: process.stdin }).on('line', async line => {
             "timeouts": { "connect_timeout": 120 },
             "servers": {
                 "fast": { "command": node, "args": [server, "fast", tmp.path()] },
-                "slow": { "command": node, "args": [server, "slow", tmp.path()] },
+                // `slow` is deliberately unselected: `required` keeps it in
+                // the eager boot set under lazy boot (#6033) so it can stand
+                // in for "an unrelated server still connecting".
+                "slow": { "command": node, "args": [server, "slow", tmp.path()], "required": true },
                 "failed": { "command": "codewhale-missing-mcp-fixture-38911" }
             }
         }))
@@ -22170,8 +22285,11 @@ lines.on('line', async (line) => {
         serde_json::to_vec(&serde_json::json!({
             "timeouts": { "connect_timeout": 30 },
             "servers": {
-                "fast": { "command": "node", "args": [server, "fast", release] },
-                "slow": { "command": "node", "args": [server, "slow", release] }
+                // Both marked `required` so lazy boot (#6033) still starts
+                // them eagerly — this test proves progress ordering, not the
+                // lazy/eligible split.
+                "fast": { "command": "node", "args": [server, "fast", release], "required": true },
+                "slow": { "command": "node", "args": [server, "slow", release], "required": true }
             }
         }))
         .expect("config JSON"),
@@ -22261,6 +22379,103 @@ lines.on('line', async (line) => {
     } else {
         assert!(finished.servers.iter().all(|row| row.connected));
     }
+}
+
+/// Lazy boot (#6033): a configured server nobody selected and nobody marked
+/// `required` must not be spawned at session start. The fixture writes a
+/// `started-<name>` marker when it receives `initialize`, so the lazy
+/// server's absence is proven by the file that never appears — not by a
+/// timeout on "it would have started by now".
+#[tokio::test]
+async fn lazy_boot_leaves_unselected_servers_unspawned() {
+    let Some(node) = crate::dependencies::resolve_node() else {
+        return;
+    };
+    let tmp = tempdir().expect("tempdir");
+    let server = tmp.path().join("server.mjs");
+    fs::write(
+        &server,
+        r#"import fs from 'node:fs';
+import path from 'node:path';
+import readline from 'node:readline';
+readline.createInterface({ input: process.stdin }).on('line', line => {
+  const request = JSON.parse(line);
+  if (request.id === undefined) return;
+  if (request.method === 'initialize') {
+    fs.writeFileSync(path.join(process.argv[3], 'started-' + process.argv[2]), 'ready');
+  }
+  const result = request.method === 'initialize'
+    ? { protocolVersion: '2024-11-05', capabilities: { tools: {} }, serverInfo: { name: process.argv[2], version: '1' } }
+    : { tools: [{ name: 'ready', inputSchema: { type: 'object' } }] };
+  process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: request.id, result }) + '\n');
+});"#,
+    )
+    .expect("fixture");
+    let config_path = tmp.path().join("mcp.json");
+    fs::write(
+        &config_path,
+        serde_json::to_vec(&serde_json::json!({
+            "servers": {
+                "eager": { "command": node, "args": [server, "eager", tmp.path()], "required": true },
+                "lazy": { "command": node, "args": [server, "lazy", tmp.path()] }
+            }
+        }))
+        .unwrap(),
+    )
+    .expect("MCP config");
+    let (engine, handle) = Engine::new(
+        EngineConfig {
+            workspace: tmp.path().to_path_buf(),
+            mcp_config_path: config_path,
+            ..Default::default()
+        },
+        &Config::default(),
+    );
+    let task = tokio::spawn(async move { engine.run().await });
+    let mut events = handle.rx_event.write().await;
+    let finished = tokio::time::timeout(Duration::from_secs(30), async {
+        while let Some(event) = events.recv().await {
+            if let Event::McpSessionBoot {
+                snapshot,
+                connecting,
+                finished: true,
+                ..
+            } = event
+            {
+                return (snapshot, connecting);
+            }
+        }
+        panic!("engine event channel closed");
+    })
+    .await
+    .expect("boot must finish");
+    drop(events);
+    handle.send(Op::Shutdown).await.expect("shutdown");
+    task.await.expect("engine task");
+
+    let (snapshot, connecting) = finished;
+    assert!(
+        tmp.path().join("started-eager").exists(),
+        "a required server is still eager"
+    );
+    assert!(
+        !tmp.path().join("started-lazy").exists(),
+        "an unselected, unrequired server must not be spawned at boot"
+    );
+    assert!(connecting.is_empty());
+    let lazy = snapshot
+        .servers
+        .iter()
+        .find(|server| server.name == "lazy")
+        .expect("configured lazy server still appears in the snapshot");
+    assert!(!lazy.connected);
+    assert!(lazy.error.is_none(), "lazy is a state, not a failure");
+    let eager = snapshot
+        .servers
+        .iter()
+        .find(|server| server.name == "eager")
+        .expect("required server in snapshot");
+    assert!(eager.connected);
 }
 
 #[tokio::test]
@@ -22362,9 +22577,9 @@ async fn mcp_boot_catalog_refresh_declares_prefix_before_mailbox_delivery() {
     );
 
     engine.session.pending_prefix_change_reason = None;
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let (tx, rx) = tokio::sync::mpsc::channel(16);
     engine.mcp_boot_rx = Some(rx);
-    tx.send(McpBootUpdate::Progress {
+    tx.try_send(McpBootUpdate::Progress {
         generation: 1,
         authority_errors: Arc::new(HashMap::new()),
         connection_errors: HashMap::new(),
@@ -22379,6 +22594,42 @@ async fn mcp_boot_catalog_refresh_declares_prefix_before_mailbox_delivery() {
 }
 
 #[tokio::test]
+async fn subagent_completion_inbox_is_bounded() {
+    let (engine, _handle) = Engine::new(EngineConfig::default(), &Config::default());
+    let tx = engine.tx_subagent_completion.clone();
+    let completion = SubAgentCompletion {
+        owner_session_id: engine.session.id.clone(),
+        agent_id: "capacity-fixture".to_string(),
+        payload: "bounded inbox fixture".to_string(),
+    };
+
+    let mut accepted = 0usize;
+    while tx.try_send(completion.clone()).is_ok() {
+        accepted += 1;
+        assert!(
+            accepted <= SUBAGENT_COMPLETION_CHANNEL_CAPACITY,
+            "the inbox accepted more than its declared capacity"
+        );
+    }
+
+    assert_eq!(
+        accepted, SUBAGENT_COMPLETION_CHANNEL_CAPACITY,
+        "the completion inbox must be exactly bounded (#6147)"
+    );
+    assert!(
+        matches!(
+            tx.try_send(completion),
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_))
+        ),
+        "an over-capacity completion must be refused, not queued without bound"
+    );
+    assert_eq!(
+        engine.rx_subagent_completion.len(),
+        SUBAGENT_COMPLETION_CHANNEL_CAPACITY
+    );
+}
+
+#[tokio::test]
 async fn stale_boot_finished_does_not_clear_a_newer_receiver() {
     let tmp = tempdir().expect("tempdir");
     let engine_config = EngineConfig {
@@ -22386,7 +22637,7 @@ async fn stale_boot_finished_does_not_clear_a_newer_receiver() {
         ..Default::default()
     };
     let (mut engine, _handle) = Engine::new(engine_config, &Config::default());
-    let (_newer_tx, newer_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (_newer_tx, newer_rx) = tokio::sync::mpsc::channel(16);
     engine.mcp_event_generation = 2;
     engine.mcp_boot_generation = Some(2);
     engine.mcp_boot_in_flight = true;
@@ -22413,7 +22664,9 @@ async fn bootstrap_and_retry_mcp_use_the_engine_owned_pool() {
     let config_path = tmp.path().join("mcp.json");
     std::fs::write(
         &config_path,
-        r#"{"servers":{"disabled":{"command":"node","disabled":true},"alpha":{"command":"codewhale-mcp-missing-alpha-9f8e7d6c"},"beta":{"command":"codewhale-mcp-missing-beta-9f8e7d6c"}}}"#,
+        // `required` keeps alpha/beta in the eager boot set under lazy boot
+        // (#6033) so they carry the connection diagnoses this test checks.
+        r#"{"servers":{"disabled":{"command":"node","disabled":true},"alpha":{"command":"codewhale-mcp-missing-alpha-9f8e7d6c","required":true},"beta":{"command":"codewhale-mcp-missing-beta-9f8e7d6c","required":true}}}"#,
     )
     .expect("MCP config");
     let engine_config = EngineConfig {

@@ -409,6 +409,18 @@ mod tests {
         drop(packets);
         frame_with_audio(&worker, 0.0, Some(sink.target()));
         let before = frame_with_audio(&worker, 400.0, Some(sink.target()));
+        // Provoke the disconnect directly rather than relying on the worker to
+        // consume a target inside `Target::current()`'s 500 ms freshness
+        // window. `send` returns `Ok(())` early for a stale target and never
+        // reaches `try_send`, so on a host slow enough to miss that window the
+        // failure is never recorded — which is why this was red on Windows and
+        // green everywhere else. This is the same path the worker takes, minus
+        // the wall clock: a fresh target, a live `active()`, and a `try_send`
+        // that observes `Disconnected` because `packets` was dropped above.
+        assert!(
+            sink.target().send([vec![0.0], vec![0.0]]).is_err(),
+            "a dropped receiver must fail a fresh send"
+        );
         assert!(sink.failed());
         worker.tx.send(Command::Export).unwrap();
         assert!(matches!(

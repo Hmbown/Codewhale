@@ -70,9 +70,9 @@ pub(crate) enum RedactionGateNotice {
 }
 pub use types::{
     AppAction, AppModeUi, AutomationAction, ComposerDensity, ComposerSubmitAction,
-    ComposerSubmitChord, InitialInput, McpUiAction, QueuedMessage, ScreenMode, SettingSelection,
-    ShellJobAction, SubmitDisposition, TaskPanelEntry, TaskPanelEntryKind, ToolCollapseMode,
-    ToolDetailRecord, TranscriptSpacing, TuiOptions, VimMode,
+    ComposerSubmitChord, InflightSteer, InitialInput, McpUiAction, QueuedMessage, ScreenMode,
+    SettingSelection, ShellJobAction, SubmitDisposition, TaskPanelEntry, TaskPanelEntryKind,
+    ToolCollapseMode, ToolDetailRecord, TranscriptSpacing, TuiOptions, VimMode,
 };
 pub(crate) use types::{
     CacheReplayTarget, GoalControlIntent, PendingGoalControl, WORKFLOW_DRAFT_INSTRUCTION_PREFIX,
@@ -589,6 +589,10 @@ pub enum LaunchRowId {
     NewSession,
     Recent(String),
     SeeAll,
+    /// The MCP problems row: Enter/click types the remedy command into the
+    /// composer (`/mcp login <name>` or `/mcp`) instead of making the user
+    /// retype what the card printed (#6085).
+    McpRemedy,
 }
 
 /// How many recent sessions the startup card lists inline before the
@@ -910,6 +914,7 @@ impl Default for ComposerState {
 
 /// Compatibility name retained for the first Tideline header slice. New
 /// surfaces register [`crate::tui::tideline::InteractionAction`] directly.
+#[cfg_attr(not(test), expect(dead_code))]
 pub type HeaderActionTarget = crate::tui::tideline::InteractionAction;
 
 /// A header target painted in the latest frame.
@@ -918,6 +923,7 @@ pub type HeaderActionTarget = crate::tui::tideline::InteractionAction;
 /// rectangular target alongside its typed action gives mouse and keyboard
 /// routes one shared destination without a second navigation system.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(test), expect(dead_code))]
 pub struct HeaderHitbox {
     pub area: Rect,
     pub target: HeaderActionTarget,
@@ -932,6 +938,10 @@ pub struct ViewportState {
     pub transcript_selection: TranscriptSelection,
     pub selection_autoscroll: Option<SelectionAutoscroll>,
     pub transcript_scrollbar_dragging: bool,
+    /// Copy transcript drag selections as Markdown source (see
+    /// `TuiConfig::selection_copy_markdown`). Resolved from config at startup;
+    /// defaults to on.
+    pub selection_copy_markdown: bool,
     pub last_transcript_area: Option<Rect>,
     pub last_composer_area: Option<Rect>,
     /// Selectable targets from the latest painted frame. Cleared before every
@@ -985,6 +995,7 @@ impl Default for ViewportState {
             transcript_selection: TranscriptSelection::default(),
             selection_autoscroll: None,
             transcript_scrollbar_dragging: false,
+            selection_copy_markdown: true,
             last_transcript_area: None,
             last_composer_area: None,
             interaction_targets: crate::tui::tideline::InteractionRegistry::default(),
@@ -1448,7 +1459,6 @@ fn try_persist_route_as_startup_default(
 pub struct App {
     pub mode: AppMode,
     /// Registered hotbar actions available for future slot config/render layers.
-    #[allow(dead_code)]
     pub hotbar_actions: HotbarActionRegistry,
     /// Composer sub-state (input, cursor, history, menus).
     pub composer: ComposerState,
@@ -1663,6 +1673,9 @@ pub struct App {
     pub workflow_config: codewhale_config::WorkflowConfigToml,
     /// Effective `[goal] max_continuations` backstop; `0` means unlimited.
     pub goal_max_continuations: u32,
+    /// Effective `[goal] enforce_token_budget`; `true` makes a goal's token
+    /// budget a hard stop instead of advisory telemetry (#6013).
+    pub goal_enforce_token_budget: bool,
     /// Typed engine lifecycle state for the cancellable between-turn wait.
     pub goal_continuation_waiting: bool,
     /// Effective explicit/managed filesystem scope captured at startup. The
@@ -1745,7 +1758,6 @@ pub struct App {
     /// fast typing or IME commits could otherwise be mis-classified as a
     /// paste burst (#1322 follow-up).
     pub bracketed_paste_seen: bool,
-    #[allow(dead_code)]
     pub system_prompt: Option<SystemPrompt>,
     pub auto_compact: bool,
     pub auto_compact_user_configured: bool,
@@ -1880,7 +1892,6 @@ pub struct App {
     /// Whether the file-tree pane was actually rendered in the last frame.
     /// Set false when the terminal is too narrow to show the tree.
     pub file_tree_visible: bool,
-    #[allow(dead_code)]
     pub compact_threshold: usize,
     pub max_input_history: usize,
     pub allow_shell: bool,
@@ -2000,7 +2011,6 @@ pub struct App {
     /// Lifecycle event outbox (`[lifecycle_outbox]` config). Disabled
     /// (all emits no-ops) when no path is configured.
     pub lifecycle_outbox: codewhale_hooks::LifecycleOutbox,
-    #[allow(dead_code)]
     pub yolo: bool,
     /// One-shot YOLO→Act+Bypass migration notice for this session (#0.8.68 M6).
     yolo_compat_notified: bool,
@@ -2110,10 +2120,9 @@ pub struct App {
     /// token breakdown lives behind `/cost` (spec §3). The field stays so the
     /// config surface keeps parsing; its reader returns with the classic
     /// renderer deletion slice.
-    #[allow(dead_code)]
     pub header_items: Vec<crate::config::HeaderItem>,
     /// Project documentation (AGENTS.md or CLAUDE.md)
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     pub project_doc: Option<String>,
     /// Plan state for tracking tasks
     pub plan_state: SharedPlanState,
@@ -2266,6 +2275,12 @@ pub struct App {
     /// channel and the bucket renders with a rejected-steer label when
     /// populated.
     pub rejected_steers: VecDeque<String>,
+    /// Steers accepted by the steer channel but not yet seen in the engine's
+    /// record. Rendered through the same "sending into turn" preview bucket as
+    /// `pending_steers`; promoted to a transcript cell by
+    /// `apply_engine_session_projection`, or moved to `rejected_steers` by
+    /// `TurnComplete` when the turn ended without them (#6190).
+    pub inflight_steers: VecDeque<InflightSteer>,
     /// Legacy resend flag for pending steer recovery.
     pub submit_pending_steers_after_interrupt: bool,
     /// Start time for current turn
@@ -3367,7 +3382,7 @@ impl App {
     }
 
     /// Cycle through modes in reverse.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn cycle_mode_reverse(&mut self) {
         let next = self.mode.previous();
         let outcome = self.select_mode(next);
@@ -3860,7 +3875,7 @@ impl App {
 
     /// Add `delta` to the parent-turn session cost and bump the displayed
     /// high-water mark so the footer total never reverses (#244).
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn accrue_session_cost(&mut self, delta: f64) {
         self.accrue_session_cost_estimate(CostEstimate::usd_only(delta));
     }
@@ -4084,7 +4099,7 @@ impl App {
 
     /// Add `delta` to the running sub-agent cost and bump the displayed
     /// high-water mark so the footer total never reverses (#244).
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn accrue_subagent_cost(&mut self, delta: f64) {
         self.accrue_subagent_cost_estimate(CostEstimate::usd_only(delta));
     }
@@ -4167,7 +4182,7 @@ impl App {
     /// Read the visible session+sub-agent cost. Guaranteed monotonic across
     /// reconciliation events (cache adjustments, provisional → final swaps)
     /// for the lifetime of one session (#244).
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn displayed_session_cost(&self) -> f64 {
         self.displayed_session_cost_for_currency(CostCurrency::Usd)
     }
@@ -5313,7 +5328,9 @@ impl App {
         event_run_id: &str,
         event: crate::tui::widgets::workflow_panel::WorkflowPanelEvent,
     ) -> bool {
-        use crate::tui::widgets::workflow_panel::{WorkflowPanel, WorkflowPanelEvent};
+        use crate::tui::widgets::workflow_panel::{
+            WorkflowPanel, WorkflowPanelEvent, WorkflowPanelLifecycle,
+        };
         if event_run_id.trim().is_empty() {
             return false;
         }
@@ -5332,6 +5349,21 @@ impl App {
         }
 
         let budget_only = matches!(&event, WorkflowPanelEvent::BudgetUpdated { .. });
+        // #5528: a failed run must be loud, not just a panel row. Capture the
+        // failure before the event is consumed below; the sticky notice fires
+        // once per run because the live stream and the tool-complete hydration
+        // can both deliver the same terminal event.
+        let run_failure = match &event {
+            WorkflowPanelEvent::RunCompleted {
+                status: WorkflowPanelLifecycle::Failed,
+                error,
+                ..
+            } => Some(error.clone()),
+            _ => None,
+        };
+        let already_failed = self.workflow_panel.as_ref().is_some_and(|panel| {
+            panel.run_id == event_run_id && panel.lifecycle == WorkflowPanelLifecycle::Failed
+        });
         match (&mut self.workflow_panel, &event) {
             (
                 None,
@@ -5368,6 +5400,27 @@ impl App {
         }
         if !budget_only {
             self.needs_redraw = true;
+        }
+        if let Some(error) = run_failure
+            && !already_failed
+        {
+            let detail = error
+                .as_deref()
+                .map(str::trim)
+                .filter(|detail| !detail.is_empty());
+            let message = match detail {
+                Some(detail) => format!(
+                    "{} · {}",
+                    self.tr(MessageId::WorkflowRunFailedToast),
+                    bound_agent_activity_text(detail)
+                ),
+                None => self.tr(MessageId::WorkflowRunFailedToast).into_owned(),
+            };
+            self.set_sticky_status(
+                message,
+                StatusToastLevel::Error,
+                Some(Self::STICKY_ERROR_TTL_MS),
+            );
         }
         true
     }
@@ -5685,7 +5738,7 @@ impl App {
     /// Park a legacy pending steer. New keyboard handling routes running-turn
     /// drafts through Ctrl+Enter (same-turn steer) or Enter (next-turn
     /// follow-up).
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn push_pending_steer(&mut self, message: QueuedMessage) {
         self.pending_steers.push_back(message);
         self.submit_pending_steers_after_interrupt = true;
@@ -5844,9 +5897,12 @@ impl App {
         self.bump_history_cell(index);
     }
 
-    /// Retry a `try_lock` up to `retries` times with a 1ms pause between
+    /// Retry a `try_lock` up to `retries` times, yielding the thread between
     /// attempts. Returns `Some(guard)` on success, `None` if the lock
-    /// remains contended after all retries.
+    /// remains contended after all retries. Reached from the async UI/event
+    /// paths, so this must not park a Tokio worker with `thread::sleep` —
+    /// `yield_now` covers the microsecond-scale critical sections behind
+    /// these mutexes, and a still-contended lock degrades to `None`.
     fn retry_lock<T>(
         mutex: &tokio::sync::Mutex<T>,
         retries: u32,
@@ -5855,7 +5911,7 @@ impl App {
             if let Ok(guard) = mutex.try_lock() {
                 return Some(guard);
             }
-            std::thread::sleep(std::time::Duration::from_millis(1));
+            std::thread::yield_now();
         }
         None
     }

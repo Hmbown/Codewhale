@@ -1,6 +1,33 @@
 //! Command matching helpers for execpolicy rules.
 
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
+
 use regex::Regex;
+
+/// `pattern` compiled once as an anchored `*`-glob, then reused.
+///
+/// Every other regex metacharacter is escaped, so `*` is the only wildcard
+/// (matching any run of characters, newline included). `None` means the pattern
+/// does not compile; callers treat that as "no match".
+///
+/// The patterns come from configuration and are stable between edits, but the
+/// callers run per shell execution and per hook event. Compiling here on first
+/// use keeps the fast path free of `Regex::new` without changing what matches.
+pub fn compiled_glob(pattern: &str) -> Option<Arc<Regex>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, Option<Arc<Regex>>>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut cache = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    cache
+        .entry(pattern.to_string())
+        .or_insert_with(|| {
+            let escaped = regex::escape(pattern).replace(r"\*", ".*");
+            Regex::new(&format!("^{escaped}$")).ok().map(Arc::new)
+        })
+        .clone()
+}
 
 /// Normalize a command string by shlex parsing and re-joining tokens.
 ///
@@ -110,11 +137,7 @@ pub fn pattern_matches(pattern: &str, command: &str) -> bool {
         return true;
     }
 
-    let escaped = regex::escape(&pattern).replace("\\*", ".*");
-    let Ok(re) = Regex::new(&format!("^{escaped}$")) else {
-        return false;
-    };
-    re.is_match(&command)
+    compiled_glob(&pattern).is_some_and(|re| re.is_match(&command))
 }
 
 #[cfg(test)]
@@ -194,5 +217,29 @@ mod tests {
         // pattern matches the heredoc form too.
         let normalized = normalize_command("cat <<EOF > file.txt\nbody\nEOF");
         assert!(pattern_matches("cat > file.txt", &normalized));
+    }
+
+    #[test]
+    fn compiled_glob_is_compiled_once_per_pattern() {
+        // The per-shell-execution and per-hook-event callers rely on this
+        // returning the same compiled program rather than rebuilding it.
+        let first = compiled_glob("mcp__*").expect("glob compiles");
+        let second = compiled_glob("mcp__*").expect("glob compiles");
+        assert!(std::sync::Arc::ptr_eq(&first, &second));
+        assert!(first.is_match("mcp__github__search"));
+        assert!(!first.is_match("read_file"));
+    }
+
+    #[test]
+    fn compiled_glob_escapes_every_metacharacter_except_star() {
+        // `regex::escape` is what makes `a.b` a literal while `*` stays a
+        // wildcard — the same contract `pattern_matches` has always had.
+        let literal = compiled_glob("a.b").expect("glob compiles");
+        assert!(literal.is_match("a.b"));
+        assert!(!literal.is_match("axb"));
+
+        let wildcard = compiled_glob("a*b").expect("glob compiles");
+        assert!(wildcard.is_match("ab"));
+        assert!(wildcard.is_match("a middle b"));
     }
 }

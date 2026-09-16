@@ -23,7 +23,7 @@ use codewhale_protocol::fleet::{
 };
 use serde::{Deserialize, Serialize};
 
-use super::identity::resolve_member_in_profiles;
+use super::identity::{FleetSelectorError, resolve_member_in_profiles};
 use super::profile::{
     AgentProfile, FleetDelegationHints, FleetLoadout, FleetProfile, FleetProfilePermissions,
     FleetRole as FleetProfileRole, FleetSlot, ProfileOrigin, canonical_public_role_name,
@@ -935,7 +935,7 @@ pub(crate) fn append_agent_profile_prompt(prompt: &mut String, agent_profile: &A
 pub(crate) fn resolve_pinned_role_profile(
     agent_profiles: &[AgentProfile],
     role: &str,
-) -> Result<Option<AgentProfile>> {
+) -> Result<Option<AgentProfile>, FleetSelectorError> {
     let pinned = agent_profiles
         .iter()
         .filter(|profile| {
@@ -949,11 +949,11 @@ pub(crate) fn resolve_pinned_role_profile(
         })
         .cloned()
         .collect::<Vec<_>>();
-    Ok(resolve_member_in_profiles(
+    resolve_member_in_profiles(
         &pinned,
         &format!("role:{}", canonical_public_role_name(role)),
-    )?
-    .cloned())
+    )
+    .map(|member| member.cloned())
 }
 
 /// Compare only the known route pair; never infer a provider from a wire id's

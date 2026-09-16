@@ -151,11 +151,9 @@ mod tests {
 // plain `╮` again. The hull taper silhouette is deliberately dropped
 // (sub-cell vector work).
 
-use ratatui::{
-    buffer::Buffer,
-    layout::Rect,
-    style::{Modifier, Style},
-};
+#[cfg(test)]
+use ratatui::style::Modifier;
+use ratatui::{buffer::Buffer, layout::Rect, style::Style};
 use unicode_width::UnicodeWidthStr;
 
 use codewhale_palette::{ChromeInk, UiTheme, chrome_style};
@@ -307,6 +305,7 @@ pub fn tideline_composer_geometry(area: Rect) -> TidelineComposerGeometry {
 /// placeholder/caret/hint projection, while the live composer supplies its
 /// multiline editor. Sharing this shell keeps the visual component and exact
 /// submit geometry coherent without creating a second input authority.
+#[cfg(test)]
 pub fn render_tideline_composer_shell(
     area: Rect,
     buf: &mut Buffer,
@@ -387,6 +386,7 @@ pub fn render_tideline_composer_submit(
 /// Paint the composer chrome. Deterministic: the caller owns the caret clock
 /// (a `low_motion` caller passes the still `_`); this render shows the draft
 /// and a terminal caret block.
+#[cfg(test)]
 pub fn render_tideline_composer(area: Rect, buf: &mut Buffer, composer: &TidelineComposer<'_>) {
     if area.width < 6 || area.height < 3 {
         return;
@@ -454,6 +454,7 @@ pub fn render_tideline_composer(area: Rect, buf: &mut Buffer, composer: &Tidelin
 
 /// Truncate a rendered string to `width` cells on a char boundary (never
 /// wrap — the composer is one line per row).
+#[cfg(test)]
 fn truncate_cells(text: &str, width: usize) -> String {
     let mut out = String::new();
     let mut used = 0;

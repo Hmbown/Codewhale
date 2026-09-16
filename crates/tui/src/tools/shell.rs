@@ -371,6 +371,35 @@ pub struct ShellDeltaResult {
     pub stderr_total_len: usize,
 }
 
+/// Which of a job's raw output streams to read. Stderr is a separate stream
+/// only for piped jobs; PTY and merged modes fold it into stdout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShellOutputStream {
+    Stdout,
+    Stderr,
+}
+
+/// A non-consuming window of a job's raw output stream at absolute byte
+/// offsets. Unlike [`ShellManager::get_output_delta`], reading a chunk never
+/// advances anyone else's cursor, so several HTTP clients can follow the same
+/// job without splitting the stream.
+pub struct ShellOutputChunk {
+    /// Absolute offset of `bytes[0]`. Exceeds the requested cursor when the
+    /// bounded buffer already discarded that prefix — the gap is reported via
+    /// `dropped`, never silently re-sent.
+    pub offset: usize,
+    /// Raw stream bytes. Output is arbitrary bytes, not guaranteed UTF-8.
+    pub bytes: Vec<u8>,
+    /// Absolute offset just past the last returned byte; the next cursor.
+    pub next_offset: usize,
+    /// Total bytes this stream has produced, including discarded bytes.
+    pub total: usize,
+    /// Leading bytes permanently discarded by the in-flight bound.
+    pub dropped: usize,
+    pub status: ShellStatus,
+    pub exit_code: Option<i64>,
+}
+
 enum ShellChild {
     Process(Child),
     #[cfg(not(target_env = "ohos"))]
@@ -1427,7 +1456,6 @@ impl BackgroundShell {
     }
 
     /// Get a snapshot of the current state
-    #[allow(dead_code)]
     pub fn snapshot(&self) -> Result<ShellResult> {
         let sandboxed = !matches!(self.sandbox_type, SandboxType::None);
         if let Some(snapshot) = self.bounded_output_snapshot(self.status != ShellStatus::Running)? {
@@ -1846,6 +1874,13 @@ impl ShellManager {
     /// commands are routed through bubblewrap for filesystem isolation.
     pub fn set_prefer_bwrap(&mut self, prefer: bool) {
         self.sandbox_manager.set_prefer_bwrap(prefer);
+    }
+
+    /// Move the fallback working directory. Callers that pass an explicit
+    /// `working_dir` are unaffected; this only keeps `None` honest when a
+    /// thread's workspace changes while its jobs are still tracked here.
+    pub fn set_default_workspace(&mut self, workspace: PathBuf) {
+        self.default_workspace = workspace;
     }
 
     /// Set user-configured bwrap mount extensions (#5410): extra read-only
@@ -2733,7 +2768,6 @@ impl ShellManager {
     }
 
     /// Get output from a background process
-    #[allow(dead_code)]
     pub fn get_output(
         &mut self,
         task_id: &str,
@@ -3053,6 +3087,92 @@ impl ShellManager {
         self.get_output_delta(task_id, wait, timeout_ms)
     }
 
+    /// Read a job's raw stream at an absolute byte offset without consuming
+    /// anything. This is the `/v1/jobs` byte-stream contract: HTTP clients hold
+    /// the cursor, so reads must not disturb the engine's own delta consumer.
+    ///
+    /// `cursor` is a byte offset into the stream's lifetime output (matching
+    /// `total`). When the bounded buffer has already discarded `[0, dropped)`,
+    /// the window starts at `dropped` instead and the caller sees the gap in
+    /// the response rather than a replayed tail. With `wait_ms > 0` on a
+    /// running job, polls up to that bound for new bytes past `cursor` before
+    /// answering — long-poll instead of a hot loop.
+    pub fn read_output_chunk(
+        &mut self,
+        task_id: &str,
+        stream: ShellOutputStream,
+        cursor: usize,
+        max_bytes: usize,
+        wait_ms: u64,
+    ) -> Result<ShellOutputChunk> {
+        let Some(shell) = self.processes.get_mut(task_id) else {
+            // Evicted jobs retain only their snapshot tails. Serve that tail as
+            // the final retained window so a late reader still gets the ending
+            // of the stream instead of a bare not-found.
+            let snapshot = self
+                .stale_jobs
+                .get(task_id)
+                .ok_or_else(|| anyhow!("Job {task_id} not found"))?;
+            let (tail, total) = match stream {
+                ShellOutputStream::Stdout => (&snapshot.stdout_tail, snapshot.stdout_len),
+                ShellOutputStream::Stderr => (&snapshot.stderr_tail, snapshot.stderr_len),
+            };
+            let tail_start = total.saturating_sub(tail.len());
+            let offset = cursor.max(tail_start).min(total);
+            let next_offset = offset.saturating_add(max_bytes).min(total);
+            return Ok(ShellOutputChunk {
+                offset,
+                bytes: tail.as_bytes()[offset - tail_start..next_offset - tail_start].to_vec(),
+                next_offset,
+                total,
+                dropped: tail_start,
+                status: snapshot.status.clone(),
+                exit_code: snapshot.exit_code,
+            });
+        };
+        let buffer = match stream {
+            ShellOutputStream::Stdout => shell.stdout_buffer.clone(),
+            ShellOutputStream::Stderr => shell
+                .stderr_buffer
+                .clone()
+                .ok_or_else(|| anyhow!("Job {task_id} merges stderr into stdout"))?,
+        };
+
+        let wait_deadline = (wait_ms > 0 && shell.status == ShellStatus::Running)
+            .then(|| Instant::now() + Duration::from_millis(wait_ms.clamp(50, 30_000)));
+        loop {
+            shell.poll();
+            let total = buffer.lock().map(|guard| guard.total_len()).unwrap_or(0);
+            let done_waiting = total > cursor
+                || shell.status != ShellStatus::Running
+                || wait_deadline.is_none_or(|deadline| Instant::now() >= deadline);
+            if done_waiting {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        let (bytes, offset, next_offset, total, dropped) = {
+            let guard = buffer.lock().unwrap_or_else(|e| e.into_inner());
+            let total = guard.total_len();
+            let dropped = guard.dropped();
+            let offset = cursor.max(dropped).min(total);
+            let next_offset = offset.saturating_add(max_bytes).min(total);
+            let retained = guard.retained();
+            let bytes = retained[offset - dropped..next_offset - dropped].to_vec();
+            (bytes, offset, next_offset, total, dropped)
+        };
+        Ok(ShellOutputChunk {
+            offset,
+            bytes,
+            next_offset,
+            total,
+            dropped,
+            status: shell.status.clone(),
+            exit_code: shell.exit_code,
+        })
+    }
+
     /// Attach durable task context to a live shell job.
     pub fn tag_linked_task(&mut self, task_id: &str, linked_task_id: Option<String>) -> Result<()> {
         let shell = self
@@ -3261,7 +3381,7 @@ impl ShellManager {
     }
 
     /// Remember a restart-stale job so the UI can show it instead of hiding it.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn remember_stale_job(
         &mut self,
         id: impl Into<String>,
@@ -3393,7 +3513,6 @@ pub fn new_shared_shell_manager(workspace: PathBuf) -> SharedShellManager {
 
 // === ToolSpec Implementations ===
 
-use crate::execpolicy::{ExecPolicyDecision, load_default_policy};
 use crate::features::Feature;
 use crate::tools::cargo_failure_summary::summarize_cargo_failure;
 use crate::tools::spec::{
@@ -3405,7 +3524,51 @@ use codewhale_execpolicy::command_safety::{
     SafetyLevel, analyze_command, extract_primary_command, is_agent_readonly_shell_command,
     is_github_readonly_command, is_parallel_readonly_command, normalize_windows_command_paths,
 };
+use codewhale_execpolicy::toml_rules::{ExecPolicyConfig, RuleDecision};
 use serde_json::json;
+
+/// The TOML execpolicy file lives in the user config home; the rule engine
+/// itself is `codewhale_execpolicy::toml_rules`.
+fn default_execpolicy_path() -> Option<std::path::PathBuf> {
+    crate::config::effective_home_dir().map(|home| home.join(".deepseek").join("execpolicy.toml"))
+}
+
+fn load_default_policy() -> anyhow::Result<Option<ExecPolicyConfig>> {
+    /// A parsed rules file, tagged with the identity it was parsed from.
+    type PolicyKey = (std::path::PathBuf, u64, Option<std::time::SystemTime>);
+
+    let Some(path) = default_execpolicy_path() else {
+        return Ok(None);
+    };
+    // An unreadable or missing file (including a permissions error, which
+    // `exists()` also swallows) means "no file rules" — the same answer as
+    // before, just reached with one `stat` instead of an existence check plus a
+    // full read.
+    let Ok(metadata) = std::fs::metadata(&path) else {
+        return Ok(None);
+    };
+    let key: PolicyKey = (path.clone(), metadata.len(), metadata.modified().ok());
+
+    // #6208: this runs on every shell execution, so the read and TOML parse
+    // happen only when the file's identity changes. Length joins the timestamp
+    // because a coarse-mtime filesystem can hand back the same instant for two
+    // different revisions.
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<Option<(PolicyKey, ExecPolicyConfig)>>> =
+        std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(|| std::sync::Mutex::new(None));
+    let mut cache = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some((cached_key, config)) = cache.as_ref()
+        && *cached_key == key
+    {
+        return Ok(Some(config.clone()));
+    }
+
+    let config = ExecPolicyConfig::from_path(&path)?;
+    *cache = Some((key, config.clone()));
+    Ok(Some(config))
+}
 
 const FOREGROUND_TIMEOUT_RECOVERY_HINT: &str = "Foreground Bash is for bounded commands. \
 The timed-out process was killed; rerun long work as Bash action=\"run\" background=true, \
@@ -5020,14 +5183,18 @@ impl ToolSpec for BashTool {
 
         let background = background || tty;
 
-        let mut execpolicy_decision: Option<ExecPolicyDecision> = None;
+        let mut execpolicy_decision: Option<RuleDecision> = None;
         if context.features.enabled(Feature::ExecPolicy)
-            && let Some(policy) = load_default_policy()
+            && let Some(policy) = tokio::task::spawn_blocking(load_default_policy)
+                .await
+                .map_err(|e| {
+                    ToolError::execution_failed(format!("execpolicy load task failed: {e}"))
+                })?
                 .map_err(|e| ToolError::execution_failed(format!("execpolicy load failed: {e}")))?
         {
             let decision = policy.evaluate(command);
             execpolicy_decision = Some(decision.clone());
-            if let ExecPolicyDecision::Deny(reason) = decision {
+            if let RuleDecision::Deny(reason) = decision {
                 return Ok(ToolResult {
                     content: format!("BLOCKED: {reason}"),
                     success: false,
@@ -5542,14 +5709,14 @@ impl ToolSpec for BashTool {
                     "combined_output": combined_output,
                     "canceled": was_cancelled,
                     "execpolicy": execpolicy_decision.as_ref().map(|decision| match decision {
-                        ExecPolicyDecision::Allow => json!({
+                        RuleDecision::Allow => json!({
                             "decision": "allow",
                         }),
-                        ExecPolicyDecision::Deny(reason) => json!({
+                        RuleDecision::Deny(reason) => json!({
                             "decision": "deny",
                             "reason": reason,
                         }),
-                        ExecPolicyDecision::AskUser(reason) => json!({
+                        RuleDecision::AskUser(reason) => json!({
                             "decision": "ask_user",
                             "reason": reason,
                         }),
@@ -6339,21 +6506,26 @@ impl ToolSpec for NoteTool {
     ) -> Result<ToolResult, ToolError> {
         let note_content = required_str(&input, "content")?;
 
-        // Ensure parent directory exists
+        // Ensure parent directory exists. Tool handlers run on the Tokio
+        // runtime, so filesystem calls use tokio::fs (blocking-call
+        // convention, #6149).
         if let Some(parent) = context.notes_path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| {
+            tokio::fs::create_dir_all(parent).await.map_err(|e| {
                 ToolError::execution_failed(format!("Failed to create notes directory: {e}"))
             })?;
         }
 
         // Append to notes file
-        let mut file = std::fs::OpenOptions::new()
+        let mut file = tokio::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(&context.notes_path)
+            .await
             .map_err(|e| ToolError::execution_failed(format!("Failed to open notes file: {e}")))?;
 
-        writeln!(file, "\n---\n{note_content}")
+        use tokio::io::AsyncWriteExt;
+        file.write_all(format!("\n---\n{note_content}\n").as_bytes())
+            .await
             .map_err(|e| ToolError::execution_failed(format!("Failed to write note: {e}")))?;
 
         Ok(ToolResult::success(format!(

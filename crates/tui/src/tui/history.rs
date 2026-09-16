@@ -77,8 +77,6 @@ pub use tool_output::{
     OutputRow, summarize_mcp_output, summarize_tool_args, summarize_tool_output,
 };
 
-use std::process::Command;
-
 /// Render mode controlling whether tool/thinking cells render their compact
 /// "live" form (with caps and collapsed reasoning) or their full transcript
 /// form (uncapped, suitable for the pager / clipboard / message export).
@@ -2928,50 +2926,40 @@ fn tool_value_style() -> Style {
     Style::default().fg(palette::TEXT_MUTED)
 }
 
-/// Parse `path:line` patterns from `text` and open the file at the given line
-/// in the user's preferred editor (`$VISUAL` / `$EDITOR` / `vim`).
+/// Find the first `path:line` reference in a rendered cell.
 ///
-/// Scans lines of `text` for patterns like `src/main.rs:42`. Resolves the path
-/// relative to `workspace` (if not absolute) and opens the editor. Returns
-/// `true` if at least one file was opened successfully.
-pub fn try_open_file_at_line(text: &str, workspace: &Path) -> bool {
-    let editor = std::env::var("VISUAL")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .or_else(|| {
-            std::env::var("EDITOR")
-                .ok()
-                .filter(|s| !s.trim().is_empty())
-        })
-        .unwrap_or_else(|| "vim".to_string());
-
-    let mut any_opened = false;
+/// Pure: it resolves and stats candidate paths but never launches anything.
+/// Spawning the editor belongs to `external_editor`, which owns the terminal
+/// handoff — this used to build its own `Command` and `spawn()` it detached
+/// while the TUI still held raw mode, the alt screen and mouse capture, and it
+/// did that once per matching line, so one click could leave N editors fighting
+/// the TUI for the same tty (#6235).
+///
+/// Returns the first match rather than every match: a click is one request to
+/// open one file.
+pub(crate) fn first_file_line_reference(text: &str, workspace: &Path) -> Option<(PathBuf, u32)> {
     for line in text.lines() {
         let trimmed = line.trim();
-        if let Some((before, after)) = trimmed.rsplit_once(':')
-            && after.chars().all(|c| c.is_ascii_digit())
-        {
-            let line_num: u32 = after.parse().unwrap_or(1);
-            let path_str = before.trim();
-            if !path_str.is_empty() && looks_like_file_path(path_str) {
-                let abs_path = if Path::new(path_str).is_absolute() {
-                    PathBuf::from(path_str)
-                } else {
-                    workspace.join(path_str)
-                };
-                if abs_path.is_file()
-                    && Command::new(&editor)
-                        .arg(format!("+{line_num}"))
-                        .arg(&abs_path)
-                        .spawn()
-                        .is_ok()
-                {
-                    any_opened = true;
-                }
-            }
+        let Some((before, after)) = trimmed.rsplit_once(':') else {
+            continue;
+        };
+        if after.is_empty() || !after.chars().all(|c| c.is_ascii_digit()) {
+            continue;
+        }
+        let path_str = before.trim();
+        if path_str.is_empty() || !looks_like_file_path(path_str) {
+            continue;
+        }
+        let abs_path = if Path::new(path_str).is_absolute() {
+            PathBuf::from(path_str)
+        } else {
+            workspace.join(path_str)
+        };
+        if abs_path.is_file() {
+            return Some((abs_path, after.parse().unwrap_or(1)));
         }
     }
-    any_opened
+    None
 }
 
 /// Heuristic check whether a string looks like a file path (contains a
@@ -3179,6 +3167,7 @@ mod tests;
 // click path (`work_surface` row rects) is reused at the landing slice;
 // not wired into `ui/frame.rs` (#5698 gate).
 
+#[cfg(test)]
 pub use tideline_stream::{TidelineStream, render_tideline_stream};
 
 /// Full export alias for the Tideline components that compose the stream

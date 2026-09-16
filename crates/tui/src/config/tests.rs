@@ -618,6 +618,8 @@ fn goal_max_continuations_loads_from_goal_table() -> Result<()> {
     );
     assert_eq!(config.goal_max_continuations(), 0);
     assert_eq!(config.goal_continuation_delay_seconds(), 0);
+    // enforce_token_budget defaults off: budgets stay advisory (#6013).
+    assert!(!config.goal_enforce_token_budget());
 
     // Explicit backstop override.
     let config: Config = toml::from_str(
@@ -638,6 +640,15 @@ max_continuations = 0
 "#,
     )?;
     assert_eq!(config.goal_max_continuations(), 0);
+
+    // Opt a set token budget into a hard stop (#6013).
+    let config: Config = toml::from_str(
+        r#"
+[goal]
+enforce_token_budget = true
+"#,
+    )?;
+    assert!(config.goal_enforce_token_budget());
     assert_eq!(config.goal_continuation_delay_seconds(), 0);
 
     // Bound accidental giant cadences; this remains a turn loop, not a
@@ -1915,6 +1926,56 @@ fn user_input_timeout_defaults_disabled_and_clamps() {
     .expect("tools config");
     assert_eq!(
         parsed.base.user_input_timeout(),
+        Some(std::time::Duration::from_secs(86_400))
+    );
+}
+
+#[test]
+fn approval_timeout_defaults_unbounded_and_clamps() {
+    let parsed: ConfigFile = toml::from_str("").expect("empty config");
+    assert_eq!(parsed.base.approval_timeout(), None);
+
+    // The card stays unbounded when only presentation is configured.
+    let parsed: ConfigFile = toml::from_str(
+        r#"
+        [approval]
+        default_selection = "allow_once"
+        "#,
+    )
+    .expect("approval config");
+    assert_eq!(parsed.base.approval_timeout(), None);
+
+    let parsed: ConfigFile = toml::from_str(
+        r#"
+        [approval]
+        timeout_seconds = 300
+        "#,
+    )
+    .expect("approval config");
+    assert_eq!(
+        parsed.base.approval_timeout(),
+        Some(std::time::Duration::from_secs(300))
+    );
+
+    // An explicit 0 follows the repo's "wait forever" convention (#6101).
+    let parsed: ConfigFile = toml::from_str(
+        r#"
+        [approval]
+        timeout_seconds = 0
+        "#,
+    )
+    .expect("approval config");
+    assert_eq!(parsed.base.approval_timeout(), None);
+
+    let parsed: ConfigFile = toml::from_str(
+        r#"
+        [approval]
+        timeout_seconds = 999999
+        "#,
+    )
+    .expect("approval config");
+    assert_eq!(
+        parsed.base.approval_timeout(),
         Some(std::time::Duration::from_secs(86_400))
     );
 }

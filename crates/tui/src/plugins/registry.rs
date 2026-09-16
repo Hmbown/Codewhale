@@ -1966,6 +1966,17 @@ pub fn verify_plugin_component_authority(
 
 /// Recheck a persisted plugin receipt, the mutable reviewed source, and the
 /// Codewhale-owned immutable runtime copy. This function performs no writes.
+///
+/// Known limitation, deliberate: this is **not** memoized on `(path, mtime,
+/// len)`, even though re-walking both trees is the dominant cost of an MCP
+/// dispatch (#6209). The reviewed source tree is user-writable, and
+/// `utimensat(2)` lets any same-uid process restore an mtime after an
+/// equal-length in-place rewrite. A stat-keyed cache would then hand back the
+/// pre-tamper digest, `content_hash` would still match, and a modified bundle
+/// would dispatch as reviewed — turning the one check that stands between a
+/// reviewed bundle and an altered one into a check of whether someone
+/// remembered to reset a timestamp. The cost is paid per dispatch on purpose.
+/// Reduce the *number* of calls instead; see `McpConnection::is_transport_ready`.
 pub fn verify_plugin_authority(authority: &PluginAuthority) -> Result<(), String> {
     verify_plugin_state_authority(authority)?;
     for (label, manifest_path) in [
