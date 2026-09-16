@@ -496,6 +496,7 @@
       html += '<button class="ab-menu-item" id="ab-m-logout">退出登录<small>退出当前账号</small></button>';
       if (installEvt) html += '<button class="ab-menu-item" id="ab-m-install">装到桌面<small>把这个页面装成桌面应用</small></button>';
       body.innerHTML = html;
+      abTipPanel(body, 'my-menu', '这里的设置改一次，<b>你名下所有项目都生效</b>（以后新建的也一样）。');
       var bStaff = body.querySelector('#ab-m-staff');
       if (bStaff) bStaff.onclick = function () { openStaff(role === 'admin' ? 'admin' : ME.user); };
       var bUsers = body.querySelector('#ab-m-users');
@@ -1508,6 +1509,7 @@
             : '<div class="ab-tip">这个项目还没有用量记录。</div>') +
           '<div class="ab-msg" id="adv-msg"></div>';
         var msgEl = el.querySelector('#adv-msg');
+        abTipPanel(el, 'adv-approval', '「<b>审批方式</b>」决定它动手前问不问你 —— 嫌问得多就选「小的自己做」');
         function post(payload) {
           return api('/_gate/advanced', { method: 'POST', body: JSON.stringify(payload) }).then(function (r2) {
             if (r2.ok) msg(msgEl, '已保存', true); else msg(msgEl, (r2.body && r2.body.error) || '保存失败', false);
@@ -2153,200 +2155,160 @@
 
   api('/_gate/whoami').then(function (r) { if (r.ok) ME = r.body; });
 
-  /* ── 上手引导（手把手版，2026-09-16 老板：「什么叫引导？？引导用户点左上角 logo、
-   *   点了再一个个引导去设置偏好、模型、记忆」）──
-   * 这版和「弹一段说明」的区别（三条缺一不可）：
-   *   ① 遮罩把别处挡掉、目标**挖洞亮出来**（他看得见该点哪儿）
-   *   ② **必须他自己点**：这一步的动作真发生了才前进（不是我自动打开给他看）
-   *   ③ 一步一步、每步一句话，随时能跳过；只对第一次来的人跑一次
-   * 技术要点：
-   *   - 遮罩用**四块拼**（上/下/左/右）围住目标，中间留空 → 点击真落在目标元素上（不是合成事件）；
-   *   - 菜单/面板都是本脚本自己画的、异步出现 → 每步先等目标元素出现再画；
-   *   - 位置按 getBoundingClientRect 实时算，resize / scroll / 转屏都重排。
+  /* ── 按需提示（in-context tips）────────────────────────────────────────────
+   * 2026-09-16 老板定 B 方案。**为什么废掉原来那套 7 步挖洞引导**：它不是没做好，
+   * 是方向错 —— NN/g《Mobile App Onboarding》(2020) 研究结论：卡片式教程**并没有提升
+   * 用户的任务表现**，且交互成本高、易被跳过、还增加记忆负担；他们的建议是
+   * 「尽可能不做引导，用户碰到那个界面时再出现提示（in-context / pull revelation）」，
+   * 并且「先测不带引导的版本，卡住了先改界面」。
+   * 所以这里只做三件事，**都不遮屏、不强制、看过就不再来**：
+   *   ① 第一次进项目  → 一行条：设置入口在左上角的标记
+   *   ② 第一次开「我的」→ 面板里一行：这些改一次，名下所有项目都生效
+   *   ③ 第一次进「高级设置」→ 面板里一行：审批方式决定它动不动就问你
+   * ⚠️ 每条只出现**一次**（localStorage 按 key 记）；客户关掉了就是不想看，别再来。
    */
-  var TOUR_KEY = 'ab-tour-v1';
-  var tour = null;   // { holder, i, steps, timer }
-  var tourWait = 0;  // 有别的面板挡着时等它关掉的次数
+  var TIP_PREFIX = 'ab-tip-';
 
-  function tourNarrow() { return window.matchMedia('(max-width: 800px)').matches; }
+  function tipSeen(key) {
+    try { return !!localStorage.getItem(TIP_PREFIX + key); } catch (e) { return true; }   // 存不了 → 当看过（别反复烦）
+  }
+  function tipMark(key) { try { localStorage.setItem(TIP_PREFIX + key, '1'); } catch (e) { /* 无所谓 */ } }
 
-  function tourSteps() {
-    var steps = [];
-    if (tourNarrow()) {
-      // 手机上 logo 藏在侧栏里（默认收起）—— 先让他把栏拉出来
-      steps.push({ sel: '#rail-open', wait: 'click', text: '先点这里，把左边的栏拉出来' });
-    }
-    steps.push({ sel: '.brand-mark', wait: 'click',
-      enter: function () { closeLayer(); },
-      text: '你的设置都在这个标记里 —— 点它一下' });
-    steps.push({ sel: '#ab-m-adv', wait: 'click',
-      text: '先在这儿把几个开关调好 —— 点「高级设置」' });
-    steps.push({ sel: '#adv-approval', wait: 'change', bail: '保持默认，下一步',
-      text: '它动手前先问你多少？选一个（拿不准就保持默认）' });
-    steps.push({ sel: '#adv-mk', wait: 'none', bail: '下一步',
-      text: '现在用的是哪个模型在这儿。想换成你自己的 API 就点「改」，不换就下一步' });
-    steps.push({ sel: '#adv-think', wait: 'change', bail: '下一步',
-      text: '想全程盯着它？这两个勾上（思考过程、动了哪些文件）' });
-    steps.push({ sel: '#ab-m-mem', wait: 'click',
-      enter: function () { closeLayer(); openMyMenu(); },
-      text: '最后一样：它自己的记忆 —— 它记下的事在这儿看，也能清空' });
-    steps.push({ end: true, text: '就这些。以后想改，点左上角那个标记 —— 它自己记的事在「AI 的记忆」里。' });
-    return steps;
+  /** 对话区顶上的一行轻提示（3 秒后自己淡出，也能手动关） */
+  function abTipTop(key, text, ms) {
+    if (tipSeen(key)) return;
+    tipMark(key);
+    var bar = document.createElement('div');
+    bar.id = 'asbudy-tip';
+    bar.innerHTML = '<span>' + text + '</span><button type="button" aria-label="关闭">✕</button>';
+    var st = document.createElement('style');
+    st.textContent = '#asbudy-tip{position:fixed;left:50%;transform:translateX(-50%);top:12px;z-index:99998;display:flex;' +
+      'align-items:center;gap:10px;background:#0d1117;border:1px solid #30363d;border-radius:10px;padding:9px 12px;' +
+      'box-shadow:0 8px 24px rgba(0,0,0,.5);color:#c9d1d9;font-size:13.5px;max-width:88vw;transition:opacity .3s}' +
+      '#asbudy-tip b{color:#e6edf3}#asbudy-tip button{background:none;border:0;color:#8b949e;cursor:pointer;font-size:13px;padding:0 2px}';
+    document.head.appendChild(st);
+    document.body.appendChild(bar);
+    function bye() { bar.style.opacity = '0'; setTimeout(function () { bar.remove(); }, 320); }
+    bar.querySelector('button').onclick = bye;
+    setTimeout(bye, ms || 4200);
   }
 
-  function tourBuild() {
-    var holder = document.createElement('div');
-    holder.id = 'ab-tour';
-    holder.style.cssText = 'position:fixed;inset:0;z-index:100001;pointer-events:none';
-    holder.innerHTML =
-      '<div data-m="top" style="position:fixed;background:rgba(2,7,17,.74);pointer-events:auto"></div>' +
-      '<div data-m="bottom" style="position:fixed;background:rgba(2,7,17,.74);pointer-events:auto"></div>' +
-      '<div data-m="left" style="position:fixed;background:rgba(2,7,17,.74);pointer-events:auto"></div>' +
-      '<div data-m="right" style="position:fixed;background:rgba(2,7,17,.74);pointer-events:auto"></div>' +
-      '<div data-h="1" style="position:fixed;border:2px solid #58a6ff;border-radius:10px;' +
-        'box-shadow:0 0 0 4px #58a6ff33, 0 0 24px #58a6ff44;pointer-events:none;transition:all .18s ease"></div>' +
-      '<div data-t="1" class="abt-tip" style="position:fixed;max-width:330px;background:#0d1117;border:1px solid #30363d;' +
-        'border-radius:12px;padding:14px 16px;box-shadow:0 12px 40px rgba(0,0,0,.65);pointer-events:auto"></div>';
-    document.body.appendChild(holder);
-    return holder;
+  /** 面板里的一行提示（插在面板内容最顶部，跟着面板一起关） */
+  function abTipPanel(body, key, text) {
+    if (!body || tipSeen(key)) return;
+    tipMark(key);
+    var d = document.createElement('div');
+    d.className = 'ab-tip';
+    d.style.cssText = 'border:1px solid #3b7ddd66;background:#3b7ddd14;border-radius:8px;padding:8px 11px;margin:0 0 12px';
+    d.innerHTML = text;
+    body.insertBefore(d, body.firstChild);
   }
 
-  function tourPaint(step) {
-    var holder = tour.holder;
-    var hole = holder.querySelector('[data-h="1"]');
-    var tip = holder.querySelector('[data-t="1"]');
-    var el = step.sel ? document.querySelector(step.sel) : null;
-    var W = window.innerWidth, H = window.innerHeight;
+  /* ── 上手清单（checklist，2026-09-16 老板定 C 方案）──────────────────────────
+   * 依据：行业实践（Notion / Slack 都这么做）—— 把上手要做的事列成 3 条、有顺序、有进度，
+   *   用户自己掌控节奏；不像强推教程那样遮屏或强迫走完。
+   * ⚠️ 三条**都不是「配设置」**，而是「先拿到一次价值」（NN/g：先让用户做成事，别先教配置）：
+   *   ① 让它帮你做一件事（真发过一句话就自动打勾）② 看看它用哪个模型 ③ 看看它自己记的事
+   * 三条齐了 → 自己消失；点「收起」也不再出现（都记在本机）。
+   */
+  var CK_KEY = 'ab-checklist-v1';
+  function ckState() { try { return JSON.parse(localStorage.getItem(CK_KEY) || '{}'); } catch (e) { return {}; } }
+  function ckSave(s) { try { localStorage.setItem(CK_KEY, JSON.stringify(s)); } catch (e) { /* 无所谓 */ } }
+  function ckSet(k) { var s = ckState(); s[k] = 1; ckSave(s); ckPaint(); }
 
-    function boxes(r) {
-      var pad = 6;
-      var t = Math.max(0, r.top - pad), l = Math.max(0, r.left - pad);
-      var b = Math.min(H, r.bottom + pad), rr = Math.min(W, r.right + pad);
-      holder.querySelector('[data-m="top"]').style.cssText = 'position:fixed;background:rgba(2,7,17,.74);pointer-events:auto;top:0;left:0;right:0;height:' + t + 'px';
-      holder.querySelector('[data-m="bottom"]').style.cssText = 'position:fixed;background:rgba(2,7,17,.74);pointer-events:auto;top:' + b + 'px;left:0;right:0;bottom:0';
-      holder.querySelector('[data-m="left"]').style.cssText = 'position:fixed;background:rgba(2,7,17,.74);pointer-events:auto;top:' + t + 'px;left:0;width:' + l + 'px;height:' + (b - t) + 'px';
-      holder.querySelector('[data-m="right"]').style.cssText = 'position:fixed;background:rgba(2,7,17,.74);pointer-events:auto;top:' + t + 'px;left:' + rr + 'px;right:0;height:' + (b - t) + 'px';
-      hole.style.cssText = hole.style.cssText.replace(/top:[^;]*;|left:[^;]*;|width:[^;]*;|height:[^;]*;/g, '') +
-        ';top:' + t + 'px;left:' + l + 'px;width:' + (rr - l) + 'px;height:' + (b - t) + 'px';
-      return { t: t, b: b, l: l, rr: rr };
+  var ckCss = document.createElement('style');
+  ckCss.textContent = [
+    '#asbudy-checklist{padding:0 0 8px}',
+    '.ck-wrap{border:1px solid #30363d;background:#0d1117;border-radius:10px;padding:10px 12px}',
+    '.ck-hd{display:flex;align-items:center;gap:9px;margin-bottom:8px}',
+    '.ck-hd b{color:#e6edf3;font-size:13.5px;flex:none}',
+    '.ck-bar{flex:1;height:5px;border-radius:3px;background:#21262d;overflow:hidden;display:block}',
+    '.ck-bar i{display:block;height:100%;background:#238636;transition:width .25s}',
+    '.ck-x{background:none;border:0;color:#8b949e;font-size:12.5px;cursor:pointer;flex:none}',
+    '.ck-x:hover{color:#e6edf3}',
+    '.ck-row{display:flex;align-items:center;gap:9px;width:100%;text-align:left;background:none;border:0;',
+    'border-top:1px solid #161b22;padding:8px 0;cursor:pointer;color:#c9d1d9;font:inherit;font-size:13.5px}',
+    '.ck-row:first-of-type{border-top:0}',
+    '.ck-row:hover{color:#e6edf3}',
+    '.ck-box{flex:none;width:17px;height:17px;border:1px solid #30363d;border-radius:5px;font-size:12px;',
+    'line-height:15px;text-align:center;color:#3fb950}',
+    '.ck-row.on .ck-box{border-color:#238636;background:#23863622}',
+    '.ck-txt{flex:1}.ck-txt small{display:block;color:#6b7280;font-size:12.5px}',
+    '.ck-go{color:#6b7280}',
+    '.ck-done{border-color:#23863666;background:#23863612;color:#3fb950;font-size:13.5px}',
+  ].join('\n');
+  document.head.appendChild(ckCss);
+
+  function ckPaint() {
+    var el = document.getElementById('asbudy-checklist');
+    var s = ckState();
+    if (s.hidden) { if (el) el.remove(); return; }
+    if (!el || !document.body.contains(el)) {
+      var wrap = document.querySelector('.composer-wrap') || document.getElementById('composer');
+      if (!wrap || !wrap.parentNode) return;                 // 界面还没起来，下次再说
+      el = document.createElement('div');
+      el.id = 'asbudy-checklist';
+      wrap.parentNode.insertBefore(el, wrap);
     }
-
-    var progress = (tour.i + 1) + '/' + tour.steps.length;
-    var buttons = '<button type="button" id="abt-skip" style="position:absolute;top:8px;right:10px;background:none;border:0;color:#8b949e;font-size:12.5px;cursor:pointer">跳过</button>' +
-      '<div data-p="1" style="position:absolute;top:8px;left:12px;color:#8b949e;font-size:12px">' + progress + '</div>';
-
-    if (step.end) {
-      hole.style.display = 'none';
-      holder.querySelectorAll('[data-m]').forEach(function (d) { d.style.cssText = d.style.cssText.replace(/top:[^;]*;|left:[^;]*;|width:[^;]*;|height:[^;]*;|right:[^;]*;|bottom:[^;]*;/g, ''); d.style.top = '0'; d.style.bottom = '0'; d.style.left = '0'; d.style.right = '0'; });
-      holder.querySelector('[data-m="bottom"]').style.cssText = 'position:fixed;background:rgba(2,7,17,.74);pointer-events:auto;inset:0';
-      holder.querySelector('[data-m="top"]').style.display = 'none';
-      holder.querySelector('[data-m="left"]').style.display = 'none';
-      holder.querySelector('[data-m="right"]').style.display = 'none';
-      tip.style.left = Math.max(12, (W - 330) / 2) + 'px';
-      tip.style.top = Math.max(40, H / 2 - 90) + 'px';
-      tip.innerHTML = buttons + '<div style="color:#e6edf3;font-size:14.5px;line-height:1.7;padding-right:52px">' + esc(step.text) + '</div>' +
-        '<div style="margin-top:12px;text-align:right"><button class="ab-btn" id="abt-done" type="button">知道了</button></div>';
-      tip.querySelector('#abt-done').onclick = function () { tourFinish(true); };
-      tip.querySelector('#abt-skip').onclick = function () { tourFinish(false); };
+    var items = [
+      { k: 'act', text: '让它帮你做一件事', hint: '在下面跟它说一句就行' },
+      { k: 'model', text: '看看它在用哪个模型', hint: '平台已配好，也能换成你自己的' },
+      { k: 'mem', text: '看看它自己记的事', hint: '记忆开关也在这儿' },
+    ];
+    var done = 0;
+    for (var i = 0; i < items.length; i++) if (s[items[i].k]) done++;
+    if (done === items.length) {
+      // 先让他看见「完成」这一下（3 秒），再记「已收起」并移除 ——
+      // 别立刻把 hidden 记上（那样下一次 paint 会当场抹掉，客户根本没看见）
+      el.innerHTML = '<div class="ck-wrap ck-done">✅ 上手完成 —— 以后想改设置，点左上角那个标记。</div>';
+      if (!el.dataset.doneAt) {
+        el.dataset.doneAt = String(Date.now());
+        setTimeout(function () {
+          var ss = ckState(); ss.hidden = 1; ckSave(ss);
+          var e2 = document.getElementById('asbudy-checklist'); if (e2) e2.remove();
+        }, 3000);
+      }
       return;
     }
-
-    holder.querySelectorAll('[data-m]').forEach(function (d) { d.style.display = ''; });
-    hole.style.display = '';
-    if (!el) return;
-
-    var rect = el.getBoundingClientRect();
-    var b = boxes(rect);
-
-    // 气泡：优先目标下方，放不下就上方
-    var below = b.b + 14, need = 150;
-    var tipTop = (below + need < H) ? below : Math.max(12, b.t - need - 14);
-    tip.style.left = Math.min(Math.max(12, b.l), Math.max(12, W - 344)) + 'px';
-    tip.style.top = tipTop + 'px';
-    var onlyText = '<div style="color:#e6edf3;font-size:14.5px;line-height:1.7;padding-right:52px">' + esc(step.text) + '</div>';
-    var acts = '';
-    if (step.bail) acts = '<div style="margin-top:12px;text-align:right"><button class="ab-btn" id="abt-next" type="button">' + esc(step.bail) + '</button></div>';
-    tip.innerHTML = buttons + onlyText + acts;
-    tip.querySelector('#abt-skip').onclick = function () { tourFinish(false); };
-    var nb = tip.querySelector('#abt-next');
-    if (nb) nb.onclick = function () { tour.i++; tourRun(); };
+    var rows = items.map(function (it) {
+      return '<button type="button" class="ck-row' + (s[it.k] ? ' on' : '') + '" data-ck="' + it.k + '">' +
+        '<span class="ck-box">' + (s[it.k] ? '✓' : '') + '</span>' +
+        '<span class="ck-txt">' + it.text + '<small>' + it.hint + '</small></span>' +
+        '<span class="ck-go">›</span></button>';
+    }).join('');
+    el.innerHTML = '<div class="ck-wrap"><div class="ck-hd"><b>上手 ' + done + '/' + items.length + '</b>' +
+      '<i class="ck-bar"><i style="width:' + Math.round(done / items.length * 100) + '%"></i></i>' +
+      '<button type="button" class="ck-x" id="ck-hide">收起</button></div>' + rows + '</div>';
+    el.querySelectorAll('[data-ck]').forEach(function (b) {
+      b.onclick = function () {
+        var k = b.getAttribute('data-ck');
+        if (k === 'act') {
+          ckSet('act');
+          var box = document.querySelector('.composer textarea, .composer input, #composer textarea, #composer input');
+          if (box) { try { box.focus(); } catch (e) { /* 无所谓 */ } }
+        } else if (k === 'model') { ckSet('model'); openModelApiLoader(); }
+        else if (k === 'mem') { ckSet('mem'); openMemory(); }
+      };
+    });
+    el.querySelector('#ck-hide').onclick = function () {
+      var s2 = ckState(); s2.hidden = 1; ckSave(s2);
+      var e3 = document.getElementById('asbudy-checklist'); if (e3) e3.remove();
+    };
   }
 
-  function tourRun() {
-    var step = tour.steps[tour.i];
-    if (!step) return tourFinish(true);
-    if (step.enter) { try { step.enter(); } catch (e) { /* 导航失败不卡住 */ } }
-    var tries = 0;
-    (function waitEl() {
-      var el = step.sel ? document.querySelector(step.sel) : null;
-      if (!el && step.sel && tries++ < 40) { tour.timer = setTimeout(waitEl, 100); return; }
-      if (el && step.sel) {
-        try { el.scrollIntoView({ block: 'center' }); } catch (e) { /* 老浏览器 */ }
-      }
-      tourPaint(step);
-    })();
-  }
-
-  function tourOnDocClick(e) {
-    if (!tour) return;
-    var step = tour.steps[tour.i];
-    if (!step || step.end || !step.sel) return;
-    var el = document.querySelector(step.sel);
-    if (el && (e.target === el || el.contains(e.target))) {
-      if (step.wait === 'click') { setTimeout(function () { tour.i++; tourRun(); }, 260); }
-    }
-  }
-
-  function tourOnChange(e) {
-    if (!tour) return;
-    var step = tour.steps[tour.i];
-    if (!step || step.end || step.wait !== 'change') return;
-    var el = document.querySelector(step.sel);
-    if (el && (e.target === el || el.contains(e.target))) { setTimeout(function () { tour.i++; tourRun(); }, 420); }
-  }
-
-  function tourFinish(completed) {
-    if (tour) {
-      if (tour.timer) clearTimeout(tour.timer);
-      var h = tour.holder;
-      if (h) { h.style.transition = 'opacity .2s'; h.style.opacity = '0'; setTimeout(function () { h.remove(); }, 220); }
-    }
-    window.removeEventListener('resize', tourRepaint, true);
-    window.removeEventListener('scroll', tourRepaint, true);
-    document.removeEventListener('click', tourOnDocClick, true);
-    document.removeEventListener('change', tourOnChange, true);
-    tour = null;
-    try { localStorage.setItem(TOUR_KEY, completed ? 'done' : 'skipped'); } catch (e) { /* 无所谓 */ }
-  }
-
-  function tourRepaint() {
-    if (!tour) return;
-    var step = tour.steps[tour.i];
-    if (step) tourPaint(step);
-  }
-
-  function abStartTour() {
-    try { if (localStorage.getItem(TOUR_KEY)) return; } catch (e) { return; }   // 存不了就不打扰
-    // 已经开着别的面板（例如「你正在替别人操作」的提示）→ 等它关掉再开始，别叠着弹
-    if (document.getElementById('asbudy-layer') && tourWait++ < 20) { setTimeout(abStartTour, 800); return; }
-    tour = { holder: null, i: 0, steps: tourSteps(), timer: null };
-    tour.holder = tourBuild();
-    window.addEventListener('resize', tourRepaint, true);
-    window.addEventListener('scroll', tourRepaint, true);
-    document.addEventListener('click', tourOnDocClick, true);
-    document.addEventListener('change', tourOnChange, true);
-    tourRun();
-  }
-
-  /* 第一次进项目 → 起引导（等官方界面把 logo 渲染出来） */
-  (function () {
+  /* ① 自动判定：他真的跟 AI 说过话（对话里出现了 AI 回复）→ 自动打勾 */
+  (function watchFirstTurn() {
     var n = 0;
     var t = setInterval(function () {
       n++;
-      if (document.querySelector('.brand-mark')) { clearInterval(t); setTimeout(abStartTour, 900); }
-      else if (n > 40) clearInterval(t);
-    }, 250);
+      if (document.querySelector('article.message.agent')) { ckSet('act'); clearInterval(t); }
+      else if (n > 400) clearInterval(t);                    // 10 分钟还没聊过 → 不再盯
+    }, 1500);
+    ckPaint();
   })();
+
+  /* ① 第一次进项目：设置入口在左上角的标记（不遮屏，几秒后自己消失） */
+  setTimeout(function () { abTipTop('where-settings', '想改模型、偏好？点<b>左上角那个标记</b>。'); }, 2600);
 
   /* 进了别人的视角 → 弹一次提示（附三 §13：替别人操作是敏感事，得让你清楚自己在谁的界面里） */
   (function () {
