@@ -103,19 +103,18 @@
         if (m && m[1] && m[1] !== 'summary') MODEL_THREAD = m[1];
       } catch (e) {}
       var p = prev.apply(this, arguments);
-      // 发消息被拒 → 直接提示
-      try {
-        if (p && p.then && /\/v1\/threads\/[^/?]+\/turns/.test(u)) {
-          p.then(function (r) { if (r && r.status >= 400) showFixBar(); }).catch(function () {});
-        }
-      } catch (e) {}
       // 换了对话 → 把上一条的提示撒掉（**不拿旧结论去猜新对话**，零误报的第一条）
       try { if (MODEL_THREAD !== before) hideFixBar(); } catch (e) {}
-      // ★ 只对【确定发生过的事】反应：引擎在事件流里推的 error
-      //   （实测教训：失败**不走 HTTP 状态码**，POST /turns 返回 201、错误在流里；
-      //    所以「拦状态码」和「定时主动体检」两种做法都不够稳 ——
-      //    老板 2026-09-16：「黄条判定有把握做到绝对稳定吗？没把握就别做」）。
-      //   流里看得见 error → 那是铁的事实，不是推测。副本读一份，不影响官方前端。
+      // ★ 只认【引擎给的权威终态】：这一轮 status = "failed" 才算「这条对话出问题了」。
+      //   （2026-09-16 老板方案 B：**去掉碰运气式的黄条**，只在真的发不出消息时才给一句话。）
+      //   为什么不再看 HTTP 状态码、不再 grep 错误关键词 —— 两次误报都出在那两处：
+      //     ① 点「停止」后那条 turn 卡在「正在停止」，紧接着再发消息 → 前端走「插话」(steer)
+      //        → 引擎回 400（“is stopping and cannot be steered”）→ 旧规则把任意 /turns 的
+      //        4xx 当“坏了” → 误报（2026-09-16 实测复现）；
+      //     ② 事件流里任一次工具失败 / 网络抖动都带 error 关键词 → 也误报。
+      //   引擎的终态是它自己下的判断：停止=interrupted、正常=completed、真出事=failed。
+      //   所以这里改成**解析 SSE 帧、只看 turn.completed 里的 payload.turn.status**（问引擎要真相）。
+      //   副本读一份，不影响官方前端。
       try {
         if (p && p.then && /\/v1\/threads\/[^/?]+\/events/.test(u)) {
           p.then(function (r) {
@@ -125,13 +124,29 @@
             try {
               var rd = copy.body.getReader();
               var dec = new TextDecoder();
-              var tail = '';
+              var buf = '';
+              var onFrame = function (frame) {
+                if (frame.indexOf('turn.completed') < 0) return;
+                var lines = frame.split('\n');
+                var data = '';
+                for (var i = 0; i < lines.length; i++) {
+                  if (lines[i].indexOf('data:') === 0) { data = lines[i].slice(5).trim(); break; }
+                }
+                if (!data) return;
+                var o;
+                try { o = JSON.parse(data); } catch (e) { return; }
+                var st = o && o.payload && o.payload.turn && o.payload.turn.status;
+                if (String(st) === 'failed') showFixBar();
+              };
               var pump = function () {
                 rd.read().then(function (x) {
                   if (x.done) return;
-                  tail = (tail + dec.decode(x.value, { stream: true })).slice(-4000);
-                  if (/("kind"\s*:\s*"error"|"event"\s*:\s*"error"|No tool output found|Responses API request failed)/.test(tail)) {
-                    showFixBar();
+                  buf += dec.decode(x.value, { stream: true });
+                  if (buf.length > 1000000) buf = buf.slice(-100000);   // 异常大帧兜底（SSE 帧本应很小）
+                  var idx;
+                  while ((idx = buf.indexOf('\n\n')) >= 0) {
+                    onFrame(buf.slice(0, idx));
+                    buf = buf.slice(idx + 2);
                   }
                   pump();
                 }).catch(function () {});
@@ -148,9 +163,11 @@
   /* ── 对话坏了 → 给一个自己就能点的「修好」──
    * 为什么不做成自动静默修：换过去之后历史不在（实测），客户得知道
    * 「刚才那条对话不在了、这是新的一条」——矞着换过去比报错更吓人。
-   * ⚠️ 检测方式：教训（2026-09-16）——原本想拦 HTTP 400，实测**拦不到**：
-   *   失败是引擎在事件流里推的（界面上那个「Error · Failed」），HTTP 反而是 201。
-   *   所以改成**主动查**：定时问门卫「当前这条对话里有 failed 轮次吗」（不用等她再碰一次）。 */
+   * ⚠️ 什么时候弹（2026-09-16 定稿 · 老板方案 B）：**只在引擎说这一轮真 failed 时** ——
+   *   看事件流里 turn.completed 帧的 payload.turn.status === "failed"（引擎的权威终态）。
+   *   试过、都已撤掉的判定（都会误报）：① 拦 HTTP 状态码（实测失败是 201，拦不到；反过来
+   *   「插话被拒」的 400 又被误当成坏了）② 扫事件流里的 error 关键词（工具瞬时失败/网络抖动
+   *   都带关键词）③ 定时主动问门卫（靠猜 status）。详见档案 §8.7 85。 */
   function showFixBar() {
     if (document.getElementById('asbudy-fixbar')) return;
     var st = document.createElement('style');
@@ -204,9 +221,9 @@
     if (b) b.remove();
   }
 
-  // （体检那套已撤 —— 2026-09-16 老板要求「没把握做到绝对稳定就别做」：
-  //   它靠猜 status，会误报；现在只对事件流里看得见的 error 反应，并把入口收敛到
-  //   下面这个「发消息被拒」分支 + 换对话就清提示。）
+  // 触发点只剩一个（2026-09-16 定稿）：引擎的 turn 终态 = failed（在上面 window.fetch 包装的
+  //   onFrame 里）。停止=interrupted、插话被拒=HTTP 400（不是 turn 终态）、工具瞬时失败但
+  //   AI 继续=completed —— 都不弹。换对话时清提示（hideFixBar）。
 
   /* ── 模型小标签可点（对话区上方的「模型: xxx」——比藏在菜单里好找）──
    * ⚠️ 2026-09-15 重写：以前写死三个名字写进 m0/.env，而**没有任何在跑的代码读那份 .env**
