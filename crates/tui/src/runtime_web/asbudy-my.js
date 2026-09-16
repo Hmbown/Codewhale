@@ -485,6 +485,7 @@
       html += '<button class="ab-menu-item" id="ab-m-proj">项目管理<small>暂停（停引擎、省内存）/ 恢复 / 删除</small></button>';
       html += '<button class="ab-menu-item" id="ab-m-auto">定时任务<small>让 AI 按点自己干活（每天 / 每周 / 每月）</small></button>';
       html += '<button class="ab-menu-item" id="ab-m-mem">AI 的记忆<small>它自己记下来的事 —— 你能看，也能清空</small></button>';
+      html += '<button class="ab-menu-item" id="ab-m-skills">它会做什么<small>它已经学会的本事 —— 做 PPT / 表格 / 文档 / PDF / 图表…</small></button>';
       html += '<button class="ab-menu-item" id="ab-m-space">空间<small>磁盘用量、每个项目占多少 / 上限多少</small></button>';
       html += '<button class="ab-menu-item" id="ab-m-adv">高级设置<small>接上你自己的代码仓库 / 模型服务 / 只看不改 / 花了多少</small></button>';
       if (role === 'customer') {
@@ -502,6 +503,7 @@
       body.querySelector('#ab-m-proj').onclick = openProjects;
       body.querySelector('#ab-m-auto').onclick = openAuto;
       body.querySelector('#ab-m-mem').onclick = openMemory;
+      body.querySelector('#ab-m-skills').onclick = openSkills;
       var bSpace = body.querySelector('#ab-m-space');
       if (bSpace) bSpace.onclick = openSpace;
       var bAdv = body.querySelector('#ab-m-adv');
@@ -1212,6 +1214,86 @@
           if (onDone) onDone();
         });
       };
+    });
+  }
+
+  /* ── 「它会做什么」：把引擎的本事清单搬给客户看（2026-09-16 · 搬表：`GET /v1/skills`）──
+   * 为什么做：引擎里 38 项技能（做 PPT / 表格 / Word / PDF / 图表 / 联网查资料…），
+   *   官方 web 界面**一条都没接** —— 客户既不知道它有什么用，也不敢把活交给它。
+   * 为什么是**只读清单、不给装**：官方 `POST /v1/skills/install` 要填的是 `github:owner/repo`
+   *   或网址（那是给开发者的口子），客户填不来；我们的做法是平台把技能统一挂公共目录
+   *   （引擎家里的 skills 软链 → `/opt/asbudy/share/skills`）→ 客户项目**全都有**。
+   *   所以这个面板只回答一句话：「它到底会哪些本事」。
+   * ⚠️ 中文名是我们自己加的（官方描述多是英文）；**表里没列的技能一律落进「其他能力」显示原名** ——
+   *   官方以后加技能不会丢，也不会因为漏翻译就消失；而表里列了但引擎当前没装的，直接不显示。
+   */
+  var SKILL_GROUPS = [
+    ['做文件', [
+      ['pptx', '做 PPT', '按你说的做幻灯片、改版式、配图'],
+      ['presentations', '做 PPT（另一套工具）', '同上；版式复杂时换它做更稳'],
+      ['xlsx', '做 Excel 表格', '建表、算公式、清洗数据、导出'],
+      ['spreadsheets', '做表格（另一套工具）', '同上；CSV / TSV 也能处理'],
+      ['docx', '做 Word 文档', '写文档、改格式、套模板'],
+      ['documents', '做 Word（另一套工具）', '同上；合同、通知、报告都行'],
+      ['pdf', '处理 PDF', '拆开、合并、旋转、加水印、提文字、识扫描件'],
+      ['dataviz', '做图表', '把数据画成图、做看板，让人一眼看懂'],
+      ['document', '写说明文档', '整理使用说明这类文档'],
+    ]],
+    ['查资料 / 对接别的系统', [
+      ['research', '上网查资料', '联网找最新信息，并给出来源'],
+      ['feishu', '对接飞书', '飞书机器人、云文档、表格、审批流'],
+      ['alapi', '对接 ALAPI 接口', '需要调 ALAPI 平台的接口时'],
+    ]],
+  ];
+
+  function abSkillCard(title, desc, sk) {
+    return '<div class="ab-card"><div class="ab-card-top"><span class="ab-n">' + esc(title) + '</span>' +
+      (sk && sk.enabled === false ? '<span class="ab-s">已关</span>' : '') + '</div>' +
+      '<div class="ab-s">' + esc(desc || '') + '</div></div>';
+  }
+
+  function openSkills() {
+    openLayer('它会做什么', function (body) {
+      body.innerHTML = '<div id="ab-skills"><div class="ab-tip">正在问它…</div></div>';
+      api('/v1/skills').then(function (r) {
+        var el = body.querySelector('#ab-skills');
+        if (!el) return;
+        if (!r.ok) {
+          el.innerHTML = '<div class="ab-tip">读不到清单：' + esc((r.body && r.body.error) || r.code) + '</div>';
+          return;
+        }
+        var list = ((r.body || {}).skills || []);
+        var known = {};
+        var html = '<div class="ab-tip">这些是它<b>已经学会</b>的本事 —— <b>你不用挑、也不用点</b>：' +
+          '直接跟它说要做什么，它自己会挑合适的用。</div>';
+        SKILL_GROUPS.forEach(function (g) {
+          var rows = '';
+          g[1].forEach(function (it) {
+            var sk = null;
+            for (var i = 0; i < list.length; i++) if (list[i].name === it[0]) { sk = list[i]; break; }
+            if (!sk) return;                     // 引擎当前没装 → 不显示（表是死的，清单是活的）
+            known[it[0]] = 1;
+            rows += abSkillCard(it[1], it[2], sk);
+          });
+          if (rows) html += '<div style="margin:12px 0 6px;color:#e6edf3;font-size:14px">' + esc(g[0]) + '</div>' + rows;
+        });
+        var rest = [];
+        for (var j = 0; j < list.length; j++) if (!known[list[j].name]) rest.push(list[j]);
+        if (rest.length) {
+          html += '<div style="margin-top:14px"><button class="ab-btn ghost sm" id="ab-sk-more" type="button">还有 ' +
+            rest.length + ' 项别的本事（点开看）</button></div><div id="ab-sk-rest" hidden>' +
+            rest.map(function (s) { return abSkillCard(s.name, (s.description || '').slice(0, 120), s); }).join('') + '</div>';
+        }
+        html += '<div class="ab-tip" style="margin-top:14px">想让它多会一样？跟平台说一声就行 —— 你自己不用装。</div>';
+        el.innerHTML = html;
+        var more = el.querySelector('#ab-sk-more');
+        if (more) more.onclick = function () {
+          var box = el.querySelector('#ab-sk-rest');
+          var wasHidden = box.hidden;
+          box.hidden = !wasHidden;
+          more.textContent = wasHidden ? '收起' : ('还有 ' + rest.length + ' 项别的本事（点开看）');
+        };
+      });
     });
   }
 
