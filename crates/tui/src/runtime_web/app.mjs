@@ -1683,9 +1683,20 @@ function startBrowserClient() {
     const title = element("h2", "", approval.tool_name || "工具请求");
     title.id = titleId;
     card.append(title);
-    card.append(element("p", "", approval.intent_summary || approval.description || "Codewhale is waiting for permission."));
+    card.append(element("p", "", approval.intent_summary || approval.description || "AsBudy 正在等你确认能不能做这一步。"));
     const actions = element("div", "attention-actions");
     const rememberLabel = element("label", "remember-field");
+    // ★ 这个勾选框藏了（2026-09-16 老板问「勾了是不是又会全自动半小时」时查出来的）：
+    //   它的文字写「这类操作以后不再问我」，但引擎源码（`runtime_threads.rs:11452`）里
+    //   `remember:true` 的**唯一**后果是 `remember_thread_auto_approve()` —— 把**整条对话**
+    //   设成 `auto_approve=true` ＋ `permission_posture="full_access"`（并重建引擎策略），
+    //   **根本没有「按操作类别记住」这回事**（runtime_threads 里跟 approval_cache 一点关系都没有）。
+    //   也就是说：它承诺的是「这类」，实际干的是「整条」—— 勾一下当前这一轮就会一路跑到底。
+    //   门卫已经加了一道保护（审批响应一结束就按客户设置拉回，见 `syncThreadApproval`），
+    //   但那样一来这个勾选框就彻底没用了 —— 留着一个「点了没用」的控件比没有更坏。
+    //   想让它全自动：去「我的 → 高级设置 → 审批方式」选「全部自己做」——那是明确的、可撤销的。
+    rememberLabel.hidden = true;
+    rememberLabel.style.display = "none";
     const remember = document.createElement("input");
     remember.type = "checkbox";
     rememberLabel.append(remember, document.createTextNode("这类操作以后不再问我"));
@@ -1693,11 +1704,11 @@ function startBrowserClient() {
     //   实际引擎收到 remember:true 后会把整条会话的 auto_approve 置为 true
     //   （见 crates/tui/src/runtime_threads 的测试：“remember flag” → thread.auto_approve），
     //   也就是**以后全自动、再也不弹**。不懂电脑的客户根本想不到这层。
-    rememberLabel.title = '勾上并点 Allow：这条对话里这类操作以后直接执行、不再弹审批';
-    const deny = element("button", "quiet-button danger", "Deny");
+    rememberLabel.title = '勾上并点「允许」：这条对话里这类操作以后直接执行、不再弹审批（**只对同一类操作**；不会让整条对话变成全自动）';
+    const deny = element("button", "quiet-button danger", "不允许");
     deny.type = "button";
     deny.addEventListener("click", () => resolveApproval(approvalId, "deny", remember.checked));
-    const allow = element("button", "primary-button", "Allow");
+    const allow = element("button", "primary-button", "允许");
     allow.type = "button";
     allow.addEventListener("click", () => resolveApproval(approvalId, "allow", remember.checked));
     actions.append(rememberLabel, deny, allow);
