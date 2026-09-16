@@ -1417,8 +1417,8 @@ function startBrowserClient() {
     if (!app.threadState.thread) {
       renderTranscriptEmpty(
         "choose-thread",
-        "你的本地智能体，就在浏览器里。",
-        "新建一个会话，或从侧栏选择一个。此客户端与终端使用同一个运行时。",
+        "准备好了，随时可以开工。",
+        "从左边挑一个会话，或者直接在下面说一句你要做什么。",
       );
       return;
     }
