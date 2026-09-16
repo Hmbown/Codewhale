@@ -125,6 +125,25 @@
       .catch(function (e) { go.disabled = false; fail(msgEl, '没建成：' + e.message); });
   };
 
+  /* 「先给我演示一个」—— 空状态页的主行动（2026-09-16 老板定 A 方案）
+   * 自动建一个带示例的项目（名字/模板用默认），省掉「起名字 + 选从哪开始」两步 ——
+   * NN/g 空状态规范里说的「直达关键任务的路」就是一步到位，别让新手先做选择题。 */
+  var quickBtn = $('abx-quick');
+  if (quickBtn) quickBtn.onclick = function () {
+    var qMsg = $('abx-quick-msg');
+    var old = quickBtn.textContent;
+    quickBtn.disabled = true;
+    quickBtn.textContent = '正在给你准备（约 10~30 秒）…';
+    info(qMsg, '建好会自动带你进去。');
+    api('/_gate/projects/create', { method: 'POST', body: { name: '我的第一个系统', template: 'example' } })
+      .then(function (r) {
+        if (!r.ok) { quickBtn.disabled = false; quickBtn.textContent = old; return fail(qMsg, (r.body && r.body.error) || '没建成'); }
+        okMsg(qMsg, '建好了，正在带你过去…');
+        location.href = '/';
+      })
+      .catch(function (e) { quickBtn.disabled = false; quickBtn.textContent = old; fail(qMsg, '没建成：' + e.message); });
+  };
+
   /* ══════════ 导入已有项目 ══════════ */
   var impPanel = $('abx-imp-panel'), inp = $('abx-imp-input');
   var pickInfo = $('abx-imp-pickinfo'), impMsg = $('abx-imp-msg'), impGo = $('abx-imp-go');
