@@ -1880,3 +1880,25 @@ noscript {
 .remember-field,
 .answer-option,
 .status-banner { font-size: 14px; }
+
+/* ── 「← 回到我的项目」：客户看了文件之后，回到自己系统的入口 ──
+   2026-09-16 老板问「用户点击了其他文件预览后，再想看她做的系统，从哪里点击查看？」
+   —— 原来只有预览栏右上角一个不起眼的「看系统」，不懂电脑的人不会往那儿找。 */
+.pv-back {
+  flex: none;
+  padding: 3px 9px;
+  font-size: 13px;
+  color: var(--text);
+  background: var(--surface, #161b22);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  cursor: pointer;
+}
+.pv-back:hover {
+  border-color: var(--text-dim);
+  color: var(--accent, #58a6ff);
+}
+/* 有返回按钮时，文件名紧跟着它，下载仍在最右 */
+.pv-back + .pv-file-name {
+  margin-right: auto;
+}

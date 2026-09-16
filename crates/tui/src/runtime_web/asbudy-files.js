@@ -608,6 +608,16 @@
       fileBox.innerHTML = '';
       var fh = document.createElement('div');
       fh.className = 'pv-file-head';
+      // 客户项目：看文件的时候，屏幕上要让「怎么回到我的项目」摆在最显眼的位置
+      //（2026-09-16 老板问：用户点了其他文件预览后，再想看她的系统从哪里点？
+      //  光靠右上角那个小按钮不够显 —— 不懂电脑的人不会往那儿找）。
+      if (projKind === 'proxy') {
+        var back = document.createElement('span');
+        back.className = 'pv-back';
+        back.id = 'pv-back';
+        back.textContent = '← 回到我的项目';
+        fh.appendChild(back);
+      }
       var nm = document.createElement('span'); nm.className = 'pv-file-name'; nm.textContent = name;
       fh.appendChild(nm);
       if (download) {
@@ -817,6 +827,7 @@
     if (!t.id) return;
     if (t.id === 'preview-close') { hidePreview(); }
     else if (t.id === 'preview-sys') { showSysPreview(); }
+    else if (t.id === 'pv-back') { showSysPreview(); }   // 文件预览区里那个「← 回到我的项目」
     else if (t.id === 'preview-reveal') { showPreview(); }
     // 「单独打开」（2026-09-16 老板：客户没法像网站一样打开自己的项目）——
     // 门卫给的地址里已经带了一张短期票，开出去就是一个能全屏用、能给同事看的页面。
