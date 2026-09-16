@@ -1661,8 +1661,9 @@ function startBrowserClient() {
    * 把样式跟渲染器写在**同一个文件**里 → 两者版本永远一致，不会再错位。
    * 尺寸都收在正文一档：标题只是一段回复里的小标题，**不能像网页 h1 那样巨大**。 */
   const MARKDOWN_CSS = [
-    '.message-body h1,.message-body h2,.message-body h3,.message-body h4{font-size:1em;font-weight:700;margin:12px 0 6px;line-height:1.4}',
+    '.message-body h1,.message-body h2,.message-body h3,.message-body h4{font-size:1em;font-weight:600;margin:12px 0 6px;line-height:1.4}',
     '.message-body h1:first-child,.message-body h2:first-child,.message-body h3:first-child,.message-body h4:first-child{margin-top:0}',
+    '.message-body strong{font-weight:600}',
     '.message-body p{margin:6px 0}',
     '.message-body p:first-child{margin-top:0}',
     '.message-body ul,.message-body ol{margin:6px 0;padding-left:22px}',

@@ -1902,3 +1902,10 @@ noscript {
 .pv-back + .pv-file-name {
   margin-right: auto;
 }
+
+/* ── AI 回复的字号（2026-09-16 · 老板：「回复字号没有变化」—— 16.5px 他觉得偏大）
+   放在末尾集中段：同选择器后写者胜，不动官方原值，以后调数只改这一处。
+   参照：客户自己发的消息、输入框都是 15.5–16px —— AI 回复比它们略小一档，
+   长回复读起来才不累。 */
+.message-body { font-size: 15px; }
+.message.user .message-body { font-size: 14.5px; }
