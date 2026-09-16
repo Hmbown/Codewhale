@@ -1612,6 +1612,15 @@ impl AcpServer {
             self.client_supports_terminal,
         ));
         let resolved_id = saved.metadata.id.clone();
+        // A short prefix can resolve to an id this connection already
+        // tracks: the in-memory fast path above checked the prefix, not the
+        // resolved id. Pushing again would duplicate the id in
+        // `insertion_order` while `sessions.insert` merely overwrites, and a
+        // later capacity eviction would then pop the stale front copy and
+        // remove a live, recently reloaded session (#6245).
+        if self.sessions.contains_key(&resolved_id) {
+            return Ok(self.session_configuration(&resolved_id));
+        }
         if self.sessions.len() >= MAX_ACP_SESSIONS
             && let Some(oldest) = self.insertion_order.pop_front()
         {
@@ -2761,6 +2770,77 @@ mod tests {
         assert_eq!(missing.expect_err("unknown session").code, -32602);
         let no_id = server.load_session(json!({}));
         assert_eq!(no_id.expect_err("missing sessionId").code, -32602);
+    }
+
+    /// #6245: reloading a tracked session by a short prefix must not push a
+    /// duplicate `insertion_order` entry. The duplicate made the deque
+    /// disagree with `sessions`, so a later capacity eviction popped the
+    /// stale front copy of a just-reloaded session and removed a live
+    /// conversation.
+    #[tokio::test]
+    async fn loading_a_tracked_session_by_prefix_does_not_duplicate_ordering() {
+        let _guard = crate::test_support::lock_test_env();
+        let home = tempfile::TempDir::new().expect("isolated codewhale home");
+        let _home_guard =
+            crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", home.path().as_os_str());
+
+        let workspace = home.path().join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        let saved = crate::session_manager::create_saved_session(
+            &[Message {
+                role: Role::User,
+                content: vec![ContentBlock::Text {
+                    text: "reload me by prefix".to_string(),
+                    cache_control: None,
+                }],
+            }],
+            "deepseek-v4-flash",
+            &workspace,
+            42,
+            None,
+        );
+        let saved_id = saved.metadata.id.clone();
+        let manager = crate::session_manager::SessionManager::new(
+            crate::session_manager::default_sessions_dir().expect("sessions dir"),
+        )
+        .expect("session manager");
+        manager.save_session(&saved).expect("save fixture session");
+
+        let mut server = AcpServer::new(
+            Config::default(),
+            "deepseek-v4-flash".to_string(),
+            workspace.clone(),
+        );
+
+        // Load by the full id first: the session becomes tracked exactly once.
+        let loaded = server
+            .load_session(json!({ "sessionId": saved_id }))
+            .expect("load by full id");
+        assert_eq!(loaded["sessionId"], saved_id);
+
+        // A prefix resolving to the same tracked id must be idempotent, not
+        // a second insertion.
+        let prefix: String = saved_id.chars().take(8).collect();
+        let reloaded = server
+            .load_session(json!({ "sessionId": prefix }))
+            .expect("load by prefix");
+        assert_eq!(reloaded["sessionId"], saved_id);
+
+        assert_eq!(server.sessions.len(), 1);
+        assert_eq!(
+            server.insertion_order.len(),
+            server.sessions.len(),
+            "a prefix reload of a tracked session must not duplicate the ordering entry"
+        );
+        assert_eq!(
+            server
+                .insertion_order
+                .iter()
+                .filter(|id| *id == &saved_id)
+                .count(),
+            1,
+            "the ordering deque holds the tracked id exactly once"
+        );
     }
 
     #[tokio::test]
