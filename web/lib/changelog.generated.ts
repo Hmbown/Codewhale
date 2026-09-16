@@ -25,7 +25,7 @@ export const CHANGELOG: ChangelogRelease[] = [
     "version": "Unreleased",
     "date": null,
     "unreleased": true,
-    "compareUrl": "https://github.com/Hmbown/CodeWhale/compare/v0.9.12...HEAD",
+    "compareUrl": "https://github.com/Hmbown/CodeWhale/compare/v0.9.13...HEAD",
     "sections": [
       {
         "heading": "Security",
@@ -38,21 +38,26 @@ export const CHANGELOG: ChangelogRelease[] = [
         "heading": "Added",
         "items": [
           "File edits are parse-gated before the write lands: Rust goes through syn::parse_file for a grammar-exact line:column, and .toml / .json through the parsers already vendored. An edit is refused only when the file parsed *before* and would not parse *after* — repairing an already-broken file is the commonest reason to edit source at all, so pre-existing breakage and new files fail open. The check precedes the write, so a rejection leaves the file untouched and apply_patch…",
-          "Rust files that were already rustfmt-clean are re-normalized after an edit, so the next patch's anchors still match. Hand-formatted files are never rewritten, and every failure path skips and lets the edit land (#6205).",
+          "Rust files that were already rustfmt-clean are re-normalized after an edit, so the next patch's anchors still match. Hand-formatted files are never rewritten, and every failure path skips and lets the edit land (#6205, #6151).",
           "Native clients can finish provider setup without dropping to the CLI: DELETE /v1/providers/{id}/key clears a Codewhale-owned credential through the same shared owner as codewhale auth clear, and GET /v1/providers now carries credentialSource / credentialWritable (plus a reason) so a client disables its control with a truthful explanation instead of letting a write fail late. A credential Codewhale does not own — a literal key in a config file, or an active external consent —…",
           "The interactive approval card can be bounded: [approval] timeout_seconds resolves an unanswered card to deny when the window elapses — the same fail-closed decision the external approval path takes — and the transcript says the bound denied the call, not the operator. Omitted or 0 keeps today's unbounded wait, so nothing changes unless you opt in (#6101).",
           "Transcript drag selection copies Markdown source by default: every cell the selection touches serializes through the same canonical path Ctrl-Y and /copy use, partial intersections round out to whole cells joined with blank lines, and the toast names the copied cell count. tui.selection_copy_markdown = false keeps the rendered-text payload (#6156).",
-          "The Runtime API serves the workspace files a native client browses and edits: GET /v1/workspace/files lists one directory, GET /v1/workspace/files/read returns a bounded byte window with a whole-file SHA-256 revision, and PUT /v1/workspace/files writes atomically through the confined opener with revision-checked overwrites (409 on drift). .git is never served and symlinks are never followed. A saved session's oversized tool outputs are served as artifacts at GET…"
+          "The Runtime API serves the workspace files a native client browses and edits: GET /v1/workspace/files lists one directory, GET /v1/workspace/files/read returns a bounded byte window with a whole-file SHA-256 revision, and PUT /v1/workspace/files writes atomically through the confined opener with revision-checked overwrites (409 on drift). .git is never served and symlinks are never followed. A saved session's oversized tool outputs are served as artifacts at GET…",
+          "A session that ended mid-turn is no longer invisible to the model. The newest workspace-scoped session still holding a crash-recovery checkpoint is surfaced as a one-line ## Prior Session notice in the session-pinned prompt prefix — metadata reads only, excluding the live session and any session this process instance created. Clean sessions get no block, so their prefix bytes are unchanged. Two bounded read-only tools, session_search and session_get, give the model…",
+          "codewhale exec --hooks opts a headless run into the same HookExecutor the TUI builds — global config, reviewed plugin snapshots, and trusted project hooks.toml. Headless runs previously fired no hooks at all. tool_call_before can still deny and shell_env still applies; a hook ask resolves fail-closed without a terminal. Fleet worker subprocesses never opt in, and permissions.toml typed rules are unchanged (#6099).",
+          "codewhale doctor flags fleet and profile model pins that the provider's own roster no longer offers. A pin is reported only when a *fresh* cached live roster for that exact route exists and omits it — stale, failed, or absent rosters prove nothing and are counted as unverifiable rather than raising a false warning. Each row names the route and every owner of the pin; the pin is surfaced, never rewritten (#6035)."
         ],
-        "itemCount": 6
+        "itemCount": 9
       },
       {
         "heading": "Changed",
         "items": [
+          "Configured MCP servers now connect lazily instead of all at session boot. The pool owns a connecting set marked at spawn and cleared on resolution or abort, so \"connecting\" is no longer inferred as enabled-minus-connected. The boot pass scopes to the eager set — required servers plus those covered by tools.always_load / allowed_tools — and a turn naming an unstarted server spawns its connects alongside, under the existing five-second deadline. A configured-but-unstarted…",
+          "The launch card's MCP problems row runs its own remedy. It already printed /mcp login <name> or /mcp; it now joins the shared paint/click/keyboard ordering, so Up/Down lands on it and Enter or a click types the printed command into the composer for you to send. Typing beats copying: no clipboard dependency over SSH, and you see the command before a second Enter runs it (#6085).",
           "Computer Use is the only computer-use product in Extensions and /mcp recommendations. Cua is no longer suggested as a parallel desktop-control MCP; enable the first-party computer-use plugin instead. The bundled plugin is 0.4.0: Return/Enter from type, filtered and paginated get_app_state, focus/get_value, and strategy:\"app\" window-scoped clicks. Shared-desktop pointer gestures stay gated.",
           "The bundled first-party catalog pins marketplace revision ca6be22, so installing Computer Use from the Extensions listing fetches the same 0.4.0 source and the published notarized 0.4.0 Mac app."
         ],
-        "itemCount": 2
+        "itemCount": 4
       },
       {
         "heading": "Fixed",
