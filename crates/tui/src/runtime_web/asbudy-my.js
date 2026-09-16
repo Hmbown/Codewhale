@@ -480,7 +480,7 @@
    * 侧栏底部显示一行带时间的版本号：他一看就知道自己加载的是不是最新，我们也别再猜。
    * ⚠️ 改完界面文件顺手把 UI_BUILD 改掉（就下面这一行）。
    */
-  var UI_BUILD = '2026-09-16 16:55';
+  var UI_BUILD = '2026-09-16 16:58';
   function abStampVersion() {
     var foot = document.querySelector('.rail-footer') || document.querySelector('.rail');
     if (!foot || document.getElementById('asbudy-version')) return;
