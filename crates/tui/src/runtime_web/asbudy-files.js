@@ -30,6 +30,11 @@
     '.asb-fold:hover{color:var(--text)}',
     '.asb-title{flex:1;min-width:0;font-weight:700;letter-spacing:0.08em;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
     '.asb-title #asb-mine-count{font-weight:400;letter-spacing:0;color:var(--text-faint)}',
+    // 「看我的项目」大按钮（2026-09-16 老板：学老系统，做成的东西放左侧栏；
+    // 以前只有预览栏右上角一个小按钮，客户找不到）
+    '.asb-openproj{display:block;width:100%;padding:10px 12px;font:inherit;font-size:14px;font-weight:600;color:#fff;background:#238636;border:0;border-radius:7px;cursor:pointer;text-align:center}',
+    '.asb-openproj:hover{background:#2ea043}',
+    '.asb-openproj:active{transform:scale(.985)}',
     '.asb-tools{flex:none;color:var(--text-dim);display:flex;gap:10px;align-items:center}',
     '.asb-bd{padding:0 10px 10px;max-height:30vh;overflow-y:auto}',
     '.asb-card.folded .asb-bd{display:none}',
@@ -250,6 +255,21 @@
   // 删掉的东西挪在这儿：资料池的来自「我的资料」，产出物的来自某个项目。
   // 能还原（挪回原位）、能彻底删（真删）。空的时候整块隐藏，不打扰。
   var recycleBox = null;
+
+  // ── 「看我的项目」入口（2026-09-16 老板要求：做成的东西放左侧栏）──
+  // 摆在整个侧栏的**最上面**，一个大大的主按钮 —— 客户最常要的就是「看我那个系统」。
+  // 为什么必须显眼：以前入口只在预览栏右上角（一个小灰按钮），老板连问了两次
+  //「她从哪点击查看她做的系统」。
+  function ensureProjectBox() {
+    if (projKind !== 'proxy') return;        // 只有「有系统的项目」才有这个入口（工作台不适用）
+    var hostEl = document.getElementById('asbudy-files');
+    if (!hostEl || document.getElementById('asbudy-openproj')) return;
+    var box = document.createElement('div');
+    box.className = 'asb-card';
+    box.id = 'asbudy-openproj';
+    box.innerHTML = '<div class="asb-bd"><button class="asb-openproj" id="asb-openproj" type="button">\u25b6 看我的项目</button></div>';
+    hostEl.insertBefore(box, hostEl.firstChild);
+  }
   function ensureRecycleBox() {
     if (recycleBox) return recycleBox;
     var mineCard = mineBody ? mineBody.closest('.asb-card') : null;
@@ -656,6 +676,7 @@
   setFold('proj', isFolded('proj'));      // 恢复上次的折叠状态
   setFold('mine', isFolded('mine'));
   setFold('undo', isFolded('undo'));      // 退回面板默认折叠（老板 2026-09-15；回收站在建卡时应用）
+  ensureProjectBox();   // 左栏最上面那个「▶ 看我的项目」大按钮
   loadProj();
   loadMine();
   loadRecycle();
@@ -828,6 +849,7 @@
     if (t.id === 'preview-close') { hidePreview(); }
     else if (t.id === 'preview-sys') { showSysPreview(); }
     else if (t.id === 'pv-back') { showSysPreview(); }   // 文件预览区里那个「← 回到我的项目」
+    else if (t.id === 'asb-openproj') { showSysPreview(); }   // 左侧栏顶上那个大按钮
     else if (t.id === 'preview-reveal') { showPreview(); }
     // 「单独打开」（2026-09-16 老板：客户没法像网站一样打开自己的项目）——
     // 门卫给的地址里已经带了一张短期票，开出去就是一个能全屏用、能给同事看的页面。
