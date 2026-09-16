@@ -1139,6 +1139,10 @@
    */
   function abSetMemory(on, btn, done) {
     if (btn) { btn.disabled = true; btn.textContent = on ? '正在打开…' : '正在关掉…'; }
+    var m = document.getElementById('mem-msg');
+    // 记忆是「引擎启动时才读」的（remember 工具那时才注册）—— 门卫会在保存后重启本项目的 AI 才真生效，
+    // 这里如实告诉客户要等几秒（否则客户会以为「点了没反应」—— 2026-09-16 实测踩到）。
+    if (m) { m.className = 'ab-msg'; m.textContent = '正在重启这个项目的 AI（几秒钟），好让设置真生效…'; }
     // 记忆也是**全局偏好**（2026-09-16 老板点名：「包括记忆也是」）——
     // 一次设置，名下所有项目都生效（没在跑的项目等下次打开时自动补）。
     api('/_gate/prefs', {
@@ -1147,8 +1151,18 @@
     }).then(function (r) {
       if (!r.ok || (r.body && r.body.ok === false)) {
         if (btn) { btn.disabled = false; btn.textContent = on ? '打开记忆' : '关掉记忆'; }
-        alert('没设置成：' + ((r.body && (r.body.error || r.body.message)) || ('HTTP ' + r.code)));
+        var why = (r.body && (r.body.error || r.body.message)) || ('HTTP ' + r.code);
+        if (m) { m.className = 'ab-msg err'; m.textContent = '没设置成：' + why; }
         return;
+      }
+      if (m) {
+        if (r.body && r.body.restarted && r.body.restarted.ok === false) {
+          m.className = 'ab-msg err';
+          m.textContent = '设置存下了，但这个项目的 AI 没能重启（' + (r.body.restarted.error || '') + '）—— 得让平台看一眼才能真生效。';
+        } else {
+          m.className = 'ab-msg ok';
+          m.textContent = '好了 —— 本项目的 AI 已重启，设置已经生效。';
+        }
       }
       if (done) done();
     });
