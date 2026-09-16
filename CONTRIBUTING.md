@@ -525,13 +525,13 @@ Issue reports should include:
 ## Security
 
 If you discover a security vulnerability, please do **not** open a public issue.
-See [SECURITY.md](SECURITY.md) for the responsible disclosure process and
+See [SECURITY.md](.github/SECURITY.md) for the responsible disclosure process and
 contact information.
 
 ## Code of Conduct
 
 Be respectful and inclusive. We welcome contributors of all backgrounds and
-experience levels. See [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) for the full
+experience levels. See [CODE_OF_CONDUCT.md](.github/CODE_OF_CONDUCT.md) for the full
 code of conduct.
 
 ## License

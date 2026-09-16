@@ -148,5 +148,5 @@ the process after crashes or host reboots.
 ## Related Documentation
 
 - [WeCom Bridge README](README.md)
-- [CodeWhale Security Policy](../../SECURITY.md)
+- [CodeWhale Security Policy](../../.github/SECURITY.md)
 - [CodeWhale Contributing Guide](../../CONTRIBUTING.md)
