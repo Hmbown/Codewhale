@@ -1902,28 +1902,3 @@ noscript {
 .pv-back + .pv-file-name {
   margin-right: auto;
 }
-
-/* ── AI 回复的 Markdown 渲染（2026-09-16 · AsBudy）────────────────────────
-   官方 web 前端不渲染 markdown（CLI/TUI 渲染、web 不渲染）→ 客户看到一堆 ## ** |。
-   我们在显示层补上（app.mjs 的 renderMarkdown）。尺寸都收在正文一档里 ——
-   标题不能像网页 h1 那样巨大，它只是一段回复里的小标题。 */
-.message-body h1, .message-body h2, .message-body h3, .message-body h4 {
-  font-size: 1em; font-weight: 700; margin: 12px 0 6px; line-height: 1.4;
-}
-.message-body h1:first-child, .message-body h2:first-child,
-.message-body h3:first-child, .message-body h4:first-child { margin-top: 0; }
-.message-body p { margin: 6px 0; }
-.message-body p:first-child { margin-top: 0; }
-.message-body ul, .message-body ol { margin: 6px 0; padding-left: 22px; }
-.message-body li { margin: 3px 0; }
-.message-body code {
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  font-size: 0.92em; background: rgba(110, 118, 129, 0.25);
-  padding: 1px 5px; border-radius: 4px;
-}
-.message-body table {
-  border-collapse: collapse; margin: 8px 0; font-size: 0.95em;
-  display: block; overflow-x: auto; max-width: 100%;
-}
-.message-body td { border: 1px solid #30363d; padding: 4px 9px; text-align: left; white-space: nowrap; }
-.message-body tr:first-child td { font-weight: 600; background: rgba(110, 118, 129, 0.12); }

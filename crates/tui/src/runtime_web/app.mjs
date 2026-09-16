@@ -1634,6 +1634,37 @@ function startBrowserClient() {
     target.innerHTML = html;
   }
 
+  /* ── Markdown 渲染的配套样式（2026-09-16）──
+   * 为什么不写在 styles.css 里：app.mjs 和 styles.css 是**两个文件、各自缓存** ——
+   * 出现过「JS 是新的（会渲染 markdown）＋ CSS 还是旧的（没有配套样式）」→ 标题按浏览器
+   * **默认**渲染成 2em（约 33px）加粗（老板当天就撞上，形容“非常大、而且加粗了”）。
+   * 把样式跟渲染器写在**同一个文件**里 → 两者版本永远一致，不会再错位。
+   * 尺寸都收在正文一档：标题只是一段回复里的小标题，**不能像网页 h1 那样巨大**。 */
+  const MARKDOWN_CSS = [
+    '.message-body h1,.message-body h2,.message-body h3,.message-body h4{font-size:1em;font-weight:700;margin:12px 0 6px;line-height:1.4}',
+    '.message-body h1:first-child,.message-body h2:first-child,.message-body h3:first-child,.message-body h4:first-child{margin-top:0}',
+    '.message-body p{margin:6px 0}',
+    '.message-body p:first-child{margin-top:0}',
+    '.message-body ul,.message-body ol{margin:6px 0;padding-left:22px}',
+    '.message-body li{margin:3px 0}',
+    '.message-body code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:.92em;background:rgba(110,118,129,.25);padding:1px 5px;border-radius:4px}',
+    '.message-body table{border-collapse:collapse;margin:8px 0;font-size:.95em;display:block;overflow-x:auto;max-width:100%}',
+    '.message-body td{border:1px solid #30363d;padding:4px 9px;text-align:left;white-space:nowrap}',
+    '.message-body tr:first-child td{font-weight:600;background:rgba(110,118,129,.12)}',
+    /* 兜底：万一有人往正文里写了更高级的选择器，也不能让标题爆尺寸 */
+    '.message-body h1,.message-body h2,.message-body h3,.message-body h4,.message-body h5,.message-body h6{font-size:1em!important}',
+  ].join("\n");
+  (function injectMarkdownStyles() {
+    if (!globalThis.document || !document.head) return;
+    let tag = document.getElementById("asbudy-md-styles");
+    if (!tag) {
+      tag = document.createElement("style");
+      tag.id = "asbudy-md-styles";
+      document.head.appendChild(tag);
+    }
+    tag.textContent = MARKDOWN_CSS;
+  })();
+
   function captureTranscriptSelection() {
     const selection = globalThis.getSelection?.();
     if (!selection || selection.rangeCount === 0 || selection.isCollapsed) return null;
