@@ -14927,13 +14927,28 @@ fn resolve_spawn_route_profile(
     if member.is_some() || configured_manual_spawn_model(runtime, request)?.is_some() {
         return Ok(member);
     }
-    let role = request
-        .assignment
-        .role
-        .as_deref()
-        .unwrap_or_else(|| request.agent_type.as_str());
-    let member = crate::fleet::worker_runtime::resolve_pinned_role_profile(roster.members(), role)
-        .map_err(|error| ToolError::invalid_input(error.to_string()))?;
+    // A role the caller never wrote is Codewhale's own default
+    // (`FleetRole::Worker` -> "general"), not a request. Refusing an ambiguous
+    // pin is right when the caller named a role, type or profile — it stops us
+    // silently choosing one of several providers for them. But for a
+    // prompt-only `agent(action=start, ...)` it turned our default into a hard
+    // failure whenever two members happened to share role `general`, blocking
+    // the spawn at the tool boundary over a selector the caller never asked
+    // for (#6244). In that case an ambiguous pin means "no usable pin": fall
+    // through to the session/operator route the spawn would have taken anyway.
+    let requested_role = request.assignment.role.as_deref();
+    let role = requested_role.unwrap_or_else(|| request.agent_type.as_str());
+    let role_was_requested = requested_role.is_some() || request.agent_type_explicit;
+    let member =
+        match crate::fleet::worker_runtime::resolve_pinned_role_profile(roster.members(), role) {
+            Ok(member) => member,
+            Err(crate::fleet::identity::FleetSelectorError::Ambiguous { .. })
+                if !role_was_requested =>
+            {
+                None
+            }
+            Err(error) => return Err(ToolError::invalid_input(error.to_string())),
+        };
     let Some(member) = member else {
         return Ok(None);
     };

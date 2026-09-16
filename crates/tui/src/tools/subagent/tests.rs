@@ -4825,6 +4825,64 @@ fn saved_role_ambiguity_fails_unless_a_higher_priority_pin_selects_the_route() {
     assert_eq!(explicit.agent_type, FleetRole::Reviewer);
 }
 
+/// A prompt-only spawn must not be refused over a role the caller never wrote.
+///
+/// `request.agent_type` defaults to `FleetRole::Worker`, whose `as_str()` is
+/// `"general"`, so the route lookup synthesized `role:general` for a call that
+/// named no type, role or profile. Two saved members sharing role `general` then
+/// made every bare `agent(action=start, ...)` fail at the tool boundary (#6244).
+/// The refusal is still correct when the caller *did* ask — that half is pinned
+/// by `saved_role_ambiguity_fails_unless_a_higher_priority_pin_selects_the_route`.
+#[test]
+fn prompt_only_spawn_survives_an_ambiguous_default_role() {
+    let root = tempdir().unwrap();
+    for id in ["general-a", "general-b"] {
+        std::fs::write(
+            root.path().join(format!("{id}.toml")),
+            format!(
+                "id = '{id}'\nbase_role = 'general'\nprovider = 'deepseek'\nmodel = 'deepseek-v4-flash'\n",
+            ),
+        )
+        .unwrap();
+    }
+    let profiles = crate::fleet::profile::load_agent_profiles_from_dir(root.path()).unwrap();
+    assert_eq!(profiles.len(), 2);
+    let roster = FleetRoster::from_members(profiles);
+    let runtime = stub_runtime();
+
+    let mut request = parse_spawn_request(&json!({"prompt":"do the thing"})).unwrap();
+    assert!(
+        !request.agent_type_explicit,
+        "a prompt-only spawn must not report an explicit type"
+    );
+    assert_eq!(request.assignment.role, None);
+
+    let member = resolve_spawn_route_profile(&runtime, &mut request, &roster)
+        .expect("an ambiguous default role must not block a prompt-only spawn");
+    assert!(
+        member.is_none(),
+        "no member is pinned, so the spawn falls through to the session route"
+    );
+    assert_eq!(
+        request.profile, None,
+        "an unusable pin must not stamp a member"
+    );
+
+    // The same roster still refuses when the caller actually named the role.
+    let mut asked = parse_spawn_request(&json!({"prompt":"do the thing", "type":"general"}))
+        .expect("an explicit general type parses");
+    if asked.agent_type_explicit {
+        let error = resolve_spawn_route_profile(&runtime, &mut asked, &roster)
+            .expect_err("an explicitly requested ambiguous role must still refuse");
+        let message = error.to_string();
+        assert!(message.contains("ambiguous"), "{message}");
+        assert!(
+            message.contains("profile"),
+            "the refusal must say how to choose one: {message}"
+        );
+    }
+}
+
 #[test]
 fn providerless_spawn_model_gate_rejects_known_foreign_route_before_spawn() {
     let runtime = stub_runtime_for_provider("moonshot");

@@ -280,7 +280,7 @@ pub enum FleetSelectorError {
         path: String,
     },
     #[error(
-        "Fleet member selector `{selector}` is ambiguous; choose one member explicitly: {candidates}"
+        "Fleet member selector `{selector}` is ambiguous; choose one member explicitly by passing `profile` as one of: {candidates}"
     )]
     Ambiguous {
         selector: String,
