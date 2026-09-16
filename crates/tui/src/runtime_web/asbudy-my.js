@@ -60,7 +60,7 @@
     '.fact-chip[data-asbudy-model] strong{text-decoration:underline;text-underline-offset:2px;text-decoration-style:dotted}',
     '.fact-chip[data-asbudy-model]:hover strong{color:#58a6ff}',
     '#asbudy-tick{font-size:13.5px;color:#8b949e;padding:0 0 6px 2px}',
-    '#asbudy-msgbar{display:flex;gap:8px;padding:0 0 6px 2px}',
+    '#asbudy-msgbar{display:flex;flex-wrap:wrap;align-items:center;gap:8px;padding:0 0 6px 2px}',
     '#asbudy-msgbar button{font:inherit;font-size:13.5px;color:#8b949e;background:transparent;border:1px solid #30363d;border-radius:6px;padding:3px 10px;cursor:pointer}',
     '#asbudy-msgbar button:hover{color:#e6edf3}',
   ].join('\n');
@@ -109,8 +109,38 @@
           p.then(function (r) { if (r && r.status >= 400) showFixBar(); }).catch(function () {});
         }
       } catch (e) {}
-      // 换了对话 → 立刻重体检（不能等 15 秒；也**不能把上一条的结论残留在新对话上**）
-      try { if (MODEL_THREAD !== before) setTimeout(checkThreadHealth, 1500); } catch (e) {}
+      // 换了对话 → 把上一条的提示撒掉（**不拿旧结论去猜新对话**，零误报的第一条）
+      try { if (MODEL_THREAD !== before) hideFixBar(); } catch (e) {}
+      // ★ 只对【确定发生过的事】反应：引擎在事件流里推的 error
+      //   （实测教训：失败**不走 HTTP 状态码**，POST /turns 返回 201、错误在流里；
+      //    所以「拦状态码」和「定时主动体检」两种做法都不够稳 ——
+      //    老板 2026-09-16：「黄条判定有把握做到绝对稳定吗？没把握就别做」）。
+      //   流里看得见 error → 那是铁的事实，不是推测。副本读一份，不影响官方前端。
+      try {
+        if (p && p.then && /\/v1\/threads\/[^/?]+\/events/.test(u)) {
+          p.then(function (r) {
+            if (!r || !r.body || typeof r.clone !== 'function') return;
+            var copy;
+            try { copy = r.clone(); } catch (e) { return; }   // 已被读过就 clone 不了 —— 放过去
+            try {
+              var rd = copy.body.getReader();
+              var dec = new TextDecoder();
+              var tail = '';
+              var pump = function () {
+                rd.read().then(function (x) {
+                  if (x.done) return;
+                  tail = (tail + dec.decode(x.value, { stream: true })).slice(-4000);
+                  if (/("kind"\s*:\s*"error"|"event"\s*:\s*"error"|No tool output found|Responses API request failed)/.test(tail)) {
+                    showFixBar();
+                  }
+                  pump();
+                }).catch(function () {});
+              };
+              pump();
+            } catch (e) {}
+          }).catch(function () {});
+        }
+      } catch (e) {}
       return p;
     };
   })();
@@ -174,24 +204,9 @@
     if (b) b.remove();
   }
 
-  // 主动体检：当前这条对话有没有 failed 轮次（有就提示「修好继续」，好了就撤掉提示）
-  var FIX_CHECKING = false;
-  function checkThreadHealth() {
-    if (FIX_CHECKING || !MODEL_THREAD) return;
-    FIX_CHECKING = true;
-    var tid = MODEL_THREAD;
-    fetch('/_gate/thread-repair?thread=' + encodeURIComponent(tid), { credentials: 'same-origin' })
-      .then(function (r) { return r.json().catch(function () { return {}; }); })
-      .then(function (j) {
-        if (tid !== MODEL_THREAD) return;    // 体检期间换了对话 → 这次结果作废，别播到别人头上
-        if (j && j.needRepair) showFixBar();
-        else hideFixBar();                   // ← 关键：没事就把黄条撒掉（以前漏了这步）
-      })
-      .catch(function () {})
-      .then(function () { FIX_CHECKING = false; });
-  }
-  setInterval(checkThreadHealth, 15000);
-  setTimeout(checkThreadHealth, 5000);
+  // （体检那套已撤 —— 2026-09-16 老板要求「没把握做到绝对稳定就别做」：
+  //   它靠猜 status，会误报；现在只对事件流里看得见的 error 反应，并把入口收敛到
+  //   下面这个「发消息被拒」分支 + 换对话就清提示。）
 
   /* ── 模型小标签可点（对话区上方的「模型: xxx」——比藏在菜单里好找）──
    * ⚠️ 2026-09-15 重写：以前写死三个名字写进 m0/.env，而**没有任何在跑的代码读那份 .env**
@@ -1859,18 +1874,32 @@
     async function loadCtx() {
       var el = document.getElementById('asbudy-ctx');
       if (!el) return;
-      if (!LAST_THREAD) { el.textContent = ''; return; }
+      // ⚠️ 2026-09-16 老板：「界面只显示「压缩」，哪有百分比？」——
+      //   病根：以前**没数据就把文字清空**（元素在、但空）→ 看着就是“没这功能”。
+      //   现在**永远显示**：没数据就说「记性 —」，鼠标移上去告诉为什么。
+      function show(txt, title, hot) {
+        el.textContent = txt;
+        el.style.color = hot ? '#f85149' : '#8b949e';
+        el.title = title;
+        el.style.cursor = 'help';
+      }
+      if (!LAST_THREAD) {
+        show('记性 —', '还没开始对话 —— 说一句之后，这里会显示它用了多少「记忆」');
+        return;
+      }
       try {
         var r = await fetch('/_gate/context?thread=' + encodeURIComponent(LAST_THREAD), { credentials: 'same-origin' });
-        if (!r.ok) { el.textContent = ''; return; }
+        if (!r.ok) { show('记性 —', '暂时读不到（接口 ' + r.status + '）'); return; }
         var d = await r.json();
-        if (!d || !d.available) { el.textContent = ''; return; }
+        if (!d || !d.available) {
+          show('记性 —', '这条对话还没有用量记录' + ((d && d.model) ? '（模型 ' + d.model + '）' : ''));
+          return;
+        }
         var hot = d.percent >= 80;
-        el.textContent = '记性 ' + d.percent + '%';
-        el.style.color = hot ? '#f85149' : '#8b949e';
-        el.title = '这次对话占了模型「记忆」的 ' + d.percent + '%（' + fmtK(d.used) + ' / ' + fmtK(d.window) + '）'
-          + (hot ? '\n快满了 —— 开个新对话，AI 会更清醒' : '');
-      } catch (e) { el.textContent = ''; }
+        show('记性 ' + d.percent + '%',
+          '这次对话占了模型「记忆」的 ' + d.percent + '%（' + fmtK(d.used) + ' / ' + fmtK(d.window) + '）'
+          + (hot ? '\n快满了 —— 开个新对话，AI 会更清醒' : ''), hot);
+      } catch (e) { show('记性 —', '暂时读不到'); }
     }
     setInterval(loadCtx, 15000);
     setTimeout(loadCtx, 3000);
