@@ -1978,7 +1978,15 @@ function startBrowserClient() {
   }
 
   function renderComposer() {
-    const ready = Boolean(app.threadState.thread);
+    // 能不能打字：有一条在看的会话，**或者还没有会话**。
+    //   ⚠️ AsBudy：不能只看 threadState.thread。新建的项目进来时引擎里一条会话都没有，
+    //   threadState.thread 为空 → 原来的判定把输入框**永久禁用**（客户点进去一个字也打不了，
+    //   而空状态还写着「直接在下面说一句你要做什么」—— 文案在骗人）。
+    //   没有会话时发送由 sendMessage() 自己建一条（官方逻辑本来就有）。
+    //   只读的历史快照（target.kind === "session"，官方叫 peek）仍然禁用：
+    //   那种情况下消息没有落点，官方原意如此（见 resolveReplyTarget）。
+    const readonlyPeek = app.target?.kind === "session";
+    const ready = Boolean(app.threadState.thread) || !readonlyPeek;
     const active = activeTurn();
     const sending = app.inFlightActions.has(composerSendAction);
     dom.composerInput.disabled = sending || !ready;
