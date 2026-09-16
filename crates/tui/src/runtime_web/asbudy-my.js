@@ -2260,7 +2260,7 @@
     if (done === items.length) {
       // 先让他看见「完成」这一下（3 秒），再记「已收起」并移除 ——
       // 别立刻把 hidden 记上（那样下一次 paint 会当场抹掉，客户根本没看见）
-      el.innerHTML = '<div class="ck-wrap ck-done">✅ 上手完成 —— 以后想改设置，点左上角那个标记。</div>';
+      el.innerHTML = '<div class="ck-wrap ck-done">✅ 上手完成 —— 以后想改设置，' + whereSettingsText() + '。</div>';
       if (!el.dataset.doneAt) {
         el.dataset.doneAt = String(Date.now());
         setTimeout(function () {
@@ -2307,8 +2307,19 @@
     ckPaint();
   })();
 
+  /* 「设置在哪」得**分屏宽说**（2026-09-16 实测）：
+   *   宽屏：logo 就在左上角（元素 x=18 y=15）→「点左上角那个标记」
+   *   窄屏/手机：左上角是「会话」按钮（拉开侧栏用），**logo 在屏幕外**（x=-380）→
+   *     必须先让他点「会话」把栏拉出来，再说「最上面那个标记」。
+   *   ⚠️ 之前一律写「点左上角那个标记」，手机客户点下去是拉开侧栏，找不到设置。 */
+  function whereSettingsText() {
+    return window.matchMedia('(max-width: 800px)').matches
+      ? '点左上角「会话」，再点最上面那个标记'
+      : '点左上角那个标记';
+  }
+
   /* ① 第一次进项目：设置入口在左上角的标记（不遮屏，几秒后自己消失） */
-  setTimeout(function () { abTipTop('where-settings', '想换模型、改设置？点<b>左上角那个标记</b>。'); }, 2600);
+  setTimeout(function () { abTipTop('where-settings', '想换模型、改设置？' + whereSettingsText() + '。'); }, 2600);
 
   /* 进了别人的视角 → 弹一次提示（附三 §13：替别人操作是敏感事，得让你清楚自己在谁的界面里） */
   (function () {
