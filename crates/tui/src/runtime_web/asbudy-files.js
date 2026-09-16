@@ -804,11 +804,12 @@
     window.addEventListener('blur', up);          // 拖到一半切走窗口也不能卡住
   });
 
-  // 所见即所得：PC（宽屏）进来默认分栏；手机（窄屏）默认对话，点文件才开预览
-  if (window.matchMedia && window.matchMedia('(min-width: 801px)').matches) {
-    if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', function () { showPreview(); });
-    else setTimeout(function () { showPreview(); }, 0);
-  }
+  // 所见即所得：进来就分栏（PC 左右分、手机上下分）。
+  // ⚠️ 2026-09-16 老板：手机也必须**自动预览**。以前这里把窄屏排除在外
+  //   （「手机默认对话，点文件才开预览」），加上手机上的三格又被去掉 ——
+  //   结果手机上**看不到自己的项目、也没有任何入口**（员工反馈「右边没出现预览」）。
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', function () { showPreview(); });
+  else setTimeout(function () { showPreview(); }, 0);
 
   document.addEventListener('click', function (e) {
     var t = e.target;
@@ -817,6 +818,12 @@
     if (t.id === 'preview-close') { hidePreview(); }
     else if (t.id === 'preview-sys') { showSysPreview(); }
     else if (t.id === 'preview-reveal') { showPreview(); }
+    // 「单独打开」（2026-09-16 老板：客户没法像网站一样打开自己的项目）——
+    // 门卫给的地址里已经带了一张短期票，开出去就是一个能全屏用、能给同事看的页面。
+    else if (t.id === 'preview-newwin') {
+      var u = previewUrl || (pkey ? ('/_pv/' + encodeURIComponent(pkey) + '/') : '');
+      if (u) window.open(u, '_blank', 'noopener');
+    }
     else if (t.id === 'preview-reload') { var f = frameEl(); if (f) f.src = f.src; }
     else if (t.id === 'asbudy-files-upload') { showUpMenu(t); }
     else if (t.id === 'asb-fold-proj') { setFold('proj', !isFolded('proj')); }

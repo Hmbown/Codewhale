@@ -1389,12 +1389,31 @@ noscript {
     width: 100%;
   }
 
-  /* 窄屏：预览栏变全屏覆盖层（点「预览」开、点「隐藏」关） */
+  /* 窄屏：预览栏占**上面一块**（不是全屏盖住）——
+     2026-09-16 老板：手机进来就要看见自己的项目（自动预览、不要三格）；
+     但全屏盖住就没办法跟 AI 说话了 —— 所以改成上下分：上面看系统，下面继续聊。
+     关掉后用右上角的「👁 预览」再打开（就一个按钮）。 */
   .shell.has-preview .preview-pane {
     position: fixed;
-    inset: 0;
+    top: var(--visual-viewport-offset-top, 0px);
+    left: 0;
+    right: 0;
+    bottom: auto;
+    height: 44vh;
     z-index: 40;
     border-left: 0;
+    border-bottom: 1px solid var(--border);
+    box-shadow: 0 8px 24px rgba(0, 0, 0, .5);
+  }
+
+  /* 对话区往下让开那 44vh，别被预览盖住 */
+  .shell.has-preview .session {
+    padding-top: 44vh;
+  }
+
+  /* 窄屏也显示「👁 预览」展开按钮（收起后靠它再打开；就一个按钮，不是底部三格） */
+  .shell:not(.has-preview) .preview-reveal {
+    display: block;
   }
 
   .rail {
