@@ -443,10 +443,10 @@
           (on && st.until ? '<div style="color:#8b949e;font-size:13.5px;margin-top:4px">有效期到 ' +
             esc(new Date(st.until).toLocaleString()) + '</div>' : '') + '</div>';
         if (on) {
-          html += '<button class="ab-menu-item" id="ab-c-off">关闭平台协助<small>关掉后，平台管理员立刻进不来</small></button>';
+          html += '<button class="ab-menu-item" id="ab-c-off">关闭平台协助<small>关闭后平台将无法进入</small></button>';
         } else {
-          html += '<button class="ab-menu-item" id="ab-c-on24">开启 24 小时<small>够排查一次问题</small></button>' +
-                  '<button class="ab-menu-item" id="ab-c-on168">开启 7 天<small>长期协助（随时可关）</small></button>';
+          html += '<button class="ab-menu-item" id="ab-c-on24">开启 24 小时<small>适合单次问题排查</small></button>' +
+                  '<button class="ab-menu-item" id="ab-c-on168">开启 7 天<small>长期协助（可随时关闭）</small></button>';
         }
         html += '<div class="ab-tip" id="ab-c-msg" style="margin-top:10px"></div>';
         body.innerHTML = html;
@@ -477,26 +477,26 @@
         (ME && ME.user ? ' · ' + esc(ME.user) : '') +
         '（' + (role === 'admin' ? '管理员' : role === 'staff' ? '员工' : '客户老板') + '）</div>';
       if (role === 'admin' || role === 'customer') {
-        html += '<button class="ab-menu-item" id="ab-m-staff">员工管理<small>给员工建账号、分配可看项目、设项目额度</small></button>';
+        html += '<button class="ab-menu-item" id="ab-m-staff">员工管理<small>添加员工、分配项目、设置额度</small></button>';
       }
       if (role === 'admin') {
-        html += '<button class="ab-menu-item" id="ab-m-users">客户管理<small>建客户账号、把项目转给客户</small></button>';
+        html += '<button class="ab-menu-item" id="ab-m-users">客户管理<small>添加客户、转移项目归属</small></button>';
       }
-      html += '<button class="ab-menu-item" id="ab-m-proj">项目管理<small>暂停（停引擎、省内存）/ 恢复 / 删除</small></button>';
-      html += '<button class="ab-menu-item" id="ab-m-auto">定时任务<small>让 AI 按点自己干活（每天 / 每周 / 每月）</small></button>';
-      html += '<button class="ab-menu-item" id="ab-m-mem">AI 的记忆<small>它自己记下来的事 —— 你能看，也能清空</small></button>';
-      html += '<button class="ab-menu-item" id="ab-m-skills">它会做什么<small>它已经学会的本事 —— 做 PPT / 表格 / 文档 / PDF / 图表…</small></button>';
-      html += '<button class="ab-menu-item" id="ab-m-space">空间<small>磁盘用量、每个项目占多少 / 上限多少</small></button>';
-      html += '<button class="ab-menu-item" id="ab-m-adv">高级设置<small>接上你自己的代码仓库 / 模型服务 / 只看不改 / 花了多少</small></button>';
+      html += '<button class="ab-menu-item" id="ab-m-proj">项目管理<small>暂停、恢复、删除项目</small></button>';
+      html += '<button class="ab-menu-item" id="ab-m-auto">定时任务<small>按计划自动执行（每天 / 每周 / 每月）</small></button>';
+      html += '<button class="ab-menu-item" id="ab-m-mem">AI 的记忆<small>查看和清除 AI 记住的内容</small></button>';
+      html += '<button class="ab-menu-item" id="ab-m-skills">它会做什么<small>内置技能：做 PPT / 表格 / 文档 / PDF / 图表…</small></button>';
+      html += '<button class="ab-menu-item" id="ab-m-space">空间<small>存储用量与配额</small></button>';
+      html += '<button class="ab-menu-item" id="ab-m-adv">高级设置<small>代码仓库 / 模型服务 / 只读模式 / 用量统计</small></button>';
       if (role === 'customer') {
-        html += '<button class="ab-menu-item" id="ab-m-consent">平台协助<small>让 AsBudy 平台协助你排查问题（只有你能开，随时可关）</small></button>';
+        html += '<button class="ab-menu-item" id="ab-m-consent">平台协助<small>允许平台协助排查问题（仅你可开启，可随时关闭）</small></button>';
       }
-      html += '<button class="ab-menu-item" id="ab-m-account">我的账号<small>我自己的名字、登录账号和归属</small></button>';
-      html += '<button class="ab-menu-item" id="ab-m-pw">修改密码<small>改自己的登录密码</small></button>';
-      html += '<button class="ab-menu-item" id="ab-m-logout">退出登录<small>退出当前账号</small></button>';
-      if (installEvt) html += '<button class="ab-menu-item" id="ab-m-install">装到桌面<small>把这个页面装成桌面应用</small></button>';
+      html += '<button class="ab-menu-item" id="ab-m-account">我的账号<small>姓名、登录账号与归属</small></button>';
+      html += '<button class="ab-menu-item" id="ab-m-pw">修改密码</button>';
+      html += '<button class="ab-menu-item" id="ab-m-logout">退出登录</button>';
+      if (installEvt) html += '<button class="ab-menu-item" id="ab-m-install">装到桌面<small>安装为桌面应用</small></button>';
       body.innerHTML = html;
-      abTipPanel(body, 'my-menu', '这里改一次，<b>你所有项目都跟着变</b>（以后新建的也是）。');
+      abTipPanel(body, 'my-menu', '此处的设置会应用到<b>你的所有项目</b>（含以后新建的）。');
       var bStaff = body.querySelector('#ab-m-staff');
       if (bStaff) bStaff.onclick = function () { openStaff(role === 'admin' ? 'admin' : ME.user); };
       var bUsers = body.querySelector('#ab-m-users');
@@ -837,7 +837,7 @@
               var wbHint = document.createElement('div');
               wbHint.className = 'ab-s';
               wbHint.style.cssText = 'align-self:center;color:#8b949e';
-              wbHint.textContent = '这是你的工作台，不能删（想省内存可以暂停）';
+              wbHint.textContent = '工作台不可删除，可暂停';
               acts.appendChild(wbHint);
             } else {
             var bDel = document.createElement('button');
@@ -891,9 +891,9 @@
             el.appendChild(h);
             arr.forEach(function (p) { el.appendChild(cardOf(p)); });
           }
-          addGroup('我的工作台', '不绑项目的干活地方 —— 做 PPT / 表格 / 文档、查资料',
+          addGroup('我的工作台', '独立于项目的工作区 —— 做 PPT / 表格 / 文档、查资料',
             list.filter(function (p) { return p.workbench; }));
-          addGroup('我的项目', '给业务用的系统 —— 能改代码、能看效果、能上线',
+          addGroup('我的项目', '面向业务的系统',
             list.filter(function (p) { return !p.workbench; }));
         });
       }
