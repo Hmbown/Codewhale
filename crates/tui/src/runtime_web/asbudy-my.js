@@ -66,6 +66,60 @@
   ].join('\n');
   document.head.appendChild(st);
 
+  /* ── 让「我的 → 高级设置」那几个开关在网页版**真的生效**（2026-09-16 老板：「1~5 修成真的」）
+   * 为什么以前是空开关：这些偏好官方只喂**终端界面**（TUI）—— settings.toml 里 34 项，
+   *   官方网页前端（app.mjs）一个都没读（`settings`/`show_thinking`/`calm_mode`/`cost_currency` 命中 0 次）
+   *   → 客户取消勾选、选了美元，界面毫无变化（老板原话：「点了没用比没有更坏」）。
+   * 做法：不碰官方代码，把值挂到 <html> 的 data-* 上，由下面几条 CSS 决定显隐；
+   *   值本身仍存在引擎里（GET/POST /v1/config），与终端界面看到的一致。
+   * ⚠️ 依赖官方 DOM 结构（`article.reasoning` / `.receipt`）—— 官方改结构要跟着改（升级检查清单里有）。
+   */
+  var DISPLAY = { show_thinking: true, thinking_default_expanded: false, show_tool_details: false, calm_mode: false, cost_currency: 'usd' };
+
+  var stD = document.createElement('style');
+  stD.textContent = [
+    'html[data-ab-think="off"] article.reasoning{display:none!important}',
+    'html[data-ab-calm="on"] article.reasoning{display:none!important}',
+    'html[data-ab-tools="off"] .receipt details{display:none!important}',
+    'html[data-ab-calm="on"] .receipt details{display:none!important}',
+  ].join('\n');
+  document.head.appendChild(stD);
+
+  function openReasoning() {
+    var list = document.querySelectorAll('article.reasoning details:not([open])');
+    for (var i = 0; i < list.length; i++) list[i].open = true;
+  }
+  var reasonObserver = null;
+  function applyDisplayPrefs() {
+    var h = document.documentElement;
+    h.setAttribute('data-ab-think', DISPLAY.show_thinking ? 'on' : 'off');
+    h.setAttribute('data-ab-tools', DISPLAY.show_tool_details ? 'on' : 'off');
+    h.setAttribute('data-ab-calm', DISPLAY.calm_mode ? 'on' : 'off');
+    if (!DISPLAY.thinking_default_expanded) return;
+    openReasoning();
+    // 流式追加出来的新思考卡片也要默认展开。只在开关打开时才观察，平时零开销。
+    if (!reasonObserver && window.MutationObserver) {
+      var pending = false;
+      reasonObserver = new MutationObserver(function () {
+        if (pending) return;
+        pending = true;
+        requestAnimationFrame(function () { pending = false; openReasoning(); });
+      });
+      reasonObserver.observe(document.body, { childList: true, subtree: true });
+    }
+  }
+
+  api('/v1/config').then(function (r) {
+    if (!r.ok) return;                 // 引擎没起 / 读不到 → 用默认（显示思考），不打扰客户
+    var c = r.body || {};
+    DISPLAY.show_thinking = c.show_thinking !== false;
+    DISPLAY.thinking_default_expanded = c.thinking_default_expanded === true;
+    DISPLAY.show_tool_details = c.show_tool_details === true;
+    DISPLAY.calm_mode = c.calm_mode === true;
+    DISPLAY.cost_currency = c.cost_currency === 'cny' ? 'cny' : 'usd';
+    applyDisplayPrefs();
+  });
+
   /* ── 浮层 ── */
   function closeLayer() { var o = document.getElementById('asbudy-layer'); if (o) o.remove(); }
   function openLayer(title, build) {
@@ -1356,9 +1410,9 @@
           '<label class="ab-chk"><input type="checkbox" id="adv-think"' + (cfg.show_thinking ? ' checked' : '') + '> 看得见它在想什么</label>' +
           '<label class="ab-chk"><input type="checkbox" id="adv-think-exp"' + (cfg.thinking_default_expanded ? ' checked' : '') + '> 思考过程默认摊开（不用点一下）</label>' +
           '<label class="ab-chk"><input type="checkbox" id="adv-tools"' + (cfg.show_tool_details ? ' checked' : '') + '> 看得见它动了哪些文件、跑了什么</label>' +
-          '<label class="ab-chk"><input type="checkbox" id="adv-calm"' + (cfg.calm_mode ? ' checked' : '') + '> 安静模式（少啰嗦，细节收得更紧）</label>' +
+          '<label class="ab-chk"><input type="checkbox" id="adv-calm"' + (cfg.calm_mode ? ' checked' : '') + '> 安静模式（过程和细节都收起来，只留结论）</label>' +
           '<label class="ab-chk"><input type="checkbox" id="adv-compact"' + (cfg.auto_compact ? ' checked' : '') + '> 聊天太长时自动帮我整理前面</label>' +
-          '<div class="ab-tip" style="margin:2px 0 10px 0">自动整理会把前面的内容总结掉 —— 细节会丢一部分（默认开）。</div>' +
+          '<div class="ab-tip" style="margin:2px 0 10px 0">自动整理会把前面的内容总结掉 —— 细节会丢一部分（默认开）。<br>⚠️ <b>关掉要留心</b>：聊得久了它可能突然不回话（前面说的已经超出模型一次能记住的范围）。</div>' +
           '<div class="ab-row"><label>花费用</label><select class="ab-input" id="adv-currency">' +
             '<option value="cny"' + (cur === 'cny' ? ' selected' : '') + '>人民币 ￥</option>' +
             '<option value="usd"' + (cur === 'usd' ? ' selected' : '') + '>美元 $</option>' +
@@ -1366,7 +1420,9 @@
           '<label class="ab-chk"><input type="checkbox" id="adv-ro"' + (d.previewReadOnly ? ' checked' : '') + '> 只看不改（防误删）</label>' +
           '<div style="margin:14px 0 6px;color:#e6edf3;font-size:14px">花了多少</div>' +
           (u
-            ? '<div class="ab-card"><div class="ab-s">累计 ￥' + Number(u.costCny || 0).toFixed(2) + ' ｜ 改动 ' + (u.turns || 0) + ' 次<br>进 ' + Math.round((u.inTok || 0) / 1000) + 'K / 出 ' + Math.round((u.outTok || 0) / 1000) + 'K token</div></div>'
+            ? '<div class="ab-card"><div class="ab-s">累计 ' + (DISPLAY.cost_currency === 'cny'
+                ? '￥' + Number(u.costCny || 0).toFixed(2)
+                : '$' + Number(u.costUsd || 0).toFixed(2)) + ' ｜ 改动 ' + (u.turns || 0) + ' 次<br>进 ' + Math.round((u.inTok || 0) / 1000) + 'K / 出 ' + Math.round((u.outTok || 0) / 1000) + 'K token</div></div>'
             : '<div class="ab-tip">这个项目还没有用量记录。</div>') +
           '<div class="ab-msg" id="adv-msg"></div>';
         var msgEl = el.querySelector('#adv-msg');
@@ -1392,8 +1448,17 @@
               return false;
             }
             msg(msgEl, b.message || '已保存（名下所有项目）', true);
+            syncDisplayPref(key, value);
             return true;
           });
+        }
+        /* 存成功后**当场**让网页版跟着变 —— 否则客户得刷新才看得到效果 */
+        function syncDisplayPref(key, v) {
+          if (key === 'cost_currency') DISPLAY.cost_currency = (v === 'cny' ? 'cny' : 'usd');
+          else if (key === 'show_thinking' || key === 'thinking_default_expanded' || key === 'show_tool_details' || key === 'calm_mode') {
+            DISPLAY[key] = (v === 'true' || v === true);
+          } else return;
+          applyDisplayPrefs();
         }
         function bindChk(id, key) {
           var box = el.querySelector('#' + id);
