@@ -1535,7 +1535,10 @@ function startBrowserClient() {
       card.className = `message ${role} ${item.status === "in_progress" ? "in-progress" : ""}`.trim();
       const time = item.started_at ? fmtDateTime(item.started_at) : "";
       setTextIfChanged(card.querySelector('[data-item-part="label"]'), role === "user" ? time : ("AsBudy" + (time ? " · " + time : "")));
-      setTextIfChanged(card.querySelector('[data-item-part="body"]'), detail);
+      // AI 的回复是 Markdown → 渲染给人看；客户自己打的字原样显示（不改他的输入）
+      const body = card.querySelector('[data-item-part="body"]');
+      if (role === "user") { body.__asbudyHtml = undefined; setTextIfChanged(body, detail); }
+      else setHtmlIfChanged(body, renderMarkdown(detail));
       return true;
     }
     if (item.kind === "agent_reasoning") {
@@ -1572,6 +1575,63 @@ function startBrowserClient() {
   function setTextIfChanged(target, value) {
     const next = value == null ? "" : String(value);
     if (target.textContent !== next) setSafeText(target, next);
+  }
+
+  /* ── 极简 Markdown 渲染（2026-09-16 老板：「回复全都好像是 md 格式，带着很多符号」）──
+   * 为什么必须有：AI 的回复本来就是 Markdown，而**官方 web 前端只做纯文本显示**
+   * （CLI / TUI 是渲染的，web 没有 —— 全文 grep 不到任何 markdown 库）→ 客户看到一堆 `##`、`**`、`|`。
+   * 按平台原则「系统能 100% 保证的就做进系统」：这是**显示层的确定性行为**，不该靠 prompt 求模型别用符号。
+   * ⚠️ 安全第一：**先把整段 HTML 转义**，再套自己的标记 —— AI 或用户文本里可能有 `<script>`，
+   *    直接 innerHTML 就是 XSS。只支持实际会遇上的语法，不引第三方库、不发网络请求。
+   */
+  function renderMarkdown(md) {
+    const esc = String(md == null ? "" : md)
+      .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    const inline = (s) => s
+      .replace(/`([^`]+)`/g, "<code>$1</code>")
+      .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+      .replace(/(^|[^*])\*([^*\n]+)\*/g, "$1<em>$2</em>");
+    const out = [];
+    let list = null, table = false;
+    const closeList = () => { if (list) { out.push("</" + list + ">"); list = null; } };
+    const closeTable = () => { if (table) { out.push("</tbody></table>"); table = false; } };
+    for (const raw of esc.split(/\r?\n/)) {
+      const line = raw.replace(/\s+$/, "");
+      const h = line.match(/^(#{1,4})\s+(.*)$/);
+      if (h) {
+        closeList(); closeTable();
+        out.push("<h" + h[1].length + ">" + inline(h[2]) + "</h" + h[1].length + ">");
+        continue;
+      }
+      if (/^\s*\|.*\|\s*$/.test(line)) {                 // 表格行
+        if (/^\s*\|[-\s:|]+\|\s*$/.test(line)) continue; // |---|---| 分隔行丢掉
+        const cells = line.trim().replace(/^\||\|$/g, "").split("|").map((c) => c.trim());
+        if (!table) { closeList(); out.push("<table><tbody>"); table = true; }
+        out.push("<tr>" + cells.map((c) => "<td>" + inline(c) + "</td>").join("") + "</tr>");
+        continue;
+      }
+      closeTable();
+      const ul = line.match(/^\s*[-*+]\s+(.*)$/);
+      const ol = line.match(/^\s*\d+[.)]\s+(.*)$/);
+      if (ul || ol) {
+        const want = ul ? "ul" : "ol";
+        if (list !== want) { closeList(); out.push("<" + want + ">"); list = want; }
+        out.push("<li>" + inline((ul || ol)[1]) + "</li>");
+        continue;
+      }
+      closeList();
+      if (line === "") continue;
+      out.push("<p>" + inline(line) + "</p>");
+    }
+    closeList(); closeTable();
+    return out.join("");
+  }
+
+  /** 只在 HTML 真变了才写 DOM（每帧重渲染时避免白刷 + 不打断选中） */
+  function setHtmlIfChanged(target, html) {
+    if (!target || target.__asbudyHtml === html) return;
+    target.__asbudyHtml = html;
+    target.innerHTML = html;
   }
 
   function captureTranscriptSelection() {
