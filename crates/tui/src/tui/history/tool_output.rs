@@ -644,7 +644,7 @@ fn is_path_or_url_like(line: &str) -> bool {
 }
 
 /// Detect whether a line contains a `path:line` pattern that could be
-/// opened by `try_open_file_at_line`. Returns a distinctive style
+/// opened by `first_file_line_reference`. Returns a distinctive style
 /// (underline + blue) when the pattern matches, or `None` otherwise.
 /// The style is applied over the existing value style so the line
 /// remains readable.

@@ -1601,7 +1601,11 @@ pub(crate) fn transcript_cell_index_from_mouse(app: &App, mouse: MouseEvent) -> 
         .map(|(cell_index, _)| cell_index)
 }
 
-pub(crate) fn handle_context_menu_action(app: &mut App, action: ContextMenuAction) {
+pub(crate) fn handle_context_menu_action(
+    terminal: &mut ratatui::Terminal<crate::tui::color_compat::ColorCompatBackend<std::io::Stdout>>,
+    app: &mut App,
+    action: ContextMenuAction,
+) {
     match action {
         ContextMenuAction::CopySelection => {
             copy_active_selection(app);
@@ -1678,10 +1682,33 @@ pub(crate) fn handle_context_menu_action(app: &mut App, action: ContextMenuActio
                     }),
                 width,
             );
-            if crate::tui::history::try_open_file_at_line(&text, &app.workspace) {
-                app.status_message = Some("Opened file in editor".to_string());
-            } else {
-                app.status_message = Some("No file:line pattern found in selection".to_string());
+            match crate::tui::history::first_file_line_reference(&text, &app.workspace) {
+                // The editor gets the terminal through the same suspend path
+                // the composer and `/hooks edit` use, one at a time, and we
+                // wait for it. It used to be spawned detached while the TUI
+                // still held raw mode, the alt screen and mouse capture (#6235).
+                Some((path, line)) => {
+                    let outcome = crate::tui::external_editor::spawn_editor_for_path(
+                        terminal,
+                        app.use_alt_screen(),
+                        app.use_mouse_capture,
+                        app.use_bracketed_paste,
+                        &path,
+                        Some(line),
+                    );
+                    app.needs_redraw = true;
+                    app.status_message = Some(match outcome {
+                        Ok(crate::tui::external_editor::EditorOutcome::Cancelled) => {
+                            format!("Editor exited without opening {}", path.display())
+                        }
+                        Ok(_) => format!("Closed editor for {}:{line}", path.display()),
+                        Err(error) => format!("Could not open the editor: {error}"),
+                    });
+                }
+                None => {
+                    app.status_message =
+                        Some("No file:line pattern found in selection".to_string());
+                }
             }
         }
         ContextMenuAction::HideCell { cell_index } => {

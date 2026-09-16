@@ -2651,7 +2651,9 @@ pub(crate) async fn handle_view_events(
                     return Ok(true);
                 }
             }
-            ViewEvent::ContextMenuSelected { action } => handle_context_menu_action(app, action),
+            ViewEvent::ContextMenuSelected { action } => {
+                handle_context_menu_action(terminal, app, action)
+            }
             ViewEvent::SkillMutationRequested { request } => {
                 handle_skill_mutation_requested(app, request).await;
             }

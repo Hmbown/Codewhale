@@ -2628,6 +2628,8 @@ fn edit_project_hooks_from_tui(terminal: &mut AppTerminal, app: &mut App, config
         app.use_mouse_capture,
         app.use_bracketed_paste,
         &path,
+        // Open the file, not a position in it: this edits hooks.toml whole.
+        None,
     );
     app.needs_redraw = true;
 
