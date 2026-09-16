@@ -425,7 +425,7 @@
       if (installEvt) html += '<button class="ab-menu-item" id="ab-m-install">装到桌面<small>把这个页面装成桌面应用</small></button>';
       body.innerHTML = html;
       var bStaff = body.querySelector('#ab-m-staff');
-      if (bStaff) bStaff.onclick = function () { openStaff(role === 'admin' ? null : ME.user); };
+      if (bStaff) bStaff.onclick = function () { openStaff(role === 'admin' ? 'admin' : ME.user); };
       var bUsers = body.querySelector('#ab-m-users');
       if (bUsers) bUsers.onclick = openUsers;
       body.querySelector('#ab-m-proj').onclick = openProjects;
@@ -475,31 +475,22 @@
 
   /* ── 员工管理 ── */
   function openStaff(owner) {
-    // 管理员没指定客户时，先让选一个（后端对 admin 要求带 ?owner=）
-    if (!owner && ME && ME.role === 'admin') {
-      api('/_gate/users').then(function (r) {
-        var users = (r.body && r.body.users) || [];
-        openLayer('员工管理 · 先选归属', function (body) {
-          body.innerHTML = '<div class="ab-tip">员工归谁？平台自己（内部）或某个客户。</div>' +
-            '<button class="ab-menu-item" data-u="admin">平台自己的员工<small>归平台（你直接管）</small></button>' +
-            users.filter(function (u) { return (u.role || 'customer') === 'customer'; }).map(function (u) {
-              return '<button class="ab-menu-item" data-u="' + esc(u.user) + '">' + esc(u.name || u.user) + '<small>' + esc(u.user) + '</small></button>';
-            }).join('');
-          body.querySelectorAll('button[data-u]').forEach(function (b) {
-            b.onclick = function () { openStaff(b.getAttribute('data-u')); };
-          });
-        });
-      });
-      return;
-    }
+    // 管理员点进来 = 管平台自己的员工。要看某个客户的员工，「客户管理」那张卡上就有「看员工」
+    // （2026-09-16 老板：别再弹一层「先选归属」）
+    if (!owner && ME && ME.role === 'admin') owner = 'admin';
     var q = owner ? ('?owner=' + encodeURIComponent(owner)) : '';
     Promise.all([api('/_gate/projects'), api('/_gate/staff' + q)]).then(function (rs) {
       var projects = (rs[0].body && rs[0].body.projects) || [];
       var staff = (rs[1].body && rs[1].body.staff) || [];
-      openLayer('员工管理' + (owner ? '（' + (owner === 'admin' ? '平台自己的' : esc(owner)) + '）' : ''), function (body) {
+      var title = '员工管理' + (owner === 'admin'
+        ? ' · 平台自己的'
+        : (owner && ME && owner !== ME.user ? ' · ' + esc(owner) + ' 的员工' : ''));
+      var tip = owner === 'admin'
+        ? '给平台自己的员工建账号、设「最多能建几个项目」、勾选「能看能操作哪几个项目」。<br>要看某个客户的员工 → 回「我的 → 客户管理」，在那家客户上点「看员工」。'
+        : '给员工建账号、设「最多能建几个项目」、勾选「能看能操作哪几个项目」。<br>员工自己建的项目归<b>你名下</b>（你可见可管）；删员工时项目转回你名下，<b>不删项目</b>。';
+      openLayer(title, function (body) {
         body.innerHTML =
-          '<div class="ab-tip">给员工建账号、设「最多能建几个项目」、勾选「能看能操作哪几个项目」。<br>' +
-          '员工自己建的项目归<b>客户公司</b>（你可见可管）；删员工时项目转回你名下，<b>不删项目</b>。</div>' +
+          '<div class="ab-tip">' + tip + '</div>' +
           '<button class="ab-btn" id="ab-add" type="button">+ 添加员工</button>' +
           '<div id="ab-list" style="margin-top:14px"></div>';
         var listEl = body.querySelector('#ab-list');
