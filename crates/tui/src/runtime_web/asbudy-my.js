@@ -804,7 +804,10 @@
           if (!el) return;
           if (!list.length) { el.innerHTML = '<div class="ab-tip">还没有项目。</div>'; return; }
           el.innerHTML = '';
-          list.forEach(function (p) {
+          // 工作台跟项目**分开两块**（2026-09-16 老板要）—— 它俩不是一类东西：
+          //   工作台 = 平台给你的干活地方（不绑项目）；项目 = 要给业务用的系统。
+          //   以前混在一个列表里，客户分不清「哪个是我的系统、哪个只是干活的地方」。
+          function cardOf(p) {
             var card = document.createElement('div'); card.className = 'ab-card';
             card.innerHTML = '<div class="ab-card-top"><div><div class="ab-n">' + esc(p.name) + '</div>' +
               '<div class="ab-s">' + (p.paused
@@ -877,8 +880,21 @@
               acts.appendChild(sel);
             }
             card.appendChild(acts);
-            el.appendChild(card);
-          });
+            return card;
+          }
+          function addGroup(title, hint, arr) {
+            if (!arr.length) return;
+            var h = document.createElement('div');
+            h.style.cssText = 'margin:18px 0 7px';
+            h.innerHTML = '<div style="font-size:14.5px;font-weight:600;color:#c9d1d9">' + title + '</div>' +
+              (hint ? '<div style="font-size:12.5px;color:#8b949e;margin-top:3px">' + hint + '</div>' : '');
+            el.appendChild(h);
+            arr.forEach(function (p) { el.appendChild(cardOf(p)); });
+          }
+          addGroup('我的工作台', '不绑项目的干活地方 —— 做 PPT / 表格 / 文档、查资料',
+            list.filter(function (p) { return p.workbench; }));
+          addGroup('我的项目', '给业务用的系统 —— 能改代码、能看效果、能上线',
+            list.filter(function (p) { return !p.workbench; }));
         });
       }
       refresh();
