@@ -5118,20 +5118,13 @@ impl Engine {
                                     tool_state.name, partial_json, tool_state.input_buffer
                                 ));
                             }
-                            // Mid-stream mirror of a partial buffer. The
-                            // argument text is *expected* to be incomplete
-                            // here, so `structure_synthesized` is ignored on
-                            // purpose; ContentBlockStop below is where an
-                            // unfinished argument becomes an error.
-                            if let Some(parsed) = parse_tool_input(&tool_state.input_buffer) {
-                                tool_state.input = parsed.value.clone();
-                                if crate::logging::is_verbose() {
-                                    crate::logging::info(format!(
-                                        "Tool '{}' input parsed: {:?}",
-                                        tool_state.name, parsed.value
-                                    ));
-                                }
-                            }
+                            // The buffer is the only mid-stream state: nothing
+                            // reads `tool_state.input` before finalization, so
+                            // there is no mirror parse here. Running the
+                            // `arg_repair` ladder per delta re-scanned the whole
+                            // accumulated buffer O(n²) times per tool call to
+                            // produce a value that `finalize_streamed_tool_input`
+                            // unconditionally overwrote (#6213 T4).
                         }
                     }
                 },
@@ -5174,8 +5167,8 @@ impl Engine {
                         && let Some(tool_state) = tool_uses.get_mut(tool_idx)
                     {
                         crate::logging::info(format!(
-                            "Tool '{}' block stop. Buffer: '{}', Current input: {:?}",
-                            tool_state.name, tool_state.input_buffer, tool_state.input
+                            "Tool '{}' block stop. Buffer: '{}'",
+                            tool_state.name, tool_state.input_buffer
                         ));
                         self.finalize_streamed_tool_input(tool_state).await;
 
@@ -5232,14 +5225,12 @@ impl Engine {
             }
         }
         // A stream cut at the provider's output limit ends without the
-        // closing ContentBlockStop for whatever block was in flight. Those
-        // blocks' inputs still hold the mid-stream mirror's best-effort
-        // parse, which ignores `structure_synthesized` by design — left
-        // as-is, a truncated tool call reaches dispatch through
-        // `tool.input` and executes (#5986). Every block that never
-        // stopped goes through the same finalization gate a normal
-        // ContentBlockStop applies, and is announced with the same
-        // finalized input.
+        // closing ContentBlockStop for whatever block was in flight. Before
+        // this drain existed a truncated tool call reached dispatch through
+        // `tool.input` and executed (#5986). Every block that never stopped
+        // goes through the same finalization gate a normal ContentBlockStop
+        // applies, and is announced with the same finalized input — which is
+        // also why no mid-stream parse is needed (#6213 T4).
         for tool_idx in std::mem::take(&mut current_tool_indices).into_values() {
             let Some(tool_state) = tool_uses.get_mut(tool_idx) else {
                 continue;
@@ -5284,9 +5275,9 @@ impl Engine {
     /// execute a truncated tool call (#5986). Called for a tool block that
     /// closes normally (`ContentBlockStop`) and again after the stream ends
     /// for blocks whose Stop never arrived — a provider cutting the stream
-    /// at its output limit omits the closing event, while the mid-stream
-    /// mirror deliberately ignores `structure_synthesized` because partial
-    /// text is the normal state mid-stream.
+    /// at its output limit omits the closing event. This is the only place
+    /// the accumulated buffer is parsed, and the only place
+    /// `structure_synthesized` is rejected.
     async fn finalize_streamed_tool_input(&self, tool_state: &mut ToolUseState) {
         if tool_state.input_buffer.trim().is_empty() {
             crate::logging::warn(format!(
