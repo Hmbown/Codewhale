@@ -581,8 +581,8 @@
         ? ' · 平台自己的'
         : (owner && ME && owner !== ME.user ? ' · ' + esc(owner) + ' 的员工' : ''));
       var tip = owner === 'admin'
-        ? '给平台自己的员工建账号、设「最多能建几个项目」、勾选「能看能操作哪几个项目」。<br>要看某个客户的员工 → 回「我的 → 客户管理」，在那家客户上点「看员工」。'
-        : '给员工建账号、设「最多能建几个项目」、勾选「能看能操作哪几个项目」。<br>员工自己建的项目归<b>你名下</b>（你可见可管）；删员工时项目转回你名下，<b>不删项目</b>。';
+        ? '添加员工账号、设置项目额度与可见项目。<br>查看客户员工请前往「客户管理」。'
+        : '添加员工账号、设置项目额度与可见项目。<br>员工创建的项目归<b>你名下</b>（可见可管）；删除员工时项目转回你名下，<b>项目不会被删除</b>。';
       openLayer(title, function (body) {
         body.innerHTML =
           '<div class="ab-tip">' + tip + '</div>' +
@@ -622,7 +622,7 @@
                 });
               };
               // 「进 ta 的视角」—— 下级的东西不并排铺在我这儿（附三 §13 原则④）
-              var bView = document.createElement('button'); bView.className = 'ab-btn ghost sm'; bView.type = 'button'; bView.textContent = '进 ta 的视角';
+              var bView = document.createElement('button'); bView.className = 'ab-btn ghost sm'; bView.type = 'button'; bView.textContent = '进入对方视角';
               bView.onclick = function () { location.href = '/view-as?as=' + encodeURIComponent(s.user); };
               acts.appendChild(bView);
               acts.appendChild(bEdit); acts.appendChild(bDel);
@@ -1087,7 +1087,7 @@
           '<div class="ab-tip">到点它会<b>自己动手</b>（改文件、跑命令都不用你确认），干完记在「' +
           esc(act.name) + '」的会话里。</div>' +
           '<button class="ab-menu-item" id="ab-au-new">+ 新建定时任务<small>每天 / 每周 / 每月 / 每小时</small></button>' +
-          '<div id="ab-au-list">' + (list.length ? '' : '<div class="ab-tip">还没有定时任务。</div>') + '</div>';
+          '<div id="ab-au-list">' + (list.length ? '' : '<div class="ab-tip">暂无定时任务。</div>') + '</div>';
         el.querySelector('#ab-au-new').onclick = function () {
           openAutoForm(act.dir, function () { openAuto(); });
         };
@@ -1188,7 +1188,7 @@
           w[0] + '"' + (w[1] === '一' ? ' checked' : '') + '>周' + w[1] + '</label>';
       }).join('');
       body.innerHTML =
-        '<div class="ab-tip">到点它会自己动手 —— <b>改文件、跑命令都不再问你</b>，干完写进这个项目的会话里。' +
+        '<div class="ab-tip">按计划自动执行 —— <b>改文件、执行命令无需逐步确认</b>，执行记录写入本项目会话。' +
         '拿不准就先写「只看不动」的活（比如「把逾期清单写成报告」）。</div>' +
         '<div class="ab-row"><label>叫什么</label><input class="ab-input" id="au-name" placeholder="例：每天早上看逾期款"></div>' +
         '<div class="ab-row"><label>多久一次</label><select class="ab-input" id="au-freq">' +
@@ -1393,7 +1393,7 @@
             (e.line_start != null ? ' · 出自 MEMORY.md 第 ' + esc(e.line_start) + ' 行' : '') +
             (e.stale ? ' · <span style="color:#d29922">来源文件改过了，可能过期</span>' : '') +
             '</div></div>';
-        }).join('') : ('<div class="ab-tip">' + (key ? '没搜到。' : '还是空的 —— 它在对话里学到东西时会自己记下来。') + '</div>');
+        }).join('') : ('<div class="ab-tip">' + (key ? '无匹配结果。' : '暂无记忆内容。') + '</div>');
       }
 
       function load() {
@@ -1425,12 +1425,12 @@
             return;
           }
           var html =
-            '<div class="ab-tip">它自己攒下来、下次对话会想起来的事（最近 32 条会带进对话，所以别拿它当资料库）。' +
-            '这些只作用于<b>本项目</b>。</div>' +
+            '<div class="ab-tip">AI 在对话中记住的内容（最近 32 条会带入对话，请勿作为资料库使用）。' +
+            '仅作用于<b>本项目</b>。</div>' +
             '<div class="ab-row"><input class="ab-input" id="mem-q" placeholder="搜一搜（比如「客户」）" value="' + esc(q) + '"></div>';
           html += '<div id="mem-list"></div>';
-          html += '<div class="ab-tip" style="margin-top:12px">这里只能<b>整批清空</b>，官方没给「只删这一条」的口子。' +
-            '想让它忘掉某一件事，直接在对话里说一声就行（比如「忘掉关于报表格式的偏好」）。</div>';
+          html += '<div class="ab-tip" style="margin-top:12px">此处仅支持<b>整批清空</b>，暂不支持单条删除。' +
+            '如需删除某条记忆，可在对话中告知 AI（例如「忘掉关于报表格式的偏好」）。</div>';
           html += '<div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">' +
             '<button class="ab-btn danger sm" id="mem-clear-ws" type="button">清空「本项目」的记忆</button>' +
             '<button class="ab-btn danger sm" id="mem-clear-global" type="button">清空「通用」的记忆</button>' +
@@ -1503,12 +1503,12 @@
         el.innerHTML =
           '<div class="ab-tip">这些是你自己的习惯，<b>改一次，名下所有项目都生效</b>（以后新建的项目也一样）。</div>' +
           '<div class="ab-row"><label>模型服务</label><span class="ab-input" style="cursor:default;color:#8b949e;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' +
-            esc(mk.provider || '—') + ' · ' + esc(mk.model || '—') + ' · ' + (mk.hasKey ? '密钥已配好' : '还没配密钥') +
+            esc(mk.provider || '—') + ' · ' + esc(mk.model || '—') + ' · ' + (mk.hasKey ? '已配置密钥' : '未配置密钥') +
           '</span><button class="ab-btn ghost sm" id="adv-mk" type="button" style="flex:0 0 auto">改</button></div>' +
           '<div class="ab-row"><label>代码仓库</label><span class="ab-input" style="cursor:default;color:#8b949e;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' +
             esc(repoSummary(repo)) +
           '</span><button class="ab-btn ghost sm" id="adv-repo" type="button" style="flex:0 0 auto">设置</button></div>' +
-          '<div style="margin:14px 0 6px;color:#e6edf3;font-size:14px">它动手前</div>' +
+          '<div style="margin:14px 0 6px;color:#e6edf3;font-size:14px">执行前</div>' +
           '<div class="ab-row"><label>审批方式</label><select class="ab-input" id="adv-approval">' +
             '<option value="suggest"' + (am === 'suggest' ? ' selected' : '') + '>每步都先问我（默认）</option>' +
             '<option value="auto"' + (am === 'auto' ? ' selected' : '') + '>小的自己做，拿不准才问我</option>' +
@@ -1516,13 +1516,13 @@
           '</select></div>' +
           '<div class="ab-tip" style="margin:-4px 0 10px 78px">选「全部自己做」之后，它改文件、跑命令就不再问你 —— 拿不准就保持默认。</div>' +
           '<div style="margin:14px 0 6px;color:#e6edf3;font-size:14px">看得见什么</div>' +
-          '<label class="ab-chk"><input type="checkbox" id="adv-think"' + (cfg.show_thinking ? ' checked' : '') + '> 看得见它在想什么</label>' +
+          '<label class="ab-chk"><input type="checkbox" id="adv-think"' + (cfg.show_thinking ? ' checked' : '') + '> 显示思考过程</label>' +
           '<label class="ab-chk"><input type="checkbox" id="adv-think-exp"' + (cfg.thinking_default_expanded ? ' checked' : '') + '> 思考过程默认摊开（不用点一下）</label>' +
-          '<label class="ab-chk"><input type="checkbox" id="adv-tools"' + (cfg.show_tool_details ? ' checked' : '') + '> 看得见它动了哪些文件、跑了什么</label>' +
+          '<label class="ab-chk"><input type="checkbox" id="adv-tools"' + (cfg.show_tool_details ? ' checked' : '') + '> 显示文件与命令明细</label>' +
           '<label class="ab-chk"><input type="checkbox" id="adv-calm"' + (cfg.calm_mode ? ' checked' : '') + '> 安静模式（过程和细节都收起来，只留结论）</label>' +
           '<label class="ab-chk"><input type="checkbox" id="adv-compact"' + (cfg.auto_compact ? ' checked' : '') + '> 聊天太长时自动帮我整理前面</label>' +
-          '<div class="ab-tip" style="margin:2px 0 10px 0">自动整理会把前面的内容总结掉 —— 细节会丢一部分（默认开）。<br>⚠️ <b>关掉要留心</b>：聊得久了它可能突然不回话（前面说的已经超出模型一次能记住的范围）。</div>' +
-          '<div class="ab-row"><label>钱按哪种显示</label><select class="ab-input" id="adv-currency">' +
+          '<div class="ab-tip" style="margin:2px 0 10px 0">自动整理会总结前面的内容 —— 部分细节会丢失（默认开启）。<br>⚠️ 关闭后请留意：长对话可能因超出模型上下文而中断。</div>' +
+          '<div class="ab-row"><label>货币单位</label><select class="ab-input" id="adv-currency">' +
             '<option value="cny"' + (cur === 'cny' ? ' selected' : '') + '>人民币 ￥</option>' +
             '<option value="usd"' + (cur === 'usd' ? ' selected' : '') + '>美元 $</option>' +
           '</select></div>' +
@@ -1535,7 +1535,7 @@
             : '<div class="ab-tip">这个项目还没有用量记录。</div>') +
           '<div class="ab-msg" id="adv-msg"></div>';
         var msgEl = el.querySelector('#adv-msg');
-        abTipPanel(el, 'adv-approval', '它改东西之前要不要先问你，在这儿选 —— 嫌问得多就选「小的自己做」');
+        abTipPanel(el, 'adv-approval', 'AI 执行操作前是否询问，可在此处设置。');
         function post(payload) {
           return api('/_gate/advanced', { method: 'POST', body: JSON.stringify(payload) }).then(function (r2) {
             if (r2.ok) msg(msgEl, '已保存', true); else msg(msgEl, (r2.body && r2.body.error) || '保存失败', false);

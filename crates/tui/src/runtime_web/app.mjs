@@ -968,7 +968,8 @@ function startBrowserClient() {
   function renderThreadList() {
     dom.threadList.replaceChildren();
     if (app.summaries.length === 0) {
-      const empty = element("p", "thread-preview", "没有匹配的会话");
+      // AsBudy：文案精简（2026-09-16 老板：「界面都是大白话会显得不专业，要有个度）」
+      const empty = element("p", "thread-preview", "无匹配会话");
       empty.style.padding = "8px 10px";
       dom.threadList.append(empty);
       return;

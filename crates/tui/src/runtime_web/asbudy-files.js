@@ -249,7 +249,7 @@
       var quotaTxt = (u && !u.unlimited) ? ' · 已用 ' + fmtMb(u.totalMb) + ' / ' + fmtMb(u.quotaMb) : '';
       if (cnt) cnt.textContent = files.length ? ('（' + files.length + ' 份' + quotaTxt + '）') : '';
       mineBody.innerHTML = '';
-      if (!files.length) { mineBody.innerHTML = '<span class="f-empty">还没传过资料 —— 点右边「+ 传资料」</span>'; return; }
+      if (!files.length) { mineBody.innerHTML = '<span class="f-empty">暂无资料</span>'; return; }
       for (var i = 0; i < files.length; i++) mineBody.appendChild(render(files[i], true));
     } catch (e) { mineBody.innerHTML = '<span class="f-empty">加载失败</span>'; }
   }
