@@ -311,7 +311,7 @@
       html += '<button class="ab-menu-item" id="ab-m-auto">定时任务<small>让 AI 按点自己干活（每天 / 每周 / 每月）</small></button>';
       html += '<button class="ab-menu-item" id="ab-m-mem">AI 的记忆<small>它自己记下来的事 —— 你能看，也能清空</small></button>';
       html += '<button class="ab-menu-item" id="ab-m-space">空间<small>磁盘用量、每个项目占多少 / 上限多少</small></button>';
-      html += '<button class="ab-menu-item" id="ab-m-adv">高级设置<small>代码存哪里（git）/ 过程显示多详细 / 只看不改 / 花了多少</small></button>';
+      html += '<button class="ab-menu-item" id="ab-m-adv">高级设置<small>接上你自己的代码仓库 / 模型服务 / 只看不改 / 花了多少</small></button>';
       if (role === 'customer') {
         html += '<button class="ab-menu-item" id="ab-m-consent">平台协助<small>让 AsBudy 平台协助你排查问题（只有你能开，随时可关）</small></button>';
       }
@@ -1173,10 +1173,11 @@
   function openAdvanced() {
     openLayer('高级设置', function (body) {
       body.innerHTML = '<div id="ab-adv">加载中…</div>';
-      Promise.all([api('/_gate/advanced'), api('/_gate/model-key'), api('/v1/config')]).then(function (rs) {
+      Promise.all([api('/_gate/advanced'), api('/_gate/model-key'), api('/v1/config'), api('/_gate/repo')]).then(function (rs) {
         var r = rs[0];
         var mk = rs[1].body || {};
         var cfg = (rs[2] && rs[2].body) || {}
+        var repo = (rs[3] && rs[3].body) || {};
         var am = cfg.approval_mode || 'suggest';   // suggest=每步先问 / auto=小的自己做 / bypass=全放行
         var cur = cfg.cost_currency === 'cny' ? 'cny' : 'usd';
         var el = body.querySelector('#ab-adv');
@@ -1192,8 +1193,9 @@
           '<div class="ab-row"><label>模型服务</label><span class="ab-input" style="cursor:default;color:#8b949e;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' +
             esc(mk.provider || '—') + ' · ' + esc(mk.model || '—') + ' · ' + (mk.hasKey ? '密钥已配好' : '还没配密钥') +
           '</span><button class="ab-btn ghost sm" id="adv-mk" type="button" style="flex:0 0 auto">改</button></div>' +
-          '<div class="ab-row"><label>代码存哪</label><input class="ab-input" id="adv-git" placeholder="git@gitee.com:某人/仓库.git" value="' + esc(d.gitRemote || '') + '"></div>' +
-          '<div style="display:flex;gap:8px;margin:-2px 0 14px 78px"><button class="ab-btn ghost sm" id="adv-git-save" type="button">保存</button><button class="ab-btn ghost sm" id="adv-git-clear" type="button">清空</button></div>' +
+          '<div class="ab-row"><label>代码仓库</label><span class="ab-input" style="cursor:default;color:#8b949e;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' +
+            esc(repoSummary(repo)) +
+          '</span><button class="ab-btn ghost sm" id="adv-repo" type="button" style="flex:0 0 auto">设置</button></div>' +
           '<div style="margin:14px 0 6px;color:#e6edf3;font-size:14px">它动手前</div>' +
           '<div class="ab-row"><label>审批方式</label><select class="ab-input" id="adv-approval">' +
             '<option value="suggest"' + (am === 'suggest' ? ' selected' : '') + '>每步都先问我（默认）</option>' +
@@ -1259,8 +1261,7 @@
           sel.onchange = function () { sel.disabled = true; setCfg(key, sel.value).then(function () { sel.disabled = false; }); };
         }
         el.querySelector('#adv-mk').onclick = openModelApiLoader;
-        el.querySelector('#adv-git-save').onclick = function () { post({ gitRemote: el.querySelector('#adv-git').value }); };
-        el.querySelector('#adv-git-clear').onclick = function () { el.querySelector('#adv-git').value = ''; post({ gitRemote: '' }); };
+        el.querySelector('#adv-repo').onclick = function () { openRepoForm(repo); };
         bindSel('adv-approval', 'approval_mode');
         bindChk('adv-think', 'show_thinking');
         bindChk('adv-think-exp', 'thinking_default_expanded');
@@ -1347,6 +1348,149 @@
       var d = r.body || {};
       if (!r.ok) { alert(d.error || '读不到配置'); return; }
       openModelApiForm(d);
+    });
+  }
+
+  /* ── 代码仓库：把项目接到客户自己的仓库（2026-09-16 老板定）──
+   * 平台只做三件事：填地址、备凭据、看得见状态。
+   * **同步（push / pull）交给 AI 在对话里做** —— 客户说「推到我的仓库」它才推
+   * （规矩写在项目自己的 AGENTS.md 里，引擎每次干活都读）。
+   * 凭据落在项目自己的引擎家（engine-home-<key>/.ssh/），门卫写不进去 → 走受限 root 帮手。
+   * 设计边界（别推翻）：平台不托管仓库、不预置任何地址、不替客户 push、也不让 AI 自作主张 push。 */
+  function repoSummary(r) {
+    if (!r) return '还没接（代码只在这台服务器上）';
+    if (!r.remote) return r.helper === false ? '还没接（平台还没装帮手）' : '还没接（代码只在这台服务器上）';
+    return String(r.remote).replace(/^[a-z]+:\/\//, '').replace(/^[^@/]*@/, '');
+  }
+  function repoWhen(iso) {
+    var d = new Date(iso);
+    if (isNaN(d.getTime())) return '';
+    function p(n) { return (n < 10 ? '0' : '') + n; }
+    return p(d.getMonth() + 1) + '-' + p(d.getDate()) + ' ' + p(d.getHours()) + ':' + p(d.getMinutes());
+  }
+  function repoStateLine(d) {
+    if (!d.initialized) return '这个项目还没有版本库 —— 保存地址时会自动建一个，并把现在的文件提交一份。';
+    var p = ['版本库 ' + (d.branch || 'main')];
+    if (d.lastCommit) p.push('最新：' + d.lastCommit.subject + '（' + repoWhen(d.lastCommit.when) + '）');
+    if (typeof d.ahead === 'number') p.push(d.ahead > 0 ? ('有 ' + d.ahead + ' 次改动还没推上去') : '本机和仓库里的一致');
+    if (d.dirty) p.push('有改动还没提交');
+    return p.join(' ｜ ');
+  }
+  function openRepoForm(init, flash) {
+    var d = init || {};
+    var plat = d.platform || 'gitee';
+    var auth = d.authMode === 'token' ? 'token' : 'deploy-key';
+    var pub = d.publicKey || '';
+
+    openLayer('代码仓库', function (body) {
+      var noHelper = d.helper === false;
+      var html = '<div class="ab-tip">把项目代码接到<b>你自己的</b>仓库，东西就不只存在这台服务器上。' +
+        '接好之后，在对话里说「推到我的仓库」它才会推 —— 不会自作主张。</div>';
+      if (noHelper) {
+        html += '<div class="ab-tip" style="color:#d29922">⚠️ 服务端还没装「代码仓库」帮手，现在存不了 —— 让管理员跑一下安装脚本。</div>';
+      }
+
+      html += '<div class="ab-row"><label>用哪家</label><select class="ab-input" id="rp-platform">' +
+        [['gitee', 'Gitee（码云）'], ['github', 'GitHub'], ['other', '其他 / 自己搭的']].map(function (x) {
+          return '<option value="' + x[0] + '"' + (x[0] === plat ? ' selected' : '') + '>' + x[1] + '</option>';
+        }).join('') + '</select></div>';
+      html += '<div class="ab-row"><label>仓库地址</label><input class="ab-input" id="rp-remote" placeholder="git@gitee.com:你的账号/仓库.git" value="' + esc(d.remote || '') + '"></div>';
+      html += '<div class="ab-tip" style="margin:-4px 0 10px 78px">在仓库页面点「克隆」，把 <b>SSH</b> 那一行贴进来（也可以是 https:// 地址）。' +
+        '请用你自己的<b>私有</b>仓库 —— 平台不托管、也不会把代码推到别处。</div>';
+      html += '<div style="display:flex;gap:8px;margin:-2px 0 6px 78px">' +
+        '<button class="ab-btn sm" id="rp-save" type="button"' + (noHelper ? ' disabled' : '') + '>保存地址</button>' +
+        '<button class="ab-btn ghost sm" id="rp-clear" type="button"' + (noHelper ? ' disabled' : '') + '>移除地址</button></div>';
+
+      html += '<div style="margin:14px 0 6px;color:#e6edf3;font-size:14px">怎么证明是你</div>';
+      html += '<div class="ab-row"><label>方式</label><select class="ab-input" id="rp-auth">' +
+        '<option value="deploy-key"' + (auth === 'deploy-key' ? ' selected' : '') + '>部署密钥（推荐）</option>' +
+        '<option value="token"' + (auth === 'token' ? ' selected' : '') + '>访问令牌（https 地址用）</option>' +
+        '</select></div>';
+
+      var keyBox = '';
+      if (d.hasKey && pub) {
+        keyBox += '<label style="color:#8b949e;font-size:13.5px">你的公钥（这段贴给仓库，不碍事）</label>' +
+          '<textarea class="ab-input" id="rp-pub" readonly style="height:70px;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12.5px;margin:4px 0;resize:vertical">' + esc(pub) + '</textarea>' +
+          '<div style="display:flex;gap:8px;margin-bottom:8px"><button class="ab-btn sm" id="rp-copy" type="button">复制公钥</button>' +
+          '<button class="ab-btn danger sm" id="rp-delkey" type="button" style="margin-left:auto">删掉密钥</button></div>';
+        if (d.fingerprint) keyBox += '<div class="ab-s" style="margin-bottom:6px">指纹 ' + esc(d.fingerprint) + '</div>';
+        keyBox += '<div class="ab-tip">还没贴到仓库？到仓库页面 → <b>设置 → 部署公钥（Deploy Keys）</b> → 粘贴 → 勾上「允许写入」。' +
+          '勾不上写入的话，推的时候会被拒。</div>';
+      } else {
+        keyBox += '<div class="ab-tip">还没有密钥。点下面这个按钮生成一对：<b>公钥</b>贴到你的仓库，<b>私钥</b>留在项目里（谁都看不到）。</div>' +
+          '<button class="ab-btn" id="rp-genkey" type="button"' + (noHelper ? ' disabled' : '') + '>生成密钥</button>';
+      }
+      html += '<div id="rp-keybox">' + keyBox + '</div>';
+
+      var tokBox = '<div class="ab-row"><label>仓库用户名</label><input class="ab-input" id="rp-user" placeholder="登录仓库的账号名"></div>' +
+        '<div class="ab-row"><label>访问令牌</label><input class="ab-input" id="rp-token" type="password" autocomplete="new-password" placeholder="' +
+        (d.hasToken ? '已经存好了（要换就填新的）' : '在仓库设置里生成一个') + '"></div>' +
+        '<div style="display:flex;gap:8px"><button class="ab-btn sm" id="rp-savetoken" type="button"' + (noHelper ? ' disabled' : '') + '>保存令牌</button>' +
+        (d.hasToken ? '<button class="ab-btn danger sm" id="rp-cleartoken" type="button" style="margin-left:auto">清除令牌</button>' : '') + '</div>' +
+        '<div class="ab-tip" style="margin-top:8px">令牌只存在这个项目里（600），不会写进对话、也不会回显。</div>';
+      html += '<div id="rp-tokenbox"' + (auth === 'token' ? '' : ' hidden') + '>' + tokBox + '</div>';
+
+      html += '<div style="margin:14px 0 6px;color:#e6edf3;font-size:14px">现在怎么样</div>';
+      html += '<div class="ab-card"><div class="ab-s" id="rp-state">' + esc(repoStateLine(d)) + '</div></div>';
+      html += '<div class="ab-msg" id="rp-msg"></div>';
+      body.innerHTML = html;
+
+      var msgEl = body.querySelector('#rp-msg');
+      if (flash) msg(msgEl, flash.text, flash.ok);
+      function refresh(flash2) {
+        api('/_gate/repo').then(function (r) { openRepoForm(r.body || {}, flash2); });
+      }
+      function post(payload, okText) {
+        msg(msgEl, '正在处理…', true);
+        api('/_gate/repo', { method: 'POST', body: JSON.stringify(payload) }).then(function (r) {
+          var b = r.body || {};
+          if (!r.ok || b.ok === false) { msg(msgEl, b.error || '没成功', false); return; }
+          if (okText) refresh({ text: okText, ok: true }); else msg(msgEl, '已保存', true);
+        });
+      }
+      function syncState() {
+        api('/_gate/repo').then(function (r) {
+          var b = r.body || {};
+          var el = body.querySelector('#rp-state');
+          if (el) el.textContent = repoStateLine(b);
+        });
+      }
+
+      body.querySelector('#rp-auth').onchange = function (e) {
+        body.querySelector('#rp-tokenbox').hidden = e.target.value !== 'token';
+        body.querySelector('#rp-keybox').hidden = e.target.value === 'token';
+      };
+      body.querySelector('#rp-save').onclick = function () {
+        var remote = body.querySelector('#rp-remote').value.trim();
+        if (!remote) { msg(msgEl, '先把仓库地址填上', false); return; }
+        post({ action: 'save', platform: body.querySelector('#rp-platform').value, remote: remote });
+        syncState();
+      };
+      body.querySelector('#rp-clear').onclick = function () {
+        if (!confirm('把仓库地址移掉？代码就只留在这台服务器上了（本地版本库不动）。')) return;
+        post({ action: 'clear', platform: body.querySelector('#rp-platform').value });
+        syncState();
+      };
+      var bg = body.querySelector('#rp-genkey');
+      if (bg) bg.onclick = function () { post({ action: 'genkey' }, '密钥生成好了 —— 复制公钥贴到你的仓库'); };
+      var bc = body.querySelector('#rp-copy');
+      if (bc) bc.onclick = function () {
+        var ta = body.querySelector('#rp-pub');
+        ta.select();
+        var done = function () { msg(msgEl, '公钥已复制，去仓库页面粘贴吧', true); };
+        if (navigator.clipboard) navigator.clipboard.writeText(ta.value).then(done, function () { msg(msgEl, '复制失败，手动选中它复制吧', false); });
+        else { try { document.execCommand('copy'); done(); } catch (e) { msg(msgEl, '复制失败，手动选中它复制吧', false); } }
+      };
+      var bd = body.querySelector('#rp-delkey');
+      if (bd) bd.onclick = function () {
+        if (!confirm('删掉这对密钥？删了之后要重新生成、并重新贴到仓库才能推。')) return;
+        post({ action: 'delkey' }, '密钥已删除');
+      };
+      body.querySelector('#rp-savetoken').onclick = function () {
+        post({ action: 'token', username: body.querySelector('#rp-user').value.trim(), token: body.querySelector('#rp-token').value.trim() }, '令牌存好了');
+      };
+      var bt = body.querySelector('#rp-cleartoken');
+      if (bt) bt.onclick = function () { post({ action: 'clearToken' }, '令牌已清除'); };
     });
   }
 
