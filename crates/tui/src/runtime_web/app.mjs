@@ -1010,7 +1010,7 @@ function startBrowserClient() {
       indicators.append(status);
       titleRow.append(indicators);
       row.append(titleRow);
-      row.append(element("span", "thread-preview", summary.preview || "还没有消息"));
+      row.append(element("span", "thread-preview", stripMarkdown(summary.preview) || "还没有消息"));
       const branch = summary.branch || basename(summary.workspace) || "本地";
       row.append(element("span", "thread-meta", `${branch} · ${relativeTime(summary.updated_at)}`));
       row.addEventListener("click", () => selectThread(summary.id));
@@ -1046,7 +1046,7 @@ function startBrowserClient() {
       const titleRow = element("span", "thread-title-row");
       titleRow.append(element("span", "thread-title", displayTitle(summary.title)));
       row.append(titleRow);
-      row.append(element("span", "thread-preview", summary.preview || summary.title));
+      row.append(element("span", "thread-preview", stripMarkdown(summary.preview || summary.title)));
       const scope = basename(summary.workspace) || "本地";
       row.append(
         element(
@@ -1625,6 +1625,26 @@ function startBrowserClient() {
     }
     closeList(); closeTable();
     return out.join("");
+  }
+
+  /** 会话预览/标题是一行纯文本，不能上 HTML 渲染 —— 但也不能把 `**` `#` 这类符号原样露给客户
+   *  （2026-09-16 老板截图：右侧正文已经干净了，而**左侧会话预览摘要里还露着** `**都已经做进程序里了**`、`# 一句话结论`）。
+   *  预览只有一行，渲染成表格/标题没意义 → 只把符号剥掉、文字一字不改。 */
+  function stripMarkdown(text) {
+    return String(text == null ? "" : text)
+      .replace(/```[\s\S]*?```/g, " ")
+      .replace(/`([^`]*)`/g, "$1")
+      // `#` 标题号：行首，或前面是空白/中英标点（`情况是这样：# 一句话结论` 这种行中的也要剥）。
+      // ⚠️ 不能无脑剥 `# ` —— 会把 `C# 语言` 这种真的代码名也削掉。
+      .replace(/(^|[\s:：,，;；、])#{1,6}\s+/g, "$1")
+      .replace(/^\s{0,3}>\s?/gm, "")
+      .replace(/^\s{0,3}[-*+]\s+/gm, "")
+      .replace(/\*\*([^*]*)\*\*/g, "$1")
+      .replace(/__([^_]*)__/g, "$1")
+      .replace(/(^|[^*])\*([^*\n]+)\*/g, "$1$2")
+      .replace(/^\s*\|.*\|\s*$/gm, " ")
+      .replace(/\s+/g, " ")
+      .trim();
   }
 
   /** 只在 HTML 真变了才写 DOM（每帧重渲染时避免白刷 + 不打断选中） */
