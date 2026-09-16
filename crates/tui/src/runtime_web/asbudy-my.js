@@ -1148,16 +1148,18 @@
    */
   function abSetMemory(on, btn, done) {
     if (btn) { btn.disabled = true; btn.textContent = on ? '正在打开…' : '正在关掉…'; }
-    api('/v1/config', {
+    // 记忆也是**全局偏好**（2026-09-16 老板点名：「包括记忆也是」）——
+    // 一次设置，名下所有项目都生效（没在跑的项目等下次打开时自动补）。
+    api('/_gate/prefs', {
       method: 'POST',
-      body: JSON.stringify({ key: 'memory_enabled', value: on ? 'true' : 'false', persist: true }),
+      body: JSON.stringify({ prefs: { memory_enabled: on ? 'true' : 'false' } }),
     }).then(function (r) {
-      if (!r.ok) {
+      if (!r.ok || (r.body && r.body.ok === false)) {
         if (btn) { btn.disabled = false; btn.textContent = on ? '打开记忆' : '关掉记忆'; }
         alert('没设置成：' + ((r.body && (r.body.error || r.body.message)) || ('HTTP ' + r.code)));
         return;
       }
-      api('/v1/config/reload', { method: 'POST' }).then(function () { if (done) done(); });
+      if (done) done();
     });
   }
 
@@ -1282,7 +1284,7 @@
         var mk = rs[1].body || {};
         var cfg = (rs[2] && rs[2].body) || {}
         var repo = (rs[3] && rs[3].body) || {};
-        var am = cfg.approval_mode || 'suggest';   // suggest=每步先问 / auto=小的自己做 / bypass=全放行
+        var am = cfg.approval_mode || 'auto';   // auto=小的自己做、拿不准才问（默认）｜ suggest=每步先问 ｜ bypass=全放行
         var cur = cfg.cost_currency === 'cny' ? 'cny' : 'usd';
         var el = body.querySelector('#ab-adv');
         if (!el) return;
@@ -1293,7 +1295,7 @@
         var d = r.body || {};
         var u = d.usage;
         el.innerHTML =
-          '<div class="ab-tip">只影响当前项目（' + esc((d.project && d.project.name) || '') + '）。</div>' +
+          '<div class="ab-tip">这些是你自己的习惯，<b>改一次，名下所有项目都生效</b>（以后新建的项目也一样）。</div>' +
           '<div class="ab-row"><label>模型服务</label><span class="ab-input" style="cursor:default;color:#8b949e;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' +
             esc(mk.provider || '—') + ' · ' + esc(mk.model || '—') + ' · ' + (mk.hasKey ? '密钥已配好' : '还没配密钥') +
           '</span><button class="ab-btn ghost sm" id="adv-mk" type="button" style="flex:0 0 auto">改</button></div>' +
@@ -1333,19 +1335,21 @@
         /* 配置项：官方 POST /v1/config（persist 才写盘）→ 再 reload 让它生效。
          * reload 官方说明：**新的一轮对话**采用新配置，不影响正在跑的那轮。 */
         function setCfg(key, value) {
-          return api('/v1/config', {
+          // ★ 全局设置（2026-09-16 老板：「直接做成全局设置就行，包括记忆 ——
+          //   用户习惯不可能每个项目都修改吧？」）—— 不再写「当前项目」，
+          //   而是交给门卫：存成这个账号的偏好 + 应用到名下所有项目
+          //   （没在跑的项目等下次打开时自动补上）。
+          return api('/_gate/prefs', {
             method: 'POST',
-            body: JSON.stringify({ key: key, value: String(value), persist: true }),
+            body: JSON.stringify({ prefs: (function () { var o = {}; o[key] = String(value); return o; })() }),
           }).then(function (r2) {
-            if (!r2.ok) {
-              var e = (r2.body && r2.body.error) || '保存失败';
-              msg(msgEl, '没设置成：' + (e.message || e), false);
+            var b = (r2.body || {});
+            if (!r2.ok || b.ok === false) {
+              msg(msgEl, '没设置成：' + (b.error || r2.code), false);
               return false;
             }
-            return api('/v1/config/reload', { method: 'POST' }).then(function () {
-              msg(msgEl, '已保存', true);
-              return true;
-            });
+            msg(msgEl, b.message || '已保存（名下所有项目）', true);
+            return true;
           });
         }
         function bindChk(id, key) {
