@@ -2153,48 +2153,200 @@
 
   api('/_gate/whoami').then(function (r) { if (r.ok) ME = r.body; });
 
-  /* ── 第一次进项目：引导客户去「我的」把设置调好 ──────────────────────────────
-   * 2026-09-16 老板：「新用户进来就直接杵在『选择项目』上，不应该引导他点左上角 logo
-   *   去配模型 / 偏好 / 高级设置吗」—— 对。官方界面**没有任何设置入口**，我们把「我的」
-   *   挂在左上角那个 logo 上：老客户知道，新客户完全看不出来能点。
-   * 为什么给「打开设置」按钮而不只是写一句话：点一下就能进去，比让他自己去找 logo 强。
-   * 为什么只弹一次：localStorage 记着（换浏览器/清缓存会再弹一次，可接受）。
-   * 为什么延迟 1.5 秒：等官方界面把 logo 渲染出来，否则弹在空页上。
+  /* ── 上手引导（手把手版，2026-09-16 老板：「什么叫引导？？引导用户点左上角 logo、
+   *   点了再一个个引导去设置偏好、模型、记忆」）──
+   * 这版和「弹一段说明」的区别（三条缺一不可）：
+   *   ① 遮罩把别处挡掉、目标**挖洞亮出来**（他看得见该点哪儿）
+   *   ② **必须他自己点**：这一步的动作真发生了才前进（不是我自动打开给他看）
+   *   ③ 一步一步、每步一句话，随时能跳过；只对第一次来的人跑一次
+   * 技术要点：
+   *   - 遮罩用**四块拼**（上/下/左/右）围住目标，中间留空 → 点击真落在目标元素上（不是合成事件）；
+   *   - 菜单/面板都是本脚本自己画的、异步出现 → 每步先等目标元素出现再画；
+   *   - 位置按 getBoundingClientRect 实时算，resize / scroll / 转屏都重排。
    */
-  function abFirstRunGuide() {
-    var KEY = 'ab-firstrun-v1';
-    try {
-      if (localStorage.getItem(KEY)) return;
-      localStorage.setItem(KEY, '1');            // 先记下，避免万一报错反复弹
-    } catch (e) { return; }                        // 存不了（隐私模式）就不打扰
-    setTimeout(function () {
-      if (document.getElementById('asbudy-layer')) return;      // 客户正在看别的面板，不抢
-      if (!document.querySelector('.brand-mark')) return;        // 界面还没起来 —— 这次算了
-      Promise.all([api('/v1/config'), api('/_gate/model-key')]).then(function (rs) {
-        var cfg = (rs[0] && rs[0].body) || {};
-        var mk = (rs[1] && rs[1].body) || {};
-        var amName = ({ suggest: '每步都先问我', auto: '拿不准才问我', bypass: '全部自己做，不问' })[cfg.approval_mode] || '拿不准才问我';
-        var modelLine = esc(mk.provider || cfg.provider || '—') + ' · ' + esc(mk.model || cfg.model || '—') +
-          (mk.hasKey === false ? '（还没配密钥）' : '（平台已配好，可以直接用；也能换成你自己的）');
-        openLayer('先花 30 秒，把它调成你要的样子', function (body) {
-          body.innerHTML =
-            '<div class="ab-tip">这些以后随时能改 —— 入口是界面<b>左上角那个 logo</b>（就是你刚才点进来这里的地方）。</div>' +
-            '<div class="ab-card"><div class="ab-card-top"><span class="ab-n">它在用哪个模型</span></div>' +
-              '<div class="ab-s">' + modelLine + '</div></div>' +
-            '<div class="ab-card"><div class="ab-card-top"><span class="ab-n">它动手前会问你多少</span></div>' +
-              '<div class="ab-s">现在：' + esc(amName) + ' —— 嫌问得多、或想让它更放手，都在设置里改。</div></div>' +
-            '<div class="ab-card"><div class="ab-card-top"><span class="ab-n">你能不能看见它在干什么</span></div>' +
-              '<div class="ab-s">思考过程、动了哪些文件、它自己记的事 —— 都能自己开关。</div></div>' +
-            '<div style="display:flex;gap:8px;margin-top:14px">' +
-              '<button class="ab-btn" id="fr-open" type="button">打开设置看看</button>' +
-              '<button class="ab-btn ghost" id="fr-later" type="button">以后再说</button></div>';
-          body.querySelector('#fr-later').onclick = closeLayer;
-          body.querySelector('#fr-open').onclick = function () { closeLayer(); openMyMenu(); };
-        });
-      });
-    }, 1500);
+  var TOUR_KEY = 'ab-tour-v1';
+  var tour = null;   // { holder, i, steps, timer }
+  var tourWait = 0;  // 有别的面板挡着时等它关掉的次数
+
+  function tourNarrow() { return window.matchMedia('(max-width: 800px)').matches; }
+
+  function tourSteps() {
+    var steps = [];
+    if (tourNarrow()) {
+      // 手机上 logo 藏在侧栏里（默认收起）—— 先让他把栏拉出来
+      steps.push({ sel: '#rail-open', wait: 'click', text: '先点这里，把左边的栏拉出来' });
+    }
+    steps.push({ sel: '.brand-mark', wait: 'click',
+      enter: function () { closeLayer(); },
+      text: '你的设置都在这个标记里 —— 点它一下' });
+    steps.push({ sel: '#ab-m-adv', wait: 'click',
+      text: '先在这儿把几个开关调好 —— 点「高级设置」' });
+    steps.push({ sel: '#adv-approval', wait: 'change', bail: '保持默认，下一步',
+      text: '它动手前先问你多少？选一个（拿不准就保持默认）' });
+    steps.push({ sel: '#adv-mk', wait: 'none', bail: '下一步',
+      text: '现在用的是哪个模型在这儿。想换成你自己的 API 就点「改」，不换就下一步' });
+    steps.push({ sel: '#adv-think', wait: 'change', bail: '下一步',
+      text: '想全程盯着它？这两个勾上（思考过程、动了哪些文件）' });
+    steps.push({ sel: '#ab-m-mem', wait: 'click',
+      enter: function () { closeLayer(); openMyMenu(); },
+      text: '最后一样：它自己的记忆 —— 它记下的事在这儿看，也能清空' });
+    steps.push({ end: true, text: '就这些。以后想改，点左上角那个标记 —— 它自己记的事在「AI 的记忆」里。' });
+    return steps;
   }
-  abFirstRunGuide();
+
+  function tourBuild() {
+    var holder = document.createElement('div');
+    holder.id = 'ab-tour';
+    holder.style.cssText = 'position:fixed;inset:0;z-index:100001;pointer-events:none';
+    holder.innerHTML =
+      '<div data-m="top" style="position:fixed;background:rgba(2,7,17,.74);pointer-events:auto"></div>' +
+      '<div data-m="bottom" style="position:fixed;background:rgba(2,7,17,.74);pointer-events:auto"></div>' +
+      '<div data-m="left" style="position:fixed;background:rgba(2,7,17,.74);pointer-events:auto"></div>' +
+      '<div data-m="right" style="position:fixed;background:rgba(2,7,17,.74);pointer-events:auto"></div>' +
+      '<div data-h="1" style="position:fixed;border:2px solid #58a6ff;border-radius:10px;' +
+        'box-shadow:0 0 0 4px #58a6ff33, 0 0 24px #58a6ff44;pointer-events:none;transition:all .18s ease"></div>' +
+      '<div data-t="1" class="abt-tip" style="position:fixed;max-width:330px;background:#0d1117;border:1px solid #30363d;' +
+        'border-radius:12px;padding:14px 16px;box-shadow:0 12px 40px rgba(0,0,0,.65);pointer-events:auto"></div>';
+    document.body.appendChild(holder);
+    return holder;
+  }
+
+  function tourPaint(step) {
+    var holder = tour.holder;
+    var hole = holder.querySelector('[data-h="1"]');
+    var tip = holder.querySelector('[data-t="1"]');
+    var el = step.sel ? document.querySelector(step.sel) : null;
+    var W = window.innerWidth, H = window.innerHeight;
+
+    function boxes(r) {
+      var pad = 6;
+      var t = Math.max(0, r.top - pad), l = Math.max(0, r.left - pad);
+      var b = Math.min(H, r.bottom + pad), rr = Math.min(W, r.right + pad);
+      holder.querySelector('[data-m="top"]').style.cssText = 'position:fixed;background:rgba(2,7,17,.74);pointer-events:auto;top:0;left:0;right:0;height:' + t + 'px';
+      holder.querySelector('[data-m="bottom"]').style.cssText = 'position:fixed;background:rgba(2,7,17,.74);pointer-events:auto;top:' + b + 'px;left:0;right:0;bottom:0';
+      holder.querySelector('[data-m="left"]').style.cssText = 'position:fixed;background:rgba(2,7,17,.74);pointer-events:auto;top:' + t + 'px;left:0;width:' + l + 'px;height:' + (b - t) + 'px';
+      holder.querySelector('[data-m="right"]').style.cssText = 'position:fixed;background:rgba(2,7,17,.74);pointer-events:auto;top:' + t + 'px;left:' + rr + 'px;right:0;height:' + (b - t) + 'px';
+      hole.style.cssText = hole.style.cssText.replace(/top:[^;]*;|left:[^;]*;|width:[^;]*;|height:[^;]*;/g, '') +
+        ';top:' + t + 'px;left:' + l + 'px;width:' + (rr - l) + 'px;height:' + (b - t) + 'px';
+      return { t: t, b: b, l: l, rr: rr };
+    }
+
+    var progress = (tour.i + 1) + '/' + tour.steps.length;
+    var buttons = '<button type="button" id="abt-skip" style="position:absolute;top:8px;right:10px;background:none;border:0;color:#8b949e;font-size:12.5px;cursor:pointer">跳过</button>' +
+      '<div data-p="1" style="position:absolute;top:8px;left:12px;color:#8b949e;font-size:12px">' + progress + '</div>';
+
+    if (step.end) {
+      hole.style.display = 'none';
+      holder.querySelectorAll('[data-m]').forEach(function (d) { d.style.cssText = d.style.cssText.replace(/top:[^;]*;|left:[^;]*;|width:[^;]*;|height:[^;]*;|right:[^;]*;|bottom:[^;]*;/g, ''); d.style.top = '0'; d.style.bottom = '0'; d.style.left = '0'; d.style.right = '0'; });
+      holder.querySelector('[data-m="bottom"]').style.cssText = 'position:fixed;background:rgba(2,7,17,.74);pointer-events:auto;inset:0';
+      holder.querySelector('[data-m="top"]').style.display = 'none';
+      holder.querySelector('[data-m="left"]').style.display = 'none';
+      holder.querySelector('[data-m="right"]').style.display = 'none';
+      tip.style.left = Math.max(12, (W - 330) / 2) + 'px';
+      tip.style.top = Math.max(40, H / 2 - 90) + 'px';
+      tip.innerHTML = buttons + '<div style="color:#e6edf3;font-size:14.5px;line-height:1.7;padding-right:52px">' + esc(step.text) + '</div>' +
+        '<div style="margin-top:12px;text-align:right"><button class="ab-btn" id="abt-done" type="button">知道了</button></div>';
+      tip.querySelector('#abt-done').onclick = function () { tourFinish(true); };
+      tip.querySelector('#abt-skip').onclick = function () { tourFinish(false); };
+      return;
+    }
+
+    holder.querySelectorAll('[data-m]').forEach(function (d) { d.style.display = ''; });
+    hole.style.display = '';
+    if (!el) return;
+
+    var rect = el.getBoundingClientRect();
+    var b = boxes(rect);
+
+    // 气泡：优先目标下方，放不下就上方
+    var below = b.b + 14, need = 150;
+    var tipTop = (below + need < H) ? below : Math.max(12, b.t - need - 14);
+    tip.style.left = Math.min(Math.max(12, b.l), Math.max(12, W - 344)) + 'px';
+    tip.style.top = tipTop + 'px';
+    var onlyText = '<div style="color:#e6edf3;font-size:14.5px;line-height:1.7;padding-right:52px">' + esc(step.text) + '</div>';
+    var acts = '';
+    if (step.bail) acts = '<div style="margin-top:12px;text-align:right"><button class="ab-btn" id="abt-next" type="button">' + esc(step.bail) + '</button></div>';
+    tip.innerHTML = buttons + onlyText + acts;
+    tip.querySelector('#abt-skip').onclick = function () { tourFinish(false); };
+    var nb = tip.querySelector('#abt-next');
+    if (nb) nb.onclick = function () { tour.i++; tourRun(); };
+  }
+
+  function tourRun() {
+    var step = tour.steps[tour.i];
+    if (!step) return tourFinish(true);
+    if (step.enter) { try { step.enter(); } catch (e) { /* 导航失败不卡住 */ } }
+    var tries = 0;
+    (function waitEl() {
+      var el = step.sel ? document.querySelector(step.sel) : null;
+      if (!el && step.sel && tries++ < 40) { tour.timer = setTimeout(waitEl, 100); return; }
+      if (el && step.sel) {
+        try { el.scrollIntoView({ block: 'center' }); } catch (e) { /* 老浏览器 */ }
+      }
+      tourPaint(step);
+    })();
+  }
+
+  function tourOnDocClick(e) {
+    if (!tour) return;
+    var step = tour.steps[tour.i];
+    if (!step || step.end || !step.sel) return;
+    var el = document.querySelector(step.sel);
+    if (el && (e.target === el || el.contains(e.target))) {
+      if (step.wait === 'click') { setTimeout(function () { tour.i++; tourRun(); }, 260); }
+    }
+  }
+
+  function tourOnChange(e) {
+    if (!tour) return;
+    var step = tour.steps[tour.i];
+    if (!step || step.end || step.wait !== 'change') return;
+    var el = document.querySelector(step.sel);
+    if (el && (e.target === el || el.contains(e.target))) { setTimeout(function () { tour.i++; tourRun(); }, 420); }
+  }
+
+  function tourFinish(completed) {
+    if (tour) {
+      if (tour.timer) clearTimeout(tour.timer);
+      var h = tour.holder;
+      if (h) { h.style.transition = 'opacity .2s'; h.style.opacity = '0'; setTimeout(function () { h.remove(); }, 220); }
+    }
+    window.removeEventListener('resize', tourRepaint, true);
+    window.removeEventListener('scroll', tourRepaint, true);
+    document.removeEventListener('click', tourOnDocClick, true);
+    document.removeEventListener('change', tourOnChange, true);
+    tour = null;
+    try { localStorage.setItem(TOUR_KEY, completed ? 'done' : 'skipped'); } catch (e) { /* 无所谓 */ }
+  }
+
+  function tourRepaint() {
+    if (!tour) return;
+    var step = tour.steps[tour.i];
+    if (step) tourPaint(step);
+  }
+
+  function abStartTour() {
+    try { if (localStorage.getItem(TOUR_KEY)) return; } catch (e) { return; }   // 存不了就不打扰
+    // 已经开着别的面板（例如「你正在替别人操作」的提示）→ 等它关掉再开始，别叠着弹
+    if (document.getElementById('asbudy-layer') && tourWait++ < 20) { setTimeout(abStartTour, 800); return; }
+    tour = { holder: null, i: 0, steps: tourSteps(), timer: null };
+    tour.holder = tourBuild();
+    window.addEventListener('resize', tourRepaint, true);
+    window.addEventListener('scroll', tourRepaint, true);
+    document.addEventListener('click', tourOnDocClick, true);
+    document.addEventListener('change', tourOnChange, true);
+    tourRun();
+  }
+
+  /* 第一次进项目 → 起引导（等官方界面把 logo 渲染出来） */
+  (function () {
+    var n = 0;
+    var t = setInterval(function () {
+      n++;
+      if (document.querySelector('.brand-mark')) { clearInterval(t); setTimeout(abStartTour, 900); }
+      else if (n > 40) clearInterval(t);
+    }, 250);
+  })();
 
   /* 进了别人的视角 → 弹一次提示（附三 §13：替别人操作是敏感事，得让你清楚自己在谁的界面里） */
   (function () {
