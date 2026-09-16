@@ -496,7 +496,7 @@
       html += '<button class="ab-menu-item" id="ab-m-logout">退出登录<small>退出当前账号</small></button>';
       if (installEvt) html += '<button class="ab-menu-item" id="ab-m-install">装到桌面<small>把这个页面装成桌面应用</small></button>';
       body.innerHTML = html;
-      abTipPanel(body, 'my-menu', '这里的设置改一次，<b>你名下所有项目都生效</b>（以后新建的也一样）。');
+      abTipPanel(body, 'my-menu', '这里改一次，<b>你所有项目都跟着变</b>（以后新建的也是）。');
       var bStaff = body.querySelector('#ab-m-staff');
       if (bStaff) bStaff.onclick = function () { openStaff(role === 'admin' ? 'admin' : ME.user); };
       var bUsers = body.querySelector('#ab-m-users');
@@ -1496,7 +1496,7 @@
           '<label class="ab-chk"><input type="checkbox" id="adv-calm"' + (cfg.calm_mode ? ' checked' : '') + '> 安静模式（过程和细节都收起来，只留结论）</label>' +
           '<label class="ab-chk"><input type="checkbox" id="adv-compact"' + (cfg.auto_compact ? ' checked' : '') + '> 聊天太长时自动帮我整理前面</label>' +
           '<div class="ab-tip" style="margin:2px 0 10px 0">自动整理会把前面的内容总结掉 —— 细节会丢一部分（默认开）。<br>⚠️ <b>关掉要留心</b>：聊得久了它可能突然不回话（前面说的已经超出模型一次能记住的范围）。</div>' +
-          '<div class="ab-row"><label>花费用</label><select class="ab-input" id="adv-currency">' +
+          '<div class="ab-row"><label>钱按哪种显示</label><select class="ab-input" id="adv-currency">' +
             '<option value="cny"' + (cur === 'cny' ? ' selected' : '') + '>人民币 ￥</option>' +
             '<option value="usd"' + (cur === 'usd' ? ' selected' : '') + '>美元 $</option>' +
           '</select></div>' +
@@ -1509,7 +1509,7 @@
             : '<div class="ab-tip">这个项目还没有用量记录。</div>') +
           '<div class="ab-msg" id="adv-msg"></div>';
         var msgEl = el.querySelector('#adv-msg');
-        abTipPanel(el, 'adv-approval', '「<b>审批方式</b>」决定它动手前问不问你 —— 嫌问得多就选「小的自己做」');
+        abTipPanel(el, 'adv-approval', '它改东西之前要不要先问你，在这儿选 —— 嫌问得多就选「小的自己做」');
         function post(payload) {
           return api('/_gate/advanced', { method: 'POST', body: JSON.stringify(payload) }).then(function (r2) {
             if (r2.ok) msg(msgEl, '已保存', true); else msg(msgEl, (r2.body && r2.body.error) || '保存失败', false);
@@ -2253,7 +2253,7 @@
     var items = [
       { k: 'act', text: '让它帮你做一件事', hint: '在下面跟它说一句就行' },
       { k: 'model', text: '看看它在用哪个模型', hint: '平台已配好，也能换成你自己的' },
-      { k: 'mem', text: '看看它自己记的事', hint: '记忆开关也在这儿' },
+      { k: 'mem', text: '看看它自己记的事', hint: '记忆的开关也在这儿' },
     ];
     var done = 0;
     for (var i = 0; i < items.length; i++) if (s[items[i].k]) done++;
@@ -2308,7 +2308,7 @@
   })();
 
   /* ① 第一次进项目：设置入口在左上角的标记（不遮屏，几秒后自己消失） */
-  setTimeout(function () { abTipTop('where-settings', '想改模型、偏好？点<b>左上角那个标记</b>。'); }, 2600);
+  setTimeout(function () { abTipTop('where-settings', '想换模型、改设置？点<b>左上角那个标记</b>。'); }, 2600);
 
   /* 进了别人的视角 → 弹一次提示（附三 §13：替别人操作是敏感事，得让你清楚自己在谁的界面里） */
   (function () {
