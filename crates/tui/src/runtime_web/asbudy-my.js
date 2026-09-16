@@ -2153,6 +2153,49 @@
 
   api('/_gate/whoami').then(function (r) { if (r.ok) ME = r.body; });
 
+  /* ── 第一次进项目：引导客户去「我的」把设置调好 ──────────────────────────────
+   * 2026-09-16 老板：「新用户进来就直接杵在『选择项目』上，不应该引导他点左上角 logo
+   *   去配模型 / 偏好 / 高级设置吗」—— 对。官方界面**没有任何设置入口**，我们把「我的」
+   *   挂在左上角那个 logo 上：老客户知道，新客户完全看不出来能点。
+   * 为什么给「打开设置」按钮而不只是写一句话：点一下就能进去，比让他自己去找 logo 强。
+   * 为什么只弹一次：localStorage 记着（换浏览器/清缓存会再弹一次，可接受）。
+   * 为什么延迟 1.5 秒：等官方界面把 logo 渲染出来，否则弹在空页上。
+   */
+  function abFirstRunGuide() {
+    var KEY = 'ab-firstrun-v1';
+    try {
+      if (localStorage.getItem(KEY)) return;
+      localStorage.setItem(KEY, '1');            // 先记下，避免万一报错反复弹
+    } catch (e) { return; }                        // 存不了（隐私模式）就不打扰
+    setTimeout(function () {
+      if (document.getElementById('asbudy-layer')) return;      // 客户正在看别的面板，不抢
+      if (!document.querySelector('.brand-mark')) return;        // 界面还没起来 —— 这次算了
+      Promise.all([api('/v1/config'), api('/_gate/model-key')]).then(function (rs) {
+        var cfg = (rs[0] && rs[0].body) || {};
+        var mk = (rs[1] && rs[1].body) || {};
+        var amName = ({ suggest: '每步都先问我', auto: '拿不准才问我', bypass: '全部自己做，不问' })[cfg.approval_mode] || '拿不准才问我';
+        var modelLine = esc(mk.provider || cfg.provider || '—') + ' · ' + esc(mk.model || cfg.model || '—') +
+          (mk.hasKey === false ? '（还没配密钥）' : '（平台已配好，可以直接用；也能换成你自己的）');
+        openLayer('先花 30 秒，把它调成你要的样子', function (body) {
+          body.innerHTML =
+            '<div class="ab-tip">这些以后随时能改 —— 入口是界面<b>左上角那个 logo</b>（就是你刚才点进来这里的地方）。</div>' +
+            '<div class="ab-card"><div class="ab-card-top"><span class="ab-n">它在用哪个模型</span></div>' +
+              '<div class="ab-s">' + modelLine + '</div></div>' +
+            '<div class="ab-card"><div class="ab-card-top"><span class="ab-n">它动手前会问你多少</span></div>' +
+              '<div class="ab-s">现在：' + esc(amName) + ' —— 嫌问得多、或想让它更放手，都在设置里改。</div></div>' +
+            '<div class="ab-card"><div class="ab-card-top"><span class="ab-n">你能不能看见它在干什么</span></div>' +
+              '<div class="ab-s">思考过程、动了哪些文件、它自己记的事 —— 都能自己开关。</div></div>' +
+            '<div style="display:flex;gap:8px;margin-top:14px">' +
+              '<button class="ab-btn" id="fr-open" type="button">打开设置看看</button>' +
+              '<button class="ab-btn ghost" id="fr-later" type="button">以后再说</button></div>';
+          body.querySelector('#fr-later').onclick = closeLayer;
+          body.querySelector('#fr-open').onclick = function () { closeLayer(); openMyMenu(); };
+        });
+      });
+    }, 1500);
+  }
+  abFirstRunGuide();
+
   /* 进了别人的视角 → 弹一次提示（附三 §13：替别人操作是敏感事，得让你清楚自己在谁的界面里） */
   (function () {
     var box = document.getElementById('asbudy-files');
