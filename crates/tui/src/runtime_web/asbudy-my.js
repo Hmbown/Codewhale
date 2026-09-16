@@ -1831,13 +1831,13 @@
       var b1 = document.createElement('button');
       b1.type = 'button';
       b1.id = 'asbudy-retry';
-      b1.textContent = '↻ 重试这轮';
-      b1.title = '让 AI 重新回答上一轮';
+      b1.textContent = '↻ 重试';
+      b1.title = '让 AI 把上一句重新答一遍（不动项目文件）';
       var b2 = document.createElement('button');
       b2.type = 'button';
       b2.id = 'asbudy-undo-turn';   // 注意：不能叫 asbudy-undo —— 那是退回面板容器的 id（重复 id 会让 getElementById 拿到错的）
-      b2.textContent = '↩ 撤销这轮';
-      b2.title = '撤回上一轮（含它改的文件）';
+      b2.textContent = '↩ 撤销';
+      b2.title = '把最后一轮问答去掉，你那句话回到输入框（不动项目文件）';
       var b3 = document.createElement('button');
       b3.type = 'button';
       b3.id = 'asbudy-compact';
@@ -1902,7 +1902,7 @@
     async function fire(kind) {
       if (!LAST_THREAD) { alert('先在右边说一句，才有可操作的对话'); return; }
       var labels = { retry: '重试', undo: '撤销', compact: '压缩' };
-      if (kind === 'undo' && !confirm('撤销上一轮？AI 这一轮改的文件也会回退。')) return;
+      if (kind === 'undo' && !confirm('撤销最后这一轮？\n\n这一问一答会从对话里去掉，你那句话回到输入框（可以改了再发）。\n项目里的文件不受影响 —— 要退文件，用左侧的「退回」。')) return;
       if (kind === 'compact' && !confirm('把当前对话压短？\n\n要点会保留，超长的历史会被 AI 总结掉 —— 能省 token，但细节会丢。')) return;
       try {
         var r = await fetch('/v1/threads/' + encodeURIComponent(LAST_THREAD) + '/' + kind, {
