@@ -921,7 +921,7 @@
             '<div class="ab-s">可用 ' + fmtMb(d.disk.availMb) + ' / 共 ' + fmtMb(d.disk.totalMb) +
             '（已用 ' + Math.round((d.disk.usedMb / d.disk.totalMb) * 100) + '%）</div></div>';
         }
-        html += '<div class="ab-tip">每个项目默认上限 ' + fmtMb(d.defaultQuotaMb) + '；满了之后上传和改动会被拦下。</div>';
+        html += '<div class="ab-tip">每个项目默认上限 ' + fmtMb(d.defaultQuotaMb) + '；超出后上传与改动将被阻止。</div>';
         if (!(d.projects || []).length) html += '<div class="ab-tip">名下还没有项目。</div>';
         (d.projects || []).forEach(function (p) {
           var bar = '<div style="height:6px;background:#21262d;border-radius:3px;margin-top:8px;overflow:hidden">' +
@@ -1351,7 +1351,7 @@
       body: JSON.stringify({ prefs: { memory_enabled: on ? 'true' : 'false' } }),
     }).then(function (r) {
       if (!r.ok || (r.body && r.body.ok === false)) {
-        if (btn) { btn.disabled = false; btn.textContent = on ? '打开记忆' : '关掉记忆'; }
+        if (btn) { btn.disabled = false; btn.textContent = on ? '开启记忆' : '关闭记忆'; }
         var why = (r.body && (r.body.error || r.body.message)) || ('HTTP ' + r.code);
         if (m) { m.className = 'ab-msg err'; m.textContent = '没设置成：' + why; }
         return;
@@ -1432,10 +1432,10 @@
           html += '<div class="ab-tip" style="margin-top:12px">此处仅支持<b>整批清空</b>，暂不支持单条删除。' +
             '如需删除某条记忆，可在对话中告知 AI（例如「忘掉关于报表格式的偏好」）。</div>';
           html += '<div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">' +
-            '<button class="ab-btn danger sm" id="mem-clear-ws" type="button">清空「本项目」的记忆</button>' +
-            '<button class="ab-btn danger sm" id="mem-clear-global" type="button">清空「通用」的记忆</button>' +
+            '<button class="ab-btn danger sm" id="mem-clear-ws" type="button">清空本项目记忆</button>' +
+            '<button class="ab-btn danger sm" id="mem-clear-global" type="button">清空通用记忆</button>' +
             '<button class="ab-btn ghost sm" id="mem-reload" type="button">刷新</button>' +
-            '<button class="ab-btn ghost sm" id="mem-off" type="button" style="margin-left:auto">关掉记忆</button></div>' +
+            '<button class="ab-btn ghost sm" id="mem-off" type="button" style="margin-left:auto">关闭记忆</button></div>' +
             '<div class="ab-msg" id="mem-msg"></div>';
           el.innerHTML = html;
 
@@ -1465,7 +1465,7 @@
           body.querySelector('#mem-clear-ws').onclick = function () { clearOne('workspace', '本项目'); };
           body.querySelector('#mem-clear-global').onclick = function () { clearOne('global', '通用'); };
           body.querySelector('#mem-off').onclick = function () {
-            if (!confirm('关掉记忆？\n以后它不再记新东西、也不再带进对话。\n（已经记下的还留着，想一并清掉就点上面的「清空」）')) return;
+            if (!confirm('关闭记忆？\n关闭后 AI 不再记录新内容，也不再带入对话。\n（已记录的内容会保留；如需一并清除，请点击上方「清空」）')) return;
             abSetMemory(false, this, load);
           };
         });
@@ -1501,10 +1501,10 @@
         var d = r.body || {};
         var u = d.usage;
         el.innerHTML =
-          '<div class="ab-tip">这些是你自己的习惯，<b>改一次，名下所有项目都生效</b>（以后新建的项目也一样）。</div>' +
+          '<div class="ab-tip">以下设置会应用到<b>你的所有项目</b>（含以后新建的）。</div>' +
           '<div class="ab-row"><label>模型服务</label><span class="ab-input" style="cursor:default;color:#8b949e;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' +
             esc(mk.provider || '—') + ' · ' + esc(mk.model || '—') + ' · ' + (mk.hasKey ? '已配置密钥' : '未配置密钥') +
-          '</span><button class="ab-btn ghost sm" id="adv-mk" type="button" style="flex:0 0 auto">改</button></div>' +
+          '</span><button class="ab-btn ghost sm" id="adv-mk" type="button" style="flex:0 0 auto">修改</button></div>' +
           '<div class="ab-row"><label>代码仓库</label><span class="ab-input" style="cursor:default;color:#8b949e;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' +
             esc(repoSummary(repo)) +
           '</span><button class="ab-btn ghost sm" id="adv-repo" type="button" style="flex:0 0 auto">设置</button></div>' +
@@ -1514,20 +1514,20 @@
             '<option value="auto"' + (am === 'auto' ? ' selected' : '') + '>小的自己做，拿不准才问我</option>' +
             '<option value="bypass"' + (am === 'bypass' ? ' selected' : '') + '>全部自己做，不问</option>' +
           '</select></div>' +
-          '<div class="ab-tip" style="margin:-4px 0 10px 78px">选「全部自己做」之后，它改文件、跑命令就不再问你 —— 拿不准就保持默认。</div>' +
-          '<div style="margin:14px 0 6px;color:#e6edf3;font-size:14px">看得见什么</div>' +
+          '<div class="ab-tip" style="margin:-4px 0 10px 78px">选择「全部自己做」后，AI 改文件、执行命令将不再询问；不确定时建议保持默认。</div>' +
+          '<div style="margin:14px 0 6px;color:#e6edf3;font-size:14px">显示</div>' +
           '<label class="ab-chk"><input type="checkbox" id="adv-think"' + (cfg.show_thinking ? ' checked' : '') + '> 显示思考过程</label>' +
-          '<label class="ab-chk"><input type="checkbox" id="adv-think-exp"' + (cfg.thinking_default_expanded ? ' checked' : '') + '> 思考过程默认摊开（不用点一下）</label>' +
+          '<label class="ab-chk"><input type="checkbox" id="adv-think-exp"' + (cfg.thinking_default_expanded ? ' checked' : '') + '> 默认展开思考过程</label>' +
           '<label class="ab-chk"><input type="checkbox" id="adv-tools"' + (cfg.show_tool_details ? ' checked' : '') + '> 显示文件与命令明细</label>' +
-          '<label class="ab-chk"><input type="checkbox" id="adv-calm"' + (cfg.calm_mode ? ' checked' : '') + '> 安静模式（过程和细节都收起来，只留结论）</label>' +
+          '<label class="ab-chk"><input type="checkbox" id="adv-calm"' + (cfg.calm_mode ? ' checked' : '') + '> 安静模式（仅显示结论）</label>' +
           '<label class="ab-chk"><input type="checkbox" id="adv-compact"' + (cfg.auto_compact ? ' checked' : '') + '> 聊天太长时自动帮我整理前面</label>' +
           '<div class="ab-tip" style="margin:2px 0 10px 0">自动整理会总结前面的内容 —— 部分细节会丢失（默认开启）。<br>⚠️ 关闭后请留意：长对话可能因超出模型上下文而中断。</div>' +
           '<div class="ab-row"><label>货币单位</label><select class="ab-input" id="adv-currency">' +
             '<option value="cny"' + (cur === 'cny' ? ' selected' : '') + '>人民币 ￥</option>' +
             '<option value="usd"' + (cur === 'usd' ? ' selected' : '') + '>美元 $</option>' +
           '</select></div>' +
-          '<label class="ab-chk"><input type="checkbox" id="adv-ro"' + (d.previewReadOnly ? ' checked' : '') + '> 只看不改（防误删）</label>' +
-          '<div style="margin:14px 0 6px;color:#e6edf3;font-size:14px">花了多少</div>' +
+          '<label class="ab-chk"><input type="checkbox" id="adv-ro"' + (d.previewReadOnly ? ' checked' : '') + '> 只读模式</label>' +
+          '<div style="margin:14px 0 6px;color:#e6edf3;font-size:14px">用量统计</div>' +
           (u
             ? '<div class="ab-card"><div class="ab-s">累计 ' + (DISPLAY.cost_currency === 'cny'
                 ? '￥' + Number(u.costCny || 0).toFixed(2)
@@ -1684,8 +1684,8 @@
    * 凭据落在项目自己的引擎家（engine-home-<key>/.ssh/），门卫写不进去 → 走受限 root 帮手。
    * 设计边界（别推翻）：平台不托管仓库、不预置任何地址、不替客户 push、也不让 AI 自作主张 push。 */
   function repoSummary(r) {
-    if (!r) return '还没接（代码只在这台服务器上）';
-    if (!r.remote) return r.helper === false ? '还没接（平台还没装帮手）' : '还没接（代码只在这台服务器上）';
+    if (!r) return '未连接（代码当前仅存于平台）';
+    if (!r.remote) return r.helper === false ? '未连接（平台组件未就绪）' : '未连接（代码当前仅存于平台）';
     return String(r.remote).replace(/^[a-z]+:\/\//, '').replace(/^[^@/]*@/, '');
   }
   function repoWhen(iso) {
@@ -1952,7 +1952,7 @@
       var el = ensureEl();
       if (!el) return;
       var sec = Math.round((Date.now() - startedAt) / 1000);
-      el.textContent = '⏱ 正在干活 · 已用 ' + fmt(sec) + (sec >= 60 ? '（还在干，不是卡死）' : '');
+      el.textContent = '⏱ 处理中 · 已用 ' + fmt(sec);
     }
     function start() {
       startedAt = Date.now();
