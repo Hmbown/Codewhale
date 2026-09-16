@@ -794,6 +794,13 @@
     var sysBtn = document.getElementById('preview-sys');
     if (sysBtn) sysBtn.hidden = true;
     shell.classList.add('has-preview');
+    // 手机：刚才是从**侧栏里**的「▶ 看我的项目」点进来的 —— 顺手把侧栏收起来，
+    //   否则它就盖在刚打开的预览上面（点完还得再点一下空白处，很别扭）。2026-09-16 老板选②。
+    if (window.matchMedia('(max-width: 800px)').matches && shell.classList.contains('rail-visible')) {
+      shell.classList.remove('rail-visible');
+      var railBtn = document.getElementById('rail-open');
+      if (railBtn) railBtn.setAttribute('aria-expanded', 'false');
+    }
   }
 
   // 分栏拖手：拽它调预览宽度（存在 .shell 的 --preview-width 上）
@@ -835,12 +842,16 @@
     window.addEventListener('blur', up);          // 拖到一半切走窗口也不能卡住
   });
 
-  // 所见即所得：进来就分栏（PC 左右分、手机上下分）。
-  // ⚠️ 2026-09-16 老板：手机也必须**自动预览**。以前这里把窄屏排除在外
-  //   （「手机默认对话，点文件才开预览」），加上手机上的三格又被去掉 ——
-  //   结果手机上**看不到自己的项目、也没有任何入口**（员工反馈「右边没出现预览」）。
-  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', function () { showPreview(); });
-  else setTimeout(function () { showPreview(); }, 0);
+  // 所见即所得：进来就分栏（PC 左右分）。
+  // ⚠️ 2026-09-16 老板实际用过手机后定（当轮第二次调整）：**手机（≤800px）进来先看对话，不自动开预览** ——
+  //   自动开时预览占上面 44vh，挡得难受；而当初「手机上看不到项目」的病根是**没有入口**，
+  //   不是「没自动打开」。所以：PC 仍进来就分栏；手机走左侧栏顶部的「▶ 看我的项目」（入口一直在）。
+  //   断点跟 styles.css 的 @media (max-width: 800px) 对齐（别各写各的）。
+  var isNarrow = function () { return window.matchMedia('(max-width: 800px)').matches; };
+  if (!isNarrow()) {
+    if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', function () { showPreview(); });
+    else setTimeout(function () { showPreview(); }, 0);
+  }
 
   document.addEventListener('click', function (e) {
     var t = e.target;
@@ -978,4 +989,20 @@
     if (undoRefresh) undoRefresh.onclick = loadUndo;
     loadUndo();
   }
+
+  /* 手机：点开预览 = **整屏**（styles.css 的 @media(max-width:800px)），所以得让人一眼知道怎么回去 ——
+     把头部那个「收起」在手机上写成「← 回到对话」。2026-09-16 老板：预览整屏后不能让人找不到回路。 */
+  (function () {
+    var relabel = function () {
+      var b = document.getElementById('preview-close');
+      if (!b) return;
+      if (window.matchMedia('(max-width: 800px)').matches) {
+        if (b.textContent !== '← 回到对话') b.textContent = '← 回到对话';
+      }
+    };
+    relabel();
+    window.addEventListener('resize', relabel);
+    var n = 0;
+    var t = setInterval(function () { relabel(); if (++n > 20) clearInterval(t); }, 500);
+  })();
 })();

@@ -1389,26 +1389,32 @@ noscript {
     width: 100%;
   }
 
-  /* 窄屏：预览栏占**上面一块**（不是全屏盖住）——
-     2026-09-16 老板：手机进来就要看见自己的项目（自动预览、不要三格）；
-     但全屏盖住就没办法跟 AI 说话了 —— 所以改成上下分：上面看系统，下面继续聊。
-     关掉后从左侧栏顶部的「▶ 看我的项目」再打开（手机端不再显示右上角的 👁 眼睛按钮）。 */
+  /* 手机：点「看我的项目」/点文件 → 预览**整屏**（老板 2026-09-16：「还是一半屏幕，这是什么傻逼设计」）。
+     为什么整屏：手机端预览只可能是客户**自己点开**的（已不再自动开）—— 他主动要看，就给他满屏，
+     而不是上半屏预览 + 下半屏对话（那两样都看不完整）。回对话 = 预览栏右上角的「← 回到对话」。
+     `${100}dvh`：手机地址栏收放时比 100vh 准；不认 dvh 的老浏览器落到上一行。 */
   .shell.has-preview .preview-pane {
     position: fixed;
     top: var(--visual-viewport-offset-top, 0px);
     left: 0;
     right: 0;
-    bottom: auto;
-    height: 44vh;
+    bottom: 0;
+    height: 100vh;
+    height: 100dvh;
     z-index: 40;
     border-left: 0;
-    border-bottom: 1px solid var(--border);
-    box-shadow: 0 8px 24px rgba(0, 0, 0, .5);
+    border-bottom: 0;
+    box-shadow: none;
   }
 
-  /* 对话区往下让开那 44vh，别被预览盖住 */
+  /* 全屏了，不再需要给预览让位（以前这里给 44vh 留白） */
   .shell.has-preview .session {
-    padding-top: 44vh;
+    padding-top: 0;
+  }
+
+  /* 全屏预览下拖动调宽没意义，收掉那条拖手 */
+  .shell.has-preview .preview-grip {
+    display: none;
   }
 
   /* 手机端不再显示「👁 我的项目」眼睛按钮（2026-09-16 老板要求去掉）；
