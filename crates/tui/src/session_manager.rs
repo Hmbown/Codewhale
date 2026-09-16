@@ -955,21 +955,40 @@ impl SavedSession {
         }
     }
 
-    fn storage_compatible_copy(&self) -> Option<Self> {
-        let journal = self.journal.as_ref()?;
-        let active_messages = journal.to_messages();
-        if !self.messages.is_empty() && self.messages == active_messages {
-            return None;
+    /// Bring `messages` and the journal into the shape the on-disk schema
+    /// expects, in place.
+    ///
+    /// This used to be `storage_compatible_copy`, which cloned the whole
+    /// session to do it. On the debounced persistence path the caller already
+    /// owns the value and `compact_for_persistence_queue` has already emptied
+    /// `messages`, so the clone was pure waste — two full deep copies of the
+    /// history per write (#6214 T3).
+    ///
+    /// The no-op cases are load-bearing and must stay no-ops: with no journal,
+    /// or with `messages` already equal to the journal's active branch, the
+    /// session serializes exactly as it arrived — including a
+    /// `metadata.message_count` that disagrees with `messages.len()`. Rewriting
+    /// that count here would silently edit live data on every save.
+    pub(crate) fn make_storage_compatible(&mut self) {
+        let Some(journal) = self.journal.as_ref() else {
+            return;
+        };
+        if self.messages.is_empty() {
+            self.messages = journal.to_messages();
+        } else {
+            if self.messages == journal.to_messages() {
+                return;
+            }
+            // Split the `journal` / `messages` borrows; the take is returned
+            // before this function ends, so the session is never left short.
+            let messages = std::mem::take(&mut self.messages);
+            if let Some(journal) = self.journal.as_mut() {
+                journal.rebranch_active_messages(&messages);
+                self.leaf_id = journal.leaf_id.clone();
+            }
+            self.messages = messages;
         }
-        let mut copy = self.clone();
-        if copy.messages.is_empty() {
-            copy.messages = active_messages;
-        } else if let Some(journal) = copy.journal.as_mut() {
-            journal.rebranch_active_messages(&copy.messages);
-            copy.leaf_id = journal.leaf_id.clone();
-        }
-        copy.metadata.message_count = copy.messages.len();
-        Some(copy)
+        self.metadata.message_count = self.messages.len();
     }
 
     pub fn ensure_journal(&mut self) {
@@ -1106,9 +1125,9 @@ impl SavedSession {
     }
 }
 
-fn serialize_saved_session(session: &SavedSession) -> io::Result<String> {
-    let compatible = session.storage_compatible_copy();
-    serde_json::to_string_pretty(compatible.as_ref().unwrap_or(session))
+fn serialize_saved_session(mut session: SavedSession) -> io::Result<String> {
+    session.make_storage_compatible();
+    serde_json::to_string_pretty(&session)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }
 
@@ -1807,24 +1826,38 @@ impl SessionManager {
     }
 
     /// Save a session to disk using atomic write (temp file + fsync + rename).
+    ///
+    /// Borrowing form: clones once so the ~150 existing `&session` call sites
+    /// keep working. The debounced persistence path already owns its value and
+    /// calls [`Self::save_session_owned`] instead (#6214 T3).
     pub fn save_session(&self, session: &SavedSession) -> std::io::Result<PathBuf> {
-        let path = self.validated_session_path(&session.metadata.id)?;
-        self.with_session_write_admission(&session.metadata.id, || {
+        self.save_session_owned(session.clone())
+    }
+
+    /// Save a session to disk, consuming it.
+    pub(crate) fn save_session_owned(&self, session: SavedSession) -> std::io::Result<PathBuf> {
+        let session_id = session.metadata.id.clone();
+        let path = self.validated_session_path(&session_id)?;
+        // Not a `move` closure: `session` is consumed inside, so inference
+        // captures it by value while `path` and `session_id` stay borrowed for
+        // the caller to use after the write.
+        self.with_session_write_admission(&session_id, || {
             let already_persisted = path.exists()
                 || self
-                    .validated_checkpoint_path(&session.metadata.id)
+                    .validated_checkpoint_path(&session_id)
                     .is_ok_and(|checkpoint| checkpoint.exists());
 
-            self.archive_before_first_graph_write(session, &path)?;
+            // Still the pre-hydration value, and still before write_atomic.
+            self.archive_before_first_graph_write(&session, &path)?;
 
-            let mut durable_session = session.clone();
+            let mut durable_session = session;
             self.hydrate_recovered_runtime_binding(&mut durable_session)?;
             self.hydrate_approval_receipts(&mut durable_session)?;
-            let content = serialize_saved_session(&durable_session)?;
+            let content = serialize_saved_session(durable_session)?;
 
             // Atomic write via write_atomic (NamedTempFile + fsync + persist)
             write_atomic(&path, content.as_bytes())?;
-            self.stamp_session_boot_owner_for_new_record(&session.metadata.id, already_persisted);
+            self.stamp_session_boot_owner_for_new_record(&session_id, already_persisted);
             Ok(())
         })?
         .ok_or_else(Self::retired_session_write_error)?;
@@ -1841,18 +1874,24 @@ impl SessionManager {
     /// Checkpoints are keyed per session (`checkpoints/<session_id>.json`) so
     /// concurrent sessions never overwrite each other's crash-recovery state.
     pub fn save_checkpoint(&self, session: &SavedSession) -> std::io::Result<PathBuf> {
-        let path = self.validated_checkpoint_path(&session.metadata.id)?;
-        self.with_session_write_admission(&session.metadata.id, || {
-            let session_path = self.validated_session_path(&session.metadata.id)?;
-            self.archive_before_first_graph_write(session, &session_path)?;
+        self.save_checkpoint_owned(session.clone())
+    }
+
+    /// Save a crash-recovery checkpoint, consuming the session.
+    pub(crate) fn save_checkpoint_owned(&self, session: SavedSession) -> std::io::Result<PathBuf> {
+        let session_id = session.metadata.id.clone();
+        let path = self.validated_checkpoint_path(&session_id)?;
+        self.with_session_write_admission(&session_id, || {
+            let session_path = self.validated_session_path(&session_id)?;
+            self.archive_before_first_graph_write(&session, &session_path)?;
             fs::create_dir_all(self.checkpoints_dir())?;
             let already_persisted = path.exists() || session_path.exists();
-            let mut durable_session = session.clone();
+            let mut durable_session = session;
             self.hydrate_recovered_runtime_binding(&mut durable_session)?;
             self.hydrate_approval_receipts(&mut durable_session)?;
-            let content = serialize_saved_session(&durable_session)?;
+            let content = serialize_saved_session(durable_session)?;
             write_atomic(&path, content.as_bytes())?;
-            self.stamp_session_boot_owner_for_new_record(&session.metadata.id, already_persisted);
+            self.stamp_session_boot_owner_for_new_record(&session_id, already_persisted);
             Ok(())
         })?
         .ok_or_else(Self::retired_session_write_error)?;
@@ -3670,7 +3709,7 @@ mod tests {
     fn make_test_message(role: &str, text: &str) -> Message {
         Message {
             role: Role::from(role),
-            content: vec![ContentBlock::Text {
+            content: vec![codewhale_models::ContentBlock::Text {
                 text: text.to_string(),
                 cache_control: None,
             }],
@@ -3792,7 +3831,7 @@ mod tests {
             &imported
                 .validated_session_path(&saved.metadata.id)
                 .expect("imported path"),
-            serialize_saved_session(&saved)
+            serialize_saved_session(saved.clone())
                 .expect("snapshot bytes")
                 .as_bytes(),
         )
@@ -4061,7 +4100,7 @@ mod tests {
         let legacy_path = manager.checkpoints_dir().join(LEGACY_CHECKPOINT_FILE);
         write_atomic(
             &legacy_path,
-            serialize_saved_session(&retired)
+            serialize_saved_session(retired.clone())
                 .expect("legacy bytes")
                 .as_bytes(),
         )
@@ -4127,7 +4166,7 @@ mod tests {
                     fs::create_dir_all(manager.checkpoints_dir()).expect("checkpoints");
                     write_atomic(
                         &manager.checkpoints_dir().join(LEGACY_CHECKPOINT_FILE),
-                        serialize_saved_session(&old)
+                        serialize_saved_session(old.clone())
                             .expect("legacy bytes")
                             .as_bytes(),
                     )
@@ -4233,7 +4272,7 @@ mod tests {
             .expect("checkpoint before deletion");
         write_atomic(
             &manager.checkpoints_dir().join(LEGACY_CHECKPOINT_FILE),
-            serialize_saved_session(&saved)
+            serialize_saved_session(saved.clone())
                 .expect("legacy bytes")
                 .as_bytes(),
         )
@@ -7697,5 +7736,98 @@ mod tests {
                 io::ErrorKind::InvalidInput
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod storage_compatible_tests {
+    use super::*;
+
+    fn user(text: &str) -> Message {
+        Message {
+            role: codewhale_models::Role::from("user"),
+            content: vec![codewhale_models::ContentBlock::Text {
+                text: text.to_string(),
+                cache_control: None,
+            }],
+        }
+    }
+
+    /// The no-op cases must stay no-ops, byte for byte.
+    ///
+    /// `make_storage_compatible` replaced a clone-and-return-`Option` helper
+    /// (#6214 T3). Two of that helper's paths returned `None`, and the caller
+    /// then serialized the *original* — so a `metadata.message_count` that
+    /// disagrees with `messages.len()` survived untouched. Rewriting it in
+    /// place would silently edit live data on every save, and nothing else in
+    /// the suite catches that.
+    #[test]
+    fn make_storage_compatible_leaves_the_no_op_cases_byte_identical() {
+        let workspace = std::env::temp_dir();
+        let messages = vec![user("one"), user("two")];
+
+        // 1. No journal at all (legacy, pre-journal files): untouched.
+        let mut legacy = create_saved_session(&messages, "test-model", &workspace, 0, None);
+        legacy.journal = None;
+        legacy.metadata.message_count = 99; // deliberately disagrees
+        let before = serde_json::to_string_pretty(&legacy).expect("legacy json");
+        let mut after_session = legacy.clone();
+        after_session.make_storage_compatible();
+        assert_eq!(
+            serde_json::to_string_pretty(&after_session).expect("legacy json"),
+            before,
+            "a session with no journal must serialize exactly as it arrived"
+        );
+        assert_eq!(after_session.metadata.message_count, 99);
+
+        // 2. Journal present and `messages` already equals its active branch:
+        //    still untouched, including the disagreeing count.
+        let mut settled = create_saved_session(&messages, "test-model", &workspace, 0, None);
+        assert!(settled.journal.is_some(), "fixture must carry a journal");
+        settled.messages = settled
+            .journal
+            .as_ref()
+            .expect("journal present")
+            .to_messages();
+        settled.metadata.message_count = 99;
+        let before = serde_json::to_string_pretty(&settled).expect("settled json");
+        let mut after_session = settled.clone();
+        after_session.make_storage_compatible();
+        assert_eq!(
+            serde_json::to_string_pretty(&after_session).expect("settled json"),
+            before,
+            "an already-consistent session must not be rewritten"
+        );
+        assert_eq!(
+            after_session.metadata.message_count, 99,
+            "the early return must happen before message_count is recomputed"
+        );
+    }
+
+    /// The queued (journal-only) path is what the debounced flush actually
+    /// writes: `compact_for_persistence_queue` empties `messages` first.
+    #[test]
+    fn make_storage_compatible_rehydrates_a_compacted_queue_snapshot() {
+        let workspace = std::env::temp_dir();
+        let messages = vec![user("one"), user("two"), user("three")];
+        let mut session = create_saved_session(&messages, "test-model", &workspace, 0, None);
+        let expected = session
+            .journal
+            .as_ref()
+            .expect("journal present")
+            .to_messages();
+
+        session.compact_for_persistence_queue();
+        assert!(
+            session.messages.is_empty(),
+            "the queued snapshot is journal-only"
+        );
+
+        session.make_storage_compatible();
+        assert_eq!(
+            session.messages, expected,
+            "the compat projection is rebuilt from the journal"
+        );
+        assert_eq!(session.metadata.message_count, expected.len());
     }
 }

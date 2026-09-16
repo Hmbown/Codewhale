@@ -538,11 +538,11 @@ fn flush_inner(manager: &SessionManager, pending: &mut PendingState) -> FlushRep
     for (session_id, session) in std::mem::take(&mut pending.sessions) {
         record(
             format!("session:{session_id}"),
-            manager.save_session(&session).map(|_| ()),
+            manager.save_session_owned(session).map(|_| ()),
         );
     }
     for (session_id, session) in std::mem::take(&mut pending.completed_commits) {
-        let commit_result = manager.save_session(&session);
+        let commit_result = manager.save_session_owned(session);
         let save_succeeded = commit_result.is_ok();
         record(
             format!("completed-commit:{session_id}"),
@@ -567,7 +567,7 @@ fn flush_inner(manager: &SessionManager, pending: &mut PendingState) -> FlushRep
     for (session_id, session) in std::mem::take(&mut pending.checkpoints) {
         record(
             format!("checkpoint:{session_id}"),
-            manager.save_checkpoint(&session).map(|_| ()),
+            manager.save_checkpoint_owned(session).map(|_| ()),
         );
     }
     for (_, request) in std::mem::take(&mut pending.offline_queue) {
