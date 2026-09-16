@@ -828,6 +828,15 @@
               };
               acts.appendChild(b);
             }
+            // 工作台不给删（2026-09-16 老板定 A）：它是平台给你的干活入口、不是客户的项目，
+            //   删了连里面所有产出文件（PPT/Excel）一起没，也没地方补。后端同时拦着，两层。
+            if (p.workbench) {
+              var wbHint = document.createElement('div');
+              wbHint.className = 'ab-s';
+              wbHint.style.cssText = 'align-self:center;color:#8b949e';
+              wbHint.textContent = '这是你的工作台，不能删（想省内存可以暂停）';
+              acts.appendChild(wbHint);
+            } else {
             var bDel = document.createElement('button');
             bDel.className = 'ab-btn danger sm';
             bDel.type = 'button';
@@ -844,6 +853,7 @@
               });
             };
             acts.appendChild(bDel);
+            }
             // 管理员：把项目转给某个客户
             if (isAdmin && owners.length) {
               var sel = document.createElement('select');
