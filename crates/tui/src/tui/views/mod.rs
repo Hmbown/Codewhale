@@ -2713,9 +2713,19 @@ impl ConfigView {
         if cached == 0 { 8 } else { cached }
     }
 
-    fn row_matches_filter(&self, row: &ConfigRow) -> bool {
-        let filter = self.filter.trim().to_lowercase();
-        if filter.is_empty() {
+    /// The lowercased search terms for the current filter, computed once per
+    /// interaction instead of once per row per pass (#6213 T6).
+    fn filter_terms(&self) -> Vec<String> {
+        self.filter
+            .trim()
+            .to_lowercase()
+            .split_whitespace()
+            .map(str::to_string)
+            .collect()
+    }
+
+    fn row_matches_filter(&self, row: &ConfigRow, terms: &[String]) -> bool {
+        if terms.is_empty() {
             return true;
         }
 
@@ -2733,7 +2743,7 @@ impl ConfigView {
         let scope_en = row.scope.label(Locale::En).to_lowercase();
         let hint = config_hint_for_key(self.locale, &row.key).to_lowercase();
 
-        filter.split_whitespace().all(|term| {
+        terms.iter().all(|term| {
             section.contains(term)
                 || section_en.contains(term)
                 || category_label.contains(term)
@@ -2750,11 +2760,12 @@ impl ConfigView {
 
     fn matching_row_indices(&self) -> Vec<usize> {
         let filtering = !self.filter.is_empty();
+        let terms = self.filter_terms();
         self.rows
             .iter()
             .enumerate()
             .filter_map(|(idx, row)| {
-                (self.row_matches_filter(row) && (filtering || self.category.contains(row)))
+                (self.row_matches_filter(row, &terms) && (filtering || self.category.contains(row)))
                     .then_some(idx)
             })
             .collect()
@@ -2765,8 +2776,9 @@ impl ConfigView {
         let mut current_section = None;
         let filtering = !self.filter.is_empty();
 
+        let terms = self.filter_terms();
         for (idx, row) in self.rows.iter().enumerate() {
-            if !self.row_matches_filter(row) {
+            if !self.row_matches_filter(row, &terms) {
                 continue;
             }
             // The rail category filters rows unless the user is searching.
