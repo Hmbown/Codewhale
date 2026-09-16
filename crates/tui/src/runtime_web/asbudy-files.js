@@ -44,6 +44,8 @@
     '.f-node .f-ic{flex:none;color:var(--text-soft);width:13px;text-align:center}',
     '.f-node .f-nm{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis}',
     '.f-node .f-sz{flex:none;color:var(--text-faint);font-size:12.5px}',
+    // 固定文件夹的中文小注（老板 2026-09-16：客户看不懂 data / public）
+    '.f-node .f-note{flex:none;color:var(--text-faint);font-size:12px;border:1px solid var(--line);border-radius:3px;padding:0 3px;line-height:1.5}',
     '.f-node .f-tag{flex:none;color:var(--text-faint);font-size:12.5px;border:1px solid var(--line);border-radius:3px;padding:0 3px;line-height:1.5}',
     '.f-node .f-del{flex:none;color:#c9ccd0;padding:0 3px}',
     '.f-node .f-del:hover{color:#f85149}',
@@ -230,7 +232,7 @@
       projSig = sig;
       body.innerHTML = '';
       if (!d.files || !d.files.length) { body.innerHTML = '<span class="f-empty">（空目录）</span>'; return; }
-      for (var i = 0; i < d.files.length; i++) body.appendChild(render(d.files[i], false));
+      for (var i = 0; i < d.files.length; i++) body.appendChild(render(d.files[i], false, true));
     } catch (e) { if (projSig === null) body.innerHTML = '<span class="f-empty">加载失败</span>'; }
   }
 
@@ -351,11 +353,23 @@
     } catch (e) { box.hidden = true; }
   }
 
-  function render(f, isMine) {
+  // 项目里几个**固定文件夹**的中文小注（2026-09-16 老板：「data、public 这些是什么？」）——
+  //   客户不懂技术，光看 `public` / `data` 一脸问号。只标**顶层**（递归下去不标，否则满屏小字），
+  //   表里没有的目录不硬凑（AI 新建的目录它自己会解释）。
+  var DIR_NOTES = {
+    '产出': '成品',
+    'public': '网页',
+    'data': '数据',
+    'src': '代码',
+    'lib': '代码'
+  };
+  function render(f, isMine, top) {
     var w = document.createElement('div');
     if (f.isDir) {
       var h = document.createElement('div'); h.className = 'f-node dir';
-      h.innerHTML = '<span class="f-ic">▸</span><span class="f-nm">' + aEsc(f.name) + '</span>' +
+      var note = (top && DIR_NOTES[f.name])
+        ? '<span class="f-note">' + DIR_NOTES[f.name] + '</span>' : '';
+      h.innerHTML = '<span class="f-ic">▸</span><span class="f-nm">' + aEsc(f.name) + '</span>' + note +
         (isMine ? '<span class="f-del" title="删掉整个文件夹">×</span>' : '');
       var kids = document.createElement('div'); kids.className = 'f-kids'; kids.style.display = 'none';
       h.onclick = function (ev) {
@@ -377,7 +391,7 @@
             });
         };
       }
-      for (var i = 0; i < (f.children || []).length; i++) kids.appendChild(render(f.children[i], isMine));
+      for (var i = 0; i < (f.children || []).length; i++) kids.appendChild(render(f.children[i], isMine, false));
       // 空文件夹：展开后给一行「（空文件夹）」，否则点了箭头没有任何视觉反馈，用户会以为折叠坏了
       if (!(f.children || []).length) {
         var emp = document.createElement('div');
