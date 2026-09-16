@@ -5,6 +5,9 @@
   if (!host) return;
   host.hidden = false;   // 骨架默认 hidden（避免脚本没加载时显示「加载中…」），脚本跑起来才露出来
   var pkey = host.getAttribute('data-pkey') || '';
+  // 项目预览的地址由门卫给（预览子域名 + 短期票）——
+  //   为什么不自拼 /_pv/：客户的内容要住到另一个门牌号下，跟控制台不同源（2026-09-16）。
+  var previewUrl = host.getAttribute('data-preview-url') || '';
   var projKind = host.getAttribute('data-kind') || 'proxy';   // proxy = 系统页面 | artifacts = 工作台（看文件内容）
   var body = document.getElementById('asbudy-files-body');        // 「项目文件」卡片内容区
   var mineBody = document.getElementById('asbudy-mine-body');     // 「我的资料」卡片内容区
@@ -724,7 +727,7 @@
     if (projKind === 'proxy') {
       // 客户项目：右栏 iframe 跑系统页面
       if (frame) {
-        var want = '/_pv/' + encodeURIComponent(pkey) + '/';
+        var want = previewUrl || ('/_pv/' + encodeURIComponent(pkey) + '/');
         if (frame.getAttribute('data-pkey') !== pkey) {
           frame.src = want;
           frame.setAttribute('data-pkey', pkey);
@@ -749,7 +752,7 @@
     var frame = frameEl();
     var fileBox = document.getElementById('preview-file');
     if (projKind === 'proxy' && frame) {
-      var want = '/_pv/' + encodeURIComponent(pkey) + '/';
+      var want = previewUrl || ('/_pv/' + encodeURIComponent(pkey) + '/');
       if (frame.getAttribute('data-pkey') !== pkey) {
         frame.src = want;
         frame.setAttribute('data-pkey', pkey);
