@@ -95,14 +95,93 @@
   (function () {
     var prev = window.fetch;
     window.fetch = function (url, opt) {
+      var u = '';
       try {
-        var u = typeof url === 'string' ? url : ((url && url.url) || '');
+        u = typeof url === 'string' ? url : ((url && url.url) || '');
         var m = u.match(/\/v1\/threads\/([^\/?]+)/);
         if (m && m[1] && m[1] !== 'summary') MODEL_THREAD = m[1];
       } catch (e) {}
-      return prev.apply(this, arguments);
+      var p = prev.apply(this, arguments);
+      // 发消息被拒（400）→ 十有八九是这条对话里有「没写完的那一轮」
+      // （实测：工具调用出事时留个空洞，之后整段历史都不合法 → provider 报 400，
+      //  连「压缩」也跟着失败）。官方前端只会把英文报错现出来，客户看不懂 ——
+      // 我们认出来，直接给一个「换一条干净的对话」的按钮（2026-09-16 老板：不能每次都人工救）。
+      try {
+        if (/\/v1\/threads\/[^/]+\/turns/.test(u) && p && p.then) {
+          p.then(function (r) { if (r && r.status >= 400) showFixBar(); }).catch(function () {});
+        }
+      } catch (e) {}
+      return p;
     };
   })();
+
+  /* ── 对话坏了 → 给一个自己就能点的「修好」──
+   * 为什么不做成自动静默修：换过去之后历史不在（实测），客户得知道
+   * 「刚才那条对话不在了、这是新的一条」——矞着换过去比报错更吓人。
+   * ⚠️ 检测方式：教训（2026-09-16）——原本想拦 HTTP 400，实测**拦不到**：
+   *   失败是引擎在事件流里推的（界面上那个「Error · Failed」），HTTP 反而是 201。
+   *   所以改成**主动查**：定时问门卫「当前这条对话里有 failed 轮次吗」（不用等她再碰一次）。 */
+  function showFixBar() {
+    if (document.getElementById('asbudy-fixbar')) return;
+    var st = document.createElement('style');
+    st.textContent = '#asbudy-fixbar{position:fixed;left:50%;transform:translateX(-50%);top:64px;z-index:99998;'
+      + 'display:flex;align-items:center;gap:12px;max-width:92vw;padding:10px 16px;border-radius:10px;'
+      + 'background:#3a2a10;border:1px solid #9e6a03;color:#e6edf3;font-size:13.5px;line-height:1.5;'
+      + 'box-shadow:0 8px 28px rgba(0,0,0,.55)}'
+      + '#asbudy-fixbar button{flex:none;font:inherit;font-size:13.5px;font-weight:600;color:#fff;background:#238636;'
+      + 'border:0;border-radius:7px;padding:7px 13px;cursor:pointer}'
+      + '#asbudy-fixbar button:hover{background:#2ea043}'
+      + '#asbudy-fixbar button:disabled{opacity:.6;cursor:default}';
+    document.head.appendChild(st);
+    var bar = document.createElement('div');
+    bar.id = 'asbudy-fixbar';
+    bar.innerHTML = '<span>这条对话出了一点问题（有一处记录没写完）。这个项目的文件、代码、数据都没事。</span>'
+      + '<button type="button" id="asbudy-fixbar-go">换一条干净的对话，继续</button>';
+    document.body.appendChild(bar);
+    var btn = bar.querySelector('#asbudy-fixbar-go');
+    btn.onclick = function () {
+      if (!MODEL_THREAD) { btn.textContent = '先随便说一句再来'; return; }
+      btn.disabled = true;
+      btn.textContent = '正在修…';
+      fetch('/_gate/thread-repair', {
+        method: 'POST', credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ thread: MODEL_THREAD }),
+      }).then(function (r) { return r.json().catch(function () { return {}; }); }).then(function (j) {
+        if (!j || !j.ok) {
+          btn.disabled = false;
+          btn.textContent = '没修成，再试一次';
+          alert((j && j.error) || '没修成');
+          return;
+        }
+        if (j.needRepair === false) {
+          btn.disabled = false;
+          btn.textContent = '再试一次';
+          alert('这条对话本身没问题 —— 可能是网络抖了一下，直接再发一次就行');
+          return;
+        }
+        location.href = '/';    // 刷新 → 打开的就是刚换出来的那条干净对话
+      }).catch(function (e) {
+        btn.disabled = false;
+        btn.textContent = '没修成，再试一次';
+        alert('没修成：' + ((e && e.message) || e));
+      });
+    };
+  }
+
+  // 主动体检：当前这条对话有没有 failed 轮次（有就提示「修好继续」）
+  var FIX_CHECKING = false;
+  function checkThreadHealth() {
+    if (FIX_CHECKING || !MODEL_THREAD || document.getElementById('asbudy-fixbar')) return;
+    FIX_CHECKING = true;
+    fetch('/_gate/thread-repair?thread=' + encodeURIComponent(MODEL_THREAD), { credentials: 'same-origin' })
+      .then(function (r) { return r.json().catch(function () { return {}; }); })
+      .then(function (j) { if (j && j.needRepair) showFixBar(); })
+      .catch(function () {})
+      .then(function () { FIX_CHECKING = false; });
+  }
+  setInterval(checkThreadHealth, 15000);
+  setTimeout(checkThreadHealth, 5000);
 
   /* ── 模型小标签可点（对话区上方的「模型: xxx」——比藏在菜单里好找）──
    * ⚠️ 2026-09-15 重写：以前写死三个名字写进 m0/.env，而**没有任何在跑的代码读那份 .env**
