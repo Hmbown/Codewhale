@@ -1162,13 +1162,23 @@
     });
   }
 
-  /* ── 高级设置（git 远程 / 详细度 / 只看不改 / 花费） ── */
+  /* ── 高级设置（git 远程 / 它干活的方式 / 看得见什么 / 只看不改 / 花费）──
+   * 这些开关走**官方 `POST /v1/config`**（引擎以 `cus-<项目>` 身份跑，自己写自己的配置）——
+   * 不需要平台介入、**不需要 sudo**。可写键受官方白名单限制（写错键时接口会列出全部键）。
+   * ⚠️ 官方**故意**不让 API 写密钥（安全设计）→ 模型密钥那条仍走门卫 + root 帮手。
+   * ⚠️ 「过程多详细（折叠几行）」= `thinking_preview_lines`，**不在白名单里**；
+   *    老做法直接写 `settings.toml` —— 那份属 `cus-<项目>`，门卫（ubuntu）写不进去（EACCES）。
+   *    → 已换成下面两个客户看得懂的开关（看得见它在想什么 / 默认摊开），不再碰那个文件。
+   */
   function openAdvanced() {
     openLayer('高级设置', function (body) {
       body.innerHTML = '<div id="ab-adv">加载中…</div>';
-      Promise.all([api('/_gate/advanced'), api('/_gate/model-key')]).then(function (rs) {
+      Promise.all([api('/_gate/advanced'), api('/_gate/model-key'), api('/v1/config')]).then(function (rs) {
         var r = rs[0];
         var mk = rs[1].body || {};
+        var cfg = (rs[2] && rs[2].body) || {}
+        var am = cfg.approval_mode || 'suggest';   // suggest=每步先问 / auto=小的自己做 / bypass=全放行
+        var cur = cfg.cost_currency === 'cny' ? 'cny' : 'usd';
         var el = body.querySelector('#ab-adv');
         if (!el) return;
         if (!r.ok) {
@@ -1184,8 +1194,24 @@
           '</span><button class="ab-btn ghost sm" id="adv-mk" type="button" style="flex:0 0 auto">改</button></div>' +
           '<div class="ab-row"><label>代码存哪</label><input class="ab-input" id="adv-git" placeholder="git@gitee.com:某人/仓库.git" value="' + esc(d.gitRemote || '') + '"></div>' +
           '<div style="display:flex;gap:8px;margin:-2px 0 14px 78px"><button class="ab-btn ghost sm" id="adv-git-save" type="button">保存</button><button class="ab-btn ghost sm" id="adv-git-clear" type="button">清空</button></div>' +
-          '<div class="ab-row"><label>过程多详细</label><input class="ab-input" id="adv-lines" type="number" min="0" max="50" value="' + (d.thinkLines != null ? d.thinkLines : 3) + '" style="max-width:110px"><span style="color:#8b949e;font-size:13.5px">折叠时显示几行</span></div>' +
-          '<div style="margin:-2px 0 14px 78px"><button class="ab-btn ghost sm" id="adv-lines-save" type="button">保存</button></div>' +
+          '<div style="margin:14px 0 6px;color:#e6edf3;font-size:14px">它动手前</div>' +
+          '<div class="ab-row"><label>审批方式</label><select class="ab-input" id="adv-approval">' +
+            '<option value="suggest"' + (am === 'suggest' ? ' selected' : '') + '>每步都先问我（默认）</option>' +
+            '<option value="auto"' + (am === 'auto' ? ' selected' : '') + '>小的自己做，拿不准才问我</option>' +
+            '<option value="bypass"' + (am === 'bypass' ? ' selected' : '') + '>全部自己做，不问</option>' +
+          '</select></div>' +
+          '<div class="ab-tip" style="margin:-4px 0 10px 78px">选「全部自己做」之后，它改文件、跑命令就不再问你 —— 拿不准就保持默认。</div>' +
+          '<div style="margin:14px 0 6px;color:#e6edf3;font-size:14px">看得见什么</div>' +
+          '<label class="ab-chk"><input type="checkbox" id="adv-think"' + (cfg.show_thinking ? ' checked' : '') + '> 看得见它在想什么</label>' +
+          '<label class="ab-chk"><input type="checkbox" id="adv-think-exp"' + (cfg.thinking_default_expanded ? ' checked' : '') + '> 思考过程默认摊开（不用点一下）</label>' +
+          '<label class="ab-chk"><input type="checkbox" id="adv-tools"' + (cfg.show_tool_details ? ' checked' : '') + '> 看得见它动了哪些文件、跑了什么</label>' +
+          '<label class="ab-chk"><input type="checkbox" id="adv-calm"' + (cfg.calm_mode ? ' checked' : '') + '> 安静模式（少啰嗦，细节收得更紧）</label>' +
+          '<label class="ab-chk"><input type="checkbox" id="adv-compact"' + (cfg.auto_compact ? ' checked' : '') + '> 聊天太长时自动帮我整理前面</label>' +
+          '<div class="ab-tip" style="margin:2px 0 10px 0">自动整理会把前面的内容总结掉 —— 细节会丢一部分（默认开）。</div>' +
+          '<div class="ab-row"><label>花费用</label><select class="ab-input" id="adv-currency">' +
+            '<option value="cny"' + (cur === 'cny' ? ' selected' : '') + '>人民币 ￥</option>' +
+            '<option value="usd"' + (cur === 'usd' ? ' selected' : '') + '>美元 $</option>' +
+          '</select></div>' +
           '<label class="ab-chk"><input type="checkbox" id="adv-ro"' + (d.previewReadOnly ? ' checked' : '') + '> 只看不改（防误删）</label>' +
           '<div style="margin:14px 0 6px;color:#e6edf3;font-size:14px">花了多少</div>' +
           (u
@@ -1198,10 +1224,50 @@
             if (r2.ok) msg(msgEl, '已保存', true); else msg(msgEl, (r2.body && r2.body.error) || '保存失败', false);
           });
         }
+        /* 配置项：官方 POST /v1/config（persist 才写盘）→ 再 reload 让它生效。
+         * reload 官方说明：**新的一轮对话**采用新配置，不影响正在跑的那轮。 */
+        function setCfg(key, value) {
+          return api('/v1/config', {
+            method: 'POST',
+            body: JSON.stringify({ key: key, value: String(value), persist: true }),
+          }).then(function (r2) {
+            if (!r2.ok) {
+              var e = (r2.body && r2.body.error) || '保存失败';
+              msg(msgEl, '没设置成：' + (e.message || e), false);
+              return false;
+            }
+            return api('/v1/config/reload', { method: 'POST' }).then(function () {
+              msg(msgEl, '已保存', true);
+              return true;
+            });
+          });
+        }
+        function bindChk(id, key) {
+          var box = el.querySelector('#' + id);
+          if (!box) return;
+          box.onchange = function () {
+            box.disabled = true;
+            setCfg(key, box.checked ? 'true' : 'false').then(function (good) {
+              box.disabled = false;
+              if (!good) box.checked = !box.checked;   // 没存成 → 拨回去，不骗人
+            });
+          };
+        }
+        function bindSel(id, key) {
+          var sel = el.querySelector('#' + id);
+          if (!sel) return;
+          sel.onchange = function () { sel.disabled = true; setCfg(key, sel.value).then(function () { sel.disabled = false; }); };
+        }
         el.querySelector('#adv-mk').onclick = openModelApiLoader;
         el.querySelector('#adv-git-save').onclick = function () { post({ gitRemote: el.querySelector('#adv-git').value }); };
         el.querySelector('#adv-git-clear').onclick = function () { el.querySelector('#adv-git').value = ''; post({ gitRemote: '' }); };
-        el.querySelector('#adv-lines-save').onclick = function () { post({ thinkLines: Number(el.querySelector('#adv-lines').value) }); };
+        bindSel('adv-approval', 'approval_mode');
+        bindChk('adv-think', 'show_thinking');
+        bindChk('adv-think-exp', 'thinking_default_expanded');
+        bindChk('adv-tools', 'show_tool_details');
+        bindChk('adv-calm', 'calm_mode');
+        bindChk('adv-compact', 'auto_compact');
+        bindSel('adv-currency', 'cost_currency');
         el.querySelector('#adv-ro').onchange = function (e) { post({ previewReadOnly: e.target.checked }); };
       });
     });
