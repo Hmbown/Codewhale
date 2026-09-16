@@ -226,9 +226,9 @@ fn theme_options_with_custom(
                 .help("Pick a theme with live preview")
                 .values(SettingValues::new(
                     Cow::Owned(current.clone()),
-                    // A reset returns to the underwater default, not a
+                    // A reset returns to the Shoreline default, not a
                     // detected palette that can repaint it.
-                    Cow::Borrowed("underwater"),
+                    Cow::Borrowed("shoreline"),
                     Cow::Borrowed(name),
                 ))
                 .availability(SettingAvailability::Available)
@@ -255,7 +255,7 @@ fn theme_options_with_custom(
                 .help("Pick a user-authored theme overlay")
                 .values(SettingValues::new(
                     Cow::Owned(current.clone()),
-                    Cow::Borrowed("underwater"),
+                    Cow::Borrowed("shoreline"),
                     Cow::Owned(custom.selector.clone()),
                 ))
                 .availability(SettingAvailability::Available)
@@ -612,11 +612,11 @@ mod tests {
     #[test]
     fn enter_commits_with_persist_true() {
         let mut v = ThemePickerView::new("system".to_string());
-        v.handle_key(key(KeyCode::Char('8'))); // -> CatppuccinMocha
+        v.handle_key(key(KeyCode::Char('9'))); // -> Grayscale
         let action = v.handle_key(key(KeyCode::Enter));
         match action {
             ViewAction::EmitAndClose(ViewEvent::ThemeSelectionUpdated { theme, persist }) => {
-                assert_eq!(theme, ThemeId::CatppuccinMocha.name());
+                assert_eq!(theme, ThemeId::Grayscale.name());
                 assert!(persist);
             }
             other => panic!("expected commit, got {other:?}"),
@@ -706,11 +706,11 @@ mod tests {
     }
 
     #[test]
-    fn digit_jumps_to_underwater_and_previews() {
+    fn digit_jumps_to_shoreline_and_previews() {
         let mut v = ThemePickerView::new("system".to_string());
         let action = v.handle_key(key(KeyCode::Char('3')));
-        // Underwater follows System and Terminal.
-        assert_eq!(selected_values(&action), Some(("underwater", false)));
+        // Shoreline follows System and Terminal.
+        assert_eq!(selected_values(&action), Some(("shoreline", false)));
     }
 
     #[test]

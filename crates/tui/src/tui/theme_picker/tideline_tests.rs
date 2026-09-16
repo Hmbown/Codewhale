@@ -7,8 +7,8 @@ use crate::tui::golden_harness::render_golden_text;
 use codewhale_palette::SELECTABLE_THEMES;
 
 #[test]
-fn theme_rows_are_the_fourteen_selectable_themes() {
-    assert_eq!(tideline_theme_rows().len(), 15);
+fn theme_rows_are_the_seventeen_selectable_themes() {
+    assert_eq!(tideline_theme_rows().len(), 17);
     assert_eq!(tideline_theme_rows().as_slice(), SELECTABLE_THEMES);
 }
 

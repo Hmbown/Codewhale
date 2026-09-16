@@ -10404,7 +10404,7 @@ context_window = 262144
             "Enter must open the theme editor"
         );
 
-        // ↓ highlights underwater: preview (persist:false), editor stays open.
+        // ↓ highlights shoreline: preview (persist:false), editor stays open.
         match key(&mut view, KeyCode::Down) {
             ViewAction::Emit(ViewEvent::ConfigUpdated {
                 key,
@@ -10412,7 +10412,7 @@ context_window = 262144
                 persist,
             }) => {
                 assert_eq!(key, "theme");
-                assert_eq!(value, "underwater");
+                assert_eq!(value, "shoreline");
                 assert!(!persist, "highlighting must not persist");
             }
             other => panic!("highlight must preview, got {other:?}"),
@@ -10454,7 +10454,7 @@ context_window = 262144
                 persist,
             }) => {
                 assert_eq!(key, "theme");
-                assert_eq!(value, "underwater");
+                assert_eq!(value, "shoreline");
                 assert!(persist, "Apply must persist");
             }
             other => panic!("enter must persist the highlight, got {other:?}"),
@@ -10529,14 +10529,14 @@ context_window = 262144
                 modifiers: KeyModifiers::NONE,
             })
         };
-        // Choice index 2 is underwater (system, terminal, underwater, …).
+        // Choice index 2 is shoreline (system, terminal, shoreline, …).
         let (rect, _) = view
             .last_choice_hitboxes
             .borrow()
             .iter()
             .copied()
             .find(|(_, idx)| *idx == 2)
-            .expect("rendered underwater hitbox");
+            .expect("rendered shoreline hitbox");
         match hover(&mut view, rect.x, rect.y) {
             ViewAction::Emit(ViewEvent::ConfigUpdated {
                 key,
@@ -10544,7 +10544,7 @@ context_window = 262144
                 persist,
             }) => {
                 assert_eq!(key, "theme");
-                assert_eq!(value, "underwater");
+                assert_eq!(value, "shoreline");
                 assert!(!persist, "hover preview must not persist");
             }
             other => panic!("hover must preview, got {other:?}"),
