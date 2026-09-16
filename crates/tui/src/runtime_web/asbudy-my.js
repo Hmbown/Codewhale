@@ -95,6 +95,7 @@
   (function () {
     var prev = window.fetch;
     window.fetch = function (url, opt) {
+      var before = MODEL_THREAD;
       var u = '';
       try {
         u = typeof url === 'string' ? url : ((url && url.url) || '');
@@ -102,15 +103,14 @@
         if (m && m[1] && m[1] !== 'summary') MODEL_THREAD = m[1];
       } catch (e) {}
       var p = prev.apply(this, arguments);
-      // 发消息被拒（400）→ 十有八九是这条对话里有「没写完的那一轮」
-      // （实测：工具调用出事时留个空洞，之后整段历史都不合法 → provider 报 400，
-      //  连「压缩」也跟着失败）。官方前端只会把英文报错现出来，客户看不懂 ——
-      // 我们认出来，直接给一个「换一条干净的对话」的按钮（2026-09-16 老板：不能每次都人工救）。
+      // 发消息被拒 → 直接提示
       try {
-        if (/\/v1\/threads\/[^/]+\/turns/.test(u) && p && p.then) {
+        if (p && p.then && /\/v1\/threads\/[^/?]+\/turns/.test(u)) {
           p.then(function (r) { if (r && r.status >= 400) showFixBar(); }).catch(function () {});
         }
       } catch (e) {}
+      // 换了对话 → 立刻重体检（不能等 15 秒；也**不能把上一条的结论残留在新对话上**）
+      try { if (MODEL_THREAD !== before) setTimeout(checkThreadHealth, 1500); } catch (e) {}
       return p;
     };
   })();
@@ -169,14 +169,24 @@
     };
   }
 
-  // 主动体检：当前这条对话有没有 failed 轮次（有就提示「修好继续」）
+  function hideFixBar() {
+    var b = document.getElementById('asbudy-fixbar');
+    if (b) b.remove();
+  }
+
+  // 主动体检：当前这条对话有没有 failed 轮次（有就提示「修好继续」，好了就撤掉提示）
   var FIX_CHECKING = false;
   function checkThreadHealth() {
-    if (FIX_CHECKING || !MODEL_THREAD || document.getElementById('asbudy-fixbar')) return;
+    if (FIX_CHECKING || !MODEL_THREAD) return;
     FIX_CHECKING = true;
-    fetch('/_gate/thread-repair?thread=' + encodeURIComponent(MODEL_THREAD), { credentials: 'same-origin' })
+    var tid = MODEL_THREAD;
+    fetch('/_gate/thread-repair?thread=' + encodeURIComponent(tid), { credentials: 'same-origin' })
       .then(function (r) { return r.json().catch(function () { return {}; }); })
-      .then(function (j) { if (j && j.needRepair) showFixBar(); })
+      .then(function (j) {
+        if (tid !== MODEL_THREAD) return;    // 体检期间换了对话 → 这次结果作废，别播到别人头上
+        if (j && j.needRepair) showFixBar();
+        else hideFixBar();                   // ← 关键：没事就把黄条撒掉（以前漏了这步）
+      })
       .catch(function () {})
       .then(function () { FIX_CHECKING = false; });
   }
