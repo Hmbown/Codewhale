@@ -1688,7 +1688,12 @@ function startBrowserClient() {
     const rememberLabel = element("label", "remember-field");
     const remember = document.createElement("input");
     remember.type = "checkbox";
-    rememberLabel.append(remember, document.createTextNode("本会话记住此选择"));
+    rememberLabel.append(remember, document.createTextNode("这类操作以后不再问我"));
+    // ⚠️ 2026-09-16：原文案是「本会话记住此选择」—— 听着像「记住我这个选择」，
+    //   实际引擎收到 remember:true 后会把整条会话的 auto_approve 置为 true
+    //   （见 crates/tui/src/runtime_threads 的测试：“remember flag” → thread.auto_approve），
+    //   也就是**以后全自动、再也不弹**。不懂电脑的客户根本想不到这层。
+    rememberLabel.title = '勾上并点 Allow：这条对话里这类操作以后直接执行、不再弹审批';
     const deny = element("button", "quiet-button danger", "Deny");
     deny.type = "button";
     deny.addEventListener("click", () => resolveApproval(approvalId, "deny", remember.checked));
