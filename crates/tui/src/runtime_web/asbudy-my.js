@@ -473,6 +473,27 @@
     });
   }
 
+  /* ── 界面版本标记（2026-09-16）─────────────────────────────────────────
+   * 为什么要有这个东西：老板报「AI 回复字很大」，我在服务器上用真浏览器量了是正常的，
+   * 两边来回扯不清 —— 根子在于**没法确认他浏览器里跑的到底是哪一版界面**
+   * （缓存 / 装成桌面应用 / 没刷新，这些都看不出来）。
+   * 侧栏底部显示一行带时间的版本号：他一看就知道自己加载的是不是最新，我们也别再猜。
+   * ⚠️ 改完界面文件顺手把 UI_BUILD 改掉（就下面这一行）。
+   */
+  var UI_BUILD = '2026-09-16 16:40';
+  function abStampVersion() {
+    var foot = document.querySelector('.rail-footer') || document.querySelector('.rail');
+    if (!foot || document.getElementById('asbudy-version')) return;
+    var el = document.createElement('div');
+    el.id = 'asbudy-version';
+    el.textContent = '界面版本 ' + UI_BUILD;
+    el.style.cssText = 'font-size:12px;opacity:.6;margin-top:8px;letter-spacing:.02em';
+    el.title = '这是你浏览器里这份界面的版本时间。若不是最新的，按 Ctrl+Shift+R 强制刷新。';
+    foot.appendChild(el);
+  }
+  setTimeout(abStampVersion, 1500);
+  setInterval(abStampVersion, 5000);
+
   /* ── 员工管理 ── */
   function openStaff(owner) {
     // 管理员点进来 = 管平台自己的员工。要看某个客户的员工，「客户管理」那张卡上就有「看员工」
