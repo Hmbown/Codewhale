@@ -545,7 +545,12 @@ mod tests {
                 "https://api.commandcode.ai/provider/v1",
                 "COMMAND_CODE_API_KEY",
             ),
-            ("aicraft", AICRAFT_TEMPLATE_ID, AICRAFT_BASE_URL, AICRAFT_API_KEY_ENV),
+            (
+                "aicraft",
+                AICRAFT_TEMPLATE_ID,
+                AICRAFT_BASE_URL,
+                AICRAFT_API_KEY_ENV,
+            ),
         ] {
             let template = provider_setup_template(alias).unwrap_or_else(|| panic!("{alias}"));
             assert_eq!(template.id, id);
