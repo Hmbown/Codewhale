@@ -775,17 +775,33 @@
     if (!shell || !pane) return;
     var startX = e.clientX;
     var startW = pane.getBoundingClientRect().width;
+    // ⚠️ 关键（2026-09-16 老板：向右拖动收窄不行）：
+    //   往右拖时鼠标会**落进右栏的 iframe**，而 iframe 会把 mousemove 吃掉 →
+    //   父页面收不到移动 → 拖动卡死（往左是进对话区，普通 DIV，所以看着“能变宽不能收窄”）。
+    //   所以拖动期间先把 iframe 的鼠标事件关掉，松手再恢复。
+    var frames = document.querySelectorAll('#preview-pane iframe');
+    Array.prototype.forEach.call(frames, function (f) { f.style.pointerEvents = 'none'; });
+    var prevUserSelect = document.body.style.userSelect;
+    document.body.style.userSelect = 'none';      // 顺手别选中文字
+    function stopFrames() {
+      Array.prototype.forEach.call(frames, function (f) { f.style.pointerEvents = ''; });
+      document.body.style.userSelect = prevUserSelect;
+    }
     function move(ev) {
       var w = startW - (ev.clientX - startX);
+      // 下限跟 CSS 的 minmax(260px, …) 保持一致 —— 两处不一样会让「最窄能拖到哪」对不上
       w = Math.max(260, Math.min(window.innerWidth - 420, w));
       shell.style.setProperty('--preview-width', w + 'px');
     }
     function up() {
       document.removeEventListener('mousemove', move);
       document.removeEventListener('mouseup', up);
+      window.removeEventListener('blur', up);
+      stopFrames();
     }
     document.addEventListener('mousemove', move);
     document.addEventListener('mouseup', up);
+    window.addEventListener('blur', up);          // 拖到一半切走窗口也不能卡住
   });
 
   // 所见即所得：PC（宽屏）进来默认分栏；手机（窄屏）默认对话，点文件才开预览

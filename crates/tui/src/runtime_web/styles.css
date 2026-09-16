@@ -131,7 +131,9 @@ summary:focus-visible {
 
 /* ── 预览栏（三栏右侧）── 门卫脚本给 .shell 加 has-preview 才出现（官方独立跑时不受影响） */
 .shell.has-preview {
-  grid-template-columns: var(--rail) minmax(0, 1fr) minmax(280px, var(--preview-width, 34vw));
+  /* 下限 260px 必须与 asbudy-files.js 里拖拽的 Math.max(260, …) 一致 ——
+     两边不一样时会出现「JS 算 260、CSS 却按 280 显示」的对不上（2026-09-16） */
+  grid-template-columns: var(--rail) minmax(0, 1fr) minmax(260px, var(--preview-width, 34vw));
 }
 
 .preview-pane {
