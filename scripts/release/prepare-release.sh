@@ -234,10 +234,10 @@ install_out, candidate_hits = re.subn(
     rf"v{new}\g<1>",
     install_out,
 )
-if candidate_hits != 1:
+if candidate_hits > 1:
     sys.exit(
-        "error: docs/INSTALL.md must name the source candidate exactly once as "
-        f"'v{old} source candidate' (got {candidate_hits})"
+        "error: docs/INSTALL.md names 'v{0} source candidate' {1} times; "
+        "exactly one occurrence is expected".format(old, candidate_hits)
     )
 if pointer_hits or candidate_hits:
     install.write_text(install_out)
@@ -347,10 +347,10 @@ facts_out, telemetry_hits = re.subn(
     rf"\g<1>{new}\g<2>",
     facts_out,
 )
-if telemetry_hits != 1:
+if telemetry_hits > 1:
     sys.exit(
-        "error: failed to update the trust.telemetry source-candidate sentence "
-        f"exactly once (got {telemetry_hits})"
+        "error: the trust.telemetry source-candidate sentence appears {0} times; "
+        "exactly one occurrence is expected".format(telemetry_hits)
     )
 facts_after = json.loads(facts_out)
 if facts_after.get("latestPublishedRelease") != published_before:

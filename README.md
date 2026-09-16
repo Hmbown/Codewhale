@@ -22,7 +22,7 @@ agents with different models and roles.
   <img src="web/public/codewhale-tui-171acee.png" alt="A Codewhale terminal session" width="720">
 </picture>
 
-*Terminal preview from a recent development build.*
+*Terminal preview from a v0.9.12 development build.*
 
 ## Install
 
