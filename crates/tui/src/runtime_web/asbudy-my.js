@@ -236,12 +236,12 @@
     document.head.appendChild(st);
     var bar = document.createElement('div');
     bar.id = 'asbudy-fixbar';
-    bar.innerHTML = '<span>这条对话出了一点问题（有一处记录没写完）。这个项目的文件、代码、数据都没事。</span>'
-      + '<button type="button" id="asbudy-fixbar-go">换一条干净的对话，继续</button>';
+    bar.innerHTML = '<span>此对话出现异常（有一处记录未完成）。项目文件、代码与数据均未受影响。</span>'
+      + '<button type="button" id="asbudy-fixbar-go">开启新对话继续</button>';
     document.body.appendChild(bar);
     var btn = bar.querySelector('#asbudy-fixbar-go');
     btn.onclick = function () {
-      if (!MODEL_THREAD) { btn.textContent = '先随便说一句再来'; return; }
+      if (!MODEL_THREAD) { btn.textContent = '请先输入一条消息'; return; }
       btn.disabled = true;
       btn.textContent = '正在修…';
       fetch('/_gate/thread-repair', {
@@ -258,7 +258,7 @@
         if (j.needRepair === false) {
           btn.disabled = false;
           btn.textContent = '再试一次';
-          alert('这条对话本身没问题 —— 可能是网络抖了一下，直接再发一次就行');
+          alert('对话未受损 —— 可能是网络波动，请重试');
           return;
         }
         location.href = '/';    // 刷新 → 打开的就是刚换出来的那条干净对话
@@ -310,19 +310,19 @@
   }
   function openModelPicker() {
     var tid = MODEL_THREAD;
-    if (!tid) { alert('先在左边点开一个会话，再换模型'); return; }
+    if (!tid) { alert('请先选择一个会话'); return; }
     api('/v1/providers').then(function (r) {
       var all = (r.body && r.body.providers) || [];
       var ready = all.filter(function (p) { return p && p.id && p.credentialState === 'configured'; });
       var cur = (r.body && r.body.current) || '';
-      if (!ready.length) { alert('引擎里还没有配好密钥的模型提供商'); return; }
+      if (!ready.length) { alert('尚未配置任何模型服务'); return; }
       api('/v1/threads/' + encodeURIComponent(tid)).then(function (tr) {
         var body = tr.body || {};
         var th = body.thread || body;          // ⚠️ 详情接口把 thread 包在 .thread 里（列表才是裸数组）
         var thProvider = String(th.model_provider_id || th.model_provider || '');
         var thModel = String(th.model || '');
         openLayer('换个模型', function (body) {
-          body.innerHTML = '<div class="ab-tip" id="mp-tip">选中的模型，这一轮对话就开始用。</div>' +
+          body.innerHTML = '<div class="ab-tip" id="mp-tip">所选模型将应用于当前对话。</div>' +
             '<div id="mp-list"><div class="ab-tip">正在读模型目录…</div></div>' +
             '<div class="ab-msg" id="mp-msg"></div>';
           var list = body.querySelector('#mp-list');
@@ -339,7 +339,7 @@
               return head + g.models.map(function (m) {
                 var on = m.id === thModel;
                 var sub = [];
-                if (!same) sub.push('换提供商要新建会话');
+                if (!same) sub.push('切换服务商需新建会话');
                 if (m.image_input === 'supported') sub.push('可看图');
                 return '<button class="ab-menu-item" data-m="' + esc(m.id) + '" data-p="' + esc(g.p.id) + '"' +
                   (same ? '' : ' style="opacity:.6"') + '>' + esc(m.id) + (on ? '（当前）' : '') +
@@ -350,7 +350,7 @@
               b.onclick = function () {
                 var mid = b.getAttribute('data-m');
                 var pid = b.getAttribute('data-p');
-                if (thProvider && pid !== thProvider) { msg(msgEl, '换提供商要新建会话（当前会话在 ' + thProvider + '）', false); return; }
+                if (thProvider && pid !== thProvider) { msg(msgEl, '切换服务商需新建会话（当前会话在 ' + thProvider + '）', false); return; }
                 api('/v1/threads/' + encodeURIComponent(tid), { method: 'PATCH', body: JSON.stringify({ model: mid }) })
                   .then(function (r2) {
                     if (!r2.ok) { msg(msgEl, (r2.body && r2.body.error) || '换不了', false); return; }
@@ -398,7 +398,7 @@
       if (c.getAttribute('data-asbudy-model')) continue;
       if (String(c.textContent || '').indexOf('模型') !== 0) continue;
       c.setAttribute('data-asbudy-model', '1');
-      c.title = '点这里换模型';
+      c.title = '切换模型';
       c.addEventListener('click', openModelPicker);
     }
   }
@@ -435,8 +435,8 @@
       var st = r.body || {};
       openLayer('平台协助', function (body) {
         var on = !!st.granted;
-        var html = '<div class="ab-tip">平台要替你排查问题时，需要先「以你的视角」进来（看到的就是你这个界面）。<br>' +
-          '<b>只有你能开这个开关，管理员不能替你开</b>；开了随时可以关。</div>';
+        var html = '<div class="ab-tip">平台协助排查问题时，需以你的视角进入（看到的就是你当前的界面）。<br>' +
+          '<b>仅你可开启此开关，管理员无法代开</b>；可随时关闭。</div>';
         html += '<div style="margin:12px 0 14px;padding:10px 12px;border:1px solid ' + (on ? '#3fb950' : '#30363d') +
           ';border-radius:8px">当前状态：<b style="color:' + (on ? '#3fb950' : '#8b949e') + '">' +
           (on ? '已开启' : '未开启') + '</b>' +
@@ -596,7 +596,7 @@
         function refresh() {
           api('/_gate/staff' + q).then(function (r) {
             staff = (r.body && r.body.staff) || [];
-            if (!staff.length) { listEl.innerHTML = '<div class="ab-tip">还没有员工。</div>'; return; }
+            if (!staff.length) { listEl.innerHTML = '<div class="ab-tip">暂无员工。</div>'; return; }
             listEl.innerHTML = '';
             staff.forEach(function (s) {
               var card = document.createElement('div'); card.className = 'ab-card';
@@ -616,7 +616,7 @@
               bEdit.onclick = function () { openStaffForm(s, owner, projects, staff, reopen); };
               var bDel = document.createElement('button'); bDel.className = 'ab-btn danger sm'; bDel.type = 'button'; bDel.textContent = '删除';
               bDel.onclick = function () {
-                if (!confirm('删掉员工「' + (s.name || s.user) + '」？\nta 建的项目会转回你名下（项目本身不删）。')) return;
+                if (!confirm('删除员工「' + (s.name || s.user) + '」？\n其创建的项目将转回你名下（项目本身保留）。')) return;
                 api('/_gate/staff', { method: 'DELETE', body: JSON.stringify({ user: s.user }) }).then(function (r) {
                   if (r.ok) { refresh(); } else { alert(r.body.error || '删除失败'); }
                 });
@@ -645,15 +645,15 @@
           : '<div class="ab-row"><label>登录账号</label><input class="ab-input" id="f-user" value="' + esc(rec.user) + '" disabled></div>') +
         '<div class="ab-row"><label>名字</label><input class="ab-input" id="f-name" placeholder="显示用，如「小王」" value="' + (isNew ? '' : esc(rec.name || '')) + '"></div>' +
         '<div class="ab-row"><label>密码</label><input class="ab-input" id="f-pw" type="password" placeholder="' + (isNew ? '至少 8 位' : '留空 = 不改') + '"></div>' +
-        '<div class="ab-row"><label>项目额度</label><input class="ab-input" id="f-quota" type="number" min="0" max="50" value="' + (isNew ? 2 : esc(rec.quota)) + '" style="max-width:110px"><span style="color:#8b949e;font-size:13.5px">最多能自己建几个项目</span></div>' +
+        '<div class="ab-row"><label>项目额度</label><input class="ab-input" id="f-quota" type="number" min="0" max="50" value="' + (isNew ? 2 : esc(rec.quota)) + '" style="max-width:110px"><span style="color:#8b949e;font-size:13.5px">可创建项目数上限</span></div>' +
         '<div class="ab-row"><label>资料空间</label><input class="ab-input" id="f-quotamb" type="number" min="0" placeholder="MB，留空 = 默认" value="' + (isNew || !rec.quotaMb ? '' : esc(rec.quotaMb)) + '" style="max-width:130px"><span style="color:#8b949e;font-size:13.5px">ta 能上传多少资料（不能超过你自己的）</span></div>' +
-        '<div style="margin:12px 0 6px;color:#e6edf3;font-size:14px">能看能操作的项目' + (isNew ? '（建完再分配也行）' : '') + '</div>' +
+        '<div style="margin:12px 0 6px;color:#e6edf3;font-size:14px">可访问的项目' + (isNew ? '（建完再分配也行）' : '') + '</div>' +
         '<div id="f-projs">' + (projects.length
           ? projects.map(function (p) {
               var on = !isNew && (rec.grants || []).indexOf(p.key) >= 0;
               return '<label class="ab-chk"><input type="checkbox" value="' + esc(p.key) + '"' + (on ? ' checked' : '') + '> ' + esc(p.name) + ' <span style="color:#8b949e;font-size:13.5px">（' + esc(p.key) + '）</span></label>';
             }).join('')
-          : '<div class="ab-tip">你名下还没有项目。</div>') + '</div>' +
+          : '<div class="ab-tip">名下暂无项目。</div>') + '</div>' +
         '<div style="display:flex;gap:8px;margin-top:16px"><button class="ab-btn" id="f-save" type="button">保存</button>' +
         '<button class="ab-btn ghost" id="f-cancel" type="button">取消</button></div>' +
         '<div class="ab-msg" id="f-msg"></div>';
@@ -695,7 +695,7 @@
   function openSpaceForm(u, onDone) {
     openLayer('设资料空间 —— ' + (u.name || u.user), function (body) {
       body.innerHTML =
-        '<div class="ab-tip">客户上传的资料、以及他回收站里占的空间，加起来不能超过这个数。<br>填写单位是 G；填 0 = 不限制。</div>' +
+        '<div class="ab-tip">客户上传的资料与回收站占用合计不得超过此值。<br>单位 G；0 表示不限制。</div>' +
         '<div class="ab-row"><label>资料空间</label><input class="ab-input" id="sp-g" type="number" min="0" step="0.5" value="'
           + (u.quotaMb ? (Math.round(u.quotaMb / 1024 * 10) / 10) : 1) + '" style="max-width:110px">'
           + '<span style="color:#8b949e;font-size:13.5px">G（当前已用 ' + fmtSpace(u.spaceMb || 0) + '）</span></div>' +
@@ -705,7 +705,7 @@
       body.querySelector('#sp-cancel').onclick = closeLayer;
       body.querySelector('#sp-save').onclick = function () {
         var g = Number(body.querySelector('#sp-g').value || 0);
-        if (!(g >= 0)) { msg('填个 0 或正数', msgEl); return; }
+        if (!(g >= 0)) { msg('请输入 0 或正数', msgEl); return; }
         api('/_gate/users', { method: 'POST', body: JSON.stringify({ user: u.user, quotaMb: Math.round(g * 1024) }) })
           .then(function (r) {
             if (!r.ok) { msg((r.body && r.body.error) || '保存失败', msgEl); return; }
@@ -796,13 +796,13 @@
   function openProjectsWith(owners) {
     var isAdmin = !!(ME && ME.role === 'admin');
     openLayer('项目管理', function (body) {
-      body.innerHTML = '<div class="ab-tip">「暂停」= 停掉引擎、释放内存（每个项目约 50~270MB），暂停期间别人访问会看到提示而不是偷偷启动；要用时点「恢复」（几秒）。</div><div id="ab-plist">加载中…</div>';
+      body.innerHTML = '<div class="ab-tip">「暂停」将停止运行环境并释放资源；暂停期间对外显示提示，不会自动启动。需要时点「恢复」。</div><div id="ab-plist">加载中…</div>';
       function refresh() {
         api('/_gate/projects').then(function (r) {
           var list = (r.body && r.body.projects) || [];
           var el = body.querySelector('#ab-plist');
           if (!el) return;
-          if (!list.length) { el.innerHTML = '<div class="ab-tip">还没有项目。</div>'; return; }
+          if (!list.length) { el.innerHTML = '<div class="ab-tip">暂无项目。</div>'; return; }
           el.innerHTML = '';
           // 工作台跟项目**分开两块**（2026-09-16 老板要）—— 它俩不是一类东西：
           //   工作台 = 平台给你的干活地方（不绑项目）；项目 = 要给业务用的系统。
@@ -811,15 +811,15 @@
             var card = document.createElement('div'); card.className = 'ab-card';
             card.innerHTML = '<div class="ab-card-top"><div><div class="ab-n">' + esc(p.name) + '</div>' +
               '<div class="ab-s">' + (p.paused
-                ? '<span style="color:#d29922">已暂停（不占内存）</span>'
+                ? '<span style="color:#d29922">已暂停（已释放资源）</span>'
                 : '<span style="color:#3fb950">运行中</span>') +
-              (p.editable ? '' : ' ｜ 这个项目没有独立引擎') + '</div></div></div>';
+              (p.editable ? '' : ' ｜ 此项目无独立运行环境') + '</div></div></div>';
             var acts = document.createElement('div'); acts.style.cssText = 'display:flex;gap:7px;margin-top:10px;flex-wrap:wrap';
             if (p.editable) {
               var b = document.createElement('button');
               b.className = 'ab-btn sm ' + (p.paused ? '' : 'ghost');
               b.type = 'button';
-              b.textContent = p.paused ? '恢复' : '暂停（省内存）';
+              b.textContent = p.paused ? '恢复' : '暂停';
               b.onclick = function () {
                 b.disabled = true;
                 b.textContent = p.paused ? '恢复中…' : '暂停中…';
@@ -847,7 +847,7 @@
             bDel.onclick = function () {
               // 2026-09-15：以前这里写的是「默认只下线，要真删得去服务器跑 --purge」——
               // 客户根本做不到，点了删除文件还在。现在点它就是真删（走后端 purge）。
-              if (!confirm('彻底删掉项目「' + p.name + '」？\n\n· 代码、数据、引擎记录一起删，找不回来\n· 只想先停掉、以后还要用 → 点「暂停」\n\n确定吗？')) return;
+              if (!confirm('删除项目「' + p.name + '」？\n\n· 代码、数据与运行记录将一并删除，无法恢复\n· 如需暂时停用，请选择「暂停」\n\n确定继续？')) return;
               api('/_gate/projects/delete', { method: 'POST', body: JSON.stringify({ key: p.key, purge: true }) }).then(function (r2) {
                 if (!r2.ok) { alert((r2.body && r2.body.error) || '删不掉'); return; }
                 // 删干净了没有要说清楚 —— 只下线不删文件时不能装作删了
@@ -857,12 +857,12 @@
             };
             acts.appendChild(bDel);
             }
-            // 管理员：把项目转给某个客户
+            // 管理员：转移项目归属
             if (isAdmin && owners.length) {
               var sel = document.createElement('select');
               sel.className = 'ab-input';
               sel.style.cssText = 'max-width:150px;padding:5px 8px;font-size:13.5px';
-              sel.title = '把项目转给某个客户';
+              sel.title = '转移项目归属';
               owners.forEach(function (o) {
                 var op = document.createElement('option');
                 op.value = o.user;
@@ -922,7 +922,7 @@
             '（已用 ' + Math.round((d.disk.usedMb / d.disk.totalMb) * 100) + '%）</div></div>';
         }
         html += '<div class="ab-tip">每个项目默认上限 ' + fmtMb(d.defaultQuotaMb) + '；超出后上传与改动将被阻止。</div>';
-        if (!(d.projects || []).length) html += '<div class="ab-tip">名下还没有项目。</div>';
+        if (!(d.projects || []).length) html += '<div class="ab-tip">名下暂无项目。</div>';
         (d.projects || []).forEach(function (p) {
           var bar = '<div style="height:6px;background:#21262d;border-radius:3px;margin-top:8px;overflow:hidden">' +
             '<div style="height:100%;width:' + Math.min(100, p.pct || 0) + '%;background:' + (p.over ? '#f85149' : '#3fb950') + '"></div></div>';
@@ -1033,8 +1033,8 @@
     var fresh = run.created_at && (!seenIso || String(run.created_at) > String(seenIso));
     var html = '上次：' + esc(abLocal(run.created_at)) + ' ' + esc(abRunState(st));
     if (fresh) html += ' <span style="color:#3fb950">● 新结果</span>';
-    if (st === 'failed') html += ' <span style="color:#f85149">—— 没干成，进去看一眼</span>';
-    else if (fresh && st === 'completed') html += ' <span style="color:#8b949e">—— 干完了</span>';
+    if (st === 'failed') html += ' <span style="color:#f85149">—— 执行失败</span>';
+    else if (fresh && st === 'completed') html += ' <span style="color:#8b949e">—— 已完成</span>';
     box.innerHTML = html;
   }
 
@@ -1080,11 +1080,11 @@
           return;
         }
         if (!act) {
-          el.innerHTML = '<div class="ab-tip">名下还没有项目，先建一个项目再来。</div>';
+          el.innerHTML = '<div class="ab-tip">名下暂无项目，请先创建项目。</div>';
           return;
         }
         el.innerHTML =
-          '<div class="ab-tip">到点它会<b>自己动手</b>（改文件、跑命令都不用你确认），干完记在「' +
+          '<div class="ab-tip">按计划自动执行：<b>改文件、执行命令无需逐步确认</b>，执行记录写入「' +
           esc(act.name) + '」的会话里。</div>' +
           '<button class="ab-menu-item" id="ab-au-new">+ 新建定时任务<small>每天 / 每周 / 每月 / 每小时</small></button>' +
           '<div id="ab-au-list">' + (list.length ? '' : '<div class="ab-tip">暂无定时任务。</div>') + '</div>';
@@ -1103,7 +1103,7 @@
             (a.next_run_at ? ' · 下次 ' + esc(abLocal(a.next_run_at)) : '') + '</div>' +
             '<div class="ab-s" id="au-run-' + esc(a.id) + '">上次：查中…</div>' +
             '<div class="ab-s" id="au-res-' + esc(a.id) + '" style="color:#8b949e"></div>' +
-            '<div class="ab-s" style="color:#8b949e">要它做的：' + esc((a.prompt || '').slice(0, 110)) +
+            '<div class="ab-s" style="color:#8b949e">任务内容：' + esc((a.prompt || '').slice(0, 110)) +
             ((a.prompt || '').length > 110 ? '…' : '') + '</div>' +
             '<div style="display:flex;gap:8px;margin-top:9px;flex-wrap:wrap">' +
             '<button class="ab-btn sm" data-act="run" data-id="' + esc(a.id) + '">立刻跑一次</button>' +
@@ -1120,7 +1120,7 @@
             var box = body.querySelector('#au-run-' + a.id);
             if (!box) return;
             var runs = abRunsOf(r).slice().sort(abByNewest);
-            if (!runs.length) { box.textContent = '上次：还没跑过'; return; }
+            if (!runs.length) { box.textContent = '上次执行：尚未运行'; return; }
             var last = runs[runs.length - 1];
             if (last.created_at) seenAfter[a.id] = last.created_at;
             abPaintRun(box, last, seenBefore[a.id]);
@@ -1154,7 +1154,7 @@
             var card = body.querySelector('#au-' + id);
             var tries = 0;
             var box0 = body.querySelector('#au-run-' + id);
-            if (box0) box0.textContent = '正在跑…（干完这里会自己更新）';
+            if (box0) box0.textContent = '执行中…（完成后自动更新）';
             var timer = setInterval(function () {
               tries++;
               api('/v1/automations/' + encodeURIComponent(id) + '/runs').then(function (rr) {
@@ -1190,16 +1190,16 @@
       body.innerHTML =
         '<div class="ab-tip">按计划自动执行 —— <b>改文件、执行命令无需逐步确认</b>，执行记录写入本项目会话。' +
         '拿不准就先写「只看不动」的活（比如「把逾期清单写成报告」）。</div>' +
-        '<div class="ab-row"><label>叫什么</label><input class="ab-input" id="au-name" placeholder="例：每天早上看逾期款"></div>' +
-        '<div class="ab-row"><label>多久一次</label><select class="ab-input" id="au-freq">' +
+        '<div class="ab-row"><label>名称</label><input class="ab-input" id="au-name" placeholder="例：每天早上看逾期款"></div>' +
+        '<div class="ab-row"><label>执行频率</label><select class="ab-input" id="au-freq">' +
         '<option value="daily">每天</option><option value="weekly">每周</option>' +
         '<option value="monthly">每月</option><option value="hourly">每小时</option></select></div>' +
-        '<div class="ab-row"><label>几点</label><input class="ab-input" id="au-time" type="time" value="09:00"></div>' +
-        '<div class="ab-row" id="au-days" style="display:none"><label>周几</label><div style="flex:1">' + dayBox + '</div></div>' +
-        '<div class="ab-row" id="au-dom" style="display:none"><label>几号</label><input class="ab-input" id="au-domv" type="number" min="1" max="31" value="1"></div>' +
-        '<div class="ab-row" style="align-items:flex-start"><label>要它做什么</label>' +
-        '<textarea class="ab-input" id="au-prompt" rows="4" placeholder="例：看 data/app.db 里逾期没付的订单，把清单写进 reports/逾期.md，并回我一句话总结"></textarea></div>' +
-        '<div style="display:flex;gap:8px;margin-top:14px"><button class="ab-btn" id="au-save" type="button">建好</button>' +
+        '<div class="ab-row"><label>执行时间</label><input class="ab-input" id="au-time" type="time" value="09:00"></div>' +
+        '<div class="ab-row" id="au-days" style="display:none"><label>星期</label><div style="flex:1">' + dayBox + '</div></div>' +
+        '<div class="ab-row" id="au-dom" style="display:none"><label>日期</label><input class="ab-input" id="au-domv" type="number" min="1" max="31" value="1"></div>' +
+        '<div class="ab-row" style="align-items:flex-start"><label>任务内容</label>' +
+        '<textarea class="ab-input" id="au-prompt" rows="4" placeholder="例：查看逾期未付的订单，把清单写入「产出」目录，并回复一句总结"></textarea></div>' +
+        '<div style="display:flex;gap:8px;margin-top:14px"><button class="ab-btn" id="au-save" type="button">创建</button>' +
         '<button class="ab-btn ghost" id="au-cancel" type="button">取消</button></div><div class="ab-msg" id="au-msg"></div>';
 
       var freqEl = body.querySelector('#au-freq');
@@ -1215,7 +1215,7 @@
       body.querySelector('#au-cancel').onclick = closeLayer;
       body.querySelector('#au-save').onclick = function () {
         var prompt = body.querySelector('#au-prompt').value.trim();
-        if (!prompt) { msg(msgEl, '还没写「要它做什么」', false); return; }
+        if (!prompt) { msg(msgEl, '请填写任务内容', false); return; }
         var days = Array.prototype.slice.call(body.querySelectorAll('#au-days input:checked')).map(function (c) { return c.value; });
         if (freqEl.value === 'weekly' && !days.length) { msg(msgEl, '每周的至少选一天', false); return; }
         var name = body.querySelector('#au-name').value.trim() || prompt.slice(0, 20);
@@ -1291,8 +1291,8 @@
         }
         var list = ((r.body || {}).skills || []);
         var known = {};
-        var html = '<div class="ab-tip">这些是它<b>已经学会</b>的本事 —— <b>你不用挑、也不用点</b>：' +
-          '直接跟它说要做什么，它自己会挑合适的用。</div>';
+        var html = '<div class="ab-tip">以下为<b>内置技能</b>，无需手动选择：' +
+          '直接说明需求，AI 会自动匹配。</div>';
         SKILL_GROUPS.forEach(function (g) {
           var rows = '';
           g[1].forEach(function (it) {
@@ -1307,18 +1307,18 @@
         var rest = [];
         for (var j = 0; j < list.length; j++) if (!known[list[j].name]) rest.push(list[j]);
         if (rest.length) {
-          html += '<div style="margin-top:14px"><button class="ab-btn ghost sm" id="ab-sk-more" type="button">还有 ' +
-            rest.length + ' 项别的本事（点开看）</button></div><div id="ab-sk-rest" hidden>' +
+          html += '<div style="margin-top:14px"><button class="ab-btn ghost sm" id="ab-sk-more" type="button">查看其余 ' +
+            rest.length + ' 项</button></div><div id="ab-sk-rest" hidden>' +
             rest.map(function (s) { return abSkillCard(s.name, (s.description || '').slice(0, 120), s); }).join('') + '</div>';
         }
-        html += '<div class="ab-tip" style="margin-top:14px">想让它多会一样？跟平台说一声就行 —— 你自己不用装。</div>';
+        html += '<div class="ab-tip" style="margin-top:14px">需要更多能力？告知平台即可，无需自行安装。</div>';
         el.innerHTML = html;
         var more = el.querySelector('#ab-sk-more');
         if (more) more.onclick = function () {
           var box = el.querySelector('#ab-sk-rest');
           var wasHidden = box.hidden;
           box.hidden = !wasHidden;
-          more.textContent = wasHidden ? '收起' : ('还有 ' + rest.length + ' 项别的本事（点开看）');
+          more.textContent = wasHidden ? '收起' : ('查看其余 ' + rest.length + ' 项');
         };
       });
     });
@@ -1343,7 +1343,7 @@
     var m = document.getElementById('mem-msg');
     // 记忆是「引擎启动时才读」的（remember 工具那时才注册）—— 门卫会在保存后重启本项目的 AI 才真生效，
     // 这里如实告诉客户要等几秒（否则客户会以为「点了没反应」—— 2026-09-16 实测踩到）。
-    if (m) { m.className = 'ab-msg'; m.textContent = '正在重启这个项目的 AI（几秒钟），好让设置真生效…'; }
+    if (m) { m.className = 'ab-msg'; m.textContent = '正在重启 AI 服务（约几秒）以使设置生效…'; }
     // 记忆也是**全局偏好**（2026-09-16 老板点名：「包括记忆也是」）——
     // 一次设置，名下所有项目都生效（没在跑的项目等下次打开时自动补）。
     api('/_gate/prefs', {
@@ -1414,9 +1414,9 @@
           if (cfg.memory_enabled === false) {
             el.innerHTML =
               '<div class="ab-tip">这个项目的「记忆」<b>还没打开</b>。</div>' +
-              '<div class="ab-tip">打开之后：它会把你在对话里说过的习惯、偏好、常用说法自己记下来，' +
-              '下次对话自动想起来（每次只会带上最近的几十条）。<b>你随时能在这儿看到它们、也能清空，' +
-              '不想用了就关掉 —— 都你自己控制，不用找平台。</b></div>' +
+              '<div class="ab-tip">开启后，AI 会记录对话中的偏好与习惯，' +
+              '并在后续对话中自动带入（仅最近数十条）。<b>可随时查看、清空或关闭，' +
+              '无需联系平台。</b></div>' +
               '<button class="ab-btn" id="mem-on" type="button">打开记忆</button><div class="ab-msg" id="mem-msg"></div>';
             body.querySelector('#mem-on').onclick = function () {
               var btn = this;
@@ -1427,7 +1427,7 @@
           var html =
             '<div class="ab-tip">AI 在对话中记住的内容（最近 32 条会带入对话，请勿作为资料库使用）。' +
             '仅作用于<b>本项目</b>。</div>' +
-            '<div class="ab-row"><input class="ab-input" id="mem-q" placeholder="搜一搜（比如「客户」）" value="' + esc(q) + '"></div>';
+            '<div class="ab-row"><input class="ab-input" id="mem-q" placeholder="搜索（例如「客户」）" value="' + esc(q) + '"></div>';
           html += '<div id="mem-list"></div>';
           html += '<div class="ab-tip" style="margin-top:12px">此处仅支持<b>整批清空</b>，暂不支持单条删除。' +
             '如需删除某条记忆，可在对话中告知 AI（例如「忘掉关于报表格式的偏好」）。</div>';
@@ -1614,10 +1614,10 @@
       var opts = ps.map(function (p) {
         var label = p.name + (nameCount[p.name] > 1 ? ' · ' + p.id : '');
         return '<option value="' + esc(p.id) + '"' + (p.id === d.provider ? ' selected' : '') + '>' +
-          esc(label) + (p.ready ? '（已配好）' : '') + '</option>';
+          esc(label) + (p.ready ? '（已配置）' : '') + '</option>';
       }).join('');
       body.innerHTML =
-        '<div class="ab-tip">用你自己的大模型 API：选一家、填密钥。留空的项就不改（端点 / 模型名 / 密钥都是）。</div>' +
+        '<div class="ab-tip">使用你自己的模型服务：选择服务商、填写密钥。留空项将保持不变（端点 / 模型名 / 密钥）。</div>' +
         (d.helper ? '' : '<div class="ab-tip" style="color:#d29922">⚠️ 服务端还没装「模型密钥」帮手，现在保存不了 —— 让管理员跑一下安装脚本。</div>') +
         '<div class="ab-row"><label>用哪家</label><select class="ab-input" id="mk-provider">' + opts + '</select></div>' +
         '<div class="ab-row"><label>端点地址</label><input class="ab-input" id="mk-base" placeholder="留空用这家的官方地址" value="' + esc(d.base_url || '') + '"></div>' +
@@ -1695,7 +1695,7 @@
     return p(d.getMonth() + 1) + '-' + p(d.getDate()) + ' ' + p(d.getHours()) + ':' + p(d.getMinutes());
   }
   function repoStateLine(d) {
-    if (!d.initialized) return '这个项目还没有版本库 —— 保存地址时会自动建一个，并把现在的文件提交一份。';
+    if (!d.initialized) return '此项目尚无版本库 —— 保存地址时会自动创建并提交当前文件。';
     var p = ['版本库 ' + (d.branch || 'main')];
     if (d.lastCommit) p.push('最新：' + d.lastCommit.subject + '（' + repoWhen(d.lastCommit.when) + '）');
     if (typeof d.ahead === 'number') p.push(d.ahead > 0 ? ('有 ' + d.ahead + ' 次改动还没推上去') : '本机和仓库里的一致');
@@ -1710,8 +1710,8 @@
 
     openLayer('代码仓库', function (body) {
       var noHelper = d.helper === false;
-      var html = '<div class="ab-tip">把项目代码接到<b>你自己的</b>仓库，东西就不只存在这台服务器上。' +
-        '接好之后，在对话里说「推到我的仓库」它才会推 —— 不会自作主张。</div>';
+      var html = '<div class="ab-tip">将项目代码连接到你自己的仓库，代码将不再仅存于平台。' +
+        '连接后需明确指示「推送到我的仓库」才会推送。</div>';
       if (noHelper) {
         html += '<div class="ab-tip" style="color:#d29922">⚠️ 服务端还没装「代码仓库」帮手，现在存不了 —— 让管理员跑一下安装脚本。</div>';
       }
@@ -1721,13 +1721,13 @@
           return '<option value="' + x[0] + '"' + (x[0] === plat ? ' selected' : '') + '>' + x[1] + '</option>';
         }).join('') + '</select></div>';
       html += '<div class="ab-row"><label>仓库地址</label><input class="ab-input" id="rp-remote" placeholder="git@gitee.com:你的账号/仓库.git" value="' + esc(d.remote || '') + '"></div>';
-      html += '<div class="ab-tip" style="margin:-4px 0 10px 78px">在仓库页面点「克隆」，把 <b>SSH</b> 那一行贴进来（也可以是 https:// 地址）。' +
-        '请用你自己的<b>私有</b>仓库 —— 平台不托管、也不会把代码推到别处。</div>';
+      html += '<div class="ab-tip" style="margin:-4px 0 10px 78px">在仓库页面复制 <b>SSH</b> 地址并粘贴到这里（也可使用 https:// 地址）。' +
+        '请使用你自己的<b>私有</b>仓库 —— 平台不托管代码，也不会推送到其他位置。</div>';
       html += '<div style="display:flex;gap:8px;margin:-2px 0 6px 78px">' +
         '<button class="ab-btn sm" id="rp-save" type="button"' + (noHelper ? ' disabled' : '') + '>保存地址</button>' +
         '<button class="ab-btn ghost sm" id="rp-clear" type="button"' + (noHelper ? ' disabled' : '') + '>移除地址</button></div>';
 
-      html += '<div style="margin:14px 0 6px;color:#e6edf3;font-size:14px">怎么证明是你</div>';
+      html += '<div style="margin:14px 0 6px;color:#e6edf3;font-size:14px">认证方式</div>';
       html += '<div class="ab-row"><label>方式</label><select class="ab-input" id="rp-auth">' +
         '<option value="deploy-key"' + (auth === 'deploy-key' ? ' selected' : '') + '>部署密钥（推荐）</option>' +
         '<option value="token"' + (auth === 'token' ? ' selected' : '') + '>访问令牌（https 地址用）</option>' +
@@ -1735,25 +1735,25 @@
 
       var keyBox = '';
       if (d.hasKey && pub) {
-        keyBox += '<label style="color:#8b949e;font-size:13.5px">你的公钥（这段贴给仓库，不碍事）</label>' +
+        keyBox += '<label style="color:#8b949e;font-size:13.5px">公钥（粘贴到仓库）</label>' +
           '<textarea class="ab-input" id="rp-pub" readonly style="height:70px;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12.5px;margin:4px 0;resize:vertical">' + esc(pub) + '</textarea>' +
           '<div style="display:flex;gap:8px;margin-bottom:8px"><button class="ab-btn sm" id="rp-copy" type="button">复制公钥</button>' +
           '<button class="ab-btn danger sm" id="rp-delkey" type="button" style="margin-left:auto">删掉密钥</button></div>';
         if (d.fingerprint) keyBox += '<div class="ab-s" style="margin-bottom:6px">指纹 ' + esc(d.fingerprint) + '</div>';
-        keyBox += '<div class="ab-tip">还没贴到仓库？到仓库页面 → <b>设置 → 部署公钥（Deploy Keys）</b> → 粘贴 → 勾上「允许写入」。' +
-          '勾不上写入的话，推的时候会被拒。</div>';
+        keyBox += '<div class="ab-tip">尚未添加？请在仓库「<b>设置 → 部署公钥（Deploy Keys）</b>」中添加，并勾选「允许写入」。' +
+          '未勾选写入权限将导致推送被拒。</div>';
       } else {
-        keyBox += '<div class="ab-tip">还没有密钥。点下面这个按钮生成一对：<b>公钥</b>贴到你的仓库，<b>私钥</b>留在项目里（谁都看不到）。</div>' +
+        keyBox += '<div class="ab-tip">尚无密钥。点击下方按钮生成：<b>公钥</b>粘贴到仓库，<b>私钥</b>保留在项目内。</div>' +
           '<button class="ab-btn" id="rp-genkey" type="button"' + (noHelper ? ' disabled' : '') + '>生成密钥</button>';
       }
       html += '<div id="rp-keybox">' + keyBox + '</div>';
 
       var tokBox = '<div class="ab-row"><label>仓库用户名</label><input class="ab-input" id="rp-user" placeholder="登录仓库的账号名"></div>' +
         '<div class="ab-row"><label>访问令牌</label><input class="ab-input" id="rp-token" type="password" autocomplete="new-password" placeholder="' +
-        (d.hasToken ? '已经存好了（要换就填新的）' : '在仓库设置里生成一个') + '"></div>' +
+        (d.hasToken ? '已保存（如需更换请填写新值）' : '在仓库设置中生成') + '"></div>' +
         '<div style="display:flex;gap:8px"><button class="ab-btn sm" id="rp-savetoken" type="button"' + (noHelper ? ' disabled' : '') + '>保存令牌</button>' +
         (d.hasToken ? '<button class="ab-btn danger sm" id="rp-cleartoken" type="button" style="margin-left:auto">清除令牌</button>' : '') + '</div>' +
-        '<div class="ab-tip" style="margin-top:8px">令牌只存在这个项目里（600），不会写进对话、也不会回显。</div>';
+        '<div class="ab-tip" style="margin-top:8px">令牌仅存储于本项目内，不会写入对话，也不会回显。</div>';
       html += '<div id="rp-tokenbox"' + (auth === 'token' ? '' : ' hidden') + '>' + tokBox + '</div>';
 
       html += '<div style="margin:14px 0 6px;color:#e6edf3;font-size:14px">现在怎么样</div>';
@@ -1793,7 +1793,7 @@
         syncState();
       };
       body.querySelector('#rp-clear').onclick = function () {
-        if (!confirm('把仓库地址移掉？代码就只留在这台服务器上了（本地版本库不动）。')) return;
+        if (!confirm('移除仓库地址？代码将仅存于平台（本地版本库不受影响）。')) return;
         post({ action: 'clear', platform: body.querySelector('#rp-platform').value });
         syncState();
       };
@@ -1803,13 +1803,13 @@
       if (bc) bc.onclick = function () {
         var ta = body.querySelector('#rp-pub');
         ta.select();
-        var done = function () { msg(msgEl, '公钥已复制，去仓库页面粘贴吧', true); };
-        if (navigator.clipboard) navigator.clipboard.writeText(ta.value).then(done, function () { msg(msgEl, '复制失败，手动选中它复制吧', false); });
-        else { try { document.execCommand('copy'); done(); } catch (e) { msg(msgEl, '复制失败，手动选中它复制吧', false); } }
+        var done = function () { msg(msgEl, '公钥已复制，请粘贴到仓库', true); };
+        if (navigator.clipboard) navigator.clipboard.writeText(ta.value).then(done, function () { msg(msgEl, '复制失败，请手动选取复制', false); });
+        else { try { document.execCommand('copy'); done(); } catch (e) { msg(msgEl, '复制失败，请手动选取复制', false); } }
       };
       var bd = body.querySelector('#rp-delkey');
       if (bd) bd.onclick = function () {
-        if (!confirm('删掉这对密钥？删了之后要重新生成、并重新贴到仓库才能推。')) return;
+        if (!confirm('删除密钥？删除后需重新生成并粘贴到仓库才能推送。')) return;
         post({ action: 'delkey' }, '密钥已删除');
       };
       body.querySelector('#rp-savetoken').onclick = function () {
@@ -1834,7 +1834,7 @@
         return '<div class="ab-row"><label>' + k + '</label>' +
           '<span class="ab-input" style="cursor:default;color:#e6edf3;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc(v) + '</span></div>';
       }
-      var html = '<div class="ab-tip">你登录进来用的就是这个账号 —— 名字只是显示用，登录时填的是「登录账号」。</div>';
+      var html = '<div class="ab-tip">这是你的登录账号；「名字」仅用于显示。</div>';
       html += row('名字', me.name || me.user || '—');
       html += row('登录账号', me.user || '—');
       html += row('角色', roleTxt);
@@ -1998,7 +1998,7 @@
         b.type = 'button';
         b.className = 'rail-hide';
         b.textContent = '收起';
-        b.title = '收起侧栏（腾地方看内容）';
+        b.title = '收起侧栏';
         brand.appendChild(b);
       }
       if (!document.getElementById('asbudy-rail-reveal')) {
@@ -2059,17 +2059,17 @@
       b1.type = 'button';
       b1.id = 'asbudy-retry';
       b1.textContent = '↻ 重试';
-      b1.title = '让 AI 把上一句重新答一遍（不动项目文件）';
+      b1.title = '让 AI 重新作答（不影响项目文件）';
       var b2 = document.createElement('button');
       b2.type = 'button';
       b2.id = 'asbudy-undo-turn';   // 注意：不能叫 asbudy-undo —— 那是退回面板容器的 id（重复 id 会让 getElementById 拿到错的）
       b2.textContent = '↩ 撤销';
-      b2.title = '把最后一轮问答去掉，你那句话回到输入框（不动项目文件）';
+      b2.title = '移除最后一轮问答，提问将回到输入框（不影响项目文件）';
       var b3 = document.createElement('button');
       b3.type = 'button';
       b3.id = 'asbudy-compact';
       b3.textContent = '🗜 压缩';
-      b3.title = '把这段长对话压短，省 token（要点保留）';
+      b3.title = '压缩当前对话以节省上下文（保留要点）';
       el.appendChild(b1);
       el.appendChild(b2);
       el.appendChild(b3);
@@ -2106,7 +2106,7 @@
         el.style.cursor = 'help';
       }
       if (!LAST_THREAD) {
-        show('记性 —', '还没开始对话 —— 说一句之后，这里会显示它用了多少「记忆」');
+        show('记性 —', '尚未开始对话 —— 发送消息后显示上下文占用');
         return;
       }
       try {
@@ -2120,17 +2120,17 @@
         var hot = d.percent >= 80;
         show('记性 ' + d.percent + '%',
           '这次对话占了模型「记忆」的 ' + d.percent + '%（' + fmtK(d.used) + ' / ' + fmtK(d.window) + '）'
-          + (hot ? '\n快满了 —— 开个新对话，AI 会更清醒' : ''), hot);
+          + (hot ? '\n接近上限 —— 建议新建对话' : ''), hot);
       } catch (e) { show('记性 —', '暂时读不到'); }
     }
     setInterval(loadCtx, 15000);
     setTimeout(loadCtx, 3000);
 
     async function fire(kind) {
-      if (!LAST_THREAD) { alert('先在右边说一句，才有可操作的对话'); return; }
+      if (!LAST_THREAD) { alert('请先发送一条消息'); return; }
       var labels = { retry: '重试', undo: '撤销', compact: '压缩' };
       if (kind === 'undo' && !confirm('撤销最后这一轮？\n\n这一问一答会从对话里去掉，你那句话回到输入框（可以改了再发）。\n项目里的文件不受影响 —— 要退文件，用左侧的「退回」。')) return;
-      if (kind === 'compact' && !confirm('把当前对话压短？\n\n要点会保留，超长的历史会被 AI 总结掉 —— 能省 token，但细节会丢。')) return;
+      if (kind === 'compact' && !confirm('压缩当前对话？\n\n将保留要点，超长历史会被总结 —— 可节省上下文，但部分细节会丢失。')) return;
       try {
         var r = await fetch('/v1/threads/' + encodeURIComponent(LAST_THREAD) + '/' + kind, {
           method: 'POST',

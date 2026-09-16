@@ -161,7 +161,7 @@
         artsEl.hidden = false;
         var h = document.createElement('div');
         h.className = 'a-head';
-        h.innerHTML = '<span>做好的东西 ' + list.length + ' 个</span><span id="asbudy-arts-toggle">收起</span>';
+        h.innerHTML = '<span>产出文件 ' + list.length + ' 个</span><span id="asbudy-arts-toggle">收起</span>';
         var wrap = document.createElement('div');
         wrap.className = 'a-list';
         list.forEach(function (a) {
@@ -326,7 +326,7 @@
           + '<span class="f-nm">' + aEsc(it.name) + '</span>'
           + '<span class="f-sz">' + aEsc(it.source || '') + ' · ' + binTime(it.at) + '</span>'
           + '<span class="f-tag" data-act="restore" style="cursor:pointer" title="放回原来位置">还原</span>'
-          + '<span class="f-del" data-act="purge" title="彻底删掉（找不回了）">×</span>';
+          + '<span class="f-del" data-act="purge" title="彻底删除（不可恢复）">×</span>';
         row.querySelector('[data-act="restore"]').onclick = function (ev) {
           ev.stopPropagation();
           fetch('/_gate/recycle/restore', { method: 'POST', credentials: 'same-origin',
@@ -339,7 +339,7 @@
         };
         row.querySelector('[data-act="purge"]').onclick = function (ev) {
           ev.stopPropagation();
-          if (!confirm('彻底删掉「' + it.name + '」？这个就真找不回来了。')) return;
+          if (!confirm('彻底删除「' + it.name + '」？此操作不可恢复。')) return;
           fetch('/_gate/recycle', { method: 'DELETE', credentials: 'same-origin',
             headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id: it.id }) })
             .then(function (rr) {
@@ -382,7 +382,7 @@
       if (delBtn) {
         delBtn.onclick = function (ev) {
           ev.stopPropagation();
-          if (!confirm('删掉整个文件夹「' + f.name + '」？（会进回收站，可以让 AI 帮你找回来）')) return;
+          if (!confirm('删除文件夹「' + f.name + '」？（将移入回收站，可由 AI 协助还原）')) return;
           fetch('/_gate/file?name=' + encodeURIComponent(f.path), { method: 'DELETE', credentials: 'same-origin' })
             .then(function (r) {
               if (r.ok) { loadMine(); loadRecycle(); return; }
@@ -415,7 +415,7 @@
       if (delF) delF.onclick = function (ev) {
         ev.stopPropagation();
         if (!confirm(isMine
-          ? '删掉「' + f.name + '」？（会进回收站，可以让 AI 帮你找回来）'
+          ? '删掉「' + f.name + '」？（将移入回收站，可由 AI 协助还原）'
           : '删掉「' + f.name + '」？（删错了可以点「退回」，但会连之后的改动一起回退）')) return;
         var url = isMine
           ? '/_gate/file?name=' + encodeURIComponent(f.path)
@@ -475,8 +475,8 @@
     if (k === 'text' || k === 'svg' || k === 'code') return showPanel(name, textBody(d.text || d.content || ''), d.download);
     if (k === 'image') return showPanel(name, imgBody(d.url), d.download);
     if (k === 'pdf') return showPanel(name, pdfBody(d.url), d.download);
-    if (k === 'unsupported') return showPanel(name, textBody(d.note || '这种格式暂时只能下下来看'), d.download);
-    return showPanel(name, textBody((d && d.note) || '这种格式暂时只能下下来看'), d.download);   // 没得预览也要说清楚，别给空面板
+    if (k === 'unsupported') return showPanel(name, textBody(d.note || '此格式暂不支持预览，请下载查看'), d.download);
+    return showPanel(name, textBody((d && d.note) || '此格式暂不支持预览，请下载查看'), d.download);   // 没得预览也要说清楚，别给空面板
   }
 
   // 提取出来的内容（docx 表格 / xlsx / pptx / csv / markdown）得看得像个正经文档 ——
@@ -579,7 +579,7 @@
       wrap.innerHTML = '';
       var p = document.createElement('div');
       p.style.cssText = 'color:#8b949e;font-size:13px';
-      p.textContent = '这张图显示不出来（文件可能坏了，或者这个格式浏览器不认）。点右上角「下载」拿下来看。';
+      p.textContent = '图片无法显示（文件可能损坏或格式不受支持）。请点击右上角「下载」查看。';
       wrap.appendChild(p);
     };
     wrap.appendChild(img);
@@ -589,7 +589,7 @@
     // 浏览器不带 PDF 阅读器时嵌进去只会是空白（navigator.pdfViewerEnabled=false）——
     // 那就别装样子，直接说清楚让他下载
     if (!url || navigator.pdfViewerEnabled === false) {
-      return textBody('这个浏览器不带 PDF 阅读器，嵌不进来 —— 点右上角「下载」拿下来看。');
+      return textBody('当前浏览器不支持内嵌 PDF 预览，请点击右上角「下载」查看。');
     }
     var f = document.createElement('iframe');
     f.src = url; f.title = 'PDF 预览';
@@ -735,7 +735,7 @@
     var f = frameEl();
     if (!f || f.hidden) return;
     // 客户正在 iframe 里点东西/填表（焦点在页面里）→ 别把页面重载掉，挂个提示让他自己决定
-    if (document.activeElement === f) { previewNotice('有更新 · 点「刷新」看最新的', '#d29922'); return; }
+    if (document.activeElement === f) { previewNotice('有更新 · 点击「刷新」查看', '#d29922'); return; }
     f.src = f.src;
     previewNotice('已更新');
   }
@@ -987,7 +987,7 @@
             var tm = document.createElement('div'); tm.className = 'u-time'; tm.textContent = fmtTime(s.ts);
             it.appendChild(lb); it.appendChild(tm);
             it.onclick = async function () {
-              if (!confirm('确定退回到这个时间点吗？之后的改动会被撤销（你填的数据都还在）。')) return;
+              if (!confirm('确认退回到该时间点？此后的改动将被撤销（已填写的数据会保留）。')) return;
               try {
                 var rr = await fetch('/_gate/restore', { method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ snapshotId: s.id }) });
                 var dd = await rr.json();

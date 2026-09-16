@@ -956,7 +956,8 @@ function startBrowserClient() {
         // The status line is enough when the response is not JSON.
       }
       if (response.status === 401) {
-        message = "此浏览器会话未通过认证。重启 `codewhale web` 以打开一个新的临时会话。";
+        // AsBudy：文案改「专业克制」（原来写着 `codewhale web` 这种给开发者看的命令）
+        message = "会话已过期，请刷新页面重新登录。";
       }
       throw new Error(message);
     }
@@ -1416,17 +1417,18 @@ function startBrowserClient() {
   function renderTranscript(preserveScroll) {
     const wasNearBottom = dom.transcript.scrollHeight - dom.transcript.scrollTop - dom.transcript.clientHeight < 120;
     if (!app.threadState.thread) {
+      // AsBudy：空状态文案改「专业克制」（2026-09-16 老板定，见 AGENTS.md「✍️ 界面文案」）
       renderTranscriptEmpty(
         "choose-thread",
-        "准备好了，随时可以开工。",
-        "从左边挑一个会话，或者直接在下面说一句你要做什么。",
+        "准备就绪。",
+        "从左侧选择会话，或直接输入需求。",
       );
       return;
     }
     if (app.threadState.itemOrder.length === 0) {
       renderTranscriptEmpty(
         "ready",
-        "准备好了，随时可以开工。",
+        "准备就绪。",
         "AI Builder, As Your Buddy",
       );
       return;
