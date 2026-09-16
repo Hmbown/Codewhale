@@ -344,7 +344,7 @@
     "std_fs": 1
   },
   "crates/tui/src/tools/shell.rs": {
-    "std_fs": 2,
+    "std_fs": 3,
     "thread_sleep": 1
   },
   "crates/tui/src/tools/shell/tests.rs": {

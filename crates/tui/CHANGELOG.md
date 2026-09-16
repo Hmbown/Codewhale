@@ -28,10 +28,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   parsed *before* and would not parse *after* — repairing an already-broken
   file is the commonest reason to edit source at all, so pre-existing breakage
   and new files fail open. The check precedes the write, so a rejection leaves
-  the file untouched and `apply_patch` cannot half-apply (#6204, #6206).
+  the file untouched and `apply_patch` cannot half-apply (#6204, #6206, #6151).
 - Rust files that were already `rustfmt`-clean are re-normalized after an edit,
   so the next patch's anchors still match. Hand-formatted files are never
-  rewritten, and every failure path skips and lets the edit land (#6205).
+  rewritten, and every failure path skips and lets the edit land (#6205, #6151).
 - Native clients can finish provider setup without dropping to the CLI:
   `DELETE /v1/providers/{id}/key` clears a Codewhale-owned credential through
   the same shared owner as `codewhale auth clear`, and `GET /v1/providers`
@@ -60,8 +60,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   symlinks are never followed. A saved session's oversized tool outputs are
   served as artifacts at `GET /v1/sessions/{id}/artifacts` and
   `GET /v1/sessions/{id}/artifacts/{artifact_id}`. (#6163)
+- A session that ended mid-turn is no longer invisible to the model. The newest
+  workspace-scoped session still holding a crash-recovery checkpoint is
+  surfaced as a one-line `## Prior Session` notice in the session-pinned prompt
+  prefix — metadata reads only, excluding the live session and any session this
+  process instance created. Clean sessions get no block, so their prefix bytes
+  are unchanged. Two bounded read-only tools, `session_search` and
+  `session_get`, give the model workspace-scoped recall over the same store
+  (one-line summaries and an 8-message tail, labeled untrusted user data, read
+  on the blocking pool). Resuming stays the user's decision: the hint tells the
+  model to offer a continuation, never to silently take one (#5715).
+- `codewhale exec --hooks` opts a headless run into the same `HookExecutor` the
+  TUI builds — global config, reviewed plugin snapshots, and trusted project
+  `hooks.toml`. Headless runs previously fired no hooks at all. `tool_call_before`
+  can still deny and `shell_env` still applies; a hook `ask` resolves
+  fail-closed without a terminal. Fleet worker subprocesses never opt in, and
+  `permissions.toml` typed rules are unchanged (#6099).
+- `codewhale doctor` flags fleet and profile model pins that the provider's own
+  roster no longer offers. A pin is reported only when a *fresh* cached live
+  roster for that exact route exists and omits it — stale, failed, or absent
+  rosters prove nothing and are counted as `unverifiable` rather than raising a
+  false warning. Each row names the route and every owner of the pin; the pin
+  is surfaced, never rewritten (#6035).
 
 ### Changed
+
+- Configured MCP servers now connect lazily instead of all at session boot. The
+  pool owns a `connecting` set marked at spawn and cleared on resolution or
+  abort, so "connecting" is no longer inferred as enabled-minus-connected. The
+  boot pass scopes to the eager set — `required` servers plus those covered by
+  `tools.always_load` / `allowed_tools` — and a turn naming an unstarted server
+  spawns its connects alongside, under the existing five-second deadline. A
+  configured-but-unstarted server now reads as configured on every surface
+  (session-boot rows, Extensions tab, launch card), never as connecting.
+  `docs/MCP.md` documents the lifecycle (#6033).
+- The launch card's MCP problems row runs its own remedy. It already printed
+  `/mcp login <name>` or `/mcp`; it now joins the shared paint/click/keyboard
+  ordering, so Up/Down lands on it and Enter or a click types the printed
+  command into the composer for you to send. Typing beats copying: no clipboard
+  dependency over SSH, and you see the command before a second Enter runs it
+  (#6085).
 
 - Computer Use is the only computer-use product in Extensions and
   `/mcp recommendations`. Cua is no longer suggested as a parallel
