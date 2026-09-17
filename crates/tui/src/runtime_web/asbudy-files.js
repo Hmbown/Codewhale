@@ -32,8 +32,8 @@
     '.asb-title #asb-mine-count{font-weight:400;letter-spacing:0;color:var(--text-faint)}',
     // 「看我的项目」大按钮（2026-09-16 老板：学老系统，做成的东西放左侧栏；
     // 以前只有预览栏右上角一个小按钮，客户找不到）
-    '.asb-openproj{display:block;width:100%;padding:10px 12px;font:inherit;font-size:14px;font-weight:600;color:#fff;background:#238636;border:0;border-radius:7px;cursor:pointer;text-align:center}',
-    '.asb-openproj:hover{background:#2ea043}',
+    '.asb-openproj{display:block;width:100%;padding:10px 12px;font:inherit;font-size:14px;font-weight:600;color:var(--action-contrast);background:var(--live);border:0;border-radius:7px;cursor:pointer;text-align:center}',
+    '.asb-openproj:hover{background:var(--live)}',
     '.asb-openproj:active{transform:scale(.985)}',
     '.asb-tools{flex:none;color:var(--text-dim);display:flex;gap:10px;align-items:center}',
     '.asb-bd{padding:0 10px 10px;max-height:30vh;overflow-y:auto}',
@@ -47,8 +47,8 @@
     // 固定文件夹的中文小注（老板 2026-09-16：客户看不懂 data / public）
     '.f-node .f-note{flex:none;color:var(--text-faint);font-size:12px;border:1px solid var(--line);border-radius:3px;padding:0 3px;line-height:1.5}',
     '.f-node .f-tag{flex:none;color:var(--text-faint);font-size:12.5px;border:1px solid var(--line);border-radius:3px;padding:0 3px;line-height:1.5}',
-    '.f-node .f-del{flex:none;color:#c9ccd0;padding:0 3px}',
-    '.f-node .f-del:hover{color:#f85149}',
+    '.f-node .f-del{flex:none;color:var(--text-soft);padding:0 3px}',
+    '.f-node .f-del:hover{color:var(--danger)}',
     '.f-node:hover{background:var(--hover)}',
     '.f-node.dir{color:var(--text-soft)}',
     '.f-kids{margin-left:12px;border-left:1px solid var(--line);padding-left:6px}',
@@ -64,8 +64,8 @@
     '.a-ic{flex:none;color:var(--text-soft)}',
     '.a-nm{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
     '.a-meta{flex:none;color:var(--text-faint);font-size:12.5px}',
-    '.a-del{flex:none;color:#c9ccd0;padding:0 3px}',
-    '.a-del:hover{color:#f85149}',
+    '.a-del{flex:none;color:var(--text-soft);padding:0 3px}',
+    '.a-del:hover{color:var(--danger)}',
     '.u-item{font-size:13.5px;color:var(--text);padding:4px 6px;border-radius:var(--radius-control);cursor:pointer;line-height:1.5}',
     '.u-item:hover{background:var(--hover)}',
     '.u-time{color:var(--text-faint);font-size:12.5px}',
@@ -493,27 +493,27 @@
       '.pv-html p{margin:6px 0}',
       '.pv-html ul,.pv-html ol{margin:6px 0;padding-left:22px}',
       '.pv-html li{margin:2px 0}',
-      '.pv-html a{color:#58a6ff}',
-      '.pv-html code{background:#161b22;border-radius:3px;padding:1px 4px;font-size:12.5px;font-family:ui-monospace,monospace}',
-      '.pv-html pre{background:#0b0f14;border:1px solid #30363d;border-radius:6px;padding:10px 12px;margin:8px 0;overflow:auto}',
+      '.pv-html a{color:var(--action)}',
+      '.pv-html code{background:var(--surface-raised);border-radius:3px;padding:1px 4px;font-size:12.5px;font-family:ui-monospace,monospace}',
+      '.pv-html pre{background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:10px 12px;margin:8px 0;overflow:auto}',
       '.pv-html pre code{background:none;padding:0}',
       '.pv-html table{border-collapse:collapse;margin:10px 0;font-size:13px;max-width:100%}',
-      '.pv-html th,.pv-html td{border:1px solid #30363d;padding:4px 8px;text-align:left;vertical-align:top}',
-      '.pv-html th{background:#161b22;font-weight:600}',
-      '.pv-html blockquote{border-left:3px solid #30363d;margin:8px 0;padding:2px 12px;color:#8b949e}',
-      '.pv-html hr{border:0;border-top:1px solid #30363d;margin:14px 0}',
+      '.pv-html th,.pv-html td{border:1px solid var(--line);padding:4px 8px;text-align:left;vertical-align:top}',
+      '.pv-html th{background:var(--surface-raised);font-weight:600}',
+      '.pv-html blockquote{border-left:3px solid var(--line);margin:8px 0;padding:2px 12px;color:var(--text-dim)}',
+      '.pv-html hr{border:0;border-top:1px solid var(--line);margin:14px 0}',
       '.pv-html img{max-width:100%}',
       // extract.py 里的提示文字（.x-mut = 说明/截断提示；.slide = pptx 的一页）
-      '.pv-html .x-mut{color:#8b949e;font-size:13px}',
-      '.pv-html .slide{border:1px solid #30363d;border-radius:8px;padding:10px 14px;margin:10px 0}',
-      '.pv-html .slide-no{color:#8b949e;font-size:12px;margin-bottom:6px}'
+      '.pv-html .x-mut{color:var(--text-dim);font-size:13px}',
+      '.pv-html .slide{border:1px solid var(--line);border-radius:8px;padding:10px 14px;margin:10px 0}',
+      '.pv-html .slide-no{color:var(--text-dim);font-size:12px;margin-bottom:6px}'
     ].join('\n');
     document.head.appendChild(s);
   }
 
   function textBody(text) {
     var pre = document.createElement('pre');
-    pre.style.cssText = 'margin:0;padding:16px;overflow:auto;font:12px/1.5 ui-monospace,monospace;color:#e6edf3;white-space:pre-wrap;word-break:break-all';
+    pre.style.cssText = 'margin:0;padding:16px;overflow:auto;font:12px/1.5 ui-monospace,monospace;color:var(--text);white-space:pre-wrap;word-break:break-all';
     pre.textContent = text;
     return pre;
   }
@@ -521,7 +521,7 @@
     ensurePreviewCss();
     var div = document.createElement('div');
     div.className = 'pv-html';
-    div.style.cssText = 'margin:0;padding:16px;overflow:auto;color:#e6edf3;font-size:14px;line-height:1.6';
+    div.style.cssText = 'margin:0;padding:16px;overflow:auto;color:var(--text);font-size:14px;line-height:1.6';
     // 内容是后端 extract.py 生成的，里面所有文字都先 html.escape 过（markdown 也一样），
     // 所以客户文件里就算写了 <script> 也只会原样显示成文字
     div.innerHTML = html;
@@ -534,26 +534,26 @@
     var wrap = document.createElement('div');
     wrap.style.cssText = 'display:flex;flex-direction:column;height:100%;min-height:0';
     var bar = document.createElement('div');
-    bar.style.cssText = 'display:flex;gap:6px;padding:7px 12px;border-bottom:1px solid #30363d;flex:0 0 auto';
+    bar.style.cssText = 'display:flex;gap:6px;padding:7px 12px;border-bottom:1px solid var(--line);flex:0 0 auto';
     var stage = document.createElement('div');
     stage.style.cssText = 'flex:1;min-height:0;overflow:auto';
     function mkBtn(label) {
       var b = document.createElement('button');
       b.type = 'button'; b.textContent = label;
-      b.style.cssText = 'border:1px solid #30363d;background:transparent;border-radius:6px;padding:3px 10px;font-size:13px;cursor:pointer;color:#e6edf3';
+      b.style.cssText = 'border:1px solid var(--line);background:transparent;border-radius:6px;padding:3px 10px;font-size:13px;cursor:pointer;color:var(--text)';
       return b;
     }
     var bWeb = mkBtn('看网页'), bCode = mkBtn('看代码');
     function paint(web) {
-      bWeb.style.color = web ? '#e6edf3' : '#8b949e';
-      bCode.style.color = web ? '#8b949e' : '#e6edf3';
-      bWeb.style.borderColor = web ? '#58a6ff' : '#30363d';
-      bCode.style.borderColor = web ? '#30363d' : '#58a6ff';
+      bWeb.style.color = web ? 'var(--text)' : 'var(--text-dim)';
+      bCode.style.color = web ? 'var(--text-dim)' : 'var(--text)';
+      bWeb.style.borderColor = web ? 'var(--action)' : 'var(--line)';
+      bCode.style.borderColor = web ? 'var(--line)' : 'var(--action)';
       stage.innerHTML = '';
       if (web) {
         var f = document.createElement('iframe');
         f.src = d.url; f.title = '网页预览';
-        f.style.cssText = 'width:100%;height:100%;min-height:70vh;border:0;background:#fff';
+        f.style.cssText = 'width:100%;height:100%;min-height:70vh;border:0;background:var(--action-contrast)';
         stage.appendChild(f);
       } else {
         stage.appendChild(textBody(d.text || ''));
@@ -578,7 +578,7 @@
     img.onerror = function () {
       wrap.innerHTML = '';
       var p = document.createElement('div');
-      p.style.cssText = 'color:#8b949e;font-size:13px';
+      p.style.cssText = 'color:var(--text-dim);font-size:13px';
       p.textContent = '图片无法显示（文件可能损坏或格式不受支持）。请点击右上角「下载」查看。';
       wrap.appendChild(p);
     };
@@ -593,15 +593,15 @@
     }
     var f = document.createElement('iframe');
     f.src = url; f.title = 'PDF 预览';
-    f.style.cssText = 'width:100%;height:70vh;border:0;background:#fff';
+    f.style.cssText = 'width:100%;height:70vh;border:0;background:var(--action-contrast)';
     return f;
   }
   function tableBody(d) {
     var wrap = document.createElement('div');
-    wrap.style.cssText = 'margin:0;padding:16px;overflow:auto;color:#e6edf3;font-size:14px;line-height:1.6';
+    wrap.style.cssText = 'margin:0;padding:16px;overflow:auto;color:var(--text);font-size:14px;line-height:1.6';
     if (d.sheet) {
       var sh = document.createElement('div');
-      sh.style.cssText = 'margin-bottom:8px;color:#8b949e;font-size:13px';
+      sh.style.cssText = 'margin-bottom:8px;color:var(--text-dim);font-size:13px';
       sh.textContent = '工作表：' + d.sheet;
       wrap.appendChild(sh);
     }
@@ -615,7 +615,7 @@
       var tr = document.createElement('tr');
       for (var c = 0; c < maxCols; c++) {
         var cell = document.createElement(r === 0 ? 'th' : 'td');
-        cell.style.cssText = 'border:1px solid #30363d;padding:4px 8px;text-align:left;white-space:nowrap;' + (r === 0 ? 'background:#161b22;font-weight:600' : '');
+        cell.style.cssText = 'border:1px solid var(--line);padding:4px 8px;text-align:left;white-space:nowrap;' + (r === 0 ? 'background:var(--surface-raised);font-weight:600' : '');
         cell.textContent = (rows[r][c] == null ? '' : rows[r][c]);
         tr.appendChild(cell);
       }
@@ -668,16 +668,16 @@
     var old = document.getElementById('asbudy-preview'); if (old) old.remove();
     var d = document.createElement('div'); d.id = 'asbudy-preview';
     d.style.cssText = 'position:fixed;inset:0;z-index:10000;background:rgba(0,0,0,.62);display:flex;align-items:center;justify-content:center';
-    var box = document.createElement('div'); box.style.cssText = 'background:#0d1117;border:1px solid #30363d;border-radius:12px;max-width:82vw;max-height:86vh;display:flex;flex-direction:column;overflow:hidden';
-    var head = document.createElement('div'); head.style.cssText = 'display:flex;justify-content:space-between;align-items:center;padding:10px 16px;border-bottom:1px solid #30363d;gap:12px';
-    var t = document.createElement('span'); t.style.cssText = 'font-size:14px;color:#e6edf3'; t.textContent = name;
+    var box = document.createElement('div'); box.style.cssText = 'background:var(--surface);border:1px solid var(--line);border-radius:12px;max-width:82vw;max-height:86vh;display:flex;flex-direction:column;overflow:hidden';
+    var head = document.createElement('div'); head.style.cssText = 'display:flex;justify-content:space-between;align-items:center;padding:10px 16px;border-bottom:1px solid var(--line);gap:12px';
+    var t = document.createElement('span'); t.style.cssText = 'font-size:14px;color:var(--text)'; t.textContent = name;
     var acts = document.createElement('div'); acts.style.cssText = 'display:flex;gap:8px;align-items:center';
     if (download) {
       var dl = document.createElement('a'); dl.textContent = '下载'; dl.href = download;
-      dl.style.cssText = 'border:1px solid #30363d;color:#8b949e;font-size:13px;cursor:pointer;border-radius:6px;padding:3px 10px;text-decoration:none';
+      dl.style.cssText = 'border:1px solid var(--line);color:var(--text-dim);font-size:13px;cursor:pointer;border-radius:6px;padding:3px 10px;text-decoration:none';
       acts.appendChild(dl);
     }
-    var x = document.createElement('button'); x.textContent = '关闭'; x.style.cssText = 'background:none;border:1px solid #30363d;color:#8b949e;font-size:13px;cursor:pointer;border-radius:6px;padding:3px 10px';
+    var x = document.createElement('button'); x.textContent = '关闭'; x.style.cssText = 'background:none;border:1px solid var(--line);color:var(--text-dim);font-size:13px;cursor:pointer;border-radius:6px;padding:3px 10px';
     x.onclick = function () { d.remove(); };
     acts.appendChild(x);
     head.appendChild(t); head.appendChild(acts);
@@ -717,7 +717,7 @@
     var s = document.createElement('span');
     s.id = 'preview-updated';
     s.textContent = text;
-    s.style.cssText = 'margin-left:10px;font-size:12.5px;color:' + (color || '#3fb950');
+    s.style.cssText = 'margin-left:10px;font-size:12.5px;color:' + (color || 'var(--live)');
     var title = head.querySelector('.preview-title');
     if (title) title.appendChild(s); else head.appendChild(s);
     setTimeout(function () { if (s.parentNode) s.remove(); }, 2600);
@@ -735,7 +735,7 @@
     var f = frameEl();
     if (!f || f.hidden) return;
     // 客户正在 iframe 里点东西/填表（焦点在页面里）→ 别把页面重载掉，挂个提示让他自己决定
-    if (document.activeElement === f) { previewNotice('有更新 · 点击「刷新」查看', '#d29922'); return; }
+    if (document.activeElement === f) { previewNotice('有更新 · 点击「刷新」查看', 'var(--human)'); return; }
     f.src = f.src;
     previewNotice('已更新');
   }
@@ -939,15 +939,15 @@
     if (old) { old.remove(); return; }
     var m = document.createElement('div');
     m.id = 'asbudy-upmenu';
-    m.style.cssText = 'position:fixed;z-index:99999;background:#0d1117;border:1px solid #30363d;border-radius:8px;padding:4px;box-shadow:0 8px 24px rgba(0,0,0,.5)';
+    m.style.cssText = 'position:fixed;z-index:99999;background:var(--surface);border:1px solid var(--line);border-radius:8px;padding:4px;box-shadow:0 8px 24px rgba(0,0,0,.5)';
     var r = anchor.getBoundingClientRect();
     m.style.left = Math.max(8, r.left - 40) + 'px';
     m.style.top = (r.bottom + 4) + 'px';
     [['选文件（可多选）', upInput], ['选整个文件夹', dirInput]].forEach(function (it) {
       var d = document.createElement('div');
       d.textContent = it[0];
-      d.style.cssText = 'padding:7px 12px;font-size:13.5px;color:#e6edf3;cursor:pointer;border-radius:5px;white-space:nowrap';
-      d.onmouseenter = function () { d.style.background = '#21262d'; };
+      d.style.cssText = 'padding:7px 12px;font-size:13.5px;color:var(--text);cursor:pointer;border-radius:5px;white-space:nowrap';
+      d.onmouseenter = function () { d.style.background = 'var(--line)'; };
       d.onmouseleave = function () { d.style.background = 'transparent'; };
       d.onclick = function () { m.remove(); it[1].click(); };
       m.appendChild(d);

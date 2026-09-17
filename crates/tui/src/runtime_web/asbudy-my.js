@@ -27,44 +27,44 @@
     '#asbudy-layer{position:fixed;inset:0;background:rgba(2,7,17,.72);z-index:99999;display:flex;align-items:center;justify-content:center}',
     // 2026-09-17 老板：设置面板在电脑上是手机样式（宽 420）—— 弹层默认按桌面尺寸来，
     // 小屏再用 92vw 兜住。配色仍是旧的 GitHub 深色（不在这次的改动范围，已单独记档）。
-    '.ab-box{background:#0d1117;border:1px solid #30363d;border-radius:12px;width:min(880px,92vw);max-height:88vh;display:flex;flex-direction:column;overflow:hidden;box-shadow:0 12px 48px rgba(0,0,0,.6)}',
-    '.ab-head{display:flex;justify-content:space-between;align-items:center;padding:12px 18px;border-bottom:1px solid #30363d;gap:14px}',
-    '.ab-title{font-size:15px;color:#e6edf3;font-weight:600}',
-    '.ab-x{color:#8b949e;cursor:pointer;font-size:14px;border:1px solid #30363d;border-radius:6px;padding:3px 10px;background:transparent}',
-    '.ab-x:hover{color:#e6edf3;border-color:#8b949e}',
+    '.ab-box{background:var(--surface);border:1px solid var(--line);border-radius:12px;width:min(880px,92vw);max-height:88vh;display:flex;flex-direction:column;overflow:hidden;box-shadow:0 12px 48px rgba(0,0,0,.6)}',
+    '.ab-head{display:flex;justify-content:space-between;align-items:center;padding:12px 18px;border-bottom:1px solid var(--line);gap:14px}',
+    '.ab-title{font-size:15px;color:var(--text);font-weight:600}',
+    '.ab-x{color:var(--text-dim);cursor:pointer;font-size:14px;border:1px solid var(--line);border-radius:6px;padding:3px 10px;background:transparent}',
+    '.ab-x:hover{color:var(--text);border-color:var(--text-dim)}',
     '.ab-body{padding:14px 18px;overflow:auto}',
-    '.ab-menu-item{display:block;width:100%;text-align:left;padding:12px 14px;border:1px solid #21262d;border-radius:8px;margin-bottom:8px;cursor:pointer;background:transparent;color:#e6edf3;font-size:14px}',
-    '.ab-menu-item:hover{border-color:#58a6ff;background:#58a6ff0d}',
-    '.ab-menu-item small{display:block;color:#8b949e;font-size:13.5px;margin-top:3px}',
-    '.ab-card{border:1px solid #21262d;border-radius:9px;padding:11px 13px;margin-bottom:9px}',
+    '.ab-menu-item{display:block;width:100%;text-align:left;padding:12px 14px;border:1px solid var(--line);border-radius:8px;margin-bottom:8px;cursor:pointer;background:transparent;color:var(--text);font-size:14px}',
+    '.ab-menu-item:hover{border-color:var(--action);background:var(--action-soft)}',
+    '.ab-menu-item small{display:block;color:var(--text-dim);font-size:13.5px;margin-top:3px}',
+    '.ab-card{border:1px solid var(--line);border-radius:9px;padding:11px 13px;margin-bottom:9px}',
     '.ab-card-top{display:flex;justify-content:space-between;align-items:center;gap:10px}',
-    '.ab-n{color:#e6edf3;font-size:14px}',
-    '.ab-s{color:#8b949e;font-size:13.5px;margin-top:3px;line-height:1.5}',
-    '.ab-btn{background:#238636;color:#fff;border:none;border-radius:7px;padding:7px 14px;font-size:14px;cursor:pointer}',
-    '.ab-btn:hover{background:#2ea043}',
-    '.ab-btn.ghost{background:transparent;color:#8b949e;border:1px solid #30363d}',
-    '.ab-btn.ghost:hover{color:#e6edf3;border-color:#8b949e}',
-    '.ab-btn.danger{background:#8b2c2c}.ab-btn.danger:hover{background:#a33}',
+    '.ab-n{color:var(--text);font-size:14px}',
+    '.ab-s{color:var(--text-dim);font-size:13.5px;margin-top:3px;line-height:1.5}',
+    '.ab-btn{background:var(--live);color:var(--action-contrast);border:none;border-radius:7px;padding:7px 14px;font-size:14px;cursor:pointer}',
+    '.ab-btn:hover{background:var(--live)}',
+    '.ab-btn.ghost{background:transparent;color:var(--text-dim);border:1px solid var(--line)}',
+    '.ab-btn.ghost:hover{color:var(--text);border-color:var(--text-dim)}',
+    '.ab-btn.danger{background:rgba(255,134,178,.22)}.ab-btn.danger:hover{background:#a33}',
     '.ab-btn.sm{padding:4px 10px;font-size:13.5px}',
     '.ab-row{display:flex;gap:8px;align-items:center;margin-bottom:10px}',
-    '.ab-row>label{color:#8b949e;font-size:14px;min-width:70px}',
-    '.ab-input{flex:1;background:#010409;border:1px solid #30363d;border-radius:7px;color:#e6edf3;padding:7px 10px;font-size:14px;box-sizing:border-box}',
-    '.ab-input:focus{outline:none;border-color:#58a6ff}',
-    '.ab-chk{display:flex;align-items:center;gap:8px;padding:6px 0;color:#e6edf3;font-size:14px;cursor:pointer}',
-    '.ab-tip{color:#8b949e;font-size:13.5px;line-height:1.6;margin-bottom:12px}',
+    '.ab-row>label{color:var(--text-dim);font-size:14px;min-width:70px}',
+    '.ab-input{flex:1;background:var(--bg);border:1px solid var(--line);border-radius:7px;color:var(--text);padding:7px 10px;font-size:14px;box-sizing:border-box}',
+    '.ab-input:focus{outline:none;border-color:var(--action)}',
+    '.ab-chk{display:flex;align-items:center;gap:8px;padding:6px 0;color:var(--text);font-size:14px;cursor:pointer}',
+    '.ab-tip{color:var(--text-dim);font-size:13.5px;line-height:1.6;margin-bottom:12px}',
     '.ab-msg{font-size:14px;margin-top:10px;min-height:16px}',
-    '.ab-msg.err{color:#f85149}.ab-msg.ok{color:#3fb950}',
-    '.ab-chip{display:flex;align-items:center;gap:8px;margin:0 0 8px;padding:6px 10px;border:1px solid #3b7ddd66;background:#3b7ddd14;border-radius:8px;font-size:13.5px;color:#e6edf3;width:fit-content}',
-    '.ab-chip b{color:#58a6ff;font-weight:600}',
-    '.ab-chip-x{cursor:pointer;color:#8b949e;padding:0 4px;font-size:15px;line-height:1}',
-    '.ab-chip-x:hover{color:#f85149}',
+    '.ab-msg.err{color:var(--danger)}.ab-msg.ok{color:var(--live)}',
+    '.ab-chip{display:flex;align-items:center;gap:8px;margin:0 0 8px;padding:6px 10px;border:1px solid rgba(106,174,242,.4);background:var(--action-soft);border-radius:8px;font-size:13.5px;color:var(--text);width:fit-content}',
+    '.ab-chip b{color:var(--action);font-weight:600}',
+    '.ab-chip-x{cursor:pointer;color:var(--text-dim);padding:0 4px;font-size:15px;line-height:1}',
+    '.ab-chip-x:hover{color:var(--danger)}',
     '.fact-chip[data-asbudy-model]{cursor:pointer}',
     '.fact-chip[data-asbudy-model] strong{text-decoration:underline;text-underline-offset:2px;text-decoration-style:dotted}',
-    '.fact-chip[data-asbudy-model]:hover strong{color:#58a6ff}',
-    '#asbudy-tick{font-size:13.5px;color:#8b949e;padding:0 0 6px 2px}',
+    '.fact-chip[data-asbudy-model]:hover strong{color:var(--action)}',
+    '#asbudy-tick{font-size:13.5px;color:var(--text-dim);padding:0 0 6px 2px}',
     '#asbudy-msgbar{display:flex;flex-wrap:wrap;align-items:center;gap:8px;padding:0 0 6px 2px}',
-    '#asbudy-msgbar button{font:inherit;font-size:13.5px;color:#8b949e;background:transparent;border:1px solid #30363d;border-radius:6px;padding:3px 10px;cursor:pointer}',
-    '#asbudy-msgbar button:hover{color:#e6edf3}',
+    '#asbudy-msgbar button{font:inherit;font-size:13.5px;color:var(--text-dim);background:transparent;border:1px solid var(--line);border-radius:6px;padding:3px 10px;cursor:pointer}',
+    '#asbudy-msgbar button:hover{color:var(--text)}',
   ].join('\n');
   document.head.appendChild(st);
 
@@ -229,11 +229,11 @@
     var st = document.createElement('style');
     st.textContent = '#asbudy-fixbar{position:fixed;left:50%;transform:translateX(-50%);top:64px;z-index:99998;'
       + 'display:flex;align-items:center;gap:12px;max-width:92vw;padding:10px 16px;border-radius:10px;'
-      + 'background:#3a2a10;border:1px solid #9e6a03;color:#e6edf3;font-size:13.5px;line-height:1.5;'
+      + 'background:rgba(246,196,83,.15);border:1px solid var(--human);color:var(--text);font-size:13.5px;line-height:1.5;'
       + 'box-shadow:0 8px 28px rgba(0,0,0,.55)}'
-      + '#asbudy-fixbar button{flex:none;font:inherit;font-size:13.5px;font-weight:600;color:#fff;background:#238636;'
+      + '#asbudy-fixbar button{flex:none;font:inherit;font-size:13.5px;font-weight:600;color:var(--action-contrast);background:var(--live);'
       + 'border:0;border-radius:7px;padding:7px 13px;cursor:pointer}'
-      + '#asbudy-fixbar button:hover{background:#2ea043}'
+      + '#asbudy-fixbar button:hover{background:var(--live)}'
       + '#asbudy-fixbar button:disabled{opacity:.6;cursor:default}';
     document.head.appendChild(st);
     var bar = document.createElement('div');
@@ -335,7 +335,7 @@
             groups.sort(function (a, b) { return (b.p.id === cur ? 1 : 0) - (a.p.id === cur ? 1 : 0); });
             list.innerHTML = groups.map(function (g) {
               var same = !thProvider || g.p.id === thProvider;
-              var head = '<div style="color:#8b949e;font-size:13px;margin:12px 0 6px">' +
+              var head = '<div style="color:var(--text-dim);font-size:13px;margin:12px 0 6px">' +
                 esc(g.p.display_name || g.p.id) + (g.p.id === cur ? '（默认）' : '') + '</div>';
               if (!g.models.length) return head + '<div class="ab-tip">这个提供商没有模型目录</div>';
               return head + g.models.map(function (m) {
@@ -345,7 +345,7 @@
                 if (m.image_input === 'supported') sub.push('可看图');
                 return '<button class="ab-menu-item" data-m="' + esc(m.id) + '" data-p="' + esc(g.p.id) + '"' +
                   (same ? '' : ' style="opacity:.6"') + '>' + esc(m.id) + (on ? '（当前）' : '') +
-                  '<small style="' + (on ? 'color:#58a6ff' : '') + '">' + esc(sub.join(' · ')) + '</small></button>';
+                  '<small style="' + (on ? 'color:var(--action)' : '') + '">' + esc(sub.join(' · ')) + '</small></button>';
               }).join('');
             }).join('');
             list.querySelectorAll('button[data-m]').forEach(function (b) {
@@ -439,10 +439,10 @@
         var on = !!st.granted;
         var html = '<div class="ab-tip">平台协助排查问题时，需以你的视角进入（看到的就是你当前的界面）。<br>' +
           '<b>仅你可开启此开关，管理员无法代开</b>；可随时关闭。</div>';
-        html += '<div style="margin:12px 0 14px;padding:10px 12px;border:1px solid ' + (on ? '#3fb950' : '#30363d') +
-          ';border-radius:8px">当前状态：<b style="color:' + (on ? '#3fb950' : '#8b949e') + '">' +
+        html += '<div style="margin:12px 0 14px;padding:10px 12px;border:1px solid ' + (on ? 'var(--live)' : 'var(--line)') +
+          ';border-radius:8px">当前状态：<b style="color:' + (on ? 'var(--live)' : 'var(--text-dim)') + '">' +
           (on ? '已开启' : '未开启') + '</b>' +
-          (on && st.until ? '<div style="color:#8b949e;font-size:13.5px;margin-top:4px">有效期到 ' +
+          (on && st.until ? '<div style="color:var(--text-dim);font-size:13.5px;margin-top:4px">有效期到 ' +
             esc(new Date(st.until).toLocaleString()) + '</div>' : '') + '</div>';
         if (on) {
           html += '<button class="ab-menu-item" id="ab-c-off">关闭平台协助<small>关闭后平台将无法进入</small></button>';
@@ -540,7 +540,7 @@
               if (it) {
                 var s = it.querySelector('small');
                 if (s) s.textContent = '有 ' + fresh + ' 条跑完还没看的结果';
-                it.style.borderColor = '#3fb950';
+                it.style.borderColor = 'var(--live)';
               }
             }
           });
@@ -590,7 +590,7 @@
                 '<div class="ab-s">登录账号：' + esc(s.user) + ' ｜ 项目额度：' + esc(s.quota) + ' 个' +
                 ' ｜ 资料空间：' + (s.quotaMb ? esc(s.quotaMb) + ' MB' : '默认') +
                 (s.projects && s.projects.length ? ' ｜ 已自建：' + esc(s.projects.join('、')) : '') + '<br>' +
-                '可看项目：' + (granted.length ? esc(granted.join('、')) : '<span style="color:#d29922">未分配</span>') + '</div></div></div>';
+                '可看项目：' + (granted.length ? esc(granted.join('、')) : '<span style="color:var(--human)">未分配</span>') + '</div></div></div>';
               var acts = document.createElement('div');
               acts.style.cssText = 'display:flex;gap:7px;margin-top:10px;flex-wrap:wrap';
               var bEdit = document.createElement('button'); bEdit.className = 'ab-btn ghost sm'; bEdit.type = 'button'; bEdit.textContent = '编辑';
@@ -626,13 +626,13 @@
           : '<div class="ab-row"><label>登录账号</label><input class="ab-input" id="f-user" value="' + esc(rec.user) + '" disabled></div>') +
         '<div class="ab-row"><label>名字</label><input class="ab-input" id="f-name" placeholder="显示用，如「小王」" value="' + (isNew ? '' : esc(rec.name || '')) + '"></div>' +
         '<div class="ab-row"><label>密码</label><input class="ab-input" id="f-pw" type="password" placeholder="' + (isNew ? '至少 8 位' : '留空 = 不改') + '"></div>' +
-        '<div class="ab-row"><label>项目额度</label><input class="ab-input" id="f-quota" type="number" min="0" max="50" value="' + (isNew ? 2 : esc(rec.quota)) + '" style="max-width:110px"><span style="color:#8b949e;font-size:13.5px">可创建项目数上限</span></div>' +
-        '<div class="ab-row"><label>资料空间</label><input class="ab-input" id="f-quotamb" type="number" min="0" placeholder="MB，留空 = 默认" value="' + (isNew || !rec.quotaMb ? '' : esc(rec.quotaMb)) + '" style="max-width:130px"><span style="color:#8b949e;font-size:13.5px">ta 能上传多少资料（不能超过你自己的）</span></div>' +
-        '<div style="margin:12px 0 6px;color:#e6edf3;font-size:14px">可访问的项目' + (isNew ? '（建完再分配也行）' : '') + '</div>' +
+        '<div class="ab-row"><label>项目额度</label><input class="ab-input" id="f-quota" type="number" min="0" max="50" value="' + (isNew ? 2 : esc(rec.quota)) + '" style="max-width:110px"><span style="color:var(--text-dim);font-size:13.5px">可创建项目数上限</span></div>' +
+        '<div class="ab-row"><label>资料空间</label><input class="ab-input" id="f-quotamb" type="number" min="0" placeholder="MB，留空 = 默认" value="' + (isNew || !rec.quotaMb ? '' : esc(rec.quotaMb)) + '" style="max-width:130px"><span style="color:var(--text-dim);font-size:13.5px">ta 能上传多少资料（不能超过你自己的）</span></div>' +
+        '<div style="margin:12px 0 6px;color:var(--text);font-size:14px">可访问的项目' + (isNew ? '（建完再分配也行）' : '') + '</div>' +
         '<div id="f-projs">' + (projects.length
           ? projects.map(function (p) {
               var on = !isNew && (rec.grants || []).indexOf(p.key) >= 0;
-              return '<label class="ab-chk"><input type="checkbox" value="' + esc(p.key) + '"' + (on ? ' checked' : '') + '> ' + esc(p.name) + ' <span style="color:#8b949e;font-size:13.5px">（' + esc(p.key) + '）</span></label>';
+              return '<label class="ab-chk"><input type="checkbox" value="' + esc(p.key) + '"' + (on ? ' checked' : '') + '> ' + esc(p.name) + ' <span style="color:var(--text-dim);font-size:13.5px">（' + esc(p.key) + '）</span></label>';
             }).join('')
           : '<div class="ab-tip">名下暂无项目。</div>') + '</div>' +
         '<div style="display:flex;gap:8px;margin-top:16px"><button class="ab-btn" id="f-save" type="button">保存</button>' +
@@ -679,7 +679,7 @@
         '<div class="ab-tip">客户上传的资料与回收站占用合计不得超过此值。<br>单位 G；0 表示不限制。</div>' +
         '<div class="ab-row"><label>资料空间</label><input class="ab-input" id="sp-g" type="number" min="0" step="0.5" value="'
           + (u.quotaMb ? (Math.round(u.quotaMb / 1024 * 10) / 10) : 1) + '" style="max-width:110px">'
-          + '<span style="color:#8b949e;font-size:13.5px">G（当前已用 ' + fmtSpace(u.spaceMb || 0) + '）</span></div>' +
+          + '<span style="color:var(--text-dim);font-size:13.5px">G（当前已用 ' + fmtSpace(u.spaceMb || 0) + '）</span></div>' +
         '<div style="display:flex;gap:8px;margin-top:16px"><button class="ab-btn" id="sp-save" type="button">保存</button>' +
         '<button class="ab-btn ghost" id="sp-cancel" type="button">取消</button></div><div class="ab-msg" id="sp-msg"></div>';
       var msgEl = body.querySelector('#sp-msg');
@@ -741,7 +741,7 @@
         '<div class="ab-row"><label>登录账号</label><input class="ab-input" id="c-user" placeholder="字母数字，2~32 位"></div>' +
         '<div class="ab-row"><label>公司名</label><input class="ab-input" id="c-name" placeholder="显示用，如「XX 公司」"></div>' +
         '<div class="ab-row"><label>密码</label><input class="ab-input" id="c-pw" type="password" placeholder="至少 8 位"></div>' +
-        '<div class="ab-row"><label>资料空间</label><input class="ab-input" id="c-space" type="number" min="0" step="0.5" value="1" style="max-width:110px"><span style="color:#8b949e;font-size:13.5px">G，0 = 不限（客户能传多少资料）</span></div>' +
+        '<div class="ab-row"><label>资料空间</label><input class="ab-input" id="c-space" type="number" min="0" step="0.5" value="1" style="max-width:110px"><span style="color:var(--text-dim);font-size:13.5px">G，0 = 不限（客户能传多少资料）</span></div>' +
         '<div style="display:flex;gap:8px;margin-top:16px"><button class="ab-btn" id="c-save" type="button">保存</button>' +
         '<button class="ab-btn ghost" id="c-cancel" type="button">取消</button></div><div class="ab-msg" id="c-msg"></div>';
       var msgEl = body.querySelector('#c-msg');
@@ -792,8 +792,8 @@
             var card = document.createElement('div'); card.className = 'ab-card';
             card.innerHTML = '<div class="ab-card-top"><div><div class="ab-n">' + esc(p.name) + '</div>' +
               '<div class="ab-s">' + (p.paused
-                ? '<span style="color:#d29922">已暂停（已释放资源）</span>'
-                : '<span style="color:#3fb950">运行中</span>') +
+                ? '<span style="color:var(--human)">已暂停（已释放资源）</span>'
+                : '<span style="color:var(--live)">运行中</span>') +
               (p.editable ? '' : ' ｜ 此项目无独立运行环境') + '</div></div></div>';
             var acts = document.createElement('div'); acts.style.cssText = 'display:flex;gap:7px;margin-top:10px;flex-wrap:wrap';
             if (p.editable) {
@@ -817,7 +817,7 @@
             if (p.workbench) {
               var wbHint = document.createElement('div');
               wbHint.className = 'ab-s';
-              wbHint.style.cssText = 'align-self:center;color:#8b949e';
+              wbHint.style.cssText = 'align-self:center;color:var(--text-dim)';
               wbHint.textContent = '工作台不可删除，可暂停';
               acts.appendChild(wbHint);
             } else {
@@ -867,8 +867,8 @@
             if (!arr.length) return;
             var h = document.createElement('div');
             h.style.cssText = 'margin:18px 0 7px';
-            h.innerHTML = '<div style="font-size:14.5px;font-weight:600;color:#c9d1d9">' + title + '</div>' +
-              (hint ? '<div style="font-size:12.5px;color:#8b949e;margin-top:3px">' + hint + '</div>' : '');
+            h.innerHTML = '<div style="font-size:14.5px;font-weight:600;color:var(--text-soft)">' + title + '</div>' +
+              (hint ? '<div style="font-size:12.5px;color:var(--text-dim);margin-top:3px">' + hint + '</div>' : '');
             el.appendChild(h);
             arr.forEach(function (p) { el.appendChild(cardOf(p)); });
           }
@@ -905,11 +905,11 @@
         html += '<div class="ab-tip">每个项目默认上限 ' + fmtMb(d.defaultQuotaMb) + '；超出后上传与改动将被阻止。</div>';
         if (!(d.projects || []).length) html += '<div class="ab-tip">名下暂无项目。</div>';
         (d.projects || []).forEach(function (p) {
-          var bar = '<div style="height:6px;background:#21262d;border-radius:3px;margin-top:8px;overflow:hidden">' +
-            '<div style="height:100%;width:' + Math.min(100, p.pct || 0) + '%;background:' + (p.over ? '#f85149' : '#3fb950') + '"></div></div>';
+          var bar = '<div style="height:6px;background:var(--line);border-radius:3px;margin-top:8px;overflow:hidden">' +
+            '<div style="height:100%;width:' + Math.min(100, p.pct || 0) + '%;background:' + (p.over ? 'var(--danger)' : 'var(--live)') + '"></div></div>';
           html += '<div class="ab-card"><div class="ab-n">' + esc(p.name) + '</div>' +
             '<div class="ab-s">已用 ' + fmtMb(p.totalMb) + ' / ' + fmtMb(p.quotaMb) + '（' + (p.pct || 0) + '%）' +
-            (p.over ? ' <span style="color:#f85149">⚠️ 满了，先清一下</span>' : '') + '</div>' + bar +
+            (p.over ? ' <span style="color:var(--danger)">⚠️ 满了，先清一下</span>' : '') + '</div>' + bar +
             (p.parts || []).map(function (x) {
               return '<div class="ab-s">· ' + esc(x.what) + '：' + (x.mb == null ? '读不到' : fmtMb(x.mb)) + '</div>';
             }).join('') +
@@ -1013,9 +1013,9 @@
     var st = run.status || '';
     var fresh = run.created_at && (!seenIso || String(run.created_at) > String(seenIso));
     var html = '上次：' + esc(abLocal(run.created_at)) + ' ' + esc(abRunState(st));
-    if (fresh) html += ' <span style="color:#3fb950">● 新结果</span>';
-    if (st === 'failed') html += ' <span style="color:#f85149">—— 执行失败</span>';
-    else if (fresh && st === 'completed') html += ' <span style="color:#8b949e">—— 已完成</span>';
+    if (fresh) html += ' <span style="color:var(--live)">● 新结果</span>';
+    if (st === 'failed') html += ' <span style="color:var(--danger)">—— 执行失败</span>';
+    else if (fresh && st === 'completed') html += ' <span style="color:var(--text-dim)">—— 已完成</span>';
     box.innerHTML = html;
   }
 
@@ -1056,7 +1056,7 @@
         var act = projs.filter(function (p) { return p.active; })[0] || projs[0] || null;
         var list = Array.isArray(rs[1].body) ? rs[1].body : ((rs[1].body && rs[1].body.automations) || []);
         if (!rs[1].ok) {
-          el.innerHTML = '<div class="ab-tip" style="color:#f85149">读不到定时任务：' +
+          el.innerHTML = '<div class="ab-tip" style="color:var(--danger)">读不到定时任务：' +
             esc((rs[1].body && rs[1].body.error) || ('HTTP ' + rs[1].code)) + '</div>';
           return;
         }
@@ -1078,13 +1078,13 @@
         holder.innerHTML = list.map(function (a) {
           return '<div class="ab-card" id="au-' + esc(a.id) + '">' +
             '<div class="ab-card-top"><span class="ab-n">' + esc(a.name || '（没名字）') + '</span>' +
-            '<span class="ab-s" style="margin:0;color:' + (a.status === 'active' ? '#3fb950' : '#d29922') + '">' +
+            '<span class="ab-s" style="margin:0;color:' + (a.status === 'active' ? 'var(--live)' : 'var(--human)') + '">' +
             (a.status === 'active' ? '启用中' : '已暂停') + '</span></div>' +
             '<div class="ab-s">' + esc(abRruleHuman(a.rrule)) +
             (a.next_run_at ? ' · 下次 ' + esc(abLocal(a.next_run_at)) : '') + '</div>' +
             '<div class="ab-s" id="au-run-' + esc(a.id) + '">上次：查中…</div>' +
-            '<div class="ab-s" id="au-res-' + esc(a.id) + '" style="color:#8b949e"></div>' +
-            '<div class="ab-s" style="color:#8b949e">任务内容：' + esc((a.prompt || '').slice(0, 110)) +
+            '<div class="ab-s" id="au-res-' + esc(a.id) + '" style="color:var(--text-dim)"></div>' +
+            '<div class="ab-s" style="color:var(--text-dim)">任务内容：' + esc((a.prompt || '').slice(0, 110)) +
             ((a.prompt || '').length > 110 ? '…' : '') + '</div>' +
             '<div style="display:flex;gap:8px;margin-top:9px;flex-wrap:wrap">' +
             '<button class="ab-btn sm" data-act="run" data-id="' + esc(a.id) + '">立刻跑一次</button>' +
@@ -1283,7 +1283,7 @@
             known[it[0]] = 1;
             rows += abSkillCard(it[1], it[2], sk);
           });
-          if (rows) html += '<div style="margin:12px 0 6px;color:#e6edf3;font-size:14px">' + esc(g[0]) + '</div>' + rows;
+          if (rows) html += '<div style="margin:12px 0 6px;color:var(--text);font-size:14px">' + esc(g[0]) + '</div>' + rows;
         });
         var rest = [];
         for (var j = 0; j < list.length; j++) if (!known[list[j].name]) rest.push(list[j]);
@@ -1372,7 +1372,7 @@
             '<div class="ab-n">' + esc(e.summary || '（空白）') + '</div>' +
             '<div class="ab-s">' + esc(abScopeName(e.scope)) +
             (e.line_start != null ? ' · 出自 MEMORY.md 第 ' + esc(e.line_start) + ' 行' : '') +
-            (e.stale ? ' · <span style="color:#d29922">来源文件改过了，可能过期</span>' : '') +
+            (e.stale ? ' · <span style="color:var(--human)">来源文件改过了，可能过期</span>' : '') +
             '</div></div>';
         }).join('') : ('<div class="ab-tip">' + (key ? '无匹配结果。' : '暂无记忆内容。') + '</div>');
       }
@@ -1388,7 +1388,7 @@
           var mem = rs[1].body || {};
           entries = mem.entries || [];
           if (!rs[1].ok) {
-            el.innerHTML = '<div class="ab-tip" style="color:#f85149">读不到记忆：' +
+            el.innerHTML = '<div class="ab-tip" style="color:var(--danger)">读不到记忆：' +
               esc(mem.error || ('HTTP ' + rs[1].code)) + '</div>';
             return;
           }
@@ -1483,20 +1483,20 @@
         var u = d.usage;
         el.innerHTML =
           '<div class="ab-tip">以下设置会应用到<b>你的所有项目</b>（含以后新建的）。</div>' +
-          '<div class="ab-row"><label>模型服务</label><span class="ab-input" style="cursor:default;color:#8b949e;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' +
+          '<div class="ab-row"><label>模型服务</label><span class="ab-input" style="cursor:default;color:var(--text-dim);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' +
             esc(mk.provider || '—') + ' · ' + esc(mk.model || '—') + ' · ' + (mk.hasKey ? '已配置密钥' : '未配置密钥') +
           '</span><button class="ab-btn ghost sm" id="adv-mk" type="button" style="flex:0 0 auto">修改</button></div>' +
-          '<div class="ab-row"><label>代码仓库</label><span class="ab-input" style="cursor:default;color:#8b949e;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' +
+          '<div class="ab-row"><label>代码仓库</label><span class="ab-input" style="cursor:default;color:var(--text-dim);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' +
             esc(repoSummary(repo)) +
           '</span><button class="ab-btn ghost sm" id="adv-repo" type="button" style="flex:0 0 auto">设置</button></div>' +
-          '<div style="margin:14px 0 6px;color:#e6edf3;font-size:14px">执行前</div>' +
+          '<div style="margin:14px 0 6px;color:var(--text);font-size:14px">执行前</div>' +
           '<div class="ab-row"><label>审批方式</label><select class="ab-input" id="adv-approval">' +
             '<option value="suggest"' + (am === 'suggest' ? ' selected' : '') + '>每步都先问我（默认）</option>' +
             '<option value="auto"' + (am === 'auto' ? ' selected' : '') + '>小的自己做，拿不准才问我</option>' +
             '<option value="bypass"' + (am === 'bypass' ? ' selected' : '') + '>全部自己做，不问</option>' +
           '</select></div>' +
           '<div class="ab-tip" style="margin:-4px 0 10px 78px">选择「全部自己做」后，AI 改文件、执行命令将不再询问；不确定时建议保持默认。</div>' +
-          '<div style="margin:14px 0 6px;color:#e6edf3;font-size:14px">显示</div>' +
+          '<div style="margin:14px 0 6px;color:var(--text);font-size:14px">显示</div>' +
           '<label class="ab-chk"><input type="checkbox" id="adv-think"' + (cfg.show_thinking ? ' checked' : '') + '> 显示思考过程</label>' +
           '<label class="ab-chk"><input type="checkbox" id="adv-think-exp"' + (cfg.thinking_default_expanded ? ' checked' : '') + '> 默认展开思考过程</label>' +
           '<label class="ab-chk"><input type="checkbox" id="adv-tools"' + (cfg.show_tool_details ? ' checked' : '') + '> 显示文件与命令明细</label>' +
@@ -1508,7 +1508,7 @@
             '<option value="usd"' + (cur === 'usd' ? ' selected' : '') + '>美元 $</option>' +
           '</select></div>' +
           '<label class="ab-chk"><input type="checkbox" id="adv-ro"' + (d.previewReadOnly ? ' checked' : '') + '> 只读模式</label>' +
-          '<div style="margin:14px 0 6px;color:#e6edf3;font-size:14px">用量统计</div>' +
+          '<div style="margin:14px 0 6px;color:var(--text);font-size:14px">用量统计</div>' +
           (u
             ? '<div class="ab-card"><div class="ab-s">累计 ' + (DISPLAY.cost_currency === 'cny'
                 ? '￥' + Number(u.costCny || 0).toFixed(2)
@@ -1599,7 +1599,7 @@
       }).join('');
       body.innerHTML =
         '<div class="ab-tip">使用你自己的模型服务：选择服务商、填写密钥。改一次，你名下所有项目都生效（以后新建的也自动带上）；留空项将保持不变（端点 / 模型名 / 密钥）。</div>' +
-        (d.helper ? '' : '<div class="ab-tip" style="color:#d29922">⚠️ 服务端还没装「模型密钥」帮手，现在保存不了 —— 让管理员跑一下安装脚本。</div>') +
+        (d.helper ? '' : '<div class="ab-tip" style="color:var(--human)">⚠️ 服务端还没装「模型密钥」帮手，现在保存不了 —— 让管理员跑一下安装脚本。</div>') +
         '<div class="ab-row"><label>用哪家</label><select class="ab-input" id="mk-provider">' + opts + '</select></div>' +
         '<div class="ab-row"><label>端点地址</label><input class="ab-input" id="mk-base" placeholder="留空用这家的官方地址" value="' + esc(d.base_url || '') + '"></div>' +
         '<div class="ab-row"><label>自己的密钥</label><input class="ab-input" id="mk-key" type="password" autocomplete="new-password" placeholder="留空 = 不改（密钥不会回显）"></div>' +
@@ -1699,7 +1699,7 @@
       var html = '<div class="ab-tip">将项目代码连接到你自己的仓库，代码将不再仅存于平台。' +
         '连接后需明确指示「推送到我的仓库」才会推送。</div>';
       if (noHelper) {
-        html += '<div class="ab-tip" style="color:#d29922">⚠️ 服务端还没装「代码仓库」帮手，现在存不了 —— 让管理员跑一下安装脚本。</div>';
+        html += '<div class="ab-tip" style="color:var(--human)">⚠️ 服务端还没装「代码仓库」帮手，现在存不了 —— 让管理员跑一下安装脚本。</div>';
       }
 
       html += '<div class="ab-row"><label>用哪家</label><select class="ab-input" id="rp-platform">' +
@@ -1713,7 +1713,7 @@
         '<button class="ab-btn sm" id="rp-save" type="button"' + (noHelper ? ' disabled' : '') + '>保存地址</button>' +
         '<button class="ab-btn ghost sm" id="rp-clear" type="button"' + (noHelper ? ' disabled' : '') + '>移除地址</button></div>';
 
-      html += '<div style="margin:14px 0 6px;color:#e6edf3;font-size:14px">认证方式</div>';
+      html += '<div style="margin:14px 0 6px;color:var(--text);font-size:14px">认证方式</div>';
       html += '<div class="ab-row"><label>方式</label><select class="ab-input" id="rp-auth">' +
         '<option value="deploy-key"' + (auth === 'deploy-key' ? ' selected' : '') + '>部署密钥（推荐）</option>' +
         '<option value="token"' + (auth === 'token' ? ' selected' : '') + '>访问令牌（https 地址用）</option>' +
@@ -1721,7 +1721,7 @@
 
       var keyBox = '';
       if (d.hasKey && pub) {
-        keyBox += '<label style="color:#8b949e;font-size:13.5px">公钥（粘贴到仓库）</label>' +
+        keyBox += '<label style="color:var(--text-dim);font-size:13.5px">公钥（粘贴到仓库）</label>' +
           '<textarea class="ab-input" id="rp-pub" readonly style="height:70px;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12.5px;margin:4px 0;resize:vertical">' + esc(pub) + '</textarea>' +
           '<div style="display:flex;gap:8px;margin-bottom:8px"><button class="ab-btn sm" id="rp-copy" type="button">复制公钥</button>' +
           '<button class="ab-btn danger sm" id="rp-delkey" type="button" style="margin-left:auto">删掉密钥</button></div>';
@@ -1742,7 +1742,7 @@
         '<div class="ab-tip" style="margin-top:8px">令牌仅存储于本项目内，不会写入对话，也不会回显。</div>';
       html += '<div id="rp-tokenbox"' + (auth === 'token' ? '' : ' hidden') + '>' + tokBox + '</div>';
 
-      html += '<div style="margin:14px 0 6px;color:#e6edf3;font-size:14px">现在怎么样</div>';
+      html += '<div style="margin:14px 0 6px;color:var(--text);font-size:14px">现在怎么样</div>';
       html += '<div class="ab-card"><div class="ab-s" id="rp-state">' + esc(repoStateLine(d)) + '</div></div>';
       html += '<div class="ab-msg" id="rp-msg"></div>';
       body.innerHTML = html;
@@ -1818,7 +1818,7 @@
       var opRoleTxt = me.operatorRole === 'admin' ? '管理员' : me.operatorRole === 'staff' ? '员工' : '客户老板';
       function row(k, v) {
         return '<div class="ab-row"><label>' + k + '</label>' +
-          '<span class="ab-input" style="cursor:default;color:#e6edf3;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc(v) + '</span></div>';
+          '<span class="ab-input" style="cursor:default;color:var(--text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc(v) + '</span></div>';
       }
       var html = '<div class="ab-tip">这是你的登录账号；「名字」仅用于显示。</div>';
       html += row('名字', me.name || me.user || '—');
@@ -1827,7 +1827,7 @@
       if (me.role === 'staff') html += row('归属', me.ownerName ? ('归「' + me.ownerName + '」管') : '平台直接管');
       if (typeof me.quota === 'number') html += row('能建几个项目', me.quota + ' 个');
       if (me.viewAs) {
-        html += '<div class="ab-tip" style="color:#d29922;border-color:#d2992255">' +
+        html += '<div class="ab-tip" style="color:var(--human);border-color:rgba(246,196,83,.33)">' +
           '⚠️ 你现在是以「' + esc(me.name || me.viewAs) + '」的视角在看；真实登录的是 ' +
           esc(me.operator || '') + '（' + opRoleTxt + '）。</div>' +
           '<div style="display:flex;gap:8px;margin-top:12px">' +
@@ -2087,7 +2087,7 @@
       //   现在**永远显示**：没数据就说「记性 —」，鼠标移上去告诉为什么。
       function show(txt, title, hot) {
         el.textContent = txt;
-        el.style.color = hot ? '#f85149' : '#8b949e';
+        el.style.color = hot ? 'var(--danger)' : 'var(--text-dim)';
         el.title = title;
         el.style.cursor = 'help';
       }
@@ -2199,9 +2199,9 @@
     bar.innerHTML = '<span>' + text + '</span><button type="button" aria-label="关闭">✕</button>';
     var st = document.createElement('style');
     st.textContent = '#asbudy-tip{position:fixed;left:50%;transform:translateX(-50%);top:12px;z-index:99998;display:flex;' +
-      'align-items:center;gap:10px;background:#0d1117;border:1px solid #30363d;border-radius:10px;padding:9px 12px;' +
-      'box-shadow:0 8px 24px rgba(0,0,0,.5);color:#c9d1d9;font-size:13.5px;max-width:88vw;transition:opacity .3s}' +
-      '#asbudy-tip b{color:#e6edf3}#asbudy-tip button{background:none;border:0;color:#8b949e;cursor:pointer;font-size:13px;padding:0 2px}';
+      'align-items:center;gap:10px;background:var(--surface);border:1px solid var(--line);border-radius:10px;padding:9px 12px;' +
+      'box-shadow:0 8px 24px rgba(0,0,0,.5);color:var(--text-soft);font-size:13.5px;max-width:88vw;transition:opacity .3s}' +
+      '#asbudy-tip b{color:var(--text)}#asbudy-tip button{background:none;border:0;color:var(--text-dim);cursor:pointer;font-size:13px;padding:0 2px}';
     document.head.appendChild(st);
     document.body.appendChild(bar);
     function bye() { bar.style.opacity = '0'; setTimeout(function () { bar.remove(); }, 320); }
@@ -2215,7 +2215,7 @@
     tipMark(key);
     var d = document.createElement('div');
     d.className = 'ab-tip';
-    d.style.cssText = 'border:1px solid #3b7ddd66;background:#3b7ddd14;border-radius:8px;padding:8px 11px;margin:0 0 12px';
+    d.style.cssText = 'border:1px solid rgba(106,174,242,.4);background:var(--action-soft);border-radius:8px;padding:8px 11px;margin:0 0 12px';
     d.innerHTML = text;
     body.insertBefore(d, body.firstChild);
   }
@@ -2235,23 +2235,23 @@
   var ckCss = document.createElement('style');
   ckCss.textContent = [
     '#asbudy-checklist{padding:0 0 8px}',
-    '.ck-wrap{border:1px solid #30363d;background:#0d1117;border-radius:10px;padding:10px 12px}',
+    '.ck-wrap{border:1px solid var(--line);background:var(--surface);border-radius:10px;padding:10px 12px}',
     '.ck-hd{display:flex;align-items:center;gap:9px;margin-bottom:8px}',
-    '.ck-hd b{color:#e6edf3;font-size:13.5px;flex:none}',
-    '.ck-bar{flex:1;height:5px;border-radius:3px;background:#21262d;overflow:hidden;display:block}',
-    '.ck-bar i{display:block;height:100%;background:#238636;transition:width .25s}',
-    '.ck-x{background:none;border:0;color:#8b949e;font-size:12.5px;cursor:pointer;flex:none}',
-    '.ck-x:hover{color:#e6edf3}',
+    '.ck-hd b{color:var(--text);font-size:13.5px;flex:none}',
+    '.ck-bar{flex:1;height:5px;border-radius:3px;background:var(--line);overflow:hidden;display:block}',
+    '.ck-bar i{display:block;height:100%;background:var(--live);transition:width .25s}',
+    '.ck-x{background:none;border:0;color:var(--text-dim);font-size:12.5px;cursor:pointer;flex:none}',
+    '.ck-x:hover{color:var(--text)}',
     '.ck-row{display:flex;align-items:center;gap:9px;width:100%;text-align:left;background:none;border:0;',
-    'border-top:1px solid #161b22;padding:8px 0;cursor:pointer;color:#c9d1d9;font:inherit;font-size:13.5px}',
+    'border-top:1px solid var(--surface-raised);padding:8px 0;cursor:pointer;color:var(--text-soft);font:inherit;font-size:13.5px}',
     '.ck-row:first-of-type{border-top:0}',
-    '.ck-row:hover{color:#e6edf3}',
-    '.ck-box{flex:none;width:17px;height:17px;border:1px solid #30363d;border-radius:5px;font-size:12px;',
-    'line-height:15px;text-align:center;color:#3fb950}',
-    '.ck-row.on .ck-box{border-color:#238636;background:#23863622}',
-    '.ck-txt{flex:1}.ck-txt small{display:block;color:#6b7280;font-size:12.5px}',
-    '.ck-go{color:#6b7280}',
-    '.ck-done{border-color:#23863666;background:#23863612;color:#3fb950;font-size:13.5px}',
+    '.ck-row:hover{color:var(--text)}',
+    '.ck-box{flex:none;width:17px;height:17px;border:1px solid var(--line);border-radius:5px;font-size:12px;',
+    'line-height:15px;text-align:center;color:var(--live)}',
+    '.ck-row.on .ck-box{border-color:var(--live);background:var(--live-wash)}',
+    '.ck-txt{flex:1}.ck-txt small{display:block;color:var(--text-dim);font-size:12.5px}',
+    '.ck-go{color:var(--text-dim)}',
+    '.ck-done{border-color:rgba(79,209,197,.4);background:var(--live-wash);color:var(--live);font-size:13.5px}',
   ].join('\n');
   document.head.appendChild(ckCss);
 
@@ -2351,12 +2351,12 @@
       openLayer('你正在替别人操作', function (body) {
         body.innerHTML =
           '<div style="display:flex;gap:12px;align-items:flex-start">' +
-            '<span style="font-size:22px;line-height:1.1;color:#d29922">⚠️</span>' +
+            '<span style="font-size:22px;line-height:1.1;color:var(--human)">⚠️</span>' +
             '<div>' +
-              '<div style="color:#d29922;font-weight:600;margin-bottom:6px">当前视角：' + esc(nm) + '（' + esc(vw) + '）</div>' +
-              '<div style="color:#c9d1d9;font-size:14px;line-height:1.65">' +
+              '<div style="color:var(--human);font-weight:600;margin-bottom:6px">当前视角：' + esc(nm) + '（' + esc(vw) + '）</div>' +
+              '<div style="color:var(--text-soft);font-size:14px;line-height:1.65">' +
                 '你现在看到和操作的，都是<b>这个人的东西</b>；每一步都会留痕。' +
-                '<div style="color:#8b949e;margin-top:8px">回到自己的界面：点侧栏项目名旁的 <b>⇄</b> → 「退出，回到我自己的」。</div>' +
+                '<div style="color:var(--text-dim);margin-top:8px">回到自己的界面：点侧栏项目名旁的 <b>⇄</b> → 「退出，回到我自己的」。</div>' +
               '</div>' +
             '</div>' +
           '</div>';
