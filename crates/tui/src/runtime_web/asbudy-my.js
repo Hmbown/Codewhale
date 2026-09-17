@@ -2379,6 +2379,24 @@
     }, 700);
   })();
 
+  /* 桌面「设置」走这条路进来：URL 带 ?settings=1 → 自动把「高级设置」摊开。
+     为什么不重写一份设置页：这些面板已经在这里了，写第二份就是两份要维护的活；
+     而设置本身（模型服务 / 记忆 / 审批 / 显示项）**都是按人的**，跟哪个项目无关。 */
+  (function () {
+    try {
+      var sp = new URLSearchParams(location.search);
+      if (sp.get('settings') !== '1') return;
+      var tries = 0;
+      var t = setInterval(function () {
+        if (typeof openAdvanced === 'function' && document.getElementById('composer-input')) {
+          clearInterval(t);
+          setTimeout(openAdvanced, 400);
+        }
+        if (++tries > 40) clearInterval(t);   // 最多等 12 秒，等不到就不弹（别把界面卡成半成品）
+      }, 300);
+    } catch (e) { /* 参数读不到就算了 */ }
+  })();
+
   if (!bindLogo()) {
     var tries = 0;
     var t = setInterval(function () { if (bindLogo() || ++tries > 60) clearInterval(t); }, 400);
