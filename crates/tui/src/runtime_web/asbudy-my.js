@@ -410,12 +410,15 @@
        posture=full_access → 官方显示「自动审核」（应该是「完全访问」）
      所以这里**按 permission_posture 重写显示**，并且点它就能改。 */
   var FACT_LABEL = { branch: '分支', provider: '模型商', permission: '审批' };
-  var POSTURE_TEXT = { ask: '每次询问', auto_review: '自动审核', full_access: '完全访问' };
+      // 三档措辞跟「高级设置 → 审批方式」下拉里的**完全同名** —— 两处说同一件事就必须用同一套词
+      //（2026-09-17 老板：「到底是什么关系？两处显示得能不能对应起来？」原来一处「每步都先问我」
+      // 一处「每次询问」，看着就是两个东西。改掉。）
+  var POSTURE_TEXT = { ask: '每次询问', auto_review: '小的自己做', full_access: '全部自己做' };
   // 三档 ↔ 引擎两个字段（跟门卫 syncThreadApproval 同一套映射 —— 改一边必须改另一边）
   var APPROVAL_OPTS = [
-    { m: 'suggest', p: 'ask', a: false, t: '每次询问', d: '每一步都先问你' },
-    { m: 'auto', p: 'auto_review', a: false, t: '自动审核', d: '小的自己做，拿不准才问你' },
-    { m: 'bypass', p: 'full_access', a: true, t: '完全访问', d: '全部自己做，不问' },
+    { m: 'suggest', p: 'ask', a: false, t: '每次询问', d: '每一步都先问我' },
+    { m: 'auto', p: 'auto_review', a: false, t: '小的自己做', d: '拿不准才问我' },
+    { m: 'bypass', p: 'full_access', a: true, t: '全部自己做', d: '不再询问' },
   ];
   function factChipEl(key) { return document.querySelector('#session-facts .fact-chip[data-fact="' + key + '"]'); }
   function localizeFacts() {
@@ -1645,11 +1648,11 @@
           '</span><button class="ab-btn ghost sm" id="adv-repo" type="button" style="flex:0 0 auto">设置</button></div>' +
           '<div style="margin:14px 0 6px;color:var(--text);font-size:14px">执行前</div>' +
           '<div class="ab-row"><label>审批方式</label><select class="ab-input" id="adv-approval">' +
-            '<option value="suggest"' + (am === 'suggest' ? ' selected' : '') + '>每步都先问我（默认）</option>' +
-            '<option value="auto"' + (am === 'auto' ? ' selected' : '') + '>小的自己做，拿不准才问我</option>' +
-            '<option value="bypass"' + (am === 'bypass' ? ' selected' : '') + '>全部自己做，不问</option>' +
+            '<option value="suggest"' + (am === 'suggest' ? ' selected' : '') + '>每次询问 —— 每一步都先问我</option>' +
+            '<option value="auto"' + (am === 'auto' ? ' selected' : '') + '>小的自己做（默认）—— 拿不准才问我</option>' +
+            '<option value="bypass"' + (am === 'bypass' ? ' selected' : '') + '>全部自己做 —— 不再询问</option>' +
           '</select></div>' +
-          '<div class="ab-tip" style="margin:-4px 0 10px 78px">选择「全部自己做」后，AI 改文件、执行命令将不再询问；不确定时建议保持默认。</div>' +
+          '<div class="ab-tip" style="margin:-4px 0 10px 78px">这里的设置对你名下所有项目生效；当前会话会立刻跟着变（对话上方那排小标签就是它）。选「全部自己做」后，AI 改文件、执行命令不再询问。</div>' +
           '<div style="margin:14px 0 6px;color:var(--text);font-size:14px">显示</div>' +
           '<label class="ab-chk"><input type="checkbox" id="adv-think"' + (cfg.show_thinking ? ' checked' : '') + '> 显示思考过程</label>' +
           '<label class="ab-chk"><input type="checkbox" id="adv-think-exp"' + (cfg.thinking_default_expanded ? ' checked' : '') + '> 默认展开思考过程</label>' +
