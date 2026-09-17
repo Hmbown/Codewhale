@@ -979,16 +979,15 @@
               acts.appendChild(wbHint);
             } else {
             var bDel = document.createElement('button');
-            bDel.className = 'ab-btn danger sm';
+            bDel.className = 'ab-btn sm';
             bDel.type = 'button';
-            bDel.textContent = '彻底删除';
+            bDel.textContent = '删除';
             bDel.onclick = function () {
-              // 2026-09-15：以前这里写的是「默认只下线，要真删得去服务器跑 --purge」——
-              // 客户根本做不到，点了删除文件还在。现在点它就是真删（走后端 purge）。
-              if (!confirm('删除项目「' + p.name + '」？\n\n· 代码、数据与运行记录将一并删除，无法恢复\n· 如需暂时停用，请选择「暂停」\n\n确定继续？')) return;
-              api('/_gate/projects/delete', { method: 'POST', body: JSON.stringify({ key: p.key, purge: true }) }).then(function (r2) {
+              // 2026-09-17（老板批准的项目回收站）：删除 = **放进回收站**，不真删 ——
+              //   员工删项目不用等审批；要真删干净，去「回收站」里彻底删除。
+              if (!confirm('删除项目「' + p.name + '」？\n\n· 它会从项目列表移除，并放进回收站，之后可以还原\n· 资料、对话记录与设置都会保留\n\n确定继续？')) return;
+              api('/_gate/projects/delete', { method: 'POST', body: JSON.stringify({ key: p.key }) }).then(function (r2) {
                 if (!r2.ok) { alert((r2.body && r2.body.error) || '删不掉'); return; }
-                // 删干净了没有要说清楚 —— 只下线不删文件时不能装作删了
                 if (r2.body && r2.body.note) alert(r2.body.note);
                 refresh();
               });
