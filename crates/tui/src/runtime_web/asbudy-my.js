@@ -2134,7 +2134,11 @@
     async function fire(kind) {
       if (!LAST_THREAD) { alert('请先发送一条消息'); return; }
       var labels = { retry: '重试', undo: '撤销', compact: '压缩' };
-      if (kind === 'undo' && !confirm('撤销最后这一轮？\n\n这一问一答会从对话里去掉，你那句话回到输入框（可以改了再发）。\n项目里的文件不受影响 —— 要退文件，用左侧的「退回」。')) return;
+      // 退文件的地方随形态变：桌面形态下左侧那个「退回」面板被收起来了，得说桌面上的路
+      var whereUndo = document.body.classList.contains('asb-desk')
+        ? '要退文件，回桌面右键这个项目的图标选「退回」'
+        : '要退文件，用左侧的「退回」';
+      if (kind === 'undo' && !confirm('撤销最后这一轮？\n\n这一问一答会从对话里去掉，你那句话回到输入框（可以改了再发）。\n项目里的文件不受影响 —— ' + whereUndo + '。')) return;
       if (kind === 'compact' && !confirm('压缩当前对话？\n\n将保留要点，超长历史会被总结 —— 可节省上下文，但部分细节会丢失。')) return;
       try {
         var r = await fetch('/v1/threads/' + encodeURIComponent(LAST_THREAD) + '/' + kind, {
