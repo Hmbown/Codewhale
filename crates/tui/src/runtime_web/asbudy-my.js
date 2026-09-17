@@ -795,7 +795,7 @@
         '<div class="ab-row"><label>名字</label><input class="ab-input" id="f-name" placeholder="显示用，如「小王」" value="' + (isNew ? '' : esc(rec.name || '')) + '"></div>' +
         '<div class="ab-row"><label>密码</label><input class="ab-input" id="f-pw" type="password" placeholder="' + (isNew ? '至少 8 位' : '留空 = 不改') + '"></div>' +
         '<div class="ab-row"><label>项目额度</label><input class="ab-input" id="f-quota" type="number" min="0" max="50" value="' + (isNew ? 2 : esc(rec.quota)) + '" style="max-width:110px"><span style="color:var(--text-dim);font-size:13.5px">可创建项目数上限</span></div>' +
-        '<div class="ab-row"><label>空间配额</label><input class="ab-input" id="f-quotamb" type="number" min="0" step="0.5" placeholder="G，留空 = 默认 2G" value="' + (isNew || !rec.quotaMb ? '' : esc(Math.round(rec.quotaMb / 1024 * 10) / 10)) + '" style="max-width:130px"><span style="color:var(--text-dim);font-size:13.5px">ta 能用的总空间（从你名下的池子里出）</span></div>' +
+        '<div class="ab-row"><label>空间配额</label><input class="ab-input" id="f-quotamb" type="number" min="0" step="0.5" placeholder="G，留空 = 默认 2G" value="' + (isNew || !rec.quotaMb ? '' : esc(Math.round(rec.quotaMb / 1024 * 10) / 10)) + '" style="max-width:130px"><span style="color:var(--text-dim);font-size:13.5px">该成员可用的空间上限（计入你的配额）</span></div>' +
         '<div style="margin:12px 0 6px;color:var(--text);font-size:14px">可访问的项目' + (isNew ? '（建完再分配也行）' : '') + '</div>' +
         '<div id="f-projs">' + (projects.length
           ? projects.map(function (p) {
@@ -848,9 +848,9 @@
   }
   /** 给一个客户设「空间配额」（2026-09-17 老板：改成客户级总池子） */
   function openSpaceForm(u, onDone) {
-    openLayer('设空间配额 —— ' + (u.name || u.user), function (body) {
+    openLayer('空间配额 · ' + (u.name || u.user), function (body) {
       body.innerHTML =
-        '<div class="ab-tip">这个客户（含他的所有下级账号）能用的总空间：项目、文件、回收站合计不得超过此值。<br>单位 G；0 表示不限制；不填 = 默认 2G。</div>' +
+        '<div class="ab-tip">该客户及其成员共用的总空间 —— 项目、文件、回收站合并计算。<br>单位 G，0 = 不限制，留空用默认 2G。</div>' +
         '<div class="ab-row"><label>空间配额</label><input class="ab-input" id="sp-g" type="number" min="0" step="0.5" value="'
           + (u.quotaMb ? (Math.round(u.quotaMb / 1024 * 10) / 10) : 2) + '" style="max-width:110px">'
           + '<span style="color:var(--text-dim);font-size:13.5px">G（当前已用 ' + fmtSpace(u.spaceMb || 0) + '）</span></div>' +
@@ -884,9 +884,9 @@
           var card = document.createElement('div'); card.className = 'ab-card';
           card.innerHTML = '<div class="ab-card-top"><div><div class="ab-n">' + esc(u.name || u.user) + '</div>' +
             '<div class="ab-s">账号：' + esc(u.user) + ' ｜ 名下项目：' + ((u.projects && u.projects.length) ? esc(u.projects.join('、')) : '无')
-              + ' ｜ 空间已用 ' + fmtSpace(u.spaceMb || 0) + ' / ' + (u.quotaMb ? fmtSpace(u.quotaMb) : '默认 2G') + '</div></div></div>';
+              + ' ｜ 空间已用 ' + fmtSpace(u.spaceMb || 0) + ' / ' + (u.quotaMb ? fmtSpace(u.quotaMb) : '2G（默认）') + '</div></div></div>';
           var acts = document.createElement('div'); acts.style.cssText = 'display:flex;gap:7px;margin-top:10px';
-          var bSpace = document.createElement('button'); bSpace.className = 'ab-btn ghost sm'; bSpace.type = 'button'; bSpace.textContent = '设空间配额';
+          var bSpace = document.createElement('button'); bSpace.className = 'ab-btn ghost sm'; bSpace.type = 'button'; bSpace.textContent = '设置配额';
           bSpace.onclick = function () { openSpaceForm(u, openUsers); };
           acts.appendChild(bSpace);
           var bStaff = document.createElement('button'); bStaff.className = 'ab-btn ghost sm'; bStaff.type = 'button'; bStaff.textContent = '看员工';
@@ -915,7 +915,7 @@
         '<div class="ab-row"><label>登录账号</label><input class="ab-input" id="c-user" placeholder="字母数字，2~32 位"></div>' +
         '<div class="ab-row"><label>公司名</label><input class="ab-input" id="c-name" placeholder="显示用，如「XX 公司」"></div>' +
         '<div class="ab-row"><label>密码</label><input class="ab-input" id="c-pw" type="password" placeholder="至少 8 位"></div>' +
-        '<div class="ab-row"><label>空间配额</label><input class="ab-input" id="c-space" type="number" min="0" step="0.5" value="2" style="max-width:110px"><span style="color:var(--text-dim);font-size:13.5px">G，0 = 不限（这个客户和它的所有下级账号共用的总空间）</span></div>' +
+        '<div class="ab-row"><label>空间配额</label><input class="ab-input" id="c-space" type="number" min="0" step="0.5" value="2" style="max-width:110px"><span style="color:var(--text-dim);font-size:13.5px">G，0 = 不限制（该客户及其成员共用）</span></div>' +
         '<div style="display:flex;gap:8px;margin-top:16px"><button class="ab-btn" id="c-save" type="button">保存</button>' +
         '<button class="ab-btn ghost" id="c-cancel" type="button">取消</button></div><div class="ab-msg" id="c-msg"></div>';
       var msgEl = body.querySelector('#c-msg');
