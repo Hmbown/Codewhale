@@ -12402,6 +12402,43 @@ fn huggingface_provider_scenario() -> Result<()> {
 }
 
 #[test]
+fn modelscope_provider_scenario() -> Result<()> {
+    // from modelscope_provider_aliases_parse
+    {
+        for alias in ["modelscope", "modelscope-cn"] {
+            assert_eq!(ApiProvider::parse(alias), Some(ApiProvider::Modelscope));
+        }
+    }
+    // from modelscope_provider_uses_direct_defaults
+    {
+        let _lock = lock_test_env();
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let temp_root = env::temp_dir().join(format!(
+            "codewhale-tui-modelscope-defaults-test-{}-{}",
+            std::process::id(),
+            nanos
+        ));
+        fs::create_dir_all(&temp_root)?;
+        let _guard = EnvGuard::new(&temp_root);
+
+        unsafe {
+            env::set_var("CODEWHALE_PROVIDER", "modelscope");
+            env::set_var("MODELSCOPE_API_KEY", "ms-env-key");
+        }
+
+        let config = Config::load(None, None)?;
+        assert_eq!(config.api_provider(), ApiProvider::Modelscope);
+        assert_eq!(config.deepseek_api_key()?, "ms-env-key");
+        assert_eq!(config.deepseek_base_url(), DEFAULT_MODELSCOPE_BASE_URL);
+        assert_eq!(config.default_model(), DEFAULT_MODELSCOPE_MODEL);
+    }
+    Ok(())
+}
+
+#[test]
 fn huggingface_hf_token_env_api_key_resolves() -> Result<()> {
     let _lock = lock_test_env();
     let nanos = SystemTime::now()

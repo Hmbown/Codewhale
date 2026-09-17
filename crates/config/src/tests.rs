@@ -4553,6 +4553,14 @@ fn provider_kind_parses_openrouter_and_novita_aliases() {
         assert_eq!(parsed.provider, ProviderKind::Huggingface);
     }
 
+    for alias in ["modelscope", "modelscope-cn"] {
+        assert_eq!(ProviderKind::parse(alias), Some(ProviderKind::Modelscope));
+
+        let parsed: ConfigToml =
+            toml::from_str(&format!("provider = \"{alias}\"")).expect("modelscope alias");
+        assert_eq!(parsed.provider, ProviderKind::Modelscope);
+    }
+
     for alias in ["deepinfra", "deep-infra", "deep_infra"] {
         assert_eq!(ProviderKind::parse(alias), Some(ProviderKind::Deepinfra));
 
