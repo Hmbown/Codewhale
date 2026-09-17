@@ -1968,3 +1968,26 @@ body.asb-settings-only #asbudy-recycle {
 body.asb-settings-only #asbudy-layer {
   background: var(--bg);
 }
+/* 更关键的一条（2026-09-17 老板：「设置弹窗现在是弹窗包着弹窗，关闭需要关两次」）：
+   设置面板自己那一层**外壳**（.ab-box 的边框/圆角/阴影 + .ab-head 的标题和「关闭」）
+   在桌面形态下是多余的 —— 框应该由**桌面那个窗口**提供。留着就是两层壳、两个关闭按钮。
+   所以这里把它拆平：弹层铺满、盒子的壳全去掉、标题栏整个不显示。
+   注意只限 asb-settings-only（?settings=1 那个 iframe）——
+   从侧栏「我的」点开的弹层还是原样，那里确实需要这层壳。 */
+body.asb-settings-only #asbudy-layer {
+  padding: 0;
+  align-items: stretch;
+  justify-content: stretch;
+}
+body.asb-settings-only .ab-box {
+  width: 100%;
+  max-width: none;
+  height: 100%;
+  max-height: none;
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
+  background: transparent;
+}
+body.asb-settings-only .ab-head { display: none; }
+body.asb-settings-only .ab-body { padding: 16px 18px; }
