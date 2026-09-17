@@ -951,7 +951,16 @@
     // 管理员：项目可转给某个客户；先把客户名单拉回来再开面板
     var isAdmin = !!(ME && ME.role === 'admin');
     var ownersP = isAdmin
-      ? api('/_gate/users').then(function (r) { return (r.body && r.body.users) || []; }).catch(function () { return []; })
+      ? api('/_gate/users').then(function (r) {
+          var us = (r.body && r.body.users) || [];
+          // ⚠️ 名单里**必须带上管理员自己**（2026-09-17 修）：`/_gate/users` 只返客户和员工，
+          //   不含 admin —— 而管理员自己名下项目的 owner = 'admin'，在下拉里匹配不到任何一项，
+          //   浏览器就**默认选中第一个**（= 第一个客户）→ 界面凭空显示成「归属：测试客户」，
+          //   实际归属一点没变（老板 2026-09-17 就是这么被误导的：「动画系统到底归谁？」）。
+          //   后果不止「显示错」：这个下拉是可改的，碰一下就把项目真转走了。
+          var meUser = (r.body && r.body.admin) || (ME && ME.user) || 'admin';
+          return [{ user: meUser, name: '管理员（平台自己）' }].concat(us);
+        }).catch(function () { return []; })
       : Promise.resolve([]);
     ownersP.then(function (owners) { openProjectsWith(owners); });
   }
@@ -1031,6 +1040,15 @@
                 if (o.user === p.owner) op.selected = true;
                 sel.appendChild(op);
               });
+              // 兜底：归属不在名单里（账号被删了 / 老数据）→ **如实显示**并选中它，
+              //   绝不让浏览器自作主张选第一个 —— 那会在界面上写一个错的归属。
+              if (!owners.some(function (o) { return o.user === p.owner; })) {
+                var opx = document.createElement('option');
+                opx.value = p.owner || '';
+                opx.textContent = p.owner ? (p.owner + '（账号已不存在）') : '未设置归属';
+                sel.insertBefore(opx, sel.firstChild);
+                opx.selected = true;
+              }
               sel.onchange = function () {
                 api('/_gate/projects/owner', { method: 'POST', body: JSON.stringify({ key: p.key, owner: sel.value }) })
                   .then(function (r2) {
