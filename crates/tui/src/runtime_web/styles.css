@@ -1915,6 +1915,37 @@ noscript {
    桌面形态下这些东西有自己的去处 —— 我的空间、窗口菜单 —— 不跟会话列表挤一起。
    只是收起来，不是删功能：不带这个标记（手机、单独打开、直接访问项目）一切照旧。 */
 body.asb-desk #asbudy-files,
-body.asb-desk #asbudy-undo {
+body.asb-desk #asbudy-undo,
+body.asb-desk #asbudy-recycle {
   display: none !important;
+}
+
+/* ── 侧栏底部那行 + 分区高度（2026-09-17 老板）────────────────────────────
+   老板：「『本地引擎已连接 / 0.9.13 · …』这里不需要换行（原来就没有换行）；
+   然后让这个位置居于左侧栏最底下，以便让最近会话条目多显示一些」。
+
+   ① 换行：官方 .connection-copy 就是 display:grid（状态一行、版本号一行），
+      不是我们改的，但老板要一行 → 改 flex 横排；挤不下时截断版本号，不得折行
+      （折行会把页脚撑高，反而又挤掉会话列表的位置）。
+   ② 底部悬空 + 会话列表被压：官方 .rail 是 grid，grid-template-rows 是
+      按「子元素顺序」一格一格分的。桌面形态下我们把「项目文件/我的资料/退回」
+      收起来（?desk=1）→ 后面元素整体前移一格。**实测（2026-09-17，1440×900）：**
+        最近会话 @第4行 只得 124px，而回收站卡片 @第5行 拿到 minmax(144px,1fr) 被拉到 325px。
+      改法：桌面形态下重设行模板（前 4 行固定语义，后面交给 grid-auto-rows），
+      并把回收站卡片也一并收起（桌面已经有回收站图标了，不再重复）。 */
+.connection-copy {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+}
+.connection-copy > * {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+body.asb-desk .rail {
+  grid-template-rows: 52px auto auto minmax(144px, 1fr);
+  grid-auto-rows: auto;
 }
