@@ -25,7 +25,9 @@
     // （带 [data-asbudy-my] 前缀，只有脚本真绑上点击才生效）。
     // 2026-09-15：右下角角标、旁边「我的」文字胶囊 —— 都做过，老板说画蛇添足，已拿掉。
     '#asbudy-layer{position:fixed;inset:0;background:rgba(2,7,17,.72);z-index:99999;display:flex;align-items:center;justify-content:center}',
-    '.ab-box{background:#0d1117;border:1px solid #30363d;border-radius:12px;width:420px;max-width:90vw;max-height:86vh;display:flex;flex-direction:column;overflow:hidden;box-shadow:0 12px 48px rgba(0,0,0,.6)}',
+    // 2026-09-17 老板：设置面板在电脑上是手机样式（宽 420）—— 弹层默认按桌面尺寸来，
+    // 小屏再用 92vw 兜住。配色仍是旧的 GitHub 深色（不在这次的改动范围，已单独记档）。
+    '.ab-box{background:#0d1117;border:1px solid #30363d;border-radius:12px;width:min(880px,92vw);max-height:88vh;display:flex;flex-direction:column;overflow:hidden;box-shadow:0 12px 48px rgba(0,0,0,.6)}',
     '.ab-head{display:flex;justify-content:space-between;align-items:center;padding:12px 18px;border-bottom:1px solid #30363d;gap:14px}',
     '.ab-title{font-size:15px;color:#e6edf3;font-weight:600}',
     '.ab-x{color:#8b949e;cursor:pointer;font-size:14px;border:1px solid #30363d;border-radius:6px;padding:3px 10px;background:transparent}',
@@ -2369,6 +2371,9 @@
     try {
       var sp = new URLSearchParams(location.search);
       if (sp.get('settings') !== '1') return;
+      // 这个 iframe 是拿来「只当设置面板用」的 —— 挂个记号让样式把官方三栏（会话/对话/预览）
+      // 收起来。不然老板看到的是「设置面板 + 三栏对话」一起冒出来（2026-09-17 报的）。
+      document.body.classList.add('asb-settings-only');
       var tries = 0;
       var t = setInterval(function () {
         if (typeof openAdvanced === 'function' && document.getElementById('composer-input')) {

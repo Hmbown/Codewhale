@@ -1949,3 +1949,22 @@ body.asb-desk .rail {
   grid-template-rows: 52px auto auto minmax(144px, 1fr);
   grid-auto-rows: auto;
 }
+
+/* ── 「设置」窗口：只当设置面板用（2026-09-17 老板）─────────────────────
+   桌面「设置」开的是一个 iframe（/?p=…&settings=1），里面装的是**完整界面**，
+   设置只是摊在上面的弹层 —— 老板看到的是「设置面板 + 三栏对话」一起冒出来。
+   挂上 asb-settings-only（由 asbudy-my.js 读 ?settings=1 时加）后，
+   把官方那三栏和侧栏里的卡片都收起来，只剩设置自己。 */
+body.asb-settings-only .rail,
+body.asb-settings-only .session,
+body.asb-settings-only .preview-pane,
+body.asb-settings-only .rail-scrim,
+body.asb-settings-only #asbudy-files,
+body.asb-settings-only #asbudy-undo,
+body.asb-settings-only #asbudy-recycle {
+  display: none !important;
+}
+/* 弹层的遮罩本来是半透明黑（让底下的对话透出来）—— 底都没了，让它直接用官方底色 */
+body.asb-settings-only #asbudy-layer {
+  background: var(--bg);
+}
