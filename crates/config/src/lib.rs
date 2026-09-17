@@ -361,6 +361,8 @@ pub struct ProvidersToml {
     #[serde(default, skip_serializing_if = "ProviderConfigToml::is_empty")]
     pub huggingface: ProviderConfigToml,
     #[serde(default, skip_serializing_if = "ProviderConfigToml::is_empty")]
+    pub modelscope: ProviderConfigToml,
+    #[serde(default, skip_serializing_if = "ProviderConfigToml::is_empty")]
     pub together: ProviderConfigToml,
     #[serde(
         default,
@@ -756,6 +758,7 @@ impl ProvidersToml {
             ProviderKind::Ollama => &self.ollama,
             ProviderKind::OllamaCloud => &self.ollama_cloud,
             ProviderKind::Huggingface => &self.huggingface,
+            ProviderKind::Modelscope => &self.modelscope,
             ProviderKind::Together => &self.together,
             ProviderKind::Qianfan => &self.qianfan,
             ProviderKind::OpenaiCodex => &self.openai_codex,
@@ -810,6 +813,7 @@ impl ProvidersToml {
             ProviderKind::Ollama => &mut self.ollama,
             ProviderKind::OllamaCloud => &mut self.ollama_cloud,
             ProviderKind::Huggingface => &mut self.huggingface,
+            ProviderKind::Modelscope => &mut self.modelscope,
             ProviderKind::Together => &mut self.together,
             ProviderKind::Qianfan => &mut self.qianfan,
             ProviderKind::OpenaiCodex => &mut self.openai_codex,
@@ -4280,6 +4284,7 @@ fn provider_passes_model_through(provider: ProviderKind) -> bool {
             | ProviderKind::Ollama
             | ProviderKind::OllamaCloud
             | ProviderKind::Huggingface
+            | ProviderKind::Modelscope
             | ProviderKind::Meta
             | ProviderKind::Xai
             | ProviderKind::Telecomjs
@@ -4800,6 +4805,7 @@ fn default_model_for_provider(provider: ProviderKind) -> &'static str {
         ProviderKind::Ollama => DEFAULT_OLLAMA_MODEL,
         ProviderKind::OllamaCloud => DEFAULT_OLLAMA_CLOUD_MODEL,
         ProviderKind::Huggingface => DEFAULT_HUGGINGFACE_MODEL,
+        ProviderKind::Modelscope => DEFAULT_MODELSCOPE_MODEL,
         ProviderKind::Together => DEFAULT_TOGETHER_MODEL,
         ProviderKind::Qianfan => DEFAULT_QIANFAN_MODEL,
         ProviderKind::OpenaiCodex => DEFAULT_OPENAI_CODEX_MODEL,
@@ -4854,6 +4860,7 @@ fn default_base_url_for_provider(provider: ProviderKind) -> &'static str {
         ProviderKind::Ollama => DEFAULT_OLLAMA_BASE_URL,
         ProviderKind::OllamaCloud => DEFAULT_OLLAMA_CLOUD_BASE_URL,
         ProviderKind::Huggingface => DEFAULT_HUGGINGFACE_BASE_URL,
+        ProviderKind::Modelscope => DEFAULT_MODELSCOPE_BASE_URL,
         ProviderKind::Together => DEFAULT_TOGETHER_BASE_URL,
         ProviderKind::Qianfan => DEFAULT_QIANFAN_BASE_URL,
         ProviderKind::OpenaiCodex => DEFAULT_OPENAI_CODEX_BASE_URL,
@@ -7313,6 +7320,8 @@ struct EnvRuntimeOverrides {
     ollama_cloud_model: Option<String>,
     huggingface_base_url: Option<String>,
     huggingface_model: Option<String>,
+    modelscope_base_url: Option<String>,
+    modelscope_model: Option<String>,
     together_base_url: Option<String>,
     together_model: Option<String>,
     qianfan_base_url: Option<String>,
@@ -7546,6 +7555,12 @@ impl EnvRuntimeOverrides {
                 .filter(|v| !v.trim().is_empty()),
             huggingface_model: std::env::var("HUGGINGFACE_MODEL")
                 .or_else(|_| std::env::var("HF_MODEL"))
+                .ok()
+                .filter(|v| !v.trim().is_empty()),
+            modelscope_base_url: std::env::var("MODELSCOPE_BASE_URL")
+                .ok()
+                .filter(|v| !v.trim().is_empty()),
+            modelscope_model: std::env::var("MODELSCOPE_MODEL")
                 .ok()
                 .filter(|v| !v.trim().is_empty()),
             together_base_url: std::env::var("TOGETHER_BASE_URL")
@@ -7782,6 +7797,7 @@ impl EnvRuntimeOverrides {
             ProviderKind::Ollama => self.ollama_base_url.clone(),
             ProviderKind::OllamaCloud => self.ollama_cloud_base_url.clone(),
             ProviderKind::Huggingface => self.huggingface_base_url.clone(),
+            ProviderKind::Modelscope => self.modelscope_base_url.clone(),
             ProviderKind::Together => self.together_base_url.clone(),
             ProviderKind::Qianfan => self.qianfan_base_url.clone(),
             ProviderKind::OpenaiCodex => self.openai_codex_base_url.clone(),
@@ -7832,6 +7848,7 @@ impl EnvRuntimeOverrides {
             ProviderKind::Novita => self.novita_model.clone(),
             ProviderKind::Fireworks => self.fireworks_model.clone(),
             ProviderKind::Huggingface => self.huggingface_model.clone(),
+            ProviderKind::Modelscope => self.modelscope_model.clone(),
             ProviderKind::Together => self.together_model.clone(),
             ProviderKind::Qianfan => self.qianfan_model.clone(),
             ProviderKind::OpenaiCodex => self.openai_codex_model.clone(),

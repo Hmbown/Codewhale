@@ -199,6 +199,14 @@ pub enum ProviderKind {
     /// [`Google`]: Self::Google
     #[serde(alias = "agy")]
     Antigravity,
+    /// ModelScope — Alibaba's ModelScope inference API (OpenAI-compatible).
+    #[serde(
+        alias = "model-scope",
+        alias = "model_scope",
+        alias = "modelscope-cn",
+        alias = "modelscope_cn"
+    )]
+    Modelscope,
     /// Google — Gemini OpenAI-compatible endpoint. Its own backend, not an
     /// OpenAI alias: thought signatures on tool calls are captured and
     /// replayed per Google's contract.
@@ -266,7 +274,7 @@ impl ProviderKind {
     /// stay on the enum for serde and `provider_for_kind`, but they are not
     /// first-class catalog rows. Plan is `mode` / base_url; dialect is
     /// `wire = openai|anthropic` on the primary provider config.
-    pub const ALL: [Self; 43] = [
+    pub const ALL: [Self; 44] = [
         Self::Deepseek,
         Self::NvidiaNim,
         Self::Openai,
@@ -305,6 +313,7 @@ impl ProviderKind {
         Self::Mistral,
         Self::Telecomjs,
         Self::ModelstudioTokenPlan,
+        Self::Modelscope,
         Self::Google,
         Self::Edenai,
         Self::Concentrate,

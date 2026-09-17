@@ -1183,6 +1183,7 @@ impl Secrets {
 /// | `siliconflow` / `siliconflow-cn` | `SILICONFLOW_API_KEY` |
 /// | `arcee` / `arcee-ai` | `ARCEE_API_KEY` |
 /// | `moonshot` / `kimi` | `MOONSHOT_API_KEY`, `KIMI_API_KEY` |
+/// | `modelscope` / `modelscope-cn` | `MODELSCOPE_API_KEY` |
 /// | `sglang` | `SGLANG_API_KEY` |
 /// | `vllm` | `VLLM_API_KEY` |
 /// | `ollama` | `OLLAMA_API_KEY` |
@@ -1217,6 +1218,9 @@ pub fn env_for(name: &str) -> Option<String> {
         | "silicon-flow-cn" | "silicon_flow_cn" | "siliconflow-china" => &["SILICONFLOW_API_KEY"],
         "arcee" | "arcee-ai" | "arcee_ai" => &["ARCEE_API_KEY"],
         "moonshot" | "moonshot-ai" | "kimi" | "kimi-k2" => &["MOONSHOT_API_KEY", "KIMI_API_KEY"],
+        "modelscope" | "model-scope" | "model_scope" | "modelscope-cn" | "modelscope_cn" => {
+            &["MODELSCOPE_API_KEY"]
+        }
         "sglang" | "sg-lang" => &["SGLANG_API_KEY"],
         "vllm" | "v-llm" => &["VLLM_API_KEY"],
         "ollama" | "ollama-local" => &["OLLAMA_API_KEY"],

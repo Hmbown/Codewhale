@@ -3549,6 +3549,21 @@ fn is_reasoning_model_for_stream_on_route(
         return true;
     }
 
+    // ModelScope's OpenAI-compatible inference API streams hybrid-model
+    // reasoning as `delta.reasoning_content` (the DashScope dialect) for the
+    // Qwen and ZhipuAI families, whose model ids carry a `qwen/` or
+    // `zhipuai/` namespace prefix. Surface those deltas as Thinking instead
+    // of inlining them into the answer text. As with Model Studio above,
+    // `reasoning_content` is deliberately NOT replayed back on later turns:
+    // the provider is absent from `provider_accepts_reasoning_content`, and
+    // the DashScope dialect does not require the reasoning field in history.
+    if provider == ApiProvider::Modelscope {
+        let lower = model.to_ascii_lowercase();
+        if lower.starts_with("qwen/") || lower.starts_with("zhipuai/") {
+            return true;
+        }
+    }
+
     provider_accepts_reasoning_content(provider) && model_supports_reasoning(model)
 }
 

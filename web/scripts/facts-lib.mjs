@@ -87,6 +87,7 @@ const PROVIDER_LABEL_MAP = {
   Ollama: { id: "ollama", label: "Ollama", env: "OLLAMA_API_KEY" },
   OllamaCloud: { id: "ollama-cloud", label: "Ollama Cloud", env: "OLLAMA_CLOUD_API_KEY / OLLAMA_API_KEY" },
   Huggingface: { id: "huggingface", label: "Hugging Face", env: "HUGGINGFACE_API_KEY / HF_TOKEN" },
+  Modelscope: { id: "modelscope", label: "ModelScope", env: "MODELSCOPE_API_KEY" },
   Deepinfra: { id: "deepinfra", label: "DeepInfra", env: "DEEPINFRA_API_KEY / DEEPINFRA_TOKEN" },
   Together: { id: "together", label: "Together AI", env: "TOGETHER_API_KEY" },
   Qianfan: { id: "qianfan", label: "Baidu Qianfan", env: "QIANFAN_API_KEY / BAIDU_QIANFAN_API_KEY" },

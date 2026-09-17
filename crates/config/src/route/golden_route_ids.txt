@@ -19,6 +19,7 @@ meta
 minimax
 minimax-anthropic
 mistral
+modelscope
 modelstudio-coding-plan
 modelstudio-coding-plan-anthropic
 modelstudio-token-plan

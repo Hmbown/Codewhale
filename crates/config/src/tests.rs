@@ -5562,12 +5562,12 @@ fn meta_model_api_scopes_both_documented_key_names_to_official_endpoint() {
 fn provider_metadata_registry_covers_every_provider_kind_once() {
     let providers = provider::all_providers();
     // Full registry keeps legacy dialect/plan kinds for provider_for_kind.
-    assert_eq!(providers.len(), 49);
+    assert_eq!(providers.len(), 50);
     // Catalog surface is one identity per vendor (no dual-wire / plan rows),
     // and never a retired tombstone: Antigravity stays in the full registry
     // so old config parses and can be cleared, but it left `ALL` when it
     // stopped being selectable (PRD §4.4 PROD-002).
-    assert_eq!(ProviderKind::ALL.len(), 43);
+    assert_eq!(ProviderKind::ALL.len(), 44);
     assert!(
         !ProviderKind::ALL.contains(&ProviderKind::Antigravity),
         "a tombstone must never be offered as a selectable provider"

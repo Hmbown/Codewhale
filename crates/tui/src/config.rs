@@ -116,6 +116,8 @@ pub enum ApiProvider {
     /// Retired Antigravity identity retained only to deserialize and clear
     /// legacy Codewhale configuration. It is never selectable or runnable.
     Antigravity,
+    /// ModelScope — Alibaba's ModelScope inference API (OpenAI-compatible).
+    Modelscope,
     /// Jiangsu Telecom TokenHub — OpenAI-compatible AI gateway.
     Telecomjs,
     /// Eden AI — OpenAI-compatible AI gateway (aggregator).
@@ -367,7 +369,7 @@ impl ApiProvider {
 
     /// `ApiProvider` discriminant → `ProviderKind` lookup.
     /// Index 1 is `None` for the legacy `DeepseekCN` variant.
-    const KIND_LOOKUP: [Option<codewhale_config::ProviderKind>; 50] = [
+    const KIND_LOOKUP: [Option<codewhale_config::ProviderKind>; 51] = [
         Some(codewhale_config::ProviderKind::Deepseek),
         None, // DeepseekCN
         Some(codewhale_config::ProviderKind::DeepseekAnthropic),
@@ -409,6 +411,7 @@ impl ApiProvider {
         Some(codewhale_config::ProviderKind::Mistral),
         Some(codewhale_config::ProviderKind::Google),
         Some(codewhale_config::ProviderKind::Antigravity),
+        Some(codewhale_config::ProviderKind::Modelscope),
         Some(codewhale_config::ProviderKind::Telecomjs),
         Some(codewhale_config::ProviderKind::Edenai),
         Some(codewhale_config::ProviderKind::Concentrate),
@@ -421,7 +424,7 @@ impl ApiProvider {
     ];
 
     /// `ProviderKind` discriminant → `ApiProvider` lookup.
-    const FROM_KIND_LOOKUP: [Self; 49] = [
+    const FROM_KIND_LOOKUP: [Self; 50] = [
         Self::Deepseek,
         Self::DeepseekAnthropic,
         Self::NvidiaNim,
@@ -466,6 +469,7 @@ impl ApiProvider {
         Self::ModelstudioCodingPlan,
         Self::ModelstudioCodingPlanAnthropic,
         Self::Antigravity,
+        Self::Modelscope,
         Self::Google,
         Self::Edenai,
         Self::Concentrate,
@@ -1591,6 +1595,7 @@ pub fn model_completion_names_for_provider(provider: ApiProvider) -> Vec<&'stati
         ApiProvider::Huggingface => {
             vec![DEFAULT_HUGGINGFACE_MODEL, DEFAULT_HUGGINGFACE_FLASH_MODEL]
         }
+        ApiProvider::Modelscope => vec![DEFAULT_MODELSCOPE_MODEL],
         ApiProvider::Deepinfra => vec![DEFAULT_DEEPINFRA_MODEL, DEFAULT_DEEPINFRA_FLASH_MODEL],
         ApiProvider::WanjieArk => {
             vec![
@@ -3890,6 +3895,8 @@ pub struct ProvidersConfig {
     pub ollama_cloud: ProviderConfig,
     #[serde(default, alias = "hugging-face", alias = "hf")]
     pub huggingface: ProviderConfig,
+    #[serde(default, alias = "model-scope", alias = "model_scope")]
+    pub modelscope: ProviderConfig,
     #[serde(default, alias = "deep-infra", alias = "deep_infra")]
     pub deepinfra: ProviderConfig,
     #[serde(default, alias = "together-ai")]
@@ -5854,6 +5861,7 @@ impl Config {
             ApiProvider::OllamaCloud => &providers.ollama_cloud,
             ApiProvider::Volcengine => &providers.volcengine,
             ApiProvider::Huggingface => &providers.huggingface,
+            ApiProvider::Modelscope => &providers.modelscope,
             ApiProvider::Deepinfra => &providers.deepinfra,
             ApiProvider::Together => &providers.together,
             ApiProvider::Qianfan => &providers.qianfan,
@@ -5955,6 +5963,7 @@ impl Config {
             ApiProvider::OllamaCloud => &mut providers.ollama_cloud,
             ApiProvider::Volcengine => &mut providers.volcengine,
             ApiProvider::Huggingface => &mut providers.huggingface,
+            ApiProvider::Modelscope => &mut providers.modelscope,
             ApiProvider::Deepinfra => &mut providers.deepinfra,
             ApiProvider::Together => &mut providers.together,
             ApiProvider::Qianfan => &mut providers.qianfan,
@@ -6417,6 +6426,7 @@ impl Config {
             ApiProvider::OllamaCloud => DEFAULT_OLLAMA_CLOUD_MODEL,
             ApiProvider::Volcengine => DEFAULT_VOLCENGINE_MODEL,
             ApiProvider::Huggingface => DEFAULT_HUGGINGFACE_MODEL,
+            ApiProvider::Modelscope => DEFAULT_MODELSCOPE_MODEL,
             ApiProvider::Deepinfra => DEFAULT_DEEPINFRA_MODEL,
             ApiProvider::Together => DEFAULT_TOGETHER_MODEL,
             ApiProvider::Qianfan => DEFAULT_QIANFAN_MODEL,
@@ -6556,6 +6566,7 @@ impl Config {
             | ApiProvider::OllamaCloud
             | ApiProvider::Volcengine
             | ApiProvider::Huggingface
+            | ApiProvider::Modelscope
             | ApiProvider::Deepinfra
             | ApiProvider::Together
             | ApiProvider::Qianfan
@@ -6665,6 +6676,7 @@ impl Config {
                         ApiProvider::OllamaCloud => DEFAULT_OLLAMA_CLOUD_BASE_URL,
                         ApiProvider::Volcengine => DEFAULT_VOLCENGINE_BASE_URL,
                         ApiProvider::Huggingface => DEFAULT_HUGGINGFACE_BASE_URL,
+                        ApiProvider::Modelscope => DEFAULT_MODELSCOPE_BASE_URL,
                         ApiProvider::Deepinfra => DEFAULT_DEEPINFRA_BASE_URL,
                         ApiProvider::Together => DEFAULT_TOGETHER_BASE_URL,
                         ApiProvider::Qianfan => DEFAULT_QIANFAN_BASE_URL,
@@ -8608,6 +8620,7 @@ fn provider_env_base_url_override(provider: ApiProvider) -> Option<String> {
         ApiProvider::Ollama => &["OLLAMA_BASE_URL"],
         ApiProvider::OllamaCloud => &["OLLAMA_CLOUD_BASE_URL"],
         ApiProvider::Huggingface => &["HUGGINGFACE_BASE_URL", "HF_BASE_URL"],
+        ApiProvider::Modelscope => &["MODELSCOPE_BASE_URL"],
         ApiProvider::Meta => &["META_MODEL_API_BASE_URL", "MODEL_API_BASE_URL"],
         ApiProvider::Xai => &["XAI_BASE_URL"],
         ApiProvider::Mistral => &["MISTRAL_BASE_URL"],
@@ -8872,6 +8885,13 @@ fn apply_env_overrides_unlocked(config: &mut Config, policy: ConfigEnvironmentPo
                     .providers
                     .get_or_insert_with(ProvidersConfig::default)
                     .huggingface
+                    .base_url = Some(value);
+            }
+            ApiProvider::Modelscope => {
+                config
+                    .providers
+                    .get_or_insert_with(ProvidersConfig::default)
+                    .modelscope
                     .base_url = Some(value);
             }
             ApiProvider::Deepinfra => {
@@ -9190,6 +9210,16 @@ fn apply_env_overrides_unlocked(config: &mut Config, policy: ConfigEnvironmentPo
             .huggingface
             .base_url = Some(value);
     }
+    if matches!(config.api_provider(), ApiProvider::Modelscope)
+        && let Ok(value) = std::env::var("MODELSCOPE_BASE_URL")
+        && !value.trim().is_empty()
+    {
+        config
+            .providers
+            .get_or_insert_with(ProvidersConfig::default)
+            .modelscope
+            .base_url = Some(value);
+    }
     if matches!(config.api_provider(), ApiProvider::Moonshot)
         && let Ok(value) =
             std::env::var("MOONSHOT_BASE_URL").or_else(|_| std::env::var("KIMI_BASE_URL"))
@@ -9366,6 +9396,7 @@ fn apply_env_overrides_unlocked(config: &mut Config, policy: ConfigEnvironmentPo
                 ApiProvider::OllamaCloud => &mut providers.ollama_cloud,
                 ApiProvider::Volcengine => &mut providers.volcengine,
                 ApiProvider::Huggingface => &mut providers.huggingface,
+                ApiProvider::Modelscope => &mut providers.modelscope,
                 ApiProvider::Deepinfra => &mut providers.deepinfra,
                 ApiProvider::Together => &mut providers.together,
                 ApiProvider::Qianfan => &mut providers.qianfan,
@@ -9586,6 +9617,17 @@ fn apply_env_overrides_unlocked(config: &mut Config, policy: ConfigEnvironmentPo
             .providers
             .get_or_insert_with(ProvidersConfig::default)
             .huggingface
+            .model = Some(value);
+        config.environment_model_applied = true;
+    }
+    if matches!(config.api_provider(), ApiProvider::Modelscope)
+        && let Ok(value) = std::env::var("MODELSCOPE_MODEL")
+        && !value.trim().is_empty()
+    {
+        config
+            .providers
+            .get_or_insert_with(ProvidersConfig::default)
+            .modelscope
             .model = Some(value);
         config.environment_model_applied = true;
     }
@@ -10096,6 +10138,7 @@ pub(crate) fn provider_passes_model_through(provider: ApiProvider) -> bool {
             | ApiProvider::Ollama
             | ApiProvider::OllamaCloud
             | ApiProvider::Huggingface
+            | ApiProvider::Modelscope
             | ApiProvider::Meta
             | ApiProvider::Xai
             | ApiProvider::Telecomjs
@@ -11360,6 +11403,7 @@ fn merge_providers(
             ollama_cloud: merge_provider_config(base.ollama_cloud, override_cfg.ollama_cloud),
             volcengine: merge_provider_config(base.volcengine, override_cfg.volcengine),
             huggingface: merge_provider_config(base.huggingface, override_cfg.huggingface),
+            modelscope: merge_provider_config(base.modelscope, override_cfg.modelscope),
             deepinfra: merge_provider_config(base.deepinfra, override_cfg.deepinfra),
             together: merge_provider_config(base.together, override_cfg.together),
             qianfan: merge_provider_config(base.qianfan, override_cfg.qianfan),
@@ -12058,6 +12102,12 @@ pub fn active_provider_has_config_api_key(config: &Config) -> bool {
         && std::env::var("HUGGINGFACE_API_KEY")
             .or_else(|_| std::env::var("HF_TOKEN"))
             .is_ok_and(|k| !k.trim().is_empty())
+    {
+        return true;
+    }
+    if !custom_endpoint
+        && matches!(provider, ApiProvider::Modelscope)
+        && std::env::var("MODELSCOPE_API_KEY").is_ok_and(|k| !k.trim().is_empty())
     {
         return true;
     }
@@ -12846,6 +12896,11 @@ fn provider_env_api_key(provider: ApiProvider) -> Option<String> {
                     .ok()
                     .filter(|value| !value.trim().is_empty())
             });
+    }
+    if provider == ApiProvider::Modelscope {
+        return std::env::var("MODELSCOPE_API_KEY")
+            .ok()
+            .filter(|value| !value.trim().is_empty());
     }
 
     provider.env_vars().iter().find_map(|var| {

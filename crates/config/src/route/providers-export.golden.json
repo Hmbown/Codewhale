@@ -421,6 +421,24 @@
       "transport": "chat-completions"
     },
     {
+      "id": "modelscope",
+      "family": "modelscope",
+      "label": "ModelScope",
+      "endpoint": "https://api-inference.modelscope.cn/v1",
+      "wire": "chat-completions",
+      "defaultModel": "Qwen/Qwen3.5-397B-A17B",
+      "envVars": [
+        "MODELSCOPE_API_KEY"
+      ],
+      "auth": [
+        {
+          "kind": "api-key",
+          "label": "API key"
+        }
+      ],
+      "transport": "chat-completions"
+    },
+    {
       "id": "modelstudio-coding-plan",
       "family": "alibaba-modelstudio",
       "label": "Alibaba Cloud Model Studio",

@@ -964,6 +964,7 @@ pub(crate) fn mirror_saved_api_key_in_config(
         ApiProvider::Ollama => &mut providers.ollama,
         ApiProvider::OllamaCloud => &mut providers.ollama_cloud,
         ApiProvider::Huggingface => &mut providers.huggingface,
+        ApiProvider::Modelscope => &mut providers.modelscope,
         ApiProvider::Deepinfra => &mut providers.deepinfra,
         ApiProvider::Together => &mut providers.together,
         ApiProvider::Qianfan => &mut providers.qianfan,
