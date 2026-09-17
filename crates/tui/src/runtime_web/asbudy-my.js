@@ -1617,7 +1617,7 @@
           esc(label) + (p.ready ? '（已配置）' : '') + '</option>';
       }).join('');
       body.innerHTML =
-        '<div class="ab-tip">使用你自己的模型服务：选择服务商、填写密钥。留空项将保持不变（端点 / 模型名 / 密钥）。</div>' +
+        '<div class="ab-tip">使用你自己的模型服务：选择服务商、填写密钥。改一次，你名下所有项目都生效（以后新建的也自动带上）；留空项将保持不变（端点 / 模型名 / 密钥）。</div>' +
         (d.helper ? '' : '<div class="ab-tip" style="color:#d29922">⚠️ 服务端还没装「模型密钥」帮手，现在保存不了 —— 让管理员跑一下安装脚本。</div>') +
         '<div class="ab-row"><label>用哪家</label><select class="ab-input" id="mk-provider">' + opts + '</select></div>' +
         '<div class="ab-row"><label>端点地址</label><input class="ab-input" id="mk-base" placeholder="留空用这家的官方地址" value="' + esc(d.base_url || '') + '"></div>' +
@@ -1638,7 +1638,7 @@
       body.querySelector('#mk-clear').onclick = function () {
         var pid = sel.value;
         var nm = (ps.filter(function (x) { return x.id === pid; })[0] || {}).name || pid;
-        if (!confirm('把「' + nm + '」的配置（密钥 / 端点 / 模型名）全删掉？\n如果当前用的就是它，会自动回退到 DeepSeek。')) return;
+        if (!confirm('把「' + nm + '」的配置（密钥 / 端点 / 模型名）全删掉？\n你名下所有项目都会跟着清掉；如果当前用的就是它，会自动回退到 DeepSeek。')) return;
         msg(msgEl, '正在清除…', true);
         api('/_gate/model-key', { method: 'POST', body: JSON.stringify({ provider: pid, clear: true }) }).then(function (r) {
           var b = r.body || {};
@@ -1647,7 +1647,7 @@
             return;
           }
           body.querySelector('#mk-key').value = '';
-          msg(msgEl, '已清除「' + nm + '」的配置', true);
+          msg(msgEl, '已清除「' + nm + '」的配置（你名下所有项目）', true);
         });
       };
       body.querySelector('#mk-save').onclick = function () {
@@ -1663,8 +1663,13 @@
           var b = r.body || {};
           if (!r.ok || b.ok === false) { msg(msgEl, b.error || '保存失败', false); return; }
           body.querySelector('#mk-key').value = '';
-          var what = (b.changed || []).join(' / ') || '无变化';
-          msg(msgEl, '改好了（' + what + '）' + (b.verified ? ' · 引擎已重读并确认' : ''), true);
+          // 2026-09-17：改成「按人」后，反馈要说清楚写到哪些项目了（不再是单个项目的结果）
+          var applied = b.applied || [], skipped = b.skipped || [], failed = b.failed || [];
+          var line = '已存进你的账号';
+          line += applied.length ? ('，写到了 ' + applied.length + ' 个项目') : '，当前没有在运行的项目要写';
+          if (skipped.length) line += '；' + skipped.length + ' 个没在运行，进去时会自动补上';
+          if (failed.length) line += '；' + failed.length + ' 个没写进去（' + ((failed[0] || {}).error || '原因不明') + '）';
+          msg(msgEl, line, failed.length === 0);
         });
       };
     });
