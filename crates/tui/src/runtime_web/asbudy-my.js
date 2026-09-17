@@ -383,6 +383,13 @@
   function bindProviderChip() {
     var chip = document.querySelector('#session-facts .fact-chip[data-fact="provider"] strong');
     if (!chip) return;
+    var box = chip.closest('.fact-chip');
+    if (box && !box.getAttribute('data-asbudy-prov')) {
+      box.setAttribute('data-asbudy-prov', '1');
+      box.title = '模型商 —— 点这里配置';
+      box.style.cursor = 'pointer';
+      box.addEventListener('click', openModelApiLoader);
+    }
     var id = String(chip.textContent || '').trim();
     if (!id) return;
     loadProviderNames().then(function (m) {
@@ -393,12 +400,154 @@
       }
     });
   }
+  /* ── 会话详情那排小标签（2026-09-17 老板）──────────────────────────────
+     老板两条意见：① 英文标签要中文（Branch / Provider / Permission）
+                   ② 除了「模型」，模型商 / 模式 / 审批也应该能点着改。
+     顺手修一个真 bug（档案 §8.7 110）：官方 `permissionLabel` 只看 `auto_approve` 布尔，
+     而门卫给「小的自己做」（auto 档）设的是 `auto_approve=false` + `permission_posture=auto_review`
+     → 官方判成「每次询问」。**两档都会错**：
+       posture=auto_review → 官方显示「每次询问」（应该是「自动审核」，实测见 §8.7 110）
+       posture=full_access → 官方显示「自动审核」（应该是「完全访问」）
+     所以这里**按 permission_posture 重写显示**，并且点它就能改。 */
+  var FACT_LABEL = { branch: '分支', provider: '模型商', permission: '审批' };
+  var POSTURE_TEXT = { ask: '每次询问', auto_review: '自动审核', full_access: '完全访问' };
+  // 三档 ↔ 引擎两个字段（跟门卫 syncThreadApproval 同一套映射 —— 改一边必须改另一边）
+  var APPROVAL_OPTS = [
+    { m: 'suggest', p: 'ask', a: false, t: '每次询问', d: '每一步都先问你' },
+    { m: 'auto', p: 'auto_review', a: false, t: '自动审核', d: '小的自己做，拿不准才问你' },
+    { m: 'bypass', p: 'full_access', a: true, t: '完全访问', d: '全部自己做，不问' },
+  ];
+  function factChipEl(key) { return document.querySelector('#session-facts .fact-chip[data-fact="' + key + '"]'); }
+  function localizeFacts() {
+    var chips = document.querySelectorAll('#session-facts .fact-chip');
+    for (var i = 0; i < chips.length; i++) {
+      var want = FACT_LABEL[chips[i].getAttribute('data-fact') || ''];
+      var lab = chips[i].querySelector('span');
+      if (want && lab && lab.textContent !== want) lab.textContent = want;
+    }
+  }
+  function currentThread() {
+    if (!MODEL_THREAD) return Promise.resolve(null);
+    return api('/v1/threads/' + encodeURIComponent(MODEL_THREAD)).then(function (r) {
+      return (r.body && (r.body.thread || r.body)) || null;
+    }).catch(function () { return null; });
+  }
+  function paintFact(key, text) {
+    var s = document.querySelector('#session-facts .fact-chip[data-fact="' + key + '"] strong');
+    if (s) s.textContent = text;
+  }
+  function bindPermissionChip() {
+    var c = factChipEl('permission');
+    if (!c) return;
+    if (!c.getAttribute('data-asbudy-perm')) {
+      c.setAttribute('data-asbudy-perm', '1');
+      c.title = '审批方式 —— 点这里改';
+      c.style.cursor = 'pointer';
+      c.addEventListener('click', openApprovalPicker);
+    }
+    var strong = c.querySelector('strong');
+    currentThread().then(function (th) {
+      if (!th || !strong) return;
+      var p = String(th.permission_posture || '');
+      var text = POSTURE_TEXT[p] || (th.trust_mode ? '完全访问' : (th.auto_approve ? '自动审核' : '每次询问'));
+      if (strong.textContent !== text) strong.textContent = text;
+    });
+  }
+  /** 把审批档当场写进当前会话（高级设置改完要用；跟门卫 syncThreadApproval 同一套映射）。 */
+  function applyApprovalToThread(mode) {
+    if (!MODEL_THREAD) return;
+    var o = APPROVAL_OPTS.filter(function (x) { return x.m === mode; })[0];
+    if (!o) return;
+    api('/v1/threads/' + encodeURIComponent(MODEL_THREAD), {
+      method: 'PATCH', body: JSON.stringify({ auto_approve: o.a, permission_posture: o.p }),
+    }).then(function () { paintFact('permission', o.t); }).catch(function () { /* 改不动就算了，发消息前门卫还会再拉一次 */ });
+  }
+  function openApprovalPicker() {
+    openLayer('审批方式', function (body) {
+      body.innerHTML =
+        '<div class="ab-tip" style="margin:0 0 12px">AI 执行操作前是否先问你。改完当前会话立刻生效，以后的项目也按这个来。</div>' +
+        '<div id="ap-list"><div class="ab-tip">正在读…</div></div><div class="ab-msg" id="ap-msg"></div>';
+      var list = body.querySelector('#ap-list'), msgEl = body.querySelector('#ap-msg');
+      currentThread().then(function (th) {
+        var cur = th ? String(th.permission_posture || '') : '';
+        list.innerHTML = APPROVAL_OPTS.map(function (o) {
+          var on = cur === o.p;
+          return '<button class="ab-menu-item" data-i="' + o.m + '"' + (on ? ' style="border-color:var(--action)"' : '') + '>' +
+            o.t + (on ? '（当前）' : '') + '<small>' + o.d + '</small></button>';
+        }).join('');
+        list.querySelectorAll('button[data-i]').forEach(function (b) {
+          b.onclick = function () {
+            var o = APPROVAL_OPTS.filter(function (x) { return x.m === b.getAttribute('data-i'); })[0];
+            if (!o) return;
+            b.disabled = true;
+            // 两边一起写：① 这条会话（立刻生效、标签跟着对）② 账号偏好（以后的会话和项目）
+            var jobs = [api('/_gate/prefs', { method: 'POST', body: JSON.stringify({ prefs: { approval_mode: o.m } }) })];
+            if (MODEL_THREAD) jobs.push(api('/v1/threads/' + encodeURIComponent(MODEL_THREAD), {
+              method: 'PATCH', body: JSON.stringify({ auto_approve: o.a, permission_posture: o.p }),
+            }));
+            Promise.all(jobs).then(function (rs) {
+              b.disabled = false;
+              if (rs[0] && !rs[0].ok) { msg(msgEl, (rs[0].body && rs[0].body.error) || '没存下来', false); return; }
+              paintFact('permission', o.t);
+              msg(msgEl, '已改为「' + o.t + '」', true);
+              setTimeout(closeLayer, 900);
+            }).catch(function (e) { b.disabled = false; msg(msgEl, '没改成功：' + ((e && e.message) || e), false); });
+          };
+        });
+      });
+    });
+  }
+  var MODE_TEXT = { agent: '工作', plan: '计划', operate: '运维' };
+  var MODE_OPTS = [
+    { v: 'agent', t: '工作', d: '直接改文件、跑命令' },
+    { v: 'plan', t: '计划', d: '先出方案，先不动手' },
+    { v: 'operate', t: '运维', d: '排查与维护' },
+  ];
+  function bindModeChip() {
+    var c = factChipEl('模式');
+    if (!c || c.getAttribute('data-asbudy-mode')) return;
+    c.setAttribute('data-asbudy-mode', '1');
+    c.title = '模式 —— 点这里改';
+    c.style.cursor = 'pointer';
+    c.addEventListener('click', openModePicker);
+  }
+  function openModePicker() {
+    openLayer('模式', function (body) {
+      body.innerHTML = '<div class="ab-tip" style="margin:0 0 12px">决定它在这次会话里的工作方式。</div>' +
+        '<div id="md-list"><div class="ab-tip">正在读…</div></div><div class="ab-msg" id="md-msg"></div>';
+      var list = body.querySelector('#md-list'), msgEl = body.querySelector('#md-msg');
+      currentThread().then(function (th) {
+        var cur = th ? String(th.mode || '') : '';
+        list.innerHTML = MODE_OPTS.map(function (o) {
+          var on = cur === o.v;
+          return '<button class="ab-menu-item" data-v="' + o.v + '"' + (on ? ' style="border-color:var(--action)"' : '') + '>' +
+            o.t + (on ? '（当前）' : '') + '<small>' + o.d + '</small></button>';
+        }).join('');
+        list.querySelectorAll('button[data-v]').forEach(function (b) {
+          b.onclick = function () {
+            var v = b.getAttribute('data-v');
+            if (!MODEL_THREAD) { msg(msgEl, '先选一个会话', false); return; }
+            b.disabled = true;
+            api('/v1/threads/' + encodeURIComponent(MODEL_THREAD), { method: 'PATCH', body: JSON.stringify({ mode: v }) })
+              .then(function (r) {
+                b.disabled = false;
+                if (!r.ok) { msg(msgEl, (r.body && r.body.error) || '没改成', false); return; }
+                paintFact('模式', MODE_TEXT[v] || v);
+                msg(msgEl, '已切到「' + (MODE_TEXT[v] || v) + '」', true);
+                setTimeout(closeLayer, 900);
+              });
+          };
+        });
+      });
+    });
+  }
   function bindModelChip() {
     var chips = document.querySelectorAll('#session-facts .fact-chip');
     for (var i = 0; i < chips.length; i++) {
       var c = chips[i];
       if (c.getAttribute('data-asbudy-model')) continue;
-      if (String(c.textContent || '').indexOf('模型') !== 0) continue;
+      // ⚠️ 按 data-fact 认，不按文字认 —— 「模型商」也以「模型」开头，按文字认会把它认成模型那个
+      if (c.getAttribute('data-fact') !== '模型') continue;
       c.setAttribute('data-asbudy-model', '1');
       c.title = '切换模型';
       c.addEventListener('click', openModelPicker);
@@ -411,7 +560,12 @@
       if (!facts) return false;
       bindModelChip();
       bindProviderChip();
-      new MutationObserver(function () { bindModelChip(); bindProviderChip(); }).observe(facts, { childList: true, subtree: true });
+      localizeFacts();
+      bindPermissionChip();
+      bindModeChip();
+      new MutationObserver(function () {
+        bindModelChip(); bindProviderChip(); localizeFacts(); bindPermissionChip(); bindModeChip();
+      }).observe(facts, { childList: true, subtree: true });
       return true;
     }
     if (!watch()) {
@@ -1540,6 +1694,10 @@
             }
             msg(msgEl, b.message || '已保存（名下所有项目）', true);
             syncDisplayPref(key, value);
+            // 审批档还牵着「当前这条会话」（引擎里是 permission_posture + auto_approve）：
+            // 不同步的话，对话框上面那个「审批」小标签会一直显示旧值
+            // —— 2026-09-17 老板就是照这个发现的（设了「小的自己做」还显示「每次询问」）。
+            if (key === 'approval_mode') applyApprovalToThread(value);
             return true;
           });
         }
