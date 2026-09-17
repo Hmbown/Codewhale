@@ -410,6 +410,13 @@
        posture=full_access → 官方显示「自动审核」（应该是「完全访问」）
      所以这里**按 permission_posture 重写显示**，并且点它就能改。 */
   var FACT_LABEL = { branch: '分支', provider: '模型商', permission: '审批' };
+  // 客户不需要看的技术标签（键就是官方给的 data-fact）：
+  //   '工作区' —— 官方塞的是工作目录 basename，也就是**项目 key**（如 s9l8fqm），对客户就是乱码；
+  //   branch   —— git 分支，客户既不需要知道也不会去切。
+  // 两个都是**纯展示、没有点击**（实测确认），藏掉不丢功能。
+  // 判据还是 DIRECTION 第 6 条：客户在界面上看不看得见技术概念。
+  // （2026-09-17 老板转来用户的反馈：「看不懂」。）
+  var FACT_HIDE = { '工作区': 1, 'branch': 1 };
       // 三档措辞跟「高级设置 → 审批方式」下拉里的**完全同名** —— 两处说同一件事就必须用同一套词
       //（2026-09-17 老板：「到底是什么关系？两处显示得能不能对应起来？」原来一处「每步都先问我」
       // 一处「每次询问」，看着就是两个东西。改掉。）
@@ -424,9 +431,13 @@
   function localizeFacts() {
     var chips = document.querySelectorAll('#session-facts .fact-chip');
     for (var i = 0; i < chips.length; i++) {
-      var want = FACT_LABEL[chips[i].getAttribute('data-fact') || ''];
+      var key = chips[i].getAttribute('data-fact') || '';
+      // 先中文化、再（按需）隐藏 —— 顺序别反：跳着走会在 DOM 里留下「Branch」这种英文
+      //（测试里那条反证「页面上没有 Branch」就是抓这个的）。
+      var want = FACT_LABEL[key];
       var lab = chips[i].querySelector('span');
       if (want && lab && lab.textContent !== want) lab.textContent = want;
+      if (FACT_HIDE[key]) chips[i].style.display = 'none';
     }
   }
   function currentThread() {
