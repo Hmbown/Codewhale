@@ -1136,29 +1136,35 @@
   function openSpace() {
     openLayer('空间', function (body) {
       body.innerHTML = '<div id="ab-space">加载中…</div>';
-      api('/_gate/usage?force=1').then(function (r) {
-        var d = r.body || {};
+      // ⚠️ 口径跟桌面的「我的空间」**必须是同一个接口**（`/_gate/space` —— 客户级总池子）。
+      //   以前这里用 `/_gate/usage`，三个毛病（2026-09-17 老板问「那是什么」时实测出来的）：
+      //     ① 它不过滤归属 → 员工点开能看到**别人名下的项目**；
+      //     ② 它把**服务器总磁盘**吐给客户（违反硬规矩 ⑲）；
+      //     ③ 口径是旧的「每个项目 1G」。
+      //   接口那边也已同时收敛（取消磁盘输出 ＋ 按人过滤）。
+      api('/_gate/space').then(function (r) {
         var el = body.querySelector('#ab-space');
         if (!el) return;
-        var html = '';
-        if (d.disk) {
-          html += '<div class="ab-card"><div class="ab-n">服务器磁盘</div>' +
-            '<div class="ab-s">可用 ' + fmtMb(d.disk.availMb) + ' / 共 ' + fmtMb(d.disk.totalMb) +
-            '（已用 ' + Math.round((d.disk.usedMb / d.disk.totalMb) * 100) + '%）</div></div>';
+        if (!r.ok) { el.textContent = (r.body && r.body.error) || '读取失败，请稍后重试'; return; }
+        var d = r.body || {};
+        var s = d.summary || {};
+        var pct = (!s.unlimited && s.quotaMb) ? Math.min(100, Math.max(s.usedMb > 0 ? 2 : 0, s.pct || 0)) : 0;
+        var html = '<div class="ab-card"><div class="ab-n">空间</div>' +
+          '<div class="ab-s">已用 ' + fmtMb(s.usedMb) + ' / ' +
+          (s.unlimited ? '不限制' : (fmtMb(s.quotaMb) + '（剩余 ' + fmtMb(s.freeMb) + '）')) + '</div>' +
+          (s.fromClient ? '<div class="ab-s">这是分配给你的额度（计入上级账号的空间）</div>' : '') +
+          '<div style="height:6px;background:var(--line);border-radius:3px;margin-top:8px;overflow:hidden">' +
+          '<div style="height:100%;width:' + pct + '%;background:' + ((s.pct || 0) >= 90 ? 'var(--danger)' : 'var(--live)') + '"></div></div></div>';
+        var items = d.items || [];
+        if (!items.length) {
+          html += '<div class="ab-tip">还没有占用。</div>';
+        } else {
+          html += '<div class="ab-tip">项目、工作台、回收站、文件都从这一个额度里出。</div>';
+          items.forEach(function (it) {
+            html += '<div class="ab-card"><div class="ab-n">' + esc(it.name) + '</div>' +
+              '<div class="ab-s">' + esc(it.group) + ' ｜ ' + fmtMb(it.mb) + '</div></div>';
+          });
         }
-        html += '<div class="ab-tip">每个项目默认上限 ' + fmtMb(d.defaultQuotaMb) + '；超出后上传与改动将被阻止。</div>';
-        if (!(d.projects || []).length) html += '<div class="ab-tip">名下暂无项目。</div>';
-        (d.projects || []).forEach(function (p) {
-          var bar = '<div style="height:6px;background:var(--line);border-radius:3px;margin-top:8px;overflow:hidden">' +
-            '<div style="height:100%;width:' + Math.min(100, p.pct || 0) + '%;background:' + (p.over ? 'var(--danger)' : 'var(--live)') + '"></div></div>';
-          html += '<div class="ab-card"><div class="ab-n">' + esc(p.name) + '</div>' +
-            '<div class="ab-s">已用 ' + fmtMb(p.totalMb) + ' / ' + fmtMb(p.quotaMb) + '（' + (p.pct || 0) + '%）' +
-            (p.over ? ' <span style="color:var(--danger)">⚠️ 满了，先清一下</span>' : '') + '</div>' + bar +
-            (p.parts || []).map(function (x) {
-              return '<div class="ab-s">· ' + esc(x.what) + '：' + (x.mb == null ? '读不到' : fmtMb(x.mb)) + '</div>';
-            }).join('') +
-            '</div>';
-        });
         el.innerHTML = html;
       });
     });
