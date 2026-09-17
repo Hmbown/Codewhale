@@ -313,11 +313,51 @@
       if (!r.ok) throw 0;
       var d = await r.json();
       var items = (d && d.items) || [];
+      var prjs = (d && d.projects) || [];        // 已删除的项目（接口一直在返回，之前没画）
       var cntEl = box.querySelector('#asb-bin-count');
-      if (cntEl) cntEl.textContent = items.length ? '（' + items.length + '）' : '';
-      if (!items.length) { box.hidden = true; binBody.innerHTML = ''; return; }
+      var total = items.length + prjs.length;
+      if (cntEl) cntEl.textContent = total ? '（' + total + '）' : '';
+      // 项目和文件**都空**才整块隐藏。原来只看文件，于是项目回收站里躺着东西、这块却藏着。
+      if (!total) { box.hidden = true; binBody.innerHTML = ''; return; }
       box.hidden = false;
       binBody.innerHTML = '';
+
+      // ── 块一：已删除的项目（跟文件分开摆 —— 两码事，别混一起）──
+      prjs.forEach(function (p) {
+        var row = document.createElement('div');
+        row.className = 'f-node';
+        row.title = p.deletedBy ? ('由 ' + p.deletedBy + ' 删除') : '已删除';
+        row.innerHTML = '<span class="f-ic">▣</span>'
+          + '<span class="f-nm">' + aEsc(p.name) + '</span>'
+          + '<span class="f-sz">' + (p.sizeMb != null ? p.sizeMb + 'M · ' : '') + binTime(p.deletedAt) + '</span>'
+          + '<span class="f-tag" data-act="prestore" style="cursor:pointer" title="让它回到项目列表">还原</span>'
+          + '<span class="f-del" data-act="ppurge" title="彻底删除（不可恢复）">×</span>';
+        row.querySelector('[data-act="prestore"]').onclick = function (ev) {
+          ev.stopPropagation();
+          fetch('/_gate/recycle/projects/restore', { method: 'POST', credentials: 'same-origin',
+            headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ key: p.key }) })
+            .then(function (rr) {
+              if (rr.ok) { loadRecycle(); return; }
+              return rr.json().then(function (j) { alert((j && j.error) || '还原失败'); })
+                .catch(function () { alert('还原失败'); });
+            });
+        };
+        row.querySelector('[data-act="ppurge"]').onclick = function (ev) {
+          ev.stopPropagation();
+          // 彻底删要手打项目名 —— 9-16 误删过一次，这层确认不能省
+          var typed = prompt('彻底删除「' + p.name + '」？\n\n它的文件、资料与对话记录会一并删掉，之后无法恢复。\n想留着以后再用，请选「暂停」而不是删除。\n\n请输入项目名以确认：', '');
+          if (typed !== p.name) { if (typed !== null) alert('名字不对，没有删除。'); return; }
+          fetch('/_gate/recycle/projects', { method: 'DELETE', credentials: 'same-origin',
+            headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ key: p.key }) })
+            .then(function (rr) {
+              if (rr.ok) { loadRecycle(); return; }
+              return rr.json().then(function (j) { alert((j && j.error) || '删不掉'); })
+                .catch(function () { alert('删不掉'); });
+            });
+        };
+        binBody.appendChild(row);
+      });
+
       items.forEach(function (it) {
         var row = document.createElement('div');
         row.className = 'f-node';
