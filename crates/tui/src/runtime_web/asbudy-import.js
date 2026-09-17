@@ -29,9 +29,13 @@
       '.abx-bar{display:flex;gap:10px;flex-wrap:wrap;margin:0 0 14px}',
       '.abx-btn{padding:10px 16px;border:1px solid var(--line);border-radius:8px;background:var(--surface);color:var(--text);font:inherit;font-size:.95em;cursor:pointer}',
       '.abx-btn:hover{border-color:var(--action)}',
-      '.abx-btn:disabled{opacity:.45;cursor:not-allowed}',
+      '.abx-btn:disabled{opacity:.75;cursor:not-allowed;border-color:var(--line);color:var(--text-faint);background:transparent}',
       '.abx-btn.abx-go{background:var(--action);border-color:var(--action);color:var(--action-contrast)}',
       '.abx-btn.abx-go:hover{border-color:var(--action)}',
+      // 禁用的主按钮得**变成灰的**：它权重比上面那条 :disabled 高，又写在后面，才压得住蓝底。
+      // （2026-09-17 老板：「不输入内容或输入错误，删除按钮始终有颜色，应该是灰度」——
+      //   官方那套只降透明度（opacity .45），可红字 / 蓝底降完还是红 / 蓝。）
+      '.abx-btn.abx-go:disabled,.abx-btn.abx-ghost:disabled{background:transparent;border-color:var(--line);color:var(--text-faint)}',
       '.abx-btn.abx-ghost{background:transparent}',
       '.abx-panel{margin:0 0 18px;padding:14px 16px;border:1px solid var(--line);border-radius:10px;background:var(--bg)}',
       '.abx-h2{margin:0 0 12px;font-size:1.05em}',
