@@ -741,3 +741,74 @@ async fn root_fork_of_depth_two_leaf_cannot_regain_a_generation() {
     assert_eq!(spec.runtime_profile.spawn_depth, 2);
     assert!(!spec.runtime_profile.can_spawn_child());
 }
+
+// ── #6282 tool-result cap tests ───────────────────────────────────────────
+
+fn cap_tokens(n: u32) -> std::num::NonZeroU32 {
+    std::num::NonZeroU32::new(n).expect("n > 0")
+}
+
+#[test]
+fn hard_cap_passes_through_content_below_both_caps() {
+    let content = "small".to_string();
+    let capped = hard_cap_tool_result(content.clone(), cap_tokens(10_000));
+    assert_eq!(capped, content);
+    assert!(!capped.contains("truncated"));
+}
+
+#[test]
+fn hard_cap_truncates_content_above_byte_cap_and_stamps_truncated_marker() {
+    let content = "X".repeat(1_048_577); // 1 byte over the 1 MiB cap
+    let capped = hard_cap_tool_result(content, cap_tokens(u32::MAX));
+    assert!(capped.len() <= 1_048_576 + "\n[truncated: true]".len());
+    assert!(capped.ends_with("\n[truncated: true]"));
+    assert!(capped.starts_with('X'));
+}
+
+#[test]
+fn hard_cap_truncates_content_above_token_cap() {
+    // 10k tokens × 3 bytes/token = 30k byte cap. 100k chars should trigger it.
+    let content = "A".repeat(100_000);
+    let capped = hard_cap_tool_result(content, cap_tokens(10_000));
+    // The effective cap is min(30k bytes, 1 MiB) = 30k bytes.
+    let token_cap_bytes = 10_000usize.saturating_mul(3);
+    assert!(capped.len() <= token_cap_bytes + "\n[truncated: true]".len());
+    assert!(capped.ends_with("\n[truncated: true]"));
+}
+
+#[test]
+fn hard_cap_truncates_at_valid_utf8_boundary() {
+    // Build content where 1 MiB boundary falls mid-char.
+    // '好' is 3 bytes in UTF-8.
+    let mut content = String::new();
+    let target = 1_048_576; // exactly at boundary
+    while content.len() < target + 2 {
+        content.push('好');
+    }
+    assert!(content.len() > target);
+    let capped = hard_cap_tool_result(content, cap_tokens(u32::MAX));
+    // Must be valid UTF-8 (no panic during to_string/display).
+    let _ = format!("{capped}");
+    assert!(capped.ends_with("\n[truncated: true]"));
+    // The marker is ASCII; verify the rest is still valid UTF-8.
+    let without_marker = &capped[..capped.len() - "\n[truncated: true]".len()];
+    assert!(std::str::from_utf8(without_marker.as_bytes()).is_ok());
+}
+
+#[test]
+fn hard_cap_respects_custom_max_output_tokens_nonzero() {
+    let content = "X".repeat(10_000);
+    // 100 tokens × 3 bytes = 300 byte cap — much tighter than default.
+    let capped = hard_cap_tool_result(content.clone(), cap_tokens(100));
+    assert!(capped.len() <= 300 + "\n[truncated: true]".len());
+    assert!(capped.ends_with("\n[truncated: true]"));
+}
+
+#[test]
+fn hard_cap_min_token_value_produces_three_byte_cap() {
+    // NonZeroU32::MIN = 1 token → cap at 3 bytes.
+    let content = "hello world".to_string();
+    let capped = hard_cap_tool_result(content, std::num::NonZeroU32::MIN);
+    assert!(capped.len() <= 3 + "\n[truncated: true]".len());
+    assert!(capped.ends_with("\n[truncated: true]"));
+}

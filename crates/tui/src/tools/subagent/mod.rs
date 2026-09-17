@@ -418,6 +418,38 @@ Wrap up now: commit or checkpoint work-in-progress and prepare your final report
 // the requested ceiling.
 const SUBAGENT_TRANSIENT_PROVIDER_MAX_RETRIES: u32 = 2;
 const SUBAGENT_TRANSIENT_PROVIDER_INITIAL_BACKOFF: Duration = Duration::from_millis(250);
+/// Hard byte ceiling for any single tool result before it enters the child
+/// context. Matches codex-rs `DEFAULT_OUTPUT_BYTES_CAP` (1 MiB). Applied
+/// after spillover so the disk backup sees the full original bytes.
+const SUBAGENT_TOOL_RESULT_BYTE_CAP: usize = 1_048_576; // 1 MiB
+/// Default per-result token cap, matched against a conservative `bytes / 3`
+/// estimate. Codex-rs `max_output_tokens` default at `shell_spec.rs:61`.
+const SUBAGENT_TOOL_RESULT_TOKEN_CAP_DEFAULT: u32 = 10_000;
+/// Conservative bytes-per-token factor (1 token ≈ up to 3–4 bytes on the
+/// wire for English/code; each extra byte is safety margin).
+const SUBAGENT_TOOL_RESULT_BYTES_PER_TOKEN: usize = 3;
+
+/// Hard-truncate a tool result to the tighter of the byte cap (1 MiB) and the
+/// token-cap estimate, appending `[truncated: true]` when either fires.
+pub(crate) fn hard_cap_tool_result(mut content: String, max_output_tokens: std::num::NonZeroU32) -> String {
+    let token_cap_bytes = max_output_tokens
+        .get()
+        .saturating_mul(SUBAGENT_TOOL_RESULT_BYTES_PER_TOKEN as u32)
+        .min(SUBAGENT_TOOL_RESULT_BYTE_CAP as u32) as usize;
+    let effective_cap = SUBAGENT_TOOL_RESULT_BYTE_CAP.min(token_cap_bytes);
+    if content.len() <= effective_cap {
+        return content;
+    }
+    // Truncate at a char boundary to avoid splitting a multi-byte UTF-8
+    // sequence.
+    let mut end = effective_cap;
+    while end > 0 && !content.is_char_boundary(end) {
+        end -= 1;
+    }
+    content.truncate(end);
+    content.push_str("\n[truncated: true]");
+    content
+}
 /// Per-step API-call timeout retry budget. A `create_message` call that
 /// exceeds `step_api_timeout` is re-issued up to this many times (with
 /// exponential backoff) before the step is interrupted with a preserved
@@ -1681,6 +1713,9 @@ pub(crate) struct SubAgentSpawnOptions {
     pub nickname: Option<String>,
     pub fork_context: bool,
     pub token_budget: Option<u64>,
+    /// Per-tool-result output token cap for this child (#6282). `None` uses
+    /// the runtime default (10k).
+    pub max_output_tokens: Option<std::num::NonZeroU32>,
     /// Host-derived Workflow run id and shared limit. Installed in the worker
     /// registration transaction, before the child can begin a model request.
     pub workflow_budget_scope: Option<(String, u64)>,
@@ -1927,6 +1962,10 @@ struct SpawnRequest {
     /// When unset, the child inherits the parent's budget pool or the
     /// configured root default.
     token_budget: Option<u64>,
+    /// Per-tool-result output token cap for this child (#6282). `None` uses
+    /// the runtime default (10k); `Some(n)` clamps every tool result to at
+    /// most n tokens before it enters the child's message history.
+    max_output_tokens: Option<u32>,
     max_steps: Option<u32>,
     wall_time: Option<Duration>,
     /// Extra tool deny-list from the caller, unioned with the parent runtime's
@@ -2660,6 +2699,11 @@ pub struct SubAgentRuntime {
     /// but legitimate tool run is not killed mid-flight. `child_runtime()`
     /// preserves the parent's value.
     pub tool_timeout: Duration,
+    /// Per-result output cap in tokens (default 10k). `None` uses the
+    /// compile-time default; `Some(n)` clamps every tool result to at
+    /// most n tokens (conservatively estimated as n × 3 bytes) before it
+    /// enters the child's message history.
+    pub max_output_tokens: Option<std::num::NonZeroU32>,
     /// Default directory for Xiaomi MiMo speech/TTS tool outputs inherited by
     /// child registries. Keeps parent and sub-agent `speech` / `tts` tools on
     /// the same `[speech].output_dir` / env override.
@@ -2747,6 +2791,7 @@ impl SubAgentRuntime {
             step_api_timeout: DEFAULT_STEP_API_TIMEOUT,
             api_timeout_retry_base_backoff: SUBAGENT_API_TIMEOUT_INITIAL_BACKOFF,
             tool_timeout: DEFAULT_TOOL_TIMEOUT,
+            max_output_tokens: None,
             speech_output_dir: None,
             todos: crate::tools::todo::new_shared_todo_list(),
             parent_mode: AppMode::Agent,
@@ -3042,6 +3087,7 @@ impl SubAgentRuntime {
             step_api_timeout: self.step_api_timeout,
             api_timeout_retry_base_backoff: self.api_timeout_retry_base_backoff,
             tool_timeout: self.tool_timeout,
+            max_output_tokens: self.max_output_tokens,
             speech_output_dir: self.speech_output_dir.clone(),
             // #4810: every spawned agent owns its todo list. Cloning the
             // parent `Arc` here made child `work_update` / `todo_write` replace
@@ -7063,6 +7109,11 @@ impl SubAgentManager {
                 preserved.wall_deadline_ms,
             );
         }
+        // #6282: spawn options narrow the per-result output cap.
+        runtime.max_output_tokens = narrow_optional_limit(
+            runtime.max_output_tokens,
+            options.max_output_tokens,
+        );
         let budget_parent = options
             .resume_from_agent_id
             .as_deref()
@@ -9660,6 +9711,10 @@ impl ToolSpec for AgentTool {
                     "type": "integer", "minimum": 1,
                     "description": "Measured provider input + output token allowance for this child and descendants. Only narrows inherited/operator pools. Request output is capped to remaining allowance; unknown prompt tokens or responses already in flight may overshoot and are reported in full. No extra model request for partial handback."
                 },
+                "max_output_tokens": {
+                    "type": "integer", "minimum": 1,
+                    "description": "Per-tool-result output token cap for this child (#6282). Overrides the 10k default; narrower values conserve context but may truncate tool results with [truncated: true] markers. Values above u32::MAX are rejected."
+                },
                 "max_steps": {
                     "type": "integer", "minimum": 1, "maximum": MAX_SUBAGENT_STEPS,
                     "description": "Maximum model turns for this run, only narrowing role/operator/parent limits. Continuation retains its remaining allowance."
@@ -10553,6 +10608,14 @@ async fn spawn_subagent_from_input(
     } else {
         runtime.child_runtime()
     };
+    // #6282: an explicit per-result output cap narrows the child's default.
+    // Zero is rejected at parse time, so a positive value translates cleanly.
+    if let Some(n) = spawn_request
+        .max_output_tokens
+        .and_then(std::num::NonZeroU32::new)
+    {
+        child_runtime.max_output_tokens = Some(n);
+    }
     let resident_context = spawn_request
         .resident_file
         .as_deref()
@@ -10773,6 +10836,9 @@ async fn spawn_subagent_from_input(
             nickname: None,
             fork_context,
             token_budget: spawn_request.token_budget,
+            max_output_tokens: spawn_request
+                .max_output_tokens
+                .and_then(|n| std::num::NonZeroU32::new(n)),
             workflow_budget_scope: workflow_identity.and_then(|identity| {
                 identity
                     .shared_token_budget
@@ -13848,13 +13914,20 @@ async fn run_subagent(
                 .iter()
                 .filter_map(|block| serde_json::to_value(block).ok())
                 .collect::<Vec<_>>();
-            let (result, spilled_to) = bound_subagent_tool_result(
+            let (raw_result, spilled_to) = bound_subagent_tool_result(
                 &agent_id,
                 &tool_id,
                 &tool_name,
                 &runtime.context.state_namespace,
                 tool_ok,
                 output.result.content,
+            );
+            let mut result = hard_cap_tool_result(
+                raw_result,
+                runtime
+                    .max_output_tokens
+                    .unwrap_or(std::num::NonZeroU32::new(SUBAGENT_TOOL_RESULT_TOKEN_CAP_DEFAULT)
+                        .expect("10_000 > 0")),
             );
             if let Some(path) = spilled_to.as_ref() {
                 record_agent_progress(
@@ -13899,6 +13972,32 @@ async fn run_subagent(
                 }
             }
 
+            // #6282: check whether adding this result to history would
+            // blow past the remaining token budget. If even a truncated
+            // result won't fit, stop the loop with budget-exhausted.
+            let estimated = crate::compaction::estimate_text_tokens_conservative(&result);
+            let remaining = runtime
+                .manager
+                .read()
+                .await
+                .available_worker_tokens(&agent_id, true);
+            if let Some(remaining) = remaining
+                && estimated as u64 >= remaining
+            {
+                // Try shrinking to fit within the remaining allowance.
+                let token_cap = std::num::NonZeroU32::new(remaining as u32)
+                    .unwrap_or(std::num::NonZeroU32::MIN);
+                let minimal = hard_cap_tool_result(result.clone(), token_cap);
+                if crate::compaction::estimate_text_tokens_conservative(&minimal) as u64 >= remaining
+                {
+                    budget_failure_reason = Some(
+                        "token budget exhausted: next tool result would exceed remaining allowance"
+                            .to_string(),
+                    );
+                    break;
+                }
+                result = minimal;
+            }
             tool_results.push(ContentBlock::ToolResult {
                 tool_use_id: tool_id,
                 content: result,
@@ -14453,6 +14552,12 @@ fn parse_spawn_request(input: &Value) -> Result<SpawnRequest, ToolError> {
         .transpose()?;
     let token_budget =
         parse_optional_positive_u64(input, &["token_budget", "tokenBudget", "max_tokens"])?;
+    let max_output_tokens = parse_optional_bounded_limit(
+        input,
+        &["max_output_tokens", "maxOutputTokens"],
+        u32::MAX as u64,
+    )?
+    .map(|n| n as u32);
     let max_steps = parse_optional_bounded_limit(
         input,
         &["max_steps", "maxSteps"],
@@ -14613,6 +14718,7 @@ fn parse_spawn_request(input: &Value) -> Result<SpawnRequest, ToolError> {
         fork_context,
         max_depth,
         token_budget,
+        max_output_tokens,
         max_steps,
         wall_time,
         disallowed_tools,
@@ -19192,4 +19298,31 @@ mod declared_shortlist_tests {
             ModelRoute::Fixed("deepseek-v4-flash".into())
         );
     }
+}
+
+#[cfg(test)]
+#[test]
+fn parse_spawn_request_reads_max_output_tokens_and_rejects_zero_and_excessive() {
+    // Valid value round-trips.
+    let req = parse_spawn_request(&json!({
+        "prompt": "test",
+        "max_output_tokens": 500
+    })).unwrap();
+    assert_eq!(req.max_output_tokens, Some(500));
+
+    // Zero is rejected (bounded to 1..=u32::MAX).
+    let err = parse_spawn_request(&json!({
+        "prompt": "test",
+        "max_output_tokens": 0
+    })).unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("max_output_tokens"), "expected rejection of zero; got: {msg}");
+
+    // Value exceeding u32::MAX is rejected.
+    let err = parse_spawn_request(&json!({
+        "prompt": "test",
+        "max_output_tokens": 5_000_000_000u64
+    })).unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("max_output_tokens"), "expected rejection of excessive; got: {msg}");
 }
