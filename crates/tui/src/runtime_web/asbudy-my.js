@@ -1433,7 +1433,7 @@
             var n = (scope === 'workspace')
               ? entries.filter(function (e) { return e.scope === 'workspace'; }).length
               : entries.filter(function (e) { return e.scope !== 'workspace'; }).length;
-            if (!n) { msg(body.querySelector('#mem-msg'), '「' + label + '」里本来就没有东西。', false); return; }
+            if (!n) { msg(body.querySelector('#mem-msg'), '「' + label + '」目前是空的。', false); return; }
             if (!confirm('清空「' + label + '」的记忆？\n共 ' + n + ' 条 —— 清掉之后 AI 就不再记得这些了。\n（不影响你的文件、代码和对话记录）')) return;
             var m = body.querySelector('#mem-msg');
             msg(m, '正在清…', true);
@@ -2355,7 +2355,7 @@
             '<div>' +
               '<div style="color:var(--human);font-weight:600;margin-bottom:6px">当前视角：' + esc(nm) + '（' + esc(vw) + '）</div>' +
               '<div style="color:var(--text-soft);font-size:14px;line-height:1.65">' +
-                '你现在看到和操作的，都是<b>这个人的东西</b>；每一步都会留痕。' +
+                '你现在看到和操作的，都是<b>这个人的项目与文件</b>；每一步都会留痕。' +
                 '<div style="color:var(--text-dim);margin-top:8px">回到自己的界面：点侧栏项目名旁的 <b>⇄</b> → 「退出，回到我自己的」。</div>' +
               '</div>' +
             '</div>' +

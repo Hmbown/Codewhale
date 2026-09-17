@@ -163,7 +163,7 @@
     var picked = collect(inp.files || []);
     if (!picked.files.length) {
       impGo.disabled = true;
-      return fail(impMsg, '这个文件夹里没找到可导入的文件（node_modules / .git 这类会自动跳过）');
+      return fail(impMsg, '这个文件夹里没找到可导入的文件（依赖和版本记录这类会自动跳过）');
     }
     // 断点接续（老板 2026-09-15 要的）：重新选的是**同一个文件夹**（路径+大小逐个对得上）
     // 就沿用上次的 uploadId，服务端那边 .part 还在，从断的地方接着传。
