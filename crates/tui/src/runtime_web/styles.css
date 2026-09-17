@@ -1907,3 +1907,14 @@ noscript {
 .pv-back + .pv-file-name {
   margin-right: auto;
 }
+
+/* ===== AsBudy：桌面形态（2026-09-17）=====
+   从桌面窗口进来的界面（body.asb-desk）少一层网页味。
+   左栏里「项目文件 / 我的资料 / 退回」是我们 2026-09-14 塞进官方界面的
+   （官方原版侧栏只有：品牌 / 新建会话 / 搜索 / 会话列表）。
+   桌面形态下这些东西有自己的去处 —— 我的空间、窗口菜单 —— 不跟会话列表挤一起。
+   只是收起来，不是删功能：不带这个标记（手机、单独打开、直接访问项目）一切照旧。 */
+body.asb-desk #asbudy-files,
+body.asb-desk #asbudy-undo {
+  display: none !important;
+}

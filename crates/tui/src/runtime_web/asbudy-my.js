@@ -2397,6 +2397,18 @@
     } catch (e) { /* 参数读不到就算了 */ }
   })();
 
+  /* 桌面形态：从桌面窗口打开的（?desk=1）给 body 挂个记号。
+     样式表据此把我们 2026-09-14 塞进官方侧栏的那几块收起来（项目文件 / 我的资料 /
+     退回）—— 那些是网页形态的遗留，桌面形态下它们有自己的去处（我的空间 / 窗口菜单），
+     不该跟会话列表挤在一起。只是收起来，不是删功能：
+     不带这个参数（手机、单独打开、直接访问项目）一切照旧。 */
+  (function () {
+    try {
+      if (new URLSearchParams(location.search).get('desk') !== '1') return;
+      document.body.classList.add('asb-desk');
+    } catch (e) { /* 参数读不到就算了 */ }
+  })();
+
   if (!bindLogo()) {
     var tries = 0;
     var t = setInterval(function () { if (bindLogo() || ++tries > 60) clearInterval(t); }, 400);
