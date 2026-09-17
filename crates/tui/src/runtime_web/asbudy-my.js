@@ -1523,7 +1523,11 @@
         var list = ((r.body || {}).skills || []);
         var known = {};
         var html = '<div class="ab-tip">以下为<b>内置技能</b>，无需手动选择：' +
-          '直接说明需求，AI 会自动匹配。</div>';
+          '直接说明需求，AI 会自动匹配。</div>' +
+          // 2026-09-18：告诉客户「技能可以自己加」——引擎原生支持（项目里的 skills/ 目录），
+          //   不需要平台代装（实测：建完引擎立刻认到，不用重启）。详见档案 §8.7 143。
+          '<div class="ab-tip">想让 AI 会做别的事？直接跟它说「<b>帮我在项目里加一个技能，用来做 XX</b>」——' +
+          '它会建在你自己的项目里，<b>只有你能用</b>。</div>';
         SKILL_GROUPS.forEach(function (g) {
           var rows = '';
           g[1].forEach(function (it) {
