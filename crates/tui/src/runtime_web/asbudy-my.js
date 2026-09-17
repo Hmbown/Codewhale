@@ -875,16 +875,42 @@
       if (!r.ok) { alert(r.body.error || '打不开'); return; }
       // 只列客户（员工不是“客户”，归到员工管理里看）—— 2026-09-15 P2
       var users = ((r.body && r.body.users) || []).filter(function (u) { return (u.role || 'customer') === 'customer'; });
+      // 转出时的可选项：管理员自己 ＋ 其他客户账号（转给谁都不会丢）
+      var adminUser = (r.body && r.body.admin) || 'admin';
+      function ownerOptions(except) {
+        var opts = [{ user: adminUser, name: '管理员（平台自己）' }].concat(
+          users.filter(function (x) { return x.user !== except; })
+            .map(function (x) { return { user: x.user, name: x.name || x.user }; }));
+        return opts.map(function (o) {
+          return '<option value="' + esc(o.user) + '">' + esc(o.name) + '</option>';
+        }).join('');
+      }
       openLayer('客户管理', function (body) {
         body.innerHTML =
-          '<div class="ab-tip">客户账号 = 一个客户公司。客户老板登录后能自己给员工建账号、分项目。<br>把项目转给客户：在项目上设归属（管理员）。</div>' +
+          '<div class="ab-tip">客户账号 = 一个客户公司。客户老板登录后能自己给员工建账号、分项目。<br>删客户前要把它名下的项目先转给别人 —— 就在下面每张卡上转。</div>' +
           '<button class="ab-btn" id="ab-add-cust" type="button">+ 添加客户</button>' +
           '<div id="ab-ulist" style="margin-top:14px"></div>';
         var listEl = body.querySelector('#ab-ulist');
         users.forEach(function (u) {
           var card = document.createElement('div'); card.className = 'ab-card';
+          // 名下项目：**显示项目名**，每个后面带一个「转给…」下拉。
+          // ⚠️ 转必须在**这里**能做成（2026-09-17 老板：「删客户提示要先转走 —— 我怎么转？？」）：
+          //   管理员的「项目管理」面板只看得到**自己名下**的项目（`canUse` 按 owner 过滤），
+          //   而这里要转的恰恰是**别人名下**的 → 那边根本看不到它，提示等于指了条走不通的路。
+          //   工作台不用转（删账号时连带删），所以不给下拉。
+          var projs = u.projects || [];
+          var projHtml = projs.length
+            ? projs.map(function (pr) {
+                var label = '<span style="white-space:nowrap">' + esc(pr.name || pr.key) + '</span>';
+                if (pr.workbench) return label + '<span style="color:var(--text-faint);font-size:13px">（随账号一起删）</span>';
+                return label + '<select class="ab-input ab-mvproj" data-key="' + esc(pr.key) + '"'
+                  + ' style="max-width:132px;padding:3px 6px;font-size:13px;margin-left:6px"'
+                  + ' title="把这个项目转给别的账号"><option value="">转给…</option>'
+                  + ownerOptions(u.user) + '</select>';
+              }).join('　')
+            : '无';
           card.innerHTML = '<div class="ab-card-top"><div><div class="ab-n">' + esc(u.name || u.user) + '</div>' +
-            '<div class="ab-s">账号：' + esc(u.user) + ' ｜ 名下项目：' + ((u.projects && u.projects.length) ? esc(u.projects.join('、')) : '无')
+            '<div class="ab-s">账号：' + esc(u.user) + ' ｜ 名下项目：' + projHtml
               + ' ｜ 空间已用 ' + fmtSpace(u.spaceMb || 0) + ' / ' + (u.quotaMb ? fmtSpace(u.quotaMb) : '不限制') + '</div></div></div>';
           var acts = document.createElement('div'); acts.style.cssText = 'display:flex;gap:7px;margin-top:10px';
           var bSpace = document.createElement('button'); bSpace.className = 'ab-btn ghost sm'; bSpace.type = 'button'; bSpace.textContent = '设置配额';
@@ -895,7 +921,12 @@
           acts.appendChild(bStaff);
           var bDel = document.createElement('button'); bDel.className = 'ab-btn danger sm'; bDel.type = 'button'; bDel.textContent = '删除';
           bDel.onclick = function () {
-            var owns = (u.projects && u.projects.length) ? '（名下还有项目：' + u.projects.join('、') + '，要先转走）' : '';
+            // 口径跟后端一致：**工作台不算拦路的项目**（它随账号一起删）
+            var blocking = projs.filter(function (x) { return !x.workbench; });
+            var owns = blocking.length
+              ? '\n\n⚠ 名下还有项目：' + blocking.map(function (x) { return x.name || x.key; }).join('、')
+                + '\n请先用上面的「转给…」把它们转给别的账号。'
+              : '';
             if (!confirm('删掉客户「' + (u.name || u.user) + '」？' + owns)) return;
             api('/_gate/users', { method: 'DELETE', body: JSON.stringify({ user: u.user }) }).then(function (r2) {
               if (!r2.ok) { alert((r2.body && r2.body.error) || '删不掉'); return; }
@@ -904,6 +935,21 @@
           };
           acts.appendChild(bDel);
           card.appendChild(acts);
+          // 「转给…」下拉：选一个账号就转走（选完刷新面板）
+          card.querySelectorAll('.ab-mvproj').forEach(function (sel) {
+            sel.onchange = function () {
+              var to = sel.value;
+              if (!to) return;
+              var pkey = sel.getAttribute('data-key');
+              var toName = sel.options[sel.selectedIndex].textContent;
+              if (!confirm('把「' + pkey + '」转给「' + toName + '」？')) { sel.value = ''; return; }
+              api('/_gate/projects/owner', { method: 'POST', body: JSON.stringify({ key: pkey, owner: to }) })
+                .then(function (r2) {
+                  if (!r2.ok) { alert((r2.body && r2.body.error) || '转不了'); sel.value = ''; return; }
+                  openUsers();
+                });
+            };
+          });
           listEl.appendChild(card);
         });
         body.querySelector('#ab-add-cust').onclick = function () { openCustomerForm(function () { openUsers(); }); };
