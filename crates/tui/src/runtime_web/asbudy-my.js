@@ -795,7 +795,7 @@
         '<div class="ab-row"><label>名字</label><input class="ab-input" id="f-name" placeholder="显示用，如「小王」" value="' + (isNew ? '' : esc(rec.name || '')) + '"></div>' +
         '<div class="ab-row"><label>密码</label><input class="ab-input" id="f-pw" type="password" placeholder="' + (isNew ? '至少 8 位' : '留空 = 不改') + '"></div>' +
         '<div class="ab-row"><label>项目额度</label><input class="ab-input" id="f-quota" type="number" min="0" max="50" value="' + (isNew ? 2 : esc(rec.quota)) + '" style="max-width:110px"><span style="color:var(--text-dim);font-size:13.5px">可创建项目数上限</span></div>' +
-        '<div class="ab-row"><label>空间配额</label><input class="ab-input" id="f-quotamb" type="number" min="0" step="0.5" placeholder="G，0 或留空 = 不限制" value="' + (isNew || rec.quotaMb == null ? '' : esc(Math.round(rec.quotaMb / 1024 * 10) / 10)) + '" style="max-width:130px"><span style="color:var(--text-dim);font-size:13.5px">该成员可用的空间上限（计入你的配额）</span></div>' +
+        '<div class="ab-row"><label>空间配额</label><input class="ab-input" id="f-quotamb" type="number" min="0" step="0.5" value="' + (rec && rec.quotaMb != null ? esc(Math.round(rec.quotaMb / 1024 * 10) / 10) : 0) + '" style="max-width:130px"><span style="color:var(--text-dim);font-size:13.5px">该成员可用的空间上限（计入你的配额）；0 = 不限制</span></div>' +
         '<div style="margin:12px 0 6px;color:var(--text);font-size:14px">可访问的项目' + (isNew ? '（建完再分配也行）' : '') + '</div>' +
         '<div id="f-projs">' + (projects.length
           ? projects.map(function (p) {
@@ -819,19 +819,18 @@
         body.querySelectorAll('#f-projs input[type=checkbox]').forEach(function (c) { if (c.checked) grants.push(c.value); });
         if (!isNew && !pw && !name) { /* 允许只改配额/授权 */ }
         var payload = { user: uname, displayName: name, quota: quota };
-        // 单位 G：留空 = 用默认（2G），0 = 不限，填了就按这个数
-        // （以前这里是 MB 直接传，而另外两处是 G —— 单位都不统一，2026-09-17 一并改了）
-        if (quotaMbRaw !== '') {
-          var gv = Number(quotaMbRaw);
-          if (!(gv >= 0)) { msg('空间配额请填 0 或正数（单位 G）', msgEl); return; }
-          payload.quotaMb = Math.round(gv * 1024);
-        }
+        // 单位 G。2026-09-17 老板拍板：「留空」这个状态不许存在 —— 留空直接拦下，
+        //   要不定限制就显式填 0（界面上看得见的一个数）。
+        if (quotaMbRaw === '') { msg(msgEl, '请填写空间配额（0 = 不限制）', false); return; }
+        var gv = Number(quotaMbRaw);
+        if (!(gv >= 0)) { msg(msgEl, '空间配额请填 0 或正数（单位 G）', false); return; }
+        payload.quotaMb = Math.round(gv * 1024);
         if (owner) payload.owner = owner;
         if (pw) payload.password = pw;
         api('/_gate/staff', { method: 'POST', body: JSON.stringify(payload) }).then(function (r) {
-          if (!r.ok) { msg(r.body.error || '保存失败', msgEl); return; }
+          if (!r.ok) { msg(msgEl, r.body.error || '保存失败', false); return; }
           api('/_gate/staff/grant', { method: 'POST', body: JSON.stringify({ user: uname, grants: grants }) }).then(function (r2) {
-            if (!r2.ok) { msg(r2.body.error || '分配项目失败', msgEl); return; }
+            if (!r2.ok) { msg(msgEl, r2.body.error || '分配项目失败', false); return; }
             closeLayer();
             if (onDone) onDone();
           });
@@ -850,20 +849,22 @@
   function openSpaceForm(u, onDone) {
     openLayer('空间配额 · ' + (u.name || u.user), function (body) {
       body.innerHTML =
-        '<div class="ab-tip">该客户及其成员共用的总空间 —— 项目、文件、回收站合并计算。<br>单位 G；0 或留空 = 不限制。</div>' +
+        '<div class="ab-tip">该客户及其成员共用的总空间 —— 项目、文件、回收站合并计算。<br>单位 G；0 = 不限制。</div>' +
         '<div class="ab-row"><label>空间配额</label><input class="ab-input" id="sp-g" type="number" min="0" step="0.5" value="'
-          + (u.quotaMb != null ? (Math.round(u.quotaMb / 1024 * 10) / 10) : 0) + '" style="max-width:110px">'
+          + (u.quotaMb != null ? (Math.round(u.quotaMb / 1024 * 10) / 10) : 2) + '" style="max-width:110px">'
           + '<span style="color:var(--text-dim);font-size:13.5px">G（当前已用 ' + fmtSpace(u.spaceMb || 0) + '）</span></div>' +
         '<div style="display:flex;gap:8px;margin-top:16px"><button class="ab-btn" id="sp-save" type="button">保存</button>' +
         '<button class="ab-btn ghost" id="sp-cancel" type="button">取消</button></div><div class="ab-msg" id="sp-msg"></div>';
       var msgEl = body.querySelector('#sp-msg');
       body.querySelector('#sp-cancel').onclick = closeLayer;
       body.querySelector('#sp-save').onclick = function () {
-        var g = Number(body.querySelector('#sp-g').value || 0);
-        if (!(g >= 0)) { msg('请输入 0 或正数', msgEl); return; }
+        var raw = body.querySelector('#sp-g').value.trim();
+        if (raw === '') { msg(msgEl, '请填写空间配额（0 = 不限制）', false); return; }
+        var g = Number(raw);
+        if (!(g >= 0)) { msg(msgEl, '请输入 0 或正数', false); return; }
         api('/_gate/users', { method: 'POST', body: JSON.stringify({ user: u.user, quotaMb: Math.round(g * 1024) }) })
           .then(function (r) {
-            if (!r.ok) { msg((r.body && r.body.error) || '保存失败', msgEl); return; }
+            if (!r.ok) { msg(msgEl, (r.body && r.body.error) || '保存失败', false); return; }
             closeLayer(); if (onDone) onDone();
           });
       };
@@ -884,7 +885,7 @@
           var card = document.createElement('div'); card.className = 'ab-card';
           card.innerHTML = '<div class="ab-card-top"><div><div class="ab-n">' + esc(u.name || u.user) + '</div>' +
             '<div class="ab-s">账号：' + esc(u.user) + ' ｜ 名下项目：' + ((u.projects && u.projects.length) ? esc(u.projects.join('、')) : '无')
-              + ' ｜ 空间已用 ' + fmtSpace(u.spaceMb || 0) + ' / ' + (u.quotaMb ? fmtSpace(u.quotaMb) : '2G（默认）') + '</div></div></div>';
+              + ' ｜ 空间已用 ' + fmtSpace(u.spaceMb || 0) + ' / ' + (u.quotaMb ? fmtSpace(u.quotaMb) : '不限制') + '</div></div></div>';
           var acts = document.createElement('div'); acts.style.cssText = 'display:flex;gap:7px;margin-top:10px';
           var bSpace = document.createElement('button'); bSpace.className = 'ab-btn ghost sm'; bSpace.type = 'button'; bSpace.textContent = '设置配额';
           bSpace.onclick = function () { openSpaceForm(u, openUsers); };
@@ -921,14 +922,20 @@
       var msgEl = body.querySelector('#c-msg');
       body.querySelector('#c-cancel').onclick = closeLayer;
       body.querySelector('#c-save').onclick = function () {
+        // 空间配额：默认 2 G，**留空不许存**（2026-09-17 老板：留空既不该默认成 2G、
+        //   也不该默默变成不限制 —— 干脆不许留空，界面上永远是一个明确的数）
+        var spaceRaw = body.querySelector('#c-space').value.trim();
+        if (spaceRaw === '') { msg(msgEl, '请填写空间配额（默认 2 G；0 = 不限制）', false); return; }
+        var spaceG = Number(spaceRaw);
+        if (!(spaceG >= 0)) { msg(msgEl, '空间配额请填 0 或正数（单位 G）', false); return; }
         var payload = {
           user: body.querySelector('#c-user').value.trim(),
           displayName: body.querySelector('#c-name').value.trim(),
           password: body.querySelector('#c-pw').value,
-          quotaMb: Math.round(Number(body.querySelector('#c-space').value || 0) * 1024),
+          quotaMb: Math.round(spaceG * 1024),
         };
         api('/_gate/users', { method: 'POST', body: JSON.stringify(payload) }).then(function (r) {
-          if (!r.ok) { msg(r.body.error || '保存失败', msgEl); return; }
+          if (!r.ok) { msg(msgEl, r.body.error || '保存失败', false); return; }
           closeLayer(); if (onDone) onDone();
         });
       };
@@ -2033,7 +2040,7 @@
           method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload),
         }).then(function (r) { return r.json(); }).then(function (j) {
           if (j.ok) { msg(msgEl, '改好了。' + (ME.role === 'admin' ? '所有设备要重新登录。' : ''), true); setTimeout(closeLayer, 1200); }
-          else msg(j.error || '改不了', false, msgEl);
+          else msg(msgEl, j.error || '改不了', false);
         });
       };
     });
