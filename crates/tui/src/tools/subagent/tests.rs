@@ -5737,6 +5737,7 @@ fn subagent_tool_schemas_advertise_real_type_and_role_vocabulary() {
         "exact_files",
         "expected_artifact",
         "limit",
+        "max_output_tokens",
         "max_steps",
         "message",
         "model",

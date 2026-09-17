@@ -431,7 +431,10 @@ const SUBAGENT_TOOL_RESULT_BYTES_PER_TOKEN: usize = 3;
 
 /// Hard-truncate a tool result to the tighter of the byte cap (1 MiB) and the
 /// token-cap estimate, appending `[truncated: true]` when either fires.
-pub(crate) fn hard_cap_tool_result(mut content: String, max_output_tokens: std::num::NonZeroU32) -> String {
+pub(crate) fn hard_cap_tool_result(
+    mut content: String,
+    max_output_tokens: std::num::NonZeroU32,
+) -> String {
     let token_cap_bytes = max_output_tokens
         .get()
         .saturating_mul(SUBAGENT_TOOL_RESULT_BYTES_PER_TOKEN as u32)
@@ -7110,10 +7113,8 @@ impl SubAgentManager {
             );
         }
         // #6282: spawn options narrow the per-result output cap.
-        runtime.max_output_tokens = narrow_optional_limit(
-            runtime.max_output_tokens,
-            options.max_output_tokens,
-        );
+        runtime.max_output_tokens =
+            narrow_optional_limit(runtime.max_output_tokens, options.max_output_tokens);
         let budget_parent = options
             .resume_from_agent_id
             .as_deref()
@@ -10608,13 +10609,15 @@ async fn spawn_subagent_from_input(
     } else {
         runtime.child_runtime()
     };
-    // #6282: an explicit per-result output cap narrows the child's default.
-    // Zero is rejected at parse time, so a positive value translates cleanly.
+    // #6282: an explicit per-result output cap only narrows the inherited
+    // cap — a spawn request can never widen it. Zero is rejected at parse
+    // time, so a positive value translates cleanly.
     if let Some(n) = spawn_request
         .max_output_tokens
         .and_then(std::num::NonZeroU32::new)
     {
-        child_runtime.max_output_tokens = Some(n);
+        child_runtime.max_output_tokens =
+            narrow_optional_limit(child_runtime.max_output_tokens, Some(n));
     }
     let resident_context = spawn_request
         .resident_file
@@ -13924,10 +13927,10 @@ async fn run_subagent(
             );
             let mut result = hard_cap_tool_result(
                 raw_result,
-                runtime
-                    .max_output_tokens
-                    .unwrap_or(std::num::NonZeroU32::new(SUBAGENT_TOOL_RESULT_TOKEN_CAP_DEFAULT)
-                        .expect("10_000 > 0")),
+                runtime.max_output_tokens.unwrap_or(
+                    std::num::NonZeroU32::new(SUBAGENT_TOOL_RESULT_TOKEN_CAP_DEFAULT)
+                        .expect("10_000 > 0"),
+                ),
             );
             if let Some(path) = spilled_to.as_ref() {
                 record_agent_progress(
@@ -13985,10 +13988,18 @@ async fn run_subagent(
                 && estimated as u64 >= remaining
             {
                 // Try shrinking to fit within the remaining allowance.
-                let token_cap = std::num::NonZeroU32::new(remaining as u32)
+                // The cap charges bytes (tokens × 3) while the estimator
+                // charges chars/3, and the `[truncated: true]` marker adds
+                // 18 ASCII bytes (≈6 estimated tokens) on top of the cap.
+                // Reserve that overhead, or the shrunk result always
+                // re-estimates at remaining + marker and never fits.
+                const SHRINK_MARKER_OVERHEAD_TOKENS: u64 = 8;
+                let fit_tokens = remaining.saturating_sub(SHRINK_MARKER_OVERHEAD_TOKENS);
+                let token_cap = std::num::NonZeroU32::new(fit_tokens as u32)
                     .unwrap_or(std::num::NonZeroU32::MIN);
                 let minimal = hard_cap_tool_result(result.clone(), token_cap);
-                if crate::compaction::estimate_text_tokens_conservative(&minimal) as u64 >= remaining
+                if crate::compaction::estimate_text_tokens_conservative(&minimal) as u64
+                    >= remaining
                 {
                     budget_failure_reason = Some(
                         "token budget exhausted: next tool result would exceed remaining allowance"
@@ -19307,22 +19318,31 @@ fn parse_spawn_request_reads_max_output_tokens_and_rejects_zero_and_excessive() 
     let req = parse_spawn_request(&json!({
         "prompt": "test",
         "max_output_tokens": 500
-    })).unwrap();
+    }))
+    .unwrap();
     assert_eq!(req.max_output_tokens, Some(500));
 
     // Zero is rejected (bounded to 1..=u32::MAX).
     let err = parse_spawn_request(&json!({
         "prompt": "test",
         "max_output_tokens": 0
-    })).unwrap_err();
+    }))
+    .unwrap_err();
     let msg = err.to_string();
-    assert!(msg.contains("max_output_tokens"), "expected rejection of zero; got: {msg}");
+    assert!(
+        msg.contains("max_output_tokens"),
+        "expected rejection of zero; got: {msg}"
+    );
 
     // Value exceeding u32::MAX is rejected.
     let err = parse_spawn_request(&json!({
         "prompt": "test",
         "max_output_tokens": 5_000_000_000u64
-    })).unwrap_err();
+    }))
+    .unwrap_err();
     let msg = err.to_string();
-    assert!(msg.contains("max_output_tokens"), "expected rejection of excessive; got: {msg}");
+    assert!(
+        msg.contains("max_output_tokens"),
+        "expected rejection of excessive; got: {msg}"
+    );
 }
