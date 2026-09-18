@@ -84,7 +84,7 @@ pub(crate) enum Credential {
     /// production path mints one yet. The variant is kept because it is half
     /// of the ported contract and the store's serialization guarantee exists
     /// precisely for it.
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), expect(dead_code))]
     OAuth {
         access: String,
         expires_at_unix_secs: Option<i64>,
@@ -94,7 +94,6 @@ pub(crate) enum Credential {
 impl Credential {
     /// Only [`store::InMemoryCredentialStore::list`] needs this today; the
     /// secret-store adapter knows every slot it holds is an api key.
-    #[allow(dead_code)]
     pub(crate) fn kind(&self) -> CredentialKind {
         match self {
             Self::ApiKey { .. } => CredentialKind::ApiKey,
@@ -135,6 +134,5 @@ pub(crate) enum CredentialKind {
     ApiKey,
     /// See the note on [`Credential::OAuth`]: no production store mints one
     /// yet.
-    #[allow(dead_code)]
     OAuth,
 }

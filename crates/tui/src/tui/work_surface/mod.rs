@@ -64,10 +64,7 @@
 mod input;
 mod interaction;
 mod model;
-pub(crate) mod panels;
 mod render;
-#[allow(dead_code)] // Tideline rail rendering (spec §5a); wired by the landing slice
-pub mod tideline;
 mod views;
 
 pub use input::{cycle_view, enter_agents, handle_key, handle_mouse};
@@ -1000,6 +997,7 @@ mod tests {
         let mut app = app();
         app.current_session_id = Some(SESSION.to_string());
         app.subagent_cache.push(SubAgentResult {
+            usage: None,
             name: "agent_worker".to_string(),
             agent_id: "agent_worker".to_string(),
             context_mode: "fresh".to_string(),
@@ -1081,6 +1079,7 @@ mod tests {
         SubAgentResult {
             // `name` is the raw session id in production snapshots — the
             // strip must never render it (#36).
+            usage: None,
             name: id.to_string(),
             agent_id: id.to_string(),
             context_mode: "fresh".to_string(),
@@ -1940,6 +1939,7 @@ mod tests {
         fn add_worker(app: &mut App) {
             app.current_session_id = Some(SESSION.to_string());
             app.subagent_cache.push(SubAgentResult {
+                usage: None,
                 name: "agent_converge".to_string(),
                 agent_id: "agent_converge".to_string(),
                 context_mode: "fresh".to_string(),

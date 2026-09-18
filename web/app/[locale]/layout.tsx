@@ -1,6 +1,6 @@
 import type { Metadata } from "next";
 import localFont from "next/font/local";
-import { JetBrains_Mono, Newsreader } from "next/font/google";
+import { IBM_Plex_Mono, Newsreader } from "next/font/google";
 import { Nav } from "@/components/nav";
 import { Footer } from "@/components/footer";
 import { UsageCounting } from "@/components/usage-counting";
@@ -13,7 +13,7 @@ import { buildSiteJsonLd } from "@/lib/site-schema";
 import "../globals.css";
 
 // Shannon Sans 0.110 supplies body and small-heading roles through one asset.
-// Its OFL notice lives beside it; Newsreader and JetBrains Mono keep their roles.
+// Its OFL notice lives beside it; Newsreader and IBM Plex Mono keep their roles.
 const sans = localFont({
   src: "../../public/brand/fonts/ShannonSans-Variable.woff2",
   weight: "100 900",
@@ -22,8 +22,9 @@ const sans = localFont({
   display: "swap",
 });
 
-const mono = JetBrains_Mono({
-  subsets: ["latin", "cyrillic"],
+// IBM Plex Mono is the GPUI app's code face; it fills the same role here.
+const mono = IBM_Plex_Mono({
+  subsets: ["latin", "latin-ext", "cyrillic"],
   weight: ["400", "500", "600"],
   variable: "--font-mono",
   display: "swap",

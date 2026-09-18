@@ -234,7 +234,17 @@ impl ToolRegistry {
                 Tool {
                     tool_type: None,
                     name: tool.name().to_string(),
-                    description: tool.description().to_string(),
+                    description: if evidence_only
+                        && matches!(tool.name(), "bash" | "Bash" | "exec_shell")
+                    {
+                        format!(
+                            "{} {}",
+                            tool.description(),
+                            codewhale_execpolicy::command_safety::readonly_command_help()
+                        )
+                    } else {
+                        tool.description().to_string()
+                    },
                     input_schema: schema,
                     allowed_callers: Some(vec!["direct".to_string()]),
                     defer_loading: Some(tool.defer_loading()),
@@ -501,7 +511,7 @@ fn project_readonly_evidence_schema(name: &str, schema: &mut Value) {
     }
 }
 
-fn enforce_tool_authority(
+pub(crate) fn enforce_tool_authority(
     name: &str,
     input: &Value,
     tool: &dyn ToolSpec,
@@ -562,8 +572,9 @@ fn enforce_tool_authority(
             return Ok(());
         }
         return Err(ToolError::permission_denied(format!(
-            "worker '{}' cannot run {name}: arbitrary command execution is outside its machine-readable authority envelope",
-            authority.owner
+            "worker '{}' cannot run {name}: arbitrary command execution is outside its machine-readable authority envelope. {}",
+            authority.owner,
+            codewhale_execpolicy::command_safety::readonly_command_help()
         )));
     }
     if name == "Run" {
@@ -578,13 +589,14 @@ fn enforce_tool_authority(
                 return Ok(());
             }
             return Err(ToolError::permission_denied(format!(
-                "worker '{}' cannot run unbounded verification arguments or commands",
+                "worker '{}' cannot run unbounded verification arguments or commands. Re-run the default gate instead: drop `commands` (run_verifiers) and any flag that can redirect what runs (run_tests `args` may only select tests), and report the blocked probe to the parent rather than working around it.",
                 authority.owner
             )));
         }
         return Err(ToolError::permission_denied(format!(
-            "worker '{}' cannot run {name}: arbitrary command execution is outside its machine-readable authority envelope",
-            authority.owner
+            "worker '{}' cannot run {name}: arbitrary command execution is outside its machine-readable authority envelope. {}",
+            authority.owner,
+            codewhale_execpolicy::command_safety::readonly_command_help()
         )));
     }
     if name == "Git" || name.starts_with("git_") || name == "review" {
@@ -761,7 +773,7 @@ impl ToolRegistryBuilder {
 
     /// Include only read-only file tools (read, list).
     #[must_use]
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), expect(dead_code))]
     pub fn with_read_only_file_tools(self) -> Self {
         use super::file::{ListDirTool, ReadFileTool};
         use super::file_tool::FileTool;
@@ -1144,6 +1156,15 @@ impl ToolRegistryBuilder {
             .with_tool(Arc::new(MemoryGetTool))
     }
 
+    /// Include the prior-session recall tools (#5715). Always-on: they are
+    /// read-only and workspace-scoped, so there is no opt-in to honor.
+    #[must_use]
+    pub fn with_session_recall_tools(self) -> Self {
+        use super::session::{SessionGetTool, SessionSearchTool};
+        self.with_tool(Arc::new(SessionSearchTool))
+            .with_tool(Arc::new(SessionGetTool))
+    }
+
     /// Include the model-facing LSP intelligence tools. They reuse the
     /// session [`crate::lsp::LspManager`] attached to `ToolContext` and never
     /// spawn a second server lifecycle.
@@ -1333,6 +1354,7 @@ impl ToolRegistryBuilder {
         builder
             .with_notify_tool()
             .with_request_plugin_install_tool()
+            .with_session_recall_tools()
     }
 
     /// Include the full child-inherited Agent surface under resolved
@@ -1405,13 +1427,6 @@ impl ToolRegistryBuilder {
         use super::subagent::AgentTool;
         use super::subagent::register_coordination_tools;
         use super::workflow::WorkflowTool;
-        use super::workflow_trigger::soft_auto_policy_is_linked;
-
-        // Keep soft-auto trigger policy linked in release builds (#4127).
-        debug_assert!(
-            soft_auto_policy_is_linked(),
-            "workflow soft-auto policy must stay linked"
-        );
 
         let builder = self
             .with_tool(Arc::new(WorkflowTool::new(

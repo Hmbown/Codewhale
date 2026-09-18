@@ -50,6 +50,12 @@ test('explicit null screenshot target reaches app resolution before capture',asy
 test('real handler/backend/native resolver never redirects an explicit app reference to frontmost',{skip:process.platform!=='darwin'},async()=>{
   const build=spawnSync('clang',['-fobjc-arc','-Os','-framework','Cocoa','-framework','ApplicationServices','-framework','ScreenCaptureKit','-framework','AVFoundation','-framework','CoreMedia','-framework','Vision',path.join(root,'tests/fixtures/darwin-targeting.m'),'-o',binary],{encoding:'utf8'});
   assert.equal(build.status,0,build.stderr);
+  const guarded=spawnSync(binary,[JSON.stringify({tool:'inspect_pointer_guard',args:{lock_dir:dir}})],{encoding:'utf8'});
+  assert.equal(guarded.status,0,guarded.stderr);
+  const guard=JSON.parse(guarded.stdout);
+  assert.match(guard.refusal,/foreground changed to Other/);
+  assert.equal(guard.posts,0,'a stale foreground binding cannot post a global mouse gesture');
+  assert.equal(guard.activations,0,'a pointer gesture cannot reclaim the user foreground');
   process.env.CU_TARGETING_NATIVE='1';
   try {
     const implicit=await call('list_windows',{});

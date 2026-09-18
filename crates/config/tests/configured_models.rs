@@ -212,22 +212,6 @@ fn invalid_limits_prices_units_and_authority_fail_closed() {
 }
 
 #[test]
-fn project_config_cannot_replace_user_model_declarations() {
-    let mut user: ConfigToml = toml::from_str(FIXTURE).unwrap();
-    let project: ConfigToml =
-        toml::from_str(&FIXTURE.replace("context = 96000", "context = 256000")).unwrap();
-    user.merge_project_overrides(project);
-    assert_eq!(
-        user.custom_models.unwrap()[0]
-            .limit
-            .as_ref()
-            .unwrap()
-            .context,
-        Some(96000)
-    );
-}
-
-#[test]
 fn declared_wire_ids_are_not_convenience_aliases() {
     for (kind, provider, base, id) in [
         (

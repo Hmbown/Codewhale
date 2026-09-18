@@ -20,31 +20,19 @@
 
 /** Contributors whose PRs were merged or harvested into this release. */
 export const RELEASE_CONTRIBUTORS: string[] = [
-  "@nightt5879",
-  "@c020627",
-  "@h3c-hexin",
-  "@asto18089",
-  "@Hmbown",
-  "@gaord",
-  "@goransh-walia",
-  "@7jrxt42BxFZo4iAnN4CX",
-  "@SparkofSpike",
   "@aboimpinto",
-  "@EvanProgramming",
-  "@wuisabel-gif",
-  "@zhuowp",
 ];
 
 /**
  * Contributors who helped with reports, reproductions, and verification.
- * Credit covers the 0.9.13 reports recorded in docs/CONTRIBUTORS.md.
+ * Credit covers the 0.9.14 reports recorded in docs/CONTRIBUTORS.md.
  */
 export const RELEASE_HELPERS: string[] = [
-  "@nsfoxer",
-  "@Nefelibata1024",
-  "@Gabriel-Degret",
+  "@7jrxt42BxFZo4iAnN4CX",
+  "@BX166",
+  "@Lstarsky0",
   "@Lujc0523",
-  "@mo-vic",
-  "@giancarlocp",
-  "@hxfhd",
+  "@Statter",
+  "@bevis-wong",
+  "@sequico",
 ];

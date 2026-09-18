@@ -1051,3 +1051,13 @@ fn provider_live_beats_models_dev_on_the_same_wire() {
             if base_url_fingerprint == "fixture"
     ));
 }
+
+#[test]
+fn endpoint_is_baseten_recognizes_the_host_not_the_spelling() {
+    assert!(endpoint_is_baseten(BASETEN_BASE_URL));
+    assert!(endpoint_is_baseten(&format!("{BASETEN_BASE_URL}/")));
+    assert!(endpoint_is_baseten("HTTPS://INFERENCE.BASETEN.CO/v1"));
+    assert!(!endpoint_is_baseten("https://api.groq.com/openai/v1"));
+    assert!(!endpoint_is_baseten("https://127.0.0.1:9/v1"));
+    assert!(!endpoint_is_baseten(""));
+}

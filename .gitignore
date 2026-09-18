@@ -67,6 +67,9 @@ docs/*.pdf
 !.github/scripts/**
 !web/public/install.sh
 !packaging/winget/**
+# Bridge launchers are shipped entry points (`npm run bridge`), not local dev
+# scripts; `!scripts/**` above only re-includes the repo-root scripts/ dir.
+!integrations/*/scripts/**
 test.txt
 TODO*.md
 todo*.md
@@ -93,6 +96,10 @@ project_overhaul_prompt.md
 .deepseek/
 **/session_*.json
 *.db
+
+# Chat bridge local state. `npm run bridge` writes the Weixin bot login token
+# (account.json) and the long-poll cursor here; these are live credentials.
+integrations/*-bridge/.state/
 npm/*/bin/downloads/
 
 # Companion app (tracked separately)
@@ -166,3 +173,7 @@ CODEWHALE_0_9_0_CUTOVER.md
 
 # computer-use plugin smoke receipts (per-run local evidence)
 crates/tui/plugins/computer-use/receipts/
+
+# Portable pet build entry points are source.
+!pet/**/*.sh
+!pet/verify.sh

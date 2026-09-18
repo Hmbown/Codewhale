@@ -2046,6 +2046,7 @@ fn new_run_record(
 fn automation_task_request(automation: &AutomationRecord) -> NewTaskRequest {
     NewTaskRequest {
         prompt: automation.prompt.clone(),
+        name: Some(automation.name.clone()),
         model: automation.model.clone(),
         model_provider: automation.model_provider.clone(),
         model_provider_id: automation.model_provider_id.clone(),
@@ -2420,6 +2421,7 @@ where
                     execution_scope: current.execution_scope.clone(),
                     request: NewTaskRequest {
                         prompt: current.message.clone(),
+                        name: None,
                         model: None,
                         model_provider: None,
                         model_provider_id: None,
@@ -2518,10 +2520,33 @@ fn apply_task_status(
             run.status = AutomationRunStatus::Canceled;
             run.started_at = run.started_at.or(task.started_at);
             run.ended_at = task.ended_at.or(Some(Utc::now()));
+            // #6162: a cancellation is not silent. Keep the task's own error
+            // when it recorded one, otherwise name the terminal reason so the
+            // settled receipt can say who or what canceled the run.
+            run.error = task.error.clone().or_else(|| {
+                task.terminal_reason
+                    .as_deref()
+                    .map(cancellation_reason_text)
+            });
             changed = true;
         }
     }
     changed
+}
+
+/// Human-readable cancellation detail for a run whose task ended without an
+/// error of its own. The task manager's terminal reasons are stable strings
+/// (`TaskTerminalReason::as_str`); anything unknown is passed through.
+fn cancellation_reason_text(terminal_reason: &str) -> String {
+    // A cooperative cancel is the one path that arrives without an error of
+    // its own; cancel-timeout and shutdown already carry the task manager's
+    // receipt message, so those arms are a fallback for records that lost it.
+    match terminal_reason {
+        "canceled" => "canceled by request".to_string(),
+        "cancel_timeout" => "canceled; the task did not stop within the cancel timeout".to_string(),
+        "shutdown" => "canceled by shutdown".to_string(),
+        other => format!("canceled ({other})"),
+    }
 }
 
 async fn reconcile_run_statuses_shared(
@@ -4929,4 +4954,73 @@ model = "private-model"
     }
     mod ownership;
     mod recovery;
+
+    /// #6162: the projection's Canceled branch must record why. A cooperative
+    /// cancel arrives with no error of its own and takes the derived text; a
+    /// task that already carries the task manager's receipt keeps it; a legacy
+    /// record with neither degrades to no detail instead of inventing one.
+    fn canceled_task_record(
+        error: Option<&str>,
+        terminal_reason: Option<&str>,
+    ) -> crate::task_manager::TaskRecord {
+        serde_json::from_value(serde_json::json!({
+            "id": "task_canceled",
+            "prompt": "nightly report",
+            "model": "deepseek-v4-pro",
+            "workspace": "/tmp/automation-fixture",
+            "mode": "agent",
+            "allow_shell": false,
+            "trust_mode": false,
+            "status": "canceled",
+            "created_at": "2026-09-14T10:00:00Z",
+            "started_at": "2026-09-14T10:00:01Z",
+            "ended_at": "2026-09-14T10:00:05Z",
+            "duration_ms": 4000,
+            "result_summary": null,
+            "result_detail_path": null,
+            "error": error,
+            "terminal_reason": terminal_reason,
+            "tool_calls": [],
+            "timeline": [],
+        }))
+        .expect("a canceled task record fixture")
+    }
+
+    #[test]
+    fn a_cooperatively_canceled_task_names_the_cancellation_on_the_run() {
+        let mut run = new_run_record("auto_1", Utc::now(), Utc::now());
+        run.status = AutomationRunStatus::Running;
+        let task = canceled_task_record(None, Some("canceled"));
+        assert!(apply_task_status(&mut run, &task));
+        assert_eq!(run.status, AutomationRunStatus::Canceled);
+        assert_eq!(run.error.as_deref(), Some("canceled by request"));
+        assert_eq!(run.started_at, task.started_at);
+        assert_eq!(run.ended_at, task.ended_at);
+    }
+
+    #[test]
+    fn a_canceled_task_with_its_own_error_keeps_that_error_on_the_run() {
+        let mut run = new_run_record("auto_1", Utc::now(), Utc::now());
+        run.status = AutomationRunStatus::Running;
+        let task = canceled_task_record(
+            Some("Task canceled because the task manager shut down"),
+            Some("shutdown"),
+        );
+        assert!(apply_task_status(&mut run, &task));
+        assert_eq!(run.status, AutomationRunStatus::Canceled);
+        assert_eq!(
+            run.error.as_deref(),
+            Some("Task canceled because the task manager shut down")
+        );
+    }
+
+    #[test]
+    fn a_legacy_canceled_task_without_a_reason_records_no_detail() {
+        let mut run = new_run_record("auto_1", Utc::now(), Utc::now());
+        run.status = AutomationRunStatus::Running;
+        let task = canceled_task_record(None, None);
+        assert!(apply_task_status(&mut run, &task));
+        assert_eq!(run.status, AutomationRunStatus::Canceled);
+        assert_eq!(run.error, None);
+    }
 }

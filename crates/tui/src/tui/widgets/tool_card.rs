@@ -49,7 +49,6 @@ pub enum ToolFamily {
     /// render path (`render_thinking` in `history.rs`); the family is
     /// declared here for completeness so any future code that reaches for
     /// it has the matching glyph + label vocabulary.
-    #[allow(dead_code)]
     Think,
     /// Anything we don't have a family glyph for yet — falls back to a
     /// neutral bullet so the card still renders cleanly.

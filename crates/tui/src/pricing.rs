@@ -50,7 +50,6 @@ pub struct CostEstimate {
 }
 
 impl CostEstimate {
-    #[allow(dead_code)]
     pub fn usd_only(usd: f64) -> Self {
         Self { usd, cny: 0.0 }
     }
@@ -113,7 +112,7 @@ impl CostEstimate {
 /// mapped onto [`BalanceInfo`] at the fetch seam.
 #[derive(Debug, Clone, Default, serde::Deserialize)]
 pub struct BalanceResponse {
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), expect(dead_code))]
     pub is_available: bool,
     pub balance_infos: Vec<BalanceInfo>,
 }
@@ -1013,6 +1012,21 @@ fn deepseek_weekend_off_peak(now: DateTime<Utc>) -> bool {
 /// Whether a turn recorded at `now` is billed at DeepSeek's peak tier.
 fn deepseek_is_peak(now: DateTime<Utc>) -> bool {
     !deepseek_weekend_off_peak(now) && deepseek_peak_hour(now.hour())
+}
+
+/// The clock-dependent tier a DeepSeek route bills at right now: `Some(true)`
+/// at peak, `Some(false)` off-peak, `None` for a model whose rates do not move
+/// with the clock. The model set is exactly the time-aware arm of
+/// [`pricing_for_model_at`], so the chip that shows this and the receipt that
+/// prices the turn can never disagree about which routes are tiered.
+#[must_use]
+pub(crate) fn deepseek_time_tier(model: &str, now: DateTime<Utc>) -> Option<bool> {
+    let lower = model.trim().to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "deepseek-v4-pro" | "deepseek-v4-flash" | "deepseek-flash"
+    )
+    .then(|| deepseek_is_peak(now))
 }
 
 fn deepseek_v4_pro_pricing(now: DateTime<Utc>) -> ModelPricing {
@@ -1990,8 +2004,7 @@ pub(crate) fn audit_turn_cost_for_route_on_endpoint_for_identity_at(
         }
         _ => None,
     };
-    let reviewed_custom_metered =
-        reviewed_custom_route_is_metered(provider, provider_identity, endpoint_fingerprint);
+    let reviewed_custom_metered = reviewed_custom_route_is_metered(provider, endpoint_fingerprint);
     let reviewed_provider_live =
         reviewed_provider_live_route_is_metered(provider, provider_identity, endpoint_fingerprint);
     // An explicitly recorded surface is evidence.  Exact non-metered surfaces
@@ -2206,31 +2219,26 @@ fn audit_openrouter_immutable_pricing(
     )
 }
 
-/// Whether a named compatible route has a reviewed per-token billing contract.
+/// Whether a named custom route has a reviewed per-token billing contract.
 ///
-/// Baseten is accepted only through its setup-template identity (including the
-/// aliases that resolve to that canonical template) and the fingerprint of its
-/// documented Model APIs endpoint. A generic custom table, a Baseten-like name,
-/// or a Baseten identity pointed at another host cannot become metered merely by
-/// publishing a priced `/models` row.
+/// Baseten is accepted only through the fingerprint of its documented Model
+/// APIs endpoint (#6289). The table name is irrelevant: a Baseten identity
+/// pointed at another host cannot become metered, and any table pointed at
+/// Baseten carries Baseten's billing contract. A priced `/models` row alone
+/// never mints metering.
 #[must_use]
 pub(crate) fn reviewed_custom_route_is_metered(
     provider: ApiProvider,
-    provider_identity: Option<&str>,
     endpoint_fingerprint: Option<&str>,
 ) -> bool {
     if provider != ApiProvider::Custom {
         return false;
     }
-    let is_baseten = provider_identity
-        .and_then(codewhale_config::provider_setup_template)
-        .is_some_and(|template| template.id == codewhale_config::BASETEN_TEMPLATE_ID);
-    if !is_baseten {
-        return false;
-    }
     endpoint_fingerprint.is_some_and(|fingerprint| {
         fingerprint
-            == codewhale_config::catalog::base_url_fingerprint(codewhale_config::BASETEN_BASE_URL)
+            == codewhale_config::catalog::base_url_fingerprint(
+                codewhale_config::catalog::BASETEN_BASE_URL,
+            )
     })
 }
 
@@ -2239,8 +2247,8 @@ pub(crate) fn reviewed_custom_route_is_metered(
 ///
 /// OpenRouter is accepted only as the built-in identity on its official API;
 /// a custom table shadowing that name or an endpoint override is a different
-/// billing contract. Baseten-compatible custom identities follow the reviewed
-/// setup template but retain their exact, case-sensitive cache ownership.
+/// billing contract. Custom tables are metered only on Baseten's endpoint
+/// fingerprint and retain their exact, case-sensitive cache ownership.
 #[must_use]
 fn reviewed_provider_live_route_is_metered(
     provider: ApiProvider,
@@ -2257,9 +2265,7 @@ fn reviewed_provider_live_route_is_metered(
                         )
                 })
         }
-        ApiProvider::Custom => {
-            reviewed_custom_route_is_metered(provider, provider_identity, endpoint_fingerprint)
-        }
+        ApiProvider::Custom => reviewed_custom_route_is_metered(provider, endpoint_fingerprint),
         _ => false,
     }
 }
@@ -4229,6 +4235,31 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    #[test]
+    fn deepseek_time_tier_names_the_window_for_tiered_models_only() {
+        // Wednesday 2026-09-16: 02:00Z sits inside the 01:00-04:00 peak
+        // window, 12:00Z outside every window.
+        let peak = Utc.with_ymd_and_hms(2026, 9, 16, 2, 0, 0).unwrap();
+        let off = Utc.with_ymd_and_hms(2026, 9, 16, 12, 0, 0).unwrap();
+        // Saturday 02:00 Beijing time (Friday 18:00Z) bills off-peak even
+        // inside a weekday peak hour.
+        let weekend = Utc.with_ymd_and_hms(2026, 9, 18, 18, 0, 0).unwrap();
+        for model in ["deepseek-v4-pro", "deepseek-v4-flash", "deepseek-flash"] {
+            assert_eq!(deepseek_time_tier(model, peak), Some(true), "{model}");
+            assert_eq!(deepseek_time_tier(model, off), Some(false), "{model}");
+            assert_eq!(deepseek_time_tier(model, weekend), Some(false), "{model}");
+        }
+        assert_eq!(deepseek_time_tier(" DeepSeek-V4-Flash ", peak), Some(true));
+        for flat in [
+            "deepseek-chat",
+            "deepseek-reasoner",
+            "deepseek-ai/deepseek-v4-flash",
+            "",
+        ] {
+            assert_eq!(deepseek_time_tier(flat, peak), None, "{flat}");
+        }
     }
 
     #[test]

@@ -304,57 +304,6 @@ fn provider_environment_model_outranks_startup_memory() {
     );
 }
 
-#[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize)]
-struct HeaderItemsTestConfig {
-    #[serde(default, deserialize_with = "deser_header_items")]
-    header_items: Option<Vec<HeaderItem>>,
-}
-
-#[test]
-fn parses_header_tokens_item() {
-    let config: HeaderItemsTestConfig = toml::from_str(
-        r#"
-header_items = ["tokens"]
-"#,
-    )
-    .expect("header_items should parse");
-
-    assert_eq!(config.header_items, Some(vec![HeaderItem::Tokens]));
-}
-
-#[test]
-fn ignores_unknown_header_items() {
-    let config: HeaderItemsTestConfig = toml::from_str(
-        r#"
-header_items = ["tokens", "future_item"]
-"#,
-    )
-    .expect("unknown header items should not reject the config");
-
-    assert_eq!(config.header_items, Some(vec![HeaderItem::Tokens]));
-}
-
-#[test]
-fn header_items_scenario() {
-    // Scenario consolidation of: header_items_round_trip, header_items_are_opt_in_by_default
-    // from header_items_round_trip
-    {
-        let original = HeaderItemsTestConfig {
-            header_items: Some(vec![HeaderItem::Tokens]),
-        };
-
-        let serialized = toml::to_string(&original).expect("config should serialize");
-        let decoded: HeaderItemsTestConfig =
-            toml::from_str(&serialized).expect("serialized config should parse");
-
-        assert_eq!(decoded, original);
-    }
-    // from header_items_are_opt_in_by_default
-    {
-        assert!(HeaderItem::default_header().is_empty());
-    }
-}
-
 #[test]
 fn malformed_config_error_omits_secret_contents_and_keys() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -618,6 +567,8 @@ fn goal_max_continuations_loads_from_goal_table() -> Result<()> {
     );
     assert_eq!(config.goal_max_continuations(), 0);
     assert_eq!(config.goal_continuation_delay_seconds(), 0);
+    // enforce_token_budget defaults off: budgets stay advisory (#6013).
+    assert!(!config.goal_enforce_token_budget());
 
     // Explicit backstop override.
     let config: Config = toml::from_str(
@@ -638,6 +589,15 @@ max_continuations = 0
 "#,
     )?;
     assert_eq!(config.goal_max_continuations(), 0);
+
+    // Opt a set token budget into a hard stop (#6013).
+    let config: Config = toml::from_str(
+        r#"
+[goal]
+enforce_token_budget = true
+"#,
+    )?;
+    assert!(config.goal_enforce_token_budget());
     assert_eq!(config.goal_continuation_delay_seconds(), 0);
 
     // Bound accidental giant cadences; this remains a turn loop, not a
@@ -1605,13 +1565,9 @@ fn workflow_config_defaults_when_omitted_and_overrides_round_trip() {
         automatic = false
         auto_start_read_only = false
         require_approval_for_writes = true
-        auto_start_child_limit = 4
         max_children = 32
         max_depth = 1
         default_token_budget = 90000
-        max_parallel_writes_without_worktree = 1
-        persist_completed_activity = false
-        persist_completed_across_restarts = false
         "#,
     )
     .expect("parse workflow config");
@@ -1620,13 +1576,9 @@ fn workflow_config_defaults_when_omitted_and_overrides_round_trip() {
     assert!(!workflow.automatic);
     assert!(!workflow.auto_start_read_only);
     assert!(workflow.require_approval_for_writes);
-    assert_eq!(workflow.auto_start_child_limit, 4);
     assert_eq!(workflow.max_children, 32);
     assert_eq!(workflow.max_depth, 1);
     assert_eq!(workflow.default_token_budget, 90_000);
-    assert_eq!(workflow.max_parallel_writes_without_worktree, 1);
-    assert!(!workflow.persist_completed_activity);
-    assert!(!workflow.persist_completed_across_restarts);
     assert_eq!(config.workflow_config(), workflow);
 
     let serialized = toml::to_string_pretty(&workflow).expect("serialize workflow");
@@ -1681,6 +1633,31 @@ fn window_title_config_parses_and_overlays() {
     assert_eq!(merged.title.as_deref(), Some("base-title"));
 }
 
+/// Run `body` with the three Tavily-resolution signals set exactly as given,
+/// restoring the ambient values afterwards. A `Default` pin (and the
+/// Firecrawl China-switch hint) means all three are absent, not just the
+/// legacy `DEEPSEEK_SEARCH_PROVIDER` alias.
+fn with_search_resolution_env<R>(set: &[(&str, &str)], body: impl FnOnce() -> R) -> R {
+    let _guard = lock_test_env();
+    let keys = [
+        "CODEWHALE_SEARCH_PROVIDER",
+        "DEEPSEEK_SEARCH_PROVIDER",
+        "TAVILY_API_KEY",
+    ];
+    let previous: Vec<Option<OsString>> = keys.iter().map(env::var_os).collect();
+    for key in keys {
+        unsafe { env::remove_var(key) };
+    }
+    for (key, value) in set {
+        unsafe { env::set_var(key, value) };
+    }
+    let output = body();
+    for (key, value) in keys.iter().zip(previous) {
+        unsafe { EnvGuard::restore_var(key, value) };
+    }
+    output
+}
+
 #[test]
 fn search_provider_scenario() {
     // Scenario consolidation of: search_provider_defaults_to_firecrawl, search_provider_resolution_reports_default_source, search_provider_resolution_reports_config_source, search_provider_resolution_reports_env_override_source, search_provider_env_override_accepts_baidu, search_provider_resolution_ignores_invalid_env_override
@@ -1694,22 +1671,121 @@ fn search_provider_scenario() {
         assert_eq!(SearchProvider::Firecrawl.as_str(), "firecrawl");
     }
     // from search_provider_resolution_reports_default_source
-    {
-        let _guard = lock_test_env();
-        let prev = env::var_os("DEEPSEEK_SEARCH_PROVIDER");
-        unsafe { env::remove_var("DEEPSEEK_SEARCH_PROVIDER") };
+    // (empty config, no env)
+    with_search_resolution_env(&[], || {
+        let config = Config::default();
+        let resolution = config.search_provider_resolution();
 
-        let resolution = Config::default().search_provider_resolution();
-
-        unsafe { EnvGuard::restore_var("DEEPSEEK_SEARCH_PROVIDER", prev) };
         assert_eq!(resolution.provider, SearchProvider::Firecrawl);
         assert_eq!(resolution.source, SearchProviderSource::Default);
-    }
+        // Autodetect never writes a provider into the config view.
+        assert_eq!(
+            config.search.as_ref().and_then(|search| search.provider),
+            None
+        );
+    });
+    // `TAVILY_API_KEY=tvly-test`, provider unset
+    with_search_resolution_env(&[("TAVILY_API_KEY", "tvly-test")], || {
+        let config = Config::default();
+        let resolution = config.search_provider_resolution();
+
+        assert_eq!(resolution.provider, SearchProvider::Tavily);
+        assert_eq!(resolution.source, SearchProviderSource::TavilyKey);
+        assert_eq!(resolution.source.as_str(), "tavily key");
+        assert_eq!(resolution.provider.as_str(), "tavily");
+        // Autodetect is runtime-only: `config.search.provider` stays unset.
+        assert_eq!(
+            config.search.as_ref().and_then(|search| search.provider),
+            None
+        );
+    });
+    // `TAVILY_API_KEY=not-a-tvly-prefix`, provider unset — a dedicated env key
+    // is never prefix-checked.
+    with_search_resolution_env(&[("TAVILY_API_KEY", "not-a-tvly-prefix")], || {
+        let resolution = Config::default().search_provider_resolution();
+
+        assert_eq!(resolution.provider, SearchProvider::Tavily);
+        assert_eq!(resolution.source, SearchProviderSource::TavilyKey);
+    });
+    // `[search] api_key = "tvly-test"`, provider unset — also the shape left by
+    // `CODEWHALE_SEARCH_API_KEY=tvly-test` after `apply_env_overrides`.
+    with_search_resolution_env(&[], || {
+        let config: Config = toml::from_str(
+            r#"
+            [search]
+            api_key = "tvly-test"
+            "#,
+        )
+        .expect("search config");
+        let resolution = config.search_provider_resolution();
+
+        assert_eq!(resolution.provider, SearchProvider::Tavily);
+        assert_eq!(resolution.source, SearchProviderSource::TavilyKey);
+        assert_eq!(
+            config.search.as_ref().and_then(|search| search.provider),
+            None
+        );
+    });
+    // A non-`tvly-` generic key never autodetects. Covers
+    // `CODEWHALE_SEARCH_API_KEY=doctor-offline-search-sentinel` and any
+    // Firecrawl `fc-` generic value.
+    with_search_resolution_env(&[], || {
+        let config: Config = toml::from_str(
+            r#"
+            [search]
+            api_key = "doctor-offline-search-sentinel"
+            "#,
+        )
+        .expect("search config");
+        let resolution = config.search_provider_resolution();
+
+        assert_eq!(resolution.provider, SearchProvider::Firecrawl);
+        assert_eq!(resolution.source, SearchProviderSource::Default);
+    });
+    // Dedicated provider keys that are not the Tavily signal leave the
+    // Firecrawl default in place.
+    with_search_resolution_env(
+        &[
+            ("FIRECRAWL_API_KEY", "fc-test"),
+            ("SOFYA_API_KEY", "ay_live_test"),
+        ],
+        || {
+            let resolution = Config::default().search_provider_resolution();
+
+            assert_eq!(resolution.provider, SearchProvider::Firecrawl);
+            assert_eq!(resolution.source, SearchProviderSource::Default);
+        },
+    );
+    // Explicit Firecrawl wins over a Tavily key.
+    with_search_resolution_env(&[("TAVILY_API_KEY", "tvly-test")], || {
+        let config: Config = toml::from_str(
+            r#"
+            [search]
+            provider = "firecrawl"
+            "#,
+        )
+        .expect("search config");
+        let resolution = config.search_provider_resolution();
+
+        assert_eq!(resolution.provider, SearchProvider::Firecrawl);
+        assert_eq!(resolution.source, SearchProviderSource::Config);
+    });
+    // An env override outranks both the config pin and the Tavily signal.
+    with_search_resolution_env(
+        &[
+            ("CODEWHALE_SEARCH_PROVIDER", "firecrawl"),
+            ("TAVILY_API_KEY", "tvly-test"),
+        ],
+        || {
+            let resolution = Config::default().search_provider_resolution();
+
+            assert_eq!(resolution.provider, SearchProvider::Firecrawl);
+            assert_eq!(resolution.source, SearchProviderSource::EnvOverride);
+        },
+    );
+
     // from search_provider_resolution_reports_config_source
-    {
-        let _guard = lock_test_env();
-        let prev = env::var_os("DEEPSEEK_SEARCH_PROVIDER");
-        unsafe { env::remove_var("DEEPSEEK_SEARCH_PROVIDER") };
+    with_search_resolution_env(&[], || {
         let config: Config = toml::from_str(
             r#"
             [search]
@@ -1720,15 +1796,11 @@ fn search_provider_scenario() {
 
         let resolution = config.search_provider_resolution();
 
-        unsafe { EnvGuard::restore_var("DEEPSEEK_SEARCH_PROVIDER", prev) };
         assert_eq!(resolution.provider, SearchProvider::Tavily);
         assert_eq!(resolution.source, SearchProviderSource::Config);
-    }
+    });
     // from search_provider_resolution_reports_env_override_source
-    {
-        let _guard = lock_test_env();
-        let prev = env::var_os("DEEPSEEK_SEARCH_PROVIDER");
-        unsafe { env::set_var("DEEPSEEK_SEARCH_PROVIDER", "bocha") };
+    with_search_resolution_env(&[("CODEWHALE_SEARCH_PROVIDER", "bocha")], || {
         let config: Config = toml::from_str(
             r#"
             [search]
@@ -1739,15 +1811,11 @@ fn search_provider_scenario() {
 
         let resolution = config.search_provider_resolution();
 
-        unsafe { EnvGuard::restore_var("DEEPSEEK_SEARCH_PROVIDER", prev) };
         assert_eq!(resolution.provider, SearchProvider::Bocha);
         assert_eq!(resolution.source, SearchProviderSource::EnvOverride);
-    }
-    // from search_provider_env_override_accepts_baidu
-    {
-        let _guard = lock_test_env();
-        let prev = env::var_os("DEEPSEEK_SEARCH_PROVIDER");
-        unsafe { env::set_var("DEEPSEEK_SEARCH_PROVIDER", "baidu") };
+    });
+    // The legacy alias still resolves the same way.
+    with_search_resolution_env(&[("DEEPSEEK_SEARCH_PROVIDER", "bocha")], || {
         let config: Config = toml::from_str(
             r#"
             [search]
@@ -1758,15 +1826,26 @@ fn search_provider_scenario() {
 
         let resolution = config.search_provider_resolution();
 
-        unsafe { EnvGuard::restore_var("DEEPSEEK_SEARCH_PROVIDER", prev) };
+        assert_eq!(resolution.provider, SearchProvider::Bocha);
+        assert_eq!(resolution.source, SearchProviderSource::EnvOverride);
+    });
+    // from search_provider_env_override_accepts_baidu
+    with_search_resolution_env(&[("CODEWHALE_SEARCH_PROVIDER", "baidu")], || {
+        let config: Config = toml::from_str(
+            r#"
+            [search]
+            provider = "duckduckgo"
+            "#,
+        )
+        .expect("search config");
+
+        let resolution = config.search_provider_resolution();
+
         assert_eq!(resolution.provider, SearchProvider::Baidu);
         assert_eq!(resolution.source, SearchProviderSource::EnvOverride);
-    }
+    });
     // from search_provider_resolution_ignores_invalid_env_override
-    {
-        let _guard = lock_test_env();
-        let prev = env::var_os("DEEPSEEK_SEARCH_PROVIDER");
-        unsafe { env::set_var("DEEPSEEK_SEARCH_PROVIDER", "not-a-provider") };
+    with_search_resolution_env(&[("CODEWHALE_SEARCH_PROVIDER", "not-a-provider")], || {
         let config: Config = toml::from_str(
             r#"
             [search]
@@ -1777,10 +1856,9 @@ fn search_provider_scenario() {
 
         let resolution = config.search_provider_resolution();
 
-        unsafe { EnvGuard::restore_var("DEEPSEEK_SEARCH_PROVIDER", prev) };
         assert_eq!(resolution.provider, SearchProvider::Tavily);
         assert_eq!(resolution.source, SearchProviderSource::Config);
-    }
+    });
 }
 
 #[test]
@@ -1915,6 +1993,56 @@ fn user_input_timeout_defaults_disabled_and_clamps() {
     .expect("tools config");
     assert_eq!(
         parsed.base.user_input_timeout(),
+        Some(std::time::Duration::from_secs(86_400))
+    );
+}
+
+#[test]
+fn approval_timeout_defaults_unbounded_and_clamps() {
+    let parsed: ConfigFile = toml::from_str("").expect("empty config");
+    assert_eq!(parsed.base.approval_timeout(), None);
+
+    // The card stays unbounded when only presentation is configured.
+    let parsed: ConfigFile = toml::from_str(
+        r#"
+        [approval]
+        default_selection = "allow_once"
+        "#,
+    )
+    .expect("approval config");
+    assert_eq!(parsed.base.approval_timeout(), None);
+
+    let parsed: ConfigFile = toml::from_str(
+        r#"
+        [approval]
+        timeout_seconds = 300
+        "#,
+    )
+    .expect("approval config");
+    assert_eq!(
+        parsed.base.approval_timeout(),
+        Some(std::time::Duration::from_secs(300))
+    );
+
+    // An explicit 0 follows the repo's "wait forever" convention (#6101).
+    let parsed: ConfigFile = toml::from_str(
+        r#"
+        [approval]
+        timeout_seconds = 0
+        "#,
+    )
+    .expect("approval config");
+    assert_eq!(parsed.base.approval_timeout(), None);
+
+    let parsed: ConfigFile = toml::from_str(
+        r#"
+        [approval]
+        timeout_seconds = 999999
+        "#,
+    )
+    .expect("approval config");
+    assert_eq!(
+        parsed.base.approval_timeout(),
         Some(std::time::Duration::from_secs(86_400))
     );
 }
@@ -2069,6 +2197,35 @@ fn sofya_search_provider_parses_and_round_trips() {
     assert_eq!(SearchProvider::parse("sofya"), Some(SearchProvider::Sofya));
     assert_eq!(SearchProvider::parse("Sofya"), Some(SearchProvider::Sofya));
     assert_eq!(SearchProvider::Sofya.as_str(), "sofya");
+}
+
+#[test]
+fn explicit_serply_search_provider_is_preserved() {
+    let config: Config = toml::from_str(
+        r#"
+        [search]
+        provider = "serply"
+        "#,
+    )
+    .expect("serply search config");
+
+    assert_eq!(
+        config.search.and_then(|search| search.provider),
+        Some(SearchProvider::Serply)
+    );
+}
+
+#[test]
+fn serply_search_provider_parses_and_round_trips() {
+    assert_eq!(
+        SearchProvider::parse("serply"),
+        Some(SearchProvider::Serply)
+    );
+    assert_eq!(
+        SearchProvider::parse("Serply"),
+        Some(SearchProvider::Serply)
+    );
+    assert_eq!(SearchProvider::Serply.as_str(), "serply");
 }
 
 #[test]
@@ -3192,29 +3349,6 @@ fn structured_role_pins_require_a_typed_model_field() {
 }
 
 #[test]
-fn subagent_token_budget_is_optional_and_zero_disables() {
-    assert_eq!(Config::default().subagent_token_budget(), None);
-
-    let disabled = Config {
-        subagents: Some(SubagentsConfig {
-            token_budget: Some(0),
-            ..SubagentsConfig::default()
-        }),
-        ..Config::default()
-    };
-    assert_eq!(disabled.subagent_token_budget(), None);
-
-    let configured = Config {
-        subagents: Some(SubagentsConfig {
-            token_budget: Some(50_000),
-            ..SubagentsConfig::default()
-        }),
-        ..Config::default()
-    };
-    assert_eq!(configured.subagent_token_budget(), Some(50_000));
-}
-
-#[test]
 fn subagent_admission_limit_defaults_and_clamps() {
     assert_eq!(
         Config::default().max_admitted_subagents(),
@@ -3267,7 +3401,6 @@ max_concurrent = 20
 launch_concurrency = 20
 max_admitted = 200
 max_depth = 6
-token_budget = 100000
 api_timeout_secs = 900
 heartbeat_timeout_secs = 1200
 
@@ -3276,7 +3409,6 @@ max_concurrent = 4
 launch_concurrency = 3
 max_admitted = 12
 max_depth = 2
-token_budget = 25000
 api_timeout_secs = 180
 heartbeat_timeout_secs = 240
 "#,
@@ -3294,10 +3426,6 @@ heartbeat_timeout_secs = 240
     assert_eq!(
         config.subagent_max_spawn_depth_for_provider(ApiProvider::Zai),
         2
-    );
-    assert_eq!(
-        config.subagent_token_budget_for_provider(ApiProvider::Zai),
-        Some(25_000)
     );
     assert_eq!(
         config.subagent_api_timeout_secs_for_provider(ApiProvider::Zai),
@@ -7746,7 +7874,7 @@ fn normalize_model_name_for_zai_canonicalizes_current_glm_models() {
 }
 
 #[test]
-fn opencode_go_config_uses_only_current_chat_completions_models() -> Result<()> {
+fn opencode_go_config_uses_documented_model_protocols() -> Result<()> {
     let _lock = lock_test_env();
     let _api_key = EnvVarGuard::remove("OPENCODE_GO_API_KEY");
     let _base_url = EnvVarGuard::remove("OPENCODE_GO_BASE_URL");
@@ -7772,26 +7900,19 @@ model = "opencode-go/glm-5.2"
     );
     assert_eq!(
         model_completion_names_for_provider(ApiProvider::OpencodeGo),
-        OPENCODE_GO_CHAT_MODELS.to_vec()
+        opencode_go_models()
     );
-    for chat_model in OPENCODE_GO_CHAT_MODELS {
+    for chat_model in opencode_go_models() {
         assert_eq!(
             canonical_model_id_for_provider(ApiProvider::OpencodeGo, chat_model).as_deref(),
-            Some(*chat_model)
+            Some(chat_model)
         );
         assert!(validate_route(ApiProvider::OpencodeGo, chat_model).is_ok());
     }
-    for messages_only in [
-        "minimax-m3",
-        "minimax-m2.7",
-        "minimax-m2.5",
-        "qwen3.7-max",
-        "qwen3.7-plus",
-        "qwen3.6-plus",
-    ] {
+    for messages_only in ["claude-unproven", "gpt-unlisted"] {
         assert!(
             !model_completion_names_for_provider(ApiProvider::OpencodeGo).contains(&messages_only),
-            "{messages_only} uses the Messages endpoint and must not be advertised"
+            "{messages_only} has no documented Go protocol and must not be advertised"
         );
         assert!(
             canonical_model_id_for_provider(ApiProvider::OpencodeGo, messages_only).is_none(),
@@ -7804,7 +7925,7 @@ model = "opencode-go/glm-5.2"
         assert!(validate_route(ApiProvider::OpencodeGo, messages_only).is_err());
         // Never substitute a different model. Keep the caller's spelling so
         // validate_route / the route resolver can reject by name. A base URL
-        // override still cannot promote a Messages-only id onto Chat Completions.
+        // override still cannot grant an unknown ID a protocol.
         assert_eq!(
             wire_model_for_provider(ApiProvider::OpencodeGo, messages_only),
             messages_only,
@@ -12163,7 +12284,7 @@ fn status_items_scenario() {
     // the retired keys are skipped, the live ones survive in order.
     {
         let toml_str = r#"
-            status_items = ["mode", "status", "model", "git_branch", "rate_limit", "tokens"]
+            status_items = ["mode", "status", "model", "agents", "rate_limit", "tokens"]
         "#;
         let tui: TuiConfig = toml::from_str(toml_str).expect("legacy items should parse");
         let items = tui.status_items.expect("status_items should be Some");
@@ -12172,6 +12293,18 @@ fn status_items_scenario() {
             vec![StatusItem::Mode, StatusItem::Model, StatusItem::Tokens],
             "retired keys should drop out without failing the whole file"
         );
+    }
+    // #6112 revived `git_branch` and added `workspace`: both parse again and
+    // round-trip through their canonical keys.
+    {
+        let toml_str = r#"
+            status_items = ["workspace", "git_branch"]
+        "#;
+        let tui: TuiConfig = toml::from_str(toml_str).expect("revived items should parse");
+        let items = tui.status_items.expect("status_items should be Some");
+        assert_eq!(items, vec![StatusItem::Workspace, StatusItem::GitBranch]);
+        assert_eq!(StatusItem::Workspace.key(), "workspace");
+        assert_eq!(StatusItem::GitBranch.key(), "git_branch");
     }
     // from status_items_deser_allows_missing_field
     {
@@ -12302,6 +12435,43 @@ fn huggingface_provider_scenario() -> Result<()> {
         assert_eq!(config.deepseek_api_key()?, "hf-env-key");
         assert_eq!(config.deepseek_base_url(), DEFAULT_HUGGINGFACE_BASE_URL);
         assert_eq!(config.default_model(), DEFAULT_HUGGINGFACE_MODEL);
+    }
+    Ok(())
+}
+
+#[test]
+fn modelscope_provider_scenario() -> Result<()> {
+    // from modelscope_provider_aliases_parse
+    {
+        for alias in ["modelscope", "modelscope-cn"] {
+            assert_eq!(ApiProvider::parse(alias), Some(ApiProvider::Modelscope));
+        }
+    }
+    // from modelscope_provider_uses_direct_defaults
+    {
+        let _lock = lock_test_env();
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let temp_root = env::temp_dir().join(format!(
+            "codewhale-tui-modelscope-defaults-test-{}-{}",
+            std::process::id(),
+            nanos
+        ));
+        fs::create_dir_all(&temp_root)?;
+        let _guard = EnvGuard::new(&temp_root);
+
+        unsafe {
+            env::set_var("CODEWHALE_PROVIDER", "modelscope");
+            env::set_var("MODELSCOPE_API_KEY", "ms-env-key");
+        }
+
+        let config = Config::load(None, None)?;
+        assert_eq!(config.api_provider(), ApiProvider::Modelscope);
+        assert_eq!(config.deepseek_api_key()?, "ms-env-key");
+        assert_eq!(config.deepseek_base_url(), DEFAULT_MODELSCOPE_BASE_URL);
+        assert_eq!(config.default_model(), DEFAULT_MODELSCOPE_MODEL);
     }
     Ok(())
 }

@@ -68,6 +68,7 @@ codewhale auth set --provider deepseek
 | `xiaomi-mimo` | 小米 | MiMo 系列 |
 | `siliconflow` | 硅基流动 | 模型聚合平台 |
 | `siliconflow-CN` | 硅基流动（中国区） | 国内域名 |
+| `modelscope` | 魔搭社区 | 大模型开源社区 |
 | `longcat` | 美团 | LongCat 系列 |
 | `telecomjs` | 中国电信 | 天翼 AI 网关 |
 

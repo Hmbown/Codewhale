@@ -101,7 +101,11 @@ async fn issue_5305_role_only_receipt_precedes_status_poll() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
 
     let (manager, _context, start) = start_consultant(workspace.path()).await;
-    assert!(start.content.len() < 1024, "receipt must remain compact");
+    assert!(
+        start.content.len() < 1024,
+        "receipt must remain compact: {} bytes",
+        start.content.len()
+    );
     let receipt = receipt_from(&start);
     assert_eq!(receipt["requested_type"], json!("advisor"));
     assert_eq!(receipt["requested_profile"], serde_json::Value::Null);
@@ -149,7 +153,45 @@ async fn issue_5305_receipt_survives_status_peek() {
         .expect("peek");
     let peek_json: serde_json::Value = serde_json::from_str(&peek.content).expect("peek json");
     assert_eq!(peek_json["child_route"], receipt);
+    assert_eq!(peek.metadata.as_ref().unwrap()["child_route"], receipt);
+    assert!(status.content.len() <= lifecycle::COMPACT_STATUS_BYTES);
+    assert!(peek.content.len() <= lifecycle::COMPACT_STATUS_BYTES);
     cancel_started(&manager, &start).await;
+}
+
+#[test]
+fn compact_receipt_bounds_long_labels_and_declared_outputs_without_hiding_limits() {
+    let metadata = spawn_route_metadata("deepseek", &"🐋\\\"".repeat(4000), "run.model");
+    let paths = (0..32)
+        .map(|index| format!("reports/{index}-{}.md", "長".repeat(4000)))
+        .collect::<Vec<_>>();
+    let mut receipt = json!({
+        "agent_id": "agent_bounded_receipt", "run_id": "agent_bounded_receipt",
+        "name": "🐋".repeat(4000), "status": "starting", "terminal": false,
+        "context_mode": "fresh", "child_route": metadata.child_route,
+        "follow_up": {"tool": "agent", "agent_id": "agent_bounded_receipt", "session_name": "🐋".repeat(4000)},
+        "usage": {"status": "unknown", "note": "No provider receipt yet"},
+        "worker_record": {"spec": {
+            "runtime_profile": {"spawn_depth": 1, "max_spawn_depth": 2, "max_steps": 8, "wall_time_secs": 30, "wall_deadline_ms": 10000},
+            "launch_manifest": {"deliverables": paths}
+        }}
+    });
+    compact_spawn_receipt(&mut receipt, false);
+    assert!(serde_json::to_vec(&receipt).unwrap().len() <= lifecycle::COMPACT_SPAWN_BYTES);
+    assert_eq!(receipt["effective_limits"]["max_steps"], 8);
+    assert_eq!(receipt["effective_limits"]["wall_deadline_ms"], 10000);
+    assert_eq!(receipt["child_route"]["truncated"], true);
+    let shown = receipt["deliverables"].as_array().unwrap();
+    assert_eq!(
+        shown.len() + receipt["deliverables_omitted"].as_u64().unwrap() as usize,
+        paths.len()
+    );
+    for (path, original) in shown.iter().zip(&paths) {
+        assert_eq!(
+            path, original,
+            "declared paths must remain exact when shown"
+        );
+    }
 }
 
 #[tokio::test]
@@ -227,10 +269,12 @@ async fn issue_5305_unbuildable_route_refuses_before_worktree_admission() {
 }
 
 #[tokio::test]
-async fn issue_5305_untethered_runtime_fails_closed_before_admission() {
-    // Role-only dispatch builds no provider client, but the wire-protocol
-    // bind still needs the session `Config`: without it the spawn fails
-    // closed before admission instead of dispatching half-bound.
+async fn issue_6320_untethered_runtime_binds_exact_route() {
+    // #6320 decision: binding to the already-exact route is acceptable. The
+    // runtime keeps its fully-constructed client; `api_config = None` only
+    // matters when a cross-protocol rebuild is needed, and that path still
+    // fails closed (see untethered_cross_protocol_rebound_fails_closed_without_config).
+    // Untethered means "no Config to rebuild from", not "no client at all".
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let manager = new_shared_subagent_manager(workspace.path().to_path_buf(), 1);
     let mut runtime = stub_runtime();
@@ -238,18 +282,17 @@ async fn issue_5305_untethered_runtime_fails_closed_before_admission() {
     runtime.manager = manager.clone();
     runtime.api_config = None;
     let context = runtime.context.clone();
-    let err = AgentTool::new(manager.clone(), runtime)
+    let start = AgentTool::new(manager.clone(), runtime)
         .execute(
             json!({"action":"start", "type":"consultant", "prompt":"untethered spawn"}),
             &context,
         )
         .await
-        .expect_err("untethered runtime must fail closed");
-    assert!(
-        err.to_string().contains("no configuration is available"),
-        "{err}"
-    );
-    assert!(manager.read().await.list_filtered(true).is_empty());
+        .expect("untethered runtime binds its exact route");
+    let receipt = receipt_from(&start);
+    assert_eq!(receipt["model_id"], json!("deepseek-v4-flash"));
+    assert!(!manager.read().await.list_filtered(true).is_empty());
+    cancel_started(&manager, &start).await;
 }
 
 #[test]
@@ -270,6 +313,7 @@ fn issue_5305_builtin_inheritance_and_redaction_are_bounded() {
         &runtime,
         "deepseek-v4-flash".to_string(),
         "run.model",
+        None,
     )
     .expect("bounded receipt");
     let encoded = serde_json::to_string(&receipt).expect("receipt json");
@@ -284,6 +328,24 @@ fn issue_5305_builtin_inheritance_and_redaction_are_bounded() {
             "receipt leaked {forbidden}: {encoded}"
         );
     }
+    // #5529 mode 2: the fallback note rides the receipt inside the same
+    // byte ceiling.
+    let fallback = mint_child_route_receipt(
+        &requested_route,
+        &request,
+        None,
+        &runtime,
+        "deepseek-v4-flash".to_string(),
+        "session.fallback",
+        Some("pinned provider 'xai' unavailable (no credentials); fell back to the session route"),
+    )
+    .expect("bounded receipt");
+    assert_eq!(
+        fallback.fallback_note.as_deref(),
+        Some("pinned provider 'xai' unavailable (no credentials); fell back to the session route")
+    );
+    let fallback_encoded = serde_json::to_string(&fallback).expect("receipt json");
+    assert!(fallback_encoded.len() <= CHILD_ROUTE_RECEIPT_MAX_BYTES);
 }
 
 #[tokio::test]
@@ -299,6 +361,7 @@ async fn issue_5305_receipt_survives_ledger_interruption_completion_and_resume()
         provider_id: "openai-codex".to_string(),
         model_id: "gpt-5.6-sol".to_string(),
         route_source: "agent_profile.model".to_string(),
+        fallback_note: None,
         requested_reasoning: "inherit".to_string(),
         effective_reasoning: Some("high".to_string()),
         runtime_version: "test".to_string(),

@@ -912,8 +912,10 @@ mod tests {
         let result = help(&mut app, Some("memory"));
         let msg = result.message.expect("help topic should return message");
         assert!(msg.contains("memory"));
-        assert!(msg.contains("persistent user-memory file"));
-        assert!(msg.contains("Usage: /memory [show|path|clear|edit|help]"));
+        assert!(msg.contains("persistent structured user memory"));
+        assert!(msg.contains(
+            "Usage: /memory [status|path|search|get|remember|import|export|reindex|clear|help]"
+        ));
     }
 
     #[test]
@@ -942,7 +944,7 @@ mod tests {
         app.history.push(HistoryCell::User {
             content: "test".to_string(),
         });
-        app.api_messages.push(Message {
+        app.api_messages_mut().push(Message {
             role: Role::User,
             content: vec![],
         });
@@ -998,7 +1000,7 @@ mod tests {
         app.history.push(HistoryCell::User {
             content: "keep me".to_string(),
         });
-        app.api_messages.push(Message {
+        app.api_messages_mut().push(Message {
             role: Role::User,
             content: vec![],
         });
@@ -1024,7 +1026,7 @@ mod tests {
         app.history.push(HistoryCell::User {
             content: "keep active turn".to_string(),
         });
-        app.api_messages.push(Message {
+        app.api_messages_mut().push(Message {
             role: Role::User,
             content: vec![],
         });

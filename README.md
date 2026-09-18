@@ -82,8 +82,12 @@ the agent and its tools:
   runs a task from a script or CI job.
 - **Local browser:** `codewhale web` opens the bundled
   [local web client](docs/WEB.md) for the same runtime.
-- **Codewhale web and desktop apps:** graphical workbenches in development.
-  Their availability is listed on the [product page](https://codewhale.net/en/product).
+- **Codewhale desktop app (GPUI):** the native GPUI desktop app is the
+  product-client direction (decided 2026-09-14; the phase map lives in
+  `docs/TRANSITION.md` in the private `codehwhale-gpui` repo). The hosted web
+  app at app.codewhale.net sunsets in phases; the marketing site, sign-in,
+  billing, legal, and download pages stay on the web permanently.
+  Availability is listed on the [product page](https://codewhale.net/en/product).
 
 **Computer Use adds tools for observing and interacting with other applications.**
 The plugin is included in the current source.

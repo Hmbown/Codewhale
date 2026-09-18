@@ -296,8 +296,8 @@ impl VerifyTool {
     /// `High` — elevated reasoning is the whole point of this tool. This is the
     /// seam for a future `[verify] critic_effort` config knob; production
     /// registration currently uses the `Max` default from [`Self::new`].
-    #[allow(dead_code)]
     #[must_use]
+    #[cfg_attr(not(test), expect(dead_code))]
     pub fn with_critic_effort(mut self, effort: ReasoningEffort) -> Self {
         self.critic_effort = clamp_to_elevated(effort);
         self

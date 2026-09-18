@@ -114,13 +114,58 @@ pub fn run_editor_raw(seed: &str) -> io::Result<EditorOutcome> {
     }
 }
 
+/// Append the file (and optional line) arguments in the spelling `program`
+/// understands.
+///
+/// Every caller that opens a real file goes through here so the three paths
+/// cannot drift on how a line number is spelled. Without a line this is exactly
+/// `cmd.arg(path)`, which is what it has always been.
+///
+/// `file_stem` rather than the whole program name, so an absolute path and a
+/// Windows `.exe` suffix both still match. An editor we do not recognize gets
+/// the bare path: opening the right file at the wrong line beats a spurious
+/// argument the editor treats as a second file to open.
+fn push_target_args(cmd: &mut Command, program: &str, path: &std::path::Path, line: Option<u32>) {
+    let Some(line) = line else {
+        cmd.arg(path);
+        return;
+    };
+    let stem = std::path::Path::new(program)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or(program)
+        .to_ascii_lowercase();
+
+    match stem.as_str() {
+        // The vi family and the editors that copied its `+N` convention.
+        "vi" | "vim" | "nvim" | "view" | "gvim" | "nano" | "pico" | "emacs" | "emacsclient"
+        | "kak" | "micro" | "joe" => {
+            cmd.arg(format!("+{line}"));
+            cmd.arg(path);
+        }
+        // VS Code and its forks need an explicit flag before `file:line`.
+        "code" | "code-insiders" | "codium" | "vscodium" | "cursor" | "windsurf" => {
+            cmd.arg("--goto");
+            cmd.arg(format!("{}:{line}", path.display()));
+        }
+        // Sublime, Zed and JetBrains launchers all take `file:line` directly.
+        "subl" | "sublime_text" | "zed" | "idea" | "pycharm" | "goland" | "clion" | "rustrover"
+        | "webstorm" => {
+            cmd.arg(format!("{}:{line}", path.display()));
+        }
+        _ => {
+            cmd.arg(path);
+        }
+    }
+}
+
 /// Run the external editor on a real file, in place.
 ///
 /// Unlike [`run_editor_raw`] there is no temp file and no seed: the file on
 /// disk *is* the document, so a `hooks.toml` the user edits stays edited even
 /// if the editor exits non-zero. The outcome only reports whether the bytes
 /// moved, which is what the caller needs in order to decide whether to reload.
-pub fn run_editor_on_path(path: &std::path::Path) -> io::Result<EditorOutcome> {
+pub fn run_editor_on_path(path: &std::path::Path, line: Option<u32>) -> io::Result<EditorOutcome> {
     let before = fs::read_to_string(path).unwrap_or_default();
 
     let raw = resolve_editor();
@@ -132,7 +177,7 @@ pub fn run_editor_on_path(path: &std::path::Path) -> io::Result<EditorOutcome> {
     if parts.len() > 1 {
         cmd.args(&parts[1..]);
     }
-    cmd.arg(path);
+    push_target_args(&mut cmd, &parts[0], path, line);
     let status = match cmd.status() {
         Ok(status) => status,
         Err(_) => return Ok(EditorOutcome::Cancelled),
@@ -161,13 +206,14 @@ pub(crate) fn spawn_editor_for_path(
     use_mouse_capture: bool,
     use_bracketed_paste: bool,
     path: &std::path::Path,
+    line: Option<u32>,
 ) -> io::Result<EditorOutcome> {
     with_suspended_tui(
         terminal,
         use_alt_screen,
         use_mouse_capture,
         use_bracketed_paste,
-        || run_editor_on_path(path),
+        || run_editor_on_path(path, line),
     )
 }
 
@@ -204,6 +250,17 @@ fn with_suspended_tui(
     use_bracketed_paste: bool,
     body: impl FnOnce() -> io::Result<EditorOutcome>,
 ) -> io::Result<EditorOutcome> {
+    // 0. Stop reading the tty.
+    // #6165: suspending crossterm state is not enough. The input pump runs on
+    // its own thread and keeps calling `event::read()` whatever mode the
+    // terminal is in, so a child launched without this pause competes with
+    // Codewhale for every keystroke — the editor cannot be quit and the
+    // fragments land in the composer. Pausing here, rather than at each call
+    // site, is what makes `/hooks edit` and the composer editor correct by
+    // the same construction. Fail closed: a pump that will not stop means the
+    // handoff would reproduce the defect, so the editor does not run.
+    let input_pause = crate::tui::ui::pause_terminal_input_for_child()?;
+
     // 1. Suspend.
     // Focus reporting is about to be disabled. Fail closed to the quiet state
     // so a stale FocusLost cannot authorize a surprise notification while an
@@ -243,6 +300,9 @@ fn with_suspended_tui(
     // Force a full repaint so a SIGWINCH during the edit doesn't leave the
     // viewport stale.
     let _ = terminal.clear();
+
+    // 4. Take the tty back, after the modes it reads under are restored.
+    drop(input_pause);
 
     result
 }
@@ -319,7 +379,7 @@ mod tests {
         unsafe { env::set_var("VISUAL", "true") };
         unsafe { env::remove_var("EDITOR") };
         assert_eq!(
-            run_editor_on_path(&path).unwrap(),
+            run_editor_on_path(&path, None).unwrap(),
             EditorOutcome::Unchanged,
             "an editor that changes nothing must not trigger a reload"
         );
@@ -330,7 +390,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt as _;
         fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
         unsafe { env::set_var("VISUAL", script.to_str().unwrap()) };
-        match run_editor_on_path(&path).unwrap() {
+        match run_editor_on_path(&path, None).unwrap() {
             EditorOutcome::Edited(text) => assert!(text.contains("# seed") && text.contains('x')),
             other => panic!("expected Edited, got {other:?}"),
         }
@@ -338,6 +398,48 @@ mod tests {
             fs::read_to_string(&path).unwrap().contains('x'),
             "the edit belongs to the real file, not a temp copy"
         );
+    }
+
+    /// The line argument is spelled per editor family, and an unknown editor
+    /// gets the bare path rather than an argument it would treat as a file.
+    #[test]
+    fn push_target_args_spells_the_line_per_editor_family() {
+        use std::ffi::OsStr;
+
+        let path = std::path::Path::new("/w/src/main.rs");
+        let args_for = |program: &str, line: Option<u32>| -> Vec<String> {
+            let mut cmd = Command::new(program);
+            push_target_args(&mut cmd, program, path, line);
+            cmd.get_args()
+                .map(OsStr::to_string_lossy)
+                .map(|s| s.into_owned())
+                .collect()
+        };
+
+        // No line: byte-identical to the historical `cmd.arg(path)`.
+        assert_eq!(args_for("vim", None), vec!["/w/src/main.rs"]);
+        assert_eq!(args_for("code", None), vec!["/w/src/main.rs"]);
+
+        // vi family, including an absolute path and a .exe suffix.
+        assert_eq!(args_for("vim", Some(12)), vec!["+12", "/w/src/main.rs"]);
+        assert_eq!(args_for("nano", Some(3)), vec!["+3", "/w/src/main.rs"]);
+        assert_eq!(
+            args_for("/usr/bin/nvim", Some(9)),
+            vec!["+9", "/w/src/main.rs"]
+        );
+        // `.exe` is stripped by `file_stem` on every platform. A backslashed
+        // Windows *path* only splits on Windows, so it is not asserted here.
+        assert_eq!(args_for("vim.exe", Some(5)), vec!["+5", "/w/src/main.rs"]);
+
+        // VS Code and forks need the flag; Zed/Sublime/JetBrains take file:line.
+        assert_eq!(
+            args_for("code", Some(42)),
+            vec!["--goto", "/w/src/main.rs:42"]
+        );
+        assert_eq!(args_for("zed", Some(42)), vec!["/w/src/main.rs:42"]);
+
+        // Unknown editor: open the right file, never an invented argument.
+        assert_eq!(args_for("my-editor", Some(42)), vec!["/w/src/main.rs"]);
     }
 
     #[test]

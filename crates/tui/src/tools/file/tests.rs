@@ -209,7 +209,7 @@ async fn contract_read_paginates_an_oversized_file_with_an_honest_budget_footer(
         .to_string();
     assert_eq!(
         footer,
-        "[Showing lines 1-100 of 2000 (100000-byte output budget). Use offset=101 to continue, or max_bytes up to 500000 to read more per call.]"
+        "[Showing lines 1-100 of 2000 (1.9MB total, 100000-byte output budget). Use offset=101 to continue, or max_bytes up to 500000 to read more per call.]"
     );
     let shown = first.content.rsplit_once("\n\n").expect("body").0;
     assert_eq!(shown.lines().count(), 100);
@@ -227,6 +227,162 @@ async fn contract_read_paginates_an_oversized_file_with_an_honest_budget_footer(
         second.content.contains("Use offset=201 to continue"),
         "{}",
         second.content
+    );
+}
+
+/// #6283 AC1: a >10 MiB file read without paging params returns page one
+/// plus the file's size, line count, and truncated flag — never the whole
+/// file.
+#[tokio::test]
+async fn contract_read_reports_size_and_truncation_for_huge_files() {
+    let _workshop_guard = crate::tools::large_output_router::active_workshop_test_guard();
+    let temporary = tempfile::tempdir().expect("tempdir");
+    let line = "x".repeat(99);
+    let content = std::iter::repeat_n(line.as_str(), 110_000)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        content.len() > 10 * 1024 * 1024,
+        "fixture exceeds 10 MiB: {}",
+        content.len()
+    );
+    std::fs::write(temporary.path().join("huge.bin.txt"), &content).expect("fixture");
+    let context = ToolContext::new(temporary.path());
+
+    let first = ReadFileTool::execute_contract_read(json!({"path": "huge.bin.txt"}), &context)
+        .await
+        .expect("first page");
+    let metadata = first.metadata.clone().expect("paging metadata");
+    assert_eq!(metadata["size"], content.len() as u64);
+    assert_eq!(metadata["truncated"], true);
+    assert_eq!(metadata["line_count"], 110_000);
+    assert!(
+        first.content.len() < content.len(),
+        "page one must never be the whole file"
+    );
+    assert!(
+        first.content.len() <= READ_DEFAULT_MAX_BYTES + 1_024,
+        "page one stays within the default budget plus footer slack: {}",
+        first.content.len()
+    );
+    assert!(
+        first.content.contains("total") && first.content.contains("Use offset="),
+        "footer names the size and the continuation: {}",
+        first
+            .content
+            .rsplit_once("\n\n")
+            .map(|(_, f)| f)
+            .unwrap_or("")
+    );
+}
+
+/// #6283 AC2: paging through a file keeps every response bounded and
+/// terminates with an untruncated page whose union is the whole file.
+#[tokio::test]
+async fn contract_read_pages_stay_bounded_and_cover_the_whole_file() {
+    let _workshop_guard = crate::tools::large_output_router::active_workshop_test_guard();
+    let temporary = tempfile::tempdir().expect("tempdir");
+    let content = (0..3_000)
+        .map(|index| format!("paged-line-{index:05}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    std::fs::write(temporary.path().join("paged.txt"), &content).expect("fixture");
+    let context = ToolContext::new(temporary.path());
+
+    let mut seen: Vec<String> = Vec::new();
+    let mut offset = 1usize;
+    for page in 0..100 {
+        let result = ReadFileTool::execute_contract_read(
+            json!({"path": "paged.txt", "offset": offset, "limit": 500}),
+            &context,
+        )
+        .await
+        .expect("page read");
+        let metadata = result.metadata.clone().expect("paging metadata");
+        assert_eq!(metadata["size"], content.len() as u64);
+        assert!(
+            result.content.len() <= READ_DEFAULT_MAX_BYTES + 1_024,
+            "page {page} bounded: {}",
+            result.content.len()
+        );
+        let body = result
+            .content
+            .rsplit_once("\n\n[")
+            .map(|(body, _)| body)
+            .unwrap_or(&result.content);
+        seen.extend(body.lines().map(str::to_string));
+        let truncated = metadata["truncated"].as_bool().expect("truncated flag");
+        if !truncated {
+            break;
+        }
+        offset += 500;
+        assert!(page < 99, "paging must terminate");
+    }
+    assert_eq!(seen.len(), 3_000);
+    assert_eq!(seen.join("\n"), content);
+}
+
+/// #6283: ordinary whole reads carry the same paging metadata (with
+/// truncated=false) and keep their footer-free shape.
+#[tokio::test]
+async fn contract_read_metadata_for_ordinary_whole_read() {
+    let temporary = tempfile::tempdir().expect("tempdir");
+    let content = "alpha\nbeta\ngamma\n";
+    std::fs::write(temporary.path().join("small.txt"), content).expect("fixture");
+    let context = ToolContext::new(temporary.path());
+
+    let result = ReadFileTool::execute_contract_read(json!({"path": "small.txt"}), &context)
+        .await
+        .expect("read result");
+    assert_eq!(result.content, content);
+    let metadata = result.metadata.clone().expect("paging metadata");
+    assert_eq!(metadata["size"], content.len() as u64);
+    assert_eq!(metadata["truncated"], false);
+    assert_eq!(metadata["line_count"], 4);
+}
+
+/// #6283 AC3: grep-then-read flow — locate a marker with `grep_files`,
+/// then read exactly that line range. (`grep_files` in the child surface
+/// is pinned by `an_explicit_parent_tool_scope_is_enforced_by_the_child_registry`.)
+#[tokio::test]
+async fn grep_then_read_flow_targets_matched_lines() {
+    use crate::tools::spec::ToolSpec;
+
+    let temporary = tempfile::tempdir().expect("tempdir");
+    let mut lines: Vec<String> = (0..200)
+        .map(|index| format!("filler line {index}"))
+        .collect();
+    lines[150] = "the needle marker lives here".to_string();
+    std::fs::write(temporary.path().join("haystack.txt"), lines.join("\n")).expect("fixture");
+    let context = ToolContext::new(temporary.path());
+
+    let grep = crate::tools::search::GrepFilesTool
+        .execute(
+            json!({"pattern": "needle marker", "path": ".", "context_lines": 1}),
+            &context,
+        )
+        .await
+        .expect("grep result");
+    let payload: serde_json::Value =
+        serde_json::from_str(&grep.content).expect("grep JSON envelope");
+    assert_eq!(payload["total_matches"], 1);
+    let matched = &payload["matches"][0];
+    assert_eq!(matched["line_number"], 151);
+
+    let read = ReadFileTool::execute_contract_read(
+        json!({
+            "path": matched["file"].as_str().expect("match file"),
+            "offset": matched["line_number"].as_u64().expect("match line"),
+            "limit": 1,
+        }),
+        &context,
+    )
+    .await
+    .expect("targeted read");
+    assert!(
+        read.content.contains("the needle marker lives here"),
+        "{}",
+        read.content
     );
 }
 
@@ -263,7 +419,7 @@ async fn contract_read_offset_oob_and_limit_continuation_match_contract() {
     .expect("limited read");
     assert_eq!(
         limited.content,
-        "two\n\n[1 more lines in file. Use offset=3 to continue.]"
+        "two\n\n[1 more lines in file (13B total). Use offset=3 to continue.]"
     );
 
     let error =

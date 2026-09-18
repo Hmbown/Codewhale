@@ -334,24 +334,23 @@ Issues:
 Validation:
 ```
 
-## The Stewardship Branch
+## Which branch to target
 
-Large refactors and architecture work stage on
-`codex/v0.9.0-stewardship` before reaching `main`. The branch exists so
-that multi-layer series (like the command-group refactor) can land layer
-by layer against a stable base, get validated by their parity harnesses,
-and then flow to `main` in periodic stewardship merges — instead of each
-layer racing `main`'s daily churn.
+**`main`, for everything.** There is no separate staging branch. An earlier
+version of this guide pointed layered refactors at `codex/v0.9.0-stewardship`;
+that branch no longer exists, so please ignore any instruction you find
+elsewhere to base work on it.
 
-What this means for you:
+For a multi-PR series or anything that will collide with other in-flight work,
+maintainers may land your branch on an `integration/<topic>-<pr>-<date>` branch
+first and merge from there. That is our bookkeeping, not extra work for you —
+you still open the PR against `main`, and your commits reach `main` with their
+history and authorship intact.
 
-- **Base layered/EPIC-sized refactor PRs on `codex/v0.9.0-stewardship`**
-  and target the PR there (see #2888 for the model). Ordinary bug fixes
-  and features still target `main`.
-- Maintainers merge the stewardship branch into `main` periodically;
-  your work reaches `main` with its history and credit intact.
-- If you're unsure which base to use, ask in your tracking issue — the
-  default for anything that isn't a multi-PR series is `main`.
+**We do not expect you to rebase around our churn.** If your PR conflicts only
+because `main` moved while it was in review, say so and a maintainer resolves
+it. If your branch is in a fork we cannot push to, we land the resolved merge
+on an integration branch rather than asking you to redo the work.
 
 ## Contribution Gate
 
@@ -525,13 +524,13 @@ Issue reports should include:
 ## Security
 
 If you discover a security vulnerability, please do **not** open a public issue.
-See [SECURITY.md](SECURITY.md) for the responsible disclosure process and
+See [SECURITY.md](.github/SECURITY.md) for the responsible disclosure process and
 contact information.
 
 ## Code of Conduct
 
 Be respectful and inclusive. We welcome contributors of all backgrounds and
-experience levels. See [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) for the full
+experience levels. See [CODE_OF_CONDUCT.md](.github/CODE_OF_CONDUCT.md) for the full
 code of conduct.
 
 ## License

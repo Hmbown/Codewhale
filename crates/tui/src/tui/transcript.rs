@@ -123,6 +123,11 @@ pub struct TranscriptViewCache {
     /// in the last pass. When a new one lands the previous newest must
     /// re-render collapsed, and its revision alone would not say so.
     newest_work_receipt: Option<usize>,
+    /// Index of the newest user turn in the last pass. Only it carries the
+    /// elevated-surface background; when a new prompt lands the previous
+    /// newest must re-render on the bare ground, and its revision alone
+    /// would not say so.
+    newest_user_turn: Option<usize>,
     reasoning_action_target: Option<ReasoningActionTarget>,
     transcript_action_owner: Option<TranscriptActionOwner>,
     identity_epoch: Option<u64>,
@@ -149,6 +154,7 @@ impl TranscriptViewCache {
             options: TranscriptRenderOptions::default(),
             folded_cells: HashSet::new(),
             newest_work_receipt: None,
+            newest_user_turn: None,
             reasoning_action_target: None,
             transcript_action_owner: None,
             identity_epoch: None,
@@ -188,7 +194,7 @@ impl TranscriptViewCache {
     }
 
     /// Convenience entry point; the live path uses shards to avoid cloning.
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), expect(dead_code))]
     pub fn ensure(
         &mut self,
         cells: &[HistoryCell],
@@ -299,7 +305,19 @@ impl TranscriptViewCache {
             .next_back();
         let work_receipt_changed = self.newest_work_receipt != newest_work_receipt;
         self.newest_work_receipt = newest_work_receipt;
-        if layout_changed || folded_changed || work_receipt_changed {
+        // Same supersession shape as the work receipt: the highlight lives on
+        // the newest user turn only, so a newly sent prompt must un-highlight
+        // its predecessor even though that cell's own revision never moved.
+        let newest_user_turn = cells
+            .iter()
+            .copied()
+            .enumerate()
+            .filter(|(_, cell)| matches!(cell, HistoryCell::User { .. }))
+            .map(|(idx, _)| idx)
+            .next_back();
+        let user_turn_changed = self.newest_user_turn != newest_user_turn;
+        self.newest_user_turn = newest_user_turn;
+        if layout_changed || folded_changed || work_receipt_changed || user_turn_changed {
             self.per_cell.clear();
         }
         self.width = width;
@@ -312,8 +330,11 @@ impl TranscriptViewCache {
         // destructive identity epoch also prevents revision reuse after an
         // index is removed and later filled by a different cell.
         let old_len = self.per_cell.len();
-        let mut any_dirty =
-            layout_changed || folded_changed || work_receipt_changed || old_len != total_cells;
+        let mut any_dirty = layout_changed
+            || folded_changed
+            || work_receipt_changed
+            || user_turn_changed
+            || old_len != total_cells;
         let mut first_dirty: Option<usize> = if old_len != total_cells {
             Some(old_len.min(total_cells))
         } else {
@@ -455,6 +476,8 @@ impl TranscriptViewCache {
                 HistoryCell::Tool(tool) if tool.is_durable_work_receipt()
             ) && newest_work_receipt
                 .is_some_and(|newest| newest != idx);
+            cell_options.newest_user_turn = matches!(cell, HistoryCell::User { .. })
+                && newest_user_turn.is_some_and(|newest| newest == idx);
             new_per_cell.push(render_cached_cell(
                 cell,
                 current_rev,

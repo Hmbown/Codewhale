@@ -20,7 +20,14 @@ use std::path::Path;
 /// rather than always present in the active surface. Because the rewrite
 /// changes an already-installed body, generation 10's exact body is retained in
 /// `SUPERSEDED_BODIES` so unmodified copies upgrade and edited copies do not.
-const BUNDLED_SKILL_VERSION: &str = "11";
+/// Generation 12 adds the everyday pack (comms, money, audio, health,
+/// shopping/travel, media, github, goals, forget, feedback) and demotes
+/// `contributor-onboarding` to a repo-local project skill: existing installed
+/// copies are left in place, new installs do not receive it.
+/// Generation 13 trims the pack: `social-media` and `health` ship to nobody
+/// (phone-export workflows, not everyday), and `feedback` joins
+/// `contributor-onboarding` as a repo-local project skill.
+const BUNDLED_SKILL_VERSION: &str = "13";
 
 // ── system & extension (meta) ───────────────────────────────────────────────
 const SKILL_CREATOR_BODY: &str = include_str!("../../assets/skills/skill-creator/SKILL.md");
@@ -55,6 +62,22 @@ const XLSX_BODY: &str = include_str!("../../assets/skills/xlsx/SKILL.md");
 const DOCUMENTS_ALIAS_BODY: &str = include_str!("../../assets/skills/documents/SKILL.md");
 const PRESENTATIONS_ALIAS_BODY: &str = include_str!("../../assets/skills/presentations/SKILL.md");
 const SPREADSHEETS_ALIAS_BODY: &str = include_str!("../../assets/skills/spreadsheets/SKILL.md");
+
+// ── everyday ────────────────────────────────────────────────────────────────
+const GITHUB_BODY: &str = include_str!("../../assets/skills/github/SKILL.md");
+const GMAIL_BODY: &str = include_str!("../../assets/skills/gmail/SKILL.md");
+const GOOGLE_CALENDAR_BODY: &str = include_str!("../../assets/skills/google-calendar/SKILL.md");
+const MONEY_BODY: &str = include_str!("../../assets/skills/money/SKILL.md");
+const SPOTIFY_BODY: &str = include_str!("../../assets/skills/spotify/SKILL.md");
+const TTS_BODY: &str = include_str!("../../assets/skills/tts/SKILL.md");
+const PODCAST_BODY: &str = include_str!("../../assets/skills/podcast/SKILL.md");
+const SHOPPING_BODY: &str = include_str!("../../assets/skills/shopping/SKILL.md");
+const FLIGHTS_BODY: &str = include_str!("../../assets/skills/flights/SKILL.md");
+const PHOTOS_BODY: &str = include_str!("../../assets/skills/photos/SKILL.md");
+const IMAGE_SEARCH_BODY: &str = include_str!("../../assets/skills/image-search/SKILL.md");
+const GOALS_BODY: &str = include_str!("../../assets/skills/goals/SKILL.md");
+const FORGET_BODY: &str = include_str!("../../assets/skills/forget/SKILL.md");
+const FEEDBACK_BODY: &str = include_str!("../../assets/skills/feedback/SKILL.md");
 
 // ── power / explicit-only ───────────────────────────────────────────────────
 const BATCH_BODY: &str = include_str!("../../assets/skills/batch/SKILL.md");
@@ -273,14 +296,75 @@ const BUNDLED_SKILLS: &[BundledSkill] = &[
         introduced_in: 5,
     },
     BundledSkill {
-        name: "contributor-onboarding",
-        body: CONTRIBUTOR_ONBOARDING_BODY,
-        introduced_in: 8,
-    },
-    BundledSkill {
         name: "mcp-discovery",
         body: MCP_DISCOVERY_BODY,
         introduced_in: 10,
+    },
+    // Everyday (generation 12)
+    BundledSkill {
+        name: "github",
+        body: GITHUB_BODY,
+        introduced_in: 12,
+    },
+    BundledSkill {
+        name: "gmail",
+        body: GMAIL_BODY,
+        introduced_in: 12,
+    },
+    BundledSkill {
+        name: "google-calendar",
+        body: GOOGLE_CALENDAR_BODY,
+        introduced_in: 12,
+    },
+    BundledSkill {
+        name: "money",
+        body: MONEY_BODY,
+        introduced_in: 12,
+    },
+    BundledSkill {
+        name: "spotify",
+        body: SPOTIFY_BODY,
+        introduced_in: 12,
+    },
+    BundledSkill {
+        name: "tts",
+        body: TTS_BODY,
+        introduced_in: 12,
+    },
+    BundledSkill {
+        name: "podcast",
+        body: PODCAST_BODY,
+        introduced_in: 12,
+    },
+    BundledSkill {
+        name: "shopping",
+        body: SHOPPING_BODY,
+        introduced_in: 12,
+    },
+    BundledSkill {
+        name: "flights",
+        body: FLIGHTS_BODY,
+        introduced_in: 12,
+    },
+    BundledSkill {
+        name: "photos",
+        body: PHOTOS_BODY,
+        introduced_in: 12,
+    },
+    BundledSkill {
+        name: "image-search",
+        body: IMAGE_SEARCH_BODY,
+        introduced_in: 12,
+    },
+    BundledSkill {
+        name: "goals",
+        body: GOALS_BODY,
+        introduced_in: 12,
+    },
+    BundledSkill {
+        name: "forget",
+        body: FORGET_BODY,
+        introduced_in: 12,
     },
 ];
 
@@ -348,6 +432,20 @@ fn v4_best_practices_body() -> &'static str {
 
 fn feishu_body() -> &'static str {
     FEISHU_BODY
+}
+
+/// Last shipped `contributor-onboarding` body (removed from the bundle in
+/// generation 12; now a repo-local project skill). Retained so tests can pin
+/// its load-bearing refusals and so an installed copy stays recognizable.
+fn contributor_onboarding_body() -> &'static str {
+    CONTRIBUTOR_ONBOARDING_BODY
+}
+
+/// Last shipped `feedback` body (removed from the bundle in generation 13;
+/// now a repo-local project skill). Retained so an installed copy stays
+/// recognizable and is left in place, never deleted by name.
+fn feedback_body() -> &'static str {
+    FEEDBACK_BODY
 }
 
 /// Whether a skill name matches one of the bundled first-party skills.
@@ -462,6 +560,14 @@ pub fn install_system_skills(skills_dir: &Path) -> std::io::Result<()> {
     // Feishu is optional: do not install for every user. If an older bundle
     // installed an exact shipped copy, leave it; never delete by name alone.
     let _ = feishu_body();
+
+    // Contributor-onboarding is repo-local since generation 12: do not install
+    // for new users. An older bundle's installed copy is left in place, same as
+    // Feishu above — never delete by name alone.
+    let _ = contributor_onboarding_body();
+
+    // Feedback is repo-local since generation 13: same leave-in-place rule.
+    let _ = feedback_body();
 
     if changed || repair_marker {
         fs::create_dir_all(skills_dir)?;

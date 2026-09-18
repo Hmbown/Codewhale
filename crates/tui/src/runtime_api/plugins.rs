@@ -64,6 +64,10 @@ pub(super) struct PluginSummaryEntry {
     pub(super) id: String,
     pub(super) name: String,
     pub(super) display_name: Option<String>,
+    pub(super) icon: Option<String>,
+    pub(super) author: Option<String>,
+    pub(super) homepage: Option<String>,
+    pub(super) platforms: Vec<String>,
     pub(super) version: String,
     pub(super) description: Option<String>,
     pub(super) scope: &'static str,
@@ -133,8 +137,6 @@ pub(super) struct PluginReviewPayload {
 pub(super) struct PluginDetailResponse {
     #[serde(flatten)]
     pub(super) summary: PluginSummaryEntry,
-    pub(super) author: Option<String>,
-    pub(super) homepage: Option<String>,
     pub(super) repository: Option<String>,
     pub(super) license: Option<String>,
     pub(super) keywords: Vec<String>,
@@ -242,6 +244,15 @@ fn plugin_summary(plugin: &LoadedPlugin) -> PluginSummaryEntry {
         id: plugin.id.as_str().to_string(),
         name: plugin.name().to_string(),
         display_name: plugin.manifest.plugin.display_name.clone(),
+        icon: plugin.manifest.plugin.icon.clone(),
+        author: plugin.manifest.plugin.author.clone(),
+        homepage: plugin.manifest.plugin.homepage.clone(),
+        platforms: plugin
+            .manifest
+            .when
+            .as_ref()
+            .and_then(|when| when.os.clone())
+            .unwrap_or_default(),
         version: plugin.manifest.plugin.version.clone(),
         description: plugin.manifest.plugin.description.clone(),
         scope: plugin.scope.as_str(),
@@ -347,8 +358,6 @@ fn review_payload(plugin: &LoadedPlugin) -> PluginReviewPayload {
 fn plugin_detail(plugin: &LoadedPlugin) -> PluginDetailResponse {
     PluginDetailResponse {
         summary: plugin_summary(plugin),
-        author: plugin.manifest.plugin.author.clone(),
-        homepage: plugin.manifest.plugin.homepage.clone(),
         repository: plugin.manifest.plugin.repository.clone(),
         license: plugin.manifest.plugin.license.clone(),
         keywords: plugin.manifest.plugin.keywords.clone(),
@@ -562,6 +571,8 @@ pub(super) struct MarketplaceInstallPlanEntry {
 pub(super) struct MarketplaceCandidateEntry {
     pub(super) name: String,
     pub(super) display_name: Option<String>,
+    pub(super) icon: Option<String>,
+    pub(super) platforms: Vec<String>,
     pub(super) description: Option<String>,
     pub(super) version: Option<String>,
     pub(super) author: Option<String>,
@@ -645,6 +656,12 @@ fn marketplace_candidate_entry(
     MarketplaceCandidateEntry {
         name: candidate.name.clone(),
         display_name: candidate.display_name.clone(),
+        icon: candidate.icon.clone(),
+        platforms: candidate
+            .when
+            .as_ref()
+            .and_then(|when| when.os.clone())
+            .unwrap_or_default(),
         description: candidate.description.clone(),
         version: candidate.version.clone(),
         author: candidate.author.clone(),

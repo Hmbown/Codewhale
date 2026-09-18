@@ -6,6 +6,7 @@
 //! checkpoints, and loop termination.
 
 use super::dispatch::{
+    FLEET_FINAL_REPORT_NOTICE, FLEET_NO_PROGRESS_STOP, FLEET_STRATEGY_SWITCH_NOTICE,
     FleetDenialAction, FleetDenialBatch, FleetDenialGuard, normalize_schema_json_containers,
 };
 use super::*;
@@ -44,7 +45,11 @@ struct StreamOutcome {
     pending_message_complete: bool,
     last_text_index: Option<usize>,
     stream_errors: u32,
-    pending_steers: Vec<String>,
+    /// Unsettled steers queued mid-stream. Each is committed into the turn's
+    /// record at a step boundary, or dropped — and dropping one reports
+    /// `SteerOutcome::Dropped` to its sender, so an interrupted or failed
+    /// turn cannot silently swallow user guidance (#6276).
+    pending_steers: Vec<handle::PendingSteer>,
     /// Typed, engine-internal drop-recovery state. `Option` + consume-once
     /// means one drop schedules exactly one resume; see [`StreamResume`].
     pending_resume: Option<StreamResume>,
@@ -391,7 +396,8 @@ impl Engine {
         };
         let (mut universe, mut refreshed) = {
             let pool = pool.lock().await;
-            (pool.model_tool_names(), pool.to_api_tools())
+            let refreshed = pool.to_api_tools();
+            (pool.model_tool_names(&refreshed), refreshed)
         };
         // A config/authority change during handshake can remove a server;
         // its previous names must also leave this turn's catalog.
@@ -496,8 +502,11 @@ impl Engine {
         for result in synthesized {
             let report_ref =
                 crate::tools::subagent::spill_subagent_final_report(&self.session.id, &result);
-            let completion =
-                crate::tools::subagent::subagent_completion_from_result_with_ref_for_session(
+            let completion = self
+                .subagent_manager
+                .read()
+                .await
+                .completion_from_result_with_ref_for_session(
                     &self.session.id,
                     &result,
                     report_ref.as_deref(),
@@ -662,33 +671,6 @@ impl Engine {
         result.map(|_| ())
     }
 
-    async fn request_turn_owned_child_coordination(
-        &mut self,
-        foreground_children: Option<&Arc<ForegroundChildRegistry>>,
-        turn_has_error: bool,
-        guard_already_sent: bool,
-    ) -> Option<usize> {
-        let agent_ids =
-            foreground_children.map_or_else(Vec::new, |registry| registry.active_agent_ids());
-        let running = agent_ids.len();
-        if !should_guard_turn_end_for_owned_children(turn_has_error, running, guard_already_sent) {
-            return None;
-        }
-
-        self.add_session_message(self.runtime_text_message_with_turn_metadata(
-            turn_owned_child_guard_runtime_text(&agent_ids),
-            UserInputProvenance::Runtime,
-        ))
-        .await;
-        let _ = self
-            .tx_event
-            .send(Event::status(format!(
-                "Continuing once — {running} turn-owned sub-agent(s) still running; wait or let them park resumably"
-            )))
-            .await;
-        Some(running)
-    }
-
     pub(super) async fn run_turn(
         &mut self,
         turn: &mut TurnContext,
@@ -783,15 +765,6 @@ impl Engine {
         // would put a message the user never sent into the transcript, the
         // exports, and every later turn's context.
         let mut reasoning_only_nudge: Option<Message> = None;
-        // A normally ending turn gets one explicit chance to join its owned
-        // children. If the model ends again while they are still live, the
-        // outer terminal barrier parks them as resumable Interrupted work.
-        let mut turn_end_child_guard_sent = false;
-        // A settlement prompt appended at the model-step ceiling must reach
-        // the provider, and a wait/tool/completion handoff needs one bounded
-        // follow-up response. Count accepted provider responses, not transport
-        // retries, so this grace cannot become an unbounded model loop.
-        let mut turn_end_child_coordination_responses_remaining = 0u8;
         // Outer stream-retry budget: when the chunked-transfer connection
         // dies mid-stream and either nothing useful was streamed (#103
         // Phase 3), the host slept mid-turn (#2990), or a host hit a
@@ -838,11 +811,12 @@ impl Engine {
             }
 
             let mut accepted_steer = false;
-            while let Some(steer) = self.next_turn_steer() {
-                let steer = steer.trim().to_string();
-                if steer.is_empty() {
+            while let Some(pending) = self.next_turn_steer() {
+                if pending.content.trim().is_empty() {
+                    // Nothing to deliver; dropping `pending` settles it.
                     continue;
                 }
+                let steer = pending.commit().trim().to_string();
                 accepted_steer = true;
                 self.session
                     .working_set
@@ -857,16 +831,10 @@ impl Engine {
                     )))
                     .await;
             }
-            if accepted_steer {
-                if let Some(guard) = fleet_denial_guard.as_mut() {
-                    guard.reset();
-                    turn.stop_diagnostics
-                        .permission_denial_rounds_without_progress = 0;
-                }
-                grant_turn_end_steer_response_allowance(
-                    turn_end_child_guard_sent,
-                    &mut turn_end_child_coordination_responses_remaining,
-                );
+            if accepted_steer && let Some(guard) = fleet_denial_guard.as_mut() {
+                guard.reset();
+                turn.stop_diagnostics
+                    .permission_denial_rounds_without_progress = 0;
             }
 
             // Child agents can finish while the parent model is still taking
@@ -875,15 +843,6 @@ impl Engine {
             // discovering them only when it eventually emits no more tools or
             // the idle handler starts a separate follow-up turn.
             self.drain_subagent_completion_events("queued").await;
-
-            // The settlement grace counts accepted provider responses, not
-            // model steps. Enforce it independently of the ordinary step
-            // ceiling: a model that keeps issuing tools after the targeted
-            // wait/finalization handoff must not turn the one-shot parent
-            // warning into another unbounded work loop.
-            if turn_end_child_guard_sent && turn_end_child_coordination_responses_remaining == 0 {
-                break;
-            }
 
             // The pinned system + tools prefix is frozen for the session:
             // recomposing it here from disk on every tool step is exactly what
@@ -921,27 +880,9 @@ impl Engine {
                     .await;
             }
 
-            if turn.at_max_steps() && turn_end_child_coordination_responses_remaining == 0 {
+            if turn.at_max_steps() {
                 turn.stop_diagnostics.reason = Some(TurnStopReason::StepBudgetExhausted);
-                if self
-                    .request_turn_owned_child_coordination(
-                        foreground_children.as_ref(),
-                        turn_error.is_some(),
-                        turn_end_child_guard_sent,
-                    )
-                    .await
-                    .is_some()
-                {
-                    turn_end_child_guard_sent = true;
-                    turn_end_child_coordination_responses_remaining = 2;
-                    // The model already supplied a final answer before this
-                    // bounded coordination pass. A tool result from the pass
-                    // may therefore close cleanly at the next ceiling check.
-                    step_budget_exhaustion_is_terminal = false;
-                    // A prior continuation/tool result already advanced to
-                    // this provider slot. Fall through and dispatch it without
-                    // incrementing the model-step counter a second time.
-                } else if step_budget_exhaustion_is_terminal && !final_report_sent {
+                if step_budget_exhaustion_is_terminal && !final_report_sent {
                     // A2 report-on-exhaustion: the budget died while the model
                     // still owes work. Never finish silently — grant exactly
                     // one final provider turn to write a bounded report, then
@@ -1306,7 +1247,6 @@ impl Engine {
             // Resolve `auto` reasoning_effort to a concrete tier (#663).
             let effective_reasoning_effort = resolve_auto_effort(
                 self.session.reasoning_effort.as_deref(),
-                &self.session.messages,
                 self.api_provider,
                 &self.api_config.deepseek_base_url(),
                 &self.config.model,
@@ -1940,10 +1880,6 @@ impl Engine {
                 // state from a previous bad round.
                 stream_retry_budget.reset();
             }
-            if turn_end_child_coordination_responses_remaining > 0 {
-                turn_end_child_coordination_responses_remaining =
-                    turn_end_child_coordination_responses_remaining.saturating_sub(1);
-            }
 
             // Persist only reasoning the provider actually emitted. Some chat
             // wires require a non-empty `reasoning_content` field when an
@@ -2136,9 +2072,9 @@ impl Engine {
             // finish the turn. Honest ladder (NOTE-turn-loop-wrongness §3):
             // 1) pending steers → resume, 2) queued subagent completions →
             // resume, 3) REPL fences → run (empty cap may end), 4) goal
-            // continuation if under cap → resume, 5) one settlement prompt
-            // for turn-owned children → resume, 6) else end. No status
-            // claims "ending" before step 6.
+            // continuation if under cap → resume, 5) else end. Healthy
+            // children continue in the background; their existence alone
+            // does not authorize another parent model request.
             if tool_uses.is_empty() && !fleet_no_progress_report {
                 if !pending_steers.is_empty() {
                     if let Some(guard) = fleet_denial_guard.as_mut() {
@@ -2146,7 +2082,8 @@ impl Engine {
                         turn.stop_diagnostics
                             .permission_denial_rounds_without_progress = 0;
                     }
-                    for steer in pending_steers.drain(..) {
+                    for pending in pending_steers.drain(..) {
+                        let steer = pending.commit().trim().to_string();
                         self.session
                             .working_set
                             .observe_user_message(&steer, &self.session.workspace);
@@ -2157,10 +2094,6 @@ impl Engine {
                         .tx_event
                         .send(Event::status("Continuing — queued steer input".to_string()))
                         .await;
-                    grant_turn_end_steer_response_allowance(
-                        turn_end_child_guard_sent,
-                        &mut turn_end_child_coordination_responses_remaining,
-                    );
                     turn.next_step();
                     continue;
                 }
@@ -2176,9 +2109,8 @@ impl Engine {
 
                 // Sub-agent completion handoff (issue #756). Resuming when
                 // queued completions exist is correct; #3216 says do not wait
-                // indefinitely for every running child here. Turn-owned work
-                // gets one bounded settlement prompt later in this ladder;
-                // detached work can still report by sentinel on a later turn.
+                // indefinitely for every running child here. Healthy work
+                // keeps running and reports by sentinel on a later turn.
                 let subagent_completions = self.drain_subagent_completion_events("").await;
                 if subagent_completions > 0 {
                     let _ = self
@@ -2442,21 +2374,6 @@ impl Engine {
                             }
                         }
                         self.emit_session_updated().await;
-                        if self
-                            .request_turn_owned_child_coordination(
-                                foreground_children.as_ref(),
-                                turn_error.is_some(),
-                                turn_end_child_guard_sent,
-                            )
-                            .await
-                            .is_some()
-                        {
-                            turn_end_child_guard_sent = true;
-                            turn_end_child_coordination_responses_remaining = 2;
-                            step_budget_exhaustion_is_terminal = false;
-                            turn.next_step();
-                            continue;
-                        }
                         break;
                     }
 
@@ -2465,21 +2382,6 @@ impl Engine {
                         // inside the round loop. End the turn now instead of
                         // letting the outer ladder synthesize another provider
                         // request.
-                        if self
-                            .request_turn_owned_child_coordination(
-                                foreground_children.as_ref(),
-                                turn_error.is_some(),
-                                turn_end_child_guard_sent,
-                            )
-                            .await
-                            .is_some()
-                        {
-                            turn_end_child_guard_sent = true;
-                            turn_end_child_coordination_responses_remaining = 2;
-                            step_budget_exhaustion_is_terminal = false;
-                            turn.next_step();
-                            continue;
-                        }
                         break;
                     }
 
@@ -2497,8 +2399,8 @@ impl Engine {
                 // Issue #1727: the turn is now genuinely finishing with no
                 // sendable content. Control only reaches here when there were
                 // no pending steers (`continue`d above) and no sub-agent
-                // completions to resume with. The bounded turn-owned-child
-                // settlement guard runs below after other continuation paths.
+                // completions to resume with. Healthy running children do
+                // not force another model request.
                 // If the assistant produced ONLY a reasoning block, the prior
                 // code fell straight through to this `break`, emitting nothing
                 // and leaving the UI spinner hung. Surface a status now —
@@ -2563,22 +2465,6 @@ impl Engine {
                             "Continuing — goal still active (pass {goal_continuations_this_turn})"
                         )))
                         .await;
-                    turn.next_step();
-                    continue;
-                }
-
-                if self
-                    .request_turn_owned_child_coordination(
-                        foreground_children.as_ref(),
-                        turn_error.is_some(),
-                        turn_end_child_guard_sent,
-                    )
-                    .await
-                    .is_some()
-                {
-                    turn_end_child_guard_sent = true;
-                    turn_end_child_coordination_responses_remaining = 2;
-                    step_budget_exhaustion_is_terminal = false;
                     turn.next_step();
                     continue;
                 }
@@ -2801,17 +2687,14 @@ impl Engine {
 
             let accepted_steer_after_tools = !pending_steers.is_empty();
             if !pending_steers.is_empty() {
-                for steer in pending_steers.drain(..) {
+                for pending in pending_steers.drain(..) {
+                    let steer = pending.commit().trim().to_string();
                     self.session
                         .working_set
                         .observe_user_message(&steer, &self.session.workspace);
                     self.add_session_message(self.user_text_message_with_turn_metadata(steer))
                         .await;
                 }
-                grant_turn_end_steer_response_allowance(
-                    turn_end_child_guard_sent,
-                    &mut turn_end_child_coordination_responses_remaining,
-                );
             }
 
             if authority_changed || accepted_steer_after_tools {
@@ -2837,7 +2720,7 @@ impl Engine {
                     )
                 } else {
                     turn.stop_diagnostics.reason = Some(TurnStopReason::NoProgress);
-                    "Fleet worker stopped after repeated permission denials without new evidence. Work and tool results are retained in the transcript; review the blocker before resuming.".to_string()
+                    FLEET_NO_PROGRESS_STOP.to_string()
                 };
                 let _ = self.tx_event.send(Event::status(error.clone())).await;
                 return (TurnOutcomeStatus::Failed, Some(error));
@@ -2849,15 +2732,11 @@ impl Engine {
                             .stop_diagnostics
                             .permission_strategy_switches
                             .saturating_add(1);
-                        Some(
-                            "Fleet strategy switch required: repeated permission denials produced no new evidence. The rejected action is held. Use another permitted tool from the current catalog to make progress, or report completed work and the blocker. Do not work around permissions or request the same approval again.",
-                        )
+                        Some(FLEET_STRATEGY_SWITCH_NOTICE)
                     }
                     FleetDenialAction::FinalReport => {
                         turn.stop_diagnostics.final_report_requested = true;
-                        Some(
-                            "Fleet no-progress final report: permission denials continued after the strategy switch without new evidence. Your next response is report-only; no tools will execute. Report what you completed, exact evidence, the permission blocker and remaining work. This is the last response unless the user changes direction or authority.",
-                        )
+                        Some(FLEET_FINAL_REPORT_NOTICE)
                     }
                 };
                 if let Some(notice) = notice {
@@ -2920,11 +2799,11 @@ impl Engine {
             let _ = self
                 .tx_event
                 .send(Event::status(format!(
-                    "Turn ending with {running} turn-owned sub-agent(s) still running; parking them as resumable work."
+                    "Turn ending with {running} turn-owned sub-agent(s) still running; keeping them running in the background."
                 )))
                 .await;
             self.add_session_message(self.runtime_text_message_with_turn_metadata(
-                turn_owned_child_parking_runtime_text(running),
+                turn_owned_child_background_runtime_text(running),
                 UserInputProvenance::Runtime,
             ))
             .await;
@@ -3103,6 +2982,7 @@ impl Engine {
                 && !McpPool::is_mcp_tool(&tool_name)
                 && tool_name != CODE_EXECUTION_TOOL_NAME
                 && tool_name != JS_EXECUTION_TOOL_NAME
+                && tool_name != EXECUTE_TOOLS_TOOL_NAME
                 && !is_tool_search_tool(&tool_name)
             {
                 blocked_error = Some(ToolError::not_available(missing_tool_error_message(
@@ -4591,7 +4471,8 @@ impl Engine {
                     if mcp_catalog_changed && let Some(pool) = self.mcp_pool.as_ref().cloned() {
                         let (universe, refreshed) = {
                             let pool = pool.lock().await;
-                            (pool.model_tool_names(), pool.to_api_tools())
+                            let refreshed = pool.to_api_tools();
+                            (pool.model_tool_names(&refreshed), refreshed)
                         };
                         let surface_budget = self
                             .turn_tool_surface_budget
@@ -4800,7 +4681,7 @@ impl Engine {
         // content-block delta delivered to the consumer).
         let mut any_content_received = false;
         let mut transparent_stream_retries = 0u32;
-        let mut pending_steers: Vec<String> = Vec::new();
+        let mut pending_steers: Vec<handle::PendingSteer> = Vec::new();
         // `stream_start` is reset on a transparent retry so the wall-clock
         // budget restarts with the fresh stream.
         let mut stream_start = Instant::now();
@@ -4857,18 +4738,16 @@ impl Engine {
             let Some(event_result) = poll_outcome else {
                 break;
             };
-            while let Some(steer) = self.next_turn_steer() {
-                let steer = steer.trim().to_string();
-                if steer.is_empty() {
+            while let Some(pending) = self.next_turn_steer() {
+                if pending.content.trim().is_empty() {
+                    // Nothing to deliver; dropping `pending` settles it.
                     continue;
                 }
-                pending_steers.push(steer.clone());
+                let preview = summarize_text(pending.content.trim(), 120);
+                pending_steers.push(pending);
                 let _ = self
                     .tx_event
-                    .send(Event::status(format!(
-                        "Steer input queued: {}",
-                        summarize_text(&steer, 120)
-                    )))
+                    .send(Event::status(format!("Steer input queued: {preview}")))
                     .await;
             }
 
@@ -5246,20 +5125,13 @@ impl Engine {
                                     tool_state.name, partial_json, tool_state.input_buffer
                                 ));
                             }
-                            // Mid-stream mirror of a partial buffer. The
-                            // argument text is *expected* to be incomplete
-                            // here, so `structure_synthesized` is ignored on
-                            // purpose; ContentBlockStop below is where an
-                            // unfinished argument becomes an error.
-                            if let Some(parsed) = parse_tool_input(&tool_state.input_buffer) {
-                                tool_state.input = parsed.value.clone();
-                                if crate::logging::is_verbose() {
-                                    crate::logging::info(format!(
-                                        "Tool '{}' input parsed: {:?}",
-                                        tool_state.name, parsed.value
-                                    ));
-                                }
-                            }
+                            // The buffer is the only mid-stream state: nothing
+                            // reads `tool_state.input` before finalization, so
+                            // there is no mirror parse here. Running the
+                            // `arg_repair` ladder per delta re-scanned the whole
+                            // accumulated buffer O(n²) times per tool call to
+                            // produce a value that `finalize_streamed_tool_input`
+                            // unconditionally overwrote (#6213 T4).
                         }
                     }
                 },
@@ -5302,8 +5174,8 @@ impl Engine {
                         && let Some(tool_state) = tool_uses.get_mut(tool_idx)
                     {
                         crate::logging::info(format!(
-                            "Tool '{}' block stop. Buffer: '{}', Current input: {:?}",
-                            tool_state.name, tool_state.input_buffer, tool_state.input
+                            "Tool '{}' block stop. Buffer: '{}'",
+                            tool_state.name, tool_state.input_buffer
                         ));
                         self.finalize_streamed_tool_input(tool_state).await;
 
@@ -5360,14 +5232,12 @@ impl Engine {
             }
         }
         // A stream cut at the provider's output limit ends without the
-        // closing ContentBlockStop for whatever block was in flight. Those
-        // blocks' inputs still hold the mid-stream mirror's best-effort
-        // parse, which ignores `structure_synthesized` by design — left
-        // as-is, a truncated tool call reaches dispatch through
-        // `tool.input` and executes (#5986). Every block that never
-        // stopped goes through the same finalization gate a normal
-        // ContentBlockStop applies, and is announced with the same
-        // finalized input.
+        // closing ContentBlockStop for whatever block was in flight. Before
+        // this drain existed a truncated tool call reached dispatch through
+        // `tool.input` and executed (#5986). Every block that never stopped
+        // goes through the same finalization gate a normal ContentBlockStop
+        // applies, and is announced with the same finalized input — which is
+        // also why no mid-stream parse is needed (#6213 T4).
         for tool_idx in std::mem::take(&mut current_tool_indices).into_values() {
             let Some(tool_state) = tool_uses.get_mut(tool_idx) else {
                 continue;
@@ -5412,9 +5282,9 @@ impl Engine {
     /// execute a truncated tool call (#5986). Called for a tool block that
     /// closes normally (`ContentBlockStop`) and again after the stream ends
     /// for blocks whose Stop never arrived — a provider cutting the stream
-    /// at its output limit omits the closing event, while the mid-stream
-    /// mirror deliberately ignores `structure_synthesized` because partial
-    /// text is the normal state mid-stream.
+    /// at its output limit omits the closing event. This is the only place
+    /// the accumulated buffer is parsed, and the only place
+    /// `structure_synthesized` is rejected.
     async fn finalize_streamed_tool_input(&self, tool_state: &mut ToolUseState) {
         if tool_state.input_buffer.trim().is_empty() {
             crate::logging::warn(format!(
@@ -5490,6 +5360,7 @@ impl Engine {
             crate::goal_loop::GoalBudget {
                 token_budget: snapshot.token_budget.map(u64::from),
                 time_budget_seconds: None,
+                enforce_token_budget: self.config.goal_enforce_token_budget,
                 max_continuations: self.config.goal_max_continuations,
             },
         );
@@ -5696,42 +5567,13 @@ fn truncate_runtime_status_field(text: &str, max_chars: usize) -> String {
     out
 }
 
-fn should_guard_turn_end_for_owned_children(
-    turn_has_error: bool,
-    running_children: usize,
-    guard_already_sent: bool,
-) -> bool {
-    !turn_has_error && running_children > 0 && !guard_already_sent
-}
-
-fn grant_turn_end_steer_response_allowance(guard_sent: bool, remaining: &mut u8) {
-    if guard_sent {
-        // User input is not coordination grace. Preserve the same bounded
-        // response + tool/finalization shape so a steer can call one tool and
-        // still receive an answer without reopening an unbounded loop.
-        *remaining = (*remaining).max(2);
-    }
-}
-
 fn turn_detached_child_count(session_running: usize, turn_owned_running: usize) -> usize {
     session_running.saturating_sub(turn_owned_running)
 }
 
-fn turn_owned_child_guard_runtime_text(agent_ids: &[String]) -> String {
-    let targeted_waits = agent_ids
-        .iter()
-        .map(|agent_id| format!("agent(action=\"wait\", agent_id=\"{agent_id}\", until=\"all\")"))
-        .collect::<Vec<_>>()
-        .join(", ");
+fn turn_owned_child_background_runtime_text(running: usize) -> String {
     format!(
-        "<codewhale:runtime_event kind=\"turn_owned_children_active\" visibility=\"internal\">\nThis is an internal runtime event, not user input. {} turn-owned sub-agent(s) are still running. Before ending, wait for these exact owned agents: {targeted_waits}. Do not use an unscoped wait-all call, because deliberately detached work must not hold this turn open. Use detached=true only when starting future work that must outlive its parent turn. If you end again while these children remain active, the runtime will park them as Interrupted work and provide an agent(action=\"start\", resume_from=\"<agent_id>\") recovery path.\n</codewhale:runtime_event>",
-        agent_ids.len()
-    )
-}
-
-fn turn_owned_child_parking_runtime_text(running: usize) -> String {
-    format!(
-        "<codewhale:runtime_event kind=\"turn_owned_children_parking\" visibility=\"internal\">\nThis is an internal runtime event, not user input. The parent ended after one settlement reminder while {running} turn-owned sub-agent(s) remained active. The runtime is parking them as Interrupted with continuable checkpoints instead of discarding their work. Their completion handoffs name the source agent_id to use with agent(action=\"start\", resume_from=\"<agent_id>\").\n</codewhale:runtime_event>"
+        "<codewhale:runtime_event kind=\"turn_owned_children_background\" visibility=\"internal\">\nThis is an internal runtime event, not user input. The parent answered while {running} owned sub-agent(s) remain active. They keep running with their existing identities and report through <codewhale:subagent.done> sentinels. No continuation is needed for healthy running work.\n</codewhale:runtime_event>"
     )
 }
 
@@ -5789,6 +5631,7 @@ fn mode_blocks_command_execution(mode: AppMode, tool_name: &str) -> bool {
                 | "exec_interact"
                 | CODE_EXECUTION_TOOL_NAME
                 | JS_EXECUTION_TOOL_NAME
+                | EXECUTE_TOOLS_TOOL_NAME
         )
 }
 
@@ -5920,6 +5763,7 @@ mod pre_tool_snapshot_gate_tests {
             "exec_shell_interact",
             CODE_EXECUTION_TOOL_NAME,
             JS_EXECUTION_TOOL_NAME,
+            EXECUTE_TOOLS_TOOL_NAME,
         ] {
             assert!(mode_blocks_command_execution(AppMode::Plan, tool));
             assert!(
@@ -6425,65 +6269,33 @@ pub(super) const REASONING_EFFORT_AUTO: &str = "auto";
 
 /// Resolve an `"auto"` reasoning-effort tier to a concrete value.
 ///
-/// When the configured effort is `"auto"`, inspects the last user message
-/// and calls [`crate::auto_reasoning::select`] to pick the actual tier.
-/// Non-`"auto"` values pass through unchanged.
+/// When the configured effort is `"auto"`, calls
+/// [`crate::auto_reasoning::select`] for the declared policy tier. The message
+/// is no longer inspected: the keyword classifier was deleted with the #6290
+/// rework, and `auto` now means the declared default rather than a guess from
+/// the user's wording. Non-`"auto"` values pass through unchanged.
 pub(super) fn resolve_auto_effort(
     reasoning_effort: Option<&str>,
-    messages: &[Message],
     provider: crate::config::ApiProvider,
     base_url: &str,
     wire_model: &str,
 ) -> Option<String> {
     match reasoning_effort {
         Some(effort) if effort == REASONING_EFFORT_AUTO => {
-            // Find the last user message in the conversation.
-            let last_msg = messages
-                .iter()
-                .rev()
-                .find(|m| m.role == "user")
-                .map(|m| {
-                    m.content
-                        .iter()
-                        .filter_map(|block| {
-                            if let ContentBlock::Text { text, .. } = block {
-                                if is_turn_metadata_text(text) {
-                                    None
-                                } else {
-                                    Some(text.as_str())
-                                }
-                            } else {
-                                None
-                            }
-                        })
-                        .collect::<Vec<&str>>()
-                        .join(" ")
-                })
-                .unwrap_or_default();
-
-            // is_subagent is false here — run_turn runs in the
-            // main engine (not a sub-agent's inner loop). Sub-agents have
-            // their own turn pass and can pass is_subagent=true when they
-            // call this function directly.
-            let tier = crate::auto_reasoning::select(false, &last_msg);
+            let tier = crate::auto_reasoning::select();
             let resolved = tier
                 .normalize_for_route(provider, base_url, wire_model)
                 .as_setting()
                 .to_string();
             tracing::debug!(
                 reasoning_effort = %resolved,
-                is_subagent = false,
-                "auto_reasoning: resolved auto tier from user message"
+                "auto_reasoning: resolved auto tier from declared policy"
             );
             Some(resolved)
         }
         Some(other) => Some(other.to_string()),
         None => None,
     }
-}
-
-fn is_turn_metadata_text(text: &str) -> bool {
-    text.trim_start().starts_with("<turn_meta>")
 }
 
 #[cfg(test)]
@@ -6782,42 +6594,14 @@ mod tests {
     }
 
     #[test]
-    fn turn_owned_children_get_one_settlement_prompt_then_a_resumable_park() {
-        assert!(should_guard_turn_end_for_owned_children(false, 1, false));
-        assert!(!should_guard_turn_end_for_owned_children(false, 1, true));
-        assert!(!should_guard_turn_end_for_owned_children(false, 0, false));
-        assert!(!should_guard_turn_end_for_owned_children(true, 1, false));
-
-        let guard = turn_owned_child_guard_runtime_text(&[
-            "agent_owned_a".to_string(),
-            "agent_owned_b".to_string(),
-        ]);
-        assert!(
-            guard.contains("agent(action=\"wait\", agent_id=\"agent_owned_a\", until=\"all\")")
-        );
-        assert!(
-            guard.contains("agent(action=\"wait\", agent_id=\"agent_owned_b\", until=\"all\")")
-        );
-        assert!(guard.contains("Do not use an unscoped wait-all call"));
-        assert!(guard.contains("detached=true"));
-        assert!(guard.contains("resume_from=\"<agent_id>\""));
-
-        let parking = turn_owned_child_parking_runtime_text(2);
-        assert!(parking.contains("Interrupted"));
-        assert!(parking.contains("continuable checkpoints"));
-        assert!(parking.contains("resume_from=\"<agent_id>\""));
-
+    fn turn_owned_children_keep_running_with_no_recovery_request() {
+        let notice = turn_owned_child_background_runtime_text(2);
+        assert!(notice.contains("keep running with their existing identities"));
+        assert!(notice.contains("No continuation is needed for healthy running work"));
+        assert!(!notice.contains("resume_from="));
+        assert!(!notice.contains("action=\"followup\""));
         assert_eq!(turn_detached_child_count(2, 1), 1);
         assert_eq!(turn_detached_child_count(1, 2), 0);
-
-        for (starting, expected) in [(0, 2), (1, 2), (2, 2), (3, 3)] {
-            let mut remaining = starting;
-            grant_turn_end_steer_response_allowance(true, &mut remaining);
-            assert_eq!(remaining, expected);
-        }
-        let mut no_guard = 0;
-        grant_turn_end_steer_response_allowance(false, &mut no_guard);
-        assert_eq!(no_guard, 0);
     }
 
     #[test]
@@ -6978,47 +6762,26 @@ mod tests {
     }
 
     #[test]
-    fn resolve_auto_effort_ignores_stored_turn_metadata() {
-        let messages = vec![Message {
-            role: Role::User,
-            content: vec![
-                ContentBlock::Text {
-                    text: "<turn_meta>\nRecent errors: src/failing.rs\n</turn_meta>".to_string(),
-                    cache_control: None,
-                },
-                ContentBlock::Text {
-                    text: "hello".to_string(),
-                    cache_control: None,
-                },
-            ],
-        }];
-
+    fn resolve_auto_effort_is_content_blind() {
+        // #6290 rework: the resolved tier no longer depends on message text
+        // at all — stored metadata, questions, and work prompts alike take
+        // the declared default.
         assert_eq!(
             resolve_auto_effort(
                 Some("auto"),
-                &messages,
                 crate::config::ApiProvider::Deepseek,
                 crate::config::DEFAULT_DEEPSEEK_BASE_URL,
                 "deepseek-v4-pro",
             ),
             Some("high".to_string()),
-            "auto thinking should classify the user request, not stored metadata"
+            "auto resolves the declared default"
         );
     }
 
     #[test]
     fn resolve_auto_effort_selects_a_concrete_kimi_code_tier() {
-        let messages = vec![Message {
-            role: Role::User,
-            content: vec![ContentBlock::Text {
-                text: "inspect this repository and fix the failing tests".to_string(),
-                cache_control: None,
-            }],
-        }];
-
         let resolved = resolve_auto_effort(
             Some("auto"),
-            &messages,
             crate::config::ApiProvider::Moonshot,
             crate::config::DEFAULT_KIMI_CODE_BASE_URL,
             crate::config::KIMI_CODE_K3_MODEL,
@@ -7032,7 +6795,6 @@ mod tests {
         assert_eq!(
             resolve_auto_effort(
                 None,
-                &messages,
                 crate::config::ApiProvider::Moonshot,
                 crate::config::DEFAULT_KIMI_CODE_BASE_URL,
                 crate::config::KIMI_CODE_K3_MODEL,

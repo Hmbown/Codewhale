@@ -9,6 +9,7 @@ import crypto from "node:crypto";
 import { spawn } from "node:child_process";
 import { run as nativeRun, runOk, ExecError, tryJson, have as nativeHave, withSignal, throwIfAborted, wait } from "../exec.mjs";
 import { pngSize } from "../png-size.mjs";
+import { createBrowser } from "../browser-cdp.mjs";
 
 const XKEYS = {
   return: "Return", enter: "Return", tab: "Tab", escape: "Escape", esc: "Escape",
@@ -58,6 +59,7 @@ function outputPath(file) {
 export function create({ exec } = {}) {
   const run = exec?.run ?? nativeRun;
   const have = exec?.have ?? nativeHave;
+  const browser = createBrowser({ platform: "linux" });
   function requireInputOwner() {
     if (exec?.persistentInputOwner !== true) throw Object.assign(new ExecError(
       "This held-input gesture requires a connected Codewhale Computer Use desktop helper so a disconnected client cannot leave keys or buttons pressed. Start the helper and reconnect before retrying."
@@ -320,6 +322,14 @@ except Exception as e:
   return {
     platform: "linux",
     releaseInput,
+    browser_start: browser.start,
+    browser_status: browser.status,
+    browser_navigate: browser.navigate,
+    browser_click: browser.click,
+    browser_type: browser.type,
+    browser_screenshot: browser.screenshot,
+    browser_stop: browser.stop,
+    closeSession: async () => { await browser.close().catch(() => {}); },
     probe: async () => {
       const s = await probeSession();
       const caps = {
@@ -589,7 +599,41 @@ print(json.dumps({"found": True, "reason": None, "element": {
       if (!text) return { action_sent: false, note: "empty text" };
       await probeSession();
       if (session === "x11") {
-        await xdotool(["type", "--delay", "12", "--", String(text)]);
+        // xdotool `type` remaps a spare keycode for characters absent from the
+        // current keymap. Two failure modes follow: a cased letter produces a
+        // single-symbol key whose XKB level 0 is the lowercase form (Ü → ü),
+        // and consecutive remaps inside one `type` call race the X server's
+        // keymap-change propagation, so non-ASCII chars intermittently drop or
+        // arrive mangled (héllo → hllo, 日本 → 本). Route every non-ASCII char
+        // through `key U<hex>` — one synchronous remap+press+restore per char —
+        // adding Shift only when the char is cased-uppercase, and batch ASCII
+        // runs through `type` as before.
+        let runText = "";
+        const chunks = [];
+        for (const ch of String(text)) {
+          if (ch.codePointAt(0) > 127) {
+            if (runText) { chunks.push(runText); runText = ""; }
+            chunks.push(ch);
+          } else runText += ch;
+        }
+        if (runText) chunks.push(runText);
+        for (const chunk of chunks) {
+          // Supplementary-plane chars are one code point but length 2; test
+          // the code point, not the string length.
+          if (chunk.codePointAt(0) > 127) {
+            const hex = chunk.codePointAt(0).toString(16).toUpperCase().padStart(4, "0");
+            const shift = chunk !== chunk.toLowerCase() ? "shift+" : "";
+            await xdotool(["key", `${shift}U${hex}`]);
+            // Each temp remap restores the keymap as soon as the event is
+            // queued; a lagging app can then read the press against the
+            // restored map and drop it. A short settle narrows that window.
+            // Under heavy host saturation XTEST drops remain possible — that
+            // residual is documented in the suite's known_limitations.
+            await new Promise((r) => setTimeout(r, 30));
+          } else {
+            await xdotool(["type", "--delay", "12", "--", chunk]);
+          }
+        }
         return { action_sent: true, chars: text.length };
       }
       need("wtype", "typing on Wayland");

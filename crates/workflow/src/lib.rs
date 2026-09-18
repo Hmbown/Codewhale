@@ -226,6 +226,10 @@ pub struct LeafSpec {
     pub isolation: IsolationMode,
     #[serde(default)]
     pub file_scope: Vec<String>,
+    /// Optional child working directory, repository-relative like
+    /// `task({cwd})`. Disambiguates multi-repo workspaces (#6232).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
     #[serde(default)]
     pub depends_on_results: Vec<String>,
     #[serde(default)]
@@ -2268,6 +2272,7 @@ mod tests {
             mode: TaskMode::ReadOnly,
             isolation: IsolationMode::Shared,
             file_scope: Vec::new(),
+            cwd: None,
             depends_on_results: Vec::new(),
             budget: BudgetSpec::default(),
             permissions: PermissionSpec::default(),
@@ -2285,6 +2290,7 @@ mod tests {
             mode: TaskMode::ReadOnly,
             isolation: IsolationMode::Shared,
             file_scope: Vec::new(),
+            cwd: None,
             depends_on_results: Vec::new(),
             budget,
             permissions: PermissionSpec::default(),
@@ -2302,6 +2308,7 @@ mod tests {
             mode: TaskMode::ReadOnly,
             isolation: IsolationMode::Shared,
             file_scope: Vec::new(),
+            cwd: None,
             depends_on_results: Vec::new(),
             budget: BudgetSpec::default(),
             permissions: PermissionSpec::default(),
@@ -2662,6 +2669,7 @@ mod tests {
             mode: TaskMode::ReadOnly,
             isolation: IsolationMode::Auto,
             file_scope: Vec::new(),
+            cwd: None,
             depends_on_results: Vec::new(),
             budget: BudgetSpec::default(),
             permissions: PermissionSpec::default(),
@@ -2714,6 +2722,7 @@ mod tests {
             mode: TaskMode::ReadOnly,
             isolation: IsolationMode::Shared,
             file_scope: vec!["README.md".to_string()],
+            cwd: None,
             depends_on_results: Vec::new(),
             budget: BudgetSpec {
                 max_steps: Some(8),
@@ -2809,6 +2818,7 @@ mod tests {
                             mode: TaskMode::ReadWrite,
                             isolation: IsolationMode::Worktree,
                             file_scope: vec!["README.md".to_string()],
+                            cwd: None,
                             depends_on_results: Vec::new(),
                             budget: BudgetSpec::default(),
                             permissions: PermissionSpec {
@@ -3228,6 +3238,7 @@ mod tests {
             mode: TaskMode::ReadOnly,
             isolation: IsolationMode::Shared,
             file_scope: Vec::new(),
+            cwd: None,
             depends_on_results: Vec::new(),
             budget: BudgetSpec::default(),
             permissions: PermissionSpec::default(),

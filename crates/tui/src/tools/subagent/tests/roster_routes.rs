@@ -467,7 +467,9 @@ async fn saved_profile_cannot_widen_parent_posture_or_depth_and_missing_provider
     let worker = guard.worker_records.get(id).unwrap();
     assert!(!worker.spec.runtime_profile.permissions.write);
     assert_eq!(worker.spec.runtime_profile.shell, ShellPolicy::None);
-    assert_eq!(worker.spec.runtime_profile.max_spawn_depth, 0);
+    assert_eq!(worker.spec.runtime_profile.max_spawn_depth, 1);
+    assert_eq!(worker.spec.runtime_profile.spawn_depth, 1);
+    assert!(!worker.spec.runtime_profile.can_spawn_child());
     guard.cancel_agent(id).unwrap();
 }
 
@@ -578,7 +580,7 @@ async fn selected_models_reach_exact_provider_and_off_list_refuses_before_admiss
         .await
         .unwrap_err();
     assert!(
-        error.to_string().contains("outside the selected Pod"),
+        error.to_string().contains("outside the selected Fleet"),
         "{error}"
     );
     assert!(
@@ -853,7 +855,7 @@ async fn fleet_editor_save_reload_reaches_type_only_admission_without_a_model_re
     let client = DeepSeekClient::new(&reloaded).unwrap();
     let manager = new_shared_subagent_manager(root.path().to_path_buf(), 1);
     let gate = manager.read().await.launch_gate.clone();
-    let held_permit = gate.acquire_owned().await.unwrap();
+    let held_permit = gate.acquire().await;
     let (mailbox, mut mailbox_rx) = Mailbox::new(CancellationToken::new());
     let context = ToolContext::new(root.path()).with_state_namespace("fleet-editor-restarted");
     let mut runtime = SubAgentRuntime::new(
@@ -968,7 +970,7 @@ model = "deepseek-v4-pro"
     let client = DeepSeekClient::new(&config).unwrap();
     let manager = new_shared_subagent_manager(root.path().to_path_buf(), 1);
     let gate = manager.read().await.launch_gate.clone();
-    let held_permit = gate.acquire_owned().await.unwrap();
+    let held_permit = gate.acquire().await;
     let (mailbox, mut mailbox_rx) = Mailbox::new(CancellationToken::new());
     let context = ToolContext::new(root.path()).with_state_namespace("manual-role-restarted");
     let mut runtime = SubAgentRuntime::new(
@@ -1152,7 +1154,7 @@ model = "deepseek/deepseek-v4-flash"
         let client = DeepSeekClient::new(&config).unwrap();
         let manager = new_shared_subagent_manager(root.path().to_path_buf(), 1);
         let gate = manager.read().await.launch_gate.clone();
-        let held_permit = gate.acquire_owned().await.unwrap();
+        let held_permit = gate.acquire().await;
         let (mailbox, mut mailbox_rx) = Mailbox::new(CancellationToken::new());
         let context = ToolContext::new(root.path()).with_state_namespace(name);
         let mut runtime = SubAgentRuntime::new(
@@ -1239,5 +1241,81 @@ model = "deepseek/deepseek-v4-flash"
             );
         }
         drop(held_permit);
+    }
+}
+
+#[tokio::test]
+async fn issue_6117_invalid_personal_profile_is_visible_and_never_admitted_as_builtin() {
+    let _env = crate::test_support::lock_test_env();
+    let root = tempdir().unwrap();
+    let home = root.path().join("state");
+    let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", &home);
+    std::fs::create_dir_all(home.join("agents")).unwrap();
+    let profile = home.join("agents/scout.toml");
+    std::fs::write(&profile, "provider = \"openrouter\"\nmodel = \"qwen/qwen3.7-plus\"\nallow_shell = false\ntrust = false\n").unwrap();
+    let (client, calls, _) = delayed_chat_client(Duration::ZERO, "done").await;
+    let config = crate::config::Config {
+        api_key: Some("test-key".into()),
+        base_url: Some(client.base_url().into()),
+        ..Default::default()
+    };
+    let manager = new_shared_subagent_manager(root.path().to_path_buf(), 2);
+    let context = ToolContext::new(root.path()).with_state_namespace("issue-6117");
+    let runtime = SubAgentRuntime::new(
+        client,
+        "deepseek-v4-flash".into(),
+        context.clone(),
+        false,
+        None,
+        manager.clone(),
+    )
+    .with_api_config(config);
+    let tool = AgentTool::new(manager.clone(), runtime);
+    let discovered = tool
+        .execute(json!({"action":"roster"}), &context)
+        .await
+        .unwrap();
+    let roster: Value = serde_json::from_str(&discovered.content).unwrap();
+    assert_eq!(roster["profile_load_issue_count"], 1);
+    assert_eq!(roster["profile_load_issues"][0]["id"], "scout");
+    for selector in ["scout", "explore", "member:SCOUT"] {
+        let error = tool
+            .execute(
+                json!({"action":"start", "profile":selector, "prompt":"Inspect."}),
+                &context,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("scout.toml"), "{error}");
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert!(manager.read().await.agents.is_empty());
+    std::fs::write(&profile, "base_role = \"explore\"\nprovider = \"deepseek\"\nmodel = \"deepseek-v4-pro\"\nreasoning_effort = \"low\"\n[permissions]\nallow_shell = false\ntrust = false\n").unwrap();
+    let started = tool
+        .execute(
+            json!({"action":"start", "profile":"scout", "prompt":"Say done."}),
+            &context,
+        )
+        .await
+        .unwrap();
+    let meta = started.metadata.as_ref().unwrap();
+    let receipt = &meta["child_route"];
+    assert_eq!(receipt["resolved_profile_id"], "scout");
+    assert_eq!(receipt["profile_origin"], "personal");
+    assert_eq!(receipt["provider_id"], "deepseek");
+    assert_eq!(receipt["model_id"], "deepseek-v4-pro");
+    assert_eq!(receipt["effective_reasoning"], "low");
+    assert_eq!(receipt["route_source"], "agent_profile.model");
+    let id = meta["agent_id"].as_str().unwrap();
+    let mut guard = manager.write().await;
+    assert!(
+        !guard.worker_records[id]
+            .spec
+            .runtime_profile
+            .permissions
+            .write
+    );
+    if guard.agents[id].status == SubAgentStatus::Running {
+        guard.cancel_agent(id).unwrap();
     }
 }

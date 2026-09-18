@@ -1656,10 +1656,16 @@ fn agent_tools_with_shell_policy_readonly_exposes_only_run_only_bash() {
             .keys()
             .cloned()
             .collect::<std::collections::BTreeSet<_>>(),
-        ["command", "justification", "sandbox_permissions", "timeout"]
-            .into_iter()
-            .map(str::to_string)
-            .collect()
+        [
+            "command",
+            "justification",
+            "read_only",
+            "sandbox_permissions",
+            "timeout"
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
     );
     for hidden in ["action", "background", "tty", "stdin", "task_id", "wait"] {
         assert!(bash.input_schema["properties"].get(hidden).is_none());
@@ -1719,6 +1725,29 @@ fn machine_readonly_catalog_is_exactly_the_evidence_profile() {
     assert!(registry.contains("Bash"));
     assert!(tools.iter().all(|tool| tool.name != "File"));
     assert!(tools.iter().all(|tool| tool.name != "Bash"));
+    let shell = tools.iter().find(|tool| tool.name == "bash").unwrap();
+    assert!(shell.description.contains("cwd field"));
+    assert!(shell.description.contains("git log"));
+    assert!(shell.description.contains("cannot change its own role"));
+    let bash = registry.get("bash").unwrap();
+    for command in [
+        "git branch -a",
+        "cd src && git status",
+        "git rev-parse HEAD",
+    ] {
+        let error = enforce_tool_authority(
+            "bash",
+            &json!({"command":command}),
+            bash.as_ref(),
+            registry.context(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("cwd field") && error.contains("git log"),
+            "{error}"
+        );
+    }
     let web = tools.iter().find(|tool| tool.name == "Web").unwrap();
     assert_eq!(
         web.input_schema["properties"]["action"]["enum"],

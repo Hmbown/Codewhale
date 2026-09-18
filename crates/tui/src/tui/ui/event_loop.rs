@@ -61,6 +61,11 @@ pub(super) fn apply_engine_session_projection(
     }
     app.context_token_cache.borrow_mut().clear();
     app.set_api_messages(messages);
+    // #6190: the projection is the engine's own record, so it is where a
+    // steer's acceptance becomes observable — and the only place the steer's
+    // real message index is known. Promote before anything else reads the
+    // transcript, so live order equals record order by construction.
+    crate::tui::ui::dispatch::settle_accepted_steers(app);
     app.system_prompt = system_prompt;
     if app.auto_model {
         app.last_effective_model = Some(model);
@@ -627,6 +632,13 @@ pub async fn run_tui(
     require_interactive_terminal(io::stdin().is_terminal(), io::stdout().is_terminal())?;
     require_foreground_terminal_owner()?;
 
+    // #6169: install the suspend/resume handshake here — after the
+    // foreground-ownership check (the termios snapshot needs the still-cooked
+    // tty) and before raw mode, so every mode enabled below has a handler that
+    // can undo it. Not in `lib.rs`: this must not run for the non-TUI
+    // subcommands.
+    job_control_guard::install_job_control_guard();
+
     // This sets local terminal attributes; it is not a terminal-response probe.
     // Do it on the owning thread, as on resume, so blocking-pool scheduling
     // cannot abort startup or leave a detached worker enabling raw mode later.
@@ -768,12 +780,16 @@ pub async fn run_tui(
             if session_id == "latest" {
                 // Special case: resume the most recent session in this workspace.
                 match manager.get_latest_session_for_workspace(&options.workspace) {
-                    Ok(Some(meta)) => manager.load_session(&meta.id).map(Some),
+                    Ok(Some(meta)) => manager
+                        .resume_session(&meta.id)
+                        .map(|recovery| Some(recovery.session)),
                     Ok(None) => Ok(None),
                     Err(e) => Err(e),
                 }
             } else {
-                manager.load_session_by_prefix(session_id).map(Some)
+                manager
+                    .resume_session_by_prefix(session_id)
+                    .map(|recovery| Some(recovery.session))
             };
 
         match load_result {
@@ -787,19 +803,31 @@ pub async fn run_tui(
                             ));
                         }
                         Err(err) => {
-                            app.status_message = Some(format!("Failed to restore session: {err}"));
+                            crate::tui::ui::session_state::surface_session_load_failure(
+                                &mut app,
+                                format!("Failed to restore session: {err}"),
+                            );
                         }
                     }
                 }
                 Err(err) => {
-                    app.status_message = Some(format!("Failed to restore session goal: {err}"));
+                    crate::tui::ui::session_state::surface_session_load_failure(
+                        &mut app,
+                        format!("Failed to restore session goal: {err}"),
+                    );
                 }
             },
             Ok(None) => {
-                app.status_message = Some("No sessions found to resume".to_string());
+                crate::tui::ui::session_state::surface_session_load_failure(
+                    &mut app,
+                    "No sessions found to resume".to_string(),
+                );
             }
             Err(e) => {
-                app.status_message = Some(format!("Failed to load session: {e}"));
+                crate::tui::ui::session_state::surface_session_load_failure(
+                    &mut app,
+                    format!("Failed to load session: {e}"),
+                );
             }
         }
     }
@@ -1341,7 +1369,7 @@ async fn submit_decided_composer_input(
             let _ = engine_handle
                 .send(Op::SyncSession {
                     session_id: app.current_session_id.clone(),
-                    messages: app.api_messages.clone(),
+                    messages: app.api_messages.as_ref().clone(),
                     system_prompt: app.system_prompt.clone(),
                     system_prompt_override: false,
                     model: app.model.clone(),
@@ -1421,6 +1449,10 @@ pub(crate) async fn run_event_loop(
     // (#6004); `None` until the first publish records it without firing.
     let mut previous_turn_state = None;
     let mut force_terminal_repaint = false;
+    // #6311: while the terminal reports unfocused, frames are pure backlog
+    // (GTK3 defers all VTE damage on occlusion and replays it on return).
+    // Event ingestion continues; only `terminal.draw` emission is gated.
+    let mut terminal_unfocused = false;
     // FocusGained debounce: some terminal emulators (e.g. Tabby) re-trigger
     // FocusGained when we re-arm focus-change reporting inside
     // recover_terminal_modes, creating a tight repaint loop. Skip
@@ -1457,6 +1489,14 @@ pub(crate) async fn run_event_loop(
     // without replacing the user's configured footer/status-line chips.
     let mut version_check: Option<tokio::task::JoinHandle<Option<UpdateNotice>>> =
         spawn_startup_version_check(config.update_config());
+    // First-run / missing-key: if a live local Ollama catalog answers, adopt a
+    // real /api/tags model into chrome instead of leaving the DeepSeek costume.
+    let mut local_ollama_probe: Option<
+        tokio::task::JoinHandle<Option<crate::local_ollama::LiveLocalOllamaCatalog>>,
+    > = crate::local_ollama::spawn_local_ollama_adoption_probe(
+        config,
+        crate::local_ollama::should_adopt_live_local_ollama(app),
+    );
 
     // Startup version-change hint: once per version, never on first run.
     // `record_launch` owns the semantics (strict semver forward move, corrupt
@@ -1491,6 +1531,40 @@ pub(crate) async fn run_event_loop(
     let mut pending_subagent_list_refresh = false;
 
     loop {
+        // #6169: first statement of every iteration. The job-control handler can
+        // stop this process mid-turn (SIGTSTP, or SIGTTIN once the group is
+        // backgrounded) after restoring the terminal from inside the handler.
+        // SIGCONT only records that the stop happened; the rebuild happens here,
+        // in normal context, where crossterm is safe to call.
+        //
+        // Two deferrals, both deliberate: a child owning the tty is handled by
+        // the pause/resume block further down (it rebuilds the modes itself), and
+        // a group that is still background (a plain `bg`) must not touch the
+        // terminal at all — re-entering raw mode and the alternate screen would
+        // steal the shell's tty. The state is left pending either way, so the
+        // rebuild still runs on the iteration after `fg`.
+        if job_control_guard::take_resume()
+            && !event_broker.is_paused()
+            && require_foreground_terminal_owner().is_ok()
+        {
+            job_control_guard::mark_resumed();
+            resume_terminal(
+                terminal,
+                app.use_alt_screen(),
+                app.use_mouse_capture,
+                app.use_bracketed_paste,
+                app.synchronized_output_enabled,
+            )?;
+            event_broker.resume_events();
+            // The input pump is deliberately not told about this: it is only
+            // ever gated by `pause_terminal_input_for_child` /
+            // `resume_after_child_terminal`, and calling the latter here would
+            // falsely clear a child's gate.
+            app.status_message = Some("Resumed after suspend".to_string());
+            app.needs_redraw = true;
+            force_terminal_repaint = true;
+        }
+
         if app.onboarding == OnboardingState::None && pending_telemetry_notice.take().is_some() {
             let receipt = app.tr(MessageId::TelemetryNoticeDefaultOn);
             app.push_status_toast(receipt.into_owned(), StatusToastLevel::Info, Some(12_000));
@@ -1572,6 +1646,18 @@ pub(crate) async fn run_event_loop(
             app.add_message(HistoryCell::System {
                 content: notice.notice_block(install),
             });
+        }
+
+        // Adopt a live local Ollama tag into first-run / missing-key chrome.
+        let mut local_done = false;
+        if let Some(ref handle) = local_ollama_probe {
+            local_done = handle.is_finished();
+        }
+        if local_done
+            && let Ok(Some(catalog)) = local_ollama_probe.take().unwrap().await
+            && crate::local_ollama::should_adopt_live_local_ollama(app)
+        {
+            adopt_live_local_ollama_catalog(app, &mut engine_handle, config, catalog).await;
         }
 
         // Non-blocking startup-default writes (mode / thinking) report their
@@ -1855,6 +1941,42 @@ pub(crate) async fn run_event_loop(
                         app.remote_control
                             .upload_resync_snapshot(&resync_run, &app.api_messages);
                     }
+                }
+                let pet_event_applies = match &event {
+                    EngineEvent::AgentSpawned {
+                        owner_session_id, ..
+                    }
+                    | EngineEvent::AgentProgress {
+                        owner_session_id, ..
+                    }
+                    | EngineEvent::AgentComplete {
+                        owner_session_id, ..
+                    } => event_owner_is_active(app.current_session_id.as_deref(), owner_session_id),
+                    EngineEvent::UserInputRequired { .. } => {
+                        !should_suppress_user_input_prompt(app)
+                    }
+                    EngineEvent::ApprovalRequired {
+                        tool_name,
+                        approval_grouping_key,
+                        approval_key,
+                        approval_force_prompt,
+                        ..
+                    } => {
+                        matches!(
+                            resolve_ui_approval_disposition(
+                                app,
+                                tool_name,
+                                approval_grouping_key,
+                                approval_key,
+                                *approval_force_prompt
+                            ),
+                            crate::core::authority::ApprovalRequestDisposition::Prompt
+                        )
+                    }
+                    _ => true,
+                };
+                if pet_event_applies {
+                    crate::tui::pet_watch::observe(app, &event, Instant::now());
                 }
                 record_turn_activity(app, &event, Instant::now());
                 match event {
@@ -2362,6 +2484,10 @@ pub(crate) async fn run_event_loop(
                         if flush_gate_receipts_for(app, None) {
                             transcript_batch_updated = true;
                         }
+                        // A steer the turn never accepted was dropped by the
+                        // engine. Report it instead of leaving it "sending"
+                        // (#6190).
+                        crate::tui::ui::dispatch::settle_unaccepted_steers_at_turn_end(app);
                         let completed_turn = app.active_turn.take();
                         // The in-flight provisional estimate hands off to the
                         // authoritative cumulative price accrued below; the
@@ -2714,7 +2840,8 @@ pub(crate) async fn run_event_loop(
                             });
                         if let Some(launch) = suggestion_launch {
                             let suggestion_cell = app.prompt_suggestion_cell.clone();
-                            let messages: Vec<codewhale_models::Message> = app.api_messages.clone();
+                            let messages: std::sync::Arc<Vec<codewhale_models::Message>> =
+                                app.api_messages.clone();
                             let gen_token = app
                                 .prompt_suggestion_gen
                                 .load(std::sync::atomic::Ordering::Relaxed);
@@ -3132,12 +3259,13 @@ pub(crate) async fn run_event_loop(
                     EngineEvent::PauseEvents { ack } => {
                         if !event_broker.is_paused() {
                             let input_handoff =
-                                terminal_input.pause_for_child_terminal().and_then(|()| {
-                                    prepare_terminal_input_handoff(
+                                match terminal_input.pause_for_child_terminal().await {
+                                    Ok(()) => prepare_terminal_input_handoff(
                                         &terminal_input,
                                         &mut pending_terminal_events,
-                                    )
-                                });
+                                    ),
+                                    Err(err) => Err(err),
+                                };
                             match input_handoff {
                                 Ok(true) => {}
                                 Ok(false) => {
@@ -3289,9 +3417,12 @@ pub(crate) async fn run_event_loop(
                     ) =>
                     {
                         let display = bound_agent_activity_text(&friendly_subagent_progress(
-                            app, &id, &status,
+                            app,
+                            &id,
+                            &status,
+                            activity.routine_wait,
                         ));
-                        if is_noisy_subagent_progress(&status) {
+                        if activity.routine_wait {
                             app.agent_progress
                                 .entry(id.clone())
                                 .or_insert_with(|| display.clone());
@@ -3709,6 +3840,7 @@ pub(crate) async fn run_event_loop(
                                     &approval_key,
                                     intent_summary.as_deref(),
                                     config.approval_default_selection(),
+                                    config.approval_timeout(),
                                 );
                                 log_sensitive_event(
                                     "tool.approval.prompted",
@@ -4009,7 +4141,7 @@ pub(crate) async fn run_event_loop(
                 let _ = engine_handle
                     .send(Op::SyncSession {
                         session_id: app.current_session_id.clone(),
-                        messages: app.api_messages.clone(),
+                        messages: app.api_messages.as_ref().clone(),
                         system_prompt: app.system_prompt.clone(),
                         system_prompt_override: false,
                         model: app.model.clone(),
@@ -4136,6 +4268,7 @@ pub(crate) async fn run_event_loop(
         }
         maybe_throttled_recovery_snapshot(app, Instant::now(), &mut last_recovery_snapshot_at);
         let history_has_live_motion = history_has_live_motion(&app.history);
+        crate::tui::pet_watch::tick(app, Instant::now());
         let active_cell_has_live_motion = active_cell_has_live_motion(app);
         let translation_placeholder_has_live_motion = app.translation_enabled
             && (pending_thinking_translations > 0 || app.streaming_thinking_active_entry.is_some());
@@ -4403,7 +4536,7 @@ pub(crate) async fn run_event_loop(
             force_terminal_repaint = true;
             app.force_next_full_repaint = false;
         }
-        if app.needs_redraw && draw_wait.is_none() {
+        if app.needs_redraw && draw_wait.is_none() && !terminal_unfocused {
             draw_app_frame_inner(terminal, app, config, force_terminal_repaint)?;
             force_terminal_repaint = false;
             frame_rate_limiter.mark_emitted(Instant::now());
@@ -4497,6 +4630,7 @@ pub(crate) async fn run_event_loop(
             let event_observed_at = observed_terminal_event.observed_at;
             let evt = observed_terminal_event.event;
             app.needs_redraw = true;
+            terminal_unfocused = next_unfocused(terminal_unfocused, &evt);
 
             // Handle bracketed paste events
             if app.redaction_gate && app.onboarding == OnboardingState::None {
@@ -4617,6 +4751,13 @@ pub(crate) async fn run_event_loop(
                 }
 
                 app.handle_resize(final_w, final_h);
+                // #6311: a resize that lands while unfocused records the size
+                // but must not emit the frame — same deferral as zero-size.
+                if terminal_unfocused {
+                    force_terminal_repaint = true;
+                    app.needs_redraw = true;
+                    continue;
+                }
                 // #macos-resize: some terminals (macOS Terminal.app, Windows
                 // ConHost) briefly report stale dimensions via
                 // `terminal::size()` after a resize. ratatui's `draw()` calls
@@ -4710,8 +4851,13 @@ pub(crate) async fn run_event_loop(
                             // A launched command dissolves the card; Esc
                             // out of the picker brings it back.
                             app.launch.dissolve_card(app.ambient_clock_ms);
-                            app.view_stack
-                                .push(SessionPickerView::new(&app.workspace, app.ui_locale));
+                            app.view_stack.push(
+                                SessionPickerView::new(&app.workspace, app.ui_locale)
+                                    .with_current_session(app.current_session_id.as_deref()),
+                            );
+                        }
+                        crate::tui::underwater::LaunchAction::McpRemedy => {
+                            type_launch_mcp_remedy(app);
                         }
                         crate::tui::underwater::LaunchAction::Help => {
                             toggle_help_view(app);
@@ -5391,8 +5537,13 @@ pub(crate) async fn run_event_loop(
                             // A launched command dissolves the card; Esc
                             // out of the picker brings it back.
                             app.launch.dissolve_card(app.ambient_clock_ms);
-                            app.view_stack
-                                .push(SessionPickerView::new(&app.workspace, app.ui_locale));
+                            app.view_stack.push(
+                                SessionPickerView::new(&app.workspace, app.ui_locale)
+                                    .with_current_session(app.current_session_id.as_deref()),
+                            );
+                        }
+                        crate::tui::underwater::LaunchAction::McpRemedy => {
+                            type_launch_mcp_remedy(app);
                         }
                         crate::tui::underwater::LaunchAction::Help => {
                             toggle_help_view(app);
@@ -5663,28 +5814,43 @@ pub(crate) async fn run_event_loop(
             // gesture. Handle it before transcript/detail Enter shortcuts so
             // it can never open an unrelated overlay instead (#382).
             let portable_submit_chord = composer_submit_chord(key, app.composer_multiline_mode);
-            // Inside the double-tap window the just-queued message steers —
-            // the same path Ctrl+Enter takes (one steering path). Outside it,
-            // an empty Enter still promotes the oldest queued message.
+            // Inside the double-tap window every queued message steers,
+            // oldest first — the same path Ctrl+Enter takes (one steering
+            // path). Outside it, an empty Enter still promotes the oldest
+            // queued message.
             if matches!(portable_submit_chord, Some(ComposerSubmitChord::Enter))
                 && app.input.trim().is_empty()
                 && !slash_menu_open
                 && !mention_menu_open
-                && let Some(queued) = app.take_queued_for_double_tap_steer()
             {
-                persist_offline_queue_state(app);
-                attempt_steer_with_queue_fallback(
-                    app,
-                    config,
-                    &engine_handle,
-                    queued,
-                    DispatchRecovery::Queued {
-                        restore_index: None,
-                    },
-                )
-                .await;
-                app.note_footer_hint_used(crate::tui::footer_hints::ENTER_AGAIN);
-                continue;
+                let steers = app.take_queued_for_double_tap_steer();
+                if !steers.is_empty() {
+                    let mut pending = steers.into_iter();
+                    for message in pending.by_ref() {
+                        let steered = attempt_steer_with_queue_fallback(
+                            app,
+                            config,
+                            &engine_handle,
+                            message,
+                            DispatchRecovery::Queued {
+                                restore_index: None,
+                            },
+                        )
+                        .await;
+                        if !steered {
+                            // The failed message is already restored; the
+                            // queue holds exactly it, so the unattempted
+                            // remainder appends behind it in order.
+                            for message in pending.by_ref() {
+                                app.queue_message(message);
+                            }
+                            break;
+                        }
+                    }
+                    persist_offline_queue_state(app);
+                    app.note_footer_hint_used(crate::tui::footer_hints::ENTER_AGAIN);
+                    continue;
+                }
             }
             if matches!(portable_submit_chord, Some(ComposerSubmitChord::Enter))
                 && matches!(
@@ -5848,8 +6014,10 @@ pub(crate) async fn run_event_loop(
                     // never restores a different project's history by
                     // surprise (#1395). Press `a` inside the picker to
                     // broaden to every saved session.
-                    app.view_stack
-                        .push(SessionPickerView::new(&app.workspace, app.ui_locale));
+                    app.view_stack.push(
+                        SessionPickerView::new(&app.workspace, app.ui_locale)
+                            .with_current_session(app.current_session_id.as_deref()),
+                    );
                     continue;
                 }
                 KeyCode::Char('c') | KeyCode::Char('C')
@@ -6120,6 +6288,26 @@ pub(crate) async fn run_event_loop(
                 {
                     select_next_slash_menu_entry(app, slash_menu_entries.len());
                 }
+                // Paging and edge motions from the shared vocabulary (#6290),
+                // claimed before the unconditional transcript-scroll arms.
+                KeyCode::PageUp if key.modifiers.is_empty() && slash_menu_open => {
+                    move_slash_menu_selection(
+                        app,
+                        slash_menu_entries.len(),
+                        crate::tui::list_nav::Motion::PagePrev,
+                    );
+                }
+                KeyCode::PageDown if key.modifiers.is_empty() && slash_menu_open => {
+                    move_slash_menu_selection(
+                        app,
+                        slash_menu_entries.len(),
+                        crate::tui::list_nav::Motion::PageNext,
+                    );
+                }
+                // Home/End deliberately stay cursor keys while the menu is open:
+                // the composer is still the focused input (same as Left/Right
+                // and the mention menu), so only vertical travel belongs to
+                // the popup.
                 KeyCode::Down
                     if key.modifiers.is_empty()
                         && app.selected_composer_attachment_index().is_some() =>
@@ -6445,31 +6633,34 @@ pub(crate) async fn run_event_loop(
                     // shortcut whether or not a model turn is streaming —
                     // editing the buffer never disturbs in-flight work.
                     let seed = app.input.clone();
-                    let editor_result = terminal_input.pause_for_child_terminal().and_then(|()| {
-                        let result = prepare_terminal_input_handoff(
-                            &terminal_input,
-                            &mut pending_terminal_events,
-                        )
-                        .and_then(|ready| {
-                            if ready {
-                                crate::tui::external_editor::spawn_editor_for_input(
-                                    terminal,
-                                    app.use_alt_screen(),
-                                    app.use_mouse_capture,
-                                    app.use_bracketed_paste,
-                                    &seed,
-                                )
-                            } else {
-                                Err(io::Error::new(
-                                    io::ErrorKind::Interrupted,
-                                    "editor handoff cancelled by pending terminal input",
-                                ))
-                            }
-                        });
-                        terminal_input.resume_after_child_terminal();
-                        force_terminal_repaint = true;
-                        result
-                    });
+                    let editor_result = match terminal_input.pause_for_child_terminal().await {
+                        Err(err) => Err(err),
+                        Ok(()) => {
+                            let result = prepare_terminal_input_handoff(
+                                &terminal_input,
+                                &mut pending_terminal_events,
+                            )
+                            .and_then(|ready| {
+                                if ready {
+                                    crate::tui::external_editor::spawn_editor_for_input(
+                                        terminal,
+                                        app.use_alt_screen(),
+                                        app.use_mouse_capture,
+                                        app.use_bracketed_paste,
+                                        &seed,
+                                    )
+                                } else {
+                                    Err(io::Error::new(
+                                        io::ErrorKind::Interrupted,
+                                        "editor handoff cancelled by pending terminal input",
+                                    ))
+                                }
+                            });
+                            terminal_input.resume_after_child_terminal();
+                            force_terminal_repaint = true;
+                            result
+                        }
+                    };
                     match editor_result {
                         Ok(crate::tui::external_editor::EditorOutcome::Edited(new)) => {
                             app.input = new;
@@ -6711,7 +6902,7 @@ pub(crate) async fn run_cache_warmup(app: &App, config: &Config) -> Result<Cache
         .map(str::to_string);
     let request = MessageRequest {
         model: route.model.clone(),
-        messages: app.api_messages.clone(),
+        messages: app.api_messages.as_ref().clone(),
         max_tokens: CACHE_WARMUP_MAX_TOKENS,
         system: app.system_prompt.clone(),
         tools: app.session.last_tool_catalog.clone(),
@@ -6735,6 +6926,34 @@ pub(crate) async fn run_cache_warmup(app: &App, config: &Config) -> Result<Cache
         base_url,
         inspection,
     })
+}
+
+/// Switch a first-run / missing-key session onto a live local Ollama tag.
+async fn adopt_live_local_ollama_catalog(
+    app: &mut App,
+    engine_handle: &mut EngineHandle,
+    config: &mut Config,
+    catalog: crate::local_ollama::LiveLocalOllamaCatalog,
+) {
+    let Some(tag) = catalog.preferred_tag().map(str::to_string) else {
+        return;
+    };
+    // switch_provider resolves against the lake we just refreshed.
+    let switched = switch_provider(
+        app,
+        engine_handle,
+        config,
+        ApiProvider::Ollama,
+        Some(tag.clone()),
+    )
+    .await;
+    if !switched {
+        return;
+    }
+    app.onboarding_needs_api_key = false;
+    app.onboarding_missing_key_recovery = false;
+    app.status_message = Some(format!("Local Ollama ready · {tag} (from GET /api/tags)"));
+    app.needs_redraw = true;
 }
 
 pub(crate) async fn run_prepared_dispatch(

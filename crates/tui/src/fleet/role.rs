@@ -40,9 +40,11 @@ pub(crate) const FLEET_ROLE_SCHEMA_VALUES: [&str; 8] = [
     "custom",
 ];
 
-/// Role aliases accepted by `normalize_role_alias`. Kept in sync with the
-/// match arms below so every input that `FleetRole::from_str` accepts also
-/// resolves to a canonical role (avoids the dual-validation rejection in #2649).
+/// Human-readable hint listing every token [`FleetRole::from_str`] accepts,
+/// for spawn-time error messages. Keep in sync with
+/// [`migrate_legacy_role_token`] and the `from_str` match arms; those two are
+/// the only role parser (#2649 was a second table in the spawn tool drifting
+/// from this set).
 pub(crate) const VALID_ROLE_ALIASES: &str = "general; explore; planner; reviewer; implement; test; advisor; custom \
      (legacy aliases remain accepted: worker; scout; builder; verifier; consultant; default; general-purpose; general_purpose; exploration; explorer; plan; planning; awaiter; review; code-review; code_review; implementer; implementation; verify; verification; validator; tester; oracle)";
 
@@ -304,12 +306,15 @@ pub(crate) const NETWORK_TOOL_DENYLIST: &[&str] = &[
 
 /// The deny-list entry that stands for "this child has no network".
 ///
-/// The deny list *is* how `network_tool = false` reaches a child registry
-/// (through `worker_profile.denied_tools`), so posture is read back off the
-/// list rather than carried as a second field that could disagree with it.
-/// `fetch_url` is the sentinel because every network denial installs it and no
-/// narrower deny list does — the `web_*` / `web.*` globs deliberately do not
-/// match it, which is why it is spelled out above.
+/// The deny list is how `network_tool = false` reaches a child across the
+/// durable-Fleet and `codewhale exec` boundaries (through
+/// `worker_profile.denied_tools` / `context.disallowed_tools`). `fetch_url` is
+/// the sentinel because every network denial installs it and no narrower deny
+/// list does — the `web_*` / `web.*` globs deliberately do not match it,
+/// which is why it is spelled out above. The in-process child reads its
+/// network axis off the resolved grant, which folds this sentinel in at
+/// resolve time — so the transport denial and the semantic answer can never
+/// disagree.
 pub(crate) const NETWORK_DENIAL_SENTINEL: &str = "fetch_url";
 
 /// Tool names that mutate the workspace directly.
@@ -385,10 +390,11 @@ pub(crate) const RAW_SHELL_DENYLIST: &[&str] = &[
 /// raw-shell denial installs it and no narrower deny list does.
 ///
 /// Read by the tests that assert the raw-shell denial actually landed. It is
-/// deliberately *not* what the execution envelope consults for shell
-/// authority — see [`SHELL_AUTHORITY_SENTINEL`] for why those are two
-/// different questions.
-#[allow(dead_code)]
+/// deliberately *not* what decides a child's shell authority — that question
+/// is answered by the resolved grant's `shell` axis, which distinguishes
+/// "no process surface" from "bounded verification surface" by grant field
+/// rather than by a sentinel name.
+#[cfg_attr(not(test), expect(dead_code))]
 pub(crate) const RAW_SHELL_SENTINEL: &str = "exec_shell";
 
 /// The built-in verification surface: the workspace's own configured checks.
@@ -405,11 +411,13 @@ pub(crate) const VERIFICATION_SURFACE_DENYLIST: &[&str] = &["Run", "run_tests", 
 /// Distinct from [`RAW_SHELL_SENTINEL`], and the distinction is the point.
 /// `exec_shell` is installed whenever the *raw* shell is removed, which
 /// includes the write-denied verifier that still holds shell authority — so
-/// reading shell authority off it reports every verifier as shell-less and
-/// takes the verification surface away from the one role that exists to use
-/// it. `run_tests` is installed only when the shell *ceiling* itself is
-/// narrower than `full`, which is exactly the posture that has no authority to
-/// start a process.
+/// reading shell authority off it would take the verification surface away
+/// from the one role that exists to use it. `run_tests` is installed only
+/// when the shell *ceiling* itself is narrower than `full`, which is exactly
+/// the posture that has no authority to start a process. The grant folds
+/// this sentinel into its `shell` axis at resolve time: `Verify`/`Full`
+/// collapse to `None`, while `Inspect` — classifier-bounded evidence reads,
+/// not process-start authority — survives.
 pub(crate) const SHELL_AUTHORITY_SENTINEL: &str = "run_tests";
 
 /// Execution primitives that are **not** spelled as shell.
@@ -735,7 +743,7 @@ fn runtime_permission_ceiling(role: &FleetRole) -> PermissionCeiling {
         write: profile.permissions.write,
         network_tool: profile.permissions.network,
         shell,
-        delegation_depth: profile.max_spawn_depth,
+        delegation_depth: profile.remaining_spawn_depth(),
         tools,
     }
 }

@@ -35,12 +35,12 @@ describe("llms.txt", () => {
       "/en/community",
       "/en/contribute",
       "/en/docs",
-      "/en/pricing",
       "/en/legal/terms",
       "/en/legal/privacy",
     ]) {
       expect(body, path).toContain(`${SITE_URL}${path}`);
     }
+    expect(body).not.toContain("/pricing");
   });
 
   it("serves the generated body as text/plain from the well-known route", async () => {

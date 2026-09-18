@@ -30,6 +30,7 @@ pub(crate) enum BackendId {
     Baidu,
     Volcengine,
     Sofya,
+    Serply,
 }
 
 impl BackendId {
@@ -47,6 +48,7 @@ impl BackendId {
             Self::Baidu => "baidu",
             Self::Volcengine => "volcengine",
             Self::Sofya => "sofya",
+            Self::Serply => "serply",
         }
     }
 }

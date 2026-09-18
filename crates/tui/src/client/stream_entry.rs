@@ -265,8 +265,7 @@ mod tests {
     #[tokio::test]
     async fn open_returns_first_attempt_response_on_dual_policy() {
         let server = ok_server().await;
-        let _ = rustls::crypto::ring::default_provider().install_default();
-        let client = reqwest::Client::new();
+        let client = crate::tls::reqwest_client();
         let attempts = Arc::new(AtomicUsize::new(0));
         let response = open_sse_response(
             &open_req(StreamHttpPolicy::DualWithH1Fallback, Duration::from_secs(5)),
@@ -327,8 +326,7 @@ mod tests {
     #[tokio::test]
     async fn transport_error_before_headers_retries_exactly_once_on_h1() {
         let server = ok_server().await;
-        let _ = rustls::crypto::ring::default_provider().install_default();
-        let client = reqwest::Client::new();
+        let client = crate::tls::reqwest_client();
         let attempts = Arc::new(AtomicUsize::new(0));
         let response = open_sse_response(
             &open_req(StreamHttpPolicy::DualWithH1Fallback, Duration::from_secs(5)),

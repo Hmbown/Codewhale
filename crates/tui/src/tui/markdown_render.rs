@@ -209,6 +209,11 @@ pub struct ParseState {
     /// a caller that hands over unrelated text gets a full re-parse, not
     /// silently wrong output.
     prefix: String,
+    /// FNV-1a digest of every byte committed since the last reset. The live
+    /// incremental cache drops `prefix` to bound memory, so the
+    /// verified-append resume path compares this digest against the incoming
+    /// content instead of retaining a second copy of the source.
+    committed_digest: u64,
     /// Length of `prefix`. Always ends just past a newline, so only whole
     /// lines are ever committed.
     consumed: usize,
@@ -243,6 +248,16 @@ impl ParseState {
                 &mut self.code_block_id,
             );
         }
+        let mut digest = if self.consumed == 0 {
+            committed_prefix_digest(&[])
+        } else {
+            self.committed_digest
+        };
+        for &byte in complete.as_bytes() {
+            digest ^= u64::from(byte);
+            digest = digest.wrapping_mul(FNV_1A_PRIME);
+        }
+        self.committed_digest = digest;
         self.prefix.push_str(complete);
         self.consumed += complete.len();
     }
@@ -284,17 +299,43 @@ impl ParseState {
             && self.committed_prefix_matches(content)
     }
 
-    /// Resume after the caller has proved that the only source mutation was an
-    /// append. The live transcript obtains that proof at the `push_str` seam;
-    /// avoiding a byte-for-byte prefix comparison is essential because such a
-    /// comparison on every chunk would itself retain the quadratic curve.
+    /// Resume after the caller has proved that the raw source mutation was an
+    /// append. The live transcript obtains that proof at the `push_str` seam.
+    ///
+    /// The receipt covers the *raw* stream, but this cache consumes the
+    /// latex-rendered projection of it, and a math block that closes late
+    /// rewrites already-committed bytes: an open `\[` is committed as literal
+    /// text and only becomes its rendered form once the closing `\]` arrives
+    /// (#6196). A length check cannot see that rewrite, so the committed
+    /// prefix is verified by digest. FNV-1a over hot cache lines costs orders
+    /// of magnitude less per beat than the render it guards, while retaining
+    /// the prefix itself would pin the whole message in memory.
     fn can_resume_verified_append(&self, content: &str) -> bool {
-        content.len() >= self.consumed && content.is_char_boundary(self.consumed)
+        content.len() >= self.consumed
+            && content.is_char_boundary(self.consumed)
+            && self.committed_digest
+                == committed_prefix_digest(&content.as_bytes()[..self.consumed])
     }
 
     fn committed_prefix_matches(&self, content: &str) -> bool {
         self.prefix == content[..self.consumed]
     }
+}
+
+/// FNV-1a constants. Chosen for speed and zero dependencies: the
+/// verified-append resume check hashes the whole committed prefix on every
+/// streaming beat, so the guard must stay far below the render cost it
+/// protects.
+const FNV_1A_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+fn committed_prefix_digest(bytes: &[u8]) -> u64 {
+    const FNV_1A_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut digest = FNV_1A_OFFSET_BASIS;
+    for &byte in bytes {
+        digest ^= u64::from(byte);
+        digest = digest.wrapping_mul(FNV_1A_PRIME);
+    }
+    digest
 }
 
 /// Deterministic work receipts for the live incremental renderer.
@@ -2554,6 +2595,72 @@ mod tests {
     }
 
     #[test]
+    fn verified_append_resume_rejects_a_rewritten_committed_prefix() {
+        // #6196: the streaming cache consumes the latex-rendered projection
+        // of the raw stream. While a `\[` display block is open,
+        // `render_latex_in_text` passes it through as literal text and the
+        // incremental cache commits those lines. When the closing `\]`
+        // finally arrives the rendered form rewrites the *committed* bytes
+        // even though the raw stream only appended, so the append receipt
+        // stays valid and only a content-aware committed-prefix check can
+        // see the rewrite. A length-only check resumed from the stale lines
+        // and the un-rendered opener stuck in the cell forever. The strings
+        // below are the projections the latex layer produces for that
+        // sequence.
+        let mut cache = IncrementalMarkdownRenderCache::default();
+        let mut rendered = Vec::new();
+        // Beat 1: raw stream `para\n\[ \alpha\n` — the open block passes
+        // through literally and its complete line is committed.
+        update_incremental_render(
+            &mut cache,
+            &mut rendered,
+            "para\n\\[ \\alpha\n",
+            80,
+            palette::PaletteMode::Dark,
+            false,
+        );
+        assert_eq!(cache.work().invalidations, 1);
+
+        // Beat 2: the raw stream appended `\]` plus more prose; the
+        // projection rewrites the committed line and grows past its old
+        // length, so the resume guard cannot rely on length alone.
+        let closed = "para\nα\nthe identity holds for every pair of terms\n";
+        update_incremental_render(
+            &mut cache,
+            &mut rendered,
+            closed,
+            80,
+            palette::PaletteMode::Dark,
+            true,
+        );
+        assert_eq!(
+            cache.work().invalidations,
+            2,
+            "rewriting committed bytes must invalidate the resume"
+        );
+        let cold = render_markdown_tagged_with_palette(
+            closed,
+            80,
+            Style::default(),
+            palette::PaletteMode::Dark,
+        );
+        assert_eq!(
+            rendered_fingerprint(&rendered),
+            rendered_fingerprint(&cold),
+            "the re-render must match a cold render of the closed form"
+        );
+        assert!(
+            !rendered.iter().any(|line| {
+                line.line
+                    .spans
+                    .iter()
+                    .any(|span| span.content.contains("\\["))
+            }),
+            "the stale literal latex opener must not survive the close"
+        );
+    }
+
+    #[test]
     fn underscores_inside_identifiers_render_as_literal_text() {
         // Regression for PR #1455 / @tiger-dog: previously the inline
         // markdown parser ate the underscore in `codewhale_tui` because
@@ -3960,6 +4067,44 @@ mod tests {
                 text,
                 "width={width}: CJK transcript content changed while wrapping"
             );
+        }
+    }
+
+    // A deliberate measurement probe, not an assertion: run it with
+    // `--nocapture` to read the per-append cost. Printing is the whole point,
+    // so the module-wide stdout ban is lifted here the same way
+    // `core/engine/tests.rs` lifts it for its probes.
+    #[allow(clippy::print_stdout)]
+    #[test]
+    fn probe_incremental_stream_cost() {
+        // Faithful to one streaming message: the document grows a word at a
+        // time and the render path re-parses and re-renders the whole visible
+        // text on every tick. Reports the cost per 250 appends so growth with
+        // message size is visible.
+        use std::time::Instant;
+        let words: Vec<&str> =
+            "the quick brown fox jumps over a lazy dog and then keeps going for a while"
+                .split(' ')
+                .collect();
+        let mut doc = String::new();
+        let width = 100u16;
+        let mut window_start = Instant::now();
+        for i in 0..2000usize {
+            doc.push_str(words[i % words.len()]);
+            doc.push(' ');
+            let parsed = parse(&doc);
+            let lines = render_parsed(&parsed, width, Style::default());
+            std::hint::black_box(&lines);
+            if (i + 1) % 250 == 0 {
+                let elapsed = window_start.elapsed();
+                println!(
+                    "PROBE bytes={} per_append={:?} total={:?}",
+                    doc.len(),
+                    elapsed / 250,
+                    elapsed
+                );
+                window_start = Instant::now();
+            }
         }
     }
 }

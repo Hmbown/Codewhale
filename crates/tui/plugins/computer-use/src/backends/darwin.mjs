@@ -11,6 +11,8 @@ import crypto from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { spawn } from "node:child_process";
 import { run, runOk, ExecError, tryJson, have, withSignal, wait, throwIfAborted, currentSignal } from "../exec.mjs";
+import { stateDir } from "../registry.mjs";
+import { createBrowser } from "../browser-cdp.mjs";
 
 /** Base64 expands 3 bytes to 4, padded to a multiple of 4. */
 const encodedSize = (bytes) => Math.ceil(bytes / 3) * 4;
@@ -114,9 +116,104 @@ const MOUSE = {
 };
 const MOUSE_MOVED = 5;
 
+/**
+ * Native refusals carry exception reasons; these map to stable codes so
+ * receipts and callers can branch without parsing prose. Unknown reasons stay
+ * uncoded (the message is the contract there).
+ */
+export function nativeErrorCode(message) {
+  const m = String(message ?? "");
+  if (/ambiguous/i.test(m)) return "window_ambiguous";
+  if (/not capturable/i.test(m)) return "window_not_capturable";
+  if (/several running applications match/i.test(m)) return "ambiguous_application";
+  if (/cannot be terminated by this plugin/i.test(m)) return "protected_application";
+  if (/refused the window frame change/i.test(m)) return "frame_refused";
+  if (/no accessibility geometry/i.test(m)) return "window_target_not_found";
+  if (/application not found|no running application/i.test(m)) return "app_not_found";
+  return null;
+}
+
+/**
+ * Choose the menu element for an exact title: a menu bar item at level 0, an
+ * open menu's item below it. Exact match only — a fuzzy match would activate
+ * the wrong command, and menu titles are stable enough to state precisely.
+ * Exported for tests; the walk itself is native.
+ */
+export function pickMenuElement(elements, label, menuBar) {
+  const role = menuBar ? "AXMenuBarItem" : "AXMenuItem";
+  return elements.find((el) => el?.label === label && el?.role === role) ?? null;
+}
+
+/**
+ * Regular apps are what "open an app" means; accessories and daemons answer
+ * menu-bar and background questions. Keep the signal, drop the XPC soup.
+ * A helper that predates the activation_policy field returns the list whole.
+ */
+export function selectApps(apps, all) {
+  if (all || !apps.some((a) => a.activation_policy)) return apps;
+  return apps.filter((a) => a.activation_policy === "regular" || a.frontmost === true);
+}
+
+/**
+ * Front-lease interference verdict (SHA-6643 slice 1). The native helper
+ * reports the borrow window (lease_ms) and the HID idle clock around it
+ * (idle_before_s/idle_after_s); synthesized events do not tick that clock,
+ * so a clock that fails to advance across the window means hardware input
+ * arrived mid-lease. Null when the reply carries no accounting (no borrow,
+ * or a helper that predates it) — receipts stay quiet then.
+ */
+const LEASE_IDLE_EPSILON_S = 0.25;
+export function leaseVerdict(r) {
+  if (r?.front_lease !== true) return null;
+  const leaseMs = r.lease_ms, before = r.idle_before_s, after = r.idle_after_s;
+  if (![leaseMs, before, after].every(Number.isFinite)) return null;
+  return after < before + leaseMs / 1000 - LEASE_IDLE_EPSILON_S;
+}
+
+/**
+ * Threads the interference accounting from a native lease reply into a
+ * model-facing receipt. Call sites that build receipts field-by-field
+ * spread this; verbatim flows (type) already carry it via native().
+ */
+export function leaseAccounting(r) {
+  if (r?.front_lease !== true) return {};
+  const out = {};
+  for (const k of ["lease_ms", "idle_before_s", "idle_after_s"]) {
+    if (Number.isFinite(r[k])) out[k] = r[k];
+  }
+  if (typeof r.user_input_during_lease === "boolean") out.user_input_during_lease = r.user_input_during_lease;
+  return out;
+}
+
 export function create({ exec }) {
   const runL = (cmd, args, opts) => exec.run(cmd, args, opts);
-  const state = { activeDisplay: 1, lastRaster: null, inputApp: null, foregroundInput: false, previewEnabled: false, pointer: null, pointerLease: null };
+  // The preview panel is on by default: while a session is bound to an app,
+  // every action updates the floating capture and its drawn cursor so the
+  // person can watch without the real pointer moving. `preview(enabled:false)`
+  // mutes it for the session.
+  // The preview panel is live while a session is bound: after the first
+  // successful capture a timer keeps refreshing it, so the person watches the
+  // app instead of a frozen still. CODEWHALE_CU_PREVIEW_REFRESH_MS=0 disables
+  // the loop (tests, headless); the floor keeps a hostile value tolerable.
+  const state = { activeDisplay: 1, lastRaster: null, inputApp: null, foregroundInput: false, previewEnabled: true, pointer: null, pointerLease: null };
+  let previewLoop = null;
+  let previewBusy = false;
+  function stopPreviewLoop() { if (previewLoop) { clearInterval(previewLoop); previewLoop = null; } }
+  // A hide must not race an in-flight capture: its late preview_notify would
+  // re-show a panel that was just dismissed.
+  async function quiescePreview() { for (let i = 0; i < 20 && previewBusy; i++) await wait(25); }
+  const browser = createBrowser();
+  function startPreviewLoop() {
+    if (previewLoop) return;
+    const ms = Number(process.env.CODEWHALE_CU_PREVIEW_REFRESH_MS ?? 1000);
+    if (!Number.isFinite(ms) || ms <= 0) return;
+    previewLoop = setInterval(() => {
+      if (previewBusy || !state.previewEnabled || !state.inputApp) return;
+      previewBusy = true;
+      updatePreview(false).catch(() => {}).finally(() => { previewBusy = false; });
+    }, Math.max(50, ms));
+    previewLoop.unref?.();
+  }
 
   async function nativeHelper() {
     let helper = process.env.CODEWHALE_CU_APP_BUNDLE
@@ -124,6 +221,13 @@ export function create({ exec }) {
     if (!helper || !fs.existsSync(helper)) {
       const packaged = fileURLToPath(new URL("../../bin/darwin/accessibility", import.meta.url));
       if (fs.existsSync(packaged)) helper = packaged;
+    }
+    // A source checkout (plugin installs in other hosts) self-compiles an
+    // unsigned helper, which has no TCC grant. Prefer the installed app's
+    // signed helper so accessibility and screen-recording grants carry over.
+    if (!helper || !fs.existsSync(helper)) {
+      const installed = path.join(os.homedir(), "Applications", "Codewhale Computer Use.app", "Contents", "MacOS", "accessibility");
+      if (fs.existsSync(installed)) helper = installed;
     }
     if (!helper || !fs.existsSync(helper)) {
       const source = fileURLToPath(new URL("./darwin-accessibility.m", import.meta.url));
@@ -142,23 +246,47 @@ export function create({ exec }) {
   }
 
   async function native(tool, args = {}) {
-    if (tool === "pointer_sequence") requireSharedPointer();
+    // Every resolved target (element center or screen point) is where the
+    // action lands; tracking it here means the preview cursor follows element
+    // actions, not just raw pointer events.
+    const t = args?.target;
+    if (t && Number.isFinite(t.x) && Number.isFinite(t.y)) state.pointer = { x: t.x, y: t.y };
+    if (tool === "bg_pointer") {
+      const last = [...(args.steps ?? [])].reverse().find((s) => Number.isFinite(s?.x) && Number.isFinite(s?.y));
+      if (last) state.pointer = { x: last.x, y: last.y };
+    }
+    if (tool === "pointer_sequence" && !args.app_scoped) requireSharedPointer();
     const helper = await nativeHelper();
     const r = await runL(helper, [JSON.stringify({ tool, args: { ...args, input_app_ref: state.inputApp, foreground_input: state.foregroundInput, owner_pipe: true } })], { timeoutMs: 20_000, ownerPipe: true });
     if (r.aborted || r.timedOut || r.code !== 0) {
       const error = new ExecError(r.aborted ? "computer request cancelled" : r.timedOut ? "native accessibility helper timed out" : r.stderr.trim() || "native accessibility helper failed", r);
       if (r.aborted) error.code = "cancelled";
+      else error.code = nativeErrorCode(error.message) ?? undefined;
       // A deterministic native refusal sent no input. A killed/timed-out
       // helper may have posted the press before losing its response.
-      const postsPress = (tool === "key_event" && args.down) || (tool === "perform_action" && args.action === "AXPress") || (tool === "pointer_sequence" && args.steps?.some((step) => [1, 3, 25].includes(step.type)));
+      const postsPress = (tool === "key_event" && args.down) || ["type", "perform_action", "click_element", "scroll_element", "set_value", "focus_element", "select_text", "bg_pointer", "bg_key"].includes(tool) || (tool === "hit_test" && args.perform) || (tool === "pointer_sequence" && args.steps?.some((step) => [1, 3, 25].includes(step.type)));
       error.inputMayHaveBeenSent = postsPress && r.spawned === true && (r.aborted || r.timedOut);
+      if (error.inputMayHaveBeenSent) error.message += "; input may already have been sent — observe the target before doing anything else";
       throw error;
     }
     const result = tryJson(r.stdout, null);
-    if (state.previewEnabled && ["type", "key_event", "pointer_sequence", "set_value", "select_text", "perform_action", "hit_test"].includes(tool)) {
+    const interference = leaseVerdict(result);
+    if (interference !== null) result.user_input_during_lease = interference;
+    if (state.previewEnabled && state.inputApp && ["type", "key_event", "pointer_sequence", "bg_pointer", "bg_key", "set_value", "select_text", "perform_action", "hit_test", "click_element", "scroll_element", "focus_element"].includes(tool)) {
       try { await updatePreview(); } catch (error) { result.preview_error = error.message; }
     }
     return result;
+  }
+
+  async function requireBackgroundActions() {
+    if ((await native("input_capabilities"))?.background_actions !== 1) {
+      throw Object.assign(new ExecError("Update the Computer Use helper to use background focus, selection, context menus and scrolling."), { code: "app_upgrade_required" });
+    }
+  }
+
+  function assertBoundElement(target) {
+    if (!state.inputApp || target.app_ref?.pid !== state.inputApp.pid) throw new ExecError("element does not belong to the bound application — open_application and observe again");
+    if (!Array.isArray(target.path) || !Number.isInteger(target.windowIndex) || !target.role) throw new ExecError("element has no resolved accessibility identity");
   }
 
   async function nativeLease(tool, args) {
@@ -171,14 +299,23 @@ export function create({ exec }) {
 
   async function updatePreview(show = false) {
     const win = await native("window_info", { app_ref: state.inputApp });
-    const dir = path.join(os.homedir(), ".codewhale-cu", "preview");
+    const dir = path.join(stateDir(), "preview");
     fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
     const temp = path.join(dir, "next.png"), file = path.join(dir, "latest.png");
     const r = await runL("screencapture", ["-x", "-o", "-l", String(win.window_id), "-t", "png", temp], { timeoutMs: 8000 });
     if (r.code !== 0) throw new ExecError(`background preview capture failed: ${r.stderr}`);
     fs.renameSync(temp, file);
     const p = state.pointer;
-    await native("preview_notify", { enabled: true, show, title: `Codewhale · ${win.name} · ${state.foregroundInput ? "Shared desktop control" : "Background app control"}`, x: p ? (p.x-win.points.x)/win.points.w : -1, y: p ? (p.y-win.points.y)/win.points.h : -1 });
+    // The user's own hardware cursor goes on the preview too, so the panel
+    // shows both pointers in the same window-relative space.
+    let userCursor = null;
+    try { userCursor = await native("cursor_position"); } catch {}
+    await native("preview_notify", { enabled: true, show, title: `Codewhale · ${win.name} · ${state.foregroundInput ? "Shared desktop control" : "Background app control"}`, x: p ? (p.x-win.points.x)/win.points.w : -1, y: p ? (p.y-win.points.y)/win.points.h : -1,
+      user_x: userCursor && Number.isFinite(userCursor.x) ? (userCursor.x-win.points.x)/win.points.w : -1,
+      user_y: userCursor && Number.isFinite(userCursor.y) ? (userCursor.y-win.points.y)/win.points.h : -1 });
+    // Any successful capture (bind, explicit preview, action refresh) starts
+    // the live refresh; the tick itself re-enters this function as a no-op.
+    if (state.previewEnabled && state.inputApp) startPreviewLoop();
     return { enabled: true, file, app: state.inputApp, pointer: p };
   }
 
@@ -209,7 +346,7 @@ export function create({ exec }) {
     const w = await native("window_at_point", { x, y });
     if (!w?.found) throw new ExecError(`no window at (${x}, ${y}) — take a fresh screenshot and choose a point inside the target window`);
     if (w.owner_pid !== state.inputApp.pid) {
-      throw new ExecError(`(${x}, ${y}) is covered by a window owned by ${w.owner_name || "another application"} (pid ${w.owner_pid}), not the application input is bound to — raise the window you meant with open_application(activate:true), observe again, or use an element target`);
+      throw new ExecError(`(${x}, ${y}) is covered by a window owned by ${w.owner_name || "another application"} (pid ${w.owner_pid}) — use an accessibility element target or a separate computer; no pointer input was sent`);
     }
     return w;
   }
@@ -254,20 +391,51 @@ export function create({ exec }) {
    */
   async function pointerClick(button, x, y, clicks, strategy = "auto") {
     assertInScreen(x, y);
-    if (!["auto", "a11y", "event"].includes(strategy)) throw new ExecError(`strategy must be auto, a11y or event (got ${JSON.stringify(strategy)})`);
+    if (!["auto", "a11y", "event", "app"].includes(strategy)) throw new ExecError(`strategy must be auto, a11y, app or event (got ${JSON.stringify(strategy)})`);
     let a11yReason = null;
-    if (strategy !== "event" && button === "left" && clicks === 1) {
-      const hit = await native("hit_test", { x, y, perform: true });
+    if (strategy !== "event" && ["left", "right"].includes(button) && clicks === 1) {
+      if (button === "right") await requireBackgroundActions();
+      const hit = await native("hit_test", { x, y, perform: true, ...(button === "right" ? { operation: "context" } : {}) });
       if (hit?.action_sent) {
         return { action_sent: true, strategy: "a11y", action: hit.action, pointer_moved: false, at: { x, y }, button, clicks,
                  element: { role: hit.element?.role ?? null, label: hit.element?.label ?? null } };
       }
       a11yReason = hit?.reason ?? "not_found";
       if (strategy === "a11y") {
-        throw new ExecError(`no pressable accessibility element at (${x}, ${y}) in the bound application (${a11yReason}) — observe again or use strategy "event"`);
+        throw new ExecError(`no supported accessibility click at (${x}, ${y}) in the bound application (${a11yReason}) — observe the available actions, use strategy "app" for a window-scoped pointer click, or a separate computer`);
       }
     } else if (strategy === "a11y") {
       throw new ExecError(`strategy "a11y" is only available for a left single click on this backend; ${mouseName(button)} x${clicks} has no accessibility equivalent`);
+    }
+    if (strategy === "app" || (strategy === "auto" && !state.foregroundInput)) {
+      // Window-routed record delivery: AppKit accepts the events as genuine
+      // input, the cursor never moves. A momentary no-raise front lease is
+      // taken and restored inside the helper; it is reported, not hidden.
+      if ((await native("input_capabilities"))?.window_record === 1) {
+        // Ownership is enforced by window containment inside the helper: the
+        // events are addressed to a window id of the bound app, so a covered
+        // background window is still safe — they cannot land on the coverer.
+        const r = await native("bg_pointer", { steps: clickSteps(button, x, y, clicks),
+          ...(a11yReason === "web_popup_requires_real_click" ? { menu_poll_ms: 6000 } : {}) });
+        return { action_sent: true, strategy: "window-record", input_scope: "application-window",
+                 at: { x, y }, button, clicks, pointer_moved: false, front_lease: r.front_lease ?? true,
+                 ...leaseAccounting(r),
+                 ...(r.menu_lease_held ? { menu_lease_held: true } : {}),
+                 window: r.window ?? null,
+                 ...(a11yReason ? { a11y_reason: a11yReason } : {}) };
+      }
+      if (strategy !== "app") {
+        // auto in background still fails closed for raw pointer; app is the
+        // explicit missing middle.
+        requireSharedPointer();
+      }
+      const owner = await assertOwnsPoint(x, y);
+      const r = await native("pointer_sequence", { steps: clickSteps(button, x, y, clicks), restore: true, app_scoped: true });
+      const last = { x, y };
+      state.pointer = last;
+      return { action_sent: true, strategy: "app-pointer", input_scope: "application-window",
+               at: last, button, clicks, window: { id: owner.window_id, owner_pid: owner.owner_pid },
+               ...pointerCost(r), ...(a11yReason ? { a11y_reason: a11yReason } : {}) };
     }
     const r = await gesture(clickSteps(button, x, y, clicks), { restore: true, guard: { x, y } });
     return { action_sent: true, strategy: "event", at: { x, y }, button, clicks, ...pointerCost(r),
@@ -293,7 +461,7 @@ export function create({ exec }) {
       else if (KEY_CODES[p] != null) { if (key) throw new ExecError(`multiple non-modifier keys in "${text}"`); key = p; }
       else throw new ExecError(`unknown key "${p}" (supported: ${Object.keys(KEY_CODES).join(", ")} + modifiers cmd/ctrl/alt/shift/fn)`);
     }
-    if (key == null) throw new ExecError(`no non-modifier key in "${text}" — use hold_key for modifier-only holds`);
+    if (key == null) throw new ExecError(`no non-modifier key in "${text}"`);
     return { flags, code: KEY_CODES[key], key };
   }
 
@@ -306,6 +474,9 @@ export function create({ exec }) {
   }
 
   async function screenshot({ display, region, app_ref, window_id, path: outPath } = {}) {
+    // Once an app is selected, ordinary observations follow it behind the
+    // user's work. An explicit display/region remains a deliberate desktop capture.
+    if (app_ref === undefined && display === undefined && region === undefined) app_ref = state.inputApp ?? undefined;
     const dir = recordingsDir();
     fs.mkdirSync(dir, { recursive: true });
     // JPEG, not PNG. A screen is photographic content — gradients, wallpaper,
@@ -351,6 +522,7 @@ export function create({ exec }) {
     const scale = d?.scale ?? 1;
     state.lastRaster = {
       file,
+      ...(window ? { app_ref, window_index: window_id ?? 0 } : {}),
       bytes: stat.size,
       display: disp ?? 1,
       // Region and window rasters describe that rect, not the whole display.
@@ -406,13 +578,29 @@ export function create({ exec }) {
     } finally { clearTimeout(timer); }
   }
 
-  async function recordingStart({ display, durationSec, region } = {}) {
+  async function recordingStart({ display, durationSec, region, app_ref, window_id } = {}) {
     const dir = recordingsDir();
     fs.mkdirSync(dir, { recursive: true });
     const id = crypto.randomBytes(4).toString("hex");
     const file = path.join(dir, `rec-${id}.mov`);
     const displays = await displayInfo();
-    const disp = display ?? state.activeDisplay;
+    // app_ref scopes the recording to the app's window rect: resolved once at
+    // start through the same window_info the AX path uses, so a background
+    // window records behind the user's work. The rect is fixed at start —
+    // it does not track later moves or resizes.
+    let window = null;
+    if (app_ref !== undefined || window_id != null) {
+      window = await native("window_info", { app_ref: app_ref === undefined ? state.inputApp ?? undefined : app_ref, window_id });
+      if (!window?.points || !(window.points.w > 0) || !(window.points.h > 0)) throw new ExecError("the selected application has no capturable window — call list_windows");
+      if (region) throw new ExecError("choose app_ref or region, not both");
+      region = [window.points.x, window.points.y, window.points.w, window.points.h];
+    }
+    let disp = display ?? state.activeDisplay;
+    if (window && display == null) {
+      const cx = region[0] + region[2] / 2, cy = region[1] + region[3] / 2;
+      const host = displays.find(d => d.points && cx >= d.points.x && cx < d.points.x + d.points.w && cy >= d.points.y && cy < d.points.y + d.points.h);
+      if (host) disp = host.index;
+    }
     const selected = displays.find(d => d.index === disp);
     if (!selected) throw new ExecError("choose one available display for recording");
     if (durationSec != null && (!Number.isFinite(durationSec) || durationSec <= 0)) throw new ExecError("durationSec must be positive");
@@ -450,7 +638,8 @@ export function create({ exec }) {
         completion.then(result => { if (!ready) reject(new ExecError(result.error || "screen recorder exited before capture started")); });
       });
       throwIfAborted();
-      return { id, pid: child.pid, file, display: disp, durationSec: durationSec ?? null, region: region ?? null, fps: 30, mode: "ScreenCaptureKit", startedAt };
+      return { id, pid: child.pid, file, display: disp, durationSec: durationSec ?? null, region: region ?? null, fps: 30, mode: "ScreenCaptureKit", startedAt,
+        ...(window ? { window: { id: window.window_id ?? null, name: window.name ?? null }, note: "Recording the window's rect as it was at start; it does not track moves or resizes." } : {}) };
     } catch (error) {
       requestRecordingStop(recording);
       const result = await waitForRecordingStop(recording, 2_000);
@@ -475,6 +664,15 @@ export function create({ exec }) {
   }
 
   async function closeSession() {
+    // The preview this session showed must not outlive the session; a panel
+    // from a dead session has no owner to refresh or hide it.
+    stopPreviewLoop();
+    await quiescePreview();
+    if (state.previewEnabled && state.inputApp) {
+      try { await native("preview_notify", { enabled: false }); } catch { /* hiding is best-effort */ }
+    }
+    state.previewEnabled = false;
+    await browser.close().catch(() => {});
     const owned = [...rec.entries()];
     for (const [, recording] of owned) requestRecordingStop(recording);
     const results = await Promise.all(owned.map(async ([id, recording]) => {
@@ -499,25 +697,49 @@ export function create({ exec }) {
     for (const f of fs.existsSync(dir) ? fs.readdirSync(dir) : []) {
       const full = path.join(dir, f);
       const st = fs.statSync(full);
-      if (st.isFile() && /\.(mov|mp4|png)$/i.test(f)) out.push({ file: full, bytes: st.size, modifiedAt: st.mtime.toISOString() });
+      if (st.isFile() && /\.(mov|mp4|png|jpe?g)$/i.test(f)) out.push({ file: full, bytes: st.size, modifiedAt: st.mtime.toISOString() });
     }
     out.sort((a, b) => b.modifiedAt.localeCompare(a.modifiedAt));
     return { dir, recordings: out.slice(0, 50), running: [...rec.keys()] };
   }
 
   // ---------- apps / windows ----------
-  async function listApps() { return native("list_apps"); }
+  async function listApps(args = {}) {
+    if (args?.installed === true) {
+      const r = await native("installed_apps", {});
+      const apps = Array.isArray(r?.apps) ? r.apps : [];
+      return {
+        apps,
+        total: apps.length,
+        installed: true,
+        note: "Installed catalog from /Applications, /System/Applications and ~/Applications; running flags reflect this moment. This scan takes a moment.",
+      };
+    }
+    const r = await native("list_apps");
+    const apps = Array.isArray(r?.apps) ? r.apps : [];
+    const shown = selectApps(apps, args?.all === true);
+    return {
+      apps: shown,
+      total: apps.length,
+      filtered: args?.all === true ? "all" : "regular",
+      ...(shown.length !== apps.length ? { note: "Regular (user-facing) apps only — pass all:true to include menu-bar helpers and background processes." } : {}),
+    };
+  }
 
-  async function listWindows({ app_ref } = {}) { return native("list_windows", { app_ref }); }
+  async function listWindows({ app_ref } = {}) { return native("list_windows", { app_ref: app_ref === undefined ? state.inputApp ?? undefined : app_ref }); }
 
   async function openApplication({ name, bundle_id: bid, pid, url: urlArg, activate = false } = {}) {
     if (!name && !bid && !pid) throw new ExecError("open_application needs name, bundle_id or pid");
+    // Failed selection must not leave an earlier app armed for shared input.
+    state.foregroundInput = false;
+    state.inputApp = null;
     // pid is the most specific identity and the only one that separates two
     // processes of the same bundle (e.g. a second Chrome on its own profile),
     // so it wins when given.
     const find = {};
     if (pid) find.pid = pid; else if (bid) find.bundle_id = bid; else find.name = String(name).replace(/\.app$/, "");
     let p;
+    let launched = false;
     // Binding an already-running app must not ask LaunchServices to reopen
     // it: reopen can raise windows even with open -g on some applications.
     if (!urlArg) {
@@ -527,21 +749,82 @@ export function create({ exec }) {
       }
     }
     if (!p?.found) {
-      if (!name && !bid) throw new ExecError(`no running application with pid ${pid}; call list_apps for the current processes`);
+      if (!name && !bid) throw Object.assign(new ExecError(`no running application with pid ${pid}; call list_apps for the current processes`), { code: "app_not_found" });
       const args = [];
       if (urlArg) args.push(urlArg);
       if (bid) args.unshift("-b", bid); else args.unshift("-a", name);
       if (!activate) args.unshift("-g");
       const r = await runL("open", args, { timeoutMs: 25_000 });
-      if (r.code !== 0) throw new ExecError(`open failed: ${r.stderr.trim().slice(0, 200)}`, r);
+      if (r.code !== 0) {
+        const stderr = (r.stderr ?? "").trim();
+        // A name or bundle id that resolves nowhere is a stable refusal code,
+        // not a generic opener failure — agents branch on the code.
+        const code = /Unable to find application|failed while trying to determine the application/i.test(stderr)
+          ? "app_not_found" : undefined;
+        throw Object.assign(new ExecError(`open failed: ${stderr.slice(0, 200)}`), { code });
+      }
+      launched = true;
       await new Promise((res) => setTimeout(res, 600));
       p = await native("app_info", { app_ref: find, activate });
     }
+    if (activate && p?.frontmost === false) throw Object.assign(new ExecError("The selected application did not become frontmost; no input mode was enabled. Continue with background control or wait for the user."), { code: "activation_not_confirmed" });
+    if (p?.bundle_id === "net.codewhale.computer-use") throw Object.assign(new ExecError("The Computer Use setup and safety controls belong to the user and cannot be operated by this plugin."), { code: "protected_application" });
     // A bare executable has no bundle id; carrying an empty one would make the
     // identity unmatchable.
-    state.inputApp = { pid: p.pid, ...(p.bundle_id ? { bundle_id: p.bundle_id } : {}) };
+    state.inputApp = { pid: p.pid, ...(p.bundle_id ? { bundle_id: p.bundle_id } : {}), ...(p.name ? { name: p.name } : {}) };
     state.foregroundInput = !!activate;
-    return { launched: true, activate, keyboard_delivery: activate ? "foreground-guarded" : "process", input_scope: activate ? "shared-desktop" : "application", shared_pointer: !!activate, isolated_desktop: false, url: urlArg ?? null, resolved: p?.found ? { name: p.name, pid: p.pid, bundle_id: p.bundle_id, frontmost: p.frontmost } : null };
+    // Surface the watch panel on bind; a capture failure (e.g. missing Screen
+    // Recording) must never block the bind itself. The first successful
+    // capture also starts the refresh loop so the panel stays live while bound.
+    if (state.previewEnabled) {
+      previewBusy = true;
+      updatePreview(true).catch(() => {}).finally(() => { previewBusy = false; });
+    }
+    return { launched, activate, keyboard_delivery: activate ? "foreground-guarded" : "process", input_scope: activate ? "shared-desktop" : "application", shared_pointer: !!activate, isolated_desktop: false, url: urlArg ?? null, resolved: p?.found ? { name: p.name, pid: p.pid, bundle_id: p.bundle_id, frontmost: p.frontmost } : null };
+  }
+
+  /**
+   * Menu items by title path, through accessibility only: no key events, no
+   * focus lease. Menus expose items only while open, so each level is pressed
+   * and the next is polled for. Exact titles; an ellipsis is part of the title.
+   */
+  async function invokeMenu(menuPath) {
+    if (!state.inputApp) throw new ExecError("open_application first — invoke_menu acts on the bound application");
+    if (!Array.isArray(menuPath) || menuPath.length < 1 || menuPath.length > 3 || menuPath.some((s) => typeof s !== "string" || !s.trim())) {
+      throw new ExecError('invoke_menu needs path: 1..3 non-empty menu titles, e.g. ["File","New"]');
+    }
+    const titles = menuPath.map((s) => s.trim());
+    const app_ref = state.inputApp;
+    const pressed = [];
+    for (let level = 0; level < titles.length; level++) {
+      const found = await findMenuItem(app_ref, titles[level], level === 0);
+      if (!found) {
+        throw Object.assign(new ExecError(`menu item "${titles[level]}" not found ${pressed.length ? `under ${pressed.join(" ▸ ")}` : "on the menu bar"} — menus expose items only while open; check the exact title with get_app_state (an ellipsis is part of the title)`), { code: "menu_item_not_found" });
+      }
+      if (found.enabled === false) {
+        throw Object.assign(new ExecError(`menu item "${titles[level]}" is present but disabled right now — the app validates it against its current state (in background mode that is often a missing key window for window-targeted commands like Close). Use an element action on the window's own control instead of pressing a disabled item.`), { code: "menu_item_disabled" });
+      }
+      const target = { app_ref, windowIndex: found.windowIndex ?? 0, path: found.path, role: found.role, label: found.label };
+      assertBoundElement(target);
+      const action = found.role === "AXMenuItem" && (found.actions ?? []).includes("AXPick") ? "AXPick" : "AXPress";
+      await native("perform_action", { target, action });
+      pressed.push(titles[level]);
+      if (level < titles.length - 1) await wait(140);
+    }
+    return { action_sent: true, strategy: "a11y", route: "accessibility", delivery: "background", menu: pressed, front_lease: false,
+             note: "Menu activation used accessibility only — no key events or focus lease. Verify the app effect (list_windows / get_app_state) before reporting success." };
+  }
+
+  /** Poll for the exact menu element; opens and submenu population are async. */
+  async function findMenuItem(app_ref, label, menuBar) {
+    const deadline = Date.now() + 4_000;
+    for (;;) {
+      const obs = await native("get_app_state", { app_ref, detail: "full" });
+      const hit = pickMenuElement(obs?.elements ?? [], label, menuBar);
+      if (hit) return hit;
+      if (Date.now() >= deadline) return null;
+      await wait(120);
+    }
   }
 
   // ---------- clipboard / cursor / waits ----------
@@ -589,10 +872,22 @@ export function create({ exec }) {
       return { activeDisplay: index };
     },
     list_apps: listApps,
+    set_window_frame: async ({ app_ref, window_id, frame } = {}) => {
+      if (!frame || !Number.isFinite(frame.x) || !Number.isFinite(frame.y) || !Number.isFinite(frame.w) || !Number.isFinite(frame.h) || frame.w <= 0 || frame.h <= 0) {
+        throw Object.assign(new ExecError("set_window_frame needs frame {x,y,w,h} with positive w/h"), { code: "bad_args" });
+      }
+      if (!Number.isSafeInteger(window_id) || window_id < 0) {
+        throw Object.assign(new ExecError("set_window_frame needs window_id (a non-negative window index from list_windows)"), { code: "bad_args" });
+      }
+      const r = await native("set_window_frame", { app_ref, window_id, frame });
+      return { ...r, verified: r?.verified === true, note: r?.note ?? "the after frame is the app's own readback; cross-check with list_windows before relying on it" };
+    },
     list_windows: listWindows,
     open_application: openApplication,
-    get_app_state: async ({ app_ref, detail, depth, window_id, include_ocr = false }) => {
-      const t = await native("get_app_state", { app_ref, detail, window_id });
+    get_app_state: async ({ app_ref, detail, depth, window_id, include_ocr = false, ocr_region } = {}) => {
+      const t0 = Date.now();
+      const t = await native("get_app_state", { app_ref: app_ref === undefined ? state.inputApp ?? undefined : app_ref, detail, window_id });
+      if (process.env.CODEWHALE_CU_DEBUG_OBSERVE) console.error(`observe ${Date.now() - t0}ms elements=${t.elements?.length} truncated=${t.truncated}`);
       if (!t.found) throw new ExecError("application not found — call list_apps for exact names/pids");
       if (include_ocr) {
         // Resolve once through AX, then capture only that exact application's
@@ -608,8 +903,9 @@ export function create({ exec }) {
           const ocrDir = path.join(recordingsDir(), "captures");
           fs.mkdirSync(ocrDir, { recursive: true });
           raster = await screenshot({
-            app_ref: { pid: t.pid, ...(t.bundle_id ? { bundle_id: t.bundle_id } : {}) },
-            window_id,
+            ...(ocr_region
+              ? { region: ocr_region }
+              : { app_ref: { pid: t.pid, ...(t.bundle_id ? { bundle_id: t.bundle_id } : {}) }, window_id }),
             path: path.join(ocrDir, `ocr-${crypto.randomBytes(4).toString("hex")}.png`),
           });
           const ocr = await native("recognize_text", { file: raster.file });
@@ -634,36 +930,42 @@ export function create({ exec }) {
     },
     preview: async ({ enabled = true } = {}) => {
       state.previewEnabled = enabled;
-      if (!enabled) { await native("preview_notify", { enabled: false }); return { enabled: false }; }
+      if (!enabled) { stopPreviewLoop(); await quiescePreview(); await native("preview_notify", { enabled: false }); return { enabled: false }; }
       if (!state.inputApp) throw new ExecError("open_application first to choose the preview app");
       return updatePreview(true);
     },
     screenshot,
     zoom,
-    left_click: async ({ target, strategy = "auto" }) => {
-      if (target.type !== "element" || strategy === "event") return pointerClick("left", target.x, target.y, 1, strategy);
-      if (!["auto", "a11y"].includes(strategy)) throw new ExecError(`strategy must be auto, a11y or event (got ${JSON.stringify(strategy)})`);
+    left_click: async ({ target, strategy = "auto" } = {}) => {
+      if (target?.type !== "element" || strategy === "event" || strategy === "app") return pointerClick("left", target?.x, target?.y, 1, strategy);
+      if (!["auto", "a11y"].includes(strategy)) throw new ExecError(`strategy must be auto, a11y, app or event (got ${JSON.stringify(strategy)})`);
       try {
-        if (!state.inputApp || target.app_ref?.pid !== state.inputApp.pid) throw new ExecError("element does not belong to the bound application — open_application and observe again");
-        if (!Array.isArray(target.path) || !Number.isInteger(target.windowIndex) || !target.role) throw new ExecError("element has no resolved accessibility identity");
+        assertBoundElement(target);
         if ((await native("input_capabilities"))?.element_identity !== 1) throw new ExecError("native helper needs an update for element identity validation");
-        const receipt = await native("perform_action", { target, action: "AXPress" });
+        const semantic = ["AXTextField", "AXTextArea", "AXComboBox", "AXRow", "AXCell", "AXMenuItem"].includes(target.role);
+        if (semantic) await requireBackgroundActions();
+        const receipt = await native(semantic ? "click_element" : "perform_action", { target, action: "AXPress" });
         if (!receipt?.action_sent) throw new ExecError("element press was not acknowledged");
-        return { ...receipt, action: "AXPress", strategy: "a11y", pointer_moved: false,
-          element: { role: target.role, label: target.label ?? null }, verified: false, verification_required: "screenshot" };
+        return { ...receipt, action: receipt.action ?? "AXPress", strategy: "a11y", pointer_moved: false,
+          element: { role: target.role, label: target.label ?? null }, verified: receipt.verified ?? false, verification_required: "observation" };
       } catch (error) {
         // An AX frame can cover other controls. Never turn a refused or
         // ambiguous element press into another element's press or a raw click.
-        error.message += ' — no coordinate fallback was sent; take a fresh screenshot or OCR observation before choosing a coordinate with strategy "event"';
+        error.message += ' — no coordinate fallback was sent; take a fresh screenshot or OCR observation and choose an advertised action or a separate computer';
         throw error;
       }
     },
-    double_click: ({ target }) => pointerClick("left", target.x, target.y, 2),
-    triple_click: ({ target }) => pointerClick("left", target.x, target.y, 3),
-    right_click: ({ target }) => pointerClick("right", target.x, target.y, 1),
-    middle_click: ({ target }) => pointerClick("middle", target.x, target.y, 1),
-    mouse_move: async ({ target }) => {
-      assertInScreen(target.x, target.y);
+    double_click: ({ target } = {}) => pointerClick("left", target?.x, target?.y, 2),
+    triple_click: ({ target } = {}) => pointerClick("left", target?.x, target?.y, 3),
+    right_click: async ({ target } = {}) => {
+      if (target?.type !== "element") return pointerClick("right", target?.x, target?.y, 1);
+      assertBoundElement(target);
+      await requireBackgroundActions();
+      return native("click_element", { target, context: true });
+    },
+    middle_click: ({ target } = {}) => pointerClick("middle", target?.x, target?.y, 1),
+    mouse_move: async ({ target } = {}) => {
+      assertInScreen(target?.x, target?.y);
       requireSharedPointer();
       if (state.pointerLease) {
         try {
@@ -676,8 +978,8 @@ export function create({ exec }) {
       const r = await gesture([{ type: MOUSE_MOVED, x: target.x, y: target.y, button: 0, clickState: 0 }], { restore: false, guard: target });
       return { action_sent: true, strategy: "event", at: { x: target.x, y: target.y }, ...pointerCost(r) };
     },
-    left_mouse_down: async ({ target }) => {
-      assertInScreen(target.x, target.y);
+    left_mouse_down: async ({ target } = {}) => {
+      assertInScreen(target?.x, target?.y);
       requireSharedPointer();
       if (state.pointerLease) throw new ExecError("this session already holds the left pointer button; release it first");
       await assertOwnsPoint(target.x, target.y);
@@ -688,7 +990,7 @@ export function create({ exec }) {
       state.pointer = { x: target.x, y: target.y };
       return { action_sent: true, strategy: "event", at: state.pointer, ...pointerCost(state.pointerLease.receipt) };
     },
-    left_mouse_up: async ({ target }) => {
+    left_mouse_up: async ({ target } = {}) => {
       if (!state.pointerLease) throw new ExecError("no agent pointer button is held by this session");
       const loc = target ?? state.pointer;
       if (!loc) throw new ExecError("no agent pointer position — mouse_move or left_mouse_down first");
@@ -700,8 +1002,8 @@ export function create({ exec }) {
       state.pointer = { x: loc.x, y: loc.y };
       return { action_sent: true, strategy: "event", at: state.pointer, pointer_moved: true, pointer_restored: false };
     },
-    left_click_drag: async ({ from_target: from, to }) => {
-      assertInScreen(from.x, from.y); assertInScreen(to.x, to.y);
+    left_click_drag: async ({ from_target: from, to } = {}) => {
+      assertInScreen(from?.x, from?.y); assertInScreen(to?.x, to?.y);
       const steps = [
         { type: MOUSE_MOVED, x: from.x, y: from.y, button: 0, clickState: 0 },
         { type: MOUSE.left.down, x: from.x, y: from.y, button: 0, clickState: 1, delayMs: 60 },
@@ -711,11 +1013,43 @@ export function create({ exec }) {
         steps.push({ type: MOUSE.left.dragged, x: from.x + ((to.x - from.x) * i) / n, y: from.y + ((to.y - from.y) * i) / n, button: 0, clickState: 1, delayMs: 45 });
       }
       steps.push({ type: MOUSE.left.up, x: to.x, y: to.y, button: 0, clickState: 1, delayMs: 80 });
+      if (!state.foregroundInput && (await native("input_capabilities"))?.window_record === 1) {
+        const r = await native("bg_pointer", { steps });
+        return { action_sent: true, strategy: "window-record", input_scope: "application-window",
+                 from, to, pointer_moved: false, front_lease: r.front_lease === true, window: r.window ?? null,
+                 ...leaseAccounting(r),
+                 ...(typeof r.front_restored === "boolean" ? { front_restored: r.front_restored } : {}) };
+      }
       const r = await gesture(steps, { restore: true, guard: from });
       return { action_sent: true, strategy: "event", from, to, ...pointerCost(r) };
     },
-    scroll: async ({ target, direction = "down", amount = 5 }) => {
-      assertInScreen(target.x, target.y);
+    scroll: async ({ target, direction = "down", amount = 5 } = {}) => {
+      assertInScreen(target?.x, target?.y);
+      if (!state.foregroundInput) {
+        await requireBackgroundActions();
+        if (target.type === "element") {
+          assertBoundElement(target);
+          return native("scroll_element", { target, direction, amount });
+        }
+        const receipt = await native("hit_test", { x: target.x, y: target.y, perform: true, direction, amount,
+          operation: ["left", "right"].includes(direction) ? "scroll-horizontal" : "scroll-vertical" });
+        if (receipt?.action_sent) return receipt;
+        // No AX scrollbar here (overlay scrollers, web pages): wheel events
+        // still reach the view through the window-record route.
+        if ((await native("input_capabilities"))?.window_record === 1) {
+          const dx = direction === "left" ? amount : direction === "right" ? -amount : 0;
+          const dy = direction === "up" ? amount : direction === "down" ? -amount : 0;
+          const notches = Math.max(1, Math.min(100, Math.round(amount)));
+          const steps = [];
+          for (let i = 0; i < notches; i++) steps.push({ scroll: [Math.sign(dx), Math.sign(dy)], x: target.x, y: target.y, delayMs: 15 });
+          const r = await native("bg_pointer", { steps });
+          return { action_sent: true, strategy: "window-record", input_scope: "application-window",
+                   direction, amount, pointer_moved: false, front_lease: r.front_lease === true, window: r.window ?? null,
+                   verified: false, verification_required: "observation", ...leaseAccounting(r),
+                   ...(typeof r.front_restored === "boolean" ? { front_restored: r.front_restored } : {}) };
+        }
+        throw Object.assign(new ExecError(`No background scrollbar at this point (${receipt?.reason ?? "not_found"}); choose an observed scroll area or a separate computer.`), { code: "background_scroll_unavailable" });
+      }
       const dx = direction === "left" ? -amount : direction === "right" ? amount : 0;
       const dy = direction === "up" ? amount : direction === "down" ? -amount : 0;
       // A wheel sends one notch at a time. One event carrying the whole amount
@@ -729,24 +1063,84 @@ export function create({ exec }) {
       const r = await gesture(steps, { restore: true, guard: target });
       return { action_sent: true, strategy: "event", direction, amount, ...pointerCost(r) };
     },
-    type: (args) => native("type", args),
-    key: async ({ text, repeat = 1 }) => {
+    type: (args = {}) => native("type", args),
+    key: async ({ text, repeat = 1 } = {}) => {
       const { flags, code, key } = parseChord(text);
-      for (let i = 0; i < Math.max(1, Math.min(100, repeat)); i++) {
-        await withPressedKey(code, flags, () => {});
-        if (i < repeat - 1) await wait(30);
+      const n = Math.max(1, Math.min(100, repeat));
+      // A chorded press is usually aimed at the menu system (cmd+w,
+      // cmd+shift+g, …), and key equivalents only validate against a key
+      // window. A process-bound event without one is discarded silently —
+      // the receipt would still say action_sent. In background mode the
+      // window-record route supplies a momentary key window, so flagged
+      // chords go through it when the helper supports it.
+      if (flags !== 0 && !state.foregroundInput && (await native("input_capabilities"))?.window_record === 1) {
+        try {
+          let last;
+          for (let i = 0; i < n; i++) {
+            last = await native("bg_key", { code, flags });
+            if (i < n - 1) await wait(30);
+          }
+          return { action_sent: true, key, code, keyboard_delivery: "window-record", input_scope: "application-window",
+                   front_lease: last?.front_lease === true, repeat: n, ...leaseAccounting(last),
+                   ...(typeof last?.front_restored === "boolean" ? { front_restored: last.front_restored } : {}),
+                   ...(last?.front_restored === false ? { note: "the momentary window-record lease did not hand the user's foreground back; their next keystrokes may land in this app. Tell the user." } : {}) };
+        } catch (error) {
+          // No focused window or a refused lease: the key cannot reach the
+          // menu system this way either. Fall through to process delivery
+          // and say plainly in the receipt what was actually sent.
+          if (!/no focused window|window-routed background keys|bg_dispatch/.test(error.message)) throw error;
+        }
       }
-      return { action_sent: true, key, code, keyboard_delivery: state.foregroundInput ? "foreground-guarded" : "process", repeat: Math.max(1, Math.min(100, repeat)) };
+      for (let i = 0; i < n; i++) {
+        await withPressedKey(code, flags, () => {});
+        if (i < n - 1) await wait(30);
+      }
+      return { action_sent: true, key, code, keyboard_delivery: state.foregroundInput ? "foreground-guarded" : "process", repeat: n,
+        ...(flags !== 0 && !state.foregroundInput ? { note: "process delivery (no focus lease was taken); menu key equivalents can be dropped without a key window. Verify the effect before retrying, or use invoke_menu for app menu commands." } : {}) };
     },
-    hold_key: async ({ text, duration }) => {
+    hold_key: async ({ text, duration } = {}) => {
       const { flags, code, key } = parseChord(text);
       const d = Math.max(0.05, Math.min(30, Number(duration) || 1));
       await withPressedKey(code, flags, () => wait(d * 1000));
       return { action_sent: true, key, keyboard_delivery: state.foregroundInput ? "foreground-guarded" : "process", heldSec: d };
     },
-    set_value: (args) => native("set_value", args),
-    select_text: (args) => native("select_text", args),
-    perform_action: (args) => native("perform_action", args),
+    set_value: async (args = {}) => {
+      if (args.target?.type !== "element") throw new ExecError("set_value needs an element target — {type:'element',index} from get_app_state");
+      try {
+        return await native("set_value", args);
+      } catch (error) {
+        // Web text controls ignore AXValue writes, so the native side refuses
+        // before dispatch. The replacement path is focus + select-all + type
+        // with a read-back verify — the same shape kimi-cu uses, with the
+        // value proven rather than asserted.
+        if (!/web area/i.test(error.message)) throw error;
+        if (args.target?.type !== "element") throw error;
+        const value = String(args.value ?? "");
+        await native("focus_element", { target: args.target });
+        // cmd+a through the record channel: menu key equivalents only
+        // validate against a key window, which the lease provides. bg_key
+        // posts a complete press (down and up); the `down` field is unused.
+        await native("bg_key", { code: 0, flags: 1 << 20 });
+        await new Promise((r) => setTimeout(r, 60));
+        await native("type", { text: value });
+        const back = await native("get_value", { target: args.target });
+        const verified = back?.value === value;
+        return { action_sent: true, strategy: "focus-type-replace", role: back?.role ?? null,
+                 after: back?.value ?? null, verified,
+                 ...(verified ? {} : { note: "replacement did not verify against the control's own value; observe before relying on it" }) };
+      }
+    },
+    focus: (args = {}) => native("focus_element", args),
+    get_value: (args = {}) => native("get_value", args),
+    select_text: async (args = {}) => {
+      if (args.target?.type !== "element") throw new ExecError("select_text needs an element target — {type:'element',index} from get_app_state");
+      return native("select_text", args);
+    },
+    perform_action: async (args = {}) => {
+      if (args.target?.type !== "element") throw new ExecError("perform_action needs an element target — {type:'element',index} from get_app_state");
+      return native("perform_action", args);
+    },
+    invoke_menu: async ({ path: menuPath } = {}) => invokeMenu(menuPath),
     read_clipboard: readClipboard,
     write_clipboard: writeClipboard,
     cursor_position: cursorPosition,
@@ -755,6 +1149,29 @@ export function create({ exec }) {
     recordingStatus,
     recordingList,
     closeSession,
+    list_sessions: async () => ({
+      via: "direct",
+      count: 1,
+      sessions: [{
+        target: state.inputApp ? { pid: state.inputApp.pid, ...(state.inputApp.bundle_id ? { bundle_id: state.inputApp.bundle_id } : {}), ...(state.inputApp.name ? { name: state.inputApp.name } : {}) } : null,
+        mode: state.foregroundInput ? "foreground" : "background",
+        action: null,
+        ageSec: 0,
+        inputHeld: !!state.pointerLease,
+      }],
+    }),
+    kill_app: async (args = {}) => {
+      const { name, bundle_id, pid, force } = args;
+      if (!name && !bundle_id && pid == null) throw Object.assign(new ExecError("kill_app needs name, bundle_id or pid"), { code: "bad_args" });
+      return native("kill_app", { name, bundle_id, pid, force: force === true });
+    },
+    browser_start: browser.start,
+    browser_status: browser.status,
+    browser_navigate: browser.navigate,
+    browser_click: browser.click,
+    browser_type: browser.type,
+    browser_screenshot: browser.screenshot,
+    browser_stop: browser.stop,
     releaseInput: async () => {
       if (!state.pointerLease) return;
       try { await withSignal(null, () => state.pointerLease.release({ point: state.pointer })); }

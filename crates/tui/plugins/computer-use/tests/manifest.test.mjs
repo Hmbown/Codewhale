@@ -21,7 +21,7 @@ test("plugin.json is an Agent Plugins v1 manifest with the Codewhale extension",
   assert.deepEqual(ext.skills, { path: "skills" });
   assert.deepEqual(ext.when.binaries, ["node"]);
   // HarmonyOS is a target device, never a host that runs the server.
-  assert.deepEqual([...ext.when.os].sort(), ["linux", "macos", "windows"]);
+  assert.deepEqual(ext.when.os, ["macos"]);
 
   const rootKeys = ["$schema", "name", "version", "description", "author", "homepage", "repository", "license", "keywords", "extensions"];
   for (const key of Object.keys(manifest)) assert.ok(rootKeys.includes(key), `unknown root key ${key}`);

@@ -705,6 +705,18 @@ impl ModalView for AutomationsView {
             let action = editor.mouse(mouse);
             return self.editor_action(action);
         }
+        // The wheel moves this list, not the transcript behind it.
+        match mouse.kind {
+            MouseEventKind::ScrollUp => {
+                self.move_row(-1);
+                return ViewAction::None;
+            }
+            MouseEventKind::ScrollDown => {
+                self.move_row(1);
+                return ViewAction::None;
+            }
+            _ => {}
+        }
         if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
             let point = (mouse.column, mouse.row).into();
             if self.new_button.get().contains(point) {

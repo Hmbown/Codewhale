@@ -52,6 +52,12 @@ use codewhale_palette as palette;
 
 const PROFILE_DIR: &str = ".codewhale/agents";
 
+/// Rows one PageUp/PageDown travels on choice steps. Pages clamp at the ends
+/// per the shared vocabulary instead of wrapping (#6290).
+const SETUP_PAGE: usize = 10;
+/// Lines one PageUp/PageDown scrolls on the Review step (unchanged).
+const REVIEW_SCROLL_PAGE: usize = 8;
+
 /// The only two truthful destinations for `/fleet setup`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum FleetSetupEditTarget {
@@ -372,7 +378,7 @@ impl FleetSetupSnapshot {
 /// use their canonical id; named custom routes keep their table key so saved
 /// Fleet profiles can rebuild the same child client.
 /// Callers derive a human-readable label from it for UI text.
-pub(super) fn cross_provider_model_routes(
+pub(crate) fn cross_provider_model_routes(
     config: &Config,
     active: crate::config::ApiProvider,
     health: &crate::provider_readiness::ProviderReadinessSnapshot,
@@ -1304,6 +1310,79 @@ impl FleetSetupView {
         }
     }
 
+    /// Apply one [`list_nav`](crate::tui::list_nav) motion (#6290), returning
+    /// whether it was consumed. Steps wrap; pages travel [`SETUP_PAGE`] rows
+    /// and clamp. On the Review step the same keys scroll the proof pane
+    /// instead — it has no row list — and render clamps the offset. The
+    /// region axis is declined so Tab/Left/Right keep their explicit wizard
+    /// arms below.
+    fn apply_motion(&mut self, motion: crate::tui::list_nav::Motion) -> bool {
+        use crate::tui::list_nav::Motion;
+        match motion {
+            Motion::Prev => {
+                self.move_up();
+                true
+            }
+            Motion::Next => {
+                self.move_down();
+                true
+            }
+            Motion::RegionPrev | Motion::RegionNext => false,
+            _ => {
+                if self.step == Step::Review {
+                    match motion {
+                        Motion::PagePrev => {
+                            self.review_scroll =
+                                self.review_scroll.saturating_sub(REVIEW_SCROLL_PAGE);
+                        }
+                        Motion::PageNext => {
+                            self.review_scroll =
+                                self.review_scroll.saturating_add(REVIEW_SCROLL_PAGE);
+                        }
+                        Motion::First => self.review_scroll = 0,
+                        // Render clamps to the content height.
+                        Motion::Last => self.review_scroll = usize::MAX,
+                        _ => return false,
+                    }
+                    return true;
+                }
+                let len = self.step_len();
+                if len == 0 {
+                    return false;
+                }
+                let current = match self.step {
+                    Step::Role => self.role_idx,
+                    Step::Model => self.model_idx,
+                    Step::Destination => self.destination_idx,
+                    _ => return false,
+                };
+                let Some(next) = crate::tui::list_nav::apply(current, len, SETUP_PAGE, motion)
+                else {
+                    return false;
+                };
+                match self.step {
+                    Step::Role => {
+                        self.role_idx = next;
+                        self.discard_model_draft();
+                        self.composition_decision = CompositionDecision::Pending;
+                    }
+                    Step::Model => {
+                        self.model_idx = next;
+                        self.discard_model_draft();
+                        if self.composition_decision != CompositionDecision::Pending {
+                            self.composition_decision = CompositionDecision::Edited;
+                        }
+                    }
+                    Step::Destination => {
+                        self.destination_idx = next;
+                    }
+                    _ => {}
+                }
+                true
+            }
+        }
+    }
+
     /// Re-stat the profile directory. Called on the two transitions that can
     /// change the answer — entering Review, and toggling project/user scope —
     /// so the Review step never touches the filesystem while painting.
@@ -1612,6 +1691,13 @@ impl ModalView for FleetSetupView {
     fn handle_key(&mut self, key: KeyEvent) -> ViewAction {
         // Model-step filter input captures keystrokes while active (#4639).
         if self.step == Step::Model && self.model_filter_active {
+            // Typing-safe movement set: pages and edges work while filtering
+            // without letter aliases eating the query (#6290).
+            if let Some(motion) = crate::tui::list_nav::motion_while_typing(&key)
+                && self.apply_motion(motion)
+            {
+                return ViewAction::None;
+            }
             match key.code {
                 KeyCode::Enter => {
                     self.model_filter_active = false;
@@ -1627,12 +1713,6 @@ impl ModalView for FleetSetupView {
                     if self.composition_decision != CompositionDecision::Pending {
                         self.composition_decision = CompositionDecision::Edited;
                     }
-                }
-                KeyCode::Up => {
-                    self.move_up();
-                }
-                KeyCode::Down => {
-                    self.move_down();
                 }
                 KeyCode::Char(ch)
                     if !key.modifiers.intersects(
@@ -1653,6 +1733,14 @@ impl ModalView for FleetSetupView {
         // below when the same blocked action is attempted again.
         if !matches!(key.code, KeyCode::Null) {
             self.notice = None;
+        }
+        // Movement keys come from the shared vocabulary (#6290), j/k aliases
+        // included; the region axis is declined so Tab/Left/Right keep their
+        // explicit wizard arms, and letter verbs below are unaffected.
+        if let Some(motion) = crate::tui::list_nav::motion(&key)
+            && self.apply_motion(motion)
+        {
+            return ViewAction::None;
         }
         match key.code {
             KeyCode::Esc if self.step != Step::Role => self.back(),
@@ -1691,14 +1779,6 @@ impl ModalView for FleetSetupView {
                 self.model_filter_active = true;
                 ViewAction::None
             }
-            KeyCode::Up | KeyCode::Char('k') => {
-                self.move_up();
-                ViewAction::None
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                self.move_down();
-                ViewAction::None
-            }
             // Secondary accelerator: jump to the Destination step. The primary
             // way to change the destination is the focused Review control.
             KeyCode::Char('s') if self.step == Step::Review => {
@@ -1735,18 +1815,6 @@ impl ModalView for FleetSetupView {
             }
             KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => self.advance(),
             KeyCode::Left | KeyCode::Char('h') => self.back(),
-            KeyCode::Home => {
-                self.review_scroll = 0;
-                ViewAction::None
-            }
-            KeyCode::PageUp => {
-                self.review_scroll = self.review_scroll.saturating_sub(8);
-                ViewAction::None
-            }
-            KeyCode::PageDown => {
-                self.review_scroll = self.review_scroll.saturating_add(8);
-                ViewAction::None
-            }
             _ => ViewAction::None,
         }
     }
@@ -1952,12 +2020,6 @@ impl FleetSetupView {
         // Compact tier: keep the choice, the file, and the consequence; drop
         // the long explanation rather than clip the file line off-screen.
         let compact = area.height < 12;
-        let workspace_name = self
-            .snapshot
-            .workspace
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| self.snapshot.workspace.display().to_string());
         let choices: Vec<Choice> = DESTINATION_ORDER
             .iter()
             .map(|scope| {
@@ -1983,7 +2045,7 @@ impl FleetSetupView {
                     description: if compact {
                         Cow::Borrowed("")
                     } else {
-                        Cow::Owned(tr(locale, description).replace("{workspace}", &workspace_name))
+                        tr(locale, description)
                     },
                 }
             })

@@ -151,11 +151,7 @@ mod tests {
 // plain `╮` again. The hull taper silhouette is deliberately dropped
 // (sub-cell vector work).
 
-use ratatui::{
-    buffer::Buffer,
-    layout::Rect,
-    style::{Modifier, Style},
-};
+use ratatui::{buffer::Buffer, layout::Rect, style::Style};
 use unicode_width::UnicodeWidthStr;
 
 use codewhale_palette::{ChromeInk, UiTheme, chrome_style};
@@ -165,74 +161,6 @@ pub const TIDELINE_COMPOSER_SUBMIT_WIDTH: u16 = 3;
 
 /// Blank cell between input content and the painted submit control.
 pub const TIDELINE_COMPOSER_SUBMIT_BREATHING_WIDTH: u16 = 1;
-
-/// What the caller owes the composer chrome. Draft, queued-crumb, and
-/// approval state are injected so renders stay deterministic for goldens.
-#[allow(dead_code)] // translation scaffolding: wired by the landing slice
-pub struct TidelineComposer<'a> {
-    pub theme: &'a UiTheme,
-    pub focused: bool,
-    /// Current draft (first line is shown; wrapping stays the caller's).
-    pub input: &'a str,
-    /// Queued-message crumb rendered as one row above the input line
-    /// (spec §3: slot 3 pending-preview merges into the composer).
-    pub pending_crumb: Option<&'a str>,
-    /// When a permission ask replaces the input line (approval-replaced
-    /// state, spec §5a), its one-line summary.
-    pub approval_summary: Option<&'a str>,
-    pub ascii_safe: bool,
-}
-
-#[allow(dead_code)] // translation scaffolding: builder methods feed tests + the landing slice
-impl<'a> TidelineComposer<'a> {
-    #[allow(dead_code)] // translation scaffolding: wired by the landing slice
-    #[must_use]
-    pub fn new(theme: &'a UiTheme, input: &'a str) -> Self {
-        Self {
-            theme,
-            focused: false,
-            input,
-            pending_crumb: None,
-            approval_summary: None,
-            ascii_safe: false,
-        }
-    }
-
-    #[must_use]
-    pub fn focused(mut self, focused: bool) -> Self {
-        self.focused = focused;
-        self
-    }
-
-    #[must_use]
-    pub fn pending_crumb(mut self, crumb: Option<&'a str>) -> Self {
-        self.pending_crumb = crumb;
-        self
-    }
-
-    #[must_use]
-    pub fn ascii_safe(mut self, ascii_safe: bool) -> Self {
-        self.ascii_safe = ascii_safe;
-        self
-    }
-
-    fn sym(&self, glyph: &str) -> String {
-        if !self.ascii_safe {
-            return glyph.to_string();
-        }
-        if let Some(fb) = crate::tui::glyphs::ascii_fallback(glyph) {
-            return fb.to_string();
-        }
-        glyph
-            .chars()
-            .map(|c| {
-                crate::tui::glyphs::ascii_fallback(&c.to_string())
-                    .map(str::to_string)
-                    .unwrap_or_else(|| c.to_string())
-            })
-            .collect()
-    }
-}
 
 fn chrome(theme: &UiTheme, ink: ChromeInk) -> Style {
     chrome_style(theme, ink)
@@ -301,58 +229,6 @@ pub fn tideline_composer_geometry(area: Rect) -> TidelineComposerGeometry {
     TidelineComposerGeometry { content, submit }
 }
 
-/// Paint only the shared rounded shell and its visible `[↑]` submit target.
-///
-/// Content remains caller-owned: the launch surface supplies its localized
-/// placeholder/caret/hint projection, while the live composer supplies its
-/// multiline editor. Sharing this shell keeps the visual component and exact
-/// submit geometry coherent without creating a second input authority.
-pub fn render_tideline_composer_shell(
-    area: Rect,
-    buf: &mut Buffer,
-    theme: &UiTheme,
-    focused: bool,
-    ascii_safe: bool,
-) {
-    if area.width < 6 || area.height < 3 {
-        return;
-    }
-    let border_ink = if focused {
-        ChromeInk::Info
-    } else {
-        ChromeInk::MetadataDim
-    };
-    let border = chrome(theme, border_ink);
-    let top_fill = usize::from(area.width.saturating_sub(2).max(1));
-    let top: String = std::iter::once('╭')
-        .chain(std::iter::repeat_n('─', top_fill))
-        .chain(std::iter::once('╮'))
-        .collect();
-    put(buf, area.x, area.y, &symbol(&top, ascii_safe), border);
-
-    let bottom_fill = usize::from(area.width.saturating_sub(2));
-    let bottom: String = std::iter::once('╰')
-        .chain(std::iter::repeat_n('─', bottom_fill))
-        .chain(std::iter::once('╯'))
-        .collect();
-    put(
-        buf,
-        area.x,
-        area.y + area.height - 1,
-        &symbol(&bottom, ascii_safe),
-        border,
-    );
-
-    let rail = symbol("│", ascii_safe);
-    let rail_width = rail.width() as u16;
-    for y in (area.y + 1)..(area.y + area.height - 1) {
-        put(buf, area.x, y, &rail, border);
-        put(buf, area.x + area.width - rail_width, y, &rail, border);
-    }
-
-    render_tideline_composer_submit(area, buf, theme, focused, ascii_safe);
-}
-
 /// Paint or restore the visible `[↑]` affordance above caller-owned content.
 ///
 /// The standalone shell paints it immediately. The multiline work composer
@@ -383,90 +259,3 @@ pub fn render_tideline_composer_submit(
         chrome(theme, send_ink),
     );
 }
-
-/// Paint the composer chrome. Deterministic: the caller owns the caret clock
-/// (a `low_motion` caller passes the still `_`); this render shows the draft
-/// and a terminal caret block.
-pub fn render_tideline_composer(area: Rect, buf: &mut Buffer, composer: &TidelineComposer<'_>) {
-    if area.width < 6 || area.height < 3 {
-        return;
-    }
-    let theme = composer.theme;
-    render_tideline_composer_shell(area, buf, theme, composer.focused, composer.ascii_safe);
-
-    let geometry = tideline_composer_geometry(area);
-    let inner_x = geometry.content.x;
-    let inner_w = geometry.content.width.max(1);
-    let content_top = geometry.content.y;
-    // Last row *inside* the border (the bottom border owns the final row).
-    let content_bottom = geometry.content.bottom().saturating_sub(1);
-
-    // Content rows: the crumb (if any) sits one row above the input line
-    // (spec §3 slot-3 merge); without a crumb the input takes the first
-    // content row and the quiet row under it carries only the send hitbox.
-    let input_y = if composer.pending_crumb.is_some() && content_bottom > content_top {
-        content_bottom
-    } else {
-        content_top
-    };
-    if let Some(crumb) = composer.pending_crumb {
-        let text = composer.sym(&format!("… queued: {crumb}"));
-        put(
-            buf,
-            inner_x,
-            content_top,
-            &truncate_cells(&text, inner_w as usize),
-            chrome(theme, ChromeInk::MetadataHint),
-        );
-    }
-
-    // Input line (or the approval ask that replaced it).
-    if let Some(approval) = composer.approval_summary {
-        let text = composer.sym(&format!("◆ approve: {approval}"));
-        put(
-            buf,
-            inner_x,
-            input_y,
-            &truncate_cells(&text, inner_w as usize),
-            chrome(theme, ChromeInk::PermissionAsk).add_modifier(Modifier::BOLD),
-        );
-    } else {
-        let draft = if composer.input.is_empty() {
-            String::new()
-        } else {
-            composer.sym(composer.input)
-        };
-        let caret = if composer.ascii_safe { "_" } else { "▌" };
-        let line = format!("{draft}{caret}");
-        let line = truncate_cells(&line, inner_w as usize);
-        let ink = if composer.focused {
-            ChromeInk::MetadataValue
-        } else {
-            ChromeInk::Metadata
-        };
-        put(buf, inner_x, input_y, &line, chrome(theme, ink));
-    }
-
-    // `render_tideline_composer_shell` paints the action for standalone
-    // callers; restore it after content so a long draft cannot erase it.
-    render_tideline_composer_submit(area, buf, theme, composer.focused, composer.ascii_safe);
-}
-
-/// Truncate a rendered string to `width` cells on a char boundary (never
-/// wrap — the composer is one line per row).
-fn truncate_cells(text: &str, width: usize) -> String {
-    let mut out = String::new();
-    let mut used = 0;
-    for ch in text.chars() {
-        let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
-        if used + w > width {
-            break;
-        }
-        out.push(ch);
-        used += w;
-    }
-    out
-}
-
-#[cfg(test)]
-mod tideline_tests;

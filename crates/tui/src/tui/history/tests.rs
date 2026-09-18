@@ -2651,3 +2651,52 @@ fn superseded_todo_snapshots_collapse_to_their_header() {
         "the collapsed row keeps the progress reading: {header}"
     );
 }
+
+/// One click is one request to open one file.
+///
+/// The old `try_open_file_at_line` looped over every line of the cell and
+/// spawned a detached editor per match, so a stack trace or a grep result could
+/// launch several at once, all fighting the still-raw-mode TUI for the tty
+/// (#6235). The parser now returns the first resolvable reference and nothing
+/// else; spawning belongs to `external_editor`.
+#[test]
+fn first_file_line_reference_returns_one_match_and_resolves_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = dir.path();
+    std::fs::create_dir_all(workspace.join("src")).unwrap();
+    std::fs::write(workspace.join("src/first.rs"), "fn a() {}\n").unwrap();
+    std::fs::write(workspace.join("src/second.rs"), "fn b() {}\n").unwrap();
+
+    let text = "note: two frames below\n  src/first.rs:12\n  src/second.rs:34\n";
+    let (path, line) = super::first_file_line_reference(text, workspace)
+        .expect("the first resolvable reference is returned");
+    assert_eq!(path, workspace.join("src/first.rs"));
+    assert_eq!(line, 12);
+}
+
+#[test]
+fn first_file_line_reference_skips_unresolvable_and_malformed_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = dir.path();
+    std::fs::create_dir_all(workspace.join("src")).unwrap();
+    std::fs::write(workspace.join("src/real.rs"), "fn a() {}\n").unwrap();
+
+    // A path that does not exist, a bare word, a non-numeric suffix and an
+    // empty suffix all fall through to the one row that resolves.
+    let text = concat!(
+        "  src/missing.rs:9\n",
+        "  notafile:12\n",
+        "  src/real.rs:abc\n",
+        "  src/real.rs:\n",
+        "  src/real.rs:7\n",
+    );
+    let (path, line) =
+        super::first_file_line_reference(text, workspace).expect("the only resolvable row wins");
+    assert_eq!(path, workspace.join("src/real.rs"));
+    assert_eq!(line, 7);
+
+    assert!(
+        super::first_file_line_reference("no references here\n", workspace).is_none(),
+        "a cell with nothing to open must report nothing, not a default"
+    );
+}

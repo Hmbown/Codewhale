@@ -37,6 +37,10 @@ use crate::tui::views::{
 use codewhale_localization::{Locale, MessageId, tr};
 use codewhale_palette as palette;
 
+/// Rows one PageUp/PageDown travels. Pages clamp at the ends per the shared
+/// vocabulary instead of wrapping (#6290).
+const FLEET_LIST_PAGE: usize = 10;
+
 /// What the host should do after this view acted on the store.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(dead_code)] // OpenDetail/None are reserved for the qualified-name flow
@@ -130,6 +134,23 @@ impl FleetListView {
         }
         self.row = crate::tui::list_nav::wrap_index(self.row, rows, delta);
         self.hovered_row.set(None);
+    }
+
+    /// Apply one [`list_nav`](crate::tui::list_nav) motion (#6290), returning
+    /// whether it was consumed. Steps wrap; pages travel [`FLEET_LIST_PAGE`]
+    /// rows and clamp. The list is single-column, so the region axis is a
+    /// no-op.
+    fn apply_motion(&mut self, motion: crate::tui::list_nav::Motion) -> bool {
+        let len = self.entries.len();
+        if len == 0 {
+            return false;
+        }
+        let Some(next) = crate::tui::list_nav::apply(self.row, len, FLEET_LIST_PAGE, motion) else {
+            return false;
+        };
+        self.row = next;
+        self.hovered_row.set(None);
+        true
     }
 
     fn hit_row(&self, mouse: MouseEvent) -> Option<usize> {
@@ -233,12 +254,10 @@ impl ModalView for FleetListView {
         }
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => ViewAction::Close,
-            KeyCode::Up | KeyCode::Char('k') => {
-                self.move_row(-1);
-                ViewAction::None
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                self.move_row(1);
+            // Movement keys come from the shared vocabulary (#6290), j/k
+            // aliases included — this surface captures no text. Pages are new
+            // here; they used to do nothing.
+            _ if crate::tui::list_nav::motion(&key).is_some_and(|m| self.apply_motion(m)) => {
                 ViewAction::None
             }
             KeyCode::Enter => {
@@ -325,16 +344,6 @@ impl ModalView for FleetListView {
                     }),
                 }
             }
-            KeyCode::Home => {
-                self.row = 0;
-                self.hovered_row.set(None);
-                ViewAction::None
-            }
-            KeyCode::End => {
-                self.row = self.entries.len().saturating_sub(1);
-                self.hovered_row.set(None);
-                ViewAction::None
-            }
             _ => ViewAction::None,
         }
     }
@@ -343,6 +352,15 @@ impl ModalView for FleetListView {
         match mouse.kind {
             MouseEventKind::Moved => {
                 self.hovered_row.set(self.hit_row(mouse));
+                ViewAction::None
+            }
+            // The wheel moves this list, not the transcript behind it.
+            MouseEventKind::ScrollUp => {
+                self.move_row(-1);
+                ViewAction::None
+            }
+            MouseEventKind::ScrollDown => {
+                self.move_row(1);
                 ViewAction::None
             }
             MouseEventKind::Down(MouseButton::Left) => {

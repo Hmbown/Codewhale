@@ -76,22 +76,22 @@ impl StatusPickerView {
             .collect()
     }
 
-    fn move_up(&mut self) {
-        if self.rows.is_empty() {
-            return;
-        }
-        if self.cursor == 0 {
-            self.cursor = self.rows.len() - 1;
-        } else {
-            self.cursor -= 1;
-        }
-    }
-
-    fn move_down(&mut self) {
-        if self.rows.is_empty() {
-            return;
-        }
-        self.cursor = (self.cursor + 1) % self.rows.len();
+    /// Apply one [`list_nav`](crate::tui::list_nav) motion (#6290), returning
+    /// whether it was consumed. Vertical motions wrap at the ends for
+    /// Prev/Next and clamp for paging and Home/End; the horizontal axis does
+    /// not exist on this single-column checklist. The checklist fits on one
+    /// screen, so a page is the whole list.
+    fn apply_motion(&mut self, motion: crate::tui::list_nav::Motion) -> bool {
+        let Some(next) = crate::tui::list_nav::apply(
+            self.cursor,
+            self.rows.len(),
+            self.rows.len().max(1),
+            motion,
+        ) else {
+            return false;
+        };
+        self.cursor = next;
+        true
     }
 
     fn toggle_current(&mut self) {
@@ -132,6 +132,14 @@ impl ModalView for StatusPickerView {
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> ViewAction {
+        // Movement keys come from the shared vocabulary (#6290): `j`/`k`,
+        // Home/End and the page keys mean here what they mean on every other
+        // list. This match owns only the checklist's own verbs.
+        if let Some(motion) = crate::tui::list_nav::motion(&key)
+            && self.apply_motion(motion)
+        {
+            return ViewAction::None;
+        }
         match key.code {
             KeyCode::Esc => {
                 // Roll the live preview back to the snapshot so Esc means
@@ -139,14 +147,6 @@ impl ModalView for StatusPickerView {
                 ViewAction::EmitAndClose(self.revert_event())
             }
             KeyCode::Enter => ViewAction::EmitAndClose(self.final_event()),
-            KeyCode::Up | KeyCode::Char('k') => {
-                self.move_up();
-                ViewAction::None
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                self.move_down();
-                ViewAction::None
-            }
             KeyCode::Char(' ') | KeyCode::Char('x') | KeyCode::Char('X') => {
                 self.toggle_current();
                 ViewAction::Emit(self.live_preview_event())
@@ -338,7 +338,8 @@ mod tests {
         let active = StatusItem::default_footer();
         let mut view = StatusPickerView::new(&active, ApiProvider::Deepseek, Locale::En);
         view.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
-        view.move_down();
+        // Move through the shared vocabulary, the same path a key takes.
+        view.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         view.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
         let action = view.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         match action {

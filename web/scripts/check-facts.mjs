@@ -63,6 +63,7 @@ function diffFacts(committed, fresh) {
     "crates",
     "sandboxBackends",
     "providers",
+    "models",
     "defaultModel",
     "nodeEngines",
     "toolCount",

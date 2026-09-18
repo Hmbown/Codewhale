@@ -73,7 +73,7 @@ impl std::fmt::Debug for SessionCommandWorld {
 fn workspace_with_one_user_message(world: &mut SessionCommandWorld) {
     let tmpdir = TempDir::new().expect("session workflow TempDir");
     let mut app = create_test_app_with_tmpdir(&tmpdir);
-    app.api_messages.push(Message {
+    app.api_messages_mut().push(Message {
         role: Role::User,
         content: vec![ContentBlock::Text {
             text: "Remember the whale migration".to_string(),

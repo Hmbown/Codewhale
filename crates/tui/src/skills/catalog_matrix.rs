@@ -359,6 +359,13 @@ fn catalogue_has_unique_entries_and_the_complete_block_fits_the_prompt_budget() 
             "budget overflow must advertise complete on-demand discovery"
         );
     }
+    // Budget headroom (docs/SKILLS.md): the shipped pack alone must render
+    // every eligible skill with no omission line, so user skills are never
+    // silently displaced by the bundle.
+    assert!(
+        !block.contains("additional skills omitted"),
+        "shipped pack alone must not truncate the ambient catalogue"
+    );
 
     // No entry may smuggle newlines or an oversized description into the
     // prompt prefix — that is how a catalogue line would poison context.

@@ -22,9 +22,9 @@ use codewhale_models::{ContentBlock, Message, MessageRequest, MessageResponse, S
 /// Big/cheap model pair the auto-router may choose between for the active
 /// provider (#3018).
 ///
-/// `cheap == None` means the provider has no known cheap tier: heuristics
-/// stay on the current model (only thinking effort varies) and the network
-/// router is skipped entirely (#1549).
+/// `cheap == None` means the provider has no known cheap tier: the local
+/// fallback stays on the current model (only thinking effort varies) and the
+/// network router is skipped entirely (#1549).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RouterCandidates {
     pub(crate) big: String,
@@ -37,11 +37,6 @@ impl RouterCandidates {
             big: "deepseek-v4-pro".to_string(),
             cheap: Some("deepseek-v4-flash".to_string()),
         }
-    }
-
-    /// The cheap-tier id, falling back to `big` when no cheap tier exists.
-    pub(crate) fn cheap_or_big(&self) -> &str {
-        self.cheap.as_deref().unwrap_or(&self.big)
     }
 }
 
@@ -218,133 +213,6 @@ pub(crate) fn provider_router_candidates(
     }
 }
 
-/// Auto-select a model based on request complexity.
-///
-/// Short messages (<100 chars) go to the cheap tier. Long messages and
-/// requests with complex keywords go to the big tier. The fallback is cheap.
-/// This DeepSeek-candidate wrapper keeps legacy callers and tests intact;
-/// provider-aware callers use [`auto_model_heuristic_for_candidates`].
-pub(crate) fn auto_model_heuristic(input: &str, current_model: &str) -> String {
-    auto_model_heuristic_for_candidates(input, current_model, &RouterCandidates::deepseek())
-}
-
-/// Candidate-aware variant of [`auto_model_heuristic`] (#3018).
-pub(crate) fn auto_model_heuristic_for_candidates(
-    input: &str,
-    current_model: &str,
-    candidates: &RouterCandidates,
-) -> String {
-    auto_model_heuristic_with_bias_for_candidates(input, current_model, false, candidates).model
-}
-
-#[cfg(test)]
-fn auto_model_heuristic_with_bias(input: &str, current_model: &str, cost_saving: bool) -> String {
-    auto_model_heuristic_with_bias_for_candidates(
-        input,
-        current_model,
-        cost_saving,
-        &RouterCandidates::deepseek(),
-    )
-    .model
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct AutoRouteHeuristicDecision {
-    model: String,
-    reason: AutoRouteHeuristicReason,
-}
-
-fn auto_model_heuristic_with_bias_for_candidates(
-    input: &str,
-    _current_model: &str,
-    cost_saving: bool,
-    candidates: &RouterCandidates,
-) -> AutoRouteHeuristicDecision {
-    let len = input.chars().count();
-    let lower = input.to_lowercase();
-    let borderline_pro_keywords: &[&str] = &[
-        "implement",
-        "analyze",
-        "\u{5b9e}\u{73b0}",
-        "\u{5206}\u{6790}",
-        "\u{5be6}\u{73fe}",
-    ];
-    let strong_match = COMPLEX_KEYWORDS
-        .iter()
-        .any(|kw| !borderline_pro_keywords.contains(kw) && lower.contains(kw));
-    let borderline_match = borderline_pro_keywords.iter().any(|kw| lower.contains(kw));
-    let pro_match = strong_match || (!cost_saving && borderline_match);
-    if pro_match {
-        return AutoRouteHeuristicDecision {
-            model: candidates.big.clone(),
-            reason: AutoRouteHeuristicReason::ComplexRequest,
-        };
-    }
-    if len < 100 {
-        return AutoRouteHeuristicDecision {
-            model: candidates.cheap_or_big().to_string(),
-            reason: if cost_saving && borderline_match {
-                AutoRouteHeuristicReason::CostSavingPolicy
-            } else {
-                AutoRouteHeuristicReason::ShortRequest
-            },
-        };
-    }
-    let long_threshold = if cost_saving { 1_000 } else { 500 };
-    if len > long_threshold {
-        return AutoRouteHeuristicDecision {
-            model: candidates.big.clone(),
-            reason: AutoRouteHeuristicReason::LongRequest,
-        };
-    }
-
-    AutoRouteHeuristicDecision {
-        model: candidates.cheap_or_big().to_string(),
-        reason: if cost_saving && borderline_match {
-            AutoRouteHeuristicReason::CostSavingPolicy
-        } else {
-            AutoRouteHeuristicReason::RoutineRequest
-        },
-    }
-}
-
-const COMPLEX_KEYWORDS: &[&str] = &[
-    "refactor",
-    "architecture",
-    "design",
-    "debug",
-    "security",
-    "review",
-    "audit",
-    "migrate",
-    "optimize",
-    "rewrite",
-    "implement",
-    "analyze",
-    "\u{91cd}\u{6784}",
-    "\u{67b6}\u{6784}",
-    "\u{8bbe}\u{8ba1}",
-    "\u{8c03}\u{8bd5}",
-    "\u{5b89}\u{5168}",
-    "\u{5ba1}\u{67e5}",
-    "\u{5ba1}\u{8ba1}",
-    "\u{8fc1}\u{79fb}",
-    "\u{4f18}\u{5316}",
-    "\u{91cd}\u{5199}",
-    "\u{5b9e}\u{73b0}",
-    "\u{5206}\u{6790}",
-    "\u{91cd}\u{69cb}",
-    "\u{67b6}\u{69cb}",
-    "\u{8a2d}\u{8a08}",
-    "\u{8abf}\u{8a66}",
-    "\u{5be9}\u{67e5}",
-    "\u{5be9}\u{8a08}",
-    "\u{9077}\u{79fb}",
-    "\u{512a}\u{5316}",
-    "\u{91cd}\u{5beb}",
-    "\u{5be6}\u{73fe}",
-];
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AutoRouteSource {
     FlashRouter,
@@ -398,7 +266,7 @@ pub(crate) enum AutoRouteScope {
     /// The network classifier saw only the active provider's runnable routes —
     /// the default Auto scope (#4411).
     ActiveProvider,
-    /// The provider-aware local heuristic selected within one resolved route.
+    /// The local declared fallback selected within one resolved route.
     ResolvedProvider,
 }
 
@@ -438,16 +306,34 @@ impl AutoRouteDataPath {
 }
 
 /// Local signal that selected the provider-safe strong/fast candidate.
+///
+/// Since the #6290 rework the local fallback never judges request content:
+/// without the flash classifier there is no per-request signal, so the route
+/// is the configured default (or the runnable fast sibling under the explicit
+/// `[auto] cost_saving` opt-in). The content-derived variants below are never
+/// constructed for new routes; they are retained so saved sessions from before
+/// the rework still deserialize.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum AutoRouteHeuristicReason {
+    /// Legacy: the deleted keyword/length classifier judged the request
+    /// complex. Retained for saved-session serde compat only.
     ComplexRequest,
+    /// Legacy: the deleted length rule judged the request short. Retained
+    /// for saved-session serde compat only.
     ShortRequest,
+    /// Legacy: the deleted length rule judged the request long. Retained
+    /// for saved-session serde compat only.
     LongRequest,
     CostSavingPolicy,
+    /// Legacy: the deleted classifier judged the request routine. Retained
+    /// for saved-session serde compat only.
     RoutineRequest,
     NoFastSibling,
     NoRunnableCandidate,
+    /// The configured default model: no classifier was available and no
+    /// content signal was consulted.
+    DeclaredDefault,
 }
 
 impl AutoRouteHeuristicReason {
@@ -461,6 +347,7 @@ impl AutoRouteHeuristicReason {
             Self::RoutineRequest => "routine request",
             Self::NoFastSibling => "no runnable fast sibling",
             Self::NoRunnableCandidate => "no runnable inventory candidate",
+            Self::DeclaredDefault => "configured default (no classifier)",
         }
     }
 }
@@ -472,7 +359,10 @@ impl AutoRouteHeuristicReason {
 #[serde(rename_all = "snake_case")]
 pub(crate) enum AutoRouteReason {
     ClassifierRecommendation,
-    LocalHeuristic(AutoRouteHeuristicReason),
+    /// The `local_heuristic` alias keeps sessions saved before the #6290
+    /// rework loadable; new sessions persist `local_fallback`.
+    #[serde(alias = "local_heuristic")]
+    LocalFallback(AutoRouteHeuristicReason),
     ClassifierFallback(AutoRouteHeuristicReason),
 }
 
@@ -481,7 +371,7 @@ impl AutoRouteReason {
     pub(crate) fn label(self) -> String {
         match self {
             Self::ClassifierRecommendation => "classifier recommendation".to_string(),
-            Self::LocalHeuristic(reason) => format!("local heuristic: {}", reason.label()),
+            Self::LocalFallback(reason) => format!("local fallback: {}", reason.label()),
             Self::ClassifierFallback(reason) => {
                 format!("classifier fallback: {}", reason.label())
             }
@@ -544,18 +434,18 @@ fn parse_auto_route_reasoning_effort(effort: &str) -> Option<ReasoningEffort> {
     ReasoningEffort::parse_strict(effort).ok()
 }
 
+/// Normalize an Auto-route effort when only the provider is known.
+///
+/// This delegates to the one authoritative normalizer,
+/// [`ReasoningEffort::normalize_for_route`], with an unresolved route (empty
+/// endpoint and wire model), so the Auto path cannot carry a second copy of
+/// the historic `low | medium -> high` provider collapse (Slice 4, D2).
 #[must_use]
 pub(crate) fn normalize_auto_route_effort_for_provider(
     provider: ApiProvider,
     effort: ReasoningEffort,
 ) -> ReasoningEffort {
-    if provider == ApiProvider::OpenaiCodex {
-        return effort.normalize_for_provider(provider);
-    }
-    match effort {
-        ReasoningEffort::Low | ReasoningEffort::Medium => ReasoningEffort::High,
-        other => other,
-    }
+    effort.normalize_for_route(provider, "", "")
 }
 
 /// Select the reasoning request that accompanies an Auto-model route.
@@ -683,17 +573,17 @@ pub(crate) async fn resolve_auto_route_with_inventory_for_session_and_cache_poli
 ) -> Result<AutoRouteSelection> {
     let inventory = ModelInventory::from_config(config);
     if !inventory.router_available {
-        // Fall back to heuristic-only auto routing when the flash router
+        // Fall back to declared-default auto routing when the flash router
         // is unavailable (e.g. non-DeepSeek providers like wanjie-ark).
         return Ok(normalize_auto_route_selection_for_config(
             config,
-            auto_route_from_inventory_heuristic(config, latest_request, &inventory),
+            auto_route_declared_fallback(config, &inventory),
         ));
     }
 
-    let heuristic = auto_route_from_inventory_heuristic(config, latest_request, &inventory);
+    let fallback = auto_route_declared_fallback(config, &inventory);
     if cfg!(test) {
-        return Ok(normalize_auto_route_selection_for_config(config, heuristic));
+        return Ok(normalize_auto_route_selection_for_config(config, fallback));
     }
 
     let selection = match auto_route_inventory_recommendation(
@@ -708,11 +598,11 @@ pub(crate) async fn resolve_auto_route_with_inventory_for_session_and_cache_poli
     )
     .await
     {
-        Ok(attempt) => auto_route_from_classifier_attempt(heuristic, &inventory, attempt),
+        Ok(attempt) => auto_route_from_classifier_attempt(fallback, &inventory, attempt),
         // Client construction/preparation failed before a provider request was
         // admitted. There is no provider usage to invent and no dropped
         // response receipt to claim.
-        Err(_) => auto_route_classifier_fallback(heuristic, &inventory),
+        Err(_) => auto_route_classifier_fallback(fallback, &inventory),
     };
     Ok(normalize_auto_route_selection_for_config(config, selection))
 }
@@ -812,11 +702,16 @@ fn explicit_model_matches_candidate(
             .is_some_and(|model| candidate.model.eq_ignore_ascii_case(&model))
 }
 
-fn auto_route_from_inventory_heuristic(
-    config: &Config,
-    latest_request: &str,
-    inventory: &ModelInventory,
-) -> AutoRouteSelection {
+/// Declared local fallback for Auto routing when the flash classifier is
+/// unavailable (or fails): the configured default model.
+///
+/// There is no per-request signal here by design. Until the #6290 rework this
+/// guessed cheap-vs-big from request wording (`COMPLEX_KEYWORDS` plus
+/// char-length thresholds) — host-side semantic determinism that made cost
+/// and quality depend on vocabulary. The only content-blind override is the
+/// explicit `[auto] cost_saving` opt-in, which pins the runnable fast
+/// sibling; providers without one stay on the default.
+fn auto_route_declared_fallback(config: &Config, inventory: &ModelInventory) -> AutoRouteSelection {
     let Some(active) = inventory.active_default() else {
         let model = config.default_model();
         return AutoRouteSelection {
@@ -827,48 +722,51 @@ fn auto_route_from_inventory_heuristic(
                 &model,
                 AutoRouteScope::ResolvedProvider,
                 AutoRouteDataPath::LocalHeuristic,
-                AutoRouteReason::LocalHeuristic(AutoRouteHeuristicReason::NoRunnableCandidate),
+                AutoRouteReason::LocalFallback(AutoRouteHeuristicReason::NoRunnableCandidate),
             )),
             model,
-            reasoning_effort: Some(crate::auto_reasoning::select(false, latest_request)),
+            reasoning_effort: Some(crate::auto_reasoning::select()),
             source: AutoRouteSource::Heuristic,
             routed_usage: Vec::new(),
             routed_usage_drop_records: Vec::new(),
             routed_usage_dropped_records: 0,
         };
     };
-    // Use the candidates' cheap/big info for complexity-based routing.
     let router_candidates = provider_router_candidates(active.provider, &active.model);
-    let fast_is_runnable = router_candidates.cheap.as_deref().is_some_and(|model| {
+    let runnable_fast = router_candidates.cheap.as_deref().filter(|model| {
         inventory
             .candidate(active.provider, model)
             .is_some_and(|candidate| candidate.readiness.can_attempt())
     });
-    let decision = if fast_is_runnable {
-        auto_model_heuristic_with_bias_for_candidates(
-            latest_request,
-            &active.model,
-            config.auto_cost_saving(),
-            &router_candidates,
-        )
-    } else {
-        AutoRouteHeuristicDecision {
-            model: active.model.clone(),
-            reason: AutoRouteHeuristicReason::NoFastSibling,
+    let (model, reason) = if config.auto_cost_saving() {
+        match runnable_fast {
+            Some(cheap) => (
+                cheap.to_string(),
+                AutoRouteHeuristicReason::CostSavingPolicy,
+            ),
+            None => (
+                active.model.clone(),
+                AutoRouteHeuristicReason::NoFastSibling,
+            ),
         }
+    } else {
+        (
+            active.model.clone(),
+            AutoRouteHeuristicReason::DeclaredDefault,
+        )
     };
     AutoRouteSelection {
         provider: active.provider,
         receipt: Some(auto_route_receipt(
             inventory,
             active.provider,
-            &decision.model,
+            &model,
             AutoRouteScope::ResolvedProvider,
             AutoRouteDataPath::LocalHeuristic,
-            AutoRouteReason::LocalHeuristic(decision.reason),
+            AutoRouteReason::LocalFallback(reason),
         )),
-        model: decision.model,
-        reasoning_effort: Some(crate::auto_reasoning::select(false, latest_request)),
+        model,
+        reasoning_effort: Some(crate::auto_reasoning::select()),
         source: AutoRouteSource::Heuristic,
         routed_usage: Vec::new(),
         routed_usage_drop_records: Vec::new(),
@@ -911,7 +809,7 @@ fn auto_route_from_classifier(
 }
 
 fn auto_route_from_classifier_attempt(
-    heuristic: AutoRouteSelection,
+    fallback: AutoRouteSelection,
     inventory: &ModelInventory,
     attempt: InventoryAutoRouteAttempt,
 ) -> AutoRouteSelection {
@@ -922,7 +820,7 @@ fn auto_route_from_classifier_attempt(
         routed_usage_dropped_records,
     } = attempt;
     let mut selection = recommendation.map_or_else(
-        || auto_route_classifier_fallback(heuristic, inventory),
+        || auto_route_classifier_fallback(fallback, inventory),
         |recommendation| auto_route_from_classifier(inventory, recommendation),
     );
     selection.routed_usage = routed_usage;
@@ -932,22 +830,22 @@ fn auto_route_from_classifier_attempt(
 }
 
 fn auto_route_classifier_fallback(
-    mut heuristic: AutoRouteSelection,
+    mut fallback: AutoRouteSelection,
     inventory: &ModelInventory,
 ) -> AutoRouteSelection {
-    if let Some(receipt) = heuristic.receipt.as_mut() {
-        let heuristic_reason = match receipt.reason {
-            AutoRouteReason::LocalHeuristic(reason)
+    if let Some(receipt) = fallback.receipt.as_mut() {
+        let fallback_reason = match receipt.reason {
+            AutoRouteReason::LocalFallback(reason)
             | AutoRouteReason::ClassifierFallback(reason) => reason,
-            AutoRouteReason::ClassifierRecommendation => AutoRouteHeuristicReason::RoutineRequest,
+            AutoRouteReason::ClassifierRecommendation => AutoRouteHeuristicReason::DeclaredDefault,
         };
         receipt.data_path = AutoRouteDataPath::Classifier {
             provider: inventory.router_provider,
             model: inventory.router_model.to_string(),
         };
-        receipt.reason = AutoRouteReason::ClassifierFallback(heuristic_reason);
+        receipt.reason = AutoRouteReason::ClassifierFallback(fallback_reason);
     }
-    heuristic
+    fallback
 }
 
 fn auto_route_receipt(
@@ -1639,10 +1537,10 @@ mod tests {
         assert_eq!(transport.routed_usage_drop_records.len(), 1);
         assert!(transport.routed_usage.is_empty());
 
-        let heuristic = auto_route_from_inventory_heuristic(&config, "quick status", &inventory);
-        let valid = auto_route_from_classifier_attempt(heuristic.clone(), &inventory, valid);
-        let invalid = auto_route_from_classifier_attempt(heuristic.clone(), &inventory, invalid);
-        let incomplete = auto_route_from_classifier_attempt(heuristic, &inventory, incomplete);
+        let fallback = auto_route_declared_fallback(&config, &inventory);
+        let valid = auto_route_from_classifier_attempt(fallback.clone(), &inventory, valid);
+        let invalid = auto_route_from_classifier_attempt(fallback.clone(), &inventory, invalid);
+        let incomplete = auto_route_from_classifier_attempt(fallback, &inventory, incomplete);
         assert_eq!(valid.source, AutoRouteSource::FlashRouter);
         for fallback in [&invalid, &incomplete] {
             assert_eq!(fallback.source, AutoRouteSource::Heuristic);
@@ -1737,53 +1635,6 @@ mod tests {
     }
 
     #[test]
-    fn auto_model_heuristic_chinese_keywords_route_to_pro() {
-        for msg in [
-            "\u{5e2e}\u{6211}\u{91cd}\u{6784}\u{8fd9}\u{4e2a}\u{6a21}\u{5757}",
-            "\u{8bbe}\u{8ba1}\u{6570}\u{636e}\u{5e93}\u{67b6}\u{6784}",
-            "\u{8c03}\u{8bd5}\u{5d29}\u{6e83}\u{95ee}\u{9898}",
-            "\u{5ba1}\u{8ba1}\u{5b89}\u{5168}\u{6f0f}\u{6d1e}",
-            "\u{8fc1}\u{79fb}\u{5230}\u{65b0}\u{6846}\u{67b6}",
-            "\u{4f18}\u{5316}\u{6027}\u{80fd}\u{74f6}\u{9888}",
-            "\u{5206}\u{6790}\u{8fd9}\u{6bb5}\u{4ee3}\u{7801}",
-        ] {
-            assert_eq!(
-                auto_model_heuristic(msg, "auto"),
-                "deepseek-v4-pro",
-                "expected Pro for `{msg}`",
-            );
-        }
-    }
-
-    #[test]
-    fn auto_model_heuristic_traditional_chinese_keywords_route_to_pro() {
-        for msg in [
-            "\u{8acb}\u{91cd}\u{69cb}\u{6b64}\u{6a21}\u{7d44}",
-            "\u{67b6}\u{69cb}\u{8a2d}\u{8a08}",
-            "\u{4ee3}\u{78bc}\u{8abf}\u{8a66}",
-            "\u{5be9}\u{8a08}\u{6f0f}\u{6d1e}",
-            "\u{9077}\u{79fb}\u{5230}\u{65b0}\u{67b6}\u{69cb}",
-            "\u{512a}\u{5316}\u{6027}\u{80fd}",
-            "\u{91cd}\u{5beb}\u{4ee3}\u{78bc}",
-            "\u{5be6}\u{73fe}\u{65b0}\u{529f}\u{80fd}",
-        ] {
-            assert_eq!(
-                auto_model_heuristic(msg, "auto"),
-                "deepseek-v4-pro",
-                "expected Pro for `{msg}`",
-            );
-        }
-    }
-
-    #[test]
-    fn auto_model_heuristic_short_chinese_chat_stays_on_flash() {
-        assert_eq!(
-            auto_model_heuristic("\u{4f60}\u{597d}", "auto"),
-            "deepseek-v4-flash",
-        );
-    }
-
-    #[test]
     fn auto_route_prompt_uses_current_session_mode() {
         let prompt = auto_route_prompt(
             "Please explain the change before editing files.",
@@ -1860,9 +1711,13 @@ mod tests {
 
     #[test]
     fn auto_route_effort_normalization_is_provider_aware() {
+        // Slice 4, D2: the Auto path delegates to the canonical route
+        // normalizer with an unresolved route. Two providers where the deleted
+        // local copy disagreed with the authority are pinned explicitly.
         assert_eq!(
             normalize_auto_route_effort_for_provider(ApiProvider::Deepseek, ReasoningEffort::Low),
-            ReasoningEffort::High
+            ReasoningEffort::Low,
+            "first-party DeepSeek documents low|high|max, so the canonical normalizer keeps low"
         );
         assert_eq!(
             normalize_auto_route_effort_for_provider(
@@ -1871,6 +1726,35 @@ mod tests {
             ),
             ReasoningEffort::High
         );
+        assert_eq!(
+            normalize_auto_route_effort_for_provider(
+                ApiProvider::OllamaCloud,
+                ReasoningEffort::Minimal
+            ),
+            ReasoningEffort::Low,
+            "OllamaCloud folds the Codewhale-only `minimal` spelling onto low"
+        );
+        assert_eq!(
+            normalize_auto_route_effort_for_provider(
+                ApiProvider::OllamaCloud,
+                ReasoningEffort::Ultra
+            ),
+            ReasoningEffort::Max
+        );
+        // A provider with no exact-route rule keeps the historic collapse.
+        assert_eq!(
+            normalize_auto_route_effort_for_provider(ApiProvider::Moonshot, ReasoningEffort::Low),
+            ReasoningEffort::High
+        );
+        assert_eq!(
+            normalize_auto_route_effort_for_provider(ApiProvider::Moonshot, ReasoningEffort::Auto),
+            ReasoningEffort::Auto
+        );
+        assert_eq!(
+            normalize_auto_route_effort_for_provider(ApiProvider::Moonshot, ReasoningEffort::Max),
+            ReasoningEffort::Max
+        );
+        // Codex keeps its provider-level mapping (off -> low, auto -> medium).
         assert_eq!(
             normalize_auto_route_effort_for_provider(
                 ApiProvider::OpenaiCodex,
@@ -2102,27 +1986,35 @@ mod tests {
             ..Default::default()
         };
 
-        let route =
-            resolve_auto_route_with_inventory(&config, "quick status check", "", "auto", "auto")
+        // #6290 rework: without the flash classifier there is no
+        // per-request signal, so every wording resolves the same declared
+        // default — the short chat and the complex ask below must agree.
+        for prompt in [
+            "quick status check",
+            "please refactor this architecture and audit its security boundaries",
+        ] {
+            let route = resolve_auto_route_with_inventory(&config, prompt, "", "auto", "auto")
                 .await
                 .expect("inventory route should resolve with authenticated active provider");
 
-        assert_eq!(route.provider, ApiProvider::Zai);
-        assert_eq!(route.model, crate::config::ZAI_GLM_5_3_FLASH_MODEL);
-        assert_eq!(route.source, AutoRouteSource::Heuristic);
-        let receipt = route.receipt.expect("Auto route receipt");
-        assert_eq!(receipt.tier, AutoRouteTier::Fast);
-        assert_eq!(receipt.scope, AutoRouteScope::ResolvedProvider);
-        assert_eq!(receipt.data_path, AutoRouteDataPath::LocalHeuristic);
-        assert_eq!(
-            receipt.reason,
-            AutoRouteReason::LocalHeuristic(AutoRouteHeuristicReason::ShortRequest)
-        );
-        assert_eq!(receipt.pair.strong, crate::config::DEFAULT_ZAI_MODEL);
-        assert_eq!(
-            receipt.pair.fast.as_deref(),
-            Some(crate::config::ZAI_GLM_5_3_FLASH_MODEL)
-        );
+            assert_eq!(route.provider, ApiProvider::Zai);
+            assert_eq!(route.model, crate::config::DEFAULT_ZAI_MODEL);
+            assert_eq!(route.source, AutoRouteSource::Heuristic);
+            let receipt = route.receipt.expect("Auto route receipt");
+            assert_eq!(receipt.tier, AutoRouteTier::Strong);
+            assert_eq!(receipt.scope, AutoRouteScope::ResolvedProvider);
+            assert_eq!(receipt.data_path, AutoRouteDataPath::LocalHeuristic);
+            assert_eq!(
+                receipt.reason,
+                AutoRouteReason::LocalFallback(AutoRouteHeuristicReason::DeclaredDefault),
+                "prompt {prompt:?} must take the declared default, not a content judgment"
+            );
+            assert_eq!(receipt.pair.strong, crate::config::DEFAULT_ZAI_MODEL);
+            assert_eq!(
+                receipt.pair.fast.as_deref(),
+                Some(crate::config::ZAI_GLM_5_3_FLASH_MODEL)
+            );
+        }
     }
 
     #[test]
@@ -2225,10 +2117,10 @@ mod tests {
 
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
-    async fn active_provider_strong_fast_selection_survives_scoping() {
-        // Same-provider tier selection is the behavior scoping must not
-        // break: a complex request still reaches the active provider's strong
-        // tier, a trivial one still reaches its fast tier (#4411).
+    async fn active_provider_declared_default_survives_scoping() {
+        // #4411: scoping keeps Auto on the active provider. #6290 rework:
+        // without the flash classifier there is no per-request tier signal,
+        // so both wordings resolve the same declared default on Zai.
         let _env_lock = crate::test_support::lock_test_env();
         let _deepseek = crate::test_support::EnvVarGuard::remove("DEEPSEEK_API_KEY");
         let _zai = crate::test_support::EnvVarGuard::set("ZAI_API_KEY", "zai-key");
@@ -2237,30 +2129,24 @@ mod tests {
             ..Default::default()
         };
 
-        let strong = resolve_auto_route_with_inventory(
-            &config,
+        for prompt in [
             "refactor the routing module and audit its security boundaries",
-            "",
-            "auto",
-            "auto",
-        )
-        .await
-        .expect("strong-tier route");
-        assert_eq!(strong.provider, ApiProvider::Zai);
-        assert_eq!(strong.model, crate::config::DEFAULT_ZAI_MODEL);
-        let strong_receipt = strong.receipt.expect("strong receipt");
-        assert_eq!(strong_receipt.tier, AutoRouteTier::Strong);
-        assert_eq!(strong_receipt.scope, AutoRouteScope::ResolvedProvider);
-
-        let fast = resolve_auto_route_with_inventory(&config, "hi", "", "auto", "auto")
-            .await
-            .expect("fast-tier route");
-        assert_eq!(fast.provider, ApiProvider::Zai);
-        assert_eq!(fast.model, crate::config::ZAI_GLM_5_3_FLASH_MODEL);
-        assert_eq!(
-            fast.receipt.expect("fast receipt").tier,
-            AutoRouteTier::Fast
-        );
+            "hi",
+        ] {
+            let route = resolve_auto_route_with_inventory(&config, prompt, "", "auto", "auto")
+                .await
+                .expect("scoped Auto route");
+            assert_eq!(route.provider, ApiProvider::Zai);
+            assert_eq!(route.model, crate::config::DEFAULT_ZAI_MODEL);
+            let receipt = route.receipt.expect("scoped receipt");
+            assert_eq!(receipt.tier, AutoRouteTier::Strong);
+            assert_eq!(receipt.scope, AutoRouteScope::ResolvedProvider);
+            assert_eq!(
+                receipt.reason,
+                AutoRouteReason::LocalFallback(AutoRouteHeuristicReason::DeclaredDefault),
+                "prompt {prompt:?}"
+            );
+        }
     }
 
     #[test]
@@ -2319,9 +2205,9 @@ mod tests {
             ..Default::default()
         };
         let inventory = ModelInventory::from_config(&config);
-        let heuristic = auto_route_from_inventory_heuristic(&config, "quick status", &inventory);
+        let fallback = auto_route_declared_fallback(&config, &inventory);
 
-        let route = auto_route_classifier_fallback(heuristic, &inventory);
+        let route = auto_route_classifier_fallback(fallback, &inventory);
 
         assert_eq!(route.source, AutoRouteSource::Heuristic);
         let receipt = route.receipt.expect("fallback receipt");
@@ -2335,9 +2221,29 @@ mod tests {
         ));
         assert_eq!(
             receipt.reason,
-            AutoRouteReason::ClassifierFallback(AutoRouteHeuristicReason::ShortRequest)
+            AutoRouteReason::ClassifierFallback(AutoRouteHeuristicReason::DeclaredDefault)
         );
         assert!(!receipt.reason.label().contains("secret-provider-error"));
+    }
+
+    #[test]
+    fn pre_rework_receipt_shape_still_deserializes() {
+        // Sessions saved before the #6290 rework persist
+        // `local_heuristic` + content-derived reasons. They must keep
+        // loading: the wrapper arrives via serde alias, the legacy reasons
+        // are retained variants.
+        let reason: AutoRouteReason =
+            serde_json::from_str(r#"{"local_heuristic":"complex_request"}"#)
+                .expect("pre-rework receipt reason deserializes");
+        assert_eq!(
+            reason,
+            AutoRouteReason::LocalFallback(AutoRouteHeuristicReason::ComplexRequest)
+        );
+        let receipt: AutoRouteReceipt = serde_json::from_str(
+            r#"{"tier":"fast","pair":{"strong":"GLM-5.3","fast":"GLM-5.3-Flash"},"scope":"resolved_provider","data_path":"local_heuristic","reason":{"local_heuristic":"short_request"}}"#,
+        )
+        .expect("pre-rework receipt deserializes");
+        assert_eq!(receipt.reason.label(), "local fallback: short request");
     }
 
     #[tokio::test]
@@ -2345,7 +2251,7 @@ mod tests {
     async fn inventory_auto_route_never_falls_back_across_providers_by_default() {
         // #4411: the active provider has no usable credential, but another
         // provider does. Auto must stay on the active provider and report a
-        // no-runnable-candidate heuristic instead of silently spending the
+        // no-runnable-candidate fallback instead of silently spending the
         // other provider's key.
         let _env_lock = crate::test_support::lock_test_env();
         let _deepseek = crate::test_support::EnvVarGuard::set("DEEPSEEK_API_KEY", "ds-key");
@@ -2367,7 +2273,7 @@ mod tests {
         assert_eq!(receipt.scope, AutoRouteScope::ResolvedProvider);
         assert_eq!(
             receipt.reason,
-            AutoRouteReason::LocalHeuristic(AutoRouteHeuristicReason::NoRunnableCandidate)
+            AutoRouteReason::LocalFallback(AutoRouteHeuristicReason::NoRunnableCandidate)
         );
     }
 
@@ -2395,13 +2301,13 @@ mod tests {
                 .expect("opted-in route should fall back to an authenticated provider");
 
         assert_eq!(route.provider, ApiProvider::Deepseek);
-        assert_eq!(route.model, "deepseek-v4-flash");
+        assert_eq!(route.model, "deepseek-flash");
         assert_eq!(route.source, AutoRouteSource::Heuristic);
     }
 
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
-    async fn inventory_auto_route_cost_saving_changes_borderline_zai_route() {
+    async fn inventory_auto_route_cost_saving_pins_fast_sibling() {
         let _env_lock = crate::test_support::lock_test_env();
         let _deepseek = crate::test_support::EnvVarGuard::remove("DEEPSEEK_API_KEY");
         let _zai = crate::test_support::EnvVarGuard::set("ZAI_API_KEY", "zai-key");
@@ -2452,7 +2358,7 @@ mod tests {
                 .map(|receipt| (receipt.tier, receipt.reason)),
             Some((
                 AutoRouteTier::Strong,
-                AutoRouteReason::LocalHeuristic(AutoRouteHeuristicReason::ComplexRequest),
+                AutoRouteReason::LocalFallback(AutoRouteHeuristicReason::DeclaredDefault),
             ))
         );
         assert_eq!(
@@ -2462,7 +2368,7 @@ mod tests {
                 .map(|receipt| (receipt.tier, receipt.reason)),
             Some((
                 AutoRouteTier::Fast,
-                AutoRouteReason::LocalHeuristic(AutoRouteHeuristicReason::CostSavingPolicy),
+                AutoRouteReason::LocalFallback(AutoRouteHeuristicReason::CostSavingPolicy),
             ))
         );
     }
@@ -2479,26 +2385,16 @@ mod tests {
             ..Default::default()
         };
 
-        let route =
-            resolve_auto_route_with_inventory(&config, "quick status check", "", "auto", "auto")
+        // #6290 rework: no classifier, no content signal — both wordings
+        // take the declared Wanjie default.
+        for prompt in ["quick status check", "please refactor this architecture"] {
+            let route = resolve_auto_route_with_inventory(&config, prompt, "", "auto", "auto")
                 .await
-                .expect("heuristic-only Wanjie route should resolve");
-        assert_eq!(route.provider, ApiProvider::WanjieArk);
-        assert_eq!(route.model, "deepseek-v4-flash");
-        assert_eq!(route.source, AutoRouteSource::Heuristic);
-
-        let route = resolve_auto_route_with_inventory(
-            &config,
-            "please refactor this architecture",
-            "",
-            "auto",
-            "auto",
-        )
-        .await
-        .expect("complex Wanjie route should resolve");
-        assert_eq!(route.provider, ApiProvider::WanjieArk);
-        assert_eq!(route.model, "deepseek-v4-pro");
-        assert_eq!(route.source, AutoRouteSource::Heuristic);
+                .expect("declared-default Wanjie route should resolve");
+            assert_eq!(route.provider, ApiProvider::WanjieArk);
+            assert_eq!(route.model, "deepseek-reasoner");
+            assert_eq!(route.source, AutoRouteSource::Heuristic);
+        }
     }
 
     #[tokio::test]
@@ -2514,82 +2410,16 @@ mod tests {
             ..Default::default()
         };
 
-        let route =
-            resolve_auto_route_with_inventory(&config, "quick status check", "", "auto", "auto")
+        // #6290 rework: no classifier, no content signal — both wordings
+        // take the declared Volcengine default.
+        for prompt in ["quick status check", "please refactor this architecture"] {
+            let route = resolve_auto_route_with_inventory(&config, prompt, "", "auto", "auto")
                 .await
-                .expect("heuristic-only Volcengine route should resolve");
-        assert_eq!(route.provider, ApiProvider::Volcengine);
-        assert_eq!(route.model, "DeepSeek-V4-Flash");
-        assert_eq!(route.source, AutoRouteSource::Heuristic);
-
-        let route = resolve_auto_route_with_inventory(
-            &config,
-            "please refactor this architecture",
-            "",
-            "auto",
-            "auto",
-        )
-        .await
-        .expect("complex Volcengine route should resolve");
-        assert_eq!(route.provider, ApiProvider::Volcengine);
-        assert_eq!(route.model, "DeepSeek-V4-Pro");
-        assert_eq!(route.source, AutoRouteSource::Heuristic);
-    }
-
-    #[test]
-    fn auto_heuristic_default_routes_implement_to_pro() {
-        assert_eq!(
-            auto_model_heuristic_with_bias("Please implement a binary search", "auto", false),
-            "deepseek-v4-pro"
-        );
-    }
-
-    #[test]
-    fn auto_heuristic_cost_saving_keeps_borderline_keywords_on_flash() {
-        assert_eq!(
-            auto_model_heuristic_with_bias("Please implement a binary search", "auto", true),
-            "deepseek-v4-flash"
-        );
-        assert_eq!(
-            auto_model_heuristic_with_bias("analyze this snippet", "auto", true),
-            "deepseek-v4-flash"
-        );
-    }
-
-    #[test]
-    fn auto_heuristic_strong_keywords_still_route_to_pro_under_cost_saving() {
-        for kw in [
-            "refactor",
-            "architecture",
-            "design",
-            "debug",
-            "security",
-            "review",
-            "audit",
-            "migrate",
-            "optimize",
-            "rewrite",
-        ] {
-            let req = format!("Please {kw} this module");
-            assert_eq!(
-                auto_model_heuristic_with_bias(&req, "auto", true),
-                "deepseek-v4-pro",
-                "expected Pro for strong keyword `{kw}` even in cost-saving mode"
-            );
+                .expect("declared-default Volcengine route should resolve");
+            assert_eq!(route.provider, ApiProvider::Volcengine);
+            assert_eq!(route.model, "deepseek-v4-pro");
+            assert_eq!(route.source, AutoRouteSource::Heuristic);
         }
-    }
-
-    #[test]
-    fn auto_heuristic_cost_saving_raises_long_message_threshold() {
-        let body = "filler sentence. ".repeat(40);
-        assert_eq!(
-            auto_model_heuristic_with_bias(&body, "auto", false),
-            "deepseek-v4-pro"
-        );
-        assert_eq!(
-            auto_model_heuristic_with_bias(&body, "auto", true),
-            "deepseek-v4-flash"
-        );
     }
 
     #[test]
@@ -2714,28 +2544,28 @@ mod tests {
         }
     }
 
-    #[test]
-    fn heuristic_without_cheap_tier_always_returns_current_model() {
-        // #3018 AC: Ollama + auto must never fabricate a DeepSeek id.
-        let candidates = RouterCandidates {
-            big: "qwen3:32b".to_string(),
-            cheap: None,
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn declared_fallback_without_cheap_tier_stays_on_default_model() {
+        // #3018 AC: Ollama + auto must never fabricate a DeepSeek id. The
+        // declared fallback returns the configured default verbatim, so no
+        // sibling id can be invented regardless of request wording.
+        let _env_lock = crate::test_support::lock_test_env();
+        let config = Config {
+            provider: Some("ollama".to_string()),
+            ..Default::default()
         };
-        for cost_saving in [false, true] {
-            for prompt in [
-                "hi",
-                "please refactor the auth module for security",
-                &"long filler sentence. ".repeat(60),
-            ] {
-                let model = auto_model_heuristic_with_bias_for_candidates(
-                    prompt,
-                    "qwen3:32b",
-                    cost_saving,
-                    &candidates,
-                )
-                .model;
-                assert_eq!(model, "qwen3:32b", "prompt {prompt:?}");
-            }
+        for prompt in ["hi", "please refactor the auth module for security"] {
+            let route = resolve_auto_route_with_inventory(&config, prompt, "", "auto", "auto")
+                .await
+                .expect("ollama Auto route should resolve");
+            assert_eq!(route.provider, ApiProvider::Ollama);
+            assert_eq!(route.model, config.default_model());
+            assert!(
+                !route.model.to_ascii_lowercase().contains("deepseek"),
+                "no DeepSeek id may be fabricated: {}",
+                route.model
+            );
         }
     }
 

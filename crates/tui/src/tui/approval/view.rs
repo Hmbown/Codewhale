@@ -98,7 +98,7 @@ pub struct ApprovalView {
     pub(super) row_hitboxes: RefCell<Vec<Rect>>,
     locale: Locale,
     pub(super) timeout: Option<Duration>,
-    requested_at: Instant,
+    pub(super) requested_at: Instant,
     /// Whether the approval card is collapsed to a single-line banner.
     pub(crate) collapsed: bool,
 }
@@ -138,6 +138,16 @@ impl ApprovalView {
             requested_at: Instant::now(),
             collapsed: false,
         }
+    }
+
+    /// Bound how long this card may wait (#6101). `Some(timeout)` resolves
+    /// the card to **deny** once the duration elapses (fail-closed); `None`
+    /// waits indefinitely. A zero duration is treated as `None` so the
+    /// config convention (`0` = wait forever) holds at this layer too.
+    #[must_use]
+    pub fn with_timeout(mut self, timeout: Option<Duration>) -> Self {
+        self.timeout = timeout.filter(|timeout| !timeout.is_zero());
+        self
     }
 
     pub(super) fn select_prev(&mut self) {

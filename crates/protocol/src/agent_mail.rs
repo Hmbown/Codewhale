@@ -21,6 +21,7 @@ pub const AGENT_MAIL_EVENT_DELIVERING: &str = "agent_mail.delivering";
 pub const AGENT_MAIL_EVENT_DELIVERED: &str = "agent_mail.delivered";
 pub const AGENT_MAIL_EVENT_READ: &str = "agent_mail.read";
 pub const AGENT_MAIL_EVENT_DELIVERY_FAILED: &str = "agent_mail.delivery_failed";
+pub const AGENT_MAIL_EVENT_CANCELED: &str = "agent_mail.canceled";
 
 pub const MAX_AGENT_MAIL_MESSAGE_ID_BYTES: usize = 80;
 pub const MAX_AGENT_MAIL_OPAQUE_ID_BYTES: usize = 128;
@@ -223,6 +224,9 @@ pub enum AgentMailStatus {
     Delivered,
     Read,
     Failed,
+    /// Explicitly withdrawn while queued (#6176). Terminal: delivery and the
+    /// wake pump never claim it, and re-cancel is an idempotent no-op.
+    Canceled,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -337,6 +341,19 @@ impl AgentMailEnvelope {
             }
             AgentMailStatus::Delivered => self.validate_delivered(false)?,
             AgentMailStatus::Read => self.validate_delivered(true)?,
+            AgentMailStatus::Canceled => {
+                // Canceled mail never started delivery: same absences as
+                // queued. Attempts stay 0 — cancel is only accepted while
+                // queued, before any delivery claim.
+                require_absent(self.delivered_at.is_some(), "delivered_at", "canceled")?;
+                require_absent(self.read_at.is_some(), "read_at", "canceled")?;
+                require_absent(self.failure.is_some(), "failure", "canceled")?;
+                require_absent(
+                    self.delivery_turn_id.is_some(),
+                    "delivery_turn_id",
+                    "canceled",
+                )?;
+            }
             AgentMailStatus::Failed => {
                 if self.attempt_count == 0 {
                     return Err(AgentMailValidationError::new(
@@ -717,6 +734,16 @@ mod tests {
         assert!(envelope.validate().is_err());
         envelope.read_at = envelope.delivered_at;
         assert!(envelope.validate().is_ok());
+    }
+
+    #[test]
+    fn canceled_envelope_validates_without_delivery_fields() {
+        let mut envelope = queued_envelope();
+        envelope.status = AgentMailStatus::Canceled;
+        assert!(envelope.validate().is_ok());
+        envelope.delivery_turn_id = Some("turn_1".into());
+        assert!(envelope.validate().is_err());
+        assert_eq!(AGENT_MAIL_EVENT_CANCELED, "agent_mail.canceled");
     }
 
     #[test]

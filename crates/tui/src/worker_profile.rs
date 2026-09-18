@@ -120,6 +120,215 @@ pub enum ToolScope {
     Explicit(Vec<String>),
 }
 
+/// File-system authority axis of a [`ChildGrant`]. Ordered least to most
+/// permissive so `Ord::min` is the non-escalation primitive.
+///
+/// `None` is not "no writes" — it is "no file access of any kind", which is
+/// what a child with an empty tool surface experiences. `Read` permits
+/// evidence collection only; `Write` permits mutation inside the session's
+/// write policy (workspace boundary, exact-file claims, approval posture).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum FileGrant {
+    None,
+    Read,
+    Write,
+}
+
+/// Process authority axis of a [`ChildGrant`]. Ordered least to most
+/// permissive so `Ord::min` is the non-escalation primitive.
+///
+/// `Inspect` is the read-only shell: canonical `bash` only, and only calls
+/// the agent read-only classifier proves mutation-free (the explore /
+/// reviewer / planner posture). `Verify` is the bounded built-in verification
+/// surface — default workspace checks, pure test selection, and bounded Git
+/// fetch/merge-tree — with no shell grammar (the test/verifier posture). A
+/// child asking for a surface its parent does not hold degrades to the
+/// narrower side (`Inspect ∩ Verify = Inspect`): bounded inspection is a
+/// subset of bounded process authority, never a widening.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ShellGrant {
+    None,
+    Inspect,
+    Verify,
+    Full,
+}
+
+/// The named tool surface a grant exposes, before the explicit scope narrows
+/// it. This is the role-preset axis of `tools` — distinct from
+/// [`ChildGrant::scope`], which is the caller's own allowlist.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolSurface {
+    /// Every registered tool the grant's other axes admit.
+    Inherited,
+    /// The read-only evidence surface — `readonly_evidence_tool` plus
+    /// `agent` (delegation). The explore / reviewer preset.
+    Evidence,
+}
+
+/// The single authority object a delegated child runs under (#5633).
+///
+/// Roles are *presets over this object*, never a second permission system:
+/// [`ChildGrant::for_role`] gives the widest grant a role can hold, and
+/// [`ChildGrant::resolve`] intersects it with the effective parent-derived
+/// profile and the caller's explicit scope. One projection serves every
+/// consumer — the child's tool catalog, its dispatch refusals, and its
+/// capability envelope all read the same fields, so a tool that is visible
+/// is callable and a tool that is denied never appears.
+///
+/// This is deliberately a *projection*, not a second persisted record:
+/// [`WorkerRuntimeProfile`] remains the wire/persistence shape and
+/// [`ChildAuthority`](crate::fleet::role::ChildAuthority) /
+/// [`ToolAuthorityEnvelope`](crate::tools::spec::ToolAuthorityEnvelope)
+/// remain the transports that carry the same authority across the durable
+/// Fleet and `codewhale exec` subprocess boundaries. What this object retires
+/// is the *semantic* duplication — posture sentinel entries read back off a
+/// deny list, and role-keyed re-derivation inside the registry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChildGrant {
+    /// File-system authority.
+    pub files: FileGrant,
+    /// Process authority.
+    pub shell: ShellGrant,
+    /// May reach the network through any surface.
+    pub network: bool,
+    /// May drive the operator's machine (computer-use / desktop tools).
+    /// Children never hold this today; the field is declared so every
+    /// surface reports the same denial rather than implying a grant.
+    pub desktop: bool,
+    /// The named tool surface before explicit scope narrowing.
+    pub surface: ToolSurface,
+    /// The caller's explicit allowlist, already intersected with the parent's
+    /// scope at spawn. `Some(vec![])` — the `tools = false` posture — permits
+    /// nothing at all.
+    pub scope: Option<Vec<String>>,
+    /// May delegate children of its own (remaining spawn depth).
+    pub spawn: bool,
+}
+
+impl ChildGrant {
+    /// The widest grant a role can ever hold — the role preset.
+    ///
+    /// This is the role-to-authority table, expressed once: everything else
+    /// only narrows it. Read-only roles stay read-only on the workspace by
+    /// intent; network reach is a read, and a worker cut off from it for no
+    /// role reason cannot do its job. `desktop` is never in any preset.
+    #[must_use]
+    pub fn for_role(role: &FleetRole) -> Self {
+        let (files, shell, surface) = match role {
+            // Read-only investigators: evidence collection only, with the
+            // classifier-bounded inspection shell.
+            FleetRole::Scout | FleetRole::Reviewer => {
+                (FileGrant::Read, ShellGrant::Inspect, ToolSurface::Evidence)
+            }
+            // Planner: analysis only, same bounded shell, broader read
+            // surface — a plan may consult any read the session offers.
+            FleetRole::Planner => (FileGrant::Read, ShellGrant::Inspect, ToolSurface::Inherited),
+            // Counsel only: reads to ground advice, never acts — no process
+            // surface at all (#4752).
+            FleetRole::Consultant => (FileGrant::Read, ShellGrant::None, ToolSurface::Inherited),
+            // Verifier: bounded workspace checks and bounded Git reference
+            // reads, no shell grammar.
+            FleetRole::Verifier => (FileGrant::Read, ShellGrant::Verify, ToolSurface::Inherited),
+            // Doers, and Custom: the preset asks for everything; the parent
+            // profile and explicit scope do all the narrowing.
+            FleetRole::Builder | FleetRole::Worker | FleetRole::Custom => {
+                (FileGrant::Write, ShellGrant::Full, ToolSurface::Inherited)
+            }
+        };
+        Self {
+            files,
+            shell,
+            network: true,
+            desktop: false,
+            surface,
+            scope: None,
+            spawn: true,
+        }
+    }
+
+    /// Resolve the grant a child actually runs under: the role preset
+    /// intersected with the effective parent-derived profile, carrying the
+    /// caller's explicit scope and the remaining delegation depth.
+    ///
+    /// Every field takes the more restrictive side, so the result can never
+    /// name authority the parent lacked. This is the in-process counterpart
+    /// of [`crate::fleet::role::ChildAuthority::clamp`].
+    #[must_use]
+    pub fn resolve(
+        role: &FleetRole,
+        profile: &WorkerRuntimeProfile,
+        scope: Option<Vec<String>>,
+        can_spawn: bool,
+    ) -> Self {
+        let preset = Self::for_role(role);
+        let profile_shell = match profile.shell {
+            ShellPolicy::None => ShellGrant::None,
+            ShellPolicy::ReadOnly => ShellGrant::Inspect,
+            ShellPolicy::Full => ShellGrant::Full,
+        };
+        // The posture deny lists are the transport the ceiling clamps install;
+        // the grant folds their sentinels into the semantic axes so the two
+        // can never disagree. `fetch_url` stands for "no network"; `run_tests`
+        // stands for "no shell authority at all" — it removes process-start
+        // grants (`Verify`/`Full` → `None`) while `Inspect` survives, because
+        // classifier-bounded evidence reads were never shell authority.
+        // `exec_shell` (raw shell gone) is deliberately *not* folded: a
+        // write-denied verifier installs it while keeping shell authority.
+        let denied = |name: &str| {
+            crate::core::engine::tool_catalog::tool_denied(
+                Some(profile.denied_tools.as_slice()),
+                name,
+            )
+        };
+        let resolved_shell = preset.shell.min(profile_shell);
+        let shell = if denied(crate::fleet::role::SHELL_AUTHORITY_SENTINEL) {
+            match resolved_shell {
+                ShellGrant::Inspect => ShellGrant::Inspect,
+                _ => ShellGrant::None,
+            }
+        } else {
+            resolved_shell
+        };
+        let no_tools = matches!(scope.as_deref(), Some([]));
+        Self {
+            files: if no_tools {
+                FileGrant::None
+            } else {
+                preset.files.min(if profile.permissions.write {
+                    FileGrant::Write
+                } else {
+                    FileGrant::Read
+                })
+            },
+            shell,
+            network: preset.network
+                && profile.permissions.network
+                && !denied(crate::fleet::role::NETWORK_DENIAL_SENTINEL),
+            desktop: false,
+            surface: preset.surface,
+            scope,
+            spawn: can_spawn,
+        }
+    }
+
+    /// The transport shell policy the registered surface and `BashTool`
+    /// enforce for this grant.
+    ///
+    /// `Verify` maps to `ShellPolicy::Full`: the bounded verification surface
+    /// is a process-start authority the profile transports as Full, while the
+    /// grant itself — not the transport — decides that raw shell names never
+    /// reach the catalog. Keeping the transport at Full also preserves the
+    /// ceiling a verifier may pass to its own children.
+    #[must_use]
+    pub const fn shell_policy(&self) -> ShellPolicy {
+        match self.shell {
+            ShellGrant::None => ShellPolicy::None,
+            ShellGrant::Inspect => ShellPolicy::ReadOnly,
+            ShellGrant::Verify | ShellGrant::Full => ShellPolicy::Full,
+        }
+    }
+}
+
 /// How a worker's model is selected. New model-facing spawns default to the
 /// parent/session model; a child only takes a smaller/faster family sibling when
 /// the parent explicitly asks for that route.
@@ -161,10 +370,18 @@ pub struct WorkerRuntimeProfile {
     /// false` input remains accepted but cannot remove this ceiling.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub denied_tools: Vec<String>,
-    /// Remaining nested-delegation budget. A worker may spawn children while
-    /// `max_spawn_depth > 0`; each level decrements it. Clamped to the workspace
-    /// ceiling.
+    /// Absolute recursion ceiling. Older profiles stored a remaining allowance;
+    /// interpreting that smaller value as absolute fails closed on recovery.
+    /// `spawn_depth` records this worker's position on the same axis.
     pub max_spawn_depth: u32,
+    #[serde(default)]
+    pub spawn_depth: u32,
+    /// Whole-run wall time, including queued, model and tool work.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wall_time_secs: Option<u64>,
+    /// Persisted wall-clock deadline; continuations cannot restart the clock.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wall_deadline_ms: Option<u64>,
     /// Optional model-turn cap. Zero means unbounded, matching the normal
     /// Codex and GrokBuild agent loop; an operator may still set a cap.
     #[serde(default = "default_general_max_steps")]
@@ -249,6 +466,9 @@ impl WorkerRuntimeProfile {
             reasoning_effort: matches!(role, FleetRole::Consultant).then(|| "high".to_string()),
             denied_tools: Vec::new(),
             max_spawn_depth: codewhale_config::DEFAULT_SPAWN_DEPTH,
+            spawn_depth: 0,
+            wall_time_secs: None,
+            wall_deadline_ms: None,
             max_steps: Self::default_max_steps(role.clone()),
             background: true,
         }
@@ -295,11 +515,11 @@ impl WorkerRuntimeProfile {
             // Parent inherits the full surface → the child's request stands.
             (ToolScope::Inherit, child) => child.clone(),
         };
-        // The child gets at most one level less budget than the parent, and never
-        // more than it requested, clamped to the hard ceiling.
+        // Depth stays absolute; only the current position increments. Every
+        // authority projection compares the position against this same ceiling.
         let max_spawn_depth = requested
             .max_spawn_depth
-            .min(self.max_spawn_depth.saturating_sub(1))
+            .min(self.max_spawn_depth)
             .min(codewhale_config::MAX_SPAWN_DEPTH_CEILING);
         WorkerRuntimeProfile {
             role: requested.role.clone(),
@@ -314,16 +534,47 @@ impl WorkerRuntimeProfile {
                 .or_else(|| self.reasoning_effort.clone()),
             denied_tools,
             max_spawn_depth,
-            max_steps: requested.max_steps,
+            spawn_depth: self.spawn_depth.saturating_add(1),
+            wall_time_secs: narrow_optional_limit(self.wall_time_secs, requested.wall_time_secs),
+            wall_deadline_ms: narrow_optional_limit(
+                self.wall_deadline_ms,
+                requested.wall_deadline_ms,
+            ),
+            max_steps: narrow_model_steps(self.max_steps, requested.max_steps),
             background: requested.background,
         }
     }
 
-    /// Whether this worker may still spawn a child (budget remaining).
+    /// Remaining generations, projected from the one absolute ceiling.
+    #[must_use]
+    pub fn remaining_spawn_depth(&self) -> u32 {
+        self.max_spawn_depth.saturating_sub(self.spawn_depth)
+    }
+
     #[must_use]
     pub fn can_spawn_child(&self) -> bool {
-        self.max_spawn_depth > 0
+        self.spawn_depth < self.max_spawn_depth
     }
+}
+
+/// Omission inherits; neither a child request nor a replay can widen a cap.
+pub(crate) fn narrow_optional_limit<T: Ord>(
+    inherited: Option<T>,
+    requested: Option<T>,
+) -> Option<T> {
+    match (inherited, requested) {
+        (Some(inherited), Some(requested)) => Some(inherited.min(requested)),
+        (inherited, requested) => inherited.or(requested),
+    }
+}
+
+/// Zero is the operator/internal unbounded sentinel, never a widening request.
+pub(crate) fn narrow_model_steps(inherited: u32, requested: u32) -> u32 {
+    narrow_optional_limit(
+        (inherited > 0).then_some(inherited),
+        (requested > 0).then_some(requested),
+    )
+    .unwrap_or(0)
 }
 
 const fn default_general_max_steps() -> u32 {
@@ -356,7 +607,8 @@ pub struct ChildLaunchManifest {
     pub coordination_contracts: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_artifact: Option<String>,
-    pub token_budget: Option<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deliverables: Vec<String>,
     pub resume_identity: Option<String>,
     #[serde(default)]
     pub generation: u32,
@@ -540,22 +792,24 @@ mod tests {
     }
 
     #[test]
-    fn spawn_depth_decrements_and_clamps() {
+    fn absolute_spawn_depth_is_preserved_and_position_increments() {
         let mut parent = WorkerRuntimeProfile::for_role(FleetRole::Worker);
         parent.max_spawn_depth = 2;
         let mut requested = WorkerRuntimeProfile::for_role(FleetRole::Worker);
         requested.max_spawn_depth = 99; // tries to grab more than the parent has
         let child = parent.derive_child(&requested);
         assert_eq!(
-            child.max_spawn_depth, 1,
-            "child budget is at most parent-1, never the requested 99"
+            child.max_spawn_depth, 2,
+            "the absolute ceiling is unchanged, never the requested 99"
         );
+        assert_eq!(child.spawn_depth, 1);
         assert!(child.can_spawn_child());
 
         let mut leaf_parent = WorkerRuntimeProfile::for_role(FleetRole::Worker);
         leaf_parent.max_spawn_depth = 1;
         let grandchild = leaf_parent.derive_child(&requested);
-        assert_eq!(grandchild.max_spawn_depth, 0);
+        assert_eq!(grandchild.max_spawn_depth, 1);
+        assert_eq!(grandchild.spawn_depth, 1);
         assert!(
             !grandchild.can_spawn_child(),
             "budget exhausted at the leaf"

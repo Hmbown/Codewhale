@@ -242,7 +242,6 @@ impl EffectiveRouteEnvelope {
     pub fn audit(&self, usage: &Usage) -> TurnCostAudit {
         let reviewed_custom_metered = crate::pricing::reviewed_custom_route_is_metered(
             self.provider,
-            Some(&self.provider_identity),
             self.endpoint_fingerprint.as_deref(),
         );
         let declared_estimate = self.provider_live_pricing.as_ref().is_some_and(|quote| {
@@ -2362,10 +2361,11 @@ mod tests {
         let now = Utc::now();
         let fetched_at = u64::try_from(now.timestamp()).expect("nonnegative timestamp");
         let model = "synthetic-baseten-priced-model";
-        let fingerprint =
-            codewhale_config::catalog::base_url_fingerprint(codewhale_config::BASETEN_BASE_URL);
+        let fingerprint = codewhale_config::catalog::base_url_fingerprint(
+            codewhale_config::catalog::BASETEN_BASE_URL,
+        );
         crate::provider_catalog_live::record_success(priced_provider_delta(
-            codewhale_config::BASETEN_TEMPLATE_ID,
+            codewhale_config::catalog::BASETEN_PROVIDER_ID,
             model,
             &fingerprint,
             fetched_at,
@@ -2376,7 +2376,7 @@ mod tests {
         };
 
         let exact = custom_usage_envelope(
-            codewhale_config::BASETEN_TEMPLATE_ID,
+            codewhale_config::catalog::BASETEN_PROVIDER_ID,
             model,
             &fingerprint,
             RouteBillingMode::Unknown,
@@ -2419,15 +2419,18 @@ mod tests {
         )
         .audit(&usage);
         assert!(!generic.is_priced(), "{generic:?}");
+        // The endpoint fingerprint establishes Baseten's billing contract no
+        // matter the table name, so the failure is an unverified price for
+        // this identity — not an unknown basis (#6289).
         assert_eq!(
             generic.unpriced_reason,
-            Some(crate::pricing::UnpricedReason::UnknownBillingBasis)
+            Some(crate::pricing::UnpricedReason::UnverifiedLivePricing)
         );
 
         let wrong_fingerprint =
             codewhale_config::catalog::base_url_fingerprint("https://proxy.example/v1");
         let wrong_endpoint = custom_usage_envelope(
-            codewhale_config::BASETEN_TEMPLATE_ID,
+            codewhale_config::catalog::BASETEN_PROVIDER_ID,
             model,
             &wrong_fingerprint,
             RouteBillingMode::Metered,
@@ -2454,10 +2457,11 @@ mod tests {
         let now = Utc::now();
         let now_unix = u64::try_from(now.timestamp()).expect("nonnegative timestamp");
         let model = "synthetic-baseten-status-model";
-        let fingerprint =
-            codewhale_config::catalog::base_url_fingerprint(codewhale_config::BASETEN_BASE_URL);
+        let fingerprint = codewhale_config::catalog::base_url_fingerprint(
+            codewhale_config::catalog::BASETEN_BASE_URL,
+        );
         let unknown_route = custom_usage_envelope(
-            codewhale_config::BASETEN_TEMPLATE_ID,
+            codewhale_config::catalog::BASETEN_PROVIDER_ID,
             model,
             &fingerprint,
             RouteBillingMode::Unknown,
@@ -2488,13 +2492,13 @@ mod tests {
             .saturating_sub(crate::provider_catalog_live::DEFAULT_PROVIDER_CATALOG_TTL_SECS)
             .saturating_sub(1);
         crate::provider_catalog_live::record_success(priced_provider_delta(
-            codewhale_config::BASETEN_TEMPLATE_ID,
+            codewhale_config::catalog::BASETEN_PROVIDER_ID,
             model,
             &fingerprint,
             stale_at,
         ));
         let stale_route = custom_usage_envelope(
-            codewhale_config::BASETEN_TEMPLATE_ID,
+            codewhale_config::catalog::BASETEN_PROVIDER_ID,
             model,
             &fingerprint,
             RouteBillingMode::Unknown,
@@ -2509,18 +2513,18 @@ mod tests {
         );
 
         crate::provider_catalog_live::record_success(priced_provider_delta(
-            codewhale_config::BASETEN_TEMPLATE_ID,
+            codewhale_config::catalog::BASETEN_PROVIDER_ID,
             model,
             &fingerprint,
             now_unix,
         ));
         crate::provider_catalog_live::record_failure(
-            codewhale_config::BASETEN_TEMPLATE_ID,
+            codewhale_config::catalog::BASETEN_PROVIDER_ID,
             &fingerprint,
             codewhale_config::catalog::CatalogRefreshError::Network,
         );
         let failed_route = custom_usage_envelope(
-            codewhale_config::BASETEN_TEMPLATE_ID,
+            codewhale_config::catalog::BASETEN_PROVIDER_ID,
             model,
             &fingerprint,
             RouteBillingMode::Unknown,
@@ -2560,9 +2564,11 @@ mod tests {
             ),
             (
                 ApiProvider::Custom,
-                codewhale_config::BASETEN_TEMPLATE_ID,
+                codewhale_config::catalog::BASETEN_PROVIDER_ID,
                 "synthetic-baseten-frozen-price",
-                codewhale_config::catalog::base_url_fingerprint(codewhale_config::BASETEN_BASE_URL),
+                codewhale_config::catalog::base_url_fingerprint(
+                    codewhale_config::catalog::BASETEN_BASE_URL,
+                ),
                 crate::pricing::UNCLASSIFIED_BILLING_SURFACE,
                 RouteBillingMode::Unknown,
             ),
@@ -2631,7 +2637,11 @@ mod tests {
             if provider == ApiProvider::Custom {
                 // Baseten's same URL can represent another account after a key
                 // switch. Starting that refresh clears the mutable old scope.
-                let _new_key_refresh = crate::provider_catalog_live::begin_refresh(identity);
+                let _new_key_refresh = crate::provider_catalog_live::begin_refresh_for_identity(
+                    provider,
+                    identity,
+                    codewhale_config::catalog::BASETEN_BASE_URL,
+                );
             }
 
             let first_audit = first.audit(&usage);
@@ -2680,10 +2690,10 @@ mod tests {
                 now,
             ),
             custom_usage_envelope(
-                codewhale_config::BASETEN_TEMPLATE_ID,
+                codewhale_config::catalog::BASETEN_PROVIDER_ID,
                 "synthetic-baseten-legacy",
                 &codewhale_config::catalog::base_url_fingerprint(
-                    codewhale_config::BASETEN_BASE_URL,
+                    codewhale_config::catalog::BASETEN_BASE_URL,
                 ),
                 RouteBillingMode::Unknown,
                 now,
@@ -2806,9 +2816,11 @@ mod tests {
             ),
             (
                 ApiProvider::Custom,
-                codewhale_config::BASETEN_TEMPLATE_ID,
+                codewhale_config::catalog::BASETEN_PROVIDER_ID,
                 "synthetic-baseten-future",
-                codewhale_config::catalog::base_url_fingerprint(codewhale_config::BASETEN_BASE_URL),
+                codewhale_config::catalog::base_url_fingerprint(
+                    codewhale_config::catalog::BASETEN_BASE_URL,
+                ),
                 crate::pricing::UNCLASSIFIED_BILLING_SURFACE,
                 RouteBillingMode::Unknown,
             ),
@@ -2874,13 +2886,11 @@ mod tests {
 
             let mut wrong_identity = captured.clone();
             wrong_identity.provider_identity.push_str("-other");
+            // The endpoint fingerprint still establishes the billing contract,
+            // so a renamed identity fails quote verification (#6289).
             assert_eq!(
                 wrong_identity.audit(&usage).unpriced_reason,
-                Some(if provider == ApiProvider::Custom {
-                    crate::pricing::UnpricedReason::UnknownBillingBasis
-                } else {
-                    crate::pricing::UnpricedReason::UnverifiedLivePricing
-                })
+                Some(crate::pricing::UnpricedReason::UnverifiedLivePricing)
             );
 
             let mut wrong_endpoint = captured;
@@ -2911,16 +2921,17 @@ mod tests {
         let now = Utc::now();
         let fetched_at = u64::try_from(now.timestamp()).expect("nonnegative timestamp");
         let model = "synthetic-baseten-serialized-quote";
-        let fingerprint =
-            codewhale_config::catalog::base_url_fingerprint(codewhale_config::BASETEN_BASE_URL);
+        let fingerprint = codewhale_config::catalog::base_url_fingerprint(
+            codewhale_config::catalog::BASETEN_BASE_URL,
+        );
         crate::provider_catalog_live::record_success(priced_provider_delta(
-            codewhale_config::BASETEN_TEMPLATE_ID,
+            codewhale_config::catalog::BASETEN_PROVIDER_ID,
             model,
             &fingerprint,
             fetched_at,
         ));
         let route = custom_usage_envelope(
-            codewhale_config::BASETEN_TEMPLATE_ID,
+            codewhale_config::catalog::BASETEN_PROVIDER_ID,
             model,
             &fingerprint,
             RouteBillingMode::Unknown,
@@ -2932,7 +2943,11 @@ mod tests {
         assert!(serialized.contains("provider_live_pricing"));
         assert!(serialized.contains("catalog_revision"));
         assert!(serialized.contains("input_per_million"));
-        for secret in [codewhale_config::BASETEN_BASE_URL, "api_key", "Bearer "] {
+        for secret in [
+            codewhale_config::catalog::BASETEN_BASE_URL,
+            "api_key",
+            "Bearer ",
+        ] {
             // The assertion message must not itself become a logging sink for
             // the credential fragment it checks for — name the check, not the
             // secret.

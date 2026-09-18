@@ -288,6 +288,52 @@ pub trait WorkflowDriver: Send + Sync {
     fn progress(&self, event: ProgressEvent);
 }
 
+/// One `tools.call()` invocation: a tool name plus its JSON arguments.
+///
+/// Unlike [`TaskRequest`], this carries no identity, route, or authority
+/// fields. Authority comes from the host side alone: the invoker resolves the
+/// name against its own registry snapshot, enforces the parent turn's
+/// deny-lists and authority envelope, and applies the run profile's gates
+/// (read-only, auto-approve). A script can neither widen nor name its own
+/// ceiling.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ToolCallRequest {
+    /// Tool name as advertised by `tool_search` (e.g. `read`).
+    pub tool: String,
+    /// Arguments for the tool. Must be a JSON object.
+    pub input: serde_json::Value,
+}
+
+/// Terminal outcome of one `tools.call()`, as JSON the VM passes to JS.
+///
+/// A resolved call either ran clean (`ok: true`, `result` is the tool
+/// payload) or ran and failed (`ok: false`, `result` is the failure
+/// message). Gate refusals and seam breaks never arrive here — those are
+/// `Err`, so the VM can tell "nothing ran" (admission) from "work failed".
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ToolCallResponse {
+    /// True when the tool ran clean. False carries the failure message.
+    pub ok: bool,
+    /// Tool payload on success; failure message string on failure.
+    pub result: serde_json::Value,
+}
+
+/// Host-side executor for direct tool calls from a script.
+///
+/// This is the tool analogue of [`WorkflowDriver`]: where the driver launches
+/// another agent/model task, the invoker executes one ordinary tool and
+/// returns its result. The two must not be confused — in particular, an
+/// invoker must never implement a call by spawning a subagent.
+///
+/// Gate refusals (unknown tool, read-only violation, approval requirement,
+/// recursion) surface as [`DriverError::Rejected`]; a broken seam surfaces
+/// as [`DriverError::Unavailable`].
+#[async_trait]
+pub trait ToolInvoker: Send + Sync {
+    /// Execute one tool call and return its outcome.
+    async fn invoke(&self, request: ToolCallRequest) -> Result<ToolCallResponse, DriverError>;
+}
+
 /// Normalize and validate a Fleet profile token: trim, lowercase, then apply
 /// the same token rule as `crates/workflow`'s `validate_leaf_profile` —
 /// non-empty, no whitespace, and none of `"`, `'`, `` ` ``, `=`.

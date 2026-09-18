@@ -55,12 +55,12 @@ async fn engine_cancel_stops_started_foreground_descendants_and_preserves_backgr
         .unwrap();
     let task = tokio::spawn(engine.run());
     let mut op = external_user_message_op("Run the foreground fixture.", AppMode::Agent, &config);
-    if let Op::SendMessage {
+    if let Op::SendMessage(TurnSpec {
         trust_mode,
         auto_approve,
         approval_mode,
         ..
-    } = &mut op
+    }) = &mut op
     {
         *trust_mode = true;
         *auto_approve = true;

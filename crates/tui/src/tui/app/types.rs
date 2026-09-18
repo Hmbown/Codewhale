@@ -207,15 +207,11 @@ pub struct TuiOptions {
     pub use_bracketed_paste: bool,
     /// Maximum number of concurrent sub-agents.
     pub max_subagents: usize,
-    #[allow(dead_code)]
     pub skills_dir: PathBuf,
-    #[allow(dead_code)]
     pub memory_path: PathBuf,
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     pub notes_path: PathBuf,
-    #[allow(dead_code)]
     pub mcp_config_path: PathBuf,
-    #[allow(dead_code)]
     pub use_memory: bool,
     /// Start in agent mode (defaults to agent; --yolo starts in YOLO)
     pub start_in_agent_mode: bool,
@@ -288,6 +284,32 @@ pub struct QueuedMessage {
     pub history_echoed: bool,
 }
 
+/// A steer handed to the engine that the engine has not yet recorded.
+///
+/// Live-only, and deliberately not in `api_messages`: `EngineHandle::steer`
+/// succeeding means the channel took the text, not that a turn accepted it.
+/// The engine commits a steer at a step boundary and drops one whose turn has
+/// already moved on, so painting a settled transcript cell at send time
+/// produced a cell that could sit above the work it followed, or survive
+/// forever for a steer the model never saw (#6190). It becomes a real cell
+/// when the engine's own record shows it, and a "could not send" receipt when
+/// the turn ends without it.
+#[derive(Debug, Clone)]
+pub struct InflightSteer {
+    /// The composed message, carried so acceptance can paint the same cell
+    /// (including the queue-time echo it may already own).
+    pub message: QueuedMessage,
+    /// Exactly what was handed to `EngineHandle::steer`. The engine records
+    /// this as the first text block of the accepted user message, which is
+    /// what acceptance matches on.
+    pub content: String,
+    /// `api_messages.len()` when the steer was sent — the lower bound for the
+    /// acceptance search, so an identical earlier message cannot claim it.
+    pub sent_after_index: usize,
+    /// Held until acceptance knows the message index to anchor them to.
+    pub references: Vec<codewhale_core::ContextReference>,
+}
+
 /// Prefix for the bounded, tool-less model turn produced by `/workflow`.
 ///
 /// The marker travels with the queued message so a draft that waits behind an
@@ -308,7 +330,7 @@ pub enum SubmitDisposition {
     Steer,
     /// Park on `queued_messages` for dispatch after TurnComplete.
     /// Legacy path; #382 unified busy states under `Queue`.
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     QueueFollowUp,
 }
 
@@ -517,12 +539,6 @@ pub enum AppAction {
     },
     /// Open the named, keyless DS4 local-runtime preset for review and save.
     OpenDs4Setup,
-    /// Open a beginner provider setup template by catalog id (#5350).
-    OpenTemplateSetup {
-        template_id: String,
-    },
-    /// Open the beginner provider template list.
-    OpenProviderTemplateList,
     /// Run the xAI/Grok device-code flow with the TUI temporarily suspended.
     StartXaiDeviceLogin,
     /// Run native ChatGPT PKCE sign-in with the TUI temporarily suspended.

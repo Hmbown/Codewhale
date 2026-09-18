@@ -30,7 +30,10 @@ use crate::schema::{
     ReplyDecodeError, SCHEMA_REPAIR_MAX_ATTEMPTS, carried_raw, compile_schema, decode_reply,
     repair_prompt,
 };
-use crate::{PARALLEL_MAX_ITEMS, WORKFLOW_LIFETIME_CAP, normalize_profile};
+use crate::{
+    CODEMODE_MAX_TOOL_CALLS, PARALLEL_MAX_ITEMS, ToolCallRequest, ToolInvoker,
+    WORKFLOW_LIFETIME_CAP, normalize_profile,
+};
 
 const DEFAULT_VM_MEMORY_LIMIT_BYTES: usize = 32 * 1024 * 1024;
 const MIN_VM_MEMORY_LIMIT_BYTES: usize = 4 * 1024 * 1024;
@@ -175,6 +178,32 @@ impl WorkflowVm {
         driver: Arc<dyn WorkflowDriver>,
         cancel: WorkflowRunCancel,
     ) -> Result<serde_json::Value, WorkflowJsError> {
+        self.run_inner(source, args, driver, None, cancel).await
+    }
+
+    /// Run a code-mode script: the same VM, plus the `tools.call()` host
+    /// binding backed by `invoker`. Workflow runs (no invoker) never see the
+    /// binding, so the Workflow sandbox keeps its documented host surface.
+    pub async fn run_tools_script(
+        &self,
+        source: &str,
+        args: serde_json::Value,
+        driver: Arc<dyn WorkflowDriver>,
+        invoker: Arc<dyn ToolInvoker>,
+        cancel: WorkflowRunCancel,
+    ) -> Result<serde_json::Value, WorkflowJsError> {
+        self.run_inner(source, args, driver, Some(invoker), cancel)
+            .await
+    }
+
+    async fn run_inner(
+        &self,
+        source: &str,
+        args: serde_json::Value,
+        driver: Arc<dyn WorkflowDriver>,
+        invoker: Option<Arc<dyn ToolInvoker>>,
+        cancel: WorkflowRunCancel,
+    ) -> Result<serde_json::Value, WorkflowJsError> {
         let args_json = serde_json::to_string(&args)
             .map_err(|err| WorkflowJsError::InvalidArgs(err.to_string()))?;
         let cancel = cancel.0;
@@ -194,6 +223,7 @@ impl WorkflowVm {
         let source = source.to_string();
         let thread_driver = driver.clone();
         let thread_cancel = cancel.clone();
+        let thread_invoker = invoker.clone();
         let spawned = std::thread::Builder::new()
             .name("workflow-js-vm".to_string())
             .stack_size(vm_thread_stack_bytes())
@@ -204,6 +234,7 @@ impl WorkflowVm {
                     args_json,
                     thread_driver.clone(),
                     thread_cancel,
+                    thread_invoker,
                     limits,
                 );
                 // Run teardown: this driver is scoped to one run, so any task
@@ -313,13 +344,16 @@ fn vm_thread_main(
     args_json: String,
     driver: Arc<dyn WorkflowDriver>,
     cancel: CancelHandle,
+    invoker: Option<Arc<dyn ToolInvoker>>,
     limits: VmLimits,
 ) -> Result<serde_json::Value, WorkflowJsError> {
     let reactor = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(|err| WorkflowJsError::VmInit(format!("failed to build VM reactor: {err}")))?;
-    reactor.block_on(run_in_vm(source, args_json, driver, cancel, limits))
+    reactor.block_on(run_in_vm(
+        source, args_json, driver, cancel, invoker, limits,
+    ))
 }
 
 async fn run_in_vm(
@@ -327,6 +361,7 @@ async fn run_in_vm(
     args_json: String,
     driver: Arc<dyn WorkflowDriver>,
     cancel: CancelHandle,
+    invoker: Option<Arc<dyn ToolInvoker>>,
     limits: VmLimits,
 ) -> Result<serde_json::Value, WorkflowJsError> {
     let runtime = AsyncRuntime::new().map_err(|err| WorkflowJsError::VmInit(err.to_string()))?;
@@ -343,7 +378,7 @@ async fn run_in_vm(
         .map_err(|err| WorkflowJsError::VmInit(err.to_string()))?;
 
     let result = context
-        .async_with(async |ctx| run_in_ctx(ctx, source, args_json, driver, cancel).await)
+        .async_with(async |ctx| run_in_ctx(ctx, source, args_json, driver, invoker, cancel).await)
         .await;
     drop(context);
     runtime.run_gc().await;
@@ -355,12 +390,18 @@ async fn run_in_ctx(
     source: String,
     args_json: String,
     driver: Arc<dyn WorkflowDriver>,
+    invoker: Option<Arc<dyn ToolInvoker>>,
     cancel: CancelHandle,
 ) -> Result<serde_json::Value, WorkflowJsError> {
-    install_host(&ctx, driver, cancel.clone(), &args_json)?;
+    install_host(&ctx, driver, invoker.clone(), cancel.clone(), &args_json)?;
     ctx.eval::<(), _>(prelude())
         .catch(&ctx)
         .map_err(|err| WorkflowJsError::VmInit(format!("prelude failed: {err}")))?;
+    if invoker.is_some() {
+        ctx.eval::<(), _>(CODEMODE_PRELUDE)
+            .catch(&ctx)
+            .map_err(|err| WorkflowJsError::VmInit(format!("codemode prelude failed: {err}")))?;
+    }
 
     let desugared = desugar_export_default(&source);
     let wrapped = format!("(async () => {{\n{desugared}\n}})()");
@@ -524,9 +565,115 @@ fn js_value_to_json<'js>(
     }
 }
 
+/// Prelude fragment for code-mode runs only: captures `__codemode_call` into
+/// the frozen `globalThis.tools` surface, then deletes the raw binding.
+/// Workflow runs never eval this, so their documented host surface is
+/// unchanged — `tools` simply does not exist there.
+const CODEMODE_PRELUDE: &str = r#"
+(() => {
+  const hostCall = __codemode_call;
+  globalThis.tools = Object.freeze({
+    call: async (tool, input) => {
+      const envelope = JSON.parse(
+        await hostCall(JSON.stringify({ tool, input: input === undefined ? {} : input }))
+      );
+      if (envelope.error !== undefined) {
+        const err = new Error(envelope.error);
+        err.kind = envelope.error_kind;
+        throw err;
+      }
+      return envelope.result;
+    },
+  });
+  try { delete globalThis.__codemode_call; } catch (_) { /* frozen shape */ }
+})();
+"#;
+
+/// The `tools.call()` host call. Infallible at the binding level, like
+/// `task_host`: outcomes return through the `{result}` /
+/// `{error, error_kind}` envelope so the prelude rethrows typed errors.
+/// Gate refusals arrive as admission errors (nothing ran); a nested tool
+/// that ran and failed arrives as an agent error (work failed).
+async fn tools_call_host(
+    call_json: String,
+    invoker: Arc<dyn ToolInvoker>,
+    cancel: CancelHandle,
+    invoked: Rc<Cell<u64>>,
+) -> String {
+    let outcome = tools_call_host_inner(call_json, invoker, cancel, invoked).await;
+    let envelope = match outcome {
+        Ok(result) => serde_json::json!({ "result": result }),
+        Err(TaskError { kind, message }) => {
+            serde_json::json!({ "error": message, "error_kind": kind.as_str() })
+        }
+    };
+    envelope.to_string()
+}
+
+async fn tools_call_host_inner(
+    call_json: String,
+    invoker: Arc<dyn ToolInvoker>,
+    cancel: CancelHandle,
+    invoked: Rc<Cell<u64>>,
+) -> Result<serde_json::Value, TaskError> {
+    let admission = |message: String| TaskError::new(TaskErrorKind::Admission, message);
+    let request: ToolCallRequest = serde_json::from_str(&call_json).map_err(|err| {
+        admission(format!(
+            "tools.call(): expected {{\"tool\", \"input\"}} JSON: {err}"
+        ))
+    })?;
+    if request.tool.trim().is_empty() {
+        return Err(admission(
+            "tools.call(): `tool` must be a non-empty string".to_string(),
+        ));
+    }
+    if !request.input.is_object() {
+        return Err(admission(
+            "tools.call(): `input` must be a JSON object".to_string(),
+        ));
+    }
+    if invoked.get() >= CODEMODE_MAX_TOOL_CALLS {
+        return Err(admission(format!(
+            "tools.call(): per-run tool-call cap ({CODEMODE_MAX_TOOL_CALLS}) reached"
+        )));
+    }
+    if cancel.is_cancelled() {
+        return Err(TaskError::new(
+            TaskErrorKind::Cancelled,
+            "tools.call(): run cancelled".to_string(),
+        ));
+    }
+    invoked.set(invoked.get() + 1);
+    let response = tokio::select! {
+        _ = cancel.cancelled() => {
+            return Err(TaskError::new(
+                TaskErrorKind::Cancelled,
+                "tools.call(): run cancelled".to_string(),
+            ));
+        }
+        response = invoker.invoke(request) => response.map_err(|err| {
+            TaskError::new(
+                TaskErrorKind::from(&err),
+                format!("tools.call(): {err}"),
+            )
+        })?,
+    };
+    if response.ok {
+        Ok(response.result)
+    } else {
+        let message = response
+            .result
+            .as_str()
+            .unwrap_or("tools.call(): tool failed without a message")
+            .to_string();
+        Err(TaskError::new(TaskErrorKind::Agent, message))
+    }
+}
+
 fn install_host(
     ctx: &Ctx<'_>,
     driver: Arc<dyn WorkflowDriver>,
+    invoker: Option<Arc<dyn ToolInvoker>>,
     cancel: CancelHandle,
     args_json: &str,
 ) -> Result<(), WorkflowJsError> {
@@ -555,6 +702,26 @@ fn install_host(
             })),
         )
         .map_err(init_err)?;
+
+    // Code-mode runs only: per-run tool-call counter. Same single-threaded
+    // check+increment discipline as `spawned` above — no await between the
+    // cap check and the increment, so a burst cannot slip past it.
+    if let Some(invoker) = invoker {
+        let invoked = Rc::new(Cell::new(0u64));
+        let call_invoker = invoker.clone();
+        let call_cancel = cancel.clone();
+        globals
+            .set(
+                "__codemode_call",
+                Func::from(Async(move |call_json: String| {
+                    let invoker = call_invoker.clone();
+                    let cancel = call_cancel.clone();
+                    let invoked = invoked.clone();
+                    async move { tools_call_host(call_json, invoker, cancel, invoked).await }
+                })),
+            )
+            .map_err(init_err)?;
+    }
 
     let log_driver = driver.clone();
     globals

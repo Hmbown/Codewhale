@@ -96,6 +96,7 @@ before(async () => {
   });
   const init = await rpc("initialize", { protocolVersion: "2025-06-18" });
   assert.equal(init.result.serverInfo.name, "codewhale-cu");
+  assert.equal(init.result.serverInfo.version, JSON.parse(fs.readFileSync(new URL("../plugin.json", import.meta.url), "utf8")).version);
 });
 
 after(() => {
@@ -103,21 +104,24 @@ after(() => {
   for (const d of [stateDir, recDir, fakeHome]) { try { fs.rmSync(d, { recursive: true, force: true }); } catch {} }
 });
 
-test("tools/list exposes the full frontier surface with valid schemas", async () => {
+test("tools/list advertises the merged surface with valid schemas; wire names stay aliases", async () => {
   const res = await rpc("tools/list", {});
   const tools = res.result.tools;
-  assert.ok(tools.length >= 38, `${tools.length} tools`);
+  assert.ok(tools.length >= 30, `${tools.length} tools`);
+  assert.ok(tools.every((t) => t.hidden !== true), "hidden aliases must not be listed");
   for (const t of tools) {
     assert.ok(t.name && t.description && t.inputSchema, `schema incomplete for ${t.name}`);
   }
   const names = new Set(tools.map((t) => t.name));
-  for (const required of ["screenshot", "zoom", "left_click", "double_click", "triple_click", "right_click", "middle_click",
-    "mouse_move", "left_click_drag", "left_mouse_down", "left_mouse_up", "scroll", "type", "key", "hold_key",
-    "set_value", "select_text", "perform_action", "get_app_state", "list_apps", "list_windows", "list_displays",
-    "switch_display", "open_application", "read_clipboard", "write_clipboard", "cursor_position", "wait",
-    "recording_start", "recording_stop", "recording_status", "recording_list",
-    "computer_list", "computer_switch", "computer_register", "computer_remove", "request_access", "stop_computer_control"]) {
+  for (const required of ["screenshot", "zoom", "click", "pointer", "left_click_drag", "scroll", "type", "key",
+    "set_value", "focus", "get_value", "find_elements", "run_actions", "select_text", "perform_action", "get_app_state", "list_apps", "list_windows", "list_displays",
+    "switch_display", "open_application", "clipboard", "cursor_position", "wait",
+    "recording", "computer", "request_access", "stop_computer_control", "invoke_menu", "preview", "wait_for"]) {
     assert.ok(names.has(required), `missing tool ${required}`);
+  }
+  for (const hidden of ["left_click", "double_click", "right_click", "hold_key", "mouse_move", "read_clipboard",
+    "recording_start", "computer_list", "computer_switch"]) {
+    assert.ok(!names.has(hidden), `${hidden} is an alias, not advertised`);
   }
 });
 
@@ -145,7 +149,13 @@ test("registering an ssh computer installs the agent and probes the platform", a
   const apps = await tool("list_apps", { computer: "box" });
   if (apps.ok) {
     assert.equal(apps.computer.id, "box");
-    assert.ok(Array.isArray(apps.apps) && apps.apps.length > 0, "apps returned over the wire");
+    assert.ok(Array.isArray(apps.apps), "an app list came back over the wire");
+    // An empty list is a real answer, not a broken one: the Linux box in
+    // docker/ runs a live X session with nothing on it. Only a login session
+    // is guaranteed to have an application in it.
+    if (process.platform === "darwin") {
+      assert.ok(apps.apps.length > 0, "apps returned over the wire");
+    }
   } else {
     assert.equal(process.platform, "linux", JSON.stringify(apps.error ?? {}));
     // A headless CI host fails closed with either shape: the modern

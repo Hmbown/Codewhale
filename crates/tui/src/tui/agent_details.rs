@@ -569,6 +569,7 @@ mod tests {
 
     fn agent(agent_id: &str, status: SubAgentStatus) -> SubAgentResult {
         SubAgentResult {
+            usage: None,
             name: agent_id.to_string(),
             agent_id: agent_id.to_string(),
             context_mode: "isolated".to_string(),
@@ -739,6 +740,7 @@ mod tests {
             provider_id: "deepseek".to_string(),
             model_id: "deepseek-v4-pro".to_string(),
             route_source: "roster".to_string(),
+            fallback_note: None,
             requested_reasoning: "inherit".to_string(),
             effective_reasoning: Some("high".to_string()),
             runtime_version: "test".to_string(),

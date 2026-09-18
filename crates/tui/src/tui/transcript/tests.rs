@@ -128,17 +128,75 @@ fn spacer_rows_after_cell(cache: &TranscriptViewCache, target_cell: usize) -> us
 }
 
 #[test]
-fn cache_renders_user_cells_with_highlight_background() {
-    let cells = vec![user_cell("# literal user prompt")];
-    let revisions = vec![1u64];
+fn cache_highlights_only_the_newest_user_turn() {
+    let cells = vec![
+        user_cell("first prompt"),
+        assistant_cell("first answer", false),
+        user_cell("second prompt"),
+    ];
+    let revisions = vec![1u64, 1, 1];
 
     let mut cache = TranscriptViewCache::new();
     cache.ensure(&cells, &revisions, 40, TranscriptRenderOptions::default());
 
+    let texts = plain_lines(&cache);
+    let first = texts
+        .iter()
+        .position(|line| line.contains("first prompt"))
+        .expect("first prompt renders");
+    let second = texts
+        .iter()
+        .position(|line| line.contains("second prompt"))
+        .expect("second prompt renders");
     let lines = cache.lines();
-    assert_eq!(lines[0].style.bg, Some(palette::SURFACE_ELEVATED));
-    assert_eq!(lines[0].width(), 40);
-    assert_eq!(plain_lines(&cache)[0].trim_end(), "▎ # literal user prompt");
+    assert_eq!(
+        lines[first].style.bg, None,
+        "an older prompt renders on the bare ground"
+    );
+    assert!(
+        lines[first]
+            .spans
+            .iter()
+            .all(|span| span.style.bg.is_none()),
+        "an older prompt paints no background block"
+    );
+    assert_eq!(
+        lines[second].style.bg,
+        Some(palette::SURFACE_ELEVATED),
+        "only the newest prompt carries the background"
+    );
+    assert_eq!(lines[second].width(), 40);
+}
+
+#[test]
+fn cache_unhighlights_the_previous_prompt_when_a_new_one_lands() {
+    let first = vec![user_cell("first prompt")];
+    let revisions = vec![1u64];
+
+    let mut cache = TranscriptViewCache::new();
+    cache.ensure(&first, &revisions, 40, TranscriptRenderOptions::default());
+    assert_eq!(
+        cache.lines()[0].style.bg,
+        Some(palette::SURFACE_ELEVATED),
+        "a lone prompt is the newest turn"
+    );
+
+    // The first cell's own revision never moves; supersession alone must
+    // re-render it without the block.
+    let both = vec![user_cell("first prompt"), user_cell("second prompt")];
+    let revisions = vec![1u64, 1];
+    cache.ensure(&both, &revisions, 40, TranscriptRenderOptions::default());
+    let lines = cache.lines();
+    assert_eq!(
+        lines[0].style.bg, None,
+        "the previous newest loses the background"
+    );
+    let texts = plain_lines(&cache);
+    let second = texts
+        .iter()
+        .position(|line| line.contains("second prompt"))
+        .expect("second prompt renders");
+    assert_eq!(lines[second].style.bg, Some(palette::SURFACE_ELEVATED));
 }
 
 #[test]

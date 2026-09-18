@@ -2,7 +2,11 @@ use std::fmt::Write;
 use std::path::{Path, PathBuf};
 
 fn main() {
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    // Cargo can reuse this build-script binary across worktrees sharing a
+    // target directory. Resolve the package being built at execution time.
+    let manifest_dir =
+        PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").expect("manifest directory"));
+    println!("cargo:rerun-if-env-changed=CARGO_MANIFEST_DIR");
     codewhale_build_support::declare_rerun_conditions(&manifest_dir);
     generate_localization(&manifest_dir);
 }

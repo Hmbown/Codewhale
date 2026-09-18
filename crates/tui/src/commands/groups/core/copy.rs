@@ -38,7 +38,7 @@ fn execute_copy(app: &mut App) -> CommandResult {
     // Any native-host attempt may fall through to the asynchronous terminal
     // transport. Preserve /export's durable recovery contract before the
     // write so every optimistic receipt names (or explicitly lacks) a backup.
-    let recovery = crate::commands::groups::session::write_last_copy(&content);
+    let recovery = crate::commands::session_export_host::write_last_copy(&content);
     match app.clipboard.write_text(&content) {
         Ok(()) if terminal_client => match recovery {
             Some(path) => CommandResult::message(
@@ -220,7 +220,7 @@ mod tests {
         let mut app = test_app();
         app.clipboard = ClipboardHandler::for_test(false, false);
         add_completed_assistant(&mut app, "visible answer before compaction");
-        app.api_messages = vec![
+        app.api_messages = std::sync::Arc::new(vec![
             Message {
                 role: Role::User,
                 content: vec![ContentBlock::Text {
@@ -235,7 +235,7 @@ mod tests {
                     cache_control: None,
                 }],
             },
-        ];
+        ]);
 
         let result = execute_copy(&mut app);
 
@@ -274,7 +274,7 @@ mod tests {
         app.clipboard = ClipboardHandler::for_test(false, false);
         add_completed_assistant(&mut app, "older answer");
         add_completed_assistant(&mut app, "newer answer");
-        app.api_messages.clear();
+        app.api_messages_mut().clear();
         app.pop_history();
 
         let result = execute_copy(&mut app);
@@ -295,7 +295,7 @@ mod tests {
             content: "next prompt".to_string(),
         });
         add_completed_assistant(&mut app, "newer answer");
-        app.api_messages.clear();
+        app.api_messages_mut().clear();
         app.truncate_history_to(2);
 
         let result = execute_copy(&mut app);

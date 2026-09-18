@@ -11,7 +11,7 @@
 use anyhow::Result;
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex as StdMutex};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use codewhale_config::AppMode;
@@ -80,6 +80,77 @@ impl Drop for TurnControlGuard {
 pub(crate) struct SteerInput {
     pub(super) turn_id: Option<u64>,
     pub(crate) content: String,
+    pub(super) outcome: Option<oneshot::Sender<SteerOutcome>>,
+}
+
+/// The engine's verdict on one steer. A steer whose turn had already moved
+/// on is discarded by `next_turn_steer`; the verdict tells the sender which
+/// happened, because "the channel accepted the text" is not "the model saw
+/// it" (#6276).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SteerOutcome {
+    /// The steer's text was committed into the session record inside the
+    /// turn it was sent to; the model received it.
+    Accepted,
+    /// The turn had already moved on (or ended) before the steer reached a
+    /// commit boundary. The model never saw the text.
+    Dropped,
+}
+
+/// A steer the engine has taken ownership of. Committing it reports
+/// [`SteerOutcome::Accepted`]; any other exit — interrupt, failure, early
+/// return, silent drop of the pending queue — reports `Dropped` from `Drop`,
+/// so no path can lose a verdict.
+pub(crate) struct PendingSteer {
+    pub(crate) content: String,
+    outcome: Option<oneshot::Sender<SteerOutcome>>,
+}
+
+impl PendingSteer {
+    pub(crate) fn new(content: String, outcome: Option<oneshot::Sender<SteerOutcome>>) -> Self {
+        Self { content, outcome }
+    }
+
+    /// Commit the steer into the turn's record: report `Accepted`, then hand
+    /// back the text. Consuming `self` without calling this reports
+    /// `Dropped` via `Drop`.
+    pub(crate) fn commit(mut self) -> String {
+        if let Some(outcome) = self.outcome.take() {
+            let _ = outcome.send(SteerOutcome::Accepted);
+        }
+        // `Drop` runs after this returns and finds `outcome` already taken,
+        // so the verdict stays exactly one `Accepted`.
+        std::mem::take(&mut self.content)
+    }
+}
+
+impl Drop for PendingSteer {
+    fn drop(&mut self) {
+        if let Some(outcome) = self.outcome.take() {
+            let _ = outcome.send(SteerOutcome::Dropped);
+        }
+    }
+}
+
+impl SteerInput {
+    /// Take ownership of this steer as an unsettled [`PendingSteer`].
+    ///
+    /// This is the only way to claim a steer off the channel. Whatever the
+    /// claimant then does — `commit()` or drop — settles it exactly once, so
+    /// there is one settlement mechanism rather than two (#6276).
+    pub(crate) fn into_pending(mut self) -> PendingSteer {
+        // Both fields are taken, so the `Drop` below finds nothing left to
+        // settle and the verdict travels with the `PendingSteer`.
+        PendingSteer::new(std::mem::take(&mut self.content), self.outcome.take())
+    }
+}
+
+impl Drop for SteerInput {
+    fn drop(&mut self) {
+        if let Some(outcome) = self.outcome.take() {
+            let _ = outcome.send(SteerOutcome::Dropped);
+        }
+    }
 }
 
 impl std::ops::Deref for SteerInput {
@@ -105,7 +176,23 @@ impl SteerPermit {
         self.permit.send(SteerInput {
             turn_id: self.turn_id,
             content,
+            outcome: None,
         });
+    }
+
+    /// Send a steer and receive the engine's verdict on it. The receiver
+    /// resolves to [`SteerOutcome::Accepted`] when the turn commits the text
+    /// into its record, [`SteerOutcome::Dropped`] when the turn moved on
+    /// first, and closes without a verdict only if the engine itself is gone
+    /// (#6276).
+    pub(crate) fn send_with_outcome(self, content: String) -> oneshot::Receiver<SteerOutcome> {
+        let (outcome_tx, outcome_rx) = oneshot::channel();
+        self.permit.send(SteerInput {
+            turn_id: self.turn_id,
+            content,
+            outcome: Some(outcome_tx),
+        });
+        outcome_rx
     }
 }
 
@@ -140,6 +227,15 @@ impl EngineHandle {
     }
 
     /// Send an operation to the engine
+    ///
+    /// This awaits channel capacity, and the engine drains `rx_op` only
+    /// between turns — so on the UI event loop an awaited send into a
+    /// saturated mailbox freezes input for the rest of the turn (#6150).
+    /// Input-path callers instead either `try_send` a droppable op (report
+    /// the rejection) or `try_reserve_owned` before committing UI state and
+    /// hand off with `send_reserved_op`. An awaited `send` remains correct
+    /// only where the operation is part of a committed, ordered transition
+    /// (session/provider reload) whose drop would desync engine and UI.
     pub async fn send(&self, op: Op) -> Result<()> {
         let authority = Self::change_mode_authority(&op);
         let permit = self.tx_op.clone().reserve_owned().await?;
@@ -192,7 +288,7 @@ impl EngineHandle {
             .turn_controls
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if matches!(&op, Op::SendMessage { .. }) {
+        if matches!(&op, Op::SendMessage(_)) {
             let control = controls.fresh();
             controls.pending.push_back(control);
         }
@@ -310,7 +406,6 @@ impl EngineHandle {
 
     /// Check if a request is currently cancelled
     #[must_use]
-    #[allow(dead_code)]
     pub fn is_cancelled(&self) -> bool {
         if let Some(control) = self
             .turn_controls
@@ -360,6 +455,16 @@ impl EngineHandle {
         Ok(())
     }
 
+    /// Deny a pending tool call because its interactive approval card
+    /// expired (#6101). Kept distinct from [`Self::deny_tool_call`] so the
+    /// receipt records a timeout instead of an operator denial.
+    pub async fn deny_tool_call_timed_out(&self, id: impl Into<String>) -> Result<()> {
+        self.tx_approval
+            .send(ApprovalDecision::TimedOut { id: id.into() })
+            .await?;
+        Ok(())
+    }
+
     /// Retry a tool call with an elevated sandbox policy.
     pub async fn retry_tool_with_policy(
         &self,
@@ -404,6 +509,20 @@ impl EngineHandle {
         Ok(())
     }
 
+    /// Request the live context-window budget for this session's route.
+    /// `None` means the route cannot express a bounded window (e.g. an
+    /// unknown model with no catalog or configured limits) — callers should
+    /// surface "unavailable" rather than inventing a number.
+    pub async fn get_context_budget(
+        &self,
+    ) -> Result<Option<crate::core::ops::SessionContextBudget>> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let tx = std::sync::Arc::new(std::sync::Mutex::new(Some(tx)));
+        self.send(Op::GetContextBudget { tx }).await?;
+        rx.await
+            .map_err(|_| anyhow::anyhow!("Engine dropped context budget oneshot"))
+    }
+
     /// Request a snapshot of the current session state.
     /// Returns the snapshot directly via a oneshot channel, avoiding
     /// competition with the SSE event stream on the mpsc receiver.
@@ -413,6 +532,19 @@ impl EngineHandle {
         self.send(Op::GetSessionSnapshot { tx }).await?;
         rx.await
             .map_err(|_| anyhow::anyhow!("Engine dropped session snapshot oneshot"))
+    }
+
+    /// Query after the active turn settles, without competing with events.
+    /// The caller must keep draining events and bound this future: an active
+    /// turn can be awaiting provider/tool work or a full event channel.
+    pub(crate) async fn get_subagent_settlement(
+        &self,
+    ) -> Result<crate::core::ops::SubAgentSettlement> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let tx = Arc::new(StdMutex::new(Some(tx)));
+        self.send(Op::GetSubAgentSettlement { tx }).await?;
+        rx.await
+            .map_err(|_| anyhow::anyhow!("Engine dropped child settlement receipt"))
     }
 
     /// Request active provider request concurrency state.

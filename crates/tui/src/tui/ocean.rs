@@ -243,7 +243,10 @@ impl OceanColumn {
     #[must_use]
     pub fn color_at_y(self, y: u16) -> Color {
         let row = y.saturating_sub(self.top).min(self.height - 1);
-        if let Some(elapsed) = self.completion_elapsed_ms {
+        if let Some(elapsed) = self
+            .completion_elapsed_ms
+            .filter(|elapsed| *elapsed < COMPLETION_BREATH_MS)
+        {
             self.ramp
                 .color_at_completion_context(row, self.height, elapsed, self.context_percent)
         } else {
@@ -318,7 +321,9 @@ impl OceanColumn {
             height: self.height,
             phase_tag: self.phase_tag(),
             animated: self.animated,
-            completion_active: self.completion_elapsed_ms.is_some(),
+            completion_active: self
+                .completion_elapsed_ms
+                .is_some_and(|elapsed| elapsed < COMPLETION_BREATH_MS),
             presence: self.presence,
             context_percent: self.context_percent,
         }

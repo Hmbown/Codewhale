@@ -2110,6 +2110,7 @@ mod tests {
             ApiProvider::Concentrate,
             ApiProvider::Telecomjs,
             ApiProvider::Edenai,
+            ApiProvider::Zenmux,
         ] {
             let identity = provider.as_str();
             let endpoint = format!("https://{identity}.catalog.invalid/v1");
@@ -2271,11 +2272,11 @@ mod tests {
         crate::provider_catalog_live::reset_cache_for_test();
         crate::provider_lake::clear_live_snapshot();
 
-        let base_url = codewhale_config::BASETEN_BASE_URL;
+        let base_url = codewhale_config::catalog::BASETEN_BASE_URL;
         let model = "synthetic-live-baseten-model";
         let mut custom = std::collections::HashMap::new();
         custom.insert(
-            codewhale_config::BASETEN_TEMPLATE_ID.to_string(),
+            codewhale_config::catalog::BASETEN_PROVIDER_ID.to_string(),
             ProviderConfig {
                 kind: Some("openai-compatible".to_string()),
                 base_url: Some(base_url.to_string()),
@@ -2284,7 +2285,7 @@ mod tests {
             },
         );
         let config = Config {
-            provider: Some(codewhale_config::BASETEN_TEMPLATE_ID.to_string()),
+            provider: Some(codewhale_config::catalog::BASETEN_PROVIDER_ID.to_string()),
             providers: Some(ProvidersConfig {
                 custom,
                 ..Default::default()
@@ -2292,11 +2293,11 @@ mod tests {
             ..Default::default()
         };
         crate::provider_catalog_live::record_success(ProviderCatalogDelta {
-            provider: codewhale_config::BASETEN_TEMPLATE_ID.to_string(),
+            provider: codewhale_config::catalog::BASETEN_PROVIDER_ID.to_string(),
             base_url_fingerprint: codewhale_config::catalog::base_url_fingerprint(base_url),
             fetched_at: codewhale_config::catalog::now_unix(),
             offerings: vec![live_catalog_offering(
-                codewhale_config::BASETEN_TEMPLATE_ID,
+                codewhale_config::catalog::BASETEN_PROVIDER_ID,
                 model,
                 base_url,
             )],
@@ -2304,7 +2305,10 @@ mod tests {
 
         let route = resolve_runtime_route(&config, ApiProvider::Custom, Some(model))
             .expect("named Baseten route resolves");
-        assert_eq!(route.identity.key, codewhale_config::BASETEN_TEMPLATE_ID);
+        assert_eq!(
+            route.identity.key,
+            codewhale_config::catalog::BASETEN_PROVIDER_ID
+        );
         assert_eq!(route.model, model);
         assert_live_catalog_route_facts(&route);
 
@@ -2342,7 +2346,7 @@ mod tests {
         assert!(
             crate::provider_lake::catalog_offering_for_model_identity(
                 ApiProvider::Custom,
-                Some(codewhale_config::BASETEN_TEMPLATE_ID),
+                Some(codewhale_config::catalog::BASETEN_PROVIDER_ID),
                 alias_model,
             )
             .is_none(),

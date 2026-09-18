@@ -1616,6 +1616,11 @@ impl OauthLoginFlow {
             "resource",
             oauth_resource,
         );
+        // #6040: logout clears this machine's token only — the provider keeps
+        // its standing grant. Without a forced prompt the next login silently
+        // re-grants it (same account/workspace, no picker ever shown), so an
+        // explicit login could never change the authorized workspace.
+        let auth_url = append_query_param(&auth_url, "prompt", Some("consent"));
 
         Ok(Self {
             auth_url,
@@ -1674,13 +1679,21 @@ impl OauthLoginFlow {
                     )
                 })?
                 .context("OAuth callback was cancelled")?;
-            let OauthCallbackResult { code, state } = match callback {
+            let OauthCallbackResult {
+                code,
+                state,
+                issuer,
+            } = match callback {
                 CallbackResult::Success(callback) => callback,
                 CallbackResult::Error(error) => return Err(anyhow!(error)),
             };
 
+            // RFC 9207: servers that advertise
+            // `authorization_response_iss_parameter_supported` send `iss` on the
+            // redirect and rmcp requires it back; forward it so the callback binds
+            // to the discovered issuer instead of failing as "missing".
             self.oauth_state
-                .handle_callback(&code, &state)
+                .handle_callback_with_issuer(&code, &state, issuer.as_deref())
                 .await
                 .context("handling MCP OAuth callback")?;
 
@@ -1715,19 +1728,47 @@ async fn start_authorization(
     oauth_client_id: Option<&str>,
 ) -> Result<OAuthState> {
     let Some(client_id) = oauth_client_id.filter(|client_id| !client_id.trim().is_empty()) else {
-        let mut oauth_state = OAuthState::new_with_oauth_http_client(
-            server_url,
-            Arc::new(RecordingOAuthHttpClient::new(client)),
-        )
-        .await?;
-        oauth_state
-            .start_authorization(
-                AuthorizationRequest::new(redirect_uri)
-                    .with_scopes(scopes.iter().copied())
-                    .with_client_name("Codewhale"),
+        let mut attempt_scopes: Vec<String> =
+            scopes.iter().map(|scope| (*scope).to_string()).collect();
+        // Dynamic registration may reject part of the scope list the server
+        // itself advertised (Supabase validates registration scopes against a
+        // narrower allow-list than its `scopes_supported`). Drop exactly the
+        // scopes the server named invalid and retry once; if it named none,
+        // register without scopes so the server applies its defaults.
+        for retried in [false, true] {
+            let mut oauth_state = OAuthState::new_with_oauth_http_client(
+                server_url,
+                Arc::new(RecordingOAuthHttpClient::new(client.clone())),
             )
             .await?;
-        return Ok(oauth_state);
+            let started = oauth_state
+                .start_authorization(
+                    AuthorizationRequest::new(redirect_uri)
+                        .with_scopes(attempt_scopes.iter().map(String::as_str))
+                        .with_client_name("Codewhale"),
+                )
+                .await;
+            match started {
+                Ok(()) => return Ok(oauth_state),
+                Err(error) if !retried && !attempt_scopes.is_empty() => {
+                    let message = error.to_string();
+                    let Some(narrowed) =
+                        scopes_after_registration_rejection(&attempt_scopes, &message)
+                    else {
+                        return Err(error.into());
+                    };
+                    tracing::warn!(
+                        target: "mcp::oauth",
+                        server_url,
+                        dropped = attempt_scopes.len() - narrowed.len(),
+                        "OAuth client registration rejected part of the requested scope list; retrying with the accepted scopes"
+                    );
+                    attempt_scopes = narrowed;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        unreachable!("registration retry loop returns on success or error");
     };
 
     let mut manager = AuthorizationManager::new_with_oauth_http_client(
@@ -1745,6 +1786,40 @@ async fn start_authorization(
     Ok(OAuthState::Session(
         AuthorizationSession::for_scope_upgrade(manager, auth_url, redirect_uri),
     ))
+}
+
+/// Given a registration failure message, return the scopes to retry with, or
+/// `None` when the failure is not about scopes. Servers that validate the
+/// `scope` field report positions like `scope.3: Invalid option`; those exact
+/// entries are dropped. A scope error without positions retries with no
+/// scopes at all, letting the server grant its defaults.
+fn scopes_after_registration_rejection(scopes: &[String], message: &str) -> Option<Vec<String>> {
+    let lower = message.to_ascii_lowercase();
+    if !(lower.contains("registration") && lower.contains("scope")) {
+        return None;
+    }
+    let mut rejected = std::collections::BTreeSet::new();
+    for (start, _) in message.match_indices("scope.") {
+        let digits: String = message[start + "scope.".len()..]
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect();
+        if let Ok(index) = digits.parse::<usize>() {
+            rejected.insert(index);
+        }
+    }
+    let narrowed: Vec<String> = scopes
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| !rejected.contains(index))
+        .map(|(_, scope)| scope.clone())
+        .collect();
+    if narrowed.len() == scopes.len() {
+        // The server complained about scopes without naming any position:
+        // the only safe retry is to omit the field.
+        return Some(Vec::new());
+    }
+    Some(narrowed)
 }
 
 fn spawn_callback_server(
@@ -1847,6 +1922,8 @@ async fn write_http_response(
 struct OauthCallbackResult {
     code: String,
     state: String,
+    /// RFC 9207 `iss` from the redirect, when the authorization server sends it.
+    issuer: Option<String>,
 }
 
 enum CallbackResult {
@@ -1871,6 +1948,7 @@ fn parse_oauth_callback(path: &str, expected_callback_path: &str) -> CallbackOut
 
     let mut code = None;
     let mut state = None;
+    let mut issuer = None;
     let mut error = None;
     let mut error_description = None;
     for pair in query.split('&') {
@@ -1884,6 +1962,7 @@ fn parse_oauth_callback(path: &str, expected_callback_path: &str) -> CallbackOut
         match key {
             "code" => code = Some(decoded),
             "state" => state = Some(decoded),
+            "iss" => issuer = Some(decoded),
             "error" => error = Some(decoded),
             "error_description" => error_description = Some(decoded),
             _ => {}
@@ -1891,7 +1970,11 @@ fn parse_oauth_callback(path: &str, expected_callback_path: &str) -> CallbackOut
     }
 
     if let (Some(code), Some(state)) = (code, state) {
-        return CallbackOutcome::Success(OauthCallbackResult { code, state });
+        return CallbackOutcome::Success(OauthCallbackResult {
+            code,
+            state,
+            issuer,
+        });
     }
     if error.is_some() || error_description.is_some() {
         return CallbackOutcome::Error(OAuthProviderError::new(error, error_description));
@@ -1985,6 +2068,37 @@ impl McpServerConfig {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn registration_rejection_drops_exactly_the_named_scopes() {
+        let scopes: Vec<String> = ["a", "b", "c", "d"].iter().map(|s| s.to_string()).collect();
+        let message = concat!(
+            "Registration failed: Dynamic registration failed: HTTP 400 Bad Request: ",
+            "{\"message\":\"scope.1: Invalid option: expected one of \\\"a\\\"|\\\"c\\\",",
+            "scope.3: Invalid option\"}"
+        );
+        assert_eq!(
+            super::scopes_after_registration_rejection(&scopes, message),
+            Some(vec!["a".to_string(), "c".to_string()])
+        );
+        // A scope complaint without positions retries without scopes.
+        assert_eq!(
+            super::scopes_after_registration_rejection(
+                &scopes,
+                "Registration failed: invalid scope"
+            ),
+            Some(Vec::new())
+        );
+        // Unrelated registration failures are not retried.
+        assert_eq!(
+            super::scopes_after_registration_rejection(&scopes, "Registration failed: HTTP 500"),
+            None
+        );
+        assert_eq!(
+            super::scopes_after_registration_rejection(&scopes, "network unreachable"),
+            None
+        );
+    }
+
     #[test]
     fn a_refresh_parse_failure_names_the_login_remedy_and_the_server() {
         let text = super::refresh_failure_context("supabase", true, None);
@@ -2158,7 +2272,33 @@ mod tests {
     #[test]
     fn parse_oauth_callback_accepts_success() {
         let parsed = parse_oauth_callback("/callback/id?code=abc&state=xyz", "/callback/id");
-        assert!(matches!(parsed, CallbackOutcome::Success(_)));
+        assert_eq!(
+            parsed,
+            CallbackOutcome::Success(OauthCallbackResult {
+                code: "abc".to_string(),
+                state: "xyz".to_string(),
+                issuer: None,
+            })
+        );
+    }
+
+    #[test]
+    fn parse_oauth_callback_keeps_rfc9207_issuer() {
+        // Cloudflare's MCP authorization server advertises
+        // authorization_response_iss_parameter_supported and sends `iss` back;
+        // dropping it makes rmcp reject the callback as missing a required issuer.
+        let parsed = parse_oauth_callback(
+            "/callback/id?code=abc&state=xyz&iss=https%3A%2F%2Fmcp.cloudflare.com",
+            "/callback/id",
+        );
+        assert_eq!(
+            parsed,
+            CallbackOutcome::Success(OauthCallbackResult {
+                code: "abc".to_string(),
+                state: "xyz".to_string(),
+                issuer: Some("https://mcp.cloudflare.com".to_string()),
+            })
+        );
     }
 
     #[test]
@@ -2544,6 +2684,49 @@ mod tests {
                 .evaluate("127.0.0.1", "mcp"),
             crate::network_policy::Decision::Deny
         );
+        drop(login);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn interactive_login_forces_the_consent_screen() {
+        use crate::mcp::{AuthenticateToolStart, McpConfig, McpPool};
+        use crate::network_policy::{DecisionToml, NetworkPolicy};
+        let _env = crate::test_support::lock_test_env();
+        let dir = tempfile::tempdir().unwrap();
+        let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", dir.path());
+        let _backend = crate::test_support::EnvVarGuard::set("CODEWHALE_SECRET_BACKEND", "file");
+        let _proxy = crate::test_support::EnvVarGuard::set("NO_PROXY", "*");
+        let (url, _, task) = guarded_oauth_fixture(None, false).await;
+        let server: McpServerConfig =
+            serde_json::from_value(serde_json::json!({"url":url})).unwrap();
+        let allowed = NetworkPolicyDecider::new(
+            NetworkPolicy {
+                default: DecisionToml::Allow,
+                ..NetworkPolicy::default()
+            },
+            None,
+        );
+        let mut config = McpConfig::default();
+        config.servers.insert("consent-probe".to_string(), server);
+        let pool = McpPool::new(config).with_network_policy(allowed);
+        let AuthenticateToolStart::Login(login) =
+            pool.begin_authenticate_tool("consent-probe").await.unwrap()
+        else {
+            panic!("a fresh server must start an interactive login");
+        };
+
+        // #6040: logout only clears this machine's token; the provider keeps
+        // its standing grant, so the login URL must force the consent screen
+        // or the same account/workspace is silently re-granted.
+        // The URL carries the PKCE challenge and state, so the assertion
+        // message reports only the fact that is being checked, never the URL.
+        let forces_consent = login.authorization_url().contains("prompt=consent");
+        assert!(
+            forces_consent,
+            "an interactive login must force consent (prompt=consent is missing from the authorization URL)"
+        );
+
         drop(login);
         task.abort();
     }

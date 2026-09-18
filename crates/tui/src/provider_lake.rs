@@ -25,7 +25,7 @@ use codewhale_config::route::{ProviderModelOffering, RouteResolver, bundled_offe
 use crate::codex_model_cache;
 use crate::config::{
     ApiProvider, Config, ProviderIdentity, model_completion_names_for_provider,
-    opencode_go_chat_model_id, provider_is_configured_for_active,
+    opencode_go_model_id, provider_is_configured_for_active,
 };
 
 static BUNDLED_SNAPSHOT: std::sync::OnceLock<CatalogSnapshot> = std::sync::OnceLock::new();
@@ -161,10 +161,8 @@ fn bundled_snapshot() -> &'static CatalogSnapshot {
 /// Remove catalog rows that cannot use the selected provider's wire protocol.
 ///
 /// OpenCode Go publishes one `/models` roster for both Chat Completions and
-/// Anthropic Messages. The `OpencodeGo` route is Chat-only, so sanitize both
-/// saved/live snapshots and the bundled fallback at the lake boundary. This is
-/// deliberately downstream of every publisher so stale cached rows cannot
-/// bypass the client-side live-fetch filter.
+/// Anthropic Messages and Responses. Keep saved and live Go rows on the same
+/// documented protocol roster, correcting stale endpoint metadata.
 fn apply_provider_model_cutlines(mut snapshot: CatalogSnapshot) -> CatalogSnapshot {
     // `ApiProvider::parse` scans every provider and alias list per call; the
     // distinct provider strings in a catalog are few, so resolve each distinct
@@ -180,9 +178,11 @@ fn apply_provider_model_cutlines(mut snapshot: CatalogSnapshot) -> CatalogSnapsh
                 .entry(offering.provider.clone())
                 .or_insert_with(|| ApiProvider::parse(&offering.provider));
             if parsed == Some(ApiProvider::OpencodeGo) {
-                let canonical = opencode_go_chat_model_id(&offering.wire_model_id)?;
+                let canonical = opencode_go_model_id(&offering.wire_model_id)?;
                 offering.provider = ApiProvider::OpencodeGo.as_str().to_string();
                 offering.wire_model_id = canonical.to_string();
+                offering.endpoint_key =
+                    codewhale_config::opencode_go_endpoint_key(canonical)?.to_string();
             }
             Some(offering)
         })
@@ -287,7 +287,7 @@ fn replace_provider_live_snapshot_for_owner(owner: LivePartitionOwner, snapshot:
 
 /// Clear all live snapshots (both Models.dev and per-provider partitions).
 /// Used by tests and shutdown paths that need a full reset.
-#[allow(dead_code)]
+#[cfg_attr(not(test), expect(dead_code))]
 pub fn clear_live_snapshot() {
     if let Ok(mut guard) = LIVE_SNAPSHOT.write() {
         guard.models_dev = None;
@@ -970,9 +970,10 @@ pub fn all_catalog_models_for_provider(provider: ApiProvider) -> Vec<String> {
 
 /// Catalog-backed model ids for one exact provider route.
 ///
-/// Built-in providers retain their canonical ids. Named compatible custom
-/// routes use `provider_identity`, so Baseten's live `/v1/models` rows and its
-/// offline setup-template seeds remain isolated from every other custom host.
+/// Built-in providers retain their canonical ids. Named custom routes use
+/// `provider_identity`, so one host's live `/v1/models` rows remain isolated
+/// from every other custom host. There are no compiled seed models: a custom
+/// route with no live, bundled, or configured rows offers nothing (#6289).
 #[must_use]
 pub fn all_catalog_models_for_provider_identity(
     provider: ApiProvider,
@@ -996,15 +997,6 @@ pub fn all_catalog_models_for_provider_identity(
             catalog_id.as_ref(),
         )),
     };
-    if models.is_empty()
-        && provider == ApiProvider::Custom
-        && let Some(template) = codewhale_config::provider_setup_template(catalog_id.as_ref())
-        && template.is_compatible()
-    {
-        for model in template.picker_models() {
-            push_unique_model(&mut models, model);
-        }
-    }
     if models.is_empty() {
         for model in model_completion_names_for_provider(provider) {
             push_unique_model(&mut models, model);
@@ -1268,21 +1260,9 @@ pub(crate) fn catalog_models_for_route(
         return models;
     }
     if provider == ApiProvider::Custom {
-        return codewhale_config::provider_setup_template(identity)
-            .filter(|template| {
-                template.is_compatible()
-                    && template.base_url().is_some_and(|default| {
-                        base_url_fingerprint(default) == base_url_fingerprint(base_url)
-                    })
-            })
-            .map(|template| {
-                template
-                    .picker_models()
-                    .into_iter()
-                    .map(str::to_string)
-                    .collect()
-            })
-            .unwrap_or_default();
+        // No compiled seeds: without a cached listing the caller retains the
+        // configured model and the live refresh fills the roster (#6289).
+        return Vec::new();
     }
     if provider.kind().is_none_or(|kind| {
         codewhale_config::provider_preserves_custom_base_url_model(kind, base_url)
@@ -2355,27 +2335,19 @@ mod tests {
     }
 
     #[test]
-    fn named_custom_catalogs_keep_exact_identity_and_baseten_offline_seeds() {
+    fn named_custom_catalogs_keep_exact_identity_without_compiled_seeds() {
         let _live = lock_live_snapshot();
         clear_live_snapshot();
 
-        let offline = all_catalog_models_for_provider_identity(
-            ApiProvider::Custom,
-            Some(codewhale_config::BASETEN_TEMPLATE_ID),
-        );
-        assert_eq!(
-            offline,
-            vec![codewhale_config::BASETEN_DEFAULT_MODEL.to_string()]
-        );
-        assert!(
-            !all_catalog_models_for_provider_identity(
-                ApiProvider::Custom,
-                Some("another-compatible-host"),
-            )
-            .iter()
-            .any(|model| offline.contains(model)),
-            "Baseten seeds must not leak into another custom provider"
-        );
+        // No live rows, no bundled rows, no configured rows: an ordinary
+        // custom route offers nothing rather than a compiled default (#6289).
+        for identity in ["baseten", "another-custom-host"] {
+            assert!(
+                all_catalog_models_for_provider_identity(ApiProvider::Custom, Some(identity))
+                    .is_empty(),
+                "{identity} must not invent models offline"
+            );
+        }
 
         set_live_snapshot(
             CatalogSnapshot {
@@ -2399,10 +2371,9 @@ mod tests {
         );
         let case_distinct =
             all_catalog_models_for_provider_identity(ApiProvider::Custom, Some("BASETEN"));
-        assert_eq!(
-            case_distinct,
-            vec![codewhale_config::BASETEN_DEFAULT_MODEL.to_string()],
-            "template schema aliases may share offline seeds, but not another exact table's live roster"
+        assert!(
+            case_distinct.is_empty(),
+            "a case variant shares neither seeds nor another exact table's live roster"
         );
         assert!(
             catalog_offering_for_model_identity(
@@ -2620,11 +2591,11 @@ mod tests {
     }
 
     #[test]
-    fn opencode_go_lake_drops_messages_only_saved_and_live_rows() {
+    fn opencode_go_lake_corrects_stale_protocols_in_saved_and_live_rows() {
         let _live = lock_live_snapshot();
         clear_live_snapshot();
 
-        let mut offerings: Vec<_> = crate::config::OPENCODE_GO_CHAT_MODELS
+        let mut offerings: Vec<_> = crate::config::opencode_go_models()
             .iter()
             .map(|model| CatalogOffering {
                 provider: "opencode_go".to_string(),
@@ -2649,16 +2620,15 @@ mod tests {
             all_catalog_models_for_provider(ApiProvider::OpencodeGo)
                 .into_iter()
                 .collect();
-        let expected: std::collections::BTreeSet<_> = crate::config::OPENCODE_GO_CHAT_MODELS
+        let expected: std::collections::BTreeSet<_> = crate::config::opencode_go_models()
             .iter()
             .map(|model| (*model).to_string())
             .collect();
         assert_eq!(models, expected);
-        for messages_only in ["minimax-m3", "qwen3.7-max"] {
-            assert!(
-                catalog_offering_for_model(ApiProvider::OpencodeGo, messages_only).is_none(),
-                "saved/live {messages_only} row must not bypass the Chat-only lake cutline"
-            );
+        for (model, endpoint) in [("minimax-m3", "messages"), ("grok-4.6", "responses")] {
+            let row = catalog_offering_for_model(ApiProvider::OpencodeGo, model)
+                .expect("documented model survives refresh");
+            assert_eq!(row.endpoint_key, endpoint);
         }
         assert!(
             catalog_offering_for_model(

@@ -17,6 +17,16 @@ function snapshot(overrides: Partial<RepoFacts> = {}): RepoFacts {
     crates: ["cli", "tui"],
     sandboxBackends: ["seatbelt (macOS)"],
     providers: [{ id: "deepseek", label: "DeepSeek", env: "DEEPSEEK_API_KEY" }],
+    models: [
+      {
+        id: "deepseek-v4-pro",
+        provider: "DeepSeek",
+        contextWindow: 1000000,
+        maxOutput: 128000,
+        reasoning: true,
+        addedAt: "2026-07-01",
+      },
+    ],
     defaultModel: "deepseek-v4-pro",
     nodeEngines: ">=18",
     toolCount: 66,

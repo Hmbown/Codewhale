@@ -17,25 +17,26 @@ use super::{
     DEFAULT_HUGGINGFACE_MODEL, DEFAULT_LONGCAT_BASE_URL, DEFAULT_LONGCAT_MODEL,
     DEFAULT_META_BASE_URL, DEFAULT_META_MODEL, DEFAULT_MINIMAX_ANTHROPIC_BASE_URL,
     DEFAULT_MINIMAX_BASE_URL, DEFAULT_MINIMAX_MODEL, DEFAULT_MISTRAL_BASE_URL,
-    DEFAULT_MISTRAL_MODEL, DEFAULT_MODELSTUDIO_CODING_PLAN_BASE_URL,
-    DEFAULT_MODELSTUDIO_TOKEN_PLAN_BASE_URL, DEFAULT_MODELSTUDIO_TOKEN_PLAN_MODEL,
-    DEFAULT_MOONSHOT_BASE_URL, DEFAULT_MOONSHOT_MODEL, DEFAULT_NOVITA_BASE_URL,
-    DEFAULT_NOVITA_MODEL, DEFAULT_NVIDIA_NIM_BASE_URL, DEFAULT_NVIDIA_NIM_MODEL,
-    DEFAULT_OLLAMA_BASE_URL, DEFAULT_OLLAMA_CLOUD_BASE_URL, DEFAULT_OLLAMA_CLOUD_MODEL,
-    DEFAULT_OLLAMA_MODEL, DEFAULT_OPENAI_BASE_URL, DEFAULT_OPENAI_CODEX_BASE_URL,
-    DEFAULT_OPENAI_CODEX_MODEL, DEFAULT_OPENAI_MODEL, DEFAULT_OPENCODE_GO_BASE_URL,
-    DEFAULT_OPENCODE_GO_MODEL, DEFAULT_OPENCODE_ZEN_BASE_URL, DEFAULT_OPENCODE_ZEN_MODEL,
-    DEFAULT_OPENMODEL_BASE_URL, DEFAULT_OPENMODEL_MODEL, DEFAULT_OPENROUTER_BASE_URL,
-    DEFAULT_OPENROUTER_MODEL, DEFAULT_ORCAROUTER_BASE_URL, DEFAULT_ORCAROUTER_MODEL,
-    DEFAULT_QIANFAN_BASE_URL, DEFAULT_QIANFAN_MODEL, DEFAULT_SAKANA_BASE_URL, DEFAULT_SAKANA_MODEL,
-    DEFAULT_SGLANG_BASE_URL, DEFAULT_SGLANG_MODEL, DEFAULT_SILICONFLOW_BASE_URL,
-    DEFAULT_SILICONFLOW_CN_BASE_URL, DEFAULT_SILICONFLOW_MODEL, DEFAULT_STEPFUN_BASE_URL,
-    DEFAULT_STEPFUN_MODEL, DEFAULT_TELECOMJS_BASE_URL, DEFAULT_TELECOMJS_MODEL,
-    DEFAULT_TOGETHER_BASE_URL, DEFAULT_TOGETHER_MODEL, DEFAULT_VLLM_BASE_URL, DEFAULT_VLLM_MODEL,
-    DEFAULT_VOLCENGINE_BASE_URL, DEFAULT_VOLCENGINE_MODEL, DEFAULT_WANJIE_ARK_BASE_URL,
-    DEFAULT_WANJIE_ARK_MODEL, DEFAULT_XAI_BASE_URL, DEFAULT_XAI_MODEL,
-    DEFAULT_XIAOMI_MIMO_BASE_URL, DEFAULT_XIAOMI_MIMO_MODEL, DEFAULT_ZAI_BASE_URL,
-    DEFAULT_ZAI_MODEL, MODELSTUDIO_CODING_PLAN_ANTHROPIC_BASE_URL,
+    DEFAULT_MISTRAL_MODEL, DEFAULT_MODELSCOPE_BASE_URL, DEFAULT_MODELSCOPE_MODEL,
+    DEFAULT_MODELSTUDIO_CODING_PLAN_BASE_URL, DEFAULT_MODELSTUDIO_TOKEN_PLAN_BASE_URL,
+    DEFAULT_MODELSTUDIO_TOKEN_PLAN_MODEL, DEFAULT_MOONSHOT_BASE_URL, DEFAULT_MOONSHOT_MODEL,
+    DEFAULT_NOVITA_BASE_URL, DEFAULT_NOVITA_MODEL, DEFAULT_NVIDIA_NIM_BASE_URL,
+    DEFAULT_NVIDIA_NIM_MODEL, DEFAULT_OLLAMA_BASE_URL, DEFAULT_OLLAMA_CLOUD_BASE_URL,
+    DEFAULT_OLLAMA_CLOUD_MODEL, DEFAULT_OLLAMA_MODEL, DEFAULT_OPENAI_BASE_URL,
+    DEFAULT_OPENAI_CODEX_BASE_URL, DEFAULT_OPENAI_CODEX_MODEL, DEFAULT_OPENAI_MODEL,
+    DEFAULT_OPENCODE_GO_BASE_URL, DEFAULT_OPENCODE_GO_MODEL, DEFAULT_OPENCODE_ZEN_BASE_URL,
+    DEFAULT_OPENCODE_ZEN_MODEL, DEFAULT_OPENMODEL_BASE_URL, DEFAULT_OPENMODEL_MODEL,
+    DEFAULT_OPENROUTER_BASE_URL, DEFAULT_OPENROUTER_MODEL, DEFAULT_ORCAROUTER_BASE_URL,
+    DEFAULT_ORCAROUTER_MODEL, DEFAULT_QIANFAN_BASE_URL, DEFAULT_QIANFAN_MODEL,
+    DEFAULT_SAKANA_BASE_URL, DEFAULT_SAKANA_MODEL, DEFAULT_SGLANG_BASE_URL, DEFAULT_SGLANG_MODEL,
+    DEFAULT_SILICONFLOW_BASE_URL, DEFAULT_SILICONFLOW_CN_BASE_URL, DEFAULT_SILICONFLOW_MODEL,
+    DEFAULT_STEPFUN_BASE_URL, DEFAULT_STEPFUN_MODEL, DEFAULT_TELECOMJS_BASE_URL,
+    DEFAULT_TELECOMJS_MODEL, DEFAULT_TOGETHER_BASE_URL, DEFAULT_TOGETHER_MODEL,
+    DEFAULT_VLLM_BASE_URL, DEFAULT_VLLM_MODEL, DEFAULT_VOLCENGINE_BASE_URL,
+    DEFAULT_VOLCENGINE_MODEL, DEFAULT_WANJIE_ARK_BASE_URL, DEFAULT_WANJIE_ARK_MODEL,
+    DEFAULT_XAI_BASE_URL, DEFAULT_XAI_MODEL, DEFAULT_XIAOMI_MIMO_BASE_URL,
+    DEFAULT_XIAOMI_MIMO_MODEL, DEFAULT_ZAI_BASE_URL, DEFAULT_ZAI_MODEL, DEFAULT_ZENMUX_BASE_URL,
+    DEFAULT_ZENMUX_MODEL, MODELSTUDIO_CODING_PLAN_ANTHROPIC_BASE_URL,
     MODELSTUDIO_TOKEN_PLAN_ANTHROPIC_BASE_URL, ProviderKind,
 };
 
@@ -371,6 +372,12 @@ pub const fn credential_help(kind: ProviderKind) -> CredentialHelp {
             docs_url: Some("https://huggingface.co/docs/hub/en/security-tokens"),
             guidance: "Create a scoped Hugging Face access token.",
         },
+        ProviderKind::Modelscope => CredentialHelp {
+            acquisition: ApiKey,
+            credential_url: Some("https://modelscope.cn/my/settings/token"),
+            docs_url: None,
+            guidance: "Create an SDK token in ModelScope account settings.",
+        },
         ProviderKind::Together => CredentialHelp {
             acquisition: ApiKey,
             credential_url: Some("https://api.together.ai/settings/api-keys"),
@@ -480,6 +487,12 @@ pub const fn credential_help(kind: ProviderKind) -> CredentialHelp {
             credential_url: Some("https://app.edenai.run/settings/api-keys"),
             docs_url: Some("https://www.edenai.co/docs"),
             guidance: "Create an Eden AI API key from the Eden AI dashboard, then select models by their provider/model namespaced id.",
+        },
+        ProviderKind::Zenmux => CredentialHelp {
+            acquisition: ApiKey,
+            credential_url: Some("https://zenmux.ai/platform/pay-as-you-go"),
+            docs_url: Some("https://zenmux.ai/docs/"),
+            guidance: "Create a ZenMux API key from the Pay As You Go management page, then select models by their provider/model namespaced id. The catalog at https://zenmux.ai/api/v1/models is keyless-readable.",
         },
         ProviderKind::Codewhale => CredentialHelp {
             acquisition: ApiKey,
@@ -684,6 +697,7 @@ macro_rules! provider {
         [$($env_var:literal),* $(,)?],
         $config_key:literal,
         aliases: [$($alias:literal),* $(,)?]
+        $(, wire_policy: $wire_policy:expr)?
     ) => {
         /// Zero-sized metadata entry for this built-in provider.
         pub struct $struct_name;
@@ -720,6 +734,10 @@ macro_rules! provider {
             fn aliases(&self) -> &'static [&'static str] {
                 &[$($alias),*]
             }
+
+            $(fn wire_policy(&self) -> WirePolicy {
+                $wire_policy
+            })?
         }
     };
 }
@@ -1064,6 +1082,17 @@ provider!(
     aliases: ["hugging-face", "hugging_face", "hf"]
 );
 provider!(
+    Modelscope,
+    Modelscope,
+    "modelscope",
+    "ModelScope",
+    DEFAULT_MODELSCOPE_BASE_URL,
+    DEFAULT_MODELSCOPE_MODEL,
+    ["MODELSCOPE_API_KEY"],
+    "modelscope",
+    aliases: ["model-scope", "model_scope", "modelscope-cn", "modelscope_cn"]
+);
+provider!(
     Together,
     Together,
     "together",
@@ -1376,7 +1405,8 @@ provider!(
     DEFAULT_OPENCODE_GO_MODEL,
     ["OPENCODE_GO_API_KEY"],
     "opencode_go",
-    aliases: ["opencode_go", "opencodego"]
+    aliases: ["opencode_go", "opencodego"],
+    wire_policy: WirePolicy::ModelAware
 );
 
 /// OpenCode Zen gateway with a model-scoped wire protocol.
@@ -1426,8 +1456,9 @@ impl Provider for OpencodeZen {
 /// scope. The account's authenticated `GET {base}/models` is the catalog
 /// authority: each row is `provider/model` and carries the protocol
 /// (`chat-completions` → `{base}/chat/completions`, `anthropic-messages` →
-/// `{base}/messages`). Both protocols authenticate with `Authorization:
-/// Bearer`; the Anthropic passthrough deliberately does not take `x-api-key`.
+/// `{base}/messages`, `responses` → `{base}/responses`). Every protocol
+/// authenticates with `Authorization: Bearer`; the Anthropic passthrough
+/// deliberately does not take `x-api-key`.
 pub struct Codewhale;
 
 impl Provider for Codewhale {
@@ -1525,6 +1556,17 @@ provider!(
     ["EDENAI_API_KEY"],
     "edenai",
     aliases: ["eden-ai", "eden_ai"]
+);
+provider!(
+    Zenmux,
+    Zenmux,
+    "zenmux",
+    "ZenMux",
+    DEFAULT_ZENMUX_BASE_URL,
+    DEFAULT_ZENMUX_MODEL,
+    ["ZENMUX_API_KEY"],
+    "zenmux",
+    aliases: ["zen-mux", "zen_mux"]
 );
 
 /// Concentrate — OpenAI Responses-compatible AI gateway (aggregator).
@@ -1849,6 +1891,7 @@ static VLLM: Vllm = Vllm;
 static OLLAMA: Ollama = Ollama;
 static OLLAMA_CLOUD: OllamaCloud = OllamaCloud;
 static HUGGINGFACE: Huggingface = Huggingface;
+static MODELSCOPE: Modelscope = Modelscope;
 static TOGETHER: Together = Together;
 static QIANFAN: Qianfan = Qianfan;
 static OPENAI_CODEX: OpenaiCodex = OpenaiCodex;
@@ -1869,6 +1912,7 @@ static MISTRAL: Mistral = Mistral;
 static ANTIGRAVITY: Antigravity = Antigravity;
 static TELECOMJS: Telecomjs = Telecomjs;
 static EDENAI: Edenai = Edenai;
+static ZENMUX: Zenmux = Zenmux;
 static CONCENTRATE: Concentrate = Concentrate;
 static CODEWHALE: Codewhale = Codewhale;
 static MODELSTUDIO_TOKEN_PLAN: ModelstudioTokenPlan = ModelstudioTokenPlan;
@@ -1879,7 +1923,7 @@ static MODELSTUDIO_CODING_PLAN_ANTHROPIC: ModelstudioCodingPlanAnthropic =
     ModelstudioCodingPlanAnthropic;
 static CUSTOM: Custom = Custom;
 
-static PROVIDER_REGISTRY: [&dyn Provider; 49] = [
+static PROVIDER_REGISTRY: [&dyn Provider; 51] = [
     &DEEPSEEK,
     &DEEPSEEK_ANTHROPIC,
     &NVIDIA_NIM,
@@ -1901,6 +1945,7 @@ static PROVIDER_REGISTRY: [&dyn Provider; 49] = [
     &OLLAMA,
     &OLLAMA_CLOUD,
     &HUGGINGFACE,
+    &MODELSCOPE,
     &TOGETHER,
     &QIANFAN,
     &OPENAI_CODEX,
@@ -1920,6 +1965,7 @@ static PROVIDER_REGISTRY: [&dyn Provider; 49] = [
     &MISTRAL,
     &TELECOMJS,
     &EDENAI,
+    &ZENMUX,
     &CONCENTRATE,
     &CODEWHALE,
     &MODELSTUDIO_TOKEN_PLAN,

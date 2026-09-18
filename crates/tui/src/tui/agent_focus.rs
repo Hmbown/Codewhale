@@ -779,6 +779,7 @@ mod tests {
         );
         app.subagent_cache
             .push(crate::tools::subagent::SubAgentResult {
+                usage: None,
                 name: "agent_scout".to_string(),
                 agent_id: "agent_scout".to_string(),
                 context_mode: "fresh".to_string(),

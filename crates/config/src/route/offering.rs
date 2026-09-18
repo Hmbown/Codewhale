@@ -213,7 +213,9 @@ pub const CODEWHALE_FALLBACK_MODELS: &[&str] = &[
 /// this is the offline inference used for the bootstrap rows and for a model
 /// id the local catalog has never seen. Only the `anthropic/` namespace routes
 /// to `{base}/messages`; everything else is OpenAI Chat Completions at
-/// `{base}/chat/completions`.
+/// `{base}/chat/completions`. The id alone carries no signal for the
+/// Responses surface — a `responses` row only ever comes from the catalog's
+/// stated `codewhale.protocol`, never from a model name.
 #[must_use]
 pub fn codewhale_endpoint_key_for_model(model: &str) -> &'static str {
     if model.trim().to_ascii_lowercase().starts_with("anthropic/") {
@@ -231,7 +233,11 @@ pub fn codewhale_endpoint_key_for_model(model: &str) -> &'static str {
 #[must_use]
 pub fn bundled_offerings() -> Vec<ProviderModelOffering> {
     // DeepSeek's 2026-07-31 production Flash update added a native Responses
-    // endpoint without changing the model id. Pro remains Chat Completions
+    // endpoint without changing the model id, and the 2026-08 unversioned
+    // rename to `deepseek-flash` kept that wire: DeepSeek's own Codex
+    // integration documents the Responses API as the path for `deepseek-flash`
+    // (legacy `deepseek-v4-flash` ids are served by the same model). The
+    // shipped default therefore rides Responses; Pro remains Chat Completions
     // until its announced Responses rollout. These exact-route transport facts
     // cannot be represented by the Models.dev-shaped fallback asset.
     let deepseek = ProviderId::from("deepseek");
@@ -256,10 +262,20 @@ pub fn bundled_offerings() -> Vec<ProviderModelOffering> {
     let mut offerings = vec![
         ProviderModelOffering {
             provider: deepseek.clone(),
+            canonical_model: Some(ModelId::from("deepseek-flash")),
+            wire_model_id: WireModelId::from("deepseek-flash"),
+            endpoint_key: "responses".to_string(),
+            default_for_provider: true,
+            limits: documented_limits,
+            capabilities: documented_capabilities,
+            pricing: PricingSku::UnknownOrStale,
+        },
+        ProviderModelOffering {
+            provider: deepseek.clone(),
             canonical_model: Some(ModelId::from("deepseek-v4-pro")),
             wire_model_id: WireModelId::from("deepseek-v4-pro"),
             endpoint_key: "chat".to_string(),
-            default_for_provider: true,
+            default_for_provider: false,
             limits: documented_limits,
             capabilities: documented_capabilities,
             pricing: PricingSku::UnknownOrStale,
@@ -292,6 +308,23 @@ pub fn bundled_offerings() -> Vec<ProviderModelOffering> {
             pricing: PricingSku::UnknownOrStale,
         },
     ];
+
+    offerings.extend(
+        crate::opencode_go::MODEL_GROUPS
+            .iter()
+            .flat_map(|(endpoint_key, models)| {
+                models.iter().map(move |model| ProviderModelOffering {
+                    provider: ProviderId::from("opencode-go"),
+                    canonical_model: None,
+                    wire_model_id: WireModelId::from(*model),
+                    endpoint_key: (*endpoint_key).to_string(),
+                    default_for_provider: *model == crate::DEFAULT_OPENCODE_GO_MODEL,
+                    limits: RouteLimits::default(),
+                    capabilities: RouteCapabilities::default(),
+                    pricing: PricingSku::UnknownOrStale,
+                })
+            }),
+    );
 
     let provider = ProviderId::from("opencode-zen");
     let groups = [

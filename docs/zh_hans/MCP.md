@@ -97,7 +97,7 @@ v0.9.10 的产品建议使用这些经过审查的固定版本定义。Plugins �
 | --- | --- | --- | --- | --- |
 | Chrome DevTools | MCP 服务器（stdio） | `npx -y chrome-devtools-mcp@1.7.0`（Windows 上为 `npx.cmd`） | [ChromeDevTools 官方项目](https://github.com/ChromeDevTools/chrome-devtools-mcp) | 用户重启 MCP 时，npm 可能会下载固定版本的包。 |
 | Playwright | MCP 服务器（stdio） | `npx -y @playwright/mcp@0.0.79 --isolated`（Windows 上为 `npx.cmd`） | [微软官方项目](https://github.com/microsoft/playwright-mcp) | `--isolated` 会启动全新的浏览器配置文件；npm 只会在显式重启后才下载固定版本的包。 |
-| Cua Computer Use | MCP 服务器（stdio） | `cua-driver mcp`；Driver `0.20.0` 已为本版本审查 | [Cua 官方项目](https://github.com/trycua/cua)；预览集成 | 签名驱动和操作系统权限是分开的、显式的安装。`/mcp add recommended cua` 只写入配置，绝不会安装或授予其中任何一项。 |
+| Computer Use | 第一方插件（MCP + skill） | 随二进制内置为 `computer-use` 插件 | Codewhale；通过 `/plugin` 或扩展市场启用 | 这是 Codewhale 唯一推荐的计算机操作集成。此处不再列出第三方桌面控制 MCP。 |
 | Browser Use | Skill 加单独安装的 Python 运行时 | Skill/运行时版本 `0.13.8` | [browser-use 官方项目](https://github.com/browser-use/browser-use) | 可选配套：不是 MCP 服务器。Codewhale 不会自动运行上游的 Skill 安装器，也不会安装其浏览器/运行时依赖。 |
 | Anthropic Sandbox Runtime | 沙箱适配器配套 | `@anthropic-ai/sandbox-runtime@0.0.73` | [anthropic-experimental 官方项目](https://github.com/anthropic-experimental/sandbox-runtime)；测试版 | v0.9.10 中仅文档说明的适配器候选：不是 MCP 服务器，也不是活跃的 Codewhale 插件适配器。它不会取代 Codewhale 的沙箱策略。 |
 

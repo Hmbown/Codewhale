@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "runtimeVersion": "0.9.13",
+  "runtimeVersion": "0.9.14",
   "routes": [
     {
       "id": "anthropic",
@@ -421,6 +421,24 @@
       "transport": "chat-completions"
     },
     {
+      "id": "modelscope",
+      "family": "modelscope",
+      "label": "ModelScope",
+      "endpoint": "https://api-inference.modelscope.cn/v1",
+      "wire": "chat-completions",
+      "defaultModel": "Qwen/Qwen3.5-397B-A17B",
+      "envVars": [
+        "MODELSCOPE_API_KEY"
+      ],
+      "auth": [
+        {
+          "kind": "api-key",
+          "label": "API key"
+        }
+      ],
+      "transport": "chat-completions"
+    },
+    {
       "id": "modelstudio-coding-plan",
       "family": "alibaba-modelstudio",
       "label": "Alibaba Cloud Model Studio",
@@ -789,7 +807,7 @@
       "family": "opencode-go",
       "label": "OpenCode Go",
       "endpoint": "https://opencode.ai/zen/go/v1",
-      "wire": "chat-completions",
+      "wire": "model-aware",
       "defaultModel": "deepseek-v4-pro",
       "envVars": [
         "OPENCODE_GO_API_KEY"
@@ -800,7 +818,7 @@
           "label": "API key"
         }
       ],
-      "transport": "chat-completions"
+      "transport": "model-aware"
     },
     {
       "id": "opencode-zen",
@@ -1243,6 +1261,24 @@
         },
         {
           "id": "glm-5.1"
+        }
+      ],
+      "transport": "chat-completions"
+    },
+    {
+      "id": "zenmux",
+      "family": "zenmux",
+      "label": "ZenMux",
+      "endpoint": "https://zenmux.ai/api/v1",
+      "wire": "chat-completions",
+      "defaultModel": "deepseek/deepseek-v4.1-flash",
+      "envVars": [
+        "ZENMUX_API_KEY"
+      ],
+      "auth": [
+        {
+          "kind": "api-key",
+          "label": "API key"
         }
       ],
       "transport": "chat-completions"

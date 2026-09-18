@@ -117,7 +117,7 @@ pub(crate) fn prune_undone_tool_context(app: &mut App, tool_id: &str) {
             .map(|(msg, stamp)| (msg.clone(), stamp))
             .collect();
     app.truncate_api_messages(msg_idx + 1);
-    app.api_messages[msg_idx].content = kept_blocks;
+    app.api_messages_mut()[msg_idx].content = kept_blocks;
     for (message, stamp) in preserved_tool_results {
         app.push_api_message_stamped(message, stamp);
     }
@@ -203,10 +203,19 @@ pub fn patch_undo(app: &mut App) -> CommandResult {
     // Pick the newest current-session candidate whose tree differs from the
     // workspace. Skipping identical snapshots makes repeated `/undo` walk
     // backward only inside the proven session boundary.
-    let differs = |s: &&crate::snapshot::Snapshot| {
-        matches!(repo.work_tree_matches_snapshot(&s.id), Ok(false))
-    };
-    let target = candidates.iter().find(differs);
+    let mut target = None;
+    for snapshot in &candidates {
+        match repo.work_tree_matches_snapshot(&snapshot.id) {
+            Ok(false) => {
+                target = Some(snapshot);
+                break;
+            }
+            Ok(true) => {}
+            Err(error) => {
+                return CommandResult::error(format!("Failed to compare snapshot: {error}"));
+            }
+        }
+    }
 
     let Some(target) = target else {
         return CommandResult::message(
@@ -224,6 +233,19 @@ pub fn patch_undo(app: &mut App) -> CommandResult {
         );
     }
 
+    // Capture what this restore is about to change *before* it runs: after the
+    // checkout the work tree matches the snapshot and the diff is empty by
+    // construction. Computed in the side repo, not the user's — the user's
+    // `git diff --stat` reports their own uncommitted work, which is not what
+    // the undo changed.
+    let diff_stat = match repo.snapshot_diff_stat(&target.id) {
+        Ok(stat) => stat,
+        Err(e) => {
+            tracing::warn!(target: "snapshot", "diff stat for the undo summary failed: {e}");
+            None
+        }
+    };
+
     if let Err(e) = repo.restore(&target.id) {
         return CommandResult::error(format!("Restore failed: {e}"));
     }
@@ -233,20 +255,6 @@ pub fn patch_undo(app: &mut App) -> CommandResult {
     } else if target.label.starts_with("pre-turn:") {
         prune_undone_turn_context(app);
     }
-
-    // Show diff stat so the user knows what changed.
-    let diff_stat = Git::command()
-        .map(|mut git| {
-            git.args(["diff", "--stat"])
-                .current_dir(&workspace)
-                .output()
-                .ok()
-                .and_then(|o| {
-                    let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
-                    if s.is_empty() { None } else { Some(s) }
-                })
-        })
-        .unwrap_or(None);
 
     let short = &target.id.as_str()[..target.id.as_str().len().min(8)];
     let summary = match diff_stat {
@@ -276,7 +284,7 @@ pub fn patch_undo(app: &mut App) -> CommandResult {
         summary,
         AppAction::SyncSession {
             session_id: app.current_session_id.clone(),
-            messages: app.api_messages.clone(),
+            messages: app.api_messages.as_ref().clone(),
             system_prompt: app.system_prompt.clone(),
             model: app.model.clone(),
             workspace: app.workspace.clone(),

@@ -14,7 +14,7 @@ use super::CommandResult;
 pub(in crate::commands) const COMMAND_INFO: CommandInfo = CommandInfo {
     name: "provider",
     aliases: &[],
-    usage: "/provider [setup [name]|templates|name [model]]",
+    usage: "/provider [setup [name]|name [model]]",
     description_id: MessageId::CmdProviderDescription,
 };
 
@@ -48,14 +48,6 @@ pub fn provider(app: &mut App, args: Option<&str>) -> CommandResult {
 
     if name.eq_ignore_ascii_case("fallback") {
         return provider_fallback(app, model_arg);
-    }
-    if name.eq_ignore_ascii_case("templates") || name.eq_ignore_ascii_case("template") {
-        if model_arg.is_some() {
-            return CommandResult::error(
-                "Usage: /provider templates — open beginner setup templates.".to_string(),
-            );
-        }
-        return CommandResult::action(AppAction::OpenProviderTemplateList);
     }
     if name.eq_ignore_ascii_case("setup") {
         return match model_arg {
@@ -128,27 +120,15 @@ pub(in crate::commands) fn provider_setup_action_for_name(raw: &str) -> Result<A
     if raw.eq_ignore_ascii_case("ds4") || raw.eq_ignore_ascii_case("dwarfstar") {
         return Ok(AppAction::OpenDs4Setup);
     }
-    if let Some(template) = codewhale_config::provider_setup_template(raw) {
-        match template.apply {
-            codewhale_config::ProviderSetupApply::FirstClass(kind) => {
-                return Ok(AppAction::OpenProviderSetup {
-                    provider: Some(ApiProvider::from_kind(kind)),
-                });
-            }
-            codewhale_config::ProviderSetupApply::Compatible
-            | codewhale_config::ProviderSetupApply::Unpublished => {
-                return Ok(AppAction::OpenTemplateSetup {
-                    template_id: template.id.to_string(),
-                });
-            }
-        }
-    }
+    // First-class aliases (zen, opencode-zen, …) resolve through the provider
+    // registry. There are no setup templates anymore: named custom hosts are
+    // configured with `/provider setup` and the blank custom form (#6289).
     match ApiProvider::parse(raw) {
         Some(provider) => Ok(AppAction::OpenProviderSetup {
             provider: Some(provider),
         }),
         None => Err(format!(
-            "Unknown provider '{raw}'. Expected: {}, or a template (agnes, sensenova, opencode-zen, opencode-go).",
+            "Unknown provider '{raw}'. Expected: {}.",
             ApiProvider::names_hint()
         )),
     }
@@ -323,36 +303,28 @@ mod tests {
     }
 
     #[test]
-    fn setup_subcommand_opens_agnes_unpublished_template() {
+    fn setup_subcommand_rejects_retired_template_name() {
         let mut app = create_test_app();
         let result = provider(&mut app, Some("setup agnes"));
-        assert_eq!(
-            result.action,
-            Some(AppAction::OpenTemplateSetup {
-                template_id: "agnes".to_string(),
-            })
-        );
-        assert!(result.message.is_none());
+        assert!(result.action.is_none());
+        let msg = result.message.expect("expected error message");
+        assert!(msg.contains("Unknown provider 'agnes'"));
+        assert!(result.is_error);
     }
 
     #[test]
-    fn setup_subcommand_opens_first_class_zen_template() {
+    fn setup_subcommand_opens_first_class_zen_provider() {
         let mut app = create_test_app();
-        let result = provider(&mut app, Some("setup opencode-zen"));
-        assert_eq!(
-            result.action,
-            Some(AppAction::OpenProviderSetup {
-                provider: Some(ApiProvider::OpencodeZen),
-            })
-        );
-    }
-
-    #[test]
-    fn templates_subcommand_opens_template_list() {
-        let mut app = create_test_app();
-        let result = provider(&mut app, Some("templates"));
-        assert_eq!(result.action, Some(AppAction::OpenProviderTemplateList));
-        assert!(result.message.is_none());
+        for name in ["setup opencode-zen", "setup zen"] {
+            let result = provider(&mut app, Some(name));
+            assert_eq!(
+                result.action,
+                Some(AppAction::OpenProviderSetup {
+                    provider: Some(ApiProvider::OpencodeZen),
+                }),
+                "{name} must resolve through the provider registry"
+            );
+        }
     }
 
     #[test]

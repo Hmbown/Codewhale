@@ -21,6 +21,9 @@ use codewhale_app_server::daemon_socket::{DaemonSocketOptions, run_daemon_socket
 use codewhale_app_server::{
     AppServerOptions, run as run_app_server, run_stdio as run_app_server_stdio,
 };
+use codewhale_config::credentials::{
+    clear_provider_api_key_from_config, provider_slot, set_provider_api_key,
+};
 use codewhale_config::route::{ProvidersExport, parse_route_kind};
 use codewhale_config::{
     CliRuntimeOverrides, ConfigApiKeyValueKind, ConfigStore, ConfigToml, ProviderKind,
@@ -229,6 +232,7 @@ Common forwarded flags:
   --session-id <SESSION_ID>        Resume a previous session by ID or prefix
   --continue                       Continue the most recent session for this workspace
   --output-format <FORMAT>         Output format: text or stream-json
+  --hooks                          Opt in to configured hooks (tool_call_before, shell_env)
 
 Plain `codewhale exec` is a one-shot model response. Use `--auto` for
 non-interactive filesystem/shell tool use, matching the supported automation
@@ -296,6 +300,10 @@ lifecycle generation you observed.
     Eval(TuiPassthroughArgs),
     /// Manage MCP servers.
     Mcp(TuiPassthroughArgs),
+    /// Run the shared ambient pet owner (`pet serve`). Internal: spawned
+    /// lazily by clients when no owner is running.
+    #[command(name = "pet", hide = true)]
+    Pet(TuiPassthroughArgs),
     /// Inspect feature flags.
     Features(TuiPassthroughArgs),
     /// Connect third-party harnesses through Codewhale (e.g. `integrations dsh status`).
@@ -2114,6 +2122,19 @@ fn run() -> Result<()> {
             let resolved_runtime = resolve_runtime_for_dispatch(&mut store, &runtime_overrides);
             run_tui_in_process(&cli, &resolved_runtime, tui_args("mcp", args))
         }
+        Some(Commands::Pet(args)) => {
+            // `pet` must reach run_with_args at argv[1]; the TUI passthrough
+            // builder would inject global flags ahead of it and the trailing
+            // PROMPT positional would otherwise swallow `pet serve`.
+            let mut argv = vec!["codewhale".to_string(), "pet".to_string()];
+            argv.extend(args.args);
+            let code = codewhale_tui::run(argv);
+            std::process::exit(if code == std::process::ExitCode::SUCCESS {
+                0
+            } else {
+                1
+            });
+        }
         Some(Commands::Integrations(args)) => {
             // Integrations only need route *identity*. Do not recover or
             // export a stored credential just to plan/launch a third-party
@@ -2619,141 +2640,11 @@ fn clear_account_session(profile: Option<&str>) -> Result<(), String> {
         .map_err(|error| error.to_string())
 }
 
-/// Map [`ProviderKind`] to the canonical provider credential slot.
-fn provider_slot(provider: ProviderKind) -> &'static str {
-    // Shared-account families (SiliconFlow China, the four Model Studio
-    // variants) collapse onto one slot; see ProviderKind::secret_store_slot.
-    provider.secret_store_slot()
-}
-
-/// Resolve the store for credential-adjacent writes: provider selection,
-/// `auth_mode` markers, and the plaintext-free metadata that accompanies a
-/// saved key.
-///
-/// Credentials and their metadata are user-global — a key saved while
-/// working in one repo must be visible from every other repo, and the secret
-/// store already is (#5045). When the ambient config path is a
-/// workspace-scoped document (`<repo>/.codewhale/config.toml`), login and
-/// `auth set` must not bind the provider or write auth markers there: the
-/// binding would be invisible from every other repo and would invite
-/// plaintext keys into a committable repo file (#5198). Returns a store
-/// loaded on the user-global document in that case, or `None` when the
-/// ambient store is already correctly scoped, so key + provider binding +
-/// auth markers share one user-global scope by default.
-fn credential_metadata_store(store: &ConfigStore) -> Result<Option<ConfigStore>> {
-    if !codewhale_config::config_path_is_workspace_scoped(store.path()) {
-        return Ok(None);
-    }
-    let global = codewhale_config::default_config_path()?;
-    eprintln!(
-        "ambient config {} is workspace-scoped; writing credential metadata to the user-global {} instead",
-        codewhale_config::quote_os_path(store.path()),
-        codewhale_config::quote_os_path(&global),
-    );
-    ConfigStore::load(Some(global)).map(Some)
-}
-
 #[cfg(test)]
 fn no_keyring_secrets() -> Secrets {
     Secrets::new(std::sync::Arc::new(
         codewhale_secrets::InMemoryKeyringStore::new(),
     ))
-}
-
-fn prepare_provider_api_key_metadata(store: &mut ConfigStore, provider: ProviderKind) {
-    store.config.auth_mode = Some("api_key".to_string());
-    let provider_config = store.config.providers.for_provider_mut(provider);
-    provider_config.auth_mode = Some("api_key".to_string());
-    provider_config.external_credentials = None;
-    if provider == ProviderKind::Xai {
-        provider_config.oauth_credential_generation = None;
-    }
-    if provider == ProviderKind::Deepseek && store.config.default_text_model.is_none() {
-        store.config.default_text_model = Some(
-            store
-                .config
-                .providers
-                .deepseek
-                .model
-                .clone()
-                .unwrap_or_else(|| "deepseek-v4-pro".to_string()),
-        );
-    }
-}
-
-/// Persist a provider credential to the durable secret store without silently
-/// downgrading a backend failure to plaintext config storage.
-fn persist_provider_api_key(
-    store: &mut ConfigStore,
-    secrets: &Secrets,
-    provider: ProviderKind,
-    api_key: &str,
-) -> Result<bool> {
-    if provider == ProviderKind::Xai {
-        return codewhale_config::with_xai_oauth_revocation_transaction(|| {
-            persist_provider_api_key_unlocked(store, secrets, provider, api_key)
-        });
-    }
-    persist_provider_api_key_unlocked(store, secrets, provider, api_key)
-}
-
-fn persist_provider_api_key_unlocked(
-    store: &mut ConfigStore,
-    secrets: &Secrets,
-    provider: ProviderKind,
-    api_key: &str,
-) -> Result<bool> {
-    let original_config = store.config.clone();
-    prepare_provider_api_key_metadata(store, provider);
-    let slot = provider_slot(provider);
-    // A readable prior value is required before a secret-store write so a
-    // later config failure can restore the exact prior state. If the backend
-    // cannot provide that snapshot, fail before changing the config file.
-    let prior_secret = secrets.get(slot);
-    let secret_store_saved = match prior_secret.as_ref().map_err(|error| error.to_string()) {
-        Ok(_) => match secrets.set(slot, api_key) {
-            Ok(()) => {
-                clear_provider_api_key_from_config(store, provider);
-                true
-            }
-            Err(err) => {
-                store.config = original_config;
-                return Err(anyhow::anyhow!(
-                    "Secret storage write failed for {slot}: {err}. Refusing to write the API key in plaintext to {}. Fix the configured secret backend and retry; Codewhale did not change that file.",
-                    codewhale_config::quote_os_path(store.path())
-                ));
-            }
-        },
-        Err(error) => {
-            store.config = original_config;
-            return Err(anyhow::anyhow!(
-                "Secret storage snapshot failed for {slot}: {error}. Refusing to write the API key in plaintext to {}. Fix the configured secret backend and retry; Codewhale did not change that file.",
-                codewhale_config::quote_os_path(store.path())
-            ));
-        }
-    };
-    if let Err(error) = store.save() {
-        store.config = original_config;
-        if secret_store_saved {
-            let current = secrets
-                .get(slot)
-                .map_err(|rollback| anyhow::anyhow!(
-                    "{error}; additionally could not verify secret-store rollback for {slot}: {rollback}"
-                ))?;
-            if current.as_deref() == Some(api_key) {
-                match prior_secret.expect("snapshot succeeded before secret write") {
-                    Some(previous) => secrets.set(slot, &previous),
-                    None => secrets.delete(slot),
-                }
-                .map_err(|rollback| anyhow::anyhow!(
-                    "{error}; additionally failed to restore prior secret-store state for {slot}: {rollback}"
-                ))?;
-            }
-        }
-        return Err(error);
-    }
-    codewhale_config::scrub_plaintext_api_keys_from_config_backup(store.path())?;
-    Ok(secret_store_saved)
 }
 
 fn clear_auth_provider(
@@ -2764,20 +2655,17 @@ fn clear_auth_provider(
     if provider == ProviderKind::Antigravity {
         return clear_legacy_antigravity_config(store, secrets);
     }
-    let slot = provider_slot(provider);
-    let original_config = store.config.clone();
-    clear_provider_api_key_from_config(store, provider);
-    if provider == ProviderKind::Xai {
-        let xai = store.config.providers.for_provider_mut(provider);
-        xai.oauth_credential_generation = None;
-        xai.auth_mode = None;
-        xai.external_credentials = None;
+    let outcome = codewhale_config::credentials::clear_provider_api_key(store, secrets, provider)?;
+    let slot = outcome.slot;
+    // The secret-store leg used to fail silently here, which meant `auth clear`
+    // could print success while the key was still in the keyring. Say so
+    // instead; the config no longer advertises a key the backend may hold.
+    if let Some(error) = &outcome.secret_store_error {
+        println!(
+            "cleared API key for {slot} from config, but the secret store refused the delete: {error}"
+        );
+        return Ok(());
     }
-    if let Err(error) = store.save() {
-        store.config = original_config;
-        return Err(error);
-    }
-    clear_provider_api_key_from_keyring(secrets, provider);
     if provider == ProviderKind::Xai {
         println!("cleared xAI credentials from config, secret store, and owned OAuth storage");
     } else {
@@ -2850,13 +2738,6 @@ fn clear_legacy_antigravity_config(store: &mut ConfigStore, secrets: &Secrets) -
         "cleared Codewhale-owned legacy Antigravity config, consent, selection, fallback entries, and secret-store slot; Google and Antigravity sessions were not read, revoked, or changed. For Gemini, configure provider google and set GEMINI_API_KEY"
     );
     Ok(())
-}
-
-fn clear_provider_api_key_from_config(store: &mut ConfigStore, provider: ProviderKind) {
-    store.config.providers.for_provider_mut(provider).api_key = None;
-    if provider == ProviderKind::Deepseek {
-        store.config.api_key = None;
-    }
 }
 
 fn provider_env_set(provider: ProviderKind) -> bool {
@@ -2976,10 +2857,6 @@ fn provider_keyring_api_key(secrets: &Secrets, provider: ProviderKind) -> Option
 
 fn provider_keyring_set(secrets: &Secrets, provider: ProviderKind) -> bool {
     provider_keyring_api_key(secrets, provider).is_some()
-}
-
-fn clear_provider_api_key_from_keyring(secrets: &Secrets, provider: ProviderKind) {
-    let _ = secrets.delete(provider_slot(provider));
 }
 
 /// Delete the keyring credential of every provider that has one stored.
@@ -4362,9 +4239,17 @@ fn run_auth_command_with_secrets_and_runtime(
                 (None, true) => read_api_key_from_stdin()?,
                 (None, false) => prompt_api_key(slot)?,
             };
-            let mut credential_store = credential_metadata_store(store)?;
+            let mut credential_store =
+                codewhale_config::credentials::credential_metadata_store(store)?;
+            if let Some(redirected) = credential_store.as_ref() {
+                eprintln!(
+                    "ambient config {} is workspace-scoped; writing credential metadata to the user-global {} instead",
+                    codewhale_config::quote_os_path(store.path()),
+                    codewhale_config::quote_os_path(redirected.path()),
+                );
+            }
             let store = credential_store.as_mut().unwrap_or(store);
-            let secret_store_saved = persist_provider_api_key(store, secrets, provider, &api_key)?;
+            let secret_store_saved = set_provider_api_key(store, secrets, provider, &api_key)?;
             // Don't print the key. Don't echo length.
             if secret_store_saved {
                 println!(
@@ -10273,11 +10158,11 @@ verbosity = "project-imported"
             .map(|provider| provider.kind())
             .collect();
         // Full registry keeps legacy dialect/plan kinds; ALL is the catalog surface.
-        assert_eq!(registry_kinds.len(), 49);
+        assert_eq!(registry_kinds.len(), 51);
         // The tombstone stays in the registry (old config must still parse
         // and clear) and left the catalog surface when it stopped being
         // selectable.
-        assert_eq!(ProviderKind::ALL.len(), 43);
+        assert_eq!(ProviderKind::ALL.len(), 45);
         for kind in ProviderKind::ALL {
             assert!(
                 registry_kinds.contains(&kind),

@@ -1,6 +1,7 @@
-//! Secret storage for CodeWhale API keys.
+//! Secret storage for CodeWhale API keys, plus the shared output-sanitization
+//! primitives that keep secrets out of diagnostics and command output.
 //!
-//! Provides a small abstraction (`KeyringStore`) plus a default
+//! Secret storage: provides a small abstraction (`KeyringStore`) plus a default
 //! file-based implementation (`FileKeyringStore`), an opt-in OS keyring
 //! implementation (`DefaultKeyringStore`), and an in-memory store for tests
 //! (`InMemoryKeyringStore`).
@@ -9,10 +10,31 @@
 //! and falls back to environment variables. Config-file precedence lives in the
 //! config crate so user-facing commands can keep `config -> secret store -> env`
 //! explicit at the call site.
+//!
+//! Sanitization: [`redact`] and [`sanitize`] are pure and carry no host types.
+//! They live here (FEAT-025 D4) because this is the lowest crate that both the
+//! config diagnostics path and the TUI already reach, so `/export`,
+//! `/structcopy`, client URL masking, and OSC8 stripping share exactly one
+//! implementation instead of drifting copies. `config::persistence` and
+//! `tui::client` / `tui::osc8` re-export or delegate to these functions.
+//!
+//! Note for the command extraction (EPIC-006): this crate is already reachable
+//! from `codewhale-command-contract` transitively via
+//! `core -> config -> secrets`, so consuming the sanitizer from the future
+//! `codewhale-commands` crate adds no new dependency edge. It does mean the
+//! sanitizer inherits this crate's OS keyring dependencies; if the surface grows
+//! beyond redaction, split a dedicated `codewhale-sanitize` crate rather than
+//! widening this one.
 #![deny(missing_docs)]
 
 /// Shared secure-storage contract for the Codewhale account session.
 pub mod account;
+/// Pure secret-redaction primitives shared by config diagnostics and the
+/// portable command sanitizer (FEAT-025 D4).
+pub mod redact;
+/// Pure text/URL/ANSI output sanitization shared by the portable command
+/// helpers (FEAT-025 D4).
+pub mod sanitize;
 
 use std::collections::HashMap;
 use std::fs;
@@ -1161,6 +1183,7 @@ impl Secrets {
 /// | `siliconflow` / `siliconflow-cn` | `SILICONFLOW_API_KEY` |
 /// | `arcee` / `arcee-ai` | `ARCEE_API_KEY` |
 /// | `moonshot` / `kimi` | `MOONSHOT_API_KEY`, `KIMI_API_KEY` |
+/// | `modelscope` / `modelscope-cn` | `MODELSCOPE_API_KEY` |
 /// | `sglang` | `SGLANG_API_KEY` |
 /// | `vllm` | `VLLM_API_KEY` |
 /// | `ollama` | `OLLAMA_API_KEY` |
@@ -1173,6 +1196,7 @@ impl Secrets {
 /// | `xai` / `grok` | `XAI_API_KEY` |
 /// | `telecomjs` / `tokenhub` | `TELECOMJS_API_KEY` |
 /// | `edenai` / `eden-ai` | `EDENAI_API_KEY` |
+/// | `zenmux` / `zen-mux` | `ZENMUX_API_KEY` |
 /// | `concentrate` / `concentrate-ai` | `CONCENTRATE_API_KEY` |
 /// | `codewhale` / `codewhale-api` | `CODEWHALE_API_KEY` |
 ///
@@ -1195,6 +1219,9 @@ pub fn env_for(name: &str) -> Option<String> {
         | "silicon-flow-cn" | "silicon_flow_cn" | "siliconflow-china" => &["SILICONFLOW_API_KEY"],
         "arcee" | "arcee-ai" | "arcee_ai" => &["ARCEE_API_KEY"],
         "moonshot" | "moonshot-ai" | "kimi" | "kimi-k2" => &["MOONSHOT_API_KEY", "KIMI_API_KEY"],
+        "modelscope" | "model-scope" | "model_scope" | "modelscope-cn" | "modelscope_cn" => {
+            &["MODELSCOPE_API_KEY"]
+        }
         "sglang" | "sg-lang" => &["SGLANG_API_KEY"],
         "vllm" | "v-llm" => &["VLLM_API_KEY"],
         "ollama" | "ollama-local" => &["OLLAMA_API_KEY"],
@@ -1227,6 +1254,7 @@ pub fn env_for(name: &str) -> Option<String> {
             &["TELECOMJS_API_KEY"]
         }
         "edenai" | "eden-ai" | "eden_ai" => &["EDENAI_API_KEY"],
+        "zenmux" | "zen-mux" | "zen_mux" => &["ZENMUX_API_KEY"],
         "concentrate" | "concentrate-ai" | "concentrate_ai" | "concentrateai" => {
             &["CONCENTRATE_API_KEY"]
         }
@@ -1337,6 +1365,7 @@ mod tests {
             "XAI_API_KEY",
             "TELECOMJS_API_KEY",
             "EDENAI_API_KEY",
+            "ZENMUX_API_KEY",
             "CONCENTRATE_API_KEY",
             "MODELSTUDIO_API_KEY",
             "DASHSCOPE_API_KEY",
@@ -1940,6 +1969,19 @@ mod tests {
 
         for alias in ["edenai", "eden-ai", "eden_ai"] {
             assert_eq!(env_for(alias).as_deref(), Some("eden-key"), "{alias}");
+        }
+
+        clear_known_envs();
+    }
+
+    #[test]
+    fn zenmux_env_aliases_resolve() {
+        let _guard = env_lock();
+        clear_known_envs();
+        unsafe { std::env::set_var("ZENMUX_API_KEY", "zen-key") };
+
+        for alias in ["zenmux", "zen-mux", "zen_mux"] {
+            assert_eq!(env_for(alias).as_deref(), Some("zen-key"), "{alias}");
         }
 
         clear_known_envs();

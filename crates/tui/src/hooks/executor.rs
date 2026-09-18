@@ -76,7 +76,6 @@ impl HookContext {
         Self::default()
     }
 
-    #[allow(dead_code)] // Public builder API, used in tests
     pub fn with_tool_name(mut self, name: &str) -> Self {
         self.tool_name = Some(name.to_string());
         self
@@ -87,7 +86,6 @@ impl HookContext {
         self
     }
 
-    #[allow(dead_code)] // Public builder API
     pub fn with_tool_args(mut self, args: &serde_json::Value) -> Self {
         self.tool_args = Some(truncate_env_value(
             &args.to_string(),
@@ -96,7 +94,6 @@ impl HookContext {
         self
     }
 
-    #[allow(dead_code)] // Public builder API
     pub fn with_tool_result(mut self, result: &str, success: bool, exit_code: Option<i64>) -> Self {
         self.tool_result = Some(truncate_env_value(
             result,
@@ -107,7 +104,6 @@ impl HookContext {
         self
     }
 
-    #[allow(dead_code)] // Public builder API, used in tests
     pub fn with_mode(mut self, mode: &str) -> Self {
         self.mode = Some(mode.to_string());
         self
@@ -118,7 +114,6 @@ impl HookContext {
         self
     }
 
-    #[allow(dead_code)] // Public builder API, used in tests
     pub fn with_workspace(mut self, path: PathBuf) -> Self {
         self.workspace = Some(path);
         self
@@ -134,13 +129,11 @@ impl HookContext {
         self
     }
 
-    #[allow(dead_code)] // Public builder API
     pub fn with_message(mut self, message: &str) -> Self {
         self.message = Some(message.to_string());
         self
     }
 
-    #[allow(dead_code)] // Public builder API
     pub fn with_error(mut self, error: &str) -> Self {
         self.error_message = Some(truncate_env_value(error, HOOK_ERROR_CONTEXT_MAX_BYTES));
         self
@@ -148,12 +141,6 @@ impl HookContext {
 
     pub fn with_tokens(mut self, tokens: u32) -> Self {
         self.total_tokens = Some(tokens);
-        self
-    }
-
-    #[allow(dead_code)] // Public builder API
-    pub fn with_cost(mut self, cost: f64) -> Self {
-        self.session_cost = Some(cost);
         self
     }
 
@@ -281,7 +268,6 @@ fn truncate_env_value(value: &str, max_bytes: usize) -> String {
 
 /// Result of a hook execution
 #[derive(Debug, Clone, Default)]
-#[allow(dead_code)] // Fields are part of public API for hook consumers
 pub struct HookResult {
     /// Hook name (if specified)
     pub name: Option<String>,
@@ -310,6 +296,7 @@ pub struct HookResult {
     /// Standard output
     pub stdout: String,
     /// Standard error
+    #[allow(dead_code)] // written by prod constructors, read only in tests
     pub stderr: String,
     /// Time taken to execute
     pub duration: Duration,
@@ -1594,7 +1581,7 @@ impl HookExecutor {
     }
 
     /// Create a disabled `HookExecutor` (no hooks will run)
-    #[allow(dead_code)] // Used in tests and as convenience constructor
+    #[cfg(test)]
     pub fn disabled() -> Self {
         Self {
             config: HooksConfig {
@@ -1611,7 +1598,7 @@ impl HookExecutor {
     }
 
     /// Check if hooks are enabled
-    #[allow(dead_code)] // Public API for hook system consumers
+    #[cfg(test)]
     pub fn is_enabled(&self) -> bool {
         self.config.enabled
     }
@@ -2059,11 +2046,11 @@ impl HookExecutor {
         if !pattern.contains('*') {
             return tool_name == pattern;
         }
-        // Escape regex metacharacters except `*`, which becomes `.*`.
-        let escaped = regex::escape(pattern);
-        let regex_pattern = escaped.replace(r"\*", ".*");
-        let anchored = format!("^{regex_pattern}$");
-        regex::Regex::new(&anchored).is_ok_and(|re| re.is_match(tool_name))
+        // #6208: the pattern is fixed by configuration while this runs once per
+        // hook per tool-call/stop event, so compile it once and reuse it rather
+        // than building a fresh `Regex` on every event.
+        codewhale_execpolicy::matcher::compiled_glob(pattern)
+            .is_some_and(|re| re.is_match(tool_name))
     }
 
     /// Check if a hook's condition matches the context
@@ -5875,6 +5862,7 @@ command = "echo project"
             ("bash", "shell"),
             // The router itself touches nothing a hook needs to gate.
             ("agent", "other"),
+            ("workflow", "other"),
             ("todo_write", "safe"),
             // Goal controls retain their existing hook classification when
             // promoted from deferred discovery to the eager catalog.

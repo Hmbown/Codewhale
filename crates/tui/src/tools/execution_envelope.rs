@@ -83,7 +83,7 @@ impl ExecutionEnvelope {
     /// starting from the widest one. Kept because it is the identity element
     /// [`Self::narrow`] is defined against, and removing it would leave that
     /// invariant untestable.
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), expect(dead_code))]
     pub(crate) const UNRESTRICTED: Self = Self {
         write: true,
         network: true,
@@ -104,7 +104,7 @@ impl ExecutionEnvelope {
     /// Exercised by this module's tests today; the grandchild-derivation path
     /// that consumes it in production lands with the ratification UI.
     #[must_use]
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), expect(dead_code))]
     pub(crate) const fn narrow(self, other: Self) -> Self {
         Self {
             write: self.write && other.write,
@@ -276,6 +276,13 @@ pub(crate) enum CallClass {
     /// Built-in verification carrying an operator command line. Held to the
     /// same bar as raw shell, with its own wording.
     UnboundedVerification,
+    /// Bounded remote-ref fetch (`Git{action: fetch}`): fixed argv against a
+    /// configured remote, updating only remote-tracking refs. Needs shell
+    /// authority (it forks git) and network (it reaches the remote) — but
+    /// not write authority, because fetching what is under review is what a
+    /// read-only verifier is for. Shape errors (unknown remote, malformed
+    /// refspec) surface from the tool, not the envelope.
+    BoundedFetch,
     /// Runs a program or a child process.
     Executes,
     /// Mutates the filesystem.
@@ -307,6 +314,15 @@ pub(crate) fn classify_call(name: &str, input: &Value, spec: &dyn ToolSpec) -> C
         }
         Some(VerificationBound::Unbounded) => return CallClass::UnboundedVerification,
         None => {}
+    }
+    // The bounded fetch answers for itself next, for the same reason: a
+    // `git fetch <remote>` updates only remote-tracking refs through fixed
+    // argv, so it needs a process (shell) and a remote (network) — but not
+    // workspace write authority. Classed before the generic rules so a
+    // malformed fetch can never be swallowed by the family's read-only
+    // default and a bounded one is never judged as opaque execution.
+    if canonical == "git_fetch" {
+        return CallClass::BoundedFetch;
     }
     if spec.is_read_only_for(input) {
         return CallClass::Bounded;
@@ -401,6 +417,23 @@ pub(crate) fn enforce_execution_envelope(
                      ceiling grants shell authority."
                 ))
             }
+        }
+        CallClass::BoundedFetch => {
+            if !envelope.shell {
+                return Err(format!(
+                    "[execution_envelope.fetch.shell_denied] Tool {name} fetches remote refs, which starts a git process and updates remote-tracking refs, and this agent has no shell \
+                     authority under its clamped permission ceiling. Use a member whose saved \
+                     ceiling grants `shell = \"full\"` (the `verifier`/`tester` preset), or report \
+                     findings without fetching the remote yourself."
+                ));
+            }
+            if !envelope.network {
+                return Err(format!(
+                    "[execution_envelope.fetch.network_denied] Tool {name} fetches remote refs, which reaches the network, and this agent runs with no network \
+                     capability under its clamped permission ceiling."
+                ));
+            }
+            Ok(())
         }
         CallClass::Executes => {
             if !envelope.write {
@@ -565,6 +598,60 @@ mod tests {
         )
         .expect_err("operator command lines are refused first");
         assert!(error.contains("arbitrary execution"), "{error}");
+    }
+
+    /// Bounded fetch costs shell plus network, never workspace write: the
+    /// shipped `verifier`/`tester` ceiling (`write = false, shell = "full"`,
+    /// network) keeps it, while a shell-less or network-less posture loses
+    /// it with a naming-its-cause refusal (#6298).
+    #[test]
+    fn bounded_fetch_costs_shell_plus_network_never_write() {
+        let fetch = executes("Git", None);
+        let input = json!({"action": "fetch", "remote": "origin"});
+        assert_eq!(
+            classify_call("Git", &input, &fetch),
+            CallClass::BoundedFetch
+        );
+
+        let verifier = ExecutionEnvelope {
+            write: false,
+            network: true,
+            shell: true,
+        };
+        enforce_execution_envelope("Git", &input, &fetch, verifier, false)
+            .expect("write=false shell=full with network keeps fetch");
+
+        let error = enforce_execution_envelope("Git", &input, &fetch, NO_SHELL, false)
+            .expect_err("a shell-less posture cannot fetch");
+        assert!(error.contains("shell authority"), "{error}");
+
+        let no_network = ExecutionEnvelope {
+            write: false,
+            network: false,
+            shell: true,
+        };
+        let error = enforce_execution_envelope("Git", &input, &fetch, no_network, false)
+            .expect_err("a network-less posture cannot fetch");
+        assert!(error.contains("network"), "{error}");
+    }
+
+    /// `cwd` scopes *where* the workspace's own checks run; it cannot name a
+    /// program or redirect what runs, so the Default/Filter bound — and the
+    /// shell authority it costs — is unchanged by it.
+    #[test]
+    fn run_cwd_does_not_change_the_verification_bound() {
+        assert_eq!(
+            classify_verification("run_tests", &json!({"cwd": "crates/tui"})),
+            Some(VerificationBound::Default)
+        );
+        assert_eq!(
+            classify_verification("run_tests", &json!({"args": "-p tui", "cwd": "crates/tui"})),
+            Some(VerificationBound::Filter)
+        );
+        assert_eq!(
+            classify_verification("run_verifiers", &json!({"cwd": "crates/tui"})),
+            Some(VerificationBound::Default)
+        );
     }
 
     /// The other side of the same rule: the shipped `verifier`/`tester` preset

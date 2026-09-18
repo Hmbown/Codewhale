@@ -169,20 +169,35 @@ pub(crate) fn render_thinking_with_preview_limit(
     lines.push(Line::from(header_spans));
 
     let content_width = width.saturating_sub(3).max(1);
-    let (collapsed_body, expandable) = collapsed_thinking_body(
-        content,
-        width,
-        streaming,
-        body_style,
-        preview_extra_lines,
-        completed_preview_lines,
-    );
-    let rendered = if collapsed {
-        collapsed_body
+    // #6196: compute only the projection being shown. The previous order ran
+    // the collapsed preview render first and threw it away whenever the body
+    // was expanded — a full extra body render per streaming beat.
+    let (rendered, expandable) = if collapsed {
+        collapsed_thinking_body(
+            content,
+            width,
+            streaming,
+            body_style,
+            preview_extra_lines,
+            completed_preview_lines,
+        )
     } else if content.trim().is_empty() {
-        Vec::new()
+        (Vec::new(), false)
     } else {
-        markdown_render::render_markdown(content, content_width, body_style)
+        let body = markdown_render::render_markdown(content, content_width, body_style);
+        // The collapse affordance mirrors the collapsed preview's "more than
+        // the preview would show" test, derived from this single render
+        // instead of rendering the preview too: streaming content outgrows
+        // the streaming preview; settled content shows more than the
+        // completed preview, or differs from its explicit summary.
+        let expandable = if streaming {
+            body.len() > THINKING_STREAMING_PREVIEW_LINE_LIMIT.saturating_add(preview_extra_lines)
+        } else {
+            extract_explicit_reasoning_summary(content).is_some_and(|summary| {
+                summary.trim() != content.trim() || body.len() > THINKING_SUMMARY_LINE_LIMIT
+            }) || body.len() > completed_preview_lines.saturating_add(preview_extra_lines)
+        };
+        (body, expandable)
     };
 
     let rail_style = Style::default().fg(thinking_state_accent(state));
@@ -229,24 +244,15 @@ fn collapsed_thinking_body(
     preview_extra_lines: usize,
     completed_preview_lines: usize,
 ) -> (Vec<Line<'static>>, bool) {
-    let (body_text, without_explicit_summary) = if streaming {
+    let (body_text, without_explicit_summary): (std::borrow::Cow<'_, str>, bool) = if streaming {
         // #861 RC4 / #1324: an in-flight block has no meaningful completed
         // summary. Render raw content; the limit below keeps its newest lines.
-        (content.to_string(), false)
+        (std::borrow::Cow::Borrowed(content), false)
     } else {
         match extract_explicit_reasoning_summary(content) {
-            Some(summary) => (summary, false),
-            None => (content.to_string(), true),
+            Some(summary) => (std::borrow::Cow::Owned(summary), false),
+            None => (std::borrow::Cow::Borrowed(content), true),
         }
-    };
-    // #4146/#4148 used to scrub snake_case here. That rule could not tell
-    // CodeWhale identifiers from user identifiers: paths, env vars, and
-    // module names became bare ellipses while the full body remained one
-    // keypress away. Keep the default view readable; do not revive the scrub.
-    let mut lines = if body_text.trim().is_empty() {
-        Vec::new()
-    } else {
-        markdown_render::render_markdown(&body_text, width.saturating_sub(3).max(1), style)
     };
     let limit = if streaming {
         THINKING_STREAMING_PREVIEW_LINE_LIMIT.saturating_add(preview_extra_lines)
@@ -254,6 +260,25 @@ fn collapsed_thinking_body(
         completed_preview_lines.saturating_add(preview_extra_lines)
     } else {
         THINKING_SUMMARY_LINE_LIMIT
+    };
+    // #6196: the streaming preview keeps only the newest `limit` rendered
+    // lines, so rendering the whole body every beat made streaming cost grow
+    // with message size. Render a self-contained tail of the source instead;
+    // the settled (`!streaming`) path still renders everything once per
+    // revision, which the transcript cache already amortizes.
+    let render_source: &str = if streaming {
+        streaming_preview_tail_source(&body_text, limit.saturating_add(1))
+    } else {
+        &body_text
+    };
+    // #4146/#4148 used to scrub snake_case here. That rule could not tell
+    // CodeWhale identifiers from user identifiers: paths, env vars, and
+    // module names became bare ellipses while the full body remained one
+    // keypress away. Keep the default view readable; do not revive the scrub.
+    let mut lines = if render_source.trim().is_empty() {
+        Vec::new()
+    } else {
+        markdown_render::render_markdown(render_source, width.saturating_sub(3).max(1), style)
     };
     let truncated = lines.len() > limit;
     if truncated {
@@ -266,6 +291,62 @@ fn collapsed_thinking_body(
     }
     let meaningful = truncated || (!streaming && body_text.trim() != content.trim());
     (lines, meaningful)
+}
+
+/// A trailing slice of the streaming reasoning body that renders
+/// independently of the lines above it (#6196).
+///
+/// The slice cannot start mid-construct: a cut inside a fenced code block
+/// would re-classify its lines as paragraphs, and a cut inside a table group
+/// would re-render it as a fresh table. One forward pass mirrors the parser's
+/// own fence rule (`push_parsed_line`) to learn, per line boundary, whether
+/// the boundary sits inside an open fence; the start is then moved back past
+/// any construct it would split. Collecting `min_source_lines` complete
+/// lines is enough for the caller's purposes: every source line renders to
+/// one or more rows, so `limit + 1` source lines always yield more than
+/// `limit` rendered rows and the "truncated" verdict survives.
+fn streaming_preview_tail_source(body: &str, min_source_lines: usize) -> &str {
+    // (byte offset, whether the boundary above this line is inside an open
+    // fence). One entry per line; cheap next to the render it bounds.
+    let mut lines: Vec<(usize, bool)> = Vec::new();
+    let mut open_fence_len: Option<usize> = None;
+    let mut offset = 0usize;
+    for piece in body.split_inclusive('\n') {
+        let raw_line = piece
+            .strip_suffix('\n')
+            .map_or(piece, |line| line.strip_suffix('\r').unwrap_or(line));
+        lines.push((offset, open_fence_len.is_some()));
+        let trimmed = raw_line.trim_start();
+        let fence_len = trimmed.chars().take_while(|c| *c == '`').count();
+        if fence_len >= 3 {
+            match open_fence_len {
+                Some(open) if fence_len >= open && trimmed[fence_len..].trim().is_empty() => {
+                    open_fence_len = None;
+                }
+                None => open_fence_len = Some(fence_len),
+                Some(_) => {}
+            }
+        }
+        offset += piece.len();
+    }
+
+    if lines.len() <= min_source_lines {
+        // Fewer lines than the window needs: render the whole body.
+        return body;
+    }
+    // Walk the desired start back to a boundary that splits no construct:
+    // never inside an open fence (that boundary's line is code content) and
+    // never mid-table (a table group is a run of `|`-prefixed lines).
+    let mut index = lines.len() - min_source_lines;
+    while index > 0 {
+        let (line_offset, inside_before) = lines[index];
+        let line = body[line_offset..].lines().next().unwrap_or("");
+        if !inside_before && !line.trim_start().starts_with('|') {
+            break;
+        }
+        index -= 1;
+    }
+    &body[lines[index].0..]
 }
 
 pub(super) fn render_hidden_thinking_activity(
@@ -353,4 +434,142 @@ static COLOR_DEPTH: std::sync::OnceLock<palette::ColorDepth> = std::sync::OnceLo
 
 pub(super) fn cached_color_depth() -> palette::ColorDepth {
     *COLOR_DEPTH.get_or_init(palette::ColorDepth::detect)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn joined_text(lines: &[Line<'static>]) -> Vec<String> {
+        lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn tail_source_extends_back_past_fences_and_tables() {
+        // Short bodies render whole.
+        assert_eq!(
+            streaming_preview_tail_source("one\ntwo\n", 12),
+            "one\ntwo\n"
+        );
+
+        let mut fenced = String::from("```rust\n");
+        for i in 0..30 {
+            fenced.push_str(&format!("let v{i} = {i};\n"));
+        }
+        fenced.push_str("```\nafter the block\n");
+        // A 2-line window would start at the closing fence (which parses as
+        // an opener when orphaned); the slice must start at the real fence
+        // opener so the code lines keep their classification.
+        let slice = streaming_preview_tail_source(&fenced, 2);
+        assert!(slice.starts_with("```rust"));
+        assert!(slice.ends_with("after the block\n"));
+
+        // A table group must not be split either.
+        let table = "intro\n| a | b |\n|---|---|\n| 1 | 2 |\n| 3 | 4 |\n";
+        assert_eq!(streaming_preview_tail_source(table, 2), table);
+
+        // An unterminated fence owns everything after its opener; the slice
+        // must extend back to the opener, not cut inside the block.
+        let open = "```\ncode a\ncode b\ncode c\n";
+        let slice = streaming_preview_tail_source(open, 2);
+        assert!(slice.starts_with("```\ncode a"));
+    }
+
+    #[test]
+    fn collapsed_streaming_preview_renders_only_the_newest_lines() {
+        let mut body = String::new();
+        for i in 0..40 {
+            body.push_str(&format!("head marker {i}\n"));
+        }
+        for i in 0..20 {
+            body.push_str(&format!("tail marker {i}\n"));
+        }
+        let (lines, expandable) = render_thinking_with_preview_limit(
+            &body,
+            100,
+            true,
+            None,
+            true,
+            false,
+            false,
+            0,
+            THINKING_COMPLETED_PREVIEW_LINE_LIMIT,
+        );
+        assert!(expandable, "a long streaming body must offer expand");
+        // header + 12 preview lines + the expand affordance row
+        assert_eq!(lines.len(), 1 + THINKING_STREAMING_PREVIEW_LINE_LIMIT + 1);
+        let text = joined_text(&lines);
+        assert!(text.iter().any(|t| t.contains("tail marker 19")));
+        assert!(text.iter().any(|t| t.contains("tail marker 8")));
+        assert!(
+            !text.iter().any(|t| t.contains("tail marker 7")),
+            "the window must drop the head: {text:?}"
+        );
+        assert!(!text.iter().any(|t| t.contains("head marker 39")));
+    }
+
+    #[test]
+    fn collapsed_streaming_preview_keeps_open_fence_classification() {
+        let mut body = String::from("```\n");
+        for i in 0..40 {
+            body.push_str(&format!("code line {i}\n"));
+        }
+        let (lines, _) = render_thinking_with_preview_limit(
+            &body,
+            100,
+            true,
+            None,
+            true,
+            false,
+            false,
+            0,
+            THINKING_COMPLETED_PREVIEW_LINE_LIMIT,
+        );
+        // Code rows carry the two-space code prefix after the rail; if the
+        // tail slice started inside the open fence they would render as
+        // paragraphs and lose it.
+        let text = joined_text(&lines);
+        let code_prefix = format!("{REASONING_RAIL}  ");
+        assert!(
+            text.iter().any(|t| t.starts_with(&code_prefix)),
+            "visible code rows must keep the code prefix: {text:?}"
+        );
+    }
+
+    #[test]
+    fn expanded_streaming_thinking_parses_the_body_once() {
+        // #6196: the expanded path used to run the collapsed preview render
+        // first and throw it away — two full body renders per beat.
+        let mut body = String::from("```\n");
+        for i in 0..40 {
+            body.push_str(&format!("expanded line {i}\n"));
+        }
+        markdown_render::reset_parse_invocation_count();
+        let (lines, expandable) = render_thinking_with_preview_limit(
+            &body,
+            100,
+            true,
+            None,
+            false,
+            false,
+            false,
+            0,
+            THINKING_COMPLETED_PREVIEW_LINE_LIMIT,
+        );
+        assert_eq!(
+            markdown_render::parse_invocation_count(),
+            1,
+            "the expanded view must render the body exactly once"
+        );
+        assert!(expandable);
+        assert!(lines.len() > THINKING_STREAMING_PREVIEW_LINE_LIMIT);
+    }
 }

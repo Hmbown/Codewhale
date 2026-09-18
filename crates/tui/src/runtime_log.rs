@@ -65,14 +65,14 @@ pub struct TuiLogGuard {
     // `--print-log-path`). Currently no caller — keep the accessor
     // wired up so adding one later doesn't require revisiting the
     // guard struct.
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     log_path: PathBuf,
 }
 
 impl TuiLogGuard {
     /// Path the subscriber is writing to.
-    #[allow(dead_code)]
     #[must_use]
+    #[expect(dead_code)]
     pub fn log_path(&self) -> &std::path::Path {
         &self.log_path
     }

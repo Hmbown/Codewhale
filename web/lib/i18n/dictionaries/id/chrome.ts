@@ -32,10 +32,10 @@ export const chrome: ChromeDict = {
 
   navProduct: "Produk",
   navModels: "Model",
-  navPricing: "Harga",
+  navPlugins: "Plugin",
   navProductSecondary: "Product",
   navModelsSecondary: "Models",
-  navPricingSecondary: "Pricing",
+  navPluginsSecondary: "Plugins",
 
   skipToContent: "Lewati ke konten utama",
 
@@ -93,7 +93,6 @@ export const chrome: ChromeDict = {
   footerIssues: "Masalah",
   footerContribute: "Kontribusi",
   footerLicense: "Lisensi MIT",
-  footerPricing: "Harga",
   footerTerms: "Ketentuan layanan",
   footerPrivacy: "Privasi",
   footerChangelog: "Catatan perubahan",

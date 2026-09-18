@@ -17,26 +17,27 @@
   "baseline_observation": {
     "accepted_requests": 128,
     "applied_version": 127,
-    "retained_queued_requests": 128,
-    "estimated_retained_payload_bytes": 8527994,
-    "enqueue_elapsed_ns": 456170,
-    "rss_during_delta_bytes": 9453568,
-    "rss_after_delta_bytes": 12861440,
+    "retained_queued_requests": 1,
+    "estimated_retained_payload_bytes": 66625,
+    "enqueue_elapsed_ns": 301246,
+    "rss_during_delta_bytes": 2801664,
+    "rss_after_delta_bytes": 6242304,
     "provenance": {
       "platform": "macos",
-      "source_sha": "2d4a9cb58c5c22ac361ab221bda1243a0e4349fb",
+      "source_sha": "9bb1a5e8dbc53238ae827e184a4b1dc9720fc0e3",
       "source_dirty": false,
-      "rustc_version": "rustc 1.97.0 (2d8144b78 2026-07-07)",
-      "cargo_version": "cargo 1.97.0 (c980f4866 2026-06-30)",
+      "rustc_version": "rustc 1.98.1 (48a229cea 2026-09-01)",
+      "cargo_version": "cargo 1.98.1 (797e8a9bc 2026-08-05)",
       "build_profile": "test",
       "sample_count": 1
     }
   },
   "ceilings": {
-    "retained_queued_requests": 128,
-    "estimated_retained_payload_bytes": 8529280,
+    "retained_queued_requests": 4,
+    "estimated_retained_payload_bytes": 96256,
     "enqueue_elapsed_ns": 25000000,
     "rss_during_delta_bytes": 33554432,
     "rss_after_delta_bytes": 33554432
-  }
+  },
+  "_rebaseline_2026_09_15": "Sender-side latest-wins coalescing (#6212): try_send absorbs each request into a shared pending state and wakes the actor through a bounded command channel, so a paused consumer retains one coalesced entry per session plus one wake command instead of one request per send. Retained payload fell from 8527994 bytes (128 queued snapshots) to an observed 66625-66625 bytes (1 coalesced entry); the 96256-byte ceiling is ~45% above the observed sample and still bounds a second concurrent session's snapshot plus wake overhead; retained_queued_requests ceiling 4 allows the fixture's single session plus headroom for the wake-command epoch."
 }

@@ -42,7 +42,6 @@ pub struct PendingInputPreview {
     pub locale: Locale,
     pub context_items: Vec<ContextPreviewItem>,
     pub pending_steers: Vec<String>,
-    pub rejected_steers: Vec<String>,
     pub queued_messages: Vec<String>,
     pub editing_queued_message: Option<String>,
     pub edit_binding: EditBinding,
@@ -67,7 +66,6 @@ impl PendingInputPreview {
             locale: Locale::En,
             context_items: Vec::new(),
             pending_steers: Vec::new(),
-            rejected_steers: Vec::new(),
             queued_messages: Vec::new(),
             editing_queued_message: None,
             edit_binding: EditBinding::UP,
@@ -76,7 +74,6 @@ impl PendingInputPreview {
 
     fn has_pending_inputs(&self) -> bool {
         !self.pending_steers.is_empty()
-            || !self.rejected_steers.is_empty()
             || !self.queued_messages.is_empty()
             || self.editing_queued_message.is_some()
     }
@@ -84,7 +81,6 @@ impl PendingInputPreview {
     fn is_queued_only(&self) -> bool {
         self.context_items.is_empty()
             && self.pending_steers.is_empty()
-            && self.rejected_steers.is_empty()
             && self.editing_queued_message.is_none()
             && !self.queued_messages.is_empty()
     }
@@ -165,19 +161,6 @@ impl PendingInputPreview {
                     dim,
                     &sending_prefix,
                     &sending_indent,
-                );
-            }
-            let rejected_prefix =
-                tr(self.locale, MessageId::PendingCouldNotSendIntoTurnPrefix).into_owned();
-            let rejected_indent = continuation_indent(&rejected_prefix);
-            for steer in &self.rejected_steers {
-                push_truncated_item(
-                    &mut lines,
-                    steer,
-                    width,
-                    dim,
-                    &rejected_prefix,
-                    &rejected_indent,
                 );
             }
             if let Some(draft) = self.editing_queued_message.as_deref() {
@@ -563,7 +546,6 @@ mod tests {
     fn all_pending_inputs_render_as_one_list() {
         let mut preview = PendingInputPreview::new();
         preview.pending_steers.push("steer".to_string());
-        preview.rejected_steers.push("rejected".to_string());
         preview.queued_messages.push("queued".to_string());
         let rows = render_to_string(&preview, 60);
         assert!(rows[0].contains("Pending inputs"));
@@ -572,7 +554,6 @@ mod tests {
             1
         );
         assert!(rows.iter().any(|r| r.contains("steer")));
-        assert!(rows.iter().any(|r| r.contains("rejected")));
         assert!(rows.iter().any(|r| r.contains("queued")));
         assert!(rows.iter().any(|r| r.contains("↑")));
         assert!(rows.iter().any(|r| r.contains("Enter send now")));
@@ -582,7 +563,6 @@ mod tests {
     fn pending_input_copy_does_not_teach_steer() {
         let mut preview = PendingInputPreview::new();
         preview.pending_steers.push("please continue".to_string());
-        preview.rejected_steers.push("too late".to_string());
         preview.queued_messages.push("next".to_string());
         let joined = render_to_string(&preview, 80)
             .join("\n")
@@ -592,14 +572,13 @@ mod tests {
             "pending-input copy leaked internal vocabulary: {joined}"
         );
         assert!(joined.contains("sending into this turn"));
-        assert!(joined.contains("held for next turn"));
+        assert!(joined.contains("queued follow-up"));
     }
 
     #[test]
     fn pending_input_rows_label_each_delivery_mode() {
         let mut preview = PendingInputPreview::new();
         preview.pending_steers.push("steer".to_string());
-        preview.rejected_steers.push("rejected".to_string());
         preview.queued_messages.push("queued".to_string());
         preview.editing_queued_message = Some("editing".to_string());
 
@@ -609,11 +588,6 @@ mod tests {
             rows.iter()
                 .any(|row| row.contains("Sending into this turn: steer")),
             "missing pending send-now label: {rows:?}"
-        );
-        assert!(
-            rows.iter()
-                .any(|row| row.contains("Held for next turn: rejected")),
-            "missing rejected send-now label: {rows:?}"
         );
         assert!(
             rows.iter()

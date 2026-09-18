@@ -68,7 +68,7 @@ pub(crate) trait CredentialStore: Send + Sync {
     /// sequence instead. Collapsing them onto `modify` would change their
     /// error messages and rollback shape, which is deliberately out of this
     /// change's scope.
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), expect(dead_code))]
     fn modify(
         &self,
         provider_id: &str,
@@ -144,14 +144,13 @@ pub(crate) fn with_provider_write_locks<T>(
 /// Default in-memory store. Real stores are injected; this one backs tests and
 /// keeps the trait honest about its own contract — including the serialization
 /// guarantee, which is only observable through `modify`.
-#[allow(dead_code)]
 #[derive(Debug, Default)]
 pub(crate) struct InMemoryCredentialStore {
     entries: Mutex<HashMap<String, Credential>>,
 }
 
-#[allow(dead_code)]
 impl InMemoryCredentialStore {
+    #[cfg_attr(not(test), expect(dead_code))]
     pub(crate) fn new() -> Self {
         Self::default()
     }

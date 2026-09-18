@@ -15,8 +15,7 @@ mod world_state;
 pub use fragment::{
     DEFAULT_FRAGMENT_MAX_BYTES, FragmentId, FragmentRender, FragmentRole, ModelContextFragment,
 };
-#[allow(unused_imports)] // WorldStateDiff consumed once hosts call render_diff in production
-pub use world_state::{WorldState, WorldStateDiff, WorldStateSnapshot};
+pub use world_state::{WorldState, WorldStateSnapshot};
 
 #[cfg(test)]
 mod tests {

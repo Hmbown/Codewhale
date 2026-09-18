@@ -1,7 +1,8 @@
 //! Local HTTP regressions for complete, bounded provider catalog observations.
 
 use super::tests::{
-    baseten_client_for_identity, mount_models_json, opencode_go_client_for, openrouter_client_for,
+    custom_mock_client_for_identity, mount_models_json, opencode_go_client_for,
+    openrouter_client_for,
 };
 use super::*;
 use crate::config::{ProviderConfig, ProvidersConfig};
@@ -181,7 +182,7 @@ async fn anthropic_after_id_completes_both_public_consumers_with_frozen_headers(
 async fn unpaginated_rosters_stay_single_request_and_unknown_continuation_refuses() {
     for go in [false, true] {
         let server = MockServer::start().await;
-        let id = crate::config::OPENCODE_GO_CHAT_MODELS[0];
+        let id = crate::config::opencode_go_models()[0];
         mount_models_json(&server, 200, json!({"data":[{"id":id}]})).await;
         let mut client = if go {
             opencode_go_client_for(&server)
@@ -219,7 +220,7 @@ async fn unpaginated_rosters_stay_single_request_and_unknown_continuation_refuse
 }
 
 #[tokio::test]
-async fn opencode_go_published_unpaginated_roster_keeps_new_chat_ids_only() {
+async fn opencode_go_published_unpaginated_roster_keeps_documented_protocols() {
     let server = MockServer::start().await;
     let base_url = format!("{}/zen/go/v1", server.uri());
     // Literal additions from the pinned Go documentation plus retained routes:
@@ -234,8 +235,6 @@ async fn opencode_go_published_unpaginated_roster_keeps_new_chat_ids_only() {
         "omen-alpha",
         "deepseek-v4-pro",
         "grok-4.5",
-    ];
-    let negatives = [
         "qwen3.8-max",
         "qwen3.8-flash",
         "minimax-m3",
@@ -244,6 +243,7 @@ async fn opencode_go_published_unpaginated_roster_keeps_new_chat_ids_only() {
         "muse-spark-1.3-contributor",
         "muse-spark-1.2-contributor",
     ];
+    let negatives = ["gpt-unlisted", "claude-unproven"];
     let rows: Vec<_> = positives
         .iter()
         .chain(negatives.iter())
@@ -299,7 +299,10 @@ async fn opencode_go_published_unpaginated_roster_keeps_new_chat_ids_only() {
     assert_eq!(delta.offerings.len(), expected.len());
     for row in &delta.offerings {
         assert_eq!(row.provider, "opencode-go");
-        assert_eq!(row.endpoint_key, "chat");
+        assert_eq!(
+            Some(row.endpoint_key.as_str()),
+            codewhale_config::opencode_go_endpoint_key(&row.wire_model_id)
+        );
         assert_eq!(row.canonical_model, None);
         assert_eq!(row.family, None);
         assert_eq!(row.limit, None);
@@ -857,6 +860,52 @@ fn assert_no_canaries(error: &anyhow::Error) {
     }
 }
 
+/// #6173: a geo-blocked key produced `Invalid request (400): ` — the colon
+/// that introduces the provider's reason, with nothing after it, because the
+/// catalog path discarded the body wholesale. A geo-block, a bad key and a
+/// wrong endpoint were then indistinguishable, and the reporter had to change
+/// VPN exits to find out which one it was. The reason is the provider's own
+/// words; only this client's secrets have to go.
+#[tokio::test]
+async fn catalog_errors_surface_the_provider_reason_without_client_secrets() {
+    const REASON: &str = "User location is not supported for the API use.";
+
+    let server = MockServer::start().await;
+    mount_page(
+        &server,
+        None,
+        ResponseTemplate::new(400).set_body_json(json!({
+            "error": {"code": 400, "message": REASON, "status": "FAILED_PRECONDITION"}
+        })),
+    )
+    .await;
+    let client = anthropic_client(&server.uri());
+    let error = client.list_models().await.unwrap_err();
+    assert!(
+        format!("{error:#}").contains(REASON),
+        "the provider's reason must reach the user: {error:#}"
+    );
+    assert_no_canaries(&error);
+
+    // The same reason, from an endpoint that also echoes back things only
+    // this client could have sent it. The reason survives; they do not.
+    let echoing = MockServer::start().await;
+    mount_page(
+        &echoing,
+        None,
+        ResponseTemplate::new(400).set_body_json(json!({
+            "error": {"message": format!("{REASON} key={KEY} header=custom-header-canary")}
+        })),
+    )
+    .await;
+    let client = anthropic_client(&echoing.uri());
+    crate::retry_status::clear();
+    let error = client.list_models().await.unwrap_err();
+    assert!(format!("{error:#}").contains(REASON), "{error:#}");
+    assert_no_canaries(&error);
+    crate::retry_status::clear();
+}
+
 #[tokio::test]
 async fn later_page_http_and_transport_errors_do_not_expose_cursor_or_key() {
     for isolated in [false, true] {
@@ -954,7 +1003,7 @@ async fn later_page_http_and_transport_errors_do_not_expose_cursor_or_key() {
 }
 
 #[tokio::test]
-async fn unpaginated_baseten_aliases_keep_exact_identity_and_endpoint_ownership() {
+async fn unpaginated_custom_identities_keep_exact_identity_and_endpoint_ownership() {
     let first = MockServer::start().await;
     let second = MockServer::start().await;
     mount_models_json(&first, 200, json!({"data":[{"id":"first/model"}]})).await;
@@ -965,7 +1014,7 @@ async fn unpaginated_baseten_aliases_keep_exact_identity_and_endpoint_ownership(
         ("Base-Ten", &first, "first/model"),
         ("base-ten", &second, "second/model"),
     ] {
-        let client = baseten_client_for_identity(server, identity);
+        let client = custom_mock_client_for_identity(server, identity);
         let delta = client.fetch_catalog_delta().await.unwrap();
         assert_eq!(delta.provider, identity);
         assert_eq!(delta.offerings[0].provider, identity);

@@ -28,6 +28,8 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::config::ApiProvider;
+
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -188,6 +190,25 @@ impl FleetMember {
                 .as_deref()
                 .is_some_and(|model| self.id.trim().starts_with(slugify(model).as_str()))
     }
+}
+
+/// Provider kinds have documented aliases; named custom routes have exact
+/// keys. Treating every provider name as case-insensitive merges distinct
+/// endpoints before the configured route binder can resolve them.
+pub(crate) fn provider_ids_match(saved: &str, requested: &str) -> bool {
+    saved.trim() == requested.trim()
+        || ApiProvider::parse(saved)
+            .filter(|provider| *provider != ApiProvider::Custom)
+            .is_some_and(|provider| Some(provider) == ApiProvider::parse(requested))
+}
+
+/// The member pins exactly `provider`/`model`.
+pub(crate) fn member_pins(member: &FleetMember, provider: &str, model: &str) -> bool {
+    member
+        .provider
+        .as_deref()
+        .is_some_and(|p| provider_ids_match(p, provider))
+        && member.model.as_deref().is_some_and(|id| id == model)
 }
 
 /// The saved named Fleet document (compatibility `schema = "fleet"`, revision 2).
@@ -374,6 +395,19 @@ impl FleetFile {
         // those rows on read so the roster reads as roles again. The next
         // save writes the clean document.
         fleet.members.retain(|member| !member.is_bare_model_pin());
+        // #6037: a member pinned to the fleet's own operator route resolves
+        // to that route either way; the pin only stops it following when the
+        // operator moves (a vendor retiring the id, an operator switching
+        // models). Read the redundant pin as the inheritance it always meant.
+        // Shortlist rows keep their pin — it is their entire content.
+        if let Some(operator) = &fleet.operator {
+            for member in &mut fleet.members {
+                if !member.shortlist && member_pins(member, &operator.provider, &operator.model) {
+                    member.provider = None;
+                    member.model = None;
+                }
+            }
+        }
         fleet.validate()?;
         Ok(fleet)
     }
@@ -549,7 +583,7 @@ fn collect_entries(dir: &Path, scope: FleetScope, out: &mut Vec<FleetEntry>) {
 /// names both origins — the caller (UI) resolves it by asking for a scope.
 /// (Kept for the qualified-name flow and the ambiguity tests; the list/detail
 /// UI resolves by scope via load_fleet_in_scope.)
-#[allow(dead_code)]
+#[cfg_attr(not(test), expect(dead_code))]
 pub fn load_fleet(
     name: &str,
     workspace: &Path,
@@ -624,7 +658,6 @@ pub fn load_fleet_in_scope(
 /// Load a v2 Fleet from a specific path (used by the editor on the currently
 /// open entry, so the saved scope is exact). API surface for the path-based
 /// editor flows; currently exercised by tests.
-#[allow(dead_code)]
 pub fn load_fleet_at(path: &Path) -> Result<(FleetFile, FleetScope), FleetStoreError> {
     let text = fs::read_to_string(path).map_err(|e| FleetStoreError::Io {
         path: path.display().to_string(),
@@ -1170,6 +1203,66 @@ mod tests {
             "{err}"
         );
         assert!(err.to_string().contains("vision"), "{err}");
+    }
+
+    #[test]
+    fn member_pin_matching_the_operator_route_reads_as_inheritance() {
+        // #6037: a role member pinned to the fleet's own operator route
+        // resolves to that route either way — the pin only stops it
+        // following when the operator moves. Parse drops the redundant pin;
+        // a different-route pin and a shortlist row keep theirs.
+        let fleet = FleetFile::parse(
+            r#"schema = "fleet"
+schema_revision = 2
+name = "Inherit"
+
+[operator]
+provider = "openrouter"
+model = "z-ai/glm-5.3"
+
+[[members]]
+id = "planner"
+role = "planner"
+provider = "openrouter"
+model = "z-ai/glm-5.3"
+
+[[members]]
+id = "builder"
+role = "builder"
+provider = "openrouter"
+model = "z-ai/glm-5.3-pro"
+
+[[members]]
+id = "choice"
+shortlist = true
+provider = "openrouter"
+model = "z-ai/glm-5.3"
+"#,
+        )
+        .expect("parse");
+        let planner = fleet.member("planner").expect("planner member");
+        assert_eq!(planner.provider, None);
+        assert_eq!(planner.model, None);
+        let builder = fleet.member("builder").expect("builder member");
+        assert_eq!(builder.provider.as_deref(), Some("openrouter"));
+        assert_eq!(builder.model.as_deref(), Some("z-ai/glm-5.3-pro"));
+        let choice = fleet
+            .members
+            .iter()
+            .find(|member| member.shortlist)
+            .expect("shortlist row");
+        assert_eq!(choice.provider.as_deref(), Some("openrouter"));
+        assert_eq!(choice.model.as_deref(), Some("z-ai/glm-5.3"));
+        // The listing still attributes the inherited role to the route it runs.
+        let models = crate::fleet::members::models_of(&fleet);
+        assert_eq!(models[0].model, "z-ai/glm-5.3");
+        assert_eq!(models[0].roles, ["operator", "planner"]);
+        assert_eq!(models[1].roles, ["builder"]);
+        // The cleaned document round-trips: inherit stays inherit.
+        assert_eq!(
+            FleetFile::parse(&fleet.render_toml().expect("render")).expect("reparse"),
+            fleet
+        );
     }
 
     #[test]

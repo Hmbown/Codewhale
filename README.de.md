@@ -1,4 +1,4 @@
-<!-- source: README.md sha256:a446e3921085 -->
+<!-- source: README.md sha256:ebf1c69de0dc -->
 # Codewhale
 
 Codewhale ist ein Open-Source-Agent, der dein Projekt liest, Dateien bearbeitet, Befehle ausführt und seine Arbeit mit einem gehosteten oder lokalen Modell deiner Wahl prüft. Starte mit einer Aufgabe im Terminal. Teile eine größere Aufgabe auf Agenten mit verschiedenen Modellen und Rollen auf.
@@ -53,7 +53,7 @@ Das Terminal und die grafischen Clients verbinden sich mit der Codewhale Runtime
 
 - **Terminal:** `codewhale` öffnet die interaktive Oberfläche; `codewhale exec` führt eine Aufgabe aus einem Skript oder CI-Job aus.
 - **Lokaler Browser:** `codewhale web` öffnet den mitgelieferten [lokalen Webclient](docs/WEB.md) für dieselbe Runtime.
-- **Web- und Desktop-Apps von Codewhale:** grafische Arbeitsumgebungen in Entwicklung. Ihre Verfügbarkeit ist auf der [Produktseite](https://codewhale.net/en/product) angegeben.
+- **Codewhale-Desktop-App (GPUI):** Die native GPUI-Desktop-App ist die Produkt-Client-Richtung (Beschluss vom 2026-09-14; der Phasenplan liegt in docs/TRANSITION.md im privaten codehwhale-gpui-Repo). Die gehostete Web-App unter app.codewhale.net wird schrittweise eingestellt; Marketing-Website, Anmeldung, Abrechnung, Rechts- und Download-Seiten bleiben dauerhaft im Web. Die Verfügbarkeit ist auf der [Produktseite](https://codewhale.net/en/product) angegeben.
 
 **Computer Use ergänzt Werkzeuge zum Beobachten anderer Anwendungen und zur Interaktion mit ihnen.** Das Plugin ist im aktuellen Quellcode enthalten. Prüfe die angeforderten Zugriffsrechte und aktiviere es vor der Verwendung; Betriebssystemberechtigungen und Plattformanforderungen gelten weiterhin. Siehe die mitgelieferte [Anleitung zu Computer Use](crates/tui/plugins/computer-use/README.md) und die [Plugin-Einrichtung](docs/PLUGINS.md).
 

@@ -104,10 +104,16 @@ fn lowercase_bash_schema_is_small_contract() {
             .keys()
             .cloned()
             .collect::<std::collections::BTreeSet<_>>(),
-        ["command", "justification", "sandbox_permissions", "timeout"]
-            .into_iter()
-            .map(str::to_string)
-            .collect()
+        [
+            "command",
+            "justification",
+            "read_only",
+            "sandbox_permissions",
+            "timeout"
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
     );
     assert!(!BashTool::new("Bash").model_visible());
 }
@@ -729,8 +735,7 @@ fn shell_owner_registers_before_spawn_and_silent_work_stays_live() {
             Some(lifecycle.clone()),
             "shell_spawn_failure",
             "missing-program",
-        )
-        .expect("register spawn intent");
+        );
     }
     lifecycle
         .register("shell_silent", "sleep 30")
@@ -1222,6 +1227,44 @@ async fn read_only_shell_policy_blocks_non_readonly_commands() {
             "{command}"
         );
     }
+}
+
+#[tokio::test]
+async fn read_only_refusal_names_child_alternatives_instead_of_mode_switch() {
+    // #6298: a child has no `/mode` to switch to — a refusal that tells it to
+    // switch modes is a dead end beside an available absurd path. The child
+    // branch must name the child's own alternatives and the escalation path.
+    let tmp = tempdir().expect("tempdir");
+    let child_ctx = ToolContext::new(tmp.path())
+        .with_shell_policy(crate::worker_profile::ShellPolicy::ReadOnly)
+        .with_owner_agent("agent_child", "child");
+    let tool = BashTool::new("Bash");
+    let result = tool
+        .execute(json!({"command": "cargo build"}), &child_ctx)
+        .await
+        .expect("execute");
+    assert!(!result.success);
+    assert!(result.content.contains("read-only shell policy"));
+    assert!(result.content.contains("read_file"));
+    assert!(
+        result
+            .content
+            .contains("report the blocked probe to the parent")
+    );
+    assert!(
+        !result.content.contains("/mode work"),
+        "child must never be told to switch modes: {}",
+        result.content
+    );
+
+    let parent_ctx = ToolContext::new(tmp.path())
+        .with_shell_policy(crate::worker_profile::ShellPolicy::ReadOnly);
+    let result = tool
+        .execute(json!({"command": "cargo build"}), &parent_ctx)
+        .await
+        .expect("execute");
+    assert!(!result.success);
+    assert!(result.content.contains("/mode work"));
 }
 
 #[cfg(unix)]
@@ -3842,6 +3885,54 @@ async fn unknown_bash_action_is_refused_instead_of_running_the_command() {
     assert!(!marker.exists(), "the command must not have run");
 }
 
+/// A NUL byte cannot cross the `exec` boundary: `Command` panics on it.
+/// Refuse with the byte offset before anything spawns (#5529).
+#[tokio::test]
+async fn nul_byte_in_shell_command_is_refused_before_spawn() {
+    let workspace = tempdir().expect("workspace");
+    let context = ToolContext::new(workspace.path().to_path_buf());
+    let marker = workspace.path().join("should-not-exist");
+
+    let error = BashTool::new("Bash")
+        .execute(
+            json!({
+                "command": format!("echo hi\0; touch {}", marker.display()),
+            }),
+            &context,
+        )
+        .await
+        .expect_err("NUL byte must be refused");
+
+    let message = error.to_string();
+    assert!(message.contains("NUL byte"), "{message}");
+    assert!(message.contains("byte offset 7"), "{message}");
+    assert!(!marker.exists(), "the command must not have run");
+}
+
+/// `cwd` crosses the same boundary via `current_dir`, so the guard covers it
+/// too (#5529).
+#[tokio::test]
+async fn nul_byte_in_shell_cwd_is_refused_before_spawn() {
+    let workspace = tempdir().expect("workspace");
+    let context = ToolContext::new(workspace.path().to_path_buf());
+
+    let error = BashTool::new("Bash")
+        .execute(
+            json!({
+                "command": "echo hi",
+                "cwd": "sub\0dir",
+            }),
+            &context,
+        )
+        .await
+        .expect_err("NUL byte must be refused");
+
+    let message = error.to_string();
+    assert!(message.contains("NUL byte"), "{message}");
+    assert!(message.contains("cwd"), "{message}");
+    assert!(message.contains("byte offset 3"), "{message}");
+}
+
 /// The same hole one type down. `and_then(as_str).unwrap_or("run")` read a
 /// non-string `action` as absent and fell through to the branch that executes
 /// arbitrary code, so `Bash{action: 3, command: "…"}` ran the command. `File`,
@@ -4568,4 +4659,49 @@ async fn readonly_sed_extra_options_never_mutate_files() {
         .await
         .unwrap();
     assert!(result.success, "{}", result.content);
+}
+
+/// A transiently busy Work-graph must not veto the command.
+///
+/// `register_operation` acquires the To-do/Plan locks with a short try-lock
+/// spin. Before this guard existed, a shell call landing in that window failed
+/// outright with "To-do state is busy; operation was not registered" — observed
+/// twice in one live session, each time right after another tool call. The
+/// registration is the same bookkeeping whose `observe` half is already
+/// best-effort, so a busy state now degrades to an unbound run.
+#[tokio::test]
+async fn busy_work_graph_degrades_the_spawn_intent_instead_of_failing_it() {
+    use crate::tools::plan::new_shared_plan_state;
+    use crate::tools::todo::new_shared_todo_list;
+    use crate::work_graph::new_shared_work_runtime;
+
+    let todos = new_shared_todo_list();
+    let plan = new_shared_plan_state();
+    let lifecycle = || ShellWorkLifecycle {
+        work: new_shared_work_runtime(todos.clone(), plan.clone()),
+        session_id: "session-test".to_string(),
+    };
+
+    // Control: with the graph free, the intent binds.
+    let bound = ShellSpawnIntentGuard::new(Some(lifecycle()), "shell_free", "echo hi");
+    assert!(
+        bound.lifecycle.is_some(),
+        "a free work-graph must bind the spawn intent"
+    );
+
+    // Busy: hold the To-do lock so the try-lock spin cannot win.
+    let _held = todos.lock().await;
+    // The raw register call still reports the busy state — this is exactly what
+    // used to propagate out of the spawn path and fail the command.
+    assert!(
+        lifecycle()
+            .register("shell_busy_direct", "echo hi")
+            .is_err(),
+        "the raw register call must observe the held lock as busy"
+    );
+    let busy = ShellSpawnIntentGuard::new(Some(lifecycle()), "shell_busy", "echo hi");
+    assert!(
+        busy.lifecycle.is_none(),
+        "a busy work-graph must degrade to an unbound guard, not fail the spawn"
+    );
 }

@@ -1,5 +1,4 @@
 import { DOC_TOPICS, REPO_DOCS_BASE, docTopicHref } from "./docs-map";
-import { PUBLIC_MEMBERSHIP_COPY } from "./content/membership";
 import { DISCORD_URL, REPO_URL } from "./i18n/links";
 import { IDENTITY_PHRASE, SITE_NAME, SITE_URL } from "./page-meta";
 
@@ -62,11 +61,6 @@ const EXTRA_PAGES: readonly { path: string; title: string; description: string }
     path: "/contribute",
     title: "Contribute",
     description: "The pull-request workflow: scoped issue, fork, test the change, explain the result.",
-  },
-  {
-    path: "/pricing",
-    title: "Pricing",
-    description: PUBLIC_MEMBERSHIP_COPY.metadata.description.en,
   },
   {
     path: "/legal/terms",

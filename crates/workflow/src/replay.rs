@@ -545,6 +545,7 @@ mod tests {
             mode: TaskMode::ReadOnly,
             isolation: crate::IsolationMode::Shared,
             file_scope: Vec::new(),
+            cwd: None,
             depends_on_results: Vec::new(),
             budget: BudgetSpec::default(),
             permissions: PermissionSpec::default(),

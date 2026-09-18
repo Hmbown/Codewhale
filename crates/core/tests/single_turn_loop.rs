@@ -10,6 +10,14 @@
 //! This guard is deliberately a source scan rather than a type check: the thing
 //! being prevented is a *second implementation*, which by definition would not
 //! be reachable from the first.
+//!
+//! Interim exception, recorded not hidden (#6088): `acp_server.rs` runs its
+//! own agentic tool loop (`run_agentic_prompt_turn`) for ACP IDE sessions,
+//! which do not run on the full thread/turn runtime yet. #5835 (IDE stage 2)
+//! converges them onto `Engine::run_turn` and deletes this exception along
+//! with the loop. Until then the scan below asserts the exception set is
+//! exactly these two owners — a third loop fails the same way a second
+//! used to.
 
 use std::path::{Path, PathBuf};
 
@@ -55,6 +63,7 @@ fn workspace_declares_exactly_one_turn_loop() {
     );
 
     let mut found = Vec::new();
+    let mut excepted = Vec::new();
     for file in &files {
         let Ok(text) = std::fs::read_to_string(file) else {
             continue;
@@ -67,6 +76,16 @@ fn workspace_declares_exactly_one_turn_loop() {
                 || trimmed.starts_with("pub(super) async fn run_turn")
             {
                 found.push((
+                    file.strip_prefix(&root).unwrap_or(file).to_path_buf(),
+                    idx + 1,
+                ));
+            }
+            // Interim #6088 exception: the ACP IDE loop, matched by its own
+            // name so it cannot hide behind the `run_turn` spelling.
+            if trimmed.starts_with("async fn run_agentic_prompt_turn")
+                || trimmed.starts_with("pub(crate) async fn run_agentic_prompt_turn")
+            {
+                excepted.push((
                     file.strip_prefix(&root).unwrap_or(file).to_path_buf(),
                     idx + 1,
                 ));
@@ -97,6 +116,27 @@ fn workspace_declares_exactly_one_turn_loop() {
          together so the documented owner stays true",
         owner_path.display(),
         owner_line
+    );
+    let expected_exception = Path::new("crates")
+        .join("tui")
+        .join("src")
+        .join("acp_server.rs");
+    assert_eq!(
+        excepted.len(),
+        1,
+        "expected exactly one recorded #6088 exception (acp_server's agentic \
+         loop), found {}: {excepted:#?}\n\
+         A second `run_agentic_prompt_turn` is a third turn loop — converge it \
+         onto Engine::run_turn instead. If #5835 deleted the ACP loop, delete \
+         this exception with it.",
+        excepted.len()
+    );
+    assert_eq!(
+        &excepted[0].0,
+        &expected_exception,
+        "the #6088 exception moved to {} — update this guard, #6088, and #5835 \
+         together so the recorded owner stays true",
+        excepted[0].0.display(),
     );
 }
 

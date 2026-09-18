@@ -188,10 +188,23 @@ fn arrows_move_selection_and_wrap() {
 #[test]
 fn selection_change_resets_detail_scroll() {
     let mut view = built_in_view();
-    view.handle_key(key(KeyCode::PageDown));
+    // Bare paging drives the row list; Shift-modified paging scrolls the
+    // detail pane (#6290, #6014-style split).
+    view.handle_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::SHIFT));
     assert_eq!(view.detail_scroll, 8);
     view.handle_key(key(KeyCode::Down));
     assert_eq!(view.detail_scroll, 0);
+}
+
+#[test]
+fn bare_paging_drives_rows_not_the_detail_pane() {
+    let mut view = built_in_view();
+    let last = view.members.len();
+    view.handle_key(key(KeyCode::PageDown));
+    assert_eq!(view.detail_scroll, 0);
+    assert_eq!(view.selected, 10.min(last));
+    view.handle_key(key(KeyCode::Home));
+    assert_eq!(view.selected, 0);
 }
 
 #[test]
@@ -445,9 +458,9 @@ fn built_in_party_lists_all_members_in_canonical_order() {
     let view = built_in_view();
     let ids: Vec<&str> = view.members.iter().map(|m| m.id.as_str()).collect();
     // The operator is rendered as the pinned session row, not a member
-    // (#dogfood 0.8.67), so it is intentionally absent from this list. The
-    // built-in `general` alias is folded out of presentation (#5888) — same
-    // posture as `worker`, still dispatchable (see the alias tests below).
+    // (#dogfood 0.8.67), so it is intentionally absent from this list. There is
+    // no built-in `general` member any more (#6244); `worker` is the posture
+    // and the selector resolves the legacy name onto it.
     assert_eq!(
         ids,
         [
@@ -465,11 +478,15 @@ fn built_in_party_lists_all_members_in_canonical_order() {
     );
 }
 
-/// #5888: the default lineup folds the legacy built-in `general` alias — the
-/// same posture as `worker` — out of presentation, while dispatch (roster
-/// lookup, identity selector alias) keeps resolving it.
+/// #5888 folded the legacy built-in `general` alias out of presentation while
+/// keeping it in the roster. #6244 removed the member instead: two built-ins
+/// that canonicalize to the same role make `role:general` permanently
+/// `Ambiguous`. The lineup is unchanged — `general` was never presented — and
+/// the name still resolves, through the identity selector rather than a second
+/// member (proven in `fleet::roster`'s
+/// `general_still_resolves_to_the_worker_member_without_its_own_built_in`).
 #[test]
-fn default_roster_folds_the_legacy_general_alias_out_of_presentation() {
+fn the_legacy_general_alias_has_no_built_in_member() {
     let view = built_in_view();
     let ids: Vec<&str> = view.members.iter().map(|m| m.id.as_str()).collect();
     assert!(
@@ -479,24 +496,30 @@ fn default_roster_folds_the_legacy_general_alias_out_of_presentation() {
     assert!(ids.contains(&"worker"), "the posture's primary name stays");
     assert_eq!(view.row_count(), 11, "operator plus ten members");
 
-    // Engine compat is untouched: the alias still resolves for dispatch.
     let roster = FleetRoster::built_ins_only();
-    assert!(roster.get("general").is_some(), "alias stays dispatchable");
+    assert!(
+        roster.get("general").is_none(),
+        "the duplicate built-in is gone"
+    );
     assert!(roster.get("worker").is_some());
 }
 
-/// #5888: only the untouched built-in alias folds away. A `general` the user
-/// actually defined — a saved-team member carries Personal/Workspace origin,
-/// like `roster_from_fleet` produces — is the user's own member and stays
-/// visible.
+/// A `general` the user actually defined — a saved-team member carries
+/// Personal/Workspace origin, like `roster_from_fleet` produces — is the
+/// user's own member and stays visible. Since #6244 there is no built-in
+/// `general` to harvest, so the fixture derives one from `worker`, which is
+/// exactly what a migrated fleet file looks like.
 #[test]
 fn user_defined_general_member_stays_visible() {
-    let mut members: Vec<AgentProfile> = FleetRoster::built_ins_only()
+    let worker: AgentProfile = FleetRoster::built_ins_only()
         .members()
         .iter()
-        .filter(|m| m.id == "worker" || m.id == "general")
+        .find(|m| m.id == "worker")
         .cloned()
-        .collect();
+        .expect("worker built-in");
+    let mut user_general = worker.clone();
+    user_general.id = "general".to_string();
+    let mut members = vec![worker, user_general];
     for member in members.iter_mut().filter(|m| m.id == "general") {
         member.origin = ProfileOrigin::Personal;
         member.source = PathBuf::from("fleets/Default.toml");

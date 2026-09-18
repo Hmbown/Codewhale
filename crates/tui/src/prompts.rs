@@ -45,6 +45,12 @@ pub struct PromptSessionContext<'a> {
     /// Optional output-verbosity mode. `concise` appends a short output
     /// discipline block; unset keeps the normal conversational prompt.
     pub verbosity: Option<&'a str>,
+    /// One-line notice that a prior session in this workspace left a
+    /// recovery checkpoint (#5715). KV effect: frozen-prefix contributor —
+    /// computed at engine construction and stable for the session; absent
+    /// entirely when no interrupted session exists, so clean sessions share
+    /// the same prefix bytes.
+    pub recovery_hint: Option<&'a str>,
     /// Restrict skill discovery to Codewhale-owned roots plus explicit
     /// `skills_dir` configuration.
     pub skills_scan_codewhale_only: bool,
@@ -68,6 +74,7 @@ impl Default for PromptSessionContext<'_> {
             model_id: "codewhale",
             context_window_override: None,
             verbosity: None,
+            recovery_hint: None,
             skills_scan_codewhale_only: false,
             plugin_registry: None,
             mode: AppMode::Agent,
@@ -388,7 +395,7 @@ fn user_constitution_disabled_by_setup_state() -> bool {
 use text::CALM_PERSONALITY;
 pub use text::{
     BASE_PROMPT, COMPACT_TEMPLATE, CORE_EXECUTION_PROFILE_PROMPT, GOAL_CONTINUATION_PROMPT,
-    HEADLESS_BASE_PROMPT, LANGUAGE_PROMPT, MEMORY_GUIDANCE, OUTPUT_PROMPT,
+    LANGUAGE_PROMPT, MEMORY_GUIDANCE, OUTPUT_PROMPT,
 };
 
 // ── Embedder prompt overrides ──
@@ -967,9 +974,9 @@ fn apply_static_prompt_composer(
     }
 }
 
-// Interactive hosts use the full base and bundled headless hosts use the
-// compact base. Tool availability is enforced by the catalog and execution
-// layer, never by mode-specific prompt text.
+// Every host shares BASE_PROMPT — one constitution, one stance. Host selects
+// only which ceremony layers follow it; tool availability is enforced by the
+// catalog and execution layer, never by mode-specific prompt text.
 
 // ── Public API ────────────────────────────────────────────────────────
 
@@ -1019,6 +1026,7 @@ pub fn system_prompt_for_mode_with_context_and_skills(
             model_id: "codewhale",
             context_window_override: None,
             verbosity: None,
+            recovery_hint: None,
             skills_scan_codewhale_only: false,
             plugin_registry: None,
             mode: AppMode::Agent,
@@ -1067,30 +1075,21 @@ pub(crate) fn system_prompt_for_mode_with_context_skills_session_and_approval_fo
     session_context: PromptSessionContext<'_>,
     prompt_host: PromptHost,
 ) -> SystemPrompt {
-    // The bundled headless coding host gets one compact constitution. Explicit
-    // user/embedder overrides retain the established full composition because
-    // those bytes are an intentional customization, not bundled ceremony.
-    let bundled_headless = prompt_host == PromptHost::Headless
-        && BASE_PROMPT_OVERRIDE.get().is_none()
-        && effective_static_prompt_composer().is_none();
-    let composed = if bundled_headless {
-        apply_model_template(
-            HEADLESS_BASE_PROMPT.trim(),
-            session_context.model_id,
-            session_context.context_window_override,
-        )
-    } else {
-        let default_layers = compose_default_static_layers_with_context(
-            session_context.model_id,
-            session_context.context_window_override,
-        );
-        apply_static_prompt_composer(
-            effective_static_prompt_composer(),
-            Personality::Calm,
-            session_context.model_id,
-            &default_layers,
-        )
-    };
+    // One base prompt for every host (AGENTS.md: `BASE_PROMPT` is the sole
+    // base prompt). Headless still skips interactive ceremony layers below —
+    // the execution profile and authority recap — which are host chrome, not
+    // doctrine.
+    let headless = prompt_host == PromptHost::Headless;
+    let default_layers = compose_default_static_layers_with_context(
+        session_context.model_id,
+        session_context.context_window_override,
+    );
+    let composed = apply_static_prompt_composer(
+        effective_static_prompt_composer(),
+        Personality::Calm,
+        session_context.model_id,
+        &default_layers,
+    );
 
     // Load project context from workspace
     let project_context = load_project_context_with_parents(workspace);
@@ -1193,7 +1192,7 @@ pub(crate) fn system_prompt_for_mode_with_context_skills_session_and_approval_fo
     // 4. Lean, runtime-only coding discipline. Context pressure, prompt-cache
     // accounting, footer presentation, and automatic compaction are host
     // responsibilities; teaching their UI to the model dilutes the task.
-    if !bundled_headless {
+    if !headless {
         full_prompt.push_str("\n\n");
         full_prompt.push_str(CORE_EXECUTION_PROFILE_PROMPT.trim());
     }
@@ -1231,6 +1230,17 @@ pub(crate) fn system_prompt_for_mode_with_context_skills_session_and_approval_fo
         workspace_parts.push(format!(
             "## Current Goal\n\n<session_goal>\n{}\n</session_goal>",
             goal_objective.trim()
+        ));
+    }
+    // #5715: name an interrupted prior workspace session so the model can
+    // offer recovery. Session-pinned: absent entirely on clean sessions so
+    // they share identical prefix bytes.
+    if let Some(hint) = session_context.recovery_hint
+        && !hint.trim().is_empty()
+    {
+        workspace_parts.push(format!(
+            "## Prior Session\n\n<session_recovery>\n{}\n</session_recovery>",
+            hint.trim()
         ));
     }
     let workspace_body = workspace_parts.join("\n\n");
@@ -1275,7 +1285,7 @@ pub(crate) fn system_prompt_for_mode_with_context_skills_session_and_approval_fo
     .to_system_blocks();
 
     // Trailers keep recency bias after WorldState: authority, then locale.
-    if !bundled_headless {
+    if !headless {
         blocks.push(SystemBlock {
             block_type: "text".to_string(),
             text: effective_authority_recap().trim().to_string(),
@@ -1523,48 +1533,6 @@ mod tests {
     }
 
     #[test]
-    fn bundled_headless_contract_is_small_and_direct() {
-        for phrase in [
-            "You already have an A",
-            "begin from possibility",
-            "bring your whole attention",
-            "a question, idea, or task",
-            "Invent no urgency or deadline",
-            "tools as senses",
-            "active authority is your limit",
-            "Failure is information",
-            "Check\nbefore concluding",
-            "unverified work as complete",
-        ] {
-            assert!(
-                HEADLESS_BASE_PROMPT.contains(phrase),
-                "bundled headless contract missing {phrase:?}"
-            );
-        }
-        for ceremony in [
-            "todo_write",
-            "checklist",
-            "`repl`",
-            "workflow",
-            "Fleet",
-            "sub-agent",
-            "delegation",
-            "goals",
-            "harness",
-            "Mode:",
-        ] {
-            assert!(
-                !HEADLESS_BASE_PROMPT.contains(ceremony),
-                "bundled headless contract must leave optional capabilities to the tool catalog: {ceremony:?}"
-            );
-        }
-        assert!(
-            HEADLESS_BASE_PROMPT.split_whitespace().count() <= 75,
-            "bundled headless contract must stay compact"
-        );
-    }
-
-    #[test]
     fn every_mode_shares_one_prompt_per_host() {
         let _env_lock = crate::test_support::lock_test_env();
         let tmp = tempdir().expect("tempdir");
@@ -1594,7 +1562,9 @@ mod tests {
             assert!(prompts[0].contains("Preserve the blue-ocean marker"));
             assert!(!prompts[0].contains("##### Mode:"));
             if host == PromptHost::Headless {
-                assert!(prompts[0].contains("You already have an A"));
+                // One base prompt for every host; headless still omits the
+                // interactive ceremony layers.
+                assert!(prompts[0].contains("The A is already yours"));
                 assert!(!prompts[0].contains("## Core Execution"));
                 assert!(!prompts[0].contains("## Authority Recap"));
             }
@@ -1716,6 +1686,7 @@ mod tests {
                     verbosity: None,
                     skills_scan_codewhale_only: false,
                     plugin_registry: None,
+                    recovery_hint: None,
                     mode: AppMode::Agent,
                 },
             ),
@@ -2139,6 +2110,7 @@ mod tests {
                     verbosity: None,
                     skills_scan_codewhale_only: false,
                     plugin_registry: None,
+                    recovery_hint: None,
                     mode: AppMode::Agent,
                 },
             ),
@@ -2264,6 +2236,7 @@ mod tests {
                     verbosity: None,
                     skills_scan_codewhale_only: false,
                     plugin_registry: None,
+                    recovery_hint: None,
                     mode: AppMode::Agent,
                 },
             ),
@@ -2311,6 +2284,7 @@ mod tests {
                     verbosity: None,
                     skills_scan_codewhale_only: false,
                     plugin_registry: None,
+                    recovery_hint: None,
                     mode: AppMode::Agent,
                 },
             ),
@@ -2404,6 +2378,7 @@ mod tests {
                     verbosity: None,
                     skills_scan_codewhale_only: false,
                     plugin_registry: None,
+                    recovery_hint: None,
                     mode: AppMode::Agent,
                 },
             ));
@@ -2585,6 +2560,7 @@ mod tests {
                     verbosity: None,
                     skills_scan_codewhale_only: false,
                     plugin_registry: None,
+                    recovery_hint: None,
                     mode: AppMode::Agent,
                 },
             ));
@@ -2615,6 +2591,7 @@ mod tests {
                     verbosity: None,
                     skills_scan_codewhale_only: false,
                     plugin_registry: None,
+                    recovery_hint: None,
                     mode: AppMode::Agent,
                 },
             ));
@@ -2659,6 +2636,7 @@ mod tests {
                     verbosity: None,
                     skills_scan_codewhale_only: false,
                     plugin_registry: None,
+                    recovery_hint: None,
                     mode: AppMode::Agent,
                 },
             ));
@@ -2789,6 +2767,7 @@ mod tests {
                     verbosity: None,
                     skills_scan_codewhale_only: false,
                     plugin_registry: None,
+                    recovery_hint: None,
                     mode: AppMode::Agent,
                 },
             ));
@@ -2820,6 +2799,7 @@ mod tests {
                     verbosity: None,
                     skills_scan_codewhale_only: false,
                     plugin_registry: None,
+                    recovery_hint: None,
                     mode: AppMode::Agent,
                 },
             ));
@@ -3042,6 +3022,7 @@ mod tests {
                     verbosity: None,
                     skills_scan_codewhale_only: false,
                     plugin_registry: None,
+                    recovery_hint: None,
                     mode: AppMode::Agent,
                 },
             ));
@@ -3076,12 +3057,65 @@ mod tests {
                     verbosity: None,
                     skills_scan_codewhale_only: false,
                     plugin_registry: None,
+                    recovery_hint: None,
                     mode: AppMode::Agent,
                 },
             ));
 
         assert!(!prompt.contains("<session_goal>"));
         assert!(!prompt.contains("## Current Goal"));
+    }
+
+    #[test]
+    fn recovery_hint_renders_only_when_present() {
+        // Prompt assembly reads env-dependent paths (skills, memory, session
+        // state); the byte-equality check must serialize against env-guard
+        // tests in the same binary.
+        let _env_guard = crate::test_support::lock_test_env();
+        let tmp = tempdir().expect("tempdir");
+        let build = |recovery_hint: Option<&str>| {
+            system_prompt_flat_text(&system_prompt_for_mode_with_context_skills_and_session(
+                tmp.path(),
+                None,
+                None,
+                None,
+                PromptSessionContext {
+                    user_memory_block: None,
+                    goal_objective: None,
+                    project_context_pack_enabled: false,
+                    locale_tag: "en",
+                    translation_enabled: false,
+                    model_id: "codewhale",
+                    context_window_override: None,
+                    verbosity: None,
+                    recovery_hint,
+                    skills_scan_codewhale_only: false,
+                    plugin_registry: None,
+                    mode: AppMode::Agent,
+                },
+            ))
+        };
+
+        let hinted = build(Some(
+            "A previous session (\"fix\", id abc12345) has a recovery checkpoint",
+        ));
+        assert!(hinted.contains("## Prior Session"));
+        assert!(hinted.contains("<session_recovery>"));
+        assert!(hinted.contains("recovery checkpoint"));
+
+        // Clean sessions share identical prefix bytes: no block, no heading.
+        let clean = build(None);
+        assert!(!clean.contains("## Prior Session"));
+        assert!(!clean.contains("session_recovery"));
+        let blank = build(Some("   "));
+        for (i, (a, b)) in clean.lines().zip(blank.lines()).enumerate() {
+            assert_eq!(a, b, "line {i} differs");
+        }
+        assert_eq!(
+            clean.lines().count(),
+            blank.lines().count(),
+            "line counts differ"
+        );
     }
 
     #[test]
@@ -3100,7 +3134,7 @@ mod tests {
             "When NOT to use certain tools",
             "Don't reach for",
         ] {
-            assert!(!HEADLESS_BASE_PROMPT.contains(forbidden));
+            assert!(!BASE_PROMPT.contains(forbidden));
         }
     }
 
@@ -3167,6 +3201,7 @@ mod tests {
                     verbosity: None,
                     skills_scan_codewhale_only: false,
                     plugin_registry: None,
+                    recovery_hint: None,
                     mode: AppMode::Agent,
                 },
             ));
@@ -3231,7 +3266,7 @@ mod tests {
             rlm_count >= 5,
             "RLM tool descriptions present: expected >= 5 mentions of 'rlm', got {rlm_count}"
         );
-        assert!(!HEADLESS_BASE_PROMPT.contains("`rlm`"));
+        assert!(!BASE_PROMPT.contains("`rlm`"));
     }
 
     /// Project instructions rank above memory, with the nearest scope winning
@@ -3268,19 +3303,19 @@ mod tests {
     fn prompt_documents_fork_context_prefix_cache_contract() {
         let source = include_str!("tools/subagent/mod.rs");
         assert!(source.contains("fork_context"));
-        assert!(!HEADLESS_BASE_PROMPT.contains("fork_context"));
+        assert!(!BASE_PROMPT.contains("fork_context"));
     }
 
     #[test]
     fn prompt_documents_explicit_subagent_model_strength() {
         let source = include_str!("tools/subagent/mod.rs");
         assert!(source.contains("model_strength"));
-        assert!(!HEADLESS_BASE_PROMPT.contains("model_strength"));
+        assert!(!BASE_PROMPT.contains("model_strength"));
     }
 
     #[test]
     fn prompt_documents_structured_subagent_briefs() {
-        assert!(!HEADLESS_BASE_PROMPT.contains("Subagent Brief"));
+        assert!(!BASE_PROMPT.contains("Subagent Brief"));
         for heading in [
             "### SUMMARY",
             "### EVIDENCE",
@@ -3294,8 +3329,8 @@ mod tests {
 
     #[test]
     fn universal_prompt_does_not_invent_orchestration_limits() {
-        assert!(!HEADLESS_BASE_PROMPT.contains("3-5 tool calls"));
-        assert!(!HEADLESS_BASE_PROMPT.contains("No fan-out without a fan-in owner"));
+        assert!(!BASE_PROMPT.contains("3-5 tool calls"));
+        assert!(!BASE_PROMPT.contains("No fan-out without a fan-in owner"));
     }
 
     #[test]
@@ -3306,7 +3341,7 @@ mod tests {
             "request_user_input",
             ".workflow.js",
         ] {
-            assert!(!HEADLESS_BASE_PROMPT.contains(recipe));
+            assert!(!BASE_PROMPT.contains(recipe));
         }
     }
 
@@ -3319,7 +3354,7 @@ mod tests {
             "dispatch, join",
             "busy-waiting",
         ] {
-            assert!(!HEADLESS_BASE_PROMPT.contains(internal));
+            assert!(!BASE_PROMPT.contains(internal));
         }
     }
 
@@ -3690,6 +3725,7 @@ mod tests {
                     verbosity: Some(" Concise "),
                     skills_scan_codewhale_only: false,
                     plugin_registry: None,
+                    recovery_hint: None,
                     mode: AppMode::Agent,
                 },
             ),
@@ -3734,6 +3770,7 @@ mod tests {
                 verbosity: Some("concise"),
                 skills_scan_codewhale_only: false,
                 plugin_registry: None,
+                recovery_hint: None,
                 mode: AppMode::Agent,
             },
         );
@@ -3787,6 +3824,7 @@ mod tests {
             verbosity: None,
             skills_scan_codewhale_only: false,
             plugin_registry: None,
+            recovery_hint: None,
             mode: AppMode::Agent,
         };
         let first = system_prompt_for_mode_with_context_skills_session_and_approval(

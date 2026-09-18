@@ -51,6 +51,7 @@ fn subagent(
     status: crate::tools::subagent::SubAgentStatus,
 ) -> crate::tools::subagent::SubAgentResult {
     crate::tools::subagent::SubAgentResult {
+        usage: None,
         name: id.to_string(),
         agent_id: id.to_string(),
         context_mode: "fresh".to_string(),
@@ -165,10 +166,15 @@ fn composed_frame_paints_each_fact_in_exactly_one_row() {
                 "help hint",
                 crate::tui::shell_key_routing::info_help_hint(app.ui_locale),
             ),
-            ("output rate", "40 avg tok/s".to_string()),
             ("ttft", "ttft 400ms".to_string()),
         ];
         facts.push(("context reading", format!("ctx {pct}%")));
+        if width >= 120 {
+            facts.push(("output rate", "40 avg tok/s".to_string()));
+        } else {
+            // The billing tier takes priority over rate at narrow widths.
+            assert_eq!(count_rows_containing(&rows, "40 avg tok/s"), 0);
+        }
         for (name, needle) in facts {
             if needle.is_empty() {
                 continue;
@@ -188,7 +194,7 @@ fn composed_frame_paints_each_fact_in_exactly_one_row() {
             .expect("posture bar");
         let metrics = rows
             .iter()
-            .position(|row| row.contains("tok/s"))
+            .position(|row| row.contains("ctx "))
             .expect("metrics line");
         let composer = app
             .viewport
@@ -820,13 +826,13 @@ fn statusline_full_frame_context_reading_updates_below_and_at_warning() {
             content: "Keep the context reading visible".to_string(),
         }];
         app.resync_history_revisions();
-        app.api_messages = vec![Message {
+        app.api_messages = std::sync::Arc::new(vec![Message {
             role: Role::User,
             content: vec![ContentBlock::Text {
                 text: "context ".repeat(400),
                 cache_control: None,
             }],
-        }];
+        }]);
         app.input = "next".to_string();
         app.cursor_position = app.input.chars().count();
         app.status_items = StatusItem::default_footer();

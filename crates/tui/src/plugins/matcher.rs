@@ -46,13 +46,17 @@ fn effective_keywords(candidate: &KeywordCandidate<'_>) -> Vec<String> {
     let mut keywords = Vec::new();
     for keyword in candidate.keywords {
         let normalized = keyword.trim().to_ascii_lowercase();
-        if is_specific_term(&normalized) {
+        if is_matchable_term(&normalized) {
             keywords.push(normalized);
         }
     }
     for domain in candidate.domains {
+        // A homepage on a code-hosting platform names where the plugin
+        // *lives*, not what it is; matching it would make every github-hosted
+        // plugin fire on any "github" mention. Everything else matches on
+        // declared data, which the host does not second-guess.
         if let Some(normalized) = normalize_domain(domain)
-            && is_specific_term(&normalized)
+            && is_matchable_term(&normalized)
             && !matches!(
                 normalized.as_str(),
                 "github.com" | "gitlab.com" | "bitbucket.org"
@@ -62,7 +66,7 @@ fn effective_keywords(candidate: &KeywordCandidate<'_>) -> Vec<String> {
         }
     }
     let name = candidate.name.trim().to_ascii_lowercase();
-    if is_specific_term(&name) {
+    if is_matchable_term(&name) {
         keywords.push(name);
     }
     keywords
@@ -70,27 +74,17 @@ fn effective_keywords(candidate: &KeywordCandidate<'_>) -> Vec<String> {
 
 // Core vocabulary is not evidence that a user needs an integration. A
 // specific product name, phrase or domain is still eligible.
-fn is_specific_term(term: &str) -> bool {
-    term.chars().count() >= 3
-        && !term.chars().any(char::is_control)
-        && !matches!(
-            term,
-            "mcp"
-                | "plugin"
-                | "plugins"
-                | "skill"
-                | "skills"
-                | "agent"
-                | "agents"
-                | "tool"
-                | "tools"
-                | "data"
-                | "code"
-                | "model"
-                | "models"
-                | "session"
-                | "sessions"
-        )
+/// Mechanical admissibility for a match term: long enough to be a word and
+/// free of control characters.
+///
+/// Deliberately **not** a semantic stoplist. It used to reject declared terms
+/// like `mcp`, `agent`, `model`, `data` and `code`, which made a catalog
+/// author's declared keywords unmatchable — the same failure mode as the
+/// deleted #6274 name suppression, one layer down. Declared keywords are the
+/// catalog author's call; the noise controls are the score threshold, the
+/// once-per-lifetime gate, and dismissal (#6290 rework).
+fn is_matchable_term(term: &str) -> bool {
+    term.chars().count() >= 3 && !term.chars().any(char::is_control)
 }
 
 pub(crate) fn normalize_domain(domain: &str) -> Option<String> {
@@ -153,9 +147,11 @@ mod tests {
             super::match_plugin_keyword("help with finance", &candidates),
             Some((0, "finance".into()))
         );
+        // Declared terms are the catalog author's call (#6290 rework): `mcp`
+        // matches when declared, and the receipt names it.
         assert_eq!(
             super::match_plugin_keyword("help with mcp", &candidates),
-            None
+            Some((0, "mcp".into()))
         );
     }
 
@@ -237,10 +233,13 @@ mod tests {
     }
 
     #[test]
-    fn core_vocabulary_short_claims_and_commands_do_not_trigger_suggestions() {
+    fn declared_vocabulary_matches_and_only_mechanics_filter_terms() {
+        // Declared keywords are the catalog author's call (#6290 rework):
+        // `mcp`, `agent`, `model`, … match when declared. The remaining
+        // filters are mechanical (>= 3 characters, no control characters),
+        // the `/`-command guard, and the code-hosting homepage exclusion.
         let words = [
-            "mcp", "plugin", "plugins", "skill", "skills", "agent", "agents", "tool", "tools",
-            "code", "data", "model", "models", "session", "sessions", "go", "ai",
+            "mcp", "plugin", "skill", "agent", "tool", "code", "data", "model", "session",
         ];
         let keywords = words
             .iter()
@@ -250,10 +249,15 @@ mod tests {
         for word in words {
             assert_eq!(
                 match_plugin_keyword(&format!("please help with {word}"), &candidates),
-                None,
+                Some(0),
                 "{word}"
             );
         }
+        // Two-character terms stay out on the mechanical floor.
+        let short_keywords = vec!["go".to_string()];
+        let short = [candidate("git", &[], &short_keywords)];
+        assert_eq!(match_plugin_keyword("go", &short), None);
+
         let shared_host = vec!["https://github.com/example/plugin".to_string()];
         let candidates = [candidate("supabase", &shared_host, &[])];
         assert_eq!(

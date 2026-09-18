@@ -11,6 +11,9 @@
 //! Copy falls back to OSC 52 (or tmux `load-buffer -w`), paste arrives through
 //! terminal input, and image clipboard reads are unavailable.
 
+#[cfg(all(target_os = "linux", not(target_env = "ohos"), not(test)))]
+mod primary;
+
 use std::ffi::OsStr;
 #[cfg(any(not(test), all(test, unix)))]
 use std::io::Write;
@@ -42,6 +45,7 @@ use base64::Engine as _;
 use image::{ImageBuffer, Rgba};
 
 const OSC52_MAX_BYTES: usize = 100 * 1024;
+const PRIMARY_MAX_BYTES: usize = 1024 * 1024;
 #[cfg(any(
     test,
     target_os = "macos",
@@ -298,6 +302,12 @@ impl TerminalClipboardWriter {
 pub struct ClipboardHandler {
     terminal_context: TerminalClipboardContext,
     terminal_writer: Option<TerminalClipboardWriter>,
+    #[cfg(all(target_os = "linux", not(target_env = "ohos"), not(test)))]
+    primary: Option<primary::PrimarySelection>,
+    #[cfg(test)]
+    primary_enabled: bool,
+    #[cfg(test)]
+    primary_text: Option<String>,
     #[cfg(any(
         target_os = "macos",
         target_os = "windows",
@@ -330,6 +340,12 @@ impl ClipboardHandler {
         Self {
             terminal_context,
             terminal_writer: None,
+            #[cfg(all(target_os = "linux", not(target_env = "ohos"), not(test)))]
+            primary: None,
+            #[cfg(test)]
+            primary_enabled: false,
+            #[cfg(test)]
+            primary_text: None,
             #[cfg(any(
                 target_os = "macos",
                 target_os = "windows",
@@ -375,6 +391,80 @@ impl ClipboardHandler {
     /// older terminals).
     pub(crate) fn requires_terminal_paste(&self) -> bool {
         self.terminal_context.requires_terminal_paste()
+    }
+
+    pub(crate) fn uses_primary_selection(&self) -> bool {
+        #[cfg(test)]
+        {
+            self.primary_enabled
+        }
+        #[cfg(not(test))]
+        {
+            cfg!(all(target_os = "linux", not(target_env = "ohos")))
+        }
+    }
+
+    /// Automatic selection never writes CLIPBOARD or sends OSC 52. A remote
+    /// terminal without a forwarded display owns its own selection and paste.
+    pub(crate) fn write_primary_text(&mut self, text: &str) -> Result<()> {
+        if !self.uses_primary_selection()
+            || !self.terminal_context.permits_native_read()
+            || text.is_empty()
+            || text.len() > PRIMARY_MAX_BYTES
+        {
+            bail!("PRIMARY selection unavailable");
+        }
+        #[cfg(test)]
+        {
+            if self.fail_text_writes {
+                bail!("test PRIMARY unavailable");
+            }
+            self.primary_text = Some(text.to_string());
+            Ok(())
+        }
+        #[cfg(all(target_os = "linux", not(target_env = "ohos"), not(test)))]
+        {
+            self.primary_selection()?.write(text)
+        }
+        #[cfg(all(not(test), not(all(target_os = "linux", not(target_env = "ohos")))))]
+        {
+            bail!("PRIMARY selection unavailable")
+        }
+    }
+
+    pub(crate) fn read_primary_text(&mut self) -> Option<String> {
+        if !self.uses_primary_selection() || !self.terminal_context.permits_native_read() {
+            return None;
+        }
+        #[cfg(test)]
+        {
+            if self.fail_text_writes {
+                None
+            } else {
+                self.primary_text.clone()
+            }
+        }
+        #[cfg(all(target_os = "linux", not(target_env = "ohos"), not(test)))]
+        {
+            self.primary_selection().ok()?.read()
+        }
+        #[cfg(all(not(test), not(all(target_os = "linux", not(target_env = "ohos")))))]
+        {
+            None
+        }
+    }
+
+    #[cfg(all(target_os = "linux", not(target_env = "ohos"), not(test)))]
+    fn primary_selection(&mut self) -> Result<&primary::PrimarySelection> {
+        if self.primary.is_none() {
+            self.primary = Some(primary::PrimarySelection::spawn()?);
+        }
+        Ok(self.primary.as_ref().expect("PRIMARY worker initialized"))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn enable_primary_for_test(&mut self) {
+        self.primary_enabled = true;
     }
 
     /// Try to connect to the system clipboard, bounded by a short timeout.
@@ -818,6 +908,35 @@ fn save_image_as_png_in(dir: &Path, image: &ImageData) -> Result<PastedImage> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn primary_transport_is_distinct_bounded_and_never_uses_ssh_host_clipboard() {
+        let mut clipboard = ClipboardHandler::for_test(false, false);
+        clipboard.enable_primary_for_test();
+        clipboard.write_text("regular").unwrap();
+        clipboard.write_primary_text("selected").unwrap();
+        assert_eq!(clipboard.last_written_text(), Some("regular"));
+        assert_eq!(clipboard.read_primary_text().as_deref(), Some("selected"));
+        assert!(clipboard.write_primary_text("").is_err());
+        assert!(
+            clipboard
+                .write_primary_text(&"x".repeat(PRIMARY_MAX_BYTES + 1))
+                .is_err()
+        );
+        assert_eq!(clipboard.read_primary_text().as_deref(), Some("selected"));
+        let mut remote = ClipboardHandler::for_test(true, false);
+        remote.enable_primary_for_test();
+        assert!(remote.write_primary_text("private").is_err());
+        assert!(remote.read_primary_text().is_none());
+        assert!(remote.last_written_text().is_none());
+        let mut forwarded = ClipboardHandler::with_terminal_context(TerminalClipboardContext {
+            endpoint: ClipboardEndpoint::ForwardedDisplay,
+            in_tmux: false,
+        });
+        forwarded.enable_primary_for_test();
+        forwarded.write_primary_text("forwarded").unwrap();
+        assert_eq!(forwarded.read_primary_text().as_deref(), Some("forwarded"));
+    }
 
     #[test]
     fn clipboard_markdown_preserves_rich_structure_and_code() {
@@ -1409,8 +1528,27 @@ fi
         perms.set_mode(0o755);
         std::fs::set_permissions(&script, perms).unwrap();
 
-        let text = read_text_with_wlpaste_using_argv(script.to_str().unwrap())
-            .expect("read text through wl-paste helper");
+        // A freshly written helper script can transiently report ETXTBSY
+        // ("Text file busy") when a concurrent test in this parallel suite
+        // forks while the write descriptor is still inherited. Retry the
+        // exec briefly so this assertion exercises the helper contract
+        // rather than the fork/exec window; the bound is load tolerance,
+        // not the behavior under test (same class as #5929).
+        let mut attempts = 0;
+        let text = loop {
+            match read_text_with_wlpaste_using_argv(script.to_str().unwrap()) {
+                Ok(text) => break text,
+                Err(error) => {
+                    attempts += 1;
+                    let busy = error.to_string().contains("Text file busy");
+                    assert!(
+                        busy && attempts < 100,
+                        "read text through wl-paste helper: {error:#}"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            }
+        };
 
         assert_eq!(text, "from-wayland");
     }

@@ -10,6 +10,20 @@ pub(crate) struct OfflineQueueTransition {
     restored: Option<OfflineQueueState>,
 }
 
+/// A session load/resume failure must survive past the next footer update.
+///
+/// The status line is replaced almost immediately, which left a failed
+/// resume looking like a silent new session — the screen even offered to
+/// resume the id it had just created (#6138). Keep both: the transcript
+/// error cell is the durable record, the status line the immediate one.
+pub(crate) fn surface_session_load_failure(app: &mut App, message: String) {
+    app.add_message(crate::tui::history::HistoryCell::Error {
+        message: message.clone(),
+        severity: crate::error_taxonomy::ErrorSeverity::Error,
+    });
+    app.status_message = Some(message);
+}
+
 /// Complete all fallible queue work before a session switch mutates the App.
 /// A second editor must fail without touching either composer or queue file.
 pub(crate) fn prepare_offline_queue_transition(
@@ -633,7 +647,7 @@ pub(crate) fn resume_launch_session(app: &mut App, session_id: &str) -> commands
         Ok(manager) => manager,
         Err(err) => return failed(app, &err.to_string()),
     };
-    let saved = match manager.load_session(session_id) {
+    let saved = match manager.load_session_snapshot(session_id) {
         Ok(saved) => saved,
         Err(err) => return failed(app, &err.to_string()),
     };
@@ -645,6 +659,20 @@ pub(crate) fn resume_launch_session(app: &mut App, session_id: &str) -> commands
     }
     app.launch.dissolve_card(app.ambient_clock_ms);
     commands::CommandResult::action(AppAction::LoadSession(path))
+}
+
+/// `LaunchAction::McpRemedy` (#6085): type the remedy the problems row
+/// prints into the composer — `/mcp login <name>` or `/mcp`. Typing beats
+/// copying (no clipboard dependency over SSH), and the user reads the
+/// command before a second Enter sends it.
+pub(crate) fn type_launch_mcp_remedy(app: &mut App) {
+    let Some(command) = crate::tui::underwater::mcp_remedy_command(app) else {
+        return;
+    };
+    app.input = command;
+    app.cursor_position = app.input.chars().count();
+    app.launch.menu_selected = None;
+    app.launch.status = None;
 }
 
 pub(crate) fn begin_launch_session(
@@ -714,7 +742,7 @@ pub(crate) async fn switch_workspace(
         let _ = engine_handle
             .send(Op::SyncSession {
                 session_id: app.current_session_id.clone(),
-                messages: app.api_messages.clone(),
+                messages: app.api_messages.as_ref().clone(),
                 system_prompt: app.system_prompt.clone(),
                 system_prompt_override: false,
                 model: app.model.clone(),
@@ -728,6 +756,30 @@ pub(crate) async fn switch_workspace(
         content: format!("Switched workspace to {}", workspace.display()),
     });
     app.status_message = Some(format!("Workspace: {}", workspace.display()));
+}
+
+/// Auth / missing-key failures: keep the transcript user bubble and clear the
+/// composer (the turn was submitted). Surface the error without "restored to
+/// composer" — the echo already owns the text.
+pub(crate) fn keep_failed_immediate_submit_echo(
+    app: &mut App,
+    message: QueuedMessage,
+    error: &str,
+) {
+    tracing::warn!(
+        error = %error,
+        "immediate user message dispatch failed auth; keeping transcript echo"
+    );
+    // Composer stays empty — HistoryCell::User already holds the turn.
+    let _ = message;
+    let status = format!("Message not sent ({error})");
+    app.status_message = Some(status.clone());
+    app.set_sticky_status(
+        status,
+        StatusToastLevel::Error,
+        Some(App::STICKY_ERROR_TTL_MS),
+    );
+    app.needs_redraw = true;
 }
 
 pub(crate) fn restore_failed_immediate_submit(
@@ -912,6 +964,7 @@ pub(crate) fn mirror_saved_api_key_in_config(
         ApiProvider::Ollama => &mut providers.ollama,
         ApiProvider::OllamaCloud => &mut providers.ollama_cloud,
         ApiProvider::Huggingface => &mut providers.huggingface,
+        ApiProvider::Modelscope => &mut providers.modelscope,
         ApiProvider::Deepinfra => &mut providers.deepinfra,
         ApiProvider::Together => &mut providers.together,
         ApiProvider::Qianfan => &mut providers.qianfan,
@@ -933,6 +986,7 @@ pub(crate) fn mirror_saved_api_key_in_config(
         ApiProvider::Antigravity => &mut providers.antigravity,
         ApiProvider::Telecomjs => &mut providers.telecomjs,
         ApiProvider::Edenai => &mut providers.edenai,
+        ApiProvider::Zenmux => &mut providers.zenmux,
         ApiProvider::Concentrate => &mut providers.concentrate,
         ApiProvider::Codewhale => &mut providers.codewhale,
         ApiProvider::ModelstudioTokenPlan => &mut providers.modelstudio_token_plan,

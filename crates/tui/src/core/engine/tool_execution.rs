@@ -483,7 +483,7 @@ impl Engine {
             "mcp"
         } else if matches!(
             tool_name.as_str(),
-            CODE_EXECUTION_TOOL_NAME | JS_EXECUTION_TOOL_NAME
+            CODE_EXECUTION_TOOL_NAME | JS_EXECUTION_TOOL_NAME | EXECUTE_TOOLS_TOOL_NAME
         ) {
             "interpreter"
         } else if registry.is_some() {
@@ -548,7 +548,7 @@ impl Engine {
             }
             if matches!(
                 tool_name.as_str(),
-                CODE_EXECUTION_TOOL_NAME | JS_EXECUTION_TOOL_NAME
+                CODE_EXECUTION_TOOL_NAME | JS_EXECUTION_TOOL_NAME | EXECUTE_TOOLS_TOOL_NAME
             ) {
                 return Err(ToolError::permission_denied(format!(
                     "worker '{}' cannot run {tool_name}: arbitrary code execution is outside its machine-readable authority envelope",
@@ -585,6 +585,20 @@ impl Engine {
             execute_js_execution_tool(&tool_input, &workspace)
                 .await
                 .map(RichToolResult::plain)
+        } else if tool_name == EXECUTE_TOOLS_TOOL_NAME {
+            if let Some(registry) = registry {
+                let context = context_override
+                    .as_ref()
+                    .cloned()
+                    .unwrap_or_else(|| registry.context().clone());
+                crate::tools::codemode::execute_tools_tool(&tool_input, registry, &context)
+                    .await
+                    .map(RichToolResult::plain)
+            } else {
+                Err(ToolError::not_available(format!(
+                    "tool '{tool_name}' is not registered"
+                )))
+            }
         } else if let Some(registry) = registry {
             registry
                 .execute_rich_full_with_context(&tool_name, tool_input, context_override.as_ref())

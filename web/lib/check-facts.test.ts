@@ -23,6 +23,15 @@ interface PublishedReleaseFact {
   url: string;
 }
 
+interface ModelFact {
+  id: string;
+  provider: string | null;
+  contextWindow: number | null;
+  maxOutput: number | null;
+  reasoning: boolean;
+  addedAt: string | null;
+}
+
 interface RepoFacts {
   [key: string]: unknown;
   generatedAt: string;
@@ -32,6 +41,7 @@ interface RepoFacts {
   crates: string[];
   sandboxBackends: string[];
   providers: ProviderFact[];
+  models: ModelFact[];
   defaultModel: string | null;
   nodeEngines: string | null;
   toolCount: number | null;
@@ -48,6 +58,7 @@ function diffFacts(
     "crates",
     "sandboxBackends",
     "providers",
+    "models",
     "defaultModel",
     "nodeEngines",
     "toolCount",
@@ -81,6 +92,16 @@ function freshFacts(overrides: Partial<RepoFacts> = {}): RepoFacts {
     providers: [
       { id: "deepseek", label: "DeepSeek", env: "DEEPSEEK_API_KEY" },
       { id: "anthropic", label: "Anthropic", env: "ANTHROPIC_API_KEY" },
+    ],
+    models: [
+      {
+        id: "deepseek-v4-pro",
+        provider: "DeepSeek",
+        contextWindow: 1000000,
+        maxOutput: 128000,
+        reasoning: true,
+        addedAt: "2026-07-01",
+      },
     ],
     defaultModel: "deepseek-v4-pro",
     nodeEngines: ">=18",

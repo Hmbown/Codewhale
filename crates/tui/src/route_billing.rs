@@ -441,6 +441,7 @@ fn classify(
         | ApiProvider::Arcee
         | ApiProvider::OllamaCloud
         | ApiProvider::Huggingface
+        | ApiProvider::Modelscope
         | ApiProvider::Together
         | ApiProvider::Qianfan
         | ApiProvider::Openmodel
@@ -454,6 +455,7 @@ fn classify(
         | ApiProvider::Antigravity
         | ApiProvider::Telecomjs
         | ApiProvider::Edenai
+        | ApiProvider::Zenmux
         | ApiProvider::Concentrate
         | ApiProvider::Codewhale
         | ApiProvider::ModelstudioTokenPlan
@@ -3028,6 +3030,7 @@ mod tests {
         (ApiProvider::Ollama, BillingPresentation::Local),
         (ApiProvider::OllamaCloud, BillingPresentation::Unknown),
         (ApiProvider::Huggingface, BillingPresentation::Metered),
+        (ApiProvider::Modelscope, BillingPresentation::Metered),
         (ApiProvider::Together, BillingPresentation::Metered),
         (ApiProvider::Qianfan, BillingPresentation::Metered),
         (
@@ -3076,13 +3079,14 @@ mod tests {
         (ApiProvider::Antigravity, BillingPresentation::Metered),
         (ApiProvider::Google, BillingPresentation::Metered),
         (ApiProvider::Edenai, BillingPresentation::Metered),
+        (ApiProvider::Zenmux, BillingPresentation::Metered),
         (ApiProvider::Concentrate, BillingPresentation::Metered),
         (ApiProvider::Codewhale, BillingPresentation::Metered),
         (ApiProvider::Custom, BillingPresentation::Unknown),
     ];
 
     /// Default-route billing is a deliberate, audited decision for every
-    /// provider `ApiProvider::all()` exposes — 49 rows covering the primary
+    /// provider `ApiProvider::all()` exposes — 51 rows covering the primary
     /// route and every dialect/plan-variant alternate identity.
     #[test]
     fn default_route_billing_audit_covers_every_provider() {
@@ -3114,7 +3118,7 @@ mod tests {
         }
         assert_eq!(
             DEFAULT_ROUTE_BILLING_AUDIT.len(),
-            49,
+            51,
             "the audit covers every provider identity, primary and alternate"
         );
 

@@ -15,6 +15,7 @@
 import type {
   ChangelogDict,
   ChromeDict,
+  ComputerUseDict,
   DocsAuthDict,
   DocsComputersDict,
   DocsConfigurationDict,
@@ -68,6 +69,24 @@ import { docsAuth as enDocsAuth } from "./en/docs-auth";
 import { docsAuth as zhDocsAuth } from "./zh/docs-auth";
 import { docsTrust as enDocsTrust } from "./en/docs-trust";
 import { docsTrust as zhDocsTrust } from "./zh/docs-trust";
+import { computerUse as enComputerUse } from "./en/computer-use";
+import { computerUse as zhComputerUse } from "./zh/computer-use";
+import { computerUse as jaComputerUse } from "./ja/computer-use";
+import { computerUse as viComputerUse } from "./vi/computer-use";
+import { computerUse as koComputerUse } from "./ko/computer-use";
+import { computerUse as ruComputerUse } from "./ru/computer-use";
+import { computerUse as ukComputerUse } from "./uk/computer-use";
+import { computerUse as esComputerUse } from "./es/computer-use";
+import { computerUse as frComputerUse } from "./fr/computer-use";
+import { computerUse as deComputerUse } from "./de/computer-use";
+import { computerUse as caComputerUse } from "./ca/computer-use";
+import { computerUse as hiComputerUse } from "./hi/computer-use";
+import { computerUse as trComputerUse } from "./tr/computer-use";
+import { computerUse as itComputerUse } from "./it/computer-use";
+import { computerUse as plComputerUse } from "./pl/computer-use";
+import { computerUse as arComputerUse } from "./ar/computer-use";
+import { computerUse as ptBrComputerUse } from "./pt-BR/computer-use";
+import { computerUse as idComputerUse } from "./id/computer-use";
 import { states as enStates } from "./en/states";
 import { states as zhStates } from "./zh/states";
 import { changelog as enChangelog } from "./en/changelog";
@@ -233,6 +252,26 @@ const DOCS_AUTH: Record<string, DocsAuthDict> = {
   zh: zhDocsAuth,
 };
 
+const COMPUTER_USE: Record<string, ComputerUseDict> = {
+  zh: zhComputerUse,
+  ja: jaComputerUse,
+  vi: viComputerUse,
+  ko: koComputerUse,
+  ru: ruComputerUse,
+  uk: ukComputerUse,
+  es: esComputerUse,
+  fr: frComputerUse,
+  de: deComputerUse,
+  ca: caComputerUse,
+  hi: hiComputerUse,
+  tr: trComputerUse,
+  it: itComputerUse,
+  pl: plComputerUse,
+  ar: arComputerUse,
+  "pt-BR": ptBrComputerUse,
+  id: idComputerUse,
+};
+
 const DOCS_TRUST: Record<string, DocsTrustDict> = {
   zh: zhDocsTrust,
 };
@@ -322,6 +361,10 @@ export function getDocsTrust(locale: string): DocsTrustDict {
   return DOCS_TRUST[locale] ?? enDocsTrust;
 }
 
+export function getComputerUse(locale: string): ComputerUseDict {
+  return COMPUTER_USE[locale] ?? enComputerUse;
+}
+
 export function getStates(locale: string): StatesDict {
   return STATES[locale] ?? enStates;
 }
@@ -360,6 +403,7 @@ export const EN_DOCS_WEB = enDocsWeb;
 export const EN_DOCS_COMPUTERS = enDocsComputers;
 export const EN_DOCS_AUTH = enDocsAuth;
 export const EN_DOCS_TRUST = enDocsTrust;
+export const EN_COMPUTER_USE = enComputerUse;
 export const EN_STATES = enStates;
 export const EN_CHANGELOG = enChangelog;
 

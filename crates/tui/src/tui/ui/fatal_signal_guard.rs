@@ -37,7 +37,7 @@
 /// over that a shell does not self-heal are the ones that poison input:
 /// mouse capture and the kitty keyboard stack get the full reset.
 #[cfg(unix)]
-const FATAL_RESTORE_BYTES: &[u8] = concat!(
+pub(crate) const FATAL_RESTORE_BYTES: &[u8] = concat!(
     "\x1b[?2026l", // close any open DEC 2026 synchronized-update batch
     "\x1b[<1u",    // pop one kitty keyboard-enhancement stack level
     "\x1b[?1007l", // alternate scroll off
@@ -220,6 +220,18 @@ mod tests {
                 "fatal restore must reset {mode}; got: {bytes:?}"
             );
         }
+    }
+
+    #[test]
+    fn job_control_guard_reuses_the_fatal_restore_bytes() {
+        // #6169: the SIGTSTP/SIGTTIN stop handler must not grow a second byte
+        // table. One teardown string is written on both the death and the
+        // suspend path, so a mode cannot be reverted on one and leaked by the
+        // other.
+        assert_eq!(
+            super::super::job_control_guard::SUSPEND_RESTORE_BYTES,
+            FATAL_RESTORE_BYTES
+        );
     }
 
     #[test]

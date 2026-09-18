@@ -374,6 +374,7 @@ mod tests {
                 provider_id: "deepseek".to_string(),
                 model_id: "deepseek-v4-pro".to_string(),
                 route_source: "roster".to_string(),
+                fallback_note: None,
                 requested_reasoning: "inherit".to_string(),
                 effective_reasoning: None,
                 runtime_version: "test".to_string(),
@@ -469,6 +470,7 @@ mod tests {
             provider_id: "deepseek".to_string(),
             model_id: "deepseek-v4-pro".to_string(),
             route_source: "roster".to_string(),
+            fallback_note: None,
             requested_reasoning: "inherit".to_string(),
             effective_reasoning: None,
             runtime_version: "test".to_string(),
@@ -485,6 +487,7 @@ mod tests {
         nickname: Option<&str>,
     ) -> crate::tools::subagent::SubAgentResult {
         crate::tools::subagent::SubAgentResult {
+            usage: None,
             // An unnamed dispatch: the manager seeds `name` with the agent id
             // and only replaces it when the caller supplied one.
             name: agent_id.to_string(),
@@ -728,6 +731,7 @@ mod tests {
             provider_id: "deepseek".to_string(),
             model_id: "deepseek-v4-flash-vision-exp".to_string(),
             route_source: "fleet".to_string(),
+            fallback_note: None,
             requested_reasoning: "inherit".to_string(),
             effective_reasoning: None,
             runtime_version: "test".to_string(),

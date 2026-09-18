@@ -90,7 +90,7 @@ use crate::tui::composer_ui::*;
 use crate::tui::context_inspector::ContextInspectorView;
 use crate::tui::event_broker::EventBroker;
 use crate::tui::file_picker_relevance;
-use crate::tui::footer_ui::{friendly_subagent_progress, is_noisy_subagent_progress};
+use crate::tui::footer_ui::friendly_subagent_progress;
 use crate::tui::format_helpers;
 use crate::tui::hotbar::actions::HotbarDispatch;
 use crate::tui::key_shortcuts;
@@ -507,7 +507,7 @@ async fn spawn_tui_engine_with_session(app: &mut App, config: &Config) -> Result
             handle
                 .send(Op::SyncSession {
                     session_id: app.current_session_id.clone(),
-                    messages: app.api_messages.clone(),
+                    messages: app.api_messages.as_ref().clone(),
                     system_prompt: app.system_prompt.clone(),
                     system_prompt_override: false,
                     model: app.model.clone(),
@@ -901,6 +901,10 @@ mod dispatch;
 mod dispatch_prepare;
 pub(crate) use dispatch_prepare::*;
 pub(crate) mod fatal_signal_guard;
+// #6169: runtime half of the foreground-ownership contract — restore on stop,
+// rebuild on continue. Sits next to the fatal guard because both write the same
+// teardown table.
+pub(crate) mod job_control_guard;
 mod motion;
 mod observer_hooks;
 mod provider_setup;
@@ -911,6 +915,9 @@ mod terminal;
 mod terminal_input;
 use remote_control_bridge::*;
 use terminal_input::*;
+// #6165: `external_editor` is a sibling of `ui`, and the pump pause now lives
+// inside its `with_suspended_tui` so no editor entry point can forget it.
+pub(crate) use terminal_input::pause_terminal_input_for_child;
 
 pub(crate) use dispatch::*;
 pub(crate) use motion::*;

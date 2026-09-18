@@ -1234,7 +1234,7 @@ mod tests {
     #[test]
     fn inspector_marks_high_context_pressure() {
         let mut app = test_app();
-        app.api_messages.push(Message {
+        app.api_messages_mut().push(Message {
             role: Role::User,
             content: vec![ContentBlock::Text {
                 text: "x".repeat(4_000_000),
@@ -1421,7 +1421,7 @@ mod tests {
     #[test]
     fn inspector_meter_matches_compaction_pressure_signal() {
         let mut app = test_app();
-        app.api_messages.push(Message {
+        app.api_messages_mut().push(Message {
             role: Role::User,
             content: vec![ContentBlock::Text {
                 text: "x".repeat(4_000),

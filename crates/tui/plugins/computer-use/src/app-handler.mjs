@@ -7,11 +7,12 @@ import { exec } from "./remote-runtime.mjs";
 import { withSignal, throwIfAborted } from "./exec.mjs";
 
 export const ALLOWED = new Set([
-  "preview", "platform", "probe", "list_displays", "switch_display", "list_apps", "list_windows",
-  "open_application", "get_app_state", "resolve_element", "screenshot", "zoom",
+  "preview", "platform", "probe", "list_displays", "switch_display", "list_apps", "list_sessions", "list_windows",
+  "open_application", "kill_app", "set_window_frame", "get_app_state", "resolve_element", "screenshot", "zoom",
+  "browser_start", "browser_status", "browser_navigate", "browser_click", "browser_type", "browser_screenshot", "browser_stop",
   "left_click", "double_click", "triple_click", "right_click", "middle_click",
   "mouse_move", "left_click_drag", "left_mouse_down", "left_mouse_up", "scroll",
-  "type", "key", "hold_key", "set_value", "select_text", "perform_action",
+  "type", "key", "hold_key", "set_value", "focus", "get_value", "select_text", "perform_action", "invoke_menu",
   "read_clipboard", "write_clipboard", "cursor_position",
   "recordingStart", "recordingStop", "recordingStatus", "recordingList",
 ]);
@@ -20,7 +21,7 @@ const backends = new Map();
 const heldPointers = new Map();
 const INPUT_MUTATIONS = new Set([
   "open_application", "left_click", "double_click", "triple_click", "right_click", "middle_click", "mouse_move",
-  "left_click_drag", "left_mouse_down", "left_mouse_up", "scroll", "type", "key", "hold_key", "set_value", "select_text", "perform_action",
+  "left_click_drag", "left_mouse_down", "left_mouse_up", "scroll", "type", "key", "hold_key", "set_value", "focus", "select_text", "perform_action", "invoke_menu",
 ]);
 let queue = Promise.resolve();
 
@@ -37,6 +38,39 @@ async function backend(computerId, sessionId, persistentInputOwner) {
 }
 
 const sessions = new Map();
+let controlMode = "ready";
+let controlGeneration = 0;
+let cleanupPending = false;
+
+/** Human-facing state contains app identity and action names, never task text. */
+export function controlStatus() {
+  return { mode: controlMode, cleanupPending, sessions: [...sessions.values()]
+    .filter((s) => !s.closed && s.target)
+    .map((s) => ({ target: s.target, mode: s.mode, action: s.action ?? null })) };
+}
+
+// Called only by the launcher's inherited control channel, never an MCP tool.
+// Abort before queuing cleanup so even a held gesture yields to the person.
+export async function setControlMode(mode) {
+  if (!["ready", "paused", "stopped"].includes(mode)) throw new Error("Unknown control mode");
+  if (mode === "ready") {
+    if (cleanupPending) throw new Error("Input is still being released; try again in a moment.");
+    controlMode = mode;
+    return controlStatus();
+  }
+  controlMode = mode;
+  const generation = ++controlGeneration;
+  cleanupPending = true;
+  const results = await Promise.allSettled([...sessions.keys()].map((key) => {
+    const colon = key.indexOf(":");
+    return releaseSessionInput(key.slice(colon + 1), key.slice(0, colon), { close: mode === "stopped" });
+  }));
+  const failure = results.find((r) => r.status === "rejected");
+  // A cleanup failure stays blocked. Resume cannot hide owned input.
+  if (failure) throw failure.reason;
+  if (generation === controlGeneration) cleanupPending = false;
+  return controlStatus();
+}
 
 function enqueue(fn) {
   const next = queue.then(fn);
@@ -88,6 +122,30 @@ export function closeAllSessions() {
 }
 
 /**
+ * Content-free session registry view for agents: which sessions are live,
+ * what each is bound to, what it is doing right now, and whether any session
+ * holds a pointer. App identity and action names only — task text never
+ * reaches this process, so none can leak. Read-only by construction.
+ */
+export function summarizeSessions() {
+  const live = [...sessions.entries()].filter(([, s]) => !s.closed);
+  return {
+    control: controlMode,
+    count: live.length,
+    sessions: live.map(([key, s]) => {
+      const computerId = key.slice(0, key.indexOf(":"));
+      return {
+        target: s.target ?? null,
+        mode: s.mode ?? null,
+        action: s.action ?? null,
+        ageSec: Math.max(0, Math.round((Date.now() - s.touched) / 1000)),
+        inputHeld: heldPointers.get(computerId) === key,
+      };
+    }),
+  };
+}
+
+/**
  * Execute one {tool, args} request on this machine's backend. Never throws:
  * every outcome is a receipt object with `ok`.
  */
@@ -97,6 +155,8 @@ export async function handle(req, { computerId = "local", sessionId = "direct", 
     return { ok: false, error: { code: "tool_not_allowed", message: `tool "${tool}" is not in the remote allow-list` } };
   }
   if (tool === "platform") return { ok: true, platform: process.platform };
+  if (controlMode !== "ready") return { ok: false, error: { code: `control_${controlMode}`, message: `Computer Use is ${controlMode} by the user. Wait for them to resume it in the menu bar.` } };
+  const generation = controlGeneration;
   const key = `${computerId}:${sessionId}`;
   let session = sessions.get(key);
   if (!session) {
@@ -125,8 +185,11 @@ export async function handle(req, { computerId = "local", sessionId = "direct", 
   try {
     return await enqueue(() => withSignal(controller.signal, async () => {
       throwIfAborted();
+      if (generation !== controlGeneration || controlMode !== "ready") throw Object.assign(new Error("Computer control was interrupted by the user."), { code: "cancelled" });
       const instance = await backend(computerId, sessionId, persistentInputOwner);
       throwIfAborted();
+      session.action = tool;
+      if (tool === "open_application") { session.target = null; session.mode = null; }
       if (INPUT_MUTATIONS.has(tool) && heldPointers.has(computerId) && heldPointers.get(computerId) !== key) {
         return { ok: false, error: { code: "input_busy", message: "Another computer session owns a held pointer; release it or close that session before sending input." } };
       }
@@ -147,6 +210,10 @@ export async function handle(req, { computerId = "local", sessionId = "direct", 
         throw error;
       }
       if (tool === "left_mouse_up" && heldPointers.get(computerId) === key) heldPointers.delete(computerId);
+      if (tool === "open_application" && data?.resolved) {
+        session.target = { name: String(data.resolved.name ?? "Application").slice(0, 128), pid: data.resolved.pid };
+        session.mode = data.shared_pointer || data.activate ? "foreground" : "background";
+      }
       return { ok: true, platform: process.platform, tool, data };
     }));
   } catch (err) {
@@ -154,6 +221,7 @@ export async function handle(req, { computerId = "local", sessionId = "direct", 
   } finally {
     signal?.removeEventListener("abort", abort);
     session.requests.delete(controller);
+    session.action = null;
     session.touched = Date.now();
   }
 }

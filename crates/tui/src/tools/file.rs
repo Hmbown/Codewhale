@@ -7,10 +7,12 @@
 //! with path validation to prevent escaping the workspace boundary.
 
 use super::diff_format::make_unified_diff;
+use super::rust_format::{NORMALIZED_NOTE, normalize_edit};
 use super::spec::{
     ApprovalRequirement, RichToolResult, ToolCapability, ToolContext, ToolError, ToolResult,
     ToolSpec, lsp_diagnostics_for_paths, optional_str, optional_u64, required_str,
 };
+use super::syntax_check::guard_edit;
 use async_trait::async_trait;
 use serde_json::{Value, json};
 use std::borrow::Cow;
@@ -758,6 +760,10 @@ impl ReadFileTool {
         let bytes = fs::read(&file_path).map_err(|error| {
             ToolError::execution_failed(format!("Failed to read {}: {error}", file_path.display()))
         })?;
+        // #6283: every read response carries the file's byte size, line
+        // count, and truncation flag so the caller can page deliberately
+        // instead of discovering a huge file one window at a time.
+        let size_bytes = bytes.len();
         check_file_operation_cancelled(context)?;
         if let Some(mime_type) = primitive_image_mime(&bytes) {
             let prepared = crate::image_attach::prepare_tool_image_bytes(&bytes, mime_type);
@@ -790,6 +796,11 @@ impl ReadFileTool {
         };
         let selected_content = selected.join("\n");
         let window = contract_read_window(&selected_content, max_bytes);
+        // Truncated means the file holds more than this response shows:
+        // either the byte budget cut the window, or a bounded range stopped
+        // before EOF. A whole file that fits is never truncated.
+        let truncated =
+            window.truncated || limit.is_some() && start + selected.len() < all_lines.len();
         let first_display = start + 1;
         let mut output = if window.first_line_too_large {
             let size = selected.first().map_or(0, |line| line.len());
@@ -820,8 +831,9 @@ impl ReadFileTool {
                 String::new()
             };
             output.push_str(&format!(
-                "\n\n[Showing lines {first_display}-{last_display} of {} ({max_bytes}-byte output budget). Use {hint} to continue{raise}.]",
-                all_lines.len()
+                "\n\n[Showing lines {first_display}-{last_display} of {} ({} total, {max_bytes}-byte output budget). Use {hint} to continue{raise}.]",
+                all_lines.len(),
+                contract_format_size(size_bytes)
             ));
         } else if limit.is_some() {
             let consumed = selected.len();
@@ -829,7 +841,8 @@ impl ReadFileTool {
                 let remaining = all_lines.len() - (start + consumed);
                 let next_offset = start + consumed + 1;
                 output.push_str(&format!(
-                    "\n\n[{remaining} more lines in file. Use offset={next_offset} to continue.]"
+                    "\n\n[{remaining} more lines in file ({} total). Use offset={next_offset} to continue.]",
+                    contract_format_size(size_bytes)
                 ));
             }
         }
@@ -844,7 +857,13 @@ impl ReadFileTool {
                 // The budget this call actually enforced. The context
                 // compactor honors it so an already-bounded read is never
                 // truncated a second time on its way into the conversation.
-                "read_budget_bytes": max_bytes
+                "read_budget_bytes": max_bytes,
+                // #6283: paging contract. `size` is the whole file in bytes,
+                // `line_count` its total lines, `truncated` whether the file
+                // holds more than this response shows.
+                "size": size_bytes,
+                "truncated": truncated,
+                "line_count": all_lines.len()
             })),
         ))
     }
@@ -1443,7 +1462,18 @@ impl WriteFileTool {
         // Preserve the existing file's line-ending style on overwrite (see
         // `preserve_prior_line_endings`); otherwise a CRLF (Windows) file is
         // silently rewritten with LF line endings.
-        let written = preserve_prior_line_endings(file_content, &prior_contents);
+        let mut written = preserve_prior_line_endings(file_content, &prior_contents);
+        guard_edit(
+            &file_path,
+            path_str,
+            existed_before.then(|| prior_contents.as_ref()),
+            &written,
+        )?;
+        if existed_before
+            && let Some(normalized) = normalize_edit(&file_path, &prior_contents, &written).await
+        {
+            written = normalized;
+        }
         crate::utils::write_atomic_workspace(&file_path, written.as_bytes()).map_err(|error| {
             ToolError::execution_failed(format!("Failed to write {}: {error}", file_path.display()))
         })?;
@@ -1561,7 +1591,19 @@ impl ToolSpec for WriteFileTool {
         // Preserve the existing file's line-ending style on overwrite (see
         // `preserve_prior_line_endings`); a full `write_file` over a CRLF
         // (Windows) file otherwise silently rewrites every line ending to LF.
-        let written = preserve_prior_line_endings(file_content, &prior_contents);
+        let mut written = preserve_prior_line_endings(file_content, &prior_contents);
+
+        guard_edit(
+            &file_path,
+            path_str,
+            existed_before.then(|| prior_contents.as_ref()),
+            &written,
+        )?;
+        if existed_before
+            && let Some(normalized) = normalize_edit(&file_path, &prior_contents, &written).await
+        {
+            written = normalized;
+        }
 
         crate::utils::write_atomic_workspace(&file_path, written.as_bytes()).map_err(|e| {
             ToolError::execution_failed(format!("Failed to write {}: {}", file_path.display(), e))
@@ -2003,7 +2045,11 @@ impl EditFileTool {
         let normalized = normalize_contract_line_endings(without_bom);
         let updated = apply_contract_edits(&normalized, &edits, path_str)?;
         check_file_operation_cancelled(context)?;
-        let final_content = format!("{bom}{}", restore_contract_line_endings(&updated, ending));
+        let mut final_content = format!("{bom}{}", restore_contract_line_endings(&updated, ending));
+        guard_edit(&file_path, path_str, Some(&raw), &final_content)?;
+        if let Some(normalized) = normalize_edit(&file_path, &raw, &final_content).await {
+            final_content = normalized;
+        }
 
         crate::utils::write_atomic_workspace(&file_path, final_content.as_bytes()).map_err(
             |error| {
@@ -2244,6 +2290,18 @@ impl ToolSpec for EditFileTool {
             ));
         }
 
+        guard_edit(&file_path, path_str, Some(&contents), &updated)?;
+
+        // #6205 — normalize after the syntax gate so the next turn's anchors
+        // match the bytes on disk rather than the text the model emitted.
+        let normalized_formatting = match normalize_edit(&file_path, &contents, &updated).await {
+            Some(normalized) => {
+                updated = normalized;
+                true
+            }
+            None => false,
+        };
+
         crate::utils::write_atomic_workspace(&file_path, updated.as_bytes()).map_err(|e| {
             ToolError::execution_failed(format!("Failed to write {}: {}", file_path.display(), e))
         })?;
@@ -2279,7 +2337,12 @@ impl ToolSpec for EditFileTool {
             Some(other) => other,
             None => "",
         };
-        let summary = format!("Replaced 1 occurrence in {display}{fuzz_note}");
+        let format_note = if normalized_formatting {
+            NORMALIZED_NOTE
+        } else {
+            ""
+        };
+        let summary = format!("Replaced 1 occurrence in {display}{fuzz_note}{format_note}");
         let body = if diff.is_empty() {
             format!("{summary}\n(no textual changes)")
         } else {

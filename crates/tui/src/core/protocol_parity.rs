@@ -13,11 +13,10 @@
 //! host must supply — so it lands with the engine handle in Phase C/D, not
 //! here.
 //!
-//! No runtime surface calls these projections yet: the first consumer is the
-//! in-process engine handle that Phase D attaches the TUI and app-server to.
-//! Until then the guard is the compile of this module itself, so dead-code
-//! is allowed here on purpose rather than hidden behind a test cfg (which
-//! would let `cargo build` pass with an unmapped variant).
+//! The foreground pet observer consumes the event projection, retaining only
+//! lifecycle metadata. Other projections remain compile-time parity guards;
+//! dead-code is allowed here rather than hiding those guards behind a test cfg
+//! (which would let `cargo build` pass with an unmapped variant).
 #![allow(dead_code)]
 
 use std::collections::BTreeMap;
@@ -382,6 +381,36 @@ fn compaction_to_wire(config: &CompactionConfig) -> wire_op::CompactionPolicy {
     }
 }
 
+/// Project the engine's per-turn authority onto the wire `TurnSpec`. Host-only
+/// fields (`initial_routed_usage`, `hook_executor`) and resolved routes are
+/// stripped; only their non-secret receipts cross.
+fn turn_spec_to_wire(spec: &crate::core::ops::TurnSpec) -> wire_op::TurnSpec {
+    wire_op::TurnSpec {
+        max_output_tokens: spec.max_output_tokens,
+        content: spec.content.clone(),
+        images: spec.images.clone(),
+        mode: app_mode_str(spec.mode).to_string(),
+        model: Some(spec.route.model.clone()),
+        model_provider: Some(spec.route.identity.key.clone()),
+        allowed_tools: spec.allowed_tools.clone(),
+        dynamic_tools: spec.dynamic_tools.clone(),
+        provenance: spec.provenance.as_str().to_string(),
+        compaction: Some(Box::new(compaction_to_wire(&spec.compaction))),
+        goal_objective: spec.goal_objective.clone(),
+        goal_token_budget: spec.goal_token_budget,
+        goal_status: spec.goal_status.as_str().to_string(),
+        reasoning_effort: spec.reasoning_effort.clone(),
+        reasoning_effort_auto: spec.reasoning_effort_auto,
+        auto_model: spec.auto_model,
+        allow_shell: spec.allow_shell,
+        trust_mode: spec.trust_mode,
+        auto_approve: spec.auto_approve,
+        approval_mode: approval_mode_str(spec.approval_mode).to_string(),
+        translation_enabled: spec.translation_enabled,
+        verbosity: spec.verbosity.clone(),
+    }
+}
+
 fn preview_unresolved_str(unresolved: &PreviewUnresolved) -> String {
     match unresolved {
         PreviewUnresolved::AutoRouteNeedsPrompt => "auto_route_needs_prompt".to_string(),
@@ -690,6 +719,9 @@ pub fn event_to_protocol(event: &Event, ids: &ProtocolIds) -> wire::EventMsg {
             parent_run_id,
             spawn_depth,
             continuable,
+            // Child usage stays off the wire: no protocol client consumes
+            // it, and metrics reads the persisted runtime payload (#6315).
+            usage: _,
         } => wire::EventMsg::AgentComplete {
             thread_id,
             session_id,
@@ -943,55 +975,7 @@ pub fn event_to_protocol(event: &Event, ids: &ProtocolIds) -> wire::EventMsg {
 #[must_use]
 pub fn op_to_protocol(op: &Op) -> wire_op::Op {
     match op {
-        Op::SendMessage {
-            max_output_tokens,
-            content,
-            images,
-            mode,
-            route,
-            compaction,
-            initial_routed_usage: _, // Host-owned accounting, never model input.
-            goal_objective,
-            goal_token_budget,
-            goal_status,
-            reasoning_effort,
-            reasoning_effort_auto,
-            auto_model,
-            allow_shell,
-            trust_mode,
-            auto_approve,
-            approval_mode,
-            translation_enabled,
-            allowed_tools,
-            dynamic_tools,
-            // Host configuration, never turn input.
-            hook_executor: _,
-            verbosity,
-            provenance,
-        } => wire_op::Op::SendMessage {
-            max_output_tokens: *max_output_tokens,
-            content: content.clone(),
-            images: images.clone(),
-            mode: app_mode_str(*mode).to_string(),
-            model: Some(route.model.clone()),
-            model_provider: Some(route.identity.key.clone()),
-            allowed_tools: allowed_tools.clone(),
-            dynamic_tools: dynamic_tools.clone(),
-            provenance: provenance.as_str().to_string(),
-            compaction: Some(Box::new(compaction_to_wire(compaction))),
-            goal_objective: goal_objective.clone(),
-            goal_token_budget: *goal_token_budget,
-            goal_status: goal_status.as_str().to_string(),
-            reasoning_effort: reasoning_effort.clone(),
-            reasoning_effort_auto: *reasoning_effort_auto,
-            auto_model: *auto_model,
-            allow_shell: *allow_shell,
-            trust_mode: *trust_mode,
-            auto_approve: *auto_approve,
-            approval_mode: approval_mode_str(*approval_mode).to_string(),
-            translation_enabled: *translation_enabled,
-            verbosity: verbosity.clone(),
-        },
+        Op::SendMessage(spec) => wire_op::Op::SendMessage(turn_spec_to_wire(spec)),
         Op::ContinueGoal {
             dynamic_tools,
             engine_schedule_id,
@@ -1059,6 +1043,7 @@ pub fn op_to_protocol(op: &Op) -> wire_op::Op {
             },
         },
         Op::ListSubAgents => wire_op::Op::ListSubAgents,
+        Op::GetSubAgentSettlement { tx: _ } => wire_op::Op::GetSubAgentSettlement,
         Op::CancelSubAgent { agent_id } => wire_op::Op::CancelSubAgent {
             agent_id: agent_id.clone(),
         },
@@ -1157,6 +1142,7 @@ pub fn op_to_protocol(op: &Op) -> wire_op::Op {
         Op::CancelCompaction { id } => wire_op::Op::CancelCompaction { id: id.clone() },
         // Reply channels never cross the wire: the answer is a frame.
         Op::GetSessionSnapshot { tx: _ } => wire_op::Op::GetSessionSnapshot,
+        Op::GetContextBudget { tx: _ } => wire_op::Op::GetContextBudget,
         Op::GetProviderRuntimeStatus { tx: _ } => wire_op::Op::GetProviderRuntimeStatus,
         Op::BootstrapMcp { tx: _ } => wire_op::Op::BootstrapMcp,
         Op::RetryMcpServer { name, tx: _ } => wire_op::Op::RetryMcpServer { name: name.clone() },
@@ -1265,6 +1251,7 @@ mod tests {
                 parent_run_id: Some("parent".into()),
                 spawn_depth: Some(2),
                 continuable: Some(false),
+                usage: None,
             };
             let wire = serde_json::to_value(event_to_protocol(&event, &ids)).unwrap();
             assert_eq!(wire["worker_status"].as_str(), expected);
@@ -1521,6 +1508,8 @@ mod tests {
 
     #[test]
     fn protocol_covers_engine_ops() {
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        let settlement_reply = std::sync::Arc::new(std::sync::Mutex::new(Some(tx)));
         let ops = vec![
             Op::SetGoalStatus {
                 goal_id: None,
@@ -1553,6 +1542,9 @@ mod tests {
             Op::GetSessionSnapshot {
                 tx: std::sync::Arc::new(std::sync::Mutex::new(None)),
             },
+            Op::GetContextBudget {
+                tx: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            },
             Op::GetProviderRuntimeStatus {
                 tx: std::sync::Arc::new(std::sync::Mutex::new(None)),
             },
@@ -1572,6 +1564,9 @@ mod tests {
                 new_message: "again".into(),
             },
             Op::SetAdvisorEnabled { enabled: true },
+            Op::GetSubAgentSettlement {
+                tx: std::sync::Arc::clone(&settlement_reply),
+            },
             Op::Shutdown,
         ];
 
@@ -1596,6 +1591,19 @@ mod tests {
             serde_json::to_value(ops[8].to_protocol()).unwrap(),
             json!({"kind": "get_session_snapshot"}),
             "reply channels must not leak onto the wire"
+        );
+        let settlement = ops
+            .iter()
+            .find(|op| matches!(op, Op::GetSubAgentSettlement { .. }))
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(settlement.to_protocol()).unwrap(),
+            json!({"kind": "get_sub_agent_settlement"}),
+            "the settlement operation must retain its own channel-free protocol twin"
+        );
+        assert!(
+            settlement_reply.lock().unwrap().is_some(),
+            "projection must not consume the host's live response sender"
         );
     }
 

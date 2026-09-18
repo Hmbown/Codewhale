@@ -8,8 +8,10 @@
 #![allow(dead_code)]
 
 use std::collections::BTreeMap;
+use std::collections::HashMap;
 #[cfg(test)]
 use std::fs::OpenOptions;
+use std::sync::{Mutex, OnceLock};
 
 use super::files::{WorkspaceFile, same_file};
 use std::io::{BufRead, Read, Seek, SeekFrom, Write};
@@ -19,10 +21,68 @@ use anyhow::{Context, Result, bail};
 use codewhale_protocol::fleet::*;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use tokio::sync::Notify;
 
 const FLEET_DIR: &str = ".codewhale";
 const FLEET_LEDGER_FILE: &str = "fleet.jsonl";
 const FLEET_LEDGER_LOCK_FILE: &str = "fleet.lock";
+
+/// Path of the ledger file under `workspace`, mirroring [`FleetLedger::open`].
+pub(crate) fn fleet_ledger_path(workspace: &Path) -> PathBuf {
+    workspace.join(FLEET_DIR).join(FLEET_LEDGER_FILE)
+}
+
+/// Process-wide append wakes, one [`Notify`] per ledger file (#6211 R7b).
+/// Ledger managers open per operation, so instances cannot share a channel
+/// handle; the registry joins differently-spelled opens of one file by
+/// canonicalized path. A wake means "re-poll with your cursor" — the cursor
+/// stays the source of truth, so a missed or spurious wake only costs one
+/// extra poll, never lost or duplicated events.
+static FLEET_LEDGER_WAKES: OnceLock<Mutex<HashMap<PathBuf, std::sync::Arc<Notify>>>> =
+    OnceLock::new();
+
+fn fleet_ledger_wake_key(ledger_path: &Path) -> PathBuf {
+    if let Ok(canonical) = ledger_path.canonicalize() {
+        return canonical;
+    }
+    // The ledger file may not exist yet at subscribe time; canonicalize the
+    // parent so both spellings still meet. A fully missing tree falls back
+    // to the raw path on both sides.
+    match ledger_path
+        .parent()
+        .and_then(|parent| parent.canonicalize().ok())
+        .zip(ledger_path.file_name())
+    {
+        Some((parent, name)) => parent.join(name),
+        None => ledger_path.to_path_buf(),
+    }
+}
+
+/// Subscribe to append wakes for the ledger at `ledger_path`. Callers must
+/// still poll on a fallback interval: the registry only sees in-process
+/// appends, and a wake can race the subscriber's last read.
+pub(crate) fn subscribe_fleet_ledger_appends(ledger_path: &Path) -> std::sync::Arc<Notify> {
+    let key = fleet_ledger_wake_key(ledger_path);
+    let mut wakes = FLEET_LEDGER_WAKES
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .expect("fleet ledger wake registry poisoned");
+    wakes
+        .entry(key)
+        .or_insert_with(|| std::sync::Arc::new(Notify::new()))
+        .clone()
+}
+
+fn notify_fleet_ledger_append(ledger_path: &Path) {
+    let key = fleet_ledger_wake_key(ledger_path);
+    let notify = FLEET_LEDGER_WAKES
+        .get()
+        .and_then(|wakes| wakes.lock().ok())
+        .and_then(|wakes| wakes.get(&key).cloned());
+    if let Some(notify) = notify {
+        notify.notify_waiters();
+    }
+}
 
 fn inline_secret_assignment_pattern() -> &'static regex::Regex {
     static PATTERN: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
@@ -420,6 +480,10 @@ impl FleetLedger {
             .with_context(|| format!("flushing fleet ledger {}", self.ledger_path.display()))?;
         file.sync_data()
             .with_context(|| format!("syncing fleet ledger {}", self.ledger_path.display()))?;
+        // Wake SSE subscribers after the bytes are durable (#6211 R7b). Every
+        // record kind funnels through here, so a wake only promises "something
+        // changed" — subscribers re-poll with their cursor.
+        notify_fleet_ledger_append(&self.ledger_path);
         Ok(())
     }
 
@@ -2532,6 +2596,37 @@ mod tests {
     use std::thread;
     use std::time::Duration;
     use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn ledger_append_wakes_subscribers() {
+        let workspace = TempDir::new().unwrap();
+        let ledger = FleetLedger::open(workspace.path()).unwrap();
+        let appends = subscribe_fleet_ledger_appends(&fleet_ledger_path(workspace.path()));
+        let notified = appends.notified();
+        tokio::pin!(notified);
+        let appended = tokio::task::spawn_blocking(move || {
+            ledger.create_run(&sample_run("run-1")).unwrap();
+        });
+        tokio::time::timeout(Duration::from_secs(5), &mut notified)
+            .await
+            .expect("append should wake subscribers");
+        appended.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ledger_wake_is_scoped_to_its_file() {
+        let first = TempDir::new().unwrap();
+        let second = TempDir::new().unwrap();
+        let ledger = FleetLedger::open(first.path()).unwrap();
+        let appends = subscribe_fleet_ledger_appends(&fleet_ledger_path(second.path()));
+        ledger.create_run(&sample_run("run-1")).unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), appends.notified())
+                .await
+                .is_err(),
+            "an append must not wake another ledger's subscribers"
+        );
+    }
 
     #[test]
     fn ledger_rejects_replaced_lock_identity() {

@@ -482,12 +482,22 @@ impl FilePickerView {
         }
     }
 
-    fn move_selection(&mut self, delta: isize) {
+    /// Apply one [`list_nav`](crate::tui::list_nav) motion (#6290), returning
+    /// whether it was consumed. This is a typing surface, so only the
+    /// typing-safe vocabulary applies — no letter alias may eat a query
+    /// character. `Prev`/`Next` wrap; paging and Home/End clamp.
+    fn apply_motion(&mut self, motion: crate::tui::list_nav::Motion) -> bool {
         if self.filtered.is_empty() {
-            return;
+            return false;
         }
-        self.selected = crate::tui::list_nav::wrap_index(self.selected, self.filtered.len(), delta);
+        let Some(next) =
+            crate::tui::list_nav::apply(self.selected, self.filtered.len(), VISIBLE_ROWS, motion)
+        else {
+            return false;
+        };
+        self.selected = next;
         self.adjust_scroll();
+        true
     }
 
     fn selected_path(&self) -> Option<&str> {
@@ -527,6 +537,13 @@ impl ModalView for FilePickerView {
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> ViewAction {
+        // Movement keys come from the shared vocabulary (#6290), typing-safe
+        // set only. This match owns the filter's own keys.
+        if let Some(motion) = crate::tui::list_nav::motion_while_typing(&key)
+            && self.apply_motion(motion)
+        {
+            return ViewAction::None;
+        }
         match key.code {
             KeyCode::Esc => ViewAction::Close,
             KeyCode::Enter => {
@@ -535,22 +552,6 @@ impl ModalView for FilePickerView {
                     return ViewAction::EmitAndClose(ViewEvent::FilePickerSelected { path });
                 }
                 ViewAction::Close
-            }
-            KeyCode::Up => {
-                self.move_selection(-1);
-                ViewAction::None
-            }
-            KeyCode::Down => {
-                self.move_selection(1);
-                ViewAction::None
-            }
-            KeyCode::PageUp => {
-                self.move_selection(-(VISIBLE_ROWS as isize));
-                ViewAction::None
-            }
-            KeyCode::PageDown => {
-                self.move_selection(VISIBLE_ROWS as isize);
-                ViewAction::None
             }
             KeyCode::Backspace => {
                 self.query.pop();
@@ -584,11 +585,11 @@ impl ModalView for FilePickerView {
     fn handle_mouse(&mut self, mouse: MouseEvent) -> ViewAction {
         match mouse.kind {
             MouseEventKind::ScrollUp => {
-                self.move_selection(-1);
+                self.apply_motion(crate::tui::list_nav::Motion::Prev);
                 ViewAction::None
             }
             MouseEventKind::ScrollDown => {
-                self.move_selection(1);
+                self.apply_motion(crate::tui::list_nav::Motion::Next);
                 ViewAction::None
             }
             MouseEventKind::Down(MouseButton::Left) => {

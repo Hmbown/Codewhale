@@ -8,6 +8,11 @@
 
 use std::path::PathBuf;
 
+/// Rows a PageUp/PageDown travels. Both lists here are modal and short, so a
+/// page is a readable jump rather than a screenful measured at paint time.
+const DETAIL_PAGE: usize = 10;
+const ROUTE_PICK_PAGE: usize = 10;
+
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
     buffer::Buffer,
@@ -27,6 +32,7 @@ use crate::tui::app::App;
 use crate::tui::views::{
     ActionHint, ModalKind, ModalView, ViewAction, ViewEvent, render_modal_footer,
 };
+use codewhale_localization::{Locale, MessageId, tr};
 use codewhale_palette as palette;
 
 /// The built-in role vocabulary offered when adding a member, in a useful
@@ -39,7 +45,11 @@ const KNOWN_ROLES: [&str; 8] = [
     "test",
     "manager",
     "advisor",
-    "summarizer",
+    // "synthesizer", not "summarizer": the setup wizard's ROLES table owns
+    // this token's spelling (profile role_hint + file stem contract), and
+    // the whale table + docs agree. Both resolve to Planner posture, but
+    // the picker must offer the same word setup does (#6087 item 3).
+    "synthesizer",
     "general",
 ];
 
@@ -49,10 +59,21 @@ enum DetailStep {
     PickRoute,
 }
 
+/// The Fleet editor row a route applies to: the Coordinator (row 0) or one
+/// member by roster index. Shared with the `/model` picker, which hands a pick
+/// back to the editor addressed by this.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PickTarget {
+pub enum FleetRouteTarget {
     Operator,
     Member(usize),
+}
+
+/// The selected row's saved route, independent of the session's picker memory.
+pub struct FleetRouteSelection {
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub reasoning: Option<crate::reasoning_preference::ReasoningEffort>,
+    pub allow_inherit: bool,
 }
 
 /// One selectable route row in the picker step: inherit or a concrete
@@ -67,13 +88,16 @@ struct RouteRow {
 
 pub struct FleetDetailView {
     fleet: FleetFile,
+    editor_id: uuid::Uuid,
+    saved_source: Option<String>,
+    locale: Locale,
     scope: FleetScope,
     source: PathBuf,
     workspace: PathBuf,
     /// 0 = operator row; 1.. = members.
     selected: usize,
     step: DetailStep,
-    pick_target: PickTarget,
+    pick_target: FleetRouteTarget,
     routes: Vec<RouteRow>,
     /// Highlight position *within the filtered list*, not into `routes`.
     pick_row: usize,
@@ -127,6 +151,7 @@ impl FleetDetailView {
         };
         let mut view = Self::from_parts(
             fleet,
+            app.ui_locale,
             scope,
             source,
             app.workspace.clone(),
@@ -148,6 +173,7 @@ impl FleetDetailView {
 
     fn from_parts(
         fleet: FleetFile,
+        locale: Locale,
         scope: FleetScope,
         source: PathBuf,
         workspace: PathBuf,
@@ -156,14 +182,20 @@ impl FleetDetailView {
         session_model: &str,
     ) -> Self {
         let routes = build_route_rows(config);
+        let saved_source = std::fs::read_to_string(&source)
+            .ok()
+            .filter(|text| FleetFile::parse(text).ok().as_ref() == Some(&fleet));
         let mut view = Self {
             fleet,
+            editor_id: uuid::Uuid::new_v4(),
+            saved_source,
+            locale,
             scope,
             source,
             workspace,
             selected: 0,
             step: DetailStep::Overview,
-            pick_target: PickTarget::Operator,
+            pick_target: FleetRouteTarget::Operator,
             routes,
             pick_row: 0,
             pick_query: String::new(),
@@ -202,10 +234,6 @@ impl FleetDetailView {
     fn selected_member(&self) -> Option<&FleetMember> {
         self.selected_member_idx()
             .and_then(|idx| self.fleet.members.get(idx))
-    }
-
-    fn move_row(&mut self, delta: isize) {
-        self.selected = crate::tui::list_nav::wrap_index(self.selected, self.row_count(), delta);
     }
 
     fn start_rename(&mut self) {
@@ -248,7 +276,7 @@ impl FleetDetailView {
 
     /// Rows passing the typed filter, as indices into `routes`.
     fn filtered_routes(&self) -> Vec<usize> {
-        let shortlist = matches!(self.pick_target, PickTarget::Member(idx)
+        let shortlist = matches!(self.pick_target, FleetRouteTarget::Member(idx)
             if self.fleet.members.get(idx).is_some_and(|member| member.shortlist));
         (0..self.routes.len())
             .filter(|idx| {
@@ -276,19 +304,19 @@ impl FleetDetailView {
     }
 
     /// Enter the route-picker step for the target.
-    fn open_route_picker(&mut self, target: PickTarget) {
+    fn open_route_picker(&mut self, target: FleetRouteTarget) {
         self.step = DetailStep::PickRoute;
         self.pick_target = target;
         // Preselect the row matching the current pin (or the inherit row).
         self.pick_row = 0;
         self.pick_query.clear();
         let current: Option<(&str, &str)> = match target {
-            PickTarget::Operator => self
+            FleetRouteTarget::Operator => self
                 .fleet
                 .operator
                 .as_ref()
                 .map(|op| (op.provider.as_str(), op.model.as_str())),
-            PickTarget::Member(idx) => self
+            FleetRouteTarget::Member(idx) => self
                 .fleet
                 .members
                 .get(idx)
@@ -309,12 +337,29 @@ impl FleetDetailView {
 
     fn apply_route_pick(&mut self) -> Option<ViewAction> {
         let route = self.routes.get(self.picked_route_index()?)?;
-        match self.pick_target {
-            PickTarget::Operator => {
-                self.fleet.operator = match (&route.provider, &route.model) {
+        let (provider, model) = (route.provider.clone(), route.model.clone());
+        self.set_route(self.pick_target, provider, model);
+        self.step = DetailStep::Overview;
+        self.rename_mode = false;
+        self.route_edit_needs_refresh();
+        Some(ViewAction::None)
+    }
+
+    /// Pin `target` to `provider`/`model`, or clear its pin when either is
+    /// absent so the row inherits the session route again. The Coordinator
+    /// keeps its reasoning tier across a route change.
+    fn set_route(
+        &mut self,
+        target: FleetRouteTarget,
+        provider: Option<String>,
+        model: Option<String>,
+    ) {
+        match target {
+            FleetRouteTarget::Operator => {
+                self.fleet.operator = match (provider, model) {
                     (Some(provider), Some(model)) => Some(FleetOperator {
-                        provider: provider.clone(),
-                        model: model.clone(),
+                        provider,
+                        model,
                         reasoning: self
                             .fleet
                             .operator
@@ -324,12 +369,12 @@ impl FleetDetailView {
                     _ => None,
                 };
             }
-            PickTarget::Member(idx) => {
+            FleetRouteTarget::Member(idx) => {
                 if let Some(member) = self.fleet.members.get_mut(idx) {
-                    match (&route.provider, &route.model) {
+                    match (provider, model) {
                         (Some(provider), Some(model)) => {
-                            member.provider = Some(provider.clone());
-                            member.model = Some(model.clone());
+                            member.provider = Some(provider);
+                            member.model = Some(model);
                         }
                         _ => {
                             member.provider = None;
@@ -339,10 +384,126 @@ impl FleetDetailView {
                 }
             }
         }
-        self.step = DetailStep::Overview;
-        self.rename_mode = false;
+    }
+
+    /// The row Enter acts on: the Coordinator on row 0, else that member.
+    fn selected_route_target(&self) -> FleetRouteTarget {
+        match self.selected_member_idx() {
+            Some(idx) => FleetRouteTarget::Member(idx),
+            None => FleetRouteTarget::Operator,
+        }
+    }
+
+    pub(crate) fn route_selection(
+        &self,
+        editor_id: uuid::Uuid,
+        target: FleetRouteTarget,
+    ) -> Option<FleetRouteSelection> {
+        if editor_id != self.editor_id {
+            return None;
+        }
+        let (provider, model, reasoning, allow_inherit) = match target {
+            FleetRouteTarget::Operator => (
+                self.fleet.operator.as_ref().map(|op| op.provider.clone()),
+                self.fleet.operator.as_ref().map(|op| op.model.clone()),
+                self.fleet
+                    .operator
+                    .as_ref()
+                    .and_then(|op| op.reasoning.as_deref()),
+                true,
+            ),
+            FleetRouteTarget::Member(idx) => {
+                let member = self.fleet.members.get(idx)?;
+                (
+                    member.provider.clone(),
+                    member.model.clone(),
+                    member.reasoning.as_deref(),
+                    !member.shortlist,
+                )
+            }
+        };
+        Some(FleetRouteSelection {
+            provider,
+            model,
+            reasoning: reasoning.and_then(|value| {
+                crate::reasoning_preference::ReasoningEffort::parse_strict(value).ok()
+            }),
+            allow_inherit,
+        })
+    }
+
+    /// Apply a route the standard `/model` picker resolved for `target` and
+    /// write the Fleet file at once, so an Enter-pick is one gesture: pick,
+    /// saved. `None`/`None` clears the pin. Returns the receipt to show, or
+    /// the reason nothing was written.
+    pub(crate) fn apply_picked_route(
+        &mut self,
+        editor_id: uuid::Uuid,
+        target: FleetRouteTarget,
+        provider: Option<String>,
+        model: Option<String>,
+        reasoning: Option<crate::reasoning_preference::ReasoningEffort>,
+    ) -> Result<String, String> {
+        // A picker belongs to one editor instance and the exact saved file
+        // it opened. Never recreate a removed file or overwrite newer edits.
+        if editor_id != self.editor_id
+            || self.saved_source.is_none()
+            || std::fs::read_to_string(&self.source).ok() != self.saved_source
+        {
+            return Err(tr(self.locale, MessageId::FleetRoutePickUnavailable).into_owned());
+        }
+        if let FleetRouteTarget::Member(idx) = target
+            && idx >= self.fleet.members.len()
+        {
+            return Err(tr(self.locale, MessageId::FleetRoutePickUnavailable).into_owned());
+        }
+        let previous = self.fleet.clone();
+        self.set_route(target, provider, model);
+        let reasoning = reasoning.map(|effort| effort.as_setting().to_string());
+        match target {
+            FleetRouteTarget::Operator => {
+                if let Some(operator) = self.fleet.operator.as_mut() {
+                    operator.reasoning = reasoning;
+                }
+            }
+            FleetRouteTarget::Member(idx) => self.fleet.members[idx].reasoning = reasoning,
+        }
         self.route_edit_needs_refresh();
-        Some(ViewAction::None)
+        let route = match target {
+            FleetRouteTarget::Operator => self
+                .fleet
+                .operator
+                .as_ref()
+                .map(|op| format!("{}/{}", op.provider, op.model)),
+            FleetRouteTarget::Member(idx) => {
+                let member = &self.fleet.members[idx];
+                member
+                    .provider
+                    .as_deref()
+                    .zip(member.model.as_deref())
+                    .map(|(provider, model)| format!("{provider}/{model}"))
+            }
+        };
+        match save_fleet(&self.fleet, self.scope, &self.workspace) {
+            Ok(path) => {
+                self.saved_source = self.fleet.render_toml().ok();
+                Ok(tr(self.locale, MessageId::FleetRouteSaved)
+                    .replace("{fleet}", &self.fleet.name)
+                    .replace(
+                        "{route}",
+                        &route.unwrap_or_else(|| {
+                            tr(self.locale, MessageId::FleetRouteInherited).into_owned()
+                        }),
+                    )
+                    .replace("{path}", &path.display().to_string()))
+            }
+            Err(err) => {
+                self.fleet = previous;
+                self.route_edit_needs_refresh();
+                Err(tr(self.locale, MessageId::FleetToggleFailed)
+                    .replace("{error}", &err.to_string()))
+            }
+        }
     }
 
     /// Cycle the reasoning level of the selected row through the supported
@@ -394,7 +555,9 @@ impl FleetDetailView {
     /// The scout receipt depends on the member pin and the session route;
     /// reasoning edits don't affect it. Pins refresh it at the next open;
     /// the marker exists so route-edit call sites document that intent.
-    fn route_edit_needs_refresh(&mut self) {}
+    fn route_edit_needs_refresh(&mut self) {
+        self.refresh_scout_receipt();
+    }
 
     fn toggle_vision_requirement(&mut self) {
         if let Some(member) = self.selected_member_idx()
@@ -521,6 +684,7 @@ impl FleetDetailView {
                     .is_some_and(|member| member.shortlist);
                 let mut hints = vec![
                     ActionHint::new("↑/↓", "move"),
+                    ActionHint::new("Enter", tr(self.locale, MessageId::PickerActionModels)),
                     ActionHint::new("o", "Coordinator model"),
                     ActionHint::new("e", "member model"),
                     ActionHint::new("r", "rename"),
@@ -567,18 +731,22 @@ impl ModalView for FleetDetailView {
                     self.step = DetailStep::Overview;
                     ViewAction::None
                 }
-                KeyCode::Up => {
-                    let len = self.filtered_routes().len();
-                    if len > 0 {
-                        self.pick_row = crate::tui::list_nav::wrap_index(self.pick_row, len, -1);
-                    }
-                    ViewAction::None
-                }
-                KeyCode::Down => {
-                    let len = self.filtered_routes().len();
-                    if len > 0 {
-                        self.pick_row = crate::tui::list_nav::wrap_index(self.pick_row, len, 1);
-                    }
+                // Typing-safe set only: this step feeds `Char(c)` into
+                // `pick_query`, so a letter alias would eat the query (#6290).
+                _ if crate::tui::list_nav::motion_while_typing(&key)
+                    .and_then(|m| {
+                        crate::tui::list_nav::apply(
+                            self.pick_row,
+                            self.filtered_routes().len(),
+                            ROUTE_PICK_PAGE,
+                            m,
+                        )
+                    })
+                    .is_some_and(|row| {
+                        self.pick_row = row;
+                        true
+                    }) =>
+                {
                     ViewAction::None
                 }
                 KeyCode::Enter => self.apply_route_pick().unwrap_or(ViewAction::None),
@@ -630,21 +798,37 @@ impl ModalView for FleetDetailView {
                 }
                 match key.code {
                     KeyCode::Esc | KeyCode::Char('q') => ViewAction::Close,
-                    KeyCode::Up | KeyCode::Char('k') => {
-                        self.move_row(-1);
+                    _ if crate::tui::list_nav::motion(&key)
+                        .and_then(|m| {
+                            crate::tui::list_nav::apply(
+                                self.selected,
+                                self.row_count(),
+                                DETAIL_PAGE,
+                                m,
+                            )
+                        })
+                        .is_some_and(|row| {
+                            self.selected = row;
+                            true
+                        }) =>
+                    {
                         ViewAction::None
                     }
-                    KeyCode::Down | KeyCode::Char('j') => {
-                        self.move_row(1);
-                        ViewAction::None
-                    }
+                    // Enter opens the standard `/model` picker for the row —
+                    // catalog, search, readiness and all — and the pick comes
+                    // back through `FleetRoutePicked` already saved. `o`/`e`
+                    // keep the inline route list for hands that know it.
+                    KeyCode::Enter => ViewAction::Emit(ViewEvent::FleetDetailRoutePickRequested {
+                        target: self.selected_route_target(),
+                        editor_id: self.editor_id,
+                    }),
                     KeyCode::Char('o') => {
-                        self.open_route_picker(PickTarget::Operator);
+                        self.open_route_picker(FleetRouteTarget::Operator);
                         ViewAction::None
                     }
                     KeyCode::Char('e') => {
                         if let Some(idx) = self.selected_member_idx() {
-                            self.open_route_picker(PickTarget::Member(idx));
+                            self.open_route_picker(FleetRouteTarget::Member(idx));
                         }
                         ViewAction::None
                     }
@@ -739,6 +923,22 @@ impl ModalView for FleetDetailView {
 }
 
 impl FleetDetailView {
+    /// A saved route pin is drifted when the `(provider, model)` pair is not
+    /// among the routes the picker can currently offer — the provider table
+    /// was removed, or the model dropped out of the provider's roster. The
+    /// pin may still serve upstream, so this only flags; it never rewrites.
+    fn pin_drifted(&self, provider: &str, model: &str) -> bool {
+        !self.routes.iter().any(|row| {
+            row.provider
+                .as_deref()
+                .is_some_and(|p| p.eq_ignore_ascii_case(provider))
+                && row
+                    .model
+                    .as_deref()
+                    .is_some_and(|m| m.eq_ignore_ascii_case(model))
+        })
+    }
+
     fn render_overview(&self, area: Rect, buf: &mut Buffer) {
         if area.width == 0 || area.height == 0 {
             return;
@@ -765,7 +965,12 @@ impl FleetDetailView {
                 .as_ref()
                 .and_then(|op| op.reasoning.as_deref())
                 .unwrap_or("inherit");
-            lines.push(Line::from(vec![
+            let drifted = self
+                .fleet
+                .operator
+                .as_ref()
+                .is_some_and(|op| self.pin_drifted(&op.provider, &op.model));
+            let mut spans = vec![
                 Span::styled(if selected { "» " } else { "  " }, base),
                 Span::styled("operator", base),
                 Span::styled("  ", Style::default()),
@@ -774,7 +979,14 @@ impl FleetDetailView {
                     format!(" · reasoning: {reasoning}"),
                     Style::default().fg(palette::TEXT_DIM),
                 ),
-            ]));
+            ];
+            if drifted {
+                spans.push(Span::styled(
+                    tr(self.locale, MessageId::FleetRouteNotInCatalog),
+                    Style::default().fg(palette::STATUS_WARNING),
+                ));
+            }
+            lines.push(Line::from(spans));
         }
 
         for (idx, member) in self.fleet.members.iter().enumerate() {
@@ -818,7 +1030,11 @@ impl FleetDetailView {
                         || member.id.clone(),
                         |name| format!("{name} ({})", member.id),
                     );
-                lines.push(Line::from(vec![
+                let drifted = matches!(
+                    (&member.provider, &member.model),
+                    (Some(provider), Some(model)) if self.pin_drifted(provider, model)
+                );
+                let mut spans = vec![
                     Span::styled(if selected { "» " } else { "  " }, base),
                     Span::styled(member_label, base),
                     Span::styled(role, Style::default().fg(palette::TEXT_SECONDARY)),
@@ -832,7 +1048,14 @@ impl FleetDetailView {
                         },
                         Style::default().fg(palette::TEXT_DIM),
                     ),
-                ]));
+                ];
+                if drifted {
+                    spans.push(Span::styled(
+                        tr(self.locale, MessageId::FleetRouteNotInCatalog),
+                        Style::default().fg(palette::STATUS_WARNING),
+                    ));
+                }
+                lines.push(Line::from(spans));
             }
         }
         Paragraph::new(ratatui::text::Text::from(lines)).render(area, buf);
@@ -846,8 +1069,8 @@ impl FleetDetailView {
         let rows_visible = usize::from(area.height).max(1);
         let pick_scroll = self.pick_row.saturating_sub(rows_visible.saturating_sub(1));
         let target_label = match self.pick_target {
-            PickTarget::Operator => "operator",
-            PickTarget::Member(idx) => self
+            FleetRouteTarget::Operator => "operator",
+            FleetRouteTarget::Member(idx) => self
                 .fleet
                 .members
                 .get(idx)
@@ -1048,6 +1271,174 @@ mod tests {
             FleetDetailView::open(&app, &Config::default(), "Nope", FleetScope::Workspace)
                 .is_none()
         );
+    }
+
+    /// Enter on a row asks the host for the standard `/model` picker, and the
+    /// route it hands back is applied and written in one step.
+    #[test]
+    fn enter_asks_for_the_model_picker_and_a_pick_saves_the_row() {
+        let ws = tempfile::TempDir::new().unwrap();
+        let fleet = sample_fleet("Team");
+        save_fleet(&fleet, FleetScope::Workspace, ws.path()).unwrap();
+        let mut view = FleetDetailView::open(
+            &app_in(ws.path().to_path_buf()),
+            &Config::default(),
+            "Team",
+            FleetScope::Workspace,
+        )
+        .expect("open");
+
+        // Row 0 is the Coordinator; the first member sits under it.
+        assert!(matches!(
+            view.handle_key(key(KeyCode::Enter)),
+            ViewAction::Emit(ViewEvent::FleetDetailRoutePickRequested {
+                target: FleetRouteTarget::Operator, editor_id
+            }) if editor_id == view.editor_id
+        ));
+        view.handle_key(key(KeyCode::Down));
+        assert!(matches!(
+            view.handle_key(key(KeyCode::Enter)),
+            ViewAction::Emit(ViewEvent::FleetDetailRoutePickRequested {
+                target: FleetRouteTarget::Member(0), editor_id
+            }) if editor_id == view.editor_id
+        ));
+
+        let receipt = view
+            .apply_picked_route(
+                view.editor_id,
+                FleetRouteTarget::Member(0),
+                Some("openai".to_string()),
+                Some("gpt-5.6".to_string()),
+                Some(crate::reasoning_preference::ReasoningEffort::High),
+            )
+            .expect("saved");
+        assert!(receipt.contains("openai/gpt-5.6"), "{receipt}");
+        let (saved, _) = load_fleet_in_scope("Team", FleetScope::Workspace, ws.path()).unwrap();
+        assert_eq!(saved.members[0].provider.as_deref(), Some("openai"));
+        assert_eq!(saved.members[0].model.as_deref(), Some("gpt-5.6"));
+        assert_eq!(saved.members[0].reasoning.as_deref(), Some("high"));
+        assert!(
+            view.scout_receipt
+                .as_deref()
+                .unwrap()
+                .contains("openai/gpt-5.6")
+        );
+
+        // Clearing the pin returns the member to the session route.
+        view.apply_picked_route(
+            view.editor_id,
+            FleetRouteTarget::Member(0),
+            None,
+            None,
+            None,
+        )
+        .expect("saved");
+        let (saved, _) = load_fleet_in_scope("Team", FleetScope::Workspace, ws.path()).unwrap();
+        assert_eq!(saved.members[0].provider, None);
+        assert_eq!(saved.members[0].model, None);
+
+        // A row that no longer exists writes nothing.
+        assert!(
+            view.apply_picked_route(
+                view.editor_id,
+                FleetRouteTarget::Member(99),
+                Some("openai".to_string()),
+                Some("gpt-5.6".to_string()),
+                None,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn route_pick_refuses_changed_missing_or_different_editor_without_overwriting() {
+        for change in ["replace", "reorder", "edit", "remove", "different-editor"] {
+            let ws = tempfile::TempDir::new().unwrap();
+            let mut fleet = sample_fleet("Team");
+            let mut second = fleet.members[0].clone();
+            second.id = "reviewer".into();
+            second.role = "reviewer".into();
+            fleet.members.push(second);
+            let path = save_fleet(&fleet, FleetScope::Workspace, ws.path()).unwrap();
+            let mut view = FleetDetailView::open(
+                &app_in(ws.path().to_path_buf()),
+                &Config::default(),
+                "Team",
+                FleetScope::Workspace,
+            )
+            .unwrap();
+            match change {
+                "replace" => {
+                    fleet.members[0].id = "replacement".into();
+                    save_fleet(&fleet, FleetScope::Workspace, ws.path()).unwrap();
+                }
+                "reorder" => {
+                    fleet.members.swap(0, 1);
+                    save_fleet(&fleet, FleetScope::Workspace, ws.path()).unwrap();
+                }
+                "edit" => {
+                    let bytes = std::fs::read_to_string(&path).unwrap();
+                    std::fs::write(&path, format!("{bytes}\n# new user note\n")).unwrap();
+                }
+                "remove" => std::fs::remove_file(&path).unwrap(),
+                _ => {}
+            }
+            let before = std::fs::read(&path).ok();
+            let draft = view.fleet.clone();
+            let editor_id = if change == "different-editor" {
+                uuid::Uuid::new_v4()
+            } else {
+                view.editor_id
+            };
+            assert!(
+                view.apply_picked_route(
+                    editor_id,
+                    FleetRouteTarget::Member(0),
+                    Some("openai".into()),
+                    Some("gpt-5.6".into()),
+                    None,
+                )
+                .is_err(),
+                "{change}"
+            );
+            assert_eq!(std::fs::read(&path).ok(), before, "{change}");
+            assert_eq!(view.fleet, draft, "{change}");
+        }
+    }
+
+    #[test]
+    fn failed_route_pick_preserves_the_editor_and_saved_team() {
+        let ws = tempfile::TempDir::new().unwrap();
+        let mut fleet = sample_fleet("Shortlist");
+        let member = &mut fleet.members[0];
+        member.shortlist = true;
+        member.role.clear();
+        member.provider = Some("openai".to_string());
+        member.model = Some("gpt-5.6".to_string());
+        let path = save_fleet(&fleet, FleetScope::Workspace, ws.path()).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let mut view = FleetDetailView::open(
+            &app_in(ws.path().to_path_buf()),
+            &Config::default(),
+            "Shortlist",
+            FleetScope::Workspace,
+        )
+        .unwrap();
+        // A shortlisted row must have an explicit route. Failed validation
+        // must not leave the editor displaying a change that never saved.
+        assert!(
+            view.apply_picked_route(
+                view.editor_id,
+                FleetRouteTarget::Member(0),
+                None,
+                None,
+                None
+            )
+            .is_err()
+        );
+        assert_eq!(view.fleet.members[0].provider.as_deref(), Some("openai"));
+        assert_eq!(view.fleet.members[0].model.as_deref(), Some("gpt-5.6"));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
     }
 
     #[test]
@@ -1325,6 +1716,60 @@ mod tests {
     }
 
     #[test]
+    fn overview_flags_a_saved_route_the_picker_can_no_longer_offer() {
+        let ws = tempfile::TempDir::new().unwrap();
+        let mut fleet = sample_fleet("Drifted");
+        fleet.members[0].provider = Some("gone-provider".to_string());
+        fleet.members[0].model = Some("gone-model".to_string());
+        fleet.members.push(FleetMember {
+            id: "kept".to_string(),
+            display_name: None,
+            shortlist: false,
+            role: "reviewer".to_string(),
+            provider: Some("deepseek".to_string()),
+            model: Some("deepseek-v4-pro".to_string()),
+            reasoning: None,
+            instructions: None,
+            requires: Vec::new(),
+        });
+        save_fleet(&fleet, FleetScope::Workspace, ws.path()).unwrap();
+
+        let view = FleetDetailView::open(
+            &app_in(ws.path().to_path_buf()),
+            &Config::default(),
+            "Drifted",
+            FleetScope::Workspace,
+        )
+        .expect("open");
+
+        assert!(view.pin_drifted("gone-provider", "gone-model"));
+        assert!(!view.pin_drifted("deepseek", "deepseek-v4-pro"));
+
+        let area = Rect::new(0, 0, 160, 8);
+        let mut buf = Buffer::empty(area);
+        view.render_overview(area, &mut buf);
+        let rows: Vec<String> = (0..area.height)
+            .map(|y| (0..area.width).map(|x| buf[(x, y)].symbol()).collect())
+            .collect();
+        let drifted_row = rows
+            .iter()
+            .find(|row| row.contains("gone-model"))
+            .expect("drifted member row rendered");
+        assert!(
+            drifted_row.contains("not in current catalog"),
+            "{drifted_row}"
+        );
+        let offered_row = rows
+            .iter()
+            .find(|row| row.contains("deepseek-v4-pro"))
+            .expect("offerable member row rendered");
+        assert!(
+            !offered_row.contains("not in current catalog"),
+            "{offered_row}"
+        );
+    }
+
+    #[test]
     fn save_writes_the_file_and_receipt_names_the_path() {
         let ws = tempfile::TempDir::new().unwrap();
         let fleet = sample_fleet("Fleet C");
@@ -1365,6 +1810,17 @@ mod tests {
         let op = loaded.operator.expect("operator");
         assert_eq!(op.model, "deepseek-v4-pro");
         assert_eq!(op.reasoning.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn roster_picker_spells_roles_like_setup() {
+        // The setup wizard's ROLES table owns the "synthesizer" spelling
+        // (profile role_hint + file stem contract); the roster add-member
+        // picker must offer the same word, not the "summarizer" near-twin
+        // (#6087 item 3). Both resolve to Planner posture, so this pins
+        // the presented vocabulary, not behavior.
+        assert!(KNOWN_ROLES.contains(&"synthesizer"));
+        assert!(!KNOWN_ROLES.contains(&"summarizer"));
     }
 
     #[test]

@@ -745,7 +745,7 @@ fn deepseek_flash_responses_body_uses_stateless_0731_contract() {
         "{}",
         body["top_p"]
     );
-    assert_eq!(body.pointer("/reasoning/effort"), Some(&json!("max")));
+    assert_eq!(body.pointer("/reasoning/effort"), Some(&json!("high")));
     assert!(body.pointer("/reasoning/summary").is_none());
     assert!(body.get("include").is_none());
     assert!(body.get("store").is_none());
@@ -894,7 +894,7 @@ fn deepseek_responses_reasoning_effort_uses_documented_labels() {
     assert_eq!(responses_reasoning_effort("low", true), Some("low"));
     assert_eq!(responses_reasoning_effort("medium", true), Some("high"));
     assert_eq!(responses_reasoning_effort("high", true), Some("high"));
-    assert_eq!(responses_reasoning_effort("xhigh", true), Some("max"));
+    assert_eq!(responses_reasoning_effort("xhigh", true), Some("high"));
     assert_eq!(responses_reasoning_effort("max", true), Some("max"));
     // The off tier must disable thinking on the wire, not collapse into
     // low: DeepSeek documents `reasoning.effort: "none"` as the off value.

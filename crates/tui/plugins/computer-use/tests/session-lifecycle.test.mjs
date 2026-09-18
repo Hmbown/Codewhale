@@ -127,6 +127,62 @@ test("separate sessions keep their own bound apps and closed sessions cannot rev
   assert.equal((await b.remote({ tool: "type", args: { text: "still alive" } })).ok, true);
 });
 
+test("list_sessions names live sessions content-free and drops closed ones", async () => {
+  const a = appExec({}, "ls-a");
+  const b = appExec({}, "ls-b");
+  await a.remote({ tool: "probe" });
+  await b.remote({ tool: "probe" });
+  const both = await a.remote({ tool: "list_sessions" });
+  assert.equal(both.ok, true);
+  assert.equal(both.data.control, "ready");
+  assert.ok(both.data.count >= 2, `both live sessions are listed (${both.data.count})`);
+  for (const s of both.data.sessions) {
+    assert.ok(s.target === null || (typeof s.target === "object" && Number.isInteger(s.target.pid)), "targets are app identity or null, never task text");
+    assert.ok(typeof s.ageSec === "number" && typeof s.inputHeld === "boolean" && typeof s.action !== "undefined");
+  }
+  const forged = await appRequest({ tool: "list_sessions", sessionId: "ls-a", leaseToken: "forged" });
+  assert.equal(forged.ok, false);
+  assert.equal(forged.error.code, "session_owner_required", "the registry needs the live owner lease, not a session id alone");
+  assert.equal((await appSessionRequest({ tool: "close_session", sessionId: "ls-b" })).ok, true);
+  const one = await a.remote({ tool: "list_sessions" });
+  assert.equal(one.data.count, both.data.count - 1, "a closed session leaves the registry");
+});
+
+test("a capability grant narrows the daemon lease, and cleanup is never blocked", async () => {
+  const prior = process.env.CODEWHALE_CU_GRANT;
+  process.env.CODEWHALE_CU_GRANT = "probe";
+  try {
+    await openAppSession("grant-a");
+    assert.equal((await appSessionRequest({ tool: "probe", sessionId: "grant-a" })).ok, true);
+    const refused = await appSessionRequest({ tool: "get_app_state", sessionId: "grant-a", args: { app_ref: { name: "Nope" } } });
+    assert.equal(refused.ok, false);
+    assert.equal(refused.error.code, "not_granted", "the daemon refuses ungranted tools even if the server asked");
+    assert.equal((await appSessionRequest({ tool: "close_session", sessionId: "grant-a" })).ok, true, "cleanup must never be blocked by a grant");
+    process.env.CODEWHALE_CU_GRANT = "";
+    await openAppSession("grant-b");
+    assert.equal((await appSessionRequest({ tool: "get_app_state", sessionId: "grant-b", args: { app_ref: { name: "Open" } } })).ok, true, "a new session without a grant is unrestricted");
+    await appSessionRequest({ tool: "close_session", sessionId: "grant-b" });
+  } finally {
+    if (prior === undefined) delete process.env.CODEWHALE_CU_GRANT; else process.env.CODEWHALE_CU_GRANT = prior;
+  }
+});
+
+test("read-only grants survive the wire-name translation (request_access travels as probe)", async () => {
+  const prior = process.env.CODEWHALE_CU_GRANT;
+  process.env.CODEWHALE_CU_GRANT = "read-only";
+  try {
+    await openAppSession("grant-ro");
+    assert.equal((await appSessionRequest({ tool: "probe", sessionId: "grant-ro" })).ok, true, "the grant must cover the transport name the daemon actually sees");
+    assert.equal((await appSessionRequest({ tool: "get_app_state", sessionId: "grant-ro", args: { app_ref: { name: "Visible" } } })).ok, true, "observation tools stay granted");
+    const refused = await appSessionRequest({ tool: "left_click", sessionId: "grant-ro", args: { target: { type: "coordinate", x: 1, y: 1 } } });
+    assert.equal(refused.ok, false);
+    assert.equal(refused.error.code, "not_granted");
+    await appSessionRequest({ tool: "close_session", sessionId: "grant-ro" });
+  } finally {
+    if (prior === undefined) delete process.env.CODEWHALE_CU_GRANT; else process.env.CODEWHALE_CU_GRANT = prior;
+  }
+});
+
 test("disconnect cancels the child process and a queued request never posts input", async () => {
   const active = new AbortController();
   const queued = new AbortController();
@@ -164,7 +220,7 @@ test("MCP cancellation drains input, keeps the host alive, and isolates a second
 test("stop cancels active and queued actions, releases held input, and leaves probes usable", async () => {
   const host = mcp();
   await host.tool("get_app_state", { app_ref: { name: "Stopped host" } });
-  await host.tool("left_mouse_down", { target: { x: 10, y: 10 } });
+  await host.tool("left_mouse_down", { target: { type: "coordinate", space: "screen", x: 10, y: 10 } });
   const hold = host.start("hold_key", { text: "mcp-stop", duration: 10 });
   await until(() => calls().some((item) => item.method === "child_started" && item.text === "mcp-stop"));
   const queued = host.start("type", { text: "must never arrive after stop" });
@@ -212,7 +268,7 @@ test("retiring a helper-backed local alias closes only that MCP host's session",
   const owner = calls().find(item => item.method === "get_app_state" && item.appName === "Retiring alias owner").instance;
   const other = calls().find(item => item.method === "get_app_state" && item.appName === "Alias retirement survivor").instance;
   assert.notEqual(owner, other);
-  assert.equal((await retiring.tool("left_mouse_down", { target: { x: 10, y: 10 } })).ok, true);
+  assert.equal((await retiring.tool("left_mouse_down", { target: { type: "coordinate", space: "screen", x: 10, y: 10 } })).ok, true);
   assert.equal((await survivor.tool("type", { text: "blocked by retiring owner" })).error.code, "input_busy");
 
   // Registration only changes the private fixture catalog. No HDC observation
@@ -253,7 +309,7 @@ test("MCP forced exit releases idle held input without waiting for another clien
   const survivor = mcp();
   await dead.tool("get_app_state", { app_ref: { name: "Killed idle host" } });
   await survivor.tool("get_app_state", { app_ref: { name: "Surviving host" } });
-  await dead.tool("left_mouse_down", { target: { x: 10, y: 10 } });
+  await dead.tool("left_mouse_down", { target: { type: "coordinate", space: "screen", x: 10, y: 10 } });
   assert.equal((await survivor.tool("type", {text:"must wait for held pointer"})).error.code,"input_busy");
   assert.equal((await survivor.tool("request_access")).ok,true,"observation stays available while another session holds input");
   const exit = new Promise((resolve) => dead.child.once("exit", resolve));
@@ -300,7 +356,7 @@ test("an app update re-leases live sessions transparently; an absent app still f
 test("MCP EOF releases a completed mouse-down and helper shutdown aborts active children", async () => {
   const host = mcp();
   await host.tool("get_app_state", { app_ref: { name: "Disconnected host" } });
-  await host.tool("left_mouse_down", { target: { x: 10, y: 10 } });
+  await host.tool("left_mouse_down", { target: { type: "coordinate", space: "screen", x: 10, y: 10 } });
   await closeHost(host);
   assert.ok(calls().some((item) => item.method === "release_input" && item.appName === "Disconnected host" && item.pointerDown));
   const held = appSessionRequest({ tool: "hold_key", sessionId: "helper-exit", args: { text: "helper-exit" } });

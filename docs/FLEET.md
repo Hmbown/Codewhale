@@ -27,7 +27,7 @@ existing workspaces, receipts, or scripts:
 - the durable ledger `.codewhale/fleet.jsonl` and the log directories
   `.codewhale/fleet/` and `.codewhale/fleet-host/`;
 - saved rosters `fleets/<name>.toml` and their `schema = "fleet"` header;
-- the `[fleet]` and `[fleets.*]` config tables;
+- the `[fleet]` config table (inline `[fleets.*]` tables were removed in 0.9.14; named fleets live in `fleets/<name>.toml` files);
 - the `codewhale workflow run --fleet <name>` flag;
 - wire, receipt, and control-plane operation ids such as `fleet.status`.
 
@@ -123,6 +123,10 @@ requirements belong on executable role members and are refused on shortlist rows
 - `/fleet add <provider> <model> [role…]` adds a model (one member row per
   role, or one `shortlist = true` row for a role-less add). The provider must be one you configured
   and, when the catalog knows the provider, must serve that exact id.
+  A role member asked to run the fleet's own operator route inherits it
+  instead of pinning — the role follows when the operator moves; a pin on
+  any other route is the deliberate opt-out. Files that already pin the
+  operator route are read as inheritance.
   With no fleet selected, a user-global fleet named `My fleet` is created and
   selected first. `/fleet remove <provider> <model>` drops every row that pins
   the route; the operator route is changed with `/fleet save`, not removed.
@@ -192,8 +196,7 @@ every step — the choice you still have to make, or the exact resolved file
 once you have made it. Nothing is written until you activate the save control
 on the review step.
 
-The **Destination** step is a focused two-option list (arrows move, Enter or
-Space chooses; Tab never changes the destination):
+The **Destination** step is a focused two-option list:
 
 - **This project** writes `<workspace>/.codewhale/agents/<role>.toml`. It
   applies to this project only and takes precedence over a Personal profile
@@ -210,12 +213,10 @@ create a new file or **replace an existing one**, and the precedence
 consequence for the roster. The review step repeats those facts under
 "Saves to" and names the final action by its effect — **Save to this
 project**, **Save as Personal profile**, or **Replace …**. Replacing an
-existing file needs a second Enter on the save control. Tab / Shift+Tab (or
-←/→) move focus between the save control, **Change destination**, and
-**Back**; `s` is a secondary shortcut back to the Destination step. Reopening a
+existing file asks for a second confirmation on the save control. Reopening a
 saved member from `/fleet` starts from what is on disk: its member identity,
 route, and save scope. Thinking (`inherit`, `off`, `low`, `medium`, `high`,
-`max`, or `auto`) is adjusted on the review step with `t`, but remains a route
+`max`, or `auto`) is adjusted on the review step, but remains a route
 execution setting rather than part of the member's fleet identity.
 
 Profile scope controls where a role definition is reusable; it does not widen
@@ -413,8 +414,8 @@ happened.
 
 ## Manager-owned Workflow fan-in
 
-When parallel work must return one combined answer, use a manager-owned
-Workflow instead of a flat `agent` fan-out:
+When parallel work must return one combined answer, prefer a manager-owned
+Workflow over a flat `agent` fan-out. Default shape:
 
 1. **Cast one manager** (operator or workflow orchestrator).
 2. **Fan out** child tasks through `workflow` (`task()`, `parallel()`,
@@ -423,9 +424,10 @@ Workflow instead of a flat `agent` fan-out:
 4. **Aggregate and verify** load-bearing claims before treating them as facts.
 5. **Synthesize** one result the operator can depend on.
 
-Raw `agent` fan-out is appropriate only for independent, fire-and-forget work
-where no single fan-in result is required. If results must be merged, compared,
-or verified, route through `workflow` so the manager owns fan-in.
+Raw `agent` fan-out fits independent work with no combined result. When
+results must be merged, compared, or verified, route through `workflow` so
+the manager owns fan-in — that is what the shape above is for, not a ban
+on simpler patterns when nothing needs combining.
 
 ## Workflow on fleet
 

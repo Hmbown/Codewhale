@@ -23,7 +23,7 @@ use codewhale_protocol::fleet::{
 };
 use serde::{Deserialize, Serialize};
 
-use super::identity::resolve_member_in_profiles;
+use super::identity::{FleetSelectorError, resolve_member_in_profiles};
 use super::profile::{
     AgentProfile, FleetDelegationHints, FleetLoadout, FleetProfile, FleetProfilePermissions,
     FleetRole as FleetProfileRole, FleetSlot, ProfileOrigin, canonical_public_role_name,
@@ -467,10 +467,7 @@ pub fn fleet_task_to_worker_spec_with_profiles(
         writable_files: Vec::new(),
         coordination_contracts,
         expected_artifact: None,
-        token_budget: task_spec
-            .budget
-            .as_ref()
-            .and_then(|budget| budget.max_tokens),
+        deliverables: Vec::new(),
         resume_identity: Some(session_name.clone()),
         generation: 1,
         resume_from_agent_id: None,
@@ -498,7 +495,7 @@ pub fn fleet_task_to_worker_spec_with_profiles(
         tool_profile,
         runtime_profile: runtime_profile.clone(),
         max_steps,
-        spawn_depth: 0,
+        spawn_depth: runtime_profile.spawn_depth,
         max_spawn_depth: runtime_profile.max_spawn_depth,
         child_route: None,
         launch_manifest: Some(launch_manifest),
@@ -934,7 +931,7 @@ pub(crate) fn append_agent_profile_prompt(prompt: &mut String, agent_profile: &A
 pub(crate) fn resolve_pinned_role_profile(
     agent_profiles: &[AgentProfile],
     role: &str,
-) -> Result<Option<AgentProfile>> {
+) -> Result<Option<AgentProfile>, FleetSelectorError> {
     let pinned = agent_profiles
         .iter()
         .filter(|profile| {
@@ -948,11 +945,11 @@ pub(crate) fn resolve_pinned_role_profile(
         })
         .cloned()
         .collect::<Vec<_>>();
-    Ok(resolve_member_in_profiles(
+    resolve_member_in_profiles(
         &pinned,
         &format!("role:{}", canonical_public_role_name(role)),
-    )?
-    .cloned())
+    )
+    .map(|member| member.cloned())
 }
 
 /// Compare only the known route pair; never infer a provider from a wire id's
@@ -1365,7 +1362,8 @@ fn fleet_worker_runtime_profile(
     } else {
         ModelRoute::Fixed(model.to_string())
     };
-    profile.max_spawn_depth = max_spawn_depth.saturating_sub(spawn_depth);
+    profile.max_spawn_depth = max_spawn_depth;
+    profile.spawn_depth = spawn_depth;
     profile.background = true;
     profile
 }
@@ -1443,10 +1441,13 @@ pub fn apply_exec_hardening(
             spec.max_steps.min(exec.max_turns)
         };
     }
-    spec.max_spawn_depth = exec
+    spec.max_spawn_depth = spec
         .max_spawn_depth
+        .min(spec.runtime_profile.max_spawn_depth)
+        .min(exec.max_spawn_depth)
         .min(codewhale_config::MAX_SPAWN_DEPTH_CEILING);
-    spec.runtime_profile.max_spawn_depth = spec.max_spawn_depth.saturating_sub(spec.spawn_depth);
+    spec.runtime_profile.max_spawn_depth = spec.max_spawn_depth;
+    spec.runtime_profile.spawn_depth = spec.spawn_depth;
 
     // Apply tool filtering
     if !exec.allowed_tools.is_empty() || !exec.disallowed_tools.is_empty() {
@@ -2285,7 +2286,9 @@ mod tests {
         assert!(!route.provider_id.is_empty());
         assert!(!route.provider_kind.is_empty());
         assert!(!route.wire_model_id.is_empty());
-        assert_eq!(route.protocol, "chat_completions");
+        // DeepSeek Flash rides Responses since a1c1741afa (see bundled_offerings):
+        // the default route follows the shipped transport, not the old pin.
+        assert_eq!(route.protocol, "responses");
         assert_eq!(route.role.as_deref(), Some("implement"));
         assert_eq!(route.loadout.as_deref(), Some("fast"));
         assert_eq!(route.model_class, None);
@@ -4294,7 +4297,8 @@ mod tests {
             spec.runtime_profile.reasoning_effort.as_deref(),
             Some("max")
         );
-        assert_eq!(spec.runtime_profile.max_spawn_depth, 2);
+        assert_eq!(spec.runtime_profile.max_spawn_depth, 3);
+        assert_eq!(spec.runtime_profile.spawn_depth, 1);
     }
 
     #[test]
@@ -4467,7 +4471,8 @@ mod tests {
             ToolScope::Explicit(vec!["read_file".to_string()])
         );
         assert_eq!(spec.runtime_profile.model, ModelRoute::Inherit);
-        assert_eq!(spec.max_spawn_depth, 1);
+        assert_eq!(spec.max_spawn_depth, 2);
+        assert_eq!(spec.spawn_depth, 1);
 
         let permissions = crate::fleet::role::fleet_effective_permissions(
             &spec.agent_type,
@@ -4484,7 +4489,7 @@ mod tests {
         assert_eq!(permissions.tool_scope, "explicit");
         assert_eq!(permissions.tools, vec!["read_file".to_string()]);
         assert!(permissions.background);
-        assert_eq!(permissions.max_spawn_depth, 1);
+        assert_eq!(permissions.max_spawn_depth, 2);
         assert_eq!(permissions.source, "worker_runtime_profile");
     }
 
@@ -4814,10 +4819,13 @@ mod tests {
             context_mode: "fresh".to_string(),
             fork_context: false,
             tool_profile: AgentWorkerToolProfile::Inherited,
-            runtime_profile: WorkerRuntimeProfile::for_role(FleetRole::Worker),
+            runtime_profile: WorkerRuntimeProfile {
+                max_spawn_depth: codewhale_config::MAX_SPAWN_DEPTH_CEILING,
+                ..WorkerRuntimeProfile::for_role(FleetRole::Worker)
+            },
             max_steps: 1000,
             spawn_depth: 0,
-            max_spawn_depth: 0,
+            max_spawn_depth: codewhale_config::MAX_SPAWN_DEPTH_CEILING,
             child_route: None,
             launch_manifest: None,
         };

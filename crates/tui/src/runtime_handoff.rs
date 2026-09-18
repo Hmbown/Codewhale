@@ -103,6 +103,28 @@ const OPERATE_CONTRACT_EVENT: &str = concat!(
     "<codewhale:runtime_event kind=\"operate_contract\" visibility=\"internal\">\n",
     "This is an internal runtime event, not user input. This session is in Operate and you ",
     "are the operator. The host turns the user's prompt into the session goal; do not ",
+    "create a second one. Keep small, chat, one-file, or tightly coupled work in the parent. ",
+    "For multi-step delegation, first state a compact plan with named steps, dependencies, ",
+    "bounded file scopes and a completion check. Use `workflow` with its structured `plan` ",
+    "argument to run those phases through the existing sub-agent runtime. Fleet configures ",
+    "these same sub-agents and roles. Inspect `agent(action=\"roster\")` before assigning ",
+    "steps; choose from its saved models or role/profile assignments and respect unavailable ",
+    "routes. Parallelize only independent steps; pass completed ",
+    "results into dependent steps and inspect failures before continuing. Use one direct ",
+    "`agent` call for a single bounded independent task when a workflow adds no value. ",
+    "Reuse an existing worker with followup for corrections; do not spawn replacements or ",
+    "extra reviewers merely to stay busy. Every write-capable child must return a VERDICT ",
+    "with real verification evidence. Inspect and integrate those results before marking ",
+    "the step complete. Dispatch is not completion: dispatched ≠ settled ≠ verified. ",
+    "Report progress by completed, blocked and next steps, then synthesize the receipts.\n",
+    "</codewhale:runtime_event>",
+);
+// Keep old persisted runtime messages recognizable for restore/display while
+// allowing the Engine to append the current scheduling contract once.
+const LEGACY_OPERATE_CONTRACT_EVENT: &str = concat!(
+    "<codewhale:runtime_event kind=\"operate_contract\" visibility=\"internal\">\n",
+    "This is an internal runtime event, not user input. This session is in Operate and you ",
+    "are the operator. The host turns the user's prompt into the session goal; do not ",
     "create a second one. Decompose the goal into independent streams. Dispatch background ",
     "`agent` workers for separable streams by default; keep small, chat, one-file, or ",
     "tightly coupled work in the parent. Use Workflow when order, phases, gates, shared ",
@@ -121,6 +143,11 @@ const RUNTIME_TURN_META: &str = concat!(
 /// Build the one Operate contract message the engine appends to history.
 pub(crate) fn operate_contract_runtime_message() -> Message {
     runtime_handoff_message_with_meta(OPERATE_CONTRACT_EVENT.to_string(), RUNTIME_TURN_META)
+}
+
+#[cfg(test)]
+pub(crate) fn legacy_operate_contract_runtime_message() -> Message {
+    runtime_handoff_message_with_meta(LEGACY_OPERATE_CONTRACT_EVENT.to_string(), RUNTIME_TURN_META)
 }
 
 /// True when `message` is the runtime-owned Operate contract. Recognition is
@@ -143,7 +170,15 @@ pub(crate) fn is_operate_contract_message(message: &Message) -> bool {
     else {
         return false;
     };
-    text == OPERATE_CONTRACT_EVENT && is_handoff_turn_meta(turn_meta, "runtime")
+    matches!(
+        text.as_str(),
+        OPERATE_CONTRACT_EVENT | LEGACY_OPERATE_CONTRACT_EVENT
+    ) && is_handoff_turn_meta(turn_meta, "runtime")
+}
+
+pub(crate) fn is_current_operate_contract_message(message: &Message) -> bool {
+    is_operate_contract_message(message)
+        && matches!(message.content.first(), Some(ContentBlock::Text { text, .. }) if text == OPERATE_CONTRACT_EVENT)
 }
 
 const DONE_SENTINEL_START: &str = "<codewhale:subagent.done>";
@@ -430,7 +465,7 @@ fn render_restored_agent_topology(checkpoint: &SavedAgentTopologyCheckpoint) -> 
     display
 }
 
-fn is_agent_topology_checkpoint(message: &Message) -> bool {
+pub(crate) fn is_agent_topology_checkpoint(message: &Message) -> bool {
     let [
         ContentBlock::Text {
             text,
@@ -456,13 +491,47 @@ fn is_agent_topology_checkpoint(message: &Message) -> bool {
 /// compaction. A current empty topology is still meaningful: it overrides a
 /// narrative summary or old runtime event that says an Agent remains live.
 /// Replays are idempotent because the previous sidecar is structurally removed
-/// before the replacement is appended.
+/// before the replacement is inserted. A trailing compaction summary is not
+/// a real user boundary, and a checkpoint after a tool result would split a
+/// strict chat template's assistant/tool round.
 pub(crate) fn replace_agent_topology_checkpoint(
     messages: &mut Vec<Message>,
     snapshots: &[SubAgentResult],
 ) {
     messages.retain(|message| !is_agent_topology_checkpoint(message));
-    messages.push(agent_topology_checkpoint_message(snapshots));
+    let ends_with_tool_result = messages.last().is_some_and(|message| {
+        message.content.iter().any(|block| {
+            matches!(
+                block,
+                ContentBlock::ToolResult { .. }
+                    | ContentBlock::ToolSearchToolResult { .. }
+                    | ContentBlock::CodeExecutionToolResult { .. }
+            )
+        })
+    });
+    let ends_with_summary = messages
+        .last()
+        .is_some_and(crate::compaction::is_wire_compaction_checkpoint_message);
+    let position = if ends_with_tool_result || ends_with_summary {
+        messages
+            .iter()
+            .rposition(|message| {
+                !crate::compaction::is_wire_compaction_checkpoint_message(message)
+                    && classify_user_turn_prompt(message) != UserTurnPromptKind::NotPrompt
+            })
+            .map_or_else(
+                || {
+                    messages
+                        .iter()
+                        .position(|message| message.role.is_assistant_like())
+                        .unwrap_or(0)
+                },
+                |index| index + 1,
+            )
+    } else {
+        messages.len()
+    };
+    messages.insert(position, agent_topology_checkpoint_message(snapshots));
 }
 
 #[cfg(test)]
@@ -759,6 +828,7 @@ fn parse_completion_payload(payload: &str) -> Option<RestoredCompletion> {
 fn normalize_terminal_status(status: &str) -> Option<&'static str> {
     match status.trim().to_ascii_lowercase().as_str() {
         "completed" => Some("completed"),
+        "degraded" => Some("degraded"),
         "failed" => Some("failed"),
         "cancelled" | "canceled" => Some("cancelled"),
         "interrupted" => Some("interrupted"),
@@ -954,6 +1024,13 @@ pub(crate) fn restored_subagent_checkpoint_display(message: &Message) -> Option<
     Some(text)
 }
 
+/// Only the restored topology sidecar belongs to the compaction prompt
+/// cluster. Other restored Agent events retain their own wire boundaries.
+pub(crate) fn is_restored_agent_topology_checkpoint(message: &Message) -> bool {
+    restored_subagent_checkpoint_display(message)
+        .is_some_and(|display| display.starts_with(RESTORED_TOPOLOGY_HEADER))
+}
+
 /// Classification used when locating a user-authored turn in the session log.
 ///
 /// Runtime and tool messages are skipped because their provider-compatible
@@ -1031,7 +1108,7 @@ pub(crate) fn edit_last_turn_target(messages: &[Message]) -> EditLastTurnTarget 
 /// user-authored. Runtime authority is accepted only from the engine-owned
 /// structural `<turn_meta>` block, never from arbitrary user text that happens
 /// to resemble a runtime envelope or metadata marker.
-fn is_runtime_owned_user_message(message: &Message) -> bool {
+pub(crate) fn is_runtime_owned_user_message(message: &Message) -> bool {
     restored_subagent_checkpoint_display(message).is_some()
         || has_non_authoritative_turn_provenance(message)
 }
@@ -1102,8 +1179,27 @@ mod tests {
     use super::*;
     use crate::tools::subagent::{FleetRole, SubAgentAssignment};
 
+    #[test]
+    fn legacy_operate_contract_stays_internal_but_does_not_suppress_current_contract() {
+        let legacy = runtime_handoff_message_with_meta(
+            LEGACY_OPERATE_CONTRACT_EVENT.to_string(),
+            RUNTIME_TURN_META,
+        );
+        assert!(is_operate_contract_message(&legacy));
+        assert!(is_internal_runtime_handoff(&legacy));
+        assert!(!is_current_operate_contract_message(&legacy));
+        let current = operate_contract_runtime_message();
+        assert!(is_operate_contract_message(&current));
+        assert!(is_current_operate_contract_message(&current));
+        let mut quoted = current;
+        quoted.content.pop();
+        assert!(!is_operate_contract_message(&quoted));
+        assert!(!is_current_operate_contract_message(&quoted));
+    }
+
     fn topology_snapshot(agent_id: &str, name: &str, status: SubAgentStatus) -> SubAgentResult {
         SubAgentResult {
+            usage: None,
             name: name.to_string(),
             agent_id: agent_id.to_string(),
             context_mode: "fresh".to_string(),
@@ -1686,6 +1782,32 @@ mod tests {
         assert!(!display.contains("runtime_event"));
         assert!(!display.contains("subagent.done"));
         assert!(!display.contains("not-json"));
+    }
+
+    #[test]
+    fn restore_projection_keeps_workflow_outcomes_in_the_shared_checkpoint_format() {
+        for status in ["completed", "degraded", "failed", "cancelled"] {
+            let payload = format!(
+                "Release workflow: inspect recorded evidence.\n<codewhale:subagent.done>{}</codewhale:subagent.done>",
+                serde_json::json!({
+                    "event": if status == "completed" { "workflow.completed" } else { "workflow.failed" },
+                    "agent_id": "workflow_release",
+                    "agent_type": "workflow",
+                    "status": status,
+                    "detail": { "tool": "workflow", "action": "status", "run_id": "workflow_release" }
+                })
+            );
+            let raw = subagent_completion_runtime_message(&payload);
+            let projected = project_messages_for_restore(&[raw]);
+            let display = restored_subagent_checkpoint_display(&projected[0])
+                .expect("workflow uses the same persisted receipt reader");
+            assert!(display.contains("workflow_release"));
+            assert!(display.contains(&format!("Status: {status}")));
+            assert!(display.contains("inspect recorded evidence"));
+            assert!(!display.contains("runtime_event"));
+            assert!(!display.contains("subagent.done"));
+            assert_eq!(project_messages_for_restore(&projected), projected);
+        }
     }
 
     #[test]

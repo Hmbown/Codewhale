@@ -49,7 +49,6 @@ mod dsh_credentials;
 mod elapsed;
 mod error_taxonomy;
 mod eval;
-mod execpolicy;
 mod external_credentials;
 mod fast_hash;
 mod features;
@@ -63,6 +62,7 @@ mod integrations;
 mod lane_control;
 mod llm_client;
 mod llm_response_cache;
+mod local_ollama;
 mod logging;
 mod lsp;
 mod mcp;
@@ -113,7 +113,6 @@ mod runtime_threads;
 mod safe_label;
 mod sandbox;
 mod scorecard;
-#[allow(dead_code)]
 mod session_diagnostics;
 // Acceptance matrix for #2934 / #4397. Test-only: the table documents the
 // contract for reviewers and is enforced by the tests beside it, so it does
@@ -124,7 +123,6 @@ mod doctor_loader_tests;
 #[cfg(test)]
 mod session_control_acceptance;
 mod session_export;
-#[allow(dead_code)]
 mod session_manager;
 mod session_peek;
 mod session_projection;
@@ -149,6 +147,9 @@ mod tool_inspection;
 mod tool_output_receipts;
 mod tools;
 mod tui;
+/// Portable, dependency-free dot-whale core and conformance helpers.
+/// The terminal and external renderers share this implementation.
+pub use tui::ambient_life::pet_sim as pet;
 mod turn_route_plan;
 mod utils;
 mod vision;
@@ -492,6 +493,13 @@ struct ExecArgs {
     /// Internal Fleet worker authority envelope. Non-secret, versioned JSON.
     #[arg(long, value_name = "JSON", hide = true)]
     tool_authority_json: Option<String>,
+    /// Fire the configured hooks in this run (opt-in). On the headless path
+    /// the engine-side events are `tool_call_before` — which may still deny
+    /// a call — and `shell_env`. A hook `ask` resolves fail-closed because
+    /// nothing can prompt headlessly. Fleet worker subprocesses never fire
+    /// operator hooks.
+    #[arg(long, default_value_t = false)]
+    hooks: bool,
     /// Prompt to send to the model
     #[arg(
         value_name = "PROMPT",
@@ -966,7 +974,8 @@ fn load_exec_resume_session(session_id: &str) -> Result<session_manager::SavedSe
     let session_ref = exec_stream_session_ref(session_id);
     SessionManager::default_location()
         .context("could not open session manager for resume")?
-        .load_session_by_prefix(session_id)
+        .resume_session_by_prefix(session_id)
+        .map(|recovery| recovery.session)
         .with_context(|| format!("could not load session {session_ref}"))
 }
 
@@ -1720,6 +1729,23 @@ fn run_with_args(args: Vec<String>) -> Result<()> {
     let startup_sandbox_mode = resolve_startup_sandbox_mode_for_hardening();
     crate::sandbox::process_hardening::apply_process_hardening(startup_sandbox_mode.as_deref());
 
+    if args.get(1).is_some_and(|arg| arg == "pet") {
+        let root = crate::tui::pet_watch::owner::directory()?;
+        match args.get(2).map(String::as_str) {
+            Some("serve") if args.len() == 3 => {
+                return crate::tui::pet_watch::owner::serve(
+                    root,
+                    std::env::var("CODEWHALE_PET_PORT")
+                        .ok()
+                        .map(|p| p.parse::<u16>())
+                        .transpose()?
+                        .unwrap_or(4633),
+                );
+            }
+            _ => anyhow::bail!("Usage: codewhale pet serve"),
+        }
+    }
+
     // ── Fatal-signal terminal guard (#5424) ───────────────────────────────
     // Abort-class deaths (stack overflow, allocation failure, double panic)
     // skip the panic hook AND every Drop guard, leaving mouse capture and
@@ -2087,8 +2113,7 @@ async fn finish_telemetry(outcome: &Result<()>, surface: codewhale_telemetry::Su
     }
     codewhale_telemetry::record(telemetry_session_end());
     if surface == codewhale_telemetry::Surface::Cli {
-        let persistence =
-            codewhale_telemetry::persist_local_blocking(codewhale_telemetry::CLI_PERSIST_TIMEOUT);
+        let persistence = codewhale_telemetry::persist_local_blocking();
         logging::info(format!(
             "telemetry local persistence outcome={persistence:?}"
         ));
@@ -2408,6 +2433,7 @@ async fn run_async_main_dispatch(
                     || args.disallowed_tools.is_some()
                     || args.append_system_prompt.is_some()
                     || args.tool_authority_json.is_some()
+                    || args.hooks
                     || args.sandbox.is_some()
                     || args.allow_sandbox_elevation
                     || env_tool_surface.is_some();
@@ -2448,6 +2474,7 @@ async fn run_async_main_dispatch(
                         disallowed_tools,
                         args.append_system_prompt.clone(),
                         args.tool_authority_json.clone(),
+                        args.hooks,
                         std::sync::Arc::clone(&plugin_registry),
                     )
                     .await
@@ -2518,7 +2545,7 @@ async fn run_async_main_dispatch(
                     args.acp,
                 )?;
                 if args.mcp {
-                    tokio::task::block_in_place(|| mcp_server::run_mcp_server(workspace))
+                    mcp_server::run_mcp_server(workspace).await
                 } else if http_selected {
                     let (mut config, config_profile) =
                         load_config_from_cli_with_effective_profile(&cli)?;
@@ -2830,8 +2857,10 @@ fn is_workspace_dotenv_credential_key(key: &str) -> bool {
             key,
             "DEEPSEEK_SEARCH_API_KEY"
                 | "SOFYA_API_KEY"
+                | "SERPLY_API_KEY"
                 | "METASO_API_KEY"
                 | "BAIDU_SEARCH_API_KEY"
+                | "TAVILY_API_KEY"
                 | "DEEPSEEK_SANDBOX_API_KEY"
         )
 }
@@ -3273,7 +3302,6 @@ async fn run_fleet_command(workspace: &Path, config: &Config, args: FleetArgs) -
             .max(max_subagents),
         Duration::from_secs(config.subagent_heartbeat_timeout_secs_for_provider(provider)),
         config.launch_concurrency_for_provider(provider),
-        config.subagent_token_budget_for_provider(provider),
     );
     // Probe the durable ledger *before* opening the manager: FleetManager::open
     // creates `.codewhale/fleet.jsonl` as a side effect, so a later probe would
@@ -4493,7 +4521,7 @@ async fn run_doctor(
         );
         // Secret hygiene: name the keys, never the values. Plain-text config
         // is not a secret store.
-        if let Ok(raw) = std::fs::read_to_string(config_path) {
+        if let Ok(raw) = tokio::fs::read_to_string(config_path).await {
             let flagged = crate::doctor::config_credential_shaped_keys(&raw);
             if !flagged.is_empty() {
                 println!(
@@ -6454,8 +6482,11 @@ fn doctor_operate_fleet_report_json(config: &Config, workspace: &Path) -> serde_
         })
         .collect();
 
+    let model_pin_drift = doctor_model_pin_drift(config, workspace, &roster);
+
     json!({
         "ready": has_credentials_or_local && runtime_ready && roster_ready,
+        "model_pin_drift": model_pin_drift,
         "provider": {
             "id": config.provider_identity_for(provider),
             "auth": {
@@ -6493,6 +6524,105 @@ fn doctor_operate_fleet_report_json(config: &Config, workspace: &Path) -> serde_
             "max_admitted": max_admitted,
             "plan_limit_probed": false,
         },
+    })
+}
+
+/// Warning-only model-pin drift surfacing (#6035). A pin is flagged only
+/// when a FRESH cached live roster for that provider route exists and does
+/// not list the pinned wire id — stale, failed, or absent rosters cannot
+/// prove drift, and bundled catalog rows say nothing about what the account
+/// currently serves. The id may still answer (soft deprecation) or be served
+/// by other providers on their own routes, so this never rewrites the pin.
+fn doctor_model_pin_drift(
+    config: &Config,
+    workspace: &Path,
+    roster: &crate::fleet::roster::FleetRoster,
+) -> serde_json::Value {
+    use serde_json::json;
+    use std::collections::BTreeMap;
+
+    // One row per affected route: (provider, model) -> pin owners.
+    let mut pins: BTreeMap<(String, String), Vec<String>> = BTreeMap::new();
+
+    for entry in crate::fleet::store::list_fleets(workspace) {
+        if entry.parse_error.is_some() {
+            continue;
+        }
+        let Ok((fleet, scope)) = crate::fleet::store::load_fleet_at(&entry.path) else {
+            continue;
+        };
+        let owner = format!("fleet:{} ({})", fleet.name, scope.label());
+        if let Some(operator) = fleet.operator.as_ref() {
+            pins.entry((operator.provider.clone(), operator.model.clone()))
+                .or_default()
+                .push(format!("{owner} operator"));
+        }
+        for member in &fleet.members {
+            if let (Some(provider), Some(model)) = (member.provider.as_ref(), member.model.as_ref())
+            {
+                pins.entry((provider.clone(), model.clone()))
+                    .or_default()
+                    .push(format!("{owner} member:{}", member.id));
+            }
+        }
+    }
+    for member in roster.members() {
+        if let (Some(provider), Some(model)) = (
+            member.profile.provider.as_ref(),
+            member.profile.model.as_ref(),
+        ) {
+            pins.entry((provider.clone(), model.clone()))
+                .or_default()
+                .push(format!("agent:{}", member.id));
+        }
+    }
+
+    let mut unverifiable = 0usize;
+    let drifted = pins
+        .iter()
+        .filter_map(|((provider, model), owners)| {
+            let kind = crate::config::ApiProvider::parse(provider)
+                .unwrap_or(crate::config::ApiProvider::Custom);
+            let identity = match kind {
+                crate::config::ApiProvider::Custom => provider.clone(),
+                _ => kind.as_str().to_string(),
+            };
+            let base_url = config.base_url_for_route_identity(kind, &identity);
+            if crate::provider_catalog_live::status_for_route(kind, &identity, &base_url)
+                != codewhale_config::catalog::CatalogStatus::Fresh
+            {
+                unverifiable += 1;
+                return None;
+            }
+            let listed =
+                crate::provider_catalog_live::cached_entry_for_route(kind, &identity, &base_url)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|entry| {
+                        entry.offerings.iter().any(|offering| {
+                            offering.wire_model_id == *model
+                                || offering.canonical_model.as_deref() == Some(model.as_str())
+                        })
+                    });
+            (!listed).then(|| {
+                json!({
+                    "provider": provider,
+                    "model": model,
+                    "owners": owners,
+                    "message": format!(
+                        "pinned id `{model}` is absent from {provider}'s current live roster; \
+                         the id may still answer (soft deprecation) or be served by other \
+                         providers on their own routes — the pin is left unchanged"
+                    ),
+                })
+            })
+        })
+        .collect::<Vec<_>>();
+
+    json!({
+        "checked": pins.len(),
+        "unverifiable": unverifiable,
+        "drifted": drifted,
     })
 }
 
@@ -7405,13 +7535,41 @@ fn doctor_search_provider_line(config: &Config) -> String {
     } else {
         ""
     };
+    // Missing-key is stdout-only (never JSON) and only applies when the
+    // operator pinned Tavily: autodetect (`tavily key`) cannot reach this line
+    // without a key signal, so it never reports a missing key.
+    let missing_key = if search_provider.provider == crate::config::SearchProvider::Tavily
+        && matches!(
+            search_provider.source,
+            crate::config::SearchProviderSource::Config
+                | crate::config::SearchProviderSource::EnvOverride
+        )
+        && !search_provider_has_tavily_key(config)
+    {
+        "; missing TAVILY_API_KEY or [search] api_key"
+    } else {
+        ""
+    };
 
     format!(
-        "search_provider: {} (source: {}{})",
+        "search_provider: {} (source: {}{}){}",
         search_provider.provider.as_str(),
         search_provider.source.as_str(),
-        switch_hint
+        switch_hint,
+        missing_key
     )
+}
+
+/// Whether *any* Tavily key is reachable: the dedicated env var, or a
+/// non-empty generic `[search] api_key`. Deliberately not prefix-gated — an
+/// explicit `provider = "tavily"` accepts any non-empty generic key.
+fn search_provider_has_tavily_key(config: &Config) -> bool {
+    crate::config::tavily_env_key().is_some()
+        || config
+            .search
+            .as_ref()
+            .and_then(|search| search.api_key.as_deref())
+            .is_some_and(|key| !key.trim().is_empty())
 }
 
 fn doctor_search_provider_json(config: &Config) -> serde_json::Value {
@@ -7734,10 +7892,12 @@ async fn run_speech(config: &Config, args: SpeechArgs) -> Result<()> {
         .await?;
 
     if let Some(parent) = output.parent().filter(|path| !path.as_os_str().is_empty()) {
-        std::fs::create_dir_all(parent)
+        tokio::fs::create_dir_all(parent)
+            .await
             .with_context(|| format!("Failed to create output directory {}", parent.display()))?;
     }
-    std::fs::write(&output, &response.audio_bytes)
+    tokio::fs::write(&output, &response.audio_bytes)
+        .await
         .with_context(|| format!("Failed to write audio file {}", output.display()))?;
 
     if json_output {
@@ -8477,12 +8637,11 @@ async fn run_review(config: &Config, args: ReviewArgs) -> Result<()> {
             crate::tools::review::plan_pr_review(&diff, view, args.max_chars, args.max_passes)
         })
         .transpose()?;
+    let review_workspace = std::env::current_dir()?;
     let (prompts, system) = if let (Some((number, view)), Some(plan)) = (&pr_view, &pr_plan) {
         (
-            plan.passes
-                .iter()
-                .map(|pass| crate::tools::review::build_pr_pass_prompt(*number, view, plan, pass))
-                .collect::<Vec<_>>(),
+            crate::tools::review::build_pr_review_prompts(*number, view, plan, &review_workspace)
+                .await?,
             SystemPrompt::Text(crate::tools::review::review_system_prompt().to_string()),
         )
     } else {
@@ -8531,11 +8690,26 @@ Provide findings ordered by severity with file references, then open questions, 
     let mut accumulator = pr_plan
         .as_ref()
         .map(crate::tools::review::PrReviewAccumulator::new);
+    // Visible-text reserve for this exact route/model (#6285). A reasoning route
+    // shares one `max_tokens` allowance between hidden reasoning and visible
+    // text, so the review request has to keep room for the review itself.
+    let review_allowance = client.effective_max_output_tokens(&request_route.model);
+    let review_reserve_percent =
+        crate::route_budget::review_visible_text_reserve_percent(&request_route.model);
+    let review_reserve_tokens = crate::route_budget::review_visible_text_reserve_tokens(
+        &request_route.model,
+        review_allowance,
+    );
     let mut output = String::new();
     let mut review_stop_reason = None;
     for (index, user_prompt) in prompts.into_iter().enumerate() {
         let reasoning_effort = route.reasoning_effort.and_then(|effort| {
-            cli_reasoning_effort_value_for_prompt(&execution_config, &model, effort, &user_prompt)
+            review_reasoning_effort_value_for_prompt(
+                &execution_config,
+                &model,
+                effort,
+                review_reserve_percent,
+            )
         });
         let request = MessageRequest {
             model: model.clone(),
@@ -8575,15 +8749,32 @@ Provide findings ordered by severity with file references, then open questions, 
         crate::tools::review::add_review_usage(&mut usage, &response.usage);
         review_stop_reason = response.stop_reason.clone();
         if codewhale_models::is_incomplete_stop_reason(review_stop_reason.as_deref()) {
+            // #6285: budget exhaustion is an infrastructure outcome, not a
+            // review verdict. The PR was never judged, so the message must not
+            // read as findings and must name what was and was not reviewed.
+            let reasoning_tokens = usage
+                .reasoning_tokens
+                .map_or_else(|| "unknown".to_string(), |tokens| tokens.to_string());
+            let reserve_clause = if review_reserve_percent == 0 {
+                "no reasoning reserve was needed for this model".to_string()
+            } else {
+                "the pass's reasoning level was capped to fit that reserve".to_string()
+            };
             return report_failure(
                 &usage,
                 index,
                 publication,
                 format!(
-                    "Review pass {}/{} incomplete: provider stop reason `{}`; the partial review was not accepted or posted.",
+                    "Review pass {}/{} exhausted its output allowance and produced no review text. This is an infrastructure/budget outcome, not a review result: the provider stopped with reason `{}` after reporting {} of {} requested output tokens as reasoning; this model's review reserve is {} tokens ({review_reserve_percent}% of the allowance) and {reserve_clause}. Coverage: {}. Reviewed so far: {} of {} planned pass(es). The partial review was not accepted or posted.",
                     index + 1,
                     planned_passes,
-                    codewhale_models::stop_reason_detail(review_stop_reason.as_deref())
+                    codewhale_models::stop_reason_detail(review_stop_reason.as_deref()),
+                    reasoning_tokens,
+                    review_allowance,
+                    review_reserve_tokens,
+                    pr_review_unreviewed_note(pr_plan.as_ref(), index),
+                    index,
+                    planned_passes,
                 ),
             );
         }
@@ -8652,7 +8843,7 @@ Provide findings ordered by severity with file references, then open questions, 
             );
             if let Some(coverage) = coverage {
                 crate::tools::review::attach_pr_review_coverage(&mut receipt, coverage)
-                    .context("Failed to attach complete PR coverage to review receipt")?;
+                    .context("Failed to attach PR coverage to review receipt")?;
             }
             let path =
                 crate::tools::review::write_review_receipt(&receipt, args.receipt_path.as_deref())
@@ -8687,6 +8878,10 @@ Provide findings ordered by severity with file references, then open questions, 
             "stop_reason": review_stop_reason,
             "usage": usage,
             "review_passes": pr_plan.as_ref().map(|plan| plan.passes.len()),
+            "complete": pr_plan
+                .as_ref()
+                .is_none_or(|plan| plan.manifest.skipped_files.is_empty()),
+            "skipped_files": pr_plan.as_ref().map(|plan| &plan.manifest.skipped_files),
             "receipt_path": receipt
                 .as_ref()
                 .map(|(path, _)| path.display().to_string()),
@@ -8721,7 +8916,62 @@ Provide findings ordered by severity with file references, then open questions, 
             eprintln!("Review receipt written: {}", path.display());
         }
     }
+    if let Some(plan) = &pr_plan
+        && !plan.manifest.skipped_files.is_empty()
+    {
+        // #6285 AC3: the partial review above is real findings, already
+        // printed and posted — but the gate must not pass on unread
+        // files. The exit still fails, naming what the gate did not read
+        // and the remedy, so it reads as limits rather than as "this PR
+        // failed review".
+        bail!(
+            "Partial PR review: {} pass(es) completed, but the gate did not read: {}. Raise --max-chars/--max-passes or shrink the PR, then re-run; publication: {}",
+            plan.passes.len(),
+            crate::tools::review::format_skipped_files(&plan.manifest.skipped_files),
+            publication.as_str()
+        );
+    }
     Ok(())
+}
+
+/// Criterion 4 (no silent caps): whatever a budget stop leaves unread is
+/// named by file, never silently dropped — including files the plan itself
+/// skipped before the first pass ran (#6285 AC4). A free function so tests
+/// can pin the note without running a review.
+fn pr_review_unreviewed_note(
+    plan: Option<&crate::tools::review::PrReviewPlan>,
+    completed_passes: usize,
+) -> String {
+    let Some(plan) = plan else {
+        return "the entire diff".to_string();
+    };
+    let mut unread: Vec<String> = Vec::new();
+    for pass in plan.manifest.passes.iter().skip(completed_passes) {
+        for file in &pass.files {
+            if !unread.iter().any(|seen| seen == file) {
+                unread.push(file.clone());
+            }
+        }
+    }
+    let mut clauses = Vec::new();
+    if !unread.is_empty() {
+        clauses.push(format!(
+            "{} file(s) were never read: {}",
+            unread.len(),
+            unread.join(", ")
+        ));
+    }
+    if !plan.manifest.skipped_files.is_empty() {
+        clauses.push(format!(
+            "the plan never scheduled: {}",
+            crate::tools::review::format_skipped_files(&plan.manifest.skipped_files)
+        ));
+    }
+    if clauses.is_empty() {
+        "no planned file was left unread".to_string()
+    } else {
+        clauses.join("; ")
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -8758,6 +9008,11 @@ fn review_failure_payload(
         "model": model,
         "success": false,
         "complete": false,
+        // #6285: a run that never produced findings is an infrastructure or
+        // budget outcome. Keeping it explicit in the payload stops CI and
+        // operators from reading `success: false` as "this PR failed review".
+        "outcome": "infrastructure",
+        "review_verdict": "not_produced",
         "publication": publication.as_str(),
         "error": message,
         "usage": usage,
@@ -9969,7 +10224,9 @@ async fn run_mcp_command(
                 .get(&name)
                 .ok_or_else(|| anyhow!("MCP server '{name}' not found"))?;
             if crate::mcp::oauth::delete_oauth_tokens_for_server(&name, server)? {
-                println!("Deleted stored OAuth credentials for MCP server '{name}'.");
+                println!(
+                    "Deleted locally stored OAuth credentials for MCP server '{name}'. That clears this machine only; the provider may keep its grant, and the next login forces the consent screen."
+                );
             } else {
                 println!("No stored OAuth credentials found for MCP server '{name}'.");
             }
@@ -11339,14 +11596,31 @@ fn cli_reasoning_effort_value_for_prompt(
     config: &Config,
     model: &str,
     effort: crate::reasoning_preference::ReasoningEffort,
-    prompt: &str,
 ) -> Option<String> {
     let resolved = if effort == crate::reasoning_preference::ReasoningEffort::Auto {
-        crate::auto_reasoning::select(false, prompt)
+        crate::auto_reasoning::select()
     } else {
         effort
     };
     cli_reasoning_effort_value(config, model, resolved)
+}
+
+/// Review-pass reasoning effort: resolve `Auto` from the prompt exactly as the
+/// ordinary CLI path does, then bound the result so hidden reasoning cannot
+/// consume the whole shared output allowance (#6285).
+fn review_reasoning_effort_value_for_prompt(
+    config: &Config,
+    model: &str,
+    effort: crate::reasoning_preference::ReasoningEffort,
+    reserve_percent: u32,
+) -> Option<String> {
+    let resolved = if effort == crate::reasoning_preference::ReasoningEffort::Auto {
+        crate::auto_reasoning::select()
+    } else {
+        effort
+    };
+    let bounded = crate::tools::review::bounded_review_reasoning_effort(resolved, reserve_percent);
+    cli_reasoning_effort_value(config, model, bounded)
 }
 
 fn normalize_cli_reasoning_effort(value: &str) -> Result<Option<String>> {
@@ -11504,7 +11778,7 @@ async fn run_one_shot(
     let execution_config = config_for_cli_route(config, &route);
     let client = DeepSeekClient::new(&execution_config)?;
     let reasoning_effort = route.reasoning_effort.and_then(|effort| {
-        cli_reasoning_effort_value_for_prompt(&execution_config, &route.model, effort, prompt)
+        cli_reasoning_effort_value_for_prompt(&execution_config, &route.model, effort)
     });
     let model = route.model;
     let request_route = client.effective_route_envelope(&model, chrono::Utc::now());
@@ -11567,7 +11841,7 @@ async fn run_one_shot_json(
     let client = DeepSeekClient::new(&execution_config)?;
     let model = route.model.clone();
     let reasoning_effort = route.reasoning_effort.and_then(|effort| {
-        cli_reasoning_effort_value_for_prompt(&execution_config, &model, effort, prompt)
+        cli_reasoning_effort_value_for_prompt(&execution_config, &model, effort)
     });
     let request_route = client.effective_route_envelope(&model, chrono::Utc::now());
     let request = MessageRequest {
@@ -12303,7 +12577,6 @@ async fn build_direct_workflow_tool(
             .max(max_subagents),
         Duration::from_secs(config.subagent_heartbeat_timeout_secs_for_provider(provider)),
         config.launch_concurrency_for_provider(provider),
-        config.subagent_token_budget_for_provider(provider),
     );
     let roster = Arc::new(crate::fleet::identity::load_effective_roster(
         &config.fleet_config(),
@@ -12351,6 +12624,7 @@ async fn build_direct_workflow_tool(
     } else {
         None
     };
+    let fleet_governor = manager.read().await.rate_limit_governor();
     let runtime = SubAgentRuntime::new(
         client,
         route.model.clone(),
@@ -12359,6 +12633,7 @@ async fn build_direct_workflow_tool(
         Some(event_tx),
         manager.clone(),
     )
+    .with_fleet_governor(fleet_governor)
     .with_locale_tag(
         codewhale_localization::resolve_locale(
             &crate::settings::Settings::load_persisted()
@@ -14506,19 +14781,133 @@ mod doctor_endpoint_tests {
     #[test]
     fn doctor_search_provider_line_includes_firecrawl_default_source_and_switch_hint() {
         let _guard = crate::test_support::lock_test_env();
+        // A Default pin means all three Tavily-resolution signals are absent.
+        let prev_code = std::env::var_os("CODEWHALE_SEARCH_PROVIDER");
         let prev = std::env::var_os("DEEPSEEK_SEARCH_PROVIDER");
-        unsafe { std::env::remove_var("DEEPSEEK_SEARCH_PROVIDER") };
+        let prev_tavily = std::env::var_os("TAVILY_API_KEY");
+        unsafe {
+            std::env::remove_var("CODEWHALE_SEARCH_PROVIDER");
+            std::env::remove_var("DEEPSEEK_SEARCH_PROVIDER");
+            std::env::remove_var("TAVILY_API_KEY");
+        }
 
         let line = doctor_search_provider_line(&Config::default());
 
+        match prev_code {
+            Some(value) => unsafe { std::env::set_var("CODEWHALE_SEARCH_PROVIDER", value) },
+            None => unsafe { std::env::remove_var("CODEWHALE_SEARCH_PROVIDER") },
+        }
         match prev {
             Some(value) => unsafe { std::env::set_var("DEEPSEEK_SEARCH_PROVIDER", value) },
             None => unsafe { std::env::remove_var("DEEPSEEK_SEARCH_PROVIDER") },
+        }
+        match prev_tavily {
+            Some(value) => unsafe { std::env::set_var("TAVILY_API_KEY", value) },
+            None => unsafe { std::env::remove_var("TAVILY_API_KEY") },
         }
         assert!(line.contains("search_provider: firecrawl"));
         assert!(line.contains("source: default"));
         assert!(line.contains("[search] provider"));
         assert!(line.contains("provider = \"baidu\""));
+        assert!(!line.contains("missing"), "got `{line}`");
+    }
+
+    #[test]
+    fn doctor_search_provider_line_reports_autodetected_tavily_key_without_missing_key() {
+        let _guard = crate::test_support::lock_test_env();
+        let prev_code = std::env::var_os("CODEWHALE_SEARCH_PROVIDER");
+        let prev = std::env::var_os("DEEPSEEK_SEARCH_PROVIDER");
+        let prev_tavily = std::env::var_os("TAVILY_API_KEY");
+        unsafe {
+            std::env::remove_var("CODEWHALE_SEARCH_PROVIDER");
+            std::env::remove_var("DEEPSEEK_SEARCH_PROVIDER");
+            std::env::set_var("TAVILY_API_KEY", "tvly-test-doctor");
+        }
+
+        let config = Config::default();
+        let line = doctor_search_provider_line(&config);
+        let report = doctor_search_provider_json(&config);
+
+        match prev_code {
+            Some(value) => unsafe { std::env::set_var("CODEWHALE_SEARCH_PROVIDER", value) },
+            None => unsafe { std::env::remove_var("CODEWHALE_SEARCH_PROVIDER") },
+        }
+        match prev {
+            Some(value) => unsafe { std::env::set_var("DEEPSEEK_SEARCH_PROVIDER", value) },
+            None => unsafe { std::env::remove_var("DEEPSEEK_SEARCH_PROVIDER") },
+        }
+        match prev_tavily {
+            Some(value) => unsafe { std::env::set_var("TAVILY_API_KEY", value) },
+            None => unsafe { std::env::remove_var("TAVILY_API_KEY") },
+        }
+
+        assert_eq!(line, "search_provider: tavily (source: tavily key)");
+        assert_eq!(report["provider"], "tavily");
+        assert_eq!(report["source"], "tavily key");
+        assert!(
+            report.get("missing_key").is_none(),
+            "missing-key is stdout-only: {report}"
+        );
+        // Autodetect is runtime-only; nothing was written to the config view.
+        assert_eq!(
+            config.search.as_ref().and_then(|search| search.provider),
+            None
+        );
+    }
+
+    #[test]
+    fn doctor_search_provider_line_reports_explicit_tavily_missing_key() {
+        let _guard = crate::test_support::lock_test_env();
+        let prev_code = std::env::var_os("CODEWHALE_SEARCH_PROVIDER");
+        let prev = std::env::var_os("DEEPSEEK_SEARCH_PROVIDER");
+        let prev_tavily = std::env::var_os("TAVILY_API_KEY");
+        unsafe {
+            std::env::remove_var("CODEWHALE_SEARCH_PROVIDER");
+            std::env::remove_var("DEEPSEEK_SEARCH_PROVIDER");
+            std::env::remove_var("TAVILY_API_KEY");
+        }
+        let config = Config {
+            search: Some(crate::config::SearchConfig {
+                provider: Some(crate::config::SearchProvider::Tavily),
+                base_url: None,
+                api_key: None,
+            }),
+            ..Default::default()
+        };
+
+        let line = doctor_search_provider_line(&config);
+
+        // The env-override arm of the same rule.
+        unsafe { std::env::set_var("CODEWHALE_SEARCH_PROVIDER", "tavily") };
+        let env_line = doctor_search_provider_line(&Config::default());
+
+        match prev_code {
+            Some(value) => unsafe { std::env::set_var("CODEWHALE_SEARCH_PROVIDER", value) },
+            None => unsafe { std::env::remove_var("CODEWHALE_SEARCH_PROVIDER") },
+        }
+        match prev {
+            Some(value) => unsafe { std::env::set_var("DEEPSEEK_SEARCH_PROVIDER", value) },
+            None => unsafe { std::env::remove_var("DEEPSEEK_SEARCH_PROVIDER") },
+        }
+        match prev_tavily {
+            Some(value) => unsafe { std::env::set_var("TAVILY_API_KEY", value) },
+            None => unsafe { std::env::remove_var("TAVILY_API_KEY") },
+        }
+
+        assert_eq!(
+            line,
+            "search_provider: tavily (source: config); missing TAVILY_API_KEY or [search] api_key"
+        );
+        assert_eq!(
+            env_line,
+            "search_provider: tavily (source: env override); missing TAVILY_API_KEY or [search] api_key"
+        );
+        // Missing-key is stdout-only.
+        assert!(
+            doctor_search_provider_json(&config)
+                .get("missing_key")
+                .is_none()
+        );
     }
 
     #[test]
@@ -14861,6 +15250,84 @@ mod terminal_mode_tests {
                 .iter()
                 .any(|layer| layer["origin"] == "project" && layer["wins"] == true),
             "project layer wins: {builder}"
+        );
+    }
+
+    #[test]
+    fn doctor_fleet_report_flags_pins_absent_from_fresh_live_roster() {
+        // #6035: a pin that vanished from the provider's current live roster
+        // is drift the report must name — warning only, never a rewrite.
+        let _env_lock = crate::test_support::lock_test_env();
+        let _live = crate::provider_lake::lock_live_snapshot();
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let home = tmp.path().join("home");
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        let _codewhale_home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", &home);
+        crate::provider_catalog_live::reset_cache_for_test();
+
+        let fleets = home.join("fleets");
+        std::fs::create_dir_all(&fleets).expect("fleets dir");
+        std::fs::write(
+            fleets.join("default.toml"),
+            "schema = \"fleet\"\nschema_revision = 2\nname = \"default\"\n\
+             [operator]\nprovider = \"deepseek\"\nmodel = \"deepseek-flash\"\n\
+             [[members]]\nid = \"builder\"\nprovider = \"deepseek\"\nmodel = \"deepseek-v4-flash\"\n",
+        )
+        .expect("fleet file");
+
+        let config = Config {
+            provider: Some("deepseek".to_string()),
+            ..Default::default()
+        };
+        let kind = crate::config::ApiProvider::Deepseek;
+        let base_url = config.base_url_for_route_identity(kind, "deepseek");
+        let fetched_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_secs();
+        let fingerprint = codewhale_config::catalog::base_url_fingerprint(&base_url);
+        assert_eq!(
+            crate::provider_catalog_live::record_success(
+                codewhale_config::catalog::ProviderCatalogDelta {
+                    provider: "deepseek".to_string(),
+                    base_url_fingerprint: fingerprint.clone(),
+                    fetched_at,
+                    offerings: vec![codewhale_config::catalog::CatalogOffering {
+                        provider: "deepseek".to_string(),
+                        wire_model_id: "deepseek-flash".to_string(),
+                        endpoint_key: "chat".to_string(),
+                        source: codewhale_config::catalog::CatalogSource::Live {
+                            base_url_fingerprint: fingerprint,
+                            fetched_at,
+                        },
+                        ..Default::default()
+                    }],
+                }
+            ),
+            codewhale_config::catalog::CatalogStatus::Fresh
+        );
+
+        let operate = doctor_operate_fleet_report_json(&config, &workspace);
+        let drift = &operate["model_pin_drift"];
+        let drifted = drift["drifted"].as_array().expect("drifted array");
+        let row = drifted
+            .iter()
+            .find(|row| row["model"] == "deepseek-v4-flash")
+            .expect("member pin flagged: {drift}");
+        assert_eq!(row["provider"], "deepseek");
+        assert!(
+            row["owners"]
+                .as_array()
+                .expect("owners")
+                .iter()
+                .any(|owner| owner.as_str().is_some_and(|o| o.contains("member:builder"))),
+            "the fleet member pin is named: {row}"
+        );
+        // The operator pin moved to the listed id — not drift.
+        assert!(
+            !drifted.iter().any(|row| row["model"] == "deepseek-flash"),
+            "listed pin must not be flagged: {drifted:?}"
         );
     }
 
@@ -16635,6 +17102,49 @@ api_key = "test-only-key"
     }
 
     #[test]
+    fn pr_review_unreviewed_note_names_budget_stops_and_plan_skips() {
+        assert_eq!(pr_review_unreviewed_note(None, 0), "the entire diff");
+        fn patch(name: &str, content: &str) -> String {
+            format!(
+                "diff --git a/{name} b/{name}\nnew file mode 100644\n--- /dev/null\n+++ b/{name}\n@@ -0,0 +1 @@\n+{content}\n"
+            )
+        }
+        let patches = [
+            patch("a.txt", "alpha"),
+            patch("b.txt", "bravo"),
+            patch("c.txt", "charlie"),
+        ];
+        let diff = patches.concat();
+        let max_chars = patches
+            .iter()
+            .map(|patch| patch.chars().count())
+            .max()
+            .unwrap();
+        let view = GhPullRequest {
+            changed_files: 3,
+            ..Default::default()
+        };
+        // Two passes of budget: a and b are planned, c is skipped by the plan.
+        let plan = crate::tools::review::plan_pr_review(&diff, &view, max_chars, 2).unwrap();
+        let note = pr_review_unreviewed_note(Some(&plan), 0);
+        assert!(note.contains("were never read"), "{note}");
+        assert!(note.contains("a/b.txt b/b.txt"), "{note}");
+        assert!(note.contains("the plan never scheduled"), "{note}");
+        assert!(note.contains("a/c.txt b/c.txt"), "{note}");
+        // One pass done: only b is left unread, but the plan skip still stands.
+        let note = pr_review_unreviewed_note(Some(&plan), 1);
+        assert!(!note.contains("a/a.txt b/a.txt"), "{note}");
+        assert!(note.contains("a/b.txt b/b.txt"), "{note}");
+        assert!(note.contains("a/c.txt b/c.txt"), "{note}");
+        // A complete plan with every pass done names nothing.
+        let complete = crate::tools::review::plan_pr_review(&diff, &view, max_chars, 3).unwrap();
+        assert_eq!(
+            pr_review_unreviewed_note(Some(&complete), 3),
+            "no planned file was left unread"
+        );
+    }
+
+    #[test]
     fn pr_review_markdown_shows_the_computed_replacement() {
         // A plain `codewhale review --pr` (no --post) computes and validates
         // the literal fix; the local report must show it, not just the prose.
@@ -16949,7 +17459,7 @@ api_key = "test-only-key"
     }
 
     #[test]
-    fn cli_prompt_paths_resolve_auto_before_k3_route_normalization() {
+    fn cli_auto_resolves_to_the_declared_default_before_k3_route_normalization() {
         let config = Config {
             provider: Some("moonshot".to_string()),
             providers: Some(crate::config::ProvidersConfig {
@@ -16963,30 +17473,24 @@ api_key = "test-only-key"
             ..Default::default()
         };
 
-        for (prompt, expected) in [
-            ("lookup the public docs", "low"),
-            ("debug this error", "max"),
-            ("review this ordinary change", "high"),
-        ] {
-            assert_eq!(
-                cli_reasoning_effort_value_for_prompt(
-                    &config,
-                    crate::config::KIMI_CODE_K3_MODEL,
-                    crate::reasoning_preference::ReasoningEffort::Auto,
-                    prompt,
-                )
-                .as_deref(),
-                Some(expected),
-                "prompt selector must resolve Auto for `{prompt}`"
-            );
-        }
+        // #6290 rework: Auto no longer classifies the prompt. Any wording
+        // resolves the declared policy tier, normalized for the K3 route.
+        assert_eq!(
+            cli_reasoning_effort_value_for_prompt(
+                &config,
+                crate::config::KIMI_CODE_K3_MODEL,
+                crate::reasoning_preference::ReasoningEffort::Auto,
+            )
+            .as_deref(),
+            Some("high"),
+            "Auto resolves the declared default, not a classification"
+        );
 
         assert_eq!(
             cli_reasoning_effort_value_for_prompt(
                 &config,
                 crate::config::KIMI_CODE_K3_MODEL,
                 crate::reasoning_preference::ReasoningEffort::Off,
-                "debug must not override an explicit effort",
             )
             .as_deref(),
             Some("low"),
@@ -17050,7 +17554,6 @@ api_key = "test-only-key"
             &config,
             crate::config::ZAI_GLM_5_2_MODEL,
             crate::reasoning_preference::ReasoningEffort::Auto,
-            "debug this failing integration test",
         )
         .expect("Auto must resolve to a concrete tier");
 
@@ -17082,6 +17585,7 @@ api_key = "test-only-key"
         assert_eq!(args.resume.as_deref(), Some("abc123"));
         assert_eq!(args.output_format, ExecOutputFormat::StreamJson);
         assert_eq!(args.prompt, vec!["follow up"]);
+        assert!(!args.hooks, "headless hooks stay opt-in by default");
     }
 
     #[test]
@@ -17113,6 +17617,7 @@ api_key = "test-only-key"
             "extra rules",
             "--tool-authority-json",
             envelope,
+            "--hooks",
             "do the thing",
         ]);
         let Some(Commands::Exec(args)) = cli.command else {
@@ -17131,6 +17636,7 @@ api_key = "test-only-key"
         assert_eq!(args.max_tool_calls, Some(9));
         assert_eq!(args.append_system_prompt.as_deref(), Some("extra rules"));
         assert_eq!(args.tool_authority_json.as_deref(), Some(envelope));
+        assert!(args.hooks);
         assert_eq!(args.prompt, vec!["do the thing"]);
     }
 
@@ -18274,6 +18780,7 @@ api_key = "test-only-key"
             tui: Some(crate::config::TuiConfig {
                 alternate_screen: Some("never".to_string()),
                 mouse_capture: None,
+                selection_copy_markdown: None,
                 terminal_probe_timeout_ms: None,
                 stream_chunk_timeout_secs: None,
                 max_model_steps: None,
@@ -18286,7 +18793,6 @@ api_key = "test-only-key"
                 osc8_links: None,
                 composer_arrows_scroll: None,
                 notification_condition: None,
-                header_items: None,
             }),
             ..Config::default()
         };
@@ -18375,6 +18881,7 @@ api_key = "test-only-key"
             tui: Some(crate::config::TuiConfig {
                 alternate_screen: None,
                 mouse_capture: Some(false),
+                selection_copy_markdown: None,
                 terminal_probe_timeout_ms: None,
                 stream_chunk_timeout_secs: None,
                 max_model_steps: None,
@@ -18387,7 +18894,6 @@ api_key = "test-only-key"
                 osc8_links: None,
                 composer_arrows_scroll: None,
                 notification_condition: None,
-                header_items: None,
             }),
             ..Config::default()
         };
@@ -18414,6 +18920,7 @@ api_key = "test-only-key"
             tui: Some(crate::config::TuiConfig {
                 alternate_screen: None,
                 mouse_capture: Some(true),
+                selection_copy_markdown: None,
                 terminal_probe_timeout_ms: None,
                 stream_chunk_timeout_secs: None,
                 max_model_steps: None,
@@ -18426,7 +18933,6 @@ api_key = "test-only-key"
                 osc8_links: None,
                 composer_arrows_scroll: None,
                 notification_condition: None,
-                header_items: None,
             }),
             ..Config::default()
         };
@@ -18507,6 +19013,7 @@ api_key = "test-only-key"
             tui: Some(crate::config::TuiConfig {
                 alternate_screen: None,
                 mouse_capture: Some(true),
+                selection_copy_markdown: None,
                 terminal_probe_timeout_ms: None,
                 stream_chunk_timeout_secs: None,
                 max_model_steps: None,
@@ -18519,7 +19026,6 @@ api_key = "test-only-key"
                 osc8_links: None,
                 composer_arrows_scroll: None,
                 notification_condition: None,
-                header_items: None,
             }),
             ..Config::default()
         };

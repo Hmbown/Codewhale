@@ -21,7 +21,9 @@ use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
 
-use crate::registry::{LaneRecord, LaneStatus, TerminalTransition};
+#[cfg(test)]
+use crate::registry::LaneStatus;
+use crate::registry::{LaneRecord, TerminalTransition};
 
 /// Maximum rows any surface may render for a run list in one payload.
 pub const DEFAULT_RUN_LIST_LIMIT: usize = 50;
@@ -1765,12 +1767,6 @@ pub fn lane_run_summary(record: &LaneRecord) -> RunSummaryDto {
 #[must_use]
 pub fn lane_run_page(records: &[LaneRecord], limit: usize) -> RunListPage {
     RunListPage::bounded(records.iter().map(lane_run_summary).collect(), limit)
-}
-
-/// Whether a Lane is still interruptible.
-#[must_use]
-pub fn lane_is_interruptible(status: LaneStatus) -> bool {
-    status.is_active()
 }
 
 // ---------------------------------------------------------------------------

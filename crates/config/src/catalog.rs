@@ -729,13 +729,6 @@ impl CatalogCompiler {
         self
     }
 
-    /// Add Codewhale-owned bundled catalog rows (layer 5).
-    #[must_use]
-    pub fn with_codewhale_bundled(mut self, rows: Vec<CatalogOffering>) -> Self {
-        self.codewhale_bundled.extend(rows);
-        self
-    }
-
     /// Add live models.dev refresh rows (layer 10).
     #[must_use]
     pub fn with_models_dev_live(mut self, rows: Vec<CatalogOffering>) -> Self {
@@ -850,6 +843,38 @@ pub fn base_url_fingerprint(base_url: &str) -> String {
         let _ = write!(&mut out, "{byte:02x}");
     }
     out
+}
+
+/// The conventional provider-table id for the Baseten known-good host.
+///
+/// Baseten is an ordinary named `[providers.baseten]` row (#6289); this
+/// string is the identity the live-catalog path serves, not a wire-fact
+/// switch — every runtime behavior keys off [`endpoint_is_baseten`].
+pub const BASETEN_PROVIDER_ID: &str = "baseten";
+
+/// Baseten Model APIs endpoint: the one hosted Chat Completions host whose
+/// wire facts differ from the generic shape (#6289).
+///
+/// Baseten's `/models` uses its own response schema and returns an
+/// account-scoped roster, so response parsing, account-scoped cache
+/// isolation, and the reviewed per-token billing contract all key off this
+/// endpoint. Recognition is by endpoint fingerprint — never by what the user
+/// named the `[providers.<name>]` table — so renames and aliases cannot
+/// change wire handling.
+pub const BASETEN_BASE_URL: &str = "https://inference.baseten.co/v1";
+
+/// The documented default model for the Baseten known-good host
+/// (`docs/PROVIDERS.md`). The live-catalog offering builder marks a
+/// discovered row with this wire id as the provider default.
+pub const BASETEN_DEFAULT_MODEL: &str = "deepseek-ai/DeepSeek-V4-Pro";
+
+/// Whether `base_url` is Baseten's Model APIs endpoint.
+///
+/// Compares fingerprints, not spellings, so a trailing slash or case
+/// difference in a user-configured URL still recognizes the host.
+#[must_use]
+pub fn endpoint_is_baseten(base_url: &str) -> bool {
+    base_url_fingerprint(base_url) == base_url_fingerprint(BASETEN_BASE_URL)
 }
 
 fn secret_free_fingerprint_input(base_url: &str) -> String {

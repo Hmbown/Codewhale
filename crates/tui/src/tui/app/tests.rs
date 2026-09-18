@@ -36,7 +36,7 @@ fn missing_api_stamps_never_drop_messages_or_shift_preserved_times() {
     let third = first + chrono::Duration::minutes(2);
     // Reproduce partial legacy/test state without going through restoration,
     // which already fills missing stamps. Reading it must preserve both rows.
-    app.api_messages = vec![message("first"), message("unstamped")];
+    app.api_messages = std::sync::Arc::new(vec![message("first"), message("unstamped")]);
     app.api_message_stamps = vec![first];
     let observed = app.api_messages_stamped().collect::<Vec<_>>();
     assert_eq!(observed.len(), 2);
@@ -53,6 +53,27 @@ fn missing_api_stamps_never_drop_messages_or_shift_preserved_times() {
     app.truncate_api_messages(1);
     assert_eq!(app.api_messages.len(), 1);
     assert_eq!(app.api_message_stamps, vec![first]);
+}
+
+#[test]
+fn set_api_messages_installs_the_shared_snapshot_without_copying() {
+    let mut app = App::new(test_options(false), &Config::default());
+    let snapshot = Arc::new(vec![Message {
+        role: codewhale_models::Role::User,
+        content: vec![codewhale_models::ContentBlock::Text {
+            text: "hello".to_string(),
+            cache_control: None,
+        }],
+    }]);
+    app.set_api_messages(Arc::clone(&snapshot));
+    assert!(Arc::ptr_eq(&app.api_messages, &snapshot));
+    // Mutating the mirror detaches; the engine snapshot is untouched.
+    app.push_api_message(Message {
+        role: codewhale_models::Role::Assistant,
+        content: vec![],
+    });
+    assert_eq!(snapshot.len(), 1);
+    assert_eq!(app.api_messages.len(), 2);
 }
 
 #[test]
@@ -558,8 +579,8 @@ fn auto_reasoning_change_invalidates_the_previous_route_and_receipt() {
         },
         scope: crate::model_routing::AutoRouteScope::ResolvedProvider,
         data_path: crate::model_routing::AutoRouteDataPath::LocalHeuristic,
-        reason: crate::model_routing::AutoRouteReason::LocalHeuristic(
-            crate::model_routing::AutoRouteHeuristicReason::ComplexRequest,
+        reason: crate::model_routing::AutoRouteReason::LocalFallback(
+            crate::model_routing::AutoRouteHeuristicReason::DeclaredDefault,
         ),
     });
     app.last_effective_reasoning_effort =
@@ -1296,9 +1317,15 @@ fn reasoning_effort_uses_one_strict_alias_table_and_legacy_fallback() {
     for raw in ["off", "none", "disabled", "false"] {
         assert_eq!(ReasoningEffort::parse_strict(raw), Ok(ReasoningEffort::Off));
     }
-    for raw in ["low", "minimum", "minimal", "light"] {
+    for raw in ["low", "minimum", "light"] {
         assert_eq!(ReasoningEffort::parse_strict(raw), Ok(ReasoningEffort::Low));
     }
+    // `minimal` is its own rung: `parse_strict(as_setting(Minimal))` must not
+    // lose the variant by collapsing it onto `Low` (Slice 4, D3).
+    assert_eq!(
+        ReasoningEffort::parse_strict("minimal"),
+        Ok(ReasoningEffort::Minimal)
+    );
     for raw in ["medium", "mid"] {
         assert_eq!(
             ReasoningEffort::parse_strict(raw),
@@ -5352,24 +5379,29 @@ fn bare_enter_scenario() {
 }
 
 #[test]
-fn double_tap_takes_the_just_queued_message_only_inside_the_window() {
+fn double_tap_drains_every_queued_message_oldest_first_inside_the_window() {
     let mut app = App::new(test_options(false), &Config::default());
     app.is_loading = true;
     app.streaming_message_index = Some(0);
     app.queue_message(QueuedMessage::new("older queued".to_string(), None));
     app.queue_message(QueuedMessage::new("just typed follow-up".to_string(), None));
     assert!(
-        app.take_queued_for_double_tap_steer().is_none(),
+        app.take_queued_for_double_tap_steer().is_empty(),
         "no window armed"
     );
     app.arm_double_tap_window();
-    let taken = app
-        .take_queued_for_double_tap_steer()
-        .expect("the window is open");
-    assert_eq!(taken.display, "just typed follow-up");
-    assert_eq!(app.queued_message_count(), 1);
+    let taken = app.take_queued_for_double_tap_steer();
+    assert_eq!(
+        taken
+            .iter()
+            .map(|message| message.display.as_str())
+            .collect::<Vec<_>>(),
+        vec!["older queued", "just typed follow-up"],
+        "the window drains the whole queue in order"
+    );
+    assert_eq!(app.queued_message_count(), 0);
     assert!(
-        app.take_queued_for_double_tap_steer().is_none(),
+        app.take_queued_for_double_tap_steer().is_empty(),
         "one steer per tap"
     );
 }

@@ -41,9 +41,6 @@ pub(crate) struct TurnRoutePlanRequest<'a> {
     /// Model-facing content of the next user message (file mentions and skill
     /// wrapping already resolved). This is what the auto router classifies.
     pub(crate) content: &'a str,
-    /// The user's display text, used by the heuristic and auto-reasoning
-    /// fallbacks exactly as production does.
-    pub(crate) display_text: &'a str,
     pub(crate) auto_router_context: &'a str,
     pub(crate) should_auto_resolve: bool,
     /// Production dispatch may use the deterministic response cache for the
@@ -88,8 +85,9 @@ pub(crate) enum TurnRoutingSource {
     ActiveFixedRoute,
     /// Auto model routing used its provider-backed classifier.
     AutoProviderClassifier,
-    /// Auto model routing used the local deterministic fallback heuristic.
-    AutoLocalHeuristic,
+    /// Auto model routing fell back to the local declared default (no
+    /// classifier signal; request wording never inspected).
+    AutoLocalFallback,
 }
 
 impl TurnRoutingSource {
@@ -97,7 +95,7 @@ impl TurnRoutingSource {
         match self {
             Self::ActiveFixedRoute => "active-fixed-route",
             Self::AutoProviderClassifier => "auto-provider-classifier",
-            Self::AutoLocalHeuristic => "auto-local-heuristic",
+            Self::AutoLocalFallback => "auto-local-fallback",
         }
     }
 }
@@ -170,13 +168,14 @@ pub(crate) async fn plan_turn_route(
         .map(|selection| selection.provider)
         .unwrap_or(request.api_provider);
 
+    // Without an Auto selection there is no per-request signal, so the
+    // route is the configured model — the same declared default the local
+    // fallback uses. Request wording is never inspected (#6290 rework).
     let effective_model = if request.auto_model {
         auto_selection
             .as_ref()
             .map(|selection| selection.model.clone())
-            .unwrap_or_else(|| {
-                crate::model_routing::auto_model_heuristic(request.display_text, request.app_model)
-            })
+            .unwrap_or_else(|| request.app_model.to_string())
     } else {
         request.app_model.to_string()
     };
@@ -268,14 +267,14 @@ pub(crate) async fn plan_turn_route(
     // Model selection and reasoning selection are independent. A fixed
     // reasoning preference survives auto model routing and is normalized
     // against the concrete route below; only an explicit `auto` delegates the
-    // tier to the classifier/heuristic.
+    // tier to the classifier/declared fallback.
     let auto_controls_reasoning = request.reasoning_effort == ReasoningEffort::Auto;
     let selected_reasoning_effort = if auto_controls_reasoning {
         Some(
             auto_selection
                 .as_ref()
                 .and_then(|selection| selection.reasoning_effort)
-                .unwrap_or_else(|| crate::auto_reasoning::select(false, request.display_text)),
+                .unwrap_or_else(crate::auto_reasoning::select),
         )
     } else {
         None
@@ -295,7 +294,7 @@ pub(crate) async fn plan_turn_route(
     } else if auto_selection.is_some() {
         TurnRoutingSource::AutoProviderClassifier
     } else {
-        TurnRoutingSource::AutoLocalHeuristic
+        TurnRoutingSource::AutoLocalFallback
     };
 
     Ok(PlannedTurnRoute {
@@ -405,7 +404,6 @@ mod tests {
             reasoning_effort: ReasoningEffort::Low,
             mode: AppMode::Agent,
             content: "explain this function",
-            display_text: "explain this function",
             auto_router_context: "",
             should_auto_resolve: false,
             allow_auto_router_response_cache: false,
@@ -417,10 +415,7 @@ mod tests {
         .await
         .expect("plan auto-model turn");
 
-        assert_eq!(
-            planned.routing_source,
-            TurnRoutingSource::AutoLocalHeuristic
-        );
+        assert_eq!(planned.routing_source, TurnRoutingSource::AutoLocalFallback);
         assert!(!planned.auto_controls_reasoning);
         assert_eq!(planned.selected_reasoning_effort, None);
         // First-party DeepSeek routes carry low as the real wire tier

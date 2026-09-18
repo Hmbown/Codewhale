@@ -236,16 +236,24 @@ visible, or set `[tui].status_items` in `config.toml`. Each key owns exactly
 one thing on screen: `mode` is the posture bar's plan/act/operate chip, and
 `model`, `context_percent`, `cost`, `balance` (prepaid providers only:
 DeepSeek, DeepSeekCN, OpenRouter, SiliconFlow), `cache`, `tokens` and
-`session_metrics` are segments of the metrics line below it. Omit
+`session_metrics`, `workspace` and `git_branch` are segments of the metrics line below it. Omit
 `status_items` to keep the built-in default; set it to `[]` to strip the
 metrics line down to the help hint.
+
+`workspace` and `git_branch` are opt-in. The workspace chip shows the folder
+name; linked worktrees include its parent to distinguish repeated names. The
+branch chip shows the current branch or a short detached HEAD SHA, with `(wt)`
+for linked worktrees. Both keep the last 24 display columns when long. Git
+metadata refreshes in the background on the existing 15-second cadence and
+when a refresh is requested; unavailable Git data removes the branch chip.
+These identify the active session workspace. The full path remains in `/status`.
 
 `context_percent` is on by default and shows `ctx NN%` at every fullness —
 0.9.12 went silent below 50% and left most of a session with no context
 signal at all. The reading keeps its warning colour from 80% up.
 
 The keys `status`, `agents`, `reasoning_replay`, `prefix_stability`,
-`git_branch`, `last_tool_elapsed` and `rate_limit` were retired in 0.9.13:
+`last_tool_elapsed` and `rate_limit` were retired in 0.9.13:
 they drove nothing. Old configuration files still load — the retired keys are
 ignored with a warning in the log.
 
@@ -328,9 +336,11 @@ Act mode is the default for most contribution work. It lets Codewhale read,
 run checks, and edit files while keeping risky actions behind approval gates.
 
 Operate keeps that direct tool surface and its approval, sandbox, shell,
-ask-rule, and repository protections. Its difference is orchestration emphasis:
-Codewhale prefers fleet workers for independent, parallel, background, or
-long-running work, while small or tightly coupled work can remain in the parent.
+ask-rule, and repository protections. Small or tightly coupled work stays
+direct. Multi-step delegation uses a compact Workflow plan with dependencies,
+bounded scopes, and completion evidence passed between steps. Fleet configures
+and manages those same sub-agents and their roles. One bounded, independent
+task can use a direct agent; continued work reuses it through `followup`.
 Heavy work can also be proposed to a Daytona cloud agent with `codewhale
 dispatch` or `/dispatch` (explicit confirmation; remotes are `github` / `cnb` /
 `gitee`). See [DAYTONA_CLOUD_DISPATCH.md](DAYTONA_CLOUD_DISPATCH.md).
@@ -397,8 +407,8 @@ walks through fleet task specs, monitoring, and Workflow authoring.
 Fleet is the public noun for the durable roster. `codewhale fleet …` is
 the command and `/fleet` the slash command. The Fleet name is
 shared by what has to stay stable across versions: the durable ledger
-`.codewhale/fleet.jsonl`, saved rosters `fleets/<name>.toml`, the `[fleet]` and
-`[fleets.*]` config tables, and the `codewhale workflow run --fleet` flag.
+`.codewhale/fleet.jsonl`, saved rosters `fleets/<name>.toml`, the `[fleet]`
+config table, and the `codewhale workflow run --fleet` flag.
 
 Use `/model auto` when you want Codewhale to choose the model and thinking
 level per turn. When the DeepSeek routing model is available, Auto may select
@@ -719,6 +729,12 @@ available. A dropped connection keeps local input locked until the last web
 lease expires so two controllers never race. Every folder you enroll from one
 terminal shares a single stable device id, so the web app lists one computer
 per machine rather than one per session.
+
+> Note (2026-09-14): the hosted web app at app.codewhale.net sunsets in phases
+> under the 2026-09-14 product-client decision; the native GPUI desktop app
+> (private `codehwhale-gpui` repo, phase map in `docs/TRANSITION.md`) is the
+> successor surface. `/rc` keeps working against the web app while it remains
+> live.
 
 ### What should I do when the model gets confused?
 

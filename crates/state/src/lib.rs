@@ -825,34 +825,6 @@ impl StateStore {
         Ok(())
     }
 
-    /// Set the memory mode for a thread.
-    ///
-    /// Pass `None` to clear the memory mode.
-    pub fn set_thread_memory_mode(&self, id: &str, mode: Option<&str>) -> Result<()> {
-        let conn = self.conn()?;
-        conn.execute(
-            "UPDATE threads SET memory_mode = ?2 WHERE id = ?1",
-            params![id, mode],
-        )
-        .context("failed to update thread memory mode")?;
-        Ok(())
-    }
-
-    /// Get the memory mode configured for a thread.
-    ///
-    /// Returns `None` if the thread does not exist or has no memory mode set.
-    pub fn get_thread_memory_mode(&self, id: &str) -> Result<Option<String>> {
-        let conn = self.conn()?;
-        conn.query_row(
-            "SELECT memory_mode FROM threads WHERE id = ?1",
-            params![id],
-            |row| row.get::<_, Option<String>>(0),
-        )
-        .optional()
-        .context("failed to read thread memory mode")
-        .map(Option::flatten)
-    }
-
     /// Insert or replace the persisted goal for a thread.
     pub fn upsert_thread_goal(&self, goal: &ThreadGoalRecord) -> Result<()> {
         codewhale_protocol::validate_goal_stall_state(
@@ -1532,32 +1504,6 @@ impl StateStore {
         Ok(())
     }
 
-    /// Retrieve a single job by its ID.
-    ///
-    /// Returns `None` if no job with the given ID exists.
-    pub fn get_job(&self, id: &str) -> Result<Option<JobStateRecord>> {
-        let conn = self.conn()?;
-        conn.query_row(
-            "SELECT id, name, status, progress, detail, created_at, updated_at FROM jobs WHERE id = ?1",
-            params![id],
-            |row| {
-                let status_raw: String = row.get(2)?;
-                let progress: Option<i64> = row.get(3)?;
-                Ok(JobStateRecord {
-                    id: row.get(0)?,
-                    name: row.get(1)?,
-                    status: job_state_status_from_str(&status_raw),
-                    progress: progress.and_then(|v| u8::try_from(v).ok()),
-                    detail: row.get(4)?,
-                    created_at: row.get(5)?,
-                    updated_at: row.get(6)?,
-                })
-            },
-        )
-        .optional()
-        .with_context(|| format!("failed to read job {id}"))
-    }
-
     /// List jobs ordered by most recently updated.
     ///
     /// The `limit` parameter caps the number of results and defaults to 100.
@@ -1587,14 +1533,6 @@ impl StateStore {
             });
         }
         Ok(out)
-    }
-
-    /// Permanently delete a job record.
-    pub fn delete_job(&self, id: &str) -> Result<()> {
-        let conn = self.conn()?;
-        conn.execute("DELETE FROM jobs WHERE id = ?1", params![id])
-            .with_context(|| format!("failed to delete job {id}"))?;
-        Ok(())
     }
 
     /// Look up the rollout file path for a thread by its ID.

@@ -606,12 +606,12 @@ pub struct ToolExecutionState {
     /// Whether to allow paths outside workspace
     pub trust_mode: bool,
     /// Current sandbox policy
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     pub sandbox_policy: SandboxPolicy,
     /// Path for notes file
     pub notes_path: PathBuf,
     /// MCP configuration path
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     pub mcp_config_path: PathBuf,
     /// Explicit skills directory used for model-visible skill discovery.
     pub skills_dir: Option<PathBuf>,
@@ -748,7 +748,6 @@ impl ToolContext {
     }
 
     /// Create a `ToolContext` with all settings specified.
-    #[allow(dead_code)]
     pub fn with_options(
         workspace: impl Into<PathBuf>,
         trust_mode: bool,
@@ -936,7 +935,6 @@ impl ToolContext {
 
     /// Attach an external sandbox backend for remote shell execution.
     #[must_use]
-    #[allow(dead_code)]
     pub fn with_sandbox_backend(mut self, backend: std::sync::Arc<dyn SandboxBackend>) -> Self {
         self.sandbox_backend = Some(backend);
         self
@@ -964,7 +962,7 @@ impl ToolContext {
     /// Attach an LSP manager so that edit tools can auto-inject diagnostics
     /// into their results after a successful file modification (#428).
     #[must_use]
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn with_lsp_manager(mut self, manager: Arc<LspManager>) -> Self {
         self.lsp_manager = Some(manager);
         self
@@ -1134,6 +1132,24 @@ impl ToolContext {
         self.resolve_nonexistent_path(candidate, &workspace_canonical)
     }
 
+    /// Resolve `raw` against the workspace and require an existing directory.
+    ///
+    /// Tools that scope execution to a subdirectory (Run `cwd`) resolve
+    /// through here so containment, existence, and the refusal wording have
+    /// one owner. A workspace escape keeps the typed `PathEscape`; a missing
+    /// or non-directory path names the fallback (drop the field to run in
+    /// the workspace root).
+    pub fn resolve_existing_dir(&self, raw: &str, field: &str) -> Result<PathBuf, ToolError> {
+        let resolved = self.resolve_path(raw)?;
+        if resolved.is_dir() {
+            Ok(resolved)
+        } else {
+            Err(ToolError::invalid_input(format!(
+                "{field} '{raw}' is not an existing directory inside the workspace; drop `{field}` to run in the workspace root"
+            )))
+        }
+    }
+
     /// Resolve a non-existent path by canonicalizing its deepest existing
     /// ancestor and validating the result is under the workspace or a
     /// trusted external path.
@@ -1207,7 +1223,7 @@ impl ToolContext {
     }
 
     /// Set the trust mode.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn with_trust_mode(mut self, trust: bool) -> Self {
         self.trust_mode = trust;
         self
@@ -1443,7 +1459,7 @@ pub trait ToolSpec: Send + Sync {
     }
 
     /// Returns whether this tool is sandboxable.
-    #[allow(dead_code)]
+    #[cfg(test)]
     fn is_sandboxable(&self) -> bool {
         self.capabilities().contains(&ToolCapability::Sandboxable)
     }

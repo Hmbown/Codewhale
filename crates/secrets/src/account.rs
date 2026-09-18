@@ -17,13 +17,6 @@ use crate::{Secrets, SecretsError};
 pub const DEFAULT_ACCOUNT_API_BASE: &str = "https://api.codewhale.net";
 /// Environment variable that selects the account API origin.
 pub const ACCOUNT_API_BASE_ENV: &str = "CODEWHALE_CLOUD_API_BASE";
-/// Former opt-in for the local file session store. The file store is now the
-/// automatic fallback (codex-style); the variable is accepted but ignored.
-#[deprecated(
-    since = "0.9.11",
-    note = "the file session store is the automatic fallback; this variable is ignored"
-)]
-pub const ACCOUNT_ALLOW_FILE_SESSION_STORE_ENV: &str = "CODEWHALE_CLOUD_ALLOW_FILE_SESSION_STORE";
 /// OS credential-manager service shared by CLI, TUI, and Runtime API.
 pub const ACCOUNT_KEYRING_SERVICE: &str = "codewhale-cloud";
 /// Current serialized account-session record version.
@@ -434,7 +427,6 @@ mod tests {
         let home = dir.path().join("codewhale-home");
         std::fs::create_dir_all(&home).expect("home");
         unsafe { std::env::set_var("CODEWHALE_HOME", &home) };
-        unsafe { std::env::remove_var("CODEWHALE_CLOUD_ALLOW_FILE_SESSION_STORE") };
         unsafe { std::env::remove_var("CODEWHALE_SECRET_BACKEND") };
         unsafe { std::env::remove_var("DEEPSEEK_SECRET_BACKEND") };
         let secrets =

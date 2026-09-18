@@ -15,13 +15,13 @@ anyhow.workspace = true
 chrono.workspace = true
 serde.workspace = true
 thiserror.workspace = true
-codewhale-config = { path = "../config", version = "0.9.13" }
-codewhale-execpolicy = { path = "../execpolicy", version = "0.9.13" }
-codewhale-hooks = { path = "../hooks", version = "0.9.13" }
-codewhale-mcp = { path = "../mcp", version = "0.9.13" }
-codewhale-protocol = { path = "../protocol", version = "0.9.13" }
-codewhale-state = { path = "../state", version = "0.9.13" }
-codewhale-tools = { path = "../tools", version = "0.9.13" }
+codewhale-config = { path = "../config", version = "0.9.14" }
+codewhale-execpolicy = { path = "../execpolicy", version = "0.9.14" }
+codewhale-hooks = { path = "../hooks", version = "0.9.14" }
+codewhale-mcp = { path = "../mcp", version = "0.9.14" }
+codewhale-protocol = { path = "../protocol", version = "0.9.14" }
+codewhale-state = { path = "../state", version = "0.9.14" }
+codewhale-tools = { path = "../tools", version = "0.9.14" }
 regex = "1.11"
 sha2.workspace = true
 serde_json = { workspace = true, features = ["preserve_order"] }

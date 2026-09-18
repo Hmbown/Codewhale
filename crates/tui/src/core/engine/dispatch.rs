@@ -41,16 +41,27 @@ pub(super) struct ToolExecOutcome {
     pub(super) original_content_digest: Option<[u8; 32]>,
 }
 
+/// Notice appended as a user-role message when the guard first asks the worker
+/// to change strategy after repeated no-progress denials (#6015).
+pub(crate) const FLEET_STRATEGY_SWITCH_NOTICE: &str = "Fleet strategy switch required: repeated permission denials produced no new evidence. The rejected action is held. Use another permitted tool from the current catalog to make progress, or report completed work and the blocker. Do not work around permissions or request the same approval again.";
+
+/// Notice appended when denials continue past the strategy switch: the next
+/// response is report-only and its tool calls are admission-held (#6015).
+pub(crate) const FLEET_FINAL_REPORT_NOTICE: &str = "Fleet no-progress final report: permission denials continued after the strategy switch without new evidence. Your next response is report-only; no tools will execute. Report what you completed, exact evidence, the permission blocker and remaining work. This is the last response unless the user changes direction or authority.";
+
+/// Terminal reason once the report-only response has been recorded (#6015).
+pub(crate) const FLEET_NO_PROGRESS_STOP: &str = "Fleet worker stopped after repeated permission denials without new evidence. Work and tool results are retained in the transcript; review the blocker before resuming.";
+
 /// Progress observations for one provider response, independent of tool finish
 /// order. Only typed permission denials contribute to the retry guard (#6015).
 #[derive(Default)]
-pub(super) struct FleetDenialBatch {
+pub(crate) struct FleetDenialBatch {
     denied: std::collections::HashSet<String>,
     made_progress: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum FleetDenialAction {
+pub(crate) enum FleetDenialAction {
     Continue,
     SwitchStrategy,
     FinalReport,
@@ -60,8 +71,9 @@ pub(super) enum FleetDenialAction {
 /// admission predicate and result accumulator, not another execution loop.
 /// Three responses give the model two opportunities to use denial feedback;
 /// after one strategy notice, three more denied responses request a report.
+/// Fleet sub-agent workers run the same guard in their own loop (#6015).
 #[derive(Default)]
-pub(super) struct FleetDenialGuard {
+pub(crate) struct FleetDenialGuard {
     denied_rounds: std::collections::HashMap<String, u8>,
     switch_requested: bool,
     recovery_denied_rounds: u8,
@@ -78,15 +90,15 @@ impl FleetDenialGuard {
     const REPEATED_DENIAL_ROUNDS: u8 = 3;
     const MAX_OBSERVATIONS: usize = 32;
 
-    pub(super) fn reset(&mut self) {
+    pub(crate) fn reset(&mut self) {
         *self = Self::default();
     }
 
-    pub(super) fn report_only(&self) -> bool {
+    pub(crate) fn report_only(&self) -> bool {
         self.report_only
     }
 
-    pub(super) fn awaiting_strategy_change(&self) -> bool {
+    pub(crate) fn awaiting_strategy_change(&self) -> bool {
         self.switch_requested
     }
 
@@ -94,7 +106,7 @@ impl FleetDenialGuard {
         self.denial_rounds_without_progress
     }
 
-    pub(super) fn original_content_digest(
+    pub(crate) fn original_content_digest(
         name: &str,
         input: &serde_json::Value,
         output: &ToolResult,
@@ -109,7 +121,7 @@ impl FleetDenialGuard {
         .then(|| Sha256::digest(output.content.as_bytes()).into())
     }
 
-    pub(super) fn admission_error(
+    pub(crate) fn admission_error(
         &self,
         name: &str,
         input: &serde_json::Value,
@@ -128,7 +140,7 @@ impl FleetDenialGuard {
         }
     }
 
-    pub(super) fn observe(
+    pub(crate) fn observe(
         &mut self,
         batch: &mut FleetDenialBatch,
         name: &str,
@@ -214,7 +226,7 @@ impl FleetDenialGuard {
         }
     }
 
-    pub(super) fn finish_batch(&mut self, batch: FleetDenialBatch) -> FleetDenialAction {
+    pub(crate) fn finish_batch(&mut self, batch: FleetDenialBatch) -> FleetDenialAction {
         if self.report_only {
             return FleetDenialAction::Continue;
         }

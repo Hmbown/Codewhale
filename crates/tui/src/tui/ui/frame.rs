@@ -33,6 +33,30 @@ pub(crate) fn session_cost_label(app: &App) -> String {
     .unwrap_or_default()
 }
 
+/// The clock-dependent billing tier of the active route, when the route has
+/// one: DeepSeek's V4 Pro/Flash and Flash halve their rates off-peak. `None`
+/// for flat-priced routes, for other vendors, and while auto routing has not
+/// pinned a concrete model.
+pub(crate) fn billing_tier_label(app: &App, now: chrono::DateTime<chrono::Utc>) -> Option<String> {
+    use crate::config::ApiProvider;
+    use codewhale_localization::{MessageId, tr};
+    if app.auto_model
+        || !matches!(
+            app.api_provider.catalog_identity(),
+            ApiProvider::Deepseek | ApiProvider::DeepseekCN
+        )
+    {
+        return None;
+    }
+    let peak = crate::pricing::deepseek_time_tier(&app.model, now)?;
+    let id = if peak {
+        MessageId::InfoLinePeak
+    } else {
+        MessageId::InfoLineOffPeak
+    };
+    Some(tr(app.ui_locale, id).into_owned())
+}
+
 /// Output tokens for the metrics line: the live stream's running estimate,
 /// else the last turn's provider receipt. Request throughput is independently
 /// sourced from SessionMetrics, so a long tool call cannot lower that rate.
@@ -65,6 +89,49 @@ pub(crate) fn info_segments(app: &App, width: u16) -> Vec<InfoSegment> {
     let mut segments = Vec::new();
     let tier = crate::tui::underwater::ShellTier::for_chrome_width(width);
     let shows = |item: StatusItem| app.status_items.contains(&item);
+
+    // Where this session writes (#6112): the workspace leaf and the branch
+    // the next commit lands on. Both read cached state only — the branch
+    // comes from `app.workspace_context`, refreshed off the render path on
+    // the workspace-context TTL, so neither chip costs IO per frame. They
+    // lead the row: identity of place before identity of route. The branch
+    // chip degrades to absent outside a repository rather than printing a
+    // permanent dash.
+    if shows(StatusItem::Workspace) {
+        let name = crate::tui::workspace_context::status_workspace_name(
+            &app.workspace,
+            app.workspace_is_linked_worktree,
+        );
+        segments.push(InfoSegment::new(
+            InfoSegmentId::Workspace,
+            "",
+            crate::tui::workspace_context::truncate_left(
+                &name,
+                crate::tui::workspace_context::STATUS_CHIP_MAX_WIDTH,
+            ),
+            ChromeInk::MetadataValue,
+        ));
+    }
+    if shows(StatusItem::GitBranch)
+        && let Some(branch) = app
+            .workspace_context
+            .as_deref()
+            .and_then(crate::tui::workspace_context::branch_from_context)
+    {
+        segments.push(InfoSegment::new(
+            InfoSegmentId::GitBranch,
+            "",
+            crate::tui::workspace_context::truncate_left(
+                &if app.workspace_is_linked_worktree {
+                    format!("{branch} (wt)")
+                } else {
+                    branch.to_string()
+                },
+                crate::tui::workspace_context::STATUS_CHIP_MAX_WIDTH,
+            ),
+            ChromeInk::MetadataValue,
+        ));
+    }
 
     // Route identity — the old identity band's fact, same shed discipline:
     // provider first, then effort, whole names or none. When no model is
@@ -164,6 +231,21 @@ pub(crate) fn info_segments(app: &App, width: u16) -> Vec<InfoSegment> {
             InfoSegmentId::Cost,
             "",
             cost,
+            ChromeInk::MetadataValue,
+        ));
+    }
+
+    // DeepSeek bills by the clock: the same flag that halves the rates
+    // off-peak is painted beside the cost, so the operator can see which tier
+    // the next turn buys without opening /cost. Gated on the cost item, whose
+    // owner asked for price readings by name.
+    if shows(StatusItem::Cost)
+        && let Some(tier) = billing_tier_label(app, chrono::Utc::now())
+    {
+        segments.push(InfoSegment::new(
+            InfoSegmentId::BillingTier,
+            "",
+            tier,
             ChromeInk::MetadataValue,
         ));
     }
@@ -353,7 +435,12 @@ fn render_info_row(
     }
     let mut segments = info_segments(app, area.width);
     if identity_only {
-        segments.retain(|segment| segment.id == InfoSegmentId::Model);
+        segments.retain(|segment| {
+            matches!(
+                segment.id,
+                InfoSegmentId::Model | InfoSegmentId::Workspace | InfoSegmentId::GitBranch
+            )
+        });
     }
     let hovered = app.last_mouse_pos.and_then(|(mx, my)| {
         app.viewport
@@ -750,7 +837,6 @@ pub(crate) async fn build_preview_request_inputs(
         reasoning_effort: app.reasoning_effort,
         mode: app.mode,
         content: &content,
-        display_text: &prompt,
         auto_router_context: &auto_router::recent_auto_router_context(&app.api_messages),
         should_auto_resolve: false,
         allow_auto_router_response_cache: false,
@@ -848,7 +934,6 @@ pub(crate) fn build_engine_config(app: &App, config: &Config) -> EngineConfig {
             },
         ),
         max_spawn_depth: config.subagent_max_spawn_depth_for_provider(provider),
-        subagent_token_budget: config.subagent_token_budget_for_provider(provider),
         allowed_tools: app.active_allowed_tools.clone(),
         disallowed_tools: None,
         max_tool_calls: None,
@@ -898,6 +983,7 @@ pub(crate) fn build_engine_config(app: &App, config: &Config) -> EngineConfig {
         goal_status: app.goal.status,
         goal_max_continuations: config.goal_max_continuations(),
         goal_continuation_delay_seconds: config.goal_continuation_delay_seconds(),
+        goal_enforce_token_budget: config.goal_enforce_token_budget(),
         reasoning_only_max_reprompts: config.reasoning_only_max_reprompts(),
         reasoning_only_reprompt_message: Some(config.reasoning_only_reprompt_message().to_string()),
         locale_tag: app.ui_locale.tag().to_string(),
@@ -942,6 +1028,13 @@ pub(crate) fn build_app_system_prompt_with_goal(
         &config.memory_path(),
         &app.workspace,
     );
+    // Keep the previewed/rebuilt prompt identical to the engine's: the
+    // recovery hint is part of the prefix when a prior workspace session
+    // ended mid-turn (#5715).
+    let recovery_hint = crate::session_manager::session_recovery_hint(
+        &app.workspace,
+        app.current_session_id.as_deref(),
+    );
     prompts::system_prompt_for_mode_with_context_skills_and_session(
         &app.workspace,
         None,
@@ -960,6 +1053,7 @@ pub(crate) fn build_app_system_prompt_with_goal(
                 app.active_route_limits,
             )),
             verbosity: app.verbosity.as_deref(),
+            recovery_hint: recovery_hint.as_deref(),
             skills_scan_codewhale_only: app.skills_scan_codewhale_only,
             plugin_registry: Some(app.plugin_registry.as_ref()),
             mode: app.mode,
@@ -967,6 +1061,11 @@ pub(crate) fn build_app_system_prompt_with_goal(
     )
 }
 
+/// Build the session snapshot every product caller queues into the
+/// persistence actor. Journal-only (#6214 T3): the `messages` projection is
+/// left empty because the queue drops it anyway, and serialization rehydrates
+/// it from the journal — the on-disk bytes are unchanged. Callers must not
+/// read `.messages` off the returned snapshot; save or serialize it.
 pub(crate) fn build_session_snapshot(
     app: &mut App,
     manager: &SessionManager,
@@ -979,7 +1078,7 @@ pub(crate) fn build_session_snapshot(
         })?,
     };
     let mut session = if let Some(existing_id) = app.current_session_id.as_ref() {
-        crate::session_manager::create_saved_session_with_id_mode_and_stamps(
+        crate::session_manager::create_saved_session_journal_only(
             existing_id.clone(),
             &app.api_messages,
             &app.api_message_stamps,
@@ -990,7 +1089,7 @@ pub(crate) fn build_session_snapshot(
             Some(app.mode.as_setting()),
         )
     } else {
-        crate::session_manager::create_saved_session_with_id_mode_and_stamps(
+        crate::session_manager::create_saved_session_journal_only(
             uuid::Uuid::new_v4().to_string(),
             &app.api_messages,
             &app.api_message_stamps,
@@ -1182,16 +1281,24 @@ pub(crate) fn commit_streaming_display_tick(
         return false;
     }
 
+    // Reveal a bounded slice per beat rather than everything received. The
+    // budget is sized from the beat and the backlog, so the displayed pace is a
+    // function of the clock instead of the provider's chunking.
+    let interval = stream_display_clock.interval();
     let mut updated = false;
     if let Some(index) = app.streaming_message_index {
-        let committed = app.streaming_state.commit_text(0);
+        let budget =
+            crate::tui::streaming::reveal_budget(interval, app.streaming_state.pending_len(0));
+        let committed = app.streaming_state.commit_text(0, budget);
         if !committed.is_empty() {
             append_streaming_text(app, index, &committed);
             accrue_streaming_token_estimate(app, &committed);
             updated = true;
         }
     } else if let Some(entry_idx) = app.streaming_thinking_active_entry {
-        let committed = app.streaming_state.commit_text(0);
+        let budget =
+            crate::tui::streaming::reveal_budget(interval, app.streaming_state.pending_len(0));
+        let committed = app.streaming_state.commit_text(0, budget);
         if !committed.is_empty() {
             if app.translation_enabled {
                 streaming_thinking::set_placeholder(app, entry_idx);
@@ -1262,13 +1369,11 @@ pub(crate) fn live_tool_content_is_receipt(content: &str) -> bool {
 
 /// Build the pending-input preview widget from current `App` state.
 ///
-/// v0.6.6 (#122) wires all three buckets:
+/// v0.6.6 (#122) wires the live buckets:
 /// - `pending_steers` — typed during a running turn + Esc; held until the
 ///   abort lands and gets resubmitted as a fresh merged turn.
-/// - `rejected_steers` — engine declined a mid-turn steer (scaffolding;
-///   no engine path produces these yet but the bucket renders with a distinct
-///   rejected-steer label).
-/// - `queued_messages` — Enter while busy; drained at end-of-turn. In Operate,
+/// - `queued_messages` — Enter while busy; drained at end-of-turn. An
+///   unaccepted steer also lands here (#6297) so it is never lost. In Operate,
 ///   the foreground operator dispatches these as additional background tasks.
 pub(crate) fn build_pending_input_preview(app: &App) -> PendingInputPreview {
     let mut preview = PendingInputPreview::new();
@@ -1295,12 +1400,15 @@ pub(crate) fn build_pending_input_preview(app: &App) -> PendingInputPreview {
             }
         })
         .collect();
+    // #6190: a steer the engine has not recorded yet is exactly what this
+    // bucket's "sending into turn" label describes, so it shares it rather
+    // than growing a fourth bucket and a fifteenth locale string.
     preview.pending_steers = app
         .pending_steers
         .iter()
+        .chain(app.inflight_steers.iter().map(|steer| &steer.message))
         .map(|m| m.display.clone())
         .collect();
-    preview.rejected_steers = app.rejected_steers.iter().cloned().collect();
     preview.queued_messages = app
         .queued_messages
         .iter()
@@ -1321,6 +1429,7 @@ pub(crate) fn render(f: &mut Frame, app: &mut App, _config: &Config) -> Option<(
     // Hover targets belong to the whole composed frame. Resetting inside the
     // transcript erased targets registered later by the composer and modals.
     crate::tui::hover_layer::begin_frame();
+    app.pet_watch.prepare_frame();
     let shell_area = session_shell_area(size);
     // Keep the view stack's focus-context texture prototype (#4823) in step
     // with the parsed setting each frame: a plain enum/theme copy, no
@@ -1365,6 +1474,10 @@ pub(crate) fn render(f: &mut Frame, app: &mut App, _config: &Config) -> Option<(
     // launch surface.
     if app.redaction_gate {
         crate::tui::redaction_gate::render(f, size, app);
+        return None;
+    }
+    if app.view_stack.top_kind() == Some(crate::tui::views::ModalKind::PetHabitat) {
+        crate::tui::pet_watch::render_full(f, app);
         return None;
     }
 
@@ -1934,6 +2047,7 @@ pub(crate) fn draw_app_frame_inner(
         }
         let mut cursor_pos = None;
         terminal.draw(|f| cursor_pos = render(f, app, config))?;
+        app.pet_watch.present(terminal.backend_mut())?;
         finish_frame_cursor(terminal, cursor_pos)?;
         Ok(())
     })();
@@ -2019,6 +2133,14 @@ pub(crate) fn transcript_scroll_percent(top: usize, visible: usize, total: usize
 }
 
 pub(crate) fn estimated_context_tokens(app: &App) -> Option<i64> {
+    // ONE estimator: this is `compaction::estimate_input_tokens_for_pressure`
+    // over the same message list (per-message cache, framing included) —
+    // deliberately not the 1.5x conservative variant. The meter, the >=80%
+    // depth warning, and the auto-compact gate must agree about where the
+    // threshold is: the inflated estimate used to show "ctx 82%" while the
+    // gate read ~55% and correctly refused to compact (#6297). The 1.5x
+    // inflation stays where it belongs — request-overflow protection
+    // (`estimate_input_tokens_conservative`).
     let message_count = app.api_messages.len();
     let mut cache = app.context_token_cache.borrow_mut();
     if cache.message_tokens.len() > message_count {
@@ -2036,13 +2158,7 @@ pub(crate) fn estimated_context_tokens(app: &App) -> Option<i64> {
         let last = message_count - 1;
         cache.message_tokens[last] = estimate_tokens(&app.api_messages[last..=last]);
     }
-    let message_tokens = cache
-        .message_tokens
-        .iter()
-        .copied()
-        .sum::<usize>()
-        .saturating_mul(3)
-        .div_ceil(2);
+    let message_tokens = cache.message_tokens.iter().copied().sum::<usize>();
     let system_tokens =
         estimate_input_tokens_conservative(&[], app.system_prompt.as_ref()).saturating_sub(48);
     let estimated = message_tokens
@@ -2288,13 +2404,13 @@ mod tests {
         use codewhale_models::{ContentBlock, Message};
         let mut app =
             crate::test_support::test_app_with_options(crate::test_support::test_tui_options("."));
-        app.api_messages = vec![Message {
+        app.api_messages = std::sync::Arc::new(vec![Message {
             role: codewhale_models::Role::User,
             content: vec![ContentBlock::Text {
                 text: "context ".repeat(400),
                 cache_control: None,
             }],
-        }];
+        }]);
         let (used, _, _) =
             super::context_usage_snapshot(&app).expect("a conversation has a context reading");
         let window = (used as f64 * 100.0 / f64::from(pct)).round().max(1.0);
@@ -2477,6 +2593,56 @@ mod tests {
         );
     }
 
+    /// DeepSeek's clock-tiered routes show which tier the next turn buys,
+    /// beside the cost; flat routes and other vendors show nothing.
+    #[test]
+    fn deepseek_tiered_routes_paint_the_billing_tier_beside_the_cost() {
+        use crate::config::ApiProvider;
+        use chrono::TimeZone as _;
+        let mut app = app_with_context_percent(10);
+        app.auto_model = false;
+        app.api_provider = ApiProvider::Deepseek;
+        app.model = "deepseek-v4-flash".to_string();
+        // Wednesday 2026-09-16: 02:00Z is inside the 01:00-04:00 peak
+        // window, 12:00Z outside every window.
+        let peak = chrono::Utc.with_ymd_and_hms(2026, 9, 16, 2, 0, 0).unwrap();
+        let off = chrono::Utc.with_ymd_and_hms(2026, 9, 16, 12, 0, 0).unwrap();
+        assert_eq!(
+            super::billing_tier_label(&app, peak).as_deref(),
+            Some("peak")
+        );
+        assert_eq!(
+            super::billing_tier_label(&app, off).as_deref(),
+            Some("off-peak")
+        );
+        let ids: Vec<InfoSegmentId> = super::info_segments(&app, 200)
+            .iter()
+            .map(|segment| segment.id)
+            .collect();
+        assert!(ids.contains(&InfoSegmentId::BillingTier), "{ids:?}");
+        let row = metrics_row(&app, 200);
+        assert!(row.contains("peak"), "the tier reads in the row: {row:?}");
+
+        // A flat-priced DeepSeek model has no tier to show.
+        app.model = "deepseek-chat".to_string();
+        assert_eq!(super::billing_tier_label(&app, peak), None);
+        let ids: Vec<InfoSegmentId> = super::info_segments(&app, 200)
+            .iter()
+            .map(|segment| segment.id)
+            .collect();
+        assert!(!ids.contains(&InfoSegmentId::BillingTier), "{ids:?}");
+
+        // Another vendor serving a DeepSeek id is priced on its own terms.
+        app.model = "deepseek-v4-flash".to_string();
+        app.api_provider = ApiProvider::Openai;
+        assert_eq!(super::billing_tier_label(&app, peak), None);
+
+        // Auto routing has not pinned a model, so there is nothing to claim.
+        app.api_provider = ApiProvider::Deepseek;
+        app.auto_model = true;
+        assert_eq!(super::billing_tier_label(&app, peak), None);
+    }
+
     /// A provider switch must not hide missing historical coverage.
     #[test]
     fn cost_unknown_preserves_saved_coverage_across_route_changes() {
@@ -2591,6 +2757,7 @@ mod tests {
             granted_balance: String::new(),
         });
         app.status_items = StatusItem::all().to_vec();
+        app.workspace_context = Some("main | clean".to_string());
 
         let ids: Vec<InfoSegmentId> = super::info_segments(&app, 200)
             .iter()
@@ -2603,6 +2770,8 @@ mod tests {
             InfoSegmentId::Ttft,
             InfoSegmentId::Rate,
             InfoSegmentId::OutputTokens,
+            InfoSegmentId::Workspace,
+            InfoSegmentId::GitBranch,
         ] {
             assert!(ids.contains(&expected), "{expected:?} missing from {ids:?}");
         }
@@ -2612,6 +2781,78 @@ mod tests {
             super::info_segments(&app, 200).is_empty(),
             "an empty status list leaves the metrics line empty"
         );
+    }
+
+    #[test]
+    fn empty_session_keeps_opted_in_workspace_identity_visible() {
+        let mut app = app_with_context_percent(0);
+        app.workspace = std::path::PathBuf::from("/fixture/checkout");
+        app.workspace_context = Some("feature-6112 | clean".to_string());
+        app.status_items = vec![StatusItem::Workspace, StatusItem::GitBranch];
+        app.metrics_line = crate::config::ChromeRowPreset::Compact;
+        let backend = ratatui::backend::TestBackend::new(100, 1);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                super::render_info_row(frame, &mut app, area, true);
+            })
+            .unwrap();
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(rendered.contains("checkout"), "{rendered}");
+        assert!(rendered.contains("feature-6112"), "{rendered}");
+    }
+
+    /// #6112: the opt-in workspace and branch chips read cached state only —
+    /// the workspace path and the TTL-refreshed `workspace_context` string —
+    /// so neither costs IO per frame. Outside a repository the branch chip
+    /// degrades to absent rather than pinning a placeholder dash.
+    #[test]
+    fn workspace_and_git_branch_chips_follow_cached_workspace_context() {
+        let mut app = app_with_context_percent(60);
+        app.status_items = vec![StatusItem::Workspace, StatusItem::GitBranch];
+
+        let segments = super::info_segments(&app, 200);
+        let workspace = segments
+            .iter()
+            .find(|segment| segment.id == InfoSegmentId::Workspace)
+            .expect("workspace chip renders from the workspace path alone");
+        assert_eq!(
+            workspace.value,
+            crate::tui::workspace_context::workspace_basename(&app.workspace)
+        );
+        assert!(
+            segments
+                .iter()
+                .all(|segment| segment.id != InfoSegmentId::GitBranch),
+            "outside a repository the branch chip is absent"
+        );
+
+        // A detached HEAD reads in its recorded short-SHA form.
+        app.workspace_context = Some("detached:abc1234 | clean".to_string());
+        let branch = super::info_segments(&app, 200)
+            .into_iter()
+            .find(|segment| segment.id == InfoSegmentId::GitBranch)
+            .expect("branch chip renders from cached context");
+        assert_eq!(branch.value, "detached:abc1234");
+        app.workspace_is_linked_worktree = true;
+        let linked = super::info_segments(&app, 200)
+            .into_iter()
+            .find(|segment| segment.id == InfoSegmentId::GitBranch)
+            .unwrap();
+        assert_eq!(linked.value, "detached:abc1234 (wt)");
+        assert!(!StatusItem::default_footer().contains(&StatusItem::Workspace));
+        assert!(!StatusItem::default_footer().contains(&StatusItem::GitBranch));
+
+        // Off means off.
+        app.status_items = Vec::new();
+        assert!(super::info_segments(&app, 200).is_empty());
     }
 }
 

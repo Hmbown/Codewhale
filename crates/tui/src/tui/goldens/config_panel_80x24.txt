@@ -14,7 +14,7 @@
    Reasoning background highlight     On                        [x]  SAVED   │  
    Help Expand Groups                 Off                       [ ]  SAVED   │  
    Contextual tips                    On                        [x]  SAVED   │  
-  system | terminal | underwater | underwater-retro | dark | light |…           
+  system | terminal | shoreline | shoreline-light | underwater |…               
   Enter or click again: Enter opens choices · Theme: current terminal · saved   
   terminal · applies on save                                                    
   Preview: ▶▶ ask · agent                                                       

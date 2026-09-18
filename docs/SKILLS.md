@@ -195,7 +195,7 @@ Collision and prompt-budget invariants asserted today:
 | Canonical wins | A canonical bundled name always beats another skill's alias (`docx` → `docx`, never `documents`). |
 | Single alias owner | No two bundled skills may claim the same alias. |
 | No duplicate entries | Each canonical name renders at most one catalogue line; aliases render zero. |
-| Budget headroom | The shipped pack alone renders under `MAX_AVAILABLE_SKILLS_CHARS` (2 400 chars) with **no** "additional skills omitted" line, so user skills are never silently displaced. |
+| Budget headroom | The shipped pack alone renders under the window-scaled skills budget (25 600 chars at the default 128k window; 2 400-char floor) with **no** "additional skills omitted" line, so user skills are never silently displaced. |
 | No context poisoning | Descriptions stay single-line and are truncated to `MAX_SKILL_DESCRIPTION_CHARS` (280) before entering the prompt. |
 
 ### Locale-aware routing metadata

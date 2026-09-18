@@ -1,12 +1,10 @@
 pub mod agent_card;
-mod header;
 pub mod key_hint;
 pub mod pending_input_preview;
 mod renderable;
 pub mod tool_card;
 pub mod workflow_panel;
 
-pub use header::header_status_indicator_frame;
 pub use renderable::Renderable;
 
 use std::borrow::Cow;
@@ -201,14 +199,14 @@ impl ChatWidget {
         // The completion breath is authored decorative motion, so it rides the
         // same motion gate as everything else in the water. Both the column's
         // settle flourish and ambient life's presence read this one clock:
-        // presence needs the settle tail past the breath, the column does not.
+        // the pet needs the settle tail too; the column clips only its light pulse.
         let completion_life_clock = (underwater_atmosphere
             && app.motion_policy().allows_decorative())
         .then_some(())
         .and(app.ocean_completion_started_at)
         .map(|started| started.elapsed().as_millis());
         let completion_elapsed_ms = completion_life_clock
-            .filter(|elapsed| *elapsed < crate::tui::ocean::COMPLETION_BREATH_MS);
+            .filter(|elapsed| *elapsed < crate::tui::ocean::COMPLETION_SETTLE_MS);
         let completion_life_active = completion_life_clock
             .is_some_and(|elapsed| elapsed < crate::tui::ocean::COMPLETION_SETTLE_MS);
         let render_empty_state = should_render_empty_state(app);
@@ -3118,7 +3116,7 @@ pub struct ElevationWidget<'a> {
 }
 
 impl<'a> ElevationWidget<'a> {
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     pub fn new(request: &'a ElevationRequest, selected: usize, locale: Locale) -> Self {
         Self {
             request,
@@ -7278,6 +7276,34 @@ mod tests {
             widget.life_presence_fixed > 0,
             "full motion should still get the completion breath"
         );
+    }
+
+    #[test]
+    fn dot_whale_gets_the_motion_gated_completion_settle_clock() {
+        let mut app = create_test_app();
+        app.low_motion = false;
+        app.fancy_animations = true;
+        app.ocean_completion_started_at =
+            Some(Instant::now() - std::time::Duration::from_millis(900));
+        let widget = ChatWidget::new(&mut app, Rect::new(0, 0, 100, 24));
+        let age = widget
+            .ocean_column
+            .and_then(|column| column.completion_elapsed_ms());
+        assert!(
+            age.is_some_and(|age| (800..1_400).contains(&age)),
+            "{age:?}"
+        );
+        assert!(widget.life_presence_fixed > 0 && widget.life_presence_fixed < 1_000);
+
+        app.low_motion = true;
+        let still = ChatWidget::new(&mut app, Rect::new(0, 0, 100, 24));
+        assert_eq!(
+            still
+                .ocean_column
+                .and_then(|column| column.completion_elapsed_ms()),
+            None
+        );
+        assert_eq!(still.life_presence_fixed, 0);
     }
 
     #[test]

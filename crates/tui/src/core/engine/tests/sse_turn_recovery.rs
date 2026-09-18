@@ -184,7 +184,7 @@ async fn finish_turn(handle: &EngineHandle, events: &mut Vec<Event>) {
 
 async fn send_user(handle: &EngineHandle, config: &Config, content: &str) {
     let mut op = external_user_message_op(content, AppMode::Agent, config);
-    if let Op::SendMessage { allow_shell, .. } = &mut op {
+    if let Op::SendMessage(TurnSpec { allow_shell, .. }) = &mut op {
         *allow_shell = false;
     }
     tokio::time::timeout(CONTROL_TIMEOUT, handle.send(op))

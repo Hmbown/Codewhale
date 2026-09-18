@@ -38,8 +38,9 @@ use codewhale_config::{
 };
 
 use super::profile::{
-    AgentProfile, load_agent_profiles_from_dir_tolerant, load_plugin_agent_profiles_from_component,
-    load_workspace_agent_profiles_tolerant, personal_agent_profile_dir,
+    AgentProfile, AgentProfileLoadIssue, load_agent_profiles_from_dir_tolerant,
+    load_plugin_agent_profiles_from_component, load_workspace_agent_profiles_tolerant,
+    personal_agent_profile_dir,
 };
 
 /// Which layer a roster member came from. Higher layers override lower ones
@@ -84,6 +85,7 @@ pub struct FleetRoster {
     /// An explicitly selected v2 Fleet could not be loaded. Consumers retain
     /// this error instead of silently substituting the legacy roster.
     load_error: Option<String>,
+    profile_load_issues: Vec<AgentProfileLoadIssue>,
 }
 
 /// A lower-precedence profile displaced by a higher layer for the same id.
@@ -157,6 +159,7 @@ impl FleetRoster {
             exact_selection: false,
             shadowed: Vec::new(),
             load_error: None,
+            profile_load_issues: Vec::new(),
         }
     }
 
@@ -172,6 +175,7 @@ impl FleetRoster {
             exact_selection: true,
             shadowed: Vec::new(),
             load_error: None,
+            profile_load_issues: Vec::new(),
         }
     }
 
@@ -185,6 +189,7 @@ impl FleetRoster {
             exact_selection: true,
             shadowed: Vec::new(),
             load_error: Some(error.into()),
+            profile_load_issues: Vec::new(),
         }
     }
 
@@ -248,6 +253,7 @@ impl FleetRoster {
         let mut built_ins = Self::built_in_members();
         let mut extras: Vec<AgentProfile> = Vec::new();
         let mut shadowed: Vec<ShadowedProfile> = Vec::new();
+        let mut profile_load_issues = Vec::new();
 
         if let Some(plugins) = plugins {
             let (sources, errors) = crate::plugins::runtime::active_component_sources(
@@ -260,12 +266,13 @@ impl FleetRoster {
             for source in sources {
                 match load_plugin_agent_profiles_from_component(&source.path, &source.authority) {
                     Ok((profiles, issues)) => {
-                        for issue in issues {
+                        for issue in &issues {
                             tracing::warn!(
                                 plugin = %source.plugin_name,
                                 "fleet roster: skipping invalid plugin Agent profile: {issue}"
                             );
                         }
+                        profile_load_issues.extend(issues);
                         for member in profiles {
                             record_shadow(
                                 merge_member(&mut built_ins, &mut extras, member),
@@ -304,11 +311,12 @@ impl FleetRoster {
         if let Some(personal_dir) = personal_dir {
             match load_agent_profiles_from_dir_tolerant(personal_dir, ProfileOrigin::Personal) {
                 Ok((profiles, issues)) => {
-                    for issue in issues {
+                    for issue in &issues {
                         tracing::warn!(
                             "fleet roster: skipping invalid personal agent profile: {issue}"
                         );
                     }
+                    profile_load_issues.extend(issues);
                     for member in profiles {
                         record_shadow(
                             merge_member(&mut built_ins, &mut extras, member),
@@ -328,12 +336,13 @@ impl FleetRoster {
         if include_workspace_profiles {
             match load_workspace_agent_profiles_tolerant(workspace) {
                 Ok((profiles, issues)) => {
-                    for issue in issues {
+                    for issue in &issues {
                         tracing::warn!(
                             workspace = %workspace.display(),
                             "fleet roster: skipping invalid workspace agent profile: {issue}"
                         );
                     }
+                    profile_load_issues.extend(issues);
                     for member in profiles {
                         record_shadow(
                             merge_member(&mut built_ins, &mut extras, member),
@@ -384,6 +393,7 @@ impl FleetRoster {
             exact_selection: false,
             shadowed,
             load_error: None,
+            profile_load_issues,
         }
     }
 
@@ -458,13 +468,6 @@ impl FleetRoster {
                 FleetSlot::Summarizer,
                 FleetLoadout::Inherit,
                 "Read-only synthesis: merge findings into one coherent report.",
-                None,
-            ),
-            (
-                "general",
-                FleetSlot::General,
-                FleetLoadout::Inherit,
-                "Legacy alias of the 'worker' posture: general-purpose worker with full capabilities.",
                 None,
             ),
             // The eight canonical dispatch postures are seeded roster members
@@ -544,6 +547,50 @@ impl FleetRoster {
     #[must_use]
     pub fn load_error(&self) -> Option<&str> {
         self.load_error.as_deref()
+    }
+
+    pub fn profile_load_issues(&self) -> &[AgentProfileLoadIssue] {
+        &self.profile_load_issues
+    }
+
+    /// A named broken override is not permission to use a built-in or an older
+    /// route. Other members remain usable, and a valid higher layer still wins.
+    pub fn resolve_member(
+        &self,
+        selector: &str,
+    ) -> Result<Option<&AgentProfile>, super::identity::FleetSelectorError> {
+        use super::identity::{
+            FleetSelectorError, bounded_identity_field, resolve_member_in_profiles,
+        };
+        let member = resolve_member_in_profiles(&self.members, selector)?;
+        let requested_id = selector
+            .trim()
+            .split_once(':')
+            .filter(|(kind, _)| matches!(kind.to_ascii_lowercase().as_str(), "member" | "id"))
+            .map_or(selector.trim(), |(_, id)| id.trim());
+        let issue = self
+            .profile_load_issues
+            .iter()
+            .filter(|issue| {
+                let same_id = issue.id.eq_ignore_ascii_case(requested_id)
+                    || member.is_some_and(|member| {
+                        super::role::public_role_label(&issue.id)
+                            .eq_ignore_ascii_case(&super::role::public_role_label(&member.id))
+                    });
+                same_id
+                    && member.is_none_or(|member| {
+                        origin_precedence(issue.origin) >= origin_precedence(member.origin)
+                    })
+            })
+            .max_by_key(|issue| origin_precedence(issue.origin));
+        if let Some(issue) = issue {
+            return Err(FleetSelectorError::Unavailable {
+                profile: bounded_identity_field(&issue.id),
+                origin: issue.origin.to_string(),
+                path: bounded_identity_field(&issue.source.to_string_lossy()),
+            });
+        }
+        Ok(member)
     }
 
     /// Whether this roster came from one explicitly selected v2 Fleet.
@@ -769,6 +816,52 @@ mod tests {
         std::fs::write(dir.join(filename), contents).unwrap();
     }
 
+    /// Removing the built-in `general` member must not make the name stop
+    /// resolving. #5888 deliberately kept `general` dispatchable because Agent
+    /// tool type tokens, saved configs and replayed transcripts name it; that
+    /// contract still holds, now through the selector rather than through a
+    /// second member — which is what lets the duplicate go (#6244).
+    #[test]
+    fn general_still_resolves_to_the_worker_member_without_its_own_built_in() {
+        use crate::fleet::identity::resolve_member_in_profiles;
+        let members = FleetRoster::built_in_members();
+        assert!(
+            !members.iter().any(|m| m.id == "general"),
+            "this test is only meaningful while `general` has no built-in member"
+        );
+        for selector in ["general", "member:general", "role:general", "default"] {
+            let resolved = resolve_member_in_profiles(&members, selector)
+                .unwrap_or_else(|error| panic!("`{selector}` must resolve, got {error:?}"))
+                .unwrap_or_else(|| panic!("`{selector}` resolved to no member"));
+            assert_eq!(
+                resolved.id, "worker",
+                "`{selector}` must land on the worker posture"
+            );
+        }
+    }
+
+    /// Two built-ins that collapse to the same canonical role make
+    /// `role:<name>` permanently unresolvable: the selector canonicalizes both
+    /// sides, matches both members, and raises `Ambiguous` forever. `general`
+    /// and `worker` both canonicalized to `general`, which is what blocked
+    /// plain agent spawns in production (#6244).
+    #[test]
+    fn built_in_members_have_one_member_per_canonical_role() {
+        use crate::fleet::role::public_role_label;
+        let mut seen: std::collections::BTreeMap<String, String> =
+            std::collections::BTreeMap::new();
+        for member in FleetRoster::built_in_members() {
+            let role = public_role_label(&member.profile.role.name).to_string();
+            if let Some(existing) = seen.insert(role.clone(), member.id.clone()) {
+                panic!(
+                    "built-ins `{existing}` and `{}` both canonicalize to role `{role}`; \
+                     a `role:{role}` selector can never resolve",
+                    member.id
+                );
+            }
+        }
+    }
+
     #[test]
     fn built_in_party_is_complete_with_floor_permissions() {
         let members = FleetRoster::built_in_members();
@@ -784,7 +877,6 @@ mod tests {
                 "verifier",
                 "consultant",
                 "synthesizer",
-                "general",
                 "worker",
                 "planner",
                 "custom"
@@ -898,7 +990,6 @@ mod tests {
                 "verifier",
                 "consultant",
                 "synthesizer",
-                "general",
                 "worker",
                 "planner",
                 "custom",
@@ -1080,6 +1171,91 @@ mod tests {
             ProfileOrigin::BuiltIn,
             "invalid legacy override must fall back to the safe built-in"
         );
+    }
+
+    #[test]
+    fn invalid_profile_selection_rejects_fallback_and_respects_layer_precedence() {
+        let root = TempDir::new().unwrap();
+        let personal = root.path().join("personal");
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir_all(&personal).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(
+            personal.join("scout.toml"),
+            "allow_shell = false\ntrust = false\n",
+        )
+        .unwrap();
+        let load = || {
+            FleetRoster::load_with_personal_dir(
+                &FleetConfigToml::default(),
+                &workspace,
+                Some(&personal),
+                true,
+            )
+        };
+        let roster = load();
+        for selector in [
+            "scout",
+            "SCOUT",
+            "member:scout",
+            "id:scout",
+            "explore",
+            "role:explore",
+        ] {
+            let error = roster.resolve_member(selector).unwrap_err().to_string();
+            assert!(
+                error.contains("invalid or unreadable"),
+                "{selector}: {error}"
+            );
+            assert!(error.contains("scout.toml"), "{error}");
+        }
+        assert!(roster.resolve_member("reviewer").unwrap().is_some());
+        assert!(roster.resolve_member("missing").unwrap().is_none());
+        write_workspace_profile(&workspace, "scout.toml", "model = \"deepseek-v4-pro\"\n");
+        let roster = load();
+        let winner = roster.resolve_member("scout").unwrap().unwrap();
+        assert_eq!(winner.origin, ProfileOrigin::Workspace);
+        assert_eq!(winner.profile.model.as_deref(), Some("deepseek-v4-pro"));
+        std::fs::write(
+            workspace.join(".codewhale/agents/scout.toml"),
+            "broken = [\n",
+        )
+        .unwrap();
+        assert!(load().resolve_member("scout").is_err());
+    }
+
+    #[test]
+    fn duplicate_and_renamed_invalid_profiles_keep_identity_without_parser_source() {
+        let root = TempDir::new().unwrap();
+        let dir = root.path().join("personal");
+        std::fs::create_dir_all(&dir).unwrap();
+        for file in ["first.toml", "second.toml"] {
+            std::fs::write(dir.join(file), "id = \"reviewer\"\n").unwrap();
+        }
+        std::fs::write(
+            dir.join("custom.toml"),
+            "id = \"renamed\"\nsecret = \"FIXTURE_SECRET_MUST_STAY_IN_LOG\"\n",
+        )
+        .unwrap();
+        let roster = FleetRoster::load_with_personal_dir(
+            &FleetConfigToml::default(),
+            root.path(),
+            Some(&dir),
+            false,
+        );
+        assert!(roster.resolve_member("reviewer").is_err());
+        assert!(
+            roster
+                .resolve_member("renamed")
+                .unwrap_err()
+                .to_string()
+                .contains("custom.toml")
+        );
+        assert_eq!(roster.profile_load_issues().len(), 3);
+        let serialized = serde_json::to_string(roster.profile_load_issues()).unwrap();
+        assert!(!serialized.contains("FIXTURE_SECRET_MUST_STAY_IN_LOG"));
+        assert!(!serialized.contains("detail"));
+        assert!(roster.resolve_member("scout").unwrap().is_some());
     }
 
     #[test]

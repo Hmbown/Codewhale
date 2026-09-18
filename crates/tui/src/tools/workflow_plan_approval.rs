@@ -184,7 +184,12 @@ pub fn analyze_workflow_plan_approval_with_config(
     let network = script_suggests_network(script);
     let worktree = script.contains("worktree") || script.contains("isolation");
     let token_budget = optional_u64(input, "token_budget");
-    let high_budget = token_budget.is_some_and(|b| b > config.default_token_budget);
+    // The card reports what the run will actually get: the caller's budget,
+    // else the configured default when one is set — 0 means none applies.
+    let effective_budget = token_budget
+        .filter(|b| *b > 0)
+        .or((config.default_token_budget > 0).then_some(config.default_token_budget));
+    let high_budget = is_high_budget(token_budget, config);
     // Unknown script authority: always elevated so the card is required.
     let elevated = true;
     let mut reasons = vec!["script_or_source".to_string()];
@@ -224,7 +229,7 @@ pub fn analyze_workflow_plan_approval_with_config(
         high_budget,
         broader_authority: false,
         token_budget,
-        budget_label: budget_label(token_budget, high_budget),
+        budget_label: budget_label(effective_budget, high_budget),
         elevated,
         reasons,
     }
@@ -432,7 +437,7 @@ fn analyze_plan_object(
         worktree = true;
     }
 
-    let high_budget = token_budget.is_some_and(|b| b > config.default_token_budget);
+    let high_budget = is_high_budget(token_budget, config);
     let mut reasons = Vec::new();
     if writes {
         reasons.push("writes".into());
@@ -709,11 +714,17 @@ fn optional_u64(value: &Value, key: &str) -> Option<u64> {
     value.get(key).and_then(Value::as_u64)
 }
 
+/// A budget is "high" only against a configured baseline; when
+/// `[workflow].default_token_budget` is 0 (the default) nothing is high.
+fn is_high_budget(token_budget: Option<u64>, config: &WorkflowConfigToml) -> bool {
+    config.default_token_budget > 0 && token_budget.is_some_and(|b| b > config.default_token_budget)
+}
+
 fn budget_label(token_budget: Option<u64>, high_budget: bool) -> String {
     match token_budget {
         Some(n) if high_budget => format!("{n} tokens (high)"),
         Some(n) => format!("{n} tokens"),
-        None => "default".to_string(),
+        None => "unbounded".to_string(),
     }
 }
 
@@ -934,12 +945,20 @@ mod tests {
                 "children": [{ "prompt": "scan", "type": "explore" }]
             }
         });
-        let summary = analyze_workflow_plan_approval(&input);
+        // With no configured baseline (the default) nothing is "high" — the
+        // flag only exists relative to an operator-set cap (#6189).
+        let uncapped = analyze_workflow_plan_approval(&input);
+        assert!(!uncapped.high_budget, "{uncapped:?}");
+        let config = WorkflowConfigToml {
+            default_token_budget: 120_000,
+            ..WorkflowConfigToml::default()
+        };
+        let summary = analyze_workflow_plan_approval_with_config(&input, &config);
         assert!(summary.high_budget, "{summary:?}");
         assert!(summary.elevated);
         assert!(summary.budget_label.contains("high"));
         assert_eq!(
-            workflow_approval_requirement_for(&input, &config()),
+            workflow_approval_requirement_for(&input, &config),
             ApprovalRequirement::Required
         );
     }

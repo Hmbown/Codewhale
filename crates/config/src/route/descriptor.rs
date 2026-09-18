@@ -165,7 +165,9 @@ impl TransportKind {
             ProviderKind::Antigravity => Self::Antigravity,
             ProviderKind::Ollama | ProviderKind::Vllm | ProviderKind::Sglang => Self::LocalRuntime,
             ProviderKind::Custom => Self::Custom,
-            ProviderKind::Deepseek | ProviderKind::OpencodeZen => Self::ModelAware,
+            ProviderKind::Deepseek | ProviderKind::OpencodeZen | ProviderKind::OpencodeGo => {
+                Self::ModelAware
+            }
             _ => match kind.provider().wire_policy() {
                 WirePolicy::ModelAware => Self::ModelAware,
                 WirePolicy::Fixed(crate::provider::WireFormat::Responses) => Self::OpenAiResponses,

@@ -13,14 +13,6 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SkillRootId(String);
 
-impl SkillRootId {
-    #[must_use]
-    #[allow(dead_code)] // consumed by audit/mutation in later #4651 stages
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
 impl std::fmt::Display for SkillRootId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.0)
@@ -42,7 +34,6 @@ pub enum CompatibleHarness {
 
 impl CompatibleHarness {
     #[must_use]
-    #[allow(dead_code)] // consumed by audit UI labels in later #4651 stages
     pub fn label(self) -> &'static str {
         match self {
             Self::Agents => "agents",
@@ -58,7 +49,6 @@ impl CompatibleHarness {
 
 /// Kind of skill root on disk (or logical source).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[allow(dead_code)] // BuiltIn / ReviewedPluginSnapshot used by later #4651 stages
 pub enum SkillRootKind {
     CodeWhaleProject,
     CodeWhaleGlobal,
@@ -66,20 +56,26 @@ pub enum SkillRootKind {
     CompatibleGlobal(CompatibleHarness),
     /// Explicitly configured `skills_dir` that is not one of the owned roots.
     Configured,
+    // Matched by the extensions UI + audit provenance, never constructed:
+    // no discovery path produces these roots yet (#4651 follow-up never came).
+    #[allow(dead_code)]
     BuiltIn,
+    #[allow(dead_code)]
     ReviewedPluginSnapshot,
     RegistryCache,
 }
 
 /// Whether CodeWhale may mutate files under this root.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[allow(dead_code)] // Immutable used by later #4651 stages
 pub enum SkillRootAccess {
     /// CodeWhale-owned project/global install targets.
     WritableOwned,
     /// Compatible harness roots and unclassified configured dirs — read only.
     ReadOnlyExternal,
     /// Built-in / reviewed plugin snapshot content.
+    // Never constructed: no discovery path assigns it yet (#4651 follow-up
+    // never came). Kept because the access taxonomy is meaningless without it.
+    #[allow(dead_code)]
     Immutable,
     /// Registry download cache — not an active install target.
     CacheOnly,
@@ -115,13 +111,6 @@ impl SkillRootDescriptor {
     #[must_use]
     pub fn is_writable_owned(&self) -> bool {
         self.access == SkillRootAccess::WritableOwned
-    }
-
-    /// Home-relative or workspace-relative path for UI / receipts.
-    #[must_use]
-    #[allow(dead_code)] // consumed by manager receipts in later #4651 stages
-    pub fn safe_display_path(&self, workspace: Option<&Path>, home: Option<&Path>) -> String {
-        safe_display_path(&self.path, workspace, home)
     }
 }
 
@@ -330,12 +319,6 @@ impl SkillRootCatalog {
         Self { roots }
     }
 
-    #[must_use]
-    #[allow(dead_code)] // consumed by audit scanners in later #4651 stages
-    pub fn roots(&self) -> &[SkillRootDescriptor] {
-        &self.roots
-    }
-
     /// Paths used by runtime discovery for the given mode (existing dirs only,
     /// first-wins order preserved). CodeWhale-only applies the workspace
     /// containment check for the project owned root.
@@ -396,7 +379,6 @@ impl SkillRootCatalog {
 
     /// Roots eligible for owned-only audit (writable owned roots that exist).
     #[must_use]
-    #[allow(dead_code)] // consumed by owned audit mode in later #4651 stages
     pub fn audit_owned_directories(&self) -> Vec<&SkillRootDescriptor> {
         self.roots
             .iter()

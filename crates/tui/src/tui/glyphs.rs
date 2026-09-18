@@ -137,6 +137,8 @@ mod tests {
             ("∿", "~"),
             ("⋯", "."),
             ("⏱", "@"),
+            ("🐳", "w"),
+            ("🐋", "w"),
         ] {
             assert_eq!(ascii_fallback(rich), Some(safe));
         }

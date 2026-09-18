@@ -602,11 +602,11 @@ mod recovery {
                 },
             )
             .await?;
-        let Some(Op::SendMessage {
+        let Some(Op::SendMessage(TurnSpec {
             route,
             max_output_tokens,
             ..
-        }) = harness.rx_op.recv().await
+        })) = harness.rx_op.recv().await
         else {
             panic!("SendMessage expected")
         };
@@ -1123,6 +1123,7 @@ fn sample_turn(thread_id: &str, turn_id: &str, status: RuntimeTurnStatus) -> Tur
         routing_settlement: false,
         effective_route_usage: None,
         permission_posture: None,
+        mode: None,
         effective_provider: None,
         effective_provider_id: None,
         effective_openrouter_vendor: None,
@@ -1591,7 +1592,7 @@ async fn root_custom_thread_and_turn_writers_omit_exact_id() -> Result<()> {
     assert_eq!(turn.effective_provider_id, None);
     assert!(!serde_json::to_string(&turn)?.contains("effective_provider_id"));
     match harness.rx_op.recv().await {
-        Some(Op::SendMessage { route, .. }) => {
+        Some(Op::SendMessage(TurnSpec { route, .. })) => {
             assert_eq!(route.identity.key, "custom");
             assert_eq!(route.identity.exact_id, None);
             assert_eq!(
@@ -1644,12 +1645,12 @@ async fn runtime_turn_reasoning_and_tool_defaults_follow_explicit_precedence() -
         )
         .await?;
     match override_harness.rx_op.recv().await {
-        Some(Op::SendMessage {
+        Some(Op::SendMessage(TurnSpec {
             reasoning_effort,
             reasoning_effort_auto,
             allowed_tools,
             ..
-        }) => {
+        })) => {
             assert_eq!(reasoning_effort.as_deref(), Some("off"));
             assert!(!reasoning_effort_auto);
             assert_eq!(
@@ -1679,11 +1680,11 @@ async fn runtime_turn_reasoning_and_tool_defaults_follow_explicit_precedence() -
         )
         .await?;
     match thread_harness.rx_op.recv().await {
-        Some(Op::SendMessage {
+        Some(Op::SendMessage(TurnSpec {
             reasoning_effort,
             allowed_tools,
             ..
-        }) => {
+        })) => {
             assert_eq!(
                 reasoning_effort.as_deref(),
                 Some("high"),
@@ -1708,11 +1709,11 @@ async fn runtime_turn_reasoning_and_tool_defaults_follow_explicit_precedence() -
         )
         .await?;
     match config_harness.rx_op.recv().await {
-        Some(Op::SendMessage {
+        Some(Op::SendMessage(TurnSpec {
             reasoning_effort,
             allowed_tools,
             ..
-        }) => {
+        })) => {
             assert_eq!(reasoning_effort.as_deref(), Some("high"));
             assert_eq!(
                 allowed_tools, None,
@@ -2153,7 +2154,7 @@ async fn caller_cancellation_after_engine_acceptance_keeps_owned_turn_lifecycle(
     });
     assert!(matches!(
         tokio::time::timeout(Duration::from_secs(2), harness.rx_op.recv()).await?,
-        Some(Op::SendMessage { .. })
+        Some(Op::SendMessage(TurnSpec { .. }))
     ));
     let turns = manager.store.list_turns_for_thread(&thread.id)?;
     assert_eq!(turns.len(), 1);
@@ -2252,7 +2253,7 @@ async fn operation_key_replays_torn_response_survives_restart_and_rejects_mismat
     });
     assert!(matches!(
         tokio::time::timeout(Duration::from_secs(2), harness.rx_op.recv()).await?,
-        Some(Op::SendMessage { .. })
+        Some(Op::SendMessage(TurnSpec { .. }))
     ));
     let turns = manager.store.list_turns_for_thread(&thread.id)?;
     assert_eq!(turns.len(), 1);
@@ -2735,7 +2736,7 @@ async fn restart_removes_torn_operation_item_before_reserved_turn_retry() -> Res
     assert_eq!(turn.id, turn_id);
     assert!(matches!(
         harness.rx_op.recv().await,
-        Some(Op::SendMessage { .. })
+        Some(Op::SendMessage(TurnSpec { .. }))
     ));
     assert_eq!(
         manager.store.list_items_for_turn(turn_id)?.len(),
@@ -2789,7 +2790,10 @@ async fn thread_updates_while_start_waits_for_capacity_survive_latest_turn_write
     let turn = tokio::time::timeout(TURN_SETTLEMENT_DEADLOCK_TIMEOUT, start_task).await???;
     let mut saw_send = false;
     for _ in 0..32 {
-        if matches!(harness.rx_op.recv().await, Some(Op::SendMessage { .. })) {
+        if matches!(
+            harness.rx_op.recv().await,
+            Some(Op::SendMessage(TurnSpec { .. }))
+        ) {
             saw_send = true;
             break;
         }
@@ -3043,7 +3047,7 @@ async fn concurrent_turn_starts_leave_one_claim_and_one_consistent_durable_turn(
         Some((false, false))
     );
     match harness.rx_op.recv().await {
-        Some(Op::SendMessage { compaction, .. }) => {
+        Some(Op::SendMessage(TurnSpec { compaction, .. })) => {
             assert_eq!(
                 compaction.runtime_cost_owner.as_deref(),
                 Some(turn.id.as_str())
@@ -3460,7 +3464,7 @@ async fn queued_reload_is_a_hard_boundary_for_a_concurrent_turn_start() -> Resul
 
     loop {
         match harness.rx_op.recv().await {
-            Some(Op::SendMessage { route, .. }) => {
+            Some(Op::SendMessage(TurnSpec { route, .. })) => {
                 assert_eq!(
                     route.config.deepseek_base_url(),
                     "http://127.0.0.1:18182/v1"
@@ -3787,7 +3791,7 @@ async fn simultaneous_named_custom_auto_threads_keep_exact_routes() -> Result<()
     assert_eq!(turn_b.effective_provider_id.as_deref(), Some("custom-b"));
     assert_eq!(turn_b.effective_model.as_deref(), Some("model-b"));
     match harness_a.rx_op.recv().await {
-        Some(Op::SendMessage { route, .. }) => {
+        Some(Op::SendMessage(TurnSpec { route, .. })) => {
             assert_eq!(route.identity.provider, ApiProvider::Custom);
             assert_eq!(route.identity.key, "custom-a");
             assert_eq!(route.model, "model-a");
@@ -3795,7 +3799,7 @@ async fn simultaneous_named_custom_auto_threads_keep_exact_routes() -> Result<()
         other => panic!("expected custom A send, got {other:?}"),
     }
     match harness_b.rx_op.recv().await {
-        Some(Op::SendMessage { route, .. }) => {
+        Some(Op::SendMessage(TurnSpec { route, .. })) => {
             assert_eq!(route.identity.provider, ApiProvider::Custom);
             assert_eq!(route.identity.key, "custom-b");
             assert_eq!(route.model, "model-b");
@@ -3900,14 +3904,15 @@ fn turn_record_round_trips_frozen_provider_live_pricing_and_drops_hostile_quotes
     let dispatched_at = Utc::now();
     let fetched_at = u64::try_from(dispatched_at.timestamp()).expect("timestamp");
     let model = "synthetic-baseten-turn-record";
-    let fingerprint =
-        codewhale_config::catalog::base_url_fingerprint(codewhale_config::BASETEN_BASE_URL);
+    let fingerprint = codewhale_config::catalog::base_url_fingerprint(
+        codewhale_config::catalog::BASETEN_BASE_URL,
+    );
     let priced_delta = |input: f64, output: f64| codewhale_config::catalog::ProviderCatalogDelta {
-        provider: codewhale_config::BASETEN_TEMPLATE_ID.to_string(),
+        provider: codewhale_config::catalog::BASETEN_PROVIDER_ID.to_string(),
         base_url_fingerprint: fingerprint.clone(),
         fetched_at,
         offerings: vec![codewhale_config::catalog::CatalogOffering {
-            provider: codewhale_config::BASETEN_TEMPLATE_ID.to_string(),
+            provider: codewhale_config::catalog::BASETEN_PROVIDER_ID.to_string(),
             wire_model_id: model.to_string(),
             endpoint_key: "chat".to_string(),
             cost: Some(codewhale_config::models_dev::ModelsDevCost {
@@ -3923,9 +3928,9 @@ fn turn_record_round_trips_frozen_provider_live_pricing_and_drops_hostile_quotes
     let route = crate::cost_status::EffectiveRouteEnvelope::capture(
         None,
         ApiProvider::Custom,
-        codewhale_config::BASETEN_TEMPLATE_ID,
+        codewhale_config::catalog::BASETEN_PROVIDER_ID,
         model,
-        Some(codewhale_config::BASETEN_BASE_URL),
+        Some(codewhale_config::catalog::BASETEN_BASE_URL),
         dispatched_at,
     );
     let valid_quote = route
@@ -3936,7 +3941,11 @@ fn turn_record_round_trips_frozen_provider_live_pricing_and_drops_hostile_quotes
     let mut turn = sample_turn("thr_quote", "turn_quote", RuntimeTurnStatus::Completed);
     turn.persist_effective_route(&route);
     let serialized = serde_json::to_string(&turn).expect("serialize quoted turn");
-    for raw_secret in [codewhale_config::BASETEN_BASE_URL, "api_key", "Bearer "] {
+    for raw_secret in [
+        codewhale_config::catalog::BASETEN_BASE_URL,
+        "api_key",
+        "Bearer ",
+    ] {
         // The assertion message must not itself log the credential fragment it
         // checks for — name the check, not the secret.
         assert!(
@@ -6676,7 +6685,7 @@ async fn thread_lifecycle_persists_across_restart() -> Result<()> {
     let mut rx_op = harness.rx_op;
     let tx_event = harness.tx_event;
     tokio::spawn(async move {
-        if matches!(rx_op.recv().await, Some(Op::SendMessage { .. })) {
+        if matches!(rx_op.recv().await, Some(Op::SendMessage(TurnSpec { .. }))) {
             let _ = tx_event
                 .send(EngineEvent::TurnStarted {
                     turn_id: "engine_turn_1".to_string(),
@@ -6771,7 +6780,7 @@ async fn initial_classifier_usage_is_persisted_before_terminal_and_merged_exactl
         .await?;
     assert!(matches!(
         harness.rx_op.recv().await,
-        Some(Op::SendMessage { .. })
+        Some(Op::SendMessage(TurnSpec { .. }))
     ));
 
     let classifier_usage = Usage {
@@ -7267,7 +7276,7 @@ async fn terminal_settlement_preserves_late_sink_receipts_during_pending_request
         .await?;
     assert!(matches!(
         harness.rx_op.recv().await,
-        Some(Op::SendMessage { .. })
+        Some(Op::SendMessage(TurnSpec { .. }))
     ));
     let lease = crate::cost_status::acquire_runtime_usage_lease(&turn.id)
         .context("admitted turn installs a persistent sink")?;
@@ -7400,7 +7409,7 @@ async fn monitor_deduplicates_sink_and_metadata_and_persists_metadata_only_missi
         .await?;
     assert!(matches!(
         harness.rx_op.recv().await,
-        Some(Op::SendMessage { .. })
+        Some(Op::SendMessage(TurnSpec { .. }))
     ));
     let mut batch =
         classifier_settlement_batch("child-route", "child/model", "sink-and-metadata", 1);
@@ -7494,7 +7503,7 @@ async fn monitor_separates_lifecycle_start_from_billing_dispatch_and_child_usage
         .await?;
     assert!(matches!(
         harness.rx_op.recv().await,
-        Some(Op::SendMessage { .. })
+        Some(Op::SendMessage(TurnSpec { .. }))
     ));
 
     let started_at = Utc::now() - chrono::Duration::minutes(5);
@@ -7665,7 +7674,7 @@ async fn monitor_separates_lifecycle_start_from_billing_dispatch_and_child_usage
         .await?;
     assert!(matches!(
         harness.rx_op.recv().await,
-        Some(Op::SendMessage { .. })
+        Some(Op::SendMessage(TurnSpec { .. }))
     ));
     let second_engine_turn = "engine_route_receipt_second";
     harness
@@ -7743,7 +7752,7 @@ async fn monitor_persists_only_terminal_request_diagnostics_per_turn() -> Result
         .await?;
     assert!(matches!(
         harness.rx_op.recv().await,
-        Some(Op::SendMessage { .. })
+        Some(Op::SendMessage(TurnSpec { .. }))
     ));
 
     let engine_turn_id = "engine_request_diagnostics_first";
@@ -7873,7 +7882,7 @@ async fn monitor_persists_only_terminal_request_diagnostics_per_turn() -> Result
         .await?;
     assert!(matches!(
         harness.rx_op.recv().await,
-        Some(Op::SendMessage { .. })
+        Some(Op::SendMessage(TurnSpec { .. }))
     ));
     let second_engine_turn_id = "engine_request_diagnostics_second";
     harness
@@ -7952,7 +7961,7 @@ async fn completed_turn_without_engine_output_fails() -> Result<()> {
     let mut rx_op = harness.rx_op;
     let tx_event = harness.tx_event;
     tokio::spawn(async move {
-        if matches!(rx_op.recv().await, Some(Op::SendMessage { .. })) {
+        if matches!(rx_op.recv().await, Some(Op::SendMessage(TurnSpec { .. }))) {
             let _ = tx_event
                 .send(EngineEvent::TurnStarted {
                     turn_id: "engine_empty_turn".to_string(),
@@ -8043,7 +8052,7 @@ async fn worker_lifecycle_receipts_preserve_owner_outcome_and_durable_replay() -
     let thread_id = thread.id.clone();
     let foreign_id = foreign.id.clone();
     tokio::spawn(async move {
-        if matches!(rx_op.recv().await, Some(Op::SendMessage { .. })) {
+        if matches!(rx_op.recv().await, Some(Op::SendMessage(TurnSpec { .. }))) {
             let _ = tx_event
                 .send(EngineEvent::TurnStarted {
                     turn_id: "engine_worker_lifecycle".into(),
@@ -8099,6 +8108,7 @@ async fn worker_lifecycle_receipts_preserve_owner_outcome_and_durable_replay() -
                             parent_run_id: Some("parent".into()),
                             spawn_depth: Some(2),
                             continuable: Some(id == "worker_interrupted"),
+                            usage: None,
                         })
                         .await;
                 }
@@ -8201,7 +8211,7 @@ async fn preturn_control_status_does_not_make_empty_turn_succeed() -> Result<()>
     let tx_event = harness.tx_event;
     let thread_id = thread.id.clone();
     tokio::spawn(async move {
-        if matches!(rx_op.recv().await, Some(Op::SendMessage { .. })) {
+        if matches!(rx_op.recv().await, Some(Op::SendMessage(TurnSpec { .. }))) {
             let _ = tx_event
                 .send(EngineEvent::AgentComplete {
                     owner_session_id: thread_id,
@@ -8211,6 +8221,7 @@ async fn preturn_control_status_does_not_make_empty_turn_succeed() -> Result<()>
                     parent_run_id: None,
                     spawn_depth: None,
                     continuable: None,
+                    usage: None,
                 })
                 .await;
             let _ = tx_event
@@ -8272,7 +8283,7 @@ async fn engine_error_remains_failed_after_nominal_turn_complete() -> Result<()>
     let mut rx_op = harness.rx_op;
     let tx_event = harness.tx_event;
     tokio::spawn(async move {
-        if matches!(rx_op.recv().await, Some(Op::SendMessage { .. })) {
+        if matches!(rx_op.recv().await, Some(Op::SendMessage(TurnSpec { .. }))) {
             let _ = tx_event
                 .send(EngineEvent::TurnStarted {
                     turn_id: "engine_error_then_complete".to_string(),
@@ -8415,6 +8426,80 @@ async fn update_thread_workspace_rejects_empty_path() -> Result<()> {
     Ok(())
 }
 
+/// Restore admission rejects any active turn whose workspace overlaps the
+/// one about to be mutated: the same tree, a nested checkout, or a parent.
+/// Unrelated workspaces are unaffected, and the thread-scoped guard reads the
+/// record under admission.
+#[tokio::test]
+async fn workspace_restore_guard_rejects_overlapping_active_turns() -> Result<()> {
+    let manager = test_manager(test_runtime_dir())?;
+    let root = std::env::temp_dir().join(format!("codewhale-restore-guard-{}", Uuid::new_v4()));
+    let busy = root.join("busy");
+    let nested = busy.join("nested");
+    let idle = root.join("idle");
+    std::fs::create_dir_all(&nested)?;
+    std::fs::create_dir_all(&idle)?;
+    let thread = manager
+        .create_thread(CreateThreadRequest {
+            workspace: Some(busy.clone()),
+            ..Default::default()
+        })
+        .await?;
+
+    // Nothing is running: both guards are granted and released.
+    drop(manager.workspace_restore_guard(&busy).await?);
+    let (guard, record) = manager.thread_restore_guard(&thread.id).await?;
+    assert_eq!(record.id, thread.id);
+    drop(guard);
+
+    let _harness = install_mock_engine(&manager, &thread.id).await;
+    {
+        let mut active = manager.active.lock().await;
+        let state = active.engines.get_mut(&thread.id).expect("mock engine");
+        state.active_turn = Some(ActiveTurnState {
+            goal_id: None,
+            turn_id: "turn_live".to_string(),
+            interrupt_requested: false,
+            compaction_id: None,
+        });
+    }
+    for workspace in [&busy, &nested, &root] {
+        let err = manager
+            .workspace_restore_guard(workspace)
+            .await
+            .expect_err("overlapping active turn must be rejected");
+        assert!(
+            format!("{err:#}").contains("already has an active turn"),
+            "{}: {err:#}",
+            workspace.display()
+        );
+    }
+    let err = manager
+        .thread_restore_guard(&thread.id)
+        .await
+        .expect_err("the busy thread itself must be rejected");
+    assert!(format!("{err:#}").contains("already has an active turn"));
+    // An unrelated workspace is not blocked by someone else's turn.
+    drop(manager.workspace_restore_guard(&idle).await?);
+    let err = manager
+        .thread_restore_guard("thr_missing")
+        .await
+        .expect_err("unknown thread");
+    assert!(format!("{err:#}").contains("Thread not found"));
+
+    {
+        let mut active = manager.active.lock().await;
+        active
+            .engines
+            .get_mut(&thread.id)
+            .expect("mock engine")
+            .active_turn = None;
+    }
+    drop(manager.workspace_restore_guard(&busy).await?);
+    let _ = std::fs::remove_dir_all(&root);
+    Ok(())
+}
+
 #[tokio::test]
 async fn update_thread_workspace_rejects_active_turn() -> Result<()> {
     let manager = test_manager(test_runtime_dir())?;
@@ -8519,11 +8604,11 @@ async fn start_turn_passes_effective_auto_approve_to_engine() -> Result<()> {
     assert_eq!(turn.permission_posture.as_deref(), Some("full_access"));
 
     match rx_op.recv().await {
-        Some(Op::SendMessage {
+        Some(Op::SendMessage(TurnSpec {
             auto_approve,
             approval_mode,
             ..
-        }) => {
+        })) => {
             assert!(auto_approve);
             assert_eq!(approval_mode, ApprovalMode::Bypass);
         }
@@ -8572,11 +8657,11 @@ async fn start_turn_can_override_thread_auto_approve_to_false() -> Result<()> {
     assert_eq!(turn.permission_posture.as_deref(), Some("ask"));
 
     match rx_op.recv().await {
-        Some(Op::SendMessage {
+        Some(Op::SendMessage(TurnSpec {
             auto_approve,
             approval_mode,
             ..
-        }) => {
+        })) => {
             assert!(!auto_approve);
             assert_eq!(approval_mode, ApprovalMode::Suggest);
         }
@@ -8619,11 +8704,11 @@ async fn start_turn_enforces_and_records_auto_review_without_legacy_bypass() -> 
         Some("auto_review")
     );
     match rx_op.recv().await {
-        Some(Op::SendMessage {
+        Some(Op::SendMessage(TurnSpec {
             auto_approve,
             approval_mode,
             ..
-        }) => {
+        })) => {
             assert!(!auto_approve);
             assert_eq!(approval_mode, ApprovalMode::Auto);
         }
@@ -8653,10 +8738,10 @@ async fn active_turn_permission_posture_switches_use_the_engine_live_authority()
         .await?;
     assert!(matches!(
         harness.rx_op.recv().await,
-        Some(Op::SendMessage {
+        Some(Op::SendMessage(TurnSpec {
             approval_mode: ApprovalMode::Suggest,
             ..
-        })
+        }))
     ));
 
     for (requested, canonical, expected_auto, expected_approval) in [
@@ -9002,7 +9087,7 @@ async fn multi_turn_continuity_same_thread() -> Result<()> {
     tokio::spawn(async move {
         let mut turn_index = 0u8;
         while let Some(op) = rx_op.recv().await {
-            if !matches!(op, Op::SendMessage { .. }) {
+            if !matches!(op, Op::SendMessage(TurnSpec { .. })) {
                 continue;
             }
             turn_index = turn_index.saturating_add(1);
@@ -9209,6 +9294,7 @@ async fn host_goal_loop_kickoff_arms_one_continuation_and_parks_at_engine_cap() 
             max_continuations: Some(2),
             continuation_delay_seconds: None,
             max_steps: None,
+            enforce_token_budget: None,
         }),
         ..Config::default()
     };
@@ -9231,7 +9317,7 @@ async fn host_goal_loop_kickoff_arms_one_continuation_and_parks_at_engine_cap() 
     let counter = passes.clone();
     tokio::spawn(async move {
         while let Some(op) = rx_op.recv().await {
-            if !matches!(op, Op::SendMessage { .. }) {
+            if !matches!(op, Op::SendMessage(TurnSpec { .. })) {
                 continue;
             }
             let pass = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
@@ -9354,7 +9440,7 @@ async fn host_goal_loop_skips_rearm_without_update_goal_and_after_failed_pass() 
     let counter = passes.clone();
     tokio::spawn(async move {
         while let Some(op) = rx_op.recv().await {
-            if !matches!(op, Op::SendMessage { .. }) {
+            if !matches!(op, Op::SendMessage(TurnSpec { .. })) {
                 continue;
             }
             counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -9442,7 +9528,7 @@ async fn host_goal_loop_skips_rearm_without_update_goal_and_after_failed_pass() 
     let failed_counter = failed_passes.clone();
     tokio::spawn(async move {
         while let Some(op) = failed_rx_op.recv().await {
-            if !matches!(op, Op::SendMessage { .. }) {
+            if !matches!(op, Op::SendMessage(TurnSpec { .. })) {
                 continue;
             }
             failed_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -9540,7 +9626,7 @@ async fn host_goal_loop_mirrors_terminal_snapshot_and_does_not_rearm() -> Result
         let status = engine_status.to_string();
         tokio::spawn(async move {
             while let Some(op) = rx_op.recv().await {
-                if !matches!(op, Op::SendMessage { .. }) {
+                if !matches!(op, Op::SendMessage(TurnSpec { .. })) {
                     continue;
                 }
                 counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -9631,6 +9717,7 @@ async fn model_created_goal_persists_through_adopted_revision() -> Result<()> {
                 max_continuations: None,
                 continuation_delay_seconds: Some(3600),
                 max_steps: None,
+                enforce_token_budget: None,
             }),
             ..Config::default()
         },
@@ -9645,7 +9732,7 @@ async fn model_created_goal_persists_through_adopted_revision() -> Result<()> {
     let tx_event = harness.tx_event;
     tokio::spawn(async move {
         while let Some(op) = rx_op.recv().await {
-            if !matches!(op, Op::SendMessage { .. }) {
+            if !matches!(op, Op::SendMessage(TurnSpec { .. })) {
                 continue;
             }
             let snapshot = crate::tools::goal::GoalSnapshot {
@@ -9725,7 +9812,7 @@ async fn model_created_goal_never_overwrites_concurrent_explicit_goal() -> Resul
     let thread_id = thread.id.clone();
     tokio::spawn(async move {
         while let Some(op) = rx_op.recv().await {
-            if !matches!(op, Op::SendMessage { .. }) {
+            if !matches!(op, Op::SendMessage(TurnSpec { .. })) {
                 continue;
             }
             // The explicit revision arrives after admission but before the
@@ -9966,7 +10053,7 @@ async fn interrupt_turn_marks_interrupted_after_cleanup() -> Result<()> {
     let cancel_token = harness.cancel_token;
     let cleanup_delay = Duration::from_millis(140);
     tokio::spawn(async move {
-        if matches!(rx_op.recv().await, Some(Op::SendMessage { .. })) {
+        if matches!(rx_op.recv().await, Some(Op::SendMessage(TurnSpec { .. }))) {
             let _ = tx_event
                 .send(EngineEvent::TurnStarted {
                     turn_id: "engine_turn_interrupt".to_string(),
@@ -10075,7 +10162,7 @@ async fn approval_required_with_stale_active_turn_is_denied() -> Result<()> {
 
     assert!(matches!(
         harness.rx_op.recv().await,
-        Some(Op::SendMessage { .. })
+        Some(Op::SendMessage(TurnSpec { .. }))
     ));
     {
         let mut active = manager.active.lock().await;
@@ -10215,7 +10302,7 @@ async fn approval_required_awaits_external_decision_allow() -> Result<()> {
         .await?;
     assert!(matches!(
         harness.rx_op.recv().await,
-        Some(Op::SendMessage { .. })
+        Some(Op::SendMessage(TurnSpec { .. }))
     ));
 
     harness
@@ -10340,7 +10427,7 @@ async fn user_input_snapshot_survives_reload_and_clears_after_submission() -> Re
         .await?;
     assert!(matches!(
         harness.rx_op.recv().await,
-        Some(Op::SendMessage { .. })
+        Some(Op::SendMessage(TurnSpec { .. }))
     ));
 
     harness
@@ -10735,7 +10822,7 @@ async fn thread_detail_cursor_precedes_projection_reads_at_terminal_boundary() -
         .await?;
     assert!(matches!(
         harness.rx_op.recv().await,
-        Some(Op::SendMessage { .. })
+        Some(Op::SendMessage(TurnSpec { .. }))
     ));
 
     let (hook_tx, mut hook_rx) = mpsc::unbounded_channel();
@@ -10932,7 +11019,7 @@ async fn thread_detail_materializes_stream_prefixes_before_their_delta_cursor() 
         .await?;
     assert!(matches!(
         harness.rx_op.recv().await,
-        Some(Op::SendMessage { .. })
+        Some(Op::SendMessage(TurnSpec { .. }))
     ));
 
     harness
@@ -11055,7 +11142,7 @@ async fn thread_detail_delta_boundary_is_replay_idempotent() -> Result<()> {
         .await?;
     assert!(matches!(
         harness.rx_op.recv().await,
-        Some(Op::SendMessage { .. })
+        Some(Op::SendMessage(TurnSpec { .. }))
     ));
 
     harness
@@ -11195,7 +11282,7 @@ async fn terminal_turn_cancels_pending_user_input_and_clears_snapshot() -> Resul
         .await?;
     assert!(matches!(
         harness.rx_op.recv().await,
-        Some(Op::SendMessage { .. })
+        Some(Op::SendMessage(TurnSpec { .. }))
     ));
     harness
         .tx_event
@@ -11278,6 +11365,108 @@ async fn terminal_turn_cancels_pending_user_input_and_clears_snapshot() -> Resul
 }
 
 #[tokio::test]
+async fn interrupted_turn_cancels_pending_user_input_and_clears_snapshot() -> Result<()> {
+    let manager = test_manager(test_runtime_dir())?;
+    let thread = manager
+        .create_thread(CreateThreadRequest::default())
+        .await?;
+    let mut harness = install_mock_engine(&manager, &thread.id).await;
+    let turn = manager
+        .start_turn(
+            &thread.id,
+            StartTurnRequest {
+                prompt: "needs input before interruption".to_string(),
+                ..StartTurnRequest::default()
+            },
+        )
+        .await?;
+    assert!(matches!(
+        harness.rx_op.recv().await,
+        Some(Op::SendMessage(TurnSpec { .. }))
+    ));
+    harness
+        .tx_event
+        .send(EngineEvent::UserInputRequired {
+            id: "input_interrupt".to_string(),
+            request: crate::tools::user_input::UserInputRequest {
+                questions: vec![crate::tools::user_input::UserInputQuestion {
+                    header: "Continue".to_string(),
+                    id: "continue".to_string(),
+                    question: "Continue?".to_string(),
+                    options: vec![crate::tools::user_input::UserInputOption {
+                        label: "Yes".to_string(),
+                        description: "Continue now".to_string(),
+                    }],
+                    allow_free_text: false,
+                    multi_select: false,
+                }],
+            },
+        })
+        .await?;
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        if !manager
+            .get_thread_detail(&thread.id)
+            .await?
+            .pending_user_inputs
+            .is_empty()
+        {
+            break;
+        }
+        if Instant::now() >= deadline {
+            bail!("pending user input did not reach the canonical snapshot");
+        }
+        sleep(Duration::from_millis(20)).await;
+    }
+
+    // The user pressed Esc: the engine lands the interrupt as a terminal
+    // turn outcome, not a failure. An unanswered prompt must not outlive it.
+    harness
+        .tx_event
+        .send(EngineEvent::TurnComplete {
+            usage: Usage::default(),
+            parent_route_usage: Usage::default(),
+            routed_usage_dropped_records: 0,
+            status: TurnOutcomeStatus::Interrupted,
+            error: None,
+            tool_catalog: None,
+            base_url: None,
+        })
+        .await?;
+    let canceled = tokio::time::timeout(
+        Duration::from_secs(2),
+        harness.recv_user_input_cancellation(),
+    )
+    .await
+    .expect("interrupted user-input cancellation timed out");
+    assert_eq!(canceled.as_deref(), Some("input_interrupt"));
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let detail = manager.get_thread_detail(&thread.id).await?;
+        if detail.pending_user_inputs.is_empty()
+            && manager.events_since(&thread.id, None)?.iter().any(|event| {
+                event.event == "user_input.canceled"
+                    && event.turn_id.as_deref() == Some(turn.id.as_str())
+                    && event.payload.get("input_id").and_then(Value::as_str)
+                        == Some("input_interrupt")
+                    && event.payload.get("terminal").and_then(Value::as_bool) == Some(true)
+            })
+        {
+            break;
+        }
+        if Instant::now() >= deadline {
+            bail!(
+                "interrupted user input was not cleared from the snapshot with a cancellation event"
+            );
+        }
+        sleep(Duration::from_millis(20)).await;
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn dynamic_tool_result_settles_snapshot_and_emits_one_safe_resolution() -> Result<()> {
     use crate::tools::spec::DynamicToolExecutor;
 
@@ -11297,7 +11486,7 @@ async fn dynamic_tool_result_settles_snapshot_and_emits_one_safe_resolution() ->
         .await?;
     assert!(matches!(
         harness.rx_op.recv().await,
-        Some(Op::SendMessage { .. })
+        Some(Op::SendMessage(TurnSpec { .. }))
     ));
     harness
         .tx_event
@@ -11458,7 +11647,7 @@ async fn dynamic_tool_result_receipt_outlives_canceled_delivery_future() -> Resu
         .await?;
     assert!(matches!(
         harness.rx_op.recv().await,
-        Some(Op::SendMessage { .. })
+        Some(Op::SendMessage(TurnSpec { .. }))
     ));
     harness
         .tx_event
@@ -12400,7 +12589,7 @@ async fn dynamic_tool_timeout_clears_snapshot_and_emits_once() -> Result<()> {
         .await?;
     assert!(matches!(
         harness.rx_op.recv().await,
-        Some(Op::SendMessage { .. })
+        Some(Op::SendMessage(TurnSpec { .. }))
     ));
     harness
         .tx_event
@@ -12474,7 +12663,7 @@ async fn terminal_turn_cancels_pending_dynamic_tool_exactly_once() -> Result<()>
         .await?;
     assert!(matches!(
         harness.rx_op.recv().await,
-        Some(Op::SendMessage { .. })
+        Some(Op::SendMessage(TurnSpec { .. }))
     ));
     harness
         .tx_event
@@ -12595,7 +12784,7 @@ async fn approval_required_external_deny_is_denied() -> Result<()> {
         .await?;
     assert!(matches!(
         harness.rx_op.recv().await,
-        Some(Op::SendMessage { .. })
+        Some(Op::SendMessage(TurnSpec { .. }))
     ));
 
     harness
@@ -12684,7 +12873,7 @@ async fn identical_raw_tool_call_ids_on_two_threads_stay_independently_gated() -
             .await?;
         assert!(matches!(
             harness.rx_op.recv().await,
-            Some(Op::SendMessage { .. })
+            Some(Op::SendMessage(TurnSpec { .. }))
         ));
         harness
             .tx_event
@@ -12819,10 +13008,10 @@ async fn auto_review_force_prompt_is_denied_without_opening_a_modal() -> Result<
         .await?;
     assert!(matches!(
         harness.rx_op.recv().await,
-        Some(Op::SendMessage {
+        Some(Op::SendMessage(TurnSpec {
             approval_mode: ApprovalMode::Auto,
             ..
-        })
+        }))
     ));
 
     harness
@@ -12929,7 +13118,7 @@ async fn approval_timeout_denies_clears_ui_and_next_turn_can_start() -> Result<(
         .await?;
     assert!(matches!(
         harness.rx_op.recv().await,
-        Some(Op::SendMessage { .. })
+        Some(Op::SendMessage(TurnSpec { .. }))
     ));
 
     harness
@@ -13017,7 +13206,10 @@ async fn approval_timeout_denies_clears_ui_and_next_turn_can_start() -> Result<(
         )
         .await?;
     assert!(
-        matches!(harness.rx_op.recv().await, Some(Op::SendMessage { .. })),
+        matches!(
+            harness.rx_op.recv().await,
+            Some(Op::SendMessage(TurnSpec { .. }))
+        ),
         "thread should accept a fresh turn after approval timeout cleanup"
     );
 
@@ -13060,7 +13252,7 @@ async fn thinking_delta_emits_agent_reasoning_item() -> Result<()> {
         .await?;
     assert!(matches!(
         harness.rx_op.recv().await,
-        Some(Op::SendMessage { .. })
+        Some(Op::SendMessage(TurnSpec { .. }))
     ));
 
     harness
@@ -13180,7 +13372,7 @@ async fn approval_required_remember_flips_thread_auto_approve() -> Result<()> {
         .await?;
     assert!(matches!(
         harness.rx_op.recv().await,
-        Some(Op::SendMessage { .. })
+        Some(Op::SendMessage(TurnSpec { .. }))
     ));
 
     harness
@@ -13270,7 +13462,7 @@ async fn elevation_required_with_stale_active_turn_is_denied() -> Result<()> {
 
     assert!(matches!(
         harness.rx_op.recv().await,
-        Some(Op::SendMessage { .. })
+        Some(Op::SendMessage(TurnSpec { .. }))
     ));
     {
         let mut active = manager.active.lock().await;
@@ -13346,7 +13538,7 @@ async fn steer_turn_on_active_turn_records_item_and_event() -> Result<()> {
     let tx_event = harness.tx_event;
     let (steer_seen_tx, steer_seen_rx) = oneshot::channel::<String>();
     tokio::spawn(async move {
-        if matches!(rx_op.recv().await, Some(Op::SendMessage { .. })) {
+        if matches!(rx_op.recv().await, Some(Op::SendMessage(TurnSpec { .. }))) {
             let _ = tx_event
                 .send(EngineEvent::TurnStarted {
                     turn_id: "engine_turn_steer".to_string(),
@@ -13355,7 +13547,9 @@ async fn steer_turn_on_active_turn_records_item_and_event() -> Result<()> {
                 })
                 .await;
             if let Some(steer) = rx_steer.recv().await {
-                let _ = steer_seen_tx.send(steer.content);
+                // Model an engine that commits the steer into its record;
+                // `commit()` is what reports acceptance back to `steer_turn`.
+                let _ = steer_seen_tx.send(steer.into_pending().commit());
             }
             let _ = tx_event
                 .send(EngineEvent::MessageStarted { index: 0 })
@@ -13461,7 +13655,10 @@ async fn steer_receipts_outlive_caller_cancellation_after_engine_acceptance() ->
             },
         )
         .await?;
-    assert!(matches!(rx_op.recv().await, Some(Op::SendMessage { .. })));
+    assert!(matches!(
+        rx_op.recv().await,
+        Some(Op::SendMessage(TurnSpec { .. }))
+    ));
 
     // Hold publication after durable persistence and mailbox acceptance so the
     // API future can be cancelled while the detached receipt task is pending.
@@ -13483,7 +13680,7 @@ async fn steer_receipts_outlive_caller_cancellation_after_engine_acceptance() ->
     assert_eq!(
         tokio::time::timeout(Duration::from_secs(2), rx_steer.recv())
             .await?
-            .map(|steer| steer.content),
+            .map(|steer| steer.into_pending().commit()),
         Some("keep the accepted steer".to_string())
     );
     steer_task.abort();
@@ -13555,6 +13752,121 @@ async fn steer_receipts_outlive_caller_cancellation_after_engine_acceptance() ->
 }
 
 #[tokio::test]
+async fn steer_dropped_by_the_engine_is_reported_as_undelivered() -> Result<()> {
+    // #6276: the channel accepting the text is not the model seeing it. An
+    // engine that takes a steer and never commits it — the turn moved on, was
+    // interrupted, or failed — must not produce a delivery receipt.
+    let manager = test_manager(test_runtime_dir())?;
+    let thread = manager
+        .create_thread(CreateThreadRequest::default())
+        .await?;
+    let harness = install_mock_engine(&manager, &thread.id).await;
+    let mut rx_op = harness.rx_op;
+    let mut rx_steer = harness.rx_steer;
+    let tx_event = harness.tx_event;
+
+    let turn = manager
+        .start_turn(
+            &thread.id,
+            StartTurnRequest {
+                prompt: "initial".to_string(),
+                ..Default::default()
+            },
+        )
+        .await?;
+    assert!(matches!(
+        rx_op.recv().await,
+        Some(Op::SendMessage(TurnSpec { .. }))
+    ));
+
+    // The engine receives the steer and drops it without committing, exactly
+    // as `next_turn_steer` does for a turn that has already moved on.
+    let drop_driver = tokio::spawn(async move {
+        let steer = rx_steer.recv().await;
+        drop(steer);
+        rx_steer
+    });
+
+    let error = manager
+        .steer_turn(
+            &thread.id,
+            &turn.id,
+            SteerTurnRequest {
+                prompt: "never reaches the model".to_string(),
+            },
+        )
+        .await
+        .expect_err("a dropped steer must not report delivery");
+    assert!(
+        error.to_string().contains("moved on before the steer"),
+        "drop error must name the cause, got: {error}"
+    );
+    let _rx_steer = drop_driver.await?;
+
+    // The durable record agrees: canceled item, no delivery count.
+    let items = manager.store.list_items_for_turn(&turn.id)?;
+    let steer_item = items
+        .iter()
+        .find(|item| item.detail.as_deref() == Some("never reaches the model"))
+        .context("the attempted steer must stay on the record")?;
+    assert_eq!(steer_item.status, TurnItemLifecycleStatus::Canceled);
+    assert_eq!(manager.store.load_turn(&turn.id)?.steer_count, 0);
+
+    let events = manager.events_since(&thread.id, None)?;
+    let dropped = events
+        .iter()
+        .find(|ev| ev.event == "turn.steer_dropped")
+        .context("a dropped steer must be announced so a client can requeue")?;
+    assert_eq!(
+        dropped.payload.get("input").and_then(Value::as_str),
+        Some("never reaches the model")
+    );
+    assert!(
+        !events.iter().any(|ev| ev.event == "turn.steered"),
+        "a dropped steer must not emit turn.steered"
+    );
+    assert!(
+        !events.iter().any(|ev| {
+            ev.event == "item.completed"
+                && ev
+                    .payload
+                    .get("item")
+                    .and_then(|item| item.get("detail"))
+                    .and_then(Value::as_str)
+                    == Some("never reaches the model")
+        }),
+        "a dropped steer must not emit item.completed"
+    );
+
+    tx_event
+        .send(EngineEvent::MessageStarted { index: 0 })
+        .await?;
+    tx_event
+        .send(EngineEvent::MessageDelta {
+            index: 0,
+            content: "unsteered response".to_string(),
+        })
+        .await?;
+    tx_event
+        .send(EngineEvent::MessageComplete { index: 0 })
+        .await?;
+    tx_event
+        .send(EngineEvent::TurnComplete {
+            usage: Usage::default(),
+            parent_route_usage: Usage::default(),
+            routed_usage_dropped_records: 0,
+            status: TurnOutcomeStatus::Completed,
+            error: None,
+            tool_catalog: None,
+            base_url: None,
+        })
+        .await?;
+    let terminal = wait_for_terminal_turn(&manager, &turn.id).await?;
+    assert_eq!(terminal.status, RuntimeTurnStatus::Completed);
+    Ok(())
+}
+
+#[tokio::test]
 async fn steer_rejects_a_terminal_durable_turn_without_dispatch_or_item() -> Result<()> {
     let manager = test_manager(test_runtime_dir())?;
     let thread = manager
@@ -13574,7 +13886,10 @@ async fn steer_rejects_a_terminal_durable_turn_without_dispatch_or_item() -> Res
             },
         )
         .await?;
-    assert!(matches!(rx_op.recv().await, Some(Op::SendMessage { .. })));
+    assert!(matches!(
+        rx_op.recv().await,
+        Some(Op::SendMessage(TurnSpec { .. }))
+    ));
     let original_item_ids = turn.item_ids.clone();
     {
         let _turn_mutation = manager.store.turn_mutation.lock();
@@ -13714,7 +14029,10 @@ async fn closed_engine_event_stream_fails_turn_items_and_evicts_engine() -> Resu
             },
         )
         .await?;
-    assert!(matches!(rx_op.recv().await, Some(Op::SendMessage { .. })));
+    assert!(matches!(
+        rx_op.recv().await,
+        Some(Op::SendMessage(TurnSpec { .. }))
+    ));
     drop(tx_event);
 
     let terminal = wait_for_terminal_turn(&manager, &turn.id).await?;
@@ -13768,7 +14086,7 @@ async fn failed_turn_cancels_pending_user_input_and_clears_snapshot() -> Result<
         .await?;
     assert!(matches!(
         harness.rx_op.recv().await,
-        Some(Op::SendMessage { .. })
+        Some(Op::SendMessage(TurnSpec { .. }))
     ));
     harness
         .tx_event
@@ -13868,7 +14186,7 @@ async fn compaction_lifecycle_emits_item_events_with_compaction_counts() -> Resu
         let mut op_count = 0usize;
         while let Some(op) = rx_op.recv().await {
             match op {
-                Op::SendMessage { .. } => {
+                Op::SendMessage(TurnSpec { .. }) => {
                     op_count = op_count.saturating_add(1);
                     let _ = tx_event
                         .send(EngineEvent::TurnStarted {
@@ -14141,6 +14459,7 @@ fn opening_manager_recovers_stale_queued_and_in_progress_work() -> Result<()> {
         routing_settlement: false,
         effective_route_usage: None,
         permission_posture: None,
+        mode: None,
         effective_provider: None,
         effective_provider_id: None,
         effective_openrouter_vendor: None,
@@ -14175,6 +14494,7 @@ fn opening_manager_recovers_stale_queued_and_in_progress_work() -> Result<()> {
         routing_settlement: false,
         effective_route_usage: None,
         permission_posture: None,
+        mode: None,
         effective_provider: None,
         effective_provider_id: None,
         effective_openrouter_vendor: None,
@@ -14307,123 +14627,6 @@ fn mode_only_override_preserves_legacy_full_access_posture() -> Result<()> {
     Ok(())
 }
 
-fn rebind_event(event: &str, agent_id: &str, seq: u64) -> RuntimeEventRecord {
-    RuntimeEventRecord {
-        schema_version: CURRENT_RUNTIME_SCHEMA_VERSION,
-        seq,
-        timestamp: Utc::now(),
-        thread_id: "thr_test".to_string(),
-        turn_id: Some("turn_test".to_string()),
-        item_id: None,
-        event: event.to_string(),
-        payload: json!({ "agent_id": agent_id,
-            "worker_status": if event == "agent.completed" { Some("completed") } else { None } }),
-    }
-}
-
-#[test]
-fn collect_agent_rebind_hints_resumes_a_mid_fanout_session() {
-    // Mirror what runtime_threads persists during a real fanout: three
-    // workers spawned, two finished, one still running when the session
-    // was killed. The TUI re-attach must rebuild placeholders for the
-    // running worker AND the two completed workers (the fanout card
-    // tracks all of them so the dot-grid stays accurate post-resume).
-    let events = vec![
-        rebind_event("agent.spawned", "agent_a", 1),
-        rebind_event("agent.spawned", "agent_b", 2),
-        rebind_event("agent.spawned", "agent_c", 3),
-        rebind_event("agent.progress", "agent_a", 4),
-        rebind_event("agent.completed", "agent_a", 5),
-        rebind_event("agent.progress", "agent_b", 6),
-        rebind_event("agent.completed", "agent_b", 7),
-        rebind_event("agent.progress", "agent_c", 8),
-    ];
-    let hints = collect_agent_rebind_hints(&events);
-    assert_eq!(hints.len(), 3, "every fanout worker must be rebound");
-    let by_id: std::collections::BTreeMap<&str, AgentRebindStatus> = hints
-        .iter()
-        .map(|h| (h.agent_id.as_str(), h.status))
-        .collect();
-    assert_eq!(by_id.get("agent_a"), Some(&AgentRebindStatus::Completed));
-    assert_eq!(by_id.get("agent_b"), Some(&AgentRebindStatus::Completed));
-    assert_eq!(
-        by_id.get("agent_c"),
-        Some(&AgentRebindStatus::InProgress),
-        "in-flight worker must rebind in InProgress, not downgrade"
-    );
-}
-
-#[test]
-fn collect_agent_rebind_hints_ignores_unrelated_events() {
-    // Status / tool events should not produce phantom hints — only the
-    // agent.* family carries the contract we re-bind from.
-    let events = vec![
-        RuntimeEventRecord {
-            schema_version: CURRENT_RUNTIME_SCHEMA_VERSION,
-            seq: 1,
-            timestamp: Utc::now(),
-            thread_id: "thr".to_string(),
-            turn_id: None,
-            item_id: None,
-            event: "tool.completed".to_string(),
-            payload: json!({"name": "read_file"}),
-        },
-        rebind_event("agent.spawned", "agent_x", 2),
-        RuntimeEventRecord {
-            schema_version: CURRENT_RUNTIME_SCHEMA_VERSION,
-            seq: 3,
-            timestamp: Utc::now(),
-            thread_id: "thr".to_string(),
-            turn_id: None,
-            item_id: None,
-            event: "compaction.completed".to_string(),
-            payload: json!({"messages_after": 12}),
-        },
-    ];
-    let hints = collect_agent_rebind_hints(&events);
-    assert_eq!(hints.len(), 1);
-    assert_eq!(hints[0].agent_id, "agent_x");
-}
-
-#[test]
-fn collect_agent_rebind_hints_does_not_downgrade_completed_to_in_progress() {
-    // Out-of-order replay: a stale `agent.progress` arriving after the
-    // completed event must NOT clobber the terminal status. This matters
-    // when an event log is concatenated from interrupted segments.
-    let events = vec![
-        rebind_event("agent.spawned", "agent_y", 1),
-        rebind_event("agent.completed", "agent_y", 2),
-        rebind_event("agent.progress", "agent_y", 3),
-    ];
-    let hints = collect_agent_rebind_hints(&events);
-    assert_eq!(hints.len(), 1);
-    assert_eq!(hints[0].status, AgentRebindStatus::Completed);
-}
-
-#[test]
-fn collect_agent_rebind_hints_preserves_typed_failures_and_legacy_uncertainty() {
-    let cases = [
-        (Some("failed"), AgentRebindStatus::Failed),
-        (Some("interrupted"), AgentRebindStatus::Interrupted),
-        (Some("cancelled"), AgentRebindStatus::Cancelled),
-        (Some("budget_exhausted"), AgentRebindStatus::BudgetExhausted),
-        (None, AgentRebindStatus::Unconfirmed),
-    ];
-    for (worker_status, expected) in cases {
-        let mut terminal = rebind_event("agent.completed", "worker", 2);
-        terminal.payload = json!({"agent_id": "worker", "worker_status": worker_status,
-            "status": "completed", "result": "Completed successfully"});
-        let hints = collect_agent_rebind_hints(&[
-            rebind_event("agent.progress", "worker", 3),
-            terminal.clone(),
-            rebind_event("agent.spawned", "worker", 1),
-            terminal,
-        ]);
-        assert_eq!(hints.len(), 1);
-        assert_eq!(hints[0].status, expected);
-    }
-}
-
 /// Helper for the `fork_at_user_message` tests: write a sequence of
 /// (user, assistant) turns under the given thread id. Each turn gets
 /// one UserMessage item carrying `user_text` in `detail` plus one
@@ -14482,6 +14685,7 @@ fn seed_turns_with_user_messages(
             routing_settlement: false,
             effective_route_usage: None,
             permission_posture: None,
+            mode: None,
             effective_provider: None,
             effective_provider_id: None,
             effective_openrouter_vendor: None,
@@ -15123,6 +15327,7 @@ fn restart_rebuild_restores_tool_call_identity_from_persisted_items() -> Result<
         routing_settlement: false,
         effective_route_usage: None,
         permission_posture: None,
+        mode: None,
         effective_provider: None,
         effective_provider_id: None,
         effective_openrouter_vendor: None,
@@ -15223,6 +15428,7 @@ fn restart_rebuild_keeps_in_flight_tool_call_identity() -> Result<()> {
         routing_settlement: false,
         effective_route_usage: None,
         permission_posture: None,
+        mode: None,
         effective_provider: None,
         effective_provider_id: None,
         effective_openrouter_vendor: None,
@@ -15258,6 +15464,102 @@ fn restart_rebuild_keeps_in_flight_tool_call_identity() -> Result<()> {
         }
         other => panic!("expected in-flight tool call identity, got {other:?}"),
     }
+
+    let _ = std::fs::remove_dir_all(dir);
+    Ok(())
+}
+
+/// A steer the engine never committed is recorded `canceled`/`queued` exactly
+/// because the model never saw it. Rebuilding history must honour that: #6276
+/// made the receipt honest, and replaying the text here would put it back into
+/// the context the receipt says it never reached.
+#[test]
+fn restart_rebuild_skips_steers_the_engine_never_delivered() -> Result<()> {
+    let dir = test_runtime_dir();
+    let manager = test_manager(dir.clone())?;
+    let thread = sample_thread("thr_rebuild_6276");
+    manager.store.save_thread(&thread)?;
+
+    let now = Utc::now();
+    let turn_id = "turn_6276_rebuild".to_string();
+    let item = |id: &str, text: &str, status: TurnItemLifecycleStatus| TurnItemRecord {
+        schema_version: CURRENT_RUNTIME_SCHEMA_VERSION,
+        id: id.to_string(),
+        turn_id: turn_id.clone(),
+        kind: TurnItemKind::UserMessage,
+        status,
+        summary: text.to_string(),
+        detail: Some(text.to_string()),
+        metadata: None,
+        artifact_refs: Vec::new(),
+        started_at: Some(now),
+        ended_at: Some(now),
+    };
+    let delivered = item("item_6276_ok", "hello", TurnItemLifecycleStatus::Completed);
+    let dropped = item(
+        "item_6276_drop",
+        "never seen by the model",
+        TurnItemLifecycleStatus::Canceled,
+    );
+    let pending = item(
+        "item_6276_queue",
+        "not settled yet",
+        TurnItemLifecycleStatus::Queued,
+    );
+    manager.store.save_item(&delivered)?;
+    manager.store.save_item(&dropped)?;
+    manager.store.save_item(&pending)?;
+    manager.store.save_turn(&TurnRecord {
+        max_output_tokens: None,
+        schema_version: CURRENT_RUNTIME_SCHEMA_VERSION,
+        id: turn_id.clone(),
+        thread_id: thread.id.clone(),
+        status: RuntimeTurnStatus::Completed,
+        input_summary: "hello".to_string(),
+        created_at: now,
+        started_at: Some(now),
+        ended_at: Some(now),
+        duration_ms: None,
+        usage: None,
+        routing_settlement: false,
+        effective_route_usage: None,
+        permission_posture: None,
+        mode: None,
+        effective_provider: None,
+        effective_provider_id: None,
+        effective_openrouter_vendor: None,
+        effective_billing_surface: None,
+        effective_endpoint_fingerprint: None,
+        effective_provider_live_pricing: None,
+        effective_billing_mode: None,
+        effective_dispatched_at: None,
+        effective_model: None,
+        routed_usage: Vec::new(),
+        routed_usage_drop_records: Vec::new(),
+        routed_usage_source_ids: Vec::new(),
+        routed_usage_dropped_records: 0,
+        model_request_diagnostics: None,
+        error: None,
+        item_ids: vec![delivered.id.clone(), dropped.id.clone(), pending.id.clone()],
+        steer_count: 0,
+        agent_mail_message_id: None,
+    })?;
+
+    let turns = manager.store.list_turns_for_thread(&thread.id)?;
+    let messages = manager.reconstruct_messages_from_turns(&turns)?;
+    let replayed: Vec<String> = messages
+        .iter()
+        .flat_map(|message| message.content.iter())
+        .filter_map(|block| match block {
+            ContentBlock::Text { text, .. } => Some(text.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        replayed,
+        vec!["hello".to_string()],
+        "only the delivered user message may be rebuilt"
+    );
 
     let _ = std::fs::remove_dir_all(dir);
     Ok(())
@@ -15318,6 +15620,7 @@ fn restart_rebuild_skips_legacy_tool_items_without_identity() -> Result<()> {
         routing_settlement: false,
         effective_route_usage: None,
         permission_posture: None,
+        mode: None,
         effective_provider: None,
         effective_provider_id: None,
         effective_openrouter_vendor: None,
@@ -16019,7 +16322,7 @@ mod runtime_image_inputs {
             let turn = manager
                 .start_turn_from_stored_images(&fork.id, request.clone())
                 .await?;
-            let Some(Op::SendMessage { images, .. }) = harness.rx_op.recv().await else {
+            let Some(Op::SendMessage(TurnSpec { images, .. })) = harness.rx_op.recv().await else {
                 bail!("expected stored image retry");
             };
             assert_eq!(images, request.images);
@@ -16097,5 +16400,179 @@ fn output_cap_wire_requires_positive_integer_and_preserves_legacy_absence() -> R
     let valid: StartTurnRequest =
         serde_json::from_value(json!({"prompt":"review","maxOutputTokens":1500}))?;
     assert_eq!(valid.max_output_tokens.unwrap().get(), 1500);
+    Ok(())
+}
+
+/// Notice projection (#6180): engine events raise watchable notices with
+/// thread/turn identity; elevation clears when its tool call completes and
+/// the rest clear on ack.
+#[tokio::test]
+async fn notices_raise_from_engine_events_and_clear_on_settle_or_ack() -> Result<()> {
+    let manager = test_manager(test_runtime_dir())?;
+    let thread = manager
+        .create_thread(CreateThreadRequest {
+            model: None,
+            workspace: None,
+            mode: None,
+            allow_shell: None,
+            trust_mode: Some(true),
+            auto_approve: Some(true),
+            archived: false,
+            system_prompt: None,
+            task_id: None,
+            ..Default::default()
+        })
+        .await?;
+    let mut harness = install_mock_engine(&manager, &thread.id).await;
+    let turn = manager
+        .start_turn(
+            &thread.id,
+            StartTurnRequest {
+                prompt: "raise notices".to_string(),
+                ..Default::default()
+            },
+        )
+        .await?;
+    assert!(matches!(
+        harness.rx_op.recv().await,
+        Some(Op::SendMessage(TurnSpec { .. }))
+    ));
+    // Agent-scoped events before TurnStarted are control-plane receipts and
+    // are skipped; the turn must start before completions count.
+    harness
+        .tx_event
+        .send(EngineEvent::TurnStarted {
+            turn_id: turn.id.clone(),
+            created_at: Utc::now(),
+            route: None,
+        })
+        .await?;
+
+    // Event projection runs on the engine task; wait (bounded) for each
+    // notice rather than sleeping a fixed span.
+    async fn wait_for_notices(
+        manager: &RuntimeThreadManager,
+        thread_id: &str,
+        count: usize,
+    ) -> Vec<ActiveNotice> {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let notices = manager.list_notices(thread_id);
+            if notices.len() == count || tokio::time::Instant::now() >= deadline {
+                return notices;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    harness
+        .tx_event
+        .send(EngineEvent::AgentComplete {
+            owner_session_id: thread.id.clone(),
+            id: "agent_done".to_string(),
+            result: "did the thing".to_string(),
+            outcome: Some(crate::tools::subagent::SubAgentStatus::Completed),
+            parent_run_id: None,
+            spawn_depth: None,
+            continuable: None,
+            usage: Some(crate::tools::subagent::AgentRunUsage {
+                status: "completed".to_string(),
+                input_tokens: Some(800),
+                output_tokens: Some(200),
+                total_tokens: Some(1000),
+                cost_microusd: Some(50),
+                note: String::new(),
+            }),
+        })
+        .await?;
+    let notices = wait_for_notices(&manager, &thread.id, 1).await;
+    assert_eq!(notices.len(), 1, "agent completion raises: {notices:?}");
+    // #6315: the completion receipt's usage persists on the event payload
+    // so metrics can answer where the child tokens went.
+    let events = manager.events_since(&thread.id, None)?;
+    let completed = events
+        .iter()
+        .find(|event| event.event == "agent.completed")
+        .expect("agent.completed persisted");
+    assert_eq!(completed.payload["usage"]["total_tokens"], 1000);
+    assert_eq!(completed.payload["usage"]["cost_microusd"], 50);
+
+    harness
+        .tx_event
+        .send(EngineEvent::ToolCallComplete {
+            id: "tool_notify_1".to_string(),
+            name: "notify".to_string(),
+            result: Ok(crate::tools::spec::ToolResult::success("pinged")),
+        })
+        .await?;
+    let notices = wait_for_notices(&manager, &thread.id, 2).await;
+    assert_eq!(notices.len(), 2, "model notify raises: {notices:?}");
+
+    harness
+        .tx_event
+        .send(EngineEvent::ElevationRequired {
+            tool_id: "tool_needs_elev".to_string(),
+            tool_name: "exec_command".to_string(),
+            command: None,
+            denial_reason: "sandbox denied".to_string(),
+            blocked_network: false,
+            blocked_write: false,
+        })
+        .await?;
+    assert!(matches!(
+        harness.recv_approval_event().await,
+        Some(crate::core::engine::MockApprovalEvent::RetryWithPolicy { .. })
+    ));
+    let notices = wait_for_notices(&manager, &thread.id, 3).await;
+    let kinds: Vec<&str> = notices.iter().map(|n| n.kind.as_str()).collect();
+    assert_eq!(notices.len(), 3, "all three kinds raise: {kinds:?}");
+    assert!(kinds.contains(&"elevation-needed"));
+    assert!(kinds.contains(&"subagent-terminal"));
+    assert!(kinds.contains(&"model-notify"));
+    assert!(notices.iter().all(|n| n.turn_id == turn.id));
+    let notify_id = notices
+        .iter()
+        .find(|n| n.kind == "model-notify")
+        .map(|n| n.id.clone())
+        .context("missing model-notify")?;
+
+    // The elevation question ends when its tool call completes.
+    harness
+        .tx_event
+        .send(EngineEvent::ToolCallComplete {
+            id: "tool_needs_elev".to_string(),
+            name: "exec_command".to_string(),
+            result: Ok(crate::tools::spec::ToolResult::success("elevated ok")),
+        })
+        .await?;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let notices = manager.list_notices(&thread.id);
+        if notices.len() == 2 || tokio::time::Instant::now() >= deadline {
+            assert_eq!(notices.len(), 2, "elevation clears on settle");
+            assert!(notices.iter().all(|n| n.kind != "elevation-needed"));
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    // Terminal/notify kinds clear on ack; unknown acks report false.
+    assert!(manager.ack_notice(&thread.id, &notify_id));
+    assert!(!manager.ack_notice(&thread.id, &notify_id));
+    assert!(!manager.ack_notice(&thread.id, "notice_nope"));
+    assert_eq!(manager.list_notices(&thread.id).len(), 1);
+
+    harness
+        .tx_event
+        .send(EngineEvent::TurnComplete {
+            usage: Usage::default(),
+            parent_route_usage: Usage::default(),
+            routed_usage_dropped_records: 0,
+            status: TurnOutcomeStatus::Completed,
+            error: None,
+            tool_catalog: None,
+            base_url: None,
+        })
+        .await?;
     Ok(())
 }

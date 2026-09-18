@@ -139,6 +139,40 @@ fn parse_auto(id: &str, body: &str) -> super::types::MarketplaceCatalog {
 }
 
 #[test]
+fn native_catalog_keeps_identity_without_fetching_artwork_or_granting_trust() {
+    let manifest: Value =
+        serde_json::from_str(include_str!("../../../plugins/computer-use/plugin.json")).unwrap();
+    let icon = manifest["extensions"]["net.codewhale"]["icon"]
+        .as_str()
+        .unwrap();
+    let mut entry = serde_json::json!({"name":"computer-use","source":"github:Hmbown/codewhale-cu-plugin","display_name":"Computer Use","author":"Codewhale","icon":icon,"platforms":["macos","windows","linux"]});
+    let catalog = parse(
+        "identity",
+        MarketplaceFormat::Codewhale,
+        &serde_json::json!({"name":"identity","plugins":[entry.clone()]}).to_string(),
+    );
+    let candidate = catalog.candidate_by_name("computer-use").unwrap();
+    assert_eq!(candidate.display_name.as_deref(), Some("Computer Use"));
+    assert_eq!(candidate.author.as_deref(), Some("Codewhale"));
+    assert_eq!(candidate.icon.as_deref(), Some(icon));
+    assert_eq!(
+        candidate.when.as_ref().unwrap().os.as_ref().unwrap().len(),
+        3
+    );
+    assert_eq!(candidate.provenance.tier, CatalogTier::Community);
+    assert!(!candidate.has_errors());
+    entry["icon"] = serde_json::json!("https://publisher.example/tracker.png");
+    let rejected = parse(
+        "identity",
+        MarketplaceFormat::Codewhale,
+        &serde_json::json!({"name":"identity","plugins":[entry]}).to_string(),
+    );
+    let candidate = rejected.candidate_by_name("computer-use").unwrap();
+    assert!(candidate.icon.is_none());
+    assert!(candidate.has_errors());
+}
+
+#[test]
 fn kimi_official_marketplace_parses_all_five_real_entries() {
     let catalog = parse_auto("kimi", KIMI_OFFICIAL_MARKETPLACE);
     assert_eq!(catalog.format, MarketplaceFormat::Kimi);

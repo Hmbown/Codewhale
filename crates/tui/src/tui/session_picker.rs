@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Local};
-use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::{
     buffer::Buffer,
     layout::{Constraint, Direction, Layout, Rect},
@@ -75,6 +75,14 @@ pub struct SessionPickerView {
     /// (#2934 / #4397). Defaults to `false`: archiving is the user putting a
     /// session away, and the browse default should honour that.
     show_archived: bool,
+    /// Hide empty auto-created sessions — the same filter the launch list
+    /// and `--continue` already apply (#6014). The picker exists to resume
+    /// work, and a session with no messages has none to resume.
+    hide_empty_sessions: bool,
+    /// The session the caller is running in, when it hands one over. Rows
+    /// mark it `current` so the user can tell which session they are inside
+    /// (#6014). Never inferred from disk state.
+    current_session_id: Option<String>,
     /// Screen rows owned by the visible session list. Keeping this local to
     /// the view gives mouse and keyboard the same selection/resume contract.
     last_row_hitboxes: RefCell<Vec<(u16, usize)>>,
@@ -135,6 +143,8 @@ impl SessionPickerView {
             workspace_scope: Some(canonical_or_self(workspace.to_path_buf())),
             show_all_workspaces: false,
             show_archived: false,
+            hide_empty_sessions: true,
+            current_session_id: None,
             last_row_hitboxes: RefCell::new(Vec::new()),
             locale,
         };
@@ -154,30 +164,54 @@ impl SessionPickerView {
     /// behind the user's back.
     pub fn new_selecting(workspace: &Path, locale: Locale, session_id: &str) -> Self {
         let mut view = Self::new(workspace, locale);
-        if view.select_session_id(session_id) {
-            return view;
+        view.select_with_fallback(session_id);
+        view
+    }
+
+    /// Land the selection on `session_id`, widening one browse filter at a
+    /// time when the row is outside the default view.
+    fn select_with_fallback(&mut self, session_id: &str) {
+        if self.select_session_id(session_id) {
+            return;
         }
-        if !view.show_archived {
-            view.show_archived = true;
-            view.apply_sort_and_filter();
-            if view.select_session_id(session_id) {
-                view.status =
-                    Some(tr(view.locale, MessageId::SessionsShowingArchived).into_owned());
-                return view;
+        if !self.show_archived {
+            self.show_archived = true;
+            self.apply_sort_and_filter();
+            if self.select_session_id(session_id) {
+                self.status =
+                    Some(tr(self.locale, MessageId::SessionsShowingArchived).into_owned());
+                return;
             }
         }
-        if !view.show_all_workspaces {
-            view.show_all_workspaces = true;
-            view.apply_sort_and_filter();
-            if view.select_session_id(session_id) {
-                view.status =
-                    Some(tr(view.locale, MessageId::SessionsShowingAllWorkspaces).into_owned());
-                return view;
+        if !self.show_all_workspaces {
+            self.show_all_workspaces = true;
+            self.apply_sort_and_filter();
+            if self.select_session_id(session_id) {
+                self.status =
+                    Some(tr(self.locale, MessageId::SessionsShowingAllWorkspaces).into_owned());
+                return;
+            }
+        }
+        // Last resort: an empty auto-created session is hidden by default
+        // but a rail handoff may still target it — widen that filter too
+        // rather than report "no results" for a session that exists (#6014).
+        if self.hide_empty_sessions {
+            self.hide_empty_sessions = false;
+            self.apply_sort_and_filter();
+            if self.select_session_id(session_id) {
+                return;
             }
         }
         // Not found at all: leave the default view rather than pretending.
-        view.status = Some(tr(view.locale, MessageId::SessionsNoResults).into_owned());
-        view
+        self.status = Some(tr(self.locale, MessageId::SessionsNoResults).into_owned());
+    }
+
+    /// Mark `session_id` as the session the caller is running in. Rows mark
+    /// it `current` (#6014); `None` leaves every row unmarked.
+    #[must_use]
+    pub fn with_current_session(mut self, session_id: Option<&str>) -> Self {
+        self.current_session_id = session_id.map(str::to_string);
+        self
     }
 
     /// Move the selection onto `session_id` if it is in the filtered list.
@@ -204,6 +238,9 @@ impl SessionPickerView {
             .with_sort(self.sort_mode)
             .with_search(self.search_input.trim().to_string())
             .with_limit(MAX_PROJECTED_SESSIONS);
+        if self.hide_empty_sessions {
+            query = query.without_empty_auto_created();
+        }
         if !self.show_all_workspaces
             && let Some(scope) = self.workspace_scope.as_deref()
         {
@@ -278,10 +315,24 @@ impl SessionPickerView {
         self.refresh_preview();
     }
 
-    fn move_selection(&mut self, delta: isize) {
-        self.selected = crate::tui::list_nav::wrap_index(self.selected, self.filtered.len(), delta);
+    /// Apply one [`list_nav`](crate::tui::list_nav) motion (#6290), returning
+    /// whether it was consumed. `Prev`/`Next` wrap (existing behavior);
+    /// paging and Home/End clamp — a paging key asks to travel, not to
+    /// teleport. The horizontal axis has nowhere to go on this surface.
+    fn apply_motion(&mut self, motion: crate::tui::list_nav::Motion) -> bool {
+        if self.filtered.is_empty() {
+            return false;
+        }
+        let page = self.list_visible_rows.get().max(1);
+        let Some(next) =
+            crate::tui::list_nav::apply(self.selected, self.filtered.len(), page, motion)
+        else {
+            return false;
+        };
+        self.selected = next;
         self.ensure_selected_visible();
         self.refresh_preview();
+        true
     }
 
     fn select_visible_shortcut(&mut self, c: char) -> bool {
@@ -595,8 +646,12 @@ impl ModalView for SessionPickerView {
 
     fn handle_mouse(&mut self, mouse: MouseEvent) -> ViewAction {
         match mouse.kind {
-            MouseEventKind::ScrollUp => self.move_selection(-1),
-            MouseEventKind::ScrollDown => self.move_selection(1),
+            MouseEventKind::ScrollUp => {
+                self.apply_motion(crate::tui::list_nav::Motion::Prev);
+            }
+            MouseEventKind::ScrollDown => {
+                self.apply_motion(crate::tui::list_nav::Motion::Next);
+            }
             MouseEventKind::Down(MouseButton::Left) => {
                 let clicked = self
                     .last_row_hitboxes
@@ -692,26 +747,33 @@ impl ModalView for SessionPickerView {
             }
         }
 
+        // Shift-modified paging belongs to the preview pane (#6014) and must
+        // be claimed before the shared vocabulary sees the bare keys.
+        if key.modifiers.contains(KeyModifiers::SHIFT) {
+            match key.code {
+                KeyCode::PageUp => {
+                    let rows = self.history_visible_rows.get().max(1);
+                    self.scroll_history(-(rows as isize));
+                    return ViewAction::None;
+                }
+                KeyCode::PageDown => {
+                    let rows = self.history_visible_rows.get().max(1);
+                    self.scroll_history(rows as isize);
+                    return ViewAction::None;
+                }
+                _ => {}
+            }
+        }
+        // Movement keys come from the shared vocabulary (#6290); this match
+        // owns only the picker's own verbs.
+        if let Some(motion) = crate::tui::list_nav::motion(&key)
+            && self.apply_motion(motion)
+        {
+            return ViewAction::None;
+        }
+
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => ViewAction::Close,
-            KeyCode::Up | KeyCode::Char('k') => {
-                self.move_selection(-1);
-                ViewAction::None
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                self.move_selection(1);
-                ViewAction::None
-            }
-            KeyCode::PageUp => {
-                let rows = self.history_visible_rows.get().max(1);
-                self.scroll_history(-(rows as isize));
-                ViewAction::None
-            }
-            KeyCode::PageDown => {
-                let rows = self.history_visible_rows.get().max(1);
-                self.scroll_history(rows as isize);
-                ViewAction::None
-            }
             KeyCode::Char('/') => {
                 self.enter_search();
                 ViewAction::None
@@ -821,6 +883,7 @@ impl ModalView for SessionPickerView {
                 self.rename_mode,
                 &self.rename_input,
                 self.status.as_deref(),
+                self.current_session_id.as_deref(),
                 self.locale,
             );
             *self.last_row_hitboxes.borrow_mut() = (0..visible_rows)
@@ -851,7 +914,10 @@ impl ModalView for SessionPickerView {
             .constraints(if narrow {
                 [Constraint::Percentage(42), Constraint::Percentage(58)]
             } else {
-                [Constraint::Percentage(64), Constraint::Percentage(36)]
+                // 36% was too thin for session rows — the list exists to be
+                // scanned, so give it a fairer share on wide terminals
+                // (#6014).
+                [Constraint::Percentage(56), Constraint::Percentage(44)]
             })
             .split(content);
         let (history_area, list_area) = if narrow {
@@ -892,6 +958,7 @@ impl ModalView for SessionPickerView {
             self.rename_mode,
             &self.rename_input,
             self.status.as_deref(),
+            self.current_session_id.as_deref(),
             self.locale,
         );
         *self.last_row_hitboxes.borrow_mut() = (0..visible_rows)
@@ -949,6 +1016,7 @@ fn build_list_lines(
     rename_mode: bool,
     rename_input: &str,
     status: Option<&str>,
+    current_session_id: Option<&str>,
     locale: Locale,
 ) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
@@ -1000,10 +1068,19 @@ fn build_list_lines(
         } else {
             "   ".to_string()
         };
-        let mut line = format!("{prefix}{}", format_session_line(session, locale));
+        // The row for the session the user is inside gets a text label, not
+        // colour alone — the same monochrome-safe convention as the
+        // archived/fork labels (#6014).
+        let is_current = current_session_id == Some(session.id.as_str());
+        let mut line = format!(
+            "{prefix}{}",
+            format_session_line(session, is_current, locale)
+        );
         line = truncate(&line, width);
         let style = if idx == selected {
             menu_style::selected_row_style()
+        } else if is_current {
+            Style::default().fg(palette::WHALE_ACTION)
         } else {
             Style::default().fg(palette::TEXT_PRIMARY)
         };
@@ -1028,7 +1105,7 @@ fn build_list_lines(
     lines
 }
 
-fn format_session_line(session: &SessionMetadata, locale: Locale) -> String {
+fn format_session_line(session: &SessionMetadata, is_current: bool, locale: Locale) -> String {
     let age = format_relative_time(&session.updated_at, locale);
     let updated = crate::session_manager::format_session_updated_at(&session.updated_at, &age);
     let raw_title = extract_title(&session.title);
@@ -1059,11 +1136,17 @@ fn format_session_line(session: &SessionMetadata, locale: Locale) -> String {
     } else {
         fork_label
     };
+    let current_label = if is_current {
+        format!(" | {}", tr(locale, MessageId::SessionsCurrentCompact))
+    } else {
+        String::new()
+    };
     format!(
-        "{} | {} | {}{} | {} | {}",
+        "{} | {} | {}{}{} | {} | {}",
         crate::session_manager::truncate_id(&session.id),
         title,
         message_count,
+        current_label,
         fork_label,
         mode,
         updated
@@ -1071,11 +1154,13 @@ fn format_session_line(session: &SessionMetadata, locale: Locale) -> String {
 }
 
 fn build_preview_lines(session: &SavedSession, locale: Locale) -> Vec<String> {
-    let mut out = Vec::new();
-    out.push(
+    let mut out = vec![
         tr(locale, MessageId::SessionsPreviewTitle)
             .replace("{title}", extract_title(&session.metadata.title)),
-    );
+    ];
+    // The full id is the handle `codewhale exec --session` and `/resume`
+    // need — the list row only has room for the truncated form (#6014).
+    out.push(tr(locale, MessageId::SessionsPreviewId).replace("{id}", &session.metadata.id));
     out.push(
         tr(locale, MessageId::SessionsPreviewUpdated).replace(
             "{updated}",
@@ -1350,6 +1435,8 @@ mod tests {
             workspace_scope,
             show_all_workspaces: false,
             show_archived: false,
+            hide_empty_sessions: true,
+            current_session_id: None,
             last_row_hitboxes: RefCell::new(Vec::new()),
             locale: Locale::En,
         };
@@ -1493,6 +1580,164 @@ mod tests {
         );
     }
 
+    #[test]
+    fn empty_auto_created_sessions_stay_out_of_the_default_view() {
+        let mut empty = test_session(0, crate::session_manager::DEFAULT_SESSION_TITLE);
+        empty.message_count = 0;
+        let view = SessionPickerView::new_with_sessions(
+            std::path::Path::new("/tmp"),
+            Locale::En,
+            vec![test_session(1, "Real work"), empty],
+        );
+
+        assert_eq!(
+            view.visible_session_ids(),
+            vec!["session-01".to_string()],
+            "a session with no messages has nothing to resume (#6014)"
+        );
+    }
+
+    #[test]
+    fn preselecting_an_empty_row_widens_the_empty_filter_only() {
+        let _lock = crate::test_support::lock_test_env();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", tmp.path());
+        let manager = SessionManager::default_location().expect("session manager");
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        let mut saved = saved_session_with_messages(vec![]);
+        saved.metadata.id = "session-01".to_string();
+        saved.metadata.title = crate::session_manager::DEFAULT_SESSION_TITLE.to_string();
+        saved.metadata.message_count = 0;
+        saved.metadata.workspace.clone_from(&workspace);
+        manager.save_session(&saved).expect("save session");
+
+        let view = SessionPickerView::new_selecting(&workspace, Locale::En, "session-01");
+
+        assert_eq!(
+            view.selected_session().map(|s| s.id.as_str()),
+            Some("session-01"),
+            "an explicit handoff must still land on a hidden empty row (#6014)"
+        );
+        assert!(
+            !view.hide_empty_sessions,
+            "the empty-session filter had to be lifted to reach the row"
+        );
+    }
+
+    #[test]
+    fn current_session_row_carries_a_text_label() {
+        let sessions = vec![
+            test_session(1, "first session"),
+            test_session(2, "second session"),
+        ];
+        let lines = build_list_lines(
+            &sessions,
+            1,
+            80,
+            0,
+            5,
+            false,
+            "",
+            "recent",
+            false,
+            false,
+            "",
+            None,
+            Some("session-01"),
+            Locale::En,
+        );
+        let row_for = |needle: &str| {
+            lines
+                .iter()
+                .map(|line| {
+                    line.spans
+                        .iter()
+                        .map(|span| span.content.to_string())
+                        .collect::<String>()
+                })
+                .find(|text| text.contains(needle))
+                .unwrap_or_default()
+        };
+        assert!(
+            row_for("first session").contains("current"),
+            "the active row needs a monochrome-safe label (#6014): {:?}",
+            row_for("first session")
+        );
+        assert!(!row_for("second session").contains("current"));
+    }
+
+    #[test]
+    fn preview_lists_the_full_session_id() {
+        let mut saved = saved_session_with_messages(vec![text_message("user", "hi")]);
+        saved.metadata.id = "session-with-a-long-identifier".to_string();
+        let lines = build_preview_lines(&saved, Locale::En);
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("session-with-a-long-identifier")),
+            "the row truncates the id; the preview is where the full handle lives (#6014)"
+        );
+    }
+
+    #[test]
+    fn page_keys_page_the_list_and_clamp_at_the_end() {
+        let sessions: Vec<SessionMetadata> = (0..20)
+            .map(|i| test_session(i, &format!("work {i}")))
+            .collect();
+        let mut view = picker_with(sessions, None);
+        // Seed the preview cache so refresh_preview never reaches the store.
+        for session in &view.sessions {
+            view.preview_cache
+                .insert(session.id.clone(), vec!["preview".to_string()]);
+        }
+
+        view.handle_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+        assert_eq!(view.selected, 8, "one viewport of eight rows");
+        view.handle_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+        assert_eq!(view.selected, 16);
+        view.handle_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+        assert_eq!(view.selected, 19, "paging clamps at the last row");
+        view.handle_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE));
+        assert_eq!(view.selected, 11);
+    }
+
+    /// #6290 step 2: the picker navigates on the shared `list_nav` vocabulary,
+    /// so Home/End exist here and the `j`/`k` aliases keep working — the two
+    /// behaviors this surface previously hand-rolled (or lacked).
+    #[test]
+    fn home_end_and_letter_aliases_come_from_the_shared_vocabulary() {
+        let sessions: Vec<SessionMetadata> = (0..20)
+            .map(|i| test_session(i, &format!("work {i}")))
+            .collect();
+        let mut view = picker_with(sessions, None);
+        for session in &view.sessions {
+            view.preview_cache
+                .insert(session.id.clone(), vec!["preview".to_string()]);
+        }
+
+        view.handle_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+        assert_eq!(view.selected, 19, "End lands on the last row");
+        view.handle_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
+        assert_eq!(view.selected, 0, "Home lands on the first row");
+        view.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert_eq!(view.selected, 1, "`j` is still the Down alias");
+        view.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
+        assert_eq!(view.selected, 0, "`k` is still the Up alias");
+    }
+
+    #[test]
+    fn shift_page_keys_still_scroll_the_history_preview() {
+        let mut view = picker_with(vec![test_session(1, "only session")], None);
+        view.current_preview = (0..30).map(|i| format!("line {i}")).collect();
+        view.history_visible_rows.set(10);
+
+        view.handle_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::SHIFT));
+        assert_eq!(view.history_scroll.get(), 10);
+        view.handle_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::SHIFT));
+        assert_eq!(view.history_scroll.get(), 0);
+    }
+
     fn buffer_row_text(buf: &Buffer, area: Rect, y: u16) -> String {
         (area.x..area.x.saturating_add(area.width))
             .map(|x| buf[(x, y)].symbol())
@@ -1587,6 +1832,7 @@ mod tests {
             false,
             "",
             None,
+            None,
             Locale::En,
         );
 
@@ -1617,6 +1863,7 @@ mod tests {
             false,
             false,
             "",
+            None,
             None,
             Locale::En,
         );
@@ -1772,11 +2019,11 @@ mod tests {
 
             let dump = buffer_text(&buf, area);
             assert!(
-                dump.contains("sessions (1-9)"),
+                dump.contains("sessions (1-9, PgUp/PgDn)"),
                 "{label} sessions pane missing:\n{dump}"
             );
             assert!(
-                dump.contains("history (PgUp/PgDn)"),
+                dump.contains("history (Shift+PgUp/PgDn)"),
                 "{label} history pane missing:\n{dump}"
             );
             assert!(dump.contains('─'), "{label} hairline missing:\n{dump}");
@@ -1823,6 +2070,7 @@ mod tests {
             false,
             "",
             None,
+            None,
             Locale::En,
         );
 
@@ -1856,6 +2104,7 @@ mod tests {
             false,
             "",
             None,
+            None,
             Locale::En,
         );
 
@@ -1887,6 +2136,7 @@ mod tests {
             false,
             false,
             "",
+            None,
             None,
             Locale::En,
         );
@@ -2039,6 +2289,8 @@ mod tests {
             workspace_scope: None,
             show_all_workspaces: true,
             show_archived: false,
+            hide_empty_sessions: false,
+            current_session_id: None,
             last_row_hitboxes: RefCell::new(Vec::new()),
             locale: Locale::En,
         };

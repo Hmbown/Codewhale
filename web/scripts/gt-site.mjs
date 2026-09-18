@@ -48,6 +48,7 @@ const STEMS = {
   "docs-trust": { exportName: "docsTrust", typeName: "DocsTrustDict" },
   states: { exportName: "states", typeName: "StatesDict" },
   changelog: { exportName: "changelog", typeName: "ChangelogDict" },
+  "computer-use": { exportName: "computerUse", typeName: "ComputerUseDict" },
 };
 
 const REQUIRED_STEMS = ["chrome", "home"];

@@ -90,7 +90,8 @@ This is stage 1 of the loop: **orient → [cw-slice](../cw-slice/SKILL.md) →
 
 ## Output
 
-State, in one short block, before doing anything else:
+Open with a short status block. Skip fields that are empty or normal — a
+clean tree on `main` with no related worktrees is one line, not five:
 
 - checkout path, branch (or detached HEAD), base commit;
 - dirty files and whose they appear to be;

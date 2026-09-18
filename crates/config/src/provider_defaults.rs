@@ -113,6 +113,8 @@ pub(crate) const DEFAULT_ARCEE_BASE_URL: &str = "https://api.arcee.ai/api/v1";
 pub(crate) const DEFAULT_HUGGINGFACE_MODEL: &str = "deepseek-ai/DeepSeek-V4-Pro";
 pub(crate) const DEFAULT_HUGGINGFACE_FLASH_MODEL: &str = "deepseek-ai/DeepSeek-V4-Flash";
 pub(crate) const DEFAULT_HUGGINGFACE_BASE_URL: &str = "https://router.huggingface.co/v1";
+pub(crate) const DEFAULT_MODELSCOPE_MODEL: &str = "Qwen/Qwen3.5-397B-A17B";
+pub(crate) const DEFAULT_MODELSCOPE_BASE_URL: &str = "https://api-inference.modelscope.cn/v1";
 pub(crate) const DEFAULT_TOGETHER_MODEL: &str = "deepseek-ai/DeepSeek-V4-Pro";
 pub(crate) const DEFAULT_TOGETHER_FLASH_MODEL: &str = "deepseek-ai/DeepSeek-V4-Flash";
 pub(crate) const DEFAULT_TOGETHER_BASE_URL: &str = "https://api.together.xyz/v1";
@@ -166,9 +168,8 @@ pub(crate) const DEFAULT_SAKANA_BASE_URL: &str = "https://api.sakana.ai/v1";
 // Meituan LongCat defaults
 pub(crate) const DEFAULT_LONGCAT_MODEL: &str = "LongCat-2.0";
 pub(crate) const DEFAULT_LONGCAT_BASE_URL: &str = "https://api.longcat.chat/openai/v1";
-// OpenCode Go Chat Completions defaults. The Go catalog also contains models
-// served only through Anthropic Messages; those are deliberately not listed by
-// this provider until Codewhale can route wire formats per model.
+// OpenCode Go keeps its Chat default and resolves other model protocols from
+// the shared opencode_go roster.
 pub(crate) const DEFAULT_OPENCODE_GO_MODEL: &str = "deepseek-v4-pro";
 pub(crate) const DEFAULT_OPENCODE_GO_BASE_URL: &str = "https://opencode.ai/zen/go/v1";
 pub(crate) const OPENCODE_GO_GROK_4_5_MODEL: &str = "grok-4.5";
@@ -201,6 +202,10 @@ pub(crate) const DEFAULT_TELECOMJS_BASE_URL: &str = "https://aigw.telecomjs.com/
 // Eden AI (OpenAI-compatible AI gateway) defaults
 pub(crate) const DEFAULT_EDENAI_MODEL: &str = "deepseek/deepseek-v4-pro";
 pub(crate) const DEFAULT_EDENAI_BASE_URL: &str = "https://api.edenai.run/v3";
+// ZenMux (OpenAI-compatible AI gateway) defaults. Default model verified
+// present in the live keyless catalog at https://zenmux.ai/api/v1/models.
+pub(crate) const DEFAULT_ZENMUX_MODEL: &str = "deepseek/deepseek-v4.1-flash";
+pub(crate) const DEFAULT_ZENMUX_BASE_URL: &str = "https://zenmux.ai/api/v1";
 // Concentrate (OpenAI Responses-compatible AI gateway) defaults. Contract:
 // https://concentrate.ai/docs/api-reference/introduction — base URL, bearer
 // Universal API key, `POST /v1/responses`, unauthenticated `GET /v1/models`.

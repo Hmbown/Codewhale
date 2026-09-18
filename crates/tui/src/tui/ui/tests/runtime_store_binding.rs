@@ -281,7 +281,18 @@ async fn runtime_store_binding_survives_launch_snapshot_and_resume() -> anyhow::
     let old_id = other_app.current_session_id.clone();
     let error = apply_loaded_session_with_goal(&mut other_app, &mut resumed_config, &loaded, None)
         .unwrap_err();
-    assert!(error.contains("Resume it in a new Codewhale process"));
+    // The refusal must name the route that actually works. "Resume it in a new
+    // Codewhale process" was true but unactionable: starting a new process and
+    // then picking the session from `/resume` returns here, because that is
+    // this same switch path (#6207, #6225).
+    assert!(
+        error.contains("codewhale resume"),
+        "the refusal must point at the direct-open path: {error}"
+    );
+    assert!(
+        error.contains(&loaded.metadata.id),
+        "the refusal must name the session to open: {error}"
+    );
     assert_eq!(other_app.current_session_id, old_id);
     assert_eq!(other_app.input, "preserve pending input");
     foreign.shutdown_and_wait().await?;
@@ -508,7 +519,7 @@ async fn picker_recovers_missing_store_into_the_idle_host_and_persists_before_re
     let binding = tasks.session_store_binding().expect("current host");
     app.runtime_services.task_manager = Some(tasks.clone());
     app.current_session_id = Some("picker-current".into());
-    app.api_messages
+    app.api_messages_mut()
         .push(text_message("user", "current conversation"));
     let current_messages = app.api_messages.clone();
     let plan_state = app.plan_state.clone();
@@ -549,6 +560,234 @@ async fn picker_recovers_missing_store_into_the_idle_host_and_persists_before_re
             .runtime_store,
         durable.metadata.runtime_store
     );
+    tasks.shutdown_and_wait().await?;
+    Ok(())
+}
+
+/// #6207: a store that exists but is empty, unheld, and scope-free holds
+/// nothing a session switch could abandon. A force-quit leaves exactly that
+/// shape — the directory is on disk, ownerless, with zero events — and
+/// refusing it left the session unopenable while protecting nothing.
+#[test]
+fn adoptable_empty_store_reports_nothing_to_abandon() -> anyhow::Result<()> {
+    let _environment = crate::test_support::lock_test_env();
+    let root = tempfile::tempdir()?;
+    let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", root.path());
+    let _runtime = crate::test_support::EnvVarGuard::remove("CODEWHALE_RUNTIME_DIR");
+    let _legacy = crate::test_support::EnvVarGuard::remove("DEEPSEEK_RUNTIME_DIR");
+
+    let store_dir = root.path().join("sessions/interrupted/runtime");
+    // Open a real store, so the layout under test is the product's rather than
+    // the test's idea of it.
+    drop(crate::runtime_threads::RuntimeThreadStore::open(
+        store_dir.clone(),
+    )?);
+
+    let binding = crate::runtime_threads::RuntimeStoreBinding {
+        data_dir: store_dir.clone(),
+        execution_scope: "0".repeat(64),
+    };
+    assert!(
+        !binding.is_missing_session_store()?,
+        "the store exists, so the old predicate cannot recover it"
+    );
+    assert!(
+        binding.has_no_durable_work()?,
+        "a freshly opened store holds nothing to abandon"
+    );
+    assert!(
+        !binding.has_live_holder()?,
+        "nobody holds the freshly opened store"
+    );
+    assert!(
+        !binding.has_scope_pinned_automation()?,
+        "no automations exist under the fixture home"
+    );
+    assert!(
+        binding.is_adoptable_empty_store()?,
+        "empty, unheld, scope-free: adoptable"
+    );
+
+    // Each work directory must be load-bearing on its own. If `open` gains a
+    // directory that RUNTIME_STORE_WORK_DIRS misses, this is the assertion that
+    // notices, instead of the miss silently widening what a switch will adopt.
+    for dir in [
+        "threads",
+        "turns",
+        "items",
+        "events",
+        "goals",
+        "agent-mail",
+        "turn-operations",
+    ] {
+        let marker = store_dir.join(dir).join("work.json");
+        std::fs::write(&marker, "{}")?;
+        assert!(
+            !binding.has_no_durable_work()?,
+            "{dir} holds work; the store must not be adopted"
+        );
+        assert!(
+            !binding.is_adoptable_empty_store()?,
+            "{dir} blocks the adopt"
+        );
+        std::fs::remove_file(&marker)?;
+    }
+    assert!(
+        binding.is_adoptable_empty_store()?,
+        "markers removed: adoptable again"
+    );
+    Ok(())
+}
+
+/// #6207: the race that reverted the first fix — a live foreign TaskManager
+/// holds the store while its disk state is still empty, so emptiness alone
+/// cannot tell abandonment from a holder that has not flushed yet. The
+/// process-owner lock is held for the manager's lifetime, which is what
+/// distinguishes the two.
+#[test]
+fn adoptable_empty_store_refuses_a_live_holder() -> anyhow::Result<()> {
+    let _environment = crate::test_support::lock_test_env();
+    let root = tempfile::tempdir()?;
+    let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", root.path());
+    let _runtime = crate::test_support::EnvVarGuard::remove("CODEWHALE_RUNTIME_DIR");
+    let _legacy = crate::test_support::EnvVarGuard::remove("DEEPSEEK_RUNTIME_DIR");
+
+    let store_dir = root.path().join("sessions/held/runtime");
+    drop(crate::runtime_threads::RuntimeThreadStore::open(
+        store_dir.clone(),
+    )?);
+    let binding = crate::runtime_threads::RuntimeStoreBinding {
+        data_dir: store_dir.clone(),
+        execution_scope: "0".repeat(64),
+    };
+    assert!(binding.is_adoptable_empty_store()?);
+
+    let _held = crate::runtime_threads::RuntimeProcessOwnerLock::acquire(&store_dir)?;
+    assert!(
+        binding.has_live_holder()?,
+        "the held owner lock reads as held"
+    );
+    assert!(
+        !binding.is_adoptable_empty_store()?,
+        "a held store must refuse even while its disk state is empty"
+    );
+    drop(_held);
+    assert!(
+        !binding.has_live_holder()?,
+        "releasing the lock releases the hold"
+    );
+    assert!(
+        binding.is_adoptable_empty_store()?,
+        "unheld again: adoptable"
+    );
+    Ok(())
+}
+
+/// #6207: scope-pinned automations are recorded outside the store
+/// directories, so an otherwise empty store with one bound to its scope
+/// still refuses — adopting it would orphan their scheduled work.
+#[test]
+fn adoptable_empty_store_refuses_a_scope_pinned_automation() -> anyhow::Result<()> {
+    let _environment = crate::test_support::lock_test_env();
+    let root = tempfile::tempdir()?;
+    let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", root.path());
+    let _runtime = crate::test_support::EnvVarGuard::remove("CODEWHALE_RUNTIME_DIR");
+    let _legacy = crate::test_support::EnvVarGuard::remove("DEEPSEEK_RUNTIME_DIR");
+
+    let store_dir = root.path().join("sessions/pinned/runtime");
+    drop(crate::runtime_threads::RuntimeThreadStore::open(
+        store_dir.clone(),
+    )?);
+    let scope = "ab".repeat(32);
+    let binding = crate::runtime_threads::RuntimeStoreBinding {
+        data_dir: store_dir.clone(),
+        execution_scope: scope.clone(),
+    };
+    assert!(binding.is_adoptable_empty_store()?);
+
+    let automations = AutomationManager::open(root.path().join("automations"))?;
+    let created = automations.create_automation(CreateAutomationRequest {
+        name: "scope fixture".into(),
+        prompt: "local fixture only".into(),
+        rrule: "FREQ=HOURLY;INTERVAL=1".into(),
+        cwds: vec![root.path().into()],
+        model: None,
+        model_provider: None,
+        model_provider_id: None,
+        mode: None,
+        allow_shell: Some(false),
+        trust_mode: Some(false),
+        auto_approve: Some(false),
+        delivery_mode: None,
+        status: Some(AutomationStatus::Paused),
+    })?;
+    automations.edit_automation(&created.id, |record| {
+        let mut record = record.ok_or_else(|| anyhow::anyhow!("fresh automation must exist"))?;
+        record.execution_scope = Some(scope.clone());
+        Ok(Some(record))
+    })?;
+    assert!(
+        binding.has_scope_pinned_automation()?,
+        "the bound automation is visible from the binding's scope"
+    );
+    assert!(
+        !binding.is_adoptable_empty_store()?,
+        "a scope-pinned automation blocks the adopt"
+    );
+    Ok(())
+}
+
+/// #6207 end to end: the picker adopts an existing-but-empty unheld store
+/// into the idle host and persists the repaired binding, the way the
+/// missing-store path already does.
+#[tokio::test]
+async fn picker_adopts_existing_empty_unheld_store() -> anyhow::Result<()> {
+    let _environment = crate::test_support::lock_test_env();
+    let root = tempfile::tempdir()?;
+    let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", root.path());
+    let _runtime = crate::test_support::EnvVarGuard::remove("CODEWHALE_RUNTIME_DIR");
+    let _legacy = crate::test_support::EnvVarGuard::remove("DEEPSEEK_RUNTIME_DIR");
+    let sessions = SessionManager::default_location()?;
+    let mut config = fixture_config();
+
+    let store_dir = root.path().join("sessions/previous/runtime");
+    drop(crate::runtime_threads::RuntimeThreadStore::open(
+        store_dir.clone(),
+    )?);
+    let mut saved = crate::session_manager::create_saved_session_with_id_and_mode(
+        "picker-adoptable".into(),
+        &[text_message("user", "retain my work")],
+        "deepseek-v4-pro",
+        root.path(),
+        0,
+        None,
+        None,
+    );
+    saved.metadata.runtime_store = Some(crate::runtime_threads::RuntimeStoreBinding {
+        data_dir: store_dir,
+        execution_scope: "0".repeat(64),
+    });
+    sessions.save_session(&saved)?;
+
+    let mut app = Box::new(create_test_app());
+    let tasks = TaskManager::start(
+        TaskManagerConfig::from_runtime(&config, root.path().into(), None, Some(1)),
+        config.clone(),
+        app.plugin_registry.clone(),
+        "picker-current",
+        None,
+    )
+    .await?;
+    let binding = tasks.session_store_binding().expect("current host");
+    app.runtime_services.task_manager = Some(tasks.clone());
+    app.current_session_id = Some("picker-current".into());
+
+    apply_loaded_session_with_goal(&mut app, &mut config, &saved, None)
+        .map_err(anyhow::Error::msg)?;
+    assert_eq!(app.current_session_id.as_deref(), Some("picker-adoptable"));
+    let durable = sessions.load_session("picker-adoptable")?;
+    assert_eq!(durable.metadata.runtime_store.as_ref(), Some(&binding));
+    assert_eq!(durable.messages, saved.messages);
     tasks.shutdown_and_wait().await?;
     Ok(())
 }

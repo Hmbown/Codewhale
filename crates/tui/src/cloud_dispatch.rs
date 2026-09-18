@@ -1366,7 +1366,7 @@ pub struct LiveDaytonaLauncher;
 impl LiveDaytonaLauncher {
     /// Total timeout for short control-plane calls (create/status/delete/
     /// list). A dispatched harness turn is NOT a short call — see
-    /// [`Self::harness_client`].
+    /// [`Self::harness_client_budget_secs`].
     const CONTROL_PLANE_TIMEOUT_SECS: u64 = 120;
 
     /// Slack added to a harness command's declared budget for the client
@@ -1376,25 +1376,26 @@ impl LiveDaytonaLauncher {
     const HARNESS_CLIENT_SLACK_SECS: u64 = 120;
 
     fn blocking_client() -> Result<reqwest::blocking::Client> {
-        Self::blocking_client_with_timeout(Self::CONTROL_PLANE_TIMEOUT_SECS)
-    }
-
-    fn blocking_client_with_timeout(total_secs: u64) -> Result<reqwest::blocking::Client> {
-        reqwest::blocking::Client::builder()
-            .connect_timeout(std::time::Duration::from_secs(8))
-            .timeout(std::time::Duration::from_secs(total_secs))
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .context("failed to initialize the cloud agent client")
-    }
-
-    /// A client scoped to one harness command: its total timeout is the
-    /// command's declared budget plus fixed slack. The declared turn budget
-    /// is an hour, so the 120s control-plane cap must NOT carry this call —
-    /// otherwise every dispatched turn longer than two minutes fails after
-    /// the spend has already started.
-    fn harness_client(command: &HarnessCommand) -> Result<reqwest::blocking::Client> {
-        Self::blocking_client_with_timeout(Self::harness_client_budget_secs(command))
+        // #6208: one client for the process. A `reqwest` client owns a
+        // connection pool and a TLS configuration, so building one per call
+        // paid a fresh TCP+TLS handshake on all nine call sites (one of them a
+        // poll loop). `clone()` here is a refcount bump on that shared pool.
+        //
+        // The total timeout is attached per request instead, because a harness
+        // turn carries a budget derived from its own command and must not
+        // inherit the control-plane cap.
+        static CLIENT: std::sync::OnceLock<Result<reqwest::blocking::Client, String>> =
+            std::sync::OnceLock::new();
+        CLIENT
+            .get_or_init(|| {
+                crate::tls::reqwest_blocking_client_builder()
+                    .connect_timeout(std::time::Duration::from_secs(8))
+                    .redirect(reqwest::redirect::Policy::none())
+                    .build()
+                    .map_err(|error| error.to_string())
+            })
+            .clone()
+            .map_err(|message| anyhow!("failed to initialize the cloud agent client: {message}"))
     }
 
     /// The total-timeout budget for a harness-carrying client, in seconds.
@@ -1453,14 +1454,22 @@ impl LiveDaytonaLauncher {
         api_key: &str,
         body: serde_json::Value,
     ) -> Result<reqwest::blocking::Response> {
-        Self::send_json_on(&Self::blocking_client()?, method, url, api_key, body)
+        Self::send_json_on(
+            &Self::blocking_client()?,
+            Self::CONTROL_PLANE_TIMEOUT_SECS,
+            method,
+            url,
+            api_key,
+            body,
+        )
     }
 
-    /// [`Self::send_json`] on a caller-supplied client, so a call whose
-    /// declared budget differs from the control-plane cap (the harness
-    /// turn) can carry a client scoped to its own budget.
+    /// [`Self::send_json`] with an explicit total timeout, so a call whose
+    /// declared budget differs from the control-plane cap (the harness turn)
+    /// can carry its own without needing a client of its own.
     fn send_json_on(
         client: &reqwest::blocking::Client,
+        total_secs: u64,
         method: reqwest::Method,
         url: &reqwest::Url,
         api_key: &str,
@@ -1468,6 +1477,7 @@ impl LiveDaytonaLauncher {
     ) -> Result<reqwest::blocking::Response> {
         client
             .request(method, url.clone())
+            .timeout(std::time::Duration::from_secs(total_secs))
             .bearer_auth(api_key)
             .json(&body)
             .send()
@@ -1639,10 +1649,16 @@ impl DaytonaLauncher for LiveDaytonaLauncher {
             "timeout": command.timeout_secs,
         });
         // This call carries the declared turn budget (an hour for the agent
-        // entry), so it rides a client scoped to that budget plus slack —
-        // never the 120s control-plane client that used to cap it.
-        let client = Self::harness_client(command)?;
-        let response = Self::send_json_on(&client, reqwest::Method::POST, &url, &api_key, body)?;
+        // entry), so it asks for that budget plus slack per request — never the
+        // 120s control-plane cap that used to bound it.
+        let response = Self::send_json_on(
+            &Self::blocking_client()?,
+            Self::harness_client_budget_secs(command),
+            reqwest::Method::POST,
+            &url,
+            &api_key,
+            body,
+        )?;
         let status = response.status();
         let text = response.text().unwrap_or_default();
         if !status.is_success() {

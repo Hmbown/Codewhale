@@ -523,8 +523,9 @@ impl FleetRouterCaller for LiveFleetRouter {
 ///
 /// The snapshot and the preflight are immutable for the life of the run:
 /// editing `fleets/<name>.toml` afterwards changes only the next Workflow.
-/// There is no run-scoped roster projection: durable runs bind members
-/// straight from the snapshot, and in-process spawns resolve roles only.
+/// Durable runs and in-process spawns bind the same frozen member. The
+/// in-process path projects only that member onto its existing profile binder;
+/// it does not read or replace the currently selected Fleet.
 #[derive(Clone)]
 pub(crate) struct ExactFleetWorkflow {
     snapshot: Arc<FleetSnapshot>,
@@ -567,6 +568,107 @@ pub(crate) struct ExactMemberBinding {
     /// concurrency slot, a router call); recomputing is what makes a stale or
     /// tampered authority detectable rather than merely improbable.
     pub(crate) session: PermissionCeiling,
+    /// Source layer captured with the snapshot, never refreshed at spawn.
+    profile_origin: super::roster::ProfileOrigin,
+    task_allowed_tools: Option<Vec<String>>,
+    task_disallowed_tools: Vec<String>,
+    task_worktree_write: bool,
+}
+
+impl ExactMemberBinding {
+    /// Task options may narrow the Runtime/parent envelope, never replace the
+    /// frozen identity or grant authority. Preserve the narrowing for the
+    /// independent launch-time recomputation and its durable fingerprint.
+    pub(crate) fn narrow_for_task(
+        &mut self,
+        write_authority: Option<&str>,
+        allowed_tools: Option<&[String]>,
+        disallowed_tools: &[String],
+        max_depth: Option<u32>,
+    ) -> Result<(), String> {
+        match write_authority {
+            Some("read_only") => self.session.write = false,
+            Some("workspace_write" | "worktree_write") if !self.authority.ceiling.write => {
+                return Err(format!(
+                    "member `{}` is read-only under its Runtime/parent ceiling; a task cannot request write authority via `write_authority`",
+                    self.member_id,
+                ));
+            }
+            Some("workspace_write") if self.task_worktree_write => {
+                return Err("a task cannot remove its worktree isolation".to_string());
+            }
+            Some("worktree_write") => self.task_worktree_write = true,
+            Some("workspace_write") | None => {}
+            Some(other) => return Err(format!("invalid task `write_authority` value `{other}`")),
+        }
+        if let Some(depth) = max_depth {
+            self.session.delegation_depth = self.session.delegation_depth.min(depth);
+        }
+        if let Some(tools) = allowed_tools {
+            let mut tools = tools.to_vec();
+            if let Some(previous) = self.task_allowed_tools.as_ref() {
+                tools.retain(|tool| previous.contains(tool));
+            }
+            tools.sort();
+            tools.dedup();
+            self.task_allowed_tools = Some(tools);
+        }
+        self.task_disallowed_tools
+            .extend_from_slice(disallowed_tools);
+        self.task_disallowed_tools.sort();
+        self.task_disallowed_tools.dedup();
+        self.authority = self.recompute_authority(&self.member_role);
+        Ok(())
+    }
+
+    fn recompute_authority(&self, role: &str) -> ChildAuthority {
+        let mut authority = ChildAuthority::from_runtime_role(role, self.session);
+        if let Some(tools) = self.task_allowed_tools.as_ref() {
+            let mut tools = tools.clone();
+            if let Some(ceiling) = authority.allowed_tools.as_ref() {
+                tools.retain(|tool| ceiling.contains(tool));
+            }
+            authority.allowed_tools = Some(tools);
+        }
+        if !self.task_disallowed_tools.is_empty() {
+            authority
+                .disallowed_tools
+                .extend(self.task_disallowed_tools.iter().cloned());
+            authority.disallowed_tools.sort();
+            authority.disallowed_tools.dedup();
+        }
+        if authority.ceiling.write && self.task_worktree_write {
+            authority.write_authority = "worktree_write";
+        }
+        authority
+    }
+
+    /// Project one preflighted member into the existing profile binder. The
+    /// saved provider configuration key stays paired with the canonical wire
+    /// model (including compatibility-migrated provider identities).
+    pub(crate) fn spawn_profile(&self) -> super::profile::AgentProfile {
+        super::profile::AgentProfile {
+            id: self.member_id.clone(),
+            display_name: None,
+            description: None,
+            requires: Vec::new(),
+            profile: codewhale_config::FleetProfile {
+                slot: codewhale_config::FleetSlot::from_name(&self.member_role),
+                role: codewhale_config::FleetRole {
+                    name: self.member_role.clone(),
+                    ..Default::default()
+                },
+                provider: Some(self.route.provider_config_id().to_string()),
+                model: Some(self.route.wire_model.clone()),
+                ..Default::default()
+            },
+            // Snapshot identity is recorded on the Workflow receipt; profile
+            // application performs no source-file lookup.
+            source: std::path::PathBuf::new(),
+            origin: self.profile_origin,
+            plugin_authority: None,
+        }
+    }
 }
 
 /// What a launched exact member resolves to, after routing.
@@ -843,6 +945,14 @@ impl ExactFleetWorkflow {
             requires_router: member.requested_reasoning.is_auto(),
             authority: ChildAuthority::from_runtime_role(&member.role, session),
             session,
+            profile_origin: match self.snapshot.fleet().origin.as_str() {
+                "workspace" => super::roster::ProfileOrigin::Workspace,
+                "codewhale_home" => super::roster::ProfileOrigin::Personal,
+                _ => super::roster::ProfileOrigin::Config,
+            },
+            task_allowed_tools: None,
+            task_disallowed_tools: Vec::new(),
+            task_worktree_write: false,
         })
     }
 
@@ -895,7 +1005,7 @@ impl ExactFleetWorkflow {
         // launch below is the value the spawn path consumes, so it must be the
         // recomputed one; the equality check is what turns a divergence into a
         // refused launch instead of a silently widened child.
-        let authority = ChildAuthority::from_runtime_role(&member.role, binding.session);
+        let authority = binding.recompute_authority(&member.role);
         if authority != binding.authority {
             return Err(format!(
                 "Fleet `{}`: member `{}` resolved a different permission envelope at launch than \

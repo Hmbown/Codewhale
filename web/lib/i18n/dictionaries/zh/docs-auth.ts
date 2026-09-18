@@ -27,7 +27,7 @@ export const docsAuth: DocsAuthDict = {
   ],
   storageTitle: "会话存放在哪里",
   storageLead:
-    "账户会话优先使用操作系统的凭证管理器；在没有凭证管理器的环境（无头主机、SSH、容器）中自动回退到权限为 0600 的私有 Codewhale 密钥文件。旧的 {fileStoreEnv} 显式开关已弃用并被忽略。",
+    "账户会话优先使用操作系统的凭证管理器；在没有凭证管理器的环境（无头主机、SSH、容器）中自动回退到权限为 0600 的私有 Codewhale 密钥文件。",
   vaultTitle: "账户自己的密钥库",
   vaultLead: "{keys} 管理已登录账户的自带密钥（BYOK）库，且永远不会显示密钥内容。",
   portableTitle: "迁移到另一台机器",

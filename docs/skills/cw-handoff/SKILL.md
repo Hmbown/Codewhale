@@ -36,7 +36,7 @@ starts at [cw-orient](../cw-orient/SKILL.md) with what you leave here.
    ```
    Tell them to trust that output over anything below it.
 
-3. **Include, in this order:**
+3. **Cover these, in whatever order fits; drop sections that are empty:**
    - Repository path and expected branch or worktree.
    - The authority line: what they may and may not do without asking. Default to
      local-only — no push, merge, tag, publish, GitHub Release, or destructive
@@ -81,7 +81,9 @@ starts at [cw-orient](../cw-orient/SKILL.md) with what you leave here.
 
 ## Output
 
-A single paste-ready block containing: refresh commands, authority line, files
-to read, landed SHAs, named dirty files, prioritized next slices, the
-verification gate, and the open decisions — with done / suspected / blocked
-visibly separated.
+A single paste-ready block with the default shape — refresh commands,
+authority line, files to read, landed SHAs, named dirty files, prioritized
+next slices, the verification gate, and the open decisions — with done /
+suspected / blocked visibly separated. Compress when trivial, but never
+compress away the state separation: that is what keeps guesses from
+becoming the next session's premises.

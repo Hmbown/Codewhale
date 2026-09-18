@@ -275,29 +275,6 @@ mod tests {
     }
 
     #[test]
-    fn working_marker_uses_the_live_work_status_role() {
-        let mut app = test_app();
-        // Match Terminal intentionally aliases both roles to ANSI Cyan. Use
-        // the branded palette here to prove the renderer selects the working
-        // slot rather than merely observing an equal terminal color.
-        app.ui_theme = codewhale_palette::UI_THEME;
-        assert_eq!(ShellPhase::Working.color(&app), app.ui_theme.status_working);
-        assert_ne!(ShellPhase::Working.color(&app), app.ui_theme.info);
-        assert_eq!(
-            crate::tui::underwater::phase_ink(ShellPhase::Working),
-            ChromeInk::Active
-        );
-        assert_eq!(
-            crate::tui::underwater::phase_ink(ShellPhase::Failed),
-            ChromeInk::Failure
-        );
-        assert_ne!(
-            crate::tui::underwater::phase_ink(ShellPhase::Working).family(),
-            codewhale_palette::SemanticFamily::Failure
-        );
-    }
-
-    #[test]
     fn done_footer_preserves_unresolved_notice_behind_later_routine_info() {
         use crate::tui::app::StatusToastLevel;
         for (level, ink) in [

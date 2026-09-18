@@ -20,6 +20,6 @@ pub enum RouteSaveChoice {
     /// Write nothing; the change lives for this session only. (Implemented
     /// directly by the key loop's `k`/Esc handling; kept as the named choice
     /// so receipts and tests speak the same vocabulary.)
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     SessionOnly,
 }

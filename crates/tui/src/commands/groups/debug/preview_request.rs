@@ -366,7 +366,7 @@ mod tests {
             "/tmp/test-workspace-preview-request-pure",
         ));
         let mut app = App::new(options, &Config::default());
-        app.api_messages.push(codewhale_models::Message {
+        app.api_messages_mut().push(codewhale_models::Message {
             role: Role::User,
             content: vec![codewhale_models::ContentBlock::Text {
                 text: "hello".to_string(),

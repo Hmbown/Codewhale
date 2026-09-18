@@ -267,8 +267,8 @@ impl WhaleState {
 
     /// State from the operator session phase. Public contract for the shell
     /// header / Fleet setup role pane (no consumer in this lane yet).
-    #[allow(dead_code)]
     #[must_use]
+    #[cfg_attr(not(test), expect(dead_code))]
     pub const fn for_shell_phase(phase: ShellPhase) -> Self {
         match phase {
             ShellPhase::Idle | ShellPhase::Done => Self::Resting,
@@ -577,6 +577,7 @@ mod tests {
     #[test]
     fn subagent_state_is_derived_from_runtime_facts_only() {
         let mut agent = SubAgentResult {
+            usage: None,
             name: "child-1".into(),
             agent_id: "child-1".into(),
             context_mode: "fresh".into(),

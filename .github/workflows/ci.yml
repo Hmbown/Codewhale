@@ -412,6 +412,11 @@ jobs:
           else
             python3 scripts/check-command-migration-manifest.py
           fi
+      - name: Check reqwest client constructors
+        if: needs.changes.outputs.heavy == 'true'
+        run: |
+          python3 scripts/test_check_reqwest_builders.py
+          python3 scripts/check-reqwest-builders.py
       # Clippy above runs without `--all-targets`, so it cannot see dead code
       # that only tests keep alive. This ratchet covers that blind spot by
       # refusing to let the `#[allow(dead_code)]` total rise (#4785).
@@ -423,6 +428,13 @@ jobs:
         # pushes to main, where the number is actually actionable.
         continue-on-error: ${{ github.event_name == 'pull_request' }}
         run: python3 scripts/check-dead-code-budget.py
+      # Ratchet for blocking calls that could park Tokio workers: any new
+      # thread::sleep/std::fs site outside spawn_blocking, dedicated-thread,
+      # or test scopes must be isolated or budgeted (#6149).
+      - name: Check blocking-calls budget
+        if: needs.changes.outputs.heavy == 'true'
+        continue-on-error: ${{ github.event_name == 'pull_request' }}
+        run: python3 scripts/check-blocking-calls-budget.py
       - name: Test runtime-contract measurement harness
         if: needs.changes.outputs.heavy == 'true'
         run: |

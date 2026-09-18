@@ -339,7 +339,6 @@ pub(crate) fn escape_review_text(value: &str) -> String {
     escaped
 }
 
-#[allow(dead_code)]
 fn _diagnostic_level_label(level: PluginDiagnosticLevel) -> &'static str {
     match level {
         PluginDiagnosticLevel::Warning => "warning",
@@ -347,7 +346,6 @@ fn _diagnostic_level_label(level: PluginDiagnosticLevel) -> &'static str {
     }
 }
 
-#[allow(dead_code)]
 fn _diagnostic_path(diagnostic: &PluginDiagnostic) -> Option<String> {
     diagnostic
         .path

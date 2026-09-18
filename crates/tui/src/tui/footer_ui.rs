@@ -1,5 +1,9 @@
+use std::cell::RefCell;
+use std::collections::HashMap;
+
 use crate::tui::app::App;
 use crate::tui::history::summarize_tool_output;
+use crate::tui::output_rows_cache::hash_str;
 use crate::tui::subagent_routing::{active_fanout_counts, running_agent_count};
 use crate::tui::ui_text::truncate_line_to_width;
 
@@ -49,29 +53,63 @@ pub(crate) fn maybe_log_provider_wait_incident(app: &mut App) {
     ));
 }
 
-pub(crate) fn is_noisy_subagent_progress(status: &str) -> bool {
-    let status = status.trim().to_ascii_lowercase();
-    status.contains("requesting model response")
+thread_local! {
+    /// Objective summaries keyed by agent id (#6213 T7). The objective is
+    /// immutable per agent, so `summarize_tool_output` — which JSON-parses the
+    /// whole assignment — only has to run once per agent instead of once per
+    /// `AgentProgress` event. `(length, hash)` of the objective guards the
+    /// memo, so even an id reuse with different text recomputes.
+    static OBJECTIVE_SUMMARIES: RefCell<HashMap<String, (usize, u64, String)>> =
+        RefCell::new(HashMap::new());
 }
 
 pub(crate) fn subagent_objective_summary(app: &App, id: &str) -> Option<String> {
-    app.subagent_cache
+    let agent = app
+        .subagent_cache
         .iter()
-        .find(|agent| agent.agent_id == id)
-        .map(|agent| summarize_tool_output(&agent.assignment.objective))
-        .filter(|summary| !summary.is_empty())
+        .find(|agent| agent.agent_id == id)?;
+    memoized_objective_summary(id, &agent.assignment.objective)
 }
 
-pub(crate) fn friendly_subagent_progress(app: &App, id: &str, status: &str) -> String {
-    if !is_noisy_subagent_progress(status) {
+/// Memoized body of [`subagent_objective_summary`], split out so the memo can
+/// be exercised without an `App`.
+fn memoized_objective_summary(id: &str, objective: &str) -> Option<String> {
+    OBJECTIVE_SUMMARIES.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        let (len, hash) = (objective.len(), hash_str(objective));
+        if let Some((cached_len, cached_hash, summary)) = cache.get(id)
+            && *cached_len == len
+            && *cached_hash == hash
+        {
+            return (!summary.is_empty()).then(|| summary.clone());
+        }
+        let summary = summarize_tool_output(objective);
+        // Bounded: live agents per session are few; a full map means the
+        // process has seen an unusual number of agents, so start over.
+        if cache.len() >= 256 {
+            cache.clear();
+        }
+        cache.insert(id.to_string(), (len, hash, summary.clone()));
+        (!summary.is_empty()).then_some(summary)
+    })
+}
+
+pub(crate) fn friendly_subagent_progress(
+    app: &App,
+    id: &str,
+    status: &str,
+    routine_wait: bool,
+) -> String {
+    if !routine_wait {
         return summarize_tool_output(status);
     }
 
     if let Some(summary) = subagent_objective_summary(app, id) {
         return format!("working on {summary}");
     }
+    // Stored entries are always friendly rewrites (the event handler stores
+    // `display`, never raw text), so no content check is needed here.
     if let Some(existing) = app.agent_progress.get(id)
-        && !is_noisy_subagent_progress(existing)
         && existing != "working"
         && existing != "in the current"
     {
@@ -150,12 +188,27 @@ pub(crate) fn format_context_budget(used: i64, max: u32) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::one_line_summary;
+    use super::{memoized_objective_summary, one_line_summary};
 
     #[test]
     fn one_line_summary_strips_ansi_before_collapsing_text() {
         let summary = one_line_summary("read \x1b[38;2;6;174;242mfile.rs\x1b[0m", 80);
         assert_eq!(summary, "read file.rs");
         assert!(!summary.contains("38;2"));
+    }
+
+    #[test]
+    fn objective_summary_memo_revalidates_on_content_change() {
+        let id = "agent_memo_test";
+        // Both objectives have the same length, so only the content hash can
+        // tell them apart — the memo must not serve the first summary for the
+        // second objective.
+        let first = memoized_objective_summary(id, r#"{"message":"alpha"}"#);
+        assert_eq!(first.as_deref(), Some("alpha"));
+        let second = memoized_objective_summary(id, r#"{"message":"beta!"}"#);
+        assert_eq!(second.as_deref(), Some("beta!"));
+        // Unchanged objective: the memo path returns the same summary.
+        let again = memoized_objective_summary(id, r#"{"message":"beta!"}"#);
+        assert_eq!(again.as_deref(), Some("beta!"));
     }
 }

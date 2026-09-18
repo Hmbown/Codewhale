@@ -30,6 +30,8 @@ release_crates=(
   codewhale-localization
   codewhale-models
   codewhale-palette
+  # Scoped memory store; tui's native memory backend. No workspace deps.
+  codewhale-memory
   codewhale-tui
   codewhale-app-server
   codewhale-cli

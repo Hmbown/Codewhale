@@ -14,6 +14,7 @@ import url from "node:url";
 import crypto from "node:crypto";
 import { spawn } from "node:child_process";
 import { stateDir } from "./registry.mjs";
+import { parseGrant, BACKEND_METHOD } from "./tools.mjs";
 import { ExecError, currentSignal, throwIfAborted, wait } from "./exec.mjs";
 
 export const PLUGIN_ROOT = path.resolve(path.dirname(url.fileURLToPath(import.meta.url)), "..");
@@ -88,7 +89,13 @@ export function appRequest(request, options) { return requestConnection(request,
 const sessionLeases = new Map();
 export function openAppSession(sessionId) {
   if (!sessionLeases.has(sessionId)) {
-    const pending = requestConnection({ tool: "open_session", sessionId }, { timeoutMs: 3_000, signal: null, keepOpen: true }).then(({ reply, socket }) => {
+    // Carry the capability grant to the daemon so a narrowed server cannot
+    // smuggle ungranted tools past the boundary that actually sends input.
+    // The daemon sees transport method names (probe, recordingStart, …), so
+    // the grant is normalized through BACKEND_METHOD before it travels.
+    const grant = parseGrant(process.env.CODEWHALE_CU_GRANT);
+    const transportGrant = grant ? [...new Set([...grant].map((name) => BACKEND_METHOD[name] ?? name))] : null;
+    const pending = requestConnection({ tool: "open_session", sessionId, ...(transportGrant ? { grant: transportGrant } : {}) }, { timeoutMs: 3_000, signal: null, keepOpen: true }).then(({ reply, socket }) => {
       if (!reply?.ok || typeof reply.leaseToken !== "string") {
         socket.destroy();
         throw Object.assign(new ExecError(reply?.error?.message ?? "Computer session lease was refused"), { code: reply?.error?.code ?? "app_session_closed" });
@@ -156,9 +163,6 @@ let lastLaunchAt = 0;
  */
 export async function ensureApp({ launch = true } = {}) {
   if (process.env.CODEWHALE_CU_APP === "off") return { via: "direct", reason: "CODEWHALE_CU_APP=off" };
-  if (process.platform === "darwin" && fs.existsSync(path.join(PLUGIN_ROOT, "bin", "darwin", "accessibility"))) {
-    return { via: "direct", reason: "Using the Computer Use helper included with Codewhale. Grant Accessibility and Screen Recording to the host app in macOS System Settings when requested." };
-  }
   let app = await hello();
   throwIfAborted();
   if (app) return { via: "app", app };
@@ -170,8 +174,11 @@ export async function ensureApp({ launch = true } = {}) {
       : "Using the Computer Use helper included with Codewhale. Input and screen permissions belong to the current host app; grant them in your operating system's privacy settings when requested." };
 
   }
+  if (typeof reg.path === "string" && !fs.existsSync(reg.path)) {
+    throw Object.assign(new ExecError(`${APP_NAME} is registered at ${reg.path}, but that app is missing. Reinstall it and open it once to refresh ${registrationPath()}.`), { code: "app_missing" });
+  }
   if (!launch || Date.now() - lastLaunchAt < 15_000) {
-    return { via: "direct", reason: `${APP_NAME} is installed at ${reg.path} but not running (last launch attempt did not come up)` };
+    throw Object.assign(new ExecError(`${APP_NAME} is installed but not responding. Open it from Applications and retry; its controls must remain in charge of input.`), { code: "app_unavailable" });
   }
   lastLaunchAt = Date.now();
   launchApp(reg);
@@ -182,5 +189,5 @@ export async function ensureApp({ launch = true } = {}) {
     throwIfAborted();
     if (app) return { via: "app", app, launched: true };
   }
-  return { via: "direct", reason: `${APP_NAME} at ${reg.path} did not answer within 8s of launch; open it manually and check ${runInfoPath()}` };
+  throw Object.assign(new ExecError(`${APP_NAME} did not answer within 8s. Open it from Applications and check its status before retrying.`), { code: "app_unavailable" });
 }

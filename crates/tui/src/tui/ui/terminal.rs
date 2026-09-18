@@ -219,6 +219,9 @@ pub(crate) fn enter_alt_screen<W: Write>(writer: &mut W) -> io::Result<()> {
 
 /// Leave the alternate screen; the counterpart of [`enter_alt_screen`].
 pub(crate) fn leave_alt_screen<W: Write>(writer: &mut W) -> io::Result<()> {
+    if crate::tui::mark::kitty_graphics_supported() {
+        crate::tui::pet_watch::clear_images(writer)?;
+    }
     execute!(writer, LeaveAlternateScreen)?;
     set_live_alt_screen(false);
     Ok(())
@@ -613,6 +616,9 @@ pub(crate) fn disable_alternate_scroll_mode<W: Write>(writer: &mut W) {
 /// raw mode + kitty keyboard flags cleared, which is what causes the
 /// `^[[>5u` shell pollution reported in #1583.
 pub fn emergency_restore_terminal() {
+    if crate::tui::mark::kitty_graphics_supported() {
+        let _ = crate::tui::pet_watch::clear_images(&mut std::io::stdout());
+    }
     let mut stdout = std::io::stdout();
     crate::tui::cursor_accent::restore_cursor_accent();
     pop_keyboard_enhancement_flags(&mut stdout);
@@ -663,6 +669,11 @@ pub(crate) fn enable_windows_ime_console_mode() {
 /// flag at startup or in `resume_terminal`, add it here too — `FocusGained`
 /// recovery calls this and will silently fall behind otherwise.
 ///
+/// There are three callers, and they must stay in step: `resume_terminal`
+/// (after a child hands the terminal back, and after a job-control suspend),
+/// and the `FocusGained` recovery path. A mode enabled in only one of them is a
+/// mode that leaks into the shell on the other two paths (#6169).
+///
 /// Excluded by design: raw mode and the alternate screen — those persist
 /// across focus events and are only re-established by `resume_terminal`
 /// after a suspension, which always runs a separate path.
@@ -711,6 +722,22 @@ pub(crate) fn disable_bracketed_paste_mode<W: Write>(writer: &mut W) {
 
 pub(crate) fn terminal_event_needs_viewport_recapture(evt: &Event) -> bool {
     matches!(evt, Event::FocusGained)
+}
+
+/// Next frame-emission gate from one terminal event (#6311).
+///
+/// GTK3 pauses the frame clock on full occlusion while VTE keeps queuing
+/// damage, so every frame emitted while covered becomes flicker backlog on
+/// return. Focus loss therefore defers draws (state keeps ingesting;
+/// `needs_redraw` stays set); focus gain re-arms with the existing
+/// full-repaint recovery. Any key/mouse/paste input also re-arms: input
+/// focus means a visible window, and it unsticks a lost `FocusGained`.
+pub(crate) fn next_unfocused(unfocused: bool, evt: &Event) -> bool {
+    match evt {
+        Event::FocusLost => true,
+        Event::FocusGained | Event::Key(_) | Event::Mouse(_) | Event::Paste(_) => false,
+        _ => unfocused,
+    }
 }
 
 pub(crate) fn terminal_pause_has_live_owner(app: &App) -> bool {

@@ -22,13 +22,24 @@ use crate::plugins::install::PluginInstallSource;
 
 use super::super::types::{
     CatalogProvenance, CatalogTier, MarketplaceCandidate, MarketplaceCandidateId,
-    MarketplaceCatalog, MarketplaceDiagnostic, MarketplaceFormat, MarketplaceInstallPlan,
-    MarketplaceSourceSpec,
+    MarketplaceCatalog, MarketplaceDiagnostic, MarketplaceEntryKind, MarketplaceFormat,
+    MarketplaceInstallPlan, MarketplaceSourceSpec,
 };
 use super::{MarketplaceDocument, str_field, unknown_fields_warning};
 
 const TOP_LEVEL_FIELDS: &[&str] = &["name", "description", "version", "plugins"];
-const ENTRY_FIELDS: &[&str] = &["name", "source", "description", "version", "homepage"];
+const ENTRY_FIELDS: &[&str] = &[
+    "name",
+    "source",
+    "kind",
+    "description",
+    "version",
+    "homepage",
+    "display_name",
+    "author",
+    "icon",
+    "platforms",
+];
 
 pub fn parse_codewhale_catalog(document: MarketplaceDocument) -> MarketplaceCatalog {
     let MarketplaceDocument {
@@ -215,14 +226,106 @@ fn parse_codewhale_entry(
         entry_diags.push(diag);
     }
 
+    let mut labels = Vec::new();
+    for field in ["display_name", "author", "icon"] {
+        let (value, bad) = str_field(obj, field);
+        if let Some(diag) = bad {
+            entry_diags.push(diag);
+        }
+        let bounded = value.filter(|text| {
+            field == "icon" || (text.chars().count() <= 128 && !text.chars().any(char::is_control))
+        });
+        if value.is_some() && bounded.is_none() {
+            entry_diags.push(MarketplaceDiagnostic::error(
+                "INVALID_IDENTITY",
+                format!("{field} must fit on one line within 128 characters"),
+                Some(name.clone()),
+                Some(index),
+            ));
+        }
+        labels.push(bounded.map(ToString::to_string));
+    }
+    let mut icon = labels.pop().flatten();
+    if let Some(value) = &icon
+        && let Err(reason) = crate::plugins::manifest::validate_icon(value)
+    {
+        entry_diags.push(MarketplaceDiagnostic::error(
+            "INVALID_ICON",
+            reason,
+            Some(name.clone()),
+            Some(index),
+        ));
+        icon = None;
+    }
+    let author = labels.pop().flatten();
+    let display_name = labels.pop().flatten();
+    let platforms = obj
+        .get("platforms")
+        .and_then(Value::as_array)
+        .filter(|values| {
+            values.len() <= 3
+                && values
+                    .iter()
+                    .enumerate()
+                    .all(|(i, value)| !values[..i].contains(value))
+        })
+        .and_then(|values| {
+            values
+                .iter()
+                .map(|value| {
+                    value
+                        .as_str()
+                        .filter(|os| ["macos", "linux", "windows"].contains(os))
+                        .map(ToString::to_string)
+                })
+                .collect::<Option<Vec<_>>>()
+        });
+    if obj.contains_key("platforms") && platforms.is_none() {
+        entry_diags.push(MarketplaceDiagnostic::error(
+            "INVALID_PLATFORMS",
+            "platforms must be an array of macos, linux or windows",
+            Some(name.clone()),
+            Some(index),
+        ));
+    }
+    // What this entry is. The Codewhale marketplace keeps plugins and
+    // skills in separate top-level directories, so the source path is the
+    // signal; a document may also declare `kind` explicitly. A skill entry
+    // stays installable, but it is not a plugin and is never suggested as
+    // one (#6290 rework).
+    let kind = match obj.get("kind").and_then(Value::as_str) {
+        Some("skill") => MarketplaceEntryKind::Skill,
+        Some("plugin") | None => {
+            let path = source
+                .strip_prefix("path:")
+                .unwrap_or(source)
+                .trim_start_matches("./");
+            if path == "skills" || path.starts_with("skills/") {
+                MarketplaceEntryKind::Skill
+            } else {
+                MarketplaceEntryKind::Plugin
+            }
+        }
+        Some(other) => {
+            entry_diags.push(MarketplaceDiagnostic::warning(
+                "UNKNOWN_ENTRY_KIND",
+                format!("unknown entry kind `{other}`; treated as a plugin"),
+                Some(name.clone()),
+                Some(index),
+            ));
+            MarketplaceEntryKind::Plugin
+        }
+    };
     Some(MarketplaceCandidate {
         id: MarketplaceCandidateId::new(catalog_id, &name),
         catalog_id: catalog_id.clone(),
+        kind,
+        icon,
         name,
-        display_name: None,
+        display_name,
         description: description.map(ToString::to_string),
         version: version.map(ToString::to_string),
-        author: None,
+        author,
         homepage: homepage.map(ToString::to_string),
         repository: None,
         license: None,
@@ -237,7 +340,10 @@ fn parse_codewhale_entry(
             publisher: None,
             source_url: None,
         },
-        when: None,
+        when: platforms.map(|os| crate::plugins::manifest::PluginWhen {
+            os: Some(os),
+            binaries: None,
+        }),
         diagnostics: entry_diags,
     })
 }

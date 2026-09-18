@@ -68,12 +68,6 @@ pub use event::{
 /// handshake would hold a user's terminal past exit.
 pub const SHUTDOWN_FLUSH_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// Maximum time a short CLI command may spend sealing queued events locally.
-///
-/// This path never performs a network request. The bound protects command
-/// latency if the writer thread or local filesystem does not answer promptly.
-pub const CLI_PERSIST_TIMEOUT: Duration = Duration::from_millis(250);
-
 /// Everything a write path needs once the process is armed.
 struct Armed {
     handle: actor::Handle,
@@ -285,9 +279,17 @@ pub fn shutdown_blocking(deadline: Duration) -> FlushOutcome {
 /// With an explicitly empty endpoint this finalizes the local dry-run batch.
 /// With a configured endpoint it leaves events in the pending buffer for the
 /// next full flush. Returns [`FlushOutcome::Empty`] when unarmed.
+///
+/// This joins the writer instead of racing it (#6269). The local path seals
+/// at most a consent re-check, a tombstone probe, and one fsync append —
+/// bounded disk work with no network in it. A deadline here buys nothing the
+/// rest of the CLI does not already forgo: startup reads config from the
+/// same disk with no timeout either. The writer always acknowledges, even on
+/// panic, so the only fail-open outcome is a writer that is already gone.
+/// Only the network flush keeps a deadline.
 #[must_use]
-pub fn persist_local_blocking(deadline: Duration) -> FlushOutcome {
-    ARMED.get().map_or(FlushOutcome::Empty, |armed| {
-        armed.handle.persist_local(deadline)
-    })
+pub fn persist_local_blocking() -> FlushOutcome {
+    ARMED
+        .get()
+        .map_or(FlushOutcome::Empty, |armed| armed.handle.persist_local())
 }

@@ -334,7 +334,7 @@ def report_tombstone_runtime_contract(
         "ProviderKind::parse_config_identity",
     )
     end = require_index(
-        provider_kind_rs, "pub fn is_siliconflow", "ProviderKind::parse_config_identity", start
+        provider_kind_rs, "pub fn secret_store_slot", "ProviderKind::parse_config_identity", start
     )
     config_identity = provider_kind_rs[start:end]
     if "parse_retired_alias" not in config_identity:

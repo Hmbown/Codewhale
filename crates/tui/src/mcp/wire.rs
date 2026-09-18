@@ -17,12 +17,27 @@ pub(super) fn is_mcp_stale_session_body(body: &str) -> bool {
     body.contains("session") && (body.contains("expired") || body.contains("invalid"))
 }
 
+/// A tool call worth replaying after drop→reconnect: either the server
+/// rejected the session id, or the transport itself is gone (dead
+/// pipe/socket) rather than merely idle.
+pub(super) fn is_retriable_mcp_call_error(err: &anyhow::Error) -> bool {
+    if is_mcp_stale_session_error(err) {
+        return true;
+    }
+    let lower = format!("{err:#}").to_ascii_lowercase();
+    is_connection_closed_error_text(&lower)
+}
+
 pub(super) fn is_mcp_stale_session_error(err: &anyhow::Error) -> bool {
     let err = format!("{err:#}");
     let lower_err = err.to_ascii_lowercase();
     err.contains("MCP Streamable HTTP session expired")
         || err.contains("MCP session expired")
         || err.contains("SSE transport closed")
+        // The exact bail text of a stdio transport whose child died (the
+        // EOF arm of `StdioTransport::recv`); without this arm a dead-child
+        // error missed the drop→reconnect→retry path that SSE closes get.
+        || err.contains("Stdio transport closed")
         || (err.contains("MCP SSE POST send failed") && is_connection_closed_error_text(&lower_err))
         || is_mcp_stale_session_body(&err)
 }

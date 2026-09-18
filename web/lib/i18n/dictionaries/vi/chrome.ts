@@ -33,10 +33,10 @@ export const chrome: ChromeDict = {
 
   navProduct: "Sản phẩm",
   navModels: "Mô hình",
-  navPricing: "Giá",
+  navPlugins: "Plugin",
   navProductSecondary: "Product",
   navModelsSecondary: "Models",
-  navPricingSecondary: "Pricing",
+  navPluginsSecondary: "Plugins",
 
   skipToContent: "Bỏ qua tới nội dung chính",
 
@@ -95,7 +95,6 @@ export const chrome: ChromeDict = {
   footerIssues: "Issues",
   footerContribute: "Đóng góp",
   footerLicense: "Giấy phép MIT",
-  footerPricing: "Bảng giá",
   footerTerms: "Điều khoản dịch vụ",
   footerPrivacy: "Quyền riêng tư",
   footerChangelog: "Nhật ký thay đổi",

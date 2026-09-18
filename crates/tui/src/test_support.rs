@@ -358,6 +358,14 @@ pub(crate) fn test_app_with_options(options: crate::tui::app::TuiOptions) -> cra
     // developer checkout can otherwise consume the bounded mention index
     // before the fixture workspace is scanned.
     app.composer.mention_cwd = None;
+    // `App::new` derives onboarding state from the real `~/.codewhale`, and a
+    // pending step makes `ui::frame::render` take its onboarding early return
+    // before it assigns `last_prompt_area` or any other chrome geometry. CI
+    // has no such state, so a layout test written against that machine passes
+    // there and fails on any developer box mid-onboarding — for no product
+    // reason. Shared fixtures render the ordinary session surface; onboarding
+    // has its own tests that set this state deliberately.
+    app.onboarding = crate::tui::app::OnboardingState::None;
     app
 }
 

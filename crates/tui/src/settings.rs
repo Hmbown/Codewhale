@@ -345,13 +345,14 @@ pub struct Settings {
     /// ca, de, fr, id, hi, ru, uk.
     /// Every shipped pack holds full `en.json` parity; nothing falls back.
     pub locale: String,
-    /// Named UI theme. `"underwater"` is the fresh-install default and paints
-    /// the ocean field. `"terminal"` fully inherits the host terminal's
-    /// foreground/background. `"system"`, `"dark"`, `"light"`,
-    /// `"grayscale"`, and the community presets: `"catppuccin-mocha"`,
-    /// `"tokyo-night"`, `"dracula"`, `"gruvbox-dark"`. The
-    /// `background_color` setting still overrides the surface color on top
-    /// of the resolved theme.
+    /// Named UI theme. `"shoreline"` is the fresh-install default: the warm
+    /// charcoal and restrained blue the desktop client paints too.
+    /// `"underwater"` paints the ocean field. `"terminal"` fully inherits the
+    /// host terminal's foreground/background. `"system"`, `"dark"`,
+    /// `"light"`, `"grayscale"`, and the community presets:
+    /// `"catppuccin-mocha"`, `"tokyo-night"`, `"dracula"`,
+    /// `"gruvbox-dark"`. The `background_color` setting still overrides the
+    /// surface color on top of the resolved theme.
     pub theme: String,
     /// Optional main TUI background color as a 6-digit hex RGB value.
     pub background_color: Option<String>,
@@ -571,7 +572,7 @@ impl Default for Settings {
             show_tool_details: false,
             inline_diffs: "full".to_string(),
             locale: "auto".to_string(),
-            theme: "underwater".to_string(),
+            theme: "shoreline".to_string(),
             background_color: None,
             composer_density: "comfortable".to_string(),
             composer_border: true,
@@ -650,6 +651,7 @@ fn normalize_rail_panel(value: &str) -> &'static str {
         "context" => "context",
         "git" => "git",
         "price" => "price",
+        "watch" => "watch",
         // `pinned` folded into the tasks view (2026-09-02 dock views).
         _ => "tasks",
     }
@@ -1055,6 +1057,43 @@ impl Settings {
             .get(canonical)
             .copied()
             .unwrap_or(Layer::Default)
+    }
+
+    /// The persisted field name behind a canonical schema key. Two schema
+    /// keys predate their persisted names and cannot be renamed without a
+    /// settings.toml migration.
+    fn persisted_field_name(canonical: &str) -> &str {
+        match canonical {
+            "tool_collapse" => "tool_collapse_mode",
+            "max_history" => "max_input_history",
+            other => other,
+        }
+    }
+
+    /// The value `key` currently holds in this store, in its written-to-disk
+    /// string form — `None` when the key is not a field of this store.
+    ///
+    /// `Settings` serializes field-for-field to settings.toml, so a document
+    /// lookup on the serialized form shares `set`'s key vocabulary instead
+    /// of growing a second hand-keyed reader beside it.
+    pub fn value(&self, key: &str) -> Option<String> {
+        let canonical = Self::canonical_key(key).unwrap_or(key);
+        let field = Self::persisted_field_name(canonical);
+        let document = toml::Value::try_from(self).ok()?;
+        let value = document.as_table()?.get(field)?;
+        Some(match value {
+            toml::Value::String(text) => text.clone(),
+            other => other.to_string(),
+        })
+    }
+
+    /// Whether the loaded settings document explicitly named `key` — a
+    /// persisted user choice rather than an inherited default.
+    pub fn is_set(&self, key: &str) -> bool {
+        let canonical = Self::canonical_key(key).unwrap_or(key);
+        self.provenance
+            .get(Self::persisted_field_name(canonical))
+            .is_some_and(|layer| *layer == Layer::UserConfig)
     }
 
     /// Whether the user explicitly persisted an auto-compaction preference.
@@ -1511,6 +1550,7 @@ impl Settings {
                         | "context"
                         | "git"
                         | "price"
+                        | "watch"
                         | "pinned"
                 ) {
                     anyhow::bail!(
@@ -2884,9 +2924,9 @@ fn normalize_synchronized_output(value: &str) -> &str {
 
 fn normalize_settings_theme(value: &str) -> String {
     // A malformed persisted selector must not turn into a painted application
-    // background. Falling back to the underwater default keeps a single
-    // compiled first-party theme until the user picks an explicit palette.
-    normalize_theme_setting(value).unwrap_or_else(|_| "underwater".to_string())
+    // background. Falling back to the compiled default keeps a single
+    // first-party theme until the user picks an explicit palette.
+    normalize_theme_setting(value).unwrap_or_else(|_| "shoreline".to_string())
 }
 
 /// Returns `true` when the active terminal is Ptyxis (the new default
@@ -3922,7 +3962,11 @@ mod tests {
             ("xhigh", "xhigh"),
             ("ultracode", "ultra"),
             ("maximum", "max"),
-            ("minimal", "low"),
+            // Slice 4, D3: `minimal` is a real rung with its own spelling, so it
+            // round-trips instead of being folded onto `low`.
+            ("minimal", "minimal"),
+            ("minimum", "low"),
+            ("light", "low"),
         ] {
             settings
                 .set("reasoning_effort", input)
@@ -4030,22 +4074,22 @@ mod tests {
     }
 
     #[test]
-    fn default_settings_resolve_to_the_underwater_theme() {
-        // Slice C: the fresh-install default is the underwater theme, end to
-        // end from `Settings::default()` through theme resolution.
+    fn default_settings_resolve_to_the_shoreline_theme() {
+        // The fresh-install default is the Shoreline theme, end to end from
+        // `Settings::default()` through theme resolution.
         let settings = Settings::default();
-        assert_eq!(settings.theme, "underwater");
+        assert_eq!(settings.theme, "shoreline");
         let (name, id, theme) = codewhale_palette::resolve_theme_setting(&settings.theme, None)
             .expect("default resolves");
-        assert_eq!(id, codewhale_palette::ThemeId::Underwater);
-        assert_eq!(name, "underwater");
-        assert_eq!(theme.name, "underwater");
+        assert_eq!(id, codewhale_palette::ThemeId::Shoreline);
+        assert_eq!(name, "shoreline");
+        assert_eq!(theme.name, "shoreline");
     }
 
     #[test]
     fn theme_normalizes_supported_values_and_rejects_unknowns() {
         let mut settings = Settings::default();
-        assert_eq!(settings.theme, "underwater");
+        assert_eq!(settings.theme, "shoreline");
 
         settings.set("theme", "grayscale").expect("set grayscale");
         assert_eq!(settings.theme, "grayscale");
@@ -5480,7 +5524,7 @@ mod tests {
         let loaded = Settings::load().expect("load settings");
 
         assert_eq!(
-            loaded.theme, "underwater",
+            loaded.theme, "shoreline",
             "explicit CODEWHALE_HOME must not inherit ambient legacy settings"
         );
         assert_eq!(

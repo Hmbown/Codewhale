@@ -350,7 +350,7 @@ is the provider-free acceptance lock for this contract.
 Actually adding Codewhale as a built-in harness lives in the external Verifiers
 repository; the public, immutable Codewhale GitHub Releases with checksum
 manifests it needs have existed since v0.9.1 (latest published release is
-v0.9.10; the workspace source candidate is v0.9.11).
+v0.9.13, published 2026-09-14; the workspace source version is 0.9.13).
 That upstream change is expected to be limited to a new
 `verifiers/v1/harnesses/codewhale/` package plus its test-matrix and docs
 registration, with `CodewhaleHarnessConfig` pinning the target release,

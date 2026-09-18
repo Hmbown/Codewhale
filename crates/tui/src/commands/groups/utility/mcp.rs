@@ -11,7 +11,6 @@ const GITHUB_MCP_URL: &str = "https://api.githubcopilot.com/mcp/";
 const CHROME_DEVTOOLS_MCP_PACKAGE: &str = "chrome-devtools-mcp@1.7.0";
 const PLAYWRIGHT_MCP_PACKAGE: &str = "@playwright/mcp@0.0.79";
 const PLAYWRIGHT_MCP_SOURCE: &str = "https://github.com/microsoft/playwright-mcp";
-const CUA_DRIVER_SOURCE: &str = "https://github.com/trycua/cua";
 const CONTAINER_USE_SOURCE: &str = "https://github.com/dagger/container-use";
 
 pub(in crate::commands) const COMMAND_INFO: CommandInfo = CommandInfo {
@@ -189,13 +188,6 @@ fn parse_add_for_platform(
                     ],
                 }))
             }
-            [_, id] if id.eq_ignore_ascii_case("cua") || id.eq_ignore_ascii_case("cua-driver") => {
-                CommandResult::action(AppAction::Mcp(McpUiAction::AddStdio {
-                    name: "cua-driver".to_string(),
-                    command: "cua-driver".to_string(),
-                    args: vec!["mcp".to_string()],
-                }))
-            }
             [_, id]
                 if id.eq_ignore_ascii_case("container-use")
                     || id.eq_ignore_ascii_case("container") =>
@@ -303,16 +295,6 @@ fn recommended_mcp_text(presentation: &mut dyn CommandPresentationContext) -> St
         .unwrap_or_else(|_| {
             format!("• playwright — Microsoft's official Playwright MCP via pinned npm package\n  package: {PLAYWRIGHT_MCP_PACKAGE}")
         });
-    let cua = presentation
-        .translate(
-            "mcp_recommendation_cua",
-            &[
-                ("source", CUA_DRIVER_SOURCE),
-                ("restart_command", "/mcp restart"),
-                ("add_command", "/mcp add recommended cua"),
-            ],
-        )
-        .unwrap_or_else(|_| format!("• cua — Cua Driver computer-use plugin (MCP server component)\n  source: {CUA_DRIVER_SOURCE}"));
     let container_use = presentation
         .translate(
             "mcp_recommendation_container_use",
@@ -337,8 +319,6 @@ fn recommended_mcp_text(presentation: &mut dyn CommandPresentationContext) -> St
          {chrome}\n\
          \n\
          {playwright}\n\
-         \n\
-         {cua}\n\
          \n\
          {container_use}\n\
          \n\
@@ -418,9 +398,6 @@ mod tests {
                 "mcp_recommendation_playwright" => {
                     "• playwright — Microsoft's official Playwright MCP via pinned npm package\n  package: {package} ({launcher})\n  source: {source}\n  --isolated starts a fresh browser profile. It can browse/control pages and read authenticated pages.\n  add: {add_command}".to_string()
                 }
-                "mcp_recommendation_cua" => {
-                    "• cua — Cua Driver computer-use plugin (MCP server component)\n  command: cua-driver mcp\n  source: {source}\n  preview: install and verify Cua Driver separately; Codewhale never downloads it. It can control the desktop and requires operating-system permissions.\n  add: {add_command}".to_string()
-                }
                 "mcp_recommendation_container_use" => {
                     "• container-use — Dagger's experimental container-use MCP\n  command: container-use stdio\n  source: {source}\n  requires the separately installed container-use binary; Codewhale never downloads or installs this binary.\n  add: {add_command}".to_string()
                 }
@@ -478,7 +455,8 @@ mod tests {
         assert!(recommended.contains("@playwright/mcp@0.0.79"));
         assert!(recommended.contains("https://github.com/microsoft/playwright-mcp"));
         assert!(recommended.contains("https://github.com/dagger/container-use"));
-        assert!(recommended.contains("https://github.com/trycua/cua"));
+        assert!(!recommended.contains("https://github.com/trycua/cua"));
+        assert!(!recommended.to_ascii_lowercase().contains("cua-driver"));
         assert!(recommended.contains("least-privilege PAT outside command history"));
         assert!(recommended.contains("read authenticated pages"));
 
@@ -536,13 +514,18 @@ mod tests {
         ));
 
         let add_cua = mcp(&mut FakePresentation, Some("add recommended cua"));
-        assert!(matches!(
-            add_cua.action,
-            Some(AppAction::Mcp(McpUiAction::AddStdio { name, command, args }))
-                if name == "cua-driver"
-                    && command == "cua-driver"
-                    && args == vec!["mcp".to_string()]
-        ));
+        assert!(
+            add_cua.is_error,
+            "Cua is not a Codewhale computer-use recommendation"
+        );
+        assert!(
+            add_cua
+                .message
+                .as_deref()
+                .is_some_and(|message| message.contains("Unknown MCP suggestion")),
+            "{:?}",
+            add_cua.message
+        );
 
         let import_list = mcp(&mut FakePresentation, Some("import"));
         assert!(matches!(
@@ -617,7 +600,8 @@ mod tests {
         assert!(text.contains("installs this binary"));
         assert!(text.contains("experimental"));
         assert!(text.contains("--isolated"));
-        assert!(text.contains("operating-system permissions"));
+        assert!(!text.contains("operating-system permissions"));
+        assert!(!text.to_ascii_lowercase().contains("cua"));
     }
 
     #[test]

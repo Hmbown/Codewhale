@@ -47,8 +47,8 @@
 //! bounded by [`JELLY_MAX_TEXT_DODGE_COLS`].
 //!
 //! Under reduced motion there is no ambient life at all: `ocean::life_presence`
-//! returns 0 and [`paint_marks`] returns before writing a cell. Marks are still
-//! *built* (the budget counters stay honest), just never painted.
+//! returns 0 and rendering exits before building marks or initializing pet
+//! tapes. Reduced motion spends no simulation work on invisible creatures.
 //!
 //! `render_ambient_life` returns per-frame budget counters
 //! ([`AmbientFrameStats`]): marks built always splits exactly into painted +
@@ -64,6 +64,13 @@ use ratatui::{
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::tui::ocean::{self, OceanColumn};
+
+#[path = "ambient_life/pet_cameo.rs"]
+mod pet_cameo;
+#[path = "ambient_life/pet_sim.rs"]
+pub mod pet_sim;
+#[path = "ambient_life/pet_widget.rs"]
+pub mod pet_widget;
 
 /// Depth layers for parallax. Nearer life is larger, faster, and more visible.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -140,16 +147,6 @@ impl LifeDensity {
 pub const AMBIENT_MIN_WIDTH: u16 = crate::tui::ocean::AMBIENT_MIN_WIDTH;
 pub const AMBIENT_MIN_HEIGHT: u16 = crate::tui::ocean::AMBIENT_MIN_HEIGHT;
 
-/// Whale cameo state: brief breach → spout → fluke → submerge.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WhaleCameoPhase {
-    Hidden,
-    Breach,
-    Spout,
-    Fluke,
-    Submerge,
-}
-
 /// Snapshot of ambient positions for one frame (memoized once per draw).
 #[derive(Debug, Clone)]
 struct FrameMarks {
@@ -168,7 +165,7 @@ struct AmbientMark {
     style_mod: Option<Modifier>,
     /// Time-varying glow in `[0, 1]`: the mark's ink is lerped from the
     /// painted water toward full ink at this amount. `None` renders the
-    /// plain ink (legacy behavior for the whale cameo).
+    /// plain habitat ink.
     brightness: Option<f32>,
 }
 
@@ -185,14 +182,11 @@ pub struct AmbientFrameStats {
     pub cells_written: u32,
 }
 
-/// Hard upper bound on marks built in one frame: 7 fish + 1 jellyfish × 4
-/// parts (2 dome rows + 2 tentacles) + 2 bubbles + 2 whale-cameo cells = 15,
-/// plus headroom. This is a test-gate ceiling asserted against
-/// [`AmbientFrameStats::marks_built`], not a runtime clamp: the population is
-/// bounded by construction, and this constant is what fails the build if a
-/// future change makes it unbounded.
+/// Bounded school (7), jellyfish (4), bubbles (2), plus at most three
+/// 18-by-6 dot-whale widgets including their labels. No particle allocations
+/// or simulation steps occur per paint after the fixed cameo tapes are cached.
 #[cfg(test)]
-pub const MAX_FRAME_MARKS: u32 = 24;
+pub const MAX_FRAME_MARKS: u32 = 13 + pet_cameo::MAX_MARKS;
 
 /// Optional pointer reaction for fish dart / bubble rise.
 #[derive(Debug, Clone, Copy, Default)]
@@ -262,19 +256,7 @@ impl AmbientActivity {
             ((elapsed_ms as f64) * f64::from(speed)) as u128
         }
     }
-
-    /// A sub-agent run surfaces as a pod: the completion cameo becomes three
-    /// whales at staggered offsets instead of one.
-    fn pod_cameo(self) -> bool {
-        self == Self::Subagents
-    }
-
-    fn pod_offsets(self) -> &'static [i16] {
-        if self.pod_cameo() { &[-5, 0, 5] } else { &[0] }
-    }
 }
-
-const WHALE_CAMEO_MS: u128 = 2_400;
 
 /// Render ambient life into empty water cells of `area`.
 ///
@@ -292,7 +274,11 @@ pub fn render_ambient_life(
     whale: WhaleCameo,
     activity: AmbientActivity,
 ) -> AmbientFrameStats {
-    if area.width < AMBIENT_MIN_WIDTH || area.height < AMBIENT_MIN_HEIGHT {
+    if area.width < AMBIENT_MIN_WIDTH
+        || area.height < AMBIENT_MIN_HEIGHT
+        || !presence.is_finite()
+        || presence <= 0.0
+    {
         return AmbientFrameStats::default();
     }
 
@@ -306,10 +292,11 @@ pub fn render_ambient_life(
     // Positions always ride the live monotonic clock; `presence` fades the
     // marks in and out, so the animated/static boundary eases instead of
     // snapping fish between t=0 and their mid-path positions.
-    let frame = build_frame_marks(
-        area, elapsed_ms, density, lines, cursor, whale, activity, &mut stats,
-    );
+    let frame = build_frame_marks(area, elapsed_ms, density, lines, cursor, &mut stats);
     paint_marks(area, buf, inks, lines, &frame, presence, &mut stats);
+    pet_cameo::paint(
+        area, buf, inks.0, lines, presence, whale, activity, &mut stats,
+    );
     stats
 }
 
@@ -320,8 +307,6 @@ fn build_frame_marks(
     density: LifeDensity,
     lines: &[Line<'static>],
     cursor: AmbientCursor,
-    whale: WhaleCameo,
-    activity: AmbientActivity,
     stats: &mut AmbientFrameStats,
 ) -> FrameMarks {
     let mut marks = Vec::with_capacity(48);
@@ -597,68 +582,6 @@ fn build_frame_marks(
             style_mod: None,
             brightness: Some(brightness),
         });
-    }
-
-    // --- Rare whale cameo (completion only) ---
-    if let Some(cameo_ms) = whale.elapsed_ms.filter(|ms| *ms < WHALE_CAMEO_MS) {
-        for (pod_index, offset) in activity.pod_offsets().iter().enumerate() {
-            // Pod members ride the same cameo breath, staggered so a sub-agent
-            // completion reads as a group surfacing rather than one whale.
-            let pod_cameo_ms = cameo_ms.saturating_add((pod_index as u128) * 240);
-            if pod_cameo_ms >= WHALE_CAMEO_MS {
-                continue;
-            }
-            let phase = whale_cameo_phase(pod_cameo_ms);
-            if phase == WhaleCameoPhase::Hidden {
-                continue;
-            }
-            // Smooth continuous forward swimming drift across cameo
-            let cameo_frac = pod_cameo_ms as f64 / WHALE_CAMEO_MS as f64;
-            let drift = (cameo_frac * 3.0).round() as u16;
-            let ax = whale
-                .anchor_x
-                .saturating_add_signed(*offset)
-                .saturating_add(drift)
-                .saturating_sub(area.x)
-                .min(area.width.saturating_sub(4));
-            let ay = whale
-                .anchor_y
-                .saturating_sub(area.y)
-                .min(area.height.saturating_sub(2));
-            let (glyph, y_off) = match phase {
-                WhaleCameoPhase::Breach => ("≈≈>", 0u16),
-                WhaleCameoPhase::Spout => ("≈≈>", 0),
-                WhaleCameoPhase::Fluke => ("～", 1),
-                WhaleCameoPhase::Submerge => ("·", 1),
-                WhaleCameoPhase::Hidden => ("", 0),
-            };
-            let whale_glow = {
-                let s = (cameo_frac * std::f64::consts::PI).sin();
-                (0.65 + 0.35 * s) as f32
-            };
-            if !glyph.is_empty() {
-                marks.push(AmbientMark {
-                    x: ax,
-                    y: ay.saturating_add(y_off).min(area.height.saturating_sub(1)),
-                    glyph,
-                    jellyfish: None,
-                    depth: Depth::Foreground,
-                    style_mod: None,
-                    brightness: Some(whale_glow),
-                });
-                if phase == WhaleCameoPhase::Spout && ay > 0 {
-                    marks.push(AmbientMark {
-                        x: ax.saturating_add(1).min(area.width.saturating_sub(1)),
-                        y: ay.saturating_sub(1),
-                        glyph: "˚",
-                        jellyfish: None,
-                        depth: Depth::Foreground,
-                        style_mod: Some(Modifier::DIM),
-                        brightness: Some(whale_glow),
-                    });
-                }
-            }
-        }
     }
 
     stats.marks_built = marks.len() as u32;
@@ -1158,17 +1081,6 @@ fn fish_body(facing_right: bool, lead: bool) -> &'static str {
         (true, false) => "><>",
         (false, true) => LEAD_FISH_LEFT,
         (false, false) => "<><",
-    }
-}
-
-#[must_use]
-pub fn whale_cameo_phase(elapsed_ms: u128) -> WhaleCameoPhase {
-    match elapsed_ms {
-        0..400 => WhaleCameoPhase::Breach,
-        400..1_000 => WhaleCameoPhase::Spout,
-        1_000..1_700 => WhaleCameoPhase::Fluke,
-        1_700..WHALE_CAMEO_MS => WhaleCameoPhase::Submerge,
-        _ => WhaleCameoPhase::Hidden,
     }
 }
 

@@ -192,7 +192,6 @@ fn worker_status_for_terminal_projection(status: &SubAgentStatus) -> AgentWorker
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn reconcile_subagent_activity_state_at(app: &mut App, now: Instant) {
     reconcile_terminal_subagent_card_retention(app, now);
 
@@ -875,38 +874,16 @@ fn task_status_label(status: TaskStatus) -> &'static str {
     }
 }
 
-fn hunt_verdict_glyph(verdict: Option<&str>) -> &'static str {
-    match verdict {
-        Some("hunting") => "·",
-        Some("hunted") => crate::tui::glyphs::DONE,
-        Some("wounded") => "!",
-        Some("escaped") => "×",
-        Some(_) => "?",
-        None => "-",
-    }
-}
-
 pub(super) fn format_task_list(tasks: &[TaskSummary]) -> String {
     if tasks.is_empty() {
         return "No tasks found.".to_string();
     }
 
-    let show_verdict = tasks.iter().any(|task| task.hunt_verdict.is_some());
     let show_session = tasks.iter().any(|task| task.owner_session_id.is_some());
     let mut lines = vec![format!("Tasks ({})", tasks.len())];
     // Build headers with the same format strings as the rows so the ID
     // column (21-char `task_` ids) can never drift out of alignment again.
-    if show_verdict && show_session {
-        lines.push(format!(
-            "{:<21}  {:<9}  {:<7}  {:<12}  {:>8}  {}",
-            "ID", "Status", "Verdict", "Session", "Time", "Title"
-        ));
-    } else if show_verdict {
-        lines.push(format!(
-            "{:<21}  {:<9}  {:<7}  {:>8}  {}",
-            "ID", "Status", "Verdict", "Time", "Title"
-        ));
-    } else if show_session {
+    if show_session {
         lines.push(format!(
             "{:<21}  {:<9}  {:<12}  {:>8}  {}",
             "ID", "Status", "Session", "Time", "Title"
@@ -929,26 +906,7 @@ pub(super) fn format_task_list(tasks: &[TaskSummary]) -> String {
         } else {
             owner_session.to_string()
         };
-        if show_verdict && show_session {
-            lines.push(format!(
-                "{:<21}  {:<9}  {:<7}  {:<12}  {:>8}  {}",
-                task.id,
-                task_status_label(task.status),
-                hunt_verdict_glyph(task.hunt_verdict.as_deref()),
-                owner_session,
-                duration,
-                task.prompt_summary
-            ));
-        } else if show_verdict {
-            lines.push(format!(
-                "{:<21}  {:<9}  {:<7}  {:>8}  {}",
-                task.id,
-                task_status_label(task.status),
-                hunt_verdict_glyph(task.hunt_verdict.as_deref()),
-                duration,
-                task.prompt_summary
-            ));
-        } else if show_session {
+        if show_session {
             lines.push(format!(
                 "{:<21}  {:<9}  {:<12}  {:>8}  {}",
                 task.id,
@@ -1130,6 +1088,7 @@ mod tests {
             id: id.to_string(),
             status,
             prompt_summary: "Fix task list output".to_string(),
+            name: None,
             model: "deepseek-v4-pro".to_string(),
             model_provider: None,
             model_provider_id: None,
@@ -1140,7 +1099,6 @@ mod tests {
             ended_at: None,
             duration_ms,
             lifecycle_seq: 1,
-            hunt_verdict: None,
             error: None,
             terminal_reason: None,
             thread_id: None,
@@ -1151,6 +1109,7 @@ mod tests {
 
     fn subagent_result(id: &str, status: SubAgentStatus) -> SubAgentResult {
         SubAgentResult {
+            usage: None,
             name: id.to_string(),
             agent_id: id.to_string(),
             context_mode: "fresh".to_string(),
@@ -1199,23 +1158,6 @@ mod tests {
             "{:<21}  {:<9}  {:>8}  {}",
             "task_abcdef12", "completed", "1s", "Fix task list output"
         )));
-    }
-
-    #[test]
-    fn task_list_renders_hunt_verdict_glyphs_when_present() {
-        let mut hunted = task_summary("task_hunted", TaskStatus::Completed, Some(1200));
-        hunted.hunt_verdict = Some("hunted".to_string());
-        let mut wounded = task_summary("task_wounded", TaskStatus::Completed, Some(2300));
-        wounded.hunt_verdict = Some("wounded".to_string());
-        let mut escaped = task_summary("task_escaped", TaskStatus::Failed, Some(3400));
-        escaped.hunt_verdict = Some("escaped".to_string());
-
-        let output = format_task_list(&[hunted, wounded, escaped]);
-
-        assert!(output.contains(&format!("{:<21}  {:<9}  {:<7}", "ID", "Status", "Verdict")));
-        assert!(output.contains(&format!("{:<21}  {:<9}  ✓", "task_hunted", "completed")));
-        assert!(output.contains(&format!("{:<21}  {:<9}  !", "task_wounded", "completed")));
-        assert!(output.contains(&format!("{:<21}  {:<9}  ×", "task_escaped", "failed")));
     }
 
     #[test]

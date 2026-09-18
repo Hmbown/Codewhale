@@ -19,7 +19,7 @@ workspace = true
 [dependencies]
 anyhow.workspace = true
 chrono.workspace = true
-codewhale-config = { path = "../config", version = "0.9.13" }
-codewhale-core = { path = "../core", version = "0.9.13" }
+codewhale-config = { path = "../config", version = "0.9.14" }
+codewhale-core = { path = "../core", version = "0.9.14" }
 serde.workspace = true
 serde_json = { workspace = true, features = ["preserve_order"] }

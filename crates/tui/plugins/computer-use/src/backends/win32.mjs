@@ -8,6 +8,7 @@ import os from "node:os";
 import path from "node:path";
 import crypto from "node:crypto";
 import { run, ExecError, tryJson, withSignal, throwIfAborted } from "../exec.mjs";
+import { createBrowser } from "../browser-cdp.mjs";
 
 const USER32 = `
 using System;
@@ -110,6 +111,7 @@ export function create(opts = {}) {
   // powershell.exe is spawned. Production uses the imported runner.
   const injectedRun = opts.exec && typeof opts.exec.run === "function" ? opts.exec.run : null;
   const runner = injectedRun ?? run;
+  const browser = createBrowser({ platform: "win32" });
 
   function requireInputOwner() {
     if (opts.exec?.persistentInputOwner !== true) throw Object.assign(new ExecError(
@@ -195,6 +197,14 @@ export function create(opts = {}) {
   return {
     platform: "win32",
     releaseInput,
+    browser_start: browser.start,
+    browser_status: browser.status,
+    browser_navigate: browser.navigate,
+    browser_click: browser.click,
+    browser_type: browser.type,
+    browser_screenshot: browser.screenshot,
+    browser_stop: browser.stop,
+    closeSession: async () => { await browser.close().catch(() => {}); },
     probe: async () => {
       const psOk = await ps("Write-Output 'ok'").then((r) => r.code === 0).catch(() => false);
       return {

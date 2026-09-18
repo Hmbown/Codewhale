@@ -25,6 +25,7 @@
 //! hacks in the shared paths).
 
 use anyhow::{Context, Result};
+use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::config::{ApiProvider, wire_model_for_provider_route};
@@ -790,13 +791,76 @@ fn apply_anthropic_cache_breakpoints(body: &mut Value) {
     }
 }
 
+/// Provider event types [`convert_anthropic_sse_data`] accepts. Anything else
+/// with a string `type` is tolerated as `None` (future additions); note
+/// `tool_projection_warning` is deliberately absent — it is local-only and
+/// must never decode from provider SSE.
+fn is_known_sse_type(event_type: &str) -> bool {
+    matches!(
+        event_type,
+        "message_start"
+            | "content_block_start"
+            | "content_block_delta"
+            | "content_block_stop"
+            | "message_delta"
+            | "message_stop"
+            | "ping"
+            | "error"
+    )
+}
+
+/// Peek at an SSE payload's `type` without building a DOM.
+#[derive(Deserialize)]
+struct SseTagPeek<'a> {
+    #[serde(borrow)]
+    r#type: Option<&'a str>,
+}
+
 /// Convert one SSE `data:` payload into a [`StreamEvent`], normalizing usage
 /// objects to the #2961 convention. Returns `None` for ignorable payloads.
+///
+/// #6213 T7: the per-token path deserializes directly into the tagged
+/// [`StreamEvent`] instead of building a `Value` DOM and converting it.
+/// Usage-bearing events (two per stream) keep the exact legacy path — the
+/// usage rewrite reads wire fields the normalized [`Usage`] cannot
+/// represent — and decode failures keep their exact legacy outcomes.
 fn convert_anthropic_sse_data(data: &str) -> Option<Result<StreamEvent>> {
     let trimmed = data.trim();
     if trimmed.is_empty() {
         return None;
     }
+    let usage_event = matches!(
+        serde_json::from_str::<SseTagPeek>(trimmed).map(|peek| peek.r#type),
+        Ok(Some("message_start" | "message_delta"))
+    );
+    if usage_event {
+        return convert_anthropic_sse_usage_event(trimmed);
+    }
+    match serde_json::from_str::<StreamEvent>(trimmed) {
+        // Local-only receipt: the legacy path ignored it (not a provider
+        // type), so it stays ignored rather than decoding.
+        Ok(StreamEvent::ToolProjectionWarning { .. }) => None,
+        Ok(event) => Some(Ok(event)),
+        Err(error) => {
+            // Cold path, reached only when direct decode fails: invalid JSON
+            // and unknown types keep their exact legacy outcomes.
+            let value: Value = match serde_json::from_str(trimmed) {
+                Ok(value) => value,
+                Err(e) => return Some(Err(anyhow::anyhow!("invalid SSE JSON: {e}"))),
+            };
+            match value.get("type").and_then(Value::as_str) {
+                // Tolerate unknown event types (e.g. future additions) silently.
+                Some(known) if !is_known_sse_type(known) => None,
+                _ => Some(Err(anyhow::anyhow!("unrecognized SSE event: {error}"))),
+            }
+        }
+    }
+}
+
+/// Legacy `Value` path for `message_start`/`message_delta`: the usage
+/// rewrite reads wire fields the normalized [`Usage`] cannot represent, so
+/// these two events normalize before decoding, exactly as before.
+fn convert_anthropic_sse_usage_event(trimmed: &str) -> Option<Result<StreamEvent>> {
     let mut value: Value = match serde_json::from_str(trimmed) {
         Ok(value) => value,
         Err(e) => return Some(Err(anyhow::anyhow!("invalid SSE JSON: {e}"))),
@@ -817,19 +881,7 @@ fn convert_anthropic_sse_data(data: &str) -> Option<Result<StreamEvent>> {
             }
         }
         // Tolerate unknown event types (e.g. future additions) silently.
-        Some(known)
-            if !matches!(
-                known,
-                "message_start"
-                    | "content_block_start"
-                    | "content_block_delta"
-                    | "content_block_stop"
-                    | "message_delta"
-                    | "message_stop"
-                    | "ping"
-                    | "error"
-            ) =>
-        {
+        Some(known) if !is_known_sse_type(known) => {
             return None;
         }
         _ => {}
@@ -1709,6 +1761,30 @@ mod tests {
             "unknown event types are tolerated"
         );
         assert!(convert_anthropic_sse_data("   ").is_none());
+    }
+
+    #[test]
+    fn sse_decode_failures_keep_legacy_outcomes_on_the_direct_path() {
+        // Malformed JSON: the invalid-input error, not the unrecognized one.
+        let error = convert_anthropic_sse_data("{oops")
+            .expect("malformed is Some")
+            .expect_err("malformed is Err");
+        assert!(error.to_string().contains("invalid SSE JSON"), "{error:?}");
+        // Structurally invalid known event: unrecognized, not tolerated.
+        let error = convert_anthropic_sse_data(r#"{"type":"content_block_stop"}"#)
+            .expect("known type is Some")
+            .expect_err("missing index is Err");
+        assert!(
+            error.to_string().contains("unrecognized SSE event"),
+            "{error:?}"
+        );
+        // Local-only receipt: never provider SSE, stays ignored.
+        assert!(
+            convert_anthropic_sse_data(
+                r#"{"type":"tool_projection_warning","provider":"x","omitted_tool_names":[],"omitted_tool_count":0}"#
+            )
+            .is_none()
+        );
     }
 
     #[test]

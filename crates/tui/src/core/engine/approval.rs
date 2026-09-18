@@ -24,6 +24,11 @@ pub(super) enum ApprovalDecision {
     Denied {
         id: String,
     },
+    /// The interactive card expired unanswered (#6101): the configured
+    /// bound denied the call, not the operator.
+    TimedOut {
+        id: String,
+    },
     /// Retry a tool with an elevated sandbox policy.
     RetryWithPolicy {
         id: String,
@@ -187,6 +192,10 @@ impl Engine {
                         }
                         ApprovalDecision::Denied { id } if id == tool_id => {
                             self.commit_approval_outcome(tool_id, ApprovalOutcome::Denied).await?;
+                            return Ok(ApprovalResult::Denied);
+                        }
+                        ApprovalDecision::TimedOut { id } if id == tool_id => {
+                            self.commit_approval_outcome(tool_id, ApprovalOutcome::Timeout).await?;
                             return Ok(ApprovalResult::Denied);
                         }
                         ApprovalDecision::RetryWithPolicy { id, policy } if id == tool_id => {
@@ -519,6 +528,7 @@ mod tests {
             None,
             Some(4),
             engine.session.approval_mode,
+            crate::core::engine::tool_catalog::ToolMode::Direct,
         );
         let events = handle.rx_event.clone();
         let mut handle = Some(handle);
@@ -698,12 +708,14 @@ mod tests {
         enum Decision {
             Approve,
             Deny,
+            Timeout,
             Cancel,
             Retry,
         }
         let cases = [
             (Decision::Approve, ApprovalOutcome::ApprovedOnce),
             (Decision::Deny, ApprovalOutcome::Denied),
+            (Decision::Timeout, ApprovalOutcome::Timeout),
             (Decision::Cancel, ApprovalOutcome::Cancelled),
             (
                 Decision::Retry,
@@ -739,6 +751,10 @@ mod tests {
             match decision {
                 Decision::Approve => handle.approve_tool_call(&tool_id).await.expect("approve"),
                 Decision::Deny => handle.deny_tool_call(&tool_id).await.expect("deny"),
+                Decision::Timeout => handle
+                    .deny_tool_call_timed_out(&tool_id)
+                    .await
+                    .expect("timeout deny"),
                 Decision::Cancel => handle.cancel(),
                 Decision::Retry => handle
                     .retry_tool_with_policy(&tool_id, SandboxPolicy::DangerFullAccess)
@@ -752,6 +768,9 @@ mod tests {
                     assert!(matches!(result, Ok(ApprovalResult::Approved)));
                 }
                 ApprovalOutcome::Denied => {
+                    assert!(matches!(result, Ok(ApprovalResult::Denied)));
+                }
+                ApprovalOutcome::Timeout => {
                     assert!(matches!(result, Ok(ApprovalResult::Denied)));
                 }
                 ApprovalOutcome::Cancelled => assert!(result.is_err()),

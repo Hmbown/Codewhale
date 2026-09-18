@@ -31,10 +31,10 @@ export const chrome: ChromeDict = {
 
   navProduct: "Produkt",
   navModels: "Modele",
-  navPricing: "Cennik",
+  navPlugins: "Wtyczki",
   navProductSecondary: "Product",
   navModelsSecondary: "Models",
-  navPricingSecondary: "Pricing",
+  navPluginsSecondary: "Plugins",
 
   skipToContent: "Przejdź do treści głównej",
 
@@ -91,7 +91,6 @@ export const chrome: ChromeDict = {
   footerIssues: "Issues",
   footerContribute: "Współtwórz",
   footerLicense: "Licencja MIT",
-  footerPricing: "Cennik",
   footerTerms: "Warunki usługi",
   footerPrivacy: "Prywatność",
   footerChangelog: "Dziennik zmian",

@@ -30,7 +30,7 @@ export interface ChromeLink {
 }
 
 /**
- * The four primary nav links — Product / Models / Pricing / Docs — identical
+ * The primary nav links — Product / Models / Plugins / Docs — identical
  * in shape for every routed locale. This is the strip a serious product
  * shows; discovery and community routes live in `secondaryNavLinks` (the
  * compact sheet's second group) and the footer.
@@ -44,9 +44,9 @@ export function navLinks(locale: string, chrome: ChromeDict): ChromeLink[] {
     },
     { href: `/${locale}/models`, label: chrome.navModels, secondary: chrome.navModelsSecondary },
     {
-      href: `/${locale}/pricing`,
-      label: chrome.navPricing,
-      secondary: chrome.navPricingSecondary,
+      href: `/${locale}/plugins`,
+      label: chrome.navPlugins,
+      secondary: chrome.navPluginsSecondary,
     },
     { href: `/${locale}/docs`, label: chrome.navDocs, secondary: chrome.navDocsSecondary },
   ];
@@ -87,6 +87,7 @@ export function footerProductLinks(locale: string, chrome: ChromeDict): ChromeLi
     { href: `/${locale}/docs/guide`, label: chrome.footerGuide },
     { href: `/${locale}/install`, label: chrome.footerInstall },
     { href: `/${locale}/models`, label: chrome.footerModels },
+    { href: `/${locale}/plugins`, label: chrome.navPlugins },
     { href: `/${locale}/runtime`, label: chrome.footerRuntime },
     { href: `/${locale}/faq`, label: chrome.footerFaq },
     { href: `/${locale}/changelog`, label: chrome.footerChangelog },
@@ -104,10 +105,9 @@ export function footerProjectLinks(locale: string, chrome: ChromeDict): ChromeLi
   ];
 }
 
-/** Footer legal / pricing destinations — reachable, never a 404. */
+/** Footer legal destinations — reachable, never a 404. */
 export function footerLegalLinks(locale: string, chrome: ChromeDict): ChromeLink[] {
   return [
-    { href: `/${locale}/pricing`, label: chrome.footerPricing },
     { href: `/${locale}/legal/terms`, label: chrome.footerTerms },
     { href: `/${locale}/legal/privacy`, label: chrome.footerPrivacy },
   ];

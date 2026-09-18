@@ -1,4 +1,4 @@
-<!-- source: README.md sha256:a446e3921085 -->
+<!-- source: README.md sha256:ebf1c69de0dc -->
 # Codewhale
 
 Codewhale é um agente de código aberto que lê seu projeto, edita arquivos, executa comandos e verifica o próprio trabalho usando um modelo hospedado ou local à sua escolha. Comece com uma tarefa no terminal. Para um trabalho maior, distribua partes do trabalho entre agentes com diferentes modelos e funções.
@@ -53,7 +53,7 @@ O terminal e os clientes gráficos se conectam ao Runtime do Codewhale, que exec
 
 - **Terminal:** `codewhale` abre a interface interativa; `codewhale exec` executa uma tarefa a partir de um script ou de um job de CI.
 - **Navegador local:** `codewhale web` abre o [cliente web local](docs/WEB.md) incluído, que usa o mesmo runtime.
-- **Aplicativos web e desktop do Codewhale:** ambientes de trabalho gráficos em desenvolvimento. A disponibilidade é informada na [página do produto](https://codewhale.net/en/product).
+- **Aplicativo de desktop Codewhale (GPUI):** o aplicativo de desktop nativo GPUI é a direção do cliente do produto (decisão de 2026-09-14; o mapa de fases está em docs/TRANSITION.md no repositório privado codehwhale-gpui). O aplicativo web hospedado em app.codewhale.net será descontinuado em fases; o site de marketing, o login, a cobrança e as páginas legais e de download permanecem na web permanentemente. A disponibilidade é informada na [página do produto](https://codewhale.net/en/product).
 
 **Computer Use adiciona ferramentas para observar outros aplicativos e interagir com eles.** O plugin está incluído no código-fonte atual. Revise o acesso solicitado e habilite-o antes de usar; as permissões do sistema operacional e os requisitos da plataforma continuam sendo necessários. Consulte o [guia de Computer Use](crates/tui/plugins/computer-use/README.md) incluído e a [configuração de plugins](docs/PLUGINS.md).
 

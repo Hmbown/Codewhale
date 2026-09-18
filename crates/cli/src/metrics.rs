@@ -71,7 +71,7 @@ pub fn run(args: MetricsArgs) -> Result<()> {
     if args.json {
         print_json(&rollup)?;
     } else {
-        print_human(&rollup);
+        print_human(&rollup, args.since);
     }
 
     Ok(())
@@ -211,6 +211,14 @@ pub struct AgentStats {
     pub budget_exhausted: u64,
     /// Terminal receipts with missing, malformed, or unrecognized outcomes.
     pub unknown_outcomes: u64,
+    /// Completions carrying a usage receipt. Token sums cover exactly these;
+    /// a completion without usage is a missing receipt, never zero tokens.
+    pub usage_receipts: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub total_tokens: u64,
+    /// Summed priced subtotal in microdollars, JSON consumers only.
+    pub cost_microusd: u64,
 }
 
 impl AgentStats {
@@ -244,6 +252,26 @@ impl AgentStats {
             }
         };
         *count = count.saturating_add(1);
+        // Child cost visibility (#6315): the runtime persists the completion
+        // receipt's usage on the agent.completed payload.
+        let usage = event
+            .pointer("/payload/usage")
+            .or_else(|| event.pointer("/details/usage"));
+        if let Some(usage) = usage
+            && usage.is_object()
+        {
+            self.usage_receipts = self.usage_receipts.saturating_add(1);
+            for (field, sum) in [
+                ("input_tokens", &mut self.input_tokens),
+                ("output_tokens", &mut self.output_tokens),
+                ("total_tokens", &mut self.total_tokens),
+                ("cost_microusd", &mut self.cost_microusd),
+            ] {
+                if let Some(n) = usage.get(field).and_then(Value::as_u64) {
+                    *sum = (*sum).saturating_add(n);
+                }
+            }
+        }
     }
 
     fn summary(&self) -> String {
@@ -265,6 +293,20 @@ impl AgentStats {
         let mut summary = format!("Sub-agents: {} spawn receipts", fmt_num(self.spawns));
         if !outcomes.is_empty() {
             summary.push_str(&format!("; outcomes: {}", outcomes.join(", ")));
+        }
+        if self.usage_receipts > 0 {
+            summary.push_str(&format!(
+                "; tokens: {} in/{} out/{} total ({} {})",
+                fmt_num(self.input_tokens),
+                fmt_num(self.output_tokens),
+                fmt_num(self.total_tokens),
+                fmt_num(self.usage_receipts),
+                if self.usage_receipts == 1 {
+                    "receipt"
+                } else {
+                    "receipts"
+                },
+            ));
         }
         summary
     }
@@ -530,7 +572,7 @@ fn read_audit_log(
                     rollup.compaction.ratio_samples += 1;
                 }
             }
-            "agent.spawn" | "subagent.spawned" => {
+            "agent.spawn" | "agent.spawned" | "subagent.spawned" => {
                 rollup.agents.spawns += 1;
             }
             "agent.completed" | "subagent.completed" => {
@@ -1099,8 +1141,10 @@ fn print_json(rollup: &Rollup) -> Result<()> {
     Ok(())
 }
 
-fn print_human(rollup: &Rollup) {
-    // Period header
+fn print_human(rollup: &Rollup, since: Option<DateTime<Utc>>) {
+    // Period header. When a --since cutoff yields nothing, print it: a bare
+    // `--since 7` is seven seconds, and the empty window must not read the
+    // same as a genuinely idle period (#6315).
     match (rollup.earliest_ts, rollup.latest_ts) {
         (Some(start), Some(end)) => {
             let days = (end - start).num_days();
@@ -1114,9 +1158,13 @@ fn print_human(rollup: &Rollup) {
         (Some(start), None) | (None, Some(start)) => {
             println!("Period: {} → (unknown)", start.format("%Y-%m-%d"));
         }
-        (None, None) => {
-            println!("Period: (no data)");
-        }
+        (None, None) => match since {
+            Some(cutoff) => println!(
+                "Period: (no data since {})",
+                cutoff.format("%Y-%m-%d %H:%M UTC")
+            ),
+            None => println!("Period: (no data)"),
+        },
     }
 
     // ── Tools ──────────────────────────────────────────────────────────────
@@ -1441,6 +1489,55 @@ mod tests {
             !summary.contains("%"),
             "partial receipts are not a success rate"
         );
+    }
+
+    #[test]
+    fn runtime_worker_usage_sums_tokens_across_completion_receipts() {
+        // #6315: completions with usage receipts sum into the rollup; a
+        // completion without usage is a missing receipt, never zero tokens.
+        let events = vec![
+            runtime_event(
+                0,
+                "2026-09-08T10:00:00Z",
+                "thread-a",
+                Some("turn-a"),
+                "agent.completed",
+                serde_json::json!({
+                    "agent_id": "worker-0",
+                    "worker_status": "completed",
+                    "usage": {
+                        "status": "completed",
+                        "input_tokens": 800,
+                        "output_tokens": 200,
+                        "total_tokens": 1000,
+                        "cost_microusd": 50,
+                    },
+                }),
+            ),
+            runtime_event(
+                1,
+                "2026-09-08T10:01:00Z",
+                "thread-a",
+                Some("turn-a"),
+                "agent.completed",
+                serde_json::json!({
+                    "agent_id": "worker-1",
+                    "worker_status": "completed",
+                }),
+            ),
+        ];
+        let tmp = write_runtime_events(&events);
+        let mut rollup = Rollup::default();
+        read_runtime_test_log(tmp.path(), None, &mut rollup);
+        let agents = &rollup.agents;
+        assert_eq!(agents.successes, 2);
+        assert_eq!(agents.usage_receipts, 1);
+        assert_eq!(agents.input_tokens, 800);
+        assert_eq!(agents.output_tokens, 200);
+        assert_eq!(agents.total_tokens, 1000);
+        assert_eq!(agents.cost_microusd, 50);
+        let summary = agents.summary();
+        assert!(summary.contains("800 in/200 out/1,000 total (1 receipt)"));
     }
 
     #[test]

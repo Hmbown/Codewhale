@@ -44,6 +44,7 @@ pub mod workflows_manager;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModalKind {
+    PetHabitat,
     Approval,
     Elevation,
     UserInput,
@@ -788,6 +789,26 @@ pub enum ViewEvent {
         /// Exact named route for `Custom`; built-in providers leave this unset.
         provider_id: Option<String>,
         model: String,
+    },
+    /// Enter on a Fleet editor row: open the standard `/model` picker for
+    /// that row (the editor stays underneath) instead of the editor's own
+    /// inline route list.
+    FleetDetailRoutePickRequested {
+        target: crate::tui::views::fleet_detail::FleetRouteTarget,
+        editor_id: uuid::Uuid,
+    },
+    /// The `/model` picker, opened for a Fleet editor row, resolved a route.
+    /// Carries the row's absolute route — never a diff against the session —
+    /// and the host applies and saves it on the editor still on the stack.
+    /// The picker's `auto` row means "inherit the session route".
+    FleetRoutePicked {
+        target: crate::tui::views::fleet_detail::FleetRouteTarget,
+        editor_id: uuid::Uuid,
+        provider: crate::config::ApiProvider,
+        /// Exact named route for `Custom`; built-in providers leave this unset.
+        provider_id: Option<String>,
+        model: String,
+        reasoning: Option<crate::reasoning_preference::ReasoningEffort>,
     },
     ModelPickerNeedsAuth {
         provider: crate::config::ApiProvider,
@@ -2055,16 +2076,6 @@ impl ConfigView {
                     .opens("/provider", MessageId::ConfigActionOpenProvider),
             },
             ConfigRow {
-                key: "provider_templates".to_string(),
-                value: codewhale_config::ProviderSetupTemplate::settings_value(),
-                editable: true,
-                scope: ConfigScope::Saved,
-                facts: ConfigRowFacts::action(
-                    "/provider templates",
-                    MessageId::ConfigActionOpenProviderTemplates,
-                ),
-            },
-            ConfigRow {
                 key: config_base_url_row_key(active_route_provider).to_string(),
                 value: config_base_url_row_value(app),
                 // An endpoint is a route receipt, not a loose global knob.
@@ -2692,9 +2703,19 @@ impl ConfigView {
         if cached == 0 { 8 } else { cached }
     }
 
-    fn row_matches_filter(&self, row: &ConfigRow) -> bool {
-        let filter = self.filter.trim().to_lowercase();
-        if filter.is_empty() {
+    /// The lowercased search terms for the current filter, computed once per
+    /// interaction instead of once per row per pass (#6213 T6).
+    fn filter_terms(&self) -> Vec<String> {
+        self.filter
+            .trim()
+            .to_lowercase()
+            .split_whitespace()
+            .map(str::to_string)
+            .collect()
+    }
+
+    fn row_matches_filter(&self, row: &ConfigRow, terms: &[String]) -> bool {
+        if terms.is_empty() {
             return true;
         }
 
@@ -2712,7 +2733,7 @@ impl ConfigView {
         let scope_en = row.scope.label(Locale::En).to_lowercase();
         let hint = config_hint_for_key(self.locale, &row.key).to_lowercase();
 
-        filter.split_whitespace().all(|term| {
+        terms.iter().all(|term| {
             section.contains(term)
                 || section_en.contains(term)
                 || category_label.contains(term)
@@ -2729,11 +2750,12 @@ impl ConfigView {
 
     fn matching_row_indices(&self) -> Vec<usize> {
         let filtering = !self.filter.is_empty();
+        let terms = self.filter_terms();
         self.rows
             .iter()
             .enumerate()
             .filter_map(|(idx, row)| {
-                (self.row_matches_filter(row) && (filtering || self.category.contains(row)))
+                (self.row_matches_filter(row, &terms) && (filtering || self.category.contains(row)))
                     .then_some(idx)
             })
             .collect()
@@ -2744,8 +2766,9 @@ impl ConfigView {
         let mut current_section = None;
         let filtering = !self.filter.is_empty();
 
+        let terms = self.filter_terms();
         for (idx, row) in self.rows.iter().enumerate() {
-            if !self.row_matches_filter(row) {
+            if !self.row_matches_filter(row, &terms) {
                 continue;
             }
             // The rail category filters rows unless the user is searching.
@@ -4250,8 +4273,6 @@ impl ConfigView {
 const CONFIG_SHELL_DETAIL_MIN_WIDTH: u16 = 100;
 /// Groups column width (the active tab's `ui.group` names).
 const CONFIG_SHELL_GROUPS_WIDTH: u16 = 18;
-/// Category rail width of the Tideline settings stage scaffold.
-const CONFIG_SHELL_RAIL_WIDTH: u16 = 20;
 
 /// Pane geometry for one render of the settings shell.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4377,68 +4398,6 @@ pub(crate) struct CategoryNavStyle {
     pub normal: Style,
     pub marker: Style,
     pub ascii_safe: bool,
-}
-
-/// Paint the vertical rail: one row per category with the selected one
-/// marked. Returns the painted rect of every category (spec §6 parity).
-pub(crate) fn render_settings_category_rail(
-    area: Rect,
-    buf: &mut Buffer,
-    selected: ConfigCategory,
-    locale: Locale,
-    style: CategoryNavStyle,
-    hovered: Option<ConfigCategory>,
-) -> Vec<(Rect, ConfigCategory)> {
-    let mut hitboxes = Vec::new();
-    if area.width < 3 {
-        return hitboxes;
-    }
-    let label_width = usize::from(area.width).saturating_sub(2);
-    for (index, category) in ConfigCategory::ALL.iter().enumerate() {
-        let Some(y) = area
-            .y
-            .checked_add(index as u16)
-            .filter(|y| *y < area.bottom())
-        else {
-            break;
-        };
-        let is_selected = *category == selected;
-        let marker = match (is_selected, style.ascii_safe) {
-            (false, _) => " ",
-            (true, true) => ">",
-            (true, false) => "▸",
-        };
-        buf.set_stringn(area.x, y, marker, 1, style.marker);
-        let label = crate::tui::ui_text::truncate_line_to_width(
-            category.label(locale).as_ref(),
-            label_width,
-        );
-        buf.set_stringn(
-            area.x.saturating_add(2),
-            y,
-            &label,
-            label_width,
-            if is_selected {
-                style.selected
-            } else if hovered == Some(*category) {
-                style
-                    .normal
-                    .patch(crate::tui::menu_style::hovered_row_style())
-            } else {
-                style.normal
-            },
-        );
-        hitboxes.push((
-            Rect {
-                x: area.x,
-                y,
-                width: area.width,
-                height: 1,
-            },
-            *category,
-        ));
-    }
-    hitboxes
 }
 
 /// Window of chips `[start, end)` that fits `width` columns while always
@@ -5517,6 +5476,7 @@ fn live_subagent_result(
     nickname: Option<String>,
 ) -> SubAgentResult {
     SubAgentResult {
+        usage: None,
         name: agent_id.to_string(),
         agent_id: agent_id.to_string(),
         context_mode: "fresh".to_string(),
@@ -6989,6 +6949,7 @@ mod tests {
 
     fn manager_agent(id: &str, status: SubAgentStatus) -> SubAgentResult {
         SubAgentResult {
+            usage: None,
             name: id.to_string(),
             agent_id: id.to_string(),
             context_mode: "fresh".to_string(),
@@ -7341,7 +7302,6 @@ mod tests {
             .map(|row| row.key.as_str())
             .collect::<Vec<_>>();
         assert!(keys.contains(&"provider"));
-        assert!(keys.contains(&"provider_templates"));
         assert!(keys.contains(&"model"));
         assert!(keys.contains(&"reasoning_effort"));
         assert!(keys.contains(&"base_url"));
@@ -8356,7 +8316,6 @@ base_url = "https://api.xiaomimimo.com/v1"
         // persisted to config.toml by `set_config_value`.
         const NOT_SETTINGS_TOML: &[&str] = &[
             "provider",
-            "provider_templates",
             "model",
             "fleet.exec.max_spawn_depth",
             "goal_command",
@@ -8437,6 +8396,10 @@ base_url = "https://api.xiaomimimo.com/v1"
                 None if def.is_int() => {
                     let default: i64 = def.default.parse().unwrap_or(0);
                     vec![(default + 1).to_string()]
+                }
+                None if def.is_float() => {
+                    let default: f64 = def.default.parse().unwrap_or(50.0);
+                    vec![(default + 0.5).to_string()]
                 }
                 None => vec!["roundtrip-probe".to_string()],
             };
@@ -8579,7 +8542,9 @@ base_url = "https://api.xiaomimimo.com/v1"
             let options = match def.kind {
                 codewhale_config::SettingKind::Bool(options) => options,
                 codewhale_config::SettingKind::Enum(options) => options,
-                codewhale_config::SettingKind::Int | codewhale_config::SettingKind::String => &[],
+                codewhale_config::SettingKind::Int
+                | codewhale_config::SettingKind::String
+                | codewhale_config::SettingKind::Float => &[],
             };
             for option in options {
                 if !option.label.is_empty() {
@@ -9285,7 +9250,6 @@ context_window = 262144
         };
 
         assert_eq!(kind_for("provider"), SettingKind::Action);
-        assert_eq!(kind_for("provider_templates"), SettingKind::Action);
         assert_eq!(kind_for("model"), SettingKind::Action);
         assert_eq!(kind_for("low_motion"), SettingKind::Boolean);
         assert_eq!(kind_for("default_mode"), SettingKind::Choice);
@@ -10379,7 +10343,7 @@ context_window = 262144
             "Enter must open the theme editor"
         );
 
-        // ↓ highlights underwater: preview (persist:false), editor stays open.
+        // ↓ highlights shoreline: preview (persist:false), editor stays open.
         match key(&mut view, KeyCode::Down) {
             ViewAction::Emit(ViewEvent::ConfigUpdated {
                 key,
@@ -10387,7 +10351,7 @@ context_window = 262144
                 persist,
             }) => {
                 assert_eq!(key, "theme");
-                assert_eq!(value, "underwater");
+                assert_eq!(value, "shoreline");
                 assert!(!persist, "highlighting must not persist");
             }
             other => panic!("highlight must preview, got {other:?}"),
@@ -10429,7 +10393,7 @@ context_window = 262144
                 persist,
             }) => {
                 assert_eq!(key, "theme");
-                assert_eq!(value, "underwater");
+                assert_eq!(value, "shoreline");
                 assert!(persist, "Apply must persist");
             }
             other => panic!("enter must persist the highlight, got {other:?}"),
@@ -10504,14 +10468,14 @@ context_window = 262144
                 modifiers: KeyModifiers::NONE,
             })
         };
-        // Choice index 2 is underwater (system, terminal, underwater, …).
+        // Choice index 2 is shoreline (system, terminal, shoreline, …).
         let (rect, _) = view
             .last_choice_hitboxes
             .borrow()
             .iter()
             .copied()
             .find(|(_, idx)| *idx == 2)
-            .expect("rendered underwater hitbox");
+            .expect("rendered shoreline hitbox");
         match hover(&mut view, rect.x, rect.y) {
             ViewAction::Emit(ViewEvent::ConfigUpdated {
                 key,
@@ -10519,7 +10483,7 @@ context_window = 262144
                 persist,
             }) => {
                 assert_eq!(key, "theme");
-                assert_eq!(value, "underwater");
+                assert_eq!(value, "shoreline");
                 assert!(!persist, "hover preview must not persist");
             }
             other => panic!("hover must preview, got {other:?}"),
@@ -11243,187 +11207,3 @@ context_window = 262144
         );
     }
 }
-
-// ---------------------------------------------------------------------------
-// Tideline settings stage (spec §5a "Settings rail", "Live preview"; §5b
-// 3-pane settings layout): the theme list + live preview composite. It
-// navigates the same `ConfigCategory::ALL` taxonomy as `ConfigView`, through
-// the shared rail/strip painters above, so there is exactly one category set.
-
-#[allow(dead_code)] // Tideline settings rail + preview (spec §5a)
-pub mod tideline_preview;
-
-/// The seven settings categories in rail order (Appearance → Advanced),
-/// exactly as `ConfigView` paints them.
-#[must_use]
-#[allow(dead_code)] // stage scaffolding: composed by the landing slice
-pub fn tideline_settings_categories(locale: Locale) -> [Cow<'static, str>; 7] {
-    ConfigCategory::ALL.map(|category| category.label(locale))
-}
-
-/// What the caller owes the settings rail.
-#[allow(dead_code)] // stage scaffolding: composed by the landing slice
-pub struct TidelineSettingsRail<'a> {
-    pub theme: &'a codewhale_palette::UiTheme,
-    /// Index into [`ConfigCategory::ALL`].
-    pub selected: usize,
-    pub ascii_safe: bool,
-    pub locale: Locale,
-}
-
-#[allow(dead_code)] // stage scaffolding: composed by the landing slice
-impl TidelineSettingsRail<'_> {
-    fn category(&self) -> ConfigCategory {
-        ConfigCategory::ALL[self.selected.min(ConfigCategory::ALL.len() - 1)]
-    }
-
-    fn nav_style(&self) -> CategoryNavStyle {
-        use codewhale_palette::{ChromeInk, chrome_style};
-        CategoryNavStyle {
-            selected: chrome_style(self.theme, ChromeInk::Identity).add_modifier(Modifier::BOLD),
-            normal: chrome_style(self.theme, ChromeInk::MetadataValue),
-            marker: chrome_style(self.theme, ChromeInk::Identity),
-            ascii_safe: self.ascii_safe,
-        }
-    }
-}
-
-#[allow(dead_code)] // stage scaffolding: composed by the landing slice
-fn srail_put(buf: &mut Buffer, x: u16, y: u16, text: &str, style: Style) {
-    buf.set_stringn(x, y, text, text.width(), style);
-}
-
-/// Paint the settings rail: the shared category rail with the selected `▸`,
-/// then the meta rows (help / file issue / feedback).
-#[allow(dead_code)] // stage scaffolding: composed by the landing slice
-pub fn render_tideline_settings_rail(
-    area: Rect,
-    buf: &mut Buffer,
-    rail: &TidelineSettingsRail<'_>,
-) {
-    if area.width < 4 || area.height < 4 {
-        return;
-    }
-    let categories = Rect {
-        height: area.height.saturating_sub(3),
-        ..area
-    };
-    render_settings_category_rail(
-        categories,
-        buf,
-        rail.category(),
-        rail.locale,
-        rail.nav_style(),
-        // The stage scaffold owns no pointer state yet; the landing slice
-        // threads its hover here when it wires the rail to mouse motion.
-        None,
-    );
-    // Meta rows pinned near the bottom (the reference's help/file/feedback).
-    let meta_y = area.y + area.height.saturating_sub(3);
-    for (offset, meta) in ["? help", "/ file issue", "f feedback"].iter().enumerate() {
-        let row_y = meta_y + offset as u16;
-        if row_y < area.y + area.height {
-            srail_put(
-                buf,
-                area.x,
-                row_y,
-                meta,
-                codewhale_palette::chrome_style(
-                    rail.theme,
-                    codewhale_palette::ChromeInk::MetadataHint,
-                ),
-            );
-        }
-    }
-}
-
-/// Category rects for the rail (spec §6: keyboard + mouse parity).
-#[must_use]
-#[allow(dead_code)] // stage scaffolding: composed by the landing slice
-pub fn tideline_settings_rail_hitboxes(area: Rect, _rail: &TidelineSettingsRail<'_>) -> Vec<Rect> {
-    let mut out = Vec::new();
-    if area.width < 4 || area.height < 4 {
-        return out;
-    }
-    for index in 0..ConfigCategory::ALL.len() {
-        let y = area.y + index as u16;
-        if y >= area.y + area.height.saturating_sub(3) {
-            break;
-        }
-        out.push(Rect {
-            x: area.x,
-            y,
-            width: area.width,
-            height: 1,
-        });
-    }
-    out
-}
-
-/// Paint the narrow-width category strip for the stage and return the
-/// painted rect of every visible category.
-#[allow(dead_code)] // stage scaffolding: composed by the landing slice
-pub fn render_tideline_settings_strip(
-    area: Rect,
-    buf: &mut Buffer,
-    rail: &TidelineSettingsRail<'_>,
-) -> Vec<Rect> {
-    render_settings_category_strip(
-        area,
-        buf,
-        rail.category(),
-        rail.locale,
-        rail.nav_style(),
-        // The stage scaffold owns no pointer state yet; the landing slice
-        // threads its hover here when it wires the strip to mouse motion.
-        None,
-        None,
-    )
-    .chips
-    .into_iter()
-    .map(|(rect, _)| rect)
-    .collect()
-}
-
-use ratatui::layout::{Constraint, Layout};
-
-/// The settings stage composite (spec §5b): `nav │ form │ preview` at
-/// ≥100 columns; below that the category strip sits over the form and the
-/// preview pane sheds.
-#[allow(dead_code)] // stage scaffolding: composed by the landing slice
-pub struct TidelineSettingsStage<'a> {
-    pub rail: TidelineSettingsRail<'a>,
-    pub theme_list: crate::tui::theme_picker::TidelineThemeList<'a>,
-    pub preview: tideline_preview::TidelineSettingsPreview<'a>,
-}
-
-/// Paint the settings stage.
-#[allow(dead_code)] // stage scaffolding: composed by the landing slice
-pub fn render_tideline_settings_stage(
-    area: Rect,
-    buf: &mut Buffer,
-    stage: &TidelineSettingsStage<'_>,
-) {
-    if area.width < 30 || area.height < 4 {
-        return;
-    }
-    if area.width >= 100 {
-        let [nav, form, preview] = Layout::horizontal([
-            Constraint::Length(CONFIG_SHELL_RAIL_WIDTH),
-            Constraint::Min(30),
-            Constraint::Percentage(38),
-        ])
-        .areas(area);
-        render_tideline_settings_rail(nav, buf, &stage.rail);
-        crate::tui::theme_picker::render_tideline_theme_list(form, buf, &stage.theme_list);
-        tideline_preview::render_tideline_settings_preview(preview, buf, &stage.preview);
-    } else {
-        let [strip, form] =
-            Layout::vertical([Constraint::Length(1), Constraint::Min(3)]).areas(area);
-        render_tideline_settings_strip(strip, buf, &stage.rail);
-        crate::tui::theme_picker::render_tideline_theme_list(form, buf, &stage.theme_list);
-    }
-}
-
-#[cfg(test)]
-mod tideline_tests;

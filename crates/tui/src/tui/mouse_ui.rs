@@ -101,7 +101,7 @@ use ratatui::layout::Rect;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
-use crate::tui::app::{App, SidebarRowAction};
+use crate::tui::app::{App, SidebarRowAction, StatusToastLevel};
 use crate::tui::command_palette::{
     CommandPaletteView, build_entries as build_command_palette_entries,
 };
@@ -111,7 +111,8 @@ use crate::tui::scrolling::{ScrollDirection, TranscriptScroll};
 use crate::tui::selection::{SelectionAutoscroll, TranscriptSelectionPoint};
 use crate::tui::tideline::InteractionAction;
 use crate::tui::ui_text::{
-    history_cell_to_text, line_to_plain, slice_text, text_display_width, truncate_line_to_width,
+    history_cell_to_clipboard_text, history_cell_to_text, line_to_plain, slice_text,
+    text_display_width, truncate_line_to_width,
 };
 use crate::tui::views::{ContextMenuAction, HelpView, ModalKind, ViewEvent};
 use codewhale_localization::MessageId;
@@ -406,6 +407,20 @@ fn handle_slash_autocomplete_mouse(app: &mut App, mouse: MouseEvent) -> bool {
 /// Handle mouse events within the composer area.
 /// Returns true if the event was consumed.
 pub(crate) fn handle_composer_mouse(app: &mut App, mouse: MouseEvent) -> bool {
+    if !app.view_stack.is_empty() {
+        return false;
+    }
+    // A transcript selection or scrollbar drag that ends over the composer
+    // belongs to the surface that started it: the transcript handler must
+    // still see the release to clear its drag state and publish the text.
+    if matches!(
+        mouse.kind,
+        MouseEventKind::Drag(MouseButton::Left) | MouseEventKind::Up(MouseButton::Left)
+    ) && (app.viewport.transcript_selection.dragging
+        || app.viewport.transcript_scrollbar_dragging)
+    {
+        return false;
+    }
     // Use outer area for hit-testing (includes border).
     let Some(area) = app.viewport.last_composer_area else {
         return false;
@@ -505,6 +520,24 @@ pub(crate) fn handle_composer_mouse(app: &mut App, mouse: MouseEvent) -> bool {
             }
             true
         }
+        MouseEventKind::Down(MouseButton::Middle) if app.clipboard.uses_primary_selection() => {
+            if let Some(text) = app.clipboard.read_primary_text() {
+                // Flush already-typed bytes at their original caret first.
+                app.insert_paste_text("");
+                let Some(position) =
+                    mouse_pos_to_char_index(app, mouse.column, mouse.row, text_area)
+                else {
+                    return true;
+                };
+                // PRIMARY often contains this very selection. Insert at the
+                // pointer, preserving the selected original rather than cutting it.
+                app.selection_anchor = None;
+                app.cursor_position = position;
+                crate::tui::work_surface::release_focus(app);
+                app.insert_paste_text(&text);
+            }
+            true
+        }
         _ => false,
     }
 }
@@ -549,6 +582,19 @@ pub(crate) fn handle_mouse_event(app: &mut App, mouse: MouseEvent) -> Vec<ViewEv
     if !app.view_stack.is_empty() {
         app.needs_redraw = true;
         return app.view_stack.handle_mouse(mouse);
+    }
+
+    // A drag can finish outside the composer/transcript that started it.
+    // Publish once before other visible surfaces consume the release event.
+    if matches!(mouse.kind, MouseEventKind::Up(MouseButton::Left))
+        && app.clipboard.uses_primary_selection()
+    {
+        let text = if app.viewport.transcript_selection.dragging {
+            selection_to_text(app).unwrap_or_default()
+        } else {
+            app.selected_text()
+        };
+        let _ = app.clipboard.write_primary_text(&text);
     }
 
     // Topbar facts are typed controls, not decorative text. Route this before
@@ -815,7 +861,7 @@ pub(crate) fn handle_mouse_event(app: &mut App, mouse: MouseEvent) -> Vec<ViewEv
         MouseEventKind::Up(MouseButton::Left) if app.viewport.transcript_selection.dragging => {
             app.viewport.transcript_selection.dragging = false;
             app.viewport.selection_autoscroll = None;
-            if selection_has_content(app) {
+            if selection_has_content(app) && !app.clipboard.uses_primary_selection() {
                 copy_active_selection(app);
             }
         }
@@ -1555,7 +1601,11 @@ pub(crate) fn transcript_cell_index_from_mouse(app: &App, mouse: MouseEvent) -> 
         .map(|(cell_index, _)| cell_index)
 }
 
-pub(crate) fn handle_context_menu_action(app: &mut App, action: ContextMenuAction) {
+pub(crate) fn handle_context_menu_action(
+    terminal: &mut ratatui::Terminal<crate::tui::color_compat::ColorCompatBackend<std::io::Stdout>>,
+    app: &mut App,
+    action: ContextMenuAction,
+) {
     match action {
         ContextMenuAction::CopySelection => {
             copy_active_selection(app);
@@ -1632,10 +1682,33 @@ pub(crate) fn handle_context_menu_action(app: &mut App, action: ContextMenuActio
                     }),
                 width,
             );
-            if crate::tui::history::try_open_file_at_line(&text, &app.workspace) {
-                app.status_message = Some("Opened file in editor".to_string());
-            } else {
-                app.status_message = Some("No file:line pattern found in selection".to_string());
+            match crate::tui::history::first_file_line_reference(&text, &app.workspace) {
+                // The editor gets the terminal through the same suspend path
+                // the composer and `/hooks edit` use, one at a time, and we
+                // wait for it. It used to be spawned detached while the TUI
+                // still held raw mode, the alt screen and mouse capture (#6235).
+                Some((path, line)) => {
+                    let outcome = crate::tui::external_editor::spawn_editor_for_path(
+                        terminal,
+                        app.use_alt_screen(),
+                        app.use_mouse_capture,
+                        app.use_bracketed_paste,
+                        &path,
+                        Some(line),
+                    );
+                    app.needs_redraw = true;
+                    app.status_message = Some(match outcome {
+                        Ok(crate::tui::external_editor::EditorOutcome::Cancelled) => {
+                            format!("Editor exited without opening {}", path.display())
+                        }
+                        Ok(_) => format!("Closed editor for {}:{line}", path.display()),
+                        Err(error) => format!("Could not open the editor: {error}"),
+                    });
+                }
+                None => {
+                    app.status_message =
+                        Some("No file:line pattern found in selection".to_string());
+                }
             }
         }
         ContextMenuAction::HideCell { cell_index } => {
@@ -1774,9 +1847,31 @@ pub(crate) fn copy_active_selection(app: &mut App) {
     if !app.viewport.transcript_selection.is_active() {
         return;
     }
-    if let Some(text) = selection_to_text(app).filter(|text| !text.is_empty()) {
+    // Markdown source first (#6156): project every intersected cell through
+    // the canonical clean-copy path. Falls back to rendered text when the
+    // `[tui] selection_copy_markdown` key is off or no cell metadata
+    // intersects the range.
+    let payload = if app.viewport.selection_copy_markdown {
+        selection_to_markdown(app).map(|(text, cells)| (text, Some(cells)))
+    } else {
+        None
+    };
+    let payload = payload.or_else(|| {
+        selection_to_text(app)
+            .filter(|text| !text.is_empty())
+            .map(|text| (text, None))
+    });
+    if let Some((text, markdown_cells)) = payload {
         if app.clipboard.write_text(&text).is_ok() {
-            app.status_message = Some("Selection copied".to_string());
+            match markdown_cells {
+                Some(cells) => {
+                    let toast = app
+                        .tr(MessageId::SelectionCopiedAsMarkdown)
+                        .replace("{count}", &cells.to_string());
+                    app.push_status_toast(toast, StatusToastLevel::Info, None);
+                }
+                None => app.status_message = Some("Selection copied".to_string()),
+            }
         } else {
             app.status_message = Some("Copy failed".to_string());
         }
@@ -1784,6 +1879,149 @@ pub(crate) fn copy_active_selection(app: &mut App) {
         clear_transcript_selection(app);
         app.status_message = Some("No selection to copy".to_string());
     }
+}
+
+/// Whether a drag selection covers every cell it touches end to end (#6228).
+///
+/// Two checks: the edge columns must reach the content edges on the boundary
+/// lines, and the line range must not cut a cell in half at either end.
+/// Middle lines are fully covered by construction, and cells render as
+/// contiguous spans, so the two edge cells decide for the whole range.
+fn selection_covers_cells_fully(
+    app: &App,
+    start: &TranscriptSelectionPoint,
+    end: &TranscriptSelectionPoint,
+    start_index: usize,
+    end_index: usize,
+) -> bool {
+    let (first_head, _) = match content_column_span(app, start_index) {
+        Some(span) => span,
+        None => return false,
+    };
+    if start.column > first_head {
+        return false;
+    }
+    let (_, last_tail) = match content_column_span(app, end_index) {
+        Some(span) => span,
+        None => return false,
+    };
+    if end.column < last_tail {
+        return false;
+    }
+    let line_meta = app.viewport.transcript_cache.line_meta();
+    let mut edge_cells = (start_index..=end_index).filter_map(|line_index| {
+        line_meta
+            .get(line_index)
+            .and_then(|meta| meta.cell_line())
+            .map(|(cell_index, _)| cell_index)
+    });
+    let Some(first_cell) = edge_cells.next() else {
+        return false;
+    };
+    let last_cell = edge_cells.next_back().unwrap_or(first_cell);
+    [first_cell, last_cell].into_iter().all(|cell| {
+        let mut span = line_meta
+            .iter()
+            .enumerate()
+            .filter_map(|(line_index, meta)| {
+                meta.cell_line()
+                    .filter(|(cell_index, _)| *cell_index == cell)
+                    .map(|_| line_index)
+            });
+        match (span.next(), span.next_back()) {
+            (Some(cell_first), Some(cell_last)) => {
+                cell_first >= start_index && cell_last <= end_index
+            }
+            (Some(only), None) => start_index <= only && only <= end_index,
+            (None, _) => false,
+        }
+    })
+}
+
+/// Rendered-column span of selectable content on one transcript cache line.
+///
+/// Mirrors the prefix math in [`selection_to_text`]: rail decorations plus
+/// copy-only prefixes are visual, so content runs from their combined width
+/// to that width plus the content's display width.
+fn content_column_span(app: &App, line_index: usize) -> Option<(usize, usize)> {
+    let cache = &app.viewport.transcript_cache;
+    let full_width = text_display_width(&line_to_plain(cache.lines().get(line_index)?));
+    let rail_width = cache.rail_prefix_width(line_index).min(full_width);
+    let copy_prefix = cache
+        .line_meta()
+        .get(line_index)
+        .map(|meta| meta.copy_prefix_width())
+        .unwrap_or(0)
+        .min(full_width.saturating_sub(rail_width));
+    let head = rail_width.saturating_add(copy_prefix);
+    let tail = head.saturating_add(
+        full_width
+            .saturating_sub(rail_width)
+            .saturating_sub(copy_prefix),
+    );
+    Some((head, tail))
+}
+
+/// Project a transcript drag selection to Markdown source (#6156).
+///
+/// Collects every history cell intersecting the selection's rendered line
+/// range, in order, and serializes each through
+/// `history_cell_to_clipboard_text` — the same canonical projection Ctrl-Y
+/// and `/copy` use — joined with a blank line. Returns the payload plus the
+/// projected cell count for the toast.
+///
+/// Markdown source is only truthful for whole cells, so a selection that
+/// cuts a cell in half is not projected here at all — it keeps its exact
+/// rendered text through the caller's [`selection_to_text`] fallback (#6228).
+///
+/// Returns `None` when the selection is a fragment, when no cell metadata
+/// intersects the range, or when every projection is blank.
+pub(crate) fn selection_to_markdown(app: &App) -> Option<(String, usize)> {
+    let (start, end) = app.viewport.transcript_selection.ordered_endpoints()?;
+    let lines = app.viewport.transcript_cache.lines();
+    if lines.is_empty() {
+        return None;
+    }
+    let end_index = end.line_index.min(lines.len().saturating_sub(1));
+    let start_index = start.line_index.min(end_index);
+    if !selection_covers_cells_fully(app, &start, &end, start_index, end_index) {
+        return None;
+    }
+    let line_meta = app.viewport.transcript_cache.line_meta();
+    let width = app
+        .viewport
+        .last_transcript_area
+        .map(|area| area.width)
+        .unwrap_or(80);
+    let mut rendered = Vec::new();
+    for line_index in start_index..=end_index {
+        if let Some((cell_index, _)) = line_meta.get(line_index).and_then(|meta| meta.cell_line())
+            && !rendered.contains(&cell_index)
+        {
+            rendered.push(cell_index);
+        }
+    }
+    let mut seen_original = Vec::new();
+    let mut parts = Vec::new();
+    for rendered_index in rendered {
+        let original = app.original_cell_index_for_rendered(rendered_index);
+        if seen_original.contains(&original) {
+            continue;
+        }
+        seen_original.push(original);
+        let Some(cell) = app.cell_at_virtual_index(original) else {
+            continue;
+        };
+        let text = history_cell_to_clipboard_text(cell, width);
+        if !text.trim().is_empty() {
+            parts.push(text);
+        }
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    let count = parts.len();
+    Some((parts.join("\n\n"), count))
 }
 pub(crate) fn clear_transcript_selection(app: &mut App) {
     app.needs_redraw |= app.viewport.transcript_selection.is_active();
@@ -1887,7 +2125,7 @@ mod tests {
     use std::path::PathBuf;
     use tempfile::tempdir;
 
-    fn create_test_app() -> App {
+    pub(super) fn create_test_app() -> App {
         let options = TuiOptions {
             ..crate::test_support::test_tui_options(PathBuf::from("."))
         };
@@ -2640,3 +2878,6 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod primary_tests;

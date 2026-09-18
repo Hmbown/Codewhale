@@ -198,13 +198,39 @@ fn marketplace_add_list_show_remove_roundtrip() {
         "list/show must not rewrite marketplace state"
     );
 
-    // duplicate name is refused
-    let dup = plugins_with_kimi_home_override(
+    // Re-adding the same source is a refresh, not a duplicate: a catalog is
+    // keyed by its document, so the second add updates it in place. (The old
+    // refusal here is what produced a second snapshot of one marketplace
+    // under a hand-made name.)
+    let refreshed = plugins_with_kimi_home_override(
         &mut app,
         Some(&format!("marketplace add kimi {}", catalog_path.display())),
         None,
     );
-    assert!(dup.is_error);
+    assert!(!refreshed.is_error, "{:?}", refreshed.message);
+    // A *different* source under the same name is still refused.
+    let other_catalog = catalogs.join("other-marketplace.json");
+    fs::write(
+        &other_catalog,
+        serde_json::to_string_pretty(&serde_json::json!({
+            "version": "2",
+            "plugins": [
+                {
+                    "id": "other-bundle",
+                    "source": "./other-bundle",
+                    "displayName": "Other Bundle"
+                }
+            ]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let clash = plugins_with_kimi_home_override(
+        &mut app,
+        Some(&format!("marketplace add kimi {}", other_catalog.display())),
+        None,
+    );
+    assert!(clash.is_error, "{:?}", clash.message);
 
     let removed = plugins_with_kimi_home_override(&mut app, Some("marketplace remove kimi"), None);
     assert!(!removed.is_error, "{:?}", removed.message);

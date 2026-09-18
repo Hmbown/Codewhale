@@ -45,20 +45,34 @@ pub(crate) fn next_escape_action(app: &App, slash_menu_open: bool) -> EscapeActi
     }
 }
 
-pub(crate) fn select_previous_slash_menu_entry(app: &mut App, entry_count: usize) {
+/// Rows one PageUp/PageDown travels in the slash menu. Pages clamp at the
+/// ends per the shared vocabulary instead of wrapping (#6290).
+const SLASH_MENU_PAGE: usize = 10;
+
+/// Move the slash-menu selection by one shared-vocabulary motion (#6290).
+/// Steps wrap; pages travel [`SLASH_MENU_PAGE`] rows and clamp. The menu is
+/// single-column, so the region axis is a no-op.
+pub(crate) fn move_slash_menu_selection(
+    app: &mut App,
+    entry_count: usize,
+    motion: crate::tui::list_nav::Motion,
+) {
     if entry_count == 0 {
         return;
     }
     let selected = app.slash_menu_selected.min(entry_count.saturating_sub(1));
-    app.slash_menu_selected = (selected + entry_count - 1) % entry_count;
+    if let Some(next) = crate::tui::list_nav::apply(selected, entry_count, SLASH_MENU_PAGE, motion)
+    {
+        app.slash_menu_selected = next;
+    }
+}
+
+pub(crate) fn select_previous_slash_menu_entry(app: &mut App, entry_count: usize) {
+    move_slash_menu_selection(app, entry_count, crate::tui::list_nav::Motion::Prev);
 }
 
 pub(crate) fn select_next_slash_menu_entry(app: &mut App, entry_count: usize) {
-    if entry_count == 0 {
-        return;
-    }
-    let selected = app.slash_menu_selected.min(entry_count.saturating_sub(1));
-    app.slash_menu_selected = (selected + 1) % entry_count;
+    move_slash_menu_selection(app, entry_count, crate::tui::list_nav::Motion::Next);
 }
 
 pub(crate) fn handle_composer_history_arrow(

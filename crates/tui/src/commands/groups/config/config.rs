@@ -691,6 +691,99 @@ pub fn sidebar(app: &mut App, arg: Option<&str>) -> CommandResult {
     CommandResult::message(rail_status_message(app))
 }
 
+/// `/pet`: turn the terminal over to the Codewhale pet.
+///
+/// Bare `/pet` toggles. `on` enters the full habitat now and lets every
+/// accepted turn re-enter it until `off`. The habitat is a modal over the
+/// existing shell: composer draft, transcript, selection and the active
+/// Engine turn stay underneath, and Escape returns without cancelling
+/// anything. The remaining verbs address the shared companion: the browser
+/// appearance studio, the native window, source selection, replay export and
+/// the single audio lease. The pet has no workbar panel.
+pub fn pet(app: &mut App, arg: Option<&str>) -> CommandResult {
+    const USAGE: &str = "Usage: /pet [on|off|status|appearance|window|source|export|sound on|off]";
+    use crate::tui::pet_watch::{self, Control};
+    let words = arg
+        .map(str::trim)
+        .unwrap_or("")
+        .split_whitespace()
+        .map(str::to_ascii_lowercase)
+        .collect::<Vec<_>>();
+    let words = words.iter().map(String::as_str).collect::<Vec<_>>();
+    let mode = |app: &mut App, enabled: bool| {
+        pet_watch::set_enabled(app, enabled);
+        CommandResult::message(tr(
+            app.ui_locale,
+            if enabled {
+                MessageId::PetModeOn
+            } else {
+                MessageId::PetModeOff
+            },
+        ))
+    };
+    let queued = |app: &mut App, control: Control| {
+        pet_watch::command(app, control);
+        CommandResult::message(tr(app.ui_locale, MessageId::PetHabitatQueued))
+    };
+    match words.as_slice() {
+        [] => {
+            let enabled = !app.pet_watch.enabled;
+            mode(app, enabled)
+        }
+        ["on"] => mode(app, true),
+        ["off"] => mode(app, false),
+        ["status"] => CommandResult::message(format!(
+            "{} · {} · {}",
+            tr(
+                app.ui_locale,
+                if app.pet_watch.enabled {
+                    MessageId::PetModeOnLabel
+                } else {
+                    MessageId::PetModeOffLabel
+                }
+            ),
+            tr(
+                app.ui_locale,
+                if pet_watch::is_open(app) {
+                    MessageId::PetViewOpen
+                } else {
+                    MessageId::PetViewClosed
+                }
+            ),
+            app.pet_watch.status()
+        )),
+        ["appearance"] => queued(app, Control::Browser),
+        ["window"] => queued(app, Control::Window),
+        ["source"] => queued(app, Control::Select),
+        ["export"] => {
+            if app.pet_watch.export() {
+                CommandResult::message(tr(app.ui_locale, MessageId::PetWatchExportQueued))
+            } else {
+                CommandResult::error(tr(app.ui_locale, MessageId::PetWatchExportUnavailable))
+            }
+        }
+        ["sound", rest @ ..] => {
+            let enabled = match rest {
+                [] => None,
+                ["on"] => Some(true),
+                ["off"] => Some(false),
+                _ => return CommandResult::error(USAGE),
+            };
+            if let Some(enabled) = enabled {
+                app.pet_watch.set_sound(enabled);
+                app.needs_redraw = true;
+            }
+            let label = if enabled == Some(true) {
+                MessageId::PetWatchSoundOn
+            } else {
+                app.pet_watch.sound_label()
+            };
+            CommandResult::message(format!("{} · /pet sound on|off", tr(app.ui_locale, label)))
+        }
+        _ => CommandResult::error(USAGE),
+    }
+}
+
 /// Truthful workbar readout: the placement and panel that actually render,
 /// with the narrow-terminal fallback and an empty-Tasks collapse spelled out.
 /// Never claims a panel is visible when no workbar area was produced.
@@ -1070,6 +1163,10 @@ fn search_provider_display(config: &Config, locale: codewhale_localization::Loca
             .to_string(),
         SearchProviderSource::Config => "config.toml".to_string(),
         SearchProviderSource::EnvOverride => "CODEWHALE_SEARCH_PROVIDER".to_string(),
+        // Same token doctor prints: the signal is a Tavily key, not a disk
+        // pin, so never name `TAVILY_API_KEY` (the winner may have been a
+        // generic `tvly-` `[search] api_key`).
+        SearchProviderSource::TavilyKey => "tavily key".to_string(),
     };
     tr(locale, MessageId::ConfigCommandSource)
         .replace("{value}", resolved.provider.as_str())
@@ -3270,6 +3367,7 @@ mod tests {
                 EnvVarGuard::remove("PTYXIS_VERSION"),
                 EnvVarGuard::remove("CODEWHALE_SEARCH_PROVIDER"),
                 EnvVarGuard::remove("DEEPSEEK_SEARCH_PROVIDER"),
+                EnvVarGuard::remove("TAVILY_API_KEY"),
             ];
             Self {
                 _vars: vars,
@@ -3313,7 +3411,7 @@ mod tests {
         let _guard = EnvGuard::new(temp.path());
         let mut app = create_test_app();
         app.status_toasts.clear();
-        assert!(app.maybe_show_behavioral_tip(BehavioralTip::PlanningMode));
+        assert!(app.maybe_show_behavioral_tip(BehavioralTip::McpValidation));
         app.push_status_toast("warning receipt", StatusToastLevel::Warning, None);
         app.push_status_toast("error receipt", StatusToastLevel::Error, None);
         app.sticky_status = Some(StatusToast::context_pressure(
@@ -3690,6 +3788,73 @@ mod tests {
         );
         let message = result.message.unwrap_or_default();
         assert!(message.contains("bottom placement"), "got: {message}");
+    }
+
+    #[test]
+    fn pet_sound_command_is_opt_in_and_rejects_invalid_changes() {
+        let mut app = create_test_app();
+        let status = pet(&mut app, Some("sound"));
+        assert!(!status.is_error);
+        assert_eq!(app.pet_watch.sound_label(), MessageId::PetWatchSoundOff);
+
+        assert!(!pet(&mut app, Some(" SOUND ON ")).is_error);
+        assert_eq!(app.pet_watch.sound_label(), MessageId::PetWatchSoundPaused);
+        for invalid in ["sound yes", "sound off extra", "sound on --save"] {
+            assert!(pet(&mut app, Some(invalid)).is_error, "{invalid}");
+            assert_eq!(app.pet_watch.sound_label(), MessageId::PetWatchSoundPaused);
+        }
+        assert!(!pet(&mut app, Some("sound off")).is_error);
+        assert_eq!(app.pet_watch.sound_label(), MessageId::PetWatchSoundOff);
+    }
+
+    #[test]
+    fn pet_command_toggles_the_habitat_and_automatic_entry() {
+        let mut app = create_test_app();
+        app.onboarding = crate::tui::app::OnboardingState::None;
+        app.redaction_gate = false;
+        app.input = "kept draft".into();
+        app.pet_watch.detach_for_test();
+
+        let on = pet(&mut app, None);
+        assert!(!on.is_error);
+        assert!(app.pet_watch.enabled);
+        assert!(crate::tui::pet_watch::is_open(&app));
+        assert_eq!(
+            on.message.as_deref(),
+            Some(&*tr(app.ui_locale, MessageId::PetModeOn))
+        );
+        // Repeating `on` is harmless: still one habitat, still enabled.
+        assert!(!pet(&mut app, Some(" ON ")).is_error);
+        assert!(app.pet_watch.enabled);
+        assert!(crate::tui::pet_watch::is_open(&app));
+
+        let off = pet(&mut app, Some("off"));
+        assert!(!off.is_error);
+        assert!(!app.pet_watch.enabled);
+        assert!(!crate::tui::pet_watch::is_open(&app));
+        assert!(app.view_stack.is_empty());
+        assert_eq!(app.input, "kept draft");
+        assert_eq!(
+            off.message.as_deref(),
+            Some(&*tr(app.ui_locale, MessageId::PetModeOff))
+        );
+
+        // Bare /pet toggles back on; unknown verbs are refused with usage.
+        app.pet_watch.detach_for_test();
+        assert!(!pet(&mut app, None).is_error);
+        assert!(app.pet_watch.enabled);
+        assert!(pet(&mut app, Some("bogus")).is_error);
+        let status = pet(&mut app, Some("status"));
+        assert!(!status.is_error);
+        let message = status.message.unwrap_or_default();
+        assert!(
+            message.contains(&*tr(app.ui_locale, MessageId::PetModeOnLabel)),
+            "{message}"
+        );
+        assert!(
+            message.contains(&*tr(app.ui_locale, MessageId::PetViewOpen)),
+            "{message}"
+        );
     }
 
     #[test]
@@ -4891,6 +5056,33 @@ completion_sound = "bell"
         assert!(
             notifications_msg.contains("completion_sound = bell"),
             "{notifications_msg}"
+        );
+    }
+
+    #[test]
+    fn config_command_shows_autodetected_tavily_key_source() {
+        let temp_root = tempfile::tempdir().expect("isolated config dir");
+        let _guard = EnvGuard::new(temp_root.path());
+        let config_path = temp_root.path().join("custom-config.toml");
+        fs::write(
+            &config_path,
+            r#"
+[search]
+api_key = "tvly-autodetected"
+"#,
+        )
+        .unwrap();
+
+        let mut app = create_test_app();
+        app.config_path = Some(config_path);
+
+        let search = config_command(&mut app, Some("search.provider"));
+        assert!(!search.is_error, "{:?}", search.message);
+        let message = search.message.expect("search provider display");
+        assert_eq!(message, "search.provider = tavily (source: tavily key)");
+        assert!(
+            !message.contains("TAVILY_API_KEY"),
+            "a generic `tvly-` key must not be reported as the env var: {message}"
         );
     }
 

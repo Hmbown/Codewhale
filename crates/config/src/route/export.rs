@@ -189,6 +189,7 @@ fn clap_compat_alias(value: &str) -> Option<ProviderKind> {
         "x-ai" | "grok" => ProviderKind::Xai,
         "mistral-ai" | "mistralai" | "la-plateforme" => ProviderKind::Mistral,
         "eden-ai" => ProviderKind::Edenai,
+        "zen-mux" => ProviderKind::Zenmux,
         _ => return None,
     })
 }

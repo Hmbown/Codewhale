@@ -33,10 +33,10 @@ export const chrome: ChromeDict = {
 
   navProduct: "製品",
   navModels: "モデル",
-  navPricing: "料金",
+  navPlugins: "プラグイン",
   navProductSecondary: "Product",
   navModelsSecondary: "Models",
-  navPricingSecondary: "Pricing",
+  navPluginsSecondary: "Plugins",
 
   skipToContent: "メインコンテンツへスキップ",
 
@@ -94,7 +94,6 @@ export const chrome: ChromeDict = {
   footerIssues: "Issues",
   footerContribute: "貢献",
   footerLicense: "MIT ライセンス",
-  footerPricing: "料金",
   footerTerms: "利用規約",
   footerPrivacy: "プライバシーポリシー",
   footerChangelog: "変更履歴",

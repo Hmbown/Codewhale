@@ -1,7 +1,6 @@
 use super::activity_detail::*;
 use super::compaction_flow::{
     apply_compaction_started, compact_interrupt_should_stop_turn, maybe_warn_context_pressure,
-    should_auto_compact_before_send, should_auto_compact_before_send_with_config,
 };
 use super::event_loop::{TabDispatch, dispatch_tab_key, shell_binding_for_key};
 use super::observer_hooks::{
@@ -18,6 +17,7 @@ use crate::config::{
     ProviderConfig, ProvidersConfig,
 };
 use crate::core::engine::mock_engine_handle;
+use crate::core::ops::TurnSpec;
 use crate::reasoning_preference::ReasoningEffort;
 use crate::tui::active_cell::ActiveCell;
 use crate::tui::app::ToolDetailRecord;
@@ -721,9 +721,32 @@ fn focus_test_app() -> App {
     app
 }
 
+#[test]
+fn bracketed_paste_returns_dock_focus_to_the_visible_composer() {
+    let mut app = focus_test_app();
+    crate::tui::work_surface::select_dock_panel(
+        &mut app,
+        crate::tui::work_surface::RailPanel::Context,
+    );
+    assert!(app.work_surface.focused);
+    handle_bracketed_paste(&mut app, "/pet status");
+    assert_eq!(app.input, "/pet status");
+    assert!(!app.work_surface.focused);
+    assert!(app.composer_enter_would_submit());
+}
+
 /// One representative terminal encoding per shell binding.
 fn shell_binding_probe(id: ShellBindingId) -> KeyEvent {
     match id {
+        ShellBindingId::PetResultUp => KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
+        ShellBindingId::PetResultDown => KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+        ShellBindingId::PetResultPageUp => KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE),
+        ShellBindingId::PetResultPageDown => KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE),
+        ShellBindingId::PetBack => KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+        ShellBindingId::PetSound => KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE),
+        ShellBindingId::PetBrowser => KeyEvent::new(KeyCode::F(8), KeyModifiers::NONE),
+        ShellBindingId::PetWindow => KeyEvent::new(KeyCode::F(9), KeyModifiers::NONE),
+
         ShellBindingId::RedactionGateConfirm => {
             KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE)
         }
@@ -783,8 +806,14 @@ fn no_shell_binding_changes_meaning_once_the_composer_has_text() {
             "{:?} changed meaning because the composer has text",
             binding.id
         );
-        if binding.focus == crate::tui::shell_key_routing::FocusScope::RedactionGate {
-            assert_eq!(on_typed, None, "consent keys must not act on a draft");
+        if !binding
+            .focus
+            .admits(crate::tui::shell_key_routing::Focus::Composer)
+        {
+            assert_eq!(
+                on_typed, None,
+                "exclusive view keys must not act on a draft"
+            );
             continue;
         }
         assert_eq!(
@@ -1731,7 +1760,12 @@ fn bottom_prompts_keep_transcript_tail_visible_through_resize_and_navigation() {
         let config = Config::default();
         for (width, height) in [(141, 38), (80, 24), (40, 12), (80, 24), (141, 38)] {
             let surface = render_test_app(&mut app, &config, width, height);
-            let prompt = app.viewport.last_prompt_area.expect("painted prompt");
+            let prompt = app.viewport.last_prompt_area.unwrap_or_else(|| {
+                panic!(
+                    "{kind:?} at {width}x{height}: no prompt area painted (onboarding={:?}, redaction_gate={}, top_kind={:?})",
+                    app.onboarding, app.redaction_gate, app.view_stack.top_kind()
+                )
+            });
             let transcript = app
                 .viewport
                 .last_transcript_area
@@ -2196,6 +2230,87 @@ fn workflow_ui_events_apply_only_to_the_active_session_owner() {
 }
 
 #[test]
+fn failed_workflow_run_raises_a_sticky_error() {
+    let mut app = create_test_app();
+    app.current_session_id = Some("session-a".to_string());
+    let started = serde_json::json!({
+        "type": "run_started",
+        "at_ms": 1,
+        "workflow_goal": "Failing workflow"
+    });
+    assert!(apply_owned_workflow_ui_event(
+        &mut app,
+        "session-a",
+        "workflow-fail",
+        &started,
+    ));
+    assert!(
+        app.sticky_status.is_none(),
+        "starting a run must not raise a failure toast"
+    );
+
+    let completed = serde_json::json!({
+        "type": "run_completed",
+        "at_ms": 2,
+        "status": "failed",
+        "error": "task(): invalid options: unknown field `count`"
+    });
+    assert!(apply_owned_workflow_ui_event(
+        &mut app,
+        "session-a",
+        "workflow-fail",
+        &completed,
+    ));
+    let sticky = app
+        .sticky_status
+        .as_ref()
+        .expect("a failed workflow run must be loud (#5528)");
+    assert_eq!(sticky.level, StatusToastLevel::Error);
+    assert_eq!(
+        sticky.ttl_ms,
+        Some(crate::tui::app::App::STICKY_ERROR_TTL_MS)
+    );
+    assert!(
+        sticky.text.contains("Workflow run failed")
+            && sticky.text.contains("unknown field `count`"),
+        "the sticky strip must name the failure and its cause: {:?}",
+        sticky.text
+    );
+}
+
+#[test]
+fn successful_workflow_run_raises_no_failure_toast() {
+    let mut app = create_test_app();
+    app.current_session_id = Some("session-a".to_string());
+    let started = serde_json::json!({
+        "type": "run_started",
+        "at_ms": 1,
+        "workflow_goal": "Healthy workflow"
+    });
+    assert!(apply_owned_workflow_ui_event(
+        &mut app,
+        "session-a",
+        "workflow-ok",
+        &started,
+    ));
+    let succeeded = serde_json::json!({
+        "type": "run_completed",
+        "at_ms": 2,
+        "status": "succeeded"
+    });
+    assert!(apply_owned_workflow_ui_event(
+        &mut app,
+        "session-a",
+        "workflow-ok",
+        &succeeded,
+    ));
+    assert!(
+        app.sticky_status.is_none(),
+        "a successful run must not raise a failure toast"
+    );
+}
+
+#[test]
 fn workflow_panel_plain_letters_return_to_composer() {
     let mut app = create_test_app();
     app.workflow_panel = Some(crate::tui::widgets::workflow_panel::WorkflowPanel::new(
@@ -2430,6 +2545,181 @@ fn plain_mcp_show_refreshes_discovery_counts() {
     assert!(!mcp_ui_action_refreshes_discovery(&McpUiAction::Init {
         force: false,
     }));
+}
+
+#[tokio::test]
+async fn mcp_show_while_turn_running_serves_cached_snapshot_without_engine_roundtrip() {
+    use crate::mcp::{McpManagerSnapshot, McpServerCapabilityMetadata, McpServerSnapshot};
+    use crate::tui::app::McpUiAction;
+
+    let mut app = create_test_app();
+    app.is_loading = true;
+    app.mcp_snapshot = Some(McpManagerSnapshot {
+        config_path: PathBuf::from("mcp.json"),
+        config_exists: true,
+        reload_required: false,
+        servers: vec![McpServerSnapshot {
+            name: "cached".into(),
+            enabled: true,
+            required: false,
+            transport: "stdio".into(),
+            command_or_url: "cached-mcp".into(),
+            connect_timeout: 5,
+            execute_timeout: 5,
+            read_timeout: 5,
+            connected: true,
+            error: None,
+            auth_required: false,
+            capability_metadata: McpServerCapabilityMetadata::LegacyFallback,
+            tools: Vec::new(),
+            resources: Vec::new(),
+            prompts: Vec::new(),
+        }],
+    });
+    let mut mock = mock_engine_handle();
+    tokio::time::timeout(
+        Duration::from_millis(200),
+        handle_mcp_ui_action(
+            &mut app,
+            &mock.handle,
+            &Config::default(),
+            McpUiAction::Show,
+        ),
+    )
+    .await
+    .expect("bare /mcp must return immediately while a turn is in flight (#6159)");
+    assert!(
+        mock.rx_op.try_recv().is_err(),
+        "no engine op may be started while a turn owns the engine loop"
+    );
+    assert_eq!(app.view_stack.top_kind(), Some(ModalKind::Extensions));
+    assert_eq!(app.mcp_configured_count, 1);
+    assert!(
+        app.history.iter().any(|cell| matches!(
+            cell,
+            HistoryCell::System { content }
+                if content.contains("last known MCP snapshot")
+        )),
+        "the receipt must name the cached snapshot the panel is showing"
+    );
+}
+
+#[tokio::test]
+async fn mcp_show_while_turn_running_without_snapshot_fails_closed() {
+    use crate::tui::app::McpUiAction;
+
+    let mut app = create_test_app();
+    app.is_loading = true;
+    assert!(app.mcp_snapshot.is_none());
+    let mut mock = mock_engine_handle();
+    tokio::time::timeout(
+        Duration::from_millis(200),
+        handle_mcp_ui_action(
+            &mut app,
+            &mock.handle,
+            &Config::default(),
+            McpUiAction::Show,
+        ),
+    )
+    .await
+    .expect("bare /mcp must return immediately while a turn is in flight (#6159)");
+    assert!(mock.rx_op.try_recv().is_err());
+    assert_ne!(
+        app.view_stack.top_kind(),
+        Some(ModalKind::Extensions),
+        "without an observed snapshot there is nothing honest to show"
+    );
+    assert!(app.history.iter().any(|cell| matches!(
+        cell,
+        HistoryCell::System { content }
+            if content.contains("no MCP snapshot has been observed")
+    )));
+}
+
+#[tokio::test]
+async fn mcp_mutations_while_turn_running_defer_the_live_pool_refresh() {
+    use crate::tui::app::McpUiAction;
+
+    let temp = tempfile::tempdir().expect("temporary MCP home");
+    let path = temp.path().join("mcp.json");
+    crate::mcp::add_server_config(
+        &path,
+        "fixture".to_string(),
+        Some("fixture-mcp".to_string()),
+        None,
+        Vec::new(),
+        None,
+    )
+    .expect("seed MCP server");
+    crate::mcp::set_server_enabled(&path, "fixture", false).expect("disable MCP server");
+
+    let mut app = create_test_app();
+    app.mcp_config_path = path.clone();
+    app.is_loading = true;
+    let mut mock = mock_engine_handle();
+    tokio::time::timeout(
+        Duration::from_millis(200),
+        handle_mcp_ui_action(
+            &mut app,
+            &mock.handle,
+            &Config::default(),
+            McpUiAction::Enable {
+                name: "fixture".to_string(),
+            },
+        ),
+    )
+    .await
+    .expect("a mutation must not park the UI loop behind the running turn (#6159)");
+    assert!(
+        mock.rx_op.try_recv().is_err(),
+        "the live-pool reload op must not be sent while a turn owns the engine"
+    );
+    assert!(
+        crate::mcp::load_config(&app.mcp_config_path)
+            .expect("persisted MCP config")
+            .servers
+            .get("fixture")
+            .expect("persisted fixture")
+            .is_enabled(),
+        "the durable config still advances while the live pool waits"
+    );
+    assert!(app.mcp_reload_required);
+    assert!(app.history.iter().any(|cell| matches!(
+        cell,
+        HistoryCell::System { content } if content.contains("Enabled MCP server 'fixture'")
+    )));
+    assert!(app.history.iter().any(|cell| matches!(
+        cell,
+        HistoryCell::System { content }
+            if content.contains("live MCP pool refresh is deferred")
+    )));
+}
+
+#[tokio::test]
+async fn mcp_retry_while_turn_running_names_the_deferral_and_never_awaits() {
+    use crate::tui::app::McpUiAction;
+
+    let mut app = create_test_app();
+    app.is_loading = true;
+    let mut mock = mock_engine_handle();
+    tokio::time::timeout(
+        Duration::from_millis(200),
+        handle_mcp_ui_action(
+            &mut app,
+            &mock.handle,
+            &Config::default(),
+            McpUiAction::Retry {
+                name: "flaky".to_string(),
+            },
+        ),
+    )
+    .await
+    .expect("retry must not park the UI loop behind the running turn (#6159)");
+    assert!(mock.rx_op.try_recv().is_err());
+    assert!(app.history.iter().any(|cell| matches!(
+        cell,
+        HistoryCell::System { content } if content.contains("/mcp retry flaky")
+    )));
 }
 
 #[tokio::test]
@@ -2856,9 +3146,56 @@ async fn mcp_reload_failure_keeps_pending_state_and_live_snapshot() {
 }
 
 #[test]
+fn session_load_failure_is_durable_in_the_transcript() {
+    // #6138: a failed resume must not exist only in the status line, which
+    // the next footer update replaces.
+    let mut app = create_test_app();
+    let before = app.history.len();
+    crate::tui::ui::session_state::surface_session_load_failure(
+        &mut app,
+        "Failed to load session: No session found with prefix: abc".to_string(),
+    );
+    assert_eq!(app.history.len(), before + 1);
+    assert!(matches!(
+        app.history.last(),
+        Some(HistoryCell::Error { message, .. })
+            if message.contains("No session found with prefix")
+    ));
+    assert_eq!(
+        app.status_message.as_deref(),
+        Some("Failed to load session: No session found with prefix: abc")
+    );
+}
+
+#[test]
 fn focus_gained_forces_terminal_viewport_recapture() {
     assert!(terminal_event_needs_viewport_recapture(&Event::FocusGained));
     assert!(!terminal_event_needs_viewport_recapture(&Event::FocusLost));
+}
+
+/// #6311: focus loss defers frame emission (occluded VTE replays every
+/// emitted frame as flicker backlog); focus gain or any input re-arms.
+#[test]
+fn focus_loss_defers_frames_until_focus_or_input_returns() {
+    use crossterm::event::{
+        KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    };
+    let key = || Event::Key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+    let mouse = || {
+        Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        })
+    };
+    assert!(next_unfocused(false, &Event::FocusLost));
+    assert!(next_unfocused(true, &Event::Resize(80, 24)));
+    assert!(!next_unfocused(true, &Event::FocusGained));
+    assert!(!next_unfocused(true, &key()));
+    assert!(!next_unfocused(true, &mouse()));
+    assert!(!next_unfocused(true, &Event::Paste("x".to_string())));
+    assert!(!next_unfocused(false, &key()));
 }
 
 // ANSI byte sequences are only written on platforms where crossterm uses the
@@ -3376,6 +3713,100 @@ fn selection_to_text_handles_multiline_and_reversed_endpoints() {
     assert_eq!(selection_to_text(&app).as_deref(), Some("a beta\ngam"));
 }
 
+/// #6228: with `selection_copy_markdown` on (the default), a fragment
+/// selection copies exactly the fragment — the Markdown path only fires for
+/// whole cells and never rounds a fragment out to the cells it touches.
+#[test]
+fn partial_selection_copies_exact_fragment_not_whole_cells() {
+    let mut app = create_test_app();
+    assert!(
+        app.viewport.selection_copy_markdown,
+        "markdown copy is the default under test"
+    );
+    app.history = vec![HistoryCell::Assistant {
+        content: "alpha beta\ngamma delta".to_string(),
+        streaming: false,
+    }];
+    app.resync_history_revisions();
+    app.viewport.transcript_cache.ensure(
+        &app.history,
+        &app.history_revisions,
+        80,
+        app.transcript_render_options(),
+    );
+
+    app.viewport.transcript_selection.anchor = Some(TranscriptSelectionPoint {
+        line_index: 0,
+        column: 6,
+    });
+    app.viewport.transcript_selection.head = Some(TranscriptSelectionPoint {
+        line_index: 1,
+        column: 5,
+    });
+
+    assert_eq!(selection_to_markdown(&app), None);
+    copy_active_selection(&mut app);
+    assert_eq!(app.clipboard.last_written_text(), Some("a beta\ngam"));
+
+    // A fully-covered middle line is still partial: the line range cuts the
+    // cell in half, so no whole cell exists to project.
+    app.viewport.transcript_selection.anchor = Some(TranscriptSelectionPoint {
+        line_index: 1,
+        column: 0,
+    });
+    app.viewport.transcript_selection.head = Some(TranscriptSelectionPoint {
+        line_index: 1,
+        column: 80,
+    });
+    assert_eq!(
+        selection_to_markdown(&app),
+        None,
+        "mid-cell line range must not round out"
+    );
+}
+
+/// #6156 retained: a selection covering whole cells end to end still copies
+/// Markdown source rather than rendered text.
+#[test]
+fn full_cell_selection_keeps_markdown_source() {
+    let mut app = create_test_app();
+    app.history = vec![HistoryCell::Assistant {
+        content: "alpha beta\ngamma delta".to_string(),
+        streaming: false,
+    }];
+    app.resync_history_revisions();
+    app.viewport.transcript_cache.ensure(
+        &app.history,
+        &app.history_revisions,
+        80,
+        app.transcript_render_options(),
+    );
+
+    let last = app
+        .viewport
+        .transcript_cache
+        .lines()
+        .len()
+        .saturating_sub(1);
+    app.viewport.transcript_selection.anchor = Some(TranscriptSelectionPoint {
+        line_index: 0,
+        column: 0,
+    });
+    app.viewport.transcript_selection.head = Some(TranscriptSelectionPoint {
+        line_index: last,
+        column: 80,
+    });
+
+    let (text, cells) = selection_to_markdown(&app).expect("whole-cell selection keeps markdown");
+    assert_eq!(cells, 1);
+    assert_eq!(text, "alpha beta\ngamma delta");
+    copy_active_selection(&mut app);
+    assert_eq!(
+        app.clipboard.last_written_text(),
+        Some("alpha beta\ngamma delta")
+    );
+}
+
 #[test]
 fn selection_to_text_removes_visual_wrap_breaks_from_paragraphs() {
     let mut app = create_test_app();
@@ -3626,7 +4057,19 @@ fn mouse_selection_autocopies_on_release_without_ctrl_c() {
         },
     );
 
-    assert_eq!(app.status_message.as_deref(), Some("Selection copied"));
+    // Drag-release autocopy now takes the Markdown-source path (#6156): the
+    // clipboard holds canonical cell content and the receipt is a toast
+    // naming the projected cell count, not the legacy status sink.
+    assert!(
+        app.status_message.is_none(),
+        "markdown copy must not touch the legacy status sink"
+    );
+    let toast = app.status_toasts.back().expect("markdown copy toast");
+    assert!(
+        toast.text.contains("(1)"),
+        "toast names the projected cell count, got {:?}",
+        toast.text
+    );
     assert!(
         app.clipboard
             .last_written_text()
@@ -7497,7 +7940,7 @@ fn setup_presets_cannot_override_managed_runtime_requirements() {
 #[tokio::test]
 async fn tool_result_api_content_never_advertises_unowned_live_output_as_retrievable() {
     let mut app = App::new(create_test_options(), &Config::default());
-    app.api_messages.push(Message {
+    app.api_messages_mut().push(Message {
         role: Role::Assistant,
         content: vec![ContentBlock::ToolUse {
             id: "call-live-big".to_string(),
@@ -7530,7 +7973,7 @@ async fn tool_result_api_content_never_advertises_unowned_live_output_as_retriev
 #[test]
 fn live_tool_receipt_messages_clones_only_matching_tool_use() {
     let mut app = App::new(create_test_options(), &Config::default());
-    app.api_messages.push(Message {
+    app.api_messages_mut().push(Message {
         role: Role::Assistant,
         content: vec![ContentBlock::ToolUse {
             id: "call-old".to_string(),
@@ -7540,7 +7983,7 @@ fn live_tool_receipt_messages_clones_only_matching_tool_use() {
             thought_signature: None,
         }],
     });
-    app.api_messages.push(Message {
+    app.api_messages_mut().push(Message {
         role: Role::User,
         content: vec![ContentBlock::ToolResult {
             tool_use_id: "call-old".to_string(),
@@ -7549,7 +7992,7 @@ fn live_tool_receipt_messages_clones_only_matching_tool_use() {
             content_blocks: None,
         }],
     });
-    app.api_messages.push(Message {
+    app.api_messages_mut().push(Message {
         role: Role::Assistant,
         content: vec![ContentBlock::ToolUse {
             id: "call-new".to_string(),
@@ -7671,7 +8114,7 @@ fn apply_loaded_session_keeps_submitted_user_tail_in_history() {
 
     apply_loaded_session(&mut app, &mut Config::default(), &session).expect("restore session");
 
-    assert_eq!(app.api_messages, vec![submitted]);
+    assert_eq!(*app.api_messages, vec![submitted]);
     assert!(app.input.is_empty());
     assert!(app.queued_draft.is_none());
     assert!(app.history.iter().any(|cell| {
@@ -7794,7 +8237,7 @@ fn apply_loaded_session_keeps_user_authored_shell_event_lookalikes() {
         let session = saved_session_with_messages(vec![user]);
         let mut app = create_test_app();
         apply_loaded_session(&mut app, &mut Config::default(), &session).expect("restore session");
-        assert_eq!(app.api_messages, session.messages);
+        assert_eq!(*app.api_messages, session.messages);
         assert!(matches!(
             app.history.as_slice(),
             [HistoryCell::User { content }] if content == literal
@@ -8173,7 +8616,11 @@ async fn apply_loaded_session_resets_workspace_runtime_state() {
     let old_context_cell = app.workspace_context_cell.clone();
     app.workspace_context = Some("old workspace context".to_string());
     if let Ok(mut cell) = old_context_cell.lock() {
-        *cell = Some("old workspace context".to_string());
+        *cell = Some(crate::tui::workspace_context::WorkspaceContextSnapshot {
+            workspace: app.workspace.clone(),
+            context: Some("old workspace context".to_string()),
+            is_linked_worktree: false,
+        });
     }
     app.workspace_context_refreshed_at = Some(Instant::now());
     app.file_tree = Some(crate::tui::file_tree::FileTreeState::new(
@@ -8276,7 +8723,7 @@ fn backtrack_prefill_rehydrates_attachment_rows() {
     app.add_message(HistoryCell::User {
         content: user_text.to_string(),
     });
-    app.api_messages.push(Message {
+    app.api_messages_mut().push(Message {
         role: Role::User,
         content: vec![ContentBlock::Text {
             text: user_text.to_string(),
@@ -8287,7 +8734,7 @@ fn backtrack_prefill_rehydrates_attachment_rows() {
         content: "done".to_string(),
         streaming: false,
     });
-    app.api_messages.push(Message {
+    app.api_messages_mut().push(Message {
         role: Role::Assistant,
         content: vec![ContentBlock::Text {
             text: "done".to_string(),
@@ -10144,21 +10591,19 @@ async fn auto_dispatch_keeps_last_and_pending_receipts_aligned() {
         app.pending_turn_route
             .as_ref()
             .map(|(provider, model, auto)| (*provider, model.as_str(), *auto)),
-        Some((
-            ApiProvider::Zai,
-            crate::config::ZAI_GLM_5_3_FLASH_MODEL,
-            true,
-        ))
+        Some((ApiProvider::Zai, crate::config::DEFAULT_ZAI_MODEL, true,))
     );
     assert_eq!(
         app.last_auto_route_receipt, app.pending_auto_route_receipt,
         "the fallback inspector must never pair a newly resolved route with a stale receipt"
     );
+    // Declared-default fallback (72b028e5e): the receipt tier is the default
+    // model's own tier (GLM-5.3 is strong), never a content-heuristic guess.
     assert_eq!(
         app.last_auto_route_receipt
             .as_ref()
             .map(|receipt| receipt.tier),
-        Some(crate::model_routing::AutoRouteTier::Fast)
+        Some(crate::model_routing::AutoRouteTier::Strong)
     );
     assert_eq!(
         app.last_effective_reasoning_effort,
@@ -10178,7 +10623,7 @@ async fn failed_paused_dispatch_preserves_app_checkpoint_state_and_engine_gate()
     app.goal.tokens_used = 7;
     app.goal.time_used_seconds = 11;
     app.goal.continuation_count = 2;
-    app.api_messages
+    app.api_messages_mut()
         .push(text_message("assistant", "existing conversation"));
     app.add_message(HistoryCell::System {
         content: "existing transcript".to_string(),
@@ -10233,11 +10678,14 @@ async fn paused_dispatch_at_compaction_threshold_enqueues_one_atomic_send() {
     app.auto_compact_user_configured = true;
     app.auto_compact = true;
     app.auto_compact_threshold_percent = 10.0;
-    app.api_messages = vec![text_message("assistant", &"context ".repeat(240_000))];
+    app.api_messages =
+        std::sync::Arc::new(vec![text_message("assistant", &"context ".repeat(240_000))]);
     let planned_compaction =
         app.compaction_config_for_route(app.api_provider, &app.model, app.active_route_limits);
+    let fixture_used =
+        estimated_context_tokens(&app).expect("fixture context estimate should be available");
     assert!(
-        should_auto_compact_before_send_with_config(&app, &planned_compaction),
+        fixture_used >= planned_compaction.token_threshold as i64,
         "fixture must already require compaction"
     );
 
@@ -10253,11 +10701,11 @@ async fn paused_dispatch_at_compaction_threshold_enqueues_one_atomic_send() {
     .expect("atomic paused dispatch");
 
     match engine.rx_op.recv().await.expect("single send operation") {
-        Op::SendMessage {
+        Op::SendMessage(TurnSpec {
             compaction,
             goal_objective,
             ..
-        } => {
+        }) => {
             assert!(compaction.enabled);
             assert_eq!(goal_objective.as_deref(), Some("finish the paused audit"));
         }
@@ -10498,20 +10946,38 @@ async fn immediate_submit_custom_provider_missing_key_preflight_shows_auth_next_
     .await
     .expect("provider preflight failures must remain inside the TUI");
 
-    assert_eq!(app.input, "preserve 用户 input");
-    assert_eq!(app.cursor_position, app.input.chars().count());
+    // Echo first: missing-key must paint HistoryCell::User, not restore the
+    // composer as the only place the turn exists.
+    assert!(
+        app.input.is_empty(),
+        "auth failure must not restore the composer when the echo landed: {:?}",
+        app.input
+    );
     assert!(app.api_messages.is_empty());
-    assert!(app.history.is_empty());
+    assert_eq!(
+        app.history
+            .iter()
+            .filter(|cell| matches!(cell, HistoryCell::User { content } if content == "preserve 用户 input"))
+            .count(),
+        1,
+        "missing-key submit must keep exactly one user echo: {:?}",
+        app.history
+    );
     assert!(app.last_submitted_prompt.is_none());
     let status = app
         .status_message
         .as_deref()
         .expect("missing-key preflight should set status");
+    assert!(status.contains("Message not sent"));
     assert!(status.contains("Failed to configure provider route lm-studio / local-model."));
     assert!(
         status.contains(
             "Next step: Run /auth or /provider setup lm-studio to configure credentials."
         )
+    );
+    assert!(
+        !status.contains("restored to composer"),
+        "auth keep-echo must not claim composer restore: {status}"
     );
 }
 
@@ -10558,7 +11024,7 @@ async fn dispatch_uses_app_owned_exact_custom_identity_when_config_selector_drif
     .expect("dispatch exact App-owned route");
 
     match engine.rx_op.recv().await.expect("send message op") {
-        Op::SendMessage { route, .. } => {
+        Op::SendMessage(TurnSpec { route, .. }) => {
             assert_eq!(route.identity.provider, ApiProvider::Custom);
             assert_eq!(route.identity.key, "custom-a");
             assert_eq!(route.identity.exact_id.as_deref(), Some("custom-a"));
@@ -10610,7 +11076,7 @@ async fn dispatch_idless_custom_identity_keeps_legacy_root_over_literal_table() 
     .expect("dispatch idless legacy root route");
 
     match engine.rx_op.recv().await.expect("send message op") {
-        Op::SendMessage { route, .. } => {
+        Op::SendMessage(TurnSpec { route, .. }) => {
             assert_eq!(route.identity.provider, ApiProvider::Custom);
             assert_eq!(route.identity.key, "custom");
             assert_eq!(route.identity.exact_id, None);
@@ -11090,13 +11556,13 @@ fn context_override_drives_compaction_meter_and_preflight_budget() {
             )
     );
 
-    app.api_messages = vec![Message {
+    app.api_messages = std::sync::Arc::new(vec![Message {
         role: Role::User,
         content: vec![ContentBlock::Text {
             text: "context ".repeat(2_000),
             cache_control: None,
         }],
-    }];
+    }]);
     let (_, meter_window, _) = context_usage_snapshot(&app).expect("context meter");
     assert_eq!(meter_window, 262_144);
 
@@ -11155,13 +11621,13 @@ fn compaction_trigger_meter_and_ladder_share_the_resolved_window() {
         )
     );
 
-    app.api_messages = vec![Message {
+    app.api_messages = std::sync::Arc::new(vec![Message {
         role: Role::User,
         content: vec![ContentBlock::Text {
             text: "context ".repeat(100_000),
             cache_control: None,
         }],
-    }];
+    }]);
     let (used, meter_window, _) = context_usage_snapshot(&app).expect("context meter");
     assert_eq!(meter_window, ladder.tokens);
 
@@ -11243,7 +11709,10 @@ printf '%s\n' '{"text":"off-loop replacement"}'
     assert!(app.dispatch_in_flight);
     assert!(app.api_messages.is_empty(), "gate has not answered yet");
 
-    let apply_hook = tokio::time::timeout(std::time::Duration::from_secs(3), completion_rx.recv())
+    // Hook itself sleeps 1s; give macOS CI runners headroom under load. The
+    // invariant under test is that terminal dispatch returned in <250ms above,
+    // not that the off-loop hook finishes within a tight 3s budget.
+    let apply_hook = tokio::time::timeout(std::time::Duration::from_secs(15), completion_rx.recv())
         .await
         .expect("hook result timed out")
         .expect("hook result channel closed");
@@ -11254,7 +11723,7 @@ printf '%s\n' '{"text":"off-loop replacement"}'
     ));
 
     let apply_dispatch =
-        tokio::time::timeout(std::time::Duration::from_secs(3), completion_rx.recv())
+        tokio::time::timeout(std::time::Duration::from_secs(15), completion_rx.recv())
             .await
             .expect("dispatch result timed out")
             .expect("dispatch result channel closed");
@@ -11294,10 +11763,154 @@ async fn live_steer_crosses_message_submit_transform_exactly_once() {
         Some("transformed steer")
     );
     assert_eq!(std::fs::read_to_string(count).expect("hook count"), "x");
-    assert!(app.api_messages.iter().any(|message| matches!(
-        &message.content[0],
-        ContentBlock::Text { text, .. } if text == "transformed steer"
-    )));
+    // #6190: the transform's output is what the engine was handed, and it is
+    // held as in-flight until the engine's own record shows it. Pushing it
+    // into `api_messages` at send time was the reorder this fix removes.
+    assert_eq!(
+        app.inflight_steers
+            .iter()
+            .map(|steer| steer.content.as_str())
+            .collect::<Vec<_>>(),
+        vec!["transformed steer"]
+    );
+    assert!(
+        !app.api_messages.iter().any(|message| matches!(
+            &message.content[0],
+            ContentBlock::Text { text, .. } if text == "transformed steer"
+        )),
+        "a steer the engine has not recorded yet must not be in the local transcript"
+    );
+}
+
+/// #6190: steering did not place the steer as the newest transcript entry —
+/// it was painted at send time, so it sat above assistant work the engine's
+/// record places before it, and the live transcript disagreed with the
+/// replayed one. The steer now becomes a cell when, and where, the engine
+/// records it.
+#[cfg(not(windows))]
+#[tokio::test]
+async fn steer_becomes_the_newest_transcript_entry_only_when_the_engine_records_it() {
+    let _environment = crate::test_support::lock_test_env();
+    let mut app = create_test_app();
+    let session = super::event_loop::ensure_runtime_session_id(&mut app);
+    app.api_messages = std::sync::Arc::new(vec![text_message("user", "original request")]);
+    app.add_message(HistoryCell::Assistant {
+        content: "work produced before the steer arrived".to_string(),
+        streaming: false,
+    });
+    app.is_loading = true;
+    let mut engine = crate::core::engine::mock_engine_handle();
+
+    attempt_steer_with_queue_fallback(
+        &mut app,
+        &Config::default(),
+        &engine.handle,
+        QueuedMessage::new("actually use the other file".to_string(), None),
+        DispatchRecovery::Immediate,
+    )
+    .await;
+    assert_eq!(
+        engine.rx_steer.recv().await.as_deref(),
+        Some("actually use the other file")
+    );
+
+    // The channel took it; the turn has not. Nothing is settled yet.
+    assert!(
+        !app.history
+            .iter()
+            .any(|cell| matches!(cell, HistoryCell::User { .. })),
+        "a steer must not own a transcript cell before the engine records it"
+    );
+    assert_eq!(app.api_messages.len(), 1);
+    assert_eq!(
+        build_pending_input_preview(&app).pending_steers,
+        vec!["actually use the other file".to_string()],
+        "an unaccepted steer is shown as still sending, not as transcript"
+    );
+
+    // The engine commits the steer at its step boundary, after the assistant
+    // message it followed. `is_loading` is cleared first only because the
+    // mid-turn checkpoint branch of the projection is not what this pins.
+    app.is_loading = false;
+    let model = app.model.clone();
+    let workspace = app.workspace.clone();
+    assert!(super::event_loop::apply_engine_session_projection(
+        &mut app,
+        &Config::default(),
+        EngineEvent::SessionUpdated {
+            session_id: session,
+            messages: std::sync::Arc::new(vec![
+                text_message("user", "original request"),
+                text_message("assistant", "work produced before the steer arrived"),
+                text_message("user", "actually use the other file"),
+            ]),
+            system_prompt: None,
+            model,
+            workspace,
+        }
+    ));
+
+    assert!(app.inflight_steers.is_empty(), "the steer was accepted");
+    assert!(build_pending_input_preview(&app).pending_steers.is_empty());
+    assert!(
+        matches!(
+            app.history.last(),
+            Some(HistoryCell::User { content }) if content == "+ actually use the other file"
+        ),
+        "the steer must be the newest transcript entry: {:?}",
+        app.history.last()
+    );
+}
+
+/// #6190 case D: `next_turn_steer` drains and *discards* a steer stamped with
+/// a turn that has already moved on. The toast said "sent into turn" and the
+/// cell stayed in history forever, for input the model never received. The
+/// steer now settles as a "could not send" receipt instead.
+#[cfg(not(windows))]
+#[tokio::test]
+async fn steer_the_turn_never_accepted_is_reported_not_left_in_the_transcript() {
+    let mut app = create_test_app();
+    app.is_loading = true;
+    let mut engine = crate::core::engine::mock_engine_handle();
+
+    attempt_steer_with_queue_fallback(
+        &mut app,
+        &Config::default(),
+        &engine.handle,
+        QueuedMessage::new("too late to matter".to_string(), None),
+        DispatchRecovery::Immediate,
+    )
+    .await;
+    assert_eq!(
+        engine.rx_steer.recv().await.as_deref(),
+        Some("too late to matter")
+    );
+
+    // The turn ends without the engine ever recording it.
+    super::dispatch::settle_unaccepted_steers_at_turn_end(&mut app);
+
+    assert!(app.inflight_steers.is_empty());
+    assert!(
+        !app.history
+            .iter()
+            .any(|cell| matches!(cell, HistoryCell::User { .. })),
+        "a dropped steer must not leave a transcript cell the record never had"
+    );
+    assert!(app.api_messages.is_empty());
+    assert_eq!(
+        app.queued_messages
+            .iter()
+            .map(|message| message.display.as_str())
+            .collect::<Vec<_>>(),
+        vec!["too late to matter"],
+        "an unaccepted steer is queued for the next turn, never dropped (#6297)"
+    );
+    let preview = build_pending_input_preview(&app);
+    assert!(preview.pending_steers.is_empty());
+    assert_eq!(
+        preview.queued_messages,
+        vec!["too late to matter".to_string()]
+    );
 }
 
 #[cfg(not(windows))]
@@ -11337,7 +11950,7 @@ async fn denied_steer_restores_queued_draft_and_keeps_active_turn() {
 #[tokio::test]
 async fn lost_strict_message_submit_executor_keeps_dispatch_atomic_and_recoverable() {
     let mut app = create_test_app();
-    app.api_messages
+    app.api_messages_mut()
         .push(text_message("assistant", "existing conversation"));
     app.add_message(HistoryCell::System {
         content: "existing receipt".to_string(),
@@ -11407,7 +12020,7 @@ async fn lost_strict_message_submit_executor_keeps_dispatch_atomic_and_recoverab
             .expect("production completion mailbox closed");
     apply_dispatch(&mut app, &engine.handle, &Config::default()).expect("apply recovery dispatch");
     match engine.rx_op.recv().await.expect("recovery SendMessage") {
-        crate::core::ops::Op::SendMessage { content, .. } => {
+        crate::core::ops::Op::SendMessage(TurnSpec { content, .. }) => {
             assert_eq!(content, "recover now");
         }
         other => panic!("expected SendMessage, got {other:?}"),
@@ -11453,7 +12066,7 @@ async fn reserved_dispatch_waits_for_ui_acceptance_before_engine_op() {
     assert!(app.pending_turn_route.is_some());
     assert!(matches!(
         engine.rx_op.try_recv(),
-        Ok(crate::core::ops::Op::SendMessage { content, .. })
+        Ok(crate::core::ops::Op::SendMessage (TurnSpec { content, .. }))
             if content == "preserve Engine lifecycle"
     ));
     assert!(engine.rx_op.try_recv().is_err(), "one Engine admission");
@@ -11632,7 +12245,7 @@ async fn reserved_dispatch_cancel_before_acceptance_keeps_prompt_and_next_dispat
             apply(&mut app, &engine.handle, &config).expect("next dispatch");
             assert!(matches!(
                 engine.rx_op.try_recv(),
-                Ok(crate::core::ops::Op::SendMessage { .. })
+                Ok(crate::core::ops::Op::SendMessage(TurnSpec { .. }))
             ));
             assert!(engine.rx_op.try_recv().is_err());
         }
@@ -11770,7 +12383,7 @@ async fn reserved_dispatch_replaced_engine_or_session_leaves_current_state_untou
         if !replace_engine {
             let _ = crate::cost_status::close_current_scope();
         }
-        app.api_messages = vec![text_message("user", "replacement session")];
+        app.api_messages = std::sync::Arc::new(vec![text_message("user", "replacement session")]);
         app.input = "new draft".to_string();
         assert!(app.dispatch_in_flight, "old admission is still outstanding");
         app.is_loading = false;
@@ -11815,7 +12428,7 @@ async fn reserved_dispatch_replaced_engine_or_session_leaves_current_state_untou
         };
         assert!(matches!(
             next_op,
-            Ok(crate::core::ops::Op::SendMessage { content, .. })
+            Ok(crate::core::ops::Op::SendMessage (TurnSpec { content, .. }))
                 if content == "new session request"
         ));
     }
@@ -11980,7 +12593,7 @@ printf '%s\n' '{"text":"after timeout"}'
         Some("hook timed out after 1s")
     );
     match engine.rx_op.recv().await.expect("send message op") {
-        crate::core::ops::Op::SendMessage { content, .. } => {
+        crate::core::ops::Op::SendMessage(TurnSpec { content, .. }) => {
             assert_eq!(content, "after timeout");
         }
         other => panic!("expected SendMessage, got {other:?}"),
@@ -12025,7 +12638,7 @@ printf '%s\n' '{"text":"after soft failure"}'
         Some("message_submit hook exited with code 9")
     );
     match engine.rx_op.recv().await.expect("send message op") {
-        crate::core::ops::Op::SendMessage { content, .. } => {
+        crate::core::ops::Op::SendMessage(TurnSpec { content, .. }) => {
             assert_eq!(content, "after soft failure");
         }
         other => panic!("expected SendMessage, got {other:?}"),
@@ -12037,7 +12650,7 @@ async fn dispatch_route_failure_leaves_loading_and_transcript_unchanged() {
     let mut app = create_test_app();
     app.set_provider_identity(ApiProvider::Custom, "lm-studio");
     app.set_model_selection("local-model".to_string());
-    app.api_messages
+    app.api_messages_mut()
         .push(text_message("assistant", "existing conversation"));
     app.add_message(HistoryCell::System {
         content: "existing receipt".to_string(),
@@ -12121,7 +12734,7 @@ printf '%s\n' '{"text":"[hooked] hello"}'
         ContentBlock::Text { text, .. } if text == "[hooked] hello"
     ));
     match engine.rx_op.recv().await.expect("send message op") {
-        crate::core::ops::Op::SendMessage { content, .. } => {
+        crate::core::ops::Op::SendMessage(TurnSpec { content, .. }) => {
             assert_eq!(content, "[hooked] hello");
         }
         other => panic!("expected SendMessage, got {other:?}"),
@@ -12228,11 +12841,11 @@ async fn dispatch_non_resume_message_preserves_paused_command_state() {
     assert!(app.goal.objective.is_none());
     assert!(!engine.handle.is_paused());
     match engine.rx_op.recv().await.expect("send message op") {
-        crate::core::ops::Op::SendMessage {
+        crate::core::ops::Op::SendMessage(TurnSpec {
             content,
             goal_objective,
             ..
-        } => {
+        }) => {
             assert!(goal_objective.is_none());
             assert!(content.contains("Paused custom slash command: Scan nested git repositories"));
             assert!(content.contains("do not continue the paused command"));
@@ -12269,11 +12882,11 @@ async fn dispatch_resume_message_restores_paused_command_goal() {
     );
     assert!(!engine.handle.is_paused());
     match engine.rx_op.recv().await.expect("send message op") {
-        crate::core::ops::Op::SendMessage {
+        crate::core::ops::Op::SendMessage(TurnSpec {
             content,
             goal_objective,
             ..
-        } => {
+        }) => {
             assert_eq!(
                 goal_objective.as_deref(),
                 Some("Scan nested git repositories")
@@ -12318,12 +12931,12 @@ async fn dispatch_user_message_keeps_auto_review_separate_from_bypass() {
         .expect("spawned dispatch should deliver Op within timeout")
         .expect("send message op");
     match op {
-        crate::core::ops::Op::SendMessage {
+        crate::core::ops::Op::SendMessage(TurnSpec {
             mode,
             auto_approve,
             approval_mode,
             ..
-        } => {
+        }) => {
             assert_eq!(mode, AppMode::Agent);
             assert!(!auto_approve);
             assert_eq!(approval_mode, ApprovalMode::Auto);
@@ -13720,6 +14333,7 @@ fn make_subagent(
     status: crate::tools::subagent::SubAgentStatus,
 ) -> crate::tools::subagent::SubAgentResult {
     crate::tools::subagent::SubAgentResult {
+        usage: None,
         name: id.to_string(),
         agent_id: id.to_string(),
         context_mode: "fresh".to_string(),
@@ -14900,13 +15514,13 @@ fn slow_external_url_command() -> Command {
 fn context_usage_snapshot_prefers_estimate_when_reported_exceeds_window() {
     let mut app = create_test_app();
     app.session.last_prompt_tokens = Some(1_200_000);
-    app.api_messages = vec![Message {
+    app.api_messages = std::sync::Arc::new(vec![Message {
         role: Role::User,
         content: vec![ContentBlock::Text {
             text: "hello".to_string(),
             cache_control: None,
         }],
-    }];
+    }]);
 
     let (used, max, percent) =
         context_usage_snapshot(&app).expect("context usage should be available");
@@ -14919,17 +15533,17 @@ fn context_usage_snapshot_prefers_estimate_when_reported_exceeds_window() {
 #[test]
 fn context_usage_cache_tracks_append_and_compaction_lengths() {
     let mut app = create_test_app();
-    app.api_messages = vec![Message {
+    app.api_messages = std::sync::Arc::new(vec![Message {
         role: Role::User,
         content: vec![ContentBlock::Text {
             text: "first".to_string(),
             cache_control: None,
         }],
-    }];
+    }]);
     context_usage_snapshot(&app).expect("context usage should be available");
     assert_eq!(app.context_token_cache.borrow().message_tokens.len(), 1);
 
-    app.api_messages.push(Message {
+    app.api_messages_mut().push(Message {
         role: Role::Assistant,
         content: vec![ContentBlock::Text {
             text: "second".to_string(),
@@ -14939,7 +15553,7 @@ fn context_usage_cache_tracks_append_and_compaction_lengths() {
     context_usage_snapshot(&app).expect("context usage should be available");
     assert_eq!(app.context_token_cache.borrow().message_tokens.len(), 2);
 
-    app.api_messages.truncate(1);
+    app.api_messages_mut().truncate(1);
     context_usage_snapshot(&app).expect("context usage should be available");
     assert_eq!(app.context_token_cache.borrow().message_tokens.len(), 1);
 }
@@ -14947,24 +15561,26 @@ fn context_usage_cache_tracks_append_and_compaction_lengths() {
 #[test]
 fn context_usage_cache_refreshes_after_compaction_replaces_messages() {
     let mut app = create_test_app();
-    app.api_messages = (0..3)
-        .map(|_| Message {
-            role: Role::User,
-            content: vec![ContentBlock::Text {
-                text: "context ".repeat(2_000),
-                cache_control: None,
-            }],
-        })
-        .collect();
+    app.api_messages = std::sync::Arc::new(
+        (0..3)
+            .map(|_| Message {
+                role: Role::User,
+                content: vec![ContentBlock::Text {
+                    text: "context ".repeat(2_000),
+                    cache_control: None,
+                }],
+            })
+            .collect(),
+    );
     let (before, _, _) = context_usage_snapshot(&app).expect("context usage should be available");
 
-    app.api_messages = vec![Message {
+    app.api_messages = std::sync::Arc::new(vec![Message {
         role: Role::Assistant,
         content: vec![ContentBlock::Text {
             text: "compact summary".to_string(),
             cache_control: None,
         }],
-    }];
+    }]);
     app.context_token_cache.borrow_mut().clear();
     let (after, _, _) =
         context_usage_snapshot(&app).expect("compacted context usage should be available");
@@ -14979,13 +15595,13 @@ fn context_usage_cache_refreshes_after_compaction_replaces_messages() {
 fn context_usage_snapshot_prefers_estimate_when_reported_is_inflated_by_old_reasoning() {
     let mut app = create_test_app();
     app.session.last_prompt_tokens = Some(980_000);
-    app.api_messages = vec![Message {
+    app.api_messages = std::sync::Arc::new(vec![Message {
         role: Role::User,
         content: vec![ContentBlock::Text {
             text: "small current context".to_string(),
             cache_control: None,
         }],
-    }];
+    }]);
 
     let (used, max, percent) =
         context_usage_snapshot(&app).expect("context usage should be available");
@@ -15004,13 +15620,13 @@ fn context_usage_snapshot_prefers_estimate_when_reported_is_inflated_by_old_reas
 #[test]
 fn context_usage_does_not_drop_when_reported_shrinks_after_multi_round_turn() {
     let mut app = create_test_app();
-    app.api_messages = vec![Message {
+    app.api_messages = std::sync::Arc::new(vec![Message {
         role: Role::User,
         content: vec![ContentBlock::Text {
             text: "context ".repeat(2_000), // ~14k tokens estimated
             cache_control: None,
         }],
-    }];
+    }]);
 
     // Simulate a multi-round turn that summed two rounds' input_tokens
     // (e.g., 200k + 210k from a long thinking + tool-call sequence).
@@ -15038,13 +15654,13 @@ fn context_usage_snapshot_prefers_live_estimate_while_loading() {
     let mut app = create_test_app();
     app.is_loading = true;
     app.session.last_prompt_tokens = Some(128);
-    app.api_messages = vec![Message {
+    app.api_messages = std::sync::Arc::new(vec![Message {
         role: Role::User,
         content: vec![ContentBlock::Text {
             text: "context ".repeat(6_000),
             cache_control: None,
         }],
-    }];
+    }]);
 
     let estimated = estimated_context_tokens(&app).expect("estimated context should be available");
     let (used, max, percent) =
@@ -15055,41 +15671,53 @@ fn context_usage_snapshot_prefers_live_estimate_while_loading() {
     assert!(percent > 0.0);
 }
 
+/// #6297: the meter the user reads and the gate that decides to compact must
+/// be one truth. Before this test, the meter multiplied message tokens by
+/// 1.5 while the gate used the non-inflated estimator — so a session could
+/// show "ctx 82%" next to "surface soon — /compact" while auto-compaction
+/// correctly refused, and the user saw a broken feature.
 #[test]
-fn should_auto_compact_before_send_uses_shared_token_threshold() {
+fn context_meter_and_compaction_gate_share_one_estimator() {
     let mut app = create_test_app();
-    app.api_messages = vec![Message {
-        role: Role::User,
-        content: vec![ContentBlock::Text {
-            text: "context ".repeat(240_000),
-            cache_control: None,
-        }],
-    }];
-    let (used, _, _) = context_usage_snapshot(&app).expect("context snapshot");
-    let used = usize::try_from(used).expect("non-negative context estimate");
+    app.api_messages = std::sync::Arc::new(vec![
+        Message {
+            role: Role::User,
+            content: vec![ContentBlock::Text {
+                text: "context ".repeat(2_000),
+                cache_control: None,
+            }],
+        },
+        Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::Text {
+                text: "answer ".repeat(500),
+                cache_control: None,
+            }],
+        },
+    ]);
 
-    app.auto_compact = true;
-    app.compact_threshold = used;
-    assert!(should_auto_compact_before_send(&app));
-
-    app.compact_threshold = used.saturating_add(1);
-    assert!(!should_auto_compact_before_send(&app));
-
-    app.auto_compact = false;
-    app.compact_threshold = 0;
-    assert!(!should_auto_compact_before_send(&app));
+    let meter = estimated_context_tokens(&app).expect("context meter");
+    let gate = i64::try_from(crate::compaction::estimate_input_tokens_for_pressure(
+        &app.api_messages,
+        app.system_prompt.as_ref(),
+    ))
+    .expect("fits i64");
+    assert_eq!(
+        meter, gate,
+        "the meter and the compaction gate must read the same estimate"
+    );
 }
 
 #[test]
 fn automatic_compaction_does_not_warn_at_its_threshold() {
     let mut app = create_test_app();
-    app.api_messages = vec![Message {
+    app.api_messages = std::sync::Arc::new(vec![Message {
         role: Role::User,
         content: vec![ContentBlock::Text {
             text: "context ".repeat(240_000),
             cache_control: None,
         }],
-    }];
+    }]);
     app.auto_compact = true;
     app.auto_compact_threshold_percent = 100.0;
     let (used, _, percent) = context_usage_snapshot(&app).expect("context snapshot");
@@ -15108,13 +15736,16 @@ fn automatic_compaction_does_not_warn_at_its_threshold() {
 #[test]
 fn context_pressure_warning_survives_later_status_and_can_be_dismissed() {
     let mut app = create_test_app();
-    app.api_messages = vec![Message {
+    app.api_messages = std::sync::Arc::new(vec![Message {
         role: Role::User,
         content: vec![ContentBlock::Text {
-            text: "context ".repeat(240_000),
+            // Sized for the honest (non-inflated) meter: ~66% of a 1M window,
+            // past the >=60% suggestion even with the meter and gate sharing
+            // one estimator (#6297).
+            text: "context ".repeat(330_000),
             cache_control: None,
         }],
-    }];
+    }]);
     app.auto_compact = false;
     app.auto_compact_threshold_percent = 100.0;
     let (used, _, _) = context_usage_snapshot(&app).expect("context snapshot");
@@ -15150,13 +15781,14 @@ fn context_pressure_warning_survives_later_status_and_can_be_dismissed() {
 #[test]
 fn context_pressure_warning_clears_when_compaction_starts() {
     let mut app = create_test_app();
-    app.api_messages = vec![Message {
+    app.api_messages = std::sync::Arc::new(vec![Message {
         role: Role::User,
         content: vec![ContentBlock::Text {
-            text: "context ".repeat(240_000),
+            // ~66% of a 1M window under the honest (non-inflated) estimator.
+            text: "context ".repeat(330_000),
             cache_control: None,
         }],
-    }];
+    }]);
     app.auto_compact = false;
     app.auto_compact_threshold_percent = 100.0;
     let (used, _, _) = context_usage_snapshot(&app).expect("context snapshot");
@@ -15354,7 +15986,7 @@ fn local_cancel_marks_late_stream_events_for_suppression() {
     assert!(suppress_engine_event_after_local_cancel(
         &EngineEvent::SessionUpdated {
             session_id: "session".to_string(),
-            messages: Vec::new(),
+            messages: std::sync::Arc::new(Vec::new()),
             system_prompt: None,
             model: "deepseek-v4-flash".to_string(),
             workspace: PathBuf::from("."),
@@ -15398,8 +16030,8 @@ fn turn_started_route_is_captured_before_cancel_suppression() {
         },
         scope: crate::model_routing::AutoRouteScope::ResolvedProvider,
         data_path: crate::model_routing::AutoRouteDataPath::LocalHeuristic,
-        reason: crate::model_routing::AutoRouteReason::LocalHeuristic(
-            crate::model_routing::AutoRouteHeuristicReason::ShortRequest,
+        reason: crate::model_routing::AutoRouteReason::LocalFallback(
+            crate::model_routing::AutoRouteHeuristicReason::DeclaredDefault,
         ),
     });
     let created_at = chrono::Utc::now();
@@ -15599,9 +16231,9 @@ fn issue_2739_stalled_turn_snapshot_preserves_api_messages() {
     let manager =
         crate::session_manager::SessionManager::new(tmp.path().join("sessions")).expect("manager");
     let mut app = create_test_app();
-    app.api_messages
+    app.api_messages_mut()
         .push(text_message("user", "hello from user"));
-    app.api_messages
+    app.api_messages_mut()
         .push(text_message("assistant", "partial reply"));
     // Simulate a running turn that stalls.
     app.is_loading = true;
@@ -15613,9 +16245,15 @@ fn issue_2739_stalled_turn_snapshot_preserves_api_messages() {
     // may fail in tests (no real home dir), we verify directly that
     // build_session_snapshot captures the in-progress messages.
     let snapshot = build_session_snapshot(&mut app, &manager).expect("session snapshot");
-    assert_eq!(snapshot.messages.len(), 2);
-    assert_eq!(snapshot.messages[0].role, "user");
-    assert_eq!(snapshot.messages[1].role, "assistant");
+    // Snapshots are journal-only (#6214 T3); the projection rehydrates at save.
+    let journal_messages = snapshot
+        .journal
+        .as_ref()
+        .expect("snapshot journal")
+        .to_messages();
+    assert_eq!(journal_messages.len(), 2);
+    assert_eq!(journal_messages[0].role, "user");
+    assert_eq!(journal_messages[1].role, "assistant");
 }
 
 #[test]
@@ -15625,9 +16263,9 @@ fn issue_2739_esc_cancel_preserves_session_messages_before_clear() {
     let manager =
         crate::session_manager::SessionManager::new(tmp.path().join("sessions")).expect("manager");
     let mut app = create_test_app();
-    app.api_messages
+    app.api_messages_mut()
         .push(text_message("user", "esc cancel test"));
-    app.api_messages
+    app.api_messages_mut()
         .push(text_message("assistant", "interrupted by esc"));
     app.is_loading = true;
     app.turn_started_at = Some(Instant::now());
@@ -15643,9 +16281,15 @@ fn issue_2739_esc_cancel_preserves_session_messages_before_clear() {
         "local cancel should create a resumable session snapshot"
     );
     let snapshot = build_session_snapshot(&mut app, &manager).expect("session snapshot");
-    assert_eq!(snapshot.messages.len(), 2);
-    assert_eq!(snapshot.messages[0].role, "user");
-    assert_eq!(snapshot.messages[1].role, "assistant");
+    // Snapshots are journal-only (#6214 T3); the projection rehydrates at save.
+    let journal_messages = snapshot
+        .journal
+        .as_ref()
+        .expect("snapshot journal")
+        .to_messages();
+    assert_eq!(journal_messages.len(), 2);
+    assert_eq!(journal_messages[0].role, "user");
+    assert_eq!(journal_messages[1].role, "assistant");
     // Turn-level bookkeeping must be cleared after cancel.
     assert!(!app.is_loading);
     assert!(app.turn_started_at.is_none());
@@ -15658,7 +16302,7 @@ fn issue_2739_dispatch_timeout_preserves_user_prompt() {
     let manager =
         crate::session_manager::SessionManager::new(tmp.path().join("sessions")).expect("manager");
     let mut app = create_test_app();
-    app.api_messages
+    app.api_messages_mut()
         .push(text_message("user", "prompt that never dispatched"));
     // Dispatch stalled before the turn ever reached `in_progress`
     // (runtime_turn_status stays None), so only the dispatch-timeout branch
@@ -15678,8 +16322,14 @@ fn issue_2739_dispatch_timeout_preserves_user_prompt() {
     // snapshot (and therefore --continue) still has it instead of loading the
     // previous save.
     let snapshot = build_session_snapshot(&mut app, &manager).expect("session snapshot");
-    assert_eq!(snapshot.messages.len(), 1);
-    assert_eq!(snapshot.messages[0].role, "user");
+    // Snapshots are journal-only (#6214 T3); the projection rehydrates at save.
+    let journal_messages = snapshot
+        .journal
+        .as_ref()
+        .expect("snapshot journal")
+        .to_messages();
+    assert_eq!(journal_messages.len(), 1);
+    assert_eq!(journal_messages[0].role, "user");
 }
 
 #[test]
@@ -16085,6 +16735,30 @@ fn slash_menu_down_wraps_from_last_to_first() {
     app.slash_menu_selected = entries.len() - 1;
     select_next_slash_menu_entry(&mut app, entries.len());
 
+    assert_eq!(app.slash_menu_selected, 0);
+    assert_eq!(app.input, "/");
+}
+
+#[test]
+fn slash_menu_paging_clamps_instead_of_wrapping() {
+    use crate::tui::list_nav::Motion;
+    let mut app = create_test_app();
+    app.input = "/".to_string();
+    app.cursor_position = 1;
+
+    let entries = visible_slash_menu_entries(&app, 128);
+    assert!(entries.len() > 1);
+    let last = entries.len() - 1;
+
+    // Pages travel and clamp (#6290); only steps wrap.
+    app.slash_menu_selected = 0;
+    move_slash_menu_selection(&mut app, entries.len(), Motion::PageNext);
+    assert_eq!(app.slash_menu_selected, 10.min(last));
+    move_slash_menu_selection(&mut app, entries.len(), Motion::PageNext);
+    assert_eq!(app.slash_menu_selected, 20.min(last));
+    move_slash_menu_selection(&mut app, entries.len(), Motion::Last);
+    assert_eq!(app.slash_menu_selected, last);
+    move_slash_menu_selection(&mut app, entries.len(), Motion::First);
     assert_eq!(app.slash_menu_selected, 0);
     assert_eq!(app.input, "/");
 }
@@ -16538,6 +17212,37 @@ fn completed_subagent_shell_tool_refreshes_workspace_context_before_ttl() {
 }
 
 #[test]
+fn workspace_context_discards_old_workspace_results_and_clears_missing_git() {
+    let mut app = create_test_app();
+    app.workspace_context = Some("feature/current | clean".into());
+    app.workspace_is_linked_worktree = true;
+    app.workspace_context_refreshed_at = Some(Instant::now());
+    *app.workspace_context_cell.lock().unwrap() =
+        Some(crate::tui::workspace_context::WorkspaceContextSnapshot {
+            workspace: app.workspace.join("old-workspace"),
+            context: Some("stale | clean".into()),
+            is_linked_worktree: false,
+        });
+    crate::tui::workspace_context::refresh_if_needed(&mut app, Instant::now(), false);
+    assert_eq!(
+        app.workspace_context.as_deref(),
+        Some("feature/current | clean")
+    );
+    assert!(app.workspace_is_linked_worktree);
+    app.needs_redraw = false;
+    *app.workspace_context_cell.lock().unwrap() =
+        Some(crate::tui::workspace_context::WorkspaceContextSnapshot {
+            workspace: app.workspace.clone(),
+            context: None,
+            is_linked_worktree: false,
+        });
+    crate::tui::workspace_context::refresh_if_needed(&mut app, Instant::now(), false);
+    assert!(app.workspace_context.is_none());
+    assert!(!app.workspace_is_linked_worktree);
+    assert!(app.needs_redraw);
+}
+
+#[test]
 fn workspace_context_drain_requests_redraw_when_context_changes() {
     let mut app = create_test_app();
     app.workspace_context = Some("feature/old | clean".to_string());
@@ -16545,7 +17250,11 @@ fn workspace_context_drain_requests_redraw_when_context_changes() {
     app.needs_redraw = false;
     {
         let mut cell = app.workspace_context_cell.lock().expect("context cell");
-        *cell = Some("feature/new | clean".to_string());
+        *cell = Some(crate::tui::workspace_context::WorkspaceContextSnapshot {
+            workspace: app.workspace.clone(),
+            context: Some("feature/new | clean".to_string()),
+            is_linked_worktree: false,
+        });
     }
 
     crate::tui::workspace_context::refresh_if_needed(&mut app, Instant::now(), false);
@@ -16577,7 +17286,7 @@ async fn dispatch_user_message_records_prompt_for_cancel_restore() {
         Some("fix this typo\nthen retry")
     );
     match engine.rx_op.recv().await.expect("send message op") {
-        crate::core::ops::Op::SendMessage { content, .. } => {
+        crate::core::ops::Op::SendMessage(TurnSpec { content, .. }) => {
             assert_eq!(content, "fix this typo\nthen retry");
             assert!(!app.show_thinking, "visibility remains TUI-owned");
         }
@@ -16619,7 +17328,7 @@ async fn startup_prompt_waits_for_onboarding_then_dispatches() {
         Some("阅读项目 and wait")
     );
     match engine.rx_op.recv().await.expect("send message op") {
-        crate::core::ops::Op::SendMessage { content, .. } => {
+        crate::core::ops::Op::SendMessage(TurnSpec { content, .. }) => {
             assert!(content.contains("阅读项目 and wait"));
         }
         other => panic!("expected SendMessage, got {other:?}"),
@@ -16665,7 +17374,9 @@ async fn redaction_gate_preserves_startup_and_external_input_without_dispatch() 
     assert!(!app.auto_submit_initial_input);
     assert!(app.input.is_empty());
     match engine.rx_op.try_recv().unwrap() {
-        Op::SendMessage { content, .. } => assert!(content.contains("review the local fixture")),
+        Op::SendMessage(TurnSpec { content, .. }) => {
+            assert!(content.contains("review the local fixture"))
+        }
         other => panic!("unexpected operation: {other:?}"),
     }
     assert!(engine.rx_op.try_recv().is_err());
@@ -16723,7 +17434,7 @@ async fn redaction_confirmation_restores_history_before_first_local_provider_req
     app.onboarding = OnboardingState::None;
     app.redaction_gate = true;
     app.current_session_id = Some("local-consent-resumed-session".to_string());
-    app.api_messages = vec![
+    app.api_messages = std::sync::Arc::new(vec![
         Message {
             role: Role::User,
             content: vec![ContentBlock::Text {
@@ -16738,7 +17449,7 @@ async fn redaction_confirmation_restores_history_before_first_local_provider_req
                 cache_control: None,
             }],
         },
-    ];
+    ]);
     let expected_history = serde_json::to_value(&app.api_messages).unwrap();
     app.input = "What color did I give you?".to_string();
     app.cursor_position = app.input.chars().count();
@@ -17139,7 +17850,7 @@ fn throttled_recovery_snapshot_persists_during_loading_turns() {
     let manager =
         crate::session_manager::SessionManager::new(tmp.path().join("sessions")).expect("manager");
     let mut app = create_test_app();
-    app.api_messages
+    app.api_messages_mut()
         .push(text_message("user", "in-progress turn"));
     app.is_loading = true;
     app.runtime_turn_status = Some("in_progress".to_string());
@@ -17149,7 +17860,13 @@ fn throttled_recovery_snapshot_persists_during_loading_turns() {
     maybe_throttled_recovery_snapshot(&mut app, t0, &mut last_snapshot_at);
     assert!(last_snapshot_at.is_some());
     let snapshot = build_session_snapshot(&mut app, &manager).expect("session snapshot");
-    assert_eq!(snapshot.messages.len(), 1);
+    // Snapshots are journal-only (#6214 T3); the projection rehydrates at save.
+    let journal_messages = snapshot
+        .journal
+        .as_ref()
+        .expect("snapshot journal")
+        .to_messages();
+    assert_eq!(journal_messages.len(), 1);
 
     maybe_throttled_recovery_snapshot(
         &mut app,
@@ -19225,7 +19942,7 @@ fn stale_cached_placeholder_title_does_not_override_generated_title() {
     let mut app = create_test_app();
     let manager = SessionManager::new(tempfile::tempdir().expect("tempdir").path().to_path_buf())
         .expect("session manager");
-    app.api_messages.push(codewhale_models::Message {
+    app.api_messages_mut().push(codewhale_models::Message {
         role: Role::User,
         content: vec![codewhale_models::ContentBlock::Text {
             text: "Please fix the login bug".to_string(),
@@ -19278,7 +19995,7 @@ fn persisted_placeholder_title_yields_to_computed_title_when_conversation_has_co
     );
     assert_eq!(stale.metadata.title, "New Session");
     manager.save_session(&stale).expect("save stale session");
-    app.api_messages.push(codewhale_models::Message {
+    app.api_messages_mut().push(codewhale_models::Message {
         role: Role::User,
         content: vec![codewhale_models::ContentBlock::Text {
             text: "fix me".to_string(),
@@ -19400,7 +20117,7 @@ fn first_snapshot_preserves_current_session_id_for_artifact_ownership() {
         crate::session_manager::SessionManager::new(tmp.path().join("sessions")).expect("manager");
     let mut app = create_test_app();
     app.current_session_id = Some("session-123".to_string());
-    app.api_messages.push(text_message("user", "hello"));
+    app.api_messages_mut().push(text_message("user", "hello"));
 
     let snapshot = build_session_snapshot(&mut app, &manager).expect("session snapshot");
 
@@ -19420,7 +20137,7 @@ fn existing_session_snapshot_updates_model_selection() {
 
     let mut app = create_test_app();
     app.current_session_id = Some(existing.metadata.id.clone());
-    app.api_messages.push(text_message("user", "hello"));
+    app.api_messages_mut().push(text_message("user", "hello"));
     app.set_model_selection("deepseek-v4-flash".to_string());
 
     let snapshot = build_session_snapshot(&mut app, &manager).expect("session snapshot");
@@ -19443,7 +20160,8 @@ fn automatic_session_snapshot_keeps_named_custom_identity_secret_free() {
         .expect("custom provider")
         .api_key = Some("super-secret-local-key".to_string());
     let mut app = App::new(create_test_options(), &config);
-    app.api_messages.push(text_message("user", "persist me"));
+    app.api_messages_mut()
+        .push(text_message("user", "persist me"));
 
     let snapshot = build_session_snapshot(&mut app, &manager).expect("session snapshot");
     let serialized = serde_json::to_string(&snapshot).expect("serialize session");
@@ -19471,7 +20189,8 @@ fn automatic_session_snapshot_omits_id_for_legacy_root_custom_route() {
         ..Config::default()
     };
     let mut app = App::new(create_test_options(), &config);
-    app.api_messages.push(text_message("user", "persist root"));
+    app.api_messages_mut()
+        .push(text_message("user", "persist root"));
 
     let snapshot = build_session_snapshot(&mut app, &manager).expect("session snapshot");
     let serialized = serde_json::to_string(&snapshot).expect("serialize session");
@@ -19487,8 +20206,9 @@ fn session_snapshot_and_resume_round_trip_work_state() {
     let manager =
         crate::session_manager::SessionManager::new(tmp.path().join("sessions")).expect("manager");
     let mut app = create_test_app();
-    app.api_messages.push(text_message("user", "keep my work"));
-    app.api_messages
+    app.api_messages_mut()
+        .push(text_message("user", "keep my work"));
+    app.api_messages_mut()
         .push(text_message("assistant", "continuity captured"));
     {
         let mut todos = app.todos.try_lock().expect("todos lock");
@@ -19604,7 +20324,7 @@ fn automatic_session_snapshot_never_reloads_existing_json_on_ui_thread() {
         crate::session_manager::SessionManager::new(sessions_dir.clone()).expect("manager");
     let mut app = create_test_app();
     app.current_session_id = Some("nonblocking-snapshot".to_string());
-    app.api_messages
+    app.api_messages_mut()
         .push(text_message("user", "first in-memory checkpoint"));
     let initial = build_session_snapshot(&mut app, &manager).expect("initial snapshot");
     manager.save_session(&initial).expect("save initial");
@@ -19613,13 +20333,22 @@ fn automatic_session_snapshot_never_reloads_existing_json_on_ui_thread() {
         "{ intentionally malformed and never read",
     )
     .expect("corrupt disk fixture");
-    app.api_messages
+    app.api_messages_mut()
         .push(text_message("assistant", "newer in-memory state"));
 
     let snapshot = build_session_snapshot(&mut app, &manager).expect("nonblocking snapshot");
 
     assert_eq!(snapshot.metadata.id, "nonblocking-snapshot");
-    assert_eq!(snapshot.messages.len(), 2);
+    // Snapshots are journal-only (#6214 T3); the projection rehydrates at save.
+    assert_eq!(
+        snapshot
+            .journal
+            .as_ref()
+            .expect("snapshot journal")
+            .to_messages()
+            .len(),
+        2
+    );
     assert_eq!(snapshot.metadata.created_at, initial.metadata.created_at);
 }
 
@@ -19634,7 +20363,7 @@ fn renamed_title_survives_next_in_memory_automatic_snapshot() {
     manager.save_session(&session).expect("save session");
     let mut app = create_test_app();
     app.current_session_id = Some(session.metadata.id.clone());
-    app.api_messages.clone_from(&session.messages);
+    app.api_messages = std::sync::Arc::new(session.messages.clone());
 
     let renamed = crate::commands::execute("/rename Renamed In Memory", &mut app);
     assert!(!renamed.is_error, "{:?}", renamed.message);
@@ -19656,7 +20385,7 @@ fn session_snapshot_uses_last_known_work_before_first_file_flush() {
     let initial = build_session_snapshot(&mut app, &manager).expect("initial snapshot");
     let expected = initial.work_state.clone();
     app.current_session_id = Some(initial.metadata.id);
-    app.api_messages
+    app.api_messages_mut()
         .push(text_message("user", "new transcript content"));
 
     let todos = app.todos.clone();
@@ -19664,7 +20393,16 @@ fn session_snapshot_uses_last_known_work_before_first_file_flush() {
     let contended = build_session_snapshot(&mut app, &manager).expect("cached snapshot");
 
     assert_eq!(contended.work_state, expected);
-    assert_eq!(contended.messages.len(), 1);
+    // Snapshots are journal-only (#6214 T3); the projection rehydrates at save.
+    assert_eq!(
+        contended
+            .journal
+            .as_ref()
+            .expect("snapshot journal")
+            .to_messages()
+            .len(),
+        1
+    );
 }
 
 #[test]
@@ -19702,7 +20440,7 @@ fn legacy_session_without_work_state_clears_previous_todo_on_load() {
 #[test]
 fn contended_work_restore_leaves_current_session_wholly_unchanged() {
     let mut app = create_test_app();
-    app.api_messages
+    app.api_messages_mut()
         .push(text_message("user", "current conversation"));
     app.current_session_id = Some("current-session".to_string());
     let mut session = saved_session_with_messages(vec![text_message("user", "replacement")]);
@@ -19732,7 +20470,7 @@ fn contended_work_restore_leaves_current_session_wholly_unchanged() {
 #[test]
 fn missing_named_custom_provider_resume_leaves_current_session_wholly_unchanged() {
     let mut app = create_test_app();
-    app.api_messages
+    app.api_messages_mut()
         .push(text_message("user", "keep the current conversation"));
     app.current_session_id = Some("current-session".to_string());
     app.workspace = PathBuf::from("/tmp/current-workspace");
@@ -19780,7 +20518,7 @@ fn missing_named_custom_provider_resume_leaves_current_session_wholly_unchanged(
 #[test]
 fn custom_session_resume_requires_structural_route_not_client_construction() {
     let mut app = create_test_app();
-    app.api_messages
+    app.api_messages_mut()
         .push(text_message("user", "keep the current conversation"));
     app.current_session_id = Some("current-session".to_string());
     app.workspace = PathBuf::from("/tmp/current-workspace");
@@ -19812,7 +20550,7 @@ fn custom_session_resume_requires_structural_route_not_client_construction() {
         app.current_session_id.as_deref(),
         Some(session.metadata.id.as_str())
     );
-    assert_eq!(app.api_messages, session.messages);
+    assert_eq!(*app.api_messages, session.messages);
     assert!(app.input.is_empty());
     assert!(app.queued_draft.is_none());
     assert_eq!(app.workspace, PathBuf::from("/tmp/other-workspace"));
@@ -19910,7 +20648,7 @@ fn file_load_uses_one_fresh_config_snapshot_for_custom_route_and_app_state() {
     app.workspace.clone_from(&workspace);
     app.set_provider_identity(ApiProvider::Custom, "custom-a");
     app.set_model_selection("model-a".to_string());
-    app.api_messages
+    app.api_messages_mut()
         .push(text_message("user", "old conversation"));
     let mut session = saved_session_with_messages(vec![
         text_message("user", "new conversation"),
@@ -19932,7 +20670,7 @@ fn file_load_uses_one_fresh_config_snapshot_for_custom_route_and_app_state() {
     assert!(respawn);
     assert_eq!(app.provider_identity_for_persistence(), "custom-b");
     assert_eq!(app.model_selection_for_persistence(), "model-b");
-    assert_eq!(app.api_messages, session.messages);
+    assert_eq!(*app.api_messages, session.messages);
     assert_eq!(stale_config.provider.as_deref(), Some("custom-b"));
     assert_eq!(
         stale_config.deepseek_base_url(),
@@ -19947,7 +20685,7 @@ fn session_load_keeps_idless_custom_record_on_root_when_table_coexists() {
     config.base_url = Some("http://127.0.0.1:18181/v1".to_string());
     config.default_text_model = Some("legacy-root-model".to_string());
     let mut app = create_test_app();
-    app.api_messages
+    app.api_messages_mut()
         .push(text_message("user", "current conversation"));
     let mut session = saved_session_with_messages(vec![
         text_message("user", "legacy custom conversation"),
@@ -19959,7 +20697,7 @@ fn session_load_keeps_idless_custom_record_on_root_when_table_coexists() {
 
     apply_loaded_session(&mut app, &mut config, &session)
         .expect("id-less custom record must retain root provenance");
-    assert_eq!(app.api_messages, session.messages);
+    assert_eq!(*app.api_messages, session.messages);
     assert_eq!(app.api_provider, ApiProvider::Custom);
     assert_eq!(app.provider_identity_for_persistence(), "custom");
     assert_eq!(app.provider_id_for_persistence(), None);
@@ -19981,7 +20719,7 @@ fn session_load_rejects_exact_custom_table_record_when_only_root_remains() {
         ..Config::default()
     };
     let mut app = create_test_app();
-    app.api_messages
+    app.api_messages_mut()
         .push(text_message("user", "current conversation"));
     let previous_messages = app.api_messages.clone();
     let previous_identity = app.provider_identity_for_persistence().to_string();
@@ -20009,7 +20747,7 @@ fn session_load_rejects_empty_custom_id_when_root_and_table_coexist() {
     config.base_url = Some("http://127.0.0.1:18181/v1".to_string());
     config.default_text_model = Some("legacy-root-model".to_string());
     let mut app = create_test_app();
-    app.api_messages
+    app.api_messages_mut()
         .push(text_message("user", "current conversation"));
     app.set_provider_identity(ApiProvider::Deepseek, "deepseek");
     app.set_model_selection("deepseek-v4-pro".to_string());
@@ -20167,7 +20905,7 @@ fn file_load_route_refresh_preserves_effective_permission_and_feature_overlays()
 #[test]
 fn session_picker_restore_rejects_active_turn_before_mutating() {
     let mut app = create_test_app();
-    app.api_messages
+    app.api_messages_mut()
         .push(text_message("user", "current active conversation"));
     app.current_session_id = Some("current-session".to_string());
     app.is_loading = true;
@@ -20307,7 +21045,7 @@ fn auto_route_receipt_survives_session_snapshot_and_restore() {
         },
         scope: crate::model_routing::AutoRouteScope::ResolvedProvider,
         data_path: crate::model_routing::AutoRouteDataPath::LocalHeuristic,
-        reason: crate::model_routing::AutoRouteReason::LocalHeuristic(
+        reason: crate::model_routing::AutoRouteReason::LocalFallback(
             crate::model_routing::AutoRouteHeuristicReason::ComplexRequest,
         ),
     };
@@ -20319,7 +21057,7 @@ fn auto_route_receipt_survives_session_snapshot_and_restore() {
     app.last_auto_route_receipt = Some(receipt.clone());
     app.last_effective_reasoning_effort =
         Some(EffectiveReasoningEffort::Tier(ReasoningEffort::High));
-    app.api_messages
+    app.api_messages_mut()
         .push(text_message("user", "inspect this route"));
 
     let snapshot = build_session_snapshot(&mut app, &manager).expect("session snapshot");
@@ -22536,7 +23274,7 @@ fn message_complete_drain_preserves_thinking_when_thinking_complete_lost() {
     app.thinking_started_at = Some(Instant::now());
     app.streaming_state.start_thinking(0);
     app.streaming_state.push_content(0, "deep reasoning text");
-    let _ = app.streaming_state.commit_text(0);
+    let _ = app.streaming_state.commit_text(0, usize::MAX);
     app.reasoning_buffer.push_str("deep reasoning text");
 
     assert!(
@@ -22595,6 +23333,7 @@ fn approval_prompt_uses_event_input_after_message_complete_drain() {
         "approval-key",
         None,
         crate::config::ApprovalDefaultSelection::Deny,
+        None,
     );
 
     let mut view = app.view_stack.pop().expect("approval view");
@@ -22628,6 +23367,7 @@ fn approval_prompt_uses_configured_default_selection() {
         "approval-key",
         None,
         crate::config::ApprovalDefaultSelection::AllowOnce,
+        None,
     );
 
     let mut view = app.view_stack.pop().expect("approval view");
@@ -22663,6 +23403,7 @@ fn patch_approval_modal_does_not_displace_the_active_file_receipt() {
         "approval-key",
         None,
         crate::config::ApprovalDefaultSelection::Deny,
+        None,
     );
 
     assert!(
@@ -22688,6 +23429,41 @@ fn patch_approval_modal_does_not_displace_the_active_file_receipt() {
     assert_eq!(
         cell.receipt.as_ref().map(|receipt| receipt.outcome_label()),
         Some("Updated src/lib.rs".to_string())
+    );
+}
+
+#[tokio::test]
+async fn timed_out_approval_denial_reaches_the_engine_as_a_timeout() {
+    let mut app = create_test_app();
+    let mut config = Config::default();
+    let mut engine = mock_engine_handle();
+
+    apply_approval_decision(
+        &mut app,
+        &mut engine.handle,
+        &mut config,
+        ApprovalDecisionEvent {
+            tool_id: "tool-timeout".to_string(),
+            tool_name: "exec_shell".to_string(),
+            decision: ReviewDecision::Denied,
+            timed_out: true,
+            approval_key: "approval-timeout-key".to_string(),
+            approval_grouping_key: "approval-group".to_string(),
+            persistent_rules: Vec::new(),
+        },
+    )
+    .await;
+
+    assert_eq!(
+        engine.recv_approval_event().await,
+        Some(crate::core::engine::MockApprovalEvent::TimedOut {
+            id: "tool-timeout".to_string()
+        }),
+        "a bound expiry must reach the engine as a timeout, not an operator denial"
+    );
+    assert!(
+        !app.approval_session_denied.contains("approval-timeout-key"),
+        "an expired card must not cache a session denial"
     );
 }
 
@@ -22933,10 +23709,33 @@ fn noisy_subagent_progress_keeps_existing_objective_summary() {
         "starting: inspect release state".to_string(),
     );
 
-    let display =
-        friendly_subagent_progress(&app, "agent_live", "step 1/8: requesting model response");
+    let display = friendly_subagent_progress(
+        &app,
+        "agent_live",
+        "step 1/8: requesting model response",
+        true,
+    );
 
     assert_eq!(display, "starting: inspect release state");
+}
+
+#[test]
+fn informative_waits_show_their_text_rather_than_rewriting() {
+    // Retry/timeout waits share the ModelWait status but carry informative
+    // text: the producer leaves routine_wait false and the footer shows the
+    // message instead of rewriting it to the objective summary.
+    let app = create_test_app();
+    let display = friendly_subagent_progress(
+        &app,
+        "agent_live",
+        "step 1/8: API call timed out after 30000ms; retrying API request 1/3 in 500ms",
+        false,
+    );
+
+    assert!(
+        display.contains("retrying API request"),
+        "informative wait must stay visible: {display}"
+    );
 }
 
 /// Regression for issue #65: `truncate_line_to_width` with a tiny budget
@@ -23740,15 +24539,13 @@ fn merged_pending_steers_cross_bounded_message_submit_serialization() {
 }
 
 #[test]
-fn build_pending_input_preview_populates_all_three_buckets() {
+fn build_pending_input_preview_populates_steer_and_queue_buckets() {
     let mut app = create_test_app();
     app.push_pending_steer(QueuedMessage::new("steer-msg".to_string(), None));
-    app.rejected_steers.push_back("rejected-msg".to_string());
     app.queue_message(QueuedMessage::new("queued-msg".to_string(), None));
 
     let preview = build_pending_input_preview(&app);
     assert_eq!(preview.pending_steers, vec!["steer-msg".to_string()]);
-    assert_eq!(preview.rejected_steers, vec!["rejected-msg".to_string()]);
     assert_eq!(preview.queued_messages, vec!["queued-msg".to_string()]);
 }
 
@@ -24442,21 +25239,21 @@ fn completed_turn_notification_uses_streaming_text() {
 #[test]
 fn completed_turn_notification_falls_back_to_latest_assistant_message() {
     let mut app = create_test_app();
-    app.api_messages.push(codewhale_models::Message {
+    app.api_messages_mut().push(codewhale_models::Message {
         role: Role::Assistant,
         content: vec![codewhale_models::ContentBlock::Text {
             text: "Earlier turn".to_string(),
             cache_control: None,
         }],
     });
-    app.api_messages.push(codewhale_models::Message {
+    app.api_messages_mut().push(codewhale_models::Message {
         role: Role::User,
         content: vec![codewhale_models::ContentBlock::Text {
             text: "next".to_string(),
             cache_control: None,
         }],
     });
-    app.api_messages.push(codewhale_models::Message {
+    app.api_messages_mut().push(codewhale_models::Message {
         role: Role::Assistant,
         content: vec![codewhale_models::ContentBlock::Text {
             text: "Latest reply".to_string(),
@@ -24773,6 +25570,7 @@ mod work_sidebar_projection_tests {
             id: id.to_string(),
             status,
             prompt_summary: format!("task {id}"),
+            name: None,
             model: "deepseek-v4-flash".to_string(),
             model_provider: None,
             model_provider_id: None,
@@ -24783,7 +25581,6 @@ mod work_sidebar_projection_tests {
             ended_at,
             duration_ms: ended_at.map(|_| 1_234),
             lifecycle_seq: 1,
-            hunt_verdict: None,
             error: None,
             terminal_reason: None,
             thread_id: None,
@@ -25541,8 +26338,8 @@ fn queued_terminal_events_keep_receipt_gap_for_late_unbracketed_submit() {
     );
 }
 
-#[test]
-fn terminal_input_child_pause_drains_codewhale_events_before_editor_handoff() {
+#[tokio::test]
+async fn terminal_input_child_pause_drains_codewhale_events_before_editor_handoff() {
     let (tx, rx) = std::sync::mpsc::channel();
     tx.send(TerminalInputMessage::Event(ObservedTerminalEvent::new(
         Event::Key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)),
@@ -25572,6 +26369,7 @@ fn terminal_input_child_pause_drains_codewhale_events_before_editor_handoff() {
 
     input
         .pause_for_child_terminal()
+        .await
         .expect("synthetic pump can pause");
     assert!(
         prepare_terminal_input_handoff(&input, &mut pending_terminal_events)
@@ -25592,8 +26390,8 @@ fn terminal_input_child_pause_drains_codewhale_events_before_editor_handoff() {
     assert!(!input.paused_ack.load(std::sync::atomic::Ordering::Acquire));
 }
 
-#[test]
-fn terminal_input_handoff_preserves_pending_cancellation_keys() {
+#[tokio::test]
+async fn terminal_input_handoff_preserves_pending_cancellation_keys() {
     let (tx, rx) = std::sync::mpsc::channel();
     tx.send(TerminalInputMessage::Event(ObservedTerminalEvent::new(
         Event::Key(KeyEvent::new(KeyCode::Char('\u{3}'), KeyModifiers::NONE)),
@@ -25622,6 +26420,7 @@ fn terminal_input_handoff_preserves_pending_cancellation_keys() {
 
     input
         .pause_for_child_terminal()
+        .await
         .expect("synthetic pump can pause");
     assert!(
         !prepare_terminal_input_handoff(&input, &mut pending_terminal_events)
@@ -25639,8 +26438,104 @@ fn terminal_input_handoff_preserves_pending_cancellation_keys() {
     input.resume_after_child_terminal();
 }
 
+/// `CHILD_TERMINAL_GATE` is process-global — one stdin, one pump. Any test
+/// that publishes or reads it must hold this, including the restart test,
+/// which publishes through `install_parts`.
+static CHILD_TERMINAL_GATE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// #6165: `/hooks edit` handed the terminal to `$EDITOR` with the pump still
+/// reading stdin, so `Esc` and `Enter` were eaten by the composer while `:`
+/// and `!` reached `vi`. The pause now lives inside `with_suspended_tui`, so
+/// this pins what that guard must do to the pump: stop it reading for the
+/// whole handoff, and start it again on the way out.
+#[test]
+fn child_terminal_pause_stops_the_pump_reading_and_resumes_it_on_drop() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    let _serialized = CHILD_TERMINAL_GATE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    let paused = std::sync::Arc::new(AtomicBool::new(false));
+    let paused_ack = std::sync::Arc::new(AtomicBool::new(false));
+    let stop = std::sync::Arc::new(AtomicBool::new(false));
+    let reads = std::sync::Arc::new(AtomicUsize::new(0));
+    // Mirrors the real pump loop's pause handling: acknowledge and stop
+    // reading while paused, read otherwise. Spawning the crossterm pump here
+    // would need an interactive terminal.
+    let worker = {
+        let (paused, paused_ack, stop, reads) = (
+            std::sync::Arc::clone(&paused),
+            std::sync::Arc::clone(&paused_ack),
+            std::sync::Arc::clone(&stop),
+            std::sync::Arc::clone(&reads),
+        );
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::Acquire) {
+                if paused.load(Ordering::Acquire) {
+                    paused_ack.store(true, Ordering::Release);
+                } else {
+                    paused_ack.store(false, Ordering::Release);
+                    reads.fetch_add(1, Ordering::Release);
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        })
+    };
+    super::terminal_input::publish_child_terminal_gate(&paused, &paused_ack);
+
+    let guard = pause_terminal_input_for_child().expect("the pump acknowledges the pause");
+    assert!(paused.load(Ordering::Acquire));
+    let while_child_owns_it = reads.load(Ordering::Acquire);
+    std::thread::sleep(Duration::from_millis(30));
+    assert_eq!(
+        reads.load(Ordering::Acquire),
+        while_child_owns_it,
+        "the pump must not read the tty while a child owns the terminal"
+    );
+
+    drop(guard);
+    assert!(!paused.load(Ordering::Acquire));
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while reads.load(Ordering::Acquire) == while_child_owns_it {
+        assert!(
+            Instant::now() < deadline,
+            "the pump must read again once the child releases the terminal"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+
+    stop.store(true, Ordering::Release);
+    let _ = worker.join();
+}
+
+/// A pump that will not stop means the handoff would reproduce #6165, so the
+/// editor must not run — and the refusal must leave the pump reading.
+#[test]
+fn child_terminal_pause_refuses_the_handoff_when_the_pump_never_acknowledges() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let _serialized = CHILD_TERMINAL_GATE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    let paused = std::sync::Arc::new(AtomicBool::new(false));
+    let paused_ack = std::sync::Arc::new(AtomicBool::new(false));
+    super::terminal_input::publish_child_terminal_gate(&paused, &paused_ack);
+
+    let error = pause_terminal_input_for_child()
+        .err()
+        .expect("an unacknowledged pause must fail the handoff");
+    assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+    assert!(
+        !paused.load(Ordering::Acquire),
+        "a refused handoff must leave the pump reading, not wedged paused"
+    );
+}
+
 #[test]
 fn input_pump_restart_detaches_wedged_thread_and_installs_fresh_parts() {
+    let _serialized = CHILD_TERMINAL_GATE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     // A "wedged" pump thread blocked forever on a channel recv stands in for
     // a crossterm `event::read` that never returns (stalled Windows console
     // poll, or a Unix tty that stopped delivering bytes). Joining it would
@@ -26771,7 +27666,7 @@ fn fresh_session_turn_lifecycle_leaves_no_orphan_checkpoint() {
         crate::core::engine::Engine::new(build_engine_config(&app, &config), &config);
 
     // Turn start (dispatch.rs): crash checkpoint under the App id.
-    app.api_messages.push(codewhale_models::Message {
+    app.api_messages_mut().push(codewhale_models::Message {
         role: Role::User,
         content: vec![codewhale_models::ContentBlock::Text {
             text: "please answer".to_string(),
@@ -26789,7 +27684,7 @@ fn fresh_session_turn_lifecycle_leaves_no_orphan_checkpoint() {
 
     // Turn completion (`PersistRequest::CompletedCommit`): save the session,
     // then clear the checkpoint of the id the snapshot carries.
-    app.api_messages.push(codewhale_models::Message {
+    app.api_messages_mut().push(codewhale_models::Message {
         role: Role::Assistant,
         content: vec![codewhale_models::ContentBlock::Text {
             text: "answer".to_string(),
@@ -27349,7 +28244,7 @@ fn stale_session_projection_cannot_rewind_a_host_launch() {
     assert!(!result.is_error, "{:?}", result.message);
     let current = app.current_session_id.clone().unwrap();
     assert_ne!(current, previous);
-    app.api_messages = vec![text_message("user", "current host transcript")];
+    app.api_messages = std::sync::Arc::new(vec![text_message("user", "current host transcript")]);
     app.system_prompt = Some(SystemPrompt::Text("current prompt".into()));
     app.input = "typing remains responsive".into();
     let workspace = app.workspace.clone();
@@ -27361,7 +28256,7 @@ fn stale_session_projection_cannot_rewind_a_host_launch() {
         &Config::default(),
         EngineEvent::SessionUpdated {
             session_id: previous,
-            messages: vec![text_message("user", "stale transcript")],
+            messages: std::sync::Arc::new(vec![text_message("user", "stale transcript")]),
             system_prompt: Some(SystemPrompt::Text("stale prompt".into())),
             model: "stale-model".into(),
             workspace: PathBuf::from("/must-not-be-adopted"),
@@ -27369,7 +28264,7 @@ fn stale_session_projection_cannot_rewind_a_host_launch() {
     ));
     assert_eq!(app.current_session_id.as_deref(), Some(current.as_str()));
     assert_eq!(
-        app.api_messages,
+        *app.api_messages,
         vec![text_message("user", "current host transcript")]
     );
     assert_eq!(
@@ -27386,7 +28281,9 @@ fn stale_session_projection_cannot_rewind_a_host_launch() {
         &Config::default(),
         EngineEvent::SessionUpdated {
             session_id: current.clone(),
-            messages: vec![text_message("user", "expected engine transcript")],
+            messages: std::sync::Arc::new(vec![
+                text_message("user", "expected engine transcript",)
+            ]),
             system_prompt: None,
             model,
             workspace,
@@ -27394,7 +28291,7 @@ fn stale_session_projection_cannot_rewind_a_host_launch() {
     ));
     assert_eq!(app.current_session_id.as_deref(), Some(current.as_str()));
     assert_eq!(
-        app.api_messages,
+        *app.api_messages,
         vec![text_message("user", "expected engine transcript")]
     );
     assert_eq!(app.input, "typing remains responsive");

@@ -3,17 +3,18 @@
 Fleet and Workflow are meant to work together, but they solve different parts
 of the problem:
 
-- **Fleet** runs durable workers, records a ledger, keeps logs and artifacts,
-  and exposes status/restart/stop controls.
+- **Fleet** configures and manages the same sub-agents: reusable roles, model
+  routes, permissions, logs, artifacts, and status/restart/stop controls.
 - **Workflow** describes orchestration: phases, branches, reducers, loops, and
   agent leaves that can dispatch through the fleet/sub-agent runtime.
 
-**Default product path:** ask in natural language. Operate can use direct tools
-under the active posture, and prefers one or more background fleet workers when
-work is independent, parallel, isolated, or long-running. Background work keeps
-the composer available for more messages. It chooses Workflow only when
-ordered phases, gates, shared budgets, or deterministic fan-in add real value;
-you do not need to write workflow files for ordinary multi-agent work. Details:
+**Default product path:** ask in natural language. Operate handles small or
+tightly coupled work directly under the active posture. Multi-step delegation
+uses a compact Workflow plan with named steps, dependencies, bounded scopes,
+and completion checks; results and evidence pass to the steps that need them.
+One bounded, independent task can use a direct background agent. Reuse that
+agent with `followup` for continued work. Background work keeps the composer
+available, and ordinary multi-agent work does not require workflow files. Details:
 [Automatic Workflows](AUTOMATIC_WORKFLOWS.md).
 
 This tutorial covers the **manual** fleet task-spec / checked-in Workflow path

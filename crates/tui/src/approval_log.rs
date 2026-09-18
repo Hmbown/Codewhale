@@ -16,9 +16,14 @@ const APPROVAL_LOCK_FILE: &str = "approval_receipts.lock";
 pub(crate) enum ApprovalOutcome {
     ApprovedOnce,
     Denied,
+    /// The interactive approval card expired unanswered (#6101): the
+    /// configured bound denied the call, not the operator.
+    Timeout,
     Cancelled,
     Unavailable,
-    RetryWithPolicy { policy: SandboxPolicy },
+    RetryWithPolicy {
+        policy: SandboxPolicy,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -59,7 +64,7 @@ impl ApprovalReceipt {
         }
     }
 
-    fn approval_id(&self) -> &str {
+    pub(crate) fn approval_id(&self) -> &str {
         match self {
             Self::Asked { approval_id, .. } | Self::Decided { approval_id, .. } => approval_id,
         }
@@ -70,12 +75,27 @@ impl ApprovalReceipt {
             Self::Asked { tool_call_id, .. } | Self::Decided { tool_call_id, .. } => tool_call_id,
         }
     }
+
+    /// The tool the agent wanted to run — present on the ask half only.
+    pub(crate) fn tool_name(&self) -> Option<&str> {
+        match self {
+            Self::Asked { tool_name, .. } => Some(tool_name),
+            Self::Decided { .. } => None,
+        }
+    }
+
+    pub(crate) fn created_at(&self) -> DateTime<Utc> {
+        match self {
+            Self::Asked { created_at, .. } | Self::Decided { created_at, .. } => *created_at,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CompletedApproval {
     pub(crate) ask: ApprovalReceipt,
     pub(crate) outcome: ApprovalOutcome,
+    pub(crate) decided_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -121,6 +141,7 @@ impl ApprovalReplay {
                     approval_id,
                     tool_call_id,
                     outcome,
+                    created_at,
                     ..
                 } => {
                     if approval_id != tool_call_id {
@@ -137,6 +158,7 @@ impl ApprovalReplay {
                     completed.push(CompletedApproval {
                         ask,
                         outcome: outcome.clone(),
+                        decided_at: *created_at,
                     });
                 }
             }
@@ -254,6 +276,27 @@ impl ApprovalReceiptStore {
         let receipts = self.load(session_id)?;
         ApprovalReplay::from_receipts(&receipts)
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))
+    }
+
+    /// Session ids that have an approval log. Only entries whose name is a
+    /// valid session id are considered, so a stray file in the sessions dir
+    /// can never become a path traversal. A missing or unreadable sessions
+    /// dir is an empty history, not an error.
+    pub(crate) fn sessions_with_logs(&self) -> Vec<String> {
+        let entries = match fs::read_dir(&self.sessions_dir) {
+            Ok(entries) => entries,
+            Err(_) => return Vec::new(),
+        };
+        let mut ids = Vec::new();
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if Self::validated_session_id(&name).is_ok()
+                && entry.path().join(APPROVAL_LOG_FILE).exists()
+            {
+                ids.push(name);
+            }
+        }
+        ids
     }
 
     pub(crate) fn append(&self, session_id: &str, receipt: &ApprovalReceipt) -> io::Result<()> {

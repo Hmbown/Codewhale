@@ -26,9 +26,12 @@ for candidate in catalog["plugins"]:
     relative = spec[5:]
     if any(part in ("", ".", "..") or not all(c.isascii() and (c.isalnum() or c in "-_.") for c in part) for part in relative.split("/")):
         raise SystemExit(f"unsafe bundle path: {relative}")
-    # Mutable update channel; installed content is hash-bound and re-reviewed
-    # when changed. The catalog snapshot itself records its exact source SHA.
-    candidate["source"] = f"https://codeload.github.com/Hmbown/codewhale-plugin-marketplace/tar.gz/refs/heads/main#path={relative}"
+    # Pin every install source to the reviewed marketplace revision so the
+    # bytes a user installs are the bytes this snapshot describes. Freshness
+    # comes from bumping the pin (the marketplace-sync workflow reports drift
+    # against `main` weekly); `/plugin update` re-downloads the same archive
+    # and reports no change until the pin moves.
+    candidate["source"] = f"https://codeload.github.com/Hmbown/codewhale-plugin-marketplace/tar.gz/{revision}#path={relative}"
 snapshot = {"repository": REPOSITORY, "revision": revision, "catalog": catalog}
 rendered = json.dumps(snapshot, indent=2, ensure_ascii=False) + "\n"
 output = ROOT / "crates/tui/assets/first-party-marketplace.json"

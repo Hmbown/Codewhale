@@ -240,7 +240,7 @@ struct ReqwestTransport {
 
 impl ReqwestTransport {
     fn new(base: Url) -> Result<Self> {
-        let client = reqwest::blocking::Client::builder()
+        let client = codewhale_release::platform_blocking_http_client_builder()
             .connect_timeout(Duration::from_secs(8))
             .timeout(Duration::from_secs(30))
             // Never replay bearer tokens or provider-key request bodies to a

@@ -17,7 +17,7 @@ use axum::middleware;
 use axum::response::Html;
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post, put};
+use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -56,7 +56,10 @@ use crate::automation_manager::{
 use crate::config::DEFAULT_TEXT_MODEL;
 use crate::config::{ApiProvider, Config, normalize_model_name_for_provider, validate_route};
 use crate::fleet::executor::{FleetExecutor, configured_codewhale_binary};
-use crate::fleet::ledger::{FleetEventReplayError, FleetLedgerState, FleetTaskLedgerStatus};
+use crate::fleet::ledger::{
+    FleetEventReplayError, FleetLedgerState, FleetTaskLedgerStatus, fleet_ledger_path,
+    subscribe_fleet_ledger_appends,
+};
 use crate::fleet::manager::{
     FleetManager, FleetStatusSnapshot, FleetWorkerInspection, FleetWorkerRuntimeProjection,
     ManagedFleetRunDescriptor,
@@ -93,9 +96,19 @@ use codewhale_protocol::fleet::{
 };
 
 mod auth;
+mod context;
+mod diagnostics;
+mod git;
+mod jobs;
+mod lsp;
+mod memory_lens;
 mod mobile;
+mod plans;
 mod plugins;
+mod secrets;
 mod sessions;
+mod targets;
+mod voice;
 mod web;
 mod workspace;
 #[cfg(test)]
@@ -105,14 +118,18 @@ use self::auth::{
     runtime_request_is_authorized,
 };
 use self::sessions::{
-    create_session_from_thread, delete_session, get_session, list_sessions, list_sessions_summary,
-    patch_session, resume_session_thread, save_current_session,
+    create_session_from_thread, delete_session, get_session, list_session_artifacts, list_sessions,
+    list_sessions_summary, patch_session, read_session_artifact, resume_session_thread,
+    save_current_session,
 };
 #[cfg(test)]
 use self::sessions::{messages_from_thread_detail, session_to_detail};
 #[cfg(test)]
 use self::workspace::collect_workspace_status;
-use self::workspace::{collect_workspace_git_metadata, workspace_status};
+use self::workspace::{
+    collect_workspace_git_metadata, workspace_file_read, workspace_file_search,
+    workspace_file_write, workspace_files_list, workspace_instructions, workspace_status,
+};
 
 const RUNTIME_TOKEN_ENV: &str = "CODEWHALE_RUNTIME_TOKEN";
 const LEGACY_RUNTIME_TOKEN_ENV: &str = "DEEPSEEK_RUNTIME_TOKEN";
@@ -189,6 +206,11 @@ pub struct RuntimeApiState {
     /// lazily-initialized slot; slow per-pool work (connect_all) runs under
     /// the inner handle so it cannot block slot reads.
     mcp_pool: Arc<Mutex<Option<Arc<Mutex<McpPool>>>>>,
+    /// Workspace-level LSP client for the HTTP surface (APPS-93): diagnostics
+    /// and semantic queries on files a client views. Engines keep their own
+    /// per-thread managers; this one serves the file view and is built lazily
+    /// so a server without LSP use never spawns a language server.
+    lsp_manager: Arc<std::sync::OnceLock<Arc<crate::lsp::LspManager>>>,
     #[cfg(test)]
     compat_stream_test_hook: Option<tokio::sync::mpsc::UnboundedSender<CompatStreamTestPoint>>,
 }
@@ -576,7 +598,6 @@ fn runtime_api_sub_agent_manager(workspace: &FsPath, workers: usize) -> SharedSu
         max_agents,
         Duration::from_secs(crate::config::DEFAULT_SUBAGENT_HEARTBEAT_TIMEOUT_SECS),
         max_agents,
-        None,
     )
 }
 
@@ -761,6 +782,8 @@ struct AutomationRunsQuery {
 struct ThreadEventsQuery {
     since_seq: Option<u64>,
     replay_limit: Option<usize>,
+    #[serde(default)]
+    progress: bool,
 }
 
 const DEFAULT_FLEET_EVENT_REPLAY_LIMIT: usize = 250;
@@ -940,6 +963,7 @@ pub async fn run_http_server(
         web,
         fleet_codewhale_binary: configured_codewhale_binary(),
         mcp_pool: Arc::new(Mutex::new(None)),
+        lsp_manager: Arc::new(std::sync::OnceLock::new()),
         #[cfg(test)]
         compat_stream_test_hook: None,
     };
@@ -1071,6 +1095,7 @@ fn fallback_sessions_dir() -> PathBuf {
 }
 
 pub fn build_router(state: RuntimeApiState) -> Router {
+    diagnostics::mark_server_started();
     let api_routes = Router::new()
         .route(
             "/v1/sessions",
@@ -1087,7 +1112,23 @@ pub fn build_router(state: RuntimeApiState) -> Router {
             "/v1/sessions/{id}/resume-thread",
             post(resume_session_thread),
         )
+        .route("/v1/sessions/{id}/artifacts", get(list_session_artifacts))
+        .route(
+            "/v1/sessions/{id}/artifacts/{artifact_id}",
+            get(read_session_artifact),
+        )
         .route("/v1/workspace/status", get(workspace_status))
+        .route("/v1/workspace/files/search", get(workspace_file_search))
+        .route(
+            "/v1/workspace/files",
+            get(workspace_files_list)
+                .put(workspace_file_write)
+                .layer(DefaultBodyLimit::max(
+                    self::workspace::FILE_WRITE_BODY_LIMIT_BYTES,
+                )),
+        )
+        .route("/v1/workspace/files/read", get(workspace_file_read))
+        .route("/v1/workspace/instructions", get(workspace_instructions))
         .route("/v1/agent-runs", get(list_agent_runs))
         .route("/v1/agent-runs/{run_id}", get(get_agent_run))
         .route("/v1/fleet/profiles", get(list_fleet_profiles))
@@ -1138,13 +1179,87 @@ pub fn build_router(state: RuntimeApiState) -> Router {
                 codewhale_protocol::runtime::MAX_RUNTIME_IMAGE_BODY_BYTES,
             )),
         )
+        .route("/v1/git", get(git::git_status_detail))
+        .route("/v1/changes", get(git::git_changes))
+        .route("/v1/diff", get(git::git_diff))
+        .route("/v1/workspace/diff", get(git::workspace_diff))
+        .route("/v1/git/graph", get(git::git_graph))
+        .route("/v1/git/stage", post(git::git_stage))
+        .route("/v1/git/unstage", post(git::git_unstage))
+        .route("/v1/git/discard", post(git::git_discard))
+        .route("/v1/git/commit", post(git::git_commit))
+        .route("/v1/git/push", post(git::git_push))
+        .route("/v1/git/branch", post(git::git_branch))
+        .route("/v1/logs", get(diagnostics::list_logs))
+        .route("/v1/logs/{name}", get(diagnostics::read_log))
+        .route("/v1/crashes", get(diagnostics::list_crashes))
+        .route("/v1/crashes/{name}", get(diagnostics::read_crash))
+        .route("/v1/process", get(diagnostics::process_info))
+        .route("/v1/jobs", get(jobs::list_jobs))
         .route("/v1/threads", get(list_threads).post(create_thread))
         .route("/v1/threads/summary", get(list_threads_summary))
+        .route("/v1/threads/running", get(list_running_threads))
+        .route("/v1/threads/{id}/notices", get(list_thread_notices))
+        .route(
+            "/v1/threads/{id}/notices/{notice_id}",
+            delete(ack_thread_notice),
+        )
         .route("/v1/threads/{id}", get(get_thread).patch(update_thread))
+        .route(
+            "/v1/threads/{id}/jobs",
+            get(jobs::list_thread_jobs).post(jobs::create_thread_job),
+        )
+        .route("/v1/threads/{id}/jobs/{job_id}", get(jobs::get_thread_job))
+        .route(
+            "/v1/threads/{id}/jobs/{job_id}/output",
+            get(jobs::get_thread_job_output),
+        )
+        .route(
+            "/v1/threads/{id}/jobs/{job_id}/stdin",
+            post(jobs::write_thread_job_stdin),
+        )
+        .route(
+            "/v1/threads/{id}/jobs/{job_id}/kill",
+            post(jobs::kill_thread_job),
+        )
+        .route("/v1/threads/{id}/context", get(context::get_thread_context))
+        .route("/v1/threads/{id}/plan", get(plans::get_thread_plan))
+        .route("/v1/threads/{id}/todo", get(plans::get_thread_todo))
+        .route("/v1/plan", get(plans::latest_plan))
+        .route("/v1/todo", get(plans::latest_todo_route))
+        .route("/v1/plans", get(plans::list_plans))
+        .route("/v1/todos", get(plans::list_todos))
+        .route(
+            "/v1/targets",
+            get(targets::list_targets).post(targets::create_target),
+        )
+        .route("/v1/targets/switch", post(targets::switch_target))
+        .route("/v1/remote", get(targets::remote_status))
+        .route("/v1/remote/connect", post(targets::remote_connect))
+        .route(
+            "/v1/ssh",
+            get(targets::ssh_status).post(targets::ssh_connect),
+        )
+        .route("/v1/ssh/connect", post(targets::ssh_connect))
+        .route(
+            "/v1/cloud",
+            get(targets::cloud_status).post(targets::cloud_attach),
+        )
+        .route("/v1/cloud/attach", post(targets::cloud_attach))
+        .route("/v1/lsp", get(lsp::lsp_status))
+        .route("/v1/diagnostics", get(lsp::lsp_diagnostics))
+        .route("/v1/definition", get(lsp::lsp_definition))
+        .route("/v1/references", get(lsp::lsp_references))
+        .route("/v1/symbols", get(lsp::lsp_symbols))
+        .route("/v1/voice", get(voice::voice_status))
+        .route("/v1/voice/dictate", post(voice::voice_dictate))
+        .route("/v1/voice/send", post(voice::voice_send))
+        .route("/v1/voice/control", post(voice::voice_control))
         .route("/v1/threads/{id}/resume", post(resume_thread))
         .route("/v1/threads/{id}/fork", post(fork_thread))
         .route("/v1/threads/{id}/undo", post(undo_thread_turn))
         .route("/v1/threads/{id}/patch-undo", post(patch_undo_thread_turn))
+        .route("/v1/threads/{id}/file-revert", post(revert_thread_file))
         .route("/v1/threads/{id}/retry", post(retry_thread_turn))
         .route(
             "/v1/threads/{id}/turn-operations/{operation_key}",
@@ -1182,6 +1297,10 @@ pub fn build_router(state: RuntimeApiState) -> Router {
             post(mark_agent_mail_read),
         )
         .route(
+            "/v1/threads/{id}/agent-mail/{message_id}/cancel",
+            post(cancel_agent_mail),
+        )
+        .route(
             "/v1/threads/{id}/goal",
             get(get_thread_goal)
                 .put(upsert_thread_goal)
@@ -1189,6 +1308,7 @@ pub fn build_router(state: RuntimeApiState) -> Router {
         )
         .route("/v1/threads/{id}/goal/complete", post(complete_thread_goal))
         .route("/v1/threads/{id}/goal/block", post(block_thread_goal))
+        .route("/v1/approvals", get(list_approvals))
         .route("/v1/approvals/{approval_id}", post(decide_approval))
         .route(
             "/v1/user-input/{thread_id}/{input_id}",
@@ -1198,6 +1318,7 @@ pub fn build_router(state: RuntimeApiState) -> Router {
         .route("/v1/tasks/{id}", get(get_task))
         .route("/v1/tasks/{id}/cancel", post(cancel_task))
         .route("/v1/skills", get(list_skills))
+        .route("/v1/commands", get(list_commands))
         .route(
             "/v1/skills/{name}",
             post(set_skill_enabled).delete(uninstall_skill_api),
@@ -1302,8 +1423,17 @@ pub fn build_router(state: RuntimeApiState) -> Router {
         .route("/v1/providers", get(list_providers))
         .route("/v1/providers/{id}/models", get(list_provider_models))
         .route("/v1/providers/{id}/switch", post(switch_provider))
+        .route(
+            "/v1/providers/{id}/key",
+            put(secrets::set_provider_key)
+                .delete(secrets::clear_provider_key)
+                .layer(DefaultBodyLimit::max(
+                    secrets::PROVIDER_KEY_BODY_LIMIT_BYTES,
+                )),
+        )
         .route("/v1/config", get(get_config).post(set_config))
         .route("/v1/config/reload", post(reload_config))
+        .route("/v1/settings/schema", get(get_settings_schema))
         .route(
             "/v1/threads/{id}/notifications/prepare",
             post(notification_delivery::prepare),
@@ -1315,6 +1445,7 @@ pub fn build_router(state: RuntimeApiState) -> Router {
                 .delete(clear_memory),
         )
         .route("/v1/memory/{id}", get(get_memory_entry))
+        .merge(memory_lens::routes())
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             require_runtime_token,
@@ -1619,6 +1750,53 @@ async fn list_threads(
         .await
         .map_err(|e| ApiError::internal(e.to_string()))?;
     Ok(Json(threads))
+}
+
+/// Threads with queued or in-progress turns, for quit/background
+/// accounting (#6180). One call, no inference from latest-turn status.
+async fn list_running_threads(
+    State(state): State<RuntimeApiState>,
+) -> Result<Json<Vec<crate::runtime_threads::RunningThread>>, ApiError> {
+    let running = state
+        .runtime_threads
+        .running_threads()
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    Ok(Json(running))
+}
+
+/// Active notices on one thread (#6180): the TUI-visible conditions a
+/// watch-only client must surface — subagent-terminal, elevation-needed,
+/// model-notify — each with turn identity for targeting.
+async fn list_thread_notices(
+    State(state): State<RuntimeApiState>,
+    Path(id): Path<String>,
+) -> Result<Json<Vec<crate::runtime_threads::ActiveNotice>>, ApiError> {
+    state
+        .runtime_threads
+        .get_thread(&id)
+        .await
+        .map_err(map_thread_err)?;
+    Ok(Json(state.runtime_threads.list_notices(&id)))
+}
+
+/// Acknowledge (clear) one notice. Terminal/notify kinds clear only here;
+/// elevation additionally auto-clears when its tool call completes.
+async fn ack_thread_notice(
+    State(state): State<RuntimeApiState>,
+    Path((id, notice_id)): Path<(String, String)>,
+) -> Result<StatusCode, ApiError> {
+    state
+        .runtime_threads
+        .get_thread(&id)
+        .await
+        .map_err(map_thread_err)?;
+    if !state.runtime_threads.ack_notice(&id, &notice_id) {
+        return Err(ApiError::not_found(format!(
+            "thread '{id}' has no notice '{notice_id}'"
+        )));
+    }
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn list_threads_summary(
@@ -2104,10 +2282,13 @@ async fn stream_fleet_events(
 ) -> Result<Sse<impl futures_util::Stream<Item = Result<SseEvent, Infallible>>>, ApiError> {
     let (after, limit) = validate_fleet_events_query(query)?;
     let run_id = FleetRunId::from(run_id);
+    // Subscribe before the initial load so no append between the load and the
+    // first wait is missed for longer than the fallback poll (#6211 R7b).
+    let appends = subscribe_fleet_ledger_appends(&fleet_ledger_path(&state.workspace));
     let initial = load_fleet_event_replay(state.clone(), run_id.clone(), after.clone(), limit)
         .await
         .map_err(map_fleet_replay_error)?;
-    let event_stream = replay_live_fleet_events(state, run_id, after, limit, initial);
+    let event_stream = replay_live_fleet_events(state, run_id, after, limit, initial, appends);
     Ok(Sse::new(event_stream).keep_alive(
         KeepAlive::new()
             .interval(Duration::from_secs(15))
@@ -2115,12 +2296,18 @@ async fn stream_fleet_events(
     ))
 }
 
+/// Fallback re-poll when no ledger-append wake arrives. Wakes cover every
+/// in-process append; the fallback heals missed wakes, out-of-process
+/// writers, and ledger compaction, which replaces rather than appends.
+const FLEET_SSE_FALLBACK_POLL: Duration = Duration::from_secs(5);
+
 fn replay_live_fleet_events(
     state: RuntimeApiState,
     run_id: FleetRunId,
     mut after: Option<String>,
     limit: usize,
     initial: FleetEventReplay,
+    appends: std::sync::Arc<tokio::sync::Notify>,
 ) -> impl futures_util::Stream<Item = Result<SseEvent, Infallible>> {
     stream! {
         let mut page = initial;
@@ -2139,7 +2326,14 @@ fn replay_live_fleet_events(
                 yield Ok(fleet_sse_event(&event));
             }
             if !page.has_more {
-                tokio::time::sleep(Duration::from_millis(250)).await;
+                // Register interest before yielding to the runtime so an
+                // append racing this wait still wakes us (#6211 R7b).
+                let notified = appends.notified();
+                tokio::pin!(notified);
+                tokio::select! {
+                    _ = &mut notified => {}
+                    _ = tokio::time::sleep(FLEET_SSE_FALLBACK_POLL) => {}
+                }
             }
             match load_fleet_event_replay(
                 state.clone(),
@@ -2851,6 +3045,120 @@ fn fleet_event_label(payload: &FleetWorkerEventPayload) -> String {
     }
 }
 
+/// One entry in the served slash-command catalog (`GET /v1/commands`, #6178).
+///
+/// Clients use this to complete and validate input without duplicating the
+/// registry: a `binding: "host"` row must never be submitted as a model
+/// prompt, and a user command shadowing a builtin name wins that spelling.
+#[derive(Debug, Serialize)]
+struct CommandCatalogEntry {
+    name: String,
+    aliases: Vec<String>,
+    /// English source text; localizing is the client's surface.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    summary: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    usage: Option<String>,
+    /// Literal verbs declared by the usage line (`/goal <block|complete|…>`).
+    subcommands: Vec<String>,
+    takes_arguments: bool,
+    /// `builtin` is registered code; `user` expands a stored template.
+    kind: &'static str,
+    /// `host` runs locally and never reaches the model; `prompt` expands into
+    /// the request the model sees.
+    binding: &'static str,
+    /// `primary` | `advanced` | `compatibility` — builtins only; `hidden`
+    /// covers rows the product does not advertise anywhere.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    discovery: Option<&'static str>,
+    hidden: bool,
+    /// User command holding this builtin's canonical name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    shadowed_by: Option<String>,
+    /// Alias spellings of this builtin taken by user commands.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    shadowed_aliases: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct CommandsResponse {
+    commands: Vec<CommandCatalogEntry>,
+}
+
+fn command_catalog(
+    user_commands: &crate::commands::user_registry::UserCommandRegistry,
+) -> Vec<CommandCatalogEntry> {
+    let mut commands = Vec::new();
+    for info in crate::commands::command_infos() {
+        let shadowed_by = user_commands
+            .get(info.name)
+            .map(|command| command.name.clone());
+        let shadowed_aliases = info
+            .aliases
+            .iter()
+            .filter(|alias| user_commands.get(alias).is_some())
+            .map(|alias| (*alias).to_string())
+            .collect();
+        commands.push(CommandCatalogEntry {
+            name: info.name.to_string(),
+            aliases: info
+                .aliases
+                .iter()
+                .map(|alias| (*alias).to_string())
+                .collect(),
+            summary: Some(
+                info.description_for(codewhale_localization::Locale::En)
+                    .into_owned(),
+            ),
+            usage: Some(info.usage.to_string()),
+            subcommands: crate::commands::traits::usage_subcommands(info.usage)
+                .iter()
+                .map(|token| (*token).to_string())
+                .collect(),
+            takes_arguments: crate::commands::user_registry::usage_describes_arguments(
+                info.name, info.usage,
+            ),
+            kind: "builtin",
+            binding: "host",
+            discovery: Some(match info.discovery() {
+                crate::commands::traits::CommandDiscovery::Primary => "primary",
+                crate::commands::traits::CommandDiscovery::Advanced => "advanced",
+                crate::commands::traits::CommandDiscovery::Compatibility => "compatibility",
+            }),
+            hidden: crate::commands::traits::UNLISTED_COMMANDS.contains(&info.name),
+            shadowed_by,
+            shadowed_aliases,
+        });
+    }
+    for command in user_commands.iter() {
+        commands.push(CommandCatalogEntry {
+            name: command.name.clone(),
+            aliases: command.aliases.clone(),
+            summary: command.description.clone(),
+            usage: command.display_usage().map(str::to_string),
+            subcommands: Vec::new(),
+            takes_arguments: command.takes_arguments(),
+            kind: "user",
+            binding: "prompt",
+            discovery: None,
+            hidden: command.hidden,
+            shadowed_by: None,
+            shadowed_aliases: Vec::new(),
+        });
+    }
+    commands
+}
+
+async fn list_commands(
+    State(state): State<RuntimeApiState>,
+) -> Result<Json<CommandsResponse>, ApiError> {
+    let commands = crate::commands::user_registry::with_registry_for_workspace(
+        Some(state.workspace.as_path()),
+        command_catalog,
+    );
+    Ok(Json(CommandsResponse { commands }))
+}
+
 async fn list_skills(
     State(state): State<RuntimeApiState>,
 ) -> Result<Json<SkillsResponse>, ApiError> {
@@ -3368,6 +3676,98 @@ async fn audit_skill_api(
         ambiguous,
         skills: entries,
     }))
+}
+
+#[derive(Debug, Deserialize)]
+struct ApprovalsQuery {
+    limit: Option<usize>,
+}
+
+/// One row of the account-wide approval history: what the agent asked
+/// permission to do and what was decided. `decided_at` is `None` while the
+/// ask is still pending.
+#[derive(Debug, Serialize)]
+struct ApprovalHistoryRow {
+    approval_id: String,
+    tool_name: String,
+    outcome: String,
+    asked_at: chrono::DateTime<Utc>,
+    decided_at: Option<chrono::DateTime<Utc>>,
+}
+
+fn approval_outcome_label(outcome: &crate::approval_log::ApprovalOutcome) -> &'static str {
+    use crate::approval_log::ApprovalOutcome;
+    match outcome {
+        ApprovalOutcome::ApprovedOnce => "allowed_once",
+        ApprovalOutcome::Denied => "denied",
+        ApprovalOutcome::Timeout => "timeout",
+        ApprovalOutcome::Cancelled => "cancelled",
+        ApprovalOutcome::Unavailable => "unavailable",
+        ApprovalOutcome::RetryWithPolicy { .. } => "retry_with_policy",
+    }
+}
+
+/// Flatten one session's replay into history rows, newest ask first. Pending
+/// asks sort by asked time alongside decided rows — they are the newest
+/// entries while live, and sink into place once decided.
+fn approval_history_rows(replay: &crate::approval_log::ApprovalReplay) -> Vec<ApprovalHistoryRow> {
+    let mut rows: Vec<ApprovalHistoryRow> = replay
+        .completed
+        .iter()
+        .map(|completed| {
+            let asked_at = completed.ask.created_at();
+            ApprovalHistoryRow {
+                approval_id: completed.ask.approval_id().to_string(),
+                tool_name: completed.ask.tool_name().unwrap_or("unknown").to_string(),
+                outcome: approval_outcome_label(&completed.outcome).to_string(),
+                asked_at,
+                decided_at: Some(completed.decided_at),
+            }
+        })
+        .chain(replay.unmatched_asks.iter().map(|ask| ApprovalHistoryRow {
+            approval_id: ask.approval_id().to_string(),
+            tool_name: ask.tool_name().unwrap_or("unknown").to_string(),
+            outcome: "pending".to_string(),
+            asked_at: ask.created_at(),
+            decided_at: None,
+        }))
+        .collect();
+    rows.sort_by_key(|row| std::cmp::Reverse(row.asked_at));
+    rows
+}
+
+/// `GET /v1/approvals` — the read-only history behind the approvals log:
+/// every decided approval plus every still-pending ask, newest first, across
+/// all sessions. A corrupt session log is skipped with a warning, never a
+/// 500 for the whole history; the warn names the file to inspect (#5931).
+async fn list_approvals(
+    State(state): State<RuntimeApiState>,
+    Query(query): Query<ApprovalsQuery>,
+) -> Result<Json<Vec<ApprovalHistoryRow>>, ApiError> {
+    let limit = query.limit.unwrap_or(100).clamp(1, 500);
+    let sessions_dir = state.sessions_dir.clone();
+    let mut rows = tokio::task::spawn_blocking(move || {
+        let store = crate::approval_log::ApprovalReceiptStore::new(sessions_dir);
+        let mut rows = Vec::new();
+        for session_id in store.sessions_with_logs() {
+            match store.replay(&session_id) {
+                Ok(replay) => rows.extend(approval_history_rows(&replay)),
+                Err(error) => tracing::warn!(
+                    target: "approval",
+                    error_kind = ?error.kind(),
+                    %error,
+                    session_id,
+                    "skipping unreadable approval log in history listing",
+                ),
+            }
+        }
+        rows
+    })
+    .await
+    .map_err(|error| ApiError::internal(format!("approval history read failed: {error}")))?;
+    rows.sort_by_key(|row| std::cmp::Reverse(row.asked_at));
+    rows.truncate(limit);
+    Ok(Json(rows))
 }
 
 async fn decide_approval(
@@ -4487,104 +4887,179 @@ async fn patch_undo_thread_turn(
     Json(req): Json<UndoTurnRequest>,
 ) -> Result<(StatusCode, Json<PatchUndoResponse>), ApiError> {
     let depth = req.depth.unwrap_or(0);
-
-    // Step 1: Try snapshot-based file rollback (patch_undo).
-    let thread = state
+    // Admission first, then the thread record under it: trust, session
+    // binding and workspace are the values that hold while files change.
+    // Active turns in an overlapping workspace are rejected (409). The wait
+    // for admission stays on the request so a client that gives up while
+    // queued cancels its undo instead of leaving it queued behind the next
+    // one and walking the workspace back twice.
+    let (reservation, thread) = state
         .runtime_threads
-        .get_thread(&id)
+        .thread_restore_guard(&id)
         .await
         .map_err(map_thread_err)?;
-    let patch_result = patch_undo_workspace_files(&thread.workspace, thread.session_id.as_deref());
-
-    // Step 2: Remove the last conversation turn (undo_conversation).
-    let (forked_thread, original_user_text, original_user_images, _) = state
-        .runtime_threads
-        .fork_at_user_message(&id, depth)
+    // Once admitted, own the operation even when the HTTP caller disconnects:
+    // the reservation must outlive both the file mutation and the fork
+    // publication, so a dropped connection cannot release it mid-Git.
+    tokio::spawn(async move {
+        let reservation = reservation;
+        // Validate depth/history before touching any file, so an invalid
+        // undo request cannot leave a half-applied workspace.
+        let prepared = state
+            .runtime_threads
+            .prepare_fork_at_user_message(&id, depth)
+            .await
+            .map_err(map_thread_err)?;
+        // File rollback is a workspace mutation, so it needs the trust the
+        // TUI's `/undo` requires. Read from the thread's own record: the
+        // client does not get to assert it.
+        let trusted = thread.trust_mode || thread.auto_approve;
+        let workspace = thread.workspace.clone();
+        let session_id = thread.session_id.clone();
+        // Step 1: snapshot-based file rollback. The `?` is deliberate: a
+        // refusal or a failed restore aborts *before* the conversation is
+        // forked, so the turn never disappears while its file changes stay.
+        let patch_result = tokio::task::spawn_blocking(move || {
+            patch_undo_workspace_files(&workspace, session_id.as_deref(), trusted)
+        })
         .await
-        .map_err(map_thread_err)?;
-
-    Ok((
-        StatusCode::CREATED,
-        Json(PatchUndoResponse {
-            patch_result,
-            thread: forked_thread,
-            original_user_text,
-            original_user_images,
-        }),
-    ))
+        .map_err(|e| ApiError::internal(format!("Patch undo task failed: {e}")))??;
+        // Step 2: publish the already-validated fork.
+        let (forked_thread, original_user_text, original_user_images, _) = state
+            .runtime_threads
+            .publish_prepared_fork(prepared)
+            .await
+            .map_err(|error| {
+                if patch_result.files_restored {
+                    ApiError::internal(format!(
+                        "Workspace files were restored from snapshot {}, but the conversation fork could not be saved: {error}. The original thread still holds the undone turn; the `pre-restore:` safety snapshot holds the files as they were before this undo.",
+                        patch_result
+                            .snapshot_label
+                            .as_deref()
+                            .unwrap_or("(unknown)")
+                    ))
+                } else {
+                    map_thread_err(error)
+                }
+            })?;
+        drop(reservation);
+        Ok((
+            StatusCode::CREATED,
+            Json(PatchUndoResponse {
+                patch_result,
+                thread: forked_thread,
+                original_user_text,
+                original_user_images,
+            }),
+        ))
+    })
+    .await
+    .map_err(|e| ApiError::internal(format!("Patch undo task failed: {e}")))?
 }
 
 /// Restore the newest `tool:` or `pre-turn:` snapshot that differs from the
 /// current workspace — same target selection as the TUI's `patch_undo`.
+///
+/// # The rollback contract
+///
+/// `Ok` is a decision the conversation fork may proceed on: either the files
+/// were restored, or there was *provably* nothing to restore. `Err` aborts the
+/// whole undo, and the caller must not fork either — dropping the turn while
+/// leaving its file changes on disk hands the user a workspace the transcript
+/// can no longer account for, which is worse than refusing outright.
+///
+/// `trusted` mirrors the gate the TUI's `patch_undo()` applies
+/// (`yolo || trust_mode`). It is evaluated *after* a real target is found, so
+/// that "there was nothing to revert" still undoes the conversation, while
+/// "there is something to revert but you are not trusted" aborts.
 fn patch_undo_workspace_files(
     workspace: &FsPath,
     current_session_id: Option<&str>,
-) -> PatchUndoResult {
-    let repo = match crate::snapshot::SnapshotRepo::open_or_init(workspace) {
-        Ok(repo) => repo,
-        Err(e) => {
-            return PatchUndoResult {
-                files_restored: false,
-                summary: Some(format!("Snapshot repo unavailable: {e}")),
-                snapshot_label: None,
-            };
-        }
-    };
+    trusted: bool,
+) -> Result<PatchUndoResult, ApiError> {
+    // An unreadable workspace directory (unmounted volume, disconnected
+    // share, permissions) proves nothing about the files a turn changed, so
+    // the conversation is not forked away from them. Every repository
+    // failure is operational and aborts for the same reason: "no snapshots"
+    // cannot be proven while Git is unavailable.
+    if !workspace.is_dir() {
+        return Err(ApiError::conflict(format!(
+            "Workspace directory {} is not available; mount or restore it before undoing files, or use /undo for a conversation-only undo.",
+            workspace.display()
+        )));
+    }
+    let repo = crate::snapshot::SnapshotRepo::open_or_init(workspace).map_err(|e| {
+        ApiError::internal(format!(
+            "Snapshot repo unavailable; conversation preserved: {e}"
+        ))
+    })?;
     let Some(current_session_id) = current_session_id else {
-        return PatchUndoResult {
+        return Ok(PatchUndoResult {
             files_restored: false,
             summary: Some(
                 "No current session is bound to this thread; workspace files were not changed."
                     .to_string(),
             ),
             snapshot_label: None,
-        };
+        });
     };
-    let snapshots = match repo.list(100) {
-        Ok(snapshots) => snapshots,
-        Err(e) => {
-            return PatchUndoResult {
-                files_restored: false,
-                summary: Some(format!("Failed to list snapshots: {e}")),
-                snapshot_label: None,
-            };
-        }
-    };
-    let target = snapshots
+    let snapshots = repo
+        .list(100)
+        .map_err(|e| ApiError::internal(format!("Failed to list snapshots: {e}")))?;
+    let mut target = None;
+    for snapshot in snapshots
         .iter()
         .filter(|s| s.label.starts_with("tool:") || s.label.starts_with("pre-turn:"))
         .filter(|s| s.session_id.as_deref() == Some(current_session_id))
-        .find(|s| matches!(repo.work_tree_matches_snapshot(&s.id), Ok(false)));
+    {
+        if !repo.work_tree_matches_snapshot(&snapshot.id).map_err(|e| {
+            ApiError::internal(format!(
+                "Failed to compare snapshot; conversation preserved: {e}"
+            ))
+        })? {
+            target = Some(snapshot);
+            break;
+        }
+    }
     let Some(target) = target else {
-        return PatchUndoResult {
+        return Ok(PatchUndoResult {
             files_restored: false,
             summary: Some(
                 "No current-session tool or pre-turn snapshots differ from the current workspace."
                     .to_string(),
             ),
             snapshot_label: None,
-        };
+        });
     };
-    if let Err(e) = repo.restore(&target.id) {
-        return PatchUndoResult {
-            files_restored: false,
-            summary: Some(format!("Restore failed: {e}")),
-            snapshot_label: None,
-        };
+
+    // Restoring is a workspace mutation. Gate it exactly where the TUI gates
+    // it — after a real, current-session target is known — so the two surfaces
+    // cannot drift into "one refuses, the other half-undoes".
+    if !trusted {
+        return Err(ApiError::conflict(
+            "Refusing to undo workspace files outside trusted mode. \
+             Turn on /trust or switch this thread to Full Access, then undo again.",
+        ));
     }
 
-    // Compute a diff stat for the summary.
-    use crate::dependencies::{ExternalTool as _, Git};
-    let diff_stat = Git::command().and_then(|mut git| {
-        git.args(["diff", "--stat"])
-            .current_dir(workspace)
-            .output()
-            .ok()
-            .and_then(|o| {
-                let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
-                if s.is_empty() { None } else { Some(s) }
-            })
-    });
+    // Capture what this restore is about to change *before* it runs: after the
+    // checkout the work tree matches the snapshot, so a post-restore stat would
+    // always be empty. Runs against the side repo, not the user's — the user's
+    // `git diff --stat` reports their own uncommitted work, which is not what
+    // the undo changed.
+    let diff_stat = match repo.snapshot_diff_stat(&target.id) {
+        Ok(stat) => stat,
+        Err(e) => {
+            tracing::warn!(
+                target: "snapshot",
+                "diff stat for the patch-undo summary failed: {e}"
+            );
+            None
+        }
+    };
+
+    repo.restore(&target.id)
+        .map_err(|e| ApiError::internal(format!("Restore failed: {e}")))?;
 
     let short = &target.id.as_str()[..target.id.as_str().len().min(8)];
     let summary = match diff_stat {
@@ -4593,14 +5068,191 @@ fn patch_undo_workspace_files(
             target.label, short
         ),
         None => format!(
-            "Restored snapshot '{}' ({}). No diff changes detected.",
+            "Restored snapshot '{}' ({}). No diff stat available.",
             target.label, short
         ),
     };
-    PatchUndoResult {
+    Ok(PatchUndoResult {
         files_restored: true,
         summary: Some(summary),
         snapshot_label: Some(target.label.clone()),
+    })
+}
+
+#[derive(Debug, Deserialize)]
+struct RevertThreadFileRequest {
+    /// The single file to restore, relative to the thread's workspace.
+    /// Absolute paths inside the workspace are accepted and normalized.
+    path: String,
+    /// Exact pre-tool/pre-turn snapshot from the change the user selected.
+    snapshot_id: String,
+    /// SHA-256 of the bytes reviewed by the client, or `absent` for deletion.
+    expected_hash: String,
+}
+
+#[derive(Debug, Serialize)]
+struct RevertThreadFileResponse {
+    /// Workspace-relative path that was restored.
+    path: String,
+    /// What the restore did to the working tree: `modified`, `recreated`, or
+    /// `removed`.
+    action: String,
+    /// Snapshot the file came from.
+    snapshot_id: String,
+    snapshot_label: String,
+}
+
+/// Restore one deliberately selected file revision.
+///
+/// The file-scoped counterpart of `patch-undo`. Where `patch-undo` checks out
+/// a whole snapshot tree, this restores exactly one regular file, so unrelated
+/// working-tree changes are never rolled back. The client names the exact
+/// `tool:`/`pre-turn:` snapshot from the change record it displayed and the
+/// hash of the bytes it reviewed; the server never guesses a "newest differing"
+/// snapshot, because an unrelated newer snapshot can erase later user edits.
+///
+/// Ownership follows the rule the TUI's `/undo` applies: only snapshots tagged
+/// with this thread's own session are candidates, and the thread must be in
+/// trusted mode or Full Access. Nothing to revert is a `409`, not a silent
+/// success, so the GUI can tell the user why the button did nothing.
+async fn revert_thread_file(
+    State(state): State<RuntimeApiState>,
+    Path(id): Path<String>,
+    Json(req): Json<RevertThreadFileRequest>,
+) -> Result<Json<RevertThreadFileResponse>, ApiError> {
+    if !snapshot_id_is_well_formed(&req.snapshot_id) {
+        return Err(ApiError::bad_request(
+            "snapshot_id must be the exact hexadecimal id reported by GET /v1/snapshots",
+        ));
+    }
+    if !expected_hash_is_well_formed(&req.expected_hash) {
+        return Err(ApiError::bad_request(
+            "expected_hash must be `sha256:<64 lowercase hex digits>` of the reviewed file bytes, or `absent` for a file the client saw as deleted",
+        ));
+    }
+    // Admission first, then the thread record under it. Active turns in an
+    // overlapping workspace are rejected instead of raced.
+    let (reservation, thread) = state
+        .runtime_threads
+        .thread_restore_guard(&id)
+        .await
+        .map_err(map_thread_err)?;
+    if !(thread.trust_mode || thread.auto_approve) {
+        return Err(ApiError::conflict(
+            "Refusing to restore workspace files outside trusted mode. Turn on /trust or switch this thread to Full Access, then retry.",
+        ));
+    }
+    let Some(session_id) = thread.session_id else {
+        return Err(ApiError::conflict(
+            "Thread has no bound session, so no snapshot can be proven to own this file.",
+        ));
+    };
+    let workspace = thread.workspace;
+    // The worker owns the reservation: a client disconnect cannot release it
+    // while Git is still changing files. Snapshot listing, diffing and
+    // checkout all shell out to git; keep that off the async workers.
+    let response = tokio::task::spawn_blocking(move || {
+        let _reservation = reservation;
+        revert_file_from_snapshot(&workspace, &session_id, &req)
+    })
+    .await
+    .map_err(|e| ApiError::internal(format!("file restore task failed: {e}")))??;
+    Ok(Json(response))
+}
+
+fn snapshot_id_is_well_formed(id: &str) -> bool {
+    matches!(id.len(), 40 | 64) && id.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+fn expected_hash_is_well_formed(hash: &str) -> bool {
+    hash == "absent"
+        || hash.strip_prefix("sha256:").is_some_and(|digest| {
+            digest.len() == 64
+                && digest
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        })
+}
+
+fn revert_file_from_snapshot(
+    workspace: &FsPath,
+    session_id: &str,
+    req: &RevertThreadFileRequest,
+) -> Result<RevertThreadFileResponse, ApiError> {
+    // Every caller-supplied path passes through this one gate. It accepts a
+    // workspace-relative path or an absolute path inside the workspace and
+    // rejects everything else (`..`, empty, or outside the work tree). The
+    // name is used literally: brackets, spaces and glob characters are part
+    // of the filename, never a pattern.
+    let rel = crate::snapshot::workspace_relative_path(workspace, &req.path).ok_or_else(|| {
+        ApiError::bad_request(format!(
+            "path must name a regular file inside the thread workspace {}; got '{}'",
+            workspace.display(),
+            req.path
+        ))
+    })?;
+    if !workspace.is_dir() {
+        return Err(ApiError::conflict(format!(
+            "Workspace directory {} is not available; mount or restore it before restoring files.",
+            workspace.display()
+        )));
+    }
+    let repo = crate::snapshot::SnapshotRepo::open_or_init(workspace)
+        .map_err(|e| ApiError::internal(format!("Snapshot repo unavailable: {e}")))?;
+    repo.validate_restore_file(&rel)
+        .map_err(map_file_restore_err)?;
+    let snapshots = repo
+        .list(usize::MAX)
+        .map_err(|e| ApiError::internal(format!("Failed to list snapshots: {e}")))?;
+    // Exact identity only: the snapshot must exist, be owned by this thread's
+    // session and be a tool/pre-turn restore point. A stale or foreign id is
+    // a conflict the client resolves by refreshing its change record.
+    let target = snapshots
+        .iter()
+        .find(|snapshot| {
+            snapshot.id.as_str() == req.snapshot_id
+                && snapshot.session_id.as_deref() == Some(session_id)
+                && (snapshot.label.starts_with("tool:")
+                    || snapshot.label.starts_with("pre-turn:"))
+        })
+        .ok_or_else(|| {
+            ApiError::conflict(
+                "Selected restore point is unavailable or belongs to another session; refresh the change record and select the change again.",
+            )
+        })?;
+
+    if !repo
+        .path_differs_from_snapshot(&target.id, &rel)
+        .map_err(map_file_restore_err)?
+    {
+        return Err(ApiError::conflict(format!(
+            "'{}' already matches snapshot '{}'; nothing to revert.",
+            rel.display(),
+            target.label
+        )));
+    }
+    let outcomes = repo
+        .restore_file_if_unchanged(&target.id, &rel, &req.expected_hash)
+        .map_err(map_file_restore_err)?;
+    let outcome = outcomes
+        .into_iter()
+        .next()
+        .ok_or_else(|| ApiError::conflict("Nothing was restored."))?;
+    Ok(RevertThreadFileResponse {
+        path: outcome.path.to_string_lossy().into_owned(),
+        action: outcome.action.as_str().to_string(),
+        snapshot_id: target.id.as_str().to_string(),
+        snapshot_label: target.label.clone(),
+    })
+}
+
+fn map_file_restore_err(error: std::io::Error) -> ApiError {
+    if error.kind() == std::io::ErrorKind::InvalidInput {
+        ApiError::bad_request(error.to_string())
+    } else if error.kind() == std::io::ErrorKind::WouldBlock {
+        ApiError::conflict(error.to_string())
+    } else {
+        ApiError::internal(format!("File restore failed: {error}"))
     }
 }
 
@@ -4788,6 +5440,23 @@ async fn mark_agent_mail_read(
     let envelope = state
         .runtime_threads
         .mark_agent_mail_read(&id, &message_id)
+        .await
+        .map_err(map_agent_mail_err)?;
+    Ok(Json(envelope))
+}
+
+/// Withdraw a queued envelope before delivery (#6176). Idempotent: a
+/// re-cancel returns the stored envelope; mail that already left `queued`
+/// is a 409, never silently dropped.
+async fn cancel_agent_mail(
+    State(state): State<RuntimeApiState>,
+    Path((id, message_id)): Path<(String, String)>,
+) -> Result<Json<AgentMailEnvelope>, ApiError> {
+    let message_id = AgentMailMessageId::parse(message_id)
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    let envelope = state
+        .runtime_threads
+        .cancel_agent_mail(&id, &message_id)
         .await
         .map_err(map_agent_mail_err)?;
     Ok(Json(envelope))
@@ -5140,7 +5809,7 @@ async fn stream_thread_events(
     State(state): State<RuntimeApiState>,
     Path(id): Path<String>,
     Query(query): Query<ThreadEventsQuery>,
-) -> Result<Sse<impl futures_util::Stream<Item = Result<SseEvent, Infallible>>>, ApiError> {
+) -> Result<Response, ApiError> {
     let _ = state
         .runtime_threads
         .get_thread(&id)
@@ -5171,13 +5840,32 @@ async fn stream_thread_events(
         replay.base_seq,
         replay.batches,
         live,
+        query.progress,
     );
 
-    Ok(Sse::new(stream).keep_alive(
-        KeepAlive::new()
-            .interval(Duration::from_secs(15))
-            .text("keepalive"),
-    ))
+    let mut response = Sse::new(stream)
+        .keep_alive(
+            KeepAlive::new()
+                .interval(Duration::from_secs(15))
+                .text("keepalive"),
+        )
+        .into_response();
+    if query.progress {
+        response
+            .headers_mut()
+            .insert("x-codewhale-event-progress", HeaderValue::from_static("1"));
+    }
+    Ok(response)
+}
+
+fn thread_stream_progress(thread_id: &str, seq: u64, live: bool) -> SseEvent {
+    sse_json(
+        "stream.progress",
+        json!({
+            "event": "stream.progress", "thread_id": thread_id, "seq": seq,
+            "state": if live { "live" } else { "replaying" },
+        }),
+    )
 }
 
 fn replay_live_thread_events(
@@ -5188,8 +5876,10 @@ fn replay_live_thread_events(
         std::result::Result<Vec<crate::runtime_threads::RuntimeEventRecord>, String>,
     >,
     mut live: tokio::sync::broadcast::Receiver<crate::runtime_threads::RuntimeEventRecord>,
+    progress: bool,
 ) -> impl futures_util::Stream<Item = Result<SseEvent, Infallible>> {
     stream! {
+        if progress { yield Ok(thread_stream_progress(&thread_id, last_seq, false)); }
         while let Some(batch) = backlog.recv().await {
             let events = match batch {
                 Ok(events) => events,
@@ -5217,8 +5907,26 @@ fn replay_live_thread_events(
             }
         }
 
+        // Backlog completion alone is insufficient: a request may have been
+        // answered while history was read. Drain the already-queued live tail
+        // before declaring the observation current. These opt-in frames carry
+        // transport progress, never new journal events or sequence numbers.
+        let mut replaying = progress;
         'live: loop {
-            match live.recv().await {
+            let next = if replaying {
+                use tokio::sync::broadcast::error::{RecvError, TryRecvError};
+                match live.try_recv() {
+                    Ok(event) => Ok(event),
+                    Err(TryRecvError::Empty) => {
+                        yield Ok(thread_stream_progress(&thread_id, last_seq, true));
+                        replaying = false;
+                        continue;
+                    }
+                    Err(TryRecvError::Lagged(skipped)) => Err(RecvError::Lagged(skipped)),
+                    Err(TryRecvError::Closed) => Err(RecvError::Closed),
+                }
+            } else { live.recv().await };
+            match next {
                 Ok(event) => {
                     if event.thread_id != thread_id || event.seq <= last_seq {
                         continue;
@@ -5232,6 +5940,10 @@ fn replay_live_thread_events(
                     ));
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                    if progress {
+                        yield Ok(thread_stream_progress(&thread_id, last_seq, false));
+                        replaying = true;
+                    }
                     // Broadcast is only a wake-up path; durable history remains
                     // authoritative. Catch up from the last delivered cursor so
                     // receiver pressure cannot turn into a silent prompt loss.
@@ -5986,7 +6698,23 @@ async fn restore_snapshot(
     State(state): State<RuntimeApiState>,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
-    restore_snapshot_for_workspace(&state.workspace, &id)?;
+    if !snapshot_id_is_well_formed(&id) {
+        return Err(ApiError::bad_request(
+            "snapshot id must be the exact hexadecimal id reported by GET /v1/snapshots",
+        ));
+    }
+    let reservation = state
+        .runtime_threads
+        .workspace_restore_guard(&state.workspace)
+        .await
+        .map_err(map_thread_err)?;
+    let restored_id = id.clone();
+    tokio::task::spawn_blocking(move || {
+        let _reservation = reservation;
+        restore_snapshot_for_workspace(&state.workspace, &restored_id)
+    })
+    .await
+    .map_err(|e| ApiError::internal(format!("Restore task failed: {e}")))??;
     Ok(Json(json!({
         "restored": id,
     })))
@@ -6065,6 +6793,24 @@ struct ProviderEntry {
     /// variable, consent-source, or token metadata.
     #[serde(rename = "credentialState")]
     credential_state: ProviderCredentialState,
+    /// Which *class* of source owns this route's credential (#6179). A class,
+    /// never a value, a path, or an environment variable name — the guarantee
+    /// above still holds. Clients need it to tell "you have no key" apart from
+    /// "your key is owned elsewhere and this control cannot change it".
+    #[serde(rename = "credentialSource")]
+    credential_source: secrets::ProviderCredentialSource,
+    /// Whether `PUT`/`DELETE /v1/providers/{id}/key` will act on this route.
+    /// False means the write would be refused, so the control should be
+    /// disabled rather than allowed to fail late.
+    #[serde(rename = "credentialWritable")]
+    credential_writable: bool,
+    /// Why a write is refused, as user-facing copy. Present only when
+    /// `credentialWritable` is false.
+    #[serde(
+        rename = "credentialWritableReason",
+        skip_serializing_if = "Option::is_none"
+    )]
+    credential_writable_reason: Option<&'static str>,
 }
 
 /// Stable, non-secret wire projection of provider readiness.
@@ -6639,6 +7385,7 @@ async fn list_providers(
             &base_url,
         )
         .is_empty();
+        let writeability = secrets::credential_writeability(&config, api_provider);
         providers.push(ProviderEntry {
             id: api_provider.as_str().to_string(),
             model_provider_id: (api_provider == active_provider)
@@ -6652,6 +7399,9 @@ async fn list_providers(
                 api_provider,
             )
             .into(),
+            credential_source: writeability.source,
+            credential_writable: writeability.writable,
+            credential_writable_reason: writeability.reason,
         });
     }
     Ok(Json(ProvidersResponse { current, providers }))
@@ -6932,6 +7682,9 @@ struct GuiConfigResponse {
     strict_tool_mode: bool,
     memory_enabled: bool,
     search_provider: String,
+    /// How `search_provider` was chosen: `default` / `config` /
+    /// `env override` / `tavily key`. Runtime-only — never persisted.
+    search_provider_source: String,
     prompt_suggestion: bool,
     /// Effective device settings, using the same leaf vocabulary as CLI/TUI.
     notifications: std::collections::BTreeMap<String, String>,
@@ -7045,6 +7798,11 @@ async fn get_config(
         strict_tool_mode: config.strict_tool_mode.unwrap_or(false),
         memory_enabled: config.memory_enabled(),
         search_provider: config.search_provider().as_str().to_string(),
+        search_provider_source: config
+            .search_provider_resolution()
+            .source
+            .as_str()
+            .to_string(),
         prompt_suggestion: config.prompt_suggestion_enabled(),
         notifications: codewhale_config::notifications::NotificationSetting::ALL
             .into_iter()
@@ -7297,6 +8055,34 @@ async fn set_config(
             }
             "search_provider" => {
                 let normalized = value.to_lowercase();
+                // GET returns the *resolved* provider. A settings save that
+                // round-trips that value must not turn autodetect (or the
+                // Firecrawl default) into a disk pin — `provider = "firecrawl"`
+                // would flip the source to `config` and permanently block a
+                // later Tavily key. A POST that differs from the resolved
+                // provider is an explicit change and still persists.
+                let resolution = state.config.read().search_provider_resolution();
+                let posted = crate::config::SearchProvider::parse(&normalized);
+                if posted == Some(resolution.provider)
+                    && matches!(
+                        resolution.source,
+                        crate::config::SearchProviderSource::Default
+                            | crate::config::SearchProviderSource::TavilyKey
+                    )
+                {
+                    return Ok(Json(SetConfigResponse {
+                        key,
+                        value,
+                        message: format!(
+                            "Config not persisted: '{}' is the resolved {} (source: {}), not a pin. Set a different provider, or pin it in config.toml.",
+                            normalized,
+                            resolution.provider.as_str(),
+                            resolution.source.as_str()
+                        ),
+                        persisted: false,
+                        requires_reload: true,
+                    }));
+                }
                 config_persistence::persist_table_string_key(
                     config_path,
                     "search",
@@ -7313,9 +8099,18 @@ async fn set_config(
                 config_persistence::persist_root_bool_key(config_path, "prompt_suggestion", enabled)
             }
             _ => {
-                return Err(ApiError::bad_request(format!(
-                    "Unknown config key '{key}'. Supported keys: model, default_model, reasoning_effort, approval_mode, base_url, provider, provider_url, cost_currency, default_mode, auto_compact, allow_shell, mcp_config_path, show_thinking, thinking_default_expanded, thinking_highlight, show_tool_details, inline_diffs, locale, max_history, calm_mode, workspace_follow_symlinks, subagents_enabled, subagents_max_depth, sandbox_mode, strict_tool_mode, memory_enabled, search_provider, prompt_suggestion"
-                )));
+                // Every other declared settings.toml key persists through the
+                // shared validator rather than a curated list — the schema
+                // route advertises them, so a known setting must not die
+                // here. Unknown keys still 400 through `Settings::set`.
+                persist_runtime_tui_setting(&key, &value)?;
+                return Ok(Json(SetConfigResponse {
+                    key,
+                    value,
+                    message: "Config persisted. Call /v1/config/reload to apply.".to_string(),
+                    persisted: true,
+                    requires_reload,
+                }));
             }
         };
 
@@ -7337,6 +8132,411 @@ async fn set_config(
         persisted: persist,
         requires_reload,
     }))
+}
+
+/// `GET /v1/settings/schema` — the Engine-declared settings surface.
+///
+/// `codewhale_config::SETTINGS_SCHEMA` is the single declaration table: one
+/// entry per setting with kind, closed value set, default, and placement.
+/// This route projects it for HTTP clients — current values resolved from
+/// the owning store (settings.toml via [`crate::settings::Settings`],
+/// config.toml, or the notifications table), labels and descriptions
+/// resolved through the locale pack. Writes stay on `POST /v1/config`;
+/// this route never invents a value, an option, or a validator.
+#[derive(Debug, Serialize)]
+struct SettingsSchemaResponse {
+    /// Payload version. Additive fields may appear without a bump; clients
+    /// must ignore fields and `kind`/`row` values they do not know.
+    version: u32,
+    tabs: Vec<SettingsSchemaTab>,
+    settings: Vec<SettingsSchemaRow>,
+}
+
+#[derive(Debug, Serialize)]
+struct SettingsSchemaTab {
+    id: String,
+    /// Humanized tab id — tab labels have no message keys in the schema.
+    label: String,
+}
+
+#[derive(Debug, Serialize)]
+struct SettingsSchemaRow {
+    key: &'static str,
+    /// `bool` | `int` | `enum` | `string`. Unknown kinds degrade to a text
+    /// field on the client; writes still validate server-side.
+    kind: &'static str,
+    tab: &'static str,
+    group: &'static str,
+    label: String,
+    description: String,
+    default: &'static str,
+    /// `setting` | `action` | `diagnostic` | `session` — from
+    /// [`codewhale_config::SettingRowKind`].
+    row: &'static str,
+    /// Current value in written-to-disk string form, when a store resolves
+    /// it. Absent for actions, unresolvable diagnostics, and session rows
+    /// the headless runtime cannot read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    value: Option<String>,
+    /// Whether the value is a persisted user choice rather than an
+    /// inherited default. Absent where no store can prove either way.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    persisted: Option<bool>,
+    /// Whether a generic client may offer a write control. Action,
+    /// diagnostic and session rows are never editable through this surface;
+    /// conditional rows (managed policy wins) report false.
+    editable: bool,
+    /// False for the hidden member of a conditional pair — e.g. a
+    /// `managed_*` row when no managed policy applies, or `base_url` when
+    /// the active route reads `provider_url`. Clients should not render
+    /// invisible rows.
+    visible: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    options: Vec<SettingsSchemaOption>,
+}
+
+#[derive(Debug, Serialize)]
+struct SettingsSchemaOption {
+    value: &'static str,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    label: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    description: String,
+}
+
+/// "Turn a schema key or tab id into a title-case label" — the same
+/// humanization the TUI applies to rows declared without a label message.
+fn humanize_schema_key(key: &str) -> String {
+    key.split(['.', '_', '-'])
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            let mut chars = part.chars();
+            let Some(first) = chars.next() else {
+                return String::new();
+            };
+            let mut word = first.to_uppercase().collect::<String>();
+            word.push_str(chars.as_str());
+            word
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// config.toml-owned keys `POST /v1/config` persists through curated arms.
+/// Kept beside `set_config`'s match: a schema Setting row outside this list
+/// and outside `Settings` has no write path and reports `editable: false`.
+const RUNTIME_CONFIG_KEYS: &[&str] = &[
+    "model",
+    "default_model",
+    "reasoning_effort",
+    "approval_mode",
+    "approval_policy",
+    "base_url",
+    "provider",
+    "provider_url",
+    "provider_base_url",
+    "cost_currency",
+    "max_history",
+    "allow_shell",
+    "mcp_config_path",
+    "subagents_enabled",
+    "subagents_max_depth",
+    "sandbox_mode",
+    "strict_tool_mode",
+    "memory_enabled",
+    "search_provider",
+    "prompt_suggestion",
+];
+
+/// A dotted-path lookup over a TOML document — used to decide `persisted`
+/// for config.toml-owned rows without trusting a decorated display string.
+fn toml_value_at_path<'a>(document: &'a toml::Value, segments: &[&str]) -> Option<&'a toml::Value> {
+    let mut current = document;
+    for segment in segments {
+        current = current.as_table()?.get(*segment)?;
+    }
+    Some(current)
+}
+
+async fn get_settings_schema(
+    State(state): State<RuntimeApiState>,
+) -> Result<Json<SettingsSchemaResponse>, ApiError> {
+    use codewhale_config::notifications::NotificationSetting;
+    use codewhale_config::settings_schema::{
+        SettingKind, SettingRowKind, schema_rows, schema_tabs,
+    };
+    use codewhale_localization::{MessageId, resolve_locale, tr, tr_key};
+
+    let config = state.config.read().clone();
+    let settings = crate::settings::Settings::load_persisted().unwrap_or_default();
+    let locale = resolve_locale(&settings.locale);
+    let notifications = config.notifications_config();
+
+    // Conditional pairs share the TUI's rule: exactly one member is shown,
+    // chosen by which store or policy owns the fact right now.
+    let permission_control = config.approval_policy_control(
+        state.config_path.as_deref(),
+        state.config_profile.as_deref(),
+        &state.workspace,
+    );
+    let shell_control = config.allow_shell_control(
+        state.config_path.as_deref(),
+        state.config_profile.as_deref(),
+        &state.workspace,
+    );
+    let base_url_row_key = match config.api_provider() {
+        ApiProvider::Deepseek | ApiProvider::DeepseekCN => "base_url",
+        _ => "provider_url",
+    };
+    let visible = |key: &str| -> bool {
+        match key {
+            "permission_posture" => matches!(
+                permission_control,
+                crate::config::ApprovalPolicyControl::Unset
+            ),
+            "approval_policy" => matches!(
+                permission_control,
+                crate::config::ApprovalPolicyControl::RootConfig
+            ),
+            "managed_approval_policy" => !matches!(
+                permission_control,
+                crate::config::ApprovalPolicyControl::Unset
+                    | crate::config::ApprovalPolicyControl::RootConfig
+            ),
+            "allow_shell" => shell_control.editable_root(),
+            "managed_allow_shell" => !shell_control.editable_root(),
+            "base_url" | "provider_url" => key == base_url_row_key,
+            _ => true,
+        }
+    };
+
+    // Raw config.toml for `persisted` on config-owned rows. A missing or
+    // unparsable file means nothing was persisted there — the live config
+    // still serves defaults through `value`.
+    let config_document = state
+        .config_path
+        .as_deref()
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .and_then(|body| toml::from_str::<toml::Value>(&body).ok());
+    let notifications_persisted = |key: &str| -> Option<bool> {
+        let setting = NotificationSetting::parse(key)?;
+        let document = config_document.as_ref()?;
+        Some(
+            toml_value_at_path(document, &setting.segments()).is_some()
+                // Legacy location the loader still honors.
+                || (matches!(setting, NotificationSetting::Condition)
+                    && toml_value_at_path(document, &["tui", "notification_condition"]).is_some()),
+        )
+    };
+
+    let tabs = schema_tabs()
+        .into_iter()
+        .map(|id| SettingsSchemaTab {
+            id: id.to_string(),
+            label: humanize_schema_key(id),
+        })
+        .collect();
+
+    let settings_rows = schema_rows()
+        .map(|def| {
+            let ui = def.ui.as_ref().expect("schema_rows filters on ui");
+            let kind = match def.kind {
+                SettingKind::Bool(_) => "bool",
+                SettingKind::Int => "int",
+                SettingKind::Float => "float",
+                SettingKind::Enum(_) => "enum",
+                SettingKind::String => "string",
+            };
+            let row = match ui.row {
+                SettingRowKind::Setting => "setting",
+                SettingRowKind::Action => "action",
+                SettingRowKind::Diagnostic => "diagnostic",
+                SettingRowKind::Session => "session",
+            };
+            let options = match def.kind {
+                SettingKind::Bool(options) | SettingKind::Enum(options) => options
+                    .iter()
+                    .map(|option| SettingsSchemaOption {
+                        value: option.value,
+                        label: if option.label.is_empty() {
+                            String::new()
+                        } else {
+                            tr_key(locale, option.label).into_owned()
+                        },
+                        description: if option.description.is_empty() {
+                            String::new()
+                        } else {
+                            tr_key(locale, option.description).into_owned()
+                        },
+                    })
+                    .collect(),
+                SettingKind::Int | SettingKind::String | SettingKind::Float => Vec::new(),
+            };
+            // Bool rows with an empty option slice carry the surface's
+            // default on/off labels — emit the bare values so clients can
+            // still build a labeled control.
+            let options = if options.is_empty() && matches!(def.kind, SettingKind::Bool(_)) {
+                vec![
+                    SettingsSchemaOption {
+                        value: "false",
+                        label: tr_key(locale, "ConfigValueOff").into_owned(),
+                        description: String::new(),
+                    },
+                    SettingsSchemaOption {
+                        value: "true",
+                        label: tr_key(locale, "ConfigValueOn").into_owned(),
+                        description: String::new(),
+                    },
+                ]
+            } else {
+                options
+            };
+
+            let notification_owned = NotificationSetting::parse(def.key).is_some();
+            // `Settings::set` is the authority on which keys settings.toml
+            // owns — including `Option` fields whose unset value serializes
+            // to nothing (e.g. permission_posture). The probe reuses the
+            // write validator on the declared default, so `editable` cannot
+            // claim a key the real write path would reject.
+            let settings_writable = crate::settings::Settings::default()
+                .set(def.key, def.default)
+                .is_ok();
+            let (value, persisted) = if notification_owned {
+                let setting = NotificationSetting::parse(def.key).expect("checked above");
+                (
+                    Some(notifications.display(setting)),
+                    notifications_persisted(def.key),
+                )
+            } else if settings_writable {
+                // Effective = the persisted value or the declared default;
+                // `is_set` says which.
+                (
+                    Some(
+                        settings
+                            .value(def.key)
+                            .unwrap_or_else(|| def.default.to_string()),
+                    ),
+                    Some(settings.is_set(def.key)),
+                )
+            } else if let Some(feature_key) = def.key.strip_prefix("features.") {
+                // Feature rows are diagnostics: the effective flag state plus
+                // whether config.toml names the leaf — no decorated phrasing,
+                // the client owns presentation of default-vs-configured.
+                let value = crate::features::FEATURES
+                    .iter()
+                    .find(|spec| spec.key == feature_key)
+                    .map(|spec| config.features().enabled(spec.id).to_string());
+                let persisted = config_document.as_ref().map(|document| {
+                    toml_value_at_path(document, &["features", feature_key]).is_some()
+                });
+                (value, persisted)
+            } else {
+                // Managed-policy receipts name the winning source rather than
+                // a writable value; everything else resolves from config.toml
+                // or stays absent for a diagnostic the runtime cannot read.
+                let managed_value = match def.key {
+                    "managed_approval_policy" => match permission_control {
+                        crate::config::ApprovalPolicyControl::Unset
+                        | crate::config::ApprovalPolicyControl::RootConfig => None,
+                        source => Some(source.label().to_string()),
+                    },
+                    "managed_allow_shell" if !shell_control.editable_root() => Some(format!(
+                        "{} · {}",
+                        config.allow_shell(),
+                        shell_control.label()
+                    )),
+                    _ => None,
+                };
+                (
+                    managed_value.or_else(|| config_schema_value(def.key, &config)),
+                    None,
+                )
+            };
+
+            // `editable` means POST /v1/config accepts the key today:
+            // notifications.* through the namespace branch, settings.toml
+            // keys through the Settings::set fallthrough, and the curated
+            // config.toml arm list. A Setting row without a write path
+            // (e.g. telemetry, which persists through its own notice
+            // module) renders read-only rather than promising a 400. The
+            // endpoint rows stay receipts: writing a live route's base URL
+            // cannot mutate an already-running client, so the TUI marks
+            // them read-only and the schema agrees.
+            let endpoint_receipt = matches!(def.key, "base_url" | "provider_url");
+            // A managed or profile-owned approval policy freezes the
+            // session-level mode switch too, not just the saved row.
+            let session_locked = def.key == "approval_mode"
+                && !matches!(
+                    permission_control,
+                    crate::config::ApprovalPolicyControl::Unset
+                );
+            let editable = !endpoint_receipt
+                && !session_locked
+                && matches!(ui.row, SettingRowKind::Setting | SettingRowKind::Session)
+                && visible(def.key)
+                && (notification_owned
+                    || settings_writable
+                    || RUNTIME_CONFIG_KEYS.contains(&def.key));
+
+            SettingsSchemaRow {
+                key: def.key,
+                kind,
+                tab: ui.tab,
+                group: ui.group,
+                label: if !ui.label.is_empty() {
+                    tr_key(locale, ui.label).into_owned()
+                } else if def.key.starts_with("features.") {
+                    tr(locale, MessageId::ConfigLabelFeaturePrefix).replace(
+                        "{name}",
+                        &humanize_schema_key(def.key.rsplit('.').next().unwrap_or(def.key)),
+                    )
+                } else {
+                    humanize_schema_key(def.key.rsplit('.').next().unwrap_or(def.key))
+                },
+                description: if ui.description.is_empty() {
+                    String::new()
+                } else {
+                    tr_key(locale, ui.description).into_owned()
+                },
+                default: def.default,
+                row,
+                value,
+                persisted,
+                editable,
+                visible: visible(def.key),
+                options,
+            }
+        })
+        .collect();
+
+    Ok(Json(SettingsSchemaResponse {
+        version: 1,
+        tabs,
+        settings: settings_rows,
+    }))
+}
+
+/// Current value of a config.toml-owned schema row, when one resolves
+/// cheaply. Diagnostics that need per-route or credential computation are
+/// omitted rather than approximated.
+fn config_schema_value(key: &str, config: &Config) -> Option<String> {
+    match key {
+        "provider" => Some(config.provider_identity_for(config.api_provider())),
+        "model" => runtime_request_model(config, None).ok(),
+        "approval_policy" => config
+            .approval_policy
+            .clone()
+            .or_else(|| Some("suggest".to_string())),
+        "telemetry" => Some(crate::telemetry_notice::saved_preference_enabled(config).to_string()),
+        "allow_shell" => Some(config.allow_shell().to_string()),
+        "base_url" => Some(config.base_url_for_route(config.api_provider())),
+        "provider_url" => Some(config.base_url_for_route(config.api_provider())),
+        "mcp_config_path" => Some(config.mcp_config_path().display().to_string()),
+        "sandbox_mode" => config.sandbox_mode.clone(),
+        "fleet.exec.max_spawn_depth" => Some(config.subagent_max_spawn_depth().to_string()),
+        "reasoning_effort" => Some(config.reasoning_effort().unwrap_or("auto").to_string()),
+        _ => None,
+    }
 }
 
 fn normalize_runtime_config_model(
@@ -7464,14 +8664,7 @@ struct ClearMemoryQuery {
 /// Mirrors `native_store()` in `commands/groups/memory/memory.rs`.
 fn native_store_for_state(state: &RuntimeApiState) -> crate::native_memory::NativeMemoryStore {
     let memory_path = state.config.read().memory_path();
-    if let Some(store) = crate::native_memory::NativeMemoryStore::from_global_path(&memory_path) {
-        return store;
-    }
-    let root = memory_path
-        .parent()
-        .unwrap_or_else(|| FsPath::new("."))
-        .join("memory");
-    crate::native_memory::NativeMemoryStore::new(root)
+    crate::native_memory::NativeMemoryStore::from_memory_anchor(&memory_path)
 }
 
 /// Derive a scope label from a source path relative to the store root.
@@ -7656,8 +8849,11 @@ async fn create_memory_entry(
     };
     let store = native_store_for_state(&state);
     let root = store.root().to_path_buf();
+    // This endpoint is an authenticated operator surface: the explicit request
+    // is the review, so the entry lands active — matching the Lens remember
+    // action. Model-reachable capture stays candidate-only.
     let hit = store
-        .remember(scope, workspace_id.as_deref(), &req.text)
+        .remember_reviewed(scope, workspace_id.as_deref(), &req.text)
         .map_err(|e| ApiError::bad_request(format!("memory create error: {e}")))?;
     let entry = memory_hit_to_record(hit, &root);
     Ok((StatusCode::CREATED, Json(json!({ "entry": entry }))))
@@ -7756,6 +8952,10 @@ fn map_thread_err(err: anyhow::Error) -> ApiError {
     } else if message.contains("already has an active turn")
         || message.contains("No active turn")
         || message.contains("is not active")
+        // A steer the engine dropped: the turn moved on before the model saw
+        // it. 409 lets a client keep the text and resend rather than trust a
+        // delivery that never happened (#6276).
+        || message.contains("moved on before the steer")
         || lower.contains("operation_key is already bound")
         || lower.contains("operation_key binding is incomplete")
         || lower.contains("operation_key binding does not match")
@@ -7771,10 +8971,17 @@ fn map_agent_mail_err(err: anyhow::Error) -> ApiError {
     let lower = message.to_ascii_lowercase();
     if lower.contains("ownership denied") {
         ApiError::forbidden(message)
-    } else if lower.contains("already exists with different delivery intent") {
+    } else if lower.contains("already exists with different delivery intent")
+        || lower.contains("can be canceled only while queued")
+    {
         ApiError::conflict(message)
     } else if (lower.contains("failed to read agent mail envelope")
-        && lower.contains("no such file"))
+        && (lower.contains("no such file")
+            || err.chain().skip(1).any(|cause| {
+                cause
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
+            })))
         || (lower.starts_with("thread '") && lower.ends_with("' not found"))
     {
         ApiError::not_found(message)
@@ -7828,6 +9035,13 @@ impl ApiError {
     fn forbidden(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::FORBIDDEN,
+            message: message.into(),
+        }
+    }
+
+    fn payload_too_large(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::PAYLOAD_TOO_LARGE,
             message: message.into(),
         }
     }
@@ -7962,6 +9176,7 @@ base_url = "http://127.0.0.1:9/v1"
             web: None,
             fleet_codewhale_binary: "unused-test-binary".to_string(),
             mcp_pool: Arc::new(Mutex::new(None)),
+            lsp_manager: Arc::new(std::sync::OnceLock::new()),
             compat_stream_test_hook: None,
         };
         let router = build_router(state.clone());

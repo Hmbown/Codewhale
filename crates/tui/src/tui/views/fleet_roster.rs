@@ -25,7 +25,7 @@
 
 use std::cell::{Cell, RefCell};
 
-use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::{
     buffer::Buffer,
     layout::{Constraint, Direction, Layout, Rect},
@@ -41,6 +41,10 @@ use crate::fleet::roster::{FleetRoster, ProfileLayer, ProfileOrigin, layers_from
 use crate::fleet::worker_runtime::roster_member_agent_type;
 use crate::tui::app::App;
 use crate::tui::menu_style;
+
+/// Rows one PageUp/PageDown travels. Pages clamp at the ends per the shared
+/// vocabulary instead of wrapping (#6290).
+const FLEET_ROSTER_PAGE: usize = 10;
 use crate::tui::views::{
     ActionHint, ModalKind, ModalView, ViewAction, ViewEvent, render_modal_footer,
     truncate_view_text,
@@ -196,22 +200,7 @@ impl FleetRosterView {
             members: roster
                 .members()
                 .iter()
-                .filter(|m| {
-                    !m.id.trim().eq_ignore_ascii_case("operator")
-                        // #5888: `general` is the legacy alias of the `worker`
-                        // posture. The engine roster keeps it dispatchable —
-                        // Agent tool type tokens, saved configs, and replayed
-                        // transcripts resolve `general`, and the identity
-                        // selector maps the alias to the worker member — but
-                        // the default lineup presents one row per posture.
-                        // Only the untouched built-in alias folds away: a
-                        // user-authored `general` (config/personal/project
-                        // origin, including saved-team members, which carry
-                        // Personal/Workspace origin by construction) is the
-                        // user's own member and stays visible.
-                        && !(m.id.eq_ignore_ascii_case("general")
-                            && m.origin == ProfileOrigin::BuiltIn)
-                })
+                .filter(|m| !m.id.trim().eq_ignore_ascii_case("operator"))
                 .cloned()
                 .collect(),
             shadowed: roster.shadowed().to_vec(),
@@ -270,6 +259,41 @@ impl FleetRosterView {
         self.detail_scroll = 0;
         self.last_mouse_selected = None;
         self.hovered_row.set(None);
+    }
+
+    /// Apply one [`list_nav`](crate::tui::list_nav) motion (#6290), returning
+    /// whether it was consumed. Steps wrap; pages travel [`FLEET_ROSTER_PAGE`]
+    /// rows and clamp. The region axis is declined so Tab keeps opening the
+    /// workers view through the explicit arm below.
+    fn apply_motion(&mut self, motion: crate::tui::list_nav::Motion) -> bool {
+        use crate::tui::list_nav::Motion;
+        match motion {
+            Motion::Prev => {
+                self.move_up();
+                true
+            }
+            Motion::Next => {
+                self.move_down();
+                true
+            }
+            Motion::RegionPrev | Motion::RegionNext => false,
+            _ => {
+                let count = self.row_count();
+                if count == 0 {
+                    return false;
+                }
+                let Some(next) =
+                    crate::tui::list_nav::apply(self.selected, count, FLEET_ROSTER_PAGE, motion)
+                else {
+                    return false;
+                };
+                self.selected = next;
+                self.detail_scroll = 0;
+                self.last_mouse_selected = None;
+                self.hovered_row.set(None);
+                true
+            }
+        }
     }
 
     fn select_row(&mut self, row: usize) {
@@ -335,16 +359,34 @@ impl ModalView for FleetRosterView {
         // A keyboard gesture ends any pending mouse double-click sequence so
         // a later single click can never activate a stale row.
         self.last_mouse_selected = None;
+        // Shift-modified paging scrolls the detail pane; bare keys drive the
+        // row list through the shared vocabulary (#6290, #6014-style split).
+        if key.modifiers.contains(KeyModifiers::SHIFT) {
+            match key.code {
+                KeyCode::PageUp => {
+                    self.detail_scroll = self.detail_scroll.saturating_sub(8);
+                    return ViewAction::None;
+                }
+                KeyCode::PageDown => {
+                    self.detail_scroll = self.detail_scroll.saturating_add(8);
+                    return ViewAction::None;
+                }
+                KeyCode::Home => {
+                    self.detail_scroll = 0;
+                    return ViewAction::None;
+                }
+                _ => {}
+            }
+        }
+        // Movement keys come from the shared vocabulary (#6290), j/k aliases
+        // included — this surface captures no text.
+        if let Some(motion) = crate::tui::list_nav::motion(&key)
+            && self.apply_motion(motion)
+        {
+            return ViewAction::None;
+        }
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => ViewAction::Close,
-            KeyCode::Up | KeyCode::Char('k') => {
-                self.move_up();
-                ViewAction::None
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                self.move_down();
-                ViewAction::None
-            }
             KeyCode::Enter => self.activate_selected(),
             // #5954: the roster stays on the stack under the view it opens,
             // so `Esc` in workers / saved teams pops back here instead of
@@ -354,18 +396,6 @@ impl ModalView for FleetRosterView {
                 ViewAction::Emit(ViewEvent::FleetRosterOpenWorkersRequested)
             }
             KeyCode::Char('f') => ViewAction::Emit(ViewEvent::FleetRosterOpenFleetsRequested),
-            KeyCode::Home => {
-                self.detail_scroll = 0;
-                ViewAction::None
-            }
-            KeyCode::PageUp => {
-                self.detail_scroll = self.detail_scroll.saturating_sub(8);
-                ViewAction::None
-            }
-            KeyCode::PageDown => {
-                self.detail_scroll = self.detail_scroll.saturating_add(8);
-                ViewAction::None
-            }
             _ => ViewAction::None,
         }
     }

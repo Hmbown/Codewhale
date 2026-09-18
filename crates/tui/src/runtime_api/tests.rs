@@ -1,6 +1,6 @@
 use super::*;
 use crate::core::events::{Event as EngineEvent, TurnOutcomeStatus};
-use crate::core::ops::Op;
+use crate::core::ops::{Op, TurnSpec};
 use crate::runtime_threads::RuntimeEventRecord;
 use crate::test_support::{EnvVarGuard, lock_test_env};
 use anyhow::{Context, bail};
@@ -14,7 +14,9 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::time::sleep;
 use uuid::Uuid;
 
+mod command_catalog;
 mod headless_catalog;
+mod workspace_instructions;
 
 /// Scale a wait budget for shared CI runners.
 ///
@@ -453,6 +455,7 @@ fn messages_from_thread_detail_batches_tool_results() {
         routing_settlement: false,
         effective_route_usage: None,
         permission_posture: Some("ask".to_string()),
+        mode: None,
         effective_provider: None,
         effective_provider_id: None,
         effective_openrouter_vendor: None,
@@ -946,6 +949,8 @@ struct TestServerOverrides {
     web: Option<web::RuntimeWebState>,
     compat_stream_test_hook: Option<mpsc::UnboundedSender<CompatStreamTestPoint>>,
     plugin_discovery: Option<Arc<crate::plugins::PluginDiscoveryContext>>,
+    /// Pre-seeded workspace LSP manager (test transports, disabled configs).
+    lsp_manager: Option<Arc<crate::lsp::LspManager>>,
 }
 
 async fn spawn_test_server_with_root_token_mobile_workspace_and_subagents(
@@ -1237,6 +1242,13 @@ async fn build_test_server(
         fleet_codewhale_binary: overrides
             .fleet_codewhale_binary
             .unwrap_or_else(configured_codewhale_binary),
+        lsp_manager: {
+            let cell = std::sync::OnceLock::new();
+            if let Some(manager) = overrides.lsp_manager {
+                let _ = cell.set(manager);
+            }
+            Arc::new(cell)
+        },
         compat_stream_test_hook: overrides.compat_stream_test_hook,
     };
     let app = build_router(state);
@@ -1569,6 +1581,63 @@ async fn health_and_tasks_endpoints_work() -> Result<()> {
         .error_for_status()?
         .json()
         .await?;
+
+    handle.abort();
+    Ok(())
+}
+
+/// Created tasks keep their caller-given name through get and list; unnamed
+/// tasks omit the field so queues can fall back to the prompt summary.
+#[tokio::test]
+async fn created_tasks_keep_their_given_name() -> Result<()> {
+    let Some((addr, _runtime_threads, handle)) = spawn_test_server().await? else {
+        return Ok(());
+    };
+    let client = crate::tls::reqwest_client();
+
+    let named: serde_json::Value = client
+        .post(format!("http://{addr}/v1/tasks"))
+        .json(&json!({ "prompt": "migrate the widget", "name": "Widget migration" }))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(named["name"], "Widget migration");
+    let id = named["id"].as_str().expect("task id").to_string();
+
+    let unnamed: serde_json::Value = client
+        .post(format!("http://{addr}/v1/tasks"))
+        .json(&json!({ "prompt": "unnamed work" }))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert!(unnamed.get("name").is_none());
+
+    let detail: serde_json::Value = client
+        .get(format!("http://{addr}/v1/tasks/{id}"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(detail["name"], "Widget migration");
+
+    let listed: serde_json::Value = client
+        .get(format!("http://{addr}/v1/tasks"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let rows = listed["tasks"].as_array().expect("task rows");
+    let row = rows
+        .iter()
+        .find(|row| row["id"] == id)
+        .expect("named row in list");
+    assert_eq!(row["name"], "Widget migration");
 
     handle.abort();
     Ok(())
@@ -2088,6 +2157,109 @@ async fn thread_summary_includes_workspace_branch_metadata() -> Result<()> {
 }
 
 #[tokio::test]
+async fn workspace_file_search_auth_matching_and_bounds() -> Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let workspace = tmp.path().join("workspace");
+    fs::create_dir_all(workspace.join("src"))?;
+    fs::create_dir_all(workspace.join("match-directory"))?;
+    fs::write(
+        workspace.join("match.rs"),
+        "contents must never be returned",
+    )?;
+    fs::write(workspace.join("src/match.rs"), "private file contents")?;
+    for index in 0..105 {
+        fs::write(workspace.join(format!("bounded-{index:03}.rs")), "")?;
+    }
+    let (addr, _, handle) = spawn_test_server_with_root_token_mobile_workspace(
+        tmp.path().join("runtime"),
+        tmp.path().join("sessions"),
+        Some("file-search-token".to_string()),
+        false,
+        workspace,
+    )
+    .await?
+    .context("file search test requires a loopback listener")?;
+    let client = crate::tls::reqwest_client();
+    let url = format!("http://{addr}/v1/workspace/files/search");
+    let search_url = |pairs: &[(&str, &str)]| {
+        let mut url = reqwest::Url::parse(&url).unwrap();
+        url.query_pairs_mut().extend_pairs(pairs.iter().copied());
+        url
+    };
+    for token in [None, Some("wrong-token")] {
+        let mut request = client.get(search_url(&[("query", "match")]));
+        if let Some(token) = token {
+            request = request.bearer_auth(token);
+        }
+        assert_eq!(request.send().await?.status(), StatusCode::UNAUTHORIZED);
+    }
+    for (query, expected) in [
+        ("MATCH", json!(["match.rs", "src/match.rs"])),
+        ("src/ma", json!(["src/match.rs"])),
+        ("", json!([])),
+        ("   ", json!([])),
+        ("no-such-file", json!([])),
+        ("../", json!([])),
+        ("/etc/passwd", json!([])),
+    ] {
+        let body: Value = client
+            .get(search_url(&[("query", query)]))
+            .bearer_auth("file-search-token")
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        assert_eq!(body, json!({"paths": expected}), "query={query:?}");
+    }
+    for (limit, expected_count) in [(None, 20), (Some("1"), 1), (Some("100"), 100)] {
+        let mut url = search_url(&[("query", "bounded")]);
+        if let Some(limit) = limit {
+            url.query_pairs_mut().append_pair("limit", limit);
+        }
+        let body: Value = client
+            .get(url)
+            .bearer_auth("file-search-token")
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        assert_eq!(body["paths"].as_array().unwrap().len(), expected_count);
+    }
+    for (key, value) in [
+        ("limit", "0".to_string()),
+        ("limit", "101".to_string()),
+        ("limit", "-1".to_string()),
+        ("limit", "abc".to_string()),
+        ("query", "é".repeat(129)),
+        ("workspace", tmp.path().display().to_string()),
+    ] {
+        assert_eq!(
+            client
+                .get(search_url(&[(key, &value)]))
+                .bearer_auth("file-search-token")
+                .send()
+                .await?
+                .status(),
+            StatusCode::BAD_REQUEST,
+            "invalid {key}"
+        );
+    }
+    let missing_query: Value = client
+        .get(&url)
+        .bearer_auth("file-search-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(missing_query, json!({"paths": []}));
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
 async fn workspace_and_automation_endpoints_work() -> Result<()> {
     let Some((addr, _runtime_threads, handle)) = spawn_test_server().await? else {
         return Ok(());
@@ -2532,8 +2704,8 @@ async fn agent_runs_runtime_api_exposes_persisted_worker_receipts() -> Result<()
                 let mut profile = WorkerRuntimeProfile::for_role(FleetRole::Verifier);
                 profile.tools = ToolScope::Explicit(vec!["read_file".to_string()]);
                 profile.model = ModelRoute::Fixed("deepseek-v4-flash".to_string());
-                profile.max_spawn_depth =
-                    crate::tools::subagent::DEFAULT_MAX_SPAWN_DEPTH.saturating_sub(1);
+                profile.max_spawn_depth = crate::tools::subagent::DEFAULT_MAX_SPAWN_DEPTH;
+                profile.spawn_depth = 1;
                 profile
             },
             max_steps: 4,
@@ -2572,16 +2744,15 @@ async fn agent_runs_runtime_api_exposes_persisted_worker_receipts() -> Result<()
             output_tokens: None,
             total_tokens: None,
             cost_microusd: None,
-            token_budget: None,
-            budget_spent_tokens: None,
-            budget_remaining_tokens: None,
-            budget_scope: None,
             note: "not reported".to_string(),
         },
         usage_source_fingerprints: Default::default(),
+        has_unreported_usage: false,
+        delivery_evidence: Default::default(),
         verification: AgentRunVerificationSummary {
             status: "self_report_only".to_string(),
             summary: "no verified receipt attached".to_string(),
+            deliverables: Vec::new(),
         },
         recommended_action: AgentRunRecommendedAction {
             action: "verify_self_report".to_string(),
@@ -2750,7 +2921,7 @@ async fn compatibility_stream_closes_losslessly_across_replay_live_handoff() -> 
     let (release_overlap, wait_for_overlap_release) = oneshot::channel();
     let (release_terminal, wait_for_terminal_release) = oneshot::channel();
     let engine_task = tokio::spawn(async move {
-        if !matches!(rx_op.recv().await, Some(Op::SendMessage { .. })) {
+        if !matches!(rx_op.recv().await, Some(Op::SendMessage(TurnSpec { .. }))) {
             return;
         }
         let _ = wait_for_overlap_release.await;
@@ -2953,7 +3124,10 @@ async fn compatibility_stream_exposes_and_resolves_user_input_without_answer_ech
     let (submission_tx, submission_rx) = oneshot::channel();
     let (release_completion, wait_for_completion_release) = oneshot::channel();
     let engine_task = tokio::spawn(async move {
-        if !matches!(harness.rx_op.recv().await, Some(Op::SendMessage { .. })) {
+        if !matches!(
+            harness.rx_op.recv().await,
+            Some(Op::SendMessage(TurnSpec { .. }))
+        ) {
             bail!("compatibility interaction engine did not receive a prompt");
         }
         harness
@@ -3373,7 +3547,7 @@ async fn thread_endpoints_expose_lifecycle_contract() -> Result<()> {
     tokio::spawn(async move {
         while let Some(op) = rx_op.recv().await {
             match op {
-                Op::SendMessage { .. } => {
+                Op::SendMessage(TurnSpec { .. }) => {
                     let _ = tx_event
                         .send(EngineEvent::TurnStarted {
                             turn_id: "mock_lifecycle".to_string(),
@@ -3552,7 +3726,7 @@ async fn turn_endpoint_operation_key_returns_original_and_conflicts_on_mismatch(
     let tx_event = harness.tx_event.clone();
     tokio::spawn(async move {
         while let Some(op) = harness.rx_op.recv().await {
-            if !matches!(op, Op::SendMessage { .. }) {
+            if !matches!(op, Op::SendMessage(TurnSpec { .. })) {
                 continue;
             }
             counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -3691,7 +3865,7 @@ async fn turn_operation_lookup_is_authenticated_read_only_and_survives_restart()
         tokio::time::timeout(ci_scaled(Duration::from_secs(2)), engine.rx_op.recv())
             .await?
             .context("accepted mock Engine operation")?,
-        Op::SendMessage { .. }
+        Op::SendMessage(TurnSpec { .. })
     ));
 
     let endpoint = format!(
@@ -3869,7 +4043,7 @@ async fn events_endpoint_respects_since_seq_cursor() -> Result<()> {
     let mut rx_op = harness.rx_op;
     let tx_event = harness.tx_event;
     tokio::spawn(async move {
-        if !matches!(rx_op.recv().await, Some(Op::SendMessage { .. })) {
+        if !matches!(rx_op.recv().await, Some(Op::SendMessage(TurnSpec { .. }))) {
             return;
         }
         let _ = tx_event
@@ -4032,6 +4206,7 @@ async fn event_handoff_replays_and_dedupes_interaction_prompts_without_a_gap() -
         initial_seq,
         backlog_rx,
         live,
+        false,
     )
     .take(2);
     let body =
@@ -4054,6 +4229,200 @@ async fn event_handoff_replays_and_dedupes_interaction_prompts_without_a_gap() -
     assert_eq!(rendered.matches("approval-handoff").count(), 1);
     assert_eq!(rendered.matches("input-handoff").count(), 1);
 
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn pet_stream_progress_drains_queued_answers_before_becoming_live() -> Result<()> {
+    let (_addr, runtime_threads, handle) = spawn_test_server()
+        .await?
+        .context("Runtime socket unavailable for pet progress acceptance")?;
+    let thread = runtime_threads
+        .create_thread(CreateThreadRequest::default())
+        .await?;
+    let initial = runtime_threads
+        .events_since(&thread.id, None)?
+        .last()
+        .unwrap()
+        .seq;
+    let live = runtime_threads.subscribe_events();
+    let required = runtime_threads
+        .emit_event_for_test(
+            &thread.id,
+            None,
+            "user_input.required",
+            json!({"id":"old-request"}),
+        )
+        .await?;
+    let backlog = runtime_threads.events_since(&thread.id, Some(initial))?;
+    let (tx, rx) = mpsc::channel(1);
+    tx.send(Ok(backlog)).await?;
+    drop(tx);
+    let answered = runtime_threads
+        .emit_event_for_test(
+            &thread.id,
+            None,
+            "user_input.answered",
+            json!({"id":"old-request"}),
+        )
+        .await?;
+    let stream = replay_live_thread_events(
+        runtime_threads.clone(),
+        thread.id.clone(),
+        initial,
+        rx,
+        live,
+        true,
+    )
+    .take(4);
+    let body = tokio::time::timeout(
+        ci_scaled(Duration::from_secs(2)),
+        axum::body::to_bytes(Sse::new(stream).into_response().into_body(), 64 * 1024),
+    )
+    .await??;
+    let rendered = String::from_utf8(body.to_vec())?;
+    let frames = rendered
+        .split("\n\n")
+        .filter(|s| !s.trim().is_empty())
+        .map(parse_sse_frame)
+        .collect::<Result<Vec<_>>>()?;
+    assert_eq!(frames.len(), 4);
+    assert_eq!(
+        frames[0].1,
+        json!({"event":"stream.progress","thread_id":thread.id,"seq":initial,"state":"replaying"})
+    );
+    assert_eq!(frames[1].1["seq"], required.seq);
+    assert_eq!(frames[2].1["seq"], answered.seq);
+    assert_eq!(
+        frames[3].1,
+        json!({"event":"stream.progress","thread_id":thread.id,"seq":answered.seq,"state":"live"})
+    );
+    assert_eq!(
+        runtime_threads
+            .events_since(&thread.id, Some(initial))?
+            .len(),
+        2,
+        "Progress is not journal data"
+    );
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn pet_stream_progress_is_opt_in_and_advertised_by_the_actual_endpoint() -> Result<()> {
+    let (addr, runtime_threads, handle) = spawn_test_server()
+        .await?
+        .context("Runtime socket unavailable for pet progress acceptance")?;
+    let thread = runtime_threads
+        .create_thread(CreateThreadRequest::default())
+        .await?;
+    let client = crate::tls::reqwest_client();
+    let response = client
+        .get(format!(
+            "http://{addr}/v1/threads/{}/events?progress=true",
+            thread.id
+        ))
+        .send()
+        .await?
+        .error_for_status()?;
+    assert_eq!(
+        response
+            .headers()
+            .get("x-codewhale-event-progress")
+            .unwrap(),
+        "1"
+    );
+    let frame = parse_sse_frame(&read_first_sse_frame(response).await?)?;
+    assert_eq!(frame.0, "stream.progress");
+    assert_eq!(frame.1["state"], "replaying");
+    let response = client
+        .get(format!("http://{addr}/v1/threads/{}/events", thread.id))
+        .send()
+        .await?
+        .error_for_status()?;
+    assert!(
+        response
+            .headers()
+            .get("x-codewhale-event-progress")
+            .is_none()
+    );
+    let frame = parse_sse_frame(&read_first_sse_frame(response).await?)?;
+    assert_eq!(frame.0, "thread.started");
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn pet_stream_progress_returns_to_replay_while_recovering_broadcast_lag() -> Result<()> {
+    let (_addr, runtime_threads, handle) = spawn_test_server()
+        .await?
+        .context("Runtime socket unavailable for pet progress acceptance")?;
+    let thread = runtime_threads
+        .create_thread(CreateThreadRequest::default())
+        .await?;
+    let initial = runtime_threads
+        .events_since(&thread.id, None)?
+        .last()
+        .unwrap()
+        .seq;
+    let (backlog_tx, backlog) = mpsc::channel(1);
+    drop(backlog_tx);
+    let (tx, live) = tokio::sync::broadcast::channel(1);
+    let mut stream = Box::pin(replay_live_thread_events(
+        runtime_threads.clone(),
+        thread.id.clone(),
+        initial,
+        backlog,
+        live,
+        true,
+    ));
+    assert_eq!(
+        sse_frame_payload(stream.next().await.unwrap().unwrap()).await?["state"],
+        "replaying"
+    );
+    assert_eq!(
+        sse_frame_payload(stream.next().await.unwrap().unwrap()).await?["state"],
+        "live"
+    );
+    let required = runtime_threads
+        .emit_event_for_test(
+            &thread.id,
+            None,
+            "user_input.required",
+            json!({"id":"queued-request"}),
+        )
+        .await?;
+    let answered = runtime_threads
+        .emit_event_for_test(
+            &thread.id,
+            None,
+            "user_input.answered",
+            json!({"id":"queued-request"}),
+        )
+        .await?;
+    tx.send(required.clone())?;
+    tx.send(answered.clone())?;
+    let frames = tokio::time::timeout(ci_scaled(Duration::from_secs(2)), async {
+        let mut frames = Vec::new();
+        for _ in 0..4 {
+            frames.push(sse_frame_payload(stream.next().await.unwrap().unwrap()).await?);
+        }
+        Ok::<_, anyhow::Error>(frames)
+    })
+    .await??;
+    assert_eq!(frames[0]["state"], "replaying");
+    assert_eq!(frames[0]["seq"], initial);
+    assert_eq!(frames[1]["seq"], required.seq);
+    assert_eq!(frames[2]["seq"], answered.seq);
+    assert_eq!(frames[3]["state"], "live");
+    assert_eq!(frames[3]["seq"], answered.seq);
+    assert_eq!(
+        runtime_threads
+            .events_since(&thread.id, Some(initial))?
+            .len(),
+        2
+    );
     handle.abort();
     Ok(())
 }
@@ -4087,7 +4456,7 @@ async fn steer_and_interrupt_endpoints_work_on_active_turn() -> Result<()> {
     let tx_event = harness.tx_event;
     let cancel_token = harness.cancel_token;
     tokio::spawn(async move {
-        if !matches!(rx_op.recv().await, Some(Op::SendMessage { .. })) {
+        if !matches!(rx_op.recv().await, Some(Op::SendMessage(TurnSpec { .. }))) {
             return;
         }
         let _ = tx_event
@@ -4100,7 +4469,10 @@ async fn steer_and_interrupt_endpoints_work_on_active_turn() -> Result<()> {
         let _ = tx_event
             .send(EngineEvent::MessageStarted { index: 0 })
             .await;
-        if let Some(steer_text) = rx_steer.recv().await {
+        if let Some(steer) = rx_steer.recv().await {
+            // An engine that uses the steer has committed it; `commit()` is
+            // what reports that acceptance back to `steer_turn`.
+            let steer_text = steer.into_pending().commit();
             let _ = tx_event
                 .send(EngineEvent::MessageDelta {
                     index: 0,
@@ -4550,7 +4922,7 @@ async fn stream_endpoint_remains_backward_compatible() -> Result<()> {
     let mut rx_op = harness.rx_op;
     let tx_event = harness.tx_event;
     tokio::spawn(async move {
-        if !matches!(rx_op.recv().await, Some(Op::SendMessage { .. })) {
+        if !matches!(rx_op.recv().await, Some(Op::SendMessage(TurnSpec { .. }))) {
             return;
         }
         let _ = tx_event
@@ -5112,6 +5484,18 @@ async fn patch_undo_endpoint_forks_and_reports_file_rollback_state() -> Result<(
         create_seeded_thread(&addr, &runtime_threads, &root, "Roll back the patch").await?;
     let client = crate::tls::reqwest_client();
 
+    // A workspace directory that is not available proves nothing about the
+    // files a turn changed: the undo is refused instead of forking the
+    // conversation away from them.
+    let resp = client
+        .post(format!("http://{addr}/v1/threads/{thread_id}/patch-undo"))
+        .json(&json!({}))
+        .send()
+        .await?;
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    assert!(resp.text().await?.contains("not available"));
+
+    fs::create_dir_all(root.join("workspace"))?;
     let resp = client
         .post(format!("http://{addr}/v1/threads/{thread_id}/patch-undo"))
         .json(&json!({}))
@@ -5120,8 +5504,8 @@ async fn patch_undo_endpoint_forks_and_reports_file_rollback_state() -> Result<(
     assert_eq!(resp.status(), StatusCode::CREATED);
     let undone: serde_json::Value = resp.json().await?;
     // The fresh workspace has no tool/pre-turn snapshots to roll back to,
-    // so the file-restore step reports failure while the conversation
-    // undo still forks the thread.
+    // so the file-restore step reports nothing restored while the
+    // conversation undo still forks the thread.
     assert_eq!(undone["patch_result"]["files_restored"], false);
     assert!(undone["patch_result"]["summary"].is_string());
     assert_eq!(undone["original_user_text"], "Roll back the patch");
@@ -5152,14 +5536,524 @@ fn patch_undo_helper_restores_only_the_bound_session() -> Result<()> {
     repo.snapshot_with_session("pre-turn:foreign", Some("session-foreign"))?;
     fs::write(&file, "current-after")?;
 
-    let restored = patch_undo_workspace_files(&workspace, Some("session-current"));
+    let restored = patch_undo_workspace_files(&workspace, Some("session-current"), true)
+        .expect("a trusted rollback should succeed");
     assert!(restored.files_restored, "{:?}", restored.summary);
     assert_eq!(fs::read_to_string(&file)?, "current-before");
 
     fs::write(&file, "must-stay")?;
-    let unbound = patch_undo_workspace_files(&workspace, None);
+    let unbound = patch_undo_workspace_files(&workspace, None, true)
+        .expect("an unbound thread has nothing to roll back, which is not a refusal");
     assert!(!unbound.files_restored);
     assert_eq!(fs::read_to_string(&file)?, "must-stay");
+    Ok(())
+}
+
+/// The gate the TUI's `/undo` applies, stated as a contract: an untrusted
+/// thread may not roll files back. When there *is* something to roll back the
+/// whole undo aborts — nothing is changed, and the caller must not fork the
+/// conversation either.
+#[test]
+fn patch_undo_helper_refuses_an_untrusted_rollback_and_touches_nothing() -> Result<()> {
+    let _lock = lock_test_env();
+    let root = tempfile::tempdir()?;
+    let home = root.path().join("home");
+    fs::create_dir_all(&home)?;
+    let _home = EnvVarGuard::set("HOME", &home);
+
+    let workspace = root.path().join("workspace");
+    fs::create_dir_all(&workspace)?;
+    let repo = crate::snapshot::SnapshotRepo::open_or_init(&workspace)?;
+    let file = workspace.join("a.txt");
+
+    fs::write(&file, "before")?;
+    repo.snapshot_with_session("pre-turn:1", Some("session-a"))?;
+    fs::write(&file, "after")?;
+
+    let err = patch_undo_workspace_files(&workspace, Some("session-a"), false)
+        .expect_err("an untrusted rollback must be refused");
+    assert_eq!(err.status, StatusCode::CONFLICT);
+    assert!(
+        err.message.contains("outside trusted mode"),
+        "got: {}",
+        err.message
+    );
+    assert_eq!(
+        fs::read_to_string(&file)?,
+        "after",
+        "a refusal must leave the workspace exactly as it was"
+    );
+
+    // The identical call once trusted performs the rollback.
+    let restored = patch_undo_workspace_files(&workspace, Some("session-a"), true)
+        .expect("a trusted rollback should succeed");
+    assert!(restored.files_restored, "{:?}", restored.summary);
+    assert_eq!(fs::read_to_string(&file)?, "before");
+    Ok(())
+}
+
+/// ...but with provably nothing to roll back, an untrusted undo is still
+/// allowed: the conversation half needs no trust, and skipping it would make
+/// Undo useless in Ask / Auto-Review for no safety gain.
+#[test]
+fn patch_undo_helper_allows_an_untrusted_undo_with_nothing_to_roll_back() -> Result<()> {
+    let _lock = lock_test_env();
+    let root = tempfile::tempdir()?;
+    let home = root.path().join("home");
+    fs::create_dir_all(&home)?;
+    let _home = EnvVarGuard::set("HOME", &home);
+
+    let workspace = root.path().join("workspace");
+    fs::create_dir_all(&workspace)?;
+    let repo = crate::snapshot::SnapshotRepo::open_or_init(&workspace)?;
+    let file = workspace.join("a.txt");
+
+    fs::write(&file, "only-state")?;
+    repo.snapshot_with_session("pre-turn:1", Some("session-a"))?;
+    // Nothing changed after the snapshot, so no target exists.
+
+    let result = patch_undo_workspace_files(&workspace, Some("session-a"), false)
+        .expect("nothing to roll back is not a refusal");
+    assert!(!result.files_restored);
+    assert!(result.summary.is_some());
+    assert_eq!(fs::read_to_string(&file)?, "only-state");
+    Ok(())
+}
+
+fn sha256_of(path: &FsPath) -> String {
+    format!(
+        "sha256:{}",
+        crate::hashing::sha256_hex(fs::read(path).unwrap())
+    )
+}
+
+fn revert_request(path: &str, snapshot_id: &str, expected_hash: &str) -> RevertThreadFileRequest {
+    RevertThreadFileRequest {
+        path: path.to_string(),
+        snapshot_id: snapshot_id.to_string(),
+        expected_hash: expected_hash.to_string(),
+    }
+}
+
+/// The acceptance criterion for per-file revert: restoring one file must not
+/// roll back any other file's turn changes.
+#[test]
+fn revert_file_helper_restores_only_the_named_file() -> Result<()> {
+    let _lock = lock_test_env();
+    let root = tempfile::tempdir()?;
+    let home = root.path().join("home");
+    fs::create_dir_all(&home)?;
+    let _home = EnvVarGuard::set("HOME", &home);
+
+    let workspace = root.path().join("workspace");
+    fs::create_dir_all(&workspace)?;
+    let repo = crate::snapshot::SnapshotRepo::open_or_init(&workspace)?;
+    let wanted = workspace.join("wanted.txt");
+    let other = workspace.join("other.txt");
+
+    fs::write(&wanted, "wanted-before")?;
+    fs::write(&other, "other-before")?;
+    repo.snapshot_with_session("pre-turn:1", Some("session-a"))?;
+
+    fs::write(&wanted, "wanted-after")?;
+    fs::write(&other, "other-after")?;
+
+    let snapshot = repo.list(10)?.remove(0);
+    let reverted = revert_file_from_snapshot(
+        &workspace,
+        "session-a",
+        &revert_request("wanted.txt", snapshot.id.as_str(), &sha256_of(&wanted)),
+    )
+    .expect("scoped revert should succeed");
+    assert_eq!(reverted.path, "wanted.txt");
+    assert_eq!(reverted.action, "modified");
+    assert_eq!(reverted.snapshot_label, "pre-turn:1");
+    assert_eq!(reverted.snapshot_id, snapshot.id.as_str());
+    assert_eq!(fs::read_to_string(&wanted)?, "wanted-before");
+    assert_eq!(
+        fs::read_to_string(&other)?,
+        "other-after",
+        "reverting one file must leave every other file's changes in place"
+    );
+    Ok(())
+}
+
+#[test]
+fn revert_file_helper_accepts_an_absolute_path_inside_the_workspace() -> Result<()> {
+    let _lock = lock_test_env();
+    let root = tempfile::tempdir()?;
+    let home = root.path().join("home");
+    fs::create_dir_all(&home)?;
+    let _home = EnvVarGuard::set("HOME", &home);
+
+    let workspace = root.path().join("workspace");
+    fs::create_dir_all(&workspace)?;
+    let repo = crate::snapshot::SnapshotRepo::open_or_init(&workspace)?;
+    let file = workspace.join("a.txt");
+
+    fs::write(&file, "v1")?;
+    repo.snapshot_with_session("pre-turn:1", Some("session-a"))?;
+    fs::write(&file, "v2")?;
+
+    // A recorded path may arrive absolute; normalization reports it back
+    // workspace-relative so the GUI's change record stays consistent.
+    let snapshot = repo.list(10)?.remove(0);
+    let reverted = revert_file_from_snapshot(
+        &workspace,
+        "session-a",
+        &revert_request(
+            &file.to_string_lossy(),
+            snapshot.id.as_str(),
+            &sha256_of(&file),
+        ),
+    )
+    .expect("scoped revert should accept an in-workspace absolute path");
+    assert_eq!(reverted.path, "a.txt");
+    assert_eq!(fs::read_to_string(&file)?, "v1");
+    Ok(())
+}
+
+/// The client names the exact snapshot from its change record. A newer
+/// unrelated snapshot must not be selected for it, and a stale hash means
+/// the user edited the file after the record was captured: refuse and leave
+/// the workspace untouched.
+#[test]
+fn revert_file_helper_requires_exact_snapshot_identity_and_reviewed_hash() -> Result<()> {
+    let _lock = lock_test_env();
+    let root = tempfile::tempdir()?;
+    let home = root.path().join("home");
+    fs::create_dir_all(&home)?;
+    let _home = EnvVarGuard::set("HOME", &home);
+
+    let workspace = root.path().join("workspace");
+    fs::create_dir_all(&workspace)?;
+    let repo = crate::snapshot::SnapshotRepo::open_or_init(&workspace)?;
+    let a = workspace.join("a.txt");
+    let b = workspace.join("b.txt");
+
+    // Tool A edits a.txt; tool B snapshots before editing only b.txt; the user
+    // then edits a.txt by hand.
+    fs::write(&a, "a-before")?;
+    fs::write(&b, "b-before")?;
+    let tool_a = repo.snapshot_with_session("tool:call-a", Some("session-a"))?;
+    fs::write(&a, "a-after-tool")?;
+    let tool_b = repo.snapshot_with_session("tool:call-b", Some("session-a"))?;
+    fs::write(&b, "b-after-tool")?;
+    fs::write(&a, "a-user-edit")?;
+
+    // Restoring a.txt from tool B's snapshot would erase only the user edit;
+    // the client must ask for tool A's snapshot and gets back a-before.
+    let err = revert_file_from_snapshot(
+        &workspace,
+        "session-a",
+        &revert_request("a.txt", tool_a.as_str(), &sha256_of(&b)),
+    )
+    .expect_err("a hash from different bytes must refuse");
+    assert_eq!(err.status, StatusCode::CONFLICT);
+    assert!(
+        err.message.contains("changed after"),
+        "got: {}",
+        err.message
+    );
+    assert_eq!(fs::read_to_string(&a)?, "a-user-edit");
+
+    let reverted = revert_file_from_snapshot(
+        &workspace,
+        "session-a",
+        &revert_request("a.txt", tool_a.as_str(), &sha256_of(&a)),
+    )
+    .expect("exact identity restores");
+    assert_eq!(reverted.snapshot_label, "tool:call-a");
+    assert_eq!(fs::read_to_string(&a)?, "a-before");
+    assert_eq!(
+        fs::read_to_string(&b)?,
+        "b-after-tool",
+        "b.txt is untouched"
+    );
+
+    // Already matching: 409, nothing changed.
+    let err = revert_file_from_snapshot(
+        &workspace,
+        "session-a",
+        &revert_request("a.txt", tool_a.as_str(), &sha256_of(&a)),
+    )
+    .expect_err("nothing to revert");
+    assert_eq!(err.status, StatusCode::CONFLICT);
+    assert!(
+        err.message.contains("nothing to revert"),
+        "got: {}",
+        err.message
+    );
+
+    // A snapshot owned by another session, an unknown id, or a non-restore
+    // label are all refused with a refresh hint.
+    let foreign = repo.snapshot_with_session("tool:foreign", Some("session-b"))?;
+    let post = repo.snapshot_with_session("post-turn:1", Some("session-a"))?;
+    for id in [
+        foreign.as_str(),
+        post.as_str(),
+        "0123456789abcdef0123456789abcdef01234567",
+    ] {
+        let err = revert_file_from_snapshot(
+            &workspace,
+            "session-a",
+            &revert_request("b.txt", id, &sha256_of(&b)),
+        )
+        .expect_err(id);
+        assert_eq!(err.status, StatusCode::CONFLICT, "{id}");
+        assert!(
+            err.message.contains("refresh the change record"),
+            "{id}: {}",
+            err.message
+        );
+    }
+    assert_eq!(fs::read_to_string(&b)?, "b-after-tool");
+    let _ = tool_b;
+
+    // Directories and Git metadata are 400s before anything is compared.
+    for path in ["", "src", ".git/config", "../escape.txt"] {
+        fs::create_dir_all(workspace.join("src"))?;
+        let err = revert_file_from_snapshot(
+            &workspace,
+            "session-a",
+            &revert_request(path, tool_a.as_str(), "absent"),
+        )
+        .expect_err(path);
+        assert_eq!(err.status, StatusCode::BAD_REQUEST, "{path}");
+    }
+    Ok(())
+}
+
+#[test]
+fn revert_file_helper_refuses_foreign_sessions_and_paths_outside_the_workspace() -> Result<()> {
+    let _lock = lock_test_env();
+    let root = tempfile::tempdir()?;
+    let home = root.path().join("home");
+    fs::create_dir_all(&home)?;
+    let _home = EnvVarGuard::set("HOME", &home);
+
+    let workspace = root.path().join("workspace");
+    fs::create_dir_all(&workspace)?;
+    let repo = crate::snapshot::SnapshotRepo::open_or_init(&workspace)?;
+    let file = workspace.join("a.txt");
+
+    // Only another session owns a snapshot, so this session has nothing it is
+    // allowed to revert.
+    fs::write(&file, "foreign-before")?;
+    repo.snapshot_with_session("pre-turn:1", Some("session-b"))?;
+    fs::write(&file, "foreign-after")?;
+
+    let foreign = repo.list(10)?.remove(0);
+    let err = revert_file_from_snapshot(
+        &workspace,
+        "session-a",
+        &revert_request("a.txt", foreign.id.as_str(), &sha256_of(&file)),
+    )
+    .expect_err("a foreign session's snapshot must not be restorable");
+    assert_eq!(err.status, StatusCode::CONFLICT);
+    assert!(
+        err.message.contains("another session"),
+        "got: {}",
+        err.message
+    );
+    assert_eq!(fs::read_to_string(&file)?, "foreign-after");
+
+    let traversal = revert_file_from_snapshot(
+        &workspace,
+        "session-a",
+        &revert_request("../escape.txt", foreign.id.as_str(), "absent"),
+    )
+    .expect_err("traversal must be refused");
+    assert_eq!(traversal.status, StatusCode::BAD_REQUEST);
+    Ok(())
+}
+
+/// The GUI decides whether to show the per-file Revert button from a `GET`
+/// probe of this route: 405 ("route exists, wrong method") means available,
+/// 404 means an older engine that must degrade with an explanation. Assert the
+/// wire contract, not just the Rust helper.
+#[tokio::test]
+async fn file_revert_route_probes_as_available_and_404s_unknown_threads() -> Result<()> {
+    let root = std::env::temp_dir().join(format!("deepseek-file-revert-route-{}", Uuid::new_v4()));
+    let sessions_dir = root.join("sessions");
+    let Some((addr, _runtime_threads, handle)) =
+        spawn_test_server_with_root(root.clone(), sessions_dir).await?
+    else {
+        return Ok(());
+    };
+    let client = crate::tls::reqwest_client();
+
+    let probe = client
+        .get(format!("http://{addr}/v1/threads/__probe__/file-revert"))
+        .send()
+        .await?;
+    assert_eq!(
+        probe.status(),
+        StatusCode::METHOD_NOT_ALLOWED,
+        "the capability probe reads any non-404 as 'endpoint available'"
+    );
+
+    let body = json!({
+        "path": "a.txt",
+        "snapshot_id": "0123456789abcdef0123456789abcdef01234567",
+        "expected_hash": "absent"
+    });
+    let missing = client
+        .post(format!("http://{addr}/v1/threads/thr_missing/file-revert"))
+        .json(&body)
+        .send()
+        .await?;
+    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+
+    handle.abort();
+    Ok(())
+}
+
+/// Route-level contract for the new destructive endpoint: malformed bodies
+/// are 422/400 before any thread state is read, an untrusted thread is a 409
+/// even with a well-formed request, and a trusted thread without a bound
+/// session is a 409 that names the reason. No file is touched in any case.
+#[tokio::test]
+async fn file_revert_route_validates_body_then_trust_then_session_binding() -> Result<()> {
+    let root = std::env::temp_dir().join(format!("deepseek-file-revert-gates-{}", Uuid::new_v4()));
+    let sessions_dir = root.join("sessions");
+    let Some((addr, runtime_threads, handle)) =
+        spawn_test_server_with_root(root.clone(), sessions_dir).await?
+    else {
+        return Ok(());
+    };
+    let thread_id = create_seeded_thread(&addr, &runtime_threads, &root, "Edit a.txt").await?;
+    let workspace = root.join("workspace");
+    fs::create_dir_all(&workspace)?;
+    let file = workspace.join("a.txt");
+    fs::write(&file, "keep")?;
+    let client = crate::tls::reqwest_client();
+    let url = format!("http://{addr}/v1/threads/{thread_id}/file-revert");
+    let well_formed = json!({
+        "path": "a.txt",
+        "snapshot_id": "0123456789abcdef0123456789abcdef01234567",
+        "expected_hash": format!("sha256:{}", "a".repeat(64))
+    });
+
+    // Missing required fields: rejected by the JSON extractor.
+    let resp = client
+        .post(&url)
+        .json(&json!({ "path": "a.txt" }))
+        .send()
+        .await?;
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    // Malformed identity/hash: 400 with the expected format.
+    for bad in [
+        json!({ "path": "a.txt", "snapshot_id": "not-hex", "expected_hash": "absent" }),
+        json!({ "path": "a.txt", "snapshot_id": "0123456789abcdef0123456789abcdef01234567", "expected_hash": "md5:abc" }),
+        json!({ "path": "a.txt", "snapshot_id": "0123456789abcdef0123456789abcdef01234567", "expected_hash": format!("sha256:{}", "A".repeat(64)) }),
+    ] {
+        let resp = client.post(&url).json(&bad).send().await?;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{bad}");
+    }
+    // Untrusted thread: 409 that says how to proceed.
+    let resp = client.post(&url).json(&well_formed).send().await?;
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let text = resp.text().await?;
+    assert!(text.contains("trusted mode"), "got: {text}");
+
+    // Trusted, but no bound session: still a 409 with the reason.
+    client
+        .patch(format!("http://{addr}/v1/threads/{thread_id}"))
+        .json(&json!({ "trust_mode": true }))
+        .send()
+        .await?
+        .error_for_status()?;
+    let resp = client.post(&url).json(&well_formed).send().await?;
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let text = resp.text().await?;
+    assert!(text.contains("no bound session"), "got: {text}");
+    assert_eq!(fs::read_to_string(&file)?, "keep");
+
+    handle.abort();
+    Ok(())
+}
+
+/// All three restore routes refuse while a turn is active in an overlapping
+/// workspace, and admit again once it settles. Nothing is changed on refusal.
+#[tokio::test]
+async fn restore_routes_refuse_an_active_turn_in_the_workspace() -> Result<()> {
+    let root = std::env::temp_dir().join(format!("deepseek-restore-active-{}", Uuid::new_v4()));
+    let sessions_dir = root.join("sessions");
+    let Some((addr, runtime_threads, handle)) =
+        spawn_test_server_with_root(root.clone(), sessions_dir).await?
+    else {
+        return Ok(());
+    };
+    let thread_id = create_seeded_thread(&addr, &runtime_threads, &root, "Keep working").await?;
+    let workspace = root.join("workspace");
+    fs::create_dir_all(&workspace)?;
+    let file = workspace.join("a.txt");
+    fs::write(&file, "live")?;
+    let client = crate::tls::reqwest_client();
+    client
+        .patch(format!("http://{addr}/v1/threads/{thread_id}"))
+        .json(&json!({ "trust_mode": true }))
+        .send()
+        .await?
+        .error_for_status()?;
+    let harness = crate::core::engine::mock_engine_handle();
+    runtime_threads
+        .install_test_engine(&thread_id, harness.handle.clone())
+        .await?;
+    runtime_threads
+        .set_active_turn_for_test(&thread_id, Some("turn_live"))
+        .await?;
+
+    let revert_body = json!({
+        "path": "a.txt",
+        "snapshot_id": "0123456789abcdef0123456789abcdef01234567",
+        "expected_hash": "absent"
+    });
+    let refusals = [
+        client
+            .post(format!("http://{addr}/v1/threads/{thread_id}/file-revert"))
+            .json(&revert_body)
+            .send()
+            .await?,
+        client
+            .post(format!("http://{addr}/v1/threads/{thread_id}/patch-undo"))
+            .json(&json!({}))
+            .send()
+            .await?,
+    ];
+    for resp in refusals {
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let text = resp.text().await?;
+        assert!(text.contains("already has an active turn"), "got: {text}");
+    }
+    assert_eq!(fs::read_to_string(&file)?, "live");
+    // The server-wide snapshot route validates its id first, then admission.
+    let resp = client
+        .post(format!("http://{addr}/v1/snapshots/not-hex/restore"))
+        .send()
+        .await?;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    runtime_threads
+        .set_active_turn_for_test(&thread_id, None)
+        .await?;
+    // Admitted again: the revert now fails on the unknown snapshot id, past
+    // the admission and trust gates, without touching the file.
+    let resp = client
+        .post(format!("http://{addr}/v1/threads/{thread_id}/file-revert"))
+        .json(&revert_body)
+        .send()
+        .await?;
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let text = resp.text().await?;
+    assert!(
+        text.contains("no bound session") || text.contains("refresh the change record"),
+        "got: {text}"
+    );
+    assert_eq!(fs::read_to_string(&file)?, "live");
+
+    handle.abort();
     Ok(())
 }
 
@@ -5243,7 +6137,7 @@ async fn session_create_from_thread_rejects_active_turn() -> Result<()> {
     let (active_tx, active_rx) = oneshot::channel();
     let (finish_tx, finish_rx) = oneshot::channel();
     tokio::spawn(async move {
-        if !matches!(rx_op.recv().await, Some(Op::SendMessage { .. })) {
+        if !matches!(rx_op.recv().await, Some(Op::SendMessage(TurnSpec { .. }))) {
             return;
         }
         let _ = tx_event
@@ -6066,6 +6960,95 @@ async fn thread_usage_endpoint_scopes_totals_to_one_thread() -> Result<()> {
     Ok(())
 }
 
+/// `GET /v1/approvals` serves the account-wide approval history behind the
+/// approvals log: decided rows carry their outcome + decision time, pending
+/// asks read "pending" with no decision time, newest ask first. A corrupt
+/// session log is skipped (warned server-side), never a 500.
+#[tokio::test]
+async fn approvals_endpoint_lists_decided_and_pending_newest_first() -> Result<()> {
+    use crate::approval_log::{ApprovalOutcome, ApprovalReceipt, ApprovalReceiptStore};
+    use chrono::{DateTime, Utc};
+
+    let root = std::env::temp_dir().join(format!("codewhale-approvals-api-{}", Uuid::new_v4()));
+    let sessions_dir = root.join("sessions");
+    let Some((addr, _threads, handle)) =
+        spawn_test_server_with_root(root, sessions_dir.clone()).await?
+    else {
+        return Ok(());
+    };
+    let client = crate::tls::reqwest_client();
+    let store = ApprovalReceiptStore::new(sessions_dir);
+
+    fn at(hour: u32) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(&format!("2026-09-10T{hour:02}:00:00Z"))
+            .expect("fixture time")
+            .to_utc()
+    }
+    // Decided pair in one session, a still-pending ask in another, a corrupt
+    // log in a third. Fixed stamps keep the newest-first order exact.
+    store.append(
+        "sess-decided",
+        &ApprovalReceipt::Asked {
+            approval_id: "tool-1".into(),
+            tool_call_id: "tool-1".into(),
+            tool_name: "exec_shell".into(),
+            created_at: at(10),
+        },
+    )?;
+    store.append(
+        "sess-decided",
+        &ApprovalReceipt::Decided {
+            approval_id: "tool-1".into(),
+            tool_call_id: "tool-1".into(),
+            outcome: ApprovalOutcome::Denied,
+            created_at: at(11),
+        },
+    )?;
+    store.append(
+        "sess-pending",
+        &ApprovalReceipt::Asked {
+            approval_id: "tool-2".into(),
+            tool_call_id: "tool-2".into(),
+            tool_name: "write_file".into(),
+            created_at: at(12),
+        },
+    )?;
+    let corrupt_dir = store.log_path("sess-corrupt")?;
+    fs::create_dir_all(corrupt_dir.parent().expect("log parent"))?;
+    fs::write(&corrupt_dir, "not-json\n")?;
+
+    let rows: serde_json::Value = client
+        .get(format!("http://{addr}/v1/approvals"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(rows.as_array().expect("rows").len(), 2);
+    assert_eq!(rows[0]["approval_id"], "tool-2");
+    assert_eq!(rows[0]["tool_name"], "write_file");
+    assert_eq!(rows[0]["outcome"], "pending");
+    assert!(rows[0]["decided_at"].is_null());
+    assert_eq!(rows[1]["approval_id"], "tool-1");
+    assert_eq!(rows[1]["tool_name"], "exec_shell");
+    assert_eq!(rows[1]["outcome"], "denied");
+    assert_eq!(rows[1]["asked_at"], "2026-09-10T10:00:00Z");
+    assert_eq!(rows[1]["decided_at"], "2026-09-10T11:00:00Z");
+
+    let one: serde_json::Value = client
+        .get(format!("http://{addr}/v1/approvals?limit=1"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(one.as_array().expect("rows").len(), 1);
+    assert_eq!(one[0]["approval_id"], "tool-2");
+
+    handle.abort();
+    Ok(())
+}
+
 /// `PUT /v1/sessions` persists the thread's audited cost with the same
 /// field semantics the TUI writer uses: parent-turn spend in
 /// `session_cost_*`, routed-child spend in `subagent_cost_*`, so a session
@@ -6124,6 +7107,7 @@ async fn session_save_merges_thread_cost_split_and_records_coverage() -> Result<
         routing_settlement: false,
         effective_route_usage: None,
         permission_posture: None,
+        mode: None,
         effective_provider: None,
         effective_provider_id: None,
         effective_openrouter_vendor: None,
@@ -6318,6 +7302,7 @@ async fn session_save_persists_parent_cny_unpriced_reasons_without_double_count(
         routing_settlement: false,
         effective_route_usage: None,
         permission_posture: None,
+        mode: None,
         effective_provider: None,
         effective_provider_id: None,
         effective_openrouter_vendor: None,
@@ -6653,6 +7638,53 @@ async fn start_turn_accepts_dynamic_tools_and_environment_id() -> Result<()> {
             .json()
             .await?;
         assert_eq!(stored["turns"][0]["permission_posture"], "auto_review");
+
+        handle.abort();
+        Ok(())
+    })
+    .await
+}
+
+/// A turn receipts the mode it ran in, not the thread's mode: a client reading
+/// the thread when the turn finishes would otherwise learn how the thread is
+/// set up *now*, which is a different question as soon as the mode is switched
+/// mid-run.
+#[tokio::test]
+async fn turn_record_reports_the_mode_it_ran_in() -> Result<()> {
+    Box::pin(async {
+        let Some((addr, _runtime_threads, handle)) = spawn_test_server().await? else {
+            return Ok(());
+        };
+        let client = crate::tls::reqwest_client();
+
+        let created: serde_json::Value = client
+            .post(format!("http://{addr}/v1/threads"))
+            .json(&json!({ "model": "test-model" }))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let thread_id = created["id"].as_str().context("missing thread id")?;
+
+        let started: serde_json::Value = client
+            .post(format!("http://{addr}/v1/threads/{thread_id}/turns"))
+            .json(&json!({ "prompt": "plan it", "mode": "plan" }))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        assert_eq!(started["turn"]["mode"], "plan");
+
+        let stored: serde_json::Value = client
+            .get(format!("http://{addr}/v1/threads/{thread_id}"))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        assert_eq!(stored["turns"][0]["mode"], "plan");
 
         handle.abort();
         Ok(())
@@ -7332,6 +8364,7 @@ fn seed_summary_search_transcript(
             routing_settlement: false,
             effective_route_usage: None,
             permission_posture: None,
+            mode: None,
             effective_provider: None,
             effective_provider_id: None,
             effective_openrouter_vendor: None,
@@ -8052,8 +9085,8 @@ async fn set_config_rejects_unknown_key_with_bad_request() -> Result<()> {
         .unwrap_or_default()
         .to_lowercase();
     assert!(
-        message.contains("unknown config key"),
-        "error message should mention 'unknown config key', got: {message}"
+        message.contains("unknown setting"),
+        "error message should mention 'unknown setting', got: {message}"
     );
 
     handle.abort();
@@ -8218,6 +9251,133 @@ async fn set_config_with_config_path_writes_to_specified_file() -> Result<()> {
 }
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn get_config_search_provider_reports_runtime_source() -> Result<()> {
+    let _lock = lock_test_env();
+    let _code = EnvVarGuard::remove("CODEWHALE_SEARCH_PROVIDER");
+    let _legacy = EnvVarGuard::remove("DEEPSEEK_SEARCH_PROVIDER");
+    let _tavily = EnvVarGuard::remove("TAVILY_API_KEY");
+
+    let root = std::env::temp_dir().join(format!("codewhale-search-source-{}", Uuid::new_v4()));
+    fs::create_dir_all(&root)?;
+    let config_file = root.join("config.toml");
+    fs::write(&config_file, "[search]\napi_key = \"tvly-autodetected\"\n")?;
+
+    let Some((addr, _runtime_threads, handle)) =
+        spawn_test_server_with_config_path(config_file).await?
+    else {
+        return Ok(());
+    };
+    let client = crate::tls::reqwest_client();
+    let body: serde_json::Value = client
+        .get(format!("http://{addr}/v1/config"))
+        .send()
+        .await
+        .expect("GET /v1/config should not fail at transport level")
+        .json()
+        .await
+        .expect("GET /v1/config should be JSON");
+    handle.abort();
+
+    assert_eq!(body["search_provider"], "tavily", "body: {body}");
+    assert_eq!(
+        body["search_provider_source"], "tavily key",
+        "GET must publish the same source token doctor prints: {body}"
+    );
+    assert!(
+        body.get("missing_key").is_none(),
+        "missing-key is stdout-only: {body}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn set_config_search_provider_persist_skips_firecrawl_default_round_trip() -> Result<()> {
+    let _lock = lock_test_env();
+    let _code = EnvVarGuard::remove("CODEWHALE_SEARCH_PROVIDER");
+    let _legacy = EnvVarGuard::remove("DEEPSEEK_SEARCH_PROVIDER");
+    let _tavily = EnvVarGuard::remove("TAVILY_API_KEY");
+
+    let root = std::env::temp_dir().join(format!("codewhale-search-persist-{}", Uuid::new_v4()));
+    fs::create_dir_all(&root)?;
+    let config_file = root.join("config.toml");
+    fs::write(&config_file, "# initial\n")?;
+
+    let Some((addr, _runtime_threads, handle)) =
+        spawn_test_server_with_config_path(config_file.clone()).await?
+    else {
+        return Ok(());
+    };
+    let client = crate::tls::reqwest_client();
+
+    // GET returns `firecrawl`; saving it back must NOT write a pin, because
+    // `provider = "firecrawl"` would flip source Default -> Config and then
+    // block a later Tavily key.
+    let (status, body) =
+        post_set_config(&client, &addr, "search_provider", "firecrawl", true).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["persisted"], false, "body: {body}");
+    let contents = fs::read_to_string(&config_file)?;
+    assert!(
+        !contents.contains("provider"),
+        "round-tripping the resolved default must not pin it: {contents}"
+    );
+
+    // An explicit *change* still persists.
+    let (status, body) = post_set_config(&client, &addr, "search_provider", "bocha", true).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["persisted"], true, "body: {body}");
+    let contents = fs::read_to_string(&config_file)?;
+    assert!(
+        contents.contains("provider = \"bocha\""),
+        "an explicit provider change must persist: {contents}"
+    );
+
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn set_config_search_provider_persist_skips_tavily_autodetect() -> Result<()> {
+    let _lock = lock_test_env();
+    let _code = EnvVarGuard::remove("CODEWHALE_SEARCH_PROVIDER");
+    let _legacy = EnvVarGuard::remove("DEEPSEEK_SEARCH_PROVIDER");
+    let _tavily = EnvVarGuard::remove("TAVILY_API_KEY");
+
+    let root = std::env::temp_dir().join(format!("codewhale-search-auto-{}", Uuid::new_v4()));
+    fs::create_dir_all(&root)?;
+    let config_file = root.join("config.toml");
+    fs::write(&config_file, "[search]\napi_key = \"tvly-autodetected\"\n")?;
+
+    let Some((addr, _runtime_threads, handle)) =
+        spawn_test_server_with_config_path(config_file.clone()).await?
+    else {
+        return Ok(());
+    };
+    let client = crate::tls::reqwest_client();
+
+    let (status, body) = post_set_config(&client, &addr, "search_provider", "tavily", true).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["persisted"], false, "body: {body}");
+    assert!(
+        body["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("tavily key")),
+        "the skip must explain the autodetect source: {body}"
+    );
+    let contents = fs::read_to_string(&config_file)?;
+    assert!(
+        !contents.contains("provider"),
+        "GET -> POST round-trip must not pin autodetect: {contents}"
+    );
+
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
 async fn reload_config_endpoint_returns_success() -> Result<()> {
     // Basic smoke test that /v1/config/reload returns 200 with a message.
     let root = std::env::temp_dir().join(format!("codewhale-config-reload-{}", Uuid::new_v4()));
@@ -8287,6 +9447,179 @@ async fn get_provider_models(
         .json()
         .await
         .expect("GET /v1/providers/{id}/models should return valid JSON")
+}
+
+/// Helper: GET `/v1/settings/schema` and return the parsed response body.
+async fn get_settings_schema(client: &reqwest::Client, addr: &SocketAddr) -> serde_json::Value {
+    client
+        .get(format!("http://{addr}/v1/settings/schema"))
+        .send()
+        .await
+        .expect("GET /v1/settings/schema should not fail at transport level")
+        .error_for_status()
+        .expect("GET /v1/settings/schema should return 200")
+        .json()
+        .await
+        .expect("GET /v1/settings/schema should return valid JSON")
+}
+
+#[tokio::test]
+async fn settings_schema_serves_every_declared_row_with_runtime_state() -> Result<()> {
+    let _lock = lock_test_env();
+    let root = tempfile::tempdir()?;
+    let config_file = root.path().join("config.toml");
+    fs::write(
+        &config_file,
+        "provider = \"deepseek\"\napi_key = \"runtime-api-test-key\"\nbase_url = \"http://127.0.0.1:1/v1\"\ntelemetry = false\n\n[notifications]\ncondition = \"always\"\n",
+    )?;
+    fs::write(root.path().join("settings.toml"), "calm_mode = true\n")?;
+    let _config = EnvVarGuard::set("CODEWHALE_CONFIG_PATH", &config_file);
+    let Some((addr, _runtime_threads, handle)) =
+        spawn_test_server_with_config_path(config_file.clone()).await?
+    else {
+        return Ok(());
+    };
+    let client = crate::tls::reqwest_client();
+    let body = get_settings_schema(&client, &addr).await;
+    handle.abort();
+
+    assert_eq!(body["version"], 1);
+    let tabs = body["tabs"].as_array().expect("tabs array");
+    let tab_ids: Vec<_> = tabs.iter().filter_map(|t| t["id"].as_str()).collect();
+    assert_eq!(
+        tab_ids,
+        codewhale_config::settings_schema::schema_tabs(),
+        "tabs project the schema declaration order"
+    );
+
+    let rows = body["settings"].as_array().expect("settings array");
+    assert_eq!(
+        rows.len(),
+        codewhale_config::settings_schema::schema_rows().count(),
+        "every declared UI row is served"
+    );
+    let row = |key: &str| {
+        rows.iter()
+            .find(|row| row["key"] == key)
+            .unwrap_or_else(|| panic!("schema row {key} missing"))
+    };
+
+    for entry in rows {
+        let kind = entry["kind"].as_str().expect("kind");
+        assert!(
+            matches!(kind, "bool" | "int" | "float" | "enum" | "string"),
+            "unknown kind {kind}"
+        );
+        assert!(
+            matches!(
+                entry["row"].as_str(),
+                Some("setting" | "action" | "diagnostic" | "session")
+            ),
+            "unknown row kind for {}",
+            entry["key"]
+        );
+        let label = entry["label"].as_str().expect("label");
+        assert!(
+            !label.is_empty() && !label.starts_with("Config"),
+            "label must be resolved prose, not a message key: {label}"
+        );
+        assert!(entry["visible"].is_boolean());
+        assert!(entry["editable"].is_boolean());
+        if kind == "enum" {
+            assert!(
+                !entry["options"]
+                    .as_array()
+                    .expect("enum options")
+                    .is_empty(),
+                "enum row {} must serve its closed value set",
+                entry["key"]
+            );
+        }
+    }
+
+    // Values resolve from the owning store, not a decorated guess.
+    assert_eq!(row("calm_mode")["value"], "true");
+    assert_eq!(row("calm_mode")["persisted"], true);
+    assert_eq!(row("notifications.condition")["value"], "always");
+    assert_eq!(row("notifications.condition")["persisted"], true);
+    assert_eq!(row("telemetry")["value"], "false");
+
+    // Row kinds and editability agree with the TUI's own semantics:
+    // model/provider open pickers (actions), approval_mode is the
+    // session-scoped writable, endpoint rows are read-only receipts.
+    assert_eq!(row("model")["row"], "action");
+    assert_eq!(row("model")["editable"], false);
+    assert_eq!(row("approval_mode")["row"], "session");
+    assert_eq!(row("approval_mode")["editable"], true);
+    assert_eq!(row("provider_url")["editable"], false);
+    assert_eq!(row("telemetry")["editable"], false);
+    for action in ["mcp_open", "plugins_open"] {
+        assert_eq!(row(action)["row"], "action");
+        assert_eq!(row(action)["editable"], false);
+    }
+
+    // The conditional triple resolves to exactly one visible member for a
+    // config with no managed policy: the editable TUI posture row.
+    assert_eq!(row("permission_posture")["visible"], true);
+    assert_eq!(row("approval_policy")["visible"], false);
+    assert_eq!(row("managed_approval_policy")["visible"], false);
+    Ok(())
+}
+
+#[tokio::test]
+async fn settings_schema_write_fallthrough_persists_declared_settings_keys() -> Result<()> {
+    let _lock = lock_test_env();
+    let root = tempfile::tempdir()?;
+    let config_file = root.path().join("config.toml");
+    fs::write(
+        &config_file,
+        "provider = \"deepseek\"\napi_key = \"runtime-api-test-key\"\nbase_url = \"http://127.0.0.1:1/v1\"\n",
+    )?;
+    let _config = EnvVarGuard::set("CODEWHALE_CONFIG_PATH", &config_file);
+    let Some((addr, _runtime_threads, handle)) =
+        spawn_test_server_with_config_path(config_file.clone()).await?
+    else {
+        return Ok(());
+    };
+    let client = crate::tls::reqwest_client();
+
+    // A schema-declared settings.toml key outside the curated arm list must
+    // persist through the shared validator rather than 400.
+    let response = client
+        .post(format!("http://{addr}/v1/config"))
+        .json(&json!({"key": "composer_density", "value": "compact", "persist": true}))
+        .send()
+        .await?
+        .error_for_status()
+        .expect("composer_density is a declared settings key")
+        .json::<serde_json::Value>()
+        .await?;
+    assert_eq!(response["persisted"], true);
+    assert_eq!(
+        crate::settings::Settings::load_persisted()?.composer_density,
+        "compact"
+    );
+    let body = get_settings_schema(&client, &addr).await;
+    let row = body["settings"]
+        .as_array()
+        .expect("settings array")
+        .iter()
+        .find(|row| row["key"] == "composer_density")
+        .expect("composer_density row");
+    assert_eq!(row["value"], "compact");
+    assert_eq!(row["persisted"], true);
+
+    // A key the schema does not declare still fails closed.
+    let status = client
+        .post(format!("http://{addr}/v1/config"))
+        .json(&json!({"key": "not_a_real_setting", "value": "x", "persist": true}))
+        .send()
+        .await?
+        .status();
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    handle.abort();
+    Ok(())
 }
 
 #[test]
@@ -9302,8 +10635,19 @@ model = "local-model"
         );
         assert_eq!(custom["credentialState"], expected_state);
 
+        // An allow-list, not a snapshot: a new field here has to be argued for
+        // in this test before it can reach the wire. `credentialSource` and
+        // `credentialWritable` (#6179) are admissible because they are a
+        // *class* and a boolean — the source is one of four fixed enum
+        // spellings and can never interpolate a value, a path, or an
+        // environment variable name. `credentialWritableReason` is
+        // `skip_serializing_if = Option::is_none`, so it is absent for every
+        // writable route and is asserted separately below when present.
         let allowed_fields: std::collections::BTreeSet<_> = [
+            "credentialSource",
             "credentialState",
+            "credentialWritable",
+            "credentialWritableReason",
             "default_model",
             "display_name",
             "has_model_catalog",
@@ -9312,20 +10656,28 @@ model = "local-model"
         ]
         .into_iter()
         .collect();
+        const CREDENTIAL_SOURCES: [&str; 4] = ["secret_store", "config", "external_auth", "none"];
         for entry in providers["providers"]
             .as_array()
             .context("providers array")?
         {
-            let actual_fields: std::collections::BTreeSet<_> = entry
-                .as_object()
-                .context("provider entry object")?
-                .keys()
-                .map(String::as_str)
-                .collect();
-            assert_eq!(
-                actual_fields, allowed_fields,
-                "provider catalog must remain a non-secret projection"
+            let object = entry.as_object().context("provider entry object")?;
+            let actual_fields: std::collections::BTreeSet<_> =
+                object.keys().map(String::as_str).collect();
+            assert!(
+                actual_fields.is_subset(&allowed_fields),
+                "provider catalog must remain a non-secret projection: {actual_fields:?}"
             );
+            // The source is a closed vocabulary. If it ever stops being one,
+            // it has become a place a value can hide.
+            let source = object["credentialSource"]
+                .as_str()
+                .context("credentialSource must be a string")?;
+            assert!(
+                CREDENTIAL_SOURCES.contains(&source),
+                "credentialSource must stay a fixed class, got {source:?}"
+            );
+            assert!(object["credentialWritable"].is_boolean());
         }
 
         let serialized = serde_json::to_string(&providers)?;
@@ -13630,7 +14982,7 @@ async fn runtime_image_http_rejects_before_dispatch_and_accepts_large_canonical_
     let response = client.post(&url).json(&body).send().await?;
     assert_eq!(response.status(), StatusCode::CREATED);
     let accepted: Value = response.json().await?;
-    let Op::SendMessage { images, .. } =
+    let Op::SendMessage(TurnSpec { images, .. }) =
         harness.rx_op.recv().await.context("accepted Engine op")?
     else {
         bail!("expected SendMessage");
@@ -14021,5 +15373,2212 @@ async fn output_cap_compatibility_stream_rejects_before_thread_creation() -> Res
             .is_empty()
     );
     server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn workspace_files_list_read_write_bounds_and_confinement() -> Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let workspace = tmp.path().join("workspace");
+    fs::create_dir_all(workspace.join("src"))?;
+    fs::create_dir_all(workspace.join("bin"))?;
+    fs::create_dir_all(workspace.join("empty"))?;
+    fs::create_dir_all(workspace.join(".git/hooks"))?;
+    fs::write(workspace.join("src/main.rs"), "fn main() {}\n")?;
+    fs::write(workspace.join("README.md"), "# readme\n")?;
+    fs::write(workspace.join("bin/blob"), [0u8, 1, 2, 255])?;
+    fs::write(workspace.join(".git/config"), "[core]\n")?;
+    let outside = tmp.path().join("outside");
+    fs::create_dir_all(&outside)?;
+    fs::write(outside.join("secret.txt"), "never served")?;
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(&outside, workspace.join("link-dir"))?;
+        std::os::unix::fs::symlink(outside.join("secret.txt"), workspace.join("link-file"))?;
+    }
+    let (addr, _, handle) = spawn_test_server_with_root_token_mobile_workspace(
+        tmp.path().join("runtime"),
+        tmp.path().join("sessions"),
+        Some("files-token".to_string()),
+        false,
+        workspace.clone(),
+    )
+    .await?
+    .context("files test requires a loopback listener")?;
+    let client = crate::tls::reqwest_client();
+    let base = format!("http://{addr}");
+    let url = |route: &str, pairs: &[(&str, &str)]| {
+        let mut url = reqwest::Url::parse(&format!("{base}{route}")).unwrap();
+        url.query_pairs_mut().extend_pairs(pairs.iter().copied());
+        url
+    };
+
+    // Authentication is required on every route.
+    for route in [
+        "/v1/workspace/files",
+        "/v1/workspace/files/read?path=README.md",
+    ] {
+        let status = client.get(format!("{base}{route}")).send().await?.status();
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{route}");
+    }
+
+    // Listing: directories first, `.git` hidden, links named but never followed.
+    let root_listing: Value = client
+        .get(url("/v1/workspace/files", &[]))
+        .bearer_auth("files-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let names: Vec<(String, String)> = root_listing["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| {
+            (
+                entry["name"].as_str().unwrap().to_string(),
+                entry["kind"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+    assert!(!names.iter().any(|(name, _)| name == ".git"));
+    assert!(names.contains(&("bin".to_string(), "directory".to_string())));
+    assert!(names.contains(&("src".to_string(), "directory".to_string())));
+    assert!(names.contains(&("README.md".to_string(), "file".to_string())));
+    #[cfg(unix)]
+    {
+        assert!(names.contains(&("link-dir".to_string(), "symlink".to_string())));
+        assert!(names.contains(&("link-file".to_string(), "symlink".to_string())));
+    }
+    let last_directory = names
+        .iter()
+        .rposition(|(_, kind)| kind == "directory")
+        .unwrap();
+    assert!(
+        names[..=last_directory]
+            .iter()
+            .all(|(_, kind)| kind == "directory"),
+        "directories are listed first: {names:?}"
+    );
+    let readme = root_listing["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["name"] == "README.md")
+        .unwrap();
+    assert_eq!(readme["size"], 9);
+    assert_eq!(readme["path"], "README.md");
+    assert!(readme["modified"].is_string());
+    assert_eq!(root_listing["truncated"], false);
+
+    let src_listing: Value = client
+        .get(url("/v1/workspace/files", &[("path", "src/")]))
+        .bearer_auth("files-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(src_listing["path"], "src");
+    assert_eq!(src_listing["entries"][0]["path"], "src/main.rs");
+    let limited: Value = client
+        .get(url("/v1/workspace/files", &[("limit", "1")]))
+        .bearer_auth("files-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(limited["entries"].as_array().unwrap().len(), 1);
+    assert_eq!(limited["truncated"], true);
+    let mut rejected_listings = vec![
+        ("../", StatusCode::BAD_REQUEST),
+        ("/etc", StatusCode::BAD_REQUEST),
+        ("src/../src", StatusCode::BAD_REQUEST),
+        ("src\\main", StatusCode::BAD_REQUEST),
+        (".git", StatusCode::FORBIDDEN),
+        ("README.md", StatusCode::BAD_REQUEST),
+        ("missing", StatusCode::NOT_FOUND),
+    ];
+    if cfg!(unix) {
+        rejected_listings.push(("link-dir", StatusCode::FORBIDDEN));
+    }
+    for (path, expected) in rejected_listings {
+        let status = client
+            .get(url("/v1/workspace/files", &[("path", path)]))
+            .bearer_auth("files-token")
+            .send()
+            .await?
+            .status();
+        assert_eq!(status, expected, "list path={path:?}");
+    }
+    let status = client
+        .get(url("/v1/workspace/files", &[("limit", "0")]))
+        .bearer_auth("files-token")
+        .send()
+        .await?
+        .status();
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // Reads: whole-file revision, byte windows, binary fallback, confinement.
+    let read: Value = client
+        .get(url("/v1/workspace/files/read", &[("path", "src/main.rs")]))
+        .bearer_auth("files-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let expected_revision = {
+        let digest = sha2::Sha256::digest(b"fn main() {}\n");
+        digest
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    };
+    assert_eq!(read["path"], "src/main.rs");
+    assert_eq!(read["encoding"], "utf-8");
+    assert_eq!(read["content"], "fn main() {}\n");
+    assert_eq!(read["size"], 13);
+    assert_eq!(read["bytes"], 13);
+    assert_eq!(read["truncated"], false);
+    assert_eq!(read["revision"], expected_revision);
+    let window: Value = client
+        .get(url(
+            "/v1/workspace/files/read",
+            &[("path", "src/main.rs"), ("offset", "3"), ("limit", "4")],
+        ))
+        .bearer_auth("files-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(window["content"], "main");
+    assert_eq!(window["offset"], 3);
+    assert_eq!(window["bytes"], 4);
+    assert_eq!(window["truncated"], true);
+    assert_eq!(
+        window["revision"], expected_revision,
+        "revision covers the whole file"
+    );
+    let binary: Value = client
+        .get(url("/v1/workspace/files/read", &[("path", "bin/blob")]))
+        .bearer_auth("files-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(binary["encoding"], "base64");
+    assert_eq!(
+        base64::engine::general_purpose::STANDARD
+            .decode(binary["content"].as_str().unwrap())
+            .unwrap(),
+        vec![0u8, 1, 2, 255]
+    );
+    let mut rejected_reads = vec![
+        ("", StatusCode::BAD_REQUEST),
+        ("../outside/secret.txt", StatusCode::BAD_REQUEST),
+        (".git/config", StatusCode::FORBIDDEN),
+        ("src", StatusCode::BAD_REQUEST),
+        ("missing.txt", StatusCode::NOT_FOUND),
+        ("src/missing.rs", StatusCode::NOT_FOUND),
+    ];
+    if cfg!(unix) {
+        rejected_reads.push(("link-file", StatusCode::FORBIDDEN));
+        rejected_reads.push(("link-dir/secret.txt", StatusCode::FORBIDDEN));
+    }
+    for (path, expected) in rejected_reads {
+        let status = client
+            .get(url("/v1/workspace/files/read", &[("path", path)]))
+            .bearer_auth("files-token")
+            .send()
+            .await?
+            .status();
+        assert_eq!(status, expected, "read path={path:?}");
+    }
+    let status = client
+        .get(url(
+            "/v1/workspace/files/read",
+            &[("path", "README.md"), ("limit", "0")],
+        ))
+        .bearer_auth("files-token")
+        .send()
+        .await?
+        .status();
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // Writes: create, then optimistic concurrency on the whole-file revision.
+    let put = |body: Value| {
+        client
+            .put(format!("{base}/v1/workspace/files"))
+            .bearer_auth("files-token")
+            .json(&body)
+    };
+    let status = client
+        .put(format!("{base}/v1/workspace/files"))
+        .json(&json!({"path": "notes/todo.md", "content": "x"}))
+        .send()
+        .await?
+        .status();
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let created = put(json!({"path": "notes/todo.md", "content": "- first\n"}))
+        .send()
+        .await?;
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let created: Value = created.json().await?;
+    assert_eq!(created["created"], true);
+    assert_eq!(created["path"], "notes/todo.md");
+    assert_eq!(created["size"], 8);
+    assert_eq!(
+        fs::read_to_string(workspace.join("notes/todo.md"))?,
+        "- first\n"
+    );
+    let first_revision = created["revision"].as_str().unwrap().to_string();
+    let read_back: Value = client
+        .get(url(
+            "/v1/workspace/files/read",
+            &[("path", "notes/todo.md")],
+        ))
+        .bearer_auth("files-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(read_back["revision"], first_revision);
+
+    // Overwrites need the revision that was read; a stale one is refused.
+    let status = put(json!({"path": "notes/todo.md", "content": "- second\n"}))
+        .send()
+        .await?
+        .status();
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "overwrite without expected_revision"
+    );
+    let stale = put(json!({
+        "path": "notes/todo.md",
+        "content": "- second\n",
+        "expected_revision": "0".repeat(64),
+    }))
+    .send()
+    .await?;
+    assert_eq!(stale.status(), StatusCode::CONFLICT);
+    let stale: Value = stale.json().await?;
+    assert!(
+        stale["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains(&first_revision),
+        "conflict names the current revision"
+    );
+    assert_eq!(
+        fs::read_to_string(workspace.join("notes/todo.md"))?,
+        "- first\n"
+    );
+    let updated = put(json!({
+        "path": "notes/todo.md",
+        "content": "- second\n",
+        "expected_revision": first_revision,
+    }))
+    .send()
+    .await?;
+    assert_eq!(updated.status(), StatusCode::OK);
+    let updated: Value = updated.json().await?;
+    assert_eq!(updated["created"], false);
+    assert_ne!(updated["revision"], first_revision);
+    assert_eq!(
+        fs::read_to_string(workspace.join("notes/todo.md"))?,
+        "- second\n"
+    );
+    let status = put(json!({
+        "path": "notes/new.md",
+        "content": "x",
+        "expected_revision": first_revision,
+    }))
+    .send()
+    .await?
+    .status();
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "expected_revision on a new file"
+    );
+    assert!(!workspace.join("notes/new.md").exists());
+
+    // Binary payloads, bad encodings, oversized bodies and confinement.
+    let encoded = put(json!({
+        "path": "bin/written.bin",
+        "content": base64::engine::general_purpose::STANDARD.encode([7u8, 0, 9]),
+        "encoding": "base64",
+    }))
+    .send()
+    .await?;
+    assert_eq!(encoded.status(), StatusCode::CREATED);
+    assert_eq!(
+        fs::read(workspace.join("bin/written.bin"))?,
+        vec![7u8, 0, 9]
+    );
+    let status = put(json!({"path": "bin/x", "content": "x", "encoding": "hex"}))
+        .send()
+        .await?
+        .status();
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let status = put(json!({"path": "bin/x", "content": "***", "encoding": "base64"}))
+        .send()
+        .await?
+        .status();
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let status = put(json!({"path": "big.txt", "content": "a".repeat(4 * 1024 * 1024 + 1)}))
+        .send()
+        .await?
+        .status();
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    let mut rejected_writes = vec![
+        ("../outside/x.txt", StatusCode::BAD_REQUEST),
+        ("/tmp/x.txt", StatusCode::BAD_REQUEST),
+        (".git/hooks/pre-commit", StatusCode::FORBIDDEN),
+        ("src", StatusCode::BAD_REQUEST),
+    ];
+    if cfg!(unix) {
+        rejected_writes.push(("link-dir/x.txt", StatusCode::FORBIDDEN));
+        rejected_writes.push(("link-file", StatusCode::FORBIDDEN));
+    }
+    for (path, expected) in rejected_writes {
+        let status = put(json!({"path": path, "content": "x"}))
+            .send()
+            .await?
+            .status();
+        assert_eq!(status, expected, "write path={path:?}");
+    }
+    assert!(!outside.join("x.txt").exists());
+    assert_eq!(
+        fs::read_to_string(outside.join("secret.txt"))?,
+        "never served"
+    );
+    assert!(!workspace.join(".git/hooks/pre-commit").exists());
+
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn session_artifacts_list_and_bounded_read() -> Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let sessions_dir = tmp.path().join("sessions");
+    let workspace = tmp.path().join("workspace");
+    fs::create_dir_all(&workspace)?;
+    let manager = crate::session_manager::SessionManager::new(sessions_dir.clone())?;
+    let session_id = "sess_artifacts_route".to_string();
+    let mut session = crate::session_manager::create_saved_session_with_id_and_mode(
+        session_id.clone(),
+        &[],
+        "deepseek-v4-pro",
+        &workspace,
+        0,
+        None,
+        Some("plan"),
+    );
+    let artifact_dir = sessions_dir.join(&session_id).join("artifacts");
+    fs::create_dir_all(&artifact_dir)?;
+    let body = "line one\nline two\n".repeat(64);
+    fs::write(artifact_dir.join("art_call_1.txt"), &body)?;
+    let served = crate::artifacts::record_tool_output_artifact_with_size(
+        &session_id,
+        "call_1",
+        "bash",
+        PathBuf::from("artifacts/art_call_1.txt"),
+        body.len() as u64,
+        "line one",
+    );
+    let escaping = crate::artifacts::record_tool_output_artifact_with_size(
+        &session_id,
+        "call_2",
+        "bash",
+        PathBuf::from("../../escape.txt"),
+        4,
+        "nope",
+    );
+    fs::write(tmp.path().join("escape.txt"), "nope")?;
+    let missing = crate::artifacts::record_tool_output_artifact_with_size(
+        &session_id,
+        "call_3",
+        "bash",
+        PathBuf::from("artifacts/gone.txt"),
+        4,
+        "gone",
+    );
+    session.artifacts = vec![served.clone(), escaping.clone(), missing.clone()];
+    manager.save_session(&session)?;
+
+    let (addr, _, handle) = spawn_test_server_with_root_token_mobile_workspace(
+        tmp.path().join("runtime"),
+        sessions_dir.clone(),
+        Some("artifacts-token".to_string()),
+        false,
+        workspace,
+    )
+    .await?
+    .context("artifacts test requires a loopback listener")?;
+    let client = crate::tls::reqwest_client();
+    let base = format!("http://{addr}");
+
+    let status = client
+        .get(format!("{base}/v1/sessions/{session_id}/artifacts"))
+        .send()
+        .await?
+        .status();
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let listing: Value = client
+        .get(format!("{base}/v1/sessions/{session_id}/artifacts"))
+        .bearer_auth("artifacts-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(listing["session_id"], session_id);
+    let artifacts = listing["artifacts"].as_array().unwrap();
+    assert_eq!(artifacts.len(), 3);
+    assert_eq!(artifacts[0]["id"], served.id);
+    assert_eq!(artifacts[0]["kind"], "tool_output");
+    assert_eq!(artifacts[0]["tool_name"], "bash");
+    assert_eq!(artifacts[0]["tool_call_id"], "call_1");
+    assert_eq!(artifacts[0]["byte_size"], body.len() as u64);
+    assert_eq!(artifacts[0]["path"], "artifacts/art_call_1.txt");
+    assert_eq!(artifacts[0]["preview"], "line one");
+    assert!(artifacts[0].get("storage_path").is_none());
+
+    let read: Value = client
+        .get(format!(
+            "{base}/v1/sessions/{session_id}/artifacts/{}",
+            served.id
+        ))
+        .bearer_auth("artifacts-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(read["artifact"]["id"], served.id);
+    assert_eq!(read["encoding"], "utf-8");
+    assert_eq!(read["content"], body);
+    assert_eq!(read["size"], body.len() as u64);
+    assert_eq!(read["truncated"], false);
+    let window: Value = client
+        .get(format!(
+            "{base}/v1/sessions/{session_id}/artifacts/{}?offset=5&limit=3",
+            served.id
+        ))
+        .bearer_auth("artifacts-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(window["content"], "one");
+    assert_eq!(window["truncated"], true);
+    assert_eq!(window["revision"], read["revision"]);
+
+    for (artifact_id, expected) in [
+        (escaping.id.as_str(), StatusCode::FORBIDDEN),
+        (missing.id.as_str(), StatusCode::NOT_FOUND),
+        ("art_unknown", StatusCode::NOT_FOUND),
+    ] {
+        let status = client
+            .get(format!(
+                "{base}/v1/sessions/{session_id}/artifacts/{artifact_id}"
+            ))
+            .bearer_auth("artifacts-token")
+            .send()
+            .await?
+            .status();
+        assert_eq!(status, expected, "artifact={artifact_id}");
+    }
+    let status = client
+        .get(format!(
+            "{base}/v1/sessions/{session_id}/artifacts/{}?limit=0",
+            served.id
+        ))
+        .bearer_auth("artifacts-token")
+        .send()
+        .await?
+        .status();
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let status = client
+        .get(format!("{base}/v1/sessions/sess_missing/artifacts"))
+        .bearer_auth("artifacts-token")
+        .send()
+        .await?
+        .status();
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    handle.abort();
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// /v1/jobs: client-owned shell jobs on the thread's shared ShellManager.
+// ---------------------------------------------------------------------------
+
+#[cfg(unix)]
+#[tokio::test]
+async fn jobs_api_lists_creates_streams_stdin_and_kills() -> Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let workspace = tmp.path().join("workspace");
+    fs::create_dir_all(&workspace)?;
+    let (addr, _runtime_threads, handle) = spawn_test_server_with_root_token_mobile_workspace(
+        tmp.path().join("runtime"),
+        tmp.path().join("sessions"),
+        Some("jobs-token".to_string()),
+        false,
+        workspace.clone(),
+    )
+    .await?
+    .context("jobs test requires a loopback listener")?;
+    let client = crate::tls::reqwest_client();
+    let base = format!("http://{addr}");
+
+    // Auth is required on every jobs route.
+    for route in ["/v1/jobs", "/v1/threads/thread-x/jobs"] {
+        let status = client.get(format!("{base}{route}")).send().await?.status();
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{route}");
+    }
+
+    let thread: Value = client
+        .post(format!("{base}/v1/threads"))
+        .bearer_auth("jobs-token")
+        .json(&json!({ "workspace": workspace, "allow_shell": true }))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let thread_id = thread["id"].as_str().unwrap().to_string();
+
+    // A shell-forbidden thread refuses job creation.
+    let no_shell: Value = client
+        .post(format!("{base}/v1/threads"))
+        .bearer_auth("jobs-token")
+        .json(&json!({ "workspace": workspace, "allow_shell": false }))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let no_shell_id = no_shell["id"].as_str().unwrap().to_string();
+    let status = client
+        .post(format!("{base}/v1/threads/{no_shell_id}/jobs"))
+        .bearer_auth("jobs-token")
+        .json(&json!({ "command": "echo never" }))
+        .send()
+        .await?
+        .status();
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // Unknown thread and unknown job are honest 404s, and a thread that never
+    // ran shell work lists empty rather than fabricating a manager.
+    let status = client
+        .get(format!("{base}/v1/threads/thread-missing/jobs"))
+        .bearer_auth("jobs-token")
+        .send()
+        .await?
+        .status();
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let empty: Value = client
+        .get(format!("{base}/v1/threads/{no_shell_id}/jobs"))
+        .bearer_auth("jobs-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(empty["jobs"].as_array().unwrap().len(), 0);
+    let status = client
+        .get(format!(
+            "{base}/v1/threads/{thread_id}/jobs/job-missing/output"
+        ))
+        .bearer_auth("jobs-token")
+        .send()
+        .await?
+        .status();
+    // The thread has no manager yet, so this is a not-found either way.
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // Create a client-owned background job.
+    let created = client
+        .post(format!("{base}/v1/threads/{thread_id}/jobs"))
+        .bearer_auth("jobs-token")
+        .json(&json!({ "command": "echo codewhale-jobs && echo second-line" }))
+        .send()
+        .await?
+        .error_for_status()?;
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let created: Value = created.json().await?;
+    let job_id = created["job"]["id"].as_str().unwrap().to_string();
+    assert_eq!(created["job"]["owner"], "client");
+    assert_eq!(created["job"]["thread_id"], thread_id);
+    assert_eq!(
+        created["job"]["command"],
+        "echo codewhale-jobs && echo second-line"
+    );
+
+    // Poll the byte stream until the job exits; the cursor contract replays
+    // the full stream from 0 for a late reader.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let mut chunk: Value;
+    loop {
+        chunk = client
+            .get(format!(
+                "{base}/v1/threads/{thread_id}/jobs/{job_id}/output?format=text"
+            ))
+            .bearer_auth("jobs-token")
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        if chunk["done"].as_bool().unwrap() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "job did not finish: {chunk}"
+        );
+        sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(chunk["status"], "Completed");
+    assert_eq!(chunk["exit_code"], 0);
+    assert!(chunk["data"].as_str().unwrap().contains("codewhale-jobs"));
+    assert_eq!(chunk["dropped"], 0);
+
+    // A cursor at the end stays put; a mid-stream cursor resumes exactly.
+    let total = chunk["total"].as_u64().unwrap();
+    let tail: Value = client
+        .get(format!(
+            "{base}/v1/threads/{thread_id}/jobs/{job_id}/output?format=text&cursor={total}"
+        ))
+        .bearer_auth("jobs-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(tail["data"], "");
+    assert_eq!(tail["next_cursor"], total);
+    assert_eq!(tail["done"], true);
+
+    // stdin round-trip: a `cat` job echoes what the API writes.
+    let cat: Value = client
+        .post(format!("{base}/v1/threads/{thread_id}/jobs"))
+        .bearer_auth("jobs-token")
+        .json(&json!({ "command": "cat" }))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let cat_id = cat["job"]["id"].as_str().unwrap().to_string();
+    assert_eq!(cat["job"]["stdin_available"], true);
+    let status = client
+        .post(format!("{base}/v1/threads/{thread_id}/jobs/{cat_id}/stdin"))
+        .bearer_auth("jobs-token")
+        .json(&json!({ "data": "typed-by-client\n", "close": true }))
+        .send()
+        .await?
+        .status();
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let echoed = loop {
+        let chunk: Value = client
+            .get(format!(
+                "{base}/v1/threads/{thread_id}/jobs/{cat_id}/output?format=text"
+            ))
+            .bearer_auth("jobs-token")
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        if chunk["done"].as_bool().unwrap() {
+            break chunk;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "cat job did not finish: {chunk}"
+        );
+        sleep(std::time::Duration::from_millis(50)).await;
+    };
+    assert_eq!(echoed["data"], "typed-by-client\n");
+
+    // The flat listing sees both jobs, tagged to this thread.
+    let all: Value = client
+        .get(format!("{base}/v1/jobs"))
+        .bearer_auth("jobs-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let ids: Vec<&str> = all["jobs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|job| job["id"].as_str().unwrap())
+        .collect();
+    assert!(ids.contains(&job_id.as_str()) && ids.contains(&cat_id.as_str()));
+
+    // Kill stops a running job and reports the terminal snapshot.
+    let sleeper: Value = client
+        .post(format!("{base}/v1/threads/{thread_id}/jobs"))
+        .bearer_auth("jobs-token")
+        .json(&json!({ "command": "sleep 60" }))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let sleeper_id = sleeper["job"]["id"].as_str().unwrap().to_string();
+    let killed: Value = client
+        .post(format!(
+            "{base}/v1/threads/{thread_id}/jobs/{sleeper_id}/kill"
+        ))
+        .bearer_auth("jobs-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(killed["job"]["status"], "Killed");
+
+    // A job id from another thread's scope is a scoped 404, not a leak.
+    let other: Value = client
+        .post(format!("{base}/v1/threads"))
+        .bearer_auth("jobs-token")
+        .json(&json!({ "workspace": workspace, "allow_shell": true }))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let other_id = other["id"].as_str().unwrap().to_string();
+    let status = client
+        .get(format!("{base}/v1/threads/{other_id}/jobs/{job_id}"))
+        .bearer_auth("jobs-token")
+        .send()
+        .await?
+        .status();
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn thread_context_reports_live_budget_from_the_engine() -> Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let workspace = tmp.path().join("workspace");
+    fs::create_dir_all(&workspace)?;
+    let (addr, _runtime_threads, handle) = spawn_test_server_with_root_token_mobile_workspace(
+        tmp.path().join("runtime"),
+        tmp.path().join("sessions"),
+        Some("context-token".to_string()),
+        false,
+        workspace.clone(),
+    )
+    .await?
+    .context("context test requires a loopback listener")?;
+    let client = crate::tls::reqwest_client();
+    let base = format!("http://{addr}");
+
+    let status = client
+        .get(format!("{base}/v1/threads/thread-x/context"))
+        .send()
+        .await?
+        .status();
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    let status = client
+        .get(format!("{base}/v1/threads/thread-missing/context"))
+        .bearer_auth("context-token")
+        .send()
+        .await?
+        .status();
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    let thread: Value = client
+        .post(format!("{base}/v1/threads"))
+        .bearer_auth("context-token")
+        .json(&json!({ "workspace": workspace }))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let thread_id = thread["id"].as_str().unwrap().to_string();
+
+    let context: Value = client
+        .get(format!("{base}/v1/threads/{thread_id}/context"))
+        .bearer_auth("context-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(context["thread_id"], thread_id);
+    assert_eq!(context["live"], true);
+    let window = context["window_tokens"].as_u64().unwrap();
+    assert!(window > 0, "a resolved route must report its window");
+    assert!(context["input_tokens"].as_u64().unwrap() > 0);
+    assert!(context["available_input_tokens"].as_u64().unwrap() <= window);
+    assert!(context["compaction_trigger_tokens"].as_u64().unwrap() <= window);
+    let percent = context["usage_percent"].as_f64().unwrap();
+    assert!((0.0..=100.0).contains(&percent));
+    assert!(matches!(
+        context["pressure"].as_str(),
+        Some("low" | "moderate" | "high" | "critical")
+    ));
+    // Fresh thread: no provider-billed count exists yet — null, not zero.
+    assert!(context["billed_input_tokens"].is_null());
+
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn provider_key_write_is_write_only_and_reports_readiness() -> Result<()> {
+    // The credential store is only exposed to tests under an explicit isolated
+    // home plus an explicit backend — both scoped to this test by the env lock.
+    let _env_lock = crate::test_support::lock_test_env();
+    let tmp = tempfile::tempdir()?;
+    let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", tmp.path().join("cwhome"));
+    let _backend = crate::test_support::EnvVarGuard::set("CODEWHALE_SECRET_BACKEND", "file");
+    fs::create_dir_all(tmp.path().join("cwhome"))?;
+    let workspace = tmp.path().join("workspace");
+    fs::create_dir_all(&workspace)?;
+
+    let (addr, _runtime_threads, handle) = spawn_test_server_with_root_token_mobile_workspace(
+        tmp.path().join("runtime"),
+        tmp.path().join("sessions"),
+        Some("keys-token".to_string()),
+        false,
+        workspace.clone(),
+    )
+    .await?
+    .context("secrets test requires a loopback listener")?;
+    let client = crate::tls::reqwest_client();
+    let base = format!("http://{addr}");
+
+    let status = client
+        .put(format!("{base}/v1/providers/openai/key"))
+        .json(&json!({ "key": "sk-test-write-only" }))
+        .send()
+        .await?
+        .status();
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    for (id, want) in [
+        ("not-a-provider", StatusCode::BAD_REQUEST),
+        ("deepseek-cn", StatusCode::BAD_REQUEST),
+    ] {
+        let status = client
+            .put(format!("{base}/v1/providers/{id}/key"))
+            .bearer_auth("keys-token")
+            .json(&json!({ "key": "sk-test" }))
+            .send()
+            .await?
+            .status();
+        assert_eq!(status, want, "{id}");
+    }
+    let status = client
+        .put(format!("{base}/v1/providers/openai/key"))
+        .bearer_auth("keys-token")
+        .json(&json!({ "key": "   " }))
+        .send()
+        .await?
+        .status();
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // A key written for the *active* provider reports configured through the
+    // live store even though the test route is a keyless local endpoint —
+    // saving a key declares the api-key contract, exactly as `auth set` would.
+    let receipt: Value = client
+        .put(format!("{base}/v1/providers/deepseek/key"))
+        .bearer_auth("keys-token")
+        .json(&json!({ "key": "sk-test-active-route-key" }))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(receipt["provider"], "deepseek");
+    assert_eq!(receipt["stored"], true);
+    assert!(!receipt.to_string().contains("sk-test-active-route-key"));
+    assert_eq!(receipt["credentialState"], "configured");
+
+    // A key written for a *non-active* provider is the harder case: the
+    // readiness catalog only probes the secret store for it when the
+    // auth-mode save marker is visible, so the route must mirror the
+    // persisted marker into the live config for the readback to be honest.
+    let receipt: Value = client
+        .put(format!("{base}/v1/providers/openai/key"))
+        .bearer_auth("keys-token")
+        .json(&json!({ "key": "sk-test-write-only-key-material" }))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(receipt["provider"], "openai");
+    assert_eq!(receipt["stored"], true);
+    // The receipt is a redacted receipt: no key bytes, not even the length.
+    let raw = receipt.to_string();
+    assert!(!raw.contains("sk-test-write-only-key-material"));
+    assert_eq!(receipt["credentialState"], "configured");
+
+    // The readiness readback agrees through the providers catalog too.
+    let providers: Value = client
+        .get(format!("{base}/v1/providers"))
+        .bearer_auth("keys-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let openai = providers["providers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["id"] == "openai")
+        .expect("openai is listed");
+    assert_eq!(openai["credentialState"], "configured");
+
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn diagnostics_list_and_read_bounded_windows() -> Result<()> {
+    // Log/crash directories resolve from the codewhale home — isolate it.
+    let _env_lock = crate::test_support::lock_test_env();
+    let tmp = tempfile::tempdir()?;
+    let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", tmp.path().join("cwhome"));
+    // Crash dumps resolve under the user home (`<home>/.codewhale/crashes`),
+    // independent of the codewhale-home override that governs logs.
+    let _user_home = crate::test_support::EnvVarGuard::set("HOME", tmp.path().join("userhome"));
+    let logs = tmp.path().join("cwhome/logs");
+    let crashes = tmp.path().join("userhome/.codewhale/crashes");
+    fs::create_dir_all(&logs)?;
+    fs::create_dir_all(&crashes)?;
+    fs::write(logs.join("tui-20990101-1.log"), "line one\nline two\n")?;
+    fs::write(tmp.path().join("cwhome/audit.log"), "{\"event\":\"x\"}\n")?;
+    fs::write(crashes.join("20990101T000000Z-turn.log"), "Panic: boom\n")?;
+    let workspace = tmp.path().join("workspace");
+    fs::create_dir_all(&workspace)?;
+
+    let (addr, _runtime_threads, handle) = spawn_test_server_with_root_token_mobile_workspace(
+        tmp.path().join("runtime"),
+        tmp.path().join("sessions"),
+        Some("diag-token".to_string()),
+        false,
+        workspace,
+    )
+    .await?
+    .context("diagnostics test requires a loopback listener")?;
+    let client = crate::tls::reqwest_client();
+    let base = format!("http://{addr}");
+
+    let status = client.get(format!("{base}/v1/logs")).send().await?.status();
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    let listed: Value = client
+        .get(format!("{base}/v1/logs"))
+        .bearer_auth("diag-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let names: Vec<&str> = listed["sources"][0]["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|f| f["name"].as_str())
+        .collect();
+    assert!(names.contains(&"tui-20990101-1.log"));
+    assert!(names.contains(&"audit.log"));
+
+    // Tail read returns the last bytes only.
+    let tail: Value = client
+        .get(format!("{base}/v1/logs/tui-20990101-1.log?tail=9"))
+        .bearer_auth("diag-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(tail["content"], "line two\n");
+    assert_eq!(tail["encoding"], "utf-8");
+    // A tail window reaches EOF; the skipped prefix shows up as offset > 0.
+    assert_eq!(tail["offset"], 9);
+    assert_eq!(tail["truncated"], false);
+
+    let crashes_list: Value = client
+        .get(format!("{base}/v1/crashes"))
+        .bearer_auth("diag-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert!(
+        crashes_list["sources"][0]["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["name"] == "20990101T000000Z-turn.log")
+    );
+    let crash: Value = client
+        .get(format!("{base}/v1/crashes/20990101T000000Z-turn.log"))
+        .bearer_auth("diag-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(crash["content"], "Panic: boom\n");
+
+    // Traversal and missing files fail closed.
+    let status = client
+        .get(format!("{base}/v1/logs/..%2Fsecret"))
+        .bearer_auth("diag-token")
+        .send()
+        .await?
+        .status();
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let status = client
+        .get(format!("{base}/v1/logs/missing.log"))
+        .bearer_auth("diag-token")
+        .send()
+        .await?
+        .status();
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let status = client
+        .get(format!("{base}/v1/crashes/missing.log"))
+        .bearer_auth("diag-token")
+        .send()
+        .await?
+        .status();
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    let process: Value = client
+        .get(format!("{base}/v1/process"))
+        .bearer_auth("diag-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(process["pid"], json!(std::process::id()));
+    assert!(process["uptime_seconds"].is_number());
+    assert_eq!(process["version"], env!("CARGO_PKG_VERSION"));
+
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn targets_report_self_and_probe_remote_endpoints() -> Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let workspace = tmp.path().join("workspace");
+    fs::create_dir_all(&workspace)?;
+
+    let (addr, _runtime_threads, handle) = spawn_test_server_with_root_token_mobile_workspace(
+        tmp.path().join("runtime"),
+        tmp.path().join("sessions"),
+        Some("targets-token".to_string()),
+        false,
+        workspace,
+    )
+    .await?
+    .context("targets test requires a loopback listener")?;
+    let client = crate::tls::reqwest_client();
+    let base = format!("http://{addr}");
+
+    let status = client
+        .get(format!("{base}/v1/targets"))
+        .send()
+        .await?
+        .status();
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    let targets: Value = client
+        .get(format!("{base}/v1/targets"))
+        .bearer_auth("targets-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let local = &targets["targets"][0];
+    assert_eq!(local["kind"], "local");
+    assert_eq!(local["current"], true);
+    assert_eq!(local["service"], "codewhale-runtime-api");
+    assert_eq!(local["auth_required"], true);
+    assert_eq!(local["endpoint"], json!(base));
+    // Control-plane-owned surfaces answer honestly instead of 404ing.
+    assert_eq!(targets["ssh"]["supported"], false);
+    assert_eq!(targets["ssh"]["owner"], "codewhale-control-plane");
+    assert_eq!(targets["cloud"]["supported"], false);
+    assert_eq!(targets["remote"]["supported"], true);
+
+    let remote: Value = client
+        .get(format!("{base}/v1/remote"))
+        .bearer_auth("targets-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(remote["loopback_only"], true);
+    assert_eq!(remote["auth_required"], true);
+    assert_eq!(remote["port"], json!(addr.port()));
+
+    // The probe identifies this same server as a Codewhale runtime.
+    let probed: Value = client
+        .post(format!("{base}/v1/remote/connect"))
+        .bearer_auth("targets-token")
+        .json(&json!({"endpoint": base}))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(probed["ok"], true);
+    assert_eq!(probed["remote"]["service"], "codewhale-runtime-api");
+    assert_eq!(probed["remote"]["auth_required"], true);
+    assert_eq!(probed["attach"], "client");
+
+    // A closed port is an honest negative verdict, not a server error.
+    let refused: Value = client
+        .post(format!("{base}/v1/remote/connect"))
+        .bearer_auth("targets-token")
+        .json(&json!({"endpoint": "http://127.0.0.1:1"}))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(refused["ok"], false);
+    assert_eq!(refused["reason"], "unreachable");
+
+    // Malformed, non-http, and credentialed endpoints fail closed at 400.
+    for endpoint in [
+        "not-a-url",
+        "ftp://example.com",
+        "http://user:pass@127.0.0.1:7878",
+    ] {
+        let status = client
+            .post(format!("{base}/v1/remote/connect"))
+            .bearer_auth("targets-token")
+            .json(&json!({"endpoint": endpoint}))
+            .send()
+            .await?
+            .status();
+        assert_eq!(status, StatusCode::BAD_REQUEST, "endpoint {endpoint}");
+    }
+    // A token field is an unknown field — never accepted for forwarding
+    // (axum's JSON extractor answers deserialization failures with 422).
+    let status = client
+        .post(format!("{base}/v1/remote/connect"))
+        .bearer_auth("targets-token")
+        .json(&json!({"endpoint": base, "token": "x"}))
+        .send()
+        .await?
+        .status();
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+
+    // Client-owned registry + control-plane-owned surfaces refuse writes.
+    for (method, path) in [
+        ("POST", "/v1/targets"),
+        ("POST", "/v1/targets/switch"),
+        ("POST", "/v1/ssh/connect"),
+        ("POST", "/v1/cloud/attach"),
+    ] {
+        let status = client
+            .request(method.parse()?, format!("{base}{path}"))
+            .bearer_auth("targets-token")
+            .json(&json!({}))
+            .send()
+            .await?
+            .status();
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{method} {path}");
+    }
+    let ssh: Value = client
+        .get(format!("{base}/v1/ssh"))
+        .bearer_auth("targets-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(ssh["supported"], false);
+    let cloud: Value = client
+        .get(format!("{base}/v1/cloud"))
+        .bearer_auth("targets-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(cloud["supported"], false);
+
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn lsp_routes_serve_workspace_files_through_a_transport() -> Result<()> {
+    use crate::lsp::diagnostics::{Diagnostic, Severity};
+    use crate::lsp::registry::Language;
+    use crate::lsp::tests::FakeTransport;
+
+    let tmp = tempfile::tempdir()?;
+    let workspace = tmp.path().join("workspace");
+    fs::create_dir_all(&workspace)?;
+    fs::write(workspace.join("main.rs"), "fn main() {}\n")?;
+    fs::write(workspace.join("notes.unknownext"), "hi\n")?;
+
+    // Seed the shared manager with a fake Rust transport — no real LSP spawn.
+    let manager = Arc::new(crate::lsp::LspManager::new(
+        crate::lsp::LspConfig::default(),
+        workspace.canonicalize()?,
+    ));
+    manager
+        .install_test_transport(
+            Language::Rust,
+            Arc::new(FakeTransport::new(vec![Diagnostic {
+                line: 1,
+                column: 4,
+                severity: Severity::Error,
+                message: "test diagnostic".to_string(),
+            }])),
+        )
+        .await;
+
+    let (addr, _runtime_threads, handle) =
+        spawn_test_server_with_root_token_mobile_workspace_and_overrides(
+            tmp.path().join("runtime"),
+            tmp.path().join("sessions"),
+            Some("lsp-token".to_string()),
+            false,
+            workspace,
+            TestServerOverrides {
+                lsp_manager: Some(manager),
+                ..TestServerOverrides::default()
+            },
+        )
+        .await?
+        .context("lsp test requires a loopback listener")?;
+    let client = crate::tls::reqwest_client();
+    let base = format!("http://{addr}");
+
+    let status = client.get(format!("{base}/v1/lsp")).send().await?.status();
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    let capability: Value = client
+        .get(format!("{base}/v1/lsp"))
+        .bearer_auth("lsp-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(capability["enabled"], true);
+    assert!(
+        capability["languages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|l| l["language"] == "rust")
+    );
+
+    // Real diagnostics through the fake transport.
+    let diagnostics: Value = client
+        .get(format!("{base}/v1/diagnostics?path=main.rs"))
+        .bearer_auth("lsp-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(diagnostics["ok"], true);
+    assert_eq!(diagnostics["items"][0]["severity"], "error");
+    assert_eq!(diagnostics["items"][0]["message"], "test diagnostic");
+
+    // A language without a server is honest data, not an HTTP error.
+    let none: Value = client
+        .get(format!("{base}/v1/diagnostics?path=notes.unknownext"))
+        .bearer_auth("lsp-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(none["items"].as_array().unwrap().len(), 0);
+
+    // Position routes validate `line` before touching LSP.
+    let status = client
+        .get(format!("{base}/v1/definition?path=main.rs"))
+        .bearer_auth("lsp-token")
+        .send()
+        .await?
+        .status();
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // The fake transport declines request-style ops — surfaced as ok:false.
+    let definition: Value = client
+        .get(format!(
+            "{base}/v1/definition?path=main.rs&line=1&character=5"
+        ))
+        .bearer_auth("lsp-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(definition["ok"], false);
+    assert_eq!(definition["reason"], "lsp_error");
+
+    // Traversal and missing files fail closed.
+    for path in ["../escape.rs", ".git/config", "missing.rs"] {
+        let status = client
+            .get(format!("{base}/v1/diagnostics?path={path}"))
+            .bearer_auth("lsp-token")
+            .send()
+            .await?
+            .status();
+        assert!(
+            matches!(
+                status,
+                StatusCode::BAD_REQUEST | StatusCode::FORBIDDEN | StatusCode::NOT_FOUND
+            ),
+            "path {path} -> {status}"
+        );
+    }
+
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn voice_routes_report_capability_and_fail_closed_without_a_recorder() -> Result<()> {
+    let _lock = lock_test_env();
+    // Deterministic: the operator kill-switch keeps the test off the host mic.
+    let _voice_off = EnvVarGuard::set("CODEWHALE_DISABLE_VOICE", "1");
+
+    let tmp = tempfile::tempdir()?;
+    let workspace = tmp.path().join("workspace");
+    fs::create_dir_all(&workspace)?;
+
+    let (addr, _runtime_threads, handle) =
+        spawn_test_server_with_root_token_mobile_workspace_and_overrides(
+            tmp.path().join("runtime"),
+            tmp.path().join("sessions"),
+            Some("voice-token".to_string()),
+            false,
+            workspace,
+            TestServerOverrides::default(),
+        )
+        .await?
+        .context("voice test requires a loopback listener")?;
+    let client = crate::tls::reqwest_client();
+    let base = format!("http://{addr}");
+
+    let status = client
+        .get(format!("{base}/v1/voice"))
+        .send()
+        .await?
+        .status();
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    for path in ["/v1/voice/dictate", "/v1/voice/send", "/v1/voice/control"] {
+        let status = client.post(format!("{base}{path}")).send().await?.status();
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "POST {path}");
+    }
+
+    let status: Value = client
+        .get(format!("{base}/v1/voice"))
+        .bearer_auth("voice-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(status["available"], false);
+    assert!(status["recorder"].is_null());
+    assert!(!status["asr"]["kind"].as_str().unwrap().is_empty());
+    assert_eq!(status["modes"].as_array().unwrap().len(), 3);
+    assert!(status["send_phrases"].as_array().unwrap().len() >= 3);
+    assert_eq!(status["max_record_seconds"], 10);
+
+    // Dictation with no recorder fails closed as data — never an HTTP 5xx.
+    for path in ["/v1/voice/dictate", "/v1/voice/send"] {
+        let outcome: Value = client
+            .post(format!("{base}{path}"))
+            .bearer_auth("voice-token")
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        assert_eq!(outcome["ok"], false, "{path}");
+        assert_eq!(outcome["reason"], "no_recorder", "{path}");
+    }
+
+    // Control mode takes an optional {"composer"} body; still no recorder.
+    let outcome: Value = client
+        .post(format!("{base}/v1/voice/control"))
+        .bearer_auth("voice-token")
+        .json(&json!({ "composer": "draft text" }))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(outcome["ok"], false);
+    assert_eq!(outcome["reason"], "no_recorder");
+
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn git_routes_drive_a_real_workspace_repo() -> Result<()> {
+    use crate::dependencies::{ExternalTool as _, Git};
+
+    let tmp = tempfile::tempdir()?;
+    let workspace = tmp.path().join("workspace");
+    fs::create_dir_all(&workspace)?;
+    let git = |args: &[&str]| {
+        let output = Git::output(args, &workspace)?;
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Ok::<_, anyhow::Error>(output)
+    };
+    git(&["init", "-b", "main"])?;
+    git(&["config", "user.email", "runtime-api@example.test"])?;
+    git(&["config", "user.name", "Runtime API Test"])?;
+    // Windows git defaults to core.autocrlf=true, so `git checkout` rewrites
+    // LF to CRLF on restore and the discard assertion below reads back
+    // "v1\r\n" instead of "v1\n". Pin the fixture repo's line endings so the
+    // test measures the route rather than the host's git config.
+    git(&["config", "core.autocrlf", "false"])?;
+    fs::write(workspace.join("tracked.txt"), "v1\n")?;
+    git(&["add", "tracked.txt"])?;
+    git(&["commit", "-m", "initial"])?;
+
+    let (addr, _runtime_threads, handle) = spawn_test_server_with_root_token_mobile_workspace(
+        tmp.path().join("runtime"),
+        tmp.path().join("sessions"),
+        Some("git-token".to_string()),
+        false,
+        workspace.clone(),
+    )
+    .await?
+    .context("git test requires a loopback listener")?;
+    let client = crate::tls::reqwest_client();
+    let base = format!("http://{addr}");
+
+    let status = client.get(format!("{base}/v1/git")).send().await?.status();
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    // Untracked file shows up in the detail read.
+    fs::write(workspace.join("new.rs"), "fn main() {}\n")?;
+    let detail: Value = client
+        .get(format!("{base}/v1/git"))
+        .bearer_auth("git-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(detail["git_repo"], true);
+    assert_eq!(detail["branch"], "main");
+    assert!(
+        detail["files"].as_array().unwrap().iter().any(|f| {
+            f["path"] == "new.rs" && f["status"] == "untracked" && f["staged"] == false
+        })
+    );
+    assert_eq!(detail["branches"], json!(["main"]));
+
+    // Stage → status reflects the index; commit lands the change.
+    let staged: Value = client
+        .post(format!("{base}/v1/git/stage"))
+        .bearer_auth("git-token")
+        .json(&json!({ "paths": ["new.rs"] }))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(staged["ok"], true);
+    assert_eq!(staged["status"]["staged"], 1);
+    let committed: Value = client
+        .post(format!("{base}/v1/git/commit"))
+        .bearer_auth("git-token")
+        .json(&json!({ "message": "add new.rs" }))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(committed["ok"], true);
+    assert_eq!(committed["status"]["staged"], 0);
+
+    // Branch create+switch, then the graph reports both commits on it.
+    let switched: Value = client
+        .post(format!("{base}/v1/git/branch"))
+        .bearer_auth("git-token")
+        .json(&json!({ "name": "feature-x", "create": true }))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(switched["ok"], true);
+    assert_eq!(switched["status"]["branch"], "feature-x");
+    let graph: Value = client
+        .get(format!("{base}/v1/git/graph"))
+        .bearer_auth("git-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let commits = graph["commits"].as_array().unwrap();
+    assert_eq!(commits.len(), 2);
+    assert_eq!(commits[0]["subject"], "add new.rs");
+    assert!(commits[1]["id"].as_str().unwrap().len() == 40);
+
+    // Discard restores a tracked file; discarding an untracked path fails
+    // closed with git's own message rather than deleting the file.
+    fs::write(workspace.join("tracked.txt"), "v2\n")?;
+    let detail: Value = client
+        .get(format!("{base}/v1/git"))
+        .bearer_auth("git-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert!(detail["files"].as_array().unwrap().iter().any(|f| {
+        f["path"] == "tracked.txt" && f["status"] == "modified" && f["staged"] == false
+    }));
+
+    // The diff reads serve the same worktree change: a unified patch for one
+    // file, the whole tree with a numstat inventory, and the changes list.
+    let file_diff: Value = client
+        .get(format!("{base}/v1/diff?path=tracked.txt"))
+        .bearer_auth("git-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(file_diff["ok"], true);
+    assert_eq!(file_diff["untracked"], false);
+    let patch = file_diff["diff"].as_str().unwrap();
+    assert!(patch.contains("-v1") && patch.contains("+v2"), "{patch}");
+    assert_eq!(file_diff["truncated"], false);
+
+    // An untracked file is honest data: no diff, flagged for the client.
+    fs::write(workspace.join("scratch.txt"), "loose\n")?;
+    let untracked: Value = client
+        .get(format!("{base}/v1/diff?path=scratch.txt"))
+        .bearer_auth("git-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(untracked["ok"], true);
+    assert_eq!(untracked["untracked"], true);
+    assert_eq!(untracked["diff"], "");
+
+    let changes: Value = client
+        .get(format!("{base}/v1/changes"))
+        .bearer_auth("git-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(changes["git_repo"], true);
+    assert!(
+        changes["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["path"] == "tracked.txt" && f["status"] == "modified")
+    );
+
+    let tree: Value = client
+        .get(format!("{base}/v1/workspace/diff"))
+        .bearer_auth("git-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(tree["ok"], true);
+    assert!(
+        tree["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["path"] == "tracked.txt" && f["added"] == 1 && f["deleted"] == 1)
+    );
+    assert!(tree["diff"].as_str().unwrap().contains("+v2"));
+    assert_eq!(tree["truncated"], false);
+
+    // Diff path validation shares the file-route confinement.
+    for (path, want) in [
+        ("../escape.txt", StatusCode::BAD_REQUEST),
+        (".git/config", StatusCode::FORBIDDEN),
+    ] {
+        let status = client
+            .get(format!("{base}/v1/diff?path={path}"))
+            .bearer_auth("git-token")
+            .send()
+            .await?
+            .status();
+        assert_eq!(status, want, "diff path {path}");
+    }
+    let discarded: Value = client
+        .post(format!("{base}/v1/git/discard"))
+        .bearer_auth("git-token")
+        .json(&json!({ "paths": ["tracked.txt"] }))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(discarded["ok"], true);
+    assert_eq!(fs::read_to_string(workspace.join("tracked.txt"))?, "v1\n");
+    let status = client
+        .post(format!("{base}/v1/git/discard"))
+        .bearer_auth("git-token")
+        .json(&json!({ "paths": ["never-tracked.txt"] }))
+        .send()
+        .await?
+        .status();
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // Whole-tree discard stays refused; invalid refs and escapes are stopped
+    // before git ever sees them (the .git refusal is forbidden, the rest are
+    // bad requests).
+    for (route, body, want) in [
+        (
+            "/v1/git/discard",
+            json!({ "all": true }),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "/v1/git/stage",
+            json!({ "paths": ["../escape.txt"] }),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "/v1/git/stage",
+            json!({ "paths": [".git/config"] }),
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            "/v1/git/branch",
+            json!({ "name": "-f" }),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "/v1/git/commit",
+            json!({ "message": " " }),
+            StatusCode::BAD_REQUEST,
+        ),
+    ] {
+        let status = client
+            .post(format!("{base}{route}"))
+            .bearer_auth("git-token")
+            .json(&body)
+            .send()
+            .await?
+            .status();
+        assert_eq!(status, want, "{route} {body}");
+    }
+
+    handle.abort();
+    Ok(())
+}
+
+/// The half of #6179 the credential route was missing: clear, the metadata a
+/// client needs to decide whether to offer the control at all, and the refusal
+/// for a credential Codewhale does not own.
+#[tokio::test]
+async fn provider_key_clear_round_trips_and_reports_writability() -> Result<()> {
+    let _env_lock = crate::test_support::lock_test_env();
+    let tmp = tempfile::tempdir()?;
+    let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", tmp.path().join("cwhome"));
+    let _backend = crate::test_support::EnvVarGuard::set("CODEWHALE_SECRET_BACKEND", "file");
+    fs::create_dir_all(tmp.path().join("cwhome"))?;
+    let workspace = tmp.path().join("workspace");
+    fs::create_dir_all(&workspace)?;
+
+    let (addr, _runtime_threads, handle) = spawn_test_server_with_root_token_mobile_workspace(
+        tmp.path().join("runtime"),
+        tmp.path().join("sessions"),
+        Some("clear-token".to_string()),
+        false,
+        workspace.clone(),
+    )
+    .await?
+    .context("secrets test requires a loopback listener")?;
+    let client = crate::tls::reqwest_client();
+    let base = format!("http://{addr}");
+
+    // Clearing is a credential operation: it authenticates like the write.
+    let status = client
+        .delete(format!("{base}/v1/providers/openai/key"))
+        .send()
+        .await?
+        .status();
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    // Same id validation as the write, so a client cannot discover providers
+    // through one verb that the other rejects.
+    for (id, want) in [
+        ("not-a-provider", StatusCode::BAD_REQUEST),
+        ("deepseek-cn", StatusCode::BAD_REQUEST),
+    ] {
+        let status = client
+            .delete(format!("{base}/v1/providers/{id}/key"))
+            .bearer_auth("clear-token")
+            .send()
+            .await?
+            .status();
+        assert_eq!(status, want, "{id}");
+    }
+
+    client
+        .put(format!("{base}/v1/providers/openai/key"))
+        .bearer_auth("clear-token")
+        .json(&json!({ "key": "sk-key-that-will-be-cleared" }))
+        .send()
+        .await?
+        .error_for_status()?;
+
+    // Before the clear the catalog says the control is live and names the
+    // source it would write — this is what lets a client enable the control.
+    let providers: Value = client
+        .get(format!("{base}/v1/providers"))
+        .bearer_auth("clear-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let openai = providers["providers"]
+        .as_array()
+        .context("providers array")?
+        .iter()
+        .find(|entry| entry["id"] == "openai")
+        .context("openai entry")?
+        .clone();
+    assert_eq!(openai["credentialState"], "configured");
+    assert_eq!(openai["credentialSource"], "secret_store");
+    assert_eq!(openai["credentialWritable"], true);
+    // A writable route carries no refusal reason to render.
+    assert!(openai["credentialWritableReason"].is_null());
+
+    let receipt: Value = client
+        .delete(format!("{base}/v1/providers/openai/key"))
+        .bearer_auth("clear-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(receipt["provider"], "openai");
+    assert_eq!(receipt["cleared"], true);
+    // A clear receipt echoes no more than a write receipt does.
+    assert!(!receipt.to_string().contains("sk-key-that-will-be-cleared"));
+    assert_eq!(receipt["credentialState"], "missing");
+
+    // And the catalog agrees on the next read, through the live config mirror
+    // rather than only after a restart.
+    let providers: Value = client
+        .get(format!("{base}/v1/providers"))
+        .bearer_auth("clear-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let openai = providers["providers"]
+        .as_array()
+        .context("providers array")?
+        .iter()
+        .find(|entry| entry["id"] == "openai")
+        .context("openai entry")?
+        .clone();
+    assert_eq!(openai["credentialState"], "missing");
+    // Still writable: the key is gone, the control is not.
+    assert_eq!(openai["credentialWritable"], true);
+
+    // Clearing an already-clear route is not an error — a client retrying a
+    // revoke must not be told something went wrong.
+    let receipt: Value = client
+        .delete(format!("{base}/v1/providers/openai/key"))
+        .bearer_auth("clear-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(receipt["cleared"], true);
+
+    handle.abort();
+    Ok(())
+}
+
+#[test]
+fn agent_mail_cancel_conflict_maps_to_409() {
+    let conflict = map_agent_mail_err(anyhow::anyhow!(
+        "Agent Mail can be canceled only while queued (status: Delivered)"
+    ));
+    assert_eq!(conflict.status, StatusCode::CONFLICT);
+}
+
+/// #6176: Agent Mail is the durable "submit while running" queue (nothing
+/// ever produces a `Queued` turn record — POST /turns rejects a busy
+/// thread). Withdrawing a queued envelope is idempotent, delivery after
+/// cancel starts no turn, and mail that already left `queued` is an
+/// explicit conflict rather than a silent drop.
+#[tokio::test]
+async fn agent_mail_cancel_withdraws_queued_mail() -> Result<()> {
+    let Some((addr, _runtime_threads, handle)) = spawn_test_server().await? else {
+        return Ok(());
+    };
+    let client = crate::tls::reqwest_client();
+    let base = format!("http://{addr}");
+
+    // Agent Mail addressability needs task-bound threads, and the sender
+    // identity must be the source thread's task id.
+    let new_thread = |task_id: &str| {
+        let client = &client;
+        let base = base.clone();
+        let task_id = task_id.to_string();
+        async move {
+            let thread: Value = client
+                .post(format!("{base}/v1/threads"))
+                .json(&json!({ "task_id": task_id }))
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+            anyhow::Ok(thread["id"].as_str().expect("thread id").to_string())
+        }
+    };
+    let source = new_thread("task_a").await?;
+    let destination = new_thread("task_b").await?;
+
+    let send = |message_id: &str| {
+        let client = &client;
+        let base = base.clone();
+        let source = source.clone();
+        let destination = destination.clone();
+        let message_id = message_id.to_string();
+        async move {
+            let sent = client
+                .post(format!("{base}/v1/agent-mail"))
+                .json(&json!({
+                    "message_id": message_id,
+                    "source_thread_id": source,
+                    "destination_thread_id": destination,
+                    "sender": {"identity": "task_a", "display_label": "Test Sender"},
+                    "summary": "handoff: review the queued work",
+                    "delivery_mode": "queue_only",
+                    "trigger_turn": false,
+                }))
+                .send()
+                .await?;
+            anyhow::Ok(sent)
+        }
+    };
+
+    let sent = send("mail_queue_1").await?;
+    assert_eq!(sent.status(), StatusCode::CREATED);
+    let body: Value = sent.json().await?;
+    assert_eq!(body["envelope"]["status"], "queued");
+
+    let inbox: Value = client
+        .get(format!("{base}/v1/threads/{destination}/agent-mail"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert!(inbox.as_array().is_some_and(|mail| {
+        mail.iter()
+            .any(|item| item["message_id"] == "mail_queue_1" && item["status"] == "queued")
+    }));
+
+    let canceled: Value = client
+        .post(format!(
+            "{base}/v1/threads/{destination}/agent-mail/mail_queue_1/cancel"
+        ))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(canceled["status"], "canceled");
+
+    // Re-cancel is an idempotent no-op returning the stored envelope.
+    let recanceled: Value = client
+        .post(format!(
+            "{base}/v1/threads/{destination}/agent-mail/mail_queue_1/cancel"
+        ))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(recanceled, canceled);
+
+    // Delivery after cancel starts no turn.
+    let delivered: Value = client
+        .post(format!(
+            "{base}/v1/threads/{destination}/agent-mail/mail_queue_1/deliver"
+        ))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(delivered["envelope"]["status"], "canceled");
+    assert!(delivered.get("turn").is_none());
+
+    // Mail that already left `queued` is an explicit conflict.
+    let sent = send("mail_queue_2").await?;
+    assert_eq!(sent.status(), StatusCode::CREATED);
+    let delivered: Value = client
+        .post(format!(
+            "{base}/v1/threads/{destination}/agent-mail/mail_queue_2/deliver"
+        ))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(delivered["envelope"]["status"], "delivered");
+    let conflict = client
+        .post(format!(
+            "{base}/v1/threads/{destination}/agent-mail/mail_queue_2/cancel"
+        ))
+        .send()
+        .await?;
+    assert_eq!(conflict.status(), StatusCode::CONFLICT);
+    assert!(
+        conflict
+            .text()
+            .await?
+            .contains("can be canceled only while queued")
+    );
+
+    // A message addressed elsewhere is a foreign-destination rejection.
+    let foreign = client
+        .post(format!(
+            "{base}/v1/threads/{source}/agent-mail/mail_queue_1/cancel"
+        ))
+        .send()
+        .await?;
+    assert_eq!(foreign.status(), StatusCode::FORBIDDEN);
+
+    // An unknown message id is a 404, never a silent success.
+    let missing = client
+        .post(format!(
+            "{base}/v1/threads/{destination}/agent-mail/mail_nope/cancel"
+        ))
+        .send()
+        .await?;
+    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+
+    handle.abort();
+    Ok(())
+}
+
+/// Running-work accounting (#6180): a watch-only client enumerates owned
+/// in-flight work in one call, with turn identity for targeting, and the
+/// listing clears when the work settles.
+#[tokio::test]
+async fn threads_running_lists_active_turns_and_clears_on_settle() -> Result<()> {
+    let Some((addr, manager, handle)) = spawn_test_server().await? else {
+        return Ok(());
+    };
+    let client = crate::tls::reqwest_client();
+    let base = format!("http://{addr}");
+
+    let idle: serde_json::Value = client
+        .get(format!("{base}/v1/threads/running"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(idle, serde_json::json!([]));
+
+    let created: serde_json::Value = client
+        .post(format!("{base}/v1/threads"))
+        .json(&serde_json::json!({ "model": "test-model" }))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let thread_id = created["id"].as_str().context("missing thread id")?;
+
+    client
+        .post(format!("{base}/v1/threads/{thread_id}/turns"))
+        .json(&serde_json::json!({ "prompt": "do the thing" }))
+        .send()
+        .await?
+        .error_for_status()?;
+
+    // Pin the turn in-flight deterministically: a test server may settle a
+    // started turn on its own, which would make the listing below racy.
+    let mut started = manager
+        .test_store()
+        .list_turns_for_thread(thread_id)?
+        .pop()
+        .context("missing started turn")?;
+    started.status = crate::runtime_threads::RuntimeTurnStatus::InProgress;
+    manager.test_store().save_turn(&started)?;
+
+    let running: serde_json::Value = client
+        .get(format!("{base}/v1/threads/running"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(running.as_array().map(Vec::len), Some(1));
+    assert_eq!(running[0]["thread_id"], thread_id);
+    let active = running[0]["active_turns"]
+        .as_array()
+        .context("missing active_turns")?;
+    assert_eq!(active.len(), 1);
+    assert_eq!(active[0]["status"], "in_progress");
+    let turn_id = active[0]["turn_id"].as_str().context("missing turn id")?;
+
+    let mut turn = manager.test_store().load_turn(turn_id)?;
+    turn.status = crate::runtime_threads::RuntimeTurnStatus::Completed;
+    manager.test_store().save_turn(&turn)?;
+
+    let settled: serde_json::Value = client
+        .get(format!("{base}/v1/threads/running"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(settled, serde_json::json!([]));
+
+    handle.abort();
+    Ok(())
+}
+
+/// Notice serving (#6180): GET lists raised notices with thread/turn
+/// identity, DELETE acks one, unknown notices and threads 404.
+#[tokio::test]
+async fn thread_notices_serve_list_and_ack() -> Result<()> {
+    let Some((addr, manager, handle)) = spawn_test_server().await? else {
+        return Ok(());
+    };
+    let client = crate::tls::reqwest_client();
+    let base = format!("http://{addr}");
+
+    let created: serde_json::Value = client
+        .post(format!("{base}/v1/threads"))
+        .json(&serde_json::json!({ "model": "test-model" }))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let thread_id = created["id"].as_str().context("missing thread id")?;
+
+    let empty: serde_json::Value = client
+        .get(format!("{base}/v1/threads/{thread_id}/notices"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(empty, serde_json::json!([]));
+
+    let notice_id = manager.raise_notice(
+        thread_id,
+        "model-notify",
+        "turn_1",
+        "tool_1",
+        "come back".to_string(),
+    );
+    let listed: serde_json::Value = client
+        .get(format!("{base}/v1/threads/{thread_id}/notices"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(listed.as_array().map(Vec::len), Some(1));
+    assert_eq!(listed[0]["id"], notice_id);
+    assert_eq!(listed[0]["kind"], "model-notify");
+    assert_eq!(listed[0]["turn_id"], "turn_1");
+    assert_eq!(listed[0]["subject"], "tool_1");
+
+    let ack = client
+        .delete(format!("{base}/v1/threads/{thread_id}/notices/{notice_id}"))
+        .send()
+        .await?;
+    assert_eq!(ack.status(), reqwest::StatusCode::NO_CONTENT);
+
+    let cleared: serde_json::Value = client
+        .get(format!("{base}/v1/threads/{thread_id}/notices"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(cleared, serde_json::json!([]));
+
+    let again = client
+        .delete(format!("{base}/v1/threads/{thread_id}/notices/{notice_id}"))
+        .send()
+        .await?;
+    assert_eq!(again.status(), reqwest::StatusCode::NOT_FOUND);
+
+    let unknown = client
+        .get(format!("{base}/v1/threads/nope/notices"))
+        .send()
+        .await?;
+    assert_eq!(unknown.status(), reqwest::StatusCode::NOT_FOUND);
+
+    handle.abort();
     Ok(())
 }

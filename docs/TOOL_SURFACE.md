@@ -72,6 +72,12 @@ MCP tools are dynamic. Successfully connected servers register names such as
 must not be presented as available. MCP and plugin tools are deferred unless a
 user explicitly names them in `[tools].always_load`.
 
+`execute_tools` is deferred and engine-injected, alongside the synthetic
+interpreter tools. It runs a JavaScript program whose only host surface is
+`tools.call(name, args)`; nested calls must be read-only and auto-approved,
+and anything else aborts the program with a host-owned receipt. It is hidden
+from Plan mode and refused under a worker authority envelope.
+
 ### Conversation toolbox cache
 
 A successful search activation is remembered by name for the current
@@ -118,8 +124,11 @@ Modes and permission postures are separate controls:
 - **Plan** keeps the stable primitive vocabulary but centrally refuses shell
   execution and file mutation.
 - **Work** is ordinary interactive execution.
-- **Operate** uses the same direct-tool authority as Work while preferring Fleet
-  workers for independent, parallel, isolated, background, or long-running work.
+- **Operate** uses the same direct-tool authority as Work. Small work stays
+  direct; multi-step delegation uses a compact Workflow plan with dependencies,
+  bounded scopes, and completion evidence. Fleet manages the same sub-agents
+  and roles. One bounded, independent task can use a direct agent; `followup`
+  reuses that agent for continued work.
 - **Ask**, **Auto-Review**, and **Full Access** control approval behavior within
   an action-capable mode. They never widen Plan into write or shell access.
 

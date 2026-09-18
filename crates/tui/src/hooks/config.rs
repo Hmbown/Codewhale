@@ -299,7 +299,6 @@ fn default_continue_on_error() -> bool {
 
 impl Hook {
     /// Create a new hook with minimal configuration
-    #[allow(dead_code)] // Public builder API, used in tests
     pub fn new(event: HookEvent, command: &str) -> Self {
         Self {
             event,
@@ -315,28 +314,24 @@ impl Hook {
     }
 
     /// Builder: set condition
-    #[allow(dead_code)] // Public builder API, used in tests
     pub fn with_condition(mut self, condition: HookCondition) -> Self {
         self.condition = Some(condition);
         self
     }
 
     /// Builder: set timeout
-    #[allow(dead_code)] // Public builder API, used in tests
     pub fn with_timeout(mut self, secs: u64) -> Self {
         self.timeout_secs = secs;
         self
     }
 
     /// Builder: run in background
-    #[allow(dead_code)] // Public builder API, used in tests
     pub fn background(mut self) -> Self {
         self.background = true;
         self
     }
 
     /// Builder: set name
-    #[allow(dead_code)] // Public builder API, used in tests
     pub fn with_name(mut self, name: &str) -> Self {
         self.name = Some(name.to_string());
         self

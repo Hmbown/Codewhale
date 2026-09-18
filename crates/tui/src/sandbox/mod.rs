@@ -59,7 +59,6 @@ pub use policy::SandboxPolicy;
 /// Public OS-sandbox capability labels consumed by the website facts
 /// generator. Keep this list limited to wrappers that the command execution
 /// path can actually select and apply.
-#[allow(dead_code)]
 // EXTERNAL CONTRACT — zero Rust references by design: the website's docs
 // drift gate parses this const out of the source text (web/lib/facts-drift.ts
 // and web/scripts/facts-lib.mjs match the literal declaration). Deleting or
@@ -471,7 +470,6 @@ pub struct SandboxManager {
     sandbox_available: Option<bool>,
 
     /// Force a specific sandbox type (for testing).
-    #[allow(dead_code)]
     forced_sandbox: Option<SandboxType>,
 
     /// When true and bwrap is executable on Linux, route commands through

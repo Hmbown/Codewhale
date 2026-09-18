@@ -89,6 +89,11 @@ pub struct SessionQuery {
     /// scoping (the picker's `a` toggle, or an API caller that asked for
     /// every workspace).
     pub workspace_scope: Option<PathBuf>,
+    /// Exclude empty auto-created sessions (zero messages under the default
+    /// title) — the same definition the launch list and `--continue` apply
+    /// (#6014). Off by default so API listings stay complete; browse
+    /// surfaces that exist to pick *resumable* work set it.
+    pub hide_empty_auto_created: bool,
     /// Hard row cap, clamped to [`MAX_PROJECTED_SESSIONS`].
     pub limit: usize,
 }
@@ -100,6 +105,7 @@ impl Default for SessionQuery {
             sort: SessionSortMode::Recent,
             search: String::new(),
             workspace_scope: None,
+            hide_empty_auto_created: false,
             limit: MAX_PROJECTED_SESSIONS,
         }
     }
@@ -134,6 +140,13 @@ impl SessionQuery {
     #[must_use]
     pub fn with_sort(mut self, sort: SessionSortMode) -> Self {
         self.sort = sort;
+        self
+    }
+
+    /// Exclude empty auto-created sessions from the listing (#6014).
+    #[must_use]
+    pub fn without_empty_auto_created(mut self) -> Self {
+        self.hide_empty_auto_created = true;
         self
     }
 }
@@ -224,6 +237,10 @@ pub fn select_sessions<'a>(
     let mut matched: Vec<&SessionMetadata> = sessions
         .iter()
         .filter(|session| query.filter.admits(session.archived))
+        .filter(|session| {
+            !query.hide_empty_auto_created
+                || !crate::session_manager::is_empty_auto_created_session(session)
+        })
         .filter(|session| matches_workspace_scope(session, query.workspace_scope.as_deref()))
         .filter(|session| session_matches_query(&query.search, session))
         .collect();

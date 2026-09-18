@@ -41,6 +41,7 @@ use crate::reasoning_preference::ReasoningEffort;
 use crate::settings::PinnedModel;
 use crate::tui::app::App;
 use crate::tui::menu_style;
+use crate::tui::views::fleet_detail::{FleetRouteSelection, FleetRouteTarget};
 use crate::tui::views::{
     ActionHint, ListDetailLayout, ModalKind, ModalView, ViewAction, ViewEvent, render_modal_footer,
     render_underwater_surface,
@@ -178,6 +179,20 @@ enum Pane {
     Effort,
 }
 
+/// What applying a row means: the session's own route (`/model`), or a pin
+/// on one Fleet editor row, where Enter hands the absolute route back to the
+/// editor instead of switching the session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ModelPickerPurpose {
+    Session,
+    FleetRoute {
+        target: FleetRouteTarget,
+        editor_id: uuid::Uuid,
+        initial_reasoning: Option<ReasoningEffort>,
+        allow_inherit: bool,
+    },
+}
+
 #[derive(Debug, Clone, Copy)]
 struct PaneRenderState {
     pane: Pane,
@@ -238,6 +253,7 @@ pub struct ModelPickerView {
     sort: Option<ModelSort>,
     column_hitboxes: RefCell<Vec<(Rect, ModelSortColumn)>>,
     pane_hitboxes: RefCell<Vec<(Rect, Pane)>>,
+    purpose: ModelPickerPurpose,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -338,6 +354,93 @@ enum PickerPricing {
 
 impl ModelPickerView {
     #[must_use]
+    /// The same picker, opened by the Fleet editor for one of its rows: Enter
+    /// hands the absolute route to the editor (`FleetRoutePicked`) instead of
+    /// switching the session.
+    pub fn new_for_fleet_route(
+        app: &App,
+        config: &Config,
+        target: FleetRouteTarget,
+        editor_id: uuid::Uuid,
+        selection: FleetRouteSelection,
+    ) -> Self {
+        let mut picker = Self::new(app, config);
+        picker.purpose = ModelPickerPurpose::FleetRoute {
+            target,
+            editor_id,
+            initial_reasoning: selection.reasoning,
+            allow_inherit: selection.allow_inherit,
+        };
+        // Session browsing memory is unrelated to the row being edited.
+        picker.query.clear();
+        picker.view = ModelListView::Configured;
+        picker.sort = None;
+        picker.initial_provider_identity = selection
+            .provider
+            .unwrap_or_else(|| app.provider_identity_for_persistence().to_string());
+        picker.initial_provider =
+            ApiProvider::parse(&picker.initial_provider_identity).unwrap_or(ApiProvider::Custom);
+        picker.initial_model = selection.model.unwrap_or_else(|| "auto".to_string());
+        picker.previous_model = picker.initial_model.clone();
+        picker.initial_effort = selection.reasoning.unwrap_or(ReasoningEffort::Auto);
+        picker.selected_effort_request = picker.initial_effort;
+        picker.apply_fleet_route_rows(app, config);
+        *picker.projection.borrow_mut() = None;
+        picker.selected_model_idx = {
+            let rows = picker.visible_model_rows();
+            rows.iter()
+                .position(|row| {
+                    row.id == picker.initial_model
+                        && model_row_matches_route(
+                            row,
+                            picker.initial_provider,
+                            &picker.initial_provider_identity,
+                        )
+                })
+                .unwrap_or(rows.len())
+        };
+        let visible_len = picker.visible_model_rows().len();
+        picker.show_custom_model_row = picker.selected_model_idx >= visible_len;
+        *picker.projection.borrow_mut() = None;
+        picker.select_effort_for_current_model();
+        picker
+    }
+
+    fn apply_fleet_route_rows(&mut self, app: &App, config: &Config) {
+        let ModelPickerPurpose::FleetRoute { allow_inherit, .. } = self.purpose else {
+            return;
+        };
+        self.route_config.provider = Some(self.initial_provider_identity.clone());
+        self.configured_providers = configured_providers(config, self.initial_provider)
+            .into_iter()
+            .filter(|provider| *provider != self.initial_provider)
+            .collect();
+        self.active_accepts_custom_model_ids =
+            config.model_ids_pass_through_for_provider(self.initial_provider);
+        if self.initial_model != "auto" {
+            push_provider_model_rows(
+                &mut self.model_rows,
+                self.initial_provider,
+                (self.initial_provider == ApiProvider::Custom)
+                    .then_some(self.initial_provider_identity.as_str()),
+                vec![self.initial_model.clone()],
+                self.initial_provider,
+                config,
+                &codex_model_cache::model_roster(),
+                &app.provider_health,
+            );
+        }
+        self.model_rows
+            .retain(|row| allow_inherit || row.id != "auto");
+        for row in &mut self.model_rows {
+            if row.id == "auto" && row.provider.is_none() {
+                row.hint = format!("{}/{}", app.provider_identity_for_persistence(), app.model);
+                row.selectable = true;
+                row.blocked_reason = None;
+            }
+        }
+    }
+
     pub fn new(app: &App, config: &Config) -> Self {
         let initial_model = if app.auto_model {
             "auto".to_string()
@@ -449,6 +552,7 @@ impl ModelPickerView {
             sort: None,
             column_hitboxes: RefCell::new(Vec::new()),
             pane_hitboxes: RefCell::new(Vec::new()),
+            purpose: ModelPickerPurpose::Session,
         };
         view.restore_memory(app.model_picker_memory.as_ref());
         view
@@ -582,12 +686,18 @@ impl ModelPickerView {
         let mut rows: Vec<_> = visible
             .iter()
             .map(|row| PaneRow {
-                primary: row
-                    .metadata
-                    .display_name
-                    .as_ref()
-                    .map(|label| format!("{label} ({})", row.id))
-                    .unwrap_or_else(|| row.id.clone()),
+                primary: if matches!(self.purpose, ModelPickerPurpose::FleetRoute { .. })
+                    && row.id == "auto"
+                    && row.provider.is_none()
+                {
+                    tr(self.locale, MessageId::FleetRouteInherited).into_owned()
+                } else {
+                    row.metadata
+                        .display_name
+                        .as_ref()
+                        .map(|label| format!("{label} ({})", row.id))
+                        .unwrap_or_else(|| row.id.clone())
+                },
                 route: row
                     .provider
                     .map(|provider| {
@@ -675,6 +785,16 @@ impl ModelPickerView {
     }
 
     fn selected_model_is_selectable(&self) -> bool {
+        if matches!(
+            self.purpose,
+            ModelPickerPurpose::FleetRoute {
+                allow_inherit: false,
+                ..
+            }
+        ) && self.resolved_model() == "auto"
+        {
+            return false;
+        }
         let rows = self.visible_model_rows();
         if let Some(row) = rows.get(self.selected_model_idx) {
             return row.selectable;
@@ -718,6 +838,11 @@ impl ModelPickerView {
             "🔒 {} is locked — {reason}. Open /provider to authenticate, then refresh.",
             row.id
         );
+        // The ordinary setup wizard switches the session after auth. A
+        // Fleet edit must keep that session route intact.
+        if matches!(self.purpose, ModelPickerPurpose::FleetRoute { .. }) {
+            return ViewAction::Emit(ViewEvent::StatusMessage { message });
+        }
         // Prefer opening provider setup so the user can remediate in one step.
         if let Some(provider) = row.provider {
             return ViewAction::Emit(ViewEvent::ModelPickerNeedsAuth {
@@ -753,6 +878,22 @@ impl ModelPickerView {
     }
 
     fn current_efforts(&self) -> Vec<ReasoningEffort> {
+        if matches!(
+            self.purpose,
+            ModelPickerPurpose::FleetRoute {
+                allow_inherit: false,
+                ..
+            }
+        ) {
+            return vec![ReasoningEffort::Auto];
+        }
+        if let ModelPickerPurpose::FleetRoute {
+            initial_reasoning, ..
+        } = self.purpose
+            && self.resolved_model() == "auto"
+        {
+            return vec![initial_reasoning.unwrap_or(ReasoningEffort::Auto)];
+        }
         let provider = self.resolved_provider().unwrap_or(self.initial_provider);
         let model = self.resolved_model();
         let base_url = self.resolved_base_url_for_provider(provider, &model);
@@ -836,6 +977,10 @@ impl ModelPickerView {
 
     fn provider_accepts_custom_model(&self, provider: ApiProvider, model: &str) -> bool {
         (provider == self.initial_provider && self.active_accepts_custom_model_ids)
+            || (provider != self.initial_provider
+                && self
+                    .route_config
+                    .model_ids_pass_through_for_provider(provider))
             || crate::config::normalize_model_name_for_provider(provider, model).is_some()
     }
 
@@ -925,6 +1070,40 @@ impl ModelPickerView {
         }
     }
 
+    /// Apply one [`list_nav`](crate::tui::list_nav) motion (#6290), returning
+    /// whether it was consumed. Steps wrap; pages travel [`MODEL_PAGE`] rows
+    /// and clamp. The region axis toggles between the model and effort panes.
+    fn apply_motion(&mut self, motion: crate::tui::list_nav::Motion) -> bool {
+        use crate::tui::list_nav::Motion;
+        if matches!(motion, Motion::RegionPrev | Motion::RegionNext) {
+            if self.can_edit_effort() {
+                self.toggle_focus();
+            }
+            return true;
+        }
+        let (current, len) = match self.focus {
+            Pane::Model => (self.selected_model_idx, self.model_row_count()),
+            Pane::Effort => (self.selected_effort_idx, self.current_efforts().len()),
+        };
+        if len == 0 {
+            return false;
+        }
+        let Some(next) = crate::tui::list_nav::apply(current, len, MODEL_PAGE, motion) else {
+            return false;
+        };
+        match self.focus {
+            Pane::Model => {
+                self.selected_model_idx = next;
+                self.select_effort_for_current_model();
+            }
+            Pane::Effort => {
+                self.selected_effort_idx = next;
+                self.selected_effort_request = self.resolved_effort();
+            }
+        }
+        true
+    }
+
     fn toggle_focus(&mut self) {
         self.focus = match self.focus {
             Pane::Model => Pane::Effort,
@@ -937,10 +1116,6 @@ impl ModelPickerView {
         self.selected_model_idx = 0;
         self.clamp_model_selection();
         self.select_effort_for_current_model();
-    }
-
-    fn build_event(&self) -> ViewEvent {
-        self.build_event_with_startup_default(false)
     }
 
     fn build_event_with_startup_default(&self, save_as_startup_default: bool) -> ViewEvent {
@@ -962,6 +1137,64 @@ impl ModelPickerView {
             previous_model: self.previous_model.clone(),
             previous_effort: self.initial_effort,
             save_as_startup_default,
+        }
+    }
+
+    /// The event Enter (or the startup-default chord) emits, by purpose. A
+    /// Fleet row gets its absolute route — provider resolved, `Custom` named
+    /// by its exact identity — and has no startup default to save.
+    fn build_apply_event(&self, save_as_startup_default: bool) -> ViewEvent {
+        match self.purpose {
+            ModelPickerPurpose::Session => {
+                self.build_event_with_startup_default(save_as_startup_default)
+            }
+            ModelPickerPurpose::FleetRoute {
+                target,
+                editor_id,
+                initial_reasoning,
+                allow_inherit,
+            } => {
+                let provider = self.resolved_provider().unwrap_or(self.initial_provider);
+                let provider_id = (provider == ApiProvider::Custom).then(|| {
+                    self.resolved_provider_identity()
+                        .unwrap_or_else(|| self.route_config.provider_identity_for(provider))
+                });
+                ViewEvent::FleetRoutePicked {
+                    target,
+                    editor_id,
+                    provider,
+                    provider_id,
+                    model: self.resolved_model(),
+                    reasoning: if !allow_inherit {
+                        None
+                    } else if self.resolved_model() == "auto"
+                        || self.selected_effort_request == self.initial_effort
+                    {
+                        initial_reasoning
+                    } else {
+                        Some(self.selected_effort_request)
+                    },
+                }
+            }
+        }
+    }
+
+    /// Footer label for Enter: apply to the session, or assign to a Fleet row.
+    fn apply_action_id(&self) -> MessageId {
+        match self.purpose {
+            ModelPickerPurpose::Session => MessageId::PickerActionApply,
+            ModelPickerPurpose::FleetRoute { .. } => MessageId::PickerActionAssignRoute,
+        }
+    }
+
+    fn can_edit_effort(&self) -> bool {
+        match self.purpose {
+            ModelPickerPurpose::Session => true,
+            // Shortlisted rows pin a model only; inherited routes retain
+            // their existing reasoning until a concrete model is selected.
+            ModelPickerPurpose::FleetRoute { allow_inherit, .. } => {
+                allow_inherit && self.resolved_model() != "auto"
+            }
         }
     }
 
@@ -2066,12 +2299,18 @@ fn provider_catalog_receipt_for_route(
     source: Option<&CatalogSource>,
 ) -> Option<(CatalogStatus, bool)> {
     let identity = provider_identity.unwrap_or_else(|| provider.as_str());
+    // A custom route owns its catalog only on Baseten's endpoint, whose
+    // account-scoped roster no snapshot can serve (#6289).
     let owns_provider_catalog = matches!(
         provider,
-        ApiProvider::Openrouter | ApiProvider::Telecomjs | ApiProvider::Edenai
+        ApiProvider::Openrouter
+            | ApiProvider::Telecomjs
+            | ApiProvider::Edenai
+            | ApiProvider::Zenmux
     ) || (provider == ApiProvider::Custom
-        && codewhale_config::provider_setup_template(identity)
-            .is_some_and(|template| template.is_compatible()));
+        && codewhale_config::catalog::endpoint_is_baseten(
+            &config.base_url_for_route_identity(provider, identity),
+        ));
     if !owns_provider_catalog {
         return None;
     }
@@ -2434,10 +2673,11 @@ fn route_labels_for_rows(rows: &[&ModelPickerRow]) -> BTreeMap<String, String> {
         let Some(identity) = row_provider_identity(row) else {
             continue;
         };
-        let label = codewhale_config::provider_setup_template(identity)
-            .map(|template| template.display_name.to_string())
-            .unwrap_or_else(|| identity.to_string());
-        labels.entry(identity.to_string()).or_insert(label);
+        // Custom tables are labeled by their `[providers.<id>]` key: there
+        // are no compiled display names anymore (#6289).
+        labels
+            .entry(identity.to_string())
+            .or_insert_with(|| identity.to_string());
     }
     labels
 }
@@ -3337,11 +3577,12 @@ impl ModelPickerView {
         self.route_config = config.clone();
         self.pinned_models = picker_pins_for_app(app);
         self.model_rows = picker_model_rows_for_app(app, config);
+        self.apply_fleet_route_rows(app, config);
         *self.projection.get_mut() = None;
         self.last_mouse_selected = None;
-        self.configured_providers = configured_providers(config, app.api_provider)
+        self.configured_providers = configured_providers(config, self.initial_provider)
             .into_iter()
-            .filter(|provider| *provider != app.api_provider)
+            .filter(|provider| *provider != self.initial_provider)
             .collect();
         // Re-anchor to the same exact provider/model after pin sorting changes;
         // preserving only the numeric index can select a different model.
@@ -3391,6 +3632,14 @@ impl ModalView for ModelPickerView {
 
     fn handle_key(&mut self, key: KeyEvent) -> ViewAction {
         self.last_mouse_selected = None;
+        // Movement keys come from the shared vocabulary (#6290); the match
+        // below owns only the picker's own verbs. The live filter means the
+        // typing-safe set — no letter aliases to eat the query.
+        if let Some(motion) = crate::tui::list_nav::motion_while_typing(&key)
+            && self.apply_motion(motion)
+        {
+            return ViewAction::None;
+        }
         match key.code {
             KeyCode::Char('s' | 'S') if key.modifiers == KeyModifiers::CONTROL => {
                 self.cycle_sort();
@@ -3398,6 +3647,9 @@ impl ModalView for ModelPickerView {
             }
             // Esc carries the browsing context out so the next open can
             // restore it (#4109 picker memory).
+            KeyCode::Esc if matches!(self.purpose, ModelPickerPurpose::FleetRoute { .. }) => {
+                ViewAction::Close
+            }
             KeyCode::Esc => ViewAction::EmitAndClose(ViewEvent::ModelPickerDismissed {
                 catalog_view: self.view.browses_all_providers(),
                 view: self.view.memory_name().to_string(),
@@ -3412,7 +3664,7 @@ impl ModalView for ModelPickerView {
                 // readiness reason and offer provider setup.
                 self.explain_unselectable_selection()
             }
-            KeyCode::Enter => ViewAction::EmitAndClose(self.build_event()),
+            KeyCode::Enter => ViewAction::EmitAndClose(self.build_apply_event(false)),
             // Shift+D makes the visible provider/model pair the startup
             // default. Plain Enter deliberately stays session-local, so a
             // one-off route comparison cannot silently change the next launch.
@@ -3422,7 +3674,7 @@ impl ModalView for ModelPickerView {
                     && ch.eq_ignore_ascii_case(&'d')
                     && self.selected_model_is_selectable() =>
             {
-                ViewAction::EmitAndClose(self.build_event_with_startup_default(true))
+                ViewAction::EmitAndClose(self.build_apply_event(true))
             }
             KeyCode::Char(ch)
                 if key.modifiers.contains(KeyModifiers::SHIFT) && ch.eq_ignore_ascii_case(&'d') =>
@@ -3446,7 +3698,11 @@ impl ModalView for ModelPickerView {
                 })
             }
             // Same rule as pinning: a shifted key, never a search character.
-            KeyCode::Char('F') if key.modifiers == KeyModifiers::SHIFT && self.query.is_empty() => {
+            KeyCode::Char('F')
+                if key.modifiers == KeyModifiers::SHIFT
+                    && self.query.is_empty()
+                    && self.purpose == ModelPickerPurpose::Session =>
+            {
                 let rows = self.visible_model_rows();
                 let Some(row) = rows.get(self.selected_model_idx) else {
                     return ViewAction::None;
@@ -3487,56 +3743,6 @@ impl ModalView for ModelPickerView {
                 let mut query = self.query.clone();
                 query.pop();
                 self.update_query(query);
-                ViewAction::None
-            }
-            KeyCode::Up => {
-                self.move_up();
-                ViewAction::None
-            }
-            KeyCode::Down => {
-                self.move_down();
-                ViewAction::None
-            }
-            KeyCode::PageUp => {
-                for _ in 0..5 {
-                    self.move_up();
-                }
-                ViewAction::None
-            }
-            KeyCode::PageDown => {
-                for _ in 0..5 {
-                    self.move_down();
-                }
-                ViewAction::None
-            }
-            KeyCode::Home => {
-                match self.focus {
-                    Pane::Model => {
-                        self.selected_model_idx = 0;
-                        self.select_effort_for_current_model();
-                    }
-                    Pane::Effort => {
-                        self.selected_effort_idx = 0;
-                        self.selected_effort_request = self.resolved_effort();
-                    }
-                }
-                ViewAction::None
-            }
-            KeyCode::End => {
-                match self.focus {
-                    Pane::Model => {
-                        self.selected_model_idx = self.model_row_count().saturating_sub(1);
-                        self.select_effort_for_current_model();
-                    }
-                    Pane::Effort => {
-                        self.selected_effort_idx = self.current_efforts().len().saturating_sub(1);
-                        self.selected_effort_request = self.resolved_effort();
-                    }
-                }
-                ViewAction::None
-            }
-            KeyCode::Tab | KeyCode::Right | KeyCode::Left | KeyCode::BackTab => {
-                self.toggle_focus();
                 ViewAction::None
             }
             // Explicit readiness + catalog refresh (safe, non-destructive).
@@ -3617,7 +3823,7 @@ impl ModalView for ModelPickerView {
                 }
                 self.last_mouse_selected = Some((pane, idx));
                 if apply && self.selected_model_is_selectable() {
-                    ViewAction::EmitAndClose(self.build_event())
+                    ViewAction::EmitAndClose(self.build_apply_event(false))
                 } else if apply {
                     self.explain_unselectable_selection()
                 } else {
@@ -3658,21 +3864,33 @@ impl ModelPickerView {
                 tr(self.locale, MessageId::RouteActionType),
                 tr(self.locale, MessageId::RouteActionSearchAnyModel),
             ),
-            ActionHint::new("Enter", tr(self.locale, MessageId::PickerActionApply)),
-            ActionHint::new(
-                "⇧D",
-                tr(self.locale, MessageId::PickerActionSetStartupDefault),
-            ),
+            ActionHint::new("Enter", tr(self.locale, self.apply_action_id())),
             ActionHint::new("⇧A", view_action),
             ActionHint::new("Ctrl+S", tr(self.locale, MessageId::SessionsActionSort)),
         ];
+        if !self.can_edit_effort() {
+            footer_hints.remove(1);
+        }
+        // A Fleet row has no startup default to save; the chord is a
+        // session-route action only.
+        if self.purpose == ModelPickerPurpose::Session {
+            footer_hints.insert(
+                4,
+                ActionHint::new(
+                    "⇧D",
+                    tr(self.locale, MessageId::PickerActionSetStartupDefault),
+                ),
+            );
+        }
         // Keep compact route modals focused on the core browse/apply actions;
         // wider shells have room to disclose the pin action too.
         if inner.width >= 72 {
-            footer_hints.push(ActionHint::new(
-                "⇧F",
-                tr(self.locale, MessageId::PickerActionFleet),
-            ));
+            if self.purpose == ModelPickerPurpose::Session {
+                footer_hints.push(ActionHint::new(
+                    "⇧F",
+                    tr(self.locale, MessageId::PickerActionFleet),
+                ));
+            }
             footer_hints.push(ActionHint::new(
                 "⇧P",
                 tr(self.locale, MessageId::PickerActionPin),
@@ -3734,7 +3952,10 @@ impl ModelPickerView {
         ])
         .render(shell[0], buf);
 
-        let layout = widen_model_pane(ListDetailLayout::split(shell[1], 24));
+        let mut layout = widen_model_pane(ListDetailLayout::split(shell[1], 24));
+        if !self.can_edit_effort() {
+            layout.list = shell[1];
+        }
 
         self.ensure_projection();
         let projection = self.projection.borrow();
@@ -3756,6 +3977,9 @@ impl ModelPickerView {
             },
         );
 
+        if !self.can_edit_effort() {
+            return;
+        }
         let effort_provider = self.resolved_provider().unwrap_or(self.initial_provider);
         let current_efforts = self.current_efforts();
         let selected_effort_idx = self
@@ -3794,6 +4018,10 @@ impl ModelPickerView {
         );
     }
 }
+
+/// Rows one PageUp/PageDown travels. Pages clamp at the ends per the shared
+/// vocabulary instead of wrapping (#6290).
+const MODEL_PAGE: usize = 5;
 
 /// Previous index in a list that rotates: 0 wraps to the last row.
 /// `count` must be non-zero.
@@ -4112,7 +4340,217 @@ mod tests {
             sort: None,
             column_hitboxes: RefCell::new(Vec::new()),
             pane_hitboxes: RefCell::new(Vec::new()),
+            purpose: ModelPickerPurpose::Session,
         }
+    }
+
+    /// Opened for a Fleet row, Enter hands the editor the absolute route
+    /// instead of switching the session; the startup-default chord is the
+    /// same pick.
+    #[test]
+    fn fleet_purpose_enter_hands_the_absolute_route_to_the_editor() {
+        let mut picker = test_picker();
+        picker.purpose = ModelPickerPurpose::FleetRoute {
+            target: FleetRouteTarget::Member(1),
+            editor_id: uuid::Uuid::nil(),
+            initial_reasoning: None,
+            allow_inherit: true,
+        };
+        let action = picker.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(
+            matches!(
+                &action,
+                ViewAction::EmitAndClose(ViewEvent::FleetRoutePicked {
+                    target: FleetRouteTarget::Member(1),
+                    provider: ApiProvider::Openai,
+                    provider_id: None,
+                    model,
+                    editor_id,
+                    reasoning: None,
+                }) if model == "model" && editor_id.is_nil()
+            ),
+            "{action:?}"
+        );
+        assert!(matches!(
+            picker.handle_key(KeyEvent::new(KeyCode::Char('D'), KeyModifiers::SHIFT)),
+            ViewAction::EmitAndClose(ViewEvent::FleetRoutePicked { .. })
+        ));
+        // The session-purpose picker is untouched by the new purpose.
+        let mut session = test_picker();
+        assert!(matches!(
+            session.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            ViewAction::EmitAndClose(ViewEvent::ModelPickerApplied { .. })
+        ));
+    }
+
+    #[test]
+    fn fleet_locked_builtin_explains_setup_without_switching_the_session() {
+        let mut picker = test_picker();
+        picker.purpose = ModelPickerPurpose::FleetRoute {
+            target: FleetRouteTarget::Operator,
+            editor_id: uuid::Uuid::nil(),
+            initial_reasoning: None,
+            allow_inherit: true,
+        };
+        picker.model_rows[0].selectable = false;
+        *picker.projection.get_mut() = None;
+        assert!(
+            matches!(picker.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)), ViewAction::Emit(ViewEvent::StatusMessage { message }) if message.contains("/provider"))
+        );
+    }
+
+    #[test]
+    fn fleet_picker_keeps_the_rows_exact_pin_and_effort_after_refresh() {
+        let _env = crate::test_support::lock_test_env();
+        let _live = crate::provider_lake::lock_live_snapshot();
+        let (config, mut app, home, _workspace) =
+            resumed_openrouter_session_with_named_custom_routes();
+        let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", home.path());
+        crate::provider_catalog_live::reset_cache_for_test();
+        crate::provider_lake::clear_live_snapshot();
+        app.model_picker_memory = Some(crate::tui::app::ModelPickerMemory {
+            catalog_view: true,
+            view: Some("catalog".to_string()),
+            selected_row_id: Some(app.model.clone()),
+        });
+        let session_route = (app.api_provider, app.model.clone());
+        let mut picker = ModelPickerView::new_for_fleet_route(
+            &app,
+            &config,
+            FleetRouteTarget::Member(0),
+            uuid::Uuid::nil(),
+            FleetRouteSelection {
+                provider: Some("command_code".to_string()),
+                model: Some("deepseek/deepseek-v4-flash".to_string()),
+                reasoning: Some(ReasoningEffort::High),
+                allow_inherit: true,
+            },
+        );
+        assert_eq!(
+            picker.resolved_provider_identity().as_deref(),
+            Some("command_code")
+        );
+        assert_eq!(picker.resolved_model(), "deepseek/deepseek-v4-flash");
+        assert_eq!(picker.selected_effort_request, ReasoningEffort::High);
+        assert!(picker.can_edit_effort());
+        assert_eq!(
+            picker
+                .visible_model_rows()
+                .iter()
+                .filter(|row| row.id == "deepseek/deepseek-v4-flash"
+                    && row_provider_identity(row) == Some("command_code"))
+                .count(),
+            1
+        );
+        picker.selected_effort_request = ReasoningEffort::Low;
+        picker.re_resolve_from_app(&app, &config);
+        assert!(picker.can_edit_effort());
+        assert!(matches!(
+            picker.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            ViewAction::EmitAndClose(ViewEvent::FleetRoutePicked {
+                provider: ApiProvider::Custom, provider_id: Some(identity), model,
+                reasoning: Some(ReasoningEffort::Low), ..
+            }) if identity == "command_code" && model == "deepseek/deepseek-v4-flash"
+        ));
+        assert_eq!((app.api_provider, app.model.clone()), session_route);
+        assert!(matches!(
+            picker.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            ViewAction::Close
+        ));
+        for query in [
+            "openrouter:new-fixture-model",
+            "openrouter new-fixture-model",
+        ] {
+            picker.update_query(query.to_string());
+            assert_eq!(picker.resolved_provider(), Some(ApiProvider::Openrouter));
+            assert_eq!(picker.resolved_model(), "new-fixture-model");
+        }
+        // A slash is part of a model id, not a provider switch: compatible
+        // routes routinely serve names such as openai/gpt-5.
+        picker.update_query("openrouter/new-fixture-model".to_string());
+        assert_eq!(picker.resolved_provider(), Some(ApiProvider::Custom));
+        assert_eq!(picker.resolved_model(), "openrouter/new-fixture-model");
+    }
+
+    #[test]
+    fn fleet_shortlist_picker_has_no_inherit_or_reasoning_edits() {
+        let _env = crate::test_support::lock_test_env();
+        let _live = crate::provider_lake::lock_live_snapshot();
+        let (config, app, home, _workspace) = resumed_openrouter_session_with_named_custom_routes();
+        let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", home.path());
+        let mut picker = ModelPickerView::new_for_fleet_route(
+            &app,
+            &config,
+            FleetRouteTarget::Member(0),
+            uuid::Uuid::nil(),
+            FleetRouteSelection {
+                provider: Some("command_code".to_string()),
+                model: Some("deepseek/deepseek-v4-flash".to_string()),
+                reasoning: None,
+                allow_inherit: false,
+            },
+        );
+        for _ in 0..2 {
+            assert!(!picker.can_edit_effort());
+            assert!(
+                picker
+                    .visible_model_rows()
+                    .iter()
+                    .all(|row| row.id != "auto")
+            );
+            picker.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+            assert_eq!(picker.focus, Pane::Model);
+            render_text(&picker, 150, 42);
+            assert!(
+                picker
+                    .pane_hitboxes
+                    .borrow()
+                    .iter()
+                    .all(|(_, pane)| *pane == Pane::Model)
+            );
+            assert!(matches!(
+                picker.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+                ViewAction::EmitAndClose(ViewEvent::FleetRoutePicked {
+                    reasoning: None,
+                    ..
+                })
+            ));
+            picker.re_resolve_from_app(&app, &config);
+        }
+        picker.update_query("auto".to_string());
+        assert!(
+            !matches!(picker.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)), ViewAction::EmitAndClose(ViewEvent::FleetRoutePicked { model, .. }) if model == "auto")
+        );
+    }
+
+    #[test]
+    fn fleet_inherited_route_is_selectable_and_named_without_session_autorouting_claims() {
+        let _env = crate::test_support::lock_test_env();
+        let _live = crate::provider_lake::lock_live_snapshot();
+        let (config, app, home, _workspace) = resumed_openrouter_session_with_named_custom_routes();
+        let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", home.path());
+        let mut picker = ModelPickerView::new_for_fleet_route(
+            &app,
+            &config,
+            FleetRouteTarget::Member(0),
+            uuid::Uuid::nil(),
+            FleetRouteSelection {
+                provider: None,
+                model: None,
+                reasoning: None,
+                allow_inherit: true,
+            },
+        );
+        assert_eq!(picker.resolved_model(), "auto");
+        assert!(picker.selected_model_is_selectable());
+        assert!(
+            render_text(&picker, 150, 42)
+                .contains(tr(app.ui_locale, MessageId::FleetRouteInherited).as_ref())
+        );
+        assert_eq!(picker.current_efforts(), vec![ReasoningEffort::Auto]);
+        assert!(
+            matches!(picker.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)), ViewAction::EmitAndClose(ViewEvent::FleetRoutePicked { model, reasoning: None, .. }) if model == "auto")
+        );
     }
 
     fn render_text(picker: &ModelPickerView, width: u16, height: u16) -> String {
@@ -4625,24 +5063,59 @@ mod tests {
 
     #[test]
     fn baseten_picker_models_use_exact_identity_and_direct_provider_label() {
+        let _env = crate::test_support::lock_test_env();
         let _live = crate::provider_lake::lock_live_snapshot();
+        let home = tempfile::tempdir().expect("test home");
+        let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", home.path());
+        crate::provider_catalog_live::reset_cache_for_test();
         crate::provider_lake::clear_live_snapshot();
+
+        // No compiled seeds: a custom route offers nothing until a live
+        // listing lands for its exact endpoint (#6289).
+        assert!(
+            provider_catalog_model_ids(
+                ApiProvider::Custom,
+                codewhale_config::catalog::BASETEN_PROVIDER_ID,
+                codewhale_config::catalog::BASETEN_BASE_URL,
+            )
+            .is_empty()
+        );
+
+        let fingerprint = codewhale_config::catalog::base_url_fingerprint(
+            codewhale_config::catalog::BASETEN_BASE_URL,
+        );
+        crate::provider_catalog_live::record_success(
+            codewhale_config::catalog::ProviderCatalogDelta {
+                provider: codewhale_config::catalog::BASETEN_PROVIDER_ID.to_string(),
+                base_url_fingerprint: fingerprint.clone(),
+                fetched_at: 1,
+                offerings: vec![codewhale_config::catalog::CatalogOffering {
+                    provider: codewhale_config::catalog::BASETEN_PROVIDER_ID.to_string(),
+                    wire_model_id: codewhale_config::catalog::BASETEN_DEFAULT_MODEL.to_string(),
+                    endpoint_key: "chat".to_string(),
+                    source: CatalogSource::Live {
+                        base_url_fingerprint: fingerprint,
+                        fetched_at: 1,
+                    },
+                    ..Default::default()
+                }],
+            },
+        );
 
         let models = provider_catalog_model_ids(
             ApiProvider::Custom,
-            codewhale_config::BASETEN_TEMPLATE_ID,
-            codewhale_config::BASETEN_BASE_URL,
+            codewhale_config::catalog::BASETEN_PROVIDER_ID,
+            codewhale_config::catalog::BASETEN_BASE_URL,
         );
         assert_eq!(
             models,
-            vec![codewhale_config::BASETEN_DEFAULT_MODEL.to_string()]
+            vec![codewhale_config::catalog::BASETEN_DEFAULT_MODEL.to_string()]
         );
-        assert!(models.contains(&codewhale_config::BASETEN_DEFAULT_MODEL.to_string()));
 
         let row = ModelPickerRow {
-            id: codewhale_config::BASETEN_DEFAULT_MODEL.to_string(),
+            id: codewhale_config::catalog::BASETEN_DEFAULT_MODEL.to_string(),
             provider: Some(ApiProvider::Custom),
-            provider_identity: Some(codewhale_config::BASETEN_TEMPLATE_ID.to_string()),
+            provider_identity: Some(codewhale_config::catalog::BASETEN_PROVIDER_ID.to_string()),
             hint: String::new(),
             metadata: EffectivePickerMetadata::default(),
             selectable: true,
@@ -4650,7 +5123,8 @@ mod tests {
             enabled: true,
         };
         let labels = route_labels_for_rows(&[&row]);
-        assert_eq!(labels.get("baseten").map(String::as_str), Some("Baseten"));
+        // No compiled display names: the route label is the table key itself.
+        assert_eq!(labels.get("baseten").map(String::as_str), Some("baseten"));
     }
 
     #[test]
@@ -4771,7 +5245,7 @@ mod tests {
                 "{identity} readiness must come from its own route"
             );
             picker.selected_model_idx = index;
-            match picker.build_event() {
+            match picker.build_apply_event(false) {
                 ViewEvent::ModelPickerApplied {
                     model,
                     provider,
@@ -4936,14 +5410,14 @@ model = "deepseek/deepseek-v4-flash"
         {
             let projection = picker.projection.borrow();
             let rows = &projection.as_ref().unwrap().rows;
-            assert!(rows.iter().any(|row| row.route == "Command Code"));
+            assert!(rows.iter().any(|row| row.route == "command_code"));
             assert!(rows.iter().any(|row| row.route == "other_code"));
             let active: Vec<_> = rows.iter().filter(|row| row.active).collect();
             assert_eq!(active.len(), 1);
             assert_eq!(active[0].route, "other_code");
         }
         let rendered = render_text(&picker, 140, 40);
-        assert!(rendered.contains("Command Code"), "{rendered}");
+        assert!(rendered.contains("command_code"), "{rendered}");
         assert!(rendered.contains("other_code"), "{rendered}");
 
         // Legacy memory has no route identity; ambiguity must preserve the

@@ -69,6 +69,12 @@ pub struct DecisionRecord {
 ///
 /// Declares expected repo-relative paths/trees and named contracts.
 /// This is coordination metadata, not another approval system.
+///
+/// An `exact_files` entry beneath a declared root binds that root to the
+/// files listed under it (#6278): peers may then share the root with
+/// disjoint file claims, and the claim's authorized surface is what
+/// [`WriteScopeClaim::contains_path`] and [`WriteScopeClaim::overlaps`]
+/// both see.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WriteScopeClaim {
     pub owner: String,
@@ -78,12 +84,27 @@ pub struct WriteScopeClaim {
 }
 
 impl WriteScopeClaim {
+    /// Roots that authorize their whole tree. A root with declared
+    /// `exact_files` beneath it is bound to those files instead: the files
+    /// are the real exclusion boundary, so peers may share one root while
+    /// claiming disjoint outputs (#6278). A root carrying no declared file
+    /// keeps tree-wide authority, and an exact file outside every root
+    /// stands alone.
+    fn open_roots(&self) -> impl Iterator<Item = &String> {
+        self.roots.iter().filter(|root| {
+            !self
+                .exact_files
+                .iter()
+                .any(|file| paths_overlap_by_containment(root, file))
+        })
+    }
+
     /// Check whether this claim overlaps with another. A claim overlaps when
-    /// either normalized tree contains the other or exact files collide.
+    /// either normalized open tree contains the other or exact files collide.
     #[must_use]
     pub fn overlaps(&self, other: &WriteScopeClaim) -> bool {
-        for root_a in &self.roots {
-            for root_b in &other.roots {
+        for root_a in self.open_roots() {
+            for root_b in other.open_roots() {
                 if paths_overlap_by_containment(root_a, root_b)
                     || paths_overlap_by_containment(root_b, root_a)
                 {
@@ -97,8 +118,7 @@ impl WriteScopeClaim {
                 .iter()
                 .any(|file| paths_overlap_equal(file, file_a))
                 || other
-                    .roots
-                    .iter()
+                    .open_roots()
                     .any(|root| paths_overlap_by_containment(root, file_a))
             {
                 return true;
@@ -106,8 +126,7 @@ impl WriteScopeClaim {
         }
         for file_b in &other.exact_files {
             if self
-                .roots
-                .iter()
+                .open_roots()
                 .any(|root| paths_overlap_by_containment(root, file_b))
             {
                 return true;
@@ -126,7 +145,7 @@ impl WriteScopeClaim {
     #[must_use]
     pub fn contains_path(&self, path: &str) -> bool {
         self.exact_files.iter().any(|file| file == path)
-            || self.roots.iter().any(|root| path_contains(root, path))
+            || self.open_roots().any(|root| path_contains(root, path))
     }
 }
 
@@ -584,12 +603,14 @@ impl CoordinationLedger {
             self.contentions.push(receipt);
             trim_front(&mut self.contentions, COORDINATION_RECORD_LIMIT);
             return Err(format!(
-                "write-scope contention with {} (roots: {:?}, files: {:?}, contracts: {:?}); serialize the work, narrow the claim, use worktree isolation, or — if that owner has already settled — clear its claim with agent(action=\"release\", agent_id=\"{}\")",
+                "write-scope contention with {}: requested roots {:?}, files {:?}, contracts {:?} overlap its writable roots {:?}, files {:?}, contracts {:?}. Claim disjoint sibling write_roots (for example tmp/scan/worker-a and tmp/scan/worker-b) or exact_files for each output. A read-only worker uses write_authority=read_only without a write claim. Otherwise serialize the writers (wait for that owner to settle, or cancel it) or use worktree isolation; a nested path inside an existing writable root still overlaps.",
                 existing.claim.owner,
+                claim.roots,
+                claim.exact_files,
+                claim.contracts,
                 existing.claim.roots,
                 existing.claim.exact_files,
-                existing.claim.contracts,
-                existing.claim.owner
+                existing.claim.contracts
             ));
         }
         self.write_claims
@@ -1506,6 +1527,88 @@ mod records_tests {
         };
         assert!(!root.overlaps(&sibling));
         assert!(root.overlaps(&child_file));
+    }
+
+    #[test]
+    fn disjoint_exact_files_share_a_root() {
+        // #6278: N workers, one results directory, one disjoint file each.
+        let a = WriteScopeClaim {
+            owner: "agent-a".into(),
+            roots: vec!["tmp/scan".into()],
+            exact_files: vec!["tmp/scan/a.txt".into()],
+            contracts: vec![],
+        };
+        let b = WriteScopeClaim {
+            owner: "agent-b".into(),
+            roots: vec!["tmp/scan".into()],
+            exact_files: vec!["tmp/scan/b.txt".into()],
+            contracts: vec![],
+        };
+        assert!(!a.overlaps(&b));
+        assert!(!b.overlaps(&a));
+        // The bound root is the file boundary: the shared tree and the
+        // peer's file are outside this claim's authorized surface.
+        assert!(a.contains_path("tmp/scan/a.txt"));
+        assert!(!a.contains_path("tmp/scan/b.txt"));
+        assert!(!a.contains_path("tmp/scan/scratch.txt"));
+    }
+
+    #[test]
+    fn file_bound_roots_still_refuse_real_overlap() {
+        let a = WriteScopeClaim {
+            owner: "agent-a".into(),
+            roots: vec!["tmp/scan".into()],
+            exact_files: vec!["tmp/scan/a.txt".into()],
+            contracts: vec![],
+        };
+        // The same file under the shared root still contends.
+        let same_file = WriteScopeClaim {
+            owner: "agent-b".into(),
+            roots: vec!["tmp/scan".into()],
+            exact_files: vec!["tmp/scan/a.txt".into()],
+            contracts: vec![],
+        };
+        assert!(a.overlaps(&same_file));
+        // An open root — no files declared beneath it — keeps tree-wide
+        // authority and still contends with a file beneath it.
+        let open_root = WriteScopeClaim {
+            owner: "agent-c".into(),
+            roots: vec!["tmp/scan".into()],
+            exact_files: vec![],
+            contracts: vec![],
+        };
+        assert!(a.overlaps(&open_root));
+        // A root whose files sit elsewhere stays open: union claims are
+        // unchanged for files outside the claimed trees.
+        let mixed = WriteScopeClaim {
+            owner: "agent-d".into(),
+            roots: vec!["src".into()],
+            exact_files: vec!["README.md".into()],
+            contracts: vec![],
+        };
+        assert!(mixed.contains_path("src/lib.rs"));
+        assert!(mixed.contains_path("README.md"));
+    }
+
+    #[test]
+    fn disjoint_file_claims_under_one_root_both_register() {
+        let mut ledger = CoordinationLedger::default();
+        for (owner, file) in [("agent-a", "tmp/scan/a.txt"), ("agent-b", "tmp/scan/b.txt")] {
+            ledger
+                .register_claim(
+                    WriteScopeClaim {
+                        owner: owner.into(),
+                        roots: vec!["tmp/scan".into()],
+                        exact_files: vec![file.into()],
+                        contracts: vec![],
+                    },
+                    false,
+                    |_| true,
+                )
+                .expect("disjoint files under a shared root register");
+        }
+        assert_eq!(ledger.write_claims.len(), 2);
+        assert!(ledger.contentions.is_empty());
     }
 
     #[test]

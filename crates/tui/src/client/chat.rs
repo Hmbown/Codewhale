@@ -2627,6 +2627,23 @@ fn last_chars(value: &str, count: usize) -> String {
     chars.into_iter().collect()
 }
 
+fn merge_adjacent_user_content(previous: Value, current: Value) -> Value {
+    match (previous, current) {
+        (Value::String(left), Value::String(right)) => json!(format!("{left}\n\n{right}")),
+        (left, right) => {
+            let mut parts = Vec::new();
+            for content in [left, right] {
+                match content {
+                    Value::Array(items) => parts.extend(items),
+                    Value::String(text) => parts.push(json!({"type": "text", "text": text})),
+                    other => parts.push(other),
+                }
+            }
+            Value::Array(parts)
+        }
+    }
+}
+
 fn build_chat_messages_with_reasoning(
     system: Option<&SystemPrompt>,
     messages: &[Message],
@@ -2652,7 +2669,53 @@ fn build_chat_messages_with_reasoning(
         }));
     }
 
-    for (message_index, message) in messages.iter().enumerate() {
+    // Persisted compaction keeps its summary after the bounded last round.
+    // On strict paired chat templates a user message after a tool result is
+    // invalid. Reorder only a generated summary immediately after a tool
+    // result; its independent provenance block rules out quoted user text.
+    // The session log retains every original message and tool ID.
+    // Limitation: this normalization applies to Chat Completions only.
+    let summary_index = messages
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(index, message)| {
+            (index > 0
+                && crate::compaction::is_wire_compaction_checkpoint_message(message)
+                && messages[index - 1]
+                    .content
+                    .iter()
+                    .any(|block| matches!(block, ContentBlock::ToolResult { .. })))
+            .then_some(index)
+        });
+    let summary_target = summary_index.and_then(|summary_index| {
+        messages[..summary_index]
+            .iter()
+            .rposition(|message| {
+                crate::runtime_handoff::classify_user_turn_prompt(message)
+                    != crate::runtime_handoff::UserTurnPromptKind::NotPrompt
+            })
+            .or_else(|| {
+                messages[..summary_index]
+                    .iter()
+                    .position(|message| message.role.is_assistant_like())
+            })
+    });
+    let wire_messages = (0..messages.len())
+        .filter(|index| Some(*index) != summary_index || summary_target.is_none())
+        .flat_map(|index| {
+            if Some(index) == summary_target {
+                [summary_index, Some(index)]
+                    .into_iter()
+                    .flatten()
+                    .collect::<Vec<_>>()
+            } else {
+                vec![index]
+            }
+        });
+
+    for message_index in wire_messages {
+        let message = &messages[message_index];
         // Which wire channel this message belongs in is decided by the shared
         // placement table, not by an `if` chain local to this adapter.
         let placement = role_placement(&message.role, WireDialect::ChatCompletions);
@@ -2852,7 +2915,26 @@ fn build_chat_messages_with_reasoning(
                 if include_tool_budget_metadata && let Some(turn_meta) = &turn_meta_budget {
                     msg["_turn_meta_budget"] = turn_meta_budget_json(turn_meta);
                 }
-                out.push(msg);
+                if (Some(message_index) == summary_index
+                    || Some(message_index) == summary_target
+                    || crate::compaction::is_wire_compaction_checkpoint_message(message)
+                    || crate::runtime_handoff::is_agent_topology_checkpoint(message)
+                    || crate::runtime_handoff::is_restored_agent_topology_checkpoint(message))
+                    && let Some(previous) = out.last_mut()
+                    && previous.get("role").and_then(Value::as_str) == Some("user")
+                {
+                    let previous_content = previous["content"].take();
+                    let current_content = msg["content"].take();
+                    previous["content"] =
+                        merge_adjacent_user_content(previous_content, current_content);
+                    if previous.get("_turn_meta_budget").is_none()
+                        && let Some(meta) = msg.get("_turn_meta_budget")
+                    {
+                        previous["_turn_meta_budget"] = meta.clone();
+                    }
+                } else {
+                    out.push(msg);
+                }
             }
         }
 
@@ -3465,6 +3547,21 @@ fn is_reasoning_model_for_stream_on_route(
     ) && model_supports_reasoning(model)
     {
         return true;
+    }
+
+    // ModelScope's OpenAI-compatible inference API streams hybrid-model
+    // reasoning as `delta.reasoning_content` (the DashScope dialect) for the
+    // Qwen and ZhipuAI families, whose model ids carry a `qwen/` or
+    // `zhipuai/` namespace prefix. Surface those deltas as Thinking instead
+    // of inlining them into the answer text. As with Model Studio above,
+    // `reasoning_content` is deliberately NOT replayed back on later turns:
+    // the provider is absent from `provider_accepts_reasoning_content`, and
+    // the DashScope dialect does not require the reasoning field in history.
+    if provider == ApiProvider::Modelscope {
+        let lower = model.to_ascii_lowercase();
+        if lower.starts_with("qwen/") || lower.starts_with("zhipuai/") {
+            return true;
+        }
     }
 
     provider_accepts_reasoning_content(provider) && model_supports_reasoning(model)
@@ -6429,6 +6526,225 @@ mod image_block_wire_tests {
     use codewhale_models::{ContentBlock, ImageUrlContent, Message, MessageRequest};
 
     const DATA_URL: &str = "data:image/png;base64,QUJD";
+
+    #[test]
+    fn compaction_checkpoint_keeps_complete_tool_round_on_wire() {
+        let mut messages: Vec<Message> = serde_json::from_value(serde_json::json!([
+            {"role":"user","content":[{"type":"text","text":"Analyze the data"}]},
+            {"role":"assistant","content":[{"type":"tool_use","id":"call_1","name":"read","input":{"path":"a.txt"}}]},
+            {"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":"ready"}]},
+            {"role":"assistant","content":[{"type":"tool_use","id":"call_2","name":"read","input":{"path":"b.txt"}}]},
+            {"role":"user","content":[{"type":"tool_result","tool_use_id":"call_2","content":"done"}]}
+        ])).unwrap();
+        let summary = codewhale_models::SystemPrompt::Text(
+            crate::compaction::build_compaction_summary_block_text("Compacted summary", ""),
+        );
+        messages.push(crate::compaction::compaction_checkpoint_message(&summary));
+        crate::runtime_handoff::replace_agent_topology_checkpoint(&mut messages, &[]);
+        let stored = messages.clone();
+        let wire = build_chat_messages(None, &messages, "gpt-4o");
+        assert_eq!(
+            messages, stored,
+            "request construction must not alter saved history"
+        );
+        let roles: Vec<&str> = wire
+            .iter()
+            .map(|message| message["role"].as_str().unwrap())
+            .collect();
+        assert_eq!(roles, ["user", "assistant", "tool", "assistant", "tool"]);
+        let prompt = wire[0]["content"].as_str().unwrap();
+        assert!(prompt.contains("Compacted summary"));
+        assert!(prompt.contains("Analyze the data"));
+        assert!(prompt.contains("codewhale.agent_topology.v1"));
+        assert_eq!(wire[1]["tool_calls"][0]["id"], "call_1");
+        assert_eq!(wire[2]["tool_call_id"], "call_1");
+        assert_eq!(wire[3]["tool_calls"][0]["id"], "call_2");
+        assert_eq!(wire[4]["tool_call_id"], "call_2");
+
+        messages.push(
+            serde_json::from_value(serde_json::json!({
+                "role":"assistant","content":[{"type":"text","text":"Analysis complete"}]
+            }))
+            .unwrap(),
+        );
+        messages.push(
+            serde_json::from_value(serde_json::json!({
+                "role":"user","content":[{"type":"text","text":"What happened next?"}]
+            }))
+            .unwrap(),
+        );
+        let later_wire = build_chat_messages(None, &messages, "gpt-4o");
+        let later_roles: Vec<&str> = later_wire
+            .iter()
+            .map(|message| message["role"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            later_roles,
+            [
+                "user",
+                "assistant",
+                "tool",
+                "assistant",
+                "tool",
+                "assistant",
+                "user"
+            ]
+        );
+        assert_eq!(later_wire[6]["content"], "What happened next?");
+
+        let restored = crate::compaction::restore_compaction_checkpoint(
+            crate::runtime_handoff::project_messages_for_restore(&messages),
+            Some(&summary),
+        );
+        let restored_wire = build_chat_messages(None, &restored, "gpt-4o");
+        let restored_roles: Vec<&str> = restored_wire
+            .iter()
+            .map(|message| message["role"].as_str().unwrap())
+            .collect();
+        assert_eq!(restored_roles, later_roles);
+        assert!(
+            restored_wire[0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("restored Agent topology checkpoint")
+        );
+        assert_eq!(restored_wire[6]["content"], "What happened next?");
+    }
+
+    #[test]
+    fn quoted_compaction_marker_does_not_reorder_user_wire_messages() {
+        let messages: Vec<Message> = serde_json::from_value(serde_json::json!([
+            {"role":"user","content":[{"type":"text","text":"First question"}]},
+            {"role":"assistant","content":[{"type":"text","text":"First answer"}]},
+            {"role":"user","content":[{"type":"text","text":"Please explain: Another language model started to solve this problem"}]},
+            {"role":"assistant","content":[{"type":"text","text":"It introduces a summary."}]},
+            {"role":"user","content":[{"type":"text","text":"Follow-up question"}]}
+        ])).unwrap();
+        let wire = build_chat_messages(None, &messages, "gpt-4o");
+        let roles: Vec<&str> = wire
+            .iter()
+            .map(|message| message["role"].as_str().unwrap())
+            .collect();
+        assert_eq!(roles, ["user", "assistant", "user", "assistant", "user"]);
+        assert_eq!(wire[0]["content"], "First question");
+        assert_eq!(
+            wire[2]["content"],
+            "Please explain: Another language model started to solve this problem"
+        );
+        assert_eq!(wire[4]["content"], "Follow-up question");
+
+        let quoted_exact_header = crate::compaction::build_compaction_summary_block_text(
+            "This text was pasted by a user",
+            "",
+        );
+        let mut with_exact_quote = messages.clone();
+        with_exact_quote[2] = Message {
+            role: Role::User,
+            content: vec![ContentBlock::Text {
+                text: quoted_exact_header.clone(),
+                cache_control: None,
+            }],
+        };
+        let exact_wire = build_chat_messages(None, &with_exact_quote, "gpt-4o");
+        let exact_roles: Vec<&str> = exact_wire
+            .iter()
+            .map(|message| message["role"].as_str().unwrap())
+            .collect();
+        assert_eq!(exact_roles, roles);
+        assert_eq!(exact_wire[2]["content"], quoted_exact_header);
+
+        let mut after_tool: Vec<Message> = serde_json::from_value(serde_json::json!([
+            {"role":"user","content":[{"type":"text","text":"Read first"}]},
+            {"role":"assistant","content":[{"type":"tool_use","id":"call_1","name":"read","input":{"path":"a.txt"}}]},
+            {"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":"contents"}]},
+            {"role":"user","content":[{"type":"text","text":"placeholder"}]},
+            {"role":"assistant","content":[{"type":"text","text":"Answer"}]}
+        ])).unwrap();
+        after_tool[3] = Message {
+            role: Role::User,
+            content: vec![ContentBlock::Text {
+                text: quoted_exact_header.clone(),
+                cache_control: None,
+            }],
+        };
+        let after_tool_wire = build_chat_messages(None, &after_tool, "gpt-4o");
+        let after_tool_roles: Vec<&str> = after_tool_wire
+            .iter()
+            .map(|message| message["role"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            after_tool_roles,
+            ["user", "assistant", "tool", "user", "assistant"]
+        );
+        assert_eq!(after_tool_wire[3]["content"], quoted_exact_header);
+    }
+
+    #[test]
+    fn topology_checkpoint_after_tool_result_keeps_wire_tool_pair() {
+        let mut messages: Vec<Message> = serde_json::from_value(serde_json::json!([
+            {"role":"user","content":[{"type":"text","text":"Read the file"}]},
+            {"role":"assistant","content":[{"type":"tool_use","id":"call_1","name":"read","input":{"path":"a.txt"}}]},
+            {"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":"contents"}]}
+        ])).unwrap();
+        crate::runtime_handoff::replace_agent_topology_checkpoint(&mut messages, &[]);
+        let wire = build_chat_messages(None, &messages, "gpt-4o");
+        let roles: Vec<&str> = wire
+            .iter()
+            .map(|message| message["role"].as_str().unwrap())
+            .collect();
+        assert_eq!(roles, ["user", "assistant", "tool"]);
+        assert!(
+            wire[0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("agent_topology_v1")
+        );
+        assert_eq!(wire[1]["tool_calls"][0]["id"], "call_1");
+        assert_eq!(wire[2]["tool_call_id"], "call_1");
+    }
+
+    #[test]
+    fn compaction_without_retained_user_has_one_wire_user_before_tools() {
+        let mut messages: Vec<Message> = serde_json::from_value(serde_json::json!([
+            {"role":"assistant","content":[{"type":"tool_use","id":"call_1","name":"read","input":{"path":"a.txt"}}]},
+            {"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":"contents"}]}
+        ])).unwrap();
+        let summary = codewhale_models::SystemPrompt::Text(
+            crate::compaction::build_compaction_summary_block_text("Summary", ""),
+        );
+        messages.push(crate::compaction::compaction_checkpoint_message(&summary));
+        crate::runtime_handoff::replace_agent_topology_checkpoint(&mut messages, &[]);
+        let wire = build_chat_messages(None, &messages, "gpt-4o");
+        let roles: Vec<&str> = wire
+            .iter()
+            .map(|message| message["role"].as_str().unwrap())
+            .collect();
+        assert_eq!(roles, ["user", "assistant", "tool"]);
+        let prompt = wire[0]["content"].as_str().unwrap();
+        assert!(prompt.contains("Summary"));
+        assert!(prompt.contains("agent_topology_v1"));
+        assert_eq!(wire[2]["tool_call_id"], "call_1");
+    }
+
+    #[test]
+    fn compaction_after_unanswered_user_prompt_has_one_wire_user() {
+        let mut messages: Vec<Message> = serde_json::from_value(serde_json::json!([
+            {"role":"user","content":[{"type":"text","text":"Please continue"}]}
+        ]))
+        .unwrap();
+        let summary = codewhale_models::SystemPrompt::Text(
+            crate::compaction::build_compaction_summary_block_text("Earlier work", ""),
+        );
+        messages.push(crate::compaction::compaction_checkpoint_message(&summary));
+        crate::runtime_handoff::replace_agent_topology_checkpoint(&mut messages, &[]);
+        let wire = build_chat_messages(None, &messages, "gpt-4o");
+        assert_eq!(wire.len(), 1);
+        assert_eq!(wire[0]["role"], "user");
+        let prompt = wire[0]["content"].as_str().unwrap();
+        assert!(prompt.contains("Please continue"));
+        assert!(prompt.contains("Earlier work"));
+        assert!(prompt.contains("agent_topology_v1"));
+    }
 
     fn fixture_tool_use(id: &str) -> ContentBlock {
         ContentBlock::ToolUse {

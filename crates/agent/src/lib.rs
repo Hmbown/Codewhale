@@ -1,7 +1,7 @@
 use std::error::Error;
 use std::fmt;
 
-use codewhale_config::{ProviderKind, opencode_go_chat_model_id};
+use codewhale_config::{ProviderKind, opencode_go_model_id};
 use serde::{Deserialize, Serialize};
 
 /// High-level model family used for shared identity affordances across clients.
@@ -898,6 +898,114 @@ impl Default for ModelRegistry {
                 supports_tools: true,
                 supports_reasoning: true,
             },
+            // ModelScope provider models
+            ModelInfo {
+                id: "Qwen/Qwen3.5-397B-A17B".to_string(),
+                provider: ProviderKind::Modelscope,
+                aliases: vec![
+                    "qwen3.5-397b-a17b".to_string(),
+                    "modelscope-qwen3.5-397b-a17b".to_string(),
+                ],
+                supports_tools: true,
+                supports_reasoning: true,
+            },
+            ModelInfo {
+                id: "Qwen/Qwen3.5-122B-A10B".to_string(),
+                provider: ProviderKind::Modelscope,
+                aliases: vec![
+                    "qwen3.5-122b-a10b".to_string(),
+                    "modelscope-qwen3.5-122b-a10b".to_string(),
+                ],
+                supports_tools: true,
+                supports_reasoning: true,
+            },
+            ModelInfo {
+                id: "Qwen/Qwen3.5-27B".to_string(),
+                provider: ProviderKind::Modelscope,
+                aliases: vec![
+                    "qwen3.5-27b".to_string(),
+                    "modelscope-qwen3.5-27b".to_string(),
+                ],
+                supports_tools: true,
+                supports_reasoning: true,
+            },
+            ModelInfo {
+                id: "Qwen/Qwen3.5-35B-A3B".to_string(),
+                provider: ProviderKind::Modelscope,
+                aliases: vec![
+                    "qwen3.5-35b-a3b".to_string(),
+                    "modelscope-qwen3.5-35b-a3b".to_string(),
+                ],
+                supports_tools: true,
+                supports_reasoning: true,
+            },
+            ModelInfo {
+                id: "Qwen/Qwen3.8-27B".to_string(),
+                provider: ProviderKind::Modelscope,
+                aliases: vec![
+                    "qwen3.8-27b".to_string(),
+                    "modelscope-qwen3.8-27b".to_string(),
+                ],
+                supports_tools: true,
+                supports_reasoning: true,
+            },
+            ModelInfo {
+                id: "Qwen/Qwen3.8-Flash-Next".to_string(),
+                provider: ProviderKind::Modelscope,
+                aliases: vec![
+                    "qwen3.8-flash-next".to_string(),
+                    "modelscope-qwen3.8-flash-next".to_string(),
+                ],
+                supports_tools: true,
+                supports_reasoning: true,
+            },
+            ModelInfo {
+                id: "deepseek-ai/DeepSeek-V4-Pro".to_string(),
+                provider: ProviderKind::Modelscope,
+                aliases: vec![
+                    "deepseek-v4-pro".to_string(),
+                    "modelscope-deepseek-v4-pro".to_string(),
+                ],
+                supports_tools: true,
+                supports_reasoning: true,
+            },
+            ModelInfo {
+                id: "deepseek-ai/DeepSeek-V4-Pro-0813".to_string(),
+                provider: ProviderKind::Modelscope,
+                aliases: vec![
+                    "deepseek-v4-pro-0813".to_string(),
+                    "modelscope-deepseek-v4-pro-0813".to_string(),
+                ],
+                supports_tools: true,
+                supports_reasoning: true,
+            },
+            ModelInfo {
+                id: "deepseek-ai/DeepSeek-V4.1-Flash".to_string(),
+                provider: ProviderKind::Modelscope,
+                aliases: vec![
+                    "deepseek-v4.1-flash".to_string(),
+                    "modelscope-deepseek-v4.1-flash".to_string(),
+                ],
+                supports_tools: true,
+                supports_reasoning: true,
+            },
+            ModelInfo {
+                id: "ZhipuAI/GLM-4.7-Flash".to_string(),
+                provider: ProviderKind::Modelscope,
+                aliases: vec![
+                    "glm-4.7-flash".to_string(),
+                    "modelscope-glm-4.7-flash".to_string(),
+                ],
+                supports_tools: true,
+                supports_reasoning: true,
+            },
+            ModelInfo {
+                id: "ZhipuAI/GLM-5.2".to_string(),
+                provider: ProviderKind::Modelscope,
+                aliases: vec!["glm-5.2".to_string(), "modelscope-glm-5.2".to_string()],
+                supports_tools: true,
+                supports_reasoning: true,
+            },
             // Together AI provider models
             ModelInfo {
                 id: "deepseek-ai/DeepSeek-V4-Pro".to_string(),
@@ -1361,9 +1469,8 @@ impl Default for ModelRegistry {
                 supports_reasoning: false,
             },
         ];
-        // The shared Chat roster owns Go compatibility; Messages and Responses
-        // models must not enter this provider's registry through a second list.
-        models.extend(codewhale_config::OPENCODE_GO_CHAT_MODELS.iter().map(|&id| {
+        // The provider-owned roster is shared with config, routing and the picker.
+        models.extend(codewhale_config::opencode_go_models().iter().map(|&id| {
             // Preserve the existing reviewed flags. Roster membership alone
             // proves neither capability; false withholds a positive assertion
             // for new models because ModelInfo cannot express unknown.
@@ -1473,13 +1580,10 @@ impl ModelRegistry {
                     fallback_chain,
                 });
             }
-            // OpenCode Go's catalog spans Chat Completions, Messages, and
-            // Responses, while this provider slice intentionally speaks Chat
-            // only. Resolve a hinted Go model through the shared Chat
-            // allowlist and never fall through to a same-named global alias on
-            // OpenRouter or MiniMax.
+            // Resolve within Go's roster without falling through to a same-named
+            // model on another provider.
             if provider_hint == Some(ProviderKind::OpencodeGo)
-                && let Some(canonical) = opencode_go_chat_model_id(name)
+                && let Some(canonical) = opencode_go_model_id(name)
                 && let Some(model) = self
                     .models
                     .iter()
@@ -2378,7 +2482,7 @@ mod tests {
     }
 
     #[test]
-    fn opencode_go_lists_only_current_chat_completions_models() {
+    fn opencode_go_lists_documented_models_without_inventing_capabilities() {
         let registry = ModelRegistry::default();
         let listed = registry.list();
         let models: Vec<&str> = listed
@@ -2407,6 +2511,19 @@ mod tests {
             ("hy4-preview", false),
             ("hy3", false),
             ("omen-alpha", false),
+            ("deepseek-v4.1-flash", false),
+            ("grok-4.6", false),
+            ("gpt-5.6-luna", false),
+            ("muse-spark-1.3-contributor", false),
+            ("muse-spark-1.2-contributor", false),
+            ("minimax-m3", false),
+            ("minimax-m2.7", false),
+            ("minimax-m2.5", false),
+            ("qwen3.8-max", false),
+            ("qwen3.8-flash", false),
+            ("qwen3.7-max", false),
+            ("qwen3.7-plus", false),
+            ("qwen3.6-plus", false),
         ];
         assert_eq!(
             models,
@@ -2440,24 +2557,11 @@ mod tests {
             }
         }
 
-        for non_chat in [
-            "minimax-m3",
-            "minimax-m2.7",
-            "minimax-m2.5",
-            "qwen3.7-max",
-            "qwen3.7-plus",
-            "qwen3.6-plus",
-            "qwen3.8-max",
-            "qwen3.8-flash",
-            "grok-4.6",
-            "gpt-5.6-luna",
-            "muse-spark-1.3-contributor",
-            "muse-spark-1.2-contributor",
-        ] {
+        for non_chat in ["claude-unproven", "unknown-model", "gpt-unlisted"] {
             for requested in [non_chat.to_string(), format!("opencode-go/{non_chat}")] {
                 let rejected = registry
                     .resolve(Some(&requested), Some(ProviderKind::OpencodeGo))
-                    .expect_err("Messages/Responses id must not fall back on the Chat-only route");
+                    .expect_err("unknown Go id must not fall back to another provider");
                 assert_eq!(
                     rejected,
                     ModelResolutionError::ModelNotAvailableForProvider {
