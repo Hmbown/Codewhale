@@ -516,7 +516,7 @@ textarea::placeholder {
   overflow-x: hidden;
   overflow-y: auto;
   overscroll-behavior: contain;
-  scrollbar-color: var(--ink-3) transparent;
+  scrollbar-color: var(--text-faint) transparent;
 }
 
 .thread-group + .thread-group {
@@ -888,7 +888,7 @@ textarea::placeholder {
   overflow-y: auto;
   overscroll-behavior: contain;
   scroll-behavior: smooth;
-  scrollbar-color: var(--ink-3) transparent;
+  scrollbar-color: var(--text-faint) transparent;
   background: var(--stage-surface);
 }
 
