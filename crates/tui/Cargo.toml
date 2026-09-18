@@ -166,4 +166,4 @@ windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Media_Audio
 # (BOOL, HRESULT, … live in windows-core itself); window_control.rs names
 # windows_core::BOOL for the EnumWindows callback, so it must be a direct
 # dependency. Version already resolved via `windows` — no extra build work.
-windows-core = { version = "0.62" }
+windows-core = { version = "0.100" }
