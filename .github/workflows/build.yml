@@ -1,8 +1,20 @@
 name: Build AsBudy
 
+# 触发条件（2026-09-18 改）
+#   以前是「push 到 main 就编」。但日常改动几乎全在 `crates/tui/src/runtime_web/`（前端资源）——
+#   门卫是从**源码目录现读**它们的（`server.js` 的 WEB_SRC），**不用进二进制**也能用，
+#   于是每次 push 都白跑 ~19 分钟。
+#   现在：只改这些「不需要编译的东西」时不触发；碰了别的（Rust 源码 / Cargo / 构建脚本）照旧自动编；
+#   想编随时手动点（workflow_dispatch）。
+#   ⚠️ 为什么用 paths-ignore 而不是「只留手动」：改了 Rust 却忘了点编译 → 线上会一直跑旧程序
+#      而没人发现（档案 §8.7 ④ 那类「二进制从哪来」的坑）。宁可多飞一次，也别默默少编一次。
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - 'crates/tui/src/runtime_web/**'   # 前端资源：门卫现读源码目录，不进二进制也能用
+      - '.github/**'                       # 改 CI 配置本身不必重编
+      - '**/*.md'                          # 文档
   workflow_dispatch:
 
 permissions:
