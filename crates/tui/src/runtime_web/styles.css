@@ -252,14 +252,12 @@ summary:focus-visible {
   display: none;
 }
 
-/* ── PC 侧栏可隐藏（官方只在窄屏给了开关，宽屏没有）── */
-.shell.rail-hidden {
-  --rail: 0px;
-}
-
-.shell.rail-hidden .rail {
-  display: none;
-}
+/* ── PC 侧栏可隐藏（官方只在窄屏给了开关，宽屏没有）──
+   ⚠️「收起」这套自加状态**只在宽屏生效** —— 三条规则都在文件下方 `@media (min-width: 801px)` 那一块里。
+   2026-09-18 修的 168：它们原来写在这里（媒体查询外），窄屏也照样 `display: none` →
+   「宽屏收过侧栏 → 窗口缩到窄屏 → 点官方 ☰」时官方 `openRail()` 照开（`rail-visible` 加上、
+   对话区被 inert、scrim 露出），**侧栏却根本不出现** —— 用户看到的是「点 ☰ 没反应」。
+   修法就是把它们关回宽屏；窄屏一切交给官方的模态抽屉，我们一行都不掺和。 */
 
 /* 预览栏收起后的展开按钮（右上角；窄屏不显示，用底部三格） */
 .preview-reveal {
@@ -309,9 +307,7 @@ summary:focus-visible {
   color: var(--text);
 }
 
-.shell.rail-hidden .rail-reveal {
-  display: block;
-}
+/* .shell.rail-hidden .rail-reveal 的显示规则同「收起」那套 —— 已收进下方 @media (min-width: 801px) */
 
 .rail-hide {
   display: none;
@@ -330,10 +326,22 @@ summary:focus-visible {
   color: var(--text);
 }
 
-/* 只在宽屏显示（窄屏有官方自带的抽屉开关） */
+/* 「PC 侧栏收起」整套只在宽屏显示 / 生效（窄屏有官方自带的抽屉开关，别掺和 —— 见 168） */
 @media (min-width: 801px) {
   .rail-hide {
     display: inline-block;
+  }
+
+  .shell.rail-hidden {
+    --rail: 0px;
+  }
+
+  .shell.rail-hidden .rail {
+    display: none;
+  }
+
+  .shell.rail-hidden .rail-reveal {
+    display: block;
   }
 }
 
