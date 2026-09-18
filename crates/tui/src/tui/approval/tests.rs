@@ -104,6 +104,24 @@ fn test_get_tool_category_unknown_tools_need_review() {
     assert_eq!(get_tool_category("unknown_tool"), ToolCategory::Unknown);
 }
 
+#[test]
+fn test_tool_search_is_safe_so_discovery_never_reaches_auto_review() {
+    // Discovery is read-only: no workspace file, no command, no socket.
+    // Routing it to Unknown made Auto-Review treat it as a destructive unknown
+    // and deny it, which removes the engine's only route to deferred tools
+    // (``Web`` included) and drops the model back to one-page-at-a-time
+    // scraping through ``bash``.
+    assert_eq!(get_tool_category("tool_search"), ToolCategory::Safe);
+    assert_eq!(
+        classify_risk(
+            "tool_search",
+            ToolCategory::Safe,
+            &json!({"query": "web search"})
+        ),
+        RiskLevel::Benign
+    );
+}
+
 // ========================================================================
 // Risk Routing Tests (#129)
 // ========================================================================

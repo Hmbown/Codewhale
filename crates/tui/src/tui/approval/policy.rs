@@ -114,6 +114,16 @@ pub fn get_tool_category(name: &str) -> ToolCategory {
             | "update_plan"
             | "search"
             | "file_search"
+            // `tool_search` only discovers and loads deferred tool schemas: it
+            // reads no workspace file, runs no command and opens no socket.
+            // While it sat in the Unknown bucket, every single tool discovery
+            // was sent to Auto-Review, whose guardian classified it as an
+            // "unrecognized tool category flagged as destructive" and denied
+            // it (2 of 4 samples in the field). Because `tool_search` is the
+            // engine's only route to deferred tools such as `Web`, a denial
+            // hid the search tool from the model entirely and pushed it into
+            // scraping pages one `bash` call at a time (43 calls in one turn).
+            | "tool_search"
             | "grep_files"
             | "git_status"
             | "git_diff"
