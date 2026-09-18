@@ -2018,6 +2018,7 @@
         var hot = d.percent >= 80;
         show('记性 ' + d.percent + '%',
           '这次对话占了模型「记忆」的 ' + d.percent + '%（' + fmtK(d.used) + ' / ' + fmtK(d.window) + '）'
+          + '\n按当前对话内容估算'      // 口径：引擎按「现在要发给模型的消息」估的，不是计费数字
           + (hot ? '\n接近上限 —— 建议新建对话' : ''), hot);
       } catch (e) { show('记性 —', '暂时读不到'); }
     }
@@ -2063,6 +2064,22 @@
     if (!ensure()) {
       var n = 0;
       var tm = setInterval(function () { if (ensure() || ++n > 60) clearInterval(tm); }, 400);
+    }
+    // 官方界面切会话 / 切项目时会**整块重建 composer** —— 插在它前面这条（含「记性」）
+    // 会被一起抹掉。而这段原来只在初始化时建一次 → 从此再也不回来（2026-09-18 老板报
+    // 「有时显示有时不显示」）。改成盯着 DOM：不见了就补回来。
+    // ⚠️ 只观察 childList（不看 characterData）：流式输出改的是文本节点，不触发；
+    //    真触发时也只做一次 getElementById，再节流 300ms 才重建。
+    if (window.MutationObserver && document.body) {
+      var pending = false;
+      new MutationObserver(function () {
+        if (pending || document.getElementById('asbudy-msgbar')) return;
+        pending = true;
+        setTimeout(function () {
+          pending = false;
+          try { if (ensure()) loadCtx(); } catch (e0) { /* 重建失败不影响对话 */ }
+        }, 300);
+      }).observe(document.body, { childList: true, subtree: true });
     }
   })();
 
