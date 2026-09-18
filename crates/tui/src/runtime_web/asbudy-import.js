@@ -43,6 +43,13 @@
       '.abx-row>span{flex:0 0 56px;color:var(--text-dim);font-size:.9em}',
       '.abx-row input,.abx-row select{flex:1;min-width:0;padding:9px 11px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--text);font:inherit;font-size:.95em}',
       '.abx-note{margin:8px 0 0;color:var(--text-dim);font-size:.88em;line-height:1.6}',
+      // 「让 AI 读项目说明文件吗」的确认层（2026-09-18 · 见下面 askTrust）
+      '.abx-trust-scrim{position:fixed;inset:0;z-index:200;display:flex;align-items:center;justify-content:center;background:rgba(2,7,17,.72)}',
+      '.abx-trust-box{width:430px;max-width:92vw;padding:22px 24px 18px;border:1px solid var(--line);border-radius:12px;background:var(--surface)}',
+      '.abx-trust-box h3{margin:0 0 10px;font-size:1.05em}',
+      '.abx-trust-box p{margin:0 0 18px;color:var(--text-dim);font-size:.92em;line-height:1.7}',
+      '.abx-trust-box code{padding:1px 5px;border-radius:4px;background:var(--bg);font-size:.95em}',
+      '.abx-trust-row{display:flex;justify-content:flex-end;gap:10px}',
       '.abx-note.bad{color:var(--warning)}',
       '.abx-note.good{color:var(--live)}',
       '.abx-tip{margin:0 0 12px;padding:8px 10px;border:1px solid var(--human);border-radius:8px;background:var(--human-wash);color:var(--human);font-size:.88em;line-height:1.5}',
@@ -105,6 +112,43 @@
   }
   function hideSlim() { slim.hidden = true; }
 
+  /* ── 「让 AI 读这个项目的说明文件吗？」（2026-09-18 老板定）──
+   * 复刻官方的「信任此工作区」。官方那个提示是**终端界面独有的**（web 端 grep trust = 0 命中），
+   * 它决定项目里的 AGENTS.md 要不要当指令加载（源码 project_context.rs:1219 的
+   * is_workspace_trusted 分支）—— 记录在引擎家 config.toml 的 [projects."<目录>"] trust_level。
+   * 门卫走 /_gate/trust → root helper asbudy-ws-trust（引擎家 600、cus-<key> 属主，gate 写不了）。
+   * 官方口径：不启用也能正常用，只是 AI 不读那份说明 —— 所以这只是个开关，不是门禁。 */
+  function askTrust(key, projName, done) {
+    var scrim = document.createElement('div');
+    scrim.className = 'abx-trust-scrim';
+    var box = document.createElement('div');
+    box.className = 'abx-trust-box';
+    var h = document.createElement('h3');
+    h.textContent = '让 AI 读「' + projName + '」里的说明文件吗？';
+    var p = document.createElement('p');
+    p.innerHTML = '项目里的 <code>AGENTS.md</code> 会作为 AI 的工作说明。' +
+      '如果里面有别人传给你的内容，先确认没问题再启用。之后可以随时改。';
+    var row = document.createElement('div');
+    row.className = 'abx-trust-row';
+    var bSkip = document.createElement('button');
+    bSkip.type = 'button'; bSkip.className = 'abx-btn abx-ghost'; bSkip.textContent = '以后再说';
+    var bOn = document.createElement('button');
+    bOn.type = 'button'; bOn.className = 'abx-btn abx-go'; bOn.textContent = '启用';
+    row.appendChild(bSkip); row.appendChild(bOn);
+    box.appendChild(h); box.appendChild(p); box.appendChild(row);
+    scrim.appendChild(box);
+    document.body.appendChild(scrim);
+
+    function finish() { if (scrim.parentNode) scrim.parentNode.removeChild(scrim); done(); }
+    bSkip.onclick = finish;
+    bOn.onclick = function () {
+      bOn.disabled = true; bOn.textContent = '正在启用…';
+      // 失败也放行 —— 不能让一个开关把客户卡在「建项目」这一步（接口那边已记日志）
+      api('/_gate/trust', { method: 'POST', body: { key: key, trusted: true } })
+        .then(finish, finish);
+    };
+  }
+
   /* ══════════ 新建项目 ══════════ */
   var newPanel = $('abx-new-panel');
   $('abx-new').onclick = function () {
@@ -124,6 +168,8 @@
         go.disabled = false;
         if (!r.ok) return fail(msgEl, r.body.error || '没建成');
         okMsg(msgEl, '建好了，正在带你过去…');
+        // 我们系统里用户自己建的项目**默认就是可信的**（老板 2026-09-18）——
+        // 目录是他自己在系统里建的，不是外面塞进来的，不需要再确认一遍。
         location.href = '/';            // 服务端已把它设为当前项目
       })
       .catch(function (e) { go.disabled = false; fail(msgEl, '没建成：' + e.message); });
@@ -143,7 +189,7 @@
       .then(function (r) {
         if (!r.ok) { quickBtn.disabled = false; quickBtn.textContent = old; return fail(qMsg, (r.body && r.body.error) || '没建成'); }
         okMsg(qMsg, '建好了，正在带你过去…');
-        location.href = '/';
+        location.href = '/';            // 自己建的项目默认可信（同上面那条）
       })
       .catch(function (e) { quickBtn.disabled = false; quickBtn.textContent = old; fail(qMsg, '没建成：' + e.message); });
   };
@@ -368,6 +414,7 @@
       })
       .then(function (r) {
         if (!r.ok) throw new Error(r.body.error || '建项目失败');
+        S.newKey = r.body.key;          // 后面要拿它问「说明书要不要启用」
         if (S.keep) return null;
         // 原件挪进回收站（不是真删 —— 客户随时能还原）
         return api('/_gate/file?name=' + encodeURIComponent(S.dest), { method: 'DELETE' });
@@ -376,7 +423,9 @@
         try { localStorage.removeItem(PENDING); } catch (e) {}
         okMsg(impMsg, '导入好了，正在带你过去…');
         showSlim(100, '导入好了，正在切到新项目…');
-        location.href = '/';        // 服务端已把新项目设为当前
+        // 导入的是**从外面传上来的文件夹** —— 里面的说明文件可能来自别处，
+        // 所以这里问一句再进去。（自己新建的项目不问，默认就是可信的）
+        askTrust(S.newKey, projName, function () { location.href = '/'; });
       })
       .catch(function (e) {
         S.busy = false;
