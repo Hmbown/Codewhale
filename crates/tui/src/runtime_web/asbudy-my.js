@@ -1195,7 +1195,8 @@
 
   function openSkills() {
     openLayer('它会做什么', function (body) {
-      body.innerHTML = '<div id="ab-skills"><div class="ab-tip">正在问它…</div></div>';
+      body.innerHTML = '<div id="ab-skills"><div class="ab-tip">正在问它…</div></div><div id="ab-apps"></div>';
+      abLoadApps(body);
       api('/v1/skills').then(function (r) {
         var el = body.querySelector('#ab-skills');
         if (!el) return;
@@ -1249,6 +1250,133 @@
    *   （路由表里就 GET/POST/DELETE 在集合上）—— 界面上得如实说，并给替代办法。
    * ⚠️ 我们的架构是**一项目一引擎一 HOME** → 这里的记忆只作用于当前项目，不会串到别的项目。
    */
+  /* ── 已装的外挂（2026-09-19 · 搬表：官方 `/v1/apps/*`，**只搬「看 + 启用/停用」**）──
+   * 官方 web **完全没有这块**（runtime_web/ grep 零命中）—— 我们补空白。
+   * 为什么**不给装新的**：装插件 = 把**外部代码**装进服务器、以客户身份执行。
+   *   官方源码自己写明：插件声明的文件/网络清单**不是沙箱边界**，stdio MCP 是
+   *   **以宿主用户权限起子进程**（`plugins/manifest.rs` 的 stdio_mcp_servers 注释原文）。
+   *   所以「装 / 信任 / 撤销 / 更新」由平台做 —— 门卫那边也堵着（`BLOCKED_APP_PATHS`）。
+   * ⚠️ 开关是**按账号各自一份**的（2026-09-19 实测：状态落在各自的
+   *   `$HOME/.codewhale/plugins/state.json`，两个引擎的 HOME 各是各的）→ **你开关不影响别人**。
+   * ⚠️ 启用前**必须先「看清它能碰什么」再确认** —— 官方就是这么设计的（引擎会拒
+   *   "requires capability review before enablement"），所以这里先弹确认框，不静默开。
+   */
+  function abInvText(inv) {
+    var parts = [], n = function (k) { return Number((inv || {})[k] || 0); };
+    if (n('skills')) parts.push(n('skills') + ' 项技能');
+    if (n('stdio_mcp_servers')) parts.push(n('stdio_mcp_servers') + ' 个外部工具（会在这台机器上起程序）');
+    if (n('remote_mcp_servers')) parts.push(n('remote_mcp_servers') + ' 个联网的外部工具');
+    if (n('commands')) parts.push(n('commands') + ' 条命令');
+    if (n('agents')) parts.push(n('agents') + ' 个智能体');
+    if (n('hooks')) parts.push(n('hooks') + ' 个自动动作');
+    if (n('native')) parts.push(n('native') + ' 个本机程序');
+    return parts.length ? parts.join(' · ') : '没有额外能力';
+  }
+  /** 这个外挂能不能在**这台机器**上用（它自己声明支持的平台） */
+  function abHostOk(pf) {
+    if (!pf || !pf.length) return true;          // 没声明 = 不限平台
+    return pf.indexOf('linux') >= 0;
+  }
+  function abAppCard(x, acc) {
+    var okHost = abHostOk(x.platforms);
+    var state = x.enabled ? '已启用' : (okHost ? '已停用' : '本机用不了');
+    var col = x.enabled ? 'var(--live)' : 'var(--text-dim)';
+    var h = '<div class="ab-card">' +
+      '<div class="ab-card-top"><span class="ab-n">' + esc(x.name) + '</span>' +
+      '<span class="ab-s" style="color:' + col + ';margin:0">' + state + '</span></div>';
+    if (x.desc) h += '<div class="ab-s">' + esc(String(x.desc).slice(0, 160)) + '</div>';
+    h += '<div class="ab-s">能碰什么：' + esc(abInvText(x.inv)) + '</div>';
+    if (!okHost) {
+      // 本机用不了的就不给「启用」—— 点了必然报错（实测：引擎回 409 "does not apply to this host"）
+      h += '<div class="ab-s">它只支持 ' + esc(x.platforms.join(' / ')) +
+           '，在这台机器上启动了也没用，所以不提供开启。</div>';
+    } else {
+      h += '<div style="margin-top:9px"><button class="ab-btn' + (x.enabled ? ' ghost' : '') +
+           '" data-app-act="' + (x.enabled ? 'disable' : 'enable') +
+           '" data-app-acc="' + esc(acc) + '" data-app-sel="' + esc(x.sel) +
+           '" data-app-name="' + esc(x.name) + '">' + (x.enabled ? '停用' : '启用') + '</button></div>';
+    }
+    return h + '</div>';
+  }
+  function abLoadApps(body) {
+    var el = body.querySelector('#ab-apps');
+    if (!el) return;
+    el.innerHTML = '<div class="ab-tip" style="margin-top:16px">正在读已装的外挂…</div>';
+    api('/_gate/apps').then(function (r) {
+      if (!body.querySelector('#ab-apps')) return;      // 面板已被关掉
+      if (!r.ok || !r.body || r.body.ok === false) { el.innerHTML = ''; return; }
+      var groups = ((r.body || {}).accounts || []).filter(function (g) {
+        return g && g.items && g.items.length;
+      });
+      if (!groups.length) { el.innerHTML = ''; return; }   // 一个外挂都没有就不摆这一块
+      var html = '<div class="ab-tip" style="margin-top:18px"><b>已装的外挂</b>（插件）—— ' +
+        '它们给 AI 加额外的本事。这里只能看和开关，<b>装新的由平台来做</b>。</div>';
+      groups.forEach(function (g) {
+        (g.items || []).forEach(function (x) { html += abAppCard(x, g.account); });
+      });
+      el.innerHTML = html;
+    });
+  }
+  /** 启用 / 停用一个外挂。**启用前先让客户看清它能碰什么**（官方语义：先审查再启用）。 */
+  function abAppAct(btn) {
+    var acc = btn.getAttribute('data-app-acc'), sel = btn.getAttribute('data-app-sel');
+    var nm = btn.getAttribute('data-app-name'), act = btn.getAttribute('data-app-act');
+    var card = btn.closest('.ab-card');
+    var invLine = card ? ((card.querySelectorAll('.ab-s')[1] || {}).textContent || '') : '';
+    var go = function () {
+      var old = btn.textContent; btn.disabled = true; btn.textContent = act === 'enable' ? '正在开启…' : '正在停用…';
+      api('/_gate/apps/act', {
+        method: 'POST',
+        body: JSON.stringify({ account: acc, id: sel, action: act }),
+      }).then(function (r) {
+        btn.disabled = false; btn.textContent = old;
+        if (r.ok && r.body && r.body.ok !== false) {
+          notify(nm + (act === 'enable' ? '：已开启' : '：已停用'));
+          var p = document.querySelector('#ab-apps');
+          if (p) abLoadApps(document);          // 传 document 就行 —— 它内部只查 #ab-apps
+          return;
+        }
+        var why = (r.body && (r.body.error || r.body.message)) || ('HTTP ' + r.code);
+        if (r.body && r.body.detail) {
+          try { var d = JSON.parse(r.body.detail); why = (d.error && d.error.message) || why; } catch (e) {}
+        }
+        notify('没成功：' + why);
+      });
+    };
+    if (act === 'enable') {
+      confirmAb('开启「' + nm + '」',
+        '<p>开启后，它会给 AI 加上这些本事：</p><p style="margin:10px 0"><b>' +
+        esc((invLine || '').replace(/^能碰什么：/, '')) + '</b></p>' +
+        '<p>这些是它自己声明的。它会在<b>你自己的项目</b>里跑，不影响别人。</p>', go);
+    } else { go(); }
+  }
+  // 事件委托绑在 document 上（**只绑一次** —— 面板会反复重建，绑在里面会累积）
+  document.addEventListener('click', function (e) {
+    var b = e.target && e.target.closest ? e.target.closest('[data-app-act]') : null;
+    if (b) { e.preventDefault(); abAppAct(b); }
+  });
+
+  /** 一个最简单的确认框（两个按钮）。刻意不再造一套弹层 —— 用浏览器原生 confirm 的面子最稳。 */
+  function confirmAb(title, html, onOk) {
+    var wrap = document.createElement('div');
+    wrap.setAttribute('role', 'dialog');
+    wrap.style.cssText = 'position:fixed;inset:0;z-index:9999;background:rgba(0,0,0,.55);' +
+      'display:flex;align-items:center;justify-content:center;padding:24px';
+    wrap.innerHTML = '<div style="background:var(--surface);border:1px solid var(--line);' +
+      'border-radius:12px;padding:18px 20px;max-width:560px;width:100%;color:var(--text)">' +
+      '<div style="font-size:16px;margin-bottom:10px">' + esc(title) + '</div>' +
+      '<div class="ab-s" style="line-height:1.7">' + html + '</div>' +
+      '<div style="display:flex;gap:10px;justify-content:flex-end;margin-top:16px">' +
+      '<button class="ab-btn ghost" data-cf="no">取消</button>' +
+      '<button class="ab-btn" data-cf="yes">确认开启</button></div></div>';
+    wrap.addEventListener('click', function (e) {
+      var k = e.target.getAttribute && e.target.getAttribute('data-cf');
+      if (k === 'yes') { document.body.removeChild(wrap); onOk(); }
+      else if (k === 'no' || e.target === wrap) { document.body.removeChild(wrap); }
+    });
+    document.body.appendChild(wrap);
+  }
+
   function abScopeName(s) { return s === 'workspace' ? '本项目' : '通用'; }
 
   /* 记忆开关：客户自己控制（老板 2026-09-16：「用户自己不能设置吗？」）
