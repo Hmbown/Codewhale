@@ -31,6 +31,18 @@ export const STREAM_EVENT_NAMES = [
   "tool_call.timeout",
 ];
 
+/// AsBudy：广播给 Msgbar 状态行的事件集（2026-09-18）——
+/// 只广播「开始 / 结束 / 需要等人的」这几类，**不含 item.delta**（太频繁，逐条广播会拖慢流式渲染）。
+const ACTIVITY_EVENTS = new Set([
+  "turn.started",
+  "turn.completed",
+  "item.started",
+  "item.completed",
+  "item.failed",
+  "tool_call.requested",
+  "tool_call.resolved",
+]);
+
 export function createThreadState(threadId = "") {
   return {
     threadId,
@@ -1377,9 +1389,15 @@ function startBrowserClient() {
         renderAll(true);
         // AsBudy：对话可能在项目目录里产出文件 —— 广播给侧栏「项目文件」树
         // （监听见 asbudy-files.js；官方 web 没有文件树，这是我们的扩展点）
-        if (envelope.event === "item.completed" || envelope.event === "turn.completed") {
+        // 2026-09-18 扩：以前只广播 item.completed / turn.completed（“事后”），
+        //   现在把「开始」也广播出去 —— 顶部那条状态行靠它显示「正在做什么」。
+        //   CLI 的进度感就来自底部那条实时状态行，web 一直没有（老板：「不像 cli 那样知道进度」）。
+        //   ⚠️ 不含 item.delta：它太频繁，逐条广播会拖慢流式渲染。
+        if (ACTIVITY_EVENTS.has(envelope.event)) {
           try {
-            window.dispatchEvent(new CustomEvent("asbudy:activity", { detail: { event: envelope.event } }));
+            window.dispatchEvent(new CustomEvent("asbudy:activity", {
+              detail: { event: envelope.event, payload: envelope.payload || {} },
+            }));
           } catch { /* 无 window 的环境（如测试）忽略 */ }
         }
         if (

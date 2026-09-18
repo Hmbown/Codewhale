@@ -65,6 +65,9 @@
     '#asbudy-msgbar{display:flex;flex-wrap:wrap;align-items:center;gap:8px;padding:0 0 6px 2px}',
     '#asbudy-msgbar button{font:inherit;font-size:13.5px;color:var(--text-dim);background:transparent;border:1px solid var(--line);border-radius:6px;padding:3px 10px;cursor:pointer}',
     '#asbudy-msgbar button:hover{color:var(--text)}',
+    // 「正在做什么」状态行（2026-09-18）：跟其他小字同档，但用等宽感区分一下
+    '#asbudy-live{font-size:13px;color:var(--text-dim);white-space:nowrap}',
+    '#asbudy-live[hidden]{display:none}',
   ].join('\n');
   document.head.appendChild(st);
 
@@ -1984,6 +1987,12 @@
       ctxEl.id = 'asbudy-ctx';
       ctxEl.setAttribute('aria-live', 'polite');
       el.appendChild(ctxEl);
+      // 「正在做什么」状态行：放在最左 —— 先看到「它现在在干什么」，再看到别的
+      var liveEl = document.createElement('span');
+      liveEl.id = 'asbudy-live';
+      liveEl.hidden = true;
+      liveEl.setAttribute('aria-live', 'polite');
+      el.insertBefore(liveEl, el.firstChild);
       wrap.parentNode.insertBefore(el, wrap);
       return el;
     }
@@ -1992,6 +2001,66 @@
     // 为什么要门卫算：官方 CLI 状态栏有 `ctx NN%`，但那是引擎**进程内部状态**，web 拿不到；
     // 门卫复刻了引擎同一套窗口规则（按模型名查表），所以换模型会自动跟着变，不用人工设。
     // 不猜：门卫拿不到窗口或没数据时返回 available:false，这里就不显示。
+    // ── 「正在做什么」实时状态（2026-09-18 · 老板：「不像 cli 版那样让人清楚知道进度」）──
+    // CLI 的进度感来自底部那条**实时状态行**（在跑什么 / 跑了多久 / 按 Esc 能打断）；
+    // web 以前只有一串「事后回执」，看不到此刻在干什么。
+    // 数据引擎早就推过来了（item.started / tool_call.requested）——只是没人拿它做状态显示；
+    // app.mjs 现在把这几个事件广播出来（见那边的 ACTIVITY_EVENTS），这里接上。
+    // ⚠️ 拿不到工具名就退成「正在处理」，不猜、不编。
+    var LIVE = { active: false, since: 0, what: '' };
+    function liveWordFor(name) {
+      var n = String(name || '').toLowerCase();
+      if (!n) return '正在处理';
+      if (n === 'bash' || n === 'shell' || n.indexOf('exec') === 0) return '正在执行命令';
+      if (n === 'write' || n === 'edit' || n === 'create' || n === 'apply_patch') return '正在写文件';
+      if (n === 'read' || n === 'ls' || n === 'glob' || n === 'grep') return '正在查看文件';
+      if (n.indexOf('search') >= 0 || n === 'fetch' || n === 'web') return '正在查资料';
+      if (n === 'workflow' || n === 'subagent' || n === 'agent') return '正在派活';
+      return '正在' + name;
+    }
+    function liveTick() {
+      var el = document.getElementById('asbudy-live');
+      if (!el) return;
+      if (!LIVE.active) { el.hidden = true; el.textContent = ''; return; }
+      var secs = Math.max(0, Math.round((Date.now() - LIVE.since) / 1000));
+      el.hidden = false;
+      el.textContent = LIVE.what + ' · ' + secs + 's';
+    }
+    function liveSet(what) {
+      LIVE.active = true;
+      LIVE.what = what;
+      if (!LIVE.since) LIVE.since = Date.now();
+      liveTick();
+    }
+    function liveStop() {
+      LIVE.active = false;
+      LIVE.since = 0;
+      liveTick();
+    }
+    setInterval(liveTick, 1000);
+    window.addEventListener('asbudy:activity', function (e) {
+      var d = (e && e.detail) || {};
+      var ev = d.event;
+      var p = d.payload || {};
+      if (ev === 'turn.started') { LIVE.since = Date.now(); liveSet('正在处理'); return; }
+      if (ev === 'turn.completed') { liveStop(); return; }
+      if (ev === 'item.started') {
+        var toolName = (p.tool && p.tool.name) || '';
+        var kind = (p.item && p.item.kind) || '';
+        if (toolName) liveSet(liveWordFor(toolName));
+        else if (kind === 'agent_reasoning') liveSet('正在思考');
+        else if (kind === 'agent_message') liveSet('正在写回复');
+        else liveSet('正在处理');
+        return;
+      }
+      if (ev === 'tool_call.requested') {
+        // 待确认的动态工具调用（等客户点）——把状态说清楚，别看着像卡住
+        liveSet('等你确认');
+        return;
+      }
+      if (ev === 'tool_call.resolved') { if (LIVE.active) liveSet('正在处理'); }
+    });
+
     function fmtK(n) {
       n = Number(n) || 0;
       if (n >= 10000) {
