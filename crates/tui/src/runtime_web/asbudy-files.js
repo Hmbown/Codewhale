@@ -60,6 +60,16 @@
     '.f-node.dir{color:var(--text-soft)}',
     '.f-kids{margin-left:12px;border-left:1px solid var(--line);padding-left:6px}',
     '.f-empty{font-size:13.5px;color:var(--text-faint);padding:0 4px}',
+    // 目录树里的「找文件」搜索框（2026-09-19 老板「文件搜索选a」）：按**名字**找，不搜内容。
+    //   底色用 --well-deep（比卡片自己的 --well 深一档，否则同色分不出来）；交互照官方 .search-field。
+    '.asb-search{padding:0 10px 8px}',
+    '.asb-search input{width:100%;box-sizing:border-box;height:30px;font:inherit;font-size:13px;color:var(--text);background:var(--well-deep);border:1px solid transparent;border-radius:var(--radius-control);padding:0 9px;outline:0}',
+    '.asb-search input::placeholder{color:var(--text-dim)}',
+    '.asb-search input:focus{border-color:rgba(106,174,242,.46);box-shadow:0 0 0 2px rgba(106,174,242,.1)}',
+    '.asb-card.folded .asb-search{display:none}',
+    // 搜索结果：一条行 = 文件名 + 它所在的上级目录（同名文件靠这个分清）
+    '.f-node .f-dir{flex:none;color:var(--text-faint);font-size:12.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:45%}',
+    '.f-hint{font-size:12.5px;color:var(--text-faint);padding:2px 4px 6px}',
     '#asbudy-undo{margin:0;border:1px solid transparent;border-radius:var(--radius-control);padding:8px 10px;background:var(--well);font-size:13.5px}',
     '#asbudy-undo-body{max-height:22vh;overflow-y:auto}',
     '#asbudy-arts{margin:8px 12px 0;border:1px solid var(--line);border-radius:8px;padding:8px;background:var(--surface);font-size:13.5px}',
@@ -222,6 +232,66 @@
   // 卡片一：项目里的文件（只读目录树）
   var projSig = null;   // 目录树内容签名：没变化就不重绘（不闪、不丢展开状态）
   var projDirty = false; // 自上次刷新预览以来，项目文件变过没有 —— **累积**标志，不只“这一次”
+  var projFiles = null;  // 最后一次拿到的目录树（「找文件」用它，不再请求）
+  var searchEl = document.getElementById('asbudy-files-search');
+
+  // ── 找文件（2026-09-19 老板「文件搜索选a」）─────────────────────────────
+  //   按**名字**找，不搜文件内容。数据源就是目录树本身（/_gate/projfiles 本来就返回全部文件）
+  //   ⇒ 纯前端过滤：不新增接口、不依赖引擎（引擎没起来也能找）、输入即时出结果。
+  function flatFiles(nodes, out) {
+    out = out || [];
+    for (var i = 0; i < (nodes || []).length; i++) {
+      var n = nodes[i];
+      if (n.isDir) flatFiles(n.children, out); else out.push(n);
+    }
+    return out;
+  }
+  /** 打分：整名命中 > 名字开头 > 名字包含 > 路径命中；都不中 = -1。
+   *  一律小写比较 —— 客户不会记得是 `Data` 还是 `data`。 */
+  function matchScore(f, q) {
+    var name = String(f.name || '').toLowerCase(), path = String(f.path || '').toLowerCase();
+    if (name === q) return 4;
+    if (name.indexOf(q) === 0) return 3;
+    if (name.indexOf(q) >= 0) return 2;
+    if (path.indexOf(q) >= 0) return 1;
+    return -1;
+  }
+  function paintTree() {
+    body.innerHTML = '';
+    if (!projFiles || !projFiles.length) { body.innerHTML = '<span class="f-empty">（空目录）</span>'; return; }
+    for (var i = 0; i < projFiles.length; i++) body.appendChild(render(projFiles[i], false, true));
+  }
+  var SEARCH_MAX = 50;   // 结果上限：再多客户也看不完，先说清「只显示前 N 个」
+  function paintSearch(q) {
+    var all = flatFiles(projFiles || []), hits = [];
+    for (var i = 0; i < all.length; i++) {
+      var s = matchScore(all[i], q);
+      if (s > 0) hits.push({ f: all[i], s: s });
+    }
+    hits.sort(function (a, b) { return b.s - a.s || a.f.path.localeCompare(b.f.path, 'zh'); });
+    body.innerHTML = '';
+    if (!hits.length) { body.innerHTML = '<span class="f-empty">没找到名字里带这个的文件</span>'; return; }
+    var head = document.createElement('div'); head.className = 'f-hint';
+    head.textContent = '找到 ' + hits.length + ' 个' + (hits.length > SEARCH_MAX ? '（只显示前 ' + SEARCH_MAX + ' 个）' : '');
+    body.appendChild(head);
+    for (var j = 0; j < Math.min(hits.length, SEARCH_MAX); j++) body.appendChild(renderHit(hits[j].f));
+  }
+  function renderHit(f) {
+    var n = document.createElement('div'); n.className = 'f-node'; n.title = f.path;
+    var cut = String(f.path || '').lastIndexOf('/');
+    var up = cut > 0 ? f.path.slice(0, cut) : '';
+    n.innerHTML = '<span class="f-ic">' + aIcon(f.name) + '</span>' +
+      '<span class="f-nm">' + aEsc(f.name) + '</span>' +
+      (up ? '<span class="f-dir">' + aEsc(up) + '</span>' : '') +
+      (f.size ? '<span class="f-sz">' + aSize(f.size) + '</span>' : '');
+    n.onclick = function () { onPick(f, false); };   // 与树里点文件同一条链（带进对话 + 弹预览）
+    return n;
+  }
+  function applySearch() {
+    var q = searchEl ? String(searchEl.value || '').trim().toLowerCase() : '';
+    if (q) paintSearch(q); else paintTree();
+  }
+  if (searchEl) searchEl.oninput = applySearch;
 
   async function loadProj(force) {
     if (!body) return;
@@ -237,9 +307,8 @@
       if (projSig !== null && sig !== projSig) projDirty = true;
       if (!force && sig === projSig) return;   // 内容没变 → 什么都不做（点「刷新」走 force）
       projSig = sig;
-      body.innerHTML = '';
-      if (!d.files || !d.files.length) { body.innerHTML = '<span class="f-empty">（空目录）</span>'; return; }
-      for (var i = 0; i < d.files.length; i++) body.appendChild(render(d.files[i], false, true));
+      projFiles = d.files || [];
+      applySearch();   // 正在找文件 → 结果跟着新数据重算；没在找 → 画树
     } catch (e) { if (projSig === null) body.innerHTML = '<span class="f-empty">加载失败</span>'; }
   }
 

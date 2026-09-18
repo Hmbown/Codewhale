@@ -41,6 +41,9 @@
         <div id="asbudy-files" data-pkey="" data-kind="proxy" hidden>
           <div class="asb-card" id="asb-card-proj">
             <div class="asb-hd"><span class="asb-fold" id="asb-fold-proj" title="折叠 / 展开">▾</span><span class="asb-title">项目文件</span><span class="asb-tools"><span id="asbudy-files-refresh">刷新</span></span></div>
+            <!-- 找文件（2026-09-19 老板「文件搜索选a」）：按**名字**找，不搜内容。
+                 数据源就是下面这棵树（/_gate/projfiles 本来就返回全部文件）—— 纯前端过滤，不新增接口。 -->
+            <div class="asb-search"><input id="asbudy-files-search" type="search" autocomplete="off" placeholder="找文件"></div>
             <div class="asb-bd" id="asbudy-files-body"><span class="f-empty">加载中…</span></div>
           </div>
           <div class="asb-card" id="asb-card-mine">
