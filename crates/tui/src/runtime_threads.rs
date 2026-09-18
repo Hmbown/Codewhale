@@ -3387,6 +3387,24 @@ pub enum UsageGroupBy {
     Thread,
 }
 
+/// 一次「当前上下文占用」的只读快照 —— 见 [`RuntimeThreadManager::context_usage_for_thread`]。
+///
+/// `used` 是**估算的当前上下文 tokens**，不是该轮累计消耗：多轮工具调用的轮次里
+/// 后者会远超窗口（官方 issue #115），拿它当占用算百分比就是「记性 100% ↔ 46%」乱跳。
+#[derive(Debug, Clone, Serialize)]
+pub struct ThreadContextUsage {
+    pub thread_id: String,
+    pub model: String,
+    /// 估算的当前上下文 tokens（已按窗口封顶）
+    pub used: u64,
+    /// 该路由的上下文窗口（0 = 不知道，客户端不显示百分比）
+    pub window: u32,
+    /// 0~100
+    pub percent: f64,
+    /// 参与估算的消息条数（排查用）
+    pub message_count: usize,
+}
+
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct UsageTotals {
     pub input_tokens: u64,
@@ -7188,6 +7206,60 @@ impl RuntimeThreadManager {
         self.store
             .load_thread(id)
             .with_context(|| format!("Thread not found: {id}"))
+    }
+
+    /// 「当前上下文占用」——口径与 TUI 状态栏的 `ctx NN%` 完全一致。
+    ///
+    /// 为什么必须由引擎回答（2026-09-18，老板报「记性乱跳」）：
+    /// `turns[].usage.input_tokens` 是**该轮所有模型请求的累加**，不是「现在上下文
+    /// 占了多少」。一个跑了 30 次模型请求的轮次会报出 1,334,296（远超 100 万窗口），
+    /// 下一轮只有 8 次请求就掉回 459,152 —— 谁拿它算百分比，用户看到的就是
+    /// 100% ↔ 46% 乱跳。官方在 `tui/ui/frame.rs` 的 `context_usage_snapshot` 注释里
+    /// 点名过同一个坑（上游 issue #115），修法是**按当前要发给模型的消息估算**，
+    /// 只在估算拿不到时才退回 reported 值。
+    ///
+    /// 所以这里复用官方那套：同一份「spawn 时喂给引擎的消息」（`restore_thread_messages`
+    /// 就是 `spawn_runtime_thread` 用的那一步）＋ 同一个
+    /// `estimate_input_tokens_conservative`，因此 web 端与 TUI 状态栏得到同一个数。
+    ///
+    /// 已知的一处口径差：默认系统提示（引擎在 `core/engine.rs` 里自己构造的那份）
+    /// 这里拿不到 —— 只有用户显式覆盖的 `thread.system_prompt` 才算得进来。
+    /// 在 100 万窗口上这个差通常在 1~2 个百分点，量级上不影响判读。
+    pub async fn context_usage_for_thread(&self, id: &str) -> Result<ThreadContextUsage> {
+        let thread = self.get_thread(id).await?;
+        let messages = self.restore_thread_messages(&thread)?;
+        let system_prompt = thread
+            .system_prompt
+            .as_ref()
+            .map(|prompt| SystemPrompt::Text(prompt.clone()));
+        let estimated =
+            crate::compaction::estimate_input_tokens_conservative(&messages, system_prompt.as_ref());
+
+        let config = self.read_config().clone();
+        let route = self.resolved_route_for_thread(&config, &thread)?;
+        let window = route_context_window_tokens(
+            route.identity.provider,
+            &route.model,
+            known_route_limits(route.candidate.limits()),
+        );
+
+        let window_u64 = u64::from(window);
+        let used = u64::try_from(estimated)
+            .unwrap_or(u64::MAX)
+            .min(window_u64);
+        let percent = if window_u64 == 0 {
+            0.0
+        } else {
+            used as f64 / window_u64 as f64 * 100.0
+        };
+        Ok(ThreadContextUsage {
+            thread_id: thread.id.clone(),
+            model: route.model.clone(),
+            used,
+            window,
+            percent,
+            message_count: messages.len(),
+        })
     }
 
     pub async fn update_thread(&self, id: &str, req: UpdateThreadRequest) -> Result<ThreadRecord> {

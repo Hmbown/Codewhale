@@ -68,8 +68,9 @@ use crate::mcp::McpPool;
 use crate::runtime_threads::{
     CompactThreadRequest, CreateThreadRequest, ExternalApprovalDecision,
     MAX_RUNTIME_EVENT_REPLAY_TAIL, RuntimeThreadManager, RuntimeThreadManagerConfig,
-    SharedRuntimeThreadManager, StartTurnRequest, SteerTurnRequest, ThreadDetail, ThreadListFilter,
-    ThreadRecord, TurnItemKind, TurnRecord, UpdateThreadRequest, UsageGroupBy, UsageTotals,
+    SharedRuntimeThreadManager, StartTurnRequest, SteerTurnRequest, ThreadContextUsage,
+    ThreadDetail, ThreadListFilter, ThreadRecord, TurnItemKind, TurnRecord, UpdateThreadRequest,
+    UsageGroupBy, UsageTotals,
 };
 #[cfg(test)]
 pub(super) use crate::runtime_threads::{RuntimeTurnStatus, TurnItemLifecycleStatus};
@@ -1174,6 +1175,7 @@ pub fn build_router(state: RuntimeApiState) -> Router {
         )
         .route("/v1/threads/{id}/compact", post(compact_thread))
         .route("/v1/threads/{id}/usage", get(get_thread_usage))
+        .route("/v1/threads/{id}/context", get(get_thread_context))
         .route("/v1/threads/{id}/events", get(stream_thread_events))
         .route("/v1/agent-mail", post(send_agent_mail))
         .route("/v1/threads/{id}/agent-mail", get(list_agent_mail))
@@ -4383,6 +4385,25 @@ async fn get_thread_usage(
         thread_id: id,
         totals,
     }))
+}
+
+/// `GET /v1/threads/{id}/context` —— 「当前上下文占用」（同 TUI 状态栏的 `ctx`）。
+///
+/// 为什么客户端不该自己算：官方 TUI 用的是引擎内部的「当前要发的消息」估算
+/// （`estimated_context_tokens`），而 turn 记录里的 `usage.input_tokens` 是**该轮
+/// 请求的累加**——多轮工具调用的轮次会报出远超窗口的值（上游 issue #115）。
+/// 客户端拿后者算百分比，就是「100% ↔ 46%」乱跳。估算口径见
+/// [`RuntimeThreadManager::context_usage_for_thread`]。
+async fn get_thread_context(
+    State(state): State<RuntimeApiState>,
+    Path(id): Path<String>,
+) -> Result<Json<ThreadContextUsage>, ApiError> {
+    let usage = state
+        .runtime_threads
+        .context_usage_for_thread(&id)
+        .await
+        .map_err(map_thread_err)?;
+    Ok(Json(usage))
 }
 
 async fn update_thread(
