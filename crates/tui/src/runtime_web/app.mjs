@@ -413,6 +413,100 @@ export function streamCursor(state, { gap = false, connected = true } = {}) {
 // Keep machine diagnostics available without making them the conversation's
 // loudest content. Known transport failures get one calm product sentence;
 // the byte-for-byte receipt remains behind the disclosure.
+/* AsBudy：回执说人话（2026-09-18 老板：「全程没有任何中文、没有进度反馈」）
+ *
+ * 官方原样：`label = humanize(kind) · humanize(status)`（“Tool Call · Completed”）、
+ *   `summary` 直接是引擎给的原文（20 行 `drwxr-xr-x` 糊在摘要位置上）。
+ *   **上游 app.mjs 就长这样，不是我们改坏的** —— 但客户看不懂，而且它把
+ *   「显示文件与命令明细」那个开关架空了（那个开关只能藏折叠块，主体还是原始输出）。
+ *
+ * 这里做两件事：
+ *   ① 标签用中文（执行命令 · 完成 / 文件改动 · 未完成）
+ *   ② 摘要说「做了什么」—— 引擎 metadata 里带着 tool_name 与 tool_input
+ *      （完整命令 / 文件路径），以前完全没用上。
+ * 原文不丢：仍然进 `raw`，挂在折叠的「查看回执」里。
+ */
+const RECEIPT_KIND_ZH = {
+  tool_call: "工具",
+  tool_result: "工具",
+  file_change: "文件改动",
+  status: "进度",
+  agent_message: "回复",
+  agent_reasoning: "思考",
+};
+const RECEIPT_STATUS_ZH = {
+  completed: "完成",
+  failed: "未完成",
+  in_progress: "进行中",
+  pending: "等待中",
+  canceled: "已取消",
+  cancelled: "已取消",
+  interrupted: "已打断",
+};
+
+function receiptLabelZh(kind, status) {
+  const head = RECEIPT_KIND_ZH[kind] || humanize(kind);
+  const tail = RECEIPT_STATUS_ZH[status] || humanize(status);
+  return tail ? `${head} · ${tail}` : head;
+}
+
+/** 路径只留最后两段 —— 别把 /opt/asbudy/customers/yanyijin/2dry8u/public/index.html 整条糊到界面上 */
+function shortPathZh(value) {
+  const parts = String(value || "").split("/").filter(Boolean);
+  return parts.length <= 2 ? String(value || "") : parts.slice(-2).join("/");
+}
+
+/** 压成一行、超长截断（摘要位置放不下一整条命令） */
+function oneLineZh(value, max) {
+  const text = String(value || "").replace(/\s+/g, " ").trim();
+  return text.length > max ? text.slice(0, max - 1) + "…" : text;
+}
+
+/** 从工具入参里拼一句「做了什么」；拼不出来返回 null（调用方回退到原文） */
+function toolIntentZh(toolName, rawInput) {
+  let input = null;
+  try {
+    const parsed = JSON.parse(String(rawInput || ""));
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) input = parsed;
+  } catch (_error) { /* 不是 JSON 就没有可读入参 */ }
+  if (!input) return null;
+  const command = input.command || input.cmd;
+  if (command) return "执行命令：" + oneLineZh(command, 96);
+  const path = input.path || input.file_path || input.target || input.filename;
+  if (!path) return null;
+  const verb = { write: "写入 ", edit: "修改 ", read: "读取 ", create: "新建 ", delete: "删除 " }[toolName] || "处理 ";
+  return verb + shortPathZh(path);
+}
+
+/* 引擎硬编码的英文状态句 → 中文（2026-09-18 老板：「全程没有任何中文」）
+ *
+ * ⚠️ 这些句子写在**引擎的 Rust 源码**里（`core/engine/turn_loop.rs` 等，全仓库十来句），
+ *    **不是配置项** —— 官方 TUI 显示一模一样的英文。这里只在**显示层**译一道。
+ * 失败模式是安全的：引擎哪天改了句子 / 换了新句，这里匹配不上就**退回英文原文**，不会崩。
+ * 重核方法：`grep -rn 'Event::status("' crates/tui/src/`。
+ */
+const ENGINE_STATUS_ZH = [
+  [/^Auto-Review checking '(.+?)'$/, (m) => `正在检查这一步（${m[1]}）`],
+  [/^Continuing — tool results$/, () => "拿到结果，继续"],
+  [/^Continuing — queued steer input$/, () => "继续（处理你插的话）"],
+  [/^Session context synced$/, () => "会话已同步"],
+  [/^Reconnecting…$/, () => "正在重新连接"],
+  [/^Request cancelled$/, () => "请求已取消"],
+  [/^Request was Paused$/, () => "请求已暂停"],
+  [/^Compaction settings updated$/, () => "整理设置已更新"],
+  [/^Goal set; starting goal work\.$/, () => "目标已设定，开始执行"],
+];
+
+function engineStatusZh(text) {
+  const raw = String(text || "").trim();
+  if (!raw) return null;
+  for (const [pattern, to] of ENGINE_STATUS_ZH) {
+    const matched = raw.match(pattern);
+    if (matched) return typeof to === "function" ? to(matched) : to;
+  }
+  return null;
+}
+
 export function receiptPresentation(item = {}) {
   const detail = String(item.detail || item.summary || "");
   const raw = String(item.summary || detail || humanize(item.kind));
@@ -430,9 +524,14 @@ export function receiptPresentation(item = {}) {
     };
   }
   const failed = item.status === "failed" || /^(?:error|failed|failure)\b/i.test(raw);
+  // AsBudy：先给「做了什么」；失败时把「未完成」缀在后面（具体原因仍在 raw / 折叠里）
+  const meta = item.metadata && typeof item.metadata === "object" ? item.metadata : {};
+  const intent = toolIntentZh(String(meta.tool_name || meta.tool || ""), meta.tool_input);
+  // 进度卡是引擎自己发的状态句（英文硬编码）→ 显示层译一道；译不出就用原文
+  const statusZh = item.kind === "status" ? engineStatusZh(raw) : null;
   return {
-    label: `${humanize(item.kind)} · ${humanize(item.status)}`,
-    summary: raw,
+    label: receiptLabelZh(item.kind, item.status),
+    summary: intent ? (failed ? `${intent} —— 未完成` : intent) : (statusZh || raw),
     raw: fullRaw,
     failed,
   };

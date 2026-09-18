@@ -91,8 +91,8 @@ describe("receiptPresentation", () => {
   it("keeps a failed MCP transport compact while preserving the raw receipt", () => {
     const raw = "Failed to connect MCP server 'github': Stdio transport closed MCP server stderr (last 1 line): Docker is not running";
     expect(receiptPresentation({ kind: "status", status: "completed", summary: raw })).toEqual({
-      label: "MCP · Unavailable",
-      summary: "github could not connect",
+      label: "MCP · 不可用",
+      summary: "github 连不上",
       raw,
       failed: true,
     });
@@ -100,11 +100,49 @@ describe("receiptPresentation", () => {
 
   it("does not rewrite ordinary receipts", () => {
     expect(receiptPresentation({ kind: "tool_result", status: "completed", summary: "3 tests passed" })).toEqual({
-      label: "Tool Result · Completed",
+      label: "工具 · 完成",
       summary: "3 tests passed",
       raw: "3 tests passed",
       failed: false,
     });
+  });
+
+  // AsBudy（2026-09-18 老板：「全程没有任何中文、没有进度反馈」）：
+  // 回执说人话 —— 标签中文 + 摘要讲「做了什么」；原文仍留在 raw 里可展开。
+  // 引擎 metadata 里本来就带着 tool_name / tool_input（以前完全没用上）。
+  it("AsBudy: 用命令/路径说清做了什么，原文仍可展开", () => {
+    const raw = "bash: total 36\ndrwxr-x---+ 8 cus-yanyijin ...";
+    const presented = receiptPresentation({
+      kind: "tool_call",
+      status: "completed",
+      summary: raw,
+      metadata: { tool_name: "bash", tool_input: JSON.stringify({ command: "cd /app && ls -la" }) },
+    });
+    expect(presented.label).toBe("工具 · 完成");
+    expect(presented.summary).toBe("执行命令：cd /app && ls -la");
+    expect(presented.raw).toContain("drwxr-xr-x");
+    expect(presented.failed).toBe(false);
+  });
+
+  it("AsBudy: 失败时先说做了什么，再缀「未完成」", () => {
+    const presented = receiptPresentation({
+      kind: "file_change",
+      status: "failed",
+      summary: "write failed: Failed to authorize tool execution: Auto-Review guardian denied...",
+      metadata: { tool_name: "write", tool_input: JSON.stringify({ path: "/opt/app/public/index.html" }) },
+    });
+    expect(presented.label).toBe("文件改动 · 未完成");
+    expect(presented.summary).toBe("写入 public/index.html —— 未完成");
+    expect(presented.failed).toBe(true);
+  });
+
+  it("AsBudy: 引擎的英文状态句译成中文，认不出的句子退回原文", () => {
+    expect(receiptPresentation({ kind: "status", status: "completed", summary: "Auto-Review checking 'bash'" }).summary)
+      .toBe("正在检查这一步（bash）");
+    expect(receiptPresentation({ kind: "status", status: "completed", summary: "Continuing — tool results" }).summary)
+      .toBe("拿到结果，继续");
+    expect(receiptPresentation({ kind: "status", status: "completed", summary: "Some brand new engine sentence" }).summary)
+      .toBe("Some brand new engine sentence");
   });
 });
 

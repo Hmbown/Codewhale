@@ -80,10 +80,19 @@
 
   var stD = document.createElement('style');
   stD.textContent = [
+    // 不显示思考过程 → 思考卡整个收起来
     'html[data-ab-think="off"] article.reasoning{display:none!important}',
     'html[data-ab-calm="on"] article.reasoning{display:none!important}',
+    // 「显示文件与命令明细」关掉 → 回执只留一行标签（具体命令/输出都收起来）
+    //   ⚠️ 2026-09-18 修：以前这里只藏了 `details`，而摘要位置上摆的是 20 行原始输出
+    //   →「明细关了，满屏还是 drwxr-xr-x」，看着就是开关坏了（老板的原话：“不起作用吗”）。
+    //   现在配套：摘要位置改成「执行命令：<命令>」（见 app.mjs 的 toolIntentZh），
+    //   关掉开关 = 只剩「工具 · 完成」一行，原文明细在折叠里也不展开。
+    'html[data-ab-tools="off"] .receipt .receipt-summary{display:none!important}',
     'html[data-ab-tools="off"] .receipt details{display:none!important}',
-    'html[data-ab-calm="on"] .receipt details{display:none!important}',
+    // 「安静模式（仅显示结论）」→ 只留 AI 说的话：思考 + 所有回执（工具/进度/文件改动）都收起来
+    //   ⚠️ 同样 2026-09-18 修：以前只藏了思考卡，工具回执照旧满屏 —— 名不副实。
+    'html[data-ab-calm="on"] .receipt{display:none!important}',
   ].join('\n');
   document.head.appendChild(stD);
 
