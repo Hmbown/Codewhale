@@ -857,10 +857,20 @@
     shell.classList.add('has-preview');
     // 手机：刚才是从**侧栏里**的「▶ 看我的项目」点进来的 —— 顺手把侧栏收起来，
     //   否则它就盖在刚打开的预览上面（点完还得再点一下空白处，很别扭）。2026-09-16 老板选②。
-    if (window.matchMedia('(max-width: 800px)').matches && shell.classList.contains('rail-visible')) {
-      shell.classList.remove('rail-visible');
-      var railBtn = document.getElementById('rail-open');
-      if (railBtn) railBtn.setAttribute('aria-expanded', 'false');
+    //
+    // ⚠️ 2026-09-18 修（老板报的「页面卡死」· 窄屏/手机 100% 复现）：
+    //   **必须走官方那条关侧栏的路** —— 点官方的「关闭」按钮（`#rail-close` 上绑的就是 closeRail），
+    //   不能自己 `remove('rail-visible')`。官方窄屏把侧栏当**模态**开：`app.mjs` 的 `openRail()`
+    //   会 `setInert(dom.session, true)` ＋ `session.aria-hidden="true"` ＋ 露出 scrim，
+    //   这一整套**只有官方的 `closeRail()` 会收**。自己改 class 的后果（实测）：
+    //   侧栏看着是收起来了，对话区的 inert 却留着 → 预览一收起，剩下那块对话区
+    //   点哪都没反应、输入框也进不去（老板说的「页面卡死」）。
+    if (shell.classList.contains('rail-visible')) {
+      var railClose = document.getElementById('rail-close');
+      if (railClose) railClose.click();
+      // 兜底：万一官方哪天把那个按钮改名/删了，至少别让侧栏盖在预览上
+      //（inert 那套只能靠官方收，所以这里只是退而求其次）
+      else shell.classList.remove('rail-visible');
     }
   }
 
