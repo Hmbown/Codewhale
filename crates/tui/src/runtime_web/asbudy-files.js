@@ -9,6 +9,11 @@
   //   为什么不自拼 /_pv/：客户的内容要住到另一个门牌号下，跟控制台不同源（2026-09-16）。
   var previewUrl = host.getAttribute('data-preview-url') || '';
   var projKind = host.getAttribute('data-kind') || 'proxy';   // proxy = 系统页面 | artifacts = 工作台（看文件内容）
+  // 「有系统」和「打得开」是两件事（2026-09-18 老板报：手机上侧栏的「▶ 看我的项目」没了）：
+  //   data-kind 判的是**打得开吗**（proxy = 后端跑着），项目还没跑起来时会退化成 artifacts；
+  //   而「看我的项目」入口该不该在，判的是**有没有系统**（门卫给的 data-sys）。
+  //   以前两者共用一个值 —— 项目一没跑起来，入口就跟着消失，客户在手机上就一个入口都摸不到。
+  var projSys = host.getAttribute('data-sys') === '1' || projKind === 'proxy';
   var body = document.getElementById('asbudy-files-body');        // 「项目文件」卡片内容区
   var mineBody = document.getElementById('asbudy-mine-body');     // 「我的资料」卡片内容区
   var refresh = document.getElementById('asbudy-files-refresh');
@@ -35,6 +40,8 @@
     '.asb-openproj{display:block;width:100%;padding:10px 12px;font:inherit;font-size:14px;font-weight:600;color:var(--action-contrast);background:var(--live);border:0;border-radius:7px;cursor:pointer;text-align:center}',
     '.asb-openproj:hover{background:var(--live)}',
     '.asb-openproj:active{transform:scale(.985)}',
+    // 点「看我的项目」却打不开时的说明（2026-09-18 老板选②：入口照常在，说清楚为什么）
+    '.asb-hint{margin-top:6px;font-size:12.5px;line-height:1.5;color:var(--text-soft)}',
     '.asb-tools{flex:none;color:var(--text-dim);display:flex;gap:10px;align-items:center}',
     '.asb-bd{padding:0 10px 10px;max-height:30vh;overflow-y:auto}',
     '.asb-card.folded .asb-bd{display:none}',
@@ -263,7 +270,7 @@
   // 为什么必须显眼：以前入口只在预览栏右上角（一个小灰按钮），老板连问了两次
   //「她从哪点击查看她做的系统」。
   function ensureProjectBox() {
-    if (projKind !== 'proxy') return;        // 只有「有系统的项目」才有这个入口（工作台不适用）
+    if (!projSys) return;                    // 只有「有系统的项目」才有这个入口（工作台不适用）
     var hostEl = document.getElementById('asbudy-files');
     if (!hostEl || document.getElementById('asbudy-openproj')) return;
     var box = document.createElement('div');
@@ -857,6 +864,28 @@
     }
   }
 
+  /** 点「▶ 看我的项目」（2026-09-18 老板选②）——
+   *  跑着的项目：照旧打开系统页面；
+   *  还没跑起来的项目：入口照常在（不然客户连入口都摸不到），点它就当场说清楚为什么打不开。 */
+  function openMySystem() {
+    if (projKind === 'proxy') { hideProjHint(); showSysPreview(); return; }
+    showProjHint('这个项目还没跑起来，暂时打不开页面。');
+  }
+  function showProjHint(text) {
+    var box = document.getElementById('asbudy-openproj');
+    if (!box) return;
+    var bd = box.querySelector('.asb-bd');
+    if (!bd) return;
+    var h = bd.querySelector('.asb-hint');
+    if (!h) { h = document.createElement('div'); h.className = 'asb-hint'; bd.appendChild(h); }
+    h.textContent = text;
+  }
+  function hideProjHint() {
+    var box = document.getElementById('asbudy-openproj');
+    var h = box && box.querySelector('.asb-hint');
+    if (h) h.remove();
+  }
+
   // 分栏拖手：拽它调预览宽度（存在 .shell 的 --preview-width 上）
   document.addEventListener('mousedown', function (e) {
     var t = e.target;
@@ -914,7 +943,7 @@
     if (t.id === 'preview-close') { hidePreview(); }
     else if (t.id === 'preview-sys') { showSysPreview(); }
     else if (t.id === 'pv-back') { showSysPreview(); }   // 文件预览区里那个「← 回到我的项目」
-    else if (t.id === 'asb-openproj') { showSysPreview(); }   // 左侧栏顶上那个大按钮
+    else if (t.id === 'asb-openproj') { openMySystem(); }   // 左侧栏顶上那个大按钮
     else if (t.id === 'preview-reveal') { showPreview(); }
     // 「单独打开」（2026-09-16 老板：客户没法像网站一样打开自己的项目）——
     // 门卫给的地址里已经带了一张短期票，开出去就是一个能全屏用、能给同事看的页面。
