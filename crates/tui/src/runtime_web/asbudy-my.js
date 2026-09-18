@@ -2409,6 +2409,28 @@
     } catch (e) { /* 参数读不到就算了 */ }
   })();
 
+  /* 桌面「我的」走这条路进来：URL 带 ?my=1 → 自动把「我的」菜单摊开。
+     跟 ?settings=1 同一个套路：不重写第二份，直接把外挂里已有的那个菜单打开。
+     「我的」是按账号的（客户管理 / 员工 / 密码），跟哪个项目无关 ——
+     桌面侧用名下第一个项目打开这个 iframe。 */
+  (function () {
+    try {
+      var sp = new URLSearchParams(location.search);
+      if (sp.get('my') !== '1') return;
+      // 只当「我的」面板用：把官方三栏（会话 / 对话 / 预览）收起来，
+      // 否则加载瞬间会先闪一下三栏再盖上层（跟 ?settings=1 同一个理由）。
+      document.body.classList.add('asb-settings-only');
+      var tries = 0;
+      var t = setInterval(function () {
+        if (typeof openMyMenu === 'function' && document.getElementById('composer-input')) {
+          clearInterval(t);
+          setTimeout(openMyMenu, 400);
+        }
+        if (++tries > 40) clearInterval(t);
+      }, 300);
+    } catch (e) { /* 参数读不到就算了 */ }
+  })();
+
   /* 桌面形态：从桌面窗口打开的（?desk=1）给 body 挂个记号。
      样式表据此把我们 2026-09-14 塞进官方侧栏的那几块收起来（项目文件 / 我的资料 /
      退回）—— 那些是网页形态的遗留，桌面形态下它们有自己的去处（我的空间 / 窗口菜单），
