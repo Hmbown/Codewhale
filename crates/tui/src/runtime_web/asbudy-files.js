@@ -864,12 +864,33 @@
     }
   }
 
-  /** 点「▶ 看我的项目」（2026-09-18 老板选②）——
-   *  跑着的项目：照旧打开系统页面；
-   *  还没跑起来的项目：入口照常在（不然客户连入口都摸不到），点它就当场说清楚为什么打不开。 */
+  /** 点「▶ 看我的项目」（2026-09-18 老板选②；同日按老板要求加探活）——
+   *  先问门卫一句「它**现在真能打开吗**」（`/_gate/proj-alive`）：
+   *    能 → 打开系统页面；不能 → 入口照常在，但当场说清是哪一种打不开。
+   *  为什么光看 data-kind 不够：「配了端口」≠「页面打得开」—— 实测踩到过
+   *  「端口在听、进程抱着**已删除目录**的旧 inode、页面 404」（见 §8.7 155）。
+   *  探活顺带按需拉起应用（门卫那头做的），所以冷启动的项目也能一次点开。 */
   function openMySystem() {
-    if (projKind === 'proxy') { hideProjHint(); showSysPreview(); return; }
-    showProjHint('这个项目还没跑起来，暂时打不开页面。');
+    if (!projSys) return;
+    var url = '/_gate/proj-alive' + (pkey ? '?project=' + encodeURIComponent(pkey) : '');
+    showProjHint('正在打开…');
+    var slow = setTimeout(function () { showProjHint('打开得有点慢，再等一下…'); }, 4000);
+    fetch(url, { credentials: 'same-origin' })
+      .then(function (r) { return r.json(); })
+      .then(function (j) {
+        clearTimeout(slow);
+        if (j && j.alive) { hideProjHint(); showSysPreview(); return; }
+        showProjHint(aliveHint(j));
+      })
+      .catch(function () { clearTimeout(slow); showProjHint('暂时打不开页面，稍后再试。'); });
+  }
+  /** 打不开的几种情形，各说一句人话（只讲「点了会怎样」，不讲我们怎么实现） */
+  function aliveHint(j) {
+    var r = (j && j.reason) || '';
+    if (r === 'no-port') return '这个项目还没跑起来，暂时打不开页面。';
+    if (r === 'unreachable') return '项目服务没有响应，稍后再试。';
+    if (r.indexOf('http-') === 0) return '项目页面暂时打不开（错误 ' + r.slice(5) + '）。';
+    return '暂时打不开页面，稍后再试。';
   }
   function showProjHint(text) {
     var box = document.getElementById('asbudy-openproj');
