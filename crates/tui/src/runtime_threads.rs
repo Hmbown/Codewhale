@@ -911,6 +911,16 @@ pub struct TurnRecord {
     /// this receipt; old records deserialize with no fabricated value.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub permission_posture: Option<String>,
+    /// Canonical mode this turn ran in (`agent` / `plan` / `operate`), resolved
+    /// from the same policy projection as `permission_posture`. It is the
+    /// per-turn record of the mode, which the thread cannot answer: `mode` may
+    /// have been switched since, so a client reading the thread at completion
+    /// learns how the thread is set up *now*, not how the run it is looking at
+    /// ran. New records always carry it; records this runtime did not run (an
+    /// imported conversation, a failed settlement for an unaccepted turn) and
+    /// pre-existing records have none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
     /// Concrete generic provider kind selected for this turn.
     #[serde(
         default,
@@ -1273,6 +1283,8 @@ fn settle_unaccepted_routed_usage(
             routing_settlement: true,
             effective_route_usage: None,
             permission_posture: None,
+            // No turn ran: this settles a turn that was never accepted.
+            mode: None,
             effective_provider: None,
             effective_provider_id: None,
             effective_openrouter_vendor: None,
@@ -8480,6 +8492,9 @@ impl RuntimeThreadManager {
                     routing_settlement: false,
                     effective_route_usage: None,
                     permission_posture: None,
+                    // An imported conversation: this runtime never selected a
+                    // mode for it, and inventing one would be a guess.
+                    mode: None,
                     effective_provider: None,
                     effective_provider_id: None,
                     effective_openrouter_vendor: None,
@@ -9571,6 +9586,7 @@ impl RuntimeThreadManager {
             routing_settlement: false,
             effective_route_usage: None,
             permission_posture: Some(policy.permission_wire().to_string()),
+            mode: Some(mode.as_setting().to_string()),
             effective_provider: Some(provider.as_str().to_string()),
             effective_provider_id: provider_identity
                 .exact_id
@@ -10018,6 +10034,13 @@ impl RuntimeThreadManager {
         let turn_id = format!("turn_{}", &Uuid::new_v4().to_string()[..8]);
         let compaction_id = format!("compact_{}", &Uuid::new_v4().to_string()[..8]);
         compaction.runtime_cost_owner = Some(turn_id.clone());
+        // The same projection the turn record receipts, computed once: the
+        // compaction runs under the thread's persisted policy.
+        let projection = RuntimePolicyProjection::from_persisted(
+            &thread.mode,
+            thread.permission_posture.as_deref(),
+            thread.auto_approve,
+        );
         let turn = TurnRecord {
             max_output_tokens: None,
             schema_version: CURRENT_RUNTIME_SCHEMA_VERSION,
@@ -10036,15 +10059,8 @@ impl RuntimeThreadManager {
             usage: None,
             routing_settlement: false,
             effective_route_usage: None,
-            permission_posture: Some(
-                RuntimePolicyProjection::from_persisted(
-                    &thread.mode,
-                    thread.permission_posture.as_deref(),
-                    thread.auto_approve,
-                )
-                .permission_wire()
-                .to_string(),
-            ),
+            permission_posture: Some(projection.permission_wire().to_string()),
+            mode: Some(projection.mode.as_setting().to_string()),
             effective_provider: Some(route_provider.as_str().to_string()),
             effective_provider_id: route_identity
                 .exact_id

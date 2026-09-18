@@ -455,6 +455,7 @@ fn messages_from_thread_detail_batches_tool_results() {
         routing_settlement: false,
         effective_route_usage: None,
         permission_posture: Some("ask".to_string()),
+        mode: None,
         effective_provider: None,
         effective_provider_id: None,
         effective_openrouter_vendor: None,
@@ -6960,6 +6961,7 @@ async fn session_save_merges_thread_cost_split_and_records_coverage() -> Result<
         routing_settlement: false,
         effective_route_usage: None,
         permission_posture: None,
+        mode: None,
         effective_provider: None,
         effective_provider_id: None,
         effective_openrouter_vendor: None,
@@ -7154,6 +7156,7 @@ async fn session_save_persists_parent_cny_unpriced_reasons_without_double_count(
         routing_settlement: false,
         effective_route_usage: None,
         permission_posture: None,
+        mode: None,
         effective_provider: None,
         effective_provider_id: None,
         effective_openrouter_vendor: None,
@@ -7489,6 +7492,53 @@ async fn start_turn_accepts_dynamic_tools_and_environment_id() -> Result<()> {
             .json()
             .await?;
         assert_eq!(stored["turns"][0]["permission_posture"], "auto_review");
+
+        handle.abort();
+        Ok(())
+    })
+    .await
+}
+
+/// A turn receipts the mode it ran in, not the thread's mode: a client reading
+/// the thread when the turn finishes would otherwise learn how the thread is
+/// set up *now*, which is a different question as soon as the mode is switched
+/// mid-run.
+#[tokio::test]
+async fn turn_record_reports_the_mode_it_ran_in() -> Result<()> {
+    Box::pin(async {
+        let Some((addr, _runtime_threads, handle)) = spawn_test_server().await? else {
+            return Ok(());
+        };
+        let client = crate::tls::reqwest_client();
+
+        let created: serde_json::Value = client
+            .post(format!("http://{addr}/v1/threads"))
+            .json(&json!({ "model": "test-model" }))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let thread_id = created["id"].as_str().context("missing thread id")?;
+
+        let started: serde_json::Value = client
+            .post(format!("http://{addr}/v1/threads/{thread_id}/turns"))
+            .json(&json!({ "prompt": "plan it", "mode": "plan" }))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        assert_eq!(started["turn"]["mode"], "plan");
+
+        let stored: serde_json::Value = client
+            .get(format!("http://{addr}/v1/threads/{thread_id}"))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        assert_eq!(stored["turns"][0]["mode"], "plan");
 
         handle.abort();
         Ok(())
@@ -8168,6 +8218,7 @@ fn seed_summary_search_transcript(
             routing_settlement: false,
             effective_route_usage: None,
             permission_posture: None,
+            mode: None,
             effective_provider: None,
             effective_provider_id: None,
             effective_openrouter_vendor: None,

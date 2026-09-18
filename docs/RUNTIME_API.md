@@ -354,7 +354,7 @@ this; the table maps each integration need to where a local client reads it.
 | Integration need | Where it comes from | Status |
 |---|---|---|
 | Route / effective model / billing surface | `TurnRecord` + thread `model`; per-run `--provider`/`--model` overrides | available |
-| Permission / sandbox / approval profile | thread `auto_approve`, sandbox + approval policy | available |
+| Permission / sandbox / approval profile | thread `auto_approve`, sandbox + approval policy; `TurnRecord.permission_posture` + `TurnRecord.mode` for how *that* run was governed (the thread's own `mode` may have been switched since) | available |
 | Run / thread / turn IDs | `thread_id`, `turn_id`, SSE event envelope | available |
 | Event stream | `GET /v1/threads/{id}/events` (replay + live SSE) | available |
 | Turn status / terminal classification | `TurnRecord.status` + error summary | available |
