@@ -652,8 +652,7 @@
       if (role === 'admin') {
         html += '<button class="ab-menu-item" id="ab-m-users">客户管理<small>添加客户、转移项目归属</small></button>';
       }
-      html += '<button class="ab-menu-item" id="ab-m-proj">项目管理<small>暂停、恢复、删除项目</small></button>';
-      html += '<button class="ab-menu-item" id="ab-m-auto">定时任务<small>按计划自动执行（每天 / 每周 / 每月）</small></button>';
+      html += '<button class="ab-menu-item" id="ab-m-proj">项目管理<small>查看和删除项目</small></button>';
       html += '<button class="ab-menu-item" id="ab-m-mem">AI 的记忆<small>查看和清除 AI 记住的内容</small></button>';
       html += '<button class="ab-menu-item" id="ab-m-skills">它会做什么<small>内置技能：做 PPT / 表格 / 文档 / PDF / 图表…</small></button>';
       html += '<button class="ab-menu-item" id="ab-m-space">空间<small>存储用量与配额</small></button>';
@@ -672,7 +671,6 @@
       var bUsers = body.querySelector('#ab-m-users');
       if (bUsers) bUsers.onclick = openUsers;
       body.querySelector('#ab-m-proj').onclick = openProjects;
-      body.querySelector('#ab-m-auto').onclick = openAuto;
       body.querySelector('#ab-m-mem').onclick = openMemory;
       body.querySelector('#ab-m-skills').onclick = openSkills;
       var bSpace = body.querySelector('#ab-m-space');
@@ -691,29 +689,6 @@
           .then(function () { location.replace('/login.html'); })
           .catch(function () { location.replace('/login.html'); });
       };
-
-      // 定时任务：有跑完还没看过的新结果 → 直接在菜单项上提醒
-      // （老板 2026-09-16：「跑完提醒就在定时任务界面提醒即可」—— 不往外发通知）
-      api('/v1/automations').then(function (r) {
-        var list = Array.isArray(r.body) ? r.body : [];
-        if (!list.length) return;
-        var seen = abSeen(), fresh = 0, left = list.length;
-        list.forEach(function (a) {
-          api('/v1/automations/' + encodeURIComponent(a.id) + '/runs').then(function (rr) {
-            var runs = abRunsOf(rr).slice().sort(abByNewest);
-            var last = runs[runs.length - 1];
-            if (last && last.created_at && (!seen[a.id] || String(last.created_at) > String(seen[a.id]))) fresh++;
-            if (--left === 0 && fresh) {
-              var it = body.querySelector('#ab-m-auto');
-              if (it) {
-                var s = it.querySelector('small');
-                if (s) s.textContent = '有 ' + fresh + ' 条跑完还没看的结果';
-                it.style.borderColor = 'var(--live)';
-              }
-            }
-          });
-        });
-      });
     });
   }
 
@@ -1013,7 +988,7 @@
   function openProjectsWith(owners) {
     var isAdmin = !!(ME && ME.role === 'admin');
     openLayer('项目管理', function (body) {
-      body.innerHTML = '<div class="ab-tip">「暂停」将停止运行环境并释放资源；暂停期间对外显示提示，不会自动启动。需要时点「恢复」。</div><div id="ab-plist">加载中…</div>';
+      body.innerHTML = '<div class="ab-tip">项目平时不占资源，点进去才会启动。</div><div id="ab-plist">加载中…</div>';
       function refresh() {
         api('/_gate/projects').then(function (r) {
           var list = (r.body && r.body.projects) || [];
@@ -1032,29 +1007,13 @@
                 : '<span style="color:var(--live)">运行中</span>') +
               (p.editable ? '' : ' ｜ 此项目无独立运行环境') + '</div></div></div>';
             var acts = document.createElement('div'); acts.style.cssText = 'display:flex;gap:7px;margin-top:10px;flex-wrap:wrap';
-            if (p.editable) {
-              var b = document.createElement('button');
-              b.className = 'ab-btn sm ' + (p.paused ? '' : 'ghost');
-              b.type = 'button';
-              b.textContent = p.paused ? '恢复' : '暂停';
-              b.onclick = function () {
-                b.disabled = true;
-                b.textContent = p.paused ? '恢复中…' : '暂停中…';
-                api('/_gate/projects/' + (p.paused ? 'resume' : 'pause'), { method: 'POST', body: JSON.stringify({ key: p.key }) })
-                  .then(function (r2) {
-                    if (!r2.ok) { alert((r2.body && r2.body.error) || '操作失败'); }
-                    refresh();
-                  });
-              };
-              acts.appendChild(b);
-            }
             // 工作台不给删（2026-09-16 老板定 A）：它是平台给你的干活入口、不是客户的项目，
             //   删了连里面所有产出文件（PPT/Excel）一起没，也没地方补。后端同时拦着，两层。
             if (p.workbench) {
               var wbHint = document.createElement('div');
               wbHint.className = 'ab-s';
               wbHint.style.cssText = 'align-self:center;color:var(--text-dim)';
-              wbHint.textContent = '工作台不可删除，可暂停';
+              wbHint.textContent = '工作台不可删除';
               acts.appendChild(wbHint);
             } else {
             var bDel = document.createElement('button');
@@ -1167,311 +1126,6 @@
         }
         el.innerHTML = html;
       });
-    });
-  }
-
-  /* ── 定时任务（搬表：官方 /v1/automations 整族，官方 web 没界面）──
-   * 2026-09-16。引擎侧 7 条路由先实测通了一遍（建 → 立刻跑 → 查到 completed → 删）。
-   * 官方 CLI 用 RRULE 表达时间（`FREQ=CRON;EXPR=0 9 * * *`）—— 对不懂编程的老板是天书，
-   * 所以这里做**人话 ↔ RRULE 双向翻译**：界面选「每天 / 每周 / 每月 / 每小时」+ 时间。
-   * 引擎支持的时间格式（读源码 runtime_api/automation_manager）：FREQ=ONCE|HOURLY|WEEKLY|CRON，
-   * CRON 是标准 5 段（分 时 日 月 周），**按本地时间**解释（系统北京时间）。
-   * ⚠️ 自动化 = 到点自己动手、不等你确认（引擎侧 auto_approve）—— 界面上必须明说。
-   */
-  var AB_WEEK = [[1, '一'], [2, '二'], [3, '三'], [4, '四'], [5, '五'], [6, '六'], [0, '日']];
-  var AB_DOW = { 0: '日', 1: '一', 2: '二', 3: '三', 4: '四', 5: '五', 6: '六', 7: '日' };
-
-  function ab2(n) { return String(n).padStart(2, '0'); }
-
-  /* 存的是 UTC、给人看一律本地时间（2026-09-15 ㉔ 定的统一规矩） */
-  function abLocal(iso) {
-    if (!iso) return '';
-    var d = new Date(iso);
-    if (isNaN(d.getTime())) return '';
-    return (d.getMonth() + 1) + '月' + d.getDate() + '日 ' + ab2(d.getHours()) + ':' + ab2(d.getMinutes());
-  }
-
-  /* RRULE → 人话（看不懂的格式就原样显示，不硬编） */
-  function abRruleHuman(s) {
-    var u = String(s || '').toUpperCase().trim();
-    var m = u.match(/^FREQ=CRON\s*;\s*EXPR=(.+)$/);
-    if (m) {
-      var f = m[1].trim().split(/\s+/);
-      if (f.length === 5) {
-        var mi = f[0], hh = f[1], dom = f[2], dow = f[4];
-        var at = (/^\d+$/.test(hh) && /^\d+$/.test(mi)) ? (ab2(+hh) + ':' + ab2(+mi)) : '';
-        var dows = dow === '*' ? '' : dow.split(',').map(function (x) {
-          var n = parseInt(x, 10);
-          return isNaN(n) ? x : '周' + (AB_DOW[n] || x);
-        }).join('、');
-        if (dom === '*' && dow === '*') return hh === '*' ? ('每小时第 ' + mi + ' 分钟') : ('每天 ' + at);
-        if (dom === '*' && dow !== '*') return '每' + dows + (at ? ' ' + at : '');
-        if (dom !== '*' && dow === '*') return '每月 ' + dom + ' 号' + (at ? ' ' + at : '');
-      }
-      return '按计划（' + m[1] + '）';
-    }
-    if (/^FREQ=HOURLY/.test(u)) {
-      var iv = (u.match(/INTERVAL=(\d+)/) || [])[1] || '1';
-      var bm = (u.match(/BYMINUTE=(\d+)/) || [])[1];
-      return '每 ' + iv + ' 小时' + (bm != null ? '（第 ' + bm + ' 分钟）' : '');
-    }
-    if (/^FREQ=ONCE/.test(u)) {
-      var at2 = (u.match(/AT=([^;]+)/) || [])[1];
-      return at2 ? ('只跑一次（' + abLocal(at2) + '）') : '只跑一次';
-    }
-    if (/^FREQ=WEEKLY/.test(u)) {
-      var bd = (u.match(/BYDAY=([^;]+)/) || [])[1] || '';
-      var bh = (u.match(/BYHOUR=(\d+)/) || [])[1];
-      var bmi = (u.match(/BYMINUTE=(\d+)/) || [])[1];
-      var names = { MO: '一', TU: '二', WE: '三', TH: '四', FR: '五', SA: '六', SU: '日' };
-      var ds = bd.split(',').map(function (x) { return names[x] || x; }).join('、');
-      return '每周' + ds + (bh != null ? ' ' + ab2(+bh) + ':' + ab2(+(bmi || 0)) : '');
-    }
-    return s || '';
-  }
-
-  /* 人话表单 → RRULE */
-  function abRrule(freq, time, days, dom) {
-    var t = String(time || '09:00').split(':');
-    var hh = parseInt(t[0], 10); var mi = parseInt(t[1], 10);
-    if (isNaN(hh)) hh = 9;
-    if (isNaN(mi)) mi = 0;
-    if (freq === 'hourly') return 'FREQ=HOURLY;INTERVAL=1;BYMINUTE=' + mi;
-    if (freq === 'weekly') return 'FREQ=CRON;EXPR=' + mi + ' ' + hh + ' * * ' + ((days && days.length) ? days.join(',') : '1');
-    if (freq === 'monthly') return 'FREQ=CRON;EXPR=' + mi + ' ' + hh + ' ' + (parseInt(dom, 10) || 1) + ' * *';
-    return 'FREQ=CRON;EXPR=' + mi + ' ' + hh + ' * * *';
-  }
-
-  function abRunState(s) {
-    return { completed: '跑成了', failed: '失败了', queued: '排队中', running: '正在跑', canceled: '已取消' }[s] || s || '';
-  }
-
-  /* 跑完的提醒「看一次就消」—— 记在本机 localStorage，按任务 id 存「我上次看到的最新一次运行」。
-   * 老板 2026-09-16 定：「跑完提醒就在定时任务界面提醒即可」—— 不往外发通知，就在这个界面里看。
-   * ⚠️ 放本机（不是服务端）：它只是「我还没翻过」的提示，不是审计记录；换设备重新看过一次无妨。
-   */
-  var AB_SEEN_KEY = 'ab-auto-seen';
-  function abSeen() {
-    try { return JSON.parse(localStorage.getItem(AB_SEEN_KEY) || '{}') || {}; } catch (e) { return {}; }
-  }
-  function abSeenSave(m) { try { localStorage.setItem(AB_SEEN_KEY, JSON.stringify(m)); } catch (e) {} }
-  function abByNewest(x, y) { return String(x.created_at || '').localeCompare(String(y.created_at || '')); }
-  function abRunsOf(r) { return Array.isArray(r.body) ? r.body : ((r.body && r.body.runs) || []); }
-
-  /* 一行状态：时间 + 结果 + 没看过的标「新结果」；失败额外说一句 */
-  function abPaintRun(box, run, seenIso) {
-    var st = run.status || '';
-    var fresh = run.created_at && (!seenIso || String(run.created_at) > String(seenIso));
-    var html = '上次：' + esc(abLocal(run.created_at)) + ' ' + esc(abRunState(st));
-    if (fresh) html += ' <span style="color:var(--live)">● 新结果</span>';
-    if (st === 'failed') html += ' <span style="color:var(--danger)">—— 执行失败</span>';
-    else if (fresh && st === 'completed') html += ' <span style="color:var(--text-dim)">—— 已完成</span>';
-    box.innerHTML = html;
-  }
-
-  /* 结果一句话：把跑出来的那个会话的开头拿出来（看不到就不显示，不编内容）
-   * ⚠️ 2026-09-16 踩过：`GET /v1/threads/{id}` 返回的是 `{thread,turns,items}`，**没有 preview/title**；
-   *   摘要只在 `GET /v1/threads/summary` 里 —— 拿 {id} 取 preview 永远是 undefined。
-   *   多条卡片共用一次 summary（5 秒缓存），避免 N 条主 N 次请求。
-   */
-  var AB_SUM_CACHE = { at: 0, list: [] };
-  function abThreadSummary(cb) {
-    if (AB_SUM_CACHE.at && Date.now() - AB_SUM_CACHE.at < 5000) return cb(AB_SUM_CACHE.list);
-    api('/v1/threads/summary?limit=50').then(function (r) {
-      var list = Array.isArray(r.body) ? r.body : ((r.body && r.body.threads) || []);
-      AB_SUM_CACHE = { at: Date.now(), list: list };
-      cb(list);
-    });
-  }
-
-  function abPaintResult(card, id, threadId) {
-    if (!card || !threadId) return;
-    var box = card.querySelector('#au-res-' + id);
-    if (!box) return;
-    abThreadSummary(function (list) {
-      var hit = list.filter(function (t) { return t.id === threadId; })[0];
-      var pv = hit && (hit.preview || hit.title);
-      if (pv) box.textContent = '它说：' + String(pv).replace(/\s+/g, ' ').slice(0, 92);
-    });
-  }
-
-  /* ── 定时任务：列表 ── */
-  function openAuto() {
-    openLayer('定时任务', function (body) {
-      body.innerHTML = '<div id="ab-auto">加载中…</div>';
-      Promise.all([api('/_gate/projects'), api('/v1/automations')]).then(function (rs) {
-        var el = body.querySelector('#ab-auto');
-        if (!el) return;
-        var projs = (rs[0].body && rs[0].body.projects) || [];
-        var act = projs.filter(function (p) { return p.active; })[0] || projs[0] || null;
-        var list = Array.isArray(rs[1].body) ? rs[1].body : ((rs[1].body && rs[1].body.automations) || []);
-        if (!rs[1].ok) {
-          el.innerHTML = '<div class="ab-tip" style="color:var(--danger)">读不到定时任务：' +
-            esc((rs[1].body && rs[1].body.error) || ('HTTP ' + rs[1].code)) + '</div>';
-          return;
-        }
-        if (!act) {
-          el.innerHTML = '<div class="ab-tip">名下暂无项目，请先创建项目。</div>';
-          return;
-        }
-        el.innerHTML =
-          '<div class="ab-tip">按计划自动执行：<b>改文件、执行命令无需逐步确认</b>，执行记录写入「' +
-          esc(act.name) + '」的会话里。</div>' +
-          '<button class="ab-menu-item" id="ab-au-new">+ 新建定时任务<small>每天 / 每周 / 每月 / 每小时</small></button>' +
-          '<div id="ab-au-list">' + (list.length ? '' : '<div class="ab-tip">暂无定时任务。</div>') + '</div>';
-        el.querySelector('#ab-au-new').onclick = function () {
-          openAutoForm(act.dir, function () { openAuto(); });
-        };
-        if (!list.length) return;
-
-        var holder = el.querySelector('#ab-au-list');
-        holder.innerHTML = list.map(function (a) {
-          return '<div class="ab-card" id="au-' + esc(a.id) + '">' +
-            '<div class="ab-card-top"><span class="ab-n">' + esc(a.name || '（没名字）') + '</span>' +
-            '<span class="ab-s" style="margin:0;color:' + (a.status === 'active' ? 'var(--live)' : 'var(--human)') + '">' +
-            (a.status === 'active' ? '启用中' : '已暂停') + '</span></div>' +
-            '<div class="ab-s">' + esc(abRruleHuman(a.rrule)) +
-            (a.next_run_at ? ' · 下次 ' + esc(abLocal(a.next_run_at)) : '') + '</div>' +
-            '<div class="ab-s" id="au-run-' + esc(a.id) + '">上次：查中…</div>' +
-            '<div class="ab-s" id="au-res-' + esc(a.id) + '" style="color:var(--text-dim)"></div>' +
-            '<div class="ab-s" style="color:var(--text-dim)">任务内容：' + esc((a.prompt || '').slice(0, 110)) +
-            ((a.prompt || '').length > 110 ? '…' : '') + '</div>' +
-            '<div style="display:flex;gap:8px;margin-top:9px;flex-wrap:wrap">' +
-            '<button class="ab-btn sm" data-act="run" data-id="' + esc(a.id) + '">立刻跑一次</button>' +
-            '<button class="ab-btn ghost sm" data-act="' + (a.status === 'active' ? 'pause' : 'resume') +
-            '" data-id="' + esc(a.id) + '">' + (a.status === 'active' ? '暂停' : '恢复') + '</button>' +
-            '<button class="ab-btn danger sm" data-act="del" data-id="' + esc(a.id) + '">删除</button></div></div>';
-        }).join('');
-
-        // 每条：拉最近一次运行 + 结果一句话 + 「跑完还没看过」的标
-        var seenBefore = abSeen(), seenAfter = Object.assign({}, seenBefore);
-        list.forEach(function (a) {
-          var card = body.querySelector('#au-' + a.id);
-          api('/v1/automations/' + encodeURIComponent(a.id) + '/runs').then(function (r) {
-            var box = body.querySelector('#au-run-' + a.id);
-            if (!box) return;
-            var runs = abRunsOf(r).slice().sort(abByNewest);
-            if (!runs.length) { box.textContent = '上次执行：尚未运行'; return; }
-            var last = runs[runs.length - 1];
-            if (last.created_at) seenAfter[a.id] = last.created_at;
-            abPaintRun(box, last, seenBefore[a.id]);
-            if (last.status === 'completed') abPaintResult(card, a.id, last.thread_id);
-          });
-        });
-        // 「新结果」标本次仍显示（让客户至少看见一次），两秒后再记成「看过了」
-        setTimeout(function () { abSeenSave(seenAfter); }, 2000);
-
-        holder.onclick = function (e) {
-          var b = e.target.closest ? e.target.closest('button[data-act]') : null;
-          if (!b) return;
-          var id = b.getAttribute('data-id'); var act2 = b.getAttribute('data-act');
-          var rec = list.filter(function (x) { return x.id === id; })[0] || {};
-          if (act2 === 'del') {
-            if (!confirm('删掉「' + (rec.name || '这个定时任务') + '」？\n（已经记下的历史会话不会删）')) return;
-            b.disabled = true;
-            api('/v1/automations/' + encodeURIComponent(id), { method: 'DELETE' }).then(function () { openAuto(); });
-            return;
-          }
-          if (act2 === 'pause' || act2 === 'resume') {
-            b.disabled = true;
-            api('/v1/automations/' + encodeURIComponent(id) + '/' + act2, { method: 'POST' }).then(function () { openAuto(); });
-            return;
-          }
-          // 立刻跑一次 —— 排上队后轮询到跑完（老板 2026-09-16：结果就在这个界面里给）
-          b.disabled = true; b.textContent = '正在跑…';
-          api('/v1/automations/' + encodeURIComponent(id) + '/run', { method: 'POST' }).then(function (r) {
-            if (!r.ok) { b.disabled = false; b.textContent = '立刻跑一次'; alert('没跑起来：' + ((r.body && r.body.error) || ('HTTP ' + r.code))); return; }
-            var runId = (r.body && r.body.id) || '';
-            var card = body.querySelector('#au-' + id);
-            var tries = 0;
-            var box0 = body.querySelector('#au-run-' + id);
-            if (box0) box0.textContent = '执行中…（完成后自动更新）';
-            var timer = setInterval(function () {
-              tries++;
-              api('/v1/automations/' + encodeURIComponent(id) + '/runs').then(function (rr) {
-                var runs = abRunsOf(rr).slice().sort(abByNewest);
-                var cur = runs.filter(function (x) { return !runId || x.id === runId; }).pop() || runs[runs.length - 1];
-                var box = body.querySelector('#au-run-' + id);
-                if (!cur || !box) return;
-                abPaintRun(box, cur, null);          // 刚发生的，按「新」显示
-                var done = cur.status === 'completed' || cur.status === 'failed' || cur.status === 'canceled';
-                if (cur.status === 'completed') abPaintResult(card, id, cur.thread_id);
-                if (done || tries >= 40) {
-                  clearInterval(timer);
-                  b.disabled = false; b.textContent = '立刻跑一次';
-                  if (cur.created_at) {
-                    var m = abSeen(); m[id] = cur.created_at; abSeenSave(m);   // 就在眼前发生的，不用再标「新」
-                  }
-                }
-              });
-            }, 3000);
-          });
-        };
-      });
-    });
-  }
-
-  /* ── 定时任务：新建 ── */
-  function openAutoForm(dir, onDone) {
-    openLayer('新建定时任务', function (body) {
-      var dayBox = AB_WEEK.map(function (w) {
-        return '<label class="ab-chk" style="display:inline-flex;margin:0 12px 0 0"><input type="checkbox" value="' +
-          w[0] + '"' + (w[1] === '一' ? ' checked' : '') + '>周' + w[1] + '</label>';
-      }).join('');
-      body.innerHTML =
-        '<div class="ab-tip">按计划自动执行 —— <b>改文件、执行命令无需逐步确认</b>，执行记录写入本项目会话。' +
-        '拿不准就先写「只看不动」的活（比如「把逾期清单写成报告」）。</div>' +
-        '<div class="ab-row"><label>名称</label><input class="ab-input" id="au-name" placeholder="例：每天早上看逾期款"></div>' +
-        '<div class="ab-row"><label>执行频率</label><select class="ab-input" id="au-freq">' +
-        '<option value="daily">每天</option><option value="weekly">每周</option>' +
-        '<option value="monthly">每月</option><option value="hourly">每小时</option></select></div>' +
-        '<div class="ab-row"><label>执行时间</label><input class="ab-input" id="au-time" type="time" value="09:00"></div>' +
-        '<div class="ab-row" id="au-days" style="display:none"><label>星期</label><div style="flex:1">' + dayBox + '</div></div>' +
-        '<div class="ab-row" id="au-dom" style="display:none"><label>日期</label><input class="ab-input" id="au-domv" type="number" min="1" max="31" value="1"></div>' +
-        '<div class="ab-row" style="align-items:flex-start"><label>任务内容</label>' +
-        '<textarea class="ab-input" id="au-prompt" rows="4" placeholder="例：查看逾期未付的订单，把清单写入「产出」目录，并回复一句总结"></textarea></div>' +
-        '<div style="display:flex;gap:8px;margin-top:14px"><button class="ab-btn" id="au-save" type="button">创建</button>' +
-        '<button class="ab-btn ghost" id="au-cancel" type="button">取消</button></div><div class="ab-msg" id="au-msg"></div>';
-
-      var freqEl = body.querySelector('#au-freq');
-      var msgEl = body.querySelector('#au-msg');
-      function syncRows() {
-        var f = freqEl.value;
-        body.querySelector('#au-days').style.display = f === 'weekly' ? '' : 'none';
-        body.querySelector('#au-dom').style.display = f === 'monthly' ? '' : 'none';
-        body.querySelector('#au-time').parentNode.style.display = f === 'hourly' ? 'none' : '';
-      }
-      freqEl.onchange = syncRows;
-      syncRows();
-      body.querySelector('#au-cancel').onclick = closeLayer;
-      body.querySelector('#au-save').onclick = function () {
-        var prompt = body.querySelector('#au-prompt').value.trim();
-        if (!prompt) { msg(msgEl, '请填写任务内容', false); return; }
-        var days = Array.prototype.slice.call(body.querySelectorAll('#au-days input:checked')).map(function (c) { return c.value; });
-        if (freqEl.value === 'weekly' && !days.length) { msg(msgEl, '每周的至少选一天', false); return; }
-        var name = body.querySelector('#au-name').value.trim() || prompt.slice(0, 20);
-        var payload = {
-          name: name,
-          prompt: prompt,
-          rrule: abRrule(freqEl.value, body.querySelector('#au-time').value, days, body.querySelector('#au-domv').value),
-          cwds: dir ? [dir] : [],
-          mode: 'agent',
-          allow_shell: true,
-          auto_approve: true,
-        };
-        var btn = body.querySelector('#au-save');
-        btn.disabled = true;
-        msg(msgEl, '正在建…', true);
-        api('/v1/automations', { method: 'POST', body: JSON.stringify(payload) }).then(function (r) {
-          if (!r.ok) {
-            btn.disabled = false;
-            msg(msgEl, ((r.body && (r.body.error || r.body.message)) || ('没建成（HTTP ' + r.code + '）')) + '', false);
-            return;
-          }
-          closeLayer();
-          if (onDone) onDone();
-        });
-      };
     });
   }
 
