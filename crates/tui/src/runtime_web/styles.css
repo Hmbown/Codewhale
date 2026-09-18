@@ -895,7 +895,14 @@ textarea::placeholder {
   overflow-x: hidden;
   overflow-y: auto;
   overscroll-behavior: contain;
-  scroll-behavior: smooth;
+  /* AsBudy：这里不能是 smooth（原值），否则「自动显示最新回复」会永久失效
+     —— 2026-09-19 老板报「发消息后停在最开始几次回复」。
+     scroll-behavior 连**程序化赋值**也管：官方那句 `scrollTop = scrollHeight` 会被降级成
+     一个约 1 秒的平滑动画，而流式回复每几十毫秒就加高一次 ⇒ 动画永远追不上
+     （实测：赋值后同一 tick scrollTop 仍是 0，500ms 才走到 4830/7285）⇒ 官方据此判定的
+     `wasNearBottom` 长期为 false 且**不可恢复**。用户主动点的「回到最新」自带
+     behavior:'smooth'，不依赖这一条。 */
+  scroll-behavior: auto;
   scrollbar-color: var(--text-faint) transparent;
   background: var(--stage-surface);
 }

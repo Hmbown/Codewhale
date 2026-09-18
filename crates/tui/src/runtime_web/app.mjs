@@ -1621,9 +1621,34 @@ function startBrowserClient() {
     reconcileChildren(dom.transcript, desired);
     restoreTranscriptSelection(selection);
     if (!preserveScroll || wasNearBottom) {
-      requestAnimationFrame(() => {
-        dom.transcript.scrollTop = dom.transcript.scrollHeight;
-      });
+      requestAnimationFrame(() => scrollTranscriptToLatest());
+    }
+  }
+
+  /* AsBudy：把对话区**立即**贴到底（2026-09-19 老板报「发消息后没法自动显示最新回复，
+     界面停在最开始几次回复」）。
+     ⚠️ 别写回 `dom.transcript.scrollTop = dom.transcript.scrollHeight` —— 只要
+     `.transcript` 带着 `scroll-behavior:smooth`，这一句就只是**发起一个约 1 秒的平滑动画**，
+     而流式回复每几十毫秒就把内容加高一次，动画永远追不上（实测：赋值后同一 tick
+     scrollTop 仍是 0，500ms 才走到 4830/7285）⇒ 上面那句 `wasNearBottom` 的读数长期落在
+     底部 120px 之外 ⇒ 从某一轮起**永久**判 false，之后所有回复都不再自动显示。
+     自动跟随必须即时；平滑只留给用户主动点的「回到最新」（asbudy-latest.js，自带
+     behavior:'smooth'）。 */
+  function scrollTranscriptToLatest() {
+    const transcript = dom.transcript;
+    if (!transcript) return;
+    try {
+      transcript.scrollTo({ top: transcript.scrollHeight, behavior: "instant" });
+    } catch (error) {
+      /* 老浏览器不认 options 形式 → 交给下面的兜底 */
+    }
+    // 兜底：仍有距离说明上一步没即时生效（比如被降级成了平滑滚动）→ 临时用行内样式
+    // 压掉 CSS 的 scroll-behavior 再赋一次（"auto" 就是即时，不会被外层的 smooth 继承）。
+    if (transcript.scrollHeight - transcript.scrollTop - transcript.clientHeight > 1) {
+      const previous = transcript.style.scrollBehavior;
+      transcript.style.scrollBehavior = "auto";
+      transcript.scrollTop = transcript.scrollHeight;
+      transcript.style.scrollBehavior = previous;
     }
   }
 
