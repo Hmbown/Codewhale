@@ -68,6 +68,23 @@
     // 「正在做什么」状态行（2026-09-18）：跟其他小字同档，但用等宽感区分一下
     '#asbudy-live{font-size:13px;color:var(--text-dim);white-space:nowrap}',
     '#asbudy-live[hidden]{display:none}',
+    // ── 工具卡按类型分开（2026-09-18 · 老板：「CLI 的工具卡是按类型分开渲染的，直接做了吧」）──
+    // CLI 那边 9 种卡各画各的（Exec/Exploring/PatchSummary/PlanUpdate/…）；web 这里做形态区分：
+    // 圆点颜色 + 排版 + 降噪。形态由 app.mjs 的 receiptVariant 算好，挂在 data-variant 上。
+    '.receipt[data-variant="exec"] .receipt-dot{background:var(--ok)}',
+    '.receipt[data-variant="file"] .receipt-dot{background:var(--action)}',
+    '.receipt[data-variant="plan"] .receipt-dot{background:var(--status-live)}',
+    '.receipt[data-variant="web"] .receipt-dot{background:var(--status-live)}',
+    '.receipt[data-variant="mcp"] .receipt-dot{background:var(--status-human)}',
+    '.receipt[data-variant="status"] .receipt-dot{background:var(--text-faint)}',
+    // 命令：等宽字体，一眼看出这是命令不是散文
+    '.receipt[data-variant="exec"] .receipt-summary{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12.5px}',
+    // 降噪：查看/搜索低调一点，引擎节拍（进度）最淡 —— 界面的主角应该是 AI 说的话
+    '.receipt[data-variant="explore"]{opacity:.82}',
+    '.receipt[data-variant="status"]{opacity:.6}',
+    // 徽标（耗时 / 退出码）
+    '.receipt-meta{color:var(--text-dim);font-size:12.5px;margin-left:6px;white-space:nowrap}',
+    '.receipt[data-variant="exec"] .receipt-meta{color:var(--text-muted)}',
   ].join('\n');
   document.head.appendChild(st);
 

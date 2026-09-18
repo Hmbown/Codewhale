@@ -95,6 +95,8 @@ describe("receiptPresentation", () => {
       summary: "github 连不上",
       raw,
       failed: true,
+      variant: "mcp",
+      meta: "",
     });
   });
 
@@ -104,7 +106,40 @@ describe("receiptPresentation", () => {
       summary: "3 tests passed",
       raw: "3 tests passed",
       failed: false,
+      variant: "generic",
+      meta: "",
     });
+  });
+
+  // AsBudy（2026-09-18 老板：「CLI 的工具卡是按类型分开渲染的，直接做了吧」）：
+  // 形态分类 + 徽标（耗时/非零退出码）—— 样式在 asbudy-my.js 注入，看 data-variant。
+  it("AsBudy: 按工具类型分形态（exec/file/explore/status），并给徽标", () => {
+    const exec = receiptPresentation({
+      kind: "tool_call",
+      status: "completed",
+      summary: "bash: out",
+      metadata: { tool_name: "bash", tool_input: JSON.stringify({ command: "ls" }), duration_ms: 1234, exit_code: 0 },
+    });
+    expect(exec.variant).toBe("exec");
+    expect(exec.meta).toBe("1.2s");
+
+    const bad = receiptPresentation({
+      kind: "tool_call", status: "failed", summary: "bash failed: x",
+      metadata: { tool_name: "bash", tool_input: JSON.stringify({ command: "node x.js" }), duration_ms: 800, exit_code: 1 },
+    });
+    expect(bad.meta).toBe("800ms · 退出码 1");
+
+    expect(receiptPresentation({
+      kind: "file_change", status: "completed", summary: "write ok",
+      metadata: { tool_name: "write", tool_input: JSON.stringify({ path: "public/index.html" }) },
+    }).variant).toBe("file");
+
+    expect(receiptPresentation({
+      kind: "tool_call", status: "completed", summary: "read: x",
+      metadata: { tool_name: "read", tool_input: JSON.stringify({ path: "AGENTS.md" }) },
+    }).variant).toBe("explore");
+
+    expect(receiptPresentation({ kind: "status", status: "completed", summary: "Continuing — tool results" }).variant).toBe("status");
   });
 
   // AsBudy（2026-09-18 老板：「全程没有任何中文、没有进度反馈」）：

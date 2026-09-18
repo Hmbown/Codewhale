@@ -519,26 +519,76 @@ function engineStatusZh(text) {
   return null;
 }
 
+/* 工具回执的「形态」分类（2026-09-18 · 老板：「CLI 的工具卡是按类型分开渲染的，直接做了吧」）
+ *
+ * CLI 那边是 9 种 ToolCell（Exec / Exploring / PatchSummary / PlanUpdate / Review / Mcp /
+ * ViewImage / WebSearch / Generic，见 crates/tui/src/tui/history.rs 与 tool_routing.rs），
+ * 各画各的 —— 所以一眼看得出「这是在跑命令还是在改文件」。web 只有一种通用卡片。
+ * 这里做**形态区分**（`data-variant` + 一枚小徽标），样式在 asbudy-my.js 注入：
+ *   exec    跑命令（等宽、带耗时/退出码）   file    改写文件（路径突出）
+ *   explore 查看/搜索（降噪）               web     联网检索
+ *   mcp     MCP 工具                        plan    计划/清单（高亮）
+ *   status  引擎节拍（最淡）                generic 其余
+ */
+function receiptVariant(item, toolName) {
+  const n = String(toolName || "").toLowerCase();
+  const kind = String(item.kind || "");
+  if (kind === "status") return "status";
+  if (kind === "file_change") return "file";
+  if (/^(write|edit|create|apply_patch|delete|mkdir|move|copy)$/.test(n)) return "file";
+  if (/^(read|ls|glob|grep|list_dir|list_files|find|cat)$/.test(n)) return "explore";
+  if (/^(bash|shell|exec|sh)$/.test(n) || n.startsWith("exec_")) return "exec";
+  if (n.includes("search") || n === "fetch" || n === "web") return "web";
+  if (n.startsWith("mcp")) return "mcp";
+  if (/plan|todo|checklist/.test(n)) return "plan";
+  return "generic";
+}
+
+/** 回执徽标：只放客户真用得上的（耗时 / 非零退出码），没有就空着 */
+function receiptMetaZh(item) {
+  const meta = item.metadata && typeof item.metadata === "object" ? item.metadata : {};
+  const parts = [];
+  const duration = Number(meta.duration_ms);
+  if (Number.isFinite(duration) && duration > 0) {
+    parts.push(duration >= 1000 ? (duration / 1000).toFixed(1) + "s" : Math.round(duration) + "ms");
+  }
+  const code = meta.exit_code;
+  if (code !== undefined && code !== null && Number(code) !== 0) parts.push("退出码 " + code);
+  return parts.join(" · ");
+}
+
+/** 给任何一条回执补齐 variant / meta（MCP、工作流这些早返分支也要带上） */
+function finishReceipt(presentation, item) {
+  const meta = item.metadata && typeof item.metadata === "object" ? item.metadata : {};
+  if (!presentation.variant) {
+    presentation.variant = receiptVariant(item, String(meta.tool_name || meta.tool || ""));
+  }
+  if (presentation.meta === undefined) presentation.meta = receiptMetaZh(item);
+  return presentation;
+}
+
 export function receiptPresentation(item = {}) {
   const detail = String(item.detail || item.summary || "");
   const raw = String(item.summary || detail || humanize(item.kind));
   const fullRaw = detail && detail !== raw ? `${raw}\n\n${detail}` : raw;
   const workflow = workflowReceiptPresentation(item, detail, fullRaw);
-  if (workflow) return workflow;
+  if (workflow) return finishReceipt(workflow, item);
   const mcpFailure = raw.match(/Failed to connect MCP server ['"]?([^'":\s]+)['"]?/i);
   if (mcpFailure) {
     const server = mcpFailure[1] || "server";
-    return {
+    return finishReceipt({
       label: "MCP · 不可用",
       summary: `${server} 连不上`,
       raw,
       failed: true,
-    };
+      variant: "mcp",
+    }, item);
   }
   const failed = item.status === "failed" || /^(?:error|failed|failure)\b/i.test(raw);
   // AsBudy：先给「做了什么」；失败时把「未完成」缀在后面（具体原因仍在 raw / 折叠里）
   const meta = item.metadata && typeof item.metadata === "object" ? item.metadata : {};
-  const intent = toolIntentZh(String(meta.tool_name || meta.tool || ""), meta.tool_input);
+  const toolName = String(meta.tool_name || meta.tool || "");
+  const intent = toolIntentZh(toolName, meta.tool_input);
   // 进度卡是引擎自己发的状态句（英文硬编码）→ 显示层译一道；译不出就用原文
   const statusZh = item.kind === "status" ? engineStatusZh(raw) : null;
   return {
@@ -546,6 +596,8 @@ export function receiptPresentation(item = {}) {
     summary: intent ? (failed ? `${intent} —— 未完成` : intent) : (statusZh || raw),
     raw: fullRaw,
     failed,
+    variant: receiptVariant(item, toolName),
+    meta: receiptMetaZh(item),
   };
 }
 
@@ -583,6 +635,7 @@ export function workflowReceiptPresentation(item, detail, raw) {
     summary,
     raw,
     failed: true,
+    variant: "plan",
   };
 }
 
@@ -1638,7 +1691,11 @@ function startBrowserClient() {
       label.dataset.itemPart = "label";
       const summary = element("span", "receipt-summary");
       summary.dataset.itemPart = "summary";
-      copy.append(label, summary);
+      // AsBudy：徽标位（耗时 / 非零退出码）—— 形态区分见 receiptVariant / asbudy-my.js 的 CSS
+      const meta = element("span", "receipt-meta");
+      meta.dataset.itemPart = "meta";
+      meta.hidden = true;
+      copy.append(label, summary, meta);
       card.append(copy);
     }
     card.dataset.itemId = item.id;
@@ -1672,8 +1729,16 @@ function startBrowserClient() {
 
     const presentation = receiptPresentation(item);
     card.className = `receipt ${presentation.failed ? "failed" : ""}`.trim();
+    // AsBudy：按形态上色/排版（exec 等宽、file 高亮、status 降噪…，规则见 asbudy-my.js）
+    card.dataset.variant = presentation.variant || "generic";
     setTextIfChanged(card.querySelector('[data-item-part="label"]'), presentation.label);
     setTextIfChanged(card.querySelector('[data-item-part="summary"]'), presentation.summary);
+    // 徽标（耗时/退出码）：老卡片可能还没这个节点，取不到就跳过
+    const metaEl = card.querySelector('[data-item-part="meta"]');
+    if (metaEl) {
+      setTextIfChanged(metaEl, presentation.meta || "");
+      metaEl.hidden = !presentation.meta;
+    }
     const copy = card.querySelector(".receipt-copy");
     let disclosure = copy.querySelector("details");
     if (presentation.raw && presentation.raw !== presentation.summary) {
