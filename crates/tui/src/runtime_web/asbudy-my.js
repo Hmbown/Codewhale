@@ -2250,30 +2250,51 @@
     // 为什么要门卫算：官方 CLI 状态栏有 `ctx NN%`，但那是引擎**进程内部状态**，web 拿不到；
     // 门卫复刻了引擎同一套窗口规则（按模型名查表），所以换模型会自动跟着变，不用人工设。
     // 不猜：门卫拿不到窗口或没数据时返回 available:false，这里就不显示。
-    // ── 「正在做什么」实时状态（2026-09-18 · 老板：「不像 cli 版那样让人清楚知道进度」）──
+    // ── 「正在做什么」实时状态（2026-09-18 老板：「不像 cli 版那样让人清楚知道进度」）──
     // CLI 的进度感来自底部那条**实时状态行**（在跑什么 / 跑了多久 / 按 Esc 能打断）；
-    // web 以前只有一串「事后回执」，看不到此刻在干什么。
-    // 数据引擎早就推过来了（item.started / tool_call.requested）——只是没人拿它做状态显示；
-    // app.mjs 现在把这几个事件广播出来（见那边的 ACTIVITY_EVENTS），这里接上。
-    // ⚠️ 拿不到工具名就退成「正在处理」，不猜、不编。
+    // web 以前只有一串「事后回执」。数据引擎早就推过来了 —— 这里接上。
+    //
+    // ★ 2026-09-19 老板：「我们对齐官方 cli 版就是了，不用创新」—— 词表与粒度全部改回 CLI 的：
+    //   CLI 是 `LiveActivityKind`（`tui/underwater.rs:440-512` 的 `label()`），注释原文
+    //   *"deliberately stays smaller than the tool taxonomy"* —— **刻意只按「族」分**：
+    //     读/找类（ToolFamily::Read|Find）→ 读取中；验证类（Verify）→ 校验中；
+    //     子代理 → 正在使用子代理；其余工具 → 使用工具中；思考 → 推理中；其余 → 工作中。
+    //   文案取 CLI 自己的中文翻译（`localization/locales/zh-Hans.json`）：
+    //     PhaseWorking=工作中 · PhaseReasoning=推理中 · PhaseReading=读取中 ·
+    //     PhaseUsingTool=使用工具中 · PhaseSubagents=正在使用子代理 · PhaseVerifying=校验中 ·
+    //     PhaseWaitingOnYou=等你处理 · ContextManualCompacting=正在压缩上下文…
+    //   ⚠️ 别按具体工具名发明新词（我们原来那套「正在执行命令 / 正在写文件 / 正在查资料」
+    //     就是自己分的 —— 也正是它跟转录里的工具卡撞车：那条报的是「具体工具 + 秒数」）。
     var LIVE = { active: false, since: 0, what: '' };
+    // 族名表都收着：引擎给的名字加上 CLI 的规范名，两边都能认。
+    var READ_TOOLS = ['read', 'read_file', 'ls', 'list_dir', 'glob', 'grep', 'grep_files', 'find',
+      'file_search', 'cat', 'view_image', 'web', 'web_search', 'fetch', 'fetch_url', 'search',
+      'registry_sync', 'git_status', 'git_diff', 'git_log', 'git_show', 'git_blame'];
+    var VERIFY_TOOLS = ['run_tests', 'run_verifiers', 'task_gate_run', 'validate_data',
+      'wait_for_dev_server', 'test'];
+    var SUBAGENT_TOOLS = ['agent', 'subagent', 'workflow', 'fleet', 'dispatch'];
     function liveWordFor(name) {
       var n = String(name || '').toLowerCase();
-      if (!n) return '正在处理';
-      if (n === 'bash' || n === 'shell' || n.indexOf('exec') === 0) return '正在执行命令';
-      if (n === 'write' || n === 'edit' || n === 'create' || n === 'apply_patch') return '正在写文件';
-      if (n === 'read' || n === 'ls' || n === 'glob' || n === 'grep') return '正在查看文件';
-      if (n.indexOf('search') >= 0 || n === 'fetch' || n === 'web') return '正在查资料';
-      if (n === 'workflow' || n === 'subagent' || n === 'agent') return '正在派活';
-      return '正在' + name;
+      if (!n) return '工作中';
+      if (VERIFY_TOOLS.indexOf(n) >= 0) return '校验中';
+      if (SUBAGENT_TOOLS.indexOf(n) >= 0) return '正在使用子代理';
+      if (READ_TOOLS.indexOf(n) >= 0) return '读取中';
+      return '使用工具中';
+    }
+    /** 时长照 CLI 的 `format_elapsed_secs`（`crates/tui/src/elapsed.rs:22`）：
+     *  <60s → `12s`；≥60s → `1m 15s`。格式也照 CLI：`{阶段词} {时长}`（空格，不加分隔符）。 */
+    function fmtElapsed(secs) {
+      secs = Math.max(0, Math.round(secs));
+      if (secs < 60) return secs + 's';
+      return Math.floor(secs / 60) + 'm ' + String(secs % 60).padStart(2, '0') + 's';
     }
     function liveTick() {
       var el = document.getElementById('asbudy-live');
       if (!el) return;
       if (!LIVE.active) { el.hidden = true; el.textContent = ''; return; }
-      var secs = Math.max(0, Math.round((Date.now() - LIVE.since) / 1000));
+      var secs = (Date.now() - LIVE.since) / 1000;
       el.hidden = false;
-      el.textContent = LIVE.what + ' · ' + secs + 's';
+      el.textContent = LIVE.what + ' ' + fmtElapsed(secs);
     }
     function liveSet(what) {
       LIVE.active = true;
@@ -2291,23 +2312,23 @@
       var d = (e && e.detail) || {};
       var ev = d.event;
       var p = d.payload || {};
-      if (ev === 'turn.started') { LIVE.since = Date.now(); liveSet('正在处理'); return; }
+      if (ev === 'turn.started') { LIVE.since = Date.now(); liveSet('工作中'); return; }
       if (ev === 'turn.completed') { liveStop(); return; }
       if (ev === 'item.started') {
         var toolName = (p.tool && p.tool.name) || '';
         var kind = (p.item && p.item.kind) || '';
         if (toolName) liveSet(liveWordFor(toolName));
-        else if (kind === 'agent_reasoning') liveSet('正在思考');
-        else if (kind === 'agent_message') liveSet('正在写回复');
-        else liveSet('正在处理');
+        else if (kind === 'agent_reasoning') liveSet('推理中');
+        else if (kind === 'context_compaction') liveSet('正在压缩上下文…');
+        else liveSet('工作中');            // CLI：写回复也算 Working，不另立一个词
         return;
       }
       if (ev === 'tool_call.requested') {
-        // 待确认的动态工具调用（等客户点）——把状态说清楚，别看着像卡住
-        liveSet('等你确认');
+        // 待确认的动态工具调用（等客户点）——CLI 的 `PhaseWaitingOnYou`（中文「等你处理」）
+        liveSet('等你处理');
         return;
       }
-      if (ev === 'tool_call.resolved') { if (LIVE.active) liveSet('正在处理'); }
+      if (ev === 'tool_call.resolved') { if (LIVE.active) liveSet('使用工具中'); }
     });
 
     function fmtK(n) {

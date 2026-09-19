@@ -486,7 +486,9 @@ function receiptLabelZh(kind, status) {
 export const RUNNING_BADGE_AFTER_SECS = 3;
 
 export function runningElapsedSuffix(item) {
-  // 只给「还在跑」的工具/思考卡加徽标；已完成、状态句、消息不进这里。
+  // 只给「还在跑」的工具卡加徽标；已完成、状态句、消息不进这里。
+  // 照 CLI `bash running (3s)`（`history.rs:2654`）。思考卡不用它 —— CLI 的 reasoning
+  // 只在**完成后**拼时长（`… reasoning done · 521ms`），进行中只有 `live`。
   if (!item || item.status !== "in_progress" || item.kind === "status") return "";
   const started = Date.parse(item.started_at || "");
   if (!Number.isFinite(started)) return "";
@@ -664,13 +666,6 @@ function receiptMetaZh(item) {
   const code = meta.exit_code;
   if (code !== undefined && code !== null && Number(code) !== 0) parts.push("退出码 " + code);
   return parts.join(" · ");
-}
-
-/** 回执类 item（工具 / 文件改动 / 进度 / 出错 / 整理对话…）—— 不是消息、不是思考。
- *  用来判断「进行中的这一条该不该落进转录」（见 renderTranscript 里的说明）。 */
-export function isReceiptItem(item) {
-  const kind = String((item && item.kind) || "");
-  return kind !== "user_message" && kind !== "agent_message" && kind !== "agent_reasoning";
 }
 
 /** 给任何一条回执补齐 variant / meta（MCP、工作流这些早返分支也要带上） */
@@ -1760,13 +1755,13 @@ function startBrowserClient() {
       // ⚠️ 只去这一类：工具（exec/file/explore/web/mcp）、思考、回复、出错、文件改动、
       //    整理对话 都照旧渲染 —— 那些是客户要看的东西，不是状态。
       if (item.kind === "status") continue;
-      // AsBudy（2026-09-19 老板）：「工具 · 进行中 (3s)」跟上方那条实时状态行
-      // （asbudy-my.js 的 #asbudy-live：「正在执行命令 · 3s」）是**同一件事显示两遍**。
-      // 照官方 CLI 的 active cell 语义（`tui/active_cell.rs`：进行中的工具/思考聚合成一个
-      // 可变的活动单元，**结束后才落进转录**）—— 进行中的回执**不落进对话区**，
-      // 跑完（完成/失败/打断）自然出现，成为一条完整记录。跑的时候上方状态行照样在报。
-      // ⚠️ 只挡回执：消息（user/agent）与思考卡照旧（AI 正在写的回复必须实时看到）。
-      if (item.status === "in_progress" && isReceiptItem(item)) continue;
+      // ⚠️ 2026-09-19 回滚一次错方向：我曾把「进行中的回执」也挡在转录外，理由是与上方状态行重复。
+      //   查了官方 CLI 才发现**错的是上面那条状态行、不是这里的卡片**：
+      //   · CLI 的转录里工具卡在跑时**是显示的**（`⠋ bash running (3s) · 摘要`，`history.rs:2654`）
+      //   · CLI 的底部条（posture bar）只报**阶段**（`使用工具中 12s`，`underwater.rs:616`）
+      //   ⇒ 两者层级不同、不重复。真正重复的是我们自创的上方状态行**用了工具级描述**
+      //     （「正在执行命令」）—— 已改成 CLI 的阶段词（见 asbudy-my.js 的 liveWordFor）。
+      //   ⇒ 所以卡片照旧落进转录。老板：「我们对齐官方 cli 版就是了，不用创新」
       let node = existing.get(itemId);
       if (!node || !updateItemNode(node, item)) node = renderItem(item);
       observeTranscriptItem(node);
@@ -1990,11 +1985,14 @@ function startBrowserClient() {
       return true;
     }
     if (item.kind === "agent_reasoning") {
+      // 照官方 CLI（`history/thinking.rs:148-170`）：进行中是 `… reasoning live` —— **不带秒数**
+      // （时长只在完成后拼：`… reasoning done · 521ms`）。我们的上方状态行已经有「推理中 12s」，
+      // 这里再写一个秒数就是同一件事两遍（老板 2026-09-19「1 做了」）。
       setTextIfChanged(
         card.querySelector('[data-item-part="summary"]'),
         item.status === "in_progress"
-          ? "思考中…" + runningElapsedSuffix(item)
-          : "思考过程" + completedElapsedSuffix(item),      // 照 CLI 的 `… reasoning done · 521ms`
+          ? "思考中…"
+          : "思考过程" + completedElapsedSuffix(item),
       );
       setTextIfChanged(card.querySelector('[data-item-part="detail"]'), detail);
       // 收起时的预览（照官方 thinking_preview_lines，见 THINKING_PREVIEW_LINES）：
@@ -2076,7 +2074,9 @@ function startBrowserClient() {
   }
 
   /* 每秒刷新「正在跑」的徽标 —— 对齐 CLI（它的 `running (Ns)` 也是每秒 tick）。
-   * 只在真有进行中的 turn 时才碰 DOM；没在跑就立刻返回，零开销。 */
+   * 只在真有进行中的 turn 时才碰 DOM；没在跑就立刻返回，零开销。
+   * ⚠️ 2026-09-19：中途我误删过一次（以为卡片都不显示了）—— 现已恢复：工具卡照旧带秒数
+   *   （CLI `bash running (3s)`）；思考卡不带（CLI 是 `… reasoning live`，时长只在完成后拼）。 */
   function refreshRunningBadges() {
     if (!dom.transcript) return;
     let busy = false;
@@ -2089,9 +2089,7 @@ function startBrowserClient() {
       if (!id) continue;
       const item = app.threadState.items.get(id);
       if (!item || item.status !== "in_progress") continue;
-      if (item.kind === "agent_reasoning") {
-        setTextIfChanged(node.querySelector('[data-item-part="summary"]'), "思考中…" + runningElapsedSuffix(item));
-      } else if (node.classList.contains("receipt")) {
+      if (node.classList.contains("receipt")) {
         setTextIfChanged(
           node.querySelector('[data-item-part="label"]'),
           receiptPresentation(item).label + runningElapsedSuffix(item),
