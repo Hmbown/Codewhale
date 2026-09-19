@@ -6027,6 +6027,12 @@ fn map_compat_stream_event(event: &crate::runtime_threads::RuntimeEventRecord) -
                     "tool_name": payload.get("tool_name"),
                     "description": payload.get("description"),
                     "intent_summary": payload.get("intent_summary"),
+                    // Forwarded so a browser client can offer "don't ask again
+                    // for this kind of action" the same way the TUI does:
+                    // store `approval_grouping_key` (the lossy, family-scoped
+                    // fingerprint), never the tool name.
+                    "approval_key": payload.get("approval_key"),
+                    "approval_grouping_key": payload.get("approval_grouping_key"),
                 }),
             ))
         }

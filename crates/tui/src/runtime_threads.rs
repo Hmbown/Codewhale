@@ -3369,6 +3369,17 @@ pub struct PendingApprovalRequest {
     /// matches `id` only, so this value settles nothing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    /// Exact-argument fingerprint (mirrors `approval_key` on the event).
+    /// Clients use it to scope *denials*.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_key: Option<String>,
+    /// Lossy / arity-aware fingerprint (mirrors `approval_grouping_key`).
+    /// This is the value a client stores for "don't ask again for this kind of
+    /// action": it covers the command family / host / patch paths, **never**
+    /// the bare tool name (approving one shell command must not grant the
+    /// whole shell tool — ops R2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_grouping_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -5514,6 +5525,8 @@ impl RuntimeThreadManager {
                 // Stands in for the provider's raw call ID so tests can prove
                 // the correlator is visible and still not deliverable.
                 tool_call_id: Some(label.to_string()),
+                approval_key: None,
+                approval_grouping_key: None,
             },
         )
     }
@@ -11375,6 +11388,8 @@ impl RuntimeThreadManager {
                     tool_name,
                     description,
                     intent_summary,
+                    approval_key,
+                    approval_grouping_key,
                     ..
                 } => {
                     let Some(authority) = self
@@ -11399,6 +11414,8 @@ impl RuntimeThreadManager {
                         description: description.clone(),
                         intent_summary: intent_summary.clone(),
                         tool_call_id: Some(id.clone()),
+                        approval_key: Some(approval_key.clone()),
+                        approval_grouping_key: Some(approval_grouping_key.clone()),
                     };
 
                     if auto_approve {
@@ -11420,6 +11437,8 @@ impl RuntimeThreadManager {
                                 "tool_name": tool_name,
                                 "description": description,
                                 "intent_summary": intent_summary,
+                                "approval_key": approval_key.clone(),
+                                "approval_grouping_key": approval_grouping_key.clone(),
                             }),
                         )
                         .await?;
@@ -11504,6 +11523,8 @@ impl RuntimeThreadManager {
                                 "tool_name": tool_name,
                                 "description": description,
                                 "intent_summary": intent_summary,
+                                "approval_key": approval_key.clone(),
+                                "approval_grouping_key": approval_grouping_key.clone(),
                             }),
                         )
                         .await
