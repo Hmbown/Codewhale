@@ -1215,6 +1215,39 @@ manager, the durable thread store, the workspace confinement layer, the
 config's credential plumbing — and add no second runtime, session store,
 scheduler, or credential store.
 
+**Terminal sessions** (the persistent Engine-owned shell)
+
+The jobs family above runs one command per job. A terminal pane needs the
+*other* authority: the stateful PTY-backed shell the agent's own terminal
+tools drive, which keeps cwd and environment across inputs. These routes
+attach to that session and never create one — a name with no live session is
+`404`, because conjuring a shell from an HTTP request would give the client a
+terminal the Engine does not know about. Input is attributable by route:
+`input` is the client's writer, `terminal_send` is the agent's.
+
+- `GET /v1/terminal/{name}/output?cursor=<bytes>&max_bytes=<1-64KiB>&format=
+  <base64|text>` — the resumable byte stream. `{name, offset, next_cursor,
+  total, dropped, encoding, data, running, exit_code}`: pass `next_cursor`
+  back to continue; reads never consume, so several clients may hold
+  independent cursors; `dropped` reports bytes the 512 KiB ring discarded
+- `POST /v1/terminal/{name}/input` — `{ "data", "encoding"? }`, UTF-8 text by
+  default or `base64` for exact bytes → `{ "name", "written" }`
+- `POST /v1/terminal/{name}/resize` — `{ "rows", "cols" }` → the kernel
+  window the child draws for
+- `POST /v1/terminal/{name}/kill` — end the shell; observe the exit through
+  `output` (`running` / `exit_code`) rather than the acknowledgement
+
+`GET /v1/runtime/info` advertises `terminal_stream`, `terminal_input`,
+`terminal_resize` and `terminal_kill`. All four are `false` on Windows builds
+today: the owner is Unix-only, the Windows routes answer `501`, and a client
+should gate its terminal controls on these flags rather than discovering it
+from a failed request. Known limitations, stated because a reader would
+otherwise assume them: there is no `wait_ms` long poll (poll the cursor),
+scrollback dropped by the ring is gone with the process, a restarted Engine
+reports no session rather than pretending to reattach, and the
+`@codewhale/runtime-sdk` package has no terminal client wrapper yet — the raw
+routes are the contract for now.
+
 **Jobs** (operator-scoped shell jobs; the terminal surface)
 - `GET /v1/jobs` — every live and known-stale job across all threads
 - `GET /v1/threads/{id}/jobs` — jobs owned by one thread's manager:

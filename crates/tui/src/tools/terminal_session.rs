@@ -35,6 +35,11 @@ use super::spec::{optional_u64, required_str};
 const BUFFER_LIMIT: usize = 512 * 1024;
 #[cfg(unix)]
 const OUTPUT_LIMIT: usize = 12 * 1024;
+/// Ceiling for one [`OutputBuffer::read_since`] response. The ring is already
+/// bounded at [`BUFFER_LIMIT`]; this bounds a single frame so a client cannot
+/// ask for the whole window at once.
+#[cfg(unix)]
+pub(crate) const READ_LIMIT: usize = 64 * 1024;
 #[cfg(unix)]
 const DEFAULT_TIMEOUT_SECS: u64 = 120;
 #[cfg(unix)]
@@ -45,8 +50,12 @@ const CANCEL_CONFIRM_TIMEOUT: Duration = Duration::from_secs(2);
 const CANCEL_SENTINEL_RETRY_INTERVAL: Duration = Duration::from_millis(50);
 
 #[cfg(unix)]
-struct TerminalSession {
+pub(crate) struct TerminalSession {
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
+    /// The pty master is retained after the reader and writer clones are taken
+    /// so [`TerminalSession::resize`] can reach the kernel's window size. The
+    /// clones keep the pty alive; nothing else clones the master.
+    master: Box<dyn portable_pty::MasterPty + Send>,
     child: Box<dyn portable_pty::Child + Send>,
     output: Arc<Mutex<OutputBuffer>>,
     read_cursor: u64,
@@ -110,6 +119,33 @@ struct OutputBuffer {
     total: u64,
 }
 
+/// One absolute-offset slice of a session's output.
+///
+/// Offsets are absolute for the life of the live PTY: they count every byte
+/// the reader thread ever appended, not the bytes still retained. That is what
+/// lets a client resume from a cursor it stored earlier, and what lets this
+/// type tell it the truth when the retained window has moved past it.
+///
+/// Field names match the `/v1/terminal/{name}/output` wire so the payload is a
+/// projection, not a translation (the same vocabulary the jobs byte stream
+/// uses).
+#[cfg(unix)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct OutputChunk {
+    pub(crate) bytes: Vec<u8>,
+    /// Absolute offset of `bytes[0]` in the session's lifetime output.
+    pub(crate) offset: u64,
+    /// Offset to pass as the next `cursor`.
+    pub(crate) next_cursor: u64,
+    /// Every byte the session has produced, retained or not.
+    pub(crate) total: u64,
+    /// Leading bytes the ring has permanently discarded.
+    pub(crate) dropped: u64,
+    /// True when the requested cursor predates the retained window. The bytes
+    /// in between cannot be recovered from this process — report, not repair.
+    pub(crate) gap: bool,
+}
+
 #[cfg(unix)]
 impl OutputBuffer {
     fn append(&mut self, data: &[u8]) {
@@ -123,10 +159,37 @@ impl OutputBuffer {
     fn text(&self) -> String {
         String::from_utf8_lossy(&self.bytes.iter().copied().collect::<Vec<_>>()).into_owned()
     }
+
+    /// Absolute offset of the oldest retained byte.
+    fn oldest(&self) -> u64 {
+        self.total.saturating_sub(self.bytes.len() as u64)
+    }
+
+    /// Read from an absolute cursor without consuming: the caller owns its own
+    /// position, so two readers can replay the same bytes and a repeated read
+    /// is idempotent. Does not advance `read_cursor` — the consuming
+    /// tool-result path is untouched. This is the cursor arithmetic only;
+    /// response-size policy belongs to the caller.
+    fn read_since(&self, cursor: u64, max_bytes: usize) -> OutputChunk {
+        let dropped = self.oldest();
+        let gap = cursor < dropped;
+        let start = cursor.max(dropped);
+        let skip = usize::try_from(start - dropped).unwrap_or(usize::MAX);
+        let take = max_bytes.min(self.bytes.len().saturating_sub(skip));
+        let bytes = self.bytes.iter().skip(skip).take(take).copied().collect();
+        OutputChunk {
+            bytes,
+            offset: start,
+            next_cursor: start + take as u64,
+            total: self.total,
+            dropped,
+            gap,
+        }
+    }
 }
 
 #[cfg(unix)]
-type SharedSession = Arc<Mutex<TerminalSession>>;
+pub(crate) type SharedSession = Arc<Mutex<TerminalSession>>;
 
 #[cfg(unix)]
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
@@ -341,6 +404,7 @@ fn create_session(
 
     Ok(Arc::new(Mutex::new(TerminalSession {
         writer: Arc::new(Mutex::new(writer)),
+        master: pair.master,
         child,
         output,
         read_cursor: 0,
@@ -352,7 +416,7 @@ fn create_session(
 }
 
 #[cfg(unix)]
-fn get_or_create(
+pub(crate) fn get_or_create(
     name: &str,
     workspace: &std::path::Path,
     policy: crate::sandbox::SandboxPolicy,
@@ -408,7 +472,7 @@ fn find(name: &str, workspace: &Path) -> Result<SharedSession, String> {
 }
 
 #[cfg(unix)]
-fn write_bytes(session: &TerminalSession, bytes: &[u8]) -> Result<(), String> {
+pub(crate) fn write_bytes(session: &TerminalSession, bytes: &[u8]) -> Result<(), String> {
     let mut writer = session
         .writer
         .lock()
@@ -433,12 +497,84 @@ fn take_output(session: &mut TerminalSession) -> String {
     let Ok(output) = session.output.lock() else {
         return String::new();
     };
-    let retained_start = output.total.saturating_sub(output.bytes.len() as u64);
-    let start = session.read_cursor.max(retained_start);
-    let skip = usize::try_from(start.saturating_sub(retained_start)).unwrap_or(usize::MAX);
-    let bytes = output.bytes.iter().skip(skip).copied().collect::<Vec<_>>();
+    let chunk = output.read_since(session.read_cursor, usize::MAX);
     session.read_cursor = output.total;
-    String::from_utf8_lossy(&bytes).into_owned()
+    String::from_utf8_lossy(&chunk.bytes).into_owned()
+}
+
+/// Resize the live pty's window. The kernel updates its `winsize` and signals
+/// the child, which is what makes an interactive app redraw at the new size.
+#[cfg(unix)]
+pub(crate) fn resize_session(
+    session: &TerminalSession,
+    rows: u16,
+    cols: u16,
+) -> Result<(), String> {
+    session
+        .master
+        .resize(portable_pty::PtySize {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .map_err(|e| format!("PTY resize failed: {e}"))
+}
+
+/// Absolute-offset, non-consuming read. `max_bytes` is clamped to
+/// [`READ_LIMIT`] so one caller cannot ask for the whole retained window.
+///
+/// Known limitation: this reports a [`OutputChunk::gap`]; it does not repair
+/// one. Bytes dropped by the ring are gone with the process, and nothing here
+/// re-reads them from disk — the durable record is identity and lifecycle,
+/// never output.
+#[cfg(unix)]
+pub(crate) fn read_session_since(
+    session: &TerminalSession,
+    cursor: u64,
+    max_bytes: usize,
+) -> Result<OutputChunk, String> {
+    let output = session
+        .output
+        .lock()
+        .map_err(|_| "terminal output lock poisoned".to_string())?;
+    Ok(output.read_since(cursor, max_bytes.min(READ_LIMIT)))
+}
+
+/// Poll the shell without blocking; `None` means it is still running.
+#[cfg(unix)]
+pub(crate) fn session_exit_status(
+    session: &mut TerminalSession,
+) -> Result<Option<portable_pty::ExitStatus>, String> {
+    session
+        .child
+        .try_wait()
+        .map_err(|e| format!("PTY wait failed: {e}"))
+}
+
+/// Terminate the shell. The caller still observes the exit through
+/// [`session_exit_status`].
+#[cfg(unix)]
+pub(crate) fn kill_session(session: &mut TerminalSession) -> Result<(), String> {
+    session
+        .child
+        .kill()
+        .map_err(|e| format!("PTY kill failed: {e}"))
+}
+
+/// Resolve a live session without creating one.
+///
+/// `/v1/terminal` attaches to shells the Engine already owns (the agent's
+/// terminal tools create them). A request for a name that has no live session
+/// is a 404, never a new process: an HTTP client must not be able to conjure a
+/// shell the Engine does not know about.
+#[cfg(unix)]
+pub(crate) fn lookup(name: &str, workspace: &Path) -> Option<SharedSession> {
+    let key = session_key(name, workspace);
+    sessions()
+        .lock()
+        .ok()
+        .and_then(|registry| registry.get(&key).map(Arc::clone))
 }
 
 #[cfg(unix)]
@@ -1210,5 +1346,142 @@ mod tests {
         let result = run(&session, "yes x | head -n 100000", Duration::from_secs(3));
         assert!(result.content.len() <= OUTPUT_LIMIT + 100);
         assert!(result.content.contains("output truncated"));
+    }
+
+    /// The cursor contract the Engine byte stream rides on: offsets are
+    /// absolute for the life of the PTY, reads never consume, and a cursor the
+    /// retained window has moved past is reported rather than silently
+    /// answered from the middle of the stream.
+    #[test]
+    #[cfg(unix)]
+    fn bounded_replay_is_absolute_non_consuming_and_reports_its_gap() {
+        let mut buffer = OutputBuffer::default();
+        buffer.append(b"hello");
+        let first = buffer.read_since(0, 4);
+        assert_eq!(first.bytes, b"hell");
+        assert_eq!(first.offset, 0);
+        assert_eq!(first.next_cursor, 4);
+        assert_eq!(first.total, 5);
+        assert_eq!(first.dropped, 0);
+        assert!(!first.gap);
+        // A second read at the same cursor returns the same bytes: the caller
+        // owns the position, so replay is idempotent.
+        assert_eq!(buffer.read_since(0, 4), first);
+        let rest = buffer.read_since(first.next_cursor, 4);
+        assert_eq!(rest.bytes, b"o");
+        assert_eq!(rest.offset, 4);
+        assert_eq!(rest.next_cursor, 5);
+
+        // Past the ring: the first 32 bytes are gone and the chunk says so.
+        let mut wrapped = OutputBuffer::default();
+        wrapped.append(&vec![b'x'; BUFFER_LIMIT + 32]);
+        let lost = wrapped.read_since(0, 8);
+        assert!(lost.gap, "a cursor below the retained window is a gap");
+        assert_eq!(lost.dropped, 32);
+        assert_eq!(
+            lost.offset, 32,
+            "the chunk starts at the oldest retained byte"
+        );
+        assert_eq!(lost.total, BUFFER_LIMIT as u64 + 32);
+        assert_eq!(lost.bytes, vec![b'x'; 8]);
+        assert_eq!(lost.next_cursor, 40);
+
+        // A cursor at the head is not a gap and returns nothing new.
+        let current = wrapped.read_since(BUFFER_LIMIT as u64 + 32, 8);
+        assert!(!current.gap);
+        assert!(current.bytes.is_empty());
+        assert_eq!(current.next_cursor, BUFFER_LIMIT as u64 + 32);
+    }
+
+    /// The session-level entry point an Engine byte stream will call: absolute
+    /// cursor, non-consuming, clamped, and honest about a cursor ahead of the
+    /// stream.
+    #[test]
+    #[cfg(unix)]
+    fn session_read_since_is_non_consuming_and_clamped() {
+        let session = fresh("test-read-since");
+        let _ = run(
+            &session,
+            "printf 'cw-replay-proof\\n'",
+            Duration::from_secs(3),
+        );
+        // The tool-result path already consumed this output through its own
+        // cursor; an absolute cursor still reads it, which is the point.
+        let printed = read_session_since(&session.lock().unwrap(), 0, usize::MAX).unwrap();
+        assert!(
+            String::from_utf8_lossy(&printed.bytes).contains("cw-replay-proof"),
+            "{}",
+            String::from_utf8_lossy(&printed.bytes)
+        );
+        let again = read_session_since(&session.lock().unwrap(), 0, usize::MAX).unwrap();
+        assert_eq!(again.bytes, printed.bytes, "a replay read must not consume");
+
+        // A cursor ahead of the stream is not a gap: nothing was lost, there
+        // is simply nothing there yet.
+        let ahead =
+            read_session_since(&session.lock().unwrap(), printed.next_cursor + 4096, 16).unwrap();
+        assert!(!ahead.gap);
+        assert!(ahead.bytes.is_empty());
+        assert_eq!(ahead.next_cursor, printed.next_cursor + 4096);
+
+        // More than one response's worth of output proves the clamp.
+        let large = fresh("test-read-since-clamp");
+        let _ = run(&large, "yes x | head -n 100000", Duration::from_secs(3));
+        let chunk = read_session_since(&large.lock().unwrap(), 0, usize::MAX).unwrap();
+        assert_eq!(chunk.bytes.len(), READ_LIMIT);
+        assert!(!chunk.gap);
+        assert_eq!(chunk.next_cursor, READ_LIMIT as u64);
+    }
+
+    /// Resize has to reach the kernel, not just a field: `get_size` reads the
+    /// window back from the pty, and the shell reports it through `stty`.
+    #[test]
+    #[cfg(unix)]
+    fn resize_reaches_the_kernel_and_the_live_shell() {
+        let session = fresh("test-resize");
+        {
+            let guard = session.lock().unwrap();
+            assert_eq!(guard.master.get_size().unwrap().rows, 24);
+        }
+        resize_session(&session.lock().unwrap(), 40, 100).unwrap();
+        let size = session.lock().unwrap().master.get_size().unwrap();
+        assert_eq!((size.rows, size.cols), (40, 100));
+        let result = run(&session, "stty size", Duration::from_secs(3));
+        assert!(
+            result.content.contains("40 100"),
+            "the shell should see the new window: {}",
+            result.content
+        );
+    }
+
+    /// Exit is observable: a killed shell reports a status instead of looking
+    /// alive forever (the "pretending to reattach" failure the durable record
+    /// is written to avoid).
+    #[test]
+    #[cfg(unix)]
+    fn killed_shell_reports_an_exit_status() {
+        let session = fresh("test-exit-status");
+        {
+            let mut guard = session.lock().unwrap();
+            assert!(
+                session_exit_status(&mut guard).unwrap().is_none(),
+                "fresh shell is alive"
+            );
+            kill_session(&mut guard).unwrap();
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let exited = session_exit_status(&mut session.lock().unwrap())
+                .unwrap()
+                .is_some();
+            if exited {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "a killed shell must report its exit"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 }

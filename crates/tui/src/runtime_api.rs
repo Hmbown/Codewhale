@@ -12,7 +12,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use async_stream::stream;
 use axum::extract::{ConnectInfo, DefaultBodyLimit, Path, Query, Request, State};
 use axum::http::header;
-use axum::http::{HeaderName, HeaderValue, Method, StatusCode};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use axum::middleware;
 use axum::response::Html;
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
@@ -108,6 +108,7 @@ mod plugins;
 mod secrets;
 mod sessions;
 mod targets;
+mod terminal;
 mod voice;
 mod web;
 mod workspace;
@@ -587,6 +588,16 @@ fn default_runtime_capabilities() -> RuntimeCapabilities {
         skill_lifecycle: true,
         plugin_management: true,
         agent_mail: true,
+        // SSE journal frames carry their durable `seq` as the event id, and the
+        // thread event stream resumes from `Last-Event-ID`.
+        event_stream_resume: true,
+        // The terminal family is Unix-only in this build: the owner is
+        // `#[cfg(unix)]` end to end and the Windows routes answer 501. A
+        // client must be able to feature-detect that before it offers a pane.
+        terminal_stream: cfg!(unix),
+        terminal_input: cfg!(unix),
+        terminal_resize: cfg!(unix),
+        terminal_kill: cfg!(unix),
     }
 }
 
@@ -837,6 +848,16 @@ struct FleetEventsQuery {
 struct StartTurnResponse {
     thread: ThreadRecord,
     turn: TurnRecord,
+    /// Present only when the durable `operation_key` made this submission a
+    /// replay of one already accepted: the turn is the original and nothing
+    /// new was admitted. Omitted otherwise so every existing response stays
+    /// byte-identical — a client that never sends a key sees no change.
+    #[serde(skip_serializing_if = "replay_flag_is_absent")]
+    idempotent_replay: bool,
+}
+
+fn replay_flag_is_absent(replayed: &bool) -> bool {
+    !*replayed
 }
 
 fn install_runtime_server_workshop_budgets(
@@ -1118,6 +1139,15 @@ pub fn build_router(state: RuntimeApiState) -> Router {
             get(read_session_artifact),
         )
         .route("/v1/workspace/status", get(workspace_status))
+        // The Engine's terminal byte stream (#34). Auth is the route layer's,
+        // not this module's; these never create a session — see terminal.rs.
+        .route("/v1/terminal/{name}/output", get(terminal::terminal_output))
+        .route("/v1/terminal/{name}/input", post(terminal::terminal_input))
+        .route(
+            "/v1/terminal/{name}/resize",
+            post(terminal::terminal_resize),
+        )
+        .route("/v1/terminal/{name}/kill", post(terminal::terminal_kill))
         .route("/v1/workspace/files/search", get(workspace_file_search))
         .route(
             "/v1/workspace/files",
@@ -5333,9 +5363,9 @@ async fn start_thread_turn(
     Path(id): Path<String>,
     Json(req): Json<StartTurnRequest>,
 ) -> Result<(StatusCode, Json<StartTurnResponse>), ApiError> {
-    let turn = state
+    let (turn, replayed) = state
         .runtime_threads
-        .start_turn(&id, req)
+        .start_turn_reporting_replay(&id, req)
         .await
         .map_err(map_thread_err)?;
     let thread = state
@@ -5343,9 +5373,22 @@ async fn start_thread_turn(
         .get_thread(&id)
         .await
         .map_err(map_thread_err)?;
+    // A replay acknowledges work already accepted rather than admitting new
+    // work: 200 tells the client "this is the turn I already started", which
+    // is what lets an ambiguous submit resolve without duplicate messages or
+    // tools. A fresh admission stays 201.
+    let status = if replayed {
+        StatusCode::OK
+    } else {
+        StatusCode::CREATED
+    };
     Ok((
-        StatusCode::CREATED,
-        Json(StartTurnResponse { thread, turn }),
+        status,
+        Json(StartTurnResponse {
+            thread,
+            turn,
+            idempotent_replay: replayed,
+        }),
     ))
 }
 
@@ -5528,7 +5571,11 @@ async fn compact_thread(
         .map_err(map_thread_err)?;
     Ok((
         StatusCode::ACCEPTED,
-        Json(StartTurnResponse { thread, turn }),
+        Json(StartTurnResponse {
+            thread,
+            turn,
+            idempotent_replay: false,
+        }),
     ))
 }
 
@@ -5809,12 +5856,21 @@ async fn stream_thread_events(
     State(state): State<RuntimeApiState>,
     Path(id): Path<String>,
     Query(query): Query<ThreadEventsQuery>,
+    headers: HeaderMap,
 ) -> Result<Response, ApiError> {
     let _ = state
         .runtime_threads
         .get_thread(&id)
         .await
         .map_err(map_thread_err)?;
+
+    // Two clients, two cursors. A browser `EventSource` can only replay through
+    // the `Last-Event-ID` header it sets on reconnect (the ids now ride the
+    // journal frames below); every other client passes `since_seq`. An explicit
+    // query cursor wins over the header, so a deliberate replay-from-zero is
+    // never silently overridden by a stale header — the header is the fallback
+    // when no cursor was asked for.
+    let since_seq = query.since_seq.or_else(|| last_event_id(&headers));
 
     // Subscribe before reading durable history. An event emitted while replay
     // is loaded is then present in both places (and deduped below) or queued
@@ -5830,7 +5886,7 @@ async fn stream_thread_events(
     }
     let replay = state
         .runtime_threads
-        .replay_events(&id, query.since_seq, query.replay_limit)
+        .replay_events(&id, since_seq, query.replay_limit)
         .await
         .map_err(|e| ApiError::internal(e.to_string()))?;
 
@@ -5903,7 +5959,8 @@ fn replay_live_thread_events(
                 yield Ok(sse_json(
                     &event_name,
                     runtime_event_payload_with_previous(event, previous_seq),
-                ));
+                )
+                .id(last_seq.to_string()));
             }
         }
 
@@ -5937,7 +5994,8 @@ fn replay_live_thread_events(
                     yield Ok(sse_json(
                         &event_name,
                         runtime_event_payload_with_previous(event, previous_seq),
-                    ));
+                    )
+                    .id(last_seq.to_string()));
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
                     if progress {
@@ -5987,7 +6045,8 @@ fn replay_live_thread_events(
                             yield Ok(sse_json(
                                 &event_name,
                                 runtime_event_payload_with_previous(event, previous_seq),
-                            ));
+                            )
+                            .id(last_seq.to_string()));
                         }
                     }
                 }
@@ -6521,6 +6580,19 @@ fn map_compat_stream_event(event: &crate::runtime_threads::RuntimeEventRecord) -
 fn sse_json(event: &str, payload: serde_json::Value) -> SseEvent {
     let data = serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string());
     SseEvent::default().event(event).data(data)
+}
+
+/// Read a `Last-Event-ID` cursor off the request.
+///
+/// Only a decimal sequence number is ours. Anything else is ignored rather
+/// than rejected: an opaque id from a proxy or an older client should start
+/// the stream from the durable head, not fail to open it — a refused stream
+/// looks like an outage to a reconnecting client.
+fn last_event_id(headers: &HeaderMap) -> Option<u64> {
+    headers
+        .get("last-event-id")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
 }
 
 fn truncate_text(text: &str, max_chars: usize) -> String {

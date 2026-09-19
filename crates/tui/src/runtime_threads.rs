@@ -5977,6 +5977,7 @@ impl RuntimeThreadManager {
             false,
         )
         .await
+        .map(|(turn, _replayed)| turn)
     }
 
     /// Terminal goal settlement for one finished turn.
@@ -6500,7 +6501,7 @@ impl RuntimeThreadManager {
             .await;
 
         match turn_result {
-            Ok(turn) => {
+            Ok((turn, _replayed)) => {
                 let delivered = {
                     let _mail_mutation = self.store.mail_mutation.lock();
                     let mut envelope = self.store.load_agent_mail(message_id)?;
@@ -9376,6 +9377,22 @@ impl RuntimeThreadManager {
         self.start_turn_inner(thread_id, req, None).await
     }
 
+    /// Start a turn and report whether the durable `operation_key` made it a
+    /// replay of an already-accepted submission.
+    ///
+    /// The distinction belongs to admission, not to the route: a client that
+    /// retried an ambiguous submit needs to be told "this is the turn you
+    /// already started" so it does not render a duplicate, and only the
+    /// admission path knows that for certain.
+    pub async fn start_turn_reporting_replay(
+        &self,
+        thread_id: &str,
+        req: StartTurnRequest,
+    ) -> Result<(TurnRecord, bool)> {
+        self.start_turn_inner_reporting_replay(thread_id, req, None)
+            .await
+    }
+
     pub(crate) async fn start_turn_with_reserved_id(
         &self,
         thread_id: &str,
@@ -9398,6 +9415,17 @@ impl RuntimeThreadManager {
         req: StartTurnRequest,
         reserved_turn_id: Option<&str>,
     ) -> Result<TurnRecord> {
+        self.start_turn_inner_reporting_replay(thread_id, req, reserved_turn_id)
+            .await
+            .map(|(turn, _replayed)| turn)
+    }
+
+    async fn start_turn_inner_reporting_replay(
+        &self,
+        thread_id: &str,
+        req: StartTurnRequest,
+        reserved_turn_id: Option<&str>,
+    ) -> Result<(TurnRecord, bool)> {
         if reserved_turn_id.is_some() && req.operation_key.is_none() {
             bail!("a reserved turn id requires an operation key");
         }
@@ -9427,8 +9455,11 @@ impl RuntimeThreadManager {
             true,
         )
         .await
+        .map(|(turn, _replayed)| turn)
     }
 
+    /// Returns the turn and whether the durable operation key made this a
+    /// replay of an already-accepted submission rather than a new admission.
     async fn start_turn_with_source(
         &self,
         thread_id: &str,
@@ -9436,7 +9467,7 @@ impl RuntimeThreadManager {
         input_source: RuntimeTurnInputSource,
         reserved_turn_id: Option<&str>,
         stored_image_bytes: bool,
-    ) -> Result<TurnRecord> {
+    ) -> Result<(TurnRecord, bool)> {
         // Heap-allocate the turn-start state machine. Its future holds two full
         // Config clones plus ThreadRecord/EngineHandle/TurnRecord/TurnItemRecord
         // and the Op::SendMessage, and inlines the large ensure_engine_loaded
@@ -9548,7 +9579,7 @@ impl RuntimeThreadManager {
         if let Some(operation) = operation.as_ref()
             && let Some(original_turn) = self.replay_turn_for_operation(operation)?
         {
-            return Ok(original_turn);
+            return Ok((original_turn, true));
         }
         if !image_blocks.is_empty() || req.max_output_tokens.is_some() {
             let identity = self.provider_identity_for_thread(&cfg_snapshot, &thread)?;
@@ -9870,7 +9901,7 @@ impl RuntimeThreadManager {
             if let Some(operation) = operation.as_ref()
                 && let Some(original_turn) = self.replay_turn_for_operation(operation)?
             {
-                return Ok(original_turn);
+                return Ok((original_turn, true));
             }
             let Some(state) = active.engines.get_mut(thread_id) else {
                 bail!("Thread engine not loaded");
@@ -9963,10 +9994,11 @@ impl RuntimeThreadManager {
             )
         };
 
-        acceptance_rx
+        let turn = acceptance_rx
             .await
             .map_err(|_| anyhow!("Turn lifecycle task ended before acknowledgement"))?
-            .map_err(anyhow::Error::msg)
+            .map_err(anyhow::Error::msg)?;
+        Ok((turn, false))
         })
         .await
     }

@@ -37,6 +37,27 @@ CODEWHALE_PROVIDER=vllm VLLM_BASE_URL=http://127.0.0.1:8000/v1 VLLM_MODEL=<id> \
 `codewhale exec` (add `--auto` for tool use) is the non-interactive path to
 exercise the full agent loop.
 
+## Keeping the host awake during a turn
+
+While an interactive TUI turn is in flight, Codewhale holds the platform's
+idle-sleep assertion, so an unattended machine does not idle into sleep
+mid-turn and lose the work:
+
+- macOS: `caffeinate -i`
+- Linux: `systemd-inhibit --what=idle --why="Codewhale turn in flight" --mode=block sleep infinity`
+
+The assertion is released the moment the turn ends, and it covers *idle* sleep
+only: an explicit `sleep` / `pmset sleepnow`, a closed lid, or a low battery
+still suspends the machine. Headless hosts — `exec`, app-server, CI — never
+hold it, so a shared runner's power policy is untouched. Windows is not
+implemented: `SetThreadExecutionState` is thread-affine and needs a holder that
+pins the thread, so the gap is deliberate rather than silent.
+
+If a turn is suspended anyway, the engine notices on wake — wall-clock elapsed
+diverging from monotonic elapsed by more than the suspend threshold — reports
+`System sleep detected; connection lost — retrying request`, and re-issues the
+request instead of failing the turn (#2990).
+
 ## Consolidated runtime commands
 
 The current `codewhale` binary runs the TUI in-process. Release installers copy

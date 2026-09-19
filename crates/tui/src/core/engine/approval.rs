@@ -14,6 +14,27 @@ use crate::tools::user_input::{UserInputRequest, UserInputResponse};
 
 const USER_INPUT_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// How often a parked wait says it is still parked.
+///
+/// A wait with no deadline and no periodic line is indistinguishable from a
+/// freeze (#6184): the approval card may never expire (only a top-of-stack view
+/// ticks), the turn wall clock is paused across this wait, and nothing else
+/// reports. This is the line that gives a stall a name. Tests drive it at a
+/// tiny interval so the real path can be observed without waiting a minute.
+#[cfg(not(test))]
+const WAIT_HEARTBEAT: Duration = Duration::from_secs(60);
+#[cfg(test)]
+const WAIT_HEARTBEAT: Duration = Duration::from_millis(50);
+
+/// The announcement a parked wait makes, in one place so the log line and the
+/// status event cannot drift apart.
+fn wait_announcement(what: &str, tool_id: &str, waited: Duration) -> String {
+    format!(
+        "Still waiting for {what} on `{tool_id}` after {}s — the turn is parked here until it is answered",
+        waited.as_secs()
+    )
+}
+
 use super::Engine;
 
 #[derive(Debug, Clone)]
@@ -166,8 +187,26 @@ impl Engine {
         &mut self,
         tool_id: &str,
     ) -> Result<ApprovalResult, ToolError> {
+        let started = std::time::Instant::now();
+        let mut heartbeat = tokio::time::interval(WAIT_HEARTBEAT);
+        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // The first tick completes immediately; consume it so the first
+        // announcement is a heartbeat later, not at the gate itself.
+        heartbeat.tick().await;
+        let mut announced = false;
         loop {
             tokio::select! {
+                _ = heartbeat.tick() => {
+                    let waited = started.elapsed();
+                    let message = wait_announcement("tool approval", tool_id, waited);
+                    // Log every heartbeat; tell the user once, so a long park
+                    // leaves a trail without filling the transcript.
+                    tracing::warn!(tool_id, waited_secs = waited.as_secs(), "{message}");
+                    if !announced {
+                        announced = true;
+                        let _ = self.tx_event.send(Event::Status { message }).await;
+                    }
+                }
                 _ = self.cancel_token.cancelled() => {
                     let suffix = self.cancel_reason_suffix();
                     self.commit_approval_outcome(tool_id, ApprovalOutcome::Cancelled).await?;
@@ -233,8 +272,24 @@ impl Engine {
         // #6003: `[tools] user_input_timeout_seconds` — absent uses the
         // built-in default; an explicit 0 waits indefinitely.
         let wait = self.config.user_input_timeout.unwrap_or(USER_INPUT_TIMEOUT);
+        let started = std::time::Instant::now();
+        let mut heartbeat = tokio::time::interval(WAIT_HEARTBEAT);
+        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        heartbeat.tick().await;
+        let mut announced = false;
         loop {
             tokio::select! {
+                _ = heartbeat.tick() => {
+                    // An indefinite wait (`user_input_timeout_seconds = 0`) is
+                    // the case that needs this most: nothing else bounds it.
+                    let waited = started.elapsed();
+                    let message = wait_announcement("user input", tool_id, waited);
+                    tracing::warn!(tool_id, waited_secs = waited.as_secs(), "{message}");
+                    if !announced {
+                        announced = true;
+                        let _ = self.tx_event.send(Event::Status { message }).await;
+                    }
+                }
                 _ = self.cancel_token.cancelled() => {
                     let suffix = self.cancel_reason_suffix();
                     return Err(ToolError::cancelled(
@@ -422,6 +477,87 @@ mod tests {
         })
         .await
         .expect("required approval event deadline")
+    }
+
+    /// #6184: a turn parked on an approval must say so. Before this the wait
+    /// had no engine-side deadline, no periodic line and no event, so a stalled
+    /// turn was indistinguishable from a working one until the user gave up.
+    #[tokio::test]
+    async fn a_parked_approval_announces_the_wait_instead_of_hanging_silently() {
+        let tmp = tempfile::tempdir().expect("fixture directory");
+        let mock = Arc::new(MockLlmClient::new(vec![counter_request(
+            false,
+            CURRENT_CALL,
+        )]));
+        let (mut engine, handle) = Engine::new_with_model_client(
+            EngineConfig {
+                workspace: tmp.path().to_path_buf(),
+                snapshots_enabled: false,
+                subagents_enabled: false,
+                terminal_chrome_enabled: false,
+                ..EngineConfig::default()
+            },
+            &Config::default(),
+            mock.clone(),
+        );
+        engine.session.approval_mode = ApprovalMode::Suggest;
+        engine.session.add_message(Message {
+            role: Role::User,
+            content: vec![ContentBlock::Text {
+                text: "Park on the approval gate.".into(),
+                cache_control: None,
+            }],
+        });
+        let mut registry = crate::tools::ToolRegistry::new(ToolContext::new(tmp.path()));
+        registry.register(Arc::new(ApprovalFixtureTool {
+            executions: Arc::new(AtomicUsize::new(0)),
+            claim_only: false,
+        }));
+        let catalog = registry.to_api_tools_with_cache(true);
+        let surface = ToolSurfacePolicy::new(
+            registry,
+            Some(catalog),
+            AppMode::Agent,
+            &engine.config.tools_always_load,
+            &[],
+            false,
+            None,
+            None,
+            Some(4),
+            engine.session.approval_mode,
+            crate::core::engine::tool_catalog::ToolMode::Direct,
+        );
+
+        let events = handle.rx_event.clone();
+        let task = tokio::spawn(async move {
+            engine
+                .run_turn(&mut TurnContext::new(8), surface, None, None)
+                .await
+        });
+
+        // Reach the gate and answer nothing: this is the park.
+        let _ = wait_for_fixture_approval(&events, CURRENT_CALL).await;
+
+        let announced = tokio::time::timeout(Duration::from_secs(5), async {
+            let mut rx = events.write().await;
+            while let Some(event) = rx.recv().await {
+                if let Event::Status { message } = &event
+                    && message.contains("Still waiting for tool approval")
+                    && message.contains(CURRENT_CALL)
+                {
+                    return true;
+                }
+            }
+            false
+        })
+        .await
+        .expect("a parked approval must announce itself before anything else happens");
+        assert!(
+            announced,
+            "the announcement must name the wait and the tool it waits on"
+        );
+
+        task.abort();
     }
 
     async fn assert_required_fixture(source: ClaimSource, action: HostAction) {

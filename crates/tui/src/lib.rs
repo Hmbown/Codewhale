@@ -132,6 +132,7 @@ mod settings;
 mod shell_dispatcher;
 mod skill_state;
 mod skills;
+mod sleep_guard;
 mod snapshot;
 mod startup_trace;
 mod task_manager;

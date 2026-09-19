@@ -688,6 +688,15 @@ impl Engine {
 
         // Only interactive TUI hosts own terminal chrome. Headless exec,
         // app-server, and stream-json stdout must remain byte-clean.
+        //
+        // The sleep guard rides the same gate: a turn that outlives the host's
+        // idle timer is lost work, and an interactive host is the only one
+        // that owns a human's machine. Bound to this function, so it releases
+        // on every return path. See `crate::sleep_guard` for its limits.
+        let _sleep_guard = self
+            .config
+            .terminal_chrome_enabled
+            .then(crate::sleep_guard::SleepGuard::hold);
         if self.config.terminal_chrome_enabled {
             crate::tui::notifications::set_taskbar_progress_busy();
             crate::tui::notifications::start_title_animation("codewhale");
