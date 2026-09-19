@@ -540,11 +540,14 @@
       });
     });
   }
-  var MODE_TEXT = { agent: '工作', plan: '计划', operate: '运维' };
+  var MODE_TEXT = { agent: '工作', plan: '计划', operate: '运维' };   // operate 只留给旧会话显示（不再给选项）
+  // 2026-09-19 老板「运维模式可以去掉」：只给客户「工作 / 计划」两种。
+  //   「运维」是 fleet 编排那套（老板已拍不搬）—— 选项里摆着它只会让人多问一句。
+  //   「计划」是真管用的：引擎里 `AppMode::Plan => allow_shell:false` + `ShellPolicy::None`，
+  //   AI 只能看、只能说，**动不了客户的项目**。
   var MODE_OPTS = [
     { v: 'agent', t: '工作', d: '直接改文件、跑命令' },
     { v: 'plan', t: '计划', d: '先出方案，先不动手' },
-    { v: 'operate', t: '运维', d: '排查与维护' },
   ];
   function bindModeChip() {
     var c = factChipEl('模式');
@@ -571,7 +574,17 @@
             var v = b.getAttribute('data-v');
             if (!MODEL_THREAD) { msg(msgEl, '先选一个会话', false); return; }
             b.disabled = true;
-            api('/v1/threads/' + encodeURIComponent(MODEL_THREAD), { method: 'PATCH', body: JSON.stringify({ mode: v }) })
+            // 走门卫而不是直接打引擎（2026-09-19）：门卫会校验「这条对话属于你能用的项目」，
+            // 并把这个人的选择**记下来** → 下次新建对话沿用同一个模式。
+            fetch('/_gate/thread-mode', {
+              method: 'POST', credentials: 'same-origin',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ thread: MODEL_THREAD, mode: v }),
+            })
+              .then(function (r) {
+                return r.json().catch(function () { return {}; })
+                  .then(function (j) { return { ok: r.ok, body: j }; });
+              })
               .then(function (r) {
                 b.disabled = false;
                 if (!r.ok) { msg(msgEl, (r.body && r.body.error) || '没改成', false); return; }
