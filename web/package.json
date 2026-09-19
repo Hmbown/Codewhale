@@ -44,7 +44,7 @@
     "tailwindcss": "^3.4.17",
     "typescript": "^5.7.3",
     "vitest": "^4.1.11",
-    "wrangler": "^4.107.0"
+    "wrangler": "^4.132.0"
   },
   "overrides": {
     "esbuild": "0.28.1",
