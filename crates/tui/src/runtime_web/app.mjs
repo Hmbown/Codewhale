@@ -1745,6 +1745,14 @@ function startBrowserClient() {
     for (const itemId of app.threadState.itemOrder) {
       const item = app.threadState.items.get(itemId);
       if (!item) continue;
+      // AsBudy：引擎的「进度」回执（kind=status，如「拿到结果，继续」「Executing tools
+      // sequentially…」）是**过程性状态**、不是产出。上方 msgbar 那条实时状态行
+      // （asbudy-my.js 的 #asbudy-live：「正在执行命令 · 3s」）已经把同一件事实时报了一遍，
+      // 两处重复。老板 2026-09-19：「对话框上方和下方的会话状态显示是不是重复了？下方的可以
+      // 去掉只保留上方的」。⇒ 不再把这一类回执画进对话区。
+      // ⚠️ 只去这一类：工具（exec/file/explore/web/mcp）、思考、回复、出错、文件改动、
+      //    整理对话 都照旧渲染 —— 那些是客户要看的东西，不是状态。
+      if (item.kind === "status") continue;
       let node = existing.get(itemId);
       if (!node || !updateItemNode(node, item)) node = renderItem(item);
       observeTranscriptItem(node);
