@@ -2840,7 +2840,9 @@ either resize the batch or tell the user which setting to change.
 Questions from `request_user_input` and approval decisions wait a bounded
 time and then cancel with a timeout (#6003). The default is 300 seconds.
 Raise it when you step away or read carefully, or set `0` to wait forever
-(overnight automation, long human review).
+(overnight automation, long human review). Headless `exec` runs have no
+responder, so `request_user_input` is withheld there by default:
+the model reports the tool absent and finishes instead of stalling.
 
 ```toml
 [tools]

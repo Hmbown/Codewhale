@@ -4616,6 +4616,53 @@ fn test_input_history_navigation() {
 }
 
 #[test]
+fn paste_while_navigating_history_detaches_before_down_can_discard_it() {
+    // A paste (insert_str family) while a history entry is on screen must
+    // detach navigation like typing does; otherwise the next Down replaces
+    // the buffer and silently destroys the pasted text.
+    let mut app = App::new(test_options(false), &Config::default());
+    app.input_history.push("older".to_string());
+    app.input_history.push("newer".to_string());
+    app.input = "draft".to_string();
+
+    app.history_up();
+    assert_eq!(app.input, "newer");
+    app.insert_str(" pasted");
+    assert!(app.history_index.is_none());
+    assert_eq!(app.input, "newer pasted");
+
+    app.history_down();
+    assert_eq!(
+        app.input, "newer pasted",
+        "detached edit must survive history keys"
+    );
+}
+
+#[test]
+fn external_edit_while_navigating_history_detaches_stale_state() {
+    // Same hazard through the $EDITOR round-trip: the edited buffer replaces
+    // recalled history, so the stale index, draft, selection, and attachment
+    // positions must not survive it.
+    let mut app = App::new(test_options(false), &Config::default());
+    app.input_history.push("older".to_string());
+    app.input = "draft".to_string();
+
+    app.history_up();
+    assert_eq!(app.input, "older");
+    app.apply_external_edit("edited in vi".to_string());
+    assert!(app.history_index.is_none());
+    assert!(app.history_navigation_draft.is_none());
+    assert!(app.selection_anchor.is_none());
+    assert_eq!(app.input, "edited in vi");
+
+    app.history_down();
+    assert_eq!(
+        app.input, "edited in vi",
+        "detached edit must survive history keys"
+    );
+}
+
+#[test]
 fn input_history_scenario() {
     // Scenario consolidation of: input_history_down_restores_live_draft_after_accidental_up, input_history_navigation_clears_stale_selection, input_history_restores_empty_draft_at_end_of_navigation
     // from input_history_down_restores_live_draft_after_accidental_up

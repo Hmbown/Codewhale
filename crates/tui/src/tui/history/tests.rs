@@ -32,7 +32,9 @@ use super::{
 };
 use crate::tools::plan::{PlanSnapshot, StepStatus};
 use crate::tui::motion::MotionMode;
-use crate::tui::ui_text::{line_to_plain, slice_text, text_display_width};
+use crate::tui::ui_text::{
+    line_to_plain, slice_visible_columns, text_display_width, text_visible_width,
+};
 use codewhale_models::{ContentBlock, Message, Role};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -726,7 +728,7 @@ fn the_copy_prefix_skips_every_decoration_and_keeps_the_payload() {
             .unwrap_or_else(|| panic!("no rendered line contains {needle:?}"));
         let text = line_to_plain(&target.line);
         (
-            slice_text(&text, target.copy_prefix_width, text_display_width(&text)),
+            slice_visible_columns(&text, target.copy_prefix_width, text_visible_width(&text)),
             target.copy_prefix_width,
         )
     };
@@ -786,7 +788,7 @@ fn the_copy_prefix_skips_every_decoration_and_keeps_the_payload() {
             .cloned()
             .collect::<Vec<_>>(),
     ));
-    let copied = slice_text(&body, header.copy_prefix_width, text_display_width(&body));
+    let copied = slice_visible_columns(&body, header.copy_prefix_width, text_visible_width(&body));
     assert!(
         copied.contains("run done"),
         "receipt text was clipped away: {copied:?}"

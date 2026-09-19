@@ -4431,7 +4431,7 @@ fn cursor_row_col_in_lines(
         .nth(offset)
         .map(|(b, _)| b)
         .unwrap_or(line.len());
-    let col = line[..byte_end].width();
+    let col = visible_str_width(&line[..byte_end]);
     (row, col)
 }
 
@@ -4514,6 +4514,28 @@ pub fn wrap_input_lines_for_mouse(input: &str, width: usize) -> Vec<(usize, Stri
 ///   the end of the preceding line rather than being swallowed.
 /// * **Every line fits.** A word longer than `width` — a URL, a path, a
 ///   base64 blob — has no usable break point and still breaks hard.
+///
+/// Display width as painted: ratatui strips control characters, so they
+/// occupy no cells. Non-control graphemes keep plain unicode width, matching
+/// the long-standing wrap/click/caret contract.
+pub(crate) fn visible_grapheme_width(grapheme: &str) -> usize {
+    if grapheme.chars().any(|c| c.is_control()) {
+        0
+    } else {
+        grapheme.width()
+    }
+}
+
+/// Plain unicode width with painted control handling: strip control
+/// graphemes first so emoji and wide-glyph measurement keeps the exact
+/// [`UnicodeWidthStr`] semantics on the remainder.
+fn visible_str_width(text: &str) -> usize {
+    text.graphemes(true)
+        .filter(|grapheme| !grapheme.chars().any(|c| c.is_control()))
+        .collect::<String>()
+        .width()
+}
+
 fn wrap_text(text: &str, width: usize) -> Vec<String> {
     if width == 0 {
         return vec![text.to_string()];
@@ -4539,7 +4561,7 @@ fn wrap_text(text: &str, width: usize) -> Vec<String> {
                 Some((byte, _)) if byte < current.len() => {
                     let remainder = current.split_off(byte);
                     lines.push(std::mem::replace(&mut current, remainder));
-                    current_width = current.width();
+                    current_width = visible_str_width(&current);
                 }
                 _ => {
                     lines.push(std::mem::take(&mut current));
@@ -4557,7 +4579,7 @@ fn wrap_text(text: &str, width: usize) -> Vec<String> {
             continue;
         }
 
-        let grapheme_width = grapheme.width();
+        let grapheme_width = visible_grapheme_width(grapheme);
         if current_width + grapheme_width > width && current_width != 0 {
             flush!();
         }
@@ -5360,6 +5382,17 @@ mod tests {
     fn wrap_input_lines_preserves_empty_lines() {
         let lines = wrap_input_lines("a\n\nb", 10);
         assert_eq!(lines, vec!["a", "", "b"]);
+    }
+
+    #[test]
+    fn wrap_and_caret_measure_tabs_as_painted() {
+        // Ratatui strips control characters, so a tab paints no cells. Wrap
+        // budgets, caret columns, and click mapping must all agree on zero;
+        // counting the tab would break the line early and drift the caret
+        // and clicks one cell per tab.
+        assert_eq!(wrap_text("\t0123456789", 11), vec!["\t0123456789"]);
+        assert_eq!(cursor_row_col("a\tb", 3, 80), (0, 2));
+        assert_eq!(cursor_row_col("\ta", 2, 80), (0, 1));
     }
 
     #[test]
