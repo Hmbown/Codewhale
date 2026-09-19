@@ -10,14 +10,23 @@
  *   塞进 transcript 里的节点会被它删掉。所以按钮挂外面，自己按 composer 的位置定位。
  *
  * 行为：默认隐藏 → 往上翻历史时出现 → 点一下回到最新（平滑滚动）→ 到底后自动隐藏。
+ *
+ * ⚠️「在不在最新」**不自己量像素**（2026-09-19 改）—— 官方 CLI 里按钮显隐与
+ *   transcript 的滚动状态是**同一个真相**：`!app.viewport.transcript_scroll.is_at_tail()`
+ *   （`crates/tui/src/tui/widgets/mod.rs`）。web 侧同一个真相由 app.mjs 的 `app.transcriptFollow`
+ *   持有，通过 `asbudy:tail` 事件广播出来。以前这里自己量 120px 像素差，跟主逻辑各判一套 ——
+ *   手机键盘把对话区压矮时会与主逻辑不一致。
  */
 (function () {
   var t = null, btn = null, mo = null;
+  // 还没收到事件时先按几何估一个（app.mjs 初始化就会广播一次）
+  var atTail = true;
 
   function ensure() {
     if (btn && document.body.contains(btn)) return true;
     t = document.getElementById('transcript');
     if (!t || !document.body) return false;
+    atTail = t.scrollHeight - t.scrollTop - t.clientHeight <= 16;
 
     var st = document.createElement('style');
     st.textContent = [
@@ -48,8 +57,12 @@
 
     t.addEventListener('scroll', sync, { passive: true });
     addEventListener('resize', place);
-    // 新消息让内容变高时不会触发 scroll 事件 → 盯一下子元素变化
+    // 新消息让内容变高时不会触发 scroll 事件 → 盯一下子元素变化（重新定位按钮）
     try { mo = new MutationObserver(sync); mo.observe(t, { childList: true, subtree: true }); } catch (e) { /* 老浏览器就算了 */ }
+    // 唯一的真相来源：app.mjs 广播的「在不在最新」（照官方 CLI 的 is_at_tail）
+    document.addEventListener('asbudy:tail', function (e) {
+      if (e && e.detail && typeof e.detail.atTail === 'boolean') { atTail = e.detail.atTail; sync(); }
+    });
     sync();
     return true;
   }
@@ -65,8 +78,9 @@
   function sync() {
     if (!btn || !t || !document.body.contains(btn)) { return; }
     place();
-    var near = t.scrollHeight - t.scrollTop - t.clientHeight < 120;   // 跟官方 wasNearBottom 同一个阈值
-    btn.hidden = near || t.scrollHeight <= t.clientHeight;
+    // 在最新 == 不显示（跟 CLI 的 is_at_tail 一致）；内容不够长（没滚动条）也不显示，
+    // 照 CLI 的 `jump_to_latest_button_rect(area, scrollbar.is_some())`。
+    btn.hidden = atTail || t.scrollHeight <= t.clientHeight;
   }
 
   if (!ensure()) {

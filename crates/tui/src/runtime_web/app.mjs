@@ -1059,6 +1059,19 @@ function startBrowserClient() {
     newThreadGeneration: 0,
     newThreadLoading: false,
     creatingThread: false,
+    // AsBudy：对话区是否**粘住最新** —— 照官方 CLI 的 TranscriptScroll 语义，不用像素差猜。
+    // CLI 那份（crates/tui/src/tui/scrolling.rs）是状态机：`to_bottom()` 哨兵 = 粘住 live tail，
+    // 只有**用户自己滚动**（scrolled_by / 滚轮 / 拖动滚动条）才变成 `at_line(n)`，滚回底部再收回。
+    // 所以内容长高、容器变高变矮都**不改变**状态 —— 这两件事在「每次渲染量像素差」的写法里
+    // 都会把状态误判成「用户翻上去了」（2026-09-19 手机版实测：键盘弹起把对话区从 361px 压到
+    // 70px，距底瞬间 291px > 120 ⇒ 之后回复一概不再跟随）。默认粘住，与 CLI 默认一致。
+    transcriptFollow: true,
+    // 我们程序化贴底时落到的 scrollTop。用来区分「这次滚动是我们干的还是用户干的」——
+    // 内容增高本身**不触发** scroll 事件（只改 scrollHeight，不动 scrollTop），
+    // 所以 scroll 事件一定意味着滚动位置真的变了，比一下就知道是谁。
+    transcriptAutoScrollTop: null,
+    // ResizeObserver 已经把一次贴底排进下一帧（合并同帧内的多次高度变化）
+    transcriptPinScheduled: false,
   };
 
   const narrowRail = globalThis.matchMedia("(max-width: 800px)");
@@ -1162,6 +1175,12 @@ function startBrowserClient() {
       dom.shell.style.setProperty("--visual-viewport-height", `${Math.round(height)}px`);
     }
     dom.shell.style.setProperty("--visual-viewport-offset-top", `${Math.max(0, Math.round(offsetTop))}px`);
+    // AsBudy：手机上键盘弹出/地址栏收放会改可视高（`.shell` 高 = 上面那个变量），
+    // 对话区跟着变矮 —— 这**不是**「用户翻上去了」。官方 CLI 的等价场景（终端 resize）
+    // 在 `app.rs` 的 `handle_resize` 里写得很直白：已在尾部就继续粘住尾部，
+    // 只有「用户自己翻上去过」才保留他的位置。照做。
+    if (app.transcriptFollow) requestAnimationFrame(() => scrollTranscriptToLatest());
+    else publishTranscriptTail();   // 没在尾部：容器变矮可能让人以为按钮该出现了，其实是位置问题
   }
 
   function focusableWithin(container) {
@@ -1698,7 +1717,6 @@ function startBrowserClient() {
   }
 
   function renderTranscript(preserveScroll) {
-    const wasNearBottom = dom.transcript.scrollHeight - dom.transcript.scrollTop - dom.transcript.clientHeight < 120;
     if (!app.threadState.thread) {
       // AsBudy：空状态文案改「专业克制」（2026-09-16 老板定，见 AGENTS.md「✍️ 界面文案」）
       renderTranscriptEmpty(
@@ -1729,13 +1747,71 @@ function startBrowserClient() {
       if (!item) continue;
       let node = existing.get(itemId);
       if (!node || !updateItemNode(node, item)) node = renderItem(item);
+      observeTranscriptItem(node);
       desired.push(node);
     }
     reconcileChildren(dom.transcript, desired);
     restoreTranscriptSelection(selection);
-    if (!preserveScroll || wasNearBottom) {
+    // 粘住最新时，新内容追加后跟着往下（CLI 的 to_bottom 哨兵在渲染时解析成 max_start，同一个意思）。
+    // 容器变矮（手机键盘）**不算**离开尾部 —— 状态没变，所以这里照旧跟随。
+    // （整屏重画 = 换会话 / 初始化 / 动作之后 → 一律回到最新，状态跟着归位；
+    //   CLI 同样在换会话和开新一轮时把「用户滚过」的锁清掉。）
+    if (!preserveScroll) setTranscriptFollow(true);
+    if (!preserveScroll || app.transcriptFollow) {
       requestAnimationFrame(() => scrollTranscriptToLatest());
     }
+  }
+
+  /** 算作「就停在最新」的容差（px）。照 CLI 是行级严格判定，web 上留给触摸回弹/亚像素。 */
+  const TRANSCRIPT_TAIL_EPSILON = 16;
+
+  function isTranscriptAtTail(element = dom.transcript) {
+    if (!element) return true;
+    return element.scrollHeight - element.scrollTop - element.clientHeight <= TRANSCRIPT_TAIL_EPSILON;
+  }
+
+  /** 改「是否粘住最新」并广播出去 —— 「回到最新」按钮（asbudy-latest.js）跟这一个真相走，
+   *  不再自己量像素（CLI 里按钮显隐就是 `!is_at_tail()`，同一个状态）。 */
+  function setTranscriptFollow(follow) {
+    const next = Boolean(follow);
+    if (next === app.transcriptFollow) return;
+    app.transcriptFollow = next;
+    try {
+      document.dispatchEvent(new CustomEvent("asbudy:tail", { detail: { atTail: next } }));
+    } catch (error) { /* 无 document 的环境（测试）忽略 */ }
+  }
+
+  /** 用户自己滚了对话区 → 按**位置**定状态（CLI 的 scrolled_by：往上一行就离开尾部，
+   *  滚回 max_start 就重新粘住）。 */
+  function handleTranscriptScroll() {
+    const transcript = dom.transcript;
+    if (!transcript) return;
+    // ① 停在最新就一律回到「粘住」（CLI：offset 落到 max_start 就收回 to_bottom）。
+    //    先判这条，是因为「用户自己滚回底部」与「我们程序化贴底」落到的位置一样，
+    //    靠「是谁滚的」分不出来 —— 而两个方向都应该粘住。
+    if (isTranscriptAtTail(transcript)) {
+      setTranscriptFollow(true);
+      return;
+    }
+    // ② 不在最新，但是**我们自己刚放下的那个位置** → 内容在长高过程中的中间态，别动状态。
+    if (app.transcriptAutoScrollTop !== null
+      && Math.abs(transcript.scrollTop - app.transcriptAutoScrollTop) <= 2) return;
+    // ③ 其余就是用户自己翻上去了 → 离开尾部（不打扰他）。
+    setTranscriptFollow(false);
+  }
+
+  /** 贴在最新（若内容还没长到需要滚，状态也归位）。 */
+  function pinTranscriptToLatest() {
+    setTranscriptFollow(true);
+    requestAnimationFrame(() => scrollTranscriptToLatest());
+  }
+
+  function publishTranscriptTail() {
+    try {
+      document.dispatchEvent(new CustomEvent("asbudy:tail", {
+        detail: { atTail: app.transcriptFollow && isTranscriptAtTail() },
+      }));
+    } catch (error) { /* 同上 */ }
   }
 
   /* AsBudy：把对话区**立即**贴到底（2026-09-19 老板报「发消息后没法自动显示最新回复，
@@ -1763,6 +1839,32 @@ function startBrowserClient() {
       transcript.scrollTop = transcript.scrollHeight;
       transcript.style.scrollBehavior = previous;
     }
+    // 记下「我们把它放在哪」—— handleTranscriptScroll 靠它认出「这不是用户滚的」。
+    app.transcriptAutoScrollTop = transcript.scrollTop;
+  }
+
+  /* AsBudy：内容「长高」有两种。一种是渲染（上面那条 rAF 贴底管的）；另一种是**渲染之后**
+     才落定的资源（图片解码完成、字体换上）—— 后者不触发任何渲染，于是贴底后还能差出小半屏。
+     2026-09-19 实测：切一条会话，贴底那一刻内容还没长完，14ms 后 +147px，而之后没人再贴一次
+     （桌面能滚 8561px，147px 就停在那儿）。官方 CLI 没这个问题：它每一帧都按行数重新解析尾部哨兵。
+     web 里能听到「内容高度变了」的只有 ResizeObserver —— 所以照上。 */
+  const transcriptItemObserver = typeof ResizeObserver === "function"
+    ? new ResizeObserver(() => {
+      if (!app.transcriptFollow || app.transcriptPinScheduled) return;
+      app.transcriptPinScheduled = true;
+      requestAnimationFrame(() => {
+        app.transcriptPinScheduled = false;
+        scrollTranscriptToLatest();
+      });
+    })
+    : null;
+  const observedTranscriptItems = new WeakSet();
+
+  /** 盯住每一条记录的高度（幂等 —— 同一个节点只挂一次）。 */
+  function observeTranscriptItem(node) {
+    if (!transcriptItemObserver || !node || observedTranscriptItems.has(node)) return;
+    observedTranscriptItems.add(node);
+    transcriptItemObserver.observe(node);
   }
 
   function renderTranscriptEmpty(kind, title, description) {
@@ -2683,6 +2785,10 @@ function startBrowserClient() {
           body: JSON.stringify({ prompt }),
         });
       }
+      // AsBudy：照官方 CLI —— 自己发消息一律回到最新（`ui/dispatch.rs` 的
+      // `paint_user_turn_cell` 在用户消息画出来的那一刻就 `scroll_to_bottom()`）。
+      // 手机上一屏只有 ~360px，用户看完旧回复常常不在底部；此时发消息更该直接回到最新。
+      pinTranscriptToLatest();
       saveDraft(app.drafts, threadId, "");
       dom.composerInput.value = "";
       resizeComposer();
@@ -2878,6 +2984,9 @@ function startBrowserClient() {
     }
   });
   narrowRail.addEventListener("change", syncRailAccessibility);
+  // AsBudy：官方 web 从来不监听对话区的滚动（只靠每次渲染量像素差猜）——
+  // CLI 的滚动状态只由用户输入改变（scrolled_by），这里补上同一件事。
+  dom.transcript.addEventListener("scroll", handleTranscriptScroll, { passive: true });
   globalThis.visualViewport?.addEventListener("resize", syncVisualViewport);
   globalThis.visualViewport?.addEventListener("scroll", syncVisualViewport);
   globalThis.addEventListener("resize", syncVisualViewport);
@@ -2885,6 +2994,7 @@ function startBrowserClient() {
 
   async function initialize() {
     syncVisualViewport();
+    publishTranscriptTail();
     syncRailAccessibility();
     try {
       [app.runtimeInfo, app.workspace] = await Promise.all([
