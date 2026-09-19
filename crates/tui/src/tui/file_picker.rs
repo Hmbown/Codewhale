@@ -655,7 +655,12 @@ impl ModalView for FilePickerView {
         // Query line.
         lines.push(Line::from(vec![
             Span::styled("> ", Style::default().fg(palette::WHALE_ACTION).bold()),
-            Span::raw(self.query.clone()),
+            // Explicit ink: the picker paints WHALE_BG, so an unstyled query
+            // would inherit a dark terminal default on light-profile terminals.
+            Span::styled(
+                self.query.clone(),
+                Style::default().fg(palette::TEXT_PRIMARY),
+            ),
             Span::styled(
                 " ",
                 Style::default()
@@ -1050,6 +1055,43 @@ mod tests {
     fn score_rejects_non_subsequence() {
         assert!(score("zzz", "main.rs").is_none());
         assert!(score("xyz", "src/lib.rs").is_none());
+    }
+
+    #[test]
+    fn query_line_carries_explicit_ink_on_the_dark_surface() {
+        // The picker paints WHALE_BG, so the typed query must carry its own
+        // fg: light-profile terminals default to black ink.
+        let dir = TempDir::new().expect("tempdir");
+        let mut picker =
+            FilePickerView::new_with_relevance(dir.path(), FilePickerRelevance::default());
+        picker.query = "main".to_string();
+        let area = Rect::new(0, 0, 80, 20);
+        let mut buf = Buffer::empty(area);
+        picker.render(area, &mut buf);
+        let mut checked = 0;
+        for y in 0..area.height {
+            let mut row = String::new();
+            for x in 0..area.width {
+                row.push_str(buf[(x, y)].symbol());
+            }
+            if !row.contains("> main") {
+                continue;
+            }
+            for x in 0..area.width {
+                let cell = &buf[(x, y)];
+                let symbol = cell.symbol();
+                if symbol.trim().is_empty() || symbol == ">" {
+                    continue;
+                }
+                assert_eq!(
+                    cell.style().fg,
+                    Some(palette::TEXT_PRIMARY),
+                    "query cell ({x}, {y}) must carry explicit body ink",
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked > 0, "expected a rendered query line");
     }
 
     #[test]

@@ -3329,9 +3329,12 @@ impl ModalView for SetupWizardView {
         let scroll = self.body_scroll.min(max_scroll);
         let content_area =
             render_panel_scroll_rail(content_area, buf, visual_rows, scroll, visible_rows, true);
+        // Explicit base ink: same black-on-black hazard as the pager body;
+        // value spans below carry no fg of their own.
         Paragraph::new(lines)
             .wrap(Wrap { trim: false })
             .scroll((scroll as u16, 0))
+            .style(Style::default().fg(palette::TEXT_PRIMARY))
             .render(content_area, buf);
     }
 

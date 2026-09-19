@@ -25,7 +25,7 @@ use crate::features::{Feature, Features};
 use crate::regex_cache::compile_user_regex;
 
 pub(super) const MULTI_TOOL_PARALLEL_NAME: &str = "multi_tool_use.parallel";
-pub(super) const REQUEST_USER_INPUT_NAME: &str = "request_user_input";
+pub(crate) const REQUEST_USER_INPUT_NAME: &str = "request_user_input";
 pub(super) const CODE_EXECUTION_TOOL_NAME: &str = "code_execution";
 const CODE_EXECUTION_TOOL_TYPE: &str = "code_execution_20250825";
 const CODE_EXECUTION_DESCRIPTION: &str = "Execute Python code with the local Python interpreter in the workspace and return stdout/stderr/return_code as JSON.";

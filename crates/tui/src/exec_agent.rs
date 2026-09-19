@@ -18,6 +18,28 @@ pub(crate) fn exec_max_steps(max_turns: Option<u32>) -> u32 {
     crate::core::engine::turn_budget::resolve_max_model_steps(max_turns)
 }
 
+/// Default-denied tools for headless `exec`, on top of the operator's own
+/// `--disallowed-tools` flag.
+///
+/// A headless run has no responder for `request_user_input`, so offering the
+/// tool can only stall the run until the turn wall clock, or forever with
+/// `[tools] user_input_timeout_seconds = 0`. Withholding it is the default
+/// form of the operator workaround (`--disallowed-tools request_user_input`):
+/// the model reports the tool absent and finishes instead of parking. This
+/// stays unconditional: there is no channel on which a one-shot CLI run
+/// could answer, so advertising the tool cannot work.
+pub(crate) fn exec_disallowed_tools(disallowed_tools: Option<Vec<String>>) -> Option<Vec<String>> {
+    use crate::core::engine::tool_catalog::REQUEST_USER_INPUT_NAME;
+    let mut disallowed = disallowed_tools.unwrap_or_default();
+    if !disallowed
+        .iter()
+        .any(|tool| tool.as_str() == REQUEST_USER_INPUT_NAME)
+    {
+        disallowed.push(REQUEST_USER_INPUT_NAME.to_string());
+    }
+    Some(disallowed)
+}
+
 type ExecSettlementProbe = std::pin::Pin<
     Box<dyn std::future::Future<Output = Result<crate::core::ops::SubAgentSettlement>> + Send>,
 >;
@@ -286,6 +308,9 @@ pub(crate) async fn run_exec_agent(
     use crate::tools::todo::new_shared_todo_list;
     use codewhale_config::AppMode;
     use codewhale_execpolicy::ApprovalMode;
+
+    // Withhold `request_user_input`; a headless run has no responder.
+    let disallowed_tools = exec_disallowed_tools(disallowed_tools);
 
     // Headless exec registers the model-facing notify tool too. Project the
     // final merged config before tool setup so `off`, quiet/category gates,
@@ -1426,8 +1451,9 @@ pub(crate) async fn run_exec_agent(
 
 #[cfg(test)]
 mod tests {
-    use super::{ExecAgentEvents, exec_automation_services};
+    use super::{ExecAgentEvents, exec_automation_services, exec_disallowed_tools};
     use crate::core::engine::mock_engine_handle;
+    use crate::core::engine::tool_catalog::REQUEST_USER_INPUT_NAME;
     use crate::core::events::{Event, TurnOutcomeStatus};
     use crate::core::ops::{Op, SubAgentSettlement};
     use codewhale_models::Usage;
@@ -1457,6 +1483,29 @@ mod tests {
             panic!("host must not shut down while child work remains");
         };
         tx.lock().unwrap().take().unwrap().send(snapshot).unwrap();
+    }
+
+    #[test]
+    fn headless_exec_withholds_request_user_input_without_a_responder() {
+        // No responder exists on a one-shot CLI run, so the tool is
+        // withheld by default rather than offered and stalled on.
+        let disallowed = exec_disallowed_tools(None).expect("withhold list");
+        assert!(
+            disallowed
+                .iter()
+                .any(|tool| tool.as_str() == REQUEST_USER_INPUT_NAME),
+            "request_user_input must be withheld by default: {disallowed:?}"
+        );
+        // An operator-passed entry is kept exactly once, not duplicated.
+        let disallowed = exec_disallowed_tools(Some(vec![REQUEST_USER_INPUT_NAME.to_string()]))
+            .expect("withhold list");
+        assert_eq!(
+            disallowed
+                .iter()
+                .filter(|tool| tool.as_str() == REQUEST_USER_INPUT_NAME)
+                .count(),
+            1
+        );
     }
 
     #[tokio::test]

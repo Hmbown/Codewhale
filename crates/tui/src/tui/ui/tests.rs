@@ -4168,6 +4168,92 @@ fn mouse_selection_autocopies_on_release_without_ctrl_c() {
 }
 
 #[test]
+fn mouse_selection_fragment_drag_copies_exact_text() {
+    // A drag that cuts a cell in half must copy the fragment's exact text,
+    // not round out to the whole cell. The receipt stays
+    // the pre-existing text-fallback status line (shared with the
+    // `selection_copy_markdown = false` path) rather than the Markdown toast;
+    // migrating copy receipts to toasts is broader than this fix.
+    let mut app = create_test_app();
+    app.history = vec![HistoryCell::Assistant {
+        content: "alpha beta".to_string(),
+        streaming: false,
+    }];
+    app.resync_history_revisions();
+    app.viewport.transcript_cache.ensure(
+        &app.history,
+        &app.history_revisions,
+        80,
+        app.transcript_render_options(),
+    );
+    app.viewport.last_transcript_area = Some(Rect {
+        x: 0,
+        y: 0,
+        width: 80,
+        height: 8,
+    });
+    app.viewport.last_transcript_top = 0;
+    app.viewport.last_transcript_total = app.viewport.transcript_cache.total_lines();
+    app.viewport.last_transcript_padding_top = 0;
+
+    handle_mouse_event(
+        &mut app,
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+    // Fragment coverage: "alpha beta" spans columns 0-10, so releasing at
+    // column 4 cuts the cell in half and the Markdown path must decline.
+    handle_mouse_event(
+        &mut app,
+        MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: 4,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+    handle_mouse_event(
+        &mut app,
+        MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: 4,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+
+    let copied = app
+        .clipboard
+        .last_written_text()
+        .expect("fragment drag must copy");
+    // Mouse columns include the 2-wide rail/prefix before content, so
+    // releasing at column 4 selects the leading 2 content chars.
+    assert_eq!(
+        copied, "al",
+        "fragment drag must copy exact text without rounding out"
+    );
+    assert!(
+        !copied.contains("beta"),
+        "must not round out to the whole cell, got {copied:?}"
+    );
+    assert_eq!(
+        app.status_message.as_deref(),
+        Some("Selection copied"),
+        "fragment copy reports through the text-fallback receipt"
+    );
+    assert!(
+        !app.status_toasts
+            .iter()
+            .any(|toast| toast.text.contains("Markdown")),
+        "fragment copy takes the text fallback, not the Markdown toast"
+    );
+}
+
+#[test]
 fn loading_mouse_filter_keeps_hover_and_active_drags() {
     let mut app = create_test_app();
     app.is_loading = true;
@@ -25087,6 +25173,131 @@ fn composer_arrow_down_at_last_line_preserves_multiline_draft() {
     assert_eq!(app.input, "line one\nline two");
     assert_eq!(app.cursor_position, app.input.chars().count());
     assert!(app.history_index.is_none());
+}
+
+// A long single-line prompt spans several visual rows; Up/Down must step
+// between them instead of recalling history (which reads as deletion). Inner
+// composer width 22 -> text width 20 after the prompt gutter, so a 45-char
+// unbroken line wraps to visual rows [0..20), [20..40), [40..45).
+#[test]
+fn composer_arrow_up_in_wrapped_line_moves_cursor_not_history() {
+    let mut app = create_test_app();
+    app.composer_arrows_scroll = false;
+    app.input = "a".repeat(45);
+    app.cursor_position = 45;
+    app.input_history.push("previous prompt".to_string());
+    app.viewport.last_composer_content = Some(Rect::new(0, 0, 22, 5));
+
+    assert!(handle_composer_history_arrow(
+        &mut app,
+        KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
+        false,
+        false,
+    ));
+
+    assert_eq!(app.input, "a".repeat(45));
+    assert!(app.history_index.is_none());
+    assert_eq!(app.cursor_position, 25);
+}
+
+#[test]
+fn composer_arrow_down_in_wrapped_line_moves_cursor_not_history() {
+    let mut app = create_test_app();
+    app.composer_arrows_scroll = false;
+    app.input = "a".repeat(45);
+    app.cursor_position = 25;
+    app.input_history.push("previous prompt".to_string());
+    app.viewport.last_composer_content = Some(Rect::new(0, 0, 22, 5));
+
+    assert!(handle_composer_history_arrow(
+        &mut app,
+        KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+        false,
+        false,
+    ));
+
+    assert_eq!(app.input, "a".repeat(45));
+    assert!(app.history_index.is_none());
+    assert_eq!(app.cursor_position, 45);
+}
+
+#[test]
+fn composer_arrow_up_on_first_visual_row_still_recalls_history() {
+    let mut app = create_test_app();
+    app.composer_arrows_scroll = false;
+    app.input = "a".repeat(45);
+    app.cursor_position = 5;
+    app.input_history.push("previous prompt".to_string());
+    app.viewport.last_composer_content = Some(Rect::new(0, 0, 22, 5));
+
+    assert!(handle_composer_history_arrow(
+        &mut app,
+        KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
+        false,
+        false,
+    ));
+
+    assert_eq!(app.input, "previous prompt");
+}
+
+#[test]
+fn composer_arrow_down_on_last_visual_row_preserves_wrapped_draft() {
+    let mut app = create_test_app();
+    app.composer_arrows_scroll = false;
+    app.input = "a".repeat(45);
+    app.cursor_position = 45;
+    app.input_history.push("previous prompt".to_string());
+    app.viewport.last_composer_content = Some(Rect::new(0, 0, 22, 5));
+
+    assert!(handle_composer_history_arrow(
+        &mut app,
+        KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+        false,
+        false,
+    ));
+
+    assert_eq!(app.input, "a".repeat(45));
+    assert_eq!(app.cursor_position, 45);
+    assert!(app.history_index.is_none());
+}
+
+#[test]
+fn composer_arrow_up_wrapped_line_without_geometry_recalls_history() {
+    let mut app = create_test_app();
+    app.composer_arrows_scroll = false;
+    app.input = "a".repeat(45);
+    app.cursor_position = 45;
+    app.input_history.push("previous prompt".to_string());
+    assert!(app.viewport.last_composer_content.is_none());
+
+    assert!(handle_composer_history_arrow(
+        &mut app,
+        KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
+        false,
+        false,
+    ));
+
+    assert_eq!(app.input, "previous prompt");
+}
+
+#[test]
+fn composer_arrows_scroll_wrapped_line_navigates_not_scrolls() {
+    let mut app = create_test_app();
+    app.composer_arrows_scroll = true;
+    app.input = "a".repeat(45);
+    app.cursor_position = 45;
+    app.viewport.last_composer_content = Some(Rect::new(0, 0, 22, 5));
+
+    assert!(handle_composer_history_arrow(
+        &mut app,
+        KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
+        false,
+        false,
+    ));
+
+    assert_eq!(app.input, "a".repeat(45));
+    assert_eq!(app.cursor_position, 25);
+    assert_eq!(app.viewport.pending_scroll_delta, 0);
 }
 
 // #1443: when mouse capture is off (e.g. Windows CMD), arrow-scroll

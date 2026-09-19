@@ -6663,8 +6663,7 @@ pub(crate) async fn run_event_loop(
                     };
                     match editor_result {
                         Ok(crate::tui::external_editor::EditorOutcome::Edited(new)) => {
-                            app.input = new;
-                            app.move_cursor_end();
+                            app.apply_external_edit(new);
                             let editor = std::env::var("VISUAL")
                                 .ok()
                                 .filter(|s| !s.trim().is_empty())
