@@ -666,6 +666,13 @@ function receiptMetaZh(item) {
   return parts.join(" · ");
 }
 
+/** 回执类 item（工具 / 文件改动 / 进度 / 出错 / 整理对话…）—— 不是消息、不是思考。
+ *  用来判断「进行中的这一条该不该落进转录」（见 renderTranscript 里的说明）。 */
+export function isReceiptItem(item) {
+  const kind = String((item && item.kind) || "");
+  return kind !== "user_message" && kind !== "agent_message" && kind !== "agent_reasoning";
+}
+
 /** 给任何一条回执补齐 variant / meta（MCP、工作流这些早返分支也要带上） */
 function finishReceipt(presentation, item) {
   const meta = item.metadata && typeof item.metadata === "object" ? item.metadata : {};
@@ -1753,6 +1760,13 @@ function startBrowserClient() {
       // ⚠️ 只去这一类：工具（exec/file/explore/web/mcp）、思考、回复、出错、文件改动、
       //    整理对话 都照旧渲染 —— 那些是客户要看的东西，不是状态。
       if (item.kind === "status") continue;
+      // AsBudy（2026-09-19 老板）：「工具 · 进行中 (3s)」跟上方那条实时状态行
+      // （asbudy-my.js 的 #asbudy-live：「正在执行命令 · 3s」）是**同一件事显示两遍**。
+      // 照官方 CLI 的 active cell 语义（`tui/active_cell.rs`：进行中的工具/思考聚合成一个
+      // 可变的活动单元，**结束后才落进转录**）—— 进行中的回执**不落进对话区**，
+      // 跑完（完成/失败/打断）自然出现，成为一条完整记录。跑的时候上方状态行照样在报。
+      // ⚠️ 只挡回执：消息（user/agent）与思考卡照旧（AI 正在写的回复必须实时看到）。
+      if (item.status === "in_progress" && isReceiptItem(item)) continue;
       let node = existing.get(itemId);
       if (!node || !updateItemNode(node, item)) node = renderItem(item);
       observeTranscriptItem(node);
