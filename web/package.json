@@ -36,7 +36,7 @@
     "@types/node": "^26.4.0",
     "@types/react": "^19.0.7",
     "@types/react-dom": "^19.2.5",
-    "autoprefixer": "^10.5.4",
+    "autoprefixer": "^10.6.1",
     "eslint": "^9.39.4",
     "eslint-config-next": "^15.5.18",
     "gt": "2.17.2",
