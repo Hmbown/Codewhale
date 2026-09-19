@@ -437,16 +437,25 @@ export function streamCursor(state, { gap = false, connected = true } = {}) {
  *   ② 摘要说「做了什么」—— 引擎 metadata 里带着 tool_name 与 tool_input
  *      （完整命令 / 文件路径），以前完全没用上。
  * 原文不丢：仍然进 `raw`，挂在折叠的「查看回执」里。
+ *
+ * ⚠️ 2026-09-19：词典要**跟着引擎的枚举补全**，漏掉的会退化成 humanize() 的英文
+ *   （引擎 `TurnItemKind` 九种、`TurnItemLifecycleStatus` 六种，见 runtime_threads.rs:640-667；
+ *   以前少了 command_execution / context_compaction / error / queued —— 客户会看到
+ *   "Command Execution · Completed" 这种英文标签）。
  */
 const RECEIPT_KIND_ZH = {
   tool_call: "工具",
   tool_result: "工具",
   file_change: "文件改动",
+  command_execution: "执行命令",
+  context_compaction: "整理对话",
   status: "进度",
+  error: "出错",
   agent_message: "回复",
   agent_reasoning: "思考",
 };
 const RECEIPT_STATUS_ZH = {
+  queued: "等待中",
   completed: "完成",
   failed: "未完成",
   in_progress: "进行中",
@@ -460,6 +469,103 @@ function receiptLabelZh(kind, status) {
   const head = RECEIPT_KIND_ZH[kind] || humanize(kind);
   const tail = RECEIPT_STATUS_ZH[status] || humanize(status);
   return tail ? `${head} · ${tail}` : head;
+}
+
+/* 「进行中 (Ns)」秒数徽标 —— 照 CLI 的 `running (Ns)`（2026-09-19）
+ *
+ * CLI 原文（`crates/tui/src/tui/history.rs:2647-2658`）：
+ *   *"Below 3s the badge is suppressed to avoid visual churn for tools that resolve in
+ *   milliseconds; at 3s and beyond the badge appears and **ticks every second** the tool
+ *   stays in flight."*
+ * ⚠️ 那个秒数**不是**引擎推的：CLI 用的是**本地 `Instant::now()`**。
+ *   引擎确实有 `ToolCallHeartbeat`（每 10 秒一次，`core/engine/tool_execution.rs:55`），
+ *   但它的定义注释明确写着它 *"carries no output and must not change user-visible status or
+ *   the transcript"*、只用于内部 stale 判护（`core/events.rs:218-224`）—— 所以这里**不碰引擎**，
+ *   前端自己算（也正因此刷新页面/换标签页不会错位）。
+ */
+export const RUNNING_BADGE_AFTER_SECS = 3;
+
+export function runningElapsedSuffix(item) {
+  // 只给「还在跑」的工具/思考卡加徽标；已完成、状态句、消息不进这里。
+  if (!item || item.status !== "in_progress" || item.kind === "status") return "";
+  const started = Date.parse(item.started_at || "");
+  if (!Number.isFinite(started)) return "";
+  const secs = Math.max(0, Math.round((Date.now() - started) / 1000));
+  return secs < RUNNING_BADGE_AFTER_SECS ? "" : ` (${secs}s)`;
+}
+
+/** 完成后的一次性耗时 —— 照 CLI 的 `… reasoning done · 521ms`
+ *  （`tui/history/thinking.rs:162-169` 把 `duration_secs` 拼在头部）。
+ *  数据不用引擎给：item 自带 `started_at` / `ended_at`。 */
+export function completedElapsedSuffix(item) {
+  if (!item || item.status !== "completed") return "";
+  const started = Date.parse(item.started_at || "");
+  const ended = Date.parse(item.ended_at || "");
+  if (!Number.isFinite(started) || !Number.isFinite(ended) || ended <= started) return "";
+  return " · " + formatElapsedMs(ended - started);
+}
+
+/** 耗时格式 —— 照官方 `format_elapsed_ms`（`elapsed.rs:35-43`）：不足 1 秒用 ms，否则用秒。 */
+export function formatElapsedMs(ms) {
+  const n = Math.max(0, Math.round(Number(ms) || 0));
+  if (n < 1000) return `${n}ms`;
+  const secs = Math.round(n / 1000);
+  if (secs < 60) return `${secs}s`;
+  return `${Math.floor(secs / 60)}m ${secs % 60}s`;
+}
+
+/* 思考卡「收起时的预览行数」——照官方 `thinking_preview_lines` 的默认值。
+ * 官方描述原文：*"Collapsed completed-thought preview rows (default 2, 0=header-only, 10=older dump)"*
+ * ⚠️ 这个键**不在 `/v1/config` 的读/写名单里**（只活在 TUI 的 /config 与 settings.toml），
+ *   网页读不到 ⇒ 先写官方默认值 2（＝老板 2026-09-19 的要求「默认为我现在的设置」，
+ *   而他那份 settings.toml 里正是 `thinking_preview_lines = 2`）。
+ *   哪天引擎把它暴露到 `/v1/config`，改成读值即可。 */
+export const THINKING_PREVIEW_LINES = 2;
+
+/* 文件改动卡的内联 diff —— 照官方 `inline_diffs`（默认 `full`）。
+ * 官方定义（`settings.rs:33-41`）：
+ *   Full（默认）= *"Show a bounded red/green unified diff plus semantic change statistics"*
+ *   Summary      = 只给语义统计（+A -D）   Off = 只留结果行
+ * 界限照 `MAX_INLINE_DIFF_LINES = 14`（`tui/history/file_mutation.rs:20`）：
+ *   官方只露前 14 行，省下的给一行提示（文件改动页那一段）。 */
+export const MAX_INLINE_DIFF_LINES = 14;
+
+export function boundedDiffLines(diffText, limit = MAX_INLINE_DIFF_LINES) {
+  const lines = String(diffText || "").replace(/\r\n?/g, "\n").split("\n");
+  while (lines.length && lines[lines.length - 1] === "") lines.pop();
+  if (lines.length <= limit) return { lines, omitted: 0 };
+  return { lines: lines.slice(0, limit), omitted: lines.length - limit };
+}
+
+/** diff 行的语义分类（决定红/绿/灰）—— 只认无歧义的行首 */
+export function diffLineKind(line) {
+  const t = String(line || "");
+  if (t.startsWith("+++") || t.startsWith("---")) return "meta";
+  if (t.startsWith("@@")) return "hunk";
+  if (t.startsWith("+")) return "add";
+  if (t.startsWith("-")) return "del";
+  return "";
+}
+
+/** 增/删行数（照官方的 semantic change statistics）——`inline_diffs=summary` 时只显示这行 */
+export function diffStats(diffText) {
+  let add = 0;
+  let del = 0;
+  for (const line of String(diffText || "").split("\n")) {
+    if (line.startsWith("+++") || line.startsWith("---")) continue;   // 文件头不算
+    if (line.startsWith("+")) add += 1;
+    else if (line.startsWith("-")) del += 1;
+  }
+  return { add, del };
+}
+
+/** 思考预览行数：优先读界面上设的值（`data-ab-thinklines`），读不到用官方默认。 */
+export function thinkingPreviewLines() {
+  if (typeof document === "undefined" || !document.documentElement) return THINKING_PREVIEW_LINES;
+  const raw = document.documentElement.getAttribute("data-ab-thinklines");
+  if (raw === null || raw === "") return THINKING_PREVIEW_LINES;
+  const n = Number.parseInt(raw, 10);
+  return Number.isFinite(n) && n >= 0 ? n : THINKING_PREVIEW_LINES;
 }
 
 /** 路径只留最后两段 —— 别把 /opt/asbudy/customers/yanyijin/2dry8u/public/index.html 整条糊到界面上 */
@@ -498,7 +604,9 @@ function toolIntentZh(toolName, rawInput) {
  * 重核方法：`grep -rn 'Event::status("' crates/tui/src/`。
  */
 const ENGINE_STATUS_ZH = [
-  [/^Auto-Review checking '(.+?)'$/, (m) => `正在检查这一步（${m[1]}）`],
+  // 时态跟着卡片状态走：这句引擎原文是**开始检查时**发的（"checking"），
+  //   而这张状态卡通常已经 completed —— 一律写成「正在检查」会读成「完成 + 正在」自相矛盾。
+  [/^Auto-Review checking '(.+?)'$/, (m, status) => `${status === "completed" ? "已检查" : "正在检查"}这一步（${m[1]}）`],
   [/^Continuing — tool results$/, () => "拿到结果，继续"],
   [/^Continuing — queued steer input$/, () => "继续（处理你插的话）"],
   [/^Session context synced$/, () => "会话已同步"],
@@ -509,12 +617,12 @@ const ENGINE_STATUS_ZH = [
   [/^Goal set; starting goal work\.$/, () => "目标已设定，开始执行"],
 ];
 
-function engineStatusZh(text) {
+function engineStatusZh(text, status) {
   const raw = String(text || "").trim();
   if (!raw) return null;
   for (const [pattern, to] of ENGINE_STATUS_ZH) {
     const matched = raw.match(pattern);
-    if (matched) return typeof to === "function" ? to(matched) : to;
+    if (matched) return typeof to === "function" ? to(matched, status) : to;
   }
   return null;
 }
@@ -535,6 +643,7 @@ function receiptVariant(item, toolName) {
   const kind = String(item.kind || "");
   if (kind === "status") return "status";
   if (kind === "file_change") return "file";
+  if (kind === "command_execution") return "exec";
   if (/^(write|edit|create|apply_patch|delete|mkdir|move|copy)$/.test(n)) return "file";
   if (/^(read|ls|glob|grep|list_dir|list_files|find|cat)$/.test(n)) return "explore";
   if (/^(bash|shell|exec|sh)$/.test(n) || n.startsWith("exec_")) return "exec";
@@ -590,7 +699,10 @@ export function receiptPresentation(item = {}) {
   const toolName = String(meta.tool_name || meta.tool || "");
   const intent = toolIntentZh(toolName, meta.tool_input);
   // 进度卡是引擎自己发的状态句（英文硬编码）→ 显示层译一道；译不出就用原文
-  const statusZh = item.kind === "status" ? engineStatusZh(raw) : null;
+  const statusZh = item.kind === "status" ? engineStatusZh(raw, item.status) : null;
+  // 文件改动的内联 diff（引擎早就带着：metadata.mutation.diff）
+  const mutation = meta.mutation && typeof meta.mutation === "object" ? meta.mutation : null;
+  const diffText = mutation && typeof mutation.diff === "string" ? mutation.diff : "";
   return {
     label: receiptLabelZh(item.kind, item.status),
     summary: intent ? (failed ? `${intent} —— 未完成` : intent) : (statusZh || raw),
@@ -598,6 +710,7 @@ export function receiptPresentation(item = {}) {
     failed,
     variant: receiptVariant(item, toolName),
     meta: receiptMetaZh(item),
+    diff: diffText,
   };
 }
 
@@ -1701,13 +1814,17 @@ function startBrowserClient() {
       card.append(label, body);
     } else if (item.kind === "agent_reasoning") {
       card = element("article", "reasoning");
+      // AsBudy：收起时也露「前几行预览」（照官方 thinking_preview_lines，见 THINKING_PREVIEW_LINES）
+      const preview = element("div", "ab-think-preview");
+      preview.dataset.itemPart = "preview";
+      preview.hidden = true;
       const disclosure = element("details");
       const summary = element("summary");
       summary.dataset.itemPart = "summary";
       const detail = element("pre");
       detail.dataset.itemPart = "detail";
       disclosure.append(summary, detail);
-      card.append(disclosure);
+      card.append(preview, disclosure);
     } else {
       card = element("article", "receipt");
       card.append(element("span", "receipt-dot"));
@@ -1722,6 +1839,11 @@ function startBrowserClient() {
       meta.hidden = true;
       copy.append(label, summary, meta);
       card.append(copy);
+      // AsBudy：文件改动的内联 diff（照官方 inline_diffs=full，界限见 MAX_INLINE_DIFF_LINES）
+      const diff = element("pre", "ab-diff");
+      diff.dataset.itemPart = "diff";
+      diff.hidden = true;
+      card.append(diff);
     }
     card.dataset.itemId = item.id;
     card.dataset.itemKind = item.kind;
@@ -1746,9 +1868,22 @@ function startBrowserClient() {
     if (item.kind === "agent_reasoning") {
       setTextIfChanged(
         card.querySelector('[data-item-part="summary"]'),
-        item.status === "in_progress" ? "思考中…" : "思考过程",
+        item.status === "in_progress"
+          ? "思考中…" + runningElapsedSuffix(item)
+          : "思考过程" + completedElapsedSuffix(item),      // 照 CLI 的 `… reasoning done · 521ms`
       );
       setTextIfChanged(card.querySelector('[data-item-part="detail"]'), detail);
+      // 收起时的预览（照官方 thinking_preview_lines，见 THINKING_PREVIEW_LINES）：
+      //   只在**已完成**时露前几行；展开着的时候由 CSS（:has(details[open])）藏掉，不重复显示
+      const preview = card.querySelector('[data-item-part="preview"]');
+      if (preview) {
+        const head = item.status === "completed"
+          ? String(detail || "").replace(/\r\n?/g, "\n").split("\n").filter((l) => l.trim()).slice(0, thinkingPreviewLines())
+          : [];
+        const text = head.join("\n");
+        preview.hidden = !text;
+        setTextIfChanged(preview, text);
+      }
       return true;
     }
 
@@ -1756,13 +1891,47 @@ function startBrowserClient() {
     card.className = `receipt ${presentation.failed ? "failed" : ""}`.trim();
     // AsBudy：按形态上色/排版（exec 等宽、file 高亮、status 降噪…，规则见 asbudy-my.js）
     card.dataset.variant = presentation.variant || "generic";
-    setTextIfChanged(card.querySelector('[data-item-part="label"]'), presentation.label);
+    setTextIfChanged(card.querySelector('[data-item-part="label"]'), presentation.label + runningElapsedSuffix(item));
     setTextIfChanged(card.querySelector('[data-item-part="summary"]'), presentation.summary);
     // 徽标（耗时/退出码）：老卡片可能还没这个节点，取不到就跳过
     const metaEl = card.querySelector('[data-item-part="meta"]');
     if (metaEl) {
       setTextIfChanged(metaEl, presentation.meta || "");
       metaEl.hidden = !presentation.meta;
+    }
+    // AsBudy：文件改动的内联 diff（照官方 inline_diffs=full，界限见 MAX_INLINE_DIFF_LINES）
+    const diffEl = card.querySelector('[data-item-part="diff"]');
+    if (diffEl) {
+      const diffText = presentation.diff || "";
+      if (!diffText) {
+        if (!diffEl.hidden) { diffEl.hidden = true; diffEl.replaceChildren(); diffEl.dataset.diffText = ""; }
+      } else if (diffEl.dataset.diffText !== diffText) {
+        // ⚠️ 逐行建节点，**绝不用 innerHTML** —— diff 来自文件内容，不能当 HTML 解析（XSS）
+        const { lines, omitted } = boundedDiffLines(diffText);
+        const fragment = document.createDocumentFragment();
+        // 第一行是统计（照官方的 semantic change statistics）——`inline_diffs=summary` 时只显这行
+        const stats = diffStats(diffText);
+        const statRow = document.createElement("span");
+        statRow.className = "ab-diff-line ab-diff-stat";
+        statRow.textContent = `${stats.add} 行新增 · ${stats.del} 行删除`;
+        fragment.append(statRow, document.createTextNode("\n"));
+        for (const line of lines) {
+          const row = document.createElement("span");
+          const kind = diffLineKind(line);
+          row.className = kind ? `ab-diff-line ab-diff-${kind}` : "ab-diff-line";
+          row.textContent = line === "" ? " " : line;
+          fragment.append(row, document.createTextNode("\n"));
+        }
+        if (omitted > 0) {
+          const more = document.createElement("span");
+          more.className = "ab-diff-line ab-diff-more";
+          more.textContent = `… 还有 ${omitted} 行（展开「查看回执」看全部）`;
+          fragment.append(more);
+        }
+        diffEl.replaceChildren(fragment);
+        diffEl.dataset.diffText = diffText;
+        diffEl.hidden = false;
+      }
     }
     const copy = card.querySelector(".receipt-copy");
     let disclosure = copy.querySelector("details");
@@ -1780,6 +1949,31 @@ function startBrowserClient() {
       disclosure.remove();
     }
     return true;
+  }
+
+  /* 每秒刷新「正在跑」的徽标 —— 对齐 CLI（它的 `running (Ns)` 也是每秒 tick）。
+   * 只在真有进行中的 turn 时才碰 DOM；没在跑就立刻返回，零开销。 */
+  function refreshRunningBadges() {
+    if (!dom.transcript) return;
+    let busy = false;
+    for (const turn of app.threadState.turns.values()) {
+      if (turn.status === "in_progress") { busy = true; break; }
+    }
+    if (!busy) return;
+    for (const node of dom.transcript.children) {
+      const id = node.dataset && node.dataset.itemId;
+      if (!id) continue;
+      const item = app.threadState.items.get(id);
+      if (!item || item.status !== "in_progress") continue;
+      if (item.kind === "agent_reasoning") {
+        setTextIfChanged(node.querySelector('[data-item-part="summary"]'), "思考中…" + runningElapsedSuffix(item));
+      } else if (node.classList.contains("receipt")) {
+        setTextIfChanged(
+          node.querySelector('[data-item-part="label"]'),
+          receiptPresentation(item).label + runningElapsedSuffix(item),
+        );
+      }
+    }
   }
 
   function setTextIfChanged(target, value) {
@@ -2712,6 +2906,9 @@ function startBrowserClient() {
   }
 
   initialize();
+
+  // AsBudy：徽标每秒 tick（CLI 同款）—— 见 runningElapsedSuffix 的注释
+  setInterval(refreshRunningBadges, 1000);
 }
 
 function basename(path) {

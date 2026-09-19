@@ -15,17 +15,98 @@ import { describe, expect, it } from "vitest";
 
 import {
   NO_TARGET,
+  boundedDiffLines,
   canReply,
   collectProviderModelPages,
+  completedElapsedSuffix,
+  diffLineKind,
+  formatElapsedMs,
   refusalMessage,
   receiptPresentation,
   resolveApprovalTarget,
   resolveReplyTarget,
+  runningElapsedSuffix,
   sessionTarget,
   streamCursor,
   threadTarget,
   workflowReceiptPresentation,
 } from "./app.mjs";
+
+describe("runningElapsedSuffix", () => {
+  const at = (secsAgo) => new Date(Date.now() - secsAgo * 1000).toISOString();
+
+  it("suppresses the badge for tools that resolve quickly (< 3s)", () => {
+    expect(runningElapsedSuffix({ kind: "tool_call", status: "in_progress", started_at: at(1) })).toBe("");
+    expect(runningElapsedSuffix({ kind: "tool_call", status: "in_progress", started_at: at(2) })).toBe("");
+  });
+
+  it("ticks the seconds once a tool has been in flight for 3s or more", () => {
+    expect(runningElapsedSuffix({ kind: "tool_call", status: "in_progress", started_at: at(3) })).toBe(" (3s)");
+    expect(runningElapsedSuffix({ kind: "tool_call", status: "in_progress", started_at: at(12) })).toBe(" (12s)");
+  });
+
+  it("never badges something that is not in flight", () => {
+    expect(runningElapsedSuffix({ kind: "tool_call", status: "completed", started_at: at(30) })).toBe("");
+    expect(runningElapsedSuffix({ kind: "status", status: "in_progress", started_at: at(30) })).toBe("");
+    expect(runningElapsedSuffix({ kind: "tool_call", status: "in_progress" })).toBe("");
+    expect(runningElapsedSuffix(null)).toBe("");
+  });
+});
+
+describe("inline diff (inline_diffs=full, bounded to 14 lines)", () => {
+  const diff = ["--- a/x.txt", "+++ b/x.txt", "@@ -1,3 +1,3 @@", " keep", "-old", "+new"].join("\n");
+
+  it("keeps a short diff whole and reports nothing omitted", () => {
+    const out = boundedDiffLines(diff);
+    expect(out.omitted).toBe(0);
+    expect(out.lines.length).toBe(6);
+  });
+
+  it("bounds a long diff and says how many rows were left out", () => {
+    const long = ["--- a/x", "+++ b/x", ...Array.from({ length: 50 }, (_, i) => `+line ${i}`)].join("\n");
+    const out = boundedDiffLines(long);
+    expect(out.lines.length).toBe(14);
+    expect(out.omitted).toBe(38);
+  });
+
+  it("classifies rows for the red/green rendering", () => {
+    expect(diffLineKind("+++ b/x")).toBe("meta");
+    expect(diffLineKind("--- a/x")).toBe("meta");
+    expect(diffLineKind("@@ -1 +1 @@")).toBe("hunk");
+    expect(diffLineKind("+added")).toBe("add");
+    expect(diffLineKind("-removed")).toBe("del");
+    expect(diffLineKind(" context")).toBe("");
+    expect(diffLineKind("")).toBe("");
+  });
+
+  it("treats an empty diff as empty", () => {
+    expect(boundedDiffLines("").lines.length).toBe(0);
+    expect(boundedDiffLines(null).omitted).toBe(0);
+  });
+});
+
+describe("completedElapsedSuffix / formatElapsedMs (CLI's `reasoning done · 521ms`)", () => {
+  const item = (ms) => ({
+    kind: "agent_reasoning",
+    status: "completed",
+    started_at: new Date(Date.now() - ms).toISOString(),
+    ended_at: new Date().toISOString(),
+  });
+
+  it("formats sub-second as ms and longer as seconds", () => {
+    expect(formatElapsedMs(521)).toBe("521ms");
+    expect(formatElapsedMs(0)).toBe("0ms");
+    expect(formatElapsedMs(1500)).toBe("2s");
+    expect(formatElapsedMs(65000)).toBe("1m 5s");
+  });
+
+  it("only badges completed items, and only with both timestamps", () => {
+    expect(completedElapsedSuffix(item(500))).toBe(" · 500ms");
+    expect(completedElapsedSuffix({ ...item(500), status: "in_progress" })).toBe("");
+    expect(completedElapsedSuffix({ kind: "agent_reasoning", status: "completed" })).toBe("");
+    expect(completedElapsedSuffix(null)).toBe("");
+  });
+});
 
 describe("collectProviderModelPages", () => {
   it("loads a 600-model catalog through every opaque page", async () => {

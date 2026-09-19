@@ -96,23 +96,57 @@
    *   值本身仍存在引擎里（GET/POST /v1/config），与终端界面看到的一致。
    * ⚠️ 依赖官方 DOM 结构（`article.reasoning` / `.receipt`）—— 官方改结构要跟着改（升级检查清单里有）。
    */
-  var DISPLAY = { show_thinking: true, thinking_default_expanded: false, show_tool_details: false, calm_mode: false, cost_currency: 'usd' };
+  var DISPLAY = { show_thinking: true, thinking_default_expanded: false, show_tool_details: false, calm_mode: false, cost_currency: 'usd', thinking_highlight: true, inline_diffs: 'full', thinking_preview_lines: 2 };
 
   var stD = document.createElement('style');
   stD.textContent = [
-    // 不显示思考过程 → 思考卡整个收起来
+    // 不显示思考过程 → 思考卡整个收起来（这条是**官方语义**：`show_thinking` 关＝不显示思考）
     'html[data-ab-think="off"] article.reasoning{display:none!important}',
-    'html[data-ab-calm="on"] article.reasoning{display:none!important}',
-    // 「显示文件与命令明细」关掉 → 回执只留一行标签（具体命令/输出都收起来）
-    //   ⚠️ 2026-09-18 修：以前这里只藏了 `details`，而摘要位置上摆的是 20 行原始输出
-    //   →「明细关了，满屏还是 drwxr-xr-x」，看着就是开关坏了（老板的原话：“不起作用吗”）。
-    //   现在配套：摘要位置改成「执行命令：<命令>」（见 app.mjs 的 toolIntentZh），
-    //   关掉开关 = 只剩「工具 · 完成」一行，原文明细在折叠里也不展开。
-    'html[data-ab-tools="off"] .receipt .receipt-summary{display:none!important}',
-    'html[data-ab-tools="off"] .receipt details{display:none!important}',
-    // 「安静模式（仅显示结论）」→ 只留 AI 说的话：思考 + 所有回执（工具/进度/文件改动）都收起来
-    //   ⚠️ 同样 2026-09-18 修：以前只藏了思考卡，工具回执照旧满屏 —— 名不副实。
-    'html[data-ab-calm="on"] .receipt{display:none!important}',
+    // 「显示文件与命令明细」——语义**照官方**（`crates/tui/src/tui/history.rs:471-491` ＋
+    //   `tui/history/constants.rs:87`）。官方**关掉**时也**不隐藏内容**，只是**限行**：
+    //   工具卡保留头部（`<符号> <动词> <状态> · <摘要>`）＋ 最多 4 行正文 ＋ 一行「展开」提示，
+    //   源码注释原话 "enough to answer 'what did that do?' without opening anything"；
+    //   而且**失败的工具卡完全不吃这套**（那个渲染分支写着 `!cell.is_failed()`，原样全显示）。
+    //   ⚠️ 2026-09-19 修：我们以前把「明细关」做成了**摘要行整行 display:none**，
+    //   而 `show_tool_details` 出厂默认就是 **false**（`settings.rs:571` / `:628`）——
+    //   于是默认档下界面只剩「工具 · 完成」这种没宾语的标签，客户根本不知道它跑了什么
+    //   （老板 2026-09-19：「还是不显示进度反馈、摘要」）。
+    //   摘要 ＝ 官方那行 header，**永远显示**；这个开关管的是**明细正文**：
+    //   关 = 收进「查看回执」折叠块（点得开）、开 = 默认摊开（见下面 openReceiptDetails）。
+    // ── 安静模式：**照官方语义**——「限行」，不是「隐藏」（2026-09-19 对齐）
+    //   官方注释（tui/history/constants.rs:100-107）原文：
+    //     *"Calm mode is about quiet, **not about hiding**, so it bounds the card at the header
+    //      plus the full successful-run preview plus the expand affordance."*
+    //   而且官方特意修过一个反直觉的 bug：calm 的上限曾比「明细关」还严（4 行 vs 6 行），
+    //   导致「开了明细反而看得更少」—— 现在 calm = `TOOL_CARD_SUMMARY_LINES` ＝ 成功预览 6 行 + 2。
+    //   ⚠️ 我们以前写的是 `article.reasoning{display:none}` + `.receipt{display:none}`（整卡抹掉）——
+    //     那是自己发明的，跟官方两回事。官方 calm **根本不管思考卡**（思考由 show_thinking 管）。
+    //   web 的对应：卡片 = 头部(1) + 摘要(1) + 正文，所以
+    //     明细关（官方上限 6 行）→ 正文限 4 行；明细开 + 安静（官方上限 8 行）→ 正文限 6 行。
+    //   ⚠️ 只限**工具输出**那一类：官方里文件改动卡是 `ToolCell::PatchSummary`，它在
+    //     `show_tool_details` / `calm` 那两个分支**之前**就返回了（`tui/history.rs:465-470`）
+    //     —— 也就是说 diff 卡**不吃这两档限行**（否则 14 行 diff 会被压成 4 行、连省略提示都看不到）。
+    'html[data-ab-tools="off"] .receipt:not([data-variant="file"]) details pre{max-height:6.2em;overflow:hidden}',
+    'html[data-ab-tools="on"][data-ab-calm="on"] .receipt:not([data-variant="file"]) details pre{max-height:9.4em;overflow:hidden}',
+    // ── 文件改动的内联 diff（照官方 inline_diffs，默认 full，2026-09-19）──
+    //   官方 Full = *"a bounded red/green unified diff"*，最多 14 行（app.mjs 的 MAX_INLINE_DIFF_LINES）
+    '.ab-diff{margin:8px 0 0;padding:10px 12px;border:1px solid var(--line);border-radius:var(--radius-control);background:var(--well-deep);color:var(--text-soft);font-family:ui-monospace,SFMono-Regular,Menlo,"Noto Sans Mono CJK SC",monospace;font-size:12px;line-height:1.5;white-space:pre-wrap;overflow-x:auto}',
+    '.ab-diff-line{white-space:pre-wrap}',
+    '.ab-diff-add{color:var(--status-live)}',
+    '.ab-diff-del{color:var(--status-danger)}',
+    '.ab-diff-hunk{color:var(--action)}',
+    '.ab-diff-meta{color:var(--text-faint)}',
+    '.ab-diff-more{color:var(--text-faint);font-style:italic}',
+    '.ab-diff-stat{color:var(--text-muted)}',
+    // 文件改动显示的三个档（官方 inline_diffs: full / summary / off，默认 full）
+    'html[data-ab-diffs="off"] .receipt .ab-diff{display:none!important}',
+    'html[data-ab-diffs="summary"] .receipt .ab-diff-line:not(.ab-diff-stat){display:none!important}',
+    // ── 思考卡「收起时的预览」（照官方 thinking_preview_lines，默认 2 行）──
+    //   展开着的时候不重复显示预览（:has 不被支持时只是多显示两行，不影响功能）
+    '.ab-think-preview{margin-top:6px;color:var(--text-faint);font-size:12.5px;line-height:1.5;white-space:pre-wrap;overflow-wrap:anywhere}',
+    'article.reasoning:has(details[open]) .ab-think-preview{display:none!important}',
+    // ── 思考背景填充（照官方 thinking_highlight，引擎里默认就是 true）──
+    'html[data-ab-thinkbg="on"] article.reasoning pre{background:var(--surface-raised)}',
   ].join('\n');
   document.head.appendChild(stD);
 
@@ -120,21 +154,37 @@
     var list = document.querySelectorAll('article.reasoning details:not([open])');
     for (var i = 0; i < list.length; i++) list[i].open = true;
   }
+  /* 明细开关打开 → 回执的「查看回执」默认摊开。
+   * 官方 tools=on 时是不截断、**完整显示**；web 上「完整」装在折叠块里，
+   * 所以「开」＝把它摊开。两档都看得到摘要，开关只决定明细要不要动手点。 */
+  function openReceiptDetails() {
+    var list = document.querySelectorAll('article.receipt details:not([open])');
+    for (var i = 0; i < list.length; i++) list[i].open = true;
+  }
+  // 回执的正文**一律展开**（长度由 CSS 按官方上限截）：
+  //   官方「明细关」不是把正文收起来，而是「头部 + 最多 4 行内容 + 展开提示」——
+  //   收起来的话客户什么都看不到（正是 2026-09-19 老板报到的那件事）。
   var reasonObserver = null;
   function applyDisplayPrefs() {
     var h = document.documentElement;
     h.setAttribute('data-ab-think', DISPLAY.show_thinking ? 'on' : 'off');
     h.setAttribute('data-ab-tools', DISPLAY.show_tool_details ? 'on' : 'off');
     h.setAttribute('data-ab-calm', DISPLAY.calm_mode ? 'on' : 'off');
-    if (!DISPLAY.thinking_default_expanded) return;
-    openReasoning();
-    // 流式追加出来的新思考卡片也要默认展开。只在开关打开时才观察，平时零开销。
+    h.setAttribute('data-ab-thinkbg', DISPLAY.thinking_highlight ? 'on' : 'off');
+    h.setAttribute('data-ab-diffs', DISPLAY.inline_diffs || 'full');
+    h.setAttribute('data-ab-thinklines', String(DISPLAY.thinking_preview_lines));
+    openReceiptDetails();
+    if (DISPLAY.thinking_default_expanded) openReasoning();
     if (!reasonObserver && window.MutationObserver) {
       var pending = false;
       reasonObserver = new MutationObserver(function () {
         if (pending) return;
         pending = true;
-        requestAnimationFrame(function () { pending = false; openReasoning(); });
+        requestAnimationFrame(function () {
+          pending = false;
+          if (DISPLAY.thinking_default_expanded) openReasoning();
+          openReceiptDetails();
+        });
       });
       reasonObserver.observe(document.body, { childList: true, subtree: true });
     }
@@ -147,6 +197,12 @@
     DISPLAY.thinking_default_expanded = c.thinking_default_expanded === true;
     DISPLAY.show_tool_details = c.show_tool_details === true;
     DISPLAY.calm_mode = c.calm_mode === true;
+    // 引擎里默认就是 true（settings.rs:567）；读不到就保持默认 true，不倒挂
+    DISPLAY.thinking_highlight = c.thinking_highlight !== false;
+    // 文件改动显示：官方三档（默认 full）
+    DISPLAY.inline_diffs = (c.inline_diffs === 'summary' || c.inline_diffs === 'off') ? c.inline_diffs : 'full';
+    // 思考预览行数：引擎可能还没暴露这个键（不在 /v1/config 名单里）→ 退回官方默认 2
+    DISPLAY.thinking_preview_lines = (typeof c.thinking_preview_lines === 'number') ? c.thinking_preview_lines : 2;
     DISPLAY.cost_currency = c.cost_currency === 'cny' ? 'cny' : 'usd';
     applyDisplayPrefs();
   });
@@ -1551,6 +1607,11 @@
         var repo = (rs[3] && rs[3].body) || {};
         var am = cfg.approval_mode || 'auto';   // auto=小的自己做、拿不准才问（默认）｜ suggest=每步先问 ｜ bypass=全放行
         var cur = cfg.cost_currency === 'cny' ? 'cny' : 'usd';
+        // 2026-09-19：官方 /config 里本来就有的显示类键（以前只接了一半，客户调不了）
+        var diffsMode = (cfg.inline_diffs === 'summary' || cfg.inline_diffs === 'off') ? cfg.inline_diffs : 'full';
+        // thinking_preview_lines 暂时可能读不到（引擎还没暴露）→ 退回官方默认 2
+        var thinkLines = (typeof cfg.thinking_preview_lines === 'number') ? cfg.thinking_preview_lines : 2;
+        var loc = cfg.locale || 'auto';
         var el = body.querySelector('#ab-adv');
         if (!el) return;
         if (!r.ok) {
@@ -1578,7 +1639,29 @@
           '<label class="ab-chk"><input type="checkbox" id="adv-think"' + (cfg.show_thinking ? ' checked' : '') + '> 显示思考过程</label>' +
           '<label class="ab-chk"><input type="checkbox" id="adv-think-exp"' + (cfg.thinking_default_expanded ? ' checked' : '') + '> 默认展开思考过程</label>' +
           '<label class="ab-chk"><input type="checkbox" id="adv-tools"' + (cfg.show_tool_details ? ' checked' : '') + '> 显示文件与命令明细</label>' +
-          '<label class="ab-chk"><input type="checkbox" id="adv-calm"' + (cfg.calm_mode ? ' checked' : '') + '> 安静模式（仅显示结论）</label>' +
+          '<label class="ab-chk"><input type="checkbox" id="adv-calm"' + (cfg.calm_mode ? ' checked' : '') + '> 安静模式（少铺开，内容不丢）</label>' +
+          '<label class="ab-chk"><input type="checkbox" id="adv-think-bg"' + (cfg.thinking_highlight !== false ? ' checked' : '') + '> 思考内容加底色</label>' +
+          '<div class="ab-row"><label>文件改动显示</label><select class="ab-input" id="adv-diffs">' +
+            '<option value="full"' + (diffsMode === 'full' ? ' selected' : '') + '>完整改动（红绿对照）</option>' +
+            '<option value="summary"' + (diffsMode === 'summary' ? ' selected' : '') + '>只显示行数统计</option>' +
+            '<option value="off"' + (diffsMode === 'off' ? ' selected' : '') + '>不显示</option>' +
+          '</select></div>' +
+          (typeof cfg.thinking_preview_lines === 'number'
+            ? '<div class="ab-row"><label>思考预览</label><select class="ab-input" id="adv-think-lines">' +
+                [0, 1, 2, 3, 5, 10].map(function (n) {
+                  return '<option value="' + n + '"' + (thinkLines === n ? ' selected' : '') + '>' +
+                    (n === 0 ? '不显示（只看标题）' : n + ' 行') + '</option>';
+                }).join('') +
+              '</select></div>'
+            // 引擎还没把 thinking_preview_lines 暴露出来时，这个控件**不出现** ——
+            //   否则客户一改就会撞到引擎的 400（「未知配置键」）。引擎更新后自动出现。
+            : '') +
+          '<div class="ab-row"><label>AI 回复语言</label><select class="ab-input" id="adv-locale">' +
+            '<option value="auto"' + (loc === 'auto' ? ' selected' : '') + '>跟随系统</option>' +
+            '<option value="zh-Hans"' + (loc === 'zh-Hans' ? ' selected' : '') + '>简体中文</option>' +
+            '<option value="en"' + (loc === 'en' ? ' selected' : '') + '>English</option>' +
+          '</select></div>' +
+          '<div class="ab-tip" style="margin:-2px 0 10px 78px">这几项都是官方本来就有的设置（页面上文字仍为中文）。</div>' +
           '<label class="ab-chk"><input type="checkbox" id="adv-compact"' + (cfg.auto_compact ? ' checked' : '') + '> 聊天太长时自动帮我整理前面</label>' +
           '<div class="ab-tip" style="margin:2px 0 10px 0">自动整理会总结前面的内容 —— 部分细节会丢失（默认开启）。<br>⚠️ 关闭后请留意：长对话可能因超出模型上下文而中断。</div>' +
           '<div class="ab-row"><label>货币单位</label><select class="ab-input" id="adv-currency">' +
@@ -1628,8 +1711,12 @@
         /* 存成功后**当场**让网页版跟着变 —— 否则客户得刷新才看得到效果 */
         function syncDisplayPref(key, v) {
           if (key === 'cost_currency') DISPLAY.cost_currency = (v === 'cny' ? 'cny' : 'usd');
-          else if (key === 'show_thinking' || key === 'thinking_default_expanded' || key === 'show_tool_details' || key === 'calm_mode') {
+          else if (key === 'show_thinking' || key === 'thinking_default_expanded' || key === 'show_tool_details' || key === 'calm_mode' || key === 'thinking_highlight') {
             DISPLAY[key] = (v === 'true' || v === true);
+          } else if (key === 'inline_diffs') {
+            DISPLAY.inline_diffs = (v === 'summary' || v === 'off') ? v : 'full';
+          } else if (key === 'thinking_preview_lines') {
+            DISPLAY.thinking_preview_lines = Number(v) || 0;
           } else return;
           applyDisplayPrefs();
         }
@@ -1652,6 +1739,10 @@
         el.querySelector('#adv-mk').onclick = openModelApiLoader;
         el.querySelector('#adv-repo').onclick = function () { openRepoForm(repo); };
         bindSel('adv-approval', 'approval_mode');
+        bindSel('adv-diffs', 'inline_diffs');
+        bindSel('adv-locale', 'locale');
+        bindSel('adv-think-lines', 'thinking_preview_lines');
+        bindChk('adv-think-bg', 'thinking_highlight');
         bindChk('adv-think', 'show_thinking');
         bindChk('adv-think-exp', 'thinking_default_expanded');
         bindChk('adv-tools', 'show_tool_details');
