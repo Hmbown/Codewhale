@@ -30,6 +30,24 @@
     //   ④ 标题排版抄官方 .rail-section-title（13px / 700 / --text-dim / 字距 0.08em）。
     '#asbudy-files{margin:0;display:flex;flex-direction:column;gap:8px;font-size:13.5px}',
     '.asb-card{border:1px solid transparent;border-radius:var(--radius-control);background:var(--well);overflow:hidden}',
+    // 手机上侧栏空间不够时，官方 .rail 是 grid，会把 auto 行一路压扁 —— 实测（390×700 真浏览器）：
+    //   回收站那一行被压到 **6px**（退回那行还有 36px）⇒ 客户看到的就是「回收站没了」。
+    //   老板 2026-09-19 报的就是这个（会话越多越挤）。给自造卡片保底高度：
+    //   宁可让侧栏能滚（.rail 本来就是 overflow:auto），也别把整块压成一条线。
+    '#asbudy-recycle,#asbudy-undo{min-height:36px}',
+    // 手机侧栏**不再摆**回收站与退回（2026-09-19 老板：「手机端左侧栏塞了太多太多东西，
+    //   很多完全可以收纳进「我的」里」）—— 它们改从「我的」菜单进、弹层里看。
+    //   桌面侧栏照旧（地方够，多一个显眼入口比多一次点击好）。
+    '@media (max-width:800px){#asbudy-recycle,#asbudy-undo{display:none!important}}',
+    // 「项目文件」卡在手机上也不摆侧栏（2026-09-19 老板：「项目文件收到「我的」里」）——
+    //   只用子选择器隐藏它在**侧栏里**的样子：弹层版是把这棵树画到别处，不受影响。
+    //   桌面侧栏照旧保留（地方够、鼠标操作树比弹层里舒服）。
+    '@media (max-width:800px){#asbudy-files > #asb-card-proj{display:none!important}}',
+    // 弹层里的树：不受侧栏那个 max-height 限制（地方大就该铺开）
+    '.ab-layer-tree{padding:0 2px;max-height:none;overflow:visible}',
+    // 标题行整条可点（2026-09-19 老板：「要点击横条就能弹出，而不是……去找那个折叠小图标才能折叠/弹出（反人类）」）
+    '[data-fold]{cursor:pointer;user-select:none}',
+    '[data-fold]:hover .asb-title,[data-fold]:hover span,[data-fold]:hover{color:var(--text)}',
     '.asb-hd{display:flex;align-items:center;gap:6px;padding:8px 10px;font-size:13px;color:var(--text-dim)}',
     '.asb-fold{cursor:pointer;color:var(--text-faint);width:12px;text-align:center;user-select:none;flex:none}',
     '.asb-fold:hover{color:var(--text)}',
@@ -256,25 +274,31 @@
     if (path.indexOf(q) >= 0) return 1;
     return -1;
   }
-  function paintTree() {
-    body.innerHTML = '';
-    if (!projFiles || !projFiles.length) { body.innerHTML = '<span class="f-empty">（空目录）</span>'; return; }
-    for (var i = 0; i < projFiles.length; i++) body.appendChild(render(projFiles[i], false, true));
+  /** 画目录树。@param host 可选：画到指定容器（弹层版用）；不传就画侧栏那棵。
+   *  2026-09-19 老板：「「项目文件」收到「我的」里」—— 弹层与侧栏共用这一份渲染。 */
+  function paintTree(host) {
+    var h = host || body;
+    if (!h) return;
+    h.innerHTML = '';
+    if (!projFiles || !projFiles.length) { h.innerHTML = '<span class="f-empty">（空目录）</span>'; return; }
+    for (var i = 0; i < projFiles.length; i++) h.appendChild(render(projFiles[i], false, true));
   }
   var SEARCH_MAX = 50;   // 结果上限：再多客户也看不完，先说清「只显示前 N 个」
-  function paintSearch(q) {
+  function paintSearch(q, host) {
+    var h = host || body;
+    if (!h) return;
     var all = flatFiles(projFiles || []), hits = [];
     for (var i = 0; i < all.length; i++) {
       var s = matchScore(all[i], q);
       if (s > 0) hits.push({ f: all[i], s: s });
     }
     hits.sort(function (a, b) { return b.s - a.s || a.f.path.localeCompare(b.f.path, 'zh'); });
-    body.innerHTML = '';
-    if (!hits.length) { body.innerHTML = '<span class="f-empty">没找到名字里带这个的文件</span>'; return; }
+    h.innerHTML = '';
+    if (!hits.length) { h.innerHTML = '<span class="f-empty">没找到名字里带这个的文件</span>'; return; }
     var head = document.createElement('div'); head.className = 'f-hint';
     head.textContent = '找到 ' + hits.length + ' 个' + (hits.length > SEARCH_MAX ? '（只显示前 ' + SEARCH_MAX + ' 个）' : '');
-    body.appendChild(head);
-    for (var j = 0; j < Math.min(hits.length, SEARCH_MAX); j++) body.appendChild(renderHit(hits[j].f));
+    h.appendChild(head);
+    for (var j = 0; j < Math.min(hits.length, SEARCH_MAX); j++) h.appendChild(renderHit(hits[j].f));
   }
   function renderHit(f) {
     var n = document.createElement('div'); n.className = 'f-node'; n.title = f.path;
@@ -310,6 +334,35 @@
       projFiles = d.files || [];
       applySearch();   // 正在找文件 → 结果跟着新数据重算；没在找 → 画树
     } catch (e) { if (projSig === null) body.innerHTML = '<span class="f-empty">加载失败</span>'; }
+  }
+
+  /** 「我的 → 项目文件」弹层版（2026-09-19 老板：「留「我的资料」，「项目文件」收到「我的」里」）——
+   *  手机上侧栏不再摆这棵树（实测：手机树区只有 102px，四五行；而树能长到几百项），
+   *  改成从「我的」点开看 —— 弹层里地方大、还能搜。
+   *  ⚠️ 与侧栏**共用同一份** paintTree/paintSearch/render，只多一次取数（打开时才拉）。
+   *  ⚠️ 引擎那条搜只能按**名字**搜（源码写明 contents must never be returned）—— 文案不夸口。 */
+  async function openProjInto(host) {
+    if (!host) return;
+    host.innerHTML = '<span class="f-empty">加载中…</span>';
+    var bar = document.createElement('div');
+    bar.className = 'asb-search';
+    bar.innerHTML = '<input type="search" autocomplete="off" placeholder="找文件">';
+    var tree = document.createElement('div');
+    tree.className = 'ab-layer-tree';
+    host.innerHTML = '';
+    host.appendChild(bar); host.appendChild(tree);
+    var inp = bar.querySelector('input');
+    inp.oninput = function () {
+      var q = String(inp.value || '').trim().toLowerCase();
+      if (q) paintSearch(q, tree); else paintTree(tree);
+    };
+    try {
+      var r = await fetch('/_gate/projfiles?project=' + encodeURIComponent(pkey), { credentials: 'same-origin' });
+      if (!r.ok) throw 0;
+      var d = await r.json();
+      projFiles = d.files || [];     // 复用模块级缓存：侧栏与弹层看到的永远是同一份
+      paintTree(tree);
+    } catch (e) { tree.innerHTML = '<span class="f-empty">加载失败</span>'; }
   }
 
   // 卡片二：我的资料（文件池，跨项目）
@@ -356,7 +409,7 @@
     recycleBox.className = 'asb-card';
     recycleBox.id = 'asbudy-recycle';
     recycleBox.hidden = true;
-    recycleBox.innerHTML = '<div class="asb-hd"><span class="asb-fold" id="asb-fold-recycle" title="折叠 / 展开">\u25b8</span>'
+    recycleBox.innerHTML = '<div class="asb-hd" data-fold="recycle"><span class="asb-fold" id="asb-fold-recycle" title="折叠 / 展开">\u25b8</span>'
       + '<span class="asb-title">回收站<span id="asb-bin-count"></span></span>'
       + '<span class="asb-tools"><span id="asbudy-recycle-refresh" style="cursor:pointer">刷新</span></span></div>'
       + '<div class="asb-bd" id="asbudy-recycle-body"></div>';
@@ -380,10 +433,20 @@
     function p(n) { return String(n).padStart(2, '0'); }
     return (d.getMonth() + 1) + '月' + d.getDate() + '日 ' + p(d.getHours()) + ':' + p(d.getMinutes());
   }
-  async function loadRecycle() {
+  /** 渲染回收站。
+   *  @param hostEl 可选：渲染到**指定的容器**（弹层版用）。不传就画进侧栏那张卡片。
+   *  为什么要这个参数（2026-09-19 老板：「手机端左侧栏塞了太多太多东西，很多完全可以收纳进「我的」里」）：
+   *    手机侧栏地方不够，回收站/退回这种**兜底功能**没必要天天占着地方 —— 它们改成「我的」里一个入口、
+   *    点开弹层看。于是同一个渲染逻辑要能画到两个地方，否则就是抄一份代码出来（下次改两处）。
+   *  ⚠️ 两处行为有一处有意不同：**空的时候**侧栏版整块隐藏（不打扰），弹层版得把「空」画出来
+   *    —— 客户点了入口看到一片白会以为坏了。 */
+  async function loadRecycle(hostEl) {
     var box = ensureRecycleBox();
     if (!box) return;
-    var binBody = box.querySelector('#asbudy-recycle-body');
+    var layered = !!hostEl;
+    var binBody = hostEl || box.querySelector('#asbudy-recycle-body');
+    if (!binBody) return;
+    var redraw = function () { return loadRecycle(hostEl); };
     try {
       var r = await fetch('/_gate/recycle', { credentials: 'same-origin' });
       if (!r.ok) throw 0;
@@ -394,8 +457,11 @@
       var total = items.length + prjs.length;
       if (cntEl) cntEl.textContent = total ? '（' + total + '）' : '';
       // 项目和文件**都空**才整块隐藏。原来只看文件，于是项目回收站里躺着东西、这块却藏着。
-      if (!total) { box.hidden = true; binBody.innerHTML = ''; return; }
-      box.hidden = false;
+      if (!total) {
+        if (layered) { binBody.innerHTML = '<div class="f-empty">回收站是空的。</div>'; return; }
+        box.hidden = true; binBody.innerHTML = ''; return;
+      }
+      if (!layered) box.hidden = false;
       binBody.innerHTML = '';
 
       // ── 块一：已删除的项目（跟文件分开摆 —— 两码事，别混一起）──
@@ -413,7 +479,7 @@
           fetch('/_gate/recycle/projects/restore', { method: 'POST', credentials: 'same-origin',
             headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ key: p.key }) })
             .then(function (rr) {
-              if (rr.ok) { loadRecycle(); return; }
+              if (rr.ok) { redraw(); return; }
               return rr.json().then(function (j) { alert((j && j.error) || '还原失败'); })
                 .catch(function () { alert('还原失败'); });
             });
@@ -426,7 +492,7 @@
           fetch('/_gate/recycle/projects', { method: 'DELETE', credentials: 'same-origin',
             headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ key: p.key }) })
             .then(function (rr) {
-              if (rr.ok) { loadRecycle(); return; }
+              if (rr.ok) { redraw(); return; }
               return rr.json().then(function (j) { alert((j && j.error) || '删不掉'); })
                 .catch(function () { alert('删不掉'); });
             });
@@ -448,7 +514,7 @@
           fetch('/_gate/recycle/restore', { method: 'POST', credentials: 'same-origin',
             headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id: it.id }) })
             .then(function (rr) {
-              if (rr.ok) { loadRecycle(); loadMine(); loadProj(); return; }
+              if (rr.ok) { redraw(); loadMine(); loadProj(); return; }
               return rr.json().then(function (j) { alert((j && j.error) || '还原失败'); })
                 .catch(function () { alert('还原失败'); });
             });
@@ -459,14 +525,14 @@
           fetch('/_gate/recycle', { method: 'DELETE', credentials: 'same-origin',
             headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id: it.id }) })
             .then(function (rr) {
-              if (rr.ok) { loadRecycle(); loadMine(); return; }
+              if (rr.ok) { redraw(); loadMine(); return; }
               return rr.json().then(function (j) { alert((j && j.error) || '删不掉'); })
                 .catch(function () { alert('删不掉'); });
             });
         };
         binBody.appendChild(row);
       });
-    } catch (e) { box.hidden = true; }
+    } catch (e) { if (layered) binBody.innerHTML = '<div class="f-empty">读不到回收站</div>'; else box.hidden = true; }
   }
 
   // 项目里几个**固定文件夹**的中文小注（2026-09-16 老板：「data、public 这些是什么？」）——
@@ -1039,6 +1105,14 @@
   document.addEventListener('click', function (e) {
     var t = e.target;
     if (!t) return;
+    // 标题行**整条**可点（2026-09-19 老板：「要点击横条就能弹出，而不是像现在的折叠行做的
+    //   要去找那个折叠小图标才能折叠/弹出（反人类）」）—— 以前只有那个 12px 的小三角能点。
+    //   行里的工具（刷新 / + 传资料）用 .asb-tools / [data-nofold] 挡掉，点它们不会顺手折叠。
+    var hd = t.closest ? t.closest('[data-fold]') : null;
+    if (hd && !(t.closest && (t.closest('.asb-tools') || t.closest('[data-nofold]')))) {
+      var w = hd.getAttribute('data-fold');
+      if (w) { setFold(w, !isFolded(w)); return; }
+    }
     if (!t.id) return;
     if (t.id === 'preview-close') { hidePreview(); }
     else if (t.id === 'preview-sys') { showSysPreview(); }
@@ -1130,7 +1204,11 @@
   }
 
   // ── 退回面板：列出可退回的时间点，点一个恢复 ──
+  //    ⚠️ 2026-09-19（老板：「手机端左侧栏塞了太多太多东西，很多完全可以收纳进「我的」里」）：
+  //    跟回收站同一套做法 —— 渲染逻辑接受一个**目标容器**，这样侧栏卡片（桌面）与
+  //    「我的」弹层（手机）共用同一份代码。
   var undoHost = document.getElementById('asbudy-undo');
+  var loadUndo = null;                 // 提到外层：文件末尾要挂到 window.__asbudyPanels
   if (undoHost) {
     undoHost.hidden = false;
     var undoBody = document.getElementById('asbudy-undo-body');
@@ -1140,14 +1218,17 @@
       function p(n) { return String(n).padStart(2, '0'); }
       return t.getFullYear() + '-' + p(t.getMonth() + 1) + '-' + p(t.getDate()) + ' ' + p(t.getHours()) + ':' + p(t.getMinutes());
     }
-    async function loadUndo() {
-      undoBody.innerHTML = '<span class="f-empty">加载中…</span>';
+    loadUndo = async function (hostEl) {
+      var target = hostEl || undoBody;
+      if (!target) return;
+      var redraw = function () { return loadUndo(hostEl); };
+      target.innerHTML = '<span class="f-empty">加载中…</span>';
       try {
         var r = await fetch('/_gate/snapshots', { credentials: 'same-origin' });
         if (!r.ok) throw 0;
         var d = await r.json();
-        undoBody.innerHTML = '';
-        if (!d.snapshots || !d.snapshots.length) { undoBody.innerHTML = '<span class="f-empty">（还没有可退回的改动）</span>'; return; }
+        target.innerHTML = '';
+        if (!d.snapshots || !d.snapshots.length) { target.innerHTML = '<span class="f-empty">（还没有可退回的改动）</span>'; return; }
         for (var i = 0; i < d.snapshots.length; i++) {
           (function (s) {
             var it = document.createElement('div');
@@ -1160,16 +1241,16 @@
               try {
                 var rr = await fetch('/_gate/restore', { method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ snapshotId: s.id }) });
                 var dd = await rr.json();
-                if (rr.ok) { alert('已退回'); loadUndo(); loadProj(); }
+                if (rr.ok) { alert('已退回'); redraw(); loadProj(); }
                 else alert(dd.error || '退回失败');
               } catch (e) { alert('退回失败'); }
             };
-            undoBody.appendChild(it);
+            target.appendChild(it);
           })(d.snapshots[i]);
         }
-      } catch (e) { undoBody.innerHTML = '<span class="f-empty">加载失败</span>'; }
-    }
-    if (undoRefresh) undoRefresh.onclick = loadUndo;
+      } catch (e) { target.innerHTML = '<span class="f-empty">加载失败</span>'; }
+    };
+    if (undoRefresh) undoRefresh.onclick = function () { loadUndo(); };
     loadUndo();
   }
 
@@ -1188,4 +1269,9 @@
     var n = 0;
     var t = setInterval(function () { relabel(); if (++n > 20) clearInterval(t); }, 500);
   })();
+
+  /* 给「我的」菜单用（2026-09-19）：这些面板要能从**弹层**里打开同一套逻辑。
+   * ⚠️ asbudy-my.js 是**另一个 IIFE**，两个文件的作用域不共享 —— 只能挂 window
+   *   （2026-09-15 在 LAST_THREAD 上踩过同一个坑）。 */
+  window.__asbudyPanels = { recycle: loadRecycle, undo: loadUndo, proj: openProjInto };
 })();

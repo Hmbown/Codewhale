@@ -47,12 +47,7 @@
     btn.setAttribute('aria-label', '回到最新');
     btn.textContent = '↓';
     btn.hidden = true;
-    btn.addEventListener('click', function () {
-      try { t.scrollTo({ top: t.scrollHeight, behavior: 'smooth' }); }
-      catch (e) { t.scrollTop = t.scrollHeight; }
-      // 平滑滚动走的不是一步到位，sync 会在滚动过程中反复纠正，这里先给个即时的反馈
-      setTimeout(sync, 400);
-    });
+    btn.addEventListener('click', function () { toBottom(); });
     document.body.appendChild(btn);
 
     t.addEventListener('scroll', sync, { passive: true });
@@ -74,6 +69,53 @@
     var h = c ? (innerHeight - c.getBoundingClientRect().top) : 96;
     btn.style.bottom = Math.round(h + 14) + 'px';
   }
+
+  /** 回底（按钮与键盘路线共用） */
+  function toBottom() {
+    if (!t) return;
+    try { t.scrollTo({ top: t.scrollHeight, behavior: 'smooth' }); }
+    catch (e) { t.scrollTop = t.scrollHeight; }
+    // 平滑滚动走的不是一步到位，sync 会在滚动过程中反复纠正，这里先给个即时的反馈
+    setTimeout(sync, 400);
+  }
+
+  /** 回顶 */
+  function toTop() {
+    if (!t) return;
+    try { t.scrollTo({ top: 0, behavior: 'smooth' }); }
+    catch (e) { t.scrollTop = 0; }
+    setTimeout(sync, 400);
+  }
+
+  function editableFocused() {
+    var el = document.activeElement;
+    if (!el) return false;
+    var tag = String(el.tagName || '').toLowerCase();
+    return tag === 'input' || tag === 'textarea' || el.isContentEditable === true;
+  }
+
+  /* 键盘路线（2026-09-19 搬）—— CLI 那个按钮背后本来就有键位：
+   *   `End` / `Ctrl+End` → 回底（`tui/ui/handlers.rs:187`，`KeyCode::End => scroll_to_bottom()`）
+   *   `Alt+Shift+G`      → 回底（`tui/ui/event_loop.rs:6237`，`Char('G')` ＋ alt 修饰）
+   *   `Home` / `Ctrl+Home` → 回顶 · `Alt+G` → 回顶（同文件 `Char('g')` 分支）
+   * ⚠️ 网页上**裸 `End` / `Home` 不接管**：那在输入框里是「光标到行尾 / 行首」，
+   *   抢过来会毁掉正在打字的人。只接管 `Ctrl+End` / `Ctrl+Home`，且
+   *   **焦点在可编辑元素里时仍然不抢**（原生编辑动作优先）。
+   *   `Alt+G` / `Alt+Shift+G` 不产生字符输入，任何时候都接管。 */
+  document.addEventListener('keydown', function (e) {
+    if (!t || e.defaultPrevented || e.isComposing) return;
+    var key = e.key;
+    if (e.altKey && !e.ctrlKey && !e.metaKey && (key === 'g' || key === 'G')) {
+      e.preventDefault();
+      if (e.shiftKey) toBottom(); else toTop();
+      return;
+    }
+    if (e.ctrlKey && !e.altKey && !e.metaKey && (key === 'End' || key === 'Home')) {
+      if (editableFocused()) return;
+      e.preventDefault();
+      if (key === 'End') toBottom(); else toTop();
+    }
+  }, true);
 
   function sync() {
     if (!btn || !t || !document.body.contains(btn)) { return; }

@@ -1,3 +1,11 @@
+// ★ AsBudy（2026-09-19）：本会话内「这类操作以后不再询问」的分组指纹集合。
+//   对齐官方 CLI 的 `approval_session_approved`（`tui/ui/approval_routing.rs`）：
+//   存的是引擎给的**分组指纹**（按操作族算：shell 命令前缀 / 域名 / 补丁路径），
+//   **绝不存工具名** —— 官方源码明确警告：批准一条 shell 命令不能放行整个 shell 工具。
+//   存的位置：内存，跟官方一样是**会话级**（页面一刷新/重开会话就清空）。
+//   ⚠️ 必须定义在任何调用之前（`applyEnvelope` 会用到）—— 挪到文件后面就是 TDZ。
+const abSessionApproved = new Set();
+
 export const STREAM_EVENT_NAMES = [
   "thread.started",
   "thread.updated",
@@ -33,9 +41,16 @@ export const STREAM_EVENT_NAMES = [
 
 /// AsBudy：广播给 Msgbar 状态行的事件集（2026-09-18）——
 /// 只广播「开始 / 结束 / 需要等人的」这几类，**不含 item.delta**（太频繁，逐条广播会拖慢流式渲染）。
+/// 2026-09-19 加 `turn.usage`：引擎每次模型调用都会推这条（`runtime_threads.rs`
+/// 的 `Event::TurnUsage` 分支，payload 带 usage / duration_ms / first_token_ms /
+/// request_ms），**官方前端自己订阅了它却没有任何处理分支** —— 等于数据到了浏览器
+/// 就丢。CLI 的状态行正是拿它算 `ttft` / `平均 tok/s` / `↓ tokens`（`tui/infoline.rs`
+/// ＋ `tui/session_metrics.rs` 的 `record_model_call`）。频率低（一次模型调用一条，
+/// 远低于 item.delta），广播出去不构成渲染压力。
 const ACTIVITY_EVENTS = new Set([
   "turn.started",
   "turn.completed",
+  "turn.usage",
   "item.started",
   "item.completed",
   "item.failed",
@@ -82,7 +97,16 @@ export function applySnapshot(state, detail, expectedThreadId = state.threadId) 
   state.approvals = new Map();
   for (const approval of Array.isArray(detail.pending_approvals) ? detail.pending_approvals : []) {
     const approvalId = approval?.approval_id || approval?.id;
-    if (approvalId) state.approvals.set(approvalId, approval);
+    if (!approvalId) continue;
+    // ★ AsBudy：这一类的分组指纹本会话已经「不再问」过 → 直接放行，不进待办列表。
+    //   ⚠️ 这条路径跟 `applyEnvelope` 是**两条**来源（快照 / 事件），两处都得判 ——
+    //   只判事件那条，页面一切会话/刷新就会被快照重新摆回弹窗（2026-09-19 实测踩到）。
+    const gk = String(approval?.approval_grouping_key || "");
+    if (gk && abSessionApproved.has(gk)) {
+      resolveApproval(approvalId, "allow", false).catch(() => {});
+    } else {
+      state.approvals.set(approvalId, approval);
+    }
   }
   state.userInputs = new Map();
   for (const input of Array.isArray(detail.pending_user_inputs) ? detail.pending_user_inputs : []) {
@@ -145,10 +169,17 @@ export function applyRuntimeEvent(state, envelope) {
   } else if (eventName === "approval.required") {
     const approvalId = payload.approval_id || payload.id;
     if (approvalId) {
-      state.approvals.set(approvalId, {
-        ...payload,
-        turn_id: payload.turn_id || envelope.turn_id || "",
-      });
+      // ★ AsBudy：这一类的分组指纹本会话已经「不再问」过 → 直接放行，不弹窗。
+      //   放行走的还是同一条正常通道（POST /v1/approvals/{id}），不绕过后端。
+      const gk = String(payload.approval_grouping_key || "");
+      if (gk && abSessionApproved.has(gk)) {
+        resolveApproval(approvalId, "allow", false).catch(() => {});
+      } else {
+        state.approvals.set(approvalId, {
+          ...payload,
+          turn_id: payload.turn_id || envelope.turn_id || "",
+        });
+      }
     }
   } else if (eventName === "approval.decided" || eventName === "approval.timeout") {
     const approvalId = payload.approval_id || payload.id;
@@ -537,6 +568,97 @@ export function boundedDiffLines(diffText, limit = MAX_INLINE_DIFF_LINES) {
   while (lines.length && lines[lines.length - 1] === "") lines.pop();
   if (lines.length <= limit) return { lines, omitted: 0 };
   return { lines: lines.slice(0, limit), omitted: lines.length - limit };
+}
+
+/* ── AsBudy：工具卡「默认可见的正文预览」（2026-09-19 · 照官方 CLI 的两档）──────────
+ * 官方**明细关**（出厂默认）时卡里是露正文的：`tui/history.rs:469-480` 把整张卡
+ * `truncate(TOOL_SUMMARY_CARD_LINES = 6)`，再补一行展开提示 —— 也就是
+ * *"头部 + 最多 4 行内容 + 展开提示"*（源码注释原文 *"enough to answer 'what did that
+ * do?' without opening anything"*）。而**失败卡完全不吃这套**（那个分支写着 `!cell.is_failed()`），
+ * 它走完整的 `TOOL_OUTPUT_LINE_LIMIT = 20` 预算。
+ * 我们以前把正文全收紧在折块里 ⇒ 默认档下客户**一个字都看不到**（比官方少）—— 这就是补的那块。 */
+export const OUT_PREVIEW_SUCCESS_LINES = 4;   // 官方 TOOL_SUMMARY_CARD_LINES(6) − 头部 − 展开提示
+
+/** 官方失败卡的预算（`TOOL_OUTPUT_LINE_LIMIT`）—— 失败卡不做小预览 */
+export const OUT_PREVIEW_FAILED_LINES = 20;
+
+/* 头/尾预算与重要性排序 —— 逐条照 `tui/history/tool_output.rs`：
+ *   `selected_output_indices`（:552）的 `head = min(TOOL_OUTPUT_HEAD_LINES=10, line_limit)`、
+ *   `tail = min(TOOL_OUTPUT_TAIL_LINES=6, line_limit-head)`，中间按 `output_importance_rank`（:596）挑，
+ *   剩下的预算再从 head 往下补满（:582 那段注释解释了为什么不补会“少显几行却声称 omitted”）。
+ * ⚠️ 正因为 `head = min(10, line_limit)`，**预算小于 10 行时这个算法退化成「取前 N 行」** ——
+ *    所以只有失败卡那 20 行预算才真用得上它（成功卡那 4 行不是它的用武之地，也不强求）。 */
+const OUT_PREVIEW_HEAD_LINES = 10;
+const OUT_PREVIEW_TAIL_LINES = 6;
+
+/** 照官方 `output_importance_rank`（`tool_output.rs:596`）：error → 0 · warning → 1 · 带路径/URL → 2 · 其余 null */
+export function outputImportanceRank(line) {
+  const lower = String(line || "").toLowerCase();
+  const ERRORS = ["error", "failed", "failure", "fatal", "panic", "exception", "traceback",
+    "denied", "not found", "no such file", "cannot", "can't"];
+  if (ERRORS.some((needle) => lower.includes(needle))) return 0;
+  if (lower.includes("warning") || lower.includes("warn")) return 1;
+  if (isPathOrUrlLike(line)) return 2;
+  return null;
+}
+
+/** 照官方 `is_path_or_url_like`（`tool_output.rs:619`） */
+function isPathOrUrlLike(line) {
+  const trimmed = String(line || "").trim();
+  if (trimmed.includes("://") || trimmed.startsWith("file:")) return true;
+  const hasSeparator = trimmed.includes("/") || trimmed.includes("\\");
+  const hasExtension = trimmed.split(/\s+/).some((part) => {
+    const dot = part.lastIndexOf(".");
+    return dot > 0 && part.length - dot - 1 <= 8 && part.length - dot - 1 > 0;
+  });
+  return hasSeparator && hasExtension;
+}
+
+/**
+ * 选取要展示的行（照官方 `selected_output_indices`）。
+ * 返回 `{ parts, omitted }`：`parts` 是按**原顺序**排的段（`{text}` 或 `{omitted:N}`，
+ * 后者是省略提示的位置），渲染时逐段建节点即可。
+ */
+export function selectedOutputLines(lines, limit) {
+  const total = lines.length;
+  if (limit <= 0) return { parts: [], omitted: total };
+  if (total <= limit) return { parts: lines.map((text) => ({ text })), omitted: 0 };
+
+  const head = Math.min(OUT_PREVIEW_HEAD_LINES, limit, total);
+  const tail = Math.min(OUT_PREVIEW_TAIL_LINES, Math.max(0, limit - head), Math.max(0, total - head));
+  const keep = new Set();
+  for (let i = 0; i < head; i += 1) keep.add(i);
+  for (let i = total - tail; i < total; i += 1) keep.add(i);
+
+  const budget = limit - keep.size;
+  if (budget > 0) {
+    const important = [];
+    for (let i = head; i < total - tail; i += 1) {
+      const rank = outputImportanceRank(lines[i]);
+      if (rank !== null) important.push([i, rank]);
+    }
+    important.sort((a, b) => (a[1] - b[1]) || (a[0] - b[0]));
+    for (const [idx] of important.slice(0, budget)) keep.add(idx);
+  }
+  // 还有剩的预算 → 从 head 往下补满（照官方那段“别白白 forfeit 预算”的处理）
+  let next = head;
+  const cap = Math.min(limit, total);
+  while (keep.size < cap && next < total) {
+    keep.add(next);
+    next += 1;
+  }
+
+  const idx = [...keep].sort((a, b) => a - b);
+  const parts = [];
+  let prev = -1;
+  for (const i of idx) {
+    const gap = i - prev - 1;
+    if (gap > 0) parts.push({ omitted: gap });
+    parts.push({ text: lines[i] });
+    prev = i;
+  }
+  if (prev < total - 1) parts.push({ omitted: total - 1 - prev });
+  return { parts, omitted: total - idx.length };
 }
 
 /** diff 行的语义分类（决定红/绿/灰）—— 只认无歧义的行首 */
@@ -1958,6 +2080,12 @@ function startBrowserClient() {
       meta.hidden = true;
       copy.append(label, summary, meta);
       card.append(copy);
+      // AsBudy：**默认可见的正文预览**（2026-09-19 · 照官方明细关：头部 ＋ 最多 4 行正文 ＋ 展开提示）
+      //   以前正文只活在折块里 ⇒ 默认档客户一个字都看不到（比官方还少）。
+      const outPreview = element("pre", "ab-out-preview");
+      outPreview.dataset.itemPart = "outpreview";
+      outPreview.hidden = true;
+      card.append(outPreview);
       // AsBudy：文件改动的内联 diff（照官方 inline_diffs=full，界限见 MAX_INLINE_DIFF_LINES）
       const diff = element("pre", "ab-diff");
       diff.dataset.itemPart = "diff";
@@ -2020,6 +2148,39 @@ function startBrowserClient() {
     if (metaEl) {
       setTextIfChanged(metaEl, presentation.meta || "");
       metaEl.hidden = !presentation.meta;
+    }
+    // AsBudy：默认可见的正文预览（展开「查看回执」时由 CSS 让位，不重复显示）
+    const outPreviewEl = card.querySelector('[data-item-part="outpreview"]');
+    if (outPreviewEl) {
+      // 用 `detail`（完整输出）；没有才退回 summary。
+      // ⚠️ **不用 `presentation.raw`** —— 它是 `summary + "\n\n" + detail`，
+      //    开头那段是引擎的 280 字摘要回显，我们的头部已经有人话摘要了，再来一遍是噪音。
+      const previewText = String(item.detail || item.summary || "").replace(/\r\n?/g, "\n");
+      const previewLines = previewText.split("\n");
+      while (previewLines.length && previewLines[previewLines.length - 1] === "") previewLines.pop();
+      const limit = presentation.failed ? OUT_PREVIEW_FAILED_LINES : OUT_PREVIEW_SUCCESS_LINES;
+      const { parts } = selectedOutputLines(previewLines, limit);
+      if (!parts.length) {
+        if (!outPreviewEl.hidden) { outPreviewEl.hidden = true; outPreviewEl.replaceChildren(); outPreviewEl.dataset.previewKey = ""; }
+      } else if (outPreviewEl.dataset.previewKey !== previewText) {
+        // ⚠️ 逐段建节点，**绝不用 innerHTML** —— 正文来自工具输出，不能当 HTML 解析（XSS）
+        const fragment = document.createDocumentFragment();
+        parts.forEach((part, index) => {
+          const row = document.createElement("span");
+          if (part.omitted !== undefined) {
+            row.className = "ab-out-more";
+            row.textContent = `… 还有 ${part.omitted} 行（展开「查看回执」看全部）`;
+          } else {
+            row.className = "ab-out-line";
+            row.textContent = part.text === "" ? " " : part.text;
+          }
+          fragment.append(row);
+          if (index < parts.length - 1) fragment.append(document.createTextNode("\n"));
+        });
+        outPreviewEl.replaceChildren(fragment);
+        outPreviewEl.dataset.previewKey = previewText;
+        outPreviewEl.hidden = false;
+      }
     }
     // AsBudy：文件改动的内联 diff（照官方 inline_diffs=full，界限见 MAX_INLINE_DIFF_LINES）
     const diffEl = card.querySelector('[data-item-part="diff"]');
@@ -2324,31 +2485,25 @@ function startBrowserClient() {
     card.append(element("p", "", approval.intent_summary || approval.description || "AsBudy 正在等你确认能不能做这一步。"));
     const actions = element("div", "attention-actions");
     const rememberLabel = element("label", "remember-field");
-    // ★ 这个勾选框藏了（2026-09-16 老板问「勾了是不是又会全自动半小时」时查出来的）：
-    //   它的文字写「这类操作以后不再问我」，但引擎源码（`runtime_threads.rs:11452`）里
-    //   `remember:true` 的**唯一**后果是 `remember_thread_auto_approve()` —— 把**整条对话**
-    //   设成 `auto_approve=true` ＋ `permission_posture="full_access"`（并重建引擎策略），
-    //   **根本没有「按操作类别记住」这回事**（runtime_threads 里跟 approval_cache 一点关系都没有）。
-    //   也就是说：它承诺的是「这类」，实际干的是「整条」—— 勾一下当前这一轮就会一路跑到底。
-    //   门卫已经加了一道保护（审批响应一结束就按客户设置拉回，见 `syncThreadApproval`），
-    //   但那样一来这个勾选框就彻底没用了 —— 留着一个「点了没用」的控件比没有更坏。
-    //   想让它全自动：去「我的 → 高级设置 → 审批方式」选「全部自己做」——那是明确的、可撤销的。
-    rememberLabel.hidden = true;
-    rememberLabel.style.display = "none";
+    // ★ 2026-09-19 起这个勾选框由**我们**接管（不再是官方那个「整条对话全自动」）：
+    //   勾上 = 把**这一类的分组指纹**记进 `abSessionApproved`，之后同类直接放行；
+    //   **不给引擎传 `remember:true`**（那会把整条对话设成永久全自动 —— 我们不要那个）。
+    //   分组键由引擎给（`approval_grouping_key`，本次引擎改动才发出来）：它是按操作族算的，
+    //   不是工具名 —— 所以批准一条 shell 命令不会连带放行所有 shell 命令。
     const remember = document.createElement("input");
     remember.type = "checkbox";
-    rememberLabel.append(remember, document.createTextNode("这类操作以后不再问我"));
-    // ⚠️ 2026-09-16：原文案是「本会话记住此选择」—— 听着像「记住我这个选择」，
-    //   实际引擎收到 remember:true 后会把整条会话的 auto_approve 置为 true
-    //   （见 crates/tui/src/runtime_threads 的测试：“remember flag” → thread.auto_approve），
-    //   也就是**以后全自动、再也不弹**。不懂电脑的客户根本想不到这层。
-    rememberLabel.title = '勾上并点「允许」：这条对话里这类操作以后直接执行、不再弹审批（**只对同一类操作**；不会让整条对话变成全自动）';
+    rememberLabel.append(remember, document.createTextNode("这类操作以后不再询问"));
+    rememberLabel.title = '勾上并点「允许」：这条对话里同类的操作以后直接执行、不再问你。只对同一类生效，不会让整条对话变成全自动。';
+    const abGroupingKey = String(approval.approval_grouping_key || "");
     const deny = element("button", "quiet-button danger", "不允许");
     deny.type = "button";
-    deny.addEventListener("click", () => resolveApproval(approvalId, "deny", remember.checked));
+    deny.addEventListener("click", () => resolveApproval(approvalId, "deny", false));
     const allow = element("button", "primary-button", "允许");
     allow.type = "button";
-    allow.addEventListener("click", () => resolveApproval(approvalId, "allow", remember.checked));
+    allow.addEventListener("click", () => {
+      if (remember.checked && abGroupingKey) abSessionApproved.add(abGroupingKey);
+      resolveApproval(approvalId, "allow", false);   // 永不传 remember:true
+    });
     actions.append(rememberLabel, deny, allow);
     card.append(actions);
     return card;

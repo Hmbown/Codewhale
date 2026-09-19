@@ -68,6 +68,9 @@
     // 「正在做什么」状态行（2026-09-18）：跟其他小字同档，但用等宽感区分一下
     '#asbudy-live{font-size:13px;color:var(--text-dim);white-space:nowrap}',
     '#asbudy-live[hidden]{display:none}',
+    // 会话指标（2026-09-19 · ttft / 平均 tok/s / ↓ tokens）：与状态行同档，不动形态
+    '#asbudy-metrics{font-size:13px;color:var(--text-dim);white-space:nowrap}',
+    '#asbudy-metrics[hidden]{display:none}',
     // ── 工具卡按类型分开（2026-09-18 · 老板：「CLI 的工具卡是按类型分开渲染的，直接做了吧」）──
     // CLI 那边 9 种卡各画各的（Exec/Exploring/PatchSummary/PlanUpdate/…）；web 这里做形态区分：
     // 圆点颜色 + 排版 + 降噪。形态由 app.mjs 的 receiptVariant 算好，挂在 data-variant 上。
@@ -121,13 +124,31 @@
     //   导致「开了明细反而看得更少」—— 现在 calm = `TOOL_CARD_SUMMARY_LINES` ＝ 成功预览 6 行 + 2。
     //   ⚠️ 我们以前写的是 `article.reasoning{display:none}` + `.receipt{display:none}`（整卡抹掉）——
     //     那是自己发明的，跟官方两回事。官方 calm **根本不管思考卡**（思考由 show_thinking 管）。
-    //   web 的对应：卡片 = 头部(1) + 摘要(1) + 正文，所以
-    //     明细关（官方上限 6 行）→ 正文限 4 行；明细开 + 安静（官方上限 8 行）→ 正文限 6 行。
-    //   ⚠️ 只限**工具输出**那一类：官方里文件改动卡是 `ToolCell::PatchSummary`，它在
-    //     `show_tool_details` / `calm` 那两个分支**之前**就返回了（`tui/history.rs:465-470`）
-    //     —— 也就是说 diff 卡**不吃这两档限行**（否则 14 行 diff 会被压成 4 行、连省略提示都看不到）。
-    'html[data-ab-tools="off"] .receipt:not([data-variant="file"]) details pre{max-height:6.2em;overflow:hidden}',
-    'html[data-ab-tools="on"][data-ab-calm="on"] .receipt:not([data-variant="file"]) details pre{max-height:9.4em;overflow:hidden}',
+    //   web 的对应：卡片 = 头部(1) ＋ 摘要(1) ＋ 正文。
+    //   ⚠️ 2026-09-19 实测作废：以前这里用 CSS 给**折叠块里那个 `<pre>`** 限高
+    //     （`details pre{max-height:6.2em;overflow:hidden}`），本意是复刻官方的「最多 4 行」。
+    //     但两边的结构不一样 —— 官方的「限行」是**整张卡**在渲染时 `truncate` 到 6 行
+    //     （`tui/history.rs:469-480`，卡里本来就有正文，所以真能看见开头几行）；
+    //     而网页的正文**只活在折叠块里**，收起时压根不渲染。那条 CSS 唯一的实际效果就是：
+    //     **客户点开「查看回执」也看不全，而且 `overflow:hidden` 连滚都滚不动。**
+    //     真浏览器实测（2026-09-19）：展开后 `clientHeight 82px` vs `scrollHeight 197px`，
+    //     `overflow-y: hidden` —— 后面的内容直接不存在。
+    //     所以这两条**删掉**，正文回到官方 `styles.css` 的 `.receipt pre{max-height:320px;overflow:auto}`：
+    //     展开即看得到、长了能滚。明细开关的语义回到「要不要默认摊开折叠块」（`openReceiptDetails`），
+    //     不再假装自己在做行数限制。
+    //   ⚠️ 遗留：安静模式（calm）在官方也是「限行」（8 行）—— 同一个道理，网页上它同样没有落点，
+    //     不再用 CSS 伪装。真要复刻官方的「默认露开头几行」，得先给卡加一个"默认可见的正文预览"元素
+    //     （像思考卡那个 `ab-think-preview`），那是**形态改动**，得先跟老板定。
+    // ── 工具卡「默认可见的正文预览」（2026-09-19 加 · 照官方明细关）──
+    //   官方 `tui/history.rs:469-480`：明细关时整张卡 `truncate(TOOL_SUMMARY_CARD_LINES)`
+    //   ＝「头部 ＋ 最多 4 行正文 ＋ 展开提示」；失败卡不吃这套，走完整 20 行预算。
+    //   行数与排序都在 app.mjs 的 `selectedOutputLines()` 里算好，这里只管排版。
+    //   ⚠️ 展开「查看回执」时让位 —— 否则同一段内容在上面（预览）和下面（全文）各出现一次。
+    '.ab-out-preview{margin:8px 0 0;padding:8px 10px;border:1px solid var(--line);border-radius:var(--radius-control);background:var(--well-deep);color:var(--text-soft);font-family:ui-monospace,SFMono-Regular,Menlo,"Noto Sans Mono CJK SC",monospace;font-size:12px;line-height:1.5;white-space:pre-wrap;overflow-wrap:anywhere;max-height:13em;overflow-y:auto}',
+    '.ab-out-preview[hidden]{display:none!important}',
+    '.ab-out-line{white-space:pre-wrap}',
+    '.ab-out-more{color:var(--text-faint);font-style:italic}',
+    '.receipt:has(details[open]) .ab-out-preview{display:none!important}',
     // ── 文件改动的内联 diff（照官方 inline_diffs，默认 full，2026-09-19）──
     //   官方 Full = *"a bounded red/green unified diff"*，最多 14 行（app.mjs 的 MAX_INLINE_DIFF_LINES）
     '.ab-diff{margin:8px 0 0;padding:10px 12px;border:1px solid var(--line);border-radius:var(--radius-control);background:var(--well-deep);color:var(--text-soft);font-family:ui-monospace,SFMono-Regular,Menlo,"Noto Sans Mono CJK SC",monospace;font-size:12px;line-height:1.5;white-space:pre-wrap;overflow-x:auto}',
@@ -157,7 +178,14 @@
   /* 明细开关打开 → 回执的「查看回执」默认摊开。
    * 官方 tools=on 时是不截断、**完整显示**；web 上「完整」装在折叠块里，
    * 所以「开」＝把它摊开。两档都看得到摘要，开关只决定明细要不要动手点。 */
+  /* 明细开关打开 → 回执的「查看回执」默认摊开；**明细关就不动它**。
+   * ⚠️ 2026-09-19 修：以前这里**无条件**展开（174 轮定的 —— 那时正文只活在折叠块里，
+   *   不展开就什么都看不到）。可现在卡上有了「默认可见的正文预览」（照官方明细关的 4 行），
+   *   再一律展开就两头坏：预览被 CSS 让位规则顶掉（永远看不见），而客户在明细关档下看到的
+   *   反而是**全文**（比官方多）。官方明细关的语义是「头部 ＋ 最多 4 行正文 ＋ 展开提示」——
+   *   所以展开归 `show_tool_details` 管。 */
   function openReceiptDetails() {
+    if (!DISPLAY.show_tool_details) return;
     var list = document.querySelectorAll('article.receipt details:not([open])');
     for (var i = 0; i < list.length; i++) list[i].open = true;
   }
@@ -505,13 +533,24 @@
       // 三档措辞跟「高级设置 → 审批方式」下拉里的**完全同名** —— 两处说同一件事就必须用同一套词
       //（2026-09-17 老板：「到底是什么关系？两处显示得能不能对应起来？」原来一处「每步都先问我」
       // 一处「每次询问」，看着就是两个东西。改掉。）
-  var POSTURE_TEXT = { ask: '每次询问', auto_review: '小的自己做', full_access: '全部自己做' };
+  // ★ 三档措辞一律用**官方语言包**（`crates/localization/locales/zh-Hans.json` 的
+  //   `ConfigChoiceAsk` / `ConfigChoiceAutoReview` / `ConfigChoiceFullAccess`）——
+  //   2026-09-19 老板：「查到官方就照搬」。以前自造的「小的自己做 / 全部自己做」已废弃。
+  //   ⚠️ 「自动审核」的说明按**实测**写（官方那句「需要你决定时才询问」跟实现不符：
+  //     源码两处写明 Auto-Review never opens an approval modal；实测 135 次审批里
+  //     91 次在 1 秒内被引擎自己批掉 —— 老板 2026-09-19 拍「按实测写」）。
+  var POSTURE_TEXT = { ask: '询问', auto_review: '自动审核', full_access: '完全访问' };
   // 三档 ↔ 引擎两个字段（跟门卫 syncThreadApproval 同一套映射 —— 改一边必须改另一边）
   var APPROVAL_OPTS = [
-    { m: 'suggest', p: 'ask', a: false, t: '每次询问', d: '每一步都先问我' },
-    { m: 'auto', p: 'auto_review', a: false, t: '小的自己做', d: '拿不准才问我' },
-    { m: 'bypass', p: 'full_access', a: true, t: '全部自己做', d: '不再询问' },
+    { m: 'suggest', p: 'ask', a: false, t: '询问', d: '在可能造成重大更改的工具运行前询问（在项目文件夹里写文件不询问）' },
+    { m: 'auto', p: 'auto_review', a: false, t: '自动审核', d: '不问你；它自己判断，不行的直接拦下（默认）' },
+    { m: 'bypass', p: 'full_access', a: true, t: '完全访问', d: '无需审批提示即可运行工具' },
   ];
+  /** 审批档的中文名 —— **一份定义两处用**（对话上方的标签、我的 → 高级设置那一行） */
+  function approvalTextOf(mode) {
+    var o = APPROVAL_OPTS.filter(function (x) { return x.m === mode; })[0];
+    return o ? o.t : '自动审核';
+  }
   function factChipEl(key) { return document.querySelector('#session-facts .fact-chip[data-fact="' + key + '"]'); }
   function localizeFacts() {
     var chips = document.querySelectorAll('#session-facts .fact-chip');
@@ -542,13 +581,13 @@
       c.setAttribute('data-asbudy-perm', '1');
       c.title = '审批方式 —— 点这里改';
       c.style.cursor = 'pointer';
-      c.addEventListener('click', openApprovalPicker);
+      c.addEventListener('click', function () { openApprovalPicker(); });
     }
     var strong = c.querySelector('strong');
     currentThread().then(function (th) {
       if (!th || !strong) return;
       var p = String(th.permission_posture || '');
-      var text = POSTURE_TEXT[p] || (th.trust_mode ? '完全访问' : (th.auto_approve ? '自动审核' : '每次询问'));
+      var text = POSTURE_TEXT[p] || (th.trust_mode ? '完全访问' : (th.auto_approve ? '自动审核' : '询问'));
       if (strong.textContent !== text) strong.textContent = text;
     });
   }
@@ -561,7 +600,20 @@
       method: 'PATCH', body: JSON.stringify({ auto_approve: o.a, permission_posture: o.p }),
     }).then(function () { paintFact('permission', o.t); }).catch(function () { /* 改不动就算了，发消息前门卫还会再拉一次 */ });
   }
-  function openApprovalPicker() {
+  /** 改审批档 —— ★ **一处实现**（2026-09-19 合并入口）：
+   *  ① 写账号偏好（以后新建的会话/项目都按这个）② 写当前这条会话（立刻生效、标签跟着对）。
+   *  两个入口（对话上方那排小标签、我的 → 高级设置那一行）都调它 —— 不再各写一套。 */
+  function applyApprovalChoice(o) {
+    if (!o) return Promise.reject(new Error('没有这一档'));
+    var jobs = [api('/_gate/prefs', { method: 'POST', body: JSON.stringify({ prefs: { approval_mode: o.m } }) })];
+    if (MODEL_THREAD) jobs.push(api('/v1/threads/' + encodeURIComponent(MODEL_THREAD), {
+      method: 'PATCH', body: JSON.stringify({ auto_approve: o.a, permission_posture: o.p }),
+    }));
+    return Promise.all(jobs);
+  }
+  /** 审批方式选择弹层 —— 对话上方的标签、高级设置那一行**共用这一个**。
+   *  onDone(o)：改成功后回调（高级设置用它就地刷新那一行的文字）。 */
+  function openApprovalPicker(onDone) {
     openLayer('审批方式', function (body) {
       body.innerHTML =
         '<div class="ab-tip" style="margin:0 0 12px">AI 执行操作前是否先问你。改完当前会话立刻生效，以后的项目也按这个来。</div>' +
@@ -580,17 +632,16 @@
             if (!o) return;
             b.disabled = true;
             // 两边一起写：① 这条会话（立刻生效、标签跟着对）② 账号偏好（以后的会话和项目）
-            var jobs = [api('/_gate/prefs', { method: 'POST', body: JSON.stringify({ prefs: { approval_mode: o.m } }) })];
-            if (MODEL_THREAD) jobs.push(api('/v1/threads/' + encodeURIComponent(MODEL_THREAD), {
-              method: 'PATCH', body: JSON.stringify({ auto_approve: o.a, permission_posture: o.p }),
-            }));
-            Promise.all(jobs).then(function (rs) {
-              b.disabled = false;
-              if (rs[0] && !rs[0].ok) { msg(msgEl, (rs[0].body && rs[0].body.error) || '没存下来', false); return; }
-              paintFact('permission', o.t);
-              msg(msgEl, '已改为「' + o.t + '」', true);
-              setTimeout(closeLayer, 900);
-            }).catch(function (e) { b.disabled = false; msg(msgEl, '没改成功：' + ((e && e.message) || e), false); });
+            applyApprovalChoice(o)
+              .then(function (rs) {
+                b.disabled = false;
+                if (rs[0] && !rs[0].ok) { msg(msgEl, (rs[0].body && rs[0].body.error) || '没存下来', false); return; }
+                paintFact('permission', o.t);
+                if (typeof onDone === 'function') { try { onDone(o); } catch (e) { /* 回调出错不影响已保存 */ } }
+                msg(msgEl, '已改为「' + o.t + '」', true);
+                setTimeout(closeLayer, 900);
+              })
+              .catch(function (e) { b.disabled = false; msg(msgEl, '没改成功：' + ((e && e.message) || e), false); });
           };
         });
       });
@@ -751,8 +802,18 @@
         html += '<button class="ab-menu-item" id="ab-m-users">客户管理<small>添加客户、转移项目归属</small></button>';
       }
       html += '<button class="ab-menu-item" id="ab-m-proj">项目管理<small>查看和删除项目</small></button>';
+      // 项目文件（2026-09-19 老板：「留「我的资料」，「项目文件」收到「我的」里」）——
+      //   手机上侧栏地方不够（实测树区只有 102px），而树能长到几百项；弹层里地方大、还能搜。
+      //   桌面侧栏照旧保留（地方够、鼠标操作树更顺）。
+      html += '<button class="ab-menu-item" id="ab-m-files">项目文件<small>看当前项目里的文件，也能按名字找</small></button>';
       html += '<button class="ab-menu-item" id="ab-m-mem">AI 的记忆<small>查看和清除 AI 记住的内容</small></button>';
       html += '<button class="ab-menu-item" id="ab-m-skills">它会做什么<small>内置技能：做 PPT / 表格 / 文档 / PDF / 图表…</small></button>';
+      // 回收站 / 退回（2026-09-19 老板：「手机端左侧栏塞了太多太多东西，很多完全可以收纳进「我的」里」）——
+      //   这两个是**兜底功能**（偶尔来看一眼），没必要天天占侧栏的地方。手机侧栏已经不再摆它们，
+      //   桌面侧栏照旧保留（地方够，多一个显眼入口比多一次点击好）。两边打开的是**同一份面板**。
+      // ⚠️ 面板函数在 asbudy-files.js 里（另一个 IIFE）—— 只能走 window.__asbudyPanels。
+      html += '<button class="ab-menu-item" id="ab-m-recycle">回收站<small>删掉的项目与文件，可以还原</small></button>';
+      html += '<button class="ab-menu-item" id="ab-m-undo">退回<small>回到某个时间点（此后的改动会撤销）</small></button>';
       html += '<button class="ab-menu-item" id="ab-m-space">空间<small>存储用量与配额</small></button>';
       html += '<button class="ab-menu-item" id="ab-m-adv">高级设置<small>代码仓库 / 模型服务 / 只读模式 / 用量统计</small></button>';
       if (role === 'customer') {
@@ -769,8 +830,11 @@
       var bUsers = body.querySelector('#ab-m-users');
       if (bUsers) bUsers.onclick = openUsers;
       body.querySelector('#ab-m-proj').onclick = openProjects;
+      body.querySelector('#ab-m-files').onclick = function () { openSidePanel('项目文件', 'proj'); };
       body.querySelector('#ab-m-mem').onclick = openMemory;
       body.querySelector('#ab-m-skills').onclick = openSkills;
+      body.querySelector('#ab-m-recycle').onclick = function () { openSidePanel('回收站', 'recycle'); };
+      body.querySelector('#ab-m-undo').onclick = function () { openSidePanel('退回', 'undo'); };
       var bSpace = body.querySelector('#ab-m-space');
       if (bSpace) bSpace.onclick = openSpace;
       var bAdv = body.querySelector('#ab-m-adv');
@@ -787,6 +851,20 @@
           .then(function () { location.replace('/login.html'); })
           .catch(function () { location.replace('/login.html'); });
       };
+    });
+  }
+
+  /** 把侧栏那些自造面板（回收站 / 退回）搬进弹层打开（2026-09-19）。
+   *  面板逻辑本身在 asbudy-files.js，通过 window.__asbudyPanels 拿到 —— 只是把**渲染目标**
+   *  换成弹层里这个容器，所以侧栏版与弹层版永远是一份代码。 */
+  function openSidePanel(title, which) {
+    openLayer(title, function (body) {
+      var host = document.createElement('div');
+      host.className = 'ab-panel-host';
+      body.appendChild(host);
+      var fn = (window.__asbudyPanels || {})[which];
+      if (!fn) { host.innerHTML = '<div class="ab-tip">这个面板还没就绪，刷新一下页面试试。</div>'; return; }
+      fn(host);
     });
   }
 
@@ -1083,6 +1161,39 @@
       : Promise.resolve([]);
     ownersP.then(function (owners) { openProjectsWith(owners); });
   }
+  /** 给项目改名（2026-09-19）—— 弹层而不是 prompt()：老板定过界面文案要「专业、克制」，
+   *  浏览器原生 prompt 又丑又会带域名头。文案只讲**点了会发生什么**。
+   *  ⚠️ 成功后**重开整个项目管理**（不是调那块列表的 refresh）：弹层一关，
+   *    它里面的 `#ab-plist` 就没了，refresh 里那句 `if (!el) return` 会直接吞掉刷新 ——
+   *    客户看到的就是「点了保存、名字没变」（2026-09-19 回归测试当场抓到）。 */
+  function openRenameProject(p, onDone) {
+    openLayer('项目改名', function (body) {
+      body.innerHTML =
+        '<div class="ab-tip">只改显示名。项目里的文件、对话记录、设置都不受影响。</div>' +
+        '<div class="ab-row"><label>名字</label>' +
+        '<input class="ab-input" id="ab-re-in" maxlength="60" style="flex:1" value="' + esc(p.name) + '"></div>' +
+        '<div class="ab-msg" id="ab-re-msg" style="display:none"></div>' +
+        '<div style="display:flex;gap:8px;justify-content:flex-end;margin-top:14px">' +
+        '<button class="ab-btn sm" id="ab-re-cancel" type="button">取消</button>' +
+        '<button class="ab-btn sm" id="ab-re-ok" type="button">保存</button></div>';
+      var inp = body.querySelector('#ab-re-in');
+      var box = body.querySelector('#ab-re-msg');
+      inp.focus(); inp.select();
+      body.querySelector('#ab-re-cancel').onclick = closeLayer;
+      body.querySelector('#ab-re-ok').onclick = function () {
+        var v = inp.value;
+        if (!v.trim()) { box.style.display = ''; msg(box, '名字不能是空的', false); return; }
+        api('/_gate/projects/rename', { method: 'POST', body: JSON.stringify({ key: p.key, name: v }) })
+          .then(function (r) {
+            if (!r.ok) { box.style.display = ''; msg(box, (r.body && r.body.error) || '改不了', false); return; }
+            closeLayer();
+            if (onDone) onDone();
+          });
+      };
+      inp.addEventListener('keydown', function (e) { if (e.key === 'Enter') body.querySelector('#ab-re-ok').click(); });
+    });
+  }
+
   function openProjectsWith(owners) {
     var isAdmin = !!(ME && ME.role === 'admin');
     openLayer('项目管理', function (body) {
@@ -1105,6 +1216,17 @@
                 : '<span style="color:var(--live)">运行中</span>') +
               (p.editable ? '' : ' ｜ 此项目无独立运行环境') + '</div></div></div>';
             var acts = document.createElement('div'); acts.style.cssText = 'display:flex;gap:7px;margin-top:10px;flex-wrap:wrap';
+            // 改名（2026-09-19 老板：「凡是用户能够通过 ai 设置的无风险事项，一律交给用户和 ai，
+            //   不要写死」）—— 项目名只是 projects.json 里的一个**显示字段**：
+            //   目录用的是 key（随机 ID），引擎 / 预览 / 对话 / 快照都不读它 ⇒ 改了不影响任何东西。
+            //   所以它**不锁在平台侧**：用户在这里改，AI 走门卫的 /_gate/ai/projects/rename 也能改。
+            //   （2026-09-19 之前根本没有这个入口 —— 老板让 AI 改项目名时，AI 编了两个不存在的菜单项。）
+            var bRe = document.createElement('button');
+            bRe.className = 'ab-btn sm';
+            bRe.type = 'button';
+            bRe.textContent = '改名';
+            bRe.onclick = function () { openRenameProject(p, openProjects); };
+            acts.appendChild(bRe);
             // 工作台不给删（2026-09-16 老板定 A）：它是平台给你的干活入口、不是客户的项目，
             //   删了连里面所有产出文件（PPT/Excel）一起没，也没地方补。后端同时拦着，两层。
             if (p.workbench) {
@@ -1629,12 +1751,15 @@
             esc(repoSummary(repo)) +
           '</span><button class="ab-btn ghost sm" id="adv-repo" type="button" style="flex:0 0 auto">设置</button></div>' +
           '<div style="margin:14px 0 6px;color:var(--text);font-size:14px">执行前</div>' +
-          '<div class="ab-row"><label>审批方式</label><select class="ab-input" id="adv-approval">' +
-            '<option value="suggest"' + (am === 'suggest' ? ' selected' : '') + '>每次询问 —— 每一步都先问我</option>' +
-            '<option value="auto"' + (am === 'auto' ? ' selected' : '') + '>小的自己做（默认）—— 拿不准才问我</option>' +
-            '<option value="bypass"' + (am === 'bypass' ? ' selected' : '') + '>全部自己做 —— 不再询问</option>' +
-          '</select></div>' +
-          '<div class="ab-tip" style="margin:-4px 0 10px 78px">这里的设置对你名下所有项目生效；当前会话会立刻跟着变（对话上方那排小标签就是它）。选「全部自己做」后，AI 改文件、执行命令不再询问。</div>' +
+          // ★ 2026-09-19（老板：「两个入口合并成一个」）：这里从**下拉**改成「值 + 修改」——
+          //   选项定义只有一份（APPROVAL_OPTS）、写路径只有一条（applyApprovalChoice），
+          //   跟**对话上方那个「审批」标签**完全是同一个设置；点「修改」就地展开三档
+          //   （不换层：`openLayer` 是单层的，弹层会把高级设置顶掉 —— 客户会莫名其妙被弹出去）。
+          '<div class="ab-row"><label>审批方式</label><span class="ab-input" id="adv-approval-val" style="cursor:default;color:var(--text-dim)">' +
+            esc(approvalTextOf(am)) +
+          '</span><button class="ab-btn ghost sm" id="adv-approval" type="button" style="flex:0 0 auto">修改</button></div>' +
+          '<div id="adv-approval-list" style="display:none;margin:-4px 0 10px 78px"></div>' +
+          '<div class="ab-tip" style="margin:-4px 0 10px 78px">也可以直接点对话上方那排小标签里的「审批」—— 两处是同一个设置。改完当前会话立刻生效，以后新建的项目也按这个来。选「完全访问」后，AI 改文件、执行命令不再询问。</div>' +
           '<div style="margin:14px 0 6px;color:var(--text);font-size:14px">显示</div>' +
           '<label class="ab-chk"><input type="checkbox" id="adv-think"' + (cfg.show_thinking ? ' checked' : '') + '> 显示思考过程</label>' +
           '<label class="ab-chk"><input type="checkbox" id="adv-think-exp"' + (cfg.thinking_default_expanded ? ' checked' : '') + '> 默认展开思考过程</label>' +
@@ -1738,7 +1863,36 @@
         }
         el.querySelector('#adv-mk').onclick = openModelApiLoader;
         el.querySelector('#adv-repo').onclick = function () { openRepoForm(repo); };
-        bindSel('adv-approval', 'approval_mode');
+        // 审批方式：不再自带一套下拉 —— 选项定义（APPROVAL_OPTS）与写路径（applyApprovalChoice）
+        // 跟对话上方那个标签**完全是同一份**；这里只是就地把那三档展开（不换层）。
+        var advApprovalBtn = el.querySelector('#adv-approval');
+        var advApprovalList = el.querySelector('#adv-approval-list');
+        if (advApprovalBtn && advApprovalList) advApprovalBtn.onclick = function () {
+          if (advApprovalList.style.display !== 'none') { advApprovalList.style.display = 'none'; return; }
+          advApprovalList.style.display = '';
+          advApprovalList.innerHTML = APPROVAL_OPTS.map(function (o) {
+            return '<button class="ab-menu-item" data-m="' + o.m + '">' + o.t + '<small>' + o.d + '</small></button>';
+          }).join('');
+          advApprovalList.querySelectorAll('button[data-m]').forEach(function (b) {
+            b.onclick = function () {
+              var o = APPROVAL_OPTS.filter(function (x) { return x.m === b.getAttribute('data-m'); })[0];
+              if (!o) return;
+              b.disabled = true;
+              applyApprovalChoice(o).then(function (rs) {
+                b.disabled = false;
+                if (rs[0] && !rs[0].ok) { msg(el.querySelector('#adv-msg'), (rs[0].body && rs[0].body.error) || '没存下来', false); return; }
+                var v = el.querySelector('#adv-approval-val');
+                if (v) v.textContent = o.t;
+                advApprovalList.style.display = 'none';
+                paintFact('permission', o.t);
+                msg(el.querySelector('#adv-msg'), '已改为「' + o.t + '」', true);
+              }).catch(function (e) {
+                b.disabled = false;
+                msg(el.querySelector('#adv-msg'), '没改成功：' + ((e && e.message) || e), false);
+              });
+            };
+          });
+        };
         bindSel('adv-diffs', 'inline_diffs');
         bindSel('adv-locale', 'locale');
         bindSel('adv-think-lines', 'thinking_preview_lines');
@@ -2236,6 +2390,13 @@
       ctxEl.id = 'asbudy-ctx';
       ctxEl.setAttribute('aria-live', 'polite');
       el.appendChild(ctxEl);
+      // 会话指标：跟「记性」同排、放在它后面（它是有数据才出现的读数，不占固定位置）
+      var metricsEl = document.createElement('span');
+      metricsEl.id = 'asbudy-metrics';
+      metricsEl.hidden = true;
+      metricsEl.setAttribute('aria-live', 'polite');
+      el.appendChild(metricsEl);
+      try { metricsRender(metricsEl); } catch (e0) { /* 首次渲染失败不影响对话 */ }
       // 「正在做什么」状态行：放在最左 —— 先看到「它现在在干什么」，再看到别的
       var liveEl = document.createElement('span');
       liveEl.id = 'asbudy-live';
@@ -2308,6 +2469,91 @@
       liveTick();
     }
     setInterval(liveTick, 1000);
+
+    // ── 会话指标：`ttft 400ms · 38 平均 tok/s · ↓ 1.2K`（2026-09-19 搬 · 逐条照官方 CLI）──
+    // 数据来源：引擎每次模型调用推的 `turn.usage`（payload 带 usage / duration_ms /
+    //   first_token_ms / request_ms）。**官方前端订阅了它却没有处理分支** ——
+    //   数据早就到浏览器了，只是没人接。这里接上。
+    // 口径逐条照 CLI 的 `SessionMetrics`（`tui/session_metrics.rs:74` `record_model_call`）：
+    //   ttft  = 本 session **报过 ttft 的那些调用**的平均值（`ttft_average`，:137）
+    //   速率  = 本 session `output_tokens 总和 ÷ request_ms 总和`（`tokens_per_second`，:147）——
+    //           只统计 request_ms > 0 的调用；ttft 样本为 0 / 秒数为 0 时**不显示**（绝不补 0）
+    //   ↓     = **最近一次**调用的 output_tokens（`output_tokens(app)`，`ui/frame.rs:63`）
+    // 显示词与格式也照官方（`tui/ui/frame.rs:268-292` ＋ zh-Hans：`ttft` / `平均 tok/s` / `↓`）。
+    // ⚠️ 作用域差异（如实记着）：CLI 的累加器活在进程里，重开会话即清零；网页端对应
+    //   「本次打开界面以来」—— 刷新页面即清零。历史轮次的累计值不在这一行（那看「用量」面板）。
+    var METRICS = { ttftTotalMs: 0, ttftSamples: 0, rateTokens: 0, rateMs: 0, lastOutput: 0 };
+
+    /** 照 CLI `format_duration`（`session_metrics.rs:246`）：`0s` / `320ms` / `1.5s` / `11m46s` / `1h02m` */
+    function fmtMetricsDur(ms) {
+      ms = Math.max(0, Math.round(Number(ms) || 0));
+      if (ms === 0) return '0s';
+      if (ms < 1000) return ms + 'ms';
+      var secs = Math.floor(ms / 1000);
+      if (secs < 60) {
+        var tenths = Math.floor((ms + 50) / 100);
+        return Math.floor(tenths / 10) + '.' + (tenths % 10) + 's';
+      }
+      if (secs < 3600) return Math.floor(secs / 60) + 'm' + String(secs % 60).padStart(2, '0') + 's';
+      return Math.floor(secs / 3600) + 'h' + String(Math.floor((secs % 3600) / 60)).padStart(2, '0') + 'm';
+    }
+    /** 照 CLI `format_tokens`（`session_metrics.rs:267`）：`842` / `12.3K` / `9.3M` / `1.2B` */
+    function fmtMetricsTokens(n) {
+      n = Math.max(0, Math.round(Number(n) || 0));
+      var units = [[1e9, 'B'], [1e6, 'M'], [1e3, 'K']];
+      for (var i = 0; i < units.length; i++) {
+        var scale = units[i][0];
+        if (n >= scale) {
+          var scaled = n / scale;
+          return (scaled >= 100 ? scaled.toFixed(0) : scaled.toFixed(1)) + units[i][1];
+        }
+      }
+      return String(n);
+    }
+    /** 照 CLI `format_rate`（`session_metrics.rs:284`）：<10 保留一位小数，否则取整 */
+    function fmtMetricsRate(rate) {
+      return rate < 10 ? rate.toFixed(1) : rate.toFixed(0);
+    }
+    function metricsRender(el) {
+      // ⚠️ `ensure()` 里调用时 msgbar 还没插进 DOM，`getElementById` 找不到它 ——
+      //   所以允许把元素直接传进来（重建时再走 id 那条路）。
+      if (!el) el = document.getElementById('asbudy-metrics');
+      if (!el) return;
+      var parts = [];
+      if (METRICS.ttftSamples > 0) {
+        parts.push('ttft ' + fmtMetricsDur(Math.floor(METRICS.ttftTotalMs / METRICS.ttftSamples)));
+      }
+      var secs = METRICS.rateMs / 1000;
+      if (METRICS.rateTokens > 0 && secs > 0) {
+        parts.push(fmtMetricsRate(METRICS.rateTokens / secs) + ' 平均 tok/s');
+      }
+      if (METRICS.lastOutput > 0) parts.push('↓ ' + fmtMetricsTokens(METRICS.lastOutput));
+      el.textContent = parts.join(' · ');
+      el.hidden = parts.length === 0;
+      el.title = parts.length
+        ? '本次打开界面以来：ttft ＝ 平均首字延迟 · 平均 tok/s ＝ 平均输出速度 · ↓ ＝ 最近一轮输出 token'
+        : '';
+    }
+    /** 折进一条 `turn.usage` —— 与 CLI `record_model_call` 同一套加减法 */
+    function metricsFold(p) {
+      var u = (p && p.usage) || {};
+      var out = Number(u.output_tokens) || 0;
+      var ttft = (p && p.first_token_ms !== null && p.first_token_ms !== undefined)
+        ? Number(p.first_token_ms) : null;
+      if (ttft !== null && isFinite(ttft) && ttft >= 0) {
+        METRICS.ttftTotalMs += ttft;
+        METRICS.ttftSamples += 1;
+      }
+      var reqMs = (p && p.request_ms !== null && p.request_ms !== undefined)
+        ? Number(p.request_ms) : null;
+      if (reqMs !== null && isFinite(reqMs) && reqMs > 0) {
+        METRICS.rateTokens += out;
+        METRICS.rateMs += reqMs;
+      }
+      if (out > 0) METRICS.lastOutput = out;
+      metricsRender();
+    }
+
     window.addEventListener('asbudy:activity', function (e) {
       var d = (e && e.detail) || {};
       var ev = d.event;
@@ -2329,6 +2575,7 @@
         return;
       }
       if (ev === 'tool_call.resolved') { if (LIVE.active) liveSet('使用工具中'); }
+      if (ev === 'turn.usage') metricsFold(p);
     });
 
     function fmtK(n) {
@@ -2425,7 +2672,7 @@
         pending = true;
         setTimeout(function () {
           pending = false;
-          try { if (ensure()) loadCtx(); } catch (e0) { /* 重建失败不影响对话 */ }
+          try { if (ensure()) { loadCtx(); metricsRender(); } } catch (e0) { /* 重建失败不影响对话 */ }
         }, 300);
       }).observe(document.body, { childList: true, subtree: true });
     }
@@ -2598,6 +2845,52 @@
       else if (n > 400) clearInterval(t);                    // 10 分钟还没聊过 → 不再盯
     }, 1500);
     ckPaint();
+  })();
+
+  /* ── 矮可视视口（手机键盘弹出）：别让非对话行把对话区挤没 ──────────────────
+   * 【2026-09-19 老板报】「AI 回复最后内容下方有一块 CSS 空白，手机点输入框后像是它挡住了输入框」。
+   * 实测（390×844 仿真手机 · headless Chromium）：
+   *   · 那块空白 = 官方两条样式叠出来的 68px —— `.transcript` 手机端 padding-bottom 44px
+   *     （`styles.css` 媒体查询 `padding: 26px 16px 44px`）＋ 最后一条 `article` 的 margin-bottom 24px。
+   *     正常态这是消息的呼吸感，**本身不是 bug**。
+   *   · 真问题在键盘弹出：`.session` 是 5 行网格，可视高掉到 560px 时实测行高
+   *     95(header) / 32(状态行) / **77(对话区)** / **212(上手卡)** / 144(输入区) —— 非对话行**一个都不缩**
+   *     ⇒ 对话区自己上下内边距就要 26+44=70px ⇒ **内容可视 7px**；掉到 480px 时对话区 0px、
+   *     AI 最后一行文字实测**可见 0 像素**，屏幕上剩下的正是那片空白。
+   *   · 对照：把上手卡拿掉 → 同一视口对话区回到 209px（内容可视 139px）。
+   * 所以这里**只做一件事**：视口矮的时候收掉上手卡 ＋ 收对话区的内边距，把地方还给对话。
+   *
+   * 判据用 `visualViewport.height`（跨 iOS/Android 的唯一真相）：
+   *   iOS 键盘弹出**不改 layout viewport**，`@media (max-height)` 在它上面不生效；Android 两者都变。
+   * 阈值 660 + 只在窄屏（≤800px，即手机布局）生效：
+   *   · 小屏手机竖屏不弹键盘（iPhone SE 667）不触发 —— 上手卡照旧看得到；
+   *   · 弹了键盘（~407）触发；键盘高度由系统决定、与我们收不收卡片无关 ⇒ **不会抖**，不用滞回。
+   *   · 桌面窗口拉矮**不触发**：桌面是另一套 6 行网格，对话区那行本来就带 minmax(144px,1fr) 保底。
+   * ⚠️ 与「用户主动点收起」是两回事：这里**不写 localStorage** —— 键盘收回去，卡片自己回来。
+   * 只加一个 class，具体收什么写在下面这张样式里（以后按同样的理由要收别的行，也往这儿加）。
+   */
+  var vvCss = document.createElement('style');
+  vvCss.id = 'ab-vv-short-css';
+  vvCss.textContent = [
+    'body.ab-vv-short #asbudy-checklist{display:none}',
+    'body.ab-vv-short .transcript{padding-top:10px;padding-bottom:12px}',
+  ].join('\n');
+  document.head.appendChild(vvCss);
+  (function () {
+    var SHORT = 660;
+    var narrow = window.matchMedia('(max-width: 800px)');
+    function vv() {
+      var h = (window.visualViewport && window.visualViewport.height) || window.innerHeight || 0;
+      document.body.classList.toggle('ab-vv-short', narrow.matches && h > 0 && h < SHORT);
+    }
+    vv();
+    if (window.visualViewport) {
+      visualViewport.addEventListener('resize', vv);
+      visualViewport.addEventListener('scroll', vv);   // iOS 上有时只发 scroll
+    }
+    window.addEventListener('resize', vv);
+    window.addEventListener('orientationchange', vv);
+    if (narrow.addEventListener) narrow.addEventListener('change', vv);
   })();
 
   /* 「设置在哪」得**分屏宽说**（2026-09-16 实测）：
