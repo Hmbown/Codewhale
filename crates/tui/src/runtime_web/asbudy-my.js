@@ -88,6 +88,19 @@
     // 徽标（耗时 / 退出码）
     '.receipt-meta{color:var(--text-dim);font-size:12.5px;margin-left:6px;white-space:nowrap}',
     '.receipt[data-variant="exec"] .receipt-meta{color:var(--text-muted)}',
+    // ── 工具族字形（2026-09-20 搬 · 照 CLI 的 `family_glyph`）──
+    //   把 7×7 的圆点换成族字形：`▷` 读 · `◆` 改 · `▶` 跑 · `⌕` 找 · `◐` 子代理 · `✓` 验证 · `•` 其它。
+    //   ⚠️ 这两组必须**排在 `[data-variant]` 那组之后** —— 两组特异性相同（2 属性 + 1 类），
+    //     靠后定义的赢；排前面的话圆点背景会盖在字形上。
+    '.receipt[data-family] .receipt-dot{flex:0 0 auto;width:auto;height:auto;margin-top:0;border-radius:0;background:none;font-size:13px;line-height:1.5;color:var(--text-faint)}',
+    '.receipt[data-family="read"] .receipt-dot{color:var(--text-dim)}',
+    '.receipt[data-family="patch"] .receipt-dot{color:var(--action)}',
+    '.receipt[data-family="run"] .receipt-dot{color:var(--ok)}',
+    '.receipt[data-family="find"] .receipt-dot{color:var(--status-live)}',
+    '.receipt[data-family="verify"] .receipt-dot{color:var(--ok)}',
+    '.receipt[data-family="delegate"] .receipt-dot{color:var(--status-human)}',
+    // 失败优先（跟 styles.css 的 `.receipt.failed .receipt-dot` 同义，只是换成前景色）
+    '.receipt.failed[data-family] .receipt-dot{color:var(--danger)}',
   ].join('\n');
   document.head.appendChild(st);
 
@@ -541,10 +554,61 @@
   //     91 次在 1 秒内被引擎自己批掉 —— 老板 2026-09-19 拍「按实测写」）。
   var POSTURE_TEXT = { ask: '询问', auto_review: '自动审核', full_access: '完全访问' };
   // 三档 ↔ 引擎两个字段（跟门卫 syncThreadApproval 同一套映射 —— 改一边必须改另一边）
+  /* ── 「状态行显示哪些段」（2026-09-20 搬 · 照官方 CLI 的 `/statusline` 多选选择器）──
+   * ⚠️ **必须放顶层**（跟 POSTURE_TEXT 这一档同级）：初版把它们写在会话指标那个嵌套作用域里，
+   *   结果 `openAdvanced`（顶层）看不到 `statuslineSummary` —— 高级设置面板直接报
+   *   `statuslineSummary is not defined`、永远停在「加载中…」（实测踩到）。
+   * 官方那一项存 **`settings.toml`**（`commands/groups/config/config.rs:550`
+   *   → `AppAction::OpenStatusPicker`，实现在 `ui/apply.rs:2135`）；
+   * 而引擎的 `POST /v1/config` **白名单里没有状态行键** ⇒ 网页端只能落 **localStorage**
+   *   （跟 tip 机制同一处；**别去写 settings.toml** —— 会撞 EACCES，见 server.js 里那条教训）。
+   * ⚠️ 所以它**不跨浏览器**（换台机器/换个浏览器要重设）—— 界面上跟客户说清了。
+   * 存的是「**关掉**的段」（默认全开 → 新搬的段自动出现，不用改存量设置）。 */
+  var STATUSLINE_OFF_KEY = 'ab-statusline-off';
+  var STATUSLINE_SEGS = [
+    { k: 'ttft', label: '首字延迟（ttft）' },
+    { k: 'rate', label: '输出速度（平均 tok/s）' },
+    { k: 'output', label: '本轮输出量（↓ tokens）' },
+    { k: 'cache', label: '缓存命中率（cache）' },
+  ];
+  function statuslineOff() {
+    try {
+      var raw = localStorage.getItem(STATUSLINE_OFF_KEY);
+      var arr = raw ? JSON.parse(raw) : [];
+      return Array.isArray(arr) ? arr : [];
+    } catch (e) { return []; }
+  }
+  function setStatuslineOff(list) {
+    try { localStorage.setItem(STATUSLINE_OFF_KEY, JSON.stringify(list)); } catch (e) { /* 存不了就用默认 */ }
+  }
+  /** 「状态行显示」那一行的值文字 —— 全开时写「全部」，否则把关掉的列出来 */
+  function statuslineSummary() {
+    var off = statuslineOff();
+    if (!off.length) return '全部 ' + STATUSLINE_SEGS.length + ' 项';
+    var names = STATUSLINE_SEGS.filter(function (s) { return off.indexOf(s.k) >= 0; })
+      .map(function (s) { return s.label.replace(/（.*）$/, ''); });
+    return '已关：' + names.join('、');
+  }
+
   var APPROVAL_OPTS = [
     { m: 'suggest', p: 'ask', a: false, t: '询问', d: '在可能造成重大更改的工具运行前询问（在项目文件夹里写文件不询问）' },
     { m: 'auto', p: 'auto_review', a: false, t: '自动审核', d: '不问你；它自己判断，不行的直接拦下（默认）' },
     { m: 'bypass', p: 'full_access', a: true, t: '完全访问', d: '无需审批提示即可运行工具' },
+  ];
+  /* 推理级别（思考强度）—— 2026-09-20 搬表 M6（官方 CLI `/effort`，别名 `/thinking`；`Ctrl+T`）
+   * ⚠️ **取值只照官方「DeepSeek 路由」那一档**（`tui/model_picker.rs:63` 的 `DEEPSEEK_PICKER_EFFORTS`
+   *   ＝ `Auto, Off, Low, High, Max`）—— **不是**通用那套（通用还有 minimal/medium/xhigh/ultra）。
+   *   官方注释（`reasoning_preference.rs:224-235`）：DeepSeek 线上文档只认 low/high/max，
+   *   `medium` 会被**上取整成 high** ⇒ 官方在 DeepSeek 上就只摆这 5 档，我们跟着摆 5 档。
+   *   键名与值串都照官方（`reasoning_effort` / `as_setting()` 的规范串）。
+   *   官方 web **没有**这一项（`runtime_web/app.mjs` 对 reasoning_effort 0 命中）—— 这是补空白。
+   *   「未设置」在引擎里读出来就是 `auto`（`runtime_api.rs:7343` 的 `unwrap_or("auto")`）。 */
+  var EFFORT_OPTS = [
+    { v: 'auto', t: '自动（默认）' },
+    { v: 'off', t: '关闭 —— 最快' },
+    { v: 'low', t: '低 —— 更快' },
+    { v: 'high', t: '高 —— 更仔细' },
+    { v: 'max', t: '最高 —— 想得最久' },
   ];
   /** 审批档的中文名 —— **一份定义两处用**（对话上方的标签、我的 → 高级设置那一行） */
   function approvalTextOf(mode) {
@@ -800,6 +864,7 @@
       }
       if (role === 'admin') {
         html += '<button class="ab-menu-item" id="ab-m-users">客户管理<small>添加客户、转移项目归属</small></button>';
+        html += '<button class="ab-menu-item" id="ab-m-tokens">用量明细<small>每个账号用了多少 token、值多少钱</small></button>';
       }
       html += '<button class="ab-menu-item" id="ab-m-proj">项目管理<small>查看和删除项目</small></button>';
       // 项目文件（2026-09-19 老板：「留「我的资料」，「项目文件」收到「我的」里」）——
@@ -829,6 +894,8 @@
       if (bStaff) bStaff.onclick = function () { openStaff(role === 'admin' ? 'admin' : ME.user); };
       var bUsers = body.querySelector('#ab-m-users');
       if (bUsers) bUsers.onclick = openUsers;
+      var bTokens = body.querySelector('#ab-m-tokens');
+      if (bTokens) bTokens.onclick = openTokenUsage;
       body.querySelector('#ab-m-proj').onclick = openProjects;
       body.querySelector('#ab-m-files').onclick = function () { openSidePanel('项目文件', 'proj'); };
       body.querySelector('#ab-m-mem').onclick = openMemory;
@@ -1338,7 +1405,7 @@
         if (!items.length) {
           html += '<div class="ab-tip">还没有占用。</div>';
         } else {
-          html += '<div class="ab-tip">项目、工作台、回收站、文件都从这一个额度里出。</div>';
+          html += '<div class="ab-tip">项目、工作台、回收站、文件、引擎数据都从这一个额度里出。</div>';
           items.forEach(function (it) {
             html += '<div class="ab-card"><div class="ab-n">' + esc(it.name) + '</div>' +
               '<div class="ab-s">' + esc(it.group) + ' ｜ ' + fmtMb(it.mb) + '</div></div>';
@@ -1606,6 +1673,106 @@
     });
   }
 
+  /* ══ 用量明细（平台管理员视角 · 2026-09-20 老板要）══════════════════════════
+   * 老板原话：「想能够看到每个账号的 token 消耗明细，以便了解用户使用情况和为以后定价做准备」。
+   *
+   * 数据源：门卫 `/_gate/token-usage` ← 各账号**引擎自带的账本**（每次调模型按 provider
+   *   报回来的 usage 落账）。所以这里显示的是**厂商口径的原始值**，不是前端估的。
+   * ⚠️ 两条口径必须写在界面上（不然数字看着像账单、实际不是）：
+   *   ① 金额是**引擎按内置价目表推算**的（含 DeepSeek 的峰谷/周末价），不是厂商账单；
+   *   ② 「未归属」= 没有记到具体项目的会话（平台内部/测试对话），不是客户的项目。
+   * ⚠️ 这是跨账号的平台视角，只给管理员（菜单里也只在 admin 下显示）。
+   */
+  var TU = {};
+  function tuN(n) { return String(Math.round(Number(n) || 0)).replace(/\B(?=(\d{3})+(?!\d))/g, ','); }
+  function tuW(n) {
+    n = Number(n) || 0;
+    if (n >= 10000) { var w = n / 10000; return (w >= 100 ? String(Math.round(w)) : String(Math.round(w * 10) / 10)) + ' 万'; }
+    return tuN(n);
+  }
+  function tuY(v) { return '￥' + (Number(v) || 0).toFixed(2); }
+  function tuLine(left, mid, right) {
+    return '<div style="display:flex;gap:10px;align-items:baseline;padding:3px 0;font-size:13.5px;color:var(--text-dim)">' +
+      '<span style="min-width:82px">' + esc(left) + '</span>' +
+      '<span style="flex:1">' + mid + '</span>' +
+      '<span style="min-width:70px;text-align:right;color:var(--text)">' + right + '</span></div>';
+  }
+  function tuAccountCard(a) {
+    var h = '<div class="ab-card">';
+    h += '<div class="ab-card-top"><b>' + esc(a.label || a.account) + '</b>' +
+      '<span class="ab-s" style="margin:0">' + esc(a.account) + (a.port ? ' · 端口 ' + a.port : '') +
+      (a.model ? ' · ' + esc(a.model) : '') + '</span></div>';
+    if (a.error || !a.totals) {
+      h += '<div class="ab-s">读不到这个账号的用量：' + esc(a.error || '引擎没在跑') + '</div>';
+      h += '<div class="ab-s">（账在引擎家的盘上，引擎起来就还在；不是丢了。）</div></div>';
+      return h;
+    }
+    var t = a.totals;
+    h += '<div class="ab-s" style="font-size:16px;color:var(--text)">' + tuY(t.costCny) +
+      '　<span style="font-size:13.5px">（调用 ' + tuN(t.calls) + ' 次）</span></div>';
+    h += '<div class="ab-s">进 ' + tuW(t.inTok) + ' · 出 ' + tuW(t.outTok) +
+      ' · 缓存命中 ' + tuW(t.cachedTok) + ' · 推理 ' + tuW(t.reasonTok) + '</div>';
+    if (!t.complete) {
+      h += '<div class="ab-s" style="color:var(--warning)">其中 ' + tuN(t.unpricedCalls) +
+        ' 次调用缺定价凭据 —— token 照记，金额少算了一点。</div>';
+    }
+    if (a.days && a.days.length) {
+      h += '<div class="ab-s" style="margin-top:10px;color:var(--text)">按天</div>';
+      a.days.forEach(function (d) {
+        h += tuLine(d.date,
+          tuN(d.calls) + ' 次 · 进 ' + tuW(d.inTok) + ' · 出 ' + tuW(d.outTok) + ' · 缓存 ' + tuW(d.cachedTok),
+          tuY(d.costCny));
+      });
+    }
+    if (a.projects && a.projects.length) {
+      h += '<div class="ab-s" style="margin-top:10px;color:var(--text)">按项目</div>';
+      a.projects.forEach(function (p) {
+        var b = p.brief || {};
+        h += tuLine(p.name || p.key || '未归属',
+          tuN(b.calls) + ' 次 · 进 ' + tuW(b.inTok) + ' · 出 ' + tuW(b.outTok) + ' · 缓存 ' + tuW(b.cachedTok),
+          tuY(b.costCny));
+      });
+    }
+    h += '</div>';
+    return h;
+  }
+  function tuRender(d) {
+    var g = d.grand || {};
+    // 口径说明每次都要看得见（不能用 abTipPanel —— 那个只看一次就不再显示）
+    var h = '<div class="ab-tip" style="border:1px solid rgba(106,174,242,.4);background:var(--action-soft);border-radius:8px;padding:8px 11px;margin:0 0 12px">' +
+      '每个账号一套引擎，数据来自引擎自带的用量账本（厂商返回的原值）。' +
+      '金额是按引擎内置价目表推算的，<b>不是厂商账单</b>；「未归属」是没有记到具体项目的对话（平台内部/测试）。' +
+      (d.cached ? '<br>本次为 60 秒内的缓存结果，点「刷新」可强制重读。' : '') + '</div>';
+    h += '<div class="ab-card">';
+    h += '<div class="ab-card-top"><b>全部账号合计</b><button class="ab-btn ghost sm" id="tu-refresh" type="button">刷新</button></div>';
+    h += '<div class="ab-s" style="font-size:16px;color:var(--text)">' + tuY(g.costCny) +
+      '　<span style="font-size:13.5px">（调用 ' + tuN(g.calls) + ' 次）</span></div>';
+    h += '<div class="ab-s">进 ' + tuW(g.inTok) + ' · 出 ' + tuW(g.outTok) + ' · 缓存命中 ' + tuW(g.cachedTok) +
+      ' · 推理 ' + tuW(g.reasonTok) + '</div>';
+    if (!g.complete) h += '<div class="ab-s" style="color:var(--warning)">含 ' + tuN(g.unpricedCalls) + ' 次缺定价凭据的调用（金额略少算）</div>';
+    h += '</div>';
+    (d.accounts || []).forEach(function (a) { h += tuAccountCard(a); });
+    return h;
+  }
+  function openTokenUsage() {
+    openLayer('用量明细', function (body) {
+      function load(force) {
+        body.innerHTML = '<div class="ab-tip">正在读各账号用量…</div>';
+        api('/_gate/token-usage' + (force ? '?force=1' : '')).then(function (r) {
+          if (!r.ok) {
+            body.innerHTML = '<div class="ab-tip">读不到：' + esc((r.body && r.body.error) || ('HTTP ' + r.code)) + '</div>';
+            return;
+          }
+          TU.last = r.body;
+          body.innerHTML = tuRender(r.body);
+          var b = body.querySelector('#tu-refresh');
+          if (b) b.onclick = function () { load(true); };
+        });
+      }
+      load(false);
+    });
+  }
+
   function openMemory() {
     openLayer('AI 的记忆', function (body) {
       body.innerHTML = '<div id="ab-mem">加载中…</div>';
@@ -1733,6 +1900,9 @@
         var diffsMode = (cfg.inline_diffs === 'summary' || cfg.inline_diffs === 'off') ? cfg.inline_diffs : 'full';
         // thinking_preview_lines 暂时可能读不到（引擎还没暴露）→ 退回官方默认 2
         var thinkLines = (typeof cfg.thinking_preview_lines === 'number') ? cfg.thinking_preview_lines : 2;
+        // 思考强度（推理级别）：只认官方 DeepSeek 路由那 5 档（见 EFFORT_OPTS）；读到别的值就显「自动」
+        var effortVals = EFFORT_OPTS.map(function (o) { return o.v; });
+        var effort = effortVals.indexOf(cfg.reasoning_effort) >= 0 ? cfg.reasoning_effort : 'auto';
         var loc = cfg.locale || 'auto';
         var el = body.querySelector('#ab-adv');
         if (!el) return;
@@ -1760,6 +1930,13 @@
           '</span><button class="ab-btn ghost sm" id="adv-approval" type="button" style="flex:0 0 auto">修改</button></div>' +
           '<div id="adv-approval-list" style="display:none;margin:-4px 0 10px 78px"></div>' +
           '<div class="ab-tip" style="margin:-4px 0 10px 78px">也可以直接点对话上方那排小标签里的「审批」—— 两处是同一个设置。改完当前会话立刻生效，以后新建的项目也按这个来。选「完全访问」后，AI 改文件、执行命令不再询问。</div>' +
+          '<div style="margin:14px 0 6px;color:var(--text);font-size:14px">思考</div>' +
+          '<div class="ab-row"><label>推理级别</label><select class="ab-input" id="adv-effort">' +
+            EFFORT_OPTS.map(function (o) {
+              return '<option value="' + o.v + '"' + (effort === o.v ? ' selected' : '') + '>' + esc(o.t) + '</option>';
+            }).join('') +
+          '</select></div>' +
+          '<div class="ab-tip" style="margin:-2px 0 10px 0">AI 回答前先想多久。调高：难题更稳，但更慢、也更费额度；调低：答得快，简单任务够用。改完下一轮对话生效。</div>' +
           '<div style="margin:14px 0 6px;color:var(--text);font-size:14px">显示</div>' +
           '<label class="ab-chk"><input type="checkbox" id="adv-think"' + (cfg.show_thinking ? ' checked' : '') + '> 显示思考过程</label>' +
           '<label class="ab-chk"><input type="checkbox" id="adv-think-exp"' + (cfg.thinking_default_expanded ? ' checked' : '') + '> 默认展开思考过程</label>' +
@@ -1786,6 +1963,11 @@
             '<option value="zh-Hans"' + (loc === 'zh-Hans' ? ' selected' : '') + '>简体中文</option>' +
             '<option value="en"' + (loc === 'en' ? ' selected' : '') + '>English</option>' +
           '</select></div>' +
+          '<div class="ab-row"><label>状态行显示</label><span class="ab-input" id="adv-statusline-val" style="cursor:default;color:var(--text-dim)">' +
+            esc(statuslineSummary()) +
+          '</span><button class="ab-btn ghost sm" id="adv-statusline" type="button" style="flex:0 0 auto">修改</button></div>' +
+          '<div id="adv-statusline-list" style="display:none;margin:-4px 0 10px 78px"></div>' +
+          '<div class="ab-tip" style="margin:-4px 0 10px 78px">底部状态行显示哪几项。窗口窄了不够摆时，没关掉的也会按重要性自动少显示几个（最先让出的是输出速度）——「模型」与「记性」两项永不丢。这一项存在<b>这台设备</b>上，换浏览器要重设。</div>' +
           '<div class="ab-tip" style="margin:-2px 0 10px 78px">这几项都是官方本来就有的设置（页面上文字仍为中文）。</div>' +
           '<label class="ab-chk"><input type="checkbox" id="adv-compact"' + (cfg.auto_compact ? ' checked' : '') + '> 聊天太长时自动帮我整理前面</label>' +
           '<div class="ab-tip" style="margin:2px 0 10px 0">自动整理会总结前面的内容 —— 部分细节会丢失（默认开启）。<br>⚠️ 关闭后请留意：长对话可能因超出模型上下文而中断。</div>' +
@@ -1893,8 +2075,41 @@
             };
           });
         };
+        // 状态行显示哪几项（2026-09-20 · 照官方 `/statusline` 的多选；落 localStorage，不走引擎）
+        var advStBtn = el.querySelector('#adv-statusline');
+        var advStList = el.querySelector('#adv-statusline-list');
+        if (advStBtn && advStList) {
+          advStBtn.onclick = function () {
+            if (advStList.style.display !== 'none') { advStList.style.display = 'none'; return; }
+            advStList.style.display = 'block';
+            var off = statuslineOff();
+            advStList.innerHTML = STATUSLINE_SEGS.map(function (s) {
+              return '<label class="ab-chk"><input type="checkbox" data-seg="' + s.k + '"' +
+                (off.indexOf(s.k) < 0 ? ' checked' : '') + '> ' + esc(s.label) + '</label>';
+            }).join('');
+            advStList.querySelectorAll('input[data-seg]').forEach(function (box) {
+              box.onchange = function () {
+                var next = [];
+                advStList.querySelectorAll('input[data-seg]').forEach(function (b) {
+                  if (!b.checked) next.push(b.dataset.seg);
+                });
+                setStatuslineOff(next);
+                var valEl = el.querySelector('#adv-statusline-val');
+                if (valEl) valEl.textContent = statuslineSummary();
+                // ⚠️ **不能直接叫 `metricsRender()`** —— 它长在「会话指标」那个**嵌套作用域**里，
+                //   而这段代码在顶层（跟 `statuslineSummary` 当初那个坑同源，实测踩过：
+                //   点了复选框、localStorage 变了、状态行纹丝不动）。
+                //   用事件把「该重画了」传回去（嵌套那侧监听）。
+                try { window.dispatchEvent(new CustomEvent('asbudy:statusline-change')); } catch (e1) { /* 没 window 就算了 */ }
+                msg(el.querySelector('#adv-msg'), '已更新状态行', true);
+              };
+            });
+          };
+        }
+
         bindSel('adv-diffs', 'inline_diffs');
         bindSel('adv-locale', 'locale');
+        bindSel('adv-effort', 'reasoning_effort');
         bindSel('adv-think-lines', 'thinking_preview_lines');
         bindChk('adv-think-bg', 'thinking_highlight');
         bindChk('adv-think', 'show_thinking');
@@ -2482,7 +2697,7 @@
     // 显示词与格式也照官方（`tui/ui/frame.rs:268-292` ＋ zh-Hans：`ttft` / `平均 tok/s` / `↓`）。
     // ⚠️ 作用域差异（如实记着）：CLI 的累加器活在进程里，重开会话即清零；网页端对应
     //   「本次打开界面以来」—— 刷新页面即清零。历史轮次的累计值不在这一行（那看「用量」面板）。
-    var METRICS = { ttftTotalMs: 0, ttftSamples: 0, rateTokens: 0, rateMs: 0, lastOutput: 0 };
+    var METRICS = { ttftTotalMs: 0, ttftSamples: 0, rateTokens: 0, rateMs: 0, lastOutput: 0, cacheHit: 0, cacheMiss: 0 };
 
     /** 照 CLI `format_duration`（`session_metrics.rs:246`）：`0s` / `320ms` / `1.5s` / `11m46s` / `1h02m` */
     function fmtMetricsDur(ms) {
@@ -2514,25 +2729,117 @@
     function fmtMetricsRate(rate) {
       return rate < 10 ? rate.toFixed(1) : rate.toFixed(0);
     }
+    /* ── 段的「丢车保帅」优先级（2026-09-20 搬 · 照 CLI `InfoSegmentId::shed_priority`）──     * `infoline.rs:113-136` 的原始表：`Rate=9 > Cache=8 = Ttft=8 > OutputTokens=7 = BillingTier=7
+     *   > Cost=6 > Balance=5 = Workspace=5 = GitBranch=5 > Goal=4 > Model=0 = Context=0`
+     * **数值越大越先丢**；`0` 那两个**永不丢**。
+     * 我们这根条上只有这 4 段（「模型」标签与「记性」在别的元素里，同属「永不丢」那一档）。 */
+    var METRIC_SHED = { rate: 9, cache: 8, ttft: 8, output: 7 };
+
+    /* ── 「状态行显示哪些段」（2026-09-20 · 照官方 CLI 的 `/statusline` 多选选择器）──
+     * 官方那一项存 **`settings.toml`**（`commands/groups/config/config.rs:550`
+     *   → `AppAction::OpenStatusPicker`，实现在 `ui/apply.rs:2135`）；
+     * 而引擎的 `POST /v1/config` **白名单里没有状态行键** ⇒ 网页端只能落 **localStorage**
+     *   （跟 tip 机制同一处；**别去写 settings.toml** —— 会撞 EACCES，见 server.js 里那条教训）。
+     * ⚠️ 所以它**不跨浏览器**（换台机器/换个浏览器要重设）—— 界面上要跟客户说清楚。
+     * 存的是「**关掉**的段」（默认全开 → 新搬的段自动出现，不用改存量设置）。 */
+    /** 这一段放得下吗。
+     *  ⚠️ 不能拿 `el.scrollWidth > el.clientWidth`：flex 会把子元素**压缩**，
+     *     读到的 clientWidth 是被压之后的，等于没量。
+     *  ⚠️ 判据不能写成「右边界 <= 容器右边界 - 2」—— 实测在正常宽度下指标位
+     *     本来就贴着容器右边，那个写法会把**放得下**误判成放不下，一路把段丢光。
+     *  两条判据：
+     *    ① 它得和**前一个可见兄弟**在同一行 —— `#asbudy-msgbar` 是 `flex-wrap:wrap`，
+     *       挤不下时它是**掉到第二行**而不是溢出。
+     *       ⚠️ **判「同一行」不能拿 top 差固定值** —— 实测同一行里 `#asbudy-ctx`（top=67）
+     *          和指标位（top=70）就差 **3px**（字号不同 + `align-items:center`）。
+     *          当初写 `r.top <= ref.top + 2`，结果把**放得下**全判成放不下、
+     *          一路把段丢到只剩一个（回归一下子红 10 条）。
+     *          ⇒ 改用**垂直区间重叠**：指标的顶跑到前一个的底下面，才算换行。
+     *    ② 别超出容器右边（flex-wrap 下一般不会，保险）。
+     */
+    function metricsFits(el) {
+      var host = el.parentNode;
+      if (!host || !host.getBoundingClientRect) return true;
+      var r = el.getBoundingClientRect();
+      if (!r.width) return true;                  // 还没布局（比如隐藏着）→ 不丢
+      var rectOf = function (node) {
+        return node && node.getBoundingClientRect ? node.getBoundingClientRect() : null;
+      };
+      var prev = el.previousElementSibling;
+      while (prev && !(rectOf(prev) && rectOf(prev).width)) prev = prev.previousElementSibling;
+      var ref = rectOf(prev) || rectOf(host);
+      if (ref && r.top >= ref.bottom - 1) return false;  // ① 换行了
+      var h = rectOf(host);
+      return !h || r.right <= h.right + 1;               // ② 没超出容器
+    }
+
     function metricsRender(el) {
       // ⚠️ `ensure()` 里调用时 msgbar 还没插进 DOM，`getElementById` 找不到它 ——
       //   所以允许把元素直接传进来（重建时再走 id 那条路）。
       if (!el) el = document.getElementById('asbudy-metrics');
       if (!el) return;
-      var parts = [];
-      if (METRICS.ttftSamples > 0) {
-        parts.push('ttft ' + fmtMetricsDur(Math.floor(METRICS.ttftTotalMs / METRICS.ttftSamples)));
+      // 先收集「有数据的段」（数组顺序即显示顺序；要丢时才按优先级挑）
+      // 客户在「高级设置 → 状态行显示」里关掉的段，这里直接不收集
+      var off = statuslineOff();
+      var on = function (k) { return off.indexOf(k) < 0; };
+      var segs = [];
+      if (METRICS.ttftSamples > 0 && on('ttft')) {
+        segs.push({ p: METRIC_SHED.ttft, t: 'ttft ' + fmtMetricsDur(Math.floor(METRICS.ttftTotalMs / METRICS.ttftSamples)) });
       }
       var secs = METRICS.rateMs / 1000;
-      if (METRICS.rateTokens > 0 && secs > 0) {
-        parts.push(fmtMetricsRate(METRICS.rateTokens / secs) + ' 平均 tok/s');
+      if (METRICS.rateTokens > 0 && secs > 0 && on('rate')) {
+        segs.push({ p: METRIC_SHED.rate, t: fmtMetricsRate(METRICS.rateTokens / secs) + ' 平均 tok/s' });
       }
-      if (METRICS.lastOutput > 0) parts.push('↓ ' + fmtMetricsTokens(METRICS.lastOutput));
-      el.textContent = parts.join(' · ');
-      el.hidden = parts.length === 0;
-      el.title = parts.length
-        ? '本次打开界面以来：ttft ＝ 平均首字延迟 · 平均 tok/s ＝ 平均输出速度 · ↓ ＝ 最近一轮输出 token'
+      if (METRICS.lastOutput > 0 && on('output')) {
+        segs.push({ p: METRIC_SHED.output, t: '↓ ' + fmtMetricsTokens(METRICS.lastOutput) });
+      }
+      // ── `cache NN%` 提示词缓存命中率（2026-09-20 搬 · 照 CLI 的 `StatusItem::Cache`）──
+      //   标签就是字面量 `cache`（`ui/frame.rs:309` 原文），跟 `ttft` 一样**不译**；
+      //   百分比公式照 `session_metrics.rs:448-451`：`(hit*100 + total/2) / total` —— 四舍五入。
+      //   ⚠️ **总数是 0 就不显示**（官方的判据是 `cache_total > 0`）—— 绝不补一个 0% 出来。
+      var cacheTotal = METRICS.cacheHit + METRICS.cacheMiss;
+      if (cacheTotal > 0 && on('cache')) {
+        segs.push({ p: METRIC_SHED.cache, t: 'cache ' + Math.floor((METRICS.cacheHit * 100 + cacheTotal / 2) / cacheTotal) + '%' });
+      }
+      var paint = function (list) {
+        el.textContent = list.map(function (s) { return s.t; }).join(' · ');
+      };
+      // 宽度不够就按优先级丢段，一直丢到放得下 —— **只丢这根条上的段**，
+      //   「模型」与「记性」那一档（Model/Context=0）永远不在这份名单里。
+      el.hidden = false;
+      if (segs.length) {
+        for (var guard = 0; guard < 8 && segs.length > 1; guard++) {
+          paint(segs);
+          if (metricsFits(el)) break;
+          var worst = 0;
+          for (var i = 1; i < segs.length; i++) if (segs[i].p > segs[worst].p) worst = i;
+          segs.splice(worst, 1);
+        }
+      }
+      paint(segs);
+      el.hidden = segs.length === 0;
+      el.title = segs.length
+        ? '本次打开界面以来：ttft ＝ 平均首字延迟 · 平均 tok/s ＝ 平均输出速度 · ↓ ＝ 最近一轮输出 token · cache ＝ 前缀缓存命中率'
         : '';
+    }
+
+    // 状态行的「段开关」改了（高级设置里点的）→ 当场重画。
+    // ⚠️ 必须走事件：那段 UI 在**顶层**、`metricsRender` 在这个嵌套作用域里 ——
+    //   顶层直接调它会报 `not defined`（跟 `statuslineSummary` 当初那个坑同源）。
+    if (typeof window !== 'undefined' && window.addEventListener) {
+      window.addEventListener('asbudy:statusline-change', function () {
+        try { metricsRender(); } catch (e) { /* 刷不动就算了 */ }
+      });
+    }
+
+    // 窗口宽度变了要重算丢哪些段 —— 否则拖窄了不丢、拖宽了不回来。
+    // 防抖 150ms（拖动过程中每帧都量一次会白算）。
+    if (typeof window !== 'undefined' && window.addEventListener) {
+      var metricsResizeTimer = null;
+      window.addEventListener('resize', function () {
+        if (metricsResizeTimer) clearTimeout(metricsResizeTimer);
+        metricsResizeTimer = setTimeout(function () { try { metricsRender(); } catch (e) { /* 量不到就算了 */ } }, 150);
+      });
     }
     /** 折进一条 `turn.usage` —— 与 CLI `record_model_call` 同一套加减法 */
     function metricsFold(p) {
@@ -2551,6 +2858,20 @@
         METRICS.rateMs += reqMs;
       }
       if (out > 0) METRICS.lastOutput = out;
+      // 前缀缓存命中/未命中 —— 照官方口径累加（`displayed_total_cache_hit_tokens` 那两个）。
+      //   ⚠️ 未命中**没上报**时，照官方脚注推算：`输入 − 命中`
+      //   （zh-Hans 的 `CmdCacheFootnote`：「当提供商未单独上报未命中时，由『输入 − 命中』推算」）。
+      //   命中本身没上报 ⇒ 这一轮**整个跳过**（不能拿 0 当命中，那会把命中率砸低）。
+      var hitN = Number(u.prompt_cache_hit_tokens);
+      if (isFinite(hitN) && hitN >= 0) {
+        var missN = Number(u.prompt_cache_miss_tokens);
+        if (!isFinite(missN)) {
+          var inN = Number(u.input_tokens);
+          missN = Math.max(0, (isFinite(inN) ? inN : hitN) - hitN);
+        }
+        METRICS.cacheHit += hitN;
+        METRICS.cacheMiss += Math.max(0, missN);
+      }
       metricsRender();
     }
 

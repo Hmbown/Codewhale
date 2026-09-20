@@ -704,6 +704,45 @@ function oneLineZh(value, max) {
   return text.length > max ? text.slice(0, max - 1) + "…" : text;
 }
 
+/* 文件改动卡的摘要 —— 照官方 `FileMutationSummary::semantic_summary()`
+ * （`history/file_mutation.rs:145-155`）：单文件是 `Created src/lib.rs · +30 -0`，
+ * 多文件是 `3 files · created 2 · updated 1`（M11 · 2026-09-20）。
+ *
+ * 为什么要有（老板报的疼点）：我们以前只有工具名猜出来的「写入 xxx」，而且**行数统计埋在
+ * diff 块里**（要展开才看得见）—— 官方那行是**卡片摘要**，默认就可见。
+ *
+ * 数据源是引擎自己给的（不用猜）：`tools/file.rs:611` 的形状
+ * `metadata.mutation = {diff, files:[{path, outcome}], renames:[]}`；
+ * `outcome` 就是引擎判定的 created / updated / deleted / renamed。
+ * ⚠️ 官方动作词（Created/Updated/…）在**中文语言包里没有**（0 命中）⇒ 中文是我们写的。
+ * ⚠️ 从 `outcome` 取而不是从工具名猜：`apply_patch` 可能一次改/删/新建好几个文件，
+ *   单看工具名说不准（官方的 outcome_label 也是读 outcome）。 */
+export function mutationSummaryZh(item) {
+  const meta = item && item.metadata && typeof item.metadata === "object" ? item.metadata : {};
+  const mut = meta.mutation && typeof meta.mutation === "object" ? meta.mutation : null;
+  if (!mut) return null;
+  const files = Array.isArray(mut.files) ? mut.files : [];
+  const stats = diffStats(typeof mut.diff === "string" ? mut.diff : "");
+  const statsText = "+" + stats.add + " -" + stats.del;
+  const outcomeZh = { created: "新建", updated: "修改", deleted: "删除", renamed: "重命名" };
+  if (!files.length) return "改动文件 · " + statsText;
+  if (files.length === 1) {
+    const file = files[0] || {};
+    const verb = outcomeZh[String(file.outcome || "").toLowerCase()] || "改动";
+    const path = shortPathZh(String(file.path || ""));
+    return (path ? verb + " " + path : verb + "文件") + " · " + statsText;
+  }
+  const counts = {};
+  files.forEach(function (file) {
+    const outcome = String((file && file.outcome) || "").toLowerCase();
+    if (outcomeZh[outcome]) counts[outcome] = (counts[outcome] || 0) + 1;
+  });
+  const parts = Object.keys(outcomeZh)
+    .filter(function (outcome) { return counts[outcome]; })
+    .map(function (outcome) { return outcomeZh[outcome] + " " + counts[outcome]; });
+  return files.length + " 个文件" + (parts.length ? " · " + parts.join(" · ") : "") + " · " + statsText;
+}
+
 /** 从工具入参里拼一句「做了什么」；拼不出来返回 null（调用方回退到原文） */
 function toolIntentZh(toolName, rawInput) {
   let input = null;
@@ -762,6 +801,365 @@ function engineStatusZh(text, status) {
  *   mcp     MCP 工具                        plan    计划/清单（高亮）
  *   status  引擎节拍（最淡）                generic 其余
  */
+/* ── 工具族（2026-09-20 搬 · 照 CLI 的 `widgets/tool_card.rs`）─────────────────
+ * CLI 每条工具卡的头部是「族字形 + 族标签 + 细节」（`family_glyph` / `family_label`），十族：
+ *   `Read ▷` `Patch ◆` `Run ▶` `Find ⌕` `Delegate ◐` `Fanout ⋮` `Rlm ⋮` `Verify ✓` `Think …` `Generic •`
+ * 我们以前**只有颜色圆点** —— 一眼分不出是哪种活。
+ *
+ * ⚠️ **名字要两步才认得出族**（2026-09-20 实测踩到的坑）：
+ *   v0.9.13 起引擎发的是**家族名 + action**（实测拿到的就是 `bash` / `agent`），
+ *   而官方的族表（`tool_family_for_name`）认的是**旧别名**（`exec_shell` / `read_file`…）。
+ *   桥梁是 `tools/canonical_action.rs` 的 `CANONICAL_ACTION_ALIASES`，
+ *   ＋它上面的 `action_family_default`（家族缺 action 时的默认）。
+ *   ⇒ **少这一步，所有族都会落成「其它」**。
+ *   官方表里还有 `tasks` / `automation` / `github` 三个家族 —— 它们的别名**不在**族表里
+ *   （落 Generic），所以这儿只抄**能影响族**的那些行。
+ * 族命名照 `tool_card.rs:80-108` 的 `tool_family_for_name`，字形照 `family_glyph`（:282-293）。
+ */
+const CANONICAL_ACTION_ALIASES = {
+  bash: { run: 'exec_shell', wait: 'exec_shell_wait', interact: 'exec_shell_interact', cancel: 'exec_shell_cancel' },
+  Bash: { run: 'exec_shell', wait: 'exec_shell_wait', interact: 'exec_shell_interact', cancel: 'exec_shell_cancel' },
+  File: {
+    read: 'read_file', list: 'list_dir', search_name: 'file_search',
+    search_content: 'grep_files', write: 'write_file', edit: 'edit_file', patch: 'apply_patch',
+  },
+  Git: {
+    status: 'git_status', diff: 'git_diff', log: 'git_log',
+    show: 'git_show', blame: 'git_blame', commit_plan: 'git_commit_plan',
+  },
+  Run: { tests: 'run_tests', verifiers: 'run_verifiers' },
+  Web: { search: 'web_search', fetch: 'fetch_url', wait: 'wait_for_dev_server' },
+  rlm: { open: 'rlm_open', eval: 'rlm_eval', configure: 'rlm_configure', close: 'rlm_close' },
+};
+/** 家族缺 `action` 时官方怎么默认（`canonical_action.rs:108-121`）；rlm/tasks/automation/github 无默认 */
+const ACTION_FAMILY_DEFAULT = { bash: 'run', Bash: 'run', File: 'read', Git: 'status', Run: 'tests', Web: 'search' };
+const TOOL_FAMILY_BY_NAME = {
+  read_file: 'read', list_dir: 'read', view_image: 'read', git_status: 'read', git_diff: 'read',
+  git_log: 'read', git_show: 'read', git_blame: 'read', git_commit_plan: 'read',
+  edit_file: 'patch', apply_patch: 'patch', write_file: 'patch',
+  exec_shell: 'run', exec_shell_wait: 'run', exec_shell_interact: 'run', exec_shell_cancel: 'run',
+  task_shell_start: 'run', task_shell_wait: 'run', start_registry_mcp_server: 'run',
+  grep_files: 'find', file_search: 'find', web_search: 'find', fetch_url: 'find', registry_sync: 'find',
+  agent: 'delegate',
+  rlm_open: 'rlm', rlm_eval: 'rlm', rlm_configure: 'rlm', rlm_close: 'rlm', rlm: 'rlm',
+  run_tests: 'verify', run_verifiers: 'verify', task_gate_run: 'verify', validate_data: 'verify',
+  wait_for_dev_server: 'verify',
+  workflow: 'fanout',
+};
+const TOOL_FAMILY_GLYPH = {
+  read: "\u25B7", patch: "\u25C6", run: "\u25B6", find: "\u2315", delegate: "\u25D0",
+  fanout: "\u22EE", rlm: "\u22EE", verify: "\u2713", think: "\u2026", generic: "\u2022",
+};
+
+/** 这条 item 的**官方工具名**（canonical 别名）—— 族判定与「运行汇总」的公共前置。
+ *  ⚠️ 为什么单独抽出来（2026-09-20 做 M10 时）：官方 `tool_run.rs` 的
+ *  `generic_tool_name_is_collapse_guard` 判的是**canonical 名**（`read_file` / `apply_patch`…），
+ *  **不是族名** —— 族名把「读」和「写」分到不同族、判不出「写改类不折叠」这条规则。
+ *  空串 = 这条 item 不是工具调用（正文 / 思考 / 子代理等）。 */
+export function toolAliasOf(item) {
+  const meta = item && item.metadata && typeof item.metadata === "object" ? item.metadata : {};
+  const raw = String(meta.tool_name || meta.tool || "").trim();
+  if (!raw) return "";
+  let alias = raw;
+  const family = CANONICAL_ACTION_ALIASES[raw];
+  if (family) {
+    let input = {};
+    const rawInput = meta.tool_input;
+    if (typeof rawInput === "string" && rawInput) {
+      try { input = JSON.parse(rawInput) || {}; } catch (e) { input = {}; }
+    } else if (rawInput && typeof rawInput === "object") {
+      input = rawInput;
+    }
+    const action = String(input.action || ACTION_FAMILY_DEFAULT[raw] || "");
+    if (action && family[action]) alias = family[action];
+  }
+  return alias;
+}
+
+/** 这条 item 属于哪个工具族 —— 两步：家族+action → 官方别名 → 族名。
+ *  调不出来时返回 `generic`（不是空 —— 卡片总得有个字形）。 */
+export function toolFamilyOf(item) {
+  const alias = toolAliasOf(item);
+  if (!alias) return "";
+  return TOOL_FAMILY_BY_NAME[alias] || "generic";
+}
+
+/* ── 运行汇总行（M10 · 2026-09-20 搬 · 照 CLI `tui/history/tool_run.rs`）─────────────
+ * 官方在转录里把**连续的成功、低风险**工具卡合成一行，因为「例行的读文件 / 跑校验」
+ * 不该占满默认视图 —— 注释原文：
+ *   *"...keeps their raw details available without making routine verifier/shell work
+ *   dominate the default transcript."*
+ *
+ * 三条**必须照搬**的规则（逐条读源码拿到的）：
+ *   ① **阈值 = 3**（`tui/app/init.rs:901` 的 `tool_collapse_threshold: 3`）—— 连着 3 个才折。
+ *   ② **什么会把运行切断**（`is_collapsible_tool_cell` ＝ `tool.is_success() && !tool.is_collapsible_guard()`）：
+ *      **没跑完的 / 失败的 / 写改删提交评审类**一律不折、并把运行切开 —— 注释原文
+ *      *"Failed, running, patch, review, diff, and plan-update cells split runs so important
+ *      state never disappears into a summary row."*
+ *      ⚠️ 但**注释与代码不一致**：那句里提了 `diff`，可 guard 词表（`contains` 那串）**没有 diff**
+ *      ⇒ 名字含 "diff" 的工具**实际可折**、且计入 edits 桶。我们**照代码、不照注释**
+ *      （将来官方把 diff 加进守卫，这一段跟着改 —— 回归里有断言盯着这条差异）。
+ *      ⚠️ **另一条容易被漏的**：思考卡（`agent_reasoning`）不是工具 → **它也会把运行切断**，
+ *      所以真实的「思考 → 工具 → 思考 → 工具」会话**根本不会成组**（实测 2026-09-20 确认，
+ *      不是 bug）。M10 只在「真的连着几个工具、中间没思考」时才触发。
+ *   ③ **计数口径**（`classify_tool_name_activity`，表与顺序逐行照抄）。
+ *
+ * ⚠️ 两个**有意偏离**（写在这儿，免得以后被当成错）：
+ *   · 官方汇总带家族名（`Explored 3 files: read, grep`）—— 那是**英文工具名**，对中文客户没意义，
+ *     我们只给数量；而且官方**没有中文文案**（语言包里 0 命中）⇒ 中文是我们写的。
+ *   · 官方这套还受 settings 的 `tool_collapse_mode` 管（compact / expanded / calm）——
+ *     那个键**不在引擎 `POST /v1/config` 白名单里**，网页端改不了 ⇒ 我们照官方默认 `compact`
+ *     （总是折）。将来若引擎露出这个键，就把它接到高级设置里（别自己造一个开关）。
+ */
+export const TOOL_RUN_MIN = 3;
+const COLLAPSE_GUARD_WORDS = ["patch", "write", "edit", "delete", "remove", "commit", "push", "review"];
+const METADATA_TOOL_NAMES = [
+  "update_plan", "work_update", "todo_write", "todo_add", "todo_update",
+  "checklist_write", "checklist_add", "checklist_update", "checklist_list",
+];
+/** 精确表：名字 → 计数桶（照 `tool_run.rs:166-210` 的 match 臂） */
+const RUN_ACTIVITY_BY_NAME = {
+  read_file: "files", list_dir: "files", view_image: "files", explore: "files",
+  git_status: "files", git_diff: "files", git_log: "files", git_show: "files",
+  git_blame: "files", git_commit_plan: "files",
+  grep_files: "searches", file_search: "searches", web_search: "searches",
+  fetch_url: "searches", registry_sync: "searches",
+  exec_shell: "commands", exec_shell_wait: "commands", exec_shell_interact: "commands",
+  exec_shell_cancel: "commands", task_shell_start: "commands", task_shell_wait: "commands",
+  start_registry_mcp_server: "commands", run_tests: "commands", run_verifiers: "commands",
+  wait_for_dev_server: "commands", task_gate_run: "commands", validate_data: "commands",
+  edit_file: "edits", apply_patch: "edits", write_file: "edits", diff: "edits",
+  agent: "delegates", rlm_open: "delegates", rlm_eval: "delegates",
+  rlm_configure: "delegates", rlm_close: "delegates", rlm: "delegates",
+};
+
+/** 是不是「元数据类」工具（待办 / 计划更新）—— 官方先拿它把 guard 判据排除掉 */
+export function isMetadataToolName(name) {
+  return METADATA_TOOL_NAMES.indexOf(String(name || "").trim().toLowerCase()) >= 0;
+}
+
+/** 写改类「永不折叠」的守卫 —— 官方 `generic_tool_name_is_collapse_guard` 逐字对应。
+ *  客户必须看得见「它动了哪个文件」，这类卡片不能被汇总行吃掉。 */
+export function isCollapseGuard(name) {
+  const normalized = String(name || "").trim().toLowerCase();
+  if (isMetadataToolName(normalized)) return false;
+  return COLLAPSE_GUARD_WORDS.some(function (word) { return normalized.indexOf(word) >= 0; });
+}
+
+/** 这个工具算进哪个计数桶（照官方 `classify_tool_name_activity` 的表与**顺序**） */
+export function runActivityOf(name) {
+  const n = String(name || "").trim().toLowerCase();
+  if (RUN_ACTIVITY_BY_NAME[n]) return RUN_ACTIVITY_BY_NAME[n];
+  if (isMetadataToolName(n)) return "metadata";
+  if (n.indexOf("search") >= 0 || n.indexOf("grep") >= 0 || n.indexOf("find") >= 0) return "searches";
+  if (n.indexOf("read") >= 0 || n.indexOf("list") >= 0 || n.indexOf("view") >= 0 || n.indexOf("open") >= 0) return "files";
+  if (n.indexOf("patch") >= 0 || n.indexOf("write") >= 0 || n.indexOf("edit") >= 0 || n.indexOf("diff") >= 0) return "edits";
+  if (n.indexOf("run") >= 0 || n.indexOf("exec") >= 0 || n.indexOf("shell") >= 0 || n.indexOf("test") >= 0 || n.indexOf("check") >= 0) return "commands";
+  if (n.indexOf("agent") >= 0 || n.indexOf("delegate") >= 0 || n.indexOf("fanout") >= 0 || n.indexOf("rlm") >= 0) return "delegates";
+  if (n.indexOf("metadata") >= 0 || n.indexOf("session") >= 0 || n.indexOf("context") >= 0 || n.indexOf("plan") >= 0 || n.indexOf("todo") >= 0) return "metadata";
+  return "other";
+}
+
+function isCollapsibleRunCell(cell) {
+  return !!(cell && cell.ok === true && !isCollapseGuard(cell.alias));
+}
+
+/** 找出「可以折成一行」的连续运行组。
+ *  `cells` 与转录同序：每个元素是 `{alias, ok}`，**不是工具调用的位置传 `null`**
+ *  （正文 / 思考 / 子代理 / 还在跑的那张卡 —— 它们本来就该把运行切开）。 */
+export function detectToolRuns(cells, minSize) {
+  const runs = [];
+  if (!Array.isArray(cells) || !minSize) return runs;
+  let index = 0;
+  while (index < cells.length) {
+    if (!isCollapsibleRunCell(cells[index])) { index += 1; continue; }
+    const start = index;
+    const activity = { files: 0, searches: 0, commands: 0, edits: 0, delegates: 0, metadata: 0, other: 0 };
+    while (index < cells.length && isCollapsibleRunCell(cells[index])) {
+      activity[runActivityOf(cells[index].alias)] += 1;
+      index += 1;
+    }
+    const count = index - start;
+    if (count >= minSize) runs.push(Object.assign({ start: start, count: count }, activity));
+  }
+  return runs;
+}
+
+/** 汇总行上的那句话（中文 —— 官方只有英文 `Explored 3 files, 2 searches`）。
+ *  分段与顺序照官方 `tool_run_summary`：文件/搜索 → 命令 → 改动 → 派发 → 元数据。 */
+export function toolRunSummaryText(run) {
+  const parts = [];
+  if (run.files) parts.push("查看了 " + run.files + " 个文件");
+  if (run.searches) parts.push("搜索了 " + run.searches + " 次");
+  if (run.commands) parts.push("执行了 " + run.commands + " 条命令");
+  if (run.edits) parts.push("改动了 " + run.edits + " 个文件");
+  if (run.delegates) parts.push("派出 " + run.delegates + " 个子代理");
+  if (run.metadata || run.other) parts.push("更新了进度");
+  return parts.length ? parts.join("、") : "完成了 " + run.count + " 步";
+}
+
+/* ── 清单 / 待办卡（M12 · 2026-09-20 搬 · 照 CLI `tui/history/checklist.rs`）──────────
+ * AI 用待办清单干活时，官方给它一张**专门的卡**：卡头 `3/7 · 43%`，下面每项一个符号
+ * （`☑ ◐ ✗ ⊘ ☐`）。
+ *
+ * ⚠️ **不搬就出事（实测 2026-09-20）**：引擎把 `todo_write` 的 item 标成 `kind=file_change`，
+ *   于是我们把它画成了「文件改动 · 完成」卡，**摘要里是一坨带换行的原始 JSON**：
+ *   `todo_write: Todo list updated (3 items, 0% settled)\n{\n  "items": [\n    {\n  ...` —— 客户看到的就是这个。
+ *
+ * ⚠️ **用哪个字段（实测确认，别改用 summary）**：
+ *   · `summary` 被引擎**截到 280 字**（这份 3 项清单已经被切掉结尾）
+ *   · `detail` 是**完整**的（同一个 item：348~369 字，JSON 完整可解析）
+ *   官方是从**完整输出**里抠 JSON 的（`parse_checklist_snapshot`：先定位第一个 `{` 再 parse）。
+ *
+ * ⚠️ 两种形状都认（否则客户在它「正在跑」时看不到清单）：
+ *   · 跑完那一帧：`Todo list updated (3 items, 33% settled)\n{"items":[{id,content,status}],"completion_pct":33}`
+ *   · 刚开始那一帧：`{"todos":[{content,status}]}`（**入参**，没有 id / 百分比）
+ */
+export const CHECKLIST_TOOL_NAMES = [
+  "work_update", "checklist_write", "checklist_add", "checklist_update",
+  "todo_write", "todo_add", "todo_update",
+];
+export function isChecklistToolName(name) {
+  return CHECKLIST_TOOL_NAMES.indexOf(String(name || "").trim().toLowerCase()) >= 0;
+}
+
+/** 每项的符号 —— 官方 `checklist_status_marker` 逐字对应（`checklist.rs:208-217`） */
+export function checklistMarkerOf(status) {
+  const s = String(status || "").trim().toLowerCase();
+  if (s === "completed" || s === "done") return "\u2611";                        // ☑
+  if (s === "in_progress" || s === "inprogress" || s === "running") return "\u25D0"; // ◐
+  if (s === "blocked" || s === "failed") return "\u2717";                        // ✗
+  if (s === "cancelled" || s === "canceled" || s === "skipped") return "\u2298";  // ⊘
+  return "\u2610";                                                                 // ☐ 待办
+}
+
+/** 给 CSS 用的桶名（颜色跟符号走） */
+export function checklistStatusKind(status) {
+  const s = String(status || "").trim().toLowerCase();
+  if (s === "completed" || s === "done") return "done";
+  if (s === "in_progress" || s === "inprogress" || s === "running") return "doing";
+  if (s === "blocked" || s === "failed") return "failed";
+  if (s === "cancelled" || s === "canceled" || s === "skipped") return "skipped";
+  return "todo";
+}
+
+/** 从工具文本里抠出清单快照 —— 照官方 `parse_checklist_snapshot`：
+ *  先找第一个 `{`（前面那段是给人看的说明）再 parse；没有 items / 空列表就返回 null。 */
+export function parseChecklistSnapshot(text) {
+  const raw = String(text || "");
+  const start = raw.indexOf("{");
+  if (start < 0) return null;
+  let parsed = null;
+  try { parsed = JSON.parse(raw.slice(start)); } catch (_error) { return null; }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+  const list = Array.isArray(parsed.items) ? parsed.items
+    : (Array.isArray(parsed.todos) ? parsed.todos : null);
+  if (!list || !list.length) return null;
+  const items = [];
+  list.forEach(function (entry) {
+    const source = entry && typeof entry === "object" ? entry : {};
+    const content = String(source.content || "").trim();
+    if (!content) return;
+    items.push({ content: content, status: String(source.status || "pending") });
+  });
+  if (!items.length) return null;
+  // 官方的 completed 计数**只认 "completed"**（`checklist.rs:72-75`）—— 这里照抄，
+  //   不跟符号判定（done 也算 ☑）合并，免得两边对不上时看着像 bug。
+  const completed = items.filter(function (it) { return it.status.toLowerCase() === "completed"; }).length;
+  const total = items.length;
+  let pct = Number(parsed.completion_pct);
+  if (!Number.isFinite(pct)) pct = total ? Math.floor((completed * 100) / total) : 0;
+  pct = Math.max(0, Math.min(100, Math.round(pct)));
+  return { items: items, completed: completed, total: total, pct: pct };
+}
+
+/** 卡头那句 `3/7 · 43%`（官方 `header_summary`） */
+export function checklistHeadText(snapshot) {
+  if (!snapshot) return "";
+  return snapshot.completed + "/" + snapshot.total + " \u00B7 " + snapshot.pct + "%";
+}
+
+/* ── 子代理卡（2026-09-20 搬 · 照 CLI `widgets/agent_card.rs` 的 DelegateCard）──────
+ * 为什么要有：引擎**自己就在发**子代理的全过程 —— `agent` 工具的 tool_call 里带着
+ *   `metadata.agent_id` / `status` / `activity` / `steps_taken` / `duration_ms`，
+ *   而**官方 web 一个渲染分支都没有**（`delegate`/`fanout`/`subagent` 在 app.mjs 里各 0 次）
+ *   ⇒ 客户只看到主 AI 说「我派了个子代理」，后面全黑箱。
+ *   2026-09-20 实测（CAPABILITY-MAP §12.10）：子代理在我们平台**开箱就能跑**
+ *   （平台默认「自动审核」档下不再被审批门拦住），所以这块值得露出来。
+ * 状态名一律照**官方语言包**（`crates/localization/locales/zh-Hans.json`）：
+ *   `SubagentsStatus{Running,Cancelled,Completed,Failed,Interrupted}`。
+ * 状态取值全集 = `AgentWorkerStatus`（`tools/subagent/mod.rs:570`，10 个）；
+ *   **认不出的状态原样显示**，不猜（不发明语义）。
+ * 字形照 CLI 的 `dot_grid`（`widgets/agent_card.rs:433-440`）：● ◐ × ⊘ ○ ◌
+ */
+const AGENT_STATUS_ZH = {
+  queued: "排队中",
+  starting: "运行中", running: "运行中", model_wait: "运行中", running_tool: "运行中",
+  waiting_for_user: "等待中",
+  completed: "已完成", failed: "失败", cancelled: "已取消", canceled: "已取消",
+  interrupted: "已中断",
+};
+const AGENT_TERMINAL_STATUS = new Set(["completed", "failed", "cancelled", "canceled", "interrupted"]);
+const AGENT_STATUS_GLYPH = {
+  queued: "○", waiting_for_user: "○",
+  completed: "●", failed: "×", cancelled: "⊘", canceled: "⊘", interrupted: "◌",
+};
+
+/** 这条 item 是不是子代理调用 —— 只认 `metadata.tool_name`（引擎给的就是 `agent`）。
+ *  ⚠️ 流式早期 metadata 可能还没齐 ⇒ 调用方要把它当**形态判定**，
+ *     判变了就重建卡片（见 `updateItemNode` 开头那段）。 */
+export function isAgentToolCall(item) {
+  if (!item || item.kind !== "tool_call") return false;
+  const meta = item.metadata && typeof item.metadata === "object" ? item.metadata : {};
+  return String(meta.tool_name || meta.tool || "").toLowerCase() === "agent";
+}
+
+/** `agent_6c821769` → `6c821769`（照 CLI 的 `truncate_id`）。
+ *  ⚠️ **只剥引擎自己的 `agent_` 前缀** —— 客户给子代理起的名字（`echo_two` 这种）不能被切成 `two`。 */
+export function shortAgentId(value) {
+  const s = String(value || "").trim();
+  return s.startsWith("agent_") ? s.slice(6) : s;
+}
+
+/** 从一段 JSON **文本**里抠一个字段（可能被截断——所以不 JSON.parse）。 */
+function grabJsonField(text, key) {
+  const m = String(text || "").match(new RegExp('"' + key + '"\\s*:\\s*(?:"([^"]*)"|([^,}\\s]+))'));
+  return m ? (m[1] !== undefined ? m[1] : m[2]) : "";
+}
+
+/** 把子代理的事实抠出来。
+ *  **metadata 优先**（可靠，但字段少）；**summary 里的 JSON 兜底** —— 它字段更全
+ *  （`steps_taken` / `duration_ms` / `status` 都在里面），但**经常被截到 280 字**
+ *  （`child_route` 那坨很长），所以只用正则抠字段，**不 JSON.parse**（截断的 JSON 会直接抛）。
+ *  另外还从 `metadata.tool_input` 抠 `agent_id` —— 被守护者拒绝的那条只有 tool_input，没有 agent_id。 */
+export function agentCardFacts(item) {
+  const meta = item && item.metadata && typeof item.metadata === "object" ? item.metadata : {};
+  const raw = String((item && (item.summary || item.detail)) || "");
+  const input = String(meta.tool_input || "");
+  const facts = {
+    agentId: String(meta.agent_id || "").trim() || grabJsonField(raw, "agent_id") || grabJsonField(input, "agent_id"),
+    name: String(meta.name || "").trim() || grabJsonField(raw, "name"),
+    action: String(meta.action || "").trim(),
+    status: String(meta.status || "").trim().toLowerCase() || grabJsonField(raw, "status").toLowerCase(),
+    steps: Number(meta.steps_taken) || Number(grabJsonField(raw, "steps_taken")) || 0,
+    durationMs: Number(meta.duration_ms) || Number(grabJsonField(raw, "duration_ms")) || 0,
+    activity: String(meta.activity || "").trim(),
+    terminal: meta.terminal === true,
+    failed: false,
+    failReason: "",
+  };
+  // 被守护者拒绝时会走这条摘要（原文形如 `agent failed: Failed to authorize tool execution: ...`）
+  const failMatch = raw.match(/^agent\s+failed:\s*([\s\S]+)$/i);
+  if (failMatch) {
+    facts.failed = true;
+    facts.failReason = failMatch[1].trim();
+  }
+  if (!facts.failed && (item.status === "failed" || meta.is_error === true)) facts.failed = true;
+  facts.terminal = facts.terminal || AGENT_TERMINAL_STATUS.has(facts.status) || facts.failed;
+  if (facts.failed && !facts.status) facts.status = "failed";
+  return facts;
+}
+
 function receiptVariant(item, toolName) {
   const n = String(toolName || "").toLowerCase();
   const kind = String(item.kind || "");
@@ -827,9 +1225,14 @@ export function receiptPresentation(item = {}) {
   // 文件改动的内联 diff（引擎早就带着：metadata.mutation.diff）
   const mutation = meta.mutation && typeof meta.mutation === "object" ? meta.mutation : null;
   const diffText = mutation && typeof mutation.diff === "string" ? mutation.diff : "";
+  // M11（2026-09-20）：文件改动卡用官方那行「动作 + 路径 · +N -M」当摘要（**默认可见**）——
+  //   优先于从工具名猜的「写入 xxx」：引擎给的 `outcome` 更准（能说出新建/删除/重命名），
+  //   而且行数以前只活在 diff 块里（要展开才看得到）。
+  const mutSummary = mutationSummaryZh(item);
+  const summaryText = mutSummary || intent;
   return {
     label: receiptLabelZh(item.kind, item.status),
-    summary: intent ? (failed ? `${intent} —— 未完成` : intent) : (statusZh || raw),
+    summary: summaryText ? (failed ? `${summaryText} —— 未完成` : summaryText) : (statusZh || raw),
     raw: fullRaw,
     failed,
     variant: receiptVariant(item, toolName),
@@ -1865,7 +2268,10 @@ function startBrowserClient() {
         .filter((node) => node.dataset.itemId)
         .map((node) => [node.dataset.itemId, node]),
     );
-    const desired = [];
+    // AsBudy M10（2026-09-20）：先按过滤后的顺序算出「运行汇总组」，再逐条渲染 ——
+    //   组内成员不单独画，只在组头画一行汇总（可点开看原来的卡）。
+    //   规则与阈值全在 detectToolRuns 那一块（照 CLI `tool_run.rs`），这里只管接线。
+    const visible = [];
     for (const itemId of app.threadState.itemOrder) {
       const item = app.threadState.items.get(itemId);
       if (!item) continue;
@@ -1876,6 +2282,8 @@ function startBrowserClient() {
       // 去掉只保留上方的」。⇒ 不再把这一类回执画进对话区。
       // ⚠️ 只去这一类：工具（exec/file/explore/web/mcp）、思考、回复、出错、文件改动、
       //    整理对话 都照旧渲染 —— 那些是客户要看的东西，不是状态。
+      //   ⚠️ 注意它**只影响画面、不参与运行汇总的分组**：官方的序列里本来就没有这一类 cell，
+      //     所以「过滤掉它」与「把它当切断点」等价（一个都没有，就无组可分）。
       if (item.kind === "status") continue;
       // ⚠️ 2026-09-19 回滚一次错方向：我曾把「进行中的回执」也挡在转录外，理由是与上方状态行重复。
       //   查了官方 CLI 才发现**错的是上面那条状态行、不是这里的卡片**：
@@ -1884,7 +2292,38 @@ function startBrowserClient() {
       //   ⇒ 两者层级不同、不重复。真正重复的是我们自创的上方状态行**用了工具级描述**
       //     （「正在执行命令」）—— 已改成 CLI 的阶段词（见 asbudy-my.js 的 liveWordFor）。
       //   ⇒ 所以卡片照旧落进转录。老板：「我们对齐官方 cli 版就是了，不用创新」
-      let node = existing.get(itemId);
+      //   ⚠️ 同一个道理在这里也成立：**还在跑的工具卡不准被折进汇总** ——
+      //     官方 `is_collapsible_tool_cell` 要求 `tool.is_success()`，Our `ok` 同样只在 completed 时为真，
+      //     所以它天然会把运行切开、自己单独一张卡（客户看得见它在干什么）。
+      visible.push(item);
+    }
+    const runCells = visible.map(function (entry) {
+      const alias = toolAliasOf(entry);
+      if (!alias) return null;              // 正文 / 思考 / 子代理……不是工具调用（会把运行切开）
+      const meta = entry.metadata && typeof entry.metadata === "object" ? entry.metadata : {};
+      return { alias: alias, ok: entry.status === "completed" && meta.is_error !== true };
+    });
+    const runs = detectToolRuns(runCells, TOOL_RUN_MIN);
+    const runOfIndex = new Map();
+    runs.forEach(function (run, ri) {
+      for (let k = run.start; k < run.start + run.count; k += 1) runOfIndex.set(k, ri);
+    });
+
+    const desired = [];
+    for (let index = 0; index < visible.length; index += 1) {
+      const item = visible[index];
+      const ri = runOfIndex.get(index);
+      if (ri !== undefined) {
+        if (index !== runs[ri].start) continue;   // 组内其余成员由汇总行代表
+        const run = runs[ri];
+        let node = existing.get("run:" + visible[run.start].id);
+        if (!node) node = renderToolRun(run, visible);
+        else updateToolRunNode(node, run, visible);
+        observeTranscriptItem(node);
+        desired.push(node);
+        continue;
+      }
+      let node = existing.get(item.id);
       if (!node || !updateItemNode(node, item)) node = renderItem(item);
       observeTranscriptItem(node);
       desired.push(node);
@@ -2066,6 +2505,42 @@ function startBrowserClient() {
       detail.dataset.itemPart = "detail";
       disclosure.append(summary, detail);
       card.append(preview, disclosure);
+    } else if (isAgentToolCall(item)) {
+      // ── 子代理卡：头部（字形+「子代理」+名字）· 动作行 · 终态行（照 CLI DelegateCard）
+      card = element("article", "agent-card");
+      card.dataset.agentCard = "1";
+      const head = element("div", "agent-head");
+      const glyph = element("span", "agent-glyph");
+      glyph.dataset.itemPart = "glyph";
+      const role = element("strong", "agent-role");
+      role.dataset.itemPart = "role";
+      const name = element("span", "agent-name");
+      name.dataset.itemPart = "name";
+      head.append(glyph, role, name);
+      const activity = element("div", "agent-activity");
+      activity.dataset.itemPart = "activity";
+      activity.hidden = true;
+      const foot = element("div", "agent-foot");
+      foot.dataset.itemPart = "foot";
+      foot.hidden = true;
+      card.append(head, activity, foot);
+    } else if (isChecklistToolName(toolAliasOf(item)) && parseChecklistSnapshot(item.detail || item.summary || "")) {
+      // ── 清单 / 待办卡（M12）—— 照 CLI `history/checklist.rs`：卡头 `3/7 · 43%` + 每项一个符号
+      //   ⚠️ 判据里**带上「能解析」**：否则 updateItemNode 那边判「该改形态麻 rebuild」时
+      //   跟这里不一致，会来回重建（每帧重画，看着像卡在闪）。
+      card = element("article", "checklist-card");
+      card.dataset.checklistCard = "1";
+      const clHead = element("div", "cl-head");
+      const clGlyph = element("span", "cl-glyph");
+      clGlyph.dataset.itemPart = "glyph";
+      const clRole = element("strong", "cl-role");
+      clRole.dataset.itemPart = "role";
+      const clCount = element("span", "cl-count");
+      clCount.dataset.itemPart = "count";
+      clHead.append(clGlyph, clRole, clCount);
+      const clList = element("ul", "cl-items");
+      clList.dataset.itemPart = "items";
+      card.append(clHead, clList);
     } else {
       card = element("article", "receipt");
       card.append(element("span", "receipt-dot"));
@@ -2098,8 +2573,74 @@ function startBrowserClient() {
     return card;
   }
 
+  /** 一行「运行汇总」（M10）—— 官方 `v` 展开在网页上的对应物：点一下看回原来的卡。
+   *
+   *  ⚠️ 两个非显然的点（都试过才会发现）：
+   *   ① 汇总节点是 `<details>`，组内卡片是它的**子节点** ⇒ 它们不参与 `desired` 的顶层
+   *      reconcile（reconcileChildren 只管直接子节点）—— 展开内容每次重画都重建。
+   *      组内全是**已终态**的卡，不会流式更新，所以重建是安全的。
+   *   ② **展开状态记在 `app.expandedRuns`（不是 DOM）** —— 重画会让 details 重建，
+   *      状态不自己记住的话，客户刚点开就被合上（M3/M4 那两个
+   *      「看起来没报错、就是没反应」的坑同源）。 */
+  function renderToolRun(run, items) {
+    const key = "run:" + items[run.start].id;
+    const card = document.createElement("details");
+    card.className = "item tool-run";
+    card.dataset.itemId = key;
+    card.dataset.itemKind = "tool_run";
+    card.dataset.runSig = toolRunSignature(run, items);
+    if (app.expandedRuns && app.expandedRuns.has(key)) card.open = true;
+    const summary = document.createElement("summary");
+    summary.className = "tool-run-head";
+    summary.title = "点开看这一步的细节";
+    const glyph = document.createElement("span");
+    glyph.className = "tool-run-glyph";
+    glyph.textContent = "\u22EF";           // ⋯ — 与「还有几个在里」的收拢语义一致
+    const text = document.createElement("span");
+    text.className = "tool-run-text";
+    text.textContent = toolRunSummaryText(run);
+    summary.append(glyph, text);
+    const body = document.createElement("div");
+    body.className = "tool-run-body";
+    for (let k = run.start; k < run.start + run.count; k += 1) {
+      body.appendChild(renderItem(items[k]));
+    }
+    card.append(summary, body);
+    card.addEventListener("toggle", function () {
+      if (!app.expandedRuns) app.expandedRuns = new Set();
+      if (card.open) app.expandedRuns.add(key);
+      else app.expandedRuns.delete(key);
+    });
+    return card;
+  }
+
+  /** 组的「签名」—— 用来判「要不要重建展开内容」。
+   *  ⚠️ 不复用会出事（做 M10 时差点漏掉）：每帧重画都新建汇总节点的话，
+   *  ① 展开着的内容每帧重建（白花力气）；② `details` 重建后 `open` 得靠 app 状态重贴，
+   *  滚动位置也可能跳。所以：**签名没变就原样留着**。 */
+  function toolRunSignature(run, items) {
+    return run.count + "|" + items[run.start].id + "|" + toolRunSummaryText(run);
+  }
+
+  function updateToolRunNode(card, run, items) {
+    const sig = toolRunSignature(run, items);
+    if (card.dataset.runSig === sig) return;      // 组没变 —— 连展开状态一起原样留着
+    card.dataset.runSig = sig;
+    const text = card.querySelector(".tool-run-text");
+    if (text) text.textContent = toolRunSummaryText(run);
+    const body = card.querySelector(".tool-run-body");
+    if (body) {
+      body.textContent = "";
+      for (let k = run.start; k < run.start + run.count; k += 1) body.appendChild(renderItem(items[k]));
+    }
+  }
+
   function updateItemNode(card, item) {
     if (card.dataset.itemKind !== item.kind) return false;
+    // 子代理卡：**形态判定**（metadata 可能要等 item.completed 才齐）——
+    //   判变了就返回 false，让上层重建卡片（调用处：`!updateItemNode(...) → renderItem(item)`）。
+    //   不这么写的话：第一帧 metadata 还没 tool_name ⇒ 先画成普通回执就**再也回不去了**。
+    if ((card.dataset.agentCard === "1") !== isAgentToolCall(item)) return false;
     const detail = item.detail || item.summary || "";
     if (item.kind === "user_message" || item.kind === "agent_message") {
       const role = item.kind === "user_message" ? "user" : "agent";
@@ -2137,10 +2678,96 @@ function startBrowserClient() {
       return true;
     }
 
+    // 清单卡：形态判定（照子代理卡那套 —— 判变了就让上层重建）
+    const clText = item.detail || item.summary || "";
+    const clSnapshot = parseChecklistSnapshot(clText);
+    const clWanted = isChecklistToolName(toolAliasOf(item)) && !!clSnapshot;
+    if ((card.dataset.checklistCard === "1") !== clWanted) return false;
+    if (card.dataset.checklistCard === "1") {
+      card.dataset.clState = item.status === "in_progress" ? "running" : (item.status === "failed" ? "failed" : "completed");
+      card.dataset.clPct = String(clSnapshot.pct);
+      setTextIfChanged(card.querySelector('[data-item-part="glyph"]'), clSnapshot.pct >= 100 ? "\u2611" : "\u25D0");
+      // 「清单」这个叫法照官方（`checklist.rs` 的卡头就是 `checklist`）
+      setTextIfChanged(card.querySelector('[data-item-part="role"]'), "清单");
+      setTextIfChanged(card.querySelector('[data-item-part="count"]'), checklistHeadText(clSnapshot));
+      const clList = card.querySelector('[data-item-part="items"]');
+      if (clList) {
+        // 用签名决定要不要重画：项内容/状态没变就不重建（否则每帧重画会把选中/滚动弄丢）
+        const sig = clSnapshot.items.map(function (it) { return it.content + ":" + it.status; }).join("|");
+        if (clList.dataset.clSig !== sig) {
+          clList.dataset.clSig = sig;
+          const frag = document.createDocumentFragment();
+          clSnapshot.items.forEach(function (entry) {
+            const li = document.createElement("li");
+            li.className = "cl-item";
+            li.dataset.clSt = checklistStatusKind(entry.status);
+            const marker = document.createElement("span");
+            marker.className = "cl-mk";
+            marker.textContent = checklistMarkerOf(entry.status);
+            const text = document.createElement("span");
+            text.className = "cl-tx";
+            text.textContent = entry.content;      // 文本节点 —— 清单内容是 AI 写的，不当 HTML 解
+            li.append(marker, text);
+            frag.append(li);
+          });
+          clList.replaceChildren(frag);
+        }
+      }
+      return true;
+    }
+
+    if (isAgentToolCall(item)) {
+      // ── 子代理卡填充（照 CLI DelegateCard：头部 → 动作尾 → 终态行）──
+      const facts = agentCardFacts(item);
+      const status = facts.status;
+      card.dataset.agentStatus = status || "unknown";
+      setTextIfChanged(card.querySelector('[data-item-part="glyph"]'),
+        AGENT_STATUS_GLYPH[status] || (facts.failed ? "×" : "◐"));
+      // 「子代理」这个译名直接用官方语言包的 `ApprovalCategoryAgent`
+      setTextIfChanged(card.querySelector('[data-item-part="role"]'), "子代理");
+      const name = shortAgentId(facts.name || facts.agentId);
+      setTextIfChanged(card.querySelector('[data-item-part="name"]'), name);
+      // 动作行：引擎给的 `activity`（形如 `step 3: requesting model response`）优先；
+      // 被守护者拒绝时改拿拒绝理由（那是客户唯一能看到的「为什么没成」）
+      const activity = facts.activity || (facts.failed ? facts.failReason : "");
+      const activityEl = card.querySelector('[data-item-part="activity"]');
+      if (activityEl) {
+        activityEl.hidden = !activity;
+        setTextIfChanged(activityEl, activity ? "│ " + activity : "");
+      }
+      // 终态行：`╰ 已完成 · 3.9s · 2 步`（照 CLI 的 `╰ done · 12s · 摘要`）。
+      // ⚠️ **只有终态才画** —— 照 CLI（`agent_card.rs:255` 那个 `if self.status.is_terminal()`）。
+      //   不这么写的话：历史里那条 `start` 记录会永远挂着「运行中」，
+      //   子代理明明早就结束了，客户却以为它还在跑（误导）。
+      const footEl = card.querySelector('[data-item-part="foot"]');
+      if (footEl) {
+        if (!facts.terminal) {
+          footEl.hidden = true;
+          setTextIfChanged(footEl, "");
+        } else {
+          const parts = [AGENT_STATUS_ZH[status] || status || "已完成"];
+          if (facts.durationMs > 0) parts.push(formatElapsedMs(facts.durationMs));
+          if (facts.steps > 0) parts.push(facts.steps + " 步");
+          footEl.hidden = false;
+          setTextIfChanged(footEl, "╰ " + parts.join(" · "));
+        }
+      }
+      return true;
+    }
+
     const presentation = receiptPresentation(item);
     card.className = `receipt ${presentation.failed ? "failed" : ""}`.trim();
     // AsBudy：按形态上色/排版（exec 等宽、file 高亮、status 降噪…，规则见 asbudy-my.js）
     card.dataset.variant = presentation.variant || "generic";
+    // 工具族字形（2026-09-20 搬 · 照 CLI 的 `family_glyph`）—— 取代原来的 7×7 圆点，
+    //   客户一眼分得出「在读文件 / 在改代码 / 在跑命令 / 在找东西 / 在验证」。
+    //   颜色由 `asbudy-my.js` 里 `[data-family=…]` 那组规则定。
+    const family = toolFamilyOf(item);
+    const dotEl2 = card.querySelector(".receipt-dot");
+    if (dotEl2) {
+      card.dataset.family = family || "generic";
+      setTextIfChanged(dotEl2, TOOL_FAMILY_GLYPH[family] || TOOL_FAMILY_GLYPH.generic);
+    }
     setTextIfChanged(card.querySelector('[data-item-part="label"]'), presentation.label + runningElapsedSuffix(item));
     setTextIfChanged(card.querySelector('[data-item-part="summary"]'), presentation.summary);
     // 徽标（耗时/退出码）：老卡片可能还没这个节点，取不到就跳过
@@ -2274,43 +2901,119 @@ function startBrowserClient() {
   function renderMarkdown(md) {
     const esc = String(md == null ? "" : md)
       .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    // 行内：代码 → 链接 → 粗体 → 删除线 → 斜体。
+    // 链接**只放行 http/https** —— `javascript:` / `data:` 一律退化成普通文字（XSS 防线）。
     const inline = (s) => s
       .replace(/`([^`]+)`/g, "<code>$1</code>")
+      .replace(/\[([^\]\n]+)\]\((https?:[^)\s]+)\)/g,
+        '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>')
       .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+      .replace(/~~([^~\n]+)~~/g, "<del>$1</del>")
       .replace(/(^|[^*])\*([^*\n]+)\*/g, "$1<em>$2</em>");
+
     const out = [];
-    let list = null, table = false;
-    const closeList = () => { if (list) { out.push("</" + list + ">"); list = null; } };
+    let lists = [];      // 嵌套列表栈：[{ tag, li }]；下标 = 层级-1，li = 这一层的 <li> 还开着
+    let table = false;
+    let quote = false;
+    let code = null;     // 代码块（**流式时常常还没闭合**，那种也要当代码块）
     const closeTable = () => { if (table) { out.push("</tbody></table>"); table = false; } };
+    const closeQuote = () => { if (quote) { out.push("</blockquote>"); quote = false; } };
+    // 关到剩 keep 层：**每层都要先把它的 <li> 收掉**，否则子列表会跑到 <li> 外面
+    const closeLists = (keep) => {
+      while (lists.length > keep) {
+        const top = lists[lists.length - 1];
+        if (top.li) { out.push("</li>"); top.li = false; }
+        out.push("</" + top.tag + ">");
+        lists.pop();
+      }
+    };
+    // 开一个列表项：嵌套时**父层的 <li> 保持开着** —— 子列表要嵌在它里面
+    const openItem = (level, tag, html) => {
+      while (lists.length > level) {
+        const top = lists[lists.length - 1];
+        if (top.li) { out.push("</li>"); top.li = false; }
+        out.push("</" + top.tag + ">");
+        lists.pop();
+      }
+      if (lists.length === level && lists[level - 1].tag !== tag) {
+        const top = lists.pop();                         // 同一层换了类型
+        if (top.li) out.push("</li>");
+        out.push("</" + top.tag + ">");
+      }
+      while (lists.length < level) { out.push("<" + tag + ">"); lists.push({ tag: tag, li: false }); }
+      if (lists[level - 1].li) { out.push("</li>"); lists[level - 1].li = false; }
+      out.push(html);
+      lists[level - 1].li = true;
+    };
+    const closeAll = () => { closeLists(0); closeTable(); closeQuote(); };
+    const flushCode = () => {
+      const b = code; code = null;
+      const cls = b.lang ? ' class="lang-' + b.lang.replace(/[^a-zA-Z0-9_+-]/g, "") + '"' : "";
+      out.push("<pre><code" + cls + ">" + b.lines.join("\n") + "</code></pre>");
+    };
+
     for (const raw of esc.split(/\r?\n/)) {
       const line = raw.replace(/\s+$/, "");
+      // 代码围栏：三个及以上反引号；开 / 关都走这里
+      const fence = line.match(/^\s*```+\s*([^\s`]*)\s*$/);
+      if (fence) {
+        if (code) flushCode(); else { closeAll(); code = { lang: fence[1] || "", lines: [] }; }
+        continue;
+      }
+      if (code) { code.lines.push(line); continue; }   // 代码块内部：原样，不解析任何标记
+
       const h = line.match(/^(#{1,4})\s+(.*)$/);
       if (h) {
-        closeList(); closeTable();
+        closeAll();
         out.push("<h" + h[1].length + ">" + inline(h[2]) + "</h" + h[1].length + ">");
         continue;
       }
       if (/^\s*\|.*\|\s*$/.test(line)) {                 // 表格行
         if (/^\s*\|[-\s:|]+\|\s*$/.test(line)) continue; // |---|---| 分隔行丢掉
+        closeLists(0); closeQuote();
         const cells = line.trim().replace(/^\||\|$/g, "").split("|").map((c) => c.trim());
-        if (!table) { closeList(); out.push("<table><tbody>"); table = true; }
+        if (!table) { out.push("<table><tbody>"); table = true; }
         out.push("<tr>" + cells.map((c) => "<td>" + inline(c) + "</td>").join("") + "</tr>");
         continue;
       }
       closeTable();
-      const ul = line.match(/^\s*[-*+]\s+(.*)$/);
-      const ol = line.match(/^\s*\d+[.)]\s+(.*)$/);
-      if (ul || ol) {
-        const want = ul ? "ul" : "ol";
-        if (list !== want) { closeList(); out.push("<" + want + ">"); list = want; }
-        out.push("<li>" + inline((ul || ol)[1]) + "</li>");
+
+      const q = line.match(/^\s*&gt;\s?(.*)$/);          // 引用块（`>` 已被转义成 &gt;）
+      if (q) {
+        closeLists(0);
+        if (!quote) { out.push("<blockquote>"); quote = true; }
+        if (q[1] !== "") out.push("<p>" + inline(q[1]) + "</p>");
         continue;
       }
-      closeList();
+      closeQuote();
+
+      const ul = line.match(/^(\s*)[-*+]\s+(.*)$/);
+      const ol = line.match(/^(\s*)\d+[.)]\s+(.*)$/);
+      if (ul || ol) {
+        const hit = ul || ol;
+        // 缩进 / 2 = 层级（1 起）；两个空格一级。**夹一下**：跳级时（比如直接从 0 到 2）
+        // 只允许比当前深一层，否则会生成没有父 <li> 的孤儿列表。
+        const rawLevel = Math.floor(hit[1].replace(/\t/g, "  ").length / 2) + 1;
+        const level = Math.min(rawLevel, lists.length + 1);
+        const tag = ul ? "ul" : "ol";
+        const item = hit[2];
+        const task = item.match(/^\[([ xX])\]\s+(.*)$/);   // 任务列表 - [ ] / - [x]
+        const html = task
+          ? '<li class="task' + (task[1].toLowerCase() === "x" ? " done" : "") +
+            '"><span class="task-box">' + (task[1].toLowerCase() === "x" ? "☑" : "☐") +
+            "</span>" + inline(task[2]) + "</li>"
+          : "<li>" + inline(item) + "</li>";
+        // ⚠️ openItem 把整个 <li> 一起推出去，所以先把 html 尾部的 </li> 去掉重拼：
+        //    嵌套时那个 </li> 要留到子列表之后才关。
+        openItem(level, tag, html.replace(/<\/li>$/, ""));
+        continue;
+      }
+      closeLists(0);
       if (line === "") continue;
       out.push("<p>" + inline(line) + "</p>");
     }
-    closeList(); closeTable();
+    if (code) flushCode();   // 流式：围栏还没闭合 —— 也要收成代码块，别把反引号露给客户
+    closeAll();
     return out.join("");
   }
 
@@ -2359,6 +3062,16 @@ function startBrowserClient() {
     '.message-body table{border-collapse:collapse;margin:8px 0;font-size:.95em;display:block;overflow-x:auto;max-width:100%}',
     '.message-body td{border:1px solid #30363d;padding:4px 9px;text-align:left;white-space:nowrap}',
     '.message-body tr:first-child td{font-weight:600;background:rgba(110,118,129,.12)}',
+    /* ── 代码块 / 链接 / 引用 / 删除线 / 任务列表（2026-09-20 补，照 CLI 的 markdown_render.rs）── */
+    '.message-body pre{margin:8px 0;padding:10px 12px;background:rgba(110,118,129,.15);border:1px solid var(--line,rgba(72,215,255,.14));border-radius:6px;overflow-x:auto;max-width:100%}',
+    '.message-body pre code{background:none;padding:0;font-size:.9em;line-height:1.5;white-space:pre;border-radius:0}',
+    '.message-body blockquote{margin:8px 0;padding:2px 0 2px 12px;border-left:3px solid var(--line,rgba(72,215,255,.35));color:var(--text-soft,#b6c0d4)}',
+    '.message-body blockquote p{margin:4px 0}',
+    '.message-body a{color:var(--action,#6aaef2);text-decoration:underline;word-break:break-word}',
+    '.message-body del{opacity:.65}',
+    '.message-body li.task{list-style:none;margin-left:-18px}',
+    '.message-body li.task .task-box{margin-right:6px;opacity:.85}',
+    '.message-body li.task.done{opacity:.7}',
     /* 兜底：万一有人往正文里写了更高级的选择器，也不能让标题爆尺寸 */
     '.message-body h1,.message-body h2,.message-body h3,.message-body h4,.message-body h5,.message-body h6{font-size:1em!important}',
   ].join("\n");
@@ -2371,6 +3084,91 @@ function startBrowserClient() {
       document.head.appendChild(tag);
     }
     tag.textContent = MARKDOWN_CSS;
+  })();
+
+  /* ── 子代理卡的样式（2026-09-20）──
+   * 跟 markdown 那套一样，**写在 app.mjs 里**（不往 styles.css 里塞）：
+   *   ① 两边各自缓存，写一起才不会「JS 新的 + CSS 旧的」；
+   *   ② styles.css 与 index.html 在门卫的 `/assets/` 白名单 + `fork-manifest.sh` 的 precheck
+   *      里有硬编码清单（§166 踩过），新加一套样式没必要去动那两个地方。
+   * 配色只用官方语义变量（见 styles.css 的 :root），不另创颜色。 */
+  const AGENT_CARD_CSS = [
+    '.agent-card{display:block;margin:6px 0;padding:5px 10px 6px;border-left:2px solid var(--line,rgba(72,215,255,.14));font-size:13px;line-height:1.5}',
+    '.agent-card[data-agent-status="running"],.agent-card[data-agent-status="model_wait"],.agent-card[data-agent-status="starting"],.agent-card[data-agent-status="running_tool"]{border-left-color:var(--status-live,#4fd1c5)}',
+    '.agent-card[data-agent-status="queued"],.agent-card[data-agent-status="waiting_for_user"]{border-left-color:var(--status-human,#f0b429)}',
+    '.agent-card[data-agent-status="completed"]{border-left-color:var(--ok,#4fd1c5)}',
+    '.agent-card[data-agent-status="failed"]{border-left-color:var(--danger,#f87171)}',
+    '.agent-card[data-agent-status="cancelled"],.agent-card[data-agent-status="interrupted"]{opacity:.75}',
+    '.agent-head{display:flex;align-items:baseline;gap:5px;flex-wrap:wrap}',
+    '.agent-glyph{flex:0 0 auto;color:var(--text-dim,#b6c0d4)}',
+    '.agent-role{font-weight:600;color:var(--text,#f6f2e8)}',
+    '.agent-name{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12.5px;color:var(--text-dim,#b6c0d4)}',
+    '.agent-activity{margin-left:11px;color:var(--text-dim,#b6c0d4);font-size:12.5px;word-break:break-word}',
+    '.agent-foot{margin-left:11px;color:var(--text-muted,#8b97ab);font-size:12.5px}',
+  ].join("\n");
+  (function injectAgentCardStyles() {
+    if (!globalThis.document || !document.head) return;
+    let tag = document.getElementById("asbudy-agent-styles");
+    if (!tag) {
+      tag = document.createElement("style");
+      tag.id = "asbudy-agent-styles";
+      document.head.appendChild(tag);
+    }
+    tag.textContent = AGENT_CARD_CSS;
+  })();
+
+  /* ── 运行汇总行的样式（M10 · 2026-09-20）──
+   * 跟 markdown / 子代理卡那两套一样，**写在 app.mjs 里**（不往 styles.css 里塞，理由同上一段）。
+   * 颜色只用官方语义变量（styles.css 的 :root）。 */
+  const TOOL_RUN_CSS = [
+    '.tool-run{display:block;margin:6px 0;font-size:13px;line-height:1.5}',
+    '.tool-run-head{display:flex;align-items:baseline;gap:6px;cursor:pointer;color:var(--text-dim,#b6c0d4);list-style:none}',
+    '.tool-run-head::-webkit-details-marker{display:none}',
+    '.tool-run-head::before{content:"\\25B8";flex:0 0 auto;font-size:10px;opacity:.7}',
+    '.tool-run[open]>.tool-run-head::before{content:"\\25BE"}',
+    '.tool-run-glyph{flex:0 0 auto;opacity:.55}',
+    '.tool-run-text{flex:1 1 auto}',
+    '.tool-run-body{margin:4px 0 0 5px;padding-left:9px;border-left:2px solid var(--line,rgba(72,215,255,.14))}',
+  ].join("\n");
+  (function injectToolRunStyles() {
+    if (!globalThis.document || !document.head) return;
+    let tag = document.getElementById("asbudy-toolrun-styles");
+    if (!tag) {
+      tag = document.createElement("style");
+      tag.id = "asbudy-toolrun-styles";
+      document.head.appendChild(tag);
+    }
+    tag.textContent = TOOL_RUN_CSS;
+  })();
+
+  /* ── 清单 / 待办卡的样式（M12 · 2026-09-20）── */
+  const CHECKLIST_CSS = [
+    '.checklist-card{display:block;margin:6px 0;padding:5px 10px 6px;border-left:2px solid var(--line,rgba(72,215,255,.14));font-size:13px;line-height:1.5}',
+    '.checklist-card[data-cl-state="running"]{border-left-color:var(--status-live,#4fd1c5)}',
+    '.checklist-card[data-cl-state="completed"]{border-left-color:var(--ok,#4fd1c5)}',
+    '.checklist-card[data-cl-state="failed"]{border-left-color:var(--danger,#f87171)}',
+    '.cl-head{display:flex;align-items:baseline;gap:6px;flex-wrap:wrap}',
+    '.cl-glyph{flex:0 0 auto;color:var(--text-dim,#b6c0d4)}',
+    '.cl-role{font-weight:600;color:var(--text,#f6f2e8)}',
+    '.cl-count{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12.5px;color:var(--text-dim,#b6c0d4)}',
+    '.cl-items{margin:3px 0 0 11px;padding:0;list-style:none}',
+    '.cl-item{display:flex;gap:6px;align-items:baseline;margin:1px 0}',
+    '.cl-mk{flex:0 0 auto}',
+    '.cl-item[data-cl-st="done"] .cl-mk{color:var(--ok,#4fd1c5)}',
+    '.cl-item[data-cl-st="doing"] .cl-mk{color:var(--status-live,#4fd1c5)}',
+    '.cl-item[data-cl-st="failed"] .cl-mk{color:var(--danger,#f87171)}',
+    '.cl-item[data-cl-st="todo"] .cl-mk,.cl-item[data-cl-st="skipped"] .cl-mk{color:var(--text-dim,#b6c0d4)}',
+    '.cl-tx{flex:1 1 auto;word-break:break-word}',
+  ].join("\n");
+  (function injectChecklistStyles() {
+    if (!globalThis.document || !document.head) return;
+    let tag = document.getElementById("asbudy-checklist-styles");
+    if (!tag) {
+      tag = document.createElement("style");
+      tag.id = "asbudy-checklist-styles";
+      document.head.appendChild(tag);
+    }
+    tag.textContent = CHECKLIST_CSS;
   })();
 
   function captureTranscriptSelection() {
