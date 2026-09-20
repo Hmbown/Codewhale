@@ -1683,7 +1683,38 @@
    *   ② 「未归属」= 没有记到具体项目的会话（平台内部/测试对话），不是客户的项目。
    * ⚠️ 这是跨账号的平台视角，只给管理员（菜单里也只在 admin 下显示）。
    */
-  var TU = {};
+  var TU = { preset: 'all', since: '', until: '' };
+  /* 时间区间（2026-09-20 老板要）。
+   * ⚠️ 日期一律用 **UTC 日**（`toISOString` 就是 UTC）—— 与引擎的「一天」口径一致
+   *   （引擎按 UTC 日分桶）。用本地时区算会让「今天」的合计与按天列表对不上。 */
+  function tuUtcDay(shift) {
+    var d = new Date();
+    if (shift) d.setUTCDate(d.getUTCDate() + shift);
+    return d.toISOString().slice(0, 10);
+  }
+  var TU_PRESETS = [['all', '全部'], ['today', '今天'], ['7d', '近 7 天'], ['30d', '近 30 天'], ['month', '本月']];
+  function tuPresetRange(p) {
+    if (p === 'today') return { since: tuUtcDay(0), until: tuUtcDay(0) };
+    if (p === '7d') return { since: tuUtcDay(-6), until: tuUtcDay(0) };
+    if (p === '30d') return { since: tuUtcDay(-29), until: tuUtcDay(0) };
+    if (p === 'month') return { since: tuUtcDay(0).slice(0, 7) + '-01', until: tuUtcDay(0) };
+    return { since: '', until: '' };
+  }
+  function tuRangeBar() {
+    var h = '<div style="display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin:0 0 6px">';
+    TU_PRESETS.forEach(function (p) {
+      h += '<button class="ab-btn ghost sm" data-range="' + p[0] + '" type="button"' +
+        (TU.preset === p[0] ? ' style="border-color:var(--action);color:var(--text)"' : '') +
+        '>' + p[1] + '</button>';
+    });
+    h += '<span class="ab-s" style="margin:0 2px">自定义</span>' +
+      '<input type="date" class="ab-input" id="tu-since" style="width:auto;padding:5px 8px" value="' + esc(TU.since) + '">' +
+      '<span class="ab-s" style="margin:0">~</span>' +
+      '<input type="date" class="ab-input" id="tu-until" style="width:auto;padding:5px 8px" value="' + esc(TU.until) + '"></div>';
+    h += '<div class="ab-s" style="margin:0 0 10px">区间按「引擎日」切（UTC，北京时间早 8 点换日）—— 与下面的按天列表完全对齐；全部就是全历史。</div>';
+    return h;
+  }
+  function tuRefresh() { return '<button class="ab-btn ghost sm" id="tu-refresh" type="button">刷新</button>'; }
   function tuN(n) { return String(Math.round(Number(n) || 0)).replace(/\B(?=(\d{3})+(?!\d))/g, ','); }
   function tuW(n) {
     n = Number(n) || 0;
@@ -1768,8 +1799,8 @@
       '每个账号一套引擎，数据来自引擎自带的用量账本（厂商返回的原值）。' +
       '金额是按引擎内置价目表推算的，<b>不是厂商账单</b>；「未归属」是没有记到具体项目的对话（平台内部/测试）。' +
       (d.cached ? '<br>本次为 60 秒内的缓存结果，点「刷新」可强制重读。' : '') + '</div>';
-    h += '<div class="ab-card">';
-    h += '<div class="ab-card-top"><b>全部账号合计</b><button class="ab-btn ghost sm" id="tu-refresh" type="button">刷新</button></div>';
+    h += tuRangeBar() + '<div class="ab-card">';
+    h += '<div class="ab-card-top"><b>全部账号合计</b>' + tuRefresh() + '</div>';
     h += '<div class="ab-s" style="font-size:16px;color:var(--text)">' + tuY(g.costCny) +
       '　<span style="font-size:13.5px">（调用 ' + tuN(g.calls) + ' 次）</span></div>';
     h += '<div class="ab-s">进 ' + tuW(g.inTok) + ' · 出 ' + tuW(g.outTok) + ' · 缓存命中 ' + tuW(g.cachedTok) +
@@ -1790,7 +1821,11 @@
     openLayer('用量明细', function (body) {
       function load(force) {
         body.innerHTML = '<div class="ab-tip">正在读各账号用量…</div>';
-        api('/_gate/token-usage' + (force ? '?force=1' : '')).then(function (r) {
+        var qs = [];
+        if (TU.since) qs.push('since=' + encodeURIComponent(TU.since));
+        if (TU.until) qs.push('until=' + encodeURIComponent(TU.until));
+        if (force) qs.push('force=1');
+        api('/_gate/token-usage' + (qs.length ? '?' + qs.join('&') : '')).then(function (r) {
           if (!r.ok) {
             body.innerHTML = '<div class="ab-tip">读不到：' + esc((r.body && r.body.error) || ('HTTP ' + r.code)) + '</div>';
             return;
@@ -1799,6 +1834,18 @@
           body.innerHTML = tuRender(r.body);
           var b = body.querySelector('#tu-refresh');
           if (b) b.onclick = function () { load(true); };
+          // 时间区间：快捷按钮 ＋ 自定义起止（2026-09-20 老板要）
+          Array.prototype.forEach.call(body.querySelectorAll('[data-range]'), function (btn) {
+            btn.onclick = function () {
+              TU.preset = btn.getAttribute('data-range');
+              var rg = tuPresetRange(TU.preset);
+              TU.since = rg.since; TU.until = rg.until;
+              load(false);
+            };
+          });
+          var iS = body.querySelector('#tu-since'), iU = body.querySelector('#tu-until');
+          if (iS) iS.onchange = function () { TU.preset = 'custom'; TU.since = iS.value; load(false); };
+          if (iU) iU.onchange = function () { TU.preset = 'custom'; TU.until = iU.value; load(false); };
           // 客户行：点一下展开 / 收起名下的账号明细（老板 2026-09-20 要的交互）
           Array.prototype.forEach.call(body.querySelectorAll('[data-cli]'), function (row) {
             row.onclick = function () {
