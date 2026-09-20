@@ -3400,6 +3400,25 @@
     } catch (e) { /* 参数读不到就算了 */ }
   })();
 
+  /* 桌面开始菜单「用量明细」走这条路进来：URL 带 `?usage=1` → 自动把用量面板打开。
+     跟 `?my=1` / `?settings=1` 同一个套路：不重写第二份，直接把外挂里已有的那个面板摊开。
+     （我 2026-09-20 加：老板说「我的」里没看到 —— 多给一个**一眼能看到**的入口。） */
+  (function () {
+    try {
+      var sp = new URLSearchParams(location.search);
+      if (sp.get('usage') !== '1') return;
+      document.body.classList.add('asb-settings-only');
+      var tries = 0;
+      var t = setInterval(function () {
+        if (typeof openTokenUsage === 'function' && document.getElementById('composer-input')) {
+          clearInterval(t);
+          setTimeout(openTokenUsage, 400);
+        }
+        if (++tries > 40) clearInterval(t);
+      }, 300);
+    } catch (e) { /* 参数读不到就算了 */ }
+  })();
+
   if (!bindLogo()) {
     var tries = 0;
     var t = setInterval(function () { if (bindLogo() || ++tries > 60) clearInterval(t); }, 400);
