@@ -1697,10 +1697,11 @@
       '<span style="flex:1">' + mid + '</span>' +
       '<span style="min-width:70px;text-align:right;color:var(--text)">' + right + '</span></div>';
   }
-  function tuAccountCard(a) {
-    var h = '<div class="ab-card">';
+  function tuAccountCard(a, nested) {
+    var h = '<div class="ab-card"' + (nested ? ' style="margin:10px 0 0;padding:9px 11px"' : '') + '>';
     h += '<div class="ab-card-top"><b>' + esc(a.label || a.account) + '</b>' +
-      '<span class="ab-s" style="margin:0">' + esc(a.account) + (a.port ? ' · 端口 ' + a.port : '') +
+      '<span class="ab-s" style="margin:0">' + (a.isSelf ? '本账号' : esc(a.roleZh || '账号')) +
+      ' · ' + esc(a.account) + (a.port ? ' · 端口 ' + a.port : '') +
       (a.model ? ' · ' + esc(a.model) : '') + '</span></div>';
     if (a.error || !a.totals) {
       h += '<div class="ab-s">读不到这个账号的用量：' + esc(a.error || '引擎没在跑') + '</div>';
@@ -1736,6 +1737,30 @@
     h += '</div>';
     return h;
   }
+  /** 客户行（可点开）—— 客户级消耗 = **客户自己的账号 ＋ 名下员工账号**。
+   *  老板 2026-09-20：「客户一行／自己账号消耗的、客户级账号消耗的；客户行点击后展开名下所有
+   *  账号（包括自己账号）的明细」—— 所以行上先把两部分拆开写清楚，再点开展明细。 */
+  function tuClientCard(c) {
+    var t = c.totals || {};
+    var h = '<div class="ab-card" style="padding:0;overflow:hidden">';
+    h += '<div data-cli="' + esc(c.key) + '" style="display:flex;gap:8px;align-items:baseline;padding:11px 13px 4px;cursor:pointer">' +
+      '<span class="tu-caret" style="min-width:12px;color:var(--text-dim)">▸</span>' +
+      '<b>' + esc(c.label) + '</b>' +
+      '<span class="ab-s" style="margin:0">' + esc(c.roleZh) + ' · ' + esc(c.key) + '</span>' +
+      '<span style="flex:1"></span>' +
+      '<span style="color:var(--text)">' + tuY(t.costCny) + '</span>' +
+      '<span class="ab-s" style="margin:0;min-width:56px;text-align:right">' + tuN(t.calls) + ' 次</span></div>';
+    h += '<div class="ab-s" style="padding:0 13px 6px 33px">进 ' + tuW(t.inTok) + ' · 出 ' + tuW(t.outTok) +
+      ' · 缓存命中 ' + tuW(t.cachedTok) + ' · 推理 ' + tuW(t.reasonTok) + '</div>';
+    h += '<div class="ab-s" style="padding:0 13px 10px 33px">' +
+      '本账号 ' + tuY(c.ownCny) + '（' + tuN(c.ownCalls) + ' 次）　·　' +
+      '名下员工 ' + tuY(c.staffCny) + '（' + tuN(c.staffCalls) + ' 次）</div>';
+    h += '<div data-body="' + esc(c.key) + '" hidden style="border-top:1px solid var(--line);padding:10px 13px 12px">';
+    h += '<div class="ab-s" style="margin:0 0 2px">名下账号明细（' + c.accounts.length + ' 个）</div>';
+    c.accounts.forEach(function (a) { h += tuAccountCard(a, true); });
+    h += '</div></div>';
+    return h;
+  }
   function tuRender(d) {
     var g = d.grand || {};
     // 口径说明每次都要看得见（不能用 abTipPanel —— 那个只看一次就不再显示）
@@ -1751,7 +1776,14 @@
       ' · 推理 ' + tuW(g.reasonTok) + '</div>';
     if (!g.complete) h += '<div class="ab-s" style="color:var(--warning)">含 ' + tuN(g.unpricedCalls) + ' 次缺定价凭据的调用（金额略少算）</div>';
     h += '</div>';
-    (d.accounts || []).forEach(function (a) { h += tuAccountCard(a); });
+    // 客户级（老板 2026-09-20 要的层级）：先客户行，点开展开名下账号
+    var clients = d.clients || [];
+    if (clients.length) {
+      h += '<div class="ab-s" style="margin:14px 0 6px;color:var(--text)">按客户（点一下展开名下的账号）</div>';
+      clients.forEach(function (c) { h += tuClientCard(c); });
+    } else {
+      (d.accounts || []).forEach(function (a) { h += tuAccountCard(a); });
+    }
     return h;
   }
   function openTokenUsage() {
@@ -1767,6 +1799,17 @@
           body.innerHTML = tuRender(r.body);
           var b = body.querySelector('#tu-refresh');
           if (b) b.onclick = function () { load(true); };
+          // 客户行：点一下展开 / 收起名下的账号明细（老板 2026-09-20 要的交互）
+          Array.prototype.forEach.call(body.querySelectorAll('[data-cli]'), function (row) {
+            row.onclick = function () {
+              var key = row.getAttribute('data-cli');
+              var bx = body.querySelector('[data-body="' + key + '"]');
+              if (!bx) return;
+              bx.hidden = !bx.hidden;
+              var car = row.querySelector('.tu-caret');
+              if (car) car.textContent = bx.hidden ? '▸' : '▾';
+            };
+          });
         });
       }
       load(false);
