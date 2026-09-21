@@ -3561,10 +3561,16 @@
       var tid = MODEL_THREAD;
       if (!tid) return Promise.resolve('unknown');
       return api('/v1/threads/' + encodeURIComponent(tid)).then(function (r) {
-        var t = (r && r.body) || {};
+        // ⚠️ 详情接口把会话**包在 `.thread` 里**（列表才是裸数组）—— 2026-09-22 就是漏了这层，
+        //    model 永远读到空 ⇒ 被误判成「模型不支持图片」⇒ 按钮直接灰掉（老板报的正是这个）。
+        //    同一个坑 `openModelPicker` 里早就踩过并写明了（`var th = body.thread || body`）。
+        var t = (r && r.body && (r.body.thread || r.body)) || {};
         var model = String(t.model || '').trim();
         var pid = String(t.model_provider || t.model_provider_id || '').trim();
-        if (!model || model.toLowerCase() === 'auto') return 'unsupported';
+        // `auto` 引擎明确不收图（runtime_threads.rs:9128）⇒ 禁；
+        // 但**读不到**只是我们没查清 —— 宁可让客户试（引擎会给出人话），也别把能用的按钮灰掉。
+        if (model.toLowerCase() === 'auto') return 'unsupported';
+        if (!model) return 'unknown';
         var key = pid + '|' + model;
         if (capCache[key]) return capCache[key];
         return loadProviderModels(pid).then(function (ms) {
