@@ -18,11 +18,11 @@ agents with different models and roles.
 [![Discord](https://img.shields.io/badge/Discord-join-5865F2?logo=discord&logoColor=white)](https://discord.gg/37gfS3ksug)
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="web/public/codewhale-tui-171acee.png">
-  <img src="web/public/codewhale-tui-171acee.png" alt="A Codewhale terminal session" width="720">
+  <source media="(prefers-color-scheme: dark)" srcset="web/public/codewhale-tui-d7a9a1c.png">
+  <img src="web/public/codewhale-tui-d7a9a1c.png" alt="A Codewhale terminal session" width="720">
 </picture>
 
-*Terminal preview from a v0.9.12 development build.*
+*Terminal preview from a v0.10.0 development build.*
 
 ## Install
 

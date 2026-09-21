@@ -1479,9 +1479,12 @@ impl ToolSpec for ReviewTool {
                         &route,
                         &usage,
                         format!(
-                            "Review pass {}/{} request failed: {error}; no partial review was accepted.",
-                            index + 1,
-                            plan.as_ref().map_or(1, |plan| plan.passes.len())
+                            "{}; no partial review was accepted.",
+                            request_failure_message(
+                                index + 1,
+                                plan.as_ref().map_or(1, |plan| plan.passes.len()),
+                                &error
+                            )
                         ),
                     ));
                 }
@@ -1574,6 +1577,23 @@ fn add_optional_usage(total: &mut Option<u32>, next: Option<u32>) {
     if let Some(next) = next {
         *total = Some(total.unwrap_or(0).saturating_add(next));
     }
+}
+
+/// Describe a failed review request with its whole error chain.
+///
+/// The client wraps the retry loop's `LlmError` in one outer context (the
+/// bare "Responses API request failed" / "Chat API request failed"), and
+/// `{error}` prints only that layer. The alternate format walks the chain,
+/// so the class the `LlmError` names (quota, auth, rate limit, upstream 5xx,
+/// network, timeout) and its sanitized provider body reach the log and the
+/// review workflow's non-run classifier. Both the agent-callable `ReviewTool`
+/// and the `codewhale review` CLI path go through here.
+pub(crate) fn request_failure_message(
+    pass: usize,
+    planned: usize,
+    error: &anyhow::Error,
+) -> String {
+    format!("Review pass {pass}/{planned} request failed: {error:#}")
 }
 
 pub(crate) fn add_review_usage(total: &mut Usage, next: &Usage) {
@@ -1954,6 +1974,20 @@ fn parse_pr_url(url: &str) -> Option<PullRequestRef> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn request_failure_message_keeps_the_provider_failure_beneath_the_context() {
+        let error = anyhow::Error::new(crate::llm_client::LlmError::ServerError {
+            status: 503,
+            message: "upstream unavailable".into(),
+        })
+        .context("Responses API request failed");
+        let message = request_failure_message(1, 1, &error);
+        assert_eq!(
+            message,
+            "Review pass 1/1 request failed: Responses API request failed: Server error (503): upstream unavailable"
+        );
+    }
 
     fn pr_view(files: usize) -> super::super::review_pr::GhPullRequest {
         super::super::review_pr::GhPullRequest {

@@ -1,9 +1,11 @@
-//! Unified read-only inventory for Codewhale extensions.
+//! Unified inventory for Codewhale extensions.
 //!
 //! This is deliberately a projection over the existing owners of Hooks,
 //! Plugins, Marketplace catalogs, Skills, and MCP. It has no registry, trust
 //! database, installer, or network fetch of its own. Future actions emitted by
 //! this view must delegate to the existing command/mutation controllers.
+//! The skills mutation manager remains at `/skills manage`; MCP setup is a
+//! read-only suggestions handoff, not an inline installer or credential editor.
 
 use std::borrow::Cow;
 use std::cell::RefCell;
@@ -823,11 +825,14 @@ fn plugin_row_action(
         }
     } else {
         // The command opens the exact-content review with its confirmation
-        // control, so this panel yields to that review.
+        // control stacked on this panel. Confirming the digest runs the
+        // trust mutation and the host re-reads the inventory, so the row the
+        // person just reviewed reports its new state instead of the stale
+        // "not reviewed" it left with.
         ExtensionAction::Command {
             label: tr(locale, MessageId::AutomationActionInspect).into_owned(),
             command: format!("/plugin trust {}", plugin.name()),
-            disposition: RowActionDisposition::LeavePanel,
+            disposition: RowActionDisposition::InPlace,
         }
     }
 }
@@ -1165,7 +1170,7 @@ fn skills_model(app: &App, locale: Locale) -> ExtensionsTabModel {
             // place.
             action: Some(ExtensionAction::Command {
                 label: tr(locale, MessageId::ExtensionsActionManage).into_owned(),
-                command: "/skills".into(),
+                command: "/skills manage".into(),
                 disposition: RowActionDisposition::LeavePanel,
             }),
             toggle: None,
@@ -1383,8 +1388,35 @@ fn mcp_model(app: &App, locale: Locale) -> ExtensionsTabModel {
             }
         })
         .collect();
+    let groups = if items.is_empty() && configured.is_some() {
+        vec![ExtensionGroup {
+            id: "mcp-start".into(),
+            label: tr(locale, MessageId::ExtensionsMcpEmpty).into_owned(),
+            items: vec![ExtensionItem {
+                id: "mcp-suggestions".into(),
+                tone: ExtensionTone::Idle,
+                label: tr(locale, MessageId::ExtensionsMcpBrowse).into_owned(),
+                description: tr(locale, MessageId::McpRecommendationsHeading).into_owned(),
+                state: tr(locale, MessageId::ExtensionsStateAvailable).into_owned(),
+                detail: localize(
+                    locale,
+                    MessageId::McpRecommendationsSafety,
+                    &[("restart_command", "/mcp restart")],
+                ),
+                action: Some(ExtensionAction::Command {
+                    label: tr(locale, MessageId::AutomationActionInspect).into_owned(),
+                    command: "/mcp recommendations".into(),
+                    disposition: RowActionDisposition::InPlacePager,
+                }),
+                toggle: None,
+                remove: None,
+            }],
+        }]
+    } else {
+        mcp_groups(locale, items)
+    };
     ExtensionsTabModel {
-        groups: mcp_groups(locale, items),
+        groups,
         problem: (configured.is_none() && app.mcp_configured_count > total).then(|| {
             localize(
                 locale,
@@ -1518,29 +1550,19 @@ impl ExtensionsView {
             last_poll: std::time::Instant::now(),
             pending_remove: None,
         };
-        // `/mcp` opens on the first server that needs a login, not on that
-        // group's heading, so the one key the screen advertises — Enter —
-        // runs the login flow straight away (#5926).
-        if view
-            .snapshot
-            .tab(tab)
-            .groups
-            .first()
-            .is_some_and(|group| group.id == MCP_LOGIN_GROUP_ID)
-        {
-            view.selected[tab.index()] = 1;
-        }
-        // A plugin manager opens on an actual plugin's inspect/action row;
-        // group headings remain reachable above it for folding.
-        if tab == ExtensionsTab::Plugins {
-            let first_item = view
+        // Each tab lands on a real item, preserving login-first MCP sorting.
+        // Group headings remain reachable for folding with Up.
+        for initial_tab in ExtensionsTab::ALL {
+            view.active_tab = initial_tab;
+            if let Some(index) = view
                 .visible_entries()
                 .iter()
-                .position(|entry| matches!(entry, VisibleEntry::Item(_, _)));
-            if let Some(index) = first_item {
-                view.selected[tab.index()] = index;
+                .position(|entry| matches!(entry, VisibleEntry::Item(_, _)))
+            {
+                view.selected[initial_tab.index()] = index;
             }
         }
+        view.active_tab = tab;
         view
     }
 
@@ -1687,8 +1709,15 @@ impl ExtensionsView {
                         })
                     }
                 },
-                _ => ViewAction::None,
+                _ => ViewAction::Emit(ViewEvent::OpenTextPager {
+                    title: item.label.clone(),
+                    content: format!("{}\n\n{}\n\n{}", item.state, item.description, item.detail),
+                }),
             },
+            Some(VisibleEntry::Problem(problem)) => ViewAction::Emit(ViewEvent::OpenTextPager {
+                title: self.active_tab.label(self.locale),
+                content: problem.to_string(),
+            }),
             _ => ViewAction::None,
         }
     }
@@ -2082,7 +2111,7 @@ impl ModalView for ExtensionsView {
                     parts.push(("  ".into(), None));
                     if let Some(action) = item.action.as_ref() {
                         parts.push((
-                            format!("[{}] ", action.label()),
+                            format!("{} · ", action.label()),
                             Some(match action {
                                 ExtensionAction::Command { .. } => {
                                     codewhale_palette::ChromeInk::Identity
@@ -2092,7 +2121,7 @@ impl ModalView for ExtensionsView {
                         ));
                     }
                     parts.push((item.label.clone(), None));
-                    parts.push((format!(" [{}]", item.state), Some(item.tone.ink())));
+                    parts.push((format!(" · {}", item.state), Some(item.tone.ink())));
                 }
                 VisibleEntry::Problem(problem) => parts.push((
                     format!("! {problem}"),
@@ -2161,23 +2190,32 @@ impl ModalView for ExtensionsView {
             }))
             .wrap(Wrap { trim: false })
             .render(rows[3], buf);
-        let compact_hints = [
+        let mut compact_hints = vec![
             super::ActionHint::new("Tab", tr(self.locale, MessageId::ExtensionsActionTabs)),
             super::ActionHint::new("/", tr(self.locale, MessageId::SessionsActionSearch)),
             super::ActionHint::new("Esc", tr(self.locale, MessageId::SessionsActionClose)),
         ];
-        // Only advertise Enter when Enter does something. A `Status` action is
-        // a state, not a verb: a row mid-connect labelled `connecting` produced
-        // the hint "Enter connecting", and pressing it did nothing — which is
-        // what makes a user press it again.
         let enter_label = match entries.get(selected).copied() {
-            Some(VisibleEntry::Item(_, item)) => item
-                .action
-                .as_ref()
-                .filter(|action| action.command().is_some())
-                .map(|action| action.label().to_string()),
-            _ => Some(tr(self.locale, MessageId::ExtensionsActionFold).into_owned()),
+            Some(VisibleEntry::Item(_, item)) => Some(
+                item.action
+                    .as_ref()
+                    .filter(|action| action.command().is_some())
+                    .map_or_else(
+                        || tr(self.locale, MessageId::AutomationActionInspect).into_owned(),
+                        |action| action.label().to_string(),
+                    ),
+            ),
+            Some(VisibleEntry::Group(_)) => {
+                Some(tr(self.locale, MessageId::ExtensionsActionFold).into_owned())
+            }
+            Some(VisibleEntry::Problem(_)) => {
+                Some(tr(self.locale, MessageId::AutomationActionInspect).into_owned())
+            }
+            _ => None,
         };
+        if let Some(label) = enter_label.as_ref() {
+            compact_hints.insert(1, super::ActionHint::new("Enter", label.clone()));
+        }
         let mut full_hints = vec![
             super::ActionHint::new("Tab", tr(self.locale, MessageId::ExtensionsActionTabs)),
             super::ActionHint::new("↑↓", tr(self.locale, MessageId::LaunchHintMove)),
@@ -2238,6 +2276,62 @@ impl ModalView for ExtensionsView {
 mod tests {
     use super::*;
     use crate::mcp::McpRecoveryKind;
+
+    #[test]
+    fn passive_rows_open_details_without_recovery_or_mutation() {
+        let mut view = view_on_item(ExtensionAction::Status {
+            label: "connected".into(),
+        });
+        let ViewAction::Emit(ViewEvent::OpenTextPager { title, content }) =
+            view.activate_selected()
+        else {
+            panic!("a passive inventory row must have useful details");
+        };
+        assert_eq!(title, "row");
+        assert!(content.contains("state"));
+        assert!(view.pending_remove.is_none());
+    }
+
+    #[test]
+    fn empty_mcp_opens_suggestions_without_installing_and_skills_manage_does_not_loop() {
+        let _env = crate::test_support::lock_test_env();
+        let root = tempfile::tempdir().unwrap();
+        let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", root.path());
+        let registry = crate::plugins::PluginDiscoveryContext::capture_pre_dotenv()
+            .registry_for_workspace(root.path());
+        let app = App::new_with_plugin_registry(
+            crate::test_support::test_tui_options(root.path()),
+            &crate::config::Config::default(),
+            registry,
+        );
+        let model = mcp_model(&app, Locale::En);
+        assert_eq!(model.groups.len(), 1);
+        assert_eq!(model.groups[0].label, "No MCP servers configured");
+        let item = &model.groups[0].items[0];
+        assert!(item.toggle.is_none() && item.remove.is_none());
+        assert!(
+            matches!(item.action.as_ref(), Some(ExtensionAction::Command {
+            command, disposition: RowActionDisposition::InPlacePager, ..
+        }) if command == "/mcp recommendations")
+        );
+        let skills = skills_model(&app, Locale::En);
+        for item in skills.groups.iter().flat_map(|group| &group.items) {
+            assert_eq!(
+                item.action.as_ref().and_then(ExtensionAction::command),
+                Some("/skills manage")
+            );
+        }
+        let mut snapshot = ExtensionsSnapshot::default();
+        snapshot.tabs[ExtensionsTab::Mcp.index()] = model;
+        let mut view =
+            ExtensionsView::from_snapshot_with_locale(snapshot, ExtensionsTab::Mcp, Locale::En);
+        assert_eq!(view.selected[ExtensionsTab::Mcp.index()], 1);
+        assert!(
+            matches!(view.activate_selected(), ViewAction::Emit(ViewEvent::ExecutePanelCommand {
+            command, pager_title: Some(_)
+        }) if command == "/mcp recommendations")
+        );
+    }
 
     #[test]
     fn workbench_extension_hover_preserves_selection_and_small_resize_clears_targets() {
@@ -2321,8 +2415,10 @@ mod tests {
             row.state,
             tr(Locale::En, MessageId::ExtensionsStateFirstParty)
         );
+        // The exact-content review stacks on the panel so the confirmed
+        // digest lands on a row that then re-reads its trust state.
         assert!(
-            matches!(&row.action, Some(ExtensionAction::Command { command, disposition: RowActionDisposition::LeavePanel, .. }) if command == "/plugin trust computer-use")
+            matches!(&row.action, Some(ExtensionAction::Command { command, disposition: RowActionDisposition::InPlace, .. }) if command == "/plugin trust computer-use")
         );
         assert!(!builtin.trusted());
         assert!(!builtin.enabled);
@@ -2512,7 +2608,7 @@ mod tests {
 
     /// Opening `/mcp` lands on the first server that needs a login, so Enter
     /// is the login key, not a fold of the group heading. A tab without a
-    /// login group keeps the heading-first default.
+    /// login group but no items keeps the empty-state selection.
     #[test]
     fn mcp_tab_opens_on_the_first_login_row() {
         let mut snapshot = ExtensionsSnapshot::default();

@@ -83,14 +83,12 @@ export default async function HomePage({ params }: { params: Promise<{ locale: s
             </div>
           </div>
 
-          {/* The founder's own capture of the v0.9.12 development build: a
-              new session, Operate mode, Full Access. Shown at its native aspect
-              so the footer stays legible; the caption says exactly what it
-              is and is not. */}
+          {/* Exact-build PTY capture of an empty session. No fabricated
+              conversation, connected tools or completion metrics. */}
           <figure className="folio-shot">
             <Image
               src={TERMINAL_SCREENSHOT.src}
-              alt={d.screenshotAlt}
+              alt={fill(d.screenshotAlt, { version: TERMINAL_SCREENSHOT.version })}
               width={TERMINAL_SCREENSHOT.width}
               height={TERMINAL_SCREENSHOT.height}
               sizes="(max-width: 58rem) calc(100vw - 2rem), 56rem"

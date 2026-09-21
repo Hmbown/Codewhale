@@ -20,7 +20,7 @@ export const home: HomeDict = {
   shotPreview: "Pratinjau terminal",
   shotBuild: "build pengembangan v{version}",
   screenshotAlt:
-    "Terminal Codewhale v0.9.12, build 171acee689aa: sesi baru dengan simbol paus, kolom penulisan pesan, Full Access dan mode Operate, dua tugas terjadwal, 21 server MCP yang masih dalam proses koneksi, serta GLM-5.3 pada tingkat upaya maksimum.",
+    "Build pengembangan Codewhale v{version}: tanda paus, sesi baru, kolom pesan, izin Ask, mode Work, dan status model. Dirender dari keluaran nyata terminal terisolasi.",
   latestRelease: "Rilis terbaru {tag}",
   releaseUnavailable: "Status rilis tidak tersedia",
   currentSource: "Sumber",

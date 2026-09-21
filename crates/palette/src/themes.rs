@@ -336,8 +336,8 @@ pub const LIGHT_UI_THEME: UiTheme = UiTheme {
 }
 .with_terminal_native_shell();
 
-/// Shoreline — the default shell from 0.9.14, and the terminal's half of the
-/// product-client palette.
+/// Shoreline — the warm charcoal alternative and the terminal's half of the
+/// product-client palette. Fresh 0.10.0 terminal installs use Underwater.
 ///
 /// The GPUI desktop window and this terminal now cite the same slots, so the
 /// two clients read as one product: a warm charcoal ground, one raised plate
@@ -348,7 +348,7 @@ pub const LIGHT_UI_THEME: UiTheme = UiTheme {
 /// direct terminal constant onto these slots, so nothing navy-tuned leaks
 /// through.
 ///
-/// The ocean is not gone, it is a choice: `underwater` keeps the painted
+/// The terminal's `underwater` default keeps the painted
 /// water column, the ambient life and the ombre.
 ///
 /// Every pair `contrast::theme_contrast_violations` audits clears its floor.

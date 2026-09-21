@@ -115,7 +115,7 @@ pub(crate) fn friendly_subagent_progress(
     {
         return existing.clone();
     }
-    "in the current".to_string()
+    "working".to_string()
 }
 
 pub(crate) fn one_line_summary(text: &str, max_width: usize) -> String {

@@ -1837,6 +1837,13 @@ async fn runtime_token_guard_protects_v1_routes() -> Result<()> {
         .send()
         .await?;
     assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+    let refresh = client
+        .post(format!(
+            "http://{addr}/v1/providers/codewhale/models/refresh"
+        ))
+        .send()
+        .await?;
+    assert_eq!(refresh.status(), StatusCode::UNAUTHORIZED);
 
     let bearer = client
         .get(format!("http://{addr}/v1/threads/summary"))
@@ -3759,9 +3766,19 @@ async fn turn_endpoint_operation_key_returns_original_and_conflicts_on_mismatch(
     assert!(!serde_json::to_string(&first)?.contains("cwc-http-operation-1"));
 
     let replay_response = client.post(&url).json(&request).send().await?;
-    assert_eq!(replay_response.status(), StatusCode::CREATED);
+    // A replay acknowledges work already accepted rather than admitting new
+    // work: 200 plus an explicit flag, so a client that retried an ambiguous
+    // submit can tell it is looking at the turn it already started (#76).
+    assert_eq!(replay_response.status(), StatusCode::OK);
     let replay: serde_json::Value = replay_response.json().await?;
     assert_eq!(replay["turn"]["id"], first_turn_id);
+    assert_eq!(replay["idempotent_replay"], true);
+    // A fresh admission carries no flag, so the response every existing client
+    // already parses is byte-identical to before.
+    assert!(
+        first.get("idempotent_replay").is_none(),
+        "only a replay is marked as one: {first}"
+    );
 
     let mismatch = client
         .post(&url)
@@ -4142,6 +4159,114 @@ async fn events_endpoint_respects_since_seq_cursor() -> Result<()> {
 
     handle.abort();
     Ok(())
+}
+
+/// The SSE `id:` a browser `EventSource` resumes from, and the `Last-Event-ID`
+/// header it replays with, against the same durable cursor `since_seq` uses.
+#[tokio::test]
+async fn thread_event_frames_carry_the_id_a_reconnect_resumes_from() -> Result<()> {
+    let Some((addr, runtime_threads, handle)) = spawn_test_server().await? else {
+        return Ok(());
+    };
+    let client = crate::tls::reqwest_client();
+    let thread = runtime_threads
+        .create_thread(CreateThreadRequest::default())
+        .await?;
+
+    // Every journal frame carries its durable seq as the SSE id.
+    let first = client
+        .get(format!(
+            "http://{addr}/v1/threads/{}/events?since_seq=0",
+            thread.id
+        ))
+        .send()
+        .await?
+        .error_for_status()?;
+    let frame = read_first_sse_frame(first).await?;
+    let (_event, payload) = parse_sse_frame(&frame)?;
+    let first_seq = payload
+        .get("seq")
+        .and_then(Value::as_u64)
+        .context("missing seq in first frame")?;
+    let id = frame
+        .lines()
+        .find_map(|line| line.strip_prefix("id:"))
+        .map(str::trim)
+        .context("SSE frames must carry an id, or nothing can resume")?
+        .to_string();
+    assert_eq!(
+        id.parse::<u64>()?,
+        first_seq,
+        "the id is the durable seq, not a frame counter"
+    );
+
+    // A second durable event, so a resume has somewhere to land.
+    let second_seq = runtime_threads
+        .emit_event_for_test(
+            &thread.id,
+            None,
+            "approval.required",
+            json!({"approval_id": "resume-proof", "tool_name": "exec_command"}),
+        )
+        .await?
+        .seq;
+    assert!(second_seq > first_seq, "the second event is later");
+
+    // The header alone is enough: a browser cannot set a query cursor.
+    let resumed = client
+        .get(format!("http://{addr}/v1/threads/{}/events", thread.id))
+        .header("Last-Event-ID", &id)
+        .send()
+        .await?
+        .error_for_status()?;
+    let frame = read_first_sse_frame(resumed).await?;
+    let (_event, payload) = parse_sse_frame(&frame)?;
+    assert_eq!(
+        payload.get("seq").and_then(Value::as_u64),
+        Some(second_seq),
+        "Last-Event-ID must resume past the acknowledged frame"
+    );
+
+    // An explicit `since_seq` outranks the header, so a deliberate
+    // replay-from-zero is never silently overridden by a stale id.
+    let explicit = client
+        .get(format!(
+            "http://{addr}/v1/threads/{}/events?since_seq=0",
+            thread.id
+        ))
+        .header("Last-Event-ID", &id)
+        .send()
+        .await?
+        .error_for_status()?;
+    let frame = read_first_sse_frame(explicit).await?;
+    let (_event, payload) = parse_sse_frame(&frame)?;
+    assert_eq!(
+        payload.get("seq").and_then(Value::as_u64),
+        Some(first_seq),
+        "the query cursor wins over the header"
+    );
+
+    handle.abort();
+    Ok(())
+}
+
+#[test]
+fn last_event_id_accepts_only_decimal_cursors() {
+    use super::last_event_id;
+
+    let mut headers = axum::http::HeaderMap::new();
+    assert_eq!(last_event_id(&headers), None, "absent header is no cursor");
+
+    headers.insert("last-event-id", "42".parse().unwrap());
+    assert_eq!(last_event_id(&headers), Some(42));
+
+    headers.insert("last-event-id", " 7 ".parse().unwrap());
+    assert_eq!(last_event_id(&headers), Some(7), "whitespace is trimmed");
+
+    // An opaque id from a proxy or an older client opens the stream from the
+    // durable head instead of refusing to open it at all.
+    headers.insert("last-event-id", "fev1_abcdef".parse().unwrap());
+    assert_eq!(last_event_id(&headers), None);
 }
 
 #[tokio::test]
@@ -8310,6 +8435,120 @@ async fn thread_summary_search_does_not_scan_the_whole_store_per_thread() -> Res
     Ok(())
 }
 
+/// The default listing carries no `search`, and it must read the store once
+/// rather than once per row.
+///
+/// This route used to call `get_thread_detail` for every row, and detail is a
+/// whole-store walk: `list_turns_for_thread` scans every turn record and
+/// `list_items_for_turns_map` scans every item record, because an item's
+/// filename carries only the item id. Listing `T` threads therefore cost
+/// `T x (all_turns + all_items)` reads — seconds-per-thread, and the reason a
+/// 72-thread rail went blank. The bound asserted here is one pass per
+/// directory, so any return to a per-row detail read fails loudly.
+#[tokio::test]
+async fn thread_summary_listing_reads_the_store_once_not_once_per_thread() -> Result<()> {
+    let Some((addr, runtime_threads, handle)) = spawn_test_server().await? else {
+        return Ok(());
+    };
+    let client = crate::tls::reqwest_client();
+
+    const THREADS: usize = 8;
+    const TURNS_PER_THREAD: usize = 4;
+    const ITEMS_PER_TURN: usize = 4;
+    const PREVIEW_TOKEN: &str = "listingreadsstoreonce";
+
+    for index in 0..THREADS {
+        let thread: serde_json::Value = client
+            .post(format!("http://{addr}/v1/threads"))
+            .json(&json!({}))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let id = thread["id"]
+            .as_str()
+            .context("missing thread id")?
+            .to_string();
+        seed_summary_search_transcript(
+            runtime_threads.test_store(),
+            &id,
+            index,
+            TURNS_PER_THREAD,
+            ITEMS_PER_TURN,
+            PREVIEW_TOKEN,
+        )?;
+    }
+
+    let total_turns = (THREADS * TURNS_PER_THREAD) as u64;
+    let total_items = (THREADS * TURNS_PER_THREAD * ITEMS_PER_TURN) as u64;
+    let per_thread_file_reads = THREADS as u64 * (total_turns + total_items);
+
+    runtime_threads.reset_whole_store_scan_file_reads();
+    let listed: serde_json::Value = client
+        .get(format!("http://{addr}/v1/threads/summary?limit={THREADS}"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let (turn_files, item_files) = runtime_threads.whole_store_scan_file_reads();
+    let rows = listed.as_array().context("summary should be an array")?;
+
+    assert_eq!(
+        rows.len(),
+        THREADS,
+        "every thread must still be listed; got {listed}"
+    );
+    assert_eq!(
+        turn_files, total_turns,
+        "the page must scan the turns directory exactly once: read {turn_files} of \
+         {total_turns} turn files, while reading one thread's detail per row would have \
+         been {per_thread_file_reads} reads in total"
+    );
+    assert_eq!(
+        item_files, total_items,
+        "the page must scan the items directory exactly once: read {item_files} of \
+         {total_items} item files, while reading one thread's detail per row would have \
+         been {per_thread_file_reads} reads in total"
+    );
+    assert!(
+        rows.iter().all(|row| row["preview"]
+            .as_str()
+            .is_some_and(|preview| preview.contains(PREVIEW_TOKEN))),
+        "one pass must still fill every row's preview; got {listed}"
+    );
+    assert!(
+        rows.iter()
+            .all(|row| row["latest_turn_status"] == "completed"),
+        "one pass must still report each thread's newest turn status; got {listed}"
+    );
+    assert!(
+        rows.iter().all(|row| row["pending_attention_count"] == 0),
+        "one pass must still read attention from live state; got {listed}"
+    );
+
+    handle.abort();
+    Ok(())
+}
+
+/// The summary resolves git metadata once per distinct workspace, so the
+/// resolve list must collapse repeated workspaces instead of keeping one entry
+/// per row: every entry costs up to five blocking `git` processes.
+#[test]
+fn thread_summary_resolves_git_metadata_once_per_distinct_workspace() {
+    let repo = PathBuf::from("/srv/repo");
+    let other = PathBuf::from("/srv/other");
+    let rows = vec![
+        repo.clone(),
+        repo.clone(),
+        other.clone(),
+        repo.clone(),
+        other.clone(),
+    ];
+    assert_eq!(distinct_paths(rows), vec![repo, other]);
+}
+
 fn seed_summary_search_transcript(
     store: &crate::runtime_threads::RuntimeThreadStore,
     thread_id: &str,
@@ -11907,7 +12146,7 @@ async fn cors_layer_advertises_exact_supported_headers_and_never_an_extra() -> R
         .header("Access-Control-Request-Method", "POST")
         .header(
             "Access-Control-Request-Headers",
-            "authorization, content-type, accept, x-codewhale-runtime-token, x-deepseek-runtime-token",
+            "authorization, content-type, accept, if-match, x-codewhale-runtime-token, x-deepseek-runtime-token",
         )
         .send()
         .await?;
@@ -11934,6 +12173,7 @@ async fn cors_layer_advertises_exact_supported_headers_and_never_an_extra() -> R
         "accept",
         "authorization",
         "content-type",
+        "if-match",
         "x-codewhale-runtime-token",
         "x-deepseek-runtime-token",
     ]
@@ -12918,6 +13158,7 @@ async fn mcp_server_management_crud() -> Result<()> {
     // 1. Create a new server.
     let created: serde_json::Value = client
         .post(&base)
+        .header(header::IF_MATCH, mcp_test_revision(&client, &base).await?)
         .json(&serde_json::json!({
             "name": "test-stdio",
             "command": "echo",
@@ -12953,6 +13194,7 @@ async fn mcp_server_management_crud() -> Result<()> {
     // 3. Duplicate create returns 409 Conflict.
     let conflict = client
         .post(&base)
+        .header(header::IF_MATCH, mcp_test_revision(&client, &base).await?)
         .json(&serde_json::json!({
             "name": "test-stdio",
             "command": "echo",
@@ -12964,10 +13206,13 @@ async fn mcp_server_management_crud() -> Result<()> {
     // 4. PATCH (update) the server.
     let updated: serde_json::Value = client
         .patch(format!("{base}/test-stdio"))
+        .header(header::IF_MATCH, mcp_test_revision(&client, &base).await?)
         .json(&serde_json::json!({
             "args": ["updated"],
             "required": true,
             "url": null,
+            "bearer_token_env_var": null,
+            "oauth_resource": null,
         }))
         .send()
         .await?
@@ -12981,6 +13226,7 @@ async fn mcp_server_management_crud() -> Result<()> {
 
     let cleared: serde_json::Value = client
         .patch(format!("{base}/test-stdio"))
+        .header(header::IF_MATCH, mcp_test_revision(&client, &base).await?)
         .json(&json!({
             "url": "https://example.com/replacement",
             "command": null,
@@ -13012,6 +13258,7 @@ async fn mcp_server_management_crud() -> Result<()> {
     // Clearing the final endpoint is invalid and must not alter persisted state.
     let invalid = client
         .patch(format!("{base}/test-stdio"))
+        .header(header::IF_MATCH, mcp_test_revision(&client, &base).await?)
         .json(&json!({ "url": null }))
         .send()
         .await?;
@@ -13028,6 +13275,7 @@ async fn mcp_server_management_crud() -> Result<()> {
     // 5. Disable the server.
     let disabled: serde_json::Value = client
         .post(format!("{base}/test-stdio/disable"))
+        .header(header::IF_MATCH, mcp_test_revision(&client, &base).await?)
         .send()
         .await?
         .error_for_status()?
@@ -13049,6 +13297,7 @@ async fn mcp_server_management_crud() -> Result<()> {
     // 6. Re-enable the server.
     let enabled: serde_json::Value = client
         .post(format!("{base}/test-stdio/enable"))
+        .header(header::IF_MATCH, mcp_test_revision(&client, &base).await?)
         .send()
         .await?
         .error_for_status()?
@@ -13057,20 +13306,32 @@ async fn mcp_server_management_crud() -> Result<()> {
     assert_eq!(enabled["action"], "enabled");
     assert_eq!(enabled["ok"], true);
 
-    // 7. Reconnect (schedules a reconnect — no live pool present so always succeeds).
+    // 7. Reconnect reports the real failure; use a missing local executable
+    // so this management test never attempts the example remote endpoint.
+    client
+        .patch(format!("{base}/test-stdio"))
+        .header(header::IF_MATCH, mcp_test_revision(&client, &base).await?)
+        .json(&json!({"command":root.join("missing-mcp-executable"),"url":null}))
+        .send()
+        .await?
+        .error_for_status()?;
     let reconnected: serde_json::Value = client
         .post(format!("{base}/test-stdio/reconnect"))
+        .header(header::IF_MATCH, mcp_test_revision(&client, &base).await?)
         .send()
         .await?
         .error_for_status()?
         .json()
         .await?;
-    assert_eq!(reconnected["action"], "reconnect_scheduled");
-    assert_eq!(reconnected["ok"], true);
+    assert_eq!(reconnected["action"], "reconnect_failed");
+    assert_eq!(reconnected["ok"], false);
+    assert_eq!(reconnected["connection"]["connected"], false);
+    assert!(reconnected["connection"]["error"].as_str().is_some());
 
     // 8. Delete the server.
     let deleted: serde_json::Value = client
         .delete(format!("{base}/test-stdio"))
+        .header(header::IF_MATCH, mcp_test_revision(&client, &base).await?)
         .send()
         .await?
         .error_for_status()?
@@ -13138,6 +13399,7 @@ async fn mcp_server_management_redacts_credentials() -> Result<()> {
     // Create a server with sensitive fields.
     let created: serde_json::Value = client
         .post(&base)
+        .header(header::IF_MATCH, mcp_test_revision(&client, &base).await?)
         .json(&serde_json::json!({
             "name": "secret-server",
             "url": "https://example.com/mcp",
@@ -13729,6 +13991,209 @@ async fn runtime_info_advertises_plugin_management_capability() -> Result<()> {
         info["capabilities"]["plugin_management"], true,
         "runtime/info must advertise plugin_management capability"
     );
+
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_info_advertises_terminal_capabilities() -> Result<()> {
+    let Some((addr, _runtime_threads, handle)) = spawn_test_server().await? else {
+        return Ok(());
+    };
+    let client = crate::tls::reqwest_client();
+
+    let info: serde_json::Value = client
+        .get(format!("http://{addr}/v1/runtime/info"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    // A GPUI client gates its terminal pane on these. They are true where the
+    // routes serve bytes and false where they answer 501 (Windows, OpenHarmony)
+    // — the flag must not claim a capability the build cannot serve, so assert
+    // the routes' own gate rather than `true`.
+    let expected = cfg!(all(unix, not(target_env = "ohos")));
+    for capability in [
+        "terminal_stream",
+        "terminal_input",
+        "terminal_resize",
+        "terminal_kill",
+    ] {
+        assert_eq!(
+            info["capabilities"][capability], expected,
+            "runtime/info must advertise {capability}={expected}"
+        );
+    }
+
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn terminal_routes_serve_a_live_engine_session_over_http() -> Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let root = tmp.path().join("runtime");
+    let workspace = tmp.path().join("ws");
+    fs::create_dir_all(&root)?;
+    fs::create_dir_all(&workspace)?;
+    let Some((addr, _runtime_threads, handle)) =
+        spawn_test_server_with_root_token_mobile_workspace(
+            root.clone(),
+            root.join("sessions"),
+            None,
+            false,
+            workspace.clone(),
+        )
+        .await?
+    else {
+        return Ok(());
+    };
+    let client = crate::tls::reqwest_client();
+    let base = format!("http://{addr}/v1/terminal/pane");
+
+    // The agent's terminal tools own session creation; stand in for that
+    // producer on the same workspace the server was started with, which is
+    // what makes this the Engine's own shell rather than a second one.
+    let _session = crate::tools::terminal_session::get_or_create(
+        "pane",
+        &workspace,
+        crate::sandbox::SandboxPolicy::DangerFullAccess,
+    )
+    .map_err(anyhow::Error::msg)?;
+
+    // Input through the route, then the shell's own echo back through the
+    // route. Bytes in, bytes out, no direct access to the session object.
+    let write: serde_json::Value = client
+        .post(format!("{base}/input"))
+        .json(&serde_json::json!({
+            "data": "printf 'terminal-route-proof\\n'\n",
+            "encoding": "text"
+        }))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert!(write["written"].as_u64().unwrap_or_default() > 0);
+
+    let read_chunk = |base: String, client: reqwest::Client| async move {
+        let chunk: serde_json::Value = client
+            .get(format!("{base}/output?cursor=0&format=text"))
+            .send()
+            .await
+            .ok()?
+            .error_for_status()
+            .ok()?
+            .json()
+            .await
+            .ok()?;
+        Some(chunk)
+    };
+
+    let deadline = std::time::Instant::now() + ci_scaled(Duration::from_secs(10));
+    loop {
+        let chunk = read_chunk(base.clone(), client.clone())
+            .await
+            .expect("terminal output route answers");
+        let data = chunk["data"].as_str().unwrap_or_default();
+        if data.contains("terminal-route-proof") {
+            // Reads are non-consuming: the same cursor returns the same bytes.
+            let again = read_chunk(base.clone(), client.clone())
+                .await
+                .expect("terminal output route answers");
+            assert_eq!(again["data"], chunk["data"]);
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "route never delivered the shell's output: {data}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // Resize is checked through the shell, not the handler: `stty size` reads
+    // the kernel's window, so a handler that only stored the numbers fails.
+    client
+        .post(format!("{base}/resize"))
+        .json(&serde_json::json!({"rows": 40, "cols": 100}))
+        .send()
+        .await?
+        .error_for_status()?;
+    client
+        .post(format!("{base}/input"))
+        .json(&serde_json::json!({"data": "stty size\n", "encoding": "text"}))
+        .send()
+        .await?
+        .error_for_status()?;
+    let deadline = std::time::Instant::now() + ci_scaled(Duration::from_secs(10));
+    loop {
+        let chunk = read_chunk(base.clone(), client.clone())
+            .await
+            .expect("terminal output route answers");
+        let data = chunk["data"].as_str().unwrap_or_default();
+        if data.contains("40 100") {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "resize never reached the shell: {data}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // Kill, then learn the truth from the stream rather than the ack.
+    client
+        .post(format!("{base}/kill"))
+        .send()
+        .await?
+        .error_for_status()?;
+    let deadline = std::time::Instant::now() + ci_scaled(Duration::from_secs(10));
+    loop {
+        let chunk = read_chunk(base.clone(), client.clone())
+            .await
+            .expect("terminal output route answers");
+        if chunk["running"] == serde_json::json!(false) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "killed session still reports running: {chunk}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn terminal_output_for_an_unknown_session_is_not_found_and_creates_nothing() -> Result<()> {
+    let Some((addr, _runtime_threads, handle)) = spawn_test_server().await? else {
+        return Ok(());
+    };
+    let client = crate::tls::reqwest_client();
+    let base = format!("http://{addr}/v1/terminal");
+
+    // The route exists and answers for a name that has no live session: the
+    // Engine attaches to shells it owns, it does not conjure one per request.
+    let missing = client
+        .get(format!("{base}/no-such-session/output"))
+        .send()
+        .await?;
+    assert_eq!(missing.status(), reqwest::StatusCode::NOT_FOUND);
+
+    // An over-long name is rejected as a miss too, so the registry is never
+    // asked to allocate for it.
+    let long_name = "n".repeat(200);
+    let oversized = client
+        .get(format!("{base}/{long_name}/output"))
+        .send()
+        .await?;
+    assert_eq!(oversized.status(), reqwest::StatusCode::NOT_FOUND);
 
     handle.abort();
     Ok(())
@@ -16729,7 +17194,8 @@ async fn lsp_routes_serve_workspace_files_through_a_transport() -> Result<()> {
         .error_for_status()?
         .json()
         .await?;
-    assert_eq!(none["items"].as_array().unwrap().len(), 0);
+    assert_eq!(none["ok"], false);
+    assert_eq!(none["reason"], "no_server");
 
     // Position routes validate `line` before touching LSP.
     let status = client
@@ -17509,14 +17975,30 @@ async fn threads_running_lists_active_turns_and_clears_on_settle() -> Result<()>
         sleep(Duration::from_millis(20)).await;
     }
 
-    let settled: serde_json::Value = client
-        .get(format!("{base}/v1/threads/running"))
-        .send()
-        .await?
-        .error_for_status()?
-        .json()
-        .await?;
-    assert_eq!(settled, serde_json::json!([]));
+    // The listing above is read from the durable store, and the engine still
+    // owns this record: it can persist its own status after the write above,
+    // which puts the turn back in flight and made a single read flaky on a
+    // loaded macOS runner. That is not a defect — the engine is entitled to
+    // finish its turn. What must hold is that a settled turn stops being
+    // listed, so poll for that instead of assuming the first read is final.
+    let deadline = std::time::Instant::now() + ci_scaled(Duration::from_secs(5));
+    loop {
+        let settled: serde_json::Value = client
+            .get(format!("{base}/v1/threads/running"))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        if settled == serde_json::json!([]) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "a settled turn must leave the running list: {settled}"
+        );
+        sleep(Duration::from_millis(50)).await;
+    }
 
     handle.abort();
     Ok(())
@@ -17598,6 +18080,869 @@ async fn thread_notices_serve_list_and_ack() -> Result<()> {
         .await?;
     assert_eq!(unknown.status(), reqwest::StatusCode::NOT_FOUND);
 
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn provider_models_refresh_uses_exact_configured_route_without_switching() -> Result<()> {
+    let _env = crate::test_support::lock_test_env();
+    let root = tempfile::tempdir()?;
+    let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", root.path());
+    let _cli = crate::test_support::EnvVarGuard::remove(codewhale_config::CLI_API_KEY_ENV);
+    crate::provider_catalog_live::reset_cache_for_test();
+    let upstream = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/v1/models"))
+        .and(wiremock::matchers::header(
+            "Authorization",
+            "Bearer refresh-fixture-key",
+        ))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .set_body_json(json!({"data":[{"id":"discovered-fixture-model"}]})),
+        )
+        .expect(1)
+        .mount(&upstream)
+        .await;
+    let config_path = root.path().join("config.toml");
+    fs::write(
+        &config_path,
+        format!(
+            r#"provider = "first"
+[providers.first]
+kind = "openai-compatible"
+base_url = "http://127.0.0.1:9/v1"
+model = "saved-model"
+[providers.second]
+kind = "openai-compatible"
+base_url = "{}/v1"
+api_key = "refresh-fixture-key"
+"#,
+            upstream.uri()
+        ),
+    )?;
+    let (addr, _, handle) = spawn_test_server_with_config_path(config_path)
+        .await?
+        .expect("loopback server required");
+    let client = crate::tls::reqwest_client_builder()
+        .timeout(Duration::from_secs(5))
+        .build()?;
+    for suffix in [
+        "custom/models/refresh?model_provider_id=",
+        "custom/models/refresh?model_provider_id=missing",
+        "openai/models/refresh?model_provider_id=second",
+        "deepseek-cn/models/refresh",
+        "custom/models/refresh?base_url=https://untrusted.invalid",
+    ] {
+        assert_eq!(
+            client
+                .post(format!("http://{addr}/v1/providers/{suffix}"))
+                .send()
+                .await?
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+    }
+    let response = client
+        .post(format!(
+            "http://{addr}/v1/providers/custom/models/refresh?model_provider_id=second"
+        ))
+        .send()
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let receipt: Value = response.json().await?;
+    assert_eq!(receipt["outcome"], "updated");
+    assert_eq!(receipt["model_count"], 1);
+    assert!(!receipt.to_string().contains("refresh-fixture-key"));
+    let catalog: Value = client
+        .get(format!(
+            "http://{addr}/v1/providers/custom/models?model_provider_id=second"
+        ))
+        .send()
+        .await?
+        .json()
+        .await?;
+    assert!(
+        catalog["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["id"] == "discovered-fixture-model")
+    );
+    assert_eq!(get_config(&client, &addr).await["provider"], "first");
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn mcp_management_selected_connection_and_retry_preserve_siblings() -> Result<()> {
+    use axum::response::IntoResponse as _;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    async fn fixture(
+        State(count): State<Arc<AtomicUsize>>,
+        Json(request): Json<Value>,
+    ) -> axum::response::Response {
+        let Some(id) = request.get("id") else {
+            return StatusCode::NO_CONTENT.into_response();
+        };
+        let result = match request["method"].as_str().unwrap_or_default() {
+            "initialize" => {
+                count.fetch_add(1, Ordering::SeqCst);
+                json!({"protocolVersion":request["params"]["protocolVersion"],"capabilities":{"tools":{}},"serverInfo":{"name":"fixture","version":"1"}})
+            }
+            "tools/list" => {
+                json!({"tools":[{"name":"fixture_tool","inputSchema":{"type":"object"}}]})
+            }
+            _ => json!({}),
+        };
+        Json(json!({"jsonrpc":"2.0","id":id,"result":result})).into_response()
+    }
+    let one = Arc::new(AtomicUsize::new(0));
+    let two = Arc::new(AtomicUsize::new(0));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let fixture_addr = listener.local_addr()?;
+    let app = axum::Router::new()
+        .route("/one", axum::routing::post(fixture).with_state(one.clone()))
+        .route("/two", axum::routing::post(fixture).with_state(two.clone()));
+    let fixture_task = tokio::spawn(async move { axum::serve(listener, app).await });
+    let root = tempfile::tempdir()?;
+    fs::write(
+        root.path().join("mcp.json"),
+        json!({"servers":{
+            "one":{"url":format!("http://{fixture_addr}/one"),"transport":"streamable_http"},
+            "two":{"url":format!("http://{fixture_addr}/two"),"transport":"streamable_http"},
+            "broken":{"command":root.path().join("missing-executable"),"connect_timeout":1}
+        }})
+        .to_string(),
+    )?;
+    let (addr, _, handle) =
+        spawn_test_server_with_root(root.path().to_owned(), root.path().join("sessions"))
+            .await?
+            .context("MCP management test requires loopback")?;
+    let client = crate::tls::reqwest_client();
+    let base = format!("http://{addr}/v1/apps/mcp");
+    let failed: Value = client
+        .get(format!("{base}/tools?server=broken&connect=true"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(failed["connections"][0]["server"], "broken");
+    assert_eq!(failed["connections"][0]["connected"], false);
+    assert!(failed["connections"][0]["error"].is_string());
+    assert_eq!(one.load(Ordering::SeqCst), 0);
+    assert_eq!(two.load(Ordering::SeqCst), 0);
+    let selected: Value = client
+        .get(format!("{base}/tools?server=one&connect=true"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(selected["connections"][0]["connected"], true, "{selected}");
+    assert_eq!(one.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        two.load(Ordering::SeqCst),
+        0,
+        "testing one server must not connect its sibling"
+    );
+    let second: Value = client
+        .get(format!("{base}/tools?server=two&connect=true"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(second["connections"][0]["connected"], true, "{second}");
+    let retry: Value = client
+        .post(format!("{base}/servers/one/reconnect"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(retry["ok"], true, "{retry}");
+    assert_eq!(one.load(Ordering::SeqCst), 2);
+    assert_eq!(two.load(Ordering::SeqCst), 1);
+    let listing: Value = client
+        .get(format!("{base}/servers"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    for name in ["one", "two"] {
+        let row = listing["servers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["name"] == name)
+            .unwrap();
+        assert_eq!(row["connected"], true, "{listing}");
+        assert_eq!(row["origin"], "global");
+        assert_eq!(row["writable"], true);
+    }
+    let mut changed: Value =
+        serde_json::from_str(&fs::read_to_string(root.path().join("mcp.json"))?)?;
+    changed["servers"]["one"]["enabled"] = json!(false);
+    fs::write(root.path().join("mcp.json"), changed.to_string())?;
+    let disabled: Value = client
+        .post(format!("{base}/servers/one/reconnect"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(disabled["ok"], false);
+    assert!(
+        disabled["connection"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("disabled")
+    );
+    assert_eq!(
+        one.load(Ordering::SeqCst),
+        2,
+        "disabled retry must not launch the old cached config"
+    );
+    changed["servers"]["one"]["enabled"] = json!(true);
+    changed["servers"]["one"]["url"] = json!(format!("http://{fixture_addr}/two"));
+    fs::write(root.path().join("mcp.json"), changed.to_string())?;
+    let stale: Value = client
+        .post(format!("{base}/servers/one/reconnect"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(stale["ok"], false);
+    assert!(
+        stale["connection"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("configuration changed")
+    );
+    assert_eq!(one.load(Ordering::SeqCst), 2);
+    assert_eq!(two.load(Ordering::SeqCst), 1);
+    let stale_connect: Value = client
+        .get(format!("{base}/tools?server=one&connect=true"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert!(
+        stale_connect["connections"][0]["error"]
+            .as_str()
+            .unwrap()
+            .contains("configuration changed")
+    );
+    assert_eq!(stale_connect["tools"], json!([]));
+    fs::write(root.path().join("mcp.json"), "{malformed")?;
+    let malformed = client
+        .get(format!("{base}/tools?server=one&connect=true"))
+        .send()
+        .await?;
+    assert_eq!(malformed.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(
+        one.load(Ordering::SeqCst),
+        2,
+        "malformed sources must not connect cached endpoints"
+    );
+    assert_eq!(two.load(Ordering::SeqCst), 1);
+    handle.abort();
+    fixture_task.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn mcp_management_project_ownership_blocks_global_shadow_mutations() -> Result<()> {
+    let _env = crate::test_support::lock_test_env();
+    let root = tempfile::tempdir()?;
+    let workspace = root.path().join("workspace");
+    fs::create_dir_all(workspace.join(".codewhale"))?;
+    let trust_path = root.path().join("trust.toml");
+    let trusted = workspace.canonicalize()?;
+    let mut projects = toml::map::Map::new();
+    projects.insert(
+        trusted.display().to_string(),
+        toml::Value::try_from(json!({"trust_level":"trusted"}))?,
+    );
+    fs::write(
+        &trust_path,
+        toml::to_string(&toml::Value::Table(toml::map::Map::from_iter([(
+            "projects".to_owned(),
+            toml::Value::Table(projects),
+        )])))?,
+    )?;
+    let _path = crate::test_support::EnvVarGuard::set("CODEWHALE_CONFIG_PATH", &trust_path);
+    let _legacy = crate::test_support::EnvVarGuard::remove("DEEPSEEK_CONFIG_PATH");
+    let global = json!({"servers":{"shared":{"command":"global-command"},"global":{"command":"global-command"}}}).to_string();
+    let project = json!({"servers":{"shared":{"command":root.path().join("missing-project-executable")},"project":{"command":root.path().join("missing-project-executable")}}}).to_string();
+    fs::write(root.path().join("mcp.json"), &global)?;
+    fs::write(workspace.join(".codewhale/mcp.json"), &project)?;
+    let (addr, _, handle) = spawn_test_server_with_root_token_mobile_workspace(
+        root.path().to_owned(),
+        root.path().join("sessions"),
+        None,
+        false,
+        workspace.clone(),
+    )
+    .await?
+    .context("MCP ownership test requires loopback")?;
+    let client = crate::tls::reqwest_client();
+    let base = format!("http://{addr}/v1/apps/mcp/servers");
+    let listing: Value = client
+        .get(&base)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    for name in ["shared", "project"] {
+        let row = listing["servers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["name"] == name)
+            .unwrap();
+        assert_eq!(row["origin"], "project", "{listing}");
+        assert_eq!(row["writable"], false);
+        let detail: Value = client
+            .get(format!("{base}/{name}"))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        assert_eq!(detail["origin"], "project");
+        assert_eq!(detail["writable"], false);
+        assert_eq!(
+            client
+                .patch(format!("{base}/{name}"))
+                .header(header::IF_MATCH, mcp_test_revision(&client, &base).await?)
+                .json(&json!({"enabled":false}))
+                .send()
+                .await?
+                .status(),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            client
+                .delete(format!("{base}/{name}"))
+                .header(header::IF_MATCH, mcp_test_revision(&client, &base).await?)
+                .send()
+                .await?
+                .status(),
+            StatusCode::CONFLICT
+        );
+        for action in ["enable", "disable"] {
+            assert_eq!(
+                client
+                    .post(format!("{base}/{name}/{action}"))
+                    .header(header::IF_MATCH, mcp_test_revision(&client, &base).await?)
+                    .send()
+                    .await?
+                    .status(),
+                StatusCode::CONFLICT
+            );
+        }
+        assert_eq!(
+            client
+                .post(&base)
+                .header(header::IF_MATCH, mcp_test_revision(&client, &base).await?)
+                .json(&json!({"name":name,"command":"override"}))
+                .send()
+                .await?
+                .status(),
+            StatusCode::CONFLICT
+        );
+    }
+    assert_eq!(fs::read_to_string(root.path().join("mcp.json"))?, global);
+    assert_eq!(
+        fs::read_to_string(workspace.join(".codewhale/mcp.json"))?,
+        project
+    );
+    // Initialize the pool under project authority, without a real executable.
+    let trusted_connect: Value = client
+        .get(format!(
+            "http://{addr}/v1/apps/mcp/tools?server=project&connect=true"
+        ))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert!(trusted_connect["connections"][0]["error"].is_string());
+    // Removing workspace trust removes project ownership rather than
+    // labelling an ignored repository file as writable effective state.
+    fs::write(&trust_path, "")?;
+    let detail: Value = client
+        .get(format!("{base}/shared"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(detail["origin"], "global");
+    assert_eq!(detail["writable"], true);
+    let revoked_connect: Value = client
+        .get(format!(
+            "http://{addr}/v1/apps/mcp/tools?server=project&connect=true"
+        ))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert!(
+        revoked_connect["connections"][0]["error"]
+            .as_str()
+            .unwrap()
+            .contains("configuration changed")
+    );
+    assert_eq!(revoked_connect["tools"], json!([]));
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn mcp_server_management_blocks_credential_retargeting() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let mut servers = serde_json::Map::new();
+    for (name, field, value) in [
+        ("env", "env", json!({"API_KEY":"fixture-private-value"})),
+        (
+            "headers",
+            "headers",
+            json!({"Authorization":"fixture-private-value"}),
+        ),
+        (
+            "env_headers",
+            "env_headers",
+            json!({"Authorization":"FIXTURE_TOKEN"}),
+        ),
+        ("bearer", "bearer_token_env_var", json!("FIXTURE_TOKEN")),
+        (
+            "oauth",
+            "oauth",
+            json!({"client_id":"fixture-private-value"}),
+        ),
+        ("scopes", "scopes", json!(["tools"])),
+        (
+            "resource",
+            "oauth_resource",
+            json!("https://original.invalid/resource"),
+        ),
+    ] {
+        let mut server = json!({"command":"original-command","args":["original"],"url":"https://original.invalid/mcp","transport":"sse"});
+        server[field] = value;
+        servers.insert(name.to_owned(), server);
+    }
+    servers.insert("plain".to_owned(), json!({"command":"original-command"}));
+    let path = root.path().join("mcp.json");
+    fs::write(&path, json!({"servers":servers}).to_string())?;
+    let (addr, _, handle) =
+        spawn_test_server_with_root(root.path().to_owned(), root.path().join("sessions"))
+            .await?
+            .context("MCP credential guard test requires loopback")?;
+    let client = crate::tls::reqwest_client();
+    let base = format!("http://{addr}/v1/apps/mcp/servers");
+    for name in [
+        "env",
+        "headers",
+        "env_headers",
+        "bearer",
+        "oauth",
+        "scopes",
+        "resource",
+    ] {
+        let detail: Value = client
+            .get(format!("{base}/{name}"))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        assert_eq!(detail["credential_configured"], true, "{name}");
+        assert!(!detail.to_string().contains("fixture-private-value"));
+        for private_field in [
+            "env",
+            "headers",
+            "env_headers",
+            "bearer_token_env_var",
+            "oauth",
+        ] {
+            assert!(
+                detail.get(private_field).is_none(),
+                "{name}: {private_field}"
+            );
+        }
+        client
+            .patch(format!("{base}/{name}"))
+            .header(header::IF_MATCH, mcp_test_revision(&client, &base).await?)
+            .json(&json!({"connect_timeout":17}))
+            .send()
+            .await?
+            .error_for_status()?;
+        let before = fs::read(&path)?;
+        for patch in [
+            json!({"command":"replacement-command"}),
+            json!({"args":["replacement"]}),
+            json!({"url":"https://other.invalid/mcp"}),
+            json!({"transport":null}),
+        ] {
+            let response = client
+                .patch(format!("{base}/{name}"))
+                .header(header::IF_MATCH, mcp_test_revision(&client, &base).await?)
+                .json(&patch)
+                .send()
+                .await?;
+            assert_eq!(response.status(), StatusCode::CONFLICT, "{name}: {patch}");
+            assert_eq!(
+                fs::read(&path)?,
+                before,
+                "rejected retarget must not change config"
+            );
+        }
+    }
+    let plain: Value = client
+        .patch(format!("{base}/plain"))
+        .header(header::IF_MATCH, mcp_test_revision(&client, &base).await?)
+        .json(&json!({"command":"replacement-command"}))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(plain["credential_configured"], false);
+    let cleared: Value = client
+        .patch(format!("{base}/env"))
+        .header(header::IF_MATCH, mcp_test_revision(&client, &base).await?)
+        .json(&json!({"env":{},"command":"replacement-command"}))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(cleared["credential_configured"], false);
+    assert_eq!(cleared["command"], "replacement-command");
+    handle.abort();
+    Ok(())
+}
+
+async fn mcp_test_revision(client: &reqwest::Client, base: &str) -> Result<String> {
+    let listing: Value = client
+        .get(base)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    Ok(format!(
+        "\"{}\"",
+        listing["revision"]
+            .as_str()
+            .context("MCP revision missing")?
+    ))
+}
+
+#[tokio::test]
+async fn mcp_management_revision_precondition_prevents_stale_mutation() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let (addr, _, handle) =
+        spawn_test_server_with_root(root.path().to_owned(), root.path().join("sessions"))
+            .await?
+            .context("loopback required")?;
+    let client = crate::tls::reqwest_client();
+    let base = format!("http://{addr}/v1/apps/mcp/servers");
+    let absent = mcp_test_revision(&client, &base).await?;
+    assert_eq!(absent, "\"mcp-v1-absent\"");
+    assert_eq!(
+        client
+            .post(&base)
+            .json(&json!({"name":"one","command":"one"}))
+            .send()
+            .await?
+            .status(),
+        StatusCode::PRECONDITION_REQUIRED
+    );
+    let created: Value = client
+        .post(&base)
+        .header(header::IF_MATCH, &absent)
+        .json(&json!({"name":"one","command":"one"}))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert!(created["revision"].as_str().unwrap().starts_with("mcp-v1-"));
+    let path = root.path().join("mcp.json");
+    let before = fs::read(&path)?;
+    for request in [
+        client
+            .post(&base)
+            .json(&json!({"name":"two","command":"two"})),
+        client
+            .patch(format!("{base}/one"))
+            .json(&json!({"command":"changed"})),
+        client.delete(format!("{base}/one")),
+        client.post(format!("{base}/one/enable")),
+        client.post(format!("{base}/one/disable")),
+    ] {
+        assert_eq!(
+            request
+                .header(header::IF_MATCH, &absent)
+                .send()
+                .await?
+                .status(),
+            StatusCode::PRECONDITION_FAILED
+        );
+        assert_eq!(fs::read(&path)?, before);
+    }
+    assert_eq!(
+        client
+            .delete(format!("{base}/one"))
+            .header(header::IF_MATCH, "*")
+            .send()
+            .await?
+            .status(),
+        StatusCode::BAD_REQUEST
+    );
+    let current = mcp_test_revision(&client, &base).await?;
+    let disabled: Value = client
+        .post(format!("{base}/one/disable"))
+        .header(header::IF_MATCH, &current)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_ne!(disabled["revision"], created["revision"]);
+    handle.abort();
+    Ok(())
+}
+
+#[cfg(all(unix, not(target_env = "ohos")))]
+#[tokio::test]
+async fn jobs_api_pty_resize_raw_input_and_nonblocking_poll() -> Result<()> {
+    use base64::Engine as _;
+    let tmp = tempfile::tempdir()?;
+    let workspace = tmp.path().join("workspace");
+    fs::create_dir_all(&workspace)?;
+    let (addr, _, handle) = spawn_test_server_with_root_token_mobile_workspace(
+        tmp.path().join("runtime"),
+        tmp.path().join("sessions"),
+        Some("pty-token".into()),
+        false,
+        workspace.clone(),
+    )
+    .await?
+    .context("PTY test requires loopback listener")?;
+    let client = crate::tls::reqwest_client();
+    let base = format!("http://{addr}");
+    let thread: Value = client
+        .post(format!("{base}/v1/threads"))
+        .bearer_auth("pty-token")
+        .json(&json!({"workspace":workspace,"allow_shell":true}))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let thread_id = thread["id"].as_str().unwrap();
+    let jobs = format!("{base}/v1/threads/{thread_id}/jobs");
+    let created: Value = client.post(&jobs).bearer_auth("pty-token")
+        .json(&json!({"command":"stty -echo; printf ready; while IFS= read -r line; do stty size; done", "tty":true}))
+        .send().await?.error_for_status()?.json().await?;
+    assert_eq!(created["job"]["tty"], true);
+    assert_eq!(
+        created["job"]["terminal_size"],
+        json!({"rows":24,"cols":80})
+    );
+    let job_id = created["job"]["job_id"].as_str().unwrap();
+    let job = format!("{jobs}/{job_id}");
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let output: Value = client
+            .get(format!("{job}/output?format=text"))
+            .bearer_auth("pty-token")
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        if output["data"].as_str().unwrap().contains("ready") {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline);
+        sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        client
+            .post(format!("{job}/resize"))
+            .json(&json!({"rows":30,"cols":90}))
+            .send()
+            .await?
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    for size in [json!({"rows":0,"cols":90}), json!({"rows":30,"cols":1001})] {
+        assert_eq!(
+            client
+                .post(format!("{job}/resize"))
+                .bearer_auth("pty-token")
+                .json(&size)
+                .send()
+                .await?
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+    }
+    let resized: Value = client
+        .post(format!("{job}/resize"))
+        .bearer_auth("pty-token")
+        .json(&json!({"rows":42,"cols":123}))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(
+        resized["job"]["terminal_size"],
+        json!({"rows":42,"cols":123})
+    );
+    client
+        .post(format!("{job}/stdin"))
+        .bearer_auth("pty-token")
+        .json(&json!({"data":"size\n"}))
+        .send()
+        .await?
+        .error_for_status()?;
+    loop {
+        let output: Value = client
+            .get(format!("{job}/output?format=text"))
+            .bearer_auth("pty-token")
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        if output["data"].as_str().unwrap().contains("42 123") {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline);
+        sleep(Duration::from_millis(20)).await;
+    }
+    let other: Value = client
+        .post(format!("{base}/v1/threads"))
+        .bearer_auth("pty-token")
+        .json(&json!({"workspace":workspace,"allow_shell":true}))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(
+        client
+            .post(format!(
+                "{base}/v1/threads/{}/jobs/{job_id}/resize",
+                other["id"].as_str().unwrap()
+            ))
+            .bearer_auth("pty-token")
+            .json(&json!({"rows":30,"cols":90}))
+            .send()
+            .await?
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+    client
+        .post(format!("{job}/kill"))
+        .bearer_auth("pty-token")
+        .send()
+        .await?
+        .error_for_status()?;
+    assert_eq!(
+        client
+            .post(format!("{job}/resize"))
+            .bearer_auth("pty-token")
+            .json(&json!({"rows":30,"cols":90}))
+            .send()
+            .await?
+            .status(),
+        StatusCode::CONFLICT
+    );
+
+    let cat: Value = client
+        .post(&jobs)
+        .bearer_auth("pty-token")
+        .json(&json!({"command":"cat"}))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(cat["job"]["tty"], false);
+    assert!(cat["job"]["terminal_size"].is_null());
+    let cat_job = format!("{jobs}/{}", cat["job"]["job_id"].as_str().unwrap());
+    assert_eq!(
+        client
+            .post(format!("{cat_job}/resize"))
+            .bearer_auth("pty-token")
+            .json(&json!({"rows":30,"cols":90}))
+            .send()
+            .await?
+            .status(),
+        StatusCode::BAD_REQUEST
+    );
+    // A 5-second output long-poll must not hold the owner lock against stdin.
+    let poll_client = client.clone();
+    let poll_url = format!("{cat_job}/output?wait_ms=5000");
+    let polling = tokio::spawn(async move {
+        poll_client
+            .get(poll_url)
+            .bearer_auth("pty-token")
+            .send()
+            .await
+    });
+    sleep(Duration::from_millis(100)).await;
+    let bytes = b"\0\xff\x1b[A\x03\n";
+    tokio::time::timeout(Duration::from_secs(2), client.post(format!("{cat_job}/stdin"))
+        .bearer_auth("pty-token").json(&json!({"data":base64::engine::general_purpose::STANDARD.encode(bytes), "encoding":"base64", "close":true})).send()).await??.error_for_status()?;
+    let _ = polling.await??.error_for_status()?;
+    let output: Value = client
+        .get(format!("{cat_job}/output?wait_ms=1000"))
+        .bearer_auth("pty-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(
+        base64::engine::general_purpose::STANDARD.decode(output["data"].as_str().unwrap())?,
+        bytes
+    );
+    let replay: Value = client
+        .get(format!("{cat_job}/output"))
+        .bearer_auth("pty-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(replay["data"], output["data"]);
+    let end = output["next_cursor"].as_u64().unwrap();
+    let tail: Value = client
+        .get(format!("{cat_job}/output?cursor={end}"))
+        .bearer_auth("pty-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(tail["data"], "");
     handle.abort();
     Ok(())
 }

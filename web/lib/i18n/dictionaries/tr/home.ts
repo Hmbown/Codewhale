@@ -20,7 +20,7 @@ export const home: HomeDict = {
   shotPreview: "Terminal önizlemesi",
   shotBuild: "v{version} geliştirme derlemesi",
   screenshotAlt:
-    "Codewhale v0.9.12 terminali, derleme 171acee689aa: balina simgesi, mesaj yazma alanı, Full Access ve Operate modu, iki zamanlanmış görev, hâlâ bağlantı kurulmakta olan 21 MCP sunucusu ve en yüksek çaba düzeyindeki GLM-5.3 ile yeni bir oturum.",
+    "Codewhale v{version} geliştirme derlemesi: balina, yeni oturum, mesaj alanı, Ask izinleri, Work modu ve model durumu. Yalıtılmış bir terminalin gerçek çıktısından oluşturulmuştur.",
   latestRelease: "En yeni sürüm {tag}",
   releaseUnavailable: "Sürüm durumu kullanılamıyor",
   currentSource: "Kaynak",

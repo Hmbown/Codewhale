@@ -1061,7 +1061,9 @@ version = "0.10.0"
 dependencies = [
  "chrono",
  "codewhale-paths",
+ "fd-lock",
  "keyring",
+ "libc",
  "regex",
  "serde",
  "serde_json",

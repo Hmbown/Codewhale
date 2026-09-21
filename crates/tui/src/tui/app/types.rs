@@ -569,7 +569,7 @@ pub enum AppAction {
     OpenFeedbackPicker,
     /// Open the `/theme` picker modal with live preview of every preset.
     OpenThemePicker,
-    /// Open the `/skills` manager — audit inventory + owned mutations.
+    /// Open the `/skills manage` manager — audit inventory + owned mutations.
     OpenSkillsManager,
     /// Open the `/workflows` run dashboard — live and retained workflow runs.
     OpenWorkflowsManager,

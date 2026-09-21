@@ -1094,18 +1094,38 @@ fn underwater_motion_keeps_its_smoother_cadence_during_live_status() {
     app.fancy_animations = true;
     app.constrained_frame_rate = false;
 
+    use crate::tui::display_refresh::DrawCadenceTier;
     assert_eq!(
-        animation_interval_ms(&app, true, false),
+        animation_interval_ms(&app, true, false, DrawCadenceTier::Interactive),
         UI_STATUS_ANIMATION_MS
     );
     assert_eq!(
-        animation_interval_ms(&app, false, true),
+        animation_interval_ms(&app, false, true, DrawCadenceTier::Interactive),
         UI_UNDERWATER_ANIMATION_MS
     );
     assert_eq!(
-        animation_interval_ms(&app, true, true),
+        animation_interval_ms(&app, true, true, DrawCadenceTier::Interactive),
         UI_UNDERWATER_ANIMATION_MS,
         "the slower status spinner must not throttle ambient fish"
+    );
+    // Only ambience moving: the tick lands on the interval the frame
+    // limiter draws at, instead of asking every 80 ms for a frame the
+    // limiter then holds until its 120 ms atmosphere cadence.
+    let atmosphere = crate::tui::display_refresh::adaptive_animation_interval_ms(false);
+    assert!(atmosphere >= UI_UNDERWATER_ANIMATION_MS);
+    assert_eq!(
+        animation_interval_ms(&app, false, true, DrawCadenceTier::Atmosphere),
+        atmosphere
+    );
+    assert_eq!(
+        underwater_animation_interval_ms(&app, DrawCadenceTier::Atmosphere),
+        crate::tui::display_refresh::content_driven_draw_interval(
+            DrawCadenceTier::Atmosphere,
+            crate::tui::display_refresh::probe_display_refresh().hz,
+            false,
+        )
+        .as_millis() as u64,
+        "the idle water ticks exactly when the limiter lets it draw"
     );
     // SAFETY: cleanup under the same lock.
     unsafe {
@@ -1135,16 +1155,19 @@ fn ghostty_caps_underwater_motion_without_slowing_interaction() {
     app.fancy_animations = true;
     app.constrained_frame_rate = false;
 
-    assert_eq!(
-        underwater_animation_interval_ms(&app),
-        UI_GHOSTTY_UNDERWATER_ANIMATION_MS
-    );
+    use crate::tui::display_refresh::DrawCadenceTier;
+    for tier in [DrawCadenceTier::Atmosphere, DrawCadenceTier::Interactive] {
+        assert_eq!(
+            underwater_animation_interval_ms(&app, tier),
+            UI_GHOSTTY_UNDERWATER_ANIMATION_MS
+        );
+    }
     const {
         assert!(UI_GHOSTTY_UNDERWATER_ANIMATION_MS < UI_UNDERWATER_ANIMATION_MS);
     }
     app.constrained_frame_rate = true;
     assert_eq!(
-        underwater_animation_interval_ms(&app),
+        underwater_animation_interval_ms(&app, DrawCadenceTier::Interactive),
         UI_CONSTRAINED_UNDERWATER_ANIMATION_MS,
         "tmux/SSH compatibility must override Ghostty's native atmosphere lane"
     );
@@ -4066,7 +4089,7 @@ fn selection_to_text_copies_rendered_transcript_block() {
         !selected.contains("Ctrl+O"),
         "short completed thinking should not show the detail affordance: {selected:?}"
     );
-    assert!(selected.contains("run done · cargo check"), "{selected:?}");
+    assert!(selected.contains("run Done · cargo check"), "{selected:?}");
     assert!(selected.contains("copy assistant"), "{selected:?}");
     // #1163: tool-card middle lines are rendered with a `│ ` left rail
     // glyph, but that decoration must not leak into copied text. Assert
@@ -6239,6 +6262,71 @@ fn selected_reasoning_hint_and_space_share_one_owner() {
 }
 
 #[test]
+fn selected_reasoning_actions_roundtrip_for_every_expansion_baseline() {
+    use crate::tui::history::ReasoningAction;
+
+    for verbose in [false, true] {
+        for default_expanded in [false, true] {
+            for folded in [false, true] {
+                let mut app = create_test_app();
+                app.verbose_transcript = verbose;
+                app.thinking_default_expanded = default_expanded;
+                app.thinking_preview_lines = 4;
+                app.history = vec![oversized_reasoning("baseline", false)];
+                if folded {
+                    app.folded_thinking.insert(0);
+                }
+                app.resync_history_revisions();
+                // The adaptive preview fills spare viewport rows. Keep the
+                // 40-line body larger than the pane so both actions exist.
+                let _ = render_underwater_test_app(&mut app, 100, 32);
+                select_original_cell(&mut app, 0);
+
+                let initially_expanded = (verbose || default_expanded) != folded;
+                for (step, expanded) in
+                    [initially_expanded, !initially_expanded, initially_expanded]
+                        .into_iter()
+                        .enumerate()
+                {
+                    let surface = render_underwater_test_app(&mut app, 100, 32);
+                    // Inspect rendered lines, including the scrolled-off part,
+                    // so viewport position cannot masquerade as a fold.
+                    let rendered_full_body = app
+                        .viewport
+                        .transcript_cache
+                        .lines()
+                        .iter()
+                        .any(|line| line.to_string().contains("baseline line 40"));
+                    assert_eq!(
+                        rendered_full_body, expanded,
+                        "verbose={verbose}, default_expanded={default_expanded}, \
+                         folded={folded}, step={step}: {surface}"
+                    );
+                    let target = app
+                        .viewport
+                        .transcript_cache
+                        .reasoning_action_target()
+                        .expect("selected reasoning has a rendered action");
+                    assert_eq!(target.owner.cell_index, 0);
+                    assert_eq!(
+                        target.action,
+                        if expanded {
+                            ReasoningAction::Collapse
+                        } else {
+                            ReasoningAction::Expand
+                        }
+                    );
+                    if step < 2 {
+                        assert!(handle_transcript_space(&mut app));
+                    }
+                }
+                assert_eq!(app.folded_thinking.contains(&0), folded);
+            }
+        }
+    }
+}
+
+#[test]
 fn mouse_selection_redraws_and_retargets_reasoning_with_unchanged_revisions() {
     let mut app = create_test_app();
     app.history = vec![
@@ -6461,6 +6549,32 @@ fn raw_paste_beginning_with_space_preserves_payload_over_reasoning_action() {
             + Duration::from_millis(2),
     ));
     assert_eq!(app.input, " x");
+}
+
+#[test]
+fn paste_safety_expiry_repaints_the_submit_cue_without_another_key() {
+    let mut app = create_test_app();
+    app.use_paste_burst_detection = true;
+    app.insert_str("/mcp");
+    let now = Instant::now();
+    app.paste_burst.extend_window(now);
+    assert!(!app.composer_enter_would_submit());
+    let waiting = render_underwater_test_app(&mut app, 80, 24);
+    assert!(waiting.contains("[·]"), "{waiting}");
+    app.needs_redraw = false;
+    assert!(flush_paste_burst_before_composer(
+        &mut app,
+        now + Duration::from_millis(121)
+    ));
+    assert!(app.needs_redraw);
+    assert!(app.composer_enter_would_submit());
+    let ready = render_underwater_test_app(&mut app, 80, 24);
+    assert!(ready.contains("[↵]"), "{ready}");
+    assert_eq!(app.input, "/mcp");
+    assert_eq!(
+        app.paste_burst_next_flush_delay_if_enabled(now + Duration::from_millis(121)),
+        None
+    );
 }
 
 #[test]
@@ -19741,7 +19855,7 @@ fn completed_exec_tool_result_still_renders_run_done() {
 
     assert_eq!(exec.status, ToolStatus::Success);
     let text = rendered_text(&exec.lines_with_motion(100, true));
-    assert!(text.contains("run done"), "{text}");
+    assert!(text.contains("run Done"), "{text}");
     assert!(!text.contains("tool loaded - retry required"), "{text}");
 }
 
@@ -19779,7 +19893,7 @@ fn hydrated_exec_tool_result_renders_retry_required_not_run_done() {
     assert_eq!(exec.status, ToolStatus::Hydrated);
     let text = rendered_text(&exec.lines_with_motion(120, true));
     assert!(text.contains("run tool loaded - retry required"), "{text}");
-    assert!(!text.contains("run done"), "{text}");
+    assert!(!text.contains("run Done"), "{text}");
 }
 
 #[test]
@@ -19817,7 +19931,7 @@ fn hydrated_tool_with_validation_body_still_uses_hydrated_status() {
     assert_eq!(generic.status, ToolStatus::Hydrated);
     let text = rendered_text(&HistoryCell::Tool(ToolCell::Generic(generic.clone())).lines(120));
     assert!(text.contains("tool loaded - retry required"), "{text}");
-    assert!(!text.contains("tool done"), "{text}");
+    assert!(!text.contains("tool Done"), "{text}");
 }
 
 #[test]
@@ -23313,13 +23427,13 @@ fn turn_inspector_switches_isolated_full_turn_pages_with_tagged_reasoning_and_ou
     for expected in [
         "FIRST-PROMPT",
         "keep this input line",
-        "[∿ reasoning 1/1 · done]",
+        "[∿ reasoning 1/1 · Done]",
         "FIRST-THOUGHT",
         "full reasoning tail",
         "[⚙ using tool]",
         "FIRST-TOOL-OUTPUT",
         "complete execution tail",
-        "[◆ · done]",
+        "[◆ · Done]",
         "FIRST-ANSWER",
         "complete assistant tail",
     ] {

@@ -271,7 +271,7 @@ pub(crate) fn info_segments(app: &App, width: u16) -> Vec<InfoSegment> {
     // The DeepSeek-harness session metrics, from the same accumulators
     // `/cost` prints: nothing here is estimated except the live stream's
     // running token count, which the provider's receipt replaces.
-    if shows(StatusItem::SessionMetrics)
+    if (shows(StatusItem::SessionMetrics) || shows(StatusItem::Ttft))
         && let Some(ttft) = app.session_metrics.ttft_average()
     {
         segments.push(InfoSegment::new(
@@ -281,7 +281,7 @@ pub(crate) fn info_segments(app: &App, width: u16) -> Vec<InfoSegment> {
             ChromeInk::MetadataValue,
         ));
     }
-    if shows(StatusItem::SessionMetrics)
+    if (shows(StatusItem::SessionMetrics) || shows(StatusItem::OutputRate))
         && let Some(rate) = app.session_metrics.tokens_per_second()
     {
         segments.push(InfoSegment::new(
@@ -433,6 +433,12 @@ fn render_info_row(
         app.viewport.last_infoline_hitboxes.clear();
         return InfoLineInteractionHitboxes::default();
     }
+    // The two bottom rows share the composer's one-cell inset. Paint the
+    // full band before insetting so hover/click geometry uses the same area.
+    Block::default()
+        .style(Style::default().bg(app.ui_theme.header_bg))
+        .render(area, f.buffer_mut());
+    let area = area.inner(ratatui::layout::Margin::new(u16::from(area.width >= 8), 0));
     let mut segments = info_segments(app, area.width);
     if identity_only {
         segments.retain(|segment| {
@@ -545,7 +551,7 @@ fn register_clickable_chrome_for_hover(app: &App) {
         );
     }
 
-    // The composer's `[↑]` submit control. It registers only when a click
+    // The composer's `[↵]` submit control. It registers only when a click
     // there would actually send: an affordance that lights up and then does
     // nothing is the same defect as one that acts without lighting up.
     if let Some(composer) = app.viewport.last_composer_area
@@ -1725,7 +1731,7 @@ pub(crate) fn render(f: &mut Frame, app: &mut App, _config: &Config) -> Option<(
             };
         app.sidebar_hover_tooltip = None;
 
-        if app.agent_focus.is_some() {
+        if app.agent_focus.is_some() && !app.launch.return_to_session {
             // A focused worker's full transcript owns the conversation area;
             // the ocean column and every other shell surface stay as they are.
             //
@@ -1747,6 +1753,14 @@ pub(crate) fn render(f: &mut Frame, app: &mut App, _config: &Config) -> Option<(
             let buf = f.buffer_mut();
             crate::tui::agent_focus::render_focus(app, chat_area, buf);
         } else {
+            if app.launch.visible
+                && !app.launch.return_to_session
+                && app.onboarding == crate::tui::app::OnboardingState::None
+            {
+                app.launch
+                    .mark_reveal_started_at
+                    .get_or_insert_with(std::time::Instant::now);
+            }
             let chat_widget = ChatWidget::new(app, chat_area).with_ocean_viewport(size);
             shell_ocean = chat_widget.ocean_column();
             let buf = f.buffer_mut();
@@ -2245,7 +2259,7 @@ mod tests {
         );
     }
 
-    /// The composer's `[↑]` answered clicks and showed nothing under the
+    /// The composer's `[↵]` answered clicks and showed nothing under the
     /// pointer — the last of the clickable-but-dark controls. It lights up
     /// only when a click there would actually send.
     #[test]
@@ -2727,6 +2741,53 @@ mod tests {
         assert_eq!(rate(&app).as_deref(), Some("24 avg tok/s"));
         app.status_items = vec![StatusItem::Tokens];
         assert_eq!(rate(&app), None, "the existing status toggle still owns it");
+    }
+
+    #[test]
+    fn default_compact_footer_keeps_measured_performance_at_working_widths() {
+        use ratatui::{Terminal, backend::TestBackend};
+        let mut app = app_with_context_percent(60);
+        app.ui_locale = codewhale_localization::Locale::En;
+        app.status_items = StatusItem::default_footer();
+        app.metrics_line = crate::config::ChromeRowPreset::Compact;
+        app.session_metrics
+            .record_model_call(120, 4_800, Some(1_000), Some(5_000));
+        for width in [80, 100, 140] {
+            let mut terminal = Terminal::new(TestBackend::new(width, 1)).unwrap();
+            terminal
+                .draw(|frame| {
+                    super::render_info_row(frame, &mut app, frame.area(), false);
+                })
+                .unwrap();
+            let row: String = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect();
+            assert!(row.contains("ttft 1.0s"), "{width}: {row}");
+            assert!(row.contains("24 avg tok/s"), "{width}: {row}");
+            assert!(!row.contains("/help"), "{width}: {row}");
+        }
+    }
+
+    #[test]
+    fn performance_readings_can_be_selected_independently() {
+        let mut app = app_with_context_percent(60);
+        app.session_metrics
+            .record_model_call(120, 4_800, Some(1_000), Some(5_000));
+        for (item, expected) in [
+            (StatusItem::Ttft, InfoSegmentId::Ttft),
+            (StatusItem::OutputRate, InfoSegmentId::Rate),
+        ] {
+            app.status_items = vec![item];
+            let ids: Vec<_> = super::info_segments(&app, 80)
+                .into_iter()
+                .map(|s| s.id)
+                .collect();
+            assert_eq!(ids, vec![expected]);
+        }
     }
 
     /// Every remaining status item owns a segment, and an empty list leaves

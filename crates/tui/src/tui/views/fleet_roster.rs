@@ -9,9 +9,9 @@
 //! `[fleet.profiles]` config < `$CODEWHALE_HOME/agents/*.toml` personal <
 //! `.codewhale/agents/*.toml` project members)
 //! as a scrollable list with a detail pane for the selected row. The view
-//! never writes anything; `s` / Enter on a selected-v2 member opens that
-//! Fleet's exact editor, while the legacy profile wizard is used only when no
-//! named Fleet is selected (the operator row is display-only). Switch named
+//! never writes anything; Enter opens the shared model/thinking picker for
+//! the selected role, retaining this roster underneath. The existing saved
+//! team/profile owner validates and persists assignments. Switch named
 //! saved Fleets with `/fleet fleets` (`/fleet fleets` remains compatible).
 //!
 //! #5888: the default lineup folds the built-in `general` alias out of
@@ -311,11 +311,9 @@ impl FleetRosterView {
             // Carry the exact member the operator already chose. The host
             // focuses it in the selected v2 Fleet editor, or starts legacy
             // setup from its member id when no Fleet is selected.
-            ViewAction::EmitAndClose(ViewEvent::FleetRosterOpenSetupRequested { member_id })
+            ViewAction::Emit(ViewEvent::FleetRosterOpenSetupRequested { member_id })
         } else {
-            // The operator is not a wizard-authored profile; its route changes
-            // via /model or /provider (the detail pane says so).
-            ViewAction::None
+            ViewAction::Emit(ViewEvent::FleetRosterOpenCoordinatorRequested)
         }
     }
 
@@ -335,17 +333,10 @@ impl FleetRosterView {
     /// destination this room has that is not a tab. Detail scrolling
     /// (PgUp/PgDn) works but is not advertised — the pane is short now.
     fn footer_hints(&self) -> Vec<ActionHint> {
-        let edit_label = if self.selected_fleet.is_some() {
-            "edit"
-        } else {
-            "setup"
-        };
-        let mut hints = vec![ActionHint::new("↑↓", "move")];
-        // The Coordinator is display-only, matching activate_selected.
-        // Advertise edit/setup only when Enter has a real member target.
-        if self.selected_member().is_some() {
-            hints.push(ActionHint::new("Enter", edit_label));
-        }
+        let mut hints = vec![
+            ActionHint::new("↑↓", "move"),
+            ActionHint::new("Enter", "model & thinking"),
+        ];
         hints.extend([
             ActionHint::new("Tab", tr(self.locale, MessageId::FleetRosterWorkers)),
             ActionHint::new("f", "saved teams"),
@@ -612,6 +603,9 @@ impl FleetRosterView {
             let hovered = !is_selected && self.hovered_row.get() == Some(idx);
             let hover_tint = || menu_style::hovered_row_style();
             let pointer = format!("{} ", crate::tui::glyphs::selection_marker(is_selected));
+            let shadow_badge = idx.checked_sub(1).and_then(|index| {
+                member_shadow_badge(self.locale, &self.members[index], &self.shadowed)
+            });
             let (text, base_style) = if idx == 0 {
                 (
                     format!(
@@ -623,12 +617,6 @@ impl FleetRosterView {
             } else {
                 let member = &self.members[idx - 1];
                 let mark = member_role_mark(member);
-                let shadow_badge = member_shadow_badge(self.locale, member, &self.shadowed);
-                let edit_marker = if is_selected && self.selected_fleet.is_some() {
-                    "[edit] "
-                } else {
-                    ""
-                };
                 let member_name = member
                     .display_name
                     .as_deref()
@@ -638,27 +626,42 @@ impl FleetRosterView {
                         || member.id.clone(),
                         |name| format!("{name} ({})", member.id),
                     );
-                // The list identifies a member. Repeating inherited session
-                // routing on every row buries that identity; the selected
-                // inspector always states the full route. Only overrides earn
-                // secondary list ink. Whale identity lives in that inspector.
-                let has_model_override = member
-                    .profile
-                    .model
-                    .as_deref()
-                    .is_some_and(|model| !model.trim().is_empty());
-                let route = if has_model_override || member.profile.loadout.as_str() != "inherit" {
-                    format!(" · {}", member_routing(member))
-                } else {
-                    String::new()
-                };
                 (
                     format!(
-                        "{pointer}{edit_marker}{mark} {member_name}{}{route}",
+                        "{pointer}{mark} {member_name}{}",
                         shadow_badge.as_deref().unwrap_or("")
                     ),
                     Style::default().fg(palette::TEXT_PRIMARY),
                 )
+            };
+            let text = if list_width >= 28 && shadow_badge.is_none() {
+                let route = if idx == 0 {
+                    self.operator.model.as_str()
+                } else {
+                    let profile = &self.members[idx - 1].profile;
+                    profile
+                        .model
+                        .as_deref()
+                        .filter(|model| !model.trim().is_empty())
+                        .unwrap_or_else(|| {
+                            if profile.loadout.as_str() == "inherit" {
+                                "follow Coordinator"
+                            } else {
+                                profile.loadout.as_str()
+                            }
+                        })
+                };
+                let role_width = (list_width / 2).clamp(14, 24);
+                let label = truncate_view_text(&text, role_width);
+                let pad = role_width
+                    .saturating_sub(unicode_width::UnicodeWidthStr::width(label.as_str()));
+                format!(
+                    "{label}{}  {}",
+                    " ".repeat(pad),
+                    truncate_view_text(route, list_width.saturating_sub(role_width + 2))
+                )
+            } else {
+                text
             };
             let style = if is_selected {
                 menu_style::selected_row_style()
@@ -821,9 +824,8 @@ fn operator_detail_lines(operator: &OperatorInfo) -> Vec<Line<'static>> {
     detail_field(
         &mut lines,
         "Description",
-        "The Coordinator is this Fleet's leader — your main session model. Every \
-         member below works for it. Change the model with /model or /provider; \
-         persist with /fleet save."
+        "The Coordinator leads this session. Press Enter to change its model and thinking. \
+         Roles set to follow the Coordinator use this route; pinned roles keep their own models."
             .to_string(),
     );
     lines.push(Line::from(Span::styled(
@@ -865,10 +867,6 @@ fn member_access_summary(member: &AgentProfile) -> String {
 /// When the loadout is `fast`, show that the runtime picks the **fast sibling
 /// of the active session model** — not a stale on-disk profile name — so the
 /// roster matches what Fleet will actually launch.
-fn member_routing(member: &AgentProfile) -> String {
-    member_routing_with_session(member, None)
-}
-
 fn member_routing_with_session(member: &AgentProfile, session_model: Option<&str>) -> String {
     if let Some(model) = member
         .profile
@@ -991,6 +989,15 @@ fn member_detail_lines_with_session(
         None => model,
     };
     detail_field(&mut lines, "Model", route);
+    detail_field(
+        &mut lines,
+        "Thinking",
+        member
+            .profile
+            .reasoning_effort
+            .clone()
+            .unwrap_or_else(|| "Follow Coordinator".to_string()),
+    );
     // Slot is internal dispatch vocabulary and duplicates Role — never shown.
     detail_field(&mut lines, "Access", member_access_summary(member));
 

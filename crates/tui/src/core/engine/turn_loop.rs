@@ -688,6 +688,15 @@ impl Engine {
 
         // Only interactive TUI hosts own terminal chrome. Headless exec,
         // app-server, and stream-json stdout must remain byte-clean.
+        //
+        // The sleep guard rides the same gate: a turn that outlives the host's
+        // idle timer is lost work, and an interactive host is the only one
+        // that owns a human's machine. Bound to this function, so it releases
+        // on every return path. See `crate::sleep_guard` for its limits.
+        let _sleep_guard = self
+            .config
+            .terminal_chrome_enabled
+            .then(crate::sleep_guard::SleepGuard::hold);
         if self.config.terminal_chrome_enabled {
             crate::tui::notifications::set_taskbar_progress_busy();
             crate::tui::notifications::start_title_animation("codewhale");
@@ -1167,7 +1176,22 @@ impl Engine {
                 self.finish_compaction(&compaction_id);
             }
 
-            let estimated_input = self.estimated_input_tokens();
+            // The guard measures what the compaction gate measures: the honest
+            // estimate, lifted to the provider's last bill plus the growth
+            // since it. `estimated_input_tokens()` carries the ×1.5 overflow
+            // inflation; compared against the honest ceiling it refused at two
+            // thirds of the budget, and emergency compaction — which targets
+            // the honest budget — could never satisfy it (#6374). A request
+            // the estimate still undercounts is rejected by the provider and
+            // takes the bounded context-length recovery below.
+            let estimated_input = turn
+                .live_input_tokens_for_compaction(
+                    &self.session.messages,
+                    self.session.system_prompt.as_ref(),
+                    self.session.latest_parent_input_tokens,
+                )
+                .and_then(|tokens| usize::try_from(tokens).ok())
+                .unwrap_or(0);
             if let Some(budget) = route_context_budget_for_route(
                 self.api_provider,
                 &self.session.model,
@@ -1217,9 +1241,11 @@ impl Engine {
                 );
                 if triggered {
                     if context_recovery_attempts >= MAX_CONTEXT_RECOVERY_ATTEMPTS {
-                        let message = format!(
-                            "Context remains above model limit after {MAX_CONTEXT_RECOVERY_ATTEMPTS} recovery attempts \
-                             (~{estimated_input} token estimate, ~{input_budget} budget). Please run /compact or /clear."
+                        let message = context_overflow_exhausted_message(
+                            self.config.terminal_chrome_enabled,
+                            turn.stop_diagnostics.emergency_compaction_attempts,
+                            estimated_input,
+                            input_budget,
                         );
                         turn_error = Some(message.clone());
                         let _ = self
@@ -3771,6 +3797,16 @@ impl Engine {
                             }));
                         }
 
+                        let result = match result {
+                            Ok(rich) => Ok(super::tool_media::project(
+                                rich,
+                                &session_id,
+                                &plan.id,
+                                &plan.name,
+                            )
+                            .await),
+                            Err(error) => Err(error),
+                        };
                         let content_blocks = result
                             .as_ref()
                             .map(|result| result.content_blocks.clone())
@@ -3915,10 +3951,10 @@ impl Engine {
                                 tool_exec_lock.clone(),
                                 tool_context_for_call(batch_tool_context.clone(), &tool_id),
                             ) => match result {
-                                Ok(rich) => (
-                                    ToolExecutionOutcome::from_legacy(Ok(rich.result)),
-                                    rich.content_blocks,
-                                ),
+                                Ok(rich) => {
+                                    let rich = super::tool_media::project(rich, &self.session.id, &tool_id, &tool_name).await;
+                                    (ToolExecutionOutcome::from_legacy(Ok(rich.result)), rich.content_blocks)
+                                },
                                 Err(err) => (
                                     ToolExecutionOutcome::from_legacy(Err(err)),
                                     Vec::new(),
@@ -4303,6 +4339,16 @@ impl Engine {
                         }));
                     }
 
+                    let result = match result {
+                        Ok(rich) => Ok(super::tool_media::project(
+                            rich,
+                            &self.session.id,
+                            &tool_id,
+                            &tool_name,
+                        )
+                        .await),
+                        Err(error) => Err(error),
+                    };
                     let content_blocks = result
                         .as_ref()
                         .map(|result| result.content_blocks.clone())

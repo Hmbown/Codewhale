@@ -15,7 +15,7 @@ const CONTAINER_USE_SOURCE: &str = "https://github.com/dagger/container-use";
 
 pub(in crate::commands) const COMMAND_INFO: CommandInfo = CommandInfo {
     name: "mcp",
-    aliases: &[],
+    aliases: &["mcps"],
     usage: "/mcp [init|import|import approve <name>|import decline <name>|recommendations|add recommended <id>|add stdio <name> <command> [args...]|add http <name> <url>|enable <name>|disable <name>|remove <name>|retry <name>|doctor|validate|restart|reload]",
     description_key: "cmd_mcp_description",
 };
@@ -45,7 +45,12 @@ fn mcp_contextual(contexts: CommandContexts<'_>, args: Option<&str>) -> CommandR
 
 fn mcp(presentation: &mut dyn CommandPresentationContext, args: Option<&str>) -> CommandResult {
     let raw = args.unwrap_or("").trim();
-    if raw.is_empty() || raw.eq_ignore_ascii_case("status") || raw.eq_ignore_ascii_case("list") {
+    if raw.is_empty() {
+        return CommandResult::action(AppAction::OpenExtensions {
+            tab: crate::tui::views::extensions::ExtensionsTab::Mcp,
+        });
+    }
+    if raw.eq_ignore_ascii_case("status") || raw.eq_ignore_ascii_case("list") {
         return CommandResult::action(AppAction::Mcp(McpUiAction::Show));
     }
 
@@ -621,6 +626,6 @@ mod tests {
             Some("Error: Command capability unavailable: presentation")
         );
         assert_eq!(McpCmd::info().description_key, "cmd_mcp_description");
-        assert_eq!(McpCmd::info().aliases, &[] as &[&str]);
+        assert_eq!(McpCmd::info().aliases, &["mcps"]);
     }
 }

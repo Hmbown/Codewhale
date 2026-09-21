@@ -1443,6 +1443,14 @@ fn import_session_container(
             .map(|journal| journal.entries.len())
             .unwrap_or(0),
         leaf_display: imported.leaf_id.as_deref().unwrap_or("(none)").to_string(),
+        sync: SessionSyncPayload {
+            session_id: Some(new_id.clone()),
+            messages: app.api_messages.as_ref().clone(),
+            system_prompt: app.system_prompt.clone(),
+            model: app.model.clone(),
+            workspace: app.workspace.clone(),
+            mode: to_command_mode(app.mode),
+        },
     })
 }
 

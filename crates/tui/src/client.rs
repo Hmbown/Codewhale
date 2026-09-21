@@ -4069,12 +4069,27 @@ pub(crate) fn parse_models_response(payload: &str) -> Result<Vec<AvailableModel>
     Ok(models)
 }
 
-/// Keep both live-model consumers on Go's documented three-protocol roster.
+/// Keep both live-model consumers on each provider's documented coding roster.
 /// Unknown models remain hidden until their wire contract is known.
 fn apply_provider_model_cutline(
     provider: ApiProvider,
     models: Vec<AvailableModel>,
 ) -> Vec<AvailableModel> {
+    if provider == ApiProvider::Stepfun {
+        // The shared /models endpoint also lists speech and image generators.
+        // Only expose routes whose text/tool contract is in our catalog.
+        let offerings = codewhale_config::catalog::bundled_catalog_offerings();
+        return models
+            .into_iter()
+            .filter(|model| {
+                offerings.iter().any(|row| {
+                    row.provider == "stepfun"
+                        && row.wire_model_id == model.id
+                        && row.tool_call == Some(true)
+                })
+            })
+            .collect();
+    }
     if provider != ApiProvider::OpencodeGo {
         return models;
     }
@@ -4699,6 +4714,27 @@ pub(super) fn apply_reasoning_effort(
     // provider keeps its own dialect below.
     if matches!(provider, ApiProvider::Deepseek | ApiProvider::DeepseekCN) {
         apply_deepseek_chat_reasoning_effort(body, &normalized);
+        return;
+    }
+    if provider == ApiProvider::Stepfun {
+        // Step 3.5 has no documented effort selector. The other coding models
+        // are always reasoning-capable; do not invent an Off wire value.
+        let model = body.get("model").and_then(Value::as_str).unwrap_or("");
+        let tier = match (model, normalized.as_str()) {
+            ("step-5-preview" | "step-3.7-flash" | "step-3.5-flash-2603", "minimal" | "low") => {
+                Some("low")
+            }
+            ("step-5-preview" | "step-3.7-flash", "medium") => Some("medium"),
+            ("step-3.5-flash-2603", "medium") => Some("high"),
+            (
+                "step-5-preview" | "step-3.7-flash" | "step-3.5-flash-2603",
+                "high" | "max" | "xhigh" | "ultra",
+            ) => Some("high"),
+            _ => None,
+        };
+        if let Some(tier) = tier {
+            body["reasoning_effort"] = json!(tier);
+        }
         return;
     }
     match normalized.as_str() {
@@ -10831,6 +10867,57 @@ mod tests {
     /// high (#52). Hosted DeepSeek-compatible routes keep the historic
     /// low/medium → high collapse because their own wire contracts are not
     /// verified here.
+    #[test]
+    fn stepfun_reasoning_effort_respects_each_model_wire_contract() {
+        for (model, effort, expected) in [
+            ("step-5-preview", "low", Some("low")),
+            ("step-5-preview", "medium", Some("medium")),
+            ("step-5-preview", "max", Some("high")),
+            ("step-3.7-flash", "medium", Some("medium")),
+            ("step-3.5-flash-2603", "medium", Some("high")),
+            ("step-3.5-flash-2603", "low", Some("low")),
+            ("step-3.5-flash", "high", None),
+            ("step-5-preview", "off", None),
+            ("step-5-preview", "auto", None),
+            ("step-audio-2", "high", None),
+        ] {
+            let mut body = json!({"model": model});
+            apply_reasoning_effort(&mut body, Some(effort), ApiProvider::Stepfun);
+            assert_eq!(
+                body.get("reasoning_effort").and_then(Value::as_str),
+                expected,
+                "{model}/{effort}"
+            );
+            assert!(body.get("thinking").is_none());
+        }
+    }
+
+    #[test]
+    fn stepfun_discovery_excludes_non_coding_and_retired_models() {
+        let models = parse_models_response(
+            r#"{"data":[
+            {"id":"step-5-preview"},{"id":"step-3.7-flash"},
+            {"id":"step-3.5-flash"},{"id":"step-3.5-flash-2603"},
+            {"id":"step-audio-2"},{"id":"step-tts-2"},
+            {"id":"step-image-edit-2"},{"id":"step-2x-large"},{"id":"step-3"}
+        ]}"#,
+        )
+        .unwrap();
+        let filtered = apply_provider_model_cutline(ApiProvider::Stepfun, models);
+        assert_eq!(
+            filtered
+                .iter()
+                .map(|model| model.id.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "step-3.5-flash",
+                "step-3.5-flash-2603",
+                "step-3.7-flash",
+                "step-5-preview"
+            ]
+        );
+    }
+
     #[test]
     fn reasoning_effort_deepseek_maps_the_documented_wire_ladder() {
         let mut body = json!({});

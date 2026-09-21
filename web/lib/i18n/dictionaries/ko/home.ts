@@ -20,7 +20,7 @@ export const home: HomeDict = {
   shotPreview: "터미널 미리보기",
   shotBuild: "v{version} 개발 빌드",
   screenshotAlt:
-    "Codewhale v0.9.12 터미널, 빌드 171acee689aa: 고래 마크, 메시지 입력창, Full Access와 Operate 모드, 예약된 작업 두 개, 연결 중인 MCP 서버 21개, 추론 강도를 최대로 설정한 GLM-5.3이 표시된 새 세션.",
+    "Codewhale v{version} 개발 빌드: 고래 마크, 새 세션, 메시지 입력창, Ask 권한, Work 모드와 모델 상태. 격리된 터미널의 실제 출력을 렌더링했습니다.",
   latestRelease: "최신 릴리스 {tag}",
   releaseUnavailable: "릴리스 상태를 확인할 수 없음",
   currentSource: "소스",

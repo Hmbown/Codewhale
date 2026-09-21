@@ -963,6 +963,31 @@ fn recv_sync_reader_output(rx: &std::sync::mpsc::Receiver<Vec<u8>>) -> Vec<u8> {
         .unwrap_or_default()
 }
 
+/// Cell dimensions accepted by the existing PTY owner. Pixel sizes remain
+/// unspecified; callers must not allocate an unbounded terminal grid.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PtyDimensions {
+    pub rows: u16,
+    pub cols: u16,
+}
+
+impl Default for PtyDimensions {
+    fn default() -> Self {
+        Self { rows: 24, cols: 80 }
+    }
+}
+
+impl PtyDimensions {
+    pub fn validate(self) -> Result<Self> {
+        anyhow::ensure!(
+            (1..=1000).contains(&self.rows) && (1..=1000).contains(&self.cols),
+            "PTY rows and columns must each be between 1 and 1000"
+        );
+        Ok(self)
+    }
+}
+
 /// A background shell process being tracked
 pub struct BackgroundShell {
     pub id: String,
@@ -994,6 +1019,10 @@ pub struct BackgroundShell {
     stderr_cursor: usize,
     completion_reported: bool,
     stdin: Option<StdinWriter>,
+    /// Retain the existing PTY owner for resize; never create another session.
+    #[cfg(not(target_env = "ohos"))]
+    pty_master: Option<Box<dyn portable_pty::MasterPty + Send>>,
+    terminal_size: Option<PtyDimensions>,
     child: Option<ShellChild>,
     #[cfg(windows)]
     windows_job: Option<WindowsJob>,
@@ -1308,16 +1337,22 @@ impl BackgroundShell {
             finish_background_reader(handle, &self.status, self.stderr_buffer.as_ref());
         }
         self.stdin = None;
+        #[cfg(not(target_env = "ohos"))]
+        {
+            self.pty_master = None;
+        }
         self.child = None;
     }
 
     fn write_stdin(&mut self, input: &str, close: bool) -> Result<()> {
+        self.write_stdin_bytes(input.as_bytes(), close)
+    }
+
+    fn write_stdin_bytes(&mut self, input: &[u8], close: bool) -> Result<()> {
         if let Some(stdin) = self.stdin.as_mut() {
             if !input.is_empty() {
-                stdin
-                    .write_all(input.as_bytes())
-                    .context("Failed to write to stdin")?;
-                stdin.flush().ok();
+                stdin.write_all(input).context("Failed to write to stdin")?;
+                stdin.flush().context("Failed to flush stdin")?;
             }
             if close {
                 self.stdin = None;
@@ -1874,6 +1909,9 @@ impl ShellManager {
                 stderr_cursor: 0,
                 completion_reported: false,
                 stdin: None,
+                #[cfg(not(target_env = "ohos"))]
+                pty_master: None,
+                terminal_size: None,
                 child: None,
                 #[cfg(windows)]
                 windows_job: None,
@@ -2554,6 +2592,8 @@ impl ShellManager {
         #[cfg(windows)]
         let mut windows_job = None;
 
+        #[cfg(not(target_env = "ohos"))]
+        let mut pty_master = None;
         let (child, stdin, stdout_thread, stderr_thread) = if tty {
             #[cfg(target_env = "ohos")]
             unreachable!("OHOS TTY mode returns before PTY setup");
@@ -2600,6 +2640,7 @@ impl ShellManager {
                     }
                 };
                 let stdout_thread = Some(spawn_reader_thread(reader, Arc::clone(&stdout_buffer)));
+                pty_master = Some(pair.master);
 
                 (
                     ShellChild::Pty(child),
@@ -2729,6 +2770,9 @@ impl ShellManager {
             stderr_cursor: 0,
             completion_reported: false,
             stdin,
+            #[cfg(not(target_env = "ohos"))]
+            pty_master,
+            terminal_size: tty.then(PtyDimensions::default),
             child: Some(child),
             #[cfg(windows)]
             windows_job,
@@ -2844,12 +2888,56 @@ impl ShellManager {
 
     /// Write data to stdin of a background process.
     pub fn write_stdin(&mut self, task_id: &str, input: &str, close: bool) -> Result<()> {
+        self.write_stdin_bytes(task_id, input.as_bytes(), close)
+    }
+
+    /// Exact input bytes from an authenticated client; never round-trip through UTF-8.
+    pub fn write_stdin_bytes(&mut self, task_id: &str, input: &[u8], close: bool) -> Result<()> {
         let shell = self
             .processes
             .get_mut(task_id)
             .ok_or_else(|| anyhow!("Task {task_id} not found"))?;
-        shell.write_stdin(input, close)?;
+        shell.write_stdin_bytes(input, close)?;
         Ok(())
+    }
+
+    /// Historical evicted records have no terminal-size evidence.
+    pub fn job_terminal_size(&self, task_id: &str) -> Option<PtyDimensions> {
+        self.processes
+            .get(task_id)
+            .and_then(|shell| shell.terminal_size)
+    }
+
+    pub fn resize_pty(&mut self, task_id: &str, size: PtyDimensions) -> Result<()> {
+        let size = size.validate()?;
+        let shell = self
+            .processes
+            .get_mut(task_id)
+            .ok_or_else(|| anyhow!("Job {task_id} not found"))?;
+        shell.poll();
+        anyhow::ensure!(
+            shell.status == ShellStatus::Running,
+            "PTY job is no longer running"
+        );
+        #[cfg(not(target_env = "ohos"))]
+        {
+            let master = shell.pty_master.as_ref().context("Job is not a PTY")?;
+            master
+                .resize(PtySize {
+                    rows: size.rows,
+                    cols: size.cols,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                })
+                .context("Failed to resize PTY")?;
+            shell.terminal_size = Some(size);
+            Ok(())
+        }
+        #[cfg(target_env = "ohos")]
+        {
+            let _ = size;
+            Err(anyhow!("PTY resize is unavailable on this platform"))
+        }
     }
 
     pub fn write_stdin_for_session(

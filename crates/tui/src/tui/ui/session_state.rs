@@ -669,6 +669,13 @@ pub(crate) fn type_launch_mcp_remedy(app: &mut App) {
     let Some(command) = crate::tui::underwater::mcp_remedy_command(app) else {
         return;
     };
+    // Home can be revisited with an unsent draft. The manager exposes the
+    // same remedy without replacing user-authored composer content.
+    if !app.input.is_empty() {
+        app.launch.dissolve_card(app.ambient_clock_ms);
+        open_mcp_extensions(app);
+        return;
+    }
     app.input = command;
     app.cursor_position = app.input.chars().count();
     app.launch.menu_selected = None;
@@ -691,7 +698,7 @@ pub(crate) fn begin_launch_session(
     app.current_session_id = Some(session_id.clone());
     app.current_session_metadata = None;
     app.session_title = Some(app.tr(MessageId::SessionsNewSessionTitle).into_owned());
-    app.launch.visible = false;
+    app.launch.dismiss();
     app.launch.status = None;
     app.status_message = None;
     commands::CommandResult::action(AppAction::SyncSession {

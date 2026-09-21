@@ -606,7 +606,34 @@ pub(super) fn is_context_length_error_message(message: &str) -> bool {
         || lower.contains("context_length")
         || lower.contains("prompt is too long")
         || lower.contains("context window")
+        // llama.cpp: "the request exceeds the available context size".
+        || lower.contains("available context size")
         || (lower.contains("requested") && lower.contains("tokens") && lower.contains("maximum"))
+}
+
+/// The turn is over: the input still exceeds the route's input budget after
+/// the bounded recovery. Say what ran and name the levers that exist where
+/// the message is read — an interactive session has `/compact` and `/clear`;
+/// a headless host (`exec`, app-server, CI) has neither (#6374).
+pub(super) fn context_overflow_exhausted_message(
+    interactive: bool,
+    emergency_compactions: u32,
+    estimated_input: usize,
+    input_budget: usize,
+) -> String {
+    let passes = match emergency_compactions {
+        1 => "1 emergency compaction pass".to_string(),
+        n => format!("{n} emergency compaction passes"),
+    };
+    let levers = if interactive {
+        "Run /compact to summarize further or /clear to start over; a larger context route or a lower output cap also raises the input budget."
+    } else {
+        "Shorten the input or choose a larger context route; a lower output cap (CODEWHALE_MAX_OUTPUT_TOKENS) or a lower [compaction] retained_user_message_tokens raises the usable input budget."
+    };
+    format!(
+        "Context is still above this route's input budget after {passes} \
+         (~{estimated_input} tokens estimated, ~{input_budget} budget). {levers}"
+    )
 }
 
 pub(super) fn is_image_input_rejection_message(message: &str) -> bool {

@@ -564,15 +564,15 @@ done
   });
 
   it("keeps supplied terminal screenshots and website dimensions truthful", () => {
-    // Website and README share the founder-supplied PNG without alteration.
+    // Website and README share the same exact-build terminal-cell capture.
     const readmeImage = bytes(matrix.screenshot.readme);
     const websiteImage = bytes(matrix.screenshot.website);
 
-    expect(imageDimensions(websiteImage)).toEqual([1078, 466]);
+    expect(imageDimensions(websiteImage)).toEqual([TERMINAL_SCREENSHOT.width, TERMINAL_SCREENSHOT.height]);
     expect(readmeImage).toEqual(websiteImage);
     expect(statSync(new URL(matrix.screenshot.readme, root)).size).toBeLessThan(500_000);
     expect(statSync(new URL(matrix.screenshot.website, root)).size).toBeLessThan(500_000);
-    expect(matrix.screenshot.terminal).toBe("unrecorded");
+    expect(matrix.screenshot.terminal).toContain("real PTY cell capture");
     // A development-build capture, never a release claim.
     expect(matrix.screenshot.capture).toContain("development build");
     expect(matrix.screenshot.capture).toContain("not a default");
@@ -583,21 +583,18 @@ done
     expect(`web/public${TERMINAL_SCREENSHOT.src}`).toBe(matrix.screenshot.website);
     expect(imageDimensions(websiteImage)).toEqual([TERMINAL_SCREENSHOT.width, TERMINAL_SCREENSHOT.height]);
     expect(homepage).toContain("src={TERMINAL_SCREENSHOT.src}");
-    // Alt text and caption are dictionary-backed; every routed locale must
-    // describe the capture as what it is — a v0.9.12 development build in
-    // Operate mode with Full Access, not a release and not a default.
-    expect(homepage).toContain("alt={d.screenshotAlt}");
+    // Every locale describes the actual capture; build identity comes from
+    // the media manifest instead of a stale version embedded in translations.
+    expect(homepage).toContain("alt={fill(d.screenshotAlt, { version: TERMINAL_SCREENSHOT.version })}");
     expect(homepage).toContain("fill(d.shotBuild, { version: TERMINAL_SCREENSHOT.version })");
     expect(getHome("en").shotBuild).toBe("v{version} development build");
-    expect(getHome("en").screenshotAlt).toContain("171acee689aa");
-    expect(getHome("en").screenshotAlt).toContain("Full Access");
-    expect(getHome("en").screenshotAlt).toContain("Operate mode");
-    for (const locale of ["zh", "ja", "vi", "ko", "ru", "uk", "es", "pt-BR", "id", "fr", "de", "ca", "hi", "tr", "it", "pl", "ar"]) {
+    for (const locale of ["en", "zh", "ja", "vi", "ko", "ru", "uk", "es", "pt-BR", "id", "fr", "de", "ca", "hi", "tr", "it", "pl", "ar"]) {
       const home = getHome(locale);
       expect(home.shotBuild, `${locale} shotBuild`).toContain("{version}");
-      expect(home.screenshotAlt, `${locale} alt`).toContain("Full Access");
-      expect(home.screenshotAlt, `${locale} alt`).toContain("Operate");
-      expect(home.screenshotAlt, `${locale} alt`).toContain("0.9.12");
+      expect(home.screenshotAlt, `${locale} alt`).toContain("{version}");
+      expect(home.screenshotAlt, `${locale} alt`).toContain("Ask");
+      expect(home.screenshotAlt, `${locale} alt`).toContain("Work");
+      expect(home.screenshotAlt, `${locale} alt`).not.toMatch(/171acee|0\.9\.12|Full Access/);
     }
   });
 

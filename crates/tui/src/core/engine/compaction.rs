@@ -470,7 +470,13 @@ impl Engine {
         };
         let turn_cancel = self.cancel_token.clone();
 
-        let before_tokens = self.estimated_input_tokens();
+        // Measured with the estimator `after_tokens` and the preflight guard
+        // use, so `recovered` compares like with like and the receipt reads
+        // ~before → ~after on one scale.
+        let before_tokens = crate::compaction::estimate_input_tokens_for_pressure(
+            &self.session.messages,
+            self.session.system_prompt.as_ref(),
+        );
         let before_count = self.session.messages.len();
 
         let mut forced_config = self.config.compaction.clone();

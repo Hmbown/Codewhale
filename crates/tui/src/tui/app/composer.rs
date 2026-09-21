@@ -861,6 +861,10 @@ impl App {
                 self.insert_char(ch);
                 true
             }
+            FlushResult::SuppressionExpired => {
+                self.needs_redraw = true;
+                true
+            }
             FlushResult::None => false,
         }
     }

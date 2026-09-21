@@ -1105,6 +1105,14 @@ fn build_list_lines(
     lines
 }
 
+pub(super) fn format_message_count(count: usize, locale: Locale) -> String {
+    if locale == Locale::En && count == 1 {
+        "1 msg".to_string()
+    } else {
+        tr(locale, MessageId::SessionsMessageCountCompact).replace("{count}", &count.to_string())
+    }
+}
+
 fn format_session_line(session: &SessionMetadata, is_current: bool, locale: Locale) -> String {
     let age = format_relative_time(&session.updated_at, locale);
     let updated = crate::session_manager::format_session_updated_at(&session.updated_at, &age);
@@ -1119,8 +1127,7 @@ fn format_session_line(session: &SessionMetadata, is_current: bool, locale: Loca
         .as_deref()
         .map(str::to_ascii_lowercase)
         .unwrap_or_else(|| tr(locale, MessageId::SessionsUnknownMode).into_owned());
-    let message_count = tr(locale, MessageId::SessionsMessageCountCompact)
-        .replace("{count}", &session.message_count.to_string());
+    let message_count = format_message_count(session.message_count, locale);
     let fork_label = if session.parent_session_id.is_some() {
         format!(" | {}", tr(locale, MessageId::SessionsForkCompact))
     } else {

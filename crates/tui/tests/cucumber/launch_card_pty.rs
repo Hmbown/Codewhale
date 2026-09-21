@@ -12,6 +12,19 @@ const SIZES: [(u16, u16); 5] = [(12, 40), (16, 60), (24, 80), (32, 100), (40, 14
 const TITLE: &str = "Recent proof";
 const SAVED_TEXT: &str = "Restored conversation proof";
 
+#[test]
+#[ignore = "opt-in website media; empty isolated session, no provider calls"]
+fn website_current_terminal_capture() {
+    assert!(std::env::var_os("QA_LAUNCH_CAPTURE_DIR").is_some());
+    let (_workspace, mut tui) =
+        start_with_options(24, 100, false, &[], Some("shoreline"), true, false);
+    // Capture only actual application output: no fabricated history, usage,
+    // connected tools, model response or completed work.
+    tui.wait_for_idle(Duration::from_secs(4), WAIT).unwrap();
+    capture(&mut tui, "website-home");
+    tui.shutdown();
+}
+
 fn start(rows: u16, cols: u16, with_mcp: bool) -> (SealedWorkspace, Harness) {
     start_titled(rows, cols, with_mcp, TITLE)
 }
@@ -26,13 +39,44 @@ fn start_with_titles(
     with_mcp: bool,
     titles: &[&str],
 ) -> (SealedWorkspace, Harness) {
+    start_with_theme(rows, cols, with_mcp, titles, None)
+}
+
+fn start_with_theme(
+    rows: u16,
+    cols: u16,
+    with_mcp: bool,
+    titles: &[&str],
+    theme: Option<&str>,
+) -> (SealedWorkspace, Harness) {
+    start_with_options(rows, cols, with_mcp, titles, theme, false, false)
+}
+
+fn start_with_options(
+    rows: u16,
+    cols: u16,
+    with_mcp: bool,
+    titles: &[&str],
+    theme: Option<&str>,
+    animated: bool,
+    no_color: bool,
+) -> (SealedWorkspace, Harness) {
     let workspace = make_sealed_workspace().unwrap();
-    std::fs::write(workspace.home().join(".codewhale/.onboarded"), "").unwrap();
     let trust = workspace.workspace().join(".deepseek");
-    std::fs::create_dir_all(&trust).unwrap();
-    std::fs::write(trust.join("trusted"), "").unwrap();
     let sessions = workspace.home().join(".codewhale/sessions");
-    std::fs::create_dir_all(&sessions).unwrap();
+    for directory in [&trust, &sessions] {
+        std::fs::create_dir_all(directory).unwrap();
+    }
+    let mut fixtures = vec![
+        (workspace.home().join(".codewhale/.onboarded"), Vec::new()),
+        (trust.join("trusted"), Vec::new()),
+    ];
+    if let Some(theme) = theme {
+        fixtures.push((
+            workspace.home().join(".codewhale/settings.toml"),
+            format!("theme = {theme:?}\n").into_bytes(),
+        ));
+    }
     for (index, title) in titles.iter().enumerate() {
         let id = format!(
             "11111111-2222-4333-8444-{:012}",
@@ -54,22 +98,23 @@ fn start_with_titles(
             "messages": [{"role": "user", "content": [{"type": "text", "text": SAVED_TEXT}]}],
             "system_prompt": null
         });
-        std::fs::write(
+        fixtures.push((
             sessions.join(format!("{id}.json")),
             serde_json::to_vec(&session).unwrap(),
-        )
-        .unwrap();
+        ));
     }
     if with_mcp {
         // A local failing server gives the summary a real row without any network.
         let mcp = serde_json::json!({"mcpServers": {"launch-proof": {
             "command": "/usr/bin/false", "required": true
         }}});
-        std::fs::write(
+        fixtures.push((
             workspace.home().join(".codewhale/mcp.json"),
             serde_json::to_vec(&mcp).unwrap(),
-        )
-        .unwrap();
+        ));
+    }
+    for (path, contents) in fixtures {
+        std::fs::write(path, contents).unwrap();
     }
 
     let mut tui = Harness::builder(Harness::cargo_bin("codewhale-tui"))
@@ -78,8 +123,9 @@ fn start_with_titles(
         .seal_home(workspace.home())
         .env("CODEWHALE_DISABLE_MODELS_DEV_FETCH", "1")
         .env("CODEWHALE_NO_UPDATE_CHECK", "1")
-        .env("NO_ANIMATIONS", "1")
+        .env("NO_ANIMATIONS", if animated { "0" } else { "1" })
         .env("COLORTERM", "truecolor")
+        .env("NO_COLOR", if no_color { "1" } else { "" })
         .args([
             "--workspace",
             workspace.workspace().to_str().unwrap(),
@@ -95,6 +141,9 @@ fn start_with_titles(
     wait(&mut tui, "You're ready.");
     tui.send(keys::key::enter()).unwrap();
     wait(&mut tui, "New session");
+    if animated {
+        return (workspace, tui);
+    }
     tui.wait_for_idle(Duration::from_millis(300), WAIT).unwrap();
     tui.send(keys::key::ctrl('u')).unwrap();
     tui.wait_for_idle(Duration::from_millis(200), WAIT).unwrap();
@@ -103,7 +152,13 @@ fn start_with_titles(
 
 fn wait(tui: &mut Harness, text: &str) {
     if let Err(error) = tui.wait_for(|frame| frame.contains(text), WAIT) {
-        panic!("waiting for {text:?}: {error}\n{}", tui.diagnostics());
+        let transcript = tui.transcript();
+        let tail = &transcript[transcript.len().saturating_sub(4096)..];
+        panic!(
+            "waiting for {text:?}: {error}\n{}\nPTY tail: {:?}",
+            tui.diagnostics(),
+            String::from_utf8_lossy(tail)
+        );
     }
 }
 
@@ -114,6 +169,51 @@ fn click_text(tui: &mut Harness, text: &str) {
         .find_text(text)
         .unwrap_or_else(|| panic!("missing click target {text:?}\n{}", tui.diagnostics()));
     tui.send(keys::mouse::click(row, col)).unwrap();
+}
+
+#[test]
+fn local_slash_navigation_does_not_create_rewindable_user_turns() {
+    let (_workspace, mut tui) = start_with_titles(24, 80, false, &[]);
+    // The first command leaves home; the others use the active-session path.
+    for (command, title) in [
+        ("/settings", "Config"),
+        ("/skills", "Extensions"),
+        ("/mcp", "Extensions"),
+    ] {
+        tui.type_line(command).unwrap();
+        wait(&mut tui, title);
+        tui.send(keys::key::esc()).unwrap();
+        tui.wait_for_idle(Duration::from_millis(200), WAIT).unwrap();
+        assert!(
+            !tui.frame()
+                .text()
+                .lines()
+                .take(18)
+                .any(|line| line.contains(command)),
+            "navigation leaked into transcript above the composer: {}",
+            tui.diagnostics()
+        );
+    }
+    tui.send(keys::key::esc()).unwrap();
+    tui.send(keys::key::esc()).unwrap();
+    tui.wait_for_idle(Duration::from_millis(200), WAIT).unwrap();
+    assert!(
+        !tui.frame().contains("Backtrack preview"),
+        "view navigation became a rewindable turn: {}",
+        tui.diagnostics()
+    );
+    tui.shutdown();
+}
+
+#[test]
+fn raw_slash_input_reenables_its_submit_cue_without_another_key() {
+    let (_workspace, mut tui) = start_with_titles(24, 80, false, &[]);
+    tui.send("/mcp").unwrap();
+    wait(&mut tui, "enter:run");
+    wait(&mut tui, "[↵]");
+    tui.send(keys::key::enter()).unwrap();
+    wait(&mut tui, "Extensions");
+    tui.shutdown();
 }
 
 #[test]
@@ -192,7 +292,7 @@ fn launch_resume_buttons_support_mouse_cancel_and_keyboard_choice() {
 
 /// Optional review evidence from the real PTY, keeping cell colors rather
 /// than relying on symbol-only goldens. The viewer supplies terminal fonts.
-fn capture(tui: &mut Harness, name: &str) {
+pub(super) fn capture(tui: &mut Harness, name: &str) {
     let Some(directory) = std::env::var_os("QA_LAUNCH_CAPTURE_DIR") else {
         return;
     };
@@ -218,6 +318,7 @@ fn workbench_settings_visual_evidence() {
         ("/fleet", "Coordinator", "fleet"),
         ("/plugin", "Extensions", "plugins"),
         ("/config", "Config", "settings"),
+        ("/statusline", "Status", "statusline"),
     ] {
         for (rows, cols) in SIZES {
             let (_workspace, mut tui) = start(rows, cols, true);
@@ -298,6 +399,261 @@ fn launch_long_resume_title_preserves_warning_and_truthful_enter_hint() {
         tui.send(keys::key::enter()).unwrap();
         wait(&mut tui, "New session");
         assert!(!tui.frame().contains(SAVED_TEXT));
+        tui.shutdown();
+    }
+}
+
+#[test]
+#[ignore = "opt-in all-theme evidence; fixture sessions, no provider calls"]
+fn workbench_every_theme_visual_evidence() {
+    assert!(std::env::var_os("QA_LAUNCH_CAPTURE_DIR").is_some());
+    for theme in codewhale_palette::SELECTABLE_THEMES {
+        let (_workspace, mut tui) = start_with_theme(24, 80, true, &[TITLE], Some(theme.name()));
+        capture(&mut tui, &format!("theme-{}-home", theme.name()));
+        tui.paste("/statusline").unwrap();
+        tui.wait_for_idle(Duration::from_millis(300), WAIT).unwrap();
+        tui.send(keys::key::enter()).unwrap();
+        wait(&mut tui, "Status");
+        capture(&mut tui, &format!("theme-{}-statusline", theme.name()));
+        tui.shutdown();
+    }
+}
+
+#[test]
+#[ignore = "opt-in real launch animation capture; fixture state, no provider calls"]
+fn workbench_whale_reveal_visual_evidence() {
+    let directory = std::path::PathBuf::from(std::env::var_os("QA_LAUNCH_CAPTURE_DIR").unwrap());
+    std::fs::create_dir_all(&directory).unwrap();
+    let (_workspace, mut tui) =
+        start_with_options(32, 100, false, &[TITLE], Some("shoreline"), true, false);
+    let start = std::time::Instant::now();
+    for index in 0..16 {
+        let frame = tui.frame();
+        assert!(
+            frame.text().contains("New session"),
+            "controls must remain usable during reveal"
+        );
+        std::fs::write(
+            directory.join(format!("reveal-{index:02}-100x32.json")),
+            serde_json::to_vec_pretty(&frame.capture_cells()).unwrap(),
+        )
+        .unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    eprintln!("Captured launch reveal over {:?}", start.elapsed());
+    tui.shutdown();
+}
+
+/// Record temporal evidence from the real terminal, including its idle settle.
+#[test]
+#[ignore = "opt-in Underwater motion capture; isolated fixture, no provider calls"]
+fn underwater_motion_visual_evidence() {
+    use std::io::Write;
+    let directory = std::path::PathBuf::from(std::env::var_os("QA_LAUNCH_CAPTURE_DIR").unwrap());
+    std::fs::create_dir_all(&directory).unwrap();
+    for (rows, cols) in [(24, 80), (36, 120)] {
+        let (_workspace, mut tui) =
+            start_with_options(rows, cols, false, &[TITLE], Some("underwater"), true, false);
+        // Home intentionally gives its brief whale reveal the stage. Sea life
+        // lives in the conversation field, so enter a fresh offline session.
+        tui.send(keys::key::ctrl('u')).unwrap();
+        click_text(&mut tui, "New session");
+        wait(&mut tui, "What do you want to accomplish?");
+        let file =
+            std::fs::File::create(directory.join(format!("ocean-{cols}x{rows}.jsonl.gz"))).unwrap();
+        let mut output = flate2::write::GzEncoder::new(file, flate2::Compression::fast());
+        let start = std::time::Instant::now();
+        for index in 0..360u64 {
+            let frame = tui.frame();
+            assert!(
+                frame.contains("Type a message")
+                    && frame.contains("What do you want to accomplish?"),
+                "motion cannot displace the conversation or composer"
+            );
+            serde_json::to_writer(
+                &mut output,
+                &serde_json::json!({
+                    "elapsed_ms": start.elapsed().as_millis(),
+                    "frame": frame.capture_cells()
+                }),
+            )
+            .unwrap();
+            output.write_all(b"\n").unwrap();
+            let target = Duration::from_millis((index + 1) * 33);
+            if let Some(remaining) = target.checked_sub(start.elapsed()) {
+                std::thread::sleep(remaining);
+            }
+        }
+        output.finish().unwrap();
+        tui.shutdown();
+    }
+}
+
+/// Exercise the visible catalog controls and provider search through the
+/// input decoder. This only browses fixture state; it never applies a route.
+#[test]
+fn settings_catalog_controls_and_provider_search_work_with_mouse_and_keyboard() {
+    for (rows, cols) in SIZES {
+        let (_workspace, mut tui) = start(rows, cols, false);
+        tui.paste("/provider").unwrap();
+        tui.send(keys::key::enter()).unwrap();
+        wait(&mut tui, "Provider");
+        click_text(&mut tui, "browse all");
+        wait(&mut tui, "configured");
+        tui.send("/Anthropic").unwrap();
+        wait(&mut tui, "search: Anthropic");
+        capture(&mut tui, "providers-search");
+        tui.send(keys::key::esc()).unwrap();
+        wait(&mut tui, "Provider");
+        capture(&mut tui, "providers-catalog");
+        tui.send(keys::key::esc()).unwrap();
+        // Let the standalone Escape decode before starting a bracketed paste.
+        tui.wait_for_idle(Duration::from_millis(200), WAIT).unwrap();
+        tui.paste("/model").unwrap();
+        tui.send(keys::key::enter()).unwrap();
+        wait(&mut tui, "route ·");
+        click_text(&mut tui, "browse catalog");
+        wait(&mut tui, "catalog");
+        capture(&mut tui, "models-catalog");
+        tui.send(keys::key::esc()).unwrap();
+        tui.shutdown();
+    }
+}
+
+#[test]
+fn fleet_roles_open_the_shared_model_picker_and_escape_returns_to_the_same_role() {
+    for (rows, cols) in SIZES {
+        let (_workspace, mut tui) = start(rows, cols, false);
+        tui.paste("/fleet").unwrap();
+        tui.send(keys::key::enter()).unwrap();
+        wait(&mut tui, "Coordinator");
+        capture(&mut tui, "fleet-assignments");
+        tui.send(keys::key::enter()).unwrap();
+        wait(&mut tui, "Model · Coordinator");
+        wait(&mut tui, "Current session");
+        capture(&mut tui, "fleet-coordinator-model");
+        tui.send(keys::key::esc()).unwrap();
+        wait(&mut tui, "saved teams");
+        tui.send(keys::key::down()).unwrap();
+        tui.send(keys::key::enter()).unwrap();
+        wait(&mut tui, "Model · manager");
+        capture(&mut tui, "fleet-role-model");
+        tui.send("search-proof").unwrap();
+        wait(&mut tui, "search-proof");
+        tui.wait_for_idle(Duration::from_millis(200), WAIT).unwrap();
+        tui.send(keys::key::esc()).unwrap();
+        tui.wait_for(|frame| !frame.contains("search-proof"), WAIT)
+            .unwrap();
+        tui.wait_for_idle(Duration::from_millis(200), WAIT).unwrap();
+        tui.send(keys::key::esc()).unwrap();
+        wait(&mut tui, "saved teams");
+        tui.send(keys::key::enter()).unwrap();
+        wait(&mut tui, "Model · manager");
+        // Following Coordinator is a selectable local choice even without credentials.
+        tui.send(keys::key::enter()).unwrap();
+        wait(&mut tui, "Personal");
+        capture(&mut tui, "fleet-role-destination");
+        tui.shutdown();
+    }
+}
+
+#[test]
+fn no_color_keeps_home_navigation_and_submit_cues_without_color() {
+    let sgr = regex::Regex::new(r"\x1b\[([0-9;:]*)m").unwrap();
+    for (rows, cols) in SIZES {
+        let (_workspace, mut tui) =
+            start_with_options(rows, cols, false, &[TITLE], Some("shoreline"), false, true);
+        wait(&mut tui, "[·]");
+        tui.send(keys::key::down()).unwrap();
+        tui.send(keys::key::down()).unwrap();
+        capture(&mut tui, "no-color-selected");
+        tui.send(keys::key::enter()).unwrap();
+        wait(&mut tui, "Resume");
+        tui.wait_for_idle(Duration::from_millis(200), WAIT).unwrap();
+        tui.send(keys::key::enter()).unwrap();
+        wait(&mut tui, SAVED_TEXT);
+        tui.send("monochrome draft").unwrap();
+        wait(&mut tui, "[↵]");
+        tui.wait_for_idle(Duration::from_millis(200), WAIT).unwrap();
+        capture(&mut tui, "no-color-draft");
+
+        for row in 0..rows {
+            for col in 0..cols {
+                assert_eq!(
+                    tui.frame().colors_at(row, col),
+                    Some((
+                        qa_harness::frame::Color::Default,
+                        qa_harness::frame::Color::Default
+                    )),
+                    "{cols}x{rows} cell ({row}, {col}) added a color"
+                );
+            }
+        }
+        // Inspect the whole emitted stream, not just its last rendered frame.
+        let transcript = tui.transcript();
+        let output = String::from_utf8_lossy(&transcript);
+        for codes in sgr.captures_iter(&output) {
+            for code in codes[1]
+                .split([';', ':'])
+                .filter_map(|code| code.parse::<u16>().ok())
+            {
+                assert!(
+                    !matches!(code, 30..=38 | 40..=48 | 58 | 90..=97 | 100..=107),
+                    "{cols}x{rows} emitted color SGR {:?}",
+                    &codes[0]
+                );
+            }
+        }
+        tui.shutdown();
+    }
+}
+
+#[test]
+fn home_returns_to_the_same_conversation_by_escape_click_and_typing() {
+    for (rows, cols) in SIZES {
+        let (_workspace, mut tui) = start(rows, cols, false);
+        click_text(&mut tui, TITLE);
+        wait(&mut tui, "Resume");
+        tui.wait_for_idle(Duration::from_millis(200), WAIT).unwrap();
+        tui.send(keys::key::enter()).unwrap();
+        wait(&mut tui, SAVED_TEXT);
+        for return_path in ["escape", "click", "type"] {
+            tui.paste("/home").unwrap();
+            tui.send(keys::key::enter()).unwrap();
+            wait(&mut tui, "Back to conversation");
+            capture(&mut tui, "home-return");
+            match return_path {
+                "escape" => tui.send(keys::key::esc()).unwrap(),
+                "click" => click_text(&mut tui, "Back to conversation"),
+                _ => tui.send("draft stays here").unwrap(),
+            }
+            tui.wait_for(|frame| !frame.contains("Back to conversation"), WAIT)
+                .unwrap();
+            tui.wait_for_idle(Duration::from_millis(200), WAIT).unwrap();
+            if return_path == "type" {
+                wait(&mut tui, "draft stays here");
+                capture(&mut tui, "home-return-draft");
+                tui.send(keys::key::ctrl('u')).unwrap();
+            }
+            // Slash commands add transcript rows. At 40x12 the original
+            // message is now above the viewport, so inspect scrollback.
+            tui.send(keys::key::page_up()).unwrap();
+            wait(&mut tui, SAVED_TEXT);
+            tui.send(keys::key::alt('G')).unwrap();
+            tui.wait_for_idle(Duration::from_millis(200), WAIT).unwrap();
+        }
+        tui.paste("/overview").unwrap();
+        tui.send(keys::key::enter()).unwrap();
+        tui.wait_for_idle(Duration::from_millis(300), WAIT).unwrap();
+        // The dashboard is longer than a short transcript viewport.
+        for _ in 0..20 {
+            if tui.frame().contains("Quick Actions") {
+                break;
+            }
+            tui.send(keys::key::page_up()).unwrap();
+            tui.wait_for_idle(Duration::from_millis(200), WAIT).unwrap();
+        }
+        wait(&mut tui, "Quick Actions");
         tui.shutdown();
     }
 }

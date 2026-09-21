@@ -308,9 +308,27 @@ pub fn publish_evidence_metadata(
 
 pub fn read_evidence_metadata(session_id: &str, handle: &str) -> io::Result<EvidenceArtifact> {
     let relative = evidence_metadata_relative_path(handle);
-    let path = crate::artifacts::session_artifact_absolute_path(session_id, &relative)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::PermissionDenied, "invalid evidence owner"))?;
-    let raw = std::fs::read(path)?;
+    let file = crate::artifacts::open_session_relative(session_id, &relative, false)?;
+    read_evidence_metadata_file(&file)
+}
+
+/// Bounded, no-follow read shared by publication/replay and authenticated HTTP
+/// retrieval. The caller chooses the existing session-root authority.
+pub(crate) fn read_evidence_metadata_file(
+    file: &crate::fleet::files::WorkspaceFile,
+) -> io::Result<EvidenceArtifact> {
+    use std::io::Read;
+    const MAX_MANIFEST_BYTES: u64 = 64 * 1024;
+    let mut raw = Vec::new();
+    file.open_file()?
+        .take(MAX_MANIFEST_BYTES + 1)
+        .read_to_end(&mut raw)?;
+    if raw.len() as u64 > MAX_MANIFEST_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "evidence metadata exceeds limit",
+        ));
+    }
     serde_json::from_slice(&raw).map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))
 }
 

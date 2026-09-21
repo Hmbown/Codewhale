@@ -2,7 +2,7 @@
    Config  ──────────────────────────────────────────────────────────────────────────────────────────────────────────── 
                                                                                                                         
    Appearance   Models & providers   Work   Tools & MCP   Trust   Motion   Advanced                                     
-   Search: type to filter  (17/70)                                                                                      
+   Search: type to filter  (17/71)                                                                                      
   ❯ Display         │  Display                                                │Theme                                    
                     │❯Theme                              terminal       ‹ ›   │theme                                    
                     │ Language                           auto           ‹ ›   │                                         
@@ -26,7 +26,7 @@
                     │                                                         │                                         
                     │                                                         │                                         
   system | terminal | shoreline | shoreline-light | underwater | underwater-retro | dark | light | grayscale |…         
-  Preview: ▶▶ ask · agent                                                                                               
+  Preview:  ask   agent                                                                                                 
   type=filter, Up/Down=select, Enter=edit, Esc=close                                                                    
  ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── 
                                                                                                                         

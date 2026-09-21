@@ -455,7 +455,7 @@ locked
         assert_eq!(chrome_ink(), codewhale_palette::ChromeInk::Metadata);
         assert_eq!(
             chrome_ink().family(),
-            codewhale_palette::SemanticFamily::Metadata
+            codewhale_palette::SemanticFamily::Neutral
         );
     }
 

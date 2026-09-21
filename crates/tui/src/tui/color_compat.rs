@@ -461,6 +461,9 @@ fn adapt_cell_colors(
     // Stage 3: depth (truecolor / 256 / 16) downsampling.
     cell.fg = palette::adapt_fg_for_depth(source_fg, cell.fg, depth, ui_theme);
     cell.bg = palette::adapt_bg(cell.bg, depth);
+    if depth == ColorDepth::Monochrome {
+        cell.underline_color = ratatui::style::Color::Reset;
+    }
 }
 
 #[cfg(test)]
@@ -568,6 +571,61 @@ mod tests {
             adapt_cell_symbol_for_ascii(&mut cell);
             assert_eq!(cell.symbol(), safe, "{rich} should map to {safe}");
             assert!(cell.symbol().is_ascii());
+        }
+    }
+
+    #[test]
+    fn monochrome_backend_suppresses_every_color_but_keeps_text_modifiers() {
+        use ratatui::style::{Modifier, Style};
+
+        let sgr = regex::Regex::new(r"\x1b\[([0-9;:]*)m").unwrap();
+        for theme_id in palette::SELECTABLE_THEMES {
+            let theme = theme_id.ui_theme();
+            let writer = SharedWriter::default();
+            let capture = writer.0.clone();
+            let mut backend =
+                ColorCompatBackend::new(writer.clone(), ColorDepth::Monochrome, theme.mode);
+            backend.set_theme(*theme_id, theme);
+            let modifiers = Modifier::BOLD | Modifier::UNDERLINED | Modifier::REVERSED;
+            let mut cell = Cell::default();
+            cell.set_symbol("x").set_style(
+                Style::default()
+                    .fg(theme.accent_primary)
+                    .bg(Color::Indexed(4))
+                    .underline_color(Color::Red)
+                    .add_modifier(modifiers),
+            );
+            let mut adapted = cell.clone();
+            adapt_cell_colors(
+                &mut adapted,
+                ColorDepth::Monochrome,
+                theme.mode,
+                *theme_id,
+                &theme,
+                None,
+            );
+            assert_eq!(
+                (adapted.fg, adapted.bg, adapted.underline_color),
+                (Color::Reset, Color::Reset, Color::Reset)
+            );
+            assert_eq!(adapted.modifier, modifiers);
+
+            // Screen-mode switches must carry the same color policy.
+            let mut backend = backend.respawn(writer);
+            backend.draw(std::iter::once((0, 0, &cell))).unwrap();
+            let output = String::from_utf8_lossy(&capture.borrow()).to_string();
+            assert!(output.contains('x'), "{theme_id:?}: {output:?}");
+            for codes in sgr.captures_iter(&output) {
+                for code in codes[1]
+                    .split([';', ':'])
+                    .filter_map(|code| code.parse::<u16>().ok())
+                {
+                    assert!(
+                        !matches!(code, 30..=38 | 40..=48 | 58 | 90..=97 | 100..=107),
+                        "{theme_id:?} emitted color SGR: {output:?}"
+                    );
+                }
+            }
         }
     }
 

@@ -22,9 +22,7 @@ fn mouse(kind: MouseEventKind, area: Rect) -> MouseEvent {
 
 fn setup_member_id(action: ViewAction) -> Option<String> {
     match action {
-        ViewAction::EmitAndClose(ViewEvent::FleetRosterOpenSetupRequested { member_id }) => {
-            Some(member_id)
-        }
+        ViewAction::Emit(ViewEvent::FleetRosterOpenSetupRequested { member_id }) => Some(member_id),
         _ => None,
     }
 }
@@ -227,20 +225,22 @@ fn bare_paging_drives_rows_not_the_detail_pane() {
 }
 
 #[test]
-fn enter_opens_the_setup_wizard_for_members_only() {
-    // Operator row: display-only, no wizard hand-off.
+fn enter_opens_role_assignment_and_keeps_the_roster_underneath() {
+    // Coordinator changes the current session through the shared picker.
     let mut view = built_in_view();
     assert!(view.operator_selected());
     assert!(
-        matches!(view.handle_key(key(KeyCode::Enter)), ViewAction::None),
-        "Enter must be inert on the operator row"
+        matches!(
+            view.handle_key(key(KeyCode::Enter)),
+            ViewAction::Emit(ViewEvent::FleetRosterOpenCoordinatorRequested)
+        ),
+        "Enter opens the Coordinator model picker"
     );
 
-    // Member row: hands off to the setup wizard.
+    // Member assignment retains this roster on the view stack.
     view.handle_key(key(KeyCode::Down));
     let action = view.handle_key(key(KeyCode::Enter));
-    let ViewAction::EmitAndClose(ViewEvent::FleetRosterOpenSetupRequested { member_id }) = action
-    else {
+    let ViewAction::Emit(ViewEvent::FleetRosterOpenSetupRequested { member_id }) = action else {
         panic!("Enter should hand off to the setup wizard");
     };
     assert_eq!(member_id, "manager");
@@ -381,12 +381,9 @@ fn selected_named_fleet_member_shows_edit_affordance() {
         30,
     );
     let text = rows.join("\n");
-    assert!(
-        text.contains("[edit]"),
-        "focused member should advertise editing: {text}"
-    );
+    assert!(text.contains("Thinking"), "{text}");
     assert!(text.contains("Team `Default`"), "{text}");
-    assert!(text.contains("Enter edit"), "{text}");
+    assert!(text.contains("Enter model & thinking"), "{text}");
     assert!(text.contains("Tab workers"), "{text}");
     assert!(text.contains("saved teams"), "{text}");
     // The letter-key wall is gone: one grammar, no `s`, `m`, `w`, PgUp hints.
@@ -561,7 +558,10 @@ fn detail_shows_access_model_and_saved_for() {
         .unwrap()
         .clone();
     assert!(member_access_summary(&reviewer).contains("read-only files"));
-    assert_eq!(member_routing(&reviewer), "same model as this session");
+    assert_eq!(
+        member_routing_with_session(&reviewer, None),
+        "same model as this session"
+    );
 
     // Built-in scout: same Access shape as reviewer.
     let scout = FleetRoster::built_ins_only().get("scout").unwrap().clone();
@@ -577,7 +577,7 @@ fn detail_shows_access_model_and_saved_for() {
     // An explicit model beats the saved-set label, with no "(pinned)" jargon.
     let mut pinned = reviewer.clone();
     pinned.profile.model = Some("glm-5.2".to_string());
-    assert_eq!(member_routing(&pinned), "model glm-5.2");
+    assert_eq!(member_routing_with_session(&pinned, None), "model glm-5.2");
 }
 
 include!("../fleet_roster_capability_tests.rs");
@@ -634,7 +634,10 @@ fn roster_loads_config_members_through_the_shared_merge() {
         FleetRosterView::from_parts(operator(), FleetRoster::load(&config, tmp.path()), None);
     let extra = view.members.iter().find(|m| m.id == "docs-writer").unwrap();
     assert_eq!(extra.origin, ProfileOrigin::Config);
-    assert_eq!(member_routing(extra), "fast model, picked at launch");
+    assert_eq!(
+        member_routing_with_session(extra, None),
+        "fast model, picked at launch"
+    );
 }
 
 #[test]

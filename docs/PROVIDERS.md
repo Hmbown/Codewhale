@@ -712,6 +712,19 @@ overlay and lets DSH resolve its own keys.
 | `modelstudio-coding-plan` | `[providers.modelstudio_coding_plan]` | `MODELSTUDIO_API_KEY`, `DASHSCOPE_API_KEY` | `MODELSTUDIO_CODING_PLAN_BASE_URL`; default `https://coding-intl.dashscope.aliyuncs.com/v1` | `qwen3.8-max` (default); same catalog as Token Plan | Alibaba Cloud Model Studio Coding Plan OpenAI-compatible Chat Completions route. `MODELSTUDIO_CODING_PLAN_MODEL` is accepted. Provider aliases: `modelstudio-coding-plan`, `alibaba-coding-plan`, `dashscope-coding-plan`. |
 | `modelstudio-coding-plan-anthropic` | `[providers.modelstudio_coding_plan_anthropic]` | `MODELSTUDIO_API_KEY`, `DASHSCOPE_API_KEY` | default `https://coding-intl.dashscope.aliyuncs.com/apps/anthropic` | Same model catalog as `modelstudio-coding-plan` | Coding Plan Anthropic-compatible Messages route (`/apps/anthropic`). Provider aliases: `modelstudio-coding-plan-anthropic`, `alibaba-coding-plan-anthropic`. |
 
+StepFun's four coding models are available through both its standard API and
+[Step Plan](https://platform.stepfun.ai/docs/en/step-plan/integrations/reasoning-api).
+Choose the billing route in `/provider`, then the model in `/model`; existing
+Step 3.7 selections remain unchanged. [Step 5 Preview](https://platform.stepfun.ai/docs/en/guides/models/step-5-preview)
+has a 1M context window. Step 5 and Step 3.7 expose low/medium/high reasoning;
+Step 3.5 Flash 2603 exposes low/high; base Step 3.5 uses provider-default reasoning.
+[Published API prices](https://platform.stepfun.ai/docs/en/guides/pricing/details)
+apply only to verified PAYG routes. Step Plan displays subscription allowance.
+Speech, music and image-generation models use separate interfaces and are not
+presented as coding models. Provider video capability metadata does not imply
+that every Codewhale client can attach video.
+
+
 ### OpenCode Zen protocol catalog
 
 Zen Responses and Chat Completions requests authenticate with Bearer
@@ -919,7 +932,7 @@ endpoint when the endpoint supports model listing.
 | `arcee` | `trinity-large-thinking`, `trinity-large-preview`; provider-hinted custom model IDs pass through | yes | yes for `trinity-large-thinking`; no for `trinity-large-preview` |
 | `moonshot` | `kimi-k2.7-code`, `kimi-k2.6` | yes | yes |
 | `zai` | `GLM-5.3`, `GLM-5.3-Flash`, `GLM-5.2`, `GLM-5.1`, `GLM-5-Turbo`; provider-hinted custom model IDs pass through | yes | yes |
-| `stepfun` | `step-3.7-flash` | yes | no |
+| `stepfun` | `step-3.7-flash` (default), `step-5-preview`, `step-3.5-flash`, `step-3.5-flash-2603` | yes | yes |
 | `minimax` | `MiniMax-M3`, `MiniMax-M2.7`, `MiniMax-M2.7-highspeed`, `MiniMax-M2.5`, `MiniMax-M2.5-highspeed`, `MiniMax-M2.1`, `MiniMax-M2.1-highspeed`, `MiniMax-M2` | yes | yes |
 | `minimax-anthropic` | `MiniMax-M3`, `MiniMax-M2.7` | yes | yes |
 | `sglang` | `deepseek-ai/DeepSeek-V4-Pro`, `deepseek-ai/DeepSeek-V4-Flash` | yes | yes |

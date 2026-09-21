@@ -247,6 +247,15 @@ jobs:
             (cd "integrations/${bridge}" && npm test)
           done
 
+      - name: Build computer-use test desktop
+        # Spawn assertions have short request deadlines; keep the cold image
+        # build outside those deadlines and fail image preparation explicitly.
+        timeout-minutes: 10
+        run: >-
+          docker build --tag codewhale-cu-linux
+          --file crates/tui/plugins/computer-use/docker/Dockerfile
+          crates/tui/plugins/computer-use
+
       - name: Run computer-use plugin suites
         # The bundled plugin is dependency-free too; its suites cover the
         # manifest contract, the registry, the exec/ssh transport, the four

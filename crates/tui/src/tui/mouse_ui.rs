@@ -440,7 +440,7 @@ pub(crate) fn handle_composer_mouse(app: &mut App, mouse: MouseEvent) -> bool {
     }
     // Resolve the border- and submit-aware input plane through the same
     // persistent prompt geometry used by rendering, cursor placement, and
-    // viewport bookkeeping. The frame records it after reserving `[↑]`.
+    // viewport bookkeeping. The frame records it after reserving `[↵]`.
     let input_plane = app.viewport.last_composer_content.unwrap_or(area);
     let text_area =
         crate::tui::widgets::composer_content_geometry(input_plane, app.is_history_search_active())
@@ -2439,7 +2439,7 @@ mod tests {
         let area = Rect::new(0, 20, 80, 4);
         app.viewport.last_composer_area = Some(area);
         // Match the frame's submit-aware input plane: x=74 stays blank,
-        // then the shared `[↑]` target begins at x=75.
+        // then the shared `[↵]` target begins at x=75.
         app.viewport.last_composer_content = Some(Rect::new(1, 21, 73, 2));
         let submit = crate::tui::widgets::active_composer_submit_rect(&app, area)
             .expect("enclosed composer submit");

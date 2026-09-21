@@ -8352,3 +8352,158 @@ fn retriable_call_error_covers_closed_transports() {
         "tool returned an application error"
     )));
 }
+
+// Executed both as an ordinary no-op test and as an isolated OS-process worker.
+#[test]
+fn mcp_transaction_child_worker() {
+    let Some(path) = std::env::var_os("CW_MCP_TRANSACTION_TEST_PATH") else {
+        return;
+    };
+    let path = PathBuf::from(path);
+    let mode = std::env::var("CW_MCP_TRANSACTION_TEST_MODE").unwrap();
+    if mode == "init" {
+        init_config(&path, false).unwrap();
+        return;
+    }
+    mutate_config(&path, None, |cfg| {
+        if mode == "hold" {
+            fs::write(path.with_extension("entered"), b"ready")?;
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while !path.with_extension("release").exists() {
+                anyhow::ensure!(
+                    std::time::Instant::now() < deadline,
+                    "fixture release timed out"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        let server: McpServerConfig =
+            serde_json::from_value(serde_json::json!({"command":"fixture-command"}))?;
+        cfg.servers.insert(mode.clone(), server);
+        Ok(())
+    })
+    .unwrap();
+}
+
+fn mcp_transaction_spawn_worker(path: &Path, mode: &str) -> std::process::Child {
+    std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "mcp::tests::mcp_transaction_child_worker",
+            "--nocapture",
+        ])
+        .env("CW_MCP_TRANSACTION_TEST_PATH", path)
+        .env("CW_MCP_TRANSACTION_TEST_MODE", mode)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap()
+}
+
+#[test]
+fn mcp_transaction_independent_process_writers_and_init_preserve_updates() {
+    for mode in ["second", "init"] {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("mcp.json");
+        let first = mcp_transaction_spawn_worker(&path, "hold");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !path.with_extension("entered").exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "first worker did not acquire lock"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // On Unix the competing process uses an alias of the same directory.
+        #[cfg(unix)]
+        let other_path = {
+            let alias = root.path().join("alias");
+            std::os::unix::fs::symlink(root.path(), &alias).unwrap();
+            alias.join("mcp.json")
+        };
+        #[cfg(not(unix))]
+        let other_path = path.clone();
+        let mut second = mcp_transaction_spawn_worker(&other_path, mode);
+        std::thread::sleep(Duration::from_millis(40));
+        assert!(
+            second.try_wait().unwrap().is_none(),
+            "second writer must wait for shared lock"
+        );
+        fs::write(path.with_extension("release"), b"go").unwrap();
+        for child in [first, second] {
+            let result = child.wait_with_output().unwrap();
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+        let cfg = load_config(&path).unwrap();
+        assert!(cfg.servers.contains_key("hold"));
+        if mode == "second" {
+            assert!(cfg.servers.contains_key("second"));
+        }
+        assert!(
+            !cfg.servers.contains_key("example"),
+            "init must not overwrite a concurrent add"
+        );
+    }
+}
+
+#[test]
+fn mcp_transaction_preserves_unknown_fields_alias_and_rejects_stale_revision() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("mcp.json");
+    fs::write(&path, r#"{"owner_note":{"keep":true},"timeouts":{"connect_timeout":10,"custom":42},"mcpServers":{"one":{"command":"one","extension":{"keep":1}}}}"#).unwrap();
+    let before = read_config_revision(&path).unwrap();
+    let (_, after) = mutate_config(&path, Some(&before), |cfg| {
+        cfg.servers.get_mut("one").unwrap().enabled = false;
+        Ok(())
+    })
+    .unwrap();
+    assert_ne!(before, after);
+    let raw: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    assert_eq!(raw["owner_note"]["keep"], true);
+    assert_eq!(raw["timeouts"]["custom"], 42);
+    assert_eq!(raw["mcpServers"]["one"]["extension"]["keep"], 1);
+    assert!(raw.get("servers").is_none());
+    let bytes = fs::read(&path).unwrap();
+    let err = mutate_config(&path, Some(&before), |cfg| {
+        cfg.servers.clear();
+        Ok(())
+    })
+    .unwrap_err();
+    assert!(err.is::<McpRevisionConflict>());
+    assert_eq!(fs::read(&path).unwrap(), bytes);
+    assert_eq!(
+        mutate_config(&path, Some(&after), |_| Ok(())).unwrap().1,
+        after
+    );
+    assert_eq!(
+        fs::read(&path).unwrap(),
+        bytes,
+        "no-op must not rewrite the document"
+    );
+}
+
+#[test]
+fn mcp_transaction_fails_closed_for_malformed_document_and_symlink() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("mcp.json");
+    fs::write(&path, "{private-malformed-fixture").unwrap();
+    let err = mutate_config(&path, None, |_| Ok(())).unwrap_err();
+    assert!(!err.to_string().contains("private-malformed-fixture"));
+    assert!(init_config(&path, true).is_err());
+    assert_eq!(
+        fs::read_to_string(&path).unwrap(),
+        "{private-malformed-fixture"
+    );
+    #[cfg(unix)]
+    {
+        let link = root.path().join("linked.json");
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+        assert!(mutate_config(&link, None, |_| Ok(())).is_err());
+        assert!(init_config(&link, true).is_err());
+    }
+}

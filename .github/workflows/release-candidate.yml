@@ -88,6 +88,13 @@ jobs:
       # resolve already proved expected_sha equals GITHUB_SHA. Do not
       # interpolate that SHA into checkout or the npm cache key.
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          # `check:facts` derives each model's `addedAt` from the commit date
+          # on which its id first appeared in the model declaration paths
+          # (web/scripts/facts-lib.mjs). A shallow checkout collapses every
+          # date to the tip commit and the committed facts always read as
+          # stale; web.yml and ci.yml pin depth 0 for the same reason.
+          fetch-depth: 0
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 22

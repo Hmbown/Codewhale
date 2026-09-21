@@ -53,11 +53,11 @@ fn current_thread_owns_contended_env_lock() -> bool {
     scope.owner == Some(current) || scope.adopted.contains(&current)
 }
 
-/// Proof that the calling thread owns a live [`lock_test_env`] scope, handed to
+/// Proof that the calling thread belongs to a live [`lock_test_env`] scope, handed to
 /// a worker thread so it can join that scope with [`join_env_scope`].
 ///
-/// Returns `None` when the caller is not the owner, so a ticket can never be
-/// minted on behalf of a test that did not seal the environment.
+/// Owners and adopted workers can pass the same live generation to child
+/// workers. Foreign threads cannot mint a ticket for a test they did not join.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct EnvScopeTicket {
     generation: u64,
@@ -92,7 +92,8 @@ pub(crate) fn current_env_scope_generation() -> Option<u64> {
 
 pub(crate) fn env_scope_ticket() -> Option<EnvScopeTicket> {
     let scope = lock_env_scope();
-    (scope.owner == Some(std::thread::current().id())).then_some(EnvScopeTicket {
+    let current = std::thread::current().id();
+    (scope.owner == Some(current) || scope.adopted.contains(&current)).then_some(EnvScopeTicket {
         generation: scope.generation,
     })
 }
@@ -227,6 +228,40 @@ mod tests {
     use super::{lock_test_env, with_test_env_lock_if_uncontended};
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn adopted_worker_can_pass_only_its_live_environment_generation() {
+        let owner = lock_test_env();
+        let ticket = super::env_scope_ticket().unwrap();
+        let nested = std::thread::spawn(move || {
+            assert!(
+                super::env_scope_ticket().is_none(),
+                "foreign thread has no authority"
+            );
+            let _membership = super::join_env_scope(Some(ticket)).unwrap();
+            let child_ticket =
+                super::env_scope_ticket().expect("adopted worker can enroll its child");
+            std::thread::spawn(move || {
+                let _membership = super::join_env_scope(Some(child_ticket)).unwrap();
+                assert_eq!(
+                    super::current_env_scope_generation(),
+                    Some(child_ticket.generation())
+                );
+                assert_eq!(super::with_test_env_lock(|| 7), 7);
+                child_ticket
+            })
+            .join()
+            .unwrap()
+        })
+        .join()
+        .unwrap();
+        drop(owner);
+        let _next = lock_test_env();
+        assert!(
+            super::join_env_scope(Some(nested)).is_none(),
+            "old generation cannot join the next test"
+        );
+    }
 
     /// The lock-order inversion this helper exists to break.
     ///

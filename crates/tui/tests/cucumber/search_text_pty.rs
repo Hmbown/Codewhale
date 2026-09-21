@@ -76,7 +76,7 @@ fn search_text_stays_in_modal_and_out_of_composer() {
             .split_once('❯')
             .unwrap()
             .1
-            .split("[↑]")
+            .split("[↵]")
             .next()
             .unwrap()
             .trim_end();

@@ -3817,6 +3817,7 @@ mod tests {
         assert_eq!(session.journal_message_stamps(), vec![t0, t1]);
         // A save with no stamps keeps the old behavior: entries collapse to
         // save time rather than inventing times.
+        let before_save = Utc::now();
         let unstamped = create_saved_session_with_id_and_mode(
             "unstamped".to_string(),
             &messages,
@@ -3828,11 +3829,10 @@ mod tests {
         );
         let journal = unstamped.journal.as_ref().expect("journal");
         assert!(
-            journal
-                .entries
-                .iter()
-                .all(|entry| entry.created_at >= unstamped.metadata.created_at),
-            "without stamps, entries stamp at save as before"
+            journal.entries.iter().all(|entry| {
+                entry.created_at >= before_save && entry.created_at <= unstamped.metadata.created_at
+            }),
+            "unstamped entries are created during save, before snapshot metadata"
         );
     }
 

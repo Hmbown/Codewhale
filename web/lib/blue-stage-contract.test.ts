@@ -44,14 +44,14 @@ describe("GPUI public-surface contract", () => {
     expect(cssHexIn(ROOT, "ink-soft")).toBe("#4a414c");
     expect(cssHexIn(ROOT, "ink-mute")).toBe("#6b606e");
     // Action on paper is the GPUI light primary; hover sinks to its hover.
-    expect(cssHexIn(ROOT, "indigo")).toBe("#245bc7");
-    expect(cssHexIn(ROOT, "indigo-deep")).toBe("#174aa9");
+    expect(cssHexIn(ROOT, "indigo")).toBe("#006684");
+    expect(cssHexIn(ROOT, "indigo-deep")).toBe("#00536d");
     expect(cssHexIn(ROOT, "mark-ink")).toBe("#302832");
     // The deep field is always the stage's darkest, and code plates keep the
     // stage deep on either side of the waterline.
     expect(cssHexIn(ROOT, "ocean-deep")).toBe("#1a181c");
-    expect(cssHexIn(ROOT, "action-on-dark")).toBe("#90b9ff");
-    expect(cssHexIn(ROOT, "ocean-current")).toBe("#90b9ff");
+    expect(cssHexIn(ROOT, "action-on-dark")).toBe("#67b8d6");
+    expect(cssHexIn(ROOT, "ocean-current")).toBe("#67b8d6");
     expect(cssHexIn(ROOT, "code-bg")).toBe("#1a181c");
   });
 
@@ -66,7 +66,7 @@ describe("GPUI public-surface contract", () => {
     expect(cssHexIn(BELOW_WATERLINE, "ink")).toBe("#f2ece5");
     expect(cssHexIn(BELOW_WATERLINE, "ink-soft")).toBe("#b0a7b2");
     expect(cssHexIn(BELOW_WATERLINE, "ink-mute")).toBe("#7e7583");
-    expect(cssHexIn(BELOW_WATERLINE, "indigo")).toBe("#90b9ff");
+    expect(cssHexIn(BELOW_WATERLINE, "indigo")).toBe("#67b8d6");
     expect(cssHexIn(BELOW_WATERLINE, "jade")).toBe("#9ec7b2");
     expect(cssHexIn(BELOW_WATERLINE, "signal-gold")).toBe("#d6c78f");
   });

@@ -20,7 +20,7 @@ export const home: HomeDict = {
   shotPreview: "Xem trước terminal",
   shotBuild: "bản phát triển v{version}",
   screenshotAlt:
-    "Terminal Codewhale v0.9.12, bản dựng 171acee689aa: một phiên mới với biểu tượng cá voi, ô soạn tin nhắn, Full Access và chế độ Operate, hai tác vụ đã lên lịch, 21 máy chủ MCP đang kết nối và GLM-5.3 được đặt ở mức nỗ lực tối đa.",
+    "Bản phát triển Codewhale v{version}: dấu cá voi, phiên mới, ô nhập tin nhắn, quyền Ask, chế độ Work và trạng thái mô hình. Hiển thị từ đầu ra thực của một terminal biệt lập.",
   latestRelease: "Bản phát hành mới nhất {tag}",
   releaseUnavailable: "Không có trạng thái phát hành",
   currentSource: "Mã nguồn",

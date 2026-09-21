@@ -704,8 +704,32 @@ fn deterministic_composition_advisory(
     Some(CompositionAdvisory { request, proposal })
 }
 
+/// A role assignment edits only route keys in the original document. The
+/// source and possible destinations are captured before opening the picker.
+struct RouteAssignment {
+    editor_id: uuid::Uuid,
+    id: String,
+    template: toml::Table,
+    original_member: crate::fleet::profile::AgentProfile,
+    source: Option<(PathBuf, String)>,
+    source_scope: Option<FleetProfileScope>,
+    destinations: Vec<(PathBuf, Option<String>)>,
+    provider: Option<String>,
+    model: Option<String>,
+    reasoning: Option<String>,
+}
+
+fn assignment_source(path: &Path) -> Result<Option<String>, String> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Ok(Some(text)),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(format!("Cannot read {}: {err}", path.display())),
+    }
+}
+
 pub struct FleetSetupView {
     snapshot: FleetSetupSnapshot,
+    assignment: Option<RouteAssignment>,
     step: Step,
     role_idx: usize,
     model_idx: usize,
@@ -825,6 +849,261 @@ impl FleetSetupView {
         Self::from_snapshot_for_role(FleetSetupSnapshot::from_app(app, config), role)
     }
 
+    pub(crate) fn new_for_route_assignment(
+        app: &App,
+        config: &Config,
+        id: &str,
+    ) -> Result<Self, String> {
+        let roster = crate::fleet::identity::load_effective_roster(
+            &config.fleet_config(),
+            &app.workspace,
+            Some(app.plugin_registry.as_ref()),
+        );
+        let member = roster
+            .members()
+            .iter()
+            .find(|member| member.id == id)
+            .ok_or_else(|| "This role is no longer available. Reopen Fleet.".to_string())?;
+        if matches!(
+            member.origin,
+            crate::fleet::roster::ProfileOrigin::Plugin
+                | crate::fleet::roster::ProfileOrigin::Config
+        ) {
+            return Err(format!(
+                "{} is managed by {} ({}). Change its model there; copying it into a profile would discard its original controls.",
+                member.id,
+                member.origin,
+                member.source.display()
+            ));
+        }
+        if member.origin == crate::fleet::roster::ProfileOrigin::BuiltIn
+            && (member.profile.permissions != Default::default()
+                || member.profile.delegation != Default::default())
+        {
+            return Err("This role has controls that cannot be copied into a profile. Edit its defining configuration.".into());
+        }
+        let mut view = Self::new_for_role(app, config, id);
+        let source_scope = match member.origin {
+            crate::fleet::roster::ProfileOrigin::Workspace => Some(FleetProfileScope::Project),
+            crate::fleet::roster::ProfileOrigin::Personal => Some(FleetProfileScope::Personal),
+            _ => None,
+        };
+        let source = if source_scope.is_some() {
+            Some((
+                member.source.clone(),
+                assignment_source(&member.source)?
+                    .ok_or_else(|| "The saved role disappeared. Reopen Fleet.".to_string())?,
+            ))
+        } else {
+            None
+        };
+        let template = if let Some((_, text)) = &source {
+            toml::from_str::<toml::Table>(text).map_err(|err| err.to_string())?
+        } else {
+            let draft = crate::fleet::profile::FleetProfileDraft {
+                id: member.id.clone(),
+                display_name: member.display_name.clone(),
+                description: member.description.clone(),
+                role_hint: member.profile.role.name.clone(),
+                model_class_hint: Some(member.profile.loadout.as_str().to_string()),
+                model: member.profile.model.clone(),
+                provider: member.profile.provider.clone(),
+                reasoning_effort: member.profile.reasoning_effort.clone(),
+                instructions: member.profile.role.instructions.clone(),
+            };
+            toml::from_str::<toml::Table>(&draft.render_toml()).map_err(|err| err.to_string())?
+        };
+        view.assignment = Some(RouteAssignment {
+            editor_id: uuid::Uuid::new_v4(),
+            id: member.id.clone(),
+            template,
+            original_member: member.clone(),
+            source,
+            source_scope,
+            destinations: Vec::new(),
+            provider: member.profile.provider.clone(),
+            model: member.profile.model.clone(),
+            reasoning: member.profile.reasoning_effort.clone(),
+        });
+        view.refresh_destinations();
+        let targets = view
+            .destinations
+            .as_ref()
+            .into_iter()
+            .flatten()
+            .filter(|destination| destination.unavailable_reason.is_none())
+            .map(|destination| {
+                Ok((
+                    destination.target.clone(),
+                    assignment_source(&destination.target)?,
+                ))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        view.assignment.as_mut().unwrap().destinations = targets;
+        view.step = Step::Destination;
+        Ok(view)
+    }
+
+    pub(crate) fn route_pick_request(&self) -> ViewAction {
+        self.assignment
+            .as_ref()
+            .map_or(ViewAction::None, |assignment| {
+                ViewAction::Emit(ViewEvent::FleetProfileRoutePickRequested {
+                    editor_id: assignment.editor_id,
+                })
+            })
+    }
+
+    pub(crate) fn assignment_context(&self) -> (String, String) {
+        (self.selected_role(), self.saves_to_line())
+    }
+
+    pub(crate) fn route_selection(
+        &self,
+        editor_id: uuid::Uuid,
+    ) -> Option<super::fleet_detail::FleetRouteSelection> {
+        let assignment = self
+            .assignment
+            .as_ref()
+            .filter(|assignment| assignment.editor_id == editor_id)?;
+        Some(super::fleet_detail::FleetRouteSelection {
+            provider: assignment.provider.clone(),
+            model: assignment.model.clone(),
+            reasoning: assignment.reasoning.as_deref().and_then(|value| {
+                crate::reasoning_preference::ReasoningEffort::parse_strict(value).ok()
+            }),
+            allow_inherit: true,
+        })
+    }
+
+    pub(crate) fn accept_route(
+        &mut self,
+        editor_id: uuid::Uuid,
+        provider: String,
+        model: String,
+        reasoning: Option<crate::reasoning_preference::ReasoningEffort>,
+    ) -> bool {
+        let Some(assignment) = self
+            .assignment
+            .as_mut()
+            .filter(|assignment| assignment.editor_id == editor_id)
+        else {
+            return false;
+        };
+        assignment.provider = (model != "auto").then_some(provider);
+        assignment.model = (model != "auto").then_some(model);
+        assignment.reasoning = reasoning.map(|effort| effort.as_setting().to_string());
+        self.step = if self.scope_decided {
+            Step::Review
+        } else {
+            Step::Destination
+        };
+        self.refresh_destinations();
+        true
+    }
+
+    pub(crate) fn commit_route_assignment(
+        &self,
+        editor_id: uuid::Uuid,
+        app: &App,
+        config: &Config,
+    ) -> Result<String, String> {
+        let assignment = self
+            .assignment
+            .as_ref()
+            .filter(|assignment| assignment.editor_id == editor_id)
+            .ok_or_else(|| "This assignment is no longer open.".to_string())?;
+        if !matches!(
+            resolve_fleet_setup_edit_target(&app.workspace),
+            Ok(FleetSetupEditTarget::LegacyProfiles)
+        ) {
+            return Err("The selected team changed. Reopen Fleet before saving.".into());
+        }
+        let roster = crate::fleet::identity::load_effective_roster(
+            &config.fleet_config(),
+            &app.workspace,
+            Some(app.plugin_registry.as_ref()),
+        );
+        if !roster
+            .members()
+            .iter()
+            .any(|member| member == &assignment.original_member)
+        {
+            return Err(
+                "This role changed while you were choosing. Reopen Fleet before saving.".into(),
+            );
+        }
+        if !self.scope_decided || !self.selected_destination_available() {
+            return Err("Choose an available save destination first.".into());
+        }
+        if self.profile_scope == FleetProfileScope::Project
+            && !crate::fleet::roster::project_agent_profiles_enabled()
+        {
+            return Err("Project profiles are disabled for this launch.".into());
+        }
+        if let Some(provider) = assignment.provider.as_deref()
+            && let Some(reason) = crate::commands::fleet_provider_rejection(app, config, provider)
+        {
+            return Err(reason);
+        }
+        if let Some((path, expected)) = &assignment.source
+            && assignment_source(path)?.as_ref() != Some(expected)
+        {
+            return Err("This role changed on disk. Reopen Fleet before saving.".into());
+        }
+        let target = &self
+            .destination_for(self.profile_scope)
+            .ok_or("Save destination unavailable")?
+            .target;
+        let expected = assignment
+            .destinations
+            .iter()
+            .find(|(path, _)| path == target)
+            .ok_or("Save destination changed. Reopen Fleet.")?;
+        if assignment_source(target)? != expected.1 {
+            return Err("The destination changed on disk. Reopen Fleet before saving.".into());
+        }
+        let dir = target.parent().ok_or("Invalid profile destination")?;
+        let identities = crate::fleet::profile::load_agent_profile_identities_from_dir(dir)
+            .map_err(|err| err.to_string())?;
+        if identities.iter().any(|profile| {
+            profile.id.eq_ignore_ascii_case(&assignment.id) && profile.source != *target
+        }) {
+            return Err("Another file already defines this role. Reopen Fleet.".into());
+        }
+        let mut table = assignment.template.clone();
+        for alias in [
+            "model",
+            "model_hint",
+            "model_id",
+            "provider",
+            "reasoning_effort",
+            "thinking",
+            "reasoning",
+        ] {
+            table.remove(alias);
+        }
+        for (key, value) in [
+            ("model", &assignment.model),
+            ("provider", &assignment.provider),
+            ("reasoning_effort", &assignment.reasoning),
+        ] {
+            if let Some(value) = value {
+                table.insert(key.into(), toml::Value::String(value.clone()));
+            }
+        }
+        table.insert("loadout".into(), toml::Value::String("inherit".into()));
+        let text = toml::to_string_pretty(&table).map_err(|err| err.to_string())?;
+        let mut transaction = codewhale_config::persistence::SetupTransaction::new();
+        transaction.stage(target.clone(), text.into_bytes());
+        transaction.commit().map_err(|err| err.to_string())?;
+        Ok(format!(
+            "{} model saved · {}",
+            assignment.id,
+            target.display()
+        ))
+    }
+
     fn from_snapshot_for_role(snapshot: FleetSetupSnapshot, role: &str) -> Self {
         let mut view = Self::from_snapshot(snapshot);
         let role = public_role_label(role);
@@ -912,6 +1191,7 @@ impl FleetSetupView {
         let composition = deterministic_composition_advisory(&snapshot.available_models);
         Self {
             snapshot,
+            assignment: None,
             step: Step::Role,
             role_idx: 0,
             model_idx: 0,
@@ -986,7 +1266,10 @@ impl FleetSetupView {
 
     /// The planner role chosen (drives the profile file name and `role_hint`).
     fn selected_role(&self) -> String {
-        ROLES[self.role_idx.min(ROLES.len() - 1)].label.to_string()
+        self.assignment
+            .as_ref()
+            .map(|assignment| assignment.id.clone())
+            .unwrap_or_else(|| ROLES[self.role_idx.min(ROLES.len() - 1)].label.to_string())
     }
 
     fn has_composition_for_selected_role(&self) -> bool {
@@ -1197,6 +1480,9 @@ impl FleetSetupView {
     /// independent of the parent/current provider (#4093) — or `None` when
     /// `inherit` is selected (reuse the session route).
     fn selected_route(&self) -> Option<(String, String)> {
+        if let Some(assignment) = &self.assignment {
+            return assignment.provider.clone().zip(assignment.model.clone());
+        }
         let real_idx = self.real_model_idx();
         if real_idx == 0 {
             return None;
@@ -1227,6 +1513,9 @@ impl FleetSetupView {
     }
 
     fn selected_reasoning_effort(&self) -> Option<String> {
+        if let Some(assignment) = &self.assignment {
+            return assignment.reasoning.clone();
+        }
         if self.thinking_idx == 0 {
             return None;
         }
@@ -1389,11 +1678,19 @@ impl FleetSetupView {
     fn refresh_destinations(&mut self) {
         let file = format!("{}.toml", profile_file_stem(&self.selected_role()));
         let statuses = DESTINATION_ORDER.map(|scope| {
+            let file = self
+                .assignment
+                .as_ref()
+                .filter(|assignment| assignment.source_scope == Some(scope))
+                .and_then(|assignment| assignment.source.as_ref())
+                .and_then(|(path, _)| path.file_name())
+                .and_then(|name| name.to_str())
+                .unwrap_or(&file);
             destination_status(
                 scope,
                 &self.snapshot.workspace,
                 &self.snapshot.personal_profile_dir,
-                &file,
+                file,
                 self.snapshot.project_profiles_enabled,
                 self.snapshot.locale,
             )
@@ -1515,6 +1812,11 @@ impl FleetSetupView {
             self.replace_armed = true;
             return ViewAction::None;
         }
+        if let Some(assignment) = &self.assignment {
+            return ViewAction::Emit(ViewEvent::FleetProfileRouteCommitRequested {
+                editor_id: assignment.editor_id,
+            });
+        }
         match self.model_draft.clone() {
             Some(draft) => ViewAction::EmitAndClose(ViewEvent::FleetProfileDraftCommitRequested {
                 draft,
@@ -1527,6 +1829,9 @@ impl FleetSetupView {
     /// Step back toward the first screen. Returns `None` at the first step (the
     /// host closes the modal via Esc instead).
     fn back(&mut self) -> ViewAction {
+        if self.assignment.is_some() {
+            return self.route_pick_request();
+        }
         match self.step {
             Step::Role => ViewAction::None,
             Step::Composition => {
@@ -1624,7 +1929,9 @@ impl FleetSetupView {
                 hints.push(ActionHint::new("Enter", "activate"));
                 hints.push(ActionHint::new("↑/↓", "scroll"));
                 hints.push(ActionHint::new("t", "thinking"));
-                if self.model_draft.is_some() {
+                if self.assignment.is_some() {
+                    // Route changes do not regenerate role instructions.
+                } else if self.model_draft.is_some() {
                     hints.push(ActionHint::new("m", "redraft"));
                 } else if self.snapshot.provider_ready {
                     hints.push(ActionHint::new("m", "model draft"));
@@ -1740,6 +2047,12 @@ impl ModalView for FleetSetupView {
         if let Some(motion) = crate::tui::list_nav::motion(&key)
             && self.apply_motion(motion)
         {
+            return ViewAction::None;
+        }
+        if self.assignment.is_some() && matches!(key.code, KeyCode::Char('t')) {
+            return self.route_pick_request();
+        }
+        if self.assignment.is_some() && matches!(key.code, KeyCode::Char('m')) {
             return ViewAction::None;
         }
         match key.code {
@@ -1868,7 +2181,13 @@ impl ModalView for FleetSetupView {
 
         // Header (title + subtitle + "Saves to" chip) above the step body.
         // In the Compact tier the subtitle is dropped so the chip survives.
-        let header_rows = if content.height < 12 { 2 } else { 3 };
+        let header_rows = if content.height < 4 {
+            1
+        } else if content.height < 12 {
+            2
+        } else {
+            3
+        };
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Length(header_rows), Constraint::Min(1)])
@@ -1980,6 +2299,12 @@ impl FleetSetupView {
             Step::Destination => (
                 Cow::Owned(tr(self.snapshot.locale, MessageId::FleetDestStepTitle).into_owned()),
                 Cow::Owned(tr(self.snapshot.locale, MessageId::FleetDestStepSubtitle).into_owned()),
+            ),
+            Step::Review if self.assignment.is_some() => (
+                Cow::Owned(format!("Review {} model", self.selected_role())),
+                Cow::Borrowed(
+                    "Save this role's model and thinking; the session model stays unchanged.",
+                ),
             ),
             Step::Review if self.model_draft.is_some() => (
                 Cow::Borrowed("Save profile"),
@@ -2157,6 +2482,25 @@ impl FleetSetupView {
             .split(area);
         self.render_review_actions(rows[0], buf);
         let body = rows[1];
+
+        if let Some(assignment) = &self.assignment {
+            let model = assignment
+                .model
+                .as_deref()
+                .unwrap_or("Follow current session");
+            let provider = assignment.provider.as_deref().unwrap_or("session provider");
+            let thinking = assignment
+                .reasoning
+                .as_deref()
+                .unwrap_or("Follow current session");
+            let text = format!(
+                "Role: {}\nModel: {model} · {provider}\nThinking: {thinking}\n{}\n\nOnly the model and thinking assignment changes. Existing name, description, instructions, tools and permissions are preserved. The current session model stays unchanged.",
+                assignment.id,
+                self.saves_to_line()
+            );
+            render_scrollable_text(body, buf, &text, self.review_scroll);
+            return;
+        }
 
         // A ratify-ready draft is on screen: show the exact TOML preview
         // inline, scrolled by the same `review_scroll` state, so the save
@@ -2427,10 +2771,10 @@ fn render_choice_step(
             .split(area);
         (cols[0], cols[1])
     } else {
-        let list_height = (choices.len() as u16).min(area.height.saturating_sub(1).max(1));
+        let list_height = (choices.len() as u16).min(area.height);
         let rows = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Length(list_height), Constraint::Min(1)])
+            .constraints([Constraint::Length(list_height), Constraint::Min(0)])
             .split(area);
         (rows[0], rows[1])
     };
@@ -2523,10 +2867,10 @@ fn register_choice_hitboxes(
             ])
             .split(area)[0]
     } else {
-        let list_height = (choice_count as u16).min(area.height.saturating_sub(1).max(1));
+        let list_height = (choice_count as u16).min(area.height);
         Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Length(list_height), Constraint::Min(1)])
+            .constraints([Constraint::Length(list_height), Constraint::Min(0)])
             .split(area)[0]
     };
     let visible = choice_count.min(usize::from(list_area.height));
@@ -2637,6 +2981,122 @@ mod tests {
     use unicode_width::UnicodeWidthStr;
 
     const BLOCKER_SIZES: [(u16, u16); 5] = [(80, 24), (89, 50), (100, 30), (120, 32), (160, 40)];
+
+    #[test]
+    fn role_assignment_preserves_profile_fields_and_rejects_stale_source() {
+        let _env = crate::test_support::lock_test_env();
+        let workspace = tempfile::tempdir().unwrap();
+        let directory = workspace
+            .path()
+            .join(crate::fleet::profile::WORKSPACE_AGENT_PROFILE_DIR);
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("different-file-name.toml");
+        let original = r#"id = "custom-reviewer"
+display_name = "My reviewer"
+description = "Keep this description"
+role_hint = "reviewer"
+loadout = "inherit"
+model = "previous-model"
+provider = "deepseek"
+[instructions]
+text = "Keep these precise instructions"
+[tools]
+posture = "read-only"
+[permissions]
+allow_shell = false
+trust = false
+approval_required = true
+"#;
+        std::fs::write(&path, original).unwrap();
+        let config = Config::default();
+        let app = App::new(
+            crate::test_support::test_tui_options(workspace.path()),
+            &config,
+        );
+        let mut view =
+            FleetSetupView::new_for_route_assignment(&app, &config, "custom-reviewer").unwrap();
+        let editor_id = view.assignment.as_ref().unwrap().editor_id;
+        assert_eq!(view.selected_role(), "custom-reviewer");
+        assert_eq!(
+            view.destination_for(FleetProfileScope::Project)
+                .unwrap()
+                .target,
+            path
+        );
+        assert!(view.accept_route(
+            editor_id,
+            "deepseek".into(),
+            "auto".into(),
+            Some(crate::reasoning_preference::ReasoningEffort::High)
+        ));
+        assert_eq!(view.step, Step::Review);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            original,
+            "picker/review must not write"
+        );
+        view.commit_route_assignment(editor_id, &app, &config)
+            .unwrap();
+        let before: toml::Table = toml::from_str(original).unwrap();
+        let after: toml::Table = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        for name in [
+            "id",
+            "display_name",
+            "description",
+            "role_hint",
+            "instructions",
+            "tools",
+            "permissions",
+        ] {
+            assert_eq!(
+                after.get(name),
+                before.get(name),
+                "{name} changed during route assignment"
+            );
+        }
+        assert!(!after.contains_key("model") && !after.contains_key("provider"));
+        assert_eq!(after["reasoning_effort"].as_str(), Some("high"));
+        let mut stale =
+            FleetSetupView::new_for_route_assignment(&app, &config, "custom-reviewer").unwrap();
+        let stale_id = stale.assignment.as_ref().unwrap().editor_id;
+        stale.accept_route(stale_id, "deepseek".into(), "auto".into(), None);
+        let changed = format!(
+            "{}\n# Another editor changed this file\n",
+            std::fs::read_to_string(&path).unwrap()
+        );
+        std::fs::write(&path, &changed).unwrap();
+        assert!(
+            stale
+                .commit_route_assignment(stale_id, &app, &config)
+                .is_err()
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), changed);
+    }
+
+    #[test]
+    fn builtin_role_assignment_requires_destination_and_rejects_new_override() {
+        let _env = crate::test_support::lock_test_env();
+        let workspace = tempfile::tempdir().unwrap();
+        let config = Config::default();
+        let app = App::new(
+            crate::test_support::test_tui_options(workspace.path()),
+            &config,
+        );
+        let mut view = FleetSetupView::new_for_route_assignment(&app, &config, "manager").unwrap();
+        let id = view.assignment.as_ref().unwrap().editor_id;
+        view.accept_route(id, "deepseek".into(), "auto".into(), None);
+        assert_eq!(view.step, Step::Destination);
+        assert!(!view.scope_decided);
+        assert!(view.commit_route_assignment(id, &app, &config).is_err());
+        let directory = workspace
+            .path()
+            .join(crate::fleet::profile::WORKSPACE_AGENT_PROFILE_DIR);
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join("manager.toml"), "id = \"manager\"\n").unwrap();
+        view.choose_destination(FleetProfileScope::Personal);
+        view.refresh_destinations();
+        assert!(view.commit_route_assignment(id, &app, &config).is_err());
+    }
 
     fn snapshot() -> FleetSetupSnapshot {
         FleetSetupSnapshot {

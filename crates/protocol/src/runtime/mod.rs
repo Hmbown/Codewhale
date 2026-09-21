@@ -56,6 +56,10 @@ pub struct RuntimeCapabilities {
     #[serde(default)]
     pub account_session: bool,
     pub threads: bool,
+    /// Explicit per-thread shell opt-in is checked against loaded policy and
+    /// cannot broaden a conversation while it has an active turn.
+    #[serde(default)]
+    pub thread_shell_consent: bool,
     pub turns: bool,
     /// `POST /v1/threads/{id}/turns` accepts a durable, thread-scoped
     /// `operation_key` and returns the original turn for exact retries.
@@ -114,6 +118,24 @@ pub struct RuntimeCapabilities {
     /// Durable, workspace-scoped cross-task Agent Mail endpoints and events.
     #[serde(default)]
     pub agent_mail: bool,
+    /// `GET /v1/terminal/{name}/output` — the resumable byte stream over a
+    /// persistent Engine-owned terminal session, with absolute cursors.
+    #[serde(default)]
+    pub terminal_stream: bool,
+    /// `POST /v1/terminal/{name}/input` — bytes into the live session.
+    #[serde(default)]
+    pub terminal_input: bool,
+    /// `POST /v1/terminal/{name}/resize` — the window the child draws for.
+    #[serde(default)]
+    pub terminal_resize: bool,
+    /// `POST /v1/terminal/{name}/kill` — end the live session.
+    #[serde(default)]
+    pub terminal_kill: bool,
+    /// `GET /v1/threads/{id}/events` puts the durable `seq` on every journal
+    /// frame as the SSE `id:` and resumes from a `Last-Event-ID` header, so a
+    /// browser `EventSource` reconnects without a cursor in the query string.
+    #[serde(default)]
+    pub event_stream_resume: bool,
 }
 
 /// Experimental opt-in flags advertised by `GET /v1/runtime/info`.
@@ -399,6 +421,7 @@ mod tests {
             turn_output_token_limit: false,
             account_session: true,
             threads: true,
+            thread_shell_consent: true,
             turns: true,
             turn_operation_idempotency: true,
             turn_operation_lookup: true,
@@ -420,10 +443,32 @@ mod tests {
             skill_lifecycle: false,
             plugin_management: false,
             agent_mail: true,
+            terminal_stream: false,
+            terminal_input: false,
+            terminal_resize: false,
+            terminal_kill: false,
+            event_stream_resume: true,
         };
         let value = serde_json::to_value(&caps).unwrap();
         let obj = value.as_object().unwrap();
         assert_eq!(obj.get("threads").unwrap(), &json!(true));
+        assert_eq!(obj.get("thread_shell_consent"), Some(&json!(true)));
+        assert!(
+            serde_json::from_value::<RuntimeCapabilities>(value.clone())
+                .unwrap()
+                .thread_shell_consent
+        );
+        let mut legacy_shell = value.clone();
+        legacy_shell
+            .as_object_mut()
+            .unwrap()
+            .remove("thread_shell_consent");
+        assert!(
+            !serde_json::from_value::<RuntimeCapabilities>(legacy_shell)
+                .unwrap()
+                .thread_shell_consent
+        );
+
         assert_eq!(obj.get("account_session").unwrap(), &json!(true));
         assert_eq!(obj.get("turn_operation_idempotency").unwrap(), &json!(true));
         assert_eq!(obj.get("turn_operation_lookup").unwrap(), &json!(true));

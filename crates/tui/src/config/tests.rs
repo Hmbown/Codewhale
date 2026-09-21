@@ -1398,14 +1398,14 @@ fn profile_hotbar_override_replaces_entire_user_list() {
         },
     );
     let config = ConfigFile {
-        base: Config {
+        base: Box::new(Config {
             hotbar: Some(vec![codewhale_config::HotbarBindingToml {
                 slot: 1,
                 action: "mode.plan".to_string(),
                 label: Some("Plan".to_string()),
             }]),
             ..Config::default()
-        },
+        }),
         profiles: Some(profiles),
     };
 
@@ -1429,14 +1429,14 @@ fn profile_without_scenario() {
         let mut profiles = HashMap::new();
         profiles.insert("work".to_string(), Config::default());
         let config = ConfigFile {
-            base: Config {
+            base: Box::new(Config {
                 hotbar: Some(vec![codewhale_config::HotbarBindingToml {
                     slot: 1,
                     action: "mode.plan".to_string(),
                     label: None,
                 }]),
                 ..Config::default()
-            },
+            }),
             profiles: Some(profiles),
         };
 
@@ -1456,13 +1456,13 @@ fn profile_without_scenario() {
         let mut profiles = HashMap::new();
         profiles.insert("work".to_string(), Config::default());
         let config = ConfigFile {
-            base: Config {
+            base: Box::new(Config {
                 context: ContextConfig {
                     enabled: Some(true),
                     ..Default::default()
                 },
                 ..Default::default()
-            },
+            }),
             profiles: Some(profiles),
         };
 
@@ -6913,7 +6913,7 @@ fn test_nonexistent_profile_error() {
     let mut profiles = HashMap::new();
     profiles.insert("work".to_string(), Config::default());
     let config = ConfigFile {
-        base: Config::default(),
+        base: Box::default(),
         profiles: Some(profiles),
     };
 
@@ -6924,10 +6924,47 @@ fn test_nonexistent_profile_error() {
     assert!(message.contains("work"));
 }
 
+/// #6362: `ConfigFile` keeps its base `Config` boxed. Parsing a document
+/// through the profile path used to carry the multi-kilobyte struct by value
+/// through the `toml::de` and `apply_profile` frames, which overflowed the
+/// 2 MiB stack libtest gives every test thread in debug builds and aborted
+/// the whole lib suite. Pin that budget explicitly: CI exports a larger
+/// `RUST_MIN_STACK`, so without this thread the regression would be masked.
+/// A regression here aborts the process with "has overflowed its stack",
+/// which is the reported symptom, not a panic.
+#[test]
+fn profile_document_parses_within_the_default_test_thread_stack() {
+    const DEFAULT_TEST_THREAD_STACK: usize = 2 * 1024 * 1024;
+    let document = r#"
+provider = "deepseek"
+approval_policy = "on-request"
+
+[tui]
+theme = "underwater"
+
+[profiles.work]
+approval_policy = "never"
+"#;
+    let handle = std::thread::Builder::new()
+        .name("config-default-test-stack".into())
+        .stack_size(DEFAULT_TEST_THREAD_STACK)
+        .spawn(move || {
+            let config =
+                Config::from_saved_document(document, Some("work")).expect("profile parses");
+            assert_eq!(config.approval_policy.as_deref(), Some("never"));
+            let base = Config::from_saved_document(document, None).expect("base parses");
+            assert_eq!(base.approval_policy.as_deref(), Some("on-request"));
+        })
+        .expect("spawn a 2 MiB test thread");
+    handle
+        .join()
+        .expect("config parsing must fit the default test thread stack");
+}
+
 #[test]
 fn test_profile_with_no_profiles_section() {
     let config = ConfigFile {
-        base: Config::default(),
+        base: Box::default(),
         profiles: None,
     };
 
@@ -7974,14 +8011,14 @@ fn profile_skills_config_merges_individual_fields() {
         },
     );
     let config = ConfigFile {
-        base: Config {
+        base: Box::new(Config {
             skills: Some(SkillsConfig {
                 registry_url: Some("https://registry.example/skills.json".to_string()),
                 max_install_size_bytes: Some(1234),
                 ..Default::default()
             }),
             ..Default::default()
-        },
+        }),
         profiles: Some(profiles),
     };
 
@@ -12350,6 +12387,21 @@ fn status_items_scenario() {
         assert_eq!(items, vec![StatusItem::Workspace, StatusItem::GitBranch]);
         assert_eq!(StatusItem::Workspace.key(), "workspace");
         assert_eq!(StatusItem::GitBranch.key(), "git_branch");
+    }
+    {
+        let tui: TuiConfig =
+            toml::from_str(r#"status_items = ["ttft", "output_rate", "session_metrics"]"#)
+                .expect("new and legacy metrics keys should parse");
+        assert_eq!(
+            tui.status_items,
+            Some(vec![
+                StatusItem::Ttft,
+                StatusItem::OutputRate,
+                StatusItem::SessionMetrics
+            ])
+        );
+        assert_eq!(StatusItem::Ttft.key(), "ttft");
+        assert_eq!(StatusItem::OutputRate.key(), "output_rate");
     }
     // from status_items_deser_allows_missing_field
     {

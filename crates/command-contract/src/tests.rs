@@ -2297,6 +2297,7 @@ fn control_facet_is_object_safe_and_transports_every_outcome() {
             truncated_id: "imp-9".to_string(),
             entry_count: 12,
             leaf_display: "leaf-3".to_string(),
+            sync: lifecycle_sync_payload(Some("imp-9")),
         })),
         sanitized_title: Some("Renamed".to_string()),
         rename: Some(Ok(SessionTitleReceipt {

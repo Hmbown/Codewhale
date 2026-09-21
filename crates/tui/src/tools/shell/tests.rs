@@ -3566,6 +3566,8 @@ fn killed_shell_does_not_wait_for_blocked_reader_threads() {
         completion_reported: false,
         bounded_output: None,
         stdin: None,
+        pty_master: None,
+        terminal_size: None,
         child: None,
         windows_job: None,
         stdout_thread: Some(stdout_thread),
@@ -4704,4 +4706,192 @@ async fn busy_work_graph_degrades_the_spawn_intent_instead_of_failing_it() {
         busy.lifecycle.is_none(),
         "a busy work-graph must degrade to an unbound guard, not fail the spawn"
     );
+}
+
+#[test]
+fn pty_dimensions_reject_zero_and_unbounded_grid() {
+    assert_eq!(
+        PtyDimensions::default(),
+        PtyDimensions { rows: 24, cols: 80 }
+    );
+    for size in [
+        PtyDimensions { rows: 0, cols: 80 },
+        PtyDimensions { rows: 24, cols: 0 },
+        PtyDimensions {
+            rows: 1001,
+            cols: 80,
+        },
+        PtyDimensions {
+            rows: 24,
+            cols: u16::MAX,
+        },
+    ] {
+        assert!(size.validate().is_err());
+    }
+    assert!(
+        PtyDimensions {
+            rows: 1000,
+            cols: 1000
+        }
+        .validate()
+        .is_ok()
+    );
+}
+
+#[test]
+#[cfg(not(target_env = "ohos"))]
+fn pty_stdin_preserves_bytes_and_reports_flush_failure() {
+    struct FlushFailure(Arc<Mutex<Vec<u8>>>);
+    impl Write for FlushFailure {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "fixture flush failure",
+            ))
+        }
+    }
+    let tmp = tempdir().unwrap();
+    let mut manager = ShellManager::new(tmp.path().to_path_buf());
+    manager.seed_finished_record_for_test("input-fixture", Duration::ZERO);
+    let bytes = Arc::new(Mutex::new(Vec::new()));
+    manager.processes.get_mut("input-fixture").unwrap().stdin =
+        Some(StdinWriter::Pty(Box::new(FlushFailure(bytes.clone()))));
+    let input = b"\0\xff\x1b[A\x03";
+    let error = manager
+        .write_stdin_bytes("input-fixture", input, false)
+        .unwrap_err();
+    assert!(error.to_string().contains("flush"));
+    assert_eq!(bytes.lock().unwrap().as_slice(), input);
+}
+
+#[test]
+#[cfg(all(unix, not(target_env = "ohos")))]
+fn pty_resize_updates_live_terminal_and_rejects_finished_or_pipe_jobs() {
+    let tmp = tempdir().unwrap();
+    let mut manager = ShellManager::new(tmp.path().to_path_buf());
+    let launched = manager
+        .execute_with_options_env(
+            "stty -echo; printf ready; while IFS= read -r line; do stty size; done",
+            None,
+            5000,
+            true,
+            None,
+            true,
+            Some(ExecutionSandboxPolicy::DangerFullAccess),
+            HashMap::new(),
+        )
+        .unwrap();
+    let id = launched.task_id.unwrap();
+    assert_eq!(
+        manager.job_terminal_size(&id),
+        Some(PtyDimensions::default())
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let chunk = manager
+            .read_output_chunk(&id, ShellOutputStream::Stdout, 0, 4096, 50)
+            .unwrap();
+        if chunk.bytes.windows(5).any(|bytes| bytes == b"ready") {
+            break;
+        }
+        assert!(Instant::now() < deadline, "PTY did not become ready");
+    }
+    let size = PtyDimensions {
+        rows: 37,
+        cols: 111,
+    };
+    manager.resize_pty(&id, size).unwrap();
+    assert_eq!(manager.job_terminal_size(&id), Some(size));
+    assert!(
+        manager
+            .resize_pty(&id, PtyDimensions { rows: 0, cols: 1 })
+            .is_err()
+    );
+    assert_eq!(manager.job_terminal_size(&id), Some(size));
+    manager.write_stdin_bytes(&id, b"size\n", false).unwrap();
+    loop {
+        let chunk = manager
+            .read_output_chunk(&id, ShellOutputStream::Stdout, 0, 4096, 0)
+            .unwrap();
+        if String::from_utf8_lossy(&chunk.bytes).contains("37 111") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "actual terminal size did not change"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    manager.kill(&id).unwrap();
+    assert!(manager.resize_pty(&id, size).is_err());
+    assert!(manager.processes[&id].pty_master.is_none());
+    let pipe = manager
+        .execute_with_options_env(
+            "cat",
+            None,
+            5000,
+            true,
+            None,
+            false,
+            Some(ExecutionSandboxPolicy::DangerFullAccess),
+            HashMap::new(),
+        )
+        .unwrap()
+        .task_id
+        .unwrap();
+    assert!(manager.resize_pty(&pipe, size).is_err());
+    manager.kill(&pipe).unwrap();
+}
+
+#[test]
+#[cfg(all(unix, not(target_env = "ohos")))]
+fn pty_raw_stdin_roundtrips_nul_and_non_utf8_bytes() {
+    let tmp = tempdir().unwrap();
+    let mut manager = ShellManager::new(tmp.path().to_path_buf());
+    let input = b"\0\xff\x1b[A\x03\n";
+    let command = format!(
+        "stty raw -echo; printf ready; dd bs=1 count={} 2>/dev/null",
+        input.len()
+    );
+    let launched = manager
+        .execute_with_options_env(
+            &command,
+            None,
+            5000,
+            true,
+            None,
+            true,
+            Some(ExecutionSandboxPolicy::DangerFullAccess),
+            HashMap::new(),
+        )
+        .unwrap();
+    let id = launched.task_id.unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let chunk = manager
+            .read_output_chunk(&id, ShellOutputStream::Stdout, 0, 4096, 0)
+            .unwrap();
+        if chunk.bytes == b"ready" {
+            break;
+        }
+        assert!(Instant::now() < deadline, "raw PTY did not become ready");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    manager.write_stdin_bytes(&id, input, false).unwrap();
+    loop {
+        let chunk = manager
+            .read_output_chunk(&id, ShellOutputStream::Stdout, 5, 4096, 0)
+            .unwrap();
+        if chunk.status != ShellStatus::Running {
+            assert_eq!(chunk.bytes, input);
+            assert_eq!(chunk.next_offset, 5 + input.len());
+            break;
+        }
+        assert!(Instant::now() < deadline, "raw PTY did not finish");
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }

@@ -177,7 +177,9 @@ pub fn unset_config_document_value(
     Ok(removed)
 }
 
-pub(crate) fn with_config_write_lock<T>(
+/// Serialize a complete read-modify-write operation against a canonical
+/// configuration path. The callback must not acquire this same lock again.
+pub fn with_config_write_lock<T>(
     path: &Path,
     operation: impl FnOnce(&Path) -> Result<T>,
 ) -> Result<T> {

@@ -74,7 +74,7 @@ fn footer_matches_goldens_at_blocker_sizes() {
     }
 }
 
-/// Claude Code's grammar: mark, permission chip with its cycle key, mode
+/// Permission chip with its cycle key, mode
 /// with its cycle key, the working clock, live counts, then the one hint
 /// that applies now.
 #[test]
@@ -83,7 +83,7 @@ fn posture_bar_reads_permission_mode_clock_counts_hint() {
     let band = text.lines().last().unwrap_or_default().trim_end();
     assert_eq!(
         band,
-        "▶▶ ask (Shift+Tab) · work (Tab) · working 1m 15s · 2 agents · worked 41m 12s · Esc to interrupt"
+        " ask (Shift+Tab)   work (Tab)   working 1m 15s   2 agents   worked 41m 12s   Esc to interrupt"
     );
 }
 
@@ -148,7 +148,7 @@ fn posture_bar_pins_notice_or_remote_control_right() {
     fixture.right = Some(("/rc connected", ChromeInk::Info));
     let text = draw(100, 30, &fixture.widget(&UI_THEME));
     assert!(text.trim_end().ends_with("/rc connected"), "{text}");
-    assert!(text.contains("▶▶ ask (Shift+Tab)"), "{text}");
+    assert!(text.contains(" ask (Shift+Tab)"), "{text}");
 
     fixture.right = Some(("Auto-denied exec_shell", ChromeInk::Attention));
     let text = draw(100, 30, &fixture.widget(&UI_THEME));
@@ -160,7 +160,7 @@ fn posture_bar_pins_notice_or_remote_control_right() {
     // Narrow: the notice truncates against the permission floor, never
     // over it.
     let narrow = draw(30, 12, &fixture.widget(&UI_THEME));
-    assert!(narrow.contains("▶▶ ask"), "{narrow}");
+    assert!(narrow.contains(" ask"), "{narrow}");
 }
 
 /// Shed ladder, most expendable first: the turn clock, the session clock,
@@ -184,7 +184,7 @@ fn posture_bar_sheds_the_clocks_then_the_hint_counts_and_posture_chips() {
     // `work` alone would also match `working`, so measure the mode chip by
     // a needle only the mode paints.
     let mode_key = narrowest_showing("work (Tab)");
-    let mode = narrowest_showing("· work ");
+    let mode = narrowest_showing("   work ");
     let permission_key = narrowest_showing("(Shift+Tab)");
     assert!(
         turn_clock > session_clock
@@ -219,7 +219,7 @@ fn compact_posture_bar_states_posture_and_nothing_live() {
     let mut fixture = working();
     fixture.right = Some(("/rc connected", ChromeInk::Info));
     let wide = draw(160, 3, &fixture.widget(&UI_THEME).compact(true));
-    for kept in ["▶▶ ask (Shift+Tab)", "· work (Tab)", "/rc connected"] {
+    for kept in [" ask (Shift+Tab)", "   work (Tab)", "/rc connected"] {
         assert!(wide.contains(kept), "compact keeps {kept}: {wide}");
     }
     for gone in [
@@ -285,7 +285,7 @@ fn posture_bar_prints_cycle_keys_only_when_live() {
     fixture.permission_key = None;
     let text = draw(120, 30, &fixture.widget(&UI_THEME));
     assert!(
-        text.contains("▶▶ ask · work · working 1m 15s · 2 agents · worked 41m 12s"),
+        text.contains(" ask   work   working 1m 15s   2 agents   worked 41m 12s"),
         "{text}"
     );
     assert!(!text.contains('('), "{text}");
@@ -297,7 +297,7 @@ fn posture_bar_ascii_safe_projects_glyphs() {
     fixture.context_percent = 90;
     let text = draw(100, 30, &fixture.widget(&UI_THEME).ascii_safe(true));
     let band = text.lines().last().unwrap_or_default();
-    assert!(band.starts_with(">> ask"), "mark projects: {band}");
+    assert!(band.starts_with(" ask"), "inset preserved: {band}");
     assert!(text.contains("^ surface soon"), "{text}");
     for ch in text.chars() {
         if ch != '\n' {
@@ -708,4 +708,31 @@ fn scheduled_count_opens_automations_directly() {
         facts.count_actions.last(),
         Some(&crate::tui::tideline::InteractionAction::OpenAutomations)
     );
+}
+
+#[test]
+fn posture_shortcuts_recede_without_changing_count_click_targets() {
+    use ratatui::{buffer::Buffer, style::Modifier};
+    let fixture = working();
+    let mut buf = Buffer::empty(Rect::new(0, 0, 120, 1));
+    let targets = render_tideline_footer(buf.area, &mut buf, &fixture.widget(&UI_THEME));
+    let text: String = buf.content().iter().map(|cell| cell.symbol()).collect();
+    let label = text.find("ask").unwrap() as u16;
+    let key = text.find("(Shift+Tab)").unwrap() as u16;
+    assert!(buf[(label, 0)].modifier.contains(Modifier::BOLD));
+    assert!(!buf[(key, 0)].modifier.contains(Modifier::BOLD));
+    assert_eq!(
+        buf[(key, 0)].fg,
+        super::tchrome(&UI_THEME, ChromeInk::MetadataHint)
+            .fg
+            .unwrap()
+    );
+    assert_ne!(buf[(label, 0)].fg, buf[(key, 0)].fg);
+    assert_eq!(targets.len(), 1);
+    let (index, target) = targets[0];
+    assert_eq!(index, 0);
+    let painted: String = (target.x..target.right())
+        .map(|x| buf[(x, 0)].symbol())
+        .collect();
+    assert_eq!(painted, "2 agents");
 }

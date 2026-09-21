@@ -1,5 +1,8 @@
 # MCP (External Tool Servers)
 
+In the terminal, `/mcp` (also `/mcps`) opens **Extensions → MCP**. Enter opens the selected server’s recovery action or read-only details. An empty inventory offers server suggestions; browsing them installs nothing. Explicit subcommands such as `/mcp status`, `/mcp doctor`, `/mcp login`, and `/mcp add` retain their existing behavior.
+
+
 > 阅读简体中文版：[zh_hans/MCP.md](zh_hans/MCP.md)
 
 codewhale can load additional tools via MCP (Model Context Protocol). MCP servers can be local stdio processes that the TUI starts, or remote URL-based servers that speak Streamable HTTP with legacy SSE fallback.

@@ -174,16 +174,15 @@ fn infoline_is_model_context_and_metrics_only() {
     }
     let work = render_row(&UI_THEME, 160, &work_segments());
     assert!(
-        work.starts_with("deepseek-v4 · ctx 61% · $0.42 · ttft 400ms · 38 tok/s · ↓ 1.2K  "),
+        work.starts_with("deepseek-v4   ctx 61%   $0.42   ttft 400ms   38 tok/s   ↓ 1.2K  "),
         "{work:?}"
     );
     assert!(work.trim_end().ends_with("/help"), "{work:?}");
 }
 
-/// Declared shed order: `tok/s`, `ttft`, `↓ tokens`, the help hint, then
-/// the cost. The model and `ctx NN%` are the floor at every width.
+/// Secondary counts and help yield before performance readings and cost. The model and `ctx NN%` are the floor at every width.
 #[test]
-fn infoline_sheds_rate_then_ttft_then_tokens_then_help_then_cost() {
+fn infoline_sheds_tokens_then_help_then_rate_then_ttft_then_cost() {
     let segments = work_segments();
     // The narrowest row that still shows a thing. A thing that sheds earlier
     // needs a wider row to survive, so these strictly decrease down the
@@ -200,7 +199,7 @@ fn infoline_sheds_rate_then_ttft_then_tokens_then_help_then_cost() {
     let help = narrowest_showing("help");
     let cost = narrowest_showing("$0.42");
     assert!(
-        rate > ttft && ttft > tokens && tokens > help && help > cost,
+        tokens > help && help > rate && rate > ttft && ttft > cost,
         "shed order broke: rate@{rate} ttft@{ttft} tokens@{tokens} help@{help} cost@{cost}"
     );
     for w in 24..=180u16 {
@@ -213,12 +212,11 @@ fn infoline_sheds_rate_then_ttft_then_tokens_then_help_then_cost() {
 }
 
 /// `tui.metrics_line = "compact"` (#5950) is the row after its first shed
-/// rungs, at any width: the telemetry (`tok/s`, `ttft`, `↓ tokens`) and
-/// the help hint are gone before width is consulted, the route, the
-/// context reading and the cost stay, and the hitboxes follow the same
+/// rungs, at any width: output counts and help are gone before width is
+/// consulted; selected TTFT/rate survive when they fit. Hitboxes follow the same
 /// pass so a click still lands on what painted.
 #[test]
-fn infoline_compact_drops_the_telemetry_and_help_before_width_does() {
+fn infoline_compact_keeps_performance_readings_without_extra_rows() {
     let segments = work_segments();
     let hint = help_hint();
     let compact_row = |width: u16| -> (String, Vec<InfoSegmentId>) {
@@ -248,20 +246,22 @@ fn infoline_compact_drops_the_telemetry_and_help_before_width_does() {
     let (wide, ids) = compact_row(160);
     assert_eq!(
         wide.trim_end(),
-        "deepseek-v4 · ctx 61% · $0.42",
-        "compact keeps the route, the reading and the price: {wide:?}"
+        "deepseek-v4   ctx 61%   $0.42   ttft 400ms   38 tok/s",
+        "compact keeps performance, route, context and price: {wide:?}"
     );
     assert_eq!(
         ids,
         vec![
             InfoSegmentId::Model,
             InfoSegmentId::Context,
-            InfoSegmentId::Cost
+            InfoSegmentId::Cost,
+            InfoSegmentId::Ttft,
+            InfoSegmentId::Rate,
         ]
     );
     for w in 24..=180u16 {
         let (row, _) = compact_row(w);
-        for gone in ["tok/s", "ttft", "1.2K", "help"] {
+        for gone in ["1.2K", "help"] {
             assert!(
                 !row.contains(gone),
                 "{w}: compact never paints {gone}: {row:?}"

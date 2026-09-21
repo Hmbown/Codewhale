@@ -38,6 +38,7 @@ fn account_model_access_receipt(config: &crate::config::Config) -> Value {
         "apiBase": if supported { api_base.as_str() } else { "" },
         "supported": supported,
         "configured": config.account_model_api_key(ApiProvider::Codewhale).is_some(),
+        "catalogRefreshNeeded": false,
         "sessionId": live.map(|a| a.session_id.as_str()),
         "expiresAt": live.map(|a| a.expires_at),
     })
@@ -75,8 +76,11 @@ pub(super) async fn set_account_model_access(
 ) -> Result<Json<Value>, ApiError> {
     tokio::task::spawn_blocking(move || {
         let config = state.config.write();
-        install_account_model_access(&config, state.config_profile.as_deref(), request)?;
-        Ok(Json(account_model_access_receipt(&config)))
+        let refresh_needed =
+            install_account_model_access(&config, state.config_profile.as_deref(), request)?;
+        let mut receipt = account_model_access_receipt(&config);
+        receipt["catalogRefreshNeeded"] = json!(refresh_needed);
+        Ok(Json(receipt))
     })
     .await
     .map_err(|_| ApiError::internal("account access update failed"))?
@@ -86,7 +90,7 @@ fn install_account_model_access(
     config: &crate::config::Config,
     profile: Option<&str>,
     request: SetAccountModelAccessRequest,
-) -> Result<(), ApiError> {
+) -> Result<bool, ApiError> {
     let expected_base = crate::config::DEFAULT_CODEWHALE_BASE_URL;
     if request.api_base.trim_end_matches('/') != expected_base
         || config
@@ -168,13 +172,21 @@ fn install_account_model_access(
             "Account model access changed; refresh before retrying.",
         ));
     }
+    let changed = access.as_ref().is_none_or(|current| {
+        current.session_id != request.session_id
+            || current.profile.as_deref() != profile
+            || current.credential.expose_secret() != request.key
+    });
+    if changed {
+        invalidate_account_catalog(config);
+    }
     *access = Some(crate::config::AccountModelAccess {
         session_id: request.session_id,
         credential: crate::credentials::Credential::ApiKey { key: request.key },
         expires_at: request.expires_at,
         profile: profile.map(str::to_string),
     });
-    Ok(())
+    Ok(changed)
 }
 
 pub(super) async fn clear_account_model_access(
@@ -200,8 +212,32 @@ fn remove_account_model_access(
             "Account model access belongs to a different session.",
         ));
     }
+    if access.is_some() {
+        invalidate_account_catalog(config);
+    }
     *access = None;
     Ok(())
+}
+
+// Beginning a generation already invalidates this account-only memory roster
+// and all older in-flight tickets. No network request or second cache is needed.
+fn invalidate_account_catalog(config: &crate::config::Config) {
+    crate::provider_catalog_live::begin_refresh_for_identity(
+        ApiProvider::Codewhale,
+        "codewhale",
+        &config.base_url_for_route(ApiProvider::Codewhale),
+    );
+}
+
+pub(super) fn invalidate_stale_account_catalog(config: &crate::config::Config) {
+    let bound = config.account_model_access.read().is_some();
+    if bound
+        && config
+            .account_model_api_key(ApiProvider::Codewhale)
+            .is_none()
+    {
+        invalidate_account_catalog(config);
+    }
 }
 
 /// Write-only credential entry for native clients (APPS-48).
@@ -585,7 +621,7 @@ mod tests {
             ..Default::default()
         };
         let cloned_before_install = config.clone();
-        install_account_model_access(&config, None, account_request(None)).unwrap();
+        assert!(install_account_model_access(&config, None, account_request(None)).unwrap());
         assert_eq!(
             cloned_before_install
                 .active_route_api_key_read_only()
@@ -610,7 +646,60 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+        use codewhale_config::catalog::{
+            CatalogStatus, ProviderCatalogDelta, base_url_fingerprint,
+        };
+        let endpoint = crate::config::DEFAULT_CODEWHALE_BASE_URL;
+        let ticket = crate::provider_catalog_live::begin_refresh_for_identity(
+            ApiProvider::Codewhale,
+            "codewhale",
+            endpoint,
+        );
+        let delta = || ProviderCatalogDelta {
+            provider: "codewhale".into(),
+            base_url_fingerprint: base_url_fingerprint(endpoint),
+            fetched_at: 1,
+            offerings: vec![],
+        };
+        assert_eq!(
+            crate::provider_catalog_live::record_success_if_current(&ticket, delta()),
+            Some(CatalogStatus::Fresh)
+        );
+        assert!(
+            !install_account_model_access(&config, None, account_request(Some("fixture-session")))
+                .unwrap()
+        );
+        assert!(
+            crate::provider_catalog_live::cached_entry_for_route(
+                ApiProvider::Codewhale,
+                "codewhale",
+                endpoint
+            )
+            .unwrap()
+            .is_some()
+        );
+        let mut extended = account_request(Some("fixture-session"));
+        extended.expires_at += 60;
+        assert!(!install_account_model_access(&config, None, extended).unwrap());
+        assert_eq!(
+            crate::provider_catalog_live::record_success_if_current(&ticket, delta()),
+            Some(CatalogStatus::Fresh)
+        );
         store.clear().unwrap();
+        invalidate_stale_account_catalog(&config);
+        assert!(
+            crate::provider_catalog_live::cached_entry_for_route(
+                ApiProvider::Codewhale,
+                "codewhale",
+                endpoint
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert_eq!(
+            crate::provider_catalog_live::record_success_if_current(&ticket, delta()),
+            None
+        );
         assert!(
             cloned_before_install
                 .active_route_api_key_read_only()
@@ -691,6 +780,7 @@ mod tests {
 
     #[test]
     fn account_overlay_clear_is_shared_and_preserves_manual_config() {
+        let _env = crate::test_support::lock_test_env();
         let mut config = Config::default();
         config
             .provider_config_for_mut(ApiProvider::Codewhale)

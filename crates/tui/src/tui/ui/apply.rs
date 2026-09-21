@@ -1425,7 +1425,7 @@ pub(crate) async fn apply_command_result(
                 // recent rows reach here through `/resume`-shaped dispatch;
                 // leaving the launch stage visible over the restored
                 // transcript is what made those rows read as dead (#4).
-                app.launch.visible = false;
+                app.launch.dismiss();
                 app.launch.status = None;
             }
             AppAction::SyncSession {

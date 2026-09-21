@@ -6,6 +6,33 @@ use std::sync::OnceLock;
 
 use ratatui::style::Color;
 
+/// The launch mark resolves once; controls and text never wait for it.
+pub(crate) const REVEAL_MS: u128 = 360;
+
+pub(crate) fn reveal_row(row: &str, elapsed_ms: u128, animated: bool) -> String {
+    let mask = if !animated || elapsed_ms >= REVEAL_MS {
+        0xff
+    } else if elapsed_ms < 60 {
+        0x09
+    } else if elapsed_ms < 140 {
+        0x1b
+    } else if elapsed_ms < 240 {
+        0x3f
+    } else {
+        0x7f
+    };
+    row.chars()
+        .map(|ch| {
+            let code = u32::from(ch);
+            if (0x2800..=0x28ff).contains(&code) {
+                char::from_u32(0x2800 + ((code - 0x2800) & mask)).unwrap_or(ch)
+            } else {
+                ch
+            }
+        })
+        .collect()
+}
+
 /// Rungs of the mark's scale ladder, each generated at its own box.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MarkSize {
@@ -232,6 +259,38 @@ pub fn probe_sixel_graphics() -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn launch_reveal_preserves_width_and_only_adds_canonical_dots() {
+        use unicode_width::UnicodeWidthStr;
+        for size in [
+            super::MarkSize::Large,
+            super::MarkSize::Small,
+            super::MarkSize::Tiny,
+        ] {
+            for row in size.rows() {
+                let mut previous = super::reveal_row(row, 0, true);
+                for elapsed in [60, 140, 240, 360, 1000] {
+                    let next = super::reveal_row(row, elapsed, true);
+                    assert_eq!(next.width(), row.width());
+                    for ((old, new), canonical) in
+                        previous.chars().zip(next.chars()).zip(row.chars())
+                    {
+                        if ('\u{2800}'..='\u{28ff}').contains(&canonical) {
+                            let old = u32::from(old) - 0x2800;
+                            let new = u32::from(new) - 0x2800;
+                            let target = u32::from(canonical) - 0x2800;
+                            assert_eq!(old & new, old);
+                            assert_eq!(new & target, new);
+                        }
+                    }
+                    previous = next;
+                }
+                assert_eq!(previous, *row);
+                assert_eq!(super::reveal_row(row, 0, false), *row);
+            }
+        }
+    }
+
     use super::*;
 
     #[test]

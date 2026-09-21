@@ -15,7 +15,8 @@ use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 
 use crate::tools::shell::{
-    ShellJobSnapshot, ShellOutputChunk, ShellOutputStream, ShellResult, ShellStatus,
+    PtyDimensions, ShellJobSnapshot, ShellManager, ShellOutputChunk, ShellOutputStream,
+    ShellResult, ShellStatus,
 };
 
 use super::{ApiError, RuntimeApiState, map_thread_err};
@@ -66,15 +67,22 @@ pub(super) struct JobView {
     /// `client` = launched through this API, `agent` = launched by the model's
     /// shell tool, `subagent` = owned by a delegated agent.
     owner: &'static str,
+    /// Null for historical records whose original transport is not known.
+    tty: Option<bool>,
+    terminal_size: Option<PtyDimensions>,
 }
 
 impl JobView {
-    fn new(snapshot: ShellJobSnapshot, thread_id: String) -> Self {
+    fn new(snapshot: ShellJobSnapshot, thread_id: String, manager: &ShellManager) -> Self {
         let owner = job_owner(&snapshot);
+        let terminal_size = manager.job_terminal_size(&snapshot.job_id);
+        let tty = (!snapshot.stale).then_some(terminal_size.is_some());
         Self {
             snapshot,
             thread_id,
             owner,
+            tty,
+            terminal_size,
         }
     }
 }
@@ -97,7 +105,7 @@ pub(super) async fn list_jobs(
                 guard
                     .list_jobs()
                     .into_iter()
-                    .map(|snapshot| JobView::new(snapshot, thread_id.clone())),
+                    .map(|snapshot| JobView::new(snapshot, thread_id.clone(), &guard)),
             );
         }
         jobs
@@ -139,7 +147,7 @@ pub(super) async fn list_thread_jobs(
         guard
             .list_jobs()
             .into_iter()
-            .map(|snapshot| JobView::new(snapshot, thread_id.clone()))
+            .map(|snapshot| JobView::new(snapshot, thread_id.clone(), &guard))
             .collect()
     })
     .await
@@ -210,6 +218,15 @@ pub(super) async fn create_thread_job(
             "this thread does not allow shell commands",
         ));
     }
+    state
+        .runtime_threads
+        .validate_shell_access_policy(
+            &thread.workspace,
+            state.config_path.as_deref(),
+            state.config_profile.as_deref(),
+        )
+        .await
+        .map_err(|error| ApiError::forbidden(error.to_string()))?;
     if let Some(cwd) = request.cwd.as_deref() {
         let resolved = std::path::Path::new(cwd);
         let resolved = if resolved.is_absolute() {
@@ -254,7 +271,7 @@ pub(super) async fn create_thread_job(
                 ApiError::internal(format!("job launched but is not tracked: {error}"))
             })?
             .snapshot;
-        Ok(JobView::new(snapshot, thread_id))
+        Ok(JobView::new(snapshot, thread_id, &guard))
     })
     .await
     .map_err(|_| ApiError::internal("job launch failed"))??;
@@ -282,7 +299,7 @@ pub(super) async fn get_thread_job(
         let mut guard = manager.lock().unwrap_or_else(|e| e.into_inner());
         let detail = guard.inspect_job(&job_id).map_err(map_job_err)?;
         Ok(Json(JobDetailResponse {
-            job: JobView::new(detail.snapshot, thread_id),
+            job: JobView::new(detail.snapshot, thread_id, &guard),
             stdout_tail: detail.stdout,
             stderr_tail: detail.stderr,
         }))
@@ -363,11 +380,26 @@ pub(super) async fn get_thread_job_output(
     let manager = thread_manager(&state, &thread_id, false).await?;
     let chunk = tokio::task::spawn_blocking({
         let job_id = job_id.clone();
-        move || {
-            let mut guard = manager.lock().unwrap_or_else(|e| e.into_inner());
-            guard
-                .read_output_chunk(&job_id, stream, cursor, max_bytes, wait_ms)
-                .map_err(map_job_err)
+        move || -> Result<ShellOutputChunk, ApiError> {
+            // Wait between non-consuming snapshots, never while owning the
+            // thread's shared ShellManager. Input, resize, and kill stay live.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(wait_ms);
+            loop {
+                let chunk = {
+                    let mut guard = manager.lock().unwrap_or_else(|e| e.into_inner());
+                    guard
+                        .read_output_chunk(&job_id, stream, cursor, max_bytes, 0)
+                        .map_err(map_job_err)?
+                };
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if chunk.total > cursor
+                    || chunk.status != ShellStatus::Running
+                    || remaining.is_zero()
+                {
+                    break Ok(chunk);
+                }
+                std::thread::sleep(remaining.min(std::time::Duration::from_millis(50)));
+            }
         }
     })
     .await
@@ -433,7 +465,7 @@ pub(super) async fn write_thread_job_stdin(
                     "data must be at most {STDIN_MAX_BYTES} bytes"
                 )));
             }
-            request.data
+            request.data.into_bytes()
         }
         "base64" => {
             if request.data.len() > STDIN_MAX_BYTES * 2 {
@@ -447,8 +479,7 @@ pub(super) async fn write_thread_job_stdin(
                     "data must be at most {STDIN_MAX_BYTES} decoded bytes"
                 )));
             }
-            String::from_utf8(bytes)
-                .map_err(|_| ApiError::bad_request("stdin data must be valid UTF-8"))?
+            bytes
         }
         _ => return Err(ApiError::bad_request("encoding must be utf-8 or base64")),
     };
@@ -457,7 +488,7 @@ pub(super) async fn write_thread_job_stdin(
     tokio::task::spawn_blocking(move || {
         let mut guard = manager.lock().unwrap_or_else(|e| e.into_inner());
         guard
-            .write_stdin(&job_id, &input, close)
+            .write_stdin_bytes(&job_id, &input, close)
             .map_err(map_job_err)
     })
     .await
@@ -486,10 +517,47 @@ pub(super) async fn kill_thread_job(
         let result = guard.kill(&job_id).map_err(map_job_err)?;
         let snapshot = guard.inspect_job(&job_id).map_err(map_job_err)?.snapshot;
         Ok(Json(KillJobResponse {
-            job: JobView::new(snapshot, thread_id),
+            job: JobView::new(snapshot, thread_id, &guard),
             result,
         }))
     })
     .await
     .map_err(|_| ApiError::internal("job kill failed"))?
+}
+
+/// `POST /v1/threads/{id}/jobs/{job_id}/resize` — resize this existing PTY.
+pub(super) async fn resize_thread_job(
+    State(state): State<RuntimeApiState>,
+    Path((thread_id, job_id)): Path<(String, String)>,
+    Json(size): Json<PtyDimensions>,
+) -> Result<Json<JobDetailResponse>, ApiError> {
+    let size = size
+        .validate()
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    if job_id.len() > JOB_ID_MAX_BYTES {
+        return Err(ApiError::not_found("job not found"));
+    }
+    let manager = thread_manager(&state, &thread_id, false).await?;
+    tokio::task::spawn_blocking(move || {
+        let mut guard = manager.lock().unwrap_or_else(|e| e.into_inner());
+        let detail = guard.inspect_job(&job_id).map_err(map_job_err)?;
+        if detail.snapshot.stale || detail.snapshot.status != ShellStatus::Running {
+            return Err(ApiError {
+                status: StatusCode::CONFLICT,
+                message: "This job is no longer running".into(),
+            });
+        }
+        if guard.job_terminal_size(&job_id).is_none() {
+            return Err(ApiError::bad_request("This job is not a PTY"));
+        }
+        guard.resize_pty(&job_id, size).map_err(map_job_err)?;
+        let detail = guard.inspect_job(&job_id).map_err(map_job_err)?;
+        Ok(Json(JobDetailResponse {
+            job: JobView::new(detail.snapshot, thread_id, &guard),
+            stdout_tail: detail.stdout,
+            stderr_tail: detail.stderr,
+        }))
+    })
+    .await
+    .map_err(|_| ApiError::internal("PTY resize failed"))?
 }

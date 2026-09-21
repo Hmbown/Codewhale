@@ -586,6 +586,44 @@ mod tests {
         );
     }
     #[test]
+    fn stamped_rebranch_keeps_prefix_identity_and_suffix_stamps() {
+        let stamp = |secs: i64| DateTime::from_timestamp(secs, 0).expect("stamp");
+        let mut j = SessionJournal::new();
+        j.append_stamped(
+            SessionEntryKind::Message {
+                message: msg("user", "a"),
+            },
+            stamp(100),
+        );
+        j.append_stamped(
+            SessionEntryKind::Message {
+                message: msg("assistant", "b"),
+            },
+            stamp(200),
+        );
+        let a_id = j.entries[0].id.clone();
+        j.rebranch_active_messages_stamped(
+            &[msg("user", "a"), msg("assistant", "b2")],
+            &[stamp(100), stamp(300)],
+        );
+        assert_eq!(j.entries.len(), 3);
+        assert_eq!(j.entries[0].id, a_id, "shared prefix keeps its id");
+        assert_eq!(j.entries[0].created_at, stamp(100));
+        let path = j.root_to_leaf();
+        assert_eq!(path.len(), 2);
+        assert_eq!(
+            path[1].created_at,
+            stamp(300),
+            "suffix keeps the live stamp"
+        );
+        assert!(
+            j.entries
+                .iter()
+                .any(|e| e.kind.as_message().as_ref() == Some(&msg("assistant", "b"))),
+            "replaced suffix survives as a sibling"
+        );
+    }
+    #[test]
     fn compaction_fits() {
         let mut j = SessionJournal::new();
         let id = j.append_compaction("summary".into(), Some(1000), Some(100), None);

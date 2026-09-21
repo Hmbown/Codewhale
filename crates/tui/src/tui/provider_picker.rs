@@ -189,6 +189,8 @@ pub struct ProviderPickerView {
     /// available from `/provider` after onboarding.
     onboarding_mode: bool,
     query: String,
+    /// Explicit search keeps provider names from invoking legacy letter actions.
+    search_mode: bool,
     api_key_input: String,
     /// An error surfaced after a failed key verification, shown inline
     /// in the key-entry stage. Cleared when the user edits the input.
@@ -227,6 +229,8 @@ pub struct ProviderPickerView {
     consent_row_hitboxes: RefCell<Vec<(Rect, usize)>>,
     choice_row_hitboxes: RefCell<Vec<(Rect, char)>>,
     detail_action_hitbox: RefCell<Option<Rect>>,
+    catalog_action_hitbox: RefCell<Option<Rect>>,
+    catalog_action_hovered: bool,
     detail_action_hovered: bool,
     hovered_choice: Option<char>,
     last_choice_mouse_selected: Option<(Stage, char)>,
@@ -935,10 +939,13 @@ impl ProviderDashboardRow {
     /// repeats. One owner so the renderer and the tests cannot disagree about
     /// what a provider's state reads as.
     fn detail_state_line(&self) -> String {
+        let auth = match self.auth_status {
+            ProviderAuthStatus::Missing | ProviderAuthStatus::Configured => String::new(),
+            status => format!(" | {}", status.label()),
+        };
         format!(
-            "{} | {} | {}{}",
+            "{}{auth} | {}{}",
             self.readiness.label(),
-            self.auth_status.label(),
             self.catalog_label(),
             self.maturity
                 .tag()
@@ -1161,7 +1168,7 @@ fn catalog_freshness_title_suffix() -> &'static str {
 
 fn catalog_freshness_title_suffix_for(freshness: ModelsDevFreshness) -> &'static str {
     match freshness {
-        ModelsDevFreshness::Stale => " · stale",
+        ModelsDevFreshness::Stale => " · cached catalog",
         // A failed optional refresh keeps prior or bundled rows available.
         // Say what the picker is using instead of implying the catalog broke.
         ModelsDevFreshness::Failed => " · refresh failed; catalog available",
@@ -1749,6 +1756,7 @@ impl ProviderPickerView {
             setup_mode: false,
             onboarding_mode: false,
             query: String::new(),
+            search_mode: false,
             api_key_input: String::new(),
             key_entry_error: None,
             locale: Locale::En,
@@ -1774,6 +1782,8 @@ impl ProviderPickerView {
             consent_row_hitboxes: RefCell::new(Vec::new()),
             choice_row_hitboxes: RefCell::new(Vec::new()),
             detail_action_hitbox: RefCell::new(None),
+            catalog_action_hitbox: RefCell::new(None),
+            catalog_action_hovered: false,
             detail_action_hovered: false,
             hovered_choice: None,
             last_choice_mouse_selected: None,
@@ -2530,7 +2540,13 @@ impl ProviderPickerView {
         } else {
             self.tr(MessageId::PickerActionSetKey)
         };
-        let title = if self.onboarding_mode {
+        let title = if !self.onboarding_mode && (self.search_mode || !self.query.is_empty()) {
+            format!(
+                "{}: {}",
+                self.tr(MessageId::SessionsActionSearch),
+                self.query
+            )
+        } else if self.onboarding_mode {
             format!(" {} ", self.tr(MessageId::OnboardProviderTitle))
         } else {
             match (self.setup_mode, self.view) {
@@ -2550,6 +2566,25 @@ impl ProviderPickerView {
                 (false, ProviderListView::Local) => " Provider · local only ".to_string(),
             }
         };
+        let view_action = match self.view {
+            ProviderListView::Configured => self.tr(MessageId::PickerActionBrowseAll),
+            ProviderListView::Catalog => self.tr(MessageId::PickerActionConfigured),
+            ProviderListView::Local => self.tr(MessageId::PickerActionBrowseAll),
+        };
+        let action_label = crate::tui::ui_text::semantic_truncate(
+            &view_action,
+            usize::from(area.width.saturating_sub(20)),
+        );
+        let action_width = unicode_width::UnicodeWidthStr::width(action_label.as_str()) as u16;
+        let show_action = !self.onboarding_mode && area.width >= 28 && area.height > 0;
+        let title = if show_action {
+            crate::tui::ui_text::semantic_truncate(
+                title.trim(),
+                usize::from(area.width.saturating_sub(action_width + 8)),
+            )
+        } else {
+            title
+        };
         let inner = if self.onboarding_mode {
             let outer = Block::default()
                 .title(Line::from(Span::styled(
@@ -2568,12 +2603,25 @@ impl ProviderPickerView {
             render_underwater_surface(area, buf, title.trim())
         };
 
-        let view_action = match self.view {
-            ProviderListView::Configured => self.tr(MessageId::PickerActionBrowseAll),
-            ProviderListView::Catalog => self.tr(MessageId::PickerActionConfigured),
-            ProviderListView::Local => self.tr(MessageId::PickerActionBrowseAll),
-        };
-        let search_active = !self.query.trim().is_empty();
+        if show_action {
+            let action = Rect::new(
+                inner.right().saturating_sub(action_width),
+                area.y + u16::from(area.height >= 24),
+                action_width,
+                1,
+            );
+            *self.catalog_action_hitbox.borrow_mut() = Some(action);
+            Paragraph::new(action_label)
+                .style(if self.catalog_action_hovered {
+                    menu_style::hovered_row_style()
+                } else {
+                    Style::default()
+                        .fg(palette::WHALE_ACTION)
+                        .add_modifier(Modifier::UNDERLINED)
+                })
+                .render(action, buf);
+        }
+        let search_active = self.search_mode || !self.query.trim().is_empty();
         // The action footer moves into the body so it wraps instead of clipping
         // at narrow widths (#3732); the provider list renders above it.
         let content = if self.onboarding_mode {
@@ -2609,7 +2657,6 @@ impl ProviderPickerView {
                     ),
                     ActionHint::new("↑↓", self.tr(MessageId::PickerActionMove)),
                     ActionHint::new("Enter", enter_action),
-                    ActionHint::new("A", view_action.clone()),
                 ],
             )
         } else if inner.height < 16 {
@@ -2623,7 +2670,7 @@ impl ProviderPickerView {
                     ActionHint::new("Enter", enter_action),
                     ActionHint::new("R", self.tr(MessageId::PickerActionEditKey)),
                     ActionHint::new("M", self.tr(MessageId::PickerActionModels)),
-                    ActionHint::new("A", view_action),
+                    ActionHint::new("/", self.tr(MessageId::SessionsActionSearch)),
                     ActionHint::new("Esc", self.tr(MessageId::PickerActionCancel)),
                 ],
             )
@@ -2633,7 +2680,7 @@ impl ProviderPickerView {
                 buf,
                 &[
                     ActionHint::new("↑↓", self.tr(MessageId::PickerActionMove)),
-                    ActionHint::new("a-z", self.tr(MessageId::PickerActionJump)),
+                    ActionHint::new("/", self.tr(MessageId::SessionsActionSearch)),
                     ActionHint::new("Enter", enter_action),
                     ActionHint::new("A", view_action),
                     // The footer advertises actions for the selected row and
@@ -2678,7 +2725,7 @@ impl ProviderPickerView {
         // Onboarding asks one question. The ordinary provider manager keeps
         // its technical detail pane, but first-run gives the available rows
         // the whole body so 40x12 still has room to choose and proceed.
-        let layout = if self.onboarding_mode {
+        let mut layout = if self.onboarding_mode {
             ListDetailLayout {
                 list: content,
                 detail: Rect::new(content.x, content.y, 0, 0),
@@ -2687,6 +2734,12 @@ impl ProviderPickerView {
         } else {
             ListDetailLayout::split(content, 34)
         };
+        if layout.stacked && filtered.len() < usize::from(layout.list.height) {
+            layout.list.height = filtered.len() as u16;
+            let detail_y = layout.list.bottom().saturating_add(1).min(content.bottom());
+            layout.detail.y = detail_y;
+            layout.detail.height = content.bottom().saturating_sub(detail_y);
+        }
         let selected_pos = filtered
             .iter()
             .position(|(idx, _)| *idx == self.selected_idx)
@@ -2731,9 +2784,11 @@ impl ProviderPickerView {
                     | CredentialState::Legacy
             );
             let hint_style = if is_selected {
-                // The credential label carries its meaning in text; focus
-                // ink must remain readable against the selection background.
-                menu_style::selected_row_style_with_fg(palette::SELECTION_TEXT)
+                menu_style::selected_row_style_with_fg(if has_usable_auth {
+                    palette::SELECTION_TEXT
+                } else {
+                    palette::STATUS_WARNING
+                })
             } else if has_usable_auth {
                 Style::default().fg(palette::TEXT_MUTED)
             } else {
@@ -2887,15 +2942,11 @@ impl ProviderPickerView {
                 // row is short now, so the fact lives here, with the rest of
                 // the provider's detail.
                 row.detail_state_line(),
-                Style::default().fg(palette::TEXT_MUTED),
-            )),
-            // Which place the credential actually came from. A row can read
-            // "key:configured" for four different reasons; naming the one that
-            // won is what lets a user reconcile the picker with a request that
-            // succeeded (or didn't).
-            Line::from(Span::styled(
-                format!("Credential: {}", row.credential_source),
-                Style::default().fg(palette::TEXT_MUTED),
+                Style::default().fg(if row.credential_state == CredentialState::MissingKey {
+                    palette::STATUS_WARNING
+                } else {
+                    palette::TEXT_MUTED
+                }),
             )),
             Line::from(Span::styled(
                 // Whether this model is the provider's default, one the
@@ -2910,6 +2961,17 @@ impl ProviderPickerView {
                 Style::default().fg(palette::TEXT_MUTED),
             )),
         ];
+        // Keep a resolved credential's origin visible. An absent credential
+        // is already named by readiness; its search details remain in the pager.
+        if full || row.credential_source != "not found" {
+            lines.insert(
+                1,
+                Line::from(Span::styled(
+                    format!("Credential: {}", row.credential_source),
+                    Style::default().fg(palette::TEXT_MUTED),
+                )),
+            );
+        }
         // Protocol/capability details explain a route, but must not crowd out
         // its model choices and prices. Credential warnings and consent stay
         // ahead of the model inventory; technical diagnostics follow it.
@@ -4154,6 +4216,11 @@ impl ModalView for ProviderPickerView {
                 self.custom_form_field_mut().push_str(sanitized.trim());
                 true
             }
+            Stage::List if self.search_mode || !self.query.is_empty() => {
+                let sanitized = text.replace(['\r', '\n', '\t'], " ");
+                self.update_query(format!("{}{}", self.query, sanitized));
+                true
+            }
             Stage::List
             | Stage::XaiAuthChoice
             | Stage::ChatgptAuthChoice
@@ -4170,12 +4237,30 @@ impl ModalView for ProviderPickerView {
     fn handle_key(&mut self, key: KeyEvent) -> ViewAction {
         self.last_choice_mouse_selected = None;
         self.hovered_choice = None;
+        if self.stage == Stage::List
+            && (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT)
+        {
+            match key.code {
+                KeyCode::Char('/') if !self.search_mode && self.query.is_empty() => {
+                    self.search_mode = true;
+                    return ViewAction::None;
+                }
+                KeyCode::Char(ch) if self.search_mode => {
+                    let mut query = self.query.clone();
+                    query.push(ch);
+                    self.update_query(query);
+                    return ViewAction::None;
+                }
+                _ => {}
+            }
+        }
         match self.stage {
             Stage::List => match key.code {
                 _ if crate::tui::shell_key_routing::is_tool_details_shortcut(&key) => {
                     self.open_provider_details()
                 }
-                KeyCode::Esc if !self.query.is_empty() => {
+                KeyCode::Esc if self.search_mode || !self.query.is_empty() => {
+                    self.search_mode = false;
                     self.update_query(String::new());
                     ViewAction::None
                 }
@@ -4681,6 +4766,26 @@ impl ModalView for ProviderPickerView {
     }
 
     fn handle_mouse(&mut self, mouse: MouseEvent) -> ViewAction {
+        let over_catalog = matches!(self.stage, Stage::List)
+            && self
+                .catalog_action_hitbox
+                .borrow()
+                .is_some_and(|rect| rect.contains((mouse.column, mouse.row).into()));
+        if mouse.kind == MouseEventKind::Moved {
+            self.catalog_action_hovered = over_catalog;
+        }
+        if over_catalog && mouse.kind == MouseEventKind::Down(MouseButton::Left) {
+            // A catalog view is unfiltered; retaining the search would make
+            // this visible action appear to do nothing.
+            if self.search_mode || !self.query.is_empty() {
+                self.search_mode = false;
+                self.update_query(String::new());
+            }
+            self.toggle_view();
+            self.catalog_action_hovered = false;
+            self.last_list_mouse_selected = None;
+            return ViewAction::None;
+        }
         if matches!(self.stage, Stage::List) {
             let over_details = self
                 .detail_action_hitbox
@@ -4781,6 +4886,8 @@ impl ModalView for ProviderPickerView {
 
     fn render(&self, area: Rect, buf: &mut Buffer) {
         self.choice_row_hitboxes.borrow_mut().clear();
+        self.list_row_hitboxes.borrow_mut().clear();
+        *self.catalog_action_hitbox.borrow_mut() = None;
         *self.detail_action_hitbox.borrow_mut() = None;
         // Managing routes needs room for both options and their explanation,
         // even with only one configured provider. First-run questions and
@@ -5336,6 +5443,100 @@ mod tests {
             .find(|row| row.provider == ApiProvider::Ollama)
             .expect("ollama row");
         assert!(active_ollama.is_configured);
+    }
+
+    #[test]
+    fn explicit_provider_search_accepts_shortcut_letters_and_escape_restores_actions() {
+        let _env = crate::test_support::lock_test_env();
+        let mut picker = ProviderPickerView::new(ApiProvider::Deepseek, &Config::default());
+        let view = picker.view;
+        picker.handle_key(key(KeyCode::Char('/')));
+        for ch in "Anthropic".chars() {
+            assert!(matches!(
+                picker.handle_key(KeyEvent::new(
+                    KeyCode::Char(ch),
+                    if ch.is_uppercase() {
+                        KeyModifiers::SHIFT
+                    } else {
+                        KeyModifiers::NONE
+                    }
+                )),
+                ViewAction::None
+            ));
+        }
+        assert_eq!(picker.query, "Anthropic");
+        assert_eq!(picker.stage, Stage::List);
+        assert_eq!(picker.view, view);
+        // Modified commands retain their own meaning in explicit search.
+        let _ = picker.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
+        assert_eq!(picker.query, "Anthropic");
+        assert!(matches!(
+            picker.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::ALT)),
+            ViewAction::Emit(ViewEvent::OpenTextPager { .. })
+        ));
+        assert!(
+            picker
+                .filtered_rows()
+                .iter()
+                .any(|(_, row)| row.provider == ApiProvider::Anthropic)
+        );
+        picker.handle_key(key(KeyCode::Esc));
+        picker.handle_key(key(KeyCode::Char('/')));
+        assert!(picker.handle_paste("Anthropic"));
+        assert_eq!(picker.query, "Anthropic");
+        picker.handle_key(key(KeyCode::Esc));
+        assert!(!picker.search_mode);
+        assert!(picker.query.is_empty());
+        picker.handle_key(key(KeyCode::Char('a')));
+        assert_ne!(picker.view, view);
+        picker.handle_key(key(KeyCode::Char('/')));
+        picker.handle_key(key(KeyCode::Esc));
+        assert!(!picker.search_mode);
+        picker.handle_key(key(KeyCode::Char('/')));
+        for ch in "anthropic".chars() {
+            picker.handle_key(key(KeyCode::Char(ch)));
+        }
+        assert_eq!(picker.selected_provider(), ApiProvider::Anthropic);
+        let action = picker.handle_key(key(KeyCode::Enter));
+        assert!(
+            matches!(action, ViewAction::EmitAndClose(_)) || picker.stage != Stage::List,
+            "Enter on a search result must apply or open its setup"
+        );
+    }
+
+    #[test]
+    fn provider_catalog_header_click_matches_keyboard_and_clears_stale_hits() {
+        let _env = crate::test_support::lock_test_env();
+        let config = Config::default();
+        for (width, height) in [(40, 12), (80, 24), (140, 40)] {
+            let mut picker = ProviderPickerView::new(ApiProvider::Deepseek, &config);
+            let mut keyboard = ProviderPickerView::new(ApiProvider::Deepseek, &config);
+            render_text(&picker, width, height);
+            let hit = picker
+                .catalog_action_hitbox
+                .borrow()
+                .expect("catalog action");
+            assert!(hit.right() <= width && hit.y < height);
+            assert!(matches!(
+                picker.handle_mouse(MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: hit.x,
+                    row: hit.y,
+                    modifiers: KeyModifiers::NONE,
+                }),
+                ViewAction::None
+            ));
+            keyboard.handle_key(key(KeyCode::Char('a')));
+            assert_eq!(picker.view, keyboard.view);
+            assert_eq!(picker.selected_idx, keyboard.selected_idx);
+            // No matches must not retain clickable provider rows from the
+            // previous frame; the catalog control remains a separate action.
+            picker.update_query("definitely-no-provider-matches-this".into());
+            render_text(&picker, width, height);
+            assert!(picker.list_row_hitboxes.borrow().is_empty());
+            render_text(&picker, 0, 0);
+            assert!(picker.catalog_action_hitbox.borrow().is_none());
+        }
     }
 
     #[test]
@@ -6855,7 +7056,8 @@ mod tests {
         assert_eq!(row.readiness, ResolvedProviderReadiness::MissingKey);
         assert_eq!(row.readiness.label(), "missing key");
         let hint = row.detail_state_line();
-        assert!(hint.contains("key:not-set"));
+        assert!(hint.contains("missing key"));
+        assert!(!hint.contains("key:not-set"));
         assert!(!hint.contains("needs-auth"));
         assert!(!hint.contains("auth:missing"));
         assert!(
@@ -7023,7 +7225,8 @@ mod tests {
 
         let rendered = render_text(&picker, 124, 24);
 
-        assert!(rendered.contains("key:configured"));
+        assert!(rendered.contains("key saved"));
+        assert!(!rendered.contains("key:configured"));
         assert!(!rendered.contains("auth:configured"));
         assert!(rendered.contains("Route: custom-model"));
         let ViewAction::Emit(ViewEvent::OpenTextPager { content, .. }) =
@@ -9271,7 +9474,7 @@ mod tests {
             let text = rows.join("\n");
 
             // Footer keeps every action (it wraps instead of clipping).
-            for label in ["move", "jump", "edit key", "models", "cancel"] {
+            for label in ["move", "search", "edit key", "models", "cancel"] {
                 assert!(text.contains(label), "{w}x{h}: missing '{label}' hint");
             }
             // The Enter action label is dynamic (apply vs set key); one shows.

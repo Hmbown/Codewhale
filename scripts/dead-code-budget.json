@@ -1,7 +1,7 @@
 {
   "_comment": "Ceiling for `#[allow(dead_code)]` across crates/. This number may go down freely; raising it needs a reviewer to say why in the PR. Regenerate with: python3 scripts/check-dead-code-budget.py --update",
   "_issue": "https://github.com/Hmbown/CodeWhale/issues/4785",
-  "total": 185,
+  "total": 174,
   "per_crate": {
     "app-server": 1,
     "core": 5,
@@ -9,6 +9,6 @@
     "models": 5,
     "palette": 20,
     "tools": 2,
-    "tui": 150
+    "tui": 139
   }
 }

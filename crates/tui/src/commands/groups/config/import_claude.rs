@@ -45,7 +45,7 @@ pub(super) fn import_claude_command(app: &mut App, arg: Option<&str>) -> Command
 
     // The plan is shown before anything is written; the only writes are the
     // report and an *unapplied* bundle file. Applying always goes through a
-    // separate consent path (`/mcp import <name> --approve`, `config import`).
+    // separate consent path (`/mcp import approve <review-token>`, `config import`).
     let imports_dir = codewhale_config::codewhale_home()
         .map(|home| home.join("imports"))
         .unwrap_or_else(|_| std::path::PathBuf::from(".codewhale/imports"));
@@ -67,13 +67,13 @@ pub(super) fn import_claude_command(app: &mut App, arg: Option<&str>) -> Command
     };
 
     if apply {
-        return apply_plan(app, &plan, &report_path, wrote_report);
+        return apply_plan(&plan, &report_path, wrote_report);
     }
 
     let mut message = import_claude::render_plan(&plan);
     message.push_str(
         "\n\nNothing above is applied yet. `/import-claude --apply` carries over the \
-         standing instructions and the MCP servers that are not hard-blocked; hooks and \
+         standing instructions. Review MCP servers individually with `/mcp import`; hooks and \
          permission rules stay manual because they run code.",
     );
     if wrote_report {
@@ -100,11 +100,10 @@ pub(super) fn import_claude_command(app: &mut App, arg: Option<&str>) -> Command
 /// Carry over what can be carried over safely, and say exactly what was done.
 ///
 /// `--apply` is the consent: the plan is printed first by the bare command, and
-/// this path never overwrites an existing file, never imports a hard-blocked
-/// MCP source, and never touches hooks or permission rules — those run code, so
+/// this path never overwrites an existing file, never imports MCP servers,
+/// and never touches hooks or permission rules — those run code, so
 /// they stay a human decision.
 fn apply_plan(
-    app: &mut App,
     plan: &import_claude::ClaudeImportPlan,
     report_path: &std::path::Path,
     wrote_report: bool,
@@ -158,23 +157,14 @@ fn apply_plan(
         }
     }
 
-    // 2. MCP servers, through the same consent path `/mcp import <name>
-    //    --approve` uses, so provenance and the consent store stay
-    //    single-sourced. Hard-blocked candidates are refused there and are
-    //    not offered here either.
-    let mcp_path = app.mcp_config_path.clone();
+    // MCP approval must bind the exact bytes and current managed-config
+    // revision shown by the shared preview. Blanket migration cannot grant it.
     for candidate in &plan.mcp_candidates {
-        if candidate.hard_blocked {
-            manual.push(format!(
-                "MCP `{}` is hard-blocked at its source and was not imported.",
-                candidate.name
-            ));
-            continue;
-        }
-        match crate::tui::ui::mcp_import_apply(&app.workspace, &mcp_path, &candidate.name, true) {
-            Ok(message) => done.push(message),
-            Err(error) => manual.push(format!("MCP `{}`: {error}", candidate.name)),
-        }
+        manual.push(if candidate.hard_blocked {
+            format!("MCP `{}` is disabled at its source and was not imported.", candidate.name)
+        } else {
+            format!("MCP `{}` needs a separate review: run /mcp import, then use its displayed approval command. It will be imported OFF.", candidate.name)
+        });
     }
 
     // 3. What stays human, always.

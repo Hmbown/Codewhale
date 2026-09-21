@@ -227,6 +227,7 @@ const MODEL_PROVIDER_LABELS = {
   Moonshot: "Moonshot/Kimi",
   Zai: "Z.ai",
   Minimax: "MiniMax",
+  Stepfun: "StepFun",
   Qwen: "Qwen",
   Arcee: "Arcee",
   Together: "Together",
@@ -250,7 +251,7 @@ const MODEL_PREFIX_PROVIDERS = {
   moonshotai: "Moonshot", minimax: "Minimax", qwen: "Qwen",
   "arcee-ai": "Arcee", together: "Together", nvidia: "Other",
   "opencode-go": "Moonshot", openai: "OpenAi", google: "Google",
-  xai: "Xai", mistral: "Mistral", stepfun: "Other", meta: "Meta",
+  xai: "Xai", mistral: "Mistral", stepfun: "Stepfun", meta: "Meta",
   huggingface: "Other",
 };
 
@@ -273,6 +274,7 @@ const MODEL_NAME_FAMILIES = [
   [/^(kimi|moonshot)/i, "Moonshot"],
   [/^(glm-|zai)/i, "Zai"],
   [/^(minimax|abab)/i, "Minimax"],
+  [/^step(?:-|audio)/i, "Stepfun"],
   [/^(qwen|qwq)/i, "Qwen"],
   [/^(arcee|trinity|afm|virtuoso|maestro|spotlight|blitz)/i, "Arcee"],
   [/^(mimo|xiaomi)/i, "XiaomiMimo"],

@@ -20,7 +20,7 @@ export const home: HomeDict = {
   shotPreview: "ターミナルのプレビュー",
   shotBuild: "v{version} 開発ビルド",
   screenshotAlt:
-    "Codewhale v0.9.12 のターミナル（ビルド 171acee689aa）。新しいセッションに、クジラのマーク、メッセージ入力欄、Full Access と Operate モード、2 件のスケジュール済みタスク、接続中の 21 台の MCP サーバー、推論の強度を最大に設定した GLM-5.3 が表示されている。",
+    "Codewhale v{version} 開発ビルド。クジラのマーク、新しいセッション、入力欄、Ask 権限、Work モード、モデルの状態。独立したターミナルの実際の出力を描画。",
   latestRelease: "最新リリース {tag}",
   releaseUnavailable: "リリース情報を取得できません",
   currentSource: "ソース",

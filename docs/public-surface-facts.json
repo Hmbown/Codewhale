@@ -237,17 +237,17 @@
     ]
   },
   "screenshot": {
-    "readme": "web/public/codewhale-tui-171acee.png",
-    "website": "web/public/codewhale-tui-171acee.png",
-    "sourceVersion": "0.9.12",
-    "sourceCommit": "171acee689aa48d44fc10df93c4a5b1a1d0622f5",
-    "sourceSha256": "48b4f13e37422ece7cfe0f465c3b9c3502dd8195d8436a6f238c495cf978aaa4",
-    "terminal": "unrecorded",
-    "theme": "Blue Stage dark",
-    "capture": "Founder-supplied capture on 2026-09-07 at 22:10:46 of a local v0.9.12 development build whose header reads 171acee689aa: a new session, the braille C-curl whale, Operate mode, Full Access, two scheduled items and 21 MCP connections still connecting. It documents appearance, not a published release or successful task execution. Full Access is the capture posture, not a default.",
+    "readme": "web/public/codewhale-tui-d7a9a1c.png",
+    "website": "web/public/codewhale-tui-d7a9a1c.png",
+    "sourceVersion": "0.10.0",
+    "sourceCommit": "d7a9a1c8c15635a84099d5fc2ee965146cf197c7",
+    "sourceSha256": "73e56158d6ec6c04933ce787c23c07322ce4d509b54050b54b12d181b09314b8",
+    "terminal": "real PTY cell capture rendered with Menlo and Apple Symbols",
+    "theme": "Shoreline dark",
+    "capture": "Captured on 2026-09-20 from the exact d7a9a1c8c156 development build in an isolated empty workspace: canonical whale mark, new session, composer, Ask permissions, Work mode and model status. Rendered directly from terminal cells without changing the content. No fixture conversations or provider requests. This documents appearance, not a published release or completed task. Ask/Work is the captured posture, not a default claim.",
     "sources": [
-      "crates/tui",
-      "web/public/codewhale-tui-171acee.png"
+      "crates/tui/tests/cucumber/launch_card_pty.rs",
+      "web/public/codewhale-tui-d7a9a1c.png"
     ]
   }
 }

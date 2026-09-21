@@ -11,8 +11,8 @@
   --whale-composer-rgb: 20 35 82;
   --whale-elevated: #1a2c63;
   --whale-elevated-rgb: 26 44 99;
-  --whale-selection: #1e3c8f;
-  --whale-selection-rgb: 30 60 143;
+  --whale-selection: #232d41;
+  --whale-selection-rgb: 35 45 65;
   --whale-text-body: #f6f2e8;
   --whale-text-body-rgb: 246 242 232;
   --whale-text-soft: #b6c0d4;
@@ -139,8 +139,8 @@
   --shoreline-composer-rgb: 43 40 46;
   --shoreline-chrome: #1a181c;
   --shoreline-chrome-rgb: 26 24 28;
-  --shoreline-selection: #354967;
-  --shoreline-selection-rgb: 53 73 103;
+  --shoreline-selection: #2c4654;
+  --shoreline-selection-rgb: 44 70 84;
   --shoreline-text-body: #f2ece5;
   --shoreline-text-body-rgb: 242 236 229;
   --shoreline-text-soft: #d9d2dc;
@@ -153,8 +153,8 @@
   --shoreline-text-dim-rgb: 126 117 131;
   --shoreline-border: #49424d;
   --shoreline-border-rgb: 73 66 77;
-  --shoreline-action: #90b9ff;
-  --shoreline-action-rgb: 144 185 255;
+  --shoreline-action: #67b8d6;
+  --shoreline-action-rgb: 103 184 214;
   --shoreline-live: #7fd6c6;
   --shoreline-live-rgb: 127 214 198;
   --shoreline-human: #f6c453;
@@ -199,8 +199,8 @@
   --shoreline-light-composer-rgb: 251 247 241;
   --shoreline-light-chrome: #ede7e0;
   --shoreline-light-chrome-rgb: 237 231 224;
-  --shoreline-light-selection: #c8d9f9;
-  --shoreline-light-selection-rgb: 200 217 249;
+  --shoreline-light-selection: #c9e0e7;
+  --shoreline-light-selection-rgb: 201 224 231;
   --shoreline-light-text-body: #302832;
   --shoreline-light-text-body-rgb: 48 40 50;
   --shoreline-light-text-soft: #4a414c;
@@ -213,8 +213,8 @@
   --shoreline-light-text-dim-rgb: 138 130 144;
   --shoreline-light-border: #d7ced5;
   --shoreline-light-border-rgb: 215 206 213;
-  --shoreline-light-action: #245bc7;
-  --shoreline-light-action-rgb: 36 91 199;
+  --shoreline-light-action: #006684;
+  --shoreline-light-action-rgb: 0 102 132;
   --shoreline-light-live: #1f7a6b;
   --shoreline-light-live-rgb: 31 122 107;
   --shoreline-light-human: #7a5500;

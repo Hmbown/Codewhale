@@ -127,6 +127,8 @@ struct ReadLintsDiagnostic {
 
 #[derive(Serialize)]
 struct ReadLintsFile {
+    #[serde(flatten)]
+    freshness: crate::lsp::DiagnosticFreshness,
     file: String,
     status: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -259,6 +261,7 @@ async fn execute_read_lints(input: Value, context: &ToolContext) -> Result<ToolR
             })
             .collect::<Vec<_>>();
         files.push(ReadLintsFile {
+            freshness: result.freshness,
             file: result.file.display().to_string(),
             status,
             error,
@@ -370,14 +373,15 @@ mod tests {
             _path: &Path,
             _text: &str,
             _wait: Duration,
-        ) -> anyhow::Result<Vec<Diagnostic>> {
+        ) -> anyhow::Result<crate::lsp::client::DiagnosticPublication> {
             self.calls.fetch_add(1, Ordering::Relaxed);
             Ok(vec![Diagnostic {
                 line: 1,
                 column: 1,
                 severity: Severity::Error,
                 message: "boom".into(),
-            }])
+            }]
+            .into())
         }
 
         async fn request(
@@ -402,8 +406,8 @@ mod tests {
             _path: &Path,
             _text: &str,
             _wait: Duration,
-        ) -> anyhow::Result<Vec<Diagnostic>> {
-            Ok(Vec::new())
+        ) -> anyhow::Result<crate::lsp::client::DiagnosticPublication> {
+            Ok(Vec::new().into())
         }
 
         async fn request(
@@ -429,8 +433,8 @@ mod tests {
             _path: &Path,
             _text: &str,
             _wait: Duration,
-        ) -> anyhow::Result<Vec<Diagnostic>> {
-            Ok(self.items.clone())
+        ) -> anyhow::Result<crate::lsp::client::DiagnosticPublication> {
+            Ok(self.items.clone().into())
         }
 
         async fn shutdown(&self) {}
@@ -445,7 +449,7 @@ mod tests {
             _path: &Path,
             _text: &str,
             _wait: Duration,
-        ) -> anyhow::Result<Vec<Diagnostic>> {
+        ) -> anyhow::Result<crate::lsp::client::DiagnosticPublication> {
             anyhow::bail!("server exploded")
         }
 
@@ -461,7 +465,7 @@ mod tests {
             _path: &Path,
             _text: &str,
             _wait: Duration,
-        ) -> anyhow::Result<Vec<Diagnostic>> {
+        ) -> anyhow::Result<crate::lsp::client::DiagnosticPublication> {
             std::future::pending().await
         }
 

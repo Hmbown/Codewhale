@@ -138,13 +138,13 @@ mod tests {
 
 // ---------------------------------------------------------------------------
 // Tideline composer restyle (spec §2 composer decision, §5a "Composer"):
-// rounded border + `[↑]` send hitbox. Translation scaffolding in
+// rounded border + `[↵]` send hitbox. Translation scaffolding in
 // the topbar mold — a pure, deterministic widget over injected state; the
 // composer authority logic (composer_ui.rs) is untouched, and wiring into
 // `ui/frame.rs` is the landing slice after #5698 settles.
 //
 // Cell rules (spec §2): no bezier strokes — `╭─╮│╰╯` border dim at rest and
-// Info on focus; the send `↑` is a 3-cell `[↑]` hitbox right-aligned inside
+// Info on focus; the send `↵` is a 3-cell `[↵]` hitbox right-aligned inside
 // the border. The hand-drawn three-cell crown fluke this cap used to carry
 // was deleted by the 2026-08-29 founder decree (terminal marks must be
 // generated from the brand master path, never hand-drawn); the corner is a
@@ -156,7 +156,7 @@ use unicode_width::UnicodeWidthStr;
 
 use codewhale_palette::{ChromeInk, UiTheme, chrome_style};
 
-/// Fixed width of the painted `[↑]` submit control.
+/// Fixed width of the painted `[↵]` submit control.
 pub const TIDELINE_COMPOSER_SUBMIT_WIDTH: u16 = 3;
 
 /// Blank cell between input content and the painted submit control.
@@ -171,34 +171,17 @@ fn put(buf: &mut Buffer, x: u16, y: u16, text: &str, style: Style) {
     buf.set_stringn(x, y, text, width, style);
 }
 
-fn symbol(glyph: &str, ascii_safe: bool) -> String {
-    if !ascii_safe {
-        return glyph.to_string();
-    }
-    if let Some(fallback) = crate::tui::glyphs::ascii_fallback(glyph) {
-        return fallback.to_string();
-    }
-    glyph
-        .chars()
-        .map(|ch| {
-            crate::tui::glyphs::ascii_fallback(&ch.to_string())
-                .map(str::to_string)
-                .unwrap_or_else(|| ch.to_string())
-        })
-        .collect()
-}
-
 /// Shared geometry for the rounded Tideline composer shell.
 ///
 /// Rendering, launch hit-testing, and the live composer must derive their
 /// interior and submit rect from this one cell map. Otherwise a visible
-/// `[↑]` can drift away from the mouse target at a terminal width boundary.
+/// `[↵]` can drift away from the mouse target at a terminal width boundary.
 #[derive(Debug, Clone, Copy)]
 pub struct TidelineComposerGeometry {
     /// Interior input rows, excluding the one-cell rails, the submit control,
     /// and its one-cell breathing space.
     pub content: Rect,
-    /// The visible three-cell `[↑]` submit affordance.
+    /// The visible three-cell `[↵]` submit affordance.
     pub submit: Rect,
 }
 
@@ -229,25 +212,31 @@ pub fn tideline_composer_geometry(area: Rect) -> TidelineComposerGeometry {
     TidelineComposerGeometry { content, submit }
 }
 
-/// Paint or restore the visible `[↑]` affordance above caller-owned content.
+/// Paint or restore the visible `[↵]` affordance above caller-owned content.
 ///
-/// The standalone shell paints it immediately. The multiline work composer
-/// calls this again after it has painted a long input or queued crumb, so that
+/// The multiline work composer paints this after its input or queued crumb, so that
 /// content can never overwrite the one cell target the user is meant to click.
+/// Ink follows the submission predicate used by the pointer target.
 pub fn render_tideline_composer_submit(
     area: Rect,
     buf: &mut Buffer,
     theme: &UiTheme,
-    focused: bool,
+    can_submit: bool,
     ascii_safe: bool,
 ) {
     if area.width < 6 || area.height < 3 {
         return;
     }
     let geometry = tideline_composer_geometry(area);
-    let send = symbol("[↑]", ascii_safe);
-    let send_ink = if focused {
-        ChromeInk::Active
+    let send = if can_submit {
+        if ascii_safe { "[>]" } else { "[↵]" }
+    } else if ascii_safe {
+        "[.]"
+    } else {
+        "[·]"
+    };
+    let send_ink = if can_submit {
+        ChromeInk::Info
     } else {
         ChromeInk::MetadataDim
     };
@@ -255,7 +244,11 @@ pub fn render_tideline_composer_submit(
         buf,
         geometry.submit.x,
         geometry.submit.y,
-        &send,
-        chrome(theme, send_ink),
+        send,
+        if can_submit {
+            chrome(theme, send_ink).bold()
+        } else {
+            chrome(theme, send_ink)
+        },
     );
 }

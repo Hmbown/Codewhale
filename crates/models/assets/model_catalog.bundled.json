@@ -477,14 +477,20 @@
       "context_window": 256000,
       "id": "step-3.7-flash",
       "input_usd_per_million": 0.2,
-      "max_output": 256000,
       "modalities": [
-        "text"
+        "text",
+        "image",
+        "video"
       ],
       "output_usd_per_million": 1.15,
       "provenance": "bundled",
-      "supported_parameters": [],
-      "supports_reasoning": false
+      "supported_parameters": [
+        "tools",
+        "tool_choice",
+        "reasoning_effort"
+      ],
+      "supports_reasoning": true,
+      "max_output": 256000
     },
     "trinity-large-thinking": {
       "context_window": 262144,
@@ -655,6 +661,56 @@
       "supported_parameters": [
         "reasoning"
       ]
+    },
+    "step-3.5-flash": {
+      "context_window": 256000,
+      "id": "step-3.5-flash",
+      "input_usd_per_million": 0.1,
+      "modalities": [
+        "text"
+      ],
+      "output_usd_per_million": 0.3,
+      "provenance": "bundled",
+      "supported_parameters": [
+        "tools",
+        "tool_choice"
+      ],
+      "supports_reasoning": true
+    },
+    "step-3.5-flash-2603": {
+      "context_window": 256000,
+      "id": "step-3.5-flash-2603",
+      "input_usd_per_million": 0.1,
+      "modalities": [
+        "text"
+      ],
+      "output_usd_per_million": 0.3,
+      "provenance": "bundled",
+      "supported_parameters": [
+        "tools",
+        "tool_choice",
+        "reasoning_effort"
+      ],
+      "supports_reasoning": true
+    },
+    "step-5-preview": {
+      "context_window": 1000000,
+      "id": "step-5-preview",
+      "input_usd_per_million": 1.0,
+      "modalities": [
+        "text",
+        "image",
+        "video"
+      ],
+      "output_usd_per_million": 2.7,
+      "provenance": "bundled",
+      "supported_parameters": [
+        "tools",
+        "tool_choice",
+        "reasoning_effort"
+      ],
+      "supports_reasoning": true,
+      "max_output": 1000000
     }
   },
   "fetched_at": "2026-07-06T00:00:00Z",

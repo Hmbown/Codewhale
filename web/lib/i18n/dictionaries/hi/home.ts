@@ -20,7 +20,7 @@ export const home: HomeDict = {
   shotPreview: "टर्मिनल पूर्वावलोकन",
   shotBuild: "v{version} डेवलपमेंट बिल्ड",
   screenshotAlt:
-    "Codewhale v0.9.12 टर्मिनल, बिल्ड 171acee689aa: नए सेशन में व्हेल का चिह्न, संदेश लिखने का बॉक्स, Full Access और Operate मोड, दो निर्धारित काम, कनेक्ट हो रहे 21 MCP सर्वर और अधिकतम प्रयास स्तर पर GLM-5.3 दिखाई देते हैं।",
+    "Codewhale v{version} डेवलपमेंट बिल्ड: व्हेल चिह्न, नया सत्र, संदेश इनपुट, Ask अनुमतियाँ, Work मोड और मॉडल की स्थिति। अलग टर्मिनल के वास्तविक आउटपुट से बनाया गया दृश्य।",
   latestRelease: "नवीनतम रिलीज़ {tag}",
   releaseUnavailable: "रिलीज़ स्थिति उपलब्ध नहीं",
   currentSource: "सोर्स",
