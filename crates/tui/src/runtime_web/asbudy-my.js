@@ -3466,4 +3466,258 @@
     var tries = 0;
     var t = setInterval(function () { if (bindLogo() || ++tries > 60) clearInterval(t); }, 400);
   }
+
+  /* ── 发图片（2026-09-21 第 44 轮）────────────────────────────────
+   * 引擎早就会收图（`POST /v1/threads/{id}/turns` 的 `images:[{mime,dataBase64}]`），
+   * 官方网页没做入口。这里补上：按钮 / 粘贴 / 拖入三种取图方式，发送时塞进请求。
+   *
+   * 为什么不改官方代码：**拦 fetch** 就够了 —— 官方的流式、乐观 UI 全照旧，
+   * 我们只在它发出 `/turns` 前把 images 拼进 body。
+   *
+   * ⚠️ 两条引擎侧的硬规矩（照抄引擎校验，不自己发明）：
+   *   ① 模型必须是**明确支持图片**的那个（`image_input === 'supported'`）——
+   *      `auto` 和不支持/未知的模型，引擎一律 400（`runtime_threads.rs:9125-9185`）。
+   *   ② `prompt` 不能为空 ⇒ 只发图不打字会被拒，所以空文字时拦下来。
+   */
+  (function bindImageAttach() {
+    var OK_TYPES = { 'image/png': 1, 'image/jpeg': 1, 'image/gif': 1, 'image/webp': 1 };
+    var MAX_ONE = 4 * 1024 * 1024;    // 引擎单图上限
+    var MAX_TOTAL = 5 * 1024 * 1024;  // 引擎单次总量上限
+    var MAX_N = 10;                   // 引擎单次张数上限
+    var pending = [];
+    var capCache = {};
+    var barEl = null;
+
+    function b64(file) {
+      return new Promise(function (res, rej) {
+        var fr = new FileReader();
+        fr.onload = function () {
+          var s = String(fr.result || '');
+          var i = s.indexOf(',');
+          if (i < 0) { rej(new Error('读不出图片内容')); return; }
+          res({ name: file.name || '图片', mime: file.type, dataBase64: s.slice(i + 1), size: file.size });
+        };
+        fr.onerror = function () { rej(new Error('读不出图片内容')); };
+        fr.readAsDataURL(file);
+      });
+    }
+
+    function totalSize() {
+      var n = 0;
+      for (var i = 0; i < pending.length; i++) n += pending[i].size;
+      return n;
+    }
+
+    function note(text) {
+      if (!barEl) return;
+      var t = barEl.querySelector('.ab-img-note');
+      if (t) t.textContent = text || '';
+    }
+
+    function paint() {
+      if (!barEl) return;
+      var strip = barEl.querySelector('.ab-img-strip');
+      if (!pending.length) { barEl.hidden = true; strip.innerHTML = ''; return; }
+      barEl.hidden = false;
+      strip.innerHTML = pending.map(function (p, i) {
+        return '<span class="ab-img-chip"><img alt="" src="data:' + p.mime + ';base64,' + p.dataBase64 + '">' +
+          '<button type="button" title="去掉" data-del="' + i + '">×</button></span>';
+      }).join('');
+      strip.querySelectorAll('button[data-del]').forEach(function (b) {
+        b.onclick = function () {
+          pending.splice(Number(b.getAttribute('data-del')), 1);
+          note('');
+          paint();
+        };
+      });
+    }
+
+    async function addFiles(files) {
+      var list = Array.prototype.slice.call(files || []);
+      if (!list.length) return;
+      note('');
+      for (var i = 0; i < list.length; i++) {
+        var f = list[i];
+        if (!OK_TYPES[f.type]) { note('只支持 PNG / JPEG / GIF / WebP 图片'); continue; }
+        if (f.size > MAX_ONE) { note('单张图片不能超过 4MB'); continue; }
+        if (pending.length >= MAX_N) { note('一次最多 ' + MAX_N + ' 张'); break; }
+        try {
+          var one = await b64(f);
+          if (totalSize() + one.size > MAX_TOTAL) { note('一次总共不能超过 5MB'); break; }
+          pending.push(one);
+        } catch (e) { note('读不出这张图'); }
+      }
+      paint();
+      // 只发图不打字 → 引擎会 400（prompt 不能为空）。**选完图就提醒**，不等客户点发送 ——
+      // 输入框空时官方那个发送按钮本来就是灰的，点了也不会有任何反应。
+      var box = document.getElementById('composer-input');
+      if (pending.length && box && !String(box.value || '').trim()) {
+        note('图片要配一句话一起发送');
+      }
+    }
+
+    /** 当前会话的模型支不支持看图 —— 问引擎要（不猜）。 */
+    function modelSupportsImage() {
+      var tid = MODEL_THREAD;
+      if (!tid) return Promise.resolve('unknown');
+      return api('/v1/threads/' + encodeURIComponent(tid)).then(function (r) {
+        var t = (r && r.body) || {};
+        var model = String(t.model || '').trim();
+        var pid = String(t.model_provider || t.model_provider_id || '').trim();
+        if (!model || model.toLowerCase() === 'auto') return 'unsupported';
+        var key = pid + '|' + model;
+        if (capCache[key]) return capCache[key];
+        return loadProviderModels(pid).then(function (ms) {
+          var hit = (ms || []).filter(function (m) { return m && m.id === model; })[0];
+          var st = (hit && hit.image_input) || 'unknown';
+          capCache[key] = st;
+          return st;
+        });
+      }).catch(function () { return 'unknown'; });
+    }
+
+    function syncButton(cap) {
+      var b = document.getElementById('asbudy-img-btn');
+      if (!b) return;
+      var bad = cap === 'unsupported';
+      b.disabled = !!bad;
+      b.title = bad ? '当前会话的模型不支持图片 —— 换一个支持图片的模型再发'
+                    : '发图片（也可以直接粘贴或拖进来）';
+      b.setAttribute('data-ab-img', cap || 'unknown');
+    }
+
+    function build() {
+      var form = document.getElementById('composer');
+      var actions = document.querySelector('.composer-actions');
+      if (!form || !actions || document.getElementById('asbudy-img-btn')) return !!form && !!actions;
+      var style = document.createElement('style');
+      style.textContent = '.ab-img-bar{padding:6px 2px 0}.ab-img-strip{display:flex;flex-wrap:wrap;gap:6px}' +
+        '.ab-img-chip{position:relative;display:inline-block;line-height:0}' +
+        '.ab-img-chip img{width:56px;height:56px;object-fit:cover;border-radius:6px;border:1px solid var(--line)}' +
+        '.ab-img-chip button{position:absolute;top:-6px;right:-6px;width:18px;height:18px;line-height:1;border-radius:50%;' +
+        'border:1px solid var(--line);background:var(--surface-raised);color:var(--text);cursor:pointer;font-size:12px;padding:0}' +
+        '.ab-img-note{font-size:12px;color:var(--text-soft)}';
+      document.head.appendChild(style);
+
+      barEl = document.createElement('div');
+      barEl.className = 'ab-img-bar';
+      barEl.hidden = true;
+      barEl.innerHTML = '<div class="ab-img-strip"></div><div class="ab-img-note"></div>';
+      form.insertBefore(barEl, form.querySelector('.composer-bar'));
+
+      var pick = document.createElement('input');
+      pick.type = 'file';
+      pick.accept = 'image/png,image/jpeg,image/gif,image/webp';
+      pick.multiple = true;
+      pick.hidden = true;
+      pick.onchange = function () { addFiles(pick.files); pick.value = ''; };
+      form.appendChild(pick);
+
+      var btn = document.createElement('button');
+      btn.type = 'button';
+      btn.id = 'asbudy-img-btn';
+      btn.className = 'quiet-button';
+      btn.textContent = '图片';
+      btn.onclick = function () { pick.click(); };
+      actions.insertBefore(btn, actions.firstChild);
+
+      return true;
+    }
+
+    // 粘贴：焦点在输入框时贴图
+    document.addEventListener('paste', function (e) {
+      try {
+        var dt = e.clipboardData;
+        if (!dt || !dt.items) return;
+        var files = [];
+        for (var i = 0; i < dt.items.length; i++) {
+          var it = dt.items[i];
+          if (it.kind === 'file' && OK_TYPES[it.type]) {
+            var f = it.getAsFile();
+            if (f) files.push(f);
+          }
+        }
+        if (files.length) { e.preventDefault(); addFiles(files); }
+      } catch (err) { /* 粘贴拿不到就算了 */ }
+    });
+
+    // 拖进来
+    document.addEventListener('dragover', function (e) {
+      try {
+        if (e.dataTransfer && Array.prototype.some.call(e.dataTransfer.types || [], function (t) { return t === 'Files'; })) {
+          e.preventDefault();
+        }
+      } catch (err) {}
+    });
+    document.addEventListener('drop', function (e) {
+      try {
+        var t = e.target;
+        if (!t || !t.closest || !t.closest('#composer')) return;
+        if (!e.dataTransfer || !e.dataTransfer.files || !e.dataTransfer.files.length) return;
+        e.preventDefault();
+        addFiles(e.dataTransfer.files);
+      } catch (err) {}
+    });
+
+    // 只发图不打字 → 引擎会 400（prompt 不能为空），这里拦住说清楚
+    document.addEventListener('click', function (e) {
+      var t = e.target;
+      if (!t || !t.closest || !t.closest('#send-message')) return;
+      if (!pending.length) return;
+      var box = document.getElementById('composer-input');
+      if (box && !String(box.value || '').trim()) {
+        e.preventDefault();
+        e.stopPropagation();
+        note('图片要配一句话一起发（引擎不接受只有图片的消息）');
+      }
+    }, true);
+
+    // 发送时把图拼进 /turns 的请求体
+    var prevFetch = window.fetch;
+    window.fetch = function (url, opt) {
+      var next = opt;
+      try {
+        var u = typeof url === 'string' ? url : ((url && url.url) || '');
+        var meth = String((opt && opt.method) || 'GET').toUpperCase();
+        if (pending.length && meth === 'POST' && /\/v1\/threads\/[^\/?]+\/turns$/.test(u) && opt && typeof opt.body === 'string') {
+          var body = JSON.parse(opt.body);
+          if (!body.images || !body.images.length) {
+            body.images = pending.map(function (p) { return { mime: p.mime, dataBase64: p.dataBase64 }; });
+            next = Object.assign({}, opt, { body: JSON.stringify(body) });
+          }
+        }
+      } catch (err) { next = opt; }
+      var sent = prevFetch.call(this, url, next);
+      try {
+        if (next !== opt && sent && sent.then) {
+          sent.then(function (r) {
+            if (r && r.ok) { pending = []; note(''); paint(); }
+            else { note('图片没能发出去 —— 当前模型可能不支持图片'); }
+          }).catch(function () {});
+        }
+      } catch (err) {}
+      return sent;
+    };
+
+    // 进页面 / 换会话时刷新按钮状态
+    var lastTid = '';
+    function tick() {
+      if (!build()) return;
+      if (MODEL_THREAD !== lastTid) {
+        lastTid = MODEL_THREAD;
+        capCache = {};                       // 换了会话 → 能力可能不同，重查
+        modelSupportsImage().then(syncButton);
+      }
+      // 按钮必须总有能力标记（会话还没选出来时是 unknown —— 不猜，也不假装支持）
+      var bb = document.getElementById('asbudy-img-btn');
+      if (bb && !bb.getAttribute('data-ab-img')) syncButton('unknown');
+    }
+    if (!tick()) {
+      var n = 0;
+      var t = setInterval(function () { if (tick() || ++n > 60) clearInterval(t); }, 400);
+    } else {
+      var n2 = 0;
+      var t2 = setInterval(function () { if (++n2 > 150) { clearInterval(t2); return; } tick(); }, 1000);
+    }
+  })();
 })();
