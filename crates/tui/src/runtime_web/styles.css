@@ -2004,5 +2004,12 @@ body.asb-settings-only .ab-box {
   box-shadow: none;
   background: transparent;
 }
-body.asb-settings-only .ab-head { display: none; }
+body.asb-settings-only .ab-head { display: flex; }
+/* 标题与「关闭」仍由**桌面那个窗口**提供（窗口标题栏＋×）—— 这里不能重复一份（会变成两个关闭）。
+   ⚠️ 但「← 返回」不能一起拆（2026-09-21）：窗口的 × 只能**关掉整个窗口**，而子面板要的是
+   「回上一层」（实测：从「我的」菜单点进「项目管理」后菜单那一层已被销毁，想再看另一个
+   面板只能重新点「我的」再找一遍）。所以：带返回的层留剩下这条返回栏，没有返回的层照样整条收起。 */
+body.asb-settings-only .ab-head .ab-title,
+body.asb-settings-only .ab-head .ab-x { display: none; }
+body.asb-settings-only .ab-head.ab-head-bare { display: none; }
 body.asb-settings-only .ab-body { padding: 16px 18px; }

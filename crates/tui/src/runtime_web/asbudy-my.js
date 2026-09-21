@@ -29,9 +29,11 @@
     // 小屏再用 92vw 兜住。配色仍是旧的 GitHub 深色（不在这次的改动范围，已单独记档）。
     '.ab-box{background:var(--surface);border:1px solid var(--line);border-radius:12px;width:min(880px,92vw);max-height:88vh;display:flex;flex-direction:column;overflow:hidden;box-shadow:0 12px 48px rgba(0,0,0,.6)}',
     '.ab-head{display:flex;justify-content:space-between;align-items:center;padding:12px 18px;border-bottom:1px solid var(--line);gap:14px}',
-    '.ab-title{font-size:15px;color:var(--text);font-weight:600}',
+    '.ab-title{font-size:15px;color:var(--text);font-weight:600;margin-right:auto}',
     '.ab-x{color:var(--text-dim);cursor:pointer;font-size:14px;border:1px solid var(--line);border-radius:6px;padding:3px 10px;background:transparent}',
     '.ab-x:hover{color:var(--text);border-color:var(--text-dim)}',
+    '.ab-back{color:var(--text-dim);cursor:pointer;font:inherit;font-size:14px;border:1px solid var(--line);border-radius:6px;padding:3px 10px;background:transparent;flex:none}',
+    '.ab-back:hover{color:var(--text);border-color:var(--text-dim)}',
     '.ab-body{padding:14px 18px;overflow:auto}',
     '.ab-menu-item{display:block;width:100%;text-align:left;padding:12px 14px;border:1px solid var(--line);border-radius:8px;margin-bottom:8px;cursor:pointer;background:transparent;color:var(--text);font-size:14px}',
     '.ab-menu-item:hover{border-color:var(--action);background:var(--action-soft)}',
@@ -249,12 +251,48 @@
   });
 
   /* ── 浮层 ── */
-  function closeLayer() { var o = document.getElementById('asbudy-layer'); if (o) o.remove(); }
-  function openLayer(title, build) {
+  // 「层」的记录：栈里每一项 = **怎么把这一层重新打开**。用来实现『← 返回』。
+  // ⚠️ 为什么需要它（2026-09-21 老板报「子界面没有返回按钮」，实测确认）：这个浮层是
+  //   **同一个框换内容** —— `openLayer` 每次都先 `closeLayer` 再重建，而且只有一个出口
+  //   「关闭」＝**退出整个浮层**。于是从「我的」菜单点进「项目管理」之后菜单那一层已经被销毁，
+  //   想再看另一个面板只能重新点「我的」、在 14 项里再找一遍（实测：菜单项 14 → 0）。
+  //   现在：只要这一层**上面还有层**，标题左边就多一个「← 返回」，点了回到上一层。
+  //   ⚠️ 24 个 openLayer 调用点**一个都不用改** —— 层级关系由栈自己推出来（不靠人记得传参）。
+  var layerStack = [];
+
+  function closeLayer() {
+    var o = document.getElementById('asbudy-layer');
+    if (o) o.remove();
+    layerStack = [];                      // 浮层整个关掉 = 这条链全没了
+  }
+
+  function openLayer(title, build, opts) {
+    var o = opts || {};
+    var prev = layerStack.slice();         // closeLayer 会把栈清空，先留一份
     closeLayer();
+    layerStack = prev.concat([{ title: title, build: build, opts: o }]);
+    var hasParent = prev.length > 0 && !o.noBack;   // 上面还有层 → 给「← 返回」
+
     var L = document.createElement('div'); L.id = 'asbudy-layer';
     var box = document.createElement('div'); box.className = 'ab-box';
     var head = document.createElement('div'); head.className = 'ab-head';
+    // 没有「返回」可给（栈底那一层）→ 打个记号：桌面窗口里的浮层会把标题栏整条收起来
+    // （外壳由**桌面那个窗口**提供：标题 + ×。带进子面板就不一样了，见 styles.css 里那段注释）
+    if (!hasParent) head.classList.add('ab-head-bare');
+    if (hasParent) {
+      var bk = document.createElement('button');
+      bk.className = 'ab-back'; bk.type = 'button'; bk.textContent = '← 返回';
+      bk.title = '回到上一层';
+      bk.addEventListener('click', function () {
+        var up = layerStack[layerStack.length - 2];      // 上一层
+        // ⚠️ 要弹掉**两层**（自己 ＋ 上一层）—— 上一层马上会被重开、重新压回栈里。
+        //    只弹一层的话，重开时它会把自己那条旧记录当成「父层」⇒ 菜单层（栈底）也会冒出返回按钮
+        //    （2026-09-21 实测抓到）。
+        layerStack = layerStack.slice(0, Math.max(0, layerStack.length - 2));
+        if (up) openLayer(up.title, up.build, up.opts);  // 重开上一层（它还自己决定要不要返回）
+      });
+      head.appendChild(bk);
+    }
     var t = document.createElement('span'); t.className = 'ab-title'; t.textContent = title;
     var x = document.createElement('button'); x.className = 'ab-x'; x.textContent = '关闭'; x.type = 'button';
     head.appendChild(t); head.appendChild(x);
@@ -3354,7 +3392,10 @@
       if (sp.get('settings') !== '1') return;
       // 这个 iframe 是拿来「只当设置面板用」的 —— 挂个记号让样式把官方三栏（会话/对话/预览）
       // 收起来。不然老板看到的是「设置面板 + 三栏对话」一起冒出来（2026-09-17 报的）。
-      document.body.classList.add('asb-settings-only');
+      // ⚠️ **只在桌面窗口里**（iframe）这么干（2026-09-21）：它不光收三栏，还会把浮层自己的
+      //   标题＋「关闭」拆掉（外壳由桌面那个窗口提供）。单独访问（手机 / 直接打开）时没有那层外壳，
+      //   拆了就变成「铺满屏幕、一个按钮都没有」—— 进去出不来。
+      if (window.self !== window.top) document.body.classList.add('asb-settings-only');
       var tries = 0;
       var t = setInterval(function () {
         if (typeof openAdvanced === 'function' && document.getElementById('composer-input')) {
@@ -3376,7 +3417,8 @@
       if (sp.get('my') !== '1') return;
       // 只当「我的」面板用：把官方三栏（会话 / 对话 / 预览）收起来，
       // 否则加载瞬间会先闪一下三栏再盖上层（跟 ?settings=1 同一个理由）。
-      document.body.classList.add('asb-settings-only');
+      // ⚠️ 同样**只在桌面窗口里**（if­rame）—— 否则浮层会连自己的标题与「关闭」一起没掉（见上面那处注释）。
+      if (window.self !== window.top) document.body.classList.add('asb-settings-only');
       var tries = 0;
       var t = setInterval(function () {
         if (typeof openMyMenu === 'function' && document.getElementById('composer-input')) {
@@ -3407,7 +3449,8 @@
     try {
       var sp = new URLSearchParams(location.search);
       if (sp.get('usage') !== '1') return;
-      document.body.classList.add('asb-settings-only');
+      // ⚠️ 只有桌面窗口里才拆外壳（同 ?my=1 那处：单独访问时拆了会「进去出不来」）
+      if (window.self !== window.top) document.body.classList.add('asb-settings-only');
       var tries = 0;
       var t = setInterval(function () {
         if (typeof openTokenUsage === 'function' && document.getElementById('composer-input')) {
