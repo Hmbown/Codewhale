@@ -88,9 +88,35 @@
       ],
       "supports_reasoning": true
     },
+    "deepseek-v4-flash": {
+      "context_window": 1000000,
+      "id": "deepseek-v4-flash",
+      "max_output": 384000,
+      "modalities": [
+        "text"
+      ],
+      "provenance": "bundled",
+      "supported_parameters": [
+        "reasoning"
+      ],
+      "supports_reasoning": true
+    },
     "deepseek-flash": {
       "context_window": 1000000,
       "id": "deepseek-flash",
+      "max_output": 384000,
+      "modalities": [
+        "text"
+      ],
+      "provenance": "bundled",
+      "supported_parameters": [
+        "reasoning"
+      ],
+      "supports_reasoning": true
+    },
+    "deepseek-v4-flash-vision-exp": {
+      "context_window": 1000000,
+      "id": "deepseek-v4-flash-vision-exp",
       "max_output": 384000,
       "modalities": [
         "text",

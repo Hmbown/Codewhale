@@ -85,47 +85,6 @@
             "output": 384000
           }
         },
-        "deepseek-v4-flash": {
-          "id": "deepseek-v4-flash",
-          "base_model": "deepseek-v4-flash",
-          "name": "DeepSeek V4 Flash",
-          "family": "deepseek",
-          "reasoning": true,
-          "tool_call": true,
-          "modalities": {
-            "input": [
-              "text"
-            ],
-            "output": [
-              "text"
-            ]
-          },
-          "limit": {
-            "context": 1000000,
-            "output": 384000
-          }
-        },
-        "deepseek-v4-flash-vision-exp": {
-          "id": "deepseek-v4-flash-vision-exp",
-          "base_model": "deepseek-v4-flash",
-          "name": "DeepSeek V4 Flash Vision (experimental)",
-          "family": "deepseek",
-          "reasoning": true,
-          "tool_call": true,
-          "modalities": {
-            "input": [
-              "text",
-              "image"
-            ],
-            "output": [
-              "text"
-            ]
-          },
-          "limit": {
-            "context": 1000000,
-            "output": 384000
-          }
-        },
         "deepseek-flash": {
           "id": "deepseek-flash",
           "base_model": "deepseek-flash",
@@ -136,7 +95,8 @@
           "tool_call": true,
           "modalities": {
             "input": [
-              "text"
+              "text",
+              "image"
             ],
             "output": [
               "text"
