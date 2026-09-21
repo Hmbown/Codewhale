@@ -99,6 +99,46 @@ change, a project-file change) into the prefix — append it as a user-role
 message instead. A later request must be `previous ⊕ suffix` unless a logged
 header change or a history reset explains the difference.
 
+## Fork-prefix inheritance (subagents)
+
+A forked subagent (`fork_context=true`) on the same route/model extends the
+parent's cached prefix instead of cold-starting: it adopts the parent's
+exact system bytes and sends the longest byte-equal head of the parent's
+wire tool block on its first request. The rest of its grant stays deferred
+and activates on demand, so truncation costs cache bytes, never capability.
+
+Contract details:
+
+- **Hot proof required.** The turn loop snapshots each final request's
+  header plus a hit count carried forward across append-only requests;
+  the gate (`resolve_fork_inherit`, pure) admits only a provably hot
+  (`>0` hits), same-route head. Spawns execute before the current
+  request's usage lands, so without the carry every mid-turn spawn
+  would read cold.
+- **Wire-canonical comparison.** Both sides canonicalize through
+  `tool_to_api_json` (the chat-API shape); internal-only flags
+  (`defer_loading`, `allowed_callers`) never reach the wire and cannot
+  false-negative the match.
+- **Graceful tiers.** `inherited_full` (whole head) prices shared
+  history as hits; `inherited_prefix` (partial head) still prices the
+  system plus matched tools. Fresh spawns, grandchildren, resumes,
+  route skew, and cold prefixes stay cold with distinct reasons.
+- **KV-cache effect:** frozen-prefix extension. The child's first
+  request is `parent-head ⊕ suffix` (framing + task); nothing volatile
+  is spliced into the prefix.
+
+Measured child first-response (same-binary A/B, DeepSeek, unique
+histories; DeepSeek counts hits in 64-token blocks): true cold 0/9421
+hits; primed cold 4736/9389; prefix k=3 5504/9941; full k=6
+8576/13251. Trial readout: `CODEWHALE_FORK_TRIAL=1` mirrors the
+decision, prefix span, history-divergence point, and cache split to
+stderr as JSON lines; `CODEWHALE_FORK_INHERIT=off` is the control arm.
+
+Known follow-ups (measured, not implemented): fork transcripts freeze
+at turn 1 (the live tail never rides, capping wins at system+tools);
+framing blocks sit ahead of where the tail would; v1 is single-level
+(grandchildren carry ~40KB all-miss transcripts today).
+
 ## Deferred: full reconstructability (Layer 3)
 
 DeepSeek Harness derives every request from an append-only session log via a

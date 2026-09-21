@@ -19,7 +19,7 @@ Workflow 通过同一个子智能体运行时执行命名步骤；Fleet 管理�
 按 `Tab` 补全 composer 菜单，或在 composer 为空时循环切换可见模式:**Plan → Work → Operate → Plan**。`Tab` 从不发送或排队 composer 文本；用 `Enter` 发送或排队。按 `Shift+Tab` 循环切换权限姿态(Ask → Auto-Review → Full Access)。按 `Ctrl+T` 循环切换推理强度。运行 `/mode` 打开模式选择器，或直接用 `/mode work`、`/mode plan`、`/mode operate` 切换。
 
 - **Plan**:设计优先的提示方式。稳定的原语名称保持熟悉，但运行时集中拒绝文件修改和 shell 执行。只读检查与策略允许的研究(包括延迟的 Web 搜索/抓取)仍然可用。
-- **Work**(内部为 `agent`):普通的多步执行。第一回合的工具箱包含 `read`、`write`、`edit`、`bash`、`agent` 和 `todo_write`，以及无需搜索即可使用的目标控制工具 `create_goal`、`get_goal` 和 `update_goal`。创建目标仍须用户明确要求；审批、沙箱、仓库法和托管策略决定什么可以执行。
+- **Work**(内部为 `agent`):普通的多步执行。第一回合的工具箱包含 `read`、`write`、`edit`、`bash`、`todo_write` 和 `create_goal`，以及合成工具 `tool_search`；`agent`、`workflow`、`get_goal` 和 `update_goal` 通过搜索发现加载（`get_goal`/`update_goal` 在目标激活时直接可用）。创建目标仍须用户明确要求；审批、沙箱、仓库法和托管策略决定什么可以执行。
 - **Operate**:通过计划中的步骤和已验证的结果推进目标。它与 Work 使用相同的工具和执行权限，Fleet 管理执行这些步骤的子智能体及其角色。小任务或紧密耦合的工作由父会话直接完成。多步骤委派先列出步骤、依赖、明确的文件范围和完成检查——如果只是单个有限的子任务，可跳过这一仪式——再通过现有 Workflow 执行。独立步骤可以并行；下一阶段接收上一阶段的结果，缺少必要结果时不会启动依赖它的工作。单个独立任务可以直接调用 `agent`；修改应通过 followup 复用已有子智能体。进度按已完成、受阻和下一步汇报。**派发不等于完成** — 有写权限的子智能体必须返回真实的验证证据。
 
 `Act` 和 `/mode act` 仍然是 Work 的兼容别名。保存的设置仍然规范化为内部值 `agent`。

@@ -136,7 +136,7 @@ fn agent_list_event(manager: &SubAgentManager, active_session_id: &str) -> Event
 }
 
 const MCP_REGISTRY_FIRST_INSTRUCTION_SOURCE: &str = "runtime:mcp-registry-first";
-const MCP_REGISTRY_FIRST_INSTRUCTION: &str = "## MCP Registry\n\nThe Registry installs and connects a local MCP server when this session lacks a capability. It is a fallback for a capability you do not have, not a step before ordinary work.\n\nPrefer what is already available, in order: tools already in this catalog, the project's own scripts, tests, and dev tooling, and platform capabilities. Creating a file, reading a fixture, running a repo command, and checking your own output are ordinary work — do them directly.\n\nReach for the Registry once you have identified a specific capability that no available tool covers and that you would otherwise install or reimplement, such as a document or media converter, access to an external database or service, or a protocol client. Then call `registry_sync` with a `query` naming that capability; it scores the local Registry snapshot host-side and returns at most eight matches, so the full index never enters the conversation. When a returned server plausibly covers that capability, call `start_registry_mcp_server` with its exact name rather than installing or running its package command through the shell. If nothing matches, refine the query once, then continue with local tools.\n\nBoth Registry tools are deferred: load one with `tool_search` before its first call, and use the returned schema. If a call instead reports that it only loaded the schema, retry once with that schema. Do not go searching for them for work you can already do.";
+const MCP_REGISTRY_FIRST_INSTRUCTION: &str = "## MCP Registry\n\nThe Registry installs a local MCP server when this session lacks a capability — a fallback for a capability you do not have, not a step before ordinary work. Prefer what is already available and do ordinary work directly; only reach for `registry_sync` with a `query` naming a specific missing capability. Both Registry tools are deferred: load one with `tool_search` before its first call. Start a match with `start_registry_mcp_server` and its exact name rather than installing or running its package command through the shell.";
 const ISOLATED_CHAT_ENGINE_PROMPT: &str = "You are Codewhale Chat. Answer the user's request directly and conversationally. This isolated chat-only session has no local workspace, project, memory, skill, account, credential, path, runtime context, or tools.";
 
 pub(crate) fn sanitize_isolated_chat_attachments(mut text: String) -> String {
@@ -884,6 +884,13 @@ pub struct Engine {
     /// Additive exact provider id. `None` preserves the legacy root-literal
     /// custom route across snapshots and config reloads.
     api_provider_id: Option<String>,
+    /// Live header cell for fork-prefix inheritance: the turn loop writes
+    /// the latest request's exact (system, tools, route, hit-flag) here
+    /// per model call, and fork contexts clone the handle so a
+    /// same-route child can extend the parent's cached prefix. Safe as
+    /// a session-lifetime cell: turns run strictly one at a time, so it
+    /// always holds the latest request of the running turn.
+    live_header: crate::prompt_zones::SharedLiveHeader,
     active_route_limits: Option<codewhale_config::route::RouteLimits>,
     active_route_capabilities: codewhale_config::route::RouteCapabilities,
     /// The endpoint the current client was built from: base URL, endpoint
@@ -1816,6 +1823,7 @@ impl Engine {
             api_provider,
             api_provider_identity,
             api_provider_id,
+            live_header: crate::prompt_zones::new_live_header_cell(),
             active_route_limits,
             active_route_capabilities: codewhale_config::route::RouteCapabilities::default(),
             active_route_endpoint: None,
@@ -4564,6 +4572,7 @@ impl Engine {
         mcp_access: McpAccess,
         route: TurnRouteContext,
         turn_id: &str,
+        turn_goal_objective: Option<&str>,
     ) -> TurnToolBuild {
         // Account-owned Chat is a text-only inference boundary. Do not build
         // native/plugin/dynamic registries, connect or snapshot MCP, capture a
@@ -4632,6 +4641,7 @@ impl Engine {
             .await;
             Some(SubAgentForkContext {
                 messages: self.messages_with_turn_metadata(),
+                live_header: Arc::clone(&self.live_header),
                 structured_state_block: state.to_system_block(),
                 // Resolve at spawn time so a todo_write earlier in this turn
                 // reaches the child rather than freezing turn-start state.
@@ -4819,7 +4829,20 @@ impl Engine {
         // The surface budget belongs to the route the request would go to,
         // which is not necessarily the installed one under auto routing.
         let capability = route.capability_profile();
-        let always_load = self.config.tools_always_load.clone();
+        let mut always_load = self.config.tools_always_load.clone();
+        // Token diet: get/update_goal cannot succeed without an active goal,
+        // so they stay deferred until one exists. Keyed off the TURN's
+        // resolved goal (the same `NextTurnPromptContext.goal_objective`
+        // the turn fragment renders), never ambient engine config:
+        // production installs the turn goal before this build while
+        // preview builds without installing, so ambient state would
+        // diverge preview from the wire body on detached-goal turns.
+        // Same-field gating also means no new cache break — the tools
+        // flip exactly when the fragment flips.
+        if turn_goal_objective.is_some() {
+            always_load.insert("get_goal".to_string());
+            always_load.insert("update_goal".to_string());
+        }
         self.turn_tool_surface_budget = Some(capability.tool_surface_budget);
         let catalog = build_model_tool_catalog_with_surface(
             tool_registry.to_api_tools_with_cache(true),
@@ -5422,6 +5445,7 @@ impl Engine {
                     reasoning_effort_auto: self.session.reasoning_effort_auto,
                 },
                 &turn_id_for_mailbox,
+                prompt_context.goal_objective.as_deref(),
             )
             .await;
         let tool_catalog_for_event = Some(surface.catalog.clone());

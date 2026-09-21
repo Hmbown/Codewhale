@@ -70,32 +70,20 @@ fn published_synthetic_names_agree_with_the_synthetic_predicate() {
 
 #[test]
 fn first_turn_surface_is_stable_across_plan_work_and_operate() {
+    // Token diet: agent+workflow (21KB of schema) and get/update_goal
+    // (meaningless without an active goal) stay deferred; discovery via
+    // tool_search restores them on demand.
     assert_eq!(
         DEFAULT_ACTIVE_NATIVE_TOOLS,
-        &[
-            "read",
-            "write",
-            "edit",
-            "bash",
-            "agent",
-            "workflow",
-            "todo_write",
-            "create_goal",
-            "get_goal",
-            "update_goal"
-        ]
+        &["read", "write", "edit", "bash", "todo_write", "create_goal"]
     );
     let expected = [
-        "agent",
         "bash",
         "create_goal",
-        "get_goal",
-        "update_goal",
         "edit",
         "read",
         "todo_write",
         "tool_search",
-        "workflow",
         "write",
     ]
     .into_iter()
@@ -238,7 +226,9 @@ fn successful_cached_execution_updates_lru_without_granting_uncached_names() {
     remove_evicted_cache_activations(&catalog, &mut active, delta.evicted);
     active.extend(delta.admitted);
     assert!(cache.names().any(|name| name == "deferred-0"));
-    assert!(!cache.names().any(|name| name == "deferred-1"));
+    // Priority order: deferred-7 was the lowest-priority entry of the
+    // first batch and was never re-touched, so it is the victim.
+    assert!(!cache.names().any(|name| name == "deferred-7"));
 
     assert!(!touch_cached_tool_after_execution(
         &catalog,
@@ -320,7 +310,7 @@ fn unknown_and_wildcard_allowlists_keep_mcp_startup() {
 }
 
 #[test]
-fn compact_surface_keeps_agent_and_workflow_eager() {
+fn compact_surface_keeps_agent_and_workflow_deferred() {
     let catalog = build_model_tool_catalog_with_surface(
         [
             "read",
@@ -346,9 +336,27 @@ fn compact_surface_keeps_agent_and_workflow_eager() {
                 .iter()
                 .find(|definition| definition.name == name)
                 .and_then(|definition| definition.defer_loading),
-            Some(false),
+            Some(true),
             "{name}"
         );
+    }
+}
+
+#[test]
+fn deferred_core_tools_restore_through_always_load() {
+    // The diet's escape hatch: discovery/activation and the goal-aware
+    // catalog build in `engine.rs` re-eager exactly these names.
+    let mut catalog = ["agent", "workflow", "get_goal", "update_goal", "read"]
+        .into_iter()
+        .map(tool)
+        .collect::<Vec<_>>();
+    let always_load = ["agent", "workflow", "get_goal", "update_goal"]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<HashSet<_>>();
+    apply_native_tool_deferral(&mut catalog, &always_load);
+    for definition in &catalog {
+        assert_eq!(definition.defer_loading, Some(false), "{}", definition.name);
     }
 }
 

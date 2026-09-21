@@ -5868,20 +5868,17 @@ command = "echo project"
         // here would never fire. This table is checked in both directions, so
         // a rename fails on the missing entry and a classifier change fails on
         // the mismatched category.
+        // Token diet: agent+workflow and get/update_goal are deferred by
+        // default (discoverable via tool_search), so they left the eager
+        // table; their classifications are pinned with the other
+        // deferred tools below instead.
         const EXPECTED: &[(&str, &str)] = &[
             ("read", "safe"),
             ("write", "file_write"),
             ("edit", "file_write"),
             ("bash", "shell"),
-            // The router itself touches nothing a hook needs to gate.
-            ("agent", "other"),
-            ("workflow", "other"),
             ("todo_write", "safe"),
-            // Goal controls retain their existing hook classification when
-            // promoted from deferred discovery to the eager catalog.
             ("create_goal", "other"),
-            ("get_goal", "other"),
-            ("update_goal", "other"),
         ];
         for name in crate::core::engine::tool_catalog::DEFAULT_ACTIVE_NATIVE_TOOLS {
             let expected = EXPECTED.iter().find(|(n, _)| n == name).map(|(_, c)| *c);
@@ -5901,6 +5898,14 @@ command = "echo project"
                  it so this table keeps describing what actually ships."
             );
         }
+
+        // Deferred by default, still classified: the router touches
+        // nothing a hook needs to gate, and the goal controls keep
+        // their classification when promoted to eager.
+        assert_eq!(tool_category_for("agent", None), "other");
+        assert_eq!(tool_category_for("workflow", None), "other");
+        assert_eq!(tool_category_for("get_goal", None), "other");
+        assert_eq!(tool_category_for("update_goal", None), "other");
 
         // The shell surface.
         assert_eq!(tool_category_for("Bash", None), "shell");

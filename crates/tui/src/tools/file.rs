@@ -623,6 +623,17 @@ async fn contract_mutation_result(
 ) -> ToolResult {
     let paths = [file_path.to_path_buf()];
     let diagnostics = lsp_diagnostics_for_paths(context, &paths).await;
+    // Echolocation: the model-facing receipt is one line while the diff
+    // rides metadata for the TUI, so the echo tells the model what its
+    // edit hit (touched symbols) and what hears it (impacted callers).
+    // Deterministic, hard-budgeted, None when there is nothing to say.
+    let mut summary = summary;
+    if let Some(echo) =
+        crate::tools::echolocation::sound_edit_echo(&context.workspace, file_path, before, after)
+    {
+        summary.push_str("\n\n");
+        summary.push_str(&echo);
+    }
     ToolResult::success(summary).with_metadata(json!({
         "event": "file.mutation",
         "lsp_diagnostics": diagnostics,
@@ -774,7 +785,16 @@ impl ReadFileTool {
         enforce_read_denylist(&file_path, "read")?;
         check_file_operation_cancelled(context)?;
         let bytes = tokio::fs::read(&file_path).await.map_err(|error| {
-            ToolError::execution_failed(format!("Failed to read {}: {error}", file_path.display()))
+            let mut message = format!("Failed to read {}: {error}", file_path.display());
+            // Miss echo: only for genuine NotFound — never for denylist or
+            // permission failures, where listing the parent would answer a
+            // refused probe.
+            if error.kind() == std::io::ErrorKind::NotFound
+                && let Some(echo) = crate::tools::echolocation::sound_miss_echo(&file_path)
+            {
+                message.push_str(&echo);
+            }
+            ToolError::execution_failed(message)
         })?;
         // #6283: every read response carries the file's byte size, line
         // count, and truncation flag so the caller can page deliberately
@@ -862,6 +882,24 @@ impl ReadFileTool {
                 ));
             }
         }
+
+        // Echolocation: stateless kin footer sounded fresh from source
+        // (no index, no new deps). Deterministic and hard-budgeted, so a
+        // repeated read is byte-identical. Two distinct files read in
+        // this pod put the next read there into the terminal buzz
+        // (callers included).
+        let buzz = file_path.parent().is_some_and(|parent| {
+            context.pod_visit_count(parent) >= crate::tools::echolocation::BUZZ_VISIT_THRESHOLD
+        });
+        output.push_str(
+            &crate::tools::echolocation::sound_echolocation(
+                &context.workspace,
+                &file_path,
+                &text,
+                buzz,
+            )
+            .render_footer(),
+        );
 
         // This internal observation keeps hidden legacy edit replay working,
         // but no hash or read-before-edit ceremony reaches the lowercase
@@ -1533,7 +1571,9 @@ impl WriteFileTool {
         drop(mutation_guard);
 
         let outcome = if existed_before { "updated" } else { "created" };
-        let utf16_units = written.encode_utf16().count();
+        // Bytes are bytes: the receipt reports what was written to disk,
+        // not UTF-16 code units (which differ on non-ASCII content).
+        let bytes_written = written.len();
         Ok(contract_mutation_result(
             context,
             &file_path,
@@ -1541,7 +1581,7 @@ impl WriteFileTool {
             prior_contents.as_ref(),
             &written,
             outcome,
-            format!("Successfully wrote {utf16_units} bytes to {path_str}"),
+            format!("Successfully wrote {bytes_written} bytes to {path_str}"),
         )
         .await)
     }

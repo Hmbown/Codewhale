@@ -440,7 +440,7 @@ done
     });
     expect(matrix.toolSurface.activationCache).toEqual({
       maximumNames: 8,
-      maximumSchemaBytes: 16_384,
+      maximumSchemaBytes: 24_576,
       scope: "per conversation; each subagent owns an independent policy-filtered cache",
     });
     expect(matrix.toolSurface.agentConcurrency).toEqual({
@@ -469,7 +469,7 @@ done
     expect(registry).toContain("Arc::new(LowercaseBashTool)");
     expect(registry).toContain('FileTool::new("File")');
     expect(registry).toContain('BashTool::new("Bash")');
-    expect(toolsPage).toContain("8 names / 16 KiB");
+    expect(toolsPage).toContain("8 names / 24 KiB");
     expect(toolsPage).toContain("Web search/fetch");
     expect(toolsPage).not.toContain("docs/TOOL_LIFECYCLE.md");
   });

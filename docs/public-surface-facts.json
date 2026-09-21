@@ -104,12 +104,8 @@
       "write",
       "edit",
       "bash",
-      "agent",
-      "workflow",
       "todo_write",
-      "create_goal",
-      "get_goal",
-      "update_goal"
+      "create_goal"
     ],
     "schemas": {
       "read": [
@@ -144,7 +140,7 @@
     },
     "activationCache": {
       "maximumNames": 8,
-      "maximumSchemaBytes": 16384,
+      "maximumSchemaBytes": 24576,
       "scope": "per conversation; each subagent owns an independent policy-filtered cache"
     },
     "agentConcurrency": {

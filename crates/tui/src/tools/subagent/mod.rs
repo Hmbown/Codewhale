@@ -2327,6 +2327,11 @@ fn terminal_mailbox_message(result: &SubAgentResult, report_ref: Option<&str>) -
 #[derive(Clone, Debug)]
 pub struct SubAgentForkContext {
     pub messages: Vec<Message>,
+    /// Handle to the parent turn's live-header cell (exact system, tools,
+    /// route, and hot-flag of its latest request). A same-route fork child
+    /// reads it at spawn to extend the parent's cached prefix instead of
+    /// starting cold; empty cells (resume, grandchildren) read cold.
+    pub live_header: crate::prompt_zones::SharedLiveHeader,
     /// Stable, To-do-free parent state captured once at turn start. History
     /// semantics stay exactly as they were: this text is not re-derived per
     /// spawn.
@@ -2366,6 +2371,7 @@ impl SubAgentForkContext {
 
         Self {
             messages: self.messages.clone(),
+            live_header: Arc::clone(&self.live_header),
             structured_state_block,
             work_source: self.work_source.clone(),
         }
@@ -10617,6 +10623,9 @@ async fn spawn_subagent_from_input(
                 .unwrap_or(checkpoint_messages);
             let resume_ctx = SubAgentForkContext {
                 messages,
+                // Resume forks a settled agent: nothing is live in the
+                // provider cache, so inheritance stays off by construction.
+                live_header: crate::prompt_zones::new_live_header_cell(),
                 structured_state_block: None,
                 work_source: None,
             };
@@ -12943,7 +12952,6 @@ async fn run_subagent(
     let fork_context = fork_context_enabled
         .then_some(runtime.fork_context.as_ref())
         .flatten();
-    let request_system = subagent_request_system_prompt(&system_prompt);
     // Refresh only the Work portion of the inherited state, now, at the fork
     // seam (#3983). The parent's captured transcript and its stable state text
     // are untouched.
@@ -13020,6 +13028,10 @@ async fn run_subagent(
         &agent_id,
         SubAgentForkContext {
             messages: messages.clone(),
+            // v1 is single-level: grandchildren fork cold. Recursive
+            // inheritance (propagating a child's own live header) is a
+            // follow-up once single-level trials report.
+            live_header: crate::prompt_zones::new_live_header_cell(),
             structured_state_block: None,
             // A grandchild forks *this* agent, so it inherits this agent's own
             // list, resolved when that spawn actually happens.
@@ -13052,7 +13064,202 @@ async fn run_subagent(
         ));
     }
     let tool_catalog = tool_registry.deferred_catalog_for_model(&agent_type);
-    let mut tool_surface = SubAgentToolSurface::new(tool_catalog, &[]);
+    // Fork-prefix inheritance: when this fork can extend the parent's
+    // live cached prefix (same route, hot proof, append-only history),
+    // the child adopts the parent's exact system bytes and sends the
+    // longest byte-equal head of the parent's wire block on its first
+    // request. The rest of its grant stays deferred and activates on
+    // demand, so truncation costs cache bytes, never capability. Every
+    // fallback below keeps today's cold start byte-identical.
+    let gate_on = crate::prompt_zones::fork_inherit_enabled();
+    let snapshot = if gate_on && fork_context_enabled {
+        refreshed_fork_context
+            .as_ref()
+            .and_then(|context| context.live_header.lock().clone())
+    } else {
+        None
+    };
+    let strict_tool_mode = runtime
+        .api_config
+        .as_ref()
+        .and_then(|config| config.strict_tool_mode)
+        .unwrap_or(false);
+    let inherit_route = runtime
+        .client
+        .effective_route_envelope(&runtime.model, chrono::Utc::now());
+    // Fresh spawns never consult the gate: without the fork framing
+    // blocks the parent's system would overwrite the role system, so
+    // they keep today's cold start (and report `fresh_spawn`, distinct
+    // from a fork whose snapshot cell was empty).
+    let decision = if fork_context_enabled {
+        crate::prompt_zones::resolve_fork_inherit(
+            gate_on,
+            snapshot.as_ref(),
+            &inherit_route.model,
+            inherit_route.provider,
+            &inherit_route.provider_identity,
+            &tool_catalog,
+            strict_tool_mode,
+            messages.len(),
+        )
+    } else {
+        crate::prompt_zones::ForkInheritDecision {
+            inherit: false,
+            reason: "fresh_spawn",
+            prefix_tools: Vec::new(),
+        }
+    };
+    let inherited_system = if decision.inherit {
+        snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.system.clone())
+    } else {
+        None
+    };
+    let inherited = inherited_system.is_some();
+    let request_system = match inherited_system {
+        Some(system) => system,
+        None => subagent_request_system_prompt(&system_prompt),
+    };
+    // The first request sends the inherited head verbatim; prefix-warm
+    // the surface so turns 2+ keep it instead of reverting to the bare
+    // eager set. Empty when cold: today's exact behavior.
+    let inherited_prefix: Option<Vec<Tool>> = if inherited {
+        Some(decision.prefix_tools.clone())
+    } else {
+        None
+    };
+    let prefix_names: Vec<String> = decision
+        .prefix_tools
+        .iter()
+        .map(|tool| tool.name.clone())
+        .collect();
+    let mut tool_surface = SubAgentToolSurface::new(tool_catalog, &prefix_names);
+    if inherited && let Some(snapshot) = snapshot.as_ref() {
+        let system_bytes = serde_json::to_string(&snapshot.system)
+            .map(|json| json.len() as u64)
+            .unwrap_or(0);
+        let history_bytes = serde_json::to_string(&messages)
+            .map(|json| json.len() as u64)
+            .unwrap_or(0);
+        tracing::info!(
+            target: "subagent",
+            agent_id = agent_id.as_str(),
+            reason = decision.reason,
+            prefix_tools = decision.prefix_tools.len(),
+            bytes = system_bytes
+                .saturating_add(snapshot.tools_json.len() as u64)
+                .saturating_add(history_bytes),
+            model = runtime.model.as_str(),
+            "fork child inheriting parent cached prefix"
+        );
+    } else if fork_context_enabled {
+        tracing::info!(
+            target: "subagent",
+            agent_id = agent_id.as_str(),
+            reason = decision.reason,
+            "fork child cold start"
+        );
+    }
+    // Trial-diagnostic stderr sink: headless `exec` installs no
+    // tracing subscriber, so `eprintln!` is the A/B readout channel by
+    // design. Env-gated, JSON lines, default off.
+    #[allow(clippy::print_stderr)]
+    if crate::prompt_zones::fork_trial_diag_enabled() {
+        // History-divergence probe: the child's history should start
+        // with the snapshotted request's messages byte-for-byte; the
+        // first divergence (Work refresh, thinking blocks, edits) is
+        // where the provider's prefix match ends and misses begin.
+        let mut div_detail = String::new();
+        if decision.inherit
+            && let Some(snapshot) = snapshot.as_ref()
+        {
+            let mut div = String::from("\"extends\"");
+            for (index, old) in snapshot.history.iter().enumerate() {
+                let Some(new) = messages.get(index) else {
+                    div = format!("\"child-shorter@{index}\"");
+                    break;
+                };
+                if old != new {
+                    let head = |message: &Message| {
+                        format!("{:?}", message.content)
+                            .replace('"', "'")
+                            .chars()
+                            .take(150)
+                            .collect::<String>()
+                    };
+                    div = format!(
+                        "\"msg{index} {:?}-vs-{:?} old:{} new:{}\"",
+                        old.role,
+                        new.role,
+                        head(old),
+                        head(new)
+                    );
+                    break;
+                }
+            }
+            div_detail = format!(",\"history_div\":{div}");
+        }
+        let prefix_names: Vec<&str> = decision
+            .prefix_tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect();
+        let parent_names: &[String] = snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.active_names.as_slice())
+            .unwrap_or(&[]);
+        // On a partial head, show where the run ended and both sides
+        // (truncated) so trials can tell grant-gaps from schema skew.
+        // Rebuilds the catalog: diag-gated, never on the hot path.
+        let mut break_detail = String::new();
+        if decision.inherit
+            && let Some(name) = parent_names.get(prefix_names.len())
+        {
+            let parent_json = snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.tools_json.split('\n').nth(prefix_names.len()))
+                .unwrap_or("");
+            let catalog = tool_registry.deferred_catalog_for_model(&agent_type);
+            let child_json = catalog
+                .iter()
+                .find(|tool| &tool.name == name)
+                .and_then(|tool| {
+                    let mut tool = tool.clone();
+                    if strict_tool_mode {
+                        crate::tools::schema_sanitize::prepare_tools_for_strict_mode(
+                            std::slice::from_mut(&mut tool),
+                        );
+                    }
+                    codewhale_core::prefix_cache::tool_to_api_json(&tool)
+                })
+                .unwrap_or_else(|| "<absent-from-grant>".to_string());
+            let trunc = |text: &str| {
+                text.replace('"', "'")
+                    .chars()
+                    .take(20000)
+                    .collect::<String>()
+            };
+            break_detail = format!(
+                ",\"break_at\":\"{name}\",\"parent_json\":\"{}\",\"child_json\":\"{}\"",
+                trunc(parent_json),
+                trunc(&child_json),
+            );
+        }
+        eprintln!(
+            "{{\"codewhale_fork_trial\":\"decision\",\"agent_id\":\"{}\",\"inherited\":{},\"reason\":\"{}\",\"prefix\":{},\"parent_n\":{},\"parent_tools\":{},\"prefix_tools\":{}{}{}}}",
+            agent_id.as_str(),
+            inherited,
+            decision.reason,
+            prefix_names.len(),
+            parent_names.len(),
+            serde_json::to_string(parent_names).unwrap_or_default(),
+            serde_json::to_string(&prefix_names).unwrap_or_default(),
+            break_detail,
+            div_detail,
+        );
+    }
+    let mut inherit_first_hit_logged = false;
     let mut steps = 0;
     let mut final_result: Option<String> = None;
     let mut pending_inputs: VecDeque<SubAgentInput> = VecDeque::new();
@@ -13227,14 +13434,20 @@ async fn run_subagent(
             budget_pacing_notice_sent = true;
         }
 
-        let tools = tool_surface.request_tools(
+        let mut tools = tool_surface.request_tools(
             tool_registry.deferred_catalog_for_model(&agent_type),
-            runtime
-                .api_config
-                .as_ref()
-                .and_then(|config| config.strict_tool_mode)
-                .unwrap_or(false),
+            strict_tool_mode,
         );
+        // Steps count from 1: the first request sends the inherited
+        // head verbatim (see the gate above), and the surface's active
+        // set is restricted to match so dispatch, tool_search, and
+        // hydrate agree with the wire block. Later steps grow normally.
+        if steps == 1
+            && let Some(prefix) = inherited_prefix.as_ref()
+        {
+            tools = prefix.clone();
+            tool_surface.active_names = prefix.iter().map(|tool| tool.name.clone()).collect();
+        }
         let request_active_tool_names = tool_surface.active_names.clone();
         let has_tools = !tools.is_empty();
         // The report-only response keeps the pinned tool catalog but asks the
@@ -13500,6 +13713,46 @@ async fn run_subagent(
         .await;
 
         tokens_used = tokens_used.saturating_add(usage_total_tokens(&response.usage));
+        if !inherit_first_hit_logged {
+            inherit_first_hit_logged = true;
+            if inherited {
+                tracing::info!(
+                    target: "subagent",
+                    agent_id = agent_id.as_str(),
+                    hit_tokens = response.usage.prompt_cache_hit_tokens.unwrap_or(0),
+                    input_tokens = response.usage.input_tokens,
+                    "fork child first response cache hits"
+                );
+            }
+            // Same trial sink as the decision line above.
+            #[allow(clippy::print_stderr)]
+            if crate::prompt_zones::fork_trial_diag_enabled() {
+                // Component wire sizes pin down HOW FAR into the request
+                // the provider's prefix match reached: hits <= system
+                // means tools diverged; hits <= system+tools means the
+                // history diverged; beyond that the history is hitting.
+                let system_bytes = serde_json::to_string(&request_system)
+                    .map(|json| json.len())
+                    .unwrap_or(0);
+                let tools_bytes = serde_json::to_string(&tools)
+                    .map(|json| json.len())
+                    .unwrap_or(0);
+                let history_bytes = serde_json::to_string(&messages)
+                    .map(|json| json.len())
+                    .unwrap_or(0);
+                eprintln!(
+                    "{{\"codewhale_fork_trial\":\"first_response\",\"agent_id\":\"{}\",\"inherited\":{},\"input\":{},\"hit\":{},\"miss\":{},\"system_bytes\":{},\"tools_bytes\":{},\"history_bytes\":{}}}",
+                    agent_id.as_str(),
+                    inherited,
+                    response.usage.input_tokens,
+                    response.usage.prompt_cache_hit_tokens.unwrap_or(0),
+                    response.usage.prompt_cache_miss_tokens.unwrap_or(0),
+                    system_bytes,
+                    tools_bytes,
+                    history_bytes,
+                );
+            }
+        }
 
         // #6194 item 7: one over-bound step lands the run through the normal
         // budget-death path (digest + hand-back + preservation note) instead
@@ -17846,7 +18099,7 @@ impl SubAgentToolRegistry {
 
     fn deferred_catalog_for_model(&self, agent_type: &FleetRole) -> Vec<Tool> {
         // Every allowed tool remains searchable. Native deferral then leaves the
-        // fixed lowercase primitives plus agent/tool_search active; Web, MCP,
+        // fixed lowercase primitives plus tool_search active; agent, Web, MCP,
         // plugins, and other tools stay discoverable rather than eager.
         let mut catalog = self.tools_for_model(agent_type);
         catalog.retain(|tool| !is_tool_search_tool(&tool.name));

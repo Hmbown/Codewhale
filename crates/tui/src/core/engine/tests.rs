@@ -10723,28 +10723,33 @@ fn approval_stamp_scenario() {
 #[test]
 fn core_primitives_and_todo_write_default_to_eager() {
     let always_load = HashSet::new();
-    for core in ["read", "write", "edit", "bash", "agent", "todo_write"] {
+    for core in ["read", "write", "edit", "bash", "todo_write"] {
         assert!(!should_default_defer_tool(core, &always_load));
     }
-    for searchable in ["File", "Bash", "Git", "Run", "tasks", "git_blame"] {
+    // Token diet: agent+workflow (21KB of schema) and get/update_goal
+    // (meaningless without an active goal) stay searchable by default.
+    for searchable in [
+        "File",
+        "Bash",
+        "Git",
+        "Run",
+        "tasks",
+        "git_blame",
+        "agent",
+        "workflow",
+        "get_goal",
+        "update_goal",
+    ] {
         assert!(should_default_defer_tool(searchable, &always_load));
     }
 }
 
 #[test]
 fn default_active_contract_keeps_discovery_and_core_tools_eager() {
-    const EXPECTED_NATIVE: [&str; 10] = [
-        "read",
-        "write",
-        "edit",
-        "bash",
-        "agent",
-        "workflow",
-        "todo_write",
-        "create_goal",
-        "get_goal",
-        "update_goal",
-    ];
+    // Token diet: agent+workflow and get/update_goal are searchable by
+    // default (see `core_primitives_and_todo_write_default_to_eager`).
+    const EXPECTED_NATIVE: [&str; 6] =
+        ["read", "write", "edit", "bash", "todo_write", "create_goal"];
     assert_eq!(
         default_active_native_tool_names(),
         EXPECTED_NATIVE.as_slice()
@@ -10783,7 +10788,7 @@ fn default_active_contract_keeps_discovery_and_core_tools_eager() {
 #[test]
 fn non_yolo_mode_retains_default_defer_policy() {
     let always_load = HashSet::new();
-    for core in ["read", "write", "edit", "bash", "agent", "todo_write"] {
+    for core in ["read", "write", "edit", "bash", "todo_write"] {
         assert!(!should_default_defer_tool(core, &always_load));
     }
     for searchable in [
@@ -10868,9 +10873,11 @@ fn model_tool_catalog_applies_native_and_mcp_deferral() {
             .and_then(|tool| tool.defer_loading)
     };
 
-    for core in ["read", "write", "edit", "bash", "agent"] {
+    for core in ["read", "write", "edit", "bash"] {
         assert_eq!(defer_loading(core), Some(false));
     }
+    // Token diet: agent stays searchable even on wide surfaces.
+    assert_eq!(defer_loading("agent"), Some(true));
     assert_eq!(defer_loading("Git"), Some(true));
     assert_eq!(defer_loading("Run"), Some(true));
     assert_eq!(defer_loading("remember"), Some(true));
@@ -10932,9 +10939,11 @@ fn capability_compact_surface_defers_nonessential_core_tools() {
             .and_then(|tool| tool.defer_loading)
     };
 
-    for core in ["read", "write", "edit", "bash", "agent"] {
+    for core in ["read", "write", "edit", "bash"] {
         assert_eq!(defer_loading(core), Some(false));
     }
+    // Token diet: agent stays searchable even on wide surfaces.
+    assert_eq!(defer_loading("agent"), Some(true));
     assert_eq!(defer_loading("Git"), Some(true));
     assert_eq!(defer_loading("update_plan"), Some(true));
     assert_eq!(defer_loading(TOOL_SEARCH_NAME), Some(false));
@@ -10962,7 +10971,7 @@ fn capability_full_surface_preserves_small_default_head() {
         crate::model_profile::ToolSurfaceBudget::Full,
     );
 
-    for name in ["read", "write", "edit", "bash", "agent"] {
+    for name in ["read", "write", "edit", "bash"] {
         assert_eq!(
             catalog
                 .iter()
@@ -10972,6 +10981,14 @@ fn capability_full_surface_preserves_small_default_head() {
             "{name} should stay eager on full tool surfaces"
         );
     }
+    // Token diet: agent stays searchable even on full surfaces.
+    assert_eq!(
+        catalog
+            .iter()
+            .find(|tool| tool.name == "agent")
+            .and_then(|tool| tool.defer_loading),
+        Some(true),
+    );
     assert_eq!(
         catalog
             .iter()
@@ -11236,6 +11253,7 @@ async fn measure_production_mode_tool_catalogs() -> serde_json::Value {
                 McpAccess::PassiveSnapshot,
                 route,
                 "",
+                None,
             )
             .await;
         let active = build.surface.active.clone().unwrap_or_default();
@@ -11272,17 +11290,16 @@ fn metric_tool_names<'a>(
 #[allow(clippy::await_holding_lock)]
 async fn runtime_contract_tool_metric_uses_canonical_mode_surfaces() {
     let payload = measure_production_mode_tool_catalogs().await;
+    // Token diet: the request head carries 7 eager tools; agent+workflow
+    // and get/update_goal stay searchable (the "full" surface below still
+    // lists them as catalog members).
     let expected_active = HashSet::from([
-        "agent",
         "bash",
         "create_goal",
-        "get_goal",
-        "update_goal",
         "edit",
         "read",
         "todo_write",
         "tool_search",
-        "workflow",
         "write",
     ]);
 
@@ -11308,7 +11325,7 @@ async fn runtime_contract_tool_metric_uses_canonical_mode_surfaces() {
         assert_eq!(
             metric_tool_names(&payload, mode, "active"),
             expected_active,
-            "{mode} must keep the same request head including goal controls"
+            "{mode} must keep the same request head"
         );
     }
 
@@ -14309,7 +14326,8 @@ fn plan_mode_toggle_preserves_catalog_byte_stability() {
         .map(|t| t.name.as_str())
         .collect();
 
-    let expected_head = ["agent", "bash", "edit", "read", "tool_search", "write"];
+    // Token diet: agent is searchable, not head.
+    let expected_head = ["bash", "edit", "read", "tool_search", "write"];
     assert_eq!(plan_names, expected_head);
     assert_eq!(agent_names, expected_head);
 
@@ -15600,6 +15618,7 @@ async fn fork_state_block_reuses_the_snapshot_body() {
     };
     let fork_context = crate::tools::subagent::SubAgentForkContext {
         messages: engine.messages_with_turn_metadata(),
+        live_header: crate::prompt_zones::new_live_header_cell(),
         structured_state_block: state.to_system_block(),
         work_source: Some(engine.todo_source()),
     };
@@ -15816,6 +15835,7 @@ async fn same_turn_fork_carries_the_updated_todo() {
     .to_system_block();
     let fork_context = crate::tools::subagent::SubAgentForkContext {
         messages: engine.messages_with_turn_metadata(),
+        live_header: crate::prompt_zones::new_live_header_cell(),
         structured_state_block: stable_block.clone(),
         work_source: Some(engine.todo_source()),
     };
@@ -22645,6 +22665,7 @@ readline.createInterface({ input: process.stdin }).on('line', async line => {
             McpAccess::Connect,
             route,
             "",
+            None,
         );
         tokio::pin!(build);
         std::future::poll_fn(|cx| {

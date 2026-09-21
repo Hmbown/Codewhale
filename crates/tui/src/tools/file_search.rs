@@ -110,6 +110,9 @@ impl ToolSpec for FileSearchTool {
 
         let extensions = parse_extensions(&input);
         let exclude_patterns = parse_exclude_patterns(&input);
+        let pod_root = base_path.clone();
+        let pod_excludes = exclude_patterns.clone();
+        let pod_extensions = extensions.clone();
         let matches = search_files_async(
             query.to_string(),
             base_path,
@@ -121,7 +124,34 @@ impl ToolSpec for FileSearchTool {
             context.follow_symlinks,
         )
         .await?;
-        ToolResult::json(&matches).map_err(|e| ToolError::execution_failed(e.to_string()))
+        // Echolocation sounding: chart the matched dirs (sorted, capped)
+        // so each candidate arrives with its neighborhood. Dirs resolve
+        // against the search root, which is the workspace by default.
+        let paths: Vec<String> = matches.iter().map(|item| item.path.clone()).collect();
+        let vis = super::echolocation::PodVisibility {
+            include: &[],
+            exclude: &pod_excludes,
+            extensions: &pod_extensions,
+            glob_root: &pod_root,
+            gitignore: true,
+        };
+        let (pods, pods_omitted) = super::echolocation::sound_match_pods(&pod_root, &paths, &vis);
+        let pods_json: Vec<Value> = pods
+            .iter()
+            .map(|pod| {
+                json!({
+                    "dir": pod.dir,
+                    "mates": pod.mates,
+                    "mate_total": pod.mate_total,
+                })
+            })
+            .collect();
+        ToolResult::json(&json!({
+            "matches": matches,
+            "pods": pods_json,
+            "pods_omitted": pods_omitted,
+        }))
+        .map_err(|e| ToolError::execution_failed(e.to_string()))
     }
 }
 
@@ -346,7 +376,7 @@ fn should_exclude(rel_path: &str, exclude_patterns: &[String]) -> bool {
         .any(|pattern| matches_glob(rel_path, pattern))
 }
 
-fn extension_matches(path: &Path, extensions: &[String]) -> bool {
+pub(crate) fn extension_matches(path: &Path, extensions: &[String]) -> bool {
     let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
         return false;
     };
@@ -464,6 +494,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_file_search_charts_match_pods() {
+        let tmp = tempdir().expect("tempdir");
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("src/net")).expect("mkdir");
+        std::fs::write(root.join("src/net/server.rs"), "fn serve() {}\n").expect("write");
+        std::fs::write(root.join("src/net/client.rs"), "fn connect() {}\n").expect("write");
+
+        let ctx = ToolContext::new(root.to_path_buf());
+        let result = FileSearchTool
+            .execute(json!({"query": "server", "limit": 5}), &ctx)
+            .await
+            .expect("execute");
+
+        assert!(result.success);
+        let body: Value = serde_json::from_str(&result.content).expect("json result");
+        assert!(!body["matches"].as_array().expect("matches").is_empty());
+        let pods = body["pods"].as_array().expect("pods array");
+        assert_eq!(pods.len(), 1);
+        assert_eq!(pods[0]["dir"], "src/net");
+        let mates: Vec<&str> = pods[0]["mates"]
+            .as_array()
+            .expect("mates")
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert!(mates.contains(&"server.rs (match)"), "{mates:?}");
+        assert!(mates.contains(&"client.rs"), "{mates:?}");
+    }
+
+    #[tokio::test]
     async fn test_file_search_respects_gitignore() {
         let tmp = tempdir().expect("tempdir");
         let root = tmp.path();
@@ -518,9 +578,9 @@ mod tests {
             .expect("execute");
 
         assert!(result.success);
-        let matches: Value = serde_json::from_str(&result.content).expect("search json");
+        let body: Value = serde_json::from_str(&result.content).expect("search json");
         assert!(
-            matches
+            body["matches"]
                 .as_array()
                 .expect("matches")
                 .iter()
@@ -545,9 +605,9 @@ mod tests {
             .expect("execute");
 
         assert!(result.success);
-        let matches: Value = serde_json::from_str(&result.content).expect("search json");
+        let body: Value = serde_json::from_str(&result.content).expect("search json");
         assert!(
-            matches
+            body["matches"]
                 .as_array()
                 .expect("matches")
                 .iter()

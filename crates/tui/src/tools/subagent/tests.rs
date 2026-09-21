@@ -5376,6 +5376,7 @@ fn forked_subagent_messages_preserve_parent_prefix_then_append_task() {
     };
     let fork_context = SubAgentForkContext {
         messages: vec![parent_message.clone()],
+        live_header: crate::prompt_zones::new_live_header_cell(),
         structured_state_block: Some("## Fork State\n- Mode: `AGENT`".to_string()),
         work_source: None,
     };
@@ -7732,6 +7733,76 @@ fn enabled_agent_surface_options() -> AgentToolSurfaceOptions {
 ///
 /// Request-boundary tests use this fixture so Moonshot compatibility coverage
 /// cannot drift into a hand-maintained approximation of the child surface.
+#[test]
+fn deferred_agent_and_workflow_are_discoverable_by_name() {
+    // Diet regression: deferral must never strand the tools. The real
+    // registry (not fixtures) carries them deferred, and both match
+    // algorithms surface them for the obvious queries.
+    use crate::core::engine::tool_catalog::{
+        TOOL_SEARCH_NAME, apply_native_tool_deferral, execute_tool_search_with_cache,
+    };
+    use crate::core::session::ToolActivationCache;
+    use crate::tools::registry::ToolRegistryBuilder;
+    use crate::tools::{ToolContext, todo};
+    use std::collections::HashSet;
+
+    let tmp = tempdir().expect("tempdir");
+    let manager = new_shared_subagent_manager(tmp.path().to_path_buf(), 4);
+    let registry = ToolRegistryBuilder::new()
+        .with_agent_runtime_surface(
+            None,
+            "test-model".to_string(),
+            enabled_agent_surface_options(),
+            todo::new_shared_todo_list(),
+            crate::tools::plan::new_shared_plan_state(),
+        )
+        .with_subagent_tools(manager, stub_runtime())
+        .build(ToolContext::new(tmp.path().to_path_buf()));
+    let mut catalog = registry.to_api_tools();
+    let always_load = HashSet::new();
+    apply_native_tool_deferral(&mut catalog, &always_load);
+    for name in ["agent", "workflow"] {
+        assert_eq!(
+            catalog
+                .iter()
+                .find(|tool| tool.name == name)
+                .and_then(|tool| tool.defer_loading),
+            Some(true),
+            "{name} is registered and deferred"
+        );
+    }
+
+    for (query, match_kind, wanted) in [
+        ("agent", "regex", "agent"),
+        ("workflow", "regex", "workflow"),
+        ("spawn subagent worker", "bm25", "agent"),
+        ("spawn subagent worker", "bm25", "workflow"),
+    ] {
+        let mut active = HashSet::new();
+        let mut cache = ToolActivationCache::default();
+        let found = execute_tool_search_with_cache(
+            TOOL_SEARCH_NAME,
+            &json!({"query": query, "match": match_kind}),
+            &catalog,
+            &mut active,
+            &mut cache,
+        )
+        .expect("tool_search runs")
+        .metadata
+        .expect("metadata")["tool_references"]
+            .as_array()
+            .expect("refs")
+            .iter()
+            .filter_map(|v| v.as_str())
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        assert!(
+            found.contains(&wanted.to_string()),
+            "{match_kind} {query:?} must surface {wanted}; got {found:?}"
+        );
+    }
+}
+
 pub(crate) fn kimi_general_child_request_tools_fixture() -> Vec<Tool> {
     let tmp = tempdir().expect("tempdir");
     let mut runtime =
@@ -7855,27 +7926,27 @@ async fn execute_surface_tool(
 }
 
 #[test]
-fn small_surface_starts_with_core_tools_and_read_only_goal_control() {
+fn small_surface_starts_with_core_tools_and_discoverable_goal_control() {
     let registry = small_surface_registry(FleetRole::Builder);
     let catalog = registry.deferred_catalog_for_model(&FleetRole::Builder);
     let mut surface = SubAgentToolSurface::new(catalog, &[]);
 
+    // Token diet: agent+workflow+get_goal ride discovery, not the head.
     assert_eq!(
         model_tool_names(model_request_tools(&mut surface)),
-        [
-            "agent",
-            "bash",
-            "edit",
-            "get_goal",
-            "read",
-            "todo_write",
-            "tool_search",
-            "workflow",
-            "write",
-        ]
-        .into_iter()
-        .map(str::to_string)
-        .collect()
+        ["bash", "edit", "read", "todo_write", "tool_search", "write",]
+            .into_iter()
+            .map(str::to_string)
+            .collect()
+    );
+    // The goal control still exists — deferred, not deleted.
+    assert_eq!(
+        surface
+            .catalog
+            .iter()
+            .find(|tool| tool.name == "get_goal")
+            .and_then(|tool| tool.defer_loading),
+        Some(true)
     );
     let strict = surface.request_tools(surface.catalog.clone(), true);
     assert_eq!(
@@ -7935,6 +8006,7 @@ async fn small_surface_read_only_child_discovers_web_deferred() {
 async fn small_surface_fork_context_survives_fresh_child_discovery() {
     let registry = small_surface_registry(FleetRole::Builder);
     let context = SubAgentForkContext {
+        live_header: crate::prompt_zones::new_live_header_cell(),
         messages: vec![
             Message {
                 role: Role::Assistant,
@@ -8033,6 +8105,46 @@ async fn small_surface_denied_warm_tool_is_not_resurrected() {
     assert!(surface.hydrate("Web").is_err());
 }
 
+fn synthetic_eager_tool(name: &str) -> Tool {
+    Tool {
+        tool_type: Some("function".to_string()),
+        name: name.to_string(),
+        description: "eager".to_string(),
+        input_schema: json!({"type": "object", "properties": {}}),
+        allowed_callers: None,
+        defer_loading: Some(false),
+        input_examples: None,
+        strict: None,
+        cache_control: None,
+    }
+}
+
+#[test]
+fn warmed_surfaces_rebuild_byte_identical_wire_tools() {
+    // Same catalog plus same warm names must serialize identically,
+    // and warming must change the wire block.
+    let catalog = vec![
+        synthetic_eager_tool("read"),
+        synthetic_deferred_tool("agent", 8),
+        synthetic_eager_tool(TOOL_SEARCH_NAME),
+    ];
+    let warm = ["agent".to_string()];
+    let mut first = SubAgentToolSurface::new(catalog.clone(), &warm);
+    let mut second = SubAgentToolSurface::new(catalog.clone(), &warm);
+    let first_wire = model_request_tools(&mut first);
+    let second_wire = model_request_tools(&mut second);
+    let first_json = crate::prompt_zones::wire_tool_catalog_json(&first_wire).expect("serializes");
+    let second_json =
+        crate::prompt_zones::wire_tool_catalog_json(&second_wire).expect("serializes");
+    assert_eq!(first_json, second_json, "same catalog plus same names");
+    assert!(first_wire.iter().any(|tool| tool.name == "agent"));
+    let mut cold = SubAgentToolSurface::new(catalog, &[]);
+    let cold_wire = model_request_tools(&mut cold);
+    let cold_json = crate::prompt_zones::wire_tool_catalog_json(&cold_wire).expect("serializes");
+    assert_ne!(cold_json, first_json, "warming must change the wire block");
+    assert!(!cold_wire.iter().any(|tool| tool.name == "agent"));
+}
+
 fn synthetic_deferred_tool(name: &str, description_bytes: usize) -> Tool {
     Tool {
         tool_type: Some("function".to_string()),
@@ -8065,19 +8177,20 @@ fn small_surface_caches_are_independent_bounded_and_revalidated() {
     let mut first = SubAgentToolSurface::new(catalog.clone(), &warm);
     let mut second = SubAgentToolSurface::new(catalog, &[]);
     let first_names = model_tool_names(model_request_tools(&mut first));
-    assert!(!first_names.contains("deferred_0"));
-    assert!(first_names.contains("deferred_8"));
-    assert!(!model_tool_names(model_request_tools(&mut second)).contains("deferred_8"));
+    // Priority order: the warm tail (lowest priority) is evicted first.
+    assert!(!first_names.contains("deferred_8"));
+    assert!(first_names.contains("deferred_0"));
+    assert!(!model_tool_names(model_request_tools(&mut second)).contains("deferred_0"));
 
-    first.catalog.retain(|tool| tool.name != "deferred_8");
-    assert!(!model_tool_names(model_request_tools(&mut first)).contains("deferred_8"));
+    first.catalog.retain(|tool| tool.name != "deferred_0");
+    assert!(!model_tool_names(model_request_tools(&mut first)).contains("deferred_0"));
     first
         .catalog
-        .push(synthetic_deferred_tool("oversized", 17 * 1024));
+        .push(synthetic_deferred_tool("oversized", 25 * 1024));
     assert!(first.hydrate("oversized").is_err());
 
     let mut byte_catalog = (0..3)
-        .map(|index| synthetic_deferred_tool(&format!("bytes_{index}"), 6 * 1024))
+        .map(|index| synthetic_deferred_tool(&format!("bytes_{index}"), 9 * 1024))
         .collect::<Vec<_>>();
     ensure_advanced_tooling(
         &mut byte_catalog,
@@ -8091,8 +8204,8 @@ fn small_surface_caches_are_independent_bounded_and_revalidated() {
         .collect::<Vec<_>>();
     let mut byte_surface = SubAgentToolSurface::new(byte_catalog, &byte_warm);
     let byte_names = model_tool_names(model_request_tools(&mut byte_surface));
-    assert!(!byte_names.contains("bytes_0"));
-    assert!(byte_names.contains("bytes_1") && byte_names.contains("bytes_2"));
+    assert!(!byte_names.contains("bytes_2"));
+    assert!(byte_names.contains("bytes_0") && byte_names.contains("bytes_1"));
 }
 
 #[tokio::test]
@@ -8139,21 +8252,14 @@ fn small_surface_depth_cap_removes_only_agent() {
         registry.deferred_catalog_for_model(&FleetRole::Builder),
         &[],
     );
+    // Token diet: the depth cap still removes only agent; get_goal and
+    // workflow are absent from the head by deferral, not by depth.
     assert_eq!(
         model_tool_names(model_request_tools(&mut surface)),
-        [
-            "bash",
-            "edit",
-            "get_goal",
-            "read",
-            "todo_write",
-            "tool_search",
-            "workflow",
-            "write"
-        ]
-        .into_iter()
-        .map(str::to_string)
-        .collect()
+        ["bash", "edit", "read", "todo_write", "tool_search", "write",]
+            .into_iter()
+            .map(str::to_string)
+            .collect()
     );
 }
 
@@ -11453,6 +11559,7 @@ fn fresh_forked_and_nested_subagents_share_authority_bound_skill_catalogs() {
     );
 
     let fork_context = SubAgentForkContext {
+        live_header: crate::prompt_zones::new_live_header_cell(),
         messages: vec![Message {
             role: Role::User,
             content: vec![ContentBlock::Text {
@@ -11484,6 +11591,7 @@ fn fresh_forked_and_nested_subagents_share_authority_bound_skill_catalogs() {
         &direct_child,
         "agent_parent",
         SubAgentForkContext {
+            live_header: crate::prompt_zones::new_live_header_cell(),
             messages: Vec::new(),
             structured_state_block: None,
             work_source: None,
@@ -12210,6 +12318,7 @@ async fn parent_todo_state_still_reaches_children_as_immutable_fork_context() {
     let mut parent = stub_runtime();
     write_todos_as(&parent, &["parent step one"]).await;
     parent.fork_context = Some(SubAgentForkContext {
+        live_header: crate::prompt_zones::new_live_header_cell(),
         messages: Vec::new(),
         structured_state_block: Some(
             "## Fork State\n\n### Work\n\nTo-do (0% settled)\n- [ ] #1 parent step one\n"
@@ -16259,6 +16368,7 @@ fn nested_tool_runtime_routes_child_completions_to_local_inbox() {
     let direct_child_runtime = runtime_with_depth(1, Some(root_tx));
     let fork_context = SubAgentForkContext {
         messages: Vec::new(),
+        live_header: crate::prompt_zones::new_live_header_cell(),
         structured_state_block: None,
         work_source: None,
     };
@@ -22965,7 +23075,11 @@ fn tool_search_cannot_return_a_retired_agents_tool() {
     let tmp = tempdir().expect("tempdir");
     let registry = subagent_registry_for_catalog(tmp.path());
     let mut catalog = registry.to_api_tools();
-    apply_native_tool_deferral(&mut catalog, &HashSet::new());
+    // Token diet: agent is searchable by default; this test's subject is
+    // retired-tool exclusion, so its precondition re-eagers agent through
+    // the same always-load path discovery uses.
+    let always_load = HashSet::from(["agent".to_string()]);
+    apply_native_tool_deferral(&mut catalog, &always_load);
     assert!(
         catalog
             .iter()
