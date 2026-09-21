@@ -132,6 +132,7 @@ mod settings;
 mod shell_dispatcher;
 mod skill_state;
 mod skills;
+mod sleep_guard;
 mod snapshot;
 mod startup_trace;
 mod task_manager;
@@ -164,7 +165,7 @@ use crate::eval::{EvalHarness, EvalHarnessConfig, ScenarioStepKind};
 use crate::features::{Feature, render_feature_table};
 use crate::llm_client::LlmClient;
 use crate::mcp::{
-    McpCommandAvailability, McpConfig, McpPool, McpServerConfig, McpServerOAuthConfig,
+    McpCommandAvailability, McpPool, McpServerConfig, McpServerOAuthConfig,
     is_relative_stdio_path_arg,
 };
 use crate::session_manager::{SessionManager, create_saved_session, truncate_id};
@@ -3548,43 +3549,12 @@ fn write_template_file(path: &Path, contents: &str, force: bool) -> Result<Write
     Ok(status)
 }
 
-fn mcp_template_json() -> Result<String> {
-    let mut cfg = McpConfig::default();
-    cfg.servers.insert(
-        "example".to_string(),
-        McpServerConfig {
-            command: Some("node".to_string()),
-            args: vec!["./path/to/your-mcp-server.js".to_string()],
-            env: std::collections::HashMap::new(),
-            cwd: None,
-            url: None,
-            transport: None,
-            connect_timeout: None,
-            execute_timeout: None,
-            read_timeout: None,
-            disabled: true,
-            enabled: true,
-            required: false,
-            enabled_tools: Vec::new(),
-            disabled_tools: Vec::new(),
-            headers: std::collections::HashMap::new(),
-            env_headers: std::collections::HashMap::new(),
-            bearer_token_env_var: None,
-            scopes: Vec::new(),
-            oauth: None,
-            oauth_resource: None,
-            reviewed_plugin: None,
-            runtime_added: false,
-            allow_private_network: false,
-        },
-    );
-    serde_json::to_string_pretty(&cfg)
-        .map_err(|e| anyhow!("Failed to render MCP template JSON: {e}"))
-}
-
 fn init_mcp_config(path: &Path, force: bool) -> Result<WriteStatus> {
-    let template = mcp_template_json()?;
-    write_template_file(path, &template, force)
+    Ok(match crate::mcp::init_config(path, force)? {
+        crate::mcp::McpWriteStatus::Created => WriteStatus::Created,
+        crate::mcp::McpWriteStatus::Overwritten => WriteStatus::Overwritten,
+        crate::mcp::McpWriteStatus::SkippedExists => WriteStatus::SkippedExists,
+    })
 }
 
 fn skills_template(name: &str) -> String {
@@ -8753,9 +8723,12 @@ Provide findings ordered by severity with file references, then open questions, 
                     index,
                     publication,
                     format!(
-                        "Review pass {}/{} request failed: {error}; no partial review was accepted or posted",
-                        index + 1,
-                        planned_passes
+                        "{}; no partial review was accepted or posted",
+                        crate::tools::review::request_failure_message(
+                            index + 1,
+                            planned_passes,
+                            &error
+                        )
                     ),
                 );
             }
@@ -10198,9 +10171,10 @@ async fn run_mcp_command(
                     .env_headers
                     .keys()
                     .all(|key| !key.trim().eq_ignore_ascii_case("authorization"));
-            let mut cfg = load_mcp_config(&config_path)?;
-            cfg.servers.insert(name.clone(), added_server.clone());
-            save_mcp_config(&config_path, &cfg)?;
+            crate::mcp::mutate_config(&config_path, None, |cfg| {
+                cfg.servers.insert(name.clone(), added_server.clone());
+                Ok(())
+            })?;
             println!("Added MCP server '{name}' in {}", config_path.display());
             if can_suggest_oauth
                 && crate::mcp::oauth::oauth_login_support(&added_server, network_policy.as_ref())
@@ -10256,35 +10230,17 @@ async fn run_mcp_command(
             Ok(())
         }
         McpCommand::Remove { name } => {
-            let mut cfg = load_mcp_config(&config_path)?;
-            if cfg.servers.remove(&name).is_none() {
-                bail!("MCP server '{name}' not found");
-            }
-            save_mcp_config(&config_path, &cfg)?;
+            crate::mcp::remove_server_config(&config_path, &name)?;
             println!("Removed MCP server '{name}'");
             Ok(())
         }
         McpCommand::Enable { name } => {
-            let mut cfg = load_mcp_config(&config_path)?;
-            let server = cfg
-                .servers
-                .get_mut(&name)
-                .ok_or_else(|| anyhow!("MCP server '{name}' not found"))?;
-            server.enabled = true;
-            server.disabled = false;
-            save_mcp_config(&config_path, &cfg)?;
+            crate::mcp::set_server_enabled(&config_path, &name, true)?;
             println!("Enabled MCP server '{name}'");
             Ok(())
         }
         McpCommand::Disable { name } => {
-            let mut cfg = load_mcp_config(&config_path)?;
-            let server = cfg
-                .servers
-                .get_mut(&name)
-                .ok_or_else(|| anyhow!("MCP server '{name}' not found"))?;
-            server.enabled = false;
-            server.disabled = true;
-            save_mcp_config(&config_path, &cfg)?;
+            crate::mcp::set_server_enabled(&config_path, &name, false)?;
             println!("Disabled MCP server '{name}'");
             Ok(())
         }
@@ -10318,42 +10274,43 @@ async fn run_mcp_command(
             args.push("serve".to_string());
             args.push("--mcp".to_string());
 
-            let mut cfg = load_mcp_config(&config_path)?;
-            if cfg.servers.contains_key(&name) {
-                bail!(
-                    "MCP server '{name}' already exists in {}. Use `codewhale mcp remove {name}` first, or choose a different --name.",
-                    config_path.display()
+            crate::mcp::mutate_config(&config_path, None, |cfg| {
+                if cfg.servers.contains_key(&name) {
+                    bail!(
+                        "MCP server '{name}' already exists in {}. Use `codewhale mcp remove {name}` first, or choose a different --name.",
+                        config_path.display()
+                    );
+                }
+                cfg.servers.insert(
+                    name.clone(),
+                    McpServerConfig {
+                        command: Some(exe_str.clone()),
+                        args,
+                        env: std::collections::HashMap::new(),
+                        cwd: None,
+                        url: None,
+                        transport: None,
+                        connect_timeout: None,
+                        execute_timeout: None,
+                        read_timeout: None,
+                        disabled: false,
+                        enabled: true,
+                        required: false,
+                        enabled_tools: Vec::new(),
+                        disabled_tools: Vec::new(),
+                        headers: std::collections::HashMap::new(),
+                        env_headers: std::collections::HashMap::new(),
+                        bearer_token_env_var: None,
+                        scopes: Vec::new(),
+                        oauth: None,
+                        oauth_resource: None,
+                        reviewed_plugin: None,
+                        runtime_added: false,
+                        allow_private_network: false,
+                    },
                 );
-            }
-            cfg.servers.insert(
-                name.clone(),
-                McpServerConfig {
-                    command: Some(exe_str.clone()),
-                    args,
-                    env: std::collections::HashMap::new(),
-                    cwd: None,
-                    url: None,
-                    transport: None,
-                    connect_timeout: None,
-                    execute_timeout: None,
-                    read_timeout: None,
-                    disabled: false,
-                    enabled: true,
-                    required: false,
-                    enabled_tools: Vec::new(),
-                    disabled_tools: Vec::new(),
-                    headers: std::collections::HashMap::new(),
-                    env_headers: std::collections::HashMap::new(),
-                    bearer_token_env_var: None,
-                    scopes: Vec::new(),
-                    oauth: None,
-                    oauth_resource: None,
-                    reviewed_plugin: None,
-                    runtime_added: false,
-                    allow_private_network: false,
-                },
-            );
-            save_mcp_config(&config_path, &cfg)?;
+                Ok(())
+            })?;
             println!(
                 "Registered Codewhale as MCP server '{name}' in {}",
                 config_path.display()
@@ -10369,21 +10326,6 @@ async fn run_mcp_command(
             Ok(())
         }
     }
-}
-
-fn load_mcp_config(path: &Path) -> Result<McpConfig> {
-    if !path.exists() {
-        return Ok(McpConfig::default());
-    }
-    let contents = std::fs::read_to_string(path)
-        .map_err(|e| anyhow::anyhow!("Failed to read MCP config {}: {}", path.display(), e))?;
-    let cfg: McpConfig = serde_json::from_str(&contents).map_err(|_| {
-        anyhow::anyhow!(
-            "Failed to parse MCP config {}; file contents were omitted",
-            codewhale_config::quote_os_path(path)
-        )
-    })?;
-    Ok(cfg)
 }
 
 /// Diagnostic status for an MCP server entry.
@@ -10565,19 +10507,6 @@ fn is_scoped_npm_package_arg(command: &str, argument: &str) -> bool {
                 && !value.contains(['@', '/', '\\'])
                 && !value.chars().any(char::is_whitespace)
         })
-}
-
-fn save_mcp_config(path: &Path, cfg: &McpConfig) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).with_context(|| {
-            format!("Failed to create MCP config directory {}", parent.display())
-        })?;
-    }
-    let rendered = serde_json::to_string_pretty(cfg)
-        .map_err(|e| anyhow!("Failed to serialize MCP config: {e}"))?;
-    crate::utils::write_atomic(path, rendered.as_bytes())
-        .map_err(|e| anyhow!("Failed to write MCP config {}: {}", path.display(), e))?;
-    Ok(())
 }
 
 fn run_sandbox_command(args: SandboxArgs) -> Result<()> {

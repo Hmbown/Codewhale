@@ -16,16 +16,23 @@ Two paths:
 1. **Local control (macOS, no setup).** The Spotify desktop app must be
    running, or say so:
    `osascript -e 'tell application "Spotify" to playpause'`
-2. **Web API (search, playlists, other platforms).** Needs a Spotify
-   developer app token from the user; fail loud when absent:
+2. **Web API (search, playlists, other platforms).** Requires an authorized Spotify
+   connection with suitable scopes; report missing access without asking the
+   user to paste a token into chat:
    `GET api.spotify.com/v1/search`, `/v1/me/playlists`, `/v1/playlists/{id}`.
 
 ## Workflow
 1. Prefer local control for transport (play/pause/next/previous/current track).
-2. Use the Web API for search, playlist contents, and recommendations.
+   Use the requested `play` or `pause` verb; `playpause` is a toggle and cannot
+   safely be retried after an uncertain result. Verify player state afterward.
+2. Use available Web API endpoints for search and playlist contents. Check
+   current app-access restrictions; do not promise the restricted Recommendations
+   API. Handle 403/429 responses without bypassing access or rate limits.
 3. Report artist, track, album, and playlist names verbatim.
 
 ## Non-goals
 - Do not change playlists (add/remove/reorder) unless asked.
 - Do not download or rip audio.
 - Do not handle the user's Spotify password.
+
+Reference: [Spotify API changes](https://developer.spotify.com/blog/2024-11-27-changes-to-the-web-api).

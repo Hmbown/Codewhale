@@ -36,7 +36,7 @@ use crate::tui::provider_picker::ProviderPickerView;
 use crate::tui::shell_key_routing::{
     Focus, SHELL_BINDINGS, ShellBindingId, is_permission_cycle_shortcut,
 };
-use crate::tui::ui_text::truncate_line_to_width;
+use crate::tui::ui_text::{line_to_plain, truncate_line_to_width};
 use crate::tui::views::ConfigView;
 use crate::tui::views::{HelpView, ModalView, ViewAction};
 use crate::working_set::Workspace;
@@ -1094,18 +1094,38 @@ fn underwater_motion_keeps_its_smoother_cadence_during_live_status() {
     app.fancy_animations = true;
     app.constrained_frame_rate = false;
 
+    use crate::tui::display_refresh::DrawCadenceTier;
     assert_eq!(
-        animation_interval_ms(&app, true, false),
+        animation_interval_ms(&app, true, false, DrawCadenceTier::Interactive),
         UI_STATUS_ANIMATION_MS
     );
     assert_eq!(
-        animation_interval_ms(&app, false, true),
+        animation_interval_ms(&app, false, true, DrawCadenceTier::Interactive),
         UI_UNDERWATER_ANIMATION_MS
     );
     assert_eq!(
-        animation_interval_ms(&app, true, true),
+        animation_interval_ms(&app, true, true, DrawCadenceTier::Interactive),
         UI_UNDERWATER_ANIMATION_MS,
         "the slower status spinner must not throttle ambient fish"
+    );
+    // Only ambience moving: the tick lands on the interval the frame
+    // limiter draws at, instead of asking every 80 ms for a frame the
+    // limiter then holds until its 120 ms atmosphere cadence.
+    let atmosphere = crate::tui::display_refresh::adaptive_animation_interval_ms(false);
+    assert!(atmosphere >= UI_UNDERWATER_ANIMATION_MS);
+    assert_eq!(
+        animation_interval_ms(&app, false, true, DrawCadenceTier::Atmosphere),
+        atmosphere
+    );
+    assert_eq!(
+        underwater_animation_interval_ms(&app, DrawCadenceTier::Atmosphere),
+        crate::tui::display_refresh::content_driven_draw_interval(
+            DrawCadenceTier::Atmosphere,
+            crate::tui::display_refresh::probe_display_refresh().hz,
+            false,
+        )
+        .as_millis() as u64,
+        "the idle water ticks exactly when the limiter lets it draw"
     );
     // SAFETY: cleanup under the same lock.
     unsafe {
@@ -1135,16 +1155,19 @@ fn ghostty_caps_underwater_motion_without_slowing_interaction() {
     app.fancy_animations = true;
     app.constrained_frame_rate = false;
 
-    assert_eq!(
-        underwater_animation_interval_ms(&app),
-        UI_GHOSTTY_UNDERWATER_ANIMATION_MS
-    );
+    use crate::tui::display_refresh::DrawCadenceTier;
+    for tier in [DrawCadenceTier::Atmosphere, DrawCadenceTier::Interactive] {
+        assert_eq!(
+            underwater_animation_interval_ms(&app, tier),
+            UI_GHOSTTY_UNDERWATER_ANIMATION_MS
+        );
+    }
     const {
         assert!(UI_GHOSTTY_UNDERWATER_ANIMATION_MS < UI_UNDERWATER_ANIMATION_MS);
     }
     app.constrained_frame_rate = true;
     assert_eq!(
-        underwater_animation_interval_ms(&app),
+        underwater_animation_interval_ms(&app, DrawCadenceTier::Interactive),
         UI_CONSTRAINED_UNDERWATER_ANIMATION_MS,
         "tmux/SSH compatibility must override Ghostty's native atmosphere lane"
     );
@@ -4066,7 +4089,7 @@ fn selection_to_text_copies_rendered_transcript_block() {
         !selected.contains("Ctrl+O"),
         "short completed thinking should not show the detail affordance: {selected:?}"
     );
-    assert!(selected.contains("run done · cargo check"), "{selected:?}");
+    assert!(selected.contains("run Done · cargo check"), "{selected:?}");
     assert!(selected.contains("copy assistant"), "{selected:?}");
     // #1163: tool-card middle lines are rendered with a `│ ` left rail
     // glyph, but that decoration must not leak into copied text. Assert
@@ -4164,6 +4187,207 @@ fn mouse_selection_autocopies_on_release_without_ctrl_c() {
             .last_written_text()
             .is_some_and(|text| text.contains("alpha")),
         "selection should be written to clipboard"
+    );
+}
+
+#[test]
+fn mouse_selection_fragment_drag_copies_exact_text() {
+    // A drag that cuts a cell in half must copy the fragment's exact text,
+    // not round out to the whole cell. The receipt stays
+    // the pre-existing text-fallback status line (shared with the
+    // `selection_copy_markdown = false` path) rather than the Markdown toast;
+    // migrating copy receipts to toasts is broader than this fix.
+    let mut app = create_test_app();
+    app.history = vec![HistoryCell::Assistant {
+        content: "alpha beta".to_string(),
+        streaming: false,
+    }];
+    app.resync_history_revisions();
+    app.viewport.transcript_cache.ensure(
+        &app.history,
+        &app.history_revisions,
+        80,
+        app.transcript_render_options(),
+    );
+    app.viewport.last_transcript_area = Some(Rect {
+        x: 0,
+        y: 0,
+        width: 80,
+        height: 8,
+    });
+    app.viewport.last_transcript_top = 0;
+    app.viewport.last_transcript_total = app.viewport.transcript_cache.total_lines();
+    app.viewport.last_transcript_padding_top = 0;
+
+    handle_mouse_event(
+        &mut app,
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+    // Fragment coverage: "alpha beta" spans columns 0-10, so releasing at
+    // column 4 cuts the cell in half and the Markdown path must decline.
+    handle_mouse_event(
+        &mut app,
+        MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: 4,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+    handle_mouse_event(
+        &mut app,
+        MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: 4,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+
+    let copied = app
+        .clipboard
+        .last_written_text()
+        .expect("fragment drag must copy");
+    // Mouse columns include the 2-wide rail/prefix before content, so
+    // releasing at column 4 selects the leading 2 content chars.
+    assert_eq!(
+        copied, "al",
+        "fragment drag must copy exact text without rounding out"
+    );
+    assert!(
+        !copied.contains("beta"),
+        "must not round out to the whole cell, got {copied:?}"
+    );
+    assert_eq!(
+        app.status_message.as_deref(),
+        Some("Selection copied"),
+        "fragment copy reports through the text-fallback receipt"
+    );
+    assert!(
+        !app.status_toasts
+            .iter()
+            .any(|toast| toast.text.contains("Markdown")),
+        "fragment copy takes the text fallback, not the Markdown toast"
+    );
+}
+
+#[test]
+fn tab_line_partial_selection_copies_exact_fragment_not_whole_cells() {
+    // Mouse columns are painted cells, where control characters are
+    // invisible. The tab below takes no column, so visible content ends 4
+    // cells before a fixed-4 tab would end it. A selection stopping short
+    // of the visible end is a fragment: the Markdown path must decline and
+    // the text fallback must slice in visible space, keeping the interior
+    // tab itself.
+    let mut app = create_test_app();
+    app.history = vec![HistoryCell::Assistant {
+        content: "abcdefgh\tcdefghij".to_string(),
+        streaming: false,
+    }];
+    app.resync_history_revisions();
+    app.viewport.transcript_cache.ensure(
+        &app.history,
+        &app.history_revisions,
+        80,
+        app.transcript_render_options(),
+    );
+    let line_index = 0;
+    let head = app.viewport.transcript_cache.rail_prefix_width(line_index)
+        + app
+            .viewport
+            .transcript_cache
+            .line_meta()
+            .get(line_index)
+            .map(|meta| meta.copy_prefix_width())
+            .unwrap_or(0);
+    assert_eq!(head, 2, "paragraph line carries the 2-wide rail only");
+    app.viewport.transcript_selection.anchor = Some(TranscriptSelectionPoint {
+        line_index,
+        column: head,
+    });
+    app.viewport.transcript_selection.head = Some(TranscriptSelectionPoint {
+        line_index,
+        column: head + 14,
+    });
+
+    assert_eq!(
+        selection_to_markdown(&app),
+        None,
+        "partial tab-line selection must not project whole cells"
+    );
+    copy_active_selection(&mut app);
+    assert_eq!(
+        app.clipboard.last_written_text(),
+        Some("abcdefgh\tcdefgh"),
+        "fragment keeps the interior tab and stops before the last chars"
+    );
+
+    // Covering all visible cells still projects Markdown source, even
+    // though the window ends before a fixed-4 tail would.
+    app.viewport.transcript_selection.head = Some(TranscriptSelectionPoint {
+        line_index,
+        column: head + 17,
+    });
+    let (text, cells) = selection_to_markdown(&app).expect("full tab line keeps markdown");
+    assert_eq!(cells, 1);
+    assert_eq!(text, "abcdefgh\tcdefghij");
+}
+
+#[test]
+fn tab_indented_code_fragment_copies_shifted_exact_text() {
+    // Leading tabs paint no cells, so the visible line is just the code
+    // chars. A window over the second visible char must copy exactly it;
+    // the zero-width tab spans at and below the window start stay out
+    // under the same strict rule every grapheme follows.
+    let mut app = create_test_app();
+    app.history = vec![HistoryCell::Assistant {
+        content: "```\n\t\txy\n```".to_string(),
+        streaming: false,
+    }];
+    app.resync_history_revisions();
+    app.viewport.transcript_cache.ensure(
+        &app.history,
+        &app.history_revisions,
+        80,
+        app.transcript_render_options(),
+    );
+    let cache = &app.viewport.transcript_cache;
+    let line_index = cache
+        .lines()
+        .iter()
+        .position(|line| line_to_plain(line).contains("xy"))
+        .expect("code line renders");
+    let head = cache.rail_prefix_width(line_index)
+        + cache
+            .line_meta()
+            .get(line_index)
+            .map(|meta| meta.copy_prefix_width())
+            .unwrap_or(0);
+    assert_eq!(head, 4, "code line carries rail plus code prefix");
+    app.viewport.transcript_selection.anchor = Some(TranscriptSelectionPoint {
+        line_index,
+        column: head + 1,
+    });
+    app.viewport.transcript_selection.head = Some(TranscriptSelectionPoint {
+        line_index,
+        column: head + 2,
+    });
+
+    assert_eq!(
+        selection_to_markdown(&app),
+        None,
+        "mid-line code fragment is not whole cells"
+    );
+    copy_active_selection(&mut app);
+    assert_eq!(
+        app.clipboard.last_written_text(),
+        Some("y"),
+        "fragment copies exactly the covered visible cell"
     );
 }
 
@@ -6038,6 +6262,71 @@ fn selected_reasoning_hint_and_space_share_one_owner() {
 }
 
 #[test]
+fn selected_reasoning_actions_roundtrip_for_every_expansion_baseline() {
+    use crate::tui::history::ReasoningAction;
+
+    for verbose in [false, true] {
+        for default_expanded in [false, true] {
+            for folded in [false, true] {
+                let mut app = create_test_app();
+                app.verbose_transcript = verbose;
+                app.thinking_default_expanded = default_expanded;
+                app.thinking_preview_lines = 4;
+                app.history = vec![oversized_reasoning("baseline", false)];
+                if folded {
+                    app.folded_thinking.insert(0);
+                }
+                app.resync_history_revisions();
+                // The adaptive preview fills spare viewport rows. Keep the
+                // 40-line body larger than the pane so both actions exist.
+                let _ = render_underwater_test_app(&mut app, 100, 32);
+                select_original_cell(&mut app, 0);
+
+                let initially_expanded = (verbose || default_expanded) != folded;
+                for (step, expanded) in
+                    [initially_expanded, !initially_expanded, initially_expanded]
+                        .into_iter()
+                        .enumerate()
+                {
+                    let surface = render_underwater_test_app(&mut app, 100, 32);
+                    // Inspect rendered lines, including the scrolled-off part,
+                    // so viewport position cannot masquerade as a fold.
+                    let rendered_full_body = app
+                        .viewport
+                        .transcript_cache
+                        .lines()
+                        .iter()
+                        .any(|line| line.to_string().contains("baseline line 40"));
+                    assert_eq!(
+                        rendered_full_body, expanded,
+                        "verbose={verbose}, default_expanded={default_expanded}, \
+                         folded={folded}, step={step}: {surface}"
+                    );
+                    let target = app
+                        .viewport
+                        .transcript_cache
+                        .reasoning_action_target()
+                        .expect("selected reasoning has a rendered action");
+                    assert_eq!(target.owner.cell_index, 0);
+                    assert_eq!(
+                        target.action,
+                        if expanded {
+                            ReasoningAction::Collapse
+                        } else {
+                            ReasoningAction::Expand
+                        }
+                    );
+                    if step < 2 {
+                        assert!(handle_transcript_space(&mut app));
+                    }
+                }
+                assert_eq!(app.folded_thinking.contains(&0), folded);
+            }
+        }
+    }
+}
+
+#[test]
 fn mouse_selection_redraws_and_retargets_reasoning_with_unchanged_revisions() {
     let mut app = create_test_app();
     app.history = vec![
@@ -6260,6 +6549,32 @@ fn raw_paste_beginning_with_space_preserves_payload_over_reasoning_action() {
             + Duration::from_millis(2),
     ));
     assert_eq!(app.input, " x");
+}
+
+#[test]
+fn paste_safety_expiry_repaints_the_submit_cue_without_another_key() {
+    let mut app = create_test_app();
+    app.use_paste_burst_detection = true;
+    app.insert_str("/mcp");
+    let now = Instant::now();
+    app.paste_burst.extend_window(now);
+    assert!(!app.composer_enter_would_submit());
+    let waiting = render_underwater_test_app(&mut app, 80, 24);
+    assert!(waiting.contains("[·]"), "{waiting}");
+    app.needs_redraw = false;
+    assert!(flush_paste_burst_before_composer(
+        &mut app,
+        now + Duration::from_millis(121)
+    ));
+    assert!(app.needs_redraw);
+    assert!(app.composer_enter_would_submit());
+    let ready = render_underwater_test_app(&mut app, 80, 24);
+    assert!(ready.contains("[↵]"), "{ready}");
+    assert_eq!(app.input, "/mcp");
+    assert_eq!(
+        app.paste_burst_next_flush_delay_if_enabled(now + Duration::from_millis(121)),
+        None
+    );
 }
 
 #[test]
@@ -19540,7 +19855,7 @@ fn completed_exec_tool_result_still_renders_run_done() {
 
     assert_eq!(exec.status, ToolStatus::Success);
     let text = rendered_text(&exec.lines_with_motion(100, true));
-    assert!(text.contains("run done"), "{text}");
+    assert!(text.contains("run Done"), "{text}");
     assert!(!text.contains("tool loaded - retry required"), "{text}");
 }
 
@@ -19578,7 +19893,7 @@ fn hydrated_exec_tool_result_renders_retry_required_not_run_done() {
     assert_eq!(exec.status, ToolStatus::Hydrated);
     let text = rendered_text(&exec.lines_with_motion(120, true));
     assert!(text.contains("run tool loaded - retry required"), "{text}");
-    assert!(!text.contains("run done"), "{text}");
+    assert!(!text.contains("run Done"), "{text}");
 }
 
 #[test]
@@ -19616,7 +19931,7 @@ fn hydrated_tool_with_validation_body_still_uses_hydrated_status() {
     assert_eq!(generic.status, ToolStatus::Hydrated);
     let text = rendered_text(&HistoryCell::Tool(ToolCell::Generic(generic.clone())).lines(120));
     assert!(text.contains("tool loaded - retry required"), "{text}");
-    assert!(!text.contains("tool done"), "{text}");
+    assert!(!text.contains("tool Done"), "{text}");
 }
 
 #[test]
@@ -23112,13 +23427,13 @@ fn turn_inspector_switches_isolated_full_turn_pages_with_tagged_reasoning_and_ou
     for expected in [
         "FIRST-PROMPT",
         "keep this input line",
-        "[∿ reasoning 1/1 · done]",
+        "[∿ reasoning 1/1 · Done]",
         "FIRST-THOUGHT",
         "full reasoning tail",
         "[⚙ using tool]",
         "FIRST-TOOL-OUTPUT",
         "complete execution tail",
-        "[◆ · done]",
+        "[◆ · Done]",
         "FIRST-ANSWER",
         "complete assistant tail",
     ] {
@@ -25087,6 +25402,131 @@ fn composer_arrow_down_at_last_line_preserves_multiline_draft() {
     assert_eq!(app.input, "line one\nline two");
     assert_eq!(app.cursor_position, app.input.chars().count());
     assert!(app.history_index.is_none());
+}
+
+// A long single-line prompt spans several visual rows; Up/Down must step
+// between them instead of recalling history (which reads as deletion). Inner
+// composer width 22 -> text width 20 after the prompt gutter, so a 45-char
+// unbroken line wraps to visual rows [0..20), [20..40), [40..45).
+#[test]
+fn composer_arrow_up_in_wrapped_line_moves_cursor_not_history() {
+    let mut app = create_test_app();
+    app.composer_arrows_scroll = false;
+    app.input = "a".repeat(45);
+    app.cursor_position = 45;
+    app.input_history.push("previous prompt".to_string());
+    app.viewport.last_composer_content = Some(Rect::new(0, 0, 22, 5));
+
+    assert!(handle_composer_history_arrow(
+        &mut app,
+        KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
+        false,
+        false,
+    ));
+
+    assert_eq!(app.input, "a".repeat(45));
+    assert!(app.history_index.is_none());
+    assert_eq!(app.cursor_position, 25);
+}
+
+#[test]
+fn composer_arrow_down_in_wrapped_line_moves_cursor_not_history() {
+    let mut app = create_test_app();
+    app.composer_arrows_scroll = false;
+    app.input = "a".repeat(45);
+    app.cursor_position = 25;
+    app.input_history.push("previous prompt".to_string());
+    app.viewport.last_composer_content = Some(Rect::new(0, 0, 22, 5));
+
+    assert!(handle_composer_history_arrow(
+        &mut app,
+        KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+        false,
+        false,
+    ));
+
+    assert_eq!(app.input, "a".repeat(45));
+    assert!(app.history_index.is_none());
+    assert_eq!(app.cursor_position, 45);
+}
+
+#[test]
+fn composer_arrow_up_on_first_visual_row_still_recalls_history() {
+    let mut app = create_test_app();
+    app.composer_arrows_scroll = false;
+    app.input = "a".repeat(45);
+    app.cursor_position = 5;
+    app.input_history.push("previous prompt".to_string());
+    app.viewport.last_composer_content = Some(Rect::new(0, 0, 22, 5));
+
+    assert!(handle_composer_history_arrow(
+        &mut app,
+        KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
+        false,
+        false,
+    ));
+
+    assert_eq!(app.input, "previous prompt");
+}
+
+#[test]
+fn composer_arrow_down_on_last_visual_row_preserves_wrapped_draft() {
+    let mut app = create_test_app();
+    app.composer_arrows_scroll = false;
+    app.input = "a".repeat(45);
+    app.cursor_position = 45;
+    app.input_history.push("previous prompt".to_string());
+    app.viewport.last_composer_content = Some(Rect::new(0, 0, 22, 5));
+
+    assert!(handle_composer_history_arrow(
+        &mut app,
+        KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+        false,
+        false,
+    ));
+
+    assert_eq!(app.input, "a".repeat(45));
+    assert_eq!(app.cursor_position, 45);
+    assert!(app.history_index.is_none());
+}
+
+#[test]
+fn composer_arrow_up_wrapped_line_without_geometry_recalls_history() {
+    let mut app = create_test_app();
+    app.composer_arrows_scroll = false;
+    app.input = "a".repeat(45);
+    app.cursor_position = 45;
+    app.input_history.push("previous prompt".to_string());
+    assert!(app.viewport.last_composer_content.is_none());
+
+    assert!(handle_composer_history_arrow(
+        &mut app,
+        KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
+        false,
+        false,
+    ));
+
+    assert_eq!(app.input, "previous prompt");
+}
+
+#[test]
+fn composer_arrows_scroll_wrapped_line_navigates_not_scrolls() {
+    let mut app = create_test_app();
+    app.composer_arrows_scroll = true;
+    app.input = "a".repeat(45);
+    app.cursor_position = 45;
+    app.viewport.last_composer_content = Some(Rect::new(0, 0, 22, 5));
+
+    assert!(handle_composer_history_arrow(
+        &mut app,
+        KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
+        false,
+        false,
+    ));
+
+    assert_eq!(app.input, "a".repeat(45));
+    assert_eq!(app.cursor_position, 25);
+    assert_eq!(app.viewport.pending_scroll_delta, 0);
 }
 
 // #1443: when mouse capture is off (e.g. Windows CMD), arrow-scroll

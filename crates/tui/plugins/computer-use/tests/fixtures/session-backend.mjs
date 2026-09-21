@@ -8,7 +8,7 @@ export function create() {
   const log = process.env.CU_SESSION_CALLS;
   let appName = null;
   let pointerDown = false;
-  const record = (method, extra = {}) => fs.appendFileSync(log, JSON.stringify({ instance, method, appName, ...extra }) + "\n");
+  const record = (method, extra = {}) => fs.appendFileSync(log, JSON.stringify({ instance, method, appName, at: Date.now(), ...extra }) + "\n");
   return {
     async probe() { return { ready: true }; },
     async get_app_state({ app_ref }) {
@@ -27,14 +27,14 @@ export function create() {
         await runOk(process.execPath, ["-e", `
           const fs = require('node:fs');
           const [file, instance, text] = process.argv.slice(1);
-          const record = method => fs.appendFileSync(file, JSON.stringify({ instance, method, text }) + '\\n');
+          const record = method => fs.appendFileSync(file, JSON.stringify({ instance, method, text, at: Date.now() }) + '\\n');
           record('child_started');
           setTimeout(() => record('late_input'), 5000);
         `, log, instance, text]);
       } finally {
         await withSignal(null, () => runOk(process.execPath, ["-e", `
           const fs = require('node:fs');
-          fs.appendFileSync(process.argv[1], JSON.stringify({ instance: process.argv[2], method: 'child_released' }) + '\\n');
+          fs.appendFileSync(process.argv[1], JSON.stringify({ instance: process.argv[2], method: 'child_released', at: Date.now() }) + '\\n');
         `, log, instance]));
       }
       return { action_sent: true };

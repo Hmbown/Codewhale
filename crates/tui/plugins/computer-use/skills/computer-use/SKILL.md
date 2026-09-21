@@ -1,6 +1,6 @@
 ---
 name: computer-use
-description: Desktop control with accessibility-first observation and actions, pixel fallback, screenshots, zoom, screen recording, and switching between registered computers. Qualified on macOS; Windows, Linux and HarmonyOS backends are experimental.
+description: Desktop control that picks the right interface per step — app scripting (AppleScript/JXA), accessibility-first observation and actions, pixel fallback, screenshots, zoom, screen recording, and switching between registered computers. Qualified on macOS; Windows, Linux and HarmonyOS backends are experimental.
 ---
 
 # Codewhale Computer Use
@@ -11,13 +11,33 @@ The plugin controls **computers**, not "the screen". `computer {action:"list"}` 
 registry; one computer is always **active**, and every tool acts on the active
 computer unless given `computer`.
 
+A computer is an execution environment, not necessarily the user's desktop.
+The registry holds two kinds:
+
+- **Spawned computers are ours.** `computer {action:"spawn", id:"<id>",
+  transport:"docker"}` provisions a disposable Linux desktop container,
+  registers it, and makes it active. Every tool works on it unchanged; the
+  user's own machine is never touched. It is destroyed by `computer
+  {action:"remove"}` or when the session ends. **Prefer a spawned computer
+  for any work that does not need the user's own session** — it is the
+  isolated workspace, not a workaround for sharing theirs politely.
+- **Registered computers are someone's.** `local` is the machine the plugin
+  runs on — the user's desktop, with their logged-in apps and their pointer.
+  `ssh` computers run the bundled remote agent (pushed automatically at
+  registration). `hdc` computers are HarmonyOS devices driven over hdc.
+  Reach for `local` only when the task genuinely needs that session — their
+  Mail, their signed-in browser, their files on screen. A spawned desktop
+  cannot replace that, and pretending otherwise is the failure mode this
+  distinction exists to prevent.
+
+Other rules:
+
 - Pass `computer: "<id>"` on any tool to act on (and stickily switch to) that
   computer. `computer_switch` changes the active computer without acting.
-- `local` is the machine the plugin runs on. `ssh` computers run the bundled
-  remote agent (pushed automatically at registration). `hdc` computers are
-  HarmonyOS devices driven over hdc.
 - Every receipt names the computer it happened on. Read it before continuing —
   never assume the action landed on the machine you meant.
+- Spawned containers are task-owned: never register one as a normal computer,
+  and never treat its filesystem or state as durable — it dies with the task.
 
 ## Human controls
 
@@ -31,9 +51,79 @@ the old session remains invalid even when the person allows new sessions.
 The helper's own setup, permission and safety controls belong to the person.
 Do not operate them or approve the host's pending authorization yourself.
 
-## Core loop
+## Consent on the user's computer
 
-Observe once, act once, then verify.
+The app, not the tool, is the unit of trust on `local`. The first call that
+targets an application — `open_application`, an `app_ref`, an element or
+`state_id`, or an action on the bound app — refuses `consent_required`
+until the user has decided. Ask them, then record the answer:
+
+- `consent {action:"allow"|"deny", app:"Safari"}` — `app` accepts a name, a
+  bundle id, or `pid:`/a bare number for a pid; `name`, `bundle_id` and
+  `pid` fields work too. Decisions cover this session; `remember:true`
+  persists them for the computer until revoked.
+- `consent {action:"status"}` — the ledger: every recorded app decision and
+  the foreground decision, each marked session or persisted.
+  `consent {action:"revoke", app:"…"}` clears a decision so the next call
+  asks again.
+- A deny is a wall, not a hint: every spelling of the same app fails
+  `app_denied` — the ledger folds name, bundle id and pid together, and a
+  denied app cannot be opened, driven, or killed through this surface.
+  Only the user can change it; never work around it.
+
+Foreground is a second, separate consent. `open_application
+{activate:true}` — the shared-desktop escalation, on any platform —
+additionally needs `consent {action:"allow", scope:"foreground"}`; a
+refusal reads `foreground_consent_required`, a recorded denial
+`foreground_denied`. Background control (`activate:false`, the default
+everywhere) needs only the app consent.
+
+Spawned computers are exempt — a task-owned desktop holds nothing of the
+user's. Remote computers are covered by their transport's trust, not this
+ledger. `app_script` keeps its own OS-level consent: Automation prompts
+belong to macOS, not to this ledger.
+
+Only in explicitly authorized foreground mode, where a shared surface is taken
+— a front lease for window-record
+input, a real-pointer gesture, foreground keys, an activation — the helper
+first waits for a gap in the person's hardware input rather than cutting
+between their keystrokes. The wait is bounded, never infinite, and every
+successful receipt that waited reports `yield_ms`. If no quiet window
+arrives, `user_busy` means no input was sent: wait for the person to finish
+or use an already-authorized isolated computer; do not disable the yield
+or loop on retries. It is turn-taking, not a lock:
+`user_input_during_lease:true` still means the outcome is contested —
+say so.
+
+## Choose the interface
+
+Clicking is only one way to use a computer. Before each step, pick the
+interface that finishes it verifiably with the fewest moving parts — and
+switch freely between steps:
+
+1. **The host's own tools** — shell, files, HTTP, git, other MCP apps.
+   A step with no reason to be on screen does not belong to this plugin:
+   never drive a terminal window to run a command the host can run itself.
+2. **`app_script`** — AppleScript/JXA into apps that ship a scripting
+   dictionary (most native macOS apps). Deterministic, returns values,
+   needs no Accessibility grant, never touches the pointer.
+3. **`browser`** — CDP for web work: exact selectors, no pixels.
+4. **Accessibility actions** — the GUI loop below. The route for apps
+   with no better interface: background-safe, element-precise, verified.
+5. **Coordinates and pixels** — last resort, when nothing else can
+   express the target.
+
+A step that *can* be clicked still costs more than the same step
+scripted, and a pixel click's `action_sent` proves less than a script's
+return value or a `get_value` read-back. Prefer the interface whose
+receipt can prove the step happened. Switching mid-task is normal —
+script Mail for the message, process it through the host, type the
+answer into a GUI-only editor; `get_app_state` still verifies what a
+script changed.
+
+## The GUI loop
+
+Once the GUI is the right interface: observe once, act once, then verify.
 
 1. If readiness is unknown, call `request_access` once. It names missing
    permissions and missing tools per platform, and never pops dialogs. Its
@@ -138,30 +228,18 @@ Observe once, act once, then verify.
     Prefer them. Text entry uses writable accessibility selection when
     available; verify the resulting value. `get_app_state`, `list_windows`
     and `screenshot` default to the selected app.
-  - **Background mode never moves the user's cursor.** A coordinate
-    `click` first tries the bound application's accessibility action,
-    including focusing a field that is not AXPressable. `right_click` uses
-    advertised context-menu actions. `scroll` uses the target's accessibility
-    scrollbar; prefer a scroll-area element and read the receipt's unit and
-    value change. Where accessibility cannot act — a point with no pressable
-    element, drag, raw double/triple/middle click, wheel scrolling without an
-    AX scrollbar — the window-record route delivers genuine mouse/wheel
-    events to the bound app's window: the cursor never moves, and a momentary
-    no-raise front-process lease is taken and restored (every receipt says
-    `strategy:"window-record"`, `pointer_moved:false`). Lease accounting is
-    explicit: `front_lease:true` plus `front_restored` when a lease was taken
-    (a failed restore is stated in the receipt — report it to the user), and
-    `front_lease:false` when the target was already frontmost and no lease was
-    needed. A taken lease also reports its borrow window (`lease_ms`) and the
-    hardware-input clock around it (`idle_before_s`, `idle_after_s`); the
-    verdict `user_input_during_lease:true` means the person's own input
-    arrived mid-lease — treat the outcome as contested, re-observe, and say
-    so. `key` chords that had no window to route through fall back to
-    process delivery and say so instead of pretending.
-    Only hover and held-button tools still need `activate:true`.
+  - **Background mode does not borrow keyboard focus.** Accessibility
+    click, focus, selection and scroll actions remain available. Raw pointer
+    fallbacks, modified/window-targeted keys, web value replacement and typing
+    paths that require a key-window lease refuse `background_focus_required`
+    before delivery. Use an accessibility menu/control, browser control or an
+    authorized separate computer. Do not escalate to foreground or retry the
+    same action merely because the user stopped typing briefly.
   - Shared-desktop gestures and foreground keyboard delivery require explicit
     user authorization for exclusive desktop use, followed by
-    `open_application(activate:true)`. Do not select it merely to work around a
+    `open_application(activate:true)` — which itself needs the foreground
+    consent (`consent {action:"allow", scope:"foreground"}`; see Consent on
+    the user's computer). Do not select it merely to work around a
     background refusal. Receipts identify `input_scope: "shared-desktop"`;
     pointer gestures use the physical cursor, even if it is restored afterward.
     Keys and raw pointer gestures stop when another app takes focus. Never
@@ -186,10 +264,10 @@ Observe once, act once, then verify.
     Acting on one fails `degenerate_frame` — scroll the real row into view
     and re-observe rather than retrying the same index.
   - `set_value` coerces numbers for `AXIncrementor`/`AXSlider`/`AXStepper`
-    and verifies the readback. Web-area elements take the replacement path
-    automatically (focus, select-all through the record channel, type,
-    read-back verify — receipt `strategy:"focus-type-replace"`) because
-    Chromium silently no-ops or coerces direct `AXValue` writes.
+    and verifies the readback. Web-area direct AXValue writes are unreliable;
+    background mode refuses the focus/select-all replacement. Use browser
+    control. The replacement is available only during explicitly authorized
+    foreground control.
   Use app-scoped screenshots (`app_ref`) to avoid capturing unrelated windows.
   The nonactivating preview panel is on by default while an app is bound —
   it shows the captured app window and a drawn cursor at each action's target
@@ -198,8 +276,10 @@ Observe once, act once, then verify.
   desktop; watching it does not authorize shared-desktop control. Process-directed actions still
   change the target app: do not work in an app the user is actively editing.
   Close only disposable documents created by your task; never quit a user app.
-- Windows/Linux: raw input is foreground by nature; UIA/AT-SPI element actions
-  are the precise path.
+- Windows/Linux: `open_application` still defaults to `activate:false` —
+  Windows launches the app minimized and Linux hands focus back to the
+  previous window — but raw input there is foreground by nature;
+  UIA/AT-SPI element actions are the precise path.
 - HarmonyOS: `uitest` synthesizes touches; there is no hover or cursor.
 
 ## Keyboard
@@ -222,6 +302,33 @@ unavailable pending session-owned cleanup; use screenshots. HarmonyOS uses
 snapshot-series (no native CLI recorder —
 the receipt says so). `recording_status` / `recording_list` report bytes and
 paths. Screenshots land in the same directory.
+
+## Scripting apps (macOS)
+
+`app_script {script, language?, timeout?}` runs AppleScript (default) or
+JXA (`language:"javascript"`) through osascript on the local computer.
+`result` is the script's stdout; a non-zero exit fails `script_error`
+with stderr, and `script_timeout` means the script — or a consent dialog
+— was still open.
+
+- A first script targeting an app may show the person an Automation
+  consent dialog; that is their choice, not your error. A declined or
+  missing consent fails `automation_denied` (-1743): name the pane
+  (System Settings → Privacy & Security → Automation) and stop — never
+  retry it away.
+- Read the dictionary before writing: `sdef /Applications/Mail.app`
+  through the host's shell, or Script Editor's Library window. A guessed
+  property earns `script_error` (-1728/-2740) — check the dictionary,
+  don't retry with another guess.
+- `tell application "X"` launches X if needed; no `open_application`
+  required, and the script runs while X stays in the background.
+- `do shell script "…"` inside a script works, but prefer the host's own
+  shell for shell work — keep `app_script` for app control and the parts
+  only a dictionary exposes.
+- ssh, docker and hdc computers refuse it (`unsupported_on_transport`):
+  remote channels stay computer-use only, never a shell — a spawned
+  desktop is no exception. Windows and Linux backends fail
+  `unsupported_on_backend` for now.
 
 ## Browser (CDP)
 

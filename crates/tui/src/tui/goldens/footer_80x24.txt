@@ -21,4 +21,4 @@
                                                                                 
                                                                                 
                                                                                 
-▶▶ ask (Shift+Tab) · work (Tab) · 2 agents · worked 41m 12s · Esc to interrupt  
+ ask (Shift+Tab)   work (Tab)   2 agents   worked 41m 12s   Esc to interrupt    

@@ -1242,6 +1242,27 @@ mod tests {
     }
 
     #[test]
+    fn stepfun_current_coding_models_have_verified_metadata() {
+        assert_eq!(context_window_for_model("step-5-preview"), Some(1_000_000));
+        assert_eq!(
+            max_output_tokens_for_model("step-5-preview"),
+            Some(1_000_000)
+        );
+        for model in [
+            "step-5-preview",
+            "step-3.7-flash",
+            "step-3.5-flash",
+            "step-3.5-flash-2603",
+        ] {
+            assert!(model_supports_reasoning(model), "{model}");
+        }
+        for model in ["step-3.5-flash", "step-3.5-flash-2603"] {
+            assert_eq!(context_window_for_model(model), Some(256_000));
+            assert_eq!(max_output_tokens_for_model(model), None);
+        }
+    }
+
+    #[test]
     fn claude_fable_5_and_sonnet_5_have_verified_metadata() {
         // 1M context / 128K output per
         // https://platform.claude.com/docs/en/about-claude/pricing (2026-07-09).

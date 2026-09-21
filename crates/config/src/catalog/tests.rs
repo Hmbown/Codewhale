@@ -1061,3 +1061,48 @@ fn endpoint_is_baseten_recognizes_the_host_not_the_spelling() {
     assert!(!endpoint_is_baseten("https://127.0.0.1:9/v1"));
     assert!(!endpoint_is_baseten(""));
 }
+
+#[test]
+fn stepfun_bundled_coding_models_preserve_default_and_plan_pricing_boundary() {
+    let rows: Vec<_> = bundled_catalog_offerings()
+        .into_iter()
+        .filter(|row| row.provider == "stepfun")
+        .collect();
+    assert_eq!(rows.len(), 4);
+    assert_eq!(
+        rows.iter()
+            .find(|row| row.default_for_provider)
+            .unwrap()
+            .wire_model_id,
+        "step-3.7-flash"
+    );
+    for row in &rows {
+        assert_eq!(row.reasoning, Some(true));
+        assert_eq!(row.tool_call, Some(true));
+        assert!(row.cost.is_none(), "Step Plan shares ids, not PAYG billing");
+        assert_eq!(row.modalities.as_ref().unwrap().output, ["text"]);
+    }
+    let step5 = rows
+        .iter()
+        .find(|row| row.wire_model_id == "step-5-preview")
+        .unwrap();
+    assert_eq!(step5.limit.as_ref().unwrap().context, Some(1_000_000));
+    assert_eq!(step5.limit.as_ref().unwrap().output, Some(1_000_000));
+    assert_eq!(
+        step5.modalities.as_ref().unwrap().input,
+        ["text", "image", "video"]
+    );
+    assert_eq!(
+        step5.reasoning_options[0]["values"],
+        serde_json::json!(["low", "medium", "high"])
+    );
+    let march = rows
+        .iter()
+        .find(|row| row.wire_model_id == "step-3.5-flash-2603")
+        .unwrap();
+    assert_eq!(
+        march.reasoning_options[0]["values"],
+        serde_json::json!(["low", "high"])
+    );
+    assert_eq!(march.limit.as_ref().unwrap().output, None);
+}

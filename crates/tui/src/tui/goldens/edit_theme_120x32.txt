@@ -4,14 +4,14 @@
   Edit Theme [theme]
 
   Scope: SAVED
-  Current: shoreline
+  Current: underwater
 
   Choose:
        1. system
        2. terminal
-    ▸  3. shoreline
+       3. shoreline
        4. shoreline-light
-       5. underwater
+    ▸  5. underwater
        6. underwater-retro
        7. dark
        8. light
@@ -25,7 +25,7 @@
       16. solarized-light
       17. uwu
 
+
   [ Apply ]  [ Cancel ]
   ↑/↓ or click choose · Enter/Apply · Esc/Cancel · 1-9 jump
-
  ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────

@@ -233,6 +233,21 @@ pub enum ProviderKind {
     /// `https://zenmux.ai/api/v1`. The `/models` catalog is keyless-readable.
     #[serde(alias = "zen-mux", alias = "zen_mux")]
     Zenmux,
+    /// CSDN 星图 (Starmap) — CSDN's hosted OpenAI-compatible model platform
+    /// and Coding Plan subscription.
+    ///
+    /// The plan model id `glm_for_coding` (GLM-5.2 underneath, 200k context
+    /// cap) bills against plan quota and requires the dedicated Coding Plan
+    /// key type; other marketplace model ids and general keys bill metered
+    /// through the same endpoint.
+    #[serde(
+        alias = "csdn-ai",
+        alias = "csdn_ai",
+        alias = "csdn-coding-plan",
+        alias = "csdn_coding_plan",
+        alias = "starmap"
+    )]
+    Csdn,
     /// Concentrate — OpenAI Responses-compatible AI gateway (aggregator).
     ///
     /// Serves a broad catalog of upstream models over the OpenAI Responses
@@ -281,7 +296,7 @@ impl ProviderKind {
     /// stay on the enum for serde and `provider_for_kind`, but they are not
     /// first-class catalog rows. Plan is `mode` / base_url; dialect is
     /// `wire = openai|anthropic` on the primary provider config.
-    pub const ALL: [Self; 45] = [
+    pub const ALL: [Self; 46] = [
         Self::Deepseek,
         Self::NvidiaNim,
         Self::Openai,
@@ -324,6 +339,7 @@ impl ProviderKind {
         Self::Google,
         Self::Edenai,
         Self::Zenmux,
+        Self::Csdn,
         Self::Concentrate,
         Self::Codewhale,
         Self::Custom,

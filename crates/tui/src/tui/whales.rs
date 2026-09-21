@@ -41,7 +41,8 @@ use codewhale_localization::{Locale, MessageId, tr};
 use codewhale_palette::{self as palette, UiTheme};
 
 /// Cells occupied by a badge (species mark + body).
-pub const BADGE_WIDTH: usize = 2;
+#[cfg(test)]
+const BADGE_WIDTH: usize = 2;
 /// Working wake loop: four frames over 720 ms, as in the CWC GIFs.
 pub const WORKING_FRAME_MS: u64 = 180;
 pub const WORKING_FRAMES: usize = 4;

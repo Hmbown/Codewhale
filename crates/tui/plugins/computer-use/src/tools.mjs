@@ -45,12 +45,12 @@ export const TOOLS = [
   { name: "preview", description: "macOS: show or hide the nonactivating app preview with the drawn agent cursor. On by default while an app is bound — each action updates the captured window and cursor without moving the real pointer. Set enabled:false to mute it for the session.", inputSchema: { type: "object", properties: { enabled: { type: "boolean" }, computer: computerParam }, additionalProperties: false } },
   // ---- computers (switching is a default) ----
   {
-    name: "computer", description: "The computer registry. action list | switch | register | remove. switch/register/remove take `id`; register also takes transport (local|ssh|hdc) plus host/port/user/target/installAgent. Every other tool also accepts `computer` to switch stickily on use.",
-    inputSchema: { type: "object", required: ["action"], properties: { action: { enum: ["list", "switch", "register", "remove"] }, id: { type: "string", description: "Short id for the registered computer (letters, digits, dot, dash)" }, transport: { enum: ["local", "ssh", "hdc"] }, label: { type: "string" }, host: { type: "string", description: "ssh: hostname" }, port: { type: "integer", description: "ssh: port (default 22)" }, user: { type: "string", description: "ssh: user" }, target: { type: "string", description: "hdc: target key (omit for the only connected device)" }, installAgent: { type: "boolean", description: "ssh: push the remote agent before first use (default true)" } }, additionalProperties: false },
+    name: "computer", description: "The computer registry. action list | switch | register | spawn | remove. switch/register/spawn/remove take `id`; register also takes transport (local|ssh|hdc) plus host/port/user/target/installAgent; spawn takes transport (docker) plus optional image/label and creates a task-owned disposable desktop that remove or session end destroys. Prefer a spawned computer for work that does not need the user's own session. Every other tool also accepts `computer` to switch stickily on use.",
+    inputSchema: { type: "object", required: ["action"], properties: { action: { enum: ["list", "switch", "register", "spawn", "remove"] }, id: { type: "string", description: "Short id for the registered computer (letters, digits, dot, dash)" }, transport: { enum: ["local", "ssh", "hdc", "docker"] }, label: { type: "string" }, image: { type: "string", description: "spawn/docker: image to run (default the plugin's Linux desktop image)" }, host: { type: "string", description: "ssh: hostname" }, port: { type: "integer", description: "ssh: port (default 22)" }, user: { type: "string", description: "ssh: user" }, target: { type: "string", description: "hdc: target key (omit for the only connected device)" }, installAgent: { type: "boolean", description: "ssh: push the remote agent before first use (default true)" } }, additionalProperties: false },
   },
   {
     name: "computer_list",
-    description: "List registered computers (local, ssh, harmony/hdc) and which one is active. Every other tool acts on the active computer unless given `computer`.",
+    description: "List registered computers (local, ssh, docker, harmony/hdc) and which one is active. Every other tool acts on the active computer unless given `computer`.",
     inputSchema: { type: "object", properties: {}, additionalProperties: false },
   },
   {
@@ -78,9 +78,61 @@ export const TOOLS = [
     },
   },
   {
+    name: "computer_spawn",
+    description: "Spawn a task-owned disposable computer. transport=docker provisions an isolated Linux desktop container registered under `computer`; every other tool works on it unchanged. The spawned computer is destroyed by computer_remove or when the session ends. Prefer it over local when the task does not need the user's own session.",
+    inputSchema: {
+      type: "object",
+      required: ["computer", "transport"],
+      properties: {
+        computer: { type: "string", description: "Short id for the spawned computer (letters, digits, dot, dash)" },
+        transport: { enum: ["docker"] },
+        image: { type: "string", description: "docker image (default the plugin's Linux desktop image)" },
+        label: { type: "string" },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
     name: "computer_remove",
     description: "Remove a registered computer. 'local' cannot be removed.",
     inputSchema: { type: "object", required: ["computer"], properties: { computer: { type: "string" } }, additionalProperties: false },
+  },
+  {
+    name: "consent",
+    description: "Per-app consent on the local computer. Any call that targets an app — open_application, an app_ref, an element, or an action on the bound app — refuses consent_required until the user decides; record their answer here. action status | allow | deny | revoke. app is a name or bundle id (or pid:/number for a pid); scope 'foreground' is the separate darwin decision for taking the shared pointer (open_application activate:true). Decisions apply to this session; remember:true persists them.",
+    inputSchema: {
+      type: "object",
+      required: ["action"],
+      properties: {
+        action: { enum: ["status", "allow", "deny", "revoke"] },
+        app: { type: "string", description: "App identity: name ('Safari'), bundle id ('com.apple.Safari'), or pid ('pid:1234')" },
+        name: { type: "string" }, bundle_id: { type: "string" }, pid: { type: "integer" },
+        scope: { enum: ["app", "foreground"], description: "app (default): consent to use one application. foreground: consent to take the shared pointer/focus (darwin activate:true)" },
+        remember: { type: "boolean", description: "Persist the decision across sessions (default: this session only)" },
+        computer: computerParam,
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "consent_status",
+    description: "List recorded app-consent decisions for a computer (persisted and this session's) plus the foreground decision.",
+    inputSchema: { type: "object", properties: { computer: computerParam }, additionalProperties: false },
+  },
+  {
+    name: "consent_allow",
+    description: "Record an allow decision: app (name/bundle_id/pid/app string) or scope:'foreground'. remember:true persists it.",
+    inputSchema: { type: "object", properties: { computer: computerParam, app: { type: "string" }, name: { type: "string" }, bundle_id: { type: "string" }, pid: { type: "integer" }, scope: { enum: ["app", "foreground"] }, remember: { type: "boolean" } }, additionalProperties: false },
+  },
+  {
+    name: "consent_deny",
+    description: "Record a deny decision: app (name/bundle_id/pid/app string) or scope:'foreground'. remember:true persists it.",
+    inputSchema: { type: "object", properties: { computer: computerParam, app: { type: "string" }, name: { type: "string" }, bundle_id: { type: "string" }, pid: { type: "integer" }, scope: { enum: ["app", "foreground"] }, remember: { type: "boolean" } }, additionalProperties: false },
+  },
+  {
+    name: "consent_revoke",
+    description: "Remove recorded decisions for an app or scope:'foreground' (session and persisted).",
+    inputSchema: { type: "object", properties: { computer: computerParam, app: { type: "string" }, name: { type: "string" }, bundle_id: { type: "string" }, pid: { type: "integer" }, scope: { enum: ["app", "foreground"] } }, additionalProperties: false },
   },
   // ---- observe & resolve ----
   {
@@ -295,7 +347,7 @@ export const TOOLS = [
       properties: {
         name: { type: "string" }, bundle_id: { type: "string" }, url: { type: "string" },
         pid: { type: "integer", description: "Bind to this exact process. Use when two processes share a bundle id (list_apps shows both); it takes precedence over name and bundle_id and never launches anything." },
-        activate: { type: "boolean", description: "Bring to foreground; defaults to false. On macOS false keeps process-bound keyboard/accessibility control and refuses shared pointer gestures. True selects shared-desktop control with guarded foreground keys and real pointer gestures; use only when the user has authorized exclusive desktop use. Neither mode is an isolated computer." },
+        activate: { type: "boolean", description: "Bring to foreground; defaults to false — background is the default on every platform. On macOS false keeps process-bound keyboard/accessibility control and refuses shared pointer gestures; on Windows it launches the app minimized; on Linux it restores the previously focused window after launch. True selects shared-desktop control and requires the separate foreground consent; use only when the user has authorized exclusive desktop use. Neither mode is an isolated computer." },
         computer: computerParam,
       },
       additionalProperties: false,
@@ -311,7 +363,7 @@ export const TOOLS = [
     inputSchema: { type: "object", required: ["action"], properties: { action: { enum: ["move", "down", "up"] }, target: targetSchema, computer: computerParam }, additionalProperties: false },
   },
   {
-    name: "left_click", description: "Left-click a coordinate (pixels in the latest raster) or perform the element's press action. macOS background mode presses via accessibility first; a point with no pressable element is delivered through the window-record route (genuine mouse events, cursor untouched, momentary no-raise front lease reported as front_lease).",
+    name: "left_click", description: "Left-click a coordinate (pixels in the latest raster) or perform an element's press action. macOS background mode uses accessibility and refuses fallbacks that require keyboard focus.",
     inputSchema: { type: "object", required: ["target"], properties: { target: targetSchema, strategy: strategyParam, computer: computerParam }, additionalProperties: false },
   },
   {
@@ -335,7 +387,7 @@ export const TOOLS = [
     inputSchema: { type: "object", required: ["target"], properties: { target: targetSchema, computer: computerParam }, additionalProperties: false },
   },
   {
-    name: "left_click_drag", description: "Press at from_target, move in steps, release at `to`. macOS background mode delivers the gesture through the window-record route (strategy \"window-record\"): AppKit receives genuine mouse events, the real cursor never moves, and a momentary no-raise front lease is taken and restored (reported as front_lease).",
+    name: "left_click_drag", description: "Press at from_target, move in steps, release at to. macOS requires explicit foreground control; background mode refuses because window-routed events still take keyboard focus.",
     inputSchema: { type: "object", required: ["from_target", "to"], properties: { from_target: targetSchema, to: targetSchema, computer: computerParam }, additionalProperties: false },
   },
   {
@@ -347,7 +399,7 @@ export const TOOLS = [
     inputSchema: { type: "object", properties: { target: targetSchema, computer: computerParam }, additionalProperties: false },
   },
   {
-    name: "scroll", description: "Scroll up/down/left/right at a target. macOS background mode uses the target's accessibility scrollbar without moving the cursor; amount counts native increments or 5% normalized steps, named in the receipt. Where no AX scrollbar exists (overlay scrollers, web pages) wheel events are delivered through the window-record route (strategy \"window-record\", a momentary no-raise front lease, cursor untouched). Other raw routes use lines/notches. Prefer an observed scroll-area element.",
+    name: "scroll", description: "Scroll up/down/left/right at a target. macOS background mode uses accessibility scrollbars; amount counts native increments or 5% normalized steps, named in the receipt. It refuses wheel-event fallbacks that take focus. Other raw routes use lines/notches. Prefer an observed scroll-area element.",
     inputSchema: { type: "object", required: ["target"], properties: { target: targetSchema, direction: { enum: ["up", "down", "left", "right"] }, amount: { type: "integer", minimum: 1, maximum: 100 }, computer: computerParam }, additionalProperties: false },
   },
   // ---- text & keyboard ----
@@ -356,7 +408,7 @@ export const TOOLS = [
     inputSchema: { type: "object", required: ["text"], properties: { text: { type: "string" }, press_enter: { type: "boolean", description: "After typing, press Return/Enter once. Prefer this to putting a newline in `text` when you want to send." }, target: { ...elementTargetSchema, description: "Element target from get_app_state; it is accessibility-focused first, then the text is typed. Element targets only." }, computer: computerParam }, additionalProperties: false },
   },
   {
-    name: "key", description: "Press a named key or chord. Examples: return, enter, backspace, tab, escape, cmd+c (macOS), ctrl+c (Linux/Windows). This is the key-press tool; type() cannot send modifiers or Return by itself except via newlines/press_enter. Repeat with `repeat`. Pass an element `target` to accessibility-focus it first. `duration` holds the key instead of tapping (hold_key semantics) and cannot be combined with repeat or target.",
+    name: "key", description: "Press a named key or chord. Examples: return, enter, backspace, tab, escape, cmd+c (macOS), ctrl+c (Linux/Windows). This is the key-press tool; type() cannot send modifiers or Return by itself except via newlines/press_enter. macOS background mode refuses modified or window-targeted keys that need keyboard focus; prefer invoke_menu. Repeat with `repeat`. Pass an element `target` to accessibility-focus it first. `duration` holds the key instead of tapping (hold_key semantics) and cannot be combined with repeat or target.",
     inputSchema: { type: "object", required: ["text"], properties: { text: { type: "string" }, repeat: { type: "integer", minimum: 1, maximum: 100 }, duration: { type: "number", minimum: 0.05, maximum: 30, description: "Hold the key for this many seconds instead of tapping." }, target: { ...elementTargetSchema, description: "Element target from get_app_state; it is accessibility-focused first, then the key is sent. Element targets only." }, computer: computerParam }, additionalProperties: false },
   },
   {
@@ -364,7 +416,7 @@ export const TOOLS = [
     inputSchema: { type: "object", required: ["text", "duration"], properties: { text: { type: "string" }, duration: { type: "number", minimum: 0.05, maximum: 30 }, computer: computerParam }, additionalProperties: false },
   },
   {
-    name: "set_value", description: "Set an editable element's value. Native controls take a background-safe AXValue write with read-back verify; web-area elements take the replacement path (focus, select-all through the window-record channel, type, read-back verify) because Chromium silently no-ops direct AXValue writes. Element targets only.",
+    name: "set_value", description: "Set an editable element's value with readback verification. On macOS native controls use AXValue; web-area replacement requires foreground control and refuses in background mode. Prefer browser control for web fields. Element targets only.",
     inputSchema: { type: "object", required: ["target", "value"], properties: { target: elementTargetSchema, value: { type: "string" }, computer: computerParam }, additionalProperties: false },
   },
   {
@@ -485,6 +537,21 @@ export const TOOLS = [
     description: "List recordings and screenshots saved on a computer.",
     inputSchema: { type: "object", properties: { computer: computerParam }, additionalProperties: false },
   },
+  // ---- programmatic interface ----
+  {
+    name: "app_script",
+    description: "macOS, local computer only: run an AppleScript or JXA (JavaScript for Automation) script through osascript — the programmatic interface inside apps that have a scripting dictionary (Finder, Mail, Safari, Calendar, Notes, Reminders, Music, System Events and most native apps). Prefer this over clicking when the app exposes one: deterministic, returns values, needs no Accessibility grant and never touches the pointer. The receipt carries stdout as `result`; a non-zero exit fails `script_error` with stderr, a user-declined consent fails `automation_denied` (the fix is System Settings → Privacy & Security → Automation, not a retry). Refused on ssh/hdc computers (`unsupported_on_transport`) — the remote channel stays computer-use only, never a shell.",
+    inputSchema: {
+      type: "object", required: ["script"],
+      properties: {
+        script: { type: "string", minLength: 1, description: "Script source. For app arguments use `on run argv` in JXA or read them inside the script; keep scripts single-purpose." },
+        language: { enum: ["applescript", "javascript"], description: "applescript (default) or javascript for JXA" },
+        timeout: { type: "number", minimum: 1, maximum: 120, description: "Seconds before the script is killed; default 30." },
+        computer: computerParam,
+      },
+      additionalProperties: false,
+    },
+  },
   // ---- kill switch ----
   {
     name: "stop_computer_control",
@@ -511,6 +578,7 @@ export const ELEMENT_ONLY_TARGET = new Set(["set_value", "select_text", "perform
 export const READ_ONLY_TOOLS = new Set([
   "computer_list", "stop_computer_control", "wait", "request_access", "recording_list", "recording_status",
   "find_elements", "get_value", "list_sessions", "browser_status", "trajectory_status", "trajectory_start", "trajectory_stop",
+  "consent_status",
 ]);
 
 /** Tools dispatchable to a remote agent over ssh (allow-list must match agent.mjs). */
@@ -523,11 +591,12 @@ export const REMOTE_TOOLS = new Set([
   "type", "key", "hold_key", "set_value", "focus", "get_value", "select_text", "perform_action", "invoke_menu",
   "read_clipboard", "write_clipboard", "cursor_position",
   "recordingStart", "recordingStop", "recordingStatus", "recordingList",
+  "app_script",
 ]);
 
 /** Map public tool name -> backend method name. */
 export const BACKEND_METHOD = Object.fromEntries(
-  TOOLS.filter((t) => !["computer_list", "computer_switch", "computer_register", "computer_remove", "stop_computer_control", "wait", "wait_for", "find_elements", "run_actions", "trajectory_start", "trajectory_stop", "trajectory_status", "trajectory_replay"].includes(t.name))
+  TOOLS.filter((t) => !["computer_list", "computer_switch", "computer_register", "computer_spawn", "computer_remove", "consent_status", "consent_allow", "consent_deny", "consent_revoke", "stop_computer_control", "wait", "wait_for", "find_elements", "run_actions", "trajectory_start", "trajectory_stop", "trajectory_status", "trajectory_replay"].includes(t.name))
     .map((t) => [t.name, {
       request_access: "probe",
       recording_start: "recordingStart",
@@ -546,7 +615,8 @@ export const MERGED_EXPANSION = {
   pointer: ["mouse_move", "left_mouse_down", "left_mouse_up"],
   clipboard: ["read_clipboard", "write_clipboard"],
   recording: ["recording_start", "recording_stop", "recording_status", "recording_list"],
-  computer: ["computer_list", "computer_switch", "computer_register", "computer_remove"],
+  computer: ["computer_list", "computer_switch", "computer_register", "computer_spawn", "computer_remove"],
+  consent: ["consent_status", "consent_allow", "consent_deny", "consent_revoke"],
   key: ["key", "hold_key"],
   browser: ["browser_start", "browser_status", "browser_navigate", "browser_click", "browser_type", "browser_screenshot", "browser_stop"],
   trajectory: ["trajectory_start", "trajectory_stop", "trajectory_status", "trajectory_replay"],
@@ -600,7 +670,14 @@ const TOOL_ANNOTATIONS = {
   // Computer registry — touches other machines.
   computer_switch: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
   computer_register: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+  computer_spawn: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   computer_remove: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
+  // Consent — the user's own decision record, not an action on apps.
+  consent: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+  consent_status: READ_ONLY_ANNOTATION,
+  consent_allow: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+  consent_deny: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+  consent_revoke: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   open_application: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
   // Input — changes what the user sees.
   left_click: INPUT_ANNOTATION, double_click: INPUT_ANNOTATION, triple_click: INPUT_ANNOTATION,
@@ -608,6 +685,8 @@ const TOOL_ANNOTATIONS = {
   left_mouse_down: INPUT_ANNOTATION, left_mouse_up: INPUT_ANNOTATION,
   type: INPUT_ANNOTATION, key: INPUT_ANNOTATION, hold_key: INPUT_ANNOTATION, invoke_menu: INPUT_ANNOTATION,
   perform_action: INPUT_ANNOTATION, run_actions: INPUT_ANNOTATION,
+  // Scripting — acts on apps through their own dictionaries, not through input.
+  app_script: INPUT_ANNOTATION,
   mouse_move: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
   scroll: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
   set_value: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
@@ -655,7 +734,8 @@ const HIDDEN_FROM_LIST = new Set([
   "mouse_move", "left_mouse_down", "left_mouse_up",
   "read_clipboard", "write_clipboard",
   "recording_start", "recording_stop", "recording_status", "recording_list",
-  "computer_list", "computer_switch", "computer_register", "computer_remove",
+  "computer_list", "computer_switch", "computer_register", "computer_spawn", "computer_remove",
+  "consent_status", "consent_allow", "consent_deny", "consent_revoke",
   "hold_key",
   "browser_start", "browser_status", "browser_navigate", "browser_click", "browser_type", "browser_screenshot", "browser_stop",
   "trajectory_start", "trajectory_stop", "trajectory_status", "trajectory_replay",
@@ -719,13 +799,25 @@ export function resolveTool(name, args = {}) {
     case "computer": {
       const rest = { ...args };
       delete rest.action;
-      const wire = { list: "computer_list", switch: "computer_switch", register: "computer_register", remove: "computer_remove" }[args.action];
-      if (!wire) throw bad(`computer action must be list, switch, register or remove (got ${JSON.stringify(args.action)})`);
+      const wire = { list: "computer_list", switch: "computer_switch", register: "computer_register", spawn: "computer_spawn", remove: "computer_remove" }[args.action];
+      if (!wire) throw bad(`computer action must be list, switch, register, spawn or remove (got ${JSON.stringify(args.action)})`);
       if (args.action === "list") return { name: wire, args: {} };
       if (rest.id == null) throw bad(`computer action "${args.action}" requires id`);
       const id = rest.id;
       delete rest.id;
       return { name: wire, args: { ...rest, computer: id } };
+    }
+    case "consent": {
+      const rest = { ...args };
+      delete rest.action;
+      const wire = { status: "consent_status", allow: "consent_allow", deny: "consent_deny", revoke: "consent_revoke" }[args.action];
+      if (!wire) throw bad(`consent action must be status, allow, deny or revoke (got ${JSON.stringify(args.action)})`);
+      if (args.action === "status") return { name: wire, args: { computer: rest.computer } };
+      const foreground = rest.scope === "foreground";
+      if (!foreground && rest.app == null && rest.name == null && rest.bundle_id == null && rest.pid == null) {
+        throw bad(`consent action "${args.action}" needs an app (name, bundle_id, pid or app string) — or scope:"foreground" for the shared-pointer decision`);
+      }
+      return { name: wire, args: rest };
     }
     case "key": {
       if (args.duration == null) return { name, args };

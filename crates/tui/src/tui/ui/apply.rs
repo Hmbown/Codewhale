@@ -1407,21 +1407,25 @@ pub(crate) async fn apply_command_result(
                         config: app.compaction_config(),
                     })
                     .await;
-                let success_message = format!(
-                    "Session loaded from {} (ID: {}, {} messages)",
-                    path.display(),
-                    crate::session_manager::truncate_id(&session.metadata.id),
-                    session.metadata.message_count
+                let title = crate::session_manager::sanitize_session_title(&session.metadata.title);
+                // Restore may have queued a legacy configuration notice.
+                // Admit it first so the confirmed resume remains the latest
+                // toast instead of being immediately covered on the next draw.
+                app.sync_status_message_to_toasts();
+                app.push_status_toast_record(
+                    StatusToast::new(
+                        app.tr(MessageId::SessionsResumed)
+                            .replace("{title}", &title),
+                        StatusToastLevel::Success,
+                        Some(4_000),
+                    )
+                    .for_event(format!("session-resumed:{}", session.metadata.id)),
                 );
-                app.add_message(HistoryCell::System {
-                    content: success_message.clone(),
-                });
-                app.status_message = Some(success_message);
                 // A loaded session is the working screen. The launch card's
                 // recent rows reach here through `/resume`-shaped dispatch;
                 // leaving the launch stage visible over the restored
                 // transcript is what made those rows read as dead (#4).
-                app.launch.visible = false;
+                app.launch.dismiss();
                 app.launch.status = None;
             }
             AppAction::SyncSession {
@@ -3653,7 +3657,7 @@ pub(crate) fn apply_loaded_session_with_goal(
     app.refresh_notification_settings(config);
     app.restore_api_messages(
         crate::runtime_handoff::project_messages_for_restore(&session.messages),
-        &session.journal_message_stamps(),
+        session,
     );
     app.clear_history();
     app.tool_cells.clear();

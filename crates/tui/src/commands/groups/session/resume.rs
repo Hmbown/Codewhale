@@ -59,16 +59,22 @@ pub(in crate::commands) fn resume_portable(
     };
     match control.resolve_resume_source(raw) {
         Ok(ResumeSource::File(path)) => match control.import_session_file(path) {
-            Ok(receipt) => CommandResult::message(format!(
-                "Imported foreign session as {} ({} entries, leaf {})",
-                receipt.truncated_id, receipt.entry_count, receipt.leaf_display
-            )),
+            Ok(receipt) => CommandResult::with_message_and_action(
+                format!(
+                    "Imported foreign session as {} ({} entries, leaf {})",
+                    receipt.truncated_id, receipt.entry_count, receipt.leaf_display
+                ),
+                super::sync_session_action(receipt.sync),
+            ),
             Err(error) => CommandResult::error(error),
         },
-        Ok(ResumeSource::Imported(receipt)) => CommandResult::message(format!(
-            "Imported foreign session as {} ({} entries, leaf {})",
-            receipt.truncated_id, receipt.entry_count, receipt.leaf_display
-        )),
+        Ok(ResumeSource::Imported(receipt)) => CommandResult::with_message_and_action(
+            format!(
+                "Imported foreign session as {} ({} entries, leaf {})",
+                receipt.truncated_id, receipt.entry_count, receipt.leaf_display
+            ),
+            super::sync_session_action(receipt.sync),
+        ),
         Ok(ResumeSource::Session {
             load_path,
             truncated_id,
@@ -133,12 +139,23 @@ mod tests {
             truncated_id: "imp-9".to_string(),
             entry_count: 12,
             leaf_display: "leaf-3".to_string(),
+            sync: super::super::lifecycle_test_support::sync_payload("imp-9"),
         }));
         let result = resume_portable(&mut fake, Some("/tmp/import.json"));
         assert!(!result.is_error);
         assert_eq!(
             message(&result),
             "Imported foreign session as imp-9 (12 entries, leaf leaf-3)"
+        );
+        // The engine must adopt the imported conversation; a message-only
+        // result would leave it on the previous session.
+        assert!(
+            matches!(
+                result.action,
+                Some(crate::tui::app::AppAction::SyncSession { ref session_id, .. })
+                if session_id.as_deref() == Some("imp-9")
+            ),
+            "{result:?}"
         );
 
         let mut fake = control_fake();
@@ -158,11 +175,20 @@ mod tests {
             truncated_id: "c-1".to_string(),
             entry_count: 0,
             leaf_display: "(none)".to_string(),
+            sync: super::super::lifecycle_test_support::sync_payload("c-1"),
         })));
         let result = resume_portable(&mut fake, Some("inline-json"));
         assert_eq!(
             message(&result),
             "Imported foreign session as c-1 (0 entries, leaf (none))"
+        );
+        assert!(
+            matches!(
+                result.action,
+                Some(crate::tui::app::AppAction::SyncSession { ref session_id, .. })
+                if session_id.as_deref() == Some("c-1")
+            ),
+            "{result:?}"
         );
     }
 

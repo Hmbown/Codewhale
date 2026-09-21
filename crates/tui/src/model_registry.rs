@@ -193,6 +193,9 @@ const SEED_MODEL_IDS: &[(&str, ModelProvider)] = &[
     ("fugu-ultra", ModelProvider::Other),
     // --- StepFun (config DEFAULT_STEPFUN_MODEL) ---
     ("step-3.7-flash", ModelProvider::Other),
+    ("step-5-preview", ModelProvider::Other),
+    ("step-3.5-flash", ModelProvider::Other),
+    ("step-3.5-flash-2603", ModelProvider::Other),
     // --- Xiaomi MiMo (config DEFAULT_XIAOMI_MIMO_MODEL) ---
     ("mimo-v2.5-pro", ModelProvider::XiaomiMimo),
     ("mimo-v2.5-pro-ultraspeed", ModelProvider::XiaomiMimo),

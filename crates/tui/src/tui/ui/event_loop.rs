@@ -387,7 +387,7 @@ pub(super) fn handle_transcript_space(app: &mut App) -> bool {
             return false;
         }
         let options = app.transcript_render_options();
-        let folded = (!options.verbose ^ options.thinking_default_expanded)
+        let folded = !(options.verbose || options.thinking_default_expanded)
             ^ (target.action == ReasoningAction::Collapse);
         app.folded_thinking.remove(&idx);
         if folded {
@@ -443,6 +443,10 @@ pub(super) fn flush_paste_burst_before_composer(app: &mut App, now: Instant) -> 
         }
         crate::tui::paste_burst::FlushResult::Typed(ch) => {
             app.insert_char(ch);
+            true
+        }
+        crate::tui::paste_burst::FlushResult::SuppressionExpired => {
+            app.needs_redraw = true;
             true
         }
         crate::tui::paste_burst::FlushResult::None => false,
@@ -631,6 +635,24 @@ pub async fn run_tui(
     // terminal hosts surface only "[Process completed]".
     require_interactive_terminal(io::stdin().is_terminal(), io::stdout().is_terminal())?;
     require_foreground_terminal_owner()?;
+
+    // The dispatcher resets SIGPIPE to SIG_DFL so `codewhale doctor | head`
+    // exits quietly (#4030). A full-screen session is the opposite case: it
+    // writes to pipes whose far end it does not own — stdio MCP servers, shell
+    // tools, hooks, LSP — and a peer that exits first must surface as an
+    // `EPIPE` error on that one write, not kill the whole TUI with the terminal
+    // left in raw mode and nothing in the runtime log. Reproduced with a stdio
+    // MCP server that exits before `initialize` is written: the process died
+    // of SIGPIPE before its first frame, and the PTY harness reported it as a
+    // plain exit 1. Children are unaffected: the standard library resets
+    // SIGPIPE to SIG_DFL before exec, so `| head` inside a shell tool still
+    // terminates the way a shell expects. Non-TUI subcommands keep SIG_DFL.
+    // SAFETY: a plain disposition change, no handler; it runs before this
+    // session spawns anything that writes to a pipe.
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_IGN);
+    }
 
     // #6169: install the suspend/resume handshake here — after the
     // foreground-ownership check (the termios snapshot needs the still-cooked
@@ -1234,6 +1256,18 @@ async fn dispatch_launch_composer_submit(
     config: &mut Config,
     chord: ComposerSubmitChord,
 ) -> Result<bool> {
+    if app.launch.return_to_session {
+        app.launch.dismiss();
+        return dispatch_session_composer_submit(
+            terminal,
+            app,
+            engine_handle,
+            task_manager,
+            config,
+            chord,
+        )
+        .await;
+    }
     let action = app.decide_composer_submit(chord);
     if app.startup_input_unproven || !app.composer_enter_would_submit() {
         // A paste burst, empty composer or startup integrity hold owns this
@@ -1257,10 +1291,7 @@ async fn dispatch_launch_composer_submit(
         return Ok(false);
     }
     if looks_like_slash_command_input(&input) {
-        // Every submit echoes (see submit_decided_composer_input).
-        app.add_message(HistoryCell::User {
-            content: input.clone(),
-        });
+        // Commands own their output; only model-bound prompts become user turns.
         if execute_command_input(terminal, app, engine_handle, task_manager, config, &input).await?
         {
             return Ok(true);
@@ -1274,7 +1305,7 @@ async fn dispatch_launch_composer_submit(
 
 /// Submit the live-session composer through the same branches Enter uses.
 ///
-/// Mouse `[↑]` sets `pending_composer_submit`; this consumes that chord without
+/// Mouse `[↵]` sets `pending_composer_submit`; this consumes that chord without
 /// duplicating draft consumption or opening transcript-only Enter shortcuts.
 /// Its own gates (`SendQueuedNow`, the paste-burst probe) run here; everything
 /// from slash-menu selection onward is the shared `submit_decided_composer_input`
@@ -1288,6 +1319,9 @@ async fn dispatch_session_composer_submit(
     config: &mut Config,
     chord: ComposerSubmitChord,
 ) -> Result<bool> {
+    if app.launch.return_to_session {
+        app.launch.dismiss();
+    }
     let action = app.decide_composer_submit(chord);
     if matches!(action, ComposerSubmitAction::SendQueuedNow) {
         let _ = send_next_queued_message_now(app, config, engine_handle).await?;
@@ -1302,7 +1336,7 @@ async fn dispatch_session_composer_submit(
 /// Shared tail of a decided composer submit: slash-menu selection, draft
 /// consumption, and the memory/`!`/`/`/message branches.
 ///
-/// Keyboard Enter and the mouse `[↑]` dispatcher both end here. Each caller
+/// Keyboard Enter and the mouse `[↵]` dispatcher both end here. Each caller
 /// keeps its own gates — transcript-only shortcuts and forced-submit chords
 /// stay keyboard-only, `SendQueuedNow` and the paste-burst probe stay in the
 /// dispatcher — so this tail is the one place either surface can change.
@@ -1348,12 +1382,8 @@ async fn submit_decided_composer_input(
         return Ok(false);
     }
     if looks_like_slash_command_input(&input) {
-        // Every submit echoes: a command that clears the composer must leave
-        // what the user typed in the thread, not just its receipt — bare
-        // error lines with no user row read as a void.
-        app.add_message(HistoryCell::User {
-            content: input.clone(),
-        });
+        // Opening a view is not a conversation turn. SendMessage actions
+        // record their real prompt through dispatch_composer_message instead.
         if execute_command_input(terminal, app, engine_handle, task_manager, config, &input).await?
         {
             return Ok(true);
@@ -4349,18 +4379,27 @@ pub(crate) async fn run_event_loop(
             active_cell_has_live_motion,
             translation_placeholder_has_live_motion,
         );
-        let animation_interval_ms = animation_interval_ms(
+        // Content-driven cadence: atmosphere rate when only ocean life moves;
+        // full interactive rate while streaming, selecting, typing, or hovering.
+        // Read once here so the animation tick and the frame limiter below
+        // agree on the same tier for this frame.
+        let cadence_tier = crate::tui::display_refresh::cadence_tier_from_signals(
+            app.is_loading || has_running_agents,
+            app.viewport.transcript_selection.is_active(),
+            !app.input.is_empty(),
+            crate::tui::hover_layer::current_hover().is_some(),
+        );
+        let underwater_motion =
+            underwater_ambient_motion || underwater_completion_motion || launch_motion;
+        let animation_active = status_motion || underwater_motion;
+        let animation_interval = Duration::from_millis(animation_interval_ms(
             app,
             status_motion,
-            underwater_ambient_motion || underwater_completion_motion || launch_motion,
-        );
+            underwater_motion,
+            cadence_tier,
+        ));
         let motion_policy = app.motion_policy();
-        if (status_motion
-            || underwater_ambient_motion
-            || underwater_completion_motion
-            || launch_motion)
-            && last_status_frame.elapsed() >= Duration::from_millis(animation_interval_ms)
-        {
+        if animation_active && last_status_frame.elapsed() >= animation_interval {
             let translation_animated = streaming_thinking::animate_pending_translation(
                 app,
                 pending_thinking_translations > 0,
@@ -4389,6 +4428,20 @@ pub(crate) async fn run_event_loop(
                 app.needs_redraw = true;
             }
             last_status_frame = Instant::now();
+        }
+        if animation_active {
+            // Aim the poll at the next tick. Without a deadline the tick only
+            // ran when the idle/active poll happened to return, which
+            // quantized an 80 ms cadence to 96 ms and a 120 ms one to 144 ms.
+            frame_requester.request_at(
+                Instant::now(),
+                last_status_frame + animation_interval,
+                motion_policy,
+            );
+        } else {
+            // Consume a deadline armed before motion stopped so an orphaned
+            // request cannot hold the poll timeout at zero.
+            let _ = frame_requester.take_due(Instant::now(), motion_policy);
         }
 
         if event_broker.is_paused() {
@@ -4505,21 +4558,15 @@ pub(crate) async fn run_event_loop(
         frame_rate_limiter.set_low_motion(motion_policy.uses_constrained_frame_rate());
         stream_display_clock.set_allow_catch_up(motion_policy.allows_catch_up_bursts());
 
-        // Content-driven cadence: atmosphere rate when only ocean life moves;
-        // full interactive rate while streaming, selecting, typing, or hovering.
+        // The draw limiter follows the same content-driven tier the
+        // animation tick above read for this frame.
         {
             use crate::tui::display_refresh::{
-                cadence_tier_from_signals, content_driven_draw_interval, probe_display_refresh,
+                content_driven_draw_interval, probe_display_refresh,
             };
-            let tier = cadence_tier_from_signals(
-                app.is_loading || has_running_agents,
-                app.viewport.transcript_selection.is_active(),
-                !app.input.is_empty(),
-                crate::tui::hover_layer::current_hover().is_some(),
-            );
             let probe = probe_display_refresh();
             frame_rate_limiter.set_adaptive_interval(Some(content_driven_draw_interval(
-                tier,
+                cadence_tier,
                 probe.hz,
                 motion_policy.uses_constrained_frame_rate(),
             )));
@@ -4629,6 +4676,13 @@ pub(crate) async fn run_event_loop(
         if let Some(observed_terminal_event) = maybe_terminal_event {
             let event_observed_at = observed_terminal_event.observed_at;
             let evt = observed_terminal_event.event;
+            if app.launch.mark_reveal_started_at.is_some()
+                && matches!(&evt, Event::Key(_) | Event::Paste(_) | Event::Resize(_, _))
+            {
+                app.launch.mark_reveal_started_at = Some(
+                    Instant::now() - Duration::from_millis(crate::tui::mark::REVEAL_MS as u64),
+                );
+            }
             app.needs_redraw = true;
             terminal_unfocused = next_unfocused(terminal_unfocused, &evt);
 
@@ -4652,6 +4706,9 @@ pub(crate) async fn run_event_loop(
                 }
             }
             if let Event::Paste(text) = &evt {
+                if app.launch.return_to_session && app.view_stack.is_empty() {
+                    app.launch.dismiss();
+                }
                 handle_bracketed_paste(app, text);
                 continue;
             }
@@ -4817,6 +4874,9 @@ pub(crate) async fn run_event_loop(
                 if let Some(action) = app.pending_launch_action.take() {
                     match action {
                         crate::tui::underwater::LaunchAction::None => {}
+                        crate::tui::underwater::LaunchAction::ReturnToSession => {
+                            app.launch.dismiss()
+                        }
                         crate::tui::underwater::LaunchAction::NewSession => {
                             let result = begin_launch_session(app, None);
                             if apply_command_result(
@@ -4858,6 +4918,10 @@ pub(crate) async fn run_event_loop(
                         }
                         crate::tui::underwater::LaunchAction::McpRemedy => {
                             type_launch_mcp_remedy(app);
+                        }
+                        crate::tui::underwater::LaunchAction::McpManager => {
+                            app.launch.dissolve_card(app.ambient_clock_ms);
+                            open_mcp_extensions(app);
                         }
                         crate::tui::underwater::LaunchAction::Help => {
                             toggle_help_view(app);
@@ -5503,6 +5567,9 @@ pub(crate) async fn run_event_loop(
                     });
                     match action {
                         crate::tui::underwater::LaunchAction::None => {}
+                        crate::tui::underwater::LaunchAction::ReturnToSession => {
+                            app.launch.dismiss()
+                        }
                         crate::tui::underwater::LaunchAction::NewSession => {
                             let result = begin_launch_session(app, None);
                             if apply_command_result(
@@ -5519,19 +5586,7 @@ pub(crate) async fn run_event_loop(
                             }
                         }
                         crate::tui::underwater::LaunchAction::ResumeSession(session_id) => {
-                            let result = resume_launch_session(app, &session_id);
-                            if apply_command_result(
-                                terminal,
-                                app,
-                                &mut engine_handle,
-                                &task_manager,
-                                config,
-                                result,
-                            )
-                            .await?
-                            {
-                                return Ok(());
-                            }
+                            crate::tui::underwater::open_launch_resume_confirm(app, &session_id);
                         }
                         crate::tui::underwater::LaunchAction::BrowseSessions => {
                             // A launched command dissolves the card; Esc
@@ -5544,6 +5599,10 @@ pub(crate) async fn run_event_loop(
                         }
                         crate::tui::underwater::LaunchAction::McpRemedy => {
                             type_launch_mcp_remedy(app);
+                        }
+                        crate::tui::underwater::LaunchAction::McpManager => {
+                            app.launch.dissolve_card(app.ambient_clock_ms);
+                            open_mcp_extensions(app);
                         }
                         crate::tui::underwater::LaunchAction::Help => {
                             toggle_help_view(app);
@@ -6444,7 +6503,7 @@ pub(crate) async fn run_event_loop(
                     );
                     // Slash-menu selection, draft consumption, and the
                     // memory/`!`/`/`/message branches are the shared tail the
-                    // mouse `[↑]` dispatcher also runs, so keyboard and pointer
+                    // mouse `[↵]` dispatcher also runs, so keyboard and pointer
                     // submit behavior cannot drift apart.
                     if submit_decided_composer_input(
                         terminal,
@@ -6663,8 +6722,7 @@ pub(crate) async fn run_event_loop(
                     };
                     match editor_result {
                         Ok(crate::tui::external_editor::EditorOutcome::Edited(new)) => {
-                            app.input = new;
-                            app.move_cursor_end();
+                            app.apply_external_edit(new);
                             let editor = std::env::var("VISUAL")
                                 .ok()
                                 .filter(|s| !s.trim().is_empty())

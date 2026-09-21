@@ -1174,6 +1174,17 @@ pub const SETTINGS_SCHEMA: &[SettingDef] = &[
     ),
     // ── trust ───────────────────────────────────────────────────────────
     def(
+        "sandbox_details",
+        SettingKind::String,
+        "",
+        ui_action(
+            TAB_TRUST,
+            "permissions",
+            "SetupStepTrustSandboxTitle",
+            "SetupStepTrustSandboxWhy",
+        ),
+    ),
+    def(
         "approval_mode",
         SettingKind::Enum(APPROVAL_MODE),
         "",

@@ -115,6 +115,7 @@ const PROVIDER_LABEL_MAP = {
   ModelstudioCodingPlan: { id: "modelstudio-coding-plan", label: "Model Studio Coding Plan", env: "MODELSTUDIO_API_KEY" },
   ModelstudioCodingPlanAnthropic: { id: "modelstudio-coding-plan-anthropic", label: "Model Studio Coding Plan (Anthropic-compatible)", env: "MODELSTUDIO_API_KEY" },
   Zenmux: { id: "zenmux", label: "ZenMux", env: "ZENMUX_API_KEY" },
+  Csdn: { id: "csdn", label: "CSDN 星图 (Starmap)", env: "CSDN_API_KEY" },
 };
 
 // DeepseekCN: not wired through shared ProviderKind (#1104).
@@ -226,6 +227,7 @@ const MODEL_PROVIDER_LABELS = {
   Moonshot: "Moonshot/Kimi",
   Zai: "Z.ai",
   Minimax: "MiniMax",
+  Stepfun: "StepFun",
   Qwen: "Qwen",
   Arcee: "Arcee",
   Together: "Together",
@@ -249,7 +251,7 @@ const MODEL_PREFIX_PROVIDERS = {
   moonshotai: "Moonshot", minimax: "Minimax", qwen: "Qwen",
   "arcee-ai": "Arcee", together: "Together", nvidia: "Other",
   "opencode-go": "Moonshot", openai: "OpenAi", google: "Google",
-  xai: "Xai", mistral: "Mistral", stepfun: "Other", meta: "Meta",
+  xai: "Xai", mistral: "Mistral", stepfun: "Stepfun", meta: "Meta",
   huggingface: "Other",
 };
 
@@ -272,6 +274,7 @@ const MODEL_NAME_FAMILIES = [
   [/^(kimi|moonshot)/i, "Moonshot"],
   [/^(glm-|zai)/i, "Zai"],
   [/^(minimax|abab)/i, "Minimax"],
+  [/^step(?:-|audio)/i, "Stepfun"],
   [/^(qwen|qwq)/i, "Qwen"],
   [/^(arcee|trinity|afm|virtuoso|maestro|spotlight|blitz)/i, "Arcee"],
   [/^(mimo|xiaomi)/i, "XiaomiMimo"],

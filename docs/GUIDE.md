@@ -236,7 +236,7 @@ visible, or set `[tui].status_items` in `config.toml`. Each key owns exactly
 one thing on screen: `mode` is the posture bar's plan/act/operate chip, and
 `model`, `context_percent`, `cost`, `balance` (prepaid providers only:
 DeepSeek, DeepSeekCN, OpenRouter, SiliconFlow), `cache`, `tokens` and
-`session_metrics`, `workspace` and `git_branch` are segments of the metrics line below it. Omit
+`ttft`, `output_rate`, `workspace` and `git_branch` are segments of the metrics line below it. Omit
 `status_items` to keep the built-in default; set it to `[]` to strip the
 metrics line down to the help hint.
 
@@ -260,19 +260,22 @@ ignored with a warning in the log.
 `status_items` composes the rows; two size presets decide how much of each
 row paints. `[tui].posture_bar` and `[tui].metrics_line` each take `full`,
 `compact`, or `hidden`. The posture bar defaults to `full` so active controls
-stay visible; the metrics line defaults to `compact` to keep routine telemetry
-out of the working surface. These are also settable at runtime with
+stay visible; the metrics line defaults to `compact` to keep selected performance
+readings while removing secondary counts and help. These are also settable at runtime with
 `/config posture_bar compact`. TOML values must be lowercase; `/config`
 accepts either case. `compact` is the row after its first shed
 rungs: the posture bar keeps its permission and mode chips — and the cap
 warning, which is advice, not decoration — and drops the clocks, counts and
 hint; the metrics line keeps the route, the context reading, the cost and
-the balance, and drops the telemetry and the help hint. `hidden` gives the
+the balance, plus selected TTFT and output rate when space allows, and drops
+secondary counts and the help hint. `hidden` gives the
 row back to the transcript. A small tmux pane can hide both rows without
 touching what `/statusline` composes.
 
-With `metrics_line = "full"`, `session_metrics` (on by default) paints the latency pair on the metrics
-line: `ttft 1.5s` — the mean time to first streamed token — and `120 avg tok/s`,
+Both `ttft` and `output_rate` are on by default and work in full or compact
+rows. `/statusline` lets you toggle them separately; Space previews, Enter saves,
+and Esc restores your previous settings. Legacy `session_metrics` still enables
+both readings. The pair shows: `ttft 1.5s` — the mean time to first streamed token — and `120 avg tok/s`,
 the session's provider-reported output tokens divided by the measured request
 seconds for those same calls. The rate includes connection setup, time to first
 token and pauses within a response, and excludes tools and idle time between

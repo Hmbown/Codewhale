@@ -1,9 +1,11 @@
-//! Unified read-only inventory for Codewhale extensions.
+//! Unified inventory for Codewhale extensions.
 //!
 //! This is deliberately a projection over the existing owners of Hooks,
 //! Plugins, Marketplace catalogs, Skills, and MCP. It has no registry, trust
 //! database, installer, or network fetch of its own. Future actions emitted by
 //! this view must delegate to the existing command/mutation controllers.
+//! The skills mutation manager remains at `/skills manage`; MCP setup is a
+//! read-only suggestions handoff, not an inline installer or credential editor.
 
 use std::borrow::Cow;
 use std::cell::RefCell;
@@ -16,7 +18,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Paragraph, Widget},
+    widgets::{Paragraph, Widget, Wrap},
 };
 
 use super::{
@@ -24,6 +26,7 @@ use super::{
     render_underwater_surface, truncate_view_text,
 };
 use crate::tui::app::App;
+use crate::tui::menu_style;
 use codewhale_localization::{Locale, MessageId, tr};
 use codewhale_palette as palette;
 
@@ -822,11 +825,14 @@ fn plugin_row_action(
         }
     } else {
         // The command opens the exact-content review with its confirmation
-        // control, so this panel yields to that review.
+        // control stacked on this panel. Confirming the digest runs the
+        // trust mutation and the host re-reads the inventory, so the row the
+        // person just reviewed reports its new state instead of the stale
+        // "not reviewed" it left with.
         ExtensionAction::Command {
             label: tr(locale, MessageId::AutomationActionInspect).into_owned(),
             command: format!("/plugin trust {}", plugin.name()),
-            disposition: RowActionDisposition::LeavePanel,
+            disposition: RowActionDisposition::InPlace,
         }
     }
 }
@@ -1164,7 +1170,7 @@ fn skills_model(app: &App, locale: Locale) -> ExtensionsTabModel {
             // place.
             action: Some(ExtensionAction::Command {
                 label: tr(locale, MessageId::ExtensionsActionManage).into_owned(),
-                command: "/skills".into(),
+                command: "/skills manage".into(),
                 disposition: RowActionDisposition::LeavePanel,
             }),
             toggle: None,
@@ -1382,8 +1388,35 @@ fn mcp_model(app: &App, locale: Locale) -> ExtensionsTabModel {
             }
         })
         .collect();
+    let groups = if items.is_empty() && configured.is_some() {
+        vec![ExtensionGroup {
+            id: "mcp-start".into(),
+            label: tr(locale, MessageId::ExtensionsMcpEmpty).into_owned(),
+            items: vec![ExtensionItem {
+                id: "mcp-suggestions".into(),
+                tone: ExtensionTone::Idle,
+                label: tr(locale, MessageId::ExtensionsMcpBrowse).into_owned(),
+                description: tr(locale, MessageId::McpRecommendationsHeading).into_owned(),
+                state: tr(locale, MessageId::ExtensionsStateAvailable).into_owned(),
+                detail: localize(
+                    locale,
+                    MessageId::McpRecommendationsSafety,
+                    &[("restart_command", "/mcp restart")],
+                ),
+                action: Some(ExtensionAction::Command {
+                    label: tr(locale, MessageId::AutomationActionInspect).into_owned(),
+                    command: "/mcp recommendations".into(),
+                    disposition: RowActionDisposition::InPlacePager,
+                }),
+                toggle: None,
+                remove: None,
+            }],
+        }]
+    } else {
+        mcp_groups(locale, items)
+    };
     ExtensionsTabModel {
-        groups: mcp_groups(locale, items),
+        groups,
         problem: (configured.is_none() && app.mcp_configured_count > total).then(|| {
             localize(
                 locale,
@@ -1477,6 +1510,8 @@ pub struct ExtensionsView {
     /// grammar the rest of the chrome uses instead of raw palette constants.
     theme: codewhale_palette::UiTheme,
     hits: RefCell<HitAreas>,
+    hovered_row: Option<usize>,
+    hovered_tab: Option<ExtensionsTab>,
     /// Last time `tick` asked the host for a fresh snapshot. Bounds the poll
     /// so a per-frame tick cannot turn into a rebuild every frame.
     last_poll: std::time::Instant,
@@ -1510,21 +1545,24 @@ impl ExtensionsView {
             folded_groups: BTreeSet::new(),
             theme: codewhale_palette::UI_THEME,
             hits: RefCell::new(HitAreas::default()),
+            hovered_row: None,
+            hovered_tab: None,
             last_poll: std::time::Instant::now(),
             pending_remove: None,
         };
-        // `/mcp` opens on the first server that needs a login, not on that
-        // group's heading, so the one key the screen advertises — Enter —
-        // runs the login flow straight away (#5926).
-        if view
-            .snapshot
-            .tab(tab)
-            .groups
-            .first()
-            .is_some_and(|group| group.id == MCP_LOGIN_GROUP_ID)
-        {
-            view.selected[tab.index()] = 1;
+        // Each tab lands on a real item, preserving login-first MCP sorting.
+        // Group headings remain reachable for folding with Up.
+        for initial_tab in ExtensionsTab::ALL {
+            view.active_tab = initial_tab;
+            if let Some(index) = view
+                .visible_entries()
+                .iter()
+                .position(|entry| matches!(entry, VisibleEntry::Item(_, _)))
+            {
+                view.selected[initial_tab.index()] = index;
+            }
         }
+        view.active_tab = tab;
         view
     }
 
@@ -1671,8 +1709,15 @@ impl ExtensionsView {
                         })
                     }
                 },
-                _ => ViewAction::None,
+                _ => ViewAction::Emit(ViewEvent::OpenTextPager {
+                    title: item.label.clone(),
+                    content: format!("{}\n\n{}\n\n{}", item.state, item.description, item.detail),
+                }),
             },
+            Some(VisibleEntry::Problem(problem)) => ViewAction::Emit(ViewEvent::OpenTextPager {
+                title: self.active_tab.label(self.locale),
+                content: problem.to_string(),
+            }),
             _ => ViewAction::None,
         }
     }
@@ -1687,6 +1732,8 @@ impl ExtensionsView {
     }
 
     fn set_tab(&mut self, tab: ExtensionsTab) {
+        self.hovered_row = None;
+        self.hovered_tab = None;
         self.pending_remove = None;
         self.active_tab = tab;
         self.clamp_selection();
@@ -1741,6 +1788,8 @@ impl ModalView for ExtensionsView {
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> ViewAction {
+        self.hovered_row = None;
+        self.hovered_tab = None;
         // One navigation grammar (grokbuild, the stated authority): Tab and
         // Shift+Tab / BackTab move across the tab bar, always — even during
         // a search, which keeps its query on the new tab. `/` searches, Esc
@@ -1841,6 +1890,19 @@ impl ModalView for ExtensionsView {
 
     fn handle_mouse(&mut self, mouse: MouseEvent) -> ViewAction {
         match mouse.kind {
+            MouseEventKind::Moved => {
+                let hits = self.hits.borrow();
+                let point = (mouse.column, mouse.row).into();
+                self.hovered_row = hits
+                    .rows
+                    .iter()
+                    .find_map(|(rect, row)| rect.contains(point).then_some(*row));
+                self.hovered_tab = hits
+                    .tabs
+                    .iter()
+                    .find_map(|(rect, tab)| rect.contains(point).then_some(*tab));
+                return ViewAction::None;
+            }
             // The wheel moves this list, not the transcript behind it.
             MouseEventKind::ScrollUp => {
                 self.pending_remove = None;
@@ -1913,6 +1975,7 @@ impl ModalView for ExtensionsView {
     }
 
     fn render(&self, area: Rect, buf: &mut Buffer) {
+        *self.hits.borrow_mut() = HitAreas::default();
         let body = render_underwater_surface(
             area,
             buf,
@@ -1927,7 +1990,7 @@ impl ModalView for ExtensionsView {
                 Constraint::Length(1),
                 Constraint::Length(1),
                 Constraint::Min(1),
-                Constraint::Length(1),
+                Constraint::Length(if body.height >= 16 { 3 } else { 1 }),
                 Constraint::Length(1),
             ])
             .split(body);
@@ -1949,10 +2012,9 @@ impl ModalView for ExtensionsView {
             let active = tab == self.active_tab;
             let focused = active && self.focus == ExtensionsFocus::Tabs;
             let style = if focused {
-                Style::default()
-                    .fg(palette::WHALE_BG)
-                    .bg(palette::WHALE_ACTION)
-                    .add_modifier(Modifier::BOLD)
+                menu_style::selected_row_style()
+            } else if self.hovered_tab == Some(tab) {
+                menu_style::hovered_row_style().fg(palette::TEXT_PRIMARY)
             } else if active {
                 Style::default()
                     .fg(palette::WHALE_ACTION)
@@ -2000,7 +2062,6 @@ impl ModalView for ExtensionsView {
         } else if selected >= scroll.saturating_add(list_height.max(1)) {
             scroll = selected.saturating_sub(list_height.saturating_sub(1));
         }
-        let spacious = area.width >= 64 && area.height >= 16;
         for (visible_offset, (entry_index, entry)) in entries
             .iter()
             .enumerate()
@@ -2015,10 +2076,11 @@ impl ModalView for ExtensionsView {
                 1,
             );
             let is_selected = entry_index == selected;
+            let hovered = self.hovered_row == Some(entry_index);
             let style = if is_selected && self.focus == ExtensionsFocus::List {
-                Style::default()
-                    .fg(palette::WHALE_BG)
-                    .bg(palette::WHALE_ACTION)
+                menu_style::selected_row_style()
+            } else if hovered {
+                menu_style::hovered_row_style().fg(palette::TEXT_PRIMARY)
             } else if is_selected {
                 Style::default()
                     .fg(palette::WHALE_ACTION)
@@ -2049,7 +2111,7 @@ impl ModalView for ExtensionsView {
                     parts.push(("  ".into(), None));
                     if let Some(action) = item.action.as_ref() {
                         parts.push((
-                            format!("[{}] ", action.label()),
+                            format!("{} · ", action.label()),
                             Some(match action {
                                 ExtensionAction::Command { .. } => {
                                     codewhale_palette::ChromeInk::Identity
@@ -2059,13 +2121,7 @@ impl ModalView for ExtensionsView {
                         ));
                     }
                     parts.push((item.label.clone(), None));
-                    parts.push((format!(" [{}]", item.state), Some(item.tone.ink())));
-                    if spacious && !item.description.is_empty() {
-                        parts.push((
-                            format!(" — {}", item.description),
-                            Some(codewhale_palette::ChromeInk::MetadataHint),
-                        ));
-                    }
+                    parts.push((format!(" · {}", item.state), Some(item.tone.ink())));
                 }
                 VisibleEntry::Problem(problem) => parts.push((
                     format!("! {problem}"),
@@ -2092,7 +2148,7 @@ impl ModalView for ExtensionsView {
                 .map(|(text, _)| text.as_str())
                 .collect::<String>();
             let clipped = truncate_view_text(&joined, usize::from(row_area.width));
-            let spans = if is_selected || clipped.len() != joined.len() {
+            let spans = if is_selected || hovered || clipped.len() != joined.len() {
                 vec![Span::styled(clipped, style)]
             } else {
                 parts
@@ -2107,33 +2163,59 @@ impl ModalView for ExtensionsView {
                     })
                     .collect()
             };
-            Paragraph::new(Line::from(spans)).render(row_area, buf);
+            Paragraph::new(Line::from(spans))
+                .style(style)
+                .render(row_area, buf);
             hits.rows.push((row_area, entry_index));
         }
 
-        let status = truncate_view_text(&self.selected_status(), usize::from(rows[3].width));
-        Paragraph::new(Line::from(Span::styled(
-            status,
-            Style::default().fg(palette::TEXT_MUTED),
-        )))
-        .render(rows[3], buf);
-        let compact_hints = [
+        let status = if rows[3].height > 1 && self.pending_remove.is_none() {
+            self.selected_item().map_or_else(
+                || self.selected_status(),
+                |item| {
+                    format!(
+                        "{} · {}\n{}\n{}",
+                        item.label, item.state, item.description, item.detail
+                    )
+                },
+            )
+        } else {
+            self.selected_status()
+        };
+        Paragraph::new(status)
+            .style(Style::default().fg(if self.pending_remove.is_some() {
+                palette::STATUS_WARNING
+            } else {
+                palette::TEXT_MUTED
+            }))
+            .wrap(Wrap { trim: false })
+            .render(rows[3], buf);
+        let mut compact_hints = vec![
             super::ActionHint::new("Tab", tr(self.locale, MessageId::ExtensionsActionTabs)),
             super::ActionHint::new("/", tr(self.locale, MessageId::SessionsActionSearch)),
             super::ActionHint::new("Esc", tr(self.locale, MessageId::SessionsActionClose)),
         ];
-        // Only advertise Enter when Enter does something. A `Status` action is
-        // a state, not a verb: a row mid-connect labelled `connecting` produced
-        // the hint "Enter connecting", and pressing it did nothing — which is
-        // what makes a user press it again.
         let enter_label = match entries.get(selected).copied() {
-            Some(VisibleEntry::Item(_, item)) => item
-                .action
-                .as_ref()
-                .filter(|action| action.command().is_some())
-                .map(|action| action.label().to_string()),
-            _ => Some(tr(self.locale, MessageId::ExtensionsActionFold).into_owned()),
+            Some(VisibleEntry::Item(_, item)) => Some(
+                item.action
+                    .as_ref()
+                    .filter(|action| action.command().is_some())
+                    .map_or_else(
+                        || tr(self.locale, MessageId::AutomationActionInspect).into_owned(),
+                        |action| action.label().to_string(),
+                    ),
+            ),
+            Some(VisibleEntry::Group(_)) => {
+                Some(tr(self.locale, MessageId::ExtensionsActionFold).into_owned())
+            }
+            Some(VisibleEntry::Problem(_)) => {
+                Some(tr(self.locale, MessageId::AutomationActionInspect).into_owned())
+            }
+            _ => None,
         };
+        if let Some(label) = enter_label.as_ref() {
+            compact_hints.insert(1, super::ActionHint::new("Enter", label.clone()));
+        }
         let mut full_hints = vec![
             super::ActionHint::new("Tab", tr(self.locale, MessageId::ExtensionsActionTabs)),
             super::ActionHint::new("↑↓", tr(self.locale, MessageId::LaunchHintMove)),
@@ -2196,6 +2278,90 @@ mod tests {
     use crate::mcp::McpRecoveryKind;
 
     #[test]
+    fn passive_rows_open_details_without_recovery_or_mutation() {
+        let mut view = view_on_item(ExtensionAction::Status {
+            label: "connected".into(),
+        });
+        let ViewAction::Emit(ViewEvent::OpenTextPager { title, content }) =
+            view.activate_selected()
+        else {
+            panic!("a passive inventory row must have useful details");
+        };
+        assert_eq!(title, "row");
+        assert!(content.contains("state"));
+        assert!(view.pending_remove.is_none());
+    }
+
+    #[test]
+    fn empty_mcp_opens_suggestions_without_installing_and_skills_manage_does_not_loop() {
+        let _env = crate::test_support::lock_test_env();
+        let root = tempfile::tempdir().unwrap();
+        let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", root.path());
+        let registry = crate::plugins::PluginDiscoveryContext::capture_pre_dotenv()
+            .registry_for_workspace(root.path());
+        let app = App::new_with_plugin_registry(
+            crate::test_support::test_tui_options(root.path()),
+            &crate::config::Config::default(),
+            registry,
+        );
+        let model = mcp_model(&app, Locale::En);
+        assert_eq!(model.groups.len(), 1);
+        assert_eq!(model.groups[0].label, "No MCP servers configured");
+        let item = &model.groups[0].items[0];
+        assert!(item.toggle.is_none() && item.remove.is_none());
+        assert!(
+            matches!(item.action.as_ref(), Some(ExtensionAction::Command {
+            command, disposition: RowActionDisposition::InPlacePager, ..
+        }) if command == "/mcp recommendations")
+        );
+        let skills = skills_model(&app, Locale::En);
+        for item in skills.groups.iter().flat_map(|group| &group.items) {
+            assert_eq!(
+                item.action.as_ref().and_then(ExtensionAction::command),
+                Some("/skills manage")
+            );
+        }
+        let mut snapshot = ExtensionsSnapshot::default();
+        snapshot.tabs[ExtensionsTab::Mcp.index()] = model;
+        let mut view =
+            ExtensionsView::from_snapshot_with_locale(snapshot, ExtensionsTab::Mcp, Locale::En);
+        assert_eq!(view.selected[ExtensionsTab::Mcp.index()], 1);
+        assert!(
+            matches!(view.activate_selected(), ViewAction::Emit(ViewEvent::ExecutePanelCommand {
+            command, pager_title: Some(_)
+        }) if command == "/mcp recommendations")
+        );
+    }
+
+    #[test]
+    fn workbench_extension_hover_preserves_selection_and_small_resize_clears_targets() {
+        let mut view = view_on_item(ExtensionAction::Command {
+            label: "enable".into(),
+            command: "/plugin enable demo".into(),
+            disposition: RowActionDisposition::InPlace,
+        });
+        let area = Rect::new(0, 0, 80, 24);
+        let mut buf = Buffer::empty(area);
+        view.render(area, &mut buf);
+        let (hit, row) = view.hits.borrow().rows[0];
+        let selected = view.selected;
+        view.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Moved,
+            column: hit.x,
+            row: hit.y,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(view.hovered_row, Some(row));
+        assert_eq!(view.selected, selected);
+        view.render(area, &mut buf);
+        assert_eq!(buf[(hit.right() - 1, hit.y)].bg, palette::SURFACE_ELEVATED);
+        let tiny = Rect::new(0, 0, 20, 4);
+        view.render(tiny, &mut Buffer::empty(tiny));
+        assert!(view.hits.borrow().rows.is_empty());
+        assert!(view.hits.borrow().tabs.is_empty());
+    }
+
+    #[test]
     fn a_plugin_contributed_server_is_not_mutable_from_this_panel() {
         // The row's name is synthesized and never appears in the config file
         // `/mcp remove` resolves against, so the gesture could only ever 404.
@@ -2249,12 +2415,14 @@ mod tests {
             row.state,
             tr(Locale::En, MessageId::ExtensionsStateFirstParty)
         );
+        // The exact-content review stacks on the panel so the confirmed
+        // digest lands on a row that then re-reads its trust state.
         assert!(
-            matches!(&row.action, Some(ExtensionAction::Command { command, disposition: RowActionDisposition::LeavePanel, .. }) if command == "/plugin trust computer-use")
+            matches!(&row.action, Some(ExtensionAction::Command { command, disposition: RowActionDisposition::InPlace, .. }) if command == "/plugin trust computer-use")
         );
         assert!(!builtin.trusted());
         assert!(!builtin.enabled);
-        assert_eq!(group.items.iter().filter(|row| matches!(&row.action, Some(ExtensionAction::Command { command, .. }) if command.starts_with("/plugin marketplace install "))).count(), 3);
+        assert_eq!(group.items.iter().filter(|row| matches!(&row.action, Some(ExtensionAction::Command { command, .. }) if command.starts_with("/plugin marketplace install "))).count(), 4);
     }
 
     #[test]
@@ -2440,7 +2608,7 @@ mod tests {
 
     /// Opening `/mcp` lands on the first server that needs a login, so Enter
     /// is the login key, not a fold of the group heading. A tab without a
-    /// login group keeps the heading-first default.
+    /// login group but no items keeps the empty-state selection.
     #[test]
     fn mcp_tab_opens_on_the_first_login_row() {
         let mut snapshot = ExtensionsSnapshot::default();

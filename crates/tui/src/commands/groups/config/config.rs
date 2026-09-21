@@ -969,7 +969,7 @@ fn config_editability_audit(app: &App) -> CommandResult {
             app.metrics_line.as_setting().to_string(),
             "runtime+persisted",
             "/config metrics_line <full|compact|hidden> --save",
-            "Writes [tui].metrics_line; hidden gives the row to the transcript, compact drops the telemetry and help hint.",
+            "Writes [tui].metrics_line; hidden gives the row to the transcript, compact drops secondary counts and help while keeping selected TTFT/rate readings when they fit. Choose readings with /statusline.",
         ),
         (
             "subagents.enabled",

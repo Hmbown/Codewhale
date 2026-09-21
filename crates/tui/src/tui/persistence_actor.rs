@@ -309,6 +309,39 @@ pub fn persist(request: PersistRequest) {
     }
 }
 
+/// Order synchronous lifecycle saves after all previously queued snapshots.
+/// Refuse a single-thread runtime rather than deadlocking its persistence task.
+pub(crate) fn flush_before_transition() -> Result<(), String> {
+    let Some(handle) = ACTOR_TX.get() else {
+        return Ok(());
+    };
+    let runtime = tokio::runtime::Handle::try_current().ok();
+    if runtime
+        .as_ref()
+        .is_some_and(|r| r.runtime_flavor() != tokio::runtime::RuntimeFlavor::MultiThread)
+    {
+        return Err("session transition requires an asynchronous persistence barrier".into());
+    }
+    let (reply, receiver) = oneshot::channel();
+    if !handle.try_send(PersistRequest::FlushAndReport { reply }) {
+        return Err("session transition could not queue persistence barrier".into());
+    }
+    let receive = || receiver.blocking_recv();
+    let report = if runtime.is_some() {
+        tokio::task::block_in_place(receive)
+    } else {
+        receive()
+    }
+    .map_err(|_| "session persistence stopped before the transition".to_string())?;
+    if !report.failures.is_empty() {
+        return Err(format!(
+            "session transition refused after persistence failures: {:?}",
+            report.failures
+        ));
+    }
+    Ok(())
+}
+
 fn request_label(request: &PersistRequest) -> &'static str {
     match request {
         PersistRequest::SaveCheckpoint { .. } => "SaveCheckpoint",

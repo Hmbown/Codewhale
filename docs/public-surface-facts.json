@@ -20,8 +20,8 @@
     ]
   },
   "sourceCandidate": {
-    "version": "0.9.14",
-    "providerCount": 49,
+    "version": "0.10.0",
+    "providerCount": 50,
     "toolCount": 80,
     "sandboxBackends": [
       "seatbelt (macOS, when available)",
@@ -105,7 +105,11 @@
       "edit",
       "bash",
       "agent",
-      "todo_write"
+      "workflow",
+      "todo_write",
+      "create_goal",
+      "get_goal",
+      "update_goal"
     ],
     "schemas": {
       "read": [
@@ -177,7 +181,7 @@
     "localRuntime": "runtime, workspace state, and audit log stay on the user's machine",
     "hostedProviderBoundary": "the selected hosted provider receives turn context required for inference",
     "localInference": "a loopback local-model route can keep inference local",
-    "telemetry": "Codewhale 0.9.14 counts anonymous usage by default and discloses it at first launch (policy notice version 5, naming Codewhale and PostHog as processors), while the earlier 0.9.11 release asked first; turning it off is a saved choice that later versions keep, an opt-out recorded under the earlier opt-in policy stays off, and showing the notice never records any acceptance on the user's behalf; Codewhale does not collect conversations, code, prompts, files, file/repo/branch names, model content, credentials, or per-turn/per-tool timelines; while on, sessions post aggregate counts and closed enums to the first-party endpoint https://telemetry.codewhale.net/v1/telemetry, whose storage has no IP, country, or geo column and a fixed three-month retention; optional PostHog forwarding requires separate operator configuration and verified IP-safe egress, and its retention is a separate project setting; telemetry_endpoint = \"\" writes only to a local dry-run file; no mandatory hosted relay",
+    "telemetry": "Codewhale 0.10.0 counts anonymous usage by default and discloses it at first launch (policy notice version 5, naming Codewhale and PostHog as processors), while the earlier 0.9.11 release asked first; turning it off is a saved choice that later versions keep, an opt-out recorded under the earlier opt-in policy stays off, and showing the notice never records any acceptance on the user's behalf; Codewhale does not collect conversations, code, prompts, files, file/repo/branch names, model content, credentials, or per-turn/per-tool timelines; while on, sessions post aggregate counts and closed enums to the first-party endpoint https://telemetry.codewhale.net/v1/telemetry, whose storage has no IP, country, or geo column and a fixed three-month retention; optional PostHog forwarding requires separate operator configuration and verified IP-safe egress, and its retention is a separate project setting; telemetry_endpoint = \"\" writes only to a local dry-run file; no mandatory hosted relay",
     "account": "no account required for the local runtime",
     "plan": "Plan centrally refuses file mutation and shell execution; policy-allowed research may contact external services and local session state can still be persisted.",
     "sandbox": "Seatbelt is used on macOS when available; Linux bubblewrap is opt-in and must be installed; Windows currently reports no OS sandbox",
@@ -233,17 +237,17 @@
     ]
   },
   "screenshot": {
-    "readme": "web/public/codewhale-tui-171acee.png",
-    "website": "web/public/codewhale-tui-171acee.png",
-    "sourceVersion": "0.9.12",
-    "sourceCommit": "171acee689aa48d44fc10df93c4a5b1a1d0622f5",
-    "sourceSha256": "48b4f13e37422ece7cfe0f465c3b9c3502dd8195d8436a6f238c495cf978aaa4",
-    "terminal": "unrecorded",
-    "theme": "Blue Stage dark",
-    "capture": "Founder-supplied capture on 2026-09-07 at 22:10:46 of a local v0.9.12 development build whose header reads 171acee689aa: a new session, the braille C-curl whale, Operate mode, Full Access, two scheduled items and 21 MCP connections still connecting. It documents appearance, not a published release or successful task execution. Full Access is the capture posture, not a default.",
+    "readme": "web/public/codewhale-tui-d7a9a1c.png",
+    "website": "web/public/codewhale-tui-d7a9a1c.png",
+    "sourceVersion": "0.10.0",
+    "sourceCommit": "d7a9a1c8c15635a84099d5fc2ee965146cf197c7",
+    "sourceSha256": "73e56158d6ec6c04933ce787c23c07322ce4d509b54050b54b12d181b09314b8",
+    "terminal": "real PTY cell capture rendered with Menlo and Apple Symbols",
+    "theme": "Shoreline dark",
+    "capture": "Captured on 2026-09-20 from the exact d7a9a1c8c156 development build in an isolated empty workspace: canonical whale mark, new session, composer, Ask permissions, Work mode and model status. Rendered directly from terminal cells without changing the content. No fixture conversations or provider requests. This documents appearance, not a published release or completed task. Ask/Work is the captured posture, not a default claim.",
     "sources": [
-      "crates/tui",
-      "web/public/codewhale-tui-171acee.png"
+      "crates/tui/tests/cucumber/launch_card_pty.rs",
+      "web/public/codewhale-tui-d7a9a1c.png"
     ]
   }
 }

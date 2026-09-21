@@ -1306,7 +1306,7 @@ pub(crate) fn catalog_models_for_route(
 }
 
 #[derive(serde::Serialize)]
-struct CatalogUpdateReceipt {
+pub(crate) struct CatalogUpdateReceipt {
     provider: String,
     source: &'static str,
     outcome: &'static str,
@@ -1446,7 +1446,7 @@ fn codex_route_matches_cli_account(config: &Config) -> bool {
     crate::oauth::auth_file_path() == cli_auth_path
 }
 
-async fn update_provider_catalog(
+pub(crate) async fn update_provider_catalog(
     config: &Config,
     identity: &ProviderIdentity,
 ) -> CatalogUpdateReceipt {
@@ -1502,9 +1502,14 @@ async fn update_provider_catalog(
     }
     // Ordinary model listing never constructs a client. Explicit refresh uses
     // the existing read-only resolver: no secret migration or OAuth refresh.
-    let client = route_config
-        .with_read_only_api_key_for_diagnostic()
-        .and_then(|config| crate::client::CodewhaleClient::for_catalog_refresh(&config));
+    let account_owner = route_config.account_model_access.read().clone();
+    let prepared = route_config.with_read_only_api_key_for_diagnostic();
+    let credential = prepared
+        .as_ref()
+        .ok()
+        .and_then(|config| config.active_route_api_key_read_only().ok());
+    let client =
+        prepared.and_then(|config| crate::client::CodewhaleClient::for_catalog_refresh(&config));
     let client = match client {
         Ok(client) => client,
         Err(_) => {
@@ -1528,6 +1533,28 @@ async fn update_provider_catalog(
     )
     .await
     .unwrap_or(Err(codewhale_config::catalog::CatalogRefreshError::Network));
+    // Resolve from the original route, not the materialized client clone: the
+    // shared session or secure credential may have changed during the request.
+    if route_config.active_route_api_key_read_only().ok() != credential {
+        receipt.outcome = "skipped";
+        receipt.error = Some("refresh_credentials_changed");
+        return receipt;
+    }
+    // Serialize publication with explicit overlay install/remove. Resolve
+    // above before taking this guard: the resolver itself reads the overlay.
+    let access = route_config.account_model_access.read();
+    let owner = |access: &crate::config::AccountModelAccess| {
+        (
+            access.session_id.clone(),
+            access.profile.clone(),
+            access.credential.expose_secret().to_string(),
+        )
+    };
+    if access.as_ref().map(owner) != account_owner.as_ref().map(owner) {
+        receipt.outcome = "skipped";
+        receipt.error = Some("refresh_credentials_changed");
+        return receipt;
+    }
     match result {
         Ok(mut delta) => {
             if delta.base_url_fingerprint != fingerprint {
@@ -1560,6 +1587,7 @@ async fn update_provider_catalog(
             receipt.outcome = "failed";
         }
     }
+    drop(access);
     let outcome = receipt.outcome;
     receipt = cached_receipt(&route_config, identity);
     receipt.outcome = outcome;
@@ -1791,6 +1819,63 @@ mod tests {
             .expect(1)
             .mount(server)
             .await;
+    }
+
+    #[tokio::test]
+    async fn models_update_refuses_credentials_changed_during_request() {
+        let _env = crate::test_support::lock_test_env();
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", home.path());
+        let _cli = crate::test_support::EnvVarGuard::remove(codewhale_config::CLI_API_KEY_ENV);
+        let _key =
+            crate::test_support::EnvVarGuard::set("CWC_CATALOG_TEST_KEY", "first-route-test-key");
+        let upstream = wiremock::MockServer::start().await;
+        let mut config = catalog_test_config(&upstream.uri(), &upstream.uri());
+        let entry = config
+            .providers
+            .as_mut()
+            .unwrap()
+            .custom
+            .get_mut("catalog-first")
+            .unwrap();
+        entry.api_key = None;
+        entry.api_key_env = Some("CWC_CATALOG_TEST_KEY".into());
+        let identity = config.resolve_provider_identity("catalog-first").unwrap();
+        crate::provider_catalog_live::reset_cache_for_test();
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_delay(std::time::Duration::from_millis(100))
+                    .set_body_json(
+                        serde_json::json!({"data":[{"id":"old-account-private-model"}]}),
+                    ),
+            )
+            .expect(1)
+            .mount(&upstream)
+            .await;
+        let change = async {
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                while upstream.received_requests().await.unwrap().is_empty() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            // This guard stays alive until after the delayed refresh completes.
+            crate::test_support::EnvVarGuard::set("CWC_CATALOG_TEST_KEY", "other-account-test-key")
+        };
+        let (receipt, _changed) = tokio::join!(update_provider_catalog(&config, &identity), change);
+        assert_eq!(receipt.outcome, "skipped");
+        assert_eq!(receipt.error, Some("refresh_credentials_changed"));
+        assert!(
+            crate::provider_catalog_live::cached_entry_for_route(
+                ApiProvider::Custom,
+                &identity.key,
+                &upstream.uri()
+            )
+            .unwrap()
+            .is_none()
+        );
     }
 
     #[tokio::test]

@@ -71,10 +71,13 @@ pub(in crate::commands) fn branch_portable(
         );
     };
     match lifecycle.branch_to(entry_id) {
-        Ok(outcome) => CommandResult::message(format!(
-            "Branched to entry {entry_id} (leaf now {}); journal entries {} (history preserved, leaf moved only)",
-            outcome.leaf_display, outcome.journal_entries_before
-        )),
+        Ok(outcome) => CommandResult::with_message_and_action(
+            format!(
+                "Branched to entry {entry_id} (leaf now {}); journal entries {} (history preserved, leaf moved only)",
+                outcome.leaf_display, outcome.journal_entries_before
+            ),
+            super::sync_session_action(outcome.sync),
+        ),
         Err(error) => CommandResult::error(error),
     }
 }

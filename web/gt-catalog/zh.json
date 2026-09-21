@@ -81,7 +81,7 @@
     "exploreProduct": "了解产品",
     "shotPreview": "终端预览",
     "shotBuild": "v{version} 开发版本",
-    "screenshotAlt": "Codewhale v0.9.12 终端，构建版本 171acee689aa：一个新会话，显示鲸鱼标志、消息输入区、Full Access 和 Operate 模式、两个定时任务、21 个正在连接的 MCP 服务器，以及推理强度设为最高的 GLM-5.3。",
+    "screenshotAlt": "Codewhale v{version} 开发版本：鲸鱼标志、新会话、消息输入区、Ask 权限、Work 模式和模型状态。由隔离终端会话的实际画面渲染。",
     "latestRelease": "最新发布 {tag}",
     "releaseUnavailable": "发布状态暂不可用",
     "currentSource": "源码",

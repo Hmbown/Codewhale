@@ -60,6 +60,7 @@
     "reason": "not_money_metered",
     "review": "Exact shipped plan/OAuth/local surfaces are excluded from money coverage before model-price lookup (route_billing.rs:345,470; pricing.rs:398; cost_status.rs:235). Retain exact dialect and plan endpoint distinctions; the same model on PAYG is a different tuple.",
     "routes": [
+      ["csdn", "glm_for_coding", "https://ai.csdn.net/api/model/v1", "chat_completions", "subscription"],
       ["modelstudio-coding-plan", "qwen3.8-max", "https://coding-intl.dashscope.aliyuncs.com/v1", "chat_completions", "subscription"],
       ["modelstudio-coding-plan-anthropic", "qwen3.8-max", "https://coding-intl.dashscope.aliyuncs.com/apps/anthropic", "anthropic_messages", "subscription"],
       ["modelstudio-token-plan", "qwen3.8-max", "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1", "chat_completions", "subscription"],

@@ -273,6 +273,8 @@ pub const DEFAULT_EDENAI_MODEL: &str = "deepseek/deepseek-v4-pro";
 pub const DEFAULT_EDENAI_BASE_URL: &str = "https://api.edenai.run/v3";
 pub const DEFAULT_ZENMUX_MODEL: &str = "deepseek/deepseek-v4.1-flash";
 pub const DEFAULT_ZENMUX_BASE_URL: &str = "https://zenmux.ai/api/v1";
+pub const DEFAULT_CSDN_MODEL: &str = "glm_for_coding";
+pub const DEFAULT_CSDN_BASE_URL: &str = "https://ai.csdn.net/api/model/v1";
 // Concentrate (OpenAI Responses-compatible AI gateway) defaults; mirrors
 // crates/config/src/provider_defaults.rs for the docs drift check.
 pub const DEFAULT_CONCENTRATE_MODEL: &str = "deepseek-v4-pro";

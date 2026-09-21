@@ -22,6 +22,8 @@ mod core_session_command_extraction;
 mod directory_listing_acceptance;
 mod epic_acceptance_harness;
 mod eval_smoke_acceptance;
+#[cfg(all(unix, feature = "long-running-tests"))]
+mod launch_card_pty;
 mod plugin_e2e_acceptance;
 #[cfg(all(unix, feature = "long-running-tests"))]
 mod screen_mode_inline_pty;

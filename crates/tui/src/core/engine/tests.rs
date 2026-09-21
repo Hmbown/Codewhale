@@ -507,6 +507,177 @@ fn registry_instruction_does_not_gate_ordinary_local_work() {
     assert!(prompt.contains("rather than installing or running its package command"));
 }
 
+/// A provider's input bill describes one route's tokenization of one prompt.
+/// The compaction gate and the preflight guard lift the honest estimate to
+/// it, so a bill carried across a route switch would measure the next
+/// request with the previous route's tokenizer and prefix. Re-installing the
+/// same route keeps the carry-over #5577 relies on; a different route drops
+/// it.
+/// A named custom provider keeps its name, model string, and (absent) limits
+/// across a config reload that points it at a different server. A different
+/// server is a different tokenizer, so the bill from the old one must not
+/// measure the first request to the new one (post-merge finding on #6380).
+#[test]
+fn custom_route_endpoint_change_forgets_the_previous_bill() {
+    let mut custom = HashMap::new();
+    custom.insert(
+        "lm-studio".to_string(),
+        crate::config::ProviderConfig {
+            kind: Some("openai-compatible".to_string()),
+            base_url: Some("http://127.0.0.1:18181/v1".to_string()),
+            model: Some("local-model".to_string()),
+            api_key: Some("local-test-key".to_string()),
+            ..crate::config::ProviderConfig::default()
+        },
+    );
+    let config = Config {
+        provider: Some("lm-studio".to_string()),
+        providers: Some(crate::config::ProvidersConfig {
+            custom,
+            ..crate::config::ProvidersConfig::default()
+        }),
+        ..Config::default()
+    };
+    let (mut engine, _handle) = Engine::new(EngineConfig::default(), &config);
+    let install = |engine: &mut Engine, config: &Config| {
+        let route = resolve_runtime_route(config, ApiProvider::Custom, Some("local-model"))
+            .expect("resolve lm-studio")
+            .validate()
+            .expect("preflight lm-studio");
+        engine.install_validated_runtime_route(route);
+    };
+    install(&mut engine, &config);
+    engine.session.latest_parent_input_tokens = Some(150_000);
+
+    install(&mut engine, &config);
+    assert_eq!(
+        engine.session.latest_parent_input_tokens,
+        Some(150_000),
+        "the same endpoint keeps the last bill"
+    );
+
+    let mut reloaded = config;
+    reloaded
+        .providers
+        .as_mut()
+        .and_then(|providers| providers.custom.get_mut("lm-studio"))
+        .expect("named custom provider")
+        .base_url = Some("http://127.0.0.1:18182/v1".to_string());
+    install(&mut engine, &reloaded);
+    assert_eq!(engine.api_provider_identity, "lm-studio");
+    assert_eq!(
+        engine.session.latest_parent_input_tokens, None,
+        "a new endpoint under the same name drops the old server's bill"
+    );
+}
+
+/// A catalog refresh can keep a route's name, base URL, model, and limits and
+/// still move it to another endpoint key or wire protocol. Chat Completions
+/// and Responses serialize a prompt differently, so the bill from one must
+/// not measure the first request on the other (post-merge finding on #6381).
+#[test]
+fn route_protocol_change_forgets_the_previous_bill() {
+    use codewhale_config::route::{RequestProtocol, ResolvedEndpoint};
+    let (mut engine, _handle) = Engine::new(EngineConfig::default(), &Config::default());
+    let chat = ResolvedEndpoint {
+        base_url: "https://gateway.example/v1".to_string(),
+        endpoint_key: "chat".to_string(),
+        protocol: RequestProtocol::ChatCompletions,
+    };
+    engine.active_route_endpoint = Some(chat.clone());
+    let identity = engine.api_provider_identity.clone();
+    let provider_id = engine.api_provider_id.clone();
+    let model = engine.session.model.clone();
+    let limits = engine.active_route_limits;
+
+    engine.session.latest_parent_input_tokens = Some(150_000);
+    engine.forget_input_bill_if_route_changes(
+        &identity,
+        provider_id.as_deref(),
+        Some(&chat),
+        &model,
+        limits,
+    );
+    assert_eq!(
+        engine.session.latest_parent_input_tokens,
+        Some(150_000),
+        "the same endpoint keeps the last bill"
+    );
+
+    let responses = ResolvedEndpoint {
+        endpoint_key: "responses".to_string(),
+        protocol: RequestProtocol::Responses,
+        ..chat
+    };
+    engine.forget_input_bill_if_route_changes(
+        &identity,
+        provider_id.as_deref(),
+        Some(&responses),
+        &model,
+        limits,
+    );
+    assert_eq!(
+        engine.session.latest_parent_input_tokens, None,
+        "a new endpoint key or protocol at the same URL drops the bill"
+    );
+}
+
+#[test]
+fn route_switch_forgets_the_previous_routes_input_bill() {
+    let mut custom = HashMap::new();
+    for (name, base_url, model) in [
+        ("custom-a", "http://127.0.0.1:18181/v1", "model-a"),
+        ("custom-b", "http://127.0.0.1:18182/v1", "model-b"),
+    ] {
+        custom.insert(
+            name.to_string(),
+            crate::config::ProviderConfig {
+                kind: Some("openai-compatible".to_string()),
+                base_url: Some(base_url.to_string()),
+                model: Some(model.to_string()),
+                api_key: Some("local-test-key".to_string()),
+                ..crate::config::ProviderConfig::default()
+            },
+        );
+    }
+    let config = Config {
+        provider: Some("custom-a".to_string()),
+        providers: Some(crate::config::ProvidersConfig {
+            custom,
+            ..crate::config::ProvidersConfig::default()
+        }),
+        ..Config::default()
+    };
+    let (mut engine, _handle) = Engine::new(EngineConfig::default(), &config);
+    let route_a = || {
+        resolve_runtime_route(&config, ApiProvider::Custom, Some("model-a"))
+            .expect("resolve custom A")
+            .validate()
+            .expect("preflight custom A")
+    };
+    engine.install_validated_runtime_route(route_a());
+    engine.session.latest_parent_input_tokens = Some(150_000);
+
+    engine.install_validated_runtime_route(route_a());
+    assert_eq!(
+        engine.session.latest_parent_input_tokens,
+        Some(150_000),
+        "re-installing the same route keeps the last bill"
+    );
+
+    let mut target = config.clone();
+    target.provider = Some("custom-b".to_string());
+    let route_b = resolve_runtime_route(&target, ApiProvider::Custom, Some("model-b"))
+        .expect("resolve custom B")
+        .validate()
+        .expect("preflight custom B");
+    engine.install_validated_runtime_route(route_b);
+    assert_eq!(
+        engine.session.latest_parent_input_tokens, None,
+        "a different route drops the previous route's bill"
+    );
+}
+
 #[test]
 fn custom_route_identity_change_rebuilds_client_for_new_named_endpoint() {
     let mut custom = HashMap::new();
@@ -15503,7 +15674,9 @@ async fn compaction_keeps_todos_out_of_the_prefix() {
 
 #[tokio::test]
 async fn compaction_completed_reports_complete_post_input_tokens() {
+    let _env = crate::test_support::lock_test_env();
     let tmp = tempdir().expect("tempdir");
+    let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", tmp.path());
     let config = EngineConfig {
         workspace: tmp.path().to_path_buf(),
         ..Default::default()
@@ -15533,6 +15706,17 @@ async fn compaction_completed_reports_complete_post_input_tokens() {
             "Compaction complete".to_string(),
             Some(4),
             Some(1),
+            super::compaction::CompactionPass {
+                trigger: "manual",
+                path: crate::compaction::CompactionPath::Summary,
+                tokens_before: 9000,
+                threshold_tokens: 8000,
+                usage: Usage {
+                    input_tokens: 120,
+                    output_tokens: 15,
+                    ..Default::default()
+                },
+            },
         )
         .await;
 
@@ -15550,6 +15734,37 @@ async fn compaction_completed_reports_complete_post_input_tokens() {
         panic!("expected CompactionCompleted, got {event:?}");
     };
     assert_eq!(post_input_tokens, Some(expected as u64));
+    let log = std::fs::read_to_string(tmp.path().join("audit.log")).unwrap();
+    let records = log
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .filter(|row| row["event"] == "compaction.completed")
+        .collect::<Vec<_>>();
+    assert_eq!(records.len(), 1);
+    let details = &records[0]["details"];
+    assert_eq!(details["messages_before"], 4);
+    assert_eq!(details["messages_after"], 1);
+    assert_eq!(details["reduction_ratio"], 0.75);
+    assert_eq!(details["estimated_tokens_before"], 9000);
+    assert_eq!(details["estimated_tokens_after"], expected);
+    assert_eq!(details["threshold_tokens"], 8000);
+    assert_eq!(details["summarizer_usage"]["input_tokens"], 120);
+    assert_eq!(details["trigger"], "manual");
+    assert_eq!(details["path"], "summary");
+    assert!(!log.contains("post-compaction message"));
+    engine
+        .record_compaction_event(
+            "compaction.refused",
+            serde_json::json!({
+                "trigger": "auto", "reason": "retained_floor", "threshold_tokens": 8000,
+            }),
+        )
+        .await;
+    assert!(
+        std::fs::read_to_string(tmp.path().join("audit.log"))
+            .unwrap()
+            .contains("compaction.refused")
+    );
 }
 
 /// `fork_context` is captured once at turn start, so a `work_update` followed
@@ -16700,9 +16915,41 @@ async fn provider_runtime_status_reports_configured_zai_cap_without_client() {
 fn detects_context_length_errors_from_provider_payloads() {
     let msg = r#"SSE stream request failed: HTTP 400 Bad Request: {"error":{"message":"This model's maximum context length is 131072 tokens. However, you requested 153056 tokens (148960 in the messages, 4096 in the completion).","type":"invalid_request_error"}}"#;
     assert!(is_context_length_error_message(msg));
+    // llama.cpp's server wording (#6374): a genuine overflow on a local route
+    // must enter the bounded recovery path too.
+    assert!(is_context_length_error_message(
+        r#"SSE stream request failed: HTTP 400 Bad Request: {"error":{"code":400,"message":"the request exceeds the available context size. try increasing the context size or enable context shift","type":"invalid_request_error"}}"#
+    ));
     assert!(!is_context_length_error_message(
         "SSE stream request failed: HTTP 400 Bad Request: model not found"
     ));
+}
+
+/// #6374: the exhausted-recovery message must name levers the reader has.
+#[test]
+fn context_overflow_exhausted_message_names_levers_that_exist_in_the_mode() {
+    let headless = super::context::context_overflow_exhausted_message(false, 2, 98_739, 97_280);
+    assert!(
+        !headless.contains("/compact") && !headless.contains("/clear"),
+        "a headless host has no command layer: {headless}"
+    );
+    assert!(
+        headless.contains("2 emergency compaction passes"),
+        "{headless}"
+    );
+    assert!(
+        headless.contains("CODEWHALE_MAX_OUTPUT_TOKENS"),
+        "{headless}"
+    );
+    let interactive = super::context::context_overflow_exhausted_message(true, 1, 98_739, 97_280);
+    assert!(
+        interactive.contains("/compact") && interactive.contains("/clear"),
+        "{interactive}"
+    );
+    assert!(
+        interactive.contains("1 emergency compaction pass "),
+        "{interactive}"
+    );
 }
 
 #[test]
@@ -16824,6 +17071,115 @@ fn route_input_limit_blocks_oversized_preflight_before_transport() {
     assert!(
         estimated_input > usize::try_from(budget.input_budget_ceiling).unwrap(),
         "the turn-loop preflight must recover before constructing a network request"
+    );
+}
+
+/// #6374: the preflight guard measured a ×1.5-inflated estimate against the
+/// honest input ceiling, so a route refused at two thirds of its budget with
+/// the request never leaving the machine. The window here is calibrated so the
+/// honest estimate sits below the ceiling and the inflated one above it; the
+/// turn must reach the model with its history untouched.
+#[tokio::test]
+async fn preflight_guard_measures_honest_input_against_the_input_ceiling() {
+    let _lock = lock_test_env();
+    let _output_env = ScopedDeepSeekMaxOutputTokens::unset();
+    let workspace = tempdir().expect("workspace");
+    let _home = EnvVarGuard::set("CODEWHALE_HOME", workspace.path());
+    let mock = std::sync::Arc::new(crate::llm_client::mock::MockLlmClient::new(vec![
+        crate::llm_client::mock::canned::simple_text_turn("continuing"),
+    ]));
+    let (mut engine, _handle) = Engine::new_with_model_client(
+        EngineConfig {
+            terminal_chrome_enabled: false,
+            ..deterministic_engine_config(workspace.path())
+        },
+        &Config::default(),
+        mock.clone(),
+    );
+    // Only the preflight guard is under test; the auto-compaction gate stays out.
+    engine.config.compaction.enabled = false;
+    let history: Vec<Message> = [
+        (Role::User, "x".repeat(120_000)),
+        (Role::Assistant, "y".repeat(100_000)),
+        (Role::User, "please continue".to_string()),
+    ]
+    .into_iter()
+    .map(|(role, text)| Message {
+        role,
+        content: vec![ContentBlock::Text {
+            text,
+            cache_control: None,
+        }],
+    })
+    .collect();
+    for message in &history {
+        engine.session.add_message(message.clone());
+    }
+    let system = engine.session.system_prompt.clone();
+    let honest = crate::compaction::estimate_input_tokens_for_pressure(&history, system.as_ref());
+    let inflated = crate::compaction::estimate_input_tokens_conservative(&history, system.as_ref());
+    assert!(
+        inflated > honest + 20_000,
+        "fixture must separate the estimators: honest {honest}, inflated {inflated}"
+    );
+    let output_cap = 4_096u64;
+    let target_ceiling = u64::try_from((honest + inflated) / 2).unwrap();
+    engine.active_route_limits = Some(codewhale_config::route::RouteLimits {
+        context_tokens: Some(
+            target_ceiling + output_cap + crate::context_budget::CONTEXT_HEADROOM_TOKENS,
+        ),
+        input_tokens: None,
+        output_tokens: Some(output_cap),
+    });
+    let ceiling = route_context_budget_for_route(
+        engine.api_provider,
+        &engine.session.model,
+        engine.active_route_limits,
+        0,
+    )
+    .expect("route limits produce a budget")
+    .input_budget_ceiling;
+    let ceiling = usize::try_from(ceiling).unwrap();
+    assert!(
+        honest < ceiling && ceiling < inflated,
+        "calibration: honest {honest} < ceiling {ceiling} < inflated {inflated}"
+    );
+
+    let registry =
+        crate::tools::ToolRegistry::new(crate::tools::spec::ToolContext::new(workspace.path()));
+    let catalog = registry.to_api_tools_with_cache(true);
+    let surface = crate::core::engine::tool_catalog::ToolSurfacePolicy::new(
+        registry,
+        Some(catalog),
+        codewhale_config::AppMode::Agent,
+        &engine.config.tools_always_load,
+        &[],
+        false,
+        None,
+        None,
+        Some(4),
+        engine.session.approval_mode,
+        crate::core::engine::tool_catalog::ToolMode::Direct,
+    );
+    let (status, error) = engine
+        .run_turn(
+            &mut crate::core::turn::TurnContext::new(8),
+            surface,
+            None,
+            None,
+        )
+        .await;
+    assert_eq!(status, TurnOutcomeStatus::Completed, "{error:?}");
+    assert_eq!(
+        mock.call_count(),
+        1,
+        "the only model request is the turn itself, not an emergency compaction"
+    );
+    let request = mock.last_request().expect("the turn reached the model");
+    assert_eq!(
+        request.messages.len(),
+        history.len(),
+        "history reached the model without an emergency compaction pass"
     );
 }
 

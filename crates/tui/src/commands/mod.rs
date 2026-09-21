@@ -601,6 +601,8 @@ mod tests {
     #[test]
     fn command_registry_contains_config_and_links_but_not_set_or_deepseek() {
         assert!(command_infos().iter().any(|cmd| cmd.name == "config"));
+        assert!(get_command_info("experiments").is_none());
+        assert!(get_command_info("experimental").is_none());
         let rail = command_infos()
             .into_iter()
             .find(|cmd| cmd.name == "workbar")
@@ -1769,7 +1771,12 @@ mod tests {
 
         let (mut app, _tmpdir, _guard) = create_isolated_test_app();
         let result = execute("/skills", &mut app);
-        assert!(matches!(result.action, Some(AppAction::OpenSkillsManager)));
+        assert!(matches!(
+            result.action,
+            Some(AppAction::OpenExtensions {
+                tab: crate::tui::views::extensions::ExtensionsTab::Skills
+            })
+        ));
 
         let mut app = create_test_app();
         let result = execute("/task list", &mut app);
@@ -2550,16 +2557,37 @@ mod tests {
         std::fs::create_dir_all(tmp.path().join("skills")).unwrap();
         feat022_write_skill(&tmp.path().join("skills"), "demo");
 
-        // Bare /skills opens the unified manager (zero network).
+        // Bare /skills opens Extensions; explicit manage retains the mutation surface.
         let result = execute("/skills", &mut app);
         assert!(!result.is_error, "{result:?}");
         assert!(
             matches!(
                 result.action,
-                Some(crate::tui::app::AppAction::OpenSkillsManager)
+                Some(crate::tui::app::AppAction::OpenExtensions {
+                    tab: crate::tui::views::extensions::ExtensionsTab::Skills
+                })
             ),
             "{result:?}"
         );
+
+        assert!(matches!(
+            execute("/skills manage", &mut app).action,
+            Some(AppAction::OpenSkillsManager)
+        ));
+        let mcp_info = get_command_info("mcp").expect("registered MCP command");
+        assert!(mcp_info.aliases.contains(&"mcps"));
+        assert_eq!(get_command_info("mcps").unwrap().name, mcp_info.name);
+        for command in ["/mcp", "/mcps"] {
+            assert!(
+                matches!(
+                    execute(command, &mut app).action,
+                    Some(AppAction::OpenExtensions {
+                        tab: crate::tui::views::extensions::ExtensionsTab::Mcp
+                    })
+                ),
+                "{command}"
+            );
+        }
 
         // /skill activates the demo skill and sets active_skill.
         let result = execute("/skill demo", &mut app);
@@ -2592,7 +2620,9 @@ mod tests {
         assert!(
             matches!(
                 result.action,
-                Some(crate::tui::app::AppAction::OpenSkillsManager)
+                Some(crate::tui::app::AppAction::OpenExtensions {
+                    tab: crate::tui::views::extensions::ExtensionsTab::Skills
+                })
             ),
             "{result:?}"
         );

@@ -185,6 +185,14 @@ impl ToolStats {
 #[derive(Debug, Default, serde::Serialize)]
 pub struct CompactionStats {
     pub events: u64,
+    pub refusals: HashMap<String, u64>,
+    pub triggers: HashMap<String, u64>,
+    pub paths: HashMap<String, u64>,
+    pub summarizer_usage_samples: u64,
+    pub summarizer_input_tokens: u64,
+    pub summarizer_output_tokens: u64,
+    #[serde(skip)]
+    receipt_ids: HashSet<String>,
     /// Sum of `reduction_ratio` from events that carry it (0.0–1.0 each).
     pub ratio_sum: f64,
     pub ratio_samples: u64,
@@ -561,7 +569,44 @@ fn read_audit_log(
                     None => stats.outcome_unknown += 1,
                 }
             }
+            "compaction.refused" => {
+                let reason = v
+                    .pointer("/details/reason")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown");
+                *rollup
+                    .compaction
+                    .refusals
+                    .entry(reason.to_string())
+                    .or_default() += 1;
+            }
             "compaction.completed" | "context.compaction" => {
+                if let Some(id) = compaction_receipt_identity(&v, false)
+                    && !rollup.compaction.receipt_ids.insert(id)
+                {
+                    continue;
+                }
+                for (field, counts) in [
+                    ("trigger", &mut rollup.compaction.triggers),
+                    ("path", &mut rollup.compaction.paths),
+                ] {
+                    if let Some(value) = v
+                        .pointer(&format!("/details/{field}"))
+                        .and_then(Value::as_str)
+                    {
+                        *counts.entry(value.to_string()).or_default() += 1;
+                    }
+                }
+                if let (Some(input), Some(output)) = (
+                    v.pointer("/details/summarizer_usage/input_tokens")
+                        .and_then(Value::as_u64),
+                    v.pointer("/details/summarizer_usage/output_tokens")
+                        .and_then(Value::as_u64),
+                ) {
+                    rollup.compaction.summarizer_usage_samples += 1;
+                    rollup.compaction.summarizer_input_tokens += input;
+                    rollup.compaction.summarizer_output_tokens += output;
+                }
                 rollup.compaction.events += 1;
                 if let Some(ratio) = v
                     .pointer("/details/reduction_ratio")
@@ -1053,11 +1098,33 @@ fn record_runtime_item_receipt(
     }
 }
 
+fn compaction_receipt_identity(v: &Value, runtime: bool) -> Option<String> {
+    let (session, id) = if runtime {
+        (
+            v.get("thread_id")?,
+            v.pointer("/payload/item/metadata/compaction_id")?,
+        )
+    } else {
+        (
+            v.pointer("/details/thread_id")
+                .filter(|id| id.is_string())
+                .or_else(|| v.pointer("/details/session_id"))?,
+            v.pointer("/details/compaction_id")?,
+        )
+    };
+    Some(format!("{}:{}", session.as_str()?, id.as_str()?))
+}
+
 /// A compaction is only counted when it completed. The size reduction comes
 /// from the two persisted message counts or it stays unknown — a compaction
 /// with no counts must never average in as a 0% reduction.
 fn record_compaction_item_receipt(event: &str, v: &Value, rollup: &mut Rollup) {
     if event != "item.completed" {
+        return;
+    }
+    if let Some(id) = compaction_receipt_identity(v, true)
+        && !rollup.compaction.receipt_ids.insert(id)
+    {
         return;
     }
     rollup.compaction.events += 1;
@@ -1247,17 +1314,30 @@ fn print_human(rollup: &Rollup, since: Option<DateTime<Utc>>) {
     }
 
     // ── Compaction ─────────────────────────────────────────────────────────
-    if rollup.compaction.events > 0 {
+    let compaction_refusals: u64 = rollup.compaction.refusals.values().sum();
+    if rollup.compaction.events > 0 || compaction_refusals > 0 {
         let avg_str = match rollup.compaction.avg_reduction_pct() {
             Some(pct) => format!(", avg {pct:.0}% size reduction"),
             // No message counts were recorded. Saying nothing here reads as
             // "no reduction"; say that it is unknown.
             None => ", size reduction unknown".to_string(),
         };
+        let usage = if rollup.compaction.summarizer_usage_samples > 0 {
+            format!(
+                "{} input / {} output tokens across {} measured passes",
+                fmt_num(rollup.compaction.summarizer_input_tokens),
+                fmt_num(rollup.compaction.summarizer_output_tokens),
+                fmt_num(rollup.compaction.summarizer_usage_samples)
+            )
+        } else {
+            "usage unavailable".to_string()
+        };
         println!(
-            "Compaction: {} events{}",
+            "Compaction: {} completed, {} refused{}; summarizer {}",
             fmt_num(rollup.compaction.events),
-            avg_str
+            fmt_num(compaction_refusals),
+            avg_str,
+            usage
         );
     } else {
         println!("Compaction: (no data)");
@@ -1398,6 +1478,34 @@ fn fmt_num(n: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compaction_audit_counts_usage_refusals_and_deduplicates_runtime_receipt() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let completed = serde_json::json!({"ts": "2026-09-19T12:00:00Z", "event": "compaction.completed", "details": {
+            "session_id": "engine-session-a", "thread_id": "thread-a", "compaction_id": "pass-a", "trigger": "manual", "path": "summary",
+            "reduction_ratio": 0.75, "summarizer_usage": {"input_tokens": 120, "output_tokens": 15}
+        }});
+        let refused = serde_json::json!({"ts": "2026-09-19T12:01:00Z", "event": "compaction.refused", "details": {"reason": "retained_floor"}});
+        std::fs::write(tmp.path(), format!("{completed}\n{completed}\n{refused}\n")).unwrap();
+        let mut rollup = Rollup::default();
+        read_audit_test_log(tmp.path(), None, &mut rollup);
+        record_compaction_item_receipt(
+            "item.completed",
+            &serde_json::json!({
+                "thread_id": "thread-a", "payload": {"item": {"metadata": {"compaction_id": "pass-a"}}, "messages_before": 4, "messages_after": 1}
+            }),
+            &mut rollup,
+        );
+        assert_eq!(rollup.compaction.events, 1);
+        assert_eq!(rollup.compaction.ratio_samples, 1);
+        assert_eq!(rollup.compaction.avg_reduction_pct(), Some(75.0));
+        assert_eq!(rollup.compaction.refusals["retained_floor"], 1);
+        assert_eq!(rollup.compaction.triggers["manual"], 1);
+        assert_eq!(rollup.compaction.paths["summary"], 1);
+        assert_eq!(rollup.compaction.summarizer_input_tokens, 120);
+        assert_eq!(rollup.compaction.summarizer_output_tokens, 15);
+    }
 
     fn read_audit_test_log(path: &Path, since: Option<DateTime<Utc>>, rollup: &mut Rollup) {
         super::read_audit_log(path, since, rollup, &HashMap::new(), &mut HashMap::new());

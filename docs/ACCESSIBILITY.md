@@ -62,8 +62,14 @@ export NO_ANIMATIONS=1
 export CODEWHALE_ASCII_SAFE=1
 
 # Optional: respect the wider terminal-color convention.
-export NO_COLOR=1            # honored by the underlying ratatui backend
+export NO_COLOR=1            # terminal-owned colors; bold/underline remain
 ```
+
+A nonempty `NO_COLOR` value suppresses foreground, background, and underline
+colors in the TUI. An empty value leaves normal terminal color detection active.
+This follows the [NO_COLOR convention](https://no-color.org/) while retaining
+text modifiers and selection symbols. ASCII rendering and reduced motion are
+separate choices.
 
 `NO_ANIMATIONS` accepts any of `1`, `true`, `yes`, or `on`
 (case-insensitive). Any other value (including `0`, `false`, empty,

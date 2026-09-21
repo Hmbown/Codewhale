@@ -124,6 +124,8 @@ pub enum ApiProvider {
     Edenai,
     /// ZenMux — OpenAI-compatible AI gateway (aggregator).
     Zenmux,
+    /// CSDN 星图 — OpenAI-compatible hosted platform and Coding Plan.
+    Csdn,
     /// Concentrate — OpenAI Responses-compatible AI gateway (aggregator; BYOK only).
     Concentrate,
     /// Codewhale API — account-backed model access over connected provider keys.
@@ -371,7 +373,7 @@ impl ApiProvider {
 
     /// `ApiProvider` discriminant → `ProviderKind` lookup.
     /// Index 1 is `None` for the legacy `DeepseekCN` variant.
-    const KIND_LOOKUP: [Option<codewhale_config::ProviderKind>; 52] = [
+    const KIND_LOOKUP: [Option<codewhale_config::ProviderKind>; 53] = [
         Some(codewhale_config::ProviderKind::Deepseek),
         None, // DeepseekCN
         Some(codewhale_config::ProviderKind::DeepseekAnthropic),
@@ -417,6 +419,7 @@ impl ApiProvider {
         Some(codewhale_config::ProviderKind::Telecomjs),
         Some(codewhale_config::ProviderKind::Edenai),
         Some(codewhale_config::ProviderKind::Zenmux),
+        Some(codewhale_config::ProviderKind::Csdn),
         Some(codewhale_config::ProviderKind::Concentrate),
         Some(codewhale_config::ProviderKind::Codewhale),
         Some(codewhale_config::ProviderKind::ModelstudioTokenPlan),
@@ -427,7 +430,7 @@ impl ApiProvider {
     ];
 
     /// `ProviderKind` discriminant → `ApiProvider` lookup.
-    const FROM_KIND_LOOKUP: [Self; 51] = [
+    const FROM_KIND_LOOKUP: [Self; 52] = [
         Self::Deepseek,
         Self::DeepseekAnthropic,
         Self::NvidiaNim,
@@ -476,6 +479,7 @@ impl ApiProvider {
         Self::Google,
         Self::Edenai,
         Self::Zenmux,
+        Self::Csdn,
         Self::Concentrate,
         Self::Codewhale,
         Self::Custom,
@@ -547,6 +551,10 @@ fn subagent_provider_key_matches(key: &str, provider: ApiProvider) -> bool {
         ApiProvider::Orcarouter => matches!(normalized.as_str(), "orcarouter" | "orca_router"),
         ApiProvider::Edenai => matches!(normalized.as_str(), "edenai" | "eden_ai"),
         ApiProvider::Zenmux => matches!(normalized.as_str(), "zenmux" | "zen_mux"),
+        ApiProvider::Csdn => matches!(
+            normalized.as_str(),
+            "csdn" | "csdn_ai" | "csdn_coding_plan" | "starmap"
+        ),
         ApiProvider::Concentrate => matches!(
             normalized.as_str(),
             "concentrate" | "concentrate_ai" | "concentrateai"
@@ -1713,6 +1721,7 @@ pub fn model_completion_names_for_provider(provider: ApiProvider) -> Vec<&'stati
         ApiProvider::Antigravity => Vec::new(),
         ApiProvider::Edenai => vec![DEFAULT_EDENAI_MODEL],
         ApiProvider::Zenmux => vec![DEFAULT_ZENMUX_MODEL],
+        ApiProvider::Csdn => vec![DEFAULT_CSDN_MODEL],
         ApiProvider::Concentrate => vec![DEFAULT_CONCENTRATE_MODEL],
         // Bootstrap rows only. The account's authenticated `GET /v1/models`
         // lists exactly the providers this customer connected and replaces
@@ -2136,9 +2145,13 @@ pub enum StatusItem {
     Tokens,
     /// Prepaid remaining credit, refreshed once per turn completion.
     Balance,
-    /// The metrics line's latency pair: `ttft NNNms` and `NN tok/s`, from
-    /// the same engine timings and provider usage `/status` prints in full.
+    /// Legacy configuration alias enabling both TTFT and output rate.
+    /// The picker expands it into independently editable readings.
     SessionMetrics,
+    /// Mean measured time from request dispatch to the first token.
+    Ttft,
+    /// Provider output tokens divided by measured request time.
+    OutputRate,
     /// Leaf directory of the session workspace, left-truncated when long.
     /// Opt-in (#6112); off the default footer.
     Workspace,
@@ -2162,7 +2175,8 @@ impl StatusItem {
             StatusItem::Cost,
             StatusItem::Cache,
             StatusItem::Tokens,
-            StatusItem::SessionMetrics,
+            StatusItem::Ttft,
+            StatusItem::OutputRate,
         ]
     }
 
@@ -2178,6 +2192,8 @@ impl StatusItem {
             StatusItem::Tokens => "tokens",
             StatusItem::Balance => "balance",
             StatusItem::SessionMetrics => "session_metrics",
+            StatusItem::Ttft => "ttft",
+            StatusItem::OutputRate => "output_rate",
             StatusItem::Workspace => "workspace",
             StatusItem::GitBranch => "git_branch",
         }
@@ -2201,6 +2217,8 @@ impl StatusItem {
             | "rate_limit" => None,
             "balance" => Some(Self::Balance),
             "session_metrics" => Some(Self::SessionMetrics),
+            "ttft" => Some(Self::Ttft),
+            "output_rate" => Some(Self::OutputRate),
             "workspace" => Some(Self::Workspace),
             // Revived in #6112 as an opt-in metrics-line chip; it parses
             // again, so a config written between its #5950 retirement and
@@ -2222,6 +2240,8 @@ impl StatusItem {
             StatusItem::Tokens => "Output tokens",
             StatusItem::Balance => "Account balance",
             StatusItem::SessionMetrics => "Session metrics",
+            StatusItem::Ttft => "Time to first token",
+            StatusItem::OutputRate => "Output rate",
             StatusItem::Workspace => "Workspace",
             StatusItem::GitBranch => "Git branch",
         }
@@ -2240,12 +2260,15 @@ impl StatusItem {
             StatusItem::Tokens => "output tokens of the live or last turn",
             StatusItem::Balance => "remaining prepaid credit from the active provider",
             StatusItem::SessionMetrics => "time to first token and output rate",
+            StatusItem::Ttft => "average wait for the first token",
+            StatusItem::OutputRate => "average tok/s, including first-token wait",
             StatusItem::Workspace => "directory this session writes to",
             StatusItem::GitBranch => "branch the next commit lands on",
         }
     }
 
-    /// Every variant in display order — used by the picker to enumerate rows.
+    /// Editable items in display order. Legacy combined metrics parse but
+    /// expand to the two individual controls instead of appearing twice.
     #[must_use]
     pub fn all() -> &'static [StatusItem] {
         &[
@@ -2256,7 +2279,8 @@ impl StatusItem {
             StatusItem::Balance,
             StatusItem::Cache,
             StatusItem::Tokens,
-            StatusItem::SessionMetrics,
+            StatusItem::Ttft,
+            StatusItem::OutputRate,
             StatusItem::Workspace,
             StatusItem::GitBranch,
         ]
@@ -2774,9 +2798,25 @@ impl TranscriptConfig {
     }
 }
 
+/// Process-only account auth transform. Shared by Config clones so logout and
+/// expiry affect future request resolution without rewriting provider config.
+/// Running turns retain their materialized client; immediate revocation of
+/// that credential remains the account service's responsibility.
+#[derive(Debug, Clone)]
+pub(crate) struct AccountModelAccess {
+    pub(crate) session_id: String,
+    pub(crate) credential: crate::credentials::Credential,
+    pub(crate) expires_at: i64,
+    pub(crate) profile: Option<String>,
+}
+
 /// Resolved CLI configuration, including defaults and environment overrides.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct Config {
+    /// Never deserialized from disk or exposed as provider configuration.
+    #[serde(skip)]
+    pub(crate) account_model_access:
+        std::sync::Arc<parking_lot::RwLock<Option<AccountModelAccess>>>,
     /// Persisted exact-route declarations, separate from provider credentials.
     #[serde(
         default,
@@ -3924,6 +3964,16 @@ pub struct ProvidersConfig {
     /// ZenMux — OpenAI-compatible AI gateway (aggregator).
     #[serde(default, alias = "zen-mux", alias = "zen_mux")]
     pub zenmux: ProviderConfig,
+    /// CSDN 星图 — OpenAI-compatible hosted platform and Coding Plan.
+    #[serde(
+        default,
+        alias = "csdn-ai",
+        alias = "csdn_ai",
+        alias = "csdn-coding-plan",
+        alias = "csdn_coding_plan",
+        alias = "starmap"
+    )]
+    pub csdn: ProviderConfig,
     /// Concentrate — OpenAI Responses-compatible AI gateway (aggregator).
     #[serde(
         default,
@@ -4046,8 +4096,12 @@ fn validate_model_context_windows(
 
 #[derive(Debug, Clone, Deserialize, Default)]
 struct ConfigFile {
+    /// Boxed so the parsed document never carries the multi-kilobyte
+    /// `Config` by value through `toml::de` and `apply_profile` frames. A
+    /// `#[tokio::test]` runs those frames on libtest's default 2 MiB stack,
+    /// which the by-value copies overflowed (#6362).
     #[serde(flatten)]
-    base: Config,
+    base: Box<Config>,
     profiles: Option<HashMap<String, Config>>,
 }
 
@@ -5823,6 +5877,7 @@ impl Config {
             ApiProvider::Telecomjs => &providers.telecomjs,
             ApiProvider::Edenai => &providers.edenai,
             ApiProvider::Zenmux => &providers.zenmux,
+            ApiProvider::Csdn => &providers.csdn,
             ApiProvider::Concentrate => &providers.concentrate,
             ApiProvider::Codewhale => &providers.codewhale,
             ApiProvider::ModelstudioTokenPlan => &providers.modelstudio_token_plan,
@@ -5926,6 +5981,7 @@ impl Config {
             ApiProvider::Telecomjs => &mut providers.telecomjs,
             ApiProvider::Edenai => &mut providers.edenai,
             ApiProvider::Zenmux => &mut providers.zenmux,
+            ApiProvider::Csdn => &mut providers.csdn,
             ApiProvider::Concentrate => &mut providers.concentrate,
             ApiProvider::Codewhale => &mut providers.codewhale,
             ApiProvider::ModelstudioTokenPlan => &mut providers.modelstudio_token_plan,
@@ -6401,6 +6457,7 @@ impl Config {
             ApiProvider::Telecomjs => DEFAULT_TELECOMJS_MODEL,
             ApiProvider::Edenai => DEFAULT_EDENAI_MODEL,
             ApiProvider::Zenmux => DEFAULT_ZENMUX_MODEL,
+            ApiProvider::Csdn => DEFAULT_CSDN_MODEL,
             ApiProvider::Concentrate => DEFAULT_CONCENTRATE_MODEL,
             ApiProvider::Codewhale => DEFAULT_CODEWHALE_MODEL,
             ApiProvider::ModelstudioTokenPlan
@@ -6528,6 +6585,7 @@ impl Config {
             | ApiProvider::Telecomjs
             | ApiProvider::Edenai
             | ApiProvider::Zenmux
+            | ApiProvider::Csdn
             | ApiProvider::Concentrate
             | ApiProvider::Codewhale
             | ApiProvider::ModelstudioTokenPlan
@@ -6642,6 +6700,7 @@ impl Config {
                         ApiProvider::Telecomjs => DEFAULT_TELECOMJS_BASE_URL,
                         ApiProvider::Edenai => DEFAULT_EDENAI_BASE_URL,
                         ApiProvider::Zenmux => DEFAULT_ZENMUX_BASE_URL,
+                        ApiProvider::Csdn => DEFAULT_CSDN_BASE_URL,
                         ApiProvider::Concentrate => DEFAULT_CONCENTRATE_BASE_URL,
                         ApiProvider::Codewhale => DEFAULT_CODEWHALE_BASE_URL,
                         ApiProvider::ModelstudioTokenPlan
@@ -6952,6 +7011,37 @@ impl Config {
                 && base_url_uses_local_host(&self.active_route_base_url()))
     }
 
+    pub(crate) fn account_model_api_key(&self, provider: ApiProvider) -> Option<String> {
+        // Exact endpoint binding, including path. A custom Codewhale route
+        // must never inherit the account's credential, even on the same host.
+        if provider != ApiProvider::Codewhale
+            || self.base_url_for_route(provider).trim_end_matches('/') != DEFAULT_CODEWHALE_BASE_URL
+            || auth_mode_disables_api_key(self.auth_mode_for_provider(provider).as_deref())
+            || self
+                .provider_config_for(provider)
+                .is_some_and(|entry| entry.auth.is_some() || entry.api_key_env.is_some())
+        {
+            return None;
+        }
+        let access = self.account_model_access.read().clone()?;
+        if access.expires_at <= chrono::Utc::now().timestamp() {
+            return None;
+        }
+        // Check the shared session again at use, so a late install cannot
+        // resurrect a session removed by another local process.
+        let secrets = codewhale_secrets::account::secure_account_session_secrets().ok()?;
+        let account = codewhale_secrets::account::AccountSessionStore::new(
+            secrets,
+            access.profile.as_deref(),
+            codewhale_secrets::account::DEFAULT_ACCOUNT_API_BASE,
+        )
+        .runtime_info_at(chrono::Utc::now())
+        .ok()?;
+        (account.state == codewhale_secrets::account::AccountSessionState::Authenticated
+            && account.session_id.as_deref() == Some(access.session_id.as_str()))
+        .then(|| access.credential.expose_secret().to_string())
+    }
+
     /// Read the API key.
     ///
     /// Precedence: **route-specific explicitly consented OAuth token → source-marked explicit CLI key →
@@ -7194,6 +7284,12 @@ impl Config {
             {
                 return Ok(value);
             }
+        }
+
+        // Account auth is a reversible fallback, never an overwrite of an
+        // environment, config-file, or durable provider credential.
+        if let Some(key) = self.account_model_api_key(provider) {
+            return Ok(key);
         }
 
         // The Codewhale API always authenticates. It is not a self-hosted
@@ -8555,6 +8651,7 @@ fn provider_env_base_url_override(provider: ApiProvider) -> Option<String> {
         ApiProvider::Telecomjs => &["TELECOMJS_BASE_URL"],
         ApiProvider::Edenai => &["EDENAI_BASE_URL"],
         ApiProvider::Zenmux => &["ZENMUX_BASE_URL"],
+        ApiProvider::Csdn => &["CSDN_BASE_URL"],
         ApiProvider::Concentrate => &["CONCENTRATE_BASE_URL"],
         ApiProvider::Codewhale => &["CODEWHALE_API_BASE"],
         ApiProvider::ModelstudioTokenPlan | ApiProvider::ModelstudioTokenPlanAnthropic => {
@@ -8955,6 +9052,13 @@ fn apply_env_overrides_unlocked(config: &mut Config, policy: ConfigEnvironmentPo
                     .zenmux
                     .base_url = Some(value);
             }
+            ApiProvider::Csdn => {
+                config
+                    .providers
+                    .get_or_insert_with(ProvidersConfig::default)
+                    .csdn
+                    .base_url = Some(value);
+            }
             ApiProvider::Concentrate => {
                 config
                     .providers
@@ -9246,6 +9350,16 @@ fn apply_env_overrides_unlocked(config: &mut Config, policy: ConfigEnvironmentPo
             .zenmux
             .base_url = Some(value);
     }
+    if matches!(config.api_provider(), ApiProvider::Csdn)
+        && let Ok(value) = std::env::var("CSDN_BASE_URL")
+        && !value.trim().is_empty()
+    {
+        config
+            .providers
+            .get_or_insert_with(ProvidersConfig::default)
+            .csdn
+            .base_url = Some(value);
+    }
     // Concentrate has no inline block here on purpose: CONCENTRATE_BASE_URL
     // is already served by `provider_env_base_url_override`, which the route
     // resolver consults — a second inline assignment was a duplicate.
@@ -9363,6 +9477,7 @@ fn apply_env_overrides_unlocked(config: &mut Config, policy: ConfigEnvironmentPo
                 ApiProvider::Telecomjs => &mut providers.telecomjs,
                 ApiProvider::Edenai => &mut providers.edenai,
                 ApiProvider::Zenmux => &mut providers.zenmux,
+                ApiProvider::Csdn => &mut providers.csdn,
                 ApiProvider::Concentrate => &mut providers.concentrate,
                 ApiProvider::Codewhale => &mut providers.codewhale,
                 ApiProvider::ModelstudioTokenPlan => &mut providers.modelstudio_token_plan,
@@ -9662,6 +9777,17 @@ fn apply_env_overrides_unlocked(config: &mut Config, policy: ConfigEnvironmentPo
             .providers
             .get_or_insert_with(ProvidersConfig::default)
             .zenmux
+            .model = Some(value);
+        config.environment_model_applied = true;
+    }
+    if matches!(config.api_provider(), ApiProvider::Csdn)
+        && let Ok(value) = std::env::var("CSDN_MODEL")
+        && !value.trim().is_empty()
+    {
+        config
+            .providers
+            .get_or_insert_with(ProvidersConfig::default)
+            .csdn
             .model = Some(value);
         config.environment_model_applied = true;
     }
@@ -10100,6 +10226,7 @@ pub(crate) fn provider_passes_model_through(provider: ApiProvider) -> bool {
             | ApiProvider::Telecomjs
             | ApiProvider::Edenai
             | ApiProvider::Zenmux
+            | ApiProvider::Csdn
             // Concentrate ids are gateway-owned (plain, `provider/model`, or the
             // gateway's own `auto`); the resolver strips only `concentrate/`.
             | ApiProvider::Concentrate
@@ -11010,7 +11137,7 @@ fn apply_profile(config: ConfigFile, profile: Option<&str>) -> Result<Config> {
         let profiles = config.profiles.as_ref();
         match profiles.and_then(|profiles| profiles.get(profile_name)) {
             Some(override_cfg) => {
-                let mut merged = merge_config(config.base, override_cfg.clone());
+                let mut merged = merge_config(*config.base, override_cfg.clone());
                 apply_layer_root_model(&mut merged, override_cfg);
                 Ok(merged)
             }
@@ -11030,7 +11157,7 @@ fn apply_profile(config: ConfigFile, profile: Option<&str>) -> Result<Config> {
             }
         }
     } else {
-        Ok(config.base)
+        Ok(*config.base)
     }
 }
 
@@ -11213,6 +11340,7 @@ fn merge_config(base: Config, override_cfg: Config) -> Config {
                 recorded => recorded,
             }
         },
+        account_model_access: base.account_model_access,
         runtime_chat_isolated: override_cfg.runtime_chat_isolated || base.runtime_chat_isolated,
         runtime_thread_inference_unrelated: override_cfg.runtime_thread_inference_unrelated
             || base.runtime_thread_inference_unrelated,
@@ -11384,6 +11512,7 @@ fn merge_providers(
             telecomjs: merge_provider_config(base.telecomjs, override_cfg.telecomjs),
             edenai: merge_provider_config(base.edenai, override_cfg.edenai),
             zenmux: merge_provider_config(base.zenmux, override_cfg.zenmux),
+            csdn: merge_provider_config(base.csdn, override_cfg.csdn),
             concentrate: merge_provider_config(base.concentrate, override_cfg.concentrate),
             codewhale: merge_provider_config(base.codewhale, override_cfg.codewhale),
             modelstudio_token_plan: merge_provider_config(
@@ -11416,7 +11545,7 @@ fn load_single_config_file(path: &Path) -> Result<Config> {
             codewhale_config::quote_os_path(path)
         )
     })?;
-    Ok(parsed.base)
+    Ok(*parsed.base)
 }
 
 /// Build a one-line warning when top-level-only keys are nested under a section

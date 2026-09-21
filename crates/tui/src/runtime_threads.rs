@@ -666,6 +666,13 @@ pub enum RuntimeTurnStatus {
     Canceled,
 }
 
+impl RuntimeTurnStatus {
+    /// Queued or in-progress — the statuses `GET /v1/threads/running` counts.
+    pub const fn is_active_work(self) -> bool {
+        matches!(self, Self::Queued | Self::InProgress)
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum TurnItemKind {
@@ -1734,7 +1741,11 @@ pub struct RuntimeThreadStore {
     thread_mutation: Arc<parking_lot::Mutex<()>>,
     /// Serializes load-modify-save operations on turn records. Like the
     /// thread guard, it is synchronous and never crosses an `.await`.
-    turn_mutation: Arc<parking_lot::Mutex<()>>,
+    /// Reentrant so [`Self::save_turn`] can take the guard while an outer
+    /// RMW transaction already holds it; every turn write goes through that
+    /// path so a store-side settle cannot be stomped by a concurrent monitor
+    /// save that loaded a stale in-flight copy.
+    turn_mutation: Arc<parking_lot::ReentrantMutex<()>>,
     /// Serializes envelope claim/state transitions. The durable envelope is
     /// the queue; this guard prevents concurrent replay/wake requests from
     /// starting more than one turn for the same message.
@@ -1794,7 +1805,7 @@ impl RuntimeThreadStore {
             state_path,
             event_lock_path,
             thread_mutation: Arc::new(parking_lot::Mutex::new(())),
-            turn_mutation: Arc::new(parking_lot::Mutex::new(())),
+            turn_mutation: Arc::new(parking_lot::ReentrantMutex::new(())),
             goal_mutation: Arc::new(parking_lot::Mutex::new(())),
             mail_mutation: Arc::new(parking_lot::Mutex::new(())),
             #[cfg(test)]
@@ -2211,6 +2222,10 @@ impl RuntimeThreadStore {
     }
 
     pub fn save_turn(&self, turn: &TurnRecord) -> Result<()> {
+        // Hold the turn mutation guard for every write — including callers that
+        // already hold it (reentrant) — so unlocked test/API settles cannot be
+        // overwritten by a monitor RMW that loaded an older in-flight snapshot.
+        let _turn_mutation = self.turn_mutation.lock();
         turn.validate_output_token_limit()?;
         validated_record_id(&turn.thread_id, "thread id")?;
         let path = self.turn_path(&turn.id)?;
@@ -2523,6 +2538,150 @@ impl RuntimeThreadStore {
             sort_turn_items_by_start(items);
         }
         Ok(out)
+    }
+
+    /// The newest agent/user message text in each requested turn, in one pass.
+    ///
+    /// [`Self::list_items_for_turns_map`] materializes every item of every
+    /// requested turn. The thread summary needs only the last user/agent
+    /// message per turn, and one page can span most of the store, so retaining
+    /// that whole projection for a page held every item it covered in memory
+    /// at once — a page's peak that grew with the page instead of with one
+    /// thread. This holds at most two message texts per requested turn — the
+    /// newest dated one and the last undated one read — and nothing else:
+    /// tool calls, results and artifacts are read and dropped, and an older
+    /// dated message is dropped the moment a newer one is read.
+    ///
+    /// The winner is the message [`sort_turn_items_by_start`] would place
+    /// last: that comparator reads only `started_at`, substitutes one "now"
+    /// for a missing timestamp once everything has been read, and is stable,
+    /// so the later-read message wins a tie. The choice between the dated
+    /// and the undated candidate is therefore made after the scan, against a
+    /// "now" taken then: a message persisted mid-scan with a timestamp later
+    /// than a "now" taken up front would otherwise outrank an undated one
+    /// the sort would have placed last.
+    ///
+    /// Known limitation: peak memory is still up to two texts per turn of
+    /// the page, untruncated, because the caller decides which turn's text
+    /// becomes the row's preview and how much of it to show.
+    pub fn newest_message_text_by_turn(
+        &self,
+        turn_ids: &[String],
+    ) -> Result<HashMap<String, String>> {
+        if turn_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        for turn_id in turn_ids {
+            validated_record_id(turn_id, "turn id")?;
+        }
+
+        let wanted: HashSet<&str> = turn_ids.iter().map(String::as_str).collect();
+        #[derive(Default)]
+        struct Candidates {
+            /// Newest `started_at` read so far; a later read wins a tie.
+            dated: Option<(DateTime<Utc>, String)>,
+            /// Last message read without a `started_at`.
+            undated: Option<String>,
+        }
+        let mut per_turn: HashMap<String, Candidates> = HashMap::new();
+        let items_dir = checked_existing_runtime_store_dir(&self.items_dir)?;
+        for entry in fs::read_dir(&items_dir)
+            .with_context(|| format!("Failed to read {}", items_dir.display()))?
+        {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().is_none_or(|ext| ext != "json") {
+                continue;
+            }
+            let item_id = path
+                .file_stem()
+                .map(|stem| stem.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let raw = read_store_file(&path).with_context(|| {
+                RuntimeStoreRecordFailure::new(
+                    RuntimeStoreOperation::Read,
+                    RuntimeStoreRecordKind::Item,
+                    &item_id,
+                    &path,
+                )
+            })?;
+            #[cfg(test)]
+            self.item_dir_files_read
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let item: TurnItemRecord = serde_json::from_str(&raw).with_context(|| {
+                RuntimeStoreRecordFailure::new(
+                    RuntimeStoreOperation::Parse,
+                    RuntimeStoreRecordKind::Item,
+                    &item_id,
+                    &path,
+                )
+            })?;
+            if item.schema_version > MAX_SUPPORTED_RUNTIME_SCHEMA_VERSION {
+                bail!(
+                    "Item schema v{} is newer than supported v{}",
+                    item.schema_version,
+                    MAX_SUPPORTED_RUNTIME_SCHEMA_VERSION
+                );
+            }
+            if !wanted.contains(item.turn_id.as_str()) {
+                continue;
+            }
+            if !matches!(
+                item.kind,
+                TurnItemKind::AgentMessage | TurnItemKind::UserMessage
+            ) {
+                continue;
+            }
+            if matches!(
+                item.schema_version,
+                IMAGE_RUNTIME_SCHEMA_VERSION | OUTPUT_LIMIT_RUNTIME_SCHEMA_VERSION
+            ) && item.kind == TurnItemKind::UserMessage
+            {
+                item.user_content()?;
+            }
+            let text = item.detail.unwrap_or(item.summary);
+            if text.trim().is_empty() {
+                continue;
+            }
+            let slot = per_turn.entry(item.turn_id).or_default();
+            match item.started_at {
+                Some(started_at) => {
+                    if slot
+                        .dated
+                        .as_ref()
+                        .is_none_or(|(held, _)| *held <= started_at)
+                    {
+                        slot.dated = Some((started_at, text));
+                    }
+                }
+                None => slot.undated = Some(text),
+            }
+        }
+
+        // The sort's stand-in for a missing timestamp, taken once the scan
+        // is over exactly as `sort_turn_items_by_start` takes it after
+        // collection: an undated message reads as newest unless a dated one
+        // is timestamped later than this instant.
+        let fallback = Utc::now();
+        Ok(per_turn
+            .into_iter()
+            .filter_map(|(turn_id, slot)| {
+                let text = match (slot.dated, slot.undated) {
+                    (Some((started_at, dated)), Some(undated)) => {
+                        if started_at > fallback {
+                            dated
+                        } else {
+                            undated
+                        }
+                    }
+                    (Some((_, dated)), None) => dated,
+                    (None, Some(undated)) => undated,
+                    (None, None) => return None,
+                };
+                Some((turn_id, text))
+            })
+            .collect())
     }
 
     pub async fn append_event(
@@ -3619,6 +3778,27 @@ pub struct RunningThread {
     pub active_turns: Vec<ActiveTurn>,
 }
 
+/// The per-row facts `GET /v1/threads/summary` cannot read off a
+/// [`ThreadRecord`], harvested for a whole page in one pass over the store.
+///
+/// Everything else a row needs (`title`, `model`, `mode`, `workspace`,
+/// `archived`, `updated_at`, `latest_turn_id`) already comes from the thread
+/// record the caller holds.
+#[derive(Debug, Clone)]
+pub struct ThreadListFacts {
+    /// Status of the thread's newest turn, `Debug`-lowercased for the wire.
+    pub latest_turn_status: Option<String>,
+    /// Newest turn's `input_summary`, verbatim. The row uses it only as the
+    /// title fallback for a thread that has no title of its own.
+    pub latest_turn_input_summary: Option<String>,
+    /// Text of the newest agent/user message in the newest turn that has one,
+    /// untruncated. `None` when the thread has no such message.
+    pub preview: Option<String>,
+    /// Pending approvals plus pending user-input requests, from live request
+    /// state rather than the store.
+    pub pending_attention_count: usize,
+}
+
 /// One watchable notice on a thread, projected from engine events so
 /// watch-only clients see what the TUI shows (#6180, codewhale-apps#573).
 /// `kind` is a [`codewhale_config::notifications::NotificationEvent`] name
@@ -4314,7 +4494,7 @@ struct RecoveredTurnReceipt {
 /// - the Runtime event-file transaction lock — serializes writes across processes.
 /// - `RuntimeThreadStore::thread_mutation` — synchronizes short, synchronous
 ///   thread-record load-modify-save transactions and never crosses `.await`.
-/// - `RuntimeThreadStore::turn_mutation` — does the same for turn records.
+/// - `RuntimeThreadStore::turn_mutation` — reentrant guard for turn records; `save_turn` always acquires it.
 /// - `RuntimeThreadStore::goal_mutation` — serializes goal controls and progress;
 ///   acquired after `active` and before `thread_mutation` at turn admission.
 /// - `RuntimeThreadManager::active` — protects the set of loaded engine handles.
@@ -5754,7 +5934,7 @@ impl RuntimeThreadManager {
         })
     }
 
-    async fn remember_thread_auto_approve(&self, thread_id: &str) {
+    fn remember_thread_auto_approve(&self, thread_id: &str, engine: &EngineHandle) {
         let thread = {
             let _thread_mutation = self.store.thread_mutation.lock();
             let Ok(mut thread) = self.store.load_thread(thread_id) else {
@@ -5776,29 +5956,20 @@ impl RuntimeThreadManager {
             thread
         };
 
-        let engine = {
-            let active = self.active.lock().await;
-            active
-                .engines
-                .get(thread_id)
-                .map(|state| state.engine.clone())
-        };
-        if let Some(engine) = engine {
-            let configured_sandbox_mode = self.read_config().sandbox_mode.clone();
-            let policy = RuntimePolicyProjection::from_persisted(
-                &thread.mode,
-                thread.permission_posture.as_deref(),
-                thread.auto_approve,
-            );
-            let _ = engine.try_send(Op::ChangeMode {
-                mode: policy.mode,
-                allow_shell: thread.allow_shell,
-                trust_mode: thread.trust_mode,
-                auto_approve: policy.auto_approve(),
-                approval_mode: policy.permission,
-                configured_sandbox_mode,
-            });
-        }
+        let configured_sandbox_mode = self.read_config().sandbox_mode.clone();
+        let policy = RuntimePolicyProjection::from_persisted(
+            &thread.mode,
+            thread.permission_posture.as_deref(),
+            thread.auto_approve,
+        );
+        let _ = engine.try_send(Op::ChangeMode {
+            mode: policy.mode,
+            allow_shell: thread.allow_shell,
+            trust_mode: thread.trust_mode,
+            auto_approve: policy.auto_approve(),
+            approval_mode: policy.permission,
+            configured_sandbox_mode,
+        });
     }
 
     #[must_use]
@@ -5977,6 +6148,7 @@ impl RuntimeThreadManager {
             false,
         )
         .await
+        .map(|(turn, _replayed)| turn)
     }
 
     /// Terminal goal settlement for one finished turn.
@@ -6500,7 +6672,7 @@ impl RuntimeThreadManager {
             .await;
 
         match turn_result {
-            Ok(turn) => {
+            Ok((turn, _replayed)) => {
                 let delivered = {
                     let _mail_mutation = self.store.mail_mutation.lock();
                     let mut envelope = self.store.load_agent_mail(message_id)?;
@@ -7256,10 +7428,7 @@ impl RuntimeThreadManager {
         let mut active_by_thread: std::collections::BTreeMap<String, Vec<ActiveTurn>> =
             std::collections::BTreeMap::new();
         for turn in self.store.list_all_turns()? {
-            if matches!(
-                turn.status,
-                RuntimeTurnStatus::Queued | RuntimeTurnStatus::InProgress
-            ) {
+            if turn.status.is_active_work() {
                 active_by_thread
                     .entry(turn.thread_id.clone())
                     .or_default()
@@ -7284,6 +7453,113 @@ impl RuntimeThreadManager {
             }
         }
         Ok(out)
+    }
+
+    /// Flush queued recovery receipts for every thread on a page.
+    ///
+    /// [`Self::get_thread_detail`] flushes per thread, and the summary route
+    /// reached it row by row, so a listing used to settle every recovered turn
+    /// it displayed: the flush cancels that turn's pending user inputs and its
+    /// unresolvable dynamic tools, and publishes the `turn.completed` a crashed
+    /// turn is missing. `pending_attention_count` reads exactly that pending
+    /// state, so dropping the flush would leave a page reporting attention for
+    /// turns that are already over until somebody opened the thread. Now that
+    /// rows no longer go through detail, doing it here keeps what the route
+    /// publishes. A thread with nothing queued costs one lock and a map lookup
+    /// — only startup recovery queues receipts — and the flush has to precede
+    /// the scan, because it changes what the scan then reports.
+    pub async fn flush_recovery_receipts(&self, thread_ids: &[String]) -> Result<()> {
+        for thread_id in thread_ids {
+            self.flush_recovery_receipts_for_thread(thread_id).await?;
+        }
+        Ok(())
+    }
+
+    /// The [`ThreadListFacts`] for every id in `thread_ids`, read in one pass.
+    ///
+    /// `GET /v1/threads/summary` used to call [`Self::get_thread_detail`] once
+    /// per row. Detail is a whole-store walk — `list_turns_for_thread` scans
+    /// every turn record and `list_items_for_turns_map` scans every item record,
+    /// because item filenames carry only the item id —
+    /// so a listing of `T` threads cost `T x (N + M)` JSON reads and parses:
+    /// ~25s for 72 threads against a 189MB store, measured 2026-09-17, which is
+    /// the cheap end of the store growing. This harvests the same facts with one
+    /// turns scan and one items scan, so the cost is `T + N + M`.
+    ///
+    /// This is a best-effort snapshot, and deliberately cheaper than detail in
+    /// three ways: it takes no per-thread projection lock, and it does not flush
+    /// recovery receipts or read the event cursor. A listing may therefore lag a
+    /// turn that is mid-flight. That is the right trade for a list — the
+    /// alternative is what made the call seconds-per-thread — and
+    /// `pending_attention_count` still comes from live in-memory state, so
+    /// attention grouping stays immediate. Callers wanting a consistent
+    /// projection of one thread still want [`Self::get_thread_detail`].
+    pub async fn thread_list_facts(
+        &self,
+        thread_ids: &[String],
+    ) -> Result<HashMap<String, ThreadListFacts>> {
+        if thread_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let wanted: HashSet<String> = thread_ids.iter().cloned().collect();
+
+        let store = self.store.clone();
+        let scanned = wanted.clone();
+        let (turns_by_thread, preview_by_turn) = tokio::task::spawn_blocking(move || {
+            // One turns scan, grouped by thread. `list_all_turns` sorts by
+            // `created_at`, so each group keeps ascending turn order and a
+            // group's last element is the newest turn — the same turn a
+            // per-thread detail read would have called `turns.last()`.
+            let mut turns_by_thread: HashMap<String, Vec<TurnRecord>> = HashMap::new();
+            for turn in store.list_all_turns()? {
+                if scanned.contains(&turn.thread_id) {
+                    turns_by_thread
+                        .entry(turn.thread_id.clone())
+                        .or_default()
+                        .push(turn);
+                }
+            }
+            // One items scan covering every turn of those threads, keeping
+            // only the message text that could be a row's preview.
+            let turn_ids: Vec<String> = turns_by_thread
+                .values()
+                .flatten()
+                .map(|turn| turn.id.clone())
+                .collect();
+            let preview_by_turn = store.newest_message_text_by_turn(&turn_ids)?;
+            Ok::<_, anyhow::Error>((turns_by_thread, preview_by_turn))
+        })
+        .await
+        .context("Runtime thread list scan task failed")??;
+
+        let mut facts = HashMap::with_capacity(wanted.len());
+        for thread_id in &wanted {
+            let turns = turns_by_thread.get(thread_id);
+            let latest_turn = turns.and_then(|turns| turns.last());
+            // Newest turn first: the scan already picked the newest message
+            // within each turn, so the first turn holding one is the message a
+            // per-thread detail read would have found.
+            let preview = turns
+                .into_iter()
+                .flatten()
+                .rev()
+                .find_map(|turn| preview_by_turn.get(&turn.id).cloned());
+            let (pending_approvals, pending_user_inputs) =
+                self.pending_requests_for_thread(thread_id);
+            facts.insert(
+                thread_id.clone(),
+                ThreadListFacts {
+                    latest_turn_status: latest_turn
+                        .map(|turn| format!("{:?}", turn.status).to_ascii_lowercase()),
+                    latest_turn_input_summary: latest_turn.map(|turn| turn.input_summary.clone()),
+                    preview,
+                    pending_attention_count: pending_approvals
+                        .len()
+                        .saturating_add(pending_user_inputs.len()),
+                },
+            );
+        }
+        Ok(facts)
     }
 
     /// Raise a watchable notice on a thread (#6180). Kind names must stay in
@@ -7569,7 +7845,23 @@ impl RuntimeThreadManager {
             .with_context(|| format!("Thread not found: {id}"))
     }
 
-    pub async fn update_thread(&self, id: &str, req: UpdateThreadRequest) -> Result<ThreadRecord> {
+    // Unit fixtures without a runtime source use the ordinary default source.
+    // Production callers must pass the source actually loaded by their host.
+    #[cfg(test)]
+    async fn update_thread(&self, id: &str, req: UpdateThreadRequest) -> Result<ThreadRecord> {
+        self.update_thread_with_shell_policy(id, req, None, None)
+            .await
+    }
+
+    pub(crate) async fn update_thread_with_shell_policy(
+        &self,
+        id: &str,
+        req: UpdateThreadRequest,
+        config_path: Option<&Path>,
+        config_profile: Option<&str>,
+    ) -> Result<ThreadRecord> {
+        // Keep policy publication ordered with this authorization decision.
+        let _config_admission = self.config_admission.read().await;
         if req.archived.is_none()
             && req.allow_shell.is_none()
             && req.trust_mode.is_none()
@@ -7605,6 +7897,21 @@ impl RuntimeThreadManager {
             bail!("workspace must not be empty");
         }
 
+        // Source resolution reads config files. Do it off the Tokio worker,
+        // then recheck the conversation identity before committing the grant.
+        let shell_policy_workspace = if req.allow_shell == Some(true) || req.workspace.is_some() {
+            let current = self.get_thread(id).await?;
+            if req.allow_shell.unwrap_or(current.allow_shell) {
+                let workspace = req.workspace.clone().unwrap_or(current.workspace);
+                self.validate_shell_access_policy(&workspace, config_path, config_profile)
+                    .await?;
+                Some(workspace)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         let configured_sandbox_mode = self.read_config().sandbox_mode.clone();
         let (thread, changes, evicted_engine, posture_engine) = {
             // Take the active guard first so a workspace mutation can check
@@ -7616,6 +7923,29 @@ impl RuntimeThreadManager {
                 .store
                 .load_thread(id)
                 .with_context(|| format!("Thread not found: {id}"))?;
+            // Shell opt-in broadens only an idle conversation. Check while
+            // holding the same active + record locks used by turn admission.
+            if req.allow_shell == Some(true)
+                && !thread.allow_shell
+                && active
+                    .engines
+                    .get(id)
+                    .and_then(|state| state.active_turn.as_ref())
+                    .is_some()
+            {
+                bail!(
+                    "thread '{id}' already has an active turn; finish it before enabling shell commands"
+                );
+            }
+            if req.allow_shell.unwrap_or(thread.allow_shell)
+                && (req.allow_shell.is_some() || req.workspace.is_some())
+                && shell_policy_workspace.as_deref()
+                    != Some(req.workspace.as_deref().unwrap_or(&thread.workspace))
+            {
+                bail!(
+                    "thread permissions changed during update; refresh the conversation before trying again"
+                );
+            }
             let mut changes = serde_json::Map::new();
             let policy_patch = if req.mode.is_some()
                 || req.permission_posture.is_some()
@@ -9376,6 +9706,22 @@ impl RuntimeThreadManager {
         self.start_turn_inner(thread_id, req, None).await
     }
 
+    /// Start a turn and report whether the durable `operation_key` made it a
+    /// replay of an already-accepted submission.
+    ///
+    /// The distinction belongs to admission, not to the route: a client that
+    /// retried an ambiguous submit needs to be told "this is the turn you
+    /// already started" so it does not render a duplicate, and only the
+    /// admission path knows that for certain.
+    pub async fn start_turn_reporting_replay(
+        &self,
+        thread_id: &str,
+        req: StartTurnRequest,
+    ) -> Result<(TurnRecord, bool)> {
+        self.start_turn_inner_reporting_replay(thread_id, req, None)
+            .await
+    }
+
     pub(crate) async fn start_turn_with_reserved_id(
         &self,
         thread_id: &str,
@@ -9398,6 +9744,17 @@ impl RuntimeThreadManager {
         req: StartTurnRequest,
         reserved_turn_id: Option<&str>,
     ) -> Result<TurnRecord> {
+        self.start_turn_inner_reporting_replay(thread_id, req, reserved_turn_id)
+            .await
+            .map(|(turn, _replayed)| turn)
+    }
+
+    async fn start_turn_inner_reporting_replay(
+        &self,
+        thread_id: &str,
+        req: StartTurnRequest,
+        reserved_turn_id: Option<&str>,
+    ) -> Result<(TurnRecord, bool)> {
         if reserved_turn_id.is_some() && req.operation_key.is_none() {
             bail!("a reserved turn id requires an operation key");
         }
@@ -9427,8 +9784,11 @@ impl RuntimeThreadManager {
             true,
         )
         .await
+        .map(|(turn, _replayed)| turn)
     }
 
+    /// Returns the turn and whether the durable operation key made this a
+    /// replay of an already-accepted submission rather than a new admission.
     async fn start_turn_with_source(
         &self,
         thread_id: &str,
@@ -9436,7 +9796,7 @@ impl RuntimeThreadManager {
         input_source: RuntimeTurnInputSource,
         reserved_turn_id: Option<&str>,
         stored_image_bytes: bool,
-    ) -> Result<TurnRecord> {
+    ) -> Result<(TurnRecord, bool)> {
         // Heap-allocate the turn-start state machine. Its future holds two full
         // Config clones plus ThreadRecord/EngineHandle/TurnRecord/TurnItemRecord
         // and the Op::SendMessage, and inlines the large ensure_engine_loaded
@@ -9548,7 +9908,7 @@ impl RuntimeThreadManager {
         if let Some(operation) = operation.as_ref()
             && let Some(original_turn) = self.replay_turn_for_operation(operation)?
         {
-            return Ok(original_turn);
+            return Ok((original_turn, true));
         }
         if !image_blocks.is_empty() || req.max_output_tokens.is_some() {
             let identity = self.provider_identity_for_thread(&cfg_snapshot, &thread)?;
@@ -9870,7 +10230,7 @@ impl RuntimeThreadManager {
             if let Some(operation) = operation.as_ref()
                 && let Some(original_turn) = self.replay_turn_for_operation(operation)?
             {
-                return Ok(original_turn);
+                return Ok((original_turn, true));
             }
             let Some(state) = active.engines.get_mut(thread_id) else {
                 bail!("Thread engine not loaded");
@@ -9963,10 +10323,11 @@ impl RuntimeThreadManager {
             )
         };
 
-        acceptance_rx
+        let turn = acceptance_rx
             .await
             .map_err(|_| anyhow!("Turn lifecycle task ended before acknowledgement"))?
-            .map_err(anyhow::Error::msg)
+            .map_err(anyhow::Error::msg)?;
+        Ok((turn, false))
         })
         .await
     }
@@ -9984,6 +10345,13 @@ impl RuntimeThreadManager {
                 bail!("Turn {turn_id} is not active on thread {thread_id}");
             }
             active_turn.interrupt_requested = true;
+            // Wake the monitor's approval wait so it can consume the Engine's
+            // terminal receipt. Revoke only this turn's minted capabilities.
+            // Registration takes the same active lock, so a late event cannot
+            // install a new waiter after this sweep.
+            self.pending_approvals.lock().retain(|_, entry| {
+                entry.thread_id != thread_id || entry.request.turn_id != turn_id
+            });
             if let Some(compaction_id) = active_turn.compaction_id.as_deref() {
                 active_thread.engine.cancel_compaction(compaction_id)?;
             } else {
@@ -10810,6 +11178,49 @@ impl RuntimeThreadManager {
             .collect()
     }
 
+    /// A thread opt-in cannot override an externally controlled denial.
+    /// Root config is the user's default, so an explicit conversation opt-in
+    /// may override it. ProjectConfig is returned only for an explicit local
+    /// false, even when the host's merged Config was loaded in another folder.
+    /// Other external values come from loaded Config: this does not reload
+    /// changed files or revoke already-running shell jobs.
+    pub(crate) async fn validate_shell_access_policy(
+        &self,
+        workspace: &Path,
+        config_path: Option<&Path>,
+        config_profile: Option<&str>,
+    ) -> Result<()> {
+        use crate::config::ShellAccessControl;
+        let config = self.read_config().clone();
+        let workspace = workspace.to_path_buf();
+        let config_path = config_path.map(Path::to_path_buf);
+        let config_profile = config_profile.map(str::to_owned);
+        #[cfg(test)]
+        let env_ticket = crate::test_support::env_scope_ticket();
+        tokio::task::spawn_blocking(move || {
+            #[cfg(test)]
+            let _membership = crate::test_support::join_env_scope(env_ticket);
+            let control = config.allow_shell_control(
+                config_path.as_deref(),
+                config_profile.as_deref(),
+                &workspace,
+            );
+            let denied = match control {
+                ShellAccessControl::Unset | ShellAccessControl::RootConfig => false,
+                ShellAccessControl::ProjectConfig | ShellAccessControl::Ambiguous => true,
+                ShellAccessControl::Profile
+                | ShellAccessControl::Environment
+                | ShellAccessControl::ManagedConfig => !config.allow_shell(),
+            };
+            if denied {
+                bail!("shell commands are restricted by {}", control.label());
+            }
+            Ok(())
+        })
+        .await
+        .context("shell policy inspection worker failed")?
+    }
+
     /// The sandbox policy an API-created job inherits — the same posture
     /// projection a turn applies to its shell calls, so a client terminal
     /// cannot run looser than the thread's own tools would.
@@ -11227,6 +11638,8 @@ impl RuntimeThreadManager {
                     {
                         let _turn_mutation = self.store.turn_mutation.lock();
                         let mut turn = self.store.load_turn(&turn_id)?;
+                        // Load-under-lock sees any concurrent terminal settle;
+                        // field updates below preserve that status.
                         turn.started_at = Some(created_at);
                         // A lifecycle start carries no billing envelope, so
                         // there is nothing to persist yet. The dispatch event
@@ -11258,6 +11671,8 @@ impl RuntimeThreadManager {
                     {
                         let _turn_mutation = self.store.turn_mutation.lock();
                         let mut turn = self.store.load_turn(&turn_id)?;
+                        // Preserve whatever status the store already has (including
+                        // a concurrent terminal settle); only refresh route fields.
                         if let Some(envelope) = route.cost_envelope() {
                             turn.persist_effective_route(&envelope);
                         }
@@ -11617,7 +12032,7 @@ impl RuntimeThreadManager {
                         status: TurnItemLifecycleStatus::InProgress,
                         summary: summarize_text(&message, SUMMARY_LIMIT),
                         detail: Some(message.clone()),
-                        metadata: None,
+                        metadata: Some(json!({ "compaction_id": id })),
                         artifact_refs: Vec::new(),
                         started_at: Some(Utc::now()),
                         ended_at: None,
@@ -12021,8 +12436,23 @@ impl RuntimeThreadManager {
                     // subscribes from an older cursor that will replay it.
                     let projection_lock = self.projection_lock(&thread_id);
                     let projection = projection_lock.lock().await;
-                    let (approval_id, rx) =
-                        self.register_pending_approval(&thread_id, pending_request);
+                    let registration = {
+                        let active = self.active.lock().await;
+                        let accepting = active
+                            .engines
+                            .get(&thread_id)
+                            .and_then(|state| state.active_turn.as_ref())
+                            .is_some_and(|turn| {
+                                turn.turn_id == turn_id && !turn.interrupt_requested
+                            });
+                        accepting
+                            .then(|| self.register_pending_approval(&thread_id, pending_request))
+                    };
+                    let Some((approval_id, rx)) = registration else {
+                        drop(projection);
+                        let _ = engine.deny_tool_call(&id).await;
+                        continue;
+                    };
                     if let Err(err) = self
                         .emit_event(
                             &thread_id,
@@ -12051,11 +12481,51 @@ impl RuntimeThreadManager {
                         Some(wait) => tokio::time::timeout(wait, rx).await,
                         None => Ok(rx.await),
                     };
+                    // A decision may already have consumed the sender when
+                    // Stop wins. Never remember or dispatch that late allow.
+                    let cancelled = {
+                        let active = self.active.lock().await;
+                        let accepting = active
+                            .engines
+                            .get(&thread_id)
+                            .and_then(|state| state.active_turn.as_ref())
+                            .is_some_and(|turn| {
+                                turn.turn_id == turn_id && !turn.interrupt_requested
+                            });
+                        if accepting
+                            && matches!(
+                                decision,
+                                Ok(Ok(ExternalApprovalDecision::Allow { remember: true }))
+                            )
+                        {
+                            // Keep Stop excluded until its competing permission
+                            // change has committed to the same active turn.
+                            self.remember_thread_auto_approve(&thread_id, &engine);
+                        }
+                        !accepting
+                    };
+                    if cancelled {
+                        self.cancel_pending_approval(&approval_id);
+                        self.emit_event(
+                            &thread_id,
+                            Some(&turn_id),
+                            None,
+                            "approval.decided",
+                            json!({
+                                "approval_id": approval_id,
+                                "tool_call_id": id,
+                                "decision": "deny",
+                                "remember": false,
+                                "cancelled": true,
+                            }),
+                        )
+                        .await
+                        .ok();
+                        let _ = engine.deny_tool_call(id).await;
+                        continue;
+                    }
                     match decision {
                         Ok(Ok(ExternalApprovalDecision::Allow { remember })) => {
-                            if remember {
-                                self.remember_thread_auto_approve(&thread_id).await;
-                            }
                             self.emit_event(
                                 &thread_id,
                                 Some(&turn_id),
@@ -12322,12 +12792,27 @@ impl RuntimeThreadManager {
                     .await?;
                 }
                 EngineEvent::ToolRequestSnapshot { snapshot } => {
-                    if let (Some(terminal), Some(engine_turn_id)) =
-                        (snapshot.terminal.as_ref(), engine_turn_id.as_deref())
-                        && !snapshot.turn_id.truncated
-                        && snapshot.turn_id.value == engine_turn_id
+                    if !snapshot.turn_id.truncated
+                        && engine_turn_id.as_deref() == Some(snapshot.turn_id.value.as_str())
                     {
-                        turn_model_request_diagnostics = Some(terminal.into());
+                        if let Some(terminal) = snapshot.terminal.as_ref() {
+                            turn_model_request_diagnostics = Some(terminal.into());
+                        }
+                        // Keep the existing bounded request projection in the
+                        // originating task's durable event stream. It describes
+                        // prepared tools, never proves provider delivery, and
+                        // does not add conversation input or transcript noise.
+                        let snapshot = codewhale_config::persistence::redact_json_secrets(
+                            &serde_json::to_value(snapshot)?,
+                        );
+                        self.emit_event(
+                            &thread_id,
+                            Some(&turn_id),
+                            None,
+                            "model.tools.snapshot",
+                            json!({ "snapshot": snapshot, "projection_redacted": true }),
+                        )
+                        .await?;
                     }
                 }
                 EngineEvent::TurnComplete {
@@ -12593,7 +13078,8 @@ impl RuntimeThreadManager {
     fn attach_item_to_turn(&self, turn_id: &str, item_id: &str) -> Result<()> {
         let _turn_mutation = self.store.turn_mutation.lock();
         let mut turn = self.store.load_turn(turn_id)?;
-        if !turn.item_ids.iter().any(|id| id == item_id) {
+        // A terminal settle must not be rewritten by a late stream item attach.
+        if turn.status.is_active_work() && !turn.item_ids.iter().any(|id| id == item_id) {
             turn.item_ids.push(item_id.to_string());
             self.store.save_turn(&turn)?;
         }
@@ -12620,7 +13106,7 @@ impl RuntimeThreadManager {
         let active = self.active.lock().await;
         let state = active.engines.get(thread_id)?;
         let turn = state.active_turn.as_ref()?;
-        if turn.turn_id != turn_id {
+        if turn.turn_id != turn_id || turn.interrupt_requested {
             return None;
         }
         Some(engine.runtime_permission_authority())

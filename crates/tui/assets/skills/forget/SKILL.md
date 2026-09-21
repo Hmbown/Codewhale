@@ -1,26 +1,24 @@
 ---
 name: forget
-description: Propose forgetting stored facts; the user confirms in Context Lens. Use when: forget, don't remember that, delete a memory, drop that fact, or stop knowing something.
+description: Help the user remove a stored fact using Codewhale's Context Lens when they ask to forget or delete a memory.
 invocation: model+user
 ---
 
 # Forget
 
-## When to use
-The user wants something removed from what Codewhale remembers about them.
+Forgetting belongs to the user's Context Lens controls. The `remember` tool
+supports append and revise candidates only; it cannot submit a deletion.
+Do not invent a removal proposal or claim one is pending.
 
-## Setup
-None. Forgetting is a review operation: the model proposes, the user
-confirms in Context Lens. There is no silent-delete path, by design.
+1. Identify the fact the user wants removed, quoting stored text only when it
+   is actually available. Do not claim a fact exists merely because it was
+   mentioned in the conversation.
+2. Direct the user to select that fact in Context Lens and use its forget
+   action. If the host has no Context Lens, say that this action is unavailable
+   there; do not substitute direct edits to memory files or a fake tool call.
+3. State that nothing has been deleted until the control reports completion.
+   Verify removal when the host exposes that evidence; otherwise attribute the
+   confirmation to the user.
 
-## Workflow
-1. Identify the fact(s) in scope — quote what you believe is stored.
-2. Propose removal through the memory capture path as a correction/removal
-   proposal for Context Lens review.
-3. Tell the user the proposal is pending their confirmation in Context Lens.
-4. After confirmation, verify the fact is gone and say plainly what was forgotten.
-
-## Non-goals
-- Do not delete or overwrite stored memory directly. Ever.
-- Do not "forget" by just not mentioning something — unconfirmed forgetting is lying.
-- Do not forget session facts the current task still depends on without saying so.
+Do not overwrite memory with an empty or contradictory note to simulate deletion.
+Removing stored memory does not erase the existing conversation or its history.

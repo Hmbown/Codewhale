@@ -49,8 +49,18 @@ test("pointer, clipboard, recording and computer expand with their requirements 
   assert.deepEqual(resolveTool("computer", { action: "list" }), { name: "computer_list", args: {} });
   assert.deepEqual(resolveTool("computer", { action: "switch", id: "mac2" }), { name: "computer_switch", args: { computer: "mac2" } });
   assert.deepEqual(resolveTool("computer", { action: "register", id: "box", transport: "ssh", host: "h" }), { name: "computer_register", args: { transport: "ssh", host: "h", computer: "box" } });
+  assert.deepEqual(resolveTool("computer", { action: "spawn", id: "task-x", transport: "docker" }), { name: "computer_spawn", args: { transport: "docker", computer: "task-x" } });
   assert.throws(() => resolveTool("computer", { action: "switch" }), /requires id/);
-  assert.throws(() => resolveTool("computer", { action: "reset" }), /list, switch, register or remove/);
+  assert.throws(() => resolveTool("computer", { action: "reset" }), /list, switch, register, spawn or remove/);
+});
+
+test("consent expands by action; app identity or foreground scope required", () => {
+  assert.deepEqual(resolveTool("consent", { action: "status" }), { name: "consent_status", args: { computer: undefined } });
+  assert.deepEqual(resolveTool("consent", { action: "allow", app: "Safari", remember: true }), { name: "consent_allow", args: { app: "Safari", remember: true } });
+  assert.deepEqual(resolveTool("consent", { action: "deny", scope: "foreground" }), { name: "consent_deny", args: { scope: "foreground" } });
+  assert.deepEqual(resolveTool("consent", { action: "revoke", bundle_id: "com.apple.Safari" }), { name: "consent_revoke", args: { bundle_id: "com.apple.Safari" } });
+  assert.throws(() => resolveTool("consent", { action: "allow" }), /needs an app/);
+  assert.throws(() => resolveTool("consent", { action: "ponder" }), /status, allow, deny or revoke/);
 });
 
 test("key with duration routes to hold semantics; conflicts are bad_args", () => {
@@ -92,14 +102,15 @@ test("browser actions expand to their wire tools; misuse fails as bad_args namin
 test("the advertised list is the merged surface; aliases are not listed", () => {
   const advertised = TOOLS.filter((t) => t.hidden !== true).map((t) => t.name);
   const hidden = TOOLS.filter((t) => t.hidden === true).map((t) => t.name);
-  assert.equal(advertised.length, 36, `advertised surface is ${advertised.length}`);
-  assert.equal(hidden.length, 30, `hidden aliases are ${hidden.length}`);
-  for (const merged of ["click", "pointer", "clipboard", "recording", "computer", "browser", "trajectory"]) assert.ok(advertised.includes(merged), merged);
+  assert.equal(advertised.length, 38, `advertised surface is ${advertised.length}`);
+  assert.equal(hidden.length, 35, `hidden aliases are ${hidden.length}`);
+  for (const merged of ["click", "pointer", "clipboard", "recording", "computer", "browser", "trajectory", "consent"]) assert.ok(advertised.includes(merged), merged);
   for (const straight of ["list_sessions", "kill_app", "set_window_frame"]) assert.ok(advertised.includes(straight), straight);
   for (const gone of ["left_click", "double_click", "triple_click", "right_click", "middle_click", "mouse_move",
     "left_mouse_down", "left_mouse_up", "read_clipboard", "write_clipboard",
     "recording_start", "recording_stop", "recording_status", "recording_list",
-    "computer_list", "computer_switch", "computer_register", "computer_remove", "hold_key",
+    "computer_list", "computer_switch", "computer_register", "computer_spawn", "computer_remove", "hold_key",
+    "consent_status", "consent_allow", "consent_deny", "consent_revoke",
     "browser_start", "browser_status", "browser_navigate", "browser_click", "browser_type", "browser_screenshot", "browser_stop",
     "trajectory_start", "trajectory_stop", "trajectory_status", "trajectory_replay"]) {
     assert.ok(!advertised.includes(gone), `${gone} must not be advertised`);
@@ -153,10 +164,10 @@ after(() => { try { server.stdin.end(); } catch {} server?.kill("SIGTERM"); });
 test("tools/list serves exactly the advertised union, validated shapes included", async () => {
   const res = await rpc("tools/list", {});
   const names = res.result.tools.map((t) => t.name);
-  assert.equal(names.length, 36);
-  assert.ok(names.includes("click") && names.includes("pointer") && names.includes("clipboard") && names.includes("recording") && names.includes("computer"));
+  assert.equal(names.length, 38);
+  assert.ok(names.includes("click") && names.includes("pointer") && names.includes("clipboard") && names.includes("recording") && names.includes("computer") && names.includes("consent"));
   assert.ok(names.includes("list_sessions") && names.includes("kill_app") && names.includes("browser") && names.includes("set_window_frame") && names.includes("trajectory"));
-  assert.ok(!names.includes("left_click") && !names.includes("hold_key") && !names.includes("read_clipboard"));
+  assert.ok(!names.includes("left_click") && !names.includes("hold_key") && !names.includes("read_clipboard") && !names.includes("consent_allow"));
 });
 
 test("a merged call and its wire alias route to the same place (no dispatch without a raster)", async () => {

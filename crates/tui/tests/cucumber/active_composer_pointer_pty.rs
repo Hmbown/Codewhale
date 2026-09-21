@@ -1,4 +1,4 @@
-//! Real-PTY regression for the active composer's painted `[↑]` submit
+//! Real-PTY regression for the active composer's painted `[↵]` submit
 //! affordance (#5773, TUI-UX-01 active-work half).
 //!
 //! The session is driven through the real onboarding flow into deterministic
@@ -167,9 +167,9 @@ fn run_pointer_submit_case(rows: u16, cols: u16) {
     std::thread::sleep(Duration::from_millis(200));
 
     tui.pump();
-    let (send_row, send_col) = tui.frame().find_text("[↑]").unwrap_or_else(|| {
+    let (send_row, send_col) = tui.frame().find_text("[↵]").unwrap_or_else(|| {
         panic!(
-            "{size}: [↑] submit affordance not painted\n{}",
+            "{size}: [↵] submit affordance not painted\n{}",
             tui.diagnostics()
         )
     });
@@ -185,14 +185,14 @@ fn run_pointer_submit_case(rows: u16, cols: u16) {
         tui.diagnostics()
     );
 
-    // Click the middle cell of the three-cell `[↑]` affordance: SGR down,
+    // Click the middle cell of the three-cell `[↵]` affordance: SGR down,
     // settle, SGR up — the sequence a real terminal sends for one click.
     tui.send(keys::mouse::down(send_row, send_col + 1))
-        .expect("SGR mouse down on [↑]");
+        .expect("SGR mouse down on [↵]");
     tui.wait_for_idle(Duration::from_millis(150), Duration::from_secs(2))
         .expect("down settles");
     tui.send(keys::mouse::up(send_row, send_col + 1))
-        .expect("SGR mouse up on [↑]");
+        .expect("SGR mouse up on [↵]");
 
     // Distinguishing assertion: a real submit — the pointer click or keyboard
     // Enter alike — consumes the draft into the deterministic offline queue
@@ -231,21 +231,21 @@ fn run_pointer_submit_case(rows: u16, cols: u16) {
         // may take a beat to process the second gesture.
         if !retried && Instant::now() >= retry_at {
             retried = true;
-            let (retry_row, retry_col) = tui.frame().find_text("[↑]").unwrap_or_else(|| {
+            let (retry_row, retry_col) = tui.frame().find_text("[↵]").unwrap_or_else(|| {
                 panic!(
-                    "{size}: [↑] submit affordance not painted on retry\n{}",
+                    "{size}: [↵] submit affordance not painted on retry\n{}",
                     tui.diagnostics()
                 )
             });
             tui.send(keys::mouse::down(retry_row, retry_col + 1))
-                .expect("SGR mouse down on [↑] retry");
+                .expect("SGR mouse down on [↵] retry");
             std::thread::sleep(Duration::from_millis(150));
             tui.send(keys::mouse::up(retry_row, retry_col + 1))
-                .expect("SGR mouse up on [↑] retry");
+                .expect("SGR mouse up on [↵] retry");
         }
         if Instant::now() >= deadline {
             panic!(
-                "{size}: click on [↑] at ({send_row},{}) produced no queue receipt \
+                "{size}: click on [↵] at ({send_row},{}) produced no queue receipt \
                  {receipt:?} and no queue growth — pointer submit did not reach the \
                  keyboard-submit dispatch path (seen={seen:?})\n{}",
                 send_col + 1,
@@ -314,21 +314,17 @@ fn assert_startup_contract(frame: &Frame, rows: u16, cols: u16, size: &str) {
             frame.debug_dump()
         );
     }
-    // The card sheds rows on narrow stages; the new-session entry holds
-    // last. The sealed harness home has no saved sessions, so wide stages
-    // also paint the empty-workspace note.
-    let needles: &[&str] = if cols < 56 {
-        &["New session"]
-    } else {
-        &["New session", "No recent sessions"]
-    };
-    for needle in needles {
-        assert!(
-            text.contains(needle),
-            "{size}: startup misses {needle:?}\n{}",
-            frame.debug_dump()
-        );
-    }
+    // Empty workspaces keep the invitation without an empty history section.
+    assert!(
+        text.contains("New session"),
+        "{size}: startup misses invitation\n{}",
+        frame.debug_dump()
+    );
+    assert!(
+        !text.contains("No recent sessions"),
+        "{size}: empty history adds noise\n{}",
+        frame.debug_dump()
+    );
     for retired_mark_row in ["▄▄▄▄██▌", "▜████▀▘"] {
         assert!(
             !text.contains(retired_mark_row),

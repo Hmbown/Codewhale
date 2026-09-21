@@ -90,7 +90,16 @@ impl PluginBootSummary {
                 .any(|diagnostic| diagnostic.level == PluginDiagnosticLevel::Error)
             {
                 invalid += 1;
-            } else if plugin_trust_needs_setup(plugin.trust_status) {
+            } else if plugin.enabled && plugin_trust_needs_setup(plugin.trust_status) {
+                // A bundle that is enabled but no longer trusted — its content
+                // or capabilities moved since the review, or it was switched on
+                // without one — is the problem this chip exists for. A disabled,
+                // never-reviewed bundle is a shipped default resting where it
+                // was shipped (every built-in starts that way), not a problem:
+                // counting it put "Plugins · Problems" in the footer of every
+                // fresh install until each built-in had been reviewed, whether
+                // or not anyone meant to enable it. Extensions still lists it
+                // with its review action.
                 needs_setup += 1;
             }
         }
@@ -489,6 +498,42 @@ mod tests {
             PluginTrustStatus::CapabilitiesChanged
         ));
         assert!(!plugin_trust_needs_setup(PluginTrustStatus::Trusted));
+    }
+
+    /// A fresh install ships every built-in bundle disabled and never
+    /// reviewed. That is the shipped resting state, not a problem: counting
+    /// it kept "Plugins · Problems" in the footer of every new install until
+    /// each built-in had been reviewed.
+    #[test]
+    fn fresh_install_built_ins_keep_the_plugin_chip_quiet() {
+        let _lock = crate::test_support::lock_test_env();
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", &home);
+
+        let registry = crate::plugins::PluginDiscoveryContext::capture_pre_dotenv()
+            .registry_for_workspace(&workspace);
+        let shipped_disabled = registry
+            .list()
+            .into_iter()
+            .filter(|plugin| {
+                !plugin.enabled && plugin.trust_status == PluginTrustStatus::NeverReviewed
+            })
+            .count();
+        assert!(
+            shipped_disabled > 0,
+            "fixture must discover at least one disabled, never-reviewed built-in"
+        );
+
+        let summary = PluginBootSummary::from_registry(&registry);
+        assert_eq!(summary.loaded, registry.list().len());
+        assert!(
+            summary.is_quiet(),
+            "a fresh install must not report plugin problems: {summary:?}"
+        );
     }
 
     #[test]

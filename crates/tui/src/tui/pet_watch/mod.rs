@@ -736,4 +736,80 @@ mod tests {
         assert!(!call.contains("PRIVATE"));
         assert!(!thought.contains("PRIVATE"));
     }
+
+    /// The pet's multi-agent count is derived on the JS side from
+    /// `agent:`-prefixed spans, keyed by the `id` this projection forwards
+    /// (app-side issue #12). The counting itself is proven in
+    /// `pet/tests/pet-engine.test.mjs`; the handoff is the half that fails
+    /// silently — a trimmed allowlist or a dropped id zeroes `parallel` with
+    /// no error and no log line, and nothing else here covers agent events.
+    /// Pin the wire shape the JS dispatches on, and keep child text off it.
+    #[test]
+    fn agent_events_forward_span_identity_without_child_text() {
+        use crate::core::events::AgentProgressEventMeta;
+        use crate::tools::subagent::{AgentWorkerStatus, SubAgentStatus};
+
+        let spawned = metadata(&Event::AgentSpawned {
+            owner_session_id: "session-a".into(),
+            id: "agent-1".into(),
+            prompt: "PRIVATE CHILD PROMPT".into(),
+            worker_status: Some(AgentWorkerStatus::Running),
+            parent_run_id: Some("run-9".into()),
+            spawn_depth: 2,
+            model: "PRIVATE CHILD MODEL".into(),
+            route_source: Some("task.model".into()),
+        })
+        .expect("agent spawns are observed");
+        assert_eq!(
+            serde_json::from_str::<Value>(&spawned).unwrap(),
+            json!({"event":"agent_spawned","id":"agent-1","worker_status":"running"})
+        );
+
+        // The JS finishes a span when progress reports a terminal status.
+        let progress = metadata(&Event::AgentProgress {
+            owner_session_id: "session-a".into(),
+            id: "agent-1".into(),
+            status: "PRIVATE PROGRESS TEXT".into(),
+            activity: AgentProgressEventMeta {
+                worker_status: AgentWorkerStatus::Completed,
+                step: Some(3),
+                tool_name: Some("exec_command".into()),
+                routine_wait: false,
+            },
+            parent_run_id: Some("run-9".into()),
+            spawn_depth: 2,
+        })
+        .expect("agent progress is observed");
+        assert_eq!(
+            serde_json::from_str::<Value>(&progress).unwrap(),
+            json!({"event":"agent_progress","id":"agent-1","worker_status":"completed"})
+        );
+
+        let complete = metadata(&Event::AgentComplete {
+            owner_session_id: "session-a".into(),
+            id: "agent-1".into(),
+            result: "PRIVATE CHILD RESULT".into(),
+            outcome: Some(SubAgentStatus::Completed),
+            parent_run_id: Some("run-9".into()),
+            spawn_depth: Some(2),
+            continuable: Some(false),
+            usage: None,
+        })
+        .expect("agent completions are observed");
+        assert_eq!(
+            serde_json::from_str::<Value>(&complete).unwrap(),
+            json!({"event":"agent_complete","id":"agent-1","worker_status":"completed"})
+        );
+
+        for (label, payload) in [
+            ("spawned", &spawned),
+            ("progress", &progress),
+            ("complete", &complete),
+        ] {
+            assert!(
+                !payload.contains("PRIVATE"),
+                "{label} leaked child text: {payload}"
+            );
+        }
+    }
 }

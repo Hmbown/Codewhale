@@ -617,6 +617,7 @@ fn provider_base_url_table_key(provider: ApiProvider) -> anyhow::Result<&'static
         ApiProvider::Telecomjs => Ok("telecomjs"),
         ApiProvider::Edenai => Ok("edenai"),
         ApiProvider::Zenmux => Ok("zenmux"),
+        ApiProvider::Csdn => Ok("csdn"),
         ApiProvider::Concentrate => Ok("concentrate"),
         ApiProvider::Codewhale => Ok("codewhale"),
         ApiProvider::ModelstudioTokenPlan => Ok("modelstudio_token_plan"),

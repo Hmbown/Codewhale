@@ -6,6 +6,7 @@ arcee
 atlascloud
 codewhale
 concentrate
+csdn
 custom
 deepinfra
 deepseek

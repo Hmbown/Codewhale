@@ -875,3 +875,78 @@ fn test_sessions_unknown_subcommand_errors() {
         result.message
     );
 }
+
+#[test]
+fn branch_snapshot_roundtrip_preserves_siblings_ids_stamps_and_engine_projection() {
+    let _guard = crate::test_support::lock_test_env();
+    let root = TempDir::new().unwrap();
+    let _home = EnvVarGuard::set("CODEWHALE_HOME", root.path().join("home"));
+    let mut app = create_test_app_with_tmpdir(&root);
+    let message = |text: &str| codewhale_models::Message {
+        role: Role::User,
+        content: vec![codewhale_models::ContentBlock::Text {
+            text: text.into(),
+            cache_control: None,
+        }],
+    };
+    for text in ["root", "chosen", "abandoned"] {
+        app.push_api_message(message(text));
+    }
+    assert!(!save(&mut app, None).is_error);
+    let id = app.current_session_id.clone().unwrap();
+    let manager = crate::session_manager::SessionManager::default_location().unwrap();
+    let initial = manager.load_session(&id).unwrap();
+    let original = initial.journal.as_ref().unwrap().entries.clone();
+    let chosen = original[1].id.clone();
+    let result = dispatch_lifecycle(&mut app, "branch", Some(&chosen));
+    assert!(!result.is_error, "{:?}", result.message);
+    let Some(AppAction::SyncSession {
+        messages,
+        session_id,
+        ..
+    }) = result.action
+    else {
+        panic!("branch must synchronize the existing engine");
+    };
+    assert_eq!(session_id.as_deref(), Some(id.as_str()));
+    assert_eq!(messages, vec![message("root"), message("chosen")]);
+    assert_eq!(app.api_messages.as_ref(), &messages);
+    assert!(
+        !app.history
+            .iter()
+            .any(|cell| format!("{cell:?}").contains("abandoned"))
+    );
+    app.push_api_message(message("new path"));
+    for _ in 0..2 {
+        let snapshot = crate::tui::ui::build_session_snapshot(&mut app, &manager).unwrap();
+        manager.save_session_owned(snapshot).unwrap();
+    }
+    let saved = manager.load_session(&id).unwrap();
+    let journal = saved.journal.as_ref().unwrap();
+    assert_eq!(
+        &journal.entries[..3],
+        original.as_slice(),
+        "all old IDs, stamps and content survive"
+    );
+    assert_eq!(journal.entries.len(), 4, "a second save appends nothing");
+    assert_eq!(
+        journal.entries[3].parent_id.as_deref(),
+        Some(chosen.as_str())
+    );
+    assert_eq!(journal.leaves().len(), 2);
+    assert_eq!(
+        saved.messages,
+        vec![message("root"), message("chosen"), message("new path")]
+    );
+    // Restoring and forking must retain the tree as well.
+    app.restore_api_messages(saved.messages.clone(), &saved);
+    let forked = fork(&mut app);
+    assert!(!forked.is_error, "{:?}", forked.message);
+    let child = manager
+        .load_session(app.current_session_id.as_deref().unwrap())
+        .unwrap();
+    assert_eq!(child.journal.as_ref().unwrap().entries, journal.entries);
+    assert_eq!(child.metadata.spawn_depth, 1);
+    let snapshot = crate::tui::ui::build_session_snapshot(&mut app, &manager).unwrap();
+    assert_eq!(snapshot.journal.unwrap().entries, journal.entries);
+}

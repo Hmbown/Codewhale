@@ -413,21 +413,19 @@ done
     expect(matrixText).not.toContain('"approvalPostures"');
   });
 
-  it("enforces the six-tool core, deferred discovery, and exact hidden compatibility", () => {
+  it("keeps public tool facts aligned with the native core and discovery boundaries", () => {
     const toolDoc = text("docs/TOOL_SURFACE.md");
-    const toolsPage = text("web/app/[locale]/docs/tools/page.tsx");
+    const toolsPage = text("web/app/[locale]/docs/tools/page.tsx") + text("web/lib/content/tools.ts");
     const registry = text("crates/tui/src/tools/registry.rs");
     const limits = text("crates/tui/src/config/subagent_limits.rs");
     const roadmap = text("web/app/[locale]/roadmap/page.tsx");
 
-    expect(matrix.toolSurface.defaultActive).toEqual([
-      "read",
-      "write",
-      "edit",
-      "bash",
-      "agent",
-      "todo_write",
-    ]);
+    const catalog = text("crates/tui/src/core/engine/tool_catalog.rs");
+    const nativeCore = catalog.match(/const DEFAULT_ACTIVE_NATIVE_TOOLS: &[\s\S]*?= &\[([\s\S]*?)\];/);
+    expect(nativeCore, "native core declaration must be found").not.toBeNull();
+    const nativeNames = [...nativeCore![1].matchAll(/"([^"\n]+)"/g)].map((match) => match[1]);
+    expect(nativeNames.length).toBeGreaterThan(0);
+    expect(matrix.toolSurface.defaultActive).toEqual(nativeNames);
     expect(matrix.toolSurface.schemas).toEqual({
       read: ["path", "offset?", "limit?"],
       write: ["path", "content"],
@@ -458,13 +456,6 @@ done
       roadmap.indexOf('title: "Underway"'),
     );
     expect(roadmap).toContain("Implemented in the v0.9.1 source candidate");
-    // docs/TOOL_SURFACE.md moved from six to seven model-facing names when
-    // the TUI promoted todo_write into DEFAULT_ACTIVE_NATIVE_TOOLS
-    // (bf6def00d). docs/public-surface-facts.json tracks the six-name
-    // DEFAULT_ACTIVE_NATIVE_TOOLS matrix (tool_search is the synthetic
-    // always-active entry outside it), and the name loop below keeps the
-    // matrix↔doc↔site alignment honest.
-    expect(toolDoc).toContain("exactly seven model-facing names");
     for (const name of matrix.toolSurface.defaultActive) {
       expect(toolDoc, name).toContain(`\`${name}\``);
       expect(toolsPage, name).toContain(name);
@@ -573,15 +564,15 @@ done
   });
 
   it("keeps supplied terminal screenshots and website dimensions truthful", () => {
-    // Website and README share the founder-supplied PNG without alteration.
+    // Website and README share the same exact-build terminal-cell capture.
     const readmeImage = bytes(matrix.screenshot.readme);
     const websiteImage = bytes(matrix.screenshot.website);
 
-    expect(imageDimensions(websiteImage)).toEqual([1078, 466]);
+    expect(imageDimensions(websiteImage)).toEqual([TERMINAL_SCREENSHOT.width, TERMINAL_SCREENSHOT.height]);
     expect(readmeImage).toEqual(websiteImage);
     expect(statSync(new URL(matrix.screenshot.readme, root)).size).toBeLessThan(500_000);
     expect(statSync(new URL(matrix.screenshot.website, root)).size).toBeLessThan(500_000);
-    expect(matrix.screenshot.terminal).toBe("unrecorded");
+    expect(matrix.screenshot.terminal).toContain("real PTY cell capture");
     // A development-build capture, never a release claim.
     expect(matrix.screenshot.capture).toContain("development build");
     expect(matrix.screenshot.capture).toContain("not a default");
@@ -592,21 +583,18 @@ done
     expect(`web/public${TERMINAL_SCREENSHOT.src}`).toBe(matrix.screenshot.website);
     expect(imageDimensions(websiteImage)).toEqual([TERMINAL_SCREENSHOT.width, TERMINAL_SCREENSHOT.height]);
     expect(homepage).toContain("src={TERMINAL_SCREENSHOT.src}");
-    // Alt text and caption are dictionary-backed; every routed locale must
-    // describe the capture as what it is — a v0.9.12 development build in
-    // Operate mode with Full Access, not a release and not a default.
-    expect(homepage).toContain("alt={d.screenshotAlt}");
+    // Every locale describes the actual capture; build identity comes from
+    // the media manifest instead of a stale version embedded in translations.
+    expect(homepage).toContain("alt={fill(d.screenshotAlt, { version: TERMINAL_SCREENSHOT.version })}");
     expect(homepage).toContain("fill(d.shotBuild, { version: TERMINAL_SCREENSHOT.version })");
     expect(getHome("en").shotBuild).toBe("v{version} development build");
-    expect(getHome("en").screenshotAlt).toContain("171acee689aa");
-    expect(getHome("en").screenshotAlt).toContain("Full Access");
-    expect(getHome("en").screenshotAlt).toContain("Operate mode");
-    for (const locale of ["zh", "ja", "vi", "ko", "ru", "uk", "es", "pt-BR", "id", "fr", "de", "ca", "hi", "tr", "it", "pl", "ar"]) {
+    for (const locale of ["en", "zh", "ja", "vi", "ko", "ru", "uk", "es", "pt-BR", "id", "fr", "de", "ca", "hi", "tr", "it", "pl", "ar"]) {
       const home = getHome(locale);
       expect(home.shotBuild, `${locale} shotBuild`).toContain("{version}");
-      expect(home.screenshotAlt, `${locale} alt`).toContain("Full Access");
-      expect(home.screenshotAlt, `${locale} alt`).toContain("Operate");
-      expect(home.screenshotAlt, `${locale} alt`).toContain("0.9.12");
+      expect(home.screenshotAlt, `${locale} alt`).toContain("{version}");
+      expect(home.screenshotAlt, `${locale} alt`).toContain("Ask");
+      expect(home.screenshotAlt, `${locale} alt`).toContain("Work");
+      expect(home.screenshotAlt, `${locale} alt`).not.toMatch(/171acee|0\.9\.12|Full Access/);
     }
   });
 

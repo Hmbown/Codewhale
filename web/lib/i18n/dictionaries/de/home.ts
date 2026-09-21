@@ -20,7 +20,7 @@ export const home: HomeDict = {
   shotPreview: "Terminal-Vorschau",
   shotBuild: "Entwicklungsbuild v{version}",
   screenshotAlt:
-    "Codewhale v0.9.12 im Terminal, Build 171acee689aa: eine neue Sitzung mit dem Wal-Zeichen, dem Nachrichteneingabefeld, Full Access und dem Modus Operate, zwei geplanten Aufgaben, 21 MCP-Servern im Verbindungsaufbau und GLM-5.3 auf der Reasoning-Stufe max.",
+    "Codewhale v{version}, Entwicklungsbuild: Wal, neue Sitzung, Nachrichteneingabe, Ask-Berechtigungen, Work-Modus und Modellstatus. Darstellung der tatsächlichen Ausgabe eines isolierten Terminals.",
   latestRelease: "Aktuellstes Release {tag}",
   releaseUnavailable: "Release-Status nicht verfügbar",
   currentSource: "Quelle",

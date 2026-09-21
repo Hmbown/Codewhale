@@ -110,6 +110,60 @@ pub(crate) fn with_test_state_io_lock<T>(operation: impl FnOnce() -> T) -> T {
     operation()
 }
 
+/// Build a test phase's future inside this call and box it (#6362).
+///
+/// In debug builds every inline `async {}` value gets a stack slot in the
+/// enclosing poll frame the size of that future's whole state machine, and
+/// the slots are never reused, so a body that awaits four phases inline
+/// carries all four state machines on its own frame at once (measured at
+/// 806 KiB for the runtime-store binding test). Constructing the phase here
+/// leaves the caller holding a pointer, and the phase's own temporaries die
+/// with its poll frame.
+pub(crate) fn boxed_phase<'a, T, M, F>(
+    make: M,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = T> + 'a>>
+where
+    M: FnOnce() -> F,
+    F: std::future::Future<Output = T> + 'a,
+{
+    Box::pin(make())
+}
+
+/// Drive a test future on a thread with libtest's default 2 MiB stack,
+/// whatever `RUST_MIN_STACK` says (#6362).
+///
+/// CI exports a 16 MiB `RUST_MIN_STACK` for every test thread, so a test
+/// that only fits because of that export never learns it overflowed the
+/// stack a contributor's plain `cargo test` gives it. The future is built on
+/// the spawned thread (so it need not be `Send`) and pinned before
+/// `block_on`, exactly as `#[tokio::test]` drives a current-thread runtime;
+/// a panic inside propagates to the caller unchanged. An overflow still
+/// aborts the process with "has overflowed its stack": that is the reported
+/// symptom, not something this helper can turn into a panic.
+pub(crate) fn block_on_default_test_stack<M, F, T>(make: M) -> T
+where
+    M: FnOnce() -> F + Send + 'static,
+    F: std::future::Future<Output = T>,
+    T: Send + 'static,
+{
+    const DEFAULT_TEST_THREAD_STACK: usize = 2 * 1024 * 1024;
+    std::thread::Builder::new()
+        .name("default-test-stack".into())
+        .stack_size(DEFAULT_TEST_THREAD_STACK)
+        .spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("current-thread test runtime");
+            let future = make();
+            tokio::pin!(future);
+            runtime.block_on(future)
+        })
+        .expect("spawn the default-stack test thread")
+        .join()
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+}
+
 /// Restore one environment variable when dropped.
 ///
 /// Callers that mutate process-global environment variables must hold

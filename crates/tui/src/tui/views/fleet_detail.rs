@@ -6,6 +6,7 @@
 //! [`crate::fleet::store`] with an atomic save and a receipt naming the exact
 //! file and scope.
 
+use std::cell::RefCell;
 use std::path::PathBuf;
 
 /// Rows a PageUp/PageDown travels. Both lists here are modal and short, so a
@@ -13,7 +14,7 @@ use std::path::PathBuf;
 const DETAIL_PAGE: usize = 10;
 const ROUTE_PICK_PAGE: usize = 10;
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::{
     buffer::Buffer,
     layout::{Constraint, Direction, Layout, Rect},
@@ -29,6 +30,7 @@ use crate::fleet::store::{
     save_fleet, set_selected,
 };
 use crate::tui::app::App;
+use crate::tui::menu_style;
 use crate::tui::views::{
     ActionHint, ModalKind, ModalView, ViewAction, ViewEvent, render_modal_footer,
 };
@@ -89,6 +91,7 @@ struct RouteRow {
 pub struct FleetDetailView {
     fleet: FleetFile,
     editor_id: uuid::Uuid,
+    pub(crate) return_to_roster: bool,
     saved_source: Option<String>,
     locale: Locale,
     scope: FleetScope,
@@ -96,6 +99,9 @@ pub struct FleetDetailView {
     workspace: PathBuf,
     /// 0 = operator row; 1.. = members.
     selected: usize,
+    row_hitboxes: RefCell<Vec<(Rect, usize)>>,
+    last_mouse_selected: Option<usize>,
+    hovered_row: Option<usize>,
     step: DetailStep,
     pick_target: FleetRouteTarget,
     routes: Vec<RouteRow>,
@@ -159,13 +165,12 @@ impl FleetDetailView {
             &session_provider,
             &session_model,
         );
-        if let Some(member_id) = member_id.map(str::trim).filter(|id| !id.is_empty())
-            && let Some(index) = view
+        if let Some(member_id) = member_id.map(str::trim).filter(|id| !id.is_empty()) {
+            let index = view
                 .fleet
                 .members
                 .iter()
-                .position(|member| member.id.eq_ignore_ascii_case(member_id))
-        {
+                .position(|member| member.id.eq_ignore_ascii_case(member_id))?;
             view.selected = index + 1;
         }
         Some(view)
@@ -188,12 +193,16 @@ impl FleetDetailView {
         let mut view = Self {
             fleet,
             editor_id: uuid::Uuid::new_v4(),
+            return_to_roster: false,
             saved_source,
             locale,
             scope,
             source,
             workspace,
             selected: 0,
+            row_hitboxes: RefCell::new(Vec::new()),
+            last_mouse_selected: None,
+            hovered_row: None,
             step: DetailStep::Overview,
             pick_target: FleetRouteTarget::Operator,
             routes,
@@ -392,6 +401,26 @@ impl FleetDetailView {
             Some(idx) => FleetRouteTarget::Member(idx),
             None => FleetRouteTarget::Operator,
         }
+    }
+
+    pub(crate) fn direct_assignment(&mut self) -> (uuid::Uuid, FleetRouteTarget) {
+        self.return_to_roster = true;
+        (self.editor_id, self.selected_route_target())
+    }
+
+    pub(crate) fn assignment_context(&self) -> (String, String) {
+        let role = self
+            .selected_member()
+            .map(|member| member.id.clone())
+            .unwrap_or_else(|| "Coordinator".into());
+        (
+            role,
+            format!("{} · {}", self.fleet.name, self.scope.label()),
+        )
+    }
+
+    pub(crate) fn is_direct_assignment(&self, editor_id: uuid::Uuid) -> bool {
+        self.return_to_roster && self.editor_id == editor_id
     }
 
     pub(crate) fn route_selection(
@@ -685,8 +714,6 @@ impl FleetDetailView {
                 let mut hints = vec![
                     ActionHint::new("↑/↓", "move"),
                     ActionHint::new("Enter", tr(self.locale, MessageId::PickerActionModels)),
-                    ActionHint::new("o", "Coordinator model"),
-                    ActionHint::new("e", "member model"),
                     ActionHint::new("r", "rename"),
                     ActionHint::new("s", "save"),
                     ActionHint::new("c", "copy destination"),
@@ -718,6 +745,8 @@ impl ModalView for FleetDetailView {
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> ViewAction {
+        self.last_mouse_selected = None;
+        self.hovered_row = None;
         match self.step {
             DetailStep::PickRoute => match key.code {
                 // Esc clears a filter before it leaves, so a mistyped query
@@ -866,7 +895,46 @@ impl ModalView for FleetDetailView {
         }
     }
 
+    fn handle_mouse(&mut self, mouse: MouseEvent) -> ViewAction {
+        // Mouse browsing cannot bypass a rename or removal confirmation.
+        if self.step != DetailStep::Overview || self.rename_mode || self.pending_remove {
+            return ViewAction::None;
+        }
+        let hit = self.row_hitboxes.borrow().iter().find_map(|(rect, row)| {
+            rect.contains((mouse.column, mouse.row).into())
+                .then_some(*row)
+        });
+        match mouse.kind {
+            MouseEventKind::Moved => self.hovered_row = hit,
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                return self.handle_key(KeyEvent::new(
+                    if mouse.kind == MouseEventKind::ScrollUp {
+                        KeyCode::Up
+                    } else {
+                        KeyCode::Down
+                    },
+                    KeyModifiers::NONE,
+                ));
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                if let Some(row) = hit {
+                    let open = self.selected == row && self.last_mouse_selected == Some(row);
+                    self.selected = row;
+                    self.last_mouse_selected = Some(row);
+                    if open {
+                        return self.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+                    }
+                } else {
+                    self.last_mouse_selected = None;
+                }
+            }
+            _ => {}
+        }
+        ViewAction::None
+    }
+
     fn render(&self, area: Rect, buf: &mut Buffer) {
+        self.row_hitboxes.borrow_mut().clear();
         Clear.render(area, buf);
         Block::default()
             .style(Style::default().bg(palette::WHALE_BG))
@@ -940,6 +1008,7 @@ impl FleetDetailView {
     }
 
     fn render_overview(&self, area: Rect, buf: &mut Buffer) {
+        self.row_hitboxes.borrow_mut().clear();
         if area.width == 0 || area.height == 0 {
             return;
         }
@@ -947,8 +1016,8 @@ impl FleetDetailView {
         let scroll = self.selected.saturating_sub(rows_visible.saturating_sub(1));
         let mut lines: Vec<Line<'static>> = Vec::new();
 
-        // Operator row.
-        if self.selected == 0 {
+        // Keep the Coordinator in place until it actually scrolls offscreen.
+        if scroll == 0 {
             let selected = self.selected == 0;
             let base = if selected {
                 Style::default().fg(palette::WHALE_ACTION).bold()
@@ -986,6 +1055,9 @@ impl FleetDetailView {
                     Style::default().fg(palette::STATUS_WARNING),
                 ));
             }
+            self.row_hitboxes
+                .borrow_mut()
+                .push((Rect::new(area.x, area.y, area.width, 1), 0));
             lines.push(Line::from(spans));
         }
 
@@ -994,6 +1066,10 @@ impl FleetDetailView {
             if row < scroll || row >= scroll + rows_visible {
                 continue;
             }
+            self.row_hitboxes.borrow_mut().push((
+                Rect::new(area.x, area.y + lines.len() as u16, area.width, 1),
+                row,
+            ));
             let selected = row == self.selected;
             let base = if selected {
                 Style::default().fg(palette::WHALE_ACTION).bold()
@@ -1056,6 +1132,31 @@ impl FleetDetailView {
                     ));
                 }
                 lines.push(Line::from(spans));
+            }
+        }
+        for ((rect, row), line) in self.row_hitboxes.borrow().iter().zip(lines.iter_mut()) {
+            let style = if *row == self.selected && !self.pending_remove {
+                Some(menu_style::selected_row_style())
+            } else if self.hovered_row == Some(*row) {
+                Some(menu_style::hovered_row_style())
+            } else {
+                None
+            };
+            if let Some(style) = style {
+                buf.set_style(*rect, style);
+                line.style = style;
+                for span in &mut line.spans {
+                    // Focus owns the fill, while warnings retain their
+                    // semantic ink and explicit diagnostic label.
+                    span.style = match span.style.fg {
+                        Some(ink)
+                            if ink == palette::STATUS_WARNING || ink == palette::WHALE_ERROR =>
+                        {
+                            style.fg(ink)
+                        }
+                        _ => style,
+                    };
+                }
             }
         }
         Paragraph::new(ratatui::text::Text::from(lines)).render(area, buf);
@@ -1271,6 +1372,58 @@ mod tests {
             FleetDetailView::open(&app, &Config::default(), "Nope", FleetScope::Workspace)
                 .is_none()
         );
+    }
+
+    #[test]
+    fn fleet_role_mouse_selection_opens_the_same_model_picker_as_enter() {
+        let ws = tempfile::TempDir::new().unwrap();
+        save_fleet(&sample_fleet("Team"), FleetScope::Workspace, ws.path()).unwrap();
+        let mut view = FleetDetailView::open(
+            &app_in(ws.path().to_path_buf()),
+            &Config::default(),
+            "Team",
+            FleetScope::Workspace,
+        )
+        .expect("open");
+        for (width, height) in [(40, 12), (80, 24), (140, 40)] {
+            view.selected = 0;
+            view.last_mouse_selected = None;
+            let area = Rect::new(0, 0, width, height);
+            view.render(area, &mut Buffer::empty(area));
+            let hit = view
+                .row_hitboxes
+                .borrow()
+                .iter()
+                .find_map(|(rect, row)| (*row == 1).then_some(*rect))
+                .expect("member row");
+            let click = MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: hit.x,
+                row: hit.y,
+                modifiers: KeyModifiers::NONE,
+            };
+            assert!(matches!(view.handle_mouse(click), ViewAction::None));
+            assert_eq!(view.selected, 1);
+            // Selection must not move the Coordinator out of the viewport.
+            view.render(area, &mut Buffer::empty(area));
+            assert_eq!(view.row_hitboxes.borrow()[0].1, 0);
+            assert_eq!(view.row_hitboxes.borrow()[1].0, hit);
+            assert!(matches!(view.handle_mouse(click),
+                ViewAction::Emit(ViewEvent::FleetDetailRoutePickRequested {
+                    target: FleetRouteTarget::Member(0), editor_id,
+                }) if editor_id == view.editor_id));
+            assert!(matches!(view.handle_key(key(KeyCode::Enter)),
+                ViewAction::Emit(ViewEvent::FleetDetailRoutePickRequested {
+                    target: FleetRouteTarget::Member(0), editor_id,
+                }) if editor_id == view.editor_id));
+            // Clicking never skips an active destructive confirmation.
+            view.pending_remove = true;
+            assert!(matches!(view.handle_mouse(click), ViewAction::None));
+            view.pending_remove = false;
+            let empty = Rect::new(0, 0, 0, 0);
+            view.render(empty, &mut Buffer::empty(empty));
+            assert!(view.row_hitboxes.borrow().is_empty());
+        }
     }
 
     /// Enter on a row asks the host for the standard `/model` picker, and the

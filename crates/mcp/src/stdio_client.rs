@@ -1689,8 +1689,10 @@ printf 'stdin closed\n' > "$CODEWHALE_MCP_TEST_MARKER"
         drop(client);
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
-            if let Ok(body) = std::fs::read_to_string(&marker) {
-                assert_eq!(body, "stdin closed\n");
+            // The child creates and truncates the marker before writing it,
+            // so a successful read can still land on an empty or partial
+            // file. Poll until it carries the whole line a clean exit writes.
+            if std::fs::read_to_string(&marker).is_ok_and(|body| body == "stdin closed\n") {
                 break;
             }
             assert!(

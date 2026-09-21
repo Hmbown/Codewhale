@@ -1,5 +1,6 @@
 // Backend tests that can run on any host: harmony logic via a mocked hdc
 // exec, linux fail-closed probing, and module-shape checks for win32.
+import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
@@ -136,6 +137,39 @@ test("linux: probe rejects with no_session when no display session is visible", 
   }
 });
 
+test("linux: open_application hands focus back unless activate:true", async () => {
+  const saved = {};
+  for (const k of ["DISPLAY", "WAYLAND_DISPLAY", "XDG_SESSION_TYPE"]) { saved[k] = process.env[k]; }
+  process.env.DISPLAY = "fixture";
+  delete process.env.WAYLAND_DISPLAY;
+  process.env.XDG_SESSION_TYPE = "x11";
+  try {
+    const mod = await import("../src/backends/linux.mjs");
+    const cmds = [];
+    const b = mod.create({ exec: {
+      have: async () => true,
+      run: async (cmd, args) => {
+        cmds.push([cmd, ...args].join(" "));
+        if (cmd === "xdotool" && args[0] === "getactivewindow") return { code: 0, stdout: "4242\n", stderr: "" };
+        return { code: 0, stdout: "", stderr: "" };
+      },
+    } });
+    // "true" is a real binary — the launch itself is harmless; the assertion is
+    // on the focus bookkeeping around it.
+    const bg = await b.open_application({ name: "true" });
+    assert.equal(bg.activate, false);
+    assert.equal(bg.focus_restored, true);
+    assert.ok(cmds.includes("xdotool getactivewindow"));
+    assert.ok(cmds.includes("xdotool windowactivate 4242"));
+    cmds.length = 0;
+    const fg = await b.open_application({ name: "true", activate: true });
+    assert.equal(fg.activate, true);
+    assert.ok(!cmds.some((c) => c.includes("windowactivate")), "activate:true must not touch focus bookkeeping");
+  } finally {
+    for (const k of ["DISPLAY", "WAYLAND_DISPLAY", "XDG_SESSION_TYPE"]) { if (saved[k] !== undefined) process.env[k] = saved[k]; else delete process.env[k]; }
+  }
+});
+
 test("win32: module loads with the full backend surface", async () => {
   const mod = await import("../src/backends/win32.mjs");
   assert.equal(typeof mod.create, "function");
@@ -151,7 +185,7 @@ test("remote agent refuses tools outside the allow-list", async () => {
   const { run } = await import("../src/exec.mjs");
   const sentinel = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "cu-agent-deny-")), "x");
   const payload = Buffer.from(JSON.stringify({ tool: "write_file", args: { path: sentinel } })).toString("base64");
-  const r = await run("node", [new URL("../agent.mjs", import.meta.url).pathname, payload]);
+  const r = await run("node", [fileURLToPath(new URL("../agent.mjs", import.meta.url)), payload]);
   const reply = JSON.parse(r.stdout.trim());
   assert.equal(reply.ok, false);
   assert.equal(reply.error.code, "tool_not_allowed");
@@ -161,7 +195,7 @@ test("remote agent refuses tools outside the allow-list", async () => {
 test("remote agent answers the platform probe", async () => {
   const { run } = await import("../src/exec.mjs");
   const payload = Buffer.from(JSON.stringify({ tool: "platform" })).toString("base64");
-  const r = await run("node", [new URL("../agent.mjs", import.meta.url).pathname, payload]);
+  const r = await run("node", [fileURLToPath(new URL("../agent.mjs", import.meta.url)), payload]);
   const reply = JSON.parse(r.stdout.trim());
   assert.equal(reply.ok, true);
   assert.equal(reply.platform, process.platform);

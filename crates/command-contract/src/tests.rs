@@ -1949,6 +1949,7 @@ fn lifecycle_facet_is_object_safe_and_transports_every_outcome() {
         branch_outcome: Some(SessionBranchOutcome {
             leaf_display: "entry-43".to_string(),
             journal_entries_before: 7,
+            sync: lifecycle_sync_payload(Some("branched-session")),
         }),
         tree: Some(Ok(TreeBodyProjection::Journal {
             rendered: "rendered journal".to_string(),
@@ -1988,6 +1989,9 @@ fn lifecycle_facet_is_object_safe_and_transports_every_outcome() {
     let branch = fake.branch_to("entry-43").expect("branch ok");
     assert_eq!(branch.leaf_display, "entry-43");
     assert_eq!(branch.journal_entries_before, 7);
+    assert_eq!(branch.sync.session_id.as_deref(), Some("branched-session"));
+    assert_eq!(branch.sync.messages.len(), 1);
+    assert_eq!(branch.sync.mode, CommandMode::Plan);
     match fake.tree_body().expect("tree ok") {
         TreeBodyProjection::Journal { rendered } => assert_eq!(rendered, "rendered journal"),
         other => panic!("expected Journal projection, got {other:?}"),
@@ -2293,6 +2297,7 @@ fn control_facet_is_object_safe_and_transports_every_outcome() {
             truncated_id: "imp-9".to_string(),
             entry_count: 12,
             leaf_display: "leaf-3".to_string(),
+            sync: lifecycle_sync_payload(Some("imp-9")),
         })),
         sanitized_title: Some("Renamed".to_string()),
         rename: Some(Ok(SessionTitleReceipt {

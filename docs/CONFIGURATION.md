@@ -964,6 +964,16 @@ save the original messages without making an extra model call. Pressure metadata
 shows estimated input tokens and the configured trigger; it is an estimate, not
 an exact promise about a provider's remaining context.
 
+Compaction history is available through `codewhale metrics` (or `--json`) and
+`audit.log` in the Codewhale home. Completed passes record their trigger,
+summary/pruning path, message and estimated-token counts, effective threshold,
+and summarizer token usage. Automatic refusals are recorded once per turn with
+their reason. These are local diagnostics, not provider invoice totals; earlier
+artifacts are not retroactively counted. A text-mode `exec` that attempts
+compaction saves its owning session at turn completion so its recovery artifacts
+remain discoverable. A killed process may leave artifacts without that final
+session snapshot; the audit writer reports I/O failures instead of inventing data.
+
 See [Settings File](#settings-file-persistent-ui-preferences) for the
 compaction settings and [Token Quantities and
 Drivers](#token-quantities-and-drivers) for what each displayed token number
@@ -2840,7 +2850,9 @@ either resize the batch or tell the user which setting to change.
 Questions from `request_user_input` and approval decisions wait a bounded
 time and then cancel with a timeout (#6003). The default is 300 seconds.
 Raise it when you step away or read carefully, or set `0` to wait forever
-(overnight automation, long human review).
+(overnight automation, long human review). Headless `exec` runs have no
+responder, so `request_user_input` is withheld there by default:
+the model reports the tool absent and finishes instead of stalling.
 
 ```toml
 [tools]

@@ -29,6 +29,9 @@
 
 /// Shared secure-storage contract for the Codewhale account session.
 pub mod account;
+mod file_lock;
+#[cfg(test)]
+mod file_transactions_tests;
 /// Pure secret-redaction primitives shared by config diagnostics and the
 /// portable command sanitizer (FEAT-025 D4).
 pub mod redact;
@@ -116,6 +119,36 @@ pub trait KeyringStore: Send + Sync {
     /// Implementations should succeed (no-op) if the entry is already absent
     /// rather than returning an error.
     fn delete(&self, key: &str) -> Result<(), SecretsError>;
+
+    /// Run a non-reentrant entry mutation while holding the backend's authority
+    /// lock. Errors must leave the stored entry unchanged.
+    fn with_entry_transaction(
+        &self,
+        _key: &str,
+        _operation: &mut dyn FnMut(&mut Option<String>) -> Result<(), SecretsError>,
+    ) -> Result<(), SecretsError> {
+        Err(SecretsError::Keyring(
+            "This secret backend does not support atomic updates".into(),
+        ))
+    }
+
+    /// Replace an entry only while its exact bytes still match a snapshot.
+    fn compare_exchange(
+        &self,
+        key: &str,
+        expected: Option<&str>,
+        replacement: Option<&str>,
+    ) -> Result<bool, SecretsError> {
+        let mut changed = false;
+        self.with_entry_transaction(key, &mut |current| {
+            if current.as_deref() == expected {
+                *current = replacement.map(str::to_owned);
+                changed = true;
+            }
+            Ok(())
+        })?;
+        Ok(changed)
+    }
 
     /// Short, human-readable label for this backend.
     ///
@@ -211,8 +244,8 @@ impl DefaultKeyringStore {
     }
 }
 
-impl KeyringStore for DefaultKeyringStore {
-    fn get(&self, key: &str) -> Result<Option<String>, SecretsError> {
+impl DefaultKeyringStore {
+    fn get_unlocked(&self, key: &str) -> Result<Option<String>, SecretsError> {
         #[cfg(any(
             target_os = "macos",
             target_os = "windows",
@@ -246,7 +279,7 @@ impl KeyringStore for DefaultKeyringStore {
         }
     }
 
-    fn set(&self, key: &str, value: &str) -> Result<(), SecretsError> {
+    fn set_unlocked(&self, key: &str, value: &str) -> Result<(), SecretsError> {
         #[cfg(any(
             target_os = "macos",
             target_os = "windows",
@@ -278,7 +311,7 @@ impl KeyringStore for DefaultKeyringStore {
         }
     }
 
-    fn delete(&self, key: &str) -> Result<(), SecretsError> {
+    fn delete_unlocked(&self, key: &str) -> Result<(), SecretsError> {
         #[cfg(any(
             target_os = "macos",
             target_os = "windows",
@@ -309,6 +342,62 @@ impl KeyringStore for DefaultKeyringStore {
             let _ = key;
             Err(SecretsError::Keyring(unsupported_keyring_message()))
         }
+    }
+}
+
+impl DefaultKeyringStore {
+    fn with_key_lock<T>(
+        &self,
+        key: &str,
+        operation: impl FnOnce() -> Result<T, SecretsError>,
+    ) -> Result<T, SecretsError> {
+        use sha2::{Digest, Sha256};
+        // OS keyring authority is per user, not per CODEWHALE_HOME/profile.
+        let home = codewhale_paths::user_home()
+            .filter(|p| p.is_absolute())
+            .ok_or_else(home_resolution_error)?;
+        let mut digest = Sha256::new();
+        digest.update(self.service.as_bytes());
+        digest.update([0]);
+        digest.update(key.as_bytes());
+        let path = home.join(".codewhale").join("keyring-locks").join(
+            digest
+                .finalize()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>(),
+        );
+        file_lock::with_write_lock(&path, |_| operation())
+    }
+}
+
+impl KeyringStore for DefaultKeyringStore {
+    fn get(&self, key: &str) -> Result<Option<String>, SecretsError> {
+        self.get_unlocked(key)
+    }
+    fn set(&self, key: &str, value: &str) -> Result<(), SecretsError> {
+        self.with_key_lock(key, || self.set_unlocked(key, value))
+    }
+    fn delete(&self, key: &str) -> Result<(), SecretsError> {
+        self.with_key_lock(key, || self.delete_unlocked(key))
+    }
+    fn with_entry_transaction(
+        &self,
+        key: &str,
+        operation: &mut dyn FnMut(&mut Option<String>) -> Result<(), SecretsError>,
+    ) -> Result<(), SecretsError> {
+        self.with_key_lock(key, || {
+            let before = self.get_unlocked(key)?;
+            let mut current = before.clone();
+            operation(&mut current)?;
+            if current != before {
+                match current {
+                    Some(value) => self.set_unlocked(key, &value)?,
+                    None => self.delete_unlocked(key)?,
+                }
+            }
+            Ok(())
+        })
     }
 
     fn backend_name(&self) -> &'static str {
@@ -373,6 +462,28 @@ impl KeyringStore for InMemoryKeyringStore {
         Ok(())
     }
 
+    fn with_entry_transaction(
+        &self,
+        key: &str,
+        operation: &mut dyn FnMut(&mut Option<String>) -> Result<(), SecretsError>,
+    ) -> Result<(), SecretsError> {
+        let mut entries = self
+            .entries
+            .lock()
+            .map_err(|_| SecretsError::Keyring("Secret store lock poisoned".into()))?;
+        let mut current = entries.get(key).cloned();
+        operation(&mut current)?;
+        match current {
+            Some(value) => {
+                entries.insert(key.into(), value);
+            }
+            None => {
+                entries.remove(key);
+            }
+        }
+        Ok(())
+    }
+
     fn backend_name(&self) -> &'static str {
         "in-memory (test)"
     }
@@ -412,10 +523,12 @@ struct ReadOnlyFileKeyringStore {
     legacy: Option<FileKeyringStore>,
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Default, PartialEq, Serialize, Deserialize)]
 struct FileSecretsBlob {
     #[serde(default)]
     entries: HashMap<String, String>,
+    #[serde(flatten)]
+    extra: serde_json::Map<String, serde_json::Value>,
 }
 
 impl FileKeyringStore {
@@ -480,20 +593,28 @@ impl FileKeyringStore {
         }
 
         let primary_store = Self::new(primary.to_path_buf());
-        let mut primary_blob = primary_store.load_unlocked()?;
-        let mut changed = false;
-        for (key, value) in legacy_blob.entries {
-            if let std::collections::hash_map::Entry::Vacant(entry) =
-                primary_blob.entries.entry(key)
-            {
-                entry.insert(value);
-                changed = true;
+        primary_store.mutate(|primary_blob| {
+            for (key, value) in legacy_blob.entries {
+                primary_blob.entries.entry(key).or_insert(value);
             }
-        }
-        if changed {
-            primary_store.store_unlocked(&primary_blob)?;
-        }
-        Ok(())
+            Ok(())
+        })
+    }
+
+    fn mutate<T>(
+        &self,
+        operation: impl FnOnce(&mut FileSecretsBlob) -> Result<T, SecretsError>,
+    ) -> Result<T, SecretsError> {
+        file_lock::with_write_lock(&self.path, |path| {
+            let store = Self::new(path);
+            let mut blob = store.load_unlocked()?;
+            let original = serde_json::to_vec(&blob)?;
+            let result = operation(&mut blob)?;
+            if serde_json::to_vec(&blob)? != original {
+                store.store_unlocked(&blob)?;
+            }
+            Ok(result)
+        })
     }
 
     /// Path used for storage.
@@ -503,25 +624,16 @@ impl FileKeyringStore {
     }
 
     fn load_unlocked(&self) -> Result<FileSecretsBlob, SecretsError> {
-        if !self.path.exists() {
-            return Ok(FileSecretsBlob::default());
-        }
-        // Reject files with unsafe permissions on unix. On Windows the
-        // ACL model is too different to enforce here; the caller is
-        // responsible for placing the file in a per-user directory.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let meta = fs::metadata(&self.path)?;
-            let mode = meta.permissions().mode() & 0o777;
-            if mode & 0o077 != 0 {
-                return Err(SecretsError::InsecurePermissions {
-                    path: self.path.clone(),
-                    mode,
-                });
+        use std::io::Read as _;
+        let mut file = match file_lock::open_private(&self.path, false) {
+            Ok(file) => file,
+            Err(SecretsError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(FileSecretsBlob::default());
             }
-        }
-        let raw = fs::read_to_string(&self.path)?;
+            Err(error) => return Err(error),
+        };
+        let mut raw = String::new();
+        file.read_to_string(&mut raw)?;
         if raw.trim().is_empty() {
             return Ok(FileSecretsBlob::default());
         }
@@ -664,22 +776,43 @@ impl KeyringStore for FileKeyringStore {
     }
 
     fn set(&self, key: &str, value: &str) -> Result<(), SecretsError> {
-        // load_unlocked already returns Ok(default) for a missing file, so the
-        // first-write-creates-the-file path is preserved. Any other Err
-        // (insecure permissions, corrupt JSON, transient I/O) MUST surface to
-        // the caller — propagating it via `unwrap_or_default()` silently
-        // wipes every previously stored secret on the next `store_unlocked`.
-        let mut blob = self.load_unlocked()?;
-        blob.entries.insert(key.to_string(), value.to_string());
-        self.store_unlocked(&blob)
+        self.mutate(|blob| {
+            account::invalidate_device_companion(&mut blob.entries, key, Some(value));
+            blob.entries.insert(key.to_string(), value.to_string());
+            Ok(())
+        })
     }
 
     fn delete(&self, key: &str) -> Result<(), SecretsError> {
-        // Same invariant as `set`: never fall back to an empty blob on read
-        // error, or `delete <one-key>` becomes `delete <every-key>`.
-        let mut blob = self.load_unlocked()?;
-        blob.entries.remove(key);
-        self.store_unlocked(&blob)
+        self.mutate(|blob| {
+            account::invalidate_device_companion(&mut blob.entries, key, None);
+            blob.entries.remove(key);
+            Ok(())
+        })
+    }
+
+    fn with_entry_transaction(
+        &self,
+        key: &str,
+        operation: &mut dyn FnMut(&mut Option<String>) -> Result<(), SecretsError>,
+    ) -> Result<(), SecretsError> {
+        self.mutate(|blob| {
+            let before = blob.entries.get(key).cloned();
+            let mut current = before.clone();
+            operation(&mut current)?;
+            if current != before {
+                account::invalidate_device_companion(&mut blob.entries, key, current.as_deref());
+                match current {
+                    Some(value) => {
+                        blob.entries.insert(key.into(), value);
+                    }
+                    None => {
+                        blob.entries.remove(key);
+                    }
+                }
+            }
+            Ok(())
+        })
     }
 
     fn backend_name(&self) -> &'static str {
@@ -1125,6 +1258,34 @@ impl Secrets {
         self.store.get(name)
     }
 
+    /// Run one non-reentrant callback under the backend's entry authority.
+    pub fn with_entry_transaction<T>(
+        &self,
+        name: &str,
+        operation: impl FnOnce(&mut Option<String>) -> Result<T, SecretsError>,
+    ) -> Result<T, SecretsError> {
+        let mut operation = Some(operation);
+        let mut result = None;
+        self.store.with_entry_transaction(name, &mut |value| {
+            let call = operation.take().ok_or_else(|| {
+                SecretsError::Keyring("Secret transaction invoked more than once".into())
+            })?;
+            result = Some(call(value)?);
+            Ok(())
+        })?;
+        result.ok_or_else(|| SecretsError::Keyring("Secret transaction was not invoked".into()))
+    }
+
+    /// Atomically update one secret only while its exact stored bytes match.
+    pub fn compare_exchange(
+        &self,
+        name: &str,
+        expected: Option<&str>,
+        replacement: Option<&str>,
+    ) -> Result<bool, SecretsError> {
+        self.store.compare_exchange(name, expected, replacement)
+    }
+
     /// Resolve a secret by key name with an optional source constraint.
     ///
     /// This is the fleet-worker secret resolution path. Unlike
@@ -1197,6 +1358,7 @@ impl Secrets {
 /// | `telecomjs` / `tokenhub` | `TELECOMJS_API_KEY` |
 /// | `edenai` / `eden-ai` | `EDENAI_API_KEY` |
 /// | `zenmux` / `zen-mux` | `ZENMUX_API_KEY` |
+/// | `csdn` / `csdn-ai` / `starmap` | `CSDN_API_KEY` |
 /// | `concentrate` / `concentrate-ai` | `CONCENTRATE_API_KEY` |
 /// | `codewhale` / `codewhale-api` | `CODEWHALE_API_KEY` |
 ///
@@ -1255,6 +1417,9 @@ pub fn env_for(name: &str) -> Option<String> {
         }
         "edenai" | "eden-ai" | "eden_ai" => &["EDENAI_API_KEY"],
         "zenmux" | "zen-mux" | "zen_mux" => &["ZENMUX_API_KEY"],
+        "csdn" | "csdn-ai" | "csdn_ai" | "csdn-coding-plan" | "csdn_coding_plan" | "starmap" => {
+            &["CSDN_API_KEY"]
+        }
         "concentrate" | "concentrate-ai" | "concentrate_ai" | "concentrateai" => {
             &["CONCENTRATE_API_KEY"]
         }
@@ -1366,6 +1531,7 @@ mod tests {
             "TELECOMJS_API_KEY",
             "EDENAI_API_KEY",
             "ZENMUX_API_KEY",
+            "CSDN_API_KEY",
             "CONCENTRATE_API_KEY",
             "MODELSTUDIO_API_KEY",
             "DASHSCOPE_API_KEY",
@@ -1982,6 +2148,26 @@ mod tests {
 
         for alias in ["zenmux", "zen-mux", "zen_mux"] {
             assert_eq!(env_for(alias).as_deref(), Some("zen-key"), "{alias}");
+        }
+
+        clear_known_envs();
+    }
+
+    #[test]
+    fn csdn_env_aliases_resolve() {
+        let _guard = env_lock();
+        clear_known_envs();
+        unsafe { std::env::set_var("CSDN_API_KEY", "csdn-key") };
+
+        for alias in [
+            "csdn",
+            "csdn-ai",
+            "csdn_ai",
+            "csdn-coding-plan",
+            "csdn_coding_plan",
+            "starmap",
+        ] {
+            assert_eq!(env_for(alias).as_deref(), Some("csdn-key"), "{alias}");
         }
 
         clear_known_envs();

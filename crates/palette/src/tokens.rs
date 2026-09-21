@@ -8,7 +8,7 @@ pub const WHALE_CHROME_RGB: (u8, u8, u8) = (12, 21, 49); // #0C1531 Navy chrome
 pub const WHALE_PANEL_RGB: (u8, u8, u8) = (16, 28, 64); // #101C40 Panel surface
 pub const WHALE_COMPOSER_RGB: (u8, u8, u8) = (20, 35, 82); // #142352 Stage plate (brand navy)
 pub const WHALE_ELEVATED_RGB: (u8, u8, u8) = (26, 44, 99); // #1A2C63 Raised
-pub const WHALE_SELECTION_RGB: (u8, u8, u8) = (30, 60, 143); // #1E3C8F Cobalt tint
+pub const WHALE_SELECTION_RGB: (u8, u8, u8) = (35, 45, 65); // #232D41 Quiet selection surface
 pub const WHALE_TEXT_BODY_RGB: (u8, u8, u8) = (246, 242, 232); // #F6F2E8 Whale Ivory
 pub const WHALE_TEXT_SOFT_RGB: (u8, u8, u8) = (182, 192, 212); // #B6C0D4
 pub const WHALE_TEXT_MUTED_RGB: (u8, u8, u8) = (147, 160, 184); // #93A0B8
@@ -225,11 +225,10 @@ pub const MATRIX_BORDER_RGB: (u8, u8, u8) = (0, 204, 0); // #00CC00
 // Shoreline — the product-client palette, shared with the GPUI desktop.
 //
 // Warm charcoal ground and warm paper sheet, one restrained blue, and the
-// whale's ivory ink on both sides. This is the default shell from 0.9.14:
-// the navy "Underwater" water column remains a selectable theme, it is no
-// longer the ground the product opens on. Values are the GPUI client's
-// `Theme` slots (`codehwhale-gpui/src/workspace/mod.rs`), so the terminal
-// and the desktop window are one product rather than two visual systems.
+// whale's ivory ink on both sides. This is the charcoal alternative to the
+// terminal's navy "Underwater" default in 0.10.0. The
+// 0.10.0 action pair uses glacial blue on charcoal and deep ocean blue on
+// paper. Shared tokens keep the terminal, desktop, and web in one system.
 //
 // Every pair audited by `contrast::theme_contrast_violations` clears its
 // floor: body roles clear 4.5:1 on all four surfaces, hint/dim and the
@@ -239,14 +238,14 @@ pub const SHORELINE_PANEL_RGB: (u8, u8, u8) = (43, 40, 46); // #2B282E raised pl
 pub const SHORELINE_ELEVATED_RGB: (u8, u8, u8) = (53, 49, 58); // #35313A
 pub const SHORELINE_COMPOSER_RGB: (u8, u8, u8) = (43, 40, 46); // #2B282E
 pub const SHORELINE_CHROME_RGB: (u8, u8, u8) = (26, 24, 28); // #1A181C recessed chrome
-pub const SHORELINE_SELECTION_RGB: (u8, u8, u8) = (53, 73, 103); // #354967
+pub const SHORELINE_SELECTION_RGB: (u8, u8, u8) = (44, 70, 84); // #2C4654 deep ocean selection
 pub const SHORELINE_TEXT_BODY_RGB: (u8, u8, u8) = (242, 236, 229); // #F2ECE5
 pub const SHORELINE_TEXT_SOFT_RGB: (u8, u8, u8) = (217, 210, 220); // #D9D2DC
 pub const SHORELINE_TEXT_MUTED_RGB: (u8, u8, u8) = (176, 167, 178); // #B0A7B2
 pub const SHORELINE_TEXT_HINT_RGB: (u8, u8, u8) = (154, 145, 159); // #9A919F
 pub const SHORELINE_TEXT_DIM_RGB: (u8, u8, u8) = (126, 117, 131); // #7E7583
 pub const SHORELINE_BORDER_RGB: (u8, u8, u8) = (73, 66, 77); // #49424D
-pub const SHORELINE_ACTION_RGB: (u8, u8, u8) = (144, 185, 255); // #90B9FF the one blue
+pub const SHORELINE_ACTION_RGB: (u8, u8, u8) = (103, 184, 214); // #67B8D6 glacial blue — action and whale identity
 pub const SHORELINE_LIVE_RGB: (u8, u8, u8) = (127, 214, 198); // #7FD6C6 the live lane
 pub const SHORELINE_HUMAN_RGB: (u8, u8, u8) = (246, 196, 83); // #F6C453 Signal Gold, the human lane
 pub const SHORELINE_ERROR_RGB: (u8, u8, u8) = (255, 143, 168); // #FF8FA8
@@ -276,14 +275,14 @@ pub const SHORELINE_LIGHT_PANEL_RGB: (u8, u8, u8) = (236, 229, 224); // #ECE5E0
 pub const SHORELINE_LIGHT_ELEVATED_RGB: (u8, u8, u8) = (255, 252, 247); // #FFFCF7
 pub const SHORELINE_LIGHT_COMPOSER_RGB: (u8, u8, u8) = (251, 247, 241); // #FBF7F1
 pub const SHORELINE_LIGHT_CHROME_RGB: (u8, u8, u8) = (237, 231, 224); // #EDE7E0
-pub const SHORELINE_LIGHT_SELECTION_RGB: (u8, u8, u8) = (200, 217, 249); // #C8D9F9
+pub const SHORELINE_LIGHT_SELECTION_RGB: (u8, u8, u8) = (201, 224, 231); // #C9E0E7 pale ocean selection
 pub const SHORELINE_LIGHT_TEXT_BODY_RGB: (u8, u8, u8) = (48, 40, 50); // #302832
 pub const SHORELINE_LIGHT_TEXT_SOFT_RGB: (u8, u8, u8) = (74, 65, 76); // #4A414C
 pub const SHORELINE_LIGHT_TEXT_MUTED_RGB: (u8, u8, u8) = (107, 96, 110); // #6B606E
 pub const SHORELINE_LIGHT_TEXT_HINT_RGB: (u8, u8, u8) = (117, 112, 128); // #757080
 pub const SHORELINE_LIGHT_TEXT_DIM_RGB: (u8, u8, u8) = (138, 130, 144); // #8A8290
 pub const SHORELINE_LIGHT_BORDER_RGB: (u8, u8, u8) = (215, 206, 213); // #D7CED5
-pub const SHORELINE_LIGHT_ACTION_RGB: (u8, u8, u8) = (36, 91, 199); // #245BC7
+pub const SHORELINE_LIGHT_ACTION_RGB: (u8, u8, u8) = (0, 102, 132); // #006684 deep ocean blue on warm paper
 pub const SHORELINE_LIGHT_LIVE_RGB: (u8, u8, u8) = (31, 122, 107); // #1F7A6B
 pub const SHORELINE_LIGHT_HUMAN_RGB: (u8, u8, u8) = (122, 85, 0); // #7A5500 Signal Gold at AA on paper
 pub const SHORELINE_LIGHT_ERROR_RGB: (u8, u8, u8) = (180, 35, 90); // #B4235A

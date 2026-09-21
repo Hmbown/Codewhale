@@ -5,7 +5,7 @@ runtime bundle, discovers it through the existing plugin registry, and runs
 only the copy the user has reviewed and enabled. Codewhale Apps uses that same
 Engine inventory and approval flow.
 
-The bundle provides 39 MCP tools for application and window observation,
+The bundle provides the current consolidated MCP tools for application and window observation,
 accessibility actions, screenshots and zoom, keyboard and pointer input,
 clipboard access, recording, and switching between registered computers.
 Implementation exists for macOS, Windows, Linux and HarmonyOS target devices;
@@ -27,7 +27,7 @@ Use `request_access` to inspect readiness; a loaded plugin alone does not prove
 its OS permissions work.
 
 When the standalone Computer Use helper is registered, it owns local input
-even when Codewhale carries an embedded native helper. Version 0.3.1 keeps its
+even when Codewhale carries an embedded native helper. Version 0.11.2 keeps its
 whale menu, permission setup, disposable background check and human
 Pause/Stop controls, and retires the daemon when its native owner disappears. A registered helper that cannot start causes a clear
 error; the client does not silently bypass its controls. Without a registered
@@ -47,19 +47,21 @@ session-aware Computer Use helper. Their direct bundled path refuses these
 operations before sending input. macOS carries its native input owner in the
 included bundle. Real Windows, Wayland and mixed-display validation is still
 required before claiming equivalent platform readiness.
-The current one-shot SSH agent also loses application binding between calls;
-stateful remote input needs a persistent session transport before it is ready.
+SSH and Docker use persistent session transports; real remote workflows still
+need target-specific acceptance. The embedded Docker build context supports
+first-use creation of a task-owned Linux desktop when a compatible daemon is available.
 
 ## Control and session ownership
 
 Select an application before sending input. On macOS, background selection
 (`activate:false`) supports process-directed typing and accessibility actions.
-It refuses gestures that would move the shared desktop pointer. Explicit
+It refuses gestures and keyboard shortcuts that would borrow the user's keyboard focus or move the shared pointer. Some Unicode and hosted-panel
+typing also refuses rather than taking a focus lease. Explicit
 foreground selection (`activate:true`) enables guarded shared-desktop input
 when the user has authorized exclusive desktop use. Neither mode is an isolated
 computer; cursor restoration does not make concurrent pointer control safe.
 Screenshots and zoom return actual image content to compatible vision models.
-Preview and recording are explicit opt-ins.
+The nonactivating preview is on by default after binding; recording is explicit.
 Application observations return a concise default summary; request full detail
 when needed. Text-only models can use element roles, values and advertised
 actions. On macOS, optional local OCR enriches the selected window observation
@@ -93,3 +95,8 @@ operations; raw mouse gestures stop if the user changes foreground apps.
 Arbitrary background dragging remains unavailable. Rebuild Core to include
 the updated native helper; updating a separate marketplace checkout alone
 does not update an already-installed Core binary.
+
+This embedded source matches canonical 9a261c4. Windows controlled-desktop
+acceptance passed in upstream CI; signed Windows distribution, mixed-DPI/raw
+input and continuous keyboard coexistence remain unqualified. Core discovery
+and materialization tests do not constitute an installed model-driven trial.

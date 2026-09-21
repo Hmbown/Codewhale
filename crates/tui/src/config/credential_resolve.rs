@@ -289,6 +289,10 @@ pub(crate) fn resolve_credential_source_with(
         format!("codewhale auth set --provider {}", provider.as_str()),
     ));
 
+    if config.account_model_api_key(provider).is_some() {
+        return CredentialResolution::found(CredentialSource::AccountSession);
+    }
+
     CredentialResolution::missing(probed)
 }
 

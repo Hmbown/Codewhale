@@ -1,164 +1,299 @@
-# TUI redesign — Shoreline
+# TUI redesign — ocean depth / Workbench index
 
-Branch `tui-redesign`, 2026-09-15. The Codewhale TUI re-inks to the product
-client's palette and moves toward the conventions the terminal-agent market
-converged on. The whalemark is unchanged and is the constant across every
-surface.
+## Overview
 
-Two asks produced this. First: a more professional shell, closer to what the
-market ships. Second: closer to the GPUI client, which is deliberately simple.
-Both are the same move — `codehwhale-gpui` already *is* the product client, and
-it already solved "calm, warm, one accent". The terminal should read as the same
-product, not as a second design system.
+Fresh 0.10.0 terminal installs use **Underwater**, the restrained navy ombré.
+Shoreline remains the warm charcoal alternative; saved theme choices are
+preserved. `/theme` previews either treatment, Enter saves, and Escape restores
+the previous choice. The same layout, whale mark and information hierarchy
+serve both themes; the ocean is a continuous background, not extra chrome.
 
-## What changed
+Shoreline is the terminal's warm charcoal, ivory and blue visual system,
+introduced on 2026-09-15 to bring the TUI closer to the GPUI product client.
+The 2026-09-19 Workbench index pass organizes that system around the next
+useful action: start work, resume a session, or inspect connected tools.
+The founder delegated the visual direction and explicitly allowed replacing
+the previous appearance when it improved the experience.
 
-### 1. One palette, two clients (landed)
+The home screen uses a compact codewhale identity, version metadata aligned
+opposite it, and one bounded reading lane centered in wide terminals. Actual
+workspace and branch context make the screen specific to the current work.
+A prominent New session action and a Recent heading for real history organize
+the available choices. A compact canonical braille whale accompanies the identity when
+space permits, yielding before session titles and actionable rows in short
+terminals. The canonical brand asset is unchanged. The full-width
+composer, shared session runtime, permission authority and website design
+remain their existing systems. The terminal default does not change app defaults.
 
-`SHORELINE_UI_THEME` and `SHORELINE_LIGHT_UI_THEME` in
-`crates/palette/src/themes.rs` cite the same slots
-`codehwhale-gpui/src/workspace/mod.rs:147-164` installs into GPUI's `Theme`.
-The terminal's default was `underwater` — a saturated navy gradient with
-decorative ambient life. It is a named theme now, not the ground the product
-opens on.
+This document describes implemented terminal behavior, not the website's
+Tidal Folio system. Source owns values and actions; this file records how
+they form a coherent interface.
 
-| Role | Value | Note |
+## Colors
+
+Underwater's continuous water column is authored by `OceanRamp::for_theme` in
+`crates/tui/src/tui/ocean.rs`: dark navy at the top, deeper near the composer.
+Its existing motion policy preserves reduced/still modes and semantic surfaces.
+
+For the charcoal alternative, the source of truth is `crates/palette/src/tokens.rs` and the
+`SHORELINE_UI_THEME` / `SHORELINE_LIGHT_UI_THEME` mappings in
+`crates/palette/src/themes.rs`. The dark palette is unchanged by the
+Workbench index pass:
+
+| Role | Value | Use |
 | --- | --- | --- |
-| field (`surface_bg`) | `#211F23` | warm charcoal |
-| plate (`panel_bg`, `composer_bg`) | `#2B282E` | raised |
-| chrome (`header_bg`, `footer_bg`) | `#1A181C` | recessed |
-| border | `#49424D` | |
-| body | `#F2ECE5` | the whale's ivory survives |
-| soft / muted / hint / dim | `#D9D2DC` / `#B0A7B2` / `#9A919F` / `#7E7583` | 4.5:1 floors |
-| action, selection | `#90B9FF` / `#354967` | the one blue |
-| live | `#7FD6C6` | |
-| human | `#F6C453` | Signal Gold, unchanged |
-| warning / danger / success | `#F0A868` / `#FF8FA8` / `#A3D977` | |
-| mode ramp | `#7EB4E8` / `#B9DCEC` / `#AD88FF` / `#FF70A0` | the shipped ramp |
+| Field (`surface_bg`) | `#211F23` | Warm charcoal reading surface |
+| Plate (`panel_bg`, `composer_bg`) | `#2B282E` | Composer and raised surfaces |
+| Elevated | `#35313A` | Hover and secondary control surfaces |
+| Chrome (`header_bg`, `footer_bg`) | `#1A181C` | Recessed shell information |
+| Border | `#49424D` | Quiet boundaries and inactive composer |
+| Body | `#F2ECE5` | Primary ivory text |
+| Soft / muted / hint / dim | `#D9D2DC` / `#B0A7B2` / `#9A919F` / `#7E7583` | Secondary information by role |
+| Action / selection background | `#67B8D6` / `#2C4654` | Affordances and focused rows |
+| Live | `#7FD6C6` | Live activity |
+| Human | `#F6C453` | Human input and decisions |
+| Warning / danger / success | `#F0A868` / `#FF8FA8` / `#A3D977` | Semantic state |
+| Mode ramp | `#7EB4E8` / `#B9DCEC` / `#AD88FF` / `#FF70A0` | Existing mode distinctions |
 
-Light is the same system on warm paper (`#F5F0E9` field, `#245BC7` action).
+Shoreline Light uses warm paper (`#F5F0E9` field) and blue action
+(`#006684`); its full mapping remains in the same source. Neither this pass
+nor the Shoreline token family re-inks `web/app/tokens.css`.
 
-Three mechanisms make it hold:
+**Focus uses selection ink on selection blue.** Bright action blue is an
+accent, not a background for pale text. Selected labels, affordances and
+state annotations must remain readable on the selected surface. Failure,
+permission and availability also retain words or marks; color never supplies
+their only meaning.
 
-- **`adapt::theme_remap_active`** lists both new presets, so every direct
-  `palette::TEXT_*` / `WHALE_*` call site lands on a Shoreline slot instead of
-  a navy-tuned value. Without this the re-ink would be half-applied — the
-  frame would repaint while every widget kept its cold grey.
-- **The mode ramp is separate from `accent_primary`.** `mode_agent` must not
-  equal the action blue: `adapt::theme_semantic_foreground_role` resolves mode
-  slots *before* the action lane, so an equal value reads the action lane as
-  `ModeAgent` and the ANSI-16 role matrix collapses. Found by
-  `every_selectable_theme_keeps_mode_badges_distinct`; fixed in the theme, not
-  the test.
-- **Every audited pair clears its floor.** `contrast::theme_contrast_violations`
-  runs over `SELECTABLE_THEMES`, so the new presets are held to 4.5:1 on the
-  four surfaces and 3:1 for hint/dim/status/diff.
+Theme remapping keeps direct palette calls consistent with the active preset.
+The mode ramp remains distinct from the action lane so semantic remapping
+continues to work in reduced-color terminals. Contrast audits are
+role-specific: the existing audit requires 4.5:1 for its primary text pairs
+and 3:1 for hint/dim/status/diff pairs. A passing theme audit is not proof
+that an arbitrary component foreground/background combination is safe.
 
-`scripts/export-design-tokens.py` reads only `(WHALE|LIGHT)_*_RGB`, so the new
-`SHORELINE_*` constants deliberately leave `web/app/tokens.css` untouched —
-`--check` still passes. When the web surfaces are re-inked, that pattern is the
-one line to widen.
+## Typography
 
-### 2. What the market actually does (surveyed, not assumed)
+The terminal host owns the font, size and rasterization. There is no separate
+application display face. Hierarchy comes from bold identity and selection,
+regular body text, secondary metadata, and spacing between groups.
 
-Seven of nine reference checkouts under `refs/` are terminal TUIs (codex,
-opencode, kimi-code, grokbuild, oh-my-pi, piagent, prime-agent); `dsh` and
-`openhands` are not TUIs at all. The convergent rules:
+Home shows session titles and age; message counts stay in session details.
+An empty workspace omits the Recent section. Titles take priority over age. Width calculations
+and truncation use terminal display cells, including wide characters; omit
+metadata before reducing a useful title to a stub. Longer labels receive an
+explicit truncation marker rather than silently running under a border.
 
-1. **No persistent top bar.** 7/7. Branding is launch-only — codex's session
-   card and grokbuild's cwd bar are the first transcript cell, they scroll
-   away.
-2. **Exactly one status row, never two, never above the composer.** All five
-   that have a status line.
-3. **That row carries model + cwd + git branch + context % + cost.**
-4. **Full-width composer.** 7/7. No reading-column cap — this is where the
-   terminal convention and the desktop window legitimately differ, and the
-   terminal wins here.
-5. **Assistant turn = bare markdown on the field.** User turn = a filled
-   background or one coloured glyph, never bold text alone.
-6. **Tool calls are collapsible cards or one-line headers**, not bare lines.
-7. **One accent over a near-black field.** `#141414` recurs as the base field
-   in three separate projects.
+## Layout
 
-Against that list the TUI is already close on 1, 4, 5 and 6 — `work_surface::height`
-returns 0 unless a panel is explicitly open, the composer is full width, and
-tool receipts are typed cells. The live deviations are 2 and 3, and the launch
-screen's proportions.
+The home screen is the transcript's launch empty state, implemented by
+`underwater::launch_empty_state`. Identity and actions share a lane capped at
+72 text cells, centered when the terminal is wider, with a two-cell action
+gutter where width permits. Version metadata aligns to the opposite edge of
+the identity row. The workspace caption uses the real workspace and adds its
+actual branch only when it fits. Command help follows recent work and MCP;
+optional top breathing room consumes spare space only. There is no permanent
+mascot column or additional navigation sidebar. The composer remains full width.
 
-### 3. Deliberately not done
+The compact ladder removes spacing first, then migration notice and MCP
+detail, then help, workspace context and identity headings, before shortening
+the recent list.
+Hidden sessions remain reachable through the overflow action while space
+allows it. The MCP summary survives longer than its per-server detail. At
+extreme dimensions, New session is the final action retained. The painted
+row list is also the keyboard and mouse ordering: shrinking the terminal
+cannot leave an invisible recent session selected.
 
-- **The composer stays full width.** The GPUI client centres a 690px column;
-  no terminal agent does. Narrowing it here would be the desktop's layout
-  applied where the medium disagrees.
-- **The ocean is not deleted.** `underwater` keeps its water column, ombre and
-  ambient life. It is selectable, and `/theme` lists it. Nothing is lost.
+Shared full-screen settings geometry lives in `views::render_underwater_surface`.
+At fewer than 24 rows it removes outer vertical margins and top padding;
+bottom padding is zero. Horizontal outer margins disappear below 44 columns.
+These are shared layout decisions, not separate compact implementations for
+each settings page. Config's option editor only expands its header when
+three choices plus detail still fit. Model/Thinking panes stack when narrow;
+in short stacked layouts the inactive pane becomes one clickable summary
+and the focused pane receives the remaining space.
 
-## Remaining work
+**Keep the two footer owners until their interactions migrate together.**
+The posture/activity row in `phase_strip` carries permissions, mode, work
+navigation and transient state. The metrics row in `ui/frame.rs` carries
+route, model, context and cost information with its own user configuration
+and pointer targets. A one-row merge was an earlier proposal, not the
+implemented design. Hiding metrics would remove model/context interactions
+unless their measured targets and configuration migrated in the same slice.
+The Workbench index deliberately retains both rows and their shedding rules.
 
-### The one-status-row merge (highest value, not started)
+## Elevation & Depth
 
-Two rows sit under the composer:
+The terminal uses tonal surfaces and cell borders. The composer is a plate
+above the field; an inactive outline recedes without making the input vanish.
+Full-screen settings use restrained top and bottom rules. Protected-focus
+modals retain the existing terminal-cell shadow and border treatment.
+There are no new glow, blur, texture or decorative motion effects.
 
-- slot 6, the posture bar — `frame.rs:1820-1835` →
-  `phase_strip::tideline_footer_from_app` (`phase_strip.rs:1270`) →
-  `render_tideline_footer` (`phase_strip.rs:953`).
-- slot 7, the metrics line — `frame.rs:1841-1844` → `render_info_row`
-  (`frame.rs:387`), fed by `info_segments` (`frame.rs:61`).
+## Shapes
 
-They are separate systems with separate shed ladders, separate hitbox
-registries (`register_footer_count_targets`, `register_info_interaction_targets`)
-and separate golden families, so this is a merge, not a deletion.
+Actions are measured rows and rectangular controls sized in terminal cells.
+Their painted area is their pointer target. Home actions share a leading
+marker, keyboard selection uses a continuous filled band and bold text,
+and hover uses the elevated surface with an underline. New session has a
+quiet plate fill before focus; Recent's trailing rule separates the list
+without enclosing each session in a box. Pointer hover does
+not silently move keyboard selection. Borders and glyphs use the terminal's
+existing vocabulary, including its reduced-capability fallbacks.
 
-The shape that fits the existing design: **the footer becomes the one row**,
-gaining a route segment and a cost segment. `TidelineFooterFacts` already
-carries `context_percent` (it uses it for the ≥80% cap warning), and
-`phase_strip::route_identity_fields` — which the info line already calls — is
-the shared route formatter, so both segments are one call each. `metrics_line`
-then defaults to `ChromeRowPreset::Hidden` and the transcript gets the line
-back.
+## Components
 
-**The blocker to solve first, not after:** the metrics line owns two pointer
-targets — `/model` on the route segment and the context inspector on the meter.
-Hiding the row without re-homing them removes two interactions users have
-today. The footer's count rects are the precedent to copy: paint the segment,
-return its `Rect`, register the target. Do that in the same commit that
-hides the row, or the slice ships a regression.
+### Home and composer
 
-### The launch screen
+Typing begins through the existing composer. Up/Down and Enter navigate and
+activate visible home rows; clicking a recent row enters the same resume
+flow. The MCP summary opens the existing manager by mouse or keyboard. A
+problem row inserts its stated remedy into the composer so the user can see
+it before submission. No separate command or session authority is introduced.
 
-`underwater::launch_empty_state` (`underwater.rs:1948`) rides the hero mark
-(14×6, `MarkSize::Large`) beside three text lines and then a session card. Two
-things read as splash rather than product: the mark is unindented at the top
-left, and its six rows are taller than the text column beside it, so `New
-session` floats in the mark's dead space. The GPUI launch is a centred compact
-lockup — mark, wordmark, one heading, one line of subtitle. Worth doing; the
-golden churn is contained to the launch surfaces.
+The composer outline uses action blue only while the composer owns focus.
+Selecting a home action or opening another surface returns it to the quiet
+border tone. Permission and mode retain their own footer status instead of
+being repeated in a multicolor composer outline. Model metadata remains
+secondary to the message and its controls.
 
-### Adjacent, out of scope here
+### Resume confirmation
 
-- Two `main` test failures pre-date this branch and are unrelated:
-  `runtime_api::tests::set_config_rejects_unknown_key_with_bad_request`
-  (the code says `unknown setting`, the test expects `unknown config key` —
-  both present at `4a85cb7877`) and
-  `tui::views::tests::every_settings_row_reaches_a_store`
-  (`auto_compact_threshold_percent` is a schema row `Settings::set` never
-  accepted; also present at `4a85cb7877`).
-- `arrow_navigation_wraps_at_picker_edges` and
-  `theme_picker_uses_shared_settings_controller` are order-dependent under a
-  bare `cargo test`: they read the real user theme directory, so a
-  `custom:` row changes the last picker row. Run tests through
-  `scripts/dev-test.sh`, which supplies the hermetic HOME.
-- `crates/tui/src/tui/work_surface/tideline.rs:207-263` (`tideline_rail_groups`,
-  the RUNS/WHALES/FLEET/WORK/CONTEXT groups) is `#[allow(dead_code)]`
-  translation scaffolding. The live rail paints `RailPanel` dock tabs. It
-  should be deleted, not reimplemented.
+Resuming names the target session and explicitly states that its history
+replaces the current context. Warning and button space are reserved before
+the title and metadata; long titles truncate to one line and cannot push the
+consequence under a button. Both Resume and Cancel are real mouse targets.
+Tab, BackTab or Left/Right switches selection; Enter activates the selected
+button and its visible hint moves with selection. Escape always cancels.
+An outside click dismisses and never confirms.
 
-## Verification
+Successful restoration announces the sanitized session title through a
+localized success toast, using the existing status-toast owner. The string
+is supplied in all 15 locale packs. It no longer appends a filesystem path,
+session ID and message-count receipt to the restored transcript, so compact
+terminals return their space to the conversation.
 
-Goldens record cell symbols only — `golden_harness.rs:27-49` dumps
-`cell.symbol()`, so **a palette change is invisible to every golden buffer**.
-The `ink plane` the harness documents at `:84-94` would close that hole and is
-documented but unimplemented. Until it exists, palette regressions are caught
-by the contrast audit and by a real terminal capture, not by a golden.
+### Settings and pickers
 
-What was run, with counts, is recorded in the three commits on this branch.
+- **Models:** one provider context row retains catalog freshness without a
+  duplicate route banner. Only the focused pane receives the filled blue
+  selection; the inactive pane retains its current-choice marker. Hover
+  covers the measured row. Compact hints prioritize browsing, searching,
+  switching, applying and canceling; secondary bindings remain available.
+- **Providers:** ordinary management uses the full-screen shell regardless
+  of configured-provider count. Initial setup, credentials and consent keep
+  their modal flows. The borderless inspector shares the list's canvas and
+  keeps provider identity, credential source, route, endpoint, concise warning
+  lines and consent facts ahead of model choices and prices. The underlined,
+  clickable Open details action and shared Alt+V shortcut (⌥V on macOS)
+  open the existing scrollable pager. That projection retains every warning
+  and the full protocol/capability diagnostics rather than crowding them into
+  the overview. Escape returns to the provider manager.
+- **Provider choice stages:** Kimi plan tier, Stepfun billing route, xAI auth
+  and ChatGPT auth choices use wrapping, measured selectable rows. A first
+  click selects through the existing key action; a second click activates
+  through the existing Enter action. This does not change billing, consent
+  or credential policy. Key entry, custom-provider text fields and final
+  credential/consent confirmations retain their existing keyboard behavior.
+- **Extensions:** tabs and inventory rows share selection and independent
+  hover styles. Plugins initially selects the first actual item when one
+  exists; group headings remain reachable for folding. Inventory rows carry
+  identity and state, while the selected description/details have a separate
+  wrapping area of three rows when space permits, one otherwise. Resize
+  clears stale hitboxes before an invisible panel can retain actions. Trust,
+  enablement and removal continue through existing guarded flows.
+- **Fleet:** the compact roster header has a genuine Workers destination,
+  reachable by mouse and the existing keyboard action. The decorative Setup
+  pseudo-tab is gone. Setup/edit belongs to the selected real member; the
+  display-only Coordinator does not advertise an Enter action it cannot run.
+  Navigation rows preserve identity, role, shadow and edit markers, adding
+  route text only for explicit overrides. Repeated inherited-route sentences
+  and species mosaics no longer tax every row; the selected inspector retains
+  full member identity, route and detail with quiet inline property labels.
+- **Config:** category tabs and Apply use the shared selection treatment.
+  Selected row annotations inherit readable selection ink instead of keeping
+  dim or action-colored text over the selection band.
+
+### Camera readability and evidence
+
+The founder's acceptance criterion includes pictures and video: recognizable
+identity, clear hierarchy when reduced, stable composition during interaction,
+and consistent state colors. The compact wordmark, repeated action gutter
+and shared selection treatment serve that criterion. Extra ornament is not
+evidence of camera readability.
+
+The validation set is 40×12, 60×16, 80×24, 100×32 and 140×40: populated home,
+MCP failure, selection, resumed conversation, long-title confirmation and
+Cancel selected, plus representative settings surfaces and provider details.
+Use fresh evidence for the exact source/binary being delivered; earlier
+captures do not qualify a later presentation slice. The capture method
+reconstructs actual PTY cells and their RGB/SGR state with Menlo and Apple
+Color Emoji fallback. These images are not screenshots of the host terminal
+and do not prove host font behavior. Static frames do not prove motion,
+transition timing or video quality.
+
+The saved conversation and failing MCP server in this evidence are synthetic
+local fixtures, not customer sessions or working-provider claims. Passing
+interaction tests demonstrates those tested paths; it does not establish
+provider success, installation, hosted CI, publication or whole-release
+readiness. Symbol-only goldens cannot validate color. Use color-preserving
+PTY evidence and the contrast audit alongside layout/interaction checks;
+record exact build and installation receipts separately.
+
+## Do's and Don'ts
+
+- **Do** preserve useful content before spacing, branding and secondary hints.
+- **Do** share geometry between painting and input, and clear targets on resize.
+- **Do** keep keyboard selection, pointer hover and consequential state distinct.
+- **Do** reserve consequence text before decorative or variable-length content.
+- **Do** check long titles, wide characters, compact choices and selected text
+  on the surface where users actually read them.
+- **Don't** restore a large launch mark at the expense of session-title width.
+- **Don't** hide footer owners or turn decorative labels into apparent controls.
+- **Don't** invent new tokens, runtime owners or permissive mutation paths to
+  implement a visual treatment.
+- **Don't** describe reconstructed cells as host screenshots or static captures
+  as motion proof, and don't imply every settings subview gained mouse parity.
+
+
+## Working-screen performance readings (2026-09-20)
+
+TTFT and output rate reuse the existing session accumulator. The compact footer
+keeps selected performance readings when they fit, shedding secondary counts
+and help first. `/statusline` offers separate Time to first token and Output
+rate controls with immediate preview, Enter to save and Esc to restore. Old
+`session_metrics` settings continue to enable both and become separate choices
+when edited. Full, compact and hidden row settings remain in `/config`.
+
+The motion focal point remains the shared activity marker: request progress,
+verification and completion use one cadence and the existing bounded completion
+settle. Numbers stay still between measured receipts, preserving legibility on
+video. There is no synthetic live speed counter, new timer or extra footer row.
+Reduced and still motion retain the same readings and explicit phase words.
+TTFT is a session average; throughput includes first-token wait and stream
+pauses, but excludes tool/idle gaps. Missing measurements stay absent.
+
+
+## Identity, theme and motion refinement (2026-09-20)
+
+Claude Fable 5.1 reviewed real terminal-cell captures and current motion source.
+The founder explicitly chose a brief whale reveal: the canonical braille mark
+resolves through nested dot masks over 360 ms, once from its first launch paint.
+Text and controls are complete immediately. Typing, paste or resize settles the
+mark; reduced/still motion shows the complete asset immediately. This reuses the
+existing frame scheduler and requests no reveal frames after the endpoint.
+
+Completion keeps the word Done stable while its existing glyph settles. Generic
+working status uses a direct verb. The send control uses action ink only when the
+same predicate used by its click handler permits submission; otherwise it is dim.
+Locked model rows retain readable keyboard focus and their availability warning.
+New session uses body ink on its filled plate to meet text contrast in light and
+warm themes. Uwu now participates in the same remapping as other named presets.
+
+Themes are being checked against five color families: surface, neutral text,
+action, live/outcome, and attention/danger. Shades preserve contrast and severity;
+labels and symbols retain meaning without color. Underwater keeps its ambient
+identity within the same chrome discipline. Nonempty NO_COLOR selects monochrome
+output: terminal-owned foreground, background, and underline colors, preserving
+text modifiers and selection symbols. ANSI16 remains a distinct colored fallback
+for terminals with a limited palette.

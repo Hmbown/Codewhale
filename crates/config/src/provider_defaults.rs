@@ -213,6 +213,8 @@ pub(crate) const DEFAULT_ZENMUX_BASE_URL: &str = "https://zenmux.ai/api/v1";
 // `provider/model` pins a provider and `concentrate/auto` is the gateway router.
 pub(crate) const DEFAULT_CONCENTRATE_MODEL: &str = "deepseek-v4-pro";
 pub(crate) const DEFAULT_CONCENTRATE_BASE_URL: &str = "https://api.concentrate.ai/v1";
+pub(crate) const DEFAULT_CSDN_MODEL: &str = "glm_for_coding";
+pub(crate) const DEFAULT_CSDN_BASE_URL: &str = "https://ai.csdn.net/api/model/v1";
 // Codewhale API (account-backed model access) defaults. The account control
 // plane serves an OpenAI-shaped `GET /v1/models` whose rows carry the wire
 // protocol per model, so this route is model-aware and its catalog is the

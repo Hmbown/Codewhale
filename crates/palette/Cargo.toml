@@ -11,7 +11,7 @@ description = "Colour tokens, themes, and contrast math for Codewhale's terminal
 workspace = true
 
 [dependencies]
-codewhale-config = { path = "../config", version = "0.9.14" }
+codewhale-config = { path = "../config", version = "0.10.0" }
 ratatui = { version = "=0.30.2", features = ["unstable-rendered-line-info"] }
 serde.workspace = true
 serde_json = { workspace = true, features = ["preserve_order", "raw_value"] }

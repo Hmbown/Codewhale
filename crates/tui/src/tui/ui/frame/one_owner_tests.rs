@@ -157,23 +157,20 @@ fn composed_frame_paints_each_fact_in_exactly_one_row() {
         // The context reading paints exactly once, at every fullness
         // (#5950 — it used to go silent below 50%).
         let mut facts = vec![
-            ("mode chip", format!("· {mode} (")),
-            ("permission chip", format!("▶▶ {permission} (")),
+            ("mode chip", format!("   {mode} (")),
+            ("permission chip", format!(" {permission} (")),
             ("model", model),
             ("cost", super::session_cost_label(&app)),
             ("agent count", "2 agents".to_string()),
-            (
-                "help hint",
-                crate::tui::shell_key_routing::info_help_hint(app.ui_locale),
-            ),
             ("ttft", "ttft 400ms".to_string()),
         ];
         facts.push(("context reading", format!("ctx {pct}%")));
+        facts.push(("output rate", "40 avg tok/s".to_string()));
         if width >= 120 {
-            facts.push(("output rate", "40 avg tok/s".to_string()));
-        } else {
-            // The billing tier takes priority over rate at narrow widths.
-            assert_eq!(count_rows_containing(&rows, "40 avg tok/s"), 0);
+            facts.push((
+                "help hint",
+                crate::tui::shell_key_routing::info_help_hint(app.ui_locale),
+            ));
         }
         for (name, needle) in facts {
             if needle.is_empty() {
@@ -190,7 +187,7 @@ fn composed_frame_paints_each_fact_in_exactly_one_row() {
         // roster — never the other way round.
         let posture = rows
             .iter()
-            .position(|row| row.contains("▶▶"))
+            .position(|row| row.contains("(Shift+Tab)"))
             .expect("posture bar");
         let metrics = rows
             .iter()
@@ -281,7 +278,7 @@ fn idle_frame_keeps_two_chrome_rows_and_last_turn_metrics() {
     app.subagent_cache.clear();
     let rows = draw(&mut app, 100, 32);
     let composer = app.viewport.last_composer_area.unwrap().bottom() as usize;
-    assert!(rows[composer].starts_with("▶▶"), "{}", rows[composer]);
+    assert!(rows[composer].contains("(Shift+Tab)"), "{}", rows[composer]);
     // The idle fixture sits at 0% context and says so: the reading is on
     // the row at every fullness (#5950), not only once it is a problem.
     assert!(
@@ -370,7 +367,7 @@ fn row_presets_reclaim_rows_and_quiet_them_in_the_composed_frame() {
     // halves only both fit beside the pinned unenforced-scope permission
     // chip from that width up, and this test asserts the full row's clocks.
     let (width, height) = (160u16, 32u16);
-    let posture_row = |rows: &[String]| rows.iter().position(|row| row.contains("▶▶"));
+    let posture_row = |rows: &[String]| rows.iter().position(|row| row.contains("(Shift+Tab)"));
     let metrics_row = |rows: &[String]| rows.iter().position(|row| row.contains("ctx "));
 
     let mut app = working_app();
@@ -418,7 +415,7 @@ fn row_presets_reclaim_rows_and_quiet_them_in_the_composed_frame() {
     assert_eq!(count_rows_containing(&rows, "deepseek-v4-pro"), 0);
 
     // Compact both: the rows are back, quieter — the posture and the
-    // route/reading/price, none of the live facts or telemetry.
+    // route/reading/price and measured performance, without secondary counts.
     app.posture_bar = ChromeRowPreset::Compact;
     app.metrics_line = ChromeRowPreset::Compact;
     let rows = draw(&mut app, width, height);
@@ -446,9 +443,10 @@ fn row_presets_reclaim_rows_and_quiet_them_in_the_composed_frame() {
         "{:?}",
         rows[metrics]
     );
+    assert!(rows[metrics].contains("ttft 400ms"), "{}", rows[metrics]);
+    assert!(rows[metrics].contains("40 avg tok/s"), "{}", rows[metrics]);
     for gone in [
-        "tok/s",
-        "ttft",
+        "↓ 1.2K",
         crate::tui::shell_key_routing::info_help_hint(app.ui_locale).as_str(),
     ] {
         assert!(
@@ -647,7 +645,14 @@ fn statusline_full_frame_presets_preserve_transcript_composer_and_hitboxes() {
                 assert_eq!(count_rows_containing(&rows, "ctx 0%"), 1, "{evidence}");
             }
             if metrics == ChromeRowPreset::Compact {
-                for shed in ["tok/s", "ttft", "Ctrl+/ help"] {
+                if width >= 60 {
+                    assert!(rows[usize::from(height - 1)].contains("ttft"), "{evidence}");
+                    assert!(
+                        rows[usize::from(height - 1)].contains("avg tok/s"),
+                        "{evidence}"
+                    );
+                }
+                for shed in ["↓ 1.2K", "Ctrl+/ help"] {
                     assert!(!rows[usize::from(height - 1)].contains(shed), "{evidence}");
                 }
             }

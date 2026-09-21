@@ -70,12 +70,6 @@ fn bundled_integration_skills_use_current_codewhale_commands_and_paths() {
 /// dirty tree — must survive any later edit to the retained body.
 #[test]
 fn contributor_onboarding_is_repo_local_and_keeps_its_refusals() {
-    // The pin tracks the current catalog generation: 9 added handoff,
-    // 10 added mcp-discovery (#5238), 11 rewrote mcp-discovery from a
-    // Registry-first gate into a missing-capability fallback, 12 added the
-    // everyday pack and demoted contributor-onboarding to repo-local, 13
-    // trimmed social-media/health and demoted feedback to repo-local.
-    assert_eq!(BUNDLED_SKILL_VERSION, "13");
     assert!(
         !is_bundled_skill_name("contributor-onboarding"),
         "contributor-onboarding must not ship to every user anymore"
@@ -663,5 +657,45 @@ fn procedural_skill_homes_remain_bundled_and_lazy() {
             is_bundled_skill_name(name),
             "procedural skill home must remain available on demand: {name}"
         );
+    }
+}
+
+#[test]
+fn generation_14_refreshes_known_bodies_and_preserves_customizations_and_deletions() {
+    for (name, old) in SUPERSEDED_BODIES
+        .iter()
+        .filter(|(name, _)| *name != "mcp-discovery")
+    {
+        let skill = BUNDLED_SKILLS
+            .iter()
+            .find(|skill| skill.name == *name)
+            .unwrap();
+        assert_ne!(*old, skill.body);
+        for customized in [false, true] {
+            let tmp = TempDir::new().unwrap();
+            let file = skill_file(&tmp, name);
+            fs::create_dir_all(skill_dir(&tmp, name)).unwrap();
+            let body = if customized {
+                format!("{old}\nMy instructions.\n")
+            } else {
+                old.to_string()
+            };
+            fs::write(&file, &body).unwrap();
+            fs::write(marker_file(&tmp), "13").unwrap();
+            install_system_skills(tmp.path()).unwrap();
+            assert_eq!(
+                fs::read_to_string(file).unwrap(),
+                if customized {
+                    body
+                } else {
+                    skill.body.to_string()
+                },
+                "{name}"
+            );
+        }
+        let tmp = TempDir::new().unwrap();
+        fs::write(marker_file(&tmp), "13").unwrap();
+        install_system_skills(tmp.path()).unwrap();
+        assert!(!skill_file(&tmp, name).exists(), "{name} must stay deleted");
     }
 }

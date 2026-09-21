@@ -37,10 +37,10 @@ export interface RepoFacts {
 }
 
 export const FACTS: RepoFacts = {
-  "generatedAt": "2026-09-18T18:49:13.339Z",
+  "generatedAt": "2026-09-20T04:56:43.746Z",
   "sourceRevision": null,
   "sourceCommittedAt": null,
-  "version": "0.9.14",
+  "version": "0.10.0",
   "crates": [
     "agent",
     "app-server",
@@ -290,6 +290,11 @@ export const FACTS: RepoFacts = {
       "env": "ZENMUX_API_KEY"
     },
     {
+      "id": "csdn",
+      "label": "CSDN 星图 (Starmap)",
+      "env": "CSDN_API_KEY"
+    },
+    {
       "id": "concentrate",
       "label": "Concentrate",
       "env": "CONCENTRATE_API_KEY"
@@ -321,6 +326,30 @@ export const FACTS: RepoFacts = {
     }
   ],
   "models": [
+    {
+      "id": "step-3.5-flash",
+      "provider": "StepFun",
+      "contextWindow": 256000,
+      "maxOutput": null,
+      "reasoning": true,
+      "addedAt": "2026-09-19"
+    },
+    {
+      "id": "step-3.5-flash-2603",
+      "provider": "StepFun",
+      "contextWindow": 256000,
+      "maxOutput": null,
+      "reasoning": true,
+      "addedAt": "2026-09-19"
+    },
+    {
+      "id": "step-5-preview",
+      "provider": "StepFun",
+      "contextWindow": 1000000,
+      "maxOutput": 1000000,
+      "reasoning": true,
+      "addedAt": "2026-09-19"
+    },
     {
       "id": "qwen3.5-flash",
       "provider": "Qwen",
@@ -771,10 +800,10 @@ export const FACTS: RepoFacts = {
     },
     {
       "id": "step-3.7-flash",
-      "provider": null,
+      "provider": "StepFun",
       "contextWindow": 256000,
       "maxOutput": 256000,
-      "reasoning": false,
+      "reasoning": true,
       "addedAt": "2026-06-12"
     },
     {

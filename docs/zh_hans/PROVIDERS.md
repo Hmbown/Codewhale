@@ -26,7 +26,7 @@ DeepSeek 仍是默认提供商，但 `ProviderKind::ALL` 中的每个条目都�
 `together`, `qianfan`, `openai-codex`, `anthropic`, `openmodel`, `zai`,
 `stepfun`, `minimax`, `deepinfra`, `sakana`, `longcat`, `opencode-go`,
 `opencode-zen`, `meta`, `xai`, `mistral`, `telecomjs`, `modelstudio-token-plan`, `modelscope`,
-`google`, `antigravity`, `edenai`, `zenmux`, 和 `custom`。
+`google`, `antigravity`, `edenai`, `zenmux`, `csdn`, 和 `custom`。
 
 `deepseek-anthropic` *不在*此列表中——它是 `deepseek` 的线协议方言，通过 `wire = "anthropic"` 访问，而不是一个可单独选择的路由。
 
@@ -97,6 +97,7 @@ DeepSeek 仍是默认提供商，但 `ProviderKind::ALL` 中的每个条目都�
 | `antigravity` | `[providers.antigravity]` | 无——请求默认失败关闭；仅凭据导入 | `ANTIGRAVITY_API_KEY`（密钥平面）；`AGY_ADC_AUTH`（进程环境变量） |
 | `edenai` | `[providers.edenai]` | OpenAI Chat Completions | `EDENAI_API_KEY` |
 | `zenmux` | `[providers.zenmux]` | OpenAI Chat Completions | `ZENMUX_API_KEY` |
+| `csdn` | `[providers.csdn]` | OpenAI Chat Completions | `CSDN_API_KEY` |
 | `modelstudio-token-plan` | `[providers.modelstudio_token_plan]` | OpenAI Chat Completions | `MODELSTUDIO_API_KEY`, `DASHSCOPE_API_KEY` |
 | `modelstudio-token-plan-anthropic` | `[providers.modelstudio_token_plan_anthropic]` | Anthropic Messages | `MODELSTUDIO_API_KEY`, `DASHSCOPE_API_KEY` |
 | `modelstudio-coding-plan` | `[providers.modelstudio_coding_plan]` | OpenAI Chat Completions | `MODELSTUDIO_API_KEY`, `DASHSCOPE_API_KEY` |
@@ -348,6 +349,7 @@ model = "qwen3:8b"        # 默认是 deepseek-v4-flash
 | `antigravity` | 用官方 `agy` CLI（1.1.13）登录。在 `codewhale auth external-consent` 之后，Codewhale 可以只读地读取该登录的精确定点 `state.vscdb` 中的 OAuth token；它从不写入或刷新该文件。`ANTIGRAVITY_API_KEY` 或进程的 `AGY_ADC_AUTH` 优先于该文件。云代码线协议未实现：请求失败关闭并给出可操作的消息——Gemini 模型请使用 `google`。 |
 | `edenai` | [Eden AI API 密钥](https://app.edenai.run/settings/api-keys) |
 | `zenmux` | [ZenMux API 密钥](https://zenmux.ai/platform/pay-as-you-go) |
+| `csdn` | [CSDN 星图控制台](https://ai.csdn.net/workbench/api-key)——`glm_for_coding` 套餐路由请选择 Coding Plan 密钥类型；通用密钥按量计费。文档：[Coding Plan](https://ai.csdn.net/coding-plan)。 |
 | `modelstudio-token-plan`, `modelstudio-token-plan-anthropic`, `modelstudio-coding-plan`, `modelstudio-coding-plan-anthropic` | [阿里云百炼 Model Studio（百炼控制台）](https://bailian.console.aliyun.com/) —— 创建或复制 Model Studio API 密钥。 |
 | `custom` | 设置该具名提供商的 `base_url` 和 `api_key_env` 或 `api_key`；不存在规范的厂商凭据页面。 |
 
@@ -424,6 +426,7 @@ Kimi 仍然仅支持 API 密钥；对 Kimi 的外部授权被拒绝。
 | `mistral` | `[providers.mistral]` | `MISTRAL_API_KEY` | `MISTRAL_BASE_URL`；默认 `https://api.mistral.ai/v1` | `mistral-code-latest`（默认；`codestral-latest` 接受为别名）, `mistral-medium-latest`（别名：`mistral-medium-3-5`）, `mistral-small-latest`（别名：`mistral-small-2603`）, `mistral-large-latest` | Mistral AI（la Plateforme）OpenAI 兼容 Chat 路由。在文档化的第一方 HTTPS `/v1` 主机上，Medium 和 Small 发送可调的 `reasoning_effort`（仅 `none` 或 `high`），解析 Mistral 的多态 thinking/text 块，并以相同线协议形状重放存储的思考。已废弃的原生 Magistral ID 仍是显式配置兼容路由：它们始终思考，从不接收可调 effort 字段。Code 和 Large 不推理。除非是文档化的第一方主机之一，自定义 `MISTRAL_BASE_URL` 保持通用 Chat 语义。接受 `MISTRAL_MODEL`。提供商别名：`mistral-ai`, `mistralai`, `la-plateforme`。 |
 | `edenai` | `[providers.edenai]` | `EDENAI_API_KEY` | `EDENAI_BASE_URL`；默认 `https://api.edenai.run/v3`；欧盟 `https://api.eu.edenai.run/v3` | `deepseek/deepseek-v4-pro`（默认）；`provider/model` id 的实时 `/models` 目录 | Eden AI OpenAI 兼容聚合网关。目录行保持提供商范围；通用推理控制被省略，因为受支持的字段取决于所选上游家族。接受 `EDENAI_MODEL`。默认的 `deepseek/deepseek-v4-pro` 只列在全球目录上；在欧盟端点上把 `EDENAI_MODEL`（或 `model`）设为欧盟 `/models` 列表中的一行，例如 `qwen/deepseek-v4-pro`。提供商别名：`eden-ai`, `eden_ai`。 |
 | `zenmux` | `[providers.zenmux]` | `ZENMUX_API_KEY` | `ZENMUX_BASE_URL`；默认 `https://zenmux.ai/api/v1` | `deepseek/deepseek-v4.1-flash`（默认）；`provider/model` id 的实时 `/models` 目录（免密钥可读） | ZenMux OpenAI 兼容聚合网关（约 190 个模型）。目录行保持提供商范围；通用推理控制被省略，因为受支持的字段取决于所选上游家族。接受 `ZENMUX_MODEL`。提供商别名：`zen-mux`, `zen_mux`。 |
+| `csdn` | `[providers.csdn]` | `CSDN_API_KEY` | `CSDN_BASE_URL`；默认 `https://ai.csdn.net/api/model/v1` | `glm_for_coding`（默认；Coding Plan 专用模型 id）；其他市场模型 id 直通 | CSDN 星图（Starmap）OpenAI 兼容托管平台。Coding Plan 密钥与通用市场密钥共用一个端点，因此计费取决于凭据产品而非 URL 本身：路由 `glm_for_coding`（出厂默认）或设置 `mode = "coding_plan"`/`"plan"`/`"subscription"` 按 CSDN Coding Plan 配额计费，不显示美元估算；任何其他模型或显式 `pay-as-you-go`/`metered` 模式按量计费；无法识别的模式或 `ai.csdn.net/api/model/v1` 之外的端点报告 `cost: unknown`。接受 `CSDN_MODEL`。提供商别名：`csdn-ai`, `csdn_ai`, `csdn-coding-plan`, `csdn_coding_plan`, `starmap`。 |
 | `xai` | `[providers.xai]` | `XAI_API_KEY`、Codewhale 自有的设备 OAuth，或显式的只读 Grok CLI 授权 | `XAI_BASE_URL`；默认 `https://api.x.ai/v1` | `grok-4.6`（默认）, `grok-4.5`, `grok-4.3`, `grok-build`, `grok-composer-2.5-fast`, `grok-4.20-0309-reasoning`, `grok-4.20-0309-non-reasoning` | xAI/Grok OpenAI 兼容 Chat Completions 路由。Grok 4.6 有 500K 上下文窗口、文本/图像输入、函数调用、结构化输出、服务端 web 搜索和 `low`/`medium`/`high`/`xhigh` 推理（默认 `high`）。提示达到 200K token 时其标准费率翻倍；同样的 2 倍长上下文规则适用于 `grok-4.5`（500K 上下文，$2.00 / $0.30 缓存 / $6.00）和 `grok-4.3`（1M 上下文，$1.25 / $0.20 缓存 / $2.50），按其[模型页](https://docs.x.ai/docs/models/grok-4.5)。没有文档化的 `latest`/`fast` 别名，也没有公布的数字输出上限。**API 密钥**（默认）：来自 console.x.ai 的 Bearer token，通过 `XAI_API_KEY` / keyring / `api_key`。**OAuth**：`codewhale auth xai-device` 使用 SSH 友好的设备登录和 Codewhale 自有的存储，它可能自行刷新。现有的 Grok CLI 凭据需要 `codewhale auth external-consent --provider xai --mode read-only`；被授予的外部文件从不刷新或重写。OAuth 在某些 SuperGrok 层级上可能返回 HTTP 403——把 API 密钥作为可靠回退。接受 `XAI_MODEL`。提供商别名：`x-ai`, `x_ai`, `grok`。 |
 | `modelstudio-token-plan` | `[providers.modelstudio_token_plan]` | `MODELSTUDIO_API_KEY`, `DASHSCOPE_API_KEY` | `MODELSTUDIO_TOKEN_PLAN_BASE_URL`；默认 `https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1` | `qwen3.8-max`（默认）, `qwen3.8-max-preview`, `qwen3.7-plus`, `qwen3.7-max`, `qwen3.6-flash`, `deepseek-v4-pro`, `deepseek-v4-flash-0731`, `glm-5.2` | 阿里云 Model Studio Token Plan OpenAI 兼容 Chat Completions 路由。Token Plan 个人版和团队版共享该端点。列出的所有模型都是可推理的文本/编码模型。DeepSeek 和 GLM 条目是提供商范围的，不与第一方路由冲突。接受 `MODELSTUDIO_TOKEN_PLAN_MODEL`。提供商别名：`modelstudio-token-plan`, `alibaba-token-plan`, `dashscope-token-plan`。 |
 | `modelstudio-token-plan-anthropic` | `[providers.modelstudio_token_plan_anthropic]` | `MODELSTUDIO_API_KEY`, `DASHSCOPE_API_KEY` | 默认 `https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic` | 与 `modelstudio-token-plan` 相同的模型目录 | Token Plan Anthropic 兼容 Messages 路由（`/apps/anthropic`）。与 OpenAI 方言相同的 API 密钥。提供商别名：`modelstudio-token-plan-anthropic`, `alibaba-token-plan-anthropic`。 |

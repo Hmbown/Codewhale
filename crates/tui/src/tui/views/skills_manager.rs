@@ -1,4 +1,4 @@
-//! Unified `/skills` manager — audit inventory + mutation actions.
+//! Dedicated `/skills manage` manager — audit inventory + mutation actions.
 //!
 //! This view never writes files. Keys emit [`ViewEvent::SkillMutationRequested`];
 //! the host runs [`crate::skills::mutation`] and rebuilds the view.

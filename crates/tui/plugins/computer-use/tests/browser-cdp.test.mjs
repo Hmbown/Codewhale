@@ -257,3 +257,15 @@ test("checkBrowserUrl allows http(s) and about:blank only; findBrowserApp honors
   assert.equal(findBrowserApp("darwin", {}, () => false), null);
   assert.equal(findBrowserApp("darwin", { CODEWHALE_CU_BROWSER_APP: "/custom/Chromium.app" }, () => false), "/custom/Chromium.app");
 });
+
+test('findBrowserApp uses actual Windows vendor folders and executable names', () => {
+  for (const [root, relative] of [
+    ['ProgramFiles', 'Google\\Chrome\\Application\\chrome.exe'],
+    ['ProgramFiles(x86)', 'Microsoft\\Edge\\Application\\msedge.exe'],
+    ['LOCALAPPDATA', 'BraveSoftware\\Brave-Browser\\Application\\brave.exe'],
+    ['LOCALAPPDATA', 'Chromium\\Application\\chrome.exe'],
+  ]) {
+    const expected = `C:\\fixture\\${relative}`;
+    assert.equal(findBrowserApp('win32', { [root]: 'C:\\fixture' }, candidate => candidate === expected), expected);
+  }
+});

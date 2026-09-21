@@ -459,12 +459,30 @@ except Exception as e:
       }
       throw new ExecError("list_windows needs wmctrl (X11), swaymsg (sway) or hyprctl (hyprland)");
     },
-    open_application: async ({ name, bundle_id: bid, url: urlArg } = {}) => {
+    open_application: async ({ name, bundle_id: bid, url: urlArg, activate } = {}) => {
       const target = name ?? bid;
       if (!target || !/^[A-Za-z0-9][A-Za-z0-9 ._-]*$/.test(target)) throw new ExecError("open_application needs a plain executable/desktop name");
+      // activate defaults to background: on X11 a new window grabs focus, so
+      // remember the active window and hand focus back after the launch.
+      let prevWindow = null;
+      if (activate !== true) {
+        try {
+          await probeSession();
+          if (session === "x11" && tools.xdotool) {
+            const active = await run("xdotool", ["getactivewindow"], { timeoutMs: 3_000 });
+            if (active.code === 0 && /^\d+$/.test(active.stdout.trim())) prevWindow = active.stdout.trim();
+          }
+        } catch { /* no session/tools — the launch itself is still fine */ }
+      }
       spawnDetached(target, urlArg ? [urlArg] : [], "", true);
       await new Promise((r) => setTimeout(r, 500));
-      return { launched: true, name: target, url: urlArg ?? null };
+      let focusRestored = false;
+      if (prevWindow) {
+        try {
+          focusRestored = (await run("xdotool", ["windowactivate", prevWindow], { timeoutMs: 3_000 })).code === 0;
+        } catch { /* best-effort */ }
+      }
+      return { launched: true, name: target, url: urlArg ?? null, activate: activate === true, ...(activate === true ? {} : { focus_restored: focusRestored }) };
     },
     get_app_state: async ({ app_ref, window_id } = {}) => {
       const name = appName(app_ref);
@@ -671,24 +689,37 @@ print(json.dumps({"found": True, "reason": None, "element": {
       return { action_sent: true, key: k, heldSec: d };
     },
     set_value: async ({ target, value }) => {
-      const out = await atspiResolve(
-        target,
-        `    v = found.queryValue()
-    v.currentValue = float(extra)`,
-        value,
-      ).catch(async (e) => {
-        // Fall back to the Text interface for text-bearing widgets.
-        const out2 = await atspiResolve(
-          target,
-          `    t = found.queryText()
-    t.setTextContents(extra)`,
-          String(value),
-        );
-        if (!out2.ok) throw e;
-        return out2;
-      });
+      // Select a supported interface before sending input. A refused write or
+      // failed readback must never trigger a second, ambiguously applied edit.
+      const out = await atspiResolve(target, `    state = found.getState()
+    if not state.contains(pyatspi.STATE_ENABLED):
+        raise RuntimeError("element_disabled")
+    try:
+        editor = found.queryEditableText()
+    except NotImplementedError:
+        editor = None
+    if editor is not None:
+        if not state.contains(pyatspi.STATE_EDITABLE):
+            raise RuntimeError("element_read_only")
+        if not editor.setTextContents(extra):
+            raise RuntimeError("value_rejected")
+        text = found.queryText()
+        after = text.getText(0, text.characterCount)
+        if after != extra:
+            raise RuntimeError("value_verification_failed")
+    else:
+        import math
+        desired = float(extra)
+        if not math.isfinite(desired):
+            raise RuntimeError("invalid_value")
+        numeric = found.queryValue()
+        numeric.currentValue = desired
+        after = numeric.currentValue
+        if after != desired:
+            raise RuntimeError("value_verification_failed")
+    print(json.dumps({"ok": True, "after": after}))`, String(value));
       if (!out.ok) throw new ExecError(`set_value failed: ${out.code}`);
-      return { action_sent: true, strategy: "a11y" };
+      return { action_sent: true, strategy: "a11y", verified: true, after: out.after };
     },
     select_text: async () => { throw new ExecError("select_text is not implemented on the linux backend — fail-closed"); },
     perform_action: async ({ target, action }) => {

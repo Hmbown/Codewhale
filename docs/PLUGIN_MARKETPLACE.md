@@ -2,7 +2,7 @@
 
 Codewhale includes an offline snapshot of the `codewhale` catalog in the same
 marketplace store consumed by the terminal, Extensions, recommendations, and
-Runtime API. It lists Computer Use, WhaleWiki, Cloudflare Docs, and the
+Runtime API. It lists Computer Use, WhaleWiki, Whalesong, Cloudflare Docs, and the
 Codewhale skill bundle. Browsing does not fetch or execute anything.
 
 ```text
@@ -27,14 +27,14 @@ The bundle source uses a gzip tarball URL with `#path=plugins/whalewiki` (or
 repository archive. Only that subtree is installed. Empty paths, traversal,
 ambiguous roots, links, oversized archives, and changed plugin identities are
 rejected. The install receipt preserves the source, including its selector,
-so `/plugin update` uses the same bundle and update channel.
+so `/plugin update` retains the same bundle selector and reviewed revision.
 
 ## Keeping the repositories current
 
 | Content | Authoritative source | Copies to check |
 | --- | --- | --- |
-| Catalog, WhaleWiki, Cloudflare Docs | `Hmbown/codewhale-plugin-marketplace` | Core catalog snapshot |
-| Bundled skills | Core `crates/tui/assets/skills` | Marketplace `skills` |
+| Catalog, WhaleWiki, Whalesong, Cloudflare Docs | `Hmbown/codewhale-plugin-marketplace` | Core catalog snapshot |
+| Bundled skills | Core active catalog and `crates/tui/assets/skills` | Marketplace `skills` and `skills/upstream.json` |
 | Computer Use | `Hmbown/codewhale-cu-plugin` | Marketplace plugin and Core bundled runtime |
 
 The `Marketplace connection` workflow validates the exact catalog revision on
@@ -48,6 +48,8 @@ source-owned copies, and run the marketplace checks:
 
 ```sh
 # From codewhale-plugin-marketplace, with sibling source checkouts:
+# After committing canonical skill changes, when intentionally updating skills:
+npm run sync:skills
 npm run check -- --core ../codewhale
 npm run check:cu-sync
 npm test && npm run check:web
@@ -64,9 +66,10 @@ npm test && npm run check:web
 ```
 
 Review the generated snapshot and rebuild Core. Its provenance records the
-exact marketplace commit, while each plugin's update channel follows the
-reviewed repository's `main` branch. Publish the marketplace revision before
-publishing a Core release that references it. Hosted CI must be green for the
+exact marketplace commit, and each generated bundle URL pins that immutable
+revision. A later marketplace change requires refreshing the Core snapshot and
+rebuilding; an existing pinned install does not silently follow `main`. Push the
+reviewed marketplace revision before publishing a Core release that references it. Hosted CI must be green for the
 actual published revisions; local checks do not prove a public URL works.
 
 Skill wording changes also need behavioral evaluation before claiming better

@@ -128,7 +128,7 @@ The canonical provider IDs are the 44 entries of `ProviderKind::ALL`
 `together`, `qianfan`, `openai-codex`, `anthropic`, `openmodel`, `zai`,
 `stepfun`, `minimax`, `deepinfra`, `sakana`, `longcat`, `opencode-go`,
 `opencode-zen`, `meta`, `xai`, `mistral`, `telecomjs`, `modelstudio-token-plan`, `modelscope`,
-`google`, `edenai`, `zenmux`, `concentrate`, `codewhale`, and `custom`.
+`google`, `edenai`, `zenmux`, `csdn`, `concentrate`, `codewhale`, and `custom`.
 
 `deepseek-anthropic` is *not* on this list — it is a wire dialect of
 `deepseek`, reached with `wire = "anthropic"`, not a separate route to select.
@@ -234,6 +234,7 @@ the listed provider env vars.
 | `google` | `[providers.google]` | OpenAI Chat Completions (official Gemini OpenAI-compat route; captures and replays thought signatures on tool calls) | `GOOGLE_API_KEY`, `GEMINI_API_KEY` |
 | `edenai` | `[providers.edenai]` | OpenAI Chat Completions | `EDENAI_API_KEY` |
 | `zenmux` | `[providers.zenmux]` | OpenAI Chat Completions | `ZENMUX_API_KEY` |
+| `csdn` | `[providers.csdn]` | OpenAI Chat Completions | `CSDN_API_KEY` |
 | `concentrate` | `[providers.concentrate]` | OpenAI Responses (`/v1/responses`) | `CONCENTRATE_API_KEY` |
 | `codewhale` | `[providers.codewhale]` | Model-aware: OpenAI Chat Completions (`/v1/chat/completions`) or Anthropic Messages (`/v1/messages`), chosen per model by the account catalog | `CODEWHALE_API_KEY` |
 | `modelstudio-token-plan` | `[providers.modelstudio_token_plan]` | OpenAI Chat Completions | `MODELSTUDIO_API_KEY`, `DASHSCOPE_API_KEY` |
@@ -595,6 +596,7 @@ configuration path instead of guessing a vendor page.
 | `google` | [Google AI Studio](https://aistudio.google.com/apikey) — Codewhale uses the official Gemini OpenAI-compatible endpoint and never reads Google OAuth files. |
 | `edenai` | [Eden AI API keys](https://app.edenai.run/settings/api-keys) |
 | `zenmux` | [ZenMux API keys](https://zenmux.ai/platform/pay-as-you-go) |
+| `csdn` | [CSDN 星图 console](https://ai.csdn.net/workbench/api-key) — choose the Coding Plan key type for the `glm_for_coding` plan route; a general key bills metered. Docs: [Coding Plan](https://ai.csdn.net/coding-plan). |
 | `concentrate` | [Concentrate dashboard](https://concentrate.ai/) → API Keys → Create API Key (a Universal API key); docs: [API introduction](https://concentrate.ai/docs/api-reference/introduction). BYOK only — the key stays in the local secret store. |
 | `modelstudio-token-plan`, `modelstudio-token-plan-anthropic`, `modelstudio-coding-plan`, `modelstudio-coding-plan-anthropic` | [Alibaba Cloud Model Studio (Bailian console)](https://bailian.console.aliyun.com/) — create or copy a Model Studio API key. |
 | `codewhale` | [Codewhale account settings](https://app.codewhale.net/settings?section=api) — create an API key with the `models:infer` scope, or run `codewhale account api-keys create --name <name> --use`. |
@@ -701,6 +703,7 @@ overlay and lets DSH resolve its own keys.
 | `mistral` | `[providers.mistral]` | `MISTRAL_API_KEY` | `MISTRAL_BASE_URL`; default `https://api.mistral.ai/v1` | `mistral-code-latest` (default; `codestral-latest` accepted as alias), `mistral-medium-latest` (aliases: `mistral-medium-3-5`), `mistral-small-latest` (aliases: `mistral-small-2603`), `mistral-large-latest` | Mistral AI (la Plateforme) OpenAI-compatible Chat route. On the documented first-party HTTPS `/v1` hosts, Medium and Small send adjustable `reasoning_effort` (`none` or `high` only), parse Mistral's polymorphic thinking/text blocks, and replay stored thinking in that same wire shape. Deprecated native Magistral IDs remain explicit-configuration compatibility routes: they are always-reasoning and never receive the adjustable effort field. Code and Large are non-reasoning. A custom `MISTRAL_BASE_URL` keeps generic Chat semantics unless it is one of the documented first-party hosts. `MISTRAL_MODEL` is accepted. Provider aliases: `mistral-ai`, `mistralai`, `la-plateforme`. |
 | `edenai` | `[providers.edenai]` | `EDENAI_API_KEY` | `EDENAI_BASE_URL`; default `https://api.edenai.run/v3`; EU `https://api.eu.edenai.run/v3` | `deepseek/deepseek-v4-pro` (default); live `/models` catalog of `provider/model` ids | Eden AI OpenAI-compatible aggregation gateway. Catalog rows remain provider-scoped; generic reasoning controls are omitted because supported fields depend on the selected upstream family. `EDENAI_MODEL` is accepted. The default `deepseek/deepseek-v4-pro` is listed on the global catalog only; on the EU endpoint set `EDENAI_MODEL` (or `model`) to a row from the EU `/models` list, for example `qwen/deepseek-v4-pro`. Provider aliases: `eden-ai`, `eden_ai`. |
 | `zenmux` | `[providers.zenmux]` | `ZENMUX_API_KEY` | `ZENMUX_BASE_URL`; default `https://zenmux.ai/api/v1` | `deepseek/deepseek-v4.1-flash` (default); live `/models` catalog of `provider/model` ids (keyless-readable) | ZenMux OpenAI-compatible aggregation gateway (~190 models). Catalog rows remain provider-scoped; generic reasoning controls are omitted because supported fields depend on the selected upstream family. `ZENMUX_MODEL` is accepted. Provider aliases: `zen-mux`, `zen_mux`. |
+| `csdn` | `[providers.csdn]` | `CSDN_API_KEY` | `CSDN_BASE_URL`; default `https://ai.csdn.net/api/model/v1` | `glm_for_coding` (default; the Coding Plan's dedicated model id); other marketplace model ids pass through | CSDN 星图 (Starmap) OpenAI-compatible hosted platform. Coding Plan keys and general marketplace keys share the one endpoint, so billing follows the credential product, never the URL alone: routing `glm_for_coding` — the shipped default — or setting `mode = "coding_plan"`/`"plan"`/`"subscription"` bills as CSDN Coding Plan quota with no dollar estimates; any other model, or an explicit `pay-as-you-go`/`metered` mode, bills metered; an unrecognized mode or an endpoint off `ai.csdn.net/api/model/v1` reports `cost: unknown`. `CSDN_MODEL` is accepted. Provider aliases: `csdn-ai`, `csdn_ai`, `csdn-coding-plan`, `csdn_coding_plan`, `starmap`. |
 | `concentrate` | `[providers.concentrate]` | `CONCENTRATE_API_KEY` | `CONCENTRATE_BASE_URL`; default `https://api.concentrate.ai/v1` | `deepseek-v4-pro` (default; a plain catalog id lets the gateway pick the upstream provider); `provider/model` ids such as `openai/gpt-5.6-sol` pin one upstream; `concentrate/auto` is the gateway's own router; unauthenticated live `/v1/models` catalog | Concentrate OpenAI Responses-compatible gateway (`POST /v1/responses`, bearer Universal API key). Opt-in and BYOK only: your key, your Concentrate bill, zero Codewhale fee, no managed default. Requests carry only documented fields (the system prompt rides as a `system` input item). Contract: [API introduction](https://concentrate.ai/docs/api-reference/introduction), [request parameters](https://concentrate.ai/docs/api-reference/endpoint/request-parameters), [streaming](https://concentrate.ai/docs/api-reference/endpoint/streaming), [errors](https://concentrate.ai/docs/api-reference/endpoint/errors). See [Concentrate Notes](#concentrate-notes). |
 | `codewhale` | `[providers.codewhale]` | `CODEWHALE_API_KEY` | `CODEWHALE_API_BASE`; default `https://api.codewhale.net/v1` | `deepseek/deepseek-v4-pro` (default), `anthropic/claude-sonnet-5`, `openai/gpt-5.6` are offline bootstrap rows only; the authenticated `GET /v1/models` listing of the account's connected providers is the catalog authority | Codewhale API: account-backed model access over the provider keys the customer connected to their Codewhale account. One `cwc_key_…` account API key with the `models:infer` scope authenticates every model. Model ids are `provider/model` exactly as the account catalog returns them, and each row states its protocol (`chat-completions` → `/v1/chat/completions`, `anthropic-messages` → `/v1/messages`, `responses` → `/v1/responses`); every protocol uses `Authorization: Bearer`, never `x-api-key`. `CODEWHALE_API_BASE` must be HTTPS except on loopback. Connect provider keys with `codewhale account keys set <provider>`. Provider aliases: `codewhale-api`, `cw-api`, `codewhale-cloud`. |
 | `xai` | `[providers.xai]` | `XAI_API_KEY`, Codewhale-owned device OAuth, or explicit read-only Grok CLI consent | `XAI_BASE_URL`; default `https://api.x.ai/v1` | `grok-4.6` (default), `grok-4.5`, `grok-4.3`, `grok-build`, `grok-composer-2.5-fast`, `grok-4.20-0309-reasoning`, `grok-4.20-0309-non-reasoning` | xAI/Grok OpenAI-compatible Chat Completions route. Grok 4.6 has a 500K context window, text/image input, function calls, structured output, server-side web search, and `low`/`medium`/`high`/`xhigh` reasoning (default `high`). Its standard rates double when the prompt reaches 200K tokens; the same 2x long-context rule applies to `grok-4.5` (500K context, $2.00 / $0.30 cached / $6.00) and `grok-4.3` (1M context, $1.25 / $0.20 cached / $2.50) per their [model pages](https://docs.x.ai/docs/models/grok-4.5). There is no documented `latest`/`fast` alias and no published numeric output limit. **API-key** (default): Bearer token from console.x.ai via `XAI_API_KEY` / keyring / `api_key`. **OAuth**: `codewhale auth xai-device` uses SSH-friendly device login and Codewhale-owned storage, which may refresh itself. Existing Grok CLI credentials require `codewhale auth external-consent --provider xai --mode read-only`; the granted external file is never refreshed or rewritten. OAuth may return HTTP 403 on some SuperGrok tiers — keep API-key as the reliable fallback. `XAI_MODEL` is accepted. Provider aliases: `x-ai`, `x_ai`, `grok`. |
@@ -708,6 +711,19 @@ overlay and lets DSH resolve its own keys.
 | `modelstudio-token-plan-anthropic` | `[providers.modelstudio_token_plan_anthropic]` | `MODELSTUDIO_API_KEY`, `DASHSCOPE_API_KEY` | default `https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic` | Same model catalog as `modelstudio-token-plan` | Token Plan Anthropic-compatible Messages route (`/apps/anthropic`). Same API key as the OpenAI dialect. Provider aliases: `modelstudio-token-plan-anthropic`, `alibaba-token-plan-anthropic`. |
 | `modelstudio-coding-plan` | `[providers.modelstudio_coding_plan]` | `MODELSTUDIO_API_KEY`, `DASHSCOPE_API_KEY` | `MODELSTUDIO_CODING_PLAN_BASE_URL`; default `https://coding-intl.dashscope.aliyuncs.com/v1` | `qwen3.8-max` (default); same catalog as Token Plan | Alibaba Cloud Model Studio Coding Plan OpenAI-compatible Chat Completions route. `MODELSTUDIO_CODING_PLAN_MODEL` is accepted. Provider aliases: `modelstudio-coding-plan`, `alibaba-coding-plan`, `dashscope-coding-plan`. |
 | `modelstudio-coding-plan-anthropic` | `[providers.modelstudio_coding_plan_anthropic]` | `MODELSTUDIO_API_KEY`, `DASHSCOPE_API_KEY` | default `https://coding-intl.dashscope.aliyuncs.com/apps/anthropic` | Same model catalog as `modelstudio-coding-plan` | Coding Plan Anthropic-compatible Messages route (`/apps/anthropic`). Provider aliases: `modelstudio-coding-plan-anthropic`, `alibaba-coding-plan-anthropic`. |
+
+StepFun's four coding models are available through both its standard API and
+[Step Plan](https://platform.stepfun.ai/docs/en/step-plan/integrations/reasoning-api).
+Choose the billing route in `/provider`, then the model in `/model`; existing
+Step 3.7 selections remain unchanged. [Step 5 Preview](https://platform.stepfun.ai/docs/en/guides/models/step-5-preview)
+has a 1M context window. Step 5 and Step 3.7 expose low/medium/high reasoning;
+Step 3.5 Flash 2603 exposes low/high; base Step 3.5 uses provider-default reasoning.
+[Published API prices](https://platform.stepfun.ai/docs/en/guides/pricing/details)
+apply only to verified PAYG routes. Step Plan displays subscription allowance.
+Speech, music and image-generation models use separate interfaces and are not
+presented as coding models. Provider video capability metadata does not imply
+that every Codewhale client can attach video.
+
 
 ### OpenCode Zen protocol catalog
 
@@ -916,7 +932,7 @@ endpoint when the endpoint supports model listing.
 | `arcee` | `trinity-large-thinking`, `trinity-large-preview`; provider-hinted custom model IDs pass through | yes | yes for `trinity-large-thinking`; no for `trinity-large-preview` |
 | `moonshot` | `kimi-k2.7-code`, `kimi-k2.6` | yes | yes |
 | `zai` | `GLM-5.3`, `GLM-5.3-Flash`, `GLM-5.2`, `GLM-5.1`, `GLM-5-Turbo`; provider-hinted custom model IDs pass through | yes | yes |
-| `stepfun` | `step-3.7-flash` | yes | no |
+| `stepfun` | `step-3.7-flash` (default), `step-5-preview`, `step-3.5-flash`, `step-3.5-flash-2603` | yes | yes |
 | `minimax` | `MiniMax-M3`, `MiniMax-M2.7`, `MiniMax-M2.7-highspeed`, `MiniMax-M2.5`, `MiniMax-M2.5-highspeed`, `MiniMax-M2.1`, `MiniMax-M2.1-highspeed`, `MiniMax-M2` | yes | yes |
 | `minimax-anthropic` | `MiniMax-M3`, `MiniMax-M2.7` | yes | yes |
 | `sglang` | `deepseek-ai/DeepSeek-V4-Pro`, `deepseek-ai/DeepSeek-V4-Flash` | yes | yes |
@@ -938,6 +954,7 @@ endpoint when the endpoint supports model listing.
 | `google` | `gemini-3.1-pro-preview`, `gemini-3-pro-preview`, `gemini-3.7-flash`, `gemini-3.6-flash`, `gemini-3.5-flash`, `gemini-3.5-flash-lite`, `gemini-2.5-pro`, `gemini-2.5-flash` | yes | yes except `gemini-3.5-flash-lite` |
 | `mistral` | `mistral-code-latest`, `mistral-medium-latest`, `mistral-small-latest`, `mistral-large-latest` | yes | yes for Medium and Small (`reasoning_effort` `none` or `high` on exact first-party routes); deprecated native Magistral remains an always-on explicit compatibility ID; no for Code and Large |
 | `modelstudio-token-plan`, `modelstudio-coding-plan` | `qwen3.8-max`, `qwen3.8-max-preview`, `qwen3.7-plus`, `qwen3.7-max`, `qwen3.6-flash`, `deepseek-v4-pro`, `deepseek-v4-flash-0731`, `glm-5.2` | yes | yes |
+| `csdn` | `glm_for_coding`; other marketplace model IDs pass through | yes | yes |
 
 AtlasCloud keeps the same default model as the config layer and adds
 provider-scoped aliases for the Pro and Flash rows. Other AtlasCloud model IDs

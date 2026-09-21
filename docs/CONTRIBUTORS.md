@@ -28,10 +28,11 @@ notes, and relevant issue/PR comments.
 ## Contributors by time
 
 <details open>
-<summary><strong>v0.9.14 — edit safety, session recovery, and runtime surfaces</strong></summary>
+<summary><strong>v0.10.0 — redesigned workbench, session recovery, and runtime surfaces</strong></summary>
 
 **Merged or adapted contributions**
 
+- **[AdityaVG13](https://github.com/AdityaVG13)** — composer wrapping, pasted/editor draft history, painted-column transcript copying, tab/caret placement, explicit terminal foregrounds, and headless user-input tool availability ([#6363](https://github.com/Hmbown/Codewhale/pull/6363), [#6365](https://github.com/Hmbown/Codewhale/pull/6365)); both PRs merged with their original ancestry.
 - **[aboimpinto](https://github.com/aboimpinto)** — moved the TUI session-export slice onto shared command contracts (FEAT-025): a session-export contract facet with one shared sanitizer, `/export` routed through the facet, pinned with baseline-captured goldens and gates ([#6096](https://github.com/Hmbown/Codewhale/pull/6096)).
 
 **Reports and reproductions**

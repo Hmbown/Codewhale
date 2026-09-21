@@ -17,7 +17,7 @@
      13. Gruvbox Dark                      Vintage warm earth tones          █
      14. Claude                            Warm navy & coral                 █
      15. Matrix                            The Matrix films inspired theme   █
-     16. Solarized Light                   Solarized light — Light, calming… │
+     16. Solarized Light                   Solarized light — Light, calming… █
+     17. Uwu                               Soft kawaii night — sakura,…      │
    ↑/↓ preview  Enter save  Esc revert
-
  ──────────────────────────────────────────────────────────────────────────────

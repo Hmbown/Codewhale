@@ -207,7 +207,12 @@ async function serve(conn) {
   });
 }
 
-const server = net.createServer(serve);
+const connections = new Set();
+const server = net.createServer(conn => {
+  connections.add(conn);
+  conn.once("close", () => connections.delete(conn));
+  serve(conn);
+});
 server.on("error", (err) => { log(`socket error: ${err.message}`); process.exit(1); });
 server.listen(sock, () => {
   if (process.platform !== "win32") { try { fs.chmodSync(sock, 0o600); } catch {} }
@@ -228,6 +233,10 @@ async function shutdown(signal) {
   shuttingDown = true;
   log(`${signal}; shutting down`);
   server.close();
+  // Windows keeps a named-pipe instance bound while accepted connections
+  // remain open. Retire those owners before allowing a replacement listener.
+  // Their close handlers abort work; closeAllSessions still awaits cleanup.
+  for (const conn of connections) conn.destroy();
   const timer = setTimeout(() => process.exit(1), 3_000);
   const results = await closeAllSessions();
   clearTimeout(timer);

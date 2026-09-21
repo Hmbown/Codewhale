@@ -260,6 +260,11 @@ pub fn capture_product(config: &Config, provider: ApiProvider) -> RouteProduct {
                 CredentialProduct::Unprovable => RouteProduct::Unproven,
             }
         }
+        ApiProvider::Csdn => match csdn_credential_product(provider_config) {
+            CredentialProduct::Plan => RouteProduct::Subscription("CSDN Coding Plan quota"),
+            CredentialProduct::PayAsYouGo => RouteProduct::Metered,
+            CredentialProduct::Unprovable => RouteProduct::Unproven,
+        },
         ApiProvider::XiaomiMimo => {
             if xiaomi_is_explicit_pay_as_you_go(provider_config) {
                 RouteProduct::Metered
@@ -405,6 +410,20 @@ fn classify(
             BillingPresentation::Unknown
         }
         ApiProvider::Minimax | ApiProvider::MinimaxAnthropic => product_billing(product),
+        // CSDN 星图 sells the Coding Plan (`glm_for_coding`) and metered
+        // marketplace models over the same endpoint; the URL proves only that
+        // the route is first-party, so the captured product decides. Anything
+        // off the supported direct endpoint is Unknown no matter what was
+        // captured.
+        ApiProvider::Csdn
+            if !codewhale_config::provider::is_exact_csdn_platform_route(
+                codewhale_config::ProviderKind::Csdn,
+                base_url,
+            ) =>
+        {
+            BillingPresentation::Unknown
+        }
+        ApiProvider::Csdn => product_billing(product),
         ApiProvider::Xai | ApiProvider::Anthropic => product_billing(product),
         // A named custom route is billed from the identity and endpoint it
         // dispatched on. Without an identity there is no vendor to name, and
@@ -533,6 +552,7 @@ pub fn billing_surface_for_dispatch(
                     ApiProvider::Minimax | ApiProvider::MinimaxAnthropic => {
                         crate::pricing::MINIMAX_TOKEN_PLAN_BILLING_SURFACE
                     }
+                    ApiProvider::Csdn => crate::pricing::CSDN_CODING_PLAN_BILLING_SURFACE,
                     ApiProvider::OpenaiCodex
                     | ApiProvider::OpencodeGo
                     | ApiProvider::Anthropic
@@ -548,6 +568,9 @@ pub fn billing_surface_for_dispatch(
                 ) =>
             {
                 return Some(crate::pricing::MINIMAX_PAYG_BILLING_SURFACE);
+            }
+            BillingPresentation::Metered if provider == ApiProvider::Csdn => {
+                return Some(crate::pricing::CSDN_PAYG_BILLING_SURFACE);
             }
             BillingPresentation::Local => return Some(crate::pricing::LOCAL_BILLING_SURFACE),
             BillingPresentation::Unknown | BillingPresentation::Metered => {}
@@ -995,6 +1018,42 @@ fn minimax_credential_product(
         Some(true) => CredentialProduct::Plan,
         Some(false) => CredentialProduct::PayAsYouGo,
         None => CredentialProduct::Unprovable,
+    }
+}
+
+/// CSDN 星图 sells the Coding Plan and metered marketplace models over the
+/// same `ai.csdn.net/api/model/v1` endpoint and `CSDN_API_KEY` slot, so the
+/// product comes from an explicit saved pay mode or the routed model:
+/// `glm_for_coding` is the Coding Plan's dedicated model id — the route the
+/// plan sells — while every other model on the platform endpoint is ordinary
+/// metered marketplace access. An explicit operator-set mode wins over the
+/// model in both directions; an unrecognized mode is not a product claim.
+fn csdn_credential_product(provider_config: Option<&ProviderConfig>) -> CredentialProduct {
+    if let Some(mode) = provider_config
+        .and_then(|config| config.mode.as_deref())
+        .filter(|mode| !mode.trim().is_empty())
+        .map(normalized)
+    {
+        return match mode.as_str() {
+            "coding_plan" | "codingplan" | "plan" | "subscription" | "subscription_plan" => {
+                CredentialProduct::Plan
+            }
+            "pay_as_you_go" | "payg" | "paygo" | "pay_as_go" | "metered" | "standard" | "api"
+            | "api_key" | "default" => CredentialProduct::PayAsYouGo,
+            _ => CredentialProduct::Unprovable,
+        };
+    }
+    // No table at all still resolves to the plan model: `glm_for_coding` is
+    // the shipped default for the `csdn` route.
+    let model = provider_config
+        .and_then(|entry| entry.model.as_deref())
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .unwrap_or(crate::config::DEFAULT_CSDN_MODEL);
+    if model.eq_ignore_ascii_case(crate::config::DEFAULT_CSDN_MODEL) {
+        CredentialProduct::Plan
+    } else {
+        CredentialProduct::PayAsYouGo
     }
 }
 
@@ -3080,6 +3139,10 @@ mod tests {
         (ApiProvider::Google, BillingPresentation::Metered),
         (ApiProvider::Edenai, BillingPresentation::Metered),
         (ApiProvider::Zenmux, BillingPresentation::Metered),
+        (
+            ApiProvider::Csdn,
+            BillingPresentation::Subscription("CSDN Coding Plan quota"),
+        ),
         (ApiProvider::Concentrate, BillingPresentation::Metered),
         (ApiProvider::Codewhale, BillingPresentation::Metered),
         (ApiProvider::Custom, BillingPresentation::Unknown),
@@ -3118,7 +3181,7 @@ mod tests {
         }
         assert_eq!(
             DEFAULT_ROUTE_BILLING_AUDIT.len(),
-            51,
+            52,
             "the audit covers every provider identity, primary and alternate"
         );
 

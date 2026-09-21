@@ -5084,6 +5084,12 @@ impl McpPool {
         names
     }
 
+    /// Compare against the freshly authorized merged configuration without
+    /// reloading or disconnecting any sibling transport.
+    pub(crate) fn config_matches(&self, config: &McpConfig) -> bool {
+        hash_mcp_config(config) == self.config_hash
+    }
+
     /// Whether every configured MCP source still has the mtime this pool last
     /// read, i.e. whether `connect_all` would find anything new.
     ///
@@ -5742,7 +5748,7 @@ fn hash_mcp_config(config: &McpConfig) -> u64 {
 /// Best-effort fetch of the MCP config file's last-modified time. Returns
 /// `None` when the file is missing, when stat fails, when the platform
 /// doesn't expose mtime, or when the path fails the same allow-list check
-/// that `load_config` / `save_config` apply. The lazy-reload check in
+/// that MCP configuration reads and mutations apply. The lazy-reload check in
 /// `McpPool::get_or_connect` treats `None` as "skip the check this turn",
 /// so a rejected path simply degrades to "no auto-reload" rather than an
 /// error path. Callers already validate via `validate_mcp_config_path` at
@@ -5754,17 +5760,115 @@ fn mcp_config_mtime(path: &Path) -> Option<std::time::SystemTime> {
     fs::metadata(path).ok()?.modified().ok()
 }
 
-pub fn save_config(path: &Path, cfg: &McpConfig) -> Result<()> {
-    validate_mcp_config_path(path)?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).with_context(|| {
-            format!("Failed to create MCP config directory {}", parent.display())
-        })?;
+/// A stale caller must reload instead of overwriting another process's edit.
+#[derive(Debug)]
+pub struct McpRevisionConflict;
+impl std::fmt::Display for McpRevisionConflict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("MCP configuration changed; reload it before saving")
     }
-    let rendered = serde_json::to_string_pretty(cfg).context("Failed to serialize MCP config")?;
-    write_atomic(path, rendered.as_bytes())
-        .with_context(|| format!("Failed to write MCP config {}", path.display()))?;
-    Ok(())
+}
+impl std::error::Error for McpRevisionConflict {}
+
+fn config_revision(raw: Option<&str>) -> String {
+    raw.map_or_else(
+        || "mcp-v1-absent".to_owned(),
+        |raw| format!("mcp-v1-{}", crate::hashing::sha256_hex(raw.as_bytes())),
+    )
+}
+
+pub fn read_config_revision(path: &Path) -> Result<String> {
+    validate_mcp_config_path(path)?;
+    let raw = read_mcp_config_file(path)?;
+    Ok(config_revision(raw.as_deref()))
+}
+
+/// Apply only changed known fields to the original JSON. Unknown fields in
+/// unrelated objects and in edited server entries remain operator-owned.
+fn apply_json_delta(
+    raw: &mut serde_json::Value,
+    before: &serde_json::Value,
+    after: &serde_json::Value,
+) {
+    if before == after {
+        return;
+    }
+    if let (Some(raw), Some(before), Some(after)) =
+        (raw.as_object_mut(), before.as_object(), after.as_object())
+    {
+        for key in before.keys().chain(after.keys()).collect::<BTreeSet<_>>() {
+            match (before.get(key), after.get(key)) {
+                (Some(old), Some(new)) if old != new => {
+                    apply_json_delta(raw.entry(key.clone()).or_insert(old.clone()), old, new);
+                }
+                (None, Some(new)) => {
+                    raw.insert(key.clone(), new.clone());
+                }
+                (Some(_), None) => {
+                    raw.remove(key);
+                }
+                _ => {}
+            }
+        }
+    } else {
+        *raw = after.clone();
+    }
+}
+
+/// Every managed MCP writer rereads under the same OS-process lock. This is
+/// a delta operation, not a save of a previously loaded typed snapshot.
+pub fn mutate_config<T>(
+    path: &Path,
+    expected_revision: Option<&str>,
+    mutate: impl FnOnce(&mut McpConfig) -> Result<T>,
+) -> Result<(T, String)> {
+    validate_mcp_config_path(path)?;
+    codewhale_config::with_config_write_lock(path, |path| {
+        let original = read_mcp_config_file(path)?;
+        let revision = config_revision(original.as_deref());
+        if expected_revision.is_some_and(|expected| expected != revision) {
+            return Err(McpRevisionConflict.into());
+        }
+        let mut raw: serde_json::Value = match original.as_deref() {
+            Some(raw) => serde_json::from_str(raw).map_err(|_| {
+                anyhow::anyhow!("Failed to parse MCP config; file contents were omitted")
+            })?,
+            None => serde_json::json!({}),
+        };
+        anyhow::ensure!(raw.is_object(), "MCP config must be an object");
+        let mut config: McpConfig = serde_json::from_value(raw.clone())
+            .map_err(|_| anyhow::anyhow!("Invalid MCP config; file contents were omitted"))?;
+        let before = serde_json::to_value(&config)?;
+        let result = mutate(&mut config)?;
+        let after = serde_json::to_value(&config)?;
+        if before == after {
+            return Ok((result, revision));
+        }
+        // Preserve legacy spelling while applying the canonical typed delta.
+        let legacy = raw.get("mcpServers").is_some();
+        if legacy {
+            let object = raw
+                .as_object_mut()
+                .context("MCP config must be an object")?;
+            let servers = object.remove("mcpServers").expect("checked above");
+            object.insert("servers".into(), servers);
+        }
+        apply_json_delta(&mut raw, &before, &after);
+        if legacy {
+            let object = raw
+                .as_object_mut()
+                .context("MCP config must be an object")?;
+            if let Some(servers) = object.remove("servers") {
+                object.insert("mcpServers".into(), servers);
+            }
+        }
+        let rendered = serde_json::to_string_pretty(&raw)?;
+        if rendered.len() as u64 > MAX_MCP_CONFIG_BYTES {
+            anyhow::bail!("MCP config exceeds the 1 MiB limit");
+        }
+        write_atomic(path, rendered.as_bytes())?;
+        Ok((result, config_revision(Some(&rendered))))
+    })
 }
 
 fn mcp_template_json() -> Result<String> {
@@ -5802,23 +5906,23 @@ fn mcp_template_json() -> Result<String> {
 
 pub fn init_config(path: &Path, force: bool) -> Result<McpWriteStatus> {
     validate_mcp_config_path(path)?;
-    if path.exists() && !force {
-        return Ok(McpWriteStatus::SkippedExists);
-    }
-    let status = if path.exists() {
-        McpWriteStatus::Overwritten
-    } else {
-        McpWriteStatus::Created
-    };
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).with_context(|| {
-            format!("Failed to create MCP config directory {}", parent.display())
-        })?;
-    }
-    let template = mcp_template_json()?;
-    write_atomic(path, template.as_bytes())
-        .with_context(|| format!("Failed to write MCP config {}", path.display()))?;
-    Ok(status)
+    codewhale_config::with_config_write_lock(path, |path| {
+        let original = read_mcp_config_file(path)?;
+        if let Some(raw) = original.as_deref() {
+            let _: McpConfig = serde_json::from_str(raw)
+                .map_err(|_| anyhow::anyhow!("Invalid MCP config; file contents were omitted"))?;
+            if !force {
+                return Ok(McpWriteStatus::SkippedExists);
+            }
+        }
+        let template = mcp_template_json()?;
+        write_atomic(path, template.as_bytes())?;
+        Ok(if original.is_some() {
+            McpWriteStatus::Overwritten
+        } else {
+            McpWriteStatus::Created
+        })
+    })
 }
 
 pub fn add_server_config(
@@ -5833,55 +5937,61 @@ pub fn add_server_config(
         anyhow::bail!("Provide either a command or URL for MCP server '{name}'.");
     }
     validate_mcp_transport(transport.as_deref())?;
-    let mut cfg = load_config(path)?;
-    cfg.servers.insert(
-        name,
-        McpServerConfig {
-            command,
-            args,
-            env: HashMap::new(),
-            cwd: None,
-            url,
-            transport,
-            connect_timeout: None,
-            execute_timeout: None,
-            read_timeout: None,
-            disabled: false,
-            enabled: true,
-            required: false,
-            enabled_tools: Vec::new(),
-            disabled_tools: Vec::new(),
-            headers: HashMap::new(),
-            env_headers: HashMap::new(),
-            bearer_token_env_var: None,
-            scopes: Vec::new(),
-            oauth: None,
-            oauth_resource: None,
-            reviewed_plugin: None,
-            runtime_added: false,
-            allow_private_network: false,
-        },
-    );
-    save_config(path, &cfg)
+    mutate_config(path, None, |cfg| {
+        cfg.servers.insert(
+            name,
+            McpServerConfig {
+                command,
+                args,
+                env: HashMap::new(),
+                cwd: None,
+                url,
+                transport,
+                connect_timeout: None,
+                execute_timeout: None,
+                read_timeout: None,
+                disabled: false,
+                enabled: true,
+                required: false,
+                enabled_tools: Vec::new(),
+                disabled_tools: Vec::new(),
+                headers: HashMap::new(),
+                env_headers: HashMap::new(),
+                bearer_token_env_var: None,
+                scopes: Vec::new(),
+                oauth: None,
+                oauth_resource: None,
+                reviewed_plugin: None,
+                runtime_added: false,
+                allow_private_network: false,
+            },
+        );
+        Ok(())
+    })
+    .map(|_| ())
 }
 
 pub fn remove_server_config(path: &Path, name: &str) -> Result<()> {
-    let mut cfg = load_config(path)?;
-    if cfg.servers.remove(name).is_none() {
-        anyhow::bail!("MCP server '{name}' not found");
-    }
-    save_config(path, &cfg)
+    mutate_config(path, None, |cfg| {
+        if cfg.servers.remove(name).is_none() {
+            anyhow::bail!("MCP server '{name}' not found");
+        }
+        Ok(())
+    })
+    .map(|_| ())
 }
 
 pub fn set_server_enabled(path: &Path, name: &str, enabled: bool) -> Result<()> {
-    let mut cfg = load_config(path)?;
-    let server = cfg
-        .servers
-        .get_mut(name)
-        .ok_or_else(|| anyhow::anyhow!("MCP server '{name}' not found"))?;
-    server.enabled = enabled;
-    server.disabled = !enabled;
-    save_config(path, &cfg)
+    mutate_config(path, None, |cfg| {
+        let server = cfg
+            .servers
+            .get_mut(name)
+            .ok_or_else(|| anyhow::anyhow!("MCP server '{name}' not found"))?;
+        server.enabled = enabled;
+        server.disabled = !enabled;
+        Ok(())
+    })
+    .map(|_| ())
 }
 
 #[cfg(test)]

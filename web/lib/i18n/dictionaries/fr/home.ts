@@ -20,7 +20,7 @@ export const home: HomeDict = {
   shotPreview: "Aperçu du terminal",
   shotBuild: "build de développement v{version}",
   screenshotAlt:
-    "Terminal Codewhale v0.9.12, build 171acee689aa : nouvelle session avec l’emblème de la baleine, la zone de rédaction des messages, Full Access et le mode Operate, deux tâches planifiées, 21 serveurs MCP en cours de connexion et GLM-5.3 avec un effort maximal.",
+    "Version de développement Codewhale v{version} : baleine, nouvelle session, saisie du message, permissions Ask, mode Work et état du modèle. Rendu de la sortie réelle d’un terminal isolé.",
   latestRelease: "Dernière version {tag}",
   releaseUnavailable: "État des versions indisponible",
   currentSource: "Source",

@@ -52,7 +52,7 @@ export function create() {
     },
     async list_apps() {
       record("list_apps", {});
-      return { items: [{ name: boundApp?.name ?? "FakeApp", pid: boundApp?.pid ?? 4242, bundle_id: "com.fake.app" }] };
+      return { apps: [{ name: boundApp?.name ?? "FakeApp", pid: boundApp?.pid ?? 4242, bundle_id: "com.fake.app" }] };
     },
     async left_mouse_down(args = {}) { record("left_mouse_down", args); return { action_sent: true, at: { x: args.target?.x, y: args.target?.y } }; },
     async left_mouse_up(args = {}) { record("left_mouse_up", args); return { action_sent: true }; },

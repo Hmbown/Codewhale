@@ -7,7 +7,9 @@ import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
 import * as registry from "../src/registry.mjs";
-import { backendFor, installRemoteAgent, executorFor, closeAppSession, routeFingerprint, closeSshChannel } from "../src/transport.mjs";
+import * as consent from "../src/consent.mjs";
+import { backendFor, installRemoteAgent, executorFor, closeAppSession, routeFingerprint, closeSshChannel, SESSION_ID } from "../src/transport.mjs";
+import { spawnDockerComputer, destroyDockerComputer, destroySessionSpawns } from "../src/spawn.mjs";
 import { TOOLS, TOOL_NAMES, REQUIRED_ARGS, ELEMENT_ONLY_TARGET, READ_ONLY_TOOLS, REMOTE_TOOLS, BACKEND_METHOD, resolveTool, parseGrant, MERGED_EXPANSION } from "../src/tools.mjs";
 import { tryJson, withSignal, throwIfAborted, wait } from "../src/exec.mjs";
 import { APP_VERSION } from "../src/app-socket.mjs";
@@ -38,12 +40,17 @@ const appStates = new Map();
 const latestStateByComputer = new Map();
 /** computerId -> last raster metadata {file, scale, origin} */
 const lastRasters = new Map();
+/** computerId -> app_ref the computer's input is bound to (set by open_application) */
+const boundApps = new Map();
 /** computerId -> route-bound session resources; the registry owns configuration. */
 const backendCache = new Map();
 const ROUTE_INSPECTION_TOOLS = new Set([
   "request_access", "list_displays", "list_apps", "list_windows", "get_app_state", "screenshot",
   "cursor_position", "read_clipboard", "recording_list", "recording_status",
   "find_elements", "get_value", "wait_for",
+  // A script does not act through the observation state this gate protects,
+  // so it must not be held up waiting for a screenshot it never reads.
+  "app_script",
 ]);
 const STATE_CHAR_BUDGET = Number(process.env.CODEWHALE_CU_MAX_STATE_CHARS) > 0
   ? Number(process.env.CODEWHALE_CU_MAX_STATE_CHARS)
@@ -84,6 +91,10 @@ function invalidateObservations(id) {
 async function retireBinding(id) {
   const binding = backendCache.get(id);
   invalidateObservations(id);
+  boundApps.delete(id);
+  // A route change means the computer behind the id changed: grants made for
+  // the old destination must not ride to the new one.
+  consent.dropSession(id);
   if (!binding) return;
   closeSshChannel(binding);
   // Mark unusable before awaiting cleanup. A failure, or a catalog rollback,
@@ -156,7 +167,7 @@ function resolveElement(target, computer) {
 }
 
 class ServerError extends Error {
-  constructor(code, message) { super(message); this.code = code; }
+  constructor(code, message, extra = null) { super(message); this.code = code; if (extra) this.extra = extra; }
 }
 
 /** Map raster-pixel coordinates to screen points using the bound raster. */
@@ -218,6 +229,7 @@ async function normalizeTarget(computer, target, kind, resolve, sink) {
       return {
         app_ref: state.app_ref, windowIndex: element.windowIndex ?? 0, path: element.path,
         strategy: "a11y", role: element.role, label: element.label, reacquired: false,
+        ...(element.runtime_id ? { runtime_id: element.runtime_id, window_runtime_id: element.window_runtime_id } : {}),
       };
     }
     const moved = !!fresh && (
@@ -446,6 +458,154 @@ async function waitFor(computer, args, switched) {
   return { content: [{ type: "text", text: JSON.stringify(receipt(computer, { ok: true, tool: "wait_for", switched, matched: false, timed_out: true, state, polls, elapsed_ms: Date.now() - started, ...(lastError ? { last_error: lastError } : {}), note: state === "absent" ? "Matches remained until the deadline." : "No match appeared before the deadline. Observe the app or widen the query." })) }] };
 }
 
+// ---------- per-app consent ----------
+// The app, not the tool, is the unit of trust on the local computer: the
+// first call that targets an application — binding input to it, observing it
+// by name, or acting through a bound/element target — refuses
+// consent_required until the user records a decision with the consent tool.
+// Spawned computers are exempt: a task-owned desktop holds nothing of the
+// user's, and remote machines are covered by the transport's own trust.
+
+/** Tools whose implicit target is the bound app when no explicit app_ref or element is given. */
+const BOUND_TARGET_TOOLS = new Set([
+  "get_app_state", "find_elements", "wait_for", "list_windows", "screenshot", "zoom",
+  "recording_start", "preview", "invoke_menu",
+  "type", "key", "hold_key",
+  "left_click", "double_click", "triple_click", "right_click", "middle_click",
+  "left_click_drag", "mouse_move", "left_mouse_down", "left_mouse_up", "scroll",
+  "set_value", "focus", "get_value", "select_text", "perform_action",
+]);
+
+/** App identity the way consent args carry it (app string, or explicit fields). */
+function refFromConsentArgs(args) {
+  const ref = {};
+  if (typeof args.bundle_id === "string" && args.bundle_id.trim()) ref.bundle_id = args.bundle_id.trim();
+  if (typeof args.name === "string" && args.name.trim()) ref.name = args.name.trim();
+  if (Number.isInteger(args.pid) && args.pid > 0) ref.pid = args.pid;
+  if (typeof args.app === "string" && args.app.trim() && !Object.keys(ref).length) {
+    const s = args.app.trim();
+    if (/^pid:\d+$/i.test(s)) ref.pid = Number(s.slice(4));
+    else if (/^\d+$/.test(s)) ref.pid = Number(s);
+    // ".app" is a filename spelling and always means a name — checked
+    // before the reverse-DNS shape it also satisfies.
+    else if (/\.app$/i.test(s)) ref.name = s.replace(/\.app$/i, "");
+    else if (/^[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+$/.test(s) && !s.includes(" ")) ref.bundle_id = s;
+    else ref.name = s;
+  }
+  return ref;
+}
+
+/**
+ * Best-effort identity enrichment through list_apps — the same match rules
+ * the native resolver uses (pid exact; name and bundle id case-insensitive).
+ * Returns {name, pid, bundle_id} or null. Only consulted when a decision is
+ * missing, so the ledger sees the same app under every spelling the model
+ * might use.
+ */
+async function resolveAppIdentity(computer, ref) {
+  if (!ref || !Object.keys(ref).length) return null;
+  let apps = null;
+  try {
+    const res = await callTool({ name: "list_apps", arguments: { computer: computer.id } });
+    const body = JSON.parse(res.content[0].text);
+    apps = body?.apps ?? null;
+  } catch { return null; }
+  if (!Array.isArray(apps)) return null;
+  const wantName = ref.name?.toLowerCase(), wantBundle = ref.bundle_id?.toLowerCase();
+  const hit = apps.find((a) =>
+    (ref.pid != null && a.pid === ref.pid) ||
+    (wantBundle && String(a.bundle_id ?? "").toLowerCase() === wantBundle) ||
+    (wantName && String(a.name ?? "").toLowerCase() === wantName));
+  return hit ? { name: hit.name ?? null, pid: hit.pid ?? null, bundle_id: hit.bundle_id ?? null } : null;
+}
+
+/**
+ * Check the ledger for one app reference: direct keys first, then — only when
+ * undecided — the resolved running-app identity so a grant made under one
+ * spelling covers the others. Returns {verdict, ref} where ref is the richest
+ * identity known (for the refusal's app field and alias merging).
+ */
+async function consentForRef(computer, ref) {
+  const direct = consent.decisionFor(computer.id, consent.appKeys(ref));
+  if (direct.state !== "undecided") return { verdict: direct, ref };
+  const resolved = await resolveAppIdentity(computer, ref);
+  if (!resolved) return { verdict: direct, ref };
+  const widened = consent.decisionFor(computer.id, consent.appKeys(resolved));
+  return { verdict: widened, ref: resolved };
+}
+
+/**
+ * The consent gate, run inside dispatch before any backend call. Returns
+ * {grant} describing the decision that let the call through (used to merge
+ * aliases after open_application resolves the real identity), or null when
+ * the call targets no app. Throws ServerError consent_required / app_denied /
+ * foreground_consent_required / foreground_denied.
+ */
+async function consentCheck(computer, name, args) {
+  if (computer.transport !== "local" || computer.owned === true) return null;
+  const refs = [];
+  if (name === "open_application" || name === "kill_app") {
+    // Both name the target app with name/bundle_id/pid args — a denied app
+    // must not be terminable any more than it must be bindable.
+    const ref = {};
+    if (Number.isInteger(args.pid)) ref.pid = args.pid;
+    else if (typeof args.bundle_id === "string" && args.bundle_id) ref.bundle_id = args.bundle_id;
+    else if (typeof args.name === "string" && args.name) ref.name = args.name;
+    if (Object.keys(ref).length) refs.push(ref);
+  } else {
+    if (args.app_ref && typeof args.app_ref === "object") refs.push(args.app_ref);
+    for (const key of ["target", "from_target", "to"]) {
+      if (args[key]?.type === "element") {
+        try { refs.push(resolveElement(args[key], computer).state.app_ref); } catch { /* the element gate reports its own staleness */ }
+      }
+    }
+    if (args.state_id != null) {
+      const st = appStates.get(args.state_id);
+      if (st?.computerId === computer.id) refs.push(st.app_ref);
+    }
+    const bound = boundApps.get(computer.id);
+    if (!refs.length && bound && BOUND_TARGET_TOOLS.has(name)) refs.push(bound);
+  }
+  let grant = null;
+  for (const ref of refs) {
+    // A state or element whose backend reported no identity at all has no app
+    // to consent to — observation never named one either, so there is nothing
+    // a recorded decision could match.
+    if (!ref || !consent.appKeys(ref).length) continue;
+    const { verdict, ref: known } = await consentForRef(computer, ref);
+    const desc = known.name ?? known.bundle_id ?? (known.pid ? `pid ${known.pid}` : "the application");
+    const arg = known.bundle_id ?? known.name ?? (known.pid ? `pid:${known.pid}` : "the app");
+    if (verdict.state === "denied") {
+      throw new ServerError("app_denied",
+        `the user denied access to ${desc} on this computer — do not work around it; only they can change it (consent {action:"revoke"}).`,
+        { app: known });
+    }
+    if (verdict.state === "undecided") {
+      throw new ServerError("consent_required",
+        `Codewhale needs the user's permission to use ${desc} on this computer — ask them, then record their answer with consent {action:"allow"|"deny", app:"${arg}"}.`,
+        { app: known });
+    }
+    grant = { ref: known, persisted: verdict.persisted === true };
+  }
+  // Taking the shared pointer/focus is a second, separate consent: the first
+  // activate:true is the moment the agent stops being background — on every
+  // platform, not just macOS.
+  if (name === "open_application" && args.activate === true) {
+    const fg = consent.foregroundDecision(computer.id);
+    if (fg.state === "denied") {
+      throw new ServerError("foreground_denied",
+        `the user denied shared-desktop (foreground) control on this computer — continue with open_application activate:false (background control) or ask them to reconsider.`,
+        { scope: "foreground" });
+    }
+    if (fg.state === "undecided") {
+      throw new ServerError("foreground_consent_required",
+        `open_application activate:true would take this computer's shared pointer and focus — ask the user, then record their answer with consent {action:"allow"|"deny", scope:"foreground"}. Background control (activate:false) needs no such consent.`,
+        { scope: "foreground" });
+    }
+  }
+  return grant ? { grant } : null;
+}
+
 // ---------- tool dispatch ----------
 async function callTool(params) {
   const requested = params.name;
@@ -550,7 +710,7 @@ async function callTool(params) {
     return { content: [{ type: "text", text: JSON.stringify(receipt(null, {
       ok: true,
       active: activeComputerId,
-      computers: Object.values(reg.computers).map((c) => ({ id: c.id, transport: c.transport, platform: c.platform ?? c.platformHint ?? null, label: c.label ?? null, host: c.host ?? null })),
+      computers: Object.values(reg.computers).map((c) => ({ id: c.id, transport: c.transport, platform: c.platform ?? c.platformHint ?? null, label: c.label ?? null, host: c.host ?? null, owned: c.owned === true || undefined, container: c.container ?? undefined })),
       note: "Pass `computer` on any tool to switch (sticky), or computer_switch to switch explicitly.",
     })) }] };
   }
@@ -582,12 +742,42 @@ async function callTool(params) {
     }
   }
 
+  if (name === "computer_spawn") {
+    try {
+      if (args.transport !== "docker") throw new ServerError("bad_args", `spawn transport must be "docker" (got ${JSON.stringify(args.transport)})`);
+      const spawned = await spawnDockerComputer({ id: args.computer, image: args.image });
+      let entry;
+      try {
+        entry = registry.register({ id: args.computer, transport: "docker", label: args.label, container: spawned.container, image: spawned.image, platform: "linux", owned: true, spawnedBy: SESSION_ID });
+      } catch (err) {
+        // The container exists but could not be registered — spawn is
+        // transactional, so take the container down with it.
+        await destroyDockerComputer({ container: spawned.container }).catch(() => {});
+        throw err;
+      }
+      await bindComputer(entry);
+      // A spawned computer is the point of the call — it becomes active so
+      // subsequent tools act on the disposable desktop without a switch.
+      activeComputerId = entry.id;
+      return { content: [{ type: "text", text: JSON.stringify(receipt(entry, { ok: true, active: activeComputerId, spawned: { id: entry.id, transport: entry.transport, platform: entry.platform, container: entry.container, image: entry.image, owned: true, built: spawned.built }, note: "This is a disposable, task-owned desktop — it is destroyed by computer remove or when this session ends. The user's own machine is untouched." })) }] };
+    } catch (err) {
+      return { content: [{ type: "text", text: JSON.stringify(fail(null, err.code ?? "spawn_failed", err.message ?? String(err))) }], isError: true };
+    }
+  }
+
   if (name === "computer_remove") {
+    let entry = null;
+    try { entry = registry.get(args.computer); } catch {}
+    let teardown = null;
+    if (entry?.transport === "docker") {
+      try { teardown = await destroyDockerComputer(entry); }
+      catch (err) { teardown = { destroyed: false, cleanup_error: err.message ?? String(err) }; }
+    }
     const res = registry.remove(args.computer);
     if (activeComputerId === args.computer) activeComputerId = "local";
     res.active = activeComputerId;
     await retireBinding(args.computer);
-    return { content: [{ type: "text", text: JSON.stringify(receipt(null, { ok: true, ...res })) }] };
+    return { content: [{ type: "text", text: JSON.stringify(receipt(null, { ok: true, ...res, ...(teardown ?? {}) })) }] };
   }
 
   if (name === "computer_switch") {
@@ -612,6 +802,39 @@ async function callTool(params) {
     return { content: [{ type: "text", text: JSON.stringify(fail(null, err.code ?? "registry_error", err.message)) }], isError: true };
   }
 
+  // Consent tools are the ledger itself — server-side, no backend dispatch.
+  // They still resolve the target computer the same way every other tool does.
+  if (name === "consent_status") {
+    return { content: [{ type: "text", text: JSON.stringify(receipt(computer, { ok: true, tool: name, switched, ...consent.status(computer.id) })) }] };
+  }
+  if (name === "consent_allow" || name === "consent_deny" || name === "consent_revoke") {
+    try {
+      const scope = args.scope === "foreground" ? "foreground" : "app";
+      const verb = { consent_allow: "allow", consent_deny: "deny" }[name] ?? null;
+      if (scope === "foreground") {
+        const r = verb ? consent.recordForeground(computer.id, verb, { remember: args.remember === true })
+          : consent.revokeForeground(computer.id);
+        return { content: [{ type: "text", text: JSON.stringify(receipt(computer, { ok: true, tool: name, switched, scope, ...r, note: verb ? `Shared-desktop (foreground) control ${verb === "allow" ? "allowed" : "denied"} for ${r.persisted ? "this computer until revoked" : "this session"}.` : "Foreground decision removed — the next activate:true asks again." })) }] };
+      }
+      const ref = refFromConsentArgs(args);
+      const keys = consent.appKeys(ref);
+      if (!keys.length) throw new ServerError("bad_args", `consent ${name.slice(8)} needs an app identity (app, name, bundle_id or pid) — or scope:"foreground"`);
+      // Fold in the resolved running-app identity so the decision holds under
+      // every spelling — and a deny cannot be sidestepped by asking for the
+      // same app a different way.
+      const resolved = await resolveAppIdentity(computer, ref);
+      const allKeys = resolved ? [...new Set([...keys, ...consent.appKeys(resolved)])] : keys;
+      if (verb) {
+        const r = consent.record(computer.id, allKeys, verb, { remember: args.remember === true, name: resolved?.name ?? ref.name ?? null });
+        return { content: [{ type: "text", text: JSON.stringify(receipt(computer, { ok: true, tool: name, switched, scope, decision: verb, app: resolved ?? ref, keys: allKeys, persisted: r.persisted, note: `${resolved?.name ?? ref.name ?? ref.bundle_id ?? `pid ${ref.pid}`} ${verb === "allow" ? "allowed" : "denied"} ${r.persisted ? "until revoked" : "for this session"}.` })) }] };
+      }
+      const r = consent.revoke(computer.id, allKeys);
+      return { content: [{ type: "text", text: JSON.stringify(receipt(computer, { ok: true, tool: name, switched, scope, app: resolved ?? ref, keys: allKeys, ...r, note: "Decisions removed — the next call targeting this app asks again." })) }] };
+    } catch (err) {
+      return { content: [{ type: "text", text: JSON.stringify(fail(computer, err.code ?? "consent_error", err.message ?? String(err), { tool: name, switched })) }], isError: true };
+    }
+  }
+
   let binding;
   let dispatched = false;
   try {
@@ -619,6 +842,10 @@ async function callTool(params) {
     if (binding.needsObservation && !ROUTE_INSPECTION_TOOLS.has(name)) {
       throw new ServerError("computer_observation_required", "Computer route changed — call screenshot or get_app_state on the registered target before acting");
     }
+    // Per-app consent: the first call that targets an application on the local
+    // computer must carry a recorded user decision. open_application returns
+    // the grant so its resolved identity can be aliased below.
+    const gateResult = await consentCheck(computer, name, args);
     if (name === "run_actions") {
       const steps = args.steps;
       if (!Array.isArray(steps) || steps.length < 1 || steps.length > 8) throw new ServerError("bad_args", "run_actions needs 1..8 steps");
@@ -656,24 +883,36 @@ async function callTool(params) {
     }
     // type/key with an element target run the documented focus-then-act idiom
     // in one call: the element is revalidated and accessibility-focused first,
-    // through the same routed path a separate focus call would take.
+    // through the same routed path a separate focus call would take. The
+    // target stays on the args — the backend also uses it to route the input
+    // into the element's own window, which is how hosted panels (native file
+    // pickers) receive keys whose handlers live outside the app's process.
     if ((name === "type" || name === "key") && args.target != null) {
       if (args.target.type !== "element") {
         throw new ServerError("bad_target", `${name} accepts element targets only — use left_click for a coordinate, then ${name}`);
       }
       const focused = await callTool({ name: "focus", arguments: { target: args.target, computer: computer.id } });
       const focusBody = JSON.parse(focused.content[0].text);
-      if (focused.isError || focusBody.ok === false) {
+      // For a chord the element's window is what matters — key equivalents
+      // dispatch at window level, so a focus refusal must not block delivery.
+      // Text is different: characters go to the first responder, so a field
+      // that could not be focused cannot receive the string either.
+      if (name === "type" && (focused.isError || focusBody.ok === false)) {
         return { content: [{ type: "text", text: JSON.stringify(fail(computer, focusBody.error?.code ?? "focus_failed", focusBody.error?.message ?? "element could not be focused", { tool: name, stage: "focus" })) }], isError: true };
       }
       args = { ...args };
-      delete args.target;
     }
     // Out-of-process runners (the desktop app for the local computer, the
     // remote agent for ssh computers) get the request over the wire.
     const backendMethod = BACKEND_METHOD[name];
+    // Scripting is honored on the local computer only. Remote agents refuse
+    // it too (their handler gates computerId), so a remote channel can never
+    // be steered into a shell — fail here first to save the hop.
+    if (name === "app_script" && computer.transport !== "local") {
+      throw new ServerError("unsupported_on_transport", `app_script runs on the local computer only — the ${computer.transport} transport stays a computer-use channel, never a shell`);
+    }
     let data;
-    const ex = computer.transport === "local" || computer.transport === "ssh" ? await executorFor(computer, binding) : null;
+    const ex = computer.transport === "local" || computer.transport === "ssh" || computer.transport === "docker" ? await executorFor(computer, binding) : null;
     if (ex?.kind === "app") binding.usedApp = true;
     // Zoom needs the bound parent raster up front (server-side check too, not
     // only the backend) so it can bind the child raster after success.
@@ -788,6 +1027,13 @@ async function callTool(params) {
     // index must never silently address the previous app's observation —
     // under a concurrent user that mistake clicks the wrong window.
     if (name === "open_application" && data?.resolved) {
+      boundApps.set(computer.id, data.resolved);
+      // The decision that let this open through covers the resolved identity
+      // under its other spellings too — a later bundle-id or name request for
+      // the same app must not prompt again.
+      if (gateResult?.grant) {
+        consent.alias(computer.id, consent.appKeys(data.resolved), { persisted: gateResult.grant.persisted, name: data.resolved.name ?? null });
+      }
       const latestId = latestStateByComputer.get(computer.id);
       const latest = latestId ? appStates.get(latestId) : null;
       if (latest) {
@@ -847,6 +1093,9 @@ async function callTool(params) {
     }
     return { content };
   } catch (err) {
+    // A failed open_application cleared the backend's input binding before it
+    // attempted anything — the tracked bound app must not claim otherwise.
+    if (name === "open_application") boundApps.delete(computer.id);
     let outcomeUnknown = !!err.requestDispatched;
     if (dispatched && !outcomeUnknown) {
       // A transport/backend can fail after delivering input. Reconcile its
@@ -861,6 +1110,7 @@ async function callTool(params) {
     const grant = name === "request_access" ? grantReport() : null;
     return { content: [{ type: "text", text: JSON.stringify(fail(computer, err.code ?? "tool_error", err.message ?? String(err), {
       tool: name, switched,
+      ...(err.extra ?? {}),
       ...(grant ? { grant } : {}),
       ...(outcomeUnknown ? { request_dispatched: true, outcome_unknown: true,
         note: "Dispatch to the previous route was attempted; its effect is unconfirmed. Observe the current target; do not automatically retry the action." } : {}),
@@ -882,7 +1132,9 @@ async function prepareArgs(computer, name, args, resolve, sink) {
   const out = { ...args };
   delete out.computer;
   delete out.ephemeral; // server-internal: never reaches a backend
-  const semantic = new Set(["set_value", "select_text", "perform_action", "focus", "get_value"]);
+  // type/key join the semantic set: their element target addresses a window
+  // for input routing (hosted panels), not a point for pointer delivery.
+  const semantic = new Set(["set_value", "select_text", "perform_action", "focus", "get_value", "type", "key"]);
   for (const key of ["target", "from_target", "to"]) {
     const given = out[key];
     if (given == null) continue;
@@ -911,6 +1163,11 @@ async function prepareArgs(computer, name, args, resolve, sink) {
     if (out.role != null && typeof out.role !== "string") throw new ServerError("bad_args", "role must be a string");
     if (out.ocr_region != null && (!Array.isArray(out.ocr_region) || out.ocr_region.length !== 4)) throw new ServerError("bad_args", "ocr_region must be [x, y, w, h] in screen points");
   }
+  if (name === "app_script") {
+    if (typeof out.script !== "string" || !out.script.trim()) throw new ServerError("bad_args", "app_script needs a non-empty script string");
+    if (out.language != null && !["applescript", "javascript"].includes(out.language)) throw new ServerError("bad_args", 'app_script language must be "applescript" or "javascript"');
+    if (out.timeout != null && (!Number.isFinite(out.timeout) || out.timeout <= 0 || out.timeout > 120)) throw new ServerError("bad_args", "app_script timeout must be 1..120 seconds");
+  }
   return out;
 }
 
@@ -936,6 +1193,7 @@ const SKILL_NAME = "computer-use";
 const SKILL_ROOT_URI = `skill://codewhale-cu/SKILL.md`;
 
 function parseFrontmatter(text) {
+  text = text.replace(/\r\n/g, "\n");
   if (!text.startsWith("---\n")) return null;
   const end = text.indexOf("\n---", 4);
   if (end === -1) return null;
@@ -1096,6 +1354,22 @@ async function shutdown() {
   for (const request of requests.values()) request.controller.abort();
   try { await releaseControl(); }
   catch (err) { process.stderr.write(`Computer input cleanup failed: ${err?.message ?? err}\n`); }
+  // Destroy the disposable computers this session spawned. Entries belonging
+  // to other (possibly still-running) sessions are left alone — a container
+  // belongs to the process that created it.
+  try {
+    await withSignal(null, async () => {
+      await destroySessionSpawns();
+      const reg = registry.list();
+      for (const c of Object.values(reg.computers)) {
+        if (c.transport === "docker" && c.owned === true && c.spawnedBy === SESSION_ID) {
+          await destroyDockerComputer(c).catch(() => {});
+          try { registry.remove(c.id); } catch {}
+          await retireBinding(c.id).catch(() => {});
+        }
+      }
+    });
+  } catch (err) { process.stderr.write(`Spawned computer cleanup failed: ${err?.message ?? err}\n`); }
   process.exit(0);
 }
 process.stdin.on("end", shutdown);

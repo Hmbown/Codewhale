@@ -99,7 +99,6 @@ fn composer_line_bounds(text: &str, pos: usize) -> (usize, usize) {
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
 use unicode_segmentation::UnicodeSegmentation;
-use unicode_width::UnicodeWidthStr;
 
 use crate::tui::app::{App, SidebarRowAction, StatusToastLevel};
 use crate::tui::command_palette::{
@@ -111,8 +110,8 @@ use crate::tui::scrolling::{ScrollDirection, TranscriptScroll};
 use crate::tui::selection::{SelectionAutoscroll, TranscriptSelectionPoint};
 use crate::tui::tideline::InteractionAction;
 use crate::tui::ui_text::{
-    history_cell_to_clipboard_text, history_cell_to_text, line_to_plain, slice_text,
-    text_display_width, truncate_line_to_width,
+    history_cell_to_clipboard_text, history_cell_to_text, line_to_plain, slice_visible_columns,
+    text_display_width, text_visible_width, truncate_line_to_width,
 };
 use crate::tui::views::{ContextMenuAction, HelpView, ModalKind, ViewEvent};
 use codewhale_localization::MessageId;
@@ -190,7 +189,9 @@ fn mouse_pos_to_char_index(app: &App, col: u16, row: u16, text_area: Rect) -> Op
     let mut char_offset = 0usize;
     let mut col_used = 0usize;
     for g in line_text.graphemes(true) {
-        let gw = g.width();
+        // Painted cells: ratatui strips control characters, so a tab takes
+        // no column here, matching the wrap and caret math.
+        let gw = crate::tui::widgets::visible_grapheme_width(g);
         if col_used + gw > rel_col {
             break;
         }
@@ -439,7 +440,7 @@ pub(crate) fn handle_composer_mouse(app: &mut App, mouse: MouseEvent) -> bool {
     }
     // Resolve the border- and submit-aware input plane through the same
     // persistent prompt geometry used by rendering, cursor placement, and
-    // viewport bookkeeping. The frame records it after reserving `[↑]`.
+    // viewport bookkeeping. The frame records it after reserving `[↵]`.
     let input_plane = app.viewport.last_composer_content.unwrap_or(area);
     let text_area =
         crate::tui::widgets::composer_content_geometry(input_plane, app.is_history_search_active())
@@ -1945,7 +1946,7 @@ fn selection_covers_cells_fully(
 /// to that width plus the content's display width.
 fn content_column_span(app: &App, line_index: usize) -> Option<(usize, usize)> {
     let cache = &app.viewport.transcript_cache;
-    let full_width = text_display_width(&line_to_plain(cache.lines().get(line_index)?));
+    let full_width = text_visible_width(&line_to_plain(cache.lines().get(line_index)?));
     let rail_width = cache.rail_prefix_width(line_index).min(full_width);
     let copy_prefix = cache
         .line_meta()
@@ -2052,24 +2053,29 @@ pub(crate) fn selection_to_text(app: &App) -> Option<String> {
         // slice off the rail prefix so subsequent column offsets operate
         // on content-only text.
         let full_text = line_to_plain(&lines[line_index]);
+        // Selection columns are painted terminal cells, where control
+        // characters are invisible (ratatui strips them). Measure and slice
+        // in that space so columns after a tab stay aligned with what the
+        // user dragged over; the fixed-width fallback would shift every
+        // downstream column.
         let line_after_rail = if rail_width > 0 {
-            slice_text(&full_text, rail_width, text_display_width(&full_text))
+            slice_visible_columns(&full_text, rail_width, text_visible_width(&full_text))
         } else {
             full_text
         };
-        let line_after_rail_width = text_display_width(&line_after_rail);
+        let line_after_rail_width = text_visible_width(&line_after_rail);
         let copy_prefix_width = line_meta
             .get(line_index)
             .map(|meta| meta.copy_prefix_width())
             .unwrap_or(0)
             .min(line_after_rail_width);
         let line_text = if copy_prefix_width > 0 {
-            slice_text(&line_after_rail, copy_prefix_width, line_after_rail_width)
+            slice_visible_columns(&line_after_rail, copy_prefix_width, line_after_rail_width)
         } else {
             line_after_rail
         };
-        let line_width = text_display_width(&line_text);
         let visual_prefix_width = rail_width.saturating_add(copy_prefix_width);
+        let line_width = text_visible_width(&line_text);
         // Selection coordinates are recorded in rendered-column space, which
         // includes visual prefixes. Add them back so the column window maps
         // correctly into copy-only text.
@@ -2090,7 +2096,7 @@ pub(crate) fn selection_to_text(app: &App) -> Option<String> {
             .saturating_sub(visual_prefix_width)
             .min(line_width);
 
-        let slice = slice_text(&line_text, col_start, col_end);
+        let slice = slice_visible_columns(&line_text, col_start, col_end);
         selected.push_str(&slice);
         separator_before = line_meta
             .get(line_index)
@@ -2133,6 +2139,18 @@ mod tests {
         // Legacy strip geometry (see ui.rs); Bottom default has its own tests.
         app.work_surface.placement = crate::tui::work_surface::WorkSurfacePlacement::Top;
         app
+    }
+
+    #[test]
+    fn composer_click_maps_tabs_as_painted() {
+        // A tab paints no cells, so clicking the visible char after one
+        // must resolve past it instead of stopping on the tab itself.
+        let mut app = create_test_app();
+        let area = Rect::new(0, 0, 80, 10);
+        app.input = "a\tb".to_string();
+        assert_eq!(super::mouse_pos_to_char_index(&app, 1, 0, area), Some(2));
+        app.input = "\ta".to_string();
+        assert_eq!(super::mouse_pos_to_char_index(&app, 0, 0, area), Some(1));
     }
 
     fn hover_row(row_y: u16, action: Option<&str>) -> SidebarHoverRow {
@@ -2421,7 +2439,7 @@ mod tests {
         let area = Rect::new(0, 20, 80, 4);
         app.viewport.last_composer_area = Some(area);
         // Match the frame's submit-aware input plane: x=74 stays blank,
-        // then the shared `[↑]` target begins at x=75.
+        // then the shared `[↵]` target begins at x=75.
         app.viewport.last_composer_content = Some(Rect::new(1, 21, 73, 2));
         let submit = crate::tui::widgets::active_composer_submit_rect(&app, area)
             .expect("enclosed composer submit");

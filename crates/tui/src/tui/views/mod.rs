@@ -134,7 +134,7 @@ pub(crate) fn render_underwater_surface(
     title: impl Into<String>,
 ) -> Rect {
     let margin_x = u16::from(area.width >= 44);
-    let margin_y = u16::from(area.height >= 14);
+    let margin_y = u16::from(area.height >= 24);
     let surface = Rect {
         x: area.x.saturating_add(margin_x),
         y: area.y.saturating_add(margin_y),
@@ -160,7 +160,7 @@ pub(crate) fn render_underwater_surface(
         .borders(Borders::TOP | Borders::BOTTOM)
         .border_style(Style::default().fg(palette::BORDER_COLOR))
         .style(Style::default().bg(palette::WHALE_BG))
-        .padding(Padding::new(1, 1, 1, 1));
+        .padding(Padding::new(1, 1, u16::from(area.height >= 24), 0));
     let inner = block.inner(surface);
     block.render(surface, buf);
     inner
@@ -793,6 +793,23 @@ pub enum ViewEvent {
     /// Enter on a Fleet editor row: open the standard `/model` picker for
     /// that row (the editor stays underneath) instead of the editor's own
     /// inline route list.
+    FleetProfileRoutePickRequested {
+        editor_id: uuid::Uuid,
+    },
+    FleetProfileRoutePicked {
+        editor_id: uuid::Uuid,
+        provider: crate::config::ApiProvider,
+        provider_id: Option<String>,
+        model: String,
+        reasoning: Option<crate::reasoning_preference::ReasoningEffort>,
+    },
+    FleetProfileRouteCommitRequested {
+        editor_id: uuid::Uuid,
+    },
+    FleetAssignmentPickerDismissed {
+        editor_id: uuid::Uuid,
+    },
+    FleetRosterOpenCoordinatorRequested,
     FleetDetailRoutePickRequested {
         target: crate::tui::views::fleet_detail::FleetRouteTarget,
         editor_id: uuid::Uuid,
@@ -2593,6 +2610,15 @@ impl ConfigView {
                     })
             });
         rows.splice(2..2, external_status_rows);
+        // An explanation route, never an editable sandbox policy. The existing
+        // status report owns the observed platform/backend enforcement facts.
+        rows.push(ConfigRow {
+            key: "sandbox_details".into(),
+            value: "/status".into(),
+            editable: true,
+            scope: ConfigScope::Session,
+            facts: ConfigRowFacts::action("/status", MessageId::AutomationActionInspect),
+        });
         rows.extend(experimental_config_rows(&config));
         rows.extend(
             codewhale_config::notifications::NotificationSetting::ALL
@@ -2795,8 +2821,14 @@ impl ConfigView {
         let scope_en = row.scope.label(Locale::En).to_lowercase();
         let hint = config_hint_for_key(self.locale, &row.key).to_lowercase();
 
+        let explanation_terms = if row.key == "sandbox_details" {
+            "sandbox filesystem unenforced isolation bubblewrap bwrap doctor"
+        } else {
+            ""
+        };
         terms.iter().all(|term| {
-            section.contains(term)
+            explanation_terms.contains(term)
+                || section.contains(term)
                 || section_en.contains(term)
                 || category_label.contains(term)
                 || category_en.contains(term)
@@ -3059,6 +3091,12 @@ impl ConfigView {
             return None;
         }
         let (command, _) = row.facts.command?;
+        if row.key == "sandbox_details" {
+            return Some(ViewAction::Emit(ViewEvent::ExecutePanelCommand {
+                command: command.to_string(),
+                pager_title: Some(config_label_for_key_for_locale(self.locale, &row.key)),
+            }));
+        }
         Some(ViewAction::Emit(ViewEvent::CommandPaletteSelected {
             action: CommandPaletteAction::ExecuteCommand {
                 command: command.to_string(),
@@ -4093,8 +4131,12 @@ impl ModalView for ConfigView {
             // Spacer rows are secondary chrome: give them up before the
             // editable value line falls below the wrapped footer on compact
             // terminals (#40x12).
-            let spacious =
-                usize::from(inner.height).saturating_sub(reserved_footer_lines + CONTROL_ROWS) >= 8;
+            let body_rows =
+                usize::from(inner.height).saturating_sub(reserved_footer_lines + CONTROL_ROWS);
+            // The expanded header costs six rows before the options. Reserve
+            // at least three choices plus their detail before adding spacers;
+            // a slightly taller compact shell must not show fewer options.
+            let spacious = body_rows >= if edit.choices.is_some() { 10 } else { 8 };
             let mut lines: Vec<Line> = Vec::new();
             let edit_label = config_label_for_key_for_locale(self.locale, &edit.key);
             let edit_title = if edit_label == edit.key {
@@ -4274,16 +4316,9 @@ impl ConfigView {
                 // The filled Apply control answers hover with an underline:
                 // a bg tint would erase its button fill.
                 if self.hovered_editor == Some(EditorControl::Apply) {
-                    Style::default()
-                        .fg(palette::SELECTION_TEXT)
-                        .bg(palette::WHALE_ACTION)
-                        .add_modifier(Modifier::BOLD)
-                        .add_modifier(Modifier::UNDERLINED)
+                    menu_style::selected_row_style().add_modifier(Modifier::UNDERLINED)
                 } else {
-                    Style::default()
-                        .fg(palette::SELECTION_TEXT)
-                        .bg(palette::WHALE_ACTION)
-                        .add_modifier(Modifier::BOLD)
+                    menu_style::selected_row_style()
                 },
             ),
             (
@@ -4518,6 +4553,49 @@ pub(crate) fn render_settings_category_strip(
 
     let mut hitboxes = CategoryStripHitboxes::default();
     if area.width < 4 || area.height == 0 {
+        return hitboxes;
+    }
+    // At phone-width terminals, show one complete category and its position.
+    // Both arrows retain the same wraparound navigation and measured targets.
+    if area.width < 50 {
+        let previous = Rect::new(area.x, area.y, 2, 1);
+        let next = Rect::new(area.right().saturating_sub(2), area.y, 2, 1);
+        let label_area = Rect::new(area.x + 2, area.y, area.width.saturating_sub(4), 1);
+        let label = format!(
+            "{}  {}/{}",
+            selected.label(locale),
+            selected.position() + 1,
+            ConfigCategory::ALL.len()
+        );
+        for (rect, glyph, step) in [
+            (
+                previous,
+                if style.ascii_safe { "< " } else { "‹ " },
+                NavStep::Previous,
+            ),
+            (
+                next,
+                if style.ascii_safe { " >" } else { " ›" },
+                NavStep::Next,
+            ),
+        ] {
+            let marker_style = if hovered_nav == Some(step) {
+                style.marker.patch(menu_style::hovered_row_style())
+            } else {
+                style.marker
+            };
+            buf.set_stringn(rect.x, rect.y, glyph, 2, marker_style);
+        }
+        buf.set_stringn(
+            label_area.x,
+            label_area.y,
+            truncate_line_to_width(&label, usize::from(label_area.width)),
+            usize::from(label_area.width),
+            style.selected,
+        );
+        hitboxes.chips.push((label_area, selected));
+        hitboxes.previous = Some(previous);
+        hitboxes.next = Some(next);
         return hitboxes;
     }
     let labels: Vec<String> = ConfigCategory::ALL
@@ -5003,12 +5081,33 @@ impl ConfigView {
         let items = self.visible_items();
         let match_count = self.matching_row_indices().len();
 
+        let compact = inner.width < 50;
+        // Keys and symbols stay legible in one row; the search field above
+        // already explains typing. Shed verbose copy before editable content.
+        let ascii_safe = crate::tui::color_compat::ascii_safe_enabled();
+        let compact_hints = if ascii_safe {
+            [
+                ActionHint::new("Tab", "<>"),
+                ActionHint::new("Up/Dn", ""),
+                ActionHint::new("Enter", ""),
+                ActionHint::new("Esc", ""),
+            ]
+        } else {
+            [
+                ActionHint::new("Tab", "⇆"),
+                ActionHint::new("↑↓", ""),
+                ActionHint::new("Enter", "↵"),
+                ActionHint::new("Esc", "×"),
+            ]
+        };
         // Reserve the action footer by its actual wrapped height so no list
         // row silently falls off the bottom on compact terminals.
         let footer_height = |id: MessageId| -> usize {
             wrapped_footer_lines(&self.tr(id), inner.width, Style::default()).len()
         };
-        let footer_lines = if !self.filter.is_empty() {
+        let footer_lines = if compact {
+            1
+        } else if !self.filter.is_empty() {
             footer_height(MessageId::ConfigFooterFiltered)
         } else {
             footer_height(MessageId::ConfigFooterScrollable)
@@ -5029,7 +5128,9 @@ impl ConfigView {
         // footer these settings paint. The preview sheds first on short
         // terminals; the sentence holds while two list lines remain.
         let preview_lines = usize::from(content_height >= HEADER_LINES + 10);
-        let sentence_lines = if content_height.saturating_sub(HEADER_LINES + preview_lines) >= 3 {
+        let sentence_lines = if compact {
+            usize::from(content_height >= HEADER_LINES + 3)
+        } else if content_height.saturating_sub(HEADER_LINES + preview_lines) >= 3 {
             // Without a detail pane the band also carries the lanes that pane
             // would have shown, on a second line so neither is truncated away.
             if show_detail {
@@ -5128,13 +5229,10 @@ impl ConfigView {
             };
             {
                 let strip_style = CategoryNavStyle {
-                    selected: Style::default()
-                        .fg(palette::SELECTION_TEXT)
-                        .bg(palette::WHALE_ACTION)
-                        .add_modifier(Modifier::BOLD),
+                    selected: menu_style::selected_row_style(),
                     normal: Style::default().fg(palette::TEXT_MUTED),
                     marker: Style::default().fg(palette::TEXT_HINT),
-                    ascii_safe: false,
+                    ascii_safe,
                 };
                 let strip = render_settings_category_strip(
                     nav_row,
@@ -5224,8 +5322,19 @@ impl ConfigView {
                             .add_modifier(Modifier::DIM)
                     };
                     let label = config_label_for_key_for_locale(self.locale, &row.key);
-                    let key = fit_config_column(&label, key_column_width);
-                    let value = fit_config_column(&self.row_display_value(row), value_column_width);
+                    let (key_width, value_width) = if compact {
+                        let available = usize::from(list.width).saturating_sub(
+                            CONFIG_ROW_PREFIX_WIDTH
+                                + CONFIG_COLUMN_GAPS_WIDTH
+                                + CONFIG_AFFORDANCE_COLUMN_WIDTH,
+                        );
+                        let key_width = UnicodeWidthStr::width(label.as_str()).min(available / 2);
+                        (key_width, available.saturating_sub(key_width))
+                    } else {
+                        (key_column_width, value_column_width)
+                    };
+                    let key = fit_config_column(&label, key_width);
+                    let value = fit_config_column(&self.row_display_value(row), value_width);
                     let kind = self.editor_kind(row);
                     let on = (kind == SettingKind::Boolean)
                         .then(|| canonical_config_choice(&row.key, row.edit_value()) == "true");
@@ -5242,16 +5351,18 @@ impl ConfigView {
                     let mut line = Line::from(vec![
                         Span::styled(
                             rail,
-                            Style::default().fg(if selected {
-                                palette::WHALE_ACTION
+                            if selected {
+                                style
                             } else {
-                                palette::TEXT_DIM
-                            }),
+                                Style::default().fg(palette::TEXT_DIM)
+                            },
                         ),
                         Span::styled(format!("{key}  {value}  "), style),
                         Span::styled(
                             format!("{affordance:<3}  "),
-                            if row.editable {
+                            if selected {
+                                style
+                            } else if row.editable {
                                 Style::default().fg(palette::WHALE_ACTION)
                             } else {
                                 Style::default()
@@ -5261,9 +5372,13 @@ impl ConfigView {
                         ),
                         Span::styled(
                             badge.into_owned(),
-                            Style::default()
-                                .fg(palette::TEXT_HINT)
-                                .add_modifier(Modifier::DIM),
+                            if selected {
+                                style
+                            } else {
+                                Style::default()
+                                    .fg(palette::TEXT_HINT)
+                                    .add_modifier(Modifier::DIM)
+                            },
                         ),
                     ]);
                     if selected {
@@ -5314,6 +5429,12 @@ impl ConfigView {
             // is more urgent and takes the row while it lasts.
             let bottom_text = if let Some(status) = self.status.as_ref() {
                 status.clone()
+            } else if let Some(row) = selected_row.filter(|_| compact) {
+                format!(
+                    "{}: {}",
+                    config_label_for_key_for_locale(self.locale, &row.key),
+                    self.row_display_value(row)
+                )
             } else if !self.filter.is_empty() {
                 format!(
                     "{}: {match_count}",
@@ -5381,12 +5502,16 @@ impl ConfigView {
         } else {
             self.tr(MessageId::ConfigFooterDefault)
         };
-        render_modal_text_footer(
-            inner,
-            buf,
-            &footer,
-            Style::default().fg(palette::TEXT_MUTED),
-        );
+        if compact {
+            render_modal_footer(inner, buf, &compact_hints);
+        } else {
+            render_modal_text_footer(
+                inner,
+                buf,
+                &footer,
+                Style::default().fg(palette::TEXT_MUTED),
+            );
+        }
     }
 }
 
@@ -6332,13 +6457,13 @@ fn fit_config_column(text: &str, width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ActionHint, ConfigCategory, ConfigListItem, ConfigScope, ConfigView, EmptyState,
-        FocusTextureMode, HelpView, ListDetailLayout, ModalKind, ModalView, SettingKind,
-        SettingsRegistry, ViewAction, ViewEvent, ViewStack, action_footer_lines,
-        canonical_config_choice, centered_modal_area, config_choice_detail, config_choice_label,
-        config_choice_values, config_label_for_key, config_label_for_key_for_locale,
-        render_modal_footer_with_gutter, render_underwater_surface, subagent_view_agents,
-        truncate_view_text,
+        ActionHint, ConfigCategory, ConfigListItem, ConfigRowKind, ConfigScope, ConfigView,
+        EmptyState, FocusTextureMode, HelpView, ListDetailLayout, ModalKind, ModalView,
+        SettingKind, SettingStore, SettingsRegistry, ViewAction, ViewEvent, ViewStack,
+        action_footer_lines, canonical_config_choice, centered_modal_area, config_choice_detail,
+        config_choice_label, config_choice_values, config_label_for_key,
+        config_label_for_key_for_locale, render_modal_footer_with_gutter,
+        render_underwater_surface, subagent_view_agents, truncate_view_text,
     };
     use crate::config::Config;
     use crate::settings::Settings;
@@ -8169,7 +8294,7 @@ base_url = "https://api.xiaomimimo.com/v1"
         let _guard = ConfigSettingsEnvGuard::new("theme = \"terminal\"\n");
         let app = create_test_app();
         let view = ConfigView::new_for_app(&app);
-        for (width, height) in [(80u16, 24u16), (120u16, 32u16)] {
+        for (width, height) in [(40u16, 12u16), (80u16, 24u16), (120u16, 32u16)] {
             let rendered = crate::tui::golden_harness::render_golden_text(width, height, |buf| {
                 view.render(Rect::new(0, 0, width, height), buf);
             });
@@ -8386,6 +8511,7 @@ base_url = "https://api.xiaomimimo.com/v1"
             "mcp_reconnect",
             "mcp_diagnose",
             "plugins_open",
+            "sandbox_details",
             "mcp_config_path",
             "approval_mode",
             "permission_posture",
@@ -9794,19 +9920,26 @@ context_window = 262144
                 cells.contains("Advanced"),
                 "{w}x{h} hitbox cells: {cells:?}"
             );
-            // Pointer parity: clicking the neighbour chip moves the category
-            // exactly as ← does.
+            // Pointer parity: the neighbour chip or compact Previous control
+            // moves the category exactly as ← does.
             let _ = view.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
             let by_key = view.category;
             let _ = view.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
             let mut buf = Buffer::empty(area);
             view.render(area, &mut buf);
             let strip = view.last_rail_hitboxes.borrow().clone();
-            let (motion, _) = strip
+            let motion = strip
                 .iter()
-                .copied()
                 .find(|(_, category)| *category == by_key)
-                .unwrap_or_else(|| panic!("{w}x{h} {by_key:?} hitbox"));
+                .map(|(rect, _)| *rect)
+                .or_else(|| {
+                    view.last_nav_controls
+                        .borrow()
+                        .iter()
+                        .find(|(_, step)| *step == super::NavStep::Previous)
+                        .map(|(rect, _)| *rect)
+                })
+                .unwrap_or_else(|| panic!("{w}x{h} {by_key:?} navigation target"));
             let action = view.handle_mouse(MouseEvent {
                 kind: MouseEventKind::Down(MouseButton::Left),
                 column: motion.x,
@@ -10132,7 +10265,11 @@ context_window = 262144
             assert_eq!(view.rows[view.selected].key, "fancy_animations");
             let dump = snapshot(&view, "Motion · ↓ to fancy_animations");
             assert!(
-                dump.contains(&en(MessageId::ConfigActivateAgain)),
+                if w < 50 {
+                    dump.contains("Enter")
+                } else {
+                    dump.contains(&en(MessageId::ConfigActivateAgain))
+                },
                 "{w}x{h} activation copy:\n{dump}"
             );
             match key(&mut view, KeyCode::Enter) {
@@ -10144,8 +10281,8 @@ context_window = 262144
             }
             assert!(view.editing.is_none());
 
-            // Pointer parity: click a visible non-active chip, then click the
-            // first listed row once (select) and again (activate).
+            // Pointer parity: click a visible non-active chip or the compact
+            // Previous control, then select and activate the first row.
             let mut buf = Buffer::empty(area);
             view.render(area, &mut buf);
             let (chip, target) = view
@@ -10154,7 +10291,14 @@ context_window = 262144
                 .iter()
                 .copied()
                 .find(|(_, category)| *category != ConfigCategory::Motion)
-                .expect("another category chip is painted");
+                .or_else(|| {
+                    view.last_nav_controls
+                        .borrow()
+                        .iter()
+                        .find(|(_, step)| *step == super::NavStep::Previous)
+                        .map(|(rect, _)| (*rect, ConfigCategory::Trust))
+                })
+                .expect("another category is reachable through a painted target");
             assert!(matches!(click(&mut view, chip.x, chip.y), ViewAction::None));
             assert_eq!(view.category, target, "{w}x{h} chip click");
             let mut buf = Buffer::empty(area);
@@ -10180,6 +10324,10 @@ context_window = 262144
                 (true, Some((command, _))) => match second {
                     ViewAction::Emit(ViewEvent::CommandPaletteSelected {
                         action: CommandPaletteAction::ExecuteCommand { command: emitted },
+                    }) => assert_eq!(emitted, command),
+                    ViewAction::Emit(ViewEvent::ExecutePanelCommand {
+                        command: emitted,
+                        pager_title: Some(_),
                     }) => assert_eq!(emitted, command),
                     other => panic!("{w}x{h} second click should open {command}: {other:?}"),
                 },
@@ -11181,6 +11329,74 @@ context_window = 262144
     /// (in-body title, column captions, separator) before it surrenders the
     /// settings rows, and the wrapped footer height must come out of the
     /// table budget instead of silently clipping rows.
+    #[test]
+    fn config_compact_theme_category_and_footer_remain_legible() {
+        let _guard = ConfigSettingsEnvGuard::new("theme = \"shoreline\"\n");
+        let mut view = create_config_view(Locale::En);
+        view.focus_key("theme");
+        let area = Rect::new(0, 0, 40, 12);
+        let mut buf = Buffer::empty(area);
+        view.render(area, &mut buf);
+        let dump = buffer_text(&buf, area);
+        let theme_rect = view
+            .last_row_hitboxes
+            .borrow()
+            .iter()
+            .find(|(_, idx)| view.rows[*idx].key == "theme")
+            .unwrap()
+            .0;
+        assert!(
+            buffer_row_text(&buf, area, theme_rect.y).contains("shoreline"),
+            "{dump}"
+        );
+        assert!(dump.contains("Appearance  1/7"), "{dump}");
+        let footer = dump
+            .lines()
+            .find(|line| line.contains("Enter") && line.contains("Esc"))
+            .expect("all compact action hints share one line");
+        assert!(footer.contains("Tab"));
+        for category in ConfigCategory::ALL {
+            view.category = category;
+            view.select_first_visible_row();
+            view.render(area, &mut buf);
+            let dump = buffer_text(&buf, area);
+            assert!(
+                dump.contains(category.label(Locale::En).as_ref()),
+                "{category:?}: {dump}"
+            );
+            assert_eq!(view.last_nav_controls.borrow().len(), 2);
+        }
+    }
+
+    #[test]
+    fn config_sandbox_search_opens_observed_status_without_editing_policy() {
+        let mut view = create_config_view(Locale::En);
+        for query in [
+            "sandbox",
+            "filesystem",
+            "unenforced",
+            "bubblewrap",
+            "doctor",
+        ] {
+            view.restore_filter(query.to_string());
+            let matches = view.matching_row_indices();
+            let index = *matches
+                .iter()
+                .find(|&&idx| view.rows[idx].key == "sandbox_details")
+                .expect("sandbox explanation discoverable");
+            view.selected = index;
+            let row = &view.rows[index];
+            assert_eq!(row.facts.kind, ConfigRowKind::Action);
+            assert_eq!(row.facts.store, SettingStore::None);
+            assert!(
+                matches!(view.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+                ViewAction::Emit(ViewEvent::ExecutePanelCommand { command, pager_title: Some(_) }) if command == "/status")
+            );
+            assert!(view.editing.is_none());
+        }
+        assert!(!view.rows.iter().any(|row| row.key == "sandbox_mode"));
+    }
+
     #[test]
     fn config_view_compact_heights_always_show_a_selectable_setting() {
         let mut view = create_config_view(Locale::En);

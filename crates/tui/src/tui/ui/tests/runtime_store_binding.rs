@@ -131,172 +131,225 @@ async fn runtime_store_binding_exit_preserves_inflight_recovery() -> anyhow::Res
     Ok(())
 }
 
-#[tokio::test]
-async fn runtime_store_binding_survives_launch_snapshot_and_resume() -> anyhow::Result<()> {
-    let _environment = crate::test_support::lock_test_env();
-    let root = tempfile::tempdir()?;
-    let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", root.path());
-    let _runtime = crate::test_support::EnvVarGuard::remove("CODEWHALE_RUNTIME_DIR");
-    let _legacy = crate::test_support::EnvVarGuard::remove("DEEPSEEK_RUNTIME_DIR");
-    let config = fixture_config();
-    let mut app = Box::new(create_test_app());
-    app.workspace = root.path().into();
-    let initial_id = super::super::event_loop::ensure_runtime_session_id(&mut app);
-    let task_config = TaskManagerConfig::from_runtime(&config, root.path().into(), None, Some(1));
-    let tasks = TaskManager::start(
-        task_config.clone(),
-        config.clone(),
-        app.plugin_registry.clone(),
-        &initial_id,
-        None,
-    )
-    .await?;
-    app.runtime_services.task_manager = Some(tasks.clone());
-    let sessions = SessionManager::default_location()?;
-    // A saved initial conversation may later be deleted while another launch
-    // still refers to its Runtime store.
-    let initial = build_session_snapshot(&mut app, &sessions).map_err(anyhow::Error::msg)?;
-    sessions.save_session(&initial)?;
-    let launch = begin_launch_session(&mut app, None);
-    assert!(!launch.is_error, "{:?}", launch.message);
-    assert_ne!(app.current_session_id.as_deref(), Some(initial_id.as_str()));
-    let saved = build_session_snapshot(&mut app, &sessions).map_err(anyhow::Error::msg)?;
-    let binding = saved
-        .metadata
-        .runtime_store
-        .clone()
-        .expect("attached host binding");
-    assert_eq!(binding.execution_scope, tasks.execution_scope());
-    sessions.save_session(&saved)?;
-    let mut automations = AutomationManager::open(root.path().join("automations"))?;
-    automations.bind_task_manager(&tasks)?;
-    let automation = automations.create_automation(CreateAutomationRequest {
-        name: "resumed ownership fixture".into(),
-        prompt: "local fixture only".into(),
-        rrule: "FREQ=HOURLY;INTERVAL=1".into(),
-        cwds: vec![root.path().into()],
-        model: None,
-        model_provider: None,
-        model_provider_id: None,
-        mode: None,
-        allow_shell: Some(false),
-        trust_mode: Some(false),
-        auto_approve: Some(false),
-        delivery_mode: None,
-        status: Some(AutomationStatus::Paused),
-    })?;
-    tasks.shutdown_and_wait().await?;
-    drop(app);
-    drop(tasks);
-    drop(automations);
-    sessions.delete_session(&initial_id)?;
-    assert!(
-        binding.data_dir.is_dir(),
-        "transcript deletion cannot erase Runtime authority"
-    );
-    let loaded = sessions.load_session(&saved.metadata.id)?;
-    assert_eq!(loaded.metadata.runtime_store.as_ref(), Some(&binding));
-    let mut resumed = Box::new(create_test_app());
-    let mut resumed_config = config.clone();
-    apply_loaded_session_with_goal(&mut resumed, &mut resumed_config, &loaded, None)
-        .map_err(anyhow::Error::msg)?;
-    let tasks = TaskManager::start(
-        task_config.clone(),
-        config.clone(),
-        resumed.plugin_registry.clone(),
-        &loaded.metadata.id,
-        loaded.metadata.runtime_store.as_ref(),
-    )
-    .await?;
-    assert_eq!(
-        tasks.execution_scope(),
-        automation.execution_scope.as_deref().unwrap()
-    );
-    resumed.runtime_services.task_manager = Some(tasks.clone());
-    let automations = Arc::new(tokio::sync::Mutex::new(AutomationManager::open(
-        root.path().join("automations"),
-    )?));
-    // The real Run-now admission must now create its durable receipt. The
-    // configured endpoint is closed loopback and no shell/tool is authorized.
-    let run = run_now_shared(&automations, &automation.id, &tasks).await?;
-    assert!(run.task_id.is_some(), "{run:?}");
-    assert_eq!(
-        automations
-            .lock()
-            .await
-            .list_runs(&automation.id, None)?
-            .len(),
-        1
-    );
-    assert_eq!(
-        automations
-            .lock()
-            .await
-            .get_automation(&automation.id)?
-            .execution_scope,
-        automation.execution_scope
-    );
-    tasks.shutdown_and_wait().await?;
-    drop(resumed);
-    drop(tasks);
-    // Reproduce the old resume path: deriving a store from the saved
-    // conversation id without its binding opens a foreign scope and cannot run.
-    let foreign = TaskManager::start(
-        task_config,
-        config,
-        Arc::new(crate::plugins::PluginRegistry::empty(root.path())),
-        &loaded.metadata.id,
-        None,
-    )
-    .await?;
-    let foreign_automations = Arc::new(tokio::sync::Mutex::new(AutomationManager::open(
-        root.path().join("automations"),
-    )?));
-    let definition_path = root
-        .path()
-        .join("automations/automations")
-        .join(format!("{}.json", automation.id));
-    let before_foreign_run = std::fs::read(&definition_path)?;
-    let error = run_now_shared(&foreign_automations, &automation.id, &foreign)
-        .await
-        .unwrap_err();
-    assert!(
-        error
-            .to_string()
-            .contains("another Runtime execution scope"),
-        "{error:#}"
-    );
-    assert_eq!(
-        foreign_automations
-            .lock()
-            .await
-            .list_runs(&automation.id, None)?
-            .len(),
-        1
-    );
-    assert_eq!(std::fs::read(definition_path)?, before_foreign_run);
-    let mut other_app = Box::new(create_test_app());
-    other_app.runtime_services.task_manager = Some(foreign.clone());
-    other_app.input = "preserve pending input".into();
-    let old_id = other_app.current_session_id.clone();
-    let error = apply_loaded_session_with_goal(&mut other_app, &mut resumed_config, &loaded, None)
-        .unwrap_err();
-    // The refusal must name the route that actually works. "Resume it in a new
-    // Codewhale process" was true but unactionable: starting a new process and
-    // then picking the session from `/resume` returns here, because that is
-    // this same switch path (#6207, #6225).
-    assert!(
-        error.contains("codewhale resume"),
-        "the refusal must point at the direct-open path: {error}"
-    );
-    assert!(
-        error.contains(&loaded.metadata.id),
-        "the refusal must name the session to open: {error}"
-    );
-    assert_eq!(other_app.current_session_id, old_id);
-    assert_eq!(other_app.input, "preserve pending input");
-    foreign.shutdown_and_wait().await?;
-    Ok(())
+/// #6362: this test used to be one async body. Every debug-build temporary
+/// of that body — the boxed `App` returns, the cloned `Config`s, two session
+/// snapshots, the task-manager futures — got its own slot in a single poll
+/// frame, which alone measured 1.1 MiB on the 2 MiB stack libtest gives a
+/// test thread (gdb frame attribution, 2026-09-20). The phases below are
+/// built and boxed through `boxed_phase`, so each phase's temporaries die
+/// with its own poll frame and the outer body holds pointers; inline
+/// `async {}` phases measured 806 KiB of never-reused slots on the outer
+/// frame and still overflowed. The test pins the default budget explicitly
+/// instead of inheriting CI's 16 MiB `RUST_MIN_STACK`, which is what masked
+/// the overflow.
+#[test]
+fn runtime_store_binding_survives_launch_snapshot_and_resume() -> anyhow::Result<()> {
+    use crate::test_support::boxed_phase;
+
+    crate::test_support::block_on_default_test_stack(|| async {
+        let _environment = crate::test_support::lock_test_env();
+        let root = tempfile::tempdir()?;
+        let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", root.path());
+        let _runtime = crate::test_support::EnvVarGuard::remove("CODEWHALE_RUNTIME_DIR");
+        let _legacy = crate::test_support::EnvVarGuard::remove("DEEPSEEK_RUNTIME_DIR");
+        let config = fixture_config();
+        let sessions = SessionManager::default_location()?;
+        let task_config =
+            TaskManagerConfig::from_runtime(&config, root.path().into(), None, Some(1));
+        let (root, config, task_config, sessions) = (&root, &config, &task_config, &sessions);
+
+        // Phase 1: launch over a saved conversation and bind its Runtime store.
+        let (initial_id, saved_id, binding, automation) = boxed_phase(move || async move {
+            let mut app = Box::new(create_test_app());
+            app.workspace = root.path().into();
+            let initial_id = super::super::event_loop::ensure_runtime_session_id(&mut app);
+            let tasks = TaskManager::start(
+                task_config.clone(),
+                config.clone(),
+                app.plugin_registry.clone(),
+                &initial_id,
+                None,
+            )
+            .await?;
+            app.runtime_services.task_manager = Some(tasks.clone());
+            // A saved initial conversation may later be deleted while another
+            // launch still refers to its Runtime store.
+            let initial = build_session_snapshot(&mut app, sessions).map_err(anyhow::Error::msg)?;
+            sessions.save_session(&initial)?;
+            let launch = begin_launch_session(&mut app, None);
+            assert!(!launch.is_error, "{:?}", launch.message);
+            assert_ne!(app.current_session_id.as_deref(), Some(initial_id.as_str()));
+            let saved = build_session_snapshot(&mut app, sessions).map_err(anyhow::Error::msg)?;
+            let binding = saved
+                .metadata
+                .runtime_store
+                .clone()
+                .expect("attached host binding");
+            assert_eq!(binding.execution_scope, tasks.execution_scope());
+            sessions.save_session(&saved)?;
+            let mut automations = AutomationManager::open(root.path().join("automations"))?;
+            automations.bind_task_manager(&tasks)?;
+            let automation = automations.create_automation(CreateAutomationRequest {
+                name: "resumed ownership fixture".into(),
+                prompt: "local fixture only".into(),
+                rrule: "FREQ=HOURLY;INTERVAL=1".into(),
+                cwds: vec![root.path().into()],
+                model: None,
+                model_provider: None,
+                model_provider_id: None,
+                mode: None,
+                allow_shell: Some(false),
+                trust_mode: Some(false),
+                auto_approve: Some(false),
+                delivery_mode: None,
+                status: Some(AutomationStatus::Paused),
+            })?;
+            tasks.shutdown_and_wait().await?;
+            drop(app);
+            drop(tasks);
+            drop(automations);
+            Ok::<_, anyhow::Error>((initial_id, saved.metadata.id.clone(), binding, automation))
+        })
+        .await?;
+        sessions.delete_session(&initial_id)?;
+        assert!(
+            binding.data_dir.is_dir(),
+            "transcript deletion cannot erase Runtime authority"
+        );
+        let loaded = sessions.load_session(&saved_id)?;
+        assert_eq!(loaded.metadata.runtime_store.as_ref(), Some(&binding));
+        let mut resumed_config = config.clone();
+        let (loaded, automation) = (&loaded, &automation);
+
+        // Phase 2: resume with the binding and run the automation for real.
+        {
+            let resumed_config = &mut resumed_config;
+            boxed_phase(move || async move {
+                let mut resumed = Box::new(create_test_app());
+                apply_loaded_session_with_goal(&mut resumed, resumed_config, loaded, None)
+                    .map_err(anyhow::Error::msg)?;
+                let tasks = TaskManager::start(
+                    task_config.clone(),
+                    config.clone(),
+                    resumed.plugin_registry.clone(),
+                    &loaded.metadata.id,
+                    loaded.metadata.runtime_store.as_ref(),
+                )
+                .await?;
+                assert_eq!(
+                    tasks.execution_scope(),
+                    automation.execution_scope.as_deref().unwrap()
+                );
+                resumed.runtime_services.task_manager = Some(tasks.clone());
+                let automations = Arc::new(tokio::sync::Mutex::new(AutomationManager::open(
+                    root.path().join("automations"),
+                )?));
+                // The real Run-now admission must now create its durable
+                // receipt. The configured endpoint is closed loopback and no
+                // shell/tool is authorized.
+                let run = run_now_shared(&automations, &automation.id, &tasks).await?;
+                assert!(run.task_id.is_some(), "{run:?}");
+                assert_eq!(
+                    automations
+                        .lock()
+                        .await
+                        .list_runs(&automation.id, None)?
+                        .len(),
+                    1
+                );
+                assert_eq!(
+                    automations
+                        .lock()
+                        .await
+                        .get_automation(&automation.id)?
+                        .execution_scope,
+                    automation.execution_scope
+                );
+                tasks.shutdown_and_wait().await?;
+                drop(resumed);
+                drop(tasks);
+                Ok::<_, anyhow::Error>(())
+            })
+            .await?;
+        }
+
+        // Phase 3: reproduce the old resume path — deriving a store from the
+        // saved conversation id without its binding opens a foreign scope and
+        // cannot run.
+        let foreign = TaskManager::start(
+            task_config.clone(),
+            config.clone(),
+            Arc::new(crate::plugins::PluginRegistry::empty(root.path())),
+            &loaded.metadata.id,
+            None,
+        )
+        .await?;
+        let foreign = &foreign;
+        boxed_phase(move || async move {
+            let foreign_automations = Arc::new(tokio::sync::Mutex::new(AutomationManager::open(
+                root.path().join("automations"),
+            )?));
+            let definition_path = root
+                .path()
+                .join("automations/automations")
+                .join(format!("{}.json", automation.id));
+            let before_foreign_run = std::fs::read(&definition_path)?;
+            let error = run_now_shared(&foreign_automations, &automation.id, foreign)
+                .await
+                .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("another Runtime execution scope"),
+                "{error:#}"
+            );
+            assert_eq!(
+                foreign_automations
+                    .lock()
+                    .await
+                    .list_runs(&automation.id, None)?
+                    .len(),
+                1
+            );
+            assert_eq!(std::fs::read(definition_path)?, before_foreign_run);
+            Ok::<_, anyhow::Error>(())
+        })
+        .await?;
+
+        // Phase 4: a host that already owns a foreign scope refuses the switch
+        // and keeps its pending input.
+        {
+            let resumed_config = &mut resumed_config;
+            boxed_phase(move || async move {
+                let mut other_app = Box::new(create_test_app());
+                other_app.runtime_services.task_manager = Some(foreign.clone());
+                other_app.input = "preserve pending input".into();
+                let old_id = other_app.current_session_id.clone();
+                let error =
+                    apply_loaded_session_with_goal(&mut other_app, resumed_config, loaded, None)
+                        .unwrap_err();
+                // The refusal must name the route that actually works. "Resume
+                // it in a new Codewhale process" was true but unactionable:
+                // starting a new process and then picking the session from
+                // `/resume` returns here, because that is this same switch
+                // path (#6207, #6225).
+                assert!(
+                    error.contains("codewhale resume"),
+                    "the refusal must point at the direct-open path: {error}"
+                );
+                assert!(
+                    error.contains(&loaded.metadata.id),
+                    "the refusal must name the session to open: {error}"
+                );
+                assert_eq!(other_app.current_session_id, old_id);
+                assert_eq!(other_app.input, "preserve pending input");
+                Ok::<_, anyhow::Error>(())
+            })
+            .await?;
+        }
+        foreign.shutdown_and_wait().await?;
+        Ok(())
+    })
 }
 
 #[cfg(unix)]

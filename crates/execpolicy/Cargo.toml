@@ -12,7 +12,7 @@ workspace = true
 
 [dependencies]
 anyhow.workspace = true
-codewhale-protocol = { path = "../protocol", version = "0.9.14" }
+codewhale-protocol = { path = "../protocol", version = "0.10.0" }
 regex = "1.11"
 serde.workspace = true
 shlex = "2.0.1"

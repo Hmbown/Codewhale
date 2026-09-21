@@ -7740,7 +7740,7 @@ async fn monitor_separates_lifecycle_start_from_billing_dispatch_and_child_usage
 }
 
 #[tokio::test]
-async fn monitor_persists_only_terminal_request_diagnostics_per_turn() -> Result<()> {
+async fn monitor_persists_request_snapshots_and_matching_terminal_diagnostics() -> Result<()> {
     let manager = test_manager(test_runtime_dir())?;
     let thread = manager
         .create_thread(CreateThreadRequest::default())
@@ -7770,11 +7770,14 @@ async fn monitor_persists_only_terminal_request_diagnostics_per_turn() -> Result
             route: None,
         })
         .await?;
+    let mut tool = catalog_tool("mcp_computer_get_app_state");
+    tool.description = "Inspect app; api_key=sk-fixture-private-value".to_string();
     let pre_request = crate::tool_inspection::ToolInspectionSnapshot::from_prepared_request(
         engine_turn_id,
         0,
-        None,
+        Some(&[tool]),
     );
+    let request_digest = pre_request.active_tool_catalog_sha256.clone();
     harness
         .tx_event
         .send(EngineEvent::ToolRequestSnapshot {
@@ -7860,6 +7863,41 @@ async fn monitor_persists_only_terminal_request_diagnostics_per_turn() -> Result
         .filter(|item| item.kind == TurnItemKind::Status)
         .count();
     assert_eq!(status_items, 4);
+    let snapshots = manager
+        .events_since(&thread.id, None)?
+        .into_iter()
+        .filter(|event| event.event == "model.tools.snapshot")
+        .collect::<Vec<_>>();
+    assert_eq!(snapshots.len(), 2, "foreign-turn snapshots must be ignored");
+    for event in &snapshots {
+        assert_eq!(event.turn_id.as_deref(), Some(first.id.as_str()));
+        assert_eq!(event.payload["projection_redacted"], true);
+        assert_eq!(
+            event.payload["snapshot"]["delivery_status"],
+            "unknown (capture does not prove provider delivery)"
+        );
+        assert!(
+            !event
+                .payload
+                .to_string()
+                .contains("sk-fixture-private-value")
+        );
+    }
+    let prepared = &snapshots[0].payload["snapshot"];
+    assert_eq!(
+        prepared["tools"][0]["name"]["value"],
+        "mcp_computer_get_app_state"
+    );
+    assert_eq!(
+        prepared["active_tool_catalog_sha256"].as_str(),
+        request_digest.as_deref()
+    );
+    assert!(prepared["terminal"].is_null());
+    assert_eq!(
+        snapshots[1].payload["snapshot"]["terminal"]["model_requests_started"],
+        2
+    );
+
     let completion = manager
         .events_since(&thread.id, None)?
         .into_iter()
@@ -7936,6 +7974,21 @@ async fn monitor_persists_only_terminal_request_diagnostics_per_turn() -> Result
         "a pre-request snapshot must not look like a delivered model call or inherit the prior turn"
     );
     assert_eq!(second.schema_version, OUTPUT_LIMIT_RUNTIME_SCHEMA_VERSION);
+    let second_snapshots = manager
+        .events_since(&thread.id, None)?
+        .into_iter()
+        .filter(|event| {
+            event.event == "model.tools.snapshot"
+                && event.turn_id.as_deref() == Some(second.id.as_str())
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(second_snapshots.len(), 1);
+    assert_eq!(
+        second_snapshots[0].payload["snapshot"]["tools_field_present"],
+        false
+    );
+    assert!(second_snapshots[0].payload["snapshot"]["terminal"].is_null());
+
     assert!(
         serde_json::to_value(&second)?
             .get("modelRequestDiagnostics")
@@ -13088,6 +13141,155 @@ async fn auto_review_force_prompt_is_denied_without_opening_a_modal() -> Result<
 }
 
 #[tokio::test]
+async fn approval_interrupt_revokes_waiter_and_rejects_late_actions() -> Result<()> {
+    // Also cover an allow already queued when Stop wins, before the monitor
+    // resumes: it must not dispatch or persist remember=true.
+    for queued_allow in [false, true] {
+        let manager = test_manager(test_runtime_dir())?;
+        let thread = manager
+            .create_thread(CreateThreadRequest::default())
+            .await?;
+        let mut harness = install_mock_engine(&manager, &thread.id).await;
+        let turn = manager
+            .start_turn(
+                &thread.id,
+                StartTurnRequest {
+                    prompt: "cancel the pending write".to_string(),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        assert!(matches!(
+            harness.rx_op.recv().await,
+            Some(Op::SendMessage(_))
+        ));
+        let event = |id: &str| EngineEvent::ApprovalRequired {
+            approval_key: id.to_string(),
+            approval_grouping_key: id.to_string(),
+            id: id.to_string(),
+            tool_name: "computer_set_value".to_string(),
+            description: "pending write".to_string(),
+            input: json!({}),
+            intent_summary: None,
+            approval_force_prompt: false,
+        };
+        harness.tx_event.send(event("pending_write")).await?;
+        let approval = await_approval_identity(&manager, &thread.id, "pending_write").await?;
+        let (other_approval, mut other_rx) =
+            manager.register_pending_approval_for_thread_for_test("other-thread", "other-call");
+
+        if queued_allow {
+            assert!(manager.deliver_external_approval(
+                &approval,
+                ExternalApprovalDecision::Allow { remember: true },
+            ));
+        }
+        manager.interrupt_turn(&thread.id, &turn.id).await?;
+        assert!(!manager.deliver_external_approval(
+            &approval,
+            ExternalApprovalDecision::Allow { remember: true },
+        ));
+        assert!(
+            manager
+                .get_thread_detail(&thread.id)
+                .await?
+                .pending_approvals
+                .is_empty()
+        );
+        assert_eq!(
+            manager.pending_approvals_count(),
+            1,
+            "other task remains gated"
+        );
+        assert!(matches!(
+            other_rx.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        let decision = tokio::time::timeout(Duration::from_secs(2), harness.recv_approval_event())
+            .await
+            .context("Stop must wake the approval monitor")?;
+        assert_eq!(
+            decision,
+            Some(MockApprovalEvent::Denied {
+                id: "pending_write".to_string()
+            })
+        );
+        assert!(!manager.store.load_thread(&thread.id)?.auto_approve);
+        assert!(
+            manager.events_since(&thread.id, None)?.iter().any(|event| {
+                event.event == "approval.decided"
+                    && event.payload["approval_id"] == approval
+                    && event.payload["decision"] == "deny"
+                    && event.payload["cancelled"] == true
+            }),
+            "cancelled approval must clear the client's pending UI"
+        );
+
+        harness.tx_event.send(event("queued_after_stop")).await?;
+        let decision = tokio::time::timeout(Duration::from_secs(2), harness.recv_approval_event())
+            .await
+            .context("late approval event must fail closed")?;
+        assert_eq!(
+            decision,
+            Some(MockApprovalEvent::Denied {
+                id: "queued_after_stop".to_string()
+            })
+        );
+        assert!(
+            manager
+                .get_thread_detail(&thread.id)
+                .await?
+                .pending_approvals
+                .is_empty()
+        );
+        assert!(
+            !manager.events_since(&thread.id, None)?.iter().any(|event| {
+                event.event == "approval.required"
+                    && event.payload["tool_call_id"] == "queued_after_stop"
+            })
+        );
+        harness
+            .tx_event
+            .send(EngineEvent::TurnComplete {
+                usage: Usage::default(),
+                parent_route_usage: Usage::default(),
+                routed_usage_dropped_records: 0,
+                status: TurnOutcomeStatus::Interrupted,
+                error: None,
+                tool_catalog: None,
+                base_url: None,
+            })
+            .await?;
+        assert_eq!(
+            wait_for_terminal_turn(&manager, &turn.id).await?.status,
+            RuntimeTurnStatus::Interrupted
+        );
+        assert!(manager.deliver_external_approval(
+            &other_approval,
+            ExternalApprovalDecision::Deny { remember: false },
+        ));
+        assert!(matches!(
+            other_rx.await?,
+            ExternalApprovalDecision::Deny { .. }
+        ));
+        manager
+            .start_turn(
+                &thread.id,
+                StartTurnRequest {
+                    prompt: "new turn after stop".to_string(),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        assert!(matches!(
+            harness.rx_op.recv().await,
+            Some(Op::SendMessage(_))
+        ));
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn approval_timeout_denies_clears_ui_and_next_turn_can_start() -> Result<()> {
     let _timeout_guard = test_approval_timeout_ms(25);
     let manager = test_manager(test_runtime_dir())?;
@@ -16580,5 +16782,304 @@ async fn notices_raise_from_engine_events_and_clear_on_settle_or_ack() -> Result
             base_url: None,
         })
         .await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn shell_opt_in_is_idle_only_and_preserves_ask() -> Result<()> {
+    let _env = crate::test_support::lock_test_env();
+    let _shell_env = [
+        crate::test_support::EnvVarGuard::remove("CODEWHALE_ALLOW_SHELL"),
+        crate::test_support::EnvVarGuard::remove("DEEPSEEK_ALLOW_SHELL"),
+    ];
+    let dir = tempfile::tempdir()?;
+    let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", dir.path());
+    let workspace = dir.path().join("workspace");
+    fs::create_dir(&workspace)?;
+    let config_path = dir.path().join("config.toml");
+    fs::write(&config_path, "allow_shell = false\n")?;
+    let manager = test_manager(dir.path().join("runtime"))?;
+    let thread = manager
+        .create_thread(CreateThreadRequest {
+            workspace: Some(workspace),
+            allow_shell: Some(false),
+            permission_posture: Some("ask".into()),
+            ..Default::default()
+        })
+        .await?;
+    let mut harness = install_mock_engine(&manager, &thread.id).await;
+    manager
+        .active
+        .lock()
+        .await
+        .engines
+        .get_mut(&thread.id)
+        .unwrap()
+        .active_turn = Some(ActiveTurnState {
+        goal_id: None,
+        turn_id: "turn_shell_guard".into(),
+        interrupt_requested: false,
+        compaction_id: None,
+    });
+    let error = manager
+        .update_thread_with_shell_policy(
+            &thread.id,
+            UpdateThreadRequest {
+                allow_shell: Some(true),
+                title: Some("must not persist".into()),
+                ..Default::default()
+            },
+            Some(&config_path),
+            None,
+        )
+        .await
+        .expect_err("active turn must reject opt-in");
+    assert!(error.to_string().contains("already has an active turn"));
+    let unchanged = manager.store.load_thread(&thread.id)?;
+    assert!(!unchanged.allow_shell);
+    assert_eq!(unchanged.title, thread.title);
+    assert_eq!(unchanged.updated_at, thread.updated_at);
+    assert!(harness.rx_op.try_recv().is_err());
+    manager
+        .active
+        .lock()
+        .await
+        .engines
+        .get_mut(&thread.id)
+        .unwrap()
+        .active_turn = None;
+    let enabled = manager
+        .update_thread_with_shell_policy(
+            &thread.id,
+            UpdateThreadRequest {
+                allow_shell: Some(true),
+                ..Default::default()
+            },
+            Some(&config_path),
+            None,
+        )
+        .await?;
+    assert!(enabled.allow_shell);
+    assert_eq!(enabled.permission_posture.as_deref(), Some("ask"));
+    assert!(!enabled.auto_approve && !enabled.trust_mode);
+    assert!(matches!(
+        harness.rx_op.recv().await,
+        Some(Op::ChangeMode {
+            allow_shell: true,
+            auto_approve: false,
+            approval_mode: ApprovalMode::Suggest,
+            ..
+        })
+    ));
+    manager
+        .active
+        .lock()
+        .await
+        .engines
+        .get_mut(&thread.id)
+        .unwrap()
+        .active_turn = Some(ActiveTurnState {
+        goal_id: None,
+        turn_id: "turn_revoke".into(),
+        interrupt_requested: false,
+        compaction_id: None,
+    });
+    let disabled = manager
+        .update_thread_with_shell_policy(
+            &thread.id,
+            UpdateThreadRequest {
+                allow_shell: Some(false),
+                ..Default::default()
+            },
+            Some(&config_path),
+            None,
+        )
+        .await?;
+    assert!(
+        !disabled.allow_shell,
+        "tightening remains available during a turn"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn shell_policy_uses_explicit_profile_and_actual_thread_workspace() -> Result<()> {
+    let _env = crate::test_support::lock_test_env();
+    let _shell_env = [
+        crate::test_support::EnvVarGuard::remove("CODEWHALE_ALLOW_SHELL"),
+        crate::test_support::EnvVarGuard::remove("DEEPSEEK_ALLOW_SHELL"),
+    ];
+    let dir = tempfile::tempdir()?;
+    let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", dir.path());
+    let workspace = dir.path().join("thread-workspace");
+    fs::create_dir(&workspace)?;
+    let config_path = dir.path().join("explicit.toml");
+    fs::write(
+        &config_path,
+        "allow_shell = true\n[profiles.restricted]\nallow_shell = false\n",
+    )?;
+    let manager = test_manager(dir.path().join("runtime"))?;
+    manager.config.write().allow_shell = Some(false);
+    let thread = manager
+        .create_thread(CreateThreadRequest {
+            workspace: Some(workspace.clone()),
+            allow_shell: Some(false),
+            ..Default::default()
+        })
+        .await?;
+    let error = manager
+        .update_thread_with_shell_policy(
+            &thread.id,
+            UpdateThreadRequest {
+                allow_shell: Some(true),
+                ..Default::default()
+            },
+            Some(&config_path),
+            Some("restricted"),
+        )
+        .await
+        .expect_err("profile denial must win");
+    assert!(error.to_string().contains("active config profile"));
+    assert!(!manager.store.load_thread(&thread.id)?.allow_shell);
+    // This same policy check is used by direct job launch, so historical
+    // opt-ins cannot bypass a subsequently controlled denial.
+    assert!(
+        manager
+            .validate_shell_access_policy(&workspace, Some(&config_path), Some("restricted"))
+            .await
+            .is_err()
+    );
+    manager.config.write().allow_shell = Some(true);
+    let project = workspace.join(codewhale_config::CODEWHALE_APP_DIR);
+    fs::create_dir(&project)?;
+    fs::write(project.join("config.toml"), "allow_shell = false\n")?;
+    let error = manager
+        .validate_shell_access_policy(&workspace, Some(&config_path), None)
+        .await
+        .expect_err("thread folder beats host merged true");
+    assert!(error.to_string().contains("project configuration"));
+    let managed = dir.path().join("managed.toml");
+    fs::write(&managed, "allow_shell = false\n")?;
+    manager.config.write().managed_config_path = Some(managed.to_string_lossy().into_owned());
+    manager.config.write().allow_shell = Some(false);
+    assert!(
+        manager
+            .validate_shell_access_policy(dir.path(), Some(&config_path), None)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("managed configuration")
+    );
+    // Ambiguous/unreadable managed authority fails closed even if a stale
+    // effective snapshot says true.
+    fs::write(&managed, "[broken")?;
+    manager.config.write().allow_shell = Some(true);
+    assert!(
+        manager
+            .validate_shell_access_policy(dir.path(), Some(&config_path), None)
+            .await
+            .is_err()
+    );
+    Ok(())
+}
+
+/// The thread summary's preview is read through `newest_message_text_by_turn`,
+/// so pin the selection rules it depends on: non-message items never win, an
+/// empty trailing message is skipped rather than reported, and a missing
+/// `started_at` reads as newest because that is what `sort_turn_items_by_start`
+/// does when it substitutes `Utc::now()`.
+#[test]
+fn newest_message_text_by_turn_picks_the_latest_message_ignoring_non_messages() {
+    let dir = test_runtime_dir();
+    let store = RuntimeThreadStore::open(dir.clone()).expect("open store");
+    let turn_id = "trn_preview".to_string();
+    let at = |seconds: i64| Some(Utc::now() - chrono::Duration::seconds(seconds));
+
+    let message = |item_id: &str, text: &str, started_at| {
+        let mut item = sample_item(&turn_id, item_id, TurnItemLifecycleStatus::Completed);
+        item.kind = TurnItemKind::AgentMessage;
+        item.summary = text.to_string();
+        item.detail = Some(text.to_string());
+        item.started_at = started_at;
+        item
+    };
+
+    // A late tool call is not a candidate; a later empty message is skipped.
+    let mut tool = sample_item(&turn_id, "itm_tool", TurnItemLifecycleStatus::Completed);
+    tool.kind = TurnItemKind::ToolCall;
+    tool.started_at = at(5);
+
+    for item in [
+        message("itm_old", "oldest", at(30)),
+        tool,
+        message("itm_mid", "newer", at(20)),
+        message("itm_blank", "   ", at(10)),
+        message("itm_undated", "undated", None),
+    ] {
+        store.save_item(&item).expect("save item");
+    }
+
+    let found = store
+        .newest_message_text_by_turn(std::slice::from_ref(&turn_id))
+        .expect("scan item store");
+    assert_eq!(
+        found.get(&turn_id).map(String::as_str),
+        Some("undated"),
+        "expected the newest non-empty message; got {found:?}"
+    );
+
+    // A turn with no message at all has no preview text, so the caller falls
+    // back to an older turn rather than reporting an empty row.
+    let empty = store
+        .newest_message_text_by_turn(&["trn_absent".to_string()])
+        .expect("scan item store");
+    assert!(empty.is_empty(), "expected no preview text; got {empty:?}");
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// The summary route settles recovered turns through
+/// `flush_recovery_receipts` now that its rows no longer go through
+/// `get_thread_detail`. That settled state is what the page's attention count
+/// reports, so the flush must drain every listed thread, not just the first.
+#[tokio::test]
+async fn flush_recovery_receipts_drains_every_listed_thread() -> Result<()> {
+    let manager = test_manager(test_runtime_dir())?;
+    let mut thread_ids = Vec::new();
+    for index in 0..2 {
+        let thread = manager
+            .create_thread(CreateThreadRequest::default())
+            .await?;
+        let turn = sample_turn(
+            &thread.id,
+            &format!("turn_flush_{index}"),
+            RuntimeTurnStatus::InProgress,
+        );
+        manager.store.save_turn(&turn)?;
+        manager.queue_recovery_receipt(RecoveredTurnReceipt {
+            turn,
+            unresolved_dynamic_tools: Vec::new(),
+        });
+        thread_ids.push(thread.id);
+    }
+    assert_eq!(
+        manager.recovery_receipts.lock().len(),
+        2,
+        "both threads should start with a queued receipt"
+    );
+
+    manager.flush_recovery_receipts(&thread_ids).await?;
+
+    let remaining = manager
+        .recovery_receipts
+        .lock()
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>();
+    assert!(
+        remaining.is_empty(),
+        "the flush must settle every listed thread; still queued: {remaining:?}"
+    );
+
     Ok(())
 }

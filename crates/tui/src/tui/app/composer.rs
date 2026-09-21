@@ -708,6 +708,10 @@ impl App {
         if text.is_empty() {
             return;
         }
+        // Any edit detaches a recalled history entry (mirrors insert_char):
+        // without this a paste typed while navigating stays on a stale index
+        // and the next Up/Down silently discards the pasted text.
+        self.clear_input_history_navigation();
         self.auto_expand_oversized_paste();
         self.delete_selection();
         self.selected_attachment_index = None;
@@ -855,6 +859,10 @@ impl App {
             }
             FlushResult::Typed(ch) => {
                 self.insert_char(ch);
+                true
+            }
+            FlushResult::SuppressionExpired => {
+                self.needs_redraw = true;
                 true
             }
             FlushResult::None => false,
@@ -1761,6 +1769,21 @@ impl App {
         self.selected_attachment_index = None;
         self.needs_redraw = true;
         true
+    }
+
+    /// Replace the composer buffer with externally edited text. Recalled
+    /// history, selection, and attachment positions belong to the old text:
+    /// a stale `history_index` would let the next Up/Down silently discard
+    /// the edited buffer.
+    pub fn apply_external_edit(&mut self, new: String) {
+        self.input = new;
+        self.resync_command_line_claim();
+        self.cursor_position = char_count(&self.input);
+        self.history_index = None;
+        self.history_navigation_draft = None;
+        self.selection_anchor = None;
+        self.selected_attachment_index = None;
+        self.needs_redraw = true;
     }
 
     /// Restore the last cleared input if the composer is empty.

@@ -65,6 +65,8 @@ pub(crate) enum CredentialSource {
     /// The user-global `~/.codewhale/config.toml`, consulted last so a key
     /// saved there survives loading a workspace config.
     UserGlobalConfig,
+    /// An expiring, process-only Codewhale account auth transform.
+    AccountSession,
     /// Nothing had a credential. `probed` is in precedence order.
     Missing { probed: Vec<CredentialProbe> },
 }
@@ -90,6 +92,7 @@ impl CredentialSource {
                 Cow::Owned(format!("{cli} credentials (read-only) {path}"))
             }
             Self::OAuth { flow } => Cow::Owned(format!("{flow} OAuth")),
+            Self::AccountSession => Cow::Borrowed("Codewhale account"),
             Self::UserGlobalConfig => Cow::Borrowed("~/.codewhale/config.toml api_key"),
             Self::Missing { .. } => Cow::Borrowed("not found"),
         }

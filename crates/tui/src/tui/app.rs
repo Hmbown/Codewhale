@@ -588,8 +588,11 @@ pub struct LaunchRecentSession {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LaunchRowId {
     NewSession,
+    ReturnToSession,
     Recent(String),
     SeeAll,
+    /// Open the MCP manager from the status summary, including healthy servers.
+    McpManager,
     /// The MCP problems row: Enter/click types the remedy command into the
     /// composer (`/mcp login <name>` or `/mcp`) instead of making the user
     /// retype what the card printed (#6085).
@@ -608,6 +611,8 @@ pub(crate) const LAUNCH_RECENT_INLINE_LIMIT: usize = 5;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LaunchState {
     pub visible: bool,
+    /// Home temporarily covers the current conversation; it does not own a session.
+    pub return_to_session: bool,
     pub status: Option<String>,
     /// Canonical workspace this launch state is scoped to. Recent work is
     /// the workspace's own sessions (archived and empty auto-created ones
@@ -648,6 +653,9 @@ pub struct LaunchState {
     /// it has. The first keystroke or a launched command dissolves the card
     /// (founder decision, 2026-09-02).
     pub dissolve_started_ms: Option<u128>,
+    /// One bounded reveal of the canonical mark, anchored at first paint.
+    /// Kept when the launcher is revisited so it never replays on navigation.
+    pub mark_reveal_started_at: Option<Instant>,
     /// Claude Code config was detected on this host (probed once at
     /// construction); drives the launch card's migration notice line.
     pub claude_code_detected: bool,
@@ -722,6 +730,7 @@ impl LaunchState {
         let claude_code_detected = has_claude_code && !import_already_reviewed;
         Self {
             visible,
+            return_to_session: false,
             status: None,
             workspace: workspace.to_path_buf(),
             recent,
@@ -732,8 +741,18 @@ impl LaunchState {
             hovered_row: None,
             menu_selected: None,
             dissolve_started_ms: None,
+            mark_reveal_started_at: None,
             claude_code_detected,
         }
+    }
+
+    /// Leave home without resetting the conversation, draft, or reveal clock.
+    pub fn dismiss(&mut self) {
+        self.visible = false;
+        self.return_to_session = false;
+        self.row_hitboxes.clear();
+        self.menu_selected = None;
+        self.hovered_row = None;
     }
 
     /// Re-read the recent-work list from disk (same filter as
@@ -1495,6 +1514,9 @@ pub struct App {
     /// length-mismatched site degrades to save-time stamps, never to a
     /// dropped message.
     pub api_message_stamps: Vec<DateTime<Utc>>,
+    /// Full saved history, including inactive branches. API messages remain
+    /// the active projection; snapshots reconcile it without rebuilding IDs.
+    pub session_journal: crate::session_tree::SessionJournal,
     /// User-visible assistant text that crossed typed completion boundaries.
     /// Receipts are aligned to transcript cells because provider context can
     /// be compacted or purged without changing what remains visible.
@@ -1799,7 +1821,7 @@ pub struct App {
     pub launch: LaunchState,
     /// Mouse-selected launch action, consumed by the async UI loop.
     pub pending_launch_action: Option<crate::tui::underwater::LaunchAction>,
-    /// Mouse click on the live composer's `[↑]` send target. The async UI loop
+    /// Mouse click on the live composer's `[↵]` send target. The async UI loop
     /// consumes it through the same submit dispatcher as Enter.
     pub pending_composer_submit: Option<ComposerSubmitChord>,
     /// Mouse-selected hotbar slot, consumed by the async UI loop.
@@ -4848,9 +4870,18 @@ impl App {
     /// per-entry `created_at` as the stamps so a next save does not rewrite
     /// history to resume time. Entries without a matching stamp fall back to
     /// now.
-    pub fn restore_api_messages(&mut self, messages: Vec<Message>, stamps: &[DateTime<Utc>]) {
-        self.api_message_stamps.clear();
-        self.api_message_stamps.extend_from_slice(stamps);
+    pub fn restore_api_messages(
+        &mut self,
+        messages: Vec<Message>,
+        session: &crate::session_manager::SavedSession,
+    ) {
+        self.session_journal = session.journal.clone().unwrap_or_else(|| {
+            crate::session_tree::SessionJournal::from_messages(
+                session.messages.clone(),
+                session.metadata.spawn_depth,
+            )
+        });
+        self.api_message_stamps = session.journal_message_stamps();
         self.api_message_stamps
             .resize_with(messages.len(), Utc::now);
         self.api_messages = Arc::new(messages);
@@ -4892,6 +4923,7 @@ impl App {
     }
 
     pub fn clear_api_messages(&mut self) {
+        self.session_journal = crate::session_tree::SessionJournal::new();
         self.api_messages_mut().clear();
         self.api_message_stamps.clear();
     }

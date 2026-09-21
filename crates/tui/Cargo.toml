@@ -30,26 +30,26 @@ name = "codewhale-tui"
 path = "src/main.rs"
 
 [dependencies]
-codewhale-memory = { path = "../memory", version = "0.9.14" }
+codewhale-memory = { path = "../memory", version = "0.10.0" }
 ahash = "0.8"
 anyhow.workspace = true
-codewhale-config = { path = "../config", version = "0.9.14" }
-codewhale-cloud-facts = { path = "../cloud-facts", version = "0.9.14" }
-codewhale-command-contract = { path = "../command-contract", version = "0.9.14" }
-codewhale-core = { path = "../core", version = "0.9.14" }
-codewhale-execpolicy = { path = "../execpolicy", version = "0.9.14" }
-codewhale-hooks = { path = "../hooks", version = "0.9.14" }
-codewhale-lane = { path = "../lane", version = "0.9.14" }
-codewhale-models = { path = "../models", version = "0.9.14" }
-codewhale-palette = { path = "../palette", version = "0.9.14" }
-codewhale-paths = { path = "../paths", version = "0.9.14" }
-codewhale-protocol = { path = "../protocol", version = "0.9.14" }
-codewhale-release = { path = "../release", version = "0.9.14" }
-codewhale-secrets = { path = "../secrets", version = "0.9.14" }
-codewhale-telemetry = { path = "../telemetry", version = "0.9.14" }
-codewhale-tools = { path = "../tools", version = "0.9.14" }
-codewhale-workflow = { path = "../workflow", version = "0.9.14" }
-codewhale-workflow-js = { path = "../workflow-js", version = "0.9.14" }
+codewhale-config = { path = "../config", version = "0.10.0" }
+codewhale-cloud-facts = { path = "../cloud-facts", version = "0.10.0" }
+codewhale-command-contract = { path = "../command-contract", version = "0.10.0" }
+codewhale-core = { path = "../core", version = "0.10.0" }
+codewhale-execpolicy = { path = "../execpolicy", version = "0.10.0" }
+codewhale-hooks = { path = "../hooks", version = "0.10.0" }
+codewhale-lane = { path = "../lane", version = "0.10.0" }
+codewhale-models = { path = "../models", version = "0.10.0" }
+codewhale-palette = { path = "../palette", version = "0.10.0" }
+codewhale-paths = { path = "../paths", version = "0.10.0" }
+codewhale-protocol = { path = "../protocol", version = "0.10.0" }
+codewhale-release = { path = "../release", version = "0.10.0" }
+codewhale-secrets = { path = "../secrets", version = "0.10.0" }
+codewhale-telemetry = { path = "../telemetry", version = "0.10.0" }
+codewhale-tools = { path = "../tools", version = "0.10.0" }
+codewhale-workflow = { path = "../workflow", version = "0.10.0" }
+codewhale-workflow-js = { path = "../workflow-js", version = "0.10.0" }
 async-stream = "0.3.6"
 async-trait.workspace = true
 base64 = "0.23.1"
@@ -125,16 +125,16 @@ liblzma = { version = "0.4", features = ["static"] }
 flate2 = "1.1"
 sha2.workspace = true
 semver.workspace = true
-codewhale-localization = { path = "../localization", version = "0.9.14" }
+codewhale-localization = { path = "../localization", version = "0.10.0" }
 shell-words = "1.1.1"
 mimalloc = { workspace = true, optional = true }
 rusty_alloc-api = { workspace = true, optional = true }
 
 [build-dependencies]
-codewhale-build-support = { path = "../build-support", version = "0.9.14" }
+codewhale-build-support = { path = "../build-support", version = "0.10.0" }
 
 [dev-dependencies]
-codewhale-models = { path = "../models", version = "0.9.14", features = [
+codewhale-models = { path = "../models", version = "0.10.0", features = [
     "test-support",
 ] }
 cucumber = "0.23.0"

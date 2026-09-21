@@ -24,7 +24,7 @@ export const home: HomeDict = {
   shotPreview: "Terminal preview",
   shotBuild: "v{version} development build",
   screenshotAlt:
-    "Codewhale v0.9.12 terminal, build 171acee689aa: a new session with the whale mark, message composer, Full Access and Operate mode, two scheduled tasks, 21 MCP servers connecting, and GLM-5.3 at max effort.",
+    "Codewhale v{version} development build: whale mark, new session, message composer, Ask permissions, Work mode and model status. Rendered from an isolated terminal capture.",
 
   latestRelease: "Latest release {tag}",
   releaseUnavailable: "Release status unavailable",

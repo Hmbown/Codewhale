@@ -123,6 +123,8 @@ const MOUSE_MOVED = 5;
  */
 export function nativeErrorCode(message) {
   const m = String(message ?? "");
+  if (/^background_focus_required:/.test(m)) return "background_focus_required";
+  if (/^user_busy:/.test(m)) return "user_busy";
   if (/ambiguous/i.test(m)) return "window_ambiguous";
   if (/not capturable/i.test(m)) return "window_not_capturable";
   if (/several running applications match/i.test(m)) return "ambiguous_application";
@@ -178,7 +180,7 @@ export function leaseVerdict(r) {
 export function leaseAccounting(r) {
   if (r?.front_lease !== true) return {};
   const out = {};
-  for (const k of ["lease_ms", "idle_before_s", "idle_after_s"]) {
+  for (const k of ["lease_ms", "idle_before_s", "idle_after_s", "yield_ms"]) {
     if (Number.isFinite(r[k])) out[k] = r[k];
   }
   if (typeof r.user_input_during_lease === "boolean") out.user_input_during_lease = r.user_input_during_lease;
@@ -196,6 +198,16 @@ export function create({ exec }) {
   // app instead of a frozen still. CODEWHALE_CU_PREVIEW_REFRESH_MS=0 disables
   // the loop (tests, headless); the floor keeps a hostile value tolerable.
   const state = { activeDisplay: 1, lastRaster: null, inputApp: null, foregroundInput: false, previewEnabled: true, pointer: null, pointerLease: null };
+  // Shared-surface politeness: front leases, real-pointer gestures,
+  // foreground keys and activations wait for a gap in the user's hardware
+  // input rather than interleave with their typing. The helper reads the
+  // same HID idle clock it uses for interference accounting. gap<=0 turns
+  // the wait off entirely; wait_ms bounds it and refuses user_busy if the
+  // person is still active. Successful waits report yield_ms in the receipt.
+  const yieldArgs = {
+    yield_gap_ms: Number(process.env.CODEWHALE_CU_YIELD_GAP_MS ?? 450),
+    yield_wait_ms: Number(process.env.CODEWHALE_CU_YIELD_WAIT_MS ?? 2500),
+  };
   let previewLoop = null;
   let previewBusy = false;
   function stopPreviewLoop() { if (previewLoop) { clearInterval(previewLoop); previewLoop = null; } }
@@ -245,10 +257,20 @@ export function create({ exec }) {
     return helper;
   }
 
+  function requireFocusControl() {
+    if (!state.foregroundInput) throw Object.assign(new ExecError("This action would take keyboard focus and was not sent in background mode. Use an accessibility action, browser control, or a separate computer."), { code: "background_focus_required" });
+  }
+
   async function native(tool, args = {}) {
+    // Window-addressed events still borrow keyboard focus. Block before even
+    // starting an older installed helper, including the app-scoped fallback.
+    if (["bg_pointer", "bg_key"].includes(tool) || (tool === "pointer_sequence" && args.app_scoped)) requireFocusControl();
     // Every resolved target (element center or screen point) is where the
     // action lands; tracking it here means the preview cursor follows element
     // actions, not just raw pointer events.
+    if (tool === "type" && !state.foregroundInput && (await native("input_capabilities"))?.background_focus_guard !== 1) {
+      throw Object.assign(new ExecError("Update the Computer Use helper before background typing; this helper may borrow keyboard focus."), { code: "app_upgrade_required" });
+    }
     const t = args?.target;
     if (t && Number.isFinite(t.x) && Number.isFinite(t.y)) state.pointer = { x: t.x, y: t.y };
     if (tool === "bg_pointer") {
@@ -257,7 +279,7 @@ export function create({ exec }) {
     }
     if (tool === "pointer_sequence" && !args.app_scoped) requireSharedPointer();
     const helper = await nativeHelper();
-    const r = await runL(helper, [JSON.stringify({ tool, args: { ...args, input_app_ref: state.inputApp, foreground_input: state.foregroundInput, owner_pipe: true } })], { timeoutMs: 20_000, ownerPipe: true });
+    const r = await runL(helper, [JSON.stringify({ tool, args: { ...args, ...yieldArgs, input_app_ref: state.inputApp, foreground_input: state.foregroundInput, owner_pipe: true } })], { timeoutMs: 20_000, ownerPipe: true });
     if (r.aborted || r.timedOut || r.code !== 0) {
       const error = new ExecError(r.aborted ? "computer request cancelled" : r.timedOut ? "native accessibility helper timed out" : r.stderr.trim() || "native accessibility helper failed", r);
       if (r.aborted) error.code = "cancelled";
@@ -294,7 +316,12 @@ export function create({ exec }) {
     if (!exec.runInputLease) throw new ExecError("This executor cannot safely own held input; update Computer Use");
     if ((await native("input_capabilities"))?.input_lease !== 1) throw new ExecError("The native helper needs an update for disconnect-safe held input");
     const helper = await nativeHelper();
-    return exec.runInputLease(helper, [JSON.stringify({ tool, args: { ...args, input_app_ref: state.inputApp, foreground_input: state.foregroundInput, owner_pipe: true, input_lease: true } })]);
+    try {
+      return await exec.runInputLease(helper, [JSON.stringify({ tool, args: { ...args, ...yieldArgs, input_app_ref: state.inputApp, foreground_input: state.foregroundInput, owner_pipe: true, input_lease: true } })]);
+    } catch (error) {
+      error.code = nativeErrorCode(error.message) ?? error.code;
+      throw error;
+    }
   }
 
   async function updatePreview(show = false) {
@@ -359,6 +386,7 @@ export function create({ exec }) {
       foreground_taken: !!r?.foreground_taken,
       ...(r?.foreground_before ? { foreground_before: r.foreground_before } : {}),
       ...(r?.foreground_after ? { foreground_after: r.foreground_after } : {}),
+      ...(Number.isFinite(r?.yield_ms) && r.yield_ms > 0 ? { yield_ms: r.yield_ms } : {}),
     };
   }
 
@@ -445,7 +473,10 @@ export function create({ exec }) {
   async function withPressedKey(code, flags, action) {
     const lease = await nativeLease("key_event", { code, flags, down: true });
     try {
-      return await action();
+      await action();
+      // The acknowledgement carries the yield_ms the helper waited for a
+      // hardware-input gap before posting the press.
+      return lease.receipt;
     } finally {
       await withSignal(null, () => lease.release());
     }
@@ -780,7 +811,8 @@ export function create({ exec }) {
       previewBusy = true;
       updatePreview(true).catch(() => {}).finally(() => { previewBusy = false; });
     }
-    return { launched, activate, keyboard_delivery: activate ? "foreground-guarded" : "process", input_scope: activate ? "shared-desktop" : "application", shared_pointer: !!activate, isolated_desktop: false, url: urlArg ?? null, resolved: p?.found ? { name: p.name, pid: p.pid, bundle_id: p.bundle_id, frontmost: p.frontmost } : null };
+    return { launched, activate, keyboard_delivery: activate ? "foreground-guarded" : "process", input_scope: activate ? "shared-desktop" : "application", shared_pointer: !!activate, isolated_desktop: false, url: urlArg ?? null, resolved: p?.found ? { name: p.name, pid: p.pid, bundle_id: p.bundle_id, frontmost: p.frontmost } : null,
+      ...(Number.isFinite(p?.yield_ms) && p.yield_ms > 0 ? { yield_ms: p.yield_ms } : {}) };
   }
 
   /**
@@ -840,9 +872,38 @@ export function create({ exec }) {
   }
   async function cursorPosition() { return native("cursor_position"); }
 
+  // ---------- app scripting ----------
+  // The programmatic interface into apps that ship a scripting dictionary:
+  // osascript runs AppleScript (default) or JXA. It never moves the pointer,
+  // needs no Accessibility grant, and returns values instead of "sent"
+  // receipts — which is why it ranks above clicking wherever a dictionary
+  // exists. The script travels as one argv entry; no shell ever parses it.
+  async function appScript({ script, language = "applescript", timeout } = {}) {
+    if (typeof script !== "string" || !script.trim()) {
+      throw Object.assign(new ExecError("app_script needs a non-empty script string"), { code: "bad_args" });
+    }
+    const lang = language === "javascript" ? ["-l", "JavaScript"] : language === "applescript" ? [] : null;
+    if (!lang) throw Object.assign(new ExecError('app_script language must be "applescript" or "javascript"'), { code: "bad_args" });
+    const timeoutMs = Math.min(Math.max(Number(timeout) > 0 ? Number(timeout) : 30, 1), 120) * 1000;
+    const r = await runL("osascript", [...lang, "-e", script], { timeoutMs, maxBuffer: 8 * 1024 * 1024 });
+    if (r.aborted) throw Object.assign(new ExecError("computer request cancelled", r), { code: "cancelled" });
+    if (r.timedOut) throw Object.assign(new ExecError(`app_script timed out after ${Math.round(timeoutMs / 1000)}s — the script or a consent dialog was still open`, r), { code: "script_timeout" });
+    if (r.code !== 0) {
+      const stderr = (r.stderr || r.stdout || "").trim();
+      if (/-1743|not authorized to send apple events|not permitted/i.test(stderr)) {
+        throw Object.assign(new ExecError(`${stderr} — Automation consent was refused or is missing; allow the responsible app to control the target in System Settings → Privacy & Security → Automation`, r), { code: "automation_denied" });
+      }
+      if (/\(-?128\)|user canceled/i.test(stderr)) {
+        throw Object.assign(new ExecError(stderr || "the script was cancelled by the user", r), { code: "script_cancelled" });
+      }
+      throw Object.assign(new ExecError(stderr || `osascript exited ${r.code}`, r), { code: "script_error" });
+    }
+    return { language, result: r.stdout.trim(), stderr: r.stderr.trim() || null };
+  }
+
   // ---------- probe ----------
   async function probe() {
-    const caps = { screenshot: true, recording: true, accessibility_tree: true, clipboard: true, displays: true };
+    const caps = { screenshot: true, recording: true, accessibility_tree: true, clipboard: true, displays: true, app_script: true };
     const perms = {};
     try {
       const ax = await native("permissions");
@@ -1064,45 +1125,29 @@ export function create({ exec }) {
       return { action_sent: true, strategy: "event", direction, amount, ...pointerCost(r) };
     },
     type: (args = {}) => native("type", args),
-    key: async ({ text, repeat = 1 } = {}) => {
+    key: async ({ text, repeat = 1, target } = {}) => {
       const { flags, code, key } = parseChord(text);
       const n = Math.max(1, Math.min(100, repeat));
-      // A chorded press is usually aimed at the menu system (cmd+w,
-      // cmd+shift+g, …), and key equivalents only validate against a key
-      // window. A process-bound event without one is discarded silently —
-      // the receipt would still say action_sent. In background mode the
-      // window-record route supplies a momentary key window, so flagged
-      // chords go through it when the helper supports it.
-      if (flags !== 0 && !state.foregroundInput && (await native("input_capabilities"))?.window_record === 1) {
-        try {
-          let last;
-          for (let i = 0; i < n; i++) {
-            last = await native("bg_key", { code, flags });
-            if (i < n - 1) await wait(30);
-          }
-          return { action_sent: true, key, code, keyboard_delivery: "window-record", input_scope: "application-window",
-                   front_lease: last?.front_lease === true, repeat: n, ...leaseAccounting(last),
-                   ...(typeof last?.front_restored === "boolean" ? { front_restored: last.front_restored } : {}),
-                   ...(last?.front_restored === false ? { note: "the momentary window-record lease did not hand the user's foreground back; their next keystrokes may land in this app. Tell the user." } : {}) };
-        } catch (error) {
-          // No focused window or a refused lease: the key cannot reach the
-          // menu system this way either. Fall through to process delivery
-          // and say plainly in the receipt what was actually sent.
-          if (!/no focused window|window-routed background keys|bg_dispatch/.test(error.message)) throw error;
-        }
-      }
+      // Modified and window-targeted keys need a key window. Background
+      // mode must never make one by borrowing the user's keyboard focus.
+      if (flags !== 0 || target != null) requireFocusControl();
+      let yieldMs = 0;
       for (let i = 0; i < n; i++) {
-        await withPressedKey(code, flags, () => {});
+        const press = await withPressedKey(code, flags, () => {});
+        if (Number.isFinite(press?.yield_ms)) yieldMs = Math.max(yieldMs, press.yield_ms);
         if (i < n - 1) await wait(30);
       }
       return { action_sent: true, key, code, keyboard_delivery: state.foregroundInput ? "foreground-guarded" : "process", repeat: n,
+        ...(yieldMs > 0 ? { yield_ms: yieldMs } : {}),
         ...(flags !== 0 && !state.foregroundInput ? { note: "process delivery (no focus lease was taken); menu key equivalents can be dropped without a key window. Verify the effect before retrying, or use invoke_menu for app menu commands." } : {}) };
     },
     hold_key: async ({ text, duration } = {}) => {
       const { flags, code, key } = parseChord(text);
+      if (flags !== 0) requireFocusControl();
       const d = Math.max(0.05, Math.min(30, Number(duration) || 1));
-      await withPressedKey(code, flags, () => wait(d * 1000));
-      return { action_sent: true, key, keyboard_delivery: state.foregroundInput ? "foreground-guarded" : "process", heldSec: d };
+      const press = await withPressedKey(code, flags, () => wait(d * 1000));
+      return { action_sent: true, key, keyboard_delivery: state.foregroundInput ? "foreground-guarded" : "process", heldSec: d,
+        ...(Number.isFinite(press?.yield_ms) && press.yield_ms > 0 ? { yield_ms: press.yield_ms } : {}) };
     },
     set_value: async (args = {}) => {
       if (args.target?.type !== "element") throw new ExecError("set_value needs an element target — {type:'element',index} from get_app_state");
@@ -1115,6 +1160,7 @@ export function create({ exec }) {
         // value proven rather than asserted.
         if (!/web area/i.test(error.message)) throw error;
         if (args.target?.type !== "element") throw error;
+        requireFocusControl();
         const value = String(args.value ?? "");
         await native("focus_element", { target: args.target });
         // cmd+a through the record channel: menu key equivalents only
@@ -1141,6 +1187,7 @@ export function create({ exec }) {
       return native("perform_action", args);
     },
     invoke_menu: async ({ path: menuPath } = {}) => invokeMenu(menuPath),
+    app_script: appScript,
     read_clipboard: readClipboard,
     write_clipboard: writeClipboard,
     cursor_position: cursorPosition,

@@ -3,6 +3,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
+import { pathToFileURL } from "node:url";
 import { once } from "node:events";
 import { createInterface } from "node:readline";
 import fs from "node:fs";
@@ -28,7 +29,7 @@ function fixture(t, backendSource, sshSource) {
   const control = path.join(dir, "control.json");
   const bin = path.join(dir, "bin");
   fs.mkdirSync(bin);
-  fs.writeFileSync(path.join(bin, "hdc"), `#!${process.execPath}
+  fs.writeFileSync(path.join(bin, "hdc.cjs"), `#!${process.execPath}
 const fs = require('node:fs');
 const args = process.argv.slice(2);
 const target = args[0] === '-t' ? args.splice(0, 2)[1] : 'default';
@@ -50,8 +51,10 @@ if (args[0] === 'file' && args[1] === 'recv') {
   fs.writeFileSync(args[3], args[2].includes('layout') ? JSON.stringify(layout) : jpeg);
 }
 `, { mode: 0o755 });
-  if (sshSource) fs.writeFileSync(path.join(bin, "ssh"), `#!${process.execPath}\n${sshSource}`, { mode: 0o755 });
+  if (sshSource) fs.writeFileSync(path.join(bin, "ssh.cjs"), `#!${process.execPath}\n${sshSource}`, { mode: 0o755 });
   const env = { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH}`,
+    CU_COMMAND_FIXTURES: bin,
+    NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ""} --import=${pathToFileURL(path.join(ROOT, "tests/fixtures/command-shims.mjs")).href}`,
     ROUTE_LOG: log, ROUTE_CONTROL: control, CODEWHALE_CU_APP: "off", CODEWHALE_CU_APP_WARM: "off",
     CODEWHALE_CU_STATE_DIR: dir, CODEWHALE_CU_RECORDINGS_DIR: dir };
   delete env.CODEWHALE_CU_TEST_REMOTE;

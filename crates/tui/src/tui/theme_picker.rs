@@ -28,6 +28,7 @@ use ratatui::{
     widgets::{Paragraph, Widget},
 };
 
+use crate::settings::DEFAULT_TUI_THEME;
 use crate::tui::menu_style;
 use crate::tui::settings_picker::{
     PickerNavResult, SettingAvailability, SettingOption, SettingValues, SettingsPickerController,
@@ -226,9 +227,8 @@ fn theme_options_with_custom(
                 .help("Pick a theme with live preview")
                 .values(SettingValues::new(
                     Cow::Owned(current.clone()),
-                    // A reset returns to the Shoreline default, not a
-                    // detected palette that can repaint it.
-                    Cow::Borrowed("shoreline"),
+                    // Reset uses the same default as fresh terminal settings.
+                    Cow::Borrowed(DEFAULT_TUI_THEME),
                     Cow::Borrowed(name),
                 ))
                 .availability(SettingAvailability::Available)
@@ -255,7 +255,7 @@ fn theme_options_with_custom(
                 .help("Pick a user-authored theme overlay")
                 .values(SettingValues::new(
                     Cow::Owned(current.clone()),
-                    Cow::Borrowed("shoreline"),
+                    Cow::Borrowed(DEFAULT_TUI_THEME),
                     Cow::Owned(custom.selector.clone()),
                 ))
                 .availability(SettingAvailability::Available)

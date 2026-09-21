@@ -74,7 +74,7 @@ async function closeHost(host) {
 }
 
 before(async () => {
-  daemon = spawn(process.execPath, [path.join(ROOT, "app/daemon.mjs")], { env, stdio: ["ignore", "ignore", "pipe"] });
+  daemon = spawn(process.execPath, [path.join(ROOT, "app/daemon.mjs")], { env: {...env, CODEWHALE_CU_CONTROL_FD: "3"}, stdio: ["ignore", "ignore", "pipe", "overlapped"] });
   daemon.stderr.on("data", (data) => { daemonErrors += data; });
   await until(async () => !!(await hello({ timeoutMs: 100 })), 5000).catch((err) => { throw new Error(`${err.message}\n${daemonErrors}`); });
 });
@@ -203,8 +203,10 @@ test("disconnect cancels the child process and a queued request never posts inpu
 test("MCP cancellation drains input, keeps the host alive, and isolates a second host", async () => {
   const a = mcp();
   const b = mcp();
+  await a.tool("consent", { action: "allow", app: "Host A" });
   await a.tool("get_app_state", { app_ref: { name: "Host A" } });
   assert.equal((await b.tool("type", { text: "unbound host B" })).error.code, "target_app_required");
+  await b.tool("consent", { action: "allow", app: "Host B" });
   await b.tool("get_app_state", { app_ref: { name: "Host B" } });
   const id = a.start("hold_key", { text: "mcp-cancel", duration: 10 });
   await until(() => calls().some((item) => item.method === "child_started" && item.text === "mcp-cancel"));
@@ -219,6 +221,7 @@ test("MCP cancellation drains input, keeps the host alive, and isolates a second
 
 test("stop cancels active and queued actions, releases held input, and leaves probes usable", async () => {
   const host = mcp();
+  await host.tool("consent", { action: "allow", app: "Stopped host" });
   await host.tool("get_app_state", { app_ref: { name: "Stopped host" } });
   await host.tool("left_mouse_down", { target: { type: "coordinate", space: "screen", x: 10, y: 10 } });
   const hold = host.start("hold_key", { text: "mcp-stop", duration: 10 });
@@ -241,6 +244,7 @@ test("stop cancels active and queued actions, releases held input, and leaves pr
 test("another MCP host cannot redirect the selected computer", async () => {
   const a = mcp();
   const b = mcp();
+  await a.tool("consent", { action: "allow", app: "Local host A" });
   await a.tool("get_app_state", { app_ref: { name: "Local host A" } });
   await b.tool("computer_register", { computer: "session-test-pad", transport: "hdc" });
   await b.tool("computer_switch", { computer: "session-test-pad" });
@@ -263,7 +267,9 @@ test("retiring a helper-backed local alias closes only that MCP host's session",
   survivor.child.stderr.on("data", chunk => { survivorErrors += chunk; });
   const alias = "retiring-helper-alias";
   assert.equal((await retiring.tool("computer_register", { computer: alias, transport: "local" })).ok, true);
+  await retiring.tool("consent", { action: "allow", app: "Retiring alias owner", computer: alias });
   assert.equal((await retiring.tool("get_app_state", { computer: alias, app_ref: { name: "Retiring alias owner" } })).ok, true);
+  await survivor.tool("consent", { action: "allow", app: "Alias retirement survivor" });
   assert.equal((await survivor.tool("get_app_state", { app_ref: { name: "Alias retirement survivor" } })).ok, true);
   const owner = calls().find(item => item.method === "get_app_state" && item.appName === "Retiring alias owner").instance;
   const other = calls().find(item => item.method === "get_app_state" && item.appName === "Alias retirement survivor").instance;
@@ -307,7 +313,9 @@ test("retiring a helper-backed local alias closes only that MCP host's session",
 test("MCP forced exit releases idle held input without waiting for another client", async () => {
   const dead = mcp();
   const survivor = mcp();
+  await dead.tool("consent", { action: "allow", app: "Killed idle host" });
   await dead.tool("get_app_state", { app_ref: { name: "Killed idle host" } });
+  await survivor.tool("consent", { action: "allow", app: "Surviving host" });
   await survivor.tool("get_app_state", { app_ref: { name: "Surviving host" } });
   await dead.tool("left_mouse_down", { target: { type: "coordinate", space: "screen", x: 10, y: 10 } });
   assert.equal((await survivor.tool("type", {text:"must wait for held pointer"})).error.code,"input_busy");
@@ -323,6 +331,7 @@ test("MCP forced exit releases idle held input without waiting for another clien
 
 test("MCP forced exit cancels its active child before delayed input can post", async () => {
   const host = mcp();
+  await host.tool("consent", { action: "allow", app: "Killed active host" });
   await host.tool("get_app_state", { app_ref: { name: "Killed active host" } });
   host.start("hold_key", { text: "killed-active", duration: 10 });
   await until(() => calls().some((item) => item.method === "child_started" && item.text === "killed-active"));
@@ -345,7 +354,7 @@ test("an app update re-leases live sessions transparently; an absent app still f
   // Mid-update the app is genuinely absent: the request fails, and that
   // failure is not cached against the session.
   await assert.rejects(appSessionRequest({ tool: "probe", sessionId }), (err) => err.code === "app_unavailable");
-  daemon = spawn(process.execPath, [path.join(ROOT, "app/daemon.mjs")], { env, stdio: ["ignore", "ignore", "pipe"] });
+  daemon = spawn(process.execPath, [path.join(ROOT, "app/daemon.mjs")], { env: {...env, CODEWHALE_CU_CONTROL_FD: "3"}, stdio: ["ignore", "ignore", "pipe", "overlapped"] });
   daemon.stderr.on("data", (data) => { daemonErrors += data; });
   await until(async () => !!(await hello({ timeoutMs: 100 })), 5000).catch((err) => { throw new Error(`${err.message}\n${daemonErrors}`); });
   const reply = await appSessionRequest({ tool: "get_app_state", sessionId, args: { app_ref: { name: "Survivor again" } } });
@@ -355,6 +364,7 @@ test("an app update re-leases live sessions transparently; an absent app still f
 
 test("MCP EOF releases a completed mouse-down and helper shutdown aborts active children", async () => {
   const host = mcp();
+  await host.tool("consent", { action: "allow", app: "Disconnected host" });
   await host.tool("get_app_state", { app_ref: { name: "Disconnected host" } });
   await host.tool("left_mouse_down", { target: { type: "coordinate", space: "screen", x: 10, y: 10 } });
   await closeHost(host);
@@ -364,7 +374,7 @@ test("MCP EOF releases a completed mouse-down and helper shutdown aborts active 
   await until(() => calls().some((item) => item.method === "child_started" && item.text === "helper-exit"));
   const instance = calls().find((item) => item.method === "child_started" && item.text === "helper-exit").instance;
   const exit = new Promise((resolve) => daemon.once("exit", resolve));
-  daemon.kill("SIGTERM");
+  daemon.stdio[3].destroy(); // Closing the human owner is graceful on every OS.
   assert.equal(await exit, 0, daemonErrors);
   await result;
   assert.ok(calls().some((item) => item.method === "child_released" && item.instance === instance));

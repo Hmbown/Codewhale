@@ -185,6 +185,10 @@ enum Pane {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ModelPickerPurpose {
     Session,
+    FleetProfileRoute {
+        editor_id: uuid::Uuid,
+        initial_reasoning: Option<ReasoningEffort>,
+    },
     FleetRoute {
         target: FleetRouteTarget,
         editor_id: uuid::Uuid,
@@ -244,6 +248,7 @@ pub struct ModelPickerView {
     configured_providers: Vec<ApiProvider>,
     row_hitboxes: RefCell<Vec<(Rect, Pane, usize)>>,
     last_mouse_selected: Option<(Pane, usize)>,
+    hovered_row: Option<(Pane, usize)>,
     /// UI locale captured from the app at construction (#4057 wave 2).
     locale: Locale,
     pinned_models: Vec<PinnedModel>,
@@ -253,7 +258,10 @@ pub struct ModelPickerView {
     sort: Option<ModelSort>,
     column_hitboxes: RefCell<Vec<(Rect, ModelSortColumn)>>,
     pane_hitboxes: RefCell<Vec<(Rect, Pane)>>,
+    catalog_action_hitbox: RefCell<Option<Rect>>,
+    catalog_action_hovered: bool,
     purpose: ModelPickerPurpose,
+    assignment_context: Option<(String, String)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -364,13 +372,53 @@ impl ModelPickerView {
         editor_id: uuid::Uuid,
         selection: FleetRouteSelection,
     ) -> Self {
+        Self::new_for_assignment(
+            app,
+            config,
+            ModelPickerPurpose::FleetRoute {
+                target,
+                editor_id,
+                initial_reasoning: selection.reasoning,
+                allow_inherit: selection.allow_inherit,
+            },
+            selection,
+        )
+    }
+
+    pub fn new_for_fleet_profile(
+        app: &App,
+        config: &Config,
+        editor_id: uuid::Uuid,
+        selection: FleetRouteSelection,
+    ) -> Self {
+        Self::new_for_assignment(
+            app,
+            config,
+            ModelPickerPurpose::FleetProfileRoute {
+                editor_id,
+                initial_reasoning: selection.reasoning,
+            },
+            selection,
+        )
+    }
+
+    pub fn with_assignment_context(
+        mut self,
+        title: impl Into<String>,
+        scope: impl Into<String>,
+    ) -> Self {
+        self.assignment_context = Some((title.into(), scope.into()));
+        self
+    }
+
+    fn new_for_assignment(
+        app: &App,
+        config: &Config,
+        purpose: ModelPickerPurpose,
+        selection: FleetRouteSelection,
+    ) -> Self {
         let mut picker = Self::new(app, config);
-        picker.purpose = ModelPickerPurpose::FleetRoute {
-            target,
-            editor_id,
-            initial_reasoning: selection.reasoning,
-            allow_inherit: selection.allow_inherit,
-        };
+        picker.purpose = purpose;
         // Session browsing memory is unrelated to the row being edited.
         picker.query.clear();
         picker.view = ModelListView::Configured;
@@ -407,8 +455,10 @@ impl ModelPickerView {
     }
 
     fn apply_fleet_route_rows(&mut self, app: &App, config: &Config) {
-        let ModelPickerPurpose::FleetRoute { allow_inherit, .. } = self.purpose else {
-            return;
+        let allow_inherit = match self.purpose {
+            ModelPickerPurpose::Session => return,
+            ModelPickerPurpose::FleetRoute { allow_inherit, .. } => allow_inherit,
+            ModelPickerPurpose::FleetProfileRoute { .. } => true,
         };
         self.route_config.provider = Some(self.initial_provider_identity.clone());
         self.configured_providers = configured_providers(config, self.initial_provider)
@@ -546,13 +596,17 @@ impl ModelPickerView {
             configured_providers,
             row_hitboxes: RefCell::new(Vec::new()),
             last_mouse_selected: None,
+            hovered_row: None,
             locale: app.ui_locale,
             pinned_models: pins,
             projection: RefCell::new(None),
             sort: None,
             column_hitboxes: RefCell::new(Vec::new()),
             pane_hitboxes: RefCell::new(Vec::new()),
+            catalog_action_hitbox: RefCell::new(None),
+            catalog_action_hovered: false,
             purpose: ModelPickerPurpose::Session,
+            assignment_context: None,
         };
         view.restore_memory(app.model_picker_memory.as_ref());
         view
@@ -686,7 +740,7 @@ impl ModelPickerView {
         let mut rows: Vec<_> = visible
             .iter()
             .map(|row| PaneRow {
-                primary: if matches!(self.purpose, ModelPickerPurpose::FleetRoute { .. })
+                primary: if self.purpose != ModelPickerPurpose::Session
                     && row.id == "auto"
                     && row.provider.is_none()
                 {
@@ -829,18 +883,18 @@ impl ModelPickerView {
             let identity = row_provider_identity(row).unwrap_or("custom");
             return ViewAction::Emit(ViewEvent::StatusMessage {
                 message: format!(
-                    "🔒 {identity}/{} is locked — {reason}. Open /provider and select {identity} to repair or authenticate this route.",
+                    "! {identity}/{} is locked — {reason}. Open /provider and select {identity} to repair or authenticate this route.",
                     row.id
                 ),
             });
         }
         let message = format!(
-            "🔒 {} is locked — {reason}. Open /provider to authenticate, then refresh.",
+            "! {} is locked — {reason}. Open /provider to authenticate, then refresh.",
             row.id
         );
         // The ordinary setup wizard switches the session after auth. A
         // Fleet edit must keep that session route intact.
-        if matches!(self.purpose, ModelPickerPurpose::FleetRoute { .. }) {
+        if self.purpose != ModelPickerPurpose::Session {
             return ViewAction::Emit(ViewEvent::StatusMessage { message });
         }
         // Prefer opening provider setup so the user can remediate in one step.
@@ -888,6 +942,9 @@ impl ModelPickerView {
             return vec![ReasoningEffort::Auto];
         }
         if let ModelPickerPurpose::FleetRoute {
+            initial_reasoning, ..
+        }
+        | ModelPickerPurpose::FleetProfileRoute {
             initial_reasoning, ..
         } = self.purpose
             && self.resolved_model() == "auto"
@@ -1144,38 +1201,53 @@ impl ModelPickerView {
     /// Fleet row gets its absolute route — provider resolved, `Custom` named
     /// by its exact identity — and has no startup default to save.
     fn build_apply_event(&self, save_as_startup_default: bool) -> ViewEvent {
-        match self.purpose {
+        let (initial_reasoning, allow_inherit) = match self.purpose {
             ModelPickerPurpose::Session => {
-                self.build_event_with_startup_default(save_as_startup_default)
+                return self.build_event_with_startup_default(save_as_startup_default);
             }
             ModelPickerPurpose::FleetRoute {
-                target,
-                editor_id,
                 initial_reasoning,
                 allow_inherit,
-            } => {
-                let provider = self.resolved_provider().unwrap_or(self.initial_provider);
-                let provider_id = (provider == ApiProvider::Custom).then(|| {
-                    self.resolved_provider_identity()
-                        .unwrap_or_else(|| self.route_config.provider_identity_for(provider))
-                });
-                ViewEvent::FleetRoutePicked {
-                    target,
+                ..
+            } => (initial_reasoning, allow_inherit),
+            ModelPickerPurpose::FleetProfileRoute {
+                initial_reasoning, ..
+            } => (initial_reasoning, true),
+        };
+        let provider = self.resolved_provider().unwrap_or(self.initial_provider);
+        let provider_id = (provider == ApiProvider::Custom).then(|| {
+            self.resolved_provider_identity()
+                .unwrap_or_else(|| self.route_config.provider_identity_for(provider))
+        });
+        let model = self.resolved_model();
+        let reasoning = if !allow_inherit {
+            None
+        } else if model == "auto" || self.selected_effort_request == self.initial_effort {
+            initial_reasoning
+        } else {
+            Some(self.selected_effort_request)
+        };
+        match self.purpose {
+            ModelPickerPurpose::FleetRoute {
+                target, editor_id, ..
+            } => ViewEvent::FleetRoutePicked {
+                target,
+                editor_id,
+                provider,
+                provider_id,
+                model,
+                reasoning,
+            },
+            ModelPickerPurpose::FleetProfileRoute { editor_id, .. } => {
+                ViewEvent::FleetProfileRoutePicked {
                     editor_id,
                     provider,
                     provider_id,
-                    model: self.resolved_model(),
-                    reasoning: if !allow_inherit {
-                        None
-                    } else if self.resolved_model() == "auto"
-                        || self.selected_effort_request == self.initial_effort
-                    {
-                        initial_reasoning
-                    } else {
-                        Some(self.selected_effort_request)
-                    },
+                    model,
+                    reasoning,
                 }
             }
+            ModelPickerPurpose::Session => unreachable!("session handled above"),
         }
     }
 
@@ -1183,13 +1255,15 @@ impl ModelPickerView {
     fn apply_action_id(&self) -> MessageId {
         match self.purpose {
             ModelPickerPurpose::Session => MessageId::PickerActionApply,
-            ModelPickerPurpose::FleetRoute { .. } => MessageId::PickerActionAssignRoute,
+            ModelPickerPurpose::FleetRoute { .. }
+            | ModelPickerPurpose::FleetProfileRoute { .. } => MessageId::PickerActionAssignRoute,
         }
     }
 
     fn can_edit_effort(&self) -> bool {
         match self.purpose {
             ModelPickerPurpose::Session => true,
+            ModelPickerPurpose::FleetProfileRoute { .. } => self.resolved_model() != "auto",
             // Shortlisted rows pin a model only; inherited routes retain
             // their existing reasoning until a concrete model is selected.
             ModelPickerPurpose::FleetRoute { allow_inherit, .. } => {
@@ -1318,6 +1392,26 @@ impl ModelPickerView {
         state: PaneRenderState,
     ) {
         self.pane_hitboxes.borrow_mut().push((area, state.pane));
+        // A short stacked picker gives the focused pane the working space.
+        // The other pane remains a clickable summary with its actual choice.
+        if area.height == 1 && !state.focused {
+            let summary = rows.get(state.selected).map_or_else(
+                || title.to_string(),
+                |row| format!("{title}: {}", row.primary),
+            );
+            Paragraph::new(crate::tui::ui_text::semantic_truncate(
+                &summary,
+                usize::from(area.width),
+            ))
+            .style(Style::default().fg(palette::TEXT_MUTED))
+            .render(area, buf);
+            if !rows.is_empty() {
+                self.row_hitboxes
+                    .borrow_mut()
+                    .push((area, state.pane, state.selected));
+            }
+            return;
+        }
         let header_height = if state.pane == Pane::Model && area.height >= 3 {
             2
         } else {
@@ -1342,17 +1436,14 @@ impl ModelPickerView {
             .render(area, buf);
         let title_area = Rect { height: 1, ..area };
         Paragraph::new(Line::from(vec![
-            Span::styled(
-                if state.focused { "▸ " } else { "  " },
-                Style::default().fg(palette::WHALE_ACTION),
-            ),
+            Span::raw("  "),
             Span::styled(
                 title,
                 Style::default()
                     .fg(if state.focused {
-                        palette::WHALE_ACTION
-                    } else {
                         palette::TEXT_PRIMARY
+                    } else {
+                        palette::TEXT_MUTED
                     })
                     .bold(),
             ),
@@ -1386,27 +1477,32 @@ impl ModelPickerView {
                 break;
             }
             let is_selected = idx == state.selected;
-            // Non-selectable rows are dimmed with a lock glyph so they never
-            // look choosable. Selection still highlights, but stays muted.
+            // Only the focused pane owns the keyboard cursor. Unavailable
+            // routes retain a width-safe attention mark and warning ink.
             let locked = row.locked;
-            // Marker precedence: a locked route first (it is the reason Enter
-            // will not work), then the keyboard cursor, then the route this
-            // session is already on. `CURRENT` is the charter's "current human
-            // choice" mark, so "which one am I on?" is answered by shape rather
-            // than by a second accent colour.
-            let marker = if locked {
-                "🔒"
-            } else if is_selected {
+            let focused = is_selected && state.focused;
+            let marker = if focused {
                 crate::tui::glyphs::SELECTION
+            } else if locked {
+                crate::tui::glyphs::ATTENTION
             } else if row.active {
                 crate::tui::glyphs::CURRENT
             } else {
                 " "
             };
-            let label_style = if is_selected && !locked {
+            let hovered = self.hovered_row == Some((state.pane, idx)) && !focused;
+            let label_style = if focused {
                 menu_style::selected_row_style()
-            } else if is_selected && locked {
-                menu_style::disabled_selected_row_style()
+            } else if hovered {
+                menu_style::hovered_row_style().fg(if locked {
+                    palette::TEXT_MUTED
+                } else {
+                    palette::TEXT_PRIMARY
+                })
+            } else if is_selected {
+                Style::default()
+                    .fg(palette::TEXT_MUTED)
+                    .bg(palette::SURFACE_ELEVATED)
             } else if locked {
                 Style::default()
                     .fg(palette::TEXT_MUTED)
@@ -1414,8 +1510,12 @@ impl ModelPickerView {
             } else {
                 Style::default().fg(palette::TEXT_PRIMARY)
             };
-            let hint_style = if is_selected && !locked {
+            let hint_style = if focused {
                 menu_style::selected_row_bg_style().fg(palette::SELECTION_TEXT)
+            } else if locked {
+                label_style.fg(palette::TEXT_MUTED)
+            } else if hovered {
+                menu_style::hovered_row_style().fg(palette::TEXT_MUTED)
             } else {
                 Style::default().fg(palette::TEXT_MUTED)
             };
@@ -1437,6 +1537,9 @@ impl ModelPickerView {
                 state.pane,
                 idx,
             ));
+            if focused || hovered {
+                buf.set_style(Rect::new(inner.x, row_y, inner.width, 1), label_style);
+            }
             let spans = picker_row_spans(
                 row,
                 marker,
@@ -1445,7 +1548,11 @@ impl ModelPickerView {
                 label_style,
                 hint_style,
             );
-            lines.push(Line::from(spans));
+            lines.push(Line::from(spans).style(if focused || hovered {
+                label_style
+            } else {
+                Style::default()
+            }));
         }
         if rows.is_empty() {
             // A search that matches nothing must say so, not render a bare
@@ -1761,9 +1868,8 @@ fn fit_identifier(text: &str, width: usize) -> String {
 
 /// Lay a row out into aligned, individually-truncated columns.
 ///
-/// Colour vocabulary is deliberately two-valued: `label_style` for the row's
-/// primary content and `hint_style` for every secondary column. Selection is
-/// the only thing that changes a row's colour.
+/// Primary and secondary ink follow the pane's focus; unavailable routes
+/// retain a semantic warning mark independently of selection.
 fn picker_row_spans<'a>(
     row: &'a PaneRow,
     marker: &'static str,
@@ -1778,7 +1884,14 @@ fn picker_row_spans<'a>(
     let marker_pad = MARKER_CELL_WIDTH.saturating_sub(UnicodeWidthStr::width(marker));
     let mut spans = vec![
         Span::styled(" ", label_style),
-        Span::styled(marker, label_style),
+        Span::styled(
+            marker,
+            if row.locked {
+                label_style.fg(palette::STATUS_WARNING)
+            } else {
+                label_style
+            },
+        ),
         Span::styled(" ".repeat(marker_pad + 1), label_style),
     ];
     let mut used = ROW_PREFIX_WIDTH;
@@ -2575,7 +2688,7 @@ fn catalog_freshness_title_suffix() -> &'static str {
 
 fn catalog_freshness_title_suffix_for(freshness: ModelsDevFreshness) -> &'static str {
     match freshness {
-        ModelsDevFreshness::Stale => " · stale",
+        ModelsDevFreshness::Stale => " · cached catalog",
         ModelsDevFreshness::Failed => " · refresh failed; catalog available",
         ModelsDevFreshness::Bundled | ModelsDevFreshness::Live => "",
     }
@@ -2755,7 +2868,7 @@ fn model_row_meta_chips(row: &ModelPickerRow) -> Vec<String> {
                 .unwrap_or_else(|| "context unknown".into()),
             row.metadata
                 .max_output
-                .map(|value| format!("{value} out"))
+                .map(|value| format!("{} out", format_picker_context_window(u64::from(value))))
                 .unwrap_or_else(|| "output unknown".into()),
             match &row.metadata.pricing {
                 PickerPricing::Known(price) => format!("estimate {price}"),
@@ -2814,7 +2927,10 @@ fn model_row_meta_chips(row: &ModelPickerRow) -> Vec<String> {
         } else {
             ""
         };
-        chips.push(format!("{max_output} out{suffix}"));
+        chips.push(format!(
+            "{} out{suffix}",
+            format_picker_context_window(u64::from(max_output))
+        ));
     }
     // Modality and tool facts are shown only when the catalog genuinely knows
     // them — an unknown is never rendered as a claim.
@@ -3632,6 +3748,7 @@ impl ModalView for ModelPickerView {
 
     fn handle_key(&mut self, key: KeyEvent) -> ViewAction {
         self.last_mouse_selected = None;
+        self.hovered_row = None;
         // Movement keys come from the shared vocabulary (#6290); the match
         // below owns only the picker's own verbs. The live filter means the
         // typing-safe set — no letter aliases to eat the query.
@@ -3647,8 +3764,17 @@ impl ModalView for ModelPickerView {
             }
             // Esc carries the browsing context out so the next open can
             // restore it (#4109 picker memory).
-            KeyCode::Esc if matches!(self.purpose, ModelPickerPurpose::FleetRoute { .. }) => {
-                ViewAction::Close
+            KeyCode::Esc if !self.query.is_empty() => {
+                self.update_query(String::new());
+                ViewAction::None
+            }
+            KeyCode::Esc if self.purpose != ModelPickerPurpose::Session => {
+                let editor_id = match self.purpose {
+                    ModelPickerPurpose::FleetRoute { editor_id, .. }
+                    | ModelPickerPurpose::FleetProfileRoute { editor_id, .. } => editor_id,
+                    ModelPickerPurpose::Session => unreachable!(),
+                };
+                ViewAction::EmitAndClose(ViewEvent::FleetAssignmentPickerDismissed { editor_id })
             }
             KeyCode::Esc => ViewAction::EmitAndClose(ViewEvent::ModelPickerDismissed {
                 catalog_view: self.view.browses_all_providers(),
@@ -3757,9 +3883,34 @@ impl ModalView for ModelPickerView {
     }
 
     fn handle_mouse(&mut self, mouse: MouseEvent) -> ViewAction {
+        let over_catalog = self
+            .catalog_action_hitbox
+            .borrow()
+            .is_some_and(|rect| rect.contains((mouse.column, mouse.row).into()));
+        if mouse.kind == MouseEventKind::Moved {
+            self.catalog_action_hovered = over_catalog;
+        }
+        if over_catalog && mouse.kind == MouseEventKind::Down(MouseButton::Left) {
+            self.toggle_view();
+            self.catalog_action_hovered = false;
+            self.last_mouse_selected = None;
+            return ViewAction::None;
+        }
         match mouse.kind {
+            MouseEventKind::Moved => {
+                self.hovered_row =
+                    self.row_hitboxes
+                        .borrow()
+                        .iter()
+                        .find_map(|(rect, pane, idx)| {
+                            rect.contains((mouse.column, mouse.row).into())
+                                .then_some((*pane, *idx))
+                        });
+                ViewAction::None
+            }
             MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
                 self.last_mouse_selected = None;
+                self.hovered_row = None;
                 let pane = self.pane_hitboxes.borrow().iter().find_map(|(rect, pane)| {
                     rect.contains(ratatui::layout::Position::new(mouse.column, mouse.row))
                         .then_some(*pane)
@@ -3844,19 +3995,58 @@ impl ModelPickerView {
         self.row_hitboxes.borrow_mut().clear();
         self.column_hitboxes.borrow_mut().clear();
         self.pane_hitboxes.borrow_mut().clear();
-        let inner = render_underwater_surface(
-            area,
-            buf,
-            tr(self.locale, MessageId::RouteSurfaceTitle)
-                .replace("{view}", self.view.title_label()),
-        );
-
-        // Say what the action does in model language. Provider changes are an
-        // implementation detail of applying a cross-provider model row.
+        *self.catalog_action_hitbox.borrow_mut() = None;
         let view_action: std::borrow::Cow<'static, str> = match self.view {
             ModelListView::Configured => tr(self.locale, MessageId::RouteBrowseCatalog),
             other => other.next().title_label().into(),
         };
+        let title = self
+            .assignment_context
+            .as_ref()
+            .map(|(role, _)| format!("Model · {role}"))
+            .unwrap_or_else(|| {
+                tr(self.locale, MessageId::RouteSurfaceTitle)
+                    .replace("{view}", self.view.title_label())
+            });
+        // The catalog is a visible action on the existing title rail, with
+        // no extra row taken from short terminals. Keep the shortcut too.
+        let action_label = crate::tui::ui_text::semantic_truncate(
+            &view_action,
+            usize::from(area.width.saturating_sub(20)),
+        );
+        let action_width = unicode_width::UnicodeWidthStr::width(action_label.as_str()) as u16;
+        let show_action = area.width >= 28
+            && area.height > 0
+            && (self.assignment_context.is_none()
+                || unicode_width::UnicodeWidthStr::width(title.as_str())
+                    + usize::from(action_width)
+                    + 8
+                    <= usize::from(area.width));
+        let title = if show_action {
+            crate::tui::ui_text::semantic_truncate(
+                &title,
+                usize::from(area.width.saturating_sub(action_width + 8)),
+            )
+        } else {
+            title
+        };
+        let inner = render_underwater_surface(area, buf, title);
+        if show_action {
+            let action = Rect::new(
+                inner.right().saturating_sub(action_width),
+                area.y + u16::from(area.height >= 24),
+                action_width,
+                1,
+            );
+            *self.catalog_action_hitbox.borrow_mut() = Some(action);
+            Paragraph::new(action_label)
+                .style(if self.catalog_action_hovered {
+                    menu_style::hovered_row_style()
+                } else {
+                    Style::default().fg(palette::WHALE_ACTION).underlined()
+                })
+                .render(action, buf);
+        }
         let mut footer_hints = vec![
             ActionHint::new("↑↓", tr(self.locale, MessageId::PickerActionMove)),
             ActionHint::new("Tab", tr(self.locale, MessageId::PickerActionSwitch)),
@@ -3866,14 +4056,19 @@ impl ModelPickerView {
             ),
             ActionHint::new("Enter", tr(self.locale, self.apply_action_id())),
             ActionHint::new("⇧A", view_action),
-            ActionHint::new("Ctrl+S", tr(self.locale, MessageId::SessionsActionSort)),
         ];
+        if inner.height >= 16 {
+            footer_hints.push(ActionHint::new(
+                "Ctrl+S",
+                tr(self.locale, MessageId::SessionsActionSort),
+            ));
+        }
         if !self.can_edit_effort() {
             footer_hints.remove(1);
         }
         // A Fleet row has no startup default to save; the chord is a
         // session-route action only.
-        if self.purpose == ModelPickerPurpose::Session {
+        if self.purpose == ModelPickerPurpose::Session && inner.height >= 16 {
             footer_hints.insert(
                 4,
                 ActionHint::new(
@@ -3884,7 +4079,7 @@ impl ModelPickerView {
         }
         // Keep compact route modals focused on the core browse/apply actions;
         // wider shells have room to disclose the pin action too.
-        if inner.width >= 72 {
+        if inner.width >= 72 && inner.height >= 16 {
             if self.purpose == ModelPickerPurpose::Session {
                 footer_hints.push(ActionHint::new(
                     "⇧F",
@@ -3905,56 +4100,61 @@ impl ModelPickerView {
         let shell = ratatui::layout::Layout::default()
             .direction(ratatui::layout::Direction::Vertical)
             .constraints([
-                ratatui::layout::Constraint::Length(3),
+                ratatui::layout::Constraint::Length(1),
                 ratatui::layout::Constraint::Min(1),
             ])
             .split(content);
-        Paragraph::new(vec![
-            Line::from(vec![
-                Span::styled(
-                    format!("─ {} ", tr(self.locale, MessageId::RoutePanelHeader)),
-                    Style::default().fg(palette::WHALE_ACTION).bold(),
-                ),
-                Span::styled(
-                    "──────────────────────── ",
-                    Style::default().fg(palette::BORDER_COLOR),
-                ),
-                Span::styled(
-                    format!(
-                        "{}{}",
-                        self.view.title_label(),
-                        catalog_freshness_title_suffix()
-                    ),
-                    Style::default().fg(palette::TEXT_MUTED),
-                ),
-                Span::styled(
-                    " ─────────────────",
-                    Style::default().fg(palette::BORDER_COLOR),
-                ),
-            ]),
-            Line::from(""),
-            Line::from(vec![
-                Span::styled(
-                    format!("  {} ", tr(self.locale, MessageId::RouteProviderLabel)),
-                    Style::default().fg(palette::WHALE_ACTION),
-                ),
-                Span::styled(
-                    self.resolved_provider()
-                        .unwrap_or(self.initial_provider)
-                        .display_name(),
-                    Style::default().fg(palette::TEXT_PRIMARY),
-                ),
-                Span::styled(
-                    format!(" · {}", tr(self.locale, MessageId::RouteModelFirstAtomic)),
-                    Style::default().fg(palette::TEXT_MUTED),
-                ),
-            ]),
-        ])
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                self.assignment_context
+                    .as_ref()
+                    .map(|(_, scope)| format!("{scope} · "))
+                    .unwrap_or_else(|| {
+                        format!("{} ", tr(self.locale, MessageId::RouteProviderLabel))
+                    }),
+                Style::default().fg(palette::TEXT_MUTED),
+            ),
+            Span::styled(
+                self.resolved_provider()
+                    .unwrap_or(self.initial_provider)
+                    .display_name(),
+                Style::default().fg(palette::TEXT_PRIMARY),
+            ),
+            Span::styled(
+                self.visible_model_rows()
+                    .get(self.selected_model_idx)
+                    .and_then(|row| row.blocked_reason.as_deref())
+                    .map(|reason| format!(" · ! {reason}"))
+                    .unwrap_or_default(),
+                Style::default().fg(palette::STATUS_WARNING),
+            ),
+            Span::styled(
+                if self.assignment_context.is_some() {
+                    ""
+                } else {
+                    catalog_freshness_title_suffix()
+                },
+                Style::default().fg(palette::TEXT_MUTED),
+            ),
+        ]))
         .render(shell[0], buf);
 
         let mut layout = widen_model_pane(ListDetailLayout::split(shell[1], 24));
         if !self.can_edit_effort() {
             layout.list = shell[1];
+        } else if layout.stacked && shell[1].height < 12 {
+            let model_height = if self.focus == Pane::Model {
+                shell[1].height.saturating_sub(1)
+            } else {
+                u16::from(shell[1].height > 0)
+            };
+            layout.list = Rect::new(shell[1].x, shell[1].y, shell[1].width, model_height);
+            layout.detail = Rect::new(
+                shell[1].x,
+                shell[1].y + model_height,
+                shell[1].width,
+                shell[1].height.saturating_sub(model_height),
+            );
         }
 
         self.ensure_projection();
@@ -4313,6 +4513,55 @@ mod tests {
         }
     }
 
+    #[test]
+    fn locked_model_keeps_keyboard_focus_visible_without_becoming_selectable() {
+        let mut picker = test_picker();
+        picker.model_rows[0].selectable = false;
+        picker.model_rows[0].blocked_reason = Some("missing key".to_string());
+        let area = Rect::new(0, 0, 100, 32);
+        let mut buf = Buffer::empty(area);
+        picker.render(area, &mut buf);
+        let hit = picker
+            .row_hitboxes
+            .borrow()
+            .iter()
+            .find(|(_, pane, idx)| *pane == Pane::Model && *idx == 0)
+            .unwrap()
+            .0;
+        assert_eq!(buf[(hit.right() - 1, hit.y)].bg, palette::SELECTION_BG);
+        assert!(!picker.model_rows[0].selectable);
+    }
+
+    #[test]
+    fn workbench_hover_preserves_model_selection_and_clears_on_keyboard_input() {
+        let mut picker = test_picker();
+        picker
+            .model_rows
+            .push(model_row(ApiProvider::Deepseek, true));
+        let area = Rect::new(0, 0, 100, 32);
+        let mut buf = Buffer::empty(area);
+        picker.render(area, &mut buf);
+        let hit = picker
+            .row_hitboxes
+            .borrow()
+            .iter()
+            .find(|(_, pane, idx)| *pane == Pane::Model && *idx == 1)
+            .unwrap()
+            .0;
+        picker.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Moved,
+            column: hit.x,
+            row: hit.y,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(picker.hovered_row, Some((Pane::Model, 1)));
+        assert_eq!(picker.selected_model_idx, 0);
+        picker.render(area, &mut buf);
+        assert_eq!(buf[(hit.right() - 1, hit.y)].bg, palette::SURFACE_ELEVATED);
+        picker.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(picker.hovered_row, None);
+    }
+
     fn test_picker() -> ModelPickerView {
         ModelPickerView {
             initial_model: "model".to_string(),
@@ -4334,19 +4583,57 @@ mod tests {
             configured_providers: Vec::new(),
             row_hitboxes: RefCell::new(Vec::new()),
             last_mouse_selected: None,
+            hovered_row: None,
             locale: Locale::En,
             pinned_models: Vec::new(),
             projection: RefCell::new(None),
             sort: None,
             column_hitboxes: RefCell::new(Vec::new()),
             pane_hitboxes: RefCell::new(Vec::new()),
+            catalog_action_hitbox: RefCell::new(None),
+            catalog_action_hovered: false,
             purpose: ModelPickerPurpose::Session,
+            assignment_context: None,
         }
     }
 
     /// Opened for a Fleet row, Enter hands the editor the absolute route
     /// instead of switching the session; the startup-default chord is the
     /// same pick.
+    #[test]
+    fn catalog_header_click_matches_keyboard_at_compact_and_wide_sizes() {
+        for (width, height) in [(40, 12), (80, 24), (140, 40)] {
+            let mut mouse_picker = test_picker();
+            let mut key_picker = test_picker();
+            let area = Rect::new(0, 0, width, height);
+            mouse_picker.render(area, &mut Buffer::empty(area));
+            let hit = mouse_picker
+                .catalog_action_hitbox
+                .borrow()
+                .expect("catalog action");
+            assert!(area.contains((hit.x, hit.y).into()));
+            assert!(hit.right() <= area.right());
+            assert!(matches!(
+                mouse_picker.handle_mouse(MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: hit.x,
+                    row: hit.y,
+                    modifiers: KeyModifiers::NONE,
+                }),
+                ViewAction::None
+            ));
+            key_picker.handle_key(KeyEvent::new(KeyCode::Char('A'), KeyModifiers::SHIFT));
+            assert_eq!(mouse_picker.view, key_picker.view);
+            assert_eq!(
+                mouse_picker.selected_model_idx,
+                key_picker.selected_model_idx
+            );
+            let empty = Rect::new(0, 0, 0, 0);
+            mouse_picker.render(empty, &mut Buffer::empty(empty));
+            assert!(mouse_picker.catalog_action_hitbox.borrow().is_none());
+        }
+    }
+
     #[test]
     fn fleet_purpose_enter_hands_the_absolute_route_to_the_editor() {
         let mut picker = test_picker();
@@ -4380,6 +4667,44 @@ mod tests {
         assert!(matches!(
             session.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
             ViewAction::EmitAndClose(ViewEvent::ModelPickerApplied { .. })
+        ));
+    }
+
+    #[test]
+    fn profile_role_picker_assigns_only_its_owner_and_search_cancels_before_closing() {
+        let editor_id = uuid::Uuid::new_v4();
+        let mut picker = test_picker().with_assignment_context("reviewer", "Choose where to save");
+        picker.purpose = ModelPickerPurpose::FleetProfileRoute {
+            editor_id,
+            initial_reasoning: None,
+        };
+        assert!(
+            matches!(picker.build_apply_event(false), ViewEvent::FleetProfileRoutePicked {
+            editor_id: owner, provider: ApiProvider::Openai, model, ..
+        } if owner == editor_id && model == "model")
+        );
+        for (width, height) in [(40, 12), (80, 24), (140, 40)] {
+            let area = Rect::new(0, 0, width, height);
+            let mut buf = Buffer::empty(area);
+            picker.render(area, &mut buf);
+            let text: String = buf.content().iter().map(|cell| cell.symbol()).collect();
+            assert!(text.contains("reviewer"), "{text}");
+            assert!(text.contains("Choose where to save"), "{text}");
+        }
+        picker.update_query("model".into());
+        assert!(matches!(
+            picker.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            ViewAction::None
+        ));
+        assert!(picker.query.is_empty());
+        assert!(
+            matches!(picker.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)), ViewAction::EmitAndClose(ViewEvent::FleetAssignmentPickerDismissed { editor_id: owner }) if owner == editor_id)
+        );
+        picker.model_rows[0].selectable = false;
+        *picker.projection.get_mut() = None;
+        assert!(matches!(
+            picker.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            ViewAction::Emit(ViewEvent::StatusMessage { .. })
         ));
     }
 
@@ -4455,7 +4780,7 @@ mod tests {
         assert_eq!((app.api_provider, app.model.clone()), session_route);
         assert!(matches!(
             picker.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
-            ViewAction::Close
+            ViewAction::EmitAndClose(ViewEvent::FleetAssignmentPickerDismissed { .. })
         ));
         for query in [
             "openrouter:new-fixture-model",

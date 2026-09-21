@@ -32,8 +32,8 @@
   --gpui-ink-mute: var(--shoreline-light-text-muted); /* light muted_foreground */
   --gpui-edge: var(--shoreline-light-border);        /* light border */
   --gpui-primary: var(--shoreline-light-action);     /* light primary */
-  --gpui-primary-hover: #174aa9;    /* light button_primary_hover — no Shoreline slot */
-  --gpui-accent: #dde6f5;           /* light accent — no Shoreline slot */
+  --gpui-primary-hover: #00536d;    /* light button_primary_hover — no Shoreline slot */
+  --gpui-accent: #dcebee;           /* light accent — no Shoreline slot */
   --gpui-selection: var(--shoreline-light-selection); /* light selection */
 
   --gpui-stage: var(--shoreline-surface);           /* dark background — warm charcoal */
@@ -45,9 +45,9 @@
   --gpui-stage-ink-dim: var(--shoreline-text-dim);
   --gpui-stage-edge: var(--shoreline-border);       /* dark border */
   --gpui-primary-dark: var(--shoreline-action);     /* dark primary */
-  --gpui-primary-hover-dark: #b0ccff; /* dark button_primary_hover — no Shoreline slot */
-  --gpui-on-primary: #15243e;       /* dark primary_foreground — no Shoreline slot */
-  --gpui-accent-dark: #353a4a;      /* dark accent — no Shoreline slot */
+  --gpui-primary-hover-dark: #93cde1; /* dark button_primary_hover — no Shoreline slot */
+  --gpui-on-primary: #102d38;       /* dark primary_foreground — no Shoreline slot */
+  --gpui-accent-dark: #303f48;      /* dark accent — no Shoreline slot */
   --gpui-selection-dark: var(--shoreline-selection); /* dark selection */
 
   /* Warm-muted state hues from the GPUI mockups, darkened or lifted per
@@ -67,7 +67,7 @@
   --c-ink-soft: var(--shoreline-light-text-soft-rgb);
   --c-ink-mute: var(--shoreline-light-text-muted-rgb);
   --c-indigo: var(--shoreline-light-action-rgb);
-  --c-indigo-deep: 23 74 169;       /* light primary hover — no Shoreline slot */
+  --c-indigo-deep: 0 83 109;       /* light primary hover — no Shoreline slot */
   --c-stage-soft: var(--shoreline-text-muted-rgb);
   --c-stage-deep: var(--shoreline-chrome-rgb);
   --c-primary-dark: var(--shoreline-action-rgb);
@@ -158,7 +158,7 @@ html[data-theme="dark"] .docs-portal {
   --c-ink-soft: var(--shoreline-text-muted-rgb);
   --c-ink-mute: var(--shoreline-text-dim-rgb);
   --c-indigo: var(--shoreline-action-rgb);
-  --c-indigo-deep: 176 204 255; /* lifted primary — hover on dark, no Shoreline slot */
+  --c-indigo-deep: 147 205 225; /* lifted primary — hover on dark, no Shoreline slot */
   --paper: var(--gpui-stage);
   --paper-deep: var(--gpui-stage-muted);
   --paper-edge: var(--gpui-stage-edge);

@@ -978,6 +978,7 @@ pub struct SessionSyncPayload {
 pub struct SessionBranchOutcome {
     pub leaf_display: String,
     pub journal_entries_before: usize,
+    pub sync: SessionSyncPayload,
 }
 
 /// `/fork` success projection for an active-conversation fork. The handler
@@ -1231,12 +1232,14 @@ pub enum ResumeSource {
 
 /// Portable `/resume` import receipt. The handler renders
 /// `Imported foreign session as {truncated_id} ({entry_count} entries, leaf
-/// {leaf_display})`.
+/// {leaf_display})`, and carries `sync` so the engine adopts the imported
+/// conversation instead of staying on the previous one.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ResumeImportReceipt {
     pub truncated_id: String,
     pub entry_count: usize,
     pub leaf_display: String,
+    pub sync: SessionSyncPayload,
 }
 
 /// `/rename` success receipt; the title is the sanitized persisted value so

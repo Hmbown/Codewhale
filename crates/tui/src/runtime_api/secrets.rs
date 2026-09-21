@@ -21,6 +21,225 @@ pub(super) struct SetProviderKeyRequest {
     key: String,
 }
 
+/// Only the first-party account endpoint can receive an account device key.
+/// This endpoint supplies a process-only reversible auth transform; it never
+/// mutates a user's provider slot or durable config. Running turns retain their
+/// materialized client: server-side device/session revocation is authoritative.
+fn account_model_access_receipt(config: &crate::config::Config) -> Value {
+    let api_base = config.base_url_for_route(ApiProvider::Codewhale);
+    let supported = api_base.trim_end_matches('/') == crate::config::DEFAULT_CODEWHALE_BASE_URL
+        && super::runtime_account_api_base()
+            == codewhale_secrets::account::DEFAULT_ACCOUNT_API_BASE;
+    let access = config.account_model_access.read().clone();
+    let live = access
+        .as_ref()
+        .filter(|a| a.expires_at > chrono::Utc::now().timestamp());
+    json!({
+        "apiBase": if supported { api_base.as_str() } else { "" },
+        "supported": supported,
+        "configured": config.account_model_api_key(ApiProvider::Codewhale).is_some(),
+        "catalogRefreshNeeded": false,
+        "sessionId": live.map(|a| a.session_id.as_str()),
+        "expiresAt": live.map(|a| a.expires_at),
+    })
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(super) struct SetAccountModelAccessRequest {
+    api_base: String,
+    session_id: String,
+    expected_session_id: Option<String>,
+    key: String,
+    expires_at: i64,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(super) struct ClearAccountModelAccessRequest {
+    session_id: String,
+}
+
+pub(super) async fn get_account_model_access(
+    State(state): State<RuntimeApiState>,
+) -> Result<Json<Value>, ApiError> {
+    tokio::task::spawn_blocking(move || {
+        Ok(Json(account_model_access_receipt(&state.config.read())))
+    })
+    .await
+    .map_err(|_| ApiError::internal("account access read failed"))?
+}
+
+pub(super) async fn set_account_model_access(
+    State(state): State<RuntimeApiState>,
+    Json(request): Json<SetAccountModelAccessRequest>,
+) -> Result<Json<Value>, ApiError> {
+    tokio::task::spawn_blocking(move || {
+        let config = state.config.write();
+        let refresh_needed =
+            install_account_model_access(&config, state.config_profile.as_deref(), request)?;
+        let mut receipt = account_model_access_receipt(&config);
+        receipt["catalogRefreshNeeded"] = json!(refresh_needed);
+        Ok(Json(receipt))
+    })
+    .await
+    .map_err(|_| ApiError::internal("account access update failed"))?
+}
+
+fn install_account_model_access(
+    config: &crate::config::Config,
+    profile: Option<&str>,
+    request: SetAccountModelAccessRequest,
+) -> Result<bool, ApiError> {
+    let expected_base = crate::config::DEFAULT_CODEWHALE_BASE_URL;
+    if request.api_base.trim_end_matches('/') != expected_base
+        || config
+            .base_url_for_route(ApiProvider::Codewhale)
+            .trim_end_matches('/')
+            != expected_base
+        || super::runtime_account_api_base() != codewhale_secrets::account::DEFAULT_ACCOUNT_API_BASE
+    {
+        return Err(ApiError::conflict(
+            "Account model access requires the first-party Codewhale endpoint.",
+        ));
+    }
+    if !request.key.starts_with("cwc_")
+        || request.key.len() < 32
+        || request.key.len() > MAX_KEY_BYTES
+        || request
+            .key
+            .chars()
+            .any(|c| c.is_control() || c.is_whitespace())
+    {
+        return Err(ApiError::bad_request("Invalid account device credential."));
+    }
+    let now = chrono::Utc::now();
+    let secrets = codewhale_secrets::account::secure_account_session_secrets()
+        .map_err(|_| ApiError::internal("Account session storage is unavailable."))?;
+    let account = codewhale_secrets::account::AccountSessionStore::new(
+        secrets,
+        profile,
+        codewhale_secrets::account::DEFAULT_ACCOUNT_API_BASE,
+    )
+    .runtime_info_at(now)
+    .map_err(|_| ApiError::conflict("Sign in again before connecting account models."))?;
+    let session_expiry = account
+        .expires_at
+        .as_deref()
+        .and_then(|date| chrono::DateTime::parse_from_rfc3339(date).ok())
+        .map(|date| date.timestamp());
+    if account.state != codewhale_secrets::account::AccountSessionState::Authenticated
+        || account.session_id.as_deref() != Some(request.session_id.as_str())
+        || request.expires_at <= now.timestamp()
+        || session_expiry.is_none_or(|expiry| request.expires_at > expiry)
+    {
+        return Err(ApiError::conflict(
+            "Account session changed or expired; sign in again.",
+        ));
+    }
+    // Probe the existing resolver without the account layer. Scope to Codewhale
+    // so even an inactive unmarked durable slot is checked. Never replace it.
+    let mut existing = config.clone();
+    existing.account_model_access = Default::default();
+    existing.provider = Some("codewhale".into());
+    let stored_key_present = match crate::config::credential_secret_store() {
+        Some(secrets) => secrets
+            .get("codewhale")
+            .map_err(|_| {
+                ApiError::conflict("The existing Codewhale credential could not be checked.")
+            })?
+            .is_some(),
+        None => false,
+    };
+    if stored_key_present
+        || existing
+            .provider_config_for(ApiProvider::Codewhale)
+            .is_some_and(|entry| entry.auth.is_some() || entry.api_key_env.is_some())
+        || !credential_writeability(&existing, ApiProvider::Codewhale).writable
+        || crate::config::has_api_key_for(&existing, ApiProvider::Codewhale)
+    {
+        return Err(ApiError::conflict(
+            "This Codewhale route already has its own credential.",
+        ));
+    }
+    let mut access = config.account_model_access.write();
+    let owner = access
+        .as_ref()
+        .filter(|a| a.expires_at > now.timestamp())
+        .map(|a| a.session_id.as_str());
+    if owner != request.expected_session_id.as_deref() {
+        return Err(ApiError::conflict(
+            "Account model access changed; refresh before retrying.",
+        ));
+    }
+    let changed = access.as_ref().is_none_or(|current| {
+        current.session_id != request.session_id
+            || current.profile.as_deref() != profile
+            || current.credential.expose_secret() != request.key
+    });
+    if changed {
+        invalidate_account_catalog(config);
+    }
+    *access = Some(crate::config::AccountModelAccess {
+        session_id: request.session_id,
+        credential: crate::credentials::Credential::ApiKey { key: request.key },
+        expires_at: request.expires_at,
+        profile: profile.map(str::to_string),
+    });
+    Ok(changed)
+}
+
+pub(super) async fn clear_account_model_access(
+    State(state): State<RuntimeApiState>,
+    Json(request): Json<ClearAccountModelAccessRequest>,
+) -> Result<Json<Value>, ApiError> {
+    tokio::task::spawn_blocking(move || {
+        let config = state.config.write();
+        remove_account_model_access(&config, &request.session_id)?;
+        Ok(Json(account_model_access_receipt(&config)))
+    })
+    .await
+    .map_err(|_| ApiError::internal("account access removal failed"))?
+}
+
+fn remove_account_model_access(
+    config: &crate::config::Config,
+    session_id: &str,
+) -> Result<(), ApiError> {
+    let mut access = config.account_model_access.write();
+    if access.as_ref().is_some_and(|a| a.session_id != session_id) {
+        return Err(ApiError::conflict(
+            "Account model access belongs to a different session.",
+        ));
+    }
+    if access.is_some() {
+        invalidate_account_catalog(config);
+    }
+    *access = None;
+    Ok(())
+}
+
+// Beginning a generation already invalidates this account-only memory roster
+// and all older in-flight tickets. No network request or second cache is needed.
+fn invalidate_account_catalog(config: &crate::config::Config) {
+    crate::provider_catalog_live::begin_refresh_for_identity(
+        ApiProvider::Codewhale,
+        "codewhale",
+        &config.base_url_for_route(ApiProvider::Codewhale),
+    );
+}
+
+pub(super) fn invalidate_stale_account_catalog(config: &crate::config::Config) {
+    let bound = config.account_model_access.read().is_some();
+    if bound
+        && config
+            .account_model_api_key(ApiProvider::Codewhale)
+            .is_none()
+    {
+        invalidate_account_catalog(config);
+    }
+}
+
 /// Write-only credential entry for native clients (APPS-48).
 ///
 /// `PUT /v1/providers/{id}/key` accepts `{ "key": "…" }`, persists it through
@@ -146,6 +365,8 @@ pub(super) async fn set_provider_key(
 pub(super) enum ProviderCredentialSource {
     /// Codewhale's own durable secret backend. The only writable source.
     SecretStore,
+    /// The expiring account transform; disconnect through account sign-out.
+    AccountSession,
     /// A literal value sitting in a config document.
     Config,
     /// An external consent or auth-command source (OAuth, `auth_source`).
@@ -215,6 +436,19 @@ pub(super) fn credential_writeability(
             reason: Some(
                 "This route's key is set literally in a config file. Remove it there before managing it here.",
             ),
+        };
+    }
+    let account_bound = config.account_model_access.read().is_some();
+    if account_bound
+        && matches!(
+            crate::config::resolve_credential_source(config, provider).source,
+            crate::credentials::CredentialSource::AccountSession
+        )
+    {
+        return CredentialWriteability {
+            source: ProviderCredentialSource::AccountSession,
+            writable: false,
+            reason: Some("This route uses your Codewhale account. Sign out to disconnect it."),
         };
     }
     CredentialWriteability {
@@ -327,6 +561,252 @@ pub(super) async fn clear_provider_key(
 mod tests {
     use super::*;
     use crate::config::Config;
+
+    fn saved_account_session(session_id: &str) -> codewhale_secrets::account::AccountSessionStore {
+        let store = codewhale_secrets::account::AccountSessionStore::new(
+            codewhale_secrets::account::secure_account_session_secrets().unwrap(),
+            None,
+            codewhale_secrets::account::DEFAULT_ACCOUNT_API_BASE,
+        );
+        store
+            .save(codewhale_secrets::account::AccountAuthBundle {
+                token_type: "Bearer".into(),
+                access_token: "fixture-access-token-for-account-models".into(),
+                refresh_token: "fixture-refresh-token-for-account-models".into(),
+                session: Some(codewhale_secrets::account::AccountSession {
+                    id: session_id.into(),
+                    status: "active".into(),
+                    expires_at: (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339(),
+                    refresh_expires_at: (chrono::Utc::now() + chrono::Duration::days(1))
+                        .to_rfc3339(),
+                    ..Default::default()
+                }),
+                user: Some(codewhale_secrets::account::AccountUser {
+                    id: "fixture-user".into(),
+                    ..Default::default()
+                }),
+            })
+            .unwrap();
+        store
+    }
+
+    fn account_request(owner: Option<&str>) -> SetAccountModelAccessRequest {
+        SetAccountModelAccessRequest {
+            api_base: crate::config::DEFAULT_CODEWHALE_BASE_URL.into(),
+            session_id: "fixture-session".into(),
+            expected_session_id: owner.map(str::to_string),
+            key: "cwc_fixture_device_credential_not_real".into(),
+            expires_at: chrono::Utc::now().timestamp() + 1800,
+        }
+    }
+
+    #[test]
+    fn account_overlay_resolves_without_disk_residue_and_logout_revokes_clones() {
+        let _env = crate::test_support::lock_test_env();
+        let tmp = tempfile::tempdir().unwrap();
+        let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", tmp.path());
+        let _backend = crate::test_support::EnvVarGuard::set("CODEWHALE_SECRET_BACKEND", "file");
+        let _base = crate::test_support::EnvVarGuard::set(
+            "CODEWHALE_CLOUD_API_BASE",
+            codewhale_secrets::account::DEFAULT_ACCOUNT_API_BASE,
+        );
+        let _api_base = crate::test_support::EnvVarGuard::set(
+            "CODEWHALE_API_BASE",
+            crate::config::DEFAULT_CODEWHALE_BASE_URL,
+        );
+        let _api_key = crate::test_support::EnvVarGuard::set("CODEWHALE_API_KEY", "");
+        let store = saved_account_session("fixture-session");
+        let config = Config {
+            provider: Some("codewhale".into()),
+            ..Default::default()
+        };
+        let cloned_before_install = config.clone();
+        assert!(install_account_model_access(&config, None, account_request(None)).unwrap());
+        assert_eq!(
+            cloned_before_install
+                .active_route_api_key_read_only()
+                .unwrap(),
+            "cwc_fixture_device_credential_not_real"
+        );
+        assert!(crate::config::has_api_key_for(
+            &config,
+            ApiProvider::Codewhale
+        ));
+        assert!(!format!("{config:?}").contains("cwc_fixture"));
+        assert!(
+            !account_model_access_receipt(&config)
+                .to_string()
+                .contains("cwc_fixture")
+        );
+        assert!(config.provider_config_for(ApiProvider::Codewhale).is_none());
+        assert!(
+            crate::config::credential_secret_store()
+                .unwrap()
+                .get("codewhale")
+                .unwrap()
+                .is_none()
+        );
+        use codewhale_config::catalog::{
+            CatalogStatus, ProviderCatalogDelta, base_url_fingerprint,
+        };
+        let endpoint = crate::config::DEFAULT_CODEWHALE_BASE_URL;
+        let ticket = crate::provider_catalog_live::begin_refresh_for_identity(
+            ApiProvider::Codewhale,
+            "codewhale",
+            endpoint,
+        );
+        let delta = || ProviderCatalogDelta {
+            provider: "codewhale".into(),
+            base_url_fingerprint: base_url_fingerprint(endpoint),
+            fetched_at: 1,
+            offerings: vec![],
+        };
+        assert_eq!(
+            crate::provider_catalog_live::record_success_if_current(&ticket, delta()),
+            Some(CatalogStatus::Fresh)
+        );
+        assert!(
+            !install_account_model_access(&config, None, account_request(Some("fixture-session")))
+                .unwrap()
+        );
+        assert!(
+            crate::provider_catalog_live::cached_entry_for_route(
+                ApiProvider::Codewhale,
+                "codewhale",
+                endpoint
+            )
+            .unwrap()
+            .is_some()
+        );
+        let mut extended = account_request(Some("fixture-session"));
+        extended.expires_at += 60;
+        assert!(!install_account_model_access(&config, None, extended).unwrap());
+        assert_eq!(
+            crate::provider_catalog_live::record_success_if_current(&ticket, delta()),
+            Some(CatalogStatus::Fresh)
+        );
+        store.clear().unwrap();
+        invalidate_stale_account_catalog(&config);
+        assert!(
+            crate::provider_catalog_live::cached_entry_for_route(
+                ApiProvider::Codewhale,
+                "codewhale",
+                endpoint
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert_eq!(
+            crate::provider_catalog_live::record_success_if_current(&ticket, delta()),
+            None
+        );
+        assert!(
+            cloned_before_install
+                .active_route_api_key_read_only()
+                .is_err()
+        );
+        assert!(
+            install_account_model_access(&config, None, account_request(Some("fixture-session")))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn account_overlay_refuses_endpoint_credentials_and_stale_session_ownership() {
+        let _env = crate::test_support::lock_test_env();
+        let tmp = tempfile::tempdir().unwrap();
+        let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", tmp.path());
+        let _backend = crate::test_support::EnvVarGuard::set("CODEWHALE_SECRET_BACKEND", "file");
+        let _base = crate::test_support::EnvVarGuard::set(
+            "CODEWHALE_CLOUD_API_BASE",
+            codewhale_secrets::account::DEFAULT_ACCOUNT_API_BASE,
+        );
+        let _api_base = crate::test_support::EnvVarGuard::set(
+            "CODEWHALE_API_BASE",
+            crate::config::DEFAULT_CODEWHALE_BASE_URL,
+        );
+        let _api_key = crate::test_support::EnvVarGuard::set("CODEWHALE_API_KEY", "");
+        saved_account_session("fixture-session");
+        let mut config = Config {
+            provider: Some("codewhale".into()),
+            ..Default::default()
+        };
+        config
+            .provider_config_for_mut(ApiProvider::Codewhale)
+            .base_url = Some("https://api.codewhale.net/other/v1".into());
+        assert!(install_account_model_access(&config, None, account_request(None)).is_err());
+        config
+            .provider_config_for_mut(ApiProvider::Codewhale)
+            .base_url = None;
+        config
+            .provider_config_for_mut(ApiProvider::Codewhale)
+            .api_key = Some("existing-user-key".into());
+        assert!(install_account_model_access(&config, None, account_request(None)).is_err());
+        config
+            .provider_config_for_mut(ApiProvider::Codewhale)
+            .api_key = None;
+        let mut expired = account_request(None);
+        expired.expires_at = chrono::Utc::now().timestamp() - 1;
+        assert!(install_account_model_access(&config, None, expired).is_err());
+        install_account_model_access(&config, None, account_request(None)).unwrap();
+        assert!(install_account_model_access(&config, None, account_request(None)).is_err());
+        install_account_model_access(&config, None, account_request(Some("fixture-session")))
+            .unwrap();
+        assert!(remove_account_model_access(&config, "stale-session").is_err());
+        assert!(
+            config
+                .account_model_api_key(ApiProvider::Codewhale)
+                .is_some()
+        );
+        config
+            .provider_config_for_mut(ApiProvider::Codewhale)
+            .api_key = Some("new-user-key".into());
+        assert_eq!(
+            config.active_route_api_key_read_only().unwrap(),
+            "new-user-key"
+        );
+        config
+            .provider_config_for_mut(ApiProvider::Codewhale)
+            .api_key = None;
+        config
+            .provider_config_for_mut(ApiProvider::Codewhale)
+            .base_url = Some("https://api.codewhale.net/other/v1".into());
+        assert!(
+            config
+                .account_model_api_key(ApiProvider::Codewhale)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn account_overlay_clear_is_shared_and_preserves_manual_config() {
+        let _env = crate::test_support::lock_test_env();
+        let mut config = Config::default();
+        config
+            .provider_config_for_mut(ApiProvider::Codewhale)
+            .api_key = Some("manual-key".into());
+        *config.account_model_access.write() = Some(crate::config::AccountModelAccess {
+            session_id: "current".into(),
+            credential: crate::credentials::Credential::ApiKey {
+                key: "cwc_fixture".into(),
+            },
+            expires_at: chrono::Utc::now().timestamp() + 60,
+            profile: None,
+        });
+        let clone = config.clone();
+        assert!(remove_account_model_access(&config, "stale").is_err());
+        assert!(clone.account_model_access.read().is_some());
+        remove_account_model_access(&config, "current").unwrap();
+        assert!(clone.account_model_access.read().is_none());
+        assert_eq!(
+            config
+                .provider_config_for(ApiProvider::Codewhale)
+                .unwrap()
+                .api_key
+                .as_deref(),
+            Some("manual-key")
+        );
+    }
 
     /// A route Codewhale owns is writable, and says its source is the store it
     /// would actually write.

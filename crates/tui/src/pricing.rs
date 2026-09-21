@@ -11,10 +11,11 @@ use codewhale_config::pricing::{
     TokenClass, TokenUsage,
 };
 
+#[cfg(test)]
+use crate::config::DEFAULT_STEPFUN_MODEL;
 use crate::config::{
     ApiProvider, DEEPSEEK_ALIAS_REPLACEMENT, DEEPSEEK_ALIAS_RETIREMENT_UTC,
-    DEFAULT_STEPFUN_BASE_URL, DEFAULT_STEPFUN_MODEL, DEFAULT_STEPFUN_PLAN_BASE_URL,
-    canonical_model_id_for_provider,
+    DEFAULT_STEPFUN_BASE_URL, DEFAULT_STEPFUN_PLAN_BASE_URL, canonical_model_id_for_provider,
 };
 use codewhale_models::{Usage, has_date_snapshot_suffix};
 
@@ -267,6 +268,10 @@ pub(crate) const AGGREGATOR_BILLING_SURFACE: &str = "aggregator-payg";
 pub(crate) const MODELSTUDIO_TOKEN_PLAN_BILLING_SURFACE: &str = "modelstudio-token-plan";
 pub(crate) const MODELSTUDIO_CODING_PLAN_BILLING_SURFACE: &str = "modelstudio-coding-plan";
 pub(crate) const VOLCENGINE_CODING_PLAN_BILLING_SURFACE: &str = "volcengine-coding-plan";
+/// CSDN 星图's Coding Plan subscription product (the `glm_for_coding` route).
+pub(crate) const CSDN_CODING_PLAN_BILLING_SURFACE: &str = "csdn-coding-plan";
+/// CSDN 星图's ordinary metered marketplace access on the same endpoint.
+pub(crate) const CSDN_PAYG_BILLING_SURFACE: &str = "csdn-payg";
 /// A reachable endpoint CodeWhale could not match to any known billing surface.
 /// Distinct from "not classified yet": this is a positive statement that the
 /// surface is unknown, and it fails closed everywhere it is consumed.
@@ -308,6 +313,7 @@ pub fn endpoint_metering_for_billing_surface(billing_surface: Option<&str>) -> E
         (MOONSHOT_PAYG_BILLING_SURFACE, EndpointMetering::Money),
         (MINIMAX_PAYG_BILLING_SURFACE, EndpointMetering::Money),
         (XIAOMI_PAYG_BILLING_SURFACE, EndpointMetering::Money),
+        (CSDN_PAYG_BILLING_SURFACE, EndpointMetering::Money),
         (FIRST_PARTY_PAYG_BILLING_SURFACE, EndpointMetering::Money),
         (AGGREGATOR_BILLING_SURFACE, EndpointMetering::Money),
         (
@@ -340,6 +346,10 @@ pub fn endpoint_metering_for_billing_surface(billing_surface: Option<&str>) -> E
         ),
         (
             XIAOMI_TOKEN_PLAN_BILLING_SURFACE,
+            EndpointMetering::ExactSubscription,
+        ),
+        (
+            CSDN_CODING_PLAN_BILLING_SURFACE,
             EndpointMetering::ExactSubscription,
         ),
         (
@@ -430,6 +440,7 @@ pub(crate) fn billing_surface_for_route(
         ApiProvider::Zai => zai_surface(&shape),
         ApiProvider::Moonshot => moonshot_surface(&shape),
         ApiProvider::Minimax | ApiProvider::MinimaxAnthropic => minimax_surface(&shape),
+        ApiProvider::Csdn => csdn_surface(&shape),
         ApiProvider::XiaomiMimo => xiaomi_surface(&shape),
         ApiProvider::ModelstudioTokenPlan
         | ApiProvider::ModelstudioTokenPlanAnthropic
@@ -541,6 +552,15 @@ fn minimax_surface(shape: &EndpointShape) -> Option<&'static str> {
     None
 }
 
+fn csdn_surface(shape: &EndpointShape) -> Option<&'static str> {
+    // Coding Plan keys and general marketplace keys share the one
+    // ai.csdn.net/api/model/v1 endpoint, so the URL proves neither product;
+    // only the captured credential product can produce a concrete surface.
+    let _is_supported_endpoint = shape.host == "ai.csdn.net"
+        && matches!(shape.path.as_str(), "/api/model" | "/api/model/v1");
+    None
+}
+
 fn xiaomi_surface(shape: &EndpointShape) -> Option<&'static str> {
     if matches!(
         shape.host.as_str(),
@@ -585,27 +605,41 @@ fn is_official_default_endpoint(provider: ApiProvider, shape: &EndpointShape) ->
     }
 }
 
+// Official PAYG rates; Step Plan consumes subscription quota instead.
+// https://platform.stepfun.ai/docs/en/guides/pricing/details (2026-09-19).
+fn stepfun_payg_pricing(model: &str) -> Option<ModelPricing> {
+    match model.trim().to_ascii_lowercase().as_str() {
+        "step-5-preview" => Some(usd_pricing(
+            0.05,
+            1.00,
+            2.70,
+            CacheWritePolicy::DocumentedAsInputRate(
+                "https://platform.stepfun.ai/docs/en/guides/pricing/details",
+            ),
+        )),
+        "step-3.7-flash" => Some(usd_only_pricing(0.04, 0.20, 1.15)),
+        "step-3.5-flash" | "step-3.5-flash-2603" => Some(usd_only_pricing(0.02, 0.10, 0.30)),
+        _ => None,
+    }
+}
+
 fn pricing_for_billing_surface(
     provider: ApiProvider,
     model: &str,
     billing_surface: Option<&str>,
 ) -> Option<ModelPricing> {
     if provider == ApiProvider::Stepfun
-        && model.trim().eq_ignore_ascii_case(DEFAULT_STEPFUN_MODEL)
         && billing_surface
             .is_some_and(|surface| surface.eq_ignore_ascii_case(STEPFUN_PAYG_BILLING_SURFACE))
     {
-        // StepFun standard API pricing (2026-07-13 audit). Step Plan uses a
-        // separate subscription quota and must never reach this token rate.
-        // https://platform.stepfun.ai/docs/en/guides/pricing/details
-        Some(usd_only_pricing(0.04, 0.20, 1.15))
+        stepfun_payg_pricing(model)
     } else {
         None
     }
 }
 
 fn route_requires_billing_surface(provider: ApiProvider, model: &str) -> bool {
-    provider == ApiProvider::Stepfun || model.trim().eq_ignore_ascii_case(DEFAULT_STEPFUN_MODEL)
+    provider == ApiProvider::Stepfun || stepfun_payg_pricing(model).is_some()
 }
 
 /// Look up pricing for a model name.
@@ -2031,8 +2065,8 @@ pub(crate) fn audit_turn_cost_for_route_on_endpoint_for_identity_at(
     }
     if provider == ApiProvider::Stepfun {
         return match pricing_for_billing_surface(provider, model, billing_surface) {
-            // StepFun's hand row publishes no cache-write rate, so a turn that
-            // wrote to cache fails closed here as well.
+            // Each model keeps its documented cache-write policy; unpublished
+            // write rates fail closed instead of borrowing another model's rate.
             Some(pricing) => match cost_estimate_with_pricing_checked(pricing, usage) {
                 Ok(estimate) => {
                     TurnCostAudit::priced(estimate, PricingProvenance::ProviderDocs, true, false)
@@ -2049,7 +2083,7 @@ pub(crate) fn audit_turn_cost_for_route_on_endpoint_for_identity_at(
             }),
         };
     }
-    if model.trim().eq_ignore_ascii_case(DEFAULT_STEPFUN_MODEL) {
+    if stepfun_payg_pricing(model).is_some() {
         return TurnCostAudit::unpriced(UnpricedReason::AmbiguousBillingSurface);
     }
     // This is the *route* audit: the caller is asserting it knows which
@@ -3329,6 +3363,36 @@ mod tests {
     }
 
     #[test]
+    fn stepfun_current_model_rates_require_payg_provenance() {
+        for (model, cache, input, output) in [
+            ("step-5-preview", 0.05, 1.00, 2.70),
+            ("step-3.7-flash", 0.04, 0.20, 1.15),
+            ("step-3.5-flash", 0.02, 0.10, 0.30),
+            ("step-3.5-flash-2603", 0.02, 0.10, 0.30),
+        ] {
+            let price = pricing_for_billing_surface(
+                ApiProvider::Stepfun,
+                model,
+                Some(STEPFUN_PAYG_BILLING_SURFACE),
+            )
+            .unwrap();
+            assert_eq!(price.usd.input_cache_hit_per_million, cache);
+            assert_eq!(price.usd.input_cache_miss_per_million, input);
+            assert_eq!(price.usd.output_per_million, output);
+            assert!(
+                pricing_for_billing_surface(
+                    ApiProvider::Stepfun,
+                    model,
+                    Some(STEPFUN_PLAN_BILLING_SURFACE)
+                )
+                .is_none()
+            );
+            assert!(route_requires_billing_surface(ApiProvider::Custom, model));
+            assert!(!has_pricing_for_provider(ApiProvider::Stepfun, model));
+        }
+    }
+
+    #[test]
     fn stepfun_billing_surface_keeps_payg_separate_from_step_plan() {
         for base_url in [
             "https://api.stepfun.ai",
@@ -3442,7 +3506,7 @@ mod tests {
         assert!(
             calculate_turn_cost_estimate_for_billing_surface(
                 ApiProvider::Stepfun,
-                "step-3.5-flash",
+                "step-unknown",
                 Some(STEPFUN_PAYG_BILLING_SURFACE),
                 &usage,
             )

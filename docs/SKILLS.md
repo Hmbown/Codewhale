@@ -1,10 +1,13 @@
 # Skills Manager
 
+In the terminal, `/skills` opens **Extensions → Skills**. Enter on a skill opens the dedicated manager, also available directly through `/skills manage`, for existing install, update, remove, and trust operations. `/skill <name>` still activates a skill, and the explicit inspection, remote, sync, and suggestion subcommands remain available.
+
+
 > 阅读简体中文版：[zh_hans/SKILLS.md](zh_hans/SKILLS.md)
 
 Skills are reusable `SKILL.md` instruction packs. Codewhale discovers them from
 several roots, but **only Codewhale-owned directories are writable**. The unified
-`/skills` manager is the interactive surface for audit and mutation; slash
+`/skills manage` manager is the interactive surface for audit and mutation; slash
 aliases share the same write path.
 
 For Claude Code plugin boundaries, see [CLAUDE_PLUGIN_COMPAT.md](CLAUDE_PLUGIN_COMPAT.md).
@@ -51,7 +54,8 @@ project/global roots only.
 
 | Command | Behavior |
 | --- | --- |
-| `/skills` | Opens the Skills Manager (owned-only scan, **no network**). |
+| `/skills` | Opens Extensions → Skills (owned-only scan, **no network**). |
+| `/skills manage` | Opens the dedicated Skills Manager for audit and mutation. |
 | `/skills <prefix>` | Text list filtered by name prefix. |
 | `/skills inspect` | Text discovery mode, searched directories, and source paths. |
 | `/skills --remote` | Explicit registry listing (network). |
@@ -76,11 +80,11 @@ Notes:
 - If the same name exists in both project and global owned roots, update /
   uninstall / trust require `--project` or `--global`.
 - If a name exists only under a compatible external root, writes are refused;
-  import it through `/skills` instead of editing harness directories.
+  import it through `/skills manage` instead of editing harness directories.
 
 ## Skills Manager (TUI)
 
-Default open path: type `/skills` and confirm. The surface is zero-network on
+Direct manager path: type `/skills manage` and confirm. The surface is zero-network on
 open (owned-only audit).
 
 | Key | Action |
@@ -313,7 +317,7 @@ See [CONFIGURATION.md](CONFIGURATION.md) for the full config surface.
 
 ## Operator checklist
 
-1. Prefer `/skills` for day-to-day management; keep `--remote` / `sync` explicit.
+1. Prefer `/skills manage` for day-to-day management; keep `--remote` / `sync` explicit.
 2. Never hand-edit `.claude` / `.agents` / `.cursor` trees to “install” for
    Codewhale — import into `.codewhale/skills` instead.
 3. Treat `.trusted` as advisory documentation of review, not a security boundary.

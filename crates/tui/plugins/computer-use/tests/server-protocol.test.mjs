@@ -17,36 +17,24 @@ const recDir = fs.mkdtempSync(path.join(os.tmpdir(), "cu-proto-rec-"));
 const fakeHome = fs.mkdtempSync(path.join(os.tmpdir(), "cu-proto-home-"));
 const binDir = fs.mkdtempSync(path.join(os.tmpdir(), "cu-proto-bin-"));
 
-// Fake ssh: rebuild the remote command after user@host, then either run the
-// agent or emulate the one remote command the installer needs (mkdir -p).
-fs.writeFileSync(path.join(binDir, "ssh"), `#!/bin/bash
-CMD=()
-FOUND=0
-for a in "$@"; do
-  if [ "$FOUND" -eq 1 ]; then CMD+=("$a"); fi
-  case "$a" in *@*) [ "$FOUND" -eq 0 ] && FOUND=1 ;; esac
-done
-SUB="\${CMD[0]}"
-if [ "$SUB" = "node" ]; then
-  exec node "$FAKE_HOME/\${CMD[1]}" "\${CMD[2]}"
-fi
-if [ "$SUB" = "mkdir" ]; then
-  LAST="\${CMD[\${#CMD[@]}-1]}"
-  mkdir -p "$FAKE_HOME/$LAST"
-  exit 0
-fi
-exit 0
+// Portable command fixtures still run the real transferred remote agent.
+fs.writeFileSync(path.join(binDir, "ssh.cjs"), `
+const fs = require('node:fs'), path = require('node:path');
+const args = process.argv.slice(2);
+const remote = args.slice(args.findIndex(a => a.includes('@')) + 1);
+if (remote[0] === 'mkdir') fs.mkdirSync(path.join(process.env.FAKE_HOME, remote.at(-1)), {recursive:true});
+else if (remote[0] === 'node') {
+  const agent = path.join(process.env.FAKE_HOME, remote[1]);
+  process.argv = [process.execPath, agent, ...remote.slice(2)];
+  import(require('node:url').pathToFileURL(agent).href);
+} else process.exit(1);
 `);
-// Fake scp: copies <src> to <user@host:dest> under FAKE_HOME.
-fs.writeFileSync(path.join(binDir, "scp"), `#!/bin/bash
-SRC="$(printf '%s\\n' "$@" | tail -n 2 | head -n 1)"
-DEST="$(printf '%s\\n' "$@" | tail -n 1)"
-DEST="$FAKE_HOME/\${DEST#*:}"
-mkdir -p "$(dirname "$DEST")"
-cp "$SRC" "$DEST"
+fs.writeFileSync(path.join(binDir, "scp.cjs"), `
+const fs = require('node:fs'), path = require('node:path');
+const [source, remote] = process.argv.slice(-2);
+const dest = path.join(process.env.FAKE_HOME, remote.slice(remote.indexOf(':') + 1));
+fs.mkdirSync(path.dirname(dest), {recursive:true}); fs.copyFileSync(source, dest);
 `);
-fs.chmodSync(path.join(binDir, "ssh"), 0o755);
-fs.chmodSync(path.join(binDir, "scp"), 0o755);
 
 let server;
 let buf = "";
@@ -72,7 +60,9 @@ before(async () => {
   server = spawn("node", [path.join(ROOT, "mcp", "server.mjs")], {
     env: {
       ...process.env,
-      PATH: `${binDir}:${process.env.PATH}`,
+      PATH: `${binDir}${path.delimiter}${process.env.PATH}`,
+      CU_COMMAND_FIXTURES: binDir,
+      NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ""} --import=${new URL("./fixtures/command-shims.mjs", import.meta.url).href}`,
       FAKE_HOME: fakeHome,
       CODEWHALE_CU_STATE_DIR: stateDir,
       CODEWHALE_CU_RECORDINGS_DIR: recDir,

@@ -25,8 +25,13 @@ test('Windows launch URLs are a single data argument, including PowerShell-looki
     const encoded=script.match(/FromBase64String\('([^']+)'\)/)?.[1];
     assert.ok(encoded, 'URL data must be carried separately from executable script');
     assert.equal(Buffer.from(encoded,'base64').toString('utf16le'),quoted);
-    assert.match(script,/Start-Process -FilePath "msedge" -ArgumentList \$launchArg/);
+    assert.match(script,/Start-Process -FilePath "msedge" -WindowStyle Minimized -ArgumentList \$launchArg/);
   }
+  // activate defaults to background everywhere: an explicit activate:true is
+  // the only launch that takes the foreground.
+  assert.match((await b.open_application({name:'msedge'}),scripts.at(-1)),/-WindowStyle Minimized/);
+  await b.open_application({name:'msedge',activate:true});
+  assert.ok(!scripts.at(-1).includes('WindowStyle'));
   const before=scripts.length;
   for(const url of [123,{},'', '-Command whoami','https://example.test/\nwhoami']) await assert.rejects(b.open_application({name:'msedge',url}), /absolute URL/);
   assert.equal(scripts.length,before);

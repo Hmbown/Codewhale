@@ -27,7 +27,9 @@ use std::path::Path;
 /// Generation 13 trims the pack: `social-media` and `health` ship to nobody
 /// (phone-export workflows, not everyday), and `feedback` joins
 /// `contributor-onboarding` as a repo-local project skill.
-const BUNDLED_SKILL_VERSION: &str = "13";
+/// Generation 14 corrects account setup, Photos export, forgetting and plugin
+/// lifecycle guidance; exact generation-13 bodies allow safe upgrades.
+const BUNDLED_SKILL_VERSION: &str = "14";
 
 // ── system & extension (meta) ───────────────────────────────────────────────
 const SKILL_CREATOR_BODY: &str = include_str!("../../assets/skills/skill-creator/SKILL.md");
@@ -108,7 +110,33 @@ const MCP_DISCOVERY_GENERATION_10_BODY: &str =
 /// pins every unmodified older copy forever: the on-disk body no longer equals
 /// the shipped one, so the skill never upgrades. Listing the previous body
 /// restores the upgrade for exactly the copies CodeWhale wrote itself.
-const SUPERSEDED_BODIES: &[(&str, &str)] = &[("mcp-discovery", MCP_DISCOVERY_GENERATION_10_BODY)];
+const SUPERSEDED_BODIES: &[(&str, &str)] = &[
+    ("mcp-discovery", MCP_DISCOVERY_GENERATION_10_BODY),
+    (
+        "gmail",
+        include_str!("../../assets/skills/gmail/SKILL.generation-13.md"),
+    ),
+    (
+        "google-calendar",
+        include_str!("../../assets/skills/google-calendar/SKILL.generation-13.md"),
+    ),
+    (
+        "photos",
+        include_str!("../../assets/skills/photos/SKILL.generation-13.md"),
+    ),
+    (
+        "forget",
+        include_str!("../../assets/skills/forget/SKILL.generation-13.md"),
+    ),
+    (
+        "spotify",
+        include_str!("../../assets/skills/spotify/SKILL.generation-13.md"),
+    ),
+    (
+        "plugin-creator",
+        include_str!("../../assets/skills/plugin-creator/SKILL.generation-13.md"),
+    ),
+];
 
 /// Whether `existing` is byte-for-byte a body CodeWhale previously shipped for
 /// `name` (and therefore safe to replace on upgrade).

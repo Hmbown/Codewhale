@@ -168,6 +168,37 @@ export function channelRequest(ch, request, timeoutMs) {
   });
 }
 
+/**
+ * Shared persistent-channel front for executors whose requests ride one
+ * long-lived `<argv> --serve` process (ssh agent, docker exec). Read-only and
+ * identity requests may run on a restarted channel; input tools may not —
+ * the fresh remote agent no longer holds this session's open_application
+ * binding.
+ */
+const SAFE_AFTER_RESTART = new Set([
+  "platform", "probe", "list_displays", "switch_display", "list_apps", "list_windows",
+  "get_app_state", "resolve_element", "screenshot", "zoom", "cursor_position",
+  "read_clipboard", "recordingList", "recordingStatus", "open_application", "preview",
+]);
+function attachPersistentChannel(ex, binding, serveArgv) {
+  if (!binding) return;
+  ex.persistent = (request, opts = {}) => {
+    const ch = ensureSshChannel(binding, serveArgv);
+    if (ch.spawnError) {
+      return Promise.reject(Object.assign(new ExecError(`remote agent channel failed to start: ${ch.spawnError.message}`), { code: "remote_session_lost" }));
+    }
+    if (ch.restarted) {
+      ch.restarted = false;
+      binding.needsObservation = true;
+      if (!SAFE_AFTER_RESTART.has(request.tool)) {
+        return Promise.reject(Object.assign(new ExecError("the remote agent session restarted — rebind with open_application and observe before acting"), { code: "remote_session_restarted" }));
+      }
+    }
+    return channelRequest(ch, request, opts.timeoutMs ?? 25_000);
+  };
+  ex.closeChannel = () => closeSshChannel(binding);
+}
+
 /** ssh executor: speaks to the remote agent installed by installRemoteAgent(). */
 export function sshExec(computer, binding) {
   const userHost = computer.user ? `${computer.user}@${computer.host}` : computer.host;
@@ -197,31 +228,42 @@ export function sshExec(computer, binding) {
       return reply;
     },
   };
-  if (binding) {
-    // Read-only/identity requests may run on a restarted channel; input tools
-    // may not, because the fresh remote agent no longer holds this session's
-    // open_application binding.
-    const SAFE_AFTER_RESTART = new Set([
-      "platform", "probe", "list_displays", "switch_display", "list_apps", "list_windows",
-      "get_app_state", "resolve_element", "screenshot", "zoom", "cursor_position",
-      "read_clipboard", "recordingList", "recordingStatus", "open_application", "preview",
-    ]);
-    ex.persistent = (request, opts = {}) => {
-      const ch = ensureSshChannel(binding, ["ssh", ...base, "node", remoteAgent, "--serve"]);
-      if (ch.spawnError) {
-        return Promise.reject(Object.assign(new ExecError(`ssh agent channel failed to start: ${ch.spawnError.message}`), { code: "remote_session_lost" }));
-      }
-      if (ch.restarted) {
-        ch.restarted = false;
-        binding.needsObservation = true;
-        if (!SAFE_AFTER_RESTART.has(request.tool)) {
-          return Promise.reject(Object.assign(new ExecError("the remote agent session restarted — rebind with open_application and observe before acting"), { code: "remote_session_restarted" }));
-        }
-      }
-      return channelRequest(ch, request, opts.timeoutMs ?? 25_000);
-    };
-    ex.closeChannel = () => closeSshChannel(binding);
-  }
+  attachPersistentChannel(ex, binding, ["ssh", ...base, "node", remoteAgent, "--serve"]);
+  return ex;
+}
+
+/**
+ * docker executor: a spawned task-owned desktop container. Same agent contract
+ * as ssh, but the channel is `docker exec` — no sshd, no keys, the container
+ * boundary itself is the isolation. Every call goes through
+ * docker/agent-exec.sh, which joins the desktop session env (display + bus)
+ * the container entrypoint recorded before serving requests.
+ */
+export function dockerExec(computer, binding) {
+  const container = safeRemotePath(computer.container);
+  const remoteAgent = "/app/docker/agent-exec.sh";
+  const ex = {
+    kind: "docker",
+    container,
+    remoteAgent,
+    run(cmd, args = [], opts = {}) {
+      // Local side commands (docker itself) run directly.
+      return run(cmd, args, opts);
+    },
+    async remote(request, opts = {}) {
+      const r = await run("docker", ["exec", container, "/bin/sh", remoteAgent, b64({ args: request.args ?? {}, tool: request.tool, nonce: crypto.randomBytes(6).toString("hex") })], {
+        timeoutMs: opts.timeoutMs ?? 25_000,
+      });
+      if (r.aborted) throw Object.assign(new ExecError("computer request cancelled", r), { code: "cancelled" });
+      if (r.timedOut) throw new ExecError(`docker exec ${container}: timed out`, r);
+      if (r.code !== 0) throw new ExecError(`docker exec ${container} exited ${r.code}: ${r.stderr.trim().slice(0, 400)}`, r);
+      const line = r.stdout.trim().split("\n").filter((l) => l.startsWith("{")).pop();
+      const reply = line ? JSON.parse(line) : null;
+      if (!reply) throw new ExecError(`docker exec ${container}: agent returned no JSON receipt`, r);
+      return reply;
+    },
+  };
+  attachPersistentChannel(ex, binding, ["docker", "exec", "-i", container, "/bin/sh", remoteAgent, "--serve"]);
   return ex;
 }
 
@@ -302,6 +344,7 @@ export async function executorFor(computer, binding) {
     return { ...localExec(), appReason: status.reason };
   }
   if (computer.transport === "ssh") return sshExec(computer, binding);
+  if (computer.transport === "docker") return dockerExec(computer, binding);
   if (computer.transport === "hdc") return hdcExec(computer);
   throw new ExecError(`unknown transport ${computer.transport}`);
 }
@@ -315,6 +358,7 @@ function effectivePlatform(computer) {
   if (!platform) {
     if (computer.transport === "local") platform = process.platform;
     else if (computer.transport === "hdc") platform = "harmonyos";
+    else if (computer.transport === "docker") platform = "linux"; // spawned containers are always the Linux desktop image
     else platform = "linux"; // conservative default for ssh; registration probes it
   }
   return platform;
@@ -323,6 +367,7 @@ function effectivePlatform(computer) {
 /** Identity of the effective route, excluding catalog presentation metadata. */
 export function routeFingerprint(computer) {
   const route = [computer.transport, effectivePlatform(computer)];
+  if (computer.transport === "docker") route.push(computer.container || null);
   if (computer.transport === "hdc") route.push(computer.target || null);
   if (computer.transport === "ssh") route.push(computer.host, computer.user || null,
     computer.port || null, computer.agentPath ?? ".codewhale-cu/agent/agent.mjs");

@@ -3,6 +3,10 @@
 Every tool takes an optional `computer` id (sticky switch). Every action
 receipt is JSON: `ok`, plus what was sent. Verify effects by observing.
 
+Interface order per step: the host's own shell/files/APIs → `app_script`
+→ `browser` (CDP) → accessibility elements → pixels. Click only what has
+no better interface.
+
 ## Observe
 - `request_access` — permissions + capabilities; call once per session.
 - `list_apps {all?}` — running apps (names, pids). Default: user-facing apps.
@@ -27,6 +31,10 @@ receipt is JSON: `ok`, plus what was sent. Verify effects by observing.
 - `scroll {target, direction, amount?}` · `left_click_drag {from_target, to}`
 - `invoke_menu {path}` — app menu items through accessibility (exact for app-level commands like New/Save/Quit; see the close recipe for windows).
 - `pointer {action, target?}` — move/down/up primitives (foreground/shared only).
+- `app_script {script, language?, timeout?}` — macOS local only: AppleScript
+  (default) or JXA through osascript. `result` is stdout; refusals are
+  `script_error`, `script_timeout`, `automation_denied` (-1743 consent) and
+  `unsupported_on_transport` on ssh/docker/hdc.
 
 ## Apps & computers
 - `open_application {name|bundle_id|pid, activate?}` — bind the input target; `app_not_found` when the selector resolves nowhere.
@@ -34,7 +42,11 @@ receipt is JSON: `ok`, plus what was sent. Verify effects by observing.
 - `kill_app {name|bundle_id|pid, force?}` — quit an app; refuses an ambiguous name match (pass pid); never the helper itself.
 - `set_window_frame {app_ref?, window_id, frame:{x,y,w,h}}` — move/resize one window; readbacks report what the app actually did (`verified`, `ax_errors`).
 - `preview {enabled}` — floating panel: captured window + agent/user cursors; live while bound.
-- `computer {action, id?}` — list / switch / register / remove.
+- `computer {action, id?}` — list / switch / register / **spawn** / remove.
+  `spawn {id, transport:"docker", image?}` provisions a task-owned disposable
+  Linux desktop (registered `owned:true`, becomes active) — the default
+  workspace for anything that does not need the user's own session. `remove`
+  or session end destroys it. `local` stays for work in the user's session.
 - `recording {action, …}` — start / stop / status / list (opt-in screen recordings).
 
 ## Browser (CDP)
@@ -46,10 +58,20 @@ receipt is JSON: `ok`, plus what was sent. Verify effects by observing.
 - `browser {action:"status"}` · `browser {action:"stop"}` — tabs/active tab; close this session's tab (last one out closes the browser).
 
 ## Session
+- `consent {action:"status"|"allow"|"deny"|"revoke", app?|scope?}` — the
+  per-app decision ledger on `local`. First contact with an app refuses
+  `consent_required`; record the user's answer (`remember:true` persists).
+  `scope:"foreground"` is the separate shared-pointer decision
+  `open_application activate:true` needs. A denied app fails `app_denied`
+  under every spelling; only the user can revoke it.
 - `list_sessions` — live sessions on this machine (content-free) and the user's control mode.
 - `trajectory {action:"start"|"stop"|"status"|"replay", id?, dry_run?}` — record this session's tool calls to a local JSONL; replay re-enters the normal pipeline and stops at the first refusal.
 - `stop_computer_control {reason?}` — kill switch; input for this session ends.
 - Capability grant (host config): `CODEWHALE_CU_GRANT="read-only"` or a tool list — the session can never see or call beyond it (`not_granted`).
+
+Receipt fields worth reading: `yield_ms` is how long an action waited for a
+gap in the user's hardware input before taking a shared surface; a deny
+never carries `action_sent`.
 
 ## Recipes
 
@@ -61,8 +83,8 @@ Type into the document body:
 
 Close a window without borrowing focus:
 1. Press the window's close-button element (`click` on the window's
-   `AXButton`), or use `key cmd+w` (which borrows focus briefly and says so:
-   `front_lease` / `front_restored`).
+   `AXButton`), or use an available `invoke_menu` close action. Modified keys
+   refuse in background mode because they need keyboard focus.
 
 Fill and submit a web form (CDP, no pixels):
 1. `browser {action:"start", url:"https://…"}`

@@ -240,11 +240,11 @@ pub(super) fn agent_row_styles(
     } else if hovered {
         app.ui_theme.elevated_bg
     } else {
-        app.ui_theme.surface_bg
+        app.ui_theme.panel_bg
     };
     let mut normal = Style::default().fg(app.ui_theme.text_body).bg(bg);
     let mut muted = Style::default().fg(app.ui_theme.text_muted).bg(bg);
-    if selected || opened {
+    if opened {
         normal = normal.fg(app.ui_theme.accent_primary);
         muted = muted.fg(app.ui_theme.accent_primary);
     }
@@ -284,7 +284,7 @@ pub(super) fn row_style(
     opened: bool,
 ) -> Style {
     let fg = tone_color(row.tone, &app.ui_theme);
-    let mut style = Style::default().fg(fg).bg(app.ui_theme.surface_bg);
+    let mut style = Style::default().fg(fg).bg(app.ui_theme.panel_bg);
     if row.tone == WorkTone::Heading {
         style = style.add_modifier(Modifier::BOLD);
     }
@@ -298,6 +298,11 @@ pub(super) fn row_style(
     }
     if selected {
         style = style
+            .fg(codewhale_palette::enforce_contrast(
+                fg,
+                app.ui_theme.selection_bg,
+                4.5,
+            ))
             .bg(app.ui_theme.selection_bg)
             .add_modifier(Modifier::BOLD);
     } else if hovered {

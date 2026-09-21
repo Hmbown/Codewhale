@@ -12,7 +12,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use async_stream::stream;
 use axum::extract::{ConnectInfo, DefaultBodyLimit, Path, Query, Request, State};
 use axum::http::header;
-use axum::http::{HeaderName, HeaderValue, Method, StatusCode};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use axum::middleware;
 use axum::response::Html;
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
@@ -72,10 +72,12 @@ use crate::runtime_threads::{
     CompactThreadRequest, CreateThreadRequest, ExternalApprovalDecision,
     MAX_RUNTIME_EVENT_REPLAY_TAIL, RuntimeThreadManager, RuntimeThreadManagerConfig,
     SharedRuntimeThreadManager, StartTurnRequest, SteerTurnRequest, ThreadDetail, ThreadListFilter,
-    ThreadRecord, TurnItemKind, TurnRecord, UpdateThreadRequest, UsageGroupBy, UsageTotals,
+    ThreadRecord, TurnRecord, UpdateThreadRequest, UsageGroupBy, UsageTotals,
 };
+// `TurnItemKind` is read only by the summary tests now that the route builds
+// its rows from `ThreadListFacts` instead of walking item records here.
 #[cfg(test)]
-pub(super) use crate::runtime_threads::{RuntimeTurnStatus, TurnItemLifecycleStatus};
+pub(super) use crate::runtime_threads::{RuntimeTurnStatus, TurnItemKind, TurnItemLifecycleStatus};
 use crate::session_manager::default_sessions_dir;
 #[cfg(test)]
 pub(super) use crate::session_manager::{SavedSession, SessionMetadata};
@@ -101,6 +103,7 @@ mod diagnostics;
 mod git;
 mod jobs;
 mod lsp;
+mod mcp_import;
 mod memory_lens;
 mod mobile;
 mod plans;
@@ -108,6 +111,7 @@ mod plugins;
 mod secrets;
 mod sessions;
 mod targets;
+mod terminal;
 mod voice;
 mod web;
 mod workspace;
@@ -127,8 +131,9 @@ use self::sessions::{messages_from_thread_detail, session_to_detail};
 #[cfg(test)]
 use self::workspace::collect_workspace_status;
 use self::workspace::{
-    collect_workspace_git_metadata, workspace_file_read, workspace_file_search,
-    workspace_file_write, workspace_files_list, workspace_instructions, workspace_status,
+    WorkspaceGitMetadata, collect_workspace_git_metadata, workspace_file_read,
+    workspace_file_search, workspace_file_write, workspace_files_list, workspace_instructions,
+    workspace_status,
 };
 
 const RUNTIME_TOKEN_ENV: &str = "CODEWHALE_RUNTIME_TOKEN";
@@ -565,6 +570,7 @@ fn default_runtime_capabilities() -> RuntimeCapabilities {
     RuntimeCapabilities {
         account_session: true,
         threads: true,
+        thread_shell_consent: true,
         turns: true,
         turn_operation_idempotency: true,
         turn_operation_lookup: true,
@@ -587,6 +593,17 @@ fn default_runtime_capabilities() -> RuntimeCapabilities {
         skill_lifecycle: true,
         plugin_management: true,
         agent_mail: true,
+        // SSE journal frames carry their durable `seq` as the event id, and the
+        // thread event stream resumes from `Last-Event-ID`.
+        event_stream_resume: true,
+        // The terminal family follows the routes' own gate: the owner is
+        // `#[cfg(unix)]` end to end, and the Windows and OpenHarmony builds
+        // answer 501. A client must be able to feature-detect that before it
+        // offers a pane, so the flag must never outrun the handler.
+        terminal_stream: cfg!(all(unix, not(target_env = "ohos"))),
+        terminal_input: cfg!(all(unix, not(target_env = "ohos"))),
+        terminal_resize: cfg!(all(unix, not(target_env = "ohos"))),
+        terminal_kill: cfg!(all(unix, not(target_env = "ohos"))),
     }
 }
 
@@ -604,6 +621,9 @@ fn runtime_api_sub_agent_manager(workspace: &FsPath, workers: usize) -> SharedSu
 #[derive(Debug, Serialize)]
 struct McpServerEntry {
     name: String,
+    origin: &'static str,
+    writable: bool,
+    auth_required: bool,
     enabled: bool,
     required: bool,
     command: Option<String>,
@@ -615,6 +635,7 @@ struct McpServerEntry {
 
 #[derive(Debug, Serialize)]
 struct McpServersResponse {
+    revision: String,
     servers: Vec<McpServerEntry>,
 }
 
@@ -637,6 +658,16 @@ struct McpToolEntry {
 #[derive(Debug, Serialize)]
 struct McpToolsResponse {
     tools: Vec<McpToolEntry>,
+    connections: Vec<McpConnectionOutcome>,
+}
+
+#[derive(Debug, Serialize)]
+struct McpConnectionOutcome {
+    server: String,
+    connected: bool,
+    auth_required: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
 }
 
 /// Request body for `POST /v1/apps/mcp/servers` (create) and
@@ -711,7 +742,12 @@ where
 /// the API never echoes credentials back to callers.
 #[derive(Debug, Serialize)]
 struct McpServerDetail {
+    revision: String,
     name: String,
+    credential_configured: bool,
+    origin: &'static str,
+    writable: bool,
+    auth_required: bool,
     enabled: bool,
     required: bool,
     command: Option<String>,
@@ -738,13 +774,23 @@ struct McpServerDetail {
 }
 
 impl McpServerDetail {
-    fn from_config(name: &str, cfg: &crate::mcp::McpServerConfig, connected: bool) -> Self {
+    fn from_config(
+        name: &str,
+        cfg: &crate::mcp::McpServerConfig,
+        connected: bool,
+        revision: String,
+    ) -> Self {
         let mut env_keys: Vec<String> = cfg.env.keys().cloned().collect();
         env_keys.sort();
         let mut env_header_keys: Vec<String> = cfg.env_headers.keys().cloned().collect();
         env_header_keys.sort();
         Self {
+            revision,
             name: name.to_string(),
+            credential_configured: mcp_credential_configured(cfg),
+            origin: "global",
+            writable: true,
+            auth_required: false,
             enabled: cfg.is_enabled(),
             required: cfg.required,
             command: cfg.command.clone(),
@@ -768,9 +814,13 @@ impl McpServerDetail {
 
 #[derive(Debug, Serialize)]
 struct McpServerActionReceipt {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    revision: Option<String>,
     name: String,
     action: &'static str,
     ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    connection: Option<McpConnectionOutcome>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -837,6 +887,16 @@ struct FleetEventsQuery {
 struct StartTurnResponse {
     thread: ThreadRecord,
     turn: TurnRecord,
+    /// Present only when the durable `operation_key` made this submission a
+    /// replay of one already accepted: the turn is the original and nothing
+    /// new was admitted. Omitted otherwise so every existing response stays
+    /// byte-identical — a client that never sends a key sees no change.
+    #[serde(skip_serializing_if = "replay_flag_is_absent")]
+    idempotent_replay: bool,
+}
+
+fn replay_flag_is_absent(replayed: &bool) -> bool {
+    !*replayed
 }
 
 fn install_runtime_server_workshop_budgets(
@@ -1118,6 +1178,15 @@ pub fn build_router(state: RuntimeApiState) -> Router {
             get(read_session_artifact),
         )
         .route("/v1/workspace/status", get(workspace_status))
+        // The Engine's terminal byte stream (#34). Auth is the route layer's,
+        // not this module's; these never create a session — see terminal.rs.
+        .route("/v1/terminal/{name}/output", get(terminal::terminal_output))
+        .route("/v1/terminal/{name}/input", post(terminal::terminal_input))
+        .route(
+            "/v1/terminal/{name}/resize",
+            post(terminal::terminal_resize),
+        )
+        .route("/v1/terminal/{name}/kill", post(terminal::terminal_kill))
         .route("/v1/workspace/files/search", get(workspace_file_search))
         .route(
             "/v1/workspace/files",
@@ -1222,6 +1291,10 @@ pub fn build_router(state: RuntimeApiState) -> Router {
             "/v1/threads/{id}/jobs/{job_id}/kill",
             post(jobs::kill_thread_job),
         )
+        .route(
+            "/v1/threads/{id}/jobs/{job_id}/resize",
+            post(jobs::resize_thread_job),
+        )
         .route("/v1/threads/{id}/context", get(context::get_thread_context))
         .route("/v1/threads/{id}/plan", get(plans::get_thread_plan))
         .route("/v1/threads/{id}/todo", get(plans::get_thread_todo))
@@ -1324,6 +1397,10 @@ pub fn build_router(state: RuntimeApiState) -> Router {
             post(set_skill_enabled).delete(uninstall_skill_api),
         )
         .route(
+            "/v1/apps/mcp/imports",
+            get(mcp_import::preview).post(mcp_import::apply),
+        )
+        .route(
             "/v1/apps/mcp/servers",
             get(list_mcp_servers).post(create_mcp_server),
         )
@@ -1420,8 +1497,21 @@ pub fn build_router(state: RuntimeApiState) -> Router {
         .route("/v1/usage", get(get_usage))
         .route("/v1/snapshots", get(list_snapshots))
         .route("/v1/snapshots/{id}/restore", post(restore_snapshot))
+        .route(
+            "/v1/account/model-access",
+            get(secrets::get_account_model_access)
+                .put(secrets::set_account_model_access)
+                .delete(secrets::clear_account_model_access)
+                .layer(DefaultBodyLimit::max(
+                    secrets::PROVIDER_KEY_BODY_LIMIT_BYTES,
+                )),
+        )
         .route("/v1/providers", get(list_providers))
         .route("/v1/providers/{id}/models", get(list_provider_models))
+        .route(
+            "/v1/providers/{id}/models/refresh",
+            post(refresh_provider_models),
+        )
         .route("/v1/providers/{id}/switch", post(switch_provider))
         .route(
             "/v1/providers/{id}/key",
@@ -1799,6 +1889,22 @@ async fn ack_thread_notice(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// First-appearance dedupe that preserves the order paths were seen in.
+///
+/// The thread summary resolves git metadata per distinct workspace rather than
+/// per row. One resolution runs up to five blocking `git` processes, and rows
+/// overwhelmingly share a single workspace, so resolving per row multiplied a
+/// listing's process count by its row count.
+fn distinct_paths(paths: impl IntoIterator<Item = PathBuf>) -> Vec<PathBuf> {
+    let mut distinct: Vec<PathBuf> = Vec::new();
+    for path in paths {
+        if !distinct.contains(&path) {
+            distinct.push(path);
+        }
+    }
+    distinct
+}
+
 async fn list_threads_summary(
     State(state): State<RuntimeApiState>,
     Query(query): Query<ThreadSummaryQuery>,
@@ -1812,10 +1918,8 @@ async fn list_threads_summary(
     // to find — was invisible. Unsearched listings keep the cheap bounded read;
     // a search scans in newest-first order and stops at `limit` matches.
     //
-    // Match on the thread record *before* `get_thread_detail`. Detail is a
-    // whole-store turns+items walk, so loading it for every thread made a
-    // non-matching dashboard keystroke O(threads × (all_turns + all_items))
-    // JSON reads. Preview is filled only for matches; it is not a search key.
+    // Match on the thread record *before* harvesting row facts. Preview is
+    // filled only for rows that are returned; it is not a search key.
     let scan_limit = if search.is_some() { None } else { Some(limit) };
     let threads = state
         .runtime_threads
@@ -1823,9 +1927,9 @@ async fn list_threads_summary(
         .await
         .map_err(|e| ApiError::internal(e.to_string()))?;
 
-    let mut summaries = Vec::new();
+    let mut rows = Vec::new();
     for thread in threads {
-        if summaries.len() >= limit {
+        if rows.len() >= limit {
             break;
         }
         if let Some(search) = &search
@@ -1835,18 +1939,60 @@ async fn list_threads_summary(
         {
             continue;
         }
-        let detail = state
-            .runtime_threads
-            .get_thread_detail(&thread.id)
-            .await
-            .map_err(map_thread_err)?;
-        let latest_turn = detail.turns.last();
-        let latest_status =
-            latest_turn.map(|turn| format!("{:?}", turn.status).to_ascii_lowercase());
-        let pending_attention_count = detail
-            .pending_approvals
-            .len()
-            .saturating_add(detail.pending_user_inputs.len());
+        rows.push(thread);
+    }
+
+    // Harvest every returned row's facts in ONE pass over the store. Reading a
+    // whole thread detail per row made this route `rows x (all_turns +
+    // all_items)` JSON reads and parses — seconds-per-thread, so the rail timed
+    // out and went blank on a store of a few dozen threads. Preview and turn
+    // status now come from that same scan; attention comes from live state.
+    let row_ids: Vec<String> = rows.iter().map(|thread| thread.id.clone()).collect();
+
+    // Settle queued recovery receipts before reading the rows, exactly as the
+    // per-row detail read did. The flush cancels a recovered turn's pending
+    // requests, and this page's attention count reads that state, so it has to
+    // precede the scan.
+    state
+        .runtime_threads
+        .flush_recovery_receipts(&row_ids)
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+
+    let facts = state
+        .runtime_threads
+        .thread_list_facts(&row_ids)
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+
+    // Resolve git metadata once per workspace, not once per row. Each
+    // resolution spawns up to five blocking `git` processes — `rev-parse
+    // --is-inside-work-tree` twice, `--abbrev-ref HEAD`, `--short HEAD` and
+    // `status --porcelain` — and rows overwhelmingly share one workspace, so a
+    // per-row resolve turned a 72-thread listing into roughly 360 process
+    // spawns, every one of them blocking whichever runtime thread ran it.
+    // One blocking task now covers every distinct workspace on the page.
+    let workspaces = distinct_paths(rows.iter().map(|thread| thread.workspace.clone()));
+    let git_by_workspace: Vec<(PathBuf, WorkspaceGitMetadata)> =
+        tokio::task::spawn_blocking(move || {
+            workspaces
+                .into_iter()
+                .map(|workspace| {
+                    let metadata = collect_workspace_git_metadata(&workspace);
+                    (workspace, metadata)
+                })
+                .collect()
+        })
+        .await
+        .map_err(|e| ApiError::internal(format!("Workspace git metadata task failed: {e}")))?;
+
+    let mut summaries = Vec::with_capacity(rows.len());
+    for thread in rows {
+        let facts = facts.get(&thread.id);
+        let latest_status = facts.and_then(|facts| facts.latest_turn_status.clone());
+        let pending_attention_count = facts.map_or(0, |facts| facts.pending_attention_count);
+        let latest_input_summary =
+            facts.and_then(|facts| facts.latest_turn_input_summary.as_deref());
 
         let title = thread
             .title
@@ -1855,44 +2001,35 @@ async fn list_threads_summary(
             .filter(|t| !t.is_empty())
             .map(|t| truncate_text(t, 72))
             .unwrap_or_else(|| {
-                latest_turn
-                    .map(|turn| {
-                        if turn.input_summary.trim().is_empty() {
+                latest_input_summary
+                    .map(|summary| {
+                        if summary.trim().is_empty() {
                             "New Thread".to_string()
                         } else {
-                            truncate_text(&turn.input_summary, 72)
+                            truncate_text(summary, 72)
                         }
                     })
                     .unwrap_or_else(|| "New Thread".to_string())
             });
 
-        let preview = detail
-            .items
-            .iter()
-            .rev()
-            .find_map(|item| match item.kind {
-                TurnItemKind::AgentMessage | TurnItemKind::UserMessage => {
-                    let text = item.detail.clone().unwrap_or_else(|| item.summary.clone());
-                    if text.trim().is_empty() {
-                        None
-                    } else {
-                        Some(truncate_text(&text, 140))
-                    }
-                }
-                _ => None,
-            })
+        let preview = facts
+            .and_then(|facts| facts.preview.as_deref())
+            .map(|text| truncate_text(text, 140))
             .unwrap_or_else(|| title.clone());
 
-        let workspace_git = collect_workspace_git_metadata(&thread.workspace);
+        let workspace_git = git_by_workspace
+            .iter()
+            .find(|(workspace, _)| workspace == &thread.workspace)
+            .map(|(_, metadata)| metadata);
         summaries.push(ThreadSummary {
             id: thread.id,
             title,
             preview,
             model: thread.model,
             mode: thread.mode,
-            branch: workspace_git.branch,
-            head: workspace_git.head,
-            dirty: workspace_git.dirty,
+            branch: workspace_git.and_then(|git| git.branch.clone()),
+            head: workspace_git.and_then(|git| git.head.clone()),
+            dirty: workspace_git.is_some_and(|git| git.dirty),
             workspace: thread.workspace,
             archived: thread.archived,
             updated_at: thread.updated_at,
@@ -3925,76 +4062,320 @@ fn normalize_runtime_account_api_base(value: &str) -> Option<String> {
     Some(url.as_str().trim_end_matches('/').to_string())
 }
 
-async fn list_mcp_servers(
-    State(state): State<RuntimeApiState>,
-) -> Result<Json<McpServersResponse>, ApiError> {
-    let mcp_config_path = state.config.read().mcp_config_path();
-    let plugin_registry = state
+/// Ownership is derived using the same trust/precedence as the existing MCP
+/// loader. A global editor must never silently change a shadowed project entry
+/// or manufacture an override for a reviewed plugin component.
+fn mcp_management_config(
+    state: &RuntimeApiState,
+) -> Result<
+    (
+        crate::mcp::McpConfig,
+        std::collections::HashMap<String, &'static str>,
+    ),
+    ApiError,
+> {
+    let global_path = state.config.read().mcp_config_path();
+    let plugins = state
         .plugin_discovery
         .registry_for_workspace(&state.workspace);
     let config = crate::mcp::load_config_with_workspace_and_plugins(
-        &mcp_config_path,
+        &global_path,
         &state.workspace,
-        plugin_registry.as_ref(),
+        plugins.as_ref(),
     )
     .map_err(|e| ApiError::internal(format!("Failed to load MCP config: {e}")))?;
+    let global = crate::mcp::load_config(&global_path)
+        .map_err(|e| ApiError::internal(format!("Failed to load MCP config: {e}")))?;
+    let project_path = crate::mcp::workspace_mcp_config_path(&state.workspace);
+    let same_source = project_path == global_path
+        || project_path
+            .canonicalize()
+            .ok()
+            .zip(global_path.canonicalize().ok())
+            .is_some_and(|(project, global)| project == global);
+    let project = if !same_source && crate::config::is_workspace_trusted(&state.workspace) {
+        crate::mcp::load_config(&project_path)
+            .map_err(|e| ApiError::internal(format!("Failed to load project MCP config: {e}")))?
+    } else {
+        crate::mcp::McpConfig::default()
+    };
+    let origins = config
+        .servers
+        .iter()
+        .map(|(name, server)| {
+            let origin = if server.reviewed_plugin.is_some() {
+                "plugin"
+            } else if project.servers.contains_key(name) {
+                "project"
+            } else if global.servers.contains_key(name) {
+                "global"
+            } else {
+                "unknown"
+            };
+            (name.clone(), origin)
+        })
+        .collect();
+    Ok((config, origins))
+}
 
+#[derive(Debug)]
+struct McpManagementFailure(ApiError);
+impl std::fmt::Display for McpManagementFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0.message)
+    }
+}
+impl std::error::Error for McpManagementFailure {}
+
+fn mcp_mutation_error(error: anyhow::Error) -> ApiError {
+    if error.is::<crate::mcp::McpRevisionConflict>() {
+        ApiError {
+            status: StatusCode::PRECONDITION_FAILED,
+            message: error.to_string(),
+        }
+    } else if let Some(error) = error.downcast_ref::<McpManagementFailure>() {
+        error.0.clone()
+    } else {
+        ApiError::internal(error.to_string())
+    }
+}
+
+fn mcp_expected_revision(headers: &axum::http::HeaderMap) -> Result<String, ApiError> {
+    let value = headers
+        .get(header::IF_MATCH)
+        .ok_or_else(|| ApiError {
+            status: StatusCode::PRECONDITION_REQUIRED,
+            message: "Read the MCP configuration and send its revision in If-Match before saving"
+                .into(),
+        })?
+        .to_str()
+        .map_err(|_| ApiError::bad_request("Invalid MCP revision"))?
+        .trim();
+    let value = if value.starts_with('"') && value.ends_with('"') && value.len() >= 2 {
+        &value[1..value.len() - 1]
+    } else {
+        value
+    };
+    if value != "mcp-v1-absent"
+        && !value.strip_prefix("mcp-v1-").is_some_and(|hash| {
+            hash.len() == 64
+                && hash
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        })
+    {
+        return Err(ApiError::bad_request("Invalid MCP revision"));
+    }
+    Ok(value.to_owned())
+}
+
+async fn mutate_mcp_management<T: Send + 'static>(
+    state: RuntimeApiState,
+    headers: axum::http::HeaderMap,
+    mutate: impl FnOnce(&RuntimeApiState, &mut crate::mcp::McpConfig) -> Result<T, ApiError>
+    + Send
+    + 'static,
+) -> Result<(T, String), ApiError> {
+    let expected = mcp_expected_revision(&headers)?;
+    #[cfg(test)]
+    let env_ticket = crate::test_support::env_scope_ticket();
+    tokio::task::spawn_blocking(move || {
+        #[cfg(test)]
+        let _membership = crate::test_support::join_env_scope(env_ticket);
+        let path = state.config.read().mcp_config_path();
+        crate::mcp::mutate_config(&path, Some(&expected), |config| {
+            mutate(&state, config).map_err(|error| anyhow::Error::new(McpManagementFailure(error)))
+        })
+        .map_err(mcp_mutation_error)
+    })
+    .await
+    .map_err(|_| ApiError::internal("MCP configuration write failed"))?
+}
+
+async fn mcp_management_snapshot(
+    state: RuntimeApiState,
+) -> Result<
+    (
+        (
+            crate::mcp::McpConfig,
+            std::collections::HashMap<String, &'static str>,
+        ),
+        String,
+    ),
+    ApiError,
+> {
+    #[cfg(test)]
+    let env_ticket = crate::test_support::env_scope_ticket();
+    tokio::task::spawn_blocking(move || {
+        #[cfg(test)]
+        let _membership = crate::test_support::join_env_scope(env_ticket);
+        let path = state.config.read().mcp_config_path();
+        codewhale_config::with_config_write_lock(&path, |path| {
+            let config = mcp_management_config(&state)
+                .map_err(|error| anyhow::Error::new(McpManagementFailure(error)))?;
+            Ok((config, crate::mcp::read_config_revision(path)?))
+        })
+        .map_err(mcp_mutation_error)
+    })
+    .await
+    .map_err(|_| ApiError::internal("MCP configuration read failed"))?
+}
+
+fn require_writable_mcp_server(state: &RuntimeApiState, name: &str) -> Result<(), ApiError> {
+    let (_, origins) = mcp_management_config(state)?;
+    match origins.get(name) {
+        Some(&"global") => Ok(()),
+        Some(origin) => Err(ApiError {
+            status: StatusCode::CONFLICT,
+            message: format!(
+                "MCP server '{name}' is owned by {origin} configuration; manage it at its source"
+            ),
+        }),
+        None => Err(ApiError::not_found(format!(
+            "MCP server '{name}' not found"
+        ))),
+    }
+}
+
+async fn mcp_pool_handle(
+    state: &RuntimeApiState,
+    create: bool,
+) -> Result<Option<Arc<Mutex<McpPool>>>, ApiError> {
+    let mut slot = state.mcp_pool.lock().await;
+    if slot.is_none() && create {
+        let path = state.config.read().mcp_config_path();
+        let plugins = state
+            .plugin_discovery
+            .registry_for_workspace(&state.workspace);
+        let pool =
+            McpPool::from_config_path_with_workspace_and_plugins(&path, &state.workspace, plugins)
+                .map_err(|e| ApiError::internal(format!("Failed to load MCP config: {e}")))?;
+        *slot = Some(Arc::new(Mutex::new(pool)));
+    }
+    Ok(slot.clone())
+}
+
+fn mcp_connection_outcome(
+    pool: &McpPool,
+    server: &str,
+    error: Option<&anyhow::Error>,
+) -> McpConnectionOutcome {
+    McpConnectionOutcome {
+        server: server.to_owned(),
+        connected: pool.connected_servers().contains(&server),
+        auth_required: pool.server_needs_auth(server),
+        error: error
+            .map(|error| truncate_text(&crate::mcp::format_mcp_error_for_display(error), 2048)),
+    }
+}
+
+async fn list_mcp_servers(
+    State(state): State<RuntimeApiState>,
+) -> Result<Json<McpServersResponse>, ApiError> {
+    let ((config, origins), revision) = mcp_management_snapshot(state.clone()).await?;
+    let handle = mcp_pool_handle(&state, false).await?;
+    let pool = match handle.as_ref() {
+        Some(handle) => Some(handle.lock().await),
+        None => None,
+    };
     let mut servers = Vec::new();
     for (name, server_cfg) in config.servers {
+        let origin = origins.get(&name).copied().unwrap_or("unknown");
         servers.push(McpServerEntry {
             name: name.clone(),
+            origin,
+            writable: origin == "global",
+            auth_required: pool
+                .as_ref()
+                .is_some_and(|pool| pool.server_needs_auth(&name)),
             enabled: server_cfg.is_enabled(),
             required: server_cfg.required,
             command: server_cfg.command.clone(),
             url: server_cfg.url.clone(),
-            connected: false,
+            connected: pool
+                .as_ref()
+                .is_some_and(|pool| pool.connected_servers().contains(&name.as_str())),
             enabled_tools: server_cfg.enabled_tools.clone(),
             disabled_tools: server_cfg.disabled_tools.clone(),
         });
     }
     servers.sort_by(|a, b| a.name.cmp(&b.name));
-
-    Ok(Json(McpServersResponse { servers }))
+    Ok(Json(McpServersResponse { servers, revision }))
 }
 
 async fn list_mcp_tools(
     State(state): State<RuntimeApiState>,
     Query(query): Query<McpToolsQuery>,
 ) -> Result<Json<McpToolsResponse>, ApiError> {
-    // Double-checked init: hold the state-level slot mutex only long enough
-    // to grab (or lazily create) the pool handle. connect_all can stall on a
-    // slow MCP server and must not run under the slot lock.
-    let pool_handle = {
-        let mut pool_slot = state.mcp_pool.lock().await;
-        match pool_slot.as_ref() {
-            Some(pool) => Some(Arc::clone(pool)),
-            None if query.connect => {
-                let mcp_config_path = state.config.read().mcp_config_path();
-                let plugin_registry = state
-                    .plugin_discovery
-                    .registry_for_workspace(&state.workspace);
-                let new_pool = McpPool::from_config_path_with_workspace_and_plugins(
-                    &mcp_config_path,
-                    &state.workspace,
-                    plugin_registry,
-                )
-                .map_err(|e| ApiError::internal(format!("Failed to load MCP config: {e}")))?;
-                let handle = Arc::new(Mutex::new(new_pool));
-                pool_slot.replace(Arc::clone(&handle));
-                Some(handle)
-            }
-            None => None,
-        }
+    // An explicit connection request must not inherit the tool dispatcher's
+    // best-effort reload behavior: unreadable/revoked sources fail closed.
+    let fresh_config = if query.connect {
+        Some(mcp_management_config(&state)?.0)
+    } else {
+        None
     };
-
-    let Some(pool_handle) = pool_handle else {
-        return Ok(Json(McpToolsResponse { tools: Vec::new() }));
+    let Some(pool_handle) = mcp_pool_handle(&state, query.connect).await? else {
+        return Ok(Json(McpToolsResponse {
+            tools: Vec::new(),
+            connections: Vec::new(),
+        }));
     };
-
     let mut pool = pool_handle.lock().await;
-    if query.connect {
-        let _errors = pool.connect_all().await;
+    if fresh_config
+        .as_ref()
+        .is_some_and(|config| !pool.config_matches(config))
+    {
+        let error =
+            anyhow::anyhow!("MCP configuration changed; reload it before connecting this server");
+        let names = query
+            .server
+            .clone()
+            .map(|name| vec![name])
+            .unwrap_or_else(|| pool.server_names());
+        return Ok(Json(McpToolsResponse {
+            tools: Vec::new(),
+            connections: names
+                .iter()
+                .map(|name| mcp_connection_outcome(&pool, name, Some(&error)))
+                .collect(),
+        }));
     }
+    let errors = if query.connect {
+        if let Some(server) = query.server.as_deref() {
+            match pool.get_or_connect(server).await {
+                Ok(_) => Vec::new(),
+                Err(error) => vec![(server.to_owned(), error)],
+            }
+        } else {
+            pool.connect_all().await
+        }
+    } else {
+        Vec::new()
+    };
+    let mut names = query
+        .server
+        .clone()
+        .map(|name| vec![name])
+        .unwrap_or_else(|| pool.server_names());
+    for (server, _) in &errors {
+        if !names.contains(server) {
+            names.push(server.clone());
+        }
+    }
+    names.sort();
+    let connections = names
+        .iter()
+        .map(|name| {
+            mcp_connection_outcome(
+                &pool,
+                name,
+                errors
+                    .iter()
+                    .find(|(server, _)| server == name)
+                    .map(|(_, error)| error),
+            )
+        })
+        .collect();
 
     let mut tools = Vec::new();
     for (prefixed_name, tool) in pool.all_tools() {
@@ -4019,7 +4400,7 @@ async fn list_mcp_tools(
 
     tools.sort_by(|a, b| a.server.cmp(&b.server).then_with(|| a.name.cmp(&b.name)));
 
-    Ok(Json(McpToolsResponse { tools }))
+    Ok(Json(McpToolsResponse { tools, connections }))
 }
 
 /// `GET /v1/apps/mcp/servers/{name}` — fetch a single server's redacted config.
@@ -4027,34 +4408,26 @@ async fn get_mcp_server(
     State(state): State<RuntimeApiState>,
     Path(name): Path<String>,
 ) -> Result<Json<McpServerDetail>, ApiError> {
-    let mcp_config_path = state.config.read().mcp_config_path();
-    let plugin_registry = state
-        .plugin_discovery
-        .registry_for_workspace(&state.workspace);
-    let config = crate::mcp::load_config_with_workspace_and_plugins(
-        &mcp_config_path,
-        &state.workspace,
-        plugin_registry.as_ref(),
-    )
-    .map_err(|e| ApiError::internal(format!("Failed to load MCP config: {e}")))?;
-
+    let ((config, origins), revision) = mcp_management_snapshot(state.clone()).await?;
     let server_cfg = config
         .servers
         .get(&name)
         .ok_or_else(|| ApiError::not_found(format!("MCP server '{name}' not found")))?;
-
-    let connected = {
-        let pool_slot = state.mcp_pool.lock().await;
-        pool_slot.as_ref().is_some_and(|pool_handle| {
-            pool_handle
-                .try_lock()
-                .is_ok_and(|p| p.connected_servers().contains(&name.as_str()))
-        })
+    let handle = mcp_pool_handle(&state, false).await?;
+    let pool = match handle.as_ref() {
+        Some(handle) => Some(handle.lock().await),
+        None => None,
     };
-
-    Ok(Json(McpServerDetail::from_config(
-        &name, server_cfg, connected,
-    )))
+    let connected = pool
+        .as_ref()
+        .is_some_and(|pool| pool.connected_servers().contains(&name.as_str()));
+    let mut detail = McpServerDetail::from_config(&name, server_cfg, connected, revision);
+    detail.origin = origins.get(&name).copied().unwrap_or("unknown");
+    detail.writable = detail.origin == "global";
+    detail.auth_required = pool
+        .as_ref()
+        .is_some_and(|pool| pool.server_needs_auth(&name));
+    Ok(Json(detail))
 }
 
 /// `POST /v1/apps/mcp/servers` — add a new server to the persistent config.
@@ -4063,6 +4436,7 @@ async fn get_mcp_server(
 /// required top-level `"name"` string that will be the server key.
 async fn create_mcp_server(
     State(state): State<RuntimeApiState>,
+    headers: axum::http::HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> Result<(StatusCode, Json<McpServerDetail>), ApiError> {
     let name = body
@@ -4091,25 +4465,26 @@ async fn create_mcp_server(
             .map_err(|e| ApiError::bad_request(e.to_string()))?;
     }
 
-    let mcp_config_path = state.config.read().mcp_config_path();
-
-    // Build the config entry from the request.
     let new_cfg = mcp_server_config_from_write_request(req, None);
-
-    // Persist to the global MCP config.
-    {
-        let mut cfg = crate::mcp::load_config(&mcp_config_path)
-            .map_err(|e| ApiError::internal(format!("Failed to load MCP config: {e}")))?;
-        if cfg.servers.contains_key(&name) {
-            return Err(ApiError {
-                status: StatusCode::CONFLICT,
-                message: format!("MCP server '{name}' already exists"),
-            });
-        }
-        cfg.servers.insert(name.clone(), new_cfg.clone());
-        crate::mcp::save_config(&mcp_config_path, &cfg)
-            .map_err(|e| ApiError::internal(format!("Failed to save MCP config: {e}")))?;
-    }
+    let target_name = name.clone();
+    let (new_cfg, revision) =
+        mutate_mcp_management(state.clone(), headers, move |state, config| {
+            if mcp_management_config(state)?
+                .0
+                .servers
+                .contains_key(&target_name)
+            {
+                return Err(ApiError {
+                    status: StatusCode::CONFLICT,
+                    message: format!(
+                        "MCP server '{target_name}' already exists in the effective configuration"
+                    ),
+                });
+            }
+            config.servers.insert(target_name, new_cfg.clone());
+            Ok(new_cfg)
+        })
+        .await?;
 
     // Invalidate the in-memory pool so the next tool call reloads from disk.
     {
@@ -4119,7 +4494,9 @@ async fn create_mcp_server(
 
     Ok((
         StatusCode::CREATED,
-        Json(McpServerDetail::from_config(&name, &new_cfg, false)),
+        Json(McpServerDetail::from_config(
+            &name, &new_cfg, false, revision,
+        )),
     ))
 }
 
@@ -4127,6 +4504,7 @@ async fn create_mcp_server(
 async fn update_mcp_server(
     State(state): State<RuntimeApiState>,
     Path(name): Path<String>,
+    headers: axum::http::HeaderMap,
     Json(req): Json<McpServerWriteRequest>,
 ) -> Result<Json<McpServerDetail>, ApiError> {
     if let Some(Some(transport)) = &req.transport {
@@ -4134,26 +4512,41 @@ async fn update_mcp_server(
             .map_err(|e| ApiError::bad_request(e.to_string()))?;
     }
 
-    let mcp_config_path = state.config.read().mcp_config_path();
-
-    let updated_cfg = {
-        let mut cfg = crate::mcp::load_config(&mcp_config_path)
-            .map_err(|e| ApiError::internal(format!("Failed to load MCP config: {e}")))?;
+    let target_name = name.clone();
+    let (updated_cfg, revision) = mutate_mcp_management(state.clone(), headers, move |state, cfg| {
+        let name = target_name;
+        require_writable_mcp_server(state, &name)?;
         let existing = cfg
             .servers
             .get_mut(&name)
             .ok_or_else(|| ApiError::not_found(format!("MCP server '{name}' not found")))?;
+        let previous_target = (
+            existing.command.clone(),
+            existing.args.clone(),
+            existing.url.clone(),
+            existing.transport.clone(),
+        );
         apply_write_request_to_config(req, existing);
+        let target_changed = previous_target
+            != (
+                existing.command.clone(),
+                existing.args.clone(),
+                existing.url.clone(),
+                existing.transport.clone(),
+            );
+        if target_changed && mcp_credential_configured(existing) {
+            return Err(ApiError {
+                status: StatusCode::CONFLICT,
+                message: "Clear this connector's credential configuration before changing its command, arguments, URL, or transport; retained credentials cannot be forwarded to a different target".to_owned(),
+            });
+        }
         if existing.command.is_none() && existing.url.is_none() {
             return Err(ApiError::bad_request(
                 "Either 'command' or 'url' must remain configured for an MCP server",
             ));
         }
-        let updated = existing.clone();
-        crate::mcp::save_config(&mcp_config_path, &cfg)
-            .map_err(|e| ApiError::internal(format!("Failed to save MCP config: {e}")))?;
-        updated
-    };
+        Ok(existing.clone())
+    }).await?;
 
     // Invalidate the in-memory pool.
     {
@@ -4165,6 +4558,7 @@ async fn update_mcp_server(
         &name,
         &updated_cfg,
         false,
+        revision,
     )))
 }
 
@@ -4172,17 +4566,17 @@ async fn update_mcp_server(
 async fn delete_mcp_server(
     State(state): State<RuntimeApiState>,
     Path(name): Path<String>,
+    headers: axum::http::HeaderMap,
 ) -> Result<Json<McpServerActionReceipt>, ApiError> {
-    let mcp_config_path = state.config.read().mcp_config_path();
-
-    crate::mcp::remove_server_config(&mcp_config_path, &name).map_err(|e| {
-        let msg = e.to_string();
-        if msg.contains("not found") {
-            ApiError::not_found(msg)
-        } else {
-            ApiError::internal(msg)
-        }
-    })?;
+    let target_name = name.clone();
+    let (_, revision) = mutate_mcp_management(state.clone(), headers, move |state, cfg| {
+        require_writable_mcp_server(state, &target_name)?;
+        cfg.servers
+            .remove(&target_name)
+            .ok_or_else(|| ApiError::not_found("MCP server not found"))?;
+        Ok(())
+    })
+    .await?;
 
     // Invalidate the in-memory pool.
     {
@@ -4191,9 +4585,11 @@ async fn delete_mcp_server(
     }
 
     Ok(Json(McpServerActionReceipt {
+        revision: Some(revision),
         name,
         action: "deleted",
         ok: true,
+        connection: None,
     }))
 }
 
@@ -4201,17 +4597,20 @@ async fn delete_mcp_server(
 async fn enable_mcp_server(
     State(state): State<RuntimeApiState>,
     Path(name): Path<String>,
+    headers: axum::http::HeaderMap,
 ) -> Result<Json<McpServerActionReceipt>, ApiError> {
-    let mcp_config_path = state.config.read().mcp_config_path();
-
-    crate::mcp::set_server_enabled(&mcp_config_path, &name, true).map_err(|e| {
-        let msg = e.to_string();
-        if msg.contains("not found") {
-            ApiError::not_found(msg)
-        } else {
-            ApiError::internal(msg)
-        }
-    })?;
+    let target_name = name.clone();
+    let (_, revision) = mutate_mcp_management(state.clone(), headers, move |state, cfg| {
+        require_writable_mcp_server(state, &target_name)?;
+        let server = cfg
+            .servers
+            .get_mut(&target_name)
+            .ok_or_else(|| ApiError::not_found("MCP server not found"))?;
+        server.enabled = true;
+        server.disabled = false;
+        Ok(())
+    })
+    .await?;
 
     // Invalidate the in-memory pool so the enabled server participates next time.
     {
@@ -4220,9 +4619,11 @@ async fn enable_mcp_server(
     }
 
     Ok(Json(McpServerActionReceipt {
+        revision: Some(revision),
         name,
         action: "enabled",
         ok: true,
+        connection: None,
     }))
 }
 
@@ -4230,17 +4631,20 @@ async fn enable_mcp_server(
 async fn disable_mcp_server(
     State(state): State<RuntimeApiState>,
     Path(name): Path<String>,
+    headers: axum::http::HeaderMap,
 ) -> Result<Json<McpServerActionReceipt>, ApiError> {
-    let mcp_config_path = state.config.read().mcp_config_path();
-
-    crate::mcp::set_server_enabled(&mcp_config_path, &name, false).map_err(|e| {
-        let msg = e.to_string();
-        if msg.contains("not found") {
-            ApiError::not_found(msg)
-        } else {
-            ApiError::internal(msg)
-        }
-    })?;
+    let target_name = name.clone();
+    let (_, revision) = mutate_mcp_management(state.clone(), headers, move |state, cfg| {
+        require_writable_mcp_server(state, &target_name)?;
+        let server = cfg
+            .servers
+            .get_mut(&target_name)
+            .ok_or_else(|| ApiError::not_found("MCP server not found"))?;
+        server.enabled = false;
+        server.disabled = true;
+        Ok(())
+    })
+    .await?;
 
     // Invalidate the in-memory pool so the disabled server is excluded next time.
     {
@@ -4249,47 +4653,50 @@ async fn disable_mcp_server(
     }
 
     Ok(Json(McpServerActionReceipt {
+        revision: Some(revision),
         name,
         action: "disabled",
         ok: true,
+        connection: None,
     }))
 }
 
-/// `POST /v1/apps/mcp/servers/{name}/reconnect` — drop the cached pool entry
-/// for this server so it re-initializes on the next call that needs tools.
+/// `POST /v1/apps/mcp/servers/{name}/reconnect` — retry only this server and
+/// return the actual result without replacing healthy sibling connections.
 async fn reconnect_mcp_server(
     State(state): State<RuntimeApiState>,
     Path(name): Path<String>,
 ) -> Result<Json<McpServerActionReceipt>, ApiError> {
-    // Verify the server exists in the config.
-    let mcp_config_path = state.config.read().mcp_config_path();
-    let plugin_registry = state
-        .plugin_discovery
-        .registry_for_workspace(&state.workspace);
-    let config = crate::mcp::load_config_with_workspace_and_plugins(
-        &mcp_config_path,
-        &state.workspace,
-        plugin_registry.as_ref(),
-    )
-    .map_err(|e| ApiError::internal(format!("Failed to load MCP config: {e}")))?;
-
+    let (config, _) = mcp_management_config(&state)?;
     if !config.servers.contains_key(&name) {
         return Err(ApiError::not_found(format!(
             "MCP server '{name}' not found"
         )));
     }
-
-    // Drop the whole pool so the next connect_all call recreates all
-    // connections from the current on-disk config.
-    {
-        let mut pool_slot = state.mcp_pool.lock().await;
-        *pool_slot = None;
-    }
-
+    let handle = mcp_pool_handle(&state, true)
+        .await?
+        .ok_or_else(|| ApiError::internal("MCP pool unavailable"))?;
+    let mut pool = handle.lock().await;
+    let error = if !config.servers[&name].is_enabled() {
+        Some(anyhow::anyhow!("MCP server '{name}' is disabled"))
+    } else if !pool.config_matches(&config) {
+        Some(anyhow::anyhow!(
+            "MCP configuration changed; reload it before retrying this server"
+        ))
+    } else {
+        pool.retry_connection(&name).await.err()
+    };
+    let connection = mcp_connection_outcome(&pool, &name, error.as_ref());
     Ok(Json(McpServerActionReceipt {
+        revision: None,
         name,
-        action: "reconnect_scheduled",
-        ok: true,
+        action: if error.is_none() {
+            "reconnected"
+        } else {
+            "reconnect_failed"
+        },
+        ok: error.is_none() && connection.connected,
+        connection: Some(connection),
     }))
 }
 
@@ -4324,6 +4731,18 @@ fn mcp_server_config_from_write_request(
         runtime_added: false,
         allow_private_network: false,
     }
+}
+
+/// Nonsecret indicator and retargeting guard. Treat environment and OAuth
+/// configuration as authority even when it only references a credential.
+fn mcp_credential_configured(cfg: &crate::mcp::McpServerConfig) -> bool {
+    !cfg.env.is_empty()
+        || !cfg.headers.is_empty()
+        || !cfg.env_headers.is_empty()
+        || cfg.bearer_token_env_var.is_some()
+        || cfg.oauth.is_some()
+        || !cfg.scopes.is_empty()
+        || cfg.oauth_resource.is_some()
 }
 
 /// Apply a partial update from a PATCH request onto an existing config entry.
@@ -4788,7 +5207,12 @@ async fn update_thread(
 ) -> Result<Json<ThreadRecord>, ApiError> {
     let thread = state
         .runtime_threads
-        .update_thread(&id, req)
+        .update_thread_with_shell_policy(
+            &id,
+            req,
+            state.config_path.as_deref(),
+            state.config_profile.as_deref(),
+        )
         .await
         .map_err(map_thread_err)?;
     Ok(Json(thread))
@@ -5333,9 +5757,9 @@ async fn start_thread_turn(
     Path(id): Path<String>,
     Json(req): Json<StartTurnRequest>,
 ) -> Result<(StatusCode, Json<StartTurnResponse>), ApiError> {
-    let turn = state
+    let (turn, replayed) = state
         .runtime_threads
-        .start_turn(&id, req)
+        .start_turn_reporting_replay(&id, req)
         .await
         .map_err(map_thread_err)?;
     let thread = state
@@ -5343,9 +5767,22 @@ async fn start_thread_turn(
         .get_thread(&id)
         .await
         .map_err(map_thread_err)?;
+    // A replay acknowledges work already accepted rather than admitting new
+    // work: 200 tells the client "this is the turn I already started", which
+    // is what lets an ambiguous submit resolve without duplicate messages or
+    // tools. A fresh admission stays 201.
+    let status = if replayed {
+        StatusCode::OK
+    } else {
+        StatusCode::CREATED
+    };
     Ok((
-        StatusCode::CREATED,
-        Json(StartTurnResponse { thread, turn }),
+        status,
+        Json(StartTurnResponse {
+            thread,
+            turn,
+            idempotent_replay: replayed,
+        }),
     ))
 }
 
@@ -5528,7 +5965,11 @@ async fn compact_thread(
         .map_err(map_thread_err)?;
     Ok((
         StatusCode::ACCEPTED,
-        Json(StartTurnResponse { thread, turn }),
+        Json(StartTurnResponse {
+            thread,
+            turn,
+            idempotent_replay: false,
+        }),
     ))
 }
 
@@ -5809,12 +6250,21 @@ async fn stream_thread_events(
     State(state): State<RuntimeApiState>,
     Path(id): Path<String>,
     Query(query): Query<ThreadEventsQuery>,
+    headers: HeaderMap,
 ) -> Result<Response, ApiError> {
     let _ = state
         .runtime_threads
         .get_thread(&id)
         .await
         .map_err(map_thread_err)?;
+
+    // Two clients, two cursors. A browser `EventSource` can only replay through
+    // the `Last-Event-ID` header it sets on reconnect (the ids now ride the
+    // journal frames below); every other client passes `since_seq`. An explicit
+    // query cursor wins over the header, so a deliberate replay-from-zero is
+    // never silently overridden by a stale header — the header is the fallback
+    // when no cursor was asked for.
+    let since_seq = query.since_seq.or_else(|| last_event_id(&headers));
 
     // Subscribe before reading durable history. An event emitted while replay
     // is loaded is then present in both places (and deduped below) or queued
@@ -5830,7 +6280,7 @@ async fn stream_thread_events(
     }
     let replay = state
         .runtime_threads
-        .replay_events(&id, query.since_seq, query.replay_limit)
+        .replay_events(&id, since_seq, query.replay_limit)
         .await
         .map_err(|e| ApiError::internal(e.to_string()))?;
 
@@ -5903,7 +6353,8 @@ fn replay_live_thread_events(
                 yield Ok(sse_json(
                     &event_name,
                     runtime_event_payload_with_previous(event, previous_seq),
-                ));
+                )
+                .id(last_seq.to_string()));
             }
         }
 
@@ -5937,7 +6388,8 @@ fn replay_live_thread_events(
                     yield Ok(sse_json(
                         &event_name,
                         runtime_event_payload_with_previous(event, previous_seq),
-                    ));
+                    )
+                    .id(last_seq.to_string()));
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
                     if progress {
@@ -5987,7 +6439,8 @@ fn replay_live_thread_events(
                             yield Ok(sse_json(
                                 &event_name,
                                 runtime_event_payload_with_previous(event, previous_seq),
-                            ));
+                            )
+                            .id(last_seq.to_string()));
                         }
                     }
                 }
@@ -6521,6 +6974,19 @@ fn map_compat_stream_event(event: &crate::runtime_threads::RuntimeEventRecord) -
 fn sse_json(event: &str, payload: serde_json::Value) -> SseEvent {
     let data = serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string());
     SseEvent::default().event(event).data(data)
+}
+
+/// Read a `Last-Event-ID` cursor off the request.
+///
+/// Only a decimal sequence number is ours. Anything else is ignored rather
+/// than rejected: an opaque id from a proxy or an older client should start
+/// the stream from the durable head, not fail to open it — a refused stream
+/// looks like an outage to a reconnecting client.
+fn last_event_id(headers: &HeaderMap) -> Option<u64> {
+    headers
+        .get("last-event-id")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
 }
 
 fn truncate_text(text: &str, max_chars: usize) -> String {
@@ -7367,44 +7833,54 @@ pub(crate) fn runtime_chat_relay_catalog(
 async fn list_providers(
     State(state): State<RuntimeApiState>,
 ) -> Result<Json<ProvidersResponse>, ApiError> {
-    let config = state.config.read().clone();
-    let active_provider = config.api_provider();
-    let active_identity = config
-        .active_provider_identity(active_provider)
-        .map_err(ApiError::bad_request)?;
-    let current = active_provider.as_str().to_string();
-    let mut providers = Vec::new();
-    for api_provider in ApiProvider::sorted_for_display() {
-        let default_model = provider_default_model_for_api(&config, active_provider, api_provider);
-        let identity = config.provider_identity_for(api_provider);
-        let base_url = config.base_url_for_route_identity(api_provider, &identity);
-        let has_model_catalog = !crate::provider_lake::configured_catalog_models_for_route(
-            &config,
-            api_provider,
-            &identity,
-            &base_url,
-        )
-        .is_empty();
-        let writeability = secrets::credential_writeability(&config, api_provider);
-        providers.push(ProviderEntry {
-            id: api_provider.as_str().to_string(),
-            model_provider_id: (api_provider == active_provider)
-                .then(|| active_identity.persisted_id().map(str::to_string))
-                .flatten(),
-            display_name: api_provider.display_name().to_string(),
-            default_model,
-            has_model_catalog,
-            credential_state: crate::provider_readiness::credential_state_for_provider(
+    #[cfg(test)]
+    let env_ticket = crate::test_support::env_scope_ticket();
+    tokio::task::spawn_blocking(move || {
+        #[cfg(test)]
+        let _membership = crate::test_support::join_env_scope(env_ticket);
+        let config = state.config.read().clone();
+        secrets::invalidate_stale_account_catalog(&config);
+        let active_provider = config.api_provider();
+        let active_identity = config
+            .active_provider_identity(active_provider)
+            .map_err(ApiError::bad_request)?;
+        let current = active_provider.as_str().to_string();
+        let mut providers = Vec::new();
+        for api_provider in ApiProvider::sorted_for_display() {
+            let default_model =
+                provider_default_model_for_api(&config, active_provider, api_provider);
+            let identity = config.provider_identity_for(api_provider);
+            let base_url = config.base_url_for_route_identity(api_provider, &identity);
+            let has_model_catalog = !crate::provider_lake::configured_catalog_models_for_route(
                 &config,
                 api_provider,
+                &identity,
+                &base_url,
             )
-            .into(),
-            credential_source: writeability.source,
-            credential_writable: writeability.writable,
-            credential_writable_reason: writeability.reason,
-        });
-    }
-    Ok(Json(ProvidersResponse { current, providers }))
+            .is_empty();
+            let writeability = secrets::credential_writeability(&config, api_provider);
+            providers.push(ProviderEntry {
+                id: api_provider.as_str().to_string(),
+                model_provider_id: (api_provider == active_provider)
+                    .then(|| active_identity.persisted_id().map(str::to_string))
+                    .flatten(),
+                display_name: api_provider.display_name().to_string(),
+                default_model,
+                has_model_catalog,
+                credential_state: crate::provider_readiness::credential_state_for_provider(
+                    &config,
+                    api_provider,
+                )
+                .into(),
+                credential_source: writeability.source,
+                credential_writable: writeability.writable,
+                credential_writable_reason: writeability.reason,
+            });
+        }
+        Ok(Json(ProvidersResponse { current, providers }))
+    })
+    .await
+    .map_err(|_| ApiError::internal("Provider listing failed"))?
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -7423,13 +7899,12 @@ struct ListProviderModelsParams {
     limit: Option<usize>,
 }
 
-async fn list_provider_models(
-    State(state): State<RuntimeApiState>,
-    Path(id): Path<String>,
-    Query(params): Query<ListProviderModelsParams>,
-) -> Result<Json<ProviderModelsResponse>, ApiError> {
-    let mut config = state.config.read().clone();
-    let api_provider = ApiProvider::parse(&id)
+fn provider_models_identity(
+    config: &Config,
+    id: &str,
+    exact_id: Option<&str>,
+) -> Result<(ApiProvider, Option<crate::config::ProviderIdentity>), ApiError> {
+    let api_provider = ApiProvider::parse(id)
         .ok_or_else(|| ApiError::bad_request(format!("Unknown provider id '{id}'")))?;
     // Reject requests for the legacy deepseek-cn alias that has no
     // ProviderKind metadata — the GUI should use `deepseek` instead.
@@ -7438,7 +7913,7 @@ async fn list_provider_models(
             "provider 'deepseek-cn' is a legacy alias; use 'deepseek' instead",
         ));
     }
-    let route_fingerprint = if let Some(exact_id) = params.model_provider_id.as_deref() {
+    let identity = if let Some(exact_id) = exact_id {
         if exact_id.is_empty()
             || exact_id != exact_id.trim()
             || exact_id.chars().any(char::is_control)
@@ -7455,26 +7930,84 @@ async fn list_provider_models(
                 "model_provider_id does not match this provider route",
             ));
         }
-        config.scope_to_provider_identity(&identity);
-        // Do not expose the endpoint in an opaque cursor. Its hash binds even
-        // identical catalogs under distinct named routes or a changed base URL.
-        let route = serde_json::to_vec(&(
-            api_provider.as_str(),
-            exact_id,
-            config.base_url_for_route_identity(api_provider, &identity.key),
-        ))
-        .map_err(|error| {
-            ApiError::internal(format!("Could not fingerprint provider route: {error}"))
-        })?;
-        Some(crate::hashing::sha256_hex(route))
+        Some(identity)
     } else {
         None
     };
-    let models = provider_models_for_api(&config, config.api_provider(), api_provider)
-        .into_iter()
-        .map(|id| provider_model_entry_for_api(&config, api_provider, id))
-        .collect();
-    paginate_provider_models(api_provider.as_str(), models, &params, route_fingerprint).map(Json)
+    Ok((api_provider, identity))
+}
+
+async fn list_provider_models(
+    State(state): State<RuntimeApiState>,
+    Path(id): Path<String>,
+    Query(params): Query<ListProviderModelsParams>,
+) -> Result<Json<ProviderModelsResponse>, ApiError> {
+    #[cfg(test)]
+    let env_ticket = crate::test_support::env_scope_ticket();
+    tokio::task::spawn_blocking(move || {
+        #[cfg(test)]
+        let _membership = crate::test_support::join_env_scope(env_ticket);
+        let mut config = state.config.read().clone();
+        secrets::invalidate_stale_account_catalog(&config);
+        let (api_provider, identity) =
+            provider_models_identity(&config, &id, params.model_provider_id.as_deref())?;
+        let route_fingerprint = if let Some(identity) = identity {
+            config.scope_to_provider_identity(&identity);
+            let route = serde_json::to_vec(&(
+                api_provider.as_str(),
+                params.model_provider_id.as_deref(),
+                config.base_url_for_route_identity(api_provider, &identity.key),
+            ))
+            .map_err(|error| {
+                ApiError::internal(format!("Could not fingerprint provider route: {error}"))
+            })?;
+            Some(crate::hashing::sha256_hex(route))
+        } else {
+            None
+        };
+        let models = provider_models_for_api(&config, config.api_provider(), api_provider)
+            .into_iter()
+            .map(|id| provider_model_entry_for_api(&config, api_provider, id))
+            .collect();
+        paginate_provider_models(api_provider.as_str(), models, &params, route_fingerprint)
+            .map(Json)
+    })
+    .await
+    .map_err(|_| ApiError::internal("Provider model listing failed"))?
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RefreshProviderModelsParams {
+    model_provider_id: Option<String>,
+}
+
+async fn refresh_provider_models(
+    State(state): State<RuntimeApiState>,
+    Path(id): Path<String>,
+    Query(params): Query<RefreshProviderModelsParams>,
+) -> Result<Json<crate::provider_lake::CatalogUpdateReceipt>, ApiError> {
+    let runtime = tokio::runtime::Handle::current();
+    #[cfg(test)]
+    let env_ticket = crate::test_support::env_scope_ticket();
+    tokio::task::spawn_blocking(move || {
+        #[cfg(test)]
+        let _membership = crate::test_support::join_env_scope(env_ticket);
+        let config = state.config.read().clone();
+        let (provider, exact) =
+            provider_models_identity(&config, &id, params.model_provider_id.as_deref())?;
+        let identity = match exact {
+            Some(identity) => identity,
+            None => config
+                .active_provider_identity(provider)
+                .map_err(ApiError::bad_request)?,
+        };
+        Ok(Json(runtime.block_on(
+            crate::provider_lake::update_provider_catalog(&config, &identity),
+        )))
+    })
+    .await
+    .map_err(|_| ApiError::internal("Provider model refresh failed"))?
 }
 
 /// Request body for `POST /v1/providers/{id}/switch`.
@@ -7597,8 +8130,9 @@ async fn switch_provider(
     // swap in the new config. A failure here means an active thread's
     // route is invalid under the new provider — surface it so the GUI can
     // tell the user to fix their config.
-    let reloaded = Config::load(state.config_path.clone(), state.config_profile.as_deref())
+    let mut reloaded = Config::load(state.config_path.clone(), state.config_profile.as_deref())
         .map_err(|e| ApiError::internal(format!("Failed to reload config: {e}")))?;
+    reloaded.account_model_access = state.config.read().account_model_access.clone();
     state
         .runtime_threads
         .reload_config(reloaded.clone())
@@ -8312,12 +8846,16 @@ async fn get_settings_schema(
 
     // Raw config.toml for `persisted` on config-owned rows. A missing or
     // unparsable file means nothing was persisted there — the live config
-    // still serves defaults through `value`.
-    let config_document = state
-        .config_path
-        .as_deref()
-        .and_then(|path| std::fs::read_to_string(path).ok())
-        .and_then(|body| toml::from_str::<toml::Value>(&body).ok());
+    // still serves defaults through `value`. This is an async axum route, so
+    // the read rides the blocking pool instead of parking a Tokio worker
+    // (#6149).
+    let config_document = match state.config_path.as_deref() {
+        Some(path) => tokio::fs::read_to_string(path)
+            .await
+            .ok()
+            .and_then(|body| toml::from_str::<toml::Value>(&body).ok()),
+        None => None,
+    };
     let notifications_persisted = |key: &str| -> Option<bool> {
         let setting = NotificationSetting::parse(key)?;
         let document = config_document.as_ref()?;
@@ -8575,8 +9113,9 @@ fn normalize_runtime_config_model(
 async fn reload_config(
     State(state): State<RuntimeApiState>,
 ) -> Result<Json<ReloadConfigResponse>, ApiError> {
-    let reloaded = Config::load(state.config_path.clone(), state.config_profile.as_deref())
+    let mut reloaded = Config::load(state.config_path.clone(), state.config_profile.as_deref())
         .map_err(|e| ApiError::internal(format!("Failed to reload config: {e}")))?;
+    reloaded.account_model_access = state.config.read().account_model_access.clone();
     state
         .runtime_threads
         .reload_config(reloaded.clone())
@@ -8917,6 +9456,7 @@ fn cors_layer(extra_origins: &[String]) -> CorsLayer {
             header::AUTHORIZATION,
             header::CONTENT_TYPE,
             header::ACCEPT,
+            header::IF_MATCH,
             HeaderName::from_static("x-codewhale-runtime-token"),
             HeaderName::from_static("x-deepseek-runtime-token"),
         ])
@@ -8949,7 +9489,10 @@ fn map_thread_err(err: anyhow::Error) -> ApiError {
         || lower.starts_with("thread not found:")
     {
         ApiError::not_found(message)
+    } else if message.starts_with("shell commands are restricted by ") {
+        ApiError::forbidden(message)
     } else if message.contains("already has an active turn")
+        || message.contains("thread permissions changed during update")
         || message.contains("No active turn")
         || message.contains("is not active")
         // A steer the engine dropped: the turn moved on before the model saw

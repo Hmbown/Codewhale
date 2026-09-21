@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "runtimeVersion": "0.9.14",
+  "runtimeVersion": "0.10.0",
   "routes": [
     {
       "id": "anthropic",
@@ -121,6 +121,24 @@
         }
       ],
       "transport": "open-ai-responses"
+    },
+    {
+      "id": "csdn",
+      "family": "csdn",
+      "label": "CSDN",
+      "endpoint": "https://ai.csdn.net/api/model/v1",
+      "wire": "chat-completions",
+      "defaultModel": "glm_for_coding",
+      "envVars": [
+        "CSDN_API_KEY"
+      ],
+      "auth": [
+        {
+          "kind": "api-key",
+          "label": "API key"
+        }
+      ],
+      "transport": "chat-completions"
     },
     {
       "id": "custom",
@@ -1052,6 +1070,21 @@
         {
           "kind": "api-key",
           "label": "API key"
+        }
+      ],
+      "models": [
+        {
+          "id": "step-3.5-flash"
+        },
+        {
+          "id": "step-3.5-flash-2603"
+        },
+        {
+          "id": "step-3.7-flash",
+          "default": true
+        },
+        {
+          "id": "step-5-preview"
         }
       ],
       "transport": "chat-completions"

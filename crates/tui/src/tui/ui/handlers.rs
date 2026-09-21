@@ -50,6 +50,27 @@ pub(crate) fn refresh_parked_fleet_roster(app: &mut App, config: &Config) {
     app.view_stack.push_boxed(view);
 }
 
+pub(super) fn dismiss_fleet_assignment(app: &mut App, editor_id: uuid::Uuid) {
+    if let Some(mut boxed) = app.view_stack.pop() {
+        let remove = if let Some(view) = boxed
+            .as_any_mut()
+            .downcast_mut::<crate::tui::views::fleet_setup::FleetSetupView>(
+        ) {
+            view.route_selection(editor_id).is_some()
+        } else if let Some(view) = boxed
+            .as_any_mut()
+            .downcast_mut::<crate::tui::views::fleet_detail::FleetDetailView>(
+        ) {
+            view.is_direct_assignment(editor_id)
+        } else {
+            false
+        };
+        if !remove {
+            app.view_stack.push_boxed(boxed);
+        }
+    }
+}
+
 /// Once per event-loop iteration: deliver a pending fleet mutation to the
 /// engine and clear the flag.
 pub(crate) fn flush_stale_fleet_roster(
@@ -672,6 +693,7 @@ pub(crate) async fn handle_mcp_ui_action(
     let snapshot_live_pool = matches!(&action, crate::tui::app::McpUiAction::Show);
     let discover = mcp_ui_action_refreshes_discovery(&action);
 
+    let approve_import = matches!(&action, crate::tui::app::McpUiAction::ImportApprove { .. });
     let action_result = match action {
         crate::tui::app::McpUiAction::Diagnose { name } => {
             let receipt = mcp_server_diagnosis(app, &name);
@@ -765,27 +787,47 @@ pub(crate) async fn handle_mcp_ui_action(
             })
         }
         crate::tui::app::McpUiAction::ImportList => {
-            let text = mcp_external_import_status_text(&app.workspace);
-            message = Some(text);
-            Ok(())
-        }
-        crate::tui::app::McpUiAction::ImportApprove { name } => {
-            match mcp_import_apply(&app.workspace, &path, &name, true) {
-                Ok(msg) => {
-                    changed = msg.contains("Imported");
-                    message = Some(msg);
+            let path = path.clone();
+            let workspace = app.workspace.clone();
+            let plugins = app.plugin_registry.clone();
+            #[cfg(test)]
+            let ticket = crate::test_support::env_scope_ticket();
+            match tokio::task::spawn_blocking(move || {
+                #[cfg(test)]
+                let _membership = crate::test_support::join_env_scope(ticket);
+                mcp_external_import_status_text(&workspace, &path, plugins.as_ref())
+            })
+            .await
+            {
+                Ok(text) => {
+                    message = Some(text);
                     Ok(())
                 }
-                Err(err) => Err(err),
+                Err(_) => Err(anyhow::anyhow!("MCP import preview failed")),
             }
         }
-        crate::tui::app::McpUiAction::ImportDecline { name } => {
-            match mcp_import_apply(&app.workspace, &path, &name, false) {
-                Ok(msg) => {
+        crate::tui::app::McpUiAction::ImportApprove { name }
+        | crate::tui::app::McpUiAction::ImportDecline { name } => {
+            let approve = approve_import;
+            let path = path.clone();
+            let workspace = app.workspace.clone();
+            let plugins = app.plugin_registry.clone();
+            #[cfg(test)]
+            let ticket = crate::test_support::env_scope_ticket();
+            match tokio::task::spawn_blocking(move || {
+                #[cfg(test)]
+                let _membership = crate::test_support::join_env_scope(ticket);
+                mcp_import_apply(&workspace, &path, plugins.as_ref(), &name, approve)
+            })
+            .await
+            {
+                Ok(Ok(msg)) => {
+                    changed = approve;
                     message = Some(msg);
                     Ok(())
                 }
-                Err(err) => Err(err),
+                Ok(Err(err)) => Err(err),
+                Err(_) => Err(anyhow::anyhow!("MCP import failed")),
             }
         }
         crate::tui::app::McpUiAction::Validate | crate::tui::app::McpUiAction::Reload => Ok(()),
@@ -1260,6 +1302,15 @@ pub(crate) async fn handle_view_events(
                     {
                         return Ok(true);
                     }
+                    // A command review confirmed over the Extensions panel
+                    // (the plugin trust digest) closes its pager and lands
+                    // back on the list, which must show the state the
+                    // confirmation just changed.
+                    if app.view_stack.extensions_is_top() {
+                        let snapshot =
+                            crate::tui::views::extensions::ExtensionsSnapshot::from_app(app);
+                        app.view_stack.refresh_extensions(snapshot);
+                    }
                 }
                 crate::tui::views::CommandPaletteAction::InsertText { text } => {
                     app.input = text;
@@ -1497,7 +1548,7 @@ pub(crate) async fn handle_view_events(
                             content: loaded_message.clone(),
                         });
                         app.status_message = Some(loaded_message);
-                        app.launch.visible = false;
+                        app.launch.dismiss();
                         app.launch.status = None;
                     }
                     Err(err) => {
@@ -1683,6 +1734,84 @@ pub(crate) async fn handle_view_events(
                 )
                 .await;
             }
+            ViewEvent::FleetRosterOpenCoordinatorRequested => {
+                app.view_stack.push(
+                    crate::tui::model_picker::ModelPickerView::new(app, config)
+                        .with_assignment_context("Coordinator", "Current session"),
+                );
+            }
+            ViewEvent::FleetProfileRoutePickRequested { editor_id } => {
+                if app.view_stack.top_kind() == Some(ModalKind::FleetSetup)
+                    && let Some(mut boxed) = app.view_stack.pop()
+                {
+                    let selection = boxed
+                        .as_any_mut()
+                        .downcast_mut::<crate::tui::views::fleet_setup::FleetSetupView>()
+                        .and_then(|view| {
+                            view.route_selection(editor_id)
+                                .map(|selection| (selection, view.assignment_context()))
+                        });
+                    app.view_stack.push_boxed(boxed);
+                    if let Some((selection, (role, scope))) = selection {
+                        app.view_stack.push(
+                            crate::tui::model_picker::ModelPickerView::new_for_fleet_profile(
+                                app, config, editor_id, selection,
+                            )
+                            .with_assignment_context(role, scope),
+                        );
+                    }
+                }
+            }
+            ViewEvent::FleetProfileRoutePicked {
+                editor_id,
+                provider,
+                provider_id,
+                model,
+                reasoning,
+            } => {
+                if app.view_stack.top_kind() == Some(ModalKind::FleetSetup)
+                    && let Some(mut boxed) = app.view_stack.pop()
+                {
+                    if let Some(view) = boxed
+                        .as_any_mut()
+                        .downcast_mut::<crate::tui::views::fleet_setup::FleetSetupView>(
+                    ) {
+                        view.accept_route(
+                            editor_id,
+                            provider_id.unwrap_or_else(|| provider.as_str().into()),
+                            model,
+                            reasoning,
+                        );
+                    }
+                    app.view_stack.push_boxed(boxed);
+                }
+            }
+            ViewEvent::FleetProfileRouteCommitRequested { editor_id } => {
+                if app.view_stack.top_kind() == Some(ModalKind::FleetSetup)
+                    && let Some(mut boxed) = app.view_stack.pop()
+                {
+                    let result = boxed
+                        .as_any_mut()
+                        .downcast_mut::<crate::tui::views::fleet_setup::FleetSetupView>()
+                        .map(|view| view.commit_route_assignment(editor_id, app, config));
+                    match result {
+                        Some(Ok(message)) => {
+                            sync_fleet_roster(app, config, engine_handle);
+                            refresh_parked_fleet_roster(app, config);
+                            app.push_status_toast(message, StatusToastLevel::Success, Some(8_000));
+                        }
+                        Some(Err(reason)) => {
+                            app.view_stack.push_boxed(boxed);
+                            app.set_sticky_status(reason, StatusToastLevel::Error, None);
+                        }
+                        None => app.view_stack.push_boxed(boxed),
+                    }
+                }
+            }
+            ViewEvent::FleetAssignmentPickerDismissed { editor_id } => {
+                dismiss_fleet_assignment(app, editor_id);
+                refresh_parked_fleet_roster(app, config);
+            }
             ViewEvent::FleetRosterOpenSetupRequested { member_id } => {
                 // The shared router opens the selected v2 Fleet's exact editor
                 // (focused on this member) or the legacy wizard when no named
@@ -1717,17 +1846,21 @@ pub(crate) async fn handle_view_events(
                     let selection = editor
                         .as_any_mut()
                         .downcast_mut::<crate::tui::views::fleet_detail::FleetDetailView>()
-                        .and_then(|view| view.route_selection(editor_id, target));
+                        .and_then(|view| {
+                            view.route_selection(editor_id, target)
+                                .map(|selection| (selection, view.assignment_context()))
+                        });
                     app.view_stack.push_boxed(editor);
                     selection
                 } else {
                     None
                 };
-                if let Some(selection) = selection {
+                if let Some((selection, (role, scope))) = selection {
                     app.view_stack.push(
                         crate::tui::model_picker::ModelPickerView::new_for_fleet_route(
                             app, config, target, editor_id, selection,
-                        ),
+                        )
+                        .with_assignment_context(role, scope),
                     );
                 }
             }
@@ -1766,6 +1899,13 @@ pub(crate) async fn handle_view_events(
                     app.view_stack.push_boxed(boxed);
                     match outcome {
                         Some(Ok(message)) => {
+                            if let Some(mut editor) = app.view_stack.pop() {
+                                let direct = editor.as_any_mut().downcast_mut::<crate::tui::views::fleet_detail::FleetDetailView>()
+                                    .is_some_and(|view| view.is_direct_assignment(editor_id));
+                                if !direct {
+                                    app.view_stack.push_boxed(editor);
+                                }
+                            }
                             app.push_status_toast(message, StatusToastLevel::Success, Some(8_000));
                             sync_fleet_roster(app, config, engine_handle);
                             refresh_parked_fleet_roster(app, config);
@@ -2177,6 +2317,7 @@ pub(crate) async fn handle_view_events(
                     save_as_startup_default,
                 )
                 .await;
+                refresh_parked_fleet_roster(app, config);
             }
             ViewEvent::ModelPickerDismissed {
                 catalog_view,
@@ -2189,6 +2330,7 @@ pub(crate) async fn handle_view_events(
                     view: Some(view),
                     selected_row_id,
                 });
+                refresh_parked_fleet_roster(app, config);
             }
             ViewEvent::ModelPickerRefresh => {
                 // Re-resolve readiness from the live credential state and
@@ -2584,13 +2726,16 @@ pub(crate) async fn handle_view_events(
                     update_backtrack_overlay_selection(app, idx);
                 }
             }
-            // The launch card's resume confirmation was accepted. Hand it to
-            // the same pending-action path the card's own Enter uses, so the
-            // resume runs through one code path rather than two.
+            // Apply the accepted choice now, for keyboard and mouse alike.
+            // Parking it in pending_launch_action left keyboard confirmation
+            // waiting for an unrelated mouse event to drain that queue.
             ViewEvent::LaunchResumeConfirmed { session_id } => {
-                app.pending_launch_action = Some(
-                    crate::tui::underwater::LaunchAction::ResumeSession(session_id),
-                );
+                let result = resume_launch_session(app, &session_id);
+                if apply_command_result(terminal, app, engine_handle, task_manager, config, result)
+                    .await?
+                {
+                    return Ok(true);
+                }
                 app.needs_redraw = true;
             }
             ViewEvent::BacktrackConfirm => {

@@ -4405,7 +4405,10 @@ exit 0
 
         let (primary_status, standby_status) = rt
             .block_on(async {
-                tokio::time::timeout(Duration::from_secs(5), async {
+                // This proves launch ownership, not a five-second latency SLA.
+                // Allow the same process/ledger headroom as the restart tests:
+                // loaded CI can spend the old deadline scheduling the fake child.
+                tokio::time::timeout(Duration::from_secs(15), async {
                     tokio::join!(
                         manager.run_to_completion(
                             &report.run_id,
@@ -4427,7 +4430,15 @@ exit 0
                 })
                 .await
             })
-            .expect("competing Fleet managers did not converge");
+            .unwrap_or_else(|error| {
+                panic!(
+                    "competing Fleet managers did not converge: {error}; status={:?}; primary={:?}; standby={:?}; starts={:?}",
+                    manager.run_status(&report.run_id),
+                    primary_executor.worker_ids(),
+                    standby_executor.worker_ids(),
+                    std::fs::read_to_string(&starts),
+                )
+            });
 
         assert_eq!(primary_status.unwrap().completed, 1);
         assert_eq!(standby_status.unwrap().completed, 1);

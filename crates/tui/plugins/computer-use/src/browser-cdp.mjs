@@ -50,17 +50,23 @@ export function findBrowserApp(platform = process.platform, env = process.env, e
   if (platform === "darwin") {
     for (const name of APPLICATIONS) {
       for (const root of ["/Applications", path.join(os.homedir(), "Applications")]) {
-        const candidate = path.join(root, `${name}.app`);
+        const candidate = path.posix.join(root, `${name}.app`);
         if (exists(candidate)) return candidate;
       }
     }
     return null;
   }
   if (platform === "win32") {
-    for (const name of APPLICATIONS) {
-      for (const root of [env["ProgramFiles"], env["ProgramFiles(x86)"], env.LOCALAPPDATA ? path.join(env.LOCALAPPDATA, "Programs") : null]) {
+    const installs = [
+      ["Google", "Chrome", "Application", "chrome.exe"],
+      ["Chromium", "Application", "chrome.exe"],
+      ["BraveSoftware", "Brave-Browser", "Application", "brave.exe"],
+      ["Microsoft", "Edge", "Application", "msedge.exe"],
+    ];
+    for (const relative of installs) {
+      for (const root of [env.ProgramFiles, env["ProgramFiles(x86)"], env.LOCALAPPDATA]) {
         if (!root) continue;
-        const candidate = path.join(root, name, "Application", name === "Microsoft Edge" ? "msedge.exe" : "chrome.exe");
+        const candidate = path.win32.join(root, ...relative);
         if (exists(candidate)) return candidate;
       }
     }

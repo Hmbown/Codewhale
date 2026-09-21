@@ -242,7 +242,7 @@ fn parse_scope_args(args: &str) -> Result<(Option<SkillTargetScope>, &str), Stri
 pub(in crate::commands) const SKILLS_INFO: CommandInfo = CommandInfo {
     name: "skills",
     aliases: &["jinengliebiao"],
-    usage: "/skills [--remote|sync|inspect|suggest <task>|<prefix>]  (bare opens manager)",
+    usage: "/skills [manage|--remote|sync|inspect|suggest <task>|<prefix>]  (bare opens Extensions)",
     description_key: "cmd_skills_description",
 };
 
@@ -270,11 +270,14 @@ fn skills_contextual(contexts: CommandContexts<'_>, arg: Option<&str>) -> Comman
     list_skills(skill_group, arg)
 }
 
-/// Portable `/skills` dispatch — byte-identical to the baseline handler.
+/// Shared inventory entry, with the dedicated mutation manager kept at `/skills manage`.
 fn list_skills(group: &mut dyn CommandSkillGroupContext, arg: Option<&str>) -> CommandResult {
     let mut prefix: Option<String> = None;
     if let Some(arg) = arg {
         let trimmed = arg.trim();
+        if trimmed == "manage" {
+            return CommandResult::action(AppAction::OpenSkillsManager);
+        }
         if trimmed == "--remote" || trimmed == "remote" {
             return list_remote_skills(group);
         }
@@ -307,8 +310,10 @@ fn list_skills(group: &mut dyn CommandSkillGroupContext, arg: Option<&str>) -> C
             prefix = Some(trimmed.to_ascii_lowercase());
         }
     } else {
-        // Bare `/skills` opens the unified manager (owned-only, zero network).
-        return CommandResult::action(AppAction::OpenSkillsManager);
+        // Bare inventory is owned-only and performs no network requests.
+        return CommandResult::action(AppAction::OpenExtensions {
+            tab: crate::tui::views::extensions::ExtensionsTab::Skills,
+        });
     }
 
     let projection = group.skill_registry_projection();
@@ -1067,11 +1072,20 @@ mod tests {
     // ── /skills parity ────────────────────────────────────────────────────
 
     #[test]
-    fn bare_skills_opens_manager_action() {
+    fn bare_skills_opens_extensions_and_manage_keeps_mutation_manager() {
         let mut group = FakeSkillGroup::new(vec![demo_entry()]);
         let result = list_skills(&mut group, None);
         assert!(result.message.is_none());
-        assert!(matches!(result.action, Some(AppAction::OpenSkillsManager)));
+        assert!(matches!(
+            result.action,
+            Some(AppAction::OpenExtensions {
+                tab: crate::tui::views::extensions::ExtensionsTab::Skills
+            })
+        ));
+        assert!(matches!(
+            list_skills(&mut group, Some("manage")).action,
+            Some(AppAction::OpenSkillsManager)
+        ));
     }
 
     #[test]

@@ -1,77 +1,35 @@
 # Status-bar color grammar
 
-The full-screen TUI already speaks a **color vocabulary**. This note names
-that vocabulary so chrome cannot pick up an eighth meaning, or spend true
-red on something that is not a failure.
+Status-bar ink goes through `crates/palette/src/grammar.rs` (`SemanticFamily`
+and `ChromeInk`). Widgets use existing theme slots; they do not invent RGB.
+The 0.10.0 direction uses five visual families per theme, with shades for
+contrast rather than an unrelated hue for every mode and state.
 
-RGB values and theme presets stay in `crates/palette/src/`. Widgets do
-not invent colors. Status-bar ink goes through
-`crates/palette/src/grammar.rs` (`SemanticFamily` + `ChromeInk`).
-Each colour has one token name: the Identity blue is `WHALE_ACTION`
-(`WHALE_INFO`, `WHALE_ACCENT_PRIMARY`, `STATUS_INFO` were aliases of it and
-are gone), and the whale theme's `info` / `accent_primary` slots both hold it.
-
-Not in scope: new themes, new orange semantics, or restyling existing
-assignments. Community themes may paint a Cognition slot with a red-like
-hue (Full Access on some presets); the **role** is still Cognition, not
-Failure.
-
-## The seven families
-
-| Family | Spoken as | Means | Typical chrome |
-| --- | --- | --- | --- |
-| Outcome | GREEN | success / settled result / model output | phase `done` |
-| Cognition | ORANGE | consequential action / elevated capability | permission ramp, waiting/approval, update chip |
-| Active | CYAN | currently live / orchestration | phase working/verifying, live goal |
-| Policy | PURPLE | user-selected mode | act / plan / operate |
-| Identity | BLUE | who / which route | status mark, effort, context meter |
-| Metadata | GRAY | passive location / historical state | route, repo/worktree, version, separators |
-| Failure | RED | actual failure / destructive warning **only** | phase `failed` |
-
-Red is reserved so it stays powerful: tool denied, destructive confirmation,
-crashed agent, context failure. A dirty worktree is Metadata (`*`), not
-Failure. The reservation is checked against *every* selectable preset, not
-just the whale default: no Outcome, Active, Policy, Identity, or Metadata
-ink may resolve to a theme's `error_fg`. Cognition is the one exemption
-described above.
-
-Metadata carries four weights, all the same meaning: `MetadataValue` for a
-readable number, `Metadata` for its label, `MetadataHint` for the version
-stamp, `MetadataDim` for separators.
-
-## Status-bar map
-
-The underwater header (top bar) and phase strip (footer rail) are the
-status bar. Each segment picks a `ChromeInk` that already exists as a
-`UiTheme` slot:
-
-| Segment | `ChromeInk` | Family |
+| Family | Role | Existing theme slots |
 | --- | --- | --- |
-| Status mark | `Identity` | Identity |
-| Provider · model | `Metadata` | Metadata |
-| Mode (act / plan / operate) | `PolicyAct` / `PolicyPlan` / `PolicyOperate` | Policy |
-| Effort | `Info` | Identity |
-| Permission (Ask / Auto-Review / Full Access) | `PermissionAsk` / `PermissionAutoReview` / `PermissionFullAccess` | Cognition |
-| Goal (live / paused) | `Active` / `Attention` | Active / Cognition |
-| Automation slot (`⏱ N scheduled · M running`) | `Info` / `Active` / `Attention` | Identity / Active / Cognition |
-| Workflow chip | `Info` | Identity |
-| Update chip | `Attention` | Cognition |
-| Repo / worktree · branch`*` | `Metadata` | Metadata |
-| Context meter / token breakdown | `Info` | Identity |
-| Session metrics value | `MetadataValue` | Metadata |
-| Session metrics label | `Metadata` | Metadata |
-| Version | `MetadataHint` | Metadata |
-| Separators | `MetadataDim` | Metadata |
-| Phase idle | `Metadata` | Metadata |
-| Phase typing | `Identity` | Identity |
-| Phase working / verifying | `Active` | Active |
-| Phase waiting / approval | `Waiting` | Cognition |
-| Phase done | `Outcome` | Outcome |
-| Phase failed | `Failure` | Failure |
-| Footer toast info / success / warning / error | `Info` / `Outcome` / `Attention` / `Failure` | Identity / Outcome / Cognition / Failure |
+| Surface | Field, plate, selection and depth | Background and selection shades |
+| Neutral | Body, values, labels and secondary context | Body/soft/muted/hint/dim text |
+| Action | Identity, navigation, mode, effort and context | `accent_primary` |
+| Live | Active work and settled outcomes | `status_working` |
+| Attention | Human decisions, permissions, warnings and failure | Existing permission, warning and danger shades |
 
-YOLO / Full Access **mode** still paints as `PolicyAct` on the header. The
-header must not borrow Failure red for a selected mode.
+Five families are not five literal RGB values. In particular, warnings and
+failures keep their existing distinct safety inks, words and symbols. Ask,
+Auto-Review and Full Access preserve their permission ramp. A mode selection
+never borrows failure red. Completed work shares the live hue but changes its
+glyph and label; the display never relies on color alone to distinguish them.
+Underwater keeps its atmospheric field while its controls follow this grammar.
+
+`Identity`, `Info` and `PolicyAct/Plan/Operate` resolve to the action slot.
+`Active` and `Outcome` resolve to the live slot. Metadata retains four weights:
+`MetadataValue`, `Metadata`, `MetadataHint` and `MetadataDim`. `Failure` always
+resolves to the exact theme error slot; the visual grouping with Attention does
+not turn a failure into a warning or change any permission authority.
+
+All selectable themes are covered by grammar and rendered selection checks.
+Terminal-owned colors remain host-defined: an unknown contrast pair is not
+reported as passing. ASCII symbols and reduced/still motion retain explicit
+state labels independently of these color choices.
 
 ## Repo / worktree honesty
 
@@ -91,9 +49,13 @@ wrap.
 
 ## Adding chrome
 
-1. Pick one of the seven families. If none fit, the fact does not belong
-   in color — use a word or glyph (`menu_style::StatusMark`).
-2. Add a `ChromeInk` only when an existing `UiTheme` slot already carries
-   that meaning. Do not add a theme and do not introduce a new family.
-3. Name the KV-cache / density effect if the change also adds session
-   context (it should not: this grammar is paint-only).
+1. Use one of these families. If a fact needs a new distinction, prefer a word
+   or glyph rather than another unrelated hue.
+2. Reuse an existing `ChromeInk` and active-theme slot where possible.
+3. Check the actual foreground/background pair on the rendered surface,
+   including selection, light themes and terminal-owned backgrounds.
+
+Shoreline pairs glacial action blue (`#67B8D6`) with warm charcoal; its light
+variant uses deep ocean blue (`#006684`) on warm paper. Selection surfaces
+use the same blue family. These replace the earlier periwinkle/cobalt pair;
+Underwater retains its existing ocean ramp and accent palette.

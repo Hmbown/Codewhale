@@ -19,6 +19,9 @@ use codewhale_palette::{normalize_hex_rgb_color, normalize_theme_setting};
 
 const SETTINGS_FILE_NAME: &str = "settings.toml";
 
+/// Fresh terminal installs and explicit theme resets share one default.
+pub(crate) const DEFAULT_TUI_THEME: &str = "underwater";
+
 /// Smallest Top work surface that can show its divider plus the compact
 /// goal / to-do / Agent projection without turning the rail into invisible
 /// keyboard state. Older releases accepted two rows, which left only one
@@ -345,9 +348,9 @@ pub struct Settings {
     /// ca, de, fr, id, hi, ru, uk.
     /// Every shipped pack holds full `en.json` parity; nothing falls back.
     pub locale: String,
-    /// Named UI theme. `"shoreline"` is the fresh-install default: the warm
-    /// charcoal and restrained blue the desktop client paints too.
-    /// `"underwater"` paints the ocean field. `"terminal"` fully inherits the
+    /// Named UI theme. `"underwater"` is the fresh-install default: a dark
+    /// navy water column. `"shoreline"` is the warm charcoal alternative.
+    /// `"terminal"` fully inherits the
     /// host terminal's foreground/background. `"system"`, `"dark"`,
     /// `"light"`, `"grayscale"`, and the community presets:
     /// `"catppuccin-mocha"`, `"tokyo-night"`, `"dracula"`,
@@ -572,7 +575,7 @@ impl Default for Settings {
             show_tool_details: false,
             inline_diffs: "full".to_string(),
             locale: "auto".to_string(),
-            theme: "shoreline".to_string(),
+            theme: DEFAULT_TUI_THEME.to_string(),
             background_color: None,
             composer_density: "comfortable".to_string(),
             composer_border: true,
@@ -2924,10 +2927,9 @@ fn normalize_synchronized_output(value: &str) -> &str {
 }
 
 fn normalize_settings_theme(value: &str) -> String {
-    // A malformed persisted selector must not turn into a painted application
-    // background. Falling back to the compiled default keeps a single
-    // first-party theme until the user picks an explicit palette.
-    normalize_theme_setting(value).unwrap_or_else(|_| "shoreline".to_string())
+    // Unknown persisted selectors fall back to the same fresh-install default.
+    // Valid saved choices, including Shoreline, remain unchanged.
+    normalize_theme_setting(value).unwrap_or_else(|_| DEFAULT_TUI_THEME.to_string())
 }
 
 /// Returns `true` when the active terminal is Ptyxis (the new default
@@ -4075,21 +4077,31 @@ mod tests {
     }
 
     #[test]
-    fn default_settings_resolve_to_the_shoreline_theme() {
-        // The fresh-install default is the Shoreline theme, end to end from
+    fn default_settings_resolve_to_the_underwater_theme() {
+        // The fresh-install default is the Underwater theme, end to end from
         // `Settings::default()` through theme resolution.
         let settings = Settings::default();
-        assert_eq!(settings.theme, "shoreline");
+        assert_eq!(settings.theme, "underwater");
         let (name, id, theme) = codewhale_palette::resolve_theme_setting(&settings.theme, None)
             .expect("default resolves");
-        assert_eq!(id, codewhale_palette::ThemeId::Shoreline);
-        assert_eq!(name, "shoreline");
-        assert_eq!(theme.name, "shoreline");
+        assert_eq!(id, codewhale_palette::ThemeId::Underwater);
+        assert_eq!(name, "underwater");
+        assert_eq!(theme.name, "underwater");
+        let saved: Settings = toml::from_str("theme = \"shoreline\"\n").expect("saved theme");
+        assert_eq!(
+            saved.theme, "shoreline",
+            "upgrades preserve an explicit choice"
+        );
     }
 
     #[test]
     fn theme_normalizes_supported_values_and_rejects_unknowns() {
         let mut settings = Settings::default();
+        assert_eq!(settings.theme, "underwater");
+
+        settings
+            .set("theme", "charcoal")
+            .expect("set charcoal alternative");
         assert_eq!(settings.theme, "shoreline");
 
         settings.set("theme", "grayscale").expect("set grayscale");
@@ -5525,7 +5537,7 @@ mod tests {
         let loaded = Settings::load().expect("load settings");
 
         assert_eq!(
-            loaded.theme, "shoreline",
+            loaded.theme, "underwater",
             "explicit CODEWHALE_HOME must not inherit ambient legacy settings"
         );
         assert_eq!(

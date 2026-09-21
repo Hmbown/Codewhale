@@ -1029,6 +1029,7 @@ impl SavedSession {
         journal.branch_to(entry_id)?;
         self.leaf_id = journal.leaf_id.clone();
         self.messages = journal.to_messages();
+        self.metadata.message_count = self.messages.len();
         self.metadata.updated_at = Utc::now();
         Ok(())
     }
@@ -3232,7 +3233,7 @@ pub fn create_saved_session_with_id_mode_and_stamps(
     create_saved_session_inner(
         id,
         messages,
-        message_stamps,
+        SessionJournal::from_messages_stamped(messages.to_vec(), message_stamps, 0),
         model,
         workspace,
         total_tokens,
@@ -3254,7 +3255,7 @@ pub fn create_saved_session_with_id_mode_and_stamps(
 pub fn create_saved_session_journal_only(
     id: String,
     messages: &[Message],
-    message_stamps: &[DateTime<Utc>],
+    journal: SessionJournal,
     model: &str,
     workspace: &Path,
     total_tokens: u64,
@@ -3264,7 +3265,7 @@ pub fn create_saved_session_journal_only(
     create_saved_session_inner(
         id,
         messages,
-        message_stamps,
+        journal,
         model,
         workspace,
         total_tokens,
@@ -3277,7 +3278,7 @@ pub fn create_saved_session_journal_only(
 fn create_saved_session_inner(
     id: String,
     messages: &[Message],
-    message_stamps: &[DateTime<Utc>],
+    journal: SessionJournal,
     model: &str,
     workspace: &Path,
     total_tokens: u64,
@@ -3293,7 +3294,6 @@ fn create_saved_session_inner(
     let title =
         conversation_derived_title(messages).unwrap_or_else(|| DEFAULT_SESSION_TITLE.to_string());
 
-    let journal = SessionJournal::from_messages_stamped(messages.to_vec(), message_stamps, 0);
     let leaf_id = journal.leaf_id.clone();
     SavedSession {
         schema_version: CURRENT_SESSION_SCHEMA_VERSION,
@@ -3315,7 +3315,7 @@ fn create_saved_session_inner(
             runtime_store: None,
             cumulative_turn_secs: 0,
             archived: false,
-            spawn_depth: 0,
+            spawn_depth: journal.spawn_depth,
         },
         messages: if fill_messages {
             messages.to_vec()
@@ -3817,6 +3817,7 @@ mod tests {
         assert_eq!(session.journal_message_stamps(), vec![t0, t1]);
         // A save with no stamps keeps the old behavior: entries collapse to
         // save time rather than inventing times.
+        let before_save = Utc::now();
         let unstamped = create_saved_session_with_id_and_mode(
             "unstamped".to_string(),
             &messages,
@@ -3828,11 +3829,10 @@ mod tests {
         );
         let journal = unstamped.journal.as_ref().expect("journal");
         assert!(
-            journal
-                .entries
-                .iter()
-                .all(|entry| entry.created_at >= unstamped.metadata.created_at),
-            "without stamps, entries stamp at save as before"
+            journal.entries.iter().all(|entry| {
+                entry.created_at >= before_save && entry.created_at <= unstamped.metadata.created_at
+            }),
+            "unstamped entries are created during save, before snapshot metadata"
         );
     }
 
@@ -7830,7 +7830,7 @@ mod storage_compatible_tests {
         let sparse = create_saved_session_journal_only(
             "roundtrip".to_string(),
             &messages,
-            &[],
+            SessionJournal::from_messages(messages.clone(), 0),
             "test-model",
             tmp.path(),
             7,

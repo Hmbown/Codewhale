@@ -12,7 +12,9 @@
 //! read, so the checklist was decoration — a new variant belongs in
 //! `crates/tui/src/config.rs` only once something paints it.
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use std::cell::RefCell;
+
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
@@ -45,6 +47,7 @@ pub struct StatusPickerView {
     /// Snapshot of `app.status_items` at open time so Esc reverts cleanly.
     original: Vec<StatusItem>,
     locale: Locale,
+    row_hitboxes: RefCell<Vec<(usize, Rect)>>,
 }
 
 impl StatusPickerView {
@@ -55,13 +58,21 @@ impl StatusPickerView {
             .filter(|item| item.is_available_for(provider))
             .copied()
             .collect();
-        let selected: Vec<bool> = rows.iter().map(|item| active.contains(item)).collect();
+        let selected: Vec<bool> = rows
+            .iter()
+            .map(|item| {
+                active.contains(item)
+                    || (active.contains(&StatusItem::SessionMetrics)
+                        && matches!(item, StatusItem::Ttft | StatusItem::OutputRate))
+            })
+            .collect();
         Self {
             rows,
             selected,
             cursor: 0,
             original: active.to_vec(),
             locale,
+            row_hitboxes: RefCell::new(Vec::new()),
         }
     }
 
@@ -168,6 +179,30 @@ impl ModalView for StatusPickerView {
         }
     }
 
+    fn handle_mouse(&mut self, mouse: MouseEvent) -> ViewAction {
+        match mouse.kind {
+            MouseEventKind::ScrollUp => {
+                self.apply_motion(crate::tui::list_nav::Motion::Prev);
+            }
+            MouseEventKind::ScrollDown => {
+                self.apply_motion(crate::tui::list_nav::Motion::Next);
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                let clicked = self.row_hitboxes.borrow().iter().find_map(|(index, rect)| {
+                    rect.contains(ratatui::layout::Position::new(mouse.column, mouse.row))
+                        .then_some(*index)
+                });
+                if let Some(index) = clicked {
+                    self.cursor = index;
+                    self.toggle_current();
+                    return ViewAction::Emit(self.live_preview_event());
+                }
+            }
+            _ => {}
+        }
+        ViewAction::None
+    }
+
     fn render(&self, area: Rect, buf: &mut Buffer) {
         // Two header lines + one row per StatusItem + the wrapping action
         // footer that now lives inside the body (one row more than the old
@@ -208,6 +243,7 @@ impl ModalView for StatusPickerView {
             ],
         );
 
+        self.row_hitboxes.borrow_mut().clear();
         let visible_rows = content.height.saturating_sub(2) as usize;
         let row_start = visible_row_start(self.rows.len(), self.cursor, visible_rows);
 
@@ -225,6 +261,15 @@ impl ModalView for StatusPickerView {
             .skip(row_start)
             .take(visible_rows)
         {
+            self.row_hitboxes.borrow_mut().push((
+                idx,
+                Rect::new(
+                    content.x,
+                    content.y + 2 + (idx - row_start) as u16,
+                    content.width,
+                    1,
+                ),
+            ));
             let checked = *self.selected.get(idx).unwrap_or(&false);
             let is_cursor = idx == self.cursor;
             let mark = if checked { "[✓]" } else { "[ ]" };
@@ -304,6 +349,59 @@ mod tests {
         let active = StatusItem::default_footer();
         let view = StatusPickerView::new(&active, ApiProvider::Deepseek, Locale::En);
         assert_eq!(view.current_selection(), active);
+    }
+
+    #[test]
+    fn legacy_metrics_can_be_split_and_cancel_restores_the_saved_pair() {
+        let original = vec![StatusItem::SessionMetrics];
+        let mut view = StatusPickerView::new(&original, ApiProvider::Stepfun, Locale::En);
+        assert_eq!(
+            view.current_selection(),
+            vec![StatusItem::Ttft, StatusItem::OutputRate]
+        );
+        view.cursor = view
+            .rows
+            .iter()
+            .position(|item| *item == StatusItem::OutputRate)
+            .unwrap();
+        view.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+        assert_eq!(view.current_selection(), vec![StatusItem::Ttft]);
+        match view.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)) {
+            ViewAction::EmitAndClose(ViewEvent::StatusItemsUpdated { items, final_save }) => {
+                assert_eq!(items, original);
+                assert!(!final_save);
+            }
+            action => panic!("unexpected cancel: {action:?}"),
+        }
+    }
+
+    #[test]
+    fn mouse_toggles_the_painted_row_after_scrolling_a_short_picker() {
+        let mut view = StatusPickerView::new(
+            &StatusItem::default_footer(),
+            ApiProvider::Stepfun,
+            Locale::En,
+        );
+        view.handle_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+        let area = Rect::new(0, 0, 40, 12);
+        view.render(area, &mut Buffer::empty(area));
+        let (index, rect) = *view.row_hitboxes.borrow().last().expect("visible row");
+        let was_selected = view.selected[index];
+        let action = view.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: rect.x + 2,
+            row: rect.y,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(matches!(
+            action,
+            ViewAction::Emit(ViewEvent::StatusItemsUpdated {
+                final_save: false,
+                ..
+            })
+        ));
+        assert_eq!(view.cursor, index);
+        assert_eq!(view.selected[index], !was_selected);
     }
 
     #[test]

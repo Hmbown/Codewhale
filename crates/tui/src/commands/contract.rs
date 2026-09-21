@@ -321,6 +321,7 @@ impl CommandSessionLifecycleContext for SessionLifecycleAdapter<'_> {
             Ok(m) => m,
             Err(e) => return Err(format!("could not open sessions directory: {e}")),
         };
+        crate::tui::persistence_actor::flush_before_transition()?;
         let mut session = match manager.load_session(&session_id) {
             Ok(s) => s,
             Err(e) => return Err(format!("could not load session {session_id}: {e}")),
@@ -334,19 +335,36 @@ impl CommandSessionLifecycleContext for SessionLifecycleAdapter<'_> {
         match session.journal_branch_to(entry_id) {
             Ok(()) => {
                 if let Err(e) = manager.save_session(&session) {
-                    return Err(format!("branch saved but persist failed: {e}"));
+                    return Err(format!(
+                        "branch could not be persisted; active conversation unchanged: {e}"
+                    ));
                 }
-                app.restore_api_messages(
-                    session.messages.clone(),
-                    &session.journal_message_stamps(),
-                );
+                app.restore_api_messages(session.messages.clone(), &session);
                 let leaf_display = session
                     .leaf_id
                     .clone()
                     .unwrap_or_else(|| "(none)".to_string());
+                app.clear_history();
+                app.session_artifacts = session.artifacts.clone();
+                app.session_context_references = session.context_references.clone();
+                app.extend_history(
+                    session
+                        .messages
+                        .iter()
+                        .flat_map(crate::tui::history::history_cells_from_message),
+                );
+                app.scroll_to_bottom();
                 Ok(SessionBranchOutcome {
                     leaf_display,
                     journal_entries_before: journal_len_before,
+                    sync: SessionSyncPayload {
+                        session_id: Some(session_id),
+                        messages: session.messages,
+                        system_prompt: app.system_prompt.clone(),
+                        model: app.model.clone(),
+                        workspace: app.workspace.clone(),
+                        mode: to_command_mode(app.mode),
+                    },
                 })
             }
             Err(e) => Err(format!(
@@ -477,74 +495,25 @@ impl CommandSessionLifecycleContext for SessionLifecycleAdapter<'_> {
             }
         };
 
-        let parent_id = app
-            .current_session_id
-            .clone()
-            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-        let mut parent = crate::session_manager::create_saved_session_with_id_and_mode(
-            parent_id,
-            &app.api_messages,
-            &app.model,
-            &app.workspace,
-            u64::from(app.session.total_tokens),
-            app.system_prompt.as_ref(),
-            Some(app.mode.label()),
-        );
-        parent
-            .metadata
-            .set_model_provider_route(app.api_provider.as_str(), app.provider_id_for_persistence());
-        if let Some(cached) = app
-            .current_session_metadata
-            .as_ref()
-            .filter(|metadata| metadata.id == parent.metadata.id)
-        {
-            parent.metadata.created_at = cached.created_at;
-            parent.metadata.title.clone_from(&cached.title);
-            parent
-                .metadata
-                .parent_session_id
-                .clone_from(&cached.parent_session_id);
-            parent.metadata.forked_from_message_count = cached.forked_from_message_count;
-        }
-        app.sync_cost_to_metadata(&mut parent.metadata);
-        parent.context_references = app.session_context_references.clone();
-        parent.artifacts = app.session_artifacts.clone();
-        let work_state = match app.work_state_snapshot() {
-            Ok(state) => state,
-            Err(err) => return Err(format!("Failed to snapshot Work state: {err}")),
-        };
-        parent.work_state = work_state.clone();
-        parent.last_auto_route = app.auto_route_for_persistence();
-
+        let mut parent = crate::tui::ui::build_session_snapshot(&mut app, &manager)?;
+        parent.make_storage_compatible();
         if let Err(err) = manager.save_session(&parent) {
             return Err(format!("Failed to save parent session: {err}"));
         }
 
-        let mut forked = crate::session_manager::create_saved_session_with_mode(
-            &app.api_messages,
-            &app.model,
-            &app.workspace,
-            u64::from(app.session.total_tokens),
-            app.system_prompt.as_ref(),
-            Some(app.mode.label()),
-        );
-        forked
-            .metadata
-            .set_model_provider_route(app.api_provider.as_str(), app.provider_id_for_persistence());
-        forked.metadata.copy_cost_from(&parent.metadata);
+        let mut forked = parent.clone();
+        forked.metadata.id = uuid::Uuid::new_v4().to_string();
+        forked.metadata.created_at = chrono::Utc::now();
+        forked.metadata.updated_at = forked.metadata.created_at;
+        forked.metadata.archived = false;
+        forked.metadata.runtime_store = None;
+        forked.approval_receipts.clear();
+        forked.window_title = None;
         forked.metadata.spawn_depth = parent.metadata.spawn_depth.saturating_add(1);
-        // Ensure journal for both sessions: parent already has one from factory, bump forked's journal depth
-        if let Some(j) = forked.journal.as_mut() {
-            j.spawn_depth = forked.metadata.spawn_depth;
-        }
-        if let Some(j) = parent.journal.as_mut() {
-            j.spawn_depth = parent.metadata.spawn_depth;
-        }
         forked.metadata.mark_forked_from(&parent.metadata);
-        forked.context_references = app.session_context_references.clone();
-        forked.artifacts = app.session_artifacts.clone();
-        forked.work_state = work_state;
-        forked.last_auto_route = app.auto_route_for_persistence();
+        if let Some(journal) = forked.journal.as_mut() {
+            journal.spawn_depth = forked.metadata.spawn_depth;
+        }
         let queue_transition =
             crate::tui::ui::prepare_offline_queue_transition(&app, &forked.metadata.id)?;
 
@@ -560,6 +529,7 @@ impl CommandSessionLifecycleContext for SessionLifecycleAdapter<'_> {
         crate::tui::ui::install_offline_queue_transition(&mut app, queue_transition);
         app.current_session_id = Some(forked.metadata.id.clone());
         app.current_session_metadata = Some(forked.metadata.clone());
+        app.restore_api_messages(forked.messages.clone(), &forked);
         app.session_title = Some(forked.metadata.title.clone());
         // A fork starts as its own session: no inherited tab/window title.
         app.window_title = None;
@@ -650,6 +620,7 @@ impl CommandSessionLifecycleContext for SessionLifecycleAdapter<'_> {
         crate::tui::ui::install_offline_queue_transition(&mut app, queue_transition);
         app.current_session_id = Some(forked.metadata.id.clone());
         app.current_session_metadata = Some(forked.metadata.clone());
+        app.restore_api_messages(forked.messages.clone(), &forked);
         app.session_title = Some(forked.metadata.title.clone());
         // A fork starts as its own session: no inherited tab/window title.
         app.window_title = None;
@@ -1456,10 +1427,7 @@ fn import_session_container(
     crate::tui::ui::install_offline_queue_transition(app, queue_transition);
     app.current_session_id = Some(new_id.clone());
     app.current_session_metadata = Some(imported.metadata.clone());
-    app.restore_api_messages(
-        imported.messages.clone(),
-        &imported.journal_message_stamps(),
-    );
+    app.restore_api_messages(imported.messages.clone(), &imported);
     let picker = crate::tui::session_picker::SessionPickerView::new_selecting(
         &app.workspace,
         app.ui_locale,
@@ -1475,6 +1443,14 @@ fn import_session_container(
             .map(|journal| journal.entries.len())
             .unwrap_or(0),
         leaf_display: imported.leaf_id.as_deref().unwrap_or("(none)").to_string(),
+        sync: SessionSyncPayload {
+            session_id: Some(new_id.clone()),
+            messages: app.api_messages.as_ref().clone(),
+            system_prompt: app.system_prompt.clone(),
+            model: app.model.clone(),
+            workspace: app.workspace.clone(),
+            mode: to_command_mode(app.mode),
+        },
     })
 }
 
