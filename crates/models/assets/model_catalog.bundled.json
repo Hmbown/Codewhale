@@ -106,7 +106,8 @@
       "id": "deepseek-flash",
       "max_output": 384000,
       "modalities": [
-        "text"
+        "text",
+        "image"
       ],
       "provenance": "bundled",
       "supported_parameters": [
