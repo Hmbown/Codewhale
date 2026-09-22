@@ -212,7 +212,16 @@
    *   值本身仍存在引擎里（GET/POST /v1/config），与终端界面看到的一致。
    * ⚠️ 依赖官方 DOM 结构（`article.reasoning` / `.receipt`）—— 官方改结构要跟着改（升级检查清单里有）。
    */
-  var DISPLAY = { show_thinking: true, thinking_default_expanded: false, show_tool_details: false, calm_mode: false, cost_currency: 'usd', thinking_highlight: true, inline_diffs: 'full', thinking_preview_lines: 2, statusline_off: null };
+  /* ⚠️ 2026-09-22 对齐官方出厂默认（老板拍「1，对齐」）—— 这几个「读不到时的兜底值」
+   * 应当就是**官方默认**，否则引擎读不到时客户看到的是另一套行为。
+   * 官方 `crates/tui/src/settings.rs:528-570` 的 `default()` 原文：
+   *   · `calm_mode: true`  —— 注释 *"#4095: default presentation is compact/calm; verbose detail is opt-in."*
+   *   · `show_thinking: false` —— 注释 *"Reasoning is useful when explicitly requested, but it should never
+   *        displace the actual conversation in the default TUI."*
+   *   · `thinking_highlight: true` / `inline_diffs: "full"` / `thinking_preview_lines: 2` / `show_tool_details: false`
+   * ⚠️ 注意：老板**自己的 CLI 配置**（`~/.codewhale/settings.toml`）是 `calm_mode=false` + `show_thinking=true`
+   *   —— 那是他调过的，**不是出厂默认**。这里对齐的是出厂默认。 */
+  var DISPLAY = { show_thinking: false, thinking_default_expanded: false, show_tool_details: false, calm_mode: true, cost_currency: 'usd', thinking_highlight: true, inline_diffs: 'full', thinking_preview_lines: 2, statusline_off: null };
 
   var stD = document.createElement('style');
   stD.textContent = [
@@ -368,10 +377,14 @@
   api('/v1/config').then(function (r) {
     if (!r.ok) return;                 // 引擎没起 / 读不到 → 用默认（显示思考），不打扰客户
     var c = r.body || {};
-    DISPLAY.show_thinking = c.show_thinking !== false;
+    // ⚠️ 2026-09-22 对齐官方默认（`settings.rs:538/564`）：`show_thinking` 官方默认 **false**、
+    //   `calm_mode` 官方默认 **true**。所以「读不到」时的兵产要倒过来 ——
+    //   以前写的是 `show_thinking !== false`（读不到当 true）＋ `calm_mode === true`（读不到当 false），
+    //   恰好与官方相反。
+    DISPLAY.show_thinking = c.show_thinking === true;
     DISPLAY.thinking_default_expanded = c.thinking_default_expanded === true;
     DISPLAY.show_tool_details = c.show_tool_details === true;
-    DISPLAY.calm_mode = c.calm_mode === true;
+    DISPLAY.calm_mode = c.calm_mode !== false;
     // 引擎里默认就是 true（settings.rs:567）；读不到就保持默认 true，不倒挂
     DISPLAY.thinking_highlight = c.thinking_highlight !== false;
     // 文件改动显示：官方三档（默认 full）
