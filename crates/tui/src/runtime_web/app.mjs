@@ -547,13 +547,24 @@ export function formatElapsedMs(ms) {
   return `${Math.floor(secs / 60)}m ${secs % 60}s`;
 }
 
-/* 思考卡「收起时的预览行数」——照官方 `thinking_preview_lines` 的默认值。
+/* 思考卡「收起时的预览行数」（**完成态**）——照官方 `thinking_preview_lines` 的默认值。
  * 官方描述原文：*"Collapsed completed-thought preview rows (default 2, 0=header-only, 10=older dump)"*
- * ⚠️ 这个键**不在 `/v1/config` 的读/写名单里**（只活在 TUI 的 /config 与 settings.toml），
- *   网页读不到 ⇒ 先写官方默认值 2（＝老板 2026-09-19 的要求「默认为我现在的设置」，
- *   而他那份 settings.toml 里正是 `thinking_preview_lines = 2`）。
- *   哪天引擎把它暴露到 `/v1/config`，改成读值即可。 */
+ * ⚠️ **2026-09-22 更正**：这条注释原先写「这个键**不在** `/v1/config` 的读/写名单里，网页读不到」
+ *   —— **是错的**（第 47 轮实测）。实况：`runtime_api.rs:7551` 在**写**名单、`:7269` 在**读**响应结构里，
+ *   字段注释原文 *"Exposed so the web client can honour the same setting the TUI does"*；
+ *   实测 admin 引擎 `GET /v1/config` 回 `"thinking_preview_lines":2`。
+ *   ⇒ 运行期一律走 `thinkingPreviewLines()`（读 `data-ab-thinklines`，由 asbudy-my.js 从引擎值写上），
+ *   下面这个常量只是**引擎读不到时的兜底**。 */
 export const THINKING_PREVIEW_LINES = 2;
+
+/* 思考卡「**流式中**的预览行数」——照官方 `THINKING_STREAMING_PREVIEW_LINE_LIMIT`
+ * （`tui/history/thinking.rs:24`，= 12）。
+ * 为什么流式与完成要两个数、而且**截取方向相反**（官方 `thinking.rs:251-266`）：
+ *   · 流式中：`lines.drain(0..len - limit)` = **丢头、保最新**（注释原文 *"Follow the live cursor:
+ *     discard the head, not the newest lines."*）⇒ 边打字边往下滚，看得到它此刻在想什么
+ *   · 完成后：`lines.truncate(limit)` = **保开头**（＝`thinking_preview_lines`，默认 2 行）⇒ 只留头两行
+ * 官方还有一个 `preview_extra_lines`（视口有空余行时把 12 撑大）—— 网页没有等价物，不实现。 */
+export const THINKING_STREAMING_PREVIEW_LINES = 12;
 
 /* 文件改动卡的内联 diff —— 照官方 `inline_diffs`（默认 `full`）。
  * 官方定义（`settings.rs:33-41`）：
@@ -690,6 +701,36 @@ export function thinkingPreviewLines() {
   if (raw === null || raw === "") return THINKING_PREVIEW_LINES;
   const n = Number.parseInt(raw, 10);
   return Number.isFinite(n) && n >= 0 ? n : THINKING_PREVIEW_LINES;
+}
+
+/** 思考卡预览的**取行算法**（纯函数、不碰 DOM）—— 从 `updateItemNode` 里抽出来才好测。
+ *
+ * 照官方 `tui/history/thinking.rs:251-266`：
+ *   · `streaming` ⇒ `lines.drain(0..len - limit)` = **丢头、保最新**（跟住 live 光标）
+ *   · 完成态   ⇒ `lines.truncate(limit)`        = **截尾、保开头**
+ * 被截断时末尾补一行 `…`（官方 `REASONING_OPENER`，`thinking.rs:11`，就是 U+2026）——
+ * 即官方的「还能展开」提示（`thinking.rs:211-220`：`collapsed && expandable` 才加）。
+ * `limit <= 0`（官方语义「0 = header only」）⇒ 返回空串（不显示预览，也不补 `…`）。
+ *
+ * @param {string} detail 思考正文（`item.detail`）
+ * @param {boolean} streaming 是否进行中
+ * @param {number} completedLines 完成态保留行数（＝`thinking_preview_lines`）
+ * @returns {string} 预览文本（截断时以 `\n…` 结尾）
+ */
+export function thinkingPreviewText(detail, streaming, completedLines) {
+  const lines = String(detail == null ? "" : detail)
+    .replace(/\r\n?/g, "\n")
+    .split("\n")
+    .filter((l) => l.trim());
+  const limit = streaming ? THINKING_STREAMING_PREVIEW_LINES : completedLines;
+  if (!(limit > 0)) return "";
+  const truncated = lines.length > limit;
+  // 丢头保最新 / 截尾保开头 —— 方向照官方，别写反
+  const body = truncated
+    ? (streaming ? lines.slice(lines.length - limit) : lines.slice(0, limit))
+    : lines;
+  if (!body.length) return "";
+  return body.join("\n") + (truncated ? "\n\u2026" : "");
 }
 
 /** 路径只留最后两段 —— 别把 /opt/asbudy/customers/yanyijin/2dry8u/public/index.html 整条糊到界面上 */
@@ -2664,14 +2705,18 @@ function startBrowserClient() {
           : "思考过程" + completedElapsedSuffix(item),
       );
       setTextIfChanged(card.querySelector('[data-item-part="detail"]'), detail);
-      // 收起时的预览（照官方 thinking_preview_lines，见 THINKING_PREVIEW_LINES）：
-      //   只在**已完成**时露前几行；展开着的时候由 CSS（:has(details[open])）藏掉，不重复显示
+      // 收起时的预览 —— **双态**，照官方 `history/thinking.rs:251-266`：
+      //   · 流式中（in_progress）：保**最新** `THINKING_STREAMING_PREVIEW_LINES`(12) 行 → 跟着光标往下滚
+      //   · 完成后：保**开头** `thinking_preview_lines`(默认 2) 行 → 只留头两行
+      //   被截断时末尾补一行 `…`（官方 `REASONING_OPENER`，`thinking.rs:11`，就是 U+2026）——
+      //   即官方的「可展开」提示（`thinking.rs:211-220`：`collapsed && expandable` 才加）。
+      //   展开着的时候由 CSS（:has(details[open])）藏掉，不重复显示。
+      //   ⚠️ **2026-09-22 前**这里是「只在完成后露前 2 行、**流式中空白**」—— 客户看到「思考中…」之后
+      //      一片空，而官方流式中恰恰**是有内容**的。这正是「自动折叠思考」这条体验的核心差别。
       const preview = card.querySelector('[data-item-part="preview"]');
       if (preview) {
-        const head = item.status === "completed"
-          ? String(detail || "").replace(/\r\n?/g, "\n").split("\n").filter((l) => l.trim()).slice(0, thinkingPreviewLines())
-          : [];
-        const text = head.join("\n");
+        // 取行算法在 `thinkingPreviewText()`（纯函数、可测）—— 这里只负责接线
+        const text = thinkingPreviewText(detail, item.status === "in_progress", thinkingPreviewLines());
         preview.hidden = !text;
         setTextIfChanged(preview, text);
       }
