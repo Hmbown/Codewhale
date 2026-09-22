@@ -947,13 +947,6 @@ removal ordering through `user_input.canceled`.
 **Client-executed dynamic tools**
 - `POST /v1/threads/{thread_id}/turns/{turn_id}/tool-calls/{call_id}/result`
 
-Chromewhale (`extensions/chrome`) is the in-tree consumer of this channel: its
-`browser_*` tools are registered per turn and executed in the user's Chrome tab.
-[`docs/CHROME.md`](CHROME.md) records what a client owes the channel in
-practice, including the fact that these tools register as
-`ApprovalRequirement::Auto` and are therefore gated by the client, not by the
-engine's approval prompt.
-
 The thread and turn in the result route must match the pending call. A call is
 settled at most once; wrong-route and duplicate results return 404. Terminal
 lifecycle events carry identifiers and status only, never tool result content.

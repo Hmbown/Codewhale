@@ -302,43 +302,6 @@ jobs:
       - name: Package VS Code extension
         run: npm run package
 
-  chrome-extension:
-    name: Chrome extension
-    timeout-minutes: 10
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: extensions/chrome
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v7
-        with:
-          node-version: 22
-      - name: Run Chromewhale suites
-        # Chromewhale has no dependencies and no build step: Chrome loads the
-        # ES modules directly, so `node --test` runs the same files the browser
-        # does. No `npm ci`, because there is nothing to install.
-        run: npm test
-      - name: Check the manifest parses and names its entry points
-        run: |
-          node --input-type=module -e '
-            import { readFileSync, accessSync } from "node:fs";
-            const manifest = JSON.parse(readFileSync("manifest.json", "utf8"));
-            for (const path of [
-              manifest.background.service_worker,
-              manifest.side_panel.default_path,
-              manifest.icons["128"],
-            ]) {
-              accessSync(path);
-            }
-            if (manifest.manifest_version !== 3) {
-              throw new Error("Chromewhale must stay Manifest V3");
-            }
-            if (manifest.host_permissions.some((p) => !/^http:\/\/(127\.0\.0\.1|localhost)\//.test(p))) {
-              throw new Error("Chromewhale takes no site access up front; use optional_host_permissions");
-            }
-          '
-
   safety-gate:
     name: Safety gate
     needs: changes
