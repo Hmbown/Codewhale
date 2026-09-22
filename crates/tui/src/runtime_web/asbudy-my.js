@@ -18,6 +18,104 @@
     });
   }
 
+  /* ── 操作反馈（2026-09-22 加）─────────────────────────────────────────
+   * 【为什么要有】老板报「点归档、新建会话、删除项目或文件…点击后都没有状态显示」。
+   *   真浏览器实测：官方那两个操作**本身是好的**，但**成功后一律静默** ——
+   *   `archiveThread()` 只在 catch 里 `showStatus(error.message)`（成功什么都不说）；
+   *   `quickNewThread()` 直接建一条、连对话框都不弹（实测：点一下 `POST /v1/threads`，
+   *   `#new-thread-dialog` 根本没开）。客户点完只能自己去列表里找变化。
+   * 【顺带修一个真 bug】下面原来调的 `notify(...)` **在官方界面里根本没定义** ——
+   *   `function notify` 在整个 runtime_web 里 grep 不到（desk.html 里那个定义在**父页面**，
+   *   iframe 里拿不到）⇒ 插件开关那两处一调就抛 `ReferenceError`，
+   *   **连紧跟其后的列表刷新都没执行**。
+   * 【做法】不碰官方逻辑：只**旁听** fetch 的响应，成功后给一条我们自己的轻提示。
+   *   样式写 inline（不往官方样式表里塞东西，不和官方 CSS 抢）；提提示层 `pointer-events:none`
+   *   （不可能挡住任何点击）。 */
+  function notify(msg, sticky) {
+    try {
+      var el = document.getElementById('asbudy-opnote');
+      if (!el) {
+        el = document.createElement('div');
+        el.id = 'asbudy-opnote';
+        el.style.cssText = 'position:fixed;left:50%;bottom:26px;transform:translateX(-50%);'
+          + 'background:rgba(14,26,48,.96);border:1px solid rgba(72,215,255,.28);color:#f6f2e8;'
+          + 'padding:9px 16px;border-radius:9px;font-size:13px;z-index:99999;pointer-events:none;'
+          + 'opacity:0;transition:opacity .18s;box-shadow:0 8px 24px rgba(0,0,0,.45)';
+        document.body.appendChild(el);
+      }
+      el.textContent = String(msg || '');
+      el.style.opacity = '1';
+      clearTimeout(notify._t);
+      if (sticky) return;               // 「进行中」这类要一直挂着，等结果回来再换
+      notify._t = setTimeout(function () { el.style.opacity = '0'; }, 2600);
+    } catch (e) {}
+  }
+
+  /* ── 「正在处理」提示（2026-09-22 老板：「等待期间没有任何状态提示，
+     这几秒钟的等待时间用户不知道自己点了没有」）──
+     跟桌上那层同一个做法：在 fetch 这一层**统一旁听写操作**，延迟 250ms 才显示
+     （快操作不闪），结果回来再换成结果。排除对话（`/turns`、`/events`）——
+     那条官方自己有「发送中」，而且要跑很久。 */
+  (function () {
+    if (window.__asbudyBusy) return;
+    window.__asbudyBusy = true;
+    var orig = window.fetch;
+    var inflight = 0, timer = null, shown = false;
+    var noteEl = function () { return document.getElementById('asbudy-opnote'); };
+    function start() {
+      if (timer !== null) return;
+      timer = setTimeout(function () { shown = true; notify('正在处理…', true); }, 250);
+    }
+    function finish() {
+      if (timer !== null) { clearTimeout(timer); timer = null; }
+      if (!shown) return;
+      setTimeout(function () {
+        if (!shown) return;
+        shown = false;
+        var el = noteEl();
+        if (el && el.textContent === '正在处理…') notify('已完成');
+        else if (el) { clearTimeout(notify._t); el.style.opacity = '0'; }
+      }, 200);
+    }
+    window.fetch = function (input, init) {
+      var url = (typeof input === 'string') ? input : ((input && input.url) || '');
+      var m = String((init && init.method) || (input && input.method) || 'GET').toUpperCase();
+      if (m === 'GET' || m === 'HEAD' || m === 'OPTIONS' || /\/v1\/threads\/[^/]+\/(turns|events)/.test(url)) {
+        return orig.apply(this, arguments);
+      }
+      inflight++;
+      start();
+      var p = orig.apply(this, arguments);
+      var done = function () { if (--inflight <= 0) { inflight = 0; finish(); } };
+      p.then(done, done);
+      return p;
+    };
+  })();
+
+  /* 旁听官方那两个「点完静默」的操作 —— 成功了给一句反馈（不改官方请求、不拦不改） */
+  (function () {
+    if (window.__asbudyFetchTap) return;
+    window.__asbudyFetchTap = true;
+    var orig = window.fetch;
+    window.fetch = function (input, init) {
+      var url = (typeof input === 'string') ? input : ((input && input.url) || '');
+      var method = String((init && init.method) || (input && input.method) || 'GET').toUpperCase();
+      var body = (init && typeof init.body === 'string') ? init.body : '';
+      var p = orig.apply(this, arguments);
+      try {
+        if (method === 'POST' && /\/v1\/threads(\?|$)/.test(url)) {
+          p.then(function (r) { if (r && r.ok) notify('已新建会话'); }, function () {});
+        } else if (method === 'PATCH' && /\/v1\/threads\/[^/?]+$/.test(url) && body.indexOf('archived') >= 0) {
+          p.then(function (r) {
+            if (!r || !r.ok) return;
+            notify(/"archived"\s*:\s*true/.test(body) ? '已归档' : '已更新');
+          }, function () {});
+        }
+      } catch (e) {}
+      return p;
+    };
+  })();
+
   /* ── 样式 ── */
   var st = document.createElement('style');
   st.textContent = [
@@ -3615,6 +3713,9 @@
         note('图片要配一句话一起发送');
       }
     }
+    // 给**父页面（桌面 desk.html）**留一个入口：桌面上把一个图片图标拖到窗口上，
+    //   父页面取回文件内容后合成 File 直接递进来（同源）。见 desk.html 的 handIconToWin。
+    window.__asbudyAttachFiles = addFiles;
 
     /** 当前会话的模型支不支持看图 —— 问引擎要（不猜）。 */
     function modelSupportsImage() {
@@ -3687,7 +3788,116 @@
       btn.onclick = function () { pick.click(); };
       actions.insertBefore(btn, actions.firstChild);
 
+      // 「图片」旁边再给一个入口：从**自己的空间目录**里选（2026-09-22 老板要的）——
+      //   以前只能从本机 / 手机选，服务器上早就存在的图（桌面 / 我的资料）选不了。
+      //   单独的按钮、不合并进「图片」：不改变原有入口的行为（避开和官方 / 已有测试的冲突）。
+      var spaceBtn = document.createElement('button');
+      spaceBtn.type = 'button';
+      spaceBtn.id = 'asbudy-img-space-btn';
+      spaceBtn.className = 'quiet-button';
+      spaceBtn.textContent = '我的空间';
+      spaceBtn.title = '从你的空间目录里选图片';
+      spaceBtn.onclick = function () { openPickFromSpace(); };
+      btn.parentNode.insertBefore(spaceBtn, btn.nextSibling);
+
       return true;
+    }
+
+    /* ── 从「我的空间」选图片 ────────────────────────────────────────
+       数据源就是账号根目录树：`GET /_gate/files?scope=root&dir=<相对路径>`，
+       一次读一层（跟桌面的「文件夹窗口」同一个接口）。只列图片与目录。
+       选中一张 → `/_gate/file/dl` 取回内容 → 合成 File → 进待发列表。 */
+    function mimeByName(name) {
+      var m = String(name).match(/\.([a-z0-9]+)$/i);
+      if (!m) return '';
+      var e = m[1].toLowerCase();
+      return e === 'png' ? 'image/png' : e === 'jpg' || e === 'jpeg' ? 'image/jpeg'
+           : e === 'gif' ? 'image/gif' : e === 'webp' ? 'image/webp' : '';
+    }
+
+    function openPickFromSpace() {
+      var old = document.getElementById('asbudy-pick');
+      if (old) old.remove();
+      var wrap = document.createElement('div');
+      wrap.id = 'asbudy-pick';
+      wrap.style.cssText = 'position:fixed;inset:0;z-index:100000;background:rgba(2,7,17,.62);'
+        + 'display:flex;align-items:center;justify-content:center';
+      wrap.innerHTML =
+        '<div style="width:min(680px,92vw);max-height:78vh;display:flex;flex-direction:column;background:var(--surface,#0e1a30);'
+        + 'border:1px solid var(--line);border-radius:12px;box-shadow:0 20px 60px rgba(0,0,0,.55);overflow:hidden">'
+        + '<div style="display:flex;align-items:center;gap:10px;padding:12px 14px;border-bottom:1px solid var(--line)">'
+        + '<strong style="font-size:14px;color:var(--text);flex:none">从我的空间选图片</strong>'
+        + '<span id="asbudy-pick-crumb" style="font-size:12px;color:var(--text-soft);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"></span>'
+        + '<button type="button" id="asbudy-pick-x" class="quiet-button">关闭</button></div>'
+        + '<div id="asbudy-pick-list" style="padding:10px 12px;overflow:auto"></div></div>';
+      document.body.appendChild(wrap);
+      wrap.addEventListener('click', function (e) { if (e.target === wrap) wrap.remove(); });
+      wrap.querySelector('#asbudy-pick-x').onclick = function () { wrap.remove(); };
+      var listEl = wrap.querySelector('#asbudy-pick-list');
+      var crumbEl = wrap.querySelector('#asbudy-pick-crumb');
+
+      function rowBase() {
+        var b = document.createElement('button');
+        b.type = 'button';
+        b.style.cssText = 'display:flex;align-items:center;gap:10px;width:100%;text-align:left;padding:8px 10px;margin:2px 0;'
+          + 'background:transparent;border:1px solid transparent;border-radius:8px;color:var(--text);cursor:pointer;font:inherit';
+        b.onmouseenter = function () { b.style.background = 'var(--hover)'; };
+        b.onmouseleave = function () { b.style.background = 'transparent'; };
+        return b;
+      }
+
+      function load(dir) {
+        crumbEl.textContent = dir ? ('/' + dir) : '账号根目录';
+        listEl.innerHTML = '<div style="color:var(--text-soft);font-size:13px;padding:8px">读取中…</div>';
+        fetch('/_gate/files?scope=root&dir=' + encodeURIComponent(dir || ''), { credentials: 'same-origin' })
+          .then(function (r) { return r.ok ? r.json() : Promise.reject(new Error('读不到这个目录')); })
+          .then(function (d) {
+            var items = (d && d.files) || [];
+            listEl.innerHTML = '';
+            if (dir) {
+              var up = rowBase();
+              up.innerHTML = '<span style="flex:1">.. 返回上一层</span>';
+              up.onclick = function () { load(dir.split('/').slice(0, -1).join('/')); };
+              listEl.appendChild(up);
+            }
+            var dirs = items.filter(function (x) { return x.isDir; });
+            var imgs = items.filter(function (x) { return !x.isDir && mimeByName(x.name); });
+            if (!dirs.length && !imgs.length) {
+              listEl.innerHTML = '<div style="color:var(--text-soft);font-size:13px;padding:8px">这个位置没有可选的图片</div>';
+              return;
+            }
+            dirs.forEach(function (x) {
+              var row = rowBase();
+              row.innerHTML = '<span style="flex:1">' + esc(x.name) + '/</span>';
+              row.onclick = function () { load(dir ? dir + '/' + x.name : x.name); };
+              listEl.appendChild(row);
+            });
+            imgs.forEach(function (x) {
+              var path = dir ? dir + '/' + x.name : x.name;
+              var row = rowBase();
+              row.innerHTML = '<span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc(x.name) + '</span>'
+                + '<span style="font-size:12px;color:var(--text-soft);flex:none">加入</span>';
+              var tag = row.lastChild;
+              row.onclick = function () {
+                if (row.dataset.busy === '1') return;
+                row.dataset.busy = '1';
+                tag.textContent = '读取中…';
+                fetch('/_gate/file/dl?scope=root&name=' + encodeURIComponent(path), { credentials: 'same-origin' })
+                  .then(function (r) { if (!r.ok) throw new Error('读不到这张图'); return r.blob(); })
+                  .then(function (b) {
+                    return addFiles([new File([b], path.split('/').pop(), { type: mimeByName(path) })]);
+                  })
+                  .then(function () { tag.textContent = '已加入'; notify('已加入待发送：' + path.split('/').pop()); })
+                  .catch(function (e) { row.dataset.busy = ''; tag.textContent = '加入'; notify('没能取回这张图：' + (e && e.message || e)); });
+              };
+              listEl.appendChild(row);
+            });
+          })
+          .catch(function (e) {
+            listEl.innerHTML = '<div style="color:var(--text-soft);font-size:13px;padding:8px">' + esc(e.message) + '</div>';
+          });
+      }
+      load('');
     }
 
     // 粘贴：焦点在输入框时贴图
