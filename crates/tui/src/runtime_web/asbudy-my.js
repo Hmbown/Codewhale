@@ -2950,6 +2950,22 @@
       if (secs < 60) return secs + 's';
       return Math.floor(secs / 60) + 'm ' + String(secs % 60).padStart(2, '0') + 's';
     }
+    /** 阶段墨色 —— 照 CLI `underwater.rs:638 phase_ink()`：
+     *  · Working / Verifying → `Active`（Seafoam 青绿）
+     *  · Waiting / Approval  → `Waiting`（Signal Gold 黄）
+     *  · Failed              → `Failure`（Rose 红）
+     *  官方注释原文：*"Status-bar phase ink. Failure red is only `Failed`."*（**红只给失败**）。
+     *  ⚠️ 这三个 CSS 变量与 CLI 的调色板**逐字同源**（2026-09-22 实测核对过，不是凡的）：
+     *     `--status-live` #4FD1C5 = `palette/tokens.rs` 的 `WHALE_ACCENT_SECONDARY_RGB`（＝ `WHALE_LIVE`，
+     *        而 `themes.rs` 里 `status_working: WHALE_LIVE`）
+     *     `--status-human` #F6C453 = `WHALE_HUMAN_RGB`（＝ `accent_action`，`ChromeInk::Waiting` 用它）
+     *     `--status-danger` #FF86B2 = `WHALE_ERROR_RGB`（＝ `error_fg`，`ChromeInk::Failure` 用它）
+     *  ⇒ **不新造颜色**，直接用两边共用的那一套；带上 fallback 防变量缺失。 */
+    function liveInk(what) {
+      if (what === '失败') return 'var(--status-danger, #ff86b2)';
+      if (what === '等你处理') return 'var(--status-human, #f6c453)';
+      return 'var(--status-live, #4fd1c5)';
+    }
     function liveTick() {
       var el = document.getElementById('asbudy-live');
       if (!el) return;
@@ -2957,6 +2973,7 @@
       var secs = (Date.now() - LIVE.since) / 1000;
       el.hidden = false;
       el.textContent = LIVE.what + ' ' + fmtElapsed(secs);
+      el.style.color = liveInk(LIVE.what);
     }
     function liveSet(what) {
       LIVE.active = true;
@@ -2964,7 +2981,16 @@
       if (!LIVE.since) LIVE.since = Date.now();
       liveTick();
     }
-    function liveStop() {
+    function liveStop(keepMs) {
+      // 失败态要先露一下红才藏（CLI 的 `Failed` 是个常驻相位；网页上状态行在
+      //  `turn.completed` 就要收，不过渡一下的话红只闪一帧就没了）。
+      if (keepMs && keepMs > 0) {
+        var mine = LIVE.what;
+        setTimeout(function () {
+          if (LIVE.what === mine) { LIVE.active = false; LIVE.since = 0; liveTick(); }
+        }, keepMs);
+        return;
+      }
       LIVE.active = false;
       LIVE.since = 0;
       liveTick();
@@ -3166,7 +3192,15 @@
       var ev = d.event;
       var p = d.payload || {};
       if (ev === 'turn.started') { LIVE.since = Date.now(); liveSet('工作中'); return; }
-      if (ev === 'turn.completed') { liveStop(); return; }
+      if (ev === 'turn.completed') {
+        // 照 CLI 的 `ShellPhase::Failed`（`underwater.rs:427`）—— 整轮失败是**独立相位**，用量红表示。
+        //   ⚠️ 不看 `item.failed`（那是**单个工具**失败：卡上自己会变红，不该把整条状态行也染红）。
+        //   turn 的状态在 payload.turn.status（`completed` / `failed` / `cancelled`）。
+        var tst = (p.turn && p.turn.status) || 'completed';
+        if (tst === 'failed') { liveSet('失败'); liveStop(3000); return; }
+        liveStop();
+        return;
+      }
       if (ev === 'item.started') {
         var toolName = (p.tool && p.tool.name) || '';
         var kind = (p.item && p.item.kind) || '';
