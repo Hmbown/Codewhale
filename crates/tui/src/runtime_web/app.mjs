@@ -496,8 +496,12 @@ const RECEIPT_STATUS_ZH = {
   interrupted: "已打断",
 };
 
-function receiptLabelZh(kind, status) {
-  const head = RECEIPT_KIND_ZH[kind] || humanize(kind);
+/** 卡头——`族标签 · 状态`（如「运行 · 完成」）。
+ *  ⚠️ 2026-09-22（第 47 轮第二步）：原来是 `工具 · 完成`（只看 kind，所有工具一个样）。
+ *    现在优先用**工具族**（`▷ 读取` / `▶ 运行` / `⌕ 搜索`…）—— 照 CLI 卡头词汇。
+ *    族认不出来时退回原来的 kind 词（`tool_call` → 「工具」），所以**行为向后兼容**。 */
+function receiptLabelZh(kind, status, familyZh) {
+  const head = familyZh || RECEIPT_KIND_ZH[kind] || humanize(kind);
   const tail = RECEIPT_STATUS_ZH[status] || humanize(status);
   return tail ? `${head} · ${tail}` : head;
 }
@@ -891,6 +895,15 @@ const TOOL_FAMILY_GLYPH = {
   read: "\u25B7", patch: "\u25C6", run: "\u25B6", find: "\u2315", delegate: "\u25D0",
   fanout: "\u22EE", rlm: "\u22EE", verify: "\u2713", think: "\u2026", generic: "\u2022",
 };
+/** 族标签（中文）—— **逐字照官方语言包** `crates/localization/locales/zh-Hans.json`
+ *  的 `ToolFamilyRead/Patch/Run/Find/Delegate/Fanout/Rlm/Verify/Think/Generic`，
+ *  **不自己造词**（铁律 #2：官方有就照搬）。英文那侧是 `read/patch/run/find/agent/fanout/rlm/verify/think/tool`。
+ *  用途：卡头显示「**运行** · 完成」而不是笼统的「工具 · 完成」——
+ *  照 CLI 的卡头词汇（`widgets/tool_card.rs:31-58` 那个枚举的注释：`▷ read` / `▶ run`…）。 */
+const TOOL_FAMILY_ZH = {
+  read: "读取", patch: "修补", run: "运行", find: "搜索", delegate: "代理",
+  fanout: "扇出", rlm: "rlm", verify: "验证", think: "思考", generic: "工具",
+};
 
 /** 这条 item 的**官方工具名**（canonical 别名）—— 族判定与「运行汇总」的公共前置。
  *  ⚠️ 为什么单独抽出来（2026-09-20 做 M10 时）：官方 `tool_run.rs` 的
@@ -902,6 +915,17 @@ export function toolAliasOf(item) {
   const raw = String(meta.tool_name || meta.tool || "").trim();
   if (!raw) return "";
   let alias = raw;
+  // 照官方 `tools/canonical_action.rs:181-186` —— **模型面新用的文件原语复用旧语义名**：
+  //   `"read" → "read_file"` · `"write" → "write_file"` · `"edit" → "edit_file"`
+  //   （官方注释原话：*The new model-facing file primitives deliberately reuse the old
+  //   semantic policy names* —— 为了权限表 / 策略缓存 / 审计聚合跨表示形式兼容）。
+  // ⚠️ **2026-09-22 补**：这一步以前漏了 ⇒ 引擎实际发的裸 `read` 查不到族，
+  //   工具卡退成「工具 · 完成」（而不是「读取 · 完成」）。实测 admin 会话里真实出现的
+  //   tool_name：`bash`（走下面的 family 分支，认得）· `read`（**原来就是漏的**）·
+  //   `tool_search` · `automation`（后两个官方 `tool_family_for_name` 里也没有 ⇒ generic，合理）。
+  //   官方也是**提前 return**，不再往下查。
+  const FILE_PRIMITIVE_ALIASES = { read: "read_file", write: "write_file", edit: "edit_file" };
+  if (FILE_PRIMITIVE_ALIASES[raw]) return FILE_PRIMITIVE_ALIASES[raw];
   const family = CANONICAL_ACTION_ALIASES[raw];
   if (family) {
     let input = {};
@@ -1272,7 +1296,7 @@ export function receiptPresentation(item = {}) {
   const mutSummary = mutationSummaryZh(item);
   const summaryText = mutSummary || intent;
   return {
-    label: receiptLabelZh(item.kind, item.status),
+    label: receiptLabelZh(item.kind, item.status, TOOL_FAMILY_ZH[toolFamilyOf(item)] || ""),
     summary: summaryText ? (failed ? `${summaryText} —— 未完成` : summaryText) : (statusZh || raw),
     raw: fullRaw,
     failed,
