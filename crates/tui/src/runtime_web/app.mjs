@@ -594,6 +594,21 @@ export function boundedDiffLines(diffText, limit = MAX_INLINE_DIFF_LINES) {
  * 我们以前把正文全收紧在折块里 ⇒ 默认档下客户**一个字都看不到**（比官方少）—— 这就是补的那块。 */
 export const OUT_PREVIEW_SUCCESS_LINES = 4;   // 官方 TOOL_SUMMARY_CARD_LINES(6) − 头部 − 展开提示
 
+/* 安静模式（calm）下的正文预览行数 —— 2026-09-22 加（档案 §8.7 201：以前这个开关**没有消费方**）。
+ * 官方 match 顺序（`tui/history.rs:469-480`）：明细**关**先命中（6 行，calm 不参与）；
+ * 明细**开** + calm 开 → `TOOL_CARD_SUMMARY_LINES`=8 行（= `TOOL_SUCCESS_OUTPUT_PREVIEW_LINES` 6 + 头部 + 展开提示）。
+ * ⇒ 「少了头部和展开提示」的那 6 行就是这里的 6（跟 `OUT_PREVIEW_SUCCESS_LINES` 是同一个换算）。
+ * ⚠️ 所以 calm **只在明细开着时**才换行数 —— 这就是默认档下它「看起来没用」的真正原因。 */
+export const OUT_PREVIEW_CALM_LINES = 6;   // 官方 TOOL_CARD_SUMMARY_LINES(8) − 头部 − 展开提示
+
+/** 安静模式是否在**这条卡上**参与（明细开 + calm 开）—— 纯读 <html data-ab-*>，不碰别的。
+ *  属性由 `asbudy-my.js` 按引擎值写上；读不到就当不参与（退到默认）。 */
+export function calmPreviewActive() {
+  if (typeof document === "undefined" || !document.documentElement) return false;
+  const h = document.documentElement;
+  return h.getAttribute("data-ab-calm") === "on" && h.getAttribute("data-ab-tools") === "on";
+}
+
 /** 官方失败卡的预算（`TOOL_OUTPUT_LINE_LIMIT`）—— 失败卡不做小预览 */
 export const OUT_PREVIEW_FAILED_LINES = 20;
 
@@ -2854,7 +2869,9 @@ function startBrowserClient() {
       const previewText = String(item.detail || item.summary || "").replace(/\r\n?/g, "\n");
       const previewLines = previewText.split("\n");
       while (previewLines.length && previewLines[previewLines.length - 1] === "") previewLines.pop();
-      const limit = presentation.failed ? OUT_PREVIEW_FAILED_LINES : OUT_PREVIEW_SUCCESS_LINES;
+      const limit = presentation.failed
+        ? OUT_PREVIEW_FAILED_LINES
+        : (calmPreviewActive() ? OUT_PREVIEW_CALM_LINES : OUT_PREVIEW_SUCCESS_LINES);
       const { parts } = selectedOutputLines(previewLines, limit);
       if (!parts.length) {
         if (!outPreviewEl.hidden) { outPreviewEl.hidden = true; outPreviewEl.replaceChildren(); outPreviewEl.dataset.previewKey = ""; }

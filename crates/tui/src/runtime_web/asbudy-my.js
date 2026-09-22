@@ -212,7 +212,7 @@
    *   值本身仍存在引擎里（GET/POST /v1/config），与终端界面看到的一致。
    * ⚠️ 依赖官方 DOM 结构（`article.reasoning` / `.receipt`）—— 官方改结构要跟着改（升级检查清单里有）。
    */
-  var DISPLAY = { show_thinking: true, thinking_default_expanded: false, show_tool_details: false, calm_mode: false, cost_currency: 'usd', thinking_highlight: true, inline_diffs: 'full', thinking_preview_lines: 2 };
+  var DISPLAY = { show_thinking: true, thinking_default_expanded: false, show_tool_details: false, calm_mode: false, cost_currency: 'usd', thinking_highlight: true, inline_diffs: 'full', thinking_preview_lines: 2, statusline_off: null };
 
   var stD = document.createElement('style');
   stD.textContent = [
@@ -294,9 +294,23 @@
   ].join('\n');
   document.head.appendChild(stD);
 
+  /* 「默认展开思考过程」只作用于**新出现的**思考卡。
+   * ⚠️ 2026-09-22 修真 bug（档案 §8.7 201 第①条）：以前这里把**所有**未展开的 details 全打开，
+   *   而它挂在 MutationObserver 上（任何一个 DOM 变化都会跑）⇒ 客户**手动收起**思考卡之后，
+   *   只要来一条新消息 / 工具卡刷新一下，就被**again弹开** —— 客户根本收不起来，
+   *   看起来就是「这个开关时灵时不灵」（老板说的「很多都实际无效」里就有它）。
+   * 现在：进过 `reasoningSeen` 的节点一律不再动（客户收起的就一直是收起的）；
+   *   设置值自己变化时清空一次（客户改设置 = 明确想要新状态，见 syncDisplayPref）。 */
+  var reasoningSeen = (typeof WeakSet === 'function') ? new WeakSet() : null;
   function openReasoning() {
-    var list = document.querySelectorAll('article.reasoning details:not([open])');
-    for (var i = 0; i < list.length; i++) list[i].open = true;
+    if (!reasoningSeen) return;
+    var list = document.querySelectorAll('article.reasoning details');
+    for (var i = 0; i < list.length; i++) {
+      var d = list[i];
+      if (reasoningSeen.has(d)) continue;   // 见过的不再动（含客户手动收起的）
+      reasoningSeen.add(d);
+      d.open = true;
+    }
   }
   /* 明细开关打开 → 回执的「查看回执」默认摊开。
    * 官方 tools=on 时是不截断、**完整显示**；web 上「完整」装在折叠块里，
@@ -309,6 +323,16 @@
    *   所以展开归 `show_tool_details` 管。 */
   function openReceiptDetails() {
     if (!DISPLAY.show_tool_details) return;
+    // ⚠️ 安静模式（2026-09-22 让它**真生效** —— 档案 §8.7 201：以前它是个完全无效的开关，
+    //   值写进了引擎与 prefs.json，网页端却**零消费方**）。
+    //   官方语义查准了（`tui/history.rs:469-480` 的 match 顺序，别照注释猜）：
+    //     · 明细**关**            → 卡截到 `TOOL_SUMMARY_CARD_LINES`=6 行（calm **不参与**，第一个分支先命中）
+    //     · 明细**开** + calm 开  → 卡截到 `TOOL_CARD_SUMMARY_LINES`=8 行
+    //     · 明细**开** + calm 关  → 完整
+    //   ⇒ **calm 只在明细开着时才起作用**（这就是它在默认档下「看起来没用」的真正原因）。
+    //   网页上「完整」＝把折块摊开，所以 calm 开时不摊开，正文改由卡上预览按 8 行预算露出
+    //   （`app.mjs` 的 `calmPreviewActive()` 读 data-ab-calm 算行数）。
+    if (DISPLAY.calm_mode) return;
     var list = document.querySelectorAll('article.receipt details:not([open])');
     for (var i = 0; i < list.length; i++) list[i].open = true;
   }
@@ -356,6 +380,31 @@
     DISPLAY.thinking_preview_lines = (typeof c.thinking_preview_lines === 'number') ? c.thinking_preview_lines : 2;
     DISPLAY.cost_currency = c.cost_currency === 'cny' ? 'cny' : 'usd';
     applyDisplayPrefs();
+  });
+
+  /* 「状态行显示」按人存（门卫 `/_gate/prefs` 的 `statusline_off`）—— 2026-09-22 改。
+   * 读法：先认账号上那份；账号上没有而本机 localStorage 有 → **一次性迁上去**
+   *   （老客户不用重设），迁完就没 localStorage 什么事了。 */
+  function useStatuslineOff(list) {
+    DISPLAY.statusline_off = Array.isArray(list) ? list : [];
+    try { window.dispatchEvent(new CustomEvent('asbudy:statusline-change')); } catch (e) { /* 监听还没挂就算了 */ }
+  }
+  api('/_gate/prefs').then(function (r) {
+    if (!r.ok) return;
+    var raw = (r.body && r.body.prefs) ? r.body.prefs.statusline_off : null;
+    if (typeof raw === 'string' && raw) {
+      try {
+        var arr = JSON.parse(raw);
+        if (Array.isArray(arr)) { useStatuslineOff(arr); return; }
+      } catch (e) { /* 坏值当没设 */ }
+    }
+    try {
+      var old = JSON.parse(localStorage.getItem(STATUSLINE_OFF_KEY) || 'null');
+      if (Array.isArray(old) && old.length) {
+        useStatuslineOff(old);
+        setStatuslineOff(old);        // 搬到账号上（以后换浏览器也跟着跑）
+      }
+    } catch (e) { /* 没 localStorage 就算了 */ }
   });
 
   /* ── 浮层 ── */
@@ -727,9 +776,12 @@
    *   `statuslineSummary is not defined`、永远停在「加载中…」（实测踩到）。
    * 官方那一项存 **`settings.toml`**（`commands/groups/config/config.rs:550`
    *   → `AppAction::OpenStatusPicker`，实现在 `ui/apply.rs:2135`）；
-   * 而引擎的 `POST /v1/config` **白名单里没有状态行键** ⇒ 网页端只能落 **localStorage**
-   *   （跟 tip 机制同一处；**别去写 settings.toml** —— 会撞 EACCES，见 server.js 里那条教训）。
-   * ⚠️ 所以它**不跨浏览器**（换台机器/换个浏览器要重设）—— 界面上跟客户说清了。
+   * 而引擎的 `POST /v1/config` **白名单里没有状态行键** ⇒ 网页端一开始只能落 localStorage。
+   * ⚠️ **2026-09-22 改**（档案 §8.7 201 第④条：状态行只存本机、换浏览器要重设）：
+   *   现在跟别的显示偏好一样**存账号** —— 门卫 `PREFS_KEYS` 里的 `statusline_off`
+   *   （`/_gate/prefs`，值是 JSON 字符串），换浏览器 / 换机器都跟着跑。
+   *   `STATUSLINE_OFF_KEY` 只用于**首次迁移**老客户本机存的那份（迁完就自然不用了）。
+   *   （**别去写 settings.toml** —— 会撞 EACCES，见 server.js 里那条教训。）
    * 存的是「**关掉**的段」（默认全开 → 新搬的段自动出现，不用改存量设置）。 */
   var STATUSLINE_OFF_KEY = 'ab-statusline-off';
   var STATUSLINE_SEGS = [
@@ -739,14 +791,17 @@
     { k: 'cache', label: '缓存命中率（cache）' },
   ];
   function statuslineOff() {
-    try {
-      var raw = localStorage.getItem(STATUSLINE_OFF_KEY);
-      var arr = raw ? JSON.parse(raw) : [];
-      return Array.isArray(arr) ? arr : [];
-    } catch (e) { return []; }
+    var v = DISPLAY.statusline_off;
+    return Array.isArray(v) ? v.slice() : [];
   }
+  /** 存到**账号**上（换浏览器也跟着跑）——返回是否存成，调用方据此报错、不骗人。 */
   function setStatuslineOff(list) {
-    try { localStorage.setItem(STATUSLINE_OFF_KEY, JSON.stringify(list)); } catch (e) { /* 存不了就用默认 */ }
+    DISPLAY.statusline_off = (list || []).slice();
+    return api('/_gate/prefs', {
+      method: 'POST',
+      body: JSON.stringify({ prefs: { statusline_off: JSON.stringify(list || []) } }),
+    }).then(function (r) { return !!(r.ok && !(r.body && r.body.ok === false)); })
+      .catch(function () { return false; });
   }
   /** 「状态行显示」那一行的值文字 —— 全开时写「全部」，否则把关掉的列出来 */
   function statuslineSummary() {
@@ -776,6 +831,30 @@
     { v: 'low', t: '低 —— 更快' },
     { v: 'high', t: '高 —— 更仔细' },
     { v: 'max', t: '最高 —— 想得最久' },
+  ];
+  /* 「AI 回复语言」的可选值 —— **官方语言包全集**（`crates/localization/locales/*.json`，共 15 个）。
+   * ⚠️ 2026-09-22 补（档案 §8.7 201 第③条：以前只摆了 auto/简体中文/English 三档）。
+   *   名字用**该语言自己的写法**（照官方语言包的习惯），不译成中文。
+   * ⚠️ 真实效果分两档：引擎自带的语言强化（`prompts.rs:758/784`）**只覆盖
+   *   zh-Hans / ja / pt-BR / vi**；简体中文与 English 则由我们门卫在 system_prompt 里
+   *   逐字点名（见 server.js 的 `langReinforcement`）。其余语言靠模型自己 —— 界面上的小字说明了这一点。 */
+  var LOCALE_OPTS = [
+    { v: 'auto', t: '跟随系统（简体中文）' },
+    { v: 'zh-Hans', t: '简体中文' },
+    { v: 'zh-Hant', t: '繁體中文' },
+    { v: 'en', t: 'English' },
+    { v: 'ja', t: '日本語' },
+    { v: 'ko', t: '한국어' },
+    { v: 'de', t: 'Deutsch' },
+    { v: 'fr', t: 'Français' },
+    { v: 'es-419', t: 'Español (Latinoamérica)' },
+    { v: 'pt-BR', t: 'Português (Brasil)' },
+    { v: 'ru', t: 'Русский' },
+    { v: 'uk', t: 'Українська' },
+    { v: 'vi', t: 'Tiếng Việt' },
+    { v: 'id', t: 'Bahasa Indonesia' },
+    { v: 'hi', t: 'हिन्दी' },
+    { v: 'ca', t: 'Català' },
   ];
   /** 审批档的中文名 —— **一份定义两处用**（对话上方的标签、我的 → 高级设置那一行） */
   function approvalTextOf(mode) {
@@ -1917,7 +1996,17 @@
     if (n >= 10000) { var w = n / 10000; return (w >= 100 ? String(Math.round(w)) : String(Math.round(w * 10) / 10)) + ' 万'; }
     return tuN(n);
   }
-  function tuY(v) { return '￥' + (Number(v) || 0).toFixed(2); }
+  /* 金额符号跟着「货币单位」偏好走（2026-09-22 修 —— 档案 §8.7 201：以前这里硬编码 ￥，
+   *   于是同一个人的用量页里，「高级设置」那行显示 $ 而这里显示 ￥，两种口径。
+   *   ⚠️ 偏好是**按人**的（DISPLAY.cost_currency 来自该账号的 /v1/config）；管理员看的是所有账号
+   *   的用量，用他自己的偏好显示，与界面其余部分一致。 */
+  function tuY(v) {
+    var usd = DISPLAY.cost_currency !== 'cny';
+    return (usd ? '$' : '￥') + (Number(v) || 0).toFixed(2);
+  }
+  /** 金额（给同时有 cny / usd 两个原值的场景挑一个）。
+   *  引擎两个原值都报，直接按偏好取，不做汇率换算。 */
+  function tuMoney(cny, usd) { return tuY(DISPLAY.cost_currency === 'cny' ? cny : (usd == null ? cny : usd)); }
   function tuLine(left, mid, right) {
     return '<div style="display:flex;gap:10px;align-items:baseline;padding:3px 0;font-size:13.5px;color:var(--text-dim)">' +
       '<span style="min-width:82px">' + esc(left) + '</span>' +
@@ -1936,7 +2025,7 @@
       return h;
     }
     var t = a.totals;
-    h += '<div class="ab-s" style="font-size:16px;color:var(--text)">' + tuY(t.costCny) +
+    h += '<div class="ab-s" style="font-size:16px;color:var(--text)">' + tuMoney(t.costCny, t.costUsd) +
       '　<span style="font-size:13.5px">（调用 ' + tuN(t.calls) + ' 次）</span></div>';
     h += '<div class="ab-s">进 ' + tuW(t.inTok) + ' · 出 ' + tuW(t.outTok) +
       ' · 缓存命中 ' + tuW(t.cachedTok) + ' · 推理 ' + tuW(t.reasonTok) + '</div>';
@@ -1949,7 +2038,7 @@
       a.days.forEach(function (d) {
         h += tuLine(d.date,
           tuN(d.calls) + ' 次 · 进 ' + tuW(d.inTok) + ' · 出 ' + tuW(d.outTok) + ' · 缓存 ' + tuW(d.cachedTok),
-          tuY(d.costCny));
+          tuMoney(d.costCny, d.costUsd));
       });
     }
     if (a.projects && a.projects.length) {
@@ -1958,7 +2047,7 @@
         var b = p.brief || {};
         h += tuLine(p.name || p.key || '未归属',
           tuN(b.calls) + ' 次 · 进 ' + tuW(b.inTok) + ' · 出 ' + tuW(b.outTok) + ' · 缓存 ' + tuW(b.cachedTok),
-          tuY(b.costCny));
+          tuMoney(b.costCny, b.costUsd));
       });
     }
     h += '</div>';
@@ -1975,13 +2064,13 @@
       '<b>' + esc(c.label) + '</b>' +
       '<span class="ab-s" style="margin:0">' + esc(c.roleZh) + ' · ' + esc(c.key) + '</span>' +
       '<span style="flex:1"></span>' +
-      '<span style="color:var(--text)">' + tuY(t.costCny) + '</span>' +
+      '<span style="color:var(--text)">' + tuMoney(t.costCny, t.costUsd) + '</span>' +
       '<span class="ab-s" style="margin:0;min-width:56px;text-align:right">' + tuN(t.calls) + ' 次</span></div>';
     h += '<div class="ab-s" style="padding:0 13px 6px 33px">进 ' + tuW(t.inTok) + ' · 出 ' + tuW(t.outTok) +
       ' · 缓存命中 ' + tuW(t.cachedTok) + ' · 推理 ' + tuW(t.reasonTok) + '</div>';
     h += '<div class="ab-s" style="padding:0 13px 10px 33px">' +
-      '本账号 ' + tuY(c.ownCny) + '（' + tuN(c.ownCalls) + ' 次）　·　' +
-      '名下员工 ' + tuY(c.staffCny) + '（' + tuN(c.staffCalls) + ' 次）</div>';
+      '本账号 ' + tuMoney(c.ownCny, c.ownUsd) + '（' + tuN(c.ownCalls) + ' 次）　·　' +
+      '名下员工 ' + tuMoney(c.staffCny, c.staffUsd) + '（' + tuN(c.staffCalls) + ' 次）</div>';
     h += '<div data-body="' + esc(c.key) + '" hidden style="border-top:1px solid var(--line);padding:10px 13px 12px">';
     h += '<div class="ab-s" style="margin:0 0 2px">名下账号明细（' + c.accounts.length + ' 个）</div>';
     c.accounts.forEach(function (a) { h += tuAccountCard(a, true); });
@@ -1997,7 +2086,7 @@
       (d.cached ? '<br>本次为 60 秒内的缓存结果，点「刷新」可强制重读。' : '') + '</div>';
     h += tuRangeBar() + '<div class="ab-card">';
     h += '<div class="ab-card-top"><b>全部账号合计</b>' + tuRefresh() + '</div>';
-    h += '<div class="ab-s" style="font-size:16px;color:var(--text)">' + tuY(g.costCny) +
+    h += '<div class="ab-s" style="font-size:16px;color:var(--text)">' + tuMoney(g.costCny, g.costUsd) +
       '　<span style="font-size:13.5px">（调用 ' + tuN(g.calls) + ' 次）</span></div>';
     h += '<div class="ab-s">进 ' + tuW(g.inTok) + ' · 出 ' + tuW(g.outTok) + ' · 缓存命中 ' + tuW(g.cachedTok) +
       ' · 推理 ' + tuW(g.reasonTok) + '</div>';
@@ -2175,12 +2264,19 @@
   function openAdvanced() {
     openLayer('高级设置', function (body) {
       body.innerHTML = '<div id="ab-adv">加载中…</div>';
-      Promise.all([api('/_gate/advanced'), api('/_gate/model-key'), api('/v1/config'), api('/_gate/repo')]).then(function (rs) {
+      Promise.all([api('/_gate/advanced'), api('/_gate/model-key'), api('/v1/config'), api('/_gate/repo'), api('/_gate/prefs')]).then(function (rs) {
         var r = rs[0];
         var mk = rs[1].body || {};
         var cfg = (rs[2] && rs[2].body) || {}
         var repo = (rs[3] && rs[3].body) || {};
-        var am = cfg.approval_mode || 'auto';   // auto=小的自己做、拿不准才问（默认）｜ suggest=每步先问 ｜ bypass=全放行
+        // ⚠️ 审批档从**平台侧**（`/_gate/prefs`）读，**不能**从引擎 `/v1/config` 读（2026-09-22 修，
+        //   档案 §8.7 201 第②条衍生出的真 bug）—— 平台侧存的是三档（bypass/auto/suggest），
+        //   而引擎 `approval_policy` **不认 bypass**（写前得映射成 auto，见门卫）
+        //   ⇒ 引擎读出来永远是映射后的值。后果（实测）：客户选了「完全访问」，
+        //   对话上方的「审批」标签说「完全访问」（读线程 posture，对的），
+        //   而这里却说「自动审核」—— 同一件事两处不一致（老板一眼就能看到）。
+        //   写路径本来就是平台侧（`setCfg` → `/_gate/prefs`），显示也得同源才自洽。
+        var am = (rs[4] && rs[4].body && rs[4].body.prefs && rs[4].body.prefs.approval_mode) || 'auto';
         var cur = cfg.cost_currency === 'cny' ? 'cny' : 'usd';
         // 2026-09-19：官方 /config 里本来就有的显示类键（以前只接了一半，客户调不了）
         var diffsMode = (cfg.inline_diffs === 'summary' || cfg.inline_diffs === 'off') ? cfg.inline_diffs : 'full';
@@ -2199,7 +2295,7 @@
         var d = r.body || {};
         var u = d.usage;
         el.innerHTML =
-          '<div class="ab-tip">以下设置会应用到<b>你的所有项目</b>（含以后新建的）。</div>' +
+          '<div class="ab-tip">以下设置会应用到<b>你的所有项目</b>（含以后新建的）；只有「只读模式」是个例外（它按项目走，下面单说）。</div>' +
           '<div class="ab-row"><label>模型服务</label><span class="ab-input" style="cursor:default;color:var(--text-dim);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' +
             esc(mk.provider || '—') + ' · ' + esc(mk.model || '—') + ' · ' + (mk.hasKey ? '已配置密钥' : '未配置密钥') +
           '</span><button class="ab-btn ghost sm" id="adv-mk" type="button" style="flex:0 0 auto">修改</button></div>' +
@@ -2227,7 +2323,11 @@
           '<label class="ab-chk"><input type="checkbox" id="adv-think"' + (cfg.show_thinking ? ' checked' : '') + '> 显示思考过程</label>' +
           '<label class="ab-chk"><input type="checkbox" id="adv-think-exp"' + (cfg.thinking_default_expanded ? ' checked' : '') + '> 默认展开思考过程</label>' +
           '<label class="ab-chk"><input type="checkbox" id="adv-tools"' + (cfg.show_tool_details ? ' checked' : '') + '> 显示文件与命令明细</label>' +
-          '<label class="ab-chk"><input type="checkbox" id="adv-calm"' + (cfg.calm_mode ? ' checked' : '') + '> 安静模式（少铺开，内容不丢）</label>' +
+          '<label class="ab-chk"><input type="checkbox" id="adv-calm"' + (cfg.calm_mode ? ' checked' : '') + '> 安静模式</label>' +
+          // 2026-09-22：这个开关以前**完全无效**（档案 §8.7 201：值写进了引擎，网页零消费方）。
+          //   照官方语义（`tui/history.rs:469-480` 的 match 顺序）修好后，它**只在「显示文件与命令明细」开着时**起作用
+          //   —— 不把真实条件写给客户，客户在默认档下勾它仍会觉得「没用」。
+          '<div class="ab-tip" style="margin:-2px 0 10px 0">开了「显示文件与命令明细」后，工具卡也只露前几行、不铺满屏幕。想看全就点卡上的「查看回执」。</div>' +
           '<label class="ab-chk"><input type="checkbox" id="adv-think-bg"' + (cfg.thinking_highlight !== false ? ' checked' : '') + '> 思考内容加底色</label>' +
           '<div class="ab-row"><label>文件改动显示</label><select class="ab-input" id="adv-diffs">' +
             '<option value="full"' + (diffsMode === 'full' ? ' selected' : '') + '>完整改动（红绿对照）</option>' +
@@ -2245,15 +2345,16 @@
             //   否则客户一改就会撞到引擎的 400（「未知配置键」）。引擎更新后自动出现。
             : '') +
           '<div class="ab-row"><label>AI 回复语言</label><select class="ab-input" id="adv-locale">' +
-            '<option value="auto"' + (loc === 'auto' ? ' selected' : '') + '>跟随系统</option>' +
-            '<option value="zh-Hans"' + (loc === 'zh-Hans' ? ' selected' : '') + '>简体中文</option>' +
-            '<option value="en"' + (loc === 'en' ? ' selected' : '') + '>English</option>' +
+            LOCALE_OPTS.map(function (o) {
+              return '<option value="' + o.v + '"' + (loc === o.v ? ' selected' : '') + '>' + esc(o.t) + '</option>';
+            }).join('') +
           '</select></div>' +
+          '<div class="ab-tip" style="margin:-2px 0 10px 0">AI 回复与思考用哪种语言。简体中文与 English 是逐字校准过的；其余语言由模型自己拿捧（引擎只对简体中文 / 日本語 / Português / Tiếng Việt 有官方强化）。</div>' +
           '<div class="ab-row"><label>状态行显示</label><span class="ab-input" id="adv-statusline-val" style="cursor:default;color:var(--text-dim)">' +
             esc(statuslineSummary()) +
           '</span><button class="ab-btn ghost sm" id="adv-statusline" type="button" style="flex:0 0 auto">修改</button></div>' +
           '<div id="adv-statusline-list" style="display:none;margin:-4px 0 10px 78px"></div>' +
-          '<div class="ab-tip" style="margin:-4px 0 10px 78px">底部状态行显示哪几项。窗口窄了不够摆时，没关掉的也会按重要性自动少显示几个（最先让出的是输出速度）——「模型」与「记性」两项永不丢。这一项存在<b>这台设备</b>上，换浏览器要重设。</div>' +
+          '<div class="ab-tip" style="margin:-4px 0 10px 78px">底部状态行显示哪几项。窗口窄了不够摆时，没关掉的也会按重要性自动少显示几个（最先让出的是输出速度）——「模型」与「记性」两项永不丢。</div>' +
           '<div class="ab-tip" style="margin:-2px 0 10px 78px">这几项都是官方本来就有的设置（页面上文字仍为中文）。</div>' +
           '<label class="ab-chk"><input type="checkbox" id="adv-compact"' + (cfg.auto_compact ? ' checked' : '') + '> 聊天太长时自动帮我整理前面</label>' +
           '<div class="ab-tip" style="margin:2px 0 10px 0">自动整理会总结前面的内容 —— 部分细节会丢失（默认开启）。<br>⚠️ 关闭后请留意：长对话可能因超出模型上下文而中断。</div>' +
@@ -2262,6 +2363,10 @@
             '<option value="usd"' + (cur === 'usd' ? ' selected' : '') + '>美元 $</option>' +
           '</select></div>' +
           '<label class="ab-chk"><input type="checkbox" id="adv-ro"' + (d.previewReadOnly ? ' checked' : '') + '> 只读模式</label>' +
+          // 2026-09-22：扫审计时抓到的语义错位（档案 §8.7 201）—— 这是**项目级**的
+          //   （`projects.json` 的 `previewReadOnly`，见 server.js:3140），却跟一堆账号级项并排、
+          //   头顶还写着「应用到你的所有项目」⇒ 客户会以为改一处就全局生效。如实写清楚。
+          '<div class="ab-tip" style="margin:-2px 0 10px 0">只对<b>当前这个项目</b>生效（其余设置才是全部项目）：打开后，打开它的预览页只能看、不能操作。适合看正在跑的真实系统。</div>' +
           '<div style="margin:14px 0 6px;color:var(--text);font-size:14px">用量统计</div>' +
           (u
             ? '<div class="ab-card"><div class="ab-s">累计 ' + (DISPLAY.cost_currency === 'cny'
@@ -2306,6 +2411,9 @@
           if (key === 'cost_currency') DISPLAY.cost_currency = (v === 'cny' ? 'cny' : 'usd');
           else if (key === 'show_thinking' || key === 'thinking_default_expanded' || key === 'show_tool_details' || key === 'calm_mode' || key === 'thinking_highlight') {
             DISPLAY[key] = (v === 'true' || v === true);
+            // 客户**自己**改「默认展开思考」→ 清掉「见过」的记账，让当前这批卡重新按新设置摆一次
+            //   （否则刚被客户收起的那些卡，改了设置也还是收着的）。其余显示键不受影响。
+            if (key === 'thinking_default_expanded') reasoningSeen = (typeof WeakSet === 'function') ? new WeakSet() : null;
           } else if (key === 'inline_diffs') {
             DISPLAY.inline_diffs = (v === 'summary' || v === 'off') ? v : 'full';
           } else if (key === 'thinking_preview_lines') {
@@ -2379,15 +2487,17 @@
                 advStList.querySelectorAll('input[data-seg]').forEach(function (b) {
                   if (!b.checked) next.push(b.dataset.seg);
                 });
-                setStatuslineOff(next);
-                var valEl = el.querySelector('#adv-statusline-val');
-                if (valEl) valEl.textContent = statuslineSummary();
-                // ⚠️ **不能直接叫 `metricsRender()`** —— 它长在「会话指标」那个**嵌套作用域**里，
-                //   而这段代码在顶层（跟 `statuslineSummary` 当初那个坑同源，实测踩过：
-                //   点了复选框、localStorage 变了、状态行纹丝不动）。
-                //   用事件把「该重画了」传回去（嵌套那侧监听）。
-                try { window.dispatchEvent(new CustomEvent('asbudy:statusline-change')); } catch (e1) { /* 没 window 就算了 */ }
-                msg(el.querySelector('#adv-msg'), '已更新状态行', true);
+                setStatuslineOff(next).then(function (good) {
+                  var valEl = el.querySelector('#adv-statusline-val');
+                  if (valEl) valEl.textContent = statuslineSummary();
+                  // ⚠️ **不能直接叫 `metricsRender()`** —— 它长在「会话指标」那个**嵌套作用域**里，
+                  //   而这段代码在顶层（跟 `statuslineSummary` 当初那个坑同源，实测踩过：
+                  //   点了复选框、localStorage 变了、状态行纹丝不动）。
+                  //   用事件把「该重画了」传回去（嵌套那侧监听）。
+                  try { window.dispatchEvent(new CustomEvent('asbudy:statusline-change')); } catch (e1) { /* 没 window 就算了 */ }
+                  // 存不成就实话实说（以前无条件报「已更新」—— 发到服务端失败也报成功就骗人了）
+                  msg(el.querySelector('#adv-msg'), good ? '已更新状态行' : '没存下来：状态行设置没保存', good);
+                });
               };
             });
           };
