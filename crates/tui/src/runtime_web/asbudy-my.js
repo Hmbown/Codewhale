@@ -672,14 +672,20 @@
       var all = (r.body && r.body.providers) || [];
       var ready = all.filter(function (p) { return p && p.id && p.credentialState === 'configured'; });
       var cur = (r.body && r.body.current) || '';
-      if (!ready.length) { alert('尚未配置任何模型服务'); return; }
+      if (!ready.length) {
+        // 客户最容易在这里以为「坏了」：列表空 ≠ 系统不支持别家，只是**这个账号还没配别家的密钥**。
+        // 所以提示要说清「去哪儿配」，而不是只报一个错（照 §8.7 198.2 ①）。
+        alert('还没有配置任何模型服务。\n\n去「我的 → 高级设置 → 模型服务」填一个服务商的密钥，这里就会出现它。');
+        return;
+      }
       api('/v1/threads/' + encodeURIComponent(tid)).then(function (tr) {
         var body = tr.body || {};
         var th = body.thread || body;          // ⚠️ 详情接口把 thread 包在 .thread 里（列表才是裸数组）
         var thProvider = String(th.model_provider_id || th.model_provider || '');
         var thModel = String(th.model || '');
         openLayer('换个模型', function (body) {
-          body.innerHTML = '<div class="ab-tip" id="mp-tip">所选模型将应用于当前对话。</div>' +
+          body.innerHTML = '<div class="ab-tip" id="mp-tip">所选模型将应用于当前对话。<br>' +
+            '只列出<b>已配置密钥</b>的服务商；要接入其他服务商，去「我的 → 高级设置 → 模型服务」。</div>' +
             '<div id="mp-list"><div class="ab-tip">正在读模型目录…</div></div>' +
             '<div class="ab-msg" id="mp-msg"></div>';
           var list = body.querySelector('#mp-list');
