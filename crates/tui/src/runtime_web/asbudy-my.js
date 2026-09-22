@@ -159,6 +159,16 @@
     //   ＝「头部 ＋ 最多 4 行正文 ＋ 展开提示」；失败卡不吃这套，走完整 20 行预算。
     //   行数与排序都在 app.mjs 的 `selectedOutputLines()` 里算好，这里只管排版。
     //   ⚠️ 展开「查看回执」时让位 —— 否则同一段内容在上面（预览）和下面（全文）各出现一次。
+    // ⚠️ 2026-09-22 修：官方 `.receipt` 是 `display:flex` ＋ **width:fit-content**（而且**不换行**），
+    //   而我们往它里面直接 append 了两个块级 <pre>（ab-out-preview / ab-diff）⇒ 它们被当成
+    //   **横向的列**参与排版，把左边的 .receipt-copy 挤成一条柱子。
+    //   实测（老板报「左边一条、右边一个黑框」那天量的）：卡总宽 526px，
+    //   `.receipt-copy` 只剩 **127px**、里面的 `raw <pre>` 变成 **127×320 的黑柱**，
+    //   而 `.ab-out-preview` 占着右边 367px。
+    //   修法（纯样式、不碰官方 DOM 结构）：允许换行，这两个块自己占满一整行。
+    '.receipt{flex-wrap:wrap}',
+    '.receipt-copy{flex:1 1 auto}',
+    '.receipt .ab-out-preview,.receipt .ab-diff{flex:1 0 100%;min-width:0}',
     '.ab-out-preview{margin:8px 0 0;padding:8px 10px;border:1px solid var(--line);border-radius:var(--radius-control);background:var(--well-deep);color:var(--text-soft);font-family:ui-monospace,SFMono-Regular,Menlo,"Noto Sans Mono CJK SC",monospace;font-size:12px;line-height:1.5;white-space:pre-wrap;overflow-wrap:anywhere;max-height:13em;overflow-y:auto}',
     '.ab-out-preview[hidden]{display:none!important}',
     '.ab-out-line{white-space:pre-wrap}',
