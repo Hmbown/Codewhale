@@ -3713,9 +3713,14 @@
         note('图片要配一句话一起发送');
       }
     }
-    // 给**父页面（桌面 desk.html）**留一个入口：桌面上把一个图片图标拖到窗口上，
-    //   父页面取回文件内容后合成 File 直接递进来（同源）。见 desk.html 的 handIconToWin。
-    window.__asbudyAttachFiles = addFiles;
+    // 给**父页面（桌面 desk.html）**留一个入口：桌面上把一个文件/文件夹图标拖到窗口上，
+    //   父页面把它的**绝对路径**递进来 —— 走的是同一条「已带上：xxx」引用链路（不读内容、不判类型）。
+    //   见 desk.html 的 handIconToWin。
+    window.__asbudyPickFile = function (abs, name) {
+      try {
+        document.dispatchEvent(new CustomEvent('asbudy-file-picked', { detail: { path: abs, name: name } }));
+      } catch (e) { /* 派发不出去就算了 */ }
+    };
 
     /** 当前会话的模型支不支持看图 —— 问引擎要（不猜）。 */
     function modelSupportsImage() {
@@ -3796,23 +3801,28 @@
       spaceBtn.id = 'asbudy-img-space-btn';
       spaceBtn.className = 'quiet-button';
       spaceBtn.textContent = '我的空间';
-      spaceBtn.title = '从你的空间目录里选图片';
+      spaceBtn.title = '从你的空间目录里选文件带上（图片也行）';
       spaceBtn.onclick = function () { openPickFromSpace(); };
       btn.parentNode.insertBefore(spaceBtn, btn.nextSibling);
 
       return true;
     }
 
-    /* ── 从「我的空间」选图片 ────────────────────────────────────────
+    /* ── 从「我的空间」选文件 ─────────────────────────────────────────
        数据源就是账号根目录树：`GET /_gate/files?scope=root&dir=<相对路径>`，
-       一次读一层（跟桌面的「文件夹窗口」同一个接口）。只列图片与目录。
-       选中一张 → `/_gate/file/dl` 取回内容 → 合成 File → 进待发列表。 */
-    function mimeByName(name) {
-      var m = String(name).match(/\.([a-z0-9]+)$/i);
-      if (!m) return '';
-      var e = m[1].toLowerCase();
-      return e === 'png' ? 'image/png' : e === 'jpg' || e === 'jpeg' ? 'image/jpeg'
-           : e === 'gif' ? 'image/gif' : e === 'webp' ? 'image/webp' : '';
+       一次读一层（跟桌面的「文件夹窗口」同一个接口）。
+       选中一份 → 走**已有的引用链路**（`asbudy-file-picked`）—— 输入框上方出现
+       「已带上：xxx」，发送时把`（用这份：<绝对路径>）`拼进消息。
+       **不在这里判类型、也不读内容**：文本 AI 自己 read_file、图片自己 view_image、
+       表格/文档也自己找工具读 —— 2026-09-22 老板纠正（上一版只列图片，太窄）。 */
+    function pickOneFromSpace(x) {
+      if (!x.abs) { notify('拿不到「' + x.name + '」的位置'); return; }
+      try {
+        document.dispatchEvent(new CustomEvent('asbudy-file-picked', { detail: { path: x.abs, name: x.name } }));
+      } catch (e) { /* 派发不出去就算了 */ }
+      notify('已带上：' + x.name);
+      var w = document.getElementById('asbudy-pick');
+      if (w) w.remove();
     }
 
     function openPickFromSpace() {
@@ -3826,7 +3836,7 @@
         '<div style="width:min(680px,92vw);max-height:78vh;display:flex;flex-direction:column;background:var(--surface,#0e1a30);'
         + 'border:1px solid var(--line);border-radius:12px;box-shadow:0 20px 60px rgba(0,0,0,.55);overflow:hidden">'
         + '<div style="display:flex;align-items:center;gap:10px;padding:12px 14px;border-bottom:1px solid var(--line)">'
-        + '<strong style="font-size:14px;color:var(--text);flex:none">从我的空间选图片</strong>'
+        + '<strong style="font-size:14px;color:var(--text);flex:none">从我的空间选文件</strong>'
         + '<span id="asbudy-pick-crumb" style="font-size:12px;color:var(--text-soft);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"></span>'
         + '<button type="button" id="asbudy-pick-x" class="quiet-button">关闭</button></div>'
         + '<div id="asbudy-pick-list" style="padding:10px 12px;overflow:auto"></div></div>';
@@ -3861,9 +3871,9 @@
               listEl.appendChild(up);
             }
             var dirs = items.filter(function (x) { return x.isDir; });
-            var imgs = items.filter(function (x) { return !x.isDir && mimeByName(x.name); });
-            if (!dirs.length && !imgs.length) {
-              listEl.innerHTML = '<div style="color:var(--text-soft);font-size:13px;padding:8px">这个位置没有可选的图片</div>';
+            var files = items.filter(function (x) { return !x.isDir; });
+            if (!dirs.length && !files.length) {
+              listEl.innerHTML = '<div style="color:var(--text-soft);font-size:13px;padding:8px">这个位置没有文件</div>';
               return;
             }
             dirs.forEach(function (x) {
@@ -3872,24 +3882,11 @@
               row.onclick = function () { load(dir ? dir + '/' + x.name : x.name); };
               listEl.appendChild(row);
             });
-            imgs.forEach(function (x) {
-              var path = dir ? dir + '/' + x.name : x.name;
+            files.forEach(function (x) {
               var row = rowBase();
               row.innerHTML = '<span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc(x.name) + '</span>'
-                + '<span style="font-size:12px;color:var(--text-soft);flex:none">加入</span>';
-              var tag = row.lastChild;
-              row.onclick = function () {
-                if (row.dataset.busy === '1') return;
-                row.dataset.busy = '1';
-                tag.textContent = '读取中…';
-                fetch('/_gate/file/dl?scope=root&name=' + encodeURIComponent(path), { credentials: 'same-origin' })
-                  .then(function (r) { if (!r.ok) throw new Error('读不到这张图'); return r.blob(); })
-                  .then(function (b) {
-                    return addFiles([new File([b], path.split('/').pop(), { type: mimeByName(path) })]);
-                  })
-                  .then(function () { tag.textContent = '已加入'; notify('已加入待发送：' + path.split('/').pop()); })
-                  .catch(function (e) { row.dataset.busy = ''; tag.textContent = '加入'; notify('没能取回这张图：' + (e && e.message || e)); });
-              };
+                + '<span style="font-size:12px;color:var(--text-soft);flex:none">带上</span>';
+              row.onclick = function () { pickOneFromSpace(x); };
               listEl.appendChild(row);
             });
           })
