@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Chromewhale</title>
+    <link rel="stylesheet" href="panel.css" />
+  </head>
+  <body>
+    <header class="bar">
+      <span class="brand">Chromewhale</span>
+      <span id="status" class="status" data-kind="offline">Connecting…</span>
+      <button id="pause" class="ghost" type="button" aria-pressed="false" title="Stop all browser tools">
+        Pause
+      </button>
+      <button id="toggle-settings" class="ghost" type="button" aria-expanded="false">Settings</button>
+    </header>
+
+    <section id="settings" class="settings" hidden>
+      <h2>Runtime</h2>
+      <label for="host">Host</label>
+      <input id="host" type="text" spellcheck="false" autocomplete="off" />
+      <label for="port">Port</label>
+      <input id="port" type="number" min="1" max="65535" />
+      <label for="token">Bearer token</label>
+      <input id="token" type="password" autocomplete="off" placeholder="CODEWHALE_RUNTIME_TOKEN" />
+      <p class="hint">
+        Start the runtime with <code>codewhale app-server --http</code>. The token stays in this
+        profile's extension storage and is sent only to the loopback address above.
+      </p>
+      <div class="row">
+        <button id="save-settings" type="button">Save and reconnect</button>
+        <button id="new-thread" class="ghost" type="button">New conversation</button>
+      </div>
+
+      <h2>Sites</h2>
+      <p class="hint">
+        Chromewhale can read and act only on sites listed here as allowed, and only while the panel
+        is open. Revoking here also drops Chrome's host permission for that site.
+      </p>
+      <ul id="sites" class="sites"></ul>
+
+      <h2>Recent browser actions</h2>
+      <ul id="activity" class="activity"></ul>
+    </section>
+
+    <main id="transcript" class="transcript" aria-live="polite"></main>
+
+    <section id="prompts" class="prompts"></section>
+
+    <form id="composer" class="composer">
+      <textarea
+        id="input"
+        rows="3"
+        placeholder="Ask about this page, or tell Chromewhale what to do in this tab…"
+      ></textarea>
+      <div class="row">
+        <button id="send" type="submit">Send</button>
+        <button id="stop" class="ghost" type="button" hidden>Stop</button>
+      </div>
+    </form>
+
+    <script type="module" src="src/panel.js"></script>
+  </body>
+</html>
