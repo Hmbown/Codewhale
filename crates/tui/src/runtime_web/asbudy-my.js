@@ -312,6 +312,10 @@
   /* 当前会话 id —— 自己猴补 fetch 捕获（官方每次选中/新建会话都会 GET /v1/threads/{id}）。
    * ⚠️ 不能复用文件后面那个 LAST_THREAD：它在**另一个 IIFE** 里，作用域不共享（2026-09-15 踩过）。 */
   var MODEL_THREAD = '';
+  /* 会话对象缓存 —— 官方自己取回来的那份会话数据，留着给 bindPermissionChip **同步**纠错用。
+   * 为什么要它：官方渲染「审批」标签是**同步**的，而我们的纠正原来是**异步** HTTP
+   * ⇒ 打开会话的头几百毫秒显示错值（2026-09-22 老板报的就是这一瞬）。详见 bindPermissionChip。 */
+  var THREAD_CACHE = {};
   (function () {
     var prev = window.fetch;
     window.fetch = function (url, opt) {
@@ -325,6 +329,23 @@
       var p = prev.apply(this, arguments);
       // 换了对话 → 把上一条的提示撒掉（**不拿旧结论去猜新对话**，零误报的第一条）
       try { if (MODEL_THREAD !== before) hideFixBar(); } catch (e) {}
+      // ★ 缓存「官方自己取回来的」单条会话对象（bindPermissionChip 靠它同步纠错）。
+      //   只认 `GET /v1/threads/<id>` 这一种（带子路径的 /events、/turns 和列表 /summary 都不算）；
+      //   用 clone 读副本，绝不消耗官方那份响应。
+      try {
+        if (p && p.then && u.indexOf('/v1/threads/summary') < 0
+            && /\/v1\/threads\/[^\/?]+(\?|$)/.test(u)) {
+          p.then(function (r) {
+            if (!r || !r.ok || typeof r.clone !== 'function') return;
+            var cp;
+            try { cp = r.clone(); } catch (e) { return; }   // 已被读过就 clone 不了 —— 放过去
+            cp.json().then(function (b) {
+              var th = (b && (b.thread || b)) || null;
+              if (th && th.id) THREAD_CACHE[th.id] = th;
+            }).catch(function () {});
+          }).catch(function () {});
+        }
+      } catch (e) {}
       // ★ 只认【引擎给的权威终态】：这一轮 status = "failed" 才算「这条对话出问题了」。
       //   （2026-09-16 老板方案 B：**去掉碰运气式的黄条**，只在真的发不出消息时才给一句话。）
       //   为什么不再看 HTTP 状态码、不再 grep 错误关键词 —— 两次误报都出在那两处：
@@ -666,11 +687,31 @@
       if (FACT_HIDE[key]) chips[i].style.display = 'none';
     }
   }
+  /* 同一条会话「在飞的请求」只留一个 —— MutationObserver 会因 characterData 频繁触发，
+   * 不去重就会对引擎发一堆重复请求（这条会话正在跑长任务时尤其明显）。 */
+  var _thInflight = null, _thInflightId = '';
   function currentThread() {
     if (!MODEL_THREAD) return Promise.resolve(null);
-    return api('/v1/threads/' + encodeURIComponent(MODEL_THREAD)).then(function (r) {
-      return (r.body && (r.body.thread || r.body)) || null;
+    var want = MODEL_THREAD;
+    if (_thInflight && _thInflightId === want) return _thInflight;
+    var pr = api('/v1/threads/' + encodeURIComponent(want)).then(function (r) {
+      var th = (r.body && (r.body.thread || r.body)) || null;
+      if (th && th.id) THREAD_CACHE[th.id] = th;   // 顺手补缓存
+      return th;
     }).catch(function () { return null; });
+    _thInflight = pr; _thInflightId = want;
+    pr.then(function () { if (_thInflight === pr) { _thInflight = null; _thInflightId = ''; } });
+    return pr;
+  }
+  /** 按 `permission_posture` 算出该显示的三档文案。
+   *  官方 `app.mjs` 的 `permissionLabel` **只看 `auto_approve` 布尔**，所以两档都会错：
+   *    · auto_review + auto_approve=false → 官方显示「每次询问」（应为「自动审核」）
+   *    · full_access + auto_approve=true  → 官方显示「自动审核」（应为「完全访问」）
+   *  这里一律按 posture 判，跟高级设置下拉、跟门卫 syncThreadApproval 同一套映射。 */
+  function postureTextOf(th) {
+    if (!th) return '';
+    var p = String(th.permission_posture || '');
+    return POSTURE_TEXT[p] || (th.trust_mode ? '完全访问' : (th.auto_approve ? '自动审核' : '询问'));
   }
   function paintFact(key, text) {
     var s = document.querySelector('#session-facts .fact-chip[data-fact="' + key + '"] strong');
@@ -686,10 +727,17 @@
       c.addEventListener('click', function () { openApprovalPicker(); });
     }
     var strong = c.querySelector('strong');
+    if (!strong) return;
+    // ① **同步**纠正 —— 官方刚取回来的那份会话数据就在手边，跟它同一拍写，不留错值窗口。
+    //    （原来只有下面那条异步路：客户点开会话，官方先写上「每次询问」，我们的补丁要飞一趟
+    //      HTTP 才改成「自动审核」—— 中间那几百毫秒客户看到的就是错值。2026-09-22 实测 0.47s；
+    //      引擎在跑长任务时更久，老板正是在那条 285 秒的会话上看到的。）
+    var sync = MODEL_THREAD ? postureTextOf(THREAD_CACHE[MODEL_THREAD]) : '';
+    if (sync && strong.textContent !== sync) strong.textContent = sync;
+    // ② 异步兜底：缓存还没有（刚打开页面 / 官方还没取过这条）时补一次。
     currentThread().then(function (th) {
-      if (!th || !strong) return;
-      var p = String(th.permission_posture || '');
-      var text = POSTURE_TEXT[p] || (th.trust_mode ? '完全访问' : (th.auto_approve ? '自动审核' : '询问'));
+      var text = postureTextOf(th);
+      if (!text) return;
       if (strong.textContent !== text) strong.textContent = text;
     });
   }
@@ -830,7 +878,9 @@
       bindModeChip();
       new MutationObserver(function () {
         bindModelChip(); bindProviderChip(); localizeFacts(); bindPermissionChip(); bindModeChip();
-      }).observe(facts, { childList: true, subtree: true });
+        // characterData：官方若**只改文本不换节点**（我们只盯 childList 时收不到），
+        // 那条错值就永远留在页面上 —— 2026-09-22 补上，兜住这一类。
+      }).observe(facts, { childList: true, subtree: true, characterData: true });
       return true;
     }
     if (!watch()) {
