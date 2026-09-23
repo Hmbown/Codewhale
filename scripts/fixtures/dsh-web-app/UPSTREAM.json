@@ -1,0 +1,14 @@
+{
+  "repository": "https://github.com/deepseek-ai/deepseek-harness",
+  "commit": "00102833dfaee1da9f48a3a8eae9d34005a75218",
+  "package": "packages/bundle/web-app",
+  "files": {
+    "package.json": "7f176880b1fb577cf4ecd6793cf040c986749b6fe3a2e702a62fdd5a1265afbe",
+    "cordis.patch.yml": "e6acb583f603d60ea971b54cc3f30777e03f059542b81a81e129e8b34eb8869a",
+    "presets/standard.patch.yml": "6cd2f197737fc94a45e487d0bb57869461dd6f392d45f6429b576e75d973eda8",
+    "presets/ptc.patch.yml": "8fcf6b04dce7c2c76fab925129f6ac9b05ebb546840508e6cde72aa2da991832",
+    "presets/minimal.patch.yml": "71ef887f43d8a37931ba3b014e5b116f79018af873d06625fb22e280a23c1dfc",
+    "presets/cordis.patch.yml": "b74d71901b692f11111d02d20072735b2fe94b74744ee7e3bfdc5d972f1a3aa5",
+    "LICENSE": "ebb4f09972aee8608be255debaf78451a68e95c290f55c240dec2ecfa16ea6be"
+  }
+}

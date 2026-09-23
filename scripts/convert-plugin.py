@@ -7,6 +7,7 @@ Requires Python 3.10+ and PyYAML 6+; never loads upstream code or configuration.
 """
 
 import argparse
+import hashlib
 import ipaddress
 import json
 import os
@@ -22,6 +23,11 @@ import yaml
 MAX_FILES = 4096
 MAX_BYTES = 64 * 1024 * 1024
 MAX_DOCUMENT = 1024 * 1024
+# One dsh bundle may declare several ordered patch layers; they are applied over
+# one empty profile exactly like the single-file form and share one byte budget.
+MAX_PATCH_FILES = 64
+# Recorded in every receipt so a reviewed conversion can be attributed to a converter revision.
+CONVERTER_VERSION = "0.10.1"
 NAME = re.compile(r"[a-z0-9](?:[a-z0-9.-]{0,62}[a-z0-9])?\Z")
 
 
@@ -140,8 +146,12 @@ def read_file(path, limit=MAX_DOCUMENT):
 
 
 def text_file(path):
+    return decode_config(read_file(path))
+
+
+def decode_config(content):
     try:
-        return read_file(path).decode("utf-8")
+        return content.decode("utf-8")
     except UnicodeError:
         raise ConversionError("Configuration and skill entrypoints must be UTF-8.") from None
 
@@ -394,45 +404,35 @@ def mcp_config(path, dialect, stdio_roots=None):
 DSH_MCP_CLIENT = "@deepseek-ai/dsh-mcp-client"
 DSH_SKILL_FILESYSTEM = "@deepseek-ai/dsh-skill-filesystem"
 DSH_ENTRY = re.compile(r"(?:\./)?[A-Za-z0-9_][A-Za-z0-9_./-]*\.(?:mjs|js|cjs)")
-DSH_ENV_NAME = r"[A-Za-z_][A-Za-z0-9_]*"
-
-
 def js_literal(text, label):
-    """Resolve a quoted string or template literal inside a `!!js` idiom; env references
-    resolve from this machine because a bundle cannot name the original author's value."""
+    """Accept a quoted string or a template literal with no interpolation.
+
+    Conversion never reads this machine's environment or any other ambient state, so a
+    literal that would resolve from it is refused for a manual port instead of being
+    serialized into generated bundle data."""
     text = text.strip()
     if len(text) >= 2 and text[0] in "\"'" and text[-1] == text[0] and text[0] not in text[1:-1]:
+        require("\\" not in text[1:-1] and "\n" not in text[1:-1],
+                f"{label} contains JavaScript escapes; author the literal explicitly.")
         return text[1:-1]
     if text.startswith("`") and text.endswith("`") and len(text) >= 2:
         body = text[1:-1]
-        resolved = re.sub(r"\$\{\s*process\.env\.(" + DSH_ENV_NAME + r")\s*\}",
-                          lambda match: os.environ.get(match[1], ""), body)
-        missing = [name for name in re.findall(r"\$\{\s*process\.env\.(" + DSH_ENV_NAME + r")\s*\}", body)
-                   if name not in os.environ]
-        if missing:
-            raise ConversionError(f"{label} references unset environment variable {missing[0]}.")
-        require("${" not in resolved, f"{label} interpolates an expression with no portable lowering.")
-        return resolved
+        require("${" not in body and "\\" not in body and "`" not in body,
+                f"{label} interpolates a value that conversion never evaluates; author the literal explicitly.")
+        return body
     raise ConversionError(f"{label} is not a quoted or template literal; author the value explicitly.")
 
 
 def lower_js(value, label):
-    """Lower the documented `!!js` idioms to a literal string; every other expression refuses."""
+    """Lower only the `!!js` idioms that need no ambient state; every other expression refuses."""
     text = str(value).strip()
     if text == "process.execPath":
         return "node"
-    match = re.fullmatch(r"process\.env\.(" + DSH_ENV_NAME + r")", text)
-    if match:
-        resolved = os.environ.get(match[1])
-        require(resolved is not None, f"{label} references environment variable {match[1]}, which is not set here.")
-        return resolved
-    match = re.fullmatch(r"process\.env\.(" + DSH_ENV_NAME + r")\s*\|\|\s*(.+)", text, re.DOTALL)
-    if match:
-        resolved = os.environ.get(match[1])
-        if resolved is not None:
-            return resolved
-        return js_literal(match[2], f"{label} fallback")
-    if text.startswith("`"):
+    if "process.env" in text:
+        raise ConversionError(
+            f"{label} reads an environment value, and conversion never evaluates this machine's environment; "
+            "author the literal explicitly, or select a packaged directory with --stdio-root")
+    if text.startswith("`") or text[:1] in "\"'":
         return js_literal(text, label)
     raise ConversionError(f"{label} uses a `!!js` expression with no portable lowering; author the value explicitly.")
 
@@ -499,10 +499,15 @@ def evaluate_patches(patches, notes):
 
 
 def load_dsh_bundle(path):
-    """Read a dsh bundle package directory: package.json → dsh.bundle.patch → evaluated rows."""
+    """Read a dsh bundle package: package.json → `dsh.bundle.patch` (one path or an ordered
+    list of paths) → rows evaluated over one empty profile.
+
+    Returns (manifest, entries, notes, layers, manifest_hash). Every layer is contained in the
+    package, read once, and bounded in aggregate before any output directory is created."""
     bundle = plain_path(path)
     require(bundle.is_dir(), "Select a dsh bundle package directory (a directory containing package.json).")
-    manifest = data(text_file(bundle / "package.json"), json_only=True)
+    manifest_content = read_file(bundle / "package.json")
+    manifest = data(decode_config(manifest_content), json_only=True)
     mapping(manifest)
     dsh = manifest.get("dsh")
     require(isinstance(dsh, dict) and isinstance(dsh.get("bundle"), dict),
@@ -510,20 +515,41 @@ def load_dsh_bundle(path):
     notes = []
     if dsh.get("client") is not None:
         notes.append("package declares `dsh.client`; the client UI half has no Codewhale equivalent and was not converted")
-    patch_rel = dsh["bundle"].get("patch")
-    require(isinstance(patch_rel, str) and bool(patch_rel), "`dsh.bundle.patch` must name a patch file.")
-    patch_path = plain_path(bundle / patch_rel)
-    require(patch_path.is_relative_to(bundle) and patch_path.is_file(),
-            "`dsh.bundle.patch` must resolve to a file inside the bundle directory.")
-    patches = data(text_file(patch_path), allow_js=True)
-    require(isinstance(patches, list), "A dsh bundle patch must be a patch list.")
-    return manifest, evaluate_patches(patches, notes), notes
+    declared = dsh["bundle"].get("patch")
+    if isinstance(declared, str):
+        declared = [declared]
+    require(isinstance(declared, list) and bool(declared),
+            "`dsh.bundle.patch` must name a patch file or a non-empty ordered list of patch files.")
+    require(all(isinstance(item, str) and bool(item) for item in declared),
+            "Every `dsh.bundle.patch` entry must be a non-empty relative path.")
+    require(len(declared) <= MAX_PATCH_FILES, "At most 64 `dsh.bundle.patch` files are supported.")
+    layers, patches, total = [], [], 0
+    seen_paths = set()
+    for relative in declared:
+        require(not Path(relative).is_absolute() and ".." not in Path(relative).parts
+                and not re.search(r"[\\\\:\x00-\x1f]", relative),
+                "Every `dsh.bundle.patch` entry must be a relative path inside the bundle directory.")
+        patch_path = plain_path(bundle / relative)
+        require(patch_path.is_relative_to(bundle) and patch_path.is_file(),
+                "Every `dsh.bundle.patch` entry must resolve to a file inside the bundle directory.")
+        require(patch_path not in seen_paths,
+                "Each `dsh.bundle.patch` file may be listed once; a duplicate would apply its layer twice.")
+        seen_paths.add(patch_path)
+        require(total < MAX_DOCUMENT, "Selected patch files exceed the 1 MiB aggregate patch limit.")
+        content = read_file(patch_path, MAX_DOCUMENT - total)
+        total += len(content)
+        layer = data(decode_config(content), allow_js=True)
+        require(isinstance(layer, list), "A dsh bundle patch must be a patch list.")
+        layers.append({"path": relative, "sha256": hashlib.sha256(content).hexdigest(), "bytes": len(content)})
+        patches.extend(layer)
+    entries = evaluate_patches(patches, notes)
+    return manifest, entries, notes, layers, hashlib.sha256(manifest_content).hexdigest()
 
 
 def dsh_bundle_components(entries, bundle, explicit_roots):
     """Convert evaluated dsh entries into Codewhale servers + skill sources.
-    Unconvertible rows are recorded as skipped diagnostics, never silently dropped."""
-    servers, hosts, notes = {}, [], []
+    Unconvertible rows are recorded as skipped outcomes, never silently dropped."""
+    servers, hosts, notes, outcomes = {}, [], [], []
     implicit_roots = {}
     skill_dirs = []
 
@@ -531,14 +557,21 @@ def dsh_bundle_components(entries, bundle, explicit_roots):
         identifier = row.get("id")
         return f"`{identifier}`" if isinstance(identifier, str) else "an unlabeled row"
 
-    def mcp_row(row):
-        config = mapping(row.get("config"))
+    def record(row, kind, result, reason=""):
+        """One structured per-row outcome, also rendered into the diagnostics list."""
+        identifier = row.get("id") if isinstance(row, dict) else None
+        package = row.get("name") if isinstance(row, dict) else None
+        outcomes.append({"row": identifier if isinstance(identifier, str) else None,
+                         "package": package if isinstance(package, str) else None,
+                         "kind": kind, "outcome": result, "reason": reason})
+        notes.append(f"{label(row)} [{kind}] {result}" + (f": {reason}" if reason else ""))
+
+    def mcp_row(row, disabled, disabled_reason):
+        config = dict(mapping(row.get("config")))
         name = config.get("serverName")
         require(isinstance(name, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,31}", name),
                 "dsh-mcp-client config needs a literal `serverName` of 1–32 letters/digits/_/-")
         require(name not in servers, f"Duplicate MCP server name `{name}`; nothing was written for it.")
-        disabled = row.get("disabled", False)
-        require(type(disabled) is bool, "`disabled` must be a boolean; conditional rows need a manual port")
         for field in ("command", "cwd", "url", "serverName"):
             if isinstance(config.get(field), JsExpr):
                 config[field] = lower_js(config[field], f"`{field}` in `{name}`")
@@ -550,60 +583,97 @@ def dsh_bundle_components(entries, bundle, explicit_roots):
         if config.get("transport") == "stdio" and root is None and isinstance(arguments, list) and len(arguments) == 1:
             arg = arguments[0]
             if isinstance(arg, str) and not DSH_ENTRY.fullmatch(arg):
-                candidate = Path(arg)
-                if candidate.is_absolute():
-                    resolved = plain_path(candidate)
-                    require(resolved.is_file(), f"`args` in `{name}` resolves to a host path that does not exist here")
-                    require(DSH_ENTRY.fullmatch(resolved.name) is not None,
-                            f"`args` in `{name}` resolves to a file that is not a .mjs/.js/.cjs entry")
-                    implicit_roots[name] = resolved.parent
-                    config["args"] = [resolved.name]
-                    notes.append(f"`{name}`: `!!js`/`args` resolved to host path; copied {resolved.parent} as its source root")
-                    root = resolved.parent
-            elif isinstance(arg, str) and ".." not in arg.split("/"):
+                # A host path is never copied implicitly: the operator selects a source root.
+                raise ConversionError(
+                    f"`args` in `{name}` names a host path that is outside the selected package; conversion never "
+                    f"copies an ambient path. Select that directory explicitly with --stdio-root {name}=DIRECTORY")
+            if isinstance(arg, str) and ".." not in arg.split("/"):
                 candidate = bundle / arg
                 cwd = config.get("cwd", "")
-                if candidate.is_file():
-                    implicit_roots[name] = bundle
+                if cwd in ("", ".") and candidate.is_file():
                     root = bundle
                 elif (isinstance(cwd, str) and cwd not in ("", ".") and ".." not in Path(cwd).parts
+                      and not re.search(r"[\\\\:\x00-\x1f]", cwd)
                       and not Path(cwd).is_absolute() and (bundle / cwd / arg).is_file()):
-                    implicit_roots[name] = bundle / cwd
-                    root = bundle / cwd
+                    root = plain_path(bundle / cwd)
                     config["cwd"] = "."
         require(free_of_js(config), f"an unevaluated `!!js` remains in `{name}`; author that field explicitly")
         local = config.get("transport") == "stdio"
         if local:
-            converted = stdio_server(config, "dsh", {}, name, root or implicit_roots.get(name))
+            converted = stdio_server(config, "dsh", {}, name, root)
+            # Commit source copying only after every field of this server validated.
+            if name not in explicit_roots:
+                implicit_roots[name] = root
+                notes.append(f"`{name}`: stdio source root resolved inside the selected package at "
+                             f"`{root.relative_to(bundle).as_posix() or '.'}`")
         else:
             converted, host = remote_server(config, "dsh", {})
             hosts.append(host)
         if disabled:
             converted["extensions"]["net.codewhale"]["disabled"] = True
         servers[name] = converted
+        record(row, "mcp", "converted-disabled" if disabled else "converted", disabled_reason)
 
-    def walk(rows):
+    def walk(rows, disabled_ancestor=None):
         for row in rows:
-            if not isinstance(row, dict):
-                continue
+            require(isinstance(row, dict), "Each dsh group child must be an entry object.")
             config = row.get("config")
-            if row.get("group") is True and isinstance(config, list):
-                walk(config)
-                continue
+            disabled = row.get("disabled", False)
             name = row.get("name")
-            if isinstance(row.get("disabled"), JsExpr):
-                notes.append(f"{label(row)} skipped: `disabled` is a `!!js` expression that cannot be evaluated offline")
+            group = row.get("group") is True
+            if group or name in (DSH_MCP_CLIENT, DSH_SKILL_FILESYSTEM):
+                # Dependency, interception and isolation affect activation/authority, including
+                # inherited group context. Unknown fields must not turn a gated row into a tool.
+                require(not row.keys() - {"id", "name", "config", "group", "disabled"},
+                        f"{label(row)} has unsupported entry policy or dependency fields; port its "
+                        "activation and authority semantics manually before conversion.")
+                require(type(row.get("group", False)) is bool,
+                        f"{label(row)} has a non-boolean group flag; resolve it explicitly.")
+            if group:
+                require(isinstance(config, list), f"{label(row)} needs a list of group entries.")
+            if type(disabled) is not bool:
+                # dsh's loader propagates `disabled` to descendants, so an unresolved gate on a
+                # group or on a convertible row is authority-relevant: refusing is the only
+                # behaviour that cannot enable content its author disables at runtime.
+                if group or name in (DSH_MCP_CLIENT, DSH_SKILL_FILESYSTEM):
+                    raise ConversionError(
+                        f"{label(row)} gates activation with a conditional or non-boolean `disabled` value that "
+                        "cannot be resolved offline; conversion refuses to assume the row is enabled. Pre-resolve "
+                        "the gate in a reviewed copy of the patch layer, then convert that copy.")
+                # A foreign row contributes nothing either way, so record it and keep going.
+                record(row, "foreign", "skipped",
+                       "no portable representation; its conditional `disabled` gate was not evaluated")
                 continue
+            if group:
+                walk(config, disabled_ancestor or (label(row) if disabled else None))
+                continue
+            if disabled:
+                disabled_reason = "the source row sets `disabled: true`"
+            elif disabled_ancestor:
+                disabled_reason = f"the row is disabled by ancestor {disabled_ancestor}"
+            else:
+                disabled_reason = ""
+            effective = disabled or bool(disabled_ancestor)
             if name == DSH_MCP_CLIENT:
+                if isinstance(config, dict):
+                    server_name = config.get("serverName")
+                    require(not isinstance(server_name, str) or server_name not in servers,
+                            "Duplicate MCP server name; no entries were written.")
                 try:
-                    mcp_row(row)
-                except ConversionError as reason:
-                    notes.append(f"{label(row)} skipped: {reason}")
+                    mcp_row(row, effective, disabled_reason)
+                except ConversionError as error:
+                    record(row, "mcp", "skipped", str(error))
             elif name == DSH_SKILL_FILESYSTEM:
+                if effective:
+                    record(row, "skill", "skipped-disabled",
+                           f"{disabled_reason}; native skills have no disabled state, so the intent is preserved "
+                           "by omission — pass --skill explicitly to import it")
+                    continue
                 dirs = config.get("customSkillDirs") if isinstance(config, dict) else None
                 if not isinstance(dirs, list) or not dirs:
-                    notes.append(f"{label(row)} skipped: skill row has no `customSkillDirs` to import")
+                    record(row, "skill", "skipped", "skill row has no `customSkillDirs` to import")
                     continue
+                imported = 0
                 for entry in dirs:
                     if isinstance(entry, JsExpr) or not isinstance(entry, str):
                         notes.append(f"{label(row)}: a `customSkillDirs` entry is not a literal path; skipped")
@@ -613,16 +683,23 @@ def dsh_bundle_components(entries, bundle, explicit_roots):
                         notes.append(f"{label(row)}: `customSkillDirs` entry `{entry}` is outside the bundle; "
                                      "pass it explicitly with --skill")
                         continue
-                    resolved = bundle / entry
+                    resolved = plain_path(bundle / entry)
                     if not resolved.is_dir():
                         notes.append(f"{label(row)}: `customSkillDirs` entry `{entry}` does not exist in the bundle; skipped")
                         continue
                     skill_dirs.append(resolved)
+                    imported += 1
+                record(row, "skill", "converted" if imported else "skipped",
+                       f"imported {imported} `customSkillDirs` entries inside the package" if imported
+                       else "no `customSkillDirs` entry inside the package could be imported")
             else:
                 shown = name if isinstance(name, str) else "unlabeled"
-                notes.append(f"{label(row)} ({shown}) skipped: only dsh-mcp-client and dsh-skill-filesystem rows convert")
+                record(row, "foreign", "skipped",
+                       f"only dsh-mcp-client and dsh-skill-filesystem rows convert; `{shown}` has no portable "
+                       "representation")
 
     walk(entries)
+    require(len(servers) <= 64, "At most 64 MCP servers can be converted at once.")
     skills = []
     for directory in skill_dirs:
         for child in sorted(directory.iterdir()):
@@ -630,7 +707,7 @@ def dsh_bundle_components(entries, bundle, explicit_roots):
                 continue
             if (child / "SKILL.md").is_file() or child.suffix == ".md":
                 skills.append(child)
-    return servers, hosts, skills, implicit_roots, notes
+    return servers, hosts, skills, implicit_roots, notes, outcomes
 
 
 def convert(args):
@@ -643,6 +720,7 @@ def convert(args):
     plain_path(output.parent)
     require(not os.path.lexists(output), "Output already exists; choose a fresh directory. Nothing was overwritten.")
     files, skill_names, notes = {}, set(), []
+    layers, manifest_hash, outcomes = [], None, []
     skill_sources = [plain_path(path) for path in args.skill]
     servers, hosts, ignored = {}, [], 0
     roots = {}
@@ -655,17 +733,18 @@ def convert(args):
         roots[name] = source
     bundle_manifest = None
     if bundle_arg is not None:
-        bundle_manifest, entries, bundle_notes = load_dsh_bundle(bundle_arg)
+        bundle_manifest, entries, bundle_notes, layers, manifest_hash = load_dsh_bundle(bundle_arg)
         notes += bundle_notes
         bundle = plain_path(bundle_arg)
         require(bundle != output and bundle not in output.parents, "Output must be outside the selected bundle.")
-        servers, hosts, bundled_skills, implicit_roots, row_notes = dsh_bundle_components(entries, bundle, roots)
+        servers, hosts, bundled_skills, implicit_roots, row_notes, outcomes = dsh_bundle_components(entries, bundle, roots)
         notes += row_notes
         skill_sources += bundled_skills
         implicit_roots.update(roots)
         explicit_names = set(roots)
         roots = implicit_roots
-        require(explicit_names <= set(servers), "Every --stdio-root must name a selected local MCP server.")
+        local_names = {name for name, server in servers.items() if server["type"] == "stdio"}
+        require(explicit_names <= local_names, "Every --stdio-root must name a selected local MCP server.")
     else:
         require(not roots or args.config, "--stdio-root requires a selected MCP configuration.")
         servers, hosts, ignored = mcp_config(args.config, args.format, roots) if args.config else ({}, [], 0)
@@ -696,22 +775,52 @@ def convert(args):
     files["plugin.json"] = (json.dumps(manifest, indent=2) + "\n").encode()
     if servers:
         files["mcp.json"] = (json.dumps({"mcpServers": servers}, indent=2) + "\n").encode()
-    notes_text = ("Bundle diagnostics:\n" + "\n".join(f"- {note}" for note in notes) + "\n\n") if notes else ""
-    files["CONVERSION.md"] = (f"# Conversion receipt\n\nSource dialect: {args.format}.\n"
-        f"Converted {len(skill_names)} selected Skills, {len(servers) - len(roots)} remote and {len(roots)} local MCP declarations.\n"
-        f"Ignored {ignored} unrelated top-level application settings.\n\n"
-        + notes_text +
-        "No source code, package manager, install hook, network request or credential lookup ran.\n"
-        "Companion skill files were copied as data; review them before loading a skill.\n"
-        "Selected Node source, dependencies and resources were copied as data into mcp/<server>.\n"
-        "Each --stdio-root is the original process working directory; the staged copy becomes its cwd.\n"
-        "Review all copied files and environment names. Node runs only through the native trusted MCP lifecycle.\n"
-        "Local MCP runs with host-user process authority, not an OS sandbox; stdio does not confine its network or files.\n"
-        "Mutable workspace state, writable package resources and external module dependencies require a manual port.\n"
-        "This output is not installed, trusted or enabled. Run `/plugin install <directory>`,\n"
-        "then `/plugin validate <name>` and review the exact trust token before enabling.\n"
-        "Remote MCP output uses Streamable HTTP only; OpenCode's legacy SSE fallback is not reproduced.\n"
-        "Conversion does not prove server connectivity or foreign runtime compatibility.\n").encode()
+    provenance = [f"Converter version {CONVERTER_VERSION}. Source dialect: {args.format}."]
+    if bundle_manifest is not None:
+        source_version = bundle_manifest.get("version")
+        provenance.append("Source package: " + str(bundle_manifest.get("name", "unnamed"))
+                          + (f"@{source_version}" if isinstance(source_version, str) and source_version.strip() else ""))
+        provenance.append(f"Source manifest sha256: {manifest_hash}")
+        provenance.append("Selected patch layers, applied in declaration order:")
+        provenance += [f"- {layer['path']} (sha256 {layer['sha256']}, {layer['bytes']} bytes)" for layer in layers]
+    outcome_lines = ["## Component outcomes (skipped rows need a manual port)", ""] + [
+        f"- {outcome['row'] or 'unlabeled'} ({outcome['package'] or 'unlabeled'}) {outcome['kind']}: {outcome['outcome']}"
+        + (f" — {outcome['reason']}" if outcome["reason"] else "") for outcome in outcomes]
+    lines = ["# Conversion receipt", "", *provenance, "",
+             f"Converted {len(skill_names)} selected Skills, {len(servers) - len(roots)} remote and "
+             f"{len(roots)} local MCP declarations.",
+             f"Ignored {ignored} unrelated top-level application settings.", ""]
+    if outcomes:
+        lines += [*outcome_lines, ""]
+    if notes:
+        lines += ["Bundle diagnostics:", *[f"- {note}" for note in notes], ""]
+    lines += [
+        "No source code, package manager, install hook, network request or credential lookup ran.",
+        "No environment variable values were resolved. Only the selected input roots were read;",
+        "host paths are never inferred from expressions or copied without an explicit source selection.",
+        "Companion skill files were copied as data; review them before loading a skill.",
+        "Selected Node source, dependencies and resources were copied as data into mcp/<server>.",
+        "Each --stdio-root is the original process working directory; the staged copy becomes its cwd.",
+        "Review all copied files and environment names. Node runs only through the native trusted MCP lifecycle.",
+        "Local MCP runs with host-user process authority, not an OS sandbox; stdio does not confine its network or files.",
+        "Mutable workspace state, writable package resources and external module dependencies require a manual port.",
+        "This output is not installed, trusted or enabled. Run `/plugin install <directory>`,",
+        "then `/plugin validate <name>` and review the exact trust token before enabling.",
+        "Remote MCP output uses Streamable HTTP only; OpenCode's legacy SSE fallback is not reproduced.",
+        "Conversion does not prove server connectivity or foreign runtime compatibility."]
+    files["CONVERSION.md"] = ("\n".join(lines) + "\n").encode()
+    if bundle_manifest is not None:
+        receipt = {
+            "schema": "codewhale.plugin-conversion.v1", "converter_version": CONVERTER_VERSION,
+            "source": {"dialect": args.format, "package": bundle_manifest.get("name"),
+                       "version": bundle_manifest.get("version"), "manifest_sha256": manifest_hash,
+                       "patch_layers": layers},
+            "counts": {"skills": len(skill_names), "mcp_servers": len(servers)},
+            "outcomes": outcomes, "diagnostics": notes,
+            "required_manual_ports": [outcome for outcome in outcomes if outcome["outcome"] == "skipped"],
+            "installed": False, "trusted": False, "enabled": False,
+        }
+        files["CONVERSION.json"] = (json.dumps(receipt, indent=2) + "\n").encode()
     require(len(files) <= MAX_FILES and sum(map(len, files.values())) <= MAX_BYTES,
             "Output exceeds the 4096-file / 64 MiB bundle budget.")
     # Complete all parsing before exclusive creation. Never install or alter a source tree.
@@ -741,7 +850,8 @@ def main():
     parser.add_argument("--format", choices=("opencode-v1", "opencode-v2", "dsh"), required=True)
     parser.add_argument("--config", type=Path, help="OpenCode JSON or static DSH Cordis YAML/JSON (optional)")
     parser.add_argument("--bundle", type=Path,
-                        help="dsh bundle package directory (package.json with dsh.bundle.patch); evaluates the patch layer")
+                        help="dsh bundle package directory (package.json with dsh.bundle.patch, one path or an "
+                             "ordered list); evaluates the patch layers in order")
     parser.add_argument("--skill", type=Path, action="append", default=[], help="Explicit skill directory or Markdown file; repeatable")
     parser.add_argument("--stdio-root", action="append", default=[], metavar="SERVER=DIRECTORY",
                         help="Explicit packaged Node MCP working directory; repeat for each selected local server")

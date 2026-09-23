@@ -240,6 +240,25 @@ jobs:
         # web client's event/snapshot state machine; it ran nowhere before.
         run: node --test crates/tui/tests/runtime_web_client.test.mjs
 
+  plugin-conversion:
+    name: Plugin conversion
+    timeout-minutes: 5
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 20
+      - name: Install data parser
+        run: python3 -m pip install --disable-pip-version-check PyYAML==6.0.2
+      - name: Check offline plugin conversion
+        # Pinned upstream YAML is data only; only our synthetic Node fixtures run.
+        # Always on: scripts and fixture changes must not depend on Rust CI filters.
+        run: python3 -B scripts/test_convert_plugin.py -v
+
   integrations:
     name: Integrations
     timeout-minutes: 15

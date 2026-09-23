@@ -2,6 +2,7 @@
 """Offline conversion contracts; only the synthetic Node fixture is executed."""
 
 import argparse
+import hashlib
 import importlib.util
 import json
 import os
@@ -22,6 +23,7 @@ assert SPEC and SPEC.loader
 converter = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(converter)
 CANARY = "conversion-secret-canary-do-not-emit-7391"
+AMBIENT = "CONVERSION_AMBIENT_CANARY_7391"
 
 
 class ConversionTests(unittest.TestCase):
@@ -440,23 +442,230 @@ for await (const line of readline.createInterface({ input: process.stdin })) {
         self.assertIn("skin", receipt)
         self.assertIn("ghost", receipt)
 
-    def test_dsh_bundle_lowers_js_command_and_host_path_arg(self):
+    def test_dsh_bundle_never_copies_a_host_path_or_reads_its_environment(self):
         bundle = self.bundle()
         server_dir = self.node_source()
-        patch = ("- insert:\n  - id: local-entry\n    name: '@deepseek-ai/dsh-mcp-client'\n"
-                 "    config:\n      serverName: localdocs\n      transport: stdio\n"
-                 "      command: !!js process.execPath\n"
-                 "      args:\n        - !!js process.env.CONVERT_TEST_UNSET_ENTRY_7391 || '"
-                 + str(server_dir / "server.mjs") + "'\n")
-        (bundle / "cordis.patch.yml").write_text(patch)
+        (bundle / "cordis.patch.yml").write_text(
+            "- insert:\n  - id: local-entry\n    name: '@deepseek-ai/dsh-mcp-client'\n"
+            "    config:\n      serverName: localdocs\n      transport: stdio\n"
+            "      command: !!js process.execPath\n"
+            "      args:\n        - !!js process.env.CONVERT_TEST_UNSET_ENTRY_7391 || '"
+            + str(server_dir / "server.mjs") + "'\n"
+            "  - id: docs-entry\n    name: '@deepseek-ai/dsh-mcp-client'\n"
+            "    config:\n      serverName: docs\n      transport: streamable-http\n"
+            "      url: https://docs.example.invalid/mcp\n")
+        args = self.args(bundle=bundle, dialect="dsh")
+        result = self.cli(args, env={"CONVERT_TEST_UNSET_ENTRY_7391": str(server_dir / "server.mjs")})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        # The environment value is never read, and the host directory is never copied.
+        self.assertEqual(sorted(self.servers(args.output)), ["docs"])
+        self.assertFalse((args.output / "mcp").exists())
+        receipt = (args.output / "CONVERSION.md").read_text()
+        self.assertIn("local-entry", receipt)
+        self.assertIn("reads an environment value", receipt)
+        self.assertIn("No environment variable values were resolved", receipt)
+        # A relative entry is the supported shape, and --stdio-root names its source.
+        relative = self.bundle()
+        (relative / "cordis.patch.yml").write_text(
+            "- insert:\n  - id: local-entry\n    name: '@deepseek-ai/dsh-mcp-client'\n"
+            "    config:\n      serverName: localdocs\n      transport: stdio\n"
+            "      command: !!js process.execPath\n      args: ['./server.mjs']\n")
+        self.refuse(self.args(bundle=relative, dialect="dsh"), message="No portable components")
+        explicit = self.args(bundle=relative, dialect="dsh", stdio_roots=[f"localdocs={server_dir}"])
+        self.assertEqual(converter.convert(explicit), (0, 1, 0))
+        self.assertEqual(self.servers(explicit.output)["localdocs"], {
+            "type": "stdio", "command": "node", "args": ["./server.mjs"], "cwd": "mcp/localdocs",
+            "env": {}, "extensions": {"net.codewhale": {}}})
+        self.assertEqual((explicit.output / "mcp/localdocs/server.mjs").read_bytes(),
+                         (server_dir / "server.mjs").read_bytes())
+
+    def test_dsh_bundle_environment_value_is_never_read_or_serialized(self):
+        bundle = self.bundle()
+        (bundle / "cordis.patch.yml").write_text(
+            "- insert:\n  - id: env-url\n    name: '@deepseek-ai/dsh-mcp-client'\n"
+            "    config:\n      serverName: envdocs\n      transport: streamable-http\n"
+            "      url: !!js '`https://example.invalid/${process.env." + AMBIENT + "}/mcp`'\n"
+            "  - id: docs-entry\n    name: '@deepseek-ai/dsh-mcp-client'\n"
+            "    config:\n      serverName: docs\n      transport: streamable-http\n"
+            "      url: https://docs.example.invalid/mcp\n")
+        args = self.args(bundle=bundle, dialect="dsh")
+        result = self.cli(args, env={AMBIENT: CANARY})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(sorted(self.servers(args.output)), ["docs"])
+        receipt = (args.output / "CONVERSION.md")
+        self.assertIn("reads an environment value", receipt.read_text())
+        self.assert_no_canary(result, args.output)
+
+    def test_dsh_bundle_disabled_ancestry_disables_children_and_is_receipted(self):
+        bundle = self.bundle()
+        child = {"id": "docs-entry", "name": "@deepseek-ai/dsh-mcp-client", "config": {
+            "serverName": "docs", "transport": "streamable-http", "url": "https://docs.example.invalid/mcp"}}
+        (bundle / "cordis.patch.yml").write_text(yaml.safe_dump([{"insert": [
+            {"id": "outer", "group": True, "disabled": True, "config": [
+                {"id": "inner", "group": True, "config": [child]},
+                {"id": "skills-row", "name": "@deepseek-ai/dsh-skill-filesystem",
+                 "config": {"customSkillDirs": ["pack-skills"]}}]},
+            {"id": "live-entry", "name": "@deepseek-ai/dsh-mcp-client", "config": {
+                "serverName": "live", "transport": "streamable-http", "url": "https://live.example.invalid/mcp"}},
+        ]}]))
+        skill = bundle / "pack-skills" / "guide"
+        skill.mkdir(parents=True)
+        (skill / "SKILL.md").write_text("---\nname: guide\ndescription: Bundled skill\n---\nBody.\n")
         args = self.args(bundle=bundle, dialect="dsh")
         result = self.cli(args)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.servers(args.output)["localdocs"], {
-            "type": "stdio", "command": "node", "args": ["server.mjs"], "cwd": "mcp/localdocs",
-            "env": {}, "extensions": {"net.codewhale": {}}})
-        self.assertEqual((args.output / "mcp/localdocs/server.mjs").read_bytes(),
-                         (server_dir / "server.mjs").read_bytes())
+        servers = self.servers(args.output)
+        self.assertEqual(servers["docs"]["extensions"]["net.codewhale"], {"disabled": True})
+        self.assertEqual(servers["live"]["extensions"]["net.codewhale"], {})
+        self.assertEqual(list(args.output.glob("skills/*/SKILL.md")), [])
+        receipt = (args.output / "CONVERSION.md").read_text()
+        self.assertIn("disabled by ancestor `outer`", receipt)
+        self.assertIn("skipped-disabled", receipt)
+
+    def test_dsh_bundle_disabled_skill_row_is_omitted_with_an_explicit_receipt(self):
+        def built(disabled):
+            bundle = self.bundle()
+            entry = bundle / "pack-skills" / "guide"
+            entry.mkdir(parents=True)
+            (entry / "SKILL.md").write_text("---\nname: guide\ndescription: Bundled skill\n---\nBody.\n")
+            row = {"id": "skills-row", "name": "@deepseek-ai/dsh-skill-filesystem",
+                   "config": {"customSkillDirs": ["pack-skills"]}, **(disabled or {})}
+            (bundle / "cordis.patch.yml").write_text(yaml.safe_dump([{"insert": [row, {
+                "id": "docs-entry", "name": "@deepseek-ai/dsh-mcp-client", "config": {
+                    "serverName": "docs", "transport": "streamable-http",
+                    "url": "https://docs.example.invalid/mcp"}}]}]))
+            return bundle
+        enabled = self.args(bundle=built(None), dialect="dsh")
+        self.assertEqual(converter.convert(enabled), (1, 1, 0))
+        disabled = self.args(bundle=built({"disabled": True}), dialect="dsh")
+        self.assertEqual(converter.convert(disabled), (0, 1, 0))
+        receipt = (disabled.output / "CONVERSION.md").read_text()
+        self.assertIn("skipped-disabled", receipt)
+        self.assertIn("preserved by omission", receipt)
+
+    def test_dsh_bundle_unresolved_conditional_gate_is_refused_not_assumed_enabled(self):
+        child = ("    - id: docs-entry\n      name: '@deepseek-ai/dsh-mcp-client'\n"
+                 "      config:\n        serverName: docs\n        transport: streamable-http\n"
+                 "        url: https://docs.example.invalid/mcp\n")
+        for patch in (
+            "- insert:\n  - id: gate\n    name: '@deepseek-ai/cordis-plugin-group'\n    group: true\n"
+            "    disabled: !!js process.env.DISABLE_THIS\n    config:\n" + child,
+            "- insert:\n  - id: docs-entry\n    name: '@deepseek-ai/dsh-mcp-client'\n"
+            "    disabled: !!js process.env.DISABLE_THIS\n    config:\n      serverName: docs\n"
+            "      transport: streamable-http\n      url: https://docs.example.invalid/mcp\n",
+            yaml.safe_dump([{"insert": [{
+                "id": "docs-entry", "name": "@deepseek-ai/dsh-mcp-client", "disabled": "yes",
+                "config": {"serverName": "docs", "transport": "streamable-http",
+                           "url": "https://docs.example.invalid/mcp"}}]}]),
+        ):
+            with self.subTest(patch=patch[:24]):
+                bundle = self.bundle()
+                (bundle / "cordis.patch.yml").write_text(patch)
+                with mock.patch.dict(os.environ, {"DISABLE_THIS": "true"}, clear=True):
+                    self.refuse(self.args(bundle=bundle, dialect="dsh"), message="conditional or non-boolean")
+        # A foreign row contributes nothing either way, so its gate is skipped, never evaluated.
+        control = self.bundle()
+        (control / "cordis.patch.yml").write_text(
+            "- insert:\n  - id: tool-bash\n    name: '@deepseek-ai/dsh-tool-bash'\n"
+            "    disabled: !!js process.platform === 'win32'\n"
+            "  - id: docs-entry\n    name: '@deepseek-ai/dsh-mcp-client'\n    config:\n"
+            "      serverName: docs\n      transport: streamable-http\n"
+            "      url: https://docs.example.invalid/mcp\n")
+        args = self.args(bundle=control, dialect="dsh")
+        result = self.cli(args)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(sorted(self.servers(args.output)), ["docs"])
+        receipt = (args.output / "CONVERSION.md").read_text()
+        self.assertIn("tool-bash", receipt)
+        self.assertIn("conditional `disabled` gate was not evaluated", receipt)
+
+    def test_dsh_bundle_applies_ordered_patch_layers_and_records_provenance(self):
+        bundle = self.bundle(manifest={"dsh": {"bundle": {"patch": [
+            "./cordis.patch.yml", "./presets/overlay.patch.yml"]}}})
+        (bundle / "cordis.patch.yml").write_text(yaml.safe_dump([{"insert": [{
+            "id": "docs-entry", "name": "@deepseek-ai/dsh-mcp-client", "config": {
+                "serverName": "docs", "transport": "streamable-http",
+                "url": "https://first.example.invalid/mcp", "toolCallTimeoutMs": 19000}}]}]))
+        (bundle / "presets").mkdir()
+        (bundle / "presets" / "overlay.patch.yml").write_text(yaml.safe_dump([{
+            "id": "docs-entry", "disabled": True,
+            # Upstream replaces config as a field; it does not deep-merge it.
+            "config": {"serverName": "docs", "transport": "streamable-http",
+                       "url": "https://second.example.invalid/mcp"}}]))
+        args = self.args(bundle=bundle, dialect="dsh")
+        result = self.cli(args)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.servers(args.output)["docs"], {
+            "type": "streamable-http", "url": "https://second.example.invalid/mcp",
+            "extensions": {"net.codewhale": {"disabled": True}}})
+        receipt = (args.output / "CONVERSION.md").read_text()
+        self.assertIn("applied in declaration order", receipt)
+        self.assertIn(f"Converter version {converter.CONVERTER_VERSION}", receipt)
+        self.assertIn("Source package: @demo/tools-dsh@1.2.3", receipt)
+        self.assertIn(hashlib.sha256((bundle / "package.json").read_bytes()).hexdigest(), receipt)
+        for relative in ("./cordis.patch.yml", "./presets/overlay.patch.yml"):
+            content = (bundle / relative.removeprefix("./")).read_bytes()
+            self.assertIn(f"{relative} (sha256 {hashlib.sha256(content).hexdigest()}, {len(content)} bytes)", receipt)
+        self.assertIn("## Component outcomes", receipt)
+        structured = json.loads((args.output / "CONVERSION.json").read_text())
+        self.assertEqual(structured["schema"], "codewhale.plugin-conversion.v1")
+        self.assertEqual(structured["source"]["manifest_sha256"],
+                         hashlib.sha256((bundle / "package.json").read_bytes()).hexdigest())
+        self.assertEqual([layer["path"] for layer in structured["source"]["patch_layers"]],
+                         ["./cordis.patch.yml", "./presets/overlay.patch.yml"])
+        self.assertEqual([(row["row"], row["outcome"]) for row in structured["outcomes"]],
+                         [("docs-entry", "converted-disabled")])
+        self.assertEqual(structured["required_manual_ports"], [])
+        self.assertFalse(structured["installed"] or structured["trusted"] or structured["enabled"])
+
+    def test_dsh_bundle_patch_layer_list_is_bounded_and_contained(self):
+        portable = yaml.safe_dump([{"insert": [{"id": "docs-entry", "name": "@deepseek-ai/dsh-mcp-client",
+            "config": {"serverName": "docs", "transport": "streamable-http",
+                       "url": "https://docs.example.invalid/mcp"}}]}])
+
+        def attempt(declared, contents=None):
+            bundle = self.bundle(manifest={"dsh": {"bundle": {"patch": declared}}})
+            for name, text in (contents or {}).items():
+                destination = bundle / name
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                destination.write_text(text)
+            return self.args(bundle=bundle, dialect="dsh")
+
+        self.assertEqual(converter.convert(attempt(["./a.yml"], {"a.yml": portable})), (0, 1, 0))
+        self.refuse(attempt(["./a.yml", "./a.yml"], {"a.yml": portable}), message="listed once")
+        self.refuse(attempt(["a.yml", "./a.yml"], {"a.yml": portable}), message="listed once")
+        self.refuse(attempt([str(self.root / "a.yml")]), message="relative path")
+        self.refuse(attempt(["C:\\a.yml"]), message="relative path")
+        self.refuse(attempt(["./a.yml", "../outside.yml"], {"a.yml": portable}), message="inside the bundle")
+        self.refuse(attempt(["./missing.yml"]), message="inside the bundle")
+        self.refuse(attempt([]), message="non-empty ordered list")
+        self.refuse(attempt([f"./layer-{index}.yml" for index in range(65)]), message="At most 64")
+        self.refuse(attempt(["./a.yml", "./b.yml"], {"a.yml": "[]\n" + " " * (1024 * 1024 - 3),
+                                                     "b.yml": "[]\n"}), message="aggregate patch limit")
+
+    def test_dsh_bundle_pinned_upstream_multifile_package_parses_without_promoting_rows(self):
+        bundle = SCRIPT.parent / "fixtures/dsh-web-app"
+        upstream = json.loads((bundle / "UPSTREAM.json").read_text())
+        self.assertEqual(upstream["commit"], "00102833dfaee1da9f48a3a8eae9d34005a75218")
+        for relative, digest in upstream["files"].items():
+            self.assertEqual(hashlib.sha256((bundle / relative).read_bytes()).hexdigest(), digest, relative)
+        manifest = json.loads((bundle / "package.json").read_text())
+        declared = manifest["dsh"]["bundle"]["patch"]
+        self.assertEqual(len(declared), 5)
+        parsed, entries, notes, layers, manifest_hash = converter.load_dsh_bundle(bundle)
+        self.assertEqual([layer["path"] for layer in layers], declared)
+        for layer in layers:
+            content = (bundle / layer["path"].removeprefix("./")).read_bytes()
+            self.assertEqual(layer["sha256"], hashlib.sha256(content).hexdigest())
+            self.assertEqual(layer["bytes"], len(content))
+        self.assertEqual(manifest_hash, hashlib.sha256((bundle / "package.json").read_bytes()).hexdigest())
+        self.assertGreater(len(entries), 0)
+        # The real bundle declares runtime, UI and platform-conditional rows: none of them may
+        # become a native declaration, and no conditional gate may be evaluated or assumed.
+        servers, hosts, skills, roots, row_notes, outcomes = converter.dsh_bundle_components(entries, bundle, {})
+        self.assertEqual((servers, hosts, skills, roots), ({}, [], [], {}))
+        self.assertTrue(all(outcome["outcome"] != "converted" for outcome in outcomes))
+        self.assertTrue(any("conditional" in note for note in row_notes))
 
     def test_dsh_bundle_relative_entry_and_group_children_convert(self):
         bundle = self.bundle()
@@ -526,6 +735,78 @@ for await (const line of readline.createInterface({ input: process.stdin })) {
         (combined / "cordis.patch.yml").write_text("[]")
         self.refuse(self.args(bundle=combined, config=self.config(self.dsh()), dialect="dsh"),
                     message="not both")
+
+    def test_dsh_bundle_policy_and_dependency_fields_never_widen_activation(self):
+        for field, value in (("inject", ["approvals"]), ("intercept", {"tools": True}),
+                             ("isolate", {"tools": "private"}), ("unknownGate", True)):
+            for shape in ("mcp", "skill", "group"):
+                for disabled in (False, True):
+                    with self.subTest(field=field, shape=shape, disabled=disabled):
+                        row = self.dsh()[0]
+                        if shape == "skill":
+                            row = {"id": "skills", "name": converter.DSH_SKILL_FILESYSTEM,
+                                   "config": {"customSkillDirs": ["skills"]}}
+                        elif shape == "group":
+                            row = {"id": "group", "group": True, "config": [row]}
+                        row.update({field: value, "disabled": disabled})
+                        bundle = self.bundle(yaml.safe_dump([{"insert": [row]}]))
+                        self.refuse(self.args(bundle=bundle, dialect="dsh"),
+                                    message="unsupported entry policy or dependency")
+
+    def test_dsh_bundle_skipped_stdio_never_copies_its_inferred_source(self):
+        bundle = self.bundle()
+        local = bundle / "packaged"
+        local.mkdir()
+        (local / "server.mjs").write_text("throw new Error('never run');\n")
+        rows = self.dsh() + [{"id": "unportable", "name": converter.DSH_MCP_CLIENT, "config": {
+            "serverName": "local", "transport": "stdio", "command": "node", "args": ["server.mjs"],
+            "cwd": "packaged", "env": {"TOKEN": CANARY}}}]
+        (bundle / "cordis.patch.yml").write_text(yaml.safe_dump([{"insert": rows}]))
+        args = self.args(bundle=bundle, dialect="dsh")
+        result = self.cli(args)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(list(self.servers(args.output)), ["docs"])
+        self.assertFalse((args.output / "mcp").exists())
+        receipt = json.loads((args.output / "CONVERSION.json").read_text())
+        self.assertEqual([row["row"] for row in receipt["required_manual_ports"]], ["unportable"])
+        self.assert_no_canary(result, args.output)
+
+    def test_dsh_bundle_resolves_relative_stdio_entry_against_declared_cwd(self):
+        bundle = self.bundle()
+        (bundle / "server.mjs").write_text("wrong source")
+        source = bundle / "packaged"
+        source.mkdir()
+        (source / "server.mjs").write_text("correct source")
+        (bundle / "cordis.patch.yml").write_text(yaml.safe_dump([{"insert": [{
+            "name": converter.DSH_MCP_CLIENT, "config": {
+                "serverName": "local", "transport": "stdio", "command": "node", "args": ["server.mjs"],
+                "cwd": "packaged"}}]}]))
+        args = self.args(bundle=bundle, dialect="dsh")
+        self.assertEqual(converter.convert(args), (0, 1, 0))
+        self.assertEqual((args.output / "mcp/local/server.mjs").read_text(), "correct source")
+
+    def test_dsh_bundle_explicit_source_must_name_a_local_server(self):
+        bundle = self.bundle(yaml.safe_dump([{"insert": self.dsh()}]))
+        self.refuse(self.args(bundle=bundle, dialect="dsh", stdio_roots=[f"docs={self.node_source()}"]),
+                    message="selected local MCP server")
+
+    def test_dsh_bundle_duplicate_server_cannot_discard_a_disabled_row(self):
+        rows = self.dsh() + self.dsh()
+        rows[1].update(id="disabled-copy", disabled=True)
+        bundle = self.bundle(yaml.safe_dump([{"insert": rows}]))
+        self.refuse(self.args(bundle=bundle, dialect="dsh"), message="Duplicate MCP server")
+
+    def test_dsh_literal_lowering_never_evaluates_or_changes_escaped_strings(self):
+        for expression in ("'https://example.invalid/mcp'", "`https://example.invalid/mcp`"):
+            self.assertEqual(converter.lower_js(converter.JsExpr(expression), "url"),
+                             "https://example.invalid/mcp")
+        for expression in (r"'https://example.invalid/\\x41'", "`x` + `y`",
+                           "process.env.TOKEN", "process.env.TOKEN || 'literal'",
+                           "`${process.env.TOKEN}`", "process.env['TOKEN']"):
+            with self.subTest(expression=expression):
+                with mock.patch.object(os.environ, "get", side_effect=AssertionError("ambient lookup")):
+                    with self.assertRaises(converter.ConversionError):
+                        converter.lower_js(converter.JsExpr(expression), "url")
 
     def test_cli_literal_credentials_and_interpolation_never_echo_or_publish(self):
         secret_file = self.write(CANARY, ".txt")
