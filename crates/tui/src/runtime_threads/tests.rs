@@ -15598,10 +15598,7 @@ mod runtime_image_inputs {
             runtime_chat_isolated: true,
             ..Config::default()
         };
-        config.set_provider_model_override(
-            ApiProvider::Deepseek,
-            Some("deepseek-flash".into()),
-        );
+        config.set_provider_model_override(ApiProvider::Deepseek, Some("deepseek-flash".into()));
         config.set_feature("mcp", false).unwrap();
         config.set_feature("subagents", false).unwrap();
         config

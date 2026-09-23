@@ -9841,9 +9841,7 @@ fn provider_catalog_keeps_official_deepseek_facts_but_not_custom_proxy_claims() 
         );
         let models = provider_models_for_api(&config, ApiProvider::Deepseek, ApiProvider::Deepseek);
         assert!(
-            models
-                .iter()
-                .any(|model| model == "deepseek-flash"),
+            models.iter().any(|model| model == "deepseek-flash"),
             "official DeepSeek endpoint must expose the experimental vision model: {official_base_url}"
         );
     }
@@ -9873,11 +9871,7 @@ fn provider_catalog_keeps_official_deepseek_facts_but_not_custom_proxy_claims() 
         "a custom proxy may legitimately reuse a first-party model id"
     );
     assert_eq!(
-        provider_model_image_input_for_api(
-            &custom,
-            ApiProvider::Deepseek,
-            "deepseek-flash",
-        ),
+        provider_model_image_input_for_api(&custom, ApiProvider::Deepseek, "deepseek-flash",),
         codewhale_config::route::CapabilityState::Unknown,
         "same-name custom proxy must not surface first-party vision capability as verified"
     );
@@ -14384,10 +14378,7 @@ async fn runtime_image_http_rejects_before_dispatch_and_accepts_large_canonical_
         api_key: Some("synthetic-image-key".into()),
         ..Default::default()
     };
-    config.set_provider_model_override(
-        ApiProvider::Deepseek,
-        Some("deepseek-flash".into()),
-    );
+    config.set_provider_model_override(ApiProvider::Deepseek, Some("deepseek-flash".into()));
     let (addr, manager, server) = spawn_test_server_with_root_token_mobile_workspace_and_overrides(
         dir.path().to_path_buf(),
         dir.path().join("sessions"),
@@ -14505,10 +14496,7 @@ async fn runtime_image_stream_rejection_does_not_leave_empty_threads() -> Result
         api_key: Some("synthetic-image-key".into()),
         ..Default::default()
     };
-    config.set_provider_model_override(
-        ApiProvider::Deepseek,
-        Some("deepseek-flash".into()),
-    );
+    config.set_provider_model_override(ApiProvider::Deepseek, Some("deepseek-flash".into()));
     let (addr, manager, server) = spawn_test_server_with_root_token_mobile_workspace_and_overrides(
         dir.path().to_path_buf(),
         dir.path().join("sessions"),
