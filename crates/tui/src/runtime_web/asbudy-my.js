@@ -2979,25 +2979,81 @@
       if (sec < 60) return sec + ' 秒';
       return Math.floor(sec / 60) + ' 分 ' + (sec % 60) + ' 秒';
     }
+    /* ── 两个钟：本轮（「处理中 · 已用 N」）＋ 这个对话累计（官方那个「已运行 N」）─────
+     * 【官方语义（照 `tui/tui/phase_strip.rs:1100` 的 `working_clock()`，别自己发明）】
+     *   · turn 读数 = `{阶段词} {时长}` —— 答「正在干什么、多久了」；
+     *   · session 读数 = `App::cumulative_turn_duration`（**已完成轮次时长之和**）＋当前这一轮；
+     *     注释原文 *"It is model work, not wall clock since launch — an idle TUI does not
+     *     claim to have been working"* ⇒ **不是「挂着多久」，是这个对话真干了多久**；
+     *   · 门槛 `CLOCK_SESSION_FLOOR_SECS = 60`（不足 1 分钟不显示）·
+     *     与 turn 读数相同时也不显示（会话第一轮，`#6041`）· 空闲时用暗色（钟停了）。
+     *   · 文案照官方语言包 `locales/zh-Hans.json:1229` —— 「已运行{duration}」。
+     * 【数据从哪来】`GET /v1/threads/{id}` 的 turns（每轮 `duration_ms`）＝已完成轮次之和；
+     *   正在跑的那一轮用本地秒表补（就是原来那个「已用 N 秒」的钟）。
+     * 【为什么合并】§12 M15：我们**已有**这个 tick，做这条时要合并，别摆出两个钟。
+     */
+    var doneMs = 0;        // 已完成轮次之和（毫秒）
+    var doneFor = '';      // doneMs 读的是哪个会话
+    var seenFor = '';      // 上次 paint 时看到的会话（用于惰性跟上切会话）
+
+    function loadDone() {
+      var tid = MODEL_THREAD;
+      if (!tid) return;
+      if (tid === doneFor) return;
+      doneFor = tid;
+      doneMs = 0;
+      api('/v1/threads/' + encodeURIComponent(tid)).then(function (r) {
+        var body = (r && r.body) || {};
+        var turns = body.turns || [];
+        var sum = 0;
+        turns.forEach(function (t) {
+          var ms = Number((t && t.duration_ms) || 0);
+          // 兜底：没有 duration_ms 就用 started_at / ended_at 算
+          if (!ms && t && t.started_at && t.ended_at) {
+            ms = Math.max(0, new Date(t.ended_at) - new Date(t.started_at));
+          }
+          sum += ms;
+        });
+        doneMs = sum;
+        paint();
+      }).catch(function () { /* 读不到就先只显示本轮钟，不报错 */ });
+    }
+    function workedSec() {
+      return Math.round((doneMs + (startedAt ? Date.now() - startedAt : 0)) / 1000);
+    }
     function paint() {
       var el = ensureEl();
       if (!el) return;
-      var sec = Math.round((Date.now() - startedAt) / 1000);
-      el.textContent = '⏱ 处理中 · 已用 ' + fmt(sec);
+      if (MODEL_THREAD !== seenFor) { seenFor = MODEL_THREAD; if (MODEL_THREAD !== doneFor) loadDone(); }
+      var parts = [];
+      var turnSec = startedAt ? Math.round((Date.now() - startedAt) / 1000) : 0;
+      if (startedAt) parts.push('⏱ 处理中 · 已用 ' + fmt(turnSec));
+      var w = workedSec();
+      // 官方两条门槛：不足 60 秒不显示；与 turn 读数相同（第一轮）也不显示
+      if (w >= 60 && !(startedAt && w === turnSec)) parts.push('已运行 ' + fmt(w));
+      el.textContent = parts.join('　·　');
+      el.hidden = parts.length === 0;
+      // 空闲时暗一点（官方：钟停了；颜色降一档，但不隐藏）
+      el.style.opacity = startedAt ? '' : '.7';
     }
     function start() {
       startedAt = Date.now();
       var el = ensureEl();
       if (el) el.hidden = false;
+      loadDone();
       paint();
       if (tick) clearInterval(tick);
       tick = setInterval(paint, 500);
     }
     function stop() {
+      if (startedAt) { doneMs += Date.now() - startedAt; startedAt = 0; }
       if (tick) { clearInterval(tick); tick = null; }
-      var el = document.getElementById('asbudy-tick');
-      if (el) el.hidden = true;
+      // 轮刚结束 → 重新跟引擎对一次账（拿真值盖本地累加，避免长会话漂）
+      doneFor = '';
+      paint();
     }
+    // 空闲时也低频跟一下：切会话 / 页面刚打开（那时 MODEL_THREAD 才被猴补 fetch 捕获）
+    setInterval(function () { if (!startedAt) paint(); }, 3000);
     function watch() {
       var btn = document.getElementById('interrupt-turn');
       if (!btn) return false;
