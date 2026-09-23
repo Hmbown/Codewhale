@@ -11,7 +11,7 @@ use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose};
 use serde_json::{Value, json};
 
-use crate::client::{DeepSeekClient, SpeechSynthesisRequest};
+use crate::client::{CodewhaleClient, SpeechSynthesisRequest};
 use crate::config::{ApiProvider, normalize_model_name_for_provider};
 use crate::network_policy::{Decision, host_from_url};
 
@@ -41,7 +41,7 @@ pub(crate) const SPEECH_MODEL_EXAMPLES: &[&str] = &[
 
 pub struct SpeechTool {
     name: &'static str,
-    client: Option<DeepSeekClient>,
+    client: Option<CodewhaleClient>,
     output_dir: Option<PathBuf>,
     /// The canonical `speech` entry is model-visible; `tts` is a hidden
     /// compat alias so one capability costs one catalog entry (#5941).
@@ -52,7 +52,7 @@ impl SpeechTool {
     #[must_use]
     pub fn new(
         name: &'static str,
-        client: Option<DeepSeekClient>,
+        client: Option<CodewhaleClient>,
         output_dir: Option<PathBuf>,
     ) -> Self {
         Self {
@@ -68,7 +68,7 @@ impl SpeechTool {
     #[must_use]
     pub fn alias(
         name: &'static str,
-        client: Option<DeepSeekClient>,
+        client: Option<CodewhaleClient>,
         output_dir: Option<PathBuf>,
     ) -> Self {
         Self {

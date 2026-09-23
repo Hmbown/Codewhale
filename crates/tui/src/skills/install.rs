@@ -200,7 +200,7 @@ pub struct InstalledSkill {
     /// SHA-256 over the downloaded tarball bytes. Used by [`update`] to detect
     /// upstream changes without re-extracting; also surfaced for telemetry /
     /// future signature-verification work.
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     pub source_checksum: String,
 }
 
@@ -270,7 +270,8 @@ pub enum InstallError {
 /// [`DEFAULT_REGISTRY_URL`]. Public for downstream consumers (tests, runtime
 /// API) even though the slash-command path always goes through
 /// [`install_with_registry`] so the user's configured registry wins.
-#[allow(dead_code)]
+#[cfg_attr(not(test), expect(dead_code))]
+#[cfg_attr(test, allow(dead_code))]
 pub async fn install(
     source: InstallSource,
     skills_dir: &Path,
@@ -326,10 +327,10 @@ pub async fn install_with_registry(
     // finalize can restore the previous install.
     let final_path = skills_dir.join(&staged.skill_name);
     let mut backup_path: Option<PathBuf> = None;
-    if final_path.exists() {
+    if tokio::fs::try_exists(&final_path).await.unwrap_or(false) {
         if !update {
             // Clean up the staging dir before returning the error.
-            let _ = fs::remove_dir_all(&staged.staged_path);
+            let _ = tokio::fs::remove_dir_all(&staged.staged_path).await;
             return Err(InstallError::AlreadyInstalled(staged.skill_name).into());
         }
         // Same ownership gate as plugins/install/place.rs: an update may only
@@ -337,31 +338,35 @@ pub async fn install_with_registry(
         // is not proof of ownership — without the marker we would delete a
         // user-authored or system skill that happened to share the name.
         if let Err(err) = reject_unmarked_update(&final_path, &staged.skill_name) {
-            let _ = fs::remove_dir_all(&staged.staged_path);
+            let _ = tokio::fs::remove_dir_all(&staged.staged_path).await;
             return Err(err.into());
         }
         let backup = skills_dir.join(format!("{}.bak", staged.skill_name));
-        if backup.exists() {
-            fs::remove_dir_all(&backup).ok();
+        if tokio::fs::try_exists(&backup).await.unwrap_or(false) {
+            tokio::fs::remove_dir_all(&backup).await.ok();
         }
-        fs::rename(&final_path, &backup).with_context(|| {
-            format!(
-                "failed to backup existing skill at {}",
-                final_path.display()
-            )
-        })?;
-        if let Err(err) = fs::rename(&staged.staged_path, &final_path) {
-            fs::rename(&backup, &final_path).ok();
+        tokio::fs::rename(&final_path, &backup)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to backup existing skill at {}",
+                    final_path.display()
+                )
+            })?;
+        if let Err(err) = tokio::fs::rename(&staged.staged_path, &final_path).await {
+            tokio::fs::rename(&backup, &final_path).await.ok();
             return Err(err).context("failed to install staged skill");
         }
         backup_path = Some(backup);
     } else {
         if let Some(parent) = final_path.parent() {
-            fs::create_dir_all(parent).with_context(|| {
+            tokio::fs::create_dir_all(parent).await.with_context(|| {
                 format!("failed to create skills directory {}", parent.display())
             })?;
         }
-        fs::rename(&staged.staged_path, &final_path).context("failed to install staged skill")?;
+        tokio::fs::rename(&staged.staged_path, &final_path)
+            .await
+            .context("failed to install staged skill")?;
     }
 
     // Write the marker last so a partial install never leaves a stale
@@ -370,9 +375,9 @@ pub async fn install_with_registry(
     let content_digest = match super::package_digest::compute_package_digest(&final_path) {
         Ok(digest) => digest,
         Err(err) => {
-            let _ = fs::remove_dir_all(&final_path);
+            let _ = tokio::fs::remove_dir_all(&final_path).await;
             if let Some(backup) = backup_path.take() {
-                let _ = fs::rename(&backup, &final_path);
+                let _ = tokio::fs::rename(&backup, &final_path).await;
             }
             return Err(anyhow::anyhow!(
                 "installed package failed content digest validation: {err}"
@@ -387,14 +392,14 @@ pub async fn install_with_registry(
         &content_digest,
         &staged.skill_name,
     ) {
-        let _ = fs::remove_dir_all(&final_path);
+        let _ = tokio::fs::remove_dir_all(&final_path).await;
         if let Some(backup) = backup_path.take() {
-            let _ = fs::rename(&backup, &final_path);
+            let _ = tokio::fs::rename(&backup, &final_path).await;
         }
         return Err(err);
     }
     if let Some(backup) = backup_path {
-        fs::remove_dir_all(&backup).ok();
+        tokio::fs::remove_dir_all(&backup).await.ok();
     }
 
     Ok(InstallOutcome::Installed(InstalledSkill {
@@ -412,7 +417,8 @@ pub async fn install_with_registry(
 /// `/skill update bar` without the user re-typing the spec.
 ///
 /// Convenience wrapper over [`update_with_registry`].
-#[allow(dead_code)]
+#[cfg_attr(not(test), expect(dead_code))]
+#[cfg_attr(test, allow(dead_code))]
 pub async fn update(
     name: &str,
     skills_dir: &Path,
@@ -431,14 +437,15 @@ pub async fn update_with_registry(
     registry_url: &str,
 ) -> Result<UpdateResult> {
     let target = skill_target_path(name, skills_dir)?;
-    if target.exists() {
+    if tokio::fs::try_exists(&target).await.unwrap_or(false) {
         ensure_target_within_skills_dir(&target, skills_dir)?;
     }
     let marker_path = target.join(INSTALLED_FROM_MARKER);
-    if !marker_path.exists() {
+    if !tokio::fs::try_exists(&marker_path).await.unwrap_or(false) {
         return Err(InstallError::NotInstalledHere(name.to_string()).into());
     }
-    let marker_body = fs::read_to_string(&marker_path)
+    let marker_body = tokio::fs::read_to_string(&marker_path)
+        .await
         .with_context(|| format!("failed to read {}", marker_path.display()))?;
     let marker: InstalledFromMarker = serde_json::from_str(&marker_body)
         .with_context(|| format!("malformed {INSTALLED_FROM_MARKER} for {name}"))?;
@@ -474,13 +481,13 @@ pub async fn update_with_registry(
     // so we get the same atomic-replace semantics. Content updates must not
     // inherit a previous trust marker.
     let trust_path = target.join(TRUSTED_MARKER);
-    let had_trust = trust_path.exists();
+    let had_trust = tokio::fs::try_exists(&trust_path).await.unwrap_or(false);
     let outcome =
         install_with_registry(source, skills_dir, max_size, network, true, registry_url).await?;
     match &outcome {
         InstallOutcome::Installed(installed) => {
             if had_trust {
-                let _ = fs::remove_file(installed.path.join(TRUSTED_MARKER));
+                let _ = tokio::fs::remove_file(installed.path.join(TRUSTED_MARKER)).await;
             }
         }
         InstallOutcome::NeedsApproval(_) | InstallOutcome::NetworkDenied(_) => {}
@@ -706,14 +713,10 @@ async fn sync_one_skill(
         // Perform a HEAD request (or conditional GET) for freshness. We use a
         // simple GET with If-None-Match when we have an ETag, falling back to
         // an unconditional GET for servers that don't support ETags.
-        let existing_meta: Option<CacheMeta> = meta_path
-            .exists()
-            .then(|| {
-                fs::read_to_string(&meta_path)
-                    .ok()
-                    .and_then(|s| serde_json::from_str(&s).ok())
-            })
-            .flatten();
+        let existing_meta: Option<CacheMeta> = tokio::fs::read_to_string(&meta_path)
+            .await
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok());
 
         // Build the request — add If-None-Match if we have a cached ETag.
         let client = reqwest_client();
@@ -813,11 +816,11 @@ async fn sync_one_skill(
             };
             // Move staged dir into its final location, replacing any prior cache.
             let dest = cache_dir.join(name);
-            if dest.exists() {
-                let _ = fs::remove_dir_all(&dest);
+            if tokio::fs::try_exists(&dest).await.unwrap_or(false) {
+                let _ = tokio::fs::remove_dir_all(&dest).await;
             }
-            if let Err(err) = fs::rename(&staged.staged_path, &dest) {
-                let _ = fs::remove_dir_all(&staged.staged_path);
+            if let Err(err) = tokio::fs::rename(&staged.staged_path, &dest).await {
+                let _ = tokio::fs::remove_dir_all(&staged.staged_path).await;
                 return SkillSyncOutcome::Failed {
                     name: name.to_string(),
                     reason: format!("failed to move staged skill into cache: {err:#}"),
@@ -826,14 +829,14 @@ async fn sync_one_skill(
             dest
         } else {
             // Plain SKILL.md (or other companion text file). Write directly.
-            if let Err(err) = fs::create_dir_all(&skill_cache_dir) {
+            if let Err(err) = tokio::fs::create_dir_all(&skill_cache_dir).await {
                 return SkillSyncOutcome::Failed {
                     name: name.to_string(),
                     reason: format!("failed to create cache dir: {err:#}"),
                 };
             }
             let skill_md_path = skill_cache_dir.join("SKILL.md");
-            if let Err(err) = fs::write(&skill_md_path, &bytes) {
+            if let Err(err) = tokio::fs::write(&skill_md_path, &bytes).await {
                 return SkillSyncOutcome::Failed {
                     name: name.to_string(),
                     reason: format!("failed to write SKILL.md to cache: {err:#}"),
@@ -849,7 +852,7 @@ async fn sync_one_skill(
             url: url.clone(),
         };
         let meta_json = serde_json::to_string(&meta).unwrap_or_default();
-        let _ = fs::write(final_path.join(".cache-meta.json"), meta_json);
+        let _ = tokio::fs::write(final_path.join(".cache-meta.json"), meta_json).await;
 
         return SkillSyncOutcome::Downloaded {
             name: name.to_string(),
@@ -880,10 +883,10 @@ pub(crate) struct InstalledFromMarker {
     #[serde(default)]
     source_checksum: Option<String>,
     #[serde(default)]
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     schema_version: Option<u32>,
     #[serde(default)]
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     content_digest: Option<String>,
 }
 

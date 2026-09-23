@@ -4,6 +4,7 @@ use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
@@ -35,7 +36,9 @@ use crate::tools::subagent::{AgentWorkerStatus, SubAgentResult};
 use crate::tools::todo::{SharedTodoList, TodoList, new_shared_todo_list};
 use crate::tui::active_cell::ActiveCell;
 use crate::tui::clipboard::{ClipboardContent, ClipboardHandler};
-use crate::tui::history::{HistoryCell, TranscriptActionOwner, TranscriptRenderOptions};
+use crate::tui::history::{
+    HistoryCell, ThinkingFold, TranscriptActionOwner, TranscriptRenderOptions,
+};
 use crate::tui::hotbar::HotbarActionRegistry;
 use crate::tui::motion::MotionPolicy;
 use crate::tui::paste_burst::{FlushResult, PasteBurst};
@@ -70,9 +73,9 @@ pub(crate) enum RedactionGateNotice {
 }
 pub use types::{
     AppAction, AppModeUi, AutomationAction, ComposerDensity, ComposerSubmitAction,
-    ComposerSubmitChord, InitialInput, McpUiAction, QueuedMessage, ScreenMode, SettingSelection,
-    ShellJobAction, SubmitDisposition, TaskPanelEntry, TaskPanelEntryKind, ToolCollapseMode,
-    ToolDetailRecord, TranscriptSpacing, TuiOptions, VimMode,
+    ComposerSubmitChord, InflightSteer, InitialInput, McpUiAction, QueuedMessage, ScreenMode,
+    SettingSelection, ShellJobAction, SubmitDisposition, TaskPanelEntry, TaskPanelEntryKind,
+    ToolCollapseMode, ToolDetailRecord, TranscriptSpacing, TuiOptions, VimMode,
 };
 pub(crate) use types::{
     CacheReplayTarget, GoalControlIntent, PendingGoalControl, WORKFLOW_DRAFT_INSTRUCTION_PREFIX,
@@ -587,8 +590,15 @@ pub struct LaunchRecentSession {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LaunchRowId {
     NewSession,
+    ReturnToSession,
     Recent(String),
     SeeAll,
+    /// Open the MCP manager from the status summary, including healthy servers.
+    McpManager,
+    /// The MCP problems row: Enter/click types the remedy command into the
+    /// composer (`/mcp login <name>` or `/mcp`) instead of making the user
+    /// retype what the card printed (#6085).
+    McpRemedy,
 }
 
 /// How many recent sessions the startup card lists inline before the
@@ -603,6 +613,8 @@ pub(crate) const LAUNCH_RECENT_INLINE_LIMIT: usize = 5;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LaunchState {
     pub visible: bool,
+    /// Home temporarily covers the current conversation; it does not own a session.
+    pub return_to_session: bool,
     pub status: Option<String>,
     /// Canonical workspace this launch state is scoped to. Recent work is
     /// the workspace's own sessions (archived and empty auto-created ones
@@ -643,6 +655,9 @@ pub struct LaunchState {
     /// it has. The first keystroke or a launched command dissolves the card
     /// (founder decision, 2026-09-02).
     pub dissolve_started_ms: Option<u128>,
+    /// One bounded reveal of the canonical mark, anchored at first paint.
+    /// Kept when the launcher is revisited so it never replays on navigation.
+    pub mark_reveal_started_at: Option<Instant>,
     /// Claude Code config was detected on this host (probed once at
     /// construction); drives the launch card's migration notice line.
     pub claude_code_detected: bool,
@@ -717,6 +732,7 @@ impl LaunchState {
         let claude_code_detected = has_claude_code && !import_already_reviewed;
         Self {
             visible,
+            return_to_session: false,
             status: None,
             workspace: workspace.to_path_buf(),
             recent,
@@ -727,8 +743,18 @@ impl LaunchState {
             hovered_row: None,
             menu_selected: None,
             dissolve_started_ms: None,
+            mark_reveal_started_at: None,
             claude_code_detected,
         }
+    }
+
+    /// Leave home without resetting the conversation, draft, or reveal clock.
+    pub fn dismiss(&mut self) {
+        self.visible = false;
+        self.return_to_session = false;
+        self.row_hitboxes.clear();
+        self.menu_selected = None;
+        self.hovered_row = None;
     }
 
     /// Re-read the recent-work list from disk (same filter as
@@ -908,21 +934,6 @@ impl Default for ComposerState {
     }
 }
 
-/// Compatibility name retained for the first Tideline header slice. New
-/// surfaces register [`crate::tui::tideline::InteractionAction`] directly.
-pub type HeaderActionTarget = crate::tui::tideline::InteractionAction;
-
-/// A header target painted in the latest frame.
-///
-/// The visible chrome owns placement; input owns dispatch. Keeping the
-/// rectangular target alongside its typed action gives mouse and keyboard
-/// routes one shared destination without a second navigation system.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct HeaderHitbox {
-    pub area: Rect,
-    pub target: HeaderActionTarget,
-}
-
 /// Viewport/scroll state — fields related to transcript scrolling and caching.
 pub struct ViewportState {
     pub transcript_scroll: TranscriptScroll,
@@ -932,6 +943,10 @@ pub struct ViewportState {
     pub transcript_selection: TranscriptSelection,
     pub selection_autoscroll: Option<SelectionAutoscroll>,
     pub transcript_scrollbar_dragging: bool,
+    /// Copy transcript drag selections as Markdown source (see
+    /// `TuiConfig::selection_copy_markdown`). Resolved from config at startup;
+    /// defaults to on.
+    pub selection_copy_markdown: bool,
     pub last_transcript_area: Option<Rect>,
     pub last_composer_area: Option<Rect>,
     /// Selectable targets from the latest painted frame. Cleared before every
@@ -985,6 +1000,7 @@ impl Default for ViewportState {
             transcript_selection: TranscriptSelection::default(),
             selection_autoscroll: None,
             transcript_scrollbar_dragging: false,
+            selection_copy_markdown: true,
             last_transcript_area: None,
             last_composer_area: None,
             interaction_targets: crate::tui::tideline::InteractionRegistry::default(),
@@ -1448,7 +1464,6 @@ fn try_persist_route_as_startup_default(
 pub struct App {
     pub mode: AppMode,
     /// Registered hotbar actions available for future slot config/render layers.
-    #[allow(dead_code)]
     pub hotbar_actions: HotbarActionRegistry,
     /// Composer sub-state (input, cursor, history, menus).
     pub composer: ComposerState,
@@ -1488,7 +1503,11 @@ pub struct App {
     pub(crate) tool_run_cache: ToolRunCache,
     /// Monotonic counter used to issue fresh per-cell revisions.
     pub next_history_revision: u64,
-    pub api_messages: Vec<Message>,
+    /// Engine transcript mirror, shared rather than copied per event
+    /// (#6214 T2). Reads dereference to the `Vec`; mutations go through
+    /// [`App::api_messages_mut`] and copy-on-write only while an engine
+    /// snapshot is outstanding.
+    pub api_messages: Arc<Vec<Message>>,
     /// When each `api_messages` entry landed, index-aligned. The persisted
     /// journal's `created_at` reads from these stamps, so a save rewrites
     /// neither an entry's content nor its time — appends during a turn stay
@@ -1497,6 +1516,9 @@ pub struct App {
     /// length-mismatched site degrades to save-time stamps, never to a
     /// dropped message.
     pub api_message_stamps: Vec<DateTime<Utc>>,
+    /// Full saved history, including inactive branches. API messages remain
+    /// the active projection; snapshots reconcile it without rebuilding IDs.
+    pub session_journal: crate::session_tree::SessionJournal,
     /// User-visible assistant text that crossed typed completion boundaries.
     /// Receipts are aligned to transcript cells because provider context can
     /// be compacted or purged without changing what remains visible.
@@ -1574,10 +1596,10 @@ pub struct App {
     pub configured_models: Vec<codewhale_config::catalog::configured::ConfiguredModel>,
     /// Exact provider/model pins loaded from settings, in user order.
     pub pinned_models: Vec<crate::settings::PinnedModel>,
-    /// When true, the model is auto-selected based on request complexity
-    /// rather than using a fixed model. The `/model auto` command sets this.
-    /// `dispatch_user_message` calls `auto_model_heuristic` to resolve the
-    /// effective model for each outbound message.
+    /// When true, the model is auto-selected rather than using a fixed
+    /// model. The `/model auto` command sets this. The flash classifier
+    /// picks the per-turn model when available; otherwise the configured
+    /// default model is used (no request-content signal).
     pub auto_model: bool,
     /// Last concrete model chosen while `auto_model` is active.
     pub last_effective_model: Option<String>,
@@ -1663,6 +1685,9 @@ pub struct App {
     pub workflow_config: codewhale_config::WorkflowConfigToml,
     /// Effective `[goal] max_continuations` backstop; `0` means unlimited.
     pub goal_max_continuations: u32,
+    /// Effective `[goal] enforce_token_budget`; `true` makes a goal's token
+    /// budget a hard stop instead of advisory telemetry (#6013).
+    pub goal_enforce_token_budget: bool,
     /// Typed engine lifecycle state for the cancellable between-turn wait.
     pub goal_continuation_waiting: bool,
     /// Effective explicit/managed filesystem scope captured at startup. The
@@ -1745,7 +1770,12 @@ pub struct App {
     /// fast typing or IME commits could otherwise be mis-classified as a
     /// paste burst (#1322 follow-up).
     pub bracketed_paste_seen: bool,
-    #[allow(dead_code)]
+    /// The terminal is one we have verified delivers `Event::Paste`, so the
+    /// rapid-keystroke heuristic is skipped from the first keystroke instead
+    /// of waiting for `bracketed_paste_seen` to be proven by an actual
+    /// paste. Resolved once at startup from the environment — never read
+    /// ambiently, so tests and headless runs stay hermetic.
+    pub bracketed_paste_trusted: bool,
     pub system_prompt: Option<SystemPrompt>,
     pub auto_compact: bool,
     pub auto_compact_user_configured: bool,
@@ -1799,7 +1829,7 @@ pub struct App {
     pub launch: LaunchState,
     /// Mouse-selected launch action, consumed by the async UI loop.
     pub pending_launch_action: Option<crate::tui::underwater::LaunchAction>,
-    /// Mouse click on the live composer's `[↑]` send target. The async UI loop
+    /// Mouse click on the live composer's `[↵]` send target. The async UI loop
     /// consumes it through the same submit dispatcher as Enter.
     pub pending_composer_submit: Option<ComposerSubmitChord>,
     /// Mouse-selected hotbar slot, consumed by the async UI loop.
@@ -1880,7 +1910,6 @@ pub struct App {
     /// Whether the file-tree pane was actually rendered in the last frame.
     /// Set false when the terminal is too narrow to show the tree.
     pub file_tree_visible: bool,
-    #[allow(dead_code)]
     pub compact_threshold: usize,
     pub max_input_history: usize,
     pub allow_shell: bool,
@@ -2000,7 +2029,6 @@ pub struct App {
     /// Lifecycle event outbox (`[lifecycle_outbox]` config). Disabled
     /// (all emits no-ops) when no path is configured.
     pub lifecycle_outbox: codewhale_hooks::LifecycleOutbox,
-    #[allow(dead_code)]
     pub yolo: bool,
     /// One-shot YOLO→Act+Bypass migration notice for this session (#0.8.68 M6).
     yolo_compat_notified: bool,
@@ -2103,17 +2131,8 @@ pub struct App {
     /// `compact` keeps the route, context, cost and balance and drops the
     /// telemetry and the help hint.
     pub metrics_line: crate::config::ChromeRowPreset,
-    /// Optional header items enabled from `tui.header_items` in `config.toml`
-    /// at startup. Built-in header content remains independent of this list.
-    /// Unread since the classic header was superseded by the Tideline info
-    /// line (2026-08-29): the info line carries the context meter by default and the
-    /// token breakdown lives behind `/cost` (spec §3). The field stays so the
-    /// config surface keeps parsing; its reader returns with the classic
-    /// renderer deletion slice.
-    #[allow(dead_code)]
-    pub header_items: Vec<crate::config::HeaderItem>,
     /// Project documentation (AGENTS.md or CLAUDE.md)
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     pub project_doc: Option<String>,
     /// Plan state for tracking tasks
     pub plan_state: SharedPlanState,
@@ -2259,13 +2278,12 @@ pub struct App {
     /// in-flight input uses Ctrl+Enter for same-turn steering and Enter for
     /// queued follow-ups; Esc only cancels the active turn.
     pub pending_steers: VecDeque<QueuedMessage>,
-    /// Engine-rejected steers (e.g. a tool was already running and couldn't be
-    /// cancelled cleanly). Surfaced in the pending-input preview so the user
-    /// knows the steer was deferred to end-of-turn. Today no engine path
-    /// produces these; the field is scaffolding for a future signalling
-    /// channel and the bucket renders with a rejected-steer label when
-    /// populated.
-    pub rejected_steers: VecDeque<String>,
+    /// Steers accepted by the steer channel but not yet seen in the engine's
+    /// record. Rendered through the same "sending into turn" preview bucket as
+    /// `pending_steers`; promoted to a transcript cell by
+    /// `apply_engine_session_projection`, or queued as a follow-up by
+    /// `TurnComplete` when the turn ended without them (#6190, #6297).
+    pub inflight_steers: VecDeque<InflightSteer>,
     /// Legacy resend flag for pending steer recovery.
     pub submit_pending_steers_after_interrupt: bool,
     /// Start time for current turn
@@ -2471,10 +2489,15 @@ pub struct App {
     /// Transcript cells the user has collapsed (hidden from view).
     /// Stores **original** virtual cell indices (pre-filtering).
     pub collapsed_cells: HashSet<usize>,
-    /// Thinking cells the user has folded (showing summary instead of full
-    /// content). Stores **original** virtual cell indices. Toggled by Space
-    /// when the composer is empty and the cursor is on a thinking cell.
-    pub folded_thinking: HashSet<usize>,
+    /// Explicit expand/collapse intents the user has recorded for thinking
+    /// cells, keyed by **original** virtual cell index. Set by Space when the
+    /// composer is empty and the cursor is on a thinking cell.
+    ///
+    /// An absent index means the user has not touched that cell, so the
+    /// display preferences decide it. A present index is absolute, so
+    /// changing `verbose` or `thinking_default_expanded` afterwards leaves
+    /// the user's own choice alone (#5847).
+    pub thinking_folds: HashMap<usize, ThinkingFold>,
     /// Mapping from filtered cell index → original virtual index.
     /// Populated during `ChatWidget::new` by filtering out collapsed cells.
     /// Used by `build_context_menu_entries` to convert line-meta indices
@@ -3367,7 +3390,7 @@ impl App {
     }
 
     /// Cycle through modes in reverse.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn cycle_mode_reverse(&mut self) {
         let next = self.mode.previous();
         let outcome = self.select_mode(next);
@@ -3608,15 +3631,17 @@ impl App {
         if self.reject_setting_change_while_busy(MessageId::SettingSubjectPermissions) {
             return None;
         }
-        if self.mode == AppMode::Plan {
-            self.push_status_toast(
-                "Plan is Read Only; switch to Act to change permissions".to_string(),
-                StatusToastLevel::Info,
-                Some(5_000),
-            );
-            self.needs_redraw = true;
-            return None;
-        }
+        // Plan used to refuse the change outright, which welded the two axes
+        // together on the keyboard: Tab cycles the mode, Shift+Tab cycles the
+        // posture, and in Plan the second key silently did nothing. They are
+        // independent settings and both must stay settable.
+        //
+        // Nothing is weakened by allowing it. Plan's read-only guarantee is
+        // derived from the mode, not from the posture: `authority` maps
+        // `(Plan, _, Bypass)` to `SandboxPolicy::ReadOnly` (there is a test
+        // pinning exactly that), and `tool_catalog` gates every write tool on
+        // `mode != AppMode::Plan`. Setting the posture here records the
+        // preference that takes effect on the next Act/Operate turn.
         if allow_root_policy && !self.approval_policy_root_editable {
             return None;
         }
@@ -3649,6 +3674,19 @@ impl App {
     fn finish_approval_posture_change(&mut self, next: ApprovalMode) {
         self.set_agent_approval_posture(next);
         self.needs_redraw = true;
+        // In Plan the new posture is real but dormant, and the footer chip
+        // alone would imply it is live. Say when it starts applying instead of
+        // refusing the change.
+        if self.mode == AppMode::Plan {
+            self.push_status_toast(
+                format!(
+                    "Permissions set to {}. Plan stays Read Only; this applies in Act and Operate.",
+                    next.permission_chip_label()
+                ),
+                StatusToastLevel::Info,
+                Some(5_000),
+            );
+        }
         // Footer permission chip is canonical — no status toast for the new
         // value, only the one-shot rebinding notice.
         self.notify_keybinding_migration_once();
@@ -3860,7 +3898,7 @@ impl App {
 
     /// Add `delta` to the parent-turn session cost and bump the displayed
     /// high-water mark so the footer total never reverses (#244).
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn accrue_session_cost(&mut self, delta: f64) {
         self.accrue_session_cost_estimate(CostEstimate::usd_only(delta));
     }
@@ -4084,7 +4122,7 @@ impl App {
 
     /// Add `delta` to the running sub-agent cost and bump the displayed
     /// high-water mark so the footer total never reverses (#244).
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn accrue_subagent_cost(&mut self, delta: f64) {
         self.accrue_subagent_cost_estimate(CostEstimate::usd_only(delta));
     }
@@ -4167,7 +4205,7 @@ impl App {
     /// Read the visible session+sub-agent cost. Guaranteed monotonic across
     /// reconciliation events (cache adjustments, provisional → final swaps)
     /// for the lifetime of one session (#244).
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn displayed_session_cost(&self) -> f64 {
         self.displayed_session_cost_for_currency(CostCurrency::Usd)
     }
@@ -4398,7 +4436,7 @@ impl App {
             .into_iter()
             .filter_map(|idx| if idx >= n { Some(idx - n) } else { None })
             .collect();
-        self.folded_thinking.clear();
+        self.thinking_folds.clear();
         self.expanded_tool_runs = std::mem::take(&mut self.expanded_tool_runs)
             .into_iter()
             .filter_map(|idx| if idx >= n { Some(idx - n) } else { None })
@@ -4814,9 +4852,16 @@ impl App {
     pub(crate) fn prune_transcript_index_state(&mut self, len: usize) {
         self.transcript_identity_epoch = self.transcript_identity_epoch.wrapping_add(1);
         self.collapsed_cells.retain(|idx| *idx < len);
-        self.folded_thinking.retain(|idx| *idx < len);
+        self.thinking_folds.retain(|idx, _| *idx < len);
         self.expanded_tool_runs.retain(|idx| *idx < len);
         self.collapsed_cell_map.clear();
+    }
+
+    /// Mutable access to the shared transcript mirror. Copy-on-write: an
+    /// exclusive `Arc` mutates in place, a shared one detaches first, so an
+    /// outstanding engine snapshot can never observe the mutation.
+    pub fn api_messages_mut(&mut self) -> &mut Vec<Message> {
+        Arc::make_mut(&mut self.api_messages)
     }
 
     /// Append a message and stamp when it landed — the persisted journal's
@@ -4825,7 +4870,7 @@ impl App {
     pub fn push_api_message(&mut self, message: Message) {
         self.api_message_stamps
             .resize_with(self.api_messages.len(), Utc::now);
-        self.api_messages.push(message);
+        self.api_messages_mut().push(message);
         self.api_message_stamps.push(Utc::now());
     }
 
@@ -4833,8 +4878,9 @@ impl App {
     /// unchanged prefix keeps the stamps it already earned — the engine
     /// mirrors the same messages back in the same order — and only entries
     /// that are new or were rewritten (compaction) are stamped now, which
-    /// lands within a turn-event of the real append.
-    pub fn set_api_messages(&mut self, messages: Vec<Message>) {
+    /// lands within a turn-event of the real append. The shared snapshot is
+    /// installed without copying.
+    pub fn set_api_messages(&mut self, messages: Arc<Vec<Message>>) {
         let keep = self
             .api_messages
             .iter()
@@ -4852,12 +4898,21 @@ impl App {
     /// per-entry `created_at` as the stamps so a next save does not rewrite
     /// history to resume time. Entries without a matching stamp fall back to
     /// now.
-    pub fn restore_api_messages(&mut self, messages: Vec<Message>, stamps: &[DateTime<Utc>]) {
-        self.api_message_stamps.clear();
-        self.api_message_stamps.extend_from_slice(stamps);
+    pub fn restore_api_messages(
+        &mut self,
+        messages: Vec<Message>,
+        session: &crate::session_manager::SavedSession,
+    ) {
+        self.session_journal = session.journal.clone().unwrap_or_else(|| {
+            crate::session_tree::SessionJournal::from_messages(
+                session.messages.clone(),
+                session.metadata.spawn_depth,
+            )
+        });
+        self.api_message_stamps = session.journal_message_stamps();
         self.api_message_stamps
             .resize_with(messages.len(), Utc::now);
-        self.api_messages = messages;
+        self.api_messages = Arc::new(messages);
     }
 
     /// Append a message with the stamp it earned earlier — used when an
@@ -4866,7 +4921,7 @@ impl App {
     pub fn push_api_message_stamped(&mut self, message: Message, stamp: DateTime<Utc>) {
         self.api_message_stamps
             .resize_with(self.api_messages.len(), Utc::now);
-        self.api_messages.push(message);
+        self.api_messages_mut().push(message);
         self.api_message_stamps.push(stamp);
     }
 
@@ -4874,7 +4929,7 @@ impl App {
         self.api_message_stamps
             .resize_with(self.api_messages.len(), Utc::now);
         self.api_message_stamps.pop();
-        self.api_messages.pop()
+        self.api_messages_mut().pop()
     }
 
     /// `created_at` of each `api_messages` entry, paired positionally.
@@ -4890,13 +4945,14 @@ impl App {
     }
 
     pub fn truncate_api_messages(&mut self, new_len: usize) {
-        self.api_messages.truncate(new_len);
+        self.api_messages_mut().truncate(new_len);
         self.api_message_stamps
             .resize_with(self.api_messages.len(), Utc::now);
     }
 
     pub fn clear_api_messages(&mut self) {
-        self.api_messages.clear();
+        self.session_journal = crate::session_tree::SessionJournal::new();
+        self.api_messages_mut().clear();
         self.api_message_stamps.clear();
     }
 
@@ -5313,7 +5369,9 @@ impl App {
         event_run_id: &str,
         event: crate::tui::widgets::workflow_panel::WorkflowPanelEvent,
     ) -> bool {
-        use crate::tui::widgets::workflow_panel::{WorkflowPanel, WorkflowPanelEvent};
+        use crate::tui::widgets::workflow_panel::{
+            WorkflowPanel, WorkflowPanelEvent, WorkflowPanelLifecycle,
+        };
         if event_run_id.trim().is_empty() {
             return false;
         }
@@ -5332,6 +5390,21 @@ impl App {
         }
 
         let budget_only = matches!(&event, WorkflowPanelEvent::BudgetUpdated { .. });
+        // #5528: a failed run must be loud, not just a panel row. Capture the
+        // failure before the event is consumed below; the sticky notice fires
+        // once per run because the live stream and the tool-complete hydration
+        // can both deliver the same terminal event.
+        let run_failure = match &event {
+            WorkflowPanelEvent::RunCompleted {
+                status: WorkflowPanelLifecycle::Failed,
+                error,
+                ..
+            } => Some(error.clone()),
+            _ => None,
+        };
+        let already_failed = self.workflow_panel.as_ref().is_some_and(|panel| {
+            panel.run_id == event_run_id && panel.lifecycle == WorkflowPanelLifecycle::Failed
+        });
         match (&mut self.workflow_panel, &event) {
             (
                 None,
@@ -5368,6 +5441,27 @@ impl App {
         }
         if !budget_only {
             self.needs_redraw = true;
+        }
+        if let Some(error) = run_failure
+            && !already_failed
+        {
+            let detail = error
+                .as_deref()
+                .map(str::trim)
+                .filter(|detail| !detail.is_empty());
+            let message = match detail {
+                Some(detail) => format!(
+                    "{} · {}",
+                    self.tr(MessageId::WorkflowRunFailedToast),
+                    bound_agent_activity_text(detail)
+                ),
+                None => self.tr(MessageId::WorkflowRunFailedToast).into_owned(),
+            };
+            self.set_sticky_status(
+                message,
+                StatusToastLevel::Error,
+                Some(Self::STICKY_ERROR_TTL_MS),
+            );
         }
         true
     }
@@ -5554,6 +5648,7 @@ impl App {
     pub fn transcript_render_options(&self) -> TranscriptRenderOptions {
         TranscriptRenderOptions {
             superseded_work_receipt: false,
+            newest_user_turn: false,
             locale: self.ui_locale,
             show_thinking: self.show_thinking,
             thinking_highlight: self.thinking_highlight,
@@ -5685,7 +5780,7 @@ impl App {
     /// Park a legacy pending steer. New keyboard handling routes running-turn
     /// drafts through Ctrl+Enter (same-turn steer) or Enter (next-turn
     /// follow-up).
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn push_pending_steer(&mut self, message: QueuedMessage) {
         self.pending_steers.push_back(message);
         self.submit_pending_steers_after_interrupt = true;
@@ -5809,15 +5904,18 @@ impl App {
                 .is_some_and(|instant| instant.elapsed() < Self::DOUBLE_TAP_WINDOW)
     }
 
-    /// Pop the most recently queued message when the double-tap window is
-    /// still open. Clears the window so a third Enter does not re-steer.
-    pub fn take_queued_for_double_tap_steer(&mut self) -> Option<QueuedMessage> {
+    /// Drain every queued message when the double-tap window is still
+    /// open, oldest first. Clears the window so a third Enter does not
+    /// re-steer. The posture bar promises "{enter} again to send now" — with
+    /// several follow-ups queued, "now" means all of them in order, not just
+    /// the latest.
+    pub fn take_queued_for_double_tap_steer(&mut self) -> Vec<QueuedMessage> {
         if !self.double_tap_window_open() || self.queued_messages.is_empty() {
-            return None;
+            return Vec::new();
         }
         match self.enter_with_double_tap() {
-            Some(SubmitDisposition::Steer) => self.queued_messages.pop_back(),
-            _ => None,
+            Some(SubmitDisposition::Steer) => self.queued_messages.drain(..).collect(),
+            _ => Vec::new(),
         }
     }
 
@@ -5844,9 +5942,12 @@ impl App {
         self.bump_history_cell(index);
     }
 
-    /// Retry a `try_lock` up to `retries` times with a 1ms pause between
+    /// Retry a `try_lock` up to `retries` times, yielding the thread between
     /// attempts. Returns `Some(guard)` on success, `None` if the lock
-    /// remains contended after all retries.
+    /// remains contended after all retries. Reached from the async UI/event
+    /// paths, so this must not park a Tokio worker with `thread::sleep` —
+    /// `yield_now` covers the microsecond-scale critical sections behind
+    /// these mutexes, and a still-contended lock degrades to `None`.
     fn retry_lock<T>(
         mutex: &tokio::sync::Mutex<T>,
         retries: u32,
@@ -5855,7 +5956,7 @@ impl App {
             if let Ok(guard) = mutex.try_lock() {
                 return Some(guard);
             }
-            std::thread::sleep(std::time::Duration::from_millis(1));
+            std::thread::yield_now();
         }
         None
     }

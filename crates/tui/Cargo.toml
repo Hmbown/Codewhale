@@ -30,25 +30,26 @@ name = "codewhale-tui"
 path = "src/main.rs"
 
 [dependencies]
+codewhale-memory = { path = "../memory", version = "0.10.0" }
 ahash = "0.8"
 anyhow.workspace = true
-codewhale-config = { path = "../config", version = "0.9.13" }
-codewhale-cloud-facts = { path = "../cloud-facts", version = "0.9.13" }
-codewhale-command-contract = { path = "../command-contract", version = "0.9.13" }
-codewhale-core = { path = "../core", version = "0.9.13" }
-codewhale-execpolicy = { path = "../execpolicy", version = "0.9.13" }
-codewhale-hooks = { path = "../hooks", version = "0.9.13" }
-codewhale-lane = { path = "../lane", version = "0.9.13" }
-codewhale-models = { path = "../models", version = "0.9.13" }
-codewhale-palette = { path = "../palette", version = "0.9.13" }
-codewhale-paths = { path = "../paths", version = "0.9.13" }
-codewhale-protocol = { path = "../protocol", version = "0.9.13" }
-codewhale-release = { path = "../release", version = "0.9.13" }
-codewhale-secrets = { path = "../secrets", version = "0.9.13" }
-codewhale-telemetry = { path = "../telemetry", version = "0.9.13" }
-codewhale-tools = { path = "../tools", version = "0.9.13" }
-codewhale-workflow = { path = "../workflow", version = "0.9.13" }
-codewhale-workflow-js = { path = "../workflow-js", version = "0.9.13" }
+codewhale-config = { path = "../config", version = "0.10.0" }
+codewhale-cloud-facts = { path = "../cloud-facts", version = "0.10.0" }
+codewhale-command-contract = { path = "../command-contract", version = "0.10.0" }
+codewhale-core = { path = "../core", version = "0.10.0" }
+codewhale-execpolicy = { path = "../execpolicy", version = "0.10.0" }
+codewhale-hooks = { path = "../hooks", version = "0.10.0" }
+codewhale-lane = { path = "../lane", version = "0.10.0" }
+codewhale-models = { path = "../models", version = "0.10.0" }
+codewhale-palette = { path = "../palette", version = "0.10.0" }
+codewhale-paths = { path = "../paths", version = "0.10.0" }
+codewhale-protocol = { path = "../protocol", version = "0.10.0" }
+codewhale-release = { path = "../release", version = "0.10.0" }
+codewhale-secrets = { path = "../secrets", version = "0.10.0" }
+codewhale-telemetry = { path = "../telemetry", version = "0.10.0" }
+codewhale-tools = { path = "../tools", version = "0.10.0" }
+codewhale-workflow = { path = "../workflow", version = "0.10.0" }
+codewhale-workflow-js = { path = "../workflow-js", version = "0.10.0" }
 async-stream = "0.3.6"
 async-trait.workspace = true
 base64 = "0.23.1"
@@ -63,7 +64,7 @@ fd-lock = "4.0.4"
 dirs.workspace = true
 futures-util = "0.3.31"
 hyper-util = { version = "=0.1.20", features = ["client-proxy"] }
-oauth2 = "5"
+oauth2 = { version = "5", default-features = false }
 # No ratatui-core pin: ColorCompatBackend answers `get_cursor_position()`
 # from tracked state (ratatui#2640's recommended workaround), so the CPR query
 # inside `Terminal::clear()` no longer races the input loop. See
@@ -84,6 +85,13 @@ serde.workspace = true
 serde_json = { workspace = true, features = ["preserve_order", "raw_value"] }
 schemars = { version = "1.2.1", features = ["derive", "preserve_order"] }
 shellexpand = "3"
+# Grammar-exact Rust parsing for the post-edit syntax gate (#6204). `syn` is
+# already in the lockfile as a proc-macro build dependency; this reuses that
+# same version rather than vendoring a second parser (#6151). `span-locations`
+# is what turns a parse failure into the `line:column` the model needs — the
+# feature is inert without it.
+syn = { version = "3.0.3", default-features = false, features = ["full", "parsing"] }
+proc-macro2 = { version = "1.0.107", features = ["span-locations"] }
 toml.workspace = true
 toml_edit.workspace = true
 tokio.workspace = true
@@ -101,7 +109,7 @@ tracing-subscriber.workspace = true
 tower-http.workspace = true
 wait-timeout = "0.2"
 webbrowser = "1.0"
-shlex = "1.3.0"
+shlex = "2.0.1"
 globset = "0.4"
 ignore = "0.4"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif"] }
@@ -117,16 +125,16 @@ liblzma = { version = "0.4", features = ["static"] }
 flate2 = "1.1"
 sha2.workspace = true
 semver.workspace = true
-codewhale-localization = { path = "../localization", version = "0.9.13" }
+codewhale-localization = { path = "../localization", version = "0.10.0" }
 shell-words = "1.1.1"
 mimalloc = { workspace = true, optional = true }
 rusty_alloc-api = { workspace = true, optional = true }
 
 [build-dependencies]
-codewhale-build-support = { path = "../build-support", version = "0.9.13" }
+codewhale-build-support = { path = "../build-support", version = "0.10.0" }
 
 [dev-dependencies]
-codewhale-models = { path = "../models", version = "0.9.13", features = [
+codewhale-models = { path = "../models", version = "0.10.0", features = [
     "test-support",
 ] }
 cucumber = "0.23.0"
@@ -154,8 +162,3 @@ objc2-foundation = { version = "0.3.2", default-features = false, features = ["s
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Media_Audio", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_Diagnostics_Debug", "Win32_System_Diagnostics_ToolHelp", "Win32_System_Environment", "Win32_System_JobObjects", "Win32_System_Registry", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging"] }
-# `windows` re-exports most of windows-core's types but not all of them
-# (BOOL, HRESULT, … live in windows-core itself); window_control.rs names
-# windows_core::BOOL for the EnumWindows callback, so it must be a direct
-# dependency. Version already resolved via `windows` — no extra build work.
-windows-core = { version = "0.62" }

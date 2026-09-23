@@ -1,11 +1,11 @@
-<!-- source: README.md sha256:a446e3921085 -->
+<!-- source: README.md sha256:29c349b6f2b4 -->
 # Codewhale
 
 Codewhale एक ओपन सोर्स एजेंट है जो आपकी पसंद के होस्ट किए गए या लोकल मॉडल से आपका प्रोजेक्ट पढ़ता है, फ़ाइलें संपादित करता है, कमांड चलाता है और अपने काम की जाँच करता है। टर्मिनल में एक काम से शुरुआत करें। बड़े काम के हिस्से अलग-अलग मॉडल और भूमिकाओं वाले एजेंटों को सौंपें।
 
-![टर्मिनल में चलता Codewhale](web/public/codewhale-tui-171acee.png)
+![टर्मिनल में चलता Codewhale](web/public/codewhale-tui-d7a9a1c.png)
 
-*v0.9.12 के विकासाधीन बिल्ड से टर्मिनल का पूर्वावलोकन।*
+*v0.10.0 के विकासाधीन बिल्ड से टर्मिनल का पूर्वावलोकन।*
 
 [English](README.md) · [简体中文](README.zh-CN.md) · [日本語](README.ja-JP.md) · [Tiếng Việt](README.vi.md) · [Bahasa Indonesia](README.id.md) · [한국어](README.ko-KR.md) · [Español](README.es-419.md) · [Português](README.pt-BR.md) · [Русский](README.ru.md) · [Українська](README.uk.md) · [Français](README.fr.md) · [Deutsch](README.de.md) · [繁體中文](README.zh-TW.md) · [Türkçe](README.tr.md) · [Italiano](README.it.md) · [Polski](README.pl.md) · [العربية](README.ar.md) · [Català](README.ca.md)
 
@@ -53,7 +53,7 @@ Codewhale आपकी रिपॉज़िटरी पढ़ सकता ह
 
 - **टर्मिनल:** `codewhale` इंटरैक्टिव इंटरफ़ेस खोलता है; `codewhale exec` किसी स्क्रिप्ट या CI जॉब से काम चलाता है।
 - **लोकल ब्राउज़र:** `codewhale web` उसी रनटाइम के लिए पैकेज में शामिल [लोकल वेब क्लाइंट](docs/WEB.md) खोलता है।
-- **Codewhale वेब और डेस्कटॉप ऐप:** विकासाधीन ग्राफ़िकल कार्यस्थल हैं। उनकी उपलब्धता [प्रोडक्ट पेज](https://codewhale.net/en/product) पर दी गई है।
+- **Codewhale डेस्कटॉप ऐप (GPUI):** नेटिव GPUI डेस्कटॉप ऐप प्रोडक्ट-क्लाइंट दिशा है (2026-09-14 निर्णय; फेज़ मैप निजी codehwhale-gpui रेपो के docs/TRANSITION.md में है)। app.codewhale.net पर होस्ट किया गया वेब ऐप चरणों में समाप्त होगा; मार्केटिंग साइट, साइन-इन, बिलिंग, कानूनी और डाउनलोड पेज वेब पर स्थायी रूप से बने रहेंगे। उनकी उपलब्धता [प्रोडक्ट पेज](https://codewhale.net/en/product) पर दी गई है।
 
 **Computer Use दूसरे ऐप देखने और उनके साथ इंटरैक्ट करने के लिए टूल जोड़ता है।** प्लगइन मौजूदा सोर्स कोड में शामिल है। इस्तेमाल से पहले उसके माँगे गए एक्सेस की समीक्षा करें और उसे सक्षम करें; OS की अनुमतियाँ और प्लेटफ़ॉर्म की आवश्यकताएँ तब भी लागू होती हैं। शामिल [Computer Use गाइड](crates/tui/plugins/computer-use/README.md) और [प्लगइन सेटअप](docs/PLUGINS.md) देखें।
 

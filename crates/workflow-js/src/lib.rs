@@ -67,8 +67,8 @@ pub mod testing;
 mod vm;
 
 pub use driver::{
-    BudgetSnapshot, ProgressEvent, SpawnedTask, TaskCompletion, TaskRequest, WorkflowDriver,
-    normalize_profile,
+    BudgetSnapshot, ProgressEvent, SpawnedTask, TaskCompletion, TaskRequest, ToolCallRequest,
+    ToolCallResponse, ToolInvoker, WorkflowDriver, normalize_profile,
 };
 pub use error::{DriverError, TaskErrorKind, WorkflowJsError};
 pub use schema::{SCHEMA_RAW_CARRY_CHARS, SCHEMA_RAW_PREVIEW_CHARS, SCHEMA_REPAIR_MAX_ATTEMPTS};
@@ -92,3 +92,10 @@ pub const WORKFLOW_MAX_CONCURRENT: usize = 16;
 /// Kept at the per-run agent ceiling so a single fan-out cannot declare more
 /// work than the lifetime cap can ever complete.
 pub const PARALLEL_MAX_ITEMS: usize = 1000;
+
+/// Maximum `tools.call()` invocations per code-mode run.
+///
+/// Counted in the VM before the invoker is consulted, so a runaway loop
+/// terminates even if the invoker would keep admitting calls. Concurrency,
+/// deadlines, and result sizes are enforced host-side by the invoker.
+pub const CODEMODE_MAX_TOOL_CALLS: u64 = 50;

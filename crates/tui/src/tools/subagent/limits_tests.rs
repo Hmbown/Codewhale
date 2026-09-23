@@ -1,41 +1,6 @@
-use super::tests::{make_snapshot, make_worker_spec, run_incomplete_response_worker, stub_runtime};
+use super::tests::{make_snapshot, make_worker_spec, stub_runtime};
 use super::*;
-use std::sync::atomic::Ordering;
 use tempfile::tempdir;
-
-fn record(
-    manager: &mut SubAgentManager,
-    id: &str,
-    parent: Option<&str>,
-    cap: Option<u64>,
-    spent: u64,
-) {
-    let mut spec = make_worker_spec(id, manager.workspace.clone());
-    spec.parent_run_id = parent.map(str::to_string);
-    spec.runtime_profile.token_budget = cap;
-    manager.register_worker(spec);
-    manager
-        .worker_records
-        .get_mut(id)
-        .unwrap()
-        .usage
-        .total_tokens = Some(spent);
-}
-
-fn continuation(manager: &mut SubAgentManager, id: &str, source: &str) {
-    let record = manager.worker_records.get_mut(id).unwrap();
-    record.spec.launch_manifest = Some(
-        serde_json::from_value(json!({
-            "owner_session": "root", "child_id": id,
-            "profile": record.spec.runtime_profile,
-            "prompt": "continue", "cwd": null, "worktree": false,
-            "writable_roots": [], "writable_files": [], "coordination_contracts": [],
-            "token_budget": record.spec.runtime_profile.token_budget,
-            "resume_identity": id, "generation": 1, "resume_from_agent_id": source
-        }))
-        .expect("continuation manifest"),
-    );
-}
 
 #[test]
 fn depth_one_child_cannot_spawn_a_grandchild_even_with_a_wider_profile() {
@@ -99,27 +64,108 @@ fn operator_and_inherited_budgets_only_narrow_including_zero_sentinels() {
     assert_eq!(resolve_max_steps(FleetRole::Worker, Some(0), Some(7)), 7);
     let parent = WorkerRuntimeProfile {
         max_steps: 8,
-        token_budget: Some(100),
         wall_time_secs: Some(40),
         wall_deadline_ms: Some(123_000),
         ..WorkerRuntimeProfile::default()
     };
     let requested = WorkerRuntimeProfile {
-        token_budget: Some(1_000),
         wall_time_secs: Some(4_000),
         wall_deadline_ms: Some(456_000),
         ..WorkerRuntimeProfile::default()
     };
     let child = parent.derive_child(&requested);
     assert_eq!(child.max_steps, 8);
-    assert_eq!(child.token_budget, Some(100));
     assert_eq!(child.wall_time_secs, Some(40));
     assert_eq!(child.wall_deadline_ms, Some(123_000));
 }
 
 #[test]
+fn child_runtime_budget_context_reports_every_resolved_limit() {
+    let mut runtime = stub_runtime();
+    runtime.worker_profile.wall_time_secs = Some(1_800);
+    runtime.worker_profile.wall_deadline_ms = Some(epoch_millis_now() + 1_700_000);
+    let context = child_runtime_budget_context(&runtime, 50, 49, 100_000);
+    assert!(context.contains("Runtime budget (host-enforced"));
+    assert!(context.contains("wall clock: task work stops about"));
+    assert!(context.contains("total run budget 30m 00s"));
+    assert!(context.contains("49 model turns of task work (limit 50"));
+    assert!(context.contains("reserved hand-back turn"));
+    assert!(context.contains("Commit or checkpoint work-in-progress early"));
+    assert!(context.contains("single step billing over 100000 input tokens"));
+    assert!(context.contains("There is no cumulative token cap"));
+}
+
+#[test]
+fn child_runtime_budget_context_names_unbounded_limits_honestly() {
+    let runtime = stub_runtime();
+    let context = child_runtime_budget_context(&runtime, 0, 0, 32_000);
+    assert!(context.contains("wall clock: no wall-clock limit."));
+    assert!(context.contains("model steps: no per-run step cap."));
+    assert!(context.contains("There is no cumulative token cap"));
+    assert!(context.contains("single step billing over 32000 input tokens"));
+    assert!(context.contains("reserved hand-back turn"));
+}
+
+#[test]
+fn child_budget_pacing_notice_fires_at_three_quarters_of_each_bound() {
+    let started_at = Instant::now() - Duration::from_secs(80);
+    let deadline = started_at + Duration::from_secs(100);
+    let notice = child_budget_pacing_notice(started_at, Some(deadline), 38, 50)
+        .expect("all three bounds past 75%");
+    assert!(notice.contains("kind=\"budget_pacing\""));
+    assert!(notice.contains("wall clock:"));
+    assert!(notice.contains("model steps: 38 of 50 used"));
+}
+
+#[test]
+fn child_budget_pacing_notice_stays_silent_with_headroom() {
+    let started_at = Instant::now();
+    let deadline = started_at + Duration::from_secs(100);
+    assert!(child_budget_pacing_notice(started_at, Some(deadline), 10, 50).is_none());
+    // No bound at all means there is nothing to pace against.
+    assert!(child_budget_pacing_notice(started_at, None, 9_999, 0).is_none());
+}
+
+#[test]
+fn child_step_input_bound_prefers_half_window_capped_at_the_guardrail() {
+    assert_eq!(child_step_input_bound(None), 100_000);
+    assert_eq!(child_step_input_bound(Some(64_000)), 32_000);
+    assert_eq!(child_step_input_bound(Some(1_000_000)), 100_000);
+    // Degenerate windows fall back to the flat guardrail, never to zero.
+    assert_eq!(child_step_input_bound(Some(0)), 100_000);
+    assert_eq!(child_step_input_bound(Some(1)), 100_000);
+}
+
+#[test]
+fn child_context_trip_fires_only_past_the_bound() {
+    let reason = child_context_trip(100_001, 100_000).expect("over bound trips");
+    assert!(reason.contains("context budget exhausted"), "{reason}");
+    assert!(reason.contains("100001"), "{reason}");
+    assert!(child_context_trip(100_000, 100_000).is_none());
+    assert!(child_context_trip(71_000, 100_000).is_none());
+    assert!(child_context_trip(0, 100_000).is_none());
+}
+
+#[test]
+fn context_budget_death_classifies_distinctly_from_other_budgets() {
+    assert_eq!(
+        subagent_failure_class(
+            &SubAgentStatus::BudgetExhausted,
+            "child context budget exhausted: step billed 150000 input tokens"
+        ),
+        "context_budget"
+    );
+    // The generic budget-exhausted status still classifies when the cause is
+    // something else entirely.
+    assert_eq!(
+        subagent_failure_class(&SubAgentStatus::BudgetExhausted, "some other reason"),
+        "budget_exhausted"
+    );
+}
+
+#[test]
 fn per_call_budget_fields_reject_empty_zero_null_negative_and_oversized_values() {
-    for field in ["token_budget", "max_steps", "wall_time_secs"] {
+    for field in ["max_steps", "wall_time_secs"] {
         for invalid in [
             json!(0),
             json!(-1),
@@ -142,120 +188,13 @@ fn per_call_budget_fields_reject_empty_zero_null_negative_and_oversized_values()
         input[field] = json!(value);
         assert!(parse_spawn_request(&input).is_err(), "{input}");
     }
-    let request =
-        parse_spawn_request(&json!({"prompt": "inspect", "token_budget": 100, "max_tokens": 9}))
-            .unwrap();
-    assert_eq!(
-        request.token_budget,
-        Some(9),
-        "aliases cannot erase a tighter supplied cap"
-    );
-}
-
-#[test]
-fn explicit_child_budget_keeps_parent_pool_and_default_is_a_ceiling() {
-    let tmp = tempdir().unwrap();
-    let mut manager =
-        SubAgentManager::new(tmp.path().to_path_buf(), 4).with_default_token_budget(Some(100));
-    record(&mut manager, "parent", None, Some(100), 25);
-    manager.attach_shared_budget_scope("parent", "pool", 100);
-    let scope = manager
-        .resolve_spawn_budget_scope("child", Some("parent"), Some(999))
-        .unwrap()
-        .unwrap();
-    assert_eq!(scope.scope_id, "pool");
-    assert_eq!((scope.limit, scope.spent, scope.remaining), (100, 25, 75));
-    let root = manager
-        .resolve_spawn_budget_scope("new_root", None, Some(999))
-        .unwrap()
-        .unwrap();
-    assert_eq!(root.limit, 100);
-}
-
-#[test]
-fn descendant_and_resume_usage_consume_each_ancestor_once_at_equality() {
-    let tmp = tempdir().unwrap();
-    let mut manager = SubAgentManager::new(tmp.path().to_path_buf(), 8);
-    record(&mut manager, "root", None, Some(100), 10);
-    manager.attach_shared_budget_scope("root", "pool", 100);
-    record(&mut manager, "child", Some("root"), Some(30), 10);
-    manager.attach_shared_budget_scope("child", "pool", 100);
-    record(&mut manager, "grandchild", Some("child"), None, 10);
-    manager.attach_shared_budget_scope("grandchild", "pool", 100);
-    record(&mut manager, "resume", Some("root"), Some(20), 10);
-    continuation(&mut manager, "resume", "child");
-    manager.attach_shared_budget_scope("resume", "pool", 100);
-    assert_eq!(manager.subtree_budget_spent("child"), 30);
-    assert_eq!(manager.aggregate_budget_spent("pool"), 40);
-    assert_eq!(manager.remaining_worker_tokens("resume"), Some(0));
-    assert!(
-        manager
-            .token_budget_exhausted_detail("resume")
-            .unwrap()
-            .contains("30/30")
-    );
-    let encoded = serde_json::to_vec(&manager.worker_records).unwrap();
-    let restored: HashMap<String, AgentWorkerRecord> = serde_json::from_slice(&encoded).unwrap();
-    manager.worker_records = restored
-        .into_iter()
-        .map(|(id, record)| (id, normalize_worker_record(record)))
-        .collect();
-    assert_eq!(
-        manager.remaining_worker_tokens("resume"),
-        Some(0),
-        "reload never refunds earlier usage"
-    );
-}
-
-#[test]
-fn a_fork_cannot_move_usage_out_of_either_source_or_current_parent_pool() {
-    let tmp = tempdir().unwrap();
-    let mut manager = SubAgentManager::new(tmp.path().to_path_buf(), 8);
-    record(&mut manager, "source", None, None, 10);
-    manager.attach_shared_budget_scope("source", "source_pool", 40);
-    record(&mut manager, "parent", None, None, 5);
-    manager.attach_shared_budget_scope("parent", "parent_pool", 100);
-    record(&mut manager, "fork", Some("parent"), None, 30);
-    continuation(&mut manager, "fork", "source");
-    manager.attach_shared_budget_scope("fork", "source_pool", 40);
-    assert_eq!(manager.aggregate_budget_spent("source_pool"), 40);
-    assert_eq!(manager.aggregate_budget_spent("parent_pool"), 35);
-    assert_eq!(manager.remaining_worker_tokens("fork"), Some(0));
-}
-
-#[test]
-fn malformed_budget_lineage_cycles_are_finite_and_do_not_double_count() {
-    let tmp = tempdir().unwrap();
-    let mut manager = SubAgentManager::new(tmp.path().to_path_buf(), 4);
-    record(&mut manager, "a", Some("b"), Some(3), 1);
-    record(&mut manager, "b", Some("a"), Some(3), 2);
-    assert_eq!(manager.subtree_budget_spent("a"), 3);
-    assert_eq!(manager.remaining_worker_tokens("b"), Some(0));
-}
-
-#[test]
-fn cleanup_retains_completed_budget_evidence_while_a_pool_member_runs() {
-    let tmp = tempdir().unwrap();
-    let mut manager = SubAgentManager::new(tmp.path().to_path_buf(), 4);
-    record(&mut manager, "old", None, Some(100), 90);
-    manager.attach_shared_budget_scope("old", "pool", 100);
-    record(&mut manager, "live", None, None, 10);
-    manager.attach_shared_budget_scope("live", "pool", 100);
-    let old = manager.worker_records.get_mut("old").unwrap();
-    old.status = AgentWorkerStatus::Completed;
-    old.completed_at_ms = Some(0);
-    old.updated_at_ms = 0;
-    manager.cleanup(Duration::ZERO);
-    assert!(manager.worker_records.contains_key("old"));
-    assert_eq!(manager.aggregate_budget_spent("pool"), 100);
-    assert_eq!(manager.remaining_worker_tokens("live"), Some(0));
 }
 
 #[test]
 fn budget_partial_handback_is_bounded_and_keeps_unknown_usage_honest() {
     let mut snapshot = make_snapshot(SubAgentStatus::Running);
     snapshot.result = Some("partial 🐳 ".repeat(2_000));
-    let result = budget_partial_result(snapshot, "child wall-time budget exhausted");
+    let result = budget_partial_result(snapshot, "child wall-time budget exhausted", None);
     assert_eq!(result.status, SubAgentStatus::BudgetExhausted);
     let summary = result.result.unwrap();
     assert!(summary.chars().count() < 4_500);
@@ -270,34 +209,10 @@ fn budget_partial_handback_is_bounded_and_keeps_unknown_usage_honest() {
 }
 
 #[tokio::test]
-async fn token_equality_stops_before_tools_and_returns_measured_partial_work() {
-    let tmp = tempdir().unwrap();
-    let (result, calls, mailbox, total_tokens) =
-        run_incomplete_response_worker(tmp.path(), "max_tokens", 8, Some(15)).await;
-    assert_eq!(result.status, SubAgentStatus::BudgetExhausted);
-    assert_eq!(
-        calls.load(Ordering::SeqCst),
-        1,
-        "no post-budget summary request"
-    );
-    assert_eq!(total_tokens, Some(15));
-    assert!(
-        !mailbox
-            .iter()
-            .any(|message| matches!(message, MailboxMessage::ToolCallStarted { .. }))
-    );
-    let partial = result.result.unwrap();
-    assert!(partial.contains("15/15"));
-    assert!(partial.contains("partial response diagnostics"));
-    assert!(partial.contains("output was truncated"));
-}
-
-#[tokio::test]
 async fn launch_narrows_all_limits_and_continuation_cannot_restart_deadline() {
     let tmp = tempdir().unwrap();
     let manager = Arc::new(RwLock::new(
         SubAgentManager::new(tmp.path().to_path_buf(), 4)
-            .with_default_token_budget(Some(100))
             .with_default_max_steps(Some(4))
             .with_default_wall_time(Some(Duration::from_secs(10))),
     ));
@@ -306,7 +221,6 @@ async fn launch_narrows_all_limits_and_continuation_cannot_restart_deadline() {
     runtime.manager = Arc::clone(&manager);
     runtime.cancel_token.cancel(); // inspect admission; no provider request may run
     let options = SubAgentSpawnOptions {
-        token_budget: Some(999),
         max_steps: Some(999),
         wall_time: Some(Duration::from_secs(999)),
         ..Default::default()
@@ -321,10 +235,10 @@ async fn launch_narrows_all_limits_and_continuation_cannot_restart_deadline() {
             SubAgentAssignment::new("inspect".to_string(), None),
             Some(vec![]),
             options,
+            None,
         )
         .unwrap();
     let profile = &guard.worker_records[&child.agent_id].spec.runtime_profile;
-    assert_eq!(profile.token_budget, Some(100));
     assert_eq!(profile.max_steps, 4);
     assert!(profile.wall_time_secs.unwrap() <= 10);
     guard
@@ -345,6 +259,7 @@ async fn launch_narrows_all_limits_and_continuation_cannot_restart_deadline() {
             resume_from_agent_id: Some(child.agent_id),
             ..Default::default()
         },
+        None,
     );
     assert!(
         refused
@@ -384,6 +299,7 @@ async fn resume_intersects_saved_write_shell_and_tool_permissions_with_current_c
                 preserve_runtime_profile: Some(saved),
                 ..Default::default()
             },
+            None,
         )
         .unwrap();
     let profile = &guard.worker_records[&child.agent_id].spec.runtime_profile;
@@ -395,262 +311,6 @@ async fn resume_intersects_saved_write_shell_and_tool_permissions_with_current_c
         ToolScope::Explicit(vec!["read_file".to_string()])
     );
     assert!(profile.denied_tools.contains(&"exec_shell".to_string()));
-}
-
-#[tokio::test]
-async fn measured_budget_caps_actual_wire_output_and_accounts_overshoot_without_retry() {
-    use axum::{Json, Router, routing::post};
-    let tmp = tempdir().unwrap();
-    let requests = Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
-    let observed = Arc::clone(&requests);
-    let app = Router::new().route("/v1/chat/completions", post(move |Json(request): Json<Value>| {
-        let observed = Arc::clone(&observed);
-        async move {
-            observed.lock().unwrap().push(request);
-            Json(json!({
-                "id": "budget-probe", "model": "deepseek-v4-flash",
-                "choices": [{"index": 0, "message": {"role": "assistant", "content": "partial evidence"}, "finish_reason": "stop"}],
-                "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
-            }))
-        }
-    }));
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
-    let server = tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
-    });
-    let config = crate::config::Config {
-        api_key: Some("fixture-key".to_string()),
-        base_url: Some(format!("http://{address}/v1")),
-        ..Default::default()
-    };
-    let mut runtime = stub_runtime();
-    runtime.client = DeepSeekClient::new(&config).unwrap();
-    runtime.context = ToolContext::new(tmp.path().to_path_buf());
-    runtime.manager = Arc::new(RwLock::new(SubAgentManager::new(
-        tmp.path().to_path_buf(),
-        4,
-    )));
-    record(
-        &mut *runtime.manager.write().await,
-        "probe",
-        None,
-        Some(7),
-        0,
-    );
-    let (_tx, rx) = mpsc::unbounded_channel();
-    let result = tokio::time::timeout(
-        Duration::from_secs(5),
-        run_subagent(
-            &runtime,
-            "probe".to_string(),
-            FleetRole::Scout,
-            "report".to_string(),
-            SubAgentAssignment::new("report".to_string(), None),
-            Some(vec![]),
-            false,
-            Instant::now(),
-            8,
-            Some(7),
-            None,
-            rx,
-        ),
-    )
-    .await
-    .unwrap()
-    .unwrap();
-    server.abort();
-    assert_eq!(result.status, SubAgentStatus::BudgetExhausted);
-    assert_eq!(
-        result.usage.as_ref().and_then(|usage| usage.total_tokens),
-        Some(15)
-    );
-    let requests = requests.lock().unwrap();
-    assert_eq!(
-        requests.len(),
-        1,
-        "no summary retry after budget exhaustion"
-    );
-    assert_eq!(
-        requests[0]
-            .get("max_tokens")
-            .or_else(|| requests[0].get("max_completion_tokens"))
-            .and_then(Value::as_u64),
-        Some(7)
-    );
-    assert!(result.result.as_deref().unwrap().contains("15/7"));
-}
-
-#[tokio::test]
-#[allow(clippy::await_holding_lock)]
-async fn workflow_scope_precedes_child_admission_and_caps_the_first_request_after_a_yield() {
-    use axum::{Json, Router, routing::post};
-    let _retry = crate::retry_status::test_guard();
-    crate::retry_status::clear();
-    crate::retry_status::clear_rate_limit();
-    let _env = crate::test_support::lock_test_env();
-    let tmp = tempdir().unwrap();
-    let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", tmp.path().join("state"));
-    let requests = Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
-    let observed = Arc::clone(&requests);
-    let app = Router::new().route("/{*path}", post(move |Json(request): Json<Value>| {
-        let observed = Arc::clone(&observed);
-        async move {
-            observed.lock().unwrap().push(request);
-            Json(json!({
-                "id": "workflow-budget-probe", "model": "deepseek-v4-flash",
-                "choices": [{"index": 0, "message": {"role": "assistant", "content": "partial evidence"}, "finish_reason": "stop"}],
-                "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
-            }))
-        }
-    }));
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
-    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    let config = crate::config::Config {
-        api_key: Some("fixture-key".to_string()),
-        base_url: Some(format!("http://{address}/v1")),
-        ..Default::default()
-    };
-    let manager = Arc::new(RwLock::new(
-        SubAgentManager::new(tmp.path().to_path_buf(), 4).with_launch_concurrency(1),
-    ));
-    let mut runtime = stub_runtime().with_api_config(config.clone());
-    runtime.client = DeepSeekClient::new(&config).unwrap();
-    runtime.context = ToolContext::new(tmp.path().to_path_buf());
-    runtime.manager = Arc::clone(&manager);
-    let gate = manager.read().await.launch_gate.clone();
-    let permit = gate.acquire_owned().await.unwrap();
-    let request: codewhale_workflow_js::TaskRequest = serde_json::from_value(json!({
-        "description": "report", "subagent_type": "scout", "allowed_tools": [],
-        "worktree": false, "token_budget": 100,
-    }))
-    .unwrap();
-    let identity = WorkflowTaskSpawnIdentity {
-        workflow_run_id: "run-first-request-budget".to_string(),
-        shared_token_budget: Some(12),
-        workflow_phase_id: None,
-        workflow_task_label: None,
-        workflow_child_index: 0,
-        fleet_authority_fingerprint: None,
-        exact_fleet_binding: None,
-    };
-    let spawned = spawn_workflow_task(
-        request.clone(),
-        Arc::clone(&manager),
-        runtime.clone(),
-        identity.clone(),
-    )
-    .await
-    .unwrap();
-    // Force the already-scheduled child to poll while admission is held. No
-    // caller-side attachment is performed, even after this scheduling boundary.
-    tokio::task::yield_now().await;
-    let handle = {
-        let mut guard = manager.write().await;
-        assert_eq!(
-            guard.budget_scope_state(&spawned.result.agent_id),
-            Some((0, 12))
-        );
-        assert_eq!(
-            guard.remaining_worker_tokens(&spawned.result.agent_id),
-            Some(12)
-        );
-        assert!(requests.lock().unwrap().is_empty());
-        guard
-            .agents
-            .get_mut(&spawned.result.agent_id)
-            .unwrap()
-            .task_handle
-            .take()
-            .unwrap()
-    };
-    drop(permit);
-    tokio::task::yield_now().await;
-    tokio::time::timeout(Duration::from_secs(5), handle)
-        .await
-        .expect("budgeted child settles")
-        .expect("child task succeeds");
-    let count = manager.read().await.worker_records.len();
-    let error = spawn_workflow_task(request, Arc::clone(&manager), runtime, identity)
-        .await
-        .expect_err("an exhausted host pool cannot admit another child");
-    assert!(error.to_string().contains("15/12 tokens spent"), "{error}");
-    let guard = manager.read().await;
-    assert_eq!(
-        guard.worker_records.len(),
-        count,
-        "refusal must precede registration"
-    );
-    assert_eq!(guard.budget_spent_for_scope("run-first-request-budget"), 15);
-    assert_eq!(
-        guard.get_result(&spawned.result.agent_id).unwrap().status,
-        SubAgentStatus::BudgetExhausted
-    );
-    server.abort();
-    let requests = requests.lock().unwrap();
-    assert_eq!(requests.len(), 1, "no request after shared exhaustion");
-    assert_eq!(
-        requests[0]
-            .get("max_tokens")
-            .or_else(|| requests[0].get("max_completion_tokens"))
-            .and_then(Value::as_u64),
-        Some(12)
-    );
-}
-
-#[tokio::test]
-async fn workflow_scope_preserves_parent_source_and_per_call_lower_ceilings() {
-    for (parent_cap, source_cap, call_cap, expected) in
-        [(17, 80, 90, 10), (80, 16, 90, 11), (80, 80, 9, 9)]
-    {
-        let tmp = tempdir().unwrap();
-        let manager = Arc::new(RwLock::new(SubAgentManager::new(
-            tmp.path().to_path_buf(),
-            4,
-        )));
-        let mut runtime = stub_runtime().child_runtime();
-        runtime.context = ToolContext::new(tmp.path().to_path_buf());
-        runtime.manager = Arc::clone(&manager);
-        runtime.parent_agent_id = Some("parent".to_string());
-        runtime.cancel_token.cancel(); // inspect admission without a provider request
-        let mut guard = manager.write().await;
-        record(&mut guard, "parent", None, Some(parent_cap), 7);
-        guard.attach_shared_budget_scope("parent", "parent-pool", parent_cap);
-        record(&mut guard, "source", None, Some(source_cap), 5);
-        guard.attach_shared_budget_scope("source", "source-pool", source_cap);
-        let child = guard
-            .spawn_background_with_assignment_options(
-                Arc::clone(&manager),
-                runtime,
-                FleetRole::Scout,
-                "continue".to_string(),
-                SubAgentAssignment::new("continue".to_string(), None),
-                Some(vec![]),
-                SubAgentSpawnOptions {
-                    token_budget: Some(call_cap),
-                    workflow_budget_scope: Some(("workflow-pool".to_string(), 100)),
-                    resume_from_agent_id: Some("source".to_string()),
-                    ..Default::default()
-                },
-            )
-            .unwrap();
-        assert_eq!(guard.budget_scope_state(&child.agent_id), Some((0, 100)));
-        assert_eq!(
-            guard.remaining_worker_tokens(&child.agent_id),
-            Some(expected)
-        );
-        guard
-            .worker_records
-            .get_mut(&child.agent_id)
-            .unwrap()
-            .usage
-            .total_tokens = Some(expected);
-        assert_eq!(guard.remaining_worker_tokens(&child.agent_id), Some(0));
-        assert_eq!(guard.budget_spent_for_scope("parent-pool"), 7 + expected);
-        assert_eq!(guard.budget_spent_for_scope("source-pool"), 5 + expected);
-        assert_eq!(guard.budget_spent_for_scope("workflow-pool"), expected);
-    }
 }
 
 #[tokio::test]
@@ -683,6 +343,7 @@ async fn root_fork_of_depth_two_leaf_cannot_regain_a_generation() {
                 resume_from_agent_id: Some("leaf".to_string()),
                 ..Default::default()
             },
+            None,
         )
         .unwrap();
     let spec = &guard.worker_records[&child.agent_id].spec;
@@ -690,4 +351,74 @@ async fn root_fork_of_depth_two_leaf_cannot_regain_a_generation() {
     assert_eq!(spec.max_spawn_depth, 2);
     assert_eq!(spec.runtime_profile.spawn_depth, 2);
     assert!(!spec.runtime_profile.can_spawn_child());
+}
+
+// ── #6282 tool-result cap tests ───────────────────────────────────────────
+
+fn cap_tokens(n: u32) -> std::num::NonZeroU32 {
+    std::num::NonZeroU32::new(n).expect("n > 0")
+}
+
+#[test]
+fn hard_cap_passes_through_content_below_both_caps() {
+    let content = "small".to_string();
+    let capped = hard_cap_tool_result(content.clone(), cap_tokens(10_000));
+    assert_eq!(capped, content);
+    assert!(!capped.contains("truncated"));
+}
+
+#[test]
+fn hard_cap_truncates_content_above_byte_cap_and_stamps_truncated_marker() {
+    let content = "X".repeat(1_048_577); // 1 byte over the 1 MiB cap
+    let capped = hard_cap_tool_result(content, cap_tokens(u32::MAX));
+    assert!(capped.len() <= 1_048_576 + "\n[truncated: true]".len());
+    assert!(capped.ends_with("\n[truncated: true]"));
+    assert!(capped.starts_with('X'));
+}
+
+#[test]
+fn hard_cap_truncates_content_above_token_cap() {
+    // 10k tokens × 3 bytes/token = 30k byte cap. 100k chars should trigger it.
+    let content = "A".repeat(100_000);
+    let capped = hard_cap_tool_result(content, cap_tokens(10_000));
+    // The effective cap is min(30k bytes, 1 MiB) = 30k bytes.
+    let token_cap_bytes = 10_000usize.saturating_mul(3);
+    assert!(capped.len() <= token_cap_bytes + "\n[truncated: true]".len());
+    assert!(capped.ends_with("\n[truncated: true]"));
+}
+
+#[test]
+fn hard_cap_truncates_at_valid_utf8_boundary() {
+    // Build content where 1 MiB boundary falls mid-char.
+    // '好' is 3 bytes in UTF-8.
+    let mut content = String::new();
+    let target = 1_048_576; // exactly at boundary
+    while content.len() < target + 2 {
+        content.push('好');
+    }
+    assert!(content.len() > target);
+    let capped = hard_cap_tool_result(content, cap_tokens(u32::MAX));
+    // Must be valid UTF-8 (no panic during slicing or display).
+    assert!(capped.ends_with("\n[truncated: true]"));
+    // The marker is ASCII; verify the rest is still valid UTF-8.
+    let without_marker = &capped[..capped.len() - "\n[truncated: true]".len()];
+    assert!(std::str::from_utf8(without_marker.as_bytes()).is_ok());
+}
+
+#[test]
+fn hard_cap_respects_custom_max_output_tokens_nonzero() {
+    let content = "X".repeat(10_000);
+    // 100 tokens × 3 bytes = 300 byte cap — much tighter than default.
+    let capped = hard_cap_tool_result(content.clone(), cap_tokens(100));
+    assert!(capped.len() <= 300 + "\n[truncated: true]".len());
+    assert!(capped.ends_with("\n[truncated: true]"));
+}
+
+#[test]
+fn hard_cap_min_token_value_produces_three_byte_cap() {
+    // NonZeroU32::MIN = 1 token → cap at 3 bytes.
+    let content = "hello world".to_string();
+    let capped = hard_cap_tool_result(content, std::num::NonZeroU32::MIN);
+    assert!(capped.len() <= 3 + "\n[truncated: true]".len());
+    assert!(capped.ends_with("\n[truncated: true]"));
 }

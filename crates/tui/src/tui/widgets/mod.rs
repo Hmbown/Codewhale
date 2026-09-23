@@ -1,12 +1,10 @@
 pub mod agent_card;
-mod header;
 pub mod key_hint;
 pub mod pending_input_preview;
 mod renderable;
 pub mod tool_card;
 pub mod workflow_panel;
 
-pub use header::header_status_indicator_frame;
 pub use renderable::Renderable;
 
 use std::borrow::Cow;
@@ -27,8 +25,6 @@ use crate::tui::menu_style;
 use crate::tui::scrolling::TranscriptLineMeta;
 use crate::tui::ui_text::{grapheme_display_width, text_display_width};
 use crate::tui::underwater::ShellPhase;
-use codewhale_config::AppMode;
-use codewhale_execpolicy::ApprovalMode;
 use codewhale_localization::{Locale, MessageId, tr};
 use codewhale_palette as palette;
 use ratatui::{
@@ -435,7 +431,7 @@ impl ChatWidget {
                 &cell_revisions,
                 transcript_width,
                 render_options,
-                &app.folded_thinking,
+                &app.thinking_folds,
                 None,
                 provisional_action_owner,
             );
@@ -536,7 +532,7 @@ impl ChatWidget {
                 &filtered_revs,
                 transcript_width,
                 render_options,
-                &app.folded_thinking,
+                &app.thinking_folds,
                 Some(&app.collapsed_cell_map),
                 provisional_action_owner,
             );
@@ -1207,7 +1203,7 @@ pub(crate) fn composer_enclosure_enabled(app: &App) -> bool {
     app.composer_border
 }
 
-/// Shared `[↑]` submit rect for the live composer, or `None` when the
+/// Shared `[↵]` submit rect for the live composer, or `None` when the
 /// enclosure cannot host the three-cell affordance.
 ///
 /// The gate is the same `enclosed_composer_panel_fits` predicate the painter
@@ -1222,11 +1218,11 @@ pub(crate) fn active_composer_submit_rect(app: &App, area: Rect) -> Option<Rect>
     Some(crate::tui::composer_chrome::tideline_composer_geometry(area).submit)
 }
 
-/// Restore the rounded corners after the semantic top/bottom passes.
+/// Restore rounded corners after the title-bearing top/bottom passes.
 ///
 /// Ratatui renders a `TOP`-only (or `BOTTOM`-only) block through the corner
 /// cells as horizontal line glyphs. The live composer needs those passes for
-/// its localized titles and independent permission/mode color ramps, so put
+/// its localized titles and shared focus outline, so put
 /// the four rounded joins back afterward rather than replacing its mature
 /// input widget with the unfinished translation scaffold.
 fn render_composer_panel_corners(
@@ -1260,7 +1256,7 @@ fn enclosed_composer_panel_fits(show_panel: bool, area_width: u16, area_height: 
 
 /// Border-aware input plane for the active composer.
 ///
-/// The shared shell's `[↑]` control occupies three cells on the inner row.
+/// The shared shell's `[↵]` control occupies three cells on the inner row.
 /// Keep the text plane to its left, with one blank cell in between, so input
 /// wrapping, cursor placement, and pointer mapping cannot claim painted send
 /// cells. The outer block still owns the trailing breathing cell before its
@@ -1421,11 +1417,17 @@ impl<'a> ComposerWidget<'a> {
         composer_inner_area(area, self.has_panel(area))
     }
 
-    fn mode_color(&self) -> Color {
-        match self.app.mode {
-            AppMode::Agent => self.app.ui_theme.mode_agent,
-            AppMode::Plan => self.app.ui_theme.mode_plan,
-            AppMode::Operate => self.app.ui_theme.mode_operate,
+    fn focus_color(&self) -> Color {
+        use crate::tui::shell_key_routing::Focus;
+        let editing = match self.app.focus() {
+            Focus::Composer => true,
+            Focus::Launch => self.app.launch.menu_selected.is_none(),
+            _ => false,
+        };
+        if editing {
+            self.app.ui_theme.accent_primary
+        } else {
+            self.app.ui_theme.border
         }
     }
 
@@ -1520,28 +1522,19 @@ impl Renderable for ComposerWidget<'_> {
                 None
             };
 
-            // Warm permission ramp: Ask is amber, Auto-Review is Signal Gold,
-            // and Full Access is coral. The bottom edge independently carries
-            // the cool Plan -> Act -> Operate mode ramp.
-            let permission_color = match self.app.approval_mode {
-                ApprovalMode::Suggest | ApprovalMode::Never => self.app.ui_theme.permission_ask,
-                ApprovalMode::Auto => self.app.ui_theme.permission_auto_review,
-                ApprovalMode::Bypass => self.app.ui_theme.permission_full_access,
-            };
-            // Paint the enclosure first so the live composer gets actual
-            // rounded side rails. The semantic top/bottom blocks below keep
-            // their existing permission/mode color ramps and titles while the
-            // neutral rails stay legible on every supported theme.
+            // Focus has one outline. Permission and mode remain explicit in
+            // their footer; repeating both around the input competes with it.
+            let focus_color = self.focus_color();
             Block::default()
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(self.app.ui_theme.border))
+                .border_style(Style::default().fg(focus_color))
                 .style(background)
                 .render(area, buf);
             let mut top_border = Block::default()
                 .borders(Borders::TOP)
                 .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(permission_color))
+                .border_style(Style::default().fg(focus_color))
                 .style(background);
             if self.app.is_history_search_active() {
                 top_border = top_border.title(Line::from(Span::styled(
@@ -1571,19 +1564,13 @@ impl Renderable for ComposerWidget<'_> {
             let mut bottom_border = Block::default()
                 .borders(Borders::BOTTOM)
                 .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(self.mode_color()))
+                .border_style(Style::default().fg(focus_color))
                 .style(background);
             if let Some(hint_line) = hint_line {
                 bottom_border = bottom_border.title_bottom(hint_line);
             }
             bottom_border.render(area, buf);
-            render_composer_panel_corners(
-                area,
-                buf,
-                background,
-                permission_color,
-                self.mode_color(),
-            );
+            render_composer_panel_corners(area, buf, background, focus_color, focus_color);
         } else if area.height >= 2 {
             let mut block = Block::default()
                 .borders(Borders::TOP)
@@ -1948,14 +1935,14 @@ impl Renderable for ComposerWidget<'_> {
                 .set_style(Style::default().fg(self.app.ui_theme.accent_primary));
         }
 
-        // Restore the shared `[↑]` after caller-owned input so a long draft
+        // Restore the shared `[↵]` after caller-owned input so a long draft
         // cannot erase the one cell target the mouse handler also uses.
         if has_panel {
             crate::tui::composer_chrome::render_tideline_composer_submit(
                 area,
                 buf,
                 &self.app.ui_theme,
-                true,
+                self.app.composer_enter_would_submit(),
                 crate::tui::color_compat::ascii_safe_enabled(),
             );
         }
@@ -3118,7 +3105,7 @@ pub struct ElevationWidget<'a> {
 }
 
 impl<'a> ElevationWidget<'a> {
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     pub fn new(request: &'a ElevationRequest, selected: usize, locale: Locale) -> Self {
         Self {
             request,
@@ -3542,6 +3529,9 @@ fn apply_selection_to_line(
 /// [`crate::tui::ui::render`] and thread the result, so the reservation and
 /// the render can never disagree inside a single frame.
 pub(crate) fn should_render_empty_state(app: &App) -> bool {
+    if app.launch.visible && app.launch.return_to_session {
+        return true;
+    }
     let active_is_empty = app
         .active_cell
         .as_ref()
@@ -3695,7 +3685,7 @@ fn composer_height(
     let has_panel = enclosed_composer_panel_fits(show_panel, area_width, available_height);
     // Measure through the same border- and submit-aware plane that rendering,
     // cursor placement, the frame viewport, and mouse mapping use. A draft
-    // that wraps here therefore cannot consume the painted `[↑]` cells later.
+    // that wraps here therefore cannot consume the painted `[↵]` cells later.
     let measurement_area = Rect::new(0, 0, area_width, if has_panel { 3 } else { 1 });
     let content_width =
         composer_content_geometry(composer_inner_area(measurement_area, has_panel), false)
@@ -4444,7 +4434,7 @@ fn cursor_row_col_in_lines(
         .nth(offset)
         .map(|(b, _)| b)
         .unwrap_or(line.len());
-    let col = line[..byte_end].width();
+    let col = visible_str_width(&line[..byte_end]);
     (row, col)
 }
 
@@ -4527,6 +4517,28 @@ pub fn wrap_input_lines_for_mouse(input: &str, width: usize) -> Vec<(usize, Stri
 ///   the end of the preceding line rather than being swallowed.
 /// * **Every line fits.** A word longer than `width` — a URL, a path, a
 ///   base64 blob — has no usable break point and still breaks hard.
+///
+/// Display width as painted: ratatui strips control characters, so they
+/// occupy no cells. Non-control graphemes keep plain unicode width, matching
+/// the long-standing wrap/click/caret contract.
+pub(crate) fn visible_grapheme_width(grapheme: &str) -> usize {
+    if grapheme.chars().any(|c| c.is_control()) {
+        0
+    } else {
+        grapheme.width()
+    }
+}
+
+/// Plain unicode width with painted control handling: strip control
+/// graphemes first so emoji and wide-glyph measurement keeps the exact
+/// [`UnicodeWidthStr`] semantics on the remainder.
+fn visible_str_width(text: &str) -> usize {
+    text.graphemes(true)
+        .filter(|grapheme| !grapheme.chars().any(|c| c.is_control()))
+        .collect::<String>()
+        .width()
+}
+
 fn wrap_text(text: &str, width: usize) -> Vec<String> {
     if width == 0 {
         return vec![text.to_string()];
@@ -4552,7 +4564,7 @@ fn wrap_text(text: &str, width: usize) -> Vec<String> {
                 Some((byte, _)) if byte < current.len() => {
                     let remainder = current.split_off(byte);
                     lines.push(std::mem::replace(&mut current, remainder));
-                    current_width = current.width();
+                    current_width = visible_str_width(&current);
                 }
                 _ => {
                     lines.push(std::mem::take(&mut current));
@@ -4570,7 +4582,7 @@ fn wrap_text(text: &str, width: usize) -> Vec<String> {
             continue;
         }
 
-        let grapheme_width = grapheme.width();
+        let grapheme_width = visible_grapheme_width(grapheme);
         if current_width + grapheme_width > width && current_width != 0 {
             flush!();
         }
@@ -4643,18 +4655,17 @@ fn line_spans_with_selection<'a>(
 #[cfg(test)]
 mod tests {
     use super::{
-        ACTIVE_REVISION_DOMAIN, ApprovalMode, ApprovalWidget, COMPOSER_PANEL_HEIGHT,
-        COMPOSER_PLACEHOLDER, ChatWidget, ComposerWidget, Renderable, SlashMenuEntry,
-        active_composer_submit_rect, active_entry_revision, apply_detail_target_highlight,
-        apply_selection_to_line, apply_send_flash, approval_palette, approval_truncation_hint,
-        build_empty_state_lines, composer_content_geometry, composer_empty_hint_text,
-        composer_height, composer_inner_area, composer_max_height, composer_submit_hint,
-        composer_top_padding, cursor_row_col, empty_composer_visual_rows,
-        enclosed_composer_panel_fits, fish_flee_offset, fish_heading, fish_mark,
-        history_entry_revision, layout_input, layout_input_with_scroll, placeholder_visual_lines,
-        push_command_entry, receipt_is_settling, revision_in_domain, should_render_empty_state,
-        slash_completion_hints, tool_run_summary_revision, wrap_input_lines,
-        wrap_input_lines_for_mouse, wrap_text,
+        ACTIVE_REVISION_DOMAIN, ApprovalWidget, COMPOSER_PANEL_HEIGHT, COMPOSER_PLACEHOLDER,
+        ChatWidget, ComposerWidget, Renderable, SlashMenuEntry, active_composer_submit_rect,
+        active_entry_revision, apply_detail_target_highlight, apply_selection_to_line,
+        apply_send_flash, approval_palette, approval_truncation_hint, build_empty_state_lines,
+        composer_content_geometry, composer_empty_hint_text, composer_height, composer_inner_area,
+        composer_max_height, composer_submit_hint, composer_top_padding, cursor_row_col,
+        empty_composer_visual_rows, enclosed_composer_panel_fits, fish_flee_offset, fish_heading,
+        fish_mark, history_entry_revision, layout_input, layout_input_with_scroll,
+        placeholder_visual_lines, push_command_entry, receipt_is_settling, revision_in_domain,
+        should_render_empty_state, slash_completion_hints, tool_run_summary_revision,
+        wrap_input_lines, wrap_input_lines_for_mouse, wrap_text,
     };
     use crate::config::{ApiProvider, Config};
     use crate::tui::active_cell::ActiveCell;
@@ -4666,7 +4677,6 @@ mod tests {
         ExecCell, ExecSource, GenericToolCell, HistoryCell, ToolCell, ToolRun, ToolStatus,
     };
     use crate::tui::scrolling::{TranscriptLineMeta, TranscriptScroll};
-    use codewhale_config::AppMode;
     use codewhale_localization::Locale;
     use codewhale_palette as palette;
     use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
@@ -5375,6 +5385,17 @@ mod tests {
     fn wrap_input_lines_preserves_empty_lines() {
         let lines = wrap_input_lines("a\n\nb", 10);
         assert_eq!(lines, vec!["a", "", "b"]);
+    }
+
+    #[test]
+    fn wrap_and_caret_measure_tabs_as_painted() {
+        // Ratatui strips control characters, so a tab paints no cells. Wrap
+        // budgets, caret columns, and click mapping must all agree on zero;
+        // counting the tab would break the line early and drift the caret
+        // and clicks one cell per tab.
+        assert_eq!(wrap_text("\t0123456789", 11), vec!["\t0123456789"]);
+        assert_eq!(cursor_row_col("a\tb", 3, 80), (0, 2));
+        assert_eq!(cursor_row_col("\ta", 2, 80), (0, 1));
     }
 
     #[test]
@@ -6416,7 +6437,7 @@ mod tests {
     #[test]
     fn composer_height_wraps_to_the_rounded_panel_content_width() {
         // At the minimum viable panel width, the side rails, prompt gutter,
-        // shared `[↑]` control, and its breathing cell leave three text
+        // shared `[↵]` control, and its breathing cell leave three text
         // columns. Measuring against the old width would render extra lines
         // without allocating their rows.
         let height = composer_height(
@@ -6666,7 +6687,7 @@ mod tests {
         );
         let inner = widget.inner_area(area);
         let quiet_row = cursor_y.saturating_add(1);
-        // The quiet row hosts exactly one thing: the shared `[↑]` affordance
+        // The quiet row hosts exactly one thing: the shared `[↵]` affordance
         // on its recorded hitbox cells. Every other cell stays blank.
         let submit = active_composer_submit_rect(&app, area).expect("enclosed composer submit");
         assert!(
@@ -6676,12 +6697,15 @@ mod tests {
                         submit.y == quiet_row && x >= submit.x && x < submit.x + submit.width;
                     on_submit || buf[(x, quiet_row)].symbol() == " "
                 }),
-            "comfortable composer should keep a quiet content row before the footer, hosting only the shared [↑]: {rendered}"
+            "comfortable composer should keep a quiet content row before the footer, hosting only the shared [↵]: {rendered}"
         );
         let painted: String = (submit.x..submit.x + submit.width)
             .map(|x| buf[(x, submit.y)].symbol().to_string())
             .collect();
-        assert_eq!(painted, "[↑]", "the quiet row hosts the shared send cells");
+        assert_eq!(
+            painted, "[·]",
+            "the empty composer has an inactive send cue"
+        );
     }
 
     #[test]
@@ -6838,52 +6862,27 @@ mod tests {
     }
 
     #[test]
-    fn composer_border_edges_encode_warm_permission_and_cool_mode_ramps() {
-        let slash_menu_entries = Vec::<SlashMenuEntry>::new();
-        let mention_menu_entries = Vec::<String>::new();
+    fn composer_outline_tracks_focus_without_repeating_permission_or_mode() {
+        let slash = Vec::<SlashMenuEntry>::new();
+        let mentions = Vec::<String>::new();
         let area = Rect::new(0, 0, 40, 5);
-
         for theme_id in palette::SELECTABLE_THEMES {
-            let theme = theme_id.ui_theme();
-            for (approval_mode, expected) in [
-                (ApprovalMode::Suggest, theme.permission_ask),
-                (ApprovalMode::Never, theme.permission_ask),
-                (ApprovalMode::Auto, theme.permission_auto_review),
-                (ApprovalMode::Bypass, theme.permission_full_access),
-            ] {
-                let mut app = create_test_app();
-                app.ui_theme = theme;
-                app.approval_mode = approval_mode;
-                let widget =
-                    ComposerWidget::new(&app, 5, &slash_menu_entries, &mention_menu_entries);
+            let mut app = create_test_app();
+            app.ui_theme = theme_id.ui_theme();
+            app.launch.visible = true;
+            for selected in [None, Some(0)] {
+                app.launch.menu_selected = selected;
+                let widget = ComposerWidget::new(&app, 5, &slash, &mentions);
                 let mut buf = Buffer::empty(area);
                 widget.render(area, &mut buf);
-                assert_eq!(
-                    buf[(1, area.top())].fg,
-                    expected,
-                    "{} {approval_mode:?}",
-                    theme_id.name()
-                );
-            }
-
-            for (mode, expected) in [
-                (AppMode::Plan, theme.mode_plan),
-                (AppMode::Agent, theme.mode_agent),
-                (AppMode::Operate, theme.mode_operate),
-            ] {
-                let mut app = create_test_app();
-                app.ui_theme = theme;
-                app.mode = mode;
-                let widget =
-                    ComposerWidget::new(&app, 5, &slash_menu_entries, &mention_menu_entries);
-                let mut buf = Buffer::empty(area);
-                widget.render(area, &mut buf);
-                assert_eq!(
-                    buf[(1, area.bottom().saturating_sub(1))].fg,
-                    expected,
-                    "{} {mode:?}",
-                    theme_id.name()
-                );
+                let expected = if selected.is_none() {
+                    app.ui_theme.accent_primary
+                } else {
+                    app.ui_theme.border
+                };
+                for cell in [(1, 0), (1, 4), (0, 1), (39, 1)] {
+                    assert_eq!(buf[cell].fg, expected, "{} {selected:?}", theme_id.name());
+                }
             }
         }
     }
@@ -6946,12 +6945,49 @@ mod tests {
         for (width, height) in [(40_u16, 12), (60, 16), (80, 24), (100, 32), (120, 32)] {
             let rendered = render_composer(&app, width, height);
             assert!(
-                rendered.contains("[↑]"),
+                rendered.contains("[↵]"),
                 "missing send affordance at {width}x{height}:\n{rendered}"
             );
             assert!(
                 !rendered.contains("▚△▞"),
                 "retired crown must stay gone at {width}x{height}:\n{rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn composer_submit_ink_matches_real_submit_readiness() {
+        let mut app = create_test_app();
+        app.composer_border = true;
+        let slash = Vec::<SlashMenuEntry>::new();
+        let mentions = Vec::<String>::new();
+        let area = Rect::new(0, 0, 80, 8);
+        for draft in ["", "   ", "ship it"] {
+            app.input = draft.to_string();
+            app.cursor_position = app.input.chars().count();
+            let widget = ComposerWidget::new(&app, 8, &slash, &mentions);
+            let mut buf = Buffer::empty(area);
+            widget.render(area, &mut buf);
+            let submit = active_composer_submit_rect(&app, area).unwrap();
+            let ready = app.composer_enter_would_submit();
+            let painted: String = (submit.x..submit.right())
+                .map(|x| buf[(x, submit.y)].symbol())
+                .collect();
+            assert_eq!(painted, if ready { "[↵]" } else { "[·]" });
+            assert_eq!(
+                buf[(submit.x, submit.y)].modifier.contains(Modifier::BOLD),
+                ready
+            );
+            let role = if ready {
+                codewhale_palette::ChromeInk::Info
+            } else {
+                codewhale_palette::ChromeInk::MetadataDim
+            };
+            assert_eq!(
+                buf[(submit.x, submit.y)].fg,
+                codewhale_palette::chrome_style(&app.ui_theme, role)
+                    .fg
+                    .unwrap()
             );
         }
     }
@@ -6972,7 +7008,7 @@ mod tests {
         let painted: String = (submit.x..submit.x + submit.width)
             .map(|x| buf[(x, submit.y)].symbol().to_string())
             .collect();
-        assert_eq!(painted, "[↑]", "geometry must cover the painted send cells");
+        assert_eq!(painted, "[↵]", "geometry must cover the painted send cells");
     }
 
     #[test]
@@ -7019,7 +7055,7 @@ mod tests {
         let painted: String = (submit.x..submit.right())
             .map(|x| buf[(x, submit.y)].symbol().to_string())
             .collect();
-        assert_eq!(painted, "[↑]", "submit stays intact beside the draft");
+        assert_eq!(painted, "[↵]", "submit stays intact beside the draft");
     }
 
     #[test]
@@ -7054,7 +7090,7 @@ mod tests {
         app.cursor_position = app.input.chars().count();
         let rendered = render_composer(&app, 80, 4);
         assert!(
-            !rendered.contains("[↑]"),
+            !rendered.contains("[↵]"),
             "compact composer must shed the send chrome:\n{rendered}"
         );
     }
@@ -7416,10 +7452,11 @@ mod tests {
 
         assert_ne!(buf[(0, 0)].bg, buf[(0, 19)].bg);
         let rendered = buffer_text(&buf, area);
-        // One loose wedge school: an eyed lead plus plain members, all
-        // facing the same way (facing equals travel by construction).
-        let rightward = rendered.matches("><>").count() + rendered.matches("><o>").count();
-        let leftward = rendered.matches("<><").count() + rendered.matches("<o><").count();
+        // One loose wedge school, every member facing the same way (facing
+        // equals travel by construction). The counter knows both silhouette
+        // families: the native braille poses this terminal paints and the
+        // ASCII bodies of `CODEWHALE_ASCII_SAFE=1`.
+        let (rightward, leftward) = crate::tui::ambient_life::fish_silhouette_counts(&rendered);
         assert!(
             rightward == 0 || leftward == 0,
             "one school shares one direction:\n{rendered}"
@@ -7429,8 +7466,6 @@ mod tests {
             (4..=7).contains(&fish_count),
             "wide idle water should show one cohesive wedge school (got {fish_count}):\n{rendered}"
         );
-        let leads = rendered.matches("><o>").count() + rendered.matches("<o><").count();
-        assert_eq!(leads, 1, "exactly one eyed lead fish:\n{rendered}");
 
         let context_x = ((100usize - UnicodeWidthStr::width(context.as_str())) / 2) as u16;
         let context_cell = (0..area.height)
@@ -7464,8 +7499,9 @@ mod tests {
         assert_eq!(buf[(0, 0)].bg, base);
         assert_eq!(buf[(0, 19)].bg, base, "flat keeps the plain theme surface");
         let rendered = buffer_text(&buf, area);
-        assert!(
-            !rendered.contains("><>") && !rendered.contains("<><"),
+        assert_eq!(
+            crate::tui::ambient_life::fish_silhouette_counts(&rendered),
+            (0, 0),
             "terminal-owned themes must keep a normal shell without decorative fish:\n{rendered}"
         );
     }
@@ -7496,8 +7532,9 @@ mod tests {
             "Solarized Light must keep canonical Base3 through the viewport"
         );
         let rendered = buffer_text(&buf, area);
-        assert!(
-            !rendered.contains("><>") && !rendered.contains("<><"),
+        assert_eq!(
+            crate::tui::ambient_life::fish_silhouette_counts(&rendered),
+            (0, 0),
             "a theme with no painted field earns no ambient life:\n{rendered}"
         );
     }
@@ -7539,8 +7576,9 @@ mod tests {
             "the Terminal treatment must never paint a background"
         );
         let rendered = buffer_text(&buf, area);
-        assert!(
-            !rendered.contains("><>") && !rendered.contains("<><"),
+        assert_eq!(
+            crate::tui::ambient_life::fish_silhouette_counts(&rendered),
+            (0, 0),
             "Terminal must remain a quiet host-owned shell without the selected Deepsea scene:\n{rendered}"
         );
     }
@@ -7806,8 +7844,9 @@ mod tests {
         // entire width. Browsing still holds the school in the clear water.
         let rows = history_field_rows(4);
         let rendered = rows.join("\n");
+        let (rightward, leftward) = crate::tui::ambient_life::fish_silhouette_counts(&rendered);
         assert!(
-            rendered.contains("><>") || rendered.contains("<><"),
+            rightward + leftward > 0,
             "open water below the transcript should hold fish:\n{rendered}"
         );
         for index in 0..4 {
@@ -7843,8 +7882,9 @@ mod tests {
         let mut buf = Buffer::empty(area);
         widget.render(area, &mut buf);
         let rendered = buffer_text(&buf, area);
+        let (rightward, leftward) = crate::tui::ambient_life::fish_silhouette_counts(&rendered);
         assert!(
-            rendered.contains("><") || rendered.contains("<o"),
+            rightward + leftward > 0,
             "submitting a message must not empty the ocean:\n{rendered}"
         );
         assert!(rendered.contains("release check 17"), "{rendered}");
@@ -7867,8 +7907,9 @@ mod tests {
         let mut buf = Buffer::empty(area);
         widget.render(area, &mut buf);
         let rendered = buffer_text(&buf, area);
+        let (rightward, leftward) = crate::tui::ambient_life::fish_silhouette_counts(&rendered);
         assert!(
-            rendered.contains("><") || rendered.contains("<o"),
+            rightward + leftward > 0,
             "the completion settle must not snap the ocean empty:\n{rendered}"
         );
         assert!(rendered.contains("release receipt"), "{rendered}");
@@ -7893,8 +7934,9 @@ mod tests {
         let mut buf = Buffer::empty(area);
         widget.render(area, &mut buf);
         let rendered = buffer_text(&buf, area);
-        assert!(
-            !rendered.contains("><>") && !rendered.contains("<><"),
+        assert_eq!(
+            crate::tui::ambient_life::fish_silhouette_counts(&rendered),
+            (0, 0),
             "a full transcript is not an aquarium:\n{rendered}"
         );
     }

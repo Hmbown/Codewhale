@@ -36,6 +36,10 @@ pub struct Harness {
     frame: Frame,
     last_pump: Instant,
     cursor_query_tail: Vec<u8>,
+    program: PathBuf,
+    sealed_home: Option<PathBuf>,
+    diagnostic_root: PathBuf,
+    terminal_environment: String,
 }
 
 pub struct HarnessBuilder {
@@ -125,11 +129,47 @@ impl HarnessBuilder {
                 .env("XDG_CACHE_HOME", home.join(".cache").to_string_lossy())
                 .env("USERPROFILE", home.to_string_lossy())
                 .env("CODEWHALE_CONFIG_PATH", codewhale_config.to_string_lossy())
-                .env("DEEPSEEK_CONFIG_PATH", deepseek_config.to_string_lossy());
+                .env("DEEPSEEK_CONFIG_PATH", deepseek_config.to_string_lossy())
+                // Sealing the filesystem is not enough on its own: the startup
+                // Ollama probe reaches the developer's machine over loopback,
+                // and adopting a live :11434 catalog rewrites the very launch
+                // screen these suites wait for.
+                .env("CODEWHALE_DISABLE_LOCAL_OLLAMA_PROBE", "1");
         }
         for (k, v) in &self.env {
             builder = builder.env(k, v);
         }
+
+        let diagnostic_root = self
+            .env
+            .get("QA_PTY_DIAGNOSTICS_DIR")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("QA_PTY_DIAGNOSTICS_DIR").map(PathBuf::from))
+            .unwrap_or_else(|| std::env::temp_dir().join("codewhale-pty-failures"));
+        // Report only terminal capabilities, never the inherited environment
+        // (which may contain developer credentials on unsealed scenarios).
+        let terminal_environment = ["TERM", "COLORTERM", "NO_COLOR"]
+            .into_iter()
+            .map(|key| {
+                let default = match key {
+                    "TERM" => "xterm-256color",
+                    "COLORTERM" => "truecolor",
+                    _ => "<unset>",
+                };
+                let value = self
+                    .env
+                    .get(key)
+                    .cloned()
+                    .or_else(|| {
+                        (!self.clear_env && key == "NO_COLOR")
+                            .then(|| std::env::var(key).ok())
+                            .flatten()
+                    })
+                    .unwrap_or_else(|| default.to_string());
+                format!("{key}={value:?}")
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
 
         // Arm the stall watchdog before the child exists, so a spawn that wedges
         // is covered too. Idempotent per process.
@@ -141,6 +181,10 @@ impl HarnessBuilder {
             frame,
             last_pump: Instant::now(),
             cursor_query_tail: Vec::new(),
+            program: self.program,
+            sealed_home: self.seal_home,
+            diagnostic_root,
+            terminal_environment,
         })
     }
 }
@@ -237,7 +281,7 @@ impl Harness {
                 return Err(anyhow!(
                     "wait_for timed out after {:?}.\n{}",
                     budget,
-                    self.frame.debug_dump()
+                    self.failure_diagnostics(budget)
                 ));
             }
             std::thread::sleep(Duration::from_millis(40));
@@ -269,10 +313,174 @@ impl Harness {
                 return Err(anyhow!(
                     "wait_for_idle: never settled within {:?}\n{}",
                     budget,
-                    self.frame.debug_dump()
+                    self.failure_diagnostics(budget)
                 ));
             }
             std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Capture evidence while the child and sealed HOME still exist. A blank
+    /// parsed frame cannot distinguish no first draw from a later clear, and
+    /// the TUI redirects stderr into its runtime log before drawing. This is
+    /// diagnostics only: predicates, deadlines and teardown are unchanged.
+    fn failure_diagnostics(&mut self, budget: Duration) -> String {
+        self.pump();
+        let transcript = self.pty.transcript();
+        let pid = self.pty.pid();
+        let exit = self.pty.wait_until(Instant::now());
+        let signal = self.pty.signal().map(str::to_owned);
+        let program = self.program.clone();
+        let diagnostic_root = self.diagnostic_root.clone();
+        let sealed_home = self.sealed_home.clone();
+        let terminal_environment = self.terminal_environment.clone();
+        let frame_dump = self.frame.debug_dump();
+        let modes_dump = self.terminal_modes().debug_dump();
+        // Failure evidence can hash a large binary and read redirected logs.
+        // Keep that I/O on a dedicated worker, then join before fixture teardown
+        // can remove the sealed HOME. Readiness itself has already timed out.
+        let worker = std::thread::Builder::new()
+            .name("qa-pty-diagnostics".into())
+            .spawn(move || {
+                let nonce = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos();
+                let destination = diagnostic_root
+                    .join(format!("{}-{nonce}", pid.unwrap_or_default()));
+                let mut report = format!(
+                    "program={:?} host={}/{} pid={pid:?} observed_exit={exit:?} signal={signal:?} wait_budget={budget:?} parent_CI={} {}\nPTY bytes={}\n",
+                    program,
+                    std::env::consts::OS,
+                    std::env::consts::ARCH,
+                    std::env::var_os("CI").is_some(),
+                    terminal_environment,
+                    transcript.len(),
+                );
+                report.push_str(&format!("diagnostic_worker={:?}\n", std::thread::current().name()));
+                // Hash the running Linux executable when available; the launch path
+                // may have been replaced by a concurrent build. Other hosts retain the
+                // launch-path digest, explicitly labelled as such.
+                let executable = pid
+                    .map(|pid| PathBuf::from(format!("/proc/{pid}/exe")))
+                    .filter(|path| path.exists())
+                    .unwrap_or_else(|| program.clone());
+                let digest = (|| -> std::io::Result<String> {
+                    use sha2::{Digest, Sha256};
+                    let mut file = std::fs::File::open(&executable)?;
+                    let mut hasher = Sha256::new();
+                    use std::io::Read;
+                    let mut buffer = [0_u8; 64 * 1024];
+                    loop {
+                        let count = file.read(&mut buffer)?;
+                        if count == 0 {
+                            break;
+                        }
+                        hasher.update(&buffer[..count]);
+                    }
+                    Ok(hasher
+                        .finalize()
+                        .iter()
+                        .map(|byte| format!("{byte:02x}"))
+                        .collect())
+                })();
+                report.push_str(&format!("executable={executable:?} sha256={digest:?}\n"));
+                // /proc is local, read-only and cheap. No debugger dependency or
+                // process environment is needed to locate a blocked Linux thread.
+                if let Some(pid) = pid {
+                    let process = PathBuf::from(format!("/proc/{pid}"));
+                    for name in ["status", "wchan"] {
+                        if let Ok(text) = std::fs::read_to_string(process.join(name)) {
+                            report.push_str(&format!("process {name}:\n{text}\n"));
+                        }
+                    }
+                    if let Ok(entries) = std::fs::read_dir(process.join("task")) {
+                        for entry in entries.flatten().take(128) {
+                            let thread = entry.path();
+                            for name in ["comm", "wchan", "stack"] {
+                                let text = std::fs::read_to_string(thread.join(name))
+                                    .unwrap_or_else(|error| format!("unavailable: {error}"));
+                                report
+                                    .push_str(&format!("thread {:?} {name}: {text}\n", entry.file_name()));
+                            }
+                        }
+                    }
+                }
+                let saved = (|| -> std::io::Result<()> {
+                    let mut directories = std::fs::DirBuilder::new();
+                    directories.recursive(true);
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::DirBuilderExt;
+                        directories.mode(0o700);
+                    }
+                    directories.create(&destination)?;
+                    let write_private = |path: &Path, contents: &[u8]| -> std::io::Result<()> {
+                        use std::io::Write;
+                        let mut options = std::fs::OpenOptions::new();
+                        options.write(true).create_new(true);
+                        #[cfg(unix)]
+                        {
+                            use std::os::unix::fs::OpenOptionsExt;
+                            options.mode(0o600);
+                        }
+                        options.open(path)?.write_all(contents)
+                    };
+                    write_private(&destination.join("pty.raw"), &transcript)?;
+                    write_private(
+                        &destination.join("frame.txt"),
+                        frame_dump.as_bytes(),
+                    )?;
+                    // Copy only runtime logs under the explicitly sealed fixture;
+                    // never walk a developer's HOME or copy configuration/credentials.
+                    if let Some(home) = &sealed_home {
+                        for relative in [".codewhale/logs", ".deepseek/logs"] {
+                            let directory = home.join(relative);
+                            if let Ok(entries) = std::fs::read_dir(&directory) {
+                                for entry in entries.flatten() {
+                                    let name = entry.file_name();
+                                    let name_text = name.to_string_lossy();
+                                    if !name_text.starts_with("tui-")
+                                        || !name_text.ends_with(".log")
+                                        || !entry.file_type()?.is_file()
+                                    {
+                                        continue;
+                                    }
+                                    let target = destination.join(relative).join(&name);
+                                    directories.create(target.parent().unwrap())?;
+                                    write_private(&target, &std::fs::read(entry.path())?)?;
+                                    report.push_str(&format!("runtime stderr: {}\n", target.display()));
+                                }
+                            }
+                        }
+                    }
+                    write_private(&destination.join("process.txt"), report.as_bytes())?;
+                    Ok(())
+                })();
+                match saved {
+                    Ok(()) => report.push_str(&format!("failure artifacts: {}\n", destination.display())),
+                    Err(error) => report.push_str(&format!("failure artifact capture failed: {error}\n")),
+                }
+                let tail = &transcript[transcript.len().saturating_sub(4096)..];
+                format!(
+                    "{}{}\nPTY tail: {:?}\n{}",
+                    frame_dump,
+                    modes_dump,
+                    String::from_utf8_lossy(tail),
+                    report
+                )
+            });
+        match worker {
+            Ok(worker) => worker.join().unwrap_or_else(|_| {
+                format!(
+                    "{}\nfailure diagnostic worker panicked",
+                    self.frame.debug_dump()
+                )
+            }),
+            Err(error) => format!(
+                "{}\nfailure diagnostic worker could not start: {error}",
+                self.frame.debug_dump()
+            ),
         }
     }
 
@@ -431,6 +639,88 @@ impl SealedWorkspace {
 #[cfg(test)]
 mod tests {
     use super::consume_cursor_position_queries;
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_wait_retains_raw_output_and_sealed_stderr_before_teardown() {
+        let directory = tempfile::tempdir().unwrap();
+        let home = directory.path().join("home");
+        let logs = home.join(".codewhale/logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        std::fs::write(
+            logs.join("tui-fixture.log"),
+            "startup stopped before first draw",
+        )
+        .unwrap();
+        std::fs::write(home.join("secret.txt"), "must never be copied").unwrap();
+        let artifacts = directory.path().join("evidence");
+        let mut harness = super::Harness::builder("/bin/sh")
+            .clear_env()
+            .seal_home(&home)
+            .env("QA_PTY_DIAGNOSTICS_DIR", artifacts.to_string_lossy())
+            .args([
+                "-c",
+                r"printf '\033[Hdrawn then erased\033[2J\033[H'; sleep 3",
+            ])
+            .spawn()
+            .unwrap();
+        // Wait for the raw clear itself, without relying on a scheduling sleep.
+        let deadline =
+            std::time::Instant::now() + super::ci_scaled(std::time::Duration::from_secs(2));
+        while !harness
+            .transcript()
+            .windows(4)
+            .any(|part| part == b"\x1b[2J")
+        {
+            harness.pump();
+            assert!(
+                std::time::Instant::now() < deadline,
+                "fixture did not emit clear"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let error = harness
+            .wait_for_text("never emitted", std::time::Duration::from_millis(20))
+            .unwrap_err();
+        assert!(error.to_string().contains("failure artifacts:"));
+        assert!(!harness.frame().contains("drawn then erased"));
+        let evidence = std::fs::read_dir(&artifacts)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        harness.shutdown();
+        let raw = std::fs::read(evidence.join("pty.raw")).unwrap();
+        assert!(raw.windows(17).any(|part| part == b"drawn then erased"));
+        assert_eq!(
+            std::fs::read_to_string(evidence.join(".codewhale/logs/tui-fixture.log")).unwrap(),
+            "startup stopped before first draw"
+        );
+        assert!(!evidence.join("secret.txt").exists());
+        assert!(
+            !error
+                .to_string()
+                .contains("startup stopped before first draw")
+        );
+        use std::os::unix::fs::PermissionsExt;
+        for path in [
+            evidence.clone(),
+            evidence.join("pty.raw"),
+            evidence.join(".codewhale/logs/tui-fixture.log"),
+        ] {
+            assert_eq!(
+                std::fs::metadata(path).unwrap().permissions().mode() & 0o077,
+                0
+            );
+        }
+        let process = std::fs::read_to_string(evidence.join("process.txt")).unwrap();
+        assert!(process.contains("pid=Some("));
+        assert!(process.contains("diagnostic_worker=Some(\"qa-pty-diagnostics\")"));
+        assert!(process.contains("wait_budget="));
+        assert!(process.contains("sha256=Ok("));
+        assert!(process.contains("TERM=\"xterm-256color\""));
+    }
 
     #[test]
     fn cursor_position_queries_survive_chunk_boundaries() {

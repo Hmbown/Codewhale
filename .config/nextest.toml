@@ -42,6 +42,20 @@ exec-persistent-service = { max-threads = 1 }
 filter = 'binary(integration) & test(/^telemetry_contract::/)'
 test-group = 'telemetry-contract'
 
+# Same hazard, different binary. `telemetry_kill_switch_dispatch` is a
+# codewhale-cli integration binary, not `integration`, so none of the filters
+# below ever matched it and it ran at full parallelism beside ~15.7k tests.
+# Each of its cases spawns the real binary, which gives a detached writer
+# thread only CLI_PERSIST_TIMEOUT (250 ms, crates/telemetry/src/lib.rs) to
+# re-read config from disk and fsync its batch before the process exits. Under
+# Ubuntu CI load that deadline is missed and the dry-run receipt never lands —
+# observed at telemetry_kill_switch_dispatch.rs:180 on PR #6104 (2026-09-12)
+# and again on PR #6267 (2026-09-16), both Ubuntu-only, both on changes that
+# touch neither telemetry nor the CLI.
+[[profile.default.overrides]]
+filter = 'binary(telemetry_kill_switch_dispatch)'
+test-group = 'telemetry-contract'
+
 [[profile.default.overrides]]
 filter = 'binary(integration) & test(/^exec_persistent_service::/)'
 test-group = 'exec-persistent-service'

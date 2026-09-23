@@ -31,8 +31,10 @@ export const chrome: ChromeDict = {
 
   navProduct: "Produkt",
   navModels: "Modele",
+  navPlugins: "Wtyczki",
   navProductSecondary: "Product",
   navModelsSecondary: "Models",
+  navPluginsSecondary: "Plugins",
 
   skipToContent: "Przejdź do treści głównej",
 

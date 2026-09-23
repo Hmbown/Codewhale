@@ -8,6 +8,7 @@
 //! keeps the dispatch site and tests resolving unchanged.
 
 use super::*;
+use crate::core::ops::TurnSpec;
 
 /// Resolve the headless `exec` model-step ceiling.
 ///
@@ -15,6 +16,28 @@ use super::*;
 /// explicit positive values retain the documented finite range.
 pub(crate) fn exec_max_steps(max_turns: Option<u32>) -> u32 {
     crate::core::engine::turn_budget::resolve_max_model_steps(max_turns)
+}
+
+/// Default-denied tools for headless `exec`, on top of the operator's own
+/// `--disallowed-tools` flag.
+///
+/// A headless run has no responder for `request_user_input`, so offering the
+/// tool can only stall the run until the turn wall clock, or forever with
+/// `[tools] user_input_timeout_seconds = 0`. Withholding it is the default
+/// form of the operator workaround (`--disallowed-tools request_user_input`):
+/// the model reports the tool absent and finishes instead of parking. This
+/// stays unconditional: there is no channel on which a one-shot CLI run
+/// could answer, so advertising the tool cannot work.
+pub(crate) fn exec_disallowed_tools(disallowed_tools: Option<Vec<String>>) -> Option<Vec<String>> {
+    use crate::core::engine::tool_catalog::REQUEST_USER_INPUT_NAME;
+    let mut disallowed = disallowed_tools.unwrap_or_default();
+    if !disallowed
+        .iter()
+        .any(|tool| tool.as_str() == REQUEST_USER_INPUT_NAME)
+    {
+        disallowed.push(REQUEST_USER_INPUT_NAME.to_string());
+    }
+    Some(disallowed)
 }
 
 type ExecSettlementProbe = std::pin::Pin<
@@ -274,6 +297,7 @@ pub(crate) async fn run_exec_agent(
     disallowed_tools: Option<Vec<String>>,
     append_system_prompt: Option<String>,
     tool_authority_json: Option<String>,
+    exec_hooks_enabled: bool,
     plugin_registry: std::sync::Arc<crate::plugins::PluginRegistry>,
 ) -> Result<()> {
     use crate::compaction::CompactionConfig;
@@ -284,6 +308,9 @@ pub(crate) async fn run_exec_agent(
     use crate::tools::todo::new_shared_todo_list;
     use codewhale_config::AppMode;
     use codewhale_execpolicy::ApprovalMode;
+
+    // Withhold `request_user_input`; a headless run has no responder.
+    let disallowed_tools = exec_disallowed_tools(disallowed_tools);
 
     // Headless exec registers the model-facing notify tool too. Project the
     // final merged config before tool setup so `off`, quiet/category gates,
@@ -381,7 +408,7 @@ pub(crate) async fn run_exec_agent(
     // `run_one_shot`/`run_one_shot_json` and the interactive launch path do,
     // so the tier the engine (and the receipt below) sees is concrete.
     let effective_reasoning_effort = route.reasoning_effort.and_then(|effort| {
-        cli_reasoning_effort_value_for_prompt(&execution_config, &effective_model, effort, prompt)
+        cli_reasoning_effort_value_for_prompt(&execution_config, &effective_model, effort)
     });
 
     let settings = crate::settings::Settings::load().unwrap_or_default();
@@ -438,6 +465,25 @@ pub(crate) async fn run_exec_agent(
     } else {
         plugin_registry
     };
+    // `exec --hooks` (#6099) is the operator's explicit opt-in: headless runs
+    // fire no hooks by default. When armed, the executor is the same one the
+    // TUI builds — global config, reviewed plugin snapshots, then trusted
+    // project `.codewhale/hooks.toml` — so `tool_call_before` can still deny
+    // and `shell_env` still applies. It is shared with the engine config, the
+    // turn's SendMessage op (which re-installs it into the engine), and the
+    // tool runtime services. Fleet workers never opt in: the narrowed
+    // authority envelope does not carry the operator's hook set into a child.
+    let exec_hook_executor = (exec_hooks_enabled && !fleet_authority_active).then(|| {
+        let hooks_config = crate::hooks::HooksConfig::load_with_project_and_plugins(
+            execution_config.hooks_config(),
+            &workspace,
+            Some(engine_plugin_registry.as_ref()),
+        );
+        std::sync::Arc::new(crate::hooks::HookExecutor::new(
+            hooks_config,
+            workspace.clone(),
+        ))
+    });
     let exec_allow_shell = crate::tools::spec::fleet_exec_shell_enabled(
         fleet_authority_active,
         outer_shell_authority,
@@ -456,6 +502,7 @@ pub(crate) async fn run_exec_agent(
         persist_services_enabled,
         automations: exec_automations,
         media_originals_dir: crate::media_originals::default_store_dir(),
+        hook_executor: exec_hook_executor.clone(),
         ..crate::tools::spec::RuntimeToolServices::default()
     };
 
@@ -511,8 +558,6 @@ pub(crate) async fn run_exec_agent(
         } else {
             execution_config.subagent_max_spawn_depth_for_provider(effective_provider)
         },
-        subagent_token_budget: execution_config
-            .subagent_token_budget_for_provider(effective_provider),
         network_policy,
         snapshots_enabled: !fleet_authority_active && execution_config.snapshots_config().enabled,
         snapshots_max_workspace_bytes: execution_config
@@ -555,6 +600,7 @@ pub(crate) async fn run_exec_agent(
         goal_status: crate::tools::goal::GoalStatus::Active,
         goal_max_continuations: execution_config.goal_max_continuations(),
         goal_continuation_delay_seconds: execution_config.goal_continuation_delay_seconds(),
+        goal_enforce_token_budget: execution_config.goal_enforce_token_budget(),
         reasoning_only_max_reprompts: execution_config.reasoning_only_max_reprompts(),
         reasoning_only_reprompt_message: Some(
             execution_config
@@ -564,7 +610,7 @@ pub(crate) async fn run_exec_agent(
         allowed_tools: allowed_tools.clone(),
         disallowed_tools: disallowed_tools.clone(),
         max_tool_calls,
-        hook_executor: None,
+        hook_executor: exec_hook_executor.clone(),
         locale_tag: codewhale_localization::resolve_locale(&settings.locale)
             .tag()
             .to_string(),
@@ -661,7 +707,7 @@ pub(crate) async fn run_exec_agent(
     let exec_turn_started_at = Instant::now();
 
     engine_handle
-        .send(Op::SendMessage {
+        .send(Op::SendMessage(TurnSpec {
             max_output_tokens: None,
             content: prompt.to_string(),
             images: Vec::new(),
@@ -674,7 +720,7 @@ pub(crate) async fn run_exec_agent(
             goal_status: crate::tools::goal::GoalStatus::Active,
             allowed_tools: allowed_tools.clone(),
             dynamic_tools: Vec::new(),
-            hook_executor: None,
+            hook_executor: exec_hook_executor.clone(),
             reasoning_effort: effective_reasoning_effort,
             reasoning_effort_auto,
             auto_model,
@@ -693,7 +739,7 @@ pub(crate) async fn run_exec_agent(
             },
             verbosity: execution_config.verbosity.clone(),
             provenance: crate::core::ops::UserInputProvenance::ExternalUser,
-        })
+        }))
         .await?;
 
     // Lifecycle outbox: the clean headless turn-start boundary. `exec` has
@@ -729,9 +775,10 @@ pub(crate) async fn run_exec_agent(
     let mut last_error_category = None;
     let mut reported_sandbox_contract = false;
 
-    let should_persist_session = resuming_session || output_format == ExecOutputFormat::StreamJson;
+    let mut should_persist_session =
+        resuming_session || output_format == ExecOutputFormat::StreamJson;
     let mut latest_session_id = loaded_session_id;
-    let mut latest_messages: Vec<Message> = Vec::new();
+    let mut latest_messages: Arc<Vec<Message>> = Arc::new(Vec::new());
     let mut latest_system_prompt: Option<SystemPrompt> = None;
     let mut latest_model = effective_model;
     let mut latest_workspace = workspace.clone();
@@ -1294,6 +1341,11 @@ pub(crate) async fn run_exec_agent(
                         .await;
                 break;
             }
+            Event::CompactionStarted { .. } => {
+                // The Engine writes recovery artifacts under its session ID.
+                // Keep the owning session discoverable even in text output.
+                should_persist_session = true;
+            }
             Event::SessionUpdated {
                 session_id,
                 messages,
@@ -1405,8 +1457,9 @@ pub(crate) async fn run_exec_agent(
 
 #[cfg(test)]
 mod tests {
-    use super::{ExecAgentEvents, exec_automation_services};
+    use super::{ExecAgentEvents, exec_automation_services, exec_disallowed_tools};
     use crate::core::engine::mock_engine_handle;
+    use crate::core::engine::tool_catalog::REQUEST_USER_INPUT_NAME;
     use crate::core::events::{Event, TurnOutcomeStatus};
     use crate::core::ops::{Op, SubAgentSettlement};
     use codewhale_models::Usage;
@@ -1436,6 +1489,29 @@ mod tests {
             panic!("host must not shut down while child work remains");
         };
         tx.lock().unwrap().take().unwrap().send(snapshot).unwrap();
+    }
+
+    #[test]
+    fn headless_exec_withholds_request_user_input_without_a_responder() {
+        // No responder exists on a one-shot CLI run, so the tool is
+        // withheld by default rather than offered and stalled on.
+        let disallowed = exec_disallowed_tools(None).expect("withhold list");
+        assert!(
+            disallowed
+                .iter()
+                .any(|tool| tool.as_str() == REQUEST_USER_INPUT_NAME),
+            "request_user_input must be withheld by default: {disallowed:?}"
+        );
+        // An operator-passed entry is kept exactly once, not duplicated.
+        let disallowed = exec_disallowed_tools(Some(vec![REQUEST_USER_INPUT_NAME.to_string()]))
+            .expect("withhold list");
+        assert_eq!(
+            disallowed
+                .iter()
+                .filter(|tool| tool.as_str() == REQUEST_USER_INPUT_NAME)
+                .count(),
+            1
+        );
     }
 
     #[tokio::test]

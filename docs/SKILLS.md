@@ -1,10 +1,13 @@
 # Skills Manager
 
+In the terminal, `/skills` opens **Extensions → Skills**. Enter on a skill opens the dedicated manager, also available directly through `/skills manage`, for existing install, update, remove, and trust operations. `/skill <name>` still activates a skill, and the explicit inspection, remote, sync, and suggestion subcommands remain available.
+
+
 > 阅读简体中文版：[zh_hans/SKILLS.md](zh_hans/SKILLS.md)
 
 Skills are reusable `SKILL.md` instruction packs. Codewhale discovers them from
 several roots, but **only Codewhale-owned directories are writable**. The unified
-`/skills` manager is the interactive surface for audit and mutation; slash
+`/skills manage` manager is the interactive surface for audit and mutation; slash
 aliases share the same write path.
 
 For Claude Code plugin boundaries, see [CLAUDE_PLUGIN_COMPAT.md](CLAUDE_PLUGIN_COMPAT.md).
@@ -51,7 +54,8 @@ project/global roots only.
 
 | Command | Behavior |
 | --- | --- |
-| `/skills` | Opens the Skills Manager (owned-only scan, **no network**). |
+| `/skills` | Opens Extensions → Skills (owned-only scan, **no network**). |
+| `/skills manage` | Opens the dedicated Skills Manager for audit and mutation. |
 | `/skills <prefix>` | Text list filtered by name prefix. |
 | `/skills inspect` | Text discovery mode, searched directories, and source paths. |
 | `/skills --remote` | Explicit registry listing (network). |
@@ -76,11 +80,11 @@ Notes:
 - If the same name exists in both project and global owned roots, update /
   uninstall / trust require `--project` or `--global`.
 - If a name exists only under a compatible external root, writes are refused;
-  import it through `/skills` instead of editing harness directories.
+  import it through `/skills manage` instead of editing harness directories.
 
 ## Skills Manager (TUI)
 
-Default open path: type `/skills` and confirm. The surface is zero-network on
+Direct manager path: type `/skills manage` and confirm. The surface is zero-network on
 open (owned-only audit).
 
 | Key | Action |
@@ -195,7 +199,7 @@ Collision and prompt-budget invariants asserted today:
 | Canonical wins | A canonical bundled name always beats another skill's alias (`docx` → `docx`, never `documents`). |
 | Single alias owner | No two bundled skills may claim the same alias. |
 | No duplicate entries | Each canonical name renders at most one catalogue line; aliases render zero. |
-| Budget headroom | The shipped pack alone renders under `MAX_AVAILABLE_SKILLS_CHARS` (2 400 chars) with **no** "additional skills omitted" line, so user skills are never silently displaced. |
+| Budget headroom | The shipped pack alone renders under the window-scaled skills budget (25 600 chars at the default 128k window; 2 400-char floor) with **no** "additional skills omitted" line, so user skills are never silently displaced. |
 | No context poisoning | Descriptions stay single-line and are truncated to `MAX_SKILL_DESCRIPTION_CHARS` (280) before entering the prompt. |
 
 ### Locale-aware routing metadata
@@ -313,7 +317,7 @@ See [CONFIGURATION.md](CONFIGURATION.md) for the full config surface.
 
 ## Operator checklist
 
-1. Prefer `/skills` for day-to-day management; keep `--remote` / `sync` explicit.
+1. Prefer `/skills manage` for day-to-day management; keep `--remote` / `sync` explicit.
 2. Never hand-edit `.claude` / `.agents` / `.cursor` trees to “install” for
    Codewhale — import into `.codewhale/skills` instead.
 3. Treat `.trusted` as advisory documentation of review, not a security boundary.

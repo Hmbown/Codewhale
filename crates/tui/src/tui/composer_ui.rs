@@ -1,4 +1,5 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use unicode_width::UnicodeWidthChar;
 
 use crate::tui::app::{App, ComposerSubmitChord};
 
@@ -45,20 +46,34 @@ pub(crate) fn next_escape_action(app: &App, slash_menu_open: bool) -> EscapeActi
     }
 }
 
-pub(crate) fn select_previous_slash_menu_entry(app: &mut App, entry_count: usize) {
+/// Rows one PageUp/PageDown travels in the slash menu. Pages clamp at the
+/// ends per the shared vocabulary instead of wrapping (#6290).
+const SLASH_MENU_PAGE: usize = 10;
+
+/// Move the slash-menu selection by one shared-vocabulary motion (#6290).
+/// Steps wrap; pages travel [`SLASH_MENU_PAGE`] rows and clamp. The menu is
+/// single-column, so the region axis is a no-op.
+pub(crate) fn move_slash_menu_selection(
+    app: &mut App,
+    entry_count: usize,
+    motion: crate::tui::list_nav::Motion,
+) {
     if entry_count == 0 {
         return;
     }
     let selected = app.slash_menu_selected.min(entry_count.saturating_sub(1));
-    app.slash_menu_selected = (selected + entry_count - 1) % entry_count;
+    if let Some(next) = crate::tui::list_nav::apply(selected, entry_count, SLASH_MENU_PAGE, motion)
+    {
+        app.slash_menu_selected = next;
+    }
+}
+
+pub(crate) fn select_previous_slash_menu_entry(app: &mut App, entry_count: usize) {
+    move_slash_menu_selection(app, entry_count, crate::tui::list_nav::Motion::Prev);
 }
 
 pub(crate) fn select_next_slash_menu_entry(app: &mut App, entry_count: usize) {
-    if entry_count == 0 {
-        return;
-    }
-    let selected = app.slash_menu_selected.min(entry_count.saturating_sub(1));
-    app.slash_menu_selected = (selected + 1) % entry_count;
+    move_slash_menu_selection(app, entry_count, crate::tui::list_nav::Motion::Next);
 }
 
 pub(crate) fn handle_composer_history_arrow(
@@ -82,12 +97,18 @@ pub(crate) fn handle_composer_history_arrow(
     // that convert the wheel into arrow keys (iTerm2's alternate-screen
     // setting) reach the composer through this path, so a draft boundary that
     // merely redraws would strand the user with no way to scroll back (#5223).
+    // A single logical line that soft-wraps across several visual rows is
+    // treated the same way: Up/Down step between visual rows and only reach
+    // history (or the transcript) from the first/last visual row.
     let scroll_transcript = app.composer_arrows_scroll && !app.input.contains('\n');
     let protect_multiline_draft = app.input.contains('\n') && app.history_index.is_none();
 
     match key.code {
         KeyCode::Up => {
-            if scroll_transcript
+            if move_cursor_visual_row(app, true) {
+                // The cursor stepped to the visual row above, so the draft is
+                // untouched and history is not recalled.
+            } else if scroll_transcript
                 || (protect_multiline_draft && !cursor_has_previous_logical_line(app))
             {
                 app.scroll_up(COMPOSER_ARROW_SCROLL_LINES);
@@ -97,7 +118,11 @@ pub(crate) fn handle_composer_history_arrow(
             true
         }
         KeyCode::Down => {
-            if scroll_transcript || (protect_multiline_draft && !cursor_has_next_logical_line(app))
+            if move_cursor_visual_row(app, false) {
+                // The cursor stepped to the visual row below, so the draft is
+                // untouched and history is not recalled.
+            } else if scroll_transcript
+                || (protect_multiline_draft && !cursor_has_next_logical_line(app))
             {
                 app.scroll_down(COMPOSER_ARROW_SCROLL_LINES);
             } else {
@@ -127,6 +152,80 @@ fn byte_index_at_char(text: &str, char_index: usize) -> usize {
         .nth(char_index)
         .map(|(idx, _)| idx)
         .unwrap_or(text.len())
+}
+
+/// Step the cursor one visual row within a soft-wrapped single logical line,
+/// returning whether it moved.
+///
+/// A long prompt with no newline still spans several screen rows; without this
+/// the first Up recalls history and the draft visibly "disappears", which reads
+/// as deletion. The wrapping reused here is the renderer's own
+/// (`wrap_input_lines_for_mouse`) and the width is the last rendered composer
+/// geometry, so key handling cannot disagree with what the user sees. History
+/// navigation keeps its claim while an entry is on screen (`history_index` is
+/// set). Callers fall through to the legacy scroll/history behavior when this
+/// returns false: first/last visual row, a single visual row, or no rendered
+/// geometry yet.
+fn move_cursor_visual_row(app: &mut App, up: bool) -> bool {
+    if app.history_index.is_some() || app.input.contains('\n') {
+        return false;
+    }
+    let Some(plane) = app.viewport.last_composer_content else {
+        return false;
+    };
+    let width =
+        crate::tui::widgets::composer_content_geometry(plane, app.is_history_search_active())
+            .text_width();
+    let rows = crate::tui::widgets::wrap_input_lines_for_mouse(&app.input, width);
+    if rows.len() < 2 {
+        return false;
+    }
+    // Current visual row: the last row whose start is at or before the cursor,
+    // matching the caret convention in `cursor_row_col_in_lines`.
+    let cursor = app.cursor_position;
+    let mut row = 0;
+    for (index, (start, _)) in rows.iter().enumerate() {
+        if *start <= cursor {
+            row = index;
+        } else {
+            break;
+        }
+    }
+    let target = if up {
+        let Some(previous) = row.checked_sub(1) else {
+            return false;
+        };
+        previous
+    } else if row + 1 < rows.len() {
+        row + 1
+    } else {
+        return false;
+    };
+    let (start, text) = &rows[row];
+    let column: usize = text
+        .chars()
+        .take(cursor.saturating_sub(*start))
+        .map(char_display_width)
+        .sum();
+    let (target_start, target_text) = &rows[target];
+    let mut stepped = 0;
+    let mut stepped_width = 0;
+    for ch in target_text.chars() {
+        let w = char_display_width(ch);
+        if stepped_width + w > column {
+            break;
+        }
+        stepped_width += w;
+        stepped += 1;
+    }
+    app.cursor_position = target_start + stepped;
+    app.needs_redraw = true;
+    true
+}
+
+/// Display columns occupied by one char; zero-width and control chars take none.
+fn char_display_width(ch: char) -> usize {
+    UnicodeWidthChar::width(ch).unwrap_or(0)
 }
 
 pub(crate) fn is_word_cursor_modifier(modifiers: KeyModifiers) -> bool {

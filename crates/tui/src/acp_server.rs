@@ -43,7 +43,7 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader, Lines};
 use tokio_util::sync::CancellationToken;
 
-use crate::client::DeepSeekClient;
+use crate::client::CodewhaleClient;
 use crate::config::{ApiProvider, Config};
 use crate::core::engine::turn_loop::run_tool_call_before_hooks;
 use crate::core::engine::{
@@ -694,7 +694,7 @@ fn prepare_acp_tool_admission(
     }
     let mut permission_reason =
         (prepared.approval != ApprovalRequirement::Auto).then(|| prepared.description.clone());
-    let approval_mode = ApprovalMode::Suggest;
+    let approval_mode = acp_approval_mode(config);
     let workspace = registry.context().workspace.as_path();
 
     let typed_rule = exec_shell_ask_rule_decision_for_policy(
@@ -764,6 +764,17 @@ fn prepare_acp_tool_admission(
     let admission = permission_reason
         .map(AcpToolAdmission::RequestPermission)
         .unwrap_or(AcpToolAdmission::Auto);
+    // #6337: Bypass pre-approves prompts so an unattended `--yolo` session
+    // executes instead of stalling on permission requests no client answers.
+    // Hard blocks above (safety floor, repo law, reviewer consult) return
+    // early and are never downgraded.
+    let admission = if approval_mode == ApprovalMode::Bypass
+        && matches!(admission, AcpToolAdmission::RequestPermission(_))
+    {
+        AcpToolAdmission::Auto
+    } else {
+        admission
+    };
     Ok((prepared, admission))
 }
 
@@ -1269,6 +1280,11 @@ fn tool_result_message_with_blocks(
 /// LLM <-> tool round-trips as the model requests (bounded by
 /// [`MAX_ACP_TOOL_ROUNDS`]).
 ///
+/// Recorded interim exception to the one-turn-loop rule (#6088, named in
+/// `crates/core/tests/single_turn_loop.rs`): ACP IDE sessions do not run on
+/// the full thread/turn runtime yet. #5835 converges them onto
+/// `Engine::run_turn` and deletes this loop along with the exception.
+///
 /// `open_stream` opens a fresh provider stream for the given message
 /// history; production callers wire it to [`AcpServer::open_prompt_stream`],
 /// while tests supply canned per-round streams so the loop can be exercised
@@ -1498,7 +1514,12 @@ impl AcpServer {
             .and_then(Value::as_str)
             .map(PathBuf::from)
             .unwrap_or_else(|| self.default_cwd.clone());
-        let session_id = format!("codewhale-{}", uuid::Uuid::new_v4());
+        // A bare uuid, the same shape `create_saved_session` produces and the
+        // same shape `session/list` advertises. The old `codewhale-` prefix put
+        // this id in a namespace no other method understood, so a client that
+        // replayed it into `session/load` — the normal thing to do — got
+        // `-32602` for an id we had just handed it (#6174).
+        let session_id = uuid::Uuid::new_v4().to_string();
         let tool_registry = Arc::new(build_acp_tool_registry(
             &self.config,
             &cwd,
@@ -1583,13 +1604,22 @@ impl AcpServer {
             .and_then(Value::as_str)
             .ok_or_else(|| AcpError::invalid_params("session/load requires sessionId"))?
             .to_string();
+        // Sessions this connection already holds resolve from memory. `session/new`
+        // sessions live only here — nothing on the ACP path writes them to the
+        // durable store — so consulting the store first would fail every id we
+        // minted ourselves. This also makes reloading an already-loaded durable
+        // session cheap and free of store side effects.
+        if self.sessions.contains_key(&session_id) {
+            return Ok(self.session_configuration(&session_id));
+        }
         let manager = Self::session_manager()
             .ok_or_else(|| AcpError::internal("no Codewhale session store is available"))?;
         let saved = manager
-            .load_session_by_prefix(&session_id)
+            .resume_session_by_prefix(&session_id)
             .map_err(|error| {
                 AcpError::invalid_params(format!("could not load session {session_id}: {error}"))
-            })?;
+            })?
+            .session;
 
         let cwd = saved.metadata.workspace.clone();
         let tool_registry = Arc::new(build_acp_tool_registry(
@@ -1598,6 +1628,15 @@ impl AcpServer {
             self.client_supports_terminal,
         ));
         let resolved_id = saved.metadata.id.clone();
+        // A short prefix can resolve to an id this connection already
+        // tracks: the in-memory fast path above checked the prefix, not the
+        // resolved id. Pushing again would duplicate the id in
+        // `insertion_order` while `sessions.insert` merely overwrites, and a
+        // later capacity eviction would then pop the stale front copy and
+        // remove a live, recently reloaded session (#6245).
+        if self.sessions.contains_key(&resolved_id) {
+            return Ok(self.session_configuration(&resolved_id));
+        }
         if self.sessions.len() >= MAX_ACP_SESSIONS
             && let Some(oldest) = self.insertion_order.pop_front()
         {
@@ -1909,7 +1948,7 @@ impl AcpServer {
             .unwrap_or("");
         let route = crate::resolve_cli_auto_route(config, selected_model, last_user_text).await?;
         let execution_config = crate::config_for_cli_route(config, &route);
-        let client = DeepSeekClient::new(&execution_config)?;
+        let client = CodewhaleClient::new(&execution_config)?;
         let model = route.model;
         let request_route = client.effective_route_envelope(&model, chrono::Utc::now());
         let reasoning_effort = route
@@ -1917,7 +1956,7 @@ impl AcpServer {
             .and_then(|effort| {
                 effort.api_value_for_route(
                     execution_config.api_provider(),
-                    &execution_config.deepseek_base_url(),
+                    &execution_config.active_route_base_url(),
                     &model,
                 )
             })
@@ -2056,6 +2095,7 @@ fn build_acp_system_prompt(
             verbosity: config.verbosity.as_deref(),
             skills_scan_codewhale_only: config.skills_config().scan_codewhale_only(),
             plugin_registry: None,
+            recovery_hint: None,
             mode: acp_mode(config),
         },
         crate::prompts::PromptHost::Headless,
@@ -2067,6 +2107,23 @@ fn acp_mode(config: &Config) -> AppMode {
         AppMode::Plan
     } else {
         AppMode::Agent
+    }
+}
+
+/// Approval posture for ACP turns, derived from server config instead of
+/// hardcoded: `--yolo` resolves to Bypass so an unattended headless session
+/// actually executes tools (#6337); otherwise the configured approval policy,
+/// else the Suggest default. Plan mode still pins read-only downstream
+/// regardless of posture.
+fn acp_approval_mode(config: &Config) -> ApprovalMode {
+    if config.yolo.unwrap_or(false) {
+        ApprovalMode::Bypass
+    } else {
+        config
+            .approval_policy
+            .as_deref()
+            .and_then(ApprovalMode::from_config_value)
+            .unwrap_or_default()
     }
 }
 
@@ -2118,7 +2175,7 @@ fn build_acp_tool_registry(
     };
     let sandbox_policy = crate::core::authority::sandbox_policy_for_turn(
         acp_mode(config),
-        ApprovalMode::Suggest,
+        acp_approval_mode(config),
         config.sandbox_mode.as_deref(),
         workspace,
         crate::core::authority::SandboxNetworkAccess::from_config(config.sandbox_network_access),
@@ -2748,6 +2805,77 @@ mod tests {
         assert_eq!(no_id.expect_err("missing sessionId").code, -32602);
     }
 
+    /// #6245: reloading a tracked session by a short prefix must not push a
+    /// duplicate `insertion_order` entry. The duplicate made the deque
+    /// disagree with `sessions`, so a later capacity eviction popped the
+    /// stale front copy of a just-reloaded session and removed a live
+    /// conversation.
+    #[tokio::test]
+    async fn loading_a_tracked_session_by_prefix_does_not_duplicate_ordering() {
+        let _guard = crate::test_support::lock_test_env();
+        let home = tempfile::TempDir::new().expect("isolated codewhale home");
+        let _home_guard =
+            crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", home.path().as_os_str());
+
+        let workspace = home.path().join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        let saved = crate::session_manager::create_saved_session(
+            &[Message {
+                role: Role::User,
+                content: vec![ContentBlock::Text {
+                    text: "reload me by prefix".to_string(),
+                    cache_control: None,
+                }],
+            }],
+            "deepseek-v4-flash",
+            &workspace,
+            42,
+            None,
+        );
+        let saved_id = saved.metadata.id.clone();
+        let manager = crate::session_manager::SessionManager::new(
+            crate::session_manager::default_sessions_dir().expect("sessions dir"),
+        )
+        .expect("session manager");
+        manager.save_session(&saved).expect("save fixture session");
+
+        let mut server = AcpServer::new(
+            Config::default(),
+            "deepseek-v4-flash".to_string(),
+            workspace.clone(),
+        );
+
+        // Load by the full id first: the session becomes tracked exactly once.
+        let loaded = server
+            .load_session(json!({ "sessionId": saved_id }))
+            .expect("load by full id");
+        assert_eq!(loaded["sessionId"], saved_id);
+
+        // A prefix resolving to the same tracked id must be idempotent, not
+        // a second insertion.
+        let prefix: String = saved_id.chars().take(8).collect();
+        let reloaded = server
+            .load_session(json!({ "sessionId": prefix }))
+            .expect("load by prefix");
+        assert_eq!(reloaded["sessionId"], saved_id);
+
+        assert_eq!(server.sessions.len(), 1);
+        assert_eq!(
+            server.insertion_order.len(),
+            server.sessions.len(),
+            "a prefix reload of a tracked session must not duplicate the ordering entry"
+        );
+        assert_eq!(
+            server
+                .insertion_order
+                .iter()
+                .filter(|id| *id == &saved_id)
+                .count(),
+            1,
+            "the ordering deque holds the tracked id exactly once"
+        );
+    }
+
     #[tokio::test]
     async fn standard_session_configuration_is_offered_and_scoped_to_one_session() {
         let workspace = tempfile::tempdir().unwrap();
@@ -2865,6 +2993,75 @@ mod tests {
         assert!(
             matches!(outcome, Err(ToolError::PermissionDenied { .. })),
             "the shared authority must reject mutation: {outcome:?}"
+        );
+        assert!(!target.exists());
+    }
+
+    #[test]
+    fn acp_approval_mode_derives_from_server_config() {
+        // #6337: `--yolo --danger-full-access` must not silently run as Ask.
+        let yolo = Config {
+            yolo: Some(true),
+            ..Config::default()
+        };
+        assert_eq!(acp_approval_mode(&yolo), ApprovalMode::Bypass);
+        let policy = Config {
+            approval_policy: Some("never".into()),
+            ..Config::default()
+        };
+        assert_eq!(acp_approval_mode(&policy), ApprovalMode::Never);
+        assert_eq!(acp_approval_mode(&Config::default()), ApprovalMode::Suggest);
+    }
+
+    #[test]
+    fn yolo_admission_auto_executes_write_without_permission_round_trip() {
+        // #6337: an unattended `--yolo` session must execute tools instead of
+        // stalling on permission requests no headless client answers.
+        let (dir, registry) = workspace_registry();
+        let config = Config {
+            yolo: Some(true),
+            ..Config::default()
+        };
+        let call = pending_call(
+            "File",
+            json!({"action": "write", "path": "yolo.txt", "content": "yolo"}),
+        );
+        let (_, admission) = prepare_acp_tool_admission(&config, &registry, &call).unwrap();
+        assert_eq!(admission, AcpToolAdmission::Auto);
+        assert_eq!(registry.context().workspace, dir.path());
+    }
+
+    #[test]
+    fn default_admission_still_requests_permission_for_write() {
+        // Pins the Ask default the yolo test above contrasts with: without
+        // `--yolo`, a write surfaces a permission request to the client.
+        let (_dir, registry) = workspace_registry();
+        let call = pending_call(
+            "File",
+            json!({"action": "write", "path": "ask.txt", "content": "ask"}),
+        );
+        let (_, admission) =
+            prepare_acp_tool_admission(&Config::default(), &registry, &call).unwrap();
+        assert!(matches!(admission, AcpToolAdmission::RequestPermission(_)));
+    }
+
+    #[tokio::test]
+    async fn plan_mode_stays_read_only_under_yolo() {
+        // The posture derivation must never loosen the Plan guardrail.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = Config {
+            yolo: Some(true),
+            sandbox_mode: Some("read-only".into()),
+            ..Config::default()
+        };
+        let registry = build_acp_tool_registry(&config, dir.path(), false);
+        let target = dir.path().join("must-not-exist.txt");
+        let outcome = registry
+            .execute_full("write", json!({"path": target, "content": "x"}))
+            .await;
+        assert!(
+            matches!(outcome, Err(ToolError::PermissionDenied { .. })),
+            "Plan stays read-only under yolo: {outcome:?}"
         );
         assert!(!target.exists());
     }
@@ -3129,6 +3326,60 @@ mod tests {
         let session_id = result["sessionId"].as_str().expect("session id");
         let session = server.sessions.get(session_id).expect("session exists");
         assert!(session.messages.is_empty());
+    }
+
+    /// #6174: an ACP client has no id for a session it just created other than
+    /// the one `session/new` returned, so that id must be loadable. It used to
+    /// come back `codewhale-<uuid>` — a namespace `session/load` did not
+    /// understand and the durable store never held — and replaying it, which is
+    /// the normal client behaviour, failed with `-32602`.
+    #[test]
+    fn session_new_returns_an_id_that_session_load_resolves() {
+        let mut server = AcpServer::new(
+            Config::default(),
+            "test-model".to_string(),
+            PathBuf::from("/tmp"),
+        );
+        let created = server
+            .new_session(json!({ "cwd": "/tmp" }))
+            .expect("new session");
+        let session_id = created["sessionId"]
+            .as_str()
+            .expect("session id")
+            .to_string();
+
+        // The id is in the one namespace every method understands: the bare
+        // uuid shape `session/list` advertises for durable sessions.
+        assert!(
+            !session_id.starts_with("codewhale-"),
+            "session/new must not mint a prefixed id, got {session_id}"
+        );
+        uuid::Uuid::parse_str(&session_id)
+            .unwrap_or_else(|e| panic!("session/new must mint a bare uuid, got {session_id}: {e}"));
+
+        // Replaying that exact id resolves, and resolves to the same session.
+        let loaded = server
+            .load_session(json!({ "sessionId": session_id }))
+            .expect("session/load must resolve an id session/new returned");
+        assert_eq!(loaded["sessionId"].as_str(), Some(session_id.as_str()));
+    }
+
+    /// The memory hit must not paper over a genuinely unknown id: that still
+    /// has to reach the durable store and fail there.
+    #[test]
+    fn session_load_still_rejects_an_id_no_one_minted() {
+        let mut server = AcpServer::new(
+            Config::default(),
+            "test-model".to_string(),
+            PathBuf::from("/tmp"),
+        );
+        let unknown = uuid::Uuid::new_v4().to_string();
+        assert!(
+            server
+                .load_session(json!({ "sessionId": unknown }))
+                .is_err(),
+            "an id from no namespace must not resolve"
+        );
     }
 
     #[test]
@@ -3821,7 +4072,7 @@ mod tests {
         );
         let text = crate::prompts::system_prompt_flat_text(&prompt);
 
-        assert!(text.contains(crate::prompts::text::HEADLESS_BASE_PROMPT.trim()));
+        assert!(text.contains(crate::prompts::text::BASE_PROMPT.trim()));
         assert!(text.contains("acp-project-marker"));
         assert!(text.contains("acp-config-marker"));
         assert!(!text.contains("You are a coding assistant inside an ACP-compatible editor."));

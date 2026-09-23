@@ -467,8 +467,16 @@ pub fn model_reasoning_capability(model: &str) -> Option<bool> {
     if canonical_official_deepseek_model_id(&lower).is_some() {
         return Some(true);
     }
-    // Remaining prefix/list arms have no catalog row yet. They stay until
-    // each family is fully sourced (#6032 part 2). Do not invent rows.
+    // Bundled Models.dev snapshot (#6032): sourced `reasoning` booleans for
+    // ids the offline catalog does not carry. Exact-id rows only — the
+    // resolver never guesses from a prefix.
+    if let Some(reasoning) =
+        codewhale_config::catalog::bundled_models_dev_catalog().reasoning_support(&lower)
+    {
+        return Some(reasoning);
+    }
+    // Remaining prefix/list arms have no bundled-catalog row yet. They stay
+    // until each family is fully sourced (#6032 part 2). Do not invent rows.
     if lower.starts_with("kimi-") {
         return Some(true);
     }
@@ -499,22 +507,14 @@ pub fn model_reasoning_capability(model: &str) -> Option<bool> {
             | "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free"
             | "nvidia/nemotron-3-ultra-550b-a55b"
             | "nvidia/nemotron-3-ultra-550b-a55b:free"
-            | "qwen/qwen3.8-flash"
-            | "qwen/qwen3.6-35b-a3b"
             | "qwen/qwen3.6-max-preview"
             | "qwen/qwen3.6-27b"
-            | "qwen/qwen3.6-plus"
-            | "qwen/qwen3.7-plus"
             | "tencent/hy3-preview"
             | "xiaomi/mimo-v2.5-pro"
             | "xiaomi/mimo-v2.5"
             | "z-ai/glm-5.1"
             | "z-ai/glm-5-turbo"
-            | "glm-5.1"
             | "glm-5-turbo"
-            | "grok-4.6"
-            | "grok-4.5"
-            | "grok-4.3"
             | "grok-build"
             | "grok-4.20-0309-reasoning"
     ) || is_openai_gpt_55_api_model(&lower)
@@ -853,6 +853,144 @@ mod tests {
         }
     }
 
+    /// #6032 part 3: the eight literal arms deleted in favor of the bundled
+    /// Models.dev snapshot. Each id's `reasoning` bool is sourced there (all
+    /// `true`), so they must keep answering without a heuristic arm — if a
+    /// row is dropped from the asset, this fails loudly instead of silently
+    /// reverting them to "reasoning not expected" (#6044).
+    #[test]
+    fn models_dev_bundled_asset_covers_the_arms_deleted_from_the_heuristic_pile() {
+        let catalog = codewhale_config::catalog::bundled_models_dev_catalog();
+        let deleted = [
+            "qwen/qwen3.8-flash",
+            "qwen/qwen3.6-35b-a3b",
+            "qwen/qwen3.6-plus",
+            "qwen/qwen3.7-plus",
+            "glm-5.1",
+            "grok-4.6",
+            "grok-4.5",
+            "grok-4.3",
+        ];
+        for model in deleted {
+            assert_eq!(
+                catalog.reasoning_support(model),
+                Some(true),
+                "{model} lost its bundled Models.dev row — restore the row or put \
+                 its heuristic arm back (#6032)"
+            );
+            assert!(
+                model_supports_reasoning(model),
+                "{model} must still classify as reasoning-capable"
+            );
+        }
+    }
+
+    /// #6032 part 3 coverage guard: every literal arm remaining in the
+    /// heuristic pile must be an id the bundled Models.dev snapshot does NOT
+    /// source, so the pile can only shrink as sourcing grows. If this fails,
+    /// the named arm is now redundant (or disagrees with the asset) — delete
+    /// it, do not widen it.
+    ///
+    /// Still unsourced/unknown as of 2026-09-15:
+    /// - the literal list below (OpenRouter-style vendor ids for Gemma,
+    ///   Kimi, MiniMax, Nemotron, Qwen, Hunyuan, MiMo, GLM, Grok families);
+    /// - the `kimi-` / `mistral-medium` / `mistral-small` / `magistral`
+    ///   prefix arms (no asset row states any Mistral-family fact at all);
+    /// - `is_openai_gpt_55_api_model` / `is_openai_gpt_56_api_model` /
+    ///   `is_openai_codex_model`, which must stay for their date-snapshot
+    ///   and chatgpt/codex variants (`gpt-5.5-2026-06-01`,
+    ///   `codex-gpt-5.5-preview`, …) that the asset does not enumerate.
+    #[test]
+    fn remaining_reasoning_heuristic_arms_are_unsourced_in_models_dev_bundled_asset() {
+        let catalog = codewhale_config::catalog::bundled_models_dev_catalog();
+        let remaining = [
+            "arcee-ai/trinity-large-thinking",
+            "thinkingmachines/inkling",
+            "google/gemma-4-31b-it",
+            "google/gemma-4-31b-it:free",
+            "google/gemma-4-26b-a4b-it",
+            "google/gemma-4-26b-a4b-it:free",
+            "moonshotai/kimi-k2.7-code-highspeed",
+            "moonshotai/kimi-k2.6",
+            "moonshotai/kimi-k2.6:free",
+            "minimax-m3",
+            "minimax-m2.7-highspeed",
+            "minimax-m2.5",
+            "minimax-m2.5-highspeed",
+            "minimax-m2.1",
+            "minimax-m2.1-highspeed",
+            "minimax-m2",
+            "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free",
+            "nvidia/nemotron-3-ultra-550b-a55b",
+            "nvidia/nemotron-3-ultra-550b-a55b:free",
+            "qwen/qwen3.6-max-preview",
+            "qwen/qwen3.6-27b",
+            "tencent/hy3-preview",
+            "xiaomi/mimo-v2.5-pro",
+            "xiaomi/mimo-v2.5",
+            "z-ai/glm-5.1",
+            "z-ai/glm-5-turbo",
+            "glm-5-turbo",
+            "grok-build",
+            "grok-4.20-0309-reasoning",
+        ];
+        for model in remaining {
+            assert_eq!(
+                catalog.reasoning_support(model),
+                None,
+                "{model} is now sourced by the bundled Models.dev asset — delete \
+                 its heuristic arm instead of keeping both (#6032)"
+            );
+            assert_eq!(
+                model_reasoning_capability(model),
+                Some(true),
+                "{model} must still classify as reasoning-capable via the pile"
+            );
+        }
+        // The prefix/function arms are not enumerable literals, so the guard
+        // samples both directions: asset rows they overlap must agree with
+        // the arm's claim (`true`), and unsourced variants that still need
+        // the arm must stay unknown in the asset.
+        for sourced_and_agreeing in [
+            "kimi-k2.6",
+            "kimi-k2.7-code",
+            "kimi-k2.7-code-highspeed",
+            "kimi-k3",
+            "gpt-5.5",
+            "gpt-5.5-pro",
+            "gpt-5.6",
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-5.6-luna",
+            "gpt-5.3-codex",
+        ] {
+            assert_eq!(
+                catalog.reasoning_support(sourced_and_agreeing),
+                Some(true),
+                "{sourced_and_agreeing} now disagrees with its heuristic arm — \
+                 resolve the source before shipping (#6032)"
+            );
+        }
+        for still_arm_only in [
+            "kimi-k2.9",
+            "mistral-medium-latest",
+            "mistral-small-latest",
+            "magistral-medium",
+            "gpt-5.5-2026-06-01",
+            "gpt-5.1-codex-max",
+            "codex-gpt-5.5-preview",
+            "chatgpt-gpt-5.5",
+        ] {
+            assert_eq!(
+                catalog.reasoning_support(still_arm_only),
+                None,
+                "{still_arm_only} is now sourced — its heuristic arm family may \
+                 be shrinkable (#6032)"
+            );
+            assert!(model_supports_reasoning(still_arm_only));
+        }
+    }
+
     #[test]
     fn output_limit_stop_reason_accepts_provider_aliases_only() {
         for reason in [
@@ -1100,6 +1238,27 @@ mod tests {
         for model in ["fugu-ultra", "fugu-ultra-20260615"] {
             assert_eq!(context_window_for_model(model), Some(1_000_000), "{model}");
             assert_eq!(max_output_tokens_for_model(model), Some(131_000), "{model}");
+        }
+    }
+
+    #[test]
+    fn stepfun_current_coding_models_have_verified_metadata() {
+        assert_eq!(context_window_for_model("step-5-preview"), Some(1_000_000));
+        assert_eq!(
+            max_output_tokens_for_model("step-5-preview"),
+            Some(1_000_000)
+        );
+        for model in [
+            "step-5-preview",
+            "step-3.7-flash",
+            "step-3.5-flash",
+            "step-3.5-flash-2603",
+        ] {
+            assert!(model_supports_reasoning(model), "{model}");
+        }
+        for model in ["step-3.5-flash", "step-3.5-flash-2603"] {
+            assert_eq!(context_window_for_model(model), Some(256_000));
+            assert_eq!(max_output_tokens_for_model(model), None);
         }
     }
 

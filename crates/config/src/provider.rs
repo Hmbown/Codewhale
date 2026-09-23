@@ -9,15 +9,16 @@ use super::{
     DEFAULT_ANTIGRAVITY_BASE_URL, DEFAULT_ANTIGRAVITY_MODEL, DEFAULT_ARCEE_BASE_URL,
     DEFAULT_ARCEE_MODEL, DEFAULT_ATLASCLOUD_BASE_URL, DEFAULT_ATLASCLOUD_MODEL,
     DEFAULT_CODEWHALE_BASE_URL, DEFAULT_CODEWHALE_MODEL, DEFAULT_CONCENTRATE_BASE_URL,
-    DEFAULT_CONCENTRATE_MODEL, DEFAULT_DEEPINFRA_BASE_URL, DEFAULT_DEEPINFRA_MODEL,
-    DEFAULT_DEEPSEEK_ANTHROPIC_BASE_URL, DEFAULT_DEEPSEEK_ANTHROPIC_MODEL,
-    DEFAULT_DEEPSEEK_BASE_URL, DEFAULT_DEEPSEEK_MODEL, DEFAULT_EDENAI_BASE_URL,
-    DEFAULT_EDENAI_MODEL, DEFAULT_FIREWORKS_BASE_URL, DEFAULT_FIREWORKS_MODEL,
-    DEFAULT_GOOGLE_BASE_URL, DEFAULT_GOOGLE_MODEL, DEFAULT_HUGGINGFACE_BASE_URL,
-    DEFAULT_HUGGINGFACE_MODEL, DEFAULT_LONGCAT_BASE_URL, DEFAULT_LONGCAT_MODEL,
-    DEFAULT_META_BASE_URL, DEFAULT_META_MODEL, DEFAULT_MINIMAX_ANTHROPIC_BASE_URL,
-    DEFAULT_MINIMAX_BASE_URL, DEFAULT_MINIMAX_MODEL, DEFAULT_MISTRAL_BASE_URL,
-    DEFAULT_MISTRAL_MODEL, DEFAULT_MODELSTUDIO_CODING_PLAN_BASE_URL,
+    DEFAULT_CONCENTRATE_MODEL, DEFAULT_CSDN_BASE_URL, DEFAULT_CSDN_MODEL,
+    DEFAULT_DEEPINFRA_BASE_URL, DEFAULT_DEEPINFRA_MODEL, DEFAULT_DEEPSEEK_ANTHROPIC_BASE_URL,
+    DEFAULT_DEEPSEEK_ANTHROPIC_MODEL, DEFAULT_DEEPSEEK_BASE_URL, DEFAULT_DEEPSEEK_MODEL,
+    DEFAULT_EDENAI_BASE_URL, DEFAULT_EDENAI_MODEL, DEFAULT_FIREWORKS_BASE_URL,
+    DEFAULT_FIREWORKS_MODEL, DEFAULT_GOOGLE_BASE_URL, DEFAULT_GOOGLE_MODEL,
+    DEFAULT_HUGGINGFACE_BASE_URL, DEFAULT_HUGGINGFACE_MODEL, DEFAULT_LONGCAT_BASE_URL,
+    DEFAULT_LONGCAT_MODEL, DEFAULT_META_BASE_URL, DEFAULT_META_MODEL,
+    DEFAULT_MINIMAX_ANTHROPIC_BASE_URL, DEFAULT_MINIMAX_BASE_URL, DEFAULT_MINIMAX_MODEL,
+    DEFAULT_MISTRAL_BASE_URL, DEFAULT_MISTRAL_MODEL, DEFAULT_MODELSCOPE_BASE_URL,
+    DEFAULT_MODELSCOPE_MODEL, DEFAULT_MODELSTUDIO_CODING_PLAN_BASE_URL,
     DEFAULT_MODELSTUDIO_TOKEN_PLAN_BASE_URL, DEFAULT_MODELSTUDIO_TOKEN_PLAN_MODEL,
     DEFAULT_MOONSHOT_BASE_URL, DEFAULT_MOONSHOT_MODEL, DEFAULT_NOVITA_BASE_URL,
     DEFAULT_NOVITA_MODEL, DEFAULT_NVIDIA_NIM_BASE_URL, DEFAULT_NVIDIA_NIM_MODEL,
@@ -35,8 +36,9 @@ use super::{
     DEFAULT_VOLCENGINE_BASE_URL, DEFAULT_VOLCENGINE_MODEL, DEFAULT_WANJIE_ARK_BASE_URL,
     DEFAULT_WANJIE_ARK_MODEL, DEFAULT_XAI_BASE_URL, DEFAULT_XAI_MODEL,
     DEFAULT_XIAOMI_MIMO_BASE_URL, DEFAULT_XIAOMI_MIMO_MODEL, DEFAULT_ZAI_BASE_URL,
-    DEFAULT_ZAI_MODEL, MODELSTUDIO_CODING_PLAN_ANTHROPIC_BASE_URL,
-    MODELSTUDIO_TOKEN_PLAN_ANTHROPIC_BASE_URL, ProviderKind,
+    DEFAULT_ZAI_MODEL, DEFAULT_ZENMUX_BASE_URL, DEFAULT_ZENMUX_MODEL,
+    MODELSTUDIO_CODING_PLAN_ANTHROPIC_BASE_URL, MODELSTUDIO_TOKEN_PLAN_ANTHROPIC_BASE_URL,
+    ProviderKind,
 };
 
 /// Wire protocol spoken by a provider.
@@ -371,6 +373,12 @@ pub const fn credential_help(kind: ProviderKind) -> CredentialHelp {
             docs_url: Some("https://huggingface.co/docs/hub/en/security-tokens"),
             guidance: "Create a scoped Hugging Face access token.",
         },
+        ProviderKind::Modelscope => CredentialHelp {
+            acquisition: ApiKey,
+            credential_url: Some("https://modelscope.cn/my/settings/token"),
+            docs_url: None,
+            guidance: "Create an SDK token in ModelScope account settings.",
+        },
         ProviderKind::Together => CredentialHelp {
             acquisition: ApiKey,
             credential_url: Some("https://api.together.ai/settings/api-keys"),
@@ -480,6 +488,18 @@ pub const fn credential_help(kind: ProviderKind) -> CredentialHelp {
             credential_url: Some("https://app.edenai.run/settings/api-keys"),
             docs_url: Some("https://www.edenai.co/docs"),
             guidance: "Create an Eden AI API key from the Eden AI dashboard, then select models by their provider/model namespaced id.",
+        },
+        ProviderKind::Zenmux => CredentialHelp {
+            acquisition: ApiKey,
+            credential_url: Some("https://zenmux.ai/platform/pay-as-you-go"),
+            docs_url: Some("https://zenmux.ai/docs/"),
+            guidance: "Create a ZenMux API key from the Pay As You Go management page, then select models by their provider/model namespaced id. The catalog at https://zenmux.ai/api/v1/models is keyless-readable.",
+        },
+        ProviderKind::Csdn => CredentialHelp {
+            acquisition: ApiKey,
+            credential_url: Some("https://ai.csdn.net/workbench/api-key"),
+            docs_url: Some("https://ai.csdn.net/coding-plan"),
+            guidance: "Create an API key in the CSDN console — choose the Coding Plan key type so glm_for_coding calls bill against plan quota; a general key bills metered.",
         },
         ProviderKind::Codewhale => CredentialHelp {
             acquisition: ApiKey,
@@ -643,6 +663,18 @@ pub fn is_exact_minimax_anthropic_route(kind: ProviderKind, base_url: &str) -> b
     kind == ProviderKind::MinimaxAnthropic
         && (is_exact_https_route(base_url, "api.minimax.io", "anthropic")
             || is_exact_https_route(base_url, "api.minimaxi.com", "anthropic"))
+}
+
+/// Whether a configured route is exactly CSDN 星图's official OpenAI-compatible
+/// platform endpoint.
+///
+/// Coding Plan keys and general marketplace keys share this one endpoint, so
+/// the URL proves neither product — only that the route is first-party.
+/// Neighboring paths, HTTP downgrades, and lookalike hosts must not inherit
+/// CSDN billing or wire semantics.
+#[must_use]
+pub fn is_exact_csdn_platform_route(kind: ProviderKind, base_url: &str) -> bool {
+    kind == ProviderKind::Csdn && is_exact_https_route(base_url, "ai.csdn.net", "api/model/v1")
 }
 
 /// Return credential help for one concrete provider route.
@@ -1069,6 +1101,17 @@ provider!(
     aliases: ["hugging-face", "hugging_face", "hf"]
 );
 provider!(
+    Modelscope,
+    Modelscope,
+    "modelscope",
+    "ModelScope",
+    DEFAULT_MODELSCOPE_BASE_URL,
+    DEFAULT_MODELSCOPE_MODEL,
+    ["MODELSCOPE_API_KEY"],
+    "modelscope",
+    aliases: ["model-scope", "model_scope", "modelscope-cn", "modelscope_cn"]
+);
+provider!(
     Together,
     Together,
     "together",
@@ -1432,8 +1475,9 @@ impl Provider for OpencodeZen {
 /// scope. The account's authenticated `GET {base}/models` is the catalog
 /// authority: each row is `provider/model` and carries the protocol
 /// (`chat-completions` → `{base}/chat/completions`, `anthropic-messages` →
-/// `{base}/messages`). Both protocols authenticate with `Authorization:
-/// Bearer`; the Anthropic passthrough deliberately does not take `x-api-key`.
+/// `{base}/messages`, `responses` → `{base}/responses`). Every protocol
+/// authenticates with `Authorization: Bearer`; the Anthropic passthrough
+/// deliberately does not take `x-api-key`.
 pub struct Codewhale;
 
 impl Provider for Codewhale {
@@ -1531,6 +1575,34 @@ provider!(
     ["EDENAI_API_KEY"],
     "edenai",
     aliases: ["eden-ai", "eden_ai"]
+);
+provider!(
+    Zenmux,
+    Zenmux,
+    "zenmux",
+    "ZenMux",
+    DEFAULT_ZENMUX_BASE_URL,
+    DEFAULT_ZENMUX_MODEL,
+    ["ZENMUX_API_KEY"],
+    "zenmux",
+    aliases: ["zen-mux", "zen_mux"]
+);
+provider!(
+    Csdn,
+    Csdn,
+    "csdn",
+    "CSDN",
+    DEFAULT_CSDN_BASE_URL,
+    DEFAULT_CSDN_MODEL,
+    ["CSDN_API_KEY"],
+    "csdn",
+    aliases: [
+        "csdn-ai",
+        "csdn_ai",
+        "csdn-coding-plan",
+        "csdn_coding_plan",
+        "starmap"
+    ]
 );
 
 /// Concentrate — OpenAI Responses-compatible AI gateway (aggregator).
@@ -1855,6 +1927,7 @@ static VLLM: Vllm = Vllm;
 static OLLAMA: Ollama = Ollama;
 static OLLAMA_CLOUD: OllamaCloud = OllamaCloud;
 static HUGGINGFACE: Huggingface = Huggingface;
+static MODELSCOPE: Modelscope = Modelscope;
 static TOGETHER: Together = Together;
 static QIANFAN: Qianfan = Qianfan;
 static OPENAI_CODEX: OpenaiCodex = OpenaiCodex;
@@ -1875,6 +1948,8 @@ static MISTRAL: Mistral = Mistral;
 static ANTIGRAVITY: Antigravity = Antigravity;
 static TELECOMJS: Telecomjs = Telecomjs;
 static EDENAI: Edenai = Edenai;
+static ZENMUX: Zenmux = Zenmux;
+static CSDN: Csdn = Csdn;
 static CONCENTRATE: Concentrate = Concentrate;
 static CODEWHALE: Codewhale = Codewhale;
 static MODELSTUDIO_TOKEN_PLAN: ModelstudioTokenPlan = ModelstudioTokenPlan;
@@ -1885,7 +1960,7 @@ static MODELSTUDIO_CODING_PLAN_ANTHROPIC: ModelstudioCodingPlanAnthropic =
     ModelstudioCodingPlanAnthropic;
 static CUSTOM: Custom = Custom;
 
-static PROVIDER_REGISTRY: [&dyn Provider; 49] = [
+static PROVIDER_REGISTRY: [&dyn Provider; 52] = [
     &DEEPSEEK,
     &DEEPSEEK_ANTHROPIC,
     &NVIDIA_NIM,
@@ -1907,6 +1982,7 @@ static PROVIDER_REGISTRY: [&dyn Provider; 49] = [
     &OLLAMA,
     &OLLAMA_CLOUD,
     &HUGGINGFACE,
+    &MODELSCOPE,
     &TOGETHER,
     &QIANFAN,
     &OPENAI_CODEX,
@@ -1926,6 +2002,8 @@ static PROVIDER_REGISTRY: [&dyn Provider; 49] = [
     &MISTRAL,
     &TELECOMJS,
     &EDENAI,
+    &ZENMUX,
+    &CSDN,
     &CONCENTRATE,
     &CODEWHALE,
     &MODELSTUDIO_TOKEN_PLAN,

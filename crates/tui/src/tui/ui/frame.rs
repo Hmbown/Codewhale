@@ -166,7 +166,7 @@ pub(crate) fn info_segments(app: &App, width: u16) -> Vec<InfoSegment> {
                     .map(|field| field.text.as_str())
                     .collect::<Vec<_>>()
                     .join(ROUTE_FIELD_JOIN),
-                ChromeInk::Identity,
+                ChromeInk::MetadataValue,
             ));
         }
     }
@@ -271,7 +271,7 @@ pub(crate) fn info_segments(app: &App, width: u16) -> Vec<InfoSegment> {
     // The DeepSeek-harness session metrics, from the same accumulators
     // `/cost` prints: nothing here is estimated except the live stream's
     // running token count, which the provider's receipt replaces.
-    if shows(StatusItem::SessionMetrics)
+    if (shows(StatusItem::SessionMetrics) || shows(StatusItem::Ttft))
         && let Some(ttft) = app.session_metrics.ttft_average()
     {
         segments.push(InfoSegment::new(
@@ -281,7 +281,7 @@ pub(crate) fn info_segments(app: &App, width: u16) -> Vec<InfoSegment> {
             ChromeInk::MetadataValue,
         ));
     }
-    if shows(StatusItem::SessionMetrics)
+    if (shows(StatusItem::SessionMetrics) || shows(StatusItem::OutputRate))
         && let Some(rate) = app.session_metrics.tokens_per_second()
     {
         segments.push(InfoSegment::new(
@@ -433,6 +433,12 @@ fn render_info_row(
         app.viewport.last_infoline_hitboxes.clear();
         return InfoLineInteractionHitboxes::default();
     }
+    // The two bottom rows share the composer's one-cell inset. Paint the
+    // full band before insetting so hover/click geometry uses the same area.
+    Block::default()
+        .style(Style::default().bg(app.ui_theme.header_bg))
+        .render(area, f.buffer_mut());
+    let area = area.inner(ratatui::layout::Margin::new(u16::from(area.width >= 8), 0));
     let mut segments = info_segments(app, area.width);
     if identity_only {
         segments.retain(|segment| {
@@ -545,7 +551,7 @@ fn register_clickable_chrome_for_hover(app: &App) {
         );
     }
 
-    // The composer's `[↑]` submit control. It registers only when a click
+    // The composer's `[↵]` submit control. It registers only when a click
     // there would actually send: an affordance that lights up and then does
     // nothing is the same defect as one that acts without lighting up.
     if let Some(composer) = app.viewport.last_composer_area
@@ -837,7 +843,6 @@ pub(crate) async fn build_preview_request_inputs(
         reasoning_effort: app.reasoning_effort,
         mode: app.mode,
         content: &content,
-        display_text: &prompt,
         auto_router_context: &auto_router::recent_auto_router_context(&app.api_messages),
         should_auto_resolve: false,
         allow_auto_router_response_cache: false,
@@ -935,7 +940,6 @@ pub(crate) fn build_engine_config(app: &App, config: &Config) -> EngineConfig {
             },
         ),
         max_spawn_depth: config.subagent_max_spawn_depth_for_provider(provider),
-        subagent_token_budget: config.subagent_token_budget_for_provider(provider),
         allowed_tools: app.active_allowed_tools.clone(),
         disallowed_tools: None,
         max_tool_calls: None,
@@ -985,6 +989,7 @@ pub(crate) fn build_engine_config(app: &App, config: &Config) -> EngineConfig {
         goal_status: app.goal.status,
         goal_max_continuations: config.goal_max_continuations(),
         goal_continuation_delay_seconds: config.goal_continuation_delay_seconds(),
+        goal_enforce_token_budget: config.goal_enforce_token_budget(),
         reasoning_only_max_reprompts: config.reasoning_only_max_reprompts(),
         reasoning_only_reprompt_message: Some(config.reasoning_only_reprompt_message().to_string()),
         locale_tag: app.ui_locale.tag().to_string(),
@@ -1029,6 +1034,13 @@ pub(crate) fn build_app_system_prompt_with_goal(
         &config.memory_path(),
         &app.workspace,
     );
+    // Keep the previewed/rebuilt prompt identical to the engine's: the
+    // recovery hint is part of the prefix when a prior workspace session
+    // ended mid-turn (#5715).
+    let recovery_hint = crate::session_manager::session_recovery_hint(
+        &app.workspace,
+        app.current_session_id.as_deref(),
+    );
     prompts::system_prompt_for_mode_with_context_skills_and_session(
         &app.workspace,
         None,
@@ -1047,6 +1059,7 @@ pub(crate) fn build_app_system_prompt_with_goal(
                 app.active_route_limits,
             )),
             verbosity: app.verbosity.as_deref(),
+            recovery_hint: recovery_hint.as_deref(),
             skills_scan_codewhale_only: app.skills_scan_codewhale_only,
             plugin_registry: Some(app.plugin_registry.as_ref()),
             mode: app.mode,
@@ -1054,6 +1067,11 @@ pub(crate) fn build_app_system_prompt_with_goal(
     )
 }
 
+/// Build the session snapshot every product caller queues into the
+/// persistence actor. Journal-only (#6214 T3): the `messages` projection is
+/// left empty because the queue drops it anyway, and serialization rehydrates
+/// it from the journal — the on-disk bytes are unchanged. Callers must not
+/// read `.messages` off the returned snapshot; save or serialize it.
 pub(crate) fn build_session_snapshot(
     app: &mut App,
     manager: &SessionManager,
@@ -1065,29 +1083,20 @@ pub(crate) fn build_session_snapshot(
             format!("automatic session snapshot skipped while Work state is busy: {err}")
         })?,
     };
-    let mut session = if let Some(existing_id) = app.current_session_id.as_ref() {
-        crate::session_manager::create_saved_session_with_id_mode_and_stamps(
-            existing_id.clone(),
-            &app.api_messages,
-            &app.api_message_stamps,
-            &model,
-            &app.workspace,
-            u64::from(app.session.total_tokens),
-            app.system_prompt.as_ref(),
-            Some(app.mode.as_setting()),
-        )
-    } else {
-        crate::session_manager::create_saved_session_with_id_mode_and_stamps(
-            uuid::Uuid::new_v4().to_string(),
-            &app.api_messages,
-            &app.api_message_stamps,
-            &model,
-            &app.workspace,
-            u64::from(app.session.total_tokens),
-            app.system_prompt.as_ref(),
-            Some(app.mode.as_setting()),
-        )
-    };
+    app.session_journal
+        .rebranch_active_messages_stamped(&app.api_messages, &app.api_message_stamps);
+    let mut session = crate::session_manager::create_saved_session_journal_only(
+        app.current_session_id
+            .clone()
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+        &app.api_messages,
+        app.session_journal.clone(),
+        &model,
+        &app.workspace,
+        u64::from(app.session.total_tokens),
+        app.system_prompt.as_ref(),
+        Some(app.mode.as_setting()),
+    );
     let computed_title = session.metadata.title.clone();
     if let Some(cached) = app
         .current_session_metadata
@@ -1269,16 +1278,24 @@ pub(crate) fn commit_streaming_display_tick(
         return false;
     }
 
+    // Reveal a bounded slice per beat rather than everything received. The
+    // budget is sized from the beat and the backlog, so the displayed pace is a
+    // function of the clock instead of the provider's chunking.
+    let interval = stream_display_clock.interval();
     let mut updated = false;
     if let Some(index) = app.streaming_message_index {
-        let committed = app.streaming_state.commit_text(0);
+        let budget =
+            crate::tui::streaming::reveal_budget(interval, app.streaming_state.pending_len(0));
+        let committed = app.streaming_state.commit_text(0, budget);
         if !committed.is_empty() {
             append_streaming_text(app, index, &committed);
             accrue_streaming_token_estimate(app, &committed);
             updated = true;
         }
     } else if let Some(entry_idx) = app.streaming_thinking_active_entry {
-        let committed = app.streaming_state.commit_text(0);
+        let budget =
+            crate::tui::streaming::reveal_budget(interval, app.streaming_state.pending_len(0));
+        let committed = app.streaming_state.commit_text(0, budget);
         if !committed.is_empty() {
             if app.translation_enabled {
                 streaming_thinking::set_placeholder(app, entry_idx);
@@ -1349,13 +1366,11 @@ pub(crate) fn live_tool_content_is_receipt(content: &str) -> bool {
 
 /// Build the pending-input preview widget from current `App` state.
 ///
-/// v0.6.6 (#122) wires all three buckets:
+/// v0.6.6 (#122) wires the live buckets:
 /// - `pending_steers` — typed during a running turn + Esc; held until the
 ///   abort lands and gets resubmitted as a fresh merged turn.
-/// - `rejected_steers` — engine declined a mid-turn steer (scaffolding;
-///   no engine path produces these yet but the bucket renders with a distinct
-///   rejected-steer label).
-/// - `queued_messages` — Enter while busy; drained at end-of-turn. In Operate,
+/// - `queued_messages` — Enter while busy; drained at end-of-turn. An
+///   unaccepted steer also lands here (#6297) so it is never lost. In Operate,
 ///   the foreground operator dispatches these as additional background tasks.
 pub(crate) fn build_pending_input_preview(app: &App) -> PendingInputPreview {
     let mut preview = PendingInputPreview::new();
@@ -1382,12 +1397,15 @@ pub(crate) fn build_pending_input_preview(app: &App) -> PendingInputPreview {
             }
         })
         .collect();
+    // #6190: a steer the engine has not recorded yet is exactly what this
+    // bucket's "sending into turn" label describes, so it shares it rather
+    // than growing a fourth bucket and a fifteenth locale string.
     preview.pending_steers = app
         .pending_steers
         .iter()
+        .chain(app.inflight_steers.iter().map(|steer| &steer.message))
         .map(|m| m.display.clone())
         .collect();
-    preview.rejected_steers = app.rejected_steers.iter().cloned().collect();
     preview.queued_messages = app
         .queued_messages
         .iter()
@@ -1713,7 +1731,7 @@ pub(crate) fn render(f: &mut Frame, app: &mut App, _config: &Config) -> Option<(
             };
         app.sidebar_hover_tooltip = None;
 
-        if app.agent_focus.is_some() {
+        if app.agent_focus.is_some() && !app.launch.return_to_session {
             // A focused worker's full transcript owns the conversation area;
             // the ocean column and every other shell surface stay as they are.
             //
@@ -1735,6 +1753,14 @@ pub(crate) fn render(f: &mut Frame, app: &mut App, _config: &Config) -> Option<(
             let buf = f.buffer_mut();
             crate::tui::agent_focus::render_focus(app, chat_area, buf);
         } else {
+            if app.launch.visible
+                && !app.launch.return_to_session
+                && app.onboarding == crate::tui::app::OnboardingState::None
+            {
+                app.launch
+                    .mark_reveal_started_at
+                    .get_or_insert_with(std::time::Instant::now);
+            }
             let chat_widget = ChatWidget::new(app, chat_area).with_ocean_viewport(size);
             shell_ocean = chat_widget.ocean_column();
             let buf = f.buffer_mut();
@@ -2112,6 +2138,14 @@ pub(crate) fn transcript_scroll_percent(top: usize, visible: usize, total: usize
 }
 
 pub(crate) fn estimated_context_tokens(app: &App) -> Option<i64> {
+    // ONE estimator: this is `compaction::estimate_input_tokens_for_pressure`
+    // over the same message list (per-message cache, framing included) —
+    // deliberately not the 1.5x conservative variant. The meter, the >=80%
+    // depth warning, and the auto-compact gate must agree about where the
+    // threshold is: the inflated estimate used to show "ctx 82%" while the
+    // gate read ~55% and correctly refused to compact (#6297). The 1.5x
+    // inflation stays where it belongs — request-overflow protection
+    // (`estimate_input_tokens_conservative`).
     let message_count = app.api_messages.len();
     let mut cache = app.context_token_cache.borrow_mut();
     if cache.message_tokens.len() > message_count {
@@ -2129,13 +2163,7 @@ pub(crate) fn estimated_context_tokens(app: &App) -> Option<i64> {
         let last = message_count - 1;
         cache.message_tokens[last] = estimate_tokens(&app.api_messages[last..=last]);
     }
-    let message_tokens = cache
-        .message_tokens
-        .iter()
-        .copied()
-        .sum::<usize>()
-        .saturating_mul(3)
-        .div_ceil(2);
+    let message_tokens = cache.message_tokens.iter().copied().sum::<usize>();
     let system_tokens =
         estimate_input_tokens_conservative(&[], app.system_prompt.as_ref()).saturating_sub(48);
     let estimated = message_tokens
@@ -2231,7 +2259,7 @@ mod tests {
         );
     }
 
-    /// The composer's `[↑]` answered clicks and showed nothing under the
+    /// The composer's `[↵]` answered clicks and showed nothing under the
     /// pointer — the last of the clickable-but-dark controls. It lights up
     /// only when a click there would actually send.
     #[test]
@@ -2381,13 +2409,13 @@ mod tests {
         use codewhale_models::{ContentBlock, Message};
         let mut app =
             crate::test_support::test_app_with_options(crate::test_support::test_tui_options("."));
-        app.api_messages = vec![Message {
+        app.api_messages = std::sync::Arc::new(vec![Message {
             role: codewhale_models::Role::User,
             content: vec![ContentBlock::Text {
                 text: "context ".repeat(400),
                 cache_control: None,
             }],
-        }];
+        }]);
         let (used, _, _) =
             super::context_usage_snapshot(&app).expect("a conversation has a context reading");
         let window = (used as f64 * 100.0 / f64::from(pct)).round().max(1.0);
@@ -2713,6 +2741,53 @@ mod tests {
         assert_eq!(rate(&app).as_deref(), Some("24 avg tok/s"));
         app.status_items = vec![StatusItem::Tokens];
         assert_eq!(rate(&app), None, "the existing status toggle still owns it");
+    }
+
+    #[test]
+    fn default_compact_footer_keeps_measured_performance_at_working_widths() {
+        use ratatui::{Terminal, backend::TestBackend};
+        let mut app = app_with_context_percent(60);
+        app.ui_locale = codewhale_localization::Locale::En;
+        app.status_items = StatusItem::default_footer();
+        app.metrics_line = crate::config::ChromeRowPreset::Compact;
+        app.session_metrics
+            .record_model_call(120, 4_800, Some(1_000), Some(5_000));
+        for width in [80, 100, 140] {
+            let mut terminal = Terminal::new(TestBackend::new(width, 1)).unwrap();
+            terminal
+                .draw(|frame| {
+                    super::render_info_row(frame, &mut app, frame.area(), false);
+                })
+                .unwrap();
+            let row: String = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect();
+            assert!(row.contains("ttft 1.0s"), "{width}: {row}");
+            assert!(row.contains("24 avg tok/s"), "{width}: {row}");
+            assert!(!row.contains("/help"), "{width}: {row}");
+        }
+    }
+
+    #[test]
+    fn performance_readings_can_be_selected_independently() {
+        let mut app = app_with_context_percent(60);
+        app.session_metrics
+            .record_model_call(120, 4_800, Some(1_000), Some(5_000));
+        for (item, expected) in [
+            (StatusItem::Ttft, InfoSegmentId::Ttft),
+            (StatusItem::OutputRate, InfoSegmentId::Rate),
+        ] {
+            app.status_items = vec![item];
+            let ids: Vec<_> = super::info_segments(&app, 80)
+                .into_iter()
+                .map(|s| s.id)
+                .collect();
+            assert_eq!(ids, vec![expected]);
+        }
     }
 
     /// Every remaining status item owns a segment, and an empty list leaves

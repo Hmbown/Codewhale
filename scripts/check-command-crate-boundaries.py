@@ -3,8 +3,11 @@
 
 Enforces the EPIC-006 boundary contract:
 
-1. `codewhale-command-contract` may not transitively depend on
-   `codewhale-tui` (normal edges, via `cargo metadata`).
+1. `codewhale-command-contract` and `codewhale-secrets` may not transitively
+   depend on `codewhale-tui` (normal edges, via `cargo metadata`).
+   `codewhale-secrets` owns the shared output sanitizer that portable command
+   helpers consume (FEAT-025 D4), so it must stay TUI-free before
+   `codewhale-commands` depends on it.
 2. `codewhale-command-contract` source may not import the concrete `App`,
    widget/renderer/view/event-loop surfaces, or `ratatui`/`crossterm`.
 3. No composite `CommandContext` symbol (supertrait/struct/enum) may exist in
@@ -32,6 +35,13 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 CONTRACT_DIR = REPO_ROOT / "crates" / "command-contract" / "src"
 CONTRACT_PACKAGE = "codewhale-command-contract"
 FORBIDDEN_TUI_PACKAGE = "codewhale-tui"
+
+# Workspace packages that must stay free of any (normal) path to the TUI. The
+# contract carries the portable shapes; `codewhale-secrets` owns the shared pure
+# sanitizer those shapes' handlers consume. Both are prerequisites for
+# `codewhale-commands` (FEAT-016/043), so a TUI edge here would silently drag
+# the whole TUI into the extracted command crate.
+TUI_FREE_PACKAGES = (CONTRACT_PACKAGE, "codewhale-secrets")
 
 # Import lines that must never appear in the contract (narrowly scoped: real
 # imports only, comments never match because they do not start with `use`).
@@ -123,24 +133,27 @@ def reaches_tui(package: str, graph: dict[str, set[str]]) -> bool:
 
 
 def check_dependency_graph(graph: dict[str, set[str]]) -> list[BoundaryViolation]:
-    """The prototype contract must not reach codewhale-tui."""
-    if CONTRACT_PACKAGE not in graph:
-        return [
-            BoundaryViolation(
-                "dependency-graph",
-                CONTRACT_PACKAGE,
-                "workspace package missing from the cargo metadata graph",
+    """No TUI-free package may reach codewhale-tui through normal edges."""
+    violations: list[BoundaryViolation] = []
+    for package in TUI_FREE_PACKAGES:
+        if package not in graph:
+            violations.append(
+                BoundaryViolation(
+                    "dependency-graph",
+                    package,
+                    "workspace package missing from the cargo metadata graph",
+                )
             )
-        ]
-    if reaches_tui(CONTRACT_PACKAGE, graph):
-        return [
-            BoundaryViolation(
-                "dependency-graph",
-                CONTRACT_PACKAGE,
-                f"transitively depends on {FORBIDDEN_TUI_PACKAGE}",
+            continue
+        if reaches_tui(package, graph):
+            violations.append(
+                BoundaryViolation(
+                    "dependency-graph",
+                    package,
+                    f"transitively depends on {FORBIDDEN_TUI_PACKAGE}",
+                )
             )
-        ]
-    return []
+    return violations
 
 
 def check_contract_source_text(text: str, display_path: str) -> list[BoundaryViolation]:
@@ -211,8 +224,8 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  {violation}", file=sys.stderr)
         return 1
     print(
-        f"[command-crate-boundaries] PASS: {CONTRACT_PACKAGE} has no "
-        f"{FORBIDDEN_TUI_PACKAGE} edge; "
+        f"[command-crate-boundaries] PASS: "
+        f"{', '.join(TUI_FREE_PACKAGES)} have no {FORBIDDEN_TUI_PACKAGE} edge; "
         "no forbidden import, composite context, or boxed handler in the contract"
     )
     return 0

@@ -112,6 +112,11 @@ test "$CARGO_BUILD_BUILD_DIR" = "$TEST_FIXTURE/outer/home/.cache/codewhale/build
 test "$CARGO_BUILD_BUILD_DIR" = "$CODEWHALE_CACHE_ROOT/build/{workspace-path-hash}"
 printf '%s\n' "$HOME" > "$TEST_FIXTURE/dev-home"
 printf '%s\n' "$@" > "$TEST_FIXTURE/dev-argv"
+# A real libtest run prints this; dev-test.sh refuses a filtered green without
+# it. TEST_CARGO_SILENT drops it so the refusal itself can be exercised.
+if [ -z "${TEST_CARGO_SILENT:-}" ]; then
+  printf '%s\n' 'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s'
+fi
 exit "${TEST_CARGO_STATUS:-0}"
 EOF
 printf '%s\n' '#!/bin/sh' 'printf "%s\n" "commit-hash: synthetic"' > "$fixture/toolchain/rustc"
@@ -212,4 +217,19 @@ win_child_home=$(cat "$fixture/win-child-home")
 test ! -d "${win_child_home%/*}"
 printf '%s\n' 'ok 9 - cygpath path normalization, backslash toolchain resolution and hermetic AppData'
 
-printf '%s\n' 'test result: 9 passed; 0 failed'
+# The guard 8b6dad20e introduced: libtest exits 0 when a filter matches
+# nothing, which has been mistaken for a pass here before. With an explicit
+# filter and no `test result:` line, dev-test.sh must refuse that green.
+status=0
+run_fixture env CODEWHALE_DEV_NEXTEST=0 TEST_CARGO_SILENT=1 \
+  "$repo_root/scripts/dev-test.sh" config 'filter $(matching nothing)' \
+  > "$fixture/dev-output" 2>&1 || status=$?
+test "$status" -ne 0
+grep -q 'refusing green' "$fixture/dev-output"
+# nextest fails loud on an empty selection, so the guard must not wrap it.
+run_fixture env CODEWHALE_DEV_NEXTEST=1 TEST_CARGO_SILENT=1 \
+  "$repo_root/scripts/dev-test.sh" config 'filter $(matching nothing)' \
+  > "$fixture/dev-output" 2>&1
+printf '%s\n' 'ok 10 - a filtered libtest run with no test result refuses green'
+
+printf '%s\n' 'test result: 10 passed; 0 failed'

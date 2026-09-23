@@ -2,6 +2,7 @@ import Link from "next/link";
 import { getFacts } from "@/lib/facts";
 import { buildPageMetadata } from "@/lib/page-meta";
 import { MODELS_COPY } from "@/lib/content/models";
+import { ModelsTable } from "@/components/models-table";
 import type { LocalizedText } from "@/lib/content/vocabulary";
 import { fill, pickText } from "@/lib/i18n/dictionaries";
 
@@ -56,7 +57,18 @@ export default async function ModelsPage({ params }: { params: Promise<{ locale:
         </div>
       </section>
 
-      <section className="portal-section portal-section-muted" aria-labelledby="providers-title">
+      <section className="portal-section portal-section-muted" aria-labelledby="models-title">
+        <div className="portal-container">
+          <div className="portal-docs-heading">
+            <h2 id="models-title">{t(MODELS_COPY.modelsTitle)}</h2>
+            <Link href={providerDocs}>{t(MODELS_COPY.providerDocs)}</Link>
+          </div>
+          <p className="mb-6 max-w-3xl text-ink-soft leading-relaxed">{t(MODELS_COPY.modelsLead)}</p>
+          <ModelsTable models={facts.models} locale={locale} />
+        </div>
+      </section>
+
+      <section className="portal-section" aria-labelledby="providers-title">
         <div className="portal-container">
           <div className="portal-docs-heading">
             <h2 id="providers-title">{t(MODELS_COPY.listTitle)}</h2>

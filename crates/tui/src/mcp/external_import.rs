@@ -1,7 +1,8 @@
 //! Consent-gated external MCP imports.
 //!
 //! Discovery can scan `~/.claude.json`, project `.mcp.json`, and marketplace
-//! manifests, but **nothing is connected until the user approves**. Provenance
+//! manifests. Import approval saves connectors OFF; a separate enable action
+//! is required before any connection. Provenance
 //! (source path + content hash) is shown before import. `enabled=false` and
 //! `disabled=true` on a source entry are hard blocks — those candidates never
 //! become managed connectors even after a blanket approval.
@@ -11,6 +12,7 @@
 //! config write path as `/mcp add`.
 
 use std::collections::HashMap;
+#[cfg(test)]
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -117,35 +119,116 @@ pub fn discover_external_sources(
 }
 
 fn discover_from_json_file(path: &Path, kind: ExternalMcpSourceKind) -> Vec<ImportCandidate> {
-    let Ok(raw) = fs::read(path) else {
-        return Vec::new();
+    checked_source(path, kind).unwrap_or_default()
+}
+
+fn checked_source(
+    path: &Path,
+    kind: ExternalMcpSourceKind,
+) -> anyhow::Result<Vec<ImportCandidate>> {
+    super::validate_mcp_config_path(path)?;
+    let Some(raw) = super::read_mcp_config_file(path)? else {
+        return Ok(Vec::new());
     };
-    let hash = hex_sha256(&raw);
-    let Ok(value) = serde_json::from_slice::<Value>(&raw) else {
-        return Vec::new();
-    };
-    let servers = extract_servers_map(&value);
-    let mut out = Vec::with_capacity(servers.len());
-    for (name, cfg_value) in servers {
-        let Ok(server) = serde_json::from_value::<McpServerConfig>(cfg_value.clone()) else {
-            continue;
-        };
+    let hash = hex_sha256(raw.as_bytes());
+    let value: Value = serde_json::from_str(&raw)
+        .map_err(|_| anyhow::anyhow!("Source is not valid JSON; contents omitted"))?;
+    anyhow::ensure!(
+        value
+            .get("mcpServers")
+            .or_else(|| value.get("servers"))
+            .is_some_and(Value::is_object)
+            || value.is_array(),
+        "Source has no supported MCP server map"
+    );
+    let mut out = Vec::new();
+    for (name, mut config) in extract_servers_map(&value) {
+        anyhow::ensure!(
+            super::mcp_name_is_command_safe(&name) && name.len() <= 128,
+            "Source contains an unsupported server name"
+        );
+        if value.is_array()
+            && let Some(map) = config.as_object_mut()
+        {
+            map.remove("name");
+        }
+        let fields = config
+            .as_object()
+            .ok_or_else(|| anyhow::anyhow!("Invalid MCP entry; contents omitted"))?;
+        const ALLOWED: &[&str] = &[
+            "command",
+            "args",
+            "env",
+            "cwd",
+            "url",
+            "allow_private_network",
+            "transport",
+            "connect_timeout",
+            "execute_timeout",
+            "read_timeout",
+            "disabled",
+            "enabled",
+            "required",
+            "enabled_tools",
+            "disabled_tools",
+            "headers",
+            "env_headers",
+            "env_http_headers",
+            "bearer_token_env_var",
+            "scopes",
+            "oauth",
+            "oauth_resource",
+        ];
+        anyhow::ensure!(
+            fields.keys().all(|key| ALLOWED.contains(&key.as_str())),
+            "Source contains unsupported MCP fields; review it at its source"
+        );
+        if let Some(oauth) = fields.get("oauth").filter(|v| !v.is_null()) {
+            anyhow::ensure!(
+                oauth
+                    .as_object()
+                    .is_some_and(|map| map.keys().all(|key| key == "client_id")),
+                "Source contains unsupported OAuth fields"
+            );
+        }
+        let server: McpServerConfig = serde_json::from_value(config)
+            .map_err(|_| anyhow::anyhow!("Invalid MCP entry; contents omitted"))?;
+        anyhow::ensure!(
+            server.command.is_some() != server.url.is_some(),
+            "MCP entry must have one target"
+        );
+        if let Some(command) = &server.command {
+            anyhow::ensure!(
+                !command.trim().is_empty() && !command.chars().any(char::is_control),
+                "Invalid MCP command"
+            );
+        }
+        if let Some(url) = &server.url {
+            let parsed =
+                reqwest::Url::parse(url).map_err(|_| anyhow::anyhow!("Invalid MCP URL"))?;
+            anyhow::ensure!(
+                matches!(parsed.scheme(), "http" | "https")
+                    && parsed.host_str().is_some()
+                    && parsed.username().is_empty()
+                    && parsed.password().is_none(),
+                "Unsupported MCP URL"
+            );
+        }
+        super::validate_mcp_transport(server.transport.as_deref())
+            .map_err(|_| anyhow::anyhow!("Unsupported MCP transport"))?;
         let hard_blocked = !server.is_enabled();
-        let summary = server_summary(&name, &server);
         out.push(ImportCandidate {
+            summary: server_summary(&name, &server),
             name,
             source_kind: kind.clone(),
             source_path: path.to_path_buf(),
             content_hash: hash.clone(),
-            summary,
             hard_blocked,
-            block_reason: hard_blocked.then(|| {
-                "enabled=false (or disabled=true) is a hard block — will not import".to_string()
-            }),
+            block_reason: hard_blocked.then(|| "Disabled at its source; cannot import".into()),
             server,
         });
     }
-    out
+    Ok(out)
 }
 
 fn extract_servers_map(value: &Value) -> Vec<(String, Value)> {
@@ -171,18 +254,26 @@ fn extract_servers_map(value: &Value) -> Vec<(String, Value)> {
     Vec::new()
 }
 
+fn destination(server: &McpServerConfig) -> String {
+    if let Some(url) = &server.url {
+        return reqwest::Url::parse(url)
+            .map(|url| url.origin().ascii_serialization())
+            .unwrap_or_else(|_| "Invalid URL".into());
+    }
+    server
+        .command
+        .as_deref()
+        .and_then(|command| Path::new(command).file_name())
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "Unknown command".into())
+}
+
 fn server_summary(name: &str, server: &McpServerConfig) -> String {
-    if let Some(url) = server.url.as_deref() {
-        return format!("{name} — http {url}");
-    }
-    if let Some(cmd) = server.command.as_deref() {
-        let args = server.args.join(" ");
-        if args.is_empty() {
-            return format!("{name} — stdio {cmd}");
-        }
-        return format!("{name} — stdio {cmd} {args}");
-    }
-    format!("{name} — (incomplete server config)")
+    format!(
+        "{name} — {} ({} arguments; credential values hidden)",
+        destination(server),
+        server.args.len()
+    )
 }
 
 fn hex_sha256(bytes: &[u8]) -> String {
@@ -190,25 +281,40 @@ fn hex_sha256(bytes: &[u8]) -> String {
     digest.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// Load consent store from disk (missing file → empty).
-pub fn load_consent_store(path: &Path) -> ImportConsentStore {
-    let Ok(raw) = fs::read_to_string(path) else {
-        return ImportConsentStore::default();
-    };
-    serde_json::from_str(&raw).unwrap_or_default()
-}
-
-/// Persist consent store atomically-ish (write then rename best-effort).
-pub fn save_consent_store(path: &Path, store: &ImportConsentStore) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let raw = serde_json::to_string_pretty(store)
-        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
-    let tmp = path.with_extension("json.tmp");
-    fs::write(&tmp, raw)?;
-    fs::rename(tmp, path)?;
-    Ok(())
+/// Record decisions against the latest consent document under the shared
+/// process lock. Malformed history is never silently replaced with empty state.
+pub fn persist_decisions(
+    path: &Path,
+    candidates: &[ImportCandidate],
+    decisions: &HashMap<String, ImportDecision>,
+    now_unix: u64,
+) -> anyhow::Result<()> {
+    super::validate_mcp_config_path(path)?;
+    codewhale_config::with_config_write_lock(path, |path| {
+        let original = super::read_mcp_config_file(path)?;
+        let mut raw: Value = match original.as_deref() {
+            Some(raw) => serde_json::from_str(raw)
+                .map_err(|_| anyhow::anyhow!("Invalid MCP consent history; contents omitted"))?,
+            None => serde_json::json!({}),
+        };
+        anyhow::ensure!(raw.is_object(), "MCP consent history must be an object");
+        let mut store: ImportConsentStore = if original.is_none() {
+            ImportConsentStore::default()
+        } else {
+            serde_json::from_value(raw.clone())
+                .map_err(|_| anyhow::anyhow!("Invalid MCP consent history; contents omitted"))?
+        };
+        let before = serde_json::to_value(&store)?;
+        record_decisions(&mut store, candidates, decisions, now_unix);
+        let after = serde_json::to_value(&store)?;
+        super::apply_json_delta(&mut raw, &before, &after);
+        let rendered = serde_json::to_vec_pretty(&raw)?;
+        if rendered.len() as u64 > super::MAX_MCP_CONFIG_BYTES {
+            anyhow::bail!("MCP consent history exceeds size limit");
+        }
+        crate::utils::write_atomic(path, &rendered)?;
+        Ok(())
+    })
 }
 
 /// Filter candidates that still need a user decision for this content hash.
@@ -237,6 +343,7 @@ pub fn candidates_needing_consent(
 
 /// Apply approvals: returns servers to merge into user mcp.json.
 /// Hard-blocked candidates are never returned even if decision is Approve.
+#[cfg(test)]
 pub fn apply_approved(
     candidates: &[ImportCandidate],
     decisions: &HashMap<String, ImportDecision>,
@@ -319,6 +426,7 @@ pub fn record_decisions(
 
 /// Merge approved servers into an existing McpConfig. Does not touch
 /// hard-blocked entries. Returns names that were newly inserted.
+#[cfg(test)]
 pub fn merge_approved_into_config(
     config: &mut McpConfig,
     approved: &[(String, McpServerConfig, ImportCandidate)],
@@ -332,13 +440,17 @@ pub fn merge_approved_into_config(
         if !server.is_enabled() {
             continue;
         }
-        config.servers.insert(name.clone(), server.clone());
+        let mut server = server.clone();
+        server.enabled = false;
+        server.disabled = true;
+        config.servers.insert(name.clone(), server);
         inserted.push(name.clone());
     }
     inserted
 }
 
 /// Human-readable provenance block for the selector / status panel.
+#[cfg(test)]
 pub fn format_candidates_for_display(candidates: &[ImportCandidate]) -> String {
     if candidates.is_empty() {
         return "No external MCP sources found (or all already decided for current content)."
@@ -368,10 +480,255 @@ pub fn format_candidates_for_display(candidates: &[ImportCandidate]) -> String {
     }
     lines.push(String::new());
     lines.push(
-        "Approve one: /mcp import approve <name> · Decline source: /mcp import decline <name> · List: /mcp import"
+        "Run /mcp import for a current reviewed approval token. Imports stay off until enabled separately."
             .to_string(),
     );
     lines.join("\n")
+}
+
+/// One authority shared by the native API and terminal import UI. Sources are
+/// selected here; callers cannot supply arbitrary source paths to the API.
+pub struct ImportContext<'a> {
+    pub workspace: &'a Path,
+    pub mcp_path: &'a Path,
+    pub plugins: &'a crate::plugins::PluginRegistry,
+    pub home: PathBuf,
+    pub codewhale_home: PathBuf,
+}
+impl<'a> ImportContext<'a> {
+    pub fn new(
+        workspace: &'a Path,
+        mcp_path: &'a Path,
+        plugins: &'a crate::plugins::PluginRegistry,
+    ) -> anyhow::Result<Self> {
+        Ok(Self {
+            workspace,
+            mcp_path,
+            plugins,
+            home: crate::config::effective_home_dir()
+                .ok_or_else(|| anyhow::anyhow!("Home directory unavailable"))?,
+            codewhale_home: codewhale_config::codewhale_home()?,
+        })
+    }
+    fn discover(&self) -> (Vec<ImportCandidate>, Vec<ImportProblem>) {
+        let sources = [
+            (
+                self.home.join(".claude.json"),
+                ExternalMcpSourceKind::ClaudeJson,
+            ),
+            (
+                self.workspace.join(".mcp.json"),
+                ExternalMcpSourceKind::ProjectMcpJson,
+            ),
+            (
+                self.codewhale_home.join("mcp-marketplace.json"),
+                ExternalMcpSourceKind::Marketplace,
+            ),
+        ];
+        let mut candidates = Vec::new();
+        let mut problems = Vec::new();
+        for (path, kind) in sources {
+            match checked_source(&path, kind.clone()) {
+                Ok(found) => candidates.extend(found),
+                Err(_) => problems.push(ImportProblem { source_kind: kind,
+                    message: "Source could not be safely read or contains unsupported configuration; review it at its source".into() }),
+            }
+        }
+        (candidates, problems)
+    }
+    fn merged(&self) -> anyhow::Result<McpConfig> {
+        super::load_config_with_workspace_and_plugins(self.mcp_path, self.workspace, self.plugins)
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct ImportProblem {
+    pub source_kind: ExternalMcpSourceKind,
+    pub message: String,
+}
+#[derive(Debug, Serialize)]
+pub struct ReviewedImport {
+    pub id: String,
+    pub name: String,
+    pub source_kind: ExternalMcpSourceKind,
+    pub source_path: PathBuf,
+    pub content_hash: String,
+    pub transport: &'static str,
+    pub destination: String,
+    pub argument_count: usize,
+    pub env_keys: Vec<String>,
+    pub header_keys: Vec<String>,
+    pub credential_configured: bool,
+    pub hard_blocked: bool,
+    pub conflict: bool,
+    pub review_token: String,
+}
+#[derive(Debug, Serialize)]
+pub struct ImportPreview {
+    pub revision: String,
+    pub candidates: Vec<ReviewedImport>,
+    pub problems: Vec<ImportProblem>,
+}
+#[derive(Debug, Serialize)]
+pub struct ImportReceipt {
+    pub name: String,
+    pub decision: ImportDecision,
+    pub imported: bool,
+    pub enabled: bool,
+    pub revision: String,
+    pub consent_recorded: bool,
+    pub warning: Option<String>,
+}
+fn candidate_id(candidate: &ImportCandidate) -> String {
+    hex_sha256(
+        format!(
+            "{}\0{}\0{}",
+            candidate.source_kind.as_str(),
+            candidate.source_path.display(),
+            candidate.name
+        )
+        .as_bytes(),
+    )
+}
+fn source_blocked(context: &ImportContext<'_>, candidate: &ImportCandidate) -> bool {
+    candidate.hard_blocked
+        || (candidate.source_kind == ExternalMcpSourceKind::ProjectMcpJson
+            && !crate::config::is_workspace_trusted(context.workspace))
+}
+
+pub fn preview_imports(context: &ImportContext<'_>) -> anyhow::Result<ImportPreview> {
+    codewhale_config::with_config_write_lock(context.mcp_path, |path| {
+        let revision = super::read_config_revision(path)?;
+        let merged = context.merged()?;
+        let (candidates, problems) = context.discover();
+        let candidates = candidates
+            .into_iter()
+            .map(|candidate| {
+                let id = candidate_id(&candidate);
+                let server = &candidate.server;
+                let mut env_keys: Vec<_> = server.env.keys().cloned().collect();
+                env_keys.sort();
+                let mut header_keys: Vec<_> = server
+                    .headers
+                    .keys()
+                    .chain(server.env_headers.keys())
+                    .cloned()
+                    .collect();
+                header_keys.sort();
+                header_keys.dedup();
+                ReviewedImport {
+                    review_token: format!(
+                        "mcp-import-v1:{id}:{}:{revision}",
+                        candidate.content_hash
+                    ),
+                    id,
+                    transport: if server.url.is_some() {
+                        "http"
+                    } else {
+                        "stdio"
+                    },
+                    destination: destination(server),
+                    argument_count: server.args.len(),
+                    env_keys,
+                    header_keys,
+                    credential_configured: !server.env.is_empty()
+                        || !server.headers.is_empty()
+                        || !server.env_headers.is_empty()
+                        || server.bearer_token_env_var.is_some()
+                        || server.oauth.is_some()
+                        || server.oauth_resource.is_some(),
+                    hard_blocked: source_blocked(context, &candidate),
+                    conflict: merged.servers.contains_key(&candidate.name),
+                    name: candidate.name,
+                    source_kind: candidate.source_kind,
+                    source_path: candidate.source_path,
+                    content_hash: candidate.content_hash,
+                }
+            })
+            .collect();
+        Ok(ImportPreview {
+            revision,
+            candidates,
+            problems,
+        })
+    })
+}
+
+/// Re-read exact reviewed bytes inside the same config transaction as insertion.
+/// Nothing connects here. Consent follows a successful write and cannot turn a
+/// completed import into a false failed-write receipt.
+pub fn apply_reviewed_import(
+    context: &ImportContext<'_>,
+    id: &str,
+    hash: &str,
+    revision: &str,
+    decision: ImportDecision,
+) -> anyhow::Result<ImportReceipt> {
+    anyhow::ensure!(
+        matches!(decision, ImportDecision::Approve | ImportDecision::Decline),
+        "Choose approve or decline"
+    );
+    let (candidate, revision) = super::mutate_config(context.mcp_path, Some(revision), |config| {
+        let (candidates, _) = context.discover();
+        let candidate = candidates
+            .into_iter()
+            .find(|candidate| candidate_id(candidate) == id)
+            .ok_or_else(|| {
+                anyhow::anyhow!("Reviewed source is unavailable; refresh the import preview")
+            })?;
+        anyhow::ensure!(
+            candidate.content_hash == hash,
+            "Source changed; refresh the import preview"
+        );
+        if decision == ImportDecision::Approve {
+            anyhow::ensure!(
+                !source_blocked(context, &candidate),
+                "Source is disabled or its workspace is untrusted"
+            );
+            anyhow::ensure!(
+                !context.merged()?.servers.contains_key(&candidate.name)
+                    && !config.servers.contains_key(&candidate.name),
+                "A managed, project or plugin connector already uses this name"
+            );
+            let mut server = candidate.server.clone();
+            server.enabled = false;
+            server.disabled = true;
+            config.servers.insert(candidate.name.clone(), server);
+        }
+        Ok(candidate)
+    })?;
+    let decisions = HashMap::from([(candidate.name.clone(), decision)]);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |time| time.as_secs());
+    let consent_recorded = persist_decisions(
+        &context.codewhale_home.join("mcp-import-consent.json"),
+        std::slice::from_ref(&candidate),
+        &decisions,
+        now,
+    )
+    .is_ok();
+    Ok(ImportReceipt { name: candidate.name, decision, imported: decision == ImportDecision::Approve,
+        enabled: false, revision, consent_recorded,
+        warning: (!consent_recorded).then(|| "The decision could not be added to import history; the configuration receipt above is authoritative".into()),
+    })
+}
+
+pub fn parse_review_token(token: &str) -> anyhow::Result<(&str, &str, &str)> {
+    let parts: Vec<_> = token.split(':').collect();
+    anyhow::ensure!(
+        parts.len() == 4
+            && parts[0] == "mcp-import-v1"
+            && parts[1..3]
+                .iter()
+                .all(|value| value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit()))
+            && (parts[3] == "mcp-v1-absent"
+                || parts[3].strip_prefix("mcp-v1-").is_some_and(
+                    |hash| hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit())
+                )),
+        "Approval needs a reviewed token, not a name. Run /mcp import and copy its approve or decline command"
+    );
+    Ok((parts[1], parts[2], parts[3]))
 }
 
 #[cfg(test)]
@@ -383,6 +740,229 @@ mod tests {
         let path = dir.join(".claude.json");
         fs::write(&path, body).unwrap();
         path
+    }
+
+    fn with_import_context(test: impl FnOnce(&ImportContext<'_>)) {
+        let _env = crate::test_support::lock_test_env();
+        let root = tempdir().unwrap();
+        let home = root.path().join("home");
+        let workspace = root.path().join("workspace");
+        let state = root.path().join("state");
+        for path in [&home, &workspace, &state] {
+            fs::create_dir_all(path).unwrap();
+        }
+        let path = state.join("mcp.json");
+        let plugins = crate::plugins::PluginRegistry::empty(&workspace);
+        test(&ImportContext {
+            workspace: &workspace,
+            mcp_path: &path,
+            plugins: &plugins,
+            home,
+            codewhale_home: state,
+        });
+    }
+
+    #[test]
+    fn reviewed_import_rejects_changed_source_and_stale_revision() {
+        with_import_context(|context| {
+            let source =
+                write_claude_json(&context.home, r#"{"mcpServers":{"x":{"command":"echo"}}}"#);
+            let preview = preview_imports(context).unwrap();
+            let row = &preview.candidates[0];
+            fs::write(&source, r#"{"mcpServers":{"x":{"command":"changed"}}}"#).unwrap();
+            assert!(
+                apply_reviewed_import(
+                    context,
+                    &row.id,
+                    &row.content_hash,
+                    &preview.revision,
+                    ImportDecision::Approve
+                )
+                .unwrap_err()
+                .to_string()
+                .contains("Source changed")
+            );
+            assert!(!context.mcp_path.exists());
+            let preview = preview_imports(context).unwrap();
+            let row = &preview.candidates[0];
+            fs::write(context.mcp_path, r#"{"servers":{}}"#).unwrap();
+            assert!(
+                apply_reviewed_import(
+                    context,
+                    &row.id,
+                    &row.content_hash,
+                    &preview.revision,
+                    ImportDecision::Approve
+                )
+                .unwrap_err()
+                .is::<super::super::McpRevisionConflict>()
+            );
+        });
+    }
+
+    #[test]
+    fn reviewed_import_is_off_and_reports_history_failure_after_commit() {
+        with_import_context(|context| {
+            write_claude_json(
+                &context.home,
+                r#"{"mcpServers":{"x":{"command":"never-launch-this"}}}"#,
+            );
+            let preview = preview_imports(context).unwrap();
+            let row = &preview.candidates[0];
+            fs::write(
+                context.codewhale_home.join("mcp-import-consent.json"),
+                "invalid history",
+            )
+            .unwrap();
+            let receipt = apply_reviewed_import(
+                context,
+                &row.id,
+                &row.content_hash,
+                &preview.revision,
+                ImportDecision::Approve,
+            )
+            .unwrap();
+            assert!(receipt.imported);
+            assert!(!receipt.enabled);
+            assert!(!receipt.consent_recorded);
+            assert!(receipt.warning.is_some());
+            assert!(
+                !super::super::load_config(context.mcp_path).unwrap().servers["x"].is_enabled()
+            );
+            let next = preview_imports(context).unwrap();
+            assert!(next.candidates[0].conflict);
+            assert!(
+                apply_reviewed_import(
+                    context,
+                    &row.id,
+                    &row.content_hash,
+                    &next.revision,
+                    ImportDecision::Approve
+                )
+                .is_err()
+            );
+        });
+    }
+
+    #[test]
+    fn reviewed_decline_does_not_create_config_and_preview_hides_values() {
+        with_import_context(|context| {
+            write_claude_json(
+                &context.home,
+                r#"{"mcpServers":{"x":{"url":"https://example.test/private-secret?key=secret-value","headers":{"Authorization":"header-secret"},"env":{"TOKEN":"env-secret"}}}}"#,
+            );
+            let preview = preview_imports(context).unwrap();
+            let rendered = serde_json::to_string(&preview).unwrap();
+            for secret in [
+                "private-secret",
+                "secret-value",
+                "header-secret",
+                "env-secret",
+            ] {
+                assert!(!rendered.contains(secret));
+            }
+            let row = &preview.candidates[0];
+            assert_eq!(row.destination, "https://example.test");
+            assert!(row.credential_configured);
+            assert!(parse_review_token(&row.review_token).is_ok());
+            assert!(parse_review_token("x").is_err());
+            let receipt = apply_reviewed_import(
+                context,
+                &row.id,
+                &row.content_hash,
+                &preview.revision,
+                ImportDecision::Decline,
+            )
+            .unwrap();
+            assert!(!receipt.imported);
+            assert!(receipt.consent_recorded);
+            assert_eq!(receipt.revision, preview.revision);
+            assert!(!context.mcp_path.exists());
+        });
+    }
+
+    #[test]
+    fn reviewed_import_blocks_disabled_and_untrusted_project_sources() {
+        with_import_context(|context| {
+            write_claude_json(
+                &context.home,
+                r#"{"mcpServers":{"disabled":{"command":"echo","disabled":true}}}"#,
+            );
+            fs::write(
+                context.workspace.join(".mcp.json"),
+                r#"{"mcpServers":{"project":{"command":"echo"}}}"#,
+            )
+            .unwrap();
+            let preview = preview_imports(context).unwrap();
+            assert_eq!(preview.candidates.len(), 2);
+            for row in preview.candidates {
+                assert!(row.hard_blocked);
+                assert!(
+                    apply_reviewed_import(
+                        context,
+                        &row.id,
+                        &row.content_hash,
+                        &preview.revision,
+                        ImportDecision::Approve
+                    )
+                    .is_err()
+                );
+            }
+            assert!(!context.mcp_path.exists());
+        });
+    }
+
+    #[test]
+    fn reviewed_discovery_rejects_oversize_and_symlink_sources() {
+        with_import_context(|context| {
+            let path = context.home.join(".claude.json");
+            fs::write(
+                &path,
+                vec![b' '; super::super::MAX_MCP_CONFIG_BYTES as usize + 1],
+            )
+            .unwrap();
+            let preview = preview_imports(context).unwrap();
+            assert!(preview.candidates.is_empty());
+            assert_eq!(preview.problems.len(), 1);
+            #[cfg(unix)]
+            {
+                fs::remove_file(&path).unwrap();
+                let target = context.home.join("target.json");
+                fs::write(&target, r#"{"mcpServers":{"x":{"command":"echo"}}}"#).unwrap();
+                std::os::unix::fs::symlink(&target, &path).unwrap();
+                let preview = preview_imports(context).unwrap();
+                assert!(preview.candidates.is_empty());
+                assert_eq!(preview.problems.len(), 1);
+            }
+        });
+    }
+
+    #[test]
+    fn consent_transaction_preserves_other_sources_and_unknown_fields() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("consent.json");
+        fs::write(&path, r#"{"entries":{},"extension":{"owner":"external"}}"#).unwrap();
+        for name in ["first", "second"] {
+            let source = dir.path().join(format!("{name}.json"));
+            fs::write(
+                &source,
+                format!(r#"{{"mcpServers":{{"{name}":{{"command":"echo"}}}}}}"#),
+            )
+            .unwrap();
+            let candidates = discover_from_json_file(&source, ExternalMcpSourceKind::ClaudeJson);
+            let decisions = HashMap::from([(name.to_string(), ImportDecision::Approve)]);
+            persist_decisions(&path, &candidates, &decisions, 1).unwrap();
+        }
+        let raw: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(raw["extension"]["owner"], "external");
+        assert_eq!(raw["entries"].as_object().unwrap().len(), 2);
+        fs::write(&path, "malformed-sensitive-history").unwrap();
+        let error = persist_decisions(&path, &[], &HashMap::new(), 2).unwrap_err();
+        assert!(!error.to_string().contains("malformed-sensitive-history"));
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "malformed-sensitive-history"
+        );
     }
 
     #[test]
@@ -411,7 +991,7 @@ mod tests {
         let inserted = merge_approved_into_config(&mut config, &approved);
         assert_eq!(inserted, vec!["ok".to_string()]);
         assert!(!config.servers.contains_key("blocked"));
-        assert!(config.servers["ok"].is_enabled());
+        assert!(!config.servers["ok"].is_enabled());
     }
 
     #[test]

@@ -1,10 +1,10 @@
 use super::{
-    CODE_EXECUTION_DESCRIPTION, DEFAULT_ACTIVE_NATIVE_TOOLS,
+    CODE_EXECUTION_DESCRIPTION, DEFAULT_ACTIVE_NATIVE_TOOLS, ToolMode,
     allowlist_is_native_file_and_shell_only, apply_mcp_tool_deferral, apply_native_tool_deferral,
     build_model_tool_catalog_with_surface, default_synthetic_catalog_tool_names,
     ensure_advanced_tooling, execute_tool_search_with_cache, initial_active_tools,
-    is_synthetic_catalog_tool, remove_evicted_cache_activations, tool_matches_any_rule,
-    touch_cached_tool_after_execution,
+    is_synthetic_catalog_tool, remove_evicted_cache_activations, requested_tool_mode,
+    tool_matches_any_rule, touch_cached_tool_after_execution,
 };
 use crate::core::session::ToolActivationCache;
 use codewhale_config::AppMode;
@@ -82,7 +82,8 @@ fn first_turn_surface_is_stable_across_plan_work_and_operate() {
             "todo_write",
             "create_goal",
             "get_goal",
-            "update_goal"
+            "update_goal",
+            "load_skill"
         ]
     );
     let expected = [
@@ -92,6 +93,7 @@ fn first_turn_surface_is_stable_across_plan_work_and_operate() {
         "get_goal",
         "update_goal",
         "edit",
+        "load_skill",
         "read",
         "todo_write",
         "tool_search",
@@ -124,7 +126,7 @@ fn first_turn_surface_is_stable_across_plan_work_and_operate() {
         .collect::<Vec<_>>();
         let always_load = HashSet::new();
         apply_native_tool_deferral(&mut catalog, &always_load);
-        ensure_advanced_tooling(&mut catalog, mode, &always_load);
+        ensure_advanced_tooling(&mut catalog, mode, &always_load, ToolMode::Direct);
         let active_names = initial_active_tools(&catalog);
         let active = active_names.iter().cloned().collect::<BTreeSet<_>>();
         assert_eq!(active, expected, "{mode:?}");
@@ -169,6 +171,7 @@ fn eager_workflow_still_respects_command_allow_and_deny_gates() {
                 deny.map(|name| vec![name.to_string()]),
                 None,
                 codewhale_execpolicy::ApprovalMode::Suggest,
+                ToolMode::Direct,
             );
             assert_eq!(policy.allows_tool("workflow"), expected);
             assert_eq!(policy.active_names.contains("workflow"), expected);
@@ -371,4 +374,53 @@ fn catalog_build_does_not_append_registry_guidance_to_the_shell_tool() {
         .expect("shell tool");
     assert_eq!(shell.description, described.description);
     assert!(!shell.description.contains("registry_sync"));
+}
+
+#[test]
+fn requested_tool_mode_prefers_model_hint_then_flag_then_direct() {
+    use crate::features::{Feature, Features};
+
+    let off = Features::with_defaults();
+    assert_eq!(requested_tool_mode(None, &off), ToolMode::Direct);
+
+    let mut on = Features::with_defaults();
+    on.enable(Feature::CodeMode);
+    assert_eq!(requested_tool_mode(None, &on), ToolMode::CodeMode);
+
+    // Model metadata wins over config, in both directions (Codex parity).
+    assert_eq!(
+        requested_tool_mode(Some(ToolMode::Direct), &on),
+        ToolMode::Direct
+    );
+    assert_eq!(
+        requested_tool_mode(Some(ToolMode::CodeMode), &off),
+        ToolMode::CodeMode
+    );
+}
+
+#[test]
+fn execute_tools_is_eager_in_code_mode_and_deferred_in_direct() {
+    for (mode, expected_defer) in [(ToolMode::Direct, true), (ToolMode::CodeMode, false)] {
+        let mut catalog = vec![tool("read")];
+        ensure_advanced_tooling(&mut catalog, AppMode::Agent, &HashSet::new(), mode);
+        let injected = catalog
+            .iter()
+            .find(|definition| definition.name == "execute_tools")
+            .expect("execute_tools is injected outside Plan");
+        assert_eq!(injected.defer_loading, Some(expected_defer), "{mode:?}");
+    }
+
+    // Plan hides the surface under every tool mode.
+    let mut catalog = vec![tool("read")];
+    ensure_advanced_tooling(
+        &mut catalog,
+        AppMode::Plan,
+        &HashSet::new(),
+        ToolMode::CodeMode,
+    );
+    assert!(
+        catalog
+            .iter()
+            .all(|definition| definition.name != "execute_tools")
+    );
 }

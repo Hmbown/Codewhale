@@ -52,7 +52,10 @@ depth/oldest-age metrics are fed in at the `ui.rs` drain sites
 A second, unrelated "adaptive chunking" policy (`streaming/chunking.rs`, plus a
 `LineBuffer` newline gate) was deleted in v0.9.4: it could only ever decide
 "drain everything available", and both `LineBuffer` constructors bypassed the
-gate. A commit beat now unconditionally flushes everything received since the
-previous beat. Newline-boundary safety for partial code fences is owned by the
-incremental markdown parser (`ParseState::commit_complete_lines`), which is
-where it is actually in force.
+gate. A commit beat now reveals a bounded slice per beat (`reveal_budget`, at
+`REVEAL_PER_SECOND`), so the displayed pace is set by the clock rather than by
+the provider's chunking; clearing the buffer within one beat is no longer the
+behaviour, and a burst is spread across beats instead of landing at once.
+Newline-boundary safety for partial code fences is owned by the incremental
+markdown parser (`ParseState::commit_complete_lines`), which is where it is
+actually in force.

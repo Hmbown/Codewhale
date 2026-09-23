@@ -17,13 +17,6 @@ use crate::{Secrets, SecretsError};
 pub const DEFAULT_ACCOUNT_API_BASE: &str = "https://api.codewhale.net";
 /// Environment variable that selects the account API origin.
 pub const ACCOUNT_API_BASE_ENV: &str = "CODEWHALE_CLOUD_API_BASE";
-/// Former opt-in for the local file session store. The file store is now the
-/// automatic fallback (codex-style); the variable is accepted but ignored.
-#[deprecated(
-    since = "0.9.11",
-    note = "the file session store is the automatic fallback; this variable is ignored"
-)]
-pub const ACCOUNT_ALLOW_FILE_SESSION_STORE_ENV: &str = "CODEWHALE_CLOUD_ALLOW_FILE_SESSION_STORE";
 /// OS credential-manager service shared by CLI, TUI, and Runtime API.
 pub const ACCOUNT_KEYRING_SERVICE: &str = "codewhale-cloud";
 /// Current serialized account-session record version.
@@ -222,6 +215,76 @@ pub struct AccountSessionStore {
     api_base: String,
 }
 
+/// Opaque account-store revision. Contains credentials; deliberately no Debug.
+#[derive(Clone)]
+pub struct AccountSessionSnapshot {
+    raw: Option<String>,
+    slot: String,
+    api_base: String,
+}
+
+impl AccountSessionSnapshot {
+    /// Decode and validate the captured record without re-reading storage.
+    pub fn load(&self) -> Result<Option<StoredAccountAuth>, AccountSessionError> {
+        let Some(raw) = &self.raw else {
+            return Ok(None);
+        };
+        let stored: StoredAccountAuth =
+            serde_json::from_str(raw).map_err(AccountSessionError::UnreadableRecord)?;
+        if stored.schema_version != ACCOUNT_SESSION_SCHEMA_VERSION
+            || stored.api_base != self.api_base
+        {
+            return Ok(None);
+        }
+        validate_account_auth_bundle(&stored.bundle)?;
+        Ok(Some(stored))
+    }
+}
+
+/// Locked account entry. Never reacquire its store lock from a callback.
+pub struct AccountSessionTransaction<'a> {
+    raw: &'a mut Option<String>,
+    slot: &'a str,
+    api_base: &'a str,
+}
+impl AccountSessionTransaction<'_> {
+    /// Capture the exact current revision without unlocking.
+    pub fn snapshot(&self) -> AccountSessionSnapshot {
+        AccountSessionSnapshot {
+            raw: self.raw.clone(),
+            slot: self.slot.into(),
+            api_base: self.api_base.into(),
+        }
+    }
+    /// Decode the current record; errors may be recovered by explicit logout.
+    pub fn load(&self) -> Result<Option<StoredAccountAuth>, AccountSessionError> {
+        self.snapshot().load()
+    }
+    /// Compare an admitted snapshot without reacquiring the lock.
+    pub fn matches(&self, snapshot: &AccountSessionSnapshot) -> bool {
+        self.slot == snapshot.slot
+            && self.api_base == snapshot.api_base
+            && *self.raw == snapshot.raw
+    }
+    /// Replace this entry on successful transaction completion.
+    pub fn replace(&mut self, bundle: AccountAuthBundle) -> Result<(), AccountSessionError> {
+        validate_account_auth_bundle(&bundle)?;
+        *self.raw = Some(
+            serde_json::to_string(&StoredAccountAuth {
+                schema_version: ACCOUNT_SESSION_SCHEMA_VERSION,
+                api_base: self.api_base.into(),
+                bundle,
+            })
+            .map_err(AccountSessionError::UnreadableRecord)?,
+        );
+        Ok(())
+    }
+    /// Remove this entry on successful transaction completion.
+    pub fn clear(&mut self) {
+        *self.raw = None;
+    }
+}
+
 impl AccountSessionStore {
     /// Create a store view for one local profile and one validated API origin.
     #[must_use]
@@ -237,18 +300,100 @@ impl AccountSessionStore {
 
     /// Load and validate the selected account session from secure storage.
     pub fn load(&self) -> Result<Option<StoredAccountAuth>, AccountSessionError> {
-        let Some(raw) = self.secrets.get(&self.auth_slot)? else {
-            return Ok(None);
-        };
-        let stored: StoredAccountAuth =
-            serde_json::from_str(&raw).map_err(AccountSessionError::UnreadableRecord)?;
-        if stored.schema_version != ACCOUNT_SESSION_SCHEMA_VERSION
-            || stored.api_base != self.api_base
+        self.snapshot()?.load()
+    }
+
+    /// Capture exact account-store bytes, including malformed/obsolete records
+    /// so logout can clear only the revision it inspected.
+    pub fn snapshot(&self) -> Result<AccountSessionSnapshot, AccountSessionError> {
+        Ok(AccountSessionSnapshot {
+            raw: self.secrets.get(&self.auth_slot)?,
+            slot: self.auth_slot.clone(),
+            api_base: self.api_base.clone(),
+        })
+    }
+
+    /// Save a renewed bundle only if the captured session has not changed.
+    /// Returns the exact committed revision, or None on a concurrent change.
+    pub fn save_if_unchanged(
+        &self,
+        expected: &AccountSessionSnapshot,
+        bundle: AccountAuthBundle,
+    ) -> Result<Option<AccountSessionSnapshot>, AccountSessionError> {
+        validate_account_auth_bundle(&bundle)?;
+        if expected.slot != self.auth_slot || expected.api_base != self.api_base {
+            return Err(AccountSessionError::InvalidCredentials);
+        }
+        let raw = serde_json::to_string(&StoredAccountAuth {
+            schema_version: ACCOUNT_SESSION_SCHEMA_VERSION,
+            api_base: self.api_base.clone(),
+            bundle,
+        })
+        .map_err(AccountSessionError::UnreadableRecord)?;
+        if !self
+            .secrets
+            .compare_exchange(&self.auth_slot, expected.raw.as_deref(), Some(&raw))?
         {
             return Ok(None);
         }
-        validate_account_auth_bundle(&stored.bundle)?;
-        Ok(Some(stored))
+        Ok(Some(AccountSessionSnapshot {
+            raw: Some(raw),
+            slot: self.auth_slot.clone(),
+            api_base: self.api_base.clone(),
+        }))
+    }
+
+    /// Remove exactly the captured revision; never erase a newer sign-in.
+    pub fn clear_if_unchanged(
+        &self,
+        expected: &AccountSessionSnapshot,
+    ) -> Result<bool, AccountSessionError> {
+        if expected.slot != self.auth_slot || expected.api_base != self.api_base {
+            return Err(AccountSessionError::InvalidCredentials);
+        }
+        Ok(self
+            .secrets
+            .compare_exchange(&self.auth_slot, expected.raw.as_deref(), None)?)
+    }
+
+    /// Serialize an account lifecycle operation with every backend writer.
+    /// Return errors roll back local changes; no nested store operations allowed.
+    pub fn with_transaction<T, E>(
+        &self,
+        operation: impl FnOnce(&mut AccountSessionTransaction<'_>) -> Result<T, E>,
+    ) -> Result<T, E>
+    where
+        E: From<AccountSessionError>,
+    {
+        let mut outcome = None;
+        let result = self.secrets.with_entry_transaction(&self.auth_slot, |raw| {
+            let mut transaction = AccountSessionTransaction {
+                raw,
+                slot: &self.auth_slot,
+                api_base: &self.api_base,
+            };
+            match operation(&mut transaction) {
+                Ok(value) => {
+                    outcome = Some(Ok(value));
+                    Ok(())
+                }
+                Err(error) => {
+                    outcome = Some(Err(error));
+                    Err(SecretsError::Keyring("Account transaction aborted".into()))
+                }
+            }
+        });
+        match outcome {
+            Some(Err(error)) => Err(error),
+            Some(Ok(value)) => {
+                result.map_err(AccountSessionError::from).map_err(E::from)?;
+                Ok(value)
+            }
+            None => {
+                result.map_err(AccountSessionError::from).map_err(E::from)?;
+                Err(E::from(AccountSessionError::InvalidCredentials))
+            }
+        }
     }
 
     /// Validate and save an account bundle in the selected secure-store slot.
@@ -434,7 +579,6 @@ mod tests {
         let home = dir.path().join("codewhale-home");
         std::fs::create_dir_all(&home).expect("home");
         unsafe { std::env::set_var("CODEWHALE_HOME", &home) };
-        unsafe { std::env::remove_var("CODEWHALE_CLOUD_ALLOW_FILE_SESSION_STORE") };
         unsafe { std::env::remove_var("CODEWHALE_SECRET_BACKEND") };
         unsafe { std::env::remove_var("DEEPSEEK_SECRET_BACKEND") };
         let secrets =
@@ -586,5 +730,116 @@ mod tests {
             store.runtime_info_at(now).unwrap().state,
             AccountSessionState::Revoked
         );
+    }
+}
+
+/// Keep device custody tied to the account session, inside the file store's
+/// existing transaction. Refreshing access tokens within that owner preserves it.
+pub(crate) fn invalidate_device_companion(
+    entries: &mut std::collections::HashMap<String, String>,
+    slot: &str,
+    replacement: Option<&str>,
+) {
+    let Some(suffix) = slot.strip_prefix("codewhale-cloud-auth-v1-") else {
+        return;
+    };
+    if suffix.len() != 64 || !suffix.bytes().all(|c| c.is_ascii_hexdigit()) {
+        return;
+    }
+    fn identity(raw: &str) -> Option<(String, String, String)> {
+        let stored: StoredAccountAuth = serde_json::from_str(raw).ok()?;
+        if stored.schema_version != ACCOUNT_SESSION_SCHEMA_VERSION {
+            return None;
+        }
+        let account = stored.bundle.user?.id;
+        let session = stored.bundle.session?.id;
+        if stored.api_base.is_empty() || account.is_empty() || session.is_empty() {
+            return None;
+        }
+        Some((stored.api_base, account, session))
+    }
+    let old = entries.get(slot).and_then(|raw| identity(raw));
+    let next = replacement.and_then(identity);
+    if old.is_none() || old != next {
+        entries.remove(&format!("codewhale-cloud-device-v1-{suffix}"));
+    }
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    use super::*;
+    use std::sync::Arc;
+    fn bundle(id: &str) -> AccountAuthBundle {
+        AccountAuthBundle {
+            token_type: "Bearer".into(),
+            access_token: format!("access-{id}"),
+            refresh_token: format!("refresh-{id}"),
+            session: Some(AccountSession {
+                id: id.into(),
+                ..Default::default()
+            }),
+            user: Some(AccountUser {
+                id: id.into(),
+                ..Default::default()
+            }),
+        }
+    }
+    #[test]
+    fn exact_revision_cas_rejects_late_replace_and_clear_on_file_and_memory() {
+        let dir = tempfile::tempdir().unwrap();
+        for secrets in [
+            Secrets::new(Arc::new(crate::InMemoryKeyringStore::new())),
+            Secrets::new(Arc::new(crate::FileKeyringStore::new(
+                dir.path().join("secrets.json"),
+            ))),
+        ] {
+            let store = AccountSessionStore::new(secrets, None, DEFAULT_ACCOUNT_API_BASE);
+            store.save(bundle("old")).unwrap();
+            let old = store.snapshot().unwrap();
+            let other = store.clone();
+            std::thread::spawn(move || other.save(bundle("new")))
+                .join()
+                .unwrap()
+                .unwrap();
+            assert!(
+                store
+                    .save_if_unchanged(&old, bundle("stale-refresh"))
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(!store.clear_if_unchanged(&old).unwrap());
+            assert_eq!(
+                store.load().unwrap().unwrap().bundle.user.unwrap().id,
+                "new"
+            );
+            let latest = store.snapshot().unwrap();
+            assert!(store.clear_if_unchanged(&latest).unwrap());
+            assert!(store.load().unwrap().is_none());
+        }
+    }
+    #[test]
+    fn snapshot_compares_original_unknown_fields_and_scopes_store_identity() {
+        let secrets = Secrets::new(Arc::new(crate::InMemoryKeyringStore::new()));
+        let store = AccountSessionStore::new(secrets.clone(), None, DEFAULT_ACCOUNT_API_BASE);
+        store.save(bundle("account")).unwrap();
+        let slot = account_auth_slot("default", DEFAULT_ACCOUNT_API_BASE);
+        let mut value: serde_json::Value =
+            serde_json::from_str(&secrets.get(&slot).unwrap().unwrap()).unwrap();
+        value["futureField"] = true.into();
+        secrets.set(&slot, &value.to_string()).unwrap();
+        let snapshot = store.snapshot().unwrap();
+        let other =
+            AccountSessionStore::new(secrets.clone(), Some("other"), DEFAULT_ACCOUNT_API_BASE);
+        assert!(other.clear_if_unchanged(&snapshot).is_err());
+        assert!(
+            store
+                .save_if_unchanged(&snapshot, bundle("account"))
+                .unwrap()
+                .is_some()
+        );
+        secrets.set(&slot, "malformed").unwrap();
+        let corrupt = store.snapshot().unwrap();
+        assert!(corrupt.load().is_err());
+        assert!(store.clear_if_unchanged(&corrupt).unwrap());
     }
 }

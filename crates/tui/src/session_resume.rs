@@ -212,8 +212,10 @@ pub fn decide_auto_resume(
     // files cannot turn startup into a long scan.
     for id in candidates.into_iter().take(MAX_AUTO_RESUME_CANDIDATES) {
         // Verify against the real file before trusting it: the listing above
-        // only parsed each session's bounded metadata prefix.
-        let saved = match manager.load_session(&id) {
+        // only parsed each session's bounded metadata prefix. The probe only
+        // needs durable metadata — repair belongs to the resume that follows,
+        // so read the snapshot without running or logging it here.
+        let saved = match manager.load_session_snapshot(&id) {
             Ok(saved) => saved,
             Err(err) => {
                 skipped_unreadable += 1;

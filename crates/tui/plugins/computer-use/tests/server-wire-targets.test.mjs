@@ -73,6 +73,10 @@ before(async () => {
   });
   const init = await rpc("initialize", { protocolVersion: "2025-06-18" });
   assert.equal(init.result.serverInfo.name, "codewhale-cu");
+  // The local consent ledger gates app-targeted calls; record the fixture
+  // app's decision up front, as a real session would.
+  const c = await tool("consent", { action: "allow", app: "FakeApp" });
+  assert.equal(c.ok, true, JSON.stringify(c));
 });
 
 after(() => {

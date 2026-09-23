@@ -24,18 +24,12 @@ Stage 2 of the loop: [cw-orient](../cw-orient/SKILL.md) → **slice** →
 
 ## Workflow
 
-1. **Walk the ladder, out loud, before opening an editor.** Stop at the first
-   rung that answers, and say which one you stopped at:
-   1. Does this need to exist? → skip it.
-   2. Already in this codebase? → reuse it.
-   3. Stdlib does it? → use it.
-   4. Native platform feature? → use it.
-   5. Installed dependency? → use it.
-   6. One line? → one line.
-   7. Only then: the minimum that works.
-
-   The ladder runs *after* reading the code, never instead of it. A short diff
-   written without reading the call sites is a guess, not a small change.
+1. **Walk the ladder before opening an editor** (`AGENTS.md`, "The ponytail
+   method" — not restated here, since a second copy is what rung 2 forbids).
+   Stop at the first rung that answers. The ladder runs *after* reading the
+   code, never instead of it: a short diff written without reading the call
+   sites is a guess, not a small change. State the rung only when the choice
+   isn't obvious from the diff itself.
 
 2. **Grep for the predecessor.** This is the step that gets skipped and the one
    that costs the most:
@@ -48,13 +42,17 @@ Stage 2 of the loop: [cw-orient](../cw-orient/SKILL.md) → **slice** →
    it. If you are still adding a new layer, its module doc must name the
    predecessor it replaces — otherwise you are editing the wrong file.
 
-3. **Check the contracts you are about to walk into.** These are the ones this
-   repo actively guards, and a guard test fails if you duplicate them:
+3. **Check the contracts you are about to walk into.** One of these is
+   guard-tested, the rest are convention — either way, move them with their
+   code, not around it:
    - One turn loop: `crates/tui/src/core/engine/turn_loop.rs`, guarded by
-     `crates/core/tests/single_turn_loop.rs`. Do not add a second.
+     `crates/core/tests/single_turn_loop.rs`. A second loop fails the guard;
+     changing the shape means changing the guard with it.
    - One base prompt: `BASE_PROMPT` in `crates/tui/src/prompts/text.rs`.
-   - The subagent tool is `agent`. Do not revive `agent_open` / `agent_eval` /
-     `agent_close` / `delegate_to_agent`.
+   - The subagent tool is `agent`; `agent_open` / `agent_eval` /
+     `agent_close` / `delegate_to_agent` are removed surfaces. If the shape
+     must move, move the code and add the guard test that judges the new
+     shape — the convention is not a fence around the area.
    - The system prompt + tool catalog are a session-pinned KV-cache prefix
      (`docs/CACHE.md`). Any new session-context contributor must state its cache
      effect — frozen prefix vs. append-only history. Never splice a volatile
@@ -73,13 +71,9 @@ Stage 2 of the loop: [cw-orient](../cw-orient/SKILL.md) → **slice** →
    `docs/design/`, not in a prototype file someone left in a sibling directory.
 
 5. **Bound the slice.** One coherent change, reviewable in one sitting, that
-   leaves the tree building and green. Two rules keep slices honest:
-   - **An abstraction must delete caller code.** If adopting it is pure
-     obligation — required methods, no default bodies that do work — it will be
-     built, adopted once, and abandoned. Don't build it.
-   - **Migrate the last consumer, or do not start.** Framework, one caller,
-     ticket the rest, silence the warning: that is how two systems ship. If the
-     migration will not fit in this slice, narrow the slice — never the adoption.
+   leaves the tree building and green. `AGENTS.md`'s two corollaries keep
+   slices honest: an abstraction must delete caller code, and a migration
+   ships its last consumer or does not start.
 
 6. **Fix the evidence bar now, not after.** Decide before writing code what will
    prove this works, and write it into your plan:
@@ -89,18 +83,18 @@ Stage 2 of the loop: [cw-orient](../cw-orient/SKILL.md) → **slice** →
    - whether it is cross-cutting enough to need the full sweep in
      [cw-gates](../cw-gates/SKILL.md).
 
-7. **Write the implementation first.** Code first, then tests — this repo does
-   not practice TDD, and that overrides any skill that says otherwise. Build it,
-   prove it runs, then add or adjust tests to cover what you actually built. A
-   regression test written after the fix still has to be shown failing without
-   the fix.
+7. **Write the implementation first.** Code first, then tests (see `AGENTS.md`
+   — this repo does not practice TDD). Build it, prove it runs, then add or
+   adjust tests to cover what you actually built.
 
 ## Red flags / don't
 
 - Don't add a module that "bridges", "mirrors", "stages", or "wraps" something
   that already exists without naming that thing in the module doc.
-- Don't add a second turn loop, base prompt, delegation axis, or lifecycle
-  system. The repo has exactly one of each on purpose.
+- Don't fork a singleton (turn loop, base prompt, delegation axis,
+  lifecycle system) without moving its guard test and consumers with it.
+  The repo has one of each on purpose; a silent second one is the failure
+  mode, not the refactor.
 - Don't write tests first. Don't add tests by default either — add one when it
   cheaply protects safety, data integrity, protocol compatibility, or a
   reproduced regression.
@@ -113,7 +107,8 @@ Stage 2 of the loop: [cw-orient](../cw-orient/SKILL.md) → **slice** →
 
 ## Output
 
-Before the first edit, state:
+Default shape before the first edit — compress when trivial (a one-line
+change gets a one-line note, not four bullets):
 
 - which rung of the ladder you stopped at and why;
 - the existing owner you found (`path/to/file.rs:line`), or the predecessor

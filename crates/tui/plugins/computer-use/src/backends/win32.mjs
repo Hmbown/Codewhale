@@ -8,6 +8,7 @@ import os from "node:os";
 import path from "node:path";
 import crypto from "node:crypto";
 import { run, ExecError, tryJson, withSignal, throwIfAborted } from "../exec.mjs";
+import { createBrowser } from "../browser-cdp.mjs";
 
 const USER32 = `
 using System;
@@ -88,6 +89,27 @@ const MODVK = { ctrl: 0x11, control: 0x11, alt: 0x12, shift: 0x10, win: 0x5b, me
 // Compilation, conversion and native-call exceptions must stop before success.
 const USER32_PRELUDE = `$ErrorActionPreference = 'Stop';\nAdd-Type -TypeDefinition @'\n${USER32}\n'@ -ErrorAction Stop;`;
 
+// Initialize UIA proxies from a typed CLR frame. The legacy proxy loader
+// walks ReflectedType on its call stack; PowerShell dynamic frames can be null
+// and leave standard controls exposed as plain panes without action patterns.
+const UIA_PRELUDE = `Add-Type -AssemblyName UIAutomationClient;
+Add-Type -AssemblyName UIAutomationTypes;
+Add-Type -ReferencedAssemblies ([System.Windows.Automation.AutomationElement].Assembly.Location) -TypeDefinition @'
+using System.Windows.Automation;
+public static class CUAutomationProviders {
+  public static void Register() {
+    var assembly = typeof(AutomationElement).Assembly.GetName();
+    assembly.Name = "UIAutomationClientsideProviders";
+    // Legacy .NET clears its one-time default-proxy flag before walking a
+    // dynamic PowerShell stack, which can throw NullReferenceException.
+    // Retry only registration (no UI action); a second failure propagates.
+    try { ClientSettings.RegisterClientSideProviderAssembly(assembly); }
+    catch (System.NullReferenceException) { ClientSettings.RegisterClientSideProviderAssembly(assembly); }
+  }
+}
+'@;
+[CUAutomationProviders]::Register();`;
+
 /** Coordinate clicks on this backend are always raw pointer events; strategy="a11y" must fail closed rather than silently degrade. */
 function assertEventStrategy(strategy) {
   if (strategy != null && strategy !== "auto" && strategy !== "event") {
@@ -99,10 +121,36 @@ function unsupportedSelector(message) {
   return Object.assign(new ExecError(message), { code: "unsupported_selector" });
 }
 
-function assertUntargetedElement(target) {
-  if (["app_ref", "windowIndex", "window_id"].some((key) => Object.hasOwn(target, key))) {
-    throw unsupportedSelector("Windows semantic actions do not support explicit application or window selectors");
+// A cached child path alone is unsafe: sibling/window order can change.
+// Runtime IDs bind both the root and leaf to the observation that supplied them.
+function elementScript(target) {
+  const ids = [target?.runtime_id, target?.window_runtime_id];
+  if (ids.some(id => !Array.isArray(id) || !id.length || !id.every(Number.isInteger))
+      || !Array.isArray(target?.path) || target.path[0] !== 0 || !target.path.every(i => Number.isInteger(i) && i >= 0)
+      || (target.windowIndex != null && target.windowIndex !== 0) || Object.hasOwn(target, "window_id")) {
+    throw unsupportedSelector("Windows semantic actions require a fresh observed element with window and element runtime identities");
   }
+  const encoded = Buffer.from(JSON.stringify(target), "utf16le").toString("base64");
+  return `${UIA_PRELUDE}
+$target = [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String('${encoded}')) | ConvertFrom-Json;
+$root = [System.Windows.Automation.AutomationElement]::RootElement;
+$windows = @($root.FindAll([System.Windows.Automation.TreeScope]::Children, [System.Windows.Automation.Condition]::TrueCondition));
+$matches = @($windows | Where-Object { ($_.GetRuntimeId() -join ',') -ceq ($target.window_runtime_id -join ',') });
+if ($matches.Count -ne 1) { throw 'element_stale: observed window no longer exists' }
+$cur = $matches[0];
+if ($target.app_ref.name -and $cur.Current.Name -cne $target.app_ref.name) { throw 'element_stale: window identity changed' }
+if ($target.app_ref.pid -and $cur.Current.ProcessId -ne $target.app_ref.pid) { throw 'element_stale: window process changed' }
+for ($step = 1; $step -lt $target.path.Count; $step++) {
+  $kids = $cur.FindAll([System.Windows.Automation.TreeScope]::Children, [System.Windows.Automation.Condition]::TrueCondition);
+  $i = $target.path[$step];
+  if ($i -ge $kids.Count) { throw 'element_stale: observed path changed' }
+  $cur = $kids[$i];
+}
+if (($cur.GetRuntimeId() -join ',') -cne ($target.runtime_id -join ',')) { throw 'element_stale: observed element was replaced' }
+if ($target.role -and ($cur.Current.ControlType.ProgrammaticName -replace '^ControlType\\.', '') -cne $target.role) { throw 'element_stale: role changed' }
+if ($null -ne $target.label -and $cur.Current.Name -cne $target.label) { throw 'element_stale: label changed' }
+if (-not $cur.Current.IsEnabled) { throw 'element_disabled: observed element is disabled' }
+`;
 }
 
 export function create(opts = {}) {
@@ -110,6 +158,7 @@ export function create(opts = {}) {
   // powershell.exe is spawned. Production uses the imported runner.
   const injectedRun = opts.exec && typeof opts.exec.run === "function" ? opts.exec.run : null;
   const runner = injectedRun ?? run;
+  const browser = createBrowser({ platform: "win32" });
 
   function requireInputOwner() {
     if (opts.exec?.persistentInputOwner !== true) throw Object.assign(new ExecError(
@@ -119,7 +168,7 @@ export function create(opts = {}) {
 
   async function ps(script, o = {}) {
     throwIfAborted();
-    const encoded = Buffer.from(script, "utf16le").toString("base64");
+    const encoded = Buffer.from(`$ErrorActionPreference = 'Stop'; $ProgressPreference = 'SilentlyContinue';\n[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false);\n${script}`, "utf16le").toString("base64");
     return runner("powershell.exe", ["-NoProfile", "-NonInteractive", "-EncodedCommand", encoded], {
       timeoutMs: o.timeoutMs ?? 25_000,
       maxBuffer: 32 * 1024 * 1024,
@@ -131,7 +180,15 @@ export function create(opts = {}) {
     const r = await ps(script, o);
     if (r.aborted) throw Object.assign(new ExecError("computer request cancelled", r), { code: "cancelled" });
     if (r.timedOut) throw new ExecError(`powershell timed out after ${o.timeoutMs ?? 25_000}ms`, r);
-    if (r.code !== 0) throw new ExecError(`powershell.exe exited ${r.code}: ${(r.stderr || r.stdout).trim().slice(0, 300)}`, r);
+    if (r.code !== 0) {
+      const raw = (r.stderr || r.stdout).trim();
+      // EncodedCommand serializes errors as CLIXML; surface the error strings,
+      // not a truncated XML/progress header that conceals the actual failure.
+      const messages = [...raw.matchAll(/<S S="Error">([\s\S]*?)<\/S>/g)].map(m => m[1]
+        .replace(/_x([0-9A-Fa-f]{4})_/g, (_, hex) => String.fromCharCode(parseInt(hex, 16)))
+        .replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&apos;/g, "'").replace(/&amp;/g, "&"));
+      throw new ExecError(`powershell.exe exited ${r.code}: ${(messages.join("") || raw).slice(0, 1600)}`, r);
+    }
     return r;
   }
 
@@ -144,6 +201,7 @@ export function create(opts = {}) {
   }
 
   let lastRaster = null;
+  let activeDisplay = null;
   const heldButtons = new Set();
   const heldKeys = new Set();
 
@@ -195,6 +253,14 @@ export function create(opts = {}) {
   return {
     platform: "win32",
     releaseInput,
+    browser_start: browser.start,
+    browser_status: browser.status,
+    browser_navigate: browser.navigate,
+    browser_click: browser.click,
+    browser_type: browser.type,
+    browser_screenshot: browser.screenshot,
+    browser_stop: browser.stop,
+    closeSession: async () => { await browser.close().catch(() => {}); },
     probe: async () => {
       const psOk = await ps("Write-Output 'ok'").then((r) => r.code === 0).catch(() => false);
       return {
@@ -206,16 +272,16 @@ export function create(opts = {}) {
     },
     list_displays: async () => {
       const d = await psJson(`Add-Type -AssemblyName System.Windows.Forms;
-$out = [System.Windows.Forms.Screen]::AllScreens | ForEach-Object { [pscustomobject]@{ name = $_.DeviceName; primary = $_.Primary; x = $_.Bounds.X; y = $_.Bounds.Y; w = $_.Bounds.Width; h = $_.Bounds.Height; } } | ConvertTo-Json -Compress;
-Write-Output ('{"displays": ' + ($out -replace '^\\[','[' -replace '\\]$/',']') + '}');`, { timeoutMs: 15_000 }).catch(async () => {
-        // Fallback: build the array safely.
-        return psJson(`Add-Type -AssemblyName System.Windows.Forms;
-$arr = @(); foreach ($s in [System.Windows.Forms.Screen]::AllScreens) { $arr += [pscustomobject]@{ name = $s.DeviceName; primary = $s.Primary; x = $s.Bounds.X; y = $s.Bounds.Y; w = $s.Bounds.Width; h = $s.Bounds.Height } }
-Write-Output ('{"displays": ' + (ConvertTo-Json $arr -Compress) + '}');`, { timeoutMs: 15_000 });
-      });
+$arr = @([System.Windows.Forms.Screen]::AllScreens | ForEach-Object { [pscustomobject]@{ name = $_.DeviceName; primary = $_.Primary; x = $_.Bounds.X; y = $_.Bounds.Y; w = $_.Bounds.Width; h = $_.Bounds.Height } });
+@{ displays = $arr } | ConvertTo-Json -Depth 4 -Compress;`, { timeoutMs: 15_000 });
       return d.displays.map((x, i) => ({ index: i + 1, name: x.name, points: { x: x.x, y: x.y, w: x.w, h: x.h }, pixels: { w: x.w, h: x.h }, scale: 1, main: !!x.primary }));
     },
-    async switch_display({ index }) { return { activeDisplay: index ?? 1, note: "windows screenshots grab the virtual screen; per-display crop applies where supported" }; },
+    async switch_display({ index = 1 }) {
+      const displays = await this.list_displays();
+      if (!displays.some(d => d.index === index)) throw new ExecError("display index is out of range");
+      activeDisplay = index;
+      return { activeDisplay };
+    },
     list_apps: async () => {
       const j = await psJson(`Add-Type -AssemblyName System.Windows.Forms;
 $out = Get-Process | Where-Object { $_.MainWindowTitle } | ForEach-Object { [pscustomobject]@{ name = $_.ProcessName; pid2 = $_.Id; title = $_.MainWindowTitle } } | ConvertTo-Json -Compress;
@@ -280,9 +346,13 @@ Write-Output ('{"windows": ' + $json + '}');`, { timeoutMs: 25_000 });
         const encoded = Buffer.from(quoted, "utf16le").toString("base64");
         argumentsScript = `$launchArg = [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String('${encoded}')); `;
       }
-      const r = await ps(`${argumentsScript}Start-Process -FilePath "${target}"${urlArg != null ? " -ArgumentList $launchArg" : ""}; Write-Output '{"launched": true}'`, { timeoutMs: 20_000 });
+      // activate defaults to background on every platform: a minimized
+      // launch leaves the user's foreground window alone. Windows input is
+      // still shared-surface — this only controls the launch, not input.
+      const windowStyle = activate === true ? "" : " -WindowStyle Minimized";
+      const r = await psOk(`${argumentsScript}Start-Process -FilePath "${target}"${windowStyle}${urlArg != null ? " -ArgumentList $launchArg" : ""}; Write-Output '{"launched": true}'`, { timeoutMs: 20_000 });
       if (r.code !== 0) throw new ExecError(`Start-Process failed: ${r.stderr.trim().slice(0, 200)}`, r);
-      return { launched: true, name: target, url: urlArg ?? null, activate };
+      return { launched: true, name: target, url: urlArg ?? null, activate: activate === true };
     },
     get_app_state: async (args = {}) => {
       if (Object.hasOwn(args, "window_id")) throw unsupportedSelector("Windows get_app_state does not support window_id");
@@ -293,8 +363,7 @@ Write-Output ('{"windows": ' + $json + '}');`, { timeoutMs: 25_000 });
       }
       const filter = Buffer.from(app_ref?.name ?? "", "utf16le").toString("base64");
       const maxEls = detail === "full" ? 800 : 400;
-      const j = await psJson(`Add-Type -AssemblyName UIAutomationClient;
-Add-Type -AssemblyName UIAutomationTypes;
+      const j = await psJson(`${UIA_PRELUDE}
 $max = ${maxEls};
 $filter = [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String('${filter}'));
 $root = [System.Windows.Automation.AutomationElement]::RootElement;
@@ -309,45 +378,49 @@ foreach ($t in $targets) {
   $nm = $t.Current.Name;
   $found = $true; $appName = $nm;
   $stack = New-Object System.Collections.Stack;
+  $windowId = @($t.GetRuntimeId());
   $stack.Push(@($t, @(0)));
   while ($stack.Count -gt 0) {
     $entry = $stack.Pop(); $cur = $entry[0]; $path = $entry[1];
     if ($els.Count -ge $max) { $truncated = $true; break }
     $rect = $cur.Current.BoundingRectangle;
     $acts = @();
-    try { $acts = @($cur.GetSupportedPatterns() | ForEach-Object { $_.ProgrammaticName -replace 'Pattern$','' }) } catch {}
-    [void]$els.Add([pscustomobject]@{ index = $els.Count; path = $path; role = [string]$cur.Current.ControlType.ProgrammaticName; label = [string]$cur.Current.Name; value = $([string]$cur.Current.Value).Substring(0, [Math]::Min(120, [string]$cur.Current.Value).Length); enabled = $cur.Current.IsEnabled;
+    try { $acts = @($cur.GetSupportedPatterns() | ForEach-Object { $_.ProgrammaticName -replace 'PatternIdentifiers\\.Pattern$','' -replace 'Pattern$','' }) } catch {}
+    $value = ''; $vp = $null;
+    if (-not $cur.Current.IsPassword -and $cur.TryGetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern, [ref]$vp)) { $value = [string]$vp.Current.Value }
+    [void]$els.Add([pscustomobject]@{ index = $els.Count; path = @($path); runtime_id = @($cur.GetRuntimeId()); window_runtime_id = $windowId; role = [string]$cur.Current.ControlType.ProgrammaticName; label = [string]$cur.Current.Name; value = $value.Substring(0, [Math]::Min(120, $value.Length)); enabled = $cur.Current.IsEnabled;
       x = [int]$rect.X; y = [int]$rect.Y; w = [int]$rect.Width; h = [int]$rect.Height; actions = $acts });
     $kids = $cur.FindAll([System.Windows.Automation.TreeScope]::Children, [System.Windows.Automation.Condition]::TrueCondition);
     for ($i = $kids.Count - 1; $i -ge 0; $i--) { $stack.Push(@($kids[$i], ($path + $i))) }
   }
   break;
 }
-$result = [pscustomobject]@{ found = $found; name = $appName; truncated = $truncated; elements = @($els | ForEach-Object { [pscustomobject]@{ index = $_.index; path = $_.path; role = ($_.role -replace 'ControlType.',''); label = $_.label; value = $_.value; enabled = $_.enabled; position = [pscustomobject]@{ x = $_.x; y = $_.y }; size = [pscustomobject]@{ w = $_.w; h = $_.h }; actions = $_.actions } }) };
+$result = [pscustomobject]@{ found = $found; name = $appName; truncated = $truncated; elements = @($els | ForEach-Object { [pscustomobject]@{ index = $_.index; path = @($_.path); runtime_id = $_.runtime_id; window_runtime_id = $_.window_runtime_id; role = ($_.role -replace 'ControlType.',''); label = $_.label; value = $_.value; enabled = $_.enabled; position = [pscustomobject]@{ x = $_.x; y = $_.y }; size = [pscustomobject]@{ w = $_.w; h = $_.h }; actions = $_.actions } }) };
 Write-Output ($result | ConvertTo-Json -Depth 6 -Compress);`, { timeoutMs: 60_000 });
       if (!j.found) throw new ExecError("application window not found in UIA tree — pass app_ref.name as the exact window title from list_windows or list_apps.title");
       return j;
     },
     screenshot: async (args = {}) => {
       if (Object.hasOwn(args, "app_ref") || Object.hasOwn(args, "window_id")) throw unsupportedSelector("Windows screenshot does not support app_ref or window_id; omit them for a desktop screenshot");
-      const { display, region, path: outPath } = args;
+      const { display = activeDisplay, region, path: outPath } = args;
+      if (display != null && (!Number.isInteger(display) || display < 1)) throw new ExecError("display index must be a positive integer");
+      if (region != null && (!Array.isArray(region) || region.length !== 4 || !region.every(Number.isInteger) || region[2] <= 0 || region[3] <= 0)) throw new ExecError("region must be integer [x,y,width,height] with positive size");
       const dir = recordingsDir();
       fs.mkdirSync(dir, { recursive: true });
-      const file = outPath || path.join(dir, `shot-${new Date().toISOString().replace(/[:.]/g, "-")}-${crypto.randomBytes(3).toString("hex")}.png`);
-      const winPath = file.replace(/\\/g, "\\\\");
-      const script = `Add-Type -AssemblyName System.Windows.Forms; Add-Type -AssemblyName System.Drawing;
+      const file = path.resolve(outPath || path.join(dir, `shot-${crypto.randomBytes(6).toString("hex")}.png`));
+      const meta = await psJson(`Add-Type -AssemblyName System.Windows.Forms; Add-Type -AssemblyName System.Drawing;
 $bounds = [System.Windows.Forms.SystemInformation]::VirtualScreen;
+${display == null ? "" : `$screens = [System.Windows.Forms.Screen]::AllScreens; if (${display} -gt $screens.Count) { throw 'display index is out of range' }; $bounds = $screens[${display - 1}].Bounds;`}
+${region == null ? "" : `$crop = New-Object System.Drawing.Rectangle(${region.join(",")}); if (-not $bounds.Contains($crop)) { throw 'region is outside capture bounds' }; $bounds = $crop;`}
 $bmp = New-Object System.Drawing.Bitmap($bounds.Width, $bounds.Height);
-$g = [System.Drawing.Graphics]::FromImage($bmp);
-$g.CopyFromScreen($bounds.X, $bounds.Y, 0, 0, $bounds.Size);
-$g.Dispose();
-$bmp.Save('${file.replace(/'/g, "''")}', [System.Drawing.Imaging.ImageFormat]::Png);
-$bmp.Dispose();
-Write-Output '{"ok": true, "w": ' + $bounds.Width + ', "h": ' + $bounds.Height + '}';`;
-      const r = await ps(script, { timeoutMs: 30_000 });
-      if (r.code !== 0 || !fs.existsSync(file)) throw new ExecError(`screenshot failed: ${(r.stderr || r.stdout).trim().slice(0, 300)}`, r);
-      const meta = tryJson(r.stdout.trim().split("\n").pop(), {});
-      lastRaster = { file, bytes: fs.statSync(file).size, points: { x: 0, y: 0, w: meta.w, h: meta.h }, pixels: { w: meta.w, h: meta.h }, scale: 1, capturedAt: new Date().toISOString() };
+try {
+  $g = [System.Drawing.Graphics]::FromImage($bmp);
+  try { $g.CopyFromScreen($bounds.X, $bounds.Y, 0, 0, $bounds.Size); } finally { $g.Dispose(); }
+  $bmp.Save('${file.replace(/'/g, "''")}', [System.Drawing.Imaging.ImageFormat]::Png);
+} finally { $bmp.Dispose(); }
+@{ x = $bounds.X; y = $bounds.Y; w = $bounds.Width; h = $bounds.Height } | ConvertTo-Json -Compress;`, { timeoutMs: 30_000 });
+      if (!fs.existsSync(file) || ![meta.x, meta.y, meta.w, meta.h].every(Number.isFinite) || meta.w <= 0 || meta.h <= 0) throw new ExecError("screenshot did not return a valid raster");
+      lastRaster = { file, bytes: fs.statSync(file).size, points: { x: meta.x, y: meta.y, w: meta.w, h: meta.h }, pixels: { w: meta.w, h: meta.h }, scale: 1, capturedAt: new Date().toISOString() };
       return { ...lastRaster };
     },
     zoom: async ({ source, region, path: outPath }) => {
@@ -364,7 +437,7 @@ $g.Dispose();
 $bmp.Save('${out.replace(/'/g, "''")}', [System.Drawing.Imaging.ImageFormat]::Png);
 $bmp.Dispose(); $img.Dispose();
 Write-Output '{"ok": true}';`;
-      const r = await ps(script, { timeoutMs: 20_000 });
+      const r = await psOk(script, { timeoutMs: 20_000 });
       if (r.code !== 0 || !fs.existsSync(out)) throw new ExecError(`zoom failed: ${(r.stderr || "").slice(0, 250)}`, r);
       return { file: out, bytes: fs.statSync(out).size, region, source: src };
     },
@@ -460,68 +533,31 @@ Write-Output '{"ok": true}';`, { timeoutMs: Math.max(10_000, d * 1000 + 8000) })
       });
     },
     set_value: async ({ target, value }) => {
-      assertUntargetedElement(target);
-      // UIA ValuePattern via a re-walk to target.path from the desktop root.
-      const b64path = Buffer.from(JSON.stringify(target.path ?? []), "utf8").toString("base64");
-      const b64val = Buffer.from(String(value ?? ""), "utf16le").toString("base64");
-      const j = await psJson(`Add-Type -AssemblyName UIAutomationClient; Add-Type -AssemblyName UIAutomationTypes;
-$path = [Convert]::FromBase64String('${b64path}'); $textPath = [Text.Encoding]::UTF8.GetString($path);
-$val = [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String('${b64val}'));
-$indices = $textPath | ConvertFrom-Json;
-$root = [System.Windows.Automation.AutomationElement]::RootElement;
-$targets = $root.FindAll([System.Windows.Automation.TreeScope]::Children, [System.Windows.Automation.Condition]::TrueCondition);
-$cur = $null;
-foreach ($t in $targets) { $cur = $t; break }
-if ($cur -eq $null) { Write-Output '{"ok": false, "code": "app_not_found"}'; exit 0 }
-foreach ($i in $indices) {
-  if ($i -eq 0) { continue }
-  $kids = $cur.FindAll([System.Windows.Automation.TreeScope]::Children, [System.Windows.Automation.Condition]::TrueCondition);
-  if ($i -ge $kids.Count) { Write-Output '{"ok": false, "code": "element_stale"}'; exit 0 }
-  $cur = $kids[$i];
-}
-try {
-  $vp = $cur.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern);
-  $vp.SetValue($val);
-  Write-Output '{"ok": true}';
-} catch { Write-Output ('{"ok": false, "code": "' + $_.Exception.Message.Replace('"','') + '"}') }`, { timeoutMs: 45_000 });
-      if (!j.ok) throw new ExecError(`set_value failed: ${j.code}`);
-      return { action_sent: true, strategy: "a11y" };
+      const resolve = elementScript(target);
+      const b64 = Buffer.from(String(value ?? ""), "utf16le").toString("base64");
+      const j = await psJson(`${resolve}
+$val = [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String('${b64}'));
+$vp = $cur.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern);
+if ($vp.Current.IsReadOnly) { throw 'element_read_only' }
+$vp.SetValue($val);
+@{ ok = $true; verified = ($vp.Current.Value -ceq $val) } | ConvertTo-Json -Compress;`, { timeoutMs: 45_000 });
+      if (!j.ok) throw new ExecError("set_value failed");
+      return { action_sent: true, strategy: "a11y", verified: j.verified === true };
     },
     select_text: async () => { throw new ExecError("select_text is not implemented on the win32 backend yet — fail-closed"); },
-    perform_action: async ({ target, action }) => {
-      assertUntargetedElement(target);
-      const b64path = Buffer.from(JSON.stringify(target.path ?? []), "utf8").toString("base64");
-      const act = String(action ?? "Invoke").replace(/'/g, "");
-      const j = await psJson(`Add-Type -AssemblyName UIAutomationClient; Add-Type -AssemblyName UIAutomationTypes;
-$path = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${b64path}'));
-$indices = $path | ConvertFrom-Json;
-$root = [System.Windows.Automation.AutomationElement]::RootElement;
-$targets = $root.FindAll([System.Windows.Automation.TreeScope]::Children, [System.Windows.Automation.Condition]::TrueCondition);
-$cur = $null;
-foreach ($t in $targets) { $cur = $t; break }
-foreach ($i in $indices) {
-  if ($i -eq 0) { continue }
-  $kids = $cur.FindAll([System.Windows.Automation.TreeScope]::Children, [System.Windows.Automation.Condition]::TrueCondition);
-  if ($i -ge $kids.Count) { Write-Output '{"ok": false, "code": "element_stale"}'; exit 0 }
-  $cur = $kids[$i];
-}
-$want = '${act}';
-try {
-  $pats = $cur.GetSupportedPatterns();
-  $names = @($pats | ForEach-Object { $_.ProgrammaticName -replace 'Pattern\$','' -replace 'Pattern$','' });
-  $chosen = $names | Where-Object { $_ -ieq $want } | Select-Object -First 1;
-  if (-not $chosen -and ($want -ieq 'click' -or $want -ieq 'invoke')) { $chosen = 'Invoke' }
-  if (-not $chosen) { Write-Output ('{"ok": false, "code": "action_not_found: " + ($names -join ",") }'); exit 0 }
-  $pt = $cur.GetCurrentPattern($pats | Where-Object { ($_.ProgrammaticName -replace 'Pattern$','') -ieq $chosen } | Select-Object -First 1);
-  if ($chosen -eq 'Invoke') { $pt.Invoke() } elseif ($chosen -eq 'ExpandCollapse') { $pt.Expand() } elseif ($chosen -eq 'Toggle') { $pt.Toggle() } else { $pt.Invoke() }
-  Write-Output '{"ok": true, "sent": true}';
-} catch { Write-Output ('{"ok": false, "code": "' + $_.Exception.Message.Replace('"','') + '"}') }`, { timeoutMs: 45_000 });
-      if (!j.ok) throw new ExecError(`perform_action failed: ${j.code}`);
+    perform_action: async ({ target, action = "Invoke" }) => {
+      const resolve = elementScript(target);
+      const actions = { invoke: ["Invoke", "Invoke"], click: ["Invoke", "Invoke"], toggle: ["Toggle", "Toggle"], expand: ["ExpandCollapse", "Expand"], expandcollapse: ["ExpandCollapse", "Expand"], collapse: ["ExpandCollapse", "Collapse"], select: ["SelectionItem", "Select"], selectionitem: ["SelectionItem", "Select"] };
+      const chosen = actions[String(action).toLowerCase()];
+      if (!chosen) throw new ExecError("unsupported UIA action");
+      await psOk(`${resolve}
+$pattern = $cur.GetCurrentPattern([System.Windows.Automation.${chosen[0]}Pattern]::Pattern);
+$pattern.${chosen[1]}();`, { timeoutMs: 45_000 });
       return { action_sent: true, strategy: "a11y", action };
     },
     read_clipboard: async () => {
       const j = await psJson(`$t = Get-Clipboard -Raw -ErrorAction SilentlyContinue;
-Write-Output ('{"text": ' + ($t | ConvertTo-Json -Compress) + '}');`, { timeoutMs: 10_000 });
+@{ text = [string]$t } | ConvertTo-Json -Compress;`, { timeoutMs: 10_000 });
       return { text: j.text ?? "", encoding: "utf8" };
     },
     write_clipboard: async ({ text }) => {

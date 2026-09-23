@@ -60,7 +60,7 @@ impl ToolSpec for ReadTool {
     }
 
     fn description(&self) -> &'static str {
-        "Read a text file. The whole file comes back in one call when it fits this call's output budget — 100000 bytes by default, raisable to 500000 with max_bytes. There is no line cap. Use offset and limit for an exact line range; when output is budget-limited the footer names the exact offset to continue from."
+        "Read a text file. The whole file comes back in one call when it fits this call's output budget — 100000 bytes by default, raisable to 500000 with max_bytes. There is no line cap. Use offset and limit for an exact line range; when output is budget-limited the footer names the exact offset to continue from. Every response reports the file's byte size, line count, and whether output was truncated."
     }
 
     fn input_schema(&self) -> Value {
@@ -227,7 +227,7 @@ impl FileTool {
         }
     }
 
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), expect(dead_code))]
     pub const fn read_only(name: &'static str) -> Self {
         Self {
             name,

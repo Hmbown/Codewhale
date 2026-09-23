@@ -25,6 +25,7 @@ const {args} = JSON.parse(process.argv[2]);
 const stop = () => { if(args.durationSec === 8) return; fs.writeFileSync(args.file, 'finalized'); process.exit(0); };
 process.on('SIGINT', stop); process.stdin.resume(); process.stdin.on('end', stop);
 fs.writeFileSync(path.join(path.dirname(args.file), '..', 'handler-installed'), '');
+fs.writeFileSync(path.join(path.dirname(args.file), '..', 'last-request.json'), process.argv[2]);
 fs.writeFileSync(args.file, 'partial');
 if(args.durationSec !== 7) console.log(JSON.stringify({ready:true}));
 setInterval(()=>{},1000);
@@ -98,6 +99,39 @@ test('session close bounds a stubborn recorder and retains its partial file', {s
   assert.equal(alive, false, 'the stubborn capture process was terminated');
   assert.equal(fs.readFileSync(recording.file, 'utf8'), 'partial');
   assert.equal((await owner.recordingList()).running.length, 0);
+});
+
+test('app_ref recording crops to the window rect on its hosting display', {skip:process.platform==='win32'}, async t => {
+  const { root } = fixture(t);
+  const requests = [];
+  const b = create({ exec: { async run(_cmd, args) {
+    const req = JSON.parse(args[0]);
+    requests.push(req.tool);
+    if (req.tool === 'input_capabilities') return {code:0,stdout:JSON.stringify({record_owner_pipe:1}),stderr:''};
+    if (req.tool === 'window_info') return {code:0,stdout:JSON.stringify({window_id:77,name:'FakeWin',points:{x:100,y:50,w:800,h:600}}),stderr:''};
+    assert.equal(req.tool, 'displays');
+    return { code: 0, stdout: JSON.stringify([{index:1,id:1,points:{x:0,y:0,w:2880,h:1620}},{index:2,id:2,points:{x:2880,y:0,w:1920,h:1080}}]), stderr: '' };
+  } } });
+  const rec = await b.recordingStart({ app_ref: { name: 'FakeApp' } });
+  t.after(() => b.closeSession().catch(() => {}));
+  assert.equal(rec.window.name, 'FakeWin');
+  assert.equal(rec.display, 1, 'window center selects the hosting display');
+  const sent = JSON.parse(fs.readFileSync(path.join(root, 'last-request.json'), 'utf8'));
+  assert.equal(sent.tool, 'record');
+  assert.deepEqual(sent.args.region, [100, 50, 800, 600]);
+  assert.equal(sent.args.displayID, 1);
+  await assert.rejects(b.recordingStart({ app_ref: { name: 'FakeApp' }, region: [0, 0, 10, 10] }), /not both/);
+});
+
+test('recording_list returns jpeg screenshots alongside recordings', {skip:process.platform==='win32'}, async t => {
+  const { make, root } = fixture(t);
+  const dir = path.join(root, 'recordings');
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, 'shot-a.jpg'), 'x');
+  fs.writeFileSync(path.join(dir, 'shot-b.png'), 'x');
+  fs.writeFileSync(path.join(dir, 'notes.txt'), 'x');
+  const list = await make().recordingList();
+  assert.deepEqual(list.recordings.map((r) => path.basename(r.file)).sort(), ['shot-a.jpg', 'shot-b.png']);
 });
 
 test('native recording startup notices owner pipe EOF without capturing a screen', {skip:process.platform!=='darwin'}, async t => {

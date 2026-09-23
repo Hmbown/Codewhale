@@ -7,6 +7,7 @@ pub mod context;
 pub mod discovery;
 pub mod export;
 pub mod install;
+pub mod managed_policy;
 pub mod manifest;
 pub mod marketplace;
 pub mod matcher;

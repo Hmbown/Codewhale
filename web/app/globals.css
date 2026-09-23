@@ -4,84 +4,124 @@
 @tailwind components;
 @tailwind utilities;
 
-/* ---------- root tokens — Tidal Folio ---------- */
+/* ---------- root tokens — GPUI theme ---------- */
 /*
- * The site is a folio read under the sea: paper at the surface, the whale's
- * navy at depth. Above the waterline the field is Whale Ivory — the same
- * ivory the TUI uses as body ink on its dark stage — and the ink is the Blue
- * Stage light preset's navy. Below the waterline (`.ocean-column`, the
- * footer, every terminal plate) the same names resolve to the dark whale
- * tokens, so a component written once reads correctly on either side.
+ * The site is a folio read in the product client's light: warm paper at the
+ * surface, warm charcoal at depth. Above the waterline the field is the GPUI
+ * light theme's paper and the ink is its plum-charcoal foreground. Below the
+ * waterline (`.ocean-column`, the footer, every terminal plate) the same
+ * names resolve to the dark charcoal tokens, so a component written once
+ * reads correctly on either side.
  *
  * The token NAMES keep their historical shape (`--paper`, `--ink`,
  * `--indigo`) so every component rule stays diffable; the VALUES resolve
- * through ./tokens.css, generated from crates/palette/src/tokens.rs by
- * scripts/export-design-tokens.py — no hand-copied hexes.
+ * through the `--gpui-*` block below, which now references the generated
+ * Shoreline tokens in ./tokens.css (crates/palette/src/tokens.rs is the
+ * single source — the same constants the GPUI client and the TUI open on).
+ * Only values with no Shoreline slot stay literal: the hover tones, the
+ * accent washes, and the AA-adapted state hues. `--whale-*`/`--light-*`
+ * remain available to anything that genuinely wants the terminal palette.
  */
 :root {
+  /* --- The GPUI source palette (generated Shoreline slots) --- */
+  --gpui-paper: var(--shoreline-light-surface);      /* light background — warm paper */
+  --gpui-paper-raised: var(--shoreline-light-elevated); /* light card/popover */
+  --gpui-paper-muted: var(--shoreline-light-panel);  /* light muted surface */
+  --gpui-ink: var(--shoreline-light-text-body);      /* light foreground */
+  --gpui-ink-soft: var(--shoreline-light-text-soft);
+  --gpui-ink-mute: var(--shoreline-light-text-muted); /* light muted_foreground */
+  --gpui-edge: var(--shoreline-light-border);        /* light border */
+  --gpui-primary: var(--shoreline-light-action);     /* light primary */
+  --gpui-primary-hover: #00536d;    /* light button_primary_hover — no Shoreline slot */
+  --gpui-accent: #dcebee;           /* light accent — no Shoreline slot */
+  --gpui-selection: var(--shoreline-light-selection); /* light selection */
+
+  --gpui-stage: var(--shoreline-surface);           /* dark background — warm charcoal */
+  --gpui-stage-deep: var(--shoreline-chrome);       /* deepest dark */
+  --gpui-stage-muted: var(--shoreline-panel);       /* dark muted surface */
+  --gpui-stage-raised: var(--shoreline-elevated);   /* raised dark plate */
+  --gpui-stage-ink: var(--shoreline-text-body);     /* dark foreground */
+  --gpui-stage-ink-soft: var(--shoreline-text-muted); /* dark muted_foreground */
+  --gpui-stage-ink-dim: var(--shoreline-text-dim);
+  --gpui-stage-edge: var(--shoreline-border);       /* dark border */
+  --gpui-primary-dark: var(--shoreline-action);     /* dark primary */
+  --gpui-primary-hover-dark: #93cde1; /* dark button_primary_hover — no Shoreline slot */
+  --gpui-on-primary: #102d38;       /* dark primary_foreground — no Shoreline slot */
+  --gpui-accent-dark: #303f48;      /* dark accent — no Shoreline slot */
+  --gpui-selection-dark: var(--shoreline-selection); /* dark selection */
+
+  /* Warm-muted state hues from the GPUI mockups, darkened or lifted per
+     side of the waterline so text uses of them still clear AA. No Shoreline
+     slots: these are site-specific adaptations. */
+  --gpui-tan: #b1a17a;              /* human mark */
+  --gpui-moss: #739686;             /* outcome */
+  --gpui-rust: #aa6f6c;             /* attention */
+
   /* RGB channel triples backing the Tailwind surface/ink tokens (see
      tailwind.config.ts). `.ocean-column` and the opt-in docs dark sheet
      override them for their dark subtree. */
-  --c-paper: var(--whale-text-body-rgb);
-  --c-paper-deep: var(--light-elevated-rgb);
-  --c-paper-edge: var(--light-border-rgb);
-  --c-ink: var(--light-text-body-rgb);
-  --c-ink-soft: var(--light-text-soft-rgb);
-  --c-ink-mute: var(--light-text-muted-rgb);
-  --c-indigo: var(--whale-cobalt-rgb);
-  --c-indigo-deep: var(--whale-composer-rgb);
-  --c-stage-soft: var(--whale-text-soft-rgb);
+  --c-paper: var(--shoreline-light-surface-rgb);
+  --c-paper-deep: var(--shoreline-light-panel-rgb);
+  --c-paper-edge: var(--shoreline-light-border-rgb);
+  --c-ink: var(--shoreline-light-text-body-rgb);
+  --c-ink-soft: var(--shoreline-light-text-soft-rgb);
+  --c-ink-mute: var(--shoreline-light-text-muted-rgb);
+  --c-indigo: var(--shoreline-light-action-rgb);
+  --c-indigo-deep: 0 83 109;       /* light primary hover — no Shoreline slot */
+  --c-stage-soft: var(--shoreline-text-muted-rgb);
+  --c-stage-deep: var(--shoreline-chrome-rgb);
+  --c-primary-dark: var(--shoreline-action-rgb);
 
   /* The sheet. */
-  --paper: var(--whale-text-body);
-  --paper-deep: var(--light-elevated);
-  --paper-edge: var(--light-border);
-  --paper-card: var(--light-panel);
-  --paper-line: var(--light-border);
-  --paper-line-soft: var(--light-border);
-  --ink: var(--light-text-body);
-  --ink-soft: var(--light-text-soft);
-  --ink-mute: var(--light-text-muted);
-  /* Action on paper is the ombre's dark end; hover sinks to brand navy. */
-  --indigo: var(--whale-cobalt);
-  --indigo-deep: var(--whale-composer);
-  --indigo-pale: rgb(var(--whale-cobalt-rgb) / 0.1);
-  --action-on-dark: var(--whale-action);
-  /* Semantic state inks at their light-preset values so they clear AA on
-     ivory: green is outcome, coral is attention, gold is the human mark. */
-  --ochre: var(--light-human);
-  --jade: var(--light-live);
-  --seafoam: var(--whale-accent-secondary);
-  --cobalt: var(--whale-cobalt);
-  --cyan: var(--light-live); /* reserved for the composer prompt glyph and the release line */
-  --ocean-deep: var(--whale-bg);
-  --ocean-mid: var(--whale-panel);
-  --ocean-current: var(--whale-ice);
-  --ocean-mist: var(--whale-text-soft);
-  --ocean-coral: var(--light-warning);
-  --signal-gold: var(--light-human);
-  /* The whale mark is brand navy on paper; below the waterline it is the
-     white silhouette. Gold stays reserved for human moments. */
-  --mark-ink: var(--whale-composer);
-  --stage-text: var(--whale-text-body);
-  --stage-soft: var(--whale-text-soft);
-  --stage-muted: var(--whale-text-muted);
+  --paper: var(--gpui-paper);
+  --paper-deep: var(--gpui-paper-muted);
+  --paper-edge: var(--gpui-edge);
+  --paper-card: var(--gpui-paper-raised);
+  --paper-line: var(--gpui-edge);
+  --paper-line-soft: var(--gpui-edge);
+  --ink: var(--gpui-ink);
+  --ink-soft: var(--gpui-ink-soft);
+  --ink-mute: var(--gpui-ink-mute);
+  /* Action on paper is the GPUI light primary; hover sinks to its hover. */
+  --indigo: var(--gpui-primary);
+  --indigo-deep: var(--gpui-primary-hover);
+  --indigo-pale: rgb(var(--c-indigo) / 0.1);
+  --action-on-dark: var(--gpui-primary-dark);
+  /* State inks darkened from the mockup hues so they clear AA on paper:
+     moss is outcome, rust is attention, tan is the human mark. */
+  --ochre: #7d6a3f;
+  --jade: #4e6f61;
+  --seafoam: var(--gpui-moss);
+  --cobalt: var(--gpui-primary);
+  --cyan: var(--gpui-primary); /* reserved for the composer prompt glyph and the release line */
+  --ocean-deep: var(--gpui-stage-deep);
+  --ocean-mid: var(--gpui-stage-muted);
+  --ocean-current: var(--gpui-primary-dark);
+  --ocean-mist: var(--gpui-stage-ink-soft);
+  --ocean-coral: #8f5a56;
+  --signal-gold: #7d6a3f;
+  /* The whale mark is ink on paper; below the waterline it is the light
+     stage foreground. The warm tan stays reserved for human moments. */
+  --mark-ink: var(--gpui-ink);
+  --stage-text: var(--gpui-stage-ink);
+  --stage-soft: var(--gpui-stage-ink-soft);
+  --stage-muted: var(--gpui-stage-ink-dim);
 
-  /* The water column, verbatim from crates/palette/src/tokens.rs. */
-  --stage-field-top: var(--whale-panel); /* surface */
-  --stage-field-mid: var(--whale-chrome); /* the authored 42% break */
-  --stage-field-deep: var(--whale-bg); /* deep field, and the footer seabed */
-  --stage-ambient: #264866;
-  --stage-composer: var(--whale-composer); /* the raised input plate */
-  --stage-elevated: var(--whale-elevated);
-  --stage-line: var(--whale-border); /* blue at 25% on stage */
-  --stage-hint: #8491aa;
-  --stage-dim: var(--whale-text-muted);
-  --violet: var(--whale-mode-operate); /* 1px rules only, never text */
+  /* The water column, re-inked in the GPUI dark ramp. */
+  --stage-field-top: var(--gpui-stage-muted); /* surface */
+  --stage-field-mid: var(--gpui-stage); /* the authored 42% break */
+  --stage-field-deep: var(--gpui-stage-deep); /* deep field, and the footer seabed */
+  --stage-ambient: var(--gpui-accent-dark);
+  --stage-composer: var(--gpui-stage-muted); /* the raised input plate */
+  --stage-elevated: var(--gpui-stage-raised);
+  --stage-line: var(--gpui-stage-edge); /* the charcoal border on stage */
+  --stage-hint: var(--gpui-stage-ink-dim);
+  --stage-dim: var(--gpui-stage-ink-soft);
+  --violet: var(--gpui-selection-dark); /* 1px rules only, never text */
 
   /* Newsreader carries h1/h2; Shannon Sans supplies body and small headings.
      The historic condensed role keeps its scale and weight, not a second face.
-     JetBrains Mono and the Unicode fallback stacks retain their own roles. */
+     IBM Plex Mono and the Unicode fallback stacks retain their own roles. */
   --font-body: var(--font-shannon-sans);
   --font-display: var(--font-shannon-sans);
   --font-cjk: "PingFang SC", "Hiragino Sans GB", "Source Han Serif SC",
@@ -89,10 +129,10 @@
 
   /* Hairline + code surfaces routed through vars so the dark subtrees can
      re-ink them without touching every rule. Code plates are always the
-     terminal's own navy, on either side of the waterline. */
-  --hairline: rgb(var(--light-text-body-rgb) / 0.14);
-  --code-bg: var(--whale-chrome);
-  --code-fg: var(--whale-text-body);
+     stage's own deepest field, on either side of the waterline. */
+  --hairline: rgb(var(--c-ink) / 0.16);
+  --code-bg: var(--gpui-stage-deep);
+  --code-fg: var(--gpui-stage-ink);
 
   /* One site container and one vertical rhythm. Every page gutter aligns
      with the nav; every hero and section shares a single padding token. */
@@ -111,33 +151,33 @@
 .ocean-column,
 .site-footer,
 html[data-theme="dark"] .docs-portal {
-  --c-paper: var(--whale-bg-rgb);
-  --c-paper-deep: var(--whale-panel-rgb);
-  --c-paper-edge: var(--whale-border-rgb);
-  --c-ink: var(--whale-text-body-rgb);
-  --c-ink-soft: var(--whale-text-soft-rgb);
-  --c-ink-mute: var(--whale-text-muted-rgb);
-  --c-indigo: var(--whale-action-rgb);
-  --c-indigo-deep: 143 196 248; /* lifted action blue — hover on dark */
-  --paper: var(--whale-bg);
-  --paper-deep: var(--whale-panel);
-  --paper-edge: var(--whale-border);
-  --paper-card: var(--whale-panel);
-  --paper-line: var(--whale-border);
-  --paper-line-soft: var(--whale-border);
-  --ink: var(--whale-text-body);
-  --ink-soft: var(--whale-text-soft);
-  --ink-mute: var(--whale-text-muted);
-  --indigo: var(--whale-action);
-  --indigo-deep: #8fc4f8;
-  --indigo-pale: rgb(var(--whale-action-rgb) / 0.16);
-  --ochre: var(--whale-human);
-  --jade: var(--whale-working-green);
-  --cyan: var(--whale-cyan);
-  --ocean-coral: var(--whale-warning);
-  --signal-gold: var(--whale-human);
-  --mark-ink: #ffffff;
-  --hairline: rgb(var(--whale-action-rgb) / 0.2);
+  --c-paper: var(--shoreline-surface-rgb);
+  --c-paper-deep: var(--shoreline-panel-rgb);
+  --c-paper-edge: var(--shoreline-border-rgb);
+  --c-ink: var(--shoreline-text-body-rgb);
+  --c-ink-soft: var(--shoreline-text-muted-rgb);
+  --c-ink-mute: var(--shoreline-text-dim-rgb);
+  --c-indigo: var(--shoreline-action-rgb);
+  --c-indigo-deep: 147 205 225; /* lifted primary — hover on dark, no Shoreline slot */
+  --paper: var(--gpui-stage);
+  --paper-deep: var(--gpui-stage-muted);
+  --paper-edge: var(--gpui-stage-edge);
+  --paper-card: var(--gpui-stage-muted);
+  --paper-line: var(--gpui-stage-edge);
+  --paper-line-soft: var(--gpui-stage-edge);
+  --ink: var(--gpui-stage-ink);
+  --ink-soft: var(--gpui-stage-ink-soft);
+  --ink-mute: var(--gpui-stage-ink-dim);
+  --indigo: var(--gpui-primary-dark);
+  --indigo-deep: var(--gpui-primary-hover-dark);
+  --indigo-pale: rgb(var(--c-primary-dark) / 0.14);
+  --ochre: #d6c78f;
+  --jade: #9ec7b2;
+  --cyan: var(--gpui-primary-dark);
+  --ocean-coral: #d08a80;
+  --signal-gold: #d6c78f;
+  --mark-ink: var(--gpui-stage-ink);
+  --hairline: rgb(var(--c-stage-soft) / 0.2);
   color-scheme: dark;
 }
 /* ---------- base ---------- */
@@ -190,7 +230,7 @@ main, header, footer, nav { position: relative; z-index: 1; }
 .cjk-prose {
   font-feature-settings: "halt", "pwid";
 }
-.font-mono { font-family: var(--font-mono), "JetBrains Mono", ui-monospace, monospace; }
+.font-mono { font-family: var(--font-mono), "IBM Plex Mono", ui-monospace, monospace; }
 
 /* ---------- the ` · ` chain ---------- */
 /* The single most recognisable thing about the TUI — its header, empty state
@@ -203,7 +243,7 @@ main, header, footer, nav { position: relative; z-index: 1; }
   display: flex;
   flex-wrap: wrap;
   align-items: baseline;
-  font-family: var(--font-mono), "JetBrains Mono", ui-monospace, monospace;
+  font-family: var(--font-mono), "IBM Plex Mono", ui-monospace, monospace;
   font-size: 0.75rem;
   letter-spacing: 0.02em;
   text-transform: none;
@@ -330,7 +370,7 @@ html[lang="ko"] h3 {
 
 /* small-caps eyebrow — muted mono chrome for compact labels */
 .eyebrow {
-  font-family: var(--font-mono), "JetBrains Mono", monospace;
+  font-family: var(--font-mono), "IBM Plex Mono", monospace;
   font-size: 0.7rem;
   font-weight: 500;
   letter-spacing: 0.18em;
@@ -426,7 +466,7 @@ pre.code-block::before {
   background: var(--hairline);
 }
 pre.code-block .prompt { color: var(--action-on-dark); }
-pre.code-block .comment { color: #8b8f9a; }
+pre.code-block .comment { color: var(--gpui-stage-ink-dim); }
 pre.code-block .key { color: var(--signal-gold); }
 
 @media (max-width: 640px) {
@@ -473,7 +513,7 @@ mark.search-highlight {
   z-index: 30;
   top: 0;
   border-bottom: 1px solid var(--hairline);
-  background: rgb(var(--whale-text-body-rgb) / 0.94);
+  background: rgb(var(--c-paper) / 0.94);
   backdrop-filter: blur(10px);
 }
 
@@ -541,7 +581,7 @@ mark.search-highlight {
 }
 
 .paper-star-badge {
-  font-family: var(--font-mono), "JetBrains Mono", monospace;
+  font-family: var(--font-mono), "IBM Plex Mono", monospace;
   font-size: 0.75rem;
   letter-spacing: 0.04em;
   text-transform: uppercase;
@@ -553,7 +593,7 @@ mark.search-highlight {
   padding: 0.35rem 0.85rem;
   background: var(--indigo-deep);
   color: var(--paper);
-  font-family: var(--font-mono), "JetBrains Mono", monospace;
+  font-family: var(--font-mono), "IBM Plex Mono", monospace;
   font-size: 0.7rem;
   font-weight: 600;
   letter-spacing: 0.1em;
@@ -578,7 +618,7 @@ mark.search-highlight {
   align-items: center;
   min-height: 2.25rem;
   padding: 0.35rem 0.75rem;
-  font-family: var(--font-mono), "JetBrains Mono", monospace;
+  font-family: var(--font-mono), "IBM Plex Mono", monospace;
   font-size: 0.7rem;
   font-weight: 600;
   letter-spacing: 0.08em;
@@ -666,7 +706,7 @@ mark.search-highlight {
   position: relative;
   height: clamp(9rem, 18vw, 15rem);
   overflow: hidden;
-  background: var(--whale-text-body);
+  background: var(--paper);
 }
 .site-footer-waterline > svg {
   position: absolute;
@@ -702,7 +742,7 @@ main:has(.ocean-column) + .site-footer .site-footer-main { border-top-color: tra
 }
 
 .site-footer-links > div { display: flex; flex-direction: column; gap: 0.55rem; }
-.site-footer-links span { margin-bottom: 0.25rem; color: var(--ocean-current); font-family: var(--font-mono), "JetBrains Mono", monospace; font-size: 0.75rem; letter-spacing: 0.1em; text-transform: uppercase; }
+.site-footer-links span { margin-bottom: 0.25rem; color: var(--ocean-current); font-family: var(--font-mono), "IBM Plex Mono", monospace; font-size: 0.75rem; letter-spacing: 0.1em; text-transform: uppercase; }
 .site-footer-links a { color: rgb(var(--c-stage-soft) / 0.76); font-size: 0.82rem; }
 .site-footer-links a:hover { color: var(--stage-text); }
 
@@ -714,7 +754,7 @@ main:has(.ocean-column) + .site-footer .site-footer-main { border-top-color: tra
   padding-block: 1rem;
   border-top: 1px solid rgb(var(--c-stage-soft) / 0.13);
   color: rgb(var(--c-stage-soft) / 0.5);
-  font-family: var(--font-mono), "JetBrains Mono", monospace;
+  font-family: var(--font-mono), "IBM Plex Mono", monospace;
   font-size: 0.75rem;
 }
 
@@ -1060,7 +1100,7 @@ a.body-link:hover { background-size: 100% 6px; color: var(--ink); }
     ellipse 82% 44% at 24% -22%,
     transparent 0,
     transparent 2.7rem,
-    rgb(var(--whale-text-dim-rgb) / 0.18) 2.76rem,
+    rgb(var(--c-stage-soft) / 0.18) 2.76rem,
     transparent 2.83rem
   );
   mask-image: linear-gradient(to bottom, transparent, black 24%, black 72%, transparent);
@@ -1155,7 +1195,7 @@ a.body-link:hover { background-size: 100% 6px; color: var(--ink); }
 
 .portal-quickstart {
   padding: clamp(1.35rem, 3vw, 2rem);
-  border: 1px solid rgb(var(--whale-ice-rgb) / 0.22);
+  border: 1px solid rgb(var(--c-stage-soft) / 0.2);
   border-radius: 8px;
   background: var(--ocean-deep);
   box-shadow: 0 1.25rem 3rem rgba(0, 0, 0, 0.45);
@@ -1164,7 +1204,7 @@ a.body-link:hover { background-size: 100% 6px; color: var(--ink); }
 
 .portal-quickstart > span {
   color: var(--stage-muted);
-  font-family: var(--font-mono), "JetBrains Mono", monospace;
+  font-family: var(--font-mono), "IBM Plex Mono", monospace;
   font-size: 0.7rem;
   letter-spacing: 0.1em;
   text-transform: uppercase;
@@ -1186,8 +1226,8 @@ a.body-link:hover { background-size: 100% 6px; color: var(--ink); }
 
 .portal-quickstart pre.code-block {
   margin-top: 1.15rem;
-  border-color: rgb(var(--whale-ice-rgb) / 0.2);
-  background: rgb(var(--whale-bg-rgb) / 0.6);
+  border-color: rgb(var(--c-stage-soft) / 0.2);
+  background: rgb(var(--c-stage-deep) / 0.6);
 }
 
 .portal-quickstart > a {
@@ -1301,7 +1341,8 @@ a.body-link:hover { background-size: 100% 6px; color: var(--ink); }
   border-top: 1px solid var(--hairline);
 }
 
-.portal-topic-list > a {
+.portal-topic-list > a,
+.portal-topic-list > div {
   display: grid;
   grid-template-columns: minmax(8rem, 0.42fr) minmax(0, 1fr) auto;
   gap: 1.25rem;
@@ -1351,6 +1392,59 @@ a.body-link:hover { background-size: 100% 6px; color: var(--ink); }
   text-underline-offset: 0.25rem;
 }
 
+/* Sortable model table — quiet column-header buttons; the active column
+   carries a direction mark instead of a color change. */
+.models-sort {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 0.35rem;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--ink-mute);
+  font: inherit;
+  font-weight: 500;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.models-sort:hover {
+  color: var(--ink);
+}
+
+.models-sort.is-active {
+  color: var(--indigo-deep);
+}
+
+.models-sort-mark {
+  font-size: 0.72em;
+  color: var(--ink-mute);
+}
+
+.models-sort.is-active .models-sort-mark {
+  color: var(--indigo-deep);
+}
+
+.models-sort:focus-visible {
+  outline: 2px solid var(--indigo);
+  outline-offset: 3px;
+  border-radius: 2px;
+}
+
+.models-reasoning {
+  display: inline-block;
+  margin-left: 0.5rem;
+  padding: 0.05rem 0.4rem;
+  border: 1px solid var(--hairline);
+  border-radius: 999px;
+  color: var(--ink-mute);
+  font-family: var(--font-mono);
+  font-size: 0.62rem;
+  letter-spacing: 0.04em;
+  vertical-align: middle;
+  white-space: nowrap;
+}
+
 .portal-doc-groups {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -1382,7 +1476,7 @@ a.body-link:hover { background-size: 100% 6px; color: var(--ink); }
 .portal-community {
   padding-block: clamp(3.25rem, 6vw, 4.75rem);
   background:
-    radial-gradient(circle at 84% -30%, rgb(var(--whale-cyan-rgb) / 0.14), transparent 30rem),
+    radial-gradient(circle at 84% -30%, rgb(var(--c-primary-dark) / 0.1), transparent 30rem),
     var(--ocean-deep);
   color: var(--stage-soft);
 }
@@ -1413,7 +1507,7 @@ a.body-link:hover { background-size: 100% 6px; color: var(--ink); }
   gap: 0.8rem 1.5rem;
   margin-top: 1.5rem;
   padding-top: 1.25rem;
-  border-top: 1px solid rgb(var(--whale-ice-rgb) / 0.18);
+  border-top: 1px solid rgb(var(--c-stage-soft) / 0.18);
 }
 
 .portal-community-links a {
@@ -1485,7 +1579,7 @@ a.body-link:hover { background-size: 100% 6px; color: var(--ink); }
 
 .contribute-steps li > span {
   color: var(--indigo-deep);
-  font-family: var(--font-mono), "JetBrains Mono", monospace;
+  font-family: var(--font-mono), "IBM Plex Mono", monospace;
   font-size: 0.75rem;
 }
 
@@ -1531,8 +1625,8 @@ a.body-link:hover { background-size: 100% 6px; color: var(--ink); }
 }
 
 .contribute-dev-loop pre.code-block {
-  border-color: rgb(var(--whale-ice-rgb) / 0.2);
-  background: rgb(var(--whale-bg-rgb) / 0.62);
+  border-color: rgb(var(--c-stage-soft) / 0.2);
+  background: rgb(var(--c-stage-deep) / 0.62);
 }
 
 @media (max-width: 900px) {
@@ -1591,16 +1685,20 @@ a.body-link:hover { background-size: 100% 6px; color: var(--ink); }
   }
 
   .portal-topic-list > a,
-  .portal-doc-groups .portal-topic-list > a {
+  .portal-topic-list > div,
+  .portal-doc-groups .portal-topic-list > a,
+  .portal-doc-groups .portal-topic-list > div {
     grid-template-columns: 1fr auto;
     gap: 0.45rem 1rem;
   }
 
-  .portal-topic-list > a span:nth-child(2) {
+  .portal-topic-list > a span:nth-child(2),
+  .portal-topic-list > div span:nth-child(2) {
     grid-column: 1 / -1;
   }
 
-  .portal-topic-list > a span:last-child {
+  .portal-topic-list > a span:last-child,
+  .portal-topic-list > div span:last-child {
     grid-column: 2;
     grid-row: 1;
   }
@@ -1744,31 +1842,31 @@ a.body-link:hover { background-size: 100% 6px; color: var(--ink); }
   width: min(100%, 40rem);
   margin-top: clamp(4rem, 12vw, 11rem);
   margin: 0;
-  border: 1px solid rgb(var(--whale-ice-rgb) / 0.22);
+  border: 1px solid rgb(var(--c-stage-soft) / 0.2);
   border-radius: 8px;
   overflow: hidden;
-  background: var(--whale-bg);
+  background: var(--gpui-stage-deep);
   /* The one shadow on the site: the plate is lifted off the water, so the
-     shadow is soft, blue, and offset downward the way light through water
-     would cast it. */
-  box-shadow: 0 30px 60px -24px rgb(var(--whale-bg-rgb) / 0.75);
+     shadow is soft and offset downward the way light through water would
+     cast it. */
+  box-shadow: 0 30px 60px -24px rgb(var(--c-stage-deep) / 0.75);
 }
 
 .folio-shot img {
   display: block;
   width: 100%;
   height: auto;
-  background: var(--whale-bg);
+  background: var(--gpui-stage-deep);
 }
 
 .folio-shot figcaption {
   display: grid;
   gap: 0.35rem;
   padding: 0.7rem 0.95rem 0.8rem;
-  border-top: 1px solid rgb(var(--whale-ice-rgb) / 0.14);
-  background: var(--whale-chrome);
+  border-top: 1px solid rgb(var(--c-stage-soft) / 0.14);
+  background: var(--gpui-stage);
   color: var(--stage-soft);
-  font-family: var(--font-mono), "JetBrains Mono", monospace;
+  font-family: var(--font-mono), "IBM Plex Mono", monospace;
   font-size: 0.75rem;
   line-height: 1.5;
 }
@@ -1783,7 +1881,7 @@ a.body-link:hover { background-size: 100% 6px; color: var(--ink); }
 .folio-shot .paper-facts .dotline-chip {
   padding: 0.08rem 0.36rem;
   border-radius: 3px;
-  background: var(--whale-panel);
+  background: var(--gpui-stage-muted);
   color: var(--stage-text);
   font-weight: 600;
 }
@@ -1805,9 +1903,9 @@ a.body-link:hover { background-size: 100% 6px; color: var(--ink); }
 .folio-chapter-num {
   display: block;
   padding-bottom: 0.7rem;
-  border-bottom: 1px solid rgb(var(--whale-ice-rgb) / 0.3);
+  border-bottom: 1px solid rgb(var(--c-stage-soft) / 0.3);
   color: var(--action-on-dark);
-  font-family: var(--font-mono), "JetBrains Mono", monospace;
+  font-family: var(--font-mono), "IBM Plex Mono", monospace;
   font-size: 0.75rem;
   letter-spacing: 0.12em;
   text-transform: uppercase;
@@ -1883,7 +1981,7 @@ a.body-link:hover { background-size: 100% 6px; color: var(--ink); }
   display: block;
   margin-bottom: 1.1rem;
   color: var(--indigo);
-  font-family: var(--font-mono), "JetBrains Mono", monospace;
+  font-family: var(--font-mono), "IBM Plex Mono", monospace;
   font-size: 0.75rem;
   letter-spacing: 0.12em;
   text-transform: uppercase;
@@ -1903,7 +2001,7 @@ a.body-link:hover { background-size: 100% 6px; color: var(--ink); }
 
 .folio-fact-list dt {
   color: var(--ink);
-  font-family: var(--font-mono), "JetBrains Mono", monospace;
+  font-family: var(--font-mono), "IBM Plex Mono", monospace;
   font-size: 0.8rem;
   font-weight: 500;
 }
@@ -2009,7 +2107,7 @@ a.body-link:hover { background-size: 100% 6px; color: var(--ink); }
 
 .gs-step-index {
   color: var(--indigo);
-  font-family: var(--font-mono), "JetBrains Mono", monospace;
+  font-family: var(--font-mono), "IBM Plex Mono", monospace;
   font-size: 0.75rem;
 }
 
@@ -2039,7 +2137,7 @@ pre.gs-step-commands {
   display: inline-block;
   margin-top: 0.9rem;
   color: var(--indigo);
-  font-family: var(--font-mono), "JetBrains Mono", monospace;
+  font-family: var(--font-mono), "IBM Plex Mono", monospace;
   font-size: 0.75rem;
 }
 
@@ -2057,7 +2155,7 @@ pre.gs-step-commands {
   padding: 0.55rem 0.9rem;
   background: var(--ink);
   color: var(--paper);
-  font-family: var(--font-mono), "JetBrains Mono", monospace;
+  font-family: var(--font-mono), "IBM Plex Mono", monospace;
   font-size: 0.75rem;
 }
 
@@ -2075,7 +2173,7 @@ pre.gs-step-commands {
   gap: 0.4rem;
   padding: 0.2rem 0.55rem;
   border: 1px solid var(--hairline);
-  font-family: var(--font-mono), "JetBrains Mono", monospace;
+  font-family: var(--font-mono), "IBM Plex Mono", monospace;
   font-size: 0.7rem;
   letter-spacing: 0.08em;
   text-transform: uppercase;
@@ -2140,7 +2238,7 @@ pre.gs-step-commands {
 
 .session-media-caption a {
   color: var(--indigo);
-  font-family: var(--font-mono), "JetBrains Mono", monospace;
+  font-family: var(--font-mono), "IBM Plex Mono", monospace;
   font-size: 0.75rem;
 }
 
@@ -2210,7 +2308,7 @@ pre.gs-step-commands {
 .ocean-column {
   position: relative;
   isolation: isolate;
-  background: linear-gradient(180deg, var(--whale-chrome) 0%, var(--whale-bg) 38rem);
+  background: linear-gradient(180deg, var(--gpui-stage) 0%, var(--gpui-stage-deep) 38rem);
   color: var(--ink);
 }
 
@@ -2301,7 +2399,7 @@ pre.gs-step-commands {
 
 .product-surface-list strong {
   color: var(--stage-text);
-  font-family: var(--font-mono), "JetBrains Mono", monospace;
+  font-family: var(--font-mono), "IBM Plex Mono", monospace;
   font-size: 1rem;
 }
 
@@ -2356,7 +2454,7 @@ pre.gs-step-commands {
   left: 1.1rem;
   z-index: 1;
   color: var(--cyan);
-  font-family: var(--font-mono), "JetBrains Mono", ui-monospace, monospace;
+  font-family: var(--font-mono), "IBM Plex Mono", ui-monospace, monospace;
   font-size: 0.78rem;
   line-height: 1.55;
   pointer-events: none;
@@ -2696,7 +2794,7 @@ pre.gs-step-commands {
 .docs-breadcrumb {
   margin-bottom: 1.15rem;
   color: var(--ink-mute);
-  font-family: var(--font-mono), "JetBrains Mono", ui-monospace, monospace;
+  font-family: var(--font-mono), "IBM Plex Mono", ui-monospace, monospace;
   font-size: 0.75rem;
 }
 
@@ -2836,7 +2934,7 @@ pre.gs-step-commands {
 .docs-topic-source {
   overflow: hidden;
   color: var(--ink-mute);
-  font-family: var(--font-mono), "JetBrains Mono", monospace;
+  font-family: var(--font-mono), "IBM Plex Mono", monospace;
   font-size: 0.75rem;
   line-height: 1.5;
   text-overflow: ellipsis;
@@ -2970,7 +3068,7 @@ pre.gs-step-commands {
   padding: 0.3rem 0.45rem;
   border: 1px solid var(--hairline);
   color: var(--ink-soft);
-  font-family: var(--font-mono), "JetBrains Mono", monospace;
+  font-family: var(--font-mono), "IBM Plex Mono", monospace;
   font-size: 0.75rem;
 }
 
@@ -2993,10 +3091,10 @@ pre.gs-step-commands {
 /* ------------------------------------------------------------------ */
 
 .docs-theme {
-  --docs-accent: var(--whale-cobalt);
-  --docs-button-bg: var(--light-panel);
-  --docs-button-border: var(--light-border);
-  --docs-button-text: var(--light-text-body);
+  --docs-accent: var(--gpui-primary);
+  --docs-button-bg: var(--gpui-paper-raised);
+  --docs-button-border: var(--gpui-edge);
+  --docs-button-text: var(--gpui-ink);
   background: var(--paper);
   color: var(--ink);
 }
@@ -3024,12 +3122,12 @@ pre.gs-step-commands {
    the shared below-the-waterline rule; only the docs-specific inks are
    restated here. */
 html[data-theme="dark"] .docs-theme {
-  --docs-accent: var(--whale-action);
-  --docs-button-bg: var(--whale-panel);
-  --docs-button-border: var(--whale-border);
-  --docs-button-text: var(--whale-text-body);
-  --code-bg: var(--whale-chrome);
-  --code-fg: var(--whale-text-body);
+  --docs-accent: var(--gpui-primary-dark);
+  --docs-button-bg: var(--gpui-stage-muted);
+  --docs-button-border: var(--gpui-stage-edge);
+  --docs-button-text: var(--gpui-stage-ink);
+  --code-bg: var(--gpui-stage-deep);
+  --code-fg: var(--gpui-stage-ink);
 }
 
 
@@ -3193,7 +3291,7 @@ html[data-theme="dark"] .docs-theme {
 .connection-copy { min-width: 0; }
 .connection-title { font-size: 0.86rem; font-weight: 600; }
 .connection-body { margin-top: 0.15rem; color: var(--ink-soft); font-size: 0.78rem; line-height: 1.5; }
-.connection-checked { color: var(--ink-mute); font-family: var(--font-mono), "JetBrains Mono", monospace; font-size: 0.75rem; }
+.connection-checked { color: var(--ink-mute); font-family: var(--font-mono), "IBM Plex Mono", monospace; font-size: 0.75rem; }
 
 .connection-actions { display: flex; gap: 0.5rem; }
 
@@ -3205,7 +3303,7 @@ html[data-theme="dark"] .docs-theme {
   border: 1px solid var(--stage-line);
   border-radius: 5px;
   color: var(--ink);
-  font-family: var(--font-mono), "JetBrains Mono", monospace;
+  font-family: var(--font-mono), "IBM Plex Mono", monospace;
   font-size: 0.75rem;
   font-weight: 600;
   letter-spacing: 0.08em;
@@ -3310,7 +3408,7 @@ html[data-theme="dark"] .docs-theme {
 }
 
 .docs-help-source {
-  font-family: var(--font-mono), "JetBrains Mono", monospace;
+  font-family: var(--font-mono), "IBM Plex Mono", monospace;
   font-size: 0.75rem !important;
   color: var(--ink-mute) !important;
 }
@@ -3334,7 +3432,7 @@ html[data-theme="dark"] .docs-theme {
   min-height: 2.5rem;
   align-items: center;
   color: var(--indigo);
-  font-family: var(--font-mono), "JetBrains Mono", monospace;
+  font-family: var(--font-mono), "IBM Plex Mono", monospace;
   font-size: 0.75rem;
 }
 
@@ -3398,7 +3496,7 @@ html[data-theme="dark"] .docs-theme {
 .changelog-facts span {
   display: block;
   color: var(--ink-mute);
-  font-family: var(--font-mono), "JetBrains Mono", monospace;
+  font-family: var(--font-mono), "IBM Plex Mono", monospace;
   font-size: 0.7rem;
   letter-spacing: 0.1em;
   text-transform: uppercase;
@@ -3482,7 +3580,7 @@ html[data-theme="dark"] .docs-theme {
 
 .changelog-sections h3 a {
   color: var(--ink-mute);
-  font-family: var(--font-mono), "JetBrains Mono", monospace;
+  font-family: var(--font-mono), "IBM Plex Mono", monospace;
   font-size: 0.75rem;
   letter-spacing: 0.04em;
   text-transform: none;
@@ -3546,12 +3644,12 @@ html[data-theme="dark"] .docs-theme {
 }
 
 .usage-counting-status {
-  color: var(--light-text-body);
+  color: var(--ink);
   font-weight: 500;
 }
 
 .usage-counting-elsewhere {
-  color: var(--light-text-muted);
+  color: var(--ink-mute);
   font-size: 0.9rem;
 }
 
@@ -3561,9 +3659,9 @@ html[data-theme="dark"] .docs-theme {
   min-height: 2.75rem;
   align-items: center;
   padding: 0.5rem 1.1rem;
-  border: 1px solid var(--whale-composer);
+  border: 1px solid var(--indigo);
   border-radius: 5px;
-  color: var(--whale-composer);
+  color: var(--indigo);
   font-size: 0.95rem;
   font-weight: 500;
   cursor: pointer;
@@ -3571,11 +3669,11 @@ html[data-theme="dark"] .docs-theme {
 }
 
 .usage-counting-button:hover {
-  background: rgb(var(--whale-cobalt-rgb) / 0.1);
+  background: rgb(var(--c-indigo) / 0.1);
 }
 
 .usage-counting-button:focus-visible {
-  outline: 2px solid var(--whale-cobalt);
+  outline: 2px solid var(--indigo);
   outline-offset: 2px;
 }
 
@@ -3644,7 +3742,7 @@ html[data-theme="dark"] .docs-theme {
 }
 
 .docs-sidebar-category {
-  font-family: var(--font-mono), "JetBrains Mono", monospace;
+  font-family: var(--font-mono), "IBM Plex Mono", monospace;
   font-size: 0.68rem;
   letter-spacing: 0.14em;
 }

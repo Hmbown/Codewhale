@@ -2,7 +2,7 @@ use super::*;
 use crate::tools::plan::PlanSnapshot;
 use crate::tui::history::{
     ExecCell, ExecSource, HistoryCell, PlanUpdateCell, ReasoningAction, ReasoningActionTarget,
-    ToolCell, ToolStatus, TranscriptActionOwner,
+    ThinkingFold, ToolCell, ToolStatus, TranscriptActionOwner,
 };
 use codewhale_localization::Locale;
 use codewhale_palette as palette;
@@ -128,17 +128,75 @@ fn spacer_rows_after_cell(cache: &TranscriptViewCache, target_cell: usize) -> us
 }
 
 #[test]
-fn cache_renders_user_cells_with_highlight_background() {
-    let cells = vec![user_cell("# literal user prompt")];
-    let revisions = vec![1u64];
+fn cache_highlights_only_the_newest_user_turn() {
+    let cells = vec![
+        user_cell("first prompt"),
+        assistant_cell("first answer", false),
+        user_cell("second prompt"),
+    ];
+    let revisions = vec![1u64, 1, 1];
 
     let mut cache = TranscriptViewCache::new();
     cache.ensure(&cells, &revisions, 40, TranscriptRenderOptions::default());
 
+    let texts = plain_lines(&cache);
+    let first = texts
+        .iter()
+        .position(|line| line.contains("first prompt"))
+        .expect("first prompt renders");
+    let second = texts
+        .iter()
+        .position(|line| line.contains("second prompt"))
+        .expect("second prompt renders");
     let lines = cache.lines();
-    assert_eq!(lines[0].style.bg, Some(palette::SURFACE_ELEVATED));
-    assert_eq!(lines[0].width(), 40);
-    assert_eq!(plain_lines(&cache)[0].trim_end(), "▎ # literal user prompt");
+    assert_eq!(
+        lines[first].style.bg, None,
+        "an older prompt renders on the bare ground"
+    );
+    assert!(
+        lines[first]
+            .spans
+            .iter()
+            .all(|span| span.style.bg.is_none()),
+        "an older prompt paints no background block"
+    );
+    assert_eq!(
+        lines[second].style.bg,
+        Some(palette::SURFACE_ELEVATED),
+        "only the newest prompt carries the background"
+    );
+    assert_eq!(lines[second].width(), 40);
+}
+
+#[test]
+fn cache_unhighlights_the_previous_prompt_when_a_new_one_lands() {
+    let first = vec![user_cell("first prompt")];
+    let revisions = vec![1u64];
+
+    let mut cache = TranscriptViewCache::new();
+    cache.ensure(&first, &revisions, 40, TranscriptRenderOptions::default());
+    assert_eq!(
+        cache.lines()[0].style.bg,
+        Some(palette::SURFACE_ELEVATED),
+        "a lone prompt is the newest turn"
+    );
+
+    // The first cell's own revision never moves; supersession alone must
+    // re-render it without the block.
+    let both = vec![user_cell("first prompt"), user_cell("second prompt")];
+    let revisions = vec![1u64, 1];
+    cache.ensure(&both, &revisions, 40, TranscriptRenderOptions::default());
+    let lines = cache.lines();
+    assert_eq!(
+        lines[0].style.bg, None,
+        "the previous newest loses the background"
+    );
+    let texts = plain_lines(&cache);
+    let second = texts
+        .iter()
+        .position(|line| line.contains("second prompt"))
+        .expect("second prompt renders");
+    assert_eq!(lines[second].style.bg, Some(palette::SURFACE_ELEVATED));
 }
 
 #[test]
@@ -879,7 +937,7 @@ fn hidden_reasoning_cache_never_advertises_or_leaks_content() {
                 show_thinking: false,
                 ..TranscriptRenderOptions::default()
             },
-            &HashSet::new(),
+            &HashMap::new(),
             None,
             Some(reasoning_owner(0)),
         );
@@ -1156,7 +1214,7 @@ fn ensure_filtered_matches_ensure_split_output() {
         &revisions,
         40,
         options,
-        &HashSet::new(),
+        &HashMap::new(),
         Some(&index_map),
         None,
     );
@@ -1168,7 +1226,7 @@ fn ensure_filtered_matches_ensure_split_output() {
         &revisions,
         40,
         options,
-        &HashSet::new(),
+        &HashMap::new(),
         Some(&index_map),
         None,
     );
@@ -1196,7 +1254,7 @@ fn ensure_filtered_reuses_unchanged_cells() {
         &revisions,
         80,
         TranscriptRenderOptions::default(),
-        &HashSet::new(),
+        &HashMap::new(),
         None,
         None,
     );
@@ -1207,7 +1265,7 @@ fn ensure_filtered_reuses_unchanged_cells() {
         &revisions,
         80,
         TranscriptRenderOptions::default(),
-        &HashSet::new(),
+        &HashMap::new(),
         None,
         None,
     );
@@ -1226,7 +1284,7 @@ fn ensure_filtered_reuses_unchanged_cells() {
         &revisions,
         80,
         TranscriptRenderOptions::default(),
-        &HashSet::new(),
+        &HashMap::new(),
         None,
         None,
     );
@@ -1274,7 +1332,7 @@ fn prose_cells_fill_full_width_on_ultrawide_by_default() {
     };
 
     let mut cache = TranscriptViewCache::new();
-    cache.ensure_filtered(&refs, &revisions, 220, options, &HashSet::new(), None, None);
+    cache.ensure_filtered(&refs, &revisions, 220, options, &HashMap::new(), None, None);
 
     for idx in 0..3 {
         let width = max_line_width(&cache.per_cell[idx].lines);
@@ -1328,7 +1386,7 @@ fn transcript_prose_measure_caps_prose_but_not_tools() {
     };
 
     let mut cache = TranscriptViewCache::new();
-    cache.ensure_filtered(&refs, &revisions, 220, options, &HashSet::new(), None, None);
+    cache.ensure_filtered(&refs, &revisions, 220, options, &HashMap::new(), None, None);
 
     for idx in 0..3 {
         let width = max_line_width(&cache.per_cell[idx].lines);
@@ -1457,7 +1515,7 @@ fn folded_thinking_cache_invalidation() {
         &revisions,
         width,
         options,
-        &HashSet::new(),
+        &HashMap::new(),
         None,
         None,
     );
@@ -1465,8 +1523,8 @@ fn folded_thinking_cache_invalidation() {
 
     // Second render: fold the thinking cell → should invalidate and
     // produce fewer lines (collapsed summary).
-    let mut folded = HashSet::new();
-    folded.insert(0usize);
+    let mut folded = HashMap::new();
+    folded.insert(0usize, ThinkingFold::Collapsed);
     cache.ensure_split(&[&cells], &revisions, width, options, &folded, None, None);
     let folded_line_count = cache.total_lines();
 
@@ -1481,7 +1539,7 @@ fn folded_thinking_cache_invalidation() {
         &revisions,
         width,
         options,
-        &HashSet::new(),
+        &HashMap::new(),
         None,
         None,
     );
@@ -1523,7 +1581,7 @@ fn folded_thinking_with_collapsed_cells_uses_original_indices() {
         &revisions,
         width,
         options,
-        &HashSet::new(),
+        &HashMap::new(),
         None,
         None,
     );
@@ -1536,8 +1594,8 @@ fn folded_thinking_with_collapsed_cells_uses_original_indices() {
     let filtered_revs = [2u64];
     let index_map: Vec<usize> = vec![1]; // filtered 0 → original 1
 
-    let mut folded = HashSet::new();
-    folded.insert(1usize); // fold original index 1
+    let mut folded = HashMap::new();
+    folded.insert(1usize, ThinkingFold::Collapsed); // fold original index 1
 
     let mut cache2 = TranscriptViewCache::new();
     cache2.ensure_split(
@@ -1561,7 +1619,7 @@ fn folded_thinking_with_collapsed_cells_uses_original_indices() {
         &filtered_revs,
         width,
         options,
-        &HashSet::new(),
+        &HashMap::new(),
         Some(&index_map),
         None,
     );
@@ -1594,7 +1652,7 @@ fn reasoning_target_transfer_rewrites_same_revision_cells() {
         &revisions,
         80,
         options,
-        &HashSet::new(),
+        &HashMap::new(),
         None,
         Some(reasoning_owner(0)),
     );
@@ -1672,7 +1730,7 @@ fn layout_aware_reasoning_budget_applies_only_to_the_newest_cell() {
         &revisions,
         80,
         constrained,
-        &HashSet::new(),
+        &HashMap::new(),
         None,
         Some(reasoning_owner(1)),
     );
@@ -1705,7 +1763,7 @@ fn layout_aware_reasoning_budget_applies_only_to_the_newest_cell() {
         &revisions,
         80,
         roomy,
-        &HashSet::new(),
+        &HashMap::new(),
         None,
         Some(reasoning_owner(1)),
     );
@@ -1731,7 +1789,7 @@ fn layout_aware_reasoning_budget_applies_only_to_the_newest_cell() {
         &[1, 1, 1],
         80,
         roomy,
-        &HashSet::new(),
+        &HashMap::new(),
         None,
         Some(reasoning_owner(2)),
     );
@@ -1756,7 +1814,7 @@ fn filtered_reasoning_owner_keeps_original_identity() {
         &revisions,
         80,
         TranscriptRenderOptions::default(),
-        &HashSet::new(),
+        &HashMap::new(),
         Some(&original_map),
         Some(reasoning_owner(1)),
     );
@@ -1780,7 +1838,7 @@ fn filtered_reasoning_owner_keeps_original_identity() {
         &revisions,
         80,
         TranscriptRenderOptions::default(),
-        &HashSet::new(),
+        &HashMap::new(),
         Some(&original_map),
         Some(reasoning_owner(0)),
     );
@@ -1797,7 +1855,7 @@ fn streaming_tail_fast_path_cannot_skip_reasoning_retarget() {
         &[1, 1],
         80,
         TranscriptRenderOptions::default(),
-        &HashSet::new(),
+        &HashMap::new(),
         None,
         Some(reasoning_owner(0)),
     );
@@ -1809,7 +1867,7 @@ fn streaming_tail_fast_path_cannot_skip_reasoning_retarget() {
         &[1, 2],
         80,
         TranscriptRenderOptions::default(),
-        &HashSet::new(),
+        &HashMap::new(),
         None,
         None,
     );
@@ -1827,7 +1885,7 @@ fn narrow_reasoning_hint_never_changes_cache_geometry() {
             &[1],
             width,
             TranscriptRenderOptions::default(),
-            &HashSet::new(),
+            &HashMap::new(),
             None,
             None,
         );
@@ -1837,7 +1895,7 @@ fn narrow_reasoning_hint_never_changes_cache_geometry() {
             &[1],
             width,
             TranscriptRenderOptions::default(),
-            &HashSet::new(),
+            &HashMap::new(),
             None,
             Some(reasoning_owner(0)),
         );
@@ -1873,7 +1931,7 @@ fn reasoning_hint_uses_the_render_locale() {
         &[1],
         80,
         options,
-        &HashSet::new(),
+        &HashMap::new(),
         None,
         Some(reasoning_owner(0)),
     );

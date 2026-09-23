@@ -261,18 +261,18 @@ mod tests {
     }
 
     #[test]
-    fn setup_provider_agnes_opens_unpublished_template() {
+    fn setup_provider_agnes_rejects_retired_template_name() {
         let mut app = test_app();
 
         let result = SetupCmd::execute(&mut app, Some("provider agnes"));
 
-        assert_eq!(
-            result.action,
-            Some(AppAction::OpenTemplateSetup {
-                template_id: "agnes".to_string(),
-            })
+        assert!(result.action.is_none());
+        assert!(
+            result
+                .message
+                .as_deref()
+                .is_some_and(|message| message.contains("Unknown provider 'agnes'"))
         );
-        assert!(result.message.is_none());
     }
 
     #[test]

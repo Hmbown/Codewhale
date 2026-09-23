@@ -56,9 +56,12 @@ base prompt". Two more corollaries earned here:
   lane is obsolete, preserve its intent and evidence rather than merging stale
   code mechanically.
 - A small coherent change may be committed directly to `main` when that checkout
-  is current, clean, and owns the affected files. A worktree remains the right
-  safety boundary for conflicting, dirty, stale, or independent work. Local
-  commit permission never implies push, merge, tag, release, or deploy permission.
+  is current, clean, and owns the affected files. Default to the checkout that
+  already exists: when several agents share it, partition by file, stage only
+  the paths your slice touched, and retry a commit that fails on `index.lock`.
+  A fresh worktree is for conflicting, dirty, stale, or independent lanes
+  (see `cw-land`), not for parallel agents on the same lane. Local commit
+  permission never implies push, merge, tag, release, or deploy permission.
 - When the task is local-only, stay fully offline: no browsing, GitHub or remote
   Git operations, downloads, dependency installation, provider calls, or
   source/diff transmission. Record the missing external receipt and keep working
@@ -69,31 +72,33 @@ base prompt". Two more corollaries earned here:
 - Keep providers and models first-class and provider-neutral.
 - Never rewrite published history, retag a release, force-push a shared ref, or
   publish without explicit authorization. Preserve human contributor credit.
+- **Model-visible means logged.** Anything that reaches a model request must be
+  reconstructable from the session log, and a new model-visible input needs a
+  session event. Live presentation and the persisted record must agree; when they
+  disagree the record is right.
+- **Misconfiguration fails loud**, at load when it is self-contained, otherwise
+  at the earliest point it can be resolved. Never silently skip a missing
+  referent.
+- **Write down what a design does not do**, beside the behaviour it owns — a
+  short known-limitations note in the owning module. A stated limit stops the
+  next reader from assuming a capability that was never built.
 
 ## Landing other people's work
 
 An external contributor's branch goes stale because *we* land things, not
 because they did anything wrong. Treat their time as more expensive than ours.
 
+**The goal is the contributor's PR merging as itself.** Review it, help it
+rebase, or fix it on their branch — that is the default path. Closing their PR
+and re-landing the work as our own commit (`auto-close-harvested`) is the
+fallback for a branch that truly cannot merge in reasonable time; done
+casually it reads as taking the work even when credit is preserved.
+
 - **Never make a contributor rebase around our churn.** If their PR conflicts
-  only because main moved, a maintainer resolves it. Read their diff against
-  the merge base first so you know exactly what they added, and re-apply that,
-  rather than hand-merging two large sides and hoping.
-- **Conflicts that split mid-function do not resolve by keeping both sides.**
-  Git's markers can land inside a body, so a both-sides resolution produces
-  unbalanced braces that look plausible and do not compile. Take one side
-  whole, then re-insert the other side's additions at their original anchor.
-- **`maintainerCanModify` does not guarantee push access to the fork.** When
-  the push is refused, land the resolved merge on
-  `integration/<topic>-<pr>-<date>` in this repo and land from there. An
-  integration branch is the normal path for anything with conflicts or several
-  moving PRs — it is cheaper than repeatedly rebasing onto a main that keeps
-  moving, and it keeps the contributor's branch untouched.
-- **Check the contribution gate before assuming a PR is stalled.** An unlisted
-  author's workflow runs sit at `action_required` and never start, so the PR
-  looks abandoned when nobody has actually looked at it. Approve the runs, then
-  fix the cause: add them to `.github/APPROVED_CONTRIBUTORS` (`all:username`),
-  or comment `/lgtm` (PR scope) / `/lgtmi` (issue scope) on their thread.
+  only because main moved, a maintainer resolves it.
+- Landing mechanics — merge-base diffing, mid-function conflicts, fork-push
+  refusal, the contribution gate — live in `cw-land`. Follow them instead of
+  improvising.
 - **Preserve credit in the mechanical sense, not just the polite one.** Commit
   authorship and `Co-authored-by` trailers must use the contributor's own
   GitHub-linked address. `AUTHOR_MAP` and `.mailmap` are project conventions —
@@ -117,22 +122,27 @@ because they did anything wrong. Treat their time as more expensive than ours.
   already been mistaken for a pass here.
 - Prefer proving a regression test fails without the fix. A test that passes
   either way pins the implementation, not the defect.
-- Audit any harness before trusting its score. `ok = ok and X or True` parses
-  as `(ok and X) or True` and silently reported twelve unevaluated rows as
-  passing.
+- Audit any hand-rolled scorer before trusting its score: quote the counts it
+  actually evaluated, not the verdict line alone.
+- Match the evidence to the surface. Run the tests that cover the change, not the
+  whole suite, and do not repeat a check that already passed in order to commit.
+  CI owns exhaustive coverage; a full local run is for CI diagnosis or for an
+  irreducibly repository-wide change.
 
 ## Current contracts
 
-- The model-facing subagent tool is `agent`. Do not revive removed
-  `agent_open`/`agent_eval`/`agent_close`/`delegate_to_agent` surfaces or parallel
-  lifecycle/tag systems.
-- `BASE_PROMPT` in `crates/tui/src/prompts/text.rs` is the sole base prompt.
+- The model-facing subagent tool is `agent`; `agent_open`/`agent_eval`/
+  `agent_close`/`delegate_to_agent` are removed surfaces. If the shape must
+  move, move the code and add the guard test that judges the new shape.
+- `BASE_PROMPT` in `crates/tui/src/prompts/text.rs` is the sole base prompt
+  by convention. Same rule: move the code, not the prose, if that changes.
 - There is exactly one turn loop: `Engine::run_turn` in
   `crates/tui/src/core/engine/turn_loop.rs`. Note that `crates/tui/src/core/`
   is a module inside the TUI crate — it is not `crates/core`, which owns
   request construction, bounded fragments, and thread/session types and
-  runs no turns. Do not add a second loop beside the one that exists; a
-  guard test (`crates/core/tests/single_turn_loop.rs`) fails if you do.
+  runs no turns. A guard test (`crates/core/tests/single_turn_loop.rs`)
+  fails on a second loop; changing the shape means changing the guard
+  with it.
 - The system prompt + tool catalog are a session-pinned KV-cache prefix
   (`docs/CACHE.md`). Any new session-context contributor must state its
   KV-cache effect: frozen prefix vs. append-only history. Never splice a
@@ -143,6 +153,13 @@ because they did anything wrong. Treat their time as more expensive than ours.
   `config/src/route/`. Native memory lives in `tui/src/native_memory.rs`;
   `tools/remember.rs` is its capture path.
 - Environment-specific behavior belongs in `docs/ENVIRONMENTS.md`, not here.
+- Blocking-call convention (#6149): code on the Tokio runtime — tool
+  handlers, engine tasks, the UI event loop, anything reached through an
+  `async` call chain — must not run blocking operations inline. Use
+  `tokio::fs` / `tokio::process`, or move the work into `spawn_blocking`;
+  a sync helper containing blocking calls runs only under `spawn_blocking`
+  or on a dedicated thread. `scripts/check-blocking-calls-budget.py`
+  ratchets the unprotected-site count.
 
 ## Code, migrations, and evidence
 
@@ -168,6 +185,12 @@ because they did anything wrong. Treat their time as more expensive than ours.
 - Prefer focused compilation, a relevant existing check, and direct product or
   manual evidence. Run a broad suite only when the change creates a genuine
   cross-cutting or release risk. Do not repeatedly rerun an unchanged suite.
+- **Batch edits; compile once.** `cargo check` and test builds on this
+  workspace take minutes, so an edit→compile→edit loop spends most of its
+  time waiting on the linker. Read precisely, write every edit a coherent
+  slice needs, then compile and test once — the same errors surface either
+  way, just later and all at once. Reserve mid-slice compiles for genuinely
+  uncertain API or borrow questions where a wrong guess would cascade.
 - Declared migrations are one-way. Once the repository adopts a replacement
   architecture or shared spine, new work uses it and touched legacy code moves
   toward it. Do not add another legacy call site for convenience. Keep a
@@ -183,14 +206,9 @@ cargo test --workspace
 cargo build --release -p codewhale-cli -p codewhale-tui
 ```
 
-`cargo nextest run` (config in `.config/nextest.toml`) is the fast way to
-run an intentionally selected suite; `cargo test --no-run` can answer a compile
-question without spending time executing unrelated cases, and `cargo test --doc`
-covers doc examples when those examples changed.
-`scripts/dev-test.sh <area>` maps a code area to its fastest `-p` invocation
-and applies the portable isolated build-dir topology for new worktrees
-(`scripts/dev-cache.sh`, `scripts/dev-cargo.sh`). See
-`docs/BUILD_PERFORMANCE.md`.
+`scripts/dev-test.sh <area|path> [filter]` maps a code area to its fastest
+invocation — see `cw-gates` for the verification ladder and
+`docs/BUILD_PERFORMANCE.md` for the build topology.
 
 Report commands actually run and distinguish source, local tests, packaged
 artifacts, CI, and public release state. Describe the evidence actually needed
@@ -198,17 +216,13 @@ for the claim; a test count is not a proxy for product quality.
 
 Community reports, PRs, logs, and reviews are evidence.
 
-**Harvested contributor credit is still a rule.** When a contributor's work
+**Harvested contributor credit is still a rule** (the fallback path above —
+prefer merging the contributor's PR itself). When a contributor's work
 lands as our commit, that commit carries `Harvested from PR #N by @handle` and a
 `Co-authored-by` naming them at their GitHub-linked address, so
 `auto-close-harvested.yml` closes their PR with credit and the contribution
 graph reflects reality. Canonical human identities come from
 `.github/AUTHOR_MAP`.
-
-**Whether a bot or agent also appears in a trailer no longer matters.** The CI
-check that policed trailer identities was removed: it rejected ordinary agent
-commits and cost more than the tidiness it bought. Give humans their credit; do
-not spend time scrubbing tool trailers.
 
 Leave unrelated work intact and keep new enforcement dry-run unless explicitly
 approved.

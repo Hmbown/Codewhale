@@ -1,7 +1,7 @@
 [
   {
     "reason": "no_pricing_row",
-    "review": "Source reviewed at 36f11b82; fixture recorded time is 2026-09-08T12:00Z with 1000 input/100 output and no cache usage or live/signed/override price state. Exact default tuples below have no usable provider-owned bundled/hand row (pricing.rs:1639,1674,2282; provider_lake.rs:993). OpenRouter official identity with no frozen quote uses immutable bundled fallback (pricing.rs:2011,2089); its DeepSeek Pro row is costless. Zen resolves gpt-5.6 to wire gpt-5.6-sol (route/offering.rs:312), while its hand fallback prices only DeepSeek Flash (pricing.rs:2426). Wanjie is not the direct-DeepSeek retired-alias/hand-price owner. No numeric rates or model-owner rates are inferred.",
+    "review": "Source reviewed at 36f11b82; fixture recorded time is 2026-09-08T12:00Z with 1000 input/100 output and no cache usage or live/signed/override price state. Exact default tuples below have no usable provider-owned bundled/hand row (pricing.rs:1639,1674,2282; provider_lake.rs:993). OpenRouter official identity with no frozen quote uses immutable bundled fallback (pricing.rs:2011,2089); its DeepSeek Pro row is costless. Zen resolves gpt-5.6 to wire gpt-5.6-sol (route/offering.rs:312), while its hand fallback prices only DeepSeek Flash (pricing.rs:2426). Wanjie is not the direct-DeepSeek retired-alias/hand-price owner. No numeric rates or model-owner rates are inferred. ZenMux review: metered OpenAI-compatible aggregator; its deepseek/deepseek-v4.1-flash default has no bundled/hand pricing row and resolves costless until the live catalog prices it. ModelScope review (ba62522a20 omitted this row): same shape — metered default with no bundled/hand row in pricing.rs.",
     "routes": [
       ["atlascloud", "deepseek-ai/deepseek-v4-flash", "https://api.atlascloud.ai/v1", "chat_completions", "metered"],
       ["codewhale", "deepseek/deepseek-v4-pro", "https://api.codewhale.net/v1", "chat_completions", "metered"],
@@ -10,6 +10,7 @@
       ["google", "gemini-3.1-pro-preview", "https://generativelanguage.googleapis.com/v1beta/openai", "chat_completions", "metered"],
       ["huggingface", "deepseek-ai/DeepSeek-V4-Pro", "https://router.huggingface.co/v1", "chat_completions", "metered"],
       ["longcat", "LongCat-2.0", "https://api.longcat.chat/openai/v1", "chat_completions", "metered"],
+      ["modelscope", "Qwen/Qwen3.5-397B-A17B", "https://api-inference.modelscope.cn/v1", "chat_completions", "metered"],
       ["novita", "deepseek/deepseek-v4-pro", "https://api.novita.ai/openai/v1", "chat_completions", "metered"],
       ["nvidia-nim", "deepseek-ai/deepseek-v4-pro", "https://integrate.api.nvidia.com/v1", "chat_completions", "metered"],
       ["opencode-zen", "gpt-5.6-sol", "https://opencode.ai/zen/v1", "responses", "metered"],
@@ -22,7 +23,8 @@
       ["siliconflow-CN", "deepseek-ai/DeepSeek-V4-Pro", "https://api.siliconflow.cn/v1", "chat_completions", "metered"],
       ["telecomjs", "deepseek-v4-pro", "https://aigw.telecomjs.com/v1", "chat_completions", "metered"],
       ["together", "deepseek-ai/DeepSeek-V4-Pro", "https://api.together.xyz/v1", "chat_completions", "metered"],
-      ["wanjie-ark", "deepseek-reasoner", "https://maas-openapi.wanjiedata.com/api/v1", "chat_completions", "metered"]
+      ["wanjie-ark", "deepseek-reasoner", "https://maas-openapi.wanjiedata.com/api/v1", "chat_completions", "metered"],
+      ["zenmux", "deepseek/deepseek-v4.1-flash", "https://zenmux.ai/api/v1", "chat_completions", "metered"]
     ]
   },
   {
@@ -34,8 +36,9 @@
   },
   {
     "reason": "unknown_billing_basis",
-    "review": "No mode/credential product is supplied. Both MiniMax dialects share a PAYG/plan endpoint that cannot prove product (route_billing.rs:253,402; pricing.rs:534); Ollama Cloud is unclassified possible spend, not local/free (pricing.rs:411). Generic Custom and five non-Baseten compatible defaults are transport descriptors without a reviewed product; production envelope refuses Unknown at cost_status.rs:239.",
+    "review": "No mode/credential product is supplied. Both MiniMax dialects share a PAYG/plan endpoint that cannot prove product (route_billing.rs:253,402; pricing.rs:534); Ollama Cloud is unclassified possible spend, not local/free (pricing.rs:411). Generic Custom and six non-Baseten compatible defaults are transport descriptors without a reviewed product; production envelope refuses Unknown at cost_status.rs:239. AICraft is the sixth compatible default: dc170add3 restored its row from the closed PR #6171 with endpoint, credential env and bootstrap model only, and no billing product or pricing row was reviewed for it. Its default is claude-4.6-sonnet, which has no bundled/hand row either; that omission is recorded here on the shape of the descriptor, and a real source review of AICraft's billing basis is still owed.",
     "routes": [
+      ["aicraft", "claude-4.6-sonnet", "https://aicraftapi.com/v1", "chat_completions", "unknown"],
       ["cerebras", "llama-3.3-70b", "https://api.cerebras.ai/v1", "chat_completions", "unknown"],
       ["command-code", "deepseek/deepseek-v4-flash", "https://api.commandcode.ai/provider/v1", "chat_completions", "unknown"],
       ["custom", "custom-model", "http://localhost/v1", "chat_completions", "unknown"],
@@ -58,6 +61,7 @@
     "reason": "not_money_metered",
     "review": "Exact shipped plan/OAuth/local surfaces are excluded from money coverage before model-price lookup (route_billing.rs:345,470; pricing.rs:398; cost_status.rs:235). Retain exact dialect and plan endpoint distinctions; the same model on PAYG is a different tuple.",
     "routes": [
+      ["csdn", "glm_for_coding", "https://ai.csdn.net/api/model/v1", "chat_completions", "subscription"],
       ["modelstudio-coding-plan", "qwen3.8-max", "https://coding-intl.dashscope.aliyuncs.com/v1", "chat_completions", "subscription"],
       ["modelstudio-coding-plan-anthropic", "qwen3.8-max", "https://coding-intl.dashscope.aliyuncs.com/apps/anthropic", "anthropic_messages", "subscription"],
       ["modelstudio-token-plan", "qwen3.8-max", "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1", "chat_completions", "subscription"],

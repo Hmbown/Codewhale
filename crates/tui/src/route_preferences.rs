@@ -203,7 +203,7 @@ pub fn scrub_root_model_aliases_for_export(document: &mut toml::value::Table) ->
             scoped.default_text_model = Some(value.to_string());
             let wire_model = crate::config::wire_model_for_provider_route(
                 identity.provider,
-                &scoped.deepseek_base_url(),
+                &scoped.active_route_base_url(),
                 &value,
             );
             if scoped.default_model() == wire_model {
@@ -422,7 +422,7 @@ pub fn unset(path: &Path, key: &str) -> Result<()> {
                 scoped.default_text_model = Some(model.to_string());
                 let wire_model = crate::config::wire_model_for_provider_route(
                     identity.provider,
-                    &scoped.deepseek_base_url(),
+                    &scoped.active_route_base_url(),
                     model,
                 );
                 // Reuse Config's root-model guards: a foreign DeepSeek root

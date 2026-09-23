@@ -10,11 +10,12 @@
 
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-/// Braille bubble frames used for running tools and background jobs. Dots fill
-/// upward, then release. Eight distinct states at five hertz keep the motion
-/// continuous without turning the one-cell marker into a high-frequency
-/// spinner.
-pub(crate) const BRAILLE_SPINNER_FRAMES: [&str; 8] = ["⠀", "⢀", "⣀", "⣄", "⣤", "⣦", "⣶", "⣿"];
+/// A small swell for running tools and background jobs. Rise and recede
+/// through adjacent dot counts, including across the loop boundary. The
+/// marker stays visible and never flashes from a full block to empty.
+/// Like Ratatui Spinner's pulse studies, the return path is part of the motion;
+/// our quieter six-dot peak and existing clock keep it subordinate to the text.
+pub(crate) const BRAILLE_SPINNER_FRAMES: [&str; 8] = ["⣀", "⣄", "⣤", "⣦", "⣶", "⣦", "⣤", "⣄"];
 pub(crate) const VERIFY_TICK_FRAMES: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
 
 /// A motion marker is earned only after work survives the eye's quick-event
@@ -129,6 +130,18 @@ mod tests {
                 1,
                 "active marker frames must never shift adjacent text"
             );
+        }
+    }
+
+    #[test]
+    fn working_swell_has_no_blank_flash_or_loop_seam() {
+        let dots: Vec<u32> = BRAILLE_SPINNER_FRAMES
+            .iter()
+            .map(|frame| (u32::from(frame.chars().next().unwrap()) - 0x2800).count_ones())
+            .collect();
+        for index in 0..dots.len() {
+            assert!((2..=6).contains(&dots[index]));
+            assert_eq!(dots[index].abs_diff(dots[(index + 1) % dots.len()]), 1);
         }
     }
 

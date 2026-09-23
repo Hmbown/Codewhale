@@ -20,7 +20,7 @@ export const home: HomeDict = {
   shotPreview: "Podgląd terminala",
   shotBuild: "kompilacja deweloperska v{version}",
   screenshotAlt:
-    "Terminal Codewhale v0.9.12, kompilacja 171acee689aa: nowa sesja ze znakiem wieloryba, polem wpisywania wiadomości, Full Access i trybem Operate, dwoma zaplanowanymi zadaniami, 21 serwerami MCP w trakcie łączenia oraz GLM-5.3 z poziomem rozumowania ustawionym na max.",
+    "Codewhale v{version}, kompilacja deweloperska: wieloryb, nowa sesja, pole wiadomości, uprawnienia Ask, tryb Work i stan modelu. Obraz rzeczywistego wyjścia odizolowanego terminala.",
   latestRelease: "Najnowsze wydanie {tag}",
   releaseUnavailable: "Status wydania niedostępny",
   currentSource: "Źródło",

@@ -284,7 +284,7 @@ fn show_single_setting(app: &App, key: &str) -> CommandResult {
                     return CommandResult::error(format!("Failed to load config: {err}"));
                 }
             };
-            Some(config.deepseek_base_url())
+            Some(config.active_route_base_url())
         }
         // `/config title` reports the config-level default, not a session's
         // `/title` override. The latter is intentionally a separate setting
@@ -305,7 +305,7 @@ fn show_single_setting(app: &App, key: &str) -> CommandResult {
                     return CommandResult::error(format!("Failed to load config: {err}"));
                 }
             };
-            Some(config.deepseek_base_url())
+            Some(config.active_route_base_url())
         }
         "context_window" | "context_window_tokens" => Some(format!(
             "{} (effective {} from {})",
@@ -969,7 +969,7 @@ fn config_editability_audit(app: &App) -> CommandResult {
             app.metrics_line.as_setting().to_string(),
             "runtime+persisted",
             "/config metrics_line <full|compact|hidden> --save",
-            "Writes [tui].metrics_line; hidden gives the row to the transcript, compact drops the telemetry and help hint.",
+            "Writes [tui].metrics_line; hidden gives the row to the transcript, compact drops secondary counts and help while keeping selected TTFT/rate readings when they fit. Choose readings with /statusline.",
         ),
         (
             "subagents.enabled",
@@ -1015,14 +1015,14 @@ fn config_editability_audit(app: &App) -> CommandResult {
         ),
         (
             "base_url",
-            config.deepseek_base_url(),
+            config.active_route_base_url(),
             "persisted restart",
             "/config base_url <url> --save",
             "Writes top-level base_url; model clients read it on startup.",
         ),
         (
             "providers.<active>.base_url",
-            provider_config.deepseek_base_url(),
+            provider_config.active_route_base_url(),
             "persisted restart",
             "/config provider_url <url> --save",
             "Writes the active provider table; model clients read it on startup.",
@@ -1163,6 +1163,10 @@ fn search_provider_display(config: &Config, locale: codewhale_localization::Loca
             .to_string(),
         SearchProviderSource::Config => "config.toml".to_string(),
         SearchProviderSource::EnvOverride => "CODEWHALE_SEARCH_PROVIDER".to_string(),
+        // Same token doctor prints: the signal is a Tavily key, not a disk
+        // pin, so never name `TAVILY_API_KEY` (the winner may have been a
+        // generic `tvly-` `[search] api_key`).
+        SearchProviderSource::TavilyKey => "tavily key".to_string(),
     };
     tr(locale, MessageId::ConfigCommandSource)
         .replace("{value}", resolved.provider.as_str())
@@ -3363,6 +3367,7 @@ mod tests {
                 EnvVarGuard::remove("PTYXIS_VERSION"),
                 EnvVarGuard::remove("CODEWHALE_SEARCH_PROVIDER"),
                 EnvVarGuard::remove("DEEPSEEK_SEARCH_PROVIDER"),
+                EnvVarGuard::remove("TAVILY_API_KEY"),
             ];
             Self {
                 _vars: vars,
@@ -3406,7 +3411,7 @@ mod tests {
         let _guard = EnvGuard::new(temp.path());
         let mut app = create_test_app();
         app.status_toasts.clear();
-        assert!(app.maybe_show_behavioral_tip(BehavioralTip::PlanningMode));
+        assert!(app.maybe_show_behavioral_tip(BehavioralTip::McpValidation));
         app.push_status_toast("warning receipt", StatusToastLevel::Warning, None);
         app.push_status_toast("error receipt", StatusToastLevel::Error, None);
         app.sticky_status = Some(StatusToast::context_pressure(
@@ -5051,6 +5056,33 @@ completion_sound = "bell"
         assert!(
             notifications_msg.contains("completion_sound = bell"),
             "{notifications_msg}"
+        );
+    }
+
+    #[test]
+    fn config_command_shows_autodetected_tavily_key_source() {
+        let temp_root = tempfile::tempdir().expect("isolated config dir");
+        let _guard = EnvGuard::new(temp_root.path());
+        let config_path = temp_root.path().join("custom-config.toml");
+        fs::write(
+            &config_path,
+            r#"
+[search]
+api_key = "tvly-autodetected"
+"#,
+        )
+        .unwrap();
+
+        let mut app = create_test_app();
+        app.config_path = Some(config_path);
+
+        let search = config_command(&mut app, Some("search.provider"));
+        assert!(!search.is_error, "{:?}", search.message);
+        let message = search.message.expect("search provider display");
+        assert_eq!(message, "search.provider = tavily (source: tavily key)");
+        assert!(
+            !message.contains("TAVILY_API_KEY"),
+            "a generic `tvly-` key must not be reported as the env var: {message}"
         );
     }
 

@@ -134,7 +134,7 @@ pub(crate) fn render_underwater_surface(
     title: impl Into<String>,
 ) -> Rect {
     let margin_x = u16::from(area.width >= 44);
-    let margin_y = u16::from(area.height >= 14);
+    let margin_y = u16::from(area.height >= 24);
     let surface = Rect {
         x: area.x.saturating_add(margin_x),
         y: area.y.saturating_add(margin_y),
@@ -160,7 +160,7 @@ pub(crate) fn render_underwater_surface(
         .borders(Borders::TOP | Borders::BOTTOM)
         .border_style(Style::default().fg(palette::BORDER_COLOR))
         .style(Style::default().bg(palette::WHALE_BG))
-        .padding(Padding::new(1, 1, 1, 1));
+        .padding(Padding::new(1, 1, u16::from(area.height >= 24), 0));
     let inner = block.inner(surface);
     block.render(surface, buf);
     inner
@@ -793,6 +793,23 @@ pub enum ViewEvent {
     /// Enter on a Fleet editor row: open the standard `/model` picker for
     /// that row (the editor stays underneath) instead of the editor's own
     /// inline route list.
+    FleetProfileRoutePickRequested {
+        editor_id: uuid::Uuid,
+    },
+    FleetProfileRoutePicked {
+        editor_id: uuid::Uuid,
+        provider: crate::config::ApiProvider,
+        provider_id: Option<String>,
+        model: String,
+        reasoning: Option<crate::reasoning_preference::ReasoningEffort>,
+    },
+    FleetProfileRouteCommitRequested {
+        editor_id: uuid::Uuid,
+    },
+    FleetAssignmentPickerDismissed {
+        editor_id: uuid::Uuid,
+    },
+    FleetRosterOpenCoordinatorRequested,
     FleetDetailRoutePickRequested {
         target: crate::tui::views::fleet_detail::FleetRouteTarget,
         editor_id: uuid::Uuid,
@@ -2076,16 +2093,6 @@ impl ConfigView {
                     .opens("/provider", MessageId::ConfigActionOpenProvider),
             },
             ConfigRow {
-                key: "provider_templates".to_string(),
-                value: codewhale_config::ProviderSetupTemplate::settings_value(),
-                editable: true,
-                scope: ConfigScope::Saved,
-                facts: ConfigRowFacts::action(
-                    "/provider templates",
-                    MessageId::ConfigActionOpenProviderTemplates,
-                ),
-            },
-            ConfigRow {
                 key: config_base_url_row_key(active_route_provider).to_string(),
                 value: config_base_url_row_value(app),
                 // An endpoint is a route receipt, not a loose global knob.
@@ -2603,6 +2610,15 @@ impl ConfigView {
                     })
             });
         rows.splice(2..2, external_status_rows);
+        // An explanation route, never an editable sandbox policy. The existing
+        // status report owns the observed platform/backend enforcement facts.
+        rows.push(ConfigRow {
+            key: "sandbox_details".into(),
+            value: "/status".into(),
+            editable: true,
+            scope: ConfigScope::Session,
+            facts: ConfigRowFacts::action("/status", MessageId::AutomationActionInspect),
+        });
         rows.extend(experimental_config_rows(&config));
         rows.extend(
             codewhale_config::notifications::NotificationSetting::ALL
@@ -2704,6 +2720,68 @@ impl ConfigView {
         &self.filter
     }
 
+    /// The key whose inline editor is open, if any. Exposes the transient
+    /// editing state to the host-level tests in `tui::ui::tests` that drive
+    /// the real `refresh_config_view_if_open` path (#theme-nav-exit).
+    ///
+    /// Test-only: production code reads `editing` directly, and a non-test lib
+    /// build would flag this as dead code under `-D warnings`.
+    #[cfg(test)]
+    pub(crate) fn editing_key(&self) -> Option<&str> {
+        self.editing.as_ref().map(|edit| edit.key.as_str())
+    }
+
+    /// The highlighted choice index inside the open editor, if any.
+    ///
+    /// Test-only; see [`Self::editing_key`].
+    #[cfg(test)]
+    pub(crate) fn editing_selected_choice(&self) -> Option<usize> {
+        self.editing.as_ref().map(|edit| edit.selected_choice)
+    }
+
+    /// Rebuild after the host applied a setting (`refresh_config_view_if_open`)
+    /// while keeping the open editor alive.
+    ///
+    /// The theme editor live-previews on every highlight, and each preview is a
+    /// `ConfigUpdated` that lands here again. A bare `new_for_app` dropped
+    /// `editing`, so the first arrow key closed the editor, the next one fell
+    /// through to the non-editing key map (where Left/Right switch category),
+    /// and `selected_choice` snapped back to 0. The user saw the highlight leap
+    /// away from the row they were on — the theme never moved (#theme-nav-exit).
+    ///
+    /// The rows themselves must come from the refreshed snapshot: a persisted
+    /// commit changes the value on disk and the row has to show it. Only the
+    /// transient editing state is carried over.
+    pub(crate) fn rebuild_preserving(app: &App, previous: &Self, focus_key: &str) -> Self {
+        let mut view = Self::new_for_app(app);
+        view.restore_filter(previous.filter_query().to_string());
+        view.focus_key(focus_key);
+        let carried = match &previous.editing {
+            // A row that vanished from the refreshed snapshot (filter, scope or
+            // availability changed underneath) has no editor to belong to.
+            Some(edit) => view
+                .rows
+                .iter()
+                .position(|row| row.key == edit.key)
+                .map(|index| (index, edit.clone())),
+            None => None,
+        };
+        match carried {
+            Some((index, mut edit)) => {
+                // The highlight is the user's cursor, not a disk fact: keep it
+                // inside the refreshed choice list instead of resetting it.
+                let choices_len = edit.choices.as_ref().map_or(0, Vec::len);
+                if edit.selected_choice >= choices_len {
+                    edit.selected_choice = choices_len.saturating_sub(1);
+                }
+                view.selected = index;
+                view.editing = Some(edit);
+            }
+            None => view.editing = None,
+        }
+        view
+    }
+
     pub(crate) fn restore_filter(&mut self, filter: String) {
         self.update_filter(|current| *current = filter);
     }
@@ -2713,9 +2791,19 @@ impl ConfigView {
         if cached == 0 { 8 } else { cached }
     }
 
-    fn row_matches_filter(&self, row: &ConfigRow) -> bool {
-        let filter = self.filter.trim().to_lowercase();
-        if filter.is_empty() {
+    /// The lowercased search terms for the current filter, computed once per
+    /// interaction instead of once per row per pass (#6213 T6).
+    fn filter_terms(&self) -> Vec<String> {
+        self.filter
+            .trim()
+            .to_lowercase()
+            .split_whitespace()
+            .map(str::to_string)
+            .collect()
+    }
+
+    fn row_matches_filter(&self, row: &ConfigRow, terms: &[String]) -> bool {
+        if terms.is_empty() {
             return true;
         }
 
@@ -2733,8 +2821,14 @@ impl ConfigView {
         let scope_en = row.scope.label(Locale::En).to_lowercase();
         let hint = config_hint_for_key(self.locale, &row.key).to_lowercase();
 
-        filter.split_whitespace().all(|term| {
-            section.contains(term)
+        let explanation_terms = if row.key == "sandbox_details" {
+            "sandbox filesystem unenforced isolation bubblewrap bwrap doctor"
+        } else {
+            ""
+        };
+        terms.iter().all(|term| {
+            explanation_terms.contains(term)
+                || section.contains(term)
                 || section_en.contains(term)
                 || category_label.contains(term)
                 || category_en.contains(term)
@@ -2750,11 +2844,12 @@ impl ConfigView {
 
     fn matching_row_indices(&self) -> Vec<usize> {
         let filtering = !self.filter.is_empty();
+        let terms = self.filter_terms();
         self.rows
             .iter()
             .enumerate()
             .filter_map(|(idx, row)| {
-                (self.row_matches_filter(row) && (filtering || self.category.contains(row)))
+                (self.row_matches_filter(row, &terms) && (filtering || self.category.contains(row)))
                     .then_some(idx)
             })
             .collect()
@@ -2765,8 +2860,9 @@ impl ConfigView {
         let mut current_section = None;
         let filtering = !self.filter.is_empty();
 
+        let terms = self.filter_terms();
         for (idx, row) in self.rows.iter().enumerate() {
-            if !self.row_matches_filter(row) {
+            if !self.row_matches_filter(row, &terms) {
                 continue;
             }
             // The rail category filters rows unless the user is searching.
@@ -2995,6 +3091,12 @@ impl ConfigView {
             return None;
         }
         let (command, _) = row.facts.command?;
+        if row.key == "sandbox_details" {
+            return Some(ViewAction::Emit(ViewEvent::ExecutePanelCommand {
+                command: command.to_string(),
+                pager_title: Some(config_label_for_key_for_locale(self.locale, &row.key)),
+            }));
+        }
         Some(ViewAction::Emit(ViewEvent::CommandPaletteSelected {
             action: CommandPaletteAction::ExecuteCommand {
                 command: command.to_string(),
@@ -4029,8 +4131,12 @@ impl ModalView for ConfigView {
             // Spacer rows are secondary chrome: give them up before the
             // editable value line falls below the wrapped footer on compact
             // terminals (#40x12).
-            let spacious =
-                usize::from(inner.height).saturating_sub(reserved_footer_lines + CONTROL_ROWS) >= 8;
+            let body_rows =
+                usize::from(inner.height).saturating_sub(reserved_footer_lines + CONTROL_ROWS);
+            // The expanded header costs six rows before the options. Reserve
+            // at least three choices plus their detail before adding spacers;
+            // a slightly taller compact shell must not show fewer options.
+            let spacious = body_rows >= if edit.choices.is_some() { 10 } else { 8 };
             let mut lines: Vec<Line> = Vec::new();
             let edit_label = config_label_for_key_for_locale(self.locale, &edit.key);
             let edit_title = if edit_label == edit.key {
@@ -4210,16 +4316,9 @@ impl ConfigView {
                 // The filled Apply control answers hover with an underline:
                 // a bg tint would erase its button fill.
                 if self.hovered_editor == Some(EditorControl::Apply) {
-                    Style::default()
-                        .fg(palette::SELECTION_TEXT)
-                        .bg(palette::WHALE_ACTION)
-                        .add_modifier(Modifier::BOLD)
-                        .add_modifier(Modifier::UNDERLINED)
+                    menu_style::selected_row_style().add_modifier(Modifier::UNDERLINED)
                 } else {
-                    Style::default()
-                        .fg(palette::SELECTION_TEXT)
-                        .bg(palette::WHALE_ACTION)
-                        .add_modifier(Modifier::BOLD)
+                    menu_style::selected_row_style()
                 },
             ),
             (
@@ -4271,8 +4370,6 @@ impl ConfigView {
 const CONFIG_SHELL_DETAIL_MIN_WIDTH: u16 = 100;
 /// Groups column width (the active tab's `ui.group` names).
 const CONFIG_SHELL_GROUPS_WIDTH: u16 = 18;
-/// Category rail width of the Tideline settings stage scaffold.
-const CONFIG_SHELL_RAIL_WIDTH: u16 = 20;
 
 /// Pane geometry for one render of the settings shell.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4400,68 +4497,6 @@ pub(crate) struct CategoryNavStyle {
     pub ascii_safe: bool,
 }
 
-/// Paint the vertical rail: one row per category with the selected one
-/// marked. Returns the painted rect of every category (spec §6 parity).
-pub(crate) fn render_settings_category_rail(
-    area: Rect,
-    buf: &mut Buffer,
-    selected: ConfigCategory,
-    locale: Locale,
-    style: CategoryNavStyle,
-    hovered: Option<ConfigCategory>,
-) -> Vec<(Rect, ConfigCategory)> {
-    let mut hitboxes = Vec::new();
-    if area.width < 3 {
-        return hitboxes;
-    }
-    let label_width = usize::from(area.width).saturating_sub(2);
-    for (index, category) in ConfigCategory::ALL.iter().enumerate() {
-        let Some(y) = area
-            .y
-            .checked_add(index as u16)
-            .filter(|y| *y < area.bottom())
-        else {
-            break;
-        };
-        let is_selected = *category == selected;
-        let marker = match (is_selected, style.ascii_safe) {
-            (false, _) => " ",
-            (true, true) => ">",
-            (true, false) => "▸",
-        };
-        buf.set_stringn(area.x, y, marker, 1, style.marker);
-        let label = crate::tui::ui_text::truncate_line_to_width(
-            category.label(locale).as_ref(),
-            label_width,
-        );
-        buf.set_stringn(
-            area.x.saturating_add(2),
-            y,
-            &label,
-            label_width,
-            if is_selected {
-                style.selected
-            } else if hovered == Some(*category) {
-                style
-                    .normal
-                    .patch(crate::tui::menu_style::hovered_row_style())
-            } else {
-                style.normal
-            },
-        );
-        hitboxes.push((
-            Rect {
-                x: area.x,
-                y,
-                width: area.width,
-                height: 1,
-            },
-            *category,
-        ));
-    }
-    hitboxes
-}
-
 /// Window of chips `[start, end)` that fits `width` columns while always
 /// containing `selected`. Chips are separated by one column and two columns
 /// are reserved on each side that hides chips, for the overflow markers.
@@ -4518,6 +4553,49 @@ pub(crate) fn render_settings_category_strip(
 
     let mut hitboxes = CategoryStripHitboxes::default();
     if area.width < 4 || area.height == 0 {
+        return hitboxes;
+    }
+    // At phone-width terminals, show one complete category and its position.
+    // Both arrows retain the same wraparound navigation and measured targets.
+    if area.width < 50 {
+        let previous = Rect::new(area.x, area.y, 2, 1);
+        let next = Rect::new(area.right().saturating_sub(2), area.y, 2, 1);
+        let label_area = Rect::new(area.x + 2, area.y, area.width.saturating_sub(4), 1);
+        let label = format!(
+            "{}  {}/{}",
+            selected.label(locale),
+            selected.position() + 1,
+            ConfigCategory::ALL.len()
+        );
+        for (rect, glyph, step) in [
+            (
+                previous,
+                if style.ascii_safe { "< " } else { "‹ " },
+                NavStep::Previous,
+            ),
+            (
+                next,
+                if style.ascii_safe { " >" } else { " ›" },
+                NavStep::Next,
+            ),
+        ] {
+            let marker_style = if hovered_nav == Some(step) {
+                style.marker.patch(menu_style::hovered_row_style())
+            } else {
+                style.marker
+            };
+            buf.set_stringn(rect.x, rect.y, glyph, 2, marker_style);
+        }
+        buf.set_stringn(
+            label_area.x,
+            label_area.y,
+            truncate_line_to_width(&label, usize::from(label_area.width)),
+            usize::from(label_area.width),
+            style.selected,
+        );
+        hitboxes.chips.push((label_area, selected));
+        hitboxes.previous = Some(previous);
+        hitboxes.next = Some(next);
         return hitboxes;
     }
     let labels: Vec<String> = ConfigCategory::ALL
@@ -5003,12 +5081,33 @@ impl ConfigView {
         let items = self.visible_items();
         let match_count = self.matching_row_indices().len();
 
+        let compact = inner.width < 50;
+        // Keys and symbols stay legible in one row; the search field above
+        // already explains typing. Shed verbose copy before editable content.
+        let ascii_safe = crate::tui::color_compat::ascii_safe_enabled();
+        let compact_hints = if ascii_safe {
+            [
+                ActionHint::new("Tab", "<>"),
+                ActionHint::new("Up/Dn", ""),
+                ActionHint::new("Enter", ""),
+                ActionHint::new("Esc", ""),
+            ]
+        } else {
+            [
+                ActionHint::new("Tab", "⇆"),
+                ActionHint::new("↑↓", ""),
+                ActionHint::new("Enter", "↵"),
+                ActionHint::new("Esc", "×"),
+            ]
+        };
         // Reserve the action footer by its actual wrapped height so no list
         // row silently falls off the bottom on compact terminals.
         let footer_height = |id: MessageId| -> usize {
             wrapped_footer_lines(&self.tr(id), inner.width, Style::default()).len()
         };
-        let footer_lines = if !self.filter.is_empty() {
+        let footer_lines = if compact {
+            1
+        } else if !self.filter.is_empty() {
             footer_height(MessageId::ConfigFooterFiltered)
         } else {
             footer_height(MessageId::ConfigFooterScrollable)
@@ -5029,7 +5128,9 @@ impl ConfigView {
         // footer these settings paint. The preview sheds first on short
         // terminals; the sentence holds while two list lines remain.
         let preview_lines = usize::from(content_height >= HEADER_LINES + 10);
-        let sentence_lines = if content_height.saturating_sub(HEADER_LINES + preview_lines) >= 3 {
+        let sentence_lines = if compact {
+            usize::from(content_height >= HEADER_LINES + 3)
+        } else if content_height.saturating_sub(HEADER_LINES + preview_lines) >= 3 {
             // Without a detail pane the band also carries the lanes that pane
             // would have shown, on a second line so neither is truncated away.
             if show_detail {
@@ -5128,13 +5229,10 @@ impl ConfigView {
             };
             {
                 let strip_style = CategoryNavStyle {
-                    selected: Style::default()
-                        .fg(palette::SELECTION_TEXT)
-                        .bg(palette::WHALE_ACTION)
-                        .add_modifier(Modifier::BOLD),
+                    selected: menu_style::selected_row_style(),
                     normal: Style::default().fg(palette::TEXT_MUTED),
                     marker: Style::default().fg(palette::TEXT_HINT),
-                    ascii_safe: false,
+                    ascii_safe,
                 };
                 let strip = render_settings_category_strip(
                     nav_row,
@@ -5224,8 +5322,19 @@ impl ConfigView {
                             .add_modifier(Modifier::DIM)
                     };
                     let label = config_label_for_key_for_locale(self.locale, &row.key);
-                    let key = fit_config_column(&label, key_column_width);
-                    let value = fit_config_column(&self.row_display_value(row), value_column_width);
+                    let (key_width, value_width) = if compact {
+                        let available = usize::from(list.width).saturating_sub(
+                            CONFIG_ROW_PREFIX_WIDTH
+                                + CONFIG_COLUMN_GAPS_WIDTH
+                                + CONFIG_AFFORDANCE_COLUMN_WIDTH,
+                        );
+                        let key_width = UnicodeWidthStr::width(label.as_str()).min(available / 2);
+                        (key_width, available.saturating_sub(key_width))
+                    } else {
+                        (key_column_width, value_column_width)
+                    };
+                    let key = fit_config_column(&label, key_width);
+                    let value = fit_config_column(&self.row_display_value(row), value_width);
                     let kind = self.editor_kind(row);
                     let on = (kind == SettingKind::Boolean)
                         .then(|| canonical_config_choice(&row.key, row.edit_value()) == "true");
@@ -5242,16 +5351,18 @@ impl ConfigView {
                     let mut line = Line::from(vec![
                         Span::styled(
                             rail,
-                            Style::default().fg(if selected {
-                                palette::WHALE_ACTION
+                            if selected {
+                                style
                             } else {
-                                palette::TEXT_DIM
-                            }),
+                                Style::default().fg(palette::TEXT_DIM)
+                            },
                         ),
                         Span::styled(format!("{key}  {value}  "), style),
                         Span::styled(
                             format!("{affordance:<3}  "),
-                            if row.editable {
+                            if selected {
+                                style
+                            } else if row.editable {
                                 Style::default().fg(palette::WHALE_ACTION)
                             } else {
                                 Style::default()
@@ -5261,9 +5372,13 @@ impl ConfigView {
                         ),
                         Span::styled(
                             badge.into_owned(),
-                            Style::default()
-                                .fg(palette::TEXT_HINT)
-                                .add_modifier(Modifier::DIM),
+                            if selected {
+                                style
+                            } else {
+                                Style::default()
+                                    .fg(palette::TEXT_HINT)
+                                    .add_modifier(Modifier::DIM)
+                            },
                         ),
                     ]);
                     if selected {
@@ -5314,6 +5429,12 @@ impl ConfigView {
             // is more urgent and takes the row while it lasts.
             let bottom_text = if let Some(status) = self.status.as_ref() {
                 status.clone()
+            } else if let Some(row) = selected_row.filter(|_| compact) {
+                format!(
+                    "{}: {}",
+                    config_label_for_key_for_locale(self.locale, &row.key),
+                    self.row_display_value(row)
+                )
             } else if !self.filter.is_empty() {
                 format!(
                     "{}: {match_count}",
@@ -5381,12 +5502,16 @@ impl ConfigView {
         } else {
             self.tr(MessageId::ConfigFooterDefault)
         };
-        render_modal_text_footer(
-            inner,
-            buf,
-            &footer,
-            Style::default().fg(palette::TEXT_MUTED),
-        );
+        if compact {
+            render_modal_footer(inner, buf, &compact_hints);
+        } else {
+            render_modal_text_footer(
+                inner,
+                buf,
+                &footer,
+                Style::default().fg(palette::TEXT_MUTED),
+            );
+        }
     }
 }
 
@@ -6332,13 +6457,13 @@ fn fit_config_column(text: &str, width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ActionHint, ConfigCategory, ConfigListItem, ConfigScope, ConfigView, EmptyState,
-        FocusTextureMode, HelpView, ListDetailLayout, ModalKind, ModalView, SettingKind,
-        SettingsRegistry, ViewAction, ViewEvent, ViewStack, action_footer_lines,
-        canonical_config_choice, centered_modal_area, config_choice_detail, config_choice_label,
-        config_choice_values, config_label_for_key, config_label_for_key_for_locale,
-        render_modal_footer_with_gutter, render_underwater_surface, subagent_view_agents,
-        truncate_view_text,
+        ActionHint, ConfigCategory, ConfigListItem, ConfigRowKind, ConfigScope, ConfigView,
+        EmptyState, FocusTextureMode, HelpView, ListDetailLayout, ModalKind, ModalView,
+        SettingKind, SettingStore, SettingsRegistry, ViewAction, ViewEvent, ViewStack,
+        action_footer_lines, canonical_config_choice, centered_modal_area, config_choice_detail,
+        config_choice_label, config_choice_values, config_label_for_key,
+        config_label_for_key_for_locale, render_modal_footer_with_gutter,
+        render_underwater_surface, subagent_view_agents, truncate_view_text,
     };
     use crate::config::Config;
     use crate::settings::Settings;
@@ -7364,7 +7489,6 @@ mod tests {
             .map(|row| row.key.as_str())
             .collect::<Vec<_>>();
         assert!(keys.contains(&"provider"));
-        assert!(keys.contains(&"provider_templates"));
         assert!(keys.contains(&"model"));
         assert!(keys.contains(&"reasoning_effort"));
         assert!(keys.contains(&"base_url"));
@@ -8170,7 +8294,7 @@ base_url = "https://api.xiaomimimo.com/v1"
         let _guard = ConfigSettingsEnvGuard::new("theme = \"terminal\"\n");
         let app = create_test_app();
         let view = ConfigView::new_for_app(&app);
-        for (width, height) in [(80u16, 24u16), (120u16, 32u16)] {
+        for (width, height) in [(40u16, 12u16), (80u16, 24u16), (120u16, 32u16)] {
             let rendered = crate::tui::golden_harness::render_golden_text(width, height, |buf| {
                 view.render(Rect::new(0, 0, width, height), buf);
             });
@@ -8368,19 +8492,16 @@ base_url = "https://api.xiaomimimo.com/v1"
         assert_eq!(actual, expected);
     }
 
-    /// Every row the screen shows must land in a store. `settings.toml` rows
-    /// round-trip through `Settings`; the rest are actions, receipts, or
-    /// `config.toml` keys, and that list is spelled out so a new row cannot
-    /// quietly become one that discards the user's edit.
+    /// Every persisted row must land in a store. Typed action rows only open
+    /// another surface; `settings.toml` rows round-trip through `Settings`.
+    /// The remaining receipts and `config.toml` keys are spelled out so a new
+    /// editable row cannot quietly discard the user's edit.
     #[test]
     fn every_settings_row_reaches_a_store() {
         let _guard = crate::test_support::lock_test_env();
-        // Not `settings.toml`: opens another surface, reports a fact, or is
-        // persisted to config.toml by `set_config_value`.
+        // Non-action rows outside `settings.toml`: report a fact or persist
+        // to config.toml through `set_config_value`.
         const NOT_SETTINGS_TOML: &[&str] = &[
-            "provider",
-            "provider_templates",
-            "model",
             "fleet.exec.max_spawn_depth",
             "goal_command",
             "workflow",
@@ -8388,6 +8509,7 @@ base_url = "https://api.xiaomimimo.com/v1"
             "mcp_reconnect",
             "mcp_diagnose",
             "plugins_open",
+            "sandbox_details",
             "mcp_config_path",
             "approval_mode",
             "permission_posture",
@@ -8413,6 +8535,11 @@ base_url = "https://api.xiaomimimo.com/v1"
         ];
 
         for def in codewhale_config::schema_rows() {
+            if def.ui.is_some_and(|ui| {
+                ui.row == codewhale_config::settings_schema::SettingRowKind::Action
+            }) {
+                continue;
+            }
             if let Some(setting) =
                 codewhale_config::notifications::NotificationSetting::parse(def.key)
             {
@@ -8460,6 +8587,10 @@ base_url = "https://api.xiaomimimo.com/v1"
                 None if def.is_int() => {
                     let default: i64 = def.default.parse().unwrap_or(0);
                     vec![(default + 1).to_string()]
+                }
+                None if def.is_float() => {
+                    let default: f64 = def.default.parse().unwrap_or(50.0);
+                    vec![(default + 0.5).to_string()]
                 }
                 None => vec!["roundtrip-probe".to_string()],
             };
@@ -8602,7 +8733,9 @@ base_url = "https://api.xiaomimimo.com/v1"
             let options = match def.kind {
                 codewhale_config::SettingKind::Bool(options) => options,
                 codewhale_config::SettingKind::Enum(options) => options,
-                codewhale_config::SettingKind::Int | codewhale_config::SettingKind::String => &[],
+                codewhale_config::SettingKind::Int
+                | codewhale_config::SettingKind::String
+                | codewhale_config::SettingKind::Float => &[],
             };
             for option in options {
                 if !option.label.is_empty() {
@@ -9308,7 +9441,6 @@ context_window = 262144
         };
 
         assert_eq!(kind_for("provider"), SettingKind::Action);
-        assert_eq!(kind_for("provider_templates"), SettingKind::Action);
         assert_eq!(kind_for("model"), SettingKind::Action);
         assert_eq!(kind_for("low_motion"), SettingKind::Boolean);
         assert_eq!(kind_for("default_mode"), SettingKind::Choice);
@@ -9791,19 +9923,26 @@ context_window = 262144
                 cells.contains("Advanced"),
                 "{w}x{h} hitbox cells: {cells:?}"
             );
-            // Pointer parity: clicking the neighbour chip moves the category
-            // exactly as ← does.
+            // Pointer parity: the neighbour chip or compact Previous control
+            // moves the category exactly as ← does.
             let _ = view.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
             let by_key = view.category;
             let _ = view.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
             let mut buf = Buffer::empty(area);
             view.render(area, &mut buf);
             let strip = view.last_rail_hitboxes.borrow().clone();
-            let (motion, _) = strip
+            let motion = strip
                 .iter()
-                .copied()
                 .find(|(_, category)| *category == by_key)
-                .unwrap_or_else(|| panic!("{w}x{h} {by_key:?} hitbox"));
+                .map(|(rect, _)| *rect)
+                .or_else(|| {
+                    view.last_nav_controls
+                        .borrow()
+                        .iter()
+                        .find(|(_, step)| *step == super::NavStep::Previous)
+                        .map(|(rect, _)| *rect)
+                })
+                .unwrap_or_else(|| panic!("{w}x{h} {by_key:?} navigation target"));
             let action = view.handle_mouse(MouseEvent {
                 kind: MouseEventKind::Down(MouseButton::Left),
                 column: motion.x,
@@ -10129,7 +10268,11 @@ context_window = 262144
             assert_eq!(view.rows[view.selected].key, "fancy_animations");
             let dump = snapshot(&view, "Motion · ↓ to fancy_animations");
             assert!(
-                dump.contains(&en(MessageId::ConfigActivateAgain)),
+                if w < 50 {
+                    dump.contains("Enter")
+                } else {
+                    dump.contains(&en(MessageId::ConfigActivateAgain))
+                },
                 "{w}x{h} activation copy:\n{dump}"
             );
             match key(&mut view, KeyCode::Enter) {
@@ -10141,8 +10284,8 @@ context_window = 262144
             }
             assert!(view.editing.is_none());
 
-            // Pointer parity: click a visible non-active chip, then click the
-            // first listed row once (select) and again (activate).
+            // Pointer parity: click a visible non-active chip or the compact
+            // Previous control, then select and activate the first row.
             let mut buf = Buffer::empty(area);
             view.render(area, &mut buf);
             let (chip, target) = view
@@ -10151,7 +10294,14 @@ context_window = 262144
                 .iter()
                 .copied()
                 .find(|(_, category)| *category != ConfigCategory::Motion)
-                .expect("another category chip is painted");
+                .or_else(|| {
+                    view.last_nav_controls
+                        .borrow()
+                        .iter()
+                        .find(|(_, step)| *step == super::NavStep::Previous)
+                        .map(|(rect, _)| (*rect, ConfigCategory::Trust))
+                })
+                .expect("another category is reachable through a painted target");
             assert!(matches!(click(&mut view, chip.x, chip.y), ViewAction::None));
             assert_eq!(view.category, target, "{w}x{h} chip click");
             let mut buf = Buffer::empty(area);
@@ -10177,6 +10327,10 @@ context_window = 262144
                 (true, Some((command, _))) => match second {
                     ViewAction::Emit(ViewEvent::CommandPaletteSelected {
                         action: CommandPaletteAction::ExecuteCommand { command: emitted },
+                    }) => assert_eq!(emitted, command),
+                    ViewAction::Emit(ViewEvent::ExecutePanelCommand {
+                        command: emitted,
+                        pager_title: Some(_),
                     }) => assert_eq!(emitted, command),
                     other => panic!("{w}x{h} second click should open {command}: {other:?}"),
                 },
@@ -10402,7 +10556,7 @@ context_window = 262144
             "Enter must open the theme editor"
         );
 
-        // ↓ highlights underwater: preview (persist:false), editor stays open.
+        // ↓ highlights shoreline: preview (persist:false), editor stays open.
         match key(&mut view, KeyCode::Down) {
             ViewAction::Emit(ViewEvent::ConfigUpdated {
                 key,
@@ -10410,7 +10564,7 @@ context_window = 262144
                 persist,
             }) => {
                 assert_eq!(key, "theme");
-                assert_eq!(value, "underwater");
+                assert_eq!(value, "shoreline");
                 assert!(!persist, "highlighting must not persist");
             }
             other => panic!("highlight must preview, got {other:?}"),
@@ -10452,7 +10606,7 @@ context_window = 262144
                 persist,
             }) => {
                 assert_eq!(key, "theme");
-                assert_eq!(value, "underwater");
+                assert_eq!(value, "shoreline");
                 assert!(persist, "Apply must persist");
             }
             other => panic!("enter must persist the highlight, got {other:?}"),
@@ -10527,14 +10681,14 @@ context_window = 262144
                 modifiers: KeyModifiers::NONE,
             })
         };
-        // Choice index 2 is underwater (system, terminal, underwater, …).
+        // Choice index 2 is shoreline (system, terminal, shoreline, …).
         let (rect, _) = view
             .last_choice_hitboxes
             .borrow()
             .iter()
             .copied()
             .find(|(_, idx)| *idx == 2)
-            .expect("rendered underwater hitbox");
+            .expect("rendered shoreline hitbox");
         match hover(&mut view, rect.x, rect.y) {
             ViewAction::Emit(ViewEvent::ConfigUpdated {
                 key,
@@ -10542,7 +10696,7 @@ context_window = 262144
                 persist,
             }) => {
                 assert_eq!(key, "theme");
-                assert_eq!(value, "underwater");
+                assert_eq!(value, "shoreline");
                 assert!(!persist, "hover preview must not persist");
             }
             other => panic!("hover must preview, got {other:?}"),
@@ -11179,6 +11333,74 @@ context_window = 262144
     /// settings rows, and the wrapped footer height must come out of the
     /// table budget instead of silently clipping rows.
     #[test]
+    fn config_compact_theme_category_and_footer_remain_legible() {
+        let _guard = ConfigSettingsEnvGuard::new("theme = \"shoreline\"\n");
+        let mut view = create_config_view(Locale::En);
+        view.focus_key("theme");
+        let area = Rect::new(0, 0, 40, 12);
+        let mut buf = Buffer::empty(area);
+        view.render(area, &mut buf);
+        let dump = buffer_text(&buf, area);
+        let theme_rect = view
+            .last_row_hitboxes
+            .borrow()
+            .iter()
+            .find(|(_, idx)| view.rows[*idx].key == "theme")
+            .unwrap()
+            .0;
+        assert!(
+            buffer_row_text(&buf, area, theme_rect.y).contains("shoreline"),
+            "{dump}"
+        );
+        assert!(dump.contains("Appearance  1/7"), "{dump}");
+        let footer = dump
+            .lines()
+            .find(|line| line.contains("Enter") && line.contains("Esc"))
+            .expect("all compact action hints share one line");
+        assert!(footer.contains("Tab"));
+        for category in ConfigCategory::ALL {
+            view.category = category;
+            view.select_first_visible_row();
+            view.render(area, &mut buf);
+            let dump = buffer_text(&buf, area);
+            assert!(
+                dump.contains(category.label(Locale::En).as_ref()),
+                "{category:?}: {dump}"
+            );
+            assert_eq!(view.last_nav_controls.borrow().len(), 2);
+        }
+    }
+
+    #[test]
+    fn config_sandbox_search_opens_observed_status_without_editing_policy() {
+        let mut view = create_config_view(Locale::En);
+        for query in [
+            "sandbox",
+            "filesystem",
+            "unenforced",
+            "bubblewrap",
+            "doctor",
+        ] {
+            view.restore_filter(query.to_string());
+            let matches = view.matching_row_indices();
+            let index = *matches
+                .iter()
+                .find(|&&idx| view.rows[idx].key == "sandbox_details")
+                .expect("sandbox explanation discoverable");
+            view.selected = index;
+            let row = &view.rows[index];
+            assert_eq!(row.facts.kind, ConfigRowKind::Action);
+            assert_eq!(row.facts.store, SettingStore::None);
+            assert!(
+                matches!(view.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+                ViewAction::Emit(ViewEvent::ExecutePanelCommand { command, pager_title: Some(_) }) if command == "/status")
+            );
+            assert!(view.editing.is_none());
+        }
+        assert!(!view.rows.iter().any(|row| row.key == "sandbox_mode"));
+    }
+
+    #[test]
     fn config_view_compact_heights_always_show_a_selectable_setting() {
         let mut view = create_config_view(Locale::En);
         for (width, height, label) in [(40u16, 12u16, "40x12"), (60, 16, "60x16")] {
@@ -11266,187 +11488,3 @@ context_window = 262144
         );
     }
 }
-
-// ---------------------------------------------------------------------------
-// Tideline settings stage (spec §5a "Settings rail", "Live preview"; §5b
-// 3-pane settings layout): the theme list + live preview composite. It
-// navigates the same `ConfigCategory::ALL` taxonomy as `ConfigView`, through
-// the shared rail/strip painters above, so there is exactly one category set.
-
-#[allow(dead_code)] // Tideline settings rail + preview (spec §5a)
-pub mod tideline_preview;
-
-/// The seven settings categories in rail order (Appearance → Advanced),
-/// exactly as `ConfigView` paints them.
-#[must_use]
-#[allow(dead_code)] // stage scaffolding: composed by the landing slice
-pub fn tideline_settings_categories(locale: Locale) -> [Cow<'static, str>; 7] {
-    ConfigCategory::ALL.map(|category| category.label(locale))
-}
-
-/// What the caller owes the settings rail.
-#[allow(dead_code)] // stage scaffolding: composed by the landing slice
-pub struct TidelineSettingsRail<'a> {
-    pub theme: &'a codewhale_palette::UiTheme,
-    /// Index into [`ConfigCategory::ALL`].
-    pub selected: usize,
-    pub ascii_safe: bool,
-    pub locale: Locale,
-}
-
-#[allow(dead_code)] // stage scaffolding: composed by the landing slice
-impl TidelineSettingsRail<'_> {
-    fn category(&self) -> ConfigCategory {
-        ConfigCategory::ALL[self.selected.min(ConfigCategory::ALL.len() - 1)]
-    }
-
-    fn nav_style(&self) -> CategoryNavStyle {
-        use codewhale_palette::{ChromeInk, chrome_style};
-        CategoryNavStyle {
-            selected: chrome_style(self.theme, ChromeInk::Identity).add_modifier(Modifier::BOLD),
-            normal: chrome_style(self.theme, ChromeInk::MetadataValue),
-            marker: chrome_style(self.theme, ChromeInk::Identity),
-            ascii_safe: self.ascii_safe,
-        }
-    }
-}
-
-#[allow(dead_code)] // stage scaffolding: composed by the landing slice
-fn srail_put(buf: &mut Buffer, x: u16, y: u16, text: &str, style: Style) {
-    buf.set_stringn(x, y, text, text.width(), style);
-}
-
-/// Paint the settings rail: the shared category rail with the selected `▸`,
-/// then the meta rows (help / file issue / feedback).
-#[allow(dead_code)] // stage scaffolding: composed by the landing slice
-pub fn render_tideline_settings_rail(
-    area: Rect,
-    buf: &mut Buffer,
-    rail: &TidelineSettingsRail<'_>,
-) {
-    if area.width < 4 || area.height < 4 {
-        return;
-    }
-    let categories = Rect {
-        height: area.height.saturating_sub(3),
-        ..area
-    };
-    render_settings_category_rail(
-        categories,
-        buf,
-        rail.category(),
-        rail.locale,
-        rail.nav_style(),
-        // The stage scaffold owns no pointer state yet; the landing slice
-        // threads its hover here when it wires the rail to mouse motion.
-        None,
-    );
-    // Meta rows pinned near the bottom (the reference's help/file/feedback).
-    let meta_y = area.y + area.height.saturating_sub(3);
-    for (offset, meta) in ["? help", "/ file issue", "f feedback"].iter().enumerate() {
-        let row_y = meta_y + offset as u16;
-        if row_y < area.y + area.height {
-            srail_put(
-                buf,
-                area.x,
-                row_y,
-                meta,
-                codewhale_palette::chrome_style(
-                    rail.theme,
-                    codewhale_palette::ChromeInk::MetadataHint,
-                ),
-            );
-        }
-    }
-}
-
-/// Category rects for the rail (spec §6: keyboard + mouse parity).
-#[must_use]
-#[allow(dead_code)] // stage scaffolding: composed by the landing slice
-pub fn tideline_settings_rail_hitboxes(area: Rect, _rail: &TidelineSettingsRail<'_>) -> Vec<Rect> {
-    let mut out = Vec::new();
-    if area.width < 4 || area.height < 4 {
-        return out;
-    }
-    for index in 0..ConfigCategory::ALL.len() {
-        let y = area.y + index as u16;
-        if y >= area.y + area.height.saturating_sub(3) {
-            break;
-        }
-        out.push(Rect {
-            x: area.x,
-            y,
-            width: area.width,
-            height: 1,
-        });
-    }
-    out
-}
-
-/// Paint the narrow-width category strip for the stage and return the
-/// painted rect of every visible category.
-#[allow(dead_code)] // stage scaffolding: composed by the landing slice
-pub fn render_tideline_settings_strip(
-    area: Rect,
-    buf: &mut Buffer,
-    rail: &TidelineSettingsRail<'_>,
-) -> Vec<Rect> {
-    render_settings_category_strip(
-        area,
-        buf,
-        rail.category(),
-        rail.locale,
-        rail.nav_style(),
-        // The stage scaffold owns no pointer state yet; the landing slice
-        // threads its hover here when it wires the strip to mouse motion.
-        None,
-        None,
-    )
-    .chips
-    .into_iter()
-    .map(|(rect, _)| rect)
-    .collect()
-}
-
-use ratatui::layout::{Constraint, Layout};
-
-/// The settings stage composite (spec §5b): `nav │ form │ preview` at
-/// ≥100 columns; below that the category strip sits over the form and the
-/// preview pane sheds.
-#[allow(dead_code)] // stage scaffolding: composed by the landing slice
-pub struct TidelineSettingsStage<'a> {
-    pub rail: TidelineSettingsRail<'a>,
-    pub theme_list: crate::tui::theme_picker::TidelineThemeList<'a>,
-    pub preview: tideline_preview::TidelineSettingsPreview<'a>,
-}
-
-/// Paint the settings stage.
-#[allow(dead_code)] // stage scaffolding: composed by the landing slice
-pub fn render_tideline_settings_stage(
-    area: Rect,
-    buf: &mut Buffer,
-    stage: &TidelineSettingsStage<'_>,
-) {
-    if area.width < 30 || area.height < 4 {
-        return;
-    }
-    if area.width >= 100 {
-        let [nav, form, preview] = Layout::horizontal([
-            Constraint::Length(CONFIG_SHELL_RAIL_WIDTH),
-            Constraint::Min(30),
-            Constraint::Percentage(38),
-        ])
-        .areas(area);
-        render_tideline_settings_rail(nav, buf, &stage.rail);
-        crate::tui::theme_picker::render_tideline_theme_list(form, buf, &stage.theme_list);
-        tideline_preview::render_tideline_settings_preview(preview, buf, &stage.preview);
-    } else {
-        let [strip, form] =
-            Layout::vertical([Constraint::Length(1), Constraint::Min(3)]).areas(area);
-        render_tideline_settings_strip(strip, buf, &stage.rail);
-        crate::tui::theme_picker::render_tideline_theme_list(form, buf, &stage.theme_list);
-    }
-}
-
-#[cfg(test)]
-mod tideline_tests;

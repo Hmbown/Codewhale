@@ -22,8 +22,8 @@ use crate::plugins::install::PluginInstallSource;
 
 use super::super::types::{
     CatalogProvenance, CatalogTier, MarketplaceCandidate, MarketplaceCandidateId,
-    MarketplaceCatalog, MarketplaceDiagnostic, MarketplaceFormat, MarketplaceInstallPlan,
-    MarketplaceSourceSpec,
+    MarketplaceCatalog, MarketplaceDiagnostic, MarketplaceEntryKind, MarketplaceFormat,
+    MarketplaceInstallPlan, MarketplaceSourceSpec,
 };
 use super::{MarketplaceDocument, str_field, unknown_fields_warning};
 
@@ -31,6 +31,7 @@ const TOP_LEVEL_FIELDS: &[&str] = &["name", "description", "version", "plugins"]
 const ENTRY_FIELDS: &[&str] = &[
     "name",
     "source",
+    "kind",
     "description",
     "version",
     "homepage",
@@ -287,9 +288,38 @@ fn parse_codewhale_entry(
             Some(index),
         ));
     }
+    // What this entry is. The Codewhale marketplace keeps plugins and
+    // skills in separate top-level directories, so the source path is the
+    // signal; a document may also declare `kind` explicitly. A skill entry
+    // stays installable, but it is not a plugin and is never suggested as
+    // one (#6290 rework).
+    let kind = match obj.get("kind").and_then(Value::as_str) {
+        Some("skill") => MarketplaceEntryKind::Skill,
+        Some("plugin") | None => {
+            let path = source
+                .strip_prefix("path:")
+                .unwrap_or(source)
+                .trim_start_matches("./");
+            if path == "skills" || path.starts_with("skills/") {
+                MarketplaceEntryKind::Skill
+            } else {
+                MarketplaceEntryKind::Plugin
+            }
+        }
+        Some(other) => {
+            entry_diags.push(MarketplaceDiagnostic::warning(
+                "UNKNOWN_ENTRY_KIND",
+                format!("unknown entry kind `{other}`; treated as a plugin"),
+                Some(name.clone()),
+                Some(index),
+            ));
+            MarketplaceEntryKind::Plugin
+        }
+    };
     Some(MarketplaceCandidate {
         id: MarketplaceCandidateId::new(catalog_id, &name),
         catalog_id: catalog_id.clone(),
+        kind,
         icon,
         name,
         display_name,

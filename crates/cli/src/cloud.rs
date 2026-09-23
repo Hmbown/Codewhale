@@ -17,9 +17,10 @@ use codewhale_config::{ConfigStore, ProviderKind};
 use codewhale_secrets::Secrets;
 use codewhale_secrets::account::{
     ACCOUNT_API_BASE_ENV as CLOUD_API_BASE_ENV, AccountAuthBundle as AuthBundle,
-    AccountSessionStore, AccountUser as CloudUser, DEFAULT_ACCOUNT_API_BASE as DEFAULT_API_BASE,
-    StoredAccountAuth as StoredCloudAuth, normalize_account_profile as normalized_profile,
-    secure_account_session_secrets, validate_account_auth_bundle as validate_auth_bundle,
+    AccountSessionSnapshot, AccountSessionStore, AccountUser as CloudUser,
+    DEFAULT_ACCOUNT_API_BASE as DEFAULT_API_BASE, StoredAccountAuth as StoredCloudAuth,
+    normalize_account_profile as normalized_profile, secure_account_session_secrets,
+    validate_account_auth_bundle as validate_auth_bundle,
 };
 use reqwest::Url;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -240,7 +241,7 @@ struct ReqwestTransport {
 
 impl ReqwestTransport {
     fn new(base: Url) -> Result<Self> {
-        let client = reqwest::blocking::Client::builder()
+        let client = codewhale_release::platform_blocking_http_client_builder()
             .connect_timeout(Duration::from_secs(8))
             .timeout(Duration::from_secs(30))
             // Never replay bearer tokens or provider-key request bodies to a
@@ -413,21 +414,30 @@ impl<'a, T: CloudTransport> CloudClient<'a, T> {
             .context("failed to save the Codewhale account session in the local secret store")
     }
 
-    fn clear_auth(&self) -> Result<()> {
-        self.account_store
-            .clear()
-            .context("failed to remove the local Codewhale account session")
-    }
-
     fn me(&self) -> Result<CloudUser> {
-        let response = self.execute_authenticated(HttpMethod::Get, "/api/me", None)?;
+        let (response, snapshot) =
+            self.execute_authenticated_snapshot(HttpMethod::Get, "/api/me", None)?;
         let me: MeResponse = expect_json(response, &[200])?;
         if me.user.id.trim().is_empty() {
             bail!("The Codewhale service returned an account without an ID");
         }
-        if let Some(mut stored) = self.load_auth()? {
+        if let Some(mut stored) = snapshot.load()? {
+            if stored
+                .bundle
+                .user
+                .as_ref()
+                .is_some_and(|user| !user.id.is_empty() && user.id != me.user.id)
+            {
+                bail!("The signed-in account changed. Refresh and try again.");
+            }
             stored.bundle.user = Some(me.user.clone());
-            self.save_auth(stored.bundle)?;
+            if self
+                .account_store
+                .save_if_unchanged(&snapshot, stored.bundle)?
+                .is_none()
+            {
+                bail!("The signed-in account changed. Refresh and try again.");
+            }
         }
         Ok(me.user)
     }
@@ -486,35 +496,35 @@ impl<'a, T: CloudTransport> CloudClient<'a, T> {
     }
 
     fn logout(&self) -> Result<bool> {
-        let stored = match self.load_auth() {
-            Ok(Some(stored)) => stored,
-            Ok(None) => {
-                // `load` deliberately treats obsolete-schema and wrong-origin
-                // records as signed out. Logout must still scrub their slot.
-                self.clear_auth()?;
-                return Ok(false);
-            }
-            Err(_) => {
-                // Logout is also the recovery path for a corrupt or obsolete
-                // local record, so it must remain able to remove that record.
-                self.clear_auth()?;
-                return Ok(false);
-            }
-        };
-        let body = json_body(&RefreshRequest {
-            refresh_token: &stored.bundle.refresh_token,
-        })?;
-        let remote_revoked = self
-            .transport
-            .execute(CloudRequest {
-                method: HttpMethod::Post,
-                path: "/api/auth/logout".to_string(),
-                bearer: None,
-                body: Some(body),
+        let snapshot = self.account_store.snapshot()?;
+        self.account_store
+            .with_transaction(|transaction| -> Result<bool> {
+                if !transaction.matches(&snapshot) {
+                    bail!("The signed-in account changed. Refresh and try again.");
+                }
+                let stored = match transaction.load() {
+                    Ok(Some(stored)) => stored,
+                    Ok(None) | Err(_) => {
+                        transaction.clear();
+                        return Ok(false);
+                    }
+                };
+                let body = json_body(&RefreshRequest {
+                    refresh_token: &stored.bundle.refresh_token,
+                })?;
+                let response = self.transport.execute(CloudRequest {
+                    method: HttpMethod::Post,
+                    path: "/api/auth/logout".into(),
+                    bearer: None,
+                    body: Some(body),
+                })?;
+                if (200..300).contains(&response.status) || matches!(response.status, 401 | 403) {
+                    transaction.clear();
+                    return Ok((200..300).contains(&response.status));
+                }
+                // Keep custody on transient failure so revocation can be retried.
+                Err(response_error(&response))
             })
-            .is_ok_and(|response| (200..300).contains(&response.status));
-        self.clear_auth()?;
-        Ok(remote_revoked)
     }
 
     fn execute_authenticated(
@@ -523,53 +533,79 @@ impl<'a, T: CloudTransport> CloudClient<'a, T> {
         path: &str,
         body: Option<Vec<u8>>,
     ) -> Result<CloudResponse> {
-        let Some(mut stored) = self.load_auth()? else {
+        self.execute_authenticated_snapshot(method, path, body)
+            .map(|(response, _)| response)
+    }
+
+    fn execute_authenticated_snapshot(
+        &self,
+        method: HttpMethod,
+        path: &str,
+        body: Option<Vec<u8>>,
+    ) -> Result<(CloudResponse, AccountSessionSnapshot)> {
+        let snapshot = self.account_store.snapshot()?;
+        let Some(mut stored) = snapshot.load()? else {
             bail!("Not signed in. Run `codewhale login` first");
         };
         let first = self.transport.execute(CloudRequest {
             method,
-            path: path.to_string(),
+            path: path.into(),
             bearer: Some(stored.bundle.access_token.clone()),
             body: body.clone(),
         })?;
         if first.status != 401 {
-            return Ok(first);
+            return Ok((first, snapshot));
         }
-
-        let refresh = self.transport.execute(CloudRequest {
-            method: HttpMethod::Post,
-            path: "/api/auth/refresh".to_string(),
-            bearer: None,
-            body: Some(json_body(&RefreshRequest {
-                refresh_token: &stored.bundle.refresh_token,
-            })?),
-        })?;
-        match refresh.status {
-            200 => {}
-            401 => {
-                self.clear_auth()?;
-                bail!("The Codewhale account session expired. Run `codewhale login` again");
-            }
-            _ => return Err(response_error(&refresh)),
-        }
-        let mut next: AuthBundle = parse_json_body(&refresh.body)?;
-        validate_auth_bundle(&next)?;
-        if next.user.is_none() {
-            next.user = stored.bundle.user.take();
-        }
-        self.save_auth(next.clone())?;
-
+        // Serialize the refresh HTTP request itself with native/CLI writers:
+        // two processes must not spend the same rotating refresh token.
+        let renewed = self
+            .account_store
+            .with_transaction(|transaction| -> Result<_> {
+                if !transaction.matches(&snapshot) {
+                    bail!("The signed-in account changed. Refresh and try again.");
+                }
+                let refresh = self.transport.execute(CloudRequest {
+                    method: HttpMethod::Post,
+                    path: "/api/auth/refresh".into(),
+                    bearer: None,
+                    body: Some(json_body(&RefreshRequest {
+                        refresh_token: &stored.bundle.refresh_token,
+                    })?),
+                })?;
+                match refresh.status {
+                    200 => {}
+                    401 => {
+                        transaction.clear();
+                        return Ok(None);
+                    }
+                    _ => return Err(response_error(&refresh)),
+                }
+                let mut next: AuthBundle = parse_json_body(&refresh.body)?;
+                validate_auth_bundle(&next)?;
+                if next.user.is_none() {
+                    next.user = stored.bundle.user.take();
+                }
+                if next.session.is_none() {
+                    next.session = stored.bundle.session.take();
+                }
+                transaction.replace(next.clone())?;
+                Ok(Some((next, transaction.snapshot())))
+            })?;
+        let Some((next, next_snapshot)) = renewed else {
+            bail!("The Codewhale account session expired. Run `codewhale login` again");
+        };
+        // The rotated token is durable before a potentially failing retry.
         let retried = self.transport.execute(CloudRequest {
             method,
-            path: path.to_string(),
+            path: path.into(),
             bearer: Some(next.access_token),
             body,
         })?;
         if retried.status == 401 {
-            self.clear_auth()?;
+            self.account_store.clear_if_unchanged(&next_snapshot)?;
             bail!("The Codewhale account session expired. Run `codewhale login` again");
         }
-        Ok(retried)
+        Ok((retried, next_snapshot))
     }
 
     /// Whether an interactive session exists for this profile and origin.

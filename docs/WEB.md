@@ -1,5 +1,7 @@
 # Local browser client
 
+> 阅读简体中文版：[zh_hans/WEB.md](zh_hans/WEB.md)。
+
 `codewhale web` opens Codewhale's embedded browser client over the canonical
 Runtime API. It is a local surface: the server always binds to
 `127.0.0.1`, cannot be rebound to a LAN address, and cannot run with Runtime

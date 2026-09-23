@@ -60,7 +60,7 @@ fn format_cache_inspect(app: &mut App, verbose: bool, json_mode: bool) -> String
         .map(str::to_string);
     let request = MessageRequest {
         model: target.model.clone(),
-        messages: app.api_messages.clone(),
+        messages: app.api_messages.as_ref().clone(),
         max_tokens: 0,
         system: app.system_prompt.clone(),
         tools: app.session.last_tool_catalog.clone(),

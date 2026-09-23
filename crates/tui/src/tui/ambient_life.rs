@@ -6,6 +6,11 @@
 //! existing delta/interpolation path: this module never requests frames on
 //! its own.
 //!
+//! Native silhouettes use the shared 2×4 braille cell: fish move in half
+//! columns with a one-dot bob; jellyfish rise in quarter rows. A bounded pose
+//! table owns no clock or simulation. ASCII-safe terminals retain the original
+//! silhouettes through the same habitat, population and collision path.
+//!
 //! Motion language (shared with the rest of the shell): every mark can lerp
 //! between the water and its ink at a time-varying brightness. Fish carry a
 //! travelling sin² wave, jellyfish a slow band-bounded pulse that opens and
@@ -65,6 +70,8 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::tui::ocean::{self, OceanColumn};
 
+#[path = "ambient_life/native_poses.rs"]
+mod native_poses;
 #[path = "ambient_life/pet_cameo.rs"]
 mod pet_cameo;
 #[path = "ambient_life/pet_sim.rs"]
@@ -134,10 +141,15 @@ impl LifeDensity {
 
     #[must_use]
     fn bubble_streams(self) -> usize {
+        // Raised from 1/2/2 (founder, "screw the cap … more alive more
+        // ocean"). Bubbles are the cheapest life in the field: one mark
+        // each, no silhouette to degrade, and `water()` already refuses any
+        // column the composition has claimed, so a denser field thins itself
+        // automatically as a transcript fills.
         match self {
-            Self::Sparse => 1,
-            Self::Normal => 2,
-            Self::Rich => 2,
+            Self::Sparse => 2,
+            Self::Normal => 4,
+            Self::Rich => 6,
         }
     }
 }
@@ -182,11 +194,11 @@ pub struct AmbientFrameStats {
     pub cells_written: u32,
 }
 
-/// Bounded school (7), jellyfish (4), bubbles (2), plus at most three
+/// Bounded school (7), jellyfish (4), bubbles (6), plus at most three
 /// 18-by-6 dot-whale widgets including their labels. No particle allocations
 /// or simulation steps occur per paint after the fixed cameo tapes are cached.
 #[cfg(test)]
-pub const MAX_FRAME_MARKS: u32 = 13 + pet_cameo::MAX_MARKS;
+pub const MAX_FRAME_MARKS: u32 = 17 + pet_cameo::MAX_MARKS;
 
 /// Optional pointer reaction for fish dart / bubble rise.
 #[derive(Debug, Clone, Copy, Default)]
@@ -235,27 +247,6 @@ impl AmbientActivity {
             _ => Self::Baseline,
         }
     }
-
-    /// Ocean-clock speed factor: thinking reads as the slow deep, tool work
-    /// as the fast current.
-    fn speed(self) -> f32 {
-        match self {
-            Self::Reasoning => 0.6,
-            Self::Reading => 0.8,
-            Self::Tools | Self::Subagents => 1.25,
-            Self::Verifying => 1.0,
-            Self::Baseline => 1.0,
-        }
-    }
-
-    fn scaled_time_ms(self, elapsed_ms: u128) -> u128 {
-        let speed = self.speed();
-        if (speed - 1.0).abs() < f32::EPSILON {
-            elapsed_ms
-        } else {
-            ((elapsed_ms as f64) * f64::from(speed)) as u128
-        }
-    }
 }
 
 /// Render ambient life into empty water cells of `area`.
@@ -282,17 +273,22 @@ pub fn render_ambient_life(
         return AmbientFrameStats::default();
     }
 
-    // Activity shifts the ocean clock: reading feels like the deep (slow
-    // drift), tool work like a brighter current (faster), verification stays
-    // on the metered pulse. Density stays bounded by MAX_FRAME_MARKS.
-    let elapsed_ms = activity.scaled_time_ms(elapsed_ms);
-
+    // Geometry always samples the same clock. Scaling its absolute age when
+    // activity changes teleports the scene; activity already owns ink/cameos.
     let density = LifeDensity::from_area(area);
     let mut stats = AmbientFrameStats::default();
     // Positions always ride the live monotonic clock; `presence` fades the
     // marks in and out, so the animated/static boundary eases instead of
     // snapping fish between t=0 and their mid-path positions.
-    let frame = build_frame_marks(area, elapsed_ms, density, lines, cursor, &mut stats);
+    let frame = build_frame_marks(
+        area,
+        elapsed_ms,
+        density,
+        lines,
+        cursor,
+        crate::tui::color_compat::ascii_safe_enabled(),
+        &mut stats,
+    );
     paint_marks(area, buf, inks, lines, &frame, presence, &mut stats);
     pet_cameo::paint(
         area, buf, inks.0, lines, presence, whale, activity, &mut stats,
@@ -307,6 +303,7 @@ fn build_frame_marks(
     density: LifeDensity,
     lines: &[Line<'static>],
     cursor: AmbientCursor,
+    ascii_safe: bool,
     stats: &mut AmbientFrameStats,
 ) -> FrameMarks {
     let mut marks = Vec::with_capacity(48);
@@ -341,6 +338,7 @@ fn build_frame_marks(
     let cycle_index = school_clock / cycle_ms;
     let cycle_frac = (school_clock % cycle_ms) as f64 / cycle_ms as f64;
     let cycle_step = (cycle_frac * travel as f64).round() as i32;
+    let cycle_dot_step = (cycle_frac * travel as f64 * 2.0).floor() as i32;
     let swims_right = school_swims_right(cycle_index);
     // The school has one home: the deep water just off the floor. It used to
     // alternate between an upper and a lower band, which is most of why the
@@ -351,20 +349,62 @@ fn build_frame_marks(
     let ptr = cursor.column.saturating_sub(area.x);
     let ptr_y = cursor.row.saturating_sub(area.y);
     for (m, (dy, dx)) in SCHOOL_WEDGE.iter().take(school_size).enumerate() {
-        let body = fish_body(swims_right, m == 0);
-        let body_w = body.len() as u16; // ASCII bodies: len == width
+        let ascii_body = fish_body(swims_right, m == 0);
+        let body_w = if ascii_safe {
+            ascii_body.width() as u16
+        } else {
+            4
+        };
         // Nose position in wrap space; trailers sit `dx` columns behind the
         // lead relative to travel, so the wedge follows instead of leading.
         // Right-swimmers enter from the left edge, left-swimmers from the
         // right edge — both facing exactly the way they move.
-        let mut x_i32 = if swims_right {
-            cycle_step - 1 - i32::from(*dx) - (i32::from(body_w) - 1)
+        // Formation drift. Every fish used to sit at an exact offset in the
+        // wedge, so seven animals crossed the field as one rigid object —
+        // the single biggest reason the water read as decoration rather than
+        // life. Each fish now eases one dot fore and aft of its slot on its
+        // own slow period, so the wedge breathes while it travels.
+        //
+        // The period is deliberately off both the bob (`3_400 + m * 640`)
+        // and the tail cycle (300 ms), per this module's rule that entity
+        // periods never match so nothing strobes in step. One dot of
+        // amplitude over ~6 s is far slower than the crossing speed, so a
+        // fish never travels against the school and `facing == velocity`
+        // still holds by construction. Costs no marks: the school's
+        // population, band and budget are unchanged.
+        let drift = i32::from(sine_bob(
+            t,
+            5_200 + entity_jitter(m as u128 + 617) % 3_400,
+            2,
+        )) - 1;
+        let x_dots = if swims_right {
+            cycle_dot_step - i32::from(*dx) * 2 - i32::from(body_w) * 2 + drift
         } else {
-            i32::from(area.width) - cycle_step + i32::from(*dx)
+            i32::from(area.width) * 2 - cycle_dot_step + i32::from(*dx) * 2 - drift
         };
-        // Slight per-fish vertical stagger + slow bob.
-        let bob = sine_bob(t, 3_400 + (m as u128) * 640, 1);
-        let y_i32 = i32::from(anchor_y) + i32::from(*dy) + i32::from(bob);
+        let mut x_i32 = if ascii_safe {
+            if swims_right {
+                cycle_step - i32::from(*dx) - i32::from(body_w)
+            } else {
+                i32::from(area.width) - cycle_step + i32::from(*dx)
+            }
+        } else {
+            x_dots.div_euclid(2)
+        };
+        // Native fish bob by one dot inside a cell, never by a whole text row.
+        let bob = sine_bob(t, 3_000 + entity_jitter(m as u128 + 41) % 2_600, 1);
+        let y_i32 =
+            i32::from(anchor_y) + i32::from(*dy) + if ascii_safe { i32::from(bob) } else { 0 };
+        let body = if ascii_safe {
+            ascii_body
+        } else {
+            native_poses::fish(
+                swims_right,
+                ((t / 300 + m as u128) % 4) as usize,
+                x_dots.rem_euclid(2) as usize,
+                usize::from(bob),
+            )
+        };
         // Fish dart sideways away from the scatter anchor (nearby only).
         if let Some(flee_ms) = cursor.flee_elapsed_ms {
             let flee = i32::from(fish_flee_offset(flee_ms));
@@ -409,14 +449,11 @@ fn build_frame_marks(
     }
 
     // --- Jellyfish: a pulsing dome with lagging tentacles ---
-    // Two dome rows (arc + bell rim) over a row of swaying
-    // tentacles. The dome opens and closes on a slow floor-bounded sin²;
-    // the tentacles repeat the pulse ~350 ms later and sway out of phase
-    // with each other — the lag is what sells "jellyfish". Rich/Normal get
-    // the full 5-cell dome; Sparse (narrow) swaps in a compact 3-cell one — a
-    // real fallback silhouette, not just fewer jellies. Both hang two
-    // tentacles. They drift slowly upward through a side lane of the deep
-    // water and vanish before the rise would reach the composition.
+    // Native braille shapes have a contracting bell and a wave travelling
+    // down two trailing arms; fractional placement still fits the 5×3-cell
+    // habitat. ASCII keeps two dome rows above two swaying strokes, with a
+    // 3-cell compact silhouette. Both representations share the rare visit,
+    // shallow glow and whole-silhouette clearance below.
     //
     // It only visits water deep enough to hold it: three rows of silhouette,
     // a row of clear water, and the school's own band, measured up from the
@@ -444,18 +481,22 @@ fn build_frame_marks(
             // the bell, which is what the dogfood frame actually showed.
             (JELLY_DOME_TOP_FRAMES, JELLY_DOME_SKIRT_FRAMES, &[1, 3])
         };
-        let dome_w = dome_top[0].len() as u16; // ASCII frames: len == width
+        let dome_w = if ascii_safe {
+            dome_top[0].width() as u16
+        } else {
+            5
+        };
+        let wobble_dots = sine_bob(t, 5_200 + phase, 2);
         let x = lane_x
-            .saturating_add(wobble)
+            .saturating_add(if ascii_safe { wobble } else { wobble_dots / 2 })
             .min(area.width.saturating_sub(dome_w + 1));
         if deep_water_rows(area, lines, x, dome_w) < JELLY_MIN_DEEP_ROWS {
             continue;
         }
         // A visit is a short, slow rise near the floor followed by a long
         // absence: the jelly climbs [`JELLY_VISIT_ROWS`] rows and then spends
-        // the rest of the cycle out of sight. Rows are discrete cells, so the
-        // per-row dwell stays long — a jellyfish should read as drifting, not
-        // as stepping.
+        // the rest of the cycle out of sight. Native movement samples quarter
+        // rows; the ASCII fallback retains its slow whole-row steps.
         let rise_period = JELLY_RISE_ROW_MS.saturating_add((j as u128) * JELLY_RISE_ROW_STAGGER_MS);
         let cycle_duration = rise_period.saturating_mul(JELLY_VISIT_CYCLE_SLOTS);
         let cycle_pos = t.saturating_add(phase) % cycle_duration;
@@ -465,10 +506,15 @@ fn build_frame_marks(
         }
         let visit_progress = cycle_pos as f64 / visit_duration as f64;
         let risen = (visit_progress * f64::from(JELLY_VISIT_ROWS)).round() as u16;
-        let y = area
-            .height
-            .saturating_sub(JELLY_FLOOR_GAP)
-            .saturating_sub(risen);
+        let y_dots = i32::from(area.height.saturating_sub(JELLY_FLOOR_GAP)) * 4
+            - (visit_progress * f64::from(JELLY_VISIT_ROWS) * 4.0).floor() as i32;
+        let y = if ascii_safe {
+            area.height
+                .saturating_sub(JELLY_FLOOR_GAP)
+                .saturating_sub(risen)
+        } else {
+            y_dots.div_euclid(4).max(0) as u16
+        };
         if y == 0 || !water(x, y, dome_w) {
             continue;
         }
@@ -494,6 +540,32 @@ fn build_frame_marks(
                 .into_iter()
                 .all(|row| water(x, row, dome_w))
         {
+            continue;
+        }
+        if !ascii_safe {
+            let pose = ((t.saturating_add(phase) % JELLY_PULSE_MS) * 16 / JELLY_PULSE_MS) as usize;
+            for (row, glyph) in native_poses::jelly(
+                pose,
+                usize::from(wobble_dots % 2),
+                y_dots.rem_euclid(4) as usize,
+            )
+            .iter()
+            .enumerate()
+            {
+                marks.push(AmbientMark {
+                    x,
+                    y: y + row as u16,
+                    glyph,
+                    jellyfish: Some(j),
+                    depth: Depth::Background,
+                    style_mod: None,
+                    brightness: Some(if row == 0 {
+                        dome_brightness
+                    } else {
+                        tentacle_brightness
+                    }),
+                });
+            }
             continue;
         }
         for (row, glyph) in [
@@ -538,14 +610,14 @@ fn build_frame_marks(
     // Floating particles rise smoothly through the water column, dissolving
     // gently with continuous time-based floating physics.
     for b in 0..density.bubble_streams() {
-        let phase = (b as u128).saturating_mul(1_900);
-        // Edge columns — avoid center brand.
-        let column = if b % 2 == 0 {
-            area.width / 8
-        } else {
-            area.width.saturating_mul(7) / 8
-        };
-        let rise_period = BUBBLE_RISE_MS.saturating_add(phase % 900);
+        // Irregular phase, period and lane. Two fixed lanes at `width/8`
+        // and `7*width/8` meant extra streams stacked into the same two
+        // columns and rose on an arithmetic beat; spread them over the whole
+        // width and let `water()` below reject any column the composition
+        // owns, which is the one placement rule this module has.
+        let phase = entity_jitter(b as u128) % 9_000;
+        let column = (entity_jitter(b as u128 + 977) % u128::from(area.width.max(1))) as u16;
+        let rise_period = BUBBLE_RISE_MS.saturating_add(entity_jitter(b as u128 + 313) % 2_600);
         let cycle = (t.saturating_add(phase) % rise_period) as f64 / rise_period as f64;
         let boost = if cursor.flee_elapsed_ms.is_some() && column.abs_diff(ptr) < 10 {
             2
@@ -672,8 +744,8 @@ const JELLY_MAX_TEXT_DODGE_COLS: u16 = 3;
 // balance can be retuned without re-deriving it from the motion code.
 
 /// Wall-clock milliseconds a jellyfish spends on each row of its rise
-/// (~9.4 s). A row step is a discrete one-cell jump, so the dwell has to stay
-/// long or the rise reads as stepping rather than drifting.
+/// (~9.4 s). Native placement samples quarter rows within this duration;
+/// ASCII-safe placement keeps the original slow whole-row cadence.
 const JELLY_RISE_ROW_MS: u128 = 9_400;
 /// Per-jelly rise-rate stagger, so two jellyfish (should a tier ever want
 /// them again) can never step in lockstep.
@@ -1052,7 +1124,25 @@ pub fn occupied_text_bounds(line: &Line<'_>) -> Option<(usize, usize)> {
     Some((leading, total.saturating_sub(trailing_run)))
 }
 
+/// Deterministic per-entity jitter.
+///
+/// Every period in this module used to be an arithmetic series — bubble
+/// phases at `b * 1_900`, fish bobs at `3_400 + m * 640` — so the field read
+/// as a mechanism keeping time rather than as animals. This spreads entity
+/// constants irregularly while staying a pure function of the index, which
+/// the delta/interpolation path requires: the module still owns no clock, no
+/// simulation and no RNG state, and two runs at the same `t` paint the same
+/// frame.
 #[must_use]
+fn entity_jitter(seed: u128) -> u128 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for byte in seed.to_le_bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    u128::from(hash)
+}
+
 fn sine_bob(elapsed_ms: u128, period_ms: u128, amplitude: u16) -> u16 {
     if period_ms == 0 || amplitude == 0 {
         return 0;
@@ -1082,6 +1172,29 @@ fn fish_body(facing_right: bool, lead: bool) -> &'static str {
         (false, true) => LEAD_FISH_LEFT,
         (false, false) => "<><",
     }
+}
+
+/// Count fish silhouettes in rendered text by facing: `(rightward, leftward)`.
+///
+/// Recognizes the ASCII bodies and every native braille pose, so a render
+/// test can assert the school without knowing which family painted it. The
+/// native poses carry no eye (ad20493), so only the ASCII lead is
+/// distinguishable from its followers.
+#[cfg(test)]
+pub(crate) fn fish_silhouette_counts(text: &str) -> (usize, usize) {
+    let native = |right: bool| {
+        let poses: std::collections::BTreeSet<&'static str> = (0..4)
+            .flat_map(|pose| (0..2).flat_map(move |dx| (0..2).map(move |dy| (pose, dx, dy))))
+            .map(|(pose, dx, dy)| native_poses::fish(right, pose, dx, dy))
+            .collect();
+        poses
+            .into_iter()
+            .map(|pose| text.matches(pose).count())
+            .sum::<usize>()
+    };
+    let ascii_right = text.matches("><>").count() + text.matches(LEAD_FISH_RIGHT).count();
+    let ascii_left = text.matches("<><").count() + text.matches(LEAD_FISH_LEFT).count();
+    (ascii_right + native(true), ascii_left + native(false))
 }
 
 /// Subtle caustic shimmer applied to empty water cells when the field would

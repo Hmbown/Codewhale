@@ -228,6 +228,7 @@ fn open_secure_regular_file(path: &Path, require_owner_only: bool) -> io::Result
     }
     if require_owner_only {
         use std::os::unix::fs::MetadataExt as _;
+        // SAFETY: geteuid(2) dereferences no pointers.
         if metadata.uid() != unsafe { libc::geteuid() }
             || metadata.mode() & 0o077 != 0
             || metadata.nlink() != 1
@@ -463,6 +464,7 @@ fn verify_windows_owner_only_handle(
         return Err(io::Error::from_raw_os_error(result as i32));
     }
     let _descriptor = WindowsLocalAllocation(descriptor.cast());
+    // SAFETY: `owner` is non-null; `user.sid()` is owned by `user`.
     if owner.is_null() || unsafe { EqualSid(owner, user.sid()) } == 0 {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
@@ -493,6 +495,7 @@ fn verify_windows_owner_only_handle(
     // SAFETY: `count == 1` proves the first returned entry is initialized.
     let entry = unsafe { &*entries };
     let trustee_sid: PSID = entry.Trustee.ptstrName.cast();
+    // SAFETY: form and null checked in this expression; sid owned by `user`.
     let current_user_only = entry.Trustee.TrusteeForm == TRUSTEE_IS_SID
         && !trustee_sid.is_null()
         && unsafe { EqualSid(trustee_sid, user.sid()) } != 0
@@ -532,7 +535,9 @@ impl CurrentWindowsUser {
         let _ =
             unsafe { GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &mut needed) };
         if needed == 0 {
+            // SAFETY: reads thread-local error state only.
             let error = io::Error::from_raw_os_error(unsafe { GetLastError() } as i32);
+            // SAFETY: `token` is owned here and not stored on this path.
             unsafe { windows_sys::Win32::Foundation::CloseHandle(token) };
             return Err(error);
         }
@@ -551,11 +556,14 @@ impl CurrentWindowsUser {
         } == 0
         {
             let error = io::Error::last_os_error();
+            // SAFETY: `token` is owned here and not stored on this path.
             unsafe { windows_sys::Win32::Foundation::CloseHandle(token) };
             return Err(error);
         }
+        // SAFETY: initialized by GetTokenInformation; buffer outlives use.
         let user = unsafe { &*token_info.as_ptr().cast::<TOKEN_USER>() };
         if user.User.Sid.is_null() {
+            // SAFETY: `token` is owned here and not stored on this path.
             unsafe { windows_sys::Win32::Foundation::CloseHandle(token) };
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,

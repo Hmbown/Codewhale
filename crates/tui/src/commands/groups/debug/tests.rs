@@ -50,7 +50,7 @@ fn test_tokens_shows_usage_info() {
     app.session.last_completion_tokens = Some(25);
     app.session.last_prompt_cache_hit_tokens = Some(70);
     app.session.last_prompt_cache_miss_tokens = Some(30);
-    app.api_messages.push(Message {
+    app.api_messages_mut().push(Message {
         role: Role::User,
         content: vec![ContentBlock::Text {
             text: "test".to_string(),
@@ -479,7 +479,7 @@ fn cache_inspect_reports_hashes_without_prompt_text() {
             "Base policy\n\n<project_instructions source=\"AGENTS.md\">\nSECRET_PROJECT_RULE\n</project_instructions>"
                 .to_string(),
         ));
-    app.api_messages.push(Message {
+    app.api_messages_mut().push(Message {
         role: Role::User,
         content: vec![ContentBlock::Text {
             text: "SECRET_USER_TASK".to_string(),
@@ -507,7 +507,7 @@ fn cache_inspect_uses_last_request_tool_catalog() {
     let mut app = create_test_app();
     app.system_prompt = Some(SystemPrompt::Text("Base policy".to_string()));
     app.session.last_tool_catalog = Some(vec![test_tool("read_file")]);
-    app.api_messages.push(Message {
+    app.api_messages_mut().push(Message {
         role: Role::User,
         content: vec![ContentBlock::Text {
             text: "Current task".to_string(),
@@ -531,7 +531,7 @@ fn cache_inspect_json_reports_tool_catalog_hash_and_layer_sizes() {
     let mut app = create_test_app();
     app.system_prompt = Some(SystemPrompt::Text("Base policy".to_string()));
     app.session.last_tool_catalog = Some(vec![test_tool("read_file")]);
-    app.api_messages.push(Message {
+    app.api_messages_mut().push(Message {
         role: Role::User,
         content: vec![ContentBlock::Text {
             text: "Current task".to_string(),
@@ -689,14 +689,14 @@ fn cache_inspect_reports_divergence_from_previous_request() {
     app.system_prompt = Some(SystemPrompt::Text(
         "Base policy\n\n## Environment\n\n- shell: powershell".to_string(),
     ));
-    app.api_messages.push(Message {
+    app.api_messages_mut().push(Message {
         role: Role::Assistant,
         content: vec![codewhale_models::ContentBlock::Text {
             text: "Prior answer".to_string(),
             cache_control: None,
         }],
     });
-    app.api_messages.push(Message {
+    app.api_messages_mut().push(Message {
         role: Role::User,
         content: vec![codewhale_models::ContentBlock::Text {
             text: "First task".to_string(),
@@ -709,7 +709,7 @@ fn cache_inspect_reports_divergence_from_previous_request() {
         .expect("first inspect output");
     assert!(first.contains("Static base prefix stability: no previous request"));
 
-    if let Some(last) = app.api_messages.last_mut()
+    if let Some(last) = app.api_messages_mut().last_mut()
         && let Some(codewhale_models::ContentBlock::Text { text, .. }) = last.content.first_mut()
     {
         *text = "Second task".to_string();
@@ -727,7 +727,7 @@ fn cache_inspect_reports_divergence_from_previous_request() {
 fn cache_inspect_displays_tool_result_budget_metadata() {
     let mut app = create_test_app();
     let long_output = format!("{}{}", "A".repeat(7_000), "Z".repeat(7_000));
-    app.api_messages.push(Message {
+    app.api_messages_mut().push(Message {
         role: Role::Assistant,
         content: vec![ContentBlock::ToolUse {
             id: "tool-1".to_string(),
@@ -737,7 +737,7 @@ fn cache_inspect_displays_tool_result_budget_metadata() {
             thought_signature: None,
         }],
     });
-    app.api_messages.push(Message {
+    app.api_messages_mut().push(Message {
         role: Role::User,
         content: vec![ContentBlock::ToolResult {
             tool_use_id: "tool-1".to_string(),
@@ -746,7 +746,7 @@ fn cache_inspect_displays_tool_result_budget_metadata() {
             content_blocks: None,
         }],
     });
-    app.api_messages.push(Message {
+    app.api_messages_mut().push(Message {
         role: Role::Assistant,
         content: vec![ContentBlock::ToolUse {
             id: "tool-2".to_string(),
@@ -756,7 +756,7 @@ fn cache_inspect_displays_tool_result_budget_metadata() {
             thought_signature: None,
         }],
     });
-    app.api_messages.push(Message {
+    app.api_messages_mut().push(Message {
         role: Role::User,
         content: vec![ContentBlock::ToolResult {
             tool_use_id: "tool-2".to_string(),
@@ -789,7 +789,7 @@ fn cache_inspect_displays_turn_meta_dedup_metadata() {
         "<turn_meta>\nCurrent local date: 2026-05-09\n{}\n</turn_meta>",
         "Working set: src/lib.rs\n".repeat(20)
     );
-    app.api_messages.push(Message {
+    app.api_messages_mut().push(Message {
         role: Role::User,
         content: vec![
             ContentBlock::Text {
@@ -802,7 +802,7 @@ fn cache_inspect_displays_turn_meta_dedup_metadata() {
             },
         ],
     });
-    app.api_messages.push(Message {
+    app.api_messages_mut().push(Message {
         role: Role::User,
         content: vec![
             ContentBlock::Text {
@@ -1081,7 +1081,7 @@ fn turn_cache_history_is_capped_at_50() {
 #[test]
 fn test_context_shows_usage_stats() {
     let mut app = create_test_app();
-    app.api_messages.push(Message {
+    app.api_messages_mut().push(Message {
         role: Role::User,
         content: vec![ContentBlock::Text {
             text: "Hello".to_string(),
@@ -1103,7 +1103,7 @@ fn test_context_shows_usage_stats() {
 #[test]
 fn test_context_report_subcommands_return_source_map() {
     let mut app = create_test_app();
-    app.api_messages.push(Message {
+    app.api_messages_mut().push(Message {
         role: Role::User,
         content: vec![ContentBlock::Text {
             text: "Hello".to_string(),
@@ -1156,11 +1156,11 @@ fn test_undo_conversation_removes_last_exchange() {
         content: "Hi".to_string(),
         streaming: false,
     });
-    app.api_messages.push(Message {
+    app.api_messages_mut().push(Message {
         role: Role::User,
         content: vec![],
     });
-    app.api_messages.push(Message {
+    app.api_messages_mut().push(Message {
         role: Role::Assistant,
         content: vec![],
     });
@@ -1181,7 +1181,7 @@ fn test_undo_conversation_nothing_to_undo() {
     let mut app = create_test_app();
     // Clear any default history
     app.history.clear();
-    app.api_messages.clear();
+    app.api_messages_mut().clear();
     let result = undo_conversation(&mut app);
     assert!(result.message.is_some());
     let msg = result.message.unwrap();
@@ -1286,7 +1286,7 @@ fn test_patch_undo_requests_session_resync_after_restore() {
     app.workspace = workspace.clone();
     app.yolo = true;
     app.current_session_id = Some("test-session".to_string());
-    app.api_messages.push(Message {
+    app.api_messages_mut().push(Message {
         role: Role::User,
         content: vec![ContentBlock::Text {
             text: "please edit a.txt".to_string(),
@@ -1303,7 +1303,8 @@ fn test_patch_undo_requests_session_resync_after_restore() {
             ref messages,
             ref workspace,
             ..
-        }) if messages == &app.api_messages && workspace == &app.workspace
+        }) if messages.as_slice() == app.api_messages.as_slice()
+            && workspace == &app.workspace
     ));
 }
 
@@ -1450,14 +1451,14 @@ fn test_patch_undo_prunes_tool_turn_context() {
     });
     app.tool_cells.insert("call-1".to_string(), 2);
 
-    app.api_messages.push(Message {
+    app.api_messages_mut().push(Message {
         role: Role::User,
         content: vec![ContentBlock::Text {
             text: "please edit a.txt".to_string(),
             cache_control: None,
         }],
     });
-    app.api_messages.push(Message {
+    app.api_messages_mut().push(Message {
         role: Role::Assistant,
         content: vec![
             ContentBlock::Text {
@@ -1473,7 +1474,7 @@ fn test_patch_undo_prunes_tool_turn_context() {
             },
         ],
     });
-    app.api_messages.push(Message {
+    app.api_messages_mut().push(Message {
         role: Role::User,
         content: vec![ContentBlock::ToolResult {
             tool_use_id: "call-1".to_string(),
@@ -1482,7 +1483,7 @@ fn test_patch_undo_prunes_tool_turn_context() {
             content_blocks: None,
         }],
     });
-    app.api_messages.push(Message {
+    app.api_messages_mut().push(Message {
         role: Role::Assistant,
         content: vec![ContentBlock::Text {
             text: "Done, file is fixed now.".to_string(),
@@ -1567,14 +1568,14 @@ fn test_patch_undo_prunes_pre_turn_context() {
         content: "Done, file is fixed now.".to_string(),
         streaming: false,
     });
-    app.api_messages.push(Message {
+    app.api_messages_mut().push(Message {
         role: Role::User,
         content: vec![ContentBlock::Text {
             text: "please edit a.txt".to_string(),
             cache_control: None,
         }],
     });
-    app.api_messages.push(Message {
+    app.api_messages_mut().push(Message {
         role: Role::Assistant,
         content: vec![ContentBlock::Text {
             text: "Done, file is fixed now.".to_string(),
@@ -1633,14 +1634,14 @@ fn test_prune_undone_tool_context_preserves_prior_tool_pairs() {
     app.tool_cells.insert("call-a".to_string(), 2);
     app.tool_cells.insert("call-b".to_string(), 3);
 
-    app.api_messages.push(Message {
+    app.api_messages_mut().push(Message {
         role: Role::User,
         content: vec![ContentBlock::Text {
             text: "edit two files".to_string(),
             cache_control: None,
         }],
     });
-    app.api_messages.push(Message {
+    app.api_messages_mut().push(Message {
         role: Role::Assistant,
         content: vec![
             ContentBlock::Text {
@@ -1663,7 +1664,7 @@ fn test_prune_undone_tool_context_preserves_prior_tool_pairs() {
             },
         ],
     });
-    app.api_messages.push(Message {
+    app.api_messages_mut().push(Message {
         role: Role::User,
         content: vec![ContentBlock::ToolResult {
             tool_use_id: "call-a".to_string(),
@@ -1672,7 +1673,7 @@ fn test_prune_undone_tool_context_preserves_prior_tool_pairs() {
             content_blocks: None,
         }],
     });
-    app.api_messages.push(Message {
+    app.api_messages_mut().push(Message {
         role: Role::User,
         content: vec![ContentBlock::ToolResult {
             tool_use_id: "call-b".to_string(),
@@ -1681,7 +1682,7 @@ fn test_prune_undone_tool_context_preserves_prior_tool_pairs() {
             content_blocks: None,
         }],
     });
-    app.api_messages.push(Message {
+    app.api_messages_mut().push(Message {
         role: Role::Assistant,
         content: vec![ContentBlock::Text {
             text: "Done.".to_string(),
@@ -2146,7 +2147,7 @@ fn test_undo_reports_that_files_were_not_reverted_when_the_repo_is_unavailable()
     app.history.push(HistoryCell::User {
         content: "change something".to_string(),
     });
-    app.api_messages.push(Message {
+    app.api_messages_mut().push(Message {
         role: Role::User,
         content: vec![ContentBlock::Text {
             text: "change something".to_string(),

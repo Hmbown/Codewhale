@@ -91,10 +91,10 @@ describe("sitemap and hreflang preservation", () => {
 
   it("keeps sitemap and hreflang output aligned with real translation coverage", () => {
     // 18 home locales + 10 guide locales + (en, zh) for every other route
-    // (including /product and /changelog, whose bodies ship en/zh only).
-    expect(sitemapEntries).toHaveLength(98);
+    // (including /product, /plugins, and /changelog, whose bodies ship en/zh only).
+    expect(sitemapEntries).toHaveLength(100);
     expect(sitemapEntries.some(entry => entry.url.endsWith("/pricing"))).toBe(false);
-    for (const path of ["/product", "/computer-use", "/signin", "/signup", "/legal/terms", "/legal/privacy"]) {
+    for (const path of ["/product", "/plugins", "/computer-use", "/signin", "/signup", "/legal/terms", "/legal/privacy"]) {
       expect(
         sitemapEntries.some((entry) => entry.url === `${SITE_URL}/en${path}`),
         path,
@@ -191,7 +191,7 @@ describe("navigation parity and accessibility", () => {
     const reference = buildNavLinks("en", getChrome("en")).map((l) =>
       l.href.replace(/^\/en\//, ""),
     );
-    expect(reference).toEqual(["product", "models", "docs"]);
+    expect(reference).toEqual(["product", "models", "plugins", "docs"]);
     const moreReference = buildSecondaryNavLinks("en", getChrome("en")).map((l) =>
       l.href.replace(/^\/en\//, ""),
     );

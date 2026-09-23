@@ -50,6 +50,27 @@ pub(crate) fn refresh_parked_fleet_roster(app: &mut App, config: &Config) {
     app.view_stack.push_boxed(view);
 }
 
+pub(super) fn dismiss_fleet_assignment(app: &mut App, editor_id: uuid::Uuid) {
+    if let Some(mut boxed) = app.view_stack.pop() {
+        let remove = if let Some(view) = boxed
+            .as_any_mut()
+            .downcast_mut::<crate::tui::views::fleet_setup::FleetSetupView>(
+        ) {
+            view.route_selection(editor_id).is_some()
+        } else if let Some(view) = boxed
+            .as_any_mut()
+            .downcast_mut::<crate::tui::views::fleet_detail::FleetDetailView>(
+        ) {
+            view.is_direct_assignment(editor_id)
+        } else {
+            false
+        };
+        if !remove {
+            app.view_stack.push_boxed(boxed);
+        }
+    }
+}
+
 /// Once per event-loop iteration: deliver a pending fleet mutation to the
 /// engine and clear the flag.
 pub(crate) fn flush_stale_fleet_roster(
@@ -289,7 +310,7 @@ pub(crate) async fn handle_setup_constitution_model_draft(
     // timeout. The loop polls constitution_draft_cell and delivers the result.
     const DRAFT_TIMEOUT: Duration = Duration::from_secs(20);
     let model_label = app.model_display_label();
-    let client = match DeepSeekClient::new(config) {
+    let client = match CodewhaleClient::new(config) {
         Ok(client) => client,
         Err(err) => {
             deliver_constitution_draft_result(
@@ -365,7 +386,7 @@ pub(crate) async fn handle_fleet_profile_model_draft(
     // the wizard interactive with a drafting status.
     const DRAFT_TIMEOUT: Duration = Duration::from_secs(20);
     let model_label = app.model_display_label();
-    let client = match DeepSeekClient::new(config) {
+    let client = match CodewhaleClient::new(config) {
         Ok(client) => client,
         Err(err) => {
             deliver_fleet_draft_result(
@@ -449,17 +470,31 @@ pub(crate) async fn handle_bang_shell_input(
         }
     };
 
-    engine_handle
-        .send(Op::RunShellCommand {
-            command: command.to_string(),
-            mode: app.mode,
-            allow_shell: app.allow_shell,
-            trust_mode: app.trust_mode,
-            auto_approve: app_auto_approve_enabled(app),
-            approval_mode: app.approval_mode,
-        })
-        .await?;
-    app.status_message = Some(format!("Shell command submitted: {command}"));
+    // #6150: composer input never awaits a full op channel — a saturated
+    // engine reports busy instead of freezing the loop.
+    match engine_handle.tx_op.clone().try_reserve_owned() {
+        Ok(permit) => {
+            engine_handle.send_reserved_op(
+                permit,
+                Op::RunShellCommand {
+                    command: command.to_string(),
+                    mode: app.mode,
+                    allow_shell: app.allow_shell,
+                    trust_mode: app.trust_mode,
+                    auto_approve: app_auto_approve_enabled(app),
+                    approval_mode: app.approval_mode,
+                },
+            );
+            app.status_message = Some(format!("Shell command submitted: {command}"));
+        }
+        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+            app.status_message =
+                Some("Engine busy — shell command not sent; try again".to_string());
+        }
+        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+            return Err(anyhow::anyhow!("engine channel closed"));
+        }
+    }
     Ok(true)
 }
 
@@ -629,6 +664,26 @@ pub(crate) fn cancel_mcp_login(app: &mut App) {
     }
 }
 
+/// The config file that owns `name`, for a mutation that must land where the
+/// server is actually declared.
+///
+/// A plugin-contributed server has no config file: it is switched off by
+/// disabling the plugin that carries it, so say that instead of writing a
+/// stray entry into the user's file under the synthesized name.
+fn mcp_scoped_config_path(
+    app: &App,
+    global_path: &std::path::Path,
+    name: &str,
+) -> anyhow::Result<std::path::PathBuf> {
+    let scope = crate::mcp::resolve_server_scope(global_path, &app.workspace, name);
+    scope.config_path(global_path).ok_or_else(|| {
+        anyhow::anyhow!(
+            "MCP server '{name}' is provided by a plugin, not by a config file. \
+             Disable the plugin that contributes it from /plugins."
+        )
+    })
+}
+
 pub(crate) async fn handle_mcp_ui_action(
     app: &mut App,
     engine_handle: &EngineHandle,
@@ -658,6 +713,7 @@ pub(crate) async fn handle_mcp_ui_action(
     let snapshot_live_pool = matches!(&action, crate::tui::app::McpUiAction::Show);
     let discover = mcp_ui_action_refreshes_discovery(&action);
 
+    let approve_import = matches!(&action, crate::tui::app::McpUiAction::ImportApprove { .. });
     let action_result = match action {
         crate::tui::app::McpUiAction::Diagnose { name } => {
             let receipt = mcp_server_diagnosis(app, &name);
@@ -705,19 +761,27 @@ pub(crate) async fn handle_mcp_ui_action(
             mcp::add_server_config(&path, name.clone(), None, Some(url), Vec::new(), transport)
                 .map(|()| message = Some(format!("Added MCP HTTP/SSE server '{name}'")))
         }
+        // Write where the server actually lives. `path` is the user's global
+        // file; a workspace-scoped server is declared in the trusted
+        // workspace's own file and overrides a same-named global entry, so
+        // editing the global file here reported success on the wrong server
+        // or failed with "not found" on a row the panel had just offered.
         crate::tui::app::McpUiAction::Enable { name } => {
             changed = true;
-            mcp::set_server_enabled(&path, &name, true)
+            mcp_scoped_config_path(app, &path, &name)
+                .and_then(|owner| mcp::set_server_enabled(&owner, &name, true))
                 .map(|()| message = Some(format!("Enabled MCP server '{name}'")))
         }
         crate::tui::app::McpUiAction::Disable { name } => {
             changed = true;
-            mcp::set_server_enabled(&path, &name, false)
+            mcp_scoped_config_path(app, &path, &name)
+                .and_then(|owner| mcp::set_server_enabled(&owner, &name, false))
                 .map(|()| message = Some(format!("Disabled MCP server '{name}'")))
         }
         crate::tui::app::McpUiAction::Remove { name } => {
             changed = true;
-            mcp::remove_server_config(&path, &name)
+            mcp_scoped_config_path(app, &path, &name)
+                .and_then(|owner| mcp::remove_server_config(&owner, &name))
                 .map(|()| message = Some(format!("Removed MCP server '{name}'")))
         }
         crate::tui::app::McpUiAction::Login { name, scopes } => {
@@ -743,7 +807,7 @@ pub(crate) async fn handle_mcp_ui_action(
                 changed = deleted;
                 message = Some(if deleted {
                     format!(
-                        "Deleted stored OAuth credentials for MCP server '{name}'. Run /mcp reload to reconnect it."
+                        "Deleted locally stored OAuth credentials for MCP server '{name}'. That clears this machine only — the provider may keep its grant; the next /mcp login re-prompts for consent. Run /mcp reload to reconnect."
                     )
                 } else {
                     format!("No stored OAuth credentials found for MCP server '{name}'.")
@@ -751,27 +815,47 @@ pub(crate) async fn handle_mcp_ui_action(
             })
         }
         crate::tui::app::McpUiAction::ImportList => {
-            let text = mcp_external_import_status_text(&app.workspace);
-            message = Some(text);
-            Ok(())
-        }
-        crate::tui::app::McpUiAction::ImportApprove { name } => {
-            match mcp_import_apply(&app.workspace, &path, &name, true) {
-                Ok(msg) => {
-                    changed = msg.contains("Imported");
-                    message = Some(msg);
+            let path = path.clone();
+            let workspace = app.workspace.clone();
+            let plugins = app.plugin_registry.clone();
+            #[cfg(test)]
+            let ticket = crate::test_support::env_scope_ticket();
+            match tokio::task::spawn_blocking(move || {
+                #[cfg(test)]
+                let _membership = crate::test_support::join_env_scope(ticket);
+                mcp_external_import_status_text(&workspace, &path, plugins.as_ref())
+            })
+            .await
+            {
+                Ok(text) => {
+                    message = Some(text);
                     Ok(())
                 }
-                Err(err) => Err(err),
+                Err(_) => Err(anyhow::anyhow!("MCP import preview failed")),
             }
         }
-        crate::tui::app::McpUiAction::ImportDecline { name } => {
-            match mcp_import_apply(&app.workspace, &path, &name, false) {
-                Ok(msg) => {
+        crate::tui::app::McpUiAction::ImportApprove { name }
+        | crate::tui::app::McpUiAction::ImportDecline { name } => {
+            let approve = approve_import;
+            let path = path.clone();
+            let workspace = app.workspace.clone();
+            let plugins = app.plugin_registry.clone();
+            #[cfg(test)]
+            let ticket = crate::test_support::env_scope_ticket();
+            match tokio::task::spawn_blocking(move || {
+                #[cfg(test)]
+                let _membership = crate::test_support::join_env_scope(ticket);
+                mcp_import_apply(&workspace, &path, plugins.as_ref(), &name, approve)
+            })
+            .await
+            {
+                Ok(Ok(msg)) => {
+                    changed = approve;
                     message = Some(msg);
                     Ok(())
                 }
-                Err(err) => Err(err),
+                Ok(Err(err)) => Err(err),
+                Err(_) => Err(anyhow::anyhow!("MCP import failed")),
             }
         }
         crate::tui::app::McpUiAction::Validate | crate::tui::app::McpUiAction::Reload => Ok(()),
@@ -788,6 +872,57 @@ pub(crate) async fn handle_mcp_ui_action(
     }
     if let Some(message) = message {
         add_mcp_message(app, message);
+    }
+
+    // Every branch below is an engine round-trip, and the engine services ops
+    // only between turns (`Engine::run` runs a turn inline and never polls
+    // `rx_op` mid-turn): awaiting one from this UI path parked every keypress
+    // and repaint behind the running turn — a full console freeze (#6159).
+    // While a turn (or its compaction work) owns the engine, serve the last
+    // known snapshot and say so; mutations name the deferral instead of
+    // freezing. `reject_inline_inference_while_runtime_chat_owns_run`
+    // (apply.rs) is the same fail-closed rule for inline inference.
+    let engine_busy = app.is_loading
+        || app.dispatch_in_flight
+        || matches!(app.runtime_turn_status.as_deref(), Some("in_progress"))
+        || app.is_compacting
+        || app.manual_compaction_queued;
+    if engine_busy && (retry_name.is_some() || snapshot_live_pool || is_reload || changed) {
+        if snapshot_live_pool {
+            match app.mcp_snapshot.clone() {
+                Some(snapshot) => {
+                    app.mcp_configured_count = snapshot.servers.len();
+                    app.mcp_snapshot = Some(snapshot);
+                    app.mcp_initializing = false;
+                    app.mcp_connecting.clear();
+                    app.hotbar_actions
+                        .replace_mcp_tools(app.mcp_snapshot.as_ref());
+                    add_mcp_message(
+                        app,
+                        app.tr(MessageId::McpShowCachedWhileTurnRuns).into_owned(),
+                    );
+                    open_mcp_extensions(app);
+                }
+                None => add_mcp_message(
+                    app,
+                    app.tr(MessageId::McpShowUnavailableWhileTurnRuns)
+                        .into_owned(),
+                ),
+            }
+        } else if let Some(name) = retry_name.as_deref() {
+            add_mcp_message(
+                app,
+                app.tr(MessageId::McpRetryDeferredWhileTurnRuns)
+                    .replace("{server}", name),
+            );
+        } else {
+            add_mcp_message(
+                app,
+                app.tr(MessageId::McpLivePoolRefreshDeferredWhileTurnRuns)
+                    .into_owned(),
+            );
+        }
+        return;
     }
 
     // A successful MCP mutation is an explicit request to change the tools
@@ -1195,6 +1330,15 @@ pub(crate) async fn handle_view_events(
                     {
                         return Ok(true);
                     }
+                    // A command review confirmed over the Extensions panel
+                    // (the plugin trust digest) closes its pager and lands
+                    // back on the list, which must show the state the
+                    // confirmation just changed.
+                    if app.view_stack.extensions_is_top() {
+                        let snapshot =
+                            crate::tui::views::extensions::ExtensionsSnapshot::from_app(app);
+                        app.view_stack.refresh_extensions(snapshot);
+                    }
                 }
                 crate::tui::views::CommandPaletteAction::InsertText { text } => {
                     app.input = text;
@@ -1288,7 +1432,7 @@ pub(crate) async fn handle_view_events(
 
                 if timed_out {
                     app.add_message(HistoryCell::System {
-                        content: "Approval request timed out - denied".to_string(),
+                        content: app.tr(MessageId::ApprovalTimedOutDenied).into_owned(),
                     });
                 }
             }
@@ -1365,8 +1509,9 @@ pub(crate) async fn handle_view_events(
                     }
                 };
 
-                match manager.load_session(&session_id) {
-                    Ok(session) => {
+                match manager.resume_session(&session_id) {
+                    Ok(recovery) => {
+                        let session = recovery.session;
                         let next_config = config.clone();
                         let respawn = match apply_loaded_session_config_snapshot(
                             app,
@@ -1377,12 +1522,19 @@ pub(crate) async fn handle_view_events(
                         ) {
                             Ok(outcome) => outcome,
                             Err(err) => {
-                                app.status_message =
-                                    Some(format!("Failed to restore session: {err}"));
+                                crate::tui::ui::session_state::surface_session_load_failure(
+                                    app,
+                                    format!("Failed to restore session: {err}"),
+                                );
                                 continue;
                             }
                         };
                         sync_runtime_workspace_state(task_manager, app.workspace.clone()).await;
+                        // #6150 audit: these sends may await a full op channel,
+                        // and that await is load-bearing — the session switch
+                        // is already committed UI-side, so each op must land in
+                        // order (drop = engine/UI desync). A wedge is possible
+                        // only while a saturated engine finishes its turn.
                         if respawn {
                             let _ = engine_handle.send(Op::Shutdown).await;
                             *engine_handle =
@@ -1399,7 +1551,7 @@ pub(crate) async fn handle_view_events(
                         let _ = engine_handle
                             .send(Op::SyncSession {
                                 session_id: app.current_session_id.clone(),
-                                messages: app.api_messages.clone(),
+                                messages: app.api_messages.as_ref().clone(),
                                 system_prompt: app.system_prompt.clone(),
                                 system_prompt_override: false,
                                 model: app.model.clone(),
@@ -1424,14 +1576,17 @@ pub(crate) async fn handle_view_events(
                             content: loaded_message.clone(),
                         });
                         app.status_message = Some(loaded_message);
-                        app.launch.visible = false;
+                        app.launch.dismiss();
                         app.launch.status = None;
                     }
                     Err(err) => {
-                        app.status_message = Some(format!(
-                            "Failed to load session {}: {err}",
-                            crate::session_manager::truncate_id(&session_id)
-                        ));
+                        crate::tui::ui::session_state::surface_session_load_failure(
+                            app,
+                            format!(
+                                "Failed to load session {}: {err}",
+                                crate::session_manager::truncate_id(&session_id)
+                            ),
+                        );
                     }
                 }
             }
@@ -1607,6 +1762,84 @@ pub(crate) async fn handle_view_events(
                 )
                 .await;
             }
+            ViewEvent::FleetRosterOpenCoordinatorRequested => {
+                app.view_stack.push(
+                    crate::tui::model_picker::ModelPickerView::new(app, config)
+                        .with_assignment_context("Coordinator", "Current session"),
+                );
+            }
+            ViewEvent::FleetProfileRoutePickRequested { editor_id } => {
+                if app.view_stack.top_kind() == Some(ModalKind::FleetSetup)
+                    && let Some(mut boxed) = app.view_stack.pop()
+                {
+                    let selection = boxed
+                        .as_any_mut()
+                        .downcast_mut::<crate::tui::views::fleet_setup::FleetSetupView>()
+                        .and_then(|view| {
+                            view.route_selection(editor_id)
+                                .map(|selection| (selection, view.assignment_context()))
+                        });
+                    app.view_stack.push_boxed(boxed);
+                    if let Some((selection, (role, scope))) = selection {
+                        app.view_stack.push(
+                            crate::tui::model_picker::ModelPickerView::new_for_fleet_profile(
+                                app, config, editor_id, selection,
+                            )
+                            .with_assignment_context(role, scope),
+                        );
+                    }
+                }
+            }
+            ViewEvent::FleetProfileRoutePicked {
+                editor_id,
+                provider,
+                provider_id,
+                model,
+                reasoning,
+            } => {
+                if app.view_stack.top_kind() == Some(ModalKind::FleetSetup)
+                    && let Some(mut boxed) = app.view_stack.pop()
+                {
+                    if let Some(view) = boxed
+                        .as_any_mut()
+                        .downcast_mut::<crate::tui::views::fleet_setup::FleetSetupView>(
+                    ) {
+                        view.accept_route(
+                            editor_id,
+                            provider_id.unwrap_or_else(|| provider.as_str().into()),
+                            model,
+                            reasoning,
+                        );
+                    }
+                    app.view_stack.push_boxed(boxed);
+                }
+            }
+            ViewEvent::FleetProfileRouteCommitRequested { editor_id } => {
+                if app.view_stack.top_kind() == Some(ModalKind::FleetSetup)
+                    && let Some(mut boxed) = app.view_stack.pop()
+                {
+                    let result = boxed
+                        .as_any_mut()
+                        .downcast_mut::<crate::tui::views::fleet_setup::FleetSetupView>()
+                        .map(|view| view.commit_route_assignment(editor_id, app, config));
+                    match result {
+                        Some(Ok(message)) => {
+                            sync_fleet_roster(app, config, engine_handle);
+                            refresh_parked_fleet_roster(app, config);
+                            app.push_status_toast(message, StatusToastLevel::Success, Some(8_000));
+                        }
+                        Some(Err(reason)) => {
+                            app.view_stack.push_boxed(boxed);
+                            app.set_sticky_status(reason, StatusToastLevel::Error, None);
+                        }
+                        None => app.view_stack.push_boxed(boxed),
+                    }
+                }
+            }
+            ViewEvent::FleetAssignmentPickerDismissed { editor_id } => {
+                dismiss_fleet_assignment(app, editor_id);
+                refresh_parked_fleet_roster(app, config);
+            }
             ViewEvent::FleetRosterOpenSetupRequested { member_id } => {
                 // The shared router opens the selected v2 Fleet's exact editor
                 // (focused on this member) or the legacy wizard when no named
@@ -1641,17 +1874,21 @@ pub(crate) async fn handle_view_events(
                     let selection = editor
                         .as_any_mut()
                         .downcast_mut::<crate::tui::views::fleet_detail::FleetDetailView>()
-                        .and_then(|view| view.route_selection(editor_id, target));
+                        .and_then(|view| {
+                            view.route_selection(editor_id, target)
+                                .map(|selection| (selection, view.assignment_context()))
+                        });
                     app.view_stack.push_boxed(editor);
                     selection
                 } else {
                     None
                 };
-                if let Some(selection) = selection {
+                if let Some((selection, (role, scope))) = selection {
                     app.view_stack.push(
                         crate::tui::model_picker::ModelPickerView::new_for_fleet_route(
                             app, config, target, editor_id, selection,
-                        ),
+                        )
+                        .with_assignment_context(role, scope),
                     );
                 }
             }
@@ -1690,6 +1927,13 @@ pub(crate) async fn handle_view_events(
                     app.view_stack.push_boxed(boxed);
                     match outcome {
                         Some(Ok(message)) => {
+                            if let Some(mut editor) = app.view_stack.pop() {
+                                let direct = editor.as_any_mut().downcast_mut::<crate::tui::views::fleet_detail::FleetDetailView>()
+                                    .is_some_and(|view| view.is_direct_assignment(editor_id));
+                                if !direct {
+                                    app.view_stack.push_boxed(editor);
+                                }
+                            }
                             app.push_status_toast(message, StatusToastLevel::Success, Some(8_000));
                             sync_fleet_roster(app, config, engine_handle);
                             refresh_parked_fleet_roster(app, config);
@@ -2035,11 +2279,12 @@ pub(crate) async fn handle_view_events(
             }
             ViewEvent::SidebarAgentCancel { agent_id } => {
                 app.status_message = Some(format!("Cancelling {agent_id}..."));
+                // #6150: the input path never awaits a full op channel. The
+                // cancel is retryable; a rejected send surfaces immediately.
                 if engine_handle
-                    .send(Op::CancelSubAgent {
+                    .try_send(Op::CancelSubAgent {
                         agent_id: agent_id.clone(),
                     })
-                    .await
                     .is_err()
                 {
                     app.status_message = Some(format!("Could not cancel {agent_id}"));
@@ -2100,6 +2345,7 @@ pub(crate) async fn handle_view_events(
                     save_as_startup_default,
                 )
                 .await;
+                refresh_parked_fleet_roster(app, config);
             }
             ViewEvent::ModelPickerDismissed {
                 catalog_view,
@@ -2112,6 +2358,7 @@ pub(crate) async fn handle_view_events(
                     view: Some(view),
                     selected_row_id,
                 });
+                refresh_parked_fleet_roster(app, config);
             }
             ViewEvent::ModelPickerRefresh => {
                 // Re-resolve readiness from the live credential state and
@@ -2507,29 +2754,53 @@ pub(crate) async fn handle_view_events(
                     update_backtrack_overlay_selection(app, idx);
                 }
             }
-            // The launch card's resume confirmation was accepted. Hand it to
-            // the same pending-action path the card's own Enter uses, so the
-            // resume runs through one code path rather than two.
+            // Apply the accepted choice now, for keyboard and mouse alike.
+            // Parking it in pending_launch_action left keyboard confirmation
+            // waiting for an unrelated mouse event to drain that queue.
             ViewEvent::LaunchResumeConfirmed { session_id } => {
-                app.pending_launch_action = Some(
-                    crate::tui::underwater::LaunchAction::ResumeSession(session_id),
-                );
+                let result = resume_launch_session(app, &session_id);
+                if apply_command_result(terminal, app, engine_handle, task_manager, config, result)
+                    .await?
+                {
+                    return Ok(true);
+                }
                 app.needs_redraw = true;
             }
             ViewEvent::BacktrackConfirm => {
                 if let Some(depth) = app.backtrack.confirm() {
-                    apply_backtrack(app, depth);
-                    let _ = engine_handle
-                        .send(Op::SyncSession {
-                            session_id: app.current_session_id.clone(),
-                            messages: app.api_messages.clone(),
-                            system_prompt: app.system_prompt.clone(),
-                            system_prompt_override: false,
-                            model: app.model.clone(),
-                            workspace: app.workspace.clone(),
-                            mode: app.mode,
-                        })
-                        .await;
+                    // Reserve the slot before mutating history (#6150): the
+                    // loop must not await a full op channel, and applying the
+                    // backtrack without delivering SyncSession would desync
+                    // the engine's messages from ours.
+                    match engine_handle.tx_op.clone().try_reserve_owned() {
+                        Ok(permit) => {
+                            apply_backtrack(app, depth);
+                            engine_handle.send_reserved_op(
+                                permit,
+                                Op::SyncSession {
+                                    session_id: app.current_session_id.clone(),
+                                    messages: app.api_messages.as_ref().clone(),
+                                    system_prompt: app.system_prompt.clone(),
+                                    system_prompt_override: false,
+                                    model: app.model.clone(),
+                                    workspace: app.workspace.clone(),
+                                    mode: app.mode,
+                                },
+                            );
+                        }
+                        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                            app.status_message = Some(
+                                "Engine busy — backtrack not applied; try again in a moment"
+                                    .to_string(),
+                            );
+                            app.needs_redraw = true;
+                        }
+                        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                            app.status_message =
+                                Some("Engine stopped — backtrack not applied".to_string());
+                            app.needs_redraw = true;
+                        }
+                    }
                 }
             }
             ViewEvent::BacktrackCancel => {
@@ -2553,7 +2824,9 @@ pub(crate) async fn handle_view_events(
                     return Ok(true);
                 }
             }
-            ViewEvent::ContextMenuSelected { action } => handle_context_menu_action(app, action),
+            ViewEvent::ContextMenuSelected { action } => {
+                handle_context_menu_action(terminal, app, action)
+            }
             ViewEvent::SkillMutationRequested { request } => {
                 handle_skill_mutation_requested(app, request).await;
             }

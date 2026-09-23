@@ -1,11 +1,11 @@
-<!-- source: README.md sha256:a446e3921085 -->
+<!-- source: README.md sha256:29c349b6f2b4 -->
 # Codewhale
 
 Codewhale adalah agen sumber terbuka yang membaca proyek, mengedit berkas, menjalankan perintah, dan memeriksa hasil kerjanya dengan model yang dihosting atau model lokal pilihan Anda. Mulailah dengan satu tugas di terminal. Untuk pekerjaan yang lebih besar, bagikan sebagian pekerjaan kepada agen dengan model dan peran yang berbeda.
 
-![Codewhale berjalan di terminal](web/public/codewhale-tui-171acee.png)
+![Codewhale berjalan di terminal](web/public/codewhale-tui-d7a9a1c.png)
 
-*Pratinjau terminal dari build pengembangan v0.9.12.*
+*Pratinjau terminal dari build pengembangan v0.10.0.*
 
 [English](README.md) · [简体中文](README.zh-CN.md) · [日本語](README.ja-JP.md) · [Tiếng Việt](README.vi.md) · [한국어](README.ko-KR.md) · [Español](README.es-419.md) · [Português](README.pt-BR.md) · [Русский](README.ru.md) · [Українська](README.uk.md) · [Français](README.fr.md) · [Deutsch](README.de.md) · [繁體中文](README.zh-TW.md) · [हिन्दी](README.hi.md) · [Türkçe](README.tr.md) · [Italiano](README.it.md) · [Polski](README.pl.md) · [العربية](README.ar.md) · [Català](README.ca.md)
 
@@ -53,7 +53,7 @@ Terminal dan klien grafis terhubung ke Codewhale Runtime, yang menjalankan agen 
 
 - **Terminal:** `codewhale` membuka antarmuka interaktif; `codewhale exec` menjalankan tugas dari skrip atau job CI.
 - **Browser lokal:** `codewhale web` membuka [klien web lokal](docs/WEB.md) bawaan untuk Runtime yang sama.
-- **Aplikasi web dan desktop Codewhale:** lingkungan kerja grafis yang sedang dikembangkan. Ketersediaannya tercantum di [halaman produk](https://codewhale.net/en/product).
+- **Aplikasi desktop Codewhale (GPUI):** aplikasi desktop native GPUI adalah arah klien produk (diputuskan 2026-09-14; peta tahap ada di docs/TRANSITION.md pada repo privat codehwhale-gpui). Aplikasi web yang dihosting di app.codewhale.net dihentikan bertahap; situs pemasaran, masuk, penagihan, halaman legal, dan unduhan tetap di web secara permanen. Ketersediaannya tercantum di [halaman produk](https://codewhale.net/en/product).
 
 **Computer Use menambahkan alat untuk mengamati dan berinteraksi dengan aplikasi lain.** Plugin ini disertakan dalam kode sumber saat ini. Tinjau akses yang diminta dan aktifkan plugin sebelum digunakan; izin OS dan persyaratan platform tetap berlaku. Lihat [panduan Computer Use](crates/tui/plugins/computer-use/README.md) yang disertakan dan [pengaturan plugin](docs/PLUGINS.md).
 

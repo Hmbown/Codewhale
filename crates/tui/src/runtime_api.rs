@@ -12,12 +12,12 @@ use anyhow::{Context, Result, anyhow, bail};
 use async_stream::stream;
 use axum::extract::{ConnectInfo, DefaultBodyLimit, Path, Query, Request, State};
 use axum::http::header;
-use axum::http::{HeaderName, HeaderValue, Method, StatusCode};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use axum::middleware;
 use axum::response::Html;
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post, put};
+use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -56,7 +56,10 @@ use crate::automation_manager::{
 use crate::config::DEFAULT_TEXT_MODEL;
 use crate::config::{ApiProvider, Config, normalize_model_name_for_provider, validate_route};
 use crate::fleet::executor::{FleetExecutor, configured_codewhale_binary};
-use crate::fleet::ledger::{FleetEventReplayError, FleetLedgerState, FleetTaskLedgerStatus};
+use crate::fleet::ledger::{
+    FleetEventReplayError, FleetLedgerState, FleetTaskLedgerStatus, fleet_ledger_path,
+    subscribe_fleet_ledger_appends,
+};
 use crate::fleet::manager::{
     FleetManager, FleetStatusSnapshot, FleetWorkerInspection, FleetWorkerRuntimeProjection,
     ManagedFleetRunDescriptor,
@@ -72,8 +75,10 @@ use crate::runtime_threads::{
     ThreadDetail, ThreadListFilter, ThreadRecord, TurnItemKind, TurnRecord, UpdateThreadRequest,
     UsageGroupBy, UsageTotals,
 };
+// `TurnItemKind` is read only by the summary tests now that the route builds
+// its rows from `ThreadListFacts` instead of walking item records here.
 #[cfg(test)]
-pub(super) use crate::runtime_threads::{RuntimeTurnStatus, TurnItemLifecycleStatus};
+pub(super) use crate::runtime_threads::{RuntimeTurnStatus, TurnItemKind, TurnItemLifecycleStatus};
 use crate::session_manager::default_sessions_dir;
 #[cfg(test)]
 pub(super) use crate::session_manager::{SavedSession, SessionMetadata};
@@ -94,9 +99,21 @@ use codewhale_protocol::fleet::{
 };
 
 mod auth;
+mod context;
+mod diagnostics;
+mod git;
+mod jobs;
+mod lsp;
+mod mcp_import;
+mod memory_lens;
 mod mobile;
+mod plans;
 mod plugins;
+mod secrets;
 mod sessions;
+mod targets;
+mod terminal;
+mod voice;
 mod web;
 mod workspace;
 #[cfg(test)]
@@ -106,14 +123,19 @@ use self::auth::{
     runtime_request_is_authorized,
 };
 use self::sessions::{
-    create_session_from_thread, delete_session, get_session, list_sessions, list_sessions_summary,
-    patch_session, resume_session_thread, save_current_session,
+    create_session_from_thread, delete_session, get_session, list_session_artifacts, list_sessions,
+    list_sessions_summary, patch_session, read_session_artifact, resume_session_thread,
+    save_current_session,
 };
 #[cfg(test)]
 use self::sessions::{messages_from_thread_detail, session_to_detail};
 #[cfg(test)]
 use self::workspace::collect_workspace_status;
-use self::workspace::{collect_workspace_git_metadata, workspace_file_search, workspace_status};
+use self::workspace::{
+    WorkspaceGitMetadata, collect_workspace_git_metadata, workspace_file_read,
+    workspace_file_search, workspace_file_write, workspace_files_list, workspace_instructions,
+    workspace_status,
+};
 
 const RUNTIME_TOKEN_ENV: &str = "CODEWHALE_RUNTIME_TOKEN";
 const LEGACY_RUNTIME_TOKEN_ENV: &str = "DEEPSEEK_RUNTIME_TOKEN";
@@ -190,6 +212,11 @@ pub struct RuntimeApiState {
     /// lazily-initialized slot; slow per-pool work (connect_all) runs under
     /// the inner handle so it cannot block slot reads.
     mcp_pool: Arc<Mutex<Option<Arc<Mutex<McpPool>>>>>,
+    /// Workspace-level LSP client for the HTTP surface (APPS-93): diagnostics
+    /// and semantic queries on files a client views. Engines keep their own
+    /// per-thread managers; this one serves the file view and is built lazily
+    /// so a server without LSP use never spawns a language server.
+    lsp_manager: Arc<std::sync::OnceLock<Arc<crate::lsp::LspManager>>>,
     #[cfg(test)]
     compat_stream_test_hook: Option<tokio::sync::mpsc::UnboundedSender<CompatStreamTestPoint>>,
 }
@@ -544,6 +571,7 @@ fn default_runtime_capabilities() -> RuntimeCapabilities {
     RuntimeCapabilities {
         account_session: true,
         threads: true,
+        thread_shell_consent: true,
         turns: true,
         turn_operation_idempotency: true,
         turn_operation_lookup: true,
@@ -566,6 +594,17 @@ fn default_runtime_capabilities() -> RuntimeCapabilities {
         skill_lifecycle: true,
         plugin_management: true,
         agent_mail: true,
+        // SSE journal frames carry their durable `seq` as the event id, and the
+        // thread event stream resumes from `Last-Event-ID`.
+        event_stream_resume: true,
+        // The terminal family follows the routes' own gate: the owner is
+        // `#[cfg(unix)]` end to end, and the Windows and OpenHarmony builds
+        // answer 501. A client must be able to feature-detect that before it
+        // offers a pane, so the flag must never outrun the handler.
+        terminal_stream: cfg!(all(unix, not(target_env = "ohos"))),
+        terminal_input: cfg!(all(unix, not(target_env = "ohos"))),
+        terminal_resize: cfg!(all(unix, not(target_env = "ohos"))),
+        terminal_kill: cfg!(all(unix, not(target_env = "ohos"))),
     }
 }
 
@@ -577,13 +616,15 @@ fn runtime_api_sub_agent_manager(workspace: &FsPath, workers: usize) -> SharedSu
         max_agents,
         Duration::from_secs(crate::config::DEFAULT_SUBAGENT_HEARTBEAT_TIMEOUT_SECS),
         max_agents,
-        None,
     )
 }
 
 #[derive(Debug, Serialize)]
 struct McpServerEntry {
     name: String,
+    origin: &'static str,
+    writable: bool,
+    auth_required: bool,
     enabled: bool,
     required: bool,
     command: Option<String>,
@@ -595,6 +636,7 @@ struct McpServerEntry {
 
 #[derive(Debug, Serialize)]
 struct McpServersResponse {
+    revision: String,
     servers: Vec<McpServerEntry>,
 }
 
@@ -617,6 +659,16 @@ struct McpToolEntry {
 #[derive(Debug, Serialize)]
 struct McpToolsResponse {
     tools: Vec<McpToolEntry>,
+    connections: Vec<McpConnectionOutcome>,
+}
+
+#[derive(Debug, Serialize)]
+struct McpConnectionOutcome {
+    server: String,
+    connected: bool,
+    auth_required: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
 }
 
 /// Request body for `POST /v1/apps/mcp/servers` (create) and
@@ -691,7 +743,12 @@ where
 /// the API never echoes credentials back to callers.
 #[derive(Debug, Serialize)]
 struct McpServerDetail {
+    revision: String,
     name: String,
+    credential_configured: bool,
+    origin: &'static str,
+    writable: bool,
+    auth_required: bool,
     enabled: bool,
     required: bool,
     command: Option<String>,
@@ -718,13 +775,23 @@ struct McpServerDetail {
 }
 
 impl McpServerDetail {
-    fn from_config(name: &str, cfg: &crate::mcp::McpServerConfig, connected: bool) -> Self {
+    fn from_config(
+        name: &str,
+        cfg: &crate::mcp::McpServerConfig,
+        connected: bool,
+        revision: String,
+    ) -> Self {
         let mut env_keys: Vec<String> = cfg.env.keys().cloned().collect();
         env_keys.sort();
         let mut env_header_keys: Vec<String> = cfg.env_headers.keys().cloned().collect();
         env_header_keys.sort();
         Self {
+            revision,
             name: name.to_string(),
+            credential_configured: mcp_credential_configured(cfg),
+            origin: "global",
+            writable: true,
+            auth_required: false,
             enabled: cfg.is_enabled(),
             required: cfg.required,
             command: cfg.command.clone(),
@@ -748,9 +815,13 @@ impl McpServerDetail {
 
 #[derive(Debug, Serialize)]
 struct McpServerActionReceipt {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    revision: Option<String>,
     name: String,
     action: &'static str,
     ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    connection: Option<McpConnectionOutcome>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -817,6 +888,16 @@ struct FleetEventsQuery {
 struct StartTurnResponse {
     thread: ThreadRecord,
     turn: TurnRecord,
+    /// Present only when the durable `operation_key` made this submission a
+    /// replay of one already accepted: the turn is the original and nothing
+    /// new was admitted. Omitted otherwise so every existing response stays
+    /// byte-identical — a client that never sends a key sees no change.
+    #[serde(skip_serializing_if = "replay_flag_is_absent")]
+    idempotent_replay: bool,
+}
+
+fn replay_flag_is_absent(replayed: &bool) -> bool {
+    !*replayed
 }
 
 fn install_runtime_server_workshop_budgets(
@@ -943,6 +1024,7 @@ pub async fn run_http_server(
         web,
         fleet_codewhale_binary: configured_codewhale_binary(),
         mcp_pool: Arc::new(Mutex::new(None)),
+        lsp_manager: Arc::new(std::sync::OnceLock::new()),
         #[cfg(test)]
         compat_stream_test_hook: None,
     };
@@ -1074,6 +1156,7 @@ fn fallback_sessions_dir() -> PathBuf {
 }
 
 pub fn build_router(state: RuntimeApiState) -> Router {
+    diagnostics::mark_server_started();
     let api_routes = Router::new()
         .route(
             "/v1/sessions",
@@ -1090,8 +1173,32 @@ pub fn build_router(state: RuntimeApiState) -> Router {
             "/v1/sessions/{id}/resume-thread",
             post(resume_session_thread),
         )
+        .route("/v1/sessions/{id}/artifacts", get(list_session_artifacts))
+        .route(
+            "/v1/sessions/{id}/artifacts/{artifact_id}",
+            get(read_session_artifact),
+        )
         .route("/v1/workspace/status", get(workspace_status))
+        // The Engine's terminal byte stream (#34). Auth is the route layer's,
+        // not this module's; these never create a session — see terminal.rs.
+        .route("/v1/terminal/{name}/output", get(terminal::terminal_output))
+        .route("/v1/terminal/{name}/input", post(terminal::terminal_input))
+        .route(
+            "/v1/terminal/{name}/resize",
+            post(terminal::terminal_resize),
+        )
+        .route("/v1/terminal/{name}/kill", post(terminal::terminal_kill))
         .route("/v1/workspace/files/search", get(workspace_file_search))
+        .route(
+            "/v1/workspace/files",
+            get(workspace_files_list)
+                .put(workspace_file_write)
+                .layer(DefaultBodyLimit::max(
+                    self::workspace::FILE_WRITE_BODY_LIMIT_BYTES,
+                )),
+        )
+        .route("/v1/workspace/files/read", get(workspace_file_read))
+        .route("/v1/workspace/instructions", get(workspace_instructions))
         .route("/v1/agent-runs", get(list_agent_runs))
         .route("/v1/agent-runs/{run_id}", get(get_agent_run))
         .route("/v1/fleet/profiles", get(list_fleet_profiles))
@@ -1142,9 +1249,86 @@ pub fn build_router(state: RuntimeApiState) -> Router {
                 codewhale_protocol::runtime::MAX_RUNTIME_IMAGE_BODY_BYTES,
             )),
         )
+        .route("/v1/git", get(git::git_status_detail))
+        .route("/v1/changes", get(git::git_changes))
+        .route("/v1/diff", get(git::git_diff))
+        .route("/v1/workspace/diff", get(git::workspace_diff))
+        .route("/v1/git/graph", get(git::git_graph))
+        .route("/v1/git/stage", post(git::git_stage))
+        .route("/v1/git/unstage", post(git::git_unstage))
+        .route("/v1/git/discard", post(git::git_discard))
+        .route("/v1/git/commit", post(git::git_commit))
+        .route("/v1/git/push", post(git::git_push))
+        .route("/v1/git/branch", post(git::git_branch))
+        .route("/v1/logs", get(diagnostics::list_logs))
+        .route("/v1/logs/{name}", get(diagnostics::read_log))
+        .route("/v1/crashes", get(diagnostics::list_crashes))
+        .route("/v1/crashes/{name}", get(diagnostics::read_crash))
+        .route("/v1/process", get(diagnostics::process_info))
+        .route("/v1/jobs", get(jobs::list_jobs))
         .route("/v1/threads", get(list_threads).post(create_thread))
         .route("/v1/threads/summary", get(list_threads_summary))
+        .route("/v1/threads/running", get(list_running_threads))
+        .route("/v1/threads/{id}/notices", get(list_thread_notices))
+        .route(
+            "/v1/threads/{id}/notices/{notice_id}",
+            delete(ack_thread_notice),
+        )
         .route("/v1/threads/{id}", get(get_thread).patch(update_thread))
+        .route(
+            "/v1/threads/{id}/jobs",
+            get(jobs::list_thread_jobs).post(jobs::create_thread_job),
+        )
+        .route("/v1/threads/{id}/jobs/{job_id}", get(jobs::get_thread_job))
+        .route(
+            "/v1/threads/{id}/jobs/{job_id}/output",
+            get(jobs::get_thread_job_output),
+        )
+        .route(
+            "/v1/threads/{id}/jobs/{job_id}/stdin",
+            post(jobs::write_thread_job_stdin),
+        )
+        .route(
+            "/v1/threads/{id}/jobs/{job_id}/kill",
+            post(jobs::kill_thread_job),
+        )
+        .route(
+            "/v1/threads/{id}/jobs/{job_id}/resize",
+            post(jobs::resize_thread_job),
+        )
+        .route("/v1/threads/{id}/context", get(context::get_thread_context))
+        .route("/v1/threads/{id}/plan", get(plans::get_thread_plan))
+        .route("/v1/threads/{id}/todo", get(plans::get_thread_todo))
+        .route("/v1/plan", get(plans::latest_plan))
+        .route("/v1/todo", get(plans::latest_todo_route))
+        .route("/v1/plans", get(plans::list_plans))
+        .route("/v1/todos", get(plans::list_todos))
+        .route(
+            "/v1/targets",
+            get(targets::list_targets).post(targets::create_target),
+        )
+        .route("/v1/targets/switch", post(targets::switch_target))
+        .route("/v1/remote", get(targets::remote_status))
+        .route("/v1/remote/connect", post(targets::remote_connect))
+        .route(
+            "/v1/ssh",
+            get(targets::ssh_status).post(targets::ssh_connect),
+        )
+        .route("/v1/ssh/connect", post(targets::ssh_connect))
+        .route(
+            "/v1/cloud",
+            get(targets::cloud_status).post(targets::cloud_attach),
+        )
+        .route("/v1/cloud/attach", post(targets::cloud_attach))
+        .route("/v1/lsp", get(lsp::lsp_status))
+        .route("/v1/diagnostics", get(lsp::lsp_diagnostics))
+        .route("/v1/definition", get(lsp::lsp_definition))
+        .route("/v1/references", get(lsp::lsp_references))
+        .route("/v1/symbols", get(lsp::lsp_symbols))
+        .route("/v1/voice", get(voice::voice_status))
+        .route("/v1/voice/dictate", post(voice::voice_dictate))
+        .route("/v1/voice/send", post(voice::voice_send))
+        .route("/v1/voice/control", post(voice::voice_control))
         .route("/v1/threads/{id}/resume", post(resume_thread))
         .route("/v1/threads/{id}/fork", post(fork_thread))
         .route("/v1/threads/{id}/undo", post(undo_thread_turn))
@@ -1188,6 +1372,10 @@ pub fn build_router(state: RuntimeApiState) -> Router {
             post(mark_agent_mail_read),
         )
         .route(
+            "/v1/threads/{id}/agent-mail/{message_id}/cancel",
+            post(cancel_agent_mail),
+        )
+        .route(
             "/v1/threads/{id}/goal",
             get(get_thread_goal)
                 .put(upsert_thread_goal)
@@ -1195,6 +1383,7 @@ pub fn build_router(state: RuntimeApiState) -> Router {
         )
         .route("/v1/threads/{id}/goal/complete", post(complete_thread_goal))
         .route("/v1/threads/{id}/goal/block", post(block_thread_goal))
+        .route("/v1/approvals", get(list_approvals))
         .route("/v1/approvals/{approval_id}", post(decide_approval))
         .route(
             "/v1/user-input/{thread_id}/{input_id}",
@@ -1204,9 +1393,14 @@ pub fn build_router(state: RuntimeApiState) -> Router {
         .route("/v1/tasks/{id}", get(get_task))
         .route("/v1/tasks/{id}/cancel", post(cancel_task))
         .route("/v1/skills", get(list_skills))
+        .route("/v1/commands", get(list_commands))
         .route(
             "/v1/skills/{name}",
             post(set_skill_enabled).delete(uninstall_skill_api),
+        )
+        .route(
+            "/v1/apps/mcp/imports",
+            get(mcp_import::preview).post(mcp_import::apply),
         )
         .route(
             "/v1/apps/mcp/servers",
@@ -1305,11 +1499,33 @@ pub fn build_router(state: RuntimeApiState) -> Router {
         .route("/v1/usage", get(get_usage))
         .route("/v1/snapshots", get(list_snapshots))
         .route("/v1/snapshots/{id}/restore", post(restore_snapshot))
+        .route(
+            "/v1/account/model-access",
+            get(secrets::get_account_model_access)
+                .put(secrets::set_account_model_access)
+                .delete(secrets::clear_account_model_access)
+                .layer(DefaultBodyLimit::max(
+                    secrets::PROVIDER_KEY_BODY_LIMIT_BYTES,
+                )),
+        )
         .route("/v1/providers", get(list_providers))
         .route("/v1/providers/{id}/models", get(list_provider_models))
+        .route(
+            "/v1/providers/{id}/models/refresh",
+            post(refresh_provider_models),
+        )
         .route("/v1/providers/{id}/switch", post(switch_provider))
+        .route(
+            "/v1/providers/{id}/key",
+            put(secrets::set_provider_key)
+                .delete(secrets::clear_provider_key)
+                .layer(DefaultBodyLimit::max(
+                    secrets::PROVIDER_KEY_BODY_LIMIT_BYTES,
+                )),
+        )
         .route("/v1/config", get(get_config).post(set_config))
         .route("/v1/config/reload", post(reload_config))
+        .route("/v1/settings/schema", get(get_settings_schema))
         .route(
             "/v1/threads/{id}/notifications/prepare",
             post(notification_delivery::prepare),
@@ -1321,6 +1537,7 @@ pub fn build_router(state: RuntimeApiState) -> Router {
                 .delete(clear_memory),
         )
         .route("/v1/memory/{id}", get(get_memory_entry))
+        .merge(memory_lens::routes())
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             require_runtime_token,
@@ -1627,6 +1844,69 @@ async fn list_threads(
     Ok(Json(threads))
 }
 
+/// Threads with queued or in-progress turns, for quit/background
+/// accounting (#6180). One call, no inference from latest-turn status.
+async fn list_running_threads(
+    State(state): State<RuntimeApiState>,
+) -> Result<Json<Vec<crate::runtime_threads::RunningThread>>, ApiError> {
+    let running = state
+        .runtime_threads
+        .running_threads()
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    Ok(Json(running))
+}
+
+/// Active notices on one thread (#6180): the TUI-visible conditions a
+/// watch-only client must surface — subagent-terminal, elevation-needed,
+/// model-notify — each with turn identity for targeting.
+async fn list_thread_notices(
+    State(state): State<RuntimeApiState>,
+    Path(id): Path<String>,
+) -> Result<Json<Vec<crate::runtime_threads::ActiveNotice>>, ApiError> {
+    state
+        .runtime_threads
+        .get_thread(&id)
+        .await
+        .map_err(map_thread_err)?;
+    Ok(Json(state.runtime_threads.list_notices(&id)))
+}
+
+/// Acknowledge (clear) one notice. Terminal/notify kinds clear only here;
+/// elevation additionally auto-clears when its tool call completes.
+async fn ack_thread_notice(
+    State(state): State<RuntimeApiState>,
+    Path((id, notice_id)): Path<(String, String)>,
+) -> Result<StatusCode, ApiError> {
+    state
+        .runtime_threads
+        .get_thread(&id)
+        .await
+        .map_err(map_thread_err)?;
+    if !state.runtime_threads.ack_notice(&id, &notice_id) {
+        return Err(ApiError::not_found(format!(
+            "thread '{id}' has no notice '{notice_id}'"
+        )));
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// First-appearance dedupe that preserves the order paths were seen in.
+///
+/// The thread summary resolves git metadata per distinct workspace rather than
+/// per row. One resolution runs up to five blocking `git` processes, and rows
+/// overwhelmingly share a single workspace, so resolving per row multiplied a
+/// listing's process count by its row count.
+fn distinct_paths(paths: impl IntoIterator<Item = PathBuf>) -> Vec<PathBuf> {
+    let mut distinct: Vec<PathBuf> = Vec::new();
+    for path in paths {
+        if !distinct.contains(&path) {
+            distinct.push(path);
+        }
+    }
+    distinct
+}
+
 async fn list_threads_summary(
     State(state): State<RuntimeApiState>,
     Query(query): Query<ThreadSummaryQuery>,
@@ -1640,11 +1920,8 @@ async fn list_threads_summary(
     // to find — was invisible. Unsearched listings keep the cheap bounded read;
     // a search scans in newest-first order and stops at `limit` matches.
     //
-    // Match on the thread record *before* projecting. The projection walks the
-    // whole turns+items store, so running it for a thread the caller will not
-    // see is wasted work — that is what made a non-matching dashboard keystroke
-    // O(threads × (all_turns + all_items)) JSON reads. Preview is filled only
-    // for matches; it is not a search key.
+    // Match on the thread record *before* harvesting row facts. Preview is
+    // filled only for rows that are returned; it is not a search key.
     let scan_limit = if search.is_some() { None } else { Some(limit) };
     let threads = state
         .runtime_threads
@@ -1652,47 +1929,72 @@ async fn list_threads_summary(
         .await
         .map_err(|e| ApiError::internal(e.to_string()))?;
 
-    // Decide which rows this response carries *before* touching the store.
-    // `limit` bounds the rows returned and a search scans in newest-first order
-    // until `limit` matches; both filters look at the thread record alone (a
-    // title-less thread peeks at most one turn file). The projection below is
-    // the expensive part, so it runs once, for the selected rows only.
-    let selected: Vec<_> = threads
-        .into_iter()
-        .filter(|thread| {
-            search.as_ref().is_none_or(|needle| {
-                state
-                    .runtime_threads
-                    .thread_matches_summary_search(thread, needle)
-            })
-        })
-        .take(limit)
-        .collect();
-    // One wholesale turns+items projection for every selected row. Calling
-    // `get_thread_detail` per row walks the whole turns+items store once *per
-    // row*, which is what made this route O(threads × store) — the same trap
-    // #3757 already fixed on the boot-recovery path. See
-    // `RuntimeThreadStore::list_thread_summary_details`.
-    let selected_ids: Vec<String> = selected.iter().map(|thread| thread.id.clone()).collect();
-    let mut details = state
-        .runtime_threads
-        .list_thread_summary_details(&selected_ids)
-        .await
-        .map_err(map_thread_err)?;
-
-    let mut summaries = Vec::with_capacity(selected.len());
-    for thread in selected {
-        // Every selected id comes back from the projection; skip defensively
-        // rather than failing the whole dashboard on a bookkeeping mismatch.
-        let Some(detail) = details.remove(&thread.id) else {
+    let mut rows = Vec::new();
+    for thread in threads {
+        if rows.len() >= limit {
+            break;
+        }
+        if let Some(search) = &search
+            && !state
+                .runtime_threads
+                .thread_matches_summary_search(&thread, search)
+        {
             continue;
-        };
-        let latest_turn = detail.turns.last();
-        let latest_status =
-            latest_turn.map(|turn| format!("{:?}", turn.status).to_ascii_lowercase());
-        let pending_attention_count = detail
-            .pending_approval_count
-            .saturating_add(detail.pending_user_input_count);
+        }
+        rows.push(thread);
+    }
+
+    // Harvest every returned row's facts in ONE pass over the store. Reading a
+    // whole thread detail per row made this route `rows x (all_turns +
+    // all_items)` JSON reads and parses — seconds-per-thread, so the rail timed
+    // out and went blank on a store of a few dozen threads. Preview and turn
+    // status now come from that same scan; attention comes from live state.
+    let row_ids: Vec<String> = rows.iter().map(|thread| thread.id.clone()).collect();
+
+    // Settle queued recovery receipts before reading the rows, exactly as the
+    // per-row detail read did. The flush cancels a recovered turn's pending
+    // requests, and this page's attention count reads that state, so it has to
+    // precede the scan.
+    state
+        .runtime_threads
+        .flush_recovery_receipts(&row_ids)
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+
+    let facts = state
+        .runtime_threads
+        .thread_list_facts(&row_ids)
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+
+    // Resolve git metadata once per workspace, not once per row. Each
+    // resolution spawns up to five blocking `git` processes — `rev-parse
+    // --is-inside-work-tree` twice, `--abbrev-ref HEAD`, `--short HEAD` and
+    // `status --porcelain` — and rows overwhelmingly share one workspace, so a
+    // per-row resolve turned a 72-thread listing into roughly 360 process
+    // spawns, every one of them blocking whichever runtime thread ran it.
+    // One blocking task now covers every distinct workspace on the page.
+    let workspaces = distinct_paths(rows.iter().map(|thread| thread.workspace.clone()));
+    let git_by_workspace: Vec<(PathBuf, WorkspaceGitMetadata)> =
+        tokio::task::spawn_blocking(move || {
+            workspaces
+                .into_iter()
+                .map(|workspace| {
+                    let metadata = collect_workspace_git_metadata(&workspace);
+                    (workspace, metadata)
+                })
+                .collect()
+        })
+        .await
+        .map_err(|e| ApiError::internal(format!("Workspace git metadata task failed: {e}")))?;
+
+    let mut summaries = Vec::with_capacity(rows.len());
+    for thread in rows {
+        let facts = facts.get(&thread.id);
+        let latest_status = facts.and_then(|facts| facts.latest_turn_status.clone());
+        let pending_attention_count = facts.map_or(0, |facts| facts.pending_attention_count);
+        let latest_input_summary =
+            facts.and_then(|facts| facts.latest_turn_input_summary.as_deref());
 
         let title = thread
             .title
@@ -1701,44 +2003,35 @@ async fn list_threads_summary(
             .filter(|t| !t.is_empty())
             .map(|t| truncate_text(t, 72))
             .unwrap_or_else(|| {
-                latest_turn
-                    .map(|turn| {
-                        if turn.input_summary.trim().is_empty() {
+                latest_input_summary
+                    .map(|summary| {
+                        if summary.trim().is_empty() {
                             "New Thread".to_string()
                         } else {
-                            truncate_text(&turn.input_summary, 72)
+                            truncate_text(summary, 72)
                         }
                     })
                     .unwrap_or_else(|| "New Thread".to_string())
             });
 
-        let preview = detail
-            .items
-            .iter()
-            .rev()
-            .find_map(|item| match item.kind {
-                TurnItemKind::AgentMessage | TurnItemKind::UserMessage => {
-                    let text = item.detail.clone().unwrap_or_else(|| item.summary.clone());
-                    if text.trim().is_empty() {
-                        None
-                    } else {
-                        Some(truncate_text(&text, 140))
-                    }
-                }
-                _ => None,
-            })
+        let preview = facts
+            .and_then(|facts| facts.preview.as_deref())
+            .map(|text| truncate_text(text, 140))
             .unwrap_or_else(|| title.clone());
 
-        let workspace_git = collect_workspace_git_metadata(&thread.workspace);
+        let workspace_git = git_by_workspace
+            .iter()
+            .find(|(workspace, _)| workspace == &thread.workspace)
+            .map(|(_, metadata)| metadata);
         summaries.push(ThreadSummary {
             id: thread.id,
             title,
             preview,
             model: thread.model,
             mode: thread.mode,
-            branch: workspace_git.branch,
-            head: workspace_git.head,
-            dirty: workspace_git.dirty,
+            branch: workspace_git.and_then(|git| git.branch.clone()),
+            head: workspace_git.and_then(|git| git.head.clone()),
+            dirty: workspace_git.is_some_and(|git| git.dirty),
             workspace: thread.workspace,
             archived: thread.archived,
             updated_at: thread.updated_at,
@@ -2128,10 +2421,13 @@ async fn stream_fleet_events(
 ) -> Result<Sse<impl futures_util::Stream<Item = Result<SseEvent, Infallible>>>, ApiError> {
     let (after, limit) = validate_fleet_events_query(query)?;
     let run_id = FleetRunId::from(run_id);
+    // Subscribe before the initial load so no append between the load and the
+    // first wait is missed for longer than the fallback poll (#6211 R7b).
+    let appends = subscribe_fleet_ledger_appends(&fleet_ledger_path(&state.workspace));
     let initial = load_fleet_event_replay(state.clone(), run_id.clone(), after.clone(), limit)
         .await
         .map_err(map_fleet_replay_error)?;
-    let event_stream = replay_live_fleet_events(state, run_id, after, limit, initial);
+    let event_stream = replay_live_fleet_events(state, run_id, after, limit, initial, appends);
     Ok(Sse::new(event_stream).keep_alive(
         KeepAlive::new()
             .interval(Duration::from_secs(15))
@@ -2139,12 +2435,18 @@ async fn stream_fleet_events(
     ))
 }
 
+/// Fallback re-poll when no ledger-append wake arrives. Wakes cover every
+/// in-process append; the fallback heals missed wakes, out-of-process
+/// writers, and ledger compaction, which replaces rather than appends.
+const FLEET_SSE_FALLBACK_POLL: Duration = Duration::from_secs(5);
+
 fn replay_live_fleet_events(
     state: RuntimeApiState,
     run_id: FleetRunId,
     mut after: Option<String>,
     limit: usize,
     initial: FleetEventReplay,
+    appends: std::sync::Arc<tokio::sync::Notify>,
 ) -> impl futures_util::Stream<Item = Result<SseEvent, Infallible>> {
     stream! {
         let mut page = initial;
@@ -2163,7 +2465,14 @@ fn replay_live_fleet_events(
                 yield Ok(fleet_sse_event(&event));
             }
             if !page.has_more {
-                tokio::time::sleep(Duration::from_millis(250)).await;
+                // Register interest before yielding to the runtime so an
+                // append racing this wait still wakes us (#6211 R7b).
+                let notified = appends.notified();
+                tokio::pin!(notified);
+                tokio::select! {
+                    _ = &mut notified => {}
+                    _ = tokio::time::sleep(FLEET_SSE_FALLBACK_POLL) => {}
+                }
             }
             match load_fleet_event_replay(
                 state.clone(),
@@ -2875,6 +3184,120 @@ fn fleet_event_label(payload: &FleetWorkerEventPayload) -> String {
     }
 }
 
+/// One entry in the served slash-command catalog (`GET /v1/commands`, #6178).
+///
+/// Clients use this to complete and validate input without duplicating the
+/// registry: a `binding: "host"` row must never be submitted as a model
+/// prompt, and a user command shadowing a builtin name wins that spelling.
+#[derive(Debug, Serialize)]
+struct CommandCatalogEntry {
+    name: String,
+    aliases: Vec<String>,
+    /// English source text; localizing is the client's surface.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    summary: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    usage: Option<String>,
+    /// Literal verbs declared by the usage line (`/goal <block|complete|…>`).
+    subcommands: Vec<String>,
+    takes_arguments: bool,
+    /// `builtin` is registered code; `user` expands a stored template.
+    kind: &'static str,
+    /// `host` runs locally and never reaches the model; `prompt` expands into
+    /// the request the model sees.
+    binding: &'static str,
+    /// `primary` | `advanced` | `compatibility` — builtins only; `hidden`
+    /// covers rows the product does not advertise anywhere.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    discovery: Option<&'static str>,
+    hidden: bool,
+    /// User command holding this builtin's canonical name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    shadowed_by: Option<String>,
+    /// Alias spellings of this builtin taken by user commands.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    shadowed_aliases: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct CommandsResponse {
+    commands: Vec<CommandCatalogEntry>,
+}
+
+fn command_catalog(
+    user_commands: &crate::commands::user_registry::UserCommandRegistry,
+) -> Vec<CommandCatalogEntry> {
+    let mut commands = Vec::new();
+    for info in crate::commands::command_infos() {
+        let shadowed_by = user_commands
+            .get(info.name)
+            .map(|command| command.name.clone());
+        let shadowed_aliases = info
+            .aliases
+            .iter()
+            .filter(|alias| user_commands.get(alias).is_some())
+            .map(|alias| (*alias).to_string())
+            .collect();
+        commands.push(CommandCatalogEntry {
+            name: info.name.to_string(),
+            aliases: info
+                .aliases
+                .iter()
+                .map(|alias| (*alias).to_string())
+                .collect(),
+            summary: Some(
+                info.description_for(codewhale_localization::Locale::En)
+                    .into_owned(),
+            ),
+            usage: Some(info.usage.to_string()),
+            subcommands: crate::commands::traits::usage_subcommands(info.usage)
+                .iter()
+                .map(|token| (*token).to_string())
+                .collect(),
+            takes_arguments: crate::commands::user_registry::usage_describes_arguments(
+                info.name, info.usage,
+            ),
+            kind: "builtin",
+            binding: "host",
+            discovery: Some(match info.discovery() {
+                crate::commands::traits::CommandDiscovery::Primary => "primary",
+                crate::commands::traits::CommandDiscovery::Advanced => "advanced",
+                crate::commands::traits::CommandDiscovery::Compatibility => "compatibility",
+            }),
+            hidden: crate::commands::traits::UNLISTED_COMMANDS.contains(&info.name),
+            shadowed_by,
+            shadowed_aliases,
+        });
+    }
+    for command in user_commands.iter() {
+        commands.push(CommandCatalogEntry {
+            name: command.name.clone(),
+            aliases: command.aliases.clone(),
+            summary: command.description.clone(),
+            usage: command.display_usage().map(str::to_string),
+            subcommands: Vec::new(),
+            takes_arguments: command.takes_arguments(),
+            kind: "user",
+            binding: "prompt",
+            discovery: None,
+            hidden: command.hidden,
+            shadowed_by: None,
+            shadowed_aliases: Vec::new(),
+        });
+    }
+    commands
+}
+
+async fn list_commands(
+    State(state): State<RuntimeApiState>,
+) -> Result<Json<CommandsResponse>, ApiError> {
+    let commands = crate::commands::user_registry::with_registry_for_workspace(
+        Some(state.workspace.as_path()),
+        command_catalog,
+    );
+    Ok(Json(CommandsResponse { commands }))
+}
+
 async fn list_skills(
     State(state): State<RuntimeApiState>,
 ) -> Result<Json<SkillsResponse>, ApiError> {
@@ -3394,6 +3817,98 @@ async fn audit_skill_api(
     }))
 }
 
+#[derive(Debug, Deserialize)]
+struct ApprovalsQuery {
+    limit: Option<usize>,
+}
+
+/// One row of the account-wide approval history: what the agent asked
+/// permission to do and what was decided. `decided_at` is `None` while the
+/// ask is still pending.
+#[derive(Debug, Serialize)]
+struct ApprovalHistoryRow {
+    approval_id: String,
+    tool_name: String,
+    outcome: String,
+    asked_at: chrono::DateTime<Utc>,
+    decided_at: Option<chrono::DateTime<Utc>>,
+}
+
+fn approval_outcome_label(outcome: &crate::approval_log::ApprovalOutcome) -> &'static str {
+    use crate::approval_log::ApprovalOutcome;
+    match outcome {
+        ApprovalOutcome::ApprovedOnce => "allowed_once",
+        ApprovalOutcome::Denied => "denied",
+        ApprovalOutcome::Timeout => "timeout",
+        ApprovalOutcome::Cancelled => "cancelled",
+        ApprovalOutcome::Unavailable => "unavailable",
+        ApprovalOutcome::RetryWithPolicy { .. } => "retry_with_policy",
+    }
+}
+
+/// Flatten one session's replay into history rows, newest ask first. Pending
+/// asks sort by asked time alongside decided rows — they are the newest
+/// entries while live, and sink into place once decided.
+fn approval_history_rows(replay: &crate::approval_log::ApprovalReplay) -> Vec<ApprovalHistoryRow> {
+    let mut rows: Vec<ApprovalHistoryRow> = replay
+        .completed
+        .iter()
+        .map(|completed| {
+            let asked_at = completed.ask.created_at();
+            ApprovalHistoryRow {
+                approval_id: completed.ask.approval_id().to_string(),
+                tool_name: completed.ask.tool_name().unwrap_or("unknown").to_string(),
+                outcome: approval_outcome_label(&completed.outcome).to_string(),
+                asked_at,
+                decided_at: Some(completed.decided_at),
+            }
+        })
+        .chain(replay.unmatched_asks.iter().map(|ask| ApprovalHistoryRow {
+            approval_id: ask.approval_id().to_string(),
+            tool_name: ask.tool_name().unwrap_or("unknown").to_string(),
+            outcome: "pending".to_string(),
+            asked_at: ask.created_at(),
+            decided_at: None,
+        }))
+        .collect();
+    rows.sort_by_key(|row| std::cmp::Reverse(row.asked_at));
+    rows
+}
+
+/// `GET /v1/approvals` — the read-only history behind the approvals log:
+/// every decided approval plus every still-pending ask, newest first, across
+/// all sessions. A corrupt session log is skipped with a warning, never a
+/// 500 for the whole history; the warn names the file to inspect (#5931).
+async fn list_approvals(
+    State(state): State<RuntimeApiState>,
+    Query(query): Query<ApprovalsQuery>,
+) -> Result<Json<Vec<ApprovalHistoryRow>>, ApiError> {
+    let limit = query.limit.unwrap_or(100).clamp(1, 500);
+    let sessions_dir = state.sessions_dir.clone();
+    let mut rows = tokio::task::spawn_blocking(move || {
+        let store = crate::approval_log::ApprovalReceiptStore::new(sessions_dir);
+        let mut rows = Vec::new();
+        for session_id in store.sessions_with_logs() {
+            match store.replay(&session_id) {
+                Ok(replay) => rows.extend(approval_history_rows(&replay)),
+                Err(error) => tracing::warn!(
+                    target: "approval",
+                    error_kind = ?error.kind(),
+                    %error,
+                    session_id,
+                    "skipping unreadable approval log in history listing",
+                ),
+            }
+        }
+        rows
+    })
+    .await
+    .map_err(|error| ApiError::internal(format!("approval history read failed: {error}")))?;
+    rows.sort_by_key(|row| std::cmp::Reverse(row.asked_at));
+    rows.truncate(limit);
+    Ok(Json(rows))
+}
+
 async fn decide_approval(
     State(state): State<RuntimeApiState>,
     Path(approval_id): Path<String>,
@@ -3549,76 +4064,320 @@ fn normalize_runtime_account_api_base(value: &str) -> Option<String> {
     Some(url.as_str().trim_end_matches('/').to_string())
 }
 
-async fn list_mcp_servers(
-    State(state): State<RuntimeApiState>,
-) -> Result<Json<McpServersResponse>, ApiError> {
-    let mcp_config_path = state.config.read().mcp_config_path();
-    let plugin_registry = state
+/// Ownership is derived using the same trust/precedence as the existing MCP
+/// loader. A global editor must never silently change a shadowed project entry
+/// or manufacture an override for a reviewed plugin component.
+fn mcp_management_config(
+    state: &RuntimeApiState,
+) -> Result<
+    (
+        crate::mcp::McpConfig,
+        std::collections::HashMap<String, &'static str>,
+    ),
+    ApiError,
+> {
+    let global_path = state.config.read().mcp_config_path();
+    let plugins = state
         .plugin_discovery
         .registry_for_workspace(&state.workspace);
     let config = crate::mcp::load_config_with_workspace_and_plugins(
-        &mcp_config_path,
+        &global_path,
         &state.workspace,
-        plugin_registry.as_ref(),
+        plugins.as_ref(),
     )
     .map_err(|e| ApiError::internal(format!("Failed to load MCP config: {e}")))?;
+    let global = crate::mcp::load_config(&global_path)
+        .map_err(|e| ApiError::internal(format!("Failed to load MCP config: {e}")))?;
+    let project_path = crate::mcp::workspace_mcp_config_path(&state.workspace);
+    let same_source = project_path == global_path
+        || project_path
+            .canonicalize()
+            .ok()
+            .zip(global_path.canonicalize().ok())
+            .is_some_and(|(project, global)| project == global);
+    let project = if !same_source && crate::config::is_workspace_trusted(&state.workspace) {
+        crate::mcp::load_config(&project_path)
+            .map_err(|e| ApiError::internal(format!("Failed to load project MCP config: {e}")))?
+    } else {
+        crate::mcp::McpConfig::default()
+    };
+    let origins = config
+        .servers
+        .iter()
+        .map(|(name, server)| {
+            let origin = if server.reviewed_plugin.is_some() {
+                "plugin"
+            } else if project.servers.contains_key(name) {
+                "project"
+            } else if global.servers.contains_key(name) {
+                "global"
+            } else {
+                "unknown"
+            };
+            (name.clone(), origin)
+        })
+        .collect();
+    Ok((config, origins))
+}
 
+#[derive(Debug)]
+struct McpManagementFailure(ApiError);
+impl std::fmt::Display for McpManagementFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0.message)
+    }
+}
+impl std::error::Error for McpManagementFailure {}
+
+fn mcp_mutation_error(error: anyhow::Error) -> ApiError {
+    if error.is::<crate::mcp::McpRevisionConflict>() {
+        ApiError {
+            status: StatusCode::PRECONDITION_FAILED,
+            message: error.to_string(),
+        }
+    } else if let Some(error) = error.downcast_ref::<McpManagementFailure>() {
+        error.0.clone()
+    } else {
+        ApiError::internal(error.to_string())
+    }
+}
+
+fn mcp_expected_revision(headers: &axum::http::HeaderMap) -> Result<String, ApiError> {
+    let value = headers
+        .get(header::IF_MATCH)
+        .ok_or_else(|| ApiError {
+            status: StatusCode::PRECONDITION_REQUIRED,
+            message: "Read the MCP configuration and send its revision in If-Match before saving"
+                .into(),
+        })?
+        .to_str()
+        .map_err(|_| ApiError::bad_request("Invalid MCP revision"))?
+        .trim();
+    let value = if value.starts_with('"') && value.ends_with('"') && value.len() >= 2 {
+        &value[1..value.len() - 1]
+    } else {
+        value
+    };
+    if value != "mcp-v1-absent"
+        && !value.strip_prefix("mcp-v1-").is_some_and(|hash| {
+            hash.len() == 64
+                && hash
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        })
+    {
+        return Err(ApiError::bad_request("Invalid MCP revision"));
+    }
+    Ok(value.to_owned())
+}
+
+async fn mutate_mcp_management<T: Send + 'static>(
+    state: RuntimeApiState,
+    headers: axum::http::HeaderMap,
+    mutate: impl FnOnce(&RuntimeApiState, &mut crate::mcp::McpConfig) -> Result<T, ApiError>
+    + Send
+    + 'static,
+) -> Result<(T, String), ApiError> {
+    let expected = mcp_expected_revision(&headers)?;
+    #[cfg(test)]
+    let env_ticket = crate::test_support::env_scope_ticket();
+    tokio::task::spawn_blocking(move || {
+        #[cfg(test)]
+        let _membership = crate::test_support::join_env_scope(env_ticket);
+        let path = state.config.read().mcp_config_path();
+        crate::mcp::mutate_config(&path, Some(&expected), |config| {
+            mutate(&state, config).map_err(|error| anyhow::Error::new(McpManagementFailure(error)))
+        })
+        .map_err(mcp_mutation_error)
+    })
+    .await
+    .map_err(|_| ApiError::internal("MCP configuration write failed"))?
+}
+
+async fn mcp_management_snapshot(
+    state: RuntimeApiState,
+) -> Result<
+    (
+        (
+            crate::mcp::McpConfig,
+            std::collections::HashMap<String, &'static str>,
+        ),
+        String,
+    ),
+    ApiError,
+> {
+    #[cfg(test)]
+    let env_ticket = crate::test_support::env_scope_ticket();
+    tokio::task::spawn_blocking(move || {
+        #[cfg(test)]
+        let _membership = crate::test_support::join_env_scope(env_ticket);
+        let path = state.config.read().mcp_config_path();
+        codewhale_config::with_config_write_lock(&path, |path| {
+            let config = mcp_management_config(&state)
+                .map_err(|error| anyhow::Error::new(McpManagementFailure(error)))?;
+            Ok((config, crate::mcp::read_config_revision(path)?))
+        })
+        .map_err(mcp_mutation_error)
+    })
+    .await
+    .map_err(|_| ApiError::internal("MCP configuration read failed"))?
+}
+
+fn require_writable_mcp_server(state: &RuntimeApiState, name: &str) -> Result<(), ApiError> {
+    let (_, origins) = mcp_management_config(state)?;
+    match origins.get(name) {
+        Some(&"global") => Ok(()),
+        Some(origin) => Err(ApiError {
+            status: StatusCode::CONFLICT,
+            message: format!(
+                "MCP server '{name}' is owned by {origin} configuration; manage it at its source"
+            ),
+        }),
+        None => Err(ApiError::not_found(format!(
+            "MCP server '{name}' not found"
+        ))),
+    }
+}
+
+async fn mcp_pool_handle(
+    state: &RuntimeApiState,
+    create: bool,
+) -> Result<Option<Arc<Mutex<McpPool>>>, ApiError> {
+    let mut slot = state.mcp_pool.lock().await;
+    if slot.is_none() && create {
+        let path = state.config.read().mcp_config_path();
+        let plugins = state
+            .plugin_discovery
+            .registry_for_workspace(&state.workspace);
+        let pool =
+            McpPool::from_config_path_with_workspace_and_plugins(&path, &state.workspace, plugins)
+                .map_err(|e| ApiError::internal(format!("Failed to load MCP config: {e}")))?;
+        *slot = Some(Arc::new(Mutex::new(pool)));
+    }
+    Ok(slot.clone())
+}
+
+fn mcp_connection_outcome(
+    pool: &McpPool,
+    server: &str,
+    error: Option<&anyhow::Error>,
+) -> McpConnectionOutcome {
+    McpConnectionOutcome {
+        server: server.to_owned(),
+        connected: pool.connected_servers().contains(&server),
+        auth_required: pool.server_needs_auth(server),
+        error: error
+            .map(|error| truncate_text(&crate::mcp::format_mcp_error_for_display(error), 2048)),
+    }
+}
+
+async fn list_mcp_servers(
+    State(state): State<RuntimeApiState>,
+) -> Result<Json<McpServersResponse>, ApiError> {
+    let ((config, origins), revision) = mcp_management_snapshot(state.clone()).await?;
+    let handle = mcp_pool_handle(&state, false).await?;
+    let pool = match handle.as_ref() {
+        Some(handle) => Some(handle.lock().await),
+        None => None,
+    };
     let mut servers = Vec::new();
     for (name, server_cfg) in config.servers {
+        let origin = origins.get(&name).copied().unwrap_or("unknown");
         servers.push(McpServerEntry {
             name: name.clone(),
+            origin,
+            writable: origin == "global",
+            auth_required: pool
+                .as_ref()
+                .is_some_and(|pool| pool.server_needs_auth(&name)),
             enabled: server_cfg.is_enabled(),
             required: server_cfg.required,
             command: server_cfg.command.clone(),
             url: server_cfg.url.clone(),
-            connected: false,
+            connected: pool
+                .as_ref()
+                .is_some_and(|pool| pool.connected_servers().contains(&name.as_str())),
             enabled_tools: server_cfg.enabled_tools.clone(),
             disabled_tools: server_cfg.disabled_tools.clone(),
         });
     }
     servers.sort_by(|a, b| a.name.cmp(&b.name));
-
-    Ok(Json(McpServersResponse { servers }))
+    Ok(Json(McpServersResponse { servers, revision }))
 }
 
 async fn list_mcp_tools(
     State(state): State<RuntimeApiState>,
     Query(query): Query<McpToolsQuery>,
 ) -> Result<Json<McpToolsResponse>, ApiError> {
-    // Double-checked init: hold the state-level slot mutex only long enough
-    // to grab (or lazily create) the pool handle. connect_all can stall on a
-    // slow MCP server and must not run under the slot lock.
-    let pool_handle = {
-        let mut pool_slot = state.mcp_pool.lock().await;
-        match pool_slot.as_ref() {
-            Some(pool) => Some(Arc::clone(pool)),
-            None if query.connect => {
-                let mcp_config_path = state.config.read().mcp_config_path();
-                let plugin_registry = state
-                    .plugin_discovery
-                    .registry_for_workspace(&state.workspace);
-                let new_pool = McpPool::from_config_path_with_workspace_and_plugins(
-                    &mcp_config_path,
-                    &state.workspace,
-                    plugin_registry,
-                )
-                .map_err(|e| ApiError::internal(format!("Failed to load MCP config: {e}")))?;
-                let handle = Arc::new(Mutex::new(new_pool));
-                pool_slot.replace(Arc::clone(&handle));
-                Some(handle)
-            }
-            None => None,
-        }
+    // An explicit connection request must not inherit the tool dispatcher's
+    // best-effort reload behavior: unreadable/revoked sources fail closed.
+    let fresh_config = if query.connect {
+        Some(mcp_management_config(&state)?.0)
+    } else {
+        None
     };
-
-    let Some(pool_handle) = pool_handle else {
-        return Ok(Json(McpToolsResponse { tools: Vec::new() }));
+    let Some(pool_handle) = mcp_pool_handle(&state, query.connect).await? else {
+        return Ok(Json(McpToolsResponse {
+            tools: Vec::new(),
+            connections: Vec::new(),
+        }));
     };
-
     let mut pool = pool_handle.lock().await;
-    if query.connect {
-        let _errors = pool.connect_all().await;
+    if fresh_config
+        .as_ref()
+        .is_some_and(|config| !pool.config_matches(config))
+    {
+        let error =
+            anyhow::anyhow!("MCP configuration changed; reload it before connecting this server");
+        let names = query
+            .server
+            .clone()
+            .map(|name| vec![name])
+            .unwrap_or_else(|| pool.server_names());
+        return Ok(Json(McpToolsResponse {
+            tools: Vec::new(),
+            connections: names
+                .iter()
+                .map(|name| mcp_connection_outcome(&pool, name, Some(&error)))
+                .collect(),
+        }));
     }
+    let errors = if query.connect {
+        if let Some(server) = query.server.as_deref() {
+            match pool.get_or_connect(server).await {
+                Ok(_) => Vec::new(),
+                Err(error) => vec![(server.to_owned(), error)],
+            }
+        } else {
+            pool.connect_all().await
+        }
+    } else {
+        Vec::new()
+    };
+    let mut names = query
+        .server
+        .clone()
+        .map(|name| vec![name])
+        .unwrap_or_else(|| pool.server_names());
+    for (server, _) in &errors {
+        if !names.contains(server) {
+            names.push(server.clone());
+        }
+    }
+    names.sort();
+    let connections = names
+        .iter()
+        .map(|name| {
+            mcp_connection_outcome(
+                &pool,
+                name,
+                errors
+                    .iter()
+                    .find(|(server, _)| server == name)
+                    .map(|(_, error)| error),
+            )
+        })
+        .collect();
 
     let mut tools = Vec::new();
     for (prefixed_name, tool) in pool.all_tools() {
@@ -3643,7 +4402,7 @@ async fn list_mcp_tools(
 
     tools.sort_by(|a, b| a.server.cmp(&b.server).then_with(|| a.name.cmp(&b.name)));
 
-    Ok(Json(McpToolsResponse { tools }))
+    Ok(Json(McpToolsResponse { tools, connections }))
 }
 
 /// `GET /v1/apps/mcp/servers/{name}` — fetch a single server's redacted config.
@@ -3651,34 +4410,26 @@ async fn get_mcp_server(
     State(state): State<RuntimeApiState>,
     Path(name): Path<String>,
 ) -> Result<Json<McpServerDetail>, ApiError> {
-    let mcp_config_path = state.config.read().mcp_config_path();
-    let plugin_registry = state
-        .plugin_discovery
-        .registry_for_workspace(&state.workspace);
-    let config = crate::mcp::load_config_with_workspace_and_plugins(
-        &mcp_config_path,
-        &state.workspace,
-        plugin_registry.as_ref(),
-    )
-    .map_err(|e| ApiError::internal(format!("Failed to load MCP config: {e}")))?;
-
+    let ((config, origins), revision) = mcp_management_snapshot(state.clone()).await?;
     let server_cfg = config
         .servers
         .get(&name)
         .ok_or_else(|| ApiError::not_found(format!("MCP server '{name}' not found")))?;
-
-    let connected = {
-        let pool_slot = state.mcp_pool.lock().await;
-        pool_slot.as_ref().is_some_and(|pool_handle| {
-            pool_handle
-                .try_lock()
-                .is_ok_and(|p| p.connected_servers().contains(&name.as_str()))
-        })
+    let handle = mcp_pool_handle(&state, false).await?;
+    let pool = match handle.as_ref() {
+        Some(handle) => Some(handle.lock().await),
+        None => None,
     };
-
-    Ok(Json(McpServerDetail::from_config(
-        &name, server_cfg, connected,
-    )))
+    let connected = pool
+        .as_ref()
+        .is_some_and(|pool| pool.connected_servers().contains(&name.as_str()));
+    let mut detail = McpServerDetail::from_config(&name, server_cfg, connected, revision);
+    detail.origin = origins.get(&name).copied().unwrap_or("unknown");
+    detail.writable = detail.origin == "global";
+    detail.auth_required = pool
+        .as_ref()
+        .is_some_and(|pool| pool.server_needs_auth(&name));
+    Ok(Json(detail))
 }
 
 /// `POST /v1/apps/mcp/servers` — add a new server to the persistent config.
@@ -3687,6 +4438,7 @@ async fn get_mcp_server(
 /// required top-level `"name"` string that will be the server key.
 async fn create_mcp_server(
     State(state): State<RuntimeApiState>,
+    headers: axum::http::HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> Result<(StatusCode, Json<McpServerDetail>), ApiError> {
     let name = body
@@ -3715,25 +4467,26 @@ async fn create_mcp_server(
             .map_err(|e| ApiError::bad_request(e.to_string()))?;
     }
 
-    let mcp_config_path = state.config.read().mcp_config_path();
-
-    // Build the config entry from the request.
     let new_cfg = mcp_server_config_from_write_request(req, None);
-
-    // Persist to the global MCP config.
-    {
-        let mut cfg = crate::mcp::load_config(&mcp_config_path)
-            .map_err(|e| ApiError::internal(format!("Failed to load MCP config: {e}")))?;
-        if cfg.servers.contains_key(&name) {
-            return Err(ApiError {
-                status: StatusCode::CONFLICT,
-                message: format!("MCP server '{name}' already exists"),
-            });
-        }
-        cfg.servers.insert(name.clone(), new_cfg.clone());
-        crate::mcp::save_config(&mcp_config_path, &cfg)
-            .map_err(|e| ApiError::internal(format!("Failed to save MCP config: {e}")))?;
-    }
+    let target_name = name.clone();
+    let (new_cfg, revision) =
+        mutate_mcp_management(state.clone(), headers, move |state, config| {
+            if mcp_management_config(state)?
+                .0
+                .servers
+                .contains_key(&target_name)
+            {
+                return Err(ApiError {
+                    status: StatusCode::CONFLICT,
+                    message: format!(
+                        "MCP server '{target_name}' already exists in the effective configuration"
+                    ),
+                });
+            }
+            config.servers.insert(target_name, new_cfg.clone());
+            Ok(new_cfg)
+        })
+        .await?;
 
     // Invalidate the in-memory pool so the next tool call reloads from disk.
     {
@@ -3743,7 +4496,9 @@ async fn create_mcp_server(
 
     Ok((
         StatusCode::CREATED,
-        Json(McpServerDetail::from_config(&name, &new_cfg, false)),
+        Json(McpServerDetail::from_config(
+            &name, &new_cfg, false, revision,
+        )),
     ))
 }
 
@@ -3751,6 +4506,7 @@ async fn create_mcp_server(
 async fn update_mcp_server(
     State(state): State<RuntimeApiState>,
     Path(name): Path<String>,
+    headers: axum::http::HeaderMap,
     Json(req): Json<McpServerWriteRequest>,
 ) -> Result<Json<McpServerDetail>, ApiError> {
     if let Some(Some(transport)) = &req.transport {
@@ -3758,26 +4514,41 @@ async fn update_mcp_server(
             .map_err(|e| ApiError::bad_request(e.to_string()))?;
     }
 
-    let mcp_config_path = state.config.read().mcp_config_path();
-
-    let updated_cfg = {
-        let mut cfg = crate::mcp::load_config(&mcp_config_path)
-            .map_err(|e| ApiError::internal(format!("Failed to load MCP config: {e}")))?;
+    let target_name = name.clone();
+    let (updated_cfg, revision) = mutate_mcp_management(state.clone(), headers, move |state, cfg| {
+        let name = target_name;
+        require_writable_mcp_server(state, &name)?;
         let existing = cfg
             .servers
             .get_mut(&name)
             .ok_or_else(|| ApiError::not_found(format!("MCP server '{name}' not found")))?;
+        let previous_target = (
+            existing.command.clone(),
+            existing.args.clone(),
+            existing.url.clone(),
+            existing.transport.clone(),
+        );
         apply_write_request_to_config(req, existing);
+        let target_changed = previous_target
+            != (
+                existing.command.clone(),
+                existing.args.clone(),
+                existing.url.clone(),
+                existing.transport.clone(),
+            );
+        if target_changed && mcp_credential_configured(existing) {
+            return Err(ApiError {
+                status: StatusCode::CONFLICT,
+                message: "Clear this connector's credential configuration before changing its command, arguments, URL, or transport; retained credentials cannot be forwarded to a different target".to_owned(),
+            });
+        }
         if existing.command.is_none() && existing.url.is_none() {
             return Err(ApiError::bad_request(
                 "Either 'command' or 'url' must remain configured for an MCP server",
             ));
         }
-        let updated = existing.clone();
-        crate::mcp::save_config(&mcp_config_path, &cfg)
-            .map_err(|e| ApiError::internal(format!("Failed to save MCP config: {e}")))?;
-        updated
-    };
+        Ok(existing.clone())
+    }).await?;
 
     // Invalidate the in-memory pool.
     {
@@ -3789,6 +4560,7 @@ async fn update_mcp_server(
         &name,
         &updated_cfg,
         false,
+        revision,
     )))
 }
 
@@ -3796,17 +4568,17 @@ async fn update_mcp_server(
 async fn delete_mcp_server(
     State(state): State<RuntimeApiState>,
     Path(name): Path<String>,
+    headers: axum::http::HeaderMap,
 ) -> Result<Json<McpServerActionReceipt>, ApiError> {
-    let mcp_config_path = state.config.read().mcp_config_path();
-
-    crate::mcp::remove_server_config(&mcp_config_path, &name).map_err(|e| {
-        let msg = e.to_string();
-        if msg.contains("not found") {
-            ApiError::not_found(msg)
-        } else {
-            ApiError::internal(msg)
-        }
-    })?;
+    let target_name = name.clone();
+    let (_, revision) = mutate_mcp_management(state.clone(), headers, move |state, cfg| {
+        require_writable_mcp_server(state, &target_name)?;
+        cfg.servers
+            .remove(&target_name)
+            .ok_or_else(|| ApiError::not_found("MCP server not found"))?;
+        Ok(())
+    })
+    .await?;
 
     // Invalidate the in-memory pool.
     {
@@ -3815,9 +4587,11 @@ async fn delete_mcp_server(
     }
 
     Ok(Json(McpServerActionReceipt {
+        revision: Some(revision),
         name,
         action: "deleted",
         ok: true,
+        connection: None,
     }))
 }
 
@@ -3825,17 +4599,20 @@ async fn delete_mcp_server(
 async fn enable_mcp_server(
     State(state): State<RuntimeApiState>,
     Path(name): Path<String>,
+    headers: axum::http::HeaderMap,
 ) -> Result<Json<McpServerActionReceipt>, ApiError> {
-    let mcp_config_path = state.config.read().mcp_config_path();
-
-    crate::mcp::set_server_enabled(&mcp_config_path, &name, true).map_err(|e| {
-        let msg = e.to_string();
-        if msg.contains("not found") {
-            ApiError::not_found(msg)
-        } else {
-            ApiError::internal(msg)
-        }
-    })?;
+    let target_name = name.clone();
+    let (_, revision) = mutate_mcp_management(state.clone(), headers, move |state, cfg| {
+        require_writable_mcp_server(state, &target_name)?;
+        let server = cfg
+            .servers
+            .get_mut(&target_name)
+            .ok_or_else(|| ApiError::not_found("MCP server not found"))?;
+        server.enabled = true;
+        server.disabled = false;
+        Ok(())
+    })
+    .await?;
 
     // Invalidate the in-memory pool so the enabled server participates next time.
     {
@@ -3844,9 +4621,11 @@ async fn enable_mcp_server(
     }
 
     Ok(Json(McpServerActionReceipt {
+        revision: Some(revision),
         name,
         action: "enabled",
         ok: true,
+        connection: None,
     }))
 }
 
@@ -3854,17 +4633,20 @@ async fn enable_mcp_server(
 async fn disable_mcp_server(
     State(state): State<RuntimeApiState>,
     Path(name): Path<String>,
+    headers: axum::http::HeaderMap,
 ) -> Result<Json<McpServerActionReceipt>, ApiError> {
-    let mcp_config_path = state.config.read().mcp_config_path();
-
-    crate::mcp::set_server_enabled(&mcp_config_path, &name, false).map_err(|e| {
-        let msg = e.to_string();
-        if msg.contains("not found") {
-            ApiError::not_found(msg)
-        } else {
-            ApiError::internal(msg)
-        }
-    })?;
+    let target_name = name.clone();
+    let (_, revision) = mutate_mcp_management(state.clone(), headers, move |state, cfg| {
+        require_writable_mcp_server(state, &target_name)?;
+        let server = cfg
+            .servers
+            .get_mut(&target_name)
+            .ok_or_else(|| ApiError::not_found("MCP server not found"))?;
+        server.enabled = false;
+        server.disabled = true;
+        Ok(())
+    })
+    .await?;
 
     // Invalidate the in-memory pool so the disabled server is excluded next time.
     {
@@ -3873,47 +4655,50 @@ async fn disable_mcp_server(
     }
 
     Ok(Json(McpServerActionReceipt {
+        revision: Some(revision),
         name,
         action: "disabled",
         ok: true,
+        connection: None,
     }))
 }
 
-/// `POST /v1/apps/mcp/servers/{name}/reconnect` — drop the cached pool entry
-/// for this server so it re-initializes on the next call that needs tools.
+/// `POST /v1/apps/mcp/servers/{name}/reconnect` — retry only this server and
+/// return the actual result without replacing healthy sibling connections.
 async fn reconnect_mcp_server(
     State(state): State<RuntimeApiState>,
     Path(name): Path<String>,
 ) -> Result<Json<McpServerActionReceipt>, ApiError> {
-    // Verify the server exists in the config.
-    let mcp_config_path = state.config.read().mcp_config_path();
-    let plugin_registry = state
-        .plugin_discovery
-        .registry_for_workspace(&state.workspace);
-    let config = crate::mcp::load_config_with_workspace_and_plugins(
-        &mcp_config_path,
-        &state.workspace,
-        plugin_registry.as_ref(),
-    )
-    .map_err(|e| ApiError::internal(format!("Failed to load MCP config: {e}")))?;
-
+    let (config, _) = mcp_management_config(&state)?;
     if !config.servers.contains_key(&name) {
         return Err(ApiError::not_found(format!(
             "MCP server '{name}' not found"
         )));
     }
-
-    // Drop the whole pool so the next connect_all call recreates all
-    // connections from the current on-disk config.
-    {
-        let mut pool_slot = state.mcp_pool.lock().await;
-        *pool_slot = None;
-    }
-
+    let handle = mcp_pool_handle(&state, true)
+        .await?
+        .ok_or_else(|| ApiError::internal("MCP pool unavailable"))?;
+    let mut pool = handle.lock().await;
+    let error = if !config.servers[&name].is_enabled() {
+        Some(anyhow::anyhow!("MCP server '{name}' is disabled"))
+    } else if !pool.config_matches(&config) {
+        Some(anyhow::anyhow!(
+            "MCP configuration changed; reload it before retrying this server"
+        ))
+    } else {
+        pool.retry_connection(&name).await.err()
+    };
+    let connection = mcp_connection_outcome(&pool, &name, error.as_ref());
     Ok(Json(McpServerActionReceipt {
+        revision: None,
         name,
-        action: "reconnect_scheduled",
-        ok: true,
+        action: if error.is_none() {
+            "reconnected"
+        } else {
+            "reconnect_failed"
+        },
+        ok: error.is_none() && connection.connected,
+        connection: Some(connection),
     }))
 }
 
@@ -3948,6 +4733,18 @@ fn mcp_server_config_from_write_request(
         runtime_added: false,
         allow_private_network: false,
     }
+}
+
+/// Nonsecret indicator and retargeting guard. Treat environment and OAuth
+/// configuration as authority even when it only references a credential.
+fn mcp_credential_configured(cfg: &crate::mcp::McpServerConfig) -> bool {
+    !cfg.env.is_empty()
+        || !cfg.headers.is_empty()
+        || !cfg.env_headers.is_empty()
+        || cfg.bearer_token_env_var.is_some()
+        || cfg.oauth.is_some()
+        || !cfg.scopes.is_empty()
+        || cfg.oauth_resource.is_some()
 }
 
 /// Apply a partial update from a PATCH request onto an existing config entry.
@@ -4431,7 +5228,12 @@ async fn update_thread(
 ) -> Result<Json<ThreadRecord>, ApiError> {
     let thread = state
         .runtime_threads
-        .update_thread(&id, req)
+        .update_thread_with_shell_policy(
+            &id,
+            req,
+            state.config_path.as_deref(),
+            state.config_profile.as_deref(),
+        )
         .await
         .map_err(map_thread_err)?;
     Ok(Json(thread))
@@ -4976,9 +5778,9 @@ async fn start_thread_turn(
     Path(id): Path<String>,
     Json(req): Json<StartTurnRequest>,
 ) -> Result<(StatusCode, Json<StartTurnResponse>), ApiError> {
-    let turn = state
+    let (turn, replayed) = state
         .runtime_threads
-        .start_turn(&id, req)
+        .start_turn_reporting_replay(&id, req)
         .await
         .map_err(map_thread_err)?;
     let thread = state
@@ -4986,9 +5788,22 @@ async fn start_thread_turn(
         .get_thread(&id)
         .await
         .map_err(map_thread_err)?;
+    // A replay acknowledges work already accepted rather than admitting new
+    // work: 200 tells the client "this is the turn I already started", which
+    // is what lets an ambiguous submit resolve without duplicate messages or
+    // tools. A fresh admission stays 201.
+    let status = if replayed {
+        StatusCode::OK
+    } else {
+        StatusCode::CREATED
+    };
     Ok((
-        StatusCode::CREATED,
-        Json(StartTurnResponse { thread, turn }),
+        status,
+        Json(StartTurnResponse {
+            thread,
+            turn,
+            idempotent_replay: replayed,
+        }),
     ))
 }
 
@@ -5088,6 +5903,23 @@ async fn mark_agent_mail_read(
     Ok(Json(envelope))
 }
 
+/// Withdraw a queued envelope before delivery (#6176). Idempotent: a
+/// re-cancel returns the stored envelope; mail that already left `queued`
+/// is a 409, never silently dropped.
+async fn cancel_agent_mail(
+    State(state): State<RuntimeApiState>,
+    Path((id, message_id)): Path<(String, String)>,
+) -> Result<Json<AgentMailEnvelope>, ApiError> {
+    let message_id = AgentMailMessageId::parse(message_id)
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    let envelope = state
+        .runtime_threads
+        .cancel_agent_mail(&id, &message_id)
+        .await
+        .map_err(map_agent_mail_err)?;
+    Ok(Json(envelope))
+}
+
 async fn steer_thread_turn(
     State(state): State<RuntimeApiState>,
     Path((id, turn_id)): Path<(String, String)>,
@@ -5154,7 +5986,11 @@ async fn compact_thread(
         .map_err(map_thread_err)?;
     Ok((
         StatusCode::ACCEPTED,
-        Json(StartTurnResponse { thread, turn }),
+        Json(StartTurnResponse {
+            thread,
+            turn,
+            idempotent_replay: false,
+        }),
     ))
 }
 
@@ -5435,12 +6271,21 @@ async fn stream_thread_events(
     State(state): State<RuntimeApiState>,
     Path(id): Path<String>,
     Query(query): Query<ThreadEventsQuery>,
+    headers: HeaderMap,
 ) -> Result<Response, ApiError> {
     let _ = state
         .runtime_threads
         .get_thread(&id)
         .await
         .map_err(map_thread_err)?;
+
+    // Two clients, two cursors. A browser `EventSource` can only replay through
+    // the `Last-Event-ID` header it sets on reconnect (the ids now ride the
+    // journal frames below); every other client passes `since_seq`. An explicit
+    // query cursor wins over the header, so a deliberate replay-from-zero is
+    // never silently overridden by a stale header — the header is the fallback
+    // when no cursor was asked for.
+    let since_seq = query.since_seq.or_else(|| last_event_id(&headers));
 
     // Subscribe before reading durable history. An event emitted while replay
     // is loaded is then present in both places (and deduped below) or queued
@@ -5456,7 +6301,7 @@ async fn stream_thread_events(
     }
     let replay = state
         .runtime_threads
-        .replay_events(&id, query.since_seq, query.replay_limit)
+        .replay_events(&id, since_seq, query.replay_limit)
         .await
         .map_err(|e| ApiError::internal(e.to_string()))?;
 
@@ -5529,7 +6374,8 @@ fn replay_live_thread_events(
                 yield Ok(sse_json(
                     &event_name,
                     runtime_event_payload_with_previous(event, previous_seq),
-                ));
+                )
+                .id(last_seq.to_string()));
             }
         }
 
@@ -5563,7 +6409,8 @@ fn replay_live_thread_events(
                     yield Ok(sse_json(
                         &event_name,
                         runtime_event_payload_with_previous(event, previous_seq),
-                    ));
+                    )
+                    .id(last_seq.to_string()));
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
                     if progress {
@@ -5613,7 +6460,8 @@ fn replay_live_thread_events(
                             yield Ok(sse_json(
                                 &event_name,
                                 runtime_event_payload_with_previous(event, previous_seq),
-                            ));
+                            )
+                            .id(last_seq.to_string()));
                         }
                     }
                 }
@@ -6155,6 +7003,19 @@ fn sse_json(event: &str, payload: serde_json::Value) -> SseEvent {
     SseEvent::default().event(event).data(data)
 }
 
+/// Read a `Last-Event-ID` cursor off the request.
+///
+/// Only a decimal sequence number is ours. Anything else is ignored rather
+/// than rejected: an opaque id from a proxy or an older client should start
+/// the stream from the durable head, not fail to open it — a refused stream
+/// looks like an outage to a reconnecting client.
+fn last_event_id(headers: &HeaderMap) -> Option<u64> {
+    headers
+        .get("last-event-id")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+}
+
 fn truncate_text(text: &str, max_chars: usize) -> String {
     let char_count = text.chars().count();
     if char_count <= max_chars {
@@ -6425,6 +7286,24 @@ struct ProviderEntry {
     /// variable, consent-source, or token metadata.
     #[serde(rename = "credentialState")]
     credential_state: ProviderCredentialState,
+    /// Which *class* of source owns this route's credential (#6179). A class,
+    /// never a value, a path, or an environment variable name — the guarantee
+    /// above still holds. Clients need it to tell "you have no key" apart from
+    /// "your key is owned elsewhere and this control cannot change it".
+    #[serde(rename = "credentialSource")]
+    credential_source: secrets::ProviderCredentialSource,
+    /// Whether `PUT`/`DELETE /v1/providers/{id}/key` will act on this route.
+    /// False means the write would be refused, so the control should be
+    /// disabled rather than allowed to fail late.
+    #[serde(rename = "credentialWritable")]
+    credential_writable: bool,
+    /// Why a write is refused, as user-facing copy. Present only when
+    /// `credentialWritable` is false.
+    #[serde(
+        rename = "credentialWritableReason",
+        skip_serializing_if = "Option::is_none"
+    )]
+    credential_writable_reason: Option<&'static str>,
 }
 
 /// Stable, non-secret wire projection of provider readiness.
@@ -6981,40 +7860,54 @@ pub(crate) fn runtime_chat_relay_catalog(
 async fn list_providers(
     State(state): State<RuntimeApiState>,
 ) -> Result<Json<ProvidersResponse>, ApiError> {
-    let config = state.config.read().clone();
-    let active_provider = config.api_provider();
-    let active_identity = config
-        .active_provider_identity(active_provider)
-        .map_err(ApiError::bad_request)?;
-    let current = active_provider.as_str().to_string();
-    let mut providers = Vec::new();
-    for api_provider in ApiProvider::sorted_for_display() {
-        let default_model = provider_default_model_for_api(&config, active_provider, api_provider);
-        let identity = config.provider_identity_for(api_provider);
-        let base_url = config.base_url_for_route_identity(api_provider, &identity);
-        let has_model_catalog = !crate::provider_lake::configured_catalog_models_for_route(
-            &config,
-            api_provider,
-            &identity,
-            &base_url,
-        )
-        .is_empty();
-        providers.push(ProviderEntry {
-            id: api_provider.as_str().to_string(),
-            model_provider_id: (api_provider == active_provider)
-                .then(|| active_identity.persisted_id().map(str::to_string))
-                .flatten(),
-            display_name: api_provider.display_name().to_string(),
-            default_model,
-            has_model_catalog,
-            credential_state: crate::provider_readiness::credential_state_for_provider(
+    #[cfg(test)]
+    let env_ticket = crate::test_support::env_scope_ticket();
+    tokio::task::spawn_blocking(move || {
+        #[cfg(test)]
+        let _membership = crate::test_support::join_env_scope(env_ticket);
+        let config = state.config.read().clone();
+        secrets::invalidate_stale_account_catalog(&config);
+        let active_provider = config.api_provider();
+        let active_identity = config
+            .active_provider_identity(active_provider)
+            .map_err(ApiError::bad_request)?;
+        let current = active_provider.as_str().to_string();
+        let mut providers = Vec::new();
+        for api_provider in ApiProvider::sorted_for_display() {
+            let default_model =
+                provider_default_model_for_api(&config, active_provider, api_provider);
+            let identity = config.provider_identity_for(api_provider);
+            let base_url = config.base_url_for_route_identity(api_provider, &identity);
+            let has_model_catalog = !crate::provider_lake::configured_catalog_models_for_route(
                 &config,
                 api_provider,
+                &identity,
+                &base_url,
             )
-            .into(),
-        });
-    }
-    Ok(Json(ProvidersResponse { current, providers }))
+            .is_empty();
+            let writeability = secrets::credential_writeability(&config, api_provider);
+            providers.push(ProviderEntry {
+                id: api_provider.as_str().to_string(),
+                model_provider_id: (api_provider == active_provider)
+                    .then(|| active_identity.persisted_id().map(str::to_string))
+                    .flatten(),
+                display_name: api_provider.display_name().to_string(),
+                default_model,
+                has_model_catalog,
+                credential_state: crate::provider_readiness::credential_state_for_provider(
+                    &config,
+                    api_provider,
+                )
+                .into(),
+                credential_source: writeability.source,
+                credential_writable: writeability.writable,
+                credential_writable_reason: writeability.reason,
+            });
+        }
+        Ok(Json(ProvidersResponse { current, providers }))
+    })
+    .await
+    .map_err(|_| ApiError::internal("Provider listing failed"))?
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -7033,13 +7926,12 @@ struct ListProviderModelsParams {
     limit: Option<usize>,
 }
 
-async fn list_provider_models(
-    State(state): State<RuntimeApiState>,
-    Path(id): Path<String>,
-    Query(params): Query<ListProviderModelsParams>,
-) -> Result<Json<ProviderModelsResponse>, ApiError> {
-    let mut config = state.config.read().clone();
-    let api_provider = ApiProvider::parse(&id)
+fn provider_models_identity(
+    config: &Config,
+    id: &str,
+    exact_id: Option<&str>,
+) -> Result<(ApiProvider, Option<crate::config::ProviderIdentity>), ApiError> {
+    let api_provider = ApiProvider::parse(id)
         .ok_or_else(|| ApiError::bad_request(format!("Unknown provider id '{id}'")))?;
     // Reject requests for the legacy deepseek-cn alias that has no
     // ProviderKind metadata — the GUI should use `deepseek` instead.
@@ -7048,7 +7940,7 @@ async fn list_provider_models(
             "provider 'deepseek-cn' is a legacy alias; use 'deepseek' instead",
         ));
     }
-    let route_fingerprint = if let Some(exact_id) = params.model_provider_id.as_deref() {
+    let identity = if let Some(exact_id) = exact_id {
         if exact_id.is_empty()
             || exact_id != exact_id.trim()
             || exact_id.chars().any(char::is_control)
@@ -7065,26 +7957,84 @@ async fn list_provider_models(
                 "model_provider_id does not match this provider route",
             ));
         }
-        config.scope_to_provider_identity(&identity);
-        // Do not expose the endpoint in an opaque cursor. Its hash binds even
-        // identical catalogs under distinct named routes or a changed base URL.
-        let route = serde_json::to_vec(&(
-            api_provider.as_str(),
-            exact_id,
-            config.base_url_for_route_identity(api_provider, &identity.key),
-        ))
-        .map_err(|error| {
-            ApiError::internal(format!("Could not fingerprint provider route: {error}"))
-        })?;
-        Some(crate::hashing::sha256_hex(route))
+        Some(identity)
     } else {
         None
     };
-    let models = provider_models_for_api(&config, config.api_provider(), api_provider)
-        .into_iter()
-        .map(|id| provider_model_entry_for_api(&config, api_provider, id))
-        .collect();
-    paginate_provider_models(api_provider.as_str(), models, &params, route_fingerprint).map(Json)
+    Ok((api_provider, identity))
+}
+
+async fn list_provider_models(
+    State(state): State<RuntimeApiState>,
+    Path(id): Path<String>,
+    Query(params): Query<ListProviderModelsParams>,
+) -> Result<Json<ProviderModelsResponse>, ApiError> {
+    #[cfg(test)]
+    let env_ticket = crate::test_support::env_scope_ticket();
+    tokio::task::spawn_blocking(move || {
+        #[cfg(test)]
+        let _membership = crate::test_support::join_env_scope(env_ticket);
+        let mut config = state.config.read().clone();
+        secrets::invalidate_stale_account_catalog(&config);
+        let (api_provider, identity) =
+            provider_models_identity(&config, &id, params.model_provider_id.as_deref())?;
+        let route_fingerprint = if let Some(identity) = identity {
+            config.scope_to_provider_identity(&identity);
+            let route = serde_json::to_vec(&(
+                api_provider.as_str(),
+                params.model_provider_id.as_deref(),
+                config.base_url_for_route_identity(api_provider, &identity.key),
+            ))
+            .map_err(|error| {
+                ApiError::internal(format!("Could not fingerprint provider route: {error}"))
+            })?;
+            Some(crate::hashing::sha256_hex(route))
+        } else {
+            None
+        };
+        let models = provider_models_for_api(&config, config.api_provider(), api_provider)
+            .into_iter()
+            .map(|id| provider_model_entry_for_api(&config, api_provider, id))
+            .collect();
+        paginate_provider_models(api_provider.as_str(), models, &params, route_fingerprint)
+            .map(Json)
+    })
+    .await
+    .map_err(|_| ApiError::internal("Provider model listing failed"))?
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RefreshProviderModelsParams {
+    model_provider_id: Option<String>,
+}
+
+async fn refresh_provider_models(
+    State(state): State<RuntimeApiState>,
+    Path(id): Path<String>,
+    Query(params): Query<RefreshProviderModelsParams>,
+) -> Result<Json<crate::provider_lake::CatalogUpdateReceipt>, ApiError> {
+    let runtime = tokio::runtime::Handle::current();
+    #[cfg(test)]
+    let env_ticket = crate::test_support::env_scope_ticket();
+    tokio::task::spawn_blocking(move || {
+        #[cfg(test)]
+        let _membership = crate::test_support::join_env_scope(env_ticket);
+        let config = state.config.read().clone();
+        let (provider, exact) =
+            provider_models_identity(&config, &id, params.model_provider_id.as_deref())?;
+        let identity = match exact {
+            Some(identity) => identity,
+            None => config
+                .active_provider_identity(provider)
+                .map_err(ApiError::bad_request)?,
+        };
+        Ok(Json(runtime.block_on(
+            crate::provider_lake::update_provider_catalog(&config, &identity),
+        )))
+    })
+    .await
+    .map_err(|_| ApiError::internal("Provider model refresh failed"))?
 }
 
 /// Request body for `POST /v1/providers/{id}/switch`.
@@ -7207,8 +8157,9 @@ async fn switch_provider(
     // swap in the new config. A failure here means an active thread's
     // route is invalid under the new provider — surface it so the GUI can
     // tell the user to fix their config.
-    let reloaded = Config::load(state.config_path.clone(), state.config_profile.as_deref())
+    let mut reloaded = Config::load(state.config_path.clone(), state.config_profile.as_deref())
         .map_err(|e| ApiError::internal(format!("Failed to reload config: {e}")))?;
+    reloaded.account_model_access = state.config.read().account_model_access.clone();
     state
         .runtime_threads
         .reload_config(reloaded.clone())
@@ -7296,6 +8247,9 @@ struct GuiConfigResponse {
     strict_tool_mode: bool,
     memory_enabled: bool,
     search_provider: String,
+    /// How `search_provider` was chosen: `default` / `config` /
+    /// `env override` / `tavily key`. Runtime-only — never persisted.
+    search_provider_source: String,
     prompt_suggestion: bool,
     /// Effective device settings, using the same leaf vocabulary as CLI/TUI.
     notifications: std::collections::BTreeMap<String, String>,
@@ -7376,7 +8330,7 @@ async fn get_config(
     let mut deepseek_config = config.clone();
     deepseek_config.scope_to_provider_identity(&identity);
     let default_model = deepseek_config.default_model();
-    let base_url = config.deepseek_base_url().to_string();
+    let base_url = config.active_route_base_url().to_string();
 
     Ok(Json(GuiConfigResponse {
         model,
@@ -7410,6 +8364,11 @@ async fn get_config(
         strict_tool_mode: config.strict_tool_mode.unwrap_or(false),
         memory_enabled: config.memory_enabled(),
         search_provider: config.search_provider().as_str().to_string(),
+        search_provider_source: config
+            .search_provider_resolution()
+            .source
+            .as_str()
+            .to_string(),
         prompt_suggestion: config.prompt_suggestion_enabled(),
         notifications: codewhale_config::notifications::NotificationSetting::ALL
             .into_iter()
@@ -7538,7 +8497,7 @@ async fn set_config(
             }
             "base_url" => config_persistence::persist_root_string_key(
                 config_path,
-                "deepseek_base_url",
+                "active_route_base_url",
                 &value,
             ),
             "provider" => {
@@ -7663,6 +8622,34 @@ async fn set_config(
             }
             "search_provider" => {
                 let normalized = value.to_lowercase();
+                // GET returns the *resolved* provider. A settings save that
+                // round-trips that value must not turn autodetect (or the
+                // Firecrawl default) into a disk pin — `provider = "firecrawl"`
+                // would flip the source to `config` and permanently block a
+                // later Tavily key. A POST that differs from the resolved
+                // provider is an explicit change and still persists.
+                let resolution = state.config.read().search_provider_resolution();
+                let posted = crate::config::SearchProvider::parse(&normalized);
+                if posted == Some(resolution.provider)
+                    && matches!(
+                        resolution.source,
+                        crate::config::SearchProviderSource::Default
+                            | crate::config::SearchProviderSource::TavilyKey
+                    )
+                {
+                    return Ok(Json(SetConfigResponse {
+                        key,
+                        value,
+                        message: format!(
+                            "Config not persisted: '{}' is the resolved {} (source: {}), not a pin. Set a different provider, or pin it in config.toml.",
+                            normalized,
+                            resolution.provider.as_str(),
+                            resolution.source.as_str()
+                        ),
+                        persisted: false,
+                        requires_reload: true,
+                    }));
+                }
                 config_persistence::persist_table_string_key(
                     config_path,
                     "search",
@@ -7679,9 +8666,18 @@ async fn set_config(
                 config_persistence::persist_root_bool_key(config_path, "prompt_suggestion", enabled)
             }
             _ => {
-                return Err(ApiError::bad_request(format!(
-                    "Unknown config key '{key}'. Supported keys: model, default_model, reasoning_effort, approval_mode, base_url, provider, provider_url, cost_currency, default_mode, auto_compact, allow_shell, mcp_config_path, show_thinking, thinking_default_expanded, thinking_preview_lines, thinking_highlight, show_tool_details, inline_diffs, locale, max_history, calm_mode, workspace_follow_symlinks, subagents_enabled, subagents_max_depth, sandbox_mode, strict_tool_mode, memory_enabled, search_provider, prompt_suggestion"
-                )));
+                // Every other declared settings.toml key persists through the
+                // shared validator rather than a curated list — the schema
+                // route advertises them, so a known setting must not die
+                // here. Unknown keys still 400 through `Settings::set`.
+                persist_runtime_tui_setting(&key, &value)?;
+                return Ok(Json(SetConfigResponse {
+                    key,
+                    value,
+                    message: "Config persisted. Call /v1/config/reload to apply.".to_string(),
+                    persisted: true,
+                    requires_reload,
+                }));
             }
         };
 
@@ -7703,6 +8699,415 @@ async fn set_config(
         persisted: persist,
         requires_reload,
     }))
+}
+
+/// `GET /v1/settings/schema` — the Engine-declared settings surface.
+///
+/// `codewhale_config::SETTINGS_SCHEMA` is the single declaration table: one
+/// entry per setting with kind, closed value set, default, and placement.
+/// This route projects it for HTTP clients — current values resolved from
+/// the owning store (settings.toml via [`crate::settings::Settings`],
+/// config.toml, or the notifications table), labels and descriptions
+/// resolved through the locale pack. Writes stay on `POST /v1/config`;
+/// this route never invents a value, an option, or a validator.
+#[derive(Debug, Serialize)]
+struct SettingsSchemaResponse {
+    /// Payload version. Additive fields may appear without a bump; clients
+    /// must ignore fields and `kind`/`row` values they do not know.
+    version: u32,
+    tabs: Vec<SettingsSchemaTab>,
+    settings: Vec<SettingsSchemaRow>,
+}
+
+#[derive(Debug, Serialize)]
+struct SettingsSchemaTab {
+    id: String,
+    /// Humanized tab id — tab labels have no message keys in the schema.
+    label: String,
+}
+
+#[derive(Debug, Serialize)]
+struct SettingsSchemaRow {
+    key: &'static str,
+    /// `bool` | `int` | `enum` | `string`. Unknown kinds degrade to a text
+    /// field on the client; writes still validate server-side.
+    kind: &'static str,
+    tab: &'static str,
+    group: &'static str,
+    label: String,
+    description: String,
+    default: &'static str,
+    /// `setting` | `action` | `diagnostic` | `session` — from
+    /// [`codewhale_config::SettingRowKind`].
+    row: &'static str,
+    /// Current value in written-to-disk string form, when a store resolves
+    /// it. Absent for actions, unresolvable diagnostics, and session rows
+    /// the headless runtime cannot read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    value: Option<String>,
+    /// Whether the value is a persisted user choice rather than an
+    /// inherited default. Absent where no store can prove either way.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    persisted: Option<bool>,
+    /// Whether a generic client may offer a write control. Action,
+    /// diagnostic and session rows are never editable through this surface;
+    /// conditional rows (managed policy wins) report false.
+    editable: bool,
+    /// False for the hidden member of a conditional pair — e.g. a
+    /// `managed_*` row when no managed policy applies, or `base_url` when
+    /// the active route reads `provider_url`. Clients should not render
+    /// invisible rows.
+    visible: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    options: Vec<SettingsSchemaOption>,
+}
+
+#[derive(Debug, Serialize)]
+struct SettingsSchemaOption {
+    value: &'static str,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    label: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    description: String,
+}
+
+/// "Turn a schema key or tab id into a title-case label" — the same
+/// humanization the TUI applies to rows declared without a label message.
+fn humanize_schema_key(key: &str) -> String {
+    key.split(['.', '_', '-'])
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            let mut chars = part.chars();
+            let Some(first) = chars.next() else {
+                return String::new();
+            };
+            let mut word = first.to_uppercase().collect::<String>();
+            word.push_str(chars.as_str());
+            word
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// config.toml-owned keys `POST /v1/config` persists through curated arms.
+/// Kept beside `set_config`'s match: a schema Setting row outside this list
+/// and outside `Settings` has no write path and reports `editable: false`.
+const RUNTIME_CONFIG_KEYS: &[&str] = &[
+    "model",
+    "default_model",
+    "reasoning_effort",
+    "approval_mode",
+    "approval_policy",
+    "base_url",
+    "provider",
+    "provider_url",
+    "provider_base_url",
+    "cost_currency",
+    "max_history",
+    "allow_shell",
+    "mcp_config_path",
+    "subagents_enabled",
+    "subagents_max_depth",
+    "sandbox_mode",
+    "strict_tool_mode",
+    "memory_enabled",
+    "search_provider",
+    "prompt_suggestion",
+];
+
+/// A dotted-path lookup over a TOML document — used to decide `persisted`
+/// for config.toml-owned rows without trusting a decorated display string.
+fn toml_value_at_path<'a>(document: &'a toml::Value, segments: &[&str]) -> Option<&'a toml::Value> {
+    let mut current = document;
+    for segment in segments {
+        current = current.as_table()?.get(*segment)?;
+    }
+    Some(current)
+}
+
+async fn get_settings_schema(
+    State(state): State<RuntimeApiState>,
+) -> Result<Json<SettingsSchemaResponse>, ApiError> {
+    use codewhale_config::notifications::NotificationSetting;
+    use codewhale_config::settings_schema::{
+        SettingKind, SettingRowKind, schema_rows, schema_tabs,
+    };
+    use codewhale_localization::{MessageId, resolve_locale, tr, tr_key};
+
+    let config = state.config.read().clone();
+    let settings = crate::settings::Settings::load_persisted().unwrap_or_default();
+    let locale = resolve_locale(&settings.locale);
+    let notifications = config.notifications_config();
+
+    // Conditional pairs share the TUI's rule: exactly one member is shown,
+    // chosen by which store or policy owns the fact right now.
+    let permission_control = config.approval_policy_control(
+        state.config_path.as_deref(),
+        state.config_profile.as_deref(),
+        &state.workspace,
+    );
+    let shell_control = config.allow_shell_control(
+        state.config_path.as_deref(),
+        state.config_profile.as_deref(),
+        &state.workspace,
+    );
+    let base_url_row_key = match config.api_provider() {
+        ApiProvider::Deepseek | ApiProvider::DeepseekCN => "base_url",
+        _ => "provider_url",
+    };
+    let visible = |key: &str| -> bool {
+        match key {
+            "permission_posture" => matches!(
+                permission_control,
+                crate::config::ApprovalPolicyControl::Unset
+            ),
+            "approval_policy" => matches!(
+                permission_control,
+                crate::config::ApprovalPolicyControl::RootConfig
+            ),
+            "managed_approval_policy" => !matches!(
+                permission_control,
+                crate::config::ApprovalPolicyControl::Unset
+                    | crate::config::ApprovalPolicyControl::RootConfig
+            ),
+            "allow_shell" => shell_control.editable_root(),
+            "managed_allow_shell" => !shell_control.editable_root(),
+            "base_url" | "provider_url" => key == base_url_row_key,
+            _ => true,
+        }
+    };
+
+    // Raw config.toml for `persisted` on config-owned rows. A missing or
+    // unparsable file means nothing was persisted there — the live config
+    // still serves defaults through `value`. This is an async axum route, so
+    // the read rides the blocking pool instead of parking a Tokio worker
+    // (#6149).
+    let config_document = match state.config_path.as_deref() {
+        Some(path) => tokio::fs::read_to_string(path)
+            .await
+            .ok()
+            .and_then(|body| toml::from_str::<toml::Value>(&body).ok()),
+        None => None,
+    };
+    let notifications_persisted = |key: &str| -> Option<bool> {
+        let setting = NotificationSetting::parse(key)?;
+        let document = config_document.as_ref()?;
+        Some(
+            toml_value_at_path(document, &setting.segments()).is_some()
+                // Legacy location the loader still honors.
+                || (matches!(setting, NotificationSetting::Condition)
+                    && toml_value_at_path(document, &["tui", "notification_condition"]).is_some()),
+        )
+    };
+
+    let tabs = schema_tabs()
+        .into_iter()
+        .map(|id| SettingsSchemaTab {
+            id: id.to_string(),
+            label: humanize_schema_key(id),
+        })
+        .collect();
+
+    let settings_rows = schema_rows()
+        .map(|def| {
+            let ui = def.ui.as_ref().expect("schema_rows filters on ui");
+            let kind = match def.kind {
+                SettingKind::Bool(_) => "bool",
+                SettingKind::Int => "int",
+                SettingKind::Float => "float",
+                SettingKind::Enum(_) => "enum",
+                SettingKind::String => "string",
+            };
+            let row = match ui.row {
+                SettingRowKind::Setting => "setting",
+                SettingRowKind::Action => "action",
+                SettingRowKind::Diagnostic => "diagnostic",
+                SettingRowKind::Session => "session",
+            };
+            let options = match def.kind {
+                SettingKind::Bool(options) | SettingKind::Enum(options) => options
+                    .iter()
+                    .map(|option| SettingsSchemaOption {
+                        value: option.value,
+                        label: if option.label.is_empty() {
+                            String::new()
+                        } else {
+                            tr_key(locale, option.label).into_owned()
+                        },
+                        description: if option.description.is_empty() {
+                            String::new()
+                        } else {
+                            tr_key(locale, option.description).into_owned()
+                        },
+                    })
+                    .collect(),
+                SettingKind::Int | SettingKind::String | SettingKind::Float => Vec::new(),
+            };
+            // Bool rows with an empty option slice carry the surface's
+            // default on/off labels — emit the bare values so clients can
+            // still build a labeled control.
+            let options = if options.is_empty() && matches!(def.kind, SettingKind::Bool(_)) {
+                vec![
+                    SettingsSchemaOption {
+                        value: "false",
+                        label: tr_key(locale, "ConfigValueOff").into_owned(),
+                        description: String::new(),
+                    },
+                    SettingsSchemaOption {
+                        value: "true",
+                        label: tr_key(locale, "ConfigValueOn").into_owned(),
+                        description: String::new(),
+                    },
+                ]
+            } else {
+                options
+            };
+
+            let notification_owned = NotificationSetting::parse(def.key).is_some();
+            // `Settings::set` is the authority on which keys settings.toml
+            // owns — including `Option` fields whose unset value serializes
+            // to nothing (e.g. permission_posture). The probe reuses the
+            // write validator on the declared default, so `editable` cannot
+            // claim a key the real write path would reject.
+            let settings_writable = crate::settings::Settings::default()
+                .set(def.key, def.default)
+                .is_ok();
+            let (value, persisted) = if notification_owned {
+                let setting = NotificationSetting::parse(def.key).expect("checked above");
+                (
+                    Some(notifications.display(setting)),
+                    notifications_persisted(def.key),
+                )
+            } else if settings_writable {
+                // Effective = the persisted value or the declared default;
+                // `is_set` says which.
+                (
+                    Some(
+                        settings
+                            .value(def.key)
+                            .unwrap_or_else(|| def.default.to_string()),
+                    ),
+                    Some(settings.is_set(def.key)),
+                )
+            } else if let Some(feature_key) = def.key.strip_prefix("features.") {
+                // Feature rows are diagnostics: the effective flag state plus
+                // whether config.toml names the leaf — no decorated phrasing,
+                // the client owns presentation of default-vs-configured.
+                let value = crate::features::FEATURES
+                    .iter()
+                    .find(|spec| spec.key == feature_key)
+                    .map(|spec| config.features().enabled(spec.id).to_string());
+                let persisted = config_document.as_ref().map(|document| {
+                    toml_value_at_path(document, &["features", feature_key]).is_some()
+                });
+                (value, persisted)
+            } else {
+                // Managed-policy receipts name the winning source rather than
+                // a writable value; everything else resolves from config.toml
+                // or stays absent for a diagnostic the runtime cannot read.
+                let managed_value = match def.key {
+                    "managed_approval_policy" => match permission_control {
+                        crate::config::ApprovalPolicyControl::Unset
+                        | crate::config::ApprovalPolicyControl::RootConfig => None,
+                        source => Some(source.label().to_string()),
+                    },
+                    "managed_allow_shell" if !shell_control.editable_root() => Some(format!(
+                        "{} · {}",
+                        config.allow_shell(),
+                        shell_control.label()
+                    )),
+                    _ => None,
+                };
+                (
+                    managed_value.or_else(|| config_schema_value(def.key, &config)),
+                    None,
+                )
+            };
+
+            // `editable` means POST /v1/config accepts the key today:
+            // notifications.* through the namespace branch, settings.toml
+            // keys through the Settings::set fallthrough, and the curated
+            // config.toml arm list. A Setting row without a write path
+            // (e.g. telemetry, which persists through its own notice
+            // module) renders read-only rather than promising a 400. The
+            // endpoint rows stay receipts: writing a live route's base URL
+            // cannot mutate an already-running client, so the TUI marks
+            // them read-only and the schema agrees.
+            let endpoint_receipt = matches!(def.key, "base_url" | "provider_url");
+            // A managed or profile-owned approval policy freezes the
+            // session-level mode switch too, not just the saved row.
+            let session_locked = def.key == "approval_mode"
+                && !matches!(
+                    permission_control,
+                    crate::config::ApprovalPolicyControl::Unset
+                );
+            let editable = !endpoint_receipt
+                && !session_locked
+                && matches!(ui.row, SettingRowKind::Setting | SettingRowKind::Session)
+                && visible(def.key)
+                && (notification_owned
+                    || settings_writable
+                    || RUNTIME_CONFIG_KEYS.contains(&def.key));
+
+            SettingsSchemaRow {
+                key: def.key,
+                kind,
+                tab: ui.tab,
+                group: ui.group,
+                label: if !ui.label.is_empty() {
+                    tr_key(locale, ui.label).into_owned()
+                } else if def.key.starts_with("features.") {
+                    tr(locale, MessageId::ConfigLabelFeaturePrefix).replace(
+                        "{name}",
+                        &humanize_schema_key(def.key.rsplit('.').next().unwrap_or(def.key)),
+                    )
+                } else {
+                    humanize_schema_key(def.key.rsplit('.').next().unwrap_or(def.key))
+                },
+                description: if ui.description.is_empty() {
+                    String::new()
+                } else {
+                    tr_key(locale, ui.description).into_owned()
+                },
+                default: def.default,
+                row,
+                value,
+                persisted,
+                editable,
+                visible: visible(def.key),
+                options,
+            }
+        })
+        .collect();
+
+    Ok(Json(SettingsSchemaResponse {
+        version: 1,
+        tabs,
+        settings: settings_rows,
+    }))
+}
+
+/// Current value of a config.toml-owned schema row, when one resolves
+/// cheaply. Diagnostics that need per-route or credential computation are
+/// omitted rather than approximated.
+fn config_schema_value(key: &str, config: &Config) -> Option<String> {
+    match key {
+        "provider" => Some(config.provider_identity_for(config.api_provider())),
+        "model" => runtime_request_model(config, None).ok(),
+        "approval_policy" => config
+            .approval_policy
+            .clone()
+            .or_else(|| Some("suggest".to_string())),
+        "telemetry" => Some(crate::telemetry_notice::saved_preference_enabled(config).to_string()),
+        "allow_shell" => Some(config.allow_shell().to_string()),
+        "base_url" => Some(config.base_url_for_route(config.api_provider())),
+        "provider_url" => Some(config.base_url_for_route(config.api_provider())),
+        "mcp_config_path" => Some(config.mcp_config_path().display().to_string()),
+        "sandbox_mode" => config.sandbox_mode.clone(),
+        "fleet.exec.max_spawn_depth" => Some(config.subagent_max_spawn_depth().to_string()),
+        "reasoning_effort" => Some(config.reasoning_effort().unwrap_or("auto").to_string()),
+        _ => None,
+    }
 }
 
 fn normalize_runtime_config_model(
@@ -7741,8 +9146,9 @@ fn normalize_runtime_config_model(
 async fn reload_config(
     State(state): State<RuntimeApiState>,
 ) -> Result<Json<ReloadConfigResponse>, ApiError> {
-    let reloaded = Config::load(state.config_path.clone(), state.config_profile.as_deref())
+    let mut reloaded = Config::load(state.config_path.clone(), state.config_profile.as_deref())
         .map_err(|e| ApiError::internal(format!("Failed to reload config: {e}")))?;
+    reloaded.account_model_access = state.config.read().account_model_access.clone();
     state
         .runtime_threads
         .reload_config(reloaded.clone())
@@ -7830,14 +9236,7 @@ struct ClearMemoryQuery {
 /// Mirrors `native_store()` in `commands/groups/memory/memory.rs`.
 fn native_store_for_state(state: &RuntimeApiState) -> crate::native_memory::NativeMemoryStore {
     let memory_path = state.config.read().memory_path();
-    if let Some(store) = crate::native_memory::NativeMemoryStore::from_global_path(&memory_path) {
-        return store;
-    }
-    let root = memory_path
-        .parent()
-        .unwrap_or_else(|| FsPath::new("."))
-        .join("memory");
-    crate::native_memory::NativeMemoryStore::new(root)
+    crate::native_memory::NativeMemoryStore::from_memory_anchor(&memory_path)
 }
 
 /// Derive a scope label from a source path relative to the store root.
@@ -8022,8 +9421,11 @@ async fn create_memory_entry(
     };
     let store = native_store_for_state(&state);
     let root = store.root().to_path_buf();
+    // This endpoint is an authenticated operator surface: the explicit request
+    // is the review, so the entry lands active — matching the Lens remember
+    // action. Model-reachable capture stays candidate-only.
     let hit = store
-        .remember(scope, workspace_id.as_deref(), &req.text)
+        .remember_reviewed(scope, workspace_id.as_deref(), &req.text)
         .map_err(|e| ApiError::bad_request(format!("memory create error: {e}")))?;
     let entry = memory_hit_to_record(hit, &root);
     Ok((StatusCode::CREATED, Json(json!({ "entry": entry }))))
@@ -8087,6 +9489,7 @@ fn cors_layer(extra_origins: &[String]) -> CorsLayer {
             header::AUTHORIZATION,
             header::CONTENT_TYPE,
             header::ACCEPT,
+            header::IF_MATCH,
             HeaderName::from_static("x-codewhale-runtime-token"),
             HeaderName::from_static("x-deepseek-runtime-token"),
         ])
@@ -8119,9 +9522,16 @@ fn map_thread_err(err: anyhow::Error) -> ApiError {
         || lower.starts_with("thread not found:")
     {
         ApiError::not_found(message)
+    } else if message.starts_with("shell commands are restricted by ") {
+        ApiError::forbidden(message)
     } else if message.contains("already has an active turn")
+        || message.contains("thread permissions changed during update")
         || message.contains("No active turn")
         || message.contains("is not active")
+        // A steer the engine dropped: the turn moved on before the model saw
+        // it. 409 lets a client keep the text and resend rather than trust a
+        // delivery that never happened (#6276).
+        || message.contains("moved on before the steer")
         || lower.contains("operation_key is already bound")
         || lower.contains("operation_key binding is incomplete")
         || lower.contains("operation_key binding does not match")
@@ -8137,10 +9547,17 @@ fn map_agent_mail_err(err: anyhow::Error) -> ApiError {
     let lower = message.to_ascii_lowercase();
     if lower.contains("ownership denied") {
         ApiError::forbidden(message)
-    } else if lower.contains("already exists with different delivery intent") {
+    } else if lower.contains("already exists with different delivery intent")
+        || lower.contains("can be canceled only while queued")
+    {
         ApiError::conflict(message)
     } else if (lower.contains("failed to read agent mail envelope")
-        && lower.contains("no such file"))
+        && (lower.contains("no such file")
+            || err.chain().skip(1).any(|cause| {
+                cause
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
+            })))
         || (lower.starts_with("thread '") && lower.ends_with("' not found"))
     {
         ApiError::not_found(message)
@@ -8194,6 +9611,13 @@ impl ApiError {
     fn forbidden(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::FORBIDDEN,
+            message: message.into(),
+        }
+    }
+
+    fn payload_too_large(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::PAYLOAD_TOO_LARGE,
             message: message.into(),
         }
     }
@@ -8328,6 +9752,7 @@ base_url = "http://127.0.0.1:9/v1"
             web: None,
             fleet_codewhale_binary: "unused-test-binary".to_string(),
             mcp_pool: Arc::new(Mutex::new(None)),
+            lsp_manager: Arc::new(std::sync::OnceLock::new()),
             compat_stream_test_hook: None,
         };
         let router = build_router(state.clone());

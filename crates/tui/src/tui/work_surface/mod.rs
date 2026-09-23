@@ -64,10 +64,7 @@
 mod input;
 mod interaction;
 mod model;
-pub(crate) mod panels;
 mod render;
-#[allow(dead_code)] // Tideline rail rendering (spec §5a); wired by the landing slice
-pub mod tideline;
 mod views;
 
 pub use input::{cycle_view, enter_agents, handle_key, handle_mouse};
@@ -2921,6 +2918,56 @@ mod tests {
     }
 
     #[test]
+    fn dock_selection_is_readable_and_close_target_stays_inside_small_hosts() {
+        use super::model::DockTabTarget;
+        use ratatui::style::Modifier;
+        for theme_id in codewhale_palette::SELECTABLE_THEMES {
+            let mut app = app();
+            app.ui_theme = theme_id.ui_theme();
+            app.work_surface.explicit_view = true;
+            add_todos(&mut app, 1);
+            let mut terminal = Terminal::new(TestBackend::new(80, 8)).unwrap();
+            terminal
+                .draw(|frame| super::render(frame, frame.area(), &mut app))
+                .unwrap();
+            let tab = app
+                .work_surface
+                .dock_tabs
+                .iter()
+                .find(|tab| tab.target == DockTabTarget::Panel(super::RailPanel::Tasks))
+                .unwrap();
+            let cell = &terminal.backend().buffer()[(tab.area.x + 1, tab.area.y)];
+            assert_eq!(cell.bg, app.ui_theme.selection_bg, "{theme_id:?}");
+            assert!(!cell.modifier.contains(Modifier::REVERSED), "{theme_id:?}");
+            if let Some(ratio) = codewhale_palette::contrast_ratio(cell.fg, cell.bg) {
+                assert!(ratio >= 4.5, "{theme_id:?}: {cell:?} ({ratio})");
+            } else {
+                // Native terminal colors are user supplied and cannot be measured here.
+                assert_eq!(*theme_id, codewhale_palette::ThemeId::Terminal);
+            }
+        }
+        for width in [1, 2, 3, 8, 16, 40, 60, 80] {
+            for placement in [WorkSurfacePlacement::Top, WorkSurfacePlacement::Bottom] {
+                let mut app = app();
+                app.work_surface.explicit_view = true;
+                app.work_surface.effective_placement = placement;
+                let mut terminal = Terminal::new(TestBackend::new(width, 8)).unwrap();
+                terminal
+                    .draw(|frame| super::render(frame, frame.area(), &mut app))
+                    .unwrap();
+                let close = app
+                    .work_surface
+                    .dock_tabs
+                    .iter()
+                    .find(|tab| tab.target == DockTabTarget::Close)
+                    .unwrap();
+                assert!(close.area.right() <= width);
+                assert!(close.area.width > 0);
+            }
+        }
+    }
+
+    #[test]
     fn narrow_dock_drops_counts_before_optional_tabs() {
         let mut app = app();
         add_todos(&mut app, 3);
@@ -2936,13 +2983,13 @@ mod tests {
             .next()
             .expect("dock tab row");
 
-        assert!(first_row.contains("TODO"), "{first_row:?}");
-        assert!(first_row.contains("AGENTS"), "{first_row:?}");
-        assert!(!first_row.contains("TODO 3"), "{first_row:?}");
-        assert!(!first_row.contains("AGENTS 1"), "{first_row:?}");
-        assert!(first_row.contains("CONTEXT"), "{first_row:?}");
+        assert!(first_row.contains("Tasks"), "{first_row:?}");
+        assert!(first_row.contains("Fleet"), "{first_row:?}");
+        assert!(!first_row.contains("Tasks 3"), "{first_row:?}");
+        assert!(!first_row.contains("Fleet 1"), "{first_row:?}");
+        assert!(first_row.contains("Context"), "{first_row:?}");
         // Shed from the right: price goes before any work view.
-        assert!(!first_row.contains("PRICE"), "{first_row:?}");
+        assert!(!first_row.contains("Cost"), "{first_row:?}");
     }
 
     #[test]

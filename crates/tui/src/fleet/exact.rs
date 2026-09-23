@@ -264,7 +264,7 @@ pub(crate) fn preflight_route(
 
     let mut scoped = config.clone();
     scoped.scope_to_provider_identity(&identity);
-    let base_url = scoped.deepseek_base_url();
+    let base_url = scoped.active_route_base_url();
 
     // Locally decided. A concrete loopback/self-hosted route is keyless by
     // design, and that is a valid, first-class state — not a downgrade and
@@ -320,7 +320,7 @@ fn validate_route_client(route: &PreflightedRoute, config: &Config) -> Result<()
     let mut scoped = config.clone();
     let identity = config.resolve_provider_identity(route.provider_config_id())?;
     scoped.scope_to_provider_identity(&identity);
-    crate::client::DeepSeekClient::new(&scoped)
+    crate::client::CodewhaleClient::new(&scoped)
         .map(|_| ())
         .map_err(|error| {
             format!(
@@ -348,7 +348,7 @@ pub(crate) trait FleetRouterCaller: Send + Sync + std::fmt::Debug {
 /// A Reasoning Router bound to its own exact preflighted route.
 #[derive(Clone)]
 pub(crate) struct LiveFleetRouter {
-    client: crate::client::DeepSeekClient,
+    client: crate::client::CodewhaleClient,
     captured: CapturedReasoningRouter,
     route: PreflightedRoute,
     /// The Router route's provider kind and base URL, kept so the call's
@@ -408,9 +408,9 @@ impl LiveFleetRouter {
             })?;
         let mut scoped = config.clone();
         scoped.scope_to_provider_identity(&identity);
-        let base_url = scoped.deepseek_base_url();
+        let base_url = scoped.active_route_base_url();
         let client =
-            crate::client::DeepSeekClient::new(&scoped).map_err(|error| RouterBindError {
+            crate::client::CodewhaleClient::new(&scoped).map_err(|error| RouterBindError {
                 reason: format!(
                     "reasoning router provider `{}` client could not be built: {error}",
                     route.provider_id

@@ -389,6 +389,16 @@ fn resolver_explicit_provider_scoped_model_maps_to_wire_id() {
 fn resolver_routes_only_official_deepseek_flash_over_responses() {
     let resolver = RouteResolver::new();
 
+    let default_flash = resolver
+        .resolve(&req(Some(ProviderKind::Deepseek), Some("deepseek-flash")))
+        .expect("official default Flash route resolves");
+    assert_eq!(default_flash.protocol(), RequestProtocol::Responses);
+    assert_eq!(default_flash.endpoint().endpoint_key, "responses");
+    assert_eq!(
+        default_flash.capabilities().server_side_web_search,
+        CapabilityState::Supported
+    );
+
     let flash = resolver
         .resolve(&req(
             Some(ProviderKind::Deepseek),
@@ -443,6 +453,59 @@ fn resolver_routes_only_official_deepseek_flash_over_responses() {
     assert_eq!(custom.endpoint().endpoint_key, "chat");
     assert_eq!(
         custom.capabilities().server_side_web_search,
+        CapabilityState::Unknown
+    );
+}
+
+#[test]
+fn resolver_sources_deepseek_files_api_only_on_exact_official_flash_routes() {
+    let resolver = RouteResolver::new();
+
+    for model in ["deepseek-flash", "deepseek-v4-flash"] {
+        let route = resolver
+            .resolve(&req(Some(ProviderKind::Deepseek), Some(model)))
+            .expect("official Flash route resolves");
+        assert_eq!(
+            route.capabilities().files_api,
+            CapabilityState::Supported,
+            "{model}"
+        );
+    }
+
+    for model in [
+        "deepseek-v4-pro",
+        "deepseek-v4-flash-vision-exp",
+        "deepseek-v5-future",
+    ] {
+        let route = resolver
+            .resolve(&req(Some(ProviderKind::Deepseek), Some(model)))
+            .expect("direct DeepSeek route resolves");
+        assert_eq!(
+            route.capabilities().files_api,
+            CapabilityState::Unknown,
+            "{model} must not inherit the Files API fact"
+        );
+    }
+
+    let custom = resolver
+        .resolve(&RouteRequest {
+            explicit_provider: Some(ProviderKind::Deepseek),
+            model_selector: Some(LogicalModelRef::from("deepseek-flash")),
+            saved_provider_model: None,
+            base_url_override: Some("https://compatible.example/v1".to_string()),
+            limit_overrides: Vec::new(),
+        })
+        .expect("custom compatible endpoint resolves");
+    assert_eq!(custom.capabilities().files_api, CapabilityState::Unknown);
+
+    let aggregator = resolver
+        .resolve(&req(
+            Some(ProviderKind::Openrouter),
+            Some("deepseek/deepseek-v4-flash"),
+        ))
+        .expect("aggregator route resolves");
+    assert_eq!(
+        aggregator.capabilities().files_api,
         CapabilityState::Unknown
     );
 }
@@ -615,7 +678,8 @@ fn resolver_auto_is_sentinel_not_literal_model() {
     assert!(out.logical_model().is_auto());
     // ...and "auto" is NOT put on the wire as a literal model.
     assert_ne!(out.wire_model_id().as_str(), "auto");
-    assert_eq!(out.wire_model_id().as_str(), "deepseek-v4-pro");
+    assert_eq!(out.wire_model_id().as_str(), "deepseek-flash");
+    assert_eq!(out.protocol(), RequestProtocol::Responses);
 }
 
 #[test]
@@ -1420,7 +1484,8 @@ fn resolver_deepseek_none_selector_uses_default_wire_id() {
         .resolve(&req(Some(ProviderKind::Deepseek), None))
         .expect("none selector should use provider default");
     assert_eq!(out.provider_kind(), ProviderKind::Deepseek);
-    assert_eq!(out.wire_model_id().as_str(), "deepseek-v4-pro");
+    assert_eq!(out.wire_model_id().as_str(), "deepseek-flash");
+    assert_eq!(out.protocol(), RequestProtocol::Responses);
 }
 
 #[test]

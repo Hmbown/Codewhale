@@ -12,6 +12,46 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use super::app::{App, looks_like_slash_command_input};
 use super::paste_burst::CharDecision;
 
+/// Terminals known to deliver `Event::Paste` for a real paste.
+///
+/// `bracketed_paste_seen` alone waits for proof: it only flips after the
+/// person has pasted once, so every session ran the rapid-keystroke
+/// heuristic until then. That heuristic re-arms a ~120 ms Enter-suppression
+/// window on each character, and the composer's send cue honestly reports it
+/// — so the `[↵]` control strobed dim-to-bold once per keystroke while
+/// someone typed at an ordinary pace. Reported from a live session.
+///
+/// Naming the terminals we have verified is deliberately narrower than
+/// trusting `EnableBracketedPaste` to have succeeded: `execute!` returning
+/// `Ok` only means the escape was written, not that the terminal honors it,
+/// and a terminal that ignores it would submit on a pasted newline. That is
+/// data loss, so the fallback stays for everything not on this list.
+///
+/// Known limitation: a terminal that sets one of these identifiers while
+/// *not* honoring bracketed paste would lose the guard. All four are checked
+/// against their own documented support.
+pub(crate) fn terminal_delivers_bracketed_paste() -> bool {
+    use std::io::IsTerminal;
+
+    // Only a real interactive terminal gets the trust. Under `cargo test`
+    // stdout is captured, so every unit test keeps the heuristic and stays
+    // hermetic regardless of the `TERM_PROGRAM` the developer happens to be
+    // running in — the first version of this read the ambient environment
+    // and broke five paste tests on a Mac running Terminal.app.
+    if !std::io::stdout().is_terminal() {
+        return false;
+    }
+    if std::env::var_os("WT_SESSION").is_some() {
+        return true;
+    }
+    std::env::var("TERM_PROGRAM").is_ok_and(|program| {
+        matches!(
+            program.trim(),
+            "ghostty" | "Ghostty" | "iTerm.app" | "WezTerm" | "Apple_Terminal"
+        )
+    })
+}
+
 /// Process a key in the context of paste-burst detection. Returns `true`
 /// when the key was fully handled by the paste machinery (caller skips
 /// further input handling); `false` when the key still needs the normal
@@ -26,7 +66,7 @@ pub fn handle_paste_burst_key(app: &mut App, key: &KeyEvent, now: Instant) -> bo
     // IME commits / autocomplete on terminals with reliable bracketed
     // paste (the dominant case on iTerm2 / Ghostty / WezTerm / Windows
     // Terminal).
-    if app.bracketed_paste_seen {
+    if app.bracketed_paste_seen || app.bracketed_paste_trusted {
         return false;
     }
 
@@ -133,6 +173,39 @@ fn in_command_context(app: &App) -> bool {
     let mut composite = app.input.clone();
     composite.push_str(&app.paste_burst.held_text());
     looks_like_slash_command_input(&composite)
+}
+
+#[cfg(test)]
+mod bracketed_paste_trust_tests {
+    use super::terminal_delivers_bracketed_paste;
+    use crate::test_support::{EnvVarGuard, lock_test_env};
+
+    /// Under `cargo test` stdout is captured, so the probe refuses to trust
+    /// anything — the heuristic stays on and every existing paste test keeps
+    /// the behaviour it was written against, whatever terminal the developer
+    /// is in. This is the hermeticity the first version of this check broke.
+    #[test]
+    fn a_captured_stdout_is_never_trusted() {
+        let _env = lock_test_env();
+        for program in ["ghostty", "iTerm.app", "WezTerm", "some-new-terminal"] {
+            let _guard = EnvVarGuard::set("TERM_PROGRAM", program);
+            assert!(
+                !terminal_delivers_bracketed_paste(),
+                "{program} must not be trusted without a real terminal"
+            );
+        }
+    }
+
+    #[test]
+    fn windows_terminal_is_trusted_through_its_session_marker() {
+        let _env = lock_test_env();
+        let _program = EnvVarGuard::remove("TERM_PROGRAM");
+        let _wt = EnvVarGuard::set("WT_SESSION", "abc-123");
+        assert!(
+            !terminal_delivers_bracketed_paste(),
+            "still gated on a real terminal, which a test never has"
+        );
+    }
 }
 
 #[cfg(test)]

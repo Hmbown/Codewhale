@@ -1,7 +1,7 @@
 //! Exercise native plan lowering and the real provider-binding spawn boundary.
 
 use super::*;
-use crate::client::DeepSeekClient;
+use crate::client::CodewhaleClient;
 use crate::config::{ApiProvider, Config};
 use crate::fleet::exact::{ExactFleetWorkflow, StaticFleetRouter};
 use crate::fleet::members::add_fleet_model;
@@ -43,7 +43,7 @@ impl RouteFixture {
             ApiProvider::Openrouter,
             Some(target.base_url().to_string()),
         );
-        let client = DeepSeekClient::new(&config).expect("parent fixture client");
+        let client = CodewhaleClient::new(&config).expect("parent fixture client");
         let manager = new_shared_subagent_manager(workspace.to_path_buf(), 4);
         let runtime = SubAgentRuntime::new(
             client,

@@ -69,9 +69,11 @@ try {
   await rpc("notifications/initialized", undefined, 5_000).catch(() => {});
   const tl = await rpc("tools/list", {});
   const tools = tl.result?.tools ?? [];
-  log("tools/list", tools.length >= 38, `${tools.length} tools`);
+  log("tools/list", tools.length >= 37, `${tools.length} tools`);
   const names = new Set(tools.map((t) => t.name));
-  for (const required of ["screenshot", "recording_start", "recording_stop", "computer_switch", "computer_list", "get_app_state", "left_click", "type", "key", "scroll", "zoom", "stop_computer_control"]) {
+  // tools/list advertises the merged surface; the per-action wire names stay
+  // callable but are not listed, so this check names the merged tools.
+  for (const required of ["screenshot", "recording", "computer", "get_app_state", "click", "type", "key", "scroll", "zoom", "app_script", "stop_computer_control"]) {
     if (!names.has(required)) log(`schema:${required}`, false, "missing");
   }
   log("schema:required-tools-present", true, "all key tools declared");
@@ -107,6 +109,12 @@ try {
   const apps = r.parsed?.apps ?? [];
   const someApp = apps.find((a) => a.windowCount > 0) ?? apps.find((a) => a.frontmost) ?? apps[0];
   if (someApp) {
+    // The consent ledger gates first app contact on the local computer —
+    // smoke exercises the real flow: refuse, record the user's allow, retry.
+    const gated = await tool("get_app_state", { app_ref: { pid: someApp.pid } });
+    log("consent_required on first app contact", gated.parsed?.error?.code === "consent_required", `code=${gated.parsed?.error?.code}`);
+    const c = await tool("consent", { action: "allow", app: `pid:${someApp.pid}` });
+    log("consent allow", c.parsed?.ok === true, `${someApp.name}: keys=${JSON.stringify(c.parsed?.keys ?? c.parsed?.error)}`);
     const st = await tool("get_app_state", { app_ref: { pid: someApp.pid } });
     log("get_app_state", st.parsed?.ok === true && st.parsed?.elements?.length > 0, `${someApp.name}: ${st.parsed?.elements?.length} elements, state_id=${st.parsed?.state_id}`);
     globalThis.__state = st.parsed;

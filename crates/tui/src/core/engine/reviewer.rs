@@ -333,7 +333,7 @@ mod tests {
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
         let server = MockServer::start().await;
-        let client = crate::client::DeepSeekClient::new(&crate::config::Config {
+        let client = crate::client::CodewhaleClient::new(&crate::config::Config {
             api_key: Some("test-guardian-cache-key".to_string()),
             base_url: Some(server.uri()),
             ..Default::default()

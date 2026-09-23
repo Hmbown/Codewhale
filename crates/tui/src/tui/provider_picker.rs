@@ -47,18 +47,18 @@ use crate::provider_readiness::{
     credential_state_for_provider, route_identity_for_model,
 };
 use crate::reasoning_preference::ReasoningEffort;
+use crate::tui::list_nav::{self, Motion};
 use crate::tui::menu_style;
 use crate::tui::views::{
     ActionHint, EmptyState, ListDetailLayout, ModalKind, ModalView, ViewAction, ViewEvent,
-    centered_modal_area, render_modal_footer, render_modal_surface,
+    centered_modal_area, render_modal_footer, render_modal_surface, render_underwater_surface,
 };
 use codewhale_config::catalog::{CatalogOffering, CatalogSnapshot};
+use codewhale_config::descriptors::{
+    ProviderDescriptor, bundled_provider_descriptors, provider_descriptor,
+};
 use codewhale_config::provider::{CredentialAcquisition, WireFormat};
 use codewhale_config::route::{PricingSku, RequestProtocol};
-use codewhale_config::{
-    AGNES_TEMPLATE_ID, ProviderSetupApply, ProviderSetupTemplate, SENSENOVA_TEMPLATE_ID,
-    provider_setup_template, provider_setup_templates,
-};
 use codewhale_localization::{Locale, MessageId, tr};
 use codewhale_palette as palette;
 use serde_json::Value;
@@ -71,6 +71,10 @@ const DS4_BASE_URL: &str = "http://127.0.0.1:8000/v1";
 const DS4_DEFAULT_MODEL: &str = "deepseek-v4-flash";
 const LM_STUDIO_PROVIDER_ID: &str = "lm_studio";
 const LM_STUDIO_BASE_URL: &str = "http://127.0.0.1:1234/v1";
+/// Rows a PageUp/PageDown travels in the provider lists. Both views are
+/// short modal surfaces; a page is a readable jump, not a screenful measured
+/// at paint time — the same rule as `fleet_detail`'s page constant.
+const PROVIDER_PAGE: usize = 10;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Stage {
@@ -99,8 +103,6 @@ enum Stage {
     /// Confirmation summary before any secret or model is persisted (#3875).
     Confirm,
     CustomForm,
-    /// Beginner template catalog (#5350).
-    TemplateList,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -190,6 +192,8 @@ pub struct ProviderPickerView {
     /// available from `/provider` after onboarding.
     onboarding_mode: bool,
     query: String,
+    /// Explicit search keeps provider names from invoking legacy letter actions.
+    search_mode: bool,
     api_key_input: String,
     /// An error surfaced after a failed key verification, shown inline
     /// in the key-entry stage. Cleared when the user edits the input.
@@ -220,15 +224,19 @@ pub struct ProviderPickerView {
     custom_provider_base_url: String,
     custom_provider_model: String,
     custom_provider_api_key_env: String,
-    template_selected_idx: usize,
-    template_row_hitboxes: RefCell<Vec<(Rect, usize)>>,
-    last_template_mouse_selected: Option<usize>,
     /// Pointer geometry for the two-pane picker (Slice D): provider-strip
     /// rows on the left, model rows on the right/under, recorded during
-    /// render like the template hitboxes above.
+    /// render like the consent hitboxes below.
     list_row_hitboxes: RefCell<Vec<(Rect, usize)>>,
     model_row_hitboxes: RefCell<Vec<(Rect, usize)>>,
     consent_row_hitboxes: RefCell<Vec<(Rect, usize)>>,
+    choice_row_hitboxes: RefCell<Vec<(Rect, char)>>,
+    detail_action_hitbox: RefCell<Option<Rect>>,
+    catalog_action_hitbox: RefCell<Option<Rect>>,
+    catalog_action_hovered: bool,
+    detail_action_hovered: bool,
+    hovered_choice: Option<char>,
+    last_choice_mouse_selected: Option<(Stage, char)>,
     /// Pointer hover positions. Advisory only — hover never moves the
     /// keyboard selection; it renders with the shared
     /// [`crate::tui::menu_style::hovered_row_style`] primitive.
@@ -239,7 +247,6 @@ pub struct ProviderPickerView {
     /// double-click-activate rhythm (mirrors the model picker).
     last_list_mouse_selected: Option<usize>,
     last_model_mouse_selected: Option<usize>,
-    hovered_template_idx: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -281,11 +288,6 @@ pub struct ProviderDashboardRow {
     /// optional — that would clutter the default view with every untouched
     /// local-provider slot.
     pub is_configured: bool,
-    /// The setup template this row stands in for: a compatible host the
-    /// operator has not configured yet (Baseten, Groq, Cerebras, ...).
-    /// Activating such a row opens the custom-provider form pre-filled from
-    /// the template instead of a key prompt for a route that does not exist.
-    pub template_id: Option<&'static str>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -681,7 +683,6 @@ impl ProviderDashboardRow {
                     configured,
                     provider == ApiProvider::Custom && provider_id_override.is_some(),
                 ),
-                template_id: None,
             };
         };
 
@@ -901,7 +902,6 @@ impl ProviderDashboardRow {
                 configured,
                 provider == ApiProvider::Custom && provider_id_override.is_some(),
             ),
-            template_id: None,
         }
     }
 
@@ -942,10 +942,13 @@ impl ProviderDashboardRow {
     /// repeats. One owner so the renderer and the tests cannot disagree about
     /// what a provider's state reads as.
     fn detail_state_line(&self) -> String {
+        let auth = match self.auth_status {
+            ProviderAuthStatus::Missing | ProviderAuthStatus::Configured => String::new(),
+            status => format!(" | {}", status.label()),
+        };
         format!(
-            "{} | {} | {}{}",
+            "{}{auth} | {}{}",
             self.readiness.label(),
-            self.auth_status.label(),
             self.catalog_label(),
             self.maturity
                 .tag()
@@ -1168,7 +1171,7 @@ fn catalog_freshness_title_suffix() -> &'static str {
 
 fn catalog_freshness_title_suffix_for(freshness: ModelsDevFreshness) -> &'static str {
     match freshness {
-        ModelsDevFreshness::Stale => " · stale",
+        ModelsDevFreshness::Stale => " · cached catalog",
         // A failed optional refresh keeps prior or bundled rows available.
         // Say what the picker is using instead of implying the catalog broke.
         ModelsDevFreshness::Failed => " · refresh failed; catalog available",
@@ -1718,7 +1721,7 @@ impl ProviderPickerView {
             })
             .collect();
         rows.extend(custom_rows);
-        rows.extend(template_dashboard_rows(active, config, runtime_status));
+        rows.extend(descriptor_dashboard_rows(active, config, runtime_status));
         // Providers you have configured lead; the rest of the catalog follows
         // alphabetically. Founder live-test: "we should also make that list
         // ordered logically so like the ones you have configured at the top
@@ -1757,6 +1760,7 @@ impl ProviderPickerView {
             setup_mode: false,
             onboarding_mode: false,
             query: String::new(),
+            search_mode: false,
             api_key_input: String::new(),
             key_entry_error: None,
             locale: Locale::En,
@@ -1777,18 +1781,21 @@ impl ProviderPickerView {
             custom_provider_base_url: String::new(),
             custom_provider_model: String::new(),
             custom_provider_api_key_env: String::new(),
-            template_selected_idx: 0,
-            template_row_hitboxes: RefCell::new(Vec::new()),
-            last_template_mouse_selected: None,
             list_row_hitboxes: RefCell::new(Vec::new()),
             model_row_hitboxes: RefCell::new(Vec::new()),
             consent_row_hitboxes: RefCell::new(Vec::new()),
+            choice_row_hitboxes: RefCell::new(Vec::new()),
+            detail_action_hitbox: RefCell::new(None),
+            catalog_action_hitbox: RefCell::new(None),
+            catalog_action_hovered: false,
+            detail_action_hovered: false,
+            hovered_choice: None,
+            last_choice_mouse_selected: None,
             hovered_list_idx: None,
             hovered_model_idx: None,
             hovered_consent_idx: None,
             last_list_mouse_selected: None,
             last_model_mouse_selected: None,
-            hovered_template_idx: None,
         };
         picker.restore_memory(memory);
         picker
@@ -1880,35 +1887,6 @@ impl ProviderPickerView {
         picker
     }
 
-    /// Open the beginner template list (`/provider templates`, Settings).
-    #[must_use]
-    pub fn new_for_template_list(
-        active: ApiProvider,
-        config: &Config,
-        runtime_status: Option<ProviderRuntimeStatus>,
-    ) -> Self {
-        let mut picker = Self::new_with_runtime_status(active, config, runtime_status);
-        picker.setup_mode = true;
-        picker.enter_template_list();
-        picker
-    }
-
-    /// Apply one catalog template: first-class key-only setup, compatible
-    /// custom form, or unpublished guidance.
-    #[must_use]
-    pub fn new_for_template_setup(
-        active: ApiProvider,
-        template_id: &str,
-        config: &Config,
-        runtime_status: Option<ProviderRuntimeStatus>,
-    ) -> Option<Self> {
-        let template = provider_setup_template(template_id)?;
-        let mut picker = Self::new_with_runtime_status(active, config, runtime_status);
-        picker.setup_mode = true;
-        picker.apply_template(template);
-        Some(picker)
-    }
-
     /// Open the setup catalog for first-run/recovery onboarding (#4763).
     /// Identical to [`Self::new_for_setup`] except that a missing-auth
     /// `target` is only *focused*: onboarding must show the navigable
@@ -1939,13 +1917,15 @@ impl ProviderPickerView {
         // is opt-in via "explore offline" and the L toggle. A local-first
         // default (introduced 2026-08-15) hid hosted providers behind a
         // keypress, which read as "only local models are supported."
-        let _ = key_entry_for_missing_auth;
         picker.view = ProviderListView::Catalog;
         picker.setup_mode = true;
         if let Some(target) = target
             && let Some(idx) = picker.rows.iter().position(|row| row.provider == target)
         {
             picker.selected_idx = idx;
+            // A provider that already has a key is *focused*, not re-prompted:
+            // `R` is the rekey affordance and the footer advertises it. Only a
+            // provider missing auth drops straight onto its key prompt.
             if key_entry_for_missing_auth && !picker.selected_has_key() {
                 picker.begin_setup();
             }
@@ -2058,6 +2038,63 @@ impl ProviderPickerView {
 
     fn move_up(&mut self) {
         self.move_selection(-1);
+    }
+
+    /// Apply one [`list_nav`] motion to the provider list (#6290).
+    ///
+    /// The key vocabulary is single-sourced in `list_nav`; this surface owns
+    /// only what a motion means here: step motions wrap through the visible
+    /// rows (existing behavior), page and edge motions clamp and never land
+    /// on a row the active filter hides.
+    fn move_by_list_motion(&mut self, key: &KeyEvent) {
+        let Some(motion) = list_nav::motion_while_typing(key) else {
+            return;
+        };
+        match motion {
+            Motion::Prev => self.move_selection(-1),
+            Motion::Next => self.move_selection(1),
+            Motion::PagePrev => self.move_selection_clamped(-(PROVIDER_PAGE as i64)),
+            Motion::PageNext => self.move_selection_clamped(PROVIDER_PAGE as i64),
+            Motion::First => self.select_first_visible(),
+            Motion::Last => self.select_last_visible(),
+            // Single-column surface: the region axis has nowhere to move to.
+            Motion::RegionPrev | Motion::RegionNext => {}
+        }
+    }
+
+    /// Clamped sibling of [`Self::move_selection`]: no wrap (a paging key asks
+    /// to travel, not to teleport — `list_nav`'s contract), and rows the
+    /// filter hides are never landed on.
+    fn move_selection_clamped(&mut self, step: i64) {
+        let count = self.rows.len();
+        if count == 0 || self.visible_row_count() == 0 {
+            return;
+        }
+        let last = count - 1;
+        let target = (self.selected_idx as i64 + step).clamp(0, last as i64) as usize;
+        let found = if step >= 0 {
+            (target..=last).find(|&index| self.row_visible(index))
+        } else {
+            (0..=target).rev().find(|&index| self.row_visible(index))
+        };
+        if let Some(index) = found {
+            self.selected_idx = index;
+        }
+    }
+
+    fn select_first_visible(&mut self) {
+        if let Some(index) = (0..self.rows.len()).find(|&index| self.row_visible(index)) {
+            self.selected_idx = index;
+        }
+    }
+
+    fn select_last_visible(&mut self) {
+        if let Some(index) = (0..self.rows.len())
+            .rev()
+            .find(|&index| self.row_visible(index))
+        {
+            self.selected_idx = index;
+        }
     }
 
     fn move_down(&mut self) {
@@ -2377,163 +2414,64 @@ impl ProviderPickerView {
         })
     }
 
-    fn enter_custom_form(&mut self) {
+    /// Open the custom-provider form with whatever a known host already
+    /// pins, leaving the cursor on the first field the user still has to
+    /// decide. Every entry point into `Stage::CustomForm` goes through here.
+    fn prefill_custom_form(
+        &mut self,
+        provider_id: &str,
+        base_url: &str,
+        model: &str,
+        api_key_env: &str,
+        field: CustomProviderField,
+    ) {
         self.stage = Stage::CustomForm;
-        self.custom_provider_field = CustomProviderField::Name;
-        self.custom_provider_id.clear();
-        self.custom_provider_base_url.clear();
-        self.custom_provider_model.clear();
-        self.custom_provider_api_key_env.clear();
+        self.custom_provider_field = field;
+        self.custom_provider_id = provider_id.to_string();
+        self.custom_provider_base_url = base_url.to_string();
+        self.custom_provider_model = model.to_string();
+        self.custom_provider_api_key_env = api_key_env.to_string();
+    }
+
+    fn enter_custom_form(&mut self) {
+        self.prefill_custom_form("", "", "", "", CustomProviderField::Name);
+    }
+
+    /// A bundled descriptor row (#6289) is set up as the named custom
+    /// provider it describes: the JSON pins id, endpoint, bootstrap model and
+    /// credential env var, so the only field left is which env var holds the
+    /// key. Submitting writes `[providers.<id>]` through the same path a
+    /// hand-entered custom provider uses.
+    fn enter_descriptor_form(&mut self, descriptor: &ProviderDescriptor) {
+        self.prefill_custom_form(
+            &descriptor.id,
+            &descriptor.base_url,
+            &descriptor.default_model,
+            &descriptor.api_key_env,
+            CustomProviderField::ApiKeyEnv,
+        );
     }
 
     fn enter_ds4_form(&mut self) {
-        self.stage = Stage::CustomForm;
-        self.custom_provider_field = CustomProviderField::ApiKeyEnv;
-        self.custom_provider_id = DS4_PROVIDER_ID.to_string();
-        self.custom_provider_base_url = DS4_BASE_URL.to_string();
-        self.custom_provider_model = DS4_DEFAULT_MODEL.to_string();
-        self.custom_provider_api_key_env.clear();
+        self.prefill_custom_form(
+            DS4_PROVIDER_ID,
+            DS4_BASE_URL,
+            DS4_DEFAULT_MODEL,
+            "",
+            CustomProviderField::ApiKeyEnv,
+        );
     }
 
     fn enter_lm_studio_form(&mut self) {
-        self.stage = Stage::CustomForm;
-        self.custom_provider_field = CustomProviderField::Model;
-        self.custom_provider_id = LM_STUDIO_PROVIDER_ID.to_string();
-        self.custom_provider_base_url = LM_STUDIO_BASE_URL.to_string();
         // LM Studio model identifiers depend on what the user has loaded, so
         // leave the model editable instead of guessing a stale default.
-        self.custom_provider_model.clear();
-        self.custom_provider_api_key_env.clear();
-    }
-
-    fn enter_sensenova_form(&mut self) {
-        if let Some(template) = provider_setup_template(SENSENOVA_TEMPLATE_ID) {
-            self.apply_template(template);
-        }
-    }
-
-    fn enter_template_list(&mut self) {
-        self.stage = Stage::TemplateList;
-        self.template_selected_idx = self
-            .template_selected_idx
-            .min(provider_setup_templates().len().saturating_sub(1));
-        self.last_template_mouse_selected = None;
-        self.template_row_hitboxes.borrow_mut().clear();
-    }
-
-    fn selected_template(&self) -> Option<&'static ProviderSetupTemplate> {
-        provider_setup_templates().get(self.template_selected_idx)
-    }
-
-    fn move_template_selection(&mut self, delta: isize) {
-        let total = provider_setup_templates().len();
-        if total == 0 {
-            return;
-        }
-        self.template_selected_idx =
-            crate::tui::list_nav::wrap_index(self.template_selected_idx, total, delta);
-        self.last_template_mouse_selected = None;
-    }
-
-    fn template_kind_label(&self, template: &ProviderSetupTemplate) -> Cow<'static, str> {
-        self.tr(match template.apply {
-            ProviderSetupApply::FirstClass(_) => MessageId::ProviderTemplateKindKeyOnly,
-            ProviderSetupApply::Compatible => MessageId::ProviderTemplateKindCompatible,
-            ProviderSetupApply::Unpublished => MessageId::ProviderTemplateKindUnpublished,
-        })
-    }
-
-    fn template_guidance_text(&self, template: &ProviderSetupTemplate) -> Cow<'static, str> {
-        match template.id {
-            "opencode-zen" => self.tr(MessageId::ProviderTemplateGuidanceOpencodeZen),
-            "opencode-go" => self.tr(MessageId::ProviderTemplateGuidanceOpencodeGo),
-            id if id == SENSENOVA_TEMPLATE_ID => {
-                self.tr(MessageId::ProviderTemplateGuidanceSenseNova)
-            }
-            id if id == AGNES_TEMPLATE_ID => self.tr(MessageId::ProviderTemplateGuidanceAgnes),
-            _ => Cow::Borrowed(template.guidance()),
-        }
-    }
-
-    fn activate_selected_template(&mut self) -> ViewAction {
-        if let Some(template) = self.selected_template() {
-            if template.is_unpublished() {
-                ViewAction::Emit(ViewEvent::StatusMessage {
-                    message: self.tr(MessageId::ProviderTemplateUnpublished).into_owned(),
-                })
-            } else {
-                self.apply_template(template);
-                ViewAction::None
-            }
-        } else {
-            ViewAction::None
-        }
-    }
-
-    fn handle_template_list_click(&mut self, mouse: MouseEvent) -> ViewAction {
-        let clicked = self
-            .template_row_hitboxes
-            .borrow()
-            .iter()
-            .find_map(|(rect, idx)| {
-                rect.contains(Position::new(mouse.column, mouse.row))
-                    .then_some(*idx)
-            });
-        let Some(idx) = clicked else {
-            return ViewAction::None;
-        };
-        let activate =
-            self.last_template_mouse_selected == Some(idx) && self.template_selected_idx == idx;
-        self.template_selected_idx = idx;
-        self.last_template_mouse_selected = Some(idx);
-        if activate {
-            self.activate_selected_template()
-        } else {
-            ViewAction::None
-        }
-    }
-
-    fn apply_template(&mut self, template: &'static ProviderSetupTemplate) {
-        match template.apply {
-            ProviderSetupApply::FirstClass(kind) => {
-                let provider = ApiProvider::from_kind(kind);
-                if !self.rows.iter().any(|row| row.provider == provider)
-                    || (self
-                        .rows
-                        .iter()
-                        .position(|row| row.provider == provider)
-                        .is_some_and(|idx| !self.row_visible(idx)))
-                {
-                    self.view = ProviderListView::Catalog;
-                }
-                if let Some(idx) = self.rows.iter().position(|row| row.provider == provider) {
-                    self.selected_idx = idx;
-                    self.stage = Stage::List;
-                    if !self.selected_has_key() {
-                        self.begin_setup();
-                    }
-                }
-            }
-            ProviderSetupApply::Compatible => self.enter_compatible_form(template),
-            ProviderSetupApply::Unpublished => {
-                if let Some(idx) = provider_setup_templates()
-                    .iter()
-                    .position(|candidate| candidate.id == template.id)
-                {
-                    self.template_selected_idx = idx;
-                }
-                self.enter_template_list();
-            }
-        }
-    }
-
-    fn enter_compatible_form(&mut self, template: &'static ProviderSetupTemplate) {
-        self.stage = Stage::CustomForm;
-        self.custom_provider_field = CustomProviderField::ApiKeyEnv;
-        self.custom_provider_id = template.id.to_string();
-        self.custom_provider_base_url = template.base_url().unwrap_or("").to_string();
-        self.custom_provider_model = template.default_model().unwrap_or("").to_string();
-        self.custom_provider_api_key_env = template.api_key_env().unwrap_or("").to_string();
+        self.prefill_custom_form(
+            LM_STUDIO_PROVIDER_ID,
+            LM_STUDIO_BASE_URL,
+            "",
+            "",
+            CustomProviderField::Model,
+        );
     }
 
     fn custom_form_field_mut(&mut self) -> &mut String {
@@ -2639,7 +2577,13 @@ impl ProviderPickerView {
         } else {
             self.tr(MessageId::PickerActionSetKey)
         };
-        let title = if self.onboarding_mode {
+        let title = if !self.onboarding_mode && (self.search_mode || !self.query.is_empty()) {
+            format!(
+                "{}: {}",
+                self.tr(MessageId::SessionsActionSearch),
+                self.query
+            )
+        } else if self.onboarding_mode {
             format!(" {} ", self.tr(MessageId::OnboardProviderTitle))
         } else {
             match (self.setup_mode, self.view) {
@@ -2659,25 +2603,62 @@ impl ProviderPickerView {
                 (false, ProviderListView::Local) => " Provider · local only ".to_string(),
             }
         };
-        let outer = Block::default()
-            .title(Line::from(Span::styled(
-                title,
-                Style::default()
-                    .fg(palette::WHALE_ACTION)
-                    .add_modifier(Modifier::BOLD),
-            )))
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(palette::BORDER_COLOR))
-            .style(Style::default().bg(palette::WHALE_BG));
-        let inner = outer.inner(area);
-        outer.render(area, buf);
-
         let view_action = match self.view {
             ProviderListView::Configured => self.tr(MessageId::PickerActionBrowseAll),
             ProviderListView::Catalog => self.tr(MessageId::PickerActionConfigured),
             ProviderListView::Local => self.tr(MessageId::PickerActionBrowseAll),
         };
-        let search_active = !self.query.trim().is_empty();
+        let action_label = crate::tui::ui_text::semantic_truncate(
+            &view_action,
+            usize::from(area.width.saturating_sub(20)),
+        );
+        let action_width = unicode_width::UnicodeWidthStr::width(action_label.as_str()) as u16;
+        let show_action = !self.onboarding_mode && area.width >= 28 && area.height > 0;
+        let title = if show_action {
+            crate::tui::ui_text::semantic_truncate(
+                title.trim(),
+                usize::from(area.width.saturating_sub(action_width + 8)),
+            )
+        } else {
+            title
+        };
+        let inner = if self.onboarding_mode {
+            let outer = Block::default()
+                .title(Line::from(Span::styled(
+                    title,
+                    Style::default()
+                        .fg(palette::WHALE_ACTION)
+                        .add_modifier(Modifier::BOLD),
+                )))
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(palette::BORDER_COLOR))
+                .style(Style::default().bg(palette::WHALE_BG));
+            let inner = outer.inner(area);
+            outer.render(area, buf);
+            inner
+        } else {
+            render_underwater_surface(area, buf, title.trim())
+        };
+
+        if show_action {
+            let action = Rect::new(
+                inner.right().saturating_sub(action_width),
+                area.y + u16::from(area.height >= 24),
+                action_width,
+                1,
+            );
+            *self.catalog_action_hitbox.borrow_mut() = Some(action);
+            Paragraph::new(action_label)
+                .style(if self.catalog_action_hovered {
+                    menu_style::hovered_row_style()
+                } else {
+                    Style::default()
+                        .fg(palette::WHALE_ACTION)
+                        .add_modifier(Modifier::UNDERLINED)
+                })
+                .render(action, buf);
+        }
+        let search_active = self.search_mode || !self.query.trim().is_empty();
         // The action footer moves into the body so it wraps instead of clipping
         // at narrow widths (#3732); the provider list renders above it.
         let content = if self.onboarding_mode {
@@ -2713,7 +2694,21 @@ impl ProviderPickerView {
                     ),
                     ActionHint::new("↑↓", self.tr(MessageId::PickerActionMove)),
                     ActionHint::new("Enter", enter_action),
-                    ActionHint::new("A", view_action.clone()),
+                ],
+            )
+        } else if inner.height < 16 {
+            // Keep the selection and recovery actions visible before teaching
+            // secondary shortcuts; the full rail returns with vertical room.
+            render_modal_footer(
+                inner,
+                buf,
+                &[
+                    ActionHint::new("↑↓", self.tr(MessageId::PickerActionMove)),
+                    ActionHint::new("Enter", enter_action),
+                    ActionHint::new("R", self.tr(MessageId::PickerActionEditKey)),
+                    ActionHint::new("M", self.tr(MessageId::PickerActionModels)),
+                    ActionHint::new("/", self.tr(MessageId::SessionsActionSearch)),
+                    ActionHint::new("Esc", self.tr(MessageId::PickerActionCancel)),
                 ],
             )
         } else {
@@ -2722,7 +2717,7 @@ impl ProviderPickerView {
                 buf,
                 &[
                     ActionHint::new("↑↓", self.tr(MessageId::PickerActionMove)),
-                    ActionHint::new("a-z", self.tr(MessageId::PickerActionJump)),
+                    ActionHint::new("/", self.tr(MessageId::SessionsActionSearch)),
                     ActionHint::new("Enter", enter_action),
                     ActionHint::new("A", view_action),
                     // The footer advertises actions for the selected row and
@@ -2767,7 +2762,7 @@ impl ProviderPickerView {
         // Onboarding asks one question. The ordinary provider manager keeps
         // its technical detail pane, but first-run gives the available rows
         // the whole body so 40x12 still has room to choose and proceed.
-        let layout = if self.onboarding_mode {
+        let mut layout = if self.onboarding_mode {
             ListDetailLayout {
                 list: content,
                 detail: Rect::new(content.x, content.y, 0, 0),
@@ -2776,6 +2771,12 @@ impl ProviderPickerView {
         } else {
             ListDetailLayout::split(content, 34)
         };
+        if layout.stacked && filtered.len() < usize::from(layout.list.height) {
+            layout.list.height = filtered.len() as u16;
+            let detail_y = layout.list.bottom().saturating_add(1).min(content.bottom());
+            layout.detail.y = detail_y;
+            layout.detail.height = content.bottom().saturating_sub(detail_y);
+        }
         let selected_pos = filtered
             .iter()
             .position(|(idx, _)| *idx == self.selected_idx)
@@ -2820,12 +2821,11 @@ impl ProviderPickerView {
                     | CredentialState::Legacy
             );
             let hint_style = if is_selected {
-                let hint_fg = if has_usable_auth {
-                    palette::TEXT_MUTED
+                menu_style::selected_row_style_with_fg(if has_usable_auth {
+                    palette::SELECTION_TEXT
                 } else {
                     palette::STATUS_WARNING
-                };
-                menu_style::selected_row_style_with_fg(hint_fg)
+                })
             } else if has_usable_auth {
                 Style::default().fg(palette::TEXT_MUTED)
             } else {
@@ -2847,6 +2847,9 @@ impl ProviderPickerView {
                 Span::styled("  ", spacer_style),
                 Span::styled(hint, hint_style),
             ]);
+            if is_hovered && !is_selected {
+                line.style = menu_style::hovered_row_style();
+            }
             if is_selected {
                 line.style = menu_style::selected_row_bg_style();
                 let target_width = usize::from(layout.list.width);
@@ -2859,6 +2862,12 @@ impl ProviderPickerView {
                 }
             }
             let row_y = layout.list.y.saturating_add(lines.len() as u16);
+            if is_hovered && !is_selected {
+                buf.set_style(
+                    Rect::new(layout.list.x, row_y, layout.list.width, 1),
+                    menu_style::hovered_row_style(),
+                );
+            }
             self.list_row_hitboxes
                 .borrow_mut()
                 .push((Rect::new(layout.list.x, row_y, layout.list.width, 1), *idx));
@@ -2871,22 +2880,91 @@ impl ProviderPickerView {
     }
 
     fn render_provider_detail(&self, area: Rect, buf: &mut Buffer, row: &ProviderDashboardRow) {
+        *self.detail_action_hitbox.borrow_mut() = None;
         if area.width == 0 || area.height == 0 {
             return;
         }
-        let block = Block::default()
-            .title(Line::from(Span::styled(
-                " Details ",
-                Style::default()
-                    .fg(palette::TEXT_PRIMARY)
-                    .add_modifier(Modifier::BOLD),
-            )))
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(palette::BORDER_COLOR))
-            .style(Style::default());
-        let inner = block.inner(area);
-        block.render(area, buf);
+        // A quiet inspector shares the canvas with the list. The explicit
+        // details action opens the existing pager for complete diagnostics.
+        let action_label = format!(
+            "{} {}",
+            crate::tui::shell_key_routing::tool_details_chord(),
+            self.tr(MessageId::CtxMenuOpenDetails)
+        );
+        let action_width =
+            (unicode_width::UnicodeWidthStr::width(action_label.as_str()) as u16).min(area.width);
+        let action = Rect::new(
+            area.right().saturating_sub(action_width),
+            area.y,
+            action_width,
+            1,
+        );
+        *self.detail_action_hitbox.borrow_mut() = Some(action);
+        let action_style = if self.detail_action_hovered {
+            menu_style::hovered_row_style().fg(palette::WHALE_ACTION)
+        } else {
+            Style::default()
+                .fg(palette::WHALE_ACTION)
+                .add_modifier(Modifier::UNDERLINED)
+        };
+        Paragraph::new(action_label)
+            .style(action_style)
+            .render(action, buf);
+        let title = Rect::new(
+            area.x,
+            area.y,
+            area.width.saturating_sub(action_width + 1),
+            1,
+        );
+        Paragraph::new(crate::tui::ui_text::semantic_truncate(
+            &row.display_name,
+            usize::from(title.width),
+        ))
+        .style(Style::default().fg(palette::TEXT_PRIMARY).bold())
+        .render(title, buf);
+        let inner = Rect::new(
+            area.x,
+            area.y.saturating_add(2),
+            area.width,
+            area.height.saturating_sub(2),
+        );
+        Paragraph::new(self.provider_detail_lines(row, inner.width, false))
+            .wrap(Wrap { trim: true })
+            .render(inner, buf);
+    }
 
+    fn open_provider_details(&self) -> ViewAction {
+        if !self.row_visible(self.selected_idx) {
+            return ViewAction::None;
+        }
+        let row = &self.rows[self.selected_idx];
+        let content = self
+            .provider_detail_lines(row, u16::MAX, true)
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        ViewAction::Emit(ViewEvent::OpenTextPager {
+            title: format!(
+                "{} · {}",
+                row.display_name,
+                self.tr(MessageId::CtxMenuOpenDetails)
+            ),
+            content,
+        })
+    }
+
+    fn provider_detail_lines(
+        &self,
+        row: &ProviderDashboardRow,
+        width: u16,
+        full: bool,
+    ) -> Vec<Line<'static>> {
         let route = if row.default_route.logical_model == row.default_route.wire_model {
             row.default_route.logical_model.clone()
         } else {
@@ -2897,25 +2975,15 @@ impl ProviderPickerView {
         };
         let mut lines = vec![
             Line::from(Span::styled(
-                row.display_name.clone(),
-                Style::default()
-                    .fg(palette::TEXT_PRIMARY)
-                    .add_modifier(Modifier::BOLD),
-            )),
-            Line::from(Span::styled(
                 // The maturity tag used to ride the list row's pipe dump. The
                 // row is short now, so the fact lives here, with the rest of
                 // the provider's detail.
                 row.detail_state_line(),
-                Style::default().fg(palette::TEXT_MUTED),
-            )),
-            // Which place the credential actually came from. A row can read
-            // "key:configured" for four different reasons; naming the one that
-            // won is what lets a user reconcile the picker with a request that
-            // succeeded (or didn't).
-            Line::from(Span::styled(
-                format!("Credential: {}", row.credential_source),
-                Style::default().fg(palette::TEXT_MUTED),
+                Style::default().fg(if row.credential_state == CredentialState::MissingKey {
+                    palette::STATUS_WARNING
+                } else {
+                    palette::TEXT_MUTED
+                }),
             )),
             Line::from(Span::styled(
                 // Whether this model is the provider's default, one the
@@ -2929,6 +2997,22 @@ impl ProviderPickerView {
                 format!("Endpoint: {}", row.base_url),
                 Style::default().fg(palette::TEXT_MUTED),
             )),
+        ];
+        // Keep a resolved credential's origin visible. An absent credential
+        // is already named by readiness; its search details remain in the pager.
+        if full || row.credential_source != "not found" {
+            lines.insert(
+                1,
+                Line::from(Span::styled(
+                    format!("Credential: {}", row.credential_source),
+                    Style::default().fg(palette::TEXT_MUTED),
+                )),
+            );
+        }
+        // Protocol/capability details explain a route, but must not crowd out
+        // its model choices and prices. Credential warnings and consent stay
+        // ahead of the model inventory; technical diagnostics follow it.
+        let diagnostics = vec![
             Line::from(Span::styled(
                 format!("Protocol: {}", row.supported_protocols.join("+")),
                 Style::default().fg(palette::TEXT_MUTED),
@@ -2948,11 +3032,19 @@ impl ProviderPickerView {
                 Style::default().fg(palette::TEXT_MUTED),
             )));
         }
-        for message in row.messages.iter().take(2) {
-            lines.push(Line::from(Span::styled(
-                format!("Note: {message}"),
-                Style::default().fg(palette::STATUS_WARNING),
-            )));
+        for message in row.messages.iter().take(if full { usize::MAX } else { 2 }) {
+            let message = if full {
+                message.clone()
+            } else {
+                crate::tui::ui_text::semantic_truncate(
+                    message,
+                    usize::from(width.saturating_sub(2)),
+                )
+            };
+            lines.push(Line::from(vec![
+                Span::styled("! ", Style::default().fg(palette::STATUS_WARNING)),
+                Span::styled(message, Style::default().fg(palette::TEXT_PRIMARY)),
+            ]));
         }
         // #5772: the external block exists only for a persisted consent record
         // (see the row constructor), and it names the owning CLI without the
@@ -3022,8 +3114,8 @@ impl ProviderPickerView {
         }
         // Slice D two-pane picker: the selected provider's models live
         // beside (wide) or under (narrow) the provider strip, each with its
-        // own $/mtok in/out from the catalog. Last on purpose: when the pane
-        // is short, clipping eats models — never the consent block above.
+        // own $/mtok in/out from the catalog. Credential and consent facts
+        // lead; model choices come before low-level route diagnostics.
         // Display-only — choosing a model happens in the model picker (`M`)
         // or the guided setup flow.
         lines.push(Line::from(""));
@@ -3034,7 +3126,7 @@ impl ProviderPickerView {
                 .add_modifier(Modifier::BOLD),
         )));
         let pane_models = provider_pane_models(&self.route_config, row, 8);
-        let name_budget = usize::from(inner.width).saturating_sub(22).max(8);
+        let name_budget = usize::from(width).saturating_sub(22).max(8);
         for (model, price, is_default) in &pane_models {
             let name = crate::tui::ui_text::truncate_line_to_width(model, name_budget);
             let mut spans = vec![
@@ -3066,9 +3158,11 @@ impl ProviderPickerView {
                 Style::default().fg(palette::TEXT_MUTED),
             )));
         }
-        Paragraph::new(lines)
-            .wrap(Wrap { trim: true })
-            .render(inner, buf);
+        if full {
+            lines.push(Line::from(""));
+            lines.extend(diagnostics);
+        }
+        lines
     }
 
     fn render_xai_auth_choice(&self, area: Rect, buf: &mut Buffer) {
@@ -3094,23 +3188,17 @@ impl ProviderPickerView {
                 ActionHint::new("Esc", self.tr(MessageId::SetupActionBack)),
             ],
         );
-        let marker = |choice| crate::tui::glyphs::selection_marker(self.xai_auth_choice == choice);
-        Paragraph::new(vec![
-            Line::from(self.tr(MessageId::XaiAuthChoiceIntro)),
-            Line::from(""),
-            Line::from(format!(
-                "{} 1. {}",
-                marker(XaiAuthChoice::ApiKey),
-                self.tr(MessageId::XaiAuthChoiceApiKeyOption),
-            )),
-            Line::from(format!(
-                "{} 2. {}",
-                marker(XaiAuthChoice::DeviceOAuth),
-                self.tr(MessageId::XaiAuthChoiceDeviceOAuthOption),
-            )),
-        ])
-        .wrap(Wrap { trim: false })
-        .render(content, buf);
+        self.render_setup_choices(
+            content,
+            buf,
+            vec![Line::from(self.tr(MessageId::XaiAuthChoiceIntro))],
+            [
+                self.tr(MessageId::XaiAuthChoiceApiKeyOption).into_owned(),
+                self.tr(MessageId::XaiAuthChoiceDeviceOAuthOption)
+                    .into_owned(),
+            ],
+            usize::from(self.xai_auth_choice == XaiAuthChoice::DeviceOAuth),
+        );
     }
 
     fn render_chatgpt_auth_choice(&self, area: Rect, buf: &mut Buffer) {
@@ -3136,24 +3224,17 @@ impl ProviderPickerView {
                 ActionHint::new("Esc", self.tr(MessageId::SetupActionBack)),
             ],
         );
-        let marker =
-            |choice| crate::tui::glyphs::selection_marker(self.chatgpt_auth_choice == choice);
-        Paragraph::new(vec![
-            Line::from(self.tr(MessageId::ChatgptAuthChoiceIntro)),
-            Line::from(""),
-            Line::from(format!(
-                "{} 1. {}",
-                marker(ChatgptAuthChoice::SignInWithChatgpt),
-                self.tr(MessageId::ChatgptAuthChoicePkceOption),
-            )),
-            Line::from(format!(
-                "{} 2. {}",
-                marker(ChatgptAuthChoice::ImportCodexCli),
-                self.tr(MessageId::ChatgptAuthChoiceImportOption),
-            )),
-        ])
-        .wrap(Wrap { trim: false })
-        .render(content, buf);
+        self.render_setup_choices(
+            content,
+            buf,
+            vec![Line::from(self.tr(MessageId::ChatgptAuthChoiceIntro))],
+            [
+                self.tr(MessageId::ChatgptAuthChoicePkceOption).into_owned(),
+                self.tr(MessageId::ChatgptAuthChoiceImportOption)
+                    .into_owned(),
+            ],
+            usize::from(self.chatgpt_auth_choice == ChatgptAuthChoice::ImportCodexCli),
+        );
     }
 
     fn render_key_entry(&self, area: Rect, buf: &mut Buffer) {
@@ -3307,8 +3388,7 @@ impl ProviderPickerView {
                 )));
                 if let Some(url) = help.docs_url {
                     hint_lines.push(Line::from(Span::styled(
-                        self.tr(MessageId::ProviderTemplateDocs)
-                            .replace("{url}", url),
+                        format!("Docs: {url}"),
                         Style::default().fg(palette::TEXT_MUTED),
                     )));
                 }
@@ -3708,23 +3788,21 @@ impl ProviderPickerView {
                 ActionHint::new("Esc", "back"),
             ],
         );
-        let selected = self.kimi_code_plan_tier;
-        let marker = |tier| crate::tui::glyphs::selection_marker(selected == tier);
-        Paragraph::new(vec![
-            Line::from("Kimi Code plan limits determine the context window used for k3."),
-            Line::from("Choose the tier you actually have; the safe floor is selected by default."),
-            Line::from(""),
-            Line::from(format!(
-                "{} 1. 262K context (safe default)",
-                marker(KimiCodePlanTier::Safe262k)
-            )),
-            Line::from(format!(
-                "{} 2. 1M context (only with an eligible plan)",
-                marker(KimiCodePlanTier::OneMillion)
-            )),
-        ])
-        .wrap(Wrap { trim: false })
-        .render(content, buf);
+        self.render_setup_choices(
+            content,
+            buf,
+            vec![
+                Line::from("Kimi Code plan limits determine the context window used for k3."),
+                Line::from(
+                    "Choose the tier you actually have; the safe floor is selected by default.",
+                ),
+            ],
+            [
+                "262K context (safe default)".into(),
+                "1M context (only with an eligible plan)".into(),
+            ],
+            usize::from(self.kimi_code_plan_tier == KimiCodePlanTier::OneMillion),
+        );
     }
 
     fn render_stepfun_billing_route(&self, area: Rect, buf: &mut Buffer) {
@@ -3749,29 +3827,89 @@ impl ProviderPickerView {
                 ActionHint::new("Esc", "back"),
             ],
         );
-        let selected = self.stepfun_billing_route;
-        let marker = |route| crate::tui::glyphs::selection_marker(selected == route);
-        // The endpoint is shown next to each choice: it is the whole
-        // difference between the two billing tracks, and it is what gets
-        // written to `[providers.stepfun] base_url` on confirm.
-        Paragraph::new(vec![
-            Line::from(self.tr(MessageId::StepfunBillingRouteIntro).to_string()),
-            Line::from(""),
-            Line::from(format!(
-                "{} 1. {} — {}",
-                marker(StepfunBillingRoute::PayAsYouGo),
-                self.tr(MessageId::StepfunBillingRoutePaygOption),
-                StepfunBillingRoute::PayAsYouGo.base_url(),
-            )),
-            Line::from(format!(
-                "{} 2. {} — {}",
-                marker(StepfunBillingRoute::StepPlan),
-                self.tr(MessageId::StepfunBillingRoutePlanOption),
-                StepfunBillingRoute::StepPlan.base_url(),
-            )),
-        ])
-        .wrap(Wrap { trim: false })
-        .render(content, buf);
+        // Keep the actual endpoint with each route; choosing only stages
+        // the value and still follows the existing confirmation flow.
+        self.render_setup_choices(
+            content,
+            buf,
+            vec![Line::from(self.tr(MessageId::StepfunBillingRouteIntro))],
+            [
+                format!(
+                    "{} — {}",
+                    self.tr(MessageId::StepfunBillingRoutePaygOption),
+                    StepfunBillingRoute::PayAsYouGo.base_url()
+                ),
+                format!(
+                    "{} — {}",
+                    self.tr(MessageId::StepfunBillingRoutePlanOption),
+                    StepfunBillingRoute::StepPlan.base_url()
+                ),
+            ],
+            usize::from(self.stepfun_billing_route == StepfunBillingRoute::StepPlan),
+        );
+    }
+
+    /// One geometry for the four two-choice setup screens. Pointer hitboxes
+    /// cover only painted rows, including wrapped labels; no auth or billing
+    /// action lives here. Small terminals give options room before prose.
+    fn render_setup_choices(
+        &self,
+        area: Rect,
+        buf: &mut Buffer,
+        intro: Vec<Line<'static>>,
+        labels: [String; 2],
+        selected: usize,
+    ) {
+        self.choice_row_hitboxes.borrow_mut().clear();
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
+        let choices: Vec<_> = labels
+            .into_iter()
+            .enumerate()
+            .map(|(idx, label)| {
+                let key = if idx == 0 { '1' } else { '2' };
+                let style = if selected == idx {
+                    menu_style::selected_row_style()
+                } else if self.hovered_choice == Some(key) {
+                    menu_style::hovered_row_style().fg(palette::TEXT_PRIMARY)
+                } else {
+                    Style::default().fg(palette::TEXT_PRIMARY)
+                };
+                Paragraph::new(format!(
+                    "{} {key}. {label}",
+                    crate::tui::glyphs::selection_marker(selected == idx)
+                ))
+                .style(style)
+                .wrap(Wrap { trim: false })
+            })
+            .collect();
+        let needed = choices
+            .iter()
+            .map(|p| p.line_count(area.width) as u16)
+            .sum::<u16>();
+        let intro = Paragraph::new(intro)
+            .style(Style::default().fg(palette::TEXT_MUTED))
+            .wrap(Wrap { trim: false });
+        let intro_height =
+            (intro.line_count(area.width) as u16).min(area.height.saturating_sub(needed));
+        intro.render(Rect::new(area.x, area.y, area.width, intro_height), buf);
+        let mut y = area.y + intro_height;
+        for (idx, choice) in choices.into_iter().enumerate() {
+            let remaining = area.bottom().saturating_sub(y);
+            let reserve = u16::from(idx == 0 && remaining > 1);
+            let height =
+                (choice.line_count(area.width) as u16).min(remaining.saturating_sub(reserve));
+            if height == 0 {
+                continue;
+            }
+            let row = Rect::new(area.x, y, area.width, height);
+            choice.render(row, buf);
+            self.choice_row_hitboxes
+                .borrow_mut()
+                .push((row, if idx == 0 { '1' } else { '2' }));
+            y += height;
+        }
     }
 
     fn render_confirm(&self, area: Rect, buf: &mut Buffer) {
@@ -3846,10 +3984,7 @@ impl ProviderPickerView {
     }
 
     fn render_custom_form(&self, area: Rect, buf: &mut Buffer) {
-        let title = provider_setup_template(&self.custom_provider_id)
-            .filter(|template| template.is_compatible())
-            .map(|template| format!(" {} ", template.display_name))
-            .unwrap_or_else(|| " Custom provider ".to_string());
+        let title = " Custom provider ".to_string();
         let outer = Block::default()
             .title(Line::from(Span::styled(
                 title,
@@ -3884,19 +4019,7 @@ impl ProviderPickerView {
             ])
             .split(content);
 
-        let hint = provider_setup_template(&self.custom_provider_id)
-            .filter(|template| template.is_compatible())
-            .map(|template| {
-                let mut parts = vec![self.template_guidance_text(template).into_owned()];
-                if let Some(url) = template.docs_url() {
-                    parts.push(
-                        self.tr(MessageId::ProviderTemplateDocs)
-                            .replace("{url}", url),
-                    );
-                }
-                parts.join(" ")
-            })
-            .unwrap_or_else(|| self.tr(MessageId::ProviderCustomFormHint).into_owned());
+        let hint = self.tr(MessageId::ProviderCustomFormHint).into_owned();
         Paragraph::new(Line::from(Span::styled(
             hint,
             Style::default().fg(palette::TEXT_MUTED),
@@ -3926,150 +4049,6 @@ impl ProviderPickerView {
             "API key env",
             "optional",
         );
-    }
-
-    fn render_template_list(&self, area: Rect, buf: &mut Buffer) {
-        self.template_row_hitboxes.borrow_mut().clear();
-        let outer = Block::default()
-            .title(Line::from(Span::styled(
-                format!(" {} ", self.tr(MessageId::ProviderTemplatesTitle)),
-                Style::default()
-                    .fg(palette::WHALE_ACTION)
-                    .add_modifier(Modifier::BOLD),
-            )))
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(palette::BORDER_COLOR))
-            .style(Style::default().bg(palette::WHALE_BG));
-        let inner = outer.inner(area);
-        outer.render(area, buf);
-
-        let content = render_modal_footer(
-            inner,
-            buf,
-            &[
-                ActionHint::new("↑↓", self.tr(MessageId::PickerActionMove)),
-                ActionHint::new("Enter", self.tr(MessageId::PickerActionApply)),
-                ActionHint::new("Esc", self.tr(MessageId::PickerActionCancel)),
-            ],
-        );
-        // Each row carries its kind label and the detail pane below explains
-        // the selected row, so the list needs no introductory paragraph.
-        let templates = provider_setup_templates();
-        let detail_reserve = if content.height >= 6 {
-            3
-        } else if content.height >= 4 {
-            2
-        } else if content.height >= 3 {
-            1
-        } else {
-            0
-        };
-        let list_budget = content.height.saturating_sub(detail_reserve).max(1);
-        let visible_count = templates
-            .len()
-            .min(usize::from(list_budget))
-            .max(usize::from(content.height > 0));
-        let list_height = u16::try_from(visible_count).unwrap_or(u16::MAX).max(1);
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(list_height),
-                Constraint::Min(detail_reserve),
-            ])
-            .split(content);
-        let selected = self
-            .template_selected_idx
-            .min(templates.len().saturating_sub(1));
-        let max_start = templates.len().saturating_sub(visible_count);
-        let start = selected
-            .saturating_sub(visible_count.saturating_sub(1))
-            .min(max_start);
-        let list_area = chunks[0];
-        for (offset, (idx, template)) in templates
-            .iter()
-            .enumerate()
-            .skip(start)
-            .take(visible_count)
-            .enumerate()
-        {
-            let row_y = list_area.y.saturating_add(offset as u16);
-            if row_y >= list_area.bottom() {
-                break;
-            }
-            let row = Rect::new(list_area.x, row_y, list_area.width, 1);
-            self.template_row_hitboxes.borrow_mut().push((row, idx));
-            let selected_row = idx == self.template_selected_idx;
-            let marker = crate::tui::glyphs::selection_marker(selected_row);
-            let kind = self.template_kind_label(template);
-            // Slice D hover rule: template rows are clickable, so they
-            // hover-respond with the shared primitive like every other row.
-            let style = if selected_row {
-                menu_style::selected_row_style_with_fg(palette::SELECTION_TEXT)
-            } else if self.hovered_template_idx == Some(idx) {
-                menu_style::hovered_row_style()
-            } else {
-                Style::default().fg(palette::TEXT_PRIMARY)
-            };
-            let label = format!(
-                "{marker} {} ({}) · {kind}",
-                template.display_name, template.id
-            );
-            Paragraph::new(Line::from(Span::styled(
-                crate::tui::ui_text::truncate_line_to_width(&label, usize::from(row.width)),
-                style,
-            )))
-            .render(row, buf);
-        }
-
-        let mut detail = Vec::new();
-        if let Some(template) = self.selected_template() {
-            if template.is_unpublished() {
-                detail.push(Line::from(Span::styled(
-                    self.tr(MessageId::ProviderTemplateUnpublished),
-                    Style::default().fg(palette::TEXT_MUTED),
-                )));
-            } else if let Some(url) = template.base_url() {
-                detail.push(Line::from(Span::styled(
-                    self.tr(MessageId::ProviderTemplateBaseUrl)
-                        .replace("{url}", url),
-                    Style::default().fg(palette::TEXT_MUTED),
-                )));
-            }
-            if let Some(env) = template.api_key_env() {
-                detail.push(Line::from(Span::styled(
-                    env.to_string(),
-                    Style::default().fg(palette::TEXT_MUTED),
-                )));
-            }
-            if let Some(model) = template.default_model() {
-                detail.push(Line::from(Span::styled(
-                    self.tr(MessageId::ProviderTemplateModel)
-                        .replace("{model}", model),
-                    Style::default().fg(palette::TEXT_MUTED),
-                )));
-            }
-            if let Some(url) = template.docs_url() {
-                detail.push(Line::from(Span::styled(
-                    self.tr(MessageId::ProviderTemplateDocs)
-                        .replace("{url}", url),
-                    Style::default().fg(palette::TEXT_MUTED),
-                )));
-            }
-            if let Some(url) = template.credential_url() {
-                detail.push(Line::from(Span::styled(
-                    self.tr(MessageId::ProviderTemplateCredentials)
-                        .replace("{url}", url),
-                    Style::default().fg(palette::TEXT_MUTED),
-                )));
-            }
-            detail.push(Line::from(Span::styled(
-                self.template_guidance_text(template),
-                Style::default().fg(palette::TEXT_MUTED),
-            )));
-        }
-        Paragraph::new(detail)
-            .wrap(Wrap { trim: true })
-            .render(chunks[1], buf);
     }
 
     fn render_custom_form_field(
@@ -4148,22 +4127,15 @@ impl ProviderPickerView {
         if !self.row_visible(self.selected_idx) {
             return ViewAction::None;
         }
-        if let Some(template) = self.rows[self.selected_idx]
-            .template_id
-            .and_then(provider_setup_template)
-        {
-            // A template row is a host the operator has not configured yet:
-            // land on the custom-provider form with the template's endpoint,
-            // model and key variable filled in, exactly as `/provider
-            // templates` does, instead of prompting for a key on a route that
-            // does not exist.
-            self.apply_template(template);
-            return ViewAction::None;
-        }
         let provider = self.selected_provider();
         let provider_id = self.selected_provider_id();
         if provider == ApiProvider::Custom && !self.rows[self.selected_idx].is_configured {
-            self.enter_custom_form();
+            // A bundled-descriptor row already knows the host; only the blank
+            // `Custom` placeholder starts from an empty form.
+            match provider_descriptor(&self.rows[self.selected_idx].provider_id) {
+                Some(descriptor) => self.enter_descriptor_form(descriptor),
+                None => self.enter_custom_form(),
+            }
             ViewAction::None
         } else if !self.selected_route_is_valid() {
             ViewAction::None
@@ -4286,6 +4258,11 @@ impl ModalView for ProviderPickerView {
                 self.custom_form_field_mut().push_str(sanitized.trim());
                 true
             }
+            Stage::List if self.search_mode || !self.query.is_empty() => {
+                let sanitized = text.replace(['\r', '\n', '\t'], " ");
+                self.update_query(format!("{}{}", self.query, sanitized));
+                true
+            }
             Stage::List
             | Stage::XaiAuthChoice
             | Stage::ChatgptAuthChoice
@@ -4295,15 +4272,37 @@ impl ModalView for ProviderPickerView {
             | Stage::ModelPick
             | Stage::PlanTier
             | Stage::StepfunBillingRoute
-            | Stage::Confirm
-            | Stage::TemplateList => false,
+            | Stage::Confirm => false,
         }
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> ViewAction {
+        self.last_choice_mouse_selected = None;
+        self.hovered_choice = None;
+        if self.stage == Stage::List
+            && (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT)
+        {
+            match key.code {
+                KeyCode::Char('/') if !self.search_mode && self.query.is_empty() => {
+                    self.search_mode = true;
+                    return ViewAction::None;
+                }
+                KeyCode::Char(ch) if self.search_mode => {
+                    let mut query = self.query.clone();
+                    query.push(ch);
+                    self.update_query(query);
+                    return ViewAction::None;
+                }
+                _ => {}
+            }
+        }
         match self.stage {
             Stage::List => match key.code {
-                KeyCode::Esc if !self.query.is_empty() => {
+                _ if crate::tui::shell_key_routing::is_tool_details_shortcut(&key) => {
+                    self.open_provider_details()
+                }
+                KeyCode::Esc if self.search_mode || !self.query.is_empty() => {
+                    self.search_mode = false;
                     self.update_query(String::new());
                     ViewAction::None
                 }
@@ -4314,12 +4313,19 @@ impl ModalView for ProviderPickerView {
                         .get(self.selected_idx)
                         .map(|row| row.provider_id.clone()),
                 }),
-                KeyCode::Up => {
-                    self.move_up();
-                    ViewAction::None
-                }
-                KeyCode::Down => {
-                    self.move_down();
+                // One movement vocabulary (#6290): `list_nav` classifies the
+                // keys; this surface owns only what a motion means for its
+                // rows. A surface with a live filter uses the typing-safe key
+                // set — no letter aliases to eat the query.
+                KeyCode::Up
+                | KeyCode::Down
+                | KeyCode::PageUp
+                | KeyCode::PageDown
+                | KeyCode::Home
+                | KeyCode::End
+                    if key.modifiers.is_empty() =>
+                {
+                    self.move_by_list_motion(&key);
                     ViewAction::None
                 }
                 // Row-dependent actions are no-ops when the current filter
@@ -4410,22 +4416,6 @@ impl ModalView for ProviderPickerView {
                         && c.eq_ignore_ascii_case(&'d') =>
                 {
                     self.enter_ds4_form();
-                    ViewAction::None
-                }
-                KeyCode::Char(c)
-                    if key.modifiers.is_empty()
-                        && self.query.is_empty()
-                        && c.eq_ignore_ascii_case(&'s') =>
-                {
-                    self.enter_sensenova_form();
-                    ViewAction::None
-                }
-                KeyCode::Char(c)
-                    if key.modifiers.is_empty()
-                        && self.query.is_empty()
-                        && c.eq_ignore_ascii_case(&'p') =>
-                {
-                    self.enter_template_list();
                     ViewAction::None
                 }
                 KeyCode::Char(c)
@@ -4775,22 +4765,6 @@ impl ModalView for ProviderPickerView {
                     .unwrap_or(ViewAction::None),
                 _ => ViewAction::None,
             },
-            Stage::TemplateList => match key.code {
-                KeyCode::Esc => {
-                    self.stage = Stage::List;
-                    ViewAction::None
-                }
-                KeyCode::Up => {
-                    self.move_template_selection(-1);
-                    ViewAction::None
-                }
-                KeyCode::Down => {
-                    self.move_template_selection(1);
-                    ViewAction::None
-                }
-                KeyCode::Enter => self.activate_selected_template(),
-                _ => ViewAction::None,
-            },
             Stage::CustomForm => match key.code {
                 KeyCode::Esc => {
                     self.stage = Stage::List;
@@ -4834,6 +4808,39 @@ impl ModalView for ProviderPickerView {
     }
 
     fn handle_mouse(&mut self, mouse: MouseEvent) -> ViewAction {
+        let over_catalog = matches!(self.stage, Stage::List)
+            && self
+                .catalog_action_hitbox
+                .borrow()
+                .is_some_and(|rect| rect.contains((mouse.column, mouse.row).into()));
+        if mouse.kind == MouseEventKind::Moved {
+            self.catalog_action_hovered = over_catalog;
+        }
+        if over_catalog && mouse.kind == MouseEventKind::Down(MouseButton::Left) {
+            // A catalog view is unfiltered; retaining the search would make
+            // this visible action appear to do nothing.
+            if self.search_mode || !self.query.is_empty() {
+                self.search_mode = false;
+                self.update_query(String::new());
+            }
+            self.toggle_view();
+            self.catalog_action_hovered = false;
+            self.last_list_mouse_selected = None;
+            return ViewAction::None;
+        }
+        if matches!(self.stage, Stage::List) {
+            let over_details = self
+                .detail_action_hitbox
+                .borrow()
+                .is_some_and(|rect| rect.contains((mouse.column, mouse.row).into()));
+            if matches!(mouse.kind, MouseEventKind::Moved) {
+                self.detail_action_hovered = over_details;
+            }
+            if over_details && mouse.kind == MouseEventKind::Down(MouseButton::Left) {
+                return self.open_provider_details();
+            }
+        }
+
         match self.stage {
             Stage::List => match mouse.kind {
                 MouseEventKind::ScrollUp => {
@@ -4878,36 +4885,39 @@ impl ModalView for ProviderPickerView {
                 }
                 _ => {}
             },
-            Stage::TemplateList => {
-                return match mouse.kind {
-                    MouseEventKind::ScrollUp => {
-                        self.move_template_selection(-1);
-                        ViewAction::None
-                    }
-                    MouseEventKind::ScrollDown => {
-                        self.move_template_selection(1);
-                        ViewAction::None
-                    }
-                    MouseEventKind::Moved => {
-                        let pos = Position::new(mouse.column, mouse.row);
-                        self.hovered_template_idx = self
-                            .template_row_hitboxes
-                            .borrow()
-                            .iter()
-                            .find_map(|(rect, idx)| rect.contains(pos).then_some(*idx));
-                        ViewAction::None
-                    }
-                    MouseEventKind::Down(MouseButton::Left) => {
-                        self.handle_template_list_click(mouse)
-                    }
-                    _ => ViewAction::None,
-                };
-            }
             Stage::PlanTier
             | Stage::StepfunBillingRoute
             | Stage::XaiAuthChoice
-            | Stage::ChatgptAuthChoice
-            | Stage::KeyEntry
+            | Stage::ChatgptAuthChoice => {
+                let hit = self
+                    .choice_row_hitboxes
+                    .borrow()
+                    .iter()
+                    .find_map(|(rect, key)| {
+                        rect.contains((mouse.column, mouse.row).into())
+                            .then_some(*key)
+                    });
+                match mouse.kind {
+                    MouseEventKind::Moved => self.hovered_choice = hit,
+                    MouseEventKind::Down(MouseButton::Left) => {
+                        if let Some(key) = hit {
+                            let stage = self.stage;
+                            let activate = self.last_choice_mouse_selected == Some((stage, key));
+                            let _ = self
+                                .handle_key(KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE));
+                            self.last_choice_mouse_selected = Some((stage, key));
+                            if activate {
+                                return self
+                                    .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+                            }
+                        } else {
+                            self.last_choice_mouse_selected = None;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Stage::KeyEntry
             | Stage::ExternalConsentConfirm
             | Stage::ExternalConsentRevokeConfirm
             | Stage::Confirm
@@ -4917,6 +4927,17 @@ impl ModalView for ProviderPickerView {
     }
 
     fn render(&self, area: Rect, buf: &mut Buffer) {
+        self.choice_row_hitboxes.borrow_mut().clear();
+        self.list_row_hitboxes.borrow_mut().clear();
+        *self.catalog_action_hitbox.borrow_mut() = None;
+        *self.detail_action_hitbox.borrow_mut() = None;
+        // Managing routes needs room for both options and their explanation,
+        // even with only one configured provider. First-run questions and
+        // credential/consent flows retain their bounded modal presentation.
+        if matches!(self.stage, Stage::List) && !self.onboarding_mode {
+            self.render_list(area, buf);
+            return;
+        }
         let preferred_height = match self.stage {
             Stage::List => (self.rows.len() as u16).saturating_add(2),
             Stage::XaiAuthChoice => 12,
@@ -4936,8 +4957,6 @@ impl ModalView for ProviderPickerView {
             Stage::StepfunBillingRoute => 11,
             Stage::Confirm => 10,
             Stage::CustomForm => 12,
-            // Catalog rows + descriptor detail (URL, env, default, docs).
-            Stage::TemplateList => 18,
         };
         let popup_area = centered_modal_area(area, 120, preferred_height, 64, 8);
 
@@ -4958,7 +4977,6 @@ impl ModalView for ProviderPickerView {
             Stage::StepfunBillingRoute => self.render_stepfun_billing_route(popup_area, buf),
             Stage::Confirm => self.render_confirm(popup_area, buf),
             Stage::CustomForm => self.render_custom_form(popup_area, buf),
-            Stage::TemplateList => self.render_template_list(popup_area, buf),
         }
     }
 }
@@ -4995,60 +5013,72 @@ fn custom_provider_dashboard_rows(
         .collect()
 }
 
-/// Compatible setup templates the operator has not configured yet (Baseten,
-/// Groq, Cerebras, ...) as rows of the provider list. They used to be
-/// reachable only through `/provider templates`; a row is what the operator
-/// looks for. Each row is derived the way a configured custom provider's row
-/// is — from a scoped config carrying the template's endpoint, model and key
-/// variable — so its protocol, readiness and credential-source facts are the
-/// real ones. It is then marked unconfigured, so it sorts with the catalog
-/// and stays out of the configured-only view, and tagged with its template so
-/// activation lands on the pre-filled custom-provider form.
-fn template_dashboard_rows(
+/// Bundled compatible-host descriptors (#6289) that are not yet written to
+/// `[providers.*]`, rendered through the same named-custom-provider row
+/// builder a configured host uses. The descriptor JSON carries the endpoint,
+/// bootstrap model and credential env var, so the row can report `missing
+/// <ENV>` before anything is persisted.
+///
+/// Known limitations: these rows are a setup invitation, never a route. They
+/// are deliberately not `is_configured`, so they sort with the rest of the
+/// unconfigured catalog and stay out of the Configured view; activating one
+/// opens the prefilled custom-provider form, and only that form's submit
+/// writes `[providers.<id>]`. A descriptor whose id or alias already names a
+/// `[providers.*]` entry is dropped here so the configured row is the only
+/// one.
+fn descriptor_dashboard_rows(
     active: ApiProvider,
     config: &Config,
     runtime_status: Option<&ProviderRuntimeStatus>,
 ) -> Vec<ProviderDashboardRow> {
-    provider_setup_templates()
+    let configured: Vec<&str> = config
+        .providers
+        .as_ref()
+        .map(|providers| providers.custom.keys().map(String::as_str).collect())
+        .unwrap_or_default();
+    bundled_provider_descriptors()
         .iter()
-        .filter(|template| template.is_compatible())
-        .filter(|template| {
-            // A custom provider the operator already named after the
-            // template has its own configured row.
-            !config
-                .providers
-                .as_ref()
-                .is_some_and(|providers| providers.custom_provider_config(template.id).is_some())
-        })
-        .map(|template| {
-            let mut scoped = config.clone();
-            scoped
-                .providers
-                .get_or_insert_with(Default::default)
-                .custom
-                .insert(
-                    template.id.to_string(),
-                    crate::config::ProviderConfig {
-                        kind: Some("openai-compatible".to_string()),
-                        base_url: template.base_url().map(str::to_string),
-                        model: template.default_model().map(str::to_string),
-                        api_key_env: template.api_key_env().map(str::to_string),
-                        ..Default::default()
-                    },
-                );
-            let mut row = ProviderDashboardRow::from_custom_config_with_runtime_status(
-                template.id,
-                active,
-                &scoped,
-                runtime_status,
-            );
-            row.display_name = template.display_name.to_string();
-            row.is_active = false;
-            row.is_configured = false;
-            row.template_id = Some(template.id);
-            row
-        })
+        .filter(|descriptor| !configured.iter().any(|id| descriptor.matches(id)))
+        .map(|descriptor| descriptor_dashboard_row(descriptor, active, config, runtime_status))
         .collect()
+}
+
+fn descriptor_dashboard_row(
+    descriptor: &ProviderDescriptor,
+    active: ApiProvider,
+    config: &Config,
+    runtime_status: Option<&ProviderRuntimeStatus>,
+) -> ProviderDashboardRow {
+    // Project the descriptor into the `[providers.<id>]` shape the user would
+    // write, so endpoint, model and credential reporting all come from the one
+    // existing row builder instead of a second pipeline. `scoped` is a local
+    // clone; nothing here touches the loaded or on-disk config.
+    let mut scoped = config.clone();
+    scoped
+        .providers
+        .get_or_insert_with(Default::default)
+        .custom
+        .insert(
+            descriptor.id.clone(),
+            crate::config::ProviderConfig {
+                kind: Some("openai-compatible".to_string()),
+                base_url: Some(descriptor.base_url.clone()),
+                model: Some(descriptor.default_model.clone()),
+                api_key_env: Some(descriptor.api_key_env.clone()),
+                ..Default::default()
+            },
+        );
+    let mut row = ProviderDashboardRow::from_custom_config_with_runtime_status(
+        &descriptor.id,
+        active,
+        &scoped,
+        runtime_status,
+    );
+    // The host's own name, not `<id> (custom)`: this is a catalog row.
+    row.display_name = descriptor.label.clone();
+    // Nothing is persisted yet, so this is an offer, not a configured host.
+    row.is_configured = false;
+    row
 }
 
 #[cfg(test)]
@@ -5064,6 +5094,98 @@ mod tests {
     // against the rest of the suite, so sibling tests raced on shared
     // provider env vars (EXAMPLE_API_KEY, OPENROUTER_API_KEY, ...) and a panic
     // while holding it cascaded PoisonError failures into unrelated tests.
+
+    #[test]
+    fn provider_inspector_keeps_exact_diagnostics_in_clickable_keyboard_pager() {
+        let _env = crate::test_support::lock_test_env();
+        let config = Config::default();
+        let mut picker = ProviderPickerView::new(ApiProvider::Deepseek, &config);
+        let message = "Recovery fixture · exact diagnostic source ".repeat(12);
+        let selected = picker.selected_idx;
+        picker.rows[selected].messages = vec![
+            message.clone(),
+            "second diagnostic".into(),
+            "third diagnostic".into(),
+        ];
+        for (width, height) in [(40, 12), (60, 16), (80, 24), (100, 32), (140, 40)] {
+            let overview = render_text(&picker, width, height);
+            assert!(!overview.contains(&message));
+            let hit = picker
+                .detail_action_hitbox
+                .borrow()
+                .expect("visible details action");
+            let ViewAction::Emit(ViewEvent::OpenTextPager { title, content }) =
+                picker.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::ALT))
+            else {
+                panic!("the shared details shortcut must open the existing pager")
+            };
+            assert!(content.contains(&message));
+            assert!(content.contains("third diagnostic"));
+            assert!(content.contains("Protocol:"));
+            let ViewAction::Emit(ViewEvent::OpenTextPager {
+                title: clicked_title,
+                content: clicked_content,
+            }) = picker.handle_mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: hit.x,
+                row: hit.y,
+                modifiers: KeyModifiers::NONE,
+            })
+            else {
+                panic!("click must open the same pager")
+            };
+            assert_eq!(clicked_title, title);
+            assert_eq!(clicked_content, content);
+            assert_eq!(picker.selected_idx, selected);
+        }
+    }
+
+    #[test]
+    fn workbench_setup_choice_clicks_share_keyboard_confirmation_paths() {
+        let _env = crate::test_support::lock_test_env();
+        for stage in [
+            Stage::PlanTier,
+            Stage::StepfunBillingRoute,
+            Stage::XaiAuthChoice,
+            Stage::ChatgptAuthChoice,
+        ] {
+            for (width, height) in [(40, 12), (60, 16), (80, 24), (100, 32), (140, 40)] {
+                let config = Config::default();
+                let mut pointer = ProviderPickerView::new(ApiProvider::Deepseek, &config);
+                let mut keyboard = ProviderPickerView::new(ApiProvider::Deepseek, &config);
+                pointer.stage = stage;
+                keyboard.stage = stage;
+                let area = Rect::new(0, 0, width, height);
+                let mut buf = Buffer::empty(area);
+                pointer.render(area, &mut buf);
+                let hit = pointer
+                    .choice_row_hitboxes
+                    .borrow()
+                    .iter()
+                    .find(|(_, key)| *key == '2')
+                    .expect("both choices visible")
+                    .0;
+                let event = MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: hit.x,
+                    row: hit.y,
+                    modifiers: KeyModifiers::NONE,
+                };
+                assert!(matches!(pointer.handle_mouse(event), ViewAction::None));
+                assert_eq!(pointer.stage, stage, "first click only selects");
+                keyboard.handle_key(key(KeyCode::Char('2')));
+                let actual = pointer.handle_mouse(event);
+                let expected = keyboard.handle_key(key(KeyCode::Enter));
+                assert_eq!(format!("{actual:?}"), format!("{expected:?}"));
+                assert_eq!(pointer.stage, keyboard.stage);
+                assert_eq!(pointer.pending_base_url, keyboard.pending_base_url);
+                assert_eq!(
+                    pointer.selected_context_window,
+                    keyboard.selected_context_window
+                );
+            }
+        }
+    }
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -5190,17 +5312,13 @@ mod tests {
             .collect();
 
         // Catalog surface: one identity per vendor (not dual-wire / plan
-        // kinds), plus one row per compatible setup template the operator has
-        // not configured (Baseten and friends).
-        let compatible_templates = provider_setup_templates()
-            .iter()
-            .filter(|template| template.is_compatible())
-            .count();
+        // kinds). Setup templates are retired (#6289); the compatible hosts
+        // that replaced them are data rows from
+        // `provider_descriptors.json`, one each, on top of the catalog.
         assert_eq!(
             names.len(),
-            ApiProvider::catalog().len() + compatible_templates
+            ApiProvider::catalog().len() + bundled_provider_descriptors().len()
         );
-        assert!(names.contains(&"Baseten"), "{names:?}");
         assert!(names.contains(&"DeepSeek"));
         assert!(names.contains(&"Alibaba Cloud Model Studio"));
         // Dialect is wire config — no second MiniMax / Model Studio rows.
@@ -5238,50 +5356,9 @@ mod tests {
         );
     }
 
-    /// Baseten (and every other compatible template) is a row of the list,
-    /// not just a `/provider templates` entry, and Enter on it lands on the
-    /// custom-provider form already filled from the template.
+    /// A named custom provider appears exactly once, as a configured row.
     #[test]
-    fn compatible_templates_are_catalog_rows_that_open_a_prefilled_form() {
-        let config = Config::default();
-        let mut picker = ProviderPickerView::new(ApiProvider::Deepseek, &config);
-        let idx = picker
-            .rows
-            .iter()
-            .position(|row| row.template_id == Some("baseten"))
-            .expect("a Baseten template row");
-        let row = &picker.rows[idx];
-        assert_eq!(row.display_name, "Baseten");
-        assert_eq!(row.provider_id, "baseten");
-        assert_eq!(row.provider, ApiProvider::Custom);
-        assert!(
-            !row.is_configured,
-            "a template is not a configured provider"
-        );
-        assert!(!row.is_active);
-        assert!(row.matches_query("baseten"));
-
-        picker.view = ProviderListView::Catalog;
-        picker.selected_idx = idx;
-        assert!(picker.row_visible(idx));
-        assert!(matches!(picker.activate_selected_row(), ViewAction::None));
-        assert!(
-            matches!(picker.stage, Stage::CustomForm),
-            "{:?}",
-            picker.stage
-        );
-        assert_eq!(picker.custom_provider_id, "baseten");
-        assert_eq!(
-            picker.custom_provider_base_url,
-            "https://inference.baseten.co/v1"
-        );
-        assert_eq!(picker.custom_provider_api_key_env, "BASETEN_API_KEY");
-    }
-
-    /// Once the operator has named a custom provider after a template, the
-    /// configured row is the only one; the template row does not duplicate it.
-    #[test]
-    fn a_configured_custom_provider_replaces_its_template_row() {
+    fn a_configured_custom_provider_appears_once() {
         let mut config = Config::default();
         config
             .providers
@@ -5305,7 +5382,141 @@ mod tests {
             .collect();
         assert_eq!(baseten.len(), 1, "one Baseten row, the configured one");
         assert!(baseten[0].is_configured);
-        assert_eq!(baseten[0].template_id, None);
+    }
+
+    /// #6289 moved the compatible hosts into
+    /// `crates/config/assets/provider_descriptors.json` and wired the file to
+    /// nothing, so SenseNova, Baseten, Groq, Cerebras, DashScope and Command
+    /// Code silently lost their `/provider` rows (and AICraft never got one).
+    /// Every bundled descriptor is a findable row again — exactly one each,
+    /// carrying the host's own name, endpoint, bootstrap model and the
+    /// credential env var it is still missing.
+    #[test]
+    fn every_bundled_descriptor_is_a_picker_row_exactly_once() {
+        let _env = crate::test_support::lock_test_env();
+        let _keys: Vec<_> = bundled_provider_descriptors()
+            .iter()
+            .map(|descriptor| crate::test_support::EnvVarGuard::remove(&descriptor.api_key_env))
+            .collect();
+        let config = Config::default();
+        let picker = ProviderPickerView::new(ApiProvider::Deepseek, &config);
+        assert!(
+            !bundled_provider_descriptors().is_empty(),
+            "the bundled descriptor file must not be empty"
+        );
+        for descriptor in bundled_provider_descriptors() {
+            let rows: Vec<_> = picker
+                .rows
+                .iter()
+                .filter(|row| row.provider_id == descriptor.id)
+                .collect();
+            assert_eq!(rows.len(), 1, "one row for {}", descriptor.id);
+            let row = rows[0];
+            assert_eq!(row.provider, ApiProvider::Custom, "{}", descriptor.id);
+            assert_eq!(row.display_name, descriptor.label);
+            assert_eq!(row.base_url, descriptor.base_url, "{}", descriptor.id);
+            assert_eq!(
+                row.default_route.logical_model, descriptor.default_model,
+                "{}",
+                descriptor.id
+            );
+            assert!(
+                !row.has_key,
+                "{} has no credential with its env var unset",
+                descriptor.id
+            );
+            assert!(
+                !row.is_configured,
+                "{} is an offer to set up, not a configured host",
+                descriptor.id
+            );
+            assert!(
+                row.messages
+                    .iter()
+                    .any(|message| message.contains(&descriptor.api_key_env)),
+                "{} must name the credential it is missing: {:?}",
+                descriptor.id,
+                row.messages
+            );
+        }
+    }
+
+    /// The bundled offer never doubles a host the user already wrote down:
+    /// `[providers.groq]` keeps its own configured row and nothing else.
+    #[test]
+    fn a_configured_descriptor_id_does_not_duplicate_its_row() {
+        let descriptor = provider_descriptor("groq").expect("groq descriptor");
+        let mut config = Config::default();
+        config
+            .providers
+            .get_or_insert_with(Default::default)
+            .custom
+            .insert(
+                descriptor.id.clone(),
+                crate::config::ProviderConfig {
+                    kind: Some("openai-compatible".to_string()),
+                    base_url: Some(descriptor.base_url.clone()),
+                    model: Some(descriptor.default_model.clone()),
+                    api_key_env: Some(descriptor.api_key_env.clone()),
+                    ..Default::default()
+                },
+            );
+        let picker = ProviderPickerView::new(ApiProvider::Deepseek, &config);
+        let rows: Vec<_> = picker
+            .rows
+            .iter()
+            .filter(|row| row.provider_id == descriptor.id)
+            .collect();
+        assert_eq!(rows.len(), 1, "the configured row wins");
+        assert!(rows[0].is_configured);
+        assert_eq!(rows[0].display_name, "groq (custom)");
+    }
+
+    /// Setting a descriptor row up goes through the named-custom-provider
+    /// submit a hand-entered host uses, so `[providers.<id>]` lands with the
+    /// descriptor's endpoint and bootstrap model. The only field left open is
+    /// which env var holds the key, and that is where the cursor starts.
+    #[test]
+    fn activating_a_descriptor_row_submits_it_as_a_named_custom_provider() {
+        let _env = crate::test_support::lock_test_env();
+        let descriptor = provider_descriptor("groq").expect("groq descriptor");
+        let _key = crate::test_support::EnvVarGuard::remove(&descriptor.api_key_env);
+        let config = Config::default();
+        let mut picker = ProviderPickerView::new(ApiProvider::Deepseek, &config);
+        picker.view = ProviderListView::Catalog;
+        picker.selected_idx = picker
+            .rows
+            .iter()
+            .position(|row| row.provider_id == descriptor.id)
+            .expect("a Groq row");
+
+        assert!(matches!(
+            picker.handle_key(key(KeyCode::Enter)),
+            ViewAction::None
+        ));
+        assert_eq!(picker.stage, Stage::CustomForm);
+        assert_eq!(picker.custom_provider_field, CustomProviderField::ApiKeyEnv);
+        assert_eq!(picker.custom_provider_id, descriptor.id);
+        assert_eq!(picker.custom_provider_base_url, descriptor.base_url);
+        assert_eq!(picker.custom_provider_model, descriptor.default_model);
+
+        match picker.handle_key(key(KeyCode::Enter)) {
+            ViewAction::EmitAndClose(ViewEvent::ProviderPickerCustomProviderSubmitted {
+                provider_id,
+                base_url,
+                model,
+                api_key_env,
+            }) => {
+                assert_eq!(provider_id, descriptor.id);
+                assert_eq!(base_url, descriptor.base_url);
+                assert_eq!(model.as_deref(), Some(descriptor.default_model.as_str()));
+                assert_eq!(
+                    api_key_env.as_deref(),
+                    Some(descriptor.api_key_env.as_str())
+                );
+            }
+            other => panic!("expected custom provider submit event, got {other:?}"),
+        }
     }
 
     #[test]
@@ -5482,6 +5693,100 @@ mod tests {
             .find(|row| row.provider == ApiProvider::Ollama)
             .expect("ollama row");
         assert!(active_ollama.is_configured);
+    }
+
+    #[test]
+    fn explicit_provider_search_accepts_shortcut_letters_and_escape_restores_actions() {
+        let _env = crate::test_support::lock_test_env();
+        let mut picker = ProviderPickerView::new(ApiProvider::Deepseek, &Config::default());
+        let view = picker.view;
+        picker.handle_key(key(KeyCode::Char('/')));
+        for ch in "Anthropic".chars() {
+            assert!(matches!(
+                picker.handle_key(KeyEvent::new(
+                    KeyCode::Char(ch),
+                    if ch.is_uppercase() {
+                        KeyModifiers::SHIFT
+                    } else {
+                        KeyModifiers::NONE
+                    }
+                )),
+                ViewAction::None
+            ));
+        }
+        assert_eq!(picker.query, "Anthropic");
+        assert_eq!(picker.stage, Stage::List);
+        assert_eq!(picker.view, view);
+        // Modified commands retain their own meaning in explicit search.
+        let _ = picker.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
+        assert_eq!(picker.query, "Anthropic");
+        assert!(matches!(
+            picker.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::ALT)),
+            ViewAction::Emit(ViewEvent::OpenTextPager { .. })
+        ));
+        assert!(
+            picker
+                .filtered_rows()
+                .iter()
+                .any(|(_, row)| row.provider == ApiProvider::Anthropic)
+        );
+        picker.handle_key(key(KeyCode::Esc));
+        picker.handle_key(key(KeyCode::Char('/')));
+        assert!(picker.handle_paste("Anthropic"));
+        assert_eq!(picker.query, "Anthropic");
+        picker.handle_key(key(KeyCode::Esc));
+        assert!(!picker.search_mode);
+        assert!(picker.query.is_empty());
+        picker.handle_key(key(KeyCode::Char('a')));
+        assert_ne!(picker.view, view);
+        picker.handle_key(key(KeyCode::Char('/')));
+        picker.handle_key(key(KeyCode::Esc));
+        assert!(!picker.search_mode);
+        picker.handle_key(key(KeyCode::Char('/')));
+        for ch in "anthropic".chars() {
+            picker.handle_key(key(KeyCode::Char(ch)));
+        }
+        assert_eq!(picker.selected_provider(), ApiProvider::Anthropic);
+        let action = picker.handle_key(key(KeyCode::Enter));
+        assert!(
+            matches!(action, ViewAction::EmitAndClose(_)) || picker.stage != Stage::List,
+            "Enter on a search result must apply or open its setup"
+        );
+    }
+
+    #[test]
+    fn provider_catalog_header_click_matches_keyboard_and_clears_stale_hits() {
+        let _env = crate::test_support::lock_test_env();
+        let config = Config::default();
+        for (width, height) in [(40, 12), (80, 24), (140, 40)] {
+            let mut picker = ProviderPickerView::new(ApiProvider::Deepseek, &config);
+            let mut keyboard = ProviderPickerView::new(ApiProvider::Deepseek, &config);
+            render_text(&picker, width, height);
+            let hit = picker
+                .catalog_action_hitbox
+                .borrow()
+                .expect("catalog action");
+            assert!(hit.right() <= width && hit.y < height);
+            assert!(matches!(
+                picker.handle_mouse(MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: hit.x,
+                    row: hit.y,
+                    modifiers: KeyModifiers::NONE,
+                }),
+                ViewAction::None
+            ));
+            keyboard.handle_key(key(KeyCode::Char('a')));
+            assert_eq!(picker.view, keyboard.view);
+            assert_eq!(picker.selected_idx, keyboard.selected_idx);
+            // No matches must not retain clickable provider rows from the
+            // previous frame; the catalog control remains a separate action.
+            picker.update_query("definitely-no-provider-matches-this".into());
+            render_text(&picker, width, height);
+            assert!(picker.list_row_hitboxes.borrow().is_empty());
+            render_text(&picker, 0, 0);
+            assert!(picker.catalog_action_hitbox.borrow().is_none());
+        }
     }
 
     #[test]
@@ -5922,9 +6227,14 @@ mod tests {
             .find(|row| row.provider == ApiProvider::Deepseek)
             .expect("DeepSeek row");
         assert_eq!(row.readiness, ResolvedProviderReadiness::SavedUnchecked);
+        // Readiness is per route identity (provider + endpoint + auth class +
+        // model), so record the check against the row's own default-route
+        // model. A hardcoded model literal goes stale whenever the provider's
+        // default route moves — which is exactly what happened here.
+        let row_model = row.default_route.logical_model.clone();
 
         let mut health = ProviderReadinessSnapshot::default();
-        health.record_success(&config, ApiProvider::Deepseek, "deepseek-v4-pro");
+        health.record_success(&config, ApiProvider::Deepseek, &row_model);
         let ready =
             ProviderPickerView::new(ApiProvider::Deepseek, &config).with_provider_health(&health);
         assert_eq!(
@@ -5940,7 +6250,7 @@ mod tests {
         health.record_failure_message(
             &config,
             ApiProvider::Deepseek,
-            "deepseek-v4-pro",
+            &row_model,
             crate::error_taxonomy::ErrorCategory::Authentication,
             "credential rejected",
         );
@@ -6716,133 +7026,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn sensenova_preset_fills_published_openai_host() {
-        let config = Config::default();
-        let mut picker = ProviderPickerView::new(ApiProvider::Deepseek, &config);
-        assert!(matches!(
-            picker.handle_key(key(KeyCode::Char('s'))),
-            ViewAction::None
-        ));
-        assert_eq!(picker.stage, Stage::CustomForm);
-        assert_eq!(picker.custom_provider_id, "sensenova");
-        assert_eq!(
-            picker.custom_provider_base_url,
-            codewhale_config::SENSENOVA_BASE_URL
-        );
-        assert_eq!(
-            picker.custom_provider_model,
-            codewhale_config::SENSENOVA_DEFAULT_MODEL
-        );
-        assert_eq!(
-            picker.custom_provider_api_key_env,
-            codewhale_config::SENSENOVA_API_KEY_ENV
-        );
-        let rendered = render_text(&picker, 100, 20);
-        assert!(rendered.contains("SenseNova"), "{rendered}");
-        assert!(
-            !rendered.contains("Custom provider"),
-            "built-in template must not look like a blank custom form: {rendered}"
-        );
-    }
-
-    #[test]
-    fn p_opens_template_list_with_catalog_rows() {
-        let config = Config::default();
-        let mut picker = ProviderPickerView::new(ApiProvider::Deepseek, &config);
-        assert!(matches!(
-            picker.handle_key(key(KeyCode::Char('p'))),
-            ViewAction::None
-        ));
-        assert_eq!(picker.stage, Stage::TemplateList);
-        let rendered = render_text(&picker, 100, 24);
-        assert!(rendered.contains("OpenCode Zen"), "{rendered}");
-        assert!(rendered.contains("OpenCode Go"), "{rendered}");
-        assert!(rendered.contains("SenseNova"), "{rendered}");
-        assert!(rendered.contains("Command Code"), "{rendered}");
-        assert!(rendered.contains("Agnes"), "{rendered}");
-        assert!(
-            rendered.contains("no published") || rendered.contains("unpublished"),
-            "{rendered}"
-        );
-        assert!(
-            rendered.contains("https://opencode.ai/zen/v1"),
-            "descriptor endpoint missing: {rendered}"
-        );
-        assert!(
-            rendered.contains("https://opencode.ai/docs/zen/"),
-            "{rendered}"
-        );
-        assert!(
-            !rendered.contains("minimax-m2.7"),
-            "template detail must not dump the Zen roster: {rendered}"
-        );
-    }
-
-    #[test]
-    fn template_list_enter_on_unpublished_agnes_does_not_invent_a_url() {
-        let config = Config::default();
-        let mut picker = ProviderPickerView::new_for_template_setup(
-            ApiProvider::Deepseek,
-            "agnes",
-            &config,
-            None,
-        )
-        .expect("agnes template");
-        assert_eq!(picker.stage, Stage::TemplateList);
-        let action = picker.handle_key(key(KeyCode::Enter));
-        match action {
-            ViewAction::Emit(ViewEvent::StatusMessage { message }) => {
-                assert!(
-                    message.to_ascii_lowercase().contains("no published"),
-                    "{message}"
-                );
-            }
-            other => panic!("expected unpublished status, got {other:?}"),
-        }
-        assert!(picker.custom_provider_base_url.is_empty());
-    }
-
-    fn template_list_click(column: u16, row: u16) -> MouseEvent {
-        MouseEvent {
-            kind: MouseEventKind::Down(MouseButton::Left),
-            column,
-            row,
-            modifiers: KeyModifiers::NONE,
-        }
-    }
-
-    /// Slice D hover rule: template rows are clickable, so hover must
-    /// respond visibly without moving the keyboard selection.
-    #[test]
-    fn template_list_hover_tracks_pointer_without_moving_selection() {
-        let config = Config::default();
-        let mut picker = ProviderPickerView::new(ApiProvider::Deepseek, &config);
-        assert!(matches!(
-            picker.handle_key(key(KeyCode::Char('p'))),
-            ViewAction::None
-        ));
-        let area = Rect::new(0, 0, 100, 24);
-        let mut buf = Buffer::empty(area);
-        picker.render(area, &mut buf);
-        let (rect, idx) = picker
-            .template_row_hitboxes
-            .borrow()
-            .iter()
-            .copied()
-            .find(|(_, row_idx)| *row_idx != picker.template_selected_idx)
-            .expect("a non-selected template row");
-        let selected_before = picker.template_selected_idx;
-        picker.handle_mouse(MouseEvent {
-            kind: MouseEventKind::Moved,
-            column: rect.x,
-            row: rect.y,
-            modifiers: KeyModifiers::NONE,
-        });
-        assert_eq!(picker.hovered_template_idx, Some(idx));
-        assert_eq!(picker.template_selected_idx, selected_before);
-    }
-
     /// Slice D two-pane picker at narrow widths: the provider strip stays on
     /// top and the priced models pane renders under it (stacked layout).
     /// Ollama carries no auth notes, so the pane fits the short detail area;
@@ -6860,192 +7043,6 @@ mod tests {
         assert!(rendered.contains("(default)"), "{rendered}");
         assert!(rendered.contains("local"), "{rendered}");
         assert!(!rendered.contains("cost:"), "{rendered}");
-    }
-
-    #[test]
-    fn template_list_mouse_selects_row_and_second_click_activates() {
-        let config = Config::default();
-        let mut picker = ProviderPickerView::new(ApiProvider::Deepseek, &config);
-        assert!(matches!(
-            picker.handle_key(key(KeyCode::Char('p'))),
-            ViewAction::None
-        ));
-        let area = Rect::new(0, 0, 100, 24);
-        let mut buf = Buffer::empty(area);
-        picker.render(area, &mut buf);
-        let (rect, idx) = picker
-            .template_row_hitboxes
-            .borrow()
-            .iter()
-            .copied()
-            .find(|(_, row_idx)| *row_idx == 2)
-            .expect("SenseNova row hitbox");
-        assert_eq!(
-            provider_setup_templates()[idx].id,
-            codewhale_config::SENSENOVA_TEMPLATE_ID
-        );
-        let click = template_list_click(rect.x, rect.y);
-        assert!(matches!(picker.handle_mouse(click), ViewAction::None));
-        assert_eq!(picker.template_selected_idx, idx);
-        assert_eq!(picker.stage, Stage::TemplateList);
-        picker.handle_mouse(click);
-        assert_eq!(picker.stage, Stage::CustomForm);
-        assert_eq!(picker.custom_provider_id, "sensenova");
-        assert_eq!(
-            picker.custom_provider_base_url,
-            codewhale_config::SENSENOVA_BASE_URL
-        );
-    }
-
-    #[test]
-    fn template_list_mouse_second_click_on_unpublished_does_not_invent_a_url() {
-        let config = Config::default();
-        let mut picker = ProviderPickerView::new(ApiProvider::Deepseek, &config);
-        assert!(matches!(
-            picker.handle_key(key(KeyCode::Char('p'))),
-            ViewAction::None
-        ));
-        let area = Rect::new(0, 0, 100, 24);
-        let mut buf = Buffer::empty(area);
-        picker.render(area, &mut buf);
-        let (rect, idx) = picker
-            .template_row_hitboxes
-            .borrow()
-            .iter()
-            .copied()
-            .find(|(_, row_idx)| provider_setup_templates()[*row_idx].is_unpublished())
-            .expect("Agnes row hitbox");
-        let click = template_list_click(rect.x, rect.y);
-        assert!(matches!(picker.handle_mouse(click), ViewAction::None));
-        assert_eq!(picker.template_selected_idx, idx);
-        match picker.handle_mouse(click) {
-            ViewAction::Emit(ViewEvent::StatusMessage { message }) => {
-                assert!(
-                    message.to_ascii_lowercase().contains("no published"),
-                    "{message}"
-                );
-            }
-            other => panic!("expected unpublished status, got {other:?}"),
-        }
-        assert!(picker.custom_provider_base_url.is_empty());
-        assert_eq!(picker.stage, Stage::TemplateList);
-    }
-
-    #[test]
-    fn template_list_compact_40x12_keeps_selection_without_clipping() {
-        let config = Config::default();
-        let mut picker = ProviderPickerView::new(ApiProvider::Deepseek, &config);
-        assert!(matches!(
-            picker.handle_key(key(KeyCode::Char('p'))),
-            ViewAction::None
-        ));
-
-        for selected in [0usize, provider_setup_templates().len().saturating_sub(1)] {
-            picker.template_selected_idx = selected;
-            let area = Rect::new(0, 0, 40, 12);
-            let mut buf = Buffer::empty(area);
-            picker.render(area, &mut buf);
-            let rendered = render_text(&picker, 40, 12);
-            let selected_template = &provider_setup_templates()[selected];
-            assert!(
-                rendered.contains(selected_template.display_name),
-                "40x12 must keep selected {} visible:\n{rendered}",
-                selected_template.display_name
-            );
-            assert!(
-                rendered.contains(crate::tui::glyphs::SELECTION),
-                "40x12 must show the selection marker:\n{rendered}"
-            );
-            for (idx, line) in rendered.lines().enumerate() {
-                assert!(
-                    crate::tui::ui_text::text_display_width(line) <= 40,
-                    "40x12 line {idx} clips: {line:?}\n{rendered}"
-                );
-            }
-            let hitboxes = picker.template_row_hitboxes.borrow().clone();
-            assert!(
-                !hitboxes.is_empty(),
-                "40x12 must register template hitboxes:\n{rendered}"
-            );
-            assert!(
-                hitboxes.iter().any(|(_, idx)| *idx == selected),
-                "40x12 hitboxes must include selected {selected}: {hitboxes:?}\n{rendered}"
-            );
-            for (rect, idx) in &hitboxes {
-                assert!(
-                    rect.y < 12 && rect.x < 40,
-                    "hitbox for {idx} is outside 40x12: {rect:?}"
-                );
-                let row = (0..40)
-                    .map(|x| buf[(x, rect.y)].symbol())
-                    .collect::<String>();
-                assert!(
-                    row.contains(provider_setup_templates()[*idx].display_name)
-                        || row.contains(provider_setup_templates()[*idx].id),
-                    "40x12 hitbox y={} should map to {}: {row:?}",
-                    rect.y,
-                    provider_setup_templates()[*idx].display_name
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn template_list_uses_locale_for_kinds_labels_and_guidance() {
-        let config = Config::default();
-        let mut picker = ProviderPickerView::new(ApiProvider::Deepseek, &config)
-            .with_locale(codewhale_localization::Locale::ZhHans);
-        assert!(matches!(
-            picker.handle_key(key(KeyCode::Char('p'))),
-            ViewAction::None
-        ));
-        let rendered = render_text(&picker, 100, 24);
-        // TestBackend stores the continuation cell of each wide CJK glyph
-        // as a space. Collapse whitespace for language-copy assertions
-        // while retaining the original cell dump for English-leak checks.
-        let compact: String = rendered.chars().filter(|ch| !ch.is_whitespace()).collect();
-        assert!(rendered.contains("OpenCode Zen"), "{rendered}");
-        assert!(rendered.contains("SenseNova"), "{rendered}");
-        assert!(rendered.contains("Agnes"), "{rendered}");
-        assert!(compact.contains("仅密钥"), "{rendered}");
-        assert!(compact.contains("兼容"), "{rendered}");
-        assert!(
-            compact.contains("基础URL"),
-            "localized Base URL label missing: {rendered}"
-        );
-        assert!(
-            compact.contains("模型：") || compact.contains("模型:"),
-            "localized Model label missing: {rendered}"
-        );
-        assert!(
-            !rendered.contains("key-only"),
-            "English kind leaked: {rendered}"
-        );
-        assert!(
-            !rendered.contains("Base URL:"),
-            "English Base URL leaked: {rendered}"
-        );
-        assert!(
-            !rendered.contains("Create or copy an OpenCode Zen API key"),
-            "English guidance leaked: {rendered}"
-        );
-        picker.template_selected_idx = provider_setup_templates()
-            .iter()
-            .position(|template| template.is_unpublished())
-            .expect("agnes");
-        let unpublished = render_text(&picker, 100, 24);
-        let unpublished_compact: String = unpublished
-            .chars()
-            .filter(|ch| !ch.is_whitespace())
-            .collect();
-        assert!(
-            unpublished_compact.contains("未公布") || unpublished_compact.contains("没有"),
-            "{unpublished}"
-        );
-        assert!(
-            !unpublished.contains("unpublished"),
-            "English unpublished kind leaked: {unpublished}"
-        );
     }
 
     #[test]
@@ -7094,6 +7091,19 @@ mod tests {
         let action = picker.handle_key(key(KeyCode::Char('t')));
         assert!(matches!(action, ViewAction::None));
         assert_eq!(picker.query, "t");
+        assert_eq!(picker.stage, Stage::List);
+    }
+
+    #[test]
+    fn p_key_is_type_ahead_not_a_retired_template_list() {
+        // #6289: the `p` template list is retired; `p` is ordinary
+        // type-ahead like every other unbound letter.
+        let config = Config::default();
+        let mut picker = ProviderPickerView::new(ApiProvider::Deepseek, &config);
+        picker.toggle_view();
+        let action = picker.handle_key(key(KeyCode::Char('p')));
+        assert!(matches!(action, ViewAction::None));
+        assert_eq!(picker.query, "p");
         assert_eq!(picker.stage, Stage::List);
     }
 
@@ -7296,7 +7306,8 @@ mod tests {
         assert_eq!(row.readiness, ResolvedProviderReadiness::MissingKey);
         assert_eq!(row.readiness.label(), "missing key");
         let hint = row.detail_state_line();
-        assert!(hint.contains("key:not-set"));
+        assert!(hint.contains("missing key"));
+        assert!(!hint.contains("key:not-set"));
         assert!(!hint.contains("needs-auth"));
         assert!(!hint.contains("auth:missing"));
         assert!(
@@ -7447,7 +7458,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_dashboard_render_includes_route_protocol_usage_and_base_url() {
+    fn provider_dashboard_keeps_route_and_prices_visible_with_protocol_in_details() {
         let config = Config {
             providers: Some(crate::config::ProvidersConfig {
                 openai: crate::config::ProviderConfig {
@@ -7464,10 +7475,17 @@ mod tests {
 
         let rendered = render_text(&picker, 124, 24);
 
-        assert!(rendered.contains("key:configured"));
+        assert!(rendered.contains("key saved"));
+        assert!(!rendered.contains("key:configured"));
         assert!(!rendered.contains("auth:configured"));
         assert!(rendered.contains("Route: custom-model"));
-        assert!(rendered.contains("chat"));
+        let ViewAction::Emit(ViewEvent::OpenTextPager { content, .. }) =
+            picker.open_provider_details()
+        else {
+            panic!("protocol details must remain accessible")
+        };
+        assert!(content.contains("Protocol: chat"));
+        assert!(rendered.contains(picker.tr(MessageId::CtxMenuOpenDetails).as_ref()));
         // Slice D: provider detail carries no cost; the models pane does.
         assert!(!rendered.contains("cost:"));
         assert!(!rendered.contains("Usage:"));
@@ -7565,6 +7583,51 @@ mod tests {
     }
 
     #[test]
+    fn page_and_edge_motions_clamp_and_never_land_on_hidden_rows() {
+        let config = Config::default();
+        let mut picker = ProviderPickerView::new(ApiProvider::Deepseek, &config);
+        picker.toggle_view(); // full catalog (#3830)
+        let last = picker.rows.len() - 1;
+
+        picker.selected_idx = 0;
+        picker.handle_key(key(KeyCode::PageDown));
+        assert_eq!(
+            picker.selected_idx,
+            PROVIDER_PAGE.min(last),
+            "PageDown travels one page and clamps at the end"
+        );
+        picker.handle_key(key(KeyCode::End));
+        assert_eq!(picker.selected_idx, last, "End is the last visible row");
+        picker.handle_key(key(KeyCode::PageDown));
+        assert_eq!(
+            picker.selected_idx, last,
+            "paging at the end clamps, never wraps"
+        );
+        picker.handle_key(key(KeyCode::PageUp));
+        assert_eq!(picker.selected_idx, last.saturating_sub(PROVIDER_PAGE));
+        picker.handle_key(key(KeyCode::Home));
+        assert_eq!(picker.selected_idx, 0, "Home is the first visible row");
+
+        // With a live filter, motions land only on rows it shows.
+        picker.update_query("deep".to_string());
+        picker.handle_key(key(KeyCode::End));
+        assert!(
+            picker.row_visible(picker.selected_idx),
+            "End must skip rows the filter hides"
+        );
+        let last_visible = (0..picker.rows.len())
+            .rev()
+            .find(|&index| picker.row_visible(index))
+            .expect("a filter matching something");
+        assert_eq!(picker.selected_idx, last_visible);
+        picker.handle_key(key(KeyCode::Home));
+        let first_visible = (0..picker.rows.len())
+            .find(|&index| picker.row_visible(index))
+            .expect("a filter matching something");
+        assert_eq!(picker.selected_idx, first_visible);
+    }
+
+    #[test]
     fn enter_with_no_key_transitions_to_key_entry_stage() {
         let config = Config::default();
         let mut picker = ProviderPickerView::new(ApiProvider::Deepseek, &config);
@@ -7625,26 +7688,27 @@ mod tests {
         let mut listed = picker
             .rows
             .iter()
-            .filter(|row| row.template_id.is_none())
             .map(|row| row.provider)
             .collect::<Vec<_>>();
         // With no configured custom providers, the catalog keeps the Custom
         // entry so a custom endpoint can still be created from setup. The
         // canonical universe is the user-facing catalog (one identity per
         // vendor): dual-wire dialects are `wire` config and plan variants are
-        // `mode`/base_url, not picker rows.
+        // `mode`/base_url, not picker rows. Setup templates are retired
+        // (#6289), so every row is a first-class provider.
         let mut expected = ApiProvider::catalog().to_vec();
+        // Plus one `Custom` row per bundled compatible-host descriptor
+        // (#6289) — setup is where those hosts are found and configured.
+        expected.extend(
+            bundled_provider_descriptors()
+                .iter()
+                .map(|_| ApiProvider::Custom),
+        );
         listed.sort_by_key(|provider| provider.as_str());
         expected.sort_by_key(|provider| provider.as_str());
         assert_eq!(
             listed, expected,
             "setup must use the canonical provider universe"
-        );
-        assert!(
-            picker
-                .rows
-                .iter()
-                .any(|row| row.template_id == Some("baseten"))
         );
     }
 
@@ -9622,7 +9686,7 @@ mod tests {
         let rendered = render_text(&picker, 80, 23);
 
         assert!(rendered.contains("DeepSeek *"));
-        assert!(rendered.contains("Details"));
+        assert!(rendered.contains(picker.tr(MessageId::CtxMenuOpenDetails).as_ref()));
         assert!(rendered.contains("Route:"));
     }
 
@@ -9667,7 +9731,7 @@ mod tests {
             let text = rows.join("\n");
 
             // Footer keeps every action (it wraps instead of clipping).
-            for label in ["move", "jump", "edit key", "models", "cancel"] {
+            for label in ["move", "search", "edit key", "models", "cancel"] {
                 assert!(text.contains(label), "{w}x{h}: missing '{label}' hint");
             }
             // The Enter action label is dynamic (apply vs set key); one shows.

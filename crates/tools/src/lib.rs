@@ -567,11 +567,6 @@ impl ToolRegistry {
         Ok(())
     }
 
-    /// Return the configured specs for every registered tool.
-    pub fn list_specs(&self) -> Vec<ConfiguredToolDescriptor> {
-        self.specs.values().cloned().collect()
-    }
-
     /// Validate and execute a tool call.
     ///
     /// Looks up the tool by name, verifies the payload kind matches the

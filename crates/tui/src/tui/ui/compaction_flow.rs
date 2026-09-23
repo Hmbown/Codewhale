@@ -522,35 +522,6 @@ fn set_context_pressure_status(
 }
 
 #[cfg(test)]
-pub(crate) fn should_auto_compact_before_send(app: &App) -> bool {
-    let config = app.compaction_config();
-    should_auto_compact_before_send_with_config(app, &config)
-}
-
-#[cfg(test)]
-pub(crate) fn should_auto_compact_before_send_with_config(
-    app: &App,
-    config: &crate::compaction::CompactionConfig,
-) -> bool {
-    if !config.enabled {
-        return false;
-    }
-    // Use the same ceiling-anchored token threshold as the engine. Comparing
-    // against a raw percentage of the input-plus-output window can delay this
-    // gate until after the spendable input budget has already been exhausted.
-    let max = config.effective_context_window.unwrap_or_else(|| {
-        crate::route_budget::route_context_window_tokens(
-            app.api_provider,
-            app.effective_model_for_budget(),
-            app.active_route_limits,
-        )
-    });
-    context_usage_snapshot_for_window(app, max)
-        .map(|(used, _, _)| used.max(0) as usize >= config.token_threshold)
-        .unwrap_or(false)
-}
-
-#[cfg(test)]
 mod config_update_tests {
     use super::*;
     use crate::core::engine::mock_engine_handle;

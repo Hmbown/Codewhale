@@ -36,7 +36,7 @@ use self::sse::SseTransport;
 use self::stdio::StdioTransport;
 #[cfg(all(test, unix))]
 use self::stdio::{STDIO_SHUTDOWN_GRACE, StderrTail};
-use self::wire::{is_mcp_stale_session_body, is_mcp_stale_session_error};
+use self::wire::{is_mcp_stale_session_body, is_retriable_mcp_call_error};
 use crate::network_policy::{Decision, NetworkPolicyDecider, host_from_url};
 use crate::utils::write_atomic;
 
@@ -44,6 +44,14 @@ use crate::utils::write_atomic;
 
 /// Bytes of a non-2xx response body to surface in connection errors.
 const ERROR_BODY_PREVIEW_BYTES: usize = 200;
+
+/// Newest dated MCP protocol revision Codewhale advertises at `initialize` and
+/// answers as an MCP server. Matches the shared MCP crate (`crates/mcp`).
+pub(crate) const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
+/// Dated MCP revisions accepted during negotiation, newest first. A peer
+/// answering or requesting any of these continues the handshake.
+pub(crate) const MCP_SUPPORTED_PROTOCOL_VERSIONS: &[&str] =
+    &[MCP_PROTOCOL_VERSION, "2025-03-26", "2024-11-05"];
 
 fn validate_mcp_config_path(path: &Path) -> Result<()> {
     if path.as_os_str().is_empty() {
@@ -631,6 +639,13 @@ pub(crate) struct ReviewedPluginMcpSource {
 }
 
 impl ReviewedPluginMcpSource {
+    /// The plugin bundle that contributes this server. The panel names it
+    /// rather than parsing the synthesized `plugin-<len>-<plugin>-<server>`
+    /// key, which is an encoding detail and not a contract.
+    pub(crate) fn plugin_name(&self) -> &str {
+        &self.authority.plugin_name
+    }
+
     fn from_authority(
         authority: crate::plugins::types::PluginAuthority,
         remote_endpoint: Option<&str>,
@@ -1236,14 +1251,15 @@ pub struct McpResourceTemplate {
 /// simple (`{id}`), and reserved (`{+path}`) expansions cover the common MCP
 /// resource templates. More elaborate operators remain listable but are not
 /// callable until their expansion semantics are implemented exactly.
-fn resource_uri_matches_template(uri: &str, template: &str) -> bool {
+///
+/// `None` is the fail-closed answer: a template this subset cannot express
+/// matches nothing.
+fn resource_template_pattern(template: &str) -> Option<String> {
     let mut pattern = String::from("^");
     let mut rest = template;
     while let Some(start) = rest.find('{') {
         pattern.push_str(&regex::escape(&rest[..start]));
-        let Some(end) = rest[start + 1..].find('}') else {
-            return false;
-        };
+        let end = rest[start + 1..].find('}')?;
         let expression = &rest[start + 1..start + 1 + end];
         let (reserved, variables) = match expression.strip_prefix('+') {
             Some(variables) => (true, variables),
@@ -1257,7 +1273,7 @@ fn resource_uri_matches_template(uri: &str, template: &str) -> bool {
                         .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.'))
             })
         {
-            return false;
+            return None;
         }
         let atom = if reserved { ".+" } else { "[^/?#]+" };
         for (index, _) in variables.split(',').enumerate() {
@@ -1269,11 +1285,38 @@ fn resource_uri_matches_template(uri: &str, template: &str) -> bool {
         rest = &rest[start + end + 2..];
     }
     if rest.contains('}') {
-        return false;
+        return None;
     }
     pattern.push_str(&regex::escape(rest));
     pattern.push('$');
-    regex::Regex::new(&pattern).is_ok_and(|regex| regex.is_match(uri))
+    Some(pattern)
+}
+
+/// `template`'s anchored pattern, compiled once and reused.
+///
+/// This runs per URI per advertised template, while the template itself is
+/// fixed by the server's listing, so compiling it on every call was pure
+/// repetition. `None` still means "matches nothing" (#6213 T7).
+fn compiled_resource_template(template: &str) -> Option<Arc<regex::Regex>> {
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<HashMap<String, Option<Arc<regex::Regex>>>>,
+    > = std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    let mut cache = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    cache
+        .entry(template.to_string())
+        .or_insert_with(|| {
+            resource_template_pattern(template)
+                .and_then(|pattern| regex::Regex::new(&pattern).ok())
+                .map(Arc::new)
+        })
+        .clone()
+}
+
+fn resource_uri_matches_template(uri: &str, template: &str) -> bool {
+    compiled_resource_template(template).is_some_and(|regex| regex.is_match(uri))
 }
 
 /// Prompt discovered from an MCP server
@@ -1396,6 +1439,22 @@ where
 pub trait McpTransport: Send + Sync {
     async fn send(&mut self, msg: Vec<u8>) -> Result<()>;
     async fn recv(&mut self) -> Result<Vec<u8>>;
+
+    /// Record the protocol revision negotiated at `initialize`. Only the
+    /// Streamable HTTP transport uses it (the `MCP-Protocol-Version` header on
+    /// subsequent requests); stdio and legacy SSE have no header channel, so
+    /// the default is a no-op.
+    fn set_protocol_version(&mut self, _version: &str) {}
+
+    /// Synchronous, best-effort liveness probe consulted by
+    /// [`McpConnection::is_ready`] so a crashed stdio child stops reading
+    /// as "ready" before the next call fails (#6187). Must never block and
+    /// never spawn — a contended lock reads as alive; the next call observes
+    /// the death. HTTP/SSE transports have no child to observe, so the
+    /// default is "alive".
+    fn probe_dead(&self) -> bool {
+        false
+    }
 
     /// Graceful shutdown — stdio transports send SIGTERM to the child and
     /// give it a brief window to exit before tokio's `kill_on_drop` fires
@@ -1536,11 +1595,30 @@ impl PendingAuthorityWatch {
         reason_slot: Arc<std::sync::Mutex<Option<String>>>,
     ) -> Self {
         let task_cancel = cancel.clone();
+        // The watch stays per-connection by design (#6211 R7a): it is born
+        // with the connect attempt (covering the pre-insertion window) and
+        // dies with the connection, so a watched server can neither be
+        // missed nor leak. A pool-level task would need the pool lock —
+        // held across in-flight calls — and regress the mid-call trip this
+        // exists for. What moves is the check itself: synchronous
+        // state fs has no place on the executor at 20Hz, so it runs on the
+        // blocking pool while the 50ms revocation cadence is unchanged.
+        let source = Arc::new(source);
         let handle = tokio::spawn(async move {
             loop {
-                if let Err(reason) =
+                let source = Arc::clone(&source);
+                let check = tokio::task::spawn_blocking(move || {
                     crate::plugins::registry::verify_plugin_state_authority(&source.authority)
-                {
+                })
+                .await;
+                let reason = match check {
+                    Ok(Err(reason)) => Some(reason),
+                    Ok(Ok(())) => None,
+                    Err(_) => {
+                        Some("plugin authority check failed to run; failing closed".to_string())
+                    }
+                };
+                if let Some(reason) = reason {
                     if let Ok(mut slot) = reason_slot.lock() {
                         *slot = Some(reason);
                     }
@@ -1793,7 +1871,7 @@ impl McpConnection {
             "id": &init_id,
             "method": "initialize",
             "params": {
-                "protocolVersion": "2024-11-05",
+                "protocolVersion": MCP_PROTOCOL_VERSION,
                 "clientInfo": {
                     "name": "codewhale-tui",
                     "version": env!("CARGO_PKG_VERSION")
@@ -1808,11 +1886,30 @@ impl McpConnection {
         .await?;
 
         let response = self.recv(init_id).await?;
-        response_result(
+        let result = response_result(
             &response,
             "initialize",
             self.config.reviewed_plugin.is_some(),
         )?;
+        // Per spec, a server that cannot speak the advertised revision answers
+        // with one it does support. Accept any dated revision we still
+        // implement; anything else ends the handshake.
+        let negotiated = result
+            .and_then(|result| result.get("protocolVersion"))
+            .and_then(|version| version.as_str())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "MCP server '{}' initialize result omitted protocolVersion",
+                    self.name
+                )
+            })?;
+        anyhow::ensure!(
+            MCP_SUPPORTED_PROTOCOL_VERSIONS.contains(&negotiated),
+            "MCP server '{}' negotiated unsupported protocol version '{negotiated}' (supported: {})",
+            self.name,
+            MCP_SUPPORTED_PROTOCOL_VERSIONS.join(", ")
+        );
+        self.transport.set_protocol_version(negotiated);
         self.server_capabilities = McpServerCapabilities::from_initialize_response(&response);
 
         // Send initialized notification (no id, no response expected)
@@ -2250,9 +2347,25 @@ impl McpConnection {
         &self.name
     }
 
-    /// Check if connection is ready
+    /// Ready to dispatch: the transport is live **and** the plugin bundle
+    /// backing it still carries the authority it was reviewed with.
     pub fn is_ready(&self) -> bool {
-        self.state == ConnectionState::Ready && self.catalog_authorized()
+        self.is_transport_ready() && self.catalog_authorized()
+    }
+
+    /// Liveness only — no authority check.
+    ///
+    /// The Ready flag alone can't see a stdio child that exited between
+    /// calls; the probe closes that gap so the pool rebuilds the connection
+    /// instead of handing a dead transport back (#6187).
+    ///
+    /// Only for callers that have just run `validate_before_use` on this same
+    /// source, where `is_ready`'s authority half would re-walk and re-hash the
+    /// plugin bundle it already verified one statement earlier (#6209). Every
+    /// other caller must use `is_ready`: dropping the authority half without
+    /// a preceding check silently dispatches to a revoked or altered bundle.
+    pub(crate) fn is_transport_ready(&self) -> bool {
+        self.state == ConnectionState::Ready && !self.transport.probe_dead()
     }
 
     /// Get server config
@@ -2570,6 +2683,21 @@ pub struct McpPool {
     /// healthy. Explicit intent (`retry_connection`, `get_or_connect`, a
     /// config reload) ignores the cooldown.
     connect_backoff: HashMap<String, ConnectBackoff>,
+    /// Servers the supervisor last saw dead. Death is reported once, on the
+    /// transition, so status surfaces flip exactly when liveness does instead
+    /// of re-emitting every sweep (#6187).
+    supervised_dead: HashSet<String>,
+    /// Servers the supervisor stopped auto-reconnecting after
+    /// [`SUPERVISOR_PARK_AFTER_CONSECUTIVE_FAILURES`] consecutive failures.
+    /// A stored-ready connection or an explicit `/mcp retry` clears the park.
+    supervised_parked: HashSet<String>,
+    /// Servers with a spawned connect in flight right now. `connect_all`,
+    /// the session boot pass, and explicit tool-selection connects all mark
+    /// names here and clear them on resolution, so status surfaces never
+    /// have to infer "connecting" from "enabled but not connected yet"
+    /// (#6033): under lazy boot an unconnected server is one nobody has
+    /// asked for, not one mid-handshake.
+    connecting: HashSet<String>,
 }
 
 /// One server's cooldown: when to try again, and what to say until then.
@@ -2577,6 +2705,56 @@ struct ConnectBackoff {
     consecutive_failures: u32,
     retry_after: std::time::Instant,
     last_error: String,
+}
+
+/// One supervised reconnect candidate: the name, the config to redial, and
+/// whether this sweep newly observed the death.
+pub(crate) struct SupervisionDue {
+    pub name: String,
+    pub config: McpServerConfig,
+    pub fresh_death: bool,
+}
+
+/// One supervisor sweep's plan: candidates to redial plus the transitions
+/// the plan phase already knows (recoveries and newly parked servers).
+pub(crate) struct SupervisionPlan {
+    pub due: Vec<SupervisionDue>,
+    pub recovered: Vec<String>,
+    pub parked: Vec<String>,
+    pub timeouts: McpTimeouts,
+    pub network_policy: Option<NetworkPolicyDecider>,
+    pub catalog_generation: u64,
+}
+
+/// One supervisor sweep's transitions. Death, recovery, failed attempts, and
+/// parking are reported on transition only, so the engine emits a snapshot
+/// update exactly when something changed (#6187).
+#[derive(Debug, Default)]
+pub(crate) struct McpSupervisorUpdate {
+    /// Newly observed dead, with the reconnect failure that confirmed it.
+    pub died: Vec<(String, String)>,
+    /// Reconnect attempt failed for an already-dead server, with last error.
+    pub failed: Vec<(String, String)>,
+    /// Dead last sweep, alive now.
+    pub recovered: Vec<String>,
+    /// Newly parked after repeated failures; explicit `/mcp retry` resumes.
+    pub parked: Vec<String>,
+}
+
+impl McpSupervisorUpdate {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.died.is_empty()
+            && self.failed.is_empty()
+            && self.recovered.is_empty()
+            && self.parked.is_empty()
+    }
+
+    fn merge(&mut self, other: McpSupervisorUpdate) {
+        self.died.extend(other.died);
+        self.failed.extend(other.failed);
+        self.recovered.extend(other.recovered);
+        self.parked.extend(other.parked);
+    }
 }
 
 /// Cooldown after `failures` consecutive failed connects.
@@ -2595,6 +2773,21 @@ fn connect_backoff_delay(failures: u32) -> std::time::Duration {
 type McpPendingConnect = (String, McpServerConfig);
 type McpConnectError = (String, anyhow::Error);
 
+/// Whether an explicit tool selection (`tools_always_load`, a turn's
+/// `allowed_tools`) covers `server`: either an exact `mcp_<server>_<tool>`
+/// name or an `mcp_<prefix>*` glob whose prefix reaches the server name.
+/// One definition shared by the lazy boot pass and the per-turn
+/// explicit-connect wait so both agree on what a selection starts (#6033).
+pub(crate) fn tool_selection_covers_server(requested: &[String], server: &str) -> bool {
+    let prefix = format!("mcp_{}_", server.to_ascii_lowercase());
+    requested.iter().any(|name| {
+        name.starts_with(&prefix)
+            || name
+                .strip_suffix('*')
+                .is_some_and(|rule| prefix.starts_with(rule))
+    })
+}
+
 impl McpPool {
     /// Create a new pool with the given configuration
     pub fn new(config: McpConfig) -> Self {
@@ -2612,6 +2805,9 @@ impl McpPool {
             config_hash,
             catalog_generation: AtomicU64::new(1),
             connect_backoff: HashMap::new(),
+            supervised_dead: HashSet::new(),
+            supervised_parked: HashSet::new(),
+            connecting: HashSet::new(),
             last_mtimes: Vec::new(),
             dynamic_servers: Arc::new(RwLock::new(HashMap::new())),
             needs_auth_servers: BTreeSet::new(),
@@ -2969,10 +3165,12 @@ impl McpPool {
             return Err(error);
         }
 
+        // Authority was just validated above for this same source; checking
+        // it again here would re-hash the bundle within one dispatch (#6209).
         let is_ready = self
             .connections
             .get(server_name)
-            .map(|conn| conn.is_ready())
+            .map(McpConnection::is_transport_ready)
             .unwrap_or(false);
         if is_ready {
             return self
@@ -2981,7 +3179,19 @@ impl McpPool {
                 .ok_or_else(|| anyhow::anyhow!("MCP connection disappeared for {server_name}"));
         }
 
-        self.drop_connection(server_name, "reconnect");
+        // Take (don't drop) the stale connection: if the reconnect attempt
+        // below fails, the previous connection is restored so its last-good
+        // tool catalog stays model-visible during the outage instead of
+        // disappearing with a dropped transport (#6187).
+        let previous_connection = self.connections.remove(server_name);
+        if previous_connection.is_some() {
+            tracing::debug!(
+                target: "mcp",
+                server = %server_name,
+                reason = "reconnect",
+                "detached MCP connection for reconnect"
+            );
+        }
 
         // Check static config first, then dynamic servers
         let server_config = self
@@ -3007,6 +3217,14 @@ impl McpPool {
             Ok(connection) => connection,
             Err(error) => {
                 self.note_connect_failure(server_name, &error);
+                if let Some(previous) = previous_connection {
+                    tracing::debug!(
+                        target: "mcp",
+                        server = %server_name,
+                        "reconnect failed; restored the previous MCP connection and its last-good catalog"
+                    );
+                    self.connections.insert(server_name.to_string(), previous);
+                }
                 return Err(error);
             }
         };
@@ -3030,7 +3248,12 @@ impl McpPool {
         // A person asked for this one by name. Clear the cooldown so the
         // attempt happens now and, if it fails again, the ladder restarts
         // from the short end rather than from wherever it had climbed to.
+        // Explicit intent restarts supervision: the cooldown, the dead mark,
+        // and any park all clear, so the supervisor resumes watching whatever
+        // this retry stores — or stays quiet while the server is connectionless.
         self.connect_backoff.remove(server_name);
+        self.supervised_dead.remove(server_name);
+        self.supervised_parked.remove(server_name);
         let plugin_source = self
             .connections
             .get(server_name)
@@ -3097,8 +3320,12 @@ impl McpPool {
             source.validate_before_use(&name, "use")?;
         }
         // A successful connect settles the auth question for this server,
-        // and the cooldown with it.
+        // and the cooldown with it — plus any supervisor dead mark or park,
+        // since a stored-ready connection is alive by construction.
+        self.connecting.remove(&name);
         self.connect_backoff.remove(&name);
+        self.supervised_dead.remove(&name);
+        self.supervised_parked.remove(&name);
         if self.needs_auth_servers.remove(&name) {
             self.needs_auth_generation = self.needs_auth_generation.wrapping_add(1);
         }
@@ -3113,6 +3340,7 @@ impl McpPool {
     /// failure replaces the verdict — the state is "the most recent connect
     /// failed auth-required", not "some connect once did".
     pub(crate) fn note_connect_failure(&mut self, name: &str, error: &anyhow::Error) {
+        self.connecting.remove(name);
         if !self.server_allowed(name) {
             return;
         }
@@ -3180,17 +3408,207 @@ impl McpPool {
     /// while bounding peak memory.
     const CONNECT_CONCURRENCY: usize = 8;
 
-    /// Decide which enabled configured servers still need a handshake.
-    /// Dynamic runtime servers stay registered and connect via
-    /// [`Self::get_or_connect`]; `connect_all` has never spawned them.
+    /// Consecutive failed reconnects after which the supervisor parks a
+    /// server instead of redialing it. The cooldown ladder already spaces
+    /// attempts, but a server that never answers (wrong binary, dead port)
+    /// should not burn a spawn+handshake every sweep forever. A stored-ready
+    /// connection or an explicit `/mcp retry` clears the park — and every
+    /// success resets the count, so an occasionally-crashing server keeps
+    /// recovering instead of parking.
+    const SUPERVISOR_PARK_AFTER_CONSECUTIVE_FAILURES: u32 = 5;
+
+    /// Supervisor sweep cadence. Death is noticed within one tick; an idle
+    /// tick costs one pool lock plus a `try_wait` per stdio child.
+    const SUPERVISOR_TICK: std::time::Duration = std::time::Duration::from_secs(5);
+
+    /// One supervisor sweep's reconnect candidates, computed under a brief
+    /// pool lock. Handshakes run outside the lock via
+    /// [`Self::spawn_pending_connects`], so a wedged server never blocks a
+    /// live turn's pool access while it burns its connect timeout.
+    pub(crate) fn plan_supervision(&mut self) -> SupervisionPlan {
+        let dynamic = self.dynamic_servers.read();
+        let candidates: Vec<(String, McpServerConfig)> = self
+            .config
+            .servers
+            .iter()
+            .filter(|(name, server)| server.is_enabled() && self.server_allowed(name))
+            .map(|(name, server)| (name.clone(), server.clone()))
+            .chain(
+                dynamic
+                    .iter()
+                    .filter(|(_, server)| server.is_enabled())
+                    .map(|(name, server)| (name.clone(), server.clone())),
+            )
+            .collect();
+        drop(dynamic);
+        let watched: HashSet<String> = candidates.iter().map(|(name, _)| name.clone()).collect();
+        // Silent prune: manual retries drop connections the supervisor never
+        // re-spawns (on-demand reconnect owns connectionless servers), and
+        // removed/disabled servers leave supervision without an event.
+        self.supervised_dead
+            .retain(|name| watched.contains(name) && self.connections.contains_key(name));
+        self.supervised_parked.retain(|name| watched.contains(name));
+        let mut due = Vec::new();
+        let mut recovered = Vec::new();
+        let mut parked = Vec::new();
+        let now = std::time::Instant::now();
+        for (name, config) in candidates {
+            let Some(connection) = self.connections.get(&name) else {
+                continue;
+            };
+            if connection.is_transport_ready() {
+                if self.supervised_dead.remove(&name) {
+                    self.supervised_parked.remove(&name);
+                    recovered.push(name);
+                }
+                continue;
+            }
+            // A login-pending server cannot be fixed by redialing; the auth
+            // surface owns it. It stays out of the dead set so recovery via
+            // login reports nothing stale.
+            if self.needs_auth_servers.contains(&name) {
+                continue;
+            }
+            let fresh_death = self.supervised_dead.insert(name.clone());
+            if self.connecting.contains(&name) {
+                continue;
+            }
+            if let Some(backoff) = self.connect_backoff.get(&name) {
+                if backoff.consecutive_failures >= Self::SUPERVISOR_PARK_AFTER_CONSECUTIVE_FAILURES
+                {
+                    if self.supervised_parked.insert(name.clone()) {
+                        parked.push(name);
+                    }
+                    continue;
+                }
+                if now < backoff.retry_after {
+                    continue;
+                }
+            }
+            due.push(SupervisionDue {
+                name,
+                config,
+                fresh_death,
+            });
+        }
+        SupervisionPlan {
+            due,
+            recovered,
+            parked,
+            timeouts: self.config.timeouts,
+            network_policy: self.network_policy.clone(),
+            catalog_generation: self.catalog_generation.load(Ordering::SeqCst),
+        }
+    }
+
+    /// Resolve one supervised reconnect attempt. Success stores the live
+    /// connection (which clears the backoff, the dead mark, and any park);
+    /// failure records the backoff and reports the death or the repeated
+    /// failure with the diagnosis, parking on the threshold crossing.
+    pub(crate) fn resolve_supervision_attempt(
+        &mut self,
+        name: &str,
+        fresh_death: bool,
+        result: Result<McpConnection, anyhow::Error>,
+    ) -> McpSupervisorUpdate {
+        let mut update = McpSupervisorUpdate::default();
+        let stored =
+            result.and_then(|connection| self.store_ready_connection(name.to_string(), connection));
+        match stored {
+            Ok(()) => {
+                if !fresh_death {
+                    update.recovered.push(name.to_string());
+                }
+            }
+            Err(error) => {
+                self.note_connect_failure(name, &error);
+                let last_error = self
+                    .connect_backoff
+                    .get(name)
+                    .map(|backoff| backoff.last_error.clone())
+                    .unwrap_or_else(|| format!("{error:#}"));
+                if fresh_death {
+                    update.died.push((name.to_string(), last_error));
+                } else {
+                    update.failed.push((name.to_string(), last_error));
+                }
+                if self.connect_backoff.get(name).is_some_and(|backoff| {
+                    backoff.consecutive_failures >= Self::SUPERVISOR_PARK_AFTER_CONSECUTIVE_FAILURES
+                }) && self.supervised_parked.insert(name.to_string())
+                {
+                    update.parked.push(name.to_string());
+                }
+            }
+        }
+        update
+    }
+
+    /// Watch every live connection and reconnect the dead ones. Exits when
+    /// the pool is dropped (the engine holds the only strong reference) or
+    /// the engine stops listening. Reports transitions only, so the engine
+    /// emits a snapshot update exactly when something changed (#6187).
+    pub(crate) async fn supervise_pool(
+        pool: std::sync::Weak<tokio::sync::Mutex<McpPool>>,
+        tx: tokio::sync::mpsc::Sender<McpSupervisorUpdate>,
+    ) {
+        loop {
+            tokio::time::sleep(Self::SUPERVISOR_TICK).await;
+            let Some(pool) = pool.upgrade() else { break };
+            let plan = pool.lock().await.plan_supervision();
+            if plan.due.is_empty() && plan.recovered.is_empty() && plan.parked.is_empty() {
+                continue;
+            }
+            let mut connects = Self::spawn_pending_connects(
+                plan.due
+                    .iter()
+                    .map(|due| (due.name.clone(), due.config.clone()))
+                    .collect(),
+                plan.timeouts,
+                plan.network_policy.clone(),
+                plan.catalog_generation,
+            );
+            let mut update = McpSupervisorUpdate {
+                recovered: plan.recovered,
+                parked: plan.parked,
+                ..Default::default()
+            };
+            let fresh_by_name: HashMap<String, bool> = plan
+                .due
+                .into_iter()
+                .map(|due| (due.name, due.fresh_death))
+                .collect();
+            while let Some(joined) = connects.join_next().await {
+                let (name, result) = joined
+                    .unwrap_or_else(|error| ("connection task".to_string(), Err(error.into())));
+                let fresh_death = fresh_by_name.get(&name).copied().unwrap_or(false);
+                let resolution =
+                    pool.lock()
+                        .await
+                        .resolve_supervision_attempt(&name, fresh_death, result);
+                update.merge(resolution);
+            }
+            if !update.is_empty() && tx.send(update).await.is_err() {
+                break;
+            }
+        }
+    }
+
+    /// Collect the configured servers a connect pass should start. `only`
+    /// scopes the pass to the given names; `None` connects every enabled,
+    /// allowed server (`connect_all`). Dynamic runtime servers stay
+    /// registered and connect via [`Self::get_or_connect`]; connect passes
+    /// have never spawned them. Every emitted name is marked
+    /// [`Self::connecting`] until its spawn resolves.
     pub(crate) fn collect_pending_connects(
         &mut self,
+        only: Option<&HashSet<String>>,
     ) -> (Vec<McpPendingConnect>, Vec<McpConnectError>) {
         let names: Vec<String> = self
             .config
             .servers
             .iter()
             .filter(|(name, server)| server.is_enabled() && self.server_allowed(name))
+            .filter(|(name, _)| only.is_none_or(|set| set.contains(*name)))
             .map(|(name, _)| name.clone())
             .collect();
         let mut pending = Vec::new();
@@ -3213,10 +3631,11 @@ impl McpPool {
                 continue;
             }
 
+            // Authority validated immediately above for this same source.
             if self
                 .connections
                 .get(&name)
-                .is_some_and(McpConnection::is_ready)
+                .is_some_and(McpConnection::is_transport_ready)
             {
                 continue;
             }
@@ -3230,10 +3649,104 @@ impl McpPool {
                 errors.push((name, anyhow::anyhow!(backoff.last_error.clone())));
                 continue;
             }
+            if self.connecting.contains(&name) {
+                // An earlier pass spawned this connect and it has not
+                // resolved; a second pass must not spawn a duplicate.
+                continue;
+            }
             self.drop_connection(&name, "reconnect");
+            self.connecting.insert(name.clone());
             pending.push((name, server_config));
         }
         (pending, errors)
+    }
+
+    /// Start connects for servers an explicit tool selection named. Unlike a
+    /// boot pass the selection is the intent — cooldowns do not apply — but
+    /// servers already ready or already in flight are left alone, and plugin
+    /// authority is re-validated exactly as in
+    /// [`Self::collect_pending_connects`]. Covers dynamic servers too: a
+    /// selection can name one.
+    pub(crate) fn take_pending_connects_for(
+        &mut self,
+        names: &[String],
+    ) -> (Vec<McpPendingConnect>, Vec<McpConnectError>) {
+        let mut pending = Vec::new();
+        let mut errors = Vec::new();
+        for name in names {
+            let Some(server_config) = self.server_config(name) else {
+                continue;
+            };
+            if !server_config.is_enabled() || !self.server_allowed(name) {
+                continue;
+            }
+            let plugin_source = self
+                .connections
+                .get(name)
+                .and_then(|connection| connection.config().reviewed_plugin.clone())
+                .or_else(|| server_config.reviewed_plugin.clone());
+            if let Some(source) = plugin_source
+                && let Err(error) = source.validate_before_use(name, "use")
+            {
+                self.drop_connection(name, "plugin authority revoked or changed");
+                errors.push((name.clone(), error));
+                continue;
+            }
+            // Authority validated immediately above for this same source.
+            if self
+                .connections
+                .get(name)
+                .is_some_and(McpConnection::is_transport_ready)
+                || !self.connecting.insert(name.clone())
+            {
+                continue;
+            }
+            self.drop_connection(name, "reconnect");
+            pending.push((name.clone(), server_config));
+        }
+        (pending, errors)
+    }
+
+    /// Forget in-flight marks for connects whose spawns were aborted before
+    /// resolution (boot-pass abort on config change, deadline expiry).
+    pub(crate) fn cancel_connecting(&mut self, names: &HashSet<String>) {
+        self.connecting.retain(|name| !names.contains(name));
+    }
+
+    /// Servers with a connect in flight right now — the one honest answer to
+    /// "which servers are connecting" (#6033).
+    pub(crate) fn connecting_servers(&self) -> Vec<String> {
+        self.connecting.iter().cloned().collect()
+    }
+
+    /// Enabled, allowed configured servers the boot pass must still start
+    /// eagerly under lazy boot (#6033): servers marked `required`, plus any
+    /// server the session's explicit tool selections cover.
+    pub(crate) fn eager_boot_server_names(&self, requested: &[String]) -> HashSet<String> {
+        self.config
+            .servers
+            .iter()
+            .filter(|(name, server)| server.is_enabled() && self.server_allowed(name))
+            .filter(|(name, server)| {
+                server.required || tool_selection_covers_server(requested, name)
+            })
+            .map(|(name, _)| name.clone())
+            .collect()
+    }
+
+    /// Enabled, allowed servers — configured or dynamic — covered by an
+    /// explicit tool selection (`mcp_<server>_*` names or `mcp_<prefix>*`
+    /// globs). These are the names a turn is allowed to start on demand.
+    pub(crate) fn explicitly_selected_server_names(&self, requested: &[String]) -> Vec<String> {
+        let dynamic = self.dynamic_servers.read();
+        self.config
+            .servers
+            .iter()
+            .chain(dynamic.iter())
+            .filter(|(name, server)| server.is_enabled() && self.server_allowed(name))
+            .filter(|(name, _)| tool_selection_covers_server(requested, name))
+            .map(|(name, _)| name.clone())
+            .collect()
     }
 
     pub(crate) fn push_required_server_errors(&self, errors: &mut Vec<McpConnectError>) {
@@ -3349,7 +3862,7 @@ impl McpPool {
         }
 
         for _pass in 0..2 {
-            let (pending, auth_errors) = self.collect_pending_connects();
+            let (pending, auth_errors) = self.collect_pending_connects(None);
             errors.extend(auth_errors);
             if pending.is_empty() {
                 break;
@@ -4035,12 +4548,18 @@ impl McpPool {
     /// uses this universe to REPLACE the pool's slice of the tool catalog
     /// instead of additively merging it — the synthetic entry must leave
     /// after a login, and dead real tools must leave after a live 401.
-    pub fn model_tool_names(&self) -> std::collections::HashSet<String> {
-        let mut names: std::collections::HashSet<String> = self
-            .to_api_tools()
-            .into_iter()
-            .map(|tool| tool.name)
-            .collect();
+    /// The model-visible tool-name universe for an already-built catalog.
+    ///
+    /// Takes the catalog rather than rebuilding it: `to_api_tools` re-verifies
+    /// every reviewed plugin bundle, so calling both meant hashing each bundle
+    /// twice per turn to produce two views of one thing — and the two could
+    /// disagree if authority drifted between them (#6209).
+    pub fn model_tool_names(
+        &self,
+        api_tools: &[codewhale_models::Tool],
+    ) -> std::collections::HashSet<String> {
+        let mut names: std::collections::HashSet<String> =
+            api_tools.iter().map(|tool| tool.name.clone()).collect();
         let dynamic = self.dynamic_servers.read();
         for (server, config) in self.config.servers.iter().chain(dynamic.iter()) {
             if self.server_allowed(server)
@@ -4423,7 +4942,7 @@ impl McpPool {
             // replays the same rejection, so it takes the auth-required
             // path below instead of the transparent retry.
             Err(err)
-                if is_mcp_stale_session_error(&err) && !oauth::error_looks_auth_required(&err) =>
+                if is_retriable_mcp_call_error(&err) && !oauth::error_looks_auth_required(&err) =>
             {
                 tracing::debug!(
                     target: "mcp",
@@ -4455,7 +4974,11 @@ impl McpPool {
                             conn.call_tool(&tool_name, arguments, timeout).await
                         }
                     }
-                    Err(err) => Err(err),
+                    // A reconnect that fails must not swallow the call error
+                    // that triggered it: report both, original first.
+                    Err(reconnect_err) => Err(anyhow::anyhow!(
+                        "{err:#}; reconnect failed: {reconnect_err:#}"
+                    )),
                 }
             }
             Err(err) => Err(err),
@@ -4534,7 +5057,6 @@ impl McpPool {
     }
 
     /// Get list of connected server names
-    #[allow(dead_code)] // Public API; the HTTP list endpoint no longer spawns a pool to call it (#3532)
     pub fn connected_servers(&self) -> Vec<&str> {
         self.connections
             .iter()
@@ -4567,6 +5089,12 @@ impl McpPool {
             }
         }
         names
+    }
+
+    /// Compare against the freshly authorized merged configuration without
+    /// reloading or disconnecting any sibling transport.
+    pub(crate) fn config_matches(&self, config: &McpConfig) -> bool {
+        hash_mcp_config(config) == self.config_hash
     }
 
     /// Whether every configured MCP source still has the mtime this pool last
@@ -4809,6 +5337,9 @@ pub fn load_config(path: &Path) -> Result<McpConfig> {
     })
 }
 
+/// Maximum bytes read from an MCP config file. Configs are kilobytes.
+const MAX_MCP_CONFIG_BYTES: u64 = 1024 * 1024;
+
 fn read_mcp_config_file(path: &Path) -> Result<Option<String>> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
@@ -4823,11 +5354,15 @@ fn read_mcp_config_file(path: &Path) -> Result<Option<String>> {
         anyhow::bail!("MCP config path must be a regular file: {}", path.display());
     }
 
-    let mut file = open_mcp_config_file(path)
+    let file = open_mcp_config_file(path)
         .with_context(|| format!("Failed to read MCP config {}", path.display()))?;
     let mut contents = String::new();
-    file.read_to_string(&mut contents)
+    file.take(MAX_MCP_CONFIG_BYTES + 1)
+        .read_to_string(&mut contents)
         .with_context(|| format!("Failed to read MCP config {}", path.display()))?;
+    if contents.len() as u64 > MAX_MCP_CONFIG_BYTES {
+        anyhow::bail!("MCP config {} exceeds the 1 MiB limit", path.display());
+    }
     Ok(Some(contents))
 }
 
@@ -4850,6 +5385,85 @@ pub fn workspace_mcp_config_path(workspace: &Path) -> PathBuf {
     normalize_workspace_path(workspace)
         .join(".codewhale")
         .join("mcp.json")
+}
+
+/// Which configuration file declares an MCP server.
+///
+/// The rows in `/mcp` are the union of the user's global file, the trusted
+/// workspace's own file, and every installed plugin's contribution. Until
+/// this existed the panel offered `e` and `d` on all three and then wrote to
+/// the global file regardless, so toggling or removing a project server
+/// failed with "MCP server '<name>' not found" — the row looked mutable and
+/// was not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum McpServerScope {
+    /// The user's own config file, shared by every workspace.
+    Global,
+    /// `<workspace>/.codewhale/mcp.json`, honoured only once the workspace
+    /// is trusted in user-owned config (#417).
+    Project(PathBuf),
+    /// Contributed by an installed plugin bundle. It lives in no config
+    /// file, so it is switched off by disabling the plugin that owns it.
+    Plugin,
+}
+
+impl McpServerScope {
+    /// The file a mutation for this server must write, or `None` when the
+    /// server has no config file of its own.
+    #[must_use]
+    pub fn config_path(&self, global_path: &Path) -> Option<PathBuf> {
+        match self {
+            Self::Global => Some(global_path.to_path_buf()),
+            Self::Project(path) => Some(path.clone()),
+            Self::Plugin => None,
+        }
+    }
+}
+
+/// Resolve the file that declares `name`.
+///
+/// Project entries are checked first because
+/// [`load_config_with_workspace_and_plugins`] lets them override a
+/// same-named global server, so the project file is the one a mutation has
+/// to edit for the change to be observable.
+/// Every server name declared by the trusted workspace's own config file.
+///
+/// Resolved once per panel snapshot so the row rendering can label scope
+/// without a file read per row.
+#[must_use]
+pub fn project_server_names(global_path: &Path, workspace: &Path) -> BTreeSet<String> {
+    let Ok(workspace) = checked_workspace_path(workspace) else {
+        return BTreeSet::new();
+    };
+    if !workspace_allows_project_mcp_config(&workspace) {
+        return BTreeSet::new();
+    }
+    let Ok(project_path) = checked_workspace_mcp_config_path(&workspace) else {
+        return BTreeSet::new();
+    };
+    if !project_path.exists() || paths_refer_to_same_config(global_path, &project_path) {
+        return BTreeSet::new();
+    }
+    load_config(&project_path)
+        .map(|config| config.servers.into_keys().collect())
+        .unwrap_or_default()
+}
+
+#[must_use]
+pub fn resolve_server_scope(global_path: &Path, workspace: &Path, name: &str) -> McpServerScope {
+    if let Ok(workspace) = checked_workspace_path(workspace)
+        && workspace_allows_project_mcp_config(&workspace)
+        && let Ok(project_path) = checked_workspace_mcp_config_path(&workspace)
+        && project_path.exists()
+        && !paths_refer_to_same_config(global_path, &project_path)
+        && load_config(&project_path).is_ok_and(|config| config.servers.contains_key(name))
+    {
+        return McpServerScope::Project(project_path);
+    }
+    if load_config(global_path).is_ok_and(|config| config.servers.contains_key(name)) {
+        return McpServerScope::Global;
+    }
+    McpServerScope::Plugin
 }
 
 pub fn load_config_with_workspace(global_path: &Path, workspace: &Path) -> Result<McpConfig> {
@@ -5018,6 +5632,25 @@ fn merge_plugin_mcp_servers_from_plugins(
         plugins,
         Arc::new(crate::plugins::HostEnvironment::capture()),
     )
+}
+
+/// Split a qualified plugin server key back into `(plugin, server)`.
+///
+/// The length prefix written by [`qualified_plugin_server_name`] exists so
+/// this split is unambiguous even when a plugin or server name contains `-`.
+/// Display surfaces use it to show `codewhale-account-plugins/codewhale-plugins`
+/// instead of the wire key `plugin-25-codewhale-account-plugins-codewhale-plugins`,
+/// which reads as noise in a list and tells a person nothing.
+#[must_use]
+pub fn split_qualified_plugin_server_name(qualified: &str) -> Option<(&str, &str)> {
+    let rest = qualified.strip_prefix("plugin-")?;
+    let (len, rest) = rest.split_once('-')?;
+    let len: usize = len.parse().ok()?;
+    if !rest.is_char_boundary(len) {
+        return None;
+    }
+    let (plugin, server) = rest.split_at(len);
+    Some((plugin, server.strip_prefix('-')?))
 }
 
 fn qualified_plugin_server_name(plugin_name: &str, server_name: &str) -> String {
@@ -5220,7 +5853,7 @@ fn hash_mcp_config(config: &McpConfig) -> u64 {
 /// Best-effort fetch of the MCP config file's last-modified time. Returns
 /// `None` when the file is missing, when stat fails, when the platform
 /// doesn't expose mtime, or when the path fails the same allow-list check
-/// that `load_config` / `save_config` apply. The lazy-reload check in
+/// that MCP configuration reads and mutations apply. The lazy-reload check in
 /// `McpPool::get_or_connect` treats `None` as "skip the check this turn",
 /// so a rejected path simply degrades to "no auto-reload" rather than an
 /// error path. Callers already validate via `validate_mcp_config_path` at
@@ -5232,17 +5865,115 @@ fn mcp_config_mtime(path: &Path) -> Option<std::time::SystemTime> {
     fs::metadata(path).ok()?.modified().ok()
 }
 
-pub fn save_config(path: &Path, cfg: &McpConfig) -> Result<()> {
-    validate_mcp_config_path(path)?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).with_context(|| {
-            format!("Failed to create MCP config directory {}", parent.display())
-        })?;
+/// A stale caller must reload instead of overwriting another process's edit.
+#[derive(Debug)]
+pub struct McpRevisionConflict;
+impl std::fmt::Display for McpRevisionConflict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("MCP configuration changed; reload it before saving")
     }
-    let rendered = serde_json::to_string_pretty(cfg).context("Failed to serialize MCP config")?;
-    write_atomic(path, rendered.as_bytes())
-        .with_context(|| format!("Failed to write MCP config {}", path.display()))?;
-    Ok(())
+}
+impl std::error::Error for McpRevisionConflict {}
+
+fn config_revision(raw: Option<&str>) -> String {
+    raw.map_or_else(
+        || "mcp-v1-absent".to_owned(),
+        |raw| format!("mcp-v1-{}", crate::hashing::sha256_hex(raw.as_bytes())),
+    )
+}
+
+pub fn read_config_revision(path: &Path) -> Result<String> {
+    validate_mcp_config_path(path)?;
+    let raw = read_mcp_config_file(path)?;
+    Ok(config_revision(raw.as_deref()))
+}
+
+/// Apply only changed known fields to the original JSON. Unknown fields in
+/// unrelated objects and in edited server entries remain operator-owned.
+fn apply_json_delta(
+    raw: &mut serde_json::Value,
+    before: &serde_json::Value,
+    after: &serde_json::Value,
+) {
+    if before == after {
+        return;
+    }
+    if let (Some(raw), Some(before), Some(after)) =
+        (raw.as_object_mut(), before.as_object(), after.as_object())
+    {
+        for key in before.keys().chain(after.keys()).collect::<BTreeSet<_>>() {
+            match (before.get(key), after.get(key)) {
+                (Some(old), Some(new)) if old != new => {
+                    apply_json_delta(raw.entry(key.clone()).or_insert(old.clone()), old, new);
+                }
+                (None, Some(new)) => {
+                    raw.insert(key.clone(), new.clone());
+                }
+                (Some(_), None) => {
+                    raw.remove(key);
+                }
+                _ => {}
+            }
+        }
+    } else {
+        *raw = after.clone();
+    }
+}
+
+/// Every managed MCP writer rereads under the same OS-process lock. This is
+/// a delta operation, not a save of a previously loaded typed snapshot.
+pub fn mutate_config<T>(
+    path: &Path,
+    expected_revision: Option<&str>,
+    mutate: impl FnOnce(&mut McpConfig) -> Result<T>,
+) -> Result<(T, String)> {
+    validate_mcp_config_path(path)?;
+    codewhale_config::with_config_write_lock(path, |path| {
+        let original = read_mcp_config_file(path)?;
+        let revision = config_revision(original.as_deref());
+        if expected_revision.is_some_and(|expected| expected != revision) {
+            return Err(McpRevisionConflict.into());
+        }
+        let mut raw: serde_json::Value = match original.as_deref() {
+            Some(raw) => serde_json::from_str(raw).map_err(|_| {
+                anyhow::anyhow!("Failed to parse MCP config; file contents were omitted")
+            })?,
+            None => serde_json::json!({}),
+        };
+        anyhow::ensure!(raw.is_object(), "MCP config must be an object");
+        let mut config: McpConfig = serde_json::from_value(raw.clone())
+            .map_err(|_| anyhow::anyhow!("Invalid MCP config; file contents were omitted"))?;
+        let before = serde_json::to_value(&config)?;
+        let result = mutate(&mut config)?;
+        let after = serde_json::to_value(&config)?;
+        if before == after {
+            return Ok((result, revision));
+        }
+        // Preserve legacy spelling while applying the canonical typed delta.
+        let legacy = raw.get("mcpServers").is_some();
+        if legacy {
+            let object = raw
+                .as_object_mut()
+                .context("MCP config must be an object")?;
+            let servers = object.remove("mcpServers").expect("checked above");
+            object.insert("servers".into(), servers);
+        }
+        apply_json_delta(&mut raw, &before, &after);
+        if legacy {
+            let object = raw
+                .as_object_mut()
+                .context("MCP config must be an object")?;
+            if let Some(servers) = object.remove("servers") {
+                object.insert("mcpServers".into(), servers);
+            }
+        }
+        let rendered = serde_json::to_string_pretty(&raw)?;
+        if rendered.len() as u64 > MAX_MCP_CONFIG_BYTES {
+            anyhow::bail!("MCP config exceeds the 1 MiB limit");
+        }
+        write_atomic(path, rendered.as_bytes())?;
+        Ok((result, config_revision(Some(&rendered))))
+    })
 }
 
 fn mcp_template_json() -> Result<String> {
@@ -5280,23 +6011,23 @@ fn mcp_template_json() -> Result<String> {
 
 pub fn init_config(path: &Path, force: bool) -> Result<McpWriteStatus> {
     validate_mcp_config_path(path)?;
-    if path.exists() && !force {
-        return Ok(McpWriteStatus::SkippedExists);
-    }
-    let status = if path.exists() {
-        McpWriteStatus::Overwritten
-    } else {
-        McpWriteStatus::Created
-    };
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).with_context(|| {
-            format!("Failed to create MCP config directory {}", parent.display())
-        })?;
-    }
-    let template = mcp_template_json()?;
-    write_atomic(path, template.as_bytes())
-        .with_context(|| format!("Failed to write MCP config {}", path.display()))?;
-    Ok(status)
+    codewhale_config::with_config_write_lock(path, |path| {
+        let original = read_mcp_config_file(path)?;
+        if let Some(raw) = original.as_deref() {
+            let _: McpConfig = serde_json::from_str(raw)
+                .map_err(|_| anyhow::anyhow!("Invalid MCP config; file contents were omitted"))?;
+            if !force {
+                return Ok(McpWriteStatus::SkippedExists);
+            }
+        }
+        let template = mcp_template_json()?;
+        write_atomic(path, template.as_bytes())?;
+        Ok(if original.is_some() {
+            McpWriteStatus::Overwritten
+        } else {
+            McpWriteStatus::Created
+        })
+    })
 }
 
 pub fn add_server_config(
@@ -5311,55 +6042,61 @@ pub fn add_server_config(
         anyhow::bail!("Provide either a command or URL for MCP server '{name}'.");
     }
     validate_mcp_transport(transport.as_deref())?;
-    let mut cfg = load_config(path)?;
-    cfg.servers.insert(
-        name,
-        McpServerConfig {
-            command,
-            args,
-            env: HashMap::new(),
-            cwd: None,
-            url,
-            transport,
-            connect_timeout: None,
-            execute_timeout: None,
-            read_timeout: None,
-            disabled: false,
-            enabled: true,
-            required: false,
-            enabled_tools: Vec::new(),
-            disabled_tools: Vec::new(),
-            headers: HashMap::new(),
-            env_headers: HashMap::new(),
-            bearer_token_env_var: None,
-            scopes: Vec::new(),
-            oauth: None,
-            oauth_resource: None,
-            reviewed_plugin: None,
-            runtime_added: false,
-            allow_private_network: false,
-        },
-    );
-    save_config(path, &cfg)
+    mutate_config(path, None, |cfg| {
+        cfg.servers.insert(
+            name,
+            McpServerConfig {
+                command,
+                args,
+                env: HashMap::new(),
+                cwd: None,
+                url,
+                transport,
+                connect_timeout: None,
+                execute_timeout: None,
+                read_timeout: None,
+                disabled: false,
+                enabled: true,
+                required: false,
+                enabled_tools: Vec::new(),
+                disabled_tools: Vec::new(),
+                headers: HashMap::new(),
+                env_headers: HashMap::new(),
+                bearer_token_env_var: None,
+                scopes: Vec::new(),
+                oauth: None,
+                oauth_resource: None,
+                reviewed_plugin: None,
+                runtime_added: false,
+                allow_private_network: false,
+            },
+        );
+        Ok(())
+    })
+    .map(|_| ())
 }
 
 pub fn remove_server_config(path: &Path, name: &str) -> Result<()> {
-    let mut cfg = load_config(path)?;
-    if cfg.servers.remove(name).is_none() {
-        anyhow::bail!("MCP server '{name}' not found");
-    }
-    save_config(path, &cfg)
+    mutate_config(path, None, |cfg| {
+        if cfg.servers.remove(name).is_none() {
+            anyhow::bail!("MCP server '{name}' not found");
+        }
+        Ok(())
+    })
+    .map(|_| ())
 }
 
 pub fn set_server_enabled(path: &Path, name: &str, enabled: bool) -> Result<()> {
-    let mut cfg = load_config(path)?;
-    let server = cfg
-        .servers
-        .get_mut(name)
-        .ok_or_else(|| anyhow::anyhow!("MCP server '{name}' not found"))?;
-    server.enabled = enabled;
-    server.disabled = !enabled;
-    save_config(path, &cfg)
+    mutate_config(path, None, |cfg| {
+        let server = cfg
+            .servers
+            .get_mut(name)
+            .ok_or_else(|| anyhow::anyhow!("MCP server '{name}' not found"))?;
+        server.enabled = enabled;
+        server.disabled = !enabled;
+        Ok(())
+    })
+    .map(|_| ())
 }
 
 #[cfg(test)]
@@ -5627,6 +6364,44 @@ fn snapshot_from_config(
         config_exists,
         reload_required,
         servers,
+    }
+}
+
+#[cfg(test)]
+mod qualified_plugin_server_name_tests {
+    use super::{qualified_plugin_server_name, split_qualified_plugin_server_name};
+
+    /// The wire key round-trips even when both halves contain `-`, which is
+    /// what the length prefix is for. The Extensions panel relies on this to
+    /// show `plugin/server` instead of `plugin-25-plugin-server`.
+    #[test]
+    fn a_qualified_plugin_server_name_round_trips_through_its_split() {
+        for (plugin, server) in [
+            ("codewhale-account-plugins", "codewhale-plugins"),
+            ("kimi-datasource", "data"),
+            ("a", "b"),
+            ("dash-heavy-name-here", "server-with-dashes"),
+        ] {
+            let qualified = qualified_plugin_server_name(plugin, server);
+            assert_eq!(
+                split_qualified_plugin_server_name(&qualified),
+                Some((plugin, server)),
+                "round trip failed for {qualified}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_name_that_is_not_a_plugin_key_does_not_split() {
+        for plain in [
+            "aws",
+            "github",
+            "plugin-",
+            "plugin-x-a-b",
+            "plugin-99-short",
+        ] {
+            assert_eq!(split_qualified_plugin_server_name(plain), None, "{plain}");
+        }
     }
 }
 

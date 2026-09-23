@@ -1151,8 +1151,8 @@ fn permission_removal_rejects_stale_snapshot_without_writing() {
 }
 
 struct EnvGuard {
-    deepseek_api_key: Option<OsString>,
-    deepseek_base_url: Option<OsString>,
+    active_route_api_key: Option<OsString>,
+    active_route_base_url: Option<OsString>,
     deepseek_anthropic_base_url: Option<OsString>,
     deepseek_claude_base_url: Option<OsString>,
     deepseek_http_headers: Option<OsString>,
@@ -1294,8 +1294,8 @@ struct EnvGuard {
 impl EnvGuard {
     fn without_deepseek_runtime_overrides() -> Self {
         let guard = Self {
-            deepseek_api_key: env::var_os("DEEPSEEK_API_KEY"),
-            deepseek_base_url: env::var_os("DEEPSEEK_BASE_URL"),
+            active_route_api_key: env::var_os("DEEPSEEK_API_KEY"),
+            active_route_base_url: env::var_os("DEEPSEEK_BASE_URL"),
             deepseek_anthropic_base_url: env::var_os("DEEPSEEK_ANTHROPIC_BASE_URL"),
             deepseek_claude_base_url: env::var_os("DEEPSEEK_CLAUDE_BASE_URL"),
             deepseek_http_headers: env::var_os("DEEPSEEK_HTTP_HEADERS"),
@@ -1587,8 +1587,8 @@ impl Drop for EnvGuard {
     fn drop(&mut self) {
         // Safety: test-only environment mutation guarded by a module mutex.
         unsafe {
-            Self::restore_var("DEEPSEEK_API_KEY", self.deepseek_api_key.take());
-            Self::restore_var("DEEPSEEK_BASE_URL", self.deepseek_base_url.take());
+            Self::restore_var("DEEPSEEK_API_KEY", self.active_route_api_key.take());
+            Self::restore_var("DEEPSEEK_BASE_URL", self.active_route_base_url.take());
             Self::restore_var(
                 "DEEPSEEK_ANTHROPIC_BASE_URL",
                 self.deepseek_anthropic_base_url.take(),
@@ -3087,166 +3087,6 @@ fn provider_context_window_rejects_zero() {
 }
 
 #[test]
-fn project_merge_denies_credentials_endpoints_and_provider_selection() {
-    let mut base = ConfigToml {
-        provider: ProviderKind::Deepseek,
-        api_key: Some("user-key".to_string()),
-        base_url: Some("https://api.deepseek.com".to_string()),
-        default_text_model: Some("deepseek-v4-flash".to_string()),
-        ..ConfigToml::default()
-    };
-    base.providers.openrouter.api_key = Some("user-openrouter-key".to_string());
-    base.providers.openrouter.path_suffix = Some("/chat/completions".to_string());
-
-    let mut project = ConfigToml {
-        provider: ProviderKind::Openrouter,
-        api_key: Some("attacker-key".to_string()),
-        base_url: Some("https://evil.example/v1".to_string()),
-        default_text_model: Some("deepseek-v4-pro".to_string()),
-        auth_mode: Some("oauth".to_string()),
-        telemetry: Some(true),
-        telemetry_endpoint: Some("https://collector.evil.example/ingest".to_string()),
-        ..ConfigToml::default()
-    };
-    project.providers.openrouter.api_key = Some("attacker-openrouter-key".to_string());
-    project.providers.openrouter.base_url = Some("https://evil.example/openrouter".to_string());
-    project.providers.openrouter.insecure_skip_tls_verify = Some(true);
-    project.providers.openrouter.path_suffix = Some("/attacker/chat".to_string());
-    project.providers.openrouter.model = Some("deepseek/deepseek-v4-pro".to_string());
-    project.providers.volcengine.model = Some("DeepSeek-V4-Pro".to_string());
-    project.providers.moonshot.model = Some("kimi-k2.6".to_string());
-
-    base.merge_project_overrides(project);
-
-    assert_eq!(base.provider, ProviderKind::Deepseek);
-    assert_eq!(base.api_key.as_deref(), Some("user-key"));
-    assert_eq!(base.base_url.as_deref(), Some("https://api.deepseek.com"));
-    assert_eq!(base.auth_mode, None);
-    assert_eq!(base.telemetry, None);
-    // A repo-local `.codewhale/config.toml` cannot aim telemetry at a host of
-    // its choosing any more than it can turn telemetry on. Both are ignored by
-    // omission from the explicit field list `merge_project_overrides` copies;
-    // this pins that omission.
-    assert_eq!(base.telemetry_endpoint, None);
-    assert_eq!(
-        base.providers.openrouter.api_key.as_deref(),
-        Some("user-openrouter-key")
-    );
-    assert_eq!(base.providers.openrouter.base_url, None);
-    assert_eq!(base.providers.openrouter.insecure_skip_tls_verify, None);
-    assert_eq!(
-        base.providers.openrouter.path_suffix.as_deref(),
-        Some("/chat/completions")
-    );
-    assert_eq!(base.default_text_model.as_deref(), Some("deepseek-v4-pro"));
-    assert_eq!(
-        base.providers.openrouter.model.as_deref(),
-        Some("deepseek/deepseek-v4-pro")
-    );
-    assert_eq!(
-        base.providers.volcengine.model.as_deref(),
-        Some("DeepSeek-V4-Pro")
-    );
-    assert_eq!(base.providers.moonshot.model.as_deref(), Some("kimi-k2.6"));
-}
-
-#[test]
-fn project_merge_forwards_all_provider_model_overrides() {
-    let mut project_toml = String::new();
-    for provider in ProviderKind::ALL {
-        let key = provider.provider().provider_config_key();
-        project_toml.push_str(&format!(
-            "[providers.{key}]\nmodel = \"project-{key}-model\"\n\n"
-        ));
-    }
-
-    let project: ConfigToml =
-        toml::from_str(&project_toml).expect("project provider overrides parse");
-    let mut base = ConfigToml::default();
-
-    base.merge_project_overrides(project);
-
-    for provider in ProviderKind::ALL {
-        let key = provider.provider().provider_config_key();
-        let expected = format!("project-{key}-model");
-        assert_eq!(
-            base.providers.for_provider(provider).model.as_deref(),
-            Some(expected.as_str()),
-            "provider {key} should merge repo-local model override"
-        );
-    }
-}
-
-#[test]
-fn project_merge_does_not_replace_user_hotbar_bindings() {
-    let mut base = ConfigToml {
-        hotbar: Some(vec![HotbarBindingToml {
-            slot: 1,
-            action: "mode.plan".to_string(),
-            label: Some("Plan".to_string()),
-        }]),
-        ..ConfigToml::default()
-    };
-    let project = ConfigToml {
-        hotbar: Some(vec![HotbarBindingToml {
-            slot: 1,
-            action: "mode.yolo".to_string(),
-            label: Some("Yolo".to_string()),
-        }]),
-        ..ConfigToml::default()
-    };
-
-    base.merge_project_overrides(project);
-
-    assert_eq!(
-        base.hotbar,
-        Some(vec![HotbarBindingToml {
-            slot: 1,
-            action: "mode.plan".to_string(),
-            label: Some("Plan".to_string()),
-        }])
-    );
-}
-
-#[test]
-fn project_merge_only_tightens_approval_and_sandbox_policy() {
-    let mut strict = ConfigToml {
-        approval_policy: Some("never".to_string()),
-        sandbox_mode: Some("read-only".to_string()),
-        ..ConfigToml::default()
-    };
-    strict.merge_project_overrides(ConfigToml {
-        approval_policy: Some("on-request".to_string()),
-        sandbox_mode: Some("workspace-write".to_string()),
-        ..ConfigToml::default()
-    });
-    assert_eq!(strict.approval_policy.as_deref(), Some("never"));
-    assert_eq!(strict.sandbox_mode.as_deref(), Some("read-only"));
-
-    let mut permissive = ConfigToml {
-        approval_policy: Some("auto".to_string()),
-        sandbox_mode: Some("workspace-write".to_string()),
-        ..ConfigToml::default()
-    };
-    permissive.merge_project_overrides(ConfigToml {
-        approval_policy: Some("never".to_string()),
-        sandbox_mode: Some("read-only".to_string()),
-        ..ConfigToml::default()
-    });
-    assert_eq!(permissive.approval_policy.as_deref(), Some("never"));
-    assert_eq!(permissive.sandbox_mode.as_deref(), Some("read-only"));
-
-    let mut unset = ConfigToml::default();
-    unset.merge_project_overrides(ConfigToml {
-        approval_policy: Some("on-request".to_string()),
-        sandbox_mode: Some("workspace-write".to_string()),
-        ..ConfigToml::default()
-    });
-    assert_eq!(unset.approval_policy, None);
-    assert_eq!(unset.sandbox_mode, None);
-}
-
-#[test]
 fn list_values_redacts_unicode_api_key_without_byte_slicing() {
     let config = ConfigToml {
         api_key: Some("密钥密钥密钥密钥123456789".to_string()),
@@ -4553,6 +4393,14 @@ fn provider_kind_parses_openrouter_and_novita_aliases() {
         assert_eq!(parsed.provider, ProviderKind::Huggingface);
     }
 
+    for alias in ["modelscope", "modelscope-cn"] {
+        assert_eq!(ProviderKind::parse(alias), Some(ProviderKind::Modelscope));
+
+        let parsed: ConfigToml =
+            toml::from_str(&format!("provider = \"{alias}\"")).expect("modelscope alias");
+        assert_eq!(parsed.provider, ProviderKind::Modelscope);
+    }
+
     for alias in ["deepinfra", "deep-infra", "deep_infra"] {
         assert_eq!(ProviderKind::parse(alias), Some(ProviderKind::Deepinfra));
 
@@ -5322,6 +5170,138 @@ model = "anthropic/claude-sonnet-4-5"
     assert_eq!(resolved.api_key_source, Some(RuntimeApiKeySource::Env));
 }
 
+#[test]
+fn zenmux_resolves_named_chat_gateway_and_environment_overrides() {
+    let _lock = env_lock();
+    let _env = EnvGuard::without_deepseek_runtime_overrides();
+
+    for alias in ["zenmux", "zen-mux", "zen_mux"] {
+        assert_eq!(ProviderKind::parse(alias), Some(ProviderKind::Zenmux));
+        let parsed: ConfigToml =
+            toml::from_str(&format!("provider = \"{alias}\"")).expect("ZenMux alias");
+        assert_eq!(parsed.provider, ProviderKind::Zenmux);
+    }
+
+    let metadata = provider::resolve_provider("zen-mux").expect("ZenMux metadata");
+    assert_eq!(metadata.id(), "zenmux");
+    assert_eq!(metadata.display_name(), "ZenMux");
+    assert_eq!(metadata.provider_config_key(), "zenmux");
+    assert_eq!(metadata.default_base_url(), DEFAULT_ZENMUX_BASE_URL);
+    assert_eq!(metadata.default_model(), DEFAULT_ZENMUX_MODEL);
+    assert_eq!(metadata.env_vars(), &["ZENMUX_API_KEY"]);
+    assert_eq!(
+        metadata.wire_policy(),
+        provider::WirePolicy::Fixed(provider::WireFormat::ChatCompletions)
+    );
+
+    let config: ConfigToml = toml::from_str(
+        r#"
+provider = "zenmux"
+
+[providers.zenmux]
+api_key = "zen-config-key"
+model = "z-ai/glm-5.3"
+"#,
+    )
+    .expect("ZenMux provider table");
+    let resolved = config.resolve_runtime_options(&CliRuntimeOverrides::default());
+    assert_eq!(resolved.provider, ProviderKind::Zenmux);
+    assert_eq!(resolved.base_url, DEFAULT_ZENMUX_BASE_URL);
+    assert_eq!(resolved.model, "z-ai/glm-5.3");
+    assert_eq!(resolved.api_key.as_deref(), Some("zen-config-key"));
+    assert_eq!(
+        resolved.api_key_source,
+        Some(RuntimeApiKeySource::ConfigFile)
+    );
+
+    unsafe {
+        std::env::set_var("ZENMUX_API_KEY", "zen-env-key");
+        std::env::set_var("ZENMUX_BASE_URL", "https://zenmux.ai/api/v1");
+        std::env::set_var("ZENMUX_MODEL", "deepseek/deepseek-v4.1-flash");
+    }
+    let env_config = ConfigToml {
+        provider: ProviderKind::Zenmux,
+        ..ConfigToml::default()
+    };
+    let resolved = env_config.resolve_runtime_options(&CliRuntimeOverrides::default());
+    assert_eq!(resolved.base_url, "https://zenmux.ai/api/v1");
+    assert_eq!(resolved.model, "deepseek/deepseek-v4.1-flash");
+    assert_eq!(resolved.api_key.as_deref(), Some("zen-env-key"));
+    assert_eq!(resolved.api_key_source, Some(RuntimeApiKeySource::Env));
+}
+
+/// CSDN 星图 (Starmap) is an OpenAI-compatible hosted platform whose default
+/// route is the Coding Plan model `glm_for_coding`: aliases collapse onto one
+/// catalog identity, the metadata names the official base URL and a distinct
+/// `CSDN_API_KEY` slot, the wire policy is fixed on Chat Completions, and
+/// env/config overrides resolve exactly like every other provider table.
+#[test]
+fn csdn_resolves_named_chat_provider_and_environment_overrides() {
+    let _lock = env_lock();
+    let _env = EnvGuard::without_deepseek_runtime_overrides();
+
+    for alias in [
+        "csdn",
+        "csdn-ai",
+        "csdn_ai",
+        "csdn-coding-plan",
+        "csdn_coding_plan",
+        "starmap",
+    ] {
+        assert_eq!(ProviderKind::parse(alias), Some(ProviderKind::Csdn));
+        let parsed: ConfigToml =
+            toml::from_str(&format!("provider = \"{alias}\"")).expect("CSDN alias");
+        assert_eq!(parsed.provider, ProviderKind::Csdn);
+    }
+
+    let metadata = provider::resolve_provider("starmap").expect("CSDN metadata");
+    assert_eq!(metadata.id(), "csdn");
+    assert_eq!(metadata.display_name(), "CSDN");
+    assert_eq!(metadata.provider_config_key(), "csdn");
+    assert_eq!(metadata.default_base_url(), DEFAULT_CSDN_BASE_URL);
+    assert_eq!(metadata.default_model(), DEFAULT_CSDN_MODEL);
+    assert_eq!(metadata.env_vars(), &["CSDN_API_KEY"]);
+    assert_eq!(
+        metadata.wire_policy(),
+        provider::WirePolicy::Fixed(provider::WireFormat::ChatCompletions)
+    );
+
+    let config: ConfigToml = toml::from_str(
+        r#"
+provider = "csdn"
+
+[providers.csdn]
+api_key = "csdn-config-key"
+model = "glm_for_coding"
+"#,
+    )
+    .expect("CSDN provider table");
+    let resolved = config.resolve_runtime_options(&CliRuntimeOverrides::default());
+    assert_eq!(resolved.provider, ProviderKind::Csdn);
+    assert_eq!(resolved.base_url, DEFAULT_CSDN_BASE_URL);
+    assert_eq!(resolved.model, "glm_for_coding");
+    assert_eq!(resolved.api_key.as_deref(), Some("csdn-config-key"));
+    assert_eq!(
+        resolved.api_key_source,
+        Some(RuntimeApiKeySource::ConfigFile)
+    );
+
+    unsafe {
+        std::env::set_var("CSDN_API_KEY", "csdn-env-key");
+        std::env::set_var("CSDN_BASE_URL", "https://ai.csdn.net/api/model/v1");
+        std::env::set_var("CSDN_MODEL", "deepseek-v3.2");
+    }
+    let env_config = ConfigToml {
+        provider: ProviderKind::Csdn,
+        ..ConfigToml::default()
+    };
+    let resolved = env_config.resolve_runtime_options(&CliRuntimeOverrides::default());
+    assert_eq!(resolved.base_url, "https://ai.csdn.net/api/model/v1");
+    assert_eq!(resolved.model, "deepseek-v3.2");
+    assert_eq!(resolved.api_key.as_deref(), Some("csdn-env-key"));
+    assert_eq!(resolved.api_key_source, Some(RuntimeApiKeySource::Env));
+}
+
 /// Concentrate is an opt-in, BYOK, Responses-wire gateway: aliases collapse
 /// onto one catalog identity, the metadata names the official base URL and a
 /// distinct `CONCENTRATE_API_KEY` slot, the wire policy is fixed on the
@@ -5562,12 +5542,12 @@ fn meta_model_api_scopes_both_documented_key_names_to_official_endpoint() {
 fn provider_metadata_registry_covers_every_provider_kind_once() {
     let providers = provider::all_providers();
     // Full registry keeps legacy dialect/plan kinds for provider_for_kind.
-    assert_eq!(providers.len(), 49);
+    assert_eq!(providers.len(), 52);
     // Catalog surface is one identity per vendor (no dual-wire / plan rows),
     // and never a retired tombstone: Antigravity stays in the full registry
     // so old config parses and can be cleared, but it left `ALL` when it
     // stopped being selectable (PRD §4.4 PROD-002).
-    assert_eq!(ProviderKind::ALL.len(), 43);
+    assert_eq!(ProviderKind::ALL.len(), 46);
     assert!(
         !ProviderKind::ALL.contains(&ProviderKind::Antigravity),
         "a tombstone must never be offered as a selectable provider"
@@ -5976,6 +5956,38 @@ fn zhipu_aliases_fold_into_zai_provider() {
         normalize_model_for_provider(ProviderKind::Zai, "glm-5-2"),
         ZAI_GLM_5_2_MODEL
     );
+}
+
+#[test]
+fn stepfun_step_plan_hosts_are_official_so_the_catalog_is_not_withheld() {
+    // A Step Plan subscriber's base URL is StepFun's own documented host.
+    // Treating it as custom made `catalog_models_for_route` return nothing,
+    // which the picker showed as `0 bundled`: no model list, and a guessed
+    // context window instead of the 1M `step-5-preview` actually has.
+    for official in [
+        "https://api.stepfun.ai/v1",
+        "https://api.stepfun.ai/step_plan/v1",
+        "https://api.stepfun.com/v1",
+        "https://api.stepfun.com/step_plan/v1",
+        "https://api.stepfun.ai/step_plan/v1/",
+    ] {
+        assert!(
+            provider_base_url_is_official(ProviderKind::Stepfun, official),
+            "{official} is a StepFun-owned endpoint"
+        );
+    }
+    // A host StepFun does not own stays custom: this predicate also scopes
+    // credentials, so it must not widen to arbitrary look-alikes.
+    for foreign in [
+        "https://api.stepfun.evil.com/v1",
+        "https://api.deepseek.com",
+        "https://stepfun.ai.attacker.test/step_plan/v1",
+    ] {
+        assert!(
+            !provider_base_url_is_official(ProviderKind::Stepfun, foreign),
+            "{foreign} must stay custom and keyless"
+        );
+    }
 }
 
 #[test]
@@ -8248,14 +8260,12 @@ fn workflow_config_defaults_match_product_surface() {
     assert!(defaults.automatic);
     assert!(defaults.auto_start_read_only);
     assert!(defaults.require_approval_for_writes);
-    assert_eq!(defaults.auto_start_child_limit, 16);
     assert_eq!(defaults.max_children, 1000);
     assert_eq!(defaults.max_concurrent, 16);
     assert_eq!(defaults.max_depth, 5);
-    assert_eq!(defaults.default_token_budget, 120_000);
-    assert_eq!(defaults.max_parallel_writes_without_worktree, 0);
-    assert!(defaults.persist_completed_activity);
-    assert!(defaults.persist_completed_across_restarts);
+    // 0 = no shared cap; budgets are opt-in, matching the parent turn loop's
+    // advisory policy (#6189).
+    assert_eq!(defaults.default_token_budget, 0);
 }
 
 #[test]
@@ -8294,12 +8304,8 @@ default_token_budget = 50000
     // Unset keys keep product defaults.
     assert!(workflow.auto_start_read_only);
     assert!(workflow.require_approval_for_writes);
-    assert_eq!(workflow.auto_start_child_limit, 16);
     assert_eq!(workflow.max_concurrent, 16);
     assert_eq!(workflow.max_depth, 5);
-    assert_eq!(workflow.max_parallel_writes_without_worktree, 0);
-    assert!(workflow.persist_completed_activity);
-    assert!(workflow.persist_completed_across_restarts);
 
     let serialized = toml::to_string_pretty(&workflow).expect("workflow serializes");
     let round_tripped: WorkflowConfigToml =
@@ -8336,6 +8342,31 @@ max_spawn_depth = 2
     .expect("fleet exec config should parse");
 
     assert_eq!(config.fleet.expect("fleet config").exec.max_spawn_depth, 2);
+}
+
+/// Retired tables/keys are ignored, never a parse failure: a pre-0.9.14
+/// config with inline `[fleets.*]`, legacy trust keys, or dead workflow
+/// knobs must still load (named fleets live in `fleets/*.toml` files).
+#[test]
+fn retired_inline_fleet_and_workflow_keys_are_ignored_not_rejected() {
+    let config: ConfigToml = toml::from_str(
+        r#"
+[fleet]
+default_trust_level = "local"
+
+[fleets.alice-team]
+operator = "alice"
+default_trust_level = "local"
+
+[workflow]
+auto_start_child_limit = 4
+max_parallel_writes_without_worktree = 1
+persist_completed_activity = false
+"#,
+    )
+    .expect("retired keys must still parse");
+    assert!(config.fleet.is_some());
+    assert!(config.workflow.is_some());
 }
 
 #[test]
@@ -8490,354 +8521,6 @@ fn test_verbosity_resolution() {
     unsafe {
         std::env::remove_var("DEEPSEEK_VERBOSITY");
     }
-}
-
-// ─── Named operator-scoped Fleet configurations (#5039) ──────────────────────
-
-#[test]
-fn named_fleet_legacy_only_config_loads_unchanged() {
-    // A config with only the legacy [fleet] table and no [fleets.*] tables.
-    let config: ConfigToml = toml::from_str(
-        r#"
-[fleet.exec]
-max_spawn_depth = 2
-"#,
-    )
-    .expect("legacy fleet config should parse");
-
-    assert_eq!(config.fleet.expect("legacy fleet").exec.max_spawn_depth, 2);
-    assert!(
-        config.fleets.is_empty(),
-        "no named fleets should be present"
-    );
-}
-
-#[test]
-fn named_fleet_parses_legacy_authority_keys_for_migration() {
-    let config: ConfigToml = toml::from_str(
-        r#"
-[fleets.alice-team]
-operator = "alice"
-default_trust_level = "local"
-max_trust_level = "operator"
-"#,
-    )
-    .expect("named fleet config should parse");
-
-    let fleet = config.fleets.get("alice-team").expect("alice-team fleet");
-    assert_eq!(fleet.operator, "alice");
-    assert_eq!(fleet.default_trust_level, "local");
-    assert_eq!(fleet.max_trust_level, "operator");
-}
-
-#[test]
-fn named_fleet_has_no_authority_defaults_when_legacy_fields_are_absent() {
-    let config: ConfigToml = toml::from_str(
-        r#"
-[fleets.minimal]
-operator = "bob"
-"#,
-    )
-    .expect("minimal named fleet should parse");
-
-    let fleet = config.fleets.get("minimal").expect("minimal fleet");
-    assert_eq!(fleet.operator, "bob");
-    assert!(fleet.default_trust_level.is_empty());
-    assert!(!fleet.require_identity_verification);
-    assert!(fleet.max_trust_level.is_empty());
-    assert!(fleet.roles.is_empty());
-    assert!(fleet.profiles.is_empty());
-}
-
-#[test]
-fn named_fleet_mixed_legacy_and_named_both_load() {
-    // Users may have the global [fleet] default AND named [fleets.*] tables.
-    let config: ConfigToml = toml::from_str(
-        r#"
-[fleet]
-default_trust_level = "sandbox"
-
-[fleets.team-a]
-operator = "alice"
-default_trust_level = "local"
-
-[fleets.team-b]
-operator = "bob"
-default_trust_level = "remote-verified"
-"#,
-    )
-    .expect("mixed fleet config should parse");
-
-    assert_eq!(
-        config
-            .fleet
-            .as_ref()
-            .expect("legacy fleet")
-            .default_trust_level,
-        "sandbox"
-    );
-    assert_eq!(config.fleets.len(), 2);
-    assert_eq!(config.fleets["team-a"].default_trust_level, "local");
-    assert_eq!(
-        config.fleets["team-b"].default_trust_level,
-        "remote-verified"
-    );
-}
-
-#[test]
-fn named_fleet_multiple_configs_independent_profiles() {
-    let config: ConfigToml = toml::from_str(
-        r#"
-[fleets.fleet-one]
-operator = "alice"
-
-[fleets.fleet-one.profiles.fast-verifier]
-slot = "verifier"
-loadout = "fast"
-
-[fleets.fleet-two]
-operator = "bob"
-
-[fleets.fleet-two.profiles.slow-reviewer]
-slot = "reviewer"
-loadout = "inherit"
-"#,
-    )
-    .expect("multiple named fleets with profiles should parse");
-
-    let fleet_one = config.fleets.get("fleet-one").expect("fleet-one");
-    assert_eq!(fleet_one.operator, "alice");
-    assert_eq!(
-        fleet_one
-            .profiles
-            .get("fast-verifier")
-            .expect("fast-verifier profile")
-            .slot,
-        FleetSlot::Verifier
-    );
-
-    let fleet_two = config.fleets.get("fleet-two").expect("fleet-two");
-    assert_eq!(fleet_two.operator, "bob");
-    assert_eq!(
-        fleet_two
-            .profiles
-            .get("slow-reviewer")
-            .expect("slow-reviewer profile")
-            .slot,
-        FleetSlot::Reviewer
-    );
-}
-
-#[test]
-fn resolve_fleet_returns_named_fleet() {
-    let config: ConfigToml = toml::from_str(
-        r#"
-[fleets.my-fleet]
-operator = "alice"
-default_trust_level = "local"
-"#,
-    )
-    .expect("fleet config");
-
-    let fleet = config.resolve_fleet("my-fleet").expect("resolve my-fleet");
-    assert_eq!(fleet.operator, "alice");
-    assert_eq!(fleet.default_trust_level, "local");
-}
-
-#[test]
-fn resolve_fleet_unknown_name_gives_actionable_error() {
-    let config: ConfigToml = toml::from_str(
-        r#"
-[fleets.real-fleet]
-operator = "alice"
-"#,
-    )
-    .expect("fleet config");
-
-    let err = config
-        .resolve_fleet("ghost-fleet")
-        .expect_err("unknown fleet");
-    match err {
-        FleetResolutionError::UnknownFleet { name, available } => {
-            assert_eq!(name, "ghost-fleet");
-            assert_eq!(available, vec!["real-fleet".to_string()]);
-        }
-        other => panic!("expected UnknownFleet, got {other}"),
-    }
-}
-
-#[test]
-fn resolve_fleet_unknown_with_no_fleets_configured() {
-    let config: ConfigToml = ConfigToml::default();
-
-    let err = config.resolve_fleet("anything").expect_err("no fleets");
-    match err {
-        FleetResolutionError::UnknownFleet { name, available } => {
-            assert_eq!(name, "anything");
-            assert!(available.is_empty());
-        }
-        other => panic!("expected UnknownFleet, got {other}"),
-    }
-}
-
-#[test]
-fn resolve_fleet_for_operator_returns_single_match() {
-    let config: ConfigToml = toml::from_str(
-        r#"
-[fleets.alice-team]
-operator = "alice"
-default_trust_level = "local"
-"#,
-    )
-    .expect("fleet config");
-
-    let (name, fleet) = config
-        .resolve_fleet_for_operator("alice")
-        .expect("resolve alice");
-    assert_eq!(name, "alice-team");
-    assert_eq!(fleet.operator, "alice");
-}
-
-#[test]
-fn resolve_fleet_for_operator_unknown_gives_actionable_error() {
-    let config: ConfigToml = toml::from_str(
-        r#"
-[fleets.alice-team]
-operator = "alice"
-"#,
-    )
-    .expect("fleet config");
-
-    let err = config
-        .resolve_fleet_for_operator("charlie")
-        .expect_err("unknown operator");
-    match err {
-        FleetResolutionError::UnknownOperator {
-            operator,
-            available,
-        } => {
-            assert_eq!(operator, "charlie");
-            assert_eq!(available, vec!["alice".to_string()]);
-        }
-        other => panic!("expected UnknownOperator, got {other}"),
-    }
-}
-
-#[test]
-fn resolve_fleet_for_operator_ambiguous_gives_actionable_error() {
-    let config: ConfigToml = toml::from_str(
-        r#"
-[fleets.fleet-a]
-operator = "alice"
-
-[fleets.fleet-b]
-operator = "alice"
-"#,
-    )
-    .expect("fleet config");
-
-    let err = config
-        .resolve_fleet_for_operator("alice")
-        .expect_err("ambiguous operator");
-    match err {
-        FleetResolutionError::AmbiguousOperator {
-            operator,
-            mut fleet_names,
-        } => {
-            assert_eq!(operator, "alice");
-            fleet_names.sort();
-            assert_eq!(fleet_names, vec!["fleet-a", "fleet-b"]);
-        }
-        other => panic!("expected AmbiguousOperator, got {other}"),
-    }
-}
-
-#[test]
-fn named_fleet_error_messages_are_actionable() {
-    // Verify Display output is human-readable and contains key hints.
-    let no_fleets_err = FleetResolutionError::UnknownFleet {
-        name: "x".to_string(),
-        available: vec![],
-    };
-    let msg = no_fleets_err.to_string();
-    assert!(msg.contains("x"), "should contain fleet name");
-    assert!(msg.contains("config.toml"), "should mention config.toml");
-
-    let with_candidates_err = FleetResolutionError::UnknownFleet {
-        name: "x".to_string(),
-        available: vec!["fleet-one".to_string(), "fleet-two".to_string()],
-    };
-    let msg = with_candidates_err.to_string();
-    assert!(msg.contains("fleet-one"), "should list available fleets");
-    assert!(msg.contains("fleet-two"), "should list available fleets");
-
-    let unknown_op_err = FleetResolutionError::UnknownOperator {
-        operator: "nobody".to_string(),
-        available: vec!["alice".to_string()],
-    };
-    let msg = unknown_op_err.to_string();
-    assert!(msg.contains("nobody"), "should contain operator name");
-    assert!(msg.contains("alice"), "should list known operators");
-
-    let ambiguous_err = FleetResolutionError::AmbiguousOperator {
-        operator: "alice".to_string(),
-        fleet_names: vec!["fleet-a".to_string(), "fleet-b".to_string()],
-    };
-    let msg = ambiguous_err.to_string();
-    assert!(msg.contains("alice"), "should contain operator");
-    assert!(msg.contains("fleet-a"), "should list fleet names");
-    assert!(msg.contains("fleet-b"), "should list fleet names");
-    assert!(
-        msg.contains("explicitly"),
-        "should prompt user to be explicit"
-    );
-}
-
-#[test]
-fn named_fleet_view_preserves_legacy_input_without_making_it_policy() {
-    let config: ConfigToml = toml::from_str(
-        r#"
-[fleets.team]
-operator = "alice"
-default_trust_level = "local"
-max_trust_level = "operator"
-require_identity_verification = false
-
-[fleets.team.exec]
-max_turns = 100
-"#,
-    )
-    .expect("fleet config");
-
-    let named = config.fleets.get("team").expect("team fleet");
-    let view = named.as_fleet_config();
-    assert_eq!(view.default_trust_level, "local");
-    assert_eq!(view.max_trust_level, "operator");
-    assert!(!view.require_identity_verification);
-    assert_eq!(view.exec.max_turns, 100);
-}
-
-#[test]
-fn named_fleet_serialization_drops_legacy_authority_keys() {
-    let config: ConfigToml = toml::from_str(
-        r#"
-[fleets.my-fleet]
-operator = "alice"
-default_trust_level = "local"
-
-[fleets.my-fleet.exec]
-max_spawn_depth = 1
-"#,
-    )
-    .expect("fleet config");
-
-    let fleet = config.fleets.get("my-fleet").expect("my-fleet");
-    let serialized = toml::to_string_pretty(fleet).expect("serializes");
-    assert!(!serialized.contains("default_trust_level"));
-    let round_tripped: NamedFleetConfigToml = toml::from_str(&serialized).expect("round trips");
-    assert_eq!(round_tripped.operator, "alice");
-    assert!(round_tripped.default_trust_level.is_empty());
-    assert_eq!(round_tripped.exec.max_spawn_depth, 1);
 }
 
 /// Save and restore the telemetry env vars around a test that mutates them.
@@ -9638,10 +9321,6 @@ fn openrouter_vendor_config_round_trip_and_trust_boundary() -> Result<()> {
         reloaded.list_values().get(key).map(String::as_str),
         Some("deepinfra/turbo")
     );
-    // Repository config must not redirect a user-selected upstream vendor.
-    let mut project = ConfigToml::default();
-    project.providers.openrouter.vendor = Some("another-vendor".into());
-    reloaded.merge_project_overrides(project);
     assert_eq!(reloaded.get_value(key).as_deref(), Some("deepinfra/turbo"));
     for invalid in ["deep infra", "deepinfra\n/turbo", " deepinfra"] {
         assert!(reloaded.set_value(key, invalid).is_err());

@@ -17,20 +17,26 @@ Implementation sources:
 
 ## Default-active contract
 
-New turns start with exactly seven model-facing names:
+New turns start with eleven eager native names plus synthetic `tool_search`:
 
 1. `read`
 2. `write`
 3. `edit`
 4. `bash`
 5. `agent`
-6. `todo_write`
-7. `tool_search`
+6. `workflow`
+7. `todo_write`
+8. `create_goal`
+9. `get_goal`
+10. `update_goal`
+11. `load_skill`
+12. `tool_search` (synthetic, always active)
 
-The first six are `DEFAULT_ACTIVE_NATIVE_TOOLS` in
-`crates/tui/src/core/engine/tool_catalog.rs`. `tool_search` is synthetic and is
-always active. An authority boundary may remove `agent` at the maximum child
-depth, but route size alone must not change this core vocabulary.
+The eleven native names are `DEFAULT_ACTIVE_NATIVE_TOOLS` in
+`crates/tui/src/core/engine/tool_catalog.rs`, pinned by
+`default_active_contract_keeps_discovery_and_core_tools_eager`. An authority
+boundary may remove `agent` at the maximum child depth, but route size alone
+must not change this core vocabulary.
 
 The direct schemas deliberately stay small:
 
@@ -41,7 +47,11 @@ The direct schemas deliberately stay small:
 | `edit` | `path`, `edits` | Apply one or more unambiguous text replacements against one original snapshot. |
 | `bash` | `command`, optional `timeout` | Run one cancellable foreground shell command and return a bounded tail. |
 | `agent` | delegated task and optional scope/context controls | Start or inspect focused child work. |
+| `workflow` | plan/script/source_path plus run controls | Coordinate multi-agent phases with dependencies and completion checks. |
 | `todo_write` | complete replacement list of `{content, status}` items | Keep optional, agent-owned progress notes for genuinely multi-step work. |
+| `create_goal` | objective plus optional budget | Start the session goal the turn works toward. |
+| `get_goal` | none | Read the active goal and its progress. |
+| `update_goal` | terminal status | Mark the goal complete or blocked. |
 | `tool_search` | `query`, optional matching controls | Discover policy-allowed deferred tools and add selected schemas to this conversation's toolbox. |
 
 Mode is an authority decision, not a synonym system. Plan, Work, and Operate
@@ -71,6 +81,12 @@ MCP tools are dynamic. Successfully connected servers register names such as
 `mcp_<server>_<tool>` from `~/.codewhale/mcp.json`; a failed or disabled server
 must not be presented as available. MCP and plugin tools are deferred unless a
 user explicitly names them in `[tools].always_load`.
+
+`execute_tools` is deferred and engine-injected, alongside the synthetic
+interpreter tools. It runs a JavaScript program whose only host surface is
+`tools.call(name, args)`; nested calls must be read-only and auto-approved,
+and anything else aborts the program with a host-owned receipt. It is hidden
+from Plan mode and refused under a worker authority envelope.
 
 ### Conversation toolbox cache
 
@@ -255,10 +271,10 @@ cargo test --locked -p codewhale-tui --lib core::engine::tests::print_mode_tool_
 
 Check the test names against the source before trusting a green run: `cargo test`
 exits 0 with "0 passed; N filtered out" when a filter matches nothing, so a
-misspelled filter is indistinguishable from a pass. (Three filters printed here
-before v0.9.4 named tests that did not exist.)
+misspelled filter is indistinguishable from a pass. See
+`scripts/check-doc-test-filters.py`, which verifies the filters below.
 
-The provider-free receipt must report the seven default-active names listed
+The provider-free receipt must report the eleven default-active names listed
 above. A separate repository-wide tool count may include deferred, dynamic,
 feature-gated, and compatibility-only registrations; it is not the number of
 tools placed in the first-turn model catalog.

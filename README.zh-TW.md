@@ -1,11 +1,11 @@
-<!-- source: README.md sha256:a446e3921085 -->
+<!-- source: README.md sha256:29c349b6f2b4 -->
 # Codewhale
 
 Codewhale 是一款開源代理，可使用你選擇的託管模型或本機模型讀取專案、編輯檔案、執行指令，並檢查自己的工作。從終端機中的一項任務開始。對於較大的工作，可以將部分任務交給使用不同模型、擔任不同角色的代理。
 
-![Codewhale 在終端機中執行](web/public/codewhale-tui-171acee.png)
+![Codewhale 在終端機中執行](web/public/codewhale-tui-d7a9a1c.png)
 
-*終端機預覽截圖來自 v0.9.12 的開發建置版本。*
+*終端機預覽截圖來自 v0.10.0 的開發建置版本。*
 
 [English](README.md) · [简体中文](README.zh-CN.md) · [日本語](README.ja-JP.md) · [Tiếng Việt](README.vi.md) · [Bahasa Indonesia](README.id.md) · [한국어](README.ko-KR.md) · [Español](README.es-419.md) · [Português](README.pt-BR.md) · [Русский](README.ru.md) · [Українська](README.uk.md) · [Français](README.fr.md) · [Deutsch](README.de.md) · [हिन्दी](README.hi.md) · [Türkçe](README.tr.md) · [Italiano](README.it.md) · [Polski](README.pl.md) · [العربية](README.ar.md) · [Català](README.ca.md)
 
@@ -53,7 +53,7 @@ Codewhale 可以讀取你的程式碼儲存庫、編輯檔案、執行指令、�
 
 - **終端機：** `codewhale` 開啟互動介面；`codewhale exec` 可從指令碼或 CI 工作中執行任務。
 - **本機瀏覽器：** `codewhale web` 開啟隨附的[本機網頁用戶端](docs/WEB.md)，使用同一個 Runtime。
-- **Codewhale 網頁與桌面應用程式：** 仍在開發中的圖形工作台。其可用情況見[產品頁面](https://codewhale.net/en/product)。
+- **Codewhale 桌面應用程式（GPUI）：** 原生 GPUI 桌面應用程式是產品客戶端方向（2026-09-14 決定；階段規劃見私有 codehwhale-gpui 儲存庫中的 docs/TRANSITION.md）。app.codewhale.net 的託管網頁應用程式將分階段退場；行銷網站、登入、計費、法律與下載頁面永久保留在網頁上。其可用情況見[產品頁面](https://codewhale.net/en/product)。
 
 **Computer Use 提供觀察其他應用程式並與之互動的工具。** 目前的原始碼已包含此外掛程式。使用前請檢視它要求的存取權限並啟用它；仍須符合作業系統權限與平台要求。請參閱隨附的 [Computer Use 指南](crates/tui/plugins/computer-use/README.md)與[外掛程式設定](docs/PLUGINS.md)。
 

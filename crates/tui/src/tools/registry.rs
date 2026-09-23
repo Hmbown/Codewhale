@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use codewhale_protocol::runtime::DynamicToolSpec;
 use serde_json::Value;
 
-use crate::client::DeepSeekClient;
+use crate::client::CodewhaleClient;
 use crate::tools::goal::SharedGoalState;
 use codewhale_models::Tool;
 
@@ -511,7 +511,7 @@ fn project_readonly_evidence_schema(name: &str, schema: &mut Value) {
     }
 }
 
-fn enforce_tool_authority(
+pub(crate) fn enforce_tool_authority(
     name: &str,
     input: &Value,
     tool: &dyn ToolSpec,
@@ -589,7 +589,7 @@ fn enforce_tool_authority(
                 return Ok(());
             }
             return Err(ToolError::permission_denied(format!(
-                "worker '{}' cannot run unbounded verification arguments or commands",
+                "worker '{}' cannot run unbounded verification arguments or commands. Re-run the default gate instead: drop `commands` (run_verifiers) and any flag that can redirect what runs (run_tests `args` may only select tests), and report the blocked probe to the parent rather than working around it.",
                 authority.owner
             )));
         }
@@ -773,7 +773,7 @@ impl ToolRegistryBuilder {
 
     /// Include only read-only file tools (read, list).
     #[must_use]
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), expect(dead_code))]
     pub fn with_read_only_file_tools(self) -> Self {
         use super::file::{ListDirTool, ReadFileTool};
         use super::file_tool::FileTool;
@@ -1030,7 +1030,7 @@ impl ToolRegistryBuilder {
     pub fn with_vision_tools(
         self,
         config: crate::config::VisionModelConfig,
-        route_client: Option<DeepSeekClient>,
+        route_client: Option<CodewhaleClient>,
     ) -> Self {
         use crate::vision::tools::ImageAnalyzeTool;
         self.with_tool(Arc::new(ImageAnalyzeTool::new_with_route_client(
@@ -1072,7 +1072,7 @@ impl ToolRegistryBuilder {
     #[must_use]
     pub fn with_speech_tools(
         self,
-        client: Option<DeepSeekClient>,
+        client: Option<CodewhaleClient>,
         output_dir: Option<PathBuf>,
     ) -> Self {
         use super::speech::SpeechTool;
@@ -1086,7 +1086,7 @@ impl ToolRegistryBuilder {
 
     /// Include the canonical persistent RLM session tool.
     #[must_use]
-    pub fn with_rlm_tool(self, client: Option<DeepSeekClient>, root_model: String) -> Self {
+    pub fn with_rlm_tool(self, client: Option<CodewhaleClient>, root_model: String) -> Self {
         use super::rlm::RlmTool;
         self.with_tool(Arc::new(
             RlmTool::new("rlm", client).with_root_model(root_model),
@@ -1110,7 +1110,7 @@ impl ToolRegistryBuilder {
 
     /// Include the review tool.
     #[must_use]
-    pub fn with_review_tool(self, client: Option<DeepSeekClient>, model: String) -> Self {
+    pub fn with_review_tool(self, client: Option<CodewhaleClient>, model: String) -> Self {
         use super::review::ReviewTool;
         self.with_tool(Arc::new(ReviewTool::new(client, model)))
     }
@@ -1119,7 +1119,7 @@ impl ToolRegistryBuilder {
     /// critic runs at elevated reasoning (default `Max`) independent of the
     /// session tier and is given no tools, so it cannot recurse into `verify`.
     #[must_use]
-    pub fn with_verify_tool(self, client: Option<DeepSeekClient>, model: String) -> Self {
+    pub fn with_verify_tool(self, client: Option<CodewhaleClient>, model: String) -> Self {
         use super::verify::VerifyTool;
         self.with_tool(Arc::new(VerifyTool::new(client, model)))
     }
@@ -1133,7 +1133,7 @@ impl ToolRegistryBuilder {
 
     /// Include the FIM (Fill-in-the-Middle) edit tool.
     #[must_use]
-    pub fn with_fim_tool(self, client: Option<DeepSeekClient>, model: String) -> Self {
+    pub fn with_fim_tool(self, client: Option<CodewhaleClient>, model: String) -> Self {
         use super::fim::FimEditTool;
         self.with_tool(Arc::new(FimEditTool::new(client, model)))
     }
@@ -1154,6 +1154,15 @@ impl ToolRegistryBuilder {
         use super::native_memory::{MemoryGetTool, MemorySearchTool};
         self.with_tool(Arc::new(MemorySearchTool))
             .with_tool(Arc::new(MemoryGetTool))
+    }
+
+    /// Include the prior-session recall tools (#5715). Always-on: they are
+    /// read-only and workspace-scoped, so there is no opt-in to honor.
+    #[must_use]
+    pub fn with_session_recall_tools(self) -> Self {
+        use super::session::{SessionGetTool, SessionSearchTool};
+        self.with_tool(Arc::new(SessionSearchTool))
+            .with_tool(Arc::new(SessionGetTool))
     }
 
     /// Include the model-facing LSP intelligence tools. They reuse the
@@ -1298,7 +1307,7 @@ impl ToolRegistryBuilder {
     #[must_use]
     pub fn with_agent_runtime_surface(
         self,
-        client: Option<DeepSeekClient>,
+        client: Option<CodewhaleClient>,
         model: String,
         options: AgentToolSurfaceOptions,
         todo_list: super::todo::SharedTodoList,
@@ -1345,6 +1354,7 @@ impl ToolRegistryBuilder {
         builder
             .with_notify_tool()
             .with_request_plugin_install_tool()
+            .with_session_recall_tools()
     }
 
     /// Include the full child-inherited Agent surface under resolved
@@ -1353,7 +1363,7 @@ impl ToolRegistryBuilder {
     #[allow(clippy::too_many_arguments)]
     pub fn with_full_agent_surface_options(
         self,
-        client: Option<DeepSeekClient>,
+        client: Option<CodewhaleClient>,
         model: String,
         manager: super::subagent::SharedSubAgentManager,
         runtime: super::subagent::SubAgentRuntime,
@@ -1417,13 +1427,6 @@ impl ToolRegistryBuilder {
         use super::subagent::AgentTool;
         use super::subagent::register_coordination_tools;
         use super::workflow::WorkflowTool;
-        use super::workflow_trigger::soft_auto_policy_is_linked;
-
-        // Keep soft-auto trigger policy linked in release builds (#4127).
-        debug_assert!(
-            soft_auto_policy_is_linked(),
-            "workflow soft-auto policy must stay linked"
-        );
 
         let builder = self
             .with_tool(Arc::new(WorkflowTool::new(

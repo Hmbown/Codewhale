@@ -373,7 +373,7 @@ impl App {
         push_enabled_provider_model(&mut enabled_provider_models, &provider_identity, &model);
         let active_context_window_override = config.context_window_for_provider_config(provider);
         let active_model_context_windows = config.model_context_windows_for(provider).cloned();
-        let configured_route_base_url = effective_auth_config.deepseek_base_url();
+        let configured_route_base_url = effective_auth_config.active_route_base_url();
         let (active_route_limits, active_route_base_url, active_context_window_source) =
             if auto_model {
                 (
@@ -468,7 +468,7 @@ impl App {
             && !reasoning_effort_explicit
             && let Some(effort) = crate::config::legacy_deepseek_alias_effort_for_route(
                 provider,
-                &effective_auth_config.deepseek_base_url(),
+                &effective_auth_config.active_route_base_url(),
                 &model,
             )
         {
@@ -673,10 +673,31 @@ impl App {
                 plugin_registry.as_ref(),
             )
             .map(|cfg| {
+                // Boot is lazy (#6033): the pre-event "connecting" prediction
+                // is the eager set — `required` servers plus ones the user's
+                // `tools.always_load` selection covers — not every enabled
+                // server. The engine's first boot event replaces this with
+                // the real in-flight set.
+                let requested = config
+                    .tools
+                    .as_ref()
+                    .map(|tools| {
+                        tools
+                            .always_load
+                            .iter()
+                            .map(|name| name.trim().to_ascii_lowercase())
+                            .filter(|name| name.starts_with("mcp_"))
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
                 let mut connecting = cfg
                     .servers
                     .iter()
                     .filter(|(_, server)| server.is_enabled())
+                    .filter(|(name, server)| {
+                        server.required
+                            || crate::mcp::tool_selection_covers_server(&requested, name)
+                    })
                     .map(|(name, _)| name.clone())
                     .collect::<Vec<_>>();
                 connecting.sort();
@@ -730,7 +751,14 @@ impl App {
                 line_began_with_slash: false,
                 startup_input_unproven: false,
             },
-            viewport: ViewportState::default(),
+            viewport: ViewportState {
+                selection_copy_markdown: config
+                    .tui
+                    .as_ref()
+                    .and_then(|tui| tui.selection_copy_markdown)
+                    .unwrap_or(true),
+                ..ViewportState::default()
+            },
             pet_watch: crate::tui::pet_watch::PetWatch::default(),
             work_surface: {
                 let mut state = crate::tui::work_surface::WorkSurfaceState::with_layout(
@@ -756,8 +784,9 @@ impl App {
             history_revisions: Vec::new(),
             tool_run_cache: ToolRunCache::default(),
             next_history_revision: 1,
-            api_messages: Vec::new(),
+            api_messages: Arc::new(Vec::new()),
             api_message_stamps: Vec::new(),
+            session_journal: crate::session_tree::SessionJournal::new(),
             completed_assistant_outputs: Vec::new(),
             context_token_cache: std::cell::RefCell::new(Default::default()),
             remote_control: crate::remote_control::RemoteControlController::default(),
@@ -819,6 +848,7 @@ impl App {
             workspace,
             workflow_config: config.workflow_config(),
             goal_max_continuations: config.goal_max_continuations(),
+            goal_enforce_token_budget: config.goal_enforce_token_budget(),
             goal_continuation_waiting: false,
             configured_sandbox_mode: config.sandbox_mode.clone(),
             configured_sandbox_network: config.sandbox_network_access,
@@ -848,6 +878,7 @@ impl App {
             use_bracketed_paste,
             use_paste_burst_detection,
             bracketed_paste_seen: false,
+            bracketed_paste_trusted: crate::tui::paste::terminal_delivers_bracketed_paste(),
             system_prompt: None,
             auto_compact,
             auto_compact_user_configured,
@@ -992,11 +1023,6 @@ impl App {
             // once here so every render pass — main cache and full-screen
             // overlay — shares one effective width; `None` = full width.
             prose_measure: config.prose_measure(),
-            header_items: config
-                .tui
-                .as_ref()
-                .and_then(|tui| tui.header_items.clone())
-                .unwrap_or_else(crate::config::HeaderItem::default_header),
             project_doc: None,
             plan_state,
             todos,
@@ -1056,7 +1082,7 @@ impl App {
             queued_messages: VecDeque::new(),
             queued_draft: None,
             pending_steers: VecDeque::new(),
-            rejected_steers: VecDeque::new(),
+            inflight_steers: VecDeque::new(),
             submit_pending_steers_after_interrupt: false,
             turn_started_at: None,
             turn_last_activity_at: None,
@@ -1115,7 +1141,7 @@ impl App {
             prefix_drift_count: 0,
             prefix_context_updates: 0,
             collapsed_cells: HashSet::new(),
-            folded_thinking: HashSet::new(),
+            thinking_folds: HashMap::new(),
             collapsed_cell_map: Vec::new(),
             edit_in_progress: false,
             lsp_enabled: config.lsp.as_ref().and_then(|l| l.enabled).unwrap_or(true),

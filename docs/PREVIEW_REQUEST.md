@@ -132,7 +132,7 @@ production path** up to (but not including) the send:
    steps — so the previewed outbound message list is exactly that list, and
    one estimate over stored messages plus system covers both the manifest
    number and the overflow decision.
-5. It prepares the request through `DeepSeekClient::prepare_outbound_request`
+5. It prepares the request through `CodewhaleClient::prepare_outbound_request`
    and describes the result — unless a runtime transform would rewrite it
    first, in which case the body is typed unavailable instead.
 
@@ -180,7 +180,7 @@ be false, and this document does not make one.
 ## Where the numbers come from
 
 **The prepared outbound request.** Every primary model turn reaches the wire
-through `DeepSeekClient::prepare_outbound_request`, which returns a
+through `CodewhaleClient::prepare_outbound_request`, which returns a
 `PreparedOutboundRequest`: dialect, endpoint identity, canonical wire model,
 the final body, and a reasoning receipt. Production dispatch sends that value;
 the preview describes it. There is no second body builder.

@@ -90,6 +90,10 @@ impl ToolSpec for RunTool {
                     "type": "boolean",
                     "description": "Include --all-features for cargo test (action=tests)"
                 },
+                "cwd": {
+                    "type": "string",
+                    "description": "Optional working directory, relative to the workspace, to run the tests or gates in. Must exist inside the workspace."
+                },
                 "profile": {
                     "type": "string",
                     "enum": ["auto", "rust", "node", "python", "go"],

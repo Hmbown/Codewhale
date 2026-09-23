@@ -14,7 +14,7 @@
 //!
 //! Now each adapter asks [`role_placement`] which channel to render into, and
 //! [`reject_unsupported_roles`] runs at the outbound seam
-//! (`DeepSeekClient::prepare_outbound_request`) so an unrepresentable pair is
+//! (`CodewhaleClient::prepare_outbound_request`) so an unrepresentable pair is
 //! refused locally, before any transport serialization, instead of being
 //! discovered by the provider.
 //!
@@ -126,7 +126,7 @@ pub(crate) struct UnsupportedRoleForDialect {
 /// Refuse an outbound transcript that a dialect cannot represent.
 ///
 /// This is the validation seam: it runs inside
-/// `DeepSeekClient::prepare_outbound_request`, before any dialect builds a
+/// `CodewhaleClient::prepare_outbound_request`, before any dialect builds a
 /// body, so no rejected pair ever reaches transport serialization.
 pub(crate) fn reject_unsupported_roles(
     messages: &[Message],

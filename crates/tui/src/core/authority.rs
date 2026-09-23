@@ -31,7 +31,7 @@ pub(crate) struct ModeSessionPrefs {
 /// The permission policy a given [`AppMode`] resolves to (#3386).
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct EffectiveModePolicy {
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), expect(dead_code))]
     pub(crate) mode: AppMode,
     pub(crate) allow_shell: bool,
     pub(crate) trust_mode: bool,
@@ -193,11 +193,7 @@ impl TurnAuthority {
             true,
             false,
             auto_approve,
-            if auto_approve {
-                ApprovalMode::Bypass
-            } else {
-                ApprovalMode::Suggest
-            },
+            posture_from_auto_approve(auto_approve),
         )
     }
 
@@ -220,6 +216,21 @@ impl TurnAuthority {
             workspace,
             network_access,
         )
+    }
+}
+
+/// The posture a legacy `auto_approve` bit stands for: a set bit is Full
+/// Access, a cleared bit is Ask.
+///
+/// Every surface that carries the bit without a session posture folds it here —
+/// the per-tool approval gate, a tool context built with only the bit, a
+/// scheduled automation — so none of them can disagree about what it means.
+#[must_use]
+pub(crate) fn posture_from_auto_approve(auto_approve: bool) -> ApprovalMode {
+    if auto_approve {
+        ApprovalMode::Bypass
+    } else {
+        ApprovalMode::Suggest
     }
 }
 

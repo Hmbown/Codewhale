@@ -8,20 +8,9 @@
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandProviderId(pub String);
 
-/// Provider-neutral reasoning preference exposed to commands.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub enum CommandReasoningEffort {
-    Off,
-    Minimal,
-    Low,
-    Medium,
-    High,
-    XHigh,
-    Ultra,
-    Auto,
-    #[default]
-    Max,
-}
+// Slice 4 removed `CommandReasoningEffort`: it was a verbatim 9-variant copy of
+// `codewhale_tui::reasoning_preference::ReasoningEffort` with no independent
+// behavior and no consumer, so it had no place on the command boundary.
 
 /// Application mode visible to commands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

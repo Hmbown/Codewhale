@@ -305,6 +305,54 @@ pub(crate) fn effective_max_output_tokens_for_route(
         .max(1)
 }
 
+/// Share of one output allowance a single review pass must keep for visible
+/// text, as a percentage.
+///
+/// A reasoning route shares one `max_tokens` allowance between hidden
+/// reasoning and visible text, and Codewhale has no wire-level separation
+/// (`thinking.budget_tokens` is not plumbed), so "reserving" means two things
+/// together: state the reserve, and cap the reasoning level that may consume
+/// it (`review::bounded_review_reasoning_effort`).
+///
+/// The share is sized from the model's reasoning behaviour rather than a flat
+/// constant:
+///
+/// * `Some(false)` — nothing to reserve; the whole allowance is visible text.
+/// * `Some(true)` in the summarized-reasoning families whose reasoning is
+///   counted as ordinary output tokens
+///   ([`codewhale_models::model_is_openai_reasoning_family`]) — half. These are
+///   the models observed consuming an entire 64K allowance on reasoning and
+///   returning zero visible text with stop reason `length` (#6285).
+/// * `Some(true)` otherwise, and `None` (no catalogue row) — a quarter. A
+///   review pass needs only enough text for its structured findings, and an
+///   unknown model is not evidence that it does not reason (#6032).
+#[must_use]
+pub(crate) fn review_visible_text_reserve_percent(model: &str) -> u32 {
+    review_reserve_percent_for(
+        codewhale_models::model_reasoning_capability(model),
+        codewhale_models::model_is_openai_reasoning_family(model),
+    )
+}
+
+/// Pure core of [`review_visible_text_reserve_percent`]: the mapping from a
+/// model's reasoning classification to the reserved share. Split out so the
+/// mapping is testable without the process-global model catalog.
+fn review_reserve_percent_for(capability: Option<bool>, openai_reasoning_family: bool) -> u32 {
+    match capability {
+        // Nothing to reserve; the whole allowance is visible text.
+        Some(false) => 0,
+        Some(true) if openai_reasoning_family => 50,
+        Some(true) | None => 25,
+    }
+}
+
+/// Visible-text reserve in tokens for one review pass on this exact model and
+/// resolved output allowance.
+#[must_use]
+pub(crate) fn review_visible_text_reserve_tokens(model: &str, allowance: u32) -> u32 {
+    allowance.saturating_mul(review_visible_text_reserve_percent(model)) / 100
+}
+
 /// Output reservation used by the internal input budget for a route.
 #[must_use]
 pub(crate) fn route_output_reservation(
@@ -1171,5 +1219,28 @@ mod tests {
         let budget = route_context_budget(ApiProvider::Arcee, "trinity-large-thinking", None, 0)
             .expect("trinity route budget");
         assert_eq!(budget.compaction_trigger_for_percent(80.0), 195_584);
+    }
+
+    #[test]
+    fn review_reserve_is_sized_from_reasoning_classification() {
+        // Mapping core (#6285): every classification arm.
+        assert_eq!(review_reserve_percent_for(Some(false), false), 0);
+        assert_eq!(review_reserve_percent_for(Some(false), true), 0);
+        assert_eq!(review_reserve_percent_for(Some(true), false), 25);
+        assert_eq!(review_reserve_percent_for(Some(true), true), 50);
+        // Unknown (no catalogue row) is not evidence of no reasoning (#6032).
+        assert_eq!(review_reserve_percent_for(None, false), 25);
+        assert_eq!(review_reserve_percent_for(None, true), 25);
+    }
+
+    #[test]
+    fn review_reserve_tokens_follow_the_model_classification() {
+        // A model no catalogue row resolves for: a quarter of the allowance is
+        // reserved as visible text, and the token math scales off the exact
+        // resolved allowance.
+        let unknown = "not-a-catalogue-model-6285";
+        assert_eq!(review_visible_text_reserve_percent(unknown), 25);
+        assert_eq!(review_visible_text_reserve_tokens(unknown, 65_536), 16_384);
+        assert_eq!(review_visible_text_reserve_tokens(unknown, 0), 0);
     }
 }

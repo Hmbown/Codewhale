@@ -7,7 +7,7 @@ use codewhale_config::route::{
 };
 use serde::Serialize;
 
-use crate::client::DeepSeekClient;
+use crate::client::CodewhaleClient;
 use crate::codex_model_cache::{CodexModelCacheFreshness, model_roster};
 use crate::config::{
     ApiProvider, Config, DEFAULT_NVIDIA_NIM_BASE_URL, KIMI_CODE_K3_CONTEXT_WINDOW_TOKENS,
@@ -212,7 +212,7 @@ pub(crate) struct ResolvedRuntimeRoute {
     pub(crate) config: Box<Config>,
     pub(crate) model: String,
     pub(crate) context_window: ContextWindowResolution,
-    preflighted_client: Option<DeepSeekClient>,
+    preflighted_client: Option<CodewhaleClient>,
 }
 
 impl std::fmt::Debug for ResolvedRuntimeRoute {
@@ -236,7 +236,7 @@ pub(crate) struct ValidatedRuntimeRoute {
     pub(crate) config: Box<Config>,
     pub(crate) model: String,
     pub(crate) context_window: ContextWindowResolution,
-    pub(crate) client: DeepSeekClient,
+    pub(crate) client: CodewhaleClient,
 }
 
 impl std::fmt::Debug for ValidatedRuntimeRoute {
@@ -253,7 +253,7 @@ impl ResolvedRuntimeRoute {
     pub(crate) fn preflight(mut self) -> Result<Self, String> {
         if self.preflighted_client.is_none() {
             self.preflighted_client = Some(
-                DeepSeekClient::from_candidate(&self.config, &self.candidate).map_err(|err| {
+                CodewhaleClient::from_candidate(&self.config, &self.candidate).map_err(|err| {
                     format_provider_route_preflight_error(&self.identity.key, &self.model, &err)
                 })?,
             );
@@ -265,7 +265,7 @@ impl ResolvedRuntimeRoute {
         let client = match self.preflighted_client.take() {
             Some(client) => client,
             None => {
-                DeepSeekClient::from_candidate(&self.config, &self.candidate).map_err(|err| {
+                CodewhaleClient::from_candidate(&self.config, &self.candidate).map_err(|err| {
                     format_provider_route_preflight_error(&self.identity.key, &self.model, &err)
                 })?
             }
@@ -280,7 +280,7 @@ impl ResolvedRuntimeRoute {
         })
     }
 
-    pub(crate) fn take_preflighted_client(&mut self) -> Option<DeepSeekClient> {
+    pub(crate) fn take_preflighted_client(&mut self) -> Option<CodewhaleClient> {
         self.preflighted_client.take()
     }
 }
@@ -813,7 +813,7 @@ pub(crate) fn resolve_runtime_route_for_identity(
     .then(|| model_roster().preferred_model_id().map(str::to_string))
     .flatten();
     let model_selector = model_selector.or(roster_preferred.as_deref());
-    let base_url = route_config.deepseek_base_url();
+    let base_url = route_config.active_route_base_url();
     // Every refreshed provider shares the same exact identity/endpoint gate.
     // Codex keeps its separate authenticated account roster and protocol seam.
     let resolution = if provider != ApiProvider::OpenaiCodex {
@@ -2110,6 +2110,7 @@ mod tests {
             ApiProvider::Concentrate,
             ApiProvider::Telecomjs,
             ApiProvider::Edenai,
+            ApiProvider::Zenmux,
         ] {
             let identity = provider.as_str();
             let endpoint = format!("https://{identity}.catalog.invalid/v1");
@@ -2271,11 +2272,11 @@ mod tests {
         crate::provider_catalog_live::reset_cache_for_test();
         crate::provider_lake::clear_live_snapshot();
 
-        let base_url = codewhale_config::BASETEN_BASE_URL;
+        let base_url = codewhale_config::catalog::BASETEN_BASE_URL;
         let model = "synthetic-live-baseten-model";
         let mut custom = std::collections::HashMap::new();
         custom.insert(
-            codewhale_config::BASETEN_TEMPLATE_ID.to_string(),
+            codewhale_config::catalog::BASETEN_PROVIDER_ID.to_string(),
             ProviderConfig {
                 kind: Some("openai-compatible".to_string()),
                 base_url: Some(base_url.to_string()),
@@ -2284,7 +2285,7 @@ mod tests {
             },
         );
         let config = Config {
-            provider: Some(codewhale_config::BASETEN_TEMPLATE_ID.to_string()),
+            provider: Some(codewhale_config::catalog::BASETEN_PROVIDER_ID.to_string()),
             providers: Some(ProvidersConfig {
                 custom,
                 ..Default::default()
@@ -2292,11 +2293,11 @@ mod tests {
             ..Default::default()
         };
         crate::provider_catalog_live::record_success(ProviderCatalogDelta {
-            provider: codewhale_config::BASETEN_TEMPLATE_ID.to_string(),
+            provider: codewhale_config::catalog::BASETEN_PROVIDER_ID.to_string(),
             base_url_fingerprint: codewhale_config::catalog::base_url_fingerprint(base_url),
             fetched_at: codewhale_config::catalog::now_unix(),
             offerings: vec![live_catalog_offering(
-                codewhale_config::BASETEN_TEMPLATE_ID,
+                codewhale_config::catalog::BASETEN_PROVIDER_ID,
                 model,
                 base_url,
             )],
@@ -2304,7 +2305,10 @@ mod tests {
 
         let route = resolve_runtime_route(&config, ApiProvider::Custom, Some(model))
             .expect("named Baseten route resolves");
-        assert_eq!(route.identity.key, codewhale_config::BASETEN_TEMPLATE_ID);
+        assert_eq!(
+            route.identity.key,
+            codewhale_config::catalog::BASETEN_PROVIDER_ID
+        );
         assert_eq!(route.model, model);
         assert_live_catalog_route_facts(&route);
 
@@ -2342,7 +2346,7 @@ mod tests {
         assert!(
             crate::provider_lake::catalog_offering_for_model_identity(
                 ApiProvider::Custom,
-                Some(codewhale_config::BASETEN_TEMPLATE_ID),
+                Some(codewhale_config::catalog::BASETEN_PROVIDER_ID),
                 alias_model,
             )
             .is_none(),

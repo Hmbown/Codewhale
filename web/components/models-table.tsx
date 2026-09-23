@@ -1,0 +1,153 @@
+"use client";
+
+import { useMemo, useState } from "react";
+import type { ModelFact } from "@/lib/facts";
+import { MODELS_COPY } from "@/lib/content/models";
+import { pickText } from "@/lib/i18n/dictionaries";
+
+type SortKey = "added" | "id" | "provider" | "context";
+
+function formatTokens(n: number | null): string {
+  if (n === null) return "—";
+  if (n >= 1_000_000) {
+    const m = n / 1_000_000;
+    return `${Number.isInteger(m) ? m : m.toFixed(2)}M`;
+  }
+  if (n >= 1_000) return `${Math.round(n / 1_000)}K`;
+  return String(n);
+}
+
+function formatDate(iso: string | null, locale: string): string {
+  if (!iso) return "—";
+  const d = new Date(`${iso}T00:00:00Z`);
+  if (!Number.isFinite(d.getTime())) return "—";
+  return new Intl.DateTimeFormat(locale === "zh" ? "zh-CN" : "en-US", {
+    dateStyle: "medium",
+    timeZone: "UTC",
+  }).format(d);
+}
+
+// Missing values sort last in BOTH directions — an undated model is never
+// "newest" or "oldest", it is simply unknown.
+function compare(a: ModelFact, b: ModelFact, key: SortKey, desc: boolean): number {
+  const tie = a.id.localeCompare(b.id);
+  switch (key) {
+    case "added": {
+      if (!a.addedAt || !b.addedAt) {
+        if (a.addedAt === b.addedAt) return tie;
+        return a.addedAt ? -1 : 1;
+      }
+      if (a.addedAt !== b.addedAt) {
+        return desc
+          ? b.addedAt.localeCompare(a.addedAt)
+          : a.addedAt.localeCompare(b.addedAt);
+      }
+      return tie;
+    }
+    case "id":
+      return desc ? -tie : tie;
+    case "provider": {
+      if (!a.provider || !b.provider) {
+        if (a.provider === b.provider) return tie;
+        return a.provider ? -1 : 1;
+      }
+      const c = a.provider.localeCompare(b.provider);
+      return c !== 0 ? (desc ? -c : c) : tie;
+    }
+    case "context": {
+      if (a.contextWindow === null || b.contextWindow === null) {
+        if (a.contextWindow === b.contextWindow) return tie;
+        return a.contextWindow === null ? 1 : -1;
+      }
+      return a.contextWindow !== b.contextWindow
+        ? desc
+          ? b.contextWindow - a.contextWindow
+          : a.contextWindow - b.contextWindow
+        : tie;
+    }
+  }
+}
+
+export function ModelsTable({
+  models,
+  locale,
+}: {
+  models: ModelFact[];
+  locale: string;
+}) {
+  const [key, setKey] = useState<SortKey>("added");
+  const [desc, setDesc] = useState(true);
+  const t = (copy: { en: string; zh: string }) => pickText(copy, locale);
+
+  const rows = useMemo(
+    () => [...models].sort((a, b) => compare(a, b, key, desc)),
+    [models, key, desc],
+  );
+
+  const setSort = (next: SortKey) => {
+    if (next === key) {
+      setDesc(!desc);
+      return;
+    }
+    setKey(next);
+    setDesc(next === "added" || next === "context");
+  };
+
+  const headers: { key: SortKey; label: string; className?: string }[] = [
+    { key: "id", label: t(MODELS_COPY.colModel) },
+    { key: "provider", label: t(MODELS_COPY.colProvider) },
+    { key: "context", label: t(MODELS_COPY.colContext) },
+    { key: "added", label: t(MODELS_COPY.colAdded) },
+  ];
+
+  return (
+    <div className="overflow-x-auto">
+      <table className="w-full text-left text-sm">
+        <caption className="sr-only">{t(MODELS_COPY.modelsTitle)}</caption>
+        <thead>
+          <tr className="hairline-b">
+            {headers.map((h) => {
+              const active = key === h.key;
+              const ascending = active && !desc;
+              return (
+                <th
+                  key={h.key}
+                  scope="col"
+                  className="py-3 pr-4"
+                  aria-sort={active ? (ascending ? "ascending" : "descending") : "none"}
+                >
+                  <button
+                    type="button"
+                    className={`models-sort${active ? " is-active" : ""}`}
+                    onClick={() => setSort(h.key)}
+                    title={t(ascending ? MODELS_COPY.sortDesc : MODELS_COPY.sortAsc)}
+                  >
+                    {h.label}
+                    <span aria-hidden="true" className="models-sort-mark">
+                      {active ? (ascending ? "↑" : "↓") : "↕"}
+                    </span>
+                  </button>
+                </th>
+              );
+            })}
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((model) => (
+            <tr key={model.id} className="hairline-b">
+              <th scope="row" className="py-3 pr-4 font-medium">
+                <code className="break-all">{model.id}</code>
+                {model.reasoning ? (
+                  <span className="models-reasoning">{t(MODELS_COPY.reasoning)}</span>
+                ) : null}
+              </th>
+              <td className="py-3 pr-4 text-ink-soft">{model.provider ?? "—"}</td>
+              <td className="py-3 pr-4 tabular-nums">{formatTokens(model.contextWindow)}</td>
+              <td className="py-3 tabular-nums">{formatDate(model.addedAt, locale)}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}

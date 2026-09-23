@@ -316,7 +316,7 @@ pub fn classify_command(tokens: &[&str]) -> String {
 ///
 /// For allow rules that contain wildcards (`*`) or regex metacharacters, the
 /// caller should additionally invoke the pattern-matching path from
-/// `crate::execpolicy::matcher::pattern_matches`.
+/// `crate::matcher::pattern_matches`.
 ///
 /// # Examples
 ///

@@ -225,6 +225,10 @@ impl ToolSpec for TasksTool {
                 json!({ "type": "string", "description": "Work prompt for the durable task (action=create)." }),
             );
             properties.insert(
+                "name".to_string(),
+                json!({ "type": "string", "description": "Short run name shown in queues; omit to derive from the prompt. (action=create)" }),
+            );
+            properties.insert(
                 "model_provider".to_string(),
                 json!({ "type": "string", "description": "Provider kind for the pinned model. Omit to inherit the configured provider." }),
             );
@@ -475,6 +479,7 @@ impl TasksTool {
         let prompt = required_str(input, "prompt")?.to_string();
         let req = NewTaskRequest {
             prompt: prompt.clone(),
+            name: optional_str(input, "name")?.map(ToString::to_string),
             model: optional_str(input, "model")?.map(ToString::to_string),
             model_provider: optional_str(input, "model_provider")?.map(ToString::to_string),
             model_provider_id: optional_str(input, "model_provider_id")?.map(ToString::to_string),
@@ -485,11 +490,18 @@ impl TasksTool {
             allow_shell: optional_bool_opt(input, "allow_shell")?,
             trust_mode: optional_bool_opt(input, "trust_mode")?,
             auto_approve: optional_bool_opt(input, "auto_approve")?,
+            // The task runs on the posture this session is in. The bits above
+            // are declarations the engine only reads when no posture is given,
+            // and a task started from a session must not run under authority
+            // that session was never granted.
+            permission_posture: Some(
+                crate::runtime_policy::approval_wire(context.approval_mode).to_string(),
+            ),
             owner_session_id: Some(context.state_namespace.clone()),
         };
         let task_id = crate::task_manager::TaskManager::new_task_id();
-        if let Some(work) = context.runtime.work.as_ref() {
-            work.register_operation(
+        if let Some(work) = context.runtime.work.as_ref()
+            && let Err(err) = work.register_operation(
                 &context.state_namespace,
                 OperationIntent::new(
                     format!("task:{task_id}"),
@@ -499,7 +511,15 @@ impl TasksTool {
                     &task_id,
                 ),
             )
-            .map_err(ToolError::execution_failed)?;
+        {
+            // Bookkeeping must not veto the task: every later reconcile is
+            // guarded by `has_operation_binding`, so an unbound task merely
+            // goes unreported on the Work surface.
+            tracing::warn!(
+                task_id = %task_id,
+                error = %err,
+                "task work-graph registration skipped; running unbound"
+            );
         }
         let task = match manager.add_task_with_id(req, task_id.clone()).await {
             Ok(task) => task,
@@ -1540,6 +1560,69 @@ mod tests {
             .execute(json!({"task_id": task_id}), &context)
             .await
             .expect("cancel background shell");
+    }
+
+    /// Creating a task from a session runs it on the posture that session
+    /// holds: `auto_approve` is a legacy bit the engine only reads when no
+    /// posture is given, so a task cannot talk itself into more authority than
+    /// the session that asked for it was granted.
+    #[tokio::test]
+    async fn create_pins_the_session_posture_on_the_task() {
+        struct NoopExecutor;
+
+        #[async_trait::async_trait]
+        impl crate::task_manager::TaskExecutor for NoopExecutor {
+            async fn execute(
+                &self,
+                _task: crate::task_manager::ExecutionTask,
+                _events: tokio::sync::mpsc::Sender<crate::task_manager::TaskExecutionEvent>,
+                _cancel: tokio_util::sync::CancellationToken,
+            ) -> crate::task_manager::TaskExecutionResult {
+                crate::task_manager::TaskExecutionResult {
+                    status: crate::task_manager::TaskStatus::Completed,
+                    result_text: Some("noop".to_string()),
+                    error: None,
+                    terminal_reason: crate::task_manager::TaskTerminalReason::Completed,
+                }
+            }
+        }
+
+        let workspace = tempfile::tempdir().expect("workspace");
+        let manager = crate::task_manager::TaskManager::start_with_executor(
+            crate::task_manager::TaskManagerConfig {
+                data_dir: workspace.path().to_path_buf(),
+                worker_count: 1,
+                default_workspace: workspace.path().to_path_buf(),
+                default_model: "deepseek-v4-pro".to_string(),
+                default_mode: "agent".to_string(),
+                allow_shell: false,
+                trust_mode: false,
+                execution_limits: crate::task_manager::TaskExecutionLimits::default(),
+            },
+            std::sync::Arc::new(NoopExecutor),
+        )
+        .await
+        .expect("task manager");
+
+        let mut context = ToolContext::new(workspace.path());
+        context.approval_mode = codewhale_execpolicy::ApprovalMode::Auto;
+        context.runtime.task_manager = Some(manager.clone());
+
+        TasksTool::new("tasks")
+            .execute(
+                json!({"action": "create", "prompt": "run the sweep", "auto_approve": true}),
+                &context,
+            )
+            .await
+            .expect("create accepted");
+
+        let queued = manager.list_tasks(Some(1)).await.expect("queued task");
+        let created = manager.get_task(&queued[0].id).await.expect("created task");
+        assert_eq!(
+            created.permission_posture.as_deref(),
+            Some("auto_review"),
+            "the task runs under its session's posture, not the model's legacy bit"
+        );
     }
 
     #[test]

@@ -154,6 +154,9 @@ jobs:
         with:
           cache-bin: false
           prefix-key: v1-${{ runner.os }}-${{ runner.arch }}-stable
+      - uses: taiki-e/install-action@e88e69ecdb9658bd172693dcdc2c84e7f0ab6a11 # nextest
+        with:
+          tool: nextest
       - name: Format check
         run: cargo fmt --all -- --check
       - name: Compile check
@@ -170,12 +173,24 @@ jobs:
             -A clippy::collapsible_if \
             -A clippy::assertions_on_constants
       - name: Workspace tests
-        run: sh scripts/with-hermetic-test-home.sh cargo test --workspace --all-features --locked
+        # Same test binaries as `cargo test`, run by cargo-nextest: one process
+        # per test. This gate used libtest, where every test shares one process,
+        # so a test that mutates process-global state leaks into its neighbours.
+        # It failed on five such tests — deterministically, and on a different
+        # set on different machines — while CI's nextest lanes were green on the
+        # same source, and every one of them passes in isolation. Match the lane
+        # that gates every merge; doctests are the next step, because nextest
+        # does not run them.
+        run: sh scripts/with-hermetic-test-home.sh cargo nextest run --workspace --all-features --locked --profile ci
         env:
           # Match the CI test lane: test threads get the same stack the product
           # gives itself (main.rs CODEWHALE_MAIN_STACK_BYTES). See the note in
           # ci.yml's "Run tests" step. Without it this gate runs the deep
           # engine/runtime futures on a stack that never ships.
+          RUST_MIN_STACK: '16777216'
+      - name: Workspace doctests
+        run: sh scripts/with-hermetic-test-home.sh cargo test --workspace --all-features --locked --doc
+        env:
           RUST_MIN_STACK: '16777216'
       - name: Protocol schema parity
         run: sh scripts/with-hermetic-test-home.sh cargo test -p codewhale-protocol --test parity_protocol --locked
@@ -246,7 +261,7 @@ jobs:
           docker-context/bin/codewhale --version
           docker-context/bin/codew --version
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
+        uses: docker/setup-buildx-action@594f3bf4285d9ea8dc53c9a0c9c4092420091003 # v4
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
         with:
@@ -276,7 +291,7 @@ jobs:
             "${EXPECTED_SHA}"
       - name: Assemble and push native image by digest
         id: build
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
         env:
           DOCKER_BUILD_RECORD_UPLOAD: false
           DOCKER_BUILD_SUMMARY: false
@@ -339,7 +354,7 @@ jobs:
           pattern: docker-digest-*
           merge-multiple: true
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
+        uses: docker/setup-buildx-action@594f3bf4285d9ea8dc53c9a0c9c4092420091003 # v4
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
         with:

@@ -62,16 +62,23 @@ macro_rules! bundle_file {
 
 /// The runtime tree of `crates/tui/plugins/computer-use`, relative path → contents.
 ///
-/// Development-only files (`tests/`, `scripts/smoke.mjs`, `package.json`,
-/// `README.md`) are deliberately absent: nothing at runtime reads them, and
-/// the `.mjs` extension already makes every module ESM without a
-/// `"type": "module"` declaration.
+/// Development-only files (`tests/`, `scripts/smoke.mjs`,
+/// `README.md`) are deliberately absent. The package manifest, lockfile and
+/// Docker context are runtime inputs for creating an isolated desktop.
 const COMPUTER_USE_FILES: &[(&str, &[u8])] = &[
     bundle_file!("LICENSE"),
+    bundle_file!("package.json"),
+    bundle_file!("package-lock.json"),
+    bundle_file!(".dockerignore"),
+    bundle_file!("docker/Dockerfile"),
+    bundle_file!("docker/entrypoint.sh"),
+    bundle_file!("docker/agent-exec.sh"),
     bundle_file!("plugin.json"),
     bundle_file!("mcp.json"),
     bundle_file!("commands/computer.md"),
     bundle_file!("skills/computer-use/SKILL.md"),
+    bundle_file!("skills/computer-use/references/quick-reference.md"),
+    bundle_file!("skills/computer-use/references/refusal-codes.md"),
     bundle_file!("skills/recording/SKILL.md"),
     bundle_file!("agent.mjs"),
     bundle_file!("app/daemon.mjs"),
@@ -81,11 +88,15 @@ const COMPUTER_USE_FILES: &[(&str, &[u8])] = &[
     bundle_file!("mcp/server.mjs"),
     bundle_file!("src/app-handler.mjs"),
     bundle_file!("src/app-socket.mjs"),
+    bundle_file!("src/browser-cdp.mjs"),
+    bundle_file!("src/consent.mjs"),
+    bundle_file!("src/spawn.mjs"),
     bundle_file!("src/exec.mjs"),
     bundle_file!("src/png-size.mjs"),
     bundle_file!("src/registry.mjs"),
     bundle_file!("src/remote-runtime.mjs"),
     bundle_file!("src/tools.mjs"),
+    bundle_file!("src/trajectory.mjs"),
     bundle_file!("src/transport.mjs"),
     bundle_file!("src/backends/darwin.mjs"),
     bundle_file!("src/backends/darwin-accessibility.m"),
@@ -431,7 +442,7 @@ mod tests {
     /// `COMPUTER_USE_FILES`.
     #[test]
     fn computer_use_embed_list_matches_the_vendored_runtime_tree() {
-        const DEV_ONLY: &[&str] = &["package.json", "README.md", "scripts/smoke.mjs"];
+        const DEV_ONLY: &[&str] = &["README.md", "scripts/smoke.mjs"];
 
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("plugins/computer-use");
         let mut on_disk: Vec<String> = Vec::new();
@@ -535,6 +546,23 @@ mod tests {
         );
         let reply: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
         assert!(reply.get("trusted").is_some());
+        let capabilities = std::process::Command::new(&helper)
+            .arg(r#"{"tool":"input_capabilities","args":{}}"#)
+            .env("PATH", "")
+            .output()
+            .unwrap();
+        assert!(capabilities.status.success());
+        let capabilities: serde_json::Value = serde_json::from_slice(&capabilities.stdout).unwrap();
+        assert_eq!(capabilities["background_focus_guard"], 1);
+        // This refusal precedes app resolution and input; no desktop target
+        // or Accessibility grant is needed to qualify the embedded guard.
+        let refused = std::process::Command::new(&helper)
+            .arg(r#"{"tool":"bg_key","args":{"foreground_input":false}}"#)
+            .env("PATH", "")
+            .output()
+            .unwrap();
+        assert!(!refused.status.success());
+        assert!(String::from_utf8_lossy(&refused.stderr).contains("background_focus_required"));
     }
 
     #[test]

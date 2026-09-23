@@ -14,7 +14,7 @@
 //!
 //! ## Authoritative host-proxy design (D1)
 //!
-//! `CommandContexts` holds fifteen independently borrowed facet objects, while
+//! `CommandContexts` holds sixteen independently borrowed facet objects, while
 //! important behavior (mode transitions, model invalidation, cost accounting,
 //! skill refresh) is authoritative on `App`. The adapters therefore share a
 //! synchronous TUI-owned host proxy. Each trait call borrows `App` only for the
@@ -54,14 +54,19 @@ use codewhale_command_contract::facets::{
     SkillSourceKind, SkillSyncEntry, SkillSyncOutcome, SkillTargetScope, SnapshotEntry,
     TitleReport, TitleSource, TodoProjection, TreeBodyProjection,
 };
+use codewhale_command_contract::facets::{
+    CommandSessionExportContext, ConversationExportProjection, ExportBlock, ExportMessage,
+    ExportMetadata, HistoryEntry, RestorePointProjection, RestoreSnapshot, ToolCallerProjection,
+    TranscriptProjection, TurnHandoffProjection,
+};
 #[cfg(test)]
 use codewhale_command_contract::handler::ContextParts;
 use codewhale_command_contract::handler::{CommandCapabilities, CommandContexts};
 use codewhale_command_contract::types::{
-    CommandApprovalMode, CommandCurrency, CommandMode, CommandProviderId, CommandReasoningEffort,
+    CommandApprovalMode, CommandCurrency, CommandMode, CommandProviderId,
 };
 use codewhale_config::AppMode;
-use codewhale_core::request::{Message, SystemPrompt};
+use codewhale_core::request::{ContentBlock, Message, SystemPrompt};
 use codewhale_execpolicy::ApprovalMode;
 
 use crate::commands::groups::plugins::plugin_network_policy;
@@ -69,7 +74,6 @@ use crate::commands::groups::plugins::plugin_network_policy;
 use crate::dependencies::ExternalTool as _;
 use crate::network_policy::NetworkPolicy;
 use crate::pricing::CostCurrency;
-use crate::reasoning_preference::ReasoningEffort;
 use crate::tui::app::App;
 use crate::tui::history::HistoryCell;
 use codewhale_localization::{MessageId, tr};
@@ -86,7 +90,7 @@ use codewhale_localization::{MessageId, tr};
 /// Not referenced by production dispatch code — the fail-closed Python gate
 /// (`scripts/check-command-migration-manifest.py`) reads this exact
 /// declaration by source regex and the Rust frontier tests assert it.
-#[allow(dead_code)]
+#[cfg_attr(not(test), expect(dead_code))]
 pub(crate) const PENDING_GROUPS: &[&str] = &["config", "core", "debug", "session"];
 
 // ---------------------------------------------------------------------------
@@ -117,21 +121,6 @@ pub(crate) fn to_command_approval(mode: ApprovalMode) -> CommandApprovalMode {
         ApprovalMode::Bypass => CommandApprovalMode::Bypass,
         ApprovalMode::Suggest => CommandApprovalMode::Suggest,
         ApprovalMode::Never => CommandApprovalMode::Never,
-    }
-}
-
-/// Map the TUI reasoning-effort tier onto the portable command boundary value.
-pub(crate) fn to_command_effort(effort: ReasoningEffort) -> CommandReasoningEffort {
-    match effort {
-        ReasoningEffort::Off => CommandReasoningEffort::Off,
-        ReasoningEffort::Minimal => CommandReasoningEffort::Minimal,
-        ReasoningEffort::Low => CommandReasoningEffort::Low,
-        ReasoningEffort::Medium => CommandReasoningEffort::Medium,
-        ReasoningEffort::High => CommandReasoningEffort::High,
-        ReasoningEffort::XHigh => CommandReasoningEffort::XHigh,
-        ReasoningEffort::Ultra => CommandReasoningEffort::Ultra,
-        ReasoningEffort::Auto => CommandReasoningEffort::Auto,
-        ReasoningEffort::Max => CommandReasoningEffort::Max,
     }
 }
 
@@ -274,7 +263,7 @@ pub(crate) fn key_to_message_id(key: &'static str) -> Option<MessageId> {
 
 /// Shared TUI host hidden behind the portable command facets.
 ///
-/// The envelope needs fifteen independently borrowed facet objects, while the
+/// The envelope needs sixteen independently borrowed facet objects, while the
 /// authoritative mutation methods live on `App`. Each adapter therefore owns
 /// an `Rc` clone of this synchronous host proxy. Trait calls borrow `App` only
 /// for the duration of one method, delegate to the real TUI authority, and
@@ -332,6 +321,7 @@ impl CommandSessionLifecycleContext for SessionLifecycleAdapter<'_> {
             Ok(m) => m,
             Err(e) => return Err(format!("could not open sessions directory: {e}")),
         };
+        crate::tui::persistence_actor::flush_before_transition()?;
         let mut session = match manager.load_session(&session_id) {
             Ok(s) => s,
             Err(e) => return Err(format!("could not load session {session_id}: {e}")),
@@ -345,19 +335,36 @@ impl CommandSessionLifecycleContext for SessionLifecycleAdapter<'_> {
         match session.journal_branch_to(entry_id) {
             Ok(()) => {
                 if let Err(e) = manager.save_session(&session) {
-                    return Err(format!("branch saved but persist failed: {e}"));
+                    return Err(format!(
+                        "branch could not be persisted; active conversation unchanged: {e}"
+                    ));
                 }
-                app.restore_api_messages(
-                    session.messages.clone(),
-                    &session.journal_message_stamps(),
-                );
+                app.restore_api_messages(session.messages.clone(), &session);
                 let leaf_display = session
                     .leaf_id
                     .clone()
                     .unwrap_or_else(|| "(none)".to_string());
+                app.clear_history();
+                app.session_artifacts = session.artifacts.clone();
+                app.session_context_references = session.context_references.clone();
+                app.extend_history(
+                    session
+                        .messages
+                        .iter()
+                        .flat_map(crate::tui::history::history_cells_from_message),
+                );
+                app.scroll_to_bottom();
                 Ok(SessionBranchOutcome {
                     leaf_display,
                     journal_entries_before: journal_len_before,
+                    sync: SessionSyncPayload {
+                        session_id: Some(session_id),
+                        messages: session.messages,
+                        system_prompt: app.system_prompt.clone(),
+                        model: app.model.clone(),
+                        workspace: app.workspace.clone(),
+                        mode: to_command_mode(app.mode),
+                    },
                 })
             }
             Err(e) => Err(format!(
@@ -424,7 +431,11 @@ impl CommandSessionLifecycleContext for SessionLifecycleAdapter<'_> {
             .map_err(|error| format!("Failed to snapshot Work state: {error}"))?;
         let manager = crate::session_manager::SessionManager::default_location()
             .map_err(|error| format!("could not open sessions directory: {error}"))?;
-        let session = crate::tui::ui::build_session_snapshot(&mut app, &manager)?;
+        let mut session = crate::tui::ui::build_session_snapshot(&mut app, &manager)?;
+        // Snapshots are journal-only (#6214 T3); this path serializes
+        // directly instead of through `save_session`, so rehydrate the
+        // `messages` projection first — otherwise the file loses history.
+        session.make_storage_compatible();
         let queue_transition =
             crate::tui::ui::prepare_offline_queue_transition(&app, &session.metadata.id)?;
         let save_path = explicit_save_path.unwrap_or_else(|| {
@@ -484,74 +495,25 @@ impl CommandSessionLifecycleContext for SessionLifecycleAdapter<'_> {
             }
         };
 
-        let parent_id = app
-            .current_session_id
-            .clone()
-            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-        let mut parent = crate::session_manager::create_saved_session_with_id_and_mode(
-            parent_id,
-            &app.api_messages,
-            &app.model,
-            &app.workspace,
-            u64::from(app.session.total_tokens),
-            app.system_prompt.as_ref(),
-            Some(app.mode.label()),
-        );
-        parent
-            .metadata
-            .set_model_provider_route(app.api_provider.as_str(), app.provider_id_for_persistence());
-        if let Some(cached) = app
-            .current_session_metadata
-            .as_ref()
-            .filter(|metadata| metadata.id == parent.metadata.id)
-        {
-            parent.metadata.created_at = cached.created_at;
-            parent.metadata.title.clone_from(&cached.title);
-            parent
-                .metadata
-                .parent_session_id
-                .clone_from(&cached.parent_session_id);
-            parent.metadata.forked_from_message_count = cached.forked_from_message_count;
-        }
-        app.sync_cost_to_metadata(&mut parent.metadata);
-        parent.context_references = app.session_context_references.clone();
-        parent.artifacts = app.session_artifacts.clone();
-        let work_state = match app.work_state_snapshot() {
-            Ok(state) => state,
-            Err(err) => return Err(format!("Failed to snapshot Work state: {err}")),
-        };
-        parent.work_state = work_state.clone();
-        parent.last_auto_route = app.auto_route_for_persistence();
-
+        let mut parent = crate::tui::ui::build_session_snapshot(&mut app, &manager)?;
+        parent.make_storage_compatible();
         if let Err(err) = manager.save_session(&parent) {
             return Err(format!("Failed to save parent session: {err}"));
         }
 
-        let mut forked = crate::session_manager::create_saved_session_with_mode(
-            &app.api_messages,
-            &app.model,
-            &app.workspace,
-            u64::from(app.session.total_tokens),
-            app.system_prompt.as_ref(),
-            Some(app.mode.label()),
-        );
-        forked
-            .metadata
-            .set_model_provider_route(app.api_provider.as_str(), app.provider_id_for_persistence());
-        forked.metadata.copy_cost_from(&parent.metadata);
+        let mut forked = parent.clone();
+        forked.metadata.id = uuid::Uuid::new_v4().to_string();
+        forked.metadata.created_at = chrono::Utc::now();
+        forked.metadata.updated_at = forked.metadata.created_at;
+        forked.metadata.archived = false;
+        forked.metadata.runtime_store = None;
+        forked.approval_receipts.clear();
+        forked.window_title = None;
         forked.metadata.spawn_depth = parent.metadata.spawn_depth.saturating_add(1);
-        // Ensure journal for both sessions: parent already has one from factory, bump forked's journal depth
-        if let Some(j) = forked.journal.as_mut() {
-            j.spawn_depth = forked.metadata.spawn_depth;
-        }
-        if let Some(j) = parent.journal.as_mut() {
-            j.spawn_depth = parent.metadata.spawn_depth;
-        }
         forked.metadata.mark_forked_from(&parent.metadata);
-        forked.context_references = app.session_context_references.clone();
-        forked.artifacts = app.session_artifacts.clone();
-        forked.work_state = work_state;
-        forked.last_auto_route = app.auto_route_for_persistence();
+        if let Some(journal) = forked.journal.as_mut() {
+            journal.spawn_depth = forked.metadata.spawn_depth;
+        }
         let queue_transition =
             crate::tui::ui::prepare_offline_queue_transition(&app, &forked.metadata.id)?;
 
@@ -567,6 +529,7 @@ impl CommandSessionLifecycleContext for SessionLifecycleAdapter<'_> {
         crate::tui::ui::install_offline_queue_transition(&mut app, queue_transition);
         app.current_session_id = Some(forked.metadata.id.clone());
         app.current_session_metadata = Some(forked.metadata.clone());
+        app.restore_api_messages(forked.messages.clone(), &forked);
         app.session_title = Some(forked.metadata.title.clone());
         // A fork starts as its own session: no inherited tab/window title.
         app.window_title = None;
@@ -579,7 +542,7 @@ impl CommandSessionLifecycleContext for SessionLifecycleAdapter<'_> {
             fork_label,
             sync: SessionSyncPayload {
                 session_id: Some(fork_id),
-                messages: app.api_messages.clone(),
+                messages: app.api_messages.as_ref().clone(),
                 system_prompt: app.system_prompt.clone(),
                 model: app.model.clone(),
                 workspace: app.workspace.clone(),
@@ -657,6 +620,7 @@ impl CommandSessionLifecycleContext for SessionLifecycleAdapter<'_> {
         crate::tui::ui::install_offline_queue_transition(&mut app, queue_transition);
         app.current_session_id = Some(forked.metadata.id.clone());
         app.current_session_metadata = Some(forked.metadata.clone());
+        app.restore_api_messages(forked.messages.clone(), &forked);
         app.session_title = Some(forked.metadata.title.clone());
         // A fork starts as its own session: no inherited tab/window title.
         app.window_title = None;
@@ -764,6 +728,7 @@ impl CommandSessionLifecycleContext for SessionLifecycleAdapter<'_> {
         // `RefCell` borrow of `App` is not simultaneously mutable and shared.
         let workspace = app.workspace.clone();
         let ui_locale = app.ui_locale;
+        let current_id = app.current_session_id.clone();
         match preselected {
             Some(session_id) => {
                 app.view_stack.push(
@@ -771,14 +736,15 @@ impl CommandSessionLifecycleContext for SessionLifecycleAdapter<'_> {
                         &workspace,
                         ui_locale,
                         &session_id,
-                    ),
+                    )
+                    .with_current_session(current_id.as_deref()),
                 );
             }
             None => {
-                app.view_stack
-                    .push(crate::tui::session_picker::SessionPickerView::new(
-                        &workspace, ui_locale,
-                    ));
+                app.view_stack.push(
+                    crate::tui::session_picker::SessionPickerView::new(&workspace, ui_locale)
+                        .with_current_session(current_id.as_deref()),
+                );
             }
         }
     }
@@ -1069,7 +1035,8 @@ impl CommandSessionControlContext for SessionControlAdapter<'_> {
     fn open_resume_picker(&mut self) {
         let mut app = self.host.app.borrow_mut();
         let picker =
-            crate::tui::session_picker::SessionPickerView::new(&app.workspace, app.ui_locale);
+            crate::tui::session_picker::SessionPickerView::new(&app.workspace, app.ui_locale)
+                .with_current_session(app.current_session_id.as_deref());
         app.view_stack.push(picker);
     }
 
@@ -1092,10 +1059,14 @@ impl CommandSessionControlContext for SessionControlAdapter<'_> {
             Ok(m) => m,
             Err(e) => return Err(format!("could not open sessions directory: {e}")),
         };
-        match manager
-            .load_session(raw)
-            .or_else(|_| manager.load_session_by_prefix(raw))
-        {
+        // Resolution only needs durable identity — the resume that follows
+        // runs and persists the repair, so probe the snapshot instead of
+        // running (and logging) an in-memory repair here.
+        match manager.load_session_snapshot(raw).or_else(|_| {
+            manager
+                .resolve_session_id_prefix(raw)
+                .and_then(|id| manager.load_session_snapshot(&id))
+        }) {
             Ok(sess) => {
                 let path = manager
                     .sessions_dir()
@@ -1456,15 +1427,13 @@ fn import_session_container(
     crate::tui::ui::install_offline_queue_transition(app, queue_transition);
     app.current_session_id = Some(new_id.clone());
     app.current_session_metadata = Some(imported.metadata.clone());
-    app.restore_api_messages(
-        imported.messages.clone(),
-        &imported.journal_message_stamps(),
-    );
+    app.restore_api_messages(imported.messages.clone(), &imported);
     let picker = crate::tui::session_picker::SessionPickerView::new_selecting(
         &app.workspace,
         app.ui_locale,
         &new_id,
-    );
+    )
+    .with_current_session(app.current_session_id.as_deref());
     app.view_stack.push(picker);
     Ok(ResumeImportReceipt {
         truncated_id: crate::session_manager::truncate_id(&new_id).to_string(),
@@ -1474,7 +1443,326 @@ fn import_session_container(
             .map(|journal| journal.entries.len())
             .unwrap_or(0),
         leaf_display: imported.leaf_id.as_deref().unwrap_or("(none)").to_string(),
+        sync: SessionSyncPayload {
+            session_id: Some(new_id.clone()),
+            messages: app.api_messages.as_ref().clone(),
+            system_prompt: app.system_prompt.clone(),
+            model: app.model.clone(),
+            workspace: app.workspace.clone(),
+            mode: to_command_mode(app.mode),
+        },
     })
+}
+
+// ---------------------------------------------------------------------------
+// Session export adapter (FEAT-025 D1/D2/D3/D5/D7/D8/D9)
+//
+// Sole host owner of concrete export machinery for `/export` and `/daochu`:
+// metadata derivation, authoritative/visible-history projection, semantic
+// restore-point projection, the shared `turn_handoff_markdown` renderer,
+// clipboard mode/recovery/delivery, and protected destination resolution/
+// writing. Every delegate reproduces the baseline order and returns portable
+// data or the exact host-error text; no concrete `App`, clipboard, snapshot,
+// history, filesystem, or turn-handoff type crosses the boundary. Hidden
+// reasoning bodies, signatures, and inline/local image payloads are excluded
+// while the projection is built (D9). The shared recovery writer and protected
+// file services live in `commands::session_export_host` (outside the future
+// portable group) so `/copy` and `/export` reuse one implementation (D5).
+// ---------------------------------------------------------------------------
+pub(crate) struct SessionExportAdapter<'a> {
+    host: SharedCommandHost<'a>,
+}
+
+impl CommandSessionExportContext for SessionExportAdapter<'_> {
+    /// Conversation export projection: metadata, transcript, and restore-point
+    /// state.
+    ///
+    /// Memory note (FEAT-025 audit, finding F3): the projection is an *owned*
+    /// copy of the transcript, so peak use is roughly the live `api_messages`
+    /// plus this projection for the duration of one render. That copy is
+    /// structural, not an oversight: the facet must return owned data because
+    /// `SharedCommandHost` hands out `App` through a `RefCell`, so no borrow can
+    /// outlive this method, and a `dyn` facet cannot lend a projection tied to a
+    /// temporary `Ref`. The baseline rendered straight from `App` and cloned one
+    /// block at a time, so this is a deliberate D3 cost accepted for the
+    /// capability boundary. Removing it needs a host proxy that can lend a
+    /// borrowed projection (tracked with the FEAT-043/046 extraction work); it is
+    /// not something this slice can fix locally.
+    fn conversation_projection(&self) -> ConversationExportProjection {
+        let app = self.host.app.borrow();
+        ConversationExportProjection {
+            metadata: export_metadata(&app),
+            transcript: project_transcript(&app),
+            restore_points: project_restore_points(&app.workspace),
+        }
+    }
+
+    fn turn_handoff_projection(&self) -> TurnHandoffProjection {
+        let app = self.host.app.borrow();
+        TurnHandoffProjection {
+            markdown: crate::tui::ui::turn_handoff_markdown(&app),
+            workspace_path: app.workspace.to_string_lossy().into_owned(),
+        }
+    }
+
+    fn clipboard_requires_terminal_paste(&self) -> bool {
+        self.host.app.borrow().clipboard.requires_terminal_paste()
+    }
+
+    fn write_recovery_copy(&self, markdown: &str) -> Option<PathBuf> {
+        crate::commands::session_export_host::write_last_copy(markdown)
+    }
+
+    fn write_clipboard(&self, markdown: &str) -> Result<(), String> {
+        self.host
+            .app
+            .borrow_mut()
+            .clipboard
+            .write_text(markdown)
+            .map_err(|err| err.to_string())
+    }
+
+    fn resolve_export_path(&self, raw: &str) -> Result<PathBuf, String> {
+        let app = self.host.app.borrow();
+        crate::commands::session_export_host::resolve_export_path(&app.workspace, raw)
+    }
+
+    fn write_export_file(&self, path: &Path, contents: &[u8], force: bool) -> Result<(), String> {
+        crate::commands::session_export_host::write_export_file(path, contents, force)
+    }
+}
+
+/// Maximum restore points listed in the export summary (baseline bound).
+const RESTORE_POINT_SUMMARY_MAX: usize = 100;
+
+/// Authoritative export metadata, reusing the baseline host derivations.
+fn export_metadata(app: &App) -> ExportMetadata {
+    let message_count = if app.api_messages.is_empty() {
+        app.history.len()
+    } else {
+        app.api_messages.len()
+    };
+    let session_label = app
+        .current_session_id
+        .as_deref()
+        .map(crate::session_manager::truncate_id)
+        .unwrap_or("unsaved")
+        .to_string();
+    let workspace_name = app
+        .workspace
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("workspace")
+        .to_string();
+    ExportMetadata {
+        session_label,
+        provider: app.provider_identity_for_persistence().to_string(),
+        model: app.model_display_label(),
+        mode: app.mode.display_name().to_string(),
+        workspace_name,
+        message_count,
+        exported_at_unix: chrono::Utc::now().timestamp(),
+    }
+}
+
+/// Authoritative transcript when API messages exist, otherwise the visible
+/// history fallback (D3 precedence).
+fn project_transcript(app: &App) -> TranscriptProjection {
+    if app.api_messages.is_empty() {
+        TranscriptProjection::HistoryFallback(
+            app.history.iter().map(project_history_cell).collect(),
+        )
+    } else {
+        TranscriptProjection::Authoritative(app.api_messages.iter().map(project_message).collect())
+    }
+}
+
+fn project_message(message: &Message) -> ExportMessage {
+    ExportMessage {
+        role: message.role.as_str().to_string(),
+        // Exact enum identity, not a string comparison: `Role::Unrecognized("user")`
+        // must not be treated as a user turn (baseline parity, F6).
+        is_user_role: message.role == codewhale_models::Role::User,
+        blocks: message.content.iter().map(project_block).collect(),
+        prompt_snippet: first_text_block(message)
+            .and_then(crate::core::turn::snapshot_label_prompt_snippet),
+    }
+}
+
+fn first_text_block(message: &Message) -> Option<&str> {
+    message.content.iter().find_map(|block| match block {
+        ContentBlock::Text { text, .. } => Some(text.as_str()),
+        _ => None,
+    })
+}
+
+/// Project one content block; hidden payloads become typed omission markers
+/// (D9) and never cross the boundary.
+fn project_block(block: &ContentBlock) -> ExportBlock {
+    match block {
+        ContentBlock::Text { text, .. } => ExportBlock::Text { text: text.clone() },
+        ContentBlock::ImageUrl { image_url } => {
+            if image_url.url.starts_with("http://") || image_url.url.starts_with("https://") {
+                ExportBlock::ImageReference {
+                    url: image_url.url.clone(),
+                }
+            } else {
+                ExportBlock::ImageOmitted
+            }
+        }
+        ContentBlock::Thinking { .. } => ExportBlock::InternalReasoning,
+        ContentBlock::ToolUse {
+            id,
+            name,
+            input,
+            caller,
+            ..
+        } => ExportBlock::ToolCall {
+            id: id.clone(),
+            name: name.clone(),
+            caller: caller.as_ref().map(|caller| ToolCallerProjection {
+                caller_type: caller.caller_type.clone(),
+                tool_id: caller.tool_id.clone(),
+            }),
+            input: input.clone(),
+        },
+        ContentBlock::ToolResult {
+            tool_use_id,
+            content,
+            is_error,
+            content_blocks,
+        } => ExportBlock::ToolResult {
+            tool_use_id: tool_use_id.clone(),
+            content: content.clone(),
+            is_error: is_error.unwrap_or(false),
+            structured: content_blocks.as_deref().map(|blocks| {
+                serde_json::Value::Array(
+                    crate::image_attach::safe_tool_result_content_blocks(Some(blocks))
+                        .unwrap_or_default(),
+                )
+            }),
+        },
+        ContentBlock::ServerToolUse { id, name, input } => ExportBlock::ServerToolCall {
+            id: id.clone(),
+            name: name.clone(),
+            input: input.clone(),
+        },
+        ContentBlock::ToolSearchToolResult {
+            tool_use_id,
+            content,
+        } => ExportBlock::ToolSearchResult {
+            tool_use_id: tool_use_id.clone(),
+            content: content.clone(),
+        },
+        ContentBlock::CodeExecutionToolResult {
+            tool_use_id,
+            content,
+        } => ExportBlock::CodeExecutionResult {
+            tool_use_id: tool_use_id.clone(),
+            content: content.clone(),
+        },
+    }
+}
+
+fn project_history_cell(cell: &HistoryCell) -> HistoryEntry {
+    match cell {
+        HistoryCell::User { content } => HistoryEntry::Sanitized {
+            role: "user".to_string(),
+            body: content.clone(),
+        },
+        HistoryCell::Assistant { content, .. } => HistoryEntry::Sanitized {
+            role: "assistant".to_string(),
+            body: content.clone(),
+        },
+        HistoryCell::System { .. } => HistoryEntry::Literal {
+            role: "system".to_string(),
+            body: "[internal context omitted]".to_string(),
+        },
+        HistoryCell::Error { message, severity } => HistoryEntry::Sanitized {
+            role: error_severity_role(*severity).to_string(),
+            body: message.clone(),
+        },
+        HistoryCell::Thinking { .. } => HistoryEntry::Literal {
+            role: "internal reasoning".to_string(),
+            body: "[internal reasoning omitted]".to_string(),
+        },
+        HistoryCell::Tool(tool) => HistoryEntry::Sanitized {
+            role: "tool".to_string(),
+            body: flatten_history_lines(tool.lines(120)),
+        },
+        HistoryCell::SubAgent(subagent) => HistoryEntry::Sanitized {
+            role: "sub-agent".to_string(),
+            body: flatten_history_lines(subagent.lines(120)),
+        },
+        HistoryCell::Automation(cell) => HistoryEntry::Sanitized {
+            role: "automation".to_string(),
+            body: flatten_history_lines(cell.render(120)),
+        },
+        HistoryCell::ArchivedContext {
+            level,
+            range,
+            summary,
+            ..
+        } => HistoryEntry::Sanitized {
+            role: "archived context".to_string(),
+            body: format!("L{level} [{range}]: {summary}"),
+        },
+    }
+}
+
+fn error_severity_role(severity: crate::error_taxonomy::ErrorSeverity) -> &'static str {
+    match severity {
+        crate::error_taxonomy::ErrorSeverity::Info => "info",
+        crate::error_taxonomy::ErrorSeverity::Warning => "warning",
+        crate::error_taxonomy::ErrorSeverity::Error => "error",
+        crate::error_taxonomy::ErrorSeverity::Critical => "critical error",
+    }
+}
+
+/// Flatten host UI lines/spans to plain text, preserving the baseline width
+/// and joining behavior (D3). UI rendering stays behind the adapter.
+fn flatten_history_lines(lines: Vec<ratatui::text::Line<'static>>) -> String {
+    lines
+        .into_iter()
+        .map(|line| {
+            line.spans
+                .into_iter()
+                .map(|span| span.content.to_string())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Read the workspace snapshot repository read-only and project its state
+/// (D8): only an existing repo is opened, never created.
+fn project_restore_points(workspace: &Path) -> RestorePointProjection {
+    match crate::snapshot::SnapshotRepo::open_existing(workspace) {
+        Ok(None) => RestorePointProjection::None,
+        Err(err) => RestorePointProjection::Unreadable {
+            reason: err.to_string(),
+        },
+        Ok(Some(repo)) => match repo.list(RESTORE_POINT_SUMMARY_MAX) {
+            Ok(snapshots) => RestorePointProjection::Recorded {
+                snapshots: snapshots.iter().map(project_restore_snapshot).collect(),
+            },
+            Err(err) => RestorePointProjection::Unreadable {
+                reason: err.to_string(),
+            },
+        },
+    }
+}
+
+fn project_restore_snapshot(snapshot: &crate::snapshot::Snapshot) -> RestoreSnapshot {
+    let parsed = crate::core::turn::parse_snapshot_label(&snapshot.label);
+    RestoreSnapshot {
+        id: snapshot.id.as_str().to_string(),
+        label: snapshot.label.clone(),
+        timestamp_unix: snapshot.timestamp,
+        kind: parsed.kind,
+        sequence: parsed.seq,
+        prompt_snippet: parsed.prompt_snippet,
+    }
 }
 
 /// Session identity, messages, queue operations, and token totals.
@@ -1488,7 +1776,7 @@ impl CommandSessionContext for SessionAdapter<'_> {
     }
 
     fn api_messages(&self) -> Vec<Message> {
-        self.host.app.borrow().api_messages.clone()
+        self.host.app.borrow().api_messages.as_ref().clone()
     }
 
     fn add_message(&mut self, message: Message) {
@@ -1536,10 +1824,6 @@ impl CommandModelContext for ModelAdapter<'_> {
             app.set_provider_identity(provider, identity);
         }
         app.set_model_selection(model);
-    }
-
-    fn reasoning_effort(&self) -> CommandReasoningEffort {
-        to_command_effort(self.host.app.borrow().reasoning_effort)
     }
 
     fn provider_identity(&self) -> Option<CommandProviderId> {
@@ -1835,7 +2119,6 @@ fn key_to_utility_message_id(key: &str) -> Option<MessageId> {
         "mcp_recommendation_github" => MessageId::McpRecommendationGithub,
         "mcp_recommendation_chrome" => MessageId::McpRecommendationChrome,
         "mcp_recommendation_playwright" => MessageId::McpRecommendationPlaywright,
-        "mcp_recommendation_cua" => MessageId::McpRecommendationCua,
         "mcp_recommendation_container_use" => MessageId::McpRecommendationContainerUse,
         _ => return None,
     })
@@ -1950,14 +2233,7 @@ pub(crate) struct MemoryAdapter<'a> {
 /// Derive the authoritative native-memory store from the resolved user-memory
 /// file path, mirroring the pre-migration `/memory` handler exactly.
 fn native_store_from_memory_path(memory_path: &Path) -> crate::native_memory::NativeMemoryStore {
-    if let Some(store) = crate::native_memory::NativeMemoryStore::from_global_path(memory_path) {
-        return store;
-    }
-    let root = memory_path
-        .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .join("memory");
-    crate::native_memory::NativeMemoryStore::new(root)
+    crate::native_memory::NativeMemoryStore::from_memory_anchor(memory_path)
 }
 
 /// Convert a TUI-owned native hit into the portable contract hit. Only the
@@ -2035,7 +2311,7 @@ impl CommandMemoryContext for MemoryAdapter<'_> {
                 Some(workspace_id),
             ),
         };
-        match store.remember(scope, workspace_id.as_deref(), note) {
+        match store.remember_reviewed(scope, workspace_id.as_deref(), note) {
             Ok(hit) => Ok(MemoryRemembered {
                 source: hit.source,
                 line_start: hit.line_start,
@@ -3933,7 +4209,7 @@ fn default_codewhale_tools_dir() -> Option<PathBuf> {
 // Envelope construction (D1)
 // ---------------------------------------------------------------------------
 
-/// Owns fifteen facet objects sharing one synchronous TUI host proxy.
+/// Owns sixteen facet objects sharing one synchronous TUI host proxy.
 ///
 /// Handlers borrow only these adapters. Every method delegates to the real App
 /// authority and releases its `RefCell` borrow before returning, so facets can
@@ -3954,6 +4230,7 @@ pub(crate) struct CommandContextBundle<'a> {
     plugin: PluginAdapter<'a>,
     lifecycle: SessionLifecycleAdapter<'a>,
     control: SessionControlAdapter<'a>,
+    export: SessionExportAdapter<'a>,
 }
 
 impl<'a> CommandContextBundle<'a> {
@@ -4005,6 +4282,9 @@ impl<'a> CommandContextBundle<'a> {
         if capabilities.contains(CommandCapabilities::SESSION_CONTROL) {
             contexts = contexts.with_control(&mut self.control);
         }
+        if capabilities.contains(CommandCapabilities::SESSION_EXPORT) {
+            contexts = contexts.with_export(&mut self.export);
+        }
         contexts
     }
 
@@ -4025,7 +4305,8 @@ impl<'a> CommandContextBundle<'a> {
             .union(CommandCapabilities::SKILL_GROUP)
             .union(CommandCapabilities::PLUGIN)
             .union(CommandCapabilities::SESSION_LIFECYCLE)
-            .union(CommandCapabilities::SESSION_CONTROL);
+            .union(CommandCapabilities::SESSION_CONTROL)
+            .union(CommandCapabilities::SESSION_EXPORT);
         self.contexts(all_test_capabilities).into_parts()
     }
 }
@@ -4052,7 +4333,8 @@ impl App {
             skill_group: SkillGroupAdapter { host: host.clone() },
             plugin: PluginAdapter { host: host.clone() },
             lifecycle: SessionLifecycleAdapter { host: host.clone() },
-            control: SessionControlAdapter { host },
+            control: SessionControlAdapter { host: host.clone() },
+            export: SessionExportAdapter { host },
         }
     }
 }
@@ -4117,19 +4399,6 @@ mod tests {
             ApprovalMode::Never,
         ] {
             let _ = to_command_approval(approval);
-        }
-        for effort in [
-            ReasoningEffort::Off,
-            ReasoningEffort::Minimal,
-            ReasoningEffort::Low,
-            ReasoningEffort::Medium,
-            ReasoningEffort::High,
-            ReasoningEffort::XHigh,
-            ReasoningEffort::Ultra,
-            ReasoningEffort::Auto,
-            ReasoningEffort::Max,
-        ] {
-            let _ = to_command_effort(effort);
         }
         for currency in [CostCurrency::Usd, CostCurrency::Cny] {
             let command = to_command_currency(currency);
@@ -4630,7 +4899,7 @@ mod tests {
         );
         assert_eq!(
             status.index,
-            tmp.path().join("memory").join("index.sqlite3")
+            tmp.path().join("memory").join("store.sqlite3")
         );
         assert_eq!(memory.path().expect("path"), tmp.path().join("memory"));
     }
@@ -4728,7 +4997,7 @@ mod tests {
         app.session.total_conversation_tokens = 2_000;
         app.goal_continuation_waiting = true;
         app.is_loading = false;
-        app.api_messages.push(codewhale_models::Message {
+        app.api_messages_mut().push(codewhale_models::Message {
             role: codewhale_models::Role::User,
             content: vec![codewhale_models::ContentBlock::Text {
                 text: "work".to_string(),
@@ -4817,7 +5086,9 @@ mod tests {
             .remember(MemoryRememberTarget::Global, "alpha note")
             .expect("remember global");
         assert!(remembered.source.ends_with("global/MEMORY.md"));
-        assert_eq!(remembered.line_start, 2);
+        // Structured records have no line position; the anchor is the scope's
+        // compatibility MEMORY.md path, not a byte offset into it.
+        assert_eq!(remembered.line_start, 0);
 
         // Workspace remember targets the workspace scope with the typed id.
         git_origin(tmp.path());
@@ -4841,7 +5112,7 @@ mod tests {
             .expect("search");
         assert_eq!(hits.len(), 1);
         assert!(hits[0].text.contains("workspace-only note"));
-        assert_eq!(hits[0].line_start, 2);
+        assert_eq!(hits[0].line_start, 0);
         // Empty results stay a typed empty vec, never an error.
         assert!(
             memory
@@ -5636,7 +5907,7 @@ mod tests {
         let mut app = lifecycle_test_app(&tmpdir);
         app.is_loading = true;
         app.current_session_id = Some("active-session".to_string());
-        app.api_messages.push(user_message("in flight"));
+        app.api_messages_mut().push(user_message("in flight"));
 
         for (command, expected) in [
             ("/fork", "Cannot fork a session"),
@@ -5666,7 +5937,8 @@ mod tests {
         let _lock = crate::test_support::lock_test_env();
         let _home = lifecycle_home_guard(&tmpdir);
         let mut app = lifecycle_test_app(&tmpdir);
-        app.api_messages.push(user_message("try another path"));
+        app.api_messages_mut()
+            .push(user_message("try another path"));
 
         let save_path = tmpdir.path().join("parent.json");
         {
@@ -5718,7 +5990,7 @@ mod tests {
         let _lock = crate::test_support::lock_test_env();
         let _home = lifecycle_home_guard(&tmpdir);
         let mut app = lifecycle_test_app(&tmpdir);
-        app.api_messages.push(user_message("parent turn"));
+        app.api_messages_mut().push(user_message("parent turn"));
         {
             let mut bundle = app.command_contexts();
             let mut parts = bundle.parts();
@@ -5768,7 +6040,7 @@ mod tests {
         let _home = lifecycle_home_guard(&tmpdir);
         let mut app = lifecycle_test_app(&tmpdir);
         app.current_session_id = Some("current-session".to_string());
-        app.api_messages.push(user_message("work"));
+        app.api_messages_mut().push(user_message("work"));
         let todos = app.todos.clone();
         let _held = todos.try_lock().expect("hold todos lock");
 
@@ -5819,7 +6091,7 @@ mod tests {
         let _lock = crate::test_support::lock_test_env();
         let _home = lifecycle_home_guard(&tmpdir);
         let mut app = lifecycle_test_app(&tmpdir);
-        app.api_messages.push(user_message("checkpoint"));
+        app.api_messages_mut().push(user_message("checkpoint"));
         let save_path = tmpdir.path().join("checkpoint.json");
         {
             let mut bundle = app.command_contexts();
@@ -5938,7 +6210,7 @@ mod tests {
         let mut linear_app = lifecycle_test_app(&tmpdir);
         linear_app.current_session_id = Some("linear-session".to_string());
         linear_app
-            .api_messages
+            .api_messages_mut()
             .push(user_message("first message with a long tail"));
         {
             let mut bundle = linear_app.command_contexts();
@@ -5956,7 +6228,7 @@ mod tests {
         // Journal projection once the session is saved with messages.
         let mut journal_app = lifecycle_test_app(&tmpdir);
         journal_app
-            .api_messages
+            .api_messages_mut()
             .push(user_message("journaled turn"));
         {
             let mut bundle = journal_app.command_contexts();
@@ -6193,7 +6465,7 @@ mod tests {
 
         let mut app = control_test_app(&tmpdir);
         app.current_session_id = Some("midturn-1".to_string());
-        app.api_messages = vec![user_message("first turn still streaming")];
+        app.api_messages = std::sync::Arc::new(vec![user_message("first turn still streaming")]);
 
         let receipt = {
             let mut bundle = app.command_contexts();

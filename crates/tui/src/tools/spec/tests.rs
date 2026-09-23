@@ -100,6 +100,24 @@ fn tool_context_keeps_execution_state_grouped_and_value_cloned() {
 }
 
 #[test]
+fn legacy_auto_approve_bit_folds_into_the_context_posture() {
+    let plain = ToolContext::new(".");
+    assert_eq!(
+        plain.approval_mode,
+        codewhale_execpolicy::ApprovalMode::Suggest,
+        "a context with no authority runs under Ask"
+    );
+
+    let yolo = ToolContext::with_auto_approve(".", false, "notes.md", "mcp.json", true);
+    assert!(yolo.auto_approve);
+    assert_eq!(
+        yolo.approval_mode,
+        codewhale_execpolicy::ApprovalMode::Bypass,
+        "a set auto-approve bit is the Full Access posture"
+    );
+}
+
+#[test]
 fn tool_context_top_level_stays_slim_as_services_grow() {
     assert!(
         std::mem::size_of::<ToolContext>()

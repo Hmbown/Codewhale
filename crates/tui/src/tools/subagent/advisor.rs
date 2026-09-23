@@ -25,7 +25,7 @@ use codewhale_config::AdvisorConfigToml;
 use tokio::sync::mpsc;
 use tracing::debug;
 
-use crate::client::DeepSeekClient;
+use crate::client::CodewhaleClient;
 use crate::config::Config;
 use crate::core::events::Event;
 use crate::llm_client::LlmClient;
@@ -313,7 +313,7 @@ pub async fn run_advisor_for_turn(
     turn_id: String,
     messages: Vec<Message>,
     config: AdvisorConfig,
-    client: DeepSeekClient,
+    client: CodewhaleClient,
     route_config: Config,
     session_model: String,
     usage_context: AdvisorUsageContext,
@@ -455,10 +455,10 @@ pub async fn run_advisor_for_turn(
 
 fn exact_advisor_client(
     config: &Config,
-    parent_client: DeepSeekClient,
+    parent_client: CodewhaleClient,
     session_model: &str,
     requested_model: &str,
-) -> anyhow::Result<(DeepSeekClient, String)> {
+) -> anyhow::Result<(CodewhaleClient, String)> {
     if requested_model
         .trim()
         .eq_ignore_ascii_case(session_model.trim())
@@ -761,7 +761,7 @@ mod tests {
             }),
             ..Config::default()
         };
-        let parent = DeepSeekClient::new(&config).expect("parent client");
+        let parent = CodewhaleClient::new(&config).expect("parent client");
         let (advisor, resolved_model) = exact_advisor_client(
             &config,
             parent,
@@ -801,7 +801,7 @@ mod tests {
             }),
             ..Config::default()
         };
-        let parent = DeepSeekClient::new(&config).expect("parent client");
+        let parent = CodewhaleClient::new(&config).expect("parent client");
         let error =
             match exact_advisor_client(&config, parent, "deepseek-chat", "private-advisor-model") {
                 Ok(_) => panic!("generic custom kind cannot identify the exact foreign route"),
@@ -846,7 +846,7 @@ mod tests {
             }),
             ..Config::default()
         };
-        let parent = DeepSeekClient::new(&config).expect("active custom-a client");
+        let parent = CodewhaleClient::new(&config).expect("active custom-a client");
         let error = match exact_advisor_client(&config, parent, "custom-a-model", "custom-b-model")
         {
             Ok(_) => panic!("custom-b must not reuse custom-a's endpoint or credential"),
@@ -900,7 +900,7 @@ mod tests {
             }),
             ..Config::default()
         };
-        let mut client = DeepSeekClient::new(&route_config).expect("advisor client");
+        let mut client = CodewhaleClient::new(&route_config).expect("advisor client");
         client.set_test_chat_transport_base_url(server.uri());
         let mut emission_guard = EmissionGuard::new();
         if suppress_as_duplicate {

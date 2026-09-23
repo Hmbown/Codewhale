@@ -257,7 +257,7 @@ codewhale --provider openrouter --model deepseek/deepseek-v4-pro
         Permission posture is configurable per session.
       </>
     ),
-    sources: ["SECURITY.md", "docs/PROVIDERS.md", "docs/RUNTIME_API.md"],
+    sources: [".github/SECURITY.md", "docs/PROVIDERS.md", "docs/RUNTIME_API.md"],
   },
   {
     q: "How do MCP servers work?",
@@ -613,7 +613,7 @@ codewhale --provider openrouter --model deepseek/deepseek-v4-pro
         权限姿态可按会话配置。
       </>
     ),
-    sources: ["SECURITY.md", "docs/PROVIDERS.md", "docs/RUNTIME_API.md"],
+    sources: [".github/SECURITY.md", "docs/PROVIDERS.md", "docs/RUNTIME_API.md"],
   },
   {
     q: "MCP 服务器如何工作？",

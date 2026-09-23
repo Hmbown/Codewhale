@@ -24,7 +24,10 @@ Compatibility launch paths on the `workflow` tool:
 Use `agent(action="roster")` to inspect the saved Fleet models and roles before
 assigning children. Native plan children accept `model` for a saved shortlist
 selector, or `role`/`profile` for a saved assignment. Named Exact Fleets keep
-their member routes fixed and reject per-step model overrides.
+their member routes fixed and reject per-step model overrides. Plan children
+also accept `cwd`, a repository-relative working directory — required in
+multi-repository workspaces so the child (and worktree isolation) resolves the
+right repository, mirroring `task({cwd})`.
 
 For a guided walkthrough from fleet task specs to Workflow authoring and
 monitoring, see [fleet + Workflow Tutorial](FLEET_WORKFLOW_TUTORIAL.md).
@@ -46,13 +49,15 @@ its own. Real work happens in sub-agents the script launches.
 - Up to **16 concurrent** live agents in one run (additional spawns wait for a slot).
 - Up to **1_000 agents per run** (VM lifetime spawn cap).
 - Configured `max_children` and `max_concurrent` can narrow these limits.
-- Soft auto-launch still uses a lower child soft-cap (`auto_start_child_limit`).
+- Automatic launch is model-judged on scope; the host enforces only the hard `max_children` / `max_depth` ceilings.
+- Plan the population the work needs and let the host queue and clamp it.
+  These ceilings are enforcement, not a reason to pre-shrink a valid plan.
 
 See the Workflow JS sandbox tests for the fail-closed host surface inventory.
 
 ## Language Choice
 
-| Surface | Strength | Tradeoff | v0.8.60 stance |
+| Surface | Strength | Tradeoff | Stance |
 |---|---|---|---|
 | YAML / JSON IR | Simple, reviewable, no runtime | Verbose for generated workflows | Keep as interchange/debug format |
 | JavaScript | Familiar object syntax and easy agent generation | Unsafe if executed as a general runtime | First-class authoring through declarative compile-only subset |
@@ -105,7 +110,9 @@ paired with `worktree: true` when the child needs an isolated checkout.
 The compiler rejects effectful constructs such as `import`, `require`, `fetch`,
 `process`, `Deno`, `Bun`, `child_process`, file reads/writes, `eval`, `async`,
 and `await`. This is intentionally stricter than JavaScript: workflow source is
-a familiar declaration format, not a second execution runtime.
+a familiar declaration format, not a second execution runtime. The denied
+effects are not denied to the run — put them in a child worker, which has
+the full tool surface, and keep the script to coordination.
 
 ## Verification
 
@@ -124,9 +131,9 @@ Workflow owns the plan: phases, branches, loops, reducers, and intermediate
 results. fleet owns the durable roster, member identity, semantic role, and
 saved provider/model pins or inheritance. Runtime owns tool posture, launch
 concurrency, leases, heartbeats, logs, receipts, and resume/stop/restart
-controls. In other words, a workflow can select fleet members and monitor their
-Runtime runs, but it must not become a second executor with its own shell or
-filesystem authority.
+controls. In other words, a workflow selects fleet members and monitors their
+Runtime runs; it isn't an executor, because the script has no shell or
+filesystem of its own — effects live in the workers.
 
 Workflow-to-Runtime launch validation applies a conservative default shape
 before any Workflow IR is lowered to selected workers:

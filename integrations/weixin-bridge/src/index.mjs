@@ -24,6 +24,7 @@ import {
   activeTurnBlock,
   helpText,
 } from "./lib.mjs";
+import { renderQrToText } from "./qr.mjs";
 import { ThreadStore as CoreThreadStore } from "../../bridge-core/src/lib.mjs";
 
 // ============================================================================
@@ -163,9 +164,15 @@ const config = {
   stateDir:
     weixinEnv("WEIXIN_STATE_DIR") ||
     "/var/lib/codewhale-weixin-bot-bridge",
+  // Defaults inside stateDir rather than to a second absolute path: setting
+  // only WEIXIN_STATE_DIR must not leave the thread map pointing at /var/lib,
+  // which fails with EACCES on every incoming message and silently drops it.
   threadMapPath:
     weixinEnv("WEIXIN_THREAD_MAP_PATH") ||
-    "/var/lib/codewhale-weixin-bot-bridge/thread-map.json",
+    path.join(
+      weixinEnv("WEIXIN_STATE_DIR") || "/var/lib/codewhale-weixin-bot-bridge",
+      "thread-map.json"
+    ),
   maxReplyChars: Number(weixinEnv("WEIXIN_MAX_REPLY_CHARS") || 3500),
   longPollTimeoutMs: Number(
     weixinEnv("WEIXIN_LONGPOLL_TIMEOUT_MS") || 35000
@@ -708,6 +715,9 @@ async function loadSyncBuf(stateDir) {
 
 async function saveSyncBuf(stateDir, buf) {
   const p = resolveSyncBufPath(stateDir);
+  // The state dir may not exist yet on a first run whose first persisted write
+  // is the poll cursor rather than account.json.
+  await fs.mkdir(path.dirname(p), { recursive: true, mode: 0o700 });
   const tmp = `${p}.tmp`;
   await fs.writeFile(tmp, buf, { mode: 0o600 });
   await fs.rename(tmp, p);
@@ -870,8 +880,26 @@ async function main() {
   console.log(`Runtime: ${config.runtimeUrl}`);
   console.log(`Workspace: ${config.workspace}`);
   console.log(`State dir: ${config.stateDir}`);
+  console.log(`Thread map: ${config.threadMapPath}`);
 
-  // 初始化 ThreadStore
+  // 初始化 ThreadStore。`open()` 只读，真正的写入发生在第一条消息到达时；
+  // 那时失败会被 getUpdates 的 catch 吞掉，表现为“微信没有回应”。所以这里
+  // 先建目录并真实写一次探针文件，把问题在启动时就暴露出来。
+  try {
+    const dir = path.dirname(config.threadMapPath);
+    await fs.mkdir(dir, { recursive: true, mode: 0o700 });
+    const probe = path.join(dir, ".write-probe");
+    await fs.writeFile(probe, "", { mode: 0o600 });
+    await fs.rm(probe, { force: true });
+  } catch (error) {
+    console.error(
+      `Thread map directory is not writable: ${path.dirname(config.threadMapPath)} (${error.message})`
+    );
+    console.error(
+      "Set WEIXIN_STATE_DIR (or WEIXIN_THREAD_MAP_PATH) to a writable directory."
+    );
+    process.exit(1);
+  }
   threadStore = await ThreadStore.open(config.threadMapPath);
 
   // 尝试加载已有账号
@@ -888,6 +916,13 @@ async function main() {
 
     const { qrcodeUrl, sessionKey } = await getLoginQR();
     console.log("请用微信扫描以下二维码登录：");
+    // Render the login URL as a scannable terminal QR. The URL is printed too,
+    // so a terminal that mangles the half-block glyphs still has a way through.
+    try {
+      if (qrcodeUrl) console.log(renderQrToText(qrcodeUrl));
+    } catch (error) {
+      console.warn(`Could not render QR in terminal: ${error.message}`);
+    }
     console.log(qrcodeUrl);
     console.log("");
 

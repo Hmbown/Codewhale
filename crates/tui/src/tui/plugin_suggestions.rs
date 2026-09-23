@@ -382,9 +382,9 @@ mod tests {
             let (mut app, _root, _home) = app_with_supabase_plugin();
             if plugin_first {
                 assert!(app.maybe_nudge_plugin_for_prompt("add supabase auth"));
-                assert!(!app.maybe_show_behavioral_tip(BehavioralTip::PlanningMode));
+                assert!(!app.maybe_show_behavioral_tip(BehavioralTip::McpValidation));
             } else {
-                assert!(app.maybe_show_behavioral_tip(BehavioralTip::PlanningMode));
+                assert!(app.maybe_show_behavioral_tip(BehavioralTip::McpValidation));
                 assert!(!app.maybe_nudge_plugin_for_prompt("add supabase auth"));
             }
             assert_eq!(app.status_toasts.len(), 1);
@@ -510,6 +510,7 @@ mod tests {
                 &app.input,
                 restarted.plugin_registry.as_ref(),
                 &[],
+                &mut crate::plugins::recommend::RecommendedPluginGate::default(),
             )
             .is_none()
         );

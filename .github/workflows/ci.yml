@@ -202,6 +202,19 @@ jobs:
         # auto-tag.yml, release.yml, prepare-release.sh), which is where a
         # missing receipt actually matters.
         run: ./scripts/release/check-versions.sh --range-audit-advisory
+      - name: Check contributor credit
+        # The three credit surfaces were only ever cross-checked against
+        # `requiredCandidateCredits`, a hand-maintained list -- so they proved
+        # each other consistent while a contributor nobody remembered stayed
+        # invisible. Nine were missing from 0.10.0. This derives the expected
+        # set from the commit range instead (authors, co-author trailers, and
+        # `Harvested from PR #N by @handle`), so forgetting someone is red.
+        run: python3 scripts/check-contributor-credit.py
+      - name: Check bundled plugin claims
+        # The 0.10.0 section claimed Computer Use 0.4.0 at revision ca6be22
+        # while the tree shipped 0.11.2 at d8640b17f275 -- three upstream
+        # releases apart, with nothing comparing the prose to the assets.
+        run: python3 scripts/check-bundled-plugin-claims.py
       - name: Check OHOS dependency graph
         run: ./scripts/release/check-ohos-deps.sh
       - name: Check release helper contracts
@@ -246,6 +259,15 @@ jobs:
             echo "== ${bridge}"
             (cd "integrations/${bridge}" && npm test)
           done
+
+      - name: Build computer-use test desktop
+        # Spawn assertions have short request deadlines; keep the cold image
+        # build outside those deadlines and fail image preparation explicitly.
+        timeout-minutes: 10
+        run: >-
+          docker build --tag codewhale-cu-linux
+          --file crates/tui/plugins/computer-use/docker/Dockerfile
+          crates/tui/plugins/computer-use
 
       - name: Run computer-use plugin suites
         # The bundled plugin is dependency-free too; its suites cover the
@@ -412,9 +434,20 @@ jobs:
           else
             python3 scripts/check-command-migration-manifest.py
           fi
-      # Clippy above runs without `--all-targets`, so it cannot see dead code
-      # that only tests keep alive. This ratchet covers that blind spot by
-      # refusing to let the `#[allow(dead_code)]` total rise (#4785).
+      - name: Check reqwest client constructors
+        if: needs.changes.outputs.heavy == 'true'
+        run: |
+          python3 scripts/test_check_reqwest_builders.py
+          python3 scripts/check-reqwest-builders.py
+      # Clippy above runs with `--all-targets` (see the clippy step), so the
+      # gap this ratchet covers is not "tests keep it alive" but suppression
+      # itself: it refuses to let dead-code suppression rise (#4785), counting
+      # both `#[allow(dead_code)]` and `#[expect(dead_code)]`, because counting
+      # one spelling let a sweep rewrite allows as expects and book it as
+      # progress (#6241).
+      - name: Test dead-code budget script
+        if: needs.changes.outputs.heavy == 'true'
+        run: python3 scripts/test_check_dead_code_budget.py
       - name: Check dead-code budget
         if: needs.changes.outputs.heavy == 'true'
         # Advisory on pull requests: this asserts a whole-repo property, so a
@@ -423,6 +456,13 @@ jobs:
         # pushes to main, where the number is actually actionable.
         continue-on-error: ${{ github.event_name == 'pull_request' }}
         run: python3 scripts/check-dead-code-budget.py
+      # Ratchet for blocking calls that could park Tokio workers: any new
+      # thread::sleep/std::fs site outside spawn_blocking, dedicated-thread,
+      # or test scopes must be isolated or budgeted (#6149).
+      - name: Check blocking-calls budget
+        if: needs.changes.outputs.heavy == 'true'
+        continue-on-error: ${{ github.event_name == 'pull_request' }}
+        run: python3 scripts/check-blocking-calls-budget.py
       - name: Test runtime-contract measurement harness
         if: needs.changes.outputs.heavy == 'true'
         run: |
@@ -627,7 +667,7 @@ jobs:
           RUSTC_WRAPPER: ${{ matrix.os != 'windows-latest' && env.RUSTC_WRAPPER || '' }}
           # Give test threads the stack the product gives itself. main.rs runs
           # the owner thread and every tokio worker at
-          # CODEWHALE_MAIN_STACK_BYTES (16 MiB) because the engine and
+          # CODEWHALE_MAIN_STACK_BYTES (32 MiB) because the engine and
           # runtime-thread futures are genuinely deep. `#[tokio::test]` builds
           # its own runtime and never sees that, so tests ran the same code on
           # ~2 MiB (~1 MiB on Windows) — a configuration that never ships.
@@ -636,7 +676,11 @@ jobs:
           # environment_id, masking every other Windows result (78afd8d3d4
           # Box::pin'd that one frame; the mismatch itself remained). std reads
           # this for any thread spawned without an explicit size, which covers
-          # both libtest's per-test threads and tokio's workers.
+          # both libtest's per-test threads and tokio's workers. Test threads
+          # hold 16 MiB: the engine-only chains they run measured a ~2.5 MiB
+          # debug high-water, while the full ~16.5 MiB UI-loop chain that
+          # forced 32 MiB lives in spawned binaries, which size their own
+          # stacks explicitly and never read this variable.
           RUST_MIN_STACK: '16777216'
       - name: Run doctests
         if: needs.changes.outputs.heavy == 'true' && (matrix.os != 'ubuntu-latest' || github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request')

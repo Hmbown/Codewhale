@@ -9,9 +9,9 @@
 //! `[fleet.profiles]` config < `$CODEWHALE_HOME/agents/*.toml` personal <
 //! `.codewhale/agents/*.toml` project members)
 //! as a scrollable list with a detail pane for the selected row. The view
-//! never writes anything; `s` / Enter on a selected-v2 member opens that
-//! Fleet's exact editor, while the legacy profile wizard is used only when no
-//! named Fleet is selected (the operator row is display-only). Switch named
+//! never writes anything; Enter opens the shared model/thinking picker for
+//! the selected role, retaining this roster underneath. The existing saved
+//! team/profile owner validates and persists assignments. Switch named
 //! saved Fleets with `/fleet fleets` (`/fleet fleets` remains compatible).
 //!
 //! #5888: the default lineup folds the built-in `general` alias out of
@@ -25,7 +25,7 @@
 
 use std::cell::{Cell, RefCell};
 
-use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::{
     buffer::Buffer,
     layout::{Constraint, Direction, Layout, Rect},
@@ -41,6 +41,10 @@ use crate::fleet::roster::{FleetRoster, ProfileLayer, ProfileOrigin, layers_from
 use crate::fleet::worker_runtime::roster_member_agent_type;
 use crate::tui::app::App;
 use crate::tui::menu_style;
+
+/// Rows one PageUp/PageDown travels. Pages clamp at the ends per the shared
+/// vocabulary instead of wrapping (#6290).
+const FLEET_ROSTER_PAGE: usize = 10;
 use crate::tui::views::{
     ActionHint, ModalKind, ModalView, ViewAction, ViewEvent, render_modal_footer,
     truncate_view_text,
@@ -151,6 +155,8 @@ pub struct FleetRosterView {
     /// Row under the pointer, tinted with the shared hover style. Hover
     /// never moves the keyboard selection; only painted rows answer.
     hovered_row: Cell<Option<usize>>,
+    workers_hitbox: Cell<Option<Rect>>,
+    hovered_workers: Cell<bool>,
     /// Canonical active-theme surface captured from `App`; Terminal owns
     /// `Color::Reset`, while explicit themes retain their resolved surface.
     surface_bg: Color,
@@ -196,22 +202,7 @@ impl FleetRosterView {
             members: roster
                 .members()
                 .iter()
-                .filter(|m| {
-                    !m.id.trim().eq_ignore_ascii_case("operator")
-                        // #5888: `general` is the legacy alias of the `worker`
-                        // posture. The engine roster keeps it dispatchable —
-                        // Agent tool type tokens, saved configs, and replayed
-                        // transcripts resolve `general`, and the identity
-                        // selector maps the alias to the worker member — but
-                        // the default lineup presents one row per posture.
-                        // Only the untouched built-in alias folds away: a
-                        // user-authored `general` (config/personal/project
-                        // origin, including saved-team members, which carry
-                        // Personal/Workspace origin by construction) is the
-                        // user's own member and stays visible.
-                        && !(m.id.eq_ignore_ascii_case("general")
-                            && m.origin == ProfileOrigin::BuiltIn)
-                })
+                .filter(|m| !m.id.trim().eq_ignore_ascii_case("operator"))
                 .cloned()
                 .collect(),
             shadowed: roster.shadowed().to_vec(),
@@ -222,6 +213,8 @@ impl FleetRosterView {
             row_hitboxes: RefCell::new(Vec::new()),
             last_mouse_selected: None,
             hovered_row: Cell::new(None),
+            workers_hitbox: Cell::new(None),
+            hovered_workers: Cell::new(false),
             surface_bg: palette::UI_THEME.surface_bg,
             locale: Locale::En,
         }
@@ -272,6 +265,41 @@ impl FleetRosterView {
         self.hovered_row.set(None);
     }
 
+    /// Apply one [`list_nav`](crate::tui::list_nav) motion (#6290), returning
+    /// whether it was consumed. Steps wrap; pages travel [`FLEET_ROSTER_PAGE`]
+    /// rows and clamp. The region axis is declined so Tab keeps opening the
+    /// workers view through the explicit arm below.
+    fn apply_motion(&mut self, motion: crate::tui::list_nav::Motion) -> bool {
+        use crate::tui::list_nav::Motion;
+        match motion {
+            Motion::Prev => {
+                self.move_up();
+                true
+            }
+            Motion::Next => {
+                self.move_down();
+                true
+            }
+            Motion::RegionPrev | Motion::RegionNext => false,
+            _ => {
+                let count = self.row_count();
+                if count == 0 {
+                    return false;
+                }
+                let Some(next) =
+                    crate::tui::list_nav::apply(self.selected, count, FLEET_ROSTER_PAGE, motion)
+                else {
+                    return false;
+                };
+                self.selected = next;
+                self.detail_scroll = 0;
+                self.last_mouse_selected = None;
+                self.hovered_row.set(None);
+                true
+            }
+        }
+    }
+
     fn select_row(&mut self, row: usize) {
         self.selected = row.min(self.row_count().saturating_sub(1));
         self.detail_scroll = 0;
@@ -283,11 +311,9 @@ impl FleetRosterView {
             // Carry the exact member the operator already chose. The host
             // focuses it in the selected v2 Fleet editor, or starts legacy
             // setup from its member id when no Fleet is selected.
-            ViewAction::EmitAndClose(ViewEvent::FleetRosterOpenSetupRequested { member_id })
+            ViewAction::Emit(ViewEvent::FleetRosterOpenSetupRequested { member_id })
         } else {
-            // The operator is not a wizard-authored profile; its route changes
-            // via /model or /provider (the detail pane says so).
-            ViewAction::None
+            ViewAction::Emit(ViewEvent::FleetRosterOpenCoordinatorRequested)
         }
     }
 
@@ -307,18 +333,16 @@ impl FleetRosterView {
     /// destination this room has that is not a tab. Detail scrolling
     /// (PgUp/PgDn) works but is not advertised — the pane is short now.
     fn footer_hints(&self) -> Vec<ActionHint> {
-        let edit_label = if self.selected_fleet.is_some() {
-            "edit"
-        } else {
-            "setup"
-        };
-        vec![
+        let mut hints = vec![
             ActionHint::new("↑↓", "move"),
-            ActionHint::new("Enter", edit_label),
+            ActionHint::new("Enter", "model & thinking"),
+        ];
+        hints.extend([
             ActionHint::new("Tab", tr(self.locale, MessageId::FleetRosterWorkers)),
             ActionHint::new("f", "saved teams"),
             ActionHint::new("Esc", "close"),
-        ]
+        ]);
+        hints
     }
 }
 
@@ -335,16 +359,36 @@ impl ModalView for FleetRosterView {
         // A keyboard gesture ends any pending mouse double-click sequence so
         // a later single click can never activate a stale row.
         self.last_mouse_selected = None;
+        self.hovered_workers.set(false);
+        self.hovered_row.set(None);
+        // Shift-modified paging scrolls the detail pane; bare keys drive the
+        // row list through the shared vocabulary (#6290, #6014-style split).
+        if key.modifiers.contains(KeyModifiers::SHIFT) {
+            match key.code {
+                KeyCode::PageUp => {
+                    self.detail_scroll = self.detail_scroll.saturating_sub(8);
+                    return ViewAction::None;
+                }
+                KeyCode::PageDown => {
+                    self.detail_scroll = self.detail_scroll.saturating_add(8);
+                    return ViewAction::None;
+                }
+                KeyCode::Home => {
+                    self.detail_scroll = 0;
+                    return ViewAction::None;
+                }
+                _ => {}
+            }
+        }
+        // Movement keys come from the shared vocabulary (#6290), j/k aliases
+        // included — this surface captures no text.
+        if let Some(motion) = crate::tui::list_nav::motion(&key)
+            && self.apply_motion(motion)
+        {
+            return ViewAction::None;
+        }
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => ViewAction::Close,
-            KeyCode::Up | KeyCode::Char('k') => {
-                self.move_up();
-                ViewAction::None
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                self.move_down();
-                ViewAction::None
-            }
             KeyCode::Enter => self.activate_selected(),
             // #5954: the roster stays on the stack under the view it opens,
             // so `Esc` in workers / saved teams pops back here instead of
@@ -354,18 +398,6 @@ impl ModalView for FleetRosterView {
                 ViewAction::Emit(ViewEvent::FleetRosterOpenWorkersRequested)
             }
             KeyCode::Char('f') => ViewAction::Emit(ViewEvent::FleetRosterOpenFleetsRequested),
-            KeyCode::Home => {
-                self.detail_scroll = 0;
-                ViewAction::None
-            }
-            KeyCode::PageUp => {
-                self.detail_scroll = self.detail_scroll.saturating_sub(8);
-                ViewAction::None
-            }
-            KeyCode::PageDown => {
-                self.detail_scroll = self.detail_scroll.saturating_add(8);
-                ViewAction::None
-            }
             _ => ViewAction::None,
         }
     }
@@ -373,6 +405,11 @@ impl ModalView for FleetRosterView {
     fn handle_mouse(&mut self, mouse: MouseEvent) -> ViewAction {
         match mouse.kind {
             MouseEventKind::Moved => {
+                self.hovered_workers.set(
+                    self.workers_hitbox
+                        .get()
+                        .is_some_and(|rect| rect.contains((mouse.column, mouse.row).into())),
+                );
                 let hovered = self
                     .row_hitboxes
                     .borrow()
@@ -393,6 +430,14 @@ impl ModalView for FleetRosterView {
                 ViewAction::None
             }
             MouseEventKind::Down(MouseButton::Left) => {
+                if self
+                    .workers_hitbox
+                    .get()
+                    .is_some_and(|rect| rect.contains((mouse.column, mouse.row).into()))
+                {
+                    self.last_mouse_selected = None;
+                    return ViewAction::Emit(ViewEvent::FleetRosterOpenWorkersRequested);
+                }
                 let action = self
                     .row_hitboxes
                     .borrow()
@@ -418,63 +463,69 @@ impl ModalView for FleetRosterView {
         let hints = self.footer_hints();
         let content = render_modal_footer(area, buf, &hints);
 
-        // Hairline shell shared with the HTML route/config/Fleet surfaces.
-        // This replaces the centered legacy card: Fleet is a product room,
-        // not a popup floating over an unrelated transcript.
+        // A compact, honest header: the roster is the current room, Workers
+        // is a real destination. Editing belongs to the selected member,
+        // rather than a decorative Setup tab that never handled clicks.
         let chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Length(3), Constraint::Min(1)])
+            .constraints([Constraint::Length(2), Constraint::Min(1)])
             .split(content);
-        let header = vec![
-            Line::from(vec![
-                Span::styled(
-                    format!("─ {} ", tr(self.locale, MessageId::FleetRosterHeaderLabel)),
-                    Style::default().fg(palette::WHALE_ACTION).bold(),
-                ),
-                Span::styled(
-                    "──────────────────────── ",
-                    Style::default().fg(palette::BORDER_COLOR),
-                ),
-                Span::styled(
-                    tr(self.locale, MessageId::FleetRosterTabRoster),
-                    Style::default().fg(palette::WHALE_ACTION).bold(),
-                ),
-                Span::styled(
-                    format!(
-                        "  {}  {} ",
-                        tr(self.locale, MessageId::FleetRosterTabSetup),
-                        tr(self.locale, MessageId::FleetRosterWorkers)
-                    ),
-                    Style::default().fg(palette::TEXT_MUTED),
-                ),
-                Span::styled("─".repeat(24), Style::default().fg(palette::BORDER_COLOR)),
-            ]),
-            Line::from(""),
-            Line::from(vec![
-                Span::styled(
-                    format!("  {}", self.selected_fleet_line()),
-                    Style::default().fg(palette::TEXT_SECONDARY),
-                ),
-                Span::styled(
-                    format!(
-                        " · {}",
-                        tr(self.locale, MessageId::FleetRosterMembersCount)
-                            .replace("{count}", &(self.members.len() + 1).to_string())
-                    ),
-                    Style::default().fg(palette::TEXT_MUTED),
-                ),
-                Span::styled(
-                    format!(
-                        " · {}",
-                        tr(self.locale, MessageId::FleetRosterOperatorFirst)
-                    ),
-                    Style::default().fg(palette::TEXT_MUTED),
-                ),
-            ]),
-        ];
-        Paragraph::new(header)
-            .wrap(Wrap { trim: false })
-            .render(chunks[0], buf);
+        let roster_label = format!(
+            " {} · {} ",
+            tr(self.locale, MessageId::FleetRosterHeaderLabel),
+            tr(self.locale, MessageId::FleetRosterTabRoster)
+        );
+        let workers_label = format!(" {} ", tr(self.locale, MessageId::FleetRosterWorkers));
+        let roster_width = unicode_width::UnicodeWidthStr::width(roster_label.as_str()) as u16;
+        let workers_width = unicode_width::UnicodeWidthStr::width(workers_label.as_str()) as u16;
+        self.workers_hitbox.set(None);
+        // Place Workers at the right edge so even a compact screen retains
+        // its full action target; the room label yields first.
+        let workers_width = workers_width.min(chunks[0].width);
+        let workers = Rect::new(
+            chunks[0].right().saturating_sub(workers_width),
+            chunks[0].y,
+            workers_width,
+            u16::from(chunks[0].height > 0),
+        );
+        if workers.width > 0 && workers.height > 0 {
+            self.workers_hitbox.set(Some(workers));
+        }
+        let title = Rect::new(
+            chunks[0].x,
+            chunks[0].y,
+            roster_width.min(chunks[0].width.saturating_sub(workers_width)),
+            workers.height,
+        );
+        Paragraph::new(Line::from(Span::styled(
+            roster_label,
+            Style::default().fg(palette::TEXT_PRIMARY).bold(),
+        )))
+        .render(title, buf);
+        let workers_style = if self.hovered_workers.get() {
+            menu_style::hovered_row_style().fg(palette::WHALE_ACTION)
+        } else {
+            Style::default()
+                .fg(palette::WHALE_ACTION)
+                .add_modifier(Modifier::UNDERLINED)
+        };
+        Paragraph::new(Line::from(Span::styled(workers_label, workers_style))).render(workers, buf);
+        if chunks[0].height > 1 {
+            let summary = format!(
+                " {} · {}",
+                self.selected_fleet_line(),
+                tr(self.locale, MessageId::FleetRosterMembersCount)
+                    .replace("{count}", &(self.members.len() + 1).to_string())
+            );
+            Paragraph::new(Line::from(Span::styled(
+                truncate_view_text(&summary, usize::from(chunks[0].width)),
+                Style::default().fg(palette::TEXT_MUTED),
+            )))
+            .render(
+                Rect::new(chunks[0].x, chunks[0].y + 1, chunks[0].width, 1),
+                buf,
+            );
+        }
 
         self.render_body(chunks[1], buf);
     }
@@ -552,33 +603,20 @@ impl FleetRosterView {
             let hovered = !is_selected && self.hovered_row.get() == Some(idx);
             let hover_tint = || menu_style::hovered_row_style();
             let pointer = format!("{} ", crate::tui::glyphs::selection_marker(is_selected));
+            let shadow_badge = idx.checked_sub(1).and_then(|index| {
+                member_shadow_badge(self.locale, &self.members[index], &self.shadowed)
+            });
             let (text, base_style) = if idx == 0 {
                 (
                     format!(
-                        "{pointer}@ {}  {}",
-                        tr(self.locale, MessageId::FleetRosterOperatorRow),
-                        self.operator.model
+                        "{pointer}@ {}",
+                        tr(self.locale, MessageId::FleetRosterOperatorRow)
                     ),
-                    Style::default()
-                        .fg(palette::WHALE_ACTION)
-                        .add_modifier(Modifier::BOLD),
+                    Style::default().fg(palette::TEXT_PRIMARY).bold(),
                 )
             } else {
                 let member = &self.members[idx - 1];
                 let mark = member_role_mark(member);
-                // #5098: badge rows whose id exists in more than one layer
-                // so a higher-layer win is visible from the list.
-                let shadow_badge = member_shadow_badge(self.locale, member, &self.shadowed);
-                // Whale Teams: the species badge sits between the charter role
-                // mark and the id, so a Scout, Patch, or Lantern reads at a
-                // glance even before the detail pane opens.
-                let species = member_species(member);
-                let badge_cells = whales::BADGE_WIDTH + 1;
-                let edit_marker = if is_selected && self.selected_fleet.is_some() {
-                    "[edit] "
-                } else {
-                    ""
-                };
                 let member_name = member
                     .display_name
                     .as_deref()
@@ -588,46 +626,42 @@ impl FleetRosterView {
                         || member.id.clone(),
                         |name| format!("{name} ({})", member.id),
                     );
-                let text = format!(
-                    "{pointer}{edit_marker}{mark} {}{}  {}",
-                    member_name,
-                    shadow_badge.as_deref().unwrap_or(""),
-                    member_routing(member)
-                );
-                let text = truncate_view_text(&text, list_width.saturating_sub(badge_cells));
-                let base_style = if is_selected {
-                    menu_style::selected_row_style()
-                } else if hovered {
-                    Style::default()
-                        .fg(palette::TEXT_PRIMARY)
-                        .patch(hover_tint())
+                (
+                    format!(
+                        "{pointer}{mark} {member_name}{}",
+                        shadow_badge.as_deref().unwrap_or("")
+                    ),
+                    Style::default().fg(palette::TEXT_PRIMARY),
+                )
+            };
+            let text = if list_width >= 28 && shadow_badge.is_none() {
+                let route = if idx == 0 {
+                    self.operator.model.as_str()
                 } else {
-                    Style::default().fg(palette::TEXT_PRIMARY)
+                    let profile = &self.members[idx - 1].profile;
+                    profile
+                        .model
+                        .as_deref()
+                        .filter(|model| !model.trim().is_empty())
+                        .unwrap_or_else(|| {
+                            if profile.loadout.as_str() == "inherit" {
+                                "follow Coordinator"
+                            } else {
+                                profile.loadout.as_str()
+                            }
+                        })
                 };
-                let split = pointer.len() + edit_marker.len() + mark.len() + 1;
-                let (head, tail) = if text.len() >= split && text.is_char_boundary(split) {
-                    text.split_at(split)
-                } else {
-                    (text.as_str(), "")
-                };
-                let mut spans = vec![Span::styled(head.to_string(), base_style)];
-                for span in whales::badge(species, &palette::UI_THEME) {
-                    spans.push(if is_selected {
-                        Span::styled(
-                            span.content,
-                            span.style
-                                .bg(palette::SELECTION_BG)
-                                .add_modifier(Modifier::BOLD),
-                        )
-                    } else if hovered {
-                        Span::styled(span.content, span.style.patch(hover_tint()))
-                    } else {
-                        span
-                    });
-                }
-                spans.push(Span::styled(format!(" {tail}"), base_style));
-                list_lines.push(Line::from(spans));
-                continue;
+                let role_width = (list_width / 2).clamp(14, 24);
+                let label = truncate_view_text(&text, role_width);
+                let pad = role_width
+                    .saturating_sub(unicode_width::UnicodeWidthStr::width(label.as_str()));
+                format!(
+                    "{label}{}  {}",
+                    " ".repeat(pad),
+                    truncate_view_text(route, list_width.saturating_sub(role_width + 2))
+                )
+            } else {
+                text
             };
             let style = if is_selected {
                 menu_style::selected_row_style()
@@ -636,6 +670,17 @@ impl FleetRosterView {
             } else {
                 base_style
             };
+            if is_selected || hovered {
+                buf.set_style(
+                    Rect::new(
+                        list_area.x,
+                        list_area.y + line_offset as u16,
+                        list_area.width,
+                        1,
+                    ),
+                    style,
+                );
+            }
             list_lines.push(Line::from(Span::styled(
                 truncate_view_text(&text, list_width),
                 style,
@@ -739,14 +784,13 @@ fn member_role_mark(member: &AgentProfile) -> &'static str {
 
 /// Shared field renderer for the detail pane.
 fn detail_field(lines: &mut Vec<Line<'static>>, label: &str, body: String) {
-    lines.push(Line::from(Span::styled(
-        label.to_string(),
-        Style::default().fg(palette::WHALE_ACTION).bold(),
-    )));
-    lines.push(Line::from(Span::styled(
-        body,
-        Style::default().fg(palette::TEXT_PRIMARY),
-    )));
+    lines.push(Line::from(vec![
+        Span::styled(
+            format!("{label}  "),
+            Style::default().fg(palette::TEXT_MUTED).bold(),
+        ),
+        Span::styled(body, Style::default().fg(palette::TEXT_PRIMARY)),
+    ]));
     lines.push(Line::from(""));
 }
 
@@ -780,9 +824,8 @@ fn operator_detail_lines(operator: &OperatorInfo) -> Vec<Line<'static>> {
     detail_field(
         &mut lines,
         "Description",
-        "The Coordinator is this Fleet's leader — your main session model. Every \
-         member below works for it. Change the model with /model or /provider; \
-         persist with /fleet save."
+        "The Coordinator leads this session. Press Enter to change its model and thinking. \
+         Roles set to follow the Coordinator use this route; pinned roles keep their own models."
             .to_string(),
     );
     lines.push(Line::from(Span::styled(
@@ -824,10 +867,6 @@ fn member_access_summary(member: &AgentProfile) -> String {
 /// When the loadout is `fast`, show that the runtime picks the **fast sibling
 /// of the active session model** — not a stale on-disk profile name — so the
 /// roster matches what Fleet will actually launch.
-fn member_routing(member: &AgentProfile) -> String {
-    member_routing_with_session(member, None)
-}
-
 fn member_routing_with_session(member: &AgentProfile, session_model: Option<&str>) -> String {
     if let Some(model) = member
         .profile
@@ -950,6 +989,15 @@ fn member_detail_lines_with_session(
         None => model,
     };
     detail_field(&mut lines, "Model", route);
+    detail_field(
+        &mut lines,
+        "Thinking",
+        member
+            .profile
+            .reasoning_effort
+            .clone()
+            .unwrap_or_else(|| "Follow Coordinator".to_string()),
+    );
     // Slot is internal dispatch vocabulary and duplicates Role — never shown.
     detail_field(&mut lines, "Access", member_access_summary(member));
 

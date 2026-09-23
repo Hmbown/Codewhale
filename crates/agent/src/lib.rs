@@ -898,6 +898,126 @@ impl Default for ModelRegistry {
                 supports_tools: true,
                 supports_reasoning: true,
             },
+            // ModelScope provider models
+            ModelInfo {
+                id: "Qwen/Qwen3.5-397B-A17B".to_string(),
+                provider: ProviderKind::Modelscope,
+                aliases: vec![
+                    "qwen3.5-397b-a17b".to_string(),
+                    "modelscope-qwen3.5-397b-a17b".to_string(),
+                ],
+                supports_tools: true,
+                supports_reasoning: true,
+            },
+            ModelInfo {
+                id: "Qwen/Qwen3.5-122B-A10B".to_string(),
+                provider: ProviderKind::Modelscope,
+                aliases: vec![
+                    "qwen3.5-122b-a10b".to_string(),
+                    "modelscope-qwen3.5-122b-a10b".to_string(),
+                ],
+                supports_tools: true,
+                supports_reasoning: true,
+            },
+            ModelInfo {
+                id: "Qwen/Qwen3.5-27B".to_string(),
+                provider: ProviderKind::Modelscope,
+                aliases: vec![
+                    "qwen3.5-27b".to_string(),
+                    "modelscope-qwen3.5-27b".to_string(),
+                ],
+                supports_tools: true,
+                supports_reasoning: true,
+            },
+            ModelInfo {
+                id: "Qwen/Qwen3.5-35B-A3B".to_string(),
+                provider: ProviderKind::Modelscope,
+                aliases: vec![
+                    "qwen3.5-35b-a3b".to_string(),
+                    "modelscope-qwen3.5-35b-a3b".to_string(),
+                ],
+                supports_tools: true,
+                supports_reasoning: true,
+            },
+            ModelInfo {
+                id: "Qwen/Qwen3.8-27B".to_string(),
+                provider: ProviderKind::Modelscope,
+                aliases: vec![
+                    "qwen3.8-27b".to_string(),
+                    "modelscope-qwen3.8-27b".to_string(),
+                ],
+                supports_tools: true,
+                supports_reasoning: true,
+            },
+            ModelInfo {
+                id: "Qwen/Qwen3.8-Flash-Next".to_string(),
+                provider: ProviderKind::Modelscope,
+                aliases: vec![
+                    "qwen3.8-flash-next".to_string(),
+                    "modelscope-qwen3.8-flash-next".to_string(),
+                ],
+                supports_tools: true,
+                supports_reasoning: true,
+            },
+            ModelInfo {
+                id: "deepseek-ai/DeepSeek-V4-Pro".to_string(),
+                provider: ProviderKind::Modelscope,
+                aliases: vec![
+                    "deepseek-v4-pro".to_string(),
+                    "modelscope-deepseek-v4-pro".to_string(),
+                ],
+                supports_tools: true,
+                supports_reasoning: true,
+            },
+            ModelInfo {
+                id: "deepseek-ai/DeepSeek-V4-Pro-0813".to_string(),
+                provider: ProviderKind::Modelscope,
+                aliases: vec![
+                    "deepseek-v4-pro-0813".to_string(),
+                    "modelscope-deepseek-v4-pro-0813".to_string(),
+                ],
+                supports_tools: true,
+                supports_reasoning: true,
+            },
+            ModelInfo {
+                id: "deepseek-ai/DeepSeek-V4.1-Flash".to_string(),
+                provider: ProviderKind::Modelscope,
+                aliases: vec![
+                    "deepseek-v4.1-flash".to_string(),
+                    "modelscope-deepseek-v4.1-flash".to_string(),
+                ],
+                supports_tools: true,
+                supports_reasoning: true,
+            },
+            ModelInfo {
+                id: "ZhipuAI/GLM-4.7-Flash".to_string(),
+                provider: ProviderKind::Modelscope,
+                aliases: vec![
+                    "glm-4.7-flash".to_string(),
+                    "modelscope-glm-4.7-flash".to_string(),
+                ],
+                supports_tools: true,
+                supports_reasoning: true,
+            },
+            ModelInfo {
+                id: "ZhipuAI/GLM-5.2".to_string(),
+                provider: ProviderKind::Modelscope,
+                aliases: vec!["glm-5.2".to_string(), "modelscope-glm-5.2".to_string()],
+                supports_tools: true,
+                supports_reasoning: true,
+            },
+            // CSDN 星图 (Starmap) — the Coding Plan's dedicated model id.
+            // Other CSDN marketplace models resolve through pass-through.
+            ModelInfo {
+                id: "glm_for_coding".to_string(),
+                provider: ProviderKind::Csdn,
+                aliases: vec![
+                    "glm-for-coding".to_string(),
+                    "csdn-glm-for-coding".to_string(),
+                ],
+                supports_tools: true,
+                supports_reasoning: true,
+            },
             // Together AI provider models
             ModelInfo {
                 id: "deepseek-ai/DeepSeek-V4-Pro".to_string(),
@@ -1016,7 +1136,28 @@ impl Default for ModelRegistry {
                 provider: ProviderKind::Stepfun,
                 aliases: vec!["stepfun".to_string(), "stepflash".to_string()],
                 supports_tools: true,
-                supports_reasoning: false,
+                supports_reasoning: true,
+            },
+            ModelInfo {
+                id: "step-5-preview".to_string(),
+                provider: ProviderKind::Stepfun,
+                aliases: vec![],
+                supports_tools: true,
+                supports_reasoning: true,
+            },
+            ModelInfo {
+                id: "step-3.5-flash".to_string(),
+                provider: ProviderKind::Stepfun,
+                aliases: vec![],
+                supports_tools: true,
+                supports_reasoning: true,
+            },
+            ModelInfo {
+                id: "step-3.5-flash-2603".to_string(),
+                provider: ProviderKind::Stepfun,
+                aliases: vec![],
+                supports_tools: true,
+                supports_reasoning: true,
             },
             ModelInfo {
                 id: "MiniMax-M3".to_string(),

@@ -426,14 +426,15 @@ pub async fn update(
     network: &NetworkPolicy,
 ) -> Result<PluginUpdateResult> {
     let target = plugin_target_path(name, user_plugins_dir)?;
-    if target.exists() {
+    if tokio::fs::try_exists(&target).await.unwrap_or(false) {
         ensure_target_within_plugins_dir(&target, user_plugins_dir)?;
     }
     let marker_path = target.join(INSTALLED_FROM_MARKER);
-    if !marker_path.exists() {
+    if !tokio::fs::try_exists(&marker_path).await.unwrap_or(false) {
         return Err(PluginInstallError::NotInstalledHere(name.to_string()).into());
     }
-    let marker_body = fs::read_to_string(&marker_path)
+    let marker_body = tokio::fs::read_to_string(&marker_path)
+        .await
         .with_context(|| format!("failed to read {}", marker_path.display()))?;
     let marker: InstalledFromMarker = serde_json::from_str(&marker_body)
         .with_context(|| format!("malformed {INSTALLED_FROM_MARKER} for {name}"))?;

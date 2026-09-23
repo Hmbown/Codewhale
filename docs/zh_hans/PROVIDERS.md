@@ -6,7 +6,7 @@
 
 DeepSeek 仍是默认提供商，但 `ProviderKind::ALL` 中的每个条目都是一等公民、可选的提供商路由。`ALL` 是目录/选择器表面——每个厂商一个身份。双线协议方言种类（`*Anthropic`，例如 `deepseek-anthropic`）和 Model Studio 套餐变体保留在枚举中用于 serde 和 `provider_for_kind`，但刻意**不**作为目录行：套餐是主提供商配置（`crates/config/src/provider_kind.rs:221-226`）上的 `mode`/`base_url`，方言则是 `wire = openai|anthropic`。托管路由、通用 OpenAI 兼容端点、OpenAI Codex/ChatGPT 路由、原生 Anthropic 以及本地运行时，都在所选提供商/模型/base URL 上运行同一个终端 harness。
 
-初级设置模板（`crates/config/src/provider_templates.rs`）覆盖 OpenCode Zen、OpenCode Go、SenseNova 和 Agnes。Zen/Go 复用下方的一等路由。SenseNova 在 `https://token.sensenova.cn/v1` 上填入一个具名 OpenAI 兼容表，默认模型为 `deepseek-v4-flash`。Agnes 在本仓库中没有已发布的 URL，因此被编目为未发布，并且不会虚构主机。`/provider` 的 `P` 打开列表；`S` 仍然填入 SenseNova；`T` 探测 `/models` 并只记录可达性（2xx 并不代表模型可用）。
+经普通 Chat Completions 访问的主机是普通的具名 provider（`[providers.<name>]` 表：base URL、模型、密钥环境变量），而不是 `ProviderKind`；`/provider` 与 `/setup` 保留「粘贴 Base URL 和密钥」路径。英文版中的「已知可用主机」表列出 SenseNova、Baseten、Groq、Cerebras、Command Code 与 AICraft 的 URL 和密钥变量，仅供参考，请以各厂商文档为准。OpenCode Zen 与 OpenCode Go 是下方的一等路由。`T` 探测 `/models` 只记录可达性（2xx 并不代表模型可用）。
 
 需要保持同步的来源：
 
@@ -18,15 +18,15 @@ DeepSeek 仍是默认提供商，但 `ProviderKind::ALL` 中的每个条目都�
 
 ## 提供商选择
 
-规范的提供商 ID 是 `ProviderKind::ALL`（`crates/config/src/provider_kind.rs`）的 42 个条目，按该顺序排列：
+规范的提供商 ID 是 `ProviderKind::ALL`（`crates/config/src/provider_kind.rs`）的 44 个条目，按该顺序排列：
 
 `deepseek`, `nvidia-nim`, `openai`, `atlascloud`, `wanjie-ark`, `volcengine`,
 `openrouter`, `orcarouter`, `xiaomi-mimo`, `novita`, `fireworks`, `siliconflow`, `arcee`,
 `siliconflow-CN`, `moonshot`, `sglang`, `vllm`, `ollama`, `ollama-cloud`, `huggingface`,
 `together`, `qianfan`, `openai-codex`, `anthropic`, `openmodel`, `zai`,
 `stepfun`, `minimax`, `deepinfra`, `sakana`, `longcat`, `opencode-go`,
-`opencode-zen`, `meta`, `xai`, `mistral`, `telecomjs`, `modelstudio-token-plan`,
-`google`, `antigravity`, `edenai`, 和 `custom`。
+`opencode-zen`, `meta`, `xai`, `mistral`, `telecomjs`, `modelstudio-token-plan`, `modelscope`,
+`google`, `antigravity`, `edenai`, `zenmux`, `csdn`, 和 `custom`。
 
 `deepseek-anthropic` *不在*此列表中——它是 `deepseek` 的线协议方言，通过 `wire = "anthropic"` 访问，而不是一个可单独选择的路由。
 
@@ -75,6 +75,7 @@ DeepSeek 仍是默认提供商，但 `ProviderKind::ALL` 中的每个条目都�
 | `ollama` | `[providers.ollama]` | 本地 OpenAI 兼容 Chat Completions | `OLLAMA_API_KEY`（可选；仅用于需要认证的本地路由） |
 | `ollama-cloud` | `[providers.ollama_cloud]` | 托管 OpenAI 兼容 Chat Completions | `OLLAMA_CLOUD_API_KEY`, `OLLAMA_API_KEY` |
 | `huggingface` | `[providers.huggingface]` | OpenAI Chat Completions | `HUGGINGFACE_API_KEY`, `HF_TOKEN` |
+| `modelscope` | `[providers.modelscope]` | OpenAI Chat Completions | `MODELSCOPE_API_KEY` |
 | `together` | `[providers.together]` | OpenAI Chat Completions | `TOGETHER_API_KEY` |
 | `qianfan` | `[providers.qianfan]` | OpenAI Chat Completions | `QIANFAN_API_KEY`, `BAIDU_QIANFAN_API_KEY` |
 | `openai-codex` | `[providers.openai_codex]` | OpenAI Responses | `OPENAI_CODEX_ACCESS_TOKEN`, `CODEX_ACCESS_TOKEN` |
@@ -95,6 +96,8 @@ DeepSeek 仍是默认提供商，但 `ProviderKind::ALL` 中的每个条目都�
 | `google` | `[providers.google]` | OpenAI Chat Completions（官方 Gemini OpenAI 兼容路由；在工具调用时捕获并回放思维签名） | `GOOGLE_API_KEY`, `GEMINI_API_KEY` |
 | `antigravity` | `[providers.antigravity]` | 无——请求默认失败关闭；仅凭据导入 | `ANTIGRAVITY_API_KEY`（密钥平面）；`AGY_ADC_AUTH`（进程环境变量） |
 | `edenai` | `[providers.edenai]` | OpenAI Chat Completions | `EDENAI_API_KEY` |
+| `zenmux` | `[providers.zenmux]` | OpenAI Chat Completions | `ZENMUX_API_KEY` |
+| `csdn` | `[providers.csdn]` | OpenAI Chat Completions | `CSDN_API_KEY` |
 | `modelstudio-token-plan` | `[providers.modelstudio_token_plan]` | OpenAI Chat Completions | `MODELSTUDIO_API_KEY`, `DASHSCOPE_API_KEY` |
 | `modelstudio-token-plan-anthropic` | `[providers.modelstudio_token_plan_anthropic]` | Anthropic Messages | `MODELSTUDIO_API_KEY`, `DASHSCOPE_API_KEY` |
 | `modelstudio-coding-plan` | `[providers.modelstudio_coding_plan]` | OpenAI Chat Completions | `MODELSTUDIO_API_KEY`, `DASHSCOPE_API_KEY` |
@@ -324,6 +327,7 @@ model = "qwen3:8b"        # 默认是 deepseek-v4-flash
 | `stepfun` | [StepFun 开放平台](https://platform.stepfun.ai/) |
 | `minimax`, `minimax-anthropic` | [MiniMax 接口密钥](https://platform.minimax.io/user-center/basic-information/interface-key) |
 | `huggingface` | [Hugging Face token](https://huggingface.co/settings/tokens) |
+| `modelscope` | [ModelScope API 密钥](https://modelscope.cn/my/settings/token) |
 | `deepinfra` | [DeepInfra API 密钥](https://deepinfra.com/dash/api_keys) |
 | `together` | [Together API 密钥](https://api.together.ai/settings/api-keys) |
 | `qianfan` | [百度云访问密钥](https://console.bce.baidu.com/iam/#/iam/accesslist) |
@@ -344,6 +348,8 @@ model = "qwen3:8b"        # 默认是 deepseek-v4-flash
 | `google` | [Google AI Studio](https://aistudio.google.com/apikey) —— Codewhale 使用官方 Gemini OpenAI 兼容端点，绝不读取 Google OAuth 文件。 |
 | `antigravity` | 用官方 `agy` CLI（1.1.13）登录。在 `codewhale auth external-consent` 之后，Codewhale 可以只读地读取该登录的精确定点 `state.vscdb` 中的 OAuth token；它从不写入或刷新该文件。`ANTIGRAVITY_API_KEY` 或进程的 `AGY_ADC_AUTH` 优先于该文件。云代码线协议未实现：请求失败关闭并给出可操作的消息——Gemini 模型请使用 `google`。 |
 | `edenai` | [Eden AI API 密钥](https://app.edenai.run/settings/api-keys) |
+| `zenmux` | [ZenMux API 密钥](https://zenmux.ai/platform/pay-as-you-go) |
+| `csdn` | [CSDN 星图控制台](https://ai.csdn.net/workbench/api-key)——`glm_for_coding` 套餐路由请选择 Coding Plan 密钥类型；通用密钥按量计费。文档：[Coding Plan](https://ai.csdn.net/coding-plan)。 |
 | `modelstudio-token-plan`, `modelstudio-token-plan-anthropic`, `modelstudio-coding-plan`, `modelstudio-coding-plan-anthropic` | [阿里云百炼 Model Studio（百炼控制台）](https://bailian.console.aliyun.com/) —— 创建或复制 Model Studio API 密钥。 |
 | `custom` | 设置该具名提供商的 `base_url` 和 `api_key_env` 或 `api_key`；不存在规范的厂商凭据页面。 |
 
@@ -404,6 +410,7 @@ Kimi 仍然仅支持 API 密钥；对 Kimi 的外部授权被拒绝。
 | `ollama` | `[providers.ollama]` | 本地可选 `OLLAMA_API_KEY` | `OLLAMA_BASE_URL`；默认 `http://localhost:11434/v1` | 本地目录的实况标签；刷新前占位 `unknown`；提供商提示的自定义标签直通 | 本地 Ollama 默认无密钥。接受 `OLLAMA_MODEL`。标题栏不得绘制本机守护进程未列出的托管 id。 |
 | `ollama-cloud` | `[providers.ollama_cloud]` | `OLLAMA_CLOUD_API_KEY`, 然后是 `OLLAMA_API_KEY` | `OLLAMA_CLOUD_BASE_URL`；默认 `https://ollama.com/v1` | `gpt-oss:120b`；任意的提供商自有 ID 直通 | 托管 OpenAI 兼容 `/v1/chat/completions` 路由。在 `ollama-cloud` 下保存凭据；精确的已发布 `ollama` + Cloud URL 元组与其遗留表和秘密槽位具有有界的只读内存兼容性。接受 `OLLAMA_CLOUD_MODEL`。 |
 | `huggingface` | `[providers.huggingface]` | `HUGGINGFACE_API_KEY`, `HF_TOKEN` | `HUGGINGFACE_BASE_URL`, `HF_BASE_URL`；默认 `https://router.huggingface.co/v1` | `deepseek-ai/DeepSeek-V4-Pro`, `deepseek-ai/DeepSeek-V4-Flash` | Hugging Face Inference Providers OpenAI 兼容路由器路由。接受的别名：`huggingface`, `hugging-face`, `hugging_face`, `hf`。Org 前缀的模型 ID 直通。接受 `HUGGINGFACE_MODEL` 和 `HF_MODEL`。Hub 浏览/导出是未来的独立功能。 |
+| `modelscope` | `[providers.modelscope]` | `MODELSCOPE_API_KEY` | `MODELSCOPE_BASE_URL`；默认 `https://api-inference.modelscope.cn/v1` | `Qwen/Qwen3.5-397B-A17B`（默认）, `Qwen/Qwen3.5-122B-A10B`, `Qwen/Qwen3.5-27B`, `Qwen/Qwen3.5-35B-A3B`, `Qwen/Qwen3.8-27B`, `Qwen/Qwen3.8-Flash-Next`, `deepseek-ai/DeepSeek-V4-Pro`, `deepseek-ai/DeepSeek-V4-Pro-0813`, `deepseek-ai/DeepSeek-V4.1-Flash`, `ZhipuAI/GLM-4.7-Flash`, `ZhipuAI/GLM-5.2` | 阿里魔搭社区 OpenAI 兼容推理 API 路由。模型 ID 直通。接受 `MODELSCOPE_MODEL`。 |
 | `deepinfra` | `[providers.deepinfra]` | `DEEPINFRA_API_KEY`, `DEEPINFRA_TOKEN` | `DEEPINFRA_BASE_URL`；默认 `https://api.deepinfra.com/v1/openai` | `deepseek-ai/DeepSeek-V4-Pro`, `deepseek-ai/DeepSeek-V4-Flash` | DeepInfra OpenAI 兼容路由。OpenAI SDK 的直接替代品。 |
 | `together` | `[providers.together]` | `TOGETHER_API_KEY` | `TOGETHER_BASE_URL`；默认 `https://api.together.xyz/v1` | `deepseek-ai/DeepSeek-V4-Pro`, `deepseek-ai/DeepSeek-V4-Flash`, `thinkingmachines/inkling` | Together AI OpenAI 兼容路由。接受 `TOGETHER_MODEL`。模型别名 `deepseek-v4-pro` 和 `deepseek-v4-flash` 规范化为 Together 的 org 前缀 ID；`inkling` 和 `together-inkling` 规范化为 Together 发布的小写 Inkling 线协议 ID。Inkling 使用 Thinking Machines 的[官方模型仓库](https://huggingface.co/thinkingmachines/Inkling)中精确的 `none`/`minimal`/`low`/`medium`/`high`/`max` 推理词汇。Together 的[发布帖](https://www.together.ai/blog/together-ai-brings-thinking-machines-labs-new-model-inkling-on-day-0)目前称 Inkling 以 1M 上下文上线，而其[模型详情页](https://www.together.ai/models/inkling)称即将推出 256K 上下文且不公布价格。在 Together 活跃的 `/models` 端点和 Models.dev 目录解决该冲突之前，Inkling 不会种入 Codewhale 的离线选择器，也不会推断路由特定的上下文或成本。 |
 | `qianfan` | `[providers.qianfan]` | `QIANFAN_API_KEY`, `BAIDU_QIANFAN_API_KEY` | `QIANFAN_BASE_URL`, `BAIDU_QIANFAN_BASE_URL`；默认 `https://api.baiduqianfan.ai/v1` | `ernie-4.0-turbo-8k`；提供商范围的定制 Qianfan 服务/模型 ID 直通 | 百度千帆 OpenAI 兼容路由。请求使用 Bearer 认证和 Chat Completions 负载。接受 `QIANFAN_MODEL` 和 `BAIDU_QIANFAN_MODEL`；别名 `baidu-qianfan`, `baidu_qianfan` 和 `baidu` 解析到该提供商。千帆文档中工具/函数调用按模型范围限定，因此 Codewhale 保留所选线协议模型，把实时能力证明留给后续的路由/能力工作。 |
@@ -418,6 +425,8 @@ Kimi 仍然仅支持 API 密钥；对 Kimi 的外部授权被拒绝。
 | `telecomjs` | `[providers.telecomjs]` | `TELECOMJS_API_KEY` | `TELECOMJS_BASE_URL`；默认 `https://aigw.telecomjs.com/v1` | 保守回退 `deepseek-v4-pro`；配置密钥后认证的 `/models` 行 | TelecomJS TokenHub OpenAI 兼容 Chat Completions 路由。实时目录按提供商和密钥指纹隔离，过期的行在瞬时刷新失败时存活，不支持的推理请求字段被省略。接受 `TELECOMJS_MODEL`。提供商别名：`telecom-js`, `telecom_js`, `telecomjs-cn`, `tokenhub`。 |
 | `mistral` | `[providers.mistral]` | `MISTRAL_API_KEY` | `MISTRAL_BASE_URL`；默认 `https://api.mistral.ai/v1` | `mistral-code-latest`（默认；`codestral-latest` 接受为别名）, `mistral-medium-latest`（别名：`mistral-medium-3-5`）, `mistral-small-latest`（别名：`mistral-small-2603`）, `mistral-large-latest` | Mistral AI（la Plateforme）OpenAI 兼容 Chat 路由。在文档化的第一方 HTTPS `/v1` 主机上，Medium 和 Small 发送可调的 `reasoning_effort`（仅 `none` 或 `high`），解析 Mistral 的多态 thinking/text 块，并以相同线协议形状重放存储的思考。已废弃的原生 Magistral ID 仍是显式配置兼容路由：它们始终思考，从不接收可调 effort 字段。Code 和 Large 不推理。除非是文档化的第一方主机之一，自定义 `MISTRAL_BASE_URL` 保持通用 Chat 语义。接受 `MISTRAL_MODEL`。提供商别名：`mistral-ai`, `mistralai`, `la-plateforme`。 |
 | `edenai` | `[providers.edenai]` | `EDENAI_API_KEY` | `EDENAI_BASE_URL`；默认 `https://api.edenai.run/v3`；欧盟 `https://api.eu.edenai.run/v3` | `deepseek/deepseek-v4-pro`（默认）；`provider/model` id 的实时 `/models` 目录 | Eden AI OpenAI 兼容聚合网关。目录行保持提供商范围；通用推理控制被省略，因为受支持的字段取决于所选上游家族。接受 `EDENAI_MODEL`。默认的 `deepseek/deepseek-v4-pro` 只列在全球目录上；在欧盟端点上把 `EDENAI_MODEL`（或 `model`）设为欧盟 `/models` 列表中的一行，例如 `qwen/deepseek-v4-pro`。提供商别名：`eden-ai`, `eden_ai`。 |
+| `zenmux` | `[providers.zenmux]` | `ZENMUX_API_KEY` | `ZENMUX_BASE_URL`；默认 `https://zenmux.ai/api/v1` | `deepseek/deepseek-v4.1-flash`（默认）；`provider/model` id 的实时 `/models` 目录（免密钥可读） | ZenMux OpenAI 兼容聚合网关（约 190 个模型）。目录行保持提供商范围；通用推理控制被省略，因为受支持的字段取决于所选上游家族。接受 `ZENMUX_MODEL`。提供商别名：`zen-mux`, `zen_mux`。 |
+| `csdn` | `[providers.csdn]` | `CSDN_API_KEY` | `CSDN_BASE_URL`；默认 `https://ai.csdn.net/api/model/v1` | `glm_for_coding`（默认；Coding Plan 专用模型 id）；其他市场模型 id 直通 | CSDN 星图（Starmap）OpenAI 兼容托管平台。Coding Plan 密钥与通用市场密钥共用一个端点，因此计费取决于凭据产品而非 URL 本身：路由 `glm_for_coding`（出厂默认）或设置 `mode = "coding_plan"`/`"plan"`/`"subscription"` 按 CSDN Coding Plan 配额计费，不显示美元估算；任何其他模型或显式 `pay-as-you-go`/`metered` 模式按量计费；无法识别的模式或 `ai.csdn.net/api/model/v1` 之外的端点报告 `cost: unknown`。接受 `CSDN_MODEL`。提供商别名：`csdn-ai`, `csdn_ai`, `csdn-coding-plan`, `csdn_coding_plan`, `starmap`。 |
 | `xai` | `[providers.xai]` | `XAI_API_KEY`、Codewhale 自有的设备 OAuth，或显式的只读 Grok CLI 授权 | `XAI_BASE_URL`；默认 `https://api.x.ai/v1` | `grok-4.6`（默认）, `grok-4.5`, `grok-4.3`, `grok-build`, `grok-composer-2.5-fast`, `grok-4.20-0309-reasoning`, `grok-4.20-0309-non-reasoning` | xAI/Grok OpenAI 兼容 Chat Completions 路由。Grok 4.6 有 500K 上下文窗口、文本/图像输入、函数调用、结构化输出、服务端 web 搜索和 `low`/`medium`/`high`/`xhigh` 推理（默认 `high`）。提示达到 200K token 时其标准费率翻倍；同样的 2 倍长上下文规则适用于 `grok-4.5`（500K 上下文，$2.00 / $0.30 缓存 / $6.00）和 `grok-4.3`（1M 上下文，$1.25 / $0.20 缓存 / $2.50），按其[模型页](https://docs.x.ai/docs/models/grok-4.5)。没有文档化的 `latest`/`fast` 别名，也没有公布的数字输出上限。**API 密钥**（默认）：来自 console.x.ai 的 Bearer token，通过 `XAI_API_KEY` / keyring / `api_key`。**OAuth**：`codewhale auth xai-device` 使用 SSH 友好的设备登录和 Codewhale 自有的存储，它可能自行刷新。现有的 Grok CLI 凭据需要 `codewhale auth external-consent --provider xai --mode read-only`；被授予的外部文件从不刷新或重写。OAuth 在某些 SuperGrok 层级上可能返回 HTTP 403——把 API 密钥作为可靠回退。接受 `XAI_MODEL`。提供商别名：`x-ai`, `x_ai`, `grok`。 |
 | `modelstudio-token-plan` | `[providers.modelstudio_token_plan]` | `MODELSTUDIO_API_KEY`, `DASHSCOPE_API_KEY` | `MODELSTUDIO_TOKEN_PLAN_BASE_URL`；默认 `https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1` | `qwen3.8-max`（默认）, `qwen3.8-max-preview`, `qwen3.7-plus`, `qwen3.7-max`, `qwen3.6-flash`, `deepseek-v4-pro`, `deepseek-v4-flash-0731`, `glm-5.2` | 阿里云 Model Studio Token Plan OpenAI 兼容 Chat Completions 路由。Token Plan 个人版和团队版共享该端点。列出的所有模型都是可推理的文本/编码模型。DeepSeek 和 GLM 条目是提供商范围的，不与第一方路由冲突。接受 `MODELSTUDIO_TOKEN_PLAN_MODEL`。提供商别名：`modelstudio-token-plan`, `alibaba-token-plan`, `dashscope-token-plan`。 |
 | `modelstudio-token-plan-anthropic` | `[providers.modelstudio_token_plan_anthropic]` | `MODELSTUDIO_API_KEY`, `DASHSCOPE_API_KEY` | 默认 `https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic` | 与 `modelstudio-token-plan` 相同的模型目录 | Token Plan Anthropic 兼容 Messages 路由（`/apps/anthropic`）。与 OpenAI 方言相同的 API 密钥。提供商别名：`modelstudio-token-plan-anthropic`, `alibaba-token-plan-anthropic`。 |
@@ -517,6 +526,7 @@ OpenRouter completions 和静态注册表行包括自 2026 年 4 月起通过 Op
 | `ollama` | 实况本地标签；提供商提示为 `ollama` 时自定义标签原样通过 | 是 | 否 |
 | `ollama-cloud` | `gpt-oss:120b`；任意的提供商自有模型 ID 原样通过 | 是 | 是 |
 | `huggingface` | `deepseek-ai/DeepSeek-V4-Pro`, `deepseek-ai/DeepSeek-V4-Flash` | 是 | 否 |
+| `modelscope` | `Qwen/Qwen3.5-397B-A17B`, `Qwen/Qwen3.5-122B-A10B`, `Qwen/Qwen3.5-27B`, `Qwen/Qwen3.5-35B-A3B`, `Qwen/Qwen3.8-27B`, `Qwen/Qwen3.8-Flash-Next`, `deepseek-ai/DeepSeek-V4-Pro`, `deepseek-ai/DeepSeek-V4-Pro-0813`, `deepseek-ai/DeepSeek-V4.1-Flash`, `ZhipuAI/GLM-4.7-Flash`, `ZhipuAI/GLM-5.2` | 是 | 否 |
 | `deepinfra` | `deepseek-ai/DeepSeek-V4-Pro`, `deepseek-ai/DeepSeek-V4-Flash` | 是 | 是 |
 | `together` | `deepseek-ai/DeepSeek-V4-Pro`, `deepseek-ai/DeepSeek-V4-Flash`, `thinkingmachines/inkling` | 是 | 是 |
 | `openai-codex` | `gpt-5.5` | 是 | 是 |
@@ -651,7 +661,7 @@ DeepSeek 将于 2026-07-24 15:59 UTC 退役 `deepseek-chat` 和 `deepseek-reason
 | 配置为 `zai` 的兼容网关 | omitted；生效值不可用 | omitted；生效值不可用 | omitted；生效值不可用 |
 | `nvidia-nim` | `chat_template_kwargs.thinking: false` | `chat_template_kwargs`：`thinking: true` + `reasoning_effort: "high"` | `chat_template_kwargs`：`thinking: true` + `reasoning_effort: "max"` |
 | `vllm` | `chat_template_kwargs.enable_thinking: false` | `chat_template_kwargs.enable_thinking: true` + `reasoning_effort` low/medium/high | `chat_template_kwargs.enable_thinking: true` + `reasoning_effort: "high"`（vLLM 没有 max 层级） |
-| `arcee`, `huggingface` | omitted | `reasoning_effort` 直通 | `reasoning_effort: "high"` |
+| `arcee`, `huggingface`, `modelscope` | omitted | `reasoning_effort` 直通 | `reasoning_effort: "high"` |
 | `fireworks` | omitted | `reasoning_effort: "high"` | `reasoning_effort: "max"` |
 | `openai`, `wanjie-ark`, `telecomjs` | omitted | omitted | omitted |
 | `openmodel` | Anthropic Messages 适配器处理思考/输出配置 | Anthropic Messages 适配器处理思考/输出配置 | Anthropic Messages 适配器处理思考/输出配置 |

@@ -17,7 +17,7 @@
 #   6. The current version has either an explicit source-candidate entry or a
 #      dated Keep a Changelog release entry and a matching compare link.
 #   7. README contributor additions are mentioned in the current release entry.
-#   8. `SECURITY.md` keeps the dedicated security contact.
+#   8. `.github/SECURITY.md` keeps the dedicated security contact.
 #   9. Generated website facts carry the workspace version.
 #  10. Public install and version snippets point at the current release.
 #  11. `codewhale-app-server` stays library-only; the shipped app-server
@@ -254,12 +254,12 @@ fi
 
 # 8) Security contact guard.
 security_email="hmbown@gmail.com"
-if ! grep -qF "${security_email}" SECURITY.md; then
-  echo "::error::SECURITY.md must list ${security_email} as the security contact." >&2
+if ! grep -qF "${security_email}" .github/SECURITY.md; then
+  echo "::error::.github/SECURITY.md must list ${security_email} as the security contact." >&2
   fail=1
 fi
-if grep -qF "hmbown.dev@gmail.com" SECURITY.md; then
-  echo "::error::SECURITY.md must not use the alternate personal fallback email; use ${security_email}." >&2
+if grep -qF "hmbown.dev@gmail.com" .github/SECURITY.md; then
+  echo "::error::.github/SECURITY.md must not use the alternate personal fallback email; use ${security_email}." >&2
   fail=1
 fi
 

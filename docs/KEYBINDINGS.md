@@ -78,7 +78,10 @@ HTML clipboard content. Plain text stays literal, and configuration fields
 always paste literal text. SSH without a forwarded graphical display uses the
 terminal's text paste. Copying a whole answer preserves its original Markdown,
 without terminal wrapping or decorative rails; the destination app decides how
-to render it. Empty or oversized HTML falls back to plain text.
+to render it. Transcript drag selections copy the same way by default:
+Markdown source, whole cells joined with blank lines (see the Transcript
+section below), with `tui.selection_copy_markdown = false` restoring rendered
+text. Empty or oversized HTML falls back to plain text.
 
 Set `composer_multiline_mode = true` to swap the portable `Enter` and
 `Shift-Enter` behaviors: `Enter` inserts a newline and `Shift-Enter` sends.
@@ -178,6 +181,13 @@ transcript selection. Earlier revisions of this table documented them as
 navigation; they were never wired, and the help catalog has a test
 (`transcript_navigation_catalog_does_not_advertise_bare_typing_keys`) that
 keeps them out.
+
+Releasing a drag selection, or pressing `Ctrl-C` with one active, copies the
+intersected cells as Markdown source by default: each selected cell is
+serialized the same way `Ctrl-Y` and `/copy` serialize it, partial
+intersections round out to whole cells, cells join with blank lines, and the
+toast names the copied cell count. Set `[tui] selection_copy_markdown = false`
+to copy the rendered text as displayed instead.
 
 For terminal-native selection, hold `Shift` while dragging (terminal support
 varies), then use the terminal's own copy command: usually `Cmd-C` on macOS or

@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 
 use crate::config::ApiProvider;
 
-use super::{DeepSeekClient, api_url, responses_api_url};
+use super::{CodewhaleClient, api_url, responses_api_url};
 
 mod zai;
 
@@ -21,7 +21,7 @@ const MAX_NATIVE_ANSWER_CHARS: usize = 4_000;
 
 #[derive(Clone)]
 pub(crate) struct ProviderNativeSearchClient {
-    pub(super) inner: DeepSeekClient,
+    pub(super) inner: CodewhaleClient,
 }
 
 #[derive(Clone)]
@@ -47,7 +47,7 @@ pub(crate) struct ProviderNativeSearchResponse {
 
 impl ProviderNativeSearchClient {
     #[must_use]
-    pub(crate) fn new(inner: DeepSeekClient) -> Option<Self> {
+    pub(crate) fn new(inner: CodewhaleClient) -> Option<Self> {
         matches!(
             inner.api_provider,
             ApiProvider::Openai
@@ -110,7 +110,7 @@ impl ProviderNativeSearchClient {
         request: &ProviderNativeSearchRequest,
     ) -> Result<ProviderNativeSearchResponse> {
         // This adapter performs model-backed inference directly instead of
-        // calling `DeepSeekClient::create_message*`. It must therefore join
+        // calling `CodewhaleClient::create_message*`. It must therefore join
         // the same attached-run ownership boundary explicitly. The guard is
         // retained through response decode so a relay writer cannot start
         // while this result is still able to feed the interactive turn.
@@ -673,7 +673,7 @@ mod tests {
             runtime_thread_inference_unrelated: unrelated,
             ..Config::default()
         };
-        ProviderNativeSearchClient::new(DeepSeekClient::new(&config).expect("test xAI client"))
+        ProviderNativeSearchClient::new(CodewhaleClient::new(&config).expect("test xAI client"))
             .expect("xAI native adapter")
     }
 
@@ -943,7 +943,7 @@ mod tests {
             }),
             ..Config::default()
         };
-        let inner = DeepSeekClient::new(&config).expect("test xAI client");
+        let inner = CodewhaleClient::new(&config).expect("test xAI client");
         let client = ProviderNativeSearchClient::new(inner).expect("xAI native adapter");
         let cache_identity = client.cache_identity();
         assert!(cache_identity.contains("provider-native://xai/"));
@@ -995,7 +995,7 @@ mod tests {
             }),
             ..Config::default()
         };
-        let inner = DeepSeekClient::new(&config).expect("test ModelStudio client");
+        let inner = CodewhaleClient::new(&config).expect("test ModelStudio client");
         let client = ProviderNativeSearchClient::new(inner).expect("Qwen native adapter");
 
         let response = client.search(&request()).await.expect("native search");
@@ -1049,7 +1049,7 @@ mod tests {
             }),
             ..Config::default()
         };
-        let inner = DeepSeekClient::new(&config).expect("test DeepSeek client");
+        let inner = CodewhaleClient::new(&config).expect("test DeepSeek client");
         let client = ProviderNativeSearchClient::new(inner).expect("DeepSeek native adapter");
 
         let response = client.search(&request()).await.expect("native search");

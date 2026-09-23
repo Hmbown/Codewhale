@@ -285,18 +285,14 @@ fn apply_one(action: &DoctorFixAction) -> DoctorFixOutcome {
 /// path the MCP editor uses. A missing file or missing server is a no-op
 /// (the plan may be stale after consent).
 fn disable_mcp_server(config_path: &Path, server_name: &str) -> Result<()> {
-    let Some(cfg) = mcp::load_config(config_path).ok() else {
-        return Ok(());
-    };
-    let mut cfg = cfg;
-    let Some(server) = cfg.servers.get_mut(server_name) else {
-        return Ok(());
-    };
-    if !server.enabled {
-        return Ok(());
-    }
-    server.enabled = false;
-    mcp::save_config(config_path, &cfg)
+    mcp::mutate_config(config_path, None, |cfg| {
+        if let Some(server) = cfg.servers.get_mut(server_name) {
+            server.enabled = false;
+            server.disabled = true;
+        }
+        Ok(())
+    })
+    .map(|_| ())
 }
 
 /// Print the repair plan the way the human doctor report presents it.
@@ -568,15 +564,17 @@ mod tests {
         let raw: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&mcp_path).expect("reread"))
                 .expect("json");
-        assert_eq!(
-            raw["servers"]["broken"]["enabled"],
-            false,
-            "file: {}",
-            std::fs::read_to_string(&mcp_path).unwrap_or_default()
+        assert!(
+            raw.get("servers").is_none(),
+            "preserve the original mcpServers spelling"
         );
+        assert_eq!(raw["mcpServers"]["broken"]["enabled"], false);
+        assert_eq!(raw["mcpServers"]["broken"]["disabled"], true);
         assert_eq!(
-            raw["servers"]["healthy"]["enabled"], true,
-            "healthy entry stays enabled"
+            raw["mcpServers"]["healthy"],
+            serde_json::json!({"command":"node", "args":["server.js"]}),
+            "healthy entry remains unchanged"
         );
+        assert!(mcp::load_config(&mcp_path).unwrap().servers["healthy"].enabled);
     }
 }

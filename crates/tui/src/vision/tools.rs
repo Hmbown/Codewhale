@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use serde_json::{Value, json};
 
-use crate::client::DeepSeekClient;
+use crate::client::CodewhaleClient;
 use crate::config::ApiProvider;
 use crate::config::VisionModelConfig;
 use crate::llm_client::{LlmError, RetryConfig, sanitize_http_error_body, with_retry};
@@ -18,7 +18,7 @@ use crate::tools::spec::{
 pub struct ImageAnalyzeTool {
     config: VisionModelConfig,
     client: reqwest::Client,
-    route_client: Option<DeepSeekClient>,
+    route_client: Option<CodewhaleClient>,
 }
 
 impl ImageAnalyzeTool {
@@ -31,7 +31,7 @@ impl ImageAnalyzeTool {
     #[must_use]
     pub fn new_with_route_client(
         config: VisionModelConfig,
-        route_client: Option<DeepSeekClient>,
+        route_client: Option<CodewhaleClient>,
     ) -> Self {
         let client = crate::tls::reqwest_client_builder()
             .timeout(Duration::from_secs(120))
@@ -444,7 +444,7 @@ mod tests {
     fn vision_vendor_pin_requires_the_matching_bound_route() {
         let _lock = crate::test_support::lock_test_env();
         let base_url = "http://127.0.0.1:18080/v1";
-        let client = DeepSeekClient::new(&crate::config::Config {
+        let client = CodewhaleClient::new(&crate::config::Config {
             provider: Some("openrouter".to_string()),
             providers: Some(crate::config::ProvidersConfig {
                 openrouter: crate::config::ProviderConfig {
@@ -493,7 +493,7 @@ mod tests {
             crate::test_support::EnvVarGuard::set("CODEWHALE_MAX_OUTPUT_TOKENS", "384000");
         let base_url = "http://127.0.0.1:18080/v1".to_string();
         let model = "DeepSeek-V4-Flash".to_string();
-        let client = DeepSeekClient::new(&crate::config::Config {
+        let client = CodewhaleClient::new(&crate::config::Config {
             provider: Some("vllm".to_string()),
             providers: Some(crate::config::ProvidersConfig {
                 vllm: crate::config::ProviderConfig {

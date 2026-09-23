@@ -215,7 +215,8 @@ fn rename_recovers_first_snapshot_from_checkpoint() {
         .save_checkpoint(&checkpoint)
         .expect("save checkpoint");
     harness.app.current_session_id = Some(session_id.clone());
-    harness.app.api_messages = vec![user_message("first turn still streaming")];
+    harness.app.api_messages =
+        std::sync::Arc::new(vec![user_message("first turn still streaming")]);
 
     let result = dispatch(&mut harness.app, "rename", Some("Midturn Rename"));
 
@@ -234,7 +235,8 @@ fn rename_builds_from_app_state_before_any_checkpoint_exists() {
     let mut harness = ControlHarness::new();
     let session_id = "live-before-first-checkpoint";
     harness.app.current_session_id = Some(session_id.to_string());
-    harness.app.api_messages = vec![user_message("turn one, nothing persisted yet")];
+    harness.app.api_messages =
+        std::sync::Arc::new(vec![user_message("turn one, nothing persisted yet")]);
 
     let result = dispatch(&mut harness.app, "rename", Some("Earliest Rename"));
 
@@ -344,7 +346,8 @@ fn title_recovers_first_snapshot_from_checkpoint() {
         .save_checkpoint(&checkpoint)
         .expect("save checkpoint");
     harness.app.current_session_id = Some(session_id.clone());
-    harness.app.api_messages = vec![user_message("first turn still streaming")];
+    harness.app.api_messages =
+        std::sync::Arc::new(vec![user_message("first turn still streaming")]);
 
     let result = dispatch(&mut harness.app, "title", Some("Midturn Title"));
 
@@ -364,7 +367,8 @@ fn title_builds_from_app_state_before_any_checkpoint_exists() {
     let mut harness = ControlHarness::new();
     let session_id = "live-title-before-first-checkpoint";
     harness.app.current_session_id = Some(session_id.to_string());
-    harness.app.api_messages = vec![user_message("turn one, nothing persisted yet")];
+    harness.app.api_messages =
+        std::sync::Arc::new(vec![user_message("turn one, nothing persisted yet")]);
 
     let result = dispatch(&mut harness.app, "title", Some("Earliest Title"));
 

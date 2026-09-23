@@ -110,6 +110,12 @@ release crates listed in `scripts/release/crates.sh`. Cargo resolves unpublished
 workspace dependencies through a
 temporary local registry, builds every unpacked tarball, and checks publication
 metadata before any upload. Dry-run mode permits source edits and stops there.
+
+If a dry-run is interrupted (Ctrl-C, or a shell that gets killed), delete the
+half-packed `target/package` before re-running. Cargo resumes against it and
+every unpacked tarball then fails with `error: Current directory is invalid:
+No such file or directory (os error 2)` — which looks like a compiler or
+workspace defect and is neither (seen 2026-09-21; a clean re-run passed).
 Publish mode requires the approved release checkout and assets, then skips
 versions already on crates.io and uploads the remaining crates in dependency
 order. Resuming still verifies the complete source release; it never weakens
@@ -474,9 +480,20 @@ for that version — bump to the next patch instead.
 ### External publish gates (not code defects)
 
 - **crates.io:** publishing needs a valid `cargo login` token on the operator
-  machine (`curl -H "Authorization: <token>" https://crates.io/api/v1/me`
-  returning 200). A 403 means the token is missing/expired — `cargo login`,
-  then `./scripts/release/publish-crates.sh publish`.
+  machine. Verify it with an authenticated, read-only *client* call rather
+  than the `/api/v1/me` endpoint: crates.io answers `/api/v1/me` with
+  `403 {"errors":[{"detail":"this action can only be performed on the
+  crates.io website"}]}` even for a good token (checked 2026-09-21 with a
+  token that `cargo owner` accepts), so a 403 there proves nothing about the
+  credential.
+
+  ```bash
+  cargo owner --list codewhale-tui   # prints the owner, e.g. `Hmbown (Hunter Bown)`
+  ```
+
+  A 403 or `401` from this call, or `cargo publish` refusing credentials,
+  means the token is missing/expired — `cargo login`, then
+  `./scripts/release/publish-crates.sh publish`.
 - **npm:** the OIDC job publishes only if the npmjs.com Trusted Publisher for
   `Hmbown` / `CodeWhale` / workflow `release.yml` / blank environment is
   configured. Missing config → the `npm` job fails `E404 No match found`. Fix

@@ -20,14 +20,14 @@ Stage 4 of the loop: [cw-orient](../cw-orient/SKILL.md) →
   selection, approvals, commands, install paths.
 - Before landing a release candidate, or before claiming a runtime behavior is
   fixed.
-- Hunter asks to "install the build", "dogfood this", or "get this on my machine".
+- The user asks to "install the build", "dogfood this", or "get this on my machine".
 
 ## Workflow
 
 1. **Gate first.** Run [cw-gates](../cw-gates/SKILL.md) to the rung the change
    deserves. Never install an ungated build.
 
-2. **Build stamped.** Local builds are unstamped (`(dev)`) since #5245, and the
+2. **Build stamped.** Local builds are unstamped (`(dev)`), and the
    installer refuses an unstamped binary on purpose — the stamp is what proves
    the thing on your PATH is the thing you just built:
    ```bash
@@ -58,12 +58,8 @@ Stage 4 of the loop: [cw-orient](../cw-orient/SKILL.md) →
    The version string must contain the short HEAD SHA you just built.
 
 5. **Use the product.** Run it in a real terminal and exercise what you changed.
-   `crates/tui/AGENTS.md` is the authority on what to look at; pick the terminal
-   sizes relevant to the change from `40x12`, `60x16`, `80x24`, `100x32`,
-   `140x40`. Judge motion from repeated frames, never a single screenshot, and
-   check it against `docs/MOTION_CONTRACT.md`. Remove inherited `NO_COLOR`,
-   `TERM=dumb`, and tmux motion overrides when they would invalidate what you
-   are looking at.
+   `crates/tui/AGENTS.md` owns sizes, motion evidence, and environment caveats;
+   judge motion against `docs/MOTION_CONTRACT.md`.
 
    Scenarios worth exercising when they are in scope:
    - **Liveness under fanout** — spawn several workers; typing, render, cancel,

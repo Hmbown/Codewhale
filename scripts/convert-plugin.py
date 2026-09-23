@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Convert selected OpenCode/DSH data into a reviewable native plugin bundle.
+"""Convert selected OpenCode/DSH data — or a dsh bundle package — into a reviewable native plugin bundle.
 
 This is an offline authoring tool, not a foreign plugin runtime or installer.
 The existing Codewhale /plugin install and hash-bound review remain authoritative.
@@ -29,6 +29,10 @@ class ConversionError(ValueError):
     pass
 
 
+class JsExpr(str):
+    """An unevaluated dsh `!!js` scalar captured for structural lowering; it is never executed."""
+
+
 def require(condition, message):
     if not condition:
         raise ConversionError(message)
@@ -56,7 +60,14 @@ class DataLoader(yaml.SafeLoader):
                             for k, v in node.value)
 
 
-def data(text, *, json_only=False):
+def js_scalar(loader, node):
+    return JsExpr(loader.construct_scalar(node))
+
+
+DataLoader.add_constructor("tag:yaml.org,2002:js", js_scalar)
+
+
+def data(text, *, json_only=False, allow_js=False):
     """Closed data parsing: no YAML aliases/tags, duplicate keys or JS expressions."""
     try:
         if json_only:
@@ -65,40 +76,48 @@ def data(text, *, json_only=False):
         else:
             depth = 0
             for event in yaml.parse(text):
-                require(not isinstance(event, yaml.AliasEvent) and not getattr(event, "tag", None),
-                        "YAML aliases and explicit tags (including !!js) are unsupported.")
+                tag = getattr(event, "tag", None)
+                if isinstance(event, yaml.AliasEvent):
+                    raise ConversionError("YAML aliases are unsupported.")
+                if tag is not None and not (allow_js and isinstance(event, yaml.ScalarEvent)
+                                            and tag == "tag:yaml.org,2002:js"):
+                    raise ConversionError("YAML aliases and explicit tags (including !!js) are unsupported.")
                 if isinstance(event, (yaml.MappingStartEvent, yaml.SequenceStartEvent)):
                     depth += 1
                     require(depth <= 32, "Configuration nesting exceeds 32 levels.")
                 elif isinstance(event, (yaml.MappingEndEvent, yaml.SequenceEndEvent)):
                     depth -= 1
             value = yaml.load(text, Loader=DataLoader)
-        check_data(value)
+        check_data(value, allow_js=allow_js)
         return value
     except (yaml.YAMLError, json.JSONDecodeError, RecursionError, TypeError):
         # Parser errors can contain source lines and credentials. Do not echo them.
         raise ConversionError("Cannot parse portable data; use JSON for OpenCode or plain YAML/JSON for DSH.") from None
 
 
-def check_data(value, depth=0):
+def check_data(value, depth=0, allow_js=False):
     require(depth <= 32, "Configuration nesting exceeds 32 levels.")
     if isinstance(value, dict):
         mapping(value)
         require("__jsExpr" not in value, "DSH executable expressions require a manual port.")
         for child in value.values():
-            check_data(child, depth + 1)
+            check_data(child, depth + 1, allow_js)
     elif isinstance(value, list):
         for child in value:
-            check_data(child, depth + 1)
+            check_data(child, depth + 1, allow_js)
     else:
-        require(value is None or type(value) in (str, int, float, bool), "Unsupported data type.")
+        require(value is None or type(value) in (str, int, float, bool)
+                or (allow_js and isinstance(value, JsExpr)), "Unsupported data type.")
 
 
 def plain_path(path):
     """Reject links/reparse points in the supplied path, including ancestors."""
     path = Path(os.path.abspath(path))
     for entry in (path, *path.parents):
-        info = entry.lstat()
+        try:
+            info = entry.lstat()
+        except FileNotFoundError:
+            continue
         require(not stat.S_ISLNK(info.st_mode)
                 and not (getattr(info, "st_file_attributes", 0) & 0x400),
                 "Source and output paths must not contain links or reparse points.")
@@ -372,20 +391,260 @@ def mcp_config(path, dialect, stdio_roots=None):
     return result, sorted(hosts), ignored
 
 
+DSH_MCP_CLIENT = "@deepseek-ai/dsh-mcp-client"
+DSH_SKILL_FILESYSTEM = "@deepseek-ai/dsh-skill-filesystem"
+DSH_ENTRY = re.compile(r"(?:\./)?[A-Za-z0-9_][A-Za-z0-9_./-]*\.(?:mjs|js|cjs)")
+DSH_ENV_NAME = r"[A-Za-z_][A-Za-z0-9_]*"
+
+
+def js_literal(text, label):
+    """Resolve a quoted string or template literal inside a `!!js` idiom; env references
+    resolve from this machine because a bundle cannot name the original author's value."""
+    text = text.strip()
+    if len(text) >= 2 and text[0] in "\"'" and text[-1] == text[0] and text[0] not in text[1:-1]:
+        return text[1:-1]
+    if text.startswith("`") and text.endswith("`") and len(text) >= 2:
+        body = text[1:-1]
+        resolved = re.sub(r"\$\{\s*process\.env\.(" + DSH_ENV_NAME + r")\s*\}",
+                          lambda match: os.environ.get(match[1], ""), body)
+        missing = [name for name in re.findall(r"\$\{\s*process\.env\.(" + DSH_ENV_NAME + r")\s*\}", body)
+                   if name not in os.environ]
+        if missing:
+            raise ConversionError(f"{label} references unset environment variable {missing[0]}.")
+        require("${" not in resolved, f"{label} interpolates an expression with no portable lowering.")
+        return resolved
+    raise ConversionError(f"{label} is not a quoted or template literal; author the value explicitly.")
+
+
+def lower_js(value, label):
+    """Lower the documented `!!js` idioms to a literal string; every other expression refuses."""
+    text = str(value).strip()
+    if text == "process.execPath":
+        return "node"
+    match = re.fullmatch(r"process\.env\.(" + DSH_ENV_NAME + r")", text)
+    if match:
+        resolved = os.environ.get(match[1])
+        require(resolved is not None, f"{label} references environment variable {match[1]}, which is not set here.")
+        return resolved
+    match = re.fullmatch(r"process\.env\.(" + DSH_ENV_NAME + r")\s*\|\|\s*(.+)", text, re.DOTALL)
+    if match:
+        resolved = os.environ.get(match[1])
+        if resolved is not None:
+            return resolved
+        return js_literal(match[2], f"{label} fallback")
+    if text.startswith("`"):
+        return js_literal(text, label)
+    raise ConversionError(f"{label} uses a `!!js` expression with no portable lowering; author the value explicitly.")
+
+
+def free_of_js(value):
+    """True when no unevaluated `!!js` scalar survives inside the value."""
+    if isinstance(value, JsExpr):
+        return False
+    if isinstance(value, dict):
+        return all(free_of_js(child) for child in value.values())
+    if isinstance(value, list):
+        return all(free_of_js(child) for child in value)
+    return True
+
+
+def evaluate_patches(patches, notes):
+    """Apply a dsh bundle patch list over an empty entry list (applyEntryPatches parity):
+    `insert` appends rows or appends into a group entry's config, keyed overrides
+    replace fields on an earlier inserted row. Skipped patches are recorded, never fatal."""
+    entries, index = [], {}
+    def build_map(rows):
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            identifier = row.get("id")
+            if isinstance(identifier, str):
+                index[identifier] = row
+            config = row.get("config")
+            if row.get("group") is True and isinstance(config, list):
+                build_map(config)
+    for order, patch in enumerate(patches):
+        require(isinstance(patch, dict), "Each dsh patch must be an object.")
+        insert, identifier = patch.get("insert"), patch.get("id")
+        if insert is not None:
+            require(isinstance(insert, list) and all(isinstance(row, dict) for row in insert),
+                    "A dsh patch `insert` must be a list of entries.")
+            if identifier is None:
+                entries.extend(insert)
+            else:
+                target = index.get(identifier)
+                if target is None or target.get("group") is not True:
+                    notes.append(f"patch {order + 1}: insert target `{identifier}` is missing or not a group; skipped")
+                    continue
+                if not isinstance(target.get("config"), list):
+                    target["config"] = []
+                target["config"].extend(insert)
+            build_map(insert)
+            continue
+        if not isinstance(identifier, str):
+            notes.append(f"patch {order + 1}: non-insert patch without an `id`; skipped")
+            continue
+        target = index.get(identifier)
+        if target is None:
+            notes.append(f"patch {order + 1}: entry `{identifier}` was not inserted by an earlier layer; skipped")
+            continue
+        name = patch.get("name")
+        if name is not None and name != target.get("name"):
+            notes.append(f"patch {order + 1}: `name` does not match entry `{identifier}`; skipped")
+            continue
+        for key, value in patch.items():
+            if key not in ("id", "name"):
+                target[key] = value
+    return entries
+
+
+def load_dsh_bundle(path):
+    """Read a dsh bundle package directory: package.json → dsh.bundle.patch → evaluated rows."""
+    bundle = plain_path(path)
+    require(bundle.is_dir(), "Select a dsh bundle package directory (a directory containing package.json).")
+    manifest = data(text_file(bundle / "package.json"), json_only=True)
+    mapping(manifest)
+    dsh = manifest.get("dsh")
+    require(isinstance(dsh, dict) and isinstance(dsh.get("bundle"), dict),
+            "Not a dsh bundle package: package.json lacks `dsh.bundle.patch`.")
+    notes = []
+    if dsh.get("client") is not None:
+        notes.append("package declares `dsh.client`; the client UI half has no Codewhale equivalent and was not converted")
+    patch_rel = dsh["bundle"].get("patch")
+    require(isinstance(patch_rel, str) and bool(patch_rel), "`dsh.bundle.patch` must name a patch file.")
+    patch_path = plain_path(bundle / patch_rel)
+    require(patch_path.is_relative_to(bundle) and patch_path.is_file(),
+            "`dsh.bundle.patch` must resolve to a file inside the bundle directory.")
+    patches = data(text_file(patch_path), allow_js=True)
+    require(isinstance(patches, list), "A dsh bundle patch must be a patch list.")
+    return manifest, evaluate_patches(patches, notes), notes
+
+
+def dsh_bundle_components(entries, bundle, explicit_roots):
+    """Convert evaluated dsh entries into Codewhale servers + skill sources.
+    Unconvertible rows are recorded as skipped diagnostics, never silently dropped."""
+    servers, hosts, notes = {}, [], []
+    implicit_roots = {}
+    skill_dirs = []
+
+    def label(row):
+        identifier = row.get("id")
+        return f"`{identifier}`" if isinstance(identifier, str) else "an unlabeled row"
+
+    def mcp_row(row):
+        config = mapping(row.get("config"))
+        name = config.get("serverName")
+        require(isinstance(name, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,31}", name),
+                "dsh-mcp-client config needs a literal `serverName` of 1–32 letters/digits/_/-")
+        require(name not in servers, f"Duplicate MCP server name `{name}`; nothing was written for it.")
+        disabled = row.get("disabled", False)
+        require(type(disabled) is bool, "`disabled` must be a boolean; conditional rows need a manual port")
+        for field in ("command", "cwd", "url", "serverName"):
+            if isinstance(config.get(field), JsExpr):
+                config[field] = lower_js(config[field], f"`{field}` in `{name}`")
+        if isinstance(config.get("args"), list):
+            config["args"] = [lower_js(item, f"`args` in `{name}`") if isinstance(item, JsExpr) else item
+                              for item in config["args"]]
+        arguments = config.get("args") or []
+        root = explicit_roots.get(name)
+        if config.get("transport") == "stdio" and root is None and isinstance(arguments, list) and len(arguments) == 1:
+            arg = arguments[0]
+            if isinstance(arg, str) and not DSH_ENTRY.fullmatch(arg):
+                candidate = Path(arg)
+                if candidate.is_absolute():
+                    resolved = plain_path(candidate)
+                    require(resolved.is_file(), f"`args` in `{name}` resolves to a host path that does not exist here")
+                    require(DSH_ENTRY.fullmatch(resolved.name) is not None,
+                            f"`args` in `{name}` resolves to a file that is not a .mjs/.js/.cjs entry")
+                    implicit_roots[name] = resolved.parent
+                    config["args"] = [resolved.name]
+                    notes.append(f"`{name}`: `!!js`/`args` resolved to host path; copied {resolved.parent} as its source root")
+                    root = resolved.parent
+            elif isinstance(arg, str) and ".." not in arg.split("/"):
+                candidate = bundle / arg
+                cwd = config.get("cwd", "")
+                if candidate.is_file():
+                    implicit_roots[name] = bundle
+                    root = bundle
+                elif (isinstance(cwd, str) and cwd not in ("", ".") and ".." not in Path(cwd).parts
+                      and not Path(cwd).is_absolute() and (bundle / cwd / arg).is_file()):
+                    implicit_roots[name] = bundle / cwd
+                    root = bundle / cwd
+                    config["cwd"] = "."
+        require(free_of_js(config), f"an unevaluated `!!js` remains in `{name}`; author that field explicitly")
+        local = config.get("transport") == "stdio"
+        if local:
+            converted = stdio_server(config, "dsh", {}, name, root or implicit_roots.get(name))
+        else:
+            converted, host = remote_server(config, "dsh", {})
+            hosts.append(host)
+        if disabled:
+            converted["extensions"]["net.codewhale"]["disabled"] = True
+        servers[name] = converted
+
+    def walk(rows):
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            config = row.get("config")
+            if row.get("group") is True and isinstance(config, list):
+                walk(config)
+                continue
+            name = row.get("name")
+            if isinstance(row.get("disabled"), JsExpr):
+                notes.append(f"{label(row)} skipped: `disabled` is a `!!js` expression that cannot be evaluated offline")
+                continue
+            if name == DSH_MCP_CLIENT:
+                try:
+                    mcp_row(row)
+                except ConversionError as reason:
+                    notes.append(f"{label(row)} skipped: {reason}")
+            elif name == DSH_SKILL_FILESYSTEM:
+                dirs = config.get("customSkillDirs") if isinstance(config, dict) else None
+                if not isinstance(dirs, list) or not dirs:
+                    notes.append(f"{label(row)} skipped: skill row has no `customSkillDirs` to import")
+                    continue
+                for entry in dirs:
+                    if isinstance(entry, JsExpr) or not isinstance(entry, str):
+                        notes.append(f"{label(row)}: a `customSkillDirs` entry is not a literal path; skipped")
+                        continue
+                    candidate = Path(entry)
+                    if candidate.is_absolute() or ".." in candidate.parts:
+                        notes.append(f"{label(row)}: `customSkillDirs` entry `{entry}` is outside the bundle; "
+                                     "pass it explicitly with --skill")
+                        continue
+                    resolved = bundle / entry
+                    if not resolved.is_dir():
+                        notes.append(f"{label(row)}: `customSkillDirs` entry `{entry}` does not exist in the bundle; skipped")
+                        continue
+                    skill_dirs.append(resolved)
+            else:
+                shown = name if isinstance(name, str) else "unlabeled"
+                notes.append(f"{label(row)} ({shown}) skipped: only dsh-mcp-client and dsh-skill-filesystem rows convert")
+
+    walk(entries)
+    skills = []
+    for directory in skill_dirs:
+        for child in sorted(directory.iterdir()):
+            if child.name.startswith("."):
+                continue
+            if (child / "SKILL.md").is_file() or child.suffix == ".md":
+                skills.append(child)
+    return servers, hosts, skills, implicit_roots, notes
+
+
 def convert(args):
     require(NAME.fullmatch(args.name) is not None and ".." not in args.name and "--" not in args.name,
             "Choose a native plugin name: 1–64 lowercase letters/digits with single internal dots or hyphens.")
+    bundle_arg = getattr(args, "bundle", None)
+    require(bundle_arg is None or args.format == "dsh", "--bundle reads a DeepSeek Harness bundle package; use --format dsh.")
+    require(not (bundle_arg is not None and args.config), "Select --bundle or --config, not both.")
     output = Path(os.path.abspath(args.output))
     plain_path(output.parent)
     require(not os.path.lexists(output), "Output already exists; choose a fresh directory. Nothing was overwritten.")
-    files, skill_names = {}, set()
-    for path in args.skill:
-        source = plain_path(path)
-        require(source != output and source not in output.parents, "Output must be outside the selected skill.")
-        name, additions = skill_files(source, MAX_FILES - len(files), MAX_BYTES - sum(map(len, files.values())))
-        require(name not in skill_names, "Duplicate skill name; no files were written.")
-        skill_names.add(name)
-        files.update(additions)
+    files, skill_names, notes = {}, set(), []
+    skill_sources = [plain_path(path) for path in args.skill]
+    servers, hosts, ignored = {}, [], 0
     roots = {}
     for specification in getattr(args, "stdio_root", []):
         name, separator, directory = specification.partition("=")
@@ -394,15 +653,42 @@ def convert(args):
         require(source.is_dir(), "The selected stdio root must be a directory.")
         require(source != output and source not in output.parents, "Output must be outside the selected MCP source.")
         roots[name] = source
-    require(not roots or args.config, "--stdio-root requires a selected MCP configuration.")
-    servers, hosts, ignored = mcp_config(args.config, args.format, roots) if args.config else ({}, [], 0)
+    bundle_manifest = None
+    if bundle_arg is not None:
+        bundle_manifest, entries, bundle_notes = load_dsh_bundle(bundle_arg)
+        notes += bundle_notes
+        bundle = plain_path(bundle_arg)
+        require(bundle != output and bundle not in output.parents, "Output must be outside the selected bundle.")
+        servers, hosts, bundled_skills, implicit_roots, row_notes = dsh_bundle_components(entries, bundle, roots)
+        notes += row_notes
+        skill_sources += bundled_skills
+        implicit_roots.update(roots)
+        explicit_names = set(roots)
+        roots = implicit_roots
+        require(explicit_names <= set(servers), "Every --stdio-root must name a selected local MCP server.")
+    else:
+        require(not roots or args.config, "--stdio-root requires a selected MCP configuration.")
+        servers, hosts, ignored = mcp_config(args.config, args.format, roots) if args.config else ({}, [], 0)
+    for source in skill_sources:
+        require(source != output and source not in output.parents, "Output must be outside the selected skill.")
+        name, additions = skill_files(source, MAX_FILES - len(files), MAX_BYTES - sum(map(len, files.values())))
+        require(name not in skill_names, "Duplicate skill name; no files were written.")
+        skill_names.add(name)
+        files.update(additions)
     for name, source in roots.items():
         files.update(stdio_files(source, name, MAX_FILES - len(files), MAX_BYTES - sum(map(len, files.values()))))
-    require(files or servers, "No portable components selected. Use --skill and/or --config.")
+    require(files or servers, "No portable components selected. Use --skill, --config or --bundle.")
     manifest = {"$schema": "https://agent-plugins.org/schemas/plugin.json", "name": args.name}
+    if bundle_manifest is not None:
+        for field in ("version", "description"):
+            value = bundle_manifest.get(field)
+            if isinstance(value, str) and value.strip():
+                manifest[field] = value
+        notes.insert(0, f"source package: {bundle_manifest.get('name', 'unnamed')}"
+                        + (f"@{bundle_manifest['version']}" if isinstance(bundle_manifest.get('version'), str) else ""))
     extension = {}
     if hosts:
-        extension["capabilities"] = {"network_hosts": hosts}
+        extension["capabilities"] = {"network_hosts": sorted(set(hosts))}
     if roots:
         extension["when"] = {"binaries": ["node"]}
     if extension:
@@ -410,9 +696,11 @@ def convert(args):
     files["plugin.json"] = (json.dumps(manifest, indent=2) + "\n").encode()
     if servers:
         files["mcp.json"] = (json.dumps({"mcpServers": servers}, indent=2) + "\n").encode()
+    notes_text = ("Bundle diagnostics:\n" + "\n".join(f"- {note}" for note in notes) + "\n\n") if notes else ""
     files["CONVERSION.md"] = (f"# Conversion receipt\n\nSource dialect: {args.format}.\n"
         f"Converted {len(skill_names)} selected Skills, {len(servers) - len(roots)} remote and {len(roots)} local MCP declarations.\n"
         f"Ignored {ignored} unrelated top-level application settings.\n\n"
+        + notes_text +
         "No source code, package manager, install hook, network request or credential lookup ran.\n"
         "Companion skill files were copied as data; review them before loading a skill.\n"
         "Selected Node source, dependencies and resources were copied as data into mcp/<server>.\n"
@@ -452,6 +740,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--format", choices=("opencode-v1", "opencode-v2", "dsh"), required=True)
     parser.add_argument("--config", type=Path, help="OpenCode JSON or static DSH Cordis YAML/JSON (optional)")
+    parser.add_argument("--bundle", type=Path,
+                        help="dsh bundle package directory (package.json with dsh.bundle.patch); evaluates the patch layer")
     parser.add_argument("--skill", type=Path, action="append", default=[], help="Explicit skill directory or Markdown file; repeatable")
     parser.add_argument("--stdio-root", action="append", default=[], metavar="SERVER=DIRECTORY",
                         help="Explicit packaged Node MCP working directory; repeat for each selected local server")

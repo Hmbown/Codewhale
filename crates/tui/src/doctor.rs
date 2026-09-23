@@ -552,7 +552,7 @@ pub(crate) fn is_keyless_ds4_route(config: &crate::config::Config) -> bool {
         .provider
         .as_deref()
         .is_some_and(|provider| provider.eq_ignore_ascii_case("ds4"))
-        && crate::config::base_url_uses_local_host(&config.deepseek_base_url())
+        && crate::config::base_url_uses_local_host(&config.active_route_base_url())
         && crate::config::auth_mode_disables_api_key(
             config
                 .auth_mode_for_provider(config.api_provider())
@@ -563,11 +563,11 @@ pub(crate) fn is_keyless_ds4_route(config: &crate::config::Config) -> bool {
 /// Probe DS4 through its cheap `/v1/models` contract instead of waking the
 /// model for a completion. The selected model must be advertised.
 pub(crate) async fn probe_ds4_models(config: &crate::config::Config) -> anyhow::Result<()> {
-    use crate::client::DeepSeekClient;
+    use crate::client::CodewhaleClient;
     use crate::core::model_client::ModelClient;
 
-    let endpoint = crate::client::redact_url_for_display(&config.deepseek_base_url());
-    let client = DeepSeekClient::new(config)?;
+    let endpoint = crate::client::redact_url_for_display(&config.active_route_base_url());
+    let client = CodewhaleClient::new(config)?;
     let configured_alias = client.model().to_string();
     let models = match tokio::time::timeout(
         std::time::Duration::from_secs(15),
@@ -603,7 +603,7 @@ pub(crate) async fn probe_ds4_models(config: &crate::config::Config) -> anyhow::
 }
 
 fn ds4_probe_error(config: &crate::config::Config, error: &str) -> String {
-    let endpoint = crate::client::redact_url_for_display(&config.deepseek_base_url());
+    let endpoint = crate::client::redact_url_for_display(&config.active_route_base_url());
     let status = error
         .split_whitespace()
         .collect::<Vec<_>>()

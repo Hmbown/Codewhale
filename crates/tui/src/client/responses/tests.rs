@@ -113,7 +113,7 @@ async fn responses_stream_retries_rate_limited_request() {
         let _codex_token =
             crate::test_support::EnvVarGuard::set("OPENAI_CODEX_ACCESS_TOKEN", "test-token");
         let _legacy_codex_token = crate::test_support::EnvVarGuard::remove("CODEX_ACCESS_TOKEN");
-        DeepSeekClient::new(&test_codex_config(&server)).unwrap()
+        CodewhaleClient::new(&test_codex_config(&server)).unwrap()
     };
     let mut request = minimal_responses_request();
     request.max_tokens = 384_000;
@@ -168,7 +168,7 @@ async fn responses_stream_retries_transient_server_error() {
         let _codex_token =
             crate::test_support::EnvVarGuard::set("OPENAI_CODEX_ACCESS_TOKEN", "test-token");
         let _legacy_codex_token = crate::test_support::EnvVarGuard::remove("CODEX_ACCESS_TOKEN");
-        DeepSeekClient::new(&test_codex_config(&server)).unwrap()
+        CodewhaleClient::new(&test_codex_config(&server)).unwrap()
     };
     let mut stream = client
         .handle_responses_stream(
@@ -209,7 +209,7 @@ async fn responses_stream_retries_upstream_499_before_streaming() {
         let _codex_token =
             crate::test_support::EnvVarGuard::set("OPENAI_CODEX_ACCESS_TOKEN", "test-token");
         let _legacy_codex_token = crate::test_support::EnvVarGuard::remove("CODEX_ACCESS_TOKEN");
-        DeepSeekClient::new(&test_codex_config(&server)).unwrap()
+        CodewhaleClient::new(&test_codex_config(&server)).unwrap()
     };
     let mut stream = client
         .handle_responses_stream(
@@ -253,7 +253,7 @@ async fn responses_stream_finishes_on_semantic_terminal_event_without_done_marke
         let _codex_token =
             crate::test_support::EnvVarGuard::set("OPENAI_CODEX_ACCESS_TOKEN", "test-token");
         let _legacy_codex_token = crate::test_support::EnvVarGuard::remove("CODEX_ACCESS_TOKEN");
-        DeepSeekClient::new(&test_codex_config(&server)).unwrap()
+        CodewhaleClient::new(&test_codex_config(&server)).unwrap()
     };
     let mut stream = client
         .handle_responses_stream(
@@ -301,7 +301,7 @@ async fn responses_stream_surfaces_notice_for_web_search_call_items() {
         let _codex_token =
             crate::test_support::EnvVarGuard::set("OPENAI_CODEX_ACCESS_TOKEN", "test-token");
         let _legacy_codex_token = crate::test_support::EnvVarGuard::remove("CODEX_ACCESS_TOKEN");
-        DeepSeekClient::new(&test_codex_config(&server)).unwrap()
+        CodewhaleClient::new(&test_codex_config(&server)).unwrap()
     };
     let mut stream = client
         .handle_responses_stream(
@@ -349,7 +349,7 @@ async fn responses_stream_fails_fast_on_non_retryable_provider_error() {
         let _codex_token =
             crate::test_support::EnvVarGuard::set("OPENAI_CODEX_ACCESS_TOKEN", "test-token");
         let _legacy_codex_token = crate::test_support::EnvVarGuard::remove("CODEX_ACCESS_TOKEN");
-        DeepSeekClient::new(&test_codex_config(&server)).unwrap()
+        CodewhaleClient::new(&test_codex_config(&server)).unwrap()
     };
 
     let err = match client
@@ -388,8 +388,8 @@ async fn responses_stream_fails_fast_on_non_retryable_provider_error() {
 fn responses_body_serializes_the_child_catalog_without_duplication() {
     // Mirror of the Anthropic contract: the real child catalog fixture
     // maps 1:1 into Responses function tools with one canonical `read` entry.
-    // Skills are discoverable through tool_search, so the child wire catalog
-    // carries no load_skill at all.
+    // `load_skill` is eager in DEFAULT_ACTIVE_NATIVE_TOOLS and children resolve
+    // the same catalog authority, so it maps through exactly once too.
     let tools = crate::tools::subagent::kimi_general_child_request_tools_fixture();
     let mut request = minimal_responses_request();
     request.tools = Some(tools);
@@ -411,9 +411,13 @@ fn responses_body_serializes_the_child_catalog_without_duplication() {
         "read keeps a valid parameters schema: {}",
         reads[0]
     );
-    assert!(
-        serialized.iter().all(|tool| tool["name"] != "load_skill"),
-        "load_skill must not appear on the child Responses wire"
+    assert_eq!(
+        serialized
+            .iter()
+            .filter(|tool| tool["name"] == "load_skill")
+            .count(),
+        1,
+        "exactly one canonical load_skill definition reaches the Responses wire"
     );
 }
 
@@ -446,7 +450,7 @@ async fn responses_stream_open_preserves_wire_headers_through_shared_seam() {
         let _codex_token =
             crate::test_support::EnvVarGuard::set("OPENAI_CODEX_ACCESS_TOKEN", "test-token");
         let _legacy_codex_token = crate::test_support::EnvVarGuard::remove("CODEX_ACCESS_TOKEN");
-        DeepSeekClient::new(&test_codex_config(&server)).unwrap()
+        CodewhaleClient::new(&test_codex_config(&server)).unwrap()
     };
     let mut stream = client
         .handle_responses_stream(
@@ -493,7 +497,7 @@ async fn responses_stream_inserts_boundary_between_reasoning_summary_parts() {
         let _codex_token =
             crate::test_support::EnvVarGuard::set("OPENAI_CODEX_ACCESS_TOKEN", "test-token");
         let _legacy_codex_token = crate::test_support::EnvVarGuard::remove("CODEX_ACCESS_TOKEN");
-        DeepSeekClient::new(&test_codex_config(&server)).unwrap()
+        CodewhaleClient::new(&test_codex_config(&server)).unwrap()
     };
     let mut stream = client
         .handle_responses_stream(
@@ -559,7 +563,7 @@ async fn codex_selected_effort_reaches_preview_wire_and_restored_receipt_unchang
         let _token =
             crate::test_support::EnvVarGuard::set("OPENAI_CODEX_ACCESS_TOKEN", "test-token");
         let _legacy = crate::test_support::EnvVarGuard::remove("CODEX_ACCESS_TOKEN");
-        DeepSeekClient::new(&test_codex_config(&server)).unwrap()
+        CodewhaleClient::new(&test_codex_config(&server)).unwrap()
     };
     let receipts = tempfile::tempdir().unwrap();
     for effort in ["low", "medium", "high", "xhigh", "max", "ultra"] {
@@ -745,7 +749,7 @@ fn deepseek_flash_responses_body_uses_stateless_0731_contract() {
         "{}",
         body["top_p"]
     );
-    assert_eq!(body.pointer("/reasoning/effort"), Some(&json!("max")));
+    assert_eq!(body.pointer("/reasoning/effort"), Some(&json!("high")));
     assert!(body.pointer("/reasoning/summary").is_none());
     assert!(body.get("include").is_none());
     assert!(body.get("store").is_none());
@@ -860,7 +864,7 @@ async fn codex_stream_captures_encrypted_reasoning_as_opaque_state() {
         let _codex_token =
             crate::test_support::EnvVarGuard::set("OPENAI_CODEX_ACCESS_TOKEN", "test-token");
         let _legacy_codex_token = crate::test_support::EnvVarGuard::remove("CODEX_ACCESS_TOKEN");
-        DeepSeekClient::new(&test_codex_config(&server)).unwrap()
+        CodewhaleClient::new(&test_codex_config(&server)).unwrap()
     };
     let mut stream = client
         .handle_responses_stream(
@@ -894,7 +898,7 @@ fn deepseek_responses_reasoning_effort_uses_documented_labels() {
     assert_eq!(responses_reasoning_effort("low", true), Some("low"));
     assert_eq!(responses_reasoning_effort("medium", true), Some("high"));
     assert_eq!(responses_reasoning_effort("high", true), Some("high"));
-    assert_eq!(responses_reasoning_effort("xhigh", true), Some("max"));
+    assert_eq!(responses_reasoning_effort("xhigh", true), Some("high"));
     assert_eq!(responses_reasoning_effort("max", true), Some("max"));
     // The off tier must disable thinking on the wire, not collapse into
     // low: DeepSeek documents `reasoning.effort: "none"` as the off value.

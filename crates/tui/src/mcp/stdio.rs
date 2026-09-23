@@ -312,6 +312,17 @@ impl McpTransport for StdioTransport {
         Ok(())
     }
 
+    /// Non-blocking liveness probe: a reaped child means the transport is
+    /// dead even though the `Ready` flag is still set (#6187). The sync
+    /// trait contract forbids awaiting the lock, so a contended lock reads
+    /// as alive — the read side observes the death on the next call.
+    fn probe_dead(&self) -> bool {
+        match self.child.try_lock() {
+            Ok(mut child) => matches!(child.try_wait(), Ok(Some(_))),
+            Err(_) => false,
+        }
+    }
+
     async fn recv(&mut self) -> Result<Vec<u8>> {
         loop {
             // Bounded read: a server emitting a newline-free multi-GB "line"

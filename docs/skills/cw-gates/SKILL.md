@@ -92,9 +92,9 @@ cargo test --workspace --all-features --locked --doc
 git diff --exit-code -- Cargo.lock                 # lockfile drift guard
 ```
 
-`--all-targets` matters: without it, clippy never lints test code, and the
-v0.9.10 release gate opened with four clippy failures on a green `main`, three
-of them in test targets.
+`--all-targets` matters: without it, clippy never lints test code. (CI runs
+the all-targets form since the v0.9.10 gate incident; run the same form
+locally so there is no weaker subset.)
 
 ### Rung 5 — website, when `web/` changed
 
@@ -110,8 +110,8 @@ cd web && npm ci && npm test && npm run check
   been mistaken for a pass here.
 - Prefer proving a regression test fails without the fix. A test that passes
   either way pins the implementation, not the defect.
-- Audit any harness before trusting its score. `ok = ok and X or True` parses as
-  `(ok and X) or True` and once reported twelve unevaluated rows as passing.
+- Audit any hand-rolled scorer before trusting its score: quote the counts it
+  actually evaluated, not the verdict line alone.
 - A focused rerun of a failing test distinguishes flake from regression in
   seconds. Do that before calling anything a flake, and root-cause anything that
   fails outside a known-flaky name — check for unisolated config-path reads or

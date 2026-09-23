@@ -1,6 +1,6 @@
 use super::*;
 use crate::core::events::{Event as EngineEvent, TurnOutcomeStatus};
-use crate::core::ops::Op;
+use crate::core::ops::{Op, TurnSpec};
 use crate::runtime_threads::RuntimeEventRecord;
 use crate::test_support::{EnvVarGuard, lock_test_env};
 use anyhow::{Context, bail};
@@ -14,7 +14,9 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::time::sleep;
 use uuid::Uuid;
 
+mod command_catalog;
 mod headless_catalog;
+mod workspace_instructions;
 
 /// Scale a wait budget for shared CI runners.
 ///
@@ -453,6 +455,7 @@ fn messages_from_thread_detail_batches_tool_results() {
         routing_settlement: false,
         effective_route_usage: None,
         permission_posture: Some("ask".to_string()),
+        mode: None,
         effective_provider: None,
         effective_provider_id: None,
         effective_openrouter_vendor: None,
@@ -946,6 +949,8 @@ struct TestServerOverrides {
     web: Option<web::RuntimeWebState>,
     compat_stream_test_hook: Option<mpsc::UnboundedSender<CompatStreamTestPoint>>,
     plugin_discovery: Option<Arc<crate::plugins::PluginDiscoveryContext>>,
+    /// Pre-seeded workspace LSP manager (test transports, disabled configs).
+    lsp_manager: Option<Arc<crate::lsp::LspManager>>,
 }
 
 async fn spawn_test_server_with_root_token_mobile_workspace_and_subagents(
@@ -1237,6 +1242,13 @@ async fn build_test_server(
         fleet_codewhale_binary: overrides
             .fleet_codewhale_binary
             .unwrap_or_else(configured_codewhale_binary),
+        lsp_manager: {
+            let cell = std::sync::OnceLock::new();
+            if let Some(manager) = overrides.lsp_manager {
+                let _ = cell.set(manager);
+            }
+            Arc::new(cell)
+        },
         compat_stream_test_hook: overrides.compat_stream_test_hook,
     };
     let app = build_router(state);
@@ -1574,6 +1586,63 @@ async fn health_and_tasks_endpoints_work() -> Result<()> {
     Ok(())
 }
 
+/// Created tasks keep their caller-given name through get and list; unnamed
+/// tasks omit the field so queues can fall back to the prompt summary.
+#[tokio::test]
+async fn created_tasks_keep_their_given_name() -> Result<()> {
+    let Some((addr, _runtime_threads, handle)) = spawn_test_server().await? else {
+        return Ok(());
+    };
+    let client = crate::tls::reqwest_client();
+
+    let named: serde_json::Value = client
+        .post(format!("http://{addr}/v1/tasks"))
+        .json(&json!({ "prompt": "migrate the widget", "name": "Widget migration" }))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(named["name"], "Widget migration");
+    let id = named["id"].as_str().expect("task id").to_string();
+
+    let unnamed: serde_json::Value = client
+        .post(format!("http://{addr}/v1/tasks"))
+        .json(&json!({ "prompt": "unnamed work" }))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert!(unnamed.get("name").is_none());
+
+    let detail: serde_json::Value = client
+        .get(format!("http://{addr}/v1/tasks/{id}"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(detail["name"], "Widget migration");
+
+    let listed: serde_json::Value = client
+        .get(format!("http://{addr}/v1/tasks"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let rows = listed["tasks"].as_array().expect("task rows");
+    let row = rows
+        .iter()
+        .find(|row| row["id"] == id)
+        .expect("named row in list");
+    assert_eq!(row["name"], "Widget migration");
+
+    handle.abort();
+    Ok(())
+}
+
 #[tokio::test]
 async fn omitted_runtime_models_use_the_active_provider_default() -> Result<()> {
     let _env = lock_test_env();
@@ -1768,6 +1837,13 @@ async fn runtime_token_guard_protects_v1_routes() -> Result<()> {
         .send()
         .await?;
     assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+    let refresh = client
+        .post(format!(
+            "http://{addr}/v1/providers/codewhale/models/refresh"
+        ))
+        .send()
+        .await?;
+    assert_eq!(refresh.status(), StatusCode::UNAUTHORIZED);
 
     let bearer = client
         .get(format!("http://{addr}/v1/threads/summary"))
@@ -2675,10 +2751,6 @@ async fn agent_runs_runtime_api_exposes_persisted_worker_receipts() -> Result<()
             output_tokens: None,
             total_tokens: None,
             cost_microusd: None,
-            token_budget: None,
-            budget_spent_tokens: None,
-            budget_remaining_tokens: None,
-            budget_scope: None,
             note: "not reported".to_string(),
         },
         usage_source_fingerprints: Default::default(),
@@ -2856,7 +2928,7 @@ async fn compatibility_stream_closes_losslessly_across_replay_live_handoff() -> 
     let (release_overlap, wait_for_overlap_release) = oneshot::channel();
     let (release_terminal, wait_for_terminal_release) = oneshot::channel();
     let engine_task = tokio::spawn(async move {
-        if !matches!(rx_op.recv().await, Some(Op::SendMessage { .. })) {
+        if !matches!(rx_op.recv().await, Some(Op::SendMessage(TurnSpec { .. }))) {
             return;
         }
         let _ = wait_for_overlap_release.await;
@@ -3059,7 +3131,10 @@ async fn compatibility_stream_exposes_and_resolves_user_input_without_answer_ech
     let (submission_tx, submission_rx) = oneshot::channel();
     let (release_completion, wait_for_completion_release) = oneshot::channel();
     let engine_task = tokio::spawn(async move {
-        if !matches!(harness.rx_op.recv().await, Some(Op::SendMessage { .. })) {
+        if !matches!(
+            harness.rx_op.recv().await,
+            Some(Op::SendMessage(TurnSpec { .. }))
+        ) {
             bail!("compatibility interaction engine did not receive a prompt");
         }
         harness
@@ -3479,7 +3554,7 @@ async fn thread_endpoints_expose_lifecycle_contract() -> Result<()> {
     tokio::spawn(async move {
         while let Some(op) = rx_op.recv().await {
             match op {
-                Op::SendMessage { .. } => {
+                Op::SendMessage(TurnSpec { .. }) => {
                     let _ = tx_event
                         .send(EngineEvent::TurnStarted {
                             turn_id: "mock_lifecycle".to_string(),
@@ -3658,7 +3733,7 @@ async fn turn_endpoint_operation_key_returns_original_and_conflicts_on_mismatch(
     let tx_event = harness.tx_event.clone();
     tokio::spawn(async move {
         while let Some(op) = harness.rx_op.recv().await {
-            if !matches!(op, Op::SendMessage { .. }) {
+            if !matches!(op, Op::SendMessage(TurnSpec { .. })) {
                 continue;
             }
             counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -3691,9 +3766,19 @@ async fn turn_endpoint_operation_key_returns_original_and_conflicts_on_mismatch(
     assert!(!serde_json::to_string(&first)?.contains("cwc-http-operation-1"));
 
     let replay_response = client.post(&url).json(&request).send().await?;
-    assert_eq!(replay_response.status(), StatusCode::CREATED);
+    // A replay acknowledges work already accepted rather than admitting new
+    // work: 200 plus an explicit flag, so a client that retried an ambiguous
+    // submit can tell it is looking at the turn it already started (#76).
+    assert_eq!(replay_response.status(), StatusCode::OK);
     let replay: serde_json::Value = replay_response.json().await?;
     assert_eq!(replay["turn"]["id"], first_turn_id);
+    assert_eq!(replay["idempotent_replay"], true);
+    // A fresh admission carries no flag, so the response every existing client
+    // already parses is byte-identical to before.
+    assert!(
+        first.get("idempotent_replay").is_none(),
+        "only a replay is marked as one: {first}"
+    );
 
     let mismatch = client
         .post(&url)
@@ -3797,7 +3882,7 @@ async fn turn_operation_lookup_is_authenticated_read_only_and_survives_restart()
         tokio::time::timeout(ci_scaled(Duration::from_secs(2)), engine.rx_op.recv())
             .await?
             .context("accepted mock Engine operation")?,
-        Op::SendMessage { .. }
+        Op::SendMessage(TurnSpec { .. })
     ));
 
     let endpoint = format!(
@@ -3975,7 +4060,7 @@ async fn events_endpoint_respects_since_seq_cursor() -> Result<()> {
     let mut rx_op = harness.rx_op;
     let tx_event = harness.tx_event;
     tokio::spawn(async move {
-        if !matches!(rx_op.recv().await, Some(Op::SendMessage { .. })) {
+        if !matches!(rx_op.recv().await, Some(Op::SendMessage(TurnSpec { .. }))) {
             return;
         }
         let _ = tx_event
@@ -4074,6 +4159,114 @@ async fn events_endpoint_respects_since_seq_cursor() -> Result<()> {
 
     handle.abort();
     Ok(())
+}
+
+/// The SSE `id:` a browser `EventSource` resumes from, and the `Last-Event-ID`
+/// header it replays with, against the same durable cursor `since_seq` uses.
+#[tokio::test]
+async fn thread_event_frames_carry_the_id_a_reconnect_resumes_from() -> Result<()> {
+    let Some((addr, runtime_threads, handle)) = spawn_test_server().await? else {
+        return Ok(());
+    };
+    let client = crate::tls::reqwest_client();
+    let thread = runtime_threads
+        .create_thread(CreateThreadRequest::default())
+        .await?;
+
+    // Every journal frame carries its durable seq as the SSE id.
+    let first = client
+        .get(format!(
+            "http://{addr}/v1/threads/{}/events?since_seq=0",
+            thread.id
+        ))
+        .send()
+        .await?
+        .error_for_status()?;
+    let frame = read_first_sse_frame(first).await?;
+    let (_event, payload) = parse_sse_frame(&frame)?;
+    let first_seq = payload
+        .get("seq")
+        .and_then(Value::as_u64)
+        .context("missing seq in first frame")?;
+    let id = frame
+        .lines()
+        .find_map(|line| line.strip_prefix("id:"))
+        .map(str::trim)
+        .context("SSE frames must carry an id, or nothing can resume")?
+        .to_string();
+    assert_eq!(
+        id.parse::<u64>()?,
+        first_seq,
+        "the id is the durable seq, not a frame counter"
+    );
+
+    // A second durable event, so a resume has somewhere to land.
+    let second_seq = runtime_threads
+        .emit_event_for_test(
+            &thread.id,
+            None,
+            "approval.required",
+            json!({"approval_id": "resume-proof", "tool_name": "exec_command"}),
+        )
+        .await?
+        .seq;
+    assert!(second_seq > first_seq, "the second event is later");
+
+    // The header alone is enough: a browser cannot set a query cursor.
+    let resumed = client
+        .get(format!("http://{addr}/v1/threads/{}/events", thread.id))
+        .header("Last-Event-ID", &id)
+        .send()
+        .await?
+        .error_for_status()?;
+    let frame = read_first_sse_frame(resumed).await?;
+    let (_event, payload) = parse_sse_frame(&frame)?;
+    assert_eq!(
+        payload.get("seq").and_then(Value::as_u64),
+        Some(second_seq),
+        "Last-Event-ID must resume past the acknowledged frame"
+    );
+
+    // An explicit `since_seq` outranks the header, so a deliberate
+    // replay-from-zero is never silently overridden by a stale id.
+    let explicit = client
+        .get(format!(
+            "http://{addr}/v1/threads/{}/events?since_seq=0",
+            thread.id
+        ))
+        .header("Last-Event-ID", &id)
+        .send()
+        .await?
+        .error_for_status()?;
+    let frame = read_first_sse_frame(explicit).await?;
+    let (_event, payload) = parse_sse_frame(&frame)?;
+    assert_eq!(
+        payload.get("seq").and_then(Value::as_u64),
+        Some(first_seq),
+        "the query cursor wins over the header"
+    );
+
+    handle.abort();
+    Ok(())
+}
+
+#[test]
+fn last_event_id_accepts_only_decimal_cursors() {
+    use super::last_event_id;
+
+    let mut headers = axum::http::HeaderMap::new();
+    assert_eq!(last_event_id(&headers), None, "absent header is no cursor");
+
+    headers.insert("last-event-id", "42".parse().unwrap());
+    assert_eq!(last_event_id(&headers), Some(42));
+
+    headers.insert("last-event-id", " 7 ".parse().unwrap());
+    assert_eq!(last_event_id(&headers), Some(7), "whitespace is trimmed");
+
+    // An opaque id from a proxy or an older client opens the stream from the
+    // durable head instead of refusing to open it at all.
+    headers.insert("last-event-id", "fev1_abcdef".parse().unwrap());
+    assert_eq!(last_event_id(&headers), None);
 }
 
 #[tokio::test]
@@ -4388,7 +4581,7 @@ async fn steer_and_interrupt_endpoints_work_on_active_turn() -> Result<()> {
     let tx_event = harness.tx_event;
     let cancel_token = harness.cancel_token;
     tokio::spawn(async move {
-        if !matches!(rx_op.recv().await, Some(Op::SendMessage { .. })) {
+        if !matches!(rx_op.recv().await, Some(Op::SendMessage(TurnSpec { .. }))) {
             return;
         }
         let _ = tx_event
@@ -4401,7 +4594,10 @@ async fn steer_and_interrupt_endpoints_work_on_active_turn() -> Result<()> {
         let _ = tx_event
             .send(EngineEvent::MessageStarted { index: 0 })
             .await;
-        if let Some(steer_text) = rx_steer.recv().await {
+        if let Some(steer) = rx_steer.recv().await {
+            // An engine that uses the steer has committed it; `commit()` is
+            // what reports that acceptance back to `steer_turn`.
+            let steer_text = steer.into_pending().commit();
             let _ = tx_event
                 .send(EngineEvent::MessageDelta {
                     index: 0,
@@ -4851,7 +5047,7 @@ async fn stream_endpoint_remains_backward_compatible() -> Result<()> {
     let mut rx_op = harness.rx_op;
     let tx_event = harness.tx_event;
     tokio::spawn(async move {
-        if !matches!(rx_op.recv().await, Some(Op::SendMessage { .. })) {
+        if !matches!(rx_op.recv().await, Some(Op::SendMessage(TurnSpec { .. }))) {
             return;
         }
         let _ = tx_event
@@ -6066,7 +6262,7 @@ async fn session_create_from_thread_rejects_active_turn() -> Result<()> {
     let (active_tx, active_rx) = oneshot::channel();
     let (finish_tx, finish_rx) = oneshot::channel();
     tokio::spawn(async move {
-        if !matches!(rx_op.recv().await, Some(Op::SendMessage { .. })) {
+        if !matches!(rx_op.recv().await, Some(Op::SendMessage(TurnSpec { .. }))) {
             return;
         }
         let _ = tx_event
@@ -6889,6 +7085,95 @@ async fn thread_usage_endpoint_scopes_totals_to_one_thread() -> Result<()> {
     Ok(())
 }
 
+/// `GET /v1/approvals` serves the account-wide approval history behind the
+/// approvals log: decided rows carry their outcome + decision time, pending
+/// asks read "pending" with no decision time, newest ask first. A corrupt
+/// session log is skipped (warned server-side), never a 500.
+#[tokio::test]
+async fn approvals_endpoint_lists_decided_and_pending_newest_first() -> Result<()> {
+    use crate::approval_log::{ApprovalOutcome, ApprovalReceipt, ApprovalReceiptStore};
+    use chrono::{DateTime, Utc};
+
+    let root = std::env::temp_dir().join(format!("codewhale-approvals-api-{}", Uuid::new_v4()));
+    let sessions_dir = root.join("sessions");
+    let Some((addr, _threads, handle)) =
+        spawn_test_server_with_root(root, sessions_dir.clone()).await?
+    else {
+        return Ok(());
+    };
+    let client = crate::tls::reqwest_client();
+    let store = ApprovalReceiptStore::new(sessions_dir);
+
+    fn at(hour: u32) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(&format!("2026-09-10T{hour:02}:00:00Z"))
+            .expect("fixture time")
+            .to_utc()
+    }
+    // Decided pair in one session, a still-pending ask in another, a corrupt
+    // log in a third. Fixed stamps keep the newest-first order exact.
+    store.append(
+        "sess-decided",
+        &ApprovalReceipt::Asked {
+            approval_id: "tool-1".into(),
+            tool_call_id: "tool-1".into(),
+            tool_name: "exec_shell".into(),
+            created_at: at(10),
+        },
+    )?;
+    store.append(
+        "sess-decided",
+        &ApprovalReceipt::Decided {
+            approval_id: "tool-1".into(),
+            tool_call_id: "tool-1".into(),
+            outcome: ApprovalOutcome::Denied,
+            created_at: at(11),
+        },
+    )?;
+    store.append(
+        "sess-pending",
+        &ApprovalReceipt::Asked {
+            approval_id: "tool-2".into(),
+            tool_call_id: "tool-2".into(),
+            tool_name: "write_file".into(),
+            created_at: at(12),
+        },
+    )?;
+    let corrupt_dir = store.log_path("sess-corrupt")?;
+    fs::create_dir_all(corrupt_dir.parent().expect("log parent"))?;
+    fs::write(&corrupt_dir, "not-json\n")?;
+
+    let rows: serde_json::Value = client
+        .get(format!("http://{addr}/v1/approvals"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(rows.as_array().expect("rows").len(), 2);
+    assert_eq!(rows[0]["approval_id"], "tool-2");
+    assert_eq!(rows[0]["tool_name"], "write_file");
+    assert_eq!(rows[0]["outcome"], "pending");
+    assert!(rows[0]["decided_at"].is_null());
+    assert_eq!(rows[1]["approval_id"], "tool-1");
+    assert_eq!(rows[1]["tool_name"], "exec_shell");
+    assert_eq!(rows[1]["outcome"], "denied");
+    assert_eq!(rows[1]["asked_at"], "2026-09-10T10:00:00Z");
+    assert_eq!(rows[1]["decided_at"], "2026-09-10T11:00:00Z");
+
+    let one: serde_json::Value = client
+        .get(format!("http://{addr}/v1/approvals?limit=1"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(one.as_array().expect("rows").len(), 1);
+    assert_eq!(one[0]["approval_id"], "tool-2");
+
+    handle.abort();
+    Ok(())
+}
+
 /// `PUT /v1/sessions` persists the thread's audited cost with the same
 /// field semantics the TUI writer uses: parent-turn spend in
 /// `session_cost_*`, routed-child spend in `subagent_cost_*`, so a session
@@ -6947,6 +7232,7 @@ async fn session_save_merges_thread_cost_split_and_records_coverage() -> Result<
         routing_settlement: false,
         effective_route_usage: None,
         permission_posture: None,
+        mode: None,
         effective_provider: None,
         effective_provider_id: None,
         effective_openrouter_vendor: None,
@@ -7141,6 +7427,7 @@ async fn session_save_persists_parent_cny_unpriced_reasons_without_double_count(
         routing_settlement: false,
         effective_route_usage: None,
         permission_posture: None,
+        mode: None,
         effective_provider: None,
         effective_provider_id: None,
         effective_openrouter_vendor: None,
@@ -7476,6 +7763,53 @@ async fn start_turn_accepts_dynamic_tools_and_environment_id() -> Result<()> {
             .json()
             .await?;
         assert_eq!(stored["turns"][0]["permission_posture"], "auto_review");
+
+        handle.abort();
+        Ok(())
+    })
+    .await
+}
+
+/// A turn receipts the mode it ran in, not the thread's mode: a client reading
+/// the thread when the turn finishes would otherwise learn how the thread is
+/// set up *now*, which is a different question as soon as the mode is switched
+/// mid-run.
+#[tokio::test]
+async fn turn_record_reports_the_mode_it_ran_in() -> Result<()> {
+    Box::pin(async {
+        let Some((addr, _runtime_threads, handle)) = spawn_test_server().await? else {
+            return Ok(());
+        };
+        let client = crate::tls::reqwest_client();
+
+        let created: serde_json::Value = client
+            .post(format!("http://{addr}/v1/threads"))
+            .json(&json!({ "model": "test-model" }))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let thread_id = created["id"].as_str().context("missing thread id")?;
+
+        let started: serde_json::Value = client
+            .post(format!("http://{addr}/v1/threads/{thread_id}/turns"))
+            .json(&json!({ "prompt": "plan it", "mode": "plan" }))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        assert_eq!(started["turn"]["mode"], "plan");
+
+        let stored: serde_json::Value = client
+            .get(format!("http://{addr}/v1/threads/{thread_id}"))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        assert_eq!(stored["turns"][0]["mode"], "plan");
 
         handle.abort();
         Ok(())
@@ -8101,6 +8435,120 @@ async fn thread_summary_search_does_not_scan_the_whole_store_per_thread() -> Res
     Ok(())
 }
 
+/// The default listing carries no `search`, and it must read the store once
+/// rather than once per row.
+///
+/// This route used to call `get_thread_detail` for every row, and detail is a
+/// whole-store walk: `list_turns_for_thread` scans every turn record and
+/// `list_items_for_turns_map` scans every item record, because an item's
+/// filename carries only the item id. Listing `T` threads therefore cost
+/// `T x (all_turns + all_items)` reads — seconds-per-thread, and the reason a
+/// 72-thread rail went blank. The bound asserted here is one pass per
+/// directory, so any return to a per-row detail read fails loudly.
+#[tokio::test]
+async fn thread_summary_listing_reads_the_store_once_not_once_per_thread() -> Result<()> {
+    let Some((addr, runtime_threads, handle)) = spawn_test_server().await? else {
+        return Ok(());
+    };
+    let client = crate::tls::reqwest_client();
+
+    const THREADS: usize = 8;
+    const TURNS_PER_THREAD: usize = 4;
+    const ITEMS_PER_TURN: usize = 4;
+    const PREVIEW_TOKEN: &str = "listingreadsstoreonce";
+
+    for index in 0..THREADS {
+        let thread: serde_json::Value = client
+            .post(format!("http://{addr}/v1/threads"))
+            .json(&json!({}))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let id = thread["id"]
+            .as_str()
+            .context("missing thread id")?
+            .to_string();
+        seed_summary_search_transcript(
+            runtime_threads.test_store(),
+            &id,
+            index,
+            TURNS_PER_THREAD,
+            ITEMS_PER_TURN,
+            PREVIEW_TOKEN,
+        )?;
+    }
+
+    let total_turns = (THREADS * TURNS_PER_THREAD) as u64;
+    let total_items = (THREADS * TURNS_PER_THREAD * ITEMS_PER_TURN) as u64;
+    let per_thread_file_reads = THREADS as u64 * (total_turns + total_items);
+
+    runtime_threads.reset_whole_store_scan_file_reads();
+    let listed: serde_json::Value = client
+        .get(format!("http://{addr}/v1/threads/summary?limit={THREADS}"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let (turn_files, item_files) = runtime_threads.whole_store_scan_file_reads();
+    let rows = listed.as_array().context("summary should be an array")?;
+
+    assert_eq!(
+        rows.len(),
+        THREADS,
+        "every thread must still be listed; got {listed}"
+    );
+    assert_eq!(
+        turn_files, total_turns,
+        "the page must scan the turns directory exactly once: read {turn_files} of \
+         {total_turns} turn files, while reading one thread's detail per row would have \
+         been {per_thread_file_reads} reads in total"
+    );
+    assert_eq!(
+        item_files, total_items,
+        "the page must scan the items directory exactly once: read {item_files} of \
+         {total_items} item files, while reading one thread's detail per row would have \
+         been {per_thread_file_reads} reads in total"
+    );
+    assert!(
+        rows.iter().all(|row| row["preview"]
+            .as_str()
+            .is_some_and(|preview| preview.contains(PREVIEW_TOKEN))),
+        "one pass must still fill every row's preview; got {listed}"
+    );
+    assert!(
+        rows.iter()
+            .all(|row| row["latest_turn_status"] == "completed"),
+        "one pass must still report each thread's newest turn status; got {listed}"
+    );
+    assert!(
+        rows.iter().all(|row| row["pending_attention_count"] == 0),
+        "one pass must still read attention from live state; got {listed}"
+    );
+
+    handle.abort();
+    Ok(())
+}
+
+/// The summary resolves git metadata once per distinct workspace, so the
+/// resolve list must collapse repeated workspaces instead of keeping one entry
+/// per row: every entry costs up to five blocking `git` processes.
+#[test]
+fn thread_summary_resolves_git_metadata_once_per_distinct_workspace() {
+    let repo = PathBuf::from("/srv/repo");
+    let other = PathBuf::from("/srv/other");
+    let rows = vec![
+        repo.clone(),
+        repo.clone(),
+        other.clone(),
+        repo.clone(),
+        other.clone(),
+    ];
+    assert_eq!(distinct_paths(rows), vec![repo, other]);
+}
+
 fn seed_summary_search_transcript(
     store: &crate::runtime_threads::RuntimeThreadStore,
     thread_id: &str,
@@ -8155,6 +8603,7 @@ fn seed_summary_search_transcript(
             routing_settlement: false,
             effective_route_usage: None,
             permission_posture: None,
+            mode: None,
             effective_provider: None,
             effective_provider_id: None,
             effective_openrouter_vendor: None,
@@ -8875,8 +9324,8 @@ async fn set_config_rejects_unknown_key_with_bad_request() -> Result<()> {
         .unwrap_or_default()
         .to_lowercase();
     assert!(
-        message.contains("unknown config key"),
-        "error message should mention 'unknown config key', got: {message}"
+        message.contains("unknown setting"),
+        "error message should mention 'unknown setting', got: {message}"
     );
 
     handle.abort();
@@ -9041,6 +9490,133 @@ async fn set_config_with_config_path_writes_to_specified_file() -> Result<()> {
 }
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn get_config_search_provider_reports_runtime_source() -> Result<()> {
+    let _lock = lock_test_env();
+    let _code = EnvVarGuard::remove("CODEWHALE_SEARCH_PROVIDER");
+    let _legacy = EnvVarGuard::remove("DEEPSEEK_SEARCH_PROVIDER");
+    let _tavily = EnvVarGuard::remove("TAVILY_API_KEY");
+
+    let root = std::env::temp_dir().join(format!("codewhale-search-source-{}", Uuid::new_v4()));
+    fs::create_dir_all(&root)?;
+    let config_file = root.join("config.toml");
+    fs::write(&config_file, "[search]\napi_key = \"tvly-autodetected\"\n")?;
+
+    let Some((addr, _runtime_threads, handle)) =
+        spawn_test_server_with_config_path(config_file).await?
+    else {
+        return Ok(());
+    };
+    let client = crate::tls::reqwest_client();
+    let body: serde_json::Value = client
+        .get(format!("http://{addr}/v1/config"))
+        .send()
+        .await
+        .expect("GET /v1/config should not fail at transport level")
+        .json()
+        .await
+        .expect("GET /v1/config should be JSON");
+    handle.abort();
+
+    assert_eq!(body["search_provider"], "tavily", "body: {body}");
+    assert_eq!(
+        body["search_provider_source"], "tavily key",
+        "GET must publish the same source token doctor prints: {body}"
+    );
+    assert!(
+        body.get("missing_key").is_none(),
+        "missing-key is stdout-only: {body}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn set_config_search_provider_persist_skips_firecrawl_default_round_trip() -> Result<()> {
+    let _lock = lock_test_env();
+    let _code = EnvVarGuard::remove("CODEWHALE_SEARCH_PROVIDER");
+    let _legacy = EnvVarGuard::remove("DEEPSEEK_SEARCH_PROVIDER");
+    let _tavily = EnvVarGuard::remove("TAVILY_API_KEY");
+
+    let root = std::env::temp_dir().join(format!("codewhale-search-persist-{}", Uuid::new_v4()));
+    fs::create_dir_all(&root)?;
+    let config_file = root.join("config.toml");
+    fs::write(&config_file, "# initial\n")?;
+
+    let Some((addr, _runtime_threads, handle)) =
+        spawn_test_server_with_config_path(config_file.clone()).await?
+    else {
+        return Ok(());
+    };
+    let client = crate::tls::reqwest_client();
+
+    // GET returns `firecrawl`; saving it back must NOT write a pin, because
+    // `provider = "firecrawl"` would flip source Default -> Config and then
+    // block a later Tavily key.
+    let (status, body) =
+        post_set_config(&client, &addr, "search_provider", "firecrawl", true).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["persisted"], false, "body: {body}");
+    let contents = fs::read_to_string(&config_file)?;
+    assert!(
+        !contents.contains("provider"),
+        "round-tripping the resolved default must not pin it: {contents}"
+    );
+
+    // An explicit *change* still persists.
+    let (status, body) = post_set_config(&client, &addr, "search_provider", "bocha", true).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["persisted"], true, "body: {body}");
+    let contents = fs::read_to_string(&config_file)?;
+    assert!(
+        contents.contains("provider = \"bocha\""),
+        "an explicit provider change must persist: {contents}"
+    );
+
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn set_config_search_provider_persist_skips_tavily_autodetect() -> Result<()> {
+    let _lock = lock_test_env();
+    let _code = EnvVarGuard::remove("CODEWHALE_SEARCH_PROVIDER");
+    let _legacy = EnvVarGuard::remove("DEEPSEEK_SEARCH_PROVIDER");
+    let _tavily = EnvVarGuard::remove("TAVILY_API_KEY");
+
+    let root = std::env::temp_dir().join(format!("codewhale-search-auto-{}", Uuid::new_v4()));
+    fs::create_dir_all(&root)?;
+    let config_file = root.join("config.toml");
+    fs::write(&config_file, "[search]\napi_key = \"tvly-autodetected\"\n")?;
+
+    let Some((addr, _runtime_threads, handle)) =
+        spawn_test_server_with_config_path(config_file.clone()).await?
+    else {
+        return Ok(());
+    };
+    let client = crate::tls::reqwest_client();
+
+    let (status, body) = post_set_config(&client, &addr, "search_provider", "tavily", true).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["persisted"], false, "body: {body}");
+    assert!(
+        body["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("tavily key")),
+        "the skip must explain the autodetect source: {body}"
+    );
+    let contents = fs::read_to_string(&config_file)?;
+    assert!(
+        !contents.contains("provider"),
+        "GET -> POST round-trip must not pin autodetect: {contents}"
+    );
+
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
 async fn reload_config_endpoint_returns_success() -> Result<()> {
     // Basic smoke test that /v1/config/reload returns 200 with a message.
     let root = std::env::temp_dir().join(format!("codewhale-config-reload-{}", Uuid::new_v4()));
@@ -9110,6 +9686,179 @@ async fn get_provider_models(
         .json()
         .await
         .expect("GET /v1/providers/{id}/models should return valid JSON")
+}
+
+/// Helper: GET `/v1/settings/schema` and return the parsed response body.
+async fn get_settings_schema(client: &reqwest::Client, addr: &SocketAddr) -> serde_json::Value {
+    client
+        .get(format!("http://{addr}/v1/settings/schema"))
+        .send()
+        .await
+        .expect("GET /v1/settings/schema should not fail at transport level")
+        .error_for_status()
+        .expect("GET /v1/settings/schema should return 200")
+        .json()
+        .await
+        .expect("GET /v1/settings/schema should return valid JSON")
+}
+
+#[tokio::test]
+async fn settings_schema_serves_every_declared_row_with_runtime_state() -> Result<()> {
+    let _lock = lock_test_env();
+    let root = tempfile::tempdir()?;
+    let config_file = root.path().join("config.toml");
+    fs::write(
+        &config_file,
+        "provider = \"deepseek\"\napi_key = \"runtime-api-test-key\"\nbase_url = \"http://127.0.0.1:1/v1\"\ntelemetry = false\n\n[notifications]\ncondition = \"always\"\n",
+    )?;
+    fs::write(root.path().join("settings.toml"), "calm_mode = true\n")?;
+    let _config = EnvVarGuard::set("CODEWHALE_CONFIG_PATH", &config_file);
+    let Some((addr, _runtime_threads, handle)) =
+        spawn_test_server_with_config_path(config_file.clone()).await?
+    else {
+        return Ok(());
+    };
+    let client = crate::tls::reqwest_client();
+    let body = get_settings_schema(&client, &addr).await;
+    handle.abort();
+
+    assert_eq!(body["version"], 1);
+    let tabs = body["tabs"].as_array().expect("tabs array");
+    let tab_ids: Vec<_> = tabs.iter().filter_map(|t| t["id"].as_str()).collect();
+    assert_eq!(
+        tab_ids,
+        codewhale_config::settings_schema::schema_tabs(),
+        "tabs project the schema declaration order"
+    );
+
+    let rows = body["settings"].as_array().expect("settings array");
+    assert_eq!(
+        rows.len(),
+        codewhale_config::settings_schema::schema_rows().count(),
+        "every declared UI row is served"
+    );
+    let row = |key: &str| {
+        rows.iter()
+            .find(|row| row["key"] == key)
+            .unwrap_or_else(|| panic!("schema row {key} missing"))
+    };
+
+    for entry in rows {
+        let kind = entry["kind"].as_str().expect("kind");
+        assert!(
+            matches!(kind, "bool" | "int" | "float" | "enum" | "string"),
+            "unknown kind {kind}"
+        );
+        assert!(
+            matches!(
+                entry["row"].as_str(),
+                Some("setting" | "action" | "diagnostic" | "session")
+            ),
+            "unknown row kind for {}",
+            entry["key"]
+        );
+        let label = entry["label"].as_str().expect("label");
+        assert!(
+            !label.is_empty() && !label.starts_with("Config"),
+            "label must be resolved prose, not a message key: {label}"
+        );
+        assert!(entry["visible"].is_boolean());
+        assert!(entry["editable"].is_boolean());
+        if kind == "enum" {
+            assert!(
+                !entry["options"]
+                    .as_array()
+                    .expect("enum options")
+                    .is_empty(),
+                "enum row {} must serve its closed value set",
+                entry["key"]
+            );
+        }
+    }
+
+    // Values resolve from the owning store, not a decorated guess.
+    assert_eq!(row("calm_mode")["value"], "true");
+    assert_eq!(row("calm_mode")["persisted"], true);
+    assert_eq!(row("notifications.condition")["value"], "always");
+    assert_eq!(row("notifications.condition")["persisted"], true);
+    assert_eq!(row("telemetry")["value"], "false");
+
+    // Row kinds and editability agree with the TUI's own semantics:
+    // model/provider open pickers (actions), approval_mode is the
+    // session-scoped writable, endpoint rows are read-only receipts.
+    assert_eq!(row("model")["row"], "action");
+    assert_eq!(row("model")["editable"], false);
+    assert_eq!(row("approval_mode")["row"], "session");
+    assert_eq!(row("approval_mode")["editable"], true);
+    assert_eq!(row("provider_url")["editable"], false);
+    assert_eq!(row("telemetry")["editable"], false);
+    for action in ["mcp_open", "plugins_open"] {
+        assert_eq!(row(action)["row"], "action");
+        assert_eq!(row(action)["editable"], false);
+    }
+
+    // The conditional triple resolves to exactly one visible member for a
+    // config with no managed policy: the editable TUI posture row.
+    assert_eq!(row("permission_posture")["visible"], true);
+    assert_eq!(row("approval_policy")["visible"], false);
+    assert_eq!(row("managed_approval_policy")["visible"], false);
+    Ok(())
+}
+
+#[tokio::test]
+async fn settings_schema_write_fallthrough_persists_declared_settings_keys() -> Result<()> {
+    let _lock = lock_test_env();
+    let root = tempfile::tempdir()?;
+    let config_file = root.path().join("config.toml");
+    fs::write(
+        &config_file,
+        "provider = \"deepseek\"\napi_key = \"runtime-api-test-key\"\nbase_url = \"http://127.0.0.1:1/v1\"\n",
+    )?;
+    let _config = EnvVarGuard::set("CODEWHALE_CONFIG_PATH", &config_file);
+    let Some((addr, _runtime_threads, handle)) =
+        spawn_test_server_with_config_path(config_file.clone()).await?
+    else {
+        return Ok(());
+    };
+    let client = crate::tls::reqwest_client();
+
+    // A schema-declared settings.toml key outside the curated arm list must
+    // persist through the shared validator rather than 400.
+    let response = client
+        .post(format!("http://{addr}/v1/config"))
+        .json(&json!({"key": "composer_density", "value": "compact", "persist": true}))
+        .send()
+        .await?
+        .error_for_status()
+        .expect("composer_density is a declared settings key")
+        .json::<serde_json::Value>()
+        .await?;
+    assert_eq!(response["persisted"], true);
+    assert_eq!(
+        crate::settings::Settings::load_persisted()?.composer_density,
+        "compact"
+    );
+    let body = get_settings_schema(&client, &addr).await;
+    let row = body["settings"]
+        .as_array()
+        .expect("settings array")
+        .iter()
+        .find(|row| row["key"] == "composer_density")
+        .expect("composer_density row");
+    assert_eq!(row["value"], "compact");
+    assert_eq!(row["persisted"], true);
+
+    // A key the schema does not declare still fails closed.
+    let status = client
+        .post(format!("http://{addr}/v1/config"))
+        .json(&json!({"key": "not_a_real_setting", "value": "x", "persist": true}))
+        .send()
+        .await?
+        .status();
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    handle.abort();
+    Ok(())
 }
 
 #[test]
@@ -10119,8 +10868,19 @@ model = "local-model"
         );
         assert_eq!(custom["credentialState"], expected_state);
 
+        // An allow-list, not a snapshot: a new field here has to be argued for
+        // in this test before it can reach the wire. `credentialSource` and
+        // `credentialWritable` (#6179) are admissible because they are a
+        // *class* and a boolean — the source is one of four fixed enum
+        // spellings and can never interpolate a value, a path, or an
+        // environment variable name. `credentialWritableReason` is
+        // `skip_serializing_if = Option::is_none`, so it is absent for every
+        // writable route and is asserted separately below when present.
         let allowed_fields: std::collections::BTreeSet<_> = [
+            "credentialSource",
             "credentialState",
+            "credentialWritable",
+            "credentialWritableReason",
             "default_model",
             "display_name",
             "has_model_catalog",
@@ -10129,20 +10889,28 @@ model = "local-model"
         ]
         .into_iter()
         .collect();
+        const CREDENTIAL_SOURCES: [&str; 4] = ["secret_store", "config", "external_auth", "none"];
         for entry in providers["providers"]
             .as_array()
             .context("providers array")?
         {
-            let actual_fields: std::collections::BTreeSet<_> = entry
-                .as_object()
-                .context("provider entry object")?
-                .keys()
-                .map(String::as_str)
-                .collect();
-            assert_eq!(
-                actual_fields, allowed_fields,
-                "provider catalog must remain a non-secret projection"
+            let object = entry.as_object().context("provider entry object")?;
+            let actual_fields: std::collections::BTreeSet<_> =
+                object.keys().map(String::as_str).collect();
+            assert!(
+                actual_fields.is_subset(&allowed_fields),
+                "provider catalog must remain a non-secret projection: {actual_fields:?}"
             );
+            // The source is a closed vocabulary. If it ever stops being one,
+            // it has become a place a value can hide.
+            let source = object["credentialSource"]
+                .as_str()
+                .context("credentialSource must be a string")?;
+            assert!(
+                CREDENTIAL_SOURCES.contains(&source),
+                "credentialSource must stay a fixed class, got {source:?}"
+            );
+            assert!(object["credentialWritable"].is_boolean());
         }
 
         let serialized = serde_json::to_string(&providers)?;
@@ -11372,7 +12140,7 @@ async fn cors_layer_advertises_exact_supported_headers_and_never_an_extra() -> R
         .header("Access-Control-Request-Method", "POST")
         .header(
             "Access-Control-Request-Headers",
-            "authorization, content-type, accept, x-codewhale-runtime-token, x-deepseek-runtime-token",
+            "authorization, content-type, accept, if-match, x-codewhale-runtime-token, x-deepseek-runtime-token",
         )
         .send()
         .await?;
@@ -11399,6 +12167,7 @@ async fn cors_layer_advertises_exact_supported_headers_and_never_an_extra() -> R
         "accept",
         "authorization",
         "content-type",
+        "if-match",
         "x-codewhale-runtime-token",
         "x-deepseek-runtime-token",
     ]
@@ -12383,6 +13152,7 @@ async fn mcp_server_management_crud() -> Result<()> {
     // 1. Create a new server.
     let created: serde_json::Value = client
         .post(&base)
+        .header(header::IF_MATCH, mcp_test_revision(&client, &base).await?)
         .json(&serde_json::json!({
             "name": "test-stdio",
             "command": "echo",
@@ -12418,6 +13188,7 @@ async fn mcp_server_management_crud() -> Result<()> {
     // 3. Duplicate create returns 409 Conflict.
     let conflict = client
         .post(&base)
+        .header(header::IF_MATCH, mcp_test_revision(&client, &base).await?)
         .json(&serde_json::json!({
             "name": "test-stdio",
             "command": "echo",
@@ -12429,10 +13200,13 @@ async fn mcp_server_management_crud() -> Result<()> {
     // 4. PATCH (update) the server.
     let updated: serde_json::Value = client
         .patch(format!("{base}/test-stdio"))
+        .header(header::IF_MATCH, mcp_test_revision(&client, &base).await?)
         .json(&serde_json::json!({
             "args": ["updated"],
             "required": true,
             "url": null,
+            "bearer_token_env_var": null,
+            "oauth_resource": null,
         }))
         .send()
         .await?
@@ -12446,6 +13220,7 @@ async fn mcp_server_management_crud() -> Result<()> {
 
     let cleared: serde_json::Value = client
         .patch(format!("{base}/test-stdio"))
+        .header(header::IF_MATCH, mcp_test_revision(&client, &base).await?)
         .json(&json!({
             "url": "https://example.com/replacement",
             "command": null,
@@ -12477,6 +13252,7 @@ async fn mcp_server_management_crud() -> Result<()> {
     // Clearing the final endpoint is invalid and must not alter persisted state.
     let invalid = client
         .patch(format!("{base}/test-stdio"))
+        .header(header::IF_MATCH, mcp_test_revision(&client, &base).await?)
         .json(&json!({ "url": null }))
         .send()
         .await?;
@@ -12493,6 +13269,7 @@ async fn mcp_server_management_crud() -> Result<()> {
     // 5. Disable the server.
     let disabled: serde_json::Value = client
         .post(format!("{base}/test-stdio/disable"))
+        .header(header::IF_MATCH, mcp_test_revision(&client, &base).await?)
         .send()
         .await?
         .error_for_status()?
@@ -12514,6 +13291,7 @@ async fn mcp_server_management_crud() -> Result<()> {
     // 6. Re-enable the server.
     let enabled: serde_json::Value = client
         .post(format!("{base}/test-stdio/enable"))
+        .header(header::IF_MATCH, mcp_test_revision(&client, &base).await?)
         .send()
         .await?
         .error_for_status()?
@@ -12522,20 +13300,32 @@ async fn mcp_server_management_crud() -> Result<()> {
     assert_eq!(enabled["action"], "enabled");
     assert_eq!(enabled["ok"], true);
 
-    // 7. Reconnect (schedules a reconnect — no live pool present so always succeeds).
+    // 7. Reconnect reports the real failure; use a missing local executable
+    // so this management test never attempts the example remote endpoint.
+    client
+        .patch(format!("{base}/test-stdio"))
+        .header(header::IF_MATCH, mcp_test_revision(&client, &base).await?)
+        .json(&json!({"command":root.join("missing-mcp-executable"),"url":null}))
+        .send()
+        .await?
+        .error_for_status()?;
     let reconnected: serde_json::Value = client
         .post(format!("{base}/test-stdio/reconnect"))
+        .header(header::IF_MATCH, mcp_test_revision(&client, &base).await?)
         .send()
         .await?
         .error_for_status()?
         .json()
         .await?;
-    assert_eq!(reconnected["action"], "reconnect_scheduled");
-    assert_eq!(reconnected["ok"], true);
+    assert_eq!(reconnected["action"], "reconnect_failed");
+    assert_eq!(reconnected["ok"], false);
+    assert_eq!(reconnected["connection"]["connected"], false);
+    assert!(reconnected["connection"]["error"].as_str().is_some());
 
     // 8. Delete the server.
     let deleted: serde_json::Value = client
         .delete(format!("{base}/test-stdio"))
+        .header(header::IF_MATCH, mcp_test_revision(&client, &base).await?)
         .send()
         .await?
         .error_for_status()?
@@ -12603,6 +13393,7 @@ async fn mcp_server_management_redacts_credentials() -> Result<()> {
     // Create a server with sensitive fields.
     let created: serde_json::Value = client
         .post(&base)
+        .header(header::IF_MATCH, mcp_test_revision(&client, &base).await?)
         .json(&serde_json::json!({
             "name": "secret-server",
             "url": "https://example.com/mcp",
@@ -13200,6 +13991,209 @@ async fn runtime_info_advertises_plugin_management_capability() -> Result<()> {
 }
 
 #[tokio::test]
+async fn runtime_info_advertises_terminal_capabilities() -> Result<()> {
+    let Some((addr, _runtime_threads, handle)) = spawn_test_server().await? else {
+        return Ok(());
+    };
+    let client = crate::tls::reqwest_client();
+
+    let info: serde_json::Value = client
+        .get(format!("http://{addr}/v1/runtime/info"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    // A GPUI client gates its terminal pane on these. They are true where the
+    // routes serve bytes and false where they answer 501 (Windows, OpenHarmony)
+    // — the flag must not claim a capability the build cannot serve, so assert
+    // the routes' own gate rather than `true`.
+    let expected = cfg!(all(unix, not(target_env = "ohos")));
+    for capability in [
+        "terminal_stream",
+        "terminal_input",
+        "terminal_resize",
+        "terminal_kill",
+    ] {
+        assert_eq!(
+            info["capabilities"][capability], expected,
+            "runtime/info must advertise {capability}={expected}"
+        );
+    }
+
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn terminal_routes_serve_a_live_engine_session_over_http() -> Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let root = tmp.path().join("runtime");
+    let workspace = tmp.path().join("ws");
+    fs::create_dir_all(&root)?;
+    fs::create_dir_all(&workspace)?;
+    let Some((addr, _runtime_threads, handle)) =
+        spawn_test_server_with_root_token_mobile_workspace(
+            root.clone(),
+            root.join("sessions"),
+            None,
+            false,
+            workspace.clone(),
+        )
+        .await?
+    else {
+        return Ok(());
+    };
+    let client = crate::tls::reqwest_client();
+    let base = format!("http://{addr}/v1/terminal/pane");
+
+    // The agent's terminal tools own session creation; stand in for that
+    // producer on the same workspace the server was started with, which is
+    // what makes this the Engine's own shell rather than a second one.
+    let _session = crate::tools::terminal_session::get_or_create(
+        "pane",
+        &workspace,
+        crate::sandbox::SandboxPolicy::DangerFullAccess,
+    )
+    .map_err(anyhow::Error::msg)?;
+
+    // Input through the route, then the shell's own echo back through the
+    // route. Bytes in, bytes out, no direct access to the session object.
+    let write: serde_json::Value = client
+        .post(format!("{base}/input"))
+        .json(&serde_json::json!({
+            "data": "printf 'terminal-route-proof\\n'\n",
+            "encoding": "text"
+        }))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert!(write["written"].as_u64().unwrap_or_default() > 0);
+
+    let read_chunk = |base: String, client: reqwest::Client| async move {
+        let chunk: serde_json::Value = client
+            .get(format!("{base}/output?cursor=0&format=text"))
+            .send()
+            .await
+            .ok()?
+            .error_for_status()
+            .ok()?
+            .json()
+            .await
+            .ok()?;
+        Some(chunk)
+    };
+
+    let deadline = std::time::Instant::now() + ci_scaled(Duration::from_secs(10));
+    loop {
+        let chunk = read_chunk(base.clone(), client.clone())
+            .await
+            .expect("terminal output route answers");
+        let data = chunk["data"].as_str().unwrap_or_default();
+        if data.contains("terminal-route-proof") {
+            // Reads are non-consuming: the same cursor returns the same bytes.
+            let again = read_chunk(base.clone(), client.clone())
+                .await
+                .expect("terminal output route answers");
+            assert_eq!(again["data"], chunk["data"]);
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "route never delivered the shell's output: {data}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // Resize is checked through the shell, not the handler: `stty size` reads
+    // the kernel's window, so a handler that only stored the numbers fails.
+    client
+        .post(format!("{base}/resize"))
+        .json(&serde_json::json!({"rows": 40, "cols": 100}))
+        .send()
+        .await?
+        .error_for_status()?;
+    client
+        .post(format!("{base}/input"))
+        .json(&serde_json::json!({"data": "stty size\n", "encoding": "text"}))
+        .send()
+        .await?
+        .error_for_status()?;
+    let deadline = std::time::Instant::now() + ci_scaled(Duration::from_secs(10));
+    loop {
+        let chunk = read_chunk(base.clone(), client.clone())
+            .await
+            .expect("terminal output route answers");
+        let data = chunk["data"].as_str().unwrap_or_default();
+        if data.contains("40 100") {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "resize never reached the shell: {data}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // Kill, then learn the truth from the stream rather than the ack.
+    client
+        .post(format!("{base}/kill"))
+        .send()
+        .await?
+        .error_for_status()?;
+    let deadline = std::time::Instant::now() + ci_scaled(Duration::from_secs(10));
+    loop {
+        let chunk = read_chunk(base.clone(), client.clone())
+            .await
+            .expect("terminal output route answers");
+        if chunk["running"] == serde_json::json!(false) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "killed session still reports running: {chunk}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn terminal_output_for_an_unknown_session_is_not_found_and_creates_nothing() -> Result<()> {
+    let Some((addr, _runtime_threads, handle)) = spawn_test_server().await? else {
+        return Ok(());
+    };
+    let client = crate::tls::reqwest_client();
+    let base = format!("http://{addr}/v1/terminal");
+
+    // The route exists and answers for a name that has no live session: the
+    // Engine attaches to shells it owns, it does not conjure one per request.
+    let missing = client
+        .get(format!("{base}/no-such-session/output"))
+        .send()
+        .await?;
+    assert_eq!(missing.status(), reqwest::StatusCode::NOT_FOUND);
+
+    // An over-long name is rejected as a miss too, so the registry is never
+    // asked to allocate for it.
+    let long_name = "n".repeat(200);
+    let oversized = client
+        .get(format!("{base}/{long_name}/output"))
+        .send()
+        .await?;
+    assert_eq!(oversized.status(), reqwest::StatusCode::NOT_FOUND);
+
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
 async fn plugin_lifecycle_over_http_installs_reviews_enables_and_uninstalls() -> Result<()> {
     let tmp = tempfile::tempdir()?;
     let root = tmp.path().join("runtime");
@@ -13705,7 +14699,7 @@ vendor = "{vendor}"
         let old_config = manager.read_config().clone();
         let old_vendor = old_config.openrouter_vendor()?;
         let old_client = if old_config.api_provider() == crate::config::ApiProvider::Openrouter {
-            Some(crate::client::DeepSeekClient::new(&old_config)?)
+            Some(crate::client::CodewhaleClient::new(&old_config)?)
         } else {
             None
         };
@@ -13714,7 +14708,7 @@ vendor = "{vendor}"
             .send()
             .await?;
         assert_eq!(reload.status(), StatusCode::OK);
-        let fresh = crate::client::DeepSeekClient::new(&manager.read_config())?;
+        let fresh = crate::client::CodewhaleClient::new(&manager.read_config())?;
         assert_eq!(
             fresh.openrouter_vendor(),
             (!vendor.is_empty()).then_some(vendor)
@@ -14444,7 +15438,7 @@ async fn runtime_image_http_rejects_before_dispatch_and_accepts_large_canonical_
     let response = client.post(&url).json(&body).send().await?;
     assert_eq!(response.status(), StatusCode::CREATED);
     let accepted: Value = response.json().await?;
-    let Op::SendMessage { images, .. } =
+    let Op::SendMessage(TurnSpec { images, .. }) =
         harness.rx_op.recv().await.context("accepted Engine op")?
     else {
         bail!("expected SendMessage");
@@ -14835,84 +15829,3108 @@ async fn output_cap_compatibility_stream_rejects_before_thread_creation() -> Res
     Ok(())
 }
 
-/// `GET /v1/threads/summary?limit=N` (no search) is the dashboard's list read:
-/// the embedded client asks for `limit=100` on every page load and again after
-/// every new thread. It used to call `get_thread_detail` once per returned row,
-/// and detail walks the entire turns directory *and* the entire items
-/// directory — so the route was O(rows × (all_turns + all_items)) file reads.
-/// Measured against the admin engine: ~70 ms per row, 6.9 s for 100 rows on a
-/// store holding 4704 item files, which is what made entering a conversation
-/// and creating a new one feel like a six-second hang.
-///
-/// The bulk projection must read the whole store a bounded number of times
-/// instead — the read count must not multiply by row count. Its `?search=`
-/// sibling above pins the same property for the search path.
 #[tokio::test]
-async fn thread_summary_listing_does_not_scan_the_whole_store_per_row() -> Result<()> {
-    let Some((addr, runtime_threads, handle)) = spawn_test_server().await? else {
-        return Ok(());
-    };
+async fn workspace_files_list_read_write_bounds_and_confinement() -> Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let workspace = tmp.path().join("workspace");
+    fs::create_dir_all(workspace.join("src"))?;
+    fs::create_dir_all(workspace.join("bin"))?;
+    fs::create_dir_all(workspace.join("empty"))?;
+    fs::create_dir_all(workspace.join(".git/hooks"))?;
+    fs::write(workspace.join("src/main.rs"), "fn main() {}\n")?;
+    fs::write(workspace.join("README.md"), "# readme\n")?;
+    fs::write(workspace.join("bin/blob"), [0u8, 1, 2, 255])?;
+    fs::write(workspace.join(".git/config"), "[core]\n")?;
+    let outside = tmp.path().join("outside");
+    fs::create_dir_all(&outside)?;
+    fs::write(outside.join("secret.txt"), "never served")?;
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(&outside, workspace.join("link-dir"))?;
+        std::os::unix::fs::symlink(outside.join("secret.txt"), workspace.join("link-file"))?;
+    }
+    let (addr, _, handle) = spawn_test_server_with_root_token_mobile_workspace(
+        tmp.path().join("runtime"),
+        tmp.path().join("sessions"),
+        Some("files-token".to_string()),
+        false,
+        workspace.clone(),
+    )
+    .await?
+    .context("files test requires a loopback listener")?;
     let client = crate::tls::reqwest_client();
+    let base = format!("http://{addr}");
+    let url = |route: &str, pairs: &[(&str, &str)]| {
+        let mut url = reqwest::Url::parse(&format!("{base}{route}")).unwrap();
+        url.query_pairs_mut().extend_pairs(pairs.iter().copied());
+        url
+    };
 
-    const THREADS: usize = 8;
-    const TURNS_PER_THREAD: usize = 4;
-    const ITEMS_PER_TURN: usize = 4;
-
-    for index in 0..THREADS {
-        let thread: serde_json::Value = client
-            .post(format!("http://{addr}/v1/threads"))
-            .json(&json!({}))
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
-        let id = thread["id"]
-            .as_str()
-            .context("missing thread id")?
-            .to_string();
-        seed_summary_search_transcript(
-            runtime_threads.test_store(),
-            &id,
-            index,
-            TURNS_PER_THREAD,
-            ITEMS_PER_TURN,
-            "previewnorm",
-        )?;
+    // Authentication is required on every route.
+    for route in [
+        "/v1/workspace/files",
+        "/v1/workspace/files/read?path=README.md",
+    ] {
+        let status = client.get(format!("{base}{route}")).send().await?.status();
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{route}");
     }
 
-    let total_turns = (THREADS * TURNS_PER_THREAD) as u64;
-    let total_items = (THREADS * TURNS_PER_THREAD * ITEMS_PER_TURN) as u64;
-    let per_row_file_reads = (THREADS as u64) * (total_turns + total_items);
-
-    runtime_threads.reset_whole_store_scan_file_reads();
-    let rows: serde_json::Value = client
-        .get(format!("http://{addr}/v1/threads/summary?limit={THREADS}"))
+    // Listing: directories first, `.git` hidden, links named but never followed.
+    let root_listing: Value = client
+        .get(url("/v1/workspace/files", &[]))
+        .bearer_auth("files-token")
         .send()
         .await?
         .error_for_status()?
         .json()
         .await?;
-    let (turn_files, item_files) = runtime_threads.whole_store_scan_file_reads();
-    let scan_reads = turn_files + item_files;
+    let names: Vec<(String, String)> = root_listing["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| {
+            (
+                entry["name"].as_str().unwrap().to_string(),
+                entry["kind"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+    assert!(!names.iter().any(|(name, _)| name == ".git"));
+    assert!(names.contains(&("bin".to_string(), "directory".to_string())));
+    assert!(names.contains(&("src".to_string(), "directory".to_string())));
+    assert!(names.contains(&("README.md".to_string(), "file".to_string())));
+    #[cfg(unix)]
+    {
+        assert!(names.contains(&("link-dir".to_string(), "symlink".to_string())));
+        assert!(names.contains(&("link-file".to_string(), "symlink".to_string())));
+    }
+    let last_directory = names
+        .iter()
+        .rposition(|(_, kind)| kind == "directory")
+        .unwrap();
+    assert!(
+        names[..=last_directory]
+            .iter()
+            .all(|(_, kind)| kind == "directory"),
+        "directories are listed first: {names:?}"
+    );
+    let readme = root_listing["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["name"] == "README.md")
+        .unwrap();
+    assert_eq!(readme["size"], 9);
+    assert_eq!(readme["path"], "README.md");
+    assert!(readme["modified"].is_string());
+    assert_eq!(root_listing["truncated"], false);
 
+    let src_listing: Value = client
+        .get(url("/v1/workspace/files", &[("path", "src/")]))
+        .bearer_auth("files-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(src_listing["path"], "src");
+    assert_eq!(src_listing["entries"][0]["path"], "src/main.rs");
+    let limited: Value = client
+        .get(url("/v1/workspace/files", &[("limit", "1")]))
+        .bearer_auth("files-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(limited["entries"].as_array().unwrap().len(), 1);
+    assert_eq!(limited["truncated"], true);
+    let mut rejected_listings = vec![
+        ("../", StatusCode::BAD_REQUEST),
+        ("/etc", StatusCode::BAD_REQUEST),
+        ("src/../src", StatusCode::BAD_REQUEST),
+        ("src\\main", StatusCode::BAD_REQUEST),
+        (".git", StatusCode::FORBIDDEN),
+        ("README.md", StatusCode::BAD_REQUEST),
+        ("missing", StatusCode::NOT_FOUND),
+    ];
+    if cfg!(unix) {
+        rejected_listings.push(("link-dir", StatusCode::FORBIDDEN));
+    }
+    for (path, expected) in rejected_listings {
+        let status = client
+            .get(url("/v1/workspace/files", &[("path", path)]))
+            .bearer_auth("files-token")
+            .send()
+            .await?
+            .status();
+        assert_eq!(status, expected, "list path={path:?}");
+    }
+    let status = client
+        .get(url("/v1/workspace/files", &[("limit", "0")]))
+        .bearer_auth("files-token")
+        .send()
+        .await?
+        .status();
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // Reads: whole-file revision, byte windows, binary fallback, confinement.
+    let read: Value = client
+        .get(url("/v1/workspace/files/read", &[("path", "src/main.rs")]))
+        .bearer_auth("files-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let expected_revision = {
+        let digest = sha2::Sha256::digest(b"fn main() {}\n");
+        digest
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    };
+    assert_eq!(read["path"], "src/main.rs");
+    assert_eq!(read["encoding"], "utf-8");
+    assert_eq!(read["content"], "fn main() {}\n");
+    assert_eq!(read["size"], 13);
+    assert_eq!(read["bytes"], 13);
+    assert_eq!(read["truncated"], false);
+    assert_eq!(read["revision"], expected_revision);
+    let window: Value = client
+        .get(url(
+            "/v1/workspace/files/read",
+            &[("path", "src/main.rs"), ("offset", "3"), ("limit", "4")],
+        ))
+        .bearer_auth("files-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(window["content"], "main");
+    assert_eq!(window["offset"], 3);
+    assert_eq!(window["bytes"], 4);
+    assert_eq!(window["truncated"], true);
     assert_eq!(
-        rows.as_array().context("summary should be an array")?.len(),
-        THREADS,
-        "every thread should still be summarised; got {rows}"
+        window["revision"], expected_revision,
+        "revision covers the whole file"
     );
-    assert!(
-        scan_reads > 0,
-        "the counter must actually observe the projection's store walk, otherwise the \
-         bound below passes vacuously"
+    let binary: Value = client
+        .get(url("/v1/workspace/files/read", &[("path", "bin/blob")]))
+        .bearer_auth("files-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(binary["encoding"], "base64");
+    assert_eq!(
+        base64::engine::general_purpose::STANDARD
+            .decode(binary["content"].as_str().unwrap())
+            .unwrap(),
+        vec![0u8, 1, 2, 255]
     );
+    let mut rejected_reads = vec![
+        ("", StatusCode::BAD_REQUEST),
+        ("../outside/secret.txt", StatusCode::BAD_REQUEST),
+        (".git/config", StatusCode::FORBIDDEN),
+        ("src", StatusCode::BAD_REQUEST),
+        ("missing.txt", StatusCode::NOT_FOUND),
+        ("src/missing.rs", StatusCode::NOT_FOUND),
+    ];
+    if cfg!(unix) {
+        rejected_reads.push(("link-file", StatusCode::FORBIDDEN));
+        rejected_reads.push(("link-dir/secret.txt", StatusCode::FORBIDDEN));
+    }
+    for (path, expected) in rejected_reads {
+        let status = client
+            .get(url("/v1/workspace/files/read", &[("path", path)]))
+            .bearer_auth("files-token")
+            .send()
+            .await?
+            .status();
+        assert_eq!(status, expected, "read path={path:?}");
+    }
+    let status = client
+        .get(url(
+            "/v1/workspace/files/read",
+            &[("path", "README.md"), ("limit", "0")],
+        ))
+        .bearer_auth("files-token")
+        .send()
+        .await?
+        .status();
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // Writes: create, then optimistic concurrency on the whole-file revision.
+    let put = |body: Value| {
+        client
+            .put(format!("{base}/v1/workspace/files"))
+            .bearer_auth("files-token")
+            .json(&body)
+    };
+    let status = client
+        .put(format!("{base}/v1/workspace/files"))
+        .json(&json!({"path": "notes/todo.md", "content": "x"}))
+        .send()
+        .await?
+        .status();
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let created = put(json!({"path": "notes/todo.md", "content": "- first\n"}))
+        .send()
+        .await?;
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let created: Value = created.json().await?;
+    assert_eq!(created["created"], true);
+    assert_eq!(created["path"], "notes/todo.md");
+    assert_eq!(created["size"], 8);
+    assert_eq!(
+        fs::read_to_string(workspace.join("notes/todo.md"))?,
+        "- first\n"
+    );
+    let first_revision = created["revision"].as_str().unwrap().to_string();
+    let read_back: Value = client
+        .get(url(
+            "/v1/workspace/files/read",
+            &[("path", "notes/todo.md")],
+        ))
+        .bearer_auth("files-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(read_back["revision"], first_revision);
+
+    // Overwrites need the revision that was read; a stale one is refused.
+    let status = put(json!({"path": "notes/todo.md", "content": "- second\n"}))
+        .send()
+        .await?
+        .status();
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "overwrite without expected_revision"
+    );
+    let stale = put(json!({
+        "path": "notes/todo.md",
+        "content": "- second\n",
+        "expected_revision": "0".repeat(64),
+    }))
+    .send()
+    .await?;
+    assert_eq!(stale.status(), StatusCode::CONFLICT);
+    let stale: Value = stale.json().await?;
     assert!(
-        scan_reads.saturating_mul(2) < per_row_file_reads,
-        "listing {THREADS} rows read {turn_files} turn files and {item_files} item files \
-         ({total_turns} turns, {total_items} items in the store); a per-row \
-         get_thread_detail would have been ~{per_row_file_reads} whole-store file reads"
+        stale["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains(&first_revision),
+        "conflict names the current revision"
+    );
+    assert_eq!(
+        fs::read_to_string(workspace.join("notes/todo.md"))?,
+        "- first\n"
+    );
+    let updated = put(json!({
+        "path": "notes/todo.md",
+        "content": "- second\n",
+        "expected_revision": first_revision,
+    }))
+    .send()
+    .await?;
+    assert_eq!(updated.status(), StatusCode::OK);
+    let updated: Value = updated.json().await?;
+    assert_eq!(updated["created"], false);
+    assert_ne!(updated["revision"], first_revision);
+    assert_eq!(
+        fs::read_to_string(workspace.join("notes/todo.md"))?,
+        "- second\n"
+    );
+    let status = put(json!({
+        "path": "notes/new.md",
+        "content": "x",
+        "expected_revision": first_revision,
+    }))
+    .send()
+    .await?
+    .status();
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "expected_revision on a new file"
+    );
+    assert!(!workspace.join("notes/new.md").exists());
+
+    // Binary payloads, bad encodings, oversized bodies and confinement.
+    let encoded = put(json!({
+        "path": "bin/written.bin",
+        "content": base64::engine::general_purpose::STANDARD.encode([7u8, 0, 9]),
+        "encoding": "base64",
+    }))
+    .send()
+    .await?;
+    assert_eq!(encoded.status(), StatusCode::CREATED);
+    assert_eq!(
+        fs::read(workspace.join("bin/written.bin"))?,
+        vec![7u8, 0, 9]
+    );
+    let status = put(json!({"path": "bin/x", "content": "x", "encoding": "hex"}))
+        .send()
+        .await?
+        .status();
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let status = put(json!({"path": "bin/x", "content": "***", "encoding": "base64"}))
+        .send()
+        .await?
+        .status();
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let status = put(json!({"path": "big.txt", "content": "a".repeat(4 * 1024 * 1024 + 1)}))
+        .send()
+        .await?
+        .status();
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    let mut rejected_writes = vec![
+        ("../outside/x.txt", StatusCode::BAD_REQUEST),
+        ("/tmp/x.txt", StatusCode::BAD_REQUEST),
+        (".git/hooks/pre-commit", StatusCode::FORBIDDEN),
+        ("src", StatusCode::BAD_REQUEST),
+    ];
+    if cfg!(unix) {
+        rejected_writes.push(("link-dir/x.txt", StatusCode::FORBIDDEN));
+        rejected_writes.push(("link-file", StatusCode::FORBIDDEN));
+    }
+    for (path, expected) in rejected_writes {
+        let status = put(json!({"path": path, "content": "x"}))
+            .send()
+            .await?
+            .status();
+        assert_eq!(status, expected, "write path={path:?}");
+    }
+    assert!(!outside.join("x.txt").exists());
+    assert_eq!(
+        fs::read_to_string(outside.join("secret.txt"))?,
+        "never served"
+    );
+    assert!(!workspace.join(".git/hooks/pre-commit").exists());
+
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn session_artifacts_list_and_bounded_read() -> Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let sessions_dir = tmp.path().join("sessions");
+    let workspace = tmp.path().join("workspace");
+    fs::create_dir_all(&workspace)?;
+    let manager = crate::session_manager::SessionManager::new(sessions_dir.clone())?;
+    let session_id = "sess_artifacts_route".to_string();
+    let mut session = crate::session_manager::create_saved_session_with_id_and_mode(
+        session_id.clone(),
+        &[],
+        "deepseek-v4-pro",
+        &workspace,
+        0,
+        None,
+        Some("plan"),
+    );
+    let artifact_dir = sessions_dir.join(&session_id).join("artifacts");
+    fs::create_dir_all(&artifact_dir)?;
+    let body = "line one\nline two\n".repeat(64);
+    fs::write(artifact_dir.join("art_call_1.txt"), &body)?;
+    let served = crate::artifacts::record_tool_output_artifact_with_size(
+        &session_id,
+        "call_1",
+        "bash",
+        PathBuf::from("artifacts/art_call_1.txt"),
+        body.len() as u64,
+        "line one",
+    );
+    let escaping = crate::artifacts::record_tool_output_artifact_with_size(
+        &session_id,
+        "call_2",
+        "bash",
+        PathBuf::from("../../escape.txt"),
+        4,
+        "nope",
+    );
+    fs::write(tmp.path().join("escape.txt"), "nope")?;
+    let missing = crate::artifacts::record_tool_output_artifact_with_size(
+        &session_id,
+        "call_3",
+        "bash",
+        PathBuf::from("artifacts/gone.txt"),
+        4,
+        "gone",
+    );
+    session.artifacts = vec![served.clone(), escaping.clone(), missing.clone()];
+    manager.save_session(&session)?;
+
+    let (addr, _, handle) = spawn_test_server_with_root_token_mobile_workspace(
+        tmp.path().join("runtime"),
+        sessions_dir.clone(),
+        Some("artifacts-token".to_string()),
+        false,
+        workspace,
+    )
+    .await?
+    .context("artifacts test requires a loopback listener")?;
+    let client = crate::tls::reqwest_client();
+    let base = format!("http://{addr}");
+
+    let status = client
+        .get(format!("{base}/v1/sessions/{session_id}/artifacts"))
+        .send()
+        .await?
+        .status();
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let listing: Value = client
+        .get(format!("{base}/v1/sessions/{session_id}/artifacts"))
+        .bearer_auth("artifacts-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(listing["session_id"], session_id);
+    let artifacts = listing["artifacts"].as_array().unwrap();
+    assert_eq!(artifacts.len(), 3);
+    assert_eq!(artifacts[0]["id"], served.id);
+    assert_eq!(artifacts[0]["kind"], "tool_output");
+    assert_eq!(artifacts[0]["tool_name"], "bash");
+    assert_eq!(artifacts[0]["tool_call_id"], "call_1");
+    assert_eq!(artifacts[0]["byte_size"], body.len() as u64);
+    assert_eq!(artifacts[0]["path"], "artifacts/art_call_1.txt");
+    assert_eq!(artifacts[0]["preview"], "line one");
+    assert!(artifacts[0].get("storage_path").is_none());
+
+    let read: Value = client
+        .get(format!(
+            "{base}/v1/sessions/{session_id}/artifacts/{}",
+            served.id
+        ))
+        .bearer_auth("artifacts-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(read["artifact"]["id"], served.id);
+    assert_eq!(read["encoding"], "utf-8");
+    assert_eq!(read["content"], body);
+    assert_eq!(read["size"], body.len() as u64);
+    assert_eq!(read["truncated"], false);
+    let window: Value = client
+        .get(format!(
+            "{base}/v1/sessions/{session_id}/artifacts/{}?offset=5&limit=3",
+            served.id
+        ))
+        .bearer_auth("artifacts-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(window["content"], "one");
+    assert_eq!(window["truncated"], true);
+    assert_eq!(window["revision"], read["revision"]);
+
+    for (artifact_id, expected) in [
+        (escaping.id.as_str(), StatusCode::FORBIDDEN),
+        (missing.id.as_str(), StatusCode::NOT_FOUND),
+        ("art_unknown", StatusCode::NOT_FOUND),
+    ] {
+        let status = client
+            .get(format!(
+                "{base}/v1/sessions/{session_id}/artifacts/{artifact_id}"
+            ))
+            .bearer_auth("artifacts-token")
+            .send()
+            .await?
+            .status();
+        assert_eq!(status, expected, "artifact={artifact_id}");
+    }
+    let status = client
+        .get(format!(
+            "{base}/v1/sessions/{session_id}/artifacts/{}?limit=0",
+            served.id
+        ))
+        .bearer_auth("artifacts-token")
+        .send()
+        .await?
+        .status();
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let status = client
+        .get(format!("{base}/v1/sessions/sess_missing/artifacts"))
+        .bearer_auth("artifacts-token")
+        .send()
+        .await?
+        .status();
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    handle.abort();
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// /v1/jobs: client-owned shell jobs on the thread's shared ShellManager.
+// ---------------------------------------------------------------------------
+
+#[cfg(unix)]
+#[tokio::test]
+async fn jobs_api_lists_creates_streams_stdin_and_kills() -> Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let workspace = tmp.path().join("workspace");
+    fs::create_dir_all(&workspace)?;
+    let (addr, _runtime_threads, handle) = spawn_test_server_with_root_token_mobile_workspace(
+        tmp.path().join("runtime"),
+        tmp.path().join("sessions"),
+        Some("jobs-token".to_string()),
+        false,
+        workspace.clone(),
+    )
+    .await?
+    .context("jobs test requires a loopback listener")?;
+    let client = crate::tls::reqwest_client();
+    let base = format!("http://{addr}");
+
+    // Auth is required on every jobs route.
+    for route in ["/v1/jobs", "/v1/threads/thread-x/jobs"] {
+        let status = client.get(format!("{base}{route}")).send().await?.status();
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{route}");
+    }
+
+    let thread: Value = client
+        .post(format!("{base}/v1/threads"))
+        .bearer_auth("jobs-token")
+        .json(&json!({ "workspace": workspace, "allow_shell": true }))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let thread_id = thread["id"].as_str().unwrap().to_string();
+
+    // A shell-forbidden thread refuses job creation.
+    let no_shell: Value = client
+        .post(format!("{base}/v1/threads"))
+        .bearer_auth("jobs-token")
+        .json(&json!({ "workspace": workspace, "allow_shell": false }))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let no_shell_id = no_shell["id"].as_str().unwrap().to_string();
+    let status = client
+        .post(format!("{base}/v1/threads/{no_shell_id}/jobs"))
+        .bearer_auth("jobs-token")
+        .json(&json!({ "command": "echo never" }))
+        .send()
+        .await?
+        .status();
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // Unknown thread and unknown job are honest 404s, and a thread that never
+    // ran shell work lists empty rather than fabricating a manager.
+    let status = client
+        .get(format!("{base}/v1/threads/thread-missing/jobs"))
+        .bearer_auth("jobs-token")
+        .send()
+        .await?
+        .status();
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let empty: Value = client
+        .get(format!("{base}/v1/threads/{no_shell_id}/jobs"))
+        .bearer_auth("jobs-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(empty["jobs"].as_array().unwrap().len(), 0);
+    let status = client
+        .get(format!(
+            "{base}/v1/threads/{thread_id}/jobs/job-missing/output"
+        ))
+        .bearer_auth("jobs-token")
+        .send()
+        .await?
+        .status();
+    // The thread has no manager yet, so this is a not-found either way.
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // Create a client-owned background job.
+    let created = client
+        .post(format!("{base}/v1/threads/{thread_id}/jobs"))
+        .bearer_auth("jobs-token")
+        .json(&json!({ "command": "echo codewhale-jobs && echo second-line" }))
+        .send()
+        .await?
+        .error_for_status()?;
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let created: Value = created.json().await?;
+    let job_id = created["job"]["id"].as_str().unwrap().to_string();
+    assert_eq!(created["job"]["owner"], "client");
+    assert_eq!(created["job"]["thread_id"], thread_id);
+    assert_eq!(
+        created["job"]["command"],
+        "echo codewhale-jobs && echo second-line"
     );
 
+    // Poll the byte stream until the job exits; the cursor contract replays
+    // the full stream from 0 for a late reader.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let mut chunk: Value;
+    loop {
+        chunk = client
+            .get(format!(
+                "{base}/v1/threads/{thread_id}/jobs/{job_id}/output?format=text"
+            ))
+            .bearer_auth("jobs-token")
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        if chunk["done"].as_bool().unwrap() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "job did not finish: {chunk}"
+        );
+        sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(chunk["status"], "Completed");
+    assert_eq!(chunk["exit_code"], 0);
+    assert!(chunk["data"].as_str().unwrap().contains("codewhale-jobs"));
+    assert_eq!(chunk["dropped"], 0);
+
+    // A cursor at the end stays put; a mid-stream cursor resumes exactly.
+    let total = chunk["total"].as_u64().unwrap();
+    let tail: Value = client
+        .get(format!(
+            "{base}/v1/threads/{thread_id}/jobs/{job_id}/output?format=text&cursor={total}"
+        ))
+        .bearer_auth("jobs-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(tail["data"], "");
+    assert_eq!(tail["next_cursor"], total);
+    assert_eq!(tail["done"], true);
+
+    // stdin round-trip: a `cat` job echoes what the API writes.
+    let cat: Value = client
+        .post(format!("{base}/v1/threads/{thread_id}/jobs"))
+        .bearer_auth("jobs-token")
+        .json(&json!({ "command": "cat" }))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let cat_id = cat["job"]["id"].as_str().unwrap().to_string();
+    assert_eq!(cat["job"]["stdin_available"], true);
+    let status = client
+        .post(format!("{base}/v1/threads/{thread_id}/jobs/{cat_id}/stdin"))
+        .bearer_auth("jobs-token")
+        .json(&json!({ "data": "typed-by-client\n", "close": true }))
+        .send()
+        .await?
+        .status();
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let echoed = loop {
+        let chunk: Value = client
+            .get(format!(
+                "{base}/v1/threads/{thread_id}/jobs/{cat_id}/output?format=text"
+            ))
+            .bearer_auth("jobs-token")
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        if chunk["done"].as_bool().unwrap() {
+            break chunk;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "cat job did not finish: {chunk}"
+        );
+        sleep(std::time::Duration::from_millis(50)).await;
+    };
+    assert_eq!(echoed["data"], "typed-by-client\n");
+
+    // The flat listing sees both jobs, tagged to this thread.
+    let all: Value = client
+        .get(format!("{base}/v1/jobs"))
+        .bearer_auth("jobs-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let ids: Vec<&str> = all["jobs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|job| job["id"].as_str().unwrap())
+        .collect();
+    assert!(ids.contains(&job_id.as_str()) && ids.contains(&cat_id.as_str()));
+
+    // Kill stops a running job and reports the terminal snapshot.
+    let sleeper: Value = client
+        .post(format!("{base}/v1/threads/{thread_id}/jobs"))
+        .bearer_auth("jobs-token")
+        .json(&json!({ "command": "sleep 60" }))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let sleeper_id = sleeper["job"]["id"].as_str().unwrap().to_string();
+    let killed: Value = client
+        .post(format!(
+            "{base}/v1/threads/{thread_id}/jobs/{sleeper_id}/kill"
+        ))
+        .bearer_auth("jobs-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(killed["job"]["status"], "Killed");
+
+    // A job id from another thread's scope is a scoped 404, not a leak.
+    let other: Value = client
+        .post(format!("{base}/v1/threads"))
+        .bearer_auth("jobs-token")
+        .json(&json!({ "workspace": workspace, "allow_shell": true }))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let other_id = other["id"].as_str().unwrap().to_string();
+    let status = client
+        .get(format!("{base}/v1/threads/{other_id}/jobs/{job_id}"))
+        .bearer_auth("jobs-token")
+        .send()
+        .await?
+        .status();
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn thread_context_reports_live_budget_from_the_engine() -> Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let workspace = tmp.path().join("workspace");
+    fs::create_dir_all(&workspace)?;
+    let (addr, _runtime_threads, handle) = spawn_test_server_with_root_token_mobile_workspace(
+        tmp.path().join("runtime"),
+        tmp.path().join("sessions"),
+        Some("context-token".to_string()),
+        false,
+        workspace.clone(),
+    )
+    .await?
+    .context("context test requires a loopback listener")?;
+    let client = crate::tls::reqwest_client();
+    let base = format!("http://{addr}");
+
+    let status = client
+        .get(format!("{base}/v1/threads/thread-x/context"))
+        .send()
+        .await?
+        .status();
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    let status = client
+        .get(format!("{base}/v1/threads/thread-missing/context"))
+        .bearer_auth("context-token")
+        .send()
+        .await?
+        .status();
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    let thread: Value = client
+        .post(format!("{base}/v1/threads"))
+        .bearer_auth("context-token")
+        .json(&json!({ "workspace": workspace }))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let thread_id = thread["id"].as_str().unwrap().to_string();
+
+    let context: Value = client
+        .get(format!("{base}/v1/threads/{thread_id}/context"))
+        .bearer_auth("context-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(context["thread_id"], thread_id);
+    assert_eq!(context["live"], true);
+    let window = context["window_tokens"].as_u64().unwrap();
+    assert!(window > 0, "a resolved route must report its window");
+    assert!(context["input_tokens"].as_u64().unwrap() > 0);
+    assert!(context["available_input_tokens"].as_u64().unwrap() <= window);
+    assert!(context["compaction_trigger_tokens"].as_u64().unwrap() <= window);
+    let percent = context["usage_percent"].as_f64().unwrap();
+    assert!((0.0..=100.0).contains(&percent));
+    assert!(matches!(
+        context["pressure"].as_str(),
+        Some("low" | "moderate" | "high" | "critical")
+    ));
+    // Fresh thread: no provider-billed count exists yet — null, not zero.
+    assert!(context["billed_input_tokens"].is_null());
+
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn provider_key_write_is_write_only_and_reports_readiness() -> Result<()> {
+    // The credential store is only exposed to tests under an explicit isolated
+    // home plus an explicit backend — both scoped to this test by the env lock.
+    let _env_lock = crate::test_support::lock_test_env();
+    let tmp = tempfile::tempdir()?;
+    let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", tmp.path().join("cwhome"));
+    let _backend = crate::test_support::EnvVarGuard::set("CODEWHALE_SECRET_BACKEND", "file");
+    fs::create_dir_all(tmp.path().join("cwhome"))?;
+    let workspace = tmp.path().join("workspace");
+    fs::create_dir_all(&workspace)?;
+
+    let (addr, _runtime_threads, handle) = spawn_test_server_with_root_token_mobile_workspace(
+        tmp.path().join("runtime"),
+        tmp.path().join("sessions"),
+        Some("keys-token".to_string()),
+        false,
+        workspace.clone(),
+    )
+    .await?
+    .context("secrets test requires a loopback listener")?;
+    let client = crate::tls::reqwest_client();
+    let base = format!("http://{addr}");
+
+    let status = client
+        .put(format!("{base}/v1/providers/openai/key"))
+        .json(&json!({ "key": "sk-test-write-only" }))
+        .send()
+        .await?
+        .status();
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    for (id, want) in [
+        ("not-a-provider", StatusCode::BAD_REQUEST),
+        ("deepseek-cn", StatusCode::BAD_REQUEST),
+    ] {
+        let status = client
+            .put(format!("{base}/v1/providers/{id}/key"))
+            .bearer_auth("keys-token")
+            .json(&json!({ "key": "sk-test" }))
+            .send()
+            .await?
+            .status();
+        assert_eq!(status, want, "{id}");
+    }
+    let status = client
+        .put(format!("{base}/v1/providers/openai/key"))
+        .bearer_auth("keys-token")
+        .json(&json!({ "key": "   " }))
+        .send()
+        .await?
+        .status();
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // A key written for the *active* provider reports configured through the
+    // live store even though the test route is a keyless local endpoint —
+    // saving a key declares the api-key contract, exactly as `auth set` would.
+    let receipt: Value = client
+        .put(format!("{base}/v1/providers/deepseek/key"))
+        .bearer_auth("keys-token")
+        .json(&json!({ "key": "sk-test-active-route-key" }))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(receipt["provider"], "deepseek");
+    assert_eq!(receipt["stored"], true);
+    assert!(!receipt.to_string().contains("sk-test-active-route-key"));
+    assert_eq!(receipt["credentialState"], "configured");
+
+    // A key written for a *non-active* provider is the harder case: the
+    // readiness catalog only probes the secret store for it when the
+    // auth-mode save marker is visible, so the route must mirror the
+    // persisted marker into the live config for the readback to be honest.
+    let receipt: Value = client
+        .put(format!("{base}/v1/providers/openai/key"))
+        .bearer_auth("keys-token")
+        .json(&json!({ "key": "sk-test-write-only-key-material" }))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(receipt["provider"], "openai");
+    assert_eq!(receipt["stored"], true);
+    // The receipt is a redacted receipt: no key bytes, not even the length.
+    let raw = receipt.to_string();
+    assert!(!raw.contains("sk-test-write-only-key-material"));
+    assert_eq!(receipt["credentialState"], "configured");
+
+    // The readiness readback agrees through the providers catalog too.
+    let providers: Value = client
+        .get(format!("{base}/v1/providers"))
+        .bearer_auth("keys-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let openai = providers["providers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["id"] == "openai")
+        .expect("openai is listed");
+    assert_eq!(openai["credentialState"], "configured");
+
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn diagnostics_list_and_read_bounded_windows() -> Result<()> {
+    // Log/crash directories resolve from the codewhale home — isolate it.
+    let _env_lock = crate::test_support::lock_test_env();
+    let tmp = tempfile::tempdir()?;
+    let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", tmp.path().join("cwhome"));
+    // Crash dumps resolve under the user home (`<home>/.codewhale/crashes`),
+    // independent of the codewhale-home override that governs logs.
+    let _user_home = crate::test_support::EnvVarGuard::set("HOME", tmp.path().join("userhome"));
+    let logs = tmp.path().join("cwhome/logs");
+    let crashes = tmp.path().join("userhome/.codewhale/crashes");
+    fs::create_dir_all(&logs)?;
+    fs::create_dir_all(&crashes)?;
+    fs::write(logs.join("tui-20990101-1.log"), "line one\nline two\n")?;
+    fs::write(tmp.path().join("cwhome/audit.log"), "{\"event\":\"x\"}\n")?;
+    fs::write(crashes.join("20990101T000000Z-turn.log"), "Panic: boom\n")?;
+    let workspace = tmp.path().join("workspace");
+    fs::create_dir_all(&workspace)?;
+
+    let (addr, _runtime_threads, handle) = spawn_test_server_with_root_token_mobile_workspace(
+        tmp.path().join("runtime"),
+        tmp.path().join("sessions"),
+        Some("diag-token".to_string()),
+        false,
+        workspace,
+    )
+    .await?
+    .context("diagnostics test requires a loopback listener")?;
+    let client = crate::tls::reqwest_client();
+    let base = format!("http://{addr}");
+
+    let status = client.get(format!("{base}/v1/logs")).send().await?.status();
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    let listed: Value = client
+        .get(format!("{base}/v1/logs"))
+        .bearer_auth("diag-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let names: Vec<&str> = listed["sources"][0]["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|f| f["name"].as_str())
+        .collect();
+    assert!(names.contains(&"tui-20990101-1.log"));
+    assert!(names.contains(&"audit.log"));
+
+    // Tail read returns the last bytes only.
+    let tail: Value = client
+        .get(format!("{base}/v1/logs/tui-20990101-1.log?tail=9"))
+        .bearer_auth("diag-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(tail["content"], "line two\n");
+    assert_eq!(tail["encoding"], "utf-8");
+    // A tail window reaches EOF; the skipped prefix shows up as offset > 0.
+    assert_eq!(tail["offset"], 9);
+    assert_eq!(tail["truncated"], false);
+
+    let crashes_list: Value = client
+        .get(format!("{base}/v1/crashes"))
+        .bearer_auth("diag-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert!(
+        crashes_list["sources"][0]["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["name"] == "20990101T000000Z-turn.log")
+    );
+    let crash: Value = client
+        .get(format!("{base}/v1/crashes/20990101T000000Z-turn.log"))
+        .bearer_auth("diag-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(crash["content"], "Panic: boom\n");
+
+    // Traversal and missing files fail closed.
+    let status = client
+        .get(format!("{base}/v1/logs/..%2Fsecret"))
+        .bearer_auth("diag-token")
+        .send()
+        .await?
+        .status();
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let status = client
+        .get(format!("{base}/v1/logs/missing.log"))
+        .bearer_auth("diag-token")
+        .send()
+        .await?
+        .status();
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let status = client
+        .get(format!("{base}/v1/crashes/missing.log"))
+        .bearer_auth("diag-token")
+        .send()
+        .await?
+        .status();
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    let process: Value = client
+        .get(format!("{base}/v1/process"))
+        .bearer_auth("diag-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(process["pid"], json!(std::process::id()));
+    assert!(process["uptime_seconds"].is_number());
+    assert_eq!(process["version"], env!("CARGO_PKG_VERSION"));
+
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn targets_report_self_and_probe_remote_endpoints() -> Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let workspace = tmp.path().join("workspace");
+    fs::create_dir_all(&workspace)?;
+
+    let (addr, _runtime_threads, handle) = spawn_test_server_with_root_token_mobile_workspace(
+        tmp.path().join("runtime"),
+        tmp.path().join("sessions"),
+        Some("targets-token".to_string()),
+        false,
+        workspace,
+    )
+    .await?
+    .context("targets test requires a loopback listener")?;
+    let client = crate::tls::reqwest_client();
+    let base = format!("http://{addr}");
+
+    let status = client
+        .get(format!("{base}/v1/targets"))
+        .send()
+        .await?
+        .status();
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    let targets: Value = client
+        .get(format!("{base}/v1/targets"))
+        .bearer_auth("targets-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let local = &targets["targets"][0];
+    assert_eq!(local["kind"], "local");
+    assert_eq!(local["current"], true);
+    assert_eq!(local["service"], "codewhale-runtime-api");
+    assert_eq!(local["auth_required"], true);
+    assert_eq!(local["endpoint"], json!(base));
+    // Control-plane-owned surfaces answer honestly instead of 404ing.
+    assert_eq!(targets["ssh"]["supported"], false);
+    assert_eq!(targets["ssh"]["owner"], "codewhale-control-plane");
+    assert_eq!(targets["cloud"]["supported"], false);
+    assert_eq!(targets["remote"]["supported"], true);
+
+    let remote: Value = client
+        .get(format!("{base}/v1/remote"))
+        .bearer_auth("targets-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(remote["loopback_only"], true);
+    assert_eq!(remote["auth_required"], true);
+    assert_eq!(remote["port"], json!(addr.port()));
+
+    // The probe identifies this same server as a Codewhale runtime.
+    let probed: Value = client
+        .post(format!("{base}/v1/remote/connect"))
+        .bearer_auth("targets-token")
+        .json(&json!({"endpoint": base}))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(probed["ok"], true);
+    assert_eq!(probed["remote"]["service"], "codewhale-runtime-api");
+    assert_eq!(probed["remote"]["auth_required"], true);
+    assert_eq!(probed["attach"], "client");
+
+    // A closed port is an honest negative verdict, not a server error.
+    let refused: Value = client
+        .post(format!("{base}/v1/remote/connect"))
+        .bearer_auth("targets-token")
+        .json(&json!({"endpoint": "http://127.0.0.1:1"}))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(refused["ok"], false);
+    assert_eq!(refused["reason"], "unreachable");
+
+    // Malformed, non-http, and credentialed endpoints fail closed at 400.
+    for endpoint in [
+        "not-a-url",
+        "ftp://example.com",
+        "http://user:pass@127.0.0.1:7878",
+    ] {
+        let status = client
+            .post(format!("{base}/v1/remote/connect"))
+            .bearer_auth("targets-token")
+            .json(&json!({"endpoint": endpoint}))
+            .send()
+            .await?
+            .status();
+        assert_eq!(status, StatusCode::BAD_REQUEST, "endpoint {endpoint}");
+    }
+    // A token field is an unknown field — never accepted for forwarding
+    // (axum's JSON extractor answers deserialization failures with 422).
+    let status = client
+        .post(format!("{base}/v1/remote/connect"))
+        .bearer_auth("targets-token")
+        .json(&json!({"endpoint": base, "token": "x"}))
+        .send()
+        .await?
+        .status();
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+
+    // Client-owned registry + control-plane-owned surfaces refuse writes.
+    for (method, path) in [
+        ("POST", "/v1/targets"),
+        ("POST", "/v1/targets/switch"),
+        ("POST", "/v1/ssh/connect"),
+        ("POST", "/v1/cloud/attach"),
+    ] {
+        let status = client
+            .request(method.parse()?, format!("{base}{path}"))
+            .bearer_auth("targets-token")
+            .json(&json!({}))
+            .send()
+            .await?
+            .status();
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{method} {path}");
+    }
+    let ssh: Value = client
+        .get(format!("{base}/v1/ssh"))
+        .bearer_auth("targets-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(ssh["supported"], false);
+    let cloud: Value = client
+        .get(format!("{base}/v1/cloud"))
+        .bearer_auth("targets-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(cloud["supported"], false);
+
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn lsp_routes_serve_workspace_files_through_a_transport() -> Result<()> {
+    use crate::lsp::diagnostics::{Diagnostic, Severity};
+    use crate::lsp::registry::Language;
+    use crate::lsp::tests::FakeTransport;
+
+    let tmp = tempfile::tempdir()?;
+    let workspace = tmp.path().join("workspace");
+    fs::create_dir_all(&workspace)?;
+    fs::write(workspace.join("main.rs"), "fn main() {}\n")?;
+    fs::write(workspace.join("notes.unknownext"), "hi\n")?;
+
+    // Seed the shared manager with a fake Rust transport — no real LSP spawn.
+    let manager = Arc::new(crate::lsp::LspManager::new(
+        crate::lsp::LspConfig::default(),
+        workspace.canonicalize()?,
+    ));
+    manager
+        .install_test_transport(
+            Language::Rust,
+            Arc::new(FakeTransport::new(vec![Diagnostic {
+                line: 1,
+                column: 4,
+                severity: Severity::Error,
+                message: "test diagnostic".to_string(),
+            }])),
+        )
+        .await;
+
+    let (addr, _runtime_threads, handle) =
+        spawn_test_server_with_root_token_mobile_workspace_and_overrides(
+            tmp.path().join("runtime"),
+            tmp.path().join("sessions"),
+            Some("lsp-token".to_string()),
+            false,
+            workspace,
+            TestServerOverrides {
+                lsp_manager: Some(manager),
+                ..TestServerOverrides::default()
+            },
+        )
+        .await?
+        .context("lsp test requires a loopback listener")?;
+    let client = crate::tls::reqwest_client();
+    let base = format!("http://{addr}");
+
+    let status = client.get(format!("{base}/v1/lsp")).send().await?.status();
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    let capability: Value = client
+        .get(format!("{base}/v1/lsp"))
+        .bearer_auth("lsp-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(capability["enabled"], true);
+    assert!(
+        capability["languages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|l| l["language"] == "rust")
+    );
+
+    // Real diagnostics through the fake transport.
+    let diagnostics: Value = client
+        .get(format!("{base}/v1/diagnostics?path=main.rs"))
+        .bearer_auth("lsp-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(diagnostics["ok"], true);
+    assert_eq!(diagnostics["items"][0]["severity"], "error");
+    assert_eq!(diagnostics["items"][0]["message"], "test diagnostic");
+
+    // A language without a server is honest data, not an HTTP error.
+    let none: Value = client
+        .get(format!("{base}/v1/diagnostics?path=notes.unknownext"))
+        .bearer_auth("lsp-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(none["ok"], false);
+    assert_eq!(none["reason"], "no_server");
+
+    // Position routes validate `line` before touching LSP.
+    let status = client
+        .get(format!("{base}/v1/definition?path=main.rs"))
+        .bearer_auth("lsp-token")
+        .send()
+        .await?
+        .status();
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // The fake transport declines request-style ops — surfaced as ok:false.
+    let definition: Value = client
+        .get(format!(
+            "{base}/v1/definition?path=main.rs&line=1&character=5"
+        ))
+        .bearer_auth("lsp-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(definition["ok"], false);
+    assert_eq!(definition["reason"], "lsp_error");
+
+    // Traversal and missing files fail closed.
+    for path in ["../escape.rs", ".git/config", "missing.rs"] {
+        let status = client
+            .get(format!("{base}/v1/diagnostics?path={path}"))
+            .bearer_auth("lsp-token")
+            .send()
+            .await?
+            .status();
+        assert!(
+            matches!(
+                status,
+                StatusCode::BAD_REQUEST | StatusCode::FORBIDDEN | StatusCode::NOT_FOUND
+            ),
+            "path {path} -> {status}"
+        );
+    }
+
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn voice_routes_report_capability_and_fail_closed_without_a_recorder() -> Result<()> {
+    let _lock = lock_test_env();
+    // Deterministic: the operator kill-switch keeps the test off the host mic.
+    let _voice_off = EnvVarGuard::set("CODEWHALE_DISABLE_VOICE", "1");
+
+    let tmp = tempfile::tempdir()?;
+    let workspace = tmp.path().join("workspace");
+    fs::create_dir_all(&workspace)?;
+
+    let (addr, _runtime_threads, handle) =
+        spawn_test_server_with_root_token_mobile_workspace_and_overrides(
+            tmp.path().join("runtime"),
+            tmp.path().join("sessions"),
+            Some("voice-token".to_string()),
+            false,
+            workspace,
+            TestServerOverrides::default(),
+        )
+        .await?
+        .context("voice test requires a loopback listener")?;
+    let client = crate::tls::reqwest_client();
+    let base = format!("http://{addr}");
+
+    let status = client
+        .get(format!("{base}/v1/voice"))
+        .send()
+        .await?
+        .status();
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    for path in ["/v1/voice/dictate", "/v1/voice/send", "/v1/voice/control"] {
+        let status = client.post(format!("{base}{path}")).send().await?.status();
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "POST {path}");
+    }
+
+    let status: Value = client
+        .get(format!("{base}/v1/voice"))
+        .bearer_auth("voice-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(status["available"], false);
+    assert!(status["recorder"].is_null());
+    assert!(!status["asr"]["kind"].as_str().unwrap().is_empty());
+    assert_eq!(status["modes"].as_array().unwrap().len(), 3);
+    assert!(status["send_phrases"].as_array().unwrap().len() >= 3);
+    assert_eq!(status["max_record_seconds"], 10);
+
+    // Dictation with no recorder fails closed as data — never an HTTP 5xx.
+    for path in ["/v1/voice/dictate", "/v1/voice/send"] {
+        let outcome: Value = client
+            .post(format!("{base}{path}"))
+            .bearer_auth("voice-token")
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        assert_eq!(outcome["ok"], false, "{path}");
+        assert_eq!(outcome["reason"], "no_recorder", "{path}");
+    }
+
+    // Control mode takes an optional {"composer"} body; still no recorder.
+    let outcome: Value = client
+        .post(format!("{base}/v1/voice/control"))
+        .bearer_auth("voice-token")
+        .json(&json!({ "composer": "draft text" }))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(outcome["ok"], false);
+    assert_eq!(outcome["reason"], "no_recorder");
+
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn git_routes_drive_a_real_workspace_repo() -> Result<()> {
+    use crate::dependencies::{ExternalTool as _, Git};
+
+    let tmp = tempfile::tempdir()?;
+    let workspace = tmp.path().join("workspace");
+    fs::create_dir_all(&workspace)?;
+    let git = |args: &[&str]| {
+        let output = Git::output(args, &workspace)?;
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Ok::<_, anyhow::Error>(output)
+    };
+    git(&["init", "-b", "main"])?;
+    git(&["config", "user.email", "runtime-api@example.test"])?;
+    git(&["config", "user.name", "Runtime API Test"])?;
+    // Windows git defaults to core.autocrlf=true, so `git checkout` rewrites
+    // LF to CRLF on restore and the discard assertion below reads back
+    // "v1\r\n" instead of "v1\n". Pin the fixture repo's line endings so the
+    // test measures the route rather than the host's git config.
+    git(&["config", "core.autocrlf", "false"])?;
+    fs::write(workspace.join("tracked.txt"), "v1\n")?;
+    git(&["add", "tracked.txt"])?;
+    git(&["commit", "-m", "initial"])?;
+
+    let (addr, _runtime_threads, handle) = spawn_test_server_with_root_token_mobile_workspace(
+        tmp.path().join("runtime"),
+        tmp.path().join("sessions"),
+        Some("git-token".to_string()),
+        false,
+        workspace.clone(),
+    )
+    .await?
+    .context("git test requires a loopback listener")?;
+    let client = crate::tls::reqwest_client();
+    let base = format!("http://{addr}");
+
+    let status = client.get(format!("{base}/v1/git")).send().await?.status();
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    // Untracked file shows up in the detail read.
+    fs::write(workspace.join("new.rs"), "fn main() {}\n")?;
+    let detail: Value = client
+        .get(format!("{base}/v1/git"))
+        .bearer_auth("git-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(detail["git_repo"], true);
+    assert_eq!(detail["branch"], "main");
+    assert!(
+        detail["files"].as_array().unwrap().iter().any(|f| {
+            f["path"] == "new.rs" && f["status"] == "untracked" && f["staged"] == false
+        })
+    );
+    assert_eq!(detail["branches"], json!(["main"]));
+
+    // Stage → status reflects the index; commit lands the change.
+    let staged: Value = client
+        .post(format!("{base}/v1/git/stage"))
+        .bearer_auth("git-token")
+        .json(&json!({ "paths": ["new.rs"] }))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(staged["ok"], true);
+    assert_eq!(staged["status"]["staged"], 1);
+    let committed: Value = client
+        .post(format!("{base}/v1/git/commit"))
+        .bearer_auth("git-token")
+        .json(&json!({ "message": "add new.rs" }))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(committed["ok"], true);
+    assert_eq!(committed["status"]["staged"], 0);
+
+    // Branch create+switch, then the graph reports both commits on it.
+    let switched: Value = client
+        .post(format!("{base}/v1/git/branch"))
+        .bearer_auth("git-token")
+        .json(&json!({ "name": "feature-x", "create": true }))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(switched["ok"], true);
+    assert_eq!(switched["status"]["branch"], "feature-x");
+    let graph: Value = client
+        .get(format!("{base}/v1/git/graph"))
+        .bearer_auth("git-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let commits = graph["commits"].as_array().unwrap();
+    assert_eq!(commits.len(), 2);
+    assert_eq!(commits[0]["subject"], "add new.rs");
+    assert!(commits[1]["id"].as_str().unwrap().len() == 40);
+
+    // Discard restores a tracked file; discarding an untracked path fails
+    // closed with git's own message rather than deleting the file.
+    fs::write(workspace.join("tracked.txt"), "v2\n")?;
+    let detail: Value = client
+        .get(format!("{base}/v1/git"))
+        .bearer_auth("git-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert!(detail["files"].as_array().unwrap().iter().any(|f| {
+        f["path"] == "tracked.txt" && f["status"] == "modified" && f["staged"] == false
+    }));
+
+    // The diff reads serve the same worktree change: a unified patch for one
+    // file, the whole tree with a numstat inventory, and the changes list.
+    let file_diff: Value = client
+        .get(format!("{base}/v1/diff?path=tracked.txt"))
+        .bearer_auth("git-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(file_diff["ok"], true);
+    assert_eq!(file_diff["untracked"], false);
+    let patch = file_diff["diff"].as_str().unwrap();
+    assert!(patch.contains("-v1") && patch.contains("+v2"), "{patch}");
+    assert_eq!(file_diff["truncated"], false);
+
+    // An untracked file is honest data: no diff, flagged for the client.
+    fs::write(workspace.join("scratch.txt"), "loose\n")?;
+    let untracked: Value = client
+        .get(format!("{base}/v1/diff?path=scratch.txt"))
+        .bearer_auth("git-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(untracked["ok"], true);
+    assert_eq!(untracked["untracked"], true);
+    assert_eq!(untracked["diff"], "");
+
+    let changes: Value = client
+        .get(format!("{base}/v1/changes"))
+        .bearer_auth("git-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(changes["git_repo"], true);
+    assert!(
+        changes["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["path"] == "tracked.txt" && f["status"] == "modified")
+    );
+
+    let tree: Value = client
+        .get(format!("{base}/v1/workspace/diff"))
+        .bearer_auth("git-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(tree["ok"], true);
+    assert!(
+        tree["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["path"] == "tracked.txt" && f["added"] == 1 && f["deleted"] == 1)
+    );
+    assert!(tree["diff"].as_str().unwrap().contains("+v2"));
+    assert_eq!(tree["truncated"], false);
+
+    // Diff path validation shares the file-route confinement.
+    for (path, want) in [
+        ("../escape.txt", StatusCode::BAD_REQUEST),
+        (".git/config", StatusCode::FORBIDDEN),
+    ] {
+        let status = client
+            .get(format!("{base}/v1/diff?path={path}"))
+            .bearer_auth("git-token")
+            .send()
+            .await?
+            .status();
+        assert_eq!(status, want, "diff path {path}");
+    }
+    let discarded: Value = client
+        .post(format!("{base}/v1/git/discard"))
+        .bearer_auth("git-token")
+        .json(&json!({ "paths": ["tracked.txt"] }))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(discarded["ok"], true);
+    assert_eq!(fs::read_to_string(workspace.join("tracked.txt"))?, "v1\n");
+    let status = client
+        .post(format!("{base}/v1/git/discard"))
+        .bearer_auth("git-token")
+        .json(&json!({ "paths": ["never-tracked.txt"] }))
+        .send()
+        .await?
+        .status();
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // Whole-tree discard stays refused; invalid refs and escapes are stopped
+    // before git ever sees them (the .git refusal is forbidden, the rest are
+    // bad requests).
+    for (route, body, want) in [
+        (
+            "/v1/git/discard",
+            json!({ "all": true }),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "/v1/git/stage",
+            json!({ "paths": ["../escape.txt"] }),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "/v1/git/stage",
+            json!({ "paths": [".git/config"] }),
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            "/v1/git/branch",
+            json!({ "name": "-f" }),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "/v1/git/commit",
+            json!({ "message": " " }),
+            StatusCode::BAD_REQUEST,
+        ),
+    ] {
+        let status = client
+            .post(format!("{base}{route}"))
+            .bearer_auth("git-token")
+            .json(&body)
+            .send()
+            .await?
+            .status();
+        assert_eq!(status, want, "{route} {body}");
+    }
+
+    handle.abort();
+    Ok(())
+}
+
+/// The half of #6179 the credential route was missing: clear, the metadata a
+/// client needs to decide whether to offer the control at all, and the refusal
+/// for a credential Codewhale does not own.
+#[tokio::test]
+async fn provider_key_clear_round_trips_and_reports_writability() -> Result<()> {
+    let _env_lock = crate::test_support::lock_test_env();
+    let tmp = tempfile::tempdir()?;
+    let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", tmp.path().join("cwhome"));
+    let _backend = crate::test_support::EnvVarGuard::set("CODEWHALE_SECRET_BACKEND", "file");
+    fs::create_dir_all(tmp.path().join("cwhome"))?;
+    let workspace = tmp.path().join("workspace");
+    fs::create_dir_all(&workspace)?;
+
+    let (addr, _runtime_threads, handle) = spawn_test_server_with_root_token_mobile_workspace(
+        tmp.path().join("runtime"),
+        tmp.path().join("sessions"),
+        Some("clear-token".to_string()),
+        false,
+        workspace.clone(),
+    )
+    .await?
+    .context("secrets test requires a loopback listener")?;
+    let client = crate::tls::reqwest_client();
+    let base = format!("http://{addr}");
+
+    // Clearing is a credential operation: it authenticates like the write.
+    let status = client
+        .delete(format!("{base}/v1/providers/openai/key"))
+        .send()
+        .await?
+        .status();
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    // Same id validation as the write, so a client cannot discover providers
+    // through one verb that the other rejects.
+    for (id, want) in [
+        ("not-a-provider", StatusCode::BAD_REQUEST),
+        ("deepseek-cn", StatusCode::BAD_REQUEST),
+    ] {
+        let status = client
+            .delete(format!("{base}/v1/providers/{id}/key"))
+            .bearer_auth("clear-token")
+            .send()
+            .await?
+            .status();
+        assert_eq!(status, want, "{id}");
+    }
+
+    client
+        .put(format!("{base}/v1/providers/openai/key"))
+        .bearer_auth("clear-token")
+        .json(&json!({ "key": "sk-key-that-will-be-cleared" }))
+        .send()
+        .await?
+        .error_for_status()?;
+
+    // Before the clear the catalog says the control is live and names the
+    // source it would write — this is what lets a client enable the control.
+    let providers: Value = client
+        .get(format!("{base}/v1/providers"))
+        .bearer_auth("clear-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let openai = providers["providers"]
+        .as_array()
+        .context("providers array")?
+        .iter()
+        .find(|entry| entry["id"] == "openai")
+        .context("openai entry")?
+        .clone();
+    assert_eq!(openai["credentialState"], "configured");
+    assert_eq!(openai["credentialSource"], "secret_store");
+    assert_eq!(openai["credentialWritable"], true);
+    // A writable route carries no refusal reason to render.
+    assert!(openai["credentialWritableReason"].is_null());
+
+    let receipt: Value = client
+        .delete(format!("{base}/v1/providers/openai/key"))
+        .bearer_auth("clear-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(receipt["provider"], "openai");
+    assert_eq!(receipt["cleared"], true);
+    // A clear receipt echoes no more than a write receipt does.
+    assert!(!receipt.to_string().contains("sk-key-that-will-be-cleared"));
+    assert_eq!(receipt["credentialState"], "missing");
+
+    // And the catalog agrees on the next read, through the live config mirror
+    // rather than only after a restart.
+    let providers: Value = client
+        .get(format!("{base}/v1/providers"))
+        .bearer_auth("clear-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let openai = providers["providers"]
+        .as_array()
+        .context("providers array")?
+        .iter()
+        .find(|entry| entry["id"] == "openai")
+        .context("openai entry")?
+        .clone();
+    assert_eq!(openai["credentialState"], "missing");
+    // Still writable: the key is gone, the control is not.
+    assert_eq!(openai["credentialWritable"], true);
+
+    // Clearing an already-clear route is not an error — a client retrying a
+    // revoke must not be told something went wrong.
+    let receipt: Value = client
+        .delete(format!("{base}/v1/providers/openai/key"))
+        .bearer_auth("clear-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(receipt["cleared"], true);
+
+    handle.abort();
+    Ok(())
+}
+
+#[test]
+fn agent_mail_cancel_conflict_maps_to_409() {
+    let conflict = map_agent_mail_err(anyhow::anyhow!(
+        "Agent Mail can be canceled only while queued (status: Delivered)"
+    ));
+    assert_eq!(conflict.status, StatusCode::CONFLICT);
+}
+
+/// #6176: Agent Mail is the durable "submit while running" queue (nothing
+/// ever produces a `Queued` turn record — POST /turns rejects a busy
+/// thread). Withdrawing a queued envelope is idempotent, delivery after
+/// cancel starts no turn, and mail that already left `queued` is an
+/// explicit conflict rather than a silent drop.
+#[tokio::test]
+async fn agent_mail_cancel_withdraws_queued_mail() -> Result<()> {
+    let Some((addr, _runtime_threads, handle)) = spawn_test_server().await? else {
+        return Ok(());
+    };
+    let client = crate::tls::reqwest_client();
+    let base = format!("http://{addr}");
+
+    // Agent Mail addressability needs task-bound threads, and the sender
+    // identity must be the source thread's task id.
+    let new_thread = |task_id: &str| {
+        let client = &client;
+        let base = base.clone();
+        let task_id = task_id.to_string();
+        async move {
+            let thread: Value = client
+                .post(format!("{base}/v1/threads"))
+                .json(&json!({ "task_id": task_id }))
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+            anyhow::Ok(thread["id"].as_str().expect("thread id").to_string())
+        }
+    };
+    let source = new_thread("task_a").await?;
+    let destination = new_thread("task_b").await?;
+
+    let send = |message_id: &str| {
+        let client = &client;
+        let base = base.clone();
+        let source = source.clone();
+        let destination = destination.clone();
+        let message_id = message_id.to_string();
+        async move {
+            let sent = client
+                .post(format!("{base}/v1/agent-mail"))
+                .json(&json!({
+                    "message_id": message_id,
+                    "source_thread_id": source,
+                    "destination_thread_id": destination,
+                    "sender": {"identity": "task_a", "display_label": "Test Sender"},
+                    "summary": "handoff: review the queued work",
+                    "delivery_mode": "queue_only",
+                    "trigger_turn": false,
+                }))
+                .send()
+                .await?;
+            anyhow::Ok(sent)
+        }
+    };
+
+    let sent = send("mail_queue_1").await?;
+    assert_eq!(sent.status(), StatusCode::CREATED);
+    let body: Value = sent.json().await?;
+    assert_eq!(body["envelope"]["status"], "queued");
+
+    let inbox: Value = client
+        .get(format!("{base}/v1/threads/{destination}/agent-mail"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert!(inbox.as_array().is_some_and(|mail| {
+        mail.iter()
+            .any(|item| item["message_id"] == "mail_queue_1" && item["status"] == "queued")
+    }));
+
+    let canceled: Value = client
+        .post(format!(
+            "{base}/v1/threads/{destination}/agent-mail/mail_queue_1/cancel"
+        ))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(canceled["status"], "canceled");
+
+    // Re-cancel is an idempotent no-op returning the stored envelope.
+    let recanceled: Value = client
+        .post(format!(
+            "{base}/v1/threads/{destination}/agent-mail/mail_queue_1/cancel"
+        ))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(recanceled, canceled);
+
+    // Delivery after cancel starts no turn.
+    let delivered: Value = client
+        .post(format!(
+            "{base}/v1/threads/{destination}/agent-mail/mail_queue_1/deliver"
+        ))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(delivered["envelope"]["status"], "canceled");
+    assert!(delivered.get("turn").is_none());
+
+    // Mail that already left `queued` is an explicit conflict.
+    let sent = send("mail_queue_2").await?;
+    assert_eq!(sent.status(), StatusCode::CREATED);
+    let delivered: Value = client
+        .post(format!(
+            "{base}/v1/threads/{destination}/agent-mail/mail_queue_2/deliver"
+        ))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(delivered["envelope"]["status"], "delivered");
+    let conflict = client
+        .post(format!(
+            "{base}/v1/threads/{destination}/agent-mail/mail_queue_2/cancel"
+        ))
+        .send()
+        .await?;
+    assert_eq!(conflict.status(), StatusCode::CONFLICT);
+    assert!(
+        conflict
+            .text()
+            .await?
+            .contains("can be canceled only while queued")
+    );
+
+    // A message addressed elsewhere is a foreign-destination rejection.
+    let foreign = client
+        .post(format!(
+            "{base}/v1/threads/{source}/agent-mail/mail_queue_1/cancel"
+        ))
+        .send()
+        .await?;
+    assert_eq!(foreign.status(), StatusCode::FORBIDDEN);
+
+    // An unknown message id is a 404, never a silent success.
+    let missing = client
+        .post(format!(
+            "{base}/v1/threads/{destination}/agent-mail/mail_nope/cancel"
+        ))
+        .send()
+        .await?;
+    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+
+    handle.abort();
+    Ok(())
+}
+
+/// Running-work accounting (#6180): a watch-only client enumerates owned
+/// in-flight work in one call, with turn identity for targeting, and the
+/// listing clears when the work settles.
+#[tokio::test]
+async fn threads_running_lists_active_turns_and_clears_on_settle() -> Result<()> {
+    let Some((addr, manager, handle)) = spawn_test_server().await? else {
+        return Ok(());
+    };
+    let client = crate::tls::reqwest_client();
+    let base = format!("http://{addr}");
+
+    let idle: serde_json::Value = client
+        .get(format!("{base}/v1/threads/running"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(idle, serde_json::json!([]));
+
+    let created: serde_json::Value = client
+        .post(format!("{base}/v1/threads"))
+        .json(&serde_json::json!({ "model": "test-model" }))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let thread_id = created["id"].as_str().context("missing thread id")?;
+
+    client
+        .post(format!("{base}/v1/threads/{thread_id}/turns"))
+        .json(&serde_json::json!({ "prompt": "do the thing" }))
+        .send()
+        .await?
+        .error_for_status()?;
+
+    // Pin the turn in-flight deterministically: a test server may settle a
+    // started turn on its own, which would make the listing below racy.
+    let mut started = manager
+        .test_store()
+        .list_turns_for_thread(thread_id)?
+        .pop()
+        .context("missing started turn")?;
+    started.status = crate::runtime_threads::RuntimeTurnStatus::InProgress;
+    manager.test_store().save_turn(&started)?;
+
+    let running: serde_json::Value = client
+        .get(format!("{base}/v1/threads/running"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(running.as_array().map(Vec::len), Some(1));
+    assert_eq!(running[0]["thread_id"], thread_id);
+    let active = running[0]["active_turns"]
+        .as_array()
+        .context("missing active_turns")?;
+    assert_eq!(active.len(), 1);
+    assert_eq!(active[0]["status"], "in_progress");
+    let turn_id = active[0]["turn_id"].as_str().context("missing turn id")?;
+
+    // Stop the live runner before the store-side settle. Mid-turn monitor
+    // projection used to load an in-flight snapshot and save_turn it back over
+    // a concurrent Completed write; save_turn now serializes every turn write
+    // (reentrant turn_mutation), late item attaches skip terminal turns, and
+    // interrupting drops the engine so no further projection races the settle.
+    // Prefer the runner's own terminalization when it lands quickly; otherwise
+    // pin Completed the same way the InProgress pin above is authoritative.
+    let _ = manager.interrupt_turn(thread_id, turn_id).await;
+    let settle_deadline = std::time::Instant::now() + Duration::from_millis(500);
+    loop {
+        let turn = manager.test_store().load_turn(turn_id)?;
+        if !turn.status.is_active_work() {
+            break;
+        }
+        if std::time::Instant::now() >= settle_deadline {
+            let mut turn = turn;
+            turn.status = crate::runtime_threads::RuntimeTurnStatus::Completed;
+            manager.test_store().save_turn(&turn)?;
+            break;
+        }
+        sleep(Duration::from_millis(20)).await;
+    }
+
+    // The listing above is read from the durable store, and the engine still
+    // owns this record: it can persist its own status after the write above,
+    // which puts the turn back in flight and made a single read flaky on a
+    // loaded macOS runner. That is not a defect — the engine is entitled to
+    // finish its turn. What must hold is that a settled turn stops being
+    // listed, so poll for that instead of assuming the first read is final.
+    let deadline = std::time::Instant::now() + ci_scaled(Duration::from_secs(5));
+    loop {
+        let settled: serde_json::Value = client
+            .get(format!("{base}/v1/threads/running"))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        if settled == serde_json::json!([]) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "a settled turn must leave the running list: {settled}"
+        );
+        sleep(Duration::from_millis(50)).await;
+    }
+
+    handle.abort();
+    Ok(())
+}
+
+/// Notice serving (#6180): GET lists raised notices with thread/turn
+/// identity, DELETE acks one, unknown notices and threads 404.
+#[tokio::test]
+async fn thread_notices_serve_list_and_ack() -> Result<()> {
+    let Some((addr, manager, handle)) = spawn_test_server().await? else {
+        return Ok(());
+    };
+    let client = crate::tls::reqwest_client();
+    let base = format!("http://{addr}");
+
+    let created: serde_json::Value = client
+        .post(format!("{base}/v1/threads"))
+        .json(&serde_json::json!({ "model": "test-model" }))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let thread_id = created["id"].as_str().context("missing thread id")?;
+
+    let empty: serde_json::Value = client
+        .get(format!("{base}/v1/threads/{thread_id}/notices"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(empty, serde_json::json!([]));
+
+    let notice_id = manager.raise_notice(
+        thread_id,
+        "model-notify",
+        "turn_1",
+        "tool_1",
+        "come back".to_string(),
+    );
+    let listed: serde_json::Value = client
+        .get(format!("{base}/v1/threads/{thread_id}/notices"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(listed.as_array().map(Vec::len), Some(1));
+    assert_eq!(listed[0]["id"], notice_id);
+    assert_eq!(listed[0]["kind"], "model-notify");
+    assert_eq!(listed[0]["turn_id"], "turn_1");
+    assert_eq!(listed[0]["subject"], "tool_1");
+
+    let ack = client
+        .delete(format!("{base}/v1/threads/{thread_id}/notices/{notice_id}"))
+        .send()
+        .await?;
+    assert_eq!(ack.status(), reqwest::StatusCode::NO_CONTENT);
+
+    let cleared: serde_json::Value = client
+        .get(format!("{base}/v1/threads/{thread_id}/notices"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(cleared, serde_json::json!([]));
+
+    let again = client
+        .delete(format!("{base}/v1/threads/{thread_id}/notices/{notice_id}"))
+        .send()
+        .await?;
+    assert_eq!(again.status(), reqwest::StatusCode::NOT_FOUND);
+
+    let unknown = client
+        .get(format!("{base}/v1/threads/nope/notices"))
+        .send()
+        .await?;
+    assert_eq!(unknown.status(), reqwest::StatusCode::NOT_FOUND);
+
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn provider_models_refresh_uses_exact_configured_route_without_switching() -> Result<()> {
+    let _env = crate::test_support::lock_test_env();
+    let root = tempfile::tempdir()?;
+    let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", root.path());
+    let _cli = crate::test_support::EnvVarGuard::remove(codewhale_config::CLI_API_KEY_ENV);
+    crate::provider_catalog_live::reset_cache_for_test();
+    let upstream = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/v1/models"))
+        .and(wiremock::matchers::header(
+            "Authorization",
+            "Bearer refresh-fixture-key",
+        ))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .set_body_json(json!({"data":[{"id":"discovered-fixture-model"}]})),
+        )
+        .expect(1)
+        .mount(&upstream)
+        .await;
+    let config_path = root.path().join("config.toml");
+    fs::write(
+        &config_path,
+        format!(
+            r#"provider = "first"
+[providers.first]
+kind = "openai-compatible"
+base_url = "http://127.0.0.1:9/v1"
+model = "saved-model"
+[providers.second]
+kind = "openai-compatible"
+base_url = "{}/v1"
+api_key = "refresh-fixture-key"
+"#,
+            upstream.uri()
+        ),
+    )?;
+    let (addr, _, handle) = spawn_test_server_with_config_path(config_path)
+        .await?
+        .expect("loopback server required");
+    let client = crate::tls::reqwest_client_builder()
+        .timeout(Duration::from_secs(5))
+        .build()?;
+    for suffix in [
+        "custom/models/refresh?model_provider_id=",
+        "custom/models/refresh?model_provider_id=missing",
+        "openai/models/refresh?model_provider_id=second",
+        "deepseek-cn/models/refresh",
+        "custom/models/refresh?base_url=https://untrusted.invalid",
+    ] {
+        assert_eq!(
+            client
+                .post(format!("http://{addr}/v1/providers/{suffix}"))
+                .send()
+                .await?
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+    }
+    let response = client
+        .post(format!(
+            "http://{addr}/v1/providers/custom/models/refresh?model_provider_id=second"
+        ))
+        .send()
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let receipt: Value = response.json().await?;
+    assert_eq!(receipt["outcome"], "updated");
+    assert_eq!(receipt["model_count"], 1);
+    assert!(!receipt.to_string().contains("refresh-fixture-key"));
+    let catalog: Value = client
+        .get(format!(
+            "http://{addr}/v1/providers/custom/models?model_provider_id=second"
+        ))
+        .send()
+        .await?
+        .json()
+        .await?;
+    assert!(
+        catalog["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["id"] == "discovered-fixture-model")
+    );
+    assert_eq!(get_config(&client, &addr).await["provider"], "first");
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn mcp_management_selected_connection_and_retry_preserve_siblings() -> Result<()> {
+    use axum::response::IntoResponse as _;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    async fn fixture(
+        State(count): State<Arc<AtomicUsize>>,
+        Json(request): Json<Value>,
+    ) -> axum::response::Response {
+        let Some(id) = request.get("id") else {
+            return StatusCode::NO_CONTENT.into_response();
+        };
+        let result = match request["method"].as_str().unwrap_or_default() {
+            "initialize" => {
+                count.fetch_add(1, Ordering::SeqCst);
+                json!({"protocolVersion":request["params"]["protocolVersion"],"capabilities":{"tools":{}},"serverInfo":{"name":"fixture","version":"1"}})
+            }
+            "tools/list" => {
+                json!({"tools":[{"name":"fixture_tool","inputSchema":{"type":"object"}}]})
+            }
+            _ => json!({}),
+        };
+        Json(json!({"jsonrpc":"2.0","id":id,"result":result})).into_response()
+    }
+    let one = Arc::new(AtomicUsize::new(0));
+    let two = Arc::new(AtomicUsize::new(0));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let fixture_addr = listener.local_addr()?;
+    let app = axum::Router::new()
+        .route("/one", axum::routing::post(fixture).with_state(one.clone()))
+        .route("/two", axum::routing::post(fixture).with_state(two.clone()));
+    let fixture_task = tokio::spawn(async move { axum::serve(listener, app).await });
+    let root = tempfile::tempdir()?;
+    fs::write(
+        root.path().join("mcp.json"),
+        json!({"servers":{
+            "one":{"url":format!("http://{fixture_addr}/one"),"transport":"streamable_http"},
+            "two":{"url":format!("http://{fixture_addr}/two"),"transport":"streamable_http"},
+            "broken":{"command":root.path().join("missing-executable"),"connect_timeout":1}
+        }})
+        .to_string(),
+    )?;
+    let (addr, _, handle) =
+        spawn_test_server_with_root(root.path().to_owned(), root.path().join("sessions"))
+            .await?
+            .context("MCP management test requires loopback")?;
+    let client = crate::tls::reqwest_client();
+    let base = format!("http://{addr}/v1/apps/mcp");
+    let failed: Value = client
+        .get(format!("{base}/tools?server=broken&connect=true"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(failed["connections"][0]["server"], "broken");
+    assert_eq!(failed["connections"][0]["connected"], false);
+    assert!(failed["connections"][0]["error"].is_string());
+    assert_eq!(one.load(Ordering::SeqCst), 0);
+    assert_eq!(two.load(Ordering::SeqCst), 0);
+    let selected: Value = client
+        .get(format!("{base}/tools?server=one&connect=true"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(selected["connections"][0]["connected"], true, "{selected}");
+    assert_eq!(one.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        two.load(Ordering::SeqCst),
+        0,
+        "testing one server must not connect its sibling"
+    );
+    let second: Value = client
+        .get(format!("{base}/tools?server=two&connect=true"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(second["connections"][0]["connected"], true, "{second}");
+    let retry: Value = client
+        .post(format!("{base}/servers/one/reconnect"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(retry["ok"], true, "{retry}");
+    assert_eq!(one.load(Ordering::SeqCst), 2);
+    assert_eq!(two.load(Ordering::SeqCst), 1);
+    let listing: Value = client
+        .get(format!("{base}/servers"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    for name in ["one", "two"] {
+        let row = listing["servers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["name"] == name)
+            .unwrap();
+        assert_eq!(row["connected"], true, "{listing}");
+        assert_eq!(row["origin"], "global");
+        assert_eq!(row["writable"], true);
+    }
+    let mut changed: Value =
+        serde_json::from_str(&fs::read_to_string(root.path().join("mcp.json"))?)?;
+    changed["servers"]["one"]["enabled"] = json!(false);
+    fs::write(root.path().join("mcp.json"), changed.to_string())?;
+    let disabled: Value = client
+        .post(format!("{base}/servers/one/reconnect"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(disabled["ok"], false);
+    assert!(
+        disabled["connection"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("disabled")
+    );
+    assert_eq!(
+        one.load(Ordering::SeqCst),
+        2,
+        "disabled retry must not launch the old cached config"
+    );
+    changed["servers"]["one"]["enabled"] = json!(true);
+    changed["servers"]["one"]["url"] = json!(format!("http://{fixture_addr}/two"));
+    fs::write(root.path().join("mcp.json"), changed.to_string())?;
+    let stale: Value = client
+        .post(format!("{base}/servers/one/reconnect"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(stale["ok"], false);
+    assert!(
+        stale["connection"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("configuration changed")
+    );
+    assert_eq!(one.load(Ordering::SeqCst), 2);
+    assert_eq!(two.load(Ordering::SeqCst), 1);
+    let stale_connect: Value = client
+        .get(format!("{base}/tools?server=one&connect=true"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert!(
+        stale_connect["connections"][0]["error"]
+            .as_str()
+            .unwrap()
+            .contains("configuration changed")
+    );
+    assert_eq!(stale_connect["tools"], json!([]));
+    fs::write(root.path().join("mcp.json"), "{malformed")?;
+    let malformed = client
+        .get(format!("{base}/tools?server=one&connect=true"))
+        .send()
+        .await?;
+    assert_eq!(malformed.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(
+        one.load(Ordering::SeqCst),
+        2,
+        "malformed sources must not connect cached endpoints"
+    );
+    assert_eq!(two.load(Ordering::SeqCst), 1);
+    handle.abort();
+    fixture_task.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn mcp_management_project_ownership_blocks_global_shadow_mutations() -> Result<()> {
+    let _env = crate::test_support::lock_test_env();
+    let root = tempfile::tempdir()?;
+    let workspace = root.path().join("workspace");
+    fs::create_dir_all(workspace.join(".codewhale"))?;
+    let trust_path = root.path().join("trust.toml");
+    let trusted = workspace.canonicalize()?;
+    let mut projects = toml::map::Map::new();
+    projects.insert(
+        trusted.display().to_string(),
+        toml::Value::try_from(json!({"trust_level":"trusted"}))?,
+    );
+    fs::write(
+        &trust_path,
+        toml::to_string(&toml::Value::Table(toml::map::Map::from_iter([(
+            "projects".to_owned(),
+            toml::Value::Table(projects),
+        )])))?,
+    )?;
+    let _path = crate::test_support::EnvVarGuard::set("CODEWHALE_CONFIG_PATH", &trust_path);
+    let _legacy = crate::test_support::EnvVarGuard::remove("DEEPSEEK_CONFIG_PATH");
+    let global = json!({"servers":{"shared":{"command":"global-command"},"global":{"command":"global-command"}}}).to_string();
+    let project = json!({"servers":{"shared":{"command":root.path().join("missing-project-executable")},"project":{"command":root.path().join("missing-project-executable")}}}).to_string();
+    fs::write(root.path().join("mcp.json"), &global)?;
+    fs::write(workspace.join(".codewhale/mcp.json"), &project)?;
+    let (addr, _, handle) = spawn_test_server_with_root_token_mobile_workspace(
+        root.path().to_owned(),
+        root.path().join("sessions"),
+        None,
+        false,
+        workspace.clone(),
+    )
+    .await?
+    .context("MCP ownership test requires loopback")?;
+    let client = crate::tls::reqwest_client();
+    let base = format!("http://{addr}/v1/apps/mcp/servers");
+    let listing: Value = client
+        .get(&base)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    for name in ["shared", "project"] {
+        let row = listing["servers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["name"] == name)
+            .unwrap();
+        assert_eq!(row["origin"], "project", "{listing}");
+        assert_eq!(row["writable"], false);
+        let detail: Value = client
+            .get(format!("{base}/{name}"))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        assert_eq!(detail["origin"], "project");
+        assert_eq!(detail["writable"], false);
+        assert_eq!(
+            client
+                .patch(format!("{base}/{name}"))
+                .header(header::IF_MATCH, mcp_test_revision(&client, &base).await?)
+                .json(&json!({"enabled":false}))
+                .send()
+                .await?
+                .status(),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            client
+                .delete(format!("{base}/{name}"))
+                .header(header::IF_MATCH, mcp_test_revision(&client, &base).await?)
+                .send()
+                .await?
+                .status(),
+            StatusCode::CONFLICT
+        );
+        for action in ["enable", "disable"] {
+            assert_eq!(
+                client
+                    .post(format!("{base}/{name}/{action}"))
+                    .header(header::IF_MATCH, mcp_test_revision(&client, &base).await?)
+                    .send()
+                    .await?
+                    .status(),
+                StatusCode::CONFLICT
+            );
+        }
+        assert_eq!(
+            client
+                .post(&base)
+                .header(header::IF_MATCH, mcp_test_revision(&client, &base).await?)
+                .json(&json!({"name":name,"command":"override"}))
+                .send()
+                .await?
+                .status(),
+            StatusCode::CONFLICT
+        );
+    }
+    assert_eq!(fs::read_to_string(root.path().join("mcp.json"))?, global);
+    assert_eq!(
+        fs::read_to_string(workspace.join(".codewhale/mcp.json"))?,
+        project
+    );
+    // Initialize the pool under project authority, without a real executable.
+    let trusted_connect: Value = client
+        .get(format!(
+            "http://{addr}/v1/apps/mcp/tools?server=project&connect=true"
+        ))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert!(trusted_connect["connections"][0]["error"].is_string());
+    // Removing workspace trust removes project ownership rather than
+    // labelling an ignored repository file as writable effective state.
+    fs::write(&trust_path, "")?;
+    let detail: Value = client
+        .get(format!("{base}/shared"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(detail["origin"], "global");
+    assert_eq!(detail["writable"], true);
+    let revoked_connect: Value = client
+        .get(format!(
+            "http://{addr}/v1/apps/mcp/tools?server=project&connect=true"
+        ))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert!(
+        revoked_connect["connections"][0]["error"]
+            .as_str()
+            .unwrap()
+            .contains("configuration changed")
+    );
+    assert_eq!(revoked_connect["tools"], json!([]));
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn mcp_server_management_blocks_credential_retargeting() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let mut servers = serde_json::Map::new();
+    for (name, field, value) in [
+        ("env", "env", json!({"API_KEY":"fixture-private-value"})),
+        (
+            "headers",
+            "headers",
+            json!({"Authorization":"fixture-private-value"}),
+        ),
+        (
+            "env_headers",
+            "env_headers",
+            json!({"Authorization":"FIXTURE_TOKEN"}),
+        ),
+        ("bearer", "bearer_token_env_var", json!("FIXTURE_TOKEN")),
+        (
+            "oauth",
+            "oauth",
+            json!({"client_id":"fixture-private-value"}),
+        ),
+        ("scopes", "scopes", json!(["tools"])),
+        (
+            "resource",
+            "oauth_resource",
+            json!("https://original.invalid/resource"),
+        ),
+    ] {
+        let mut server = json!({"command":"original-command","args":["original"],"url":"https://original.invalid/mcp","transport":"sse"});
+        server[field] = value;
+        servers.insert(name.to_owned(), server);
+    }
+    servers.insert("plain".to_owned(), json!({"command":"original-command"}));
+    let path = root.path().join("mcp.json");
+    fs::write(&path, json!({"servers":servers}).to_string())?;
+    let (addr, _, handle) =
+        spawn_test_server_with_root(root.path().to_owned(), root.path().join("sessions"))
+            .await?
+            .context("MCP credential guard test requires loopback")?;
+    let client = crate::tls::reqwest_client();
+    let base = format!("http://{addr}/v1/apps/mcp/servers");
+    for name in [
+        "env",
+        "headers",
+        "env_headers",
+        "bearer",
+        "oauth",
+        "scopes",
+        "resource",
+    ] {
+        let detail: Value = client
+            .get(format!("{base}/{name}"))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        assert_eq!(detail["credential_configured"], true, "{name}");
+        assert!(!detail.to_string().contains("fixture-private-value"));
+        for private_field in [
+            "env",
+            "headers",
+            "env_headers",
+            "bearer_token_env_var",
+            "oauth",
+        ] {
+            assert!(
+                detail.get(private_field).is_none(),
+                "{name}: {private_field}"
+            );
+        }
+        client
+            .patch(format!("{base}/{name}"))
+            .header(header::IF_MATCH, mcp_test_revision(&client, &base).await?)
+            .json(&json!({"connect_timeout":17}))
+            .send()
+            .await?
+            .error_for_status()?;
+        let before = fs::read(&path)?;
+        for patch in [
+            json!({"command":"replacement-command"}),
+            json!({"args":["replacement"]}),
+            json!({"url":"https://other.invalid/mcp"}),
+            json!({"transport":null}),
+        ] {
+            let response = client
+                .patch(format!("{base}/{name}"))
+                .header(header::IF_MATCH, mcp_test_revision(&client, &base).await?)
+                .json(&patch)
+                .send()
+                .await?;
+            assert_eq!(response.status(), StatusCode::CONFLICT, "{name}: {patch}");
+            assert_eq!(
+                fs::read(&path)?,
+                before,
+                "rejected retarget must not change config"
+            );
+        }
+    }
+    let plain: Value = client
+        .patch(format!("{base}/plain"))
+        .header(header::IF_MATCH, mcp_test_revision(&client, &base).await?)
+        .json(&json!({"command":"replacement-command"}))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(plain["credential_configured"], false);
+    let cleared: Value = client
+        .patch(format!("{base}/env"))
+        .header(header::IF_MATCH, mcp_test_revision(&client, &base).await?)
+        .json(&json!({"env":{},"command":"replacement-command"}))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(cleared["credential_configured"], false);
+    assert_eq!(cleared["command"], "replacement-command");
+    handle.abort();
+    Ok(())
+}
+
+async fn mcp_test_revision(client: &reqwest::Client, base: &str) -> Result<String> {
+    let listing: Value = client
+        .get(base)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    Ok(format!(
+        "\"{}\"",
+        listing["revision"]
+            .as_str()
+            .context("MCP revision missing")?
+    ))
+}
+
+#[tokio::test]
+async fn mcp_management_revision_precondition_prevents_stale_mutation() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let (addr, _, handle) =
+        spawn_test_server_with_root(root.path().to_owned(), root.path().join("sessions"))
+            .await?
+            .context("loopback required")?;
+    let client = crate::tls::reqwest_client();
+    let base = format!("http://{addr}/v1/apps/mcp/servers");
+    let absent = mcp_test_revision(&client, &base).await?;
+    assert_eq!(absent, "\"mcp-v1-absent\"");
+    assert_eq!(
+        client
+            .post(&base)
+            .json(&json!({"name":"one","command":"one"}))
+            .send()
+            .await?
+            .status(),
+        StatusCode::PRECONDITION_REQUIRED
+    );
+    let created: Value = client
+        .post(&base)
+        .header(header::IF_MATCH, &absent)
+        .json(&json!({"name":"one","command":"one"}))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert!(created["revision"].as_str().unwrap().starts_with("mcp-v1-"));
+    let path = root.path().join("mcp.json");
+    let before = fs::read(&path)?;
+    for request in [
+        client
+            .post(&base)
+            .json(&json!({"name":"two","command":"two"})),
+        client
+            .patch(format!("{base}/one"))
+            .json(&json!({"command":"changed"})),
+        client.delete(format!("{base}/one")),
+        client.post(format!("{base}/one/enable")),
+        client.post(format!("{base}/one/disable")),
+    ] {
+        assert_eq!(
+            request
+                .header(header::IF_MATCH, &absent)
+                .send()
+                .await?
+                .status(),
+            StatusCode::PRECONDITION_FAILED
+        );
+        assert_eq!(fs::read(&path)?, before);
+    }
+    assert_eq!(
+        client
+            .delete(format!("{base}/one"))
+            .header(header::IF_MATCH, "*")
+            .send()
+            .await?
+            .status(),
+        StatusCode::BAD_REQUEST
+    );
+    let current = mcp_test_revision(&client, &base).await?;
+    let disabled: Value = client
+        .post(format!("{base}/one/disable"))
+        .header(header::IF_MATCH, &current)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_ne!(disabled["revision"], created["revision"]);
+    handle.abort();
+    Ok(())
+}
+
+#[cfg(all(unix, not(target_env = "ohos")))]
+#[tokio::test]
+async fn jobs_api_pty_resize_raw_input_and_nonblocking_poll() -> Result<()> {
+    use base64::Engine as _;
+    let tmp = tempfile::tempdir()?;
+    let workspace = tmp.path().join("workspace");
+    fs::create_dir_all(&workspace)?;
+    let (addr, _, handle) = spawn_test_server_with_root_token_mobile_workspace(
+        tmp.path().join("runtime"),
+        tmp.path().join("sessions"),
+        Some("pty-token".into()),
+        false,
+        workspace.clone(),
+    )
+    .await?
+    .context("PTY test requires loopback listener")?;
+    let client = crate::tls::reqwest_client();
+    let base = format!("http://{addr}");
+    let thread: Value = client
+        .post(format!("{base}/v1/threads"))
+        .bearer_auth("pty-token")
+        .json(&json!({"workspace":workspace,"allow_shell":true}))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let thread_id = thread["id"].as_str().unwrap();
+    let jobs = format!("{base}/v1/threads/{thread_id}/jobs");
+    let created: Value = client.post(&jobs).bearer_auth("pty-token")
+        .json(&json!({"command":"stty -echo; printf ready; while IFS= read -r line; do stty size; done", "tty":true}))
+        .send().await?.error_for_status()?.json().await?;
+    assert_eq!(created["job"]["tty"], true);
+    assert_eq!(
+        created["job"]["terminal_size"],
+        json!({"rows":24,"cols":80})
+    );
+    let job_id = created["job"]["job_id"].as_str().unwrap();
+    let job = format!("{jobs}/{job_id}");
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let output: Value = client
+            .get(format!("{job}/output?format=text"))
+            .bearer_auth("pty-token")
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        if output["data"].as_str().unwrap().contains("ready") {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline);
+        sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        client
+            .post(format!("{job}/resize"))
+            .json(&json!({"rows":30,"cols":90}))
+            .send()
+            .await?
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    for size in [json!({"rows":0,"cols":90}), json!({"rows":30,"cols":1001})] {
+        assert_eq!(
+            client
+                .post(format!("{job}/resize"))
+                .bearer_auth("pty-token")
+                .json(&size)
+                .send()
+                .await?
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+    }
+    let resized: Value = client
+        .post(format!("{job}/resize"))
+        .bearer_auth("pty-token")
+        .json(&json!({"rows":42,"cols":123}))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(
+        resized["job"]["terminal_size"],
+        json!({"rows":42,"cols":123})
+    );
+    client
+        .post(format!("{job}/stdin"))
+        .bearer_auth("pty-token")
+        .json(&json!({"data":"size\n"}))
+        .send()
+        .await?
+        .error_for_status()?;
+    loop {
+        let output: Value = client
+            .get(format!("{job}/output?format=text"))
+            .bearer_auth("pty-token")
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        if output["data"].as_str().unwrap().contains("42 123") {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline);
+        sleep(Duration::from_millis(20)).await;
+    }
+    let other: Value = client
+        .post(format!("{base}/v1/threads"))
+        .bearer_auth("pty-token")
+        .json(&json!({"workspace":workspace,"allow_shell":true}))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(
+        client
+            .post(format!(
+                "{base}/v1/threads/{}/jobs/{job_id}/resize",
+                other["id"].as_str().unwrap()
+            ))
+            .bearer_auth("pty-token")
+            .json(&json!({"rows":30,"cols":90}))
+            .send()
+            .await?
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+    client
+        .post(format!("{job}/kill"))
+        .bearer_auth("pty-token")
+        .send()
+        .await?
+        .error_for_status()?;
+    assert_eq!(
+        client
+            .post(format!("{job}/resize"))
+            .bearer_auth("pty-token")
+            .json(&json!({"rows":30,"cols":90}))
+            .send()
+            .await?
+            .status(),
+        StatusCode::CONFLICT
+    );
+
+    let cat: Value = client
+        .post(&jobs)
+        .bearer_auth("pty-token")
+        .json(&json!({"command":"cat"}))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(cat["job"]["tty"], false);
+    assert!(cat["job"]["terminal_size"].is_null());
+    let cat_job = format!("{jobs}/{}", cat["job"]["job_id"].as_str().unwrap());
+    assert_eq!(
+        client
+            .post(format!("{cat_job}/resize"))
+            .bearer_auth("pty-token")
+            .json(&json!({"rows":30,"cols":90}))
+            .send()
+            .await?
+            .status(),
+        StatusCode::BAD_REQUEST
+    );
+    // A 5-second output long-poll must not hold the owner lock against stdin.
+    let poll_client = client.clone();
+    let poll_url = format!("{cat_job}/output?wait_ms=5000");
+    let polling = tokio::spawn(async move {
+        poll_client
+            .get(poll_url)
+            .bearer_auth("pty-token")
+            .send()
+            .await
+    });
+    sleep(Duration::from_millis(100)).await;
+    let bytes = b"\0\xff\x1b[A\x03\n";
+    tokio::time::timeout(Duration::from_secs(2), client.post(format!("{cat_job}/stdin"))
+        .bearer_auth("pty-token").json(&json!({"data":base64::engine::general_purpose::STANDARD.encode(bytes), "encoding":"base64", "close":true})).send()).await??.error_for_status()?;
+    let _ = polling.await??.error_for_status()?;
+    let output: Value = client
+        .get(format!("{cat_job}/output?wait_ms=1000"))
+        .bearer_auth("pty-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(
+        base64::engine::general_purpose::STANDARD.decode(output["data"].as_str().unwrap())?,
+        bytes
+    );
+    let replay: Value = client
+        .get(format!("{cat_job}/output"))
+        .bearer_auth("pty-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(replay["data"], output["data"]);
+    let end = output["next_cursor"].as_u64().unwrap();
+    let tail: Value = client
+        .get(format!("{cat_job}/output?cursor={end}"))
+        .bearer_auth("pty-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(tail["data"], "");
     handle.abort();
     Ok(())
 }

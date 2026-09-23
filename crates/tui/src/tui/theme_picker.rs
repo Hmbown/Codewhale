@@ -28,6 +28,7 @@ use ratatui::{
     widgets::{Paragraph, Widget},
 };
 
+use crate::settings::DEFAULT_TUI_THEME;
 use crate::tui::menu_style;
 use crate::tui::settings_picker::{
     PickerNavResult, SettingAvailability, SettingOption, SettingValues, SettingsPickerController,
@@ -226,9 +227,8 @@ fn theme_options_with_custom(
                 .help("Pick a theme with live preview")
                 .values(SettingValues::new(
                     Cow::Owned(current.clone()),
-                    // A reset returns to the underwater default, not a
-                    // detected palette that can repaint it.
-                    Cow::Borrowed("underwater"),
+                    // Reset uses the same default as fresh terminal settings.
+                    Cow::Borrowed(DEFAULT_TUI_THEME),
                     Cow::Borrowed(name),
                 ))
                 .availability(SettingAvailability::Available)
@@ -255,7 +255,7 @@ fn theme_options_with_custom(
                 .help("Pick a user-authored theme overlay")
                 .values(SettingValues::new(
                     Cow::Owned(current.clone()),
-                    Cow::Borrowed("underwater"),
+                    Cow::Borrowed(DEFAULT_TUI_THEME),
                     Cow::Owned(custom.selector.clone()),
                 ))
                 .availability(SettingAvailability::Available)
@@ -612,11 +612,11 @@ mod tests {
     #[test]
     fn enter_commits_with_persist_true() {
         let mut v = ThemePickerView::new("system".to_string());
-        v.handle_key(key(KeyCode::Char('8'))); // -> CatppuccinMocha
+        v.handle_key(key(KeyCode::Char('9'))); // -> Grayscale
         let action = v.handle_key(key(KeyCode::Enter));
         match action {
             ViewAction::EmitAndClose(ViewEvent::ThemeSelectionUpdated { theme, persist }) => {
-                assert_eq!(theme, ThemeId::CatppuccinMocha.name());
+                assert_eq!(theme, ThemeId::Grayscale.name());
                 assert!(persist);
             }
             other => panic!("expected commit, got {other:?}"),
@@ -706,11 +706,11 @@ mod tests {
     }
 
     #[test]
-    fn digit_jumps_to_underwater_and_previews() {
+    fn digit_jumps_to_shoreline_and_previews() {
         let mut v = ThemePickerView::new("system".to_string());
         let action = v.handle_key(key(KeyCode::Char('3')));
-        // Underwater follows System and Terminal.
-        assert_eq!(selected_values(&action), Some(("underwater", false)));
+        // Shoreline follows System and Terminal.
+        assert_eq!(selected_values(&action), Some(("shoreline", false)));
     }
 
     #[test]
@@ -897,188 +897,3 @@ mod tests {
         }
     }
 }
-
-use unicode_width::UnicodeWidthStr as _TidelineWidth;
-
-// ---------------------------------------------------------------------------
-// Tideline theme list (spec §5a "Theme list"): the 14 selectable themes
-// (4 mode rows + 9 presets), the selected row boxed with ✓, and the MOTION
-// (OPTIONAL) toggles. Translation scaffolding in the topbar mold: pure,
-// deterministic, injected selection — Up/Down preview and Enter apply stay
-// the shared settings-picker controller's job at the landing slice; not
-// wired into `ui/frame.rs` (#5698 gate).
-
-/// The 14 themes in display order: 4 mode rows then 10 presets.
-#[allow(dead_code)] // translation scaffolding: wired by the landing slice
-pub fn tideline_theme_rows() -> Vec<codewhale_palette::ThemeId> {
-    codewhale_palette::SELECTABLE_THEMES.to_vec()
-}
-
-/// What the caller owes the theme-list render.
-#[allow(dead_code)] // translation scaffolding: wired by the landing slice
-pub struct TidelineThemeList<'a> {
-    pub theme: &'a UiTheme,
-    /// Selected row index into the 14-theme display order.
-    pub selected: usize,
-    /// `low_motion` setting (MOTION OPTIONAL toggle 1).
-    pub low_motion: bool,
-    /// `fancy_animations` setting (MOTION OPTIONAL toggle 2).
-    pub fancy_animations: bool,
-    pub ascii_safe: bool,
-}
-
-#[allow(dead_code)] // translation scaffolding: builder methods feed tests + the landing slice
-impl<'a> TidelineThemeList<'a> {
-    #[allow(dead_code)] // translation scaffolding: wired by the landing slice
-    #[must_use]
-    pub fn new(theme: &'a UiTheme, selected: usize) -> Self {
-        Self {
-            theme,
-            selected,
-            low_motion: false,
-            fancy_animations: true,
-            ascii_safe: false,
-        }
-    }
-
-    #[must_use]
-    pub fn motion(mut self, low_motion: bool, fancy_animations: bool) -> Self {
-        self.low_motion = low_motion;
-        self.fancy_animations = fancy_animations;
-        self
-    }
-
-    #[must_use]
-    pub fn ascii_safe(mut self, ascii_safe: bool) -> Self {
-        self.ascii_safe = ascii_safe;
-        self
-    }
-
-    fn sym(&self, glyph: &str) -> String {
-        if !self.ascii_safe {
-            return glyph.to_string();
-        }
-        if let Some(fb) = crate::tui::glyphs::ascii_fallback(glyph) {
-            return fb.to_string();
-        }
-        glyph
-            .chars()
-            .map(|c| {
-                crate::tui::glyphs::ascii_fallback(&c.to_string())
-                    .map(str::to_string)
-                    .unwrap_or_else(|| c.to_string())
-            })
-            .collect()
-    }
-}
-
-fn tput(buf: &mut Buffer, x: u16, y: u16, text: &str, style: Style) {
-    buf.set_stringn(x, y, text, _TidelineWidth::width(text), style);
-}
-
-fn tchrome(theme: &UiTheme, ink: codewhale_palette::ChromeInk) -> Style {
-    codewhale_palette::chrome_style(theme, ink)
-}
-
-/// Paint the theme list: 14 rows (4 modes + 10 presets) with the selected
-/// row boxed `[ ✓ Name ]`, then the MOTION (OPTIONAL) toggle rows.
-#[allow(dead_code)] // translation scaffolding: wired by the landing slice
-pub fn render_tideline_theme_list(area: Rect, buf: &mut Buffer, list: &TidelineThemeList<'_>) {
-    if area.width < 8 || area.height < 3 {
-        return;
-    }
-    let theme = list.theme;
-    let rows = tideline_theme_rows();
-    let mut y = area.y;
-    for (index, id) in rows.iter().enumerate() {
-        if y >= area.y + area.height {
-            return;
-        }
-        let selected = list.selected == index;
-        let label = id.display_name();
-        let row = if selected {
-            format!("[ {} {} ]", list.sym("✓"), label)
-        } else {
-            format!("  {label}  ")
-        };
-        let ink = if selected {
-            codewhale_palette::ChromeInk::Identity
-        } else {
-            codewhale_palette::ChromeInk::MetadataValue
-        };
-        let mut style = tchrome(theme, ink);
-        if selected {
-            style = style.add_modifier(Modifier::BOLD);
-        }
-        tput(buf, area.x, y, &row, style);
-        y += 1;
-    }
-    // MOTION (OPTIONAL)
-    if y < area.y + area.height {
-        tput(
-            buf,
-            area.x,
-            y,
-            "MOTION (OPTIONAL)",
-            tchrome(theme, codewhale_palette::ChromeInk::MetadataDim).add_modifier(Modifier::BOLD),
-        );
-        y += 1;
-    }
-    for (label, on) in [
-        ("low motion", list.low_motion),
-        ("ambient life", list.fancy_animations),
-    ] {
-        if y >= area.y + area.height {
-            return;
-        }
-        let mark = if on { "◉" } else { "○" };
-        let row = format!("{} {}", list.sym(mark), label);
-        let ink = if on {
-            codewhale_palette::ChromeInk::Active
-        } else {
-            codewhale_palette::ChromeInk::MetadataDim
-        };
-        tput(buf, area.x + 1, y, &row, tchrome(theme, ink));
-        y += 1;
-    }
-}
-
-/// Row hitboxes for the theme list (spec §6): 13 theme rects + 2 toggles.
-#[must_use]
-#[allow(dead_code)] // translation scaffolding: wired by the landing slice
-pub fn tideline_theme_list_hitboxes(area: Rect, _list: &TidelineThemeList<'_>) -> Vec<Rect> {
-    let mut out = Vec::new();
-    if area.width < 8 || area.height < 3 {
-        return out;
-    }
-    let rows = tideline_theme_rows().len();
-    for index in 0..rows {
-        let y = area.y + index as u16;
-        if y >= area.y + area.height {
-            return out;
-        }
-        out.push(Rect {
-            x: area.x,
-            y,
-            width: area.width,
-            height: 1,
-        });
-    }
-    // Toggle rows follow the MOTION (OPTIONAL) header.
-    let toggle_y = area.y + rows as u16 + 1;
-    for offset in 0..2 {
-        let y = toggle_y + offset;
-        if y < area.y + area.height {
-            out.push(Rect {
-                x: area.x,
-                y,
-                width: area.width,
-                height: 1,
-            });
-        }
-    }
-    out
-}
-
-#[cfg(test)]
-mod tideline_tests;

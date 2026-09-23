@@ -35,6 +35,7 @@
 6. [HOOKS.md](../HOOKS.md) —— 钩子机制与自动化
 7. [TOOL_SURFACE.md](../TOOL_SURFACE.md) —— 工具面：AI 当前可用的工具契约
 8. [AGENT_RUNTIME.md](../AGENT_RUNTIME.md) —— Agent 运行时：子智能体、exec 与 Fleet 的关系
+9. [WEB.md](WEB.md) —— 本地浏览器客户端：启动方式、会话验证边界与故障排查
 
 ## 四、开发者（阅读源码或为 Codewhale 贡献）
 
@@ -42,7 +43,7 @@
 
 1. [ARCHITECTURE.md](../ARCHITECTURE.md) —— 架构总览
 2. [CONTRIBUTING.md](../../CONTRIBUTING.md) —— 贡献指南：如何提交 Issue 与 PR、代码约定与验证门禁
-3. [CODE_OF_CONDUCT.md](../../CODE_OF_CONDUCT.md) —— 社区行为准则
+3. [CODE_OF_CONDUCT.md](../../.github/CODE_OF_CONDUCT.md) —— 社区行为准则
 4. [RUNTIME_API.md](../RUNTIME_API.md) —— Runtime API 与集成契约（供集成与二次开发）
 5. [PLUGIN_AUTHORING.md](PLUGIN_AUTHORING.md) —— 从最小 Skills 示例开始编写、审查和启用插件
 
@@ -61,5 +62,5 @@
 - 中文文档回链英文源，并标注 "last synced with English revision" 日期，让过期一目了然。
 - 旧位置的 `.zh-CN.md` 文件保留为重定向占位页，保留一个发布周期后移除。
 
-本文档更新于 2026 年 8 月 18 日
-Last Updated on August 18, 2026
+本文档更新于 2026 年 9 月 22 日
+Last Updated on September 22, 2026

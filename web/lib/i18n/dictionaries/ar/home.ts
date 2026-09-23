@@ -20,7 +20,7 @@ export const home: HomeDict = {
   shotPreview: "معاينة الطرفية",
   shotBuild: "إصدار تطوير v{version}",
   screenshotAlt:
-    "طرفية Codewhale v0.9.12، البناء 171acee689aa: جلسة جديدة تظهر فيها علامة الحوت وحقل كتابة الرسائل وFull Access ووضع Operate ومهمتان مجدولتان، مع 21 خادم MCP جارٍ الاتصال بها وGLM-5.3 بأقصى مستوى جهد.",
+    "إصدار تطوير Codewhale v{version}: علامة الحوت، جلسة جديدة، حقل الرسالة، أذونات Ask، وضع Work وحالة النموذج. عرض للمخرجات الفعلية من طرفية معزولة.",
   latestRelease: "أحدث إصدار {tag}",
   releaseUnavailable: "حالة الإصدار غير متاحة",
   currentSource: "المصدر",

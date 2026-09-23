@@ -249,8 +249,19 @@ jobs:
           # The review is advisory: a provider-side outage (balance, auth,
           # rate limit, upstream 5xx) must not block the PR. Real review
           # failures still fail the job with the original exit status.
-          if echo "$OUTPUT" | grep -qE 'LLM error: HTTP (401|402|403|408|429|5[0-9][0-9])'; then
-            REASON=$(echo "$OUTPUT" | grep -oE 'LLM error: HTTP (401|402|403|408|429|5[0-9][0-9])[^"]{0,80}' | head -1)
+          # The CLI renders each provider failure class with its own prefix
+          # (crates/tui/src/llm_client/mod.rs, `impl Display for LlmError`);
+          # the legacy `LLM error: HTTP <status>` form covers statuses without a
+          # class of their own (402 without quota wording, 408). The class is
+          # anchored to its position in the error chain — right after
+          # "request failed:" and the client's one optional "<wire> API request
+          # failed:" layer — so provider body text deeper in the chain cannot
+          # impersonate a class (an `Invalid request (400)` whose body mentions
+          # "Network error" stays a real failure).
+          CLASS='LLM error: HTTP (401|402|403|408|429|5[0-9][0-9])|Provider plan quota exhausted|Authentication failed|Authorization failed|Rate limit exceeded|Server error \([0-9]{3}\)|Network error|Request timed out'
+          NONRUN="Review pass [0-9]+/[0-9]+ request failed: ([A-Za-z ]+ request failed: )?($CLASS)"
+          if echo "$OUTPUT" | grep -qE "$NONRUN"; then
+            REASON=$(echo "$OUTPUT" | grep -oE "${NONRUN}[^\"]{0,80}" | head -1)
             echo "::warning::Codewhale review could not run (${REASON}). The PR is not blocked — provider funding/config is founder-gated."
             echo "Codewhale review: not run (provider unavailable; this is not a clean-review result)." >> "$GITHUB_STEP_SUMMARY"
             # Silence is not success: leave one visible, idempotent note on the

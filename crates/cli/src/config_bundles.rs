@@ -287,9 +287,22 @@ pub fn find_rejected_entries(bundle: &PortableBundle) -> Vec<RejectedEntry> {
     rejected
 }
 
+/// Maximum nesting depth the export walkers descend. Config files are
+/// shallow; anything deeper is pathological and fails closed.
+const MAX_EXPORT_WALK_DEPTH: usize = 64;
+
 /// Why a value carries nested non-portable authority or looks like a bare
 /// credential, or `None` when it is safe to move between machines.
 fn value_rejection_reason(path: &str, value: &toml::Value) -> Option<String> {
+    value_rejection_reason_at(path, value, 0)
+}
+
+fn value_rejection_reason_at(path: &str, value: &toml::Value, depth: usize) -> Option<String> {
+    if depth > MAX_EXPORT_WALK_DEPTH {
+        return Some(format!(
+            "nested more than {MAX_EXPORT_WALK_DEPTH} levels deep"
+        ));
+    }
     if let Some(reason) = nonportable_value_reason(path, value) {
         return Some(reason.to_string());
     }
@@ -297,7 +310,7 @@ fn value_rejection_reason(path: &str, value: &toml::Value) -> Option<String> {
         toml::Value::String(text) => string_secret_reason(text),
         toml::Value::Array(items) => items
             .iter()
-            .find_map(|value| value_rejection_reason(path, value))
+            .find_map(|value| value_rejection_reason_at(path, value, depth + 1))
             .map(|reason| format!("array contains an entry where {reason}")),
         toml::Value::Table(map) => {
             for (key, nested_value) in map {
@@ -309,7 +322,9 @@ fn value_rejection_reason(path: &str, value: &toml::Value) -> Option<String> {
                 if let Some(reason) = nonportable_path_reason(&child_path) {
                     return Some(format!("nested key {key:?} {reason}"));
                 }
-                if let Some(reason) = value_rejection_reason(&child_path, nested_value) {
+                if let Some(reason) =
+                    value_rejection_reason_at(&child_path, nested_value, depth + 1)
+                {
                     return Some(format!("nested under {key:?}, {reason}"));
                 }
             }
@@ -965,6 +980,13 @@ fn config_document(config: &ConfigToml) -> Result<toml::map::Map<String, toml::V
 /// machine-local paths are omitted rather than replaced with a placeholder,
 /// because a placeholder would become literal config on re-import.
 fn sanitize_export_value(path: &str, value: &toml::Value) -> Option<toml::Value> {
+    sanitize_export_value_at(path, value, 0)
+}
+
+fn sanitize_export_value_at(path: &str, value: &toml::Value, depth: usize) -> Option<toml::Value> {
+    if depth > MAX_EXPORT_WALK_DEPTH {
+        return None;
+    }
     if nonportable_path_reason(path).is_some() || nonportable_value_reason(path, value).is_some() {
         return None;
     }
@@ -973,14 +995,14 @@ fn sanitize_export_value(path: &str, value: &toml::Value) -> Option<toml::Value>
         toml::Value::Array(values) => Some(toml::Value::Array(
             values
                 .iter()
-                .filter_map(|value| sanitize_export_value(path, value))
+                .filter_map(|value| sanitize_export_value_at(path, value, depth + 1))
                 .collect(),
         )),
         toml::Value::Table(table) => {
             let mut scrubbed = toml::map::Map::new();
             for (key, value) in table {
                 let child_path = format!("{path}.{key}");
-                if let Some(value) = sanitize_export_value(&child_path, value) {
+                if let Some(value) = sanitize_export_value_at(&child_path, value, depth + 1) {
                     scrubbed.insert(key.clone(), value);
                 }
             }
@@ -3619,6 +3641,28 @@ command = "/synthetic/direct-tool-override"
         assert!(!scrubbed.contains("plugin_dir"), "{scrubbed}");
         assert!(!scrubbed.contains("overrides"), "{scrubbed}");
         assert!(find_rejected_entries(&exported).is_empty(), "{exported:?}");
+    }
+
+    #[test]
+    fn deep_nesting_fails_closed_for_rejection_and_sanitize() {
+        fn deep_toml(depth: usize) -> toml::Value {
+            let mut value = toml::Value::String("leaf".to_string());
+            for _ in 0..depth {
+                let mut map = toml::map::Map::new();
+                map.insert("t".to_string(), value);
+                value = toml::Value::Table(map);
+            }
+            value
+        }
+
+        let deep = deep_toml(70);
+        let reason = value_rejection_reason("t", &deep).expect("over-deep value must be rejected");
+        assert!(reason.contains("levels deep"), "{reason}");
+        assert!(
+            sanitize_export_value("t", &deep)
+                .is_some_and(|scrubbed| !scrubbed.to_string().contains("leaf")),
+            "over-deep branch must be omitted, not exported"
+        );
     }
 
     #[test]

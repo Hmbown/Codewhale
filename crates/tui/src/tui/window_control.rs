@@ -56,7 +56,7 @@ mod imp {
         SW_RESTORE, SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW,
         SetWindowPos, ShowWindowAsync, WINDOWINFO, WS_EX_TOPMOST, WS_MAXIMIZE,
     };
-    use windows_core::BOOL;
+    use windows::core::BOOL;
 
     /// Pin state: remembers the pre-pin window rect so unpinning restores it,
     /// plus whether the window was maximized (unpin restores maximized then,
@@ -222,7 +222,9 @@ mod imp {
         // nothing. Skip it entirely and resolve the real host window.
         let conpty = std::env::var("WT_SESSION").is_ok() || std::env::var("TERM_PROGRAM").is_ok();
         if !conpty {
+            // SAFETY: no preconditions; invalid return handled.
             let hwnd = unsafe { GetConsoleWindow() };
+            // SAFETY: invalid handles return false.
             if !hwnd.is_invalid() && unsafe { IsWindowVisible(hwnd) }.as_bool() {
                 tracing::debug!("window_control: host window resolved via GetConsoleWindow");
                 return Some(hwnd);
@@ -248,11 +250,14 @@ mod imp {
     /// window). Visibility is required — a hidden foreground window cannot
     /// be the host the user is looking at.
     fn foreground_window_in_parent_chain(pid: u32) -> Option<HWND> {
+        // SAFETY: no preconditions; invalid return handled.
         let foreground = unsafe { GetForegroundWindow() };
+        // SAFETY: invalid handles return false.
         if foreground.is_invalid() || !unsafe { IsWindowVisible(foreground) }.as_bool() {
             return None;
         }
         let mut fg_pid = 0u32;
+        // SAFETY: `fg_pid` is live for the call.
         unsafe {
             GetWindowThreadProcessId(foreground, Some(&mut fg_pid));
         }
@@ -308,12 +313,14 @@ mod imp {
     /// Look up a process's parent PID and image name from a toolhelp
     /// snapshot. The snapshot handle is always closed.
     fn process_entry(pid: u32) -> Option<(u32, String)> {
+        // SAFETY: returned handle is owned here; closed below.
         let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) }.ok()?;
         let mut entry = PROCESSENTRY32W {
             dwSize: size_of::<PROCESSENTRY32W>() as u32,
             ..Default::default()
         };
         let mut found = None;
+        // SAFETY: `entry` is live with dwSize initialized above.
         let mut ok = unsafe { Process32FirstW(snapshot, &mut entry) }.is_ok();
         while ok {
             if entry.th32ProcessID == pid {
@@ -326,8 +333,10 @@ mod imp {
                 found = Some((entry.th32ParentProcessID, name));
                 break;
             }
+            // SAFETY: `entry` is live with dwSize initialized above.
             ok = unsafe { Process32NextW(snapshot, &mut entry) }.is_ok();
         }
+        // SAFETY: `snapshot` is owned here and not used after.
         unsafe {
             let _ = CloseHandle(snapshot);
         }
@@ -349,8 +358,10 @@ mod imp {
             found: None,
         };
         unsafe extern "system" fn enum_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
+            // SAFETY: lparam carries the live `ctx` below; EnumWindows is synchronous.
             let ctx = unsafe { &mut *(lparam.0 as *mut Ctx) };
             let mut wpid = 0u32;
+            // SAFETY: `hwnd` is valid per EnumWindows; `wpid` is live.
             unsafe {
                 GetWindowThreadProcessId(hwnd, Some(&mut wpid));
                 if wpid == ctx.target && IsWindowVisible(hwnd).as_bool() {
@@ -364,6 +375,7 @@ mod imp {
             }
             BOOL(1)
         }
+        // SAFETY: `ctx` outlives the synchronous enumeration.
         unsafe {
             let _ = EnumWindows(Some(enum_proc), LPARAM(&mut ctx as *mut Ctx as isize));
         }

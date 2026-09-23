@@ -1,20 +1,13 @@
-//! A final report inside the existing worker's budget and turn loop.
+//! A bounded final report inside the existing worker's turn loop. Runs stop
+//! on wall time, steps, cancellation, or completion — never on token
+//! accounting (#6189); the report turn is sized by a fixed allowance, not by
+//! what a budget has left.
 use super::*;
 
 pub(super) const MAX_HAND_BACK_TOKENS: u64 = 8_192;
-const MIN_HAND_BACK_TOKENS: u64 = 1_024;
 const MAX_HAND_BACK_OUTPUT: u32 = 1_024;
 const MIN_HAND_BACK_OUTPUT: u64 = 128;
 const MAX_HAND_BACK_TIME: Duration = Duration::from_secs(10);
-
-pub(super) fn token_reserve(limit: u64) -> u64 {
-    let reserve = (limit / 10).min(MAX_HAND_BACK_TOKENS);
-    if reserve >= MIN_HAND_BACK_TOKENS {
-        reserve
-    } else {
-        0
-    }
-}
 
 pub(super) fn wall_deadlines(runtime: &SubAgentRuntime) -> (Option<Instant>, Option<Instant>) {
     let hard = runtime.worker_profile.wall_deadline_ms.map(|deadline| {
@@ -29,105 +22,9 @@ pub(super) fn wall_deadlines(runtime: &SubAgentRuntime) -> (Option<Instant>, Opt
 }
 
 impl SubAgentManager {
-    /// The same capped families used by measured budget accounting must also
-    /// retain missing-usage evidence across sibling work and continuations.
-    /// An untouched/legacy record is not itself evidence of a missing bill.
-    fn budget_has_unreported_usage(&self, worker: &str) -> bool {
-        let mut capped_ancestors = BTreeSet::new();
-        let mut capped_scopes = BTreeSet::new();
-        for id in self.budget_ancestors(worker) {
-            let Some(record) = self.worker_records.get(&id) else {
-                continue;
-            };
-            if record.spec.runtime_profile.token_budget.is_some() {
-                capped_ancestors.insert(id);
-            }
-            if record.usage.token_budget.is_some()
-                && let Some(scope) = record.usage.budget_scope.as_deref()
-            {
-                capped_scopes.insert(scope);
-            }
-        }
-        self.worker_records.values().any(|record| {
-            if !record.has_unreported_usage {
-                return false;
-            }
-            self.budget_ancestors(&record.spec.worker_id)
-                .iter()
-                .any(|id| {
-                    capped_ancestors.contains(id)
-                        || self.worker_records.get(id).is_some_and(|ancestor| {
-                            ancestor
-                                .usage
-                                .budget_scope
-                                .as_deref()
-                                .is_some_and(|scope| capped_scopes.contains(scope))
-                        })
-                })
-        })
-    }
-
-    pub(super) fn reserved_handback_tokens(&self, owner: &str, scope: Option<&str>) -> u64 {
-        self.handback_reservations
-            .iter()
-            .filter_map(|(worker, reservation)| reservation.upgrade().map(|value| (worker, value)))
-            .filter(|(worker, _)| {
-                let ancestors = self.budget_ancestors(worker);
-                scope.map_or_else(
-                    || ancestors.contains(owner),
-                    |scope| {
-                        ancestors.iter().any(|id| {
-                            self.worker_records.get(id).is_some_and(|record| {
-                                record.usage.budget_scope.as_deref() == Some(scope)
-                            })
-                        })
-                    },
-                )
-            })
-            .fold(0_u64, |total, (_, tokens)| total.saturating_add(*tokens))
-    }
-
-    /// Dispatch headroom, separate from actual billed usage. A single reserve
-    /// is held back per applicable scope, not once per sibling. Active report
-    /// reservations are subtracted while their provider response is pending.
-    pub(super) fn available_worker_tokens(
-        &self,
-        worker: &str,
-        preserve_report: bool,
-    ) -> Option<u64> {
-        self.budget_ancestors(worker)
-            .iter()
-            .fold(None, |remaining, id| {
-                let Some(record) = self.worker_records.get(id) else {
-                    return remaining;
-                };
-                let available = |spent: u64, limit: u64, scope: Option<&str>| {
-                    limit
-                        .saturating_sub(spent)
-                        .saturating_sub(self.reserved_handback_tokens(id, scope))
-                        .saturating_sub(if preserve_report {
-                            token_reserve(limit)
-                        } else {
-                            0
-                        })
-                };
-                let shared = self.budget_scope_state(id).map(|(spent, limit)| {
-                    available(spent, limit, record.usage.budget_scope.as_deref())
-                });
-                let local = record
-                    .spec
-                    .runtime_profile
-                    .token_budget
-                    .map(|limit| available(self.subtree_budget_spent(id), limit, None));
-                narrow_optional_limit(remaining, narrow_optional_limit(shared, local))
-            })
-    }
-
     pub(super) fn reserve_handback(
         &mut self,
         worker: &str,
-        local_remaining: Option<u64>,
-        allowance: u64,
         input_tokens: u64,
         output_cap: u32,
     ) -> std::result::Result<(u32, Arc<u64>), &'static str> {
@@ -138,25 +35,16 @@ impl SubAgentManager {
         {
             return Err("worker is no longer active");
         }
-        if self.budget_has_unreported_usage(worker) {
-            return Err("earlier provider token usage is unknown in an applicable budget scope");
-        }
         self.handback_reservations
             .retain(|_, value| value.strong_count() > 0);
         if self.handback_reservations.contains_key(worker) {
             return Err("a hand-back turn is already in flight");
         }
-        let available =
-            narrow_optional_limit(self.available_worker_tokens(worker, false), local_remaining)
-                .unwrap_or(allowance)
-                .min(allowance);
-        let output = available
+        let output = MAX_HAND_BACK_TOKENS
             .saturating_sub(input_tokens)
             .min(u64::from(output_cap));
         if output < MIN_HAND_BACK_OUTPUT {
-            return Err(
-                "remaining token allowance cannot cover the estimated report input and output",
-            );
+            return Err("the fixed hand-back allowance cannot cover the report input and output");
         }
         let reservation = Arc::new(input_tokens.saturating_add(output));
         self.handback_reservations
@@ -263,10 +151,6 @@ pub(super) async fn request_report(
     messages: &mut Vec<Message>,
     steps: &mut u32,
     max_steps: u32,
-    token_budget: Option<u64>,
-    tokens_used: u64,
-    allowance: u64,
-    usage_complete: bool,
     hard_deadline: Option<Instant>,
     cause: &str,
 ) -> Outcome {
@@ -281,34 +165,11 @@ pub(super) async fn request_report(
     if *steps == 0 {
         return fallback("no completed model turn was recorded");
     }
-    if max_steps > 0 && *steps >= max_steps {
-        return fallback("no model turn remains within the step cap");
-    }
-    if allowance < MIN_HAND_BACK_TOKENS {
-        return fallback("token allowance is too small to reserve a report");
-    }
-    if narrow_optional_limit(
-        runtime
-            .manager
-            .read()
-            .await
-            .remaining_worker_tokens(agent_id),
-        token_budget.map(|limit| limit.saturating_sub(tokens_used)),
-    ) == Some(0)
-    {
-        return fallback("remaining token allowance is exhausted");
-    }
-    if !usage_complete
-        && (token_budget.is_some()
-            || runtime
-                .manager
-                .read()
-                .await
-                .remaining_worker_tokens(agent_id)
-                .is_some())
-    {
-        return fallback("earlier provider token usage is unknown");
-    }
+    // The hand-back turn is a reserved allowance OUTSIDE the task step
+    // budget: a worker stopped by its own step cap has, by definition, no
+    // task step left, and that same stop message promises the remaining
+    // turn is reserved for hand-back (#6277). Only the wall-time deadline
+    // below can refuse the turn.
     let deadline = hard_deadline
         .unwrap_or_else(|| Instant::now() + MAX_HAND_BACK_TIME)
         .min(Instant::now() + MAX_HAND_BACK_TIME)
@@ -328,12 +189,12 @@ pub(super) async fn request_report(
         let candidate = report_messages(assignment, messages, cause, evidence_bytes);
         let estimate =
             crate::compaction::estimate_input_tokens_conservative(&candidate, Some(&system)) as u64;
-        if estimate.saturating_add(MIN_HAND_BACK_OUTPUT) <= allowance {
+        if estimate.saturating_add(MIN_HAND_BACK_OUTPUT) <= MAX_HAND_BACK_TOKENS {
             break candidate;
         }
         if evidence_bytes <= 256 {
             return fallback(
-                "token allowance cannot fit the report instructions and grounded evidence",
+                "the fixed hand-back allowance cannot fit the report instructions and grounded evidence",
             );
         }
         evidence_bytes /= 2;
@@ -346,8 +207,6 @@ pub(super) async fn request_report(
         .effective_route_envelope(&runtime.model, chrono::Utc::now());
     let (output_tokens, _reservation) = match runtime.manager.write().await.reserve_handback(
         agent_id,
-        token_budget.map(|limit| limit.saturating_sub(tokens_used)),
-        allowance,
         input_tokens,
         runtime
             .client
@@ -503,4 +362,101 @@ pub(super) async fn request_report(
             usage_reported: usage_has_reported_data(&response.usage),
         }
     }
+}
+
+/// Deterministic fallback body when no model hand-back report exists (#6194).
+///
+/// Prefers the last recorded assistant text. When a budget death interrupts a
+/// child that only ever emitted thinking and tool calls — the read-only review
+/// shape — there is no text, and returning silence discards everything the
+/// child did. The digest below names the grounded work instead: tool calls are
+/// actions that happened, and the thinking excerpt is explicitly unverified.
+/// Everything is bounded; the parent gets evidence, never a report.
+pub(super) fn fallback_partial_text(messages: &[Message]) -> String {
+    const MAX_TEXT_CHARS: usize = 4_000;
+    const MAX_TOOL_ENTRIES: usize = 12;
+    const MAX_THINKING_BYTES: usize = 1_500;
+
+    if let Some(text) = messages
+        .iter()
+        .rev()
+        .filter(|message| message.role == Role::Assistant)
+        .flat_map(|message| message.content.iter().rev())
+        .find_map(|block| match block {
+            ContentBlock::Text { text, .. } if !text.trim().is_empty() => Some(text),
+            _ => None,
+        })
+    {
+        return text.chars().take(MAX_TEXT_CHARS).collect();
+    }
+    let mut tools = Vec::new();
+    let mut extra_tools = 0usize;
+    let mut thinking = None;
+    for message in messages.iter().rev() {
+        if message.role != Role::Assistant {
+            continue;
+        }
+        for block in message.content.iter().rev() {
+            match block {
+                ContentBlock::ToolUse { name, input, .. } => {
+                    if tools.len() < MAX_TOOL_ENTRIES {
+                        tools.push(format!("{name} {}", tool_target_preview(input)));
+                    } else {
+                        extra_tools += 1;
+                    }
+                }
+                ContentBlock::Thinking { thinking: text, .. }
+                    if thinking.is_none() && !text.trim().is_empty() =>
+                {
+                    thinking = Some(text);
+                }
+                _ => {}
+            }
+        }
+    }
+    if tools.is_empty() && thinking.is_none() {
+        return "No assistant text was recorded; inspect the checkpoint for completed tool work."
+            .to_string();
+    }
+    let mut digest =
+        String::from("No assistant text was recorded. Work recorded before the budget death:");
+    if !tools.is_empty() {
+        digest.push_str("\nTool calls (newest first):");
+        for entry in &tools {
+            digest.push_str(&format!("\n- {entry}"));
+        }
+        if extra_tools > 0 {
+            digest.push_str(&format!("\n- ...and {extra_tools} more"));
+        }
+    }
+    if let Some(text) = thinking {
+        digest.push_str("\nLatest reasoning (unverified, may be incomplete):\n");
+        digest.push_str(&lifecycle::text_preview(text, MAX_THINKING_BYTES));
+    }
+    digest
+}
+
+/// One-line target for a recorded tool call: the well-known path/commandish
+/// key when present, else a truncated rendering of the whole input.
+fn tool_target_preview(input: &serde_json::Value) -> String {
+    const KEYS: [&str; 7] = [
+        "path",
+        "file",
+        "file_path",
+        "command",
+        "pattern",
+        "query",
+        "url",
+    ];
+    for key in KEYS {
+        if let Some(hit) = input.get(key).and_then(serde_json::Value::as_str)
+            && !hit.trim().is_empty()
+        {
+            return lifecycle::text_preview(hit, 120);
+        }
+    }
+    if let Some(hit) = input.as_str() {
+        return lifecycle::text_preview(hit, 120);
+    }
+    lifecycle::text_preview(&input.to_string(), 120)
 }

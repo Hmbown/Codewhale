@@ -1,7 +1,10 @@
 //! Delivery evidence replacing the old prose-verb/git-status heuristic.
 //! The worker ledger retains the spawn baseline; this module only reads files.
 
-use super::{AgentRunVerificationSummary, AgentWorkerSpec, normalize_claim_path};
+use super::{
+    AgentRunVerificationSummary, AgentWorkerSpec, default_agent_run_verification,
+    normalize_claim_path,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -12,6 +15,10 @@ use std::process::Command;
 
 pub(super) const MAX_DELIVERABLES: usize = 16;
 const MAX_BASELINE_PATHS: usize = 4096;
+/// Past this many changed paths the explicit `git add` arg list is the
+/// bigger risk, so the checkpoint falls back to a whole-tree add (isolated
+/// worktrees only — the caller guarantees that).
+const MAX_CHECKPOINT_PATHS: usize = 1000;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DeliverableVerdict {
@@ -38,8 +45,8 @@ struct GitDeliveryBaseline {
     dirty: BTreeMap<String, String>,
 }
 
-fn git(root: &Path, args: &[&str]) -> Option<Vec<u8>> {
-    let output = Command::new("git")
+fn git_output(root: &Path, args: &[&str]) -> Option<std::process::Output> {
+    Command::new("git")
         .arg("-C")
         .arg(root)
         .args([
@@ -52,8 +59,34 @@ fn git(root: &Path, args: &[&str]) -> Option<Vec<u8>> {
         .env("GIT_OPTIONAL_LOCKS", "0")
         .env("GIT_NO_LAZY_FETCH", "1")
         .output()
-        .ok()?;
+        .ok()
+}
+
+fn git(root: &Path, args: &[&str]) -> Option<Vec<u8>> {
+    let output = git_output(root, args)?;
     output.status.success().then_some(output.stdout)
+}
+
+/// `git` that reports stderr on failure, for checkpoint notes.
+fn git_captured(root: &Path, args: &[&str]) -> Result<String, String> {
+    let output = git_output(root, args).ok_or_else(|| "git spawn failed".to_string())?;
+    if !output.status.success() {
+        return Err(first_line_lossy(&output.stderr, 200));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+fn first_line_lossy(bytes: &[u8], max_chars: usize) -> String {
+    let line = String::from_utf8_lossy(bytes)
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    if line.is_empty() {
+        return "git failed with no message".to_string();
+    }
+    line.chars().take(max_chars).collect()
 }
 
 fn status_paths(root: &Path) -> Option<BTreeSet<String>> {
@@ -120,14 +153,19 @@ fn fingerprint(root: &Path, relative: &str) -> Option<String> {
 
 impl DeliveryEvidence {
     pub(super) fn capture(spec: &AgentWorkerSpec) -> Self {
-        let baseline = spec
-            .runtime_profile
-            .permissions
-            .write
+        Self::capture_for_handle(&spec.workspace, spec.runtime_profile.permissions.write)
+    }
+
+    /// Baseline capture that needs only the workspace and write permission —
+    /// the two spec fields the baseline actually reads. The async spawn path
+    /// calls this in `spawn_blocking` BEFORE the manager write lock (#6210)
+    /// and threads the evidence through registration, so git + file
+    /// fingerprints never run under the lock.
+    pub(super) fn capture_for_handle(workspace: &Path, write: bool) -> Self {
+        let baseline = write
             .then(|| {
                 let root =
-                    String::from_utf8(git(&spec.workspace, &["rev-parse", "--show-toplevel"])?)
-                        .ok()?;
+                    String::from_utf8(git(workspace, &["rev-parse", "--show-toplevel"])?).ok()?;
                 let root = PathBuf::from(root.trim());
                 let head = git(&root, &["rev-parse", "--verify", "HEAD"])
                     .and_then(|bytes| String::from_utf8(bytes).ok())
@@ -223,6 +261,100 @@ impl DeliveryEvidence {
         }
         Some(changed)
     }
+
+    /// Commit the worker's uncommitted changes as labeled salvage, and only
+    /// on an isolated worktree (#6194 item 4, #5529). Synchronous git reads
+    /// and writes: call under `spawn_blocking`, never under the manager
+    /// lock. `changed` is the `changed_paths` inventory the caller already
+    /// computed; the commit is skipped (not forced) when the tree is already
+    /// clean, and every failure degrades to a note — never an error.
+    pub(super) fn checkpoint_uncommitted(
+        &self,
+        changed: &BTreeSet<String>,
+        agent_id: &str,
+        cause: &str,
+        isolated_worktree: bool,
+    ) -> BudgetCheckpointOutcome {
+        use BudgetCheckpointOutcome::*;
+        if !isolated_worktree {
+            // A shared checkout may hold the parent's or a sibling's dirty
+            // files; auto-commit would sweep them into the checkpoint.
+            return SkippedNonIsolated;
+        }
+        if changed.is_empty() {
+            return Clean;
+        }
+        let Some(baseline) = self.baseline.as_ref() else {
+            return Failed {
+                reason: "no delivery baseline".to_string(),
+            };
+        };
+        match git_captured(&baseline.root, &["status", "--porcelain=v1", "-z", "--"]) {
+            Ok(status) if status.trim().is_empty() => return Clean,
+            Err(reason) => return Failed { reason },
+            Ok(_) => {}
+        }
+        // Stage exactly the worker-attributable inventory, not the whole
+        // tree: a pre-existing dirty file the worker never touched must not
+        // ride into the checkpoint.
+        if changed.len() > MAX_CHECKPOINT_PATHS {
+            if let Err(reason) = git_captured(&baseline.root, &["add", "-A", "--"]) {
+                return Failed { reason };
+            }
+        } else {
+            let mut args = Vec::with_capacity(changed.len() + 2);
+            args.push("add");
+            args.push("--");
+            args.extend(changed.iter().map(String::as_str));
+            if let Err(reason) = git_captured(&baseline.root, &args) {
+                return Failed { reason };
+            }
+        }
+        let cause_short: String = cause
+            .lines()
+            .next()
+            .unwrap_or(cause)
+            .chars()
+            .take(120)
+            .collect();
+        let message = format!(
+            "checkpoint: {agent_id} ({cause_short}) - {} uncommitted file(s) at budget death; unreviewed salvage",
+            changed.len()
+        );
+        if let Err(reason) = git_captured(
+            &baseline.root,
+            &[
+                "-c",
+                "user.name=Codewhale Subagent",
+                "-c",
+                "user.email=subagent@codewhale.invalid",
+                "commit",
+                "--quiet",
+                "-m",
+                &message,
+            ],
+        ) {
+            return Failed { reason };
+        }
+        match git_captured(&baseline.root, &["rev-parse", "--short", "HEAD"]) {
+            Ok(sha) => Committed {
+                sha: sha.trim().to_string(),
+            },
+            Err(reason) => Failed { reason },
+        }
+    }
+}
+
+/// Outcome of the budget-death checkpoint commit.
+pub(super) enum BudgetCheckpointOutcome {
+    /// Uncommitted work is now commit `sha` on the worker branch.
+    Committed { sha: String },
+    /// Nothing attributable to commit (clean tree, or the worker committed).
+    Clean,
+    /// Shared checkout: auto-commit would sweep up other writers' work.
+    SkippedNonIsolated,
+    /// Nothing was committed; files survive on disk.
+    Failed { reason: String },
 }
 
 fn same_path_identity(left: &Path, right: &Path) -> bool {
@@ -482,4 +614,62 @@ pub(super) fn verify_changes(
         ),
         deliverables: Vec::new(),
     })
+}
+
+/// Everything delivery verification needs, snapshotted under a read lock.
+/// `allowed[i]` is the write-scope verdict for `deliverables[i]`. The compute
+/// half runs in `spawn_blocking` with no manager lock held (#6210).
+#[derive(Debug, Clone)]
+pub(super) struct DeliveryVerificationInputs {
+    pub evidence: DeliveryEvidence,
+    pub workspace: PathBuf,
+    pub result_text: String,
+    pub write_perm: bool,
+    pub deliverables: Vec<String>,
+    pub allowed: Vec<bool>,
+}
+
+/// Pure compute half of worker delivery verification: the git trio +
+/// fingerprints (`changed_paths`), claim comparison, and per-deliverable
+/// presence checks. Runs off the manager lock; the caller stores the summary.
+pub(super) fn compute_delivery_verification(
+    inputs: &DeliveryVerificationInputs,
+) -> AgentRunVerificationSummary {
+    let changed = inputs.evidence.changed_paths(&inputs.workspace);
+    let mut verification = verify_changes(
+        &inputs.result_text,
+        inputs.write_perm,
+        &inputs.evidence,
+        changed.as_ref(),
+        &inputs.deliverables.iter().cloned().collect(),
+    )
+    .unwrap_or_else(default_agent_run_verification);
+    verification.deliverables = inputs
+        .deliverables
+        .iter()
+        .zip(inputs.allowed.iter())
+        .map(|(path, allowed)| check_deliverable(&inputs.workspace, path, *allowed))
+        .collect();
+    let missing = verification
+        .deliverables
+        .iter()
+        .filter(|verdict| verdict.status != "present")
+        .map(|verdict| format!("{} ({})", verdict.path, verdict.status))
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        let prior = if verification.status == "claim_mismatch" {
+            format!(" {}", verification.summary)
+        } else {
+            String::new()
+        };
+        verification.status = "deliverable_missing".to_string();
+        verification.summary = format!(
+            "Declared deliverables not produced as non-empty files in the worker write scope: {}.{prior}",
+            missing.join(", ")
+        );
+    } else if !inputs.deliverables.is_empty() && verification.status == "self_report_only" {
+        verification.status = "deliverables_present".to_string();
+        verification.summary = "Declared files exist and are non-empty inside the worker write scope; their contents remain a worker self-report.".to_string();
+    }
+    verification
 }

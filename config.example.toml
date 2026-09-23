@@ -21,7 +21,7 @@
 # `api_key` / `base_url` are
 # still read as DeepSeek defaults when `[providers.deepseek]` is absent
 # (backward compatibility).
-provider = "deepseek" # deepseek | deepseek-cn | deepseek-anthropic | nvidia-nim | openai | atlascloud | wanjie-ark | volcengine | openrouter | orcarouter | xiaomi-mimo | novita | fireworks | siliconflow | siliconflow-CN | arcee | moonshot | zai | stepfun | minimax | sglang | vllm | ollama | huggingface | together | qianfan | openai-codex | anthropic | openmodel | deepinfra | sakana | longcat | opencode-go | opencode-zen | meta | xai | modelstudio-token-plan | modelstudio-coding-plan
+provider = "deepseek" # deepseek | deepseek-cn | deepseek-anthropic | nvidia-nim | openai | atlascloud | wanjie-ark | volcengine | openrouter | orcarouter | xiaomi-mimo | novita | fireworks | siliconflow | siliconflow-CN | arcee | moonshot | zai | stepfun | minimax | sglang | vllm | ollama | ollama-cloud | huggingface | modelscope | together | qianfan | openai-codex | anthropic | openmodel | deepinfra | sakana | longcat | opencode-go | opencode-zen | meta | xai | mistral | telecomjs | google | edenai | zenmux | csdn | concentrate | modelstudio-token-plan | modelstudio-coding-plan | codewhale
 api_key = "YOUR_DEEPSEEK_API_KEY" # must be non-empty
 base_url = "https://api.deepseek.com/beta"
 # provider = "deepseek-cn"                       # legacy alias (official host is still https://api.deepseek.com)
@@ -258,6 +258,12 @@ memory_path = "~/.codewhale/memory.md"
 # Seconds a question or an approval decision waits before it cancels (#6003).
 # 0 disables the timeout entirely; values above 86400 (24h) are clamped.
 # user_input_timeout_seconds = 300
+#
+# Bound an interactive approval card's wait (#6101). When the window elapses
+# the card resolves to deny (fail-closed) and the transcript says the bound
+# denied the call; omitted or 0 waits indefinitely.
+# [approval]
+# timeout_seconds = 300
 
 # ─────────────────────────────────────────────────────────────────────────────────
 # Product telemetry — optional, enabled by default with a startup disclosure
@@ -990,6 +996,21 @@ max_subagents = 10 # optional (default 64, clamped to 1-128)
 # base_url = "https://api.openmodel.ai"
 # model = "deepseek-v4-flash"
 
+# Codewhale API (https://app.codewhale.net/settings?section=api)
+# Account-backed model access over the provider keys connected to the
+# customer's Codewhale account. The account's authenticated `GET /v1/models`
+# listing is the catalog authority: each `provider/model` row states its wire
+# (`chat-completions` → `/v1/chat/completions`, `anthropic-messages` →
+# `/v1/messages`, `responses` → `/v1/responses`). Every protocol authenticates
+# the account key with `Authorization: Bearer`, never `x-api-key`.
+# Provider aliases: codewhale-api, cw-api, codewhale-cloud
+# Env vars: CODEWHALE_API_KEY, CODEWHALE_API_BASE (HTTPS except loopback);
+#           the generic CODEWHALE_MODEL override also applies.
+[providers.codewhale]
+# api_key = "cwc_key_..."                   # or `codewhale account api-keys create --name <name> --use`
+# base_url = "https://api.codewhale.net/v1"
+# model = "deepseek/deepseek-v4-pro"        # provider/model exactly as the account catalog returns it
+
 # ─────────────────────────────────────────────────────────────────────────────────
 # Web Search Provider
 # ─────────────────────────────────────────────────────────────────────────────────
@@ -1006,11 +1027,14 @@ max_subagents = 10 # optional (default 64, clamped to 1-128)
 #                            # duckduckgo: HTML scrape with Bing fallback
 #                            # bing:       HTML scrape, no API key
 #                            # tavily:     https://tavily.com — AI search, needs api_key
+#                            #             TAVILY_API_KEY set + provider unset auto-selects tavily
+#                            #             at runtime; it is never written to config.toml
 #                            # bocha:      https://bochaai.com — 博查AI搜索，国内友好，需api_key
 #                            # metaso:     https://metaso.cn — 秘塔AI搜索，需 api_key
 #                            #             设置 METASO_API_KEY 或 [search] api_key
 #                            # searxng:    https://docs.searxng.org — trusted/self-hosted JSON API,
 #                            #             set base_url; no public instance is used by default
+#                            #             instance must enable JSON (settings.yml search.formats); HTML-only instances 403
 #                            # baidu:      百度 AI Search via qianfan.baidubce.com，需 api_key
 #                            # volcengine: 火山引擎 Ark web_search (免费 2 万次/月), 需 api_key
 #                            #             也回退到 VOLCENGINE_API_KEY / VOLCENGINE_ARK_API_KEY / ARK_API_KEY 环境变量
@@ -1039,6 +1063,9 @@ max_subagents = 10 # optional (default 64, clamped to 1-128)
 #   VOLCENGINE_API_KEY / VOLCENGINE_ARK_API_KEY / ARK_API_KEY → volcengine key fallback
 #   SOFYA_API_KEY            → sofya key fallback
 #   SERPLY_API_KEY           → serply key fallback
+#   TAVILY_API_KEY           → tavily autodetect when provider is unset (explicit
+#                              provider = "..." or CODEWHALE_SEARCH_PROVIDER still
+#                              wins; the autodetect is never persisted)
 
 # ─────────────────────────────────────────────────────────────────────────────────
 # Network Policy (#135)
@@ -1131,7 +1158,8 @@ max_subagents = 10 # optional (default 64, clamped to 1-128)
 # ─────────────────────────────────────────────────────────────────────────────────
 [tui]
 alternate_screen = "auto"   # auto/always start on the alternate screen; never starts inline (keeps terminal scrollback). /fullscreen and /inline switch at runtime
-mouse_capture = true        # true copies only transcript user/assistant text; false uses raw terminal selection/copy
+mouse_capture = true        # true: TUI-owned mouse selection (payload set by selection_copy_markdown); false: raw terminal selection/copy
+selection_copy_markdown = true # true: copy transcript drag selections as Markdown source; false: rendered text
 terminal_probe_timeout_ms = 500 # optional startup terminal-mode timeout (100-5000ms)
 stream_chunk_timeout_secs = 900 # optional SSE idle timeout per chunk (0 = default, 1-3600)
 # Model steps are uncapped by default. Uncomment to install an explicit
@@ -1150,9 +1178,10 @@ osc8_links = true            # emit OSC 8 escapes around URLs (Cmd+click in iTer
 # interactively with `/statusline`.
 # Supported keys: mode, model, context_percent, cost,
 # balance (prepaid providers only: DeepSeek, DeepSeekCN, OpenRouter,
-# SiliconFlow), cache, tokens, session_metrics.
+# SiliconFlow), cache, tokens, ttft, output_rate, workspace, git_branch.
+# Legacy session_metrics enables both ttft and output_rate.
 # Retired in 0.9.13: status, agents, reasoning_replay, prefix_stability,
-# git_branch, last_tool_elapsed, rate_limit — they drove nothing. Old files
+# last_tool_elapsed, rate_limit — they drove nothing. Old files
 # keep loading; the retired keys are ignored.
 # status_items = ["mode", "model", "context_percent", "cost", "tokens"]
 # Size presets for the two rows themselves (#5950) — composition stays in
@@ -1163,8 +1192,8 @@ osc8_links = true            # emit OSC 8 escapes around URLs (Cmd+click in iTer
 #                               # hidden gives the row to the transcript.
 # metrics_line = "compact"      # full | compact | hidden (default compact)
 #                               # compact keeps the route, context reading, cost
-#                               # and balance and drops the telemetry and the
-#                               # help hint; hidden gives the row to the transcript.
+#                               # and balance plus selected TTFT/rate when they fit.
+#                               # It drops secondary counts and help; hidden gives the row to the transcript.
 #                               # Also settable at runtime: /config posture_bar compact
 # notification_condition = "unfocused" # unfocused | always | never
 #                                    "unfocused" = notify only after this terminal has been
@@ -1625,8 +1654,6 @@ default_text_model = "deepseek-ai/deepseek-v4-pro"
 # auto_start_read_only = true
 # # Require an approval card before write/shell/network/high-budget launches.
 # require_approval_for_writes = true
-# # Soft cap on children admitted by automatic launch (larger plans ask first).
-# auto_start_child_limit = 16
 # # Hard ceiling on agents in one Workflow run (matches VM lifetime cap).
 # max_children = 1000
 # # Maximum concurrently live agents inside one run (others wait for a slot).
@@ -1636,13 +1663,6 @@ default_text_model = "deepseek-ai/deepseek-v4-pro"
 # max_depth = 5
 # # Default shared token budget for a Workflow run and its children.
 # default_token_budget = 120000
-# # Parallel write children that may share the parent worktree without
-# # isolation. 0 forces worktree isolation for parallel writes.
-# max_parallel_writes_without_worktree = 0
-# # Keep completed Workflow activity visible until the next run / clear.
-# persist_completed_activity = true
-# # Persist completed activity across process restarts via the run journal.
-# persist_completed_across_restarts = true
 
 # ─────────────────────────────────────────────────────────────────────────────────
 # Agent Fleet roster, role registry, and execution requests (#3165, #3167)
@@ -1698,47 +1718,12 @@ default_text_model = "deepseek-ai/deepseek-v4-pro"
 # instructions = "Review diffs for correctness, regressions, and missing tests."
 
 # ─────────────────────────────────────────────────────────────────────────────────
-# Named operator-scoped Fleet configurations (#5039)
+# Named fleets live in files, not inline tables (0.9.14).
 #
-# Multiple named Fleets may coexist alongside the default [fleet] table.
-# Each [fleets.<name>] entry must include an `operator` field and may configure
-# its own roles, profiles, and execution requests independently. Runtime policy
-# remains separate from Fleet identity.
-#
-# Selection precedence (most specific wins):
-#   1. Explicit fleet name  — config.resolve_fleet("name")
-#   2. Operator lookup      — config.resolve_fleet_for_operator("alice")
-#   3. Global default       — config.fleet  (the [fleet] table)
-#
-# Unknown fleet/operator references fail with an actionable error listing
-# what IS configured, rather than silently falling back.
+# Inline [fleets.<name>] tables were removed: define named fleets as
+# `fleets/<name>.toml` under $CODEWHALE_HOME or the workspace instead
+# (see docs/FLEET.md). Old inline tables still parse but are ignored.
 # ─────────────────────────────────────────────────────────────────────────────────
-#
-# [fleets.alice-team]
-# # Required: the operator/leader identity for this fleet.
-# operator = "alice"
-#
-# [fleets.alice-team.exec]
-# max_turns = 200
-# max_spawn_depth = 2
-# append_system_prompt = "Always ask before modifying configuration files."
-#
-# [fleets.alice-team.profiles.ci-linter]
-# slot = "verifier"
-# loadout = "fast"
-# model = "deepseek-v4-pro"
-#
-# [fleets.alice-team.profiles.ci-linter.role]
-# name = "CI Linter"
-# description = "Runs linters and formatters for alice-team"
-# instructions = "Run cargo fmt --check and cargo clippy; never apply fixes."
-#
-# [fleets.bob-team]
-# operator = "bob"
-#
-# [fleets.bob-team.profiles.implementer]
-# slot = "implementer"
-# loadout = "inherit"
 
 # ─────────────────────────────────────────────────────────────────────────────────
 # Requirements (admin constraints) example file

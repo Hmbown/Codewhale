@@ -735,8 +735,7 @@ fn shell_owner_registers_before_spawn_and_silent_work_stays_live() {
             Some(lifecycle.clone()),
             "shell_spawn_failure",
             "missing-program",
-        )
-        .expect("register spawn intent");
+        );
     }
     lifecycle
         .register("shell_silent", "sleep 30")
@@ -1228,6 +1227,44 @@ async fn read_only_shell_policy_blocks_non_readonly_commands() {
             "{command}"
         );
     }
+}
+
+#[tokio::test]
+async fn read_only_refusal_names_child_alternatives_instead_of_mode_switch() {
+    // #6298: a child has no `/mode` to switch to — a refusal that tells it to
+    // switch modes is a dead end beside an available absurd path. The child
+    // branch must name the child's own alternatives and the escalation path.
+    let tmp = tempdir().expect("tempdir");
+    let child_ctx = ToolContext::new(tmp.path())
+        .with_shell_policy(crate::worker_profile::ShellPolicy::ReadOnly)
+        .with_owner_agent("agent_child", "child");
+    let tool = BashTool::new("Bash");
+    let result = tool
+        .execute(json!({"command": "cargo build"}), &child_ctx)
+        .await
+        .expect("execute");
+    assert!(!result.success);
+    assert!(result.content.contains("read-only shell policy"));
+    assert!(result.content.contains("read_file"));
+    assert!(
+        result
+            .content
+            .contains("report the blocked probe to the parent")
+    );
+    assert!(
+        !result.content.contains("/mode work"),
+        "child must never be told to switch modes: {}",
+        result.content
+    );
+
+    let parent_ctx = ToolContext::new(tmp.path())
+        .with_shell_policy(crate::worker_profile::ShellPolicy::ReadOnly);
+    let result = tool
+        .execute(json!({"command": "cargo build"}), &parent_ctx)
+        .await
+        .expect("execute");
+    assert!(!result.success);
+    assert!(result.content.contains("/mode work"));
 }
 
 #[cfg(unix)]
@@ -3529,6 +3566,8 @@ fn killed_shell_does_not_wait_for_blocked_reader_threads() {
         completion_reported: false,
         bounded_output: None,
         stdin: None,
+        pty_master: None,
+        terminal_size: None,
         child: None,
         windows_job: None,
         stdout_thread: Some(stdout_thread),
@@ -3846,6 +3885,54 @@ async fn unknown_bash_action_is_refused_instead_of_running_the_command() {
         "must name the actions that dispatch: {message}"
     );
     assert!(!marker.exists(), "the command must not have run");
+}
+
+/// A NUL byte cannot cross the `exec` boundary: `Command` panics on it.
+/// Refuse with the byte offset before anything spawns (#5529).
+#[tokio::test]
+async fn nul_byte_in_shell_command_is_refused_before_spawn() {
+    let workspace = tempdir().expect("workspace");
+    let context = ToolContext::new(workspace.path().to_path_buf());
+    let marker = workspace.path().join("should-not-exist");
+
+    let error = BashTool::new("Bash")
+        .execute(
+            json!({
+                "command": format!("echo hi\0; touch {}", marker.display()),
+            }),
+            &context,
+        )
+        .await
+        .expect_err("NUL byte must be refused");
+
+    let message = error.to_string();
+    assert!(message.contains("NUL byte"), "{message}");
+    assert!(message.contains("byte offset 7"), "{message}");
+    assert!(!marker.exists(), "the command must not have run");
+}
+
+/// `cwd` crosses the same boundary via `current_dir`, so the guard covers it
+/// too (#5529).
+#[tokio::test]
+async fn nul_byte_in_shell_cwd_is_refused_before_spawn() {
+    let workspace = tempdir().expect("workspace");
+    let context = ToolContext::new(workspace.path().to_path_buf());
+
+    let error = BashTool::new("Bash")
+        .execute(
+            json!({
+                "command": "echo hi",
+                "cwd": "sub\0dir",
+            }),
+            &context,
+        )
+        .await
+        .expect_err("NUL byte must be refused");
+
+    let message = error.to_string();
+    assert!(message.contains("NUL byte"), "{message}");
+    assert!(message.contains("cwd"), "{message}");
+    assert!(message.contains("byte offset 3"), "{message}");
 }
 
 /// The same hole one type down. `and_then(as_str).unwrap_or("run")` read a
@@ -4574,4 +4661,237 @@ async fn readonly_sed_extra_options_never_mutate_files() {
         .await
         .unwrap();
     assert!(result.success, "{}", result.content);
+}
+
+/// A transiently busy Work-graph must not veto the command.
+///
+/// `register_operation` acquires the To-do/Plan locks with a short try-lock
+/// spin. Before this guard existed, a shell call landing in that window failed
+/// outright with "To-do state is busy; operation was not registered" — observed
+/// twice in one live session, each time right after another tool call. The
+/// registration is the same bookkeeping whose `observe` half is already
+/// best-effort, so a busy state now degrades to an unbound run.
+#[tokio::test]
+async fn busy_work_graph_degrades_the_spawn_intent_instead_of_failing_it() {
+    use crate::tools::plan::new_shared_plan_state;
+    use crate::tools::todo::new_shared_todo_list;
+    use crate::work_graph::new_shared_work_runtime;
+
+    let todos = new_shared_todo_list();
+    let plan = new_shared_plan_state();
+    let lifecycle = || ShellWorkLifecycle {
+        work: new_shared_work_runtime(todos.clone(), plan.clone()),
+        session_id: "session-test".to_string(),
+    };
+
+    // Control: with the graph free, the intent binds.
+    let bound = ShellSpawnIntentGuard::new(Some(lifecycle()), "shell_free", "echo hi");
+    assert!(
+        bound.lifecycle.is_some(),
+        "a free work-graph must bind the spawn intent"
+    );
+
+    // Busy: hold the To-do lock so the try-lock spin cannot win.
+    let _held = todos.lock().await;
+    // The raw register call still reports the busy state — this is exactly what
+    // used to propagate out of the spawn path and fail the command.
+    assert!(
+        lifecycle()
+            .register("shell_busy_direct", "echo hi")
+            .is_err(),
+        "the raw register call must observe the held lock as busy"
+    );
+    let busy = ShellSpawnIntentGuard::new(Some(lifecycle()), "shell_busy", "echo hi");
+    assert!(
+        busy.lifecycle.is_none(),
+        "a busy work-graph must degrade to an unbound guard, not fail the spawn"
+    );
+}
+
+#[test]
+fn pty_dimensions_reject_zero_and_unbounded_grid() {
+    assert_eq!(
+        PtyDimensions::default(),
+        PtyDimensions { rows: 24, cols: 80 }
+    );
+    for size in [
+        PtyDimensions { rows: 0, cols: 80 },
+        PtyDimensions { rows: 24, cols: 0 },
+        PtyDimensions {
+            rows: 1001,
+            cols: 80,
+        },
+        PtyDimensions {
+            rows: 24,
+            cols: u16::MAX,
+        },
+    ] {
+        assert!(size.validate().is_err());
+    }
+    assert!(
+        PtyDimensions {
+            rows: 1000,
+            cols: 1000
+        }
+        .validate()
+        .is_ok()
+    );
+}
+
+#[test]
+#[cfg(not(target_env = "ohos"))]
+fn pty_stdin_preserves_bytes_and_reports_flush_failure() {
+    struct FlushFailure(Arc<Mutex<Vec<u8>>>);
+    impl Write for FlushFailure {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "fixture flush failure",
+            ))
+        }
+    }
+    let tmp = tempdir().unwrap();
+    let mut manager = ShellManager::new(tmp.path().to_path_buf());
+    manager.seed_finished_record_for_test("input-fixture", Duration::ZERO);
+    let bytes = Arc::new(Mutex::new(Vec::new()));
+    manager.processes.get_mut("input-fixture").unwrap().stdin =
+        Some(StdinWriter::Pty(Box::new(FlushFailure(bytes.clone()))));
+    let input = b"\0\xff\x1b[A\x03";
+    let error = manager
+        .write_stdin_bytes("input-fixture", input, false)
+        .unwrap_err();
+    assert!(error.to_string().contains("flush"));
+    assert_eq!(bytes.lock().unwrap().as_slice(), input);
+}
+
+#[test]
+#[cfg(all(unix, not(target_env = "ohos")))]
+fn pty_resize_updates_live_terminal_and_rejects_finished_or_pipe_jobs() {
+    let tmp = tempdir().unwrap();
+    let mut manager = ShellManager::new(tmp.path().to_path_buf());
+    let launched = manager
+        .execute_with_options_env(
+            "stty -echo; printf ready; while IFS= read -r line; do stty size; done",
+            None,
+            5000,
+            true,
+            None,
+            true,
+            Some(ExecutionSandboxPolicy::DangerFullAccess),
+            HashMap::new(),
+        )
+        .unwrap();
+    let id = launched.task_id.unwrap();
+    assert_eq!(
+        manager.job_terminal_size(&id),
+        Some(PtyDimensions::default())
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let chunk = manager
+            .read_output_chunk(&id, ShellOutputStream::Stdout, 0, 4096, 50)
+            .unwrap();
+        if chunk.bytes.windows(5).any(|bytes| bytes == b"ready") {
+            break;
+        }
+        assert!(Instant::now() < deadline, "PTY did not become ready");
+    }
+    let size = PtyDimensions {
+        rows: 37,
+        cols: 111,
+    };
+    manager.resize_pty(&id, size).unwrap();
+    assert_eq!(manager.job_terminal_size(&id), Some(size));
+    assert!(
+        manager
+            .resize_pty(&id, PtyDimensions { rows: 0, cols: 1 })
+            .is_err()
+    );
+    assert_eq!(manager.job_terminal_size(&id), Some(size));
+    manager.write_stdin_bytes(&id, b"size\n", false).unwrap();
+    loop {
+        let chunk = manager
+            .read_output_chunk(&id, ShellOutputStream::Stdout, 0, 4096, 0)
+            .unwrap();
+        if String::from_utf8_lossy(&chunk.bytes).contains("37 111") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "actual terminal size did not change"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    manager.kill(&id).unwrap();
+    assert!(manager.resize_pty(&id, size).is_err());
+    assert!(manager.processes[&id].pty_master.is_none());
+    let pipe = manager
+        .execute_with_options_env(
+            "cat",
+            None,
+            5000,
+            true,
+            None,
+            false,
+            Some(ExecutionSandboxPolicy::DangerFullAccess),
+            HashMap::new(),
+        )
+        .unwrap()
+        .task_id
+        .unwrap();
+    assert!(manager.resize_pty(&pipe, size).is_err());
+    manager.kill(&pipe).unwrap();
+}
+
+#[test]
+#[cfg(all(unix, not(target_env = "ohos")))]
+fn pty_raw_stdin_roundtrips_nul_and_non_utf8_bytes() {
+    let tmp = tempdir().unwrap();
+    let mut manager = ShellManager::new(tmp.path().to_path_buf());
+    let input = b"\0\xff\x1b[A\x03\n";
+    let command = format!(
+        "stty raw -echo; printf ready; dd bs=1 count={} 2>/dev/null",
+        input.len()
+    );
+    let launched = manager
+        .execute_with_options_env(
+            &command,
+            None,
+            5000,
+            true,
+            None,
+            true,
+            Some(ExecutionSandboxPolicy::DangerFullAccess),
+            HashMap::new(),
+        )
+        .unwrap();
+    let id = launched.task_id.unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let chunk = manager
+            .read_output_chunk(&id, ShellOutputStream::Stdout, 0, 4096, 0)
+            .unwrap();
+        if chunk.bytes == b"ready" {
+            break;
+        }
+        assert!(Instant::now() < deadline, "raw PTY did not become ready");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    manager.write_stdin_bytes(&id, input, false).unwrap();
+    loop {
+        let chunk = manager
+            .read_output_chunk(&id, ShellOutputStream::Stdout, 5, 4096, 0)
+            .unwrap();
+        if chunk.status != ShellStatus::Running {
+            assert_eq!(chunk.bytes, input);
+            assert_eq!(chunk.next_offset, 5 + input.len());
+            break;
+        }
+        assert!(Instant::now() < deadline, "raw PTY did not finish");
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }

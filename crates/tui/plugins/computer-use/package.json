@@ -1,8 +1,11 @@
 {
   "name": "codewhale-cu",
-  "version": "0.3.1",
+  "version": "0.11.2",
   "description": "Codewhale's included Computer Use plugin: accessibility, screenshots, keyboard and pointer control, and recording through the Engine's reviewed plugin authority.",
   "license": "MIT",
+  "repository": "github:Hmbown/codewhale-cu-plugin",
+  "homepage": "https://github.com/Hmbown/codewhale-cu-plugin#readme",
+  "bugs": "https://github.com/Hmbown/codewhale-cu-plugin/issues",
   "type": "module",
   "private": true,
   "main": "./mcp/server.mjs",
@@ -12,5 +15,8 @@
   },
   "engines": {
     "node": ">=20"
+  },
+  "devDependencies": {
+    "sharp": "0.35.4"
   }
 }

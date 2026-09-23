@@ -16,6 +16,21 @@ pub(crate) struct RuntimePolicyProjection {
     pub(crate) permission: ApprovalMode,
 }
 
+/// The wire spelling of one approval posture: what a thread or task request
+/// names in its `permission_posture` field.
+///
+/// `Never` is a managed-policy value the product surface does not carry, so it
+/// reads as Ask — exactly as [`RuntimePolicyProjection::permission_wire`] has
+/// always spelled it.
+#[must_use]
+pub(crate) fn approval_wire(mode: ApprovalMode) -> &'static str {
+    match mode {
+        ApprovalMode::Auto => "auto_review",
+        ApprovalMode::Bypass => "full_access",
+        ApprovalMode::Suggest | ApprovalMode::Never => "ask",
+    }
+}
+
 impl RuntimePolicyProjection {
     /// Read a persisted compatibility shape. Unknown historical values fail
     /// closed to Act + Ask unless the old bypass bit is explicitly present.
@@ -77,12 +92,7 @@ impl RuntimePolicyProjection {
 
     #[must_use]
     pub(crate) fn permission_wire(self) -> &'static str {
-        match self.permission {
-            ApprovalMode::Suggest => "ask",
-            ApprovalMode::Auto => "auto_review",
-            ApprovalMode::Bypass => "full_access",
-            ApprovalMode::Never => "ask",
-        }
+        approval_wire(self.permission)
     }
 
     #[must_use]
@@ -113,6 +123,15 @@ fn legacy_yolo_alias(mode: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn approval_wire_spells_every_product_posture() {
+        assert_eq!(approval_wire(ApprovalMode::Suggest), "ask");
+        assert_eq!(approval_wire(ApprovalMode::Auto), "auto_review");
+        assert_eq!(approval_wire(ApprovalMode::Bypass), "full_access");
+        // `Never` is a managed-policy value the product surface does not carry.
+        assert_eq!(approval_wire(ApprovalMode::Never), "ask");
+    }
 
     #[test]
     fn legacy_inputs_project_to_current_mode_and_permission_wires() {

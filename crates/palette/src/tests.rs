@@ -637,7 +637,7 @@ fn color_depth_detect_is_safe_without_env() {
 }
 
 /// no-color.org contract (spec TIDELINE §5d gap): `NO_COLOR` present and
-/// non-empty forces the mono/ascii-safe path even on a truecolor terminal;
+/// non-empty suppresses colors even on a truecolor terminal;
 /// an empty value does not count.
 #[test]
 fn no_color_forces_the_mono_depth_even_on_truecolor() {
@@ -650,7 +650,21 @@ fn no_color_forces_the_mono_depth_even_on_truecolor() {
         }
     }
     let depth = ColorDepth::detect_with(read(&[("NO_COLOR", "1"), ("COLORTERM", "truecolor")]));
-    assert_eq!(depth, ColorDepth::Ansi16, "NO_COLOR wins over COLORTERM");
+    assert_eq!(
+        depth,
+        ColorDepth::Monochrome,
+        "NO_COLOR wins over COLORTERM"
+    );
+    for color in [
+        Color::Reset,
+        Color::Red,
+        Color::Indexed(9),
+        Color::Rgb(103, 184, 214),
+    ] {
+        assert_eq!(adapt_color(color, depth), Color::Reset);
+        assert_eq!(adapt_bg(color, depth), Color::Reset);
+    }
+    assert!(reasoning_surface_tint(depth).is_none());
     let depth = ColorDepth::detect_with(read(&[("NO_COLOR", ""), ("COLORTERM", "truecolor")]));
     assert_eq!(
         depth,
@@ -1088,6 +1102,86 @@ fn measured_light_background_selects_the_light_theme_end_to_end() {
 }
 
 // === #4813: cross-theme contrast audit ===
+
+#[test]
+fn grayscale_background_roles_survive_direct_and_token_render_paths() {
+    let theme = GRAYSCALE_UI_THEME;
+    for (token, expected) in [
+        (WHALE_BG, theme.surface_bg),
+        (WHALE_PANEL, theme.panel_bg),
+        (SURFACE_TOOL_ACTIVE, theme.elevated_bg),
+        (SELECTION_BG, theme.selection_bg),
+        (LIGHT_SELECTION_BG, theme.selection_bg),
+        (SURFACE_REASONING, GRAYSCALE_REASONING),
+        (DIFF_ADDED_BG, theme.diff_added_bg),
+        (DIFF_DELETED_BG, theme.diff_deleted_bg),
+    ] {
+        let resolved = adapt_bg_for_palette_mode(token, PaletteMode::Grayscale);
+        assert_eq!(resolved, expected, "token {token:?}");
+        assert_eq!(
+            adapt_bg_for_palette_mode(expected, PaletteMode::Grayscale),
+            expected,
+            "direct theme role {expected:?} must not be bucketed twice",
+        );
+    }
+}
+
+#[test]
+fn rendered_workbench_selection_tracks_every_selectable_theme() {
+    use ratatui::{
+        buffer::Buffer,
+        layout::Rect,
+        style::{Modifier, Style},
+        widgets::{Block, Paragraph, Widget},
+    };
+
+    // Menus and Config paint legacy semantic tokens; the home/composer use
+    // direct UiTheme roles. The final cell remap must make those surfaces
+    // agree, including the selected row's padding, on every picker choice.
+    for theme_id in SELECTABLE_THEMES {
+        let theme = theme_id.ui_theme();
+        for width in [40, 80] {
+            let area = Rect::new(0, 0, width, 3);
+            let mut buffer = Buffer::empty(area);
+            Block::default()
+                .style(Style::default().bg(WHALE_BG))
+                .render(area, &mut buffer);
+            Paragraph::new("Current workspace")
+                .style(Style::default().fg(TEXT_BODY))
+                .render(Rect::new(0, 0, width, 1), &mut buffer);
+            Paragraph::new("> Recent session")
+                .style(
+                    Style::default()
+                        .fg(super::tokens::SELECTION_TEXT)
+                        .bg(SELECTION_BG)
+                        .add_modifier(Modifier::BOLD),
+                )
+                .render(Rect::new(0, 1, width, 1), &mut buffer);
+
+            // The same two semantic adaptation stages as ColorCompatBackend,
+            // before terminal-depth quantization or any contrast correction.
+            for cell in &mut buffer.content {
+                cell.fg = adapt_fg_for_theme(cell.fg, *theme_id, &theme);
+                cell.bg = adapt_bg_for_theme(cell.bg, *theme_id, &theme);
+                cell.fg = adapt_fg_for_palette_mode(cell.fg, cell.bg, theme.mode);
+                cell.bg = adapt_bg_for_palette_mode(cell.bg, theme.mode);
+            }
+            assert_eq!(buffer[(0, 0)].fg, theme.text_body, "{} body", theme.name);
+            assert_eq!(buffer[(0, 0)].bg, theme.surface_bg, "{} field", theme.name);
+            for x in 0..width {
+                let selected = &buffer[(x, 1)];
+                assert_eq!(selected.fg, theme.text_body, "{} selected ink", theme.name);
+                assert_eq!(selected.bg, theme.selection_bg, "{} selection", theme.name);
+                assert!(selected.modifier.contains(Modifier::BOLD));
+            }
+            if let Some(ratio) =
+                super::contrast::contrast_ratio(buffer[(0, 1)].fg, buffer[(0, 1)].bg)
+            {
+                assert!(ratio >= 4.5, "{} selected text: {ratio}", theme.name);
+            }
+        }
+    }
+}
 
 #[test]
 fn every_selectable_theme_clears_the_text_floor() {

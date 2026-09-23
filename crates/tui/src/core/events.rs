@@ -143,6 +143,12 @@ pub struct AgentProgressEventMeta {
     /// Canonical action/tool name. Presentation aliases are applied by the UI
     /// when it creates the bounded current-activity projection.
     pub tool_name: Option<String>,
+    /// True when this progress is the routine per-step wait heartbeat
+    /// ("requesting model response"). Retry/timeout waits share the
+    /// `ModelWait` status but carry informative text, so the status alone
+    /// cannot tell them apart — the producer sets this instead, and UI
+    /// consumers rewrite on it rather than sniffing the message (#6290).
+    pub routine_wait: bool,
 }
 
 impl AgentProgressEventMeta {
@@ -152,12 +158,19 @@ impl AgentProgressEventMeta {
             worker_status,
             step: None,
             tool_name: None,
+            routine_wait: false,
         }
     }
 
     #[must_use]
     pub const fn with_step(mut self, step: u32) -> Self {
         self.step = Some(step);
+        self
+    }
+
+    #[must_use]
+    pub const fn routine_wait(mut self) -> Self {
+        self.routine_wait = true;
         self
     }
 
@@ -427,6 +440,9 @@ pub enum Event {
         parent_run_id: Option<String>,
         spawn_depth: Option<u32>,
         continuable: Option<bool>,
+        /// Provider-reported child usage from the durable ledger (#6315).
+        /// None means the worker has no usage receipt, never zero tokens.
+        usage: Option<crate::tools::subagent::AgentRunUsage>,
     },
 
     /// Receipt for an operator follow-up sent to a child (`Op::FollowUpSubAgent`).
@@ -564,7 +580,9 @@ pub enum Event {
     /// later `reasoning_content` replay.
     SessionUpdated {
         session_id: String,
-        messages: Vec<Message>,
+        /// Shared history snapshot (#6214 T2): the engine hands out an `Arc`
+        /// instead of deep-copying the transcript per event.
+        messages: Arc<Vec<Message>>,
         system_prompt: Option<SystemPrompt>,
         model: String,
         workspace: PathBuf,

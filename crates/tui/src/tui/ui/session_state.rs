@@ -10,6 +10,20 @@ pub(crate) struct OfflineQueueTransition {
     restored: Option<OfflineQueueState>,
 }
 
+/// A session load/resume failure must survive past the next footer update.
+///
+/// The status line is replaced almost immediately, which left a failed
+/// resume looking like a silent new session — the screen even offered to
+/// resume the id it had just created (#6138). Keep both: the transcript
+/// error cell is the durable record, the status line the immediate one.
+pub(crate) fn surface_session_load_failure(app: &mut App, message: String) {
+    app.add_message(crate::tui::history::HistoryCell::Error {
+        message: message.clone(),
+        severity: crate::error_taxonomy::ErrorSeverity::Error,
+    });
+    app.status_message = Some(message);
+}
+
 /// Complete all fallible queue work before a session switch mutates the App.
 /// A second editor must fail without touching either composer or queue file.
 pub(crate) fn prepare_offline_queue_transition(
@@ -633,7 +647,7 @@ pub(crate) fn resume_launch_session(app: &mut App, session_id: &str) -> commands
         Ok(manager) => manager,
         Err(err) => return failed(app, &err.to_string()),
     };
-    let saved = match manager.load_session(session_id) {
+    let saved = match manager.load_session_snapshot(session_id) {
         Ok(saved) => saved,
         Err(err) => return failed(app, &err.to_string()),
     };
@@ -645,6 +659,27 @@ pub(crate) fn resume_launch_session(app: &mut App, session_id: &str) -> commands
     }
     app.launch.dissolve_card(app.ambient_clock_ms);
     commands::CommandResult::action(AppAction::LoadSession(path))
+}
+
+/// `LaunchAction::McpRemedy` (#6085): type the remedy the problems row
+/// prints into the composer — `/mcp login <name>` or `/mcp`. Typing beats
+/// copying (no clipboard dependency over SSH), and the user reads the
+/// command before a second Enter sends it.
+pub(crate) fn type_launch_mcp_remedy(app: &mut App) {
+    let Some(command) = crate::tui::underwater::mcp_remedy_command(app) else {
+        return;
+    };
+    // Home can be revisited with an unsent draft. The manager exposes the
+    // same remedy without replacing user-authored composer content.
+    if !app.input.is_empty() {
+        app.launch.dissolve_card(app.ambient_clock_ms);
+        open_mcp_extensions(app);
+        return;
+    }
+    app.input = command;
+    app.cursor_position = app.input.chars().count();
+    app.launch.menu_selected = None;
+    app.launch.status = None;
 }
 
 pub(crate) fn begin_launch_session(
@@ -663,7 +698,7 @@ pub(crate) fn begin_launch_session(
     app.current_session_id = Some(session_id.clone());
     app.current_session_metadata = None;
     app.session_title = Some(app.tr(MessageId::SessionsNewSessionTitle).into_owned());
-    app.launch.visible = false;
+    app.launch.dismiss();
     app.launch.status = None;
     app.status_message = None;
     commands::CommandResult::action(AppAction::SyncSession {
@@ -714,7 +749,7 @@ pub(crate) async fn switch_workspace(
         let _ = engine_handle
             .send(Op::SyncSession {
                 session_id: app.current_session_id.clone(),
-                messages: app.api_messages.clone(),
+                messages: app.api_messages.as_ref().clone(),
                 system_prompt: app.system_prompt.clone(),
                 system_prompt_override: false,
                 model: app.model.clone(),
@@ -936,6 +971,7 @@ pub(crate) fn mirror_saved_api_key_in_config(
         ApiProvider::Ollama => &mut providers.ollama,
         ApiProvider::OllamaCloud => &mut providers.ollama_cloud,
         ApiProvider::Huggingface => &mut providers.huggingface,
+        ApiProvider::Modelscope => &mut providers.modelscope,
         ApiProvider::Deepinfra => &mut providers.deepinfra,
         ApiProvider::Together => &mut providers.together,
         ApiProvider::Qianfan => &mut providers.qianfan,
@@ -957,6 +993,8 @@ pub(crate) fn mirror_saved_api_key_in_config(
         ApiProvider::Antigravity => &mut providers.antigravity,
         ApiProvider::Telecomjs => &mut providers.telecomjs,
         ApiProvider::Edenai => &mut providers.edenai,
+        ApiProvider::Zenmux => &mut providers.zenmux,
+        ApiProvider::Csdn => &mut providers.csdn,
         ApiProvider::Concentrate => &mut providers.concentrate,
         ApiProvider::Codewhale => &mut providers.codewhale,
         ApiProvider::ModelstudioTokenPlan => &mut providers.modelstudio_token_plan,
@@ -1013,11 +1051,11 @@ pub(crate) fn restore_loaded_session_provider(
             .reasoning_effort_preference
             .unwrap_or(app.reasoning_effort);
         app.reasoning_effort =
-            requested.normalize_for_route(provider, &config.deepseek_base_url(), &app.model);
+            requested.normalize_for_route(provider, &config.active_route_base_url(), &app.model);
     }
     app.set_active_context_window_override(config, provider);
     app.active_route_limits = app.context_window_override_limits();
-    app.active_route_base_url = config.deepseek_base_url();
+    app.active_route_base_url = config.active_route_base_url();
     app.active_context_window_source = app
         .configured_context_window_for(&app.model)
         .map(|resolution| resolution.source)
@@ -1028,7 +1066,7 @@ pub(crate) fn resolve_loaded_session_route(app: &mut App, config: &Config) {
     app.set_active_context_window_override(config, app.api_provider);
     if app.auto_model {
         app.active_route_limits = app.context_window_override_limits();
-        app.active_route_base_url = config.deepseek_base_url();
+        app.active_route_base_url = config.active_route_base_url();
         app.active_context_window_source = app
             .configured_context_window_for(&app.model)
             .map(|resolution| resolution.source)
@@ -1046,7 +1084,7 @@ pub(crate) fn resolve_loaded_session_route(app: &mut App, config: &Config) {
         }
         Err(_) => {
             app.active_route_limits = app.context_window_override_limits();
-            app.active_route_base_url = config.deepseek_base_url();
+            app.active_route_base_url = config.active_route_base_url();
             app.active_context_window_source = app
                 .configured_context_window_for(&app.model)
                 .map(|resolution| resolution.source)

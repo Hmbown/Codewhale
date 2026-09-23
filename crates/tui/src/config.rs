@@ -116,10 +116,16 @@ pub enum ApiProvider {
     /// Retired Antigravity identity retained only to deserialize and clear
     /// legacy Codewhale configuration. It is never selectable or runnable.
     Antigravity,
+    /// ModelScope — Alibaba's ModelScope inference API (OpenAI-compatible).
+    Modelscope,
     /// Jiangsu Telecom TokenHub — OpenAI-compatible AI gateway.
     Telecomjs,
     /// Eden AI — OpenAI-compatible AI gateway (aggregator).
     Edenai,
+    /// ZenMux — OpenAI-compatible AI gateway (aggregator).
+    Zenmux,
+    /// CSDN 星图 — OpenAI-compatible hosted platform and Coding Plan.
+    Csdn,
     /// Concentrate — OpenAI Responses-compatible AI gateway (aggregator; BYOK only).
     Concentrate,
     /// Codewhale API — account-backed model access over connected provider keys.
@@ -367,7 +373,7 @@ impl ApiProvider {
 
     /// `ApiProvider` discriminant → `ProviderKind` lookup.
     /// Index 1 is `None` for the legacy `DeepseekCN` variant.
-    const KIND_LOOKUP: [Option<codewhale_config::ProviderKind>; 50] = [
+    const KIND_LOOKUP: [Option<codewhale_config::ProviderKind>; 53] = [
         Some(codewhale_config::ProviderKind::Deepseek),
         None, // DeepseekCN
         Some(codewhale_config::ProviderKind::DeepseekAnthropic),
@@ -409,8 +415,11 @@ impl ApiProvider {
         Some(codewhale_config::ProviderKind::Mistral),
         Some(codewhale_config::ProviderKind::Google),
         Some(codewhale_config::ProviderKind::Antigravity),
+        Some(codewhale_config::ProviderKind::Modelscope),
         Some(codewhale_config::ProviderKind::Telecomjs),
         Some(codewhale_config::ProviderKind::Edenai),
+        Some(codewhale_config::ProviderKind::Zenmux),
+        Some(codewhale_config::ProviderKind::Csdn),
         Some(codewhale_config::ProviderKind::Concentrate),
         Some(codewhale_config::ProviderKind::Codewhale),
         Some(codewhale_config::ProviderKind::ModelstudioTokenPlan),
@@ -421,7 +430,7 @@ impl ApiProvider {
     ];
 
     /// `ProviderKind` discriminant → `ApiProvider` lookup.
-    const FROM_KIND_LOOKUP: [Self; 49] = [
+    const FROM_KIND_LOOKUP: [Self; 52] = [
         Self::Deepseek,
         Self::DeepseekAnthropic,
         Self::NvidiaNim,
@@ -466,8 +475,11 @@ impl ApiProvider {
         Self::ModelstudioCodingPlan,
         Self::ModelstudioCodingPlanAnthropic,
         Self::Antigravity,
+        Self::Modelscope,
         Self::Google,
         Self::Edenai,
+        Self::Zenmux,
+        Self::Csdn,
         Self::Concentrate,
         Self::Codewhale,
         Self::Custom,
@@ -538,6 +550,11 @@ fn subagent_provider_key_matches(key: &str, provider: ApiProvider) -> bool {
         ApiProvider::Openrouter => matches!(normalized.as_str(), "openrouter" | "open_router"),
         ApiProvider::Orcarouter => matches!(normalized.as_str(), "orcarouter" | "orca_router"),
         ApiProvider::Edenai => matches!(normalized.as_str(), "edenai" | "eden_ai"),
+        ApiProvider::Zenmux => matches!(normalized.as_str(), "zenmux" | "zen_mux"),
+        ApiProvider::Csdn => matches!(
+            normalized.as_str(),
+            "csdn" | "csdn_ai" | "csdn_coding_plan" | "starmap"
+        ),
         ApiProvider::Concentrate => matches!(
             normalized.as_str(),
             "concentrate" | "concentrate_ai" | "concentrateai"
@@ -1591,6 +1608,7 @@ pub fn model_completion_names_for_provider(provider: ApiProvider) -> Vec<&'stati
         ApiProvider::Huggingface => {
             vec![DEFAULT_HUGGINGFACE_MODEL, DEFAULT_HUGGINGFACE_FLASH_MODEL]
         }
+        ApiProvider::Modelscope => vec![DEFAULT_MODELSCOPE_MODEL],
         ApiProvider::Deepinfra => vec![DEFAULT_DEEPINFRA_MODEL, DEFAULT_DEEPINFRA_FLASH_MODEL],
         ApiProvider::WanjieArk => {
             vec![
@@ -1702,6 +1720,8 @@ pub fn model_completion_names_for_provider(provider: ApiProvider) -> Vec<&'stati
         // Legacy tombstone only; never advertise a runnable model.
         ApiProvider::Antigravity => Vec::new(),
         ApiProvider::Edenai => vec![DEFAULT_EDENAI_MODEL],
+        ApiProvider::Zenmux => vec![DEFAULT_ZENMUX_MODEL],
+        ApiProvider::Csdn => vec![DEFAULT_CSDN_MODEL],
         ApiProvider::Concentrate => vec![DEFAULT_CONCENTRATE_MODEL],
         // Bootstrap rows only. The account's authenticated `GET /v1/models`
         // lists exactly the providers this customer connected and replaces
@@ -1747,36 +1767,17 @@ where
     }))
 }
 
-/// Deserialize `header_items` tolerantly: skip keys unknown to this build
-/// instead of failing with an "unknown variant" error.
-///
-/// This keeps configuration files forward-compatible. For example, a newer
-/// CodeWhale build may write a header item that an older build does not yet
-/// understand; the older build will ignore that item while preserving the
-/// remaining supported entries.
-fn deser_header_items<'de, D>(deserializer: D) -> Result<Option<Vec<HeaderItem>>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let raw: Option<Vec<String>> = Option::deserialize(deserializer)?;
-    Ok(raw.map(|strings| {
-        strings
-            .into_iter()
-            .filter_map(|s| {
-                HeaderItem::from_key(&s).or_else(|| {
-                    tracing::warn!("ignoring unknown header item {s:?} in config");
-                    None
-                })
-            })
-            .collect()
-    }))
-}
-
 /// UI configuration loaded from config files.
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct TuiConfig {
     pub alternate_screen: Option<String>,
     pub mouse_capture: Option<bool>,
+    /// Copy a transcript drag selection as Markdown source (`true`, the
+    /// default) instead of rendered terminal text. The payload projects every
+    /// intersected cell through the same canonical serialization Ctrl-Y and
+    /// `/copy` use. Set `false` to restore the rendered-text payload (#6156).
+    /// PRIMARY selection on Linux always keeps rendered text.
+    pub selection_copy_markdown: Option<bool>,
     /// Legacy setting retained for config compatibility. Raw mode is set
     /// directly on the terminal-owning thread; this value has no effect.
     pub terminal_probe_timeout_ms: Option<u64>,
@@ -1822,22 +1823,6 @@ pub struct TuiConfig {
     /// balance and drops the telemetry and the help hint (#5950).
     #[serde(default)]
     pub metrics_line: Option<ChromeRowPreset>,
-    /// Ordered list of optional header items the user wants visible.
-    ///
-    /// `None` (the field missing from `config.toml`) preserves the built-in
-    /// header unchanged. An empty `Some(vec![])` likewise enables no additional
-    /// header items, while configured entries enable their corresponding
-    /// optional header content.
-    ///
-    /// The existing context-utilisation display remains part of the built-in
-    /// header and is not controlled by this list.
-    ///
-    /// Unknown items are ignored during deserialization so configurations written
-    /// by newer CodeWhale versions remain loadable by older versions.
-    ///
-    /// Persisted to `tui.header_items` in `~/.deepseek/config.toml`.
-    #[serde(default, deserialize_with = "deser_header_items")]
-    pub header_items: Option<Vec<HeaderItem>>,
     /// Emit OSC 8 hyperlink escape sequences around URLs in the transcript so
     /// supporting terminals (iTerm2, Terminal.app 13+, Ghostty, Kitty,
     /// WezTerm, Alacritty, recent gnome-terminal/konsole) make them clickable
@@ -2085,6 +2070,14 @@ pub struct GoalConfig {
     /// inside a provider turn.
     #[serde(default)]
     pub continuation_delay_seconds: Option<u64>,
+
+    /// Make a goal's `token_budget` a hard stop instead of advisory telemetry
+    /// (#6013). `false`/`None` preserves current behavior: crossing the budget
+    /// logs and continues. `true` stops the run with `BudgetLimit` once
+    /// `tokens_used >= token_budget`; goals created without a token budget
+    /// stay unbounded either way.
+    #[serde(default)]
+    pub enforce_token_budget: Option<bool>,
 }
 
 /// Reasoning-only recovery controls (`[reasoning_only]` table in config.toml).
@@ -2152,9 +2145,13 @@ pub enum StatusItem {
     Tokens,
     /// Prepaid remaining credit, refreshed once per turn completion.
     Balance,
-    /// The metrics line's latency pair: `ttft NNNms` and `NN tok/s`, from
-    /// the same engine timings and provider usage `/status` prints in full.
+    /// Legacy configuration alias enabling both TTFT and output rate.
+    /// The picker expands it into independently editable readings.
     SessionMetrics,
+    /// Mean measured time from request dispatch to the first token.
+    Ttft,
+    /// Provider output tokens divided by measured request time.
+    OutputRate,
     /// Leaf directory of the session workspace, left-truncated when long.
     /// Opt-in (#6112); off the default footer.
     Workspace,
@@ -2178,7 +2175,8 @@ impl StatusItem {
             StatusItem::Cost,
             StatusItem::Cache,
             StatusItem::Tokens,
-            StatusItem::SessionMetrics,
+            StatusItem::Ttft,
+            StatusItem::OutputRate,
         ]
     }
 
@@ -2194,6 +2192,8 @@ impl StatusItem {
             StatusItem::Tokens => "tokens",
             StatusItem::Balance => "balance",
             StatusItem::SessionMetrics => "session_metrics",
+            StatusItem::Ttft => "ttft",
+            StatusItem::OutputRate => "output_rate",
             StatusItem::Workspace => "workspace",
             StatusItem::GitBranch => "git_branch",
         }
@@ -2217,6 +2217,8 @@ impl StatusItem {
             | "rate_limit" => None,
             "balance" => Some(Self::Balance),
             "session_metrics" => Some(Self::SessionMetrics),
+            "ttft" => Some(Self::Ttft),
+            "output_rate" => Some(Self::OutputRate),
             "workspace" => Some(Self::Workspace),
             // Revived in #6112 as an opt-in metrics-line chip; it parses
             // again, so a config written between its #5950 retirement and
@@ -2238,6 +2240,8 @@ impl StatusItem {
             StatusItem::Tokens => "Output tokens",
             StatusItem::Balance => "Account balance",
             StatusItem::SessionMetrics => "Session metrics",
+            StatusItem::Ttft => "Time to first token",
+            StatusItem::OutputRate => "Output rate",
             StatusItem::Workspace => "Workspace",
             StatusItem::GitBranch => "Git branch",
         }
@@ -2256,12 +2260,15 @@ impl StatusItem {
             StatusItem::Tokens => "output tokens of the live or last turn",
             StatusItem::Balance => "remaining prepaid credit from the active provider",
             StatusItem::SessionMetrics => "time to first token and output rate",
+            StatusItem::Ttft => "average wait for the first token",
+            StatusItem::OutputRate => "average tok/s, including first-token wait",
             StatusItem::Workspace => "directory this session writes to",
             StatusItem::GitBranch => "branch the next commit lands on",
         }
     }
 
-    /// Every variant in display order — used by the picker to enumerate rows.
+    /// Editable items in display order. Legacy combined metrics parse but
+    /// expand to the two individual controls instead of appearing twice.
     #[must_use]
     pub fn all() -> &'static [StatusItem] {
         &[
@@ -2272,7 +2279,8 @@ impl StatusItem {
             StatusItem::Balance,
             StatusItem::Cache,
             StatusItem::Tokens,
-            StatusItem::SessionMetrics,
+            StatusItem::Ttft,
+            StatusItem::OutputRate,
             StatusItem::Workspace,
             StatusItem::GitBranch,
         ]
@@ -2302,43 +2310,6 @@ pub fn provider_has_balance_api(provider: ApiProvider) -> bool {
             | ApiProvider::Siliconflow
             | ApiProvider::SiliconflowCn
     )
-}
-
-/// One configurable header item
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Hash)]
-#[serde(rename_all = "snake_case")]
-pub enum HeaderItem {
-    /// Session token usage: input / cache-hit / output.
-    Tokens,
-}
-
-impl HeaderItem {
-    /// Default header composition for the always-on status line. Used when
-    /// `tui.header_items` is missing from `config.toml` so upgraders see a
-    /// concise header by default; diagnostic chips remain available through
-    /// explicit configuration without crowding the main UI.
-    #[must_use]
-    pub fn default_header() -> Vec<HeaderItem> {
-        Vec::new()
-    }
-
-    /// Stable canonical name used in TOML.
-    #[must_use]
-    pub fn key(self) -> &'static str {
-        match self {
-            HeaderItem::Tokens => "tokens",
-        }
-    }
-
-    /// Parse a config string while ignoring unknown items.
-    #[must_use]
-    pub fn from_key(key: &str) -> Option<Self> {
-        match key {
-            "tokens" => Some(Self::Tokens),
-            _ => None,
-        }
-    }
 }
 
 /// Resolved retry policy with defaults applied.
@@ -2478,11 +2449,6 @@ pub struct SubagentsConfig {
     /// execution bounded.
     #[serde(default, alias = "max_total", alias = "admission_limit")]
     pub max_admitted: Option<usize>,
-    /// Optional aggregate token budget shared by a root `agent` run and its
-    /// descendants. When unset or 0, sub-agents keep legacy unlimited spend
-    /// behavior unless an individual `agent` call supplies a per-run override.
-    #[serde(default)]
-    pub token_budget: Option<u64>,
     /// Deprecated pre-v0.8.61 alias for `launch_concurrency`. Honored only
     /// when `launch_concurrency` is unset, so the new key always wins.
     #[serde(default, rename = "interactive_max_launch")]
@@ -2567,8 +2533,6 @@ pub struct SubagentProviderConfig {
     pub launch_concurrency: Option<usize>,
     #[serde(default, alias = "max_total", alias = "admission_limit")]
     pub max_admitted: Option<usize>,
-    #[serde(default)]
-    pub token_budget: Option<u64>,
     #[serde(default)]
     pub api_timeout_secs: Option<u64>,
     #[serde(default)]
@@ -2764,6 +2728,13 @@ pub struct ApprovalConfig {
     /// Default: `deny`.
     #[serde(default)]
     pub default_selection: ApprovalDefaultSelection,
+    /// Seconds an interactive approval card may wait before it resolves
+    /// **deny** on its own (#6101). Absent or an explicit `0` waits
+    /// indefinitely — the operator is at the terminal, so the card stays
+    /// unbounded by default. Values above 86,400 (24h) are clamped with a
+    /// warning.
+    #[serde(default)]
+    pub timeout_seconds: Option<u64>,
 }
 
 /// `transcript.prose_measure` exactly as written in `config.toml`.
@@ -2827,9 +2798,25 @@ impl TranscriptConfig {
     }
 }
 
+/// Process-only account auth transform. Shared by Config clones so logout and
+/// expiry affect future request resolution without rewriting provider config.
+/// Running turns retain their materialized client; immediate revocation of
+/// that credential remains the account service's responsibility.
+#[derive(Debug, Clone)]
+pub(crate) struct AccountModelAccess {
+    pub(crate) session_id: String,
+    pub(crate) credential: crate::credentials::Credential,
+    pub(crate) expires_at: i64,
+    pub(crate) profile: Option<String>,
+}
+
 /// Resolved CLI configuration, including defaults and environment overrides.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct Config {
+    /// Never deserialized from disk or exposed as provider configuration.
+    #[serde(skip)]
+    pub(crate) account_model_access:
+        std::sync::Arc<parking_lot::RwLock<Option<AccountModelAccess>>>,
     /// Persisted exact-route declarations, separate from provider credentials.
     #[serde(
         default,
@@ -3869,6 +3856,8 @@ pub struct ProvidersConfig {
     pub ollama_cloud: ProviderConfig,
     #[serde(default, alias = "hugging-face", alias = "hf")]
     pub huggingface: ProviderConfig,
+    #[serde(default, alias = "model-scope", alias = "model_scope")]
+    pub modelscope: ProviderConfig,
     #[serde(default, alias = "deep-infra", alias = "deep_infra")]
     pub deepinfra: ProviderConfig,
     #[serde(default, alias = "together-ai")]
@@ -3972,6 +3961,19 @@ pub struct ProvidersConfig {
     /// Eden AI — OpenAI-compatible AI gateway (aggregator).
     #[serde(default, alias = "eden-ai", alias = "eden_ai")]
     pub edenai: ProviderConfig,
+    /// ZenMux — OpenAI-compatible AI gateway (aggregator).
+    #[serde(default, alias = "zen-mux", alias = "zen_mux")]
+    pub zenmux: ProviderConfig,
+    /// CSDN 星图 — OpenAI-compatible hosted platform and Coding Plan.
+    #[serde(
+        default,
+        alias = "csdn-ai",
+        alias = "csdn_ai",
+        alias = "csdn-coding-plan",
+        alias = "csdn_coding_plan",
+        alias = "starmap"
+    )]
+    pub csdn: ProviderConfig,
     /// Concentrate — OpenAI Responses-compatible AI gateway (aggregator).
     #[serde(
         default,
@@ -4094,8 +4096,12 @@ fn validate_model_context_windows(
 
 #[derive(Debug, Clone, Deserialize, Default)]
 struct ConfigFile {
+    /// Boxed so the parsed document never carries the multi-kilobyte
+    /// `Config` by value through `toml::de` and `apply_profile` frames. A
+    /// `#[tokio::test]` runs those frames on libtest's default 2 MiB stack,
+    /// which the by-value copies overflowed (#6362).
     #[serde(flatten)]
-    base: Config,
+    base: Box<Config>,
     profiles: Option<HashMap<String, Config>>,
 }
 
@@ -4683,6 +4689,21 @@ impl Config {
             };
         }
 
+        // Tavily autodetect: a dedicated `TAVILY_API_KEY`, or a generic
+        // `[search] api_key` in the `tvly-` family. Runtime-only — never write
+        // `[search] provider` from here, and never merge the env key into
+        // `search.api_key`.
+        let generic_key = self
+            .search
+            .as_ref()
+            .and_then(|search| search.api_key.as_deref());
+        if tavily_key_from(generic_key).is_some() {
+            return SearchProviderResolution {
+                provider: SearchProvider::Tavily,
+                source: SearchProviderSource::TavilyKey,
+            };
+        }
+
         SearchProviderResolution {
             provider: SearchProvider::default(),
             source: SearchProviderSource::Default,
@@ -4718,7 +4739,7 @@ impl Config {
 
     /// Return `true` only when `[auto] cross_provider = true` is persisted in
     /// config (#4411). Auto mode otherwise stays on the active provider: the
-    /// classifier never sees other providers' routes, and the local heuristic
+    /// classifier never sees other providers' routes, and the local fallback
     /// never selects one. There is no interactive toggle — enabling
     /// cross-provider Auto is an explicit, durable config edit.
     #[must_use]
@@ -5075,7 +5096,7 @@ impl Config {
         let active_provider = self.api_provider();
         match validate_kimi_code_api_model_id(
             active_provider,
-            &self.deepseek_base_url(),
+            &self.active_route_base_url(),
             &self.default_model(),
         ) {
             Err(error) if error == KIMI_CODE_CLAUDE_ALIAS_GUIDANCE => {
@@ -5833,6 +5854,7 @@ impl Config {
             ApiProvider::OllamaCloud => &providers.ollama_cloud,
             ApiProvider::Volcengine => &providers.volcengine,
             ApiProvider::Huggingface => &providers.huggingface,
+            ApiProvider::Modelscope => &providers.modelscope,
             ApiProvider::Deepinfra => &providers.deepinfra,
             ApiProvider::Together => &providers.together,
             ApiProvider::Qianfan => &providers.qianfan,
@@ -5854,6 +5876,8 @@ impl Config {
             ApiProvider::Antigravity => &providers.antigravity,
             ApiProvider::Telecomjs => &providers.telecomjs,
             ApiProvider::Edenai => &providers.edenai,
+            ApiProvider::Zenmux => &providers.zenmux,
+            ApiProvider::Csdn => &providers.csdn,
             ApiProvider::Concentrate => &providers.concentrate,
             ApiProvider::Codewhale => &providers.codewhale,
             ApiProvider::ModelstudioTokenPlan => &providers.modelstudio_token_plan,
@@ -5934,6 +5958,7 @@ impl Config {
             ApiProvider::OllamaCloud => &mut providers.ollama_cloud,
             ApiProvider::Volcengine => &mut providers.volcengine,
             ApiProvider::Huggingface => &mut providers.huggingface,
+            ApiProvider::Modelscope => &mut providers.modelscope,
             ApiProvider::Deepinfra => &mut providers.deepinfra,
             ApiProvider::Together => &mut providers.together,
             ApiProvider::Qianfan => &mut providers.qianfan,
@@ -5955,6 +5980,8 @@ impl Config {
             ApiProvider::Antigravity => &mut providers.antigravity,
             ApiProvider::Telecomjs => &mut providers.telecomjs,
             ApiProvider::Edenai => &mut providers.edenai,
+            ApiProvider::Zenmux => &mut providers.zenmux,
+            ApiProvider::Csdn => &mut providers.csdn,
             ApiProvider::Concentrate => &mut providers.concentrate,
             ApiProvider::Codewhale => &mut providers.codewhale,
             ApiProvider::ModelstudioTokenPlan => &mut providers.modelstudio_token_plan,
@@ -6234,7 +6261,7 @@ impl Config {
         // the previous proxy for it — "the wire id was rewritten" — also
         // excluded every id DeepSeek retires while still accepting, which is
         // exactly the V4 Pro case.
-        let base_url = self.deepseek_base_url();
+        let base_url = self.active_route_base_url();
         if base_url_is_custom_for_provider(provider, &base_url) {
             return None;
         }
@@ -6255,7 +6282,7 @@ impl Config {
                 self,
                 provider,
                 &self.provider_identity_for(provider),
-                &self.deepseek_base_url(),
+                &self.active_route_base_url(),
                 model,
             )
             .is_some()
@@ -6396,6 +6423,7 @@ impl Config {
             ApiProvider::OllamaCloud => DEFAULT_OLLAMA_CLOUD_MODEL,
             ApiProvider::Volcengine => DEFAULT_VOLCENGINE_MODEL,
             ApiProvider::Huggingface => DEFAULT_HUGGINGFACE_MODEL,
+            ApiProvider::Modelscope => DEFAULT_MODELSCOPE_MODEL,
             ApiProvider::Deepinfra => DEFAULT_DEEPINFRA_MODEL,
             ApiProvider::Together => DEFAULT_TOGETHER_MODEL,
             ApiProvider::Qianfan => DEFAULT_QIANFAN_MODEL,
@@ -6428,6 +6456,8 @@ impl Config {
             ApiProvider::Antigravity => DEFAULT_ANTIGRAVITY_MODEL,
             ApiProvider::Telecomjs => DEFAULT_TELECOMJS_MODEL,
             ApiProvider::Edenai => DEFAULT_EDENAI_MODEL,
+            ApiProvider::Zenmux => DEFAULT_ZENMUX_MODEL,
+            ApiProvider::Csdn => DEFAULT_CSDN_MODEL,
             ApiProvider::Concentrate => DEFAULT_CONCENTRATE_MODEL,
             ApiProvider::Codewhale => DEFAULT_CODEWHALE_MODEL,
             ApiProvider::ModelstudioTokenPlan
@@ -6445,7 +6475,7 @@ impl Config {
 
     /// Return the configured API base URL (normalized) for the selected route.
     #[must_use]
-    pub fn deepseek_base_url(&self) -> String {
+    pub fn active_route_base_url(&self) -> String {
         self.base_url_for_route(self.api_provider())
     }
 
@@ -6508,9 +6538,16 @@ impl Config {
                 self.route_owned_root_base_url(provider, identity)
             }
             // Xiaomi MiMo honours a root `base_url` when the per-provider table
-            // has none — otherwise a minimal top-level config silently falls
-            // back to the official host.
-            ApiProvider::XiaomiMimo => self.route_owned_root_base_url(provider, identity),
+            // has none — but only when that root is an endpoint the MiMo family
+            // owns. A legacy DeepSeek root must not become this route's
+            // endpoint: the custom-endpoint guard withholds the MiMo credential
+            // from a foreign host, so the route would answer with the other
+            // vendor's unauthenticated 401 while the user believed they were
+            // testing their own key. A proxy or any other host is still
+            // expressible on `[providers.xiaomi_mimo] base_url`.
+            ApiProvider::XiaomiMimo => self
+                .route_owned_root_base_url(provider, identity)
+                .filter(|base| xiaomi_mimo_root_belongs_to_provider(base)),
             ApiProvider::DeepseekAnthropic => None,
             ApiProvider::NvidiaNim => self
                 .route_owned_root_base_url(provider, identity)
@@ -6535,6 +6572,7 @@ impl Config {
             | ApiProvider::OllamaCloud
             | ApiProvider::Volcengine
             | ApiProvider::Huggingface
+            | ApiProvider::Modelscope
             | ApiProvider::Deepinfra
             | ApiProvider::Together
             | ApiProvider::Qianfan
@@ -6553,6 +6591,8 @@ impl Config {
             | ApiProvider::Antigravity
             | ApiProvider::Telecomjs
             | ApiProvider::Edenai
+            | ApiProvider::Zenmux
+            | ApiProvider::Csdn
             | ApiProvider::Concentrate
             | ApiProvider::Codewhale
             | ApiProvider::ModelstudioTokenPlan
@@ -6644,6 +6684,7 @@ impl Config {
                         ApiProvider::OllamaCloud => DEFAULT_OLLAMA_CLOUD_BASE_URL,
                         ApiProvider::Volcengine => DEFAULT_VOLCENGINE_BASE_URL,
                         ApiProvider::Huggingface => DEFAULT_HUGGINGFACE_BASE_URL,
+                        ApiProvider::Modelscope => DEFAULT_MODELSCOPE_BASE_URL,
                         ApiProvider::Deepinfra => DEFAULT_DEEPINFRA_BASE_URL,
                         ApiProvider::Together => DEFAULT_TOGETHER_BASE_URL,
                         ApiProvider::Qianfan => DEFAULT_QIANFAN_BASE_URL,
@@ -6665,6 +6706,8 @@ impl Config {
                         ApiProvider::Antigravity => DEFAULT_ANTIGRAVITY_BASE_URL,
                         ApiProvider::Telecomjs => DEFAULT_TELECOMJS_BASE_URL,
                         ApiProvider::Edenai => DEFAULT_EDENAI_BASE_URL,
+                        ApiProvider::Zenmux => DEFAULT_ZENMUX_BASE_URL,
+                        ApiProvider::Csdn => DEFAULT_CSDN_BASE_URL,
                         ApiProvider::Concentrate => DEFAULT_CONCENTRATE_BASE_URL,
                         ApiProvider::Codewhale => DEFAULT_CODEWHALE_BASE_URL,
                         ApiProvider::ModelstudioTokenPlan
@@ -6820,9 +6863,18 @@ impl Config {
         let provider_base = self
             .provider_config_string_with_runtime_fallback(provider, |entry| entry.base_url.clone());
         match provider {
-            ApiProvider::Deepseek | ApiProvider::DeepseekCN | ApiProvider::XiaomiMimo => {
+            ApiProvider::Deepseek | ApiProvider::DeepseekCN => {
                 provider_base.or_else(|| self.route_owned_root_base_url(provider, &identity))
             }
+            // Same rule as `base_url_for_route`: the legacy root is a DeepSeek
+            // field, so only a MiMo-owned endpoint may be inherited from it.
+            // Every layer that reads the root has to agree, or route
+            // canonicalization and credential scoping disagree about which
+            // endpoint this route owns.
+            ApiProvider::XiaomiMimo => provider_base.or_else(|| {
+                self.route_owned_root_base_url(provider, &identity)
+                    .filter(|base| xiaomi_mimo_root_belongs_to_provider(base))
+            }),
             ApiProvider::NvidiaNim => provider_base.or_else(|| {
                 self.route_owned_root_base_url(provider, &identity)
                     .filter(|base| base.contains("integrate.api.nvidia.com"))
@@ -6953,7 +7005,7 @@ impl Config {
             // official provider's saved credential.
             let explicitly_authenticated_loopback = provider == self.api_provider()
                 && auth_mode_requires_api_key(auth_mode.as_deref())
-                && base_url_uses_local_host(&self.deepseek_base_url());
+                && base_url_uses_local_host(&self.active_route_base_url());
             if !explicitly_authenticated_loopback {
                 return true;
             }
@@ -6972,7 +7024,38 @@ impl Config {
 
         provider_route_is_keyless_self_hosted(provider, &self.base_url_for_route(provider))
             || (provider == self.api_provider()
-                && base_url_uses_local_host(&self.deepseek_base_url()))
+                && base_url_uses_local_host(&self.active_route_base_url()))
+    }
+
+    pub(crate) fn account_model_api_key(&self, provider: ApiProvider) -> Option<String> {
+        // Exact endpoint binding, including path. A custom Codewhale route
+        // must never inherit the account's credential, even on the same host.
+        if provider != ApiProvider::Codewhale
+            || self.base_url_for_route(provider).trim_end_matches('/') != DEFAULT_CODEWHALE_BASE_URL
+            || auth_mode_disables_api_key(self.auth_mode_for_provider(provider).as_deref())
+            || self
+                .provider_config_for(provider)
+                .is_some_and(|entry| entry.auth.is_some() || entry.api_key_env.is_some())
+        {
+            return None;
+        }
+        let access = self.account_model_access.read().clone()?;
+        if access.expires_at <= chrono::Utc::now().timestamp() {
+            return None;
+        }
+        // Check the shared session again at use, so a late install cannot
+        // resurrect a session removed by another local process.
+        let secrets = codewhale_secrets::account::secure_account_session_secrets().ok()?;
+        let account = codewhale_secrets::account::AccountSessionStore::new(
+            secrets,
+            access.profile.as_deref(),
+            codewhale_secrets::account::DEFAULT_ACCOUNT_API_BASE,
+        )
+        .runtime_info_at(chrono::Utc::now())
+        .ok()?;
+        (account.state == codewhale_secrets::account::AccountSessionState::Authenticated
+            && account.session_id.as_deref() == Some(access.session_id.as_str()))
+        .then(|| access.credential.expose_secret().to_string())
     }
 
     /// Read the API key.
@@ -6984,8 +7067,8 @@ impl Config {
     /// The in-memory `self.api_key` override is only honored when the user
     /// explicitly set the field (not the legacy `API_KEYRING_SENTINEL`
     /// placeholder, not empty whitespace).
-    pub fn deepseek_api_key(&self) -> Result<String> {
-        self.deepseek_api_key_with_secret_store_mode(false)
+    pub fn active_route_api_key(&self) -> Result<String> {
+        self.active_route_api_key_with_secret_store_mode(false)
     }
 
     /// Resolve an API key for a diagnostic without migrating a legacy secret
@@ -6994,10 +7077,10 @@ impl Config {
     /// This retains ordinary credential precedence, including a legacy
     /// file-backed secret as a fallback, but it must only be used by static
     /// diagnostic/reporting paths. Normal runtime and authentication paths use
-    /// [`Self::deepseek_api_key`] and preserve their existing migration
+    /// [`Self::active_route_api_key`] and preserve their existing migration
     /// behavior.
-    pub(crate) fn deepseek_api_key_read_only(&self) -> Result<String> {
-        self.deepseek_api_key_with_secret_store_mode(true)
+    pub(crate) fn active_route_api_key_read_only(&self) -> Result<String> {
+        self.active_route_api_key_with_secret_store_mode(true)
     }
 
     /// Clone this route with a diagnostic-only credential in its in-memory
@@ -7010,13 +7093,13 @@ impl Config {
     /// persisted.
     pub(crate) fn with_read_only_api_key_for_diagnostic(&self) -> Result<Self> {
         let provider = self.api_provider();
-        let api_key = self.deepseek_api_key_read_only()?;
+        let api_key = self.active_route_api_key_read_only()?;
         let mut diagnostic = self.clone();
         diagnostic.set_provider_api_key_override(provider, Some(api_key));
         Ok(diagnostic)
     }
 
-    fn deepseek_api_key_with_secret_store_mode(&self, read_only: bool) -> Result<String> {
+    fn active_route_api_key_with_secret_store_mode(&self, read_only: bool) -> Result<String> {
         let provider = self.api_provider();
         if provider == ApiProvider::Antigravity {
             anyhow::bail!(codewhale_config::LEGACY_ANTIGRAVITY_TOMBSTONE_MESSAGE);
@@ -7065,7 +7148,7 @@ impl Config {
                 .is_some_and(provider_config_uses_kimi_imported_token)
         {
             let credential_help =
-                credential_help_for_provider_route(provider, &self.deepseek_base_url());
+                credential_help_for_provider_route(provider, &self.active_route_base_url());
             anyhow::bail!(
                 "Kimi CLI credential import is unsupported. Codewhale does not impersonate or reuse Kimi OAuth clients; configure an API key from {} instead.",
                 credential_help
@@ -7189,7 +7272,7 @@ impl Config {
                 .provider_config_for(provider)
                 .and_then(|provider| provider.mode.as_deref());
             if let Some(value) =
-                xiaomi_mimo_env_api_key_for_runtime(mode, Some(&self.deepseek_base_url()))
+                xiaomi_mimo_env_api_key_for_runtime(mode, Some(&self.active_route_base_url()))
                 && !value.trim().is_empty()
             {
                 return Ok(value);
@@ -7219,6 +7302,12 @@ impl Config {
             }
         }
 
+        // Account auth is a reversible fallback, never an overwrite of an
+        // environment, config-file, or durable provider credential.
+        if let Some(key) = self.account_model_api_key(provider) {
+            return Ok(key);
+        }
+
         // The Codewhale API always authenticates. It is not a self-hosted
         // runtime, and a loopback `CODEWHALE_API_BASE` is a test origin for
         // the same authenticated contract — never a keyless one. Without this
@@ -7226,8 +7315,8 @@ impl Config {
         // out with no `Authorization` header at all.
         if provider != ApiProvider::Codewhale
             && !auth_mode_requires_api_key(auth_mode.as_deref())
-            && (provider_route_is_keyless_self_hosted(provider, &self.deepseek_base_url())
-                || base_url_uses_local_host(&self.deepseek_base_url()))
+            && (provider_route_is_keyless_self_hosted(provider, &self.active_route_base_url())
+                || base_url_uses_local_host(&self.active_route_base_url()))
         {
             return Ok(String::new());
         }
@@ -7239,7 +7328,7 @@ impl Config {
                 .unwrap_or_else(|| provider.as_str());
             anyhow::bail!(
                 "Custom endpoint credentials for {route_name} must be bound explicitly. Ambient provider credentials are not sent to {}. Add api_key or api_key_env to this provider route, or pass --api-key with --base-url.",
-                self.deepseek_base_url()
+                self.active_route_base_url()
             );
         }
 
@@ -7288,8 +7377,8 @@ impl Config {
             ),
             ApiProvider::Moonshot => {
                 let credential_help =
-                    credential_help_for_provider_route(provider, &self.deepseek_base_url());
-                if moonshot_base_url_is_exact_kimi_code(&self.deepseek_base_url()) {
+                    credential_help_for_provider_route(provider, &self.active_route_base_url());
+                if moonshot_base_url_is_exact_kimi_code(&self.active_route_base_url()) {
                     anyhow::bail!(
                         "Kimi Code membership-plan API key not found. Get a plan key: {}. This route uses api.kimi.com/coding/v1 and does not import Kimi CLI credentials. Run 'codewhale auth set --provider moonshot', set {}, or add [{}] api_key.",
                         credential_help
@@ -7346,12 +7435,16 @@ impl Config {
             // Return an empty key and let the client omit the Authorization header.
             ApiProvider::Sglang | ApiProvider::Vllm => Ok(String::new()),
             ApiProvider::Ollama
-                if provider_route_is_keyless_self_hosted(provider, &self.deepseek_base_url()) =>
+                if provider_route_is_keyless_self_hosted(
+                    provider,
+                    &self.active_route_base_url(),
+                ) =>
             {
                 Ok(String::new())
             }
             ApiProvider::Ollama => {
-                let help = credential_help_for_provider_route(provider, &self.deepseek_base_url());
+                let help =
+                    credential_help_for_provider_route(provider, &self.active_route_base_url());
                 anyhow::bail!(
                     "Ollama Cloud API key not found. Get a key: {}. Run 'codewhale auth set --provider ollama', set OLLAMA_API_KEY, or add [providers.ollama] api_key in ~/.codewhale/config.toml.",
                     help.credential_url
@@ -7535,6 +7628,16 @@ impl Config {
                 clamped
             }
         }
+    }
+
+    /// Whether a goal's `token_budget` is a hard stop (#6013). Default `false`
+    /// keeps the advisory/telemetry behavior.
+    #[must_use]
+    pub fn goal_enforce_token_budget(&self) -> bool {
+        self.goal
+            .as_ref()
+            .and_then(|goal| goal.enforce_token_budget)
+            .unwrap_or(false)
     }
 
     /// Quiet period between successful interactive goal turns (#5508).
@@ -7831,28 +7934,6 @@ impl Config {
             .or_else(|| self.subagents.as_ref().and_then(|cfg| cfg.max_admitted))
             .unwrap_or(MAX_SUBAGENT_ADMISSION)
             .clamp(max_concurrent, MAX_SUBAGENT_ADMISSION)
-    }
-
-    /// Optional aggregate token budget for each root `agent` run.
-    ///
-    /// Reads `[subagents] token_budget`. `None` and `0` both mean unlimited,
-    /// preserving legacy behavior until a budget is explicitly configured.
-    #[must_use]
-    pub fn subagent_token_budget(&self) -> Option<u64> {
-        self.subagents
-            .as_ref()
-            .and_then(|cfg| cfg.token_budget)
-            .filter(|budget| *budget > 0)
-    }
-
-    /// Return the provider-specific aggregate token budget for each root
-    /// `agent` run.
-    #[must_use]
-    pub fn subagent_token_budget_for_provider(&self, provider: ApiProvider) -> Option<u64> {
-        self.subagent_provider_config(provider)
-            .and_then(|cfg| cfg.token_budget)
-            .or_else(|| self.subagents.as_ref().and_then(|cfg| cfg.token_budget))
-            .filter(|budget| *budget > 0)
     }
 
     /// Default per-child model-turn budget from `[subagents]
@@ -8168,6 +8249,25 @@ impl Config {
     #[must_use]
     pub fn approval_default_selection(&self) -> ApprovalDefaultSelection {
         self.approval.unwrap_or_default().default_selection
+    }
+
+    /// Effective expiry for the interactive approval card (#6101).
+    /// `None` (absent or an explicit `0`) waits indefinitely; a positive
+    /// value bounds the wait and expiry resolves to deny (fail-closed).
+    /// Values above 24h clamp with a warning.
+    #[must_use]
+    pub fn approval_timeout(&self) -> Option<std::time::Duration> {
+        const MAX_SECONDS: u64 = 86_400;
+        let seconds = self.approval.unwrap_or_default().timeout_seconds?;
+        if seconds == 0 {
+            return None;
+        }
+        if seconds > MAX_SECONDS {
+            tracing::warn!(
+                "[approval] timeout_seconds={seconds} exceeds 24h; clamping to {MAX_SECONDS}"
+            );
+        }
+        Some(std::time::Duration::from_secs(seconds.min(MAX_SECONDS)))
     }
 
     /// Resolve workspace side-git snapshot settings with defaults applied.
@@ -8558,6 +8658,7 @@ fn provider_env_base_url_override(provider: ApiProvider) -> Option<String> {
         ApiProvider::Ollama => &["OLLAMA_BASE_URL"],
         ApiProvider::OllamaCloud => &["OLLAMA_CLOUD_BASE_URL"],
         ApiProvider::Huggingface => &["HUGGINGFACE_BASE_URL", "HF_BASE_URL"],
+        ApiProvider::Modelscope => &["MODELSCOPE_BASE_URL"],
         ApiProvider::Meta => &["META_MODEL_API_BASE_URL", "MODEL_API_BASE_URL"],
         ApiProvider::Xai => &["XAI_BASE_URL"],
         ApiProvider::Mistral => &["MISTRAL_BASE_URL"],
@@ -8565,6 +8666,8 @@ fn provider_env_base_url_override(provider: ApiProvider) -> Option<String> {
         ApiProvider::Antigravity => &[],
         ApiProvider::Telecomjs => &["TELECOMJS_BASE_URL"],
         ApiProvider::Edenai => &["EDENAI_BASE_URL"],
+        ApiProvider::Zenmux => &["ZENMUX_BASE_URL"],
+        ApiProvider::Csdn => &["CSDN_BASE_URL"],
         ApiProvider::Concentrate => &["CONCENTRATE_BASE_URL"],
         ApiProvider::Codewhale => &["CODEWHALE_API_BASE"],
         ApiProvider::ModelstudioTokenPlan | ApiProvider::ModelstudioTokenPlanAnthropic => {
@@ -8824,6 +8927,13 @@ fn apply_env_overrides_unlocked(config: &mut Config, policy: ConfigEnvironmentPo
                     .huggingface
                     .base_url = Some(value);
             }
+            ApiProvider::Modelscope => {
+                config
+                    .providers
+                    .get_or_insert_with(ProvidersConfig::default)
+                    .modelscope
+                    .base_url = Some(value);
+            }
             ApiProvider::Deepinfra => {
                 config
                     .providers
@@ -8949,6 +9059,20 @@ fn apply_env_overrides_unlocked(config: &mut Config, policy: ConfigEnvironmentPo
                     .providers
                     .get_or_insert_with(ProvidersConfig::default)
                     .edenai
+                    .base_url = Some(value);
+            }
+            ApiProvider::Zenmux => {
+                config
+                    .providers
+                    .get_or_insert_with(ProvidersConfig::default)
+                    .zenmux
+                    .base_url = Some(value);
+            }
+            ApiProvider::Csdn => {
+                config
+                    .providers
+                    .get_or_insert_with(ProvidersConfig::default)
+                    .csdn
                     .base_url = Some(value);
             }
             ApiProvider::Concentrate => {
@@ -9140,6 +9264,16 @@ fn apply_env_overrides_unlocked(config: &mut Config, policy: ConfigEnvironmentPo
             .huggingface
             .base_url = Some(value);
     }
+    if matches!(config.api_provider(), ApiProvider::Modelscope)
+        && let Ok(value) = std::env::var("MODELSCOPE_BASE_URL")
+        && !value.trim().is_empty()
+    {
+        config
+            .providers
+            .get_or_insert_with(ProvidersConfig::default)
+            .modelscope
+            .base_url = Some(value);
+    }
     if matches!(config.api_provider(), ApiProvider::Moonshot)
         && let Ok(value) =
             std::env::var("MOONSHOT_BASE_URL").or_else(|_| std::env::var("KIMI_BASE_URL"))
@@ -9220,6 +9354,26 @@ fn apply_env_overrides_unlocked(config: &mut Config, policy: ConfigEnvironmentPo
             .providers
             .get_or_insert_with(ProvidersConfig::default)
             .edenai
+            .base_url = Some(value);
+    }
+    if matches!(config.api_provider(), ApiProvider::Zenmux)
+        && let Ok(value) = std::env::var("ZENMUX_BASE_URL")
+        && !value.trim().is_empty()
+    {
+        config
+            .providers
+            .get_or_insert_with(ProvidersConfig::default)
+            .zenmux
+            .base_url = Some(value);
+    }
+    if matches!(config.api_provider(), ApiProvider::Csdn)
+        && let Ok(value) = std::env::var("CSDN_BASE_URL")
+        && !value.trim().is_empty()
+    {
+        config
+            .providers
+            .get_or_insert_with(ProvidersConfig::default)
+            .csdn
             .base_url = Some(value);
     }
     // Concentrate has no inline block here on purpose: CONCENTRATE_BASE_URL
@@ -9316,6 +9470,7 @@ fn apply_env_overrides_unlocked(config: &mut Config, policy: ConfigEnvironmentPo
                 ApiProvider::OllamaCloud => &mut providers.ollama_cloud,
                 ApiProvider::Volcengine => &mut providers.volcengine,
                 ApiProvider::Huggingface => &mut providers.huggingface,
+                ApiProvider::Modelscope => &mut providers.modelscope,
                 ApiProvider::Deepinfra => &mut providers.deepinfra,
                 ApiProvider::Together => &mut providers.together,
                 ApiProvider::Qianfan => &mut providers.qianfan,
@@ -9337,6 +9492,8 @@ fn apply_env_overrides_unlocked(config: &mut Config, policy: ConfigEnvironmentPo
                 ApiProvider::Antigravity => &mut providers.antigravity,
                 ApiProvider::Telecomjs => &mut providers.telecomjs,
                 ApiProvider::Edenai => &mut providers.edenai,
+                ApiProvider::Zenmux => &mut providers.zenmux,
+                ApiProvider::Csdn => &mut providers.csdn,
                 ApiProvider::Concentrate => &mut providers.concentrate,
                 ApiProvider::Codewhale => &mut providers.codewhale,
                 ApiProvider::ModelstudioTokenPlan => &mut providers.modelstudio_token_plan,
@@ -9539,6 +9696,17 @@ fn apply_env_overrides_unlocked(config: &mut Config, policy: ConfigEnvironmentPo
             .model = Some(value);
         config.environment_model_applied = true;
     }
+    if matches!(config.api_provider(), ApiProvider::Modelscope)
+        && let Ok(value) = std::env::var("MODELSCOPE_MODEL")
+        && !value.trim().is_empty()
+    {
+        config
+            .providers
+            .get_or_insert_with(ProvidersConfig::default)
+            .modelscope
+            .model = Some(value);
+        config.environment_model_applied = true;
+    }
     if matches!(config.api_provider(), ApiProvider::Meta)
         && let Ok(value) =
             std::env::var("META_MODEL_API_MODEL").or_else(|_| std::env::var("MODEL_API_MODEL"))
@@ -9614,6 +9782,28 @@ fn apply_env_overrides_unlocked(config: &mut Config, policy: ConfigEnvironmentPo
             .providers
             .get_or_insert_with(ProvidersConfig::default)
             .edenai
+            .model = Some(value);
+        config.environment_model_applied = true;
+    }
+    if matches!(config.api_provider(), ApiProvider::Zenmux)
+        && let Ok(value) = std::env::var("ZENMUX_MODEL")
+        && !value.trim().is_empty()
+    {
+        config
+            .providers
+            .get_or_insert_with(ProvidersConfig::default)
+            .zenmux
+            .model = Some(value);
+        config.environment_model_applied = true;
+    }
+    if matches!(config.api_provider(), ApiProvider::Csdn)
+        && let Ok(value) = std::env::var("CSDN_MODEL")
+        && !value.trim().is_empty()
+    {
+        config
+            .providers
+            .get_or_insert_with(ProvidersConfig::default)
+            .csdn
             .model = Some(value);
         config.environment_model_applied = true;
     }
@@ -9847,7 +10037,7 @@ fn normalize_model_config(config: &mut Config) {
         config.default_text_model.clone_from(&config.legacy_model);
     }
     let provider = config.api_provider();
-    let base_url = config.deepseek_base_url();
+    let base_url = config.active_route_base_url();
     let mut declared = Vec::new();
     for provider in ApiProvider::all()
         .iter()
@@ -10046,10 +10236,13 @@ pub(crate) fn provider_passes_model_through(provider: ApiProvider) -> bool {
             | ApiProvider::Ollama
             | ApiProvider::OllamaCloud
             | ApiProvider::Huggingface
+            | ApiProvider::Modelscope
             | ApiProvider::Meta
             | ApiProvider::Xai
             | ApiProvider::Telecomjs
             | ApiProvider::Edenai
+            | ApiProvider::Zenmux
+            | ApiProvider::Csdn
             // Concentrate ids are gateway-owned (plain, `provider/model`, or the
             // gateway's own `auto`); the resolver strips only `concentrate/`.
             | ApiProvider::Concentrate
@@ -10125,6 +10318,19 @@ fn xiaomi_mimo_base_url_uses_token_plan(base_url: &str) -> bool {
     normalized == XIAOMI_MIMO_TOKEN_PLAN_CN_BASE_URL
         || normalized == XIAOMI_MIMO_TOKEN_PLAN_SGP_BASE_URL
         || normalized == XIAOMI_MIMO_TOKEN_PLAN_AMS_BASE_URL
+}
+
+/// Whether a legacy *root* `base_url` may be inherited by the MiMo route.
+///
+/// One owner for the family definition: `provider_base_url_is_official` in
+/// `codewhale-config` is the same predicate route canonicalization and
+/// credential scoping use, so the endpoint this route advertises and the
+/// endpoint its credential is scoped to cannot disagree.
+fn xiaomi_mimo_root_belongs_to_provider(base_url: &str) -> bool {
+    codewhale_config::provider_base_url_is_official(
+        codewhale_config::ProviderKind::XiaomiMimo,
+        base_url,
+    )
 }
 
 fn xiaomi_mimo_env_var(candidates: &[&str]) -> Option<String> {
@@ -10960,7 +11166,7 @@ fn apply_profile(config: ConfigFile, profile: Option<&str>) -> Result<Config> {
         let profiles = config.profiles.as_ref();
         match profiles.and_then(|profiles| profiles.get(profile_name)) {
             Some(override_cfg) => {
-                let mut merged = merge_config(config.base, override_cfg.clone());
+                let mut merged = merge_config(*config.base, override_cfg.clone());
                 apply_layer_root_model(&mut merged, override_cfg);
                 Ok(merged)
             }
@@ -10980,7 +11186,7 @@ fn apply_profile(config: ConfigFile, profile: Option<&str>) -> Result<Config> {
             }
         }
     } else {
-        Ok(config.base)
+        Ok(*config.base)
     }
 }
 
@@ -11163,6 +11369,7 @@ fn merge_config(base: Config, override_cfg: Config) -> Config {
                 recorded => recorded,
             }
         },
+        account_model_access: base.account_model_access,
         runtime_chat_isolated: override_cfg.runtime_chat_isolated || base.runtime_chat_isolated,
         runtime_thread_inference_unrelated: override_cfg.runtime_thread_inference_unrelated
             || base.runtime_thread_inference_unrelated,
@@ -11310,6 +11517,7 @@ fn merge_providers(
             ollama_cloud: merge_provider_config(base.ollama_cloud, override_cfg.ollama_cloud),
             volcengine: merge_provider_config(base.volcengine, override_cfg.volcengine),
             huggingface: merge_provider_config(base.huggingface, override_cfg.huggingface),
+            modelscope: merge_provider_config(base.modelscope, override_cfg.modelscope),
             deepinfra: merge_provider_config(base.deepinfra, override_cfg.deepinfra),
             together: merge_provider_config(base.together, override_cfg.together),
             qianfan: merge_provider_config(base.qianfan, override_cfg.qianfan),
@@ -11332,6 +11540,8 @@ fn merge_providers(
             antigravity: merge_provider_config(base.antigravity, override_cfg.antigravity),
             telecomjs: merge_provider_config(base.telecomjs, override_cfg.telecomjs),
             edenai: merge_provider_config(base.edenai, override_cfg.edenai),
+            zenmux: merge_provider_config(base.zenmux, override_cfg.zenmux),
+            csdn: merge_provider_config(base.csdn, override_cfg.csdn),
             concentrate: merge_provider_config(base.concentrate, override_cfg.concentrate),
             codewhale: merge_provider_config(base.codewhale, override_cfg.codewhale),
             modelstudio_token_plan: merge_provider_config(
@@ -11364,7 +11574,7 @@ fn load_single_config_file(path: &Path) -> Result<Config> {
             codewhale_config::quote_os_path(path)
         )
     })?;
-    Ok(parsed.base)
+    Ok(*parsed.base)
 }
 
 /// Build a one-line warning when top-level-only keys are nested under a section
@@ -11810,12 +12020,12 @@ fn plaintext_credential_fallback_refused(
 /// isolated `CODEWHALE_HOME` and an explicit backend, so unit tests can never
 /// touch the developer's real credential store.
 #[cfg(not(test))]
-fn credential_secret_store() -> Option<codewhale_secrets::Secrets> {
+pub(crate) fn credential_secret_store() -> Option<codewhale_secrets::Secrets> {
     Some(codewhale_secrets::Secrets::auto_detect())
 }
 
 #[cfg(test)]
-fn credential_secret_store() -> Option<codewhale_secrets::Secrets> {
+pub(crate) fn credential_secret_store() -> Option<codewhale_secrets::Secrets> {
     let isolated_home = codewhale_paths::codewhale_home_is_explicit();
     let explicit_backend = std::env::var_os("CODEWHALE_SECRET_BACKEND")
         .or_else(|| std::env::var_os("DEEPSEEK_SECRET_BACKEND"))
@@ -12008,6 +12218,12 @@ pub fn active_provider_has_config_api_key(config: &Config) -> bool {
         && std::env::var("HUGGINGFACE_API_KEY")
             .or_else(|_| std::env::var("HF_TOKEN"))
             .is_ok_and(|k| !k.trim().is_empty())
+    {
+        return true;
+    }
+    if !custom_endpoint
+        && matches!(provider, ApiProvider::Modelscope)
+        && std::env::var("MODELSCOPE_API_KEY").is_ok_and(|k| !k.trim().is_empty())
     {
         return true;
     }
@@ -12797,6 +13013,11 @@ fn provider_env_api_key(provider: ApiProvider) -> Option<String> {
                     .filter(|value| !value.trim().is_empty())
             });
     }
+    if provider == ApiProvider::Modelscope {
+        return std::env::var("MODELSCOPE_API_KEY")
+            .ok()
+            .filter(|value| !value.trim().is_empty());
+    }
 
     provider.env_vars().iter().find_map(|var| {
         std::env::var(var)
@@ -13055,7 +13276,7 @@ fn missing_provider_api_key_message(provider: ApiProvider) -> Result<String> {
 ///
 /// Environment variables (`DEEPSEEK_API_KEY`, etc.) are intentionally
 /// **not** unset — they are managed by the user's shell and outside the
-/// CLI's purview. `Config::deepseek_api_key`'s explicit-override path
+/// CLI's purview. `Config::active_route_api_key`'s explicit-override path
 /// (Path 0) ensures a freshly-entered key still wins over a stale env
 /// var that lingers from a previous session.
 pub fn clear_api_key() -> Result<()> {

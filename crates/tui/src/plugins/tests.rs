@@ -3,6 +3,10 @@ use std::path::{Path, PathBuf};
 
 use super::activation::PluginActivationCapability;
 use super::discovery::{DiscoveryConfig, discover_with_config};
+use super::managed_policy::{
+    MANAGED_POLICY_FILE_NAME, MANAGED_POLICY_PATH_ENV, MANAGED_POLICY_SCHEMA_VERSION,
+    ManagedPluginPolicy,
+};
 use super::manifest::{PluginCompatibility, capability_hash_v1, capability_hash_v2};
 use super::types::{PluginDiagnosticLevel, PluginTrustStatus};
 
@@ -1523,4 +1527,269 @@ fn export_skills_normalization_collision_is_an_error() {
         !target.exists(),
         "a failed export removes the directory it created"
     );
+}
+
+fn policy_path(config: &DiscoveryConfig) -> PathBuf {
+    config
+        .state_path
+        .parent()
+        .expect("state path has a parent")
+        .join(MANAGED_POLICY_FILE_NAME)
+}
+
+fn write_policy(path: &Path, policy: &ManagedPluginPolicy) {
+    fs::create_dir_all(path.parent().expect("policy path has a parent")).unwrap();
+    fs::write(path, serde_json::to_string_pretty(policy).unwrap()).unwrap();
+}
+
+fn restrictive_policy() -> ManagedPluginPolicy {
+    ManagedPluginPolicy {
+        schema_version: MANAGED_POLICY_SCHEMA_VERSION,
+        allowed_plugins: Default::default(),
+        allow_unlisted: false,
+    }
+}
+
+#[test]
+fn absent_managed_policy_preserves_today_enablement() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = config(tmp.path());
+    write_plugin(&config, "");
+
+    let mut registry = discover_with_config(&config);
+    assert!(registry.managed_policy_error().is_none());
+    assert_eq!(
+        registry.managed_policy_path(),
+        Some(policy_path(&config).as_path())
+    );
+    assert!(
+        !registry
+            .diagnostics()
+            .iter()
+            .any(|diagnostic| diagnostic.code == "policy-invalid"),
+        "no policy file means no policy diagnostic"
+    );
+
+    registry.trust("demo").unwrap();
+    registry.enable("demo").unwrap();
+    assert!(registry.is_active("demo"));
+
+    let reloaded = discover_with_config(&config);
+    assert!(
+        reloaded.is_active("demo"),
+        "absent policy must keep today's restart behaviour"
+    );
+}
+
+#[test]
+fn managed_policy_refuses_unlisted_enable_with_named_reason() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = config(tmp.path());
+    write_plugin(&config, "");
+    write_named_plugin(&config, "extra", "");
+
+    // Review first: trust hardens the state directory, and the policy file
+    // lands next to it afterwards, the way an organization delivery would.
+    let mut registry = discover_with_config(&config);
+    registry.trust("demo").unwrap();
+    registry.trust("extra").unwrap();
+    let extra_id = registry.get("extra").expect("extra plugin").id.clone();
+
+    write_policy(
+        &policy_path(&config),
+        &ManagedPluginPolicy {
+            schema_version: MANAGED_POLICY_SCHEMA_VERSION,
+            allowed_plugins: [extra_id].into_iter().collect(),
+            allow_unlisted: false,
+        },
+    );
+
+    let mut registry = discover_with_config(&config);
+
+    let error = registry.enable("demo").unwrap_err();
+    assert!(
+        error.contains("managed plugin policy"),
+        "refusal must name the policy: {error}"
+    );
+    assert!(
+        error.contains("not on the plugin allowlist"),
+        "refusal must say why: {error}"
+    );
+    assert!(!registry.is_enabled("demo"));
+    assert!(!registry.is_active("demo"));
+
+    registry.enable("extra").unwrap();
+    assert!(registry.is_active("extra"));
+
+    // Flipping the document to allow unlisted plugins applies to the live
+    // registry: `enable` re-reads the policy instead of trusting its snapshot.
+    write_policy(
+        &policy_path(&config),
+        &ManagedPluginPolicy {
+            schema_version: MANAGED_POLICY_SCHEMA_VERSION,
+            allowed_plugins: Default::default(),
+            allow_unlisted: true,
+        },
+    );
+    registry.enable("demo").unwrap();
+    assert!(registry.is_active("demo"));
+}
+
+#[test]
+fn plugin_enabled_before_policy_arrived_does_not_survive_rediscovery() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = config(tmp.path());
+    write_plugin(&config, "");
+
+    let mut registry = discover_with_config(&config);
+    registry.trust("demo").unwrap();
+    registry.enable("demo").unwrap();
+    assert!(registry.is_active("demo"));
+
+    write_policy(&policy_path(&config), &restrictive_policy());
+
+    let reloaded = discover_with_config(&config);
+    assert!(
+        !reloaded.is_enabled("demo"),
+        "a forbidden plugin must not come back enabled"
+    );
+    assert!(!reloaded.is_active("demo"));
+}
+
+#[test]
+fn hand_edited_enabled_state_does_not_defeat_policy() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = config(tmp.path());
+    write_plugin(&config, "");
+
+    let mut registry = discover_with_config(&config);
+    registry.trust("demo").unwrap();
+    let id = registry
+        .get("demo")
+        .expect("demo plugin")
+        .id
+        .as_str()
+        .to_string();
+
+    // Forge the exact attack: flip the persisted bit by hand.
+    let raw = fs::read_to_string(&config.state_path).unwrap();
+    let mut state: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    state["plugins"][id.as_str()]["enabled"] = serde_json::Value::Bool(true);
+    fs::write(
+        &config.state_path,
+        serde_json::to_string_pretty(&state).unwrap(),
+    )
+    .unwrap();
+
+    // Control: without a policy the forged bit comes back enabled and active.
+    let unpoliced = discover_with_config(&config);
+    assert!(unpoliced.is_enabled("demo"));
+    assert!(unpoliced.is_active("demo"));
+
+    write_policy(&policy_path(&config), &restrictive_policy());
+
+    let policed = discover_with_config(&config);
+    assert!(
+        !policed.is_enabled("demo"),
+        "hand-edited enabled:true must not survive a forbidding policy"
+    );
+    assert!(!policed.is_active("demo"));
+}
+
+#[test]
+fn malformed_managed_policy_fails_closed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = config(tmp.path());
+    write_plugin(&config, "");
+
+    let mut registry = discover_with_config(&config);
+    registry.trust("demo").unwrap();
+    registry.enable("demo").unwrap();
+    assert!(registry.is_active("demo"));
+
+    let path = policy_path(&config);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+
+    fs::write(&path, "{ malformed").unwrap();
+    let mut registry = discover_with_config(&config);
+    assert!(
+        registry
+            .managed_policy_error()
+            .is_some_and(|error| error.contains("failed to parse")),
+        "garbage policy must report a clear load error"
+    );
+    assert!(
+        registry
+            .diagnostics()
+            .iter()
+            .any(|diagnostic| diagnostic.code == "policy-invalid"),
+        "garbage policy must leave a registry diagnostic"
+    );
+    assert!(
+        !registry.is_enabled("demo"),
+        "a malformed policy must not leave the plugin enabled"
+    );
+    assert!(!registry.is_active("demo"));
+    let error = registry.enable("demo").unwrap_err();
+    assert!(
+        error.contains("Managed plugin policy"),
+        "fail-closed refusal must name the policy: {error}"
+    );
+
+    fs::write(
+        &path,
+        r#"{"schema_version":999,"allowed_plugins":[],"allow_unlisted":false}"#,
+    )
+    .unwrap();
+    let registry = discover_with_config(&config);
+    assert!(
+        registry
+            .managed_policy_error()
+            .is_some_and(|error| error.contains("unsupported managed plugin policy schema")),
+        "wrong-schema policy must fail closed with a clear error"
+    );
+    assert!(!registry.is_enabled("demo"));
+
+    fs::write(
+        &path,
+        r#"{"schema_version":1,"allowed_plugins":[],"allow_unlisted":false,"surprise":true}"#,
+    )
+    .unwrap();
+    let registry = discover_with_config(&config);
+    assert!(
+        registry.managed_policy_error().is_some(),
+        "unknown policy fields must fail closed like unknown state fields"
+    );
+    assert!(!registry.is_enabled("demo"));
+}
+
+#[test]
+fn managed_policy_path_env_override_is_honored() {
+    let _lock = crate::test_support::lock_test_env();
+    let tmp = tempfile::tempdir().unwrap();
+    let config = config(tmp.path());
+    write_plugin(&config, "");
+
+    let custom = tmp.path().join("custom-policy.json");
+    write_policy(&custom, &restrictive_policy());
+    assert!(
+        !policy_path(&config).exists(),
+        "the default sibling must stay absent so the override is proven"
+    );
+
+    let _guard = crate::test_support::EnvVarGuard::set(MANAGED_POLICY_PATH_ENV, &custom);
+    let mut registry = discover_with_config(&config);
+    assert_eq!(
+        registry.managed_policy_path(),
+        Some(custom.as_path()),
+        "the env override must win over the default sibling path"
+    );
+
+    registry.trust("demo").unwrap();
+    let error = registry.enable("demo").unwrap_err();
+    assert!(
+        error.contains("managed plugin policy"),
+        "override policy must refuse with the named reason: {error}"
+    );
+    assert!(!registry.is_enabled("demo"));
 }

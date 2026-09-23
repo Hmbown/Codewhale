@@ -13,6 +13,7 @@ members = [
     "crates/lane",
     "crates/localization",
     "crates/mcp",
+    "crates/memory",
     "crates/models",
     "crates/palette",
     "crates/paths",
@@ -30,7 +31,7 @@ default-members = ["crates/cli"]
 resolver = "2"
 
 [workspace.package]
-version = "0.9.13"
+version = "0.10.0"
 edition = "2024"
 # Rust 1.88 stabilized `let_chains` in `if`/`while` conditions, which the
 # codebase relies on extensively. Cargo enforces this so users on older
@@ -58,7 +59,7 @@ dirs = "7.0.0"
 encoding_rs = "0.8.35"
 # Sole user is crates/workflow-js (schemaui is gone); keep the graph on one
 # jsonschema/jsonschema-regex/referencing/fancy-regex stack.
-jsonschema = { version = "0.52", default-features = false }
+jsonschema = { version = "0.56", default-features = false }
 libc = "0.2"
 reqwest = { version = "0.13.1", default-features = false, features = ["json", "rustls-no-provider", "socks"] }
 # NOT "parallel": the Workflow VM stays single-threaded and bridges to the

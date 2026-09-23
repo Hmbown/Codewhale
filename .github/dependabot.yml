@@ -5,6 +5,13 @@ updates:
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
+    groups:
+      # `windows` re-exports windows-core's types; bumping one alone makes
+      # BOOL/HRESULT two distinct types and the Windows leg stops compiling.
+      windows:
+        patterns:
+          - "windows"
+          - "windows-*"
   - package-ecosystem: github-actions
     directory: /
     schedule:

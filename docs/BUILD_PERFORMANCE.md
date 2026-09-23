@@ -325,13 +325,13 @@ TUI-DOG-017) — left as they are.
      `tools::schema_sanitize`, `tools::large_output_router` and
      `tools::truncate`, while `tools/{spec,review,registry,rlm,verify,
      speech,fim,web_search,web/backend,subagent/advisor}.rs` use
-     `client::{DeepSeekClient, ProviderNativeSearchClient,
+     `client::{CodewhaleClient, ProviderNativeSearchClient,
      ProviderNativeSearchRequest, SpeechSynthesisRequest,
      RemoteControlInferencePermit}`.
    - `crate::core` ⇄ `client` is the same shape: `client` uses
      `core::events::bounded_tool_projection_warning_names`, while
      `core/{engine,engine/preview,engine/dispatch,engine/turn_loop,
-     engine/reviewer,protocol_parity}.rs` use `client::{DeepSeekClient,
+     engine/reviewer,protocol_parity}.rs` use `client::{CodewhaleClient,
      PreparedOutboundRequest, canonical_json, parse_usage,
      is_reasoning_replay_placeholder, redact_url_for_display}`.
    Item 1 is therefore the whole precondition: move `ApiProvider`, the

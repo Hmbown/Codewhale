@@ -898,6 +898,11 @@ impl FleetExecutor {
         }
     }
 
+    /// Maximum bytes drained from a worker log per call, and the cap for the
+    /// buffered partial line. Event lines are small; the remainder stays for
+    /// the next drain.
+    const MAX_DRAIN_BYTES: u64 = 1024 * 1024;
+
     /// Read any newly-written stream-json lines for a worker and map them to
     /// fleet ledger events. Safe to call repeatedly; only new bytes are parsed,
     /// and a trailing partial line is buffered until its newline arrives.
@@ -914,7 +919,7 @@ impl FleetExecutor {
             return events;
         }
         let mut buf = Vec::new();
-        if let Ok(read) = file.read_to_end(&mut buf) {
+        if let Ok(read) = file.take(Self::MAX_DRAIN_BYTES).read_to_end(&mut buf) {
             stream.offset += read as u64;
             stream.pending.extend_from_slice(&buf);
             while let Some(idx) = stream.pending.iter().position(|byte| *byte == b'\n') {
@@ -922,6 +927,16 @@ impl FleetExecutor {
                 if let Some(event) = stream.observe_line(&line) {
                     events.push(event);
                 }
+            }
+            // Whatever remains has no newline; drop it rather than buffering
+            // a newline-free flood forever.
+            if stream.pending.len() as u64 > Self::MAX_DRAIN_BYTES {
+                tracing::debug!(
+                    worker_id,
+                    dropped_bytes = stream.pending.len(),
+                    "fleet drain dropped a newline-free flood exceeding the per-call budget"
+                );
+                stream.pending.clear();
             }
         }
         events

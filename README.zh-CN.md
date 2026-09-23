@@ -1,11 +1,11 @@
-<!-- source: README.md sha256:a446e3921085 -->
+<!-- source: README.md sha256:29c349b6f2b4 -->
 # Codewhale
 
 Codewhale 是一款开源智能体，可使用你选择的托管模型或本地模型读取项目、编辑文件、运行命令并检查自己的工作。从终端中的一项任务开始。对于较大的工作，可以将其中的部分任务交给使用不同模型、承担不同角色的智能体。
 
-![Codewhale 在终端中运行](web/public/codewhale-tui-171acee.png)
+![Codewhale 在终端中运行](web/public/codewhale-tui-d7a9a1c.png)
 
-*终端预览截图来自 v0.9.12 的开发构建。*
+*终端预览截图来自 v0.10.0 的开发构建。*
 
 [English](README.md) · [日本語](README.ja-JP.md) · [Tiếng Việt](README.vi.md) · [Bahasa Indonesia](README.id.md) · [한국어](README.ko-KR.md) · [Español](README.es-419.md) · [Português](README.pt-BR.md) · [Русский](README.ru.md) · [Українська](README.uk.md) · [Français](README.fr.md) · [Deutsch](README.de.md) · [繁體中文](README.zh-TW.md) · [हिन्दी](README.hi.md) · [Türkçe](README.tr.md) · [Italiano](README.it.md) · [Polski](README.pl.md) · [العربية](README.ar.md) · [Català](README.ca.md)
 
@@ -56,7 +56,7 @@ Codewhale 可以读取你的代码仓库、编辑文件、运行命令、检查�
 
 - **终端：** `codewhale` 打开交互界面；`codewhale exec` 可从脚本或 CI 作业中运行任务。
 - **本地浏览器：** `codewhale web` 打开随附的[本地 Web 客户端](docs/WEB.md)，使用同一个 Runtime。
-- **Codewhale Web 和桌面应用：** 仍在开发中的图形工作台。其可用情况见[产品页面](https://codewhale.net/en/product)。
+- **Codewhale 桌面应用（GPUI）：** 原生 GPUI 桌面应用是产品客户端方向（2026-09-14 决定；阶段规划见私有 codehwhale-gpui 仓库中的 docs/TRANSITION.md）。app.codewhale.net 的托管网页应用将分阶段下线；营销站点、登录、计费、法律和下载页面永久保留在网页上。其可用情况见[产品页面](https://codewhale.net/en/product)。
 
 **Computer Use 提供观察其他应用并与之交互的工具。** 当前源码已包含此插件。使用前请查看它请求的访问权限并启用它；仍须满足操作系统权限和平台要求。请参阅随附的 [Computer Use 指南](crates/tui/plugins/computer-use/README.md)和[插件设置](docs/PLUGINS.md)。
 

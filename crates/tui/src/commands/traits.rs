@@ -524,7 +524,7 @@ impl CommandRegistry {
     /// Used by test assertions under `#[cfg(test)]`; production builds have
     /// no contextual entries, so the method is dead there until a group
     /// migrates (FEAT-018+).
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), expect(dead_code))]
     pub(crate) fn has_contextual_handler(&self, name: &str) -> bool {
         self.get(name)
             .is_some_and(|command| command.contextual_handler().is_some())

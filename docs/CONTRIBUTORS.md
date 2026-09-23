@@ -28,6 +28,36 @@ notes, and relevant issue/PR comments.
 ## Contributors by time
 
 <details open>
+<summary><strong>v0.10.0 — redesigned workbench, session recovery, and runtime surfaces</strong></summary>
+
+**Merged or adapted contributions**
+
+- **[AdityaVG13](https://github.com/AdityaVG13)** — composer wrapping, pasted/editor draft history, painted-column transcript copying, tab/caret placement, explicit terminal foregrounds, and headless user-input tool availability ([#6363](https://github.com/Hmbown/Codewhale/pull/6363), [#6365](https://github.com/Hmbown/Codewhale/pull/6365)); both PRs merged with their original ancestry.
+- **[aboimpinto](https://github.com/aboimpinto)** — moved the TUI session-export slice onto shared command contracts (FEAT-025): a session-export contract facet with one shared sanitizer, `/export` routed through the facet, pinned with baseline-captured goldens and gates ([#6096](https://github.com/Hmbown/Codewhale/pull/6096)).
+- **[gaord](https://github.com/gaord)** — recorded the mode each turn ran in so mixed-mode sessions stay legible ([#6321](https://github.com/Hmbown/Codewhale/pull/6321), harvested), stated the approval posture a task thread starts on ([#6386](https://github.com/Hmbown/Codewhale/pull/6386)), and rebuilt the runtime-API thread summary in one store pass instead of one per row ([#6376](https://github.com/Hmbown/Codewhale/pull/6376)).
+- **[zhuowp](https://github.com/zhuowp)** — preserved chat roles across compaction, protected user turns on recompaction, and kept the operate contract intact through the same path ([#6286](https://github.com/Hmbown/Codewhale/pull/6286)).
+- **[h3c-hexin](https://github.com/h3c-hexin)** — rate-limit-adaptive subagent launch scheduling: the `DynamicGate` that replaces fixed spawn pacing when a provider throttles ([#6055](https://github.com/Hmbown/Codewhale/pull/6055), harvested).
+- **[asto18089](https://github.com/asto18089)** — co-authored the rate-limit-adaptive launch scheduling work ([#6055](https://github.com/Hmbown/Codewhale/pull/6055)).
+- **[yrk111222](https://github.com/yrk111222)** — ModelScope provider support, landed through the shared `ChildGrant` fleet authority ([#6299](https://github.com/Hmbown/Codewhale/pull/6299), harvested).
+- **[xiechimon](https://github.com/xiechimon)** — capped child tool results at capture time rather than at render ([#6294](https://github.com/Hmbown/Codewhale/pull/6294), harvested).
+- **[VincentCorleone](https://github.com/VincentCorleone)** — defined and implemented the weixin-bridge Quick Start so a first run works from the README alone ([#6170](https://github.com/Hmbown/Codewhale/pull/6170), harvested).
+- **[Serendo](https://github.com/Serendo)** — fixed the `/config` theme editor exiting the panel on an arrow key ([#6336](https://github.com/Hmbown/Codewhale/pull/6336)).
+- **[yetuge](https://github.com/yetuge)** — dropped the retired `token_budget` field from the subagent documentation ([#6335](https://github.com/Hmbown/Codewhale/pull/6335)).
+- **[Water-Run](https://github.com/Water-Run)** — ingested namespaced model-only catalog entries so models present only in the canonical `models` map reach the offering list ([#6400](https://github.com/Hmbown/Codewhale/pull/6400)); translated the local browser client guide into Simplified Chinese ([#6401](https://github.com/Hmbown/Codewhale/pull/6401)); and retired the blanket dead-code allowance and its unused feature stages, tightening the budget to match ([#6402](https://github.com/Hmbown/Codewhale/pull/6402)).
+
+**Reports and reproductions**
+
+- **[BX166](https://github.com/BX166)** — contributed the AICraft provider template and its documentation ([#6171](https://github.com/Hmbown/Codewhale/pull/6171)). The PR was closed unmerged, but it is what surfaced the decision to stop special-casing named OpenAI-compatible hosts and make them ordinary providers ([#6289](https://github.com/Hmbown/Codewhale/issues/6289)); its base URL and key env carry into that work.
+- **[7jrxt42BxFZo4iAnN4CX](https://github.com/7jrxt42BxFZo4iAnN4CX)** — reported the session-retention defects behind archive-past-the-cap and empty-session cap occupancy ([#6136](https://github.com/Hmbown/Codewhale/issues/6136), [#6137](https://github.com/Hmbown/Codewhale/issues/6137)), the resume-failure design behind durable transcript errors ([#6138](https://github.com/Hmbown/Codewhale/issues/6138)), and the gaps behind the opt-in approval timeout ([#6101](https://github.com/Hmbown/Codewhale/issues/6101)), `codewhale exec --hooks` ([#6099](https://github.com/Hmbown/Codewhale/issues/6099)), Markdown drag-copy ([#6156](https://github.com/Hmbown/Codewhale/issues/6156)), and the browsable, current-aware session picker ([#6014](https://github.com/Hmbown/Codewhale/issues/6014)); the goal token-budget hard stop ([#6013](https://github.com/Hmbown/Codewhale/issues/6013)) and the fleet no-progress guard shared with child workers ([#6015](https://github.com/Hmbown/Codewhale/issues/6015)) landed as first slices of two larger proposals, and the runtime-store session refusal ([#6207](https://github.com/Hmbown/Codewhale/issues/6207)) stays open after the first fix was reverted on a race.
+- **[Lstarsky0](https://github.com/Lstarsky0)** — reported TUI tests reading machine state instead of hermetic fixtures; the `lock_test_env` remedy from that report shaped two more hermetic fixes for shared UI fixtures and the compaction budget test ([#5359](https://github.com/Hmbown/Codewhale/issues/5359)).
+- **[Lujc0523](https://github.com/Lujc0523)** — reported `/hooks edit` splitting keystrokes between the editor and the composer, fixed by pausing the TUI input pump inside the editor handoff ([#6165](https://github.com/Hmbown/Codewhale/issues/6165)).
+- **[Statter](https://github.com/Statter)** — reported the Gemini `/models` failure that now surfaces the provider's reason instead of an empty error ([#6173](https://github.com/Hmbown/Codewhale/issues/6173)).
+- **[sequico](https://github.com/sequico)** — reported the ACP `session/new` ids that `session/load` could not resolve, fixed by minting resolvable session ids ([#6174](https://github.com/Hmbown/Codewhale/issues/6174)).
+- **[bevis-wong](https://github.com/bevis-wong)** — reported the mid-run engine freeze behind the bounded turn-end foreground-child join, and the resume path that re-ran identical tool-call repair on every load instead of persisting it ([#6184](https://github.com/Hmbown/Codewhale/issues/6184), [#6185](https://github.com/Hmbown/Codewhale/issues/6185)).
+
+</details>
+
+<details open>
 <summary><strong>v0.9.13 — paste integrity, dispatch safety, and the Computer Use bundle</strong></summary>
 
 **Merged or adapted contributions**

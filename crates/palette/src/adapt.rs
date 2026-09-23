@@ -199,13 +199,18 @@ const fn theme_diff_deleted_bg(ui: &UiTheme) -> Color {
 
 /// Returns `true` if the preset participates in the cell-level remap. The
 /// default Whale and System themes pass through unchanged so this whole
-/// stage compiles down to a single load+compare on the hot path.
+/// stage compiles down to a single load+compare on the hot path. Shoreline is
+/// listed because it is a full re-ink — warm charcoal instead of the navy the
+/// direct terminal constants were tuned for — so every one of those call
+/// sites has to land on the preset's slots.
 #[inline]
 #[must_use]
 pub const fn theme_remap_active(theme: ThemeId) -> bool {
     matches!(
         theme,
         ThemeId::Terminal
+            | ThemeId::Shoreline
+            | ThemeId::ShorelineLight
             | ThemeId::CatppuccinMocha
             | ThemeId::TokyoNight
             | ThemeId::Dracula
@@ -213,6 +218,7 @@ pub const fn theme_remap_active(theme: ThemeId) -> bool {
             | ThemeId::Claude
             | ThemeId::Matrix
             | ThemeId::SolarizedLight
+            | ThemeId::Uwu
     )
 }
 
@@ -403,7 +409,18 @@ fn adapt_fg_for_grayscale_palette(color: Color) -> Color {
 }
 
 fn adapt_bg_for_grayscale_palette(color: Color) -> Color {
-    if color == Color::Reset {
+    // Direct UiTheme paints have already resolved these slots. Bucketing
+    // their luminance again collapses selection into panel and raised
+    // surfaces into the field, so preserve the authored grayscale ladder.
+    if color == Color::Reset
+        || color == GRAYSCALE_SURFACE
+        || color == GRAYSCALE_PANEL
+        || color == GRAYSCALE_ELEVATED
+        || color == GRAYSCALE_REASONING
+        || color == GRAYSCALE_SELECTION_BG
+        || color == GRAYSCALE_SUCCESS
+        || color == GRAYSCALE_ERROR
+    {
         return color;
     }
     if color == WHALE_BG || color == BACKGROUND_DARK || color == LIGHT_SURFACE {
@@ -415,12 +432,9 @@ fn adapt_bg_for_grayscale_palette(color: Color) -> Color {
         || color == LIGHT_PANEL
     {
         GRAYSCALE_PANEL
-    } else if color == SURFACE_ELEVATED
-        || color == SURFACE_TOOL_ACTIVE
-        || color == LIGHT_ELEVATED
-        || color == SELECTION_BG
-        || color == LIGHT_SELECTION_BG
-    {
+    } else if color == SELECTION_BG || color == LIGHT_SELECTION_BG {
+        GRAYSCALE_SELECTION_BG
+    } else if color == SURFACE_ELEVATED || color == SURFACE_TOOL_ACTIVE || color == LIGHT_ELEVATED {
         GRAYSCALE_ELEVATED
     } else if color == SURFACE_REASONING
         || color == SURFACE_REASONING_TINT
@@ -483,6 +497,9 @@ pub(crate) fn luma(r: u8, g: u8, b: u8) -> u8 {
 /// tints) on terminals that can't render them faithfully.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ColorDepth {
+    /// Explicit NO_COLOR: terminal-owned foreground/background, with text
+    /// modifiers and semantic symbols retained.
+    Monochrome,
     /// 16-color terminals (macOS Terminal.app default, dumb tmux setups).
     /// Background tints distort the named-palette mapping, so we drop them.
     Ansi16,
@@ -625,17 +642,14 @@ impl ColorDepth {
     /// `NO_COLOR` contract is testable without mutating process env.
     ///
     /// `NO_COLOR` (no-color.org): present and non-empty ⇒ suppress color.
-    /// The TUI's contained answer is to force the mono/ascii-safe path —
-    /// ANSI-16 depth, where backgrounds drop to `Color::Reset` and the
-    /// injective role matrix carries meaning in glyph/intensity, never hue.
-    /// TODO(depth): a fully colorless SGR stream would additionally need a
-    /// theme-level Reset override; that is deliberately out of this fix.
+    /// Monochrome is distinct from a terminal that supports ANSI-16 hues.
+    /// Text modifiers and Unicode symbols remain independent preferences.
     #[must_use]
     pub(crate) fn detect_with(get: impl Fn(&str) -> Option<std::ffi::OsString>) -> Self {
         if let Some(no_color) = get("NO_COLOR")
             && !no_color.is_empty()
         {
-            return Self::Ansi16;
+            return Self::Monochrome;
         }
         if let Some(ct) = get("COLORTERM") {
             let ct = ct.to_string_lossy().to_ascii_lowercase();
@@ -684,6 +698,7 @@ impl ColorDepth {
 #[must_use]
 pub fn adapt_color(color: Color, depth: ColorDepth) -> Color {
     match (color, depth) {
+        (_, ColorDepth::Monochrome) => Color::Reset,
         (_, ColorDepth::TrueColor) => color,
         (Color::Rgb(r, g, b), ColorDepth::Ansi256) => Color::Indexed(rgb_to_ansi256(r, g, b)),
         (Color::Rgb(r, g, b), ColorDepth::Ansi16) => nearest_ansi16(r, g, b),
@@ -701,7 +716,7 @@ pub fn adapt_bg(color: Color, depth: ColorDepth) -> Color {
         (_, ColorDepth::TrueColor) => color,
         (Color::Rgb(r, g, b), ColorDepth::Ansi256) => Color::Indexed(rgb_to_ansi256(r, g, b)),
         (_, ColorDepth::Ansi256) => color,
-        (_, ColorDepth::Ansi16) => Color::Reset,
+        (_, ColorDepth::Ansi16 | ColorDepth::Monochrome) => Color::Reset,
     }
 }
 
@@ -731,7 +746,7 @@ pub fn blend(fg: Color, bg: Color, alpha: f32) -> Color {
 #[must_use]
 pub fn reasoning_surface_tint(depth: ColorDepth) -> Option<Color> {
     match depth {
-        ColorDepth::Ansi16 => None,
+        ColorDepth::Ansi16 | ColorDepth::Monochrome => None,
         _ => Some(adapt_bg(SURFACE_REASONING_TINT, depth)),
     }
 }

@@ -26,10 +26,10 @@ This is read-and-recommend. You do NOT merge, close, tag, or publish. You surfac
 
 2. **Identify the real landing branch.** The release head is frequently local-only:
    ```
-   git branch --list 'codex/v0.8*' 'codex/v0.9*'
+   git branch --sort=-committerdate --format='%(committerdate:short) %(refname:short)' | head -20
    git log --oneline -1 <release-branch>
    ```
-   Use that ref, not `main`, for every mergeability test below.
+   Ask the maintainer when several lanes look live. Use that ref, not `main`, for every mergeability test below.
 
 3. **Read each candidate from code, not title.** For every non-trivial PR:
    ```
@@ -59,9 +59,10 @@ This is read-and-recommend. You do NOT merge, close, tag, or publish. You surfac
    - **HARVEST** — the change is good but conflicts, needs fmt/rebase, or is entangled with the release work. Reimplement on the release branch and credit with trailers (cherry-pick is not preserving authorship here):
      ```
      Co-authored-by: Name <email>
-     Harvested-from: PR #<N> by @handle
+
+     Harvested from PR #<N> by @handle
      ```
-     The `Harvested-from:` trailer lets the auto-close-at-main workflow close the PR with credit once the change reaches main.
+     The `Harvested from PR #<N> by @handle` body line is what the auto-close-at-main workflow greps for; a `Harvested-from:` trailer does not match. See `gh-credit-harvest` for the exact shape.
    - **DEFER** — sound but blocked by an open question, missing tests, or a release freeze. Leave a positive, specific comment; do not close.
    - **CLOSE-WITH-NOTE** — superseded, duplicated, or out of scope. Propose the close to the maintainer with a crediting, appreciative note; never close it yourself.
 
@@ -72,7 +73,7 @@ This is read-and-recommend. You do NOT merge, close, tag, or publish. You surfac
 - **Don't judge by title.** "fix(...)" / "feat(...)" / emoji-prefixed test PRs prove nothing. Open the diff every time.
 - **Don't trust `mergeStateStatus` for the real target.** CLEAN/BLOCKED/DIRTY are vs `main`; always confirm with `git merge-tree <release> <pr-head>`.
 - **Don't conflate trivial and real check failures.** A fmt-only `Lint` red is harvestable; a failing `Test (...)` is not — read the log.
-- **Don't drop credit.** Every harvest carries `Co-authored-by:` + `Harvested-from:`; every cherry-pick keeps the original author. No silent reimplementation.
+- **Don't drop credit.** Every harvest carries `Co-authored-by:` + a `Harvested from PR #N` body line; every cherry-pick keeps the original author. No silent reimplementation.
 - **Don't merge, close, retarget, tag, publish, or release.** Recommend; the maintainer decides.
 - **Don't post negative or nitpicking comments.** GitHub-facing comments are positive and crediting; keep critique in your internal report to the maintainer.
 - **Don't modify the working tree or any branch.** `git merge-tree --write-tree` is the only "write" allowed — it touches the object store only.

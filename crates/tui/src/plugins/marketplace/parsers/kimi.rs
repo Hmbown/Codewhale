@@ -23,8 +23,8 @@ use crate::plugins::agent_plugin::{is_standard_plugin_name, slugify_plugin_name}
 
 use super::super::types::{
     CatalogProvenance, CatalogTier, MarketplaceCandidate, MarketplaceCandidateId,
-    MarketplaceCatalog, MarketplaceDiagnostic, MarketplaceFormat, MarketplaceInstallPlan,
-    MarketplaceSourceSpec,
+    MarketplaceCatalog, MarketplaceDiagnostic, MarketplaceEntryKind, MarketplaceFormat,
+    MarketplaceInstallPlan, MarketplaceSourceSpec,
 };
 use super::{MarketplaceDocument, str_array_field, str_field, unknown_fields_warning};
 
@@ -232,6 +232,7 @@ fn parse_kimi_entry(
     Some(MarketplaceCandidate {
         id: MarketplaceCandidateId::new(catalog_id, &name),
         catalog_id: catalog_id.clone(),
+        kind: MarketplaceEntryKind::Plugin,
         icon: None,
         name,
         display_name,

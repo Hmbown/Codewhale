@@ -95,27 +95,27 @@ pub enum IntegrityState {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)] // NotApplicable reserved for non-filesystem rows in later stages
 pub enum TrustState {
     TrustedForDigest(String),
     TrustStale,
     LegacyAdvisory,
     Untrusted,
+    // Matched by the skills manager ("n/a") but never constructed: no
+    // discovery path yields a non-filesystem row yet.
+    #[allow(dead_code)]
     NotApplicable,
     Unknown,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // Partial / NeedsSetup filled when #4407 readiness cache is wired
 pub enum ReadinessState {
+    // Constructed only in tests until the #4407 readiness cache is wired.
+    #[cfg(test)]
     Ready,
-    Partial,
-    NeedsSetup,
     Unknown,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)] // Unknown reserved for unclassified logical sources
 pub enum ProvenanceState {
     Managed {
         spec: Option<String>,
@@ -127,6 +127,9 @@ pub enum ProvenanceState {
     BuiltIn,
     Plugin,
     Cache,
+    // Matched by the skills manager ("unknown") but never constructed: no
+    // discovery path yields an unclassified logical source yet.
+    #[allow(dead_code)]
     Unknown,
 }
 
@@ -641,8 +644,9 @@ struct PackageAnalysis {
     warnings: Vec<String>,
 }
 
-/// Compute the bounded package content digest used by audit and mutation.
-#[allow(dead_code)] // public wrapper; mutation uses package_digest directly
+/// Test-only digest helper. Prod paths (audit, mutation) call
+/// `package_digest::compute_package_digest` directly.
+#[cfg(test)]
 pub fn compute_package_digest(package_dir: &Path) -> Result<String, DigestUnknownReason> {
     package_digest::compute_package_digest(package_dir).map_err(digest_error_to_unknown)
 }
@@ -686,7 +690,6 @@ fn analyze_package(package_dir: &Path, _canonical_root: &Path) -> PackageAnalysi
 // ── markers ──────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)] // optional v2 fields reserved for mutation receipts in #4651 stage 3
 struct InstalledFromFile {
     #[serde(default)]
     schema_version: Option<u32>,
@@ -694,15 +697,8 @@ struct InstalledFromFile {
     spec: Option<String>,
     #[serde(default)]
     url: Option<String>,
-    /// v1 field name.
-    #[serde(default)]
-    checksum: Option<String>,
-    #[serde(default)]
-    source_checksum: Option<String>,
     #[serde(default)]
     content_digest: Option<String>,
-    #[serde(default)]
-    installed_name: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -710,8 +706,8 @@ enum MarkerParse {
     Absent,
     V1(InstalledFromFile),
     V2(InstalledFromFile),
-    #[allow(dead_code)] // reason retained for future audit warning surfacing
-    Broken(String),
+    // Reason kept for Debug + future warning surfacing; matches bind `_`.
+    Broken(#[allow(dead_code)] String),
 }
 
 fn read_installed_from(package_dir: &Path) -> MarkerParse {

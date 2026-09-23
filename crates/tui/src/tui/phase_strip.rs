@@ -248,14 +248,9 @@ fn selected_notice(
         })
 }
 
-/// The identity band's right-aligned key legend, and — since the Tideline
-/// footer merge — the merged footer's `keys_legend` source. Live phases keep
-/// the row quiet; idle and drafting advertise the chords the shell owns.
-/// `← for agents · ↓ to manage` joins the chorus whenever the empty composer
-/// still owns those keys.
-/// Peers inside one group — provider and model, a count and its verb — keep
-/// the middle dot.
-const ITEM_SEPARATOR: &str = " · ";
+/// Separate footer groups with breathing room; provider/model fields keep
+/// their internal middle dots in the identity row.
+const ITEM_SEPARATOR: &str = "   ";
 const ITEM_SEPARATOR_WIDTH: usize = 3;
 
 #[cfg(test)]
@@ -272,29 +267,6 @@ mod tests {
             },
             &Config::default(),
         )
-    }
-
-    #[test]
-    fn working_marker_uses_the_live_work_status_role() {
-        let mut app = test_app();
-        // Match Terminal intentionally aliases both roles to ANSI Cyan. Use
-        // the branded palette here to prove the renderer selects the working
-        // slot rather than merely observing an equal terminal color.
-        app.ui_theme = codewhale_palette::UI_THEME;
-        assert_eq!(ShellPhase::Working.color(&app), app.ui_theme.status_working);
-        assert_ne!(ShellPhase::Working.color(&app), app.ui_theme.info);
-        assert_eq!(
-            crate::tui::underwater::phase_ink(ShellPhase::Working),
-            ChromeInk::Active
-        );
-        assert_eq!(
-            crate::tui::underwater::phase_ink(ShellPhase::Failed),
-            ChromeInk::Failure
-        );
-        assert_ne!(
-            crate::tui::underwater::phase_ink(ShellPhase::Working).family(),
-            codewhale_palette::SemanticFamily::Failure
-        );
     }
 
     #[test]
@@ -427,8 +399,9 @@ mod tests {
     #[test]
     fn session_metrics_strip_is_on_by_default() {
         assert!(
-            crate::config::StatusItem::default_footer()
-                .contains(&crate::config::StatusItem::SessionMetrics)
+            crate::config::StatusItem::default_footer().contains(&crate::config::StatusItem::Ttft)
+                && crate::config::StatusItem::default_footer()
+                    .contains(&crate::config::StatusItem::OutputRate)
         );
         assert_eq!(
             crate::config::StatusItem::from_key("session_metrics"),
@@ -569,7 +542,7 @@ mod tests {
 // direction 2026-09-02): the first row under the composer, in Claude Code's
 // grammar —
 //
-//   ▶▶ full access (Shift+Tab) · work (Tab) · 2 agents, 1 task · Esc to interrupt      rc connected
+//    full access (Shift+Tab)   work (Tab)   2 agents, 1 task   Esc to interrupt      rc connected
 //
 // permission chip first (never sheds, #5796), the mode, the turn clock, the
 // live counts, the session clock, then the one hint that applies right now;
@@ -592,9 +565,6 @@ mod tests {
 /// in the metrics line; this bar still says what to do about it.
 const DEPTH_WARN: &str = "surface soon — /compact";
 
-/// The bar's leading glyph — Claude Code's double chevron, in the
-/// permission chip's ink.
-const POSTURE_MARK: &str = "▶▶";
 /// Inside the counts group (`2 agents, 1 task`).
 const COUNT_SEPARATOR: &str = ", ";
 
@@ -854,7 +824,7 @@ fn posture_items(footer: &TidelineFooter<'_>, shed: u8) -> Vec<PostureItem> {
                 footer.mode_key.filter(|_| shed < SHED_MODE_KEY),
             ),
             ink,
-            bold: true,
+            bold: false,
             joined: false,
             count_index: None,
         });
@@ -930,10 +900,8 @@ fn separator_before(item: &PostureItem) -> &'static str {
     }
 }
 
-fn left_run_width(mark: &str, items: &[PostureItem]) -> usize {
-    mark.width()
-        + 1
-        + items.iter().map(|item| item.text.width()).sum::<usize>()
+fn left_run_width(items: &[PostureItem]) -> usize {
+    items.iter().map(|item| item.text.width()).sum::<usize>()
         + items
             .iter()
             .skip(1)
@@ -959,13 +927,13 @@ pub fn render_tideline_footer(
     if area.width < 8 || area.height < 1 {
         return count_rects;
     }
+    let area = area.inner(ratatui::layout::Margin::new(1, 0));
     let theme = footer.theme;
     let width = usize::from(area.width);
-    let mark = footer.sym(POSTURE_MARK);
 
     // The permission chip alone is the floor; the right slot takes what is
     // left after it, and the rest of the left run sheds against the slot.
-    let floor = left_run_width(&mark, &posture_items(footer, MAX_SHED));
+    let floor = left_run_width(&posture_items(footer, MAX_SHED));
     let right = footer.right.map(|(text, ink)| {
         let budget = width.saturating_sub(floor + 1);
         (
@@ -980,10 +948,9 @@ pub fn render_tideline_footer(
     let left_budget = width.saturating_sub(right_width);
     let items = (footer.first_shed_rung()..=MAX_SHED)
         .map(|shed| posture_items(footer, shed))
-        .find(|items| left_run_width(&mark, items) <= left_budget)
+        .find(|items| left_run_width(items) <= left_budget)
         .unwrap_or_else(|| posture_items(footer, MAX_SHED));
 
-    let permission_ink = footer.permission_chip.1;
     let mut x = usize::from(area.x);
     let clip = |x: usize, text: &str| -> String {
         crate::tui::ui_text::truncate_line_to_width(
@@ -991,14 +958,6 @@ pub fn render_tideline_footer(
             (usize::from(area.x) + left_budget).saturating_sub(x),
         )
     };
-    tput(
-        buf,
-        x as u16,
-        area.y,
-        &clip(x, &mark),
-        tchrome(theme, permission_ink).add_modifier(Modifier::BOLD),
-    );
-    x += mark.width() + 1;
     for (index, item) in items.iter().enumerate() {
         if index > 0 {
             // Projected like every other glyph on the row: an ascii-safe
@@ -1020,7 +979,31 @@ pub fn render_tideline_footer(
             style = style.add_modifier(Modifier::BOLD);
         }
         let text = clip(x, &item.text);
-        tput(buf, x as u16, area.y, &text, style);
+        // Keep the state legible while its taught keyboard hint recedes.
+        // Only known shortcut suffixes qualify; parenthetical scope/warnings
+        // retain their semantic ink.
+        let key_start = [footer.permission_key, footer.mode_key, Some("Ctrl+]")]
+            .into_iter()
+            .flatten()
+            .find_map(|key| {
+                let suffix = format!(" ({key})");
+                item.text
+                    .ends_with(&suffix)
+                    .then(|| item.text.len() - suffix.len())
+            });
+        if let Some(start) = key_start.filter(|start| *start < text.len()) {
+            let (label, key) = text.split_at(start);
+            tput(buf, x as u16, area.y, label, style);
+            tput(
+                buf,
+                (x + label.width()) as u16,
+                area.y,
+                key,
+                tchrome(theme, ChromeInk::MetadataHint),
+            );
+        } else {
+            tput(buf, x as u16, area.y, &text, style);
+        }
         if let Some(count_index) = item.count_index
             && !text.is_empty()
         {
@@ -1246,7 +1229,7 @@ fn live_counts(
         // key opened it — founder live-test: "what do we press at the bottom
         // to get the workbar to show up?". It carries its chord until the
         // binding has been used, exactly like the permission and mode chips.
-        let label = RailPanel::Tasks.title().to_ascii_lowercase();
+        let label = "Work bar".to_string();
         let chord = crate::tui::shell_key_routing::binding(
             crate::tui::shell_key_routing::ShellBindingId::ViewCycle,
         )
@@ -1259,7 +1242,7 @@ fn live_counts(
         } else {
             format!("{label} ({chord})")
         };
-        counts.push((label, ChromeInk::MetadataValue));
+        counts.push((label, ChromeInk::Info));
         panels.push(InteractionAction::ShowDockPanel(RailPanel::Tasks));
     }
     (counts, panels)
@@ -1331,7 +1314,16 @@ pub(crate) fn tideline_footer_from_app(app: &mut App, width: u16) -> TidelineFoo
     // half.
     let notice_budget = (usize::from(width) / 2).max(8);
     let right = selected_notice(app.active_status_toast(phase), &phase_label)
-        .map(|(text, ink, _urgent)| (text, ink))
+        .map(|(text, ink, _urgent)| {
+            (
+                text,
+                if ink == ChromeInk::Info {
+                    ChromeInk::Metadata
+                } else {
+                    ink
+                },
+            )
+        })
         .or_else(|| {
             // The launch screen carries the full MCP block — every state, with
             // the failing and unauthorized servers named. Repeating a squeezed
@@ -1389,8 +1381,9 @@ mod neutrality_tests {
     #[test]
     fn session_metrics_strip_is_on_by_default() {
         assert!(
-            crate::config::StatusItem::default_footer()
-                .contains(&crate::config::StatusItem::SessionMetrics)
+            crate::config::StatusItem::default_footer().contains(&crate::config::StatusItem::Ttft)
+                && crate::config::StatusItem::default_footer()
+                    .contains(&crate::config::StatusItem::OutputRate)
         );
         assert_eq!(
             crate::config::StatusItem::from_key("session_metrics"),

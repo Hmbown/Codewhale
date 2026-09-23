@@ -8,7 +8,7 @@ description: "Hunt the issue/PR queue for highest value-over-risk wins: clean fo
 Hunt the open queue for the highest value-over-risk wins fast: clean focused
 community PRs, issues the branch already implements, and safe quick-fixes.
 Output a ranked action list with credit handling. Never act on title or labels
-alone, and never merge/close/tag without Hunter's approval.
+alone, and never merge/close/tag without maintainer approval.
 
 ## When to use
 
@@ -78,7 +78,7 @@ alone, and never merge/close/tag without Hunter's approval.
 
 ## Red flags / don't
 
-- Don't merge, close, defer, harvest, or tag without Hunter's explicit approval.
+- Don't merge, close, defer, harvest, or tag without explicit maintainer approval.
 - Don't trust a `main`-based clean flag for a release branch; run `git merge-tree`
   against the real landing branch.
 - Don't judge from title/labels; read code + tests + comments + checks.

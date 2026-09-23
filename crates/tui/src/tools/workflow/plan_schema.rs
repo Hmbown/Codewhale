@@ -49,6 +49,10 @@ pub(super) fn structured_plan_schema() -> Value {
                 "type": "array",
                 "items": { "type": "string" },
                 "description": "Workspace-relative file scopes for this child. Use [] when no narrower scope is requested."
+            },
+            "cwd": {
+                "type": "string",
+                "description": "Optional repository-relative working directory for this child. Required in multi-repository workspaces so the child (and worktree isolation) resolves the right repository."
             }
         },
         "required": ["prompt", "file_scope"],
@@ -247,6 +251,7 @@ mod tests {
         assert_eq!(
             property_names(child),
             [
+                "cwd",
                 "file_scope",
                 "id",
                 "label",

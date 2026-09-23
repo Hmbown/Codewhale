@@ -39,25 +39,43 @@ BUDGET_PATH = REPO_ROOT / "scripts" / "dead-code-budget.json"
 
 # Matches `#[allow(dead_code)]`, `#![allow(dead_code)]`, and combined forms like
 # `#[allow(dead_code, clippy::large_enum_variant)]`.
-PATTERN = re.compile(r"allow\(\s*dead_code\b")
+ALLOW_PATTERN = re.compile(r"allow\(\s*dead_code\b")
+# `#[expect(dead_code)]` suppresses exactly the same lint. Counting only the
+# `allow` spelling made the gate blind: rewriting an `allow` as an `expect`
+# lowered the headline number by the full count while removing no dead code
+# at all (#6241). `137fb70a9` did this 92 times and the budget recorded a
+# 115-point "improvement" for a real reduction of 21.
+EXPECT_PATTERN = re.compile(r"expect\(\s*dead_code\b")
 
 
-def measure() -> tuple[int, dict[str, int]]:
-    """Return (total occurrences, per-crate counts)."""
-    per_crate: dict[str, int] = {}
-    total = 0
+def measure() -> tuple[int, int, dict[str, dict[str, int]]]:
+    """Return (allow total, expect total, per-crate {allow, expect} counts).
+
+    Both spellings suppress the same lint, so the gate ratchets on their sum.
+    They are still reported separately because `expect` is the better
+    attribute — it errors when the lint stops firing, so it cannot rot
+    silently — and a sweep converting `allow` into `expect` is real progress
+    even though it leaves the total unchanged.
+    """
+    per_crate: dict[str, dict[str, int]] = {}
+    allow_total = 0
+    expect_total = 0
     for path in sorted(CRATES_DIR.rglob("*.rs")):
         try:
             text = path.read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError):
             continue
-        hits = len(PATTERN.findall(text))
-        if not hits:
+        allows = len(ALLOW_PATTERN.findall(text))
+        expects = len(EXPECT_PATTERN.findall(text))
+        if not allows and not expects:
             continue
         crate = path.relative_to(CRATES_DIR).parts[0]
-        per_crate[crate] = per_crate.get(crate, 0) + hits
-        total += hits
-    return total, per_crate
+        entry = per_crate.setdefault(crate, {"allow": 0, "expect": 0})
+        entry["allow"] += allows
+        entry["expect"] += expects
+        allow_total += allows
+        expect_total += expects
+    return allow_total, expect_total, per_crate
 
 
 def load_budget() -> dict:
@@ -66,15 +84,27 @@ def load_budget() -> dict:
     return json.loads(BUDGET_PATH.read_text(encoding="utf-8"))
 
 
-def write_budget(total: int, per_crate: dict[str, int]) -> None:
+def write_budget(
+    allow_total: int, expect_total: int, per_crate: dict[str, dict[str, int]]
+) -> None:
     payload = {
         "_comment": (
-            "Ceiling for `#[allow(dead_code)]` across crates/. This number may "
-            "go down freely; raising it needs a reviewer to say why in the PR. "
-            "Regenerate with: python3 scripts/check-dead-code-budget.py --update"
+            "Ceiling for dead-code suppressions across crates/, counting both "
+            "`#[allow(dead_code)]` and `#[expect(dead_code)]`. `total` is the "
+            "sum and is the ratcheted figure. It may go down freely; raising "
+            "it needs a reviewer to say why in the PR. Regenerate with: "
+            "python3 scripts/check-dead-code-budget.py --update"
         ),
         "_issue": "https://github.com/Hmbown/CodeWhale/issues/4785",
-        "total": total,
+        "_expect_blind_spot": (
+            "Until #6241 this gate counted only the `allow` spelling, so "
+            "rewriting an allow as an expect lowered the number without "
+            "removing any dead code. The ceiling was re-based to the true "
+            "combined count when that was fixed; it is not a regression."
+        ),
+        "total": allow_total + expect_total,
+        "allow_total": allow_total,
+        "expect_total": expect_total,
         "per_crate": dict(sorted(per_crate.items())),
     }
     BUDGET_PATH.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
@@ -89,12 +119,16 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    total, per_crate = measure()
+    allow_total, expect_total, per_crate = measure()
+    total = allow_total + expect_total
 
     if args.update:
-        write_budget(total, per_crate)
+        write_budget(allow_total, expect_total, per_crate)
         rel = BUDGET_PATH.relative_to(REPO_ROOT)
-        print(f"[dead-code-budget] wrote {rel}: total={total}")
+        print(
+            f"[dead-code-budget] wrote {rel}: total={total} "
+            f"(allow={allow_total}, expect={expect_total})"
+        )
         return 0
 
     budget = load_budget()
@@ -102,7 +136,8 @@ def main() -> int:
 
     if total > ceiling:
         print(
-            f"[dead-code-budget] FAIL: {total} `#[allow(dead_code)]` attributes, "
+            f"[dead-code-budget] FAIL: {total} dead-code suppressions "
+            f"(allow={allow_total}, expect={expect_total}), "
             f"budget is {ceiling} (+{total - ceiling}).",
             file=sys.stderr,
         )
@@ -110,10 +145,21 @@ def main() -> int:
         print("Per crate now vs. budget:", file=sys.stderr)
         recorded = budget.get("per_crate", {})
         for crate in sorted(set(per_crate) | set(recorded)):
-            now = per_crate.get(crate, 0)
-            was = int(recorded.get(crate, 0))
+            entry = per_crate.get(crate, {"allow": 0, "expect": 0})
+            now = entry["allow"] + entry["expect"]
+            was_entry = recorded.get(crate, 0)
+            # Tolerate the pre-#6241 shape, where each crate mapped to a bare
+            # `allow` count rather than an {allow, expect} pair.
+            if isinstance(was_entry, dict):
+                was = int(was_entry.get("allow", 0)) + int(was_entry.get("expect", 0))
+            else:
+                was = int(was_entry)
             marker = "  <-- grew" if now > was else ""
-            print(f"  {crate:<16} {now:>4}  (budget {was}){marker}", file=sys.stderr)
+            print(
+                f"  {crate:<16} {now:>4}  (allow {entry['allow']}, "
+                f"expect {entry['expect']}; budget {was}){marker}",
+                file=sys.stderr,
+            )
         print("", file=sys.stderr)
         print(
             "Either delete the dead item, or narrow the attribute to the one item\n"
@@ -127,13 +173,17 @@ def main() -> int:
 
     if total < ceiling:
         print(
-            f"[dead-code-budget] {total} attributes, budget {ceiling} "
+            f"[dead-code-budget] {total} suppressions "
+            f"(allow={allow_total}, expect={expect_total}), budget {ceiling} "
             f"({ceiling - total} under). Lower the budget to lock in the win:\n"
             f"  python3 scripts/check-dead-code-budget.py --update"
         )
         return 0
 
-    print(f"[dead-code-budget] PASS: {total} attributes, exactly at budget.")
+    print(
+        f"[dead-code-budget] PASS: {total} suppressions "
+        f"(allow={allow_total}, expect={expect_total}), exactly at budget."
+    )
     return 0
 
 

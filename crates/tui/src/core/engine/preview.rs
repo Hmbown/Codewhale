@@ -201,6 +201,7 @@ impl Engine {
                         crate::goal_loop::GoalBudget {
                             token_budget: snapshot.token_budget.map(u64::from),
                             time_budget_seconds: None,
+                            enforce_token_budget: self.config.goal_enforce_token_budget,
                             max_continuations: self.config.goal_max_continuations,
                         },
                     ))
@@ -437,13 +438,12 @@ impl Engine {
             .preview_runtime_transforms(&messages, system_prompt.as_ref(), &planned_compaction)
             .await;
 
-        // The turn loop resolves an `auto` sentinel tier against the messages
-        // it is about to send, *after* the planner normalized it. Skipping
-        // that step described a request carrying a literal `auto`, which no
-        // route receives.
+        // The turn loop resolves an `auto` sentinel tier to its declared
+        // policy value, *after* the planner normalized it. Skipping that step
+        // described a request carrying a literal `auto`, which no route
+        // receives.
         let effective_reasoning_effort = super::turn_loop::resolve_auto_effort(
             reasoning_effort.as_deref(),
-            &messages,
             provider,
             &base_url,
             &model,

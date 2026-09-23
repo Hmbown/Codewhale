@@ -69,8 +69,10 @@ Stage 5 of the loop: [cw-orient](../cw-orient/SKILL.md) →
      ```
    - **Conflicts that split mid-function do not resolve by keeping both sides.**
      Git's markers can land inside a body, so a both-sides resolution produces
-     unbalanced braces that look plausible and do not compile. Take one side
-     whole, then re-insert the other side's additions at their original anchor.
+     unbalanced braces that look plausible and do not compile. Default: take
+     one side whole, then re-insert the other side's additions at their
+     original anchor; when the conflict doesn't fit that pattern, resolve it
+     however is correct and let the compiler judge.
    - `maintainerCanModify` does not guarantee push access to the fork. When the
      push is refused, land the resolved merge on an integration branch here.
    - **Check the contribution gate before assuming a PR is stalled.** An
@@ -85,18 +87,14 @@ Stage 5 of the loop: [cw-orient](../cw-orient/SKILL.md) →
    git merge-tree $(git merge-base <base> <pr-head>) <base> <pr-head>
    ```
 
-6. **Merging under a gate.**
-   - **A gate is its artifact.** When a rail says a PR merges only on a passing
-     acceptance record, the record must literally say PASS at merge time. "I
-     re-ran it and the failures are rows this PR does not own" is a judgement to
-     write into the artifact first, not a reason to merge past it.
-   - **Read the review thread, not the check rollup.** Green checks plus an
-     unread review with confirmed findings is a merge that ships known bugs.
-   - **When the artifact is ambiguous, resolve the ambiguity — never the merge.**
+6. **Merging under a gate.** `AGENTS.md` ("Merging under a gate") owns this:
+   the artifact must literally say PASS, the review thread outranks the check
+   rollup, and ambiguity blocks the merge — never the reverse.
 
 7. **Clean up your own lane.** When a worktree's branch lands on `main`, remove
-   the worktree (`git worktree remove <path>`). Worktree sprawl was a 560 GB
-   problem here once.
+   the worktree (`git worktree remove <path>`). `scripts/worktree-gc.sh`
+   lists lanes by merged/dirty state; `--remove-merged --yes` prunes the
+   merged-and-clean ones. Worktree sprawl was a 560 GB problem here once.
 
 ## Red flags / don't
 

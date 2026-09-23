@@ -168,6 +168,10 @@ impl CommandGroup for CoreCommands {
                 home::HomeCmd::execute,
             )),
             Box::new(FunctionCommand::new(
+                home::OverviewCmd::info(),
+                home::OverviewCmd::execute,
+            )),
+            Box::new(FunctionCommand::new(
                 workspace::WorkspaceCmd::info(),
                 workspace::WorkspaceCmd::execute,
             )),

@@ -2043,9 +2043,24 @@ fn new_run_record(
     }
 }
 
+/// The posture an automation's `auto_approve` bit stands for, in the wire
+/// spelling a task request carries.
+///
+/// A scheduled run fires with no session to inherit from, so the only authority
+/// it has is its own record — and stating it explicitly keeps the scheduled
+/// task from re-deriving a posture out of a legacy bit on every later change to
+/// what that bit means.
+fn automation_posture(auto_approve: bool) -> String {
+    crate::runtime_policy::approval_wire(crate::core::authority::posture_from_auto_approve(
+        auto_approve,
+    ))
+    .to_string()
+}
+
 fn automation_task_request(automation: &AutomationRecord) -> NewTaskRequest {
     NewTaskRequest {
         prompt: automation.prompt.clone(),
+        name: Some(automation.name.clone()),
         model: automation.model.clone(),
         model_provider: automation.model_provider.clone(),
         model_provider_id: automation.model_provider_id.clone(),
@@ -2054,6 +2069,7 @@ fn automation_task_request(automation: &AutomationRecord) -> NewTaskRequest {
         allow_shell: Some(automation.task_allow_shell()),
         trust_mode: Some(automation.task_trust_mode()),
         auto_approve: Some(automation.task_auto_approve()),
+        permission_posture: Some(automation_posture(automation.task_auto_approve())),
         owner_session_id: None,
     }
 }
@@ -2420,6 +2436,7 @@ where
                     execution_scope: current.execution_scope.clone(),
                     request: NewTaskRequest {
                         prompt: current.message.clone(),
+                        name: None,
                         model: None,
                         model_provider: None,
                         model_provider_id: None,
@@ -2428,6 +2445,7 @@ where
                         allow_shell: Some(false),
                         trust_mode: Some(false),
                         auto_approve: Some(false),
+                        permission_posture: Some(automation_posture(false)),
                         owner_session_id: current.owner_session_id.clone(),
                     },
                     task_data_dir: task_data_dir.canonicalize()?,
@@ -2518,10 +2536,33 @@ fn apply_task_status(
             run.status = AutomationRunStatus::Canceled;
             run.started_at = run.started_at.or(task.started_at);
             run.ended_at = task.ended_at.or(Some(Utc::now()));
+            // #6162: a cancellation is not silent. Keep the task's own error
+            // when it recorded one, otherwise name the terminal reason so the
+            // settled receipt can say who or what canceled the run.
+            run.error = task.error.clone().or_else(|| {
+                task.terminal_reason
+                    .as_deref()
+                    .map(cancellation_reason_text)
+            });
             changed = true;
         }
     }
     changed
+}
+
+/// Human-readable cancellation detail for a run whose task ended without an
+/// error of its own. The task manager's terminal reasons are stable strings
+/// (`TaskTerminalReason::as_str`); anything unknown is passed through.
+fn cancellation_reason_text(terminal_reason: &str) -> String {
+    // A cooperative cancel is the one path that arrives without an error of
+    // its own; cancel-timeout and shutdown already carry the task manager's
+    // receipt message, so those arms are a fallback for records that lost it.
+    match terminal_reason {
+        "canceled" => "canceled by request".to_string(),
+        "cancel_timeout" => "canceled; the task did not stop within the cancel timeout".to_string(),
+        "shutdown" => "canceled by shutdown".to_string(),
+        other => format!("canceled ({other})"),
+    }
 }
 
 async fn reconcile_run_statuses_shared(
@@ -4227,6 +4268,54 @@ mod tests {
         assert_eq!(record.delivery_mode(), AutomationDeliveryMode::Task);
     }
 
+    #[test]
+    fn automation_requests_pin_the_posture_its_bit_stands_for() {
+        let now = Utc::now().to_rfc3339();
+        let legacy: AutomationRecord = serde_json::from_value(serde_json::json!({
+            "schema_version": CURRENT_AUTOMATION_SCHEMA_VERSION,
+            "id": Uuid::new_v4().to_string(),
+            "name": "Nightly",
+            "prompt": "Run the nightly sweep",
+            "rrule": "FREQ=DAILY",
+            "cwds": [],
+            "status": "active",
+            "created_at": now,
+            "updated_at": now
+        }))
+        .expect("legacy automation record");
+
+        // No session exists when a scheduler fires, so the request states the
+        // posture the record's own authority means instead of leaving the
+        // runtime to re-derive it from the bit.
+        assert!(legacy.auto_approve.is_none());
+        assert_eq!(
+            automation_task_request(&legacy)
+                .permission_posture
+                .as_deref(),
+            Some("ask")
+        );
+
+        let elevated: AutomationRecord = serde_json::from_value(serde_json::json!({
+            "schema_version": CURRENT_AUTOMATION_SCHEMA_VERSION,
+            "id": Uuid::new_v4().to_string(),
+            "name": "Nightly, unattended",
+            "prompt": "Run the nightly sweep",
+            "rrule": "FREQ=DAILY",
+            "cwds": [],
+            "auto_approve": true,
+            "status": "active",
+            "created_at": now,
+            "updated_at": now
+        }))
+        .expect("elevated automation record");
+        assert_eq!(
+            automation_task_request(&elevated)
+                .permission_posture
+                .as_deref(),
+            Some("full_access")
+        );
+    }
+
     #[tokio::test]
     async fn automation_enqueue_uses_default_and_explicit_task_settings() -> Result<()> {
         let tempdir = tempfile::tempdir().expect("tempdir");
@@ -4929,4 +5018,73 @@ model = "private-model"
     }
     mod ownership;
     mod recovery;
+
+    /// #6162: the projection's Canceled branch must record why. A cooperative
+    /// cancel arrives with no error of its own and takes the derived text; a
+    /// task that already carries the task manager's receipt keeps it; a legacy
+    /// record with neither degrades to no detail instead of inventing one.
+    fn canceled_task_record(
+        error: Option<&str>,
+        terminal_reason: Option<&str>,
+    ) -> crate::task_manager::TaskRecord {
+        serde_json::from_value(serde_json::json!({
+            "id": "task_canceled",
+            "prompt": "nightly report",
+            "model": "deepseek-v4-pro",
+            "workspace": "/tmp/automation-fixture",
+            "mode": "agent",
+            "allow_shell": false,
+            "trust_mode": false,
+            "status": "canceled",
+            "created_at": "2026-09-14T10:00:00Z",
+            "started_at": "2026-09-14T10:00:01Z",
+            "ended_at": "2026-09-14T10:00:05Z",
+            "duration_ms": 4000,
+            "result_summary": null,
+            "result_detail_path": null,
+            "error": error,
+            "terminal_reason": terminal_reason,
+            "tool_calls": [],
+            "timeline": [],
+        }))
+        .expect("a canceled task record fixture")
+    }
+
+    #[test]
+    fn a_cooperatively_canceled_task_names_the_cancellation_on_the_run() {
+        let mut run = new_run_record("auto_1", Utc::now(), Utc::now());
+        run.status = AutomationRunStatus::Running;
+        let task = canceled_task_record(None, Some("canceled"));
+        assert!(apply_task_status(&mut run, &task));
+        assert_eq!(run.status, AutomationRunStatus::Canceled);
+        assert_eq!(run.error.as_deref(), Some("canceled by request"));
+        assert_eq!(run.started_at, task.started_at);
+        assert_eq!(run.ended_at, task.ended_at);
+    }
+
+    #[test]
+    fn a_canceled_task_with_its_own_error_keeps_that_error_on_the_run() {
+        let mut run = new_run_record("auto_1", Utc::now(), Utc::now());
+        run.status = AutomationRunStatus::Running;
+        let task = canceled_task_record(
+            Some("Task canceled because the task manager shut down"),
+            Some("shutdown"),
+        );
+        assert!(apply_task_status(&mut run, &task));
+        assert_eq!(run.status, AutomationRunStatus::Canceled);
+        assert_eq!(
+            run.error.as_deref(),
+            Some("Task canceled because the task manager shut down")
+        );
+    }
+
+    #[test]
+    fn a_legacy_canceled_task_without_a_reason_records_no_detail() {
+        let mut run = new_run_record("auto_1", Utc::now(), Utc::now());
+        run.status = AutomationRunStatus::Running;
+        let task = canceled_task_record(None, None);
+        assert!(apply_task_status(&mut run, &task));
+        assert_eq!(run.status, AutomationRunStatus::Canceled);
+        assert_eq!(run.error, None);
+    }
 }

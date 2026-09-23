@@ -306,12 +306,15 @@ pub(crate) const NETWORK_TOOL_DENYLIST: &[&str] = &[
 
 /// The deny-list entry that stands for "this child has no network".
 ///
-/// The deny list *is* how `network_tool = false` reaches a child registry
-/// (through `worker_profile.denied_tools`), so posture is read back off the
-/// list rather than carried as a second field that could disagree with it.
-/// `fetch_url` is the sentinel because every network denial installs it and no
-/// narrower deny list does — the `web_*` / `web.*` globs deliberately do not
-/// match it, which is why it is spelled out above.
+/// The deny list is how `network_tool = false` reaches a child across the
+/// durable-Fleet and `codewhale exec` boundaries (through
+/// `worker_profile.denied_tools` / `context.disallowed_tools`). `fetch_url` is
+/// the sentinel because every network denial installs it and no narrower deny
+/// list does — the `web_*` / `web.*` globs deliberately do not match it,
+/// which is why it is spelled out above. The in-process child reads its
+/// network axis off the resolved grant, which folds this sentinel in at
+/// resolve time — so the transport denial and the semantic answer can never
+/// disagree.
 pub(crate) const NETWORK_DENIAL_SENTINEL: &str = "fetch_url";
 
 /// Tool names that mutate the workspace directly.
@@ -387,10 +390,11 @@ pub(crate) const RAW_SHELL_DENYLIST: &[&str] = &[
 /// raw-shell denial installs it and no narrower deny list does.
 ///
 /// Read by the tests that assert the raw-shell denial actually landed. It is
-/// deliberately *not* what the execution envelope consults for shell
-/// authority — see [`SHELL_AUTHORITY_SENTINEL`] for why those are two
-/// different questions.
-#[allow(dead_code)]
+/// deliberately *not* what decides a child's shell authority — that question
+/// is answered by the resolved grant's `shell` axis, which distinguishes
+/// "no process surface" from "bounded verification surface" by grant field
+/// rather than by a sentinel name.
+#[cfg_attr(not(test), expect(dead_code))]
 pub(crate) const RAW_SHELL_SENTINEL: &str = "exec_shell";
 
 /// The built-in verification surface: the workspace's own configured checks.
@@ -407,11 +411,13 @@ pub(crate) const VERIFICATION_SURFACE_DENYLIST: &[&str] = &["Run", "run_tests", 
 /// Distinct from [`RAW_SHELL_SENTINEL`], and the distinction is the point.
 /// `exec_shell` is installed whenever the *raw* shell is removed, which
 /// includes the write-denied verifier that still holds shell authority — so
-/// reading shell authority off it reports every verifier as shell-less and
-/// takes the verification surface away from the one role that exists to use
-/// it. `run_tests` is installed only when the shell *ceiling* itself is
-/// narrower than `full`, which is exactly the posture that has no authority to
-/// start a process.
+/// reading shell authority off it would take the verification surface away
+/// from the one role that exists to use it. `run_tests` is installed only
+/// when the shell *ceiling* itself is narrower than `full`, which is exactly
+/// the posture that has no authority to start a process. The grant folds
+/// this sentinel into its `shell` axis at resolve time: `Verify`/`Full`
+/// collapse to `None`, while `Inspect` — classifier-bounded evidence reads,
+/// not process-start authority — survives.
 pub(crate) const SHELL_AUTHORITY_SENTINEL: &str = "run_tests";
 
 /// Execution primitives that are **not** spelled as shell.

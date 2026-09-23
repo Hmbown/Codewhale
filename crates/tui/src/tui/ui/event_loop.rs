@@ -61,6 +61,11 @@ pub(super) fn apply_engine_session_projection(
     }
     app.context_token_cache.borrow_mut().clear();
     app.set_api_messages(messages);
+    // #6190: the projection is the engine's own record, so it is where a
+    // steer's acceptance becomes observable — and the only place the steer's
+    // real message index is known. Promote before anything else reads the
+    // transcript, so live order equals record order by construction.
+    crate::tui::ui::dispatch::settle_accepted_steers(app);
     app.system_prompt = system_prompt;
     if app.auto_model {
         app.last_effective_model = Some(model);
@@ -286,7 +291,7 @@ fn translation_session_is_current(app: &App, origin_session_fingerprint: Option<
 fn exact_translation_client(
     config: &Config,
     route: &crate::core::events::TurnRoute,
-) -> anyhow::Result<Arc<DeepSeekClient>> {
+) -> anyhow::Result<Arc<CodewhaleClient>> {
     let identity = config
         .resolve_persisted_provider_identity(
             Some(route.provider.as_str()),
@@ -381,13 +386,14 @@ pub(super) fn handle_transcript_space(app: &mut App) -> bool {
         if !app.show_thinking || !is_thinking {
             return false;
         }
-        let options = app.transcript_render_options();
-        let folded = (!options.verbose ^ options.thinking_default_expanded)
-            ^ (target.action == ReasoningAction::Collapse);
-        app.folded_thinking.remove(&idx);
-        if folded {
-            app.folded_thinking.insert(idx);
-        }
+        // The rendered action names the state the user is asking for, so
+        // record that outright. A relative bit would be re-read as its
+        // opposite the next time a display preference changed (#5847).
+        let intent = match target.action {
+            ReasoningAction::Expand => ThinkingFold::Expanded,
+            ReasoningAction::Collapse => ThinkingFold::Collapsed,
+        };
+        app.thinking_folds.insert(idx, intent);
     } else if app.toggle_tool_run_expansion_at(idx) {
         return true;
     } else if !app.collapsed_cells.remove(&idx) {
@@ -438,6 +444,10 @@ pub(super) fn flush_paste_burst_before_composer(app: &mut App, now: Instant) -> 
         }
         crate::tui::paste_burst::FlushResult::Typed(ch) => {
             app.insert_char(ch);
+            true
+        }
+        crate::tui::paste_burst::FlushResult::SuppressionExpired => {
+            app.needs_redraw = true;
             true
         }
         crate::tui::paste_burst::FlushResult::None => false,
@@ -627,6 +637,31 @@ pub async fn run_tui(
     require_interactive_terminal(io::stdin().is_terminal(), io::stdout().is_terminal())?;
     require_foreground_terminal_owner()?;
 
+    // The dispatcher resets SIGPIPE to SIG_DFL so `codewhale doctor | head`
+    // exits quietly (#4030). A full-screen session is the opposite case: it
+    // writes to pipes whose far end it does not own — stdio MCP servers, shell
+    // tools, hooks, LSP — and a peer that exits first must surface as an
+    // `EPIPE` error on that one write, not kill the whole TUI with the terminal
+    // left in raw mode and nothing in the runtime log. Reproduced with a stdio
+    // MCP server that exits before `initialize` is written: the process died
+    // of SIGPIPE before its first frame, and the PTY harness reported it as a
+    // plain exit 1. Children are unaffected: the standard library resets
+    // SIGPIPE to SIG_DFL before exec, so `| head` inside a shell tool still
+    // terminates the way a shell expects. Non-TUI subcommands keep SIG_DFL.
+    // SAFETY: a plain disposition change, no handler; it runs before this
+    // session spawns anything that writes to a pipe.
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_IGN);
+    }
+
+    // #6169: install the suspend/resume handshake here — after the
+    // foreground-ownership check (the termios snapshot needs the still-cooked
+    // tty) and before raw mode, so every mode enabled below has a handler that
+    // can undo it. Not in `lib.rs`: this must not run for the non-TUI
+    // subcommands.
+    job_control_guard::install_job_control_guard();
+
     // This sets local terminal attributes; it is not a terminal-response probe.
     // Do it on the owning thread, as on resume, so blocking-pool scheduling
     // cannot abort startup or leave a detached worker enabling raw mode later.
@@ -768,12 +803,16 @@ pub async fn run_tui(
             if session_id == "latest" {
                 // Special case: resume the most recent session in this workspace.
                 match manager.get_latest_session_for_workspace(&options.workspace) {
-                    Ok(Some(meta)) => manager.load_session(&meta.id).map(Some),
+                    Ok(Some(meta)) => manager
+                        .resume_session(&meta.id)
+                        .map(|recovery| Some(recovery.session)),
                     Ok(None) => Ok(None),
                     Err(e) => Err(e),
                 }
             } else {
-                manager.load_session_by_prefix(session_id).map(Some)
+                manager
+                    .resume_session_by_prefix(session_id)
+                    .map(|recovery| Some(recovery.session))
             };
 
         match load_result {
@@ -787,19 +826,31 @@ pub async fn run_tui(
                             ));
                         }
                         Err(err) => {
-                            app.status_message = Some(format!("Failed to restore session: {err}"));
+                            crate::tui::ui::session_state::surface_session_load_failure(
+                                &mut app,
+                                format!("Failed to restore session: {err}"),
+                            );
                         }
                     }
                 }
                 Err(err) => {
-                    app.status_message = Some(format!("Failed to restore session goal: {err}"));
+                    crate::tui::ui::session_state::surface_session_load_failure(
+                        &mut app,
+                        format!("Failed to restore session goal: {err}"),
+                    );
                 }
             },
             Ok(None) => {
-                app.status_message = Some("No sessions found to resume".to_string());
+                crate::tui::ui::session_state::surface_session_load_failure(
+                    &mut app,
+                    "No sessions found to resume".to_string(),
+                );
             }
             Err(e) => {
-                app.status_message = Some(format!("Failed to load session: {e}"));
+                crate::tui::ui::session_state::surface_session_load_failure(
+                    &mut app,
+                    format!("Failed to load session: {e}"),
+                );
             }
         }
     }
@@ -917,7 +968,7 @@ pub async fn run_tui(
     // startup, even when the API key is missing, the base URL is malformed,
     // or the network is unavailable.
     // Translations are skipped with a logged warning until a key is saved.
-    let translation_client = match DeepSeekClient::new(config) {
+    let translation_client = match CodewhaleClient::new(config) {
         Ok(client) => Some(Arc::new(client)),
         Err(err) => {
             if app.onboarding == OnboardingState::None {
@@ -1206,6 +1257,18 @@ async fn dispatch_launch_composer_submit(
     config: &mut Config,
     chord: ComposerSubmitChord,
 ) -> Result<bool> {
+    if app.launch.return_to_session {
+        app.launch.dismiss();
+        return dispatch_session_composer_submit(
+            terminal,
+            app,
+            engine_handle,
+            task_manager,
+            config,
+            chord,
+        )
+        .await;
+    }
     let action = app.decide_composer_submit(chord);
     if app.startup_input_unproven || !app.composer_enter_would_submit() {
         // A paste burst, empty composer or startup integrity hold owns this
@@ -1229,10 +1292,7 @@ async fn dispatch_launch_composer_submit(
         return Ok(false);
     }
     if looks_like_slash_command_input(&input) {
-        // Every submit echoes (see submit_decided_composer_input).
-        app.add_message(HistoryCell::User {
-            content: input.clone(),
-        });
+        // Commands own their output; only model-bound prompts become user turns.
         if execute_command_input(terminal, app, engine_handle, task_manager, config, &input).await?
         {
             return Ok(true);
@@ -1246,7 +1306,7 @@ async fn dispatch_launch_composer_submit(
 
 /// Submit the live-session composer through the same branches Enter uses.
 ///
-/// Mouse `[↑]` sets `pending_composer_submit`; this consumes that chord without
+/// Mouse `[↵]` sets `pending_composer_submit`; this consumes that chord without
 /// duplicating draft consumption or opening transcript-only Enter shortcuts.
 /// Its own gates (`SendQueuedNow`, the paste-burst probe) run here; everything
 /// from slash-menu selection onward is the shared `submit_decided_composer_input`
@@ -1260,6 +1320,9 @@ async fn dispatch_session_composer_submit(
     config: &mut Config,
     chord: ComposerSubmitChord,
 ) -> Result<bool> {
+    if app.launch.return_to_session {
+        app.launch.dismiss();
+    }
     let action = app.decide_composer_submit(chord);
     if matches!(action, ComposerSubmitAction::SendQueuedNow) {
         let _ = send_next_queued_message_now(app, config, engine_handle).await?;
@@ -1274,7 +1337,7 @@ async fn dispatch_session_composer_submit(
 /// Shared tail of a decided composer submit: slash-menu selection, draft
 /// consumption, and the memory/`!`/`/`/message branches.
 ///
-/// Keyboard Enter and the mouse `[↑]` dispatcher both end here. Each caller
+/// Keyboard Enter and the mouse `[↵]` dispatcher both end here. Each caller
 /// keeps its own gates — transcript-only shortcuts and forced-submit chords
 /// stay keyboard-only, `SendQueuedNow` and the paste-burst probe stay in the
 /// dispatcher — so this tail is the one place either surface can change.
@@ -1320,12 +1383,8 @@ async fn submit_decided_composer_input(
         return Ok(false);
     }
     if looks_like_slash_command_input(&input) {
-        // Every submit echoes: a command that clears the composer must leave
-        // what the user typed in the thread, not just its receipt — bare
-        // error lines with no user row read as a void.
-        app.add_message(HistoryCell::User {
-            content: input.clone(),
-        });
+        // Opening a view is not a conversation turn. SendMessage actions
+        // record their real prompt through dispatch_composer_message instead.
         if execute_command_input(terminal, app, engine_handle, task_manager, config, &input).await?
         {
             return Ok(true);
@@ -1341,7 +1400,7 @@ async fn submit_decided_composer_input(
             let _ = engine_handle
                 .send(Op::SyncSession {
                     session_id: app.current_session_id.clone(),
-                    messages: app.api_messages.clone(),
+                    messages: app.api_messages.as_ref().clone(),
                     system_prompt: app.system_prompt.clone(),
                     system_prompt_override: false,
                     model: app.model.clone(),
@@ -1364,7 +1423,7 @@ pub(crate) async fn run_event_loop(
     mut engine_handle: EngineHandle,
     task_manager: SharedTaskManager,
     event_broker: &EventBroker,
-    translation_client: Option<Arc<DeepSeekClient>>,
+    translation_client: Option<Arc<CodewhaleClient>>,
     mut pending_telemetry_notice: Option<crate::telemetry_notice::PendingTelemetryNotice>,
     mut dispatch_completion_rx: tokio::sync::mpsc::Receiver<crate::tui::app::DispatchApplyFn>,
 ) -> Result<()> {
@@ -1421,6 +1480,10 @@ pub(crate) async fn run_event_loop(
     // (#6004); `None` until the first publish records it without firing.
     let mut previous_turn_state = None;
     let mut force_terminal_repaint = false;
+    // #6311: while the terminal reports unfocused, frames are pure backlog
+    // (GTK3 defers all VTE damage on occlusion and replays it on return).
+    // Event ingestion continues; only `terminal.draw` emission is gated.
+    let mut terminal_unfocused = false;
     // FocusGained debounce: some terminal emulators (e.g. Tabby) re-trigger
     // FocusGained when we re-arm focus-change reporting inside
     // recover_terminal_modes, creating a tight repaint loop. Skip
@@ -1490,8 +1553,8 @@ pub(crate) async fn run_event_loop(
     // providers so the footer chip can show on the first frame without
     // waiting for a turn to complete.
     if !app.balance_initiated {
-        let api_key = config.deepseek_api_key().unwrap_or_default();
-        let base_url = config.deepseek_base_url();
+        let api_key = config.active_route_api_key().unwrap_or_default();
+        let base_url = config.active_route_base_url();
         schedule_balance_fetch(app, &api_key, &base_url, false);
         app.balance_initiated = true;
     }
@@ -1499,6 +1562,40 @@ pub(crate) async fn run_event_loop(
     let mut pending_subagent_list_refresh = false;
 
     loop {
+        // #6169: first statement of every iteration. The job-control handler can
+        // stop this process mid-turn (SIGTSTP, or SIGTTIN once the group is
+        // backgrounded) after restoring the terminal from inside the handler.
+        // SIGCONT only records that the stop happened; the rebuild happens here,
+        // in normal context, where crossterm is safe to call.
+        //
+        // Two deferrals, both deliberate: a child owning the tty is handled by
+        // the pause/resume block further down (it rebuilds the modes itself), and
+        // a group that is still background (a plain `bg`) must not touch the
+        // terminal at all — re-entering raw mode and the alternate screen would
+        // steal the shell's tty. The state is left pending either way, so the
+        // rebuild still runs on the iteration after `fg`.
+        if job_control_guard::take_resume()
+            && !event_broker.is_paused()
+            && require_foreground_terminal_owner().is_ok()
+        {
+            job_control_guard::mark_resumed();
+            resume_terminal(
+                terminal,
+                app.use_alt_screen(),
+                app.use_mouse_capture,
+                app.use_bracketed_paste,
+                app.synchronized_output_enabled,
+            )?;
+            event_broker.resume_events();
+            // The input pump is deliberately not told about this: it is only
+            // ever gated by `pause_terminal_input_for_child` /
+            // `resume_after_child_terminal`, and calling the latter here would
+            // falsely clear a child's gate.
+            app.status_message = Some("Resumed after suspend".to_string());
+            app.needs_redraw = true;
+            force_terminal_repaint = true;
+        }
+
         if app.onboarding == OnboardingState::None && pending_telemetry_notice.take().is_some() {
             let receipt = app.tr(MessageId::TelemetryNoticeDefaultOn);
             app.push_status_toast(receipt.into_owned(), StatusToastLevel::Info, Some(12_000));
@@ -2418,6 +2515,10 @@ pub(crate) async fn run_event_loop(
                         if flush_gate_receipts_for(app, None) {
                             transcript_batch_updated = true;
                         }
+                        // A steer the turn never accepted was dropped by the
+                        // engine. Report it instead of leaving it "sending"
+                        // (#6190).
+                        crate::tui::ui::dispatch::settle_unaccepted_steers_at_turn_end(app);
                         let completed_turn = app.active_turn.take();
                         // The in-flight provisional estimate hands off to the
                         // authoritative cumulative price accrued below; the
@@ -2770,7 +2871,8 @@ pub(crate) async fn run_event_loop(
                             });
                         if let Some(launch) = suggestion_launch {
                             let suggestion_cell = app.prompt_suggestion_cell.clone();
-                            let messages: Vec<codewhale_models::Message> = app.api_messages.clone();
+                            let messages: std::sync::Arc<Vec<codewhale_models::Message>> =
+                                app.api_messages.clone();
                             let gen_token = app
                                 .prompt_suggestion_gen
                                 .load(std::sync::atomic::Ordering::Relaxed);
@@ -2873,8 +2975,8 @@ pub(crate) async fn run_event_loop(
                         // Refresh prepaid remaining credit after each completed
                         // turn so the footer balance chip stays current without
                         // adding latency to any request path.
-                        let api_key = config.deepseek_api_key().unwrap_or_default();
-                        let base_url = config.deepseek_base_url();
+                        let api_key = config.active_route_api_key().unwrap_or_default();
+                        let base_url = config.active_route_base_url();
                         schedule_balance_fetch(app, &api_key, &base_url, false);
 
                         // Legacy pending-steer recovery. Current keyboard
@@ -3188,12 +3290,13 @@ pub(crate) async fn run_event_loop(
                     EngineEvent::PauseEvents { ack } => {
                         if !event_broker.is_paused() {
                             let input_handoff =
-                                terminal_input.pause_for_child_terminal().and_then(|()| {
-                                    prepare_terminal_input_handoff(
+                                match terminal_input.pause_for_child_terminal().await {
+                                    Ok(()) => prepare_terminal_input_handoff(
                                         &terminal_input,
                                         &mut pending_terminal_events,
-                                    )
-                                });
+                                    ),
+                                    Err(err) => Err(err),
+                                };
                             match input_handoff {
                                 Ok(true) => {}
                                 Ok(false) => {
@@ -3345,9 +3448,12 @@ pub(crate) async fn run_event_loop(
                     ) =>
                     {
                         let display = bound_agent_activity_text(&friendly_subagent_progress(
-                            app, &id, &status,
+                            app,
+                            &id,
+                            &status,
+                            activity.routine_wait,
                         ));
-                        if is_noisy_subagent_progress(&status) {
+                        if activity.routine_wait {
                             app.agent_progress
                                 .entry(id.clone())
                                 .or_insert_with(|| display.clone());
@@ -3765,6 +3871,7 @@ pub(crate) async fn run_event_loop(
                                     &approval_key,
                                     intent_summary.as_deref(),
                                     config.approval_default_selection(),
+                                    config.approval_timeout(),
                                 );
                                 log_sensitive_event(
                                     "tool.approval.prompted",
@@ -4065,7 +4172,7 @@ pub(crate) async fn run_event_loop(
                 let _ = engine_handle
                     .send(Op::SyncSession {
                         session_id: app.current_session_id.clone(),
-                        messages: app.api_messages.clone(),
+                        messages: app.api_messages.as_ref().clone(),
                         system_prompt: app.system_prompt.clone(),
                         system_prompt_override: false,
                         model: app.model.clone(),
@@ -4273,18 +4380,27 @@ pub(crate) async fn run_event_loop(
             active_cell_has_live_motion,
             translation_placeholder_has_live_motion,
         );
-        let animation_interval_ms = animation_interval_ms(
+        // Content-driven cadence: atmosphere rate when only ocean life moves;
+        // full interactive rate while streaming, selecting, typing, or hovering.
+        // Read once here so the animation tick and the frame limiter below
+        // agree on the same tier for this frame.
+        let cadence_tier = crate::tui::display_refresh::cadence_tier_from_signals(
+            app.is_loading || has_running_agents,
+            app.viewport.transcript_selection.is_active(),
+            !app.input.is_empty(),
+            crate::tui::hover_layer::current_hover().is_some(),
+        );
+        let underwater_motion =
+            underwater_ambient_motion || underwater_completion_motion || launch_motion;
+        let animation_active = status_motion || underwater_motion;
+        let animation_interval = Duration::from_millis(animation_interval_ms(
             app,
             status_motion,
-            underwater_ambient_motion || underwater_completion_motion || launch_motion,
-        );
+            underwater_motion,
+            cadence_tier,
+        ));
         let motion_policy = app.motion_policy();
-        if (status_motion
-            || underwater_ambient_motion
-            || underwater_completion_motion
-            || launch_motion)
-            && last_status_frame.elapsed() >= Duration::from_millis(animation_interval_ms)
-        {
+        if animation_active && last_status_frame.elapsed() >= animation_interval {
             let translation_animated = streaming_thinking::animate_pending_translation(
                 app,
                 pending_thinking_translations > 0,
@@ -4313,6 +4429,20 @@ pub(crate) async fn run_event_loop(
                 app.needs_redraw = true;
             }
             last_status_frame = Instant::now();
+        }
+        if animation_active {
+            // Aim the poll at the next tick. Without a deadline the tick only
+            // ran when the idle/active poll happened to return, which
+            // quantized an 80 ms cadence to 96 ms and a 120 ms one to 144 ms.
+            frame_requester.request_at(
+                Instant::now(),
+                last_status_frame + animation_interval,
+                motion_policy,
+            );
+        } else {
+            // Consume a deadline armed before motion stopped so an orphaned
+            // request cannot hold the poll timeout at zero.
+            let _ = frame_requester.take_due(Instant::now(), motion_policy);
         }
 
         if event_broker.is_paused() {
@@ -4429,21 +4559,15 @@ pub(crate) async fn run_event_loop(
         frame_rate_limiter.set_low_motion(motion_policy.uses_constrained_frame_rate());
         stream_display_clock.set_allow_catch_up(motion_policy.allows_catch_up_bursts());
 
-        // Content-driven cadence: atmosphere rate when only ocean life moves;
-        // full interactive rate while streaming, selecting, typing, or hovering.
+        // The draw limiter follows the same content-driven tier the
+        // animation tick above read for this frame.
         {
             use crate::tui::display_refresh::{
-                cadence_tier_from_signals, content_driven_draw_interval, probe_display_refresh,
+                content_driven_draw_interval, probe_display_refresh,
             };
-            let tier = cadence_tier_from_signals(
-                app.is_loading || has_running_agents,
-                app.viewport.transcript_selection.is_active(),
-                !app.input.is_empty(),
-                crate::tui::hover_layer::current_hover().is_some(),
-            );
             let probe = probe_display_refresh();
             frame_rate_limiter.set_adaptive_interval(Some(content_driven_draw_interval(
-                tier,
+                cadence_tier,
                 probe.hz,
                 motion_policy.uses_constrained_frame_rate(),
             )));
@@ -4460,7 +4584,7 @@ pub(crate) async fn run_event_loop(
             force_terminal_repaint = true;
             app.force_next_full_repaint = false;
         }
-        if app.needs_redraw && draw_wait.is_none() {
+        if app.needs_redraw && draw_wait.is_none() && !terminal_unfocused {
             draw_app_frame_inner(terminal, app, config, force_terminal_repaint)?;
             force_terminal_repaint = false;
             frame_rate_limiter.mark_emitted(Instant::now());
@@ -4553,7 +4677,15 @@ pub(crate) async fn run_event_loop(
         if let Some(observed_terminal_event) = maybe_terminal_event {
             let event_observed_at = observed_terminal_event.observed_at;
             let evt = observed_terminal_event.event;
+            if app.launch.mark_reveal_started_at.is_some()
+                && matches!(&evt, Event::Key(_) | Event::Paste(_) | Event::Resize(_, _))
+            {
+                app.launch.mark_reveal_started_at = Some(
+                    Instant::now() - Duration::from_millis(crate::tui::mark::REVEAL_MS as u64),
+                );
+            }
             app.needs_redraw = true;
+            terminal_unfocused = next_unfocused(terminal_unfocused, &evt);
 
             // Handle bracketed paste events
             if app.redaction_gate && app.onboarding == OnboardingState::None {
@@ -4575,6 +4707,9 @@ pub(crate) async fn run_event_loop(
                 }
             }
             if let Event::Paste(text) = &evt {
+                if app.launch.return_to_session && app.view_stack.is_empty() {
+                    app.launch.dismiss();
+                }
                 handle_bracketed_paste(app, text);
                 continue;
             }
@@ -4674,6 +4809,13 @@ pub(crate) async fn run_event_loop(
                 }
 
                 app.handle_resize(final_w, final_h);
+                // #6311: a resize that lands while unfocused records the size
+                // but must not emit the frame — same deferral as zero-size.
+                if terminal_unfocused {
+                    force_terminal_repaint = true;
+                    app.needs_redraw = true;
+                    continue;
+                }
                 // #macos-resize: some terminals (macOS Terminal.app, Windows
                 // ConHost) briefly report stale dimensions via
                 // `terminal::size()` after a resize. ratatui's `draw()` calls
@@ -4733,6 +4875,9 @@ pub(crate) async fn run_event_loop(
                 if let Some(action) = app.pending_launch_action.take() {
                     match action {
                         crate::tui::underwater::LaunchAction::None => {}
+                        crate::tui::underwater::LaunchAction::ReturnToSession => {
+                            app.launch.dismiss()
+                        }
                         crate::tui::underwater::LaunchAction::NewSession => {
                             let result = begin_launch_session(app, None);
                             if apply_command_result(
@@ -4767,8 +4912,17 @@ pub(crate) async fn run_event_loop(
                             // A launched command dissolves the card; Esc
                             // out of the picker brings it back.
                             app.launch.dissolve_card(app.ambient_clock_ms);
-                            app.view_stack
-                                .push(SessionPickerView::new(&app.workspace, app.ui_locale));
+                            app.view_stack.push(
+                                SessionPickerView::new(&app.workspace, app.ui_locale)
+                                    .with_current_session(app.current_session_id.as_deref()),
+                            );
+                        }
+                        crate::tui::underwater::LaunchAction::McpRemedy => {
+                            type_launch_mcp_remedy(app);
+                        }
+                        crate::tui::underwater::LaunchAction::McpManager => {
+                            app.launch.dissolve_card(app.ambient_clock_ms);
+                            open_mcp_extensions(app);
                         }
                         crate::tui::underwater::LaunchAction::Help => {
                             toggle_help_view(app);
@@ -5414,6 +5568,9 @@ pub(crate) async fn run_event_loop(
                     });
                     match action {
                         crate::tui::underwater::LaunchAction::None => {}
+                        crate::tui::underwater::LaunchAction::ReturnToSession => {
+                            app.launch.dismiss()
+                        }
                         crate::tui::underwater::LaunchAction::NewSession => {
                             let result = begin_launch_session(app, None);
                             if apply_command_result(
@@ -5430,26 +5587,23 @@ pub(crate) async fn run_event_loop(
                             }
                         }
                         crate::tui::underwater::LaunchAction::ResumeSession(session_id) => {
-                            let result = resume_launch_session(app, &session_id);
-                            if apply_command_result(
-                                terminal,
-                                app,
-                                &mut engine_handle,
-                                &task_manager,
-                                config,
-                                result,
-                            )
-                            .await?
-                            {
-                                return Ok(());
-                            }
+                            crate::tui::underwater::open_launch_resume_confirm(app, &session_id);
                         }
                         crate::tui::underwater::LaunchAction::BrowseSessions => {
                             // A launched command dissolves the card; Esc
                             // out of the picker brings it back.
                             app.launch.dissolve_card(app.ambient_clock_ms);
-                            app.view_stack
-                                .push(SessionPickerView::new(&app.workspace, app.ui_locale));
+                            app.view_stack.push(
+                                SessionPickerView::new(&app.workspace, app.ui_locale)
+                                    .with_current_session(app.current_session_id.as_deref()),
+                            );
+                        }
+                        crate::tui::underwater::LaunchAction::McpRemedy => {
+                            type_launch_mcp_remedy(app);
+                        }
+                        crate::tui::underwater::LaunchAction::McpManager => {
+                            app.launch.dissolve_card(app.ambient_clock_ms);
+                            open_mcp_extensions(app);
                         }
                         crate::tui::underwater::LaunchAction::Help => {
                             toggle_help_view(app);
@@ -5720,28 +5874,43 @@ pub(crate) async fn run_event_loop(
             // gesture. Handle it before transcript/detail Enter shortcuts so
             // it can never open an unrelated overlay instead (#382).
             let portable_submit_chord = composer_submit_chord(key, app.composer_multiline_mode);
-            // Inside the double-tap window the just-queued message steers —
-            // the same path Ctrl+Enter takes (one steering path). Outside it,
-            // an empty Enter still promotes the oldest queued message.
+            // Inside the double-tap window every queued message steers,
+            // oldest first — the same path Ctrl+Enter takes (one steering
+            // path). Outside it, an empty Enter still promotes the oldest
+            // queued message.
             if matches!(portable_submit_chord, Some(ComposerSubmitChord::Enter))
                 && app.input.trim().is_empty()
                 && !slash_menu_open
                 && !mention_menu_open
-                && let Some(queued) = app.take_queued_for_double_tap_steer()
             {
-                persist_offline_queue_state(app);
-                attempt_steer_with_queue_fallback(
-                    app,
-                    config,
-                    &engine_handle,
-                    queued,
-                    DispatchRecovery::Queued {
-                        restore_index: None,
-                    },
-                )
-                .await;
-                app.note_footer_hint_used(crate::tui::footer_hints::ENTER_AGAIN);
-                continue;
+                let steers = app.take_queued_for_double_tap_steer();
+                if !steers.is_empty() {
+                    let mut pending = steers.into_iter();
+                    for message in pending.by_ref() {
+                        let steered = attempt_steer_with_queue_fallback(
+                            app,
+                            config,
+                            &engine_handle,
+                            message,
+                            DispatchRecovery::Queued {
+                                restore_index: None,
+                            },
+                        )
+                        .await;
+                        if !steered {
+                            // The failed message is already restored; the
+                            // queue holds exactly it, so the unattempted
+                            // remainder appends behind it in order.
+                            for message in pending.by_ref() {
+                                app.queue_message(message);
+                            }
+                            break;
+                        }
+                    }
+                    persist_offline_queue_state(app);
+                    app.note_footer_hint_used(crate::tui::footer_hints::ENTER_AGAIN);
+                    continue;
+                }
             }
             if matches!(portable_submit_chord, Some(ComposerSubmitChord::Enter))
                 && matches!(
@@ -5905,8 +6074,10 @@ pub(crate) async fn run_event_loop(
                     // never restores a different project's history by
                     // surprise (#1395). Press `a` inside the picker to
                     // broaden to every saved session.
-                    app.view_stack
-                        .push(SessionPickerView::new(&app.workspace, app.ui_locale));
+                    app.view_stack.push(
+                        SessionPickerView::new(&app.workspace, app.ui_locale)
+                            .with_current_session(app.current_session_id.as_deref()),
+                    );
                     continue;
                 }
                 KeyCode::Char('c') | KeyCode::Char('C')
@@ -6177,6 +6348,26 @@ pub(crate) async fn run_event_loop(
                 {
                     select_next_slash_menu_entry(app, slash_menu_entries.len());
                 }
+                // Paging and edge motions from the shared vocabulary (#6290),
+                // claimed before the unconditional transcript-scroll arms.
+                KeyCode::PageUp if key.modifiers.is_empty() && slash_menu_open => {
+                    move_slash_menu_selection(
+                        app,
+                        slash_menu_entries.len(),
+                        crate::tui::list_nav::Motion::PagePrev,
+                    );
+                }
+                KeyCode::PageDown if key.modifiers.is_empty() && slash_menu_open => {
+                    move_slash_menu_selection(
+                        app,
+                        slash_menu_entries.len(),
+                        crate::tui::list_nav::Motion::PageNext,
+                    );
+                }
+                // Home/End deliberately stay cursor keys while the menu is open:
+                // the composer is still the focused input (same as Left/Right
+                // and the mention menu), so only vertical travel belongs to
+                // the popup.
                 KeyCode::Down
                     if key.modifiers.is_empty()
                         && app.selected_composer_attachment_index().is_some() =>
@@ -6313,7 +6504,7 @@ pub(crate) async fn run_event_loop(
                     );
                     // Slash-menu selection, draft consumption, and the
                     // memory/`!`/`/`/message branches are the shared tail the
-                    // mouse `[↑]` dispatcher also runs, so keyboard and pointer
+                    // mouse `[↵]` dispatcher also runs, so keyboard and pointer
                     // submit behavior cannot drift apart.
                     if submit_decided_composer_input(
                         terminal,
@@ -6502,35 +6693,37 @@ pub(crate) async fn run_event_loop(
                     // shortcut whether or not a model turn is streaming —
                     // editing the buffer never disturbs in-flight work.
                     let seed = app.input.clone();
-                    let editor_result = terminal_input.pause_for_child_terminal().and_then(|()| {
-                        let result = prepare_terminal_input_handoff(
-                            &terminal_input,
-                            &mut pending_terminal_events,
-                        )
-                        .and_then(|ready| {
-                            if ready {
-                                crate::tui::external_editor::spawn_editor_for_input(
-                                    terminal,
-                                    app.use_alt_screen(),
-                                    app.use_mouse_capture,
-                                    app.use_bracketed_paste,
-                                    &seed,
-                                )
-                            } else {
-                                Err(io::Error::new(
-                                    io::ErrorKind::Interrupted,
-                                    "editor handoff cancelled by pending terminal input",
-                                ))
-                            }
-                        });
-                        terminal_input.resume_after_child_terminal();
-                        force_terminal_repaint = true;
-                        result
-                    });
+                    let editor_result = match terminal_input.pause_for_child_terminal().await {
+                        Err(err) => Err(err),
+                        Ok(()) => {
+                            let result = prepare_terminal_input_handoff(
+                                &terminal_input,
+                                &mut pending_terminal_events,
+                            )
+                            .and_then(|ready| {
+                                if ready {
+                                    crate::tui::external_editor::spawn_editor_for_input(
+                                        terminal,
+                                        app.use_alt_screen(),
+                                        app.use_mouse_capture,
+                                        app.use_bracketed_paste,
+                                        &seed,
+                                    )
+                                } else {
+                                    Err(io::Error::new(
+                                        io::ErrorKind::Interrupted,
+                                        "editor handoff cancelled by pending terminal input",
+                                    ))
+                                }
+                            });
+                            terminal_input.resume_after_child_terminal();
+                            force_terminal_repaint = true;
+                            result
+                        }
+                    };
                     match editor_result {
                         Ok(crate::tui::external_editor::EditorOutcome::Edited(new)) => {
-                            app.input = new;
-                            app.move_cursor_end();
+                            app.apply_external_edit(new);
                             let editor = std::env::var("VISUAL")
                                 .ok()
                                 .filter(|s| !s.trim().is_empty())
@@ -6768,7 +6961,7 @@ pub(crate) async fn run_cache_warmup(app: &App, config: &Config) -> Result<Cache
         .map(str::to_string);
     let request = MessageRequest {
         model: route.model.clone(),
-        messages: app.api_messages.clone(),
+        messages: app.api_messages.as_ref().clone(),
         max_tokens: CACHE_WARMUP_MAX_TOKENS,
         system: app.system_prompt.clone(),
         tools: app.session.last_tool_catalog.clone(),

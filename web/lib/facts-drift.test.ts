@@ -59,9 +59,12 @@ afterEach(() => {
 });
 
 describe("deriveFactsFromRemote", () => {
-  it("derives tool count from the same exact remote revision", async () => {
+  it("derives tool count and model rows from the same exact remote revision", async () => {
     installGitHubFixture(
-      'export const FACTS: RepoFacts = {"toolCount":73};',
+      'export const FACTS: RepoFacts = {"toolCount":73,"models":[' +
+        '{"id":"deepseek-v4-pro","provider":"DeepSeek","contextWindow":1000000,' +
+        '"maxOutput":128000,"reasoning":true,"addedAt":"2026-07-01"}' +
+        "]};",
     );
 
     const facts = await deriveFactsFromRemote();
@@ -69,6 +72,16 @@ describe("deriveFactsFromRemote", () => {
     expect(facts?.sourceRevision).toBe(REVISION);
     expect(facts?.version).toBe("0.9.2");
     expect(facts?.toolCount).toBe(73);
+    expect(facts?.models).toEqual([
+      {
+        id: "deepseek-v4-pro",
+        provider: "DeepSeek",
+        contextWindow: 1000000,
+        maxOutput: 128000,
+        reasoning: true,
+        addedAt: "2026-07-01",
+      },
+    ]);
     expect(facts?.sandboxBackends).toEqual([
       "seatbelt (macOS, when available)",
       "bubblewrap (Linux, opt-in when installed)",
@@ -81,6 +94,14 @@ describe("deriveFactsFromRemote", () => {
 
   it("fails derivation when the exact revision has no valid tool count", async () => {
     installGitHubFixture(null);
+
+    await expect(deriveFactsFromRemote()).resolves.toBeNull();
+  });
+
+  it("fails derivation when the exact revision has malformed model rows", async () => {
+    installGitHubFixture(
+      'export const FACTS: RepoFacts = {"toolCount":73,"models":[{"id":42}]};',
+    );
 
     await expect(deriveFactsFromRemote()).resolves.toBeNull();
   });

@@ -230,10 +230,10 @@ families obey `STATUS_BAR_COLOR_GRAMMAR.md`:
 
 Resolution paths: truecolor presets → ANSI-256 → ANSI-16 injective role
 matrix (`palette/adapt.rs:598`, `role.ansi16()`), ANSI-16 backgrounds drop to
-`Color::Reset` (`adapt_bg`). **Gap found and required by this spec:** add
-`NO_COLOR` detection to `ColorDepth::detect` forcing the mono/ascii-safe path
-(currently only `child_env.rs:214` passes it through; the TUI itself ignores
-it). Dark/Light/Deepsea all resolve because widgets never name a color.
+`Color::Reset` (`adapt_bg`). Nonempty `NO_COLOR` selects a distinct monochrome
+depth: foreground, background, and underline colors become `Color::Reset`,
+while bold, underline, reverse, and selection symbols remain. ASCII rendering
+is independent. Dark/Light/Deepsea all resolve through the same output adapter.
 
 ## 5e. Motion table (wall-clock keyed; `MotionMode`-gated; still frames carry the facts)
 
@@ -302,7 +302,7 @@ authored, everything else staying calm:
   cells-only, opt-in, settles under low motion).
 
 Accessibility is non-negotiable throughout: every motion above has a still
-frame; ANSI-16 and NO_COLOR carry meaning in glyph/intensity, not hue; every
+frame; NO_COLOR retains meaning in glyph/intensity, and ANSI-16 adds its role hues; every
 target is keyboard-reachable with visible focus; red stays failure-only.
 
 ## 8. Acceptance status

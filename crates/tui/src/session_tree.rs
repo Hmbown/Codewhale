@@ -329,6 +329,16 @@ impl SessionJournal {
     /// The existing active branch remains as evidence. We reuse its longest
     /// unchanged prefix, then append the repaired suffix as a sibling branch.
     pub fn rebranch_active_messages(&mut self, messages: &[Message]) {
+        self.rebranch_active_messages_stamped(messages, &[]);
+    }
+
+    /// Preserve existing entry identity and timestamps; only append the changed
+    /// suffix, keeping the previous branch reachable.
+    pub fn rebranch_active_messages_stamped(
+        &mut self,
+        messages: &[Message],
+        stamps: &[DateTime<Utc>],
+    ) {
         let active_path = self.root_to_leaf();
         let shared_prefix = active_path
             .iter()
@@ -338,8 +348,13 @@ impl SessionJournal {
         self.leaf_id = shared_prefix
             .checked_sub(1)
             .map(|index| active_path[index].id.clone());
-        for message in &messages[shared_prefix..] {
-            self.append_message(message.clone());
+        for (index, message) in messages.iter().enumerate().skip(shared_prefix) {
+            self.append_stamped(
+                SessionEntryKind::Message {
+                    message: message.clone(),
+                },
+                stamps.get(index).copied().unwrap_or_else(Utc::now),
+            );
         }
     }
 }
@@ -568,6 +583,44 @@ mod tests {
             journal.entries.len(),
             5,
             "one shared entry plus two branches"
+        );
+    }
+    #[test]
+    fn stamped_rebranch_keeps_prefix_identity_and_suffix_stamps() {
+        let stamp = |secs: i64| DateTime::from_timestamp(secs, 0).expect("stamp");
+        let mut j = SessionJournal::new();
+        j.append_stamped(
+            SessionEntryKind::Message {
+                message: msg("user", "a"),
+            },
+            stamp(100),
+        );
+        j.append_stamped(
+            SessionEntryKind::Message {
+                message: msg("assistant", "b"),
+            },
+            stamp(200),
+        );
+        let a_id = j.entries[0].id.clone();
+        j.rebranch_active_messages_stamped(
+            &[msg("user", "a"), msg("assistant", "b2")],
+            &[stamp(100), stamp(300)],
+        );
+        assert_eq!(j.entries.len(), 3);
+        assert_eq!(j.entries[0].id, a_id, "shared prefix keeps its id");
+        assert_eq!(j.entries[0].created_at, stamp(100));
+        let path = j.root_to_leaf();
+        assert_eq!(path.len(), 2);
+        assert_eq!(
+            path[1].created_at,
+            stamp(300),
+            "suffix keeps the live stamp"
+        );
+        assert!(
+            j.entries
+                .iter()
+                .any(|e| e.kind.as_message().as_ref() == Some(&msg("assistant", "b"))),
+            "replaced suffix survives as a sibling"
         );
     }
     #[test]

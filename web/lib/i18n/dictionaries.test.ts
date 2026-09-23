@@ -13,6 +13,7 @@ import {
   EN_DOCS_COMPUTERS,
   EN_DOCS_AUTH,
   EN_DOCS_TRUST,
+  EN_COMPUTER_USE,
   EN_CHANGELOG,
   EN_DOCS_SHELL,
   EN_DOCS_TROUBLESHOOTING,
@@ -30,6 +31,7 @@ import {
   getDocsComputers,
   getDocsAuth,
   getDocsTrust,
+  getComputerUse,
   getChangelog,
   getDocsShell,
   getDocsTroubleshooting,
@@ -280,6 +282,22 @@ describe("website dictionaries", () => {
         expect(get(locale), `${locale} ${label}`).toBe(reference);
       }
     }
+  });
+
+  it("ships the Computer Use page dictionary for every routed locale", () => {
+    const enKeys = Object.keys(EN_COMPUTER_USE).sort();
+    for (const locale of [...DICTIONARY_LOCALES, "und"]) {
+      expect(Object.keys(getComputerUse(locale)).sort(), `${locale} computer-use keys`).toEqual(enKeys);
+      expect(getComputerUse(locale).steps, `${locale} computer-use steps`).toHaveLength(4);
+    }
+    // The download page is translated for every routed locale, not passed
+    // through: each dictionary locale resolves its own object with its own
+    // primary-button label; only an unknown locale gets the English reference.
+    for (const locale of DICTIONARY_LOCALES) {
+      expect(getComputerUse(locale), `${locale} computer-use`).not.toBe(EN_COMPUTER_USE);
+      expect(getComputerUse(locale).download, `${locale} computer-use download`).not.toBe(EN_COMPUTER_USE.download);
+    }
+    expect(getComputerUse("und")).toBe(EN_COMPUTER_USE);
   });
 
   it("keeps the docs page lists structurally aligned", () => {

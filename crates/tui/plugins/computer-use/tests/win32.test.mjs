@@ -178,3 +178,48 @@ test("win32: wheel packets preserve signed DWORD bits in both axes and clamp not
     assert.doesNotMatch(script, /-band 0xFFFFFFFF/);
   }
 });
+
+test('win32: single-monitor discovery preserves an array and negative raster origins', async t => {
+  const fs = await import('node:fs'); const os = await import('node:os'); const path = await import('node:path');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cu-win-capture-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const file = path.join(dir, 'shot.png');
+  const scripts = [];
+  const mod = await import('../src/backends/win32.mjs');
+  const b = mod.create({ exec: { run: async (_cmd, args) => {
+    const script = decodeScript(args); scripts.push(script);
+    if (script.includes('CopyFromScreen')) { fs.writeFileSync(file, 'fixture'); return { code: 0, stdout: JSON.stringify({x:-1920,y:-100,w:1920,h:1080}), stderr:'' }; }
+    return { code:0, stdout: JSON.stringify({ displays:[{name:'one',primary:true,x:-1920,y:-100,w:1920,h:1080}] }), stderr:'' };
+  } } });
+  assert.equal((await b.list_displays()).length, 1);
+  assert.match(scripts[0], /displays = \$arr/);
+  const shot = await b.screenshot({path:file});
+  assert.deepEqual(shot.points, {x:-1920,y:-100,w:1920,h:1080});
+  await assert.rejects(b.screenshot({region:[0,0,-1,5]}), /region/);
+  for (const result of [{code:0,timedOut:true},{code:0,aborted:true},{code:1}]) {
+    const broken = mod.create({ exec:{run:async()=>({stdout:'{"x":0,"y":0,"w":1,"h":1}',stderr:'capture failure',...result})} });
+    await assert.rejects(broken.screenshot({path:file}));
+    await assert.rejects(broken.open_application({name:'notepad'}));
+  }
+});
+
+test('win32: semantic mutations carry window and leaf identities and traverse zero child indices', async () => {
+  const mod = await import('../src/backends/win32.mjs');
+  const scripts=[];
+  const b=mod.create({exec:{run:async(_cmd,args)=>{scripts.push(decodeScript(args));return {code:0,stdout:'{"ok":true,"verified":true}',stderr:''};}}});
+  const target={path:[0,0,0],runtime_id:[42,10,1],window_runtime_id:[42,10],app_ref:{name:'Fixture'},windowIndex:0,role:'Edit',label:''};
+  assert.equal((await b.set_value({target,value:'漢😀'})).verified,true);
+  await b.perform_action({target,action:'Invoke'});
+  for(const script of scripts){
+    assert.match(script,/\$step = 1/); assert.doesNotMatch(script,/if \(\$i -eq 0\)/);
+    assert.match(script,/observed element was replaced/); assert.match(script,/observed window no longer exists/);
+    assert.ok(script.indexOf('element_stale') < script.indexOf('$vp.SetValue') || !script.includes('$vp.SetValue'));
+  }
+  await assert.rejects(b.perform_action({target,action:"';Invoke-Expression evil"}), /unsupported UIA action/);
+});
+
+test('win32: CLIXML reports the actual PowerShell error rather than its serialization envelope', async () => {
+  const mod=await import('../src/backends/win32.mjs');
+  const b=mod.create({exec:{run:async()=>({code:1,stdout:'',stderr:'#< CLIXML\n<Objs><S S="Error">native failure &lt;target&gt;_x000D__x000A_</S></Objs>'})}});
+  await assert.rejects(b.type({text:'x'}), error => /native failure <target>/.test(error.message) && !/CLIXML|<Objs>/.test(error.message));
+});

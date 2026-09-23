@@ -250,28 +250,9 @@ pub fn update_network_fallback_hint() -> String {
     )
 }
 
-/// Fetches a release JSON payload from `url` using a blocking HTTP client.
+/// Fetches a release JSON payload from `url` (async).
 ///
 /// `description` is included in error messages to identify the request purpose.
-pub fn fetch_release_json_blocking(url: &str, description: &str) -> Result<String> {
-    let client = platform_blocking_http_client_builder()
-        .user_agent(UPDATE_USER_AGENT)
-        .timeout(RELEASE_METADATA_TIMEOUT)
-        .build()
-        .context("failed to build release check HTTP client")?;
-    let response = client
-        .get(url)
-        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
-        .send()
-        .with_context(|| format!("failed to fetch {description} from {url}"))?;
-    let status = response.status();
-    let body = response
-        .text()
-        .with_context(|| format!("failed to read {description} response from {url}"));
-    release_response_body(status, body, url, description)
-}
-
-/// Async counterpart of [`fetch_release_json_blocking`].
 pub async fn fetch_release_json_async(url: &str, description: &str) -> Result<String> {
     let client = platform_http_client_builder()
         .user_agent(UPDATE_USER_AGENT)
@@ -349,21 +330,6 @@ pub async fn latest_release_tag_async(channel: ReleaseChannel) -> Result<String>
         }
         ReleaseQuery::GitHubReleaseList { url } => {
             let body = fetch_release_json_async(url, "release list").await?;
-            latest_beta_tag_from_release_list_json(&body)
-        }
-    }
-}
-
-/// Blocking counterpart of [`latest_release_tag_async`].
-pub fn latest_release_tag_blocking(channel: ReleaseChannel) -> Result<String> {
-    match resolve_release_query(channel) {
-        ReleaseQuery::Mirror { version, .. } => Ok(format!("v{}", version.trim_start_matches('v'))),
-        ReleaseQuery::GitHubLatest { url } => {
-            let body = fetch_release_json_blocking(url, "latest release")?;
-            latest_tag_from_release_json(&body)
-        }
-        ReleaseQuery::GitHubReleaseList { url } => {
-            let body = fetch_release_json_blocking(url, "release list")?;
             latest_beta_tag_from_release_list_json(&body)
         }
     }

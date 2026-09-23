@@ -93,6 +93,7 @@ fn branch_composes_exact_baseline_messages() {
         branch: Ok(SessionBranchOutcome {
             leaf_display: "entry-3".to_string(),
             journal_entries_before: 5,
+            sync: sync_payload("branched-session"),
         }),
         ..CannedLifecycle::default()
     };
@@ -103,7 +104,9 @@ fn branch_composes_exact_baseline_messages() {
             "Branched to entry entry-3 (leaf now entry-3); journal entries 5 (history preserved, leaf moved only)"
         )
     );
-    assert!(result.action.is_none());
+    assert!(
+        matches!(result.action, Some(AppAction::SyncSession { session_id: Some(ref id), .. }) if id == "branched-session")
+    );
     assert_eq!(canned.branch_entries, ["entry-3"]);
 
     // Host stage error passes through unchanged.

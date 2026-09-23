@@ -77,8 +77,8 @@ export function switchTo(id) {
 /** Register or update a computer. Returns the entry. */
 export function register({ id, transport, label, ...rest }) {
   if (!id || !ID_RE.test(id)) throw new RegistryError("invalid_id", "computer id must match " + ID_RE);
-  if (!["local", "ssh", "hdc"].includes(transport)) {
-    throw new RegistryError("invalid_transport", "transport must be one of: local, ssh, hdc");
+  if (!["local", "ssh", "hdc", "docker"].includes(transport)) {
+    throw new RegistryError("invalid_transport", "transport must be one of: local, ssh, hdc, docker");
   }
   if (id === "local" && transport !== "local") {
     throw new RegistryError("reserved_id", '"local" is reserved for this machine');
@@ -99,6 +99,13 @@ export function register({ id, transport, label, ...rest }) {
       throw new RegistryError("invalid_target", "hdc target key contains invalid characters");
     }
     rest.platform = "harmonyos";
+  }
+  if (transport === "docker") {
+    if (!rest.container || !/^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/.test(rest.container)) {
+      throw new RegistryError("invalid_container", "docker computers need a valid container name");
+    }
+    // Spawned containers always run the Linux desktop image.
+    rest.platform = rest.platform ?? "linux";
   }
   const reg = load();
   const prev = reg.computers[id];

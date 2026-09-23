@@ -234,18 +234,13 @@ pub fn take_frame_links() -> Vec<LinkRegion> {
     FRAME_LINKS.with(|cell| std::mem::take(&mut *cell.borrow_mut()))
 }
 
-/// Strip every ANSI escape sequence from `s` into `out`, preserving only the
-/// visible characters. ratatui's buffer drops the leading `ESC` byte but
-/// happily paints every other byte of an escape (`[`, `0`, `;`, `m`, OSC
-/// payloads, etc.) into a buffer cell, drifting columns. Tool stdout that
-/// includes ANSI (e.g. `gh`/`git` with color forced on, anything run through
-/// a PTY) must be sanitized before it enters the transcript.
+/// Strip ANSI/OSC/control sequences from `s` into `out`.
 ///
-/// Handles CSI (`ESC [ … final`), OSC (`ESC ] … BEL` or `ESC \`), DCS, SOS,
-/// PM, APC, and standalone two-byte ESC sequences. OSC 8 hyperlink wrappers
-/// (`ESC ] 8 ; … BEL` / `ESC \`) are stripped along with the rest.
+/// Delegates to the single shared implementation in
+/// [`codewhale_secrets::sanitize`] (FEAT-025 D4) so `/export`, `/structcopy`,
+/// and the renderer cannot drift.
 pub fn strip_ansi_into(s: &str, out: &mut String) {
-    strip_ansi_impl(s, out, false);
+    codewhale_secrets::sanitize::strip_ansi_into(s, out);
 }
 
 /// Like [`strip_ansi_into`], but SGR sequences (`ESC [ … m`: colour, bold,
@@ -254,100 +249,16 @@ pub fn strip_ansi_into(s: &str, out: &mut String) {
 /// (including OSC 8 hyperlink wrappers), cursor movement, DCS, lone control
 /// bytes — is still removed; only the styling survives.
 pub fn strip_ansi_keep_sgr_into(s: &str, out: &mut String) {
-    strip_ansi_impl(s, out, true);
-}
-
-fn strip_ansi_impl(s: &str, out: &mut String, keep_sgr: bool) {
-    let bytes = s.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == 0x1b && i + 1 < bytes.len() {
-            let next = bytes[i + 1];
-            match next {
-                // CSI: ESC [ ... <final byte 0x40..=0x7E>
-                b'[' => {
-                    let mut j = i + 2;
-                    let mut final_byte = 0u8;
-                    while j < bytes.len() {
-                        let b = bytes[j];
-                        if (0x40..=0x7e).contains(&b) {
-                            final_byte = b;
-                            j += 1;
-                            break;
-                        }
-                        j += 1;
-                    }
-                    if keep_sgr
-                        && final_byte == b'm'
-                        && let Ok(seq) = std::str::from_utf8(&bytes[i..j])
-                    {
-                        out.push_str(seq);
-                    }
-                    i = j;
-                    continue;
-                }
-                // OSC / DCS / SOS / PM / APC: ESC ] | P | X | ^ | _ ... ST(ESC \) or BEL
-                b']' | b'P' | b'X' | b'^' | b'_' => {
-                    let mut j = i + 2;
-                    while j < bytes.len() {
-                        if bytes[j] == 0x07 {
-                            j += 1;
-                            break;
-                        }
-                        if bytes[j] == 0x1b && j + 1 < bytes.len() && bytes[j + 1] == b'\\' {
-                            j += 2;
-                            break;
-                        }
-                        j += 1;
-                    }
-                    i = j;
-                    continue;
-                }
-                // Standalone two-byte ESC sequence (RIS, charset selection, etc.)
-                _ => {
-                    i += 2;
-                    continue;
-                }
-            }
-        }
-        // Strip lone control bytes that ratatui would otherwise drop (and which
-        // mean nothing in transcript output) but keep \n, \r, \t as legitimate
-        // formatting.
-        let b = bytes[i];
-        if b < 0x80 {
-            if b < 0x20 && b != b'\n' && b != b'\r' && b != b'\t' {
-                i += 1;
-                continue;
-            }
-            out.push(b as char);
-            i += 1;
-        } else {
-            // UTF-8 multi-byte sequence: copy the whole code point intact.
-            // Pushing `b as char` would mis-decode it as Latin-1 and mangle
-            // non-ASCII text (CJK, accented Latin, emoji, …).
-            let len = utf8_seq_len(b);
-            let end = (i + len).min(bytes.len());
-            if let Ok(chunk) = std::str::from_utf8(&bytes[i..end]) {
-                out.push_str(chunk);
-            }
-            i = end;
-        }
-    }
+    codewhale_secrets::sanitize::strip_ansi_keep_sgr_into(s, out);
 }
 
 /// Length in bytes of the UTF-8 sequence that starts with `lead`. Falls back
 /// to `1` for continuation bytes / invalid leads so callers always make
 /// forward progress.
+///
+/// Delegates to the shared implementation in [`codewhale_secrets::sanitize`].
 fn utf8_seq_len(lead: u8) -> usize {
-    if lead < 0xc0 {
-        1
-    } else if lead < 0xe0 {
-        2
-    } else if lead < 0xf0 {
-        3
-    } else {
-        4
-    }
+    codewhale_secrets::sanitize::utf8_seq_len(lead)
 }
 
 /// Strip OSC 8 escape sequences from `s` into `out`, preserving the visible

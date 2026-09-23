@@ -616,7 +616,9 @@ impl ToolSpec for AgentsInterruptTool {
             let manager = self.manager.read().await;
             manager.get_worker_record_for_session(&context.state_namespace, &snapshot.agent_id)
         };
-        let projection = subagent_session_projection(snapshot, false, context, worker_record).await;
+        let projection =
+            subagent_session_projection(&self.manager, snapshot, false, context, worker_record)
+                .await;
         let payload = json!({
             "action": "interrupt",
             "agent_id": projection.agent_id,

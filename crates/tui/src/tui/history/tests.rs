@@ -25,14 +25,16 @@ use super::constants::{
 use super::thinking::cached_color_depth;
 use super::{
     ASSISTANT_GLYPH, ExecCell, ExecSource, GenericToolCell, HistoryCell, PlanUpdateCell,
-    REASONING_CURSOR, REASONING_OPENER, REASONING_RAIL, RenderMode, ToolCell, ToolStatus,
-    TranscriptRenderOptions, WebSearchCell, assistant_label_style_for, extract_reasoning_summary,
-    render_spillover_annotation, render_thinking, render_thinking_with_analysis,
-    running_status_label_with_elapsed,
+    REASONING_CURSOR, REASONING_OPENER, REASONING_RAIL, RenderMode, ThinkingFold, ToolCell,
+    ToolStatus, TranscriptRenderOptions, WebSearchCell, assistant_label_style_for,
+    extract_reasoning_summary, render_spillover_annotation, render_thinking,
+    render_thinking_with_analysis, running_status_label_with_elapsed,
 };
 use crate::tools::plan::{PlanSnapshot, StepStatus};
 use crate::tui::motion::MotionMode;
-use crate::tui::ui_text::{line_to_plain, slice_text, text_display_width};
+use crate::tui::ui_text::{
+    line_to_plain, slice_visible_columns, text_display_width, text_visible_width,
+};
 use codewhale_models::{ContentBlock, Message, Role};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -504,17 +506,17 @@ fn reasoning_folds_in_live_and_the_fold_is_reversible() {
             low_motion: true,
             ..TranscriptRenderOptions::default()
         };
-        // `folded` is the Space toggle *relative to* the configured default,
-        // so the expanded state is whichever call disagrees with it. Running
-        // both defaults proves the toggle survives the inversion.
+        // An explicit intent says expanded or collapsed outright, so the same
+        // two calls answer for either configured default. Running both proves
+        // the intent is not re-read through the preference.
         let expanded = lines_text(
             &cell
-                .lines_with_options_folded(80, options, !default_expanded)
+                .lines_with_options_folded(80, options, Some(ThinkingFold::Expanded))
                 .0,
         );
         let collapsed = lines_text(
             &cell
-                .lines_with_options_folded(80, options, default_expanded)
+                .lines_with_options_folded(80, options, Some(ThinkingFold::Collapsed))
                 .0,
         );
 
@@ -542,12 +544,14 @@ fn reasoning_folds_in_live_and_the_fold_is_reversible() {
     }
 }
 
-/// The fold toggle is relative to the expanded baseline (verbose session or
-/// expanded default): Space inverts the baseline, never the other flag.
-/// In particular verbose plus an expanded default renders expanded — the
-/// old triple-XOR collapsed exactly that cell.
+/// The preference baseline (verbose session or expanded default) decides only
+/// the cells nobody has touched; an explicit intent decides its own cell in
+/// both directions. Verbose plus an expanded default renders expanded — the
+/// old triple-XOR collapsed exactly that cell — and an explicit expand stays
+/// expanded under every preference combination, which the later relative bit
+/// still got wrong (#5847).
 #[test]
-fn thinking_fold_toggle_is_relative_to_the_expanded_baseline() {
+fn explicit_thinking_fold_outranks_every_preference_baseline() {
     let body = (1..=20)
         .map(|i| format!("step {i:02}: baseline check"))
         .collect::<Vec<_>>()
@@ -557,16 +561,23 @@ fn thinking_fold_toggle_is_relative_to_the_expanded_baseline() {
         streaming: false,
         duration_secs: Some(1.0),
     };
-    // (folded, verbose, default_expanded, expect_expanded)
-    for (folded, verbose, default_expanded, expect_expanded) in [
-        (false, false, false, false),
-        (false, false, true, true),
-        (false, true, false, true),
-        (false, true, true, true),
-        (true, false, false, true),
-        (true, false, true, false),
-        (true, true, false, false),
-        (true, true, true, false),
+    // (fold, verbose, default_expanded, expect_expanded)
+    for (fold, verbose, default_expanded, expect_expanded) in [
+        // No explicit intent: the preference baseline decides.
+        (None, false, false, false),
+        (None, false, true, true),
+        (None, true, false, true),
+        (None, true, true, true),
+        // An explicit expand renders expanded whatever the preferences say.
+        (Some(ThinkingFold::Expanded), false, false, true),
+        (Some(ThinkingFold::Expanded), false, true, true),
+        (Some(ThinkingFold::Expanded), true, false, true),
+        (Some(ThinkingFold::Expanded), true, true, true),
+        // And an explicit collapse renders collapsed whatever they say.
+        (Some(ThinkingFold::Collapsed), false, false, false),
+        (Some(ThinkingFold::Collapsed), false, true, false),
+        (Some(ThinkingFold::Collapsed), true, false, false),
+        (Some(ThinkingFold::Collapsed), true, true, false),
     ] {
         let options = TranscriptRenderOptions {
             verbose,
@@ -574,11 +585,11 @@ fn thinking_fold_toggle_is_relative_to_the_expanded_baseline() {
             low_motion: true,
             ..TranscriptRenderOptions::default()
         };
-        let text = lines_text(&cell.lines_with_options_folded(80, options, folded).0);
+        let text = lines_text(&cell.lines_with_options_folded(80, options, fold).0);
         let expanded = text.contains("step 20: baseline check");
         assert_eq!(
             expanded, expect_expanded,
-            "[folded={folded} verbose={verbose} default_expanded={default_expanded}]"
+            "[fold={fold:?} verbose={verbose} default_expanded={default_expanded}]"
         );
     }
 }
@@ -726,7 +737,7 @@ fn the_copy_prefix_skips_every_decoration_and_keeps_the_payload() {
             .unwrap_or_else(|| panic!("no rendered line contains {needle:?}"));
         let text = line_to_plain(&target.line);
         (
-            slice_text(&text, target.copy_prefix_width, text_display_width(&text)),
+            slice_visible_columns(&text, target.copy_prefix_width, text_visible_width(&text)),
             target.copy_prefix_width,
         )
     };
@@ -786,9 +797,9 @@ fn the_copy_prefix_skips_every_decoration_and_keeps_the_payload() {
             .cloned()
             .collect::<Vec<_>>(),
     ));
-    let copied = slice_text(&body, header.copy_prefix_width, text_display_width(&body));
+    let copied = slice_visible_columns(&body, header.copy_prefix_width, text_visible_width(&body));
     assert!(
-        copied.contains("run done"),
+        copied.contains("run Done"),
         "receipt text was clipped away: {copied:?}"
     );
     for glyph in decorations {
@@ -1203,11 +1214,11 @@ fn a_card_verb_agrees_with_its_own_label_in_every_locale() {
     for (label, expected_en, expected_zh, forbidden_en) in [
         (
             "Searching for `TranscriptScroll`",
-            "find done",
+            "find Done",
             "find 完成",
-            "read done",
+            "read Done",
         ),
-        ("Reading src/foo.rs", "read done", "read 完成", "find done"),
+        ("Reading src/foo.rs", "read Done", "read 完成", "find Done"),
     ] {
         let cell = super::ExploringCell {
             entries: vec![super::ExploringEntry {
@@ -1236,7 +1247,7 @@ fn a_card_verb_agrees_with_its_own_label_in_every_locale() {
             "{label:?} should read {expected_zh:?} in zh-Hans: {header_zh:?}"
         );
         assert!(
-            !header_zh.contains("done"),
+            !header_zh.to_lowercase().contains("done"),
             "zh-Hans must not leak the English status word: {header_zh:?}"
         );
         assert!(
@@ -1255,7 +1266,7 @@ fn receipts_count_only_what_they_actually_counted() {
     use crate::tui::widgets::tool_card::ToolFamily;
     use codewhale_localization::Locale;
 
-    for (locale, done, unit) in [(Locale::En, "done", "line"), (Locale::ZhHans, "完成", "行")] {
+    for (locale, done, unit) in [(Locale::En, "Done", "line"), (Locale::ZhHans, "完成", "行")] {
         let label = |family, status, output| {
             super::tool_receipt_label(family, status, Some(output), locale)
         };
@@ -1337,7 +1348,7 @@ fn shell_headers_stay_truthful_through_the_output_formatters() {
         cell.duration_ms = Some(42);
 
         for (locale, done, unit) in [
-            (Locale::En, "done", "lines"),
+            (Locale::En, "Done", "lines"),
             (Locale::ZhHans, "完成", "行"),
         ] {
             let header = line_text(&cell.render_with_locale(80, true, RenderMode::Live, locale)[0]);
@@ -1409,7 +1420,7 @@ fn agent_cards_stay_one_line_and_spawn_cards_yield_to_the_delegate_card() {
                 "{summary:?} should read as {expected:?}: {text:?}"
             );
             assert!(
-                !text.contains("delegate done"),
+                !text.to_lowercase().contains("delegate done"),
                 "an inspection must not read as a finished delegation: {text:?}"
             );
         }
@@ -1701,7 +1712,7 @@ fn degraded_workflow_receipt_is_terminal_warning_not_running_or_success() {
     let text = lines_text(&lines);
     assert!(text.contains("issue"), "warning receipt missing: {text:?}");
     assert!(
-        !text.contains(" done"),
+        !text.to_lowercase().contains(" done"),
         "must not read as success: {text:?}"
     );
     assert!(
@@ -2649,5 +2660,54 @@ fn superseded_todo_snapshots_collapse_to_their_header() {
     assert!(
         header.contains("1/3"),
         "the collapsed row keeps the progress reading: {header}"
+    );
+}
+
+/// One click is one request to open one file.
+///
+/// The old `try_open_file_at_line` looped over every line of the cell and
+/// spawned a detached editor per match, so a stack trace or a grep result could
+/// launch several at once, all fighting the still-raw-mode TUI for the tty
+/// (#6235). The parser now returns the first resolvable reference and nothing
+/// else; spawning belongs to `external_editor`.
+#[test]
+fn first_file_line_reference_returns_one_match_and_resolves_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = dir.path();
+    std::fs::create_dir_all(workspace.join("src")).unwrap();
+    std::fs::write(workspace.join("src/first.rs"), "fn a() {}\n").unwrap();
+    std::fs::write(workspace.join("src/second.rs"), "fn b() {}\n").unwrap();
+
+    let text = "note: two frames below\n  src/first.rs:12\n  src/second.rs:34\n";
+    let (path, line) = super::first_file_line_reference(text, workspace)
+        .expect("the first resolvable reference is returned");
+    assert_eq!(path, workspace.join("src/first.rs"));
+    assert_eq!(line, 12);
+}
+
+#[test]
+fn first_file_line_reference_skips_unresolvable_and_malformed_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = dir.path();
+    std::fs::create_dir_all(workspace.join("src")).unwrap();
+    std::fs::write(workspace.join("src/real.rs"), "fn a() {}\n").unwrap();
+
+    // A path that does not exist, a bare word, a non-numeric suffix and an
+    // empty suffix all fall through to the one row that resolves.
+    let text = concat!(
+        "  src/missing.rs:9\n",
+        "  notafile:12\n",
+        "  src/real.rs:abc\n",
+        "  src/real.rs:\n",
+        "  src/real.rs:7\n",
+    );
+    let (path, line) =
+        super::first_file_line_reference(text, workspace).expect("the only resolvable row wins");
+    assert_eq!(path, workspace.join("src/real.rs"));
+    assert_eq!(line, 7);
+
+    assert!(
+        super::first_file_line_reference("no references here\n", workspace).is_none(),
+        "a cell with nothing to open must report nothing, not a default"
     );
 }

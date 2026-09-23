@@ -10,6 +10,10 @@ const fixture = () => ({ tag_name: "v0.3.0", draft: false, prerelease: false,
   assets: [asset(archive, 80000000), asset("release.json", 500)] });
 const receipt = () => ({ version: "0.3.0", platform: "macos", arch: "universal", archive,
   sha256, size: 80000000, notarized: true });
+const image = "Codewhale-Computer-Use-0.3.0-macos-universal.dmg";
+const imageSha = "c".repeat(64);
+const imageAsset = () => ({ ...asset(image, 81000000), digest: `sha256:${imageSha}` });
+const imageReceipt = () => ({ ...receipt(), dmg: { archive: image, size: 81000000, sha256: imageSha, notarized: true } });
 
 const API_LATEST = "https://api.github.com/repos/Hmbown/codewhale-cu-plugin/releases/latest";
 const WEB_RECEIPT = `${COMPUTER_USE_REPO}/releases/latest/download/release.json`;
@@ -131,6 +135,35 @@ describe("Computer Use download qualification", () => {
     expect((await getComputerUseRelease()).status).toBe("unavailable");
     expect((await getComputerUseRelease()).status).toBe("pending");
     expect(fetcher).toHaveBeenCalledTimes(3);
+  });
+  it("offers the disk image only when the receipt and GitHub's digest agree on it", () => {
+    const withImage = { ...fixture(), assets: [...fixture().assets, imageAsset()] };
+    expect(qualifiedComputerUseRelease(withImage, imageReceipt())).toMatchObject({
+      status: "ready", dmg: { downloadUrl: imageAsset().browser_download_url, size: 81000000, sha256: imageSha },
+    });
+    // A release without the image, a receipt without the entry, or a mismatch all fall back to the archive alone.
+    expect(qualifiedComputerUseRelease(fixture(), imageReceipt())).not.toHaveProperty("dmg");
+    expect(qualifiedComputerUseRelease(withImage, receipt())).not.toHaveProperty("dmg");
+    const mismatched = imageReceipt(); mismatched.dmg.sha256 = "d".repeat(64);
+    expect(qualifiedComputerUseRelease(withImage, mismatched)).toMatchObject({ status: "ready" });
+    expect(qualifiedComputerUseRelease(withImage, mismatched)).not.toHaveProperty("dmg");
+    const unnotarized = imageReceipt(); unnotarized.dmg.notarized = false;
+    expect(qualifiedComputerUseRelease(withImage, unnotarized)).not.toHaveProperty("dmg");
+  });
+  it("confirms the disk image is served before offering it from the receipt fallback", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    let fetcher = stub(status(403), redirect(OBJECT_URL), Response.json(imageReceipt()), redirect(OBJECT_URL), redirect(OBJECT_URL));
+    expect(await getComputerUseRelease()).toMatchObject({
+      status: "ready", verification: "receipt",
+      dmg: { downloadUrl: `${COMPUTER_USE_REPO}/releases/download/v0.3.0/${image}`, size: 81000000, sha256: imageSha },
+    });
+    expect(fetcher.mock.calls[4][0]).toBe(`${COMPUTER_USE_REPO}/releases/download/v0.3.0/${image}`);
+    expect(fetcher.mock.calls[4][1].method).toBe("HEAD");
+    fetcher = stub(status(403), redirect(OBJECT_URL), Response.json(imageReceipt()), redirect(OBJECT_URL), status(404));
+    const withoutImage = await getComputerUseRelease();
+    expect(withoutImage).toMatchObject({ status: "ready", verification: "receipt" });
+    expect(withoutImage).not.toHaveProperty("dmg");
+    expect(fetcher).toHaveBeenCalledTimes(5);
   });
   it("keeps production builds offline without claiming that a release is available", async () => {
     vi.stubEnv("NEXT_PHASE", "phase-production-build");

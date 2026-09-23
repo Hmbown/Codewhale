@@ -1,5 +1,8 @@
 # MCP (External Tool Servers)
 
+In the terminal, `/mcp` (also `/mcps`) opens **Extensions → MCP**. Enter opens the selected server’s recovery action or read-only details. An empty inventory offers server suggestions; browsing them installs nothing. Explicit subcommands such as `/mcp status`, `/mcp doctor`, `/mcp login`, and `/mcp add` retain their existing behavior.
+
+
 > 阅读简体中文版：[zh_hans/MCP.md](zh_hans/MCP.md)
 
 codewhale can load additional tools via MCP (Model Context Protocol). MCP servers can be local stdio processes that the TUI starts, or remote URL-based servers that speak Streamable HTTP with legacy SSE fallback.
@@ -94,6 +97,12 @@ codewhale mcp remove <name>
 codewhale mcp validate
 ```
 
+`codewhale mcp logout <name>` (and `/mcp logout`) clears locally stored
+OAuth credentials only — the provider may keep its standing grant. The next
+login forces the consent screen, so the authorized account/workspace can
+change; to sever the grant remotely, revoke the app from the provider's
+account settings.
+
 ## In-TUI Manager
 
 Inside the interactive TUI, `/mcp` opens a compact manager for the resolved
@@ -138,7 +147,7 @@ diagnostic surfaces:
 | --- | --- | --- | --- | --- |
 | Chrome DevTools | MCP server (stdio) | `npx -y chrome-devtools-mcp@1.7.0` (`npx.cmd` on Windows) | [Official ChromeDevTools project](https://github.com/ChromeDevTools/chrome-devtools-mcp) | npm may download the pinned package when the user restarts MCP. |
 | Playwright | MCP server (stdio) | `npx -y @playwright/mcp@0.0.79 --isolated` (`npx.cmd` on Windows) | [Official Microsoft project](https://github.com/microsoft/playwright-mcp) | `--isolated` starts a fresh browser profile; npm may download the pinned package only after an explicit restart. |
-| Cua Computer Use | MCP server (stdio) | `cua-driver mcp`; Driver `0.20.0` reviewed for this release | [Official Cua project](https://github.com/trycua/cua); preview integration | The signed driver and OS permissions are separate, explicit installs. `/mcp add recommended cua` only writes config and never installs or grants either. |
+| Computer Use | First-party plugin (MCP + skill) | Ships in the binary as the `computer-use` plugin | Codewhale; enable through `/plugin` or the Extensions marketplace | This is the only computer-use integration Codewhale recommends. Third-party desktop-control MCPs are not listed here. |
 | Browser Use | Skill plus separately installed Python runtime | Skill/runtime release `0.13.8` | [Official browser-use project](https://github.com/browser-use/browser-use) | Optional companion: not an MCP server. Codewhale does not auto-run the upstream Skill installer or install its browser/runtime dependencies. |
 | Anthropic Sandbox Runtime | Sandbox adapter companion | `@anthropic-ai/sandbox-runtime@0.0.73` | [Official anthropic-experimental project](https://github.com/anthropic-experimental/sandbox-runtime); beta | Documentation-only adapter candidate in v0.9.10: not an MCP server and not an active Codewhale plugin adapter. It does not replace Codewhale's sandbox policy. |
 
@@ -462,6 +471,17 @@ After adding, test the connection:
 codewhale mcp validate
 codewhale mcp tools codewhale
 ```
+
+## Connection Lifecycle
+
+Session boot is lazy (#6033): a configured server is not spawned until
+something asks for it — a turn whose `allowed_tools`/`tools.always_load`
+selection covers its `mcp_<server>_*` names, a model call that resolves to
+one of its tools, or an explicit `/mcp` connect/retry. Servers marked
+`required` still connect eagerly at boot so their failure surfaces before the
+first turn. A configured-but-unstarted server shows as `configured`, never
+`connecting`; the connecting label only describes handshakes actually in
+flight.
 
 ## Server Fields
 

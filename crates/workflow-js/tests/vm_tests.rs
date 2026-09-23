@@ -2426,3 +2426,92 @@ async fn the_dropped_slot_breadcrumb_names_the_kind_and_the_slot() {
         driver.events()
     );
 }
+
+struct EchoInvoker;
+
+#[async_trait::async_trait]
+impl codewhale_workflow_js::ToolInvoker for EchoInvoker {
+    async fn invoke(
+        &self,
+        request: codewhale_workflow_js::ToolCallRequest,
+    ) -> Result<codewhale_workflow_js::ToolCallResponse, codewhale_workflow_js::DriverError> {
+        use codewhale_workflow_js::{DriverError, ToolCallResponse};
+        if request.tool == "boom" {
+            return Ok(ToolCallResponse {
+                ok: false,
+                result: json!("kaput"),
+            });
+        }
+        if request.tool == "deny" {
+            return Err(DriverError::Rejected("nope".to_string()));
+        }
+        Ok(ToolCallResponse {
+            ok: true,
+            result: json!({ "echo": request.input }),
+        })
+    }
+}
+
+async fn run_tools(source: &str) -> Result<serde_json::Value, WorkflowJsError> {
+    let driver = Arc::new(FakeDriver::new());
+    WorkflowVm::new()
+        .run_tools_script(
+            source,
+            json!(null),
+            driver.clone() as Arc<dyn codewhale_workflow_js::WorkflowDriver>,
+            Arc::new(EchoInvoker) as Arc<dyn codewhale_workflow_js::ToolInvoker>,
+            WorkflowRunCancel::new(),
+        )
+        .await
+}
+
+#[tokio::test]
+async fn tools_surface_is_absent_without_invoker() {
+    let driver = Arc::new(FakeDriver::new());
+    let value = run(&driver, "return typeof tools;", json!(null))
+        .await
+        .unwrap();
+    assert_eq!(value, json!("undefined"));
+}
+
+#[tokio::test]
+async fn tools_call_round_trips() {
+    let value =
+        run_tools(r#"const r = await tools.call("read", { path: "x" }); return r.echo.path;"#)
+            .await
+            .unwrap();
+    assert_eq!(value, json!("x"));
+}
+
+#[tokio::test]
+async fn tools_call_refusal_throws_admission_kind() {
+    let value = run_tools(
+        r#"try { await tools.call("deny", {}); return "no-throw"; } catch (e) { return e.kind; }"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(value, json!("admission"));
+}
+
+#[tokio::test]
+async fn tools_call_failure_throws_agent_kind() {
+    let value = run_tools(
+        r#"try { await tools.call("boom", {}); return "no-throw"; } catch (e) { return e.kind; }"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(value, json!("agent"));
+}
+
+#[tokio::test]
+async fn tools_call_cap_rejects_runaway_loops() {
+    let err = run_tools(
+        r#"for (let i = 0; i < 55; i++) { await tools.call("read", {}); } return "never";"#,
+    )
+    .await;
+    let message = script_message(err);
+    assert!(
+        message.contains("per-run tool-call cap"),
+        "unexpected: {message}"
+    );
+}

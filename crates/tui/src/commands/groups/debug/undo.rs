@@ -117,7 +117,7 @@ pub(crate) fn prune_undone_tool_context(app: &mut App, tool_id: &str) {
             .map(|(msg, stamp)| (msg.clone(), stamp))
             .collect();
     app.truncate_api_messages(msg_idx + 1);
-    app.api_messages[msg_idx].content = kept_blocks;
+    app.api_messages_mut()[msg_idx].content = kept_blocks;
     for (message, stamp) in preserved_tool_results {
         app.push_api_message_stamped(message, stamp);
     }
@@ -284,7 +284,7 @@ pub fn patch_undo(app: &mut App) -> CommandResult {
         summary,
         AppAction::SyncSession {
             session_id: app.current_session_id.clone(),
-            messages: app.api_messages.clone(),
+            messages: app.api_messages.as_ref().clone(),
             system_prompt: app.system_prompt.clone(),
             model: app.model.clone(),
             workspace: app.workspace.clone(),

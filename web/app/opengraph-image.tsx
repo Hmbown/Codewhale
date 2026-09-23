@@ -14,7 +14,7 @@ export const contentType = "image/png";
 // regeneration on the site fail with a 500 and serve its build snapshot forever.
 async function brandSvgs(): Promise<[string, string]> {
   const [mark, wordmark] = await Promise.all([
-    readFile(join(process.cwd(), "public/brand/mark.svg")),
+    readFile(join(process.cwd(), "public/brand/mark-reversed.svg")),
     readFile(join(process.cwd(), "public/brand/wordmark-inverted.svg")),
   ]);
   return [mark.toString().replace("currentColor", "#ffffff"), wordmark.toString()];
@@ -43,8 +43,8 @@ export default async function OpengraphImage() {
         }}
       >
         <img src={markDataUrl} width={200} height={200} alt="" />
-        {/* The traced wordmark is 1874x264 (~7.1:1). */}
-        <img src={wordmarkDataUrl} width={532} height={75} alt="Codewhale" />
+        {/* The family wordmark is 1024x160 (6.4:1). */}
+        <img src={wordmarkDataUrl} width={532} height={83} alt="Codewhale" />
         <div style={{ display: "flex", fontSize: 30, color: "#F6F2E8", marginTop: 14 }}>
           {IDENTITY_PHRASE}
         </div>

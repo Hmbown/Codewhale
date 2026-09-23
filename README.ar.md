@@ -1,11 +1,11 @@
-<!-- source: README.md sha256:a446e3921085 -->
+<!-- source: README.md sha256:29c349b6f2b4 -->
 # Codewhale
 
 Codewhale وكيل مفتوح المصدر يقرأ مشروعك ويعدّل الملفات ويشغّل الأوامر ويتحقق من عمله باستخدام نموذج مستضاف أو محلي تختاره. ابدأ بمهمة واحدة في الطرفية. وللأعمال الأكبر، وزّع أجزاء العمل على وكلاء بنماذج وأدوار مختلفة.
 
-![Codewhale يعمل في طرفية](web/public/codewhale-tui-171acee.png)
+![Codewhale يعمل في طرفية](web/public/codewhale-tui-d7a9a1c.png)
 
-*معاينة للطرفية من بنية تطوير للإصدار v0.9.12.*
+*معاينة للطرفية من بنية تطوير للإصدار v0.10.0.*
 
 [English](README.md) · [简体中文](README.zh-CN.md) · [日本語](README.ja-JP.md) · [Tiếng Việt](README.vi.md) · [Bahasa Indonesia](README.id.md) · [한국어](README.ko-KR.md) · [Español](README.es-419.md) · [Português](README.pt-BR.md) · [Русский](README.ru.md) · [Українська](README.uk.md) · [Français](README.fr.md) · [Deutsch](README.de.md) · [繁體中文](README.zh-TW.md) · [हिन्दी](README.hi.md) · [Türkçe](README.tr.md) · [Italiano](README.it.md) · [Polski](README.pl.md) · [Català](README.ca.md)
 
@@ -53,7 +53,7 @@ codewhale exec "fix the failing tests and explain what changed"
 
 - **الطرفية:** يفتح `codewhale` الواجهة التفاعلية؛ ويشغّل `codewhale exec` مهمة من برنامج نصي أو مهمة CI.
 - **المتصفح المحلي:** يفتح `codewhale web` [عميل الويب المحلي](docs/WEB.md) المرفق، والمتصل ببيئة التشغيل نفسها.
-- **تطبيقات Codewhale للويب وسطح المكتب:** بيئات عمل رسومية قيد التطوير. تُدرج معلومات توفرها في [صفحة المنتج](https://codewhale.net/en/product).
+- **تطبيق Codewhale لسطح المكتب (GPUI):** تطبيق سطح المكتب الأصلي GPUI هو اتجاه عميل المنتج (قرار بتاريخ 2026-09-14؛ خريطة المراحل في docs/TRANSITION.md ضمن المستودع الخاص codehwhale-gpui). يتوقف تطبيق الويب المستضاف على app.codewhale.net على مراحل؛ ويبقى موقع التسويق وتسجيل الدخول والفوترة والصفحات القانونية وصفحات التنزيل على الويب بشكل دائم. تُدرج معلومات توفره في [صفحة المنتج](https://codewhale.net/en/product).
 
 **يضيف Computer Use أدوات لمراقبة التطبيقات الأخرى والتفاعل معها.** الإضافة مضمنة في الشيفرة المصدرية الحالية. راجع صلاحيات الوصول التي تطلبها وفعّلها قبل الاستخدام؛ وتظل أذونات نظام التشغيل ومتطلبات المنصة سارية. راجع [دليل Computer Use](crates/tui/plugins/computer-use/README.md) المرفق و[إعداد الإضافات](docs/PLUGINS.md).
 

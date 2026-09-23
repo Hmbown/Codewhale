@@ -123,12 +123,7 @@ pub(super) fn compact_row(manager: &SubAgentManager, agent: &SubAgent) -> Value 
         object.insert("max_spawn_depth".into(), json!(record.spec.max_spawn_depth));
         if let Ok(profile) = serde_json::to_value(&record.spec.runtime_profile) {
             let mut limits = serde_json::Map::new();
-            for key in [
-                "max_steps",
-                "token_budget",
-                "wall_time_secs",
-                "wall_deadline_ms",
-            ] {
+            for key in ["max_steps", "wall_time_secs", "wall_deadline_ms"] {
                 if let Some(value) = profile.get(key) {
                     limits.insert(key.to_string(), value.clone());
                 }
@@ -142,8 +137,7 @@ pub(super) fn compact_row(manager: &SubAgentManager, agent: &SubAgent) -> Value 
             "usage".into(),
             json!({
                 "input_tokens": usage.input_tokens, "output_tokens": usage.output_tokens,
-                "total_tokens": usage.total_tokens, "token_budget": usage.token_budget,
-                "budget_remaining_tokens": usage.budget_remaining_tokens,
+                "total_tokens": usage.total_tokens,
             }),
         );
         object.insert("last_activity_ms".into(), json!(record.updated_at_ms));
@@ -185,6 +179,51 @@ pub(super) fn compact_row(manager: &SubAgentManager, agent: &SubAgent) -> Value 
                 "child_route".into(),
                 compact_child_route(serde_json::to_value(route).unwrap_or(Value::Null)),
             );
+        }
+        // #6194 item 5: live declared-vs-observed write surfacing. The child
+        // declares deliverables at spawn and the registry records every
+        // successful scoped write; the parent sees the diff while the child
+        // is still alive instead of only in the post-mortem receipt.
+        if record.spec.runtime_profile.permissions.write {
+            const MAX_LISTED_WRITES: usize = 4;
+            let declared: Vec<String> = record
+                .spec
+                .launch_manifest
+                .as_ref()
+                .map(|manifest| {
+                    manifest
+                        .deliverables
+                        .iter()
+                        .take(MAX_LISTED_WRITES)
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_default();
+            let declared_total = record
+                .spec
+                .launch_manifest
+                .as_ref()
+                .map(|manifest| manifest.deliverables.len())
+                .unwrap_or(0);
+            let observed: Vec<String> = record
+                .delivery_evidence
+                .observed_writes
+                .iter()
+                .take(MAX_LISTED_WRITES)
+                .cloned()
+                .collect();
+            let observed_total = record.delivery_evidence.observed_writes.len();
+            if declared_total > 0 || observed_total > 0 {
+                object.insert(
+                    "write_progress".into(),
+                    json!({
+                        "declared": declared,
+                        "declared_total": declared_total,
+                        "observed": observed,
+                        "observed_total": observed_total,
+                    }),
+                );
+            }
         }
     }
     if let Some(source) = manager.continuation_source(&agent.id) {

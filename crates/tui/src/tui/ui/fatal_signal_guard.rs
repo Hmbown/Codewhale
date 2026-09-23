@@ -37,7 +37,7 @@
 /// over that a shell does not self-heal are the ones that poison input:
 /// mouse capture and the kitty keyboard stack get the full reset.
 #[cfg(unix)]
-const FATAL_RESTORE_BYTES: &[u8] = concat!(
+pub(crate) const FATAL_RESTORE_BYTES: &[u8] = concat!(
     "\x1b[?2026l", // close any open DEC 2026 synchronized-update batch
     "\x1b[<1u",    // pop one kitty keyboard-enhancement stack level
     "\x1b[?1007l", // alternate scroll off
@@ -68,6 +68,7 @@ pub(crate) fn install_fatal_signal_guard() {
     #[cfg(unix)]
     {
         // Piped/embedded surfaces must never receive escape bytes.
+        // SAFETY: isatty(2) dereferences no pointers.
         if unsafe { libc::isatty(libc::STDOUT_FILENO) } == 0 {
             tracing::debug!("Fatal-signal terminal guard skipped: stdout is not a TTY");
             return;
@@ -90,6 +91,7 @@ pub(crate) fn install_fatal_signal_guard() {
             }
         }
         for signal in [libc::SIGABRT, libc::SIGBUS, libc::SIGILL, libc::SIGFPE] {
+            // SAFETY: ABRT/BUS/ILL/FPE all terminate by default.
             unsafe { install_handler(signal) };
         }
         tracing::debug!("Fatal-signal terminal guard installed (ABRT/BUS/ILL/FPE)");
@@ -112,6 +114,7 @@ pub(crate) fn install_fatal_signal_guard() {
 /// exists and are never written again).
 #[cfg(unix)]
 unsafe extern "C" fn fatal_signal_handler(signal: libc::c_int) {
+    // SAFETY: signal-safe syscalls only, per the contract above.
     unsafe {
         // 1. Restore the terminal: stdout first, stderr as fallback.
         let mut written: usize = 0;
@@ -188,6 +191,7 @@ unsafe extern "C" fn fatal_signal_handler(signal: libc::c_int) {
 /// `signal` must be a fatal signal whose default action is to terminate.
 #[cfg(unix)]
 unsafe fn install_handler(signal: libc::c_int) {
+    // SAFETY: `action` is live and zeroed; oldact is null.
     unsafe {
         // Zero the whole struct then set our two fields: the remaining
         // members (empty signal mask; any hidden per-OS plumbing like the
@@ -220,6 +224,18 @@ mod tests {
                 "fatal restore must reset {mode}; got: {bytes:?}"
             );
         }
+    }
+
+    #[test]
+    fn job_control_guard_reuses_the_fatal_restore_bytes() {
+        // #6169: the SIGTSTP/SIGTTIN stop handler must not grow a second byte
+        // table. One teardown string is written on both the death and the
+        // suspend path, so a mode cannot be reverted on one and leaked by the
+        // other.
+        assert_eq!(
+            super::super::job_control_guard::SUSPEND_RESTORE_BYTES,
+            FATAL_RESTORE_BYTES
+        );
     }
 
     #[test]

@@ -250,6 +250,14 @@ impl HttpTransport {
 
 #[async_trait::async_trait]
 impl McpTransport for HttpTransport {
+    fn set_protocol_version(&mut self, version: &str) {
+        // Only Streamable HTTP carries the MCP-Protocol-Version header; the
+        // legacy SSE transport predates it and ignores the negotiation result.
+        if let HttpTransportMode::Streamable(transport) = &mut self.mode {
+            transport.set_protocol_version(version);
+        }
+    }
+
     async fn send(&mut self, msg: Vec<u8>) -> Result<()> {
         match &mut self.mode {
             HttpTransportMode::Streamable(transport) => match transport.send(msg.clone()).await {

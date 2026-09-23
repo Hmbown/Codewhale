@@ -107,7 +107,7 @@ async fn roster_preserves_unknown_and_non_metered_costs_and_invalid_role_errors(
         selected.api_key = Some("roster-private-fixture-key".into());
         selected.model = Some(model.into());
         selected.vendor = vendor.map(str::to_string);
-        let client = DeepSeekClient::new(&config).unwrap();
+        let client = CodewhaleClient::new(&config).unwrap();
         let manager = new_shared_subagent_manager(root.path().to_path_buf(), 1);
         let runtime = SubAgentRuntime::new(
             client,
@@ -852,10 +852,10 @@ async fn fleet_editor_save_reload_reaches_type_only_admission_without_a_model_re
 
     // Restart from the ordinary file loader; no old UI state or runtime roster survives.
     let reloaded = crate::config::Config::load(Some(config_path), None).unwrap();
-    let client = DeepSeekClient::new(&reloaded).unwrap();
+    let client = CodewhaleClient::new(&reloaded).unwrap();
     let manager = new_shared_subagent_manager(root.path().to_path_buf(), 1);
     let gate = manager.read().await.launch_gate.clone();
-    let held_permit = gate.acquire_owned().await.unwrap();
+    let held_permit = gate.acquire().await;
     let (mailbox, mut mailbox_rx) = Mailbox::new(CancellationToken::new());
     let context = ToolContext::new(root.path()).with_state_namespace("fleet-editor-restarted");
     let mut runtime = SubAgentRuntime::new(
@@ -967,10 +967,10 @@ model = "deepseek-v4-pro"
     let overrides = config.subagent_model_overrides();
     assert_eq!(overrides["reviewer"].model, "deepseek-v4-pro");
     assert_eq!(overrides["reviewer"].provider, None);
-    let client = DeepSeekClient::new(&config).unwrap();
+    let client = CodewhaleClient::new(&config).unwrap();
     let manager = new_shared_subagent_manager(root.path().to_path_buf(), 1);
     let gate = manager.read().await.launch_gate.clone();
-    let held_permit = gate.acquire_owned().await.unwrap();
+    let held_permit = gate.acquire().await;
     let (mailbox, mut mailbox_rx) = Mailbox::new(CancellationToken::new());
     let context = ToolContext::new(root.path()).with_state_namespace("manual-role-restarted");
     let mut runtime = SubAgentRuntime::new(
@@ -1151,10 +1151,10 @@ model = "deepseek/deepseek-v4-flash"
             config.provider_identity_for(config.api_provider()),
             parent_provider
         );
-        let client = DeepSeekClient::new(&config).unwrap();
+        let client = CodewhaleClient::new(&config).unwrap();
         let manager = new_shared_subagent_manager(root.path().to_path_buf(), 1);
         let gate = manager.read().await.launch_gate.clone();
-        let held_permit = gate.acquire_owned().await.unwrap();
+        let held_permit = gate.acquire().await;
         let (mailbox, mut mailbox_rx) = Mailbox::new(CancellationToken::new());
         let context = ToolContext::new(root.path()).with_state_namespace(name);
         let mut runtime = SubAgentRuntime::new(

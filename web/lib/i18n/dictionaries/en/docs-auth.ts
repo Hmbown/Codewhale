@@ -31,7 +31,7 @@ export const docsAuth: DocsAuthDict = {
   ],
   storageTitle: "Where sessions live",
   storageLead:
-    "Account sessions prefer the operating system's credential manager and fall back automatically to the private, 0600 Codewhale secrets file when no credential manager is available — headless hosts, SSH, containers. The former {fileStoreEnv} opt-in is deprecated and ignored.",
+    "Account sessions prefer the operating system's credential manager and fall back automatically to the private, 0600 Codewhale secrets file when no credential manager is available — headless hosts, SSH, containers.",
   vaultTitle: "The account's own key vault",
   vaultLead:
     "{keys} manages the signed-in account's bring-your-own-key vault without ever displaying a secret value.",

@@ -27,7 +27,7 @@ existing workspaces, receipts, or scripts:
 - the durable ledger `.codewhale/fleet.jsonl` and the log directories
   `.codewhale/fleet/` and `.codewhale/fleet-host/`;
 - saved rosters `fleets/<name>.toml` and their `schema = "fleet"` header;
-- the `[fleet]` and `[fleets.*]` config tables;
+- the `[fleet]` config table (inline `[fleets.*]` tables were removed in 0.9.14; named fleets live in `fleets/<name>.toml` files);
 - the `codewhale workflow run --fleet <name>` flag;
 - wire, receipt, and control-plane operation ids such as `fleet.status`.
 
@@ -123,6 +123,10 @@ requirements belong on executable role members and are refused on shortlist rows
 - `/fleet add <provider> <model> [role…]` adds a model (one member row per
   role, or one `shortlist = true` row for a role-less add). The provider must be one you configured
   and, when the catalog knows the provider, must serve that exact id.
+  A role member asked to run the fleet's own operator route inherits it
+  instead of pinning — the role follows when the operator moves; a pin on
+  any other route is the deliberate opt-out. Files that already pin the
+  operator route are read as inheritance.
   With no fleet selected, a user-global fleet named `My fleet` is created and
   selected first. `/fleet remove <provider> <model>` drops every row that pins
   the route; the operator route is changed with `/fleet save`, not removed.
@@ -163,14 +167,14 @@ have their own name:
   silently do a smaller thing — it reports `surface_not_supported` and names
   the CLI command.
 
-Before v0.9.2, `/fleet status` showed session sub-agents. That reading is gone;
-`/fleet workers` replaces it.
-
 The contract behind this — descriptors, availability reasons, exact-identity
 targets, receipts, typed unknowns, and bounds — is documented in
 [`docs/COMMAND_CONTROL_PLANE.md`](COMMAND_CONTROL_PLANE.md).
 
 ## Authoring agent profiles (`/fleet setup`)
+
+Agents: the durable artifact is the profile TOML described below; the
+key-by-key walkthrough is the human interactive path.
 
 `/fleet setup` (also `/fleet setup edit` / `new`) opens an in-TUI wizard for
 authoring a reusable agent-team profile. Bare `/fleet` and the
@@ -192,8 +196,7 @@ every step — the choice you still have to make, or the exact resolved file
 once you have made it. Nothing is written until you activate the save control
 on the review step.
 
-The **Destination** step is a focused two-option list (arrows move, Enter or
-Space chooses; Tab never changes the destination):
+The **Destination** step is a focused two-option list:
 
 - **This project** writes `<workspace>/.codewhale/agents/<role>.toml`. It
   applies to this project only and takes precedence over a Personal profile
@@ -210,12 +213,10 @@ create a new file or **replace an existing one**, and the precedence
 consequence for the roster. The review step repeats those facts under
 "Saves to" and names the final action by its effect — **Save to this
 project**, **Save as Personal profile**, or **Replace …**. Replacing an
-existing file needs a second Enter on the save control. Tab / Shift+Tab (or
-←/→) move focus between the save control, **Change destination**, and
-**Back**; `s` is a secondary shortcut back to the Destination step. Reopening a
+existing file asks for a second confirmation on the save control. Reopening a
 saved member from `/fleet` starts from what is on disk: its member identity,
 route, and save scope. Thinking (`inherit`, `off`, `low`, `medium`, `high`,
-`max`, or `auto`) is adjusted on the review step with `t`, but remains a route
+`max`, or `auto`) is adjusted on the review step, but remains a route
 execution setting rather than part of the member's fleet identity.
 
 Profile scope controls where a role definition is reusable; it does not widen
@@ -240,13 +241,12 @@ user-named OpenAI-compatible provider configured under `[providers.<name>]`
 such as `lm-studio`; the launch path preserves that id and fails closed if the
 provider is not configured.
 
-Profiles are also how the model-facing `agent` tool selects a route since the
-v0.9.9 schema slim (#5324, #5123): the advertised surface no longer carries
-`model` or `thinking` — a child either runs as a `profile` (whose saved route
-and thinking tier it uses exactly) or inherits the operator's model. Removed
-fields stay parse-accepted for saved transcripts, ACP/MCP clients and fleet
-configs; see docs/SUBAGENTS.md for the advertised 12-field list and the
-compat list.
+Profiles are also how the model-facing `agent` tool selects a route: a child
+either runs as a `profile` (whose saved route and thinking tier it uses
+exactly) or inherits the operator's model. Per-task `model`, `model_strength`,
+and `thinking` remain advertised for unpinned roles; saved profile and manual
+role pins refuse overrides. See docs/SUBAGENTS.md for the advertised field
+list and the parse-accepted compat list.
 
 When a provider is configured, the review step also offers model-assisted
 drafting behind an explicit preview-before-save gate:
@@ -340,7 +340,7 @@ model = "gpt-5.6"
 ```
 
 The workflow crate's older `schema = "exact"`, revision 1 files are migration
-input only. Do not author them for v0.9.11; the selected roster and setup UI
+input only. Do not author revision-1 files; the selected roster and setup UI
 read and write only `schema = "fleet"`, revision 2.
 
 Reasoning is a separate route-execution decision, not fleet identity. The
@@ -391,7 +391,7 @@ call actually carries is spelled by that route's own normalizer, not by the tier
 label: an OpenAI Codex route is asked for `xhigh`, not `max`, and cannot be
 asked for `off` at all.
 
-A v0.9.11 durable fleet CLI receipt keeps the selected profile id in
+A durable fleet CLI receipt keeps the selected profile id in
 `effective_permissions.profile_id`, the resolved semantic role in
 `resolved_route.role`, and the effective Runtime surface in the permission,
 shell, and tool-scope fields. An exact Workflow launch receipt records
@@ -413,8 +413,8 @@ happened.
 
 ## Manager-owned Workflow fan-in
 
-When parallel work must return one combined answer, use a manager-owned
-Workflow instead of a flat `agent` fan-out:
+When parallel work must return one combined answer, prefer a manager-owned
+Workflow over a flat `agent` fan-out. Default shape:
 
 1. **Cast one manager** (operator or workflow orchestrator).
 2. **Fan out** child tasks through `workflow` (`task()`, `parallel()`,
@@ -423,9 +423,10 @@ Workflow instead of a flat `agent` fan-out:
 4. **Aggregate and verify** load-bearing claims before treating them as facts.
 5. **Synthesize** one result the operator can depend on.
 
-Raw `agent` fan-out is appropriate only for independent, fire-and-forget work
-where no single fan-in result is required. If results must be merged, compared,
-or verified, route through `workflow` so the manager owns fan-in.
+Raw `agent` fan-out fits independent work with no combined result. When
+results must be merged, compared, or verified, route through `workflow` so
+the manager owns fan-in — that is what the shape above is for, not a ban
+on simpler patterns when nothing needs combining.
 
 ## Workflow on fleet
 
@@ -511,7 +512,9 @@ or Runtime inputs applied after the member is resolved. A task can declare:
 
 None of those execution-policy fields becomes part of a fleet identity or an
 alternate member selector. Omitted or zero `max_steps` means no model-step
-ceiling; Codewhale must not synthesize a default step budget. Explicit positive
+ceiling; Codewhale must not synthesize a default step budget. (This is the
+fleet file task-spec convention; model-facing `agent` calls differ — the tool
+parser rejects an explicit zero. See `docs/SUBAGENTS.md`.) Explicit positive
 step limits, timeouts, cancellation, provider safeguards, heartbeats, and
 admission control are enforced independently by the delegated coordinator and
 Runtime.

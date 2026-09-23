@@ -49,7 +49,7 @@ use windows::Win32::System::Console::{GetConsoleMode, GetStdHandle, SetConsoleMo
 use crate::audit::log_sensitive_event;
 use crate::automation_manager::{AutomationManager, AutomationSchedulerConfig, spawn_scheduler};
 use crate::client::{
-    CACHE_WARMUP_MAX_TOKENS, CacheWarmupKey, DeepSeekClient, PromptInspection,
+    CACHE_WARMUP_MAX_TOKENS, CacheWarmupKey, CodewhaleClient, PromptInspection,
     build_cache_warmup_request, inspect_prompt_for_request,
 };
 use crate::commands;
@@ -90,7 +90,7 @@ use crate::tui::composer_ui::*;
 use crate::tui::context_inspector::ContextInspectorView;
 use crate::tui::event_broker::EventBroker;
 use crate::tui::file_picker_relevance;
-use crate::tui::footer_ui::{friendly_subagent_progress, is_noisy_subagent_progress};
+use crate::tui::footer_ui::friendly_subagent_progress;
 use crate::tui::format_helpers;
 use crate::tui::hotbar::actions::HotbarDispatch;
 use crate::tui::key_shortcuts;
@@ -150,14 +150,14 @@ use super::approval::{
     ApprovalRequest, ApprovalView, ElevationRequest, ElevationView, ReviewDecision,
 };
 use super::history::{
-    ExecCell, HistoryCell, ReasoningAction, ToolCell, ToolStatus, history_cells_from_message,
-    summarize_tool_output,
+    ExecCell, HistoryCell, ReasoningAction, ThinkingFold, ToolCell, ToolStatus,
+    history_cells_from_message, summarize_tool_output,
 };
 use super::slash_menu::{
     apply_slash_menu_selection, partial_inline_skill_mention_at_cursor,
     try_autocomplete_slash_command, visible_slash_menu_entries,
 };
-use super::views::{ConfigView, ContextMenuAction, HelpView, ModalKind, ViewEvent};
+use super::views::{ConfigView, ContextMenuAction, HelpView, ModalKind, ViewAction, ViewEvent};
 use super::widgets::pending_input_preview::{ContextPreviewItem, PendingInputPreview};
 use super::widgets::{ChatWidget, ComposerWidget, Renderable};
 
@@ -507,7 +507,7 @@ async fn spawn_tui_engine_with_session(app: &mut App, config: &Config) -> Result
             handle
                 .send(Op::SyncSession {
                     session_id: app.current_session_id.clone(),
-                    messages: app.api_messages.clone(),
+                    messages: app.api_messages.as_ref().clone(),
                     system_prompt: app.system_prompt.clone(),
                     system_prompt_override: false,
                     model: app.model.clone(),
@@ -832,7 +832,7 @@ fn open_fleet_setup_target(app: &mut App, config: &Config, member_id: Option<&st
             if app.view_stack.top_kind() == Some(ModalKind::FleetDetail) {
                 return;
             }
-            let Some(view) = crate::tui::views::fleet_detail::FleetDetailView::open_for_member(
+            let Some(mut view) = crate::tui::views::fleet_detail::FleetDetailView::open_for_member(
                 app, config, &name, scope, member_id,
             ) else {
                 app.set_sticky_status(
@@ -844,7 +844,22 @@ fn open_fleet_setup_target(app: &mut App, config: &Config, member_id: Option<&st
                 return;
             };
             let fleet_name = crate::safe_label::SafeLabel::phrase(&name);
+            let picker = if member_id.is_some() {
+                let (editor_id, target) = view.direct_assignment();
+                let (role, scope) = view.assignment_context();
+                view.route_selection(editor_id, target).map(|selection| {
+                    crate::tui::model_picker::ModelPickerView::new_for_fleet_route(
+                        app, config, target, editor_id, selection,
+                    )
+                    .with_assignment_context(role, scope)
+                })
+            } else {
+                None
+            };
             app.view_stack.push(view);
+            if let Some(picker) = picker {
+                app.view_stack.push(picker);
+            }
             app.status_message = Some(format!(
                 "Editing selected team `{fleet_name}` ({}) — legacy profiles will not be changed.",
                 scope.label()
@@ -852,6 +867,30 @@ fn open_fleet_setup_target(app: &mut App, config: &Config, member_id: Option<&st
         }
         Ok(FleetSetupEditTarget::LegacyProfiles) => {
             if app.view_stack.top_kind() == Some(ModalKind::FleetSetup) {
+                return;
+            }
+            if let Some(member_id) = member_id {
+                match crate::tui::views::fleet_setup::FleetSetupView::new_for_route_assignment(
+                    app, config, member_id,
+                ) {
+                    Ok(view) => {
+                        if let ViewAction::Emit(ViewEvent::FleetProfileRoutePickRequested {
+                            editor_id,
+                        }) = view.route_pick_request()
+                            && let Some(selection) = view.route_selection(editor_id)
+                        {
+                            let (role, scope) = view.assignment_context();
+                            let picker =
+                                crate::tui::model_picker::ModelPickerView::new_for_fleet_profile(
+                                    app, config, editor_id, selection,
+                                )
+                                .with_assignment_context(role, scope);
+                            app.view_stack.push(view);
+                            app.view_stack.push(picker);
+                        }
+                    }
+                    Err(reason) => app.set_sticky_status(reason, StatusToastLevel::Error, None),
+                }
                 return;
             }
             let _ = app.next_draft_gen();
@@ -901,6 +940,10 @@ mod dispatch;
 mod dispatch_prepare;
 pub(crate) use dispatch_prepare::*;
 pub(crate) mod fatal_signal_guard;
+// #6169: runtime half of the foreground-ownership contract — restore on stop,
+// rebuild on continue. Sits next to the fatal guard because both write the same
+// teardown table.
+pub(crate) mod job_control_guard;
 mod motion;
 mod observer_hooks;
 mod provider_setup;
@@ -911,6 +954,9 @@ mod terminal;
 mod terminal_input;
 use remote_control_bridge::*;
 use terminal_input::*;
+// #6165: `external_editor` is a sibling of `ui`, and the pump pause now lives
+// inside its `with_suspended_tui` so no editor entry point can forget it.
+pub(crate) use terminal_input::pause_terminal_input_for_child;
 
 pub(crate) use dispatch::*;
 pub(crate) use motion::*;
@@ -2304,3 +2350,44 @@ fn completed_turn_cost_route_receipt(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+#[test]
+fn fleet_role_entry_opens_shared_picker_and_cancel_restores_parked_roster() {
+    use crate::tui::views::ModalView;
+    let _env = crate::test_support::lock_test_env();
+    let workspace = tempfile::tempdir().unwrap();
+    let config = Config::default();
+    let mut app = App::new(
+        crate::test_support::test_tui_options(workspace.path()),
+        &config,
+    );
+    app.view_stack
+        .push(crate::tui::views::fleet_roster::FleetRosterView::new(
+            &app, &config,
+        ));
+    open_fleet_setup_target(&mut app, &config, Some("manager"));
+    assert_eq!(app.view_stack.top_kind(), Some(ModalKind::ModelPicker));
+    let mut picker = app.view_stack.pop().unwrap();
+    let action = picker
+        .as_any_mut()
+        .downcast_mut::<crate::tui::model_picker::ModelPickerView>()
+        .unwrap()
+        .handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Esc,
+            crossterm::event::KeyModifiers::NONE,
+        ));
+    let ViewAction::EmitAndClose(ViewEvent::FleetAssignmentPickerDismissed { editor_id }) = action
+    else {
+        panic!("assignment cancel must identify its editor")
+    };
+    assert_eq!(app.view_stack.top_kind(), Some(ModalKind::FleetSetup));
+    handlers::dismiss_fleet_assignment(&mut app, editor_id);
+    assert_eq!(app.view_stack.top_kind(), Some(ModalKind::FleetRoster));
+    assert!(
+        !workspace
+            .path()
+            .join(".codewhale/agents/manager.toml")
+            .exists()
+    );
+}

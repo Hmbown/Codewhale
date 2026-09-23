@@ -351,7 +351,7 @@ impl FanoutCard {
     }
 
     /// Pre-seed worker slots when the fanout size is known up front.
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), expect(dead_code))]
     pub fn with_workers<I, S>(mut self, ids: I) -> Self
     where
         I: IntoIterator<Item = S>,
@@ -640,6 +640,14 @@ pub fn apply_to_delegate(card: &mut DelegateCard, msg: &MailboxMessage) -> bool 
     true
 }
 
+/// Known limitation: this still matches on message text, while the footer
+/// path keys off the structured `routine_wait` flag (#6290). The mailbox is
+/// a stable cross-crate (`protocol`) surface whose payloads may come from
+/// another binary, so this arm cannot assume the flag exists — and no
+/// in-crate producer sends routine waits here anyway (only "queued" and
+/// "running" texts), so threading the flag would change nothing. If a future
+/// producer sends routine waits over the mailbox, give `Progress` the flag
+/// and match on it here instead of extending this list.
 fn is_low_signal_progress(status: &str) -> bool {
     let status = status.trim().to_ascii_lowercase();
     status.contains("requesting model response")

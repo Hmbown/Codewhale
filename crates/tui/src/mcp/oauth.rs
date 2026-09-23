@@ -1616,6 +1616,11 @@ impl OauthLoginFlow {
             "resource",
             oauth_resource,
         );
+        // #6040: logout clears this machine's token only — the provider keeps
+        // its standing grant. Without a forced prompt the next login silently
+        // re-grants it (same account/workspace, no picker ever shown), so an
+        // explicit login could never change the authorized workspace.
+        let auth_url = append_query_param(&auth_url, "prompt", Some("consent"));
 
         Ok(Self {
             auth_url,
@@ -1674,13 +1679,21 @@ impl OauthLoginFlow {
                     )
                 })?
                 .context("OAuth callback was cancelled")?;
-            let OauthCallbackResult { code, state } = match callback {
+            let OauthCallbackResult {
+                code,
+                state,
+                issuer,
+            } = match callback {
                 CallbackResult::Success(callback) => callback,
                 CallbackResult::Error(error) => return Err(anyhow!(error)),
             };
 
+            // RFC 9207: servers that advertise
+            // `authorization_response_iss_parameter_supported` send `iss` on the
+            // redirect and rmcp requires it back; forward it so the callback binds
+            // to the discovered issuer instead of failing as "missing".
             self.oauth_state
-                .handle_callback(&code, &state)
+                .handle_callback_with_issuer(&code, &state, issuer.as_deref())
                 .await
                 .context("handling MCP OAuth callback")?;
 
@@ -1909,6 +1922,8 @@ async fn write_http_response(
 struct OauthCallbackResult {
     code: String,
     state: String,
+    /// RFC 9207 `iss` from the redirect, when the authorization server sends it.
+    issuer: Option<String>,
 }
 
 enum CallbackResult {
@@ -1933,6 +1948,7 @@ fn parse_oauth_callback(path: &str, expected_callback_path: &str) -> CallbackOut
 
     let mut code = None;
     let mut state = None;
+    let mut issuer = None;
     let mut error = None;
     let mut error_description = None;
     for pair in query.split('&') {
@@ -1946,6 +1962,7 @@ fn parse_oauth_callback(path: &str, expected_callback_path: &str) -> CallbackOut
         match key {
             "code" => code = Some(decoded),
             "state" => state = Some(decoded),
+            "iss" => issuer = Some(decoded),
             "error" => error = Some(decoded),
             "error_description" => error_description = Some(decoded),
             _ => {}
@@ -1953,7 +1970,11 @@ fn parse_oauth_callback(path: &str, expected_callback_path: &str) -> CallbackOut
     }
 
     if let (Some(code), Some(state)) = (code, state) {
-        return CallbackOutcome::Success(OauthCallbackResult { code, state });
+        return CallbackOutcome::Success(OauthCallbackResult {
+            code,
+            state,
+            issuer,
+        });
     }
     if error.is_some() || error_description.is_some() {
         return CallbackOutcome::Error(OAuthProviderError::new(error, error_description));
@@ -2251,7 +2272,33 @@ mod tests {
     #[test]
     fn parse_oauth_callback_accepts_success() {
         let parsed = parse_oauth_callback("/callback/id?code=abc&state=xyz", "/callback/id");
-        assert!(matches!(parsed, CallbackOutcome::Success(_)));
+        assert_eq!(
+            parsed,
+            CallbackOutcome::Success(OauthCallbackResult {
+                code: "abc".to_string(),
+                state: "xyz".to_string(),
+                issuer: None,
+            })
+        );
+    }
+
+    #[test]
+    fn parse_oauth_callback_keeps_rfc9207_issuer() {
+        // Cloudflare's MCP authorization server advertises
+        // authorization_response_iss_parameter_supported and sends `iss` back;
+        // dropping it makes rmcp reject the callback as missing a required issuer.
+        let parsed = parse_oauth_callback(
+            "/callback/id?code=abc&state=xyz&iss=https%3A%2F%2Fmcp.cloudflare.com",
+            "/callback/id",
+        );
+        assert_eq!(
+            parsed,
+            CallbackOutcome::Success(OauthCallbackResult {
+                code: "abc".to_string(),
+                state: "xyz".to_string(),
+                issuer: Some("https://mcp.cloudflare.com".to_string()),
+            })
+        );
     }
 
     #[test]
@@ -2637,6 +2684,49 @@ mod tests {
                 .evaluate("127.0.0.1", "mcp"),
             crate::network_policy::Decision::Deny
         );
+        drop(login);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn interactive_login_forces_the_consent_screen() {
+        use crate::mcp::{AuthenticateToolStart, McpConfig, McpPool};
+        use crate::network_policy::{DecisionToml, NetworkPolicy};
+        let _env = crate::test_support::lock_test_env();
+        let dir = tempfile::tempdir().unwrap();
+        let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", dir.path());
+        let _backend = crate::test_support::EnvVarGuard::set("CODEWHALE_SECRET_BACKEND", "file");
+        let _proxy = crate::test_support::EnvVarGuard::set("NO_PROXY", "*");
+        let (url, _, task) = guarded_oauth_fixture(None, false).await;
+        let server: McpServerConfig =
+            serde_json::from_value(serde_json::json!({"url":url})).unwrap();
+        let allowed = NetworkPolicyDecider::new(
+            NetworkPolicy {
+                default: DecisionToml::Allow,
+                ..NetworkPolicy::default()
+            },
+            None,
+        );
+        let mut config = McpConfig::default();
+        config.servers.insert("consent-probe".to_string(), server);
+        let pool = McpPool::new(config).with_network_policy(allowed);
+        let AuthenticateToolStart::Login(login) =
+            pool.begin_authenticate_tool("consent-probe").await.unwrap()
+        else {
+            panic!("a fresh server must start an interactive login");
+        };
+
+        // #6040: logout only clears this machine's token; the provider keeps
+        // its standing grant, so the login URL must force the consent screen
+        // or the same account/workspace is silently re-granted.
+        // The URL carries the PKCE challenge and state, so the assertion
+        // message reports only the fact that is being checked, never the URL.
+        let forces_consent = login.authorization_url().contains("prompt=consent");
+        assert!(
+            forces_consent,
+            "an interactive login must force consent (prompt=consent is missing from the authorization URL)"
+        );
+
         drop(login);
         task.abort();
     }

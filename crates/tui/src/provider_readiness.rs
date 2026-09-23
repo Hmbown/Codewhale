@@ -67,7 +67,7 @@ pub(crate) fn route_identity_for_model(
         provider.as_str()
     };
     let endpoint = if provider == config.api_provider() {
-        config.deepseek_base_url()
+        config.active_route_base_url()
     } else {
         configured
             .and_then(|entry| entry.base_url.as_deref())
@@ -156,7 +156,7 @@ pub(crate) fn credential_state_for_provider(
     // provider enum.
     if provider == config.api_provider()
         && !official_endpoint
-        && crate::config::base_url_uses_local_host(&config.deepseek_base_url())
+        && crate::config::base_url_uses_local_host(&config.active_route_base_url())
     {
         return if api_key_required {
             if crate::config::has_api_key_for(config, provider) {
@@ -381,7 +381,7 @@ pub(crate) fn route_is_valid_for_model(
         model_selector: configured_model.or(active_model).map(LogicalModelRef::from),
         saved_provider_model: None,
         base_url_override: if provider == config.api_provider() {
-            Some(config.deepseek_base_url())
+            Some(config.active_route_base_url())
         } else if provider == ApiProvider::Custom && config.uses_legacy_literal_custom_route() {
             config
                 .base_url
@@ -1517,7 +1517,7 @@ mod tests {
             credential_state_for_provider(&missing, ApiProvider::Vllm),
             CredentialState::MissingKey
         );
-        assert!(missing.deepseek_api_key().is_err());
+        assert!(missing.active_route_api_key().is_err());
 
         let mut configured = missing.clone();
         configured
@@ -1531,7 +1531,7 @@ mod tests {
             CredentialState::Saved
         );
         assert_eq!(
-            configured.deepseek_api_key().expect("configured key"),
+            configured.active_route_api_key().expect("configured key"),
             "protected-local-key"
         );
 
@@ -1556,7 +1556,7 @@ mod tests {
             credential_state_for_provider(&named_custom, ApiProvider::Custom),
             CredentialState::MissingKey
         );
-        assert!(named_custom.deepseek_api_key().is_err());
+        assert!(named_custom.active_route_api_key().is_err());
     }
 
     #[test]
@@ -1771,7 +1771,7 @@ default_text_model = "deepseek-chat"
         let config = crate::config::Config::load(Some(config_path), None).expect("load config");
         assert_eq!(config.default_model(), "anthropic/private-model");
         assert_eq!(
-            config.deepseek_api_key().expect("explicit CLI key"),
+            config.active_route_api_key().expect("explicit CLI key"),
             "explicit-cli-key"
         );
         assert!(route_is_valid_for_model(

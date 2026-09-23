@@ -6,6 +6,7 @@ arcee
 atlascloud
 codewhale
 concentrate
+csdn
 custom
 deepinfra
 deepseek
@@ -19,6 +20,7 @@ meta
 minimax
 minimax-anthropic
 mistral
+modelscope
 modelstudio-coding-plan
 modelstudio-coding-plan-anthropic
 modelstudio-token-plan
@@ -49,3 +51,4 @@ wanjie-ark
 xai
 xiaomi-mimo
 zai
+zenmux

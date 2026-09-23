@@ -44,6 +44,7 @@ const OPTIONAL_FILES = [
   "docs-trust.ts",
   "states.ts",
   "changelog.ts",
+  "computer-use.ts",
 ];
 
 /** Top-level keys of the exported object literal (two-space indented `key:`). */

@@ -8,7 +8,7 @@ description: "Harvest one community PR into a release branch with authorship and
 Harvest exactly one community PR into the real landing branch with full
 authorship and machine-readable credit, verified green, then thank the
 contributor. A PR is evidence: judge it from code, tests, comments, and checks,
-never the title. Do not merge, close, tag, or publish without Hunter's approval —
+never the title. Do not merge, close, tag, or publish without maintainer approval —
 this skill lands a credited commit and posts thanks; the workflow closes the PR.
 
 ## When to use
@@ -19,7 +19,7 @@ this skill lands a credited commit and posts thanks; the workflow closes the PR.
 
 ## Workflow
 
-1. Find the real landing branch (the one Hunter named, not always `main`) and fetch the PR head:
+1. Find the real landing branch (the one the maintainer named, not always `main`) and fetch the PR head:
    ```bash
    git switch <release-branch>
    git fetch origin pull/<N>/head
@@ -55,10 +55,10 @@ this skill lands a credited commit and posts thanks; the workflow closes the PR.
 7. Post a brief, warm, specific thank-you on the PR — name what the change fixed, no drama. Leave the PR open; the workflow closes it with credit when the commit lands on `main`:
    ```bash
    gh pr comment <N> --repo Hmbown/CodeWhale \
-     --body "Thank you @<handle> — clean fix for <the specific bug>. Harvested into the v0.8.61 lane with your authorship preserved; it'll auto-close with credit once it reaches main."
+     --body "Thank you @<handle> — clean fix for <the specific bug>. Harvested into the <release-branch> lane with your authorship preserved; it'll auto-close with credit once it reaches main."
    ```
 
-Grounded example: PR #3221 by @hongchen1993 (honour `DEEPSEEK_BASE_URL`/`DEEPSEEK_MODEL` in exec) cherry-picks cleanly, so its author is preserved with no manual trailers; a focused `cargo test -p` on the touched crate is enough to land it green.
+Shape of a clean harvest: a single-commit PR that cherry-picks with no conflicts needs no manual trailers — the author is preserved automatically — and a focused `cargo test -p` on the touched crate is enough to land it green.
 
 ## Red flags / don't
 
@@ -68,5 +68,5 @@ Grounded example: PR #3221 by @hongchen1993 (honour `DEEPSEEK_BASE_URL`/`DEEPSEE
 - Don't invent co-author emails. Use `.github/AUTHOR_MAP`, then numeric noreply; never raw third-party, `.local`, placeholder, or bot emails.
 - Don't omit the `Harvested from PR #<N> by @<handle>` body line — without it the PR won't auto-close with credit.
 - Don't land red, harvest more than one PR per commit, or batch unrelated changes into the harvest.
-- Don't merge, close, tag, publish, or push release artifacts without Hunter's approval. Keep the comment positive and crediting.
+- Don't merge, close, tag, publish, or push release artifacts without maintainer approval. Keep the comment positive and crediting.
 - Already on the landing branch? Don't re-harvest — close-with-credit via `gh-close-issues`.

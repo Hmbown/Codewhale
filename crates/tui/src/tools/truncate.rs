@@ -460,7 +460,7 @@ fn truncated_preview(
 /// Error results (`success == false`) are skipped: error messages
 /// are typically short, and turning them into a truncated preview
 /// would just hide the error from the model's reasoning.
-#[allow(dead_code)]
+#[cfg_attr(not(test), expect(dead_code))]
 pub fn apply_spillover(result: &mut ToolResult, tool_id: &str) -> Option<PathBuf> {
     apply_spillover_inner(result, tool_id, None, false)
 }

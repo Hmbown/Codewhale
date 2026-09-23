@@ -22,9 +22,7 @@ fn mouse(kind: MouseEventKind, area: Rect) -> MouseEvent {
 
 fn setup_member_id(action: ViewAction) -> Option<String> {
     match action {
-        ViewAction::EmitAndClose(ViewEvent::FleetRosterOpenSetupRequested { member_id }) => {
-            Some(member_id)
-        }
+        ViewAction::Emit(ViewEvent::FleetRosterOpenSetupRequested { member_id }) => Some(member_id),
         _ => None,
     }
 }
@@ -69,6 +67,8 @@ fn view_with_overrides() -> FleetRosterView {
         row_hitboxes: RefCell::new(Vec::new()),
         last_mouse_selected: None,
         hovered_row: Cell::new(None),
+        workers_hitbox: Cell::new(None),
+        hovered_workers: Cell::new(false),
         surface_bg: palette::UI_THEME.surface_bg,
         locale: Locale::En,
     }
@@ -154,7 +154,24 @@ fn operator_row_is_pinned_first_with_the_session_model() {
     );
     assert!(text.contains("deepseek-v4-pro"), "session model shown");
     assert!(text.contains("full session access"), "{text}");
-    assert!(text.contains("leads the Fleet"), "{text}");
+    // Inline field labels can wrap the role at this width. Read just the
+    // inspector columns, excluding the independently positioned member list.
+    let detail_start = rows
+        .iter()
+        .find_map(|row| row.find("Role  ").map(|index| row[..index].chars().count()))
+        .expect("role field rendered");
+    let detail = rows
+        .iter()
+        .map(|row| {
+            row.chars()
+                .skip(detail_start)
+                .collect::<String>()
+                .trim()
+                .to_owned()
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(detail.contains("leads the Fleet"), "{text}");
 }
 
 #[test]
@@ -188,27 +205,42 @@ fn arrows_move_selection_and_wrap() {
 #[test]
 fn selection_change_resets_detail_scroll() {
     let mut view = built_in_view();
-    view.handle_key(key(KeyCode::PageDown));
+    // Bare paging drives the row list; Shift-modified paging scrolls the
+    // detail pane (#6290, #6014-style split).
+    view.handle_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::SHIFT));
     assert_eq!(view.detail_scroll, 8);
     view.handle_key(key(KeyCode::Down));
     assert_eq!(view.detail_scroll, 0);
 }
 
 #[test]
-fn enter_opens_the_setup_wizard_for_members_only() {
-    // Operator row: display-only, no wizard hand-off.
+fn bare_paging_drives_rows_not_the_detail_pane() {
+    let mut view = built_in_view();
+    let last = view.members.len();
+    view.handle_key(key(KeyCode::PageDown));
+    assert_eq!(view.detail_scroll, 0);
+    assert_eq!(view.selected, 10.min(last));
+    view.handle_key(key(KeyCode::Home));
+    assert_eq!(view.selected, 0);
+}
+
+#[test]
+fn enter_opens_role_assignment_and_keeps_the_roster_underneath() {
+    // Coordinator changes the current session through the shared picker.
     let mut view = built_in_view();
     assert!(view.operator_selected());
     assert!(
-        matches!(view.handle_key(key(KeyCode::Enter)), ViewAction::None),
-        "Enter must be inert on the operator row"
+        matches!(
+            view.handle_key(key(KeyCode::Enter)),
+            ViewAction::Emit(ViewEvent::FleetRosterOpenCoordinatorRequested)
+        ),
+        "Enter opens the Coordinator model picker"
     );
 
-    // Member row: hands off to the setup wizard.
+    // Member assignment retains this roster on the view stack.
     view.handle_key(key(KeyCode::Down));
     let action = view.handle_key(key(KeyCode::Enter));
-    let ViewAction::EmitAndClose(ViewEvent::FleetRosterOpenSetupRequested { member_id }) = action
-    else {
+    let ViewAction::Emit(ViewEvent::FleetRosterOpenSetupRequested { member_id }) = action else {
         panic!("Enter should hand off to the setup wizard");
     };
     assert_eq!(member_id, "manager");
@@ -349,12 +381,9 @@ fn selected_named_fleet_member_shows_edit_affordance() {
         30,
     );
     let text = rows.join("\n");
-    assert!(
-        text.contains("[edit]"),
-        "focused member should advertise editing: {text}"
-    );
+    assert!(text.contains("Thinking"), "{text}");
     assert!(text.contains("Team `Default`"), "{text}");
-    assert!(text.contains("Enter edit"), "{text}");
+    assert!(text.contains("Enter model & thinking"), "{text}");
     assert!(text.contains("Tab workers"), "{text}");
     assert!(text.contains("saved teams"), "{text}");
     // The letter-key wall is gone: one grammar, no `s`, `m`, `w`, PgUp hints.
@@ -445,9 +474,9 @@ fn built_in_party_lists_all_members_in_canonical_order() {
     let view = built_in_view();
     let ids: Vec<&str> = view.members.iter().map(|m| m.id.as_str()).collect();
     // The operator is rendered as the pinned session row, not a member
-    // (#dogfood 0.8.67), so it is intentionally absent from this list. The
-    // built-in `general` alias is folded out of presentation (#5888) — same
-    // posture as `worker`, still dispatchable (see the alias tests below).
+    // (#dogfood 0.8.67), so it is intentionally absent from this list. There is
+    // no built-in `general` member any more (#6244); `worker` is the posture
+    // and the selector resolves the legacy name onto it.
     assert_eq!(
         ids,
         [
@@ -465,11 +494,15 @@ fn built_in_party_lists_all_members_in_canonical_order() {
     );
 }
 
-/// #5888: the default lineup folds the legacy built-in `general` alias — the
-/// same posture as `worker` — out of presentation, while dispatch (roster
-/// lookup, identity selector alias) keeps resolving it.
+/// #5888 folded the legacy built-in `general` alias out of presentation while
+/// keeping it in the roster. #6244 removed the member instead: two built-ins
+/// that canonicalize to the same role make `role:general` permanently
+/// `Ambiguous`. The lineup is unchanged — `general` was never presented — and
+/// the name still resolves, through the identity selector rather than a second
+/// member (proven in `fleet::roster`'s
+/// `general_still_resolves_to_the_worker_member_without_its_own_built_in`).
 #[test]
-fn default_roster_folds_the_legacy_general_alias_out_of_presentation() {
+fn the_legacy_general_alias_has_no_built_in_member() {
     let view = built_in_view();
     let ids: Vec<&str> = view.members.iter().map(|m| m.id.as_str()).collect();
     assert!(
@@ -479,24 +512,30 @@ fn default_roster_folds_the_legacy_general_alias_out_of_presentation() {
     assert!(ids.contains(&"worker"), "the posture's primary name stays");
     assert_eq!(view.row_count(), 11, "operator plus ten members");
 
-    // Engine compat is untouched: the alias still resolves for dispatch.
     let roster = FleetRoster::built_ins_only();
-    assert!(roster.get("general").is_some(), "alias stays dispatchable");
+    assert!(
+        roster.get("general").is_none(),
+        "the duplicate built-in is gone"
+    );
     assert!(roster.get("worker").is_some());
 }
 
-/// #5888: only the untouched built-in alias folds away. A `general` the user
-/// actually defined — a saved-team member carries Personal/Workspace origin,
-/// like `roster_from_fleet` produces — is the user's own member and stays
-/// visible.
+/// A `general` the user actually defined — a saved-team member carries
+/// Personal/Workspace origin, like `roster_from_fleet` produces — is the
+/// user's own member and stays visible. Since #6244 there is no built-in
+/// `general` to harvest, so the fixture derives one from `worker`, which is
+/// exactly what a migrated fleet file looks like.
 #[test]
 fn user_defined_general_member_stays_visible() {
-    let mut members: Vec<AgentProfile> = FleetRoster::built_ins_only()
+    let worker: AgentProfile = FleetRoster::built_ins_only()
         .members()
         .iter()
-        .filter(|m| m.id == "worker" || m.id == "general")
+        .find(|m| m.id == "worker")
         .cloned()
-        .collect();
+        .expect("worker built-in");
+    let mut user_general = worker.clone();
+    user_general.id = "general".to_string();
+    let mut members = vec![worker, user_general];
     for member in members.iter_mut().filter(|m| m.id == "general") {
         member.origin = ProfileOrigin::Personal;
         member.source = PathBuf::from("fleets/Default.toml");
@@ -519,7 +558,10 @@ fn detail_shows_access_model_and_saved_for() {
         .unwrap()
         .clone();
     assert!(member_access_summary(&reviewer).contains("read-only files"));
-    assert_eq!(member_routing(&reviewer), "same model as this session");
+    assert_eq!(
+        member_routing_with_session(&reviewer, None),
+        "same model as this session"
+    );
 
     // Built-in scout: same Access shape as reviewer.
     let scout = FleetRoster::built_ins_only().get("scout").unwrap().clone();
@@ -535,7 +577,7 @@ fn detail_shows_access_model_and_saved_for() {
     // An explicit model beats the saved-set label, with no "(pinned)" jargon.
     let mut pinned = reviewer.clone();
     pinned.profile.model = Some("glm-5.2".to_string());
-    assert_eq!(member_routing(&pinned), "model glm-5.2");
+    assert_eq!(member_routing_with_session(&pinned, None), "model glm-5.2");
 }
 
 include!("../fleet_roster_capability_tests.rs");
@@ -592,7 +634,10 @@ fn roster_loads_config_members_through_the_shared_merge() {
         FleetRosterView::from_parts(operator(), FleetRoster::load(&config, tmp.path()), None);
     let extra = view.members.iter().find(|m| m.id == "docs-writer").unwrap();
     assert_eq!(extra.origin, ProfileOrigin::Config);
-    assert_eq!(member_routing(extra), "fast model, picked at launch");
+    assert_eq!(
+        member_routing_with_session(extra, None),
+        "fast model, picked at launch"
+    );
 }
 
 #[test]
@@ -705,12 +750,12 @@ fn fleet_roster_is_usable_and_opaque_at_blocker_sizes() {
     }
 }
 
-/// Whale Teams: member rows carry the species badge and the detail pane
-/// opens with the identity block (badge plus `Name · species · job`) with no
+/// Whale Teams: the selected member's detail pane carries the identity
+/// block (badge plus `Name · species · job`) with no
 /// caption labels and no state claim. The hand-drawn portrait art was
 /// deleted per the 2026-08-29 founder directive, so no tier ever draws it.
 #[test]
-fn roster_rows_and_detail_carry_whale_identity_without_claiming_state() {
+fn roster_detail_carries_whale_identity_without_claiming_state() {
     let wide = render_through_stack(
         || {
             let mut v = built_in_view();
@@ -721,9 +766,7 @@ fn roster_rows_and_detail_carry_whale_identity_without_claiming_state() {
         32,
     )
     .join("\n");
-    assert!(wide.contains("◂▰ scout"), "{wide}");
-    assert!(wide.contains("▰] builder"), "{wide}");
-    assert!(wide.contains("◇▰ reviewer"), "{wide}");
+    assert!(wide.contains("◂▰ Scout"), "{wide}");
     assert!(wide.contains("Scout · beaked whale · research"), "{wide}");
     assert!(
         !wide.contains("Whale identity"),
@@ -769,5 +812,27 @@ fn selection_stays_visible_when_list_scrolls() {
         24,
     );
     let text = rows.join("\n");
-    assert!(text.contains("▸ · ·▰ custom"), "{text}");
+    assert!(text.contains("▸ · custom"), "{text}");
+}
+
+#[test]
+fn workbench_workers_header_is_clickable_without_moving_selection() {
+    for (width, height) in [(40, 12), (60, 16), (80, 24), (100, 32), (140, 40)] {
+        let mut view = built_in_view();
+        let area = Rect::new(0, 0, width, height);
+        let mut buf = Buffer::empty(area);
+        view.render(area, &mut buf);
+        let hit = view
+            .workers_hitbox
+            .get()
+            .expect("visible Workers destination");
+        assert!(area.contains((hit.x, hit.y).into()));
+        view.handle_mouse(mouse(MouseEventKind::Moved, hit));
+        assert!(view.hovered_workers.get());
+        assert_eq!(view.selected, 0);
+        assert!(matches!(
+            view.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), hit)),
+            ViewAction::Emit(ViewEvent::FleetRosterOpenWorkersRequested)
+        ));
+    }
 }

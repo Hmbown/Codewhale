@@ -11,7 +11,6 @@ const SPANS: Record<string, string> = {
   accountLogin: "codewhale account login",
   profile: "--profile",
   cloud: "codewhale cloud …",
-  fileStoreEnv: "CODEWHALE_CLOUD_ALLOW_FILE_SESSION_STORE",
   keys: "codewhale account keys list|set|remove",
   portable: "codewhale config export --portable",
 };

@@ -171,9 +171,9 @@ pub fn route_is_supported_suggestion_provider(provider: ApiProvider) -> bool {
 /// different provider kind, yields `None`.
 ///
 /// The returned `base_url` is the **resolved route candidate's** endpoint, not
-/// `Config::deepseek_base_url()`. Those two are not the same string: the config
+/// `Config::active_route_base_url()`. Those two are not the same string: the config
 /// accessor is one input to candidate resolution, and the candidate endpoint is
-/// what `DeepSeekClient::from_candidate` binds the transport to and therefore
+/// what `CodewhaleClient::from_candidate` binds the transport to and therefore
 /// what `Event::TurnComplete` reports back. Comparing anything else here would
 /// compare a turn's actual endpoint against a differently-canonicalized value
 /// and fail closed on routes that never changed.
@@ -210,7 +210,7 @@ fn resolve_credentials_for_identity(
     {
         return None;
     }
-    let api_key = resolved.config.deepseek_api_key().ok()?;
+    let api_key = resolved.config.active_route_api_key().ok()?;
     Some(SuggestionRouteCredentials {
         api_key,
         base_url: resolved.candidate.endpoint().base_url.clone(),
@@ -400,7 +400,7 @@ pub async fn generate_suggestion(
     // Suggestions are model output derived from the just-completed
     // interactive transcript. They therefore participate in the same
     // attached CWC run even though this narrow adapter owns a raw reqwest
-    // client instead of a `DeepSeekClient`. Retain the permit through decode
+    // client instead of a `CodewhaleClient`. Retain the permit through decode
     // so Runtime Chat cannot overlap or project a second inference lifecycle.
     let _inference = crate::client::acquire_remote_control_inference_participant().await;
     let client = suggestion_client();
@@ -1333,7 +1333,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let client = crate::client::DeepSeekClient::new(&config).unwrap();
+        let client = crate::client::CodewhaleClient::new(&config).unwrap();
         let authority = SuggestionRouteAuthority::from_receipt_for_test(
             client.turn_route_receipt("openrouter"),
         );
@@ -1404,7 +1404,7 @@ mod tests {
     /// The endpoint `Event::TurnComplete` would report for this config.
     ///
     /// Deliberately derived from the production resolver rather than written
-    /// as a literal: `Config::deepseek_base_url()` canonicalizes DeepSeek hosts
+    /// as a literal: `Config::active_route_base_url()` canonicalizes DeepSeek hosts
     /// (it strips a trailing `/v1`), and the transport is bound to the resolved
     /// candidate's endpoint, so a hand-written literal is a different string
     /// than the one the client actually uses.

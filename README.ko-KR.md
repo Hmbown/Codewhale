@@ -1,11 +1,11 @@
-<!-- source: README.md sha256:a446e3921085 -->
+<!-- source: README.md sha256:29c349b6f2b4 -->
 # Codewhale
 
 Codewhale은 사용자가 선택한 호스팅 모델이나 로컬 모델로 프로젝트를 읽고, 파일을 편집하고, 명령을 실행하며, 작업 결과를 확인하는 오픈 소스 에이전트입니다. 터미널에서 하나의 작업으로 시작하세요. 더 큰 작업은 서로 다른 모델과 역할을 가진 에이전트에게 나누어 맡길 수 있습니다.
 
-![터미널에서 실행 중인 Codewhale](web/public/codewhale-tui-171acee.png)
+![터미널에서 실행 중인 Codewhale](web/public/codewhale-tui-d7a9a1c.png)
 
-*v0.9.12 개발 빌드의 터미널 미리보기입니다.*
+*v0.10.0 개발 빌드의 터미널 미리보기입니다.*
 
 [English](README.md) · [简体中文](README.zh-CN.md) · [日本語](README.ja-JP.md) · [Tiếng Việt](README.vi.md) · [Bahasa Indonesia](README.id.md) · [Español](README.es-419.md) · [Português](README.pt-BR.md) · [Русский](README.ru.md) · [Українська](README.uk.md) · [Français](README.fr.md) · [Deutsch](README.de.md) · [繁體中文](README.zh-TW.md) · [हिन्दी](README.hi.md) · [Türkçe](README.tr.md) · [Italiano](README.it.md) · [Polski](README.pl.md) · [العربية](README.ar.md) · [Català](README.ca.md)
 
@@ -53,7 +53,7 @@ Codewhale은 저장소를 읽고, 파일을 편집하고, 명령을 실행하고
 
 - **터미널:** `codewhale`은 대화형 인터페이스를 열고, `codewhale exec`는 스크립트나 CI 작업에서 태스크를 실행합니다.
 - **로컬 브라우저:** `codewhale web`은 같은 Runtime을 사용하는 내장 [로컬 웹 클라이언트](docs/WEB.md)를 엽니다.
-- **Codewhale 웹 및 데스크톱 앱:** 개발 중인 그래픽 작업 환경입니다. 이용 가능 여부는 [제품 페이지](https://codewhale.net/en/product)에서 확인할 수 있습니다.
+- **Codewhale 데스크톱 앱(GPUI):** 네이티브 GPUI 데스크톱 앱이 제품 클라이언트 방향입니다(2026-09-14 결정; 단계 계획은 비공개 codehwhale-gpui 저장소의 docs/TRANSITION.md에 있음). app.codewhale.net의 호스티드 웹 앱은 단계적으로 종료되며, 마케팅 사이트, 로그인, 결제, 법률, 다운로드 페이지는 웹에 영구적으로 유지됩니다. 이용 가능 여부는 [제품 페이지](https://codewhale.net/en/product)에서 확인할 수 있습니다.
 
 **Computer Use는 다른 애플리케이션을 관찰하고 조작하는 도구를 추가합니다.** 이 플러그인은 현재 소스에 포함되어 있습니다. 사용 전에 요청하는 접근 권한을 검토하고 활성화하세요. OS 권한과 플랫폼 요구 사항도 충족해야 합니다. 포함된 [Computer Use 안내서](crates/tui/plugins/computer-use/README.md)와 [플러그인 설정](docs/PLUGINS.md)을 참조하세요.
 

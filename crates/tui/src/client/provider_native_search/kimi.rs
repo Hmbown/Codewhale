@@ -503,7 +503,7 @@ mod tests {
             ..Config::default()
         };
         let client = ProviderNativeSearchClient::new(
-            crate::client::DeepSeekClient::new(&config).expect("test Moonshot client"),
+            crate::client::CodewhaleClient::new(&config).expect("test Moonshot client"),
         )
         .expect("Moonshot native adapter");
 

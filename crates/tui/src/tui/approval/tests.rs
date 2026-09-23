@@ -664,6 +664,37 @@ fn test_approval_view_initial_state() {
 }
 
 #[test]
+fn zero_timeout_builder_keeps_the_card_unbounded() {
+    let mut view =
+        ApprovalView::new(benign_request()).with_timeout(Some(std::time::Duration::ZERO));
+    assert!(view.timeout.is_none());
+    assert!(matches!(view.tick(), ViewAction::None));
+}
+
+#[test]
+fn expired_approval_card_denies_fail_closed() {
+    let mut view =
+        ApprovalView::new(benign_request()).with_timeout(Some(std::time::Duration::from_secs(30)));
+    view.requested_at = std::time::Instant::now() - std::time::Duration::from_secs(31);
+
+    assert!(matches!(
+        view.tick(),
+        ViewAction::EmitAndClose(ViewEvent::ApprovalDecision {
+            decision: ReviewDecision::Denied,
+            timed_out: true,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn unexpired_approval_card_stays_open() {
+    let mut view =
+        ApprovalView::new(benign_request()).with_timeout(Some(std::time::Duration::from_secs(30)));
+    assert!(matches!(view.tick(), ViewAction::None));
+}
+
+#[test]
 fn exec_shell_request_builds_ask_rule_preview() {
     let request = shell_request();
 

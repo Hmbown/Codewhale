@@ -115,17 +115,65 @@ pub enum SearchProviderSource {
     Default,
     Config,
     EnvOverride,
+    /// Autodetected from a Tavily key signal: `TAVILY_API_KEY`, or a generic
+    /// `[search] api_key` / `CODEWHALE_SEARCH_API_KEY` value in the `tvly-`
+    /// family. Runtime-only — resolution never writes `[search] provider`.
+    TavilyKey,
 }
 
 impl SearchProviderSource {
+    /// One honest source token for doctor, `/config`, and the runtime GET
+    /// route. `tavily key` names where the signal came from without claiming a
+    /// disk pin or naming `TAVILY_API_KEY` when the winner was a `tvly-`
+    /// generic key.
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Default => "default",
             Self::Config => "config",
             Self::EnvOverride => "env override",
+            Self::TavilyKey => "tavily key",
         }
     }
+}
+
+/// Tavily issues keys in the `tvly-` family; the Tavily error copy already
+/// says so. Applied to **generic** keys only — a dedicated `TAVILY_API_KEY`
+/// is honored as-is, however it is shaped.
+#[must_use]
+pub fn looks_like_tavily_key(value: &str) -> bool {
+    value.trim().starts_with("tvly-")
+}
+
+/// `TAVILY_API_KEY`, read at request time. Deliberately never merged into
+/// [`SearchConfig::api_key`]: that generic slot is shared by every provider,
+/// so merging would hand a Tavily key to Firecrawl (or the reverse) the moment
+/// the operator pins a different provider.
+#[must_use]
+pub fn tavily_env_key() -> Option<String> {
+    std::env::var("TAVILY_API_KEY")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+/// The key a Tavily request should send.
+///
+/// Dedicated env wins over the generic `[search] api_key` so resolution and
+/// the request agree on one key: `[search] api_key` is shared, and a
+/// Firecrawl `fc-` / sentinel generic value must never be POSTed to
+/// `api.tavily.com`. The generic fallback is prefix-gated, which is what
+/// stops `CODEWHALE_SEARCH_API_KEY=doctor-offline-search-sentinel` from
+/// autodetecting Tavily.
+#[must_use]
+pub fn tavily_key_from(search_api_key: Option<&str>) -> Option<String> {
+    if let Some(env_key) = tavily_env_key() {
+        return Some(env_key);
+    }
+    search_api_key
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && looks_like_tavily_key(value))
+        .map(str::to_string)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -150,6 +198,12 @@ pub struct SearchConfig {
     /// Baidu also falls back to `BAIDU_SEARCH_API_KEY` env var.
     /// Serply also falls back to the `SERPLY_API_KEY` env var.
     /// Volcengine also falls back to `VOLCENGINE_API_KEY` / `VOLCENGINE_ARK_API_KEY` / `ARK_API_KEY` env vars.
+    ///
+    /// This slot is shared across providers. `TAVILY_API_KEY` is **not**
+    /// merged into it — Tavily reads its dedicated env at request time
+    /// ([`tavily_key_from`]) so pinning another provider never forwards a
+    /// Tavily key, and a `tvly-` value here can autodetect Tavily without a
+    /// disk write.
     #[serde(default)]
     pub api_key: Option<String>,
 }

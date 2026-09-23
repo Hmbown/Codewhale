@@ -1621,3 +1621,216 @@ fn the_machine_token_surface_is_a_different_noun_from_the_provider_vault() {
         CloudCommand::ApiKeys(_)
     ));
 }
+
+struct ConcurrentSessionTransport {
+    inner: FakeTransport,
+    trigger: &'static str,
+    hold_writes: bool,
+    writes: std::sync::mpsc::Sender<()>,
+    done: Mutex<std::sync::mpsc::Receiver<()>>,
+}
+impl CloudTransport for ConcurrentSessionTransport {
+    fn execute(&self, request: CloudRequest) -> Result<CloudResponse> {
+        if request.path == self.trigger {
+            self.writes.send(()).unwrap();
+            if self.hold_writes {
+                assert!(
+                    matches!(
+                        self.done
+                            .lock()
+                            .unwrap()
+                            .recv_timeout(Duration::from_millis(100)),
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                    ),
+                    "account writer bypassed lifecycle transaction"
+                );
+            } else {
+                self.done
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap();
+            }
+        }
+        self.inner.execute(request)
+    }
+}
+
+#[test]
+fn delayed_account_responses_never_replace_or_clear_a_new_sign_in() {
+    for (operation, status) in [
+        ("refresh", 200),
+        ("refresh", 401),
+        ("logout", 200),
+        ("me", 200),
+    ] {
+        let (secrets, _) = test_secrets();
+        let owner = AccountSessionStore::new(secrets.clone(), Some("default"), DEFAULT_API_BASE);
+        owner
+            .save(auth("old-access", "old-refresh", "old-account"))
+            .unwrap();
+        let (write_tx, write_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            write_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            owner
+                .save(auth("new-access", "new-refresh", "new-account"))
+                .unwrap();
+            done_tx.send(()).unwrap();
+        });
+        let (trigger, responses) = match operation {
+            "refresh" => (
+                "/api/auth/refresh",
+                vec![
+                    response(401, json!({})),
+                    response(
+                        status,
+                        auth_json("rotated-access", "rotated-refresh", "old-account"),
+                    ),
+                ],
+            ),
+            "logout" => ("/api/auth/logout", vec![response(status, json!({}))]),
+            "me" => ("/api/me", vec![response(status, account("old-account"))]),
+            _ => unreachable!(),
+        };
+        let transport = ConcurrentSessionTransport {
+            inner: FakeTransport::new(responses),
+            trigger,
+            hold_writes: operation != "me",
+            writes: write_tx,
+            done: Mutex::new(done_rx),
+        };
+        let client = CloudClient::new(&transport, &secrets, "default", DEFAULT_API_BASE);
+        if operation == "logout" {
+            assert!(client.logout().unwrap());
+        } else {
+            assert!(client.me().is_err());
+        }
+        writer.join().unwrap();
+        let current = client.load_auth().unwrap().unwrap();
+        assert_eq!(current.bundle.access_token, "new-access");
+        assert_eq!(current.bundle.refresh_token, "new-refresh");
+        assert_eq!(current.bundle.user.unwrap().id, "new-account");
+        assert_eq!(
+            transport.inner.requests().len(),
+            if operation == "refresh" {
+                if status == 200 { 3 } else { 2 }
+            } else {
+                1
+            }
+        );
+    }
+}
+
+#[test]
+fn renewed_credentials_survive_retry_transport_failure() {
+    let (secrets, _) = test_secrets();
+    let transport = FakeTransport::new(vec![
+        response(401, json!({})),
+        response(
+            200,
+            auth_json("renewed-access", "renewed-refresh", "account"),
+        ),
+    ]);
+    let client = CloudClient::new(&transport, &secrets, "default", DEFAULT_API_BASE);
+    client
+        .save_auth(auth("old-access", "old-refresh", "account"))
+        .unwrap();
+    assert!(client.me().is_err());
+    let current = client.load_auth().unwrap().unwrap();
+    assert_eq!(current.bundle.access_token, "renewed-access");
+    assert_eq!(current.bundle.refresh_token, "renewed-refresh");
+}
+
+#[test]
+fn concurrent_clients_spend_refresh_token_only_once() {
+    use std::sync::{
+        Barrier,
+        atomic::{AtomicUsize, Ordering},
+    };
+    struct Transport {
+        first_reads: AtomicUsize,
+        refreshes: AtomicUsize,
+        barrier: Barrier,
+    }
+    impl CloudTransport for Transport {
+        fn execute(&self, request: CloudRequest) -> Result<CloudResponse> {
+            if request.path == "/api/auth/refresh" {
+                self.refreshes.fetch_add(1, Ordering::SeqCst);
+                return Ok(response(
+                    200,
+                    auth_json("new-access", "new-refresh", "account"),
+                ));
+            }
+            if self.first_reads.fetch_add(1, Ordering::SeqCst) < 2 {
+                self.barrier.wait();
+                Ok(response(401, json!({})))
+            } else {
+                Ok(response(200, account("account")))
+            }
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let secrets = Secrets::new(Arc::new(codewhale_secrets::FileKeyringStore::new(
+        dir.path().join("secrets.json"),
+    )));
+    let transport = Transport {
+        first_reads: AtomicUsize::new(0),
+        refreshes: AtomicUsize::new(0),
+        barrier: Barrier::new(2),
+    };
+    let client = CloudClient::new(&transport, &secrets, "default", DEFAULT_API_BASE);
+    client
+        .save_auth(auth("old-access", "old-refresh", "account"))
+        .unwrap();
+    let successes = std::thread::scope(|scope| {
+        let a = scope
+            .spawn(|| CloudClient::new(&transport, &secrets, "default", DEFAULT_API_BASE).me());
+        let b = scope
+            .spawn(|| CloudClient::new(&transport, &secrets, "default", DEFAULT_API_BASE).me());
+        [a.join().unwrap(), b.join().unwrap()]
+            .into_iter()
+            .filter(Result::is_ok)
+            .count()
+    });
+    assert_eq!(successes, 1);
+    assert_eq!(transport.refreshes.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        client.load_auth().unwrap().unwrap().bundle.refresh_token,
+        "new-refresh"
+    );
+}
+#[test]
+fn logout_preserves_custody_until_server_confirms_revocation_or_dead_session() {
+    for status in [
+        None,
+        Some(429),
+        Some(500),
+        Some(503),
+        Some(200),
+        Some(204),
+        Some(401),
+        Some(403),
+    ] {
+        let (secrets, _) = test_secrets();
+        let responses = status
+            .map(|code| vec![response(code, json!({}))])
+            .unwrap_or_default();
+        let transport = FakeTransport::new(responses);
+        let client = CloudClient::new(&transport, &secrets, "default", DEFAULT_API_BASE);
+        client
+            .save_auth(auth("access-revoke", "refresh-revoke", "account"))
+            .unwrap();
+        let result = client.logout();
+        if status.is_some_and(|s| (200..300).contains(&s) || matches!(s, 401 | 403)) {
+            assert!(result.is_ok());
+            assert!(client.load_auth().unwrap().is_none());
+        } else {
+            assert!(result.is_err());
+            assert_eq!(
+                client.load_auth().unwrap().unwrap().bundle.refresh_token,
+                "refresh-revoke"
+            );
+        }
+    }
+}

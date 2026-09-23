@@ -107,7 +107,7 @@ impl Default for LspConfig {
 impl LspConfig {
     /// Resolve `(command, args)` for `lang`. User-supplied overrides take
     /// precedence over the built-in registry.
-    fn resolve_command(&self, lang: Language) -> Option<(String, Vec<String>)> {
+    pub(crate) fn resolve_command(&self, lang: Language) -> Option<(String, Vec<String>)> {
         if let Some(parts) = self.servers.get(lang.as_key())
             && let Some((first, rest)) = parts.split_first()
         {
@@ -121,15 +121,17 @@ impl LspConfig {
     }
 }
 
+type TransportSlot = Arc<AsyncMutex<Option<Arc<dyn LspTransport>>>>;
+
 /// The LspManager holds a lazily populated map of `Language -> Transport`.
 /// One transport is reused across files of the same language for the
 /// session's lifetime.
 pub struct LspManager {
     config: LspConfig,
     workspace: PathBuf,
-    /// Per-language transports. Wrapped in `Arc` so we can release the outer
-    /// lock before driving I/O on a single transport.
-    transports: AsyncMutex<HashMap<Language, Arc<dyn LspTransport>>>,
+    /// One startup slot per language. Cold callers share a handshake without
+    /// holding the map lock or blocking unrelated language servers.
+    transports: AsyncMutex<HashMap<Language, TransportSlot>>,
     /// Per-language "we already warned the user that the binary is missing"
     /// guard so we do not spam the audit log on every edit.
     missing_warned: AsyncMutex<HashSet<Language>>,
@@ -137,7 +139,7 @@ pub struct LspManager {
     /// real LSP processes. Keyed by language.
     test_transports: AsyncMutex<HashMap<Language, Arc<dyn LspTransport>>>,
     /// Per-extension transports for user-defined custom language servers.
-    custom_transports: AsyncMutex<HashMap<String, Arc<dyn LspTransport>>>,
+    custom_transports: AsyncMutex<HashMap<String, TransportSlot>>,
     /// Per-extension "we already warned" guard for custom servers.
     custom_missing_warned: AsyncMutex<HashSet<String>>,
 }
@@ -150,6 +152,7 @@ pub(crate) struct LintReadResult {
     pub(crate) file: PathBuf,
     pub(crate) status: LintReadStatus,
     pub(crate) items: Vec<Diagnostic>,
+    pub(crate) freshness: DiagnosticFreshness,
     /// Number of diagnostics after severity selection but before the
     /// configured per-file cap was applied. Unknown when the request did not
     /// complete successfully.
@@ -164,8 +167,18 @@ pub(crate) enum LintReadStatus {
     Timeout { wait_ms: u64 },
 }
 
+#[derive(Debug, Default, serde::Serialize)]
+pub(crate) struct DiagnosticFreshness {
+    pub(crate) source_revision: Option<String>,
+    pub(crate) document_version: Option<i64>,
+    pub(crate) diagnostic_version: Option<i64>,
+    /// Only an exact publication version match proves the text was checked.
+    pub(crate) freshness: Option<&'static str>,
+}
+
 struct DiagnosticPollSuccess {
     block: DiagnosticBlock,
+    freshness: DiagnosticFreshness,
     total_diagnostic_count: usize,
     truncated: bool,
 }
@@ -198,6 +211,46 @@ impl LspManager {
         &self.config
     }
 
+    async fn read_workspace_text(&self, file: &Path) -> std::io::Result<String> {
+        let root = self.workspace.clone();
+        let requested = file.to_path_buf();
+        tokio::task::spawn_blocking(move || {
+            use std::io::Read;
+            // The caller may already have resolved the configured workspace
+            // alias (macOS /var -> /private/var, or a workspace-root symlink).
+            // Resolve only that authorized root, never the requested file:
+            // internal links must still be rejected by the confined opener.
+            let canonical_root = root.canonicalize()?;
+            let relative = requested
+                .strip_prefix(&root)
+                .or_else(|_| requested.strip_prefix(&canonical_root))
+                .map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "LSP file is outside the workspace",
+                    )
+                })?;
+            // Match the existing workspace file serving ceiling. Decode only
+            // bounded UTF-8 bytes from the same no-follow workspace opener.
+            const MAX_DOCUMENT_BYTES: u64 = 16 * 1024 * 1024;
+            let file = crate::fleet::files::WorkspaceFile::open(&canonical_root, relative, false)?;
+            let mut bytes = Vec::new();
+            file.open_file()?
+                .take(MAX_DOCUMENT_BYTES + 1)
+                .read_to_end(&mut bytes)?;
+            if bytes.len() as u64 > MAX_DOCUMENT_BYTES {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "LSP file exceeds the document limit",
+                ));
+            }
+            String::from_utf8(bytes)
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+        })
+        .await
+        .map_err(std::io::Error::other)?
+    }
+
     /// Inject a fake transport for a language. Used by tests so we never
     /// fork a real LSP server in CI.
     #[cfg(test)]
@@ -228,7 +281,7 @@ impl LspManager {
             return None;
         }
 
-        let text = match tokio::fs::read_to_string(file).await {
+        let text = match self.read_workspace_text(file).await {
             Ok(text) => text,
             Err(err) => {
                 tracing::debug!(?err, file = %file.display(), "lsp: read file failed");
@@ -271,16 +324,19 @@ impl LspManager {
         transport: Arc<dyn LspTransport>,
     ) -> DiagnosticPollOutcome {
         let wait = Duration::from_millis(self.config.poll_after_edit_ms);
-        // The stdio transport treats its own deadline as an empty diagnostics
-        // result. Give it a slightly longer inner deadline so this outer bound
-        // owns the timeout state while still accepting an explicit empty
-        // publishDiagnostics payload as success.
+        // The outer bound owns timeout reporting, including time waiting for
+        // another operation on the same transport. An explicit empty
+        // publishDiagnostics payload is a successful publication.
         let inner_wait = wait.saturating_add(Duration::from_millis(100));
         let raw = match timeout(wait, transport.diagnostics_for(file, text, inner_wait)).await {
             Ok(Ok(items)) => items,
             Ok(Err(err)) => {
                 tracing::debug!(?err, file = %file.display(), "lsp: diagnostics call failed");
-                return DiagnosticPollOutcome::Error(err.to_string());
+                return if err.to_string().contains("timed out") {
+                    DiagnosticPollOutcome::Timeout
+                } else {
+                    DiagnosticPollOutcome::Error(err.to_string())
+                };
             }
             Err(_) => {
                 tracing::debug!(file = %file.display(), "lsp: diagnostics timed out");
@@ -288,9 +344,16 @@ impl LspManager {
             }
         };
 
+        let freshness = DiagnosticFreshness {
+            source_revision: Some(crate::hashing::sha256_hex(text.as_bytes())),
+            document_version: raw.document_version,
+            diagnostic_version: raw.diagnostic_version,
+            freshness: Some(raw.freshness()),
+        };
         // Filter, sort, and truncate.
         let include_warnings = self.config.include_warnings;
         let mut items: Vec<Diagnostic> = raw
+            .items
             .into_iter()
             .filter(|d| match d.severity {
                 Severity::Error => true,
@@ -313,6 +376,7 @@ impl LspManager {
         block.truncate(self.config.max_diagnostics_per_file);
         DiagnosticPollOutcome::Success(DiagnosticPollSuccess {
             block,
+            freshness,
             total_diagnostic_count,
             truncated,
         })
@@ -325,7 +389,7 @@ impl LspManager {
         custom: &CustomLspDef,
     ) -> Option<DiagnosticBlock> {
         let ext = file.extension()?.to_str()?.to_ascii_lowercase();
-        let text = match tokio::fs::read_to_string(file).await {
+        let text = match self.read_workspace_text(file).await {
             Ok(t) => t,
             Err(err) => {
                 tracing::debug!(?err, file = %file.display(), "lsp: read file failed");
@@ -345,25 +409,18 @@ impl LspManager {
         ext: &str,
         def: &CustomLspDef,
     ) -> Option<Arc<dyn LspTransport>> {
-        if let Some(t) = self.custom_transports.lock().await.get(ext) {
-            return Some(t.clone());
-        }
-        match StdioLspTransport::spawn(
-            &def.command,
-            &def.args,
-            &def.language_id,
-            self.workspace.clone(),
-        )
-        .await
+        let slot = self
+            .custom_transports
+            .lock()
+            .await
+            .entry(ext.to_owned())
+            .or_default()
+            .clone();
+        match self
+            .cached_transport(&slot, &def.command, &def.args, &def.language_id)
+            .await
         {
-            Ok(t) => {
-                let arc: Arc<dyn LspTransport> = Arc::new(t);
-                self.custom_transports
-                    .lock()
-                    .await
-                    .insert(ext.to_string(), arc.clone());
-                Some(arc)
-            }
+            Ok(transport) => Some(transport),
             Err(err) => {
                 let key = ext.to_string();
                 let mut warned = self.custom_missing_warned.lock().await;
@@ -387,24 +444,47 @@ impl LspManager {
             return Some(t.clone());
         }
 
-        if let Some(t) = self.transports.lock().await.get(&lang) {
-            return Some(t.clone());
-        }
-
         let (cmd, args) = self.config.resolve_command(lang)?;
-        match StdioLspTransport::spawn(&cmd, &args, lang.language_id(), self.workspace.clone())
+        let slot = self
+            .transports
+            .lock()
+            .await
+            .entry(lang)
+            .or_default()
+            .clone();
+        match self
+            .cached_transport(&slot, &cmd, &args, lang.language_id())
             .await
         {
-            Ok(transport) => {
-                let arc: Arc<dyn LspTransport> = Arc::new(transport);
-                self.transports.lock().await.insert(lang, arc.clone());
-                Some(arc)
-            }
+            Ok(transport) => Some(transport),
             Err(err) => {
                 self.warn_missing_once(lang, &cmd, &err).await;
                 None
             }
         }
+    }
+
+    async fn cached_transport(
+        &self,
+        slot: &TransportSlot,
+        command: &str,
+        args: &[String],
+        language_id: &str,
+    ) -> anyhow::Result<Arc<dyn LspTransport>> {
+        let mut cached = slot.lock().await;
+        if let Some(transport) = cached.as_ref().filter(|transport| transport.is_alive()) {
+            return Ok(transport.clone());
+        }
+        // Only a later caller retries a dead process; never replay a failed
+        // operation or spawn a background restart loop.
+        if let Some(dead) = cached.take() {
+            dead.shutdown().await;
+        }
+        let transport: Arc<dyn LspTransport> = Arc::new(
+            StdioLspTransport::spawn(command, args, language_id, self.workspace.clone()).await?,
+        );
+        *cached = Some(transport.clone());
+        Ok(transport)
     }
 
     async fn warn_missing_once(&self, lang: Language, cmd: &str, err: &anyhow::Error) {
@@ -446,117 +526,268 @@ impl LspManager {
         character: Option<u32>,
         query: Option<&str>,
     ) -> Result<serde_json::Value, String> {
+        self.intelligence_at_revision(operation, file, line, character, query, None)
+            .await
+    }
+
+    /// Optional source revision for native navigation; raw tool results remain
+    /// available. A target revision proves bytes read here, not server analysis.
+    pub async fn intelligence_at_revision(
+        &self,
+        operation: &str,
+        file: &Path,
+        line: Option<u32>,
+        character: Option<u32>,
+        query: Option<&str>,
+        expected_revision: Option<&str>,
+    ) -> Result<serde_json::Value, String> {
         if !self.config.enabled {
             return Err("LSP is disabled ([lsp] enabled = false)".to_string());
         }
         let wait = Duration::from_millis(self.config.poll_after_edit_ms);
         match operation {
             "diagnostics" => {
-                let block = self
-                    .diagnostics_for(file, 0)
-                    .await
-                    .map(|b| {
-                        serde_json::json!({
-                            "file": b.file.display().to_string(),
-                            "items": b.items.iter().map(|d| serde_json::json!({
-                                "line": d.line,
-                                "column": d.column,
-                                "severity": format!("{:?}", d.severity).to_ascii_lowercase(),
-                                "message": d.message,
-                            })).collect::<Vec<_>>(),
-                        })
-                    })
-                    .unwrap_or_else(|| {
-                        serde_json::json!({
-                            "file": relative_to_workspace(&self.workspace, file).display().to_string(),
-                            "items": [],
-                        })
-                    });
-                Ok(block)
+                let result = self
+                    .diagnostics_for_paths(&[file.to_path_buf()])
+                    .await?
+                    .into_iter()
+                    .next()
+                    .ok_or("LSP diagnostics returned no outcome")?;
+                match result.status {
+                    LintReadStatus::Error(error) => Err(error),
+                    LintReadStatus::Timeout { wait_ms } => {
+                        Err(format!("LSP diagnostics timed out after {wait_ms} ms"))
+                    }
+                    LintReadStatus::Success => Ok(serde_json::json!({
+                        "file": result.file.display().to_string(),
+                        "items": result.items.iter().map(|d| serde_json::json!({
+                            "line": d.line, "column": d.column,
+                            "severity": format!("{:?}", d.severity).to_ascii_lowercase(),
+                            "message": d.message,
+                        })).collect::<Vec<_>>(),
+                        "source_revision": result.freshness.source_revision,
+                        "document_version": result.freshness.document_version,
+                        "diagnostic_version": result.freshness.diagnostic_version,
+                        "freshness": result.freshness.freshness,
+                        "total_diagnostic_count": result.total_diagnostic_count,
+                        "truncated": result.truncated,
+                    })),
+                }
             }
             "symbols" | "definition" | "references" => {
+                let text = self
+                    .read_workspace_text(file)
+                    .await
+                    .map_err(|err| format!("read {}: {err}", file.display()))?;
+                let source_revision = crate::hashing::sha256_hex(text.as_bytes());
+                if expected_revision.is_some_and(|expected| expected != source_revision) {
+                    return Err("stale_document".into());
+                }
+                let root = tokio::fs::canonicalize(&self.workspace)
+                    .await
+                    .map_err(|_| "workspace unavailable")?;
+                let source_path = file
+                    .strip_prefix(&self.workspace)
+                    .or_else(|_| file.strip_prefix(&root))
+                    .ok()
+                    .and_then(semantic_relative_path)
+                    .ok_or("source path is not workspace-relative UTF-8")?;
+                let uri = client::uri_from_path(file);
+                let (method, params) = if operation == "symbols" {
+                    if let Some(q) = query.filter(|s| !s.trim().is_empty()) {
+                        if q.len() > 1024 {
+                            return Err("symbol query is too long".into());
+                        }
+                        ("workspace/symbol", serde_json::json!({"query":q}))
+                    } else {
+                        (
+                            "textDocument/documentSymbol",
+                            serde_json::json!({"textDocument":{"uri":uri}}),
+                        )
+                    }
+                } else {
+                    let position = SemanticPosition {
+                        line: line
+                            .and_then(|value| value.checked_sub(1))
+                            .ok_or("line must be 1-based")?,
+                        character: character
+                            .unwrap_or(1)
+                            .checked_sub(1)
+                            .ok_or("character must be 1-based")?,
+                    };
+                    if !position.valid_in(&text) {
+                        return Err(
+                            "position is outside the document or splits a UTF-16 character".into(),
+                        );
+                    }
+                    let method = if operation == "definition" {
+                        "textDocument/definition"
+                    } else {
+                        "textDocument/references"
+                    };
+                    let mut params =
+                        serde_json::json!({"textDocument":{"uri":uri}, "position":position});
+                    if operation == "references" {
+                        params["context"] = serde_json::json!({"includeDeclaration":true});
+                    }
+                    (method, params)
+                };
                 let transport = self
                     .transport_for_path(file)
                     .await
                     .ok_or_else(|| format!("no LSP server for {}", file.display()))?;
-                let text = tokio::fs::read_to_string(file)
-                    .await
-                    .map_err(|err| format!("read {}: {err}", file.display()))?;
-                transport
-                    .ensure_open(file, &text)
+                let reply = transport
+                    .request_for_document(file, &text, method, params, wait)
                     .await
                     .map_err(|err| err.to_string())?;
-                let uri = client::uri_from_path(file);
-                let result = match operation {
-                    "symbols" => {
-                        if let Some(q) = query.filter(|s| !s.trim().is_empty()) {
-                            transport
-                                .request(
-                                    "workspace/symbol",
-                                    serde_json::json!({ "query": q }),
-                                    wait,
-                                )
-                                .await
-                        } else {
-                            transport
-                                .request(
-                                    "textDocument/documentSymbol",
-                                    serde_json::json!({
-                                        "textDocument": { "uri": uri }
-                                    }),
-                                    wait,
-                                )
-                                .await
-                        }
-                    }
-                    "definition" => {
-                        let line = line.ok_or("definition requires line (1-based)")?;
-                        let character = character.unwrap_or(1);
-                        transport
-                            .request(
-                                "textDocument/definition",
-                                serde_json::json!({
-                                    "textDocument": { "uri": uri },
-                                    "position": {
-                                        "line": line.saturating_sub(1),
-                                        "character": character.saturating_sub(1),
-                                    }
-                                }),
-                                wait,
-                            )
-                            .await
-                    }
-                    "references" => {
-                        let line = line.ok_or("references requires line (1-based)")?;
-                        let character = character.unwrap_or(1);
-                        transport
-                            .request(
-                                "textDocument/references",
-                                serde_json::json!({
-                                    "textDocument": { "uri": uri },
-                                    "position": {
-                                        "line": line.saturating_sub(1),
-                                        "character": character.saturating_sub(1),
-                                    },
-                                    "context": { "includeDeclaration": true }
-                                }),
-                                wait,
-                            )
-                            .await
-                    }
-                    _ => unreachable!(),
+                let (locations, truncated, omitted) =
+                    self.semantic_locations(&reply.result, file, &text).await;
+                // Re-read after the request and normalization; a changed or
+                // replaced source cannot publish a successful navigation result.
+                let current = self
+                    .read_workspace_text(file)
+                    .await
+                    .map_err(|_| "stale_document")?;
+                if crate::hashing::sha256_hex(current.as_bytes()) != source_revision {
+                    return Err("stale_document".into());
                 }
-                .map_err(|err| err.to_string())?;
                 Ok(serde_json::json!({
                     "operation": operation,
-                    "file": relative_to_workspace(&self.workspace, file).display().to_string(),
-                    "result": truncate_intelligence_result(result),
+                    "file": source_path,
+                    "semantic_contract_version": 1,
+                    "position_encoding": "utf-16",
+                    "source_revision": source_revision,
+                    "document_version": reply.document_version,
+                    "freshness": if reply.document_version.is_some() { "verified" } else { "unverified" },
+                    "locations": locations, "truncated": truncated, "omitted": omitted,
+                    "result": truncate_intelligence_result(reply.result),
                 }))
             }
             other => Err(format!(
                 "unknown LSP operation '{other}'; use diagnostics, symbols, definition, or references"
             )),
         }
+    }
+
+    async fn semantic_locations(
+        &self,
+        raw: &serde_json::Value,
+        source: &Path,
+        source_text: &str,
+    ) -> (Vec<SemanticLocation>, bool, usize) {
+        const MAX_LOCATIONS: usize = 40;
+        const MAX_NODES: usize = 256;
+        const MAX_TARGET_BYTES: usize = 16 * 1024 * 1024;
+        let root = match tokio::fs::canonicalize(&self.workspace).await {
+            Ok(root) => root,
+            Err(_) => return (vec![], false, 1),
+        };
+        let mut pending = vec![(raw, 0usize)];
+        let mut locations = Vec::new();
+        let mut visited = 0;
+        let mut target_bytes: usize = 0;
+        let mut truncated = false;
+        let mut omitted = 0;
+        while let Some((value, depth)) = pending.pop() {
+            visited += 1;
+            if visited > MAX_NODES || locations.len() >= MAX_LOCATIONS {
+                truncated = true;
+                break;
+            }
+            if value.is_null() {
+                continue;
+            }
+            if let Some(items) = value.as_array() {
+                let remaining = MAX_NODES.saturating_sub(visited + pending.len());
+                truncated |= items.len() > remaining;
+                pending.extend(items.iter().take(remaining).rev().map(|item| (item, depth)));
+                continue;
+            }
+            if let Some(children) = value.get("children").and_then(serde_json::Value::as_array) {
+                if depth >= 16 {
+                    truncated |= !children.is_empty();
+                } else {
+                    let remaining = MAX_NODES.saturating_sub(visited + pending.len());
+                    truncated |= children.len() > remaining;
+                    pending.extend(
+                        children
+                            .iter()
+                            .take(remaining)
+                            .rev()
+                            .map(|item| (item, depth + 1)),
+                    );
+                }
+            }
+            let location = value.get("location").unwrap_or(value);
+            let uri = location.get("uri").or_else(|| value.get("targetUri"));
+            let target = match uri {
+                Some(uri) => uri.as_str().and_then(client::path_from_uri),
+                None if value
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some()
+                    && value.get("selectionRange").is_some() =>
+                {
+                    Some(source.to_path_buf())
+                }
+                _ => None,
+            };
+            let range = value
+                .get("targetSelectionRange")
+                .or_else(|| value.get("selectionRange"))
+                .or_else(|| location.get("range"))
+                .and_then(|range| serde_json::from_value::<SemanticRange>(range.clone()).ok());
+            let (Some(target), Some(range)) = (target, range) else {
+                omitted += 1;
+                continue;
+            };
+            let relative = match target.strip_prefix(&self.workspace).or_else(|_| target.strip_prefix(&root)) {
+                Ok(relative) if !relative.as_os_str().is_empty()
+                    && relative.components().all(|component| matches!(component, std::path::Component::Normal(part) if part != ".git")) => relative,
+                _ => { omitted += 1; continue; }
+            };
+            let Some(path) = semantic_relative_path(relative) else {
+                omitted += 1;
+                continue;
+            };
+            let text = if target == source {
+                source_text.to_owned()
+            } else {
+                match self.read_workspace_text(&target).await {
+                    Ok(text) => text,
+                    Err(_) => {
+                        omitted += 1;
+                        continue;
+                    }
+                }
+            };
+            target_bytes = target_bytes.saturating_add(text.len());
+            if target_bytes > MAX_TARGET_BYTES {
+                truncated = true;
+                break;
+            }
+            if range.start > range.end || !range.start.valid_in(&text) || !range.end.valid_in(&text)
+            {
+                omitted += 1;
+                continue;
+            }
+            locations.push(SemanticLocation {
+                path,
+                range,
+                target_revision: crate::hashing::sha256_hex(text.as_bytes()),
+                target_freshness: "unverified",
+                name: value
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .map(|name| name.chars().filter(|c| !c.is_control()).take(256).collect()),
+                kind: value
+                    .get("kind")
+                    .and_then(serde_json::Value::as_u64)
+                    .and_then(|kind| u32::try_from(kind).ok())
+                    .filter(|kind| (1..=26).contains(kind)),
+            });
+        }
+        (locations, truncated, omitted)
     }
 
     /// Read diagnostics for several existing files through the shared LSP
@@ -574,13 +805,14 @@ impl LspManager {
         let mut results = Vec::with_capacity(files.len());
         for file in files {
             let relative_file = relative_to_workspace(&self.workspace, file);
-            let text = match tokio::fs::read_to_string(file).await {
+            let text = match self.read_workspace_text(file).await {
                 Ok(text) => text,
                 Err(err) => {
                     results.push(LintReadResult {
                         file: relative_file,
                         status: LintReadStatus::Error(format!("failed to read file: {err}")),
                         items: Vec::new(),
+                        freshness: DiagnosticFreshness::default(),
                         total_diagnostic_count: None,
                         truncated: false,
                     });
@@ -594,6 +826,7 @@ impl LspManager {
                         "no LSP server is available for this file".to_string(),
                     ),
                     items: Vec::new(),
+                    freshness: DiagnosticFreshness::default(),
                     total_diagnostic_count: None,
                     truncated: false,
                 });
@@ -605,6 +838,7 @@ impl LspManager {
                     file: outcome.block.file,
                     status: LintReadStatus::Success,
                     items: outcome.block.items,
+                    freshness: outcome.freshness,
                     total_diagnostic_count: Some(outcome.total_diagnostic_count),
                     truncated: outcome.truncated,
                 },
@@ -614,6 +848,7 @@ impl LspManager {
                         "LSP diagnostics request failed: {error}"
                     )),
                     items: Vec::new(),
+                    freshness: DiagnosticFreshness::default(),
                     total_diagnostic_count: None,
                     truncated: false,
                 },
@@ -623,6 +858,7 @@ impl LspManager {
                         wait_ms: self.config.poll_after_edit_ms,
                     },
                     items: Vec::new(),
+                    freshness: DiagnosticFreshness::default(),
                     total_diagnostic_count: None,
                     truncated: false,
                 },
@@ -633,22 +869,21 @@ impl LspManager {
 
     /// Best-effort shutdown of every spawned transport. Called when the
     /// session ends.
-    #[allow(dead_code)]
+    #[cfg_attr(any(not(test), not(unix)), expect(dead_code))]
     pub async fn shutdown_all(&self) {
-        let transports: Vec<Arc<dyn LspTransport>> =
+        let transports: Vec<TransportSlot> =
             self.transports.lock().await.values().cloned().collect();
-        let custom: Vec<Arc<dyn LspTransport>> = self
+        let custom: Vec<TransportSlot> = self
             .custom_transports
             .lock()
             .await
             .values()
             .cloned()
             .collect();
-        for transport in transports {
-            transport.shutdown().await;
-        }
-        for transport in custom {
-            transport.shutdown().await;
+        for slot in transports.into_iter().chain(custom) {
+            if let Some(transport) = slot.lock().await.take() {
+                transport.shutdown().await;
+            }
         }
     }
 }
@@ -663,37 +898,92 @@ impl LspConfig {
     }
 }
 
+fn semantic_relative_path(path: &Path) -> Option<String> {
+    let parts = path
+        .components()
+        .map(|component| match component {
+            std::path::Component::Normal(part) if part != ".git" => {
+                part.to_str().filter(|part| !part.contains('\\'))
+            }
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()?;
+    let path = parts.join("/");
+    (!path.is_empty() && path.len() <= 4096).then_some(path)
+}
+
+/// LSP positions are zero-based UTF-16 code units, never UTF-8 byte offsets.
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Deserialize, serde::Serialize,
+)]
+struct SemanticPosition {
+    line: u32,
+    character: u32,
+}
+impl SemanticPosition {
+    fn valid_in(self, text: &str) -> bool {
+        let Some(line) = text.split('\n').nth(self.line as usize) else {
+            return false;
+        };
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        let mut column = 0;
+        for ch in line.chars() {
+            if column == self.character {
+                return true;
+            }
+            column += ch.len_utf16() as u32;
+            if column > self.character {
+                return false;
+            }
+        }
+        column == self.character
+    }
+}
+
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+struct SemanticRange {
+    start: SemanticPosition,
+    end: SemanticPosition,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct SemanticLocation {
+    path: String,
+    range: SemanticRange,
+    target_revision: String,
+    target_freshness: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    kind: Option<u32>,
+}
+
 /// Cap intelligence payloads so a chatty language server cannot flood the
 /// model context. Arrays keep the first `MAX` entries and set `truncated`.
 fn truncate_intelligence_result(value: serde_json::Value) -> serde_json::Value {
     const MAX_ITEMS: usize = 40;
     const MAX_CHARS: usize = 12_000;
-    match value {
-        serde_json::Value::Array(mut items) => {
+    let bounded = match value {
+        serde_json::Value::Array(mut items) if items.len() > MAX_ITEMS => {
             let total = items.len();
-            if total > MAX_ITEMS {
-                items.truncate(MAX_ITEMS);
-                serde_json::json!({
-                    "items": items,
-                    "truncated": true,
-                    "total": total,
-                })
-            } else {
-                serde_json::Value::Array(items)
-            }
+            items.truncate(MAX_ITEMS);
+            serde_json::json!({"items":items, "truncated":true, "total":total})
         }
-        other => {
-            let rendered = other.to_string();
-            if rendered.len() > MAX_CHARS {
-                serde_json::json!({
-                    "truncated": true,
-                    "preview": &rendered[..MAX_CHARS],
-                    "total_chars": rendered.len(),
-                })
-            } else {
-                other
-            }
+        other => other,
+    };
+    let rendered = bounded.to_string();
+    if rendered.len() > MAX_CHARS {
+        let mut boundary = MAX_CHARS;
+        while !rendered.is_char_boundary(boundary) {
+            boundary -= 1;
         }
+        serde_json::json!({
+            "truncated": true,
+            "preview": &rendered[..boundary],
+            "total_chars": rendered.len(),
+        })
+    } else {
+        bounded
     }
 }
 
@@ -760,12 +1050,295 @@ pub(crate) mod tests {
             _path: &Path,
             _text: &str,
             _wait: Duration,
-        ) -> anyhow::Result<Vec<Diagnostic>> {
+        ) -> anyhow::Result<crate::lsp::client::DiagnosticPublication> {
             self.calls.fetch_add(1, Ordering::Relaxed);
-            Ok(self.items.clone())
+            Ok(self.items.clone().into())
         }
 
         async fn shutdown(&self) {}
+    }
+
+    #[cfg(unix)]
+    async fn cache_fixture(custom: bool) {
+        let root = tempfile::tempdir().unwrap();
+        let pids = root.path().join("pids");
+        let args = vec![
+            "-u".into(),
+            "-c".into(),
+            client::tests::STDIO_FIXTURE.into(),
+            "cache".into(),
+            pids.to_string_lossy().into_owned(),
+        ];
+        let mut config = LspConfig::default();
+        if custom {
+            config.custom.insert(
+                "cachetest".into(),
+                CustomLspDef {
+                    command: "python3".into(),
+                    args,
+                    language_id: "cachetest".into(),
+                },
+            );
+        } else {
+            let mut command = vec!["python3".into()];
+            command.extend(args);
+            config.servers.insert("python".into(), command);
+        }
+        let manager = LspManager::new(config, root.path().to_owned());
+        let path = root
+            .path()
+            .join(if custom { "file.cachetest" } else { "file.py" });
+        let (first, second, third) = tokio::join!(
+            manager.transport_for_path(&path),
+            manager.transport_for_path(&path),
+            manager.transport_for_path(&path)
+        );
+        let first = first.unwrap();
+        assert!(Arc::ptr_eq(&first, &second.unwrap()));
+        assert!(Arc::ptr_eq(&first, &third.unwrap()));
+        assert_eq!(std::fs::read_to_string(&pids).unwrap().lines().count(), 1);
+        assert!(
+            first
+                .request(
+                    "fixture/exit",
+                    serde_json::json!({}),
+                    Duration::from_secs(2)
+                )
+                .await
+                .is_err()
+        );
+        timeout(Duration::from_secs(2), async {
+            while first.is_alive() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let recovered = manager.transport_for_path(&path).await.unwrap();
+        assert!(!Arc::ptr_eq(&first, &recovered));
+        assert!(
+            recovered
+                .request(
+                    "fixture/ready",
+                    serde_json::json!({}),
+                    Duration::from_secs(2)
+                )
+                .await
+                .is_ok()
+        );
+        assert_eq!(std::fs::read_to_string(&pids).unwrap().lines().count(), 2);
+        manager.shutdown_all().await;
+        assert!(manager.transport_for_path(&path).await.is_some());
+        assert_eq!(std::fs::read_to_string(&pids).unwrap().lines().count(), 3);
+        manager.shutdown_all().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn built_in_transport_cache_shares_cold_start_and_recovers_after_exit() {
+        cache_fixture(false).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn custom_transport_cache_shares_cold_start_and_recovers_after_exit() {
+        cache_fixture(true).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_transport_initialization_does_not_poison_the_cache() {
+        let root = tempfile::tempdir().unwrap();
+        let script = root.path().join("server.py");
+        let mut config = LspConfig::default();
+        config.servers.insert(
+            "python".into(),
+            vec![
+                "python3".into(),
+                "-u".into(),
+                script.to_string_lossy().into_owned(),
+                "cache".into(),
+                root.path().join("pids").to_string_lossy().into_owned(),
+            ],
+        );
+        let manager = LspManager::new(config, root.path().to_owned());
+        let path = root.path().join("file.py");
+        assert!(manager.transport_for_path(&path).await.is_none());
+        std::fs::write(&script, client::tests::STDIO_FIXTURE).unwrap();
+        assert!(manager.transport_for_path(&path).await.is_some());
+        manager.shutdown_all().await;
+    }
+
+    struct SemanticFixture {
+        result: serde_json::Value,
+        mutate: Option<PathBuf>,
+    }
+    #[async_trait::async_trait]
+    impl LspTransport for SemanticFixture {
+        async fn diagnostics_for(
+            &self,
+            _: &Path,
+            _: &str,
+            _: Duration,
+        ) -> anyhow::Result<client::DiagnosticPublication> {
+            Ok(vec![].into())
+        }
+        async fn request(
+            &self,
+            _: &str,
+            _: serde_json::Value,
+            _: Duration,
+        ) -> anyhow::Result<serde_json::Value> {
+            if let Some(path) = &self.mutate {
+                tokio::fs::write(path, "changed").await?;
+            }
+            Ok(self.result.clone())
+        }
+        async fn shutdown(&self) {}
+    }
+
+    #[tokio::test]
+    async fn semantic_source_revision_rejects_stale_before_and_after_request() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("main.rs");
+        tokio::fs::write(&file, "fn main() {}\n").await.unwrap();
+        let manager = LspManager::new(LspConfig::default(), root.path().to_owned());
+        assert_eq!(
+            manager
+                .intelligence_at_revision(
+                    "definition",
+                    &file,
+                    Some(1),
+                    Some(1),
+                    None,
+                    Some("wrong")
+                )
+                .await
+                .unwrap_err(),
+            "stale_document"
+        );
+        manager
+            .install_test_transport(
+                Language::Rust,
+                Arc::new(SemanticFixture {
+                    result: serde_json::json!([]),
+                    mutate: Some(file.clone()),
+                }),
+            )
+            .await;
+        let revision = crate::hashing::sha256_hex(b"fn main() {}\n");
+        assert_eq!(
+            manager
+                .intelligence_at_revision(
+                    "definition",
+                    &file,
+                    Some(1),
+                    Some(1),
+                    None,
+                    Some(&revision)
+                )
+                .await
+                .unwrap_err(),
+            "stale_document"
+        );
+    }
+
+    #[tokio::test]
+    async fn semantic_locations_preserve_raw_and_distinguish_target_readback_from_analysis() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("main.rs");
+        let target = root.path().join("a b.rs");
+        tokio::fs::write(&file, "fn main() {}\n").await.unwrap();
+        tokio::fs::write(&target, "🐋foo\n").await.unwrap();
+        let raw = serde_json::json!([{"targetUri":client::uri_from_path(&target),"targetSelectionRange":{"start":{"line":0,"character":2},"end":{"line":0,"character":5}}}]);
+        let manager = LspManager::new(LspConfig::default(), root.path().to_owned());
+        manager
+            .install_test_transport(
+                Language::Rust,
+                Arc::new(SemanticFixture {
+                    result: raw.clone(),
+                    mutate: None,
+                }),
+            )
+            .await;
+        let result = manager
+            .intelligence("definition", &file, Some(1), Some(1), None)
+            .await
+            .unwrap();
+        assert_eq!(result["result"], raw);
+        assert_eq!(result["semantic_contract_version"], 1);
+        assert_eq!(result["position_encoding"], "utf-16");
+        assert_eq!(result["freshness"], "unverified");
+        assert_eq!(result["locations"][0]["path"], "a b.rs");
+        assert_eq!(
+            result["locations"][0]["target_revision"],
+            crate::hashing::sha256_hex("🐋foo\n".as_bytes())
+        );
+        assert_eq!(result["locations"][0]["target_freshness"], "unverified");
+        assert_eq!(result["omitted"], 0);
+    }
+
+    #[tokio::test]
+    async fn semantic_locations_reject_unsafe_uri_range_and_symlink_and_bound_symbols() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("main.rs");
+        tokio::fs::write(&file, "🐋foo\n").await.unwrap();
+        let manager = LspManager::new(LspConfig::default(), root.path().to_owned());
+        let good = serde_json::json!({"name":"foo","kind":12,"selectionRange":{"start":{"line":0,"character":2},"end":{"line":0,"character":5}}});
+        let mut split = good.clone();
+        split["selectionRange"]["start"]["character"] = serde_json::json!(1);
+        let mut huge = good.clone();
+        huge["selectionRange"]["end"]["character"] = serde_json::json!(u64::MAX);
+        let mut unsafe_uri = good.clone();
+        unsafe_uri["uri"] = serde_json::json!("file://remote/etc/passwd");
+        let mut outside = good.clone();
+        outside["uri"] = serde_json::json!("file:///etc/passwd");
+        let mut reverse = good.clone();
+        reverse["selectionRange"]["end"]["character"] = serde_json::json!(0);
+        let cases = vec![good.clone(), split, huge, unsafe_uri, outside, reverse];
+        #[cfg(unix)]
+        let cases = {
+            let mut cases = cases;
+            let link = root.path().join("link.rs");
+            std::os::unix::fs::symlink(&file, &link).unwrap();
+            let mut linked = good.clone();
+            linked["uri"] = serde_json::json!(client::uri_from_path(&link));
+            cases.push(linked);
+            cases
+        };
+        let expected_omitted = cases.len() - 1;
+        let (locations, truncated, omitted) = manager
+            .semantic_locations(&serde_json::json!(cases), &file, "🐋foo\n")
+            .await;
+        assert_eq!(locations.len(), 1);
+        assert!(!truncated);
+        assert_eq!(omitted, expected_omitted);
+        let (locations, truncated, _) = manager
+            .semantic_locations(&serde_json::json!(vec![good; 100]), &file, "🐋foo\n")
+            .await;
+        assert_eq!(locations.len(), 40);
+        assert!(truncated);
+        assert!(
+            !SemanticPosition {
+                line: 0,
+                character: 1
+            }
+            .valid_in("🐋")
+        );
+        assert!(
+            SemanticPosition {
+                line: 0,
+                character: 2
+            }
+            .valid_in("🐋")
+        );
+    }
+
+    #[test]
+    fn semantic_raw_result_bound_is_unicode_safe_for_arrays_too() {
+        let result = truncate_intelligence_result(serde_json::json!(["🐋".repeat(20_000)]));
+        assert_eq!(result["truncated"], true);
+        assert!(result["preview"].as_str().unwrap().len() <= 12_000);
     }
 
     #[tokio::test]
@@ -1069,10 +1642,10 @@ pub(crate) mod tests {
             severity: Severity::Error,
             message: "ruby type error".to_string(),
         }]));
-        mgr.custom_transports
-            .lock()
-            .await
-            .insert("rb".to_string(), fake.clone());
+        mgr.custom_transports.lock().await.insert(
+            "rb".to_string(),
+            Arc::new(AsyncMutex::new(Some(fake.clone()))),
+        );
 
         let block = mgr.diagnostics_for(&path, 1).await.expect("has block");
         let rendered = block.render();
@@ -1090,5 +1663,132 @@ pub(crate) mod tests {
 
         // No custom config for .lua and Lua is not built-in → should be None.
         assert!(mgr.diagnostics_for(&path, 1).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn diagnostic_freshness_intelligence_distinguishes_no_server_and_unverified_empty() {
+        let root = tempfile::tempdir().unwrap();
+        let unknown = root.path().join("notes.unsupported_extension");
+        std::fs::write(&unknown, "text").unwrap();
+        let manager = LspManager::new(LspConfig::default(), root.path().to_owned());
+        let error = manager
+            .intelligence("diagnostics", &unknown, None, None, None)
+            .await
+            .unwrap_err();
+        assert!(error.contains("no LSP server"));
+        let file = root.path().join("main.rs");
+        let text = "fn main() { /* 🐋 */ }";
+        std::fs::write(&file, text).unwrap();
+        manager
+            .install_test_transport(Language::Rust, Arc::new(FakeTransport::new(vec![])))
+            .await;
+        let result = manager
+            .intelligence("diagnostics", &file, None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(result["items"], serde_json::json!([]));
+        assert_eq!(
+            result["source_revision"],
+            crate::hashing::sha256_hex(text.as_bytes())
+        );
+        assert_eq!(result["freshness"], "unverified");
+        assert!(result["diagnostic_version"].is_null());
+        assert_eq!(result["total_diagnostic_count"], 0);
+    }
+
+    #[tokio::test]
+    async fn diagnostic_freshness_missing_binary_is_not_clean() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("main.rs");
+        std::fs::write(&file, "fn main() {}").unwrap();
+        let mut config = LspConfig::default();
+        config.servers.insert(
+            "rust".into(),
+            vec![
+                root.path()
+                    .join("nonexistent-language-server")
+                    .display()
+                    .to_string(),
+            ],
+        );
+        let manager = LspManager::new(config, root.path().to_owned());
+        assert!(
+            manager
+                .intelligence("diagnostics", &file, None, None, None)
+                .await
+                .unwrap_err()
+                .contains("no LSP server")
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn diagnostic_freshness_confined_read_rejects_replaced_symlink() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let secret = outside.path().join("secret.rs");
+        std::fs::write(&secret, "outside text").unwrap();
+        let file = root.path().join("main.rs");
+        std::os::unix::fs::symlink(&secret, &file).unwrap();
+        let manager = LspManager::new(LspConfig::default(), root.path().to_owned());
+        let fake = Arc::new(FakeTransport::new(vec![]));
+        manager
+            .install_test_transport(Language::Rust, fake.clone())
+            .await;
+        assert!(
+            manager
+                .intelligence("diagnostics", &file, None, None, None)
+                .await
+                .unwrap_err()
+                .contains("read file")
+        );
+        assert_eq!(
+            fake.call_count(),
+            0,
+            "outside bytes must not reach the language server"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn diagnostic_freshness_accepts_verified_workspace_root_alias_only() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let alias = root.path().join("workspace-alias");
+        std::os::unix::fs::symlink(&workspace, &alias).unwrap();
+        let original = workspace.join("main.rs");
+        std::fs::write(&original, "fn main() {} 🐋").unwrap();
+        let manager = LspManager::new(LspConfig::default(), alias.clone());
+        assert_eq!(
+            manager
+                .read_workspace_text(&original.canonicalize().unwrap())
+                .await
+                .unwrap(),
+            "fn main() {} 🐋"
+        );
+        assert_eq!(
+            manager
+                .read_workspace_text(&alias.join("main.rs"))
+                .await
+                .unwrap(),
+            "fn main() {} 🐋"
+        );
+        let outside = root.path().join("outside.rs");
+        std::fs::write(&outside, "not in workspace").unwrap();
+        assert!(manager.read_workspace_text(&outside).await.is_err());
+        std::os::unix::fs::symlink(&outside, workspace.join("escape.rs")).unwrap();
+        assert!(
+            manager
+                .read_workspace_text(&alias.join("escape.rs"))
+                .await
+                .is_err()
+        );
+        assert!(
+            manager
+                .read_workspace_text(&workspace.canonicalize().unwrap().join("escape.rs"))
+                .await
+                .is_err()
+        );
     }
 }

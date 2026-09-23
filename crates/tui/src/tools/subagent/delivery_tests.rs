@@ -42,7 +42,6 @@ fn worker(root: &Path, write: bool, paths: &[&str], scope: &[&str]) -> (SubAgent
         coordination_contracts: Vec::new(),
         expected_artifact: None,
         deliverables: paths.iter().map(|path| (*path).into()).collect(),
-        token_budget: None,
         resume_identity: None,
         generation: 1,
         resume_from_agent_id: None,
@@ -71,6 +70,14 @@ fn complete(manager: &mut SubAgentManager, id: &str, report: &str) -> AgentRunVe
     result.status = SubAgentStatus::Completed;
     result.result = Some(report.into());
     manager.complete_worker_from_result(id, &result);
+    // Deferred verification (#6210): the commit leaves verification pending;
+    // run the same snapshot→compute→store halves `ensure` runs off the lock.
+    if !manager.worker_records[id].delivery_evidence.checked
+        && let Some(inputs) = manager.delivery_verification_inputs(id, &result)
+    {
+        let verification = delivery::compute_delivery_verification(&inputs);
+        manager.store_delivery_verification(id, verification);
+    }
     manager.worker_records[id].verification.clone()
 }
 
@@ -428,7 +435,9 @@ fn disjoint_sibling_write_paths_admit_and_ancestor_overlap_names_actual_remedy()
 #[tokio::test]
 #[allow(clippy::print_stderr)] // Test receipt must distinguish refused probes from exercised isolation.
 async fn enforced_readonly_python_queries_sqlite_under_a_live_peer_write_claim() {
-    let tmp = tempdir().unwrap();
+    // #6305: the sandbox replaces /tmp with a fresh tmpfs, so a fixture
+    // rooted there vanishes before --chdir reaches it.
+    let tmp = crate::test_support::sandbox_visible_tempdir();
     let database = rusqlite::Connection::open(tmp.path().join("fixture.sqlite")).unwrap();
     database
         .execute_batch(
@@ -540,4 +549,137 @@ async fn enforced_readonly_python_queries_sqlite_under_a_live_peer_write_claim()
             "NATIVE_READONLY_ENFORCED: child SQLite query passed under a live peer claim; mutation denied"
         );
     }
+}
+
+/// Deferred-verification contract (#6210): the terminal commit stores the
+/// worker projection but leaves verification pending for `ensure`.
+#[test]
+fn terminal_commit_leaves_delivery_verification_pending() {
+    let tmp = tempdir().unwrap();
+    repository(tmp.path());
+    let (mut manager, id) = worker(tmp.path(), true, &["report.md"], &["."]);
+    let mut result = manager.get_result(&id).unwrap();
+    result.status = SubAgentStatus::Completed;
+    result.result = Some("Finished the research.".into());
+    manager.complete_worker_from_result(&id, &result);
+    let record = manager.worker_records.get(&id).unwrap();
+    assert!(!record.delivery_evidence.checked);
+    assert_eq!(record.verification.status, "self_report_only");
+    assert_eq!(
+        record.result_summary.as_deref(),
+        Some("Finished the research.")
+    );
+}
+
+#[tokio::test]
+async fn ensure_worker_delivery_verified_stores_verdicts_and_is_idempotent() {
+    let tmp = tempdir().unwrap();
+    repository(tmp.path());
+    let (manager, id) = worker(tmp.path(), true, &["report.md"], &["."]);
+    let manager = Arc::new(RwLock::new(manager));
+    let result = {
+        let mut guard = manager.write().await;
+        let mut result = guard.get_result(&id).unwrap();
+        result.status = SubAgentStatus::Completed;
+        result.result = Some("Finished the research.".into());
+        guard.complete_worker_from_result(&id, &result);
+        assert!(!guard.worker_records[&id].delivery_evidence.checked);
+        result
+    };
+    ensure_worker_delivery_verified(&manager, &id, &result).await;
+    let first = manager.read().await.worker_records[&id]
+        .verification
+        .clone();
+    assert_eq!(first.status, "deliverable_missing");
+    assert!(
+        manager.read().await.worker_records[&id]
+            .delivery_evidence
+            .checked
+    );
+    // A second call is a no-op even with a different report.
+    let mut other = result.clone();
+    other.result = Some("CHANGES: src/lib.rs".into());
+    ensure_worker_delivery_verified(&manager, &id, &other).await;
+    assert_eq!(manager.read().await.worker_records[&id].verification, first);
+}
+
+#[tokio::test]
+async fn ensure_worker_delivery_verified_ignores_running_missing_and_checked() {
+    let tmp = tempdir().unwrap();
+    repository(tmp.path());
+    let (manager, id) = worker(tmp.path(), true, &[], &["src"]);
+    let manager = Arc::new(RwLock::new(manager));
+    let running = manager.read().await.get_result(&id).unwrap();
+    assert_eq!(running.status, SubAgentStatus::Running);
+    ensure_worker_delivery_verified(&manager, &id, &running).await;
+    assert!(
+        !manager.read().await.worker_records[&id]
+            .delivery_evidence
+            .checked
+    );
+    // A missing worker id is a silent no-op.
+    let mut missing = running.clone();
+    missing.agent_id = "agent_missing".to_string();
+    missing.status = SubAgentStatus::Completed;
+    ensure_worker_delivery_verified(&manager, "agent_missing", &missing).await;
+    // A checked record keeps its stored verdict.
+    let mut done = running.clone();
+    done.status = SubAgentStatus::Completed;
+    done.result = Some("CHANGES: src/lib.rs".into());
+    ensure_worker_delivery_verified(&manager, &id, &done).await;
+    assert_eq!(
+        manager.read().await.worker_records[&id].verification.status,
+        "claim_mismatch"
+    );
+    let mut changed_mind = done.clone();
+    changed_mind.result = Some("CHANGES: None".into());
+    ensure_worker_delivery_verified(&manager, &id, &changed_mind).await;
+    assert_eq!(
+        manager.read().await.worker_records[&id].verification.status,
+        "claim_mismatch"
+    );
+}
+
+/// Read-side backstop (#6210): a terminal detail projection heals a
+/// verification left pending by a Stop/interrupt/close/stale commit.
+#[tokio::test]
+async fn detail_projection_heals_pending_delivery_verification() {
+    let tmp = tempdir().unwrap();
+    repository(tmp.path());
+    let (manager, id) = worker(tmp.path(), true, &["report.md"], &["."]);
+    let manager = Arc::new(RwLock::new(manager));
+    let result = {
+        let mut guard = manager.write().await;
+        let mut result = guard.get_result(&id).unwrap();
+        result.status = SubAgentStatus::Completed;
+        result.result = Some("Finished the research.".into());
+        guard.complete_worker_from_result(&id, &result);
+        result
+    };
+    let mut context = ToolContext::new(tmp.path());
+    context.state_namespace = "workspace".to_string();
+    let worker_record = manager
+        .read()
+        .await
+        .get_worker_record_for_session("workspace", &id);
+    assert!(
+        worker_record
+            .as_ref()
+            .is_some_and(|record| !record.delivery_evidence.checked)
+    );
+    let projection =
+        subagent_session_projection(&manager, result, false, &context, worker_record).await;
+    assert_eq!(projection.verification.status, "deliverable_missing");
+    assert!(
+        projection
+            .verification
+            .deliverables
+            .iter()
+            .any(|verdict| verdict.path == "report.md")
+    );
+    assert!(
+        manager.read().await.worker_records[&id]
+            .delivery_evidence
+            .checked
+    );
 }

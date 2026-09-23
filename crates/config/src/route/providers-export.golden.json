@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "runtimeVersion": "0.9.13",
+  "runtimeVersion": "0.10.0",
   "routes": [
     {
       "id": "anthropic",
@@ -121,6 +121,24 @@
         }
       ],
       "transport": "open-ai-responses"
+    },
+    {
+      "id": "csdn",
+      "family": "csdn",
+      "label": "CSDN",
+      "endpoint": "https://ai.csdn.net/api/model/v1",
+      "wire": "chat-completions",
+      "defaultModel": "glm_for_coding",
+      "envVars": [
+        "CSDN_API_KEY"
+      ],
+      "auth": [
+        {
+          "kind": "api-key",
+          "label": "API key"
+        }
+      ],
+      "transport": "chat-completions"
     },
     {
       "id": "custom",
@@ -411,6 +429,24 @@
       "defaultModel": "mistral-code-latest",
       "envVars": [
         "MISTRAL_API_KEY"
+      ],
+      "auth": [
+        {
+          "kind": "api-key",
+          "label": "API key"
+        }
+      ],
+      "transport": "chat-completions"
+    },
+    {
+      "id": "modelscope",
+      "family": "modelscope",
+      "label": "ModelScope",
+      "endpoint": "https://api-inference.modelscope.cn/v1",
+      "wire": "chat-completions",
+      "defaultModel": "Qwen/Qwen3.5-397B-A17B",
+      "envVars": [
+        "MODELSCOPE_API_KEY"
       ],
       "auth": [
         {
@@ -1036,6 +1072,21 @@
           "label": "API key"
         }
       ],
+      "models": [
+        {
+          "id": "step-3.5-flash"
+        },
+        {
+          "id": "step-3.5-flash-2603"
+        },
+        {
+          "id": "step-3.7-flash",
+          "default": true
+        },
+        {
+          "id": "step-5-preview"
+        }
+      ],
       "transport": "chat-completions"
     },
     {
@@ -1204,6 +1255,12 @@
         {
           "id": "mimo-v2.5-pro",
           "default": true
+        },
+        {
+          "id": "mimo-v2.6-flash"
+        },
+        {
+          "id": "mimo-v2.6-pro"
         }
       ],
       "transport": "chat-completions"
@@ -1243,6 +1300,24 @@
         },
         {
           "id": "glm-5.1"
+        }
+      ],
+      "transport": "chat-completions"
+    },
+    {
+      "id": "zenmux",
+      "family": "zenmux",
+      "label": "ZenMux",
+      "endpoint": "https://zenmux.ai/api/v1",
+      "wire": "chat-completions",
+      "defaultModel": "deepseek/deepseek-v4.1-flash",
+      "envVars": [
+        "ZENMUX_API_KEY"
+      ],
+      "auth": [
+        {
+          "kind": "api-key",
+          "label": "API key"
         }
       ],
       "transport": "chat-completions"

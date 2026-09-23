@@ -1,4 +1,4 @@
-use super::DeepSeekClient;
+use super::CodewhaleClient;
 use super::chat::{parse_chat_message, parse_sse_chunk};
 use crate::config::{Config, ProviderConfig, ProvidersConfig};
 use anyhow::Result;
@@ -6,7 +6,7 @@ use codewhale_models::Role;
 use codewhale_models::{ContentBlock, Delta, Message, MessageRequest, StreamEvent, Tool};
 use serde_json::{Value, json};
 
-fn ds4_client() -> DeepSeekClient {
+fn ds4_client() -> CodewhaleClient {
     let mut providers = ProvidersConfig::default();
     providers.custom.insert(
         "ds4".to_string(),
@@ -19,7 +19,7 @@ fn ds4_client() -> DeepSeekClient {
             ..Default::default()
         },
     );
-    DeepSeekClient::new(&Config {
+    CodewhaleClient::new(&Config {
         provider: Some("ds4".to_string()),
         providers: Some(providers),
         ..Default::default()

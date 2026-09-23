@@ -10,9 +10,9 @@
 //! - Human-only. This is a slash command, never a model-visible tool, event,
 //!   or authority, and it writes nothing back into App/session/plan/workflow
 //!   state (see the registry/catalog contract test).
-//! - Read-only projection over existing state. Redaction reuses the
-//!   transcript/export seams (`export::redact_json` for values,
-//!   `export::sanitize_text` for keys and status labels, which
+//! - Read-only projection over existing state. Redaction reuses the shared
+//!   sanitizer seams in `codewhale_secrets::sanitize` (`redact_json` for
+//!   values, `sanitize_text` for keys and status labels, which
 //!   `redact_json` does not reach) plus a strict pass that strips URL
 //!   userinfo/query/fragment entirely and folds the workspace and home
 //!   prefixes to labels, removes other absolute paths, and handles generic
@@ -28,8 +28,8 @@
 //! - It is not a general PII scrubber. Workspace/home paths retain a useful
 //!   labelled suffix; other absolute POSIX, drive-letter, and UNC paths are
 //!   replaced outright.
-//! - Redaction is pattern-based (the export seam's private-key/bearer/JWT/
-//!   URL/secret regexes plus this module's strict URL pass). A secret that
+//! - Redaction is pattern-based (the shared sanitizer's private-key/bearer/
+//!   JWT/URL/secret regexes plus this module's strict URL pass). A secret that
 //!   matches none of those patterns and sits under a non-sensitive key is
 //!   copied as-is.
 //! - Delivery to the clipboard is not confirmed. Terminal-client transports
@@ -49,7 +49,10 @@ use codewhale_localization::{Locale, MessageId, tr};
 use codewhale_models::{ContentBlock, Message};
 
 use super::CommandResult;
-use super::export::{is_internal_role, is_sensitive_key, redact_json, sanitize_text};
+// FEAT-025 D4: the sanitizer helpers moved to the single shared portable
+// implementation in `codewhale-secrets`; `/structcopy` stays legacy until
+// FEAT-026 and only rewires its import.
+use codewhale_secrets::sanitize::{is_internal_role, is_sensitive_key, redact_json, sanitize_text};
 
 pub(in crate::commands) const COMMAND_INFO: CommandInfo = CommandInfo {
     name: "structcopy",
@@ -340,7 +343,7 @@ fn block_payload(block: &ContentBlock) -> Value {
 fn tool_payload(app: &App, call_id: &str) -> Result<(&'static str, Value, Value), String> {
     let mut found_call: Option<(String, Value)> = None;
     let mut found_result: Option<(Option<bool>, String, Option<Vec<Value>>)> = None;
-    for message in &app.api_messages {
+    for message in app.api_messages.iter() {
         for block in &message.content {
             match block {
                 ContentBlock::ToolUse {
@@ -720,7 +723,7 @@ fn scrub_string(text: &str, labels: &PathLabels) -> String {
     scrub_paths(&scrub_urls(&labelled))
 }
 
-/// Convert the prose placeholders owned by the shared export seam into stable
+/// Convert the prose placeholders owned by the shared sanitizer into stable
 /// language-neutral codes. Structural JSON is a machine artifact and must not
 /// change with the UI locale.
 fn normalize_redaction_codes(value: &mut Value) {
@@ -783,7 +786,7 @@ const URL_TRAILING_PUNCTUATION: &[char] = &[
 /// Strip URL userinfo, query, and fragment entirely, leaving a
 /// `scheme://host[:port]/path` label.
 ///
-/// The export seam has already masked credentials in URLs it recognised;
+/// The shared sanitizer has already masked credentials in URLs it recognised;
 /// this pass enforces the stricter structural-copy contract that no
 /// userinfo, query string, or fragment may survive at all — including for
 /// URLs that are punctuation-wrapped (`(https://…)`, `<https://…>`,
@@ -1272,7 +1275,7 @@ mod tests {
     }
 
     fn seed_transcript(app: &mut App) {
-        app.api_messages = vec![
+        app.api_messages = std::sync::Arc::new(vec![
             Message {
                 role: Role::User,
                 content: vec![ContentBlock::Text {
@@ -1312,7 +1315,7 @@ mod tests {
                     content_blocks: None,
                 }],
             },
-        ];
+        ]);
     }
 
     #[test]
@@ -1366,7 +1369,7 @@ mod tests {
     fn generated_omissions_are_language_neutral_codes() {
         let tmpdir = TempDir::new().expect("tempdir");
         let mut app = test_app(&tmpdir);
-        app.api_messages = vec![
+        app.api_messages = std::sync::Arc::new(vec![
             Message {
                 role: Role::System,
                 content: vec![ContentBlock::Text {
@@ -1382,7 +1385,7 @@ mod tests {
                     },
                 }],
             },
-        ];
+        ]);
 
         let internal = parsed(&stdout_json(&execute_structcopy(
             &mut app,
@@ -1429,13 +1432,15 @@ mod tests {
         assert!(!json.contains("result-secret-token"), "{json}");
 
         // A call without a result is honest, not fabricated.
-        app.api_messages[1].content.push(ContentBlock::ToolUse {
-            id: "call-lonely".to_string(),
-            name: "view_image".to_string(),
-            input: json!({}),
-            caller: None,
-            thought_signature: None,
-        });
+        app.api_messages_mut()[1]
+            .content
+            .push(ContentBlock::ToolUse {
+                id: "call-lonely".to_string(),
+                name: "view_image".to_string(),
+                input: json!({}),
+                caller: None,
+                thought_signature: None,
+            });
         let json = stdout_json(&execute_structcopy(
             &mut app,
             Some("tool call-lonely stdout"),
@@ -1454,7 +1459,7 @@ mod tests {
 
         let tmpdir = TempDir::new().expect("tempdir");
         let mut app = test_app(&tmpdir);
-        app.api_messages = vec![
+        app.api_messages = std::sync::Arc::new(vec![
             Message {
                 role: Role::Assistant,
                 content: vec![ContentBlock::ToolUse {
@@ -1475,7 +1480,7 @@ mod tests {
                     content_blocks: None,
                 }],
             },
-        ];
+        ]);
 
         // Tool-pair projection.
         let json = stdout_json(&execute_structcopy(
@@ -1747,13 +1752,15 @@ mod tests {
 
         // Receipt path: a long but *available* selector is bounded too.
         let long_id = format!("call-{}", "z".repeat(4096));
-        app.api_messages[1].content.push(ContentBlock::ToolUse {
-            id: long_id.clone(),
-            name: "exec_command".to_string(),
-            input: json!({}),
-            caller: None,
-            thought_signature: None,
-        });
+        app.api_messages_mut()[1]
+            .content
+            .push(ContentBlock::ToolUse {
+                id: long_id.clone(),
+                name: "exec_command".to_string(),
+                input: json!({}),
+                caller: None,
+                thought_signature: None,
+            });
         let json = stdout_json(&execute_structcopy(
             &mut app,
             Some(&format!("tool {long_id} stdout")),
@@ -1773,13 +1780,15 @@ mod tests {
             "call-Bearer-abcdef1234567890",
             "call-Bearer=zyxwvutsrqponmlk",
         ] {
-            app.api_messages[1].content.push(ContentBlock::ToolUse {
-                id: bearer_id.to_string(),
-                name: "exec_command".to_string(),
-                input: json!({}),
-                caller: None,
-                thought_signature: None,
-            });
+            app.api_messages_mut()[1]
+                .content
+                .push(ContentBlock::ToolUse {
+                    id: bearer_id.to_string(),
+                    name: "exec_command".to_string(),
+                    input: json!({}),
+                    caller: None,
+                    thought_signature: None,
+                });
             let json = stdout_json(&execute_structcopy(
                 &mut app,
                 Some(&format!("tool {bearer_id} stdout")),
@@ -1811,7 +1820,7 @@ mod tests {
             "\u{1b}[31mansi\u{1b}[0m\nkey": 4,
             format!("at {workspace}/src"): 5,
         });
-        app.api_messages = vec![Message {
+        app.api_messages = std::sync::Arc::new(vec![Message {
             role: Role::Assistant,
             content: vec![ContentBlock::ToolUse {
                 id: "call-keys".to_string(),
@@ -1820,7 +1829,7 @@ mod tests {
                 caller: None,
                 thought_signature: None,
             }],
-        }];
+        }]);
 
         let first = stdout_json(&execute_structcopy(&mut app, Some("tool call-keys stdout")));
         let second = stdout_json(&execute_structcopy(&mut app, Some("tool call-keys stdout")));
@@ -1880,7 +1889,7 @@ mod tests {
     fn sensitive_keys_are_classified_after_control_and_ansi_normalization() {
         let tmpdir = TempDir::new().expect("tempdir");
         let mut app = test_app(&tmpdir);
-        app.api_messages = vec![Message {
+        app.api_messages = std::sync::Arc::new(vec![Message {
             role: Role::Assistant,
             content: vec![ContentBlock::ToolUse {
                 id: "call-obfuscated-keys".to_string(),
@@ -1892,7 +1901,7 @@ mod tests {
                 caller: None,
                 thought_signature: None,
             }],
-        }];
+        }]);
 
         let json = stdout_json(&execute_structcopy(
             &mut app,
@@ -1949,7 +1958,7 @@ mod tests {
         let mut app = test_app(&tmpdir);
         let exact = "x".repeat(MAX_KEY_BYTES);
         let same_after_flatten = format!("{exact}\n");
-        app.api_messages = vec![Message {
+        app.api_messages = std::sync::Arc::new(vec![Message {
             role: Role::Assistant,
             content: vec![ContentBlock::ToolUse {
                 id: "call-reserve".to_string(),
@@ -1958,7 +1967,7 @@ mod tests {
                 caller: None,
                 thought_signature: None,
             }],
-        }];
+        }]);
 
         let json = stdout_json(&execute_structcopy(
             &mut app,
@@ -2031,7 +2040,7 @@ mod tests {
         let tmpdir = TempDir::new().expect("tempdir");
         let mut app = test_app(&tmpdir);
         let workspace = tmpdir.path().to_string_lossy().into_owned();
-        app.api_messages = vec![Message {
+        app.api_messages = std::sync::Arc::new(vec![Message {
             role: Role::User,
             content: vec![ContentBlock::Text {
                 text: format!(
@@ -2043,7 +2052,7 @@ mod tests {
                 ),
                 cache_control: None,
             }],
-        }];
+        }]);
 
         let json = stdout_json(&execute_structcopy(&mut app, Some("turn 1 stdout")));
         for forbidden in [
@@ -2261,7 +2270,7 @@ mod tests {
         let tmpdir = TempDir::new().expect("tempdir");
         let mut app = test_app(&tmpdir);
         let call_id = "call=/opt/customer/private-id";
-        app.api_messages = vec![Message {
+        app.api_messages = std::sync::Arc::new(vec![Message {
             role: Role::Assistant,
             content: vec![ContentBlock::ToolUse {
                 id: call_id.to_string(),
@@ -2273,7 +2282,7 @@ mod tests {
                 caller: None,
                 thought_signature: None,
             }],
-        }];
+        }]);
 
         let json = stdout_json(&execute_structcopy(
             &mut app,
@@ -2296,13 +2305,13 @@ mod tests {
     fn string_bytes_cap_truncates_grapheme_safely() {
         let tmpdir = TempDir::new().expect("tempdir");
         let mut app = test_app(&tmpdir);
-        app.api_messages = vec![Message {
+        app.api_messages = std::sync::Arc::new(vec![Message {
             role: Role::User,
             content: vec![ContentBlock::Text {
                 text: "emoji cluster test: 👨‍👩‍👧‍👦🏳️‍🌈 repeated many times over".repeat(20),
                 cache_control: None,
             }],
-        }];
+        }]);
         let caps = Caps {
             max_string_bytes: 40,
             ..DEFAULT_CAPS
@@ -2365,13 +2374,13 @@ mod tests {
         // receipt still reports the truncation.
         let tmpdir = TempDir::new().expect("tempdir");
         let mut app = test_app(&tmpdir);
-        app.api_messages = vec![Message {
+        app.api_messages = std::sync::Arc::new(vec![Message {
             role: Role::User,
             content: vec![ContentBlock::Text {
                 text: "a longer body that cannot fit".to_string(),
                 cache_control: None,
             }],
-        }];
+        }]);
         let caps = Caps {
             max_string_bytes: 1,
             ..DEFAULT_CAPS
@@ -2422,7 +2431,7 @@ mod tests {
     fn depth_cap_omits_deep_subtrees() {
         let tmpdir = TempDir::new().expect("tempdir");
         let mut app = test_app(&tmpdir);
-        app.api_messages = vec![Message {
+        app.api_messages = std::sync::Arc::new(vec![Message {
             role: Role::Assistant,
             content: vec![ContentBlock::ToolUse {
                 id: "call-deep".to_string(),
@@ -2431,7 +2440,7 @@ mod tests {
                 caller: None,
                 thought_signature: None,
             }],
-        }];
+        }]);
         let caps = Caps {
             max_depth: 3,
             ..DEFAULT_CAPS
@@ -2462,7 +2471,7 @@ mod tests {
         let mut app = test_app(&tmpdir);
         // Two strings and two array items live below the depth cut, plus one
         // string and one array item above it.
-        app.api_messages = vec![Message {
+        app.api_messages = std::sync::Arc::new(vec![Message {
             role: Role::Assistant,
             content: vec![ContentBlock::ToolUse {
                 id: "call-counts".to_string(),
@@ -2474,7 +2483,7 @@ mod tests {
                 caller: None,
                 thought_signature: None,
             }],
-        }];
+        }]);
         let caps = Caps {
             max_depth: 3,
             ..DEFAULT_CAPS
@@ -2534,7 +2543,7 @@ mod tests {
         let mut app = test_app(&tmpdir);
         let long_a = format!("{}A", "private-key-name-".repeat(32));
         let long_b = format!("{}B", "private-key-name-".repeat(32));
-        app.api_messages = vec![Message {
+        app.api_messages = std::sync::Arc::new(vec![Message {
             role: Role::Assistant,
             content: vec![ContentBlock::ToolUse {
                 id: "call-deep-keys".to_string(),
@@ -2543,7 +2552,7 @@ mod tests {
                 caller: None,
                 thought_signature: None,
             }],
-        }];
+        }]);
         let caps = Caps {
             max_depth: 3,
             ..DEFAULT_CAPS

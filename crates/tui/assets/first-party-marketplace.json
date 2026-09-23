@@ -1,6 +1,6 @@
 {
   "repository": "https://github.com/Hmbown/codewhale-plugin-marketplace",
-  "revision": "0eaedd0bd4d8e8e4d150fce79a608f022f039d1d",
+  "revision": "d8640b17f27542e7122c76368724196f92a0af61",
   "catalog": {
     "name": "codewhale",
     "description": "First-party Codewhale extensions: the plugins and skills Codewhale ships, maintained in the open so anyone can propose a change.",
@@ -8,8 +8,8 @@
     "plugins": [
       {
         "name": "computer-use",
-        "source": "https://codeload.github.com/Hmbown/codewhale-plugin-marketplace/tar.gz/0eaedd0bd4d8e8e4d150fce79a608f022f039d1d#path=plugins/computer-use",
-        "version": "0.3.1",
+        "source": "https://codeload.github.com/Hmbown/codewhale-plugin-marketplace/tar.gz/d8640b17f27542e7122c76368724196f92a0af61#path=plugins/computer-use",
+        "version": "0.11.2",
         "description": "Control apps with Codewhale. macOS beta; Windows and Linux backends are experimental and source-only.",
         "homepage": "https://codewhale.net/computer-use",
         "display_name": "Computer Use",
@@ -20,25 +20,40 @@
         ]
       },
       {
+        "name": "whalesong",
+        "source": "https://codeload.github.com/Hmbown/codewhale-plugin-marketplace/tar.gz/d8640b17f27542e7122c76368724196f92a0af61#path=plugins/whalesong",
+        "version": "0.2.0",
+        "description": "Review agent traces and failures, compare runs, and turn session timing into audio. Requires the local Whalesong platform.",
+        "homepage": "https://github.com/Hmbown/codewhale-plugin-marketplace",
+        "display_name": "Whalesong",
+        "author": "Codewhale"
+      },
+      {
         "name": "whalewiki",
-        "source": "https://codeload.github.com/Hmbown/codewhale-plugin-marketplace/tar.gz/0eaedd0bd4d8e8e4d150fce79a608f022f039d1d#path=plugins/whalewiki",
-        "version": "0.1.0",
-        "description": "An evidence-bound wiki for the repo: generated pages sealed against the source files they were written from, computed staleness, a zero-install CI drift gate, and a read-only MCP surface.",
-        "homepage": "https://github.com/Hmbown/codewhale-plugin-marketplace"
+        "source": "https://codeload.github.com/Hmbown/codewhale-plugin-marketplace/tar.gz/d8640b17f27542e7122c76368724196f92a0af61#path=plugins/whalewiki",
+        "version": "0.2.0",
+        "description": "Understand a repo, find where to change it, and see which docs depend on a file. Source citations, freshness checks and a searchable offline reader.",
+        "homepage": "https://github.com/Hmbown/codewhale-plugin-marketplace",
+        "display_name": "WhaleWiki",
+        "author": "Codewhale"
       },
       {
         "name": "cloudflare-docs",
-        "source": "https://codeload.github.com/Hmbown/codewhale-plugin-marketplace/tar.gz/0eaedd0bd4d8e8e4d150fce79a608f022f039d1d#path=plugins/cloudflare-docs",
+        "source": "https://codeload.github.com/Hmbown/codewhale-plugin-marketplace/tar.gz/d8640b17f27542e7122c76368724196f92a0af61#path=plugins/cloudflare-docs",
         "version": "0.1.0",
-        "description": "Cloudflare's official remote docs MCP: current Workers/Pages/storage/platform documentation search. No credentials required.",
-        "homepage": "https://github.com/Hmbown/codewhale-plugin-marketplace"
+        "description": "Search current Cloudflare documentation through its official remote MCP. No account or credential required.",
+        "homepage": "https://github.com/Hmbown/codewhale-plugin-marketplace",
+        "display_name": "Cloudflare Docs",
+        "author": "Codewhale"
       },
       {
         "name": "codewhale-skills",
-        "source": "https://codeload.github.com/Hmbown/codewhale-plugin-marketplace/tar.gz/0eaedd0bd4d8e8e4d150fce79a608f022f039d1d#path=skills",
-        "version": "1.0.0",
-        "description": "The Codewhale skill set as one reviewed plugin: implement, debug, test, review, verify, webapp-testing, release, handoff, research and the rest of the bundled workflow skills. Each arrives namespaced as codewhale-skills:<name>. These skills also ship inside the Codewhale binary; install this bundle to carry a reviewed copy to a host that only loads plugins.",
-        "homepage": "https://github.com/Hmbown/codewhale-plugin-marketplace"
+        "source": "https://codeload.github.com/Hmbown/codewhale-plugin-marketplace/tar.gz/d8640b17f27542e7122c76368724196f92a0af61#path=skills",
+        "version": "1.1.0",
+        "description": "47 workflows for coding, research, documents, email, calendar, travel, shopping and local audio. Account and tool setup is separate; see the skill directory.",
+        "homepage": "https://github.com/Hmbown/codewhale-plugin-marketplace",
+        "display_name": "Codewhale Skills",
+        "author": "Codewhale"
       }
     ]
   }

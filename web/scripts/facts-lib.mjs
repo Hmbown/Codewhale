@@ -13,6 +13,7 @@
  *   - <repo>/web/data/latest-published-release.json → latest published release
  */
 import { readFileSync, readdirSync, existsSync } from "node:fs";
+import { spawnSync } from "node:child_process";
 import { join, dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -86,6 +87,7 @@ const PROVIDER_LABEL_MAP = {
   Ollama: { id: "ollama", label: "Ollama", env: "OLLAMA_API_KEY" },
   OllamaCloud: { id: "ollama-cloud", label: "Ollama Cloud", env: "OLLAMA_CLOUD_API_KEY / OLLAMA_API_KEY" },
   Huggingface: { id: "huggingface", label: "Hugging Face", env: "HUGGINGFACE_API_KEY / HF_TOKEN" },
+  Modelscope: { id: "modelscope", label: "ModelScope", env: "MODELSCOPE_API_KEY" },
   Deepinfra: { id: "deepinfra", label: "DeepInfra", env: "DEEPINFRA_API_KEY / DEEPINFRA_TOKEN" },
   Together: { id: "together", label: "Together AI", env: "TOGETHER_API_KEY" },
   Qianfan: { id: "qianfan", label: "Baidu Qianfan", env: "QIANFAN_API_KEY / BAIDU_QIANFAN_API_KEY" },
@@ -112,6 +114,8 @@ const PROVIDER_LABEL_MAP = {
   ModelstudioTokenPlanAnthropic: { id: "modelstudio-token-plan-anthropic", label: "Model Studio Token Plan (Anthropic-compatible)", env: "MODELSTUDIO_API_KEY" },
   ModelstudioCodingPlan: { id: "modelstudio-coding-plan", label: "Model Studio Coding Plan", env: "MODELSTUDIO_API_KEY" },
   ModelstudioCodingPlanAnthropic: { id: "modelstudio-coding-plan-anthropic", label: "Model Studio Coding Plan (Anthropic-compatible)", env: "MODELSTUDIO_API_KEY" },
+  Zenmux: { id: "zenmux", label: "ZenMux", env: "ZENMUX_API_KEY" },
+  Csdn: { id: "csdn", label: "CSDN 星图 (Starmap)", env: "CSDN_API_KEY" },
 };
 
 // DeepseekCN: not wired through shared ProviderKind (#1104).
@@ -182,6 +186,232 @@ export function deriveNodeEngines() {
   }
 }
 
+// --- Models ---------------------------------------------------------------
+//
+// The public "which models" list. Two source files are read, never scraped
+// from live provider APIs:
+//
+//   crates/tui/src/model_registry.rs          → SEED_MODEL_IDS tuples carry
+//     the canonical model ids Codewhale makes first-class promises about,
+//     each with its coarse ModelProvider grouping.
+//   crates/models/assets/model_catalog.bundled.json → the bundled metadata
+//     snapshot (context window, max output, reasoning flag) that the
+//     runtime's offline catalog layer ships.
+//
+// Provider-prefixed spellings of the same model (`deepseek/`,
+// `deepseek-ai/`, `z-ai/`, `moonshotai/`, `minimax/`, `qwen/`, `arcee-ai/`,
+// `opencode-go/`, `nvidia/`) collapse into one canonical row — they are wire
+// aliases for one model, not separate models.
+//
+// `addedAt` is the honest recency the repo itself can prove: the commit date
+// on which the model id first appeared in the model *declaration* paths
+// below — where a model becomes selectable, not where it is mentioned in
+// tests or docs. It means "first supported in Codewhale source", which is
+// the claim the page makes; it is NOT the provider's own release date.
+
+const MODEL_REGISTRY_PATH = "crates/tui/src/model_registry.rs";
+const MODEL_CATALOG_PATH = "crates/models/assets/model_catalog.bundled.json";
+const MODEL_DECLARATION_PATHS = [
+  "crates/config",
+  "crates/models",
+  "crates/tui/src/model_registry.rs",
+  "crates/tui/src/config",
+  "crates/tui/src/model_routing.rs",
+];
+
+const MODEL_PROVIDER_LABELS = {
+  DeepSeek: "DeepSeek",
+  Anthropic: "Anthropic",
+  OpenAi: "OpenAI",
+  OpenAiCodex: "OpenAI Codex",
+  Moonshot: "Moonshot/Kimi",
+  Zai: "Z.ai",
+  Minimax: "MiniMax",
+  Stepfun: "StepFun",
+  Qwen: "Qwen",
+  Arcee: "Arcee",
+  Together: "Together",
+  XiaomiMimo: "Xiaomi MiMo",
+  Meta: "Meta",
+  Xai: "xAI",
+  Mistral: "Mistral",
+  Google: "Google",
+  Other: null,
+};
+
+// Longest prefixes first so `deepseek-ai/` wins over `deepseek/`.
+const MODEL_ID_PREFIXES = [
+  "deepseek-ai", "moonshotai", "opencode-go", "arcee-ai", "minimax",
+  "deepseek", "huggingface", "together", "nvidia", "qwen", "z-ai",
+  "openai", "google", "xai", "mistral", "stepfun", "meta",
+];
+
+const MODEL_PREFIX_PROVIDERS = {
+  "deepseek-ai": "DeepSeek", deepseek: "DeepSeek", "z-ai": "Zai",
+  moonshotai: "Moonshot", minimax: "Minimax", qwen: "Qwen",
+  "arcee-ai": "Arcee", together: "Together", nvidia: "Other",
+  "opencode-go": "Moonshot", openai: "OpenAi", google: "Google",
+  xai: "Xai", mistral: "Mistral", stepfun: "Stepfun", meta: "Meta",
+  huggingface: "Other",
+};
+
+function canonicalModelId(id) {
+  const slash = id.indexOf("/");
+  if (slash < 0) return { canonical: id, prefix: null };
+  const prefix = id.slice(0, slash);
+  return MODEL_ID_PREFIXES.includes(prefix)
+    ? { canonical: id.slice(slash + 1), prefix }
+    : { canonical: id, prefix: null };
+}
+
+// Catalog-only ids carry no provider prefix; the model family is still
+// obvious from the name for these. Everything else stays "Other" and renders
+// as "—" rather than a guessed attribution.
+const MODEL_NAME_FAMILIES = [
+  [/^deepseek/i, "DeepSeek"],
+  [/^claude/i, "Anthropic"],
+  [/^(gpt|o[0-9]|codex|chatgpt)/i, "OpenAi"],
+  [/^(kimi|moonshot)/i, "Moonshot"],
+  [/^(glm-|zai)/i, "Zai"],
+  [/^(minimax|abab)/i, "Minimax"],
+  [/^step(?:-|audio)/i, "Stepfun"],
+  [/^(qwen|qwq)/i, "Qwen"],
+  [/^(arcee|trinity|afm|virtuoso|maestro|spotlight|blitz)/i, "Arcee"],
+  [/^(mimo|xiaomi)/i, "XiaomiMimo"],
+  [/^(llama|meta-llama)/i, "Meta"],
+  [/^grok/i, "Xai"],
+  [/^(mistral|codestral|devstral|magistral|mixtral|pixtral|ministral|voxtral)/i, "Mistral"],
+  [/^(gemini|gemma|learnlm)/i, "Google"],
+];
+
+function inferModelFamily(canonical) {
+  for (const [re, provider] of MODEL_NAME_FAMILIES) {
+    if (re.test(canonical)) return provider;
+  }
+  return "Other";
+}
+
+function seedModelRows() {
+  const src = read(MODEL_REGISTRY_PATH);
+  if (!src) return [];
+  return [...src.matchAll(/\("([^"]+)",\s*ModelProvider::(\w+)\)/g)]
+    .map((m) => ({ id: m[1], provider: m[2] }));
+}
+
+function bundledCatalogEntries() {
+  const raw = read(MODEL_CATALOG_PATH);
+  if (!raw) return new Map();
+  try {
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === "object" && parsed.entries
+      ? new Map(Object.entries(parsed.entries))
+      : new Map();
+  } catch {
+    return new Map();
+  }
+}
+
+/**
+ * First-appearance dates for every model alias in ONE history pass. The
+ * `-G` alternation restricts emitted diffs to commits that touched a model
+ * id line, keeping the output small; walking it oldest-first and matching
+ * `"id"` on added lines gives each alias its introduction commit. A commit
+ * that only removed an id can never be its earliest hit.
+ */
+function modelFirstSeen(aliases) {
+  const needles = [...new Set(aliases)].map((id) =>
+    `"${id.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}"`,
+  );
+  if (needles.length === 0) return new Map();
+  const res = spawnSync(
+    "git",
+    [
+      "log", "--reverse", "--format=%x00%cI", "--no-renames",
+      "-G", needles.join("|"),
+      "-p", "--", ...MODEL_DECLARATION_PATHS,
+    ],
+    { cwd: REPO_ROOT, encoding: "utf8", maxBuffer: 256 * 1024 * 1024 },
+  );
+  const firstSeen = new Map();
+  if (res.status !== 0 || typeof res.stdout !== "string") return firstSeen;
+  for (const chunk of res.stdout.split("\0").slice(1)) {
+    const nl = chunk.indexOf("\n");
+    const when = chunk.slice(0, nl).trim().slice(0, 10);
+    const added = chunk
+      .split("\n")
+      .filter((line) => line.startsWith("+") && !line.startsWith("+++"))
+      .join("\n");
+    for (const id of aliases) {
+      if (!firstSeen.has(id) && added.includes(`"${id}"`)) {
+        firstSeen.set(id, when);
+      }
+    }
+  }
+  return firstSeen;
+}
+
+export function deriveModels() {
+  const catalog = bundledCatalogEntries();
+
+  // Canonical id → merged row.
+  const rows = new Map();
+  const note = (rawId, providerKey) => {
+    const { canonical, prefix } = canonicalModelId(rawId);
+    const existing = rows.get(canonical);
+    const provider =
+      providerKey ??
+      MODEL_PREFIX_PROVIDERS[prefix] ??
+      inferModelFamily(canonical);
+    if (existing) {
+      if (existing.provider === "Other" && provider !== "Other") {
+        existing.provider = provider;
+      }
+      existing.catalogIds.push(rawId);
+      return existing;
+    }
+    const row = { id: canonical, provider, catalogIds: [rawId] };
+    rows.set(canonical, row);
+    return row;
+  };
+
+  for (const seed of seedModelRows()) {
+    note(seed.id, seed.provider);
+  }
+  for (const [id, entry] of catalog) {
+    const row = note(id, null);
+    row.entry = row.entry ?? entry;
+  }
+
+  // A model's date is the earliest first-appearance across all of its wire
+  // spellings — an alias arriving later must not move the model's date.
+  const allAliases = [...rows.values()].flatMap((row) => row.catalogIds);
+  const firstSeen = modelFirstSeen(allAliases);
+  const models = [...rows.values()].map((row) => {
+    const seen = row.catalogIds
+      .map((cid) => firstSeen.get(cid))
+      .filter(Boolean)
+      .sort();
+    return {
+      id: row.id,
+      provider: MODEL_PROVIDER_LABELS[row.provider] ?? null,
+      contextWindow: row.entry?.context_window ?? null,
+      maxOutput: row.entry?.max_output ?? null,
+      reasoning: row.entry?.supports_reasoning === true,
+      addedAt: seen[0] ?? null,
+    };
+  });
+
+  // Newest first; undated rows sink to the end alphabetically.
+  models.sort((a, b) => {
+    if (a.addedAt && b.addedAt && a.addedAt !== b.addedAt) {
+      return b.addedAt.localeCompare(a.addedAt);
+    }
+    if (a.addedAt !== b.addedAt) return a.addedAt ? -1 : 1;
+    return a.id.localeCompare(b.id);
+  });
+  return models;
+}
+
 export function deriveToolCount() {
   const dir = join(REPO_ROOT, "crates/tui/src/tools");
   if (!existsSync(dir)) return null;
@@ -248,6 +478,7 @@ export function buildFacts() {
     crates: deriveCrates(),
     sandboxBackends: deriveSandboxBackends(),
     providers,
+    models: deriveModels(),
     defaultModel: deriveDefaultModel(),
     nodeEngines: deriveNodeEngines(),
     toolCount: deriveToolCount(),

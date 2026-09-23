@@ -3,14 +3,17 @@
   "note": "How to talk to a host. Model ids are not compiled here; live /v1/models and the Codewhale catalog are truth. default_model is a bootstrap hint only.",
   "descriptors": [
     {
-      "id": "sensenova",
-      "label": "SenseNova",
+      "id": "aicraft",
+      "label": "AICraft",
       "wire": "openai-compatible",
-      "base_url": "https://token.sensenova.cn/v1",
-      "api_key_env": "SENSENOVA_API_KEY",
-      "default_model": "deepseek-v4-flash",
+      "base_url": "https://aicraftapi.com/v1",
+      "api_key_env": "AICRAFT_API_KEY",
+      "default_model": "claude-4.6-sonnet",
       "discovery": "models_endpoint",
-      "aliases": ["sense-nova", "meituan-sensenova", "meituan-sensenova-cn"]
+      "aliases": [
+        "ai-craft",
+        "ai_craft"
+      ]
     },
     {
       "id": "baseten",
@@ -22,18 +25,10 @@
       "discovery": "models_endpoint",
       "docs_url": "https://docs.baseten.co/inference/model-apis/overview",
       "credential_url": "https://app.baseten.co/settings/api_keys",
-      "aliases": ["base-ten", "base_ten"]
-    },
-    {
-      "id": "groq",
-      "label": "Groq",
-      "wire": "openai-compatible",
-      "base_url": "https://api.groq.com/openai/v1",
-      "api_key_env": "GROQ_API_KEY",
-      "default_model": "llama-3.3-70b-versatile",
-      "discovery": "models_endpoint",
-      "docs_url": "https://console.groq.com/docs/quickstart",
-      "credential_url": "https://console.groq.com/keys"
+      "aliases": [
+        "base-ten",
+        "base_ten"
+      ]
     },
     {
       "id": "cerebras",
@@ -47,19 +42,6 @@
       "credential_url": "https://cloud.cerebras.ai"
     },
     {
-      "id": "dashscope",
-      "label": "Alibaba Model Studio (DashScope)",
-      "wire": "openai-compatible",
-      "base_url": "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
-      "api_key_env": "DASHSCOPE_API_KEY",
-      "default_model": "qwen3.8-flash",
-      "discovery": "models_endpoint",
-      "docs_url": "https://www.alibabacloud.com/help/en/model-studio/getting-started/models",
-      "credential_url": "https://bailian.console.alibabacloud.com/",
-      "guidance": "International Model Studio compatible-mode endpoint (OpenAI Chat Completions + GET /v1/models). Live /v1/models is the model authority: Qwen 3.8 Flash and the dated 0901 release arrive through the catalog, never a hard-coded id. Store DASHSCOPE_API_KEY, not a raw key.",
-      "aliases": ["dashscope-intl", "alibaba-model-studio", "model-studio", "qwen"]
-    },
-    {
       "id": "command-code",
       "label": "Command Code",
       "wire": "openai-compatible",
@@ -70,7 +52,53 @@
       "docs_url": "https://commandcode.ai/docs/provider",
       "credential_url": "https://commandcode.ai/provider",
       "guidance": "Published Provider API (OpenAI Chat Completions + GET /v1/models). Do not import the Command Code CLI login. Store COMMAND_CODE_API_KEY, not a raw key.",
-      "aliases": ["commandcode", "cmd-code"]
+      "aliases": [
+        "commandcode",
+        "cmd-code"
+      ]
+    },
+    {
+      "id": "dashscope",
+      "label": "Alibaba Model Studio (DashScope)",
+      "wire": "openai-compatible",
+      "base_url": "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+      "api_key_env": "DASHSCOPE_API_KEY",
+      "default_model": "qwen3.8-flash",
+      "discovery": "models_endpoint",
+      "docs_url": "https://www.alibabacloud.com/help/en/model-studio/getting-started/models",
+      "credential_url": "https://bailian.console.alibabacloud.com/",
+      "guidance": "International Model Studio compatible-mode endpoint (OpenAI Chat Completions + GET /v1/models). Live /v1/models is the model authority: Qwen 3.8 Flash and the dated 0901 release arrive through the catalog, never a hard-coded id. Store DASHSCOPE_API_KEY, not a raw key.",
+      "aliases": [
+        "dashscope-intl",
+        "alibaba-model-studio",
+        "model-studio",
+        "qwen"
+      ]
+    },
+    {
+      "id": "groq",
+      "label": "Groq",
+      "wire": "openai-compatible",
+      "base_url": "https://api.groq.com/openai/v1",
+      "api_key_env": "GROQ_API_KEY",
+      "default_model": "llama-3.3-70b-versatile",
+      "discovery": "models_endpoint",
+      "docs_url": "https://console.groq.com/docs/quickstart",
+      "credential_url": "https://console.groq.com/keys"
+    },
+    {
+      "id": "sensenova",
+      "label": "SenseNova",
+      "wire": "openai-compatible",
+      "base_url": "https://token.sensenova.cn/v1",
+      "api_key_env": "SENSENOVA_API_KEY",
+      "default_model": "deepseek-v4-flash",
+      "discovery": "models_endpoint",
+      "aliases": [
+        "sense-nova",
+        "meituan-sensenova",
+        "meituan-sensenova-cn"
+      ]
     }
   ]
 }

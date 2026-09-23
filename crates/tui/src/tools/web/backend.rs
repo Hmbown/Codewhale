@@ -651,7 +651,8 @@ mod tests {
             codewhale_config::route::CapabilityState::Supported;
         context.provider_native_search = Some(
             crate::client::ProviderNativeSearchClient::new(
-                crate::client::DeepSeekClient::new(&moonshot_config).expect("test Moonshot client"),
+                crate::client::CodewhaleClient::new(&moonshot_config)
+                    .expect("test Moonshot client"),
             )
             .expect("Moonshot native adapter"),
         );
@@ -691,7 +692,7 @@ mod tests {
             codewhale_config::route::CapabilityState::Supported;
         xai_context.provider_native_search = Some(
             crate::client::ProviderNativeSearchClient::new(
-                crate::client::DeepSeekClient::new(&xai_config).expect("test xAI client"),
+                crate::client::CodewhaleClient::new(&xai_config).expect("test xAI client"),
             )
             .expect("xAI native adapter"),
         );

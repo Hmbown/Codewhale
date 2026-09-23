@@ -142,7 +142,9 @@ fn python(script: &str) -> String {
 #[tokio::test]
 #[allow(clippy::print_stderr)] // Native enforcement receipt, outside the TUI runtime.
 async fn enforced_readonly_native_python_reads_sqlite_and_cannot_write() {
-    let tmp = tempdir().unwrap();
+    // #6305: the sandbox replaces /tmp with a fresh tmpfs, so a fixture
+    // rooted there vanishes before --chdir reaches it.
+    let tmp = crate::test_support::sandbox_visible_tempdir();
     let Some(context) = native_context(tmp.path()) else {
         return;
     };
@@ -192,7 +194,9 @@ async fn enforced_readonly_native_python_reads_sqlite_and_cannot_write() {
 #[tokio::test]
 #[allow(clippy::print_stderr)] // Native enforcement receipt, outside the TUI runtime.
 async fn enforced_readonly_native_python_cannot_reach_a_loopback_listener() {
-    let tmp = tempdir().unwrap();
+    // #6305: the sandbox replaces /tmp with a fresh tmpfs, so a fixture
+    // rooted there vanishes before --chdir reaches it.
+    let tmp = crate::test_support::sandbox_visible_tempdir();
     let Some(context) = native_context(tmp.path()) else {
         return;
     };

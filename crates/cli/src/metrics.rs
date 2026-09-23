@@ -71,7 +71,7 @@ pub fn run(args: MetricsArgs) -> Result<()> {
     if args.json {
         print_json(&rollup)?;
     } else {
-        print_human(&rollup);
+        print_human(&rollup, args.since);
     }
 
     Ok(())
@@ -185,6 +185,14 @@ impl ToolStats {
 #[derive(Debug, Default, serde::Serialize)]
 pub struct CompactionStats {
     pub events: u64,
+    pub refusals: HashMap<String, u64>,
+    pub triggers: HashMap<String, u64>,
+    pub paths: HashMap<String, u64>,
+    pub summarizer_usage_samples: u64,
+    pub summarizer_input_tokens: u64,
+    pub summarizer_output_tokens: u64,
+    #[serde(skip)]
+    receipt_ids: HashSet<String>,
     /// Sum of `reduction_ratio` from events that carry it (0.0–1.0 each).
     pub ratio_sum: f64,
     pub ratio_samples: u64,
@@ -211,6 +219,14 @@ pub struct AgentStats {
     pub budget_exhausted: u64,
     /// Terminal receipts with missing, malformed, or unrecognized outcomes.
     pub unknown_outcomes: u64,
+    /// Completions carrying a usage receipt. Token sums cover exactly these;
+    /// a completion without usage is a missing receipt, never zero tokens.
+    pub usage_receipts: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub total_tokens: u64,
+    /// Summed priced subtotal in microdollars, JSON consumers only.
+    pub cost_microusd: u64,
 }
 
 impl AgentStats {
@@ -244,6 +260,26 @@ impl AgentStats {
             }
         };
         *count = count.saturating_add(1);
+        // Child cost visibility (#6315): the runtime persists the completion
+        // receipt's usage on the agent.completed payload.
+        let usage = event
+            .pointer("/payload/usage")
+            .or_else(|| event.pointer("/details/usage"));
+        if let Some(usage) = usage
+            && usage.is_object()
+        {
+            self.usage_receipts = self.usage_receipts.saturating_add(1);
+            for (field, sum) in [
+                ("input_tokens", &mut self.input_tokens),
+                ("output_tokens", &mut self.output_tokens),
+                ("total_tokens", &mut self.total_tokens),
+                ("cost_microusd", &mut self.cost_microusd),
+            ] {
+                if let Some(n) = usage.get(field).and_then(Value::as_u64) {
+                    *sum = (*sum).saturating_add(n);
+                }
+            }
+        }
     }
 
     fn summary(&self) -> String {
@@ -265,6 +301,20 @@ impl AgentStats {
         let mut summary = format!("Sub-agents: {} spawn receipts", fmt_num(self.spawns));
         if !outcomes.is_empty() {
             summary.push_str(&format!("; outcomes: {}", outcomes.join(", ")));
+        }
+        if self.usage_receipts > 0 {
+            summary.push_str(&format!(
+                "; tokens: {} in/{} out/{} total ({} {})",
+                fmt_num(self.input_tokens),
+                fmt_num(self.output_tokens),
+                fmt_num(self.total_tokens),
+                fmt_num(self.usage_receipts),
+                if self.usage_receipts == 1 {
+                    "receipt"
+                } else {
+                    "receipts"
+                },
+            ));
         }
         summary
     }
@@ -519,7 +569,44 @@ fn read_audit_log(
                     None => stats.outcome_unknown += 1,
                 }
             }
+            "compaction.refused" => {
+                let reason = v
+                    .pointer("/details/reason")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown");
+                *rollup
+                    .compaction
+                    .refusals
+                    .entry(reason.to_string())
+                    .or_default() += 1;
+            }
             "compaction.completed" | "context.compaction" => {
+                if let Some(id) = compaction_receipt_identity(&v, false)
+                    && !rollup.compaction.receipt_ids.insert(id)
+                {
+                    continue;
+                }
+                for (field, counts) in [
+                    ("trigger", &mut rollup.compaction.triggers),
+                    ("path", &mut rollup.compaction.paths),
+                ] {
+                    if let Some(value) = v
+                        .pointer(&format!("/details/{field}"))
+                        .and_then(Value::as_str)
+                    {
+                        *counts.entry(value.to_string()).or_default() += 1;
+                    }
+                }
+                if let (Some(input), Some(output)) = (
+                    v.pointer("/details/summarizer_usage/input_tokens")
+                        .and_then(Value::as_u64),
+                    v.pointer("/details/summarizer_usage/output_tokens")
+                        .and_then(Value::as_u64),
+                ) {
+                    rollup.compaction.summarizer_usage_samples += 1;
+                    rollup.compaction.summarizer_input_tokens += input;
+                    rollup.compaction.summarizer_output_tokens += output;
+                }
                 rollup.compaction.events += 1;
                 if let Some(ratio) = v
                     .pointer("/details/reduction_ratio")
@@ -530,7 +617,7 @@ fn read_audit_log(
                     rollup.compaction.ratio_samples += 1;
                 }
             }
-            "agent.spawn" | "subagent.spawned" => {
+            "agent.spawn" | "agent.spawned" | "subagent.spawned" => {
                 rollup.agents.spawns += 1;
             }
             "agent.completed" | "subagent.completed" => {
@@ -1011,11 +1098,33 @@ fn record_runtime_item_receipt(
     }
 }
 
+fn compaction_receipt_identity(v: &Value, runtime: bool) -> Option<String> {
+    let (session, id) = if runtime {
+        (
+            v.get("thread_id")?,
+            v.pointer("/payload/item/metadata/compaction_id")?,
+        )
+    } else {
+        (
+            v.pointer("/details/thread_id")
+                .filter(|id| id.is_string())
+                .or_else(|| v.pointer("/details/session_id"))?,
+            v.pointer("/details/compaction_id")?,
+        )
+    };
+    Some(format!("{}:{}", session.as_str()?, id.as_str()?))
+}
+
 /// A compaction is only counted when it completed. The size reduction comes
 /// from the two persisted message counts or it stays unknown — a compaction
 /// with no counts must never average in as a 0% reduction.
 fn record_compaction_item_receipt(event: &str, v: &Value, rollup: &mut Rollup) {
     if event != "item.completed" {
+        return;
+    }
+    if let Some(id) = compaction_receipt_identity(v, true)
+        && !rollup.compaction.receipt_ids.insert(id)
+    {
         return;
     }
     rollup.compaction.events += 1;
@@ -1099,8 +1208,10 @@ fn print_json(rollup: &Rollup) -> Result<()> {
     Ok(())
 }
 
-fn print_human(rollup: &Rollup) {
-    // Period header
+fn print_human(rollup: &Rollup, since: Option<DateTime<Utc>>) {
+    // Period header. When a --since cutoff yields nothing, print it: a bare
+    // `--since 7` is seven seconds, and the empty window must not read the
+    // same as a genuinely idle period (#6315).
     match (rollup.earliest_ts, rollup.latest_ts) {
         (Some(start), Some(end)) => {
             let days = (end - start).num_days();
@@ -1114,9 +1225,13 @@ fn print_human(rollup: &Rollup) {
         (Some(start), None) | (None, Some(start)) => {
             println!("Period: {} → (unknown)", start.format("%Y-%m-%d"));
         }
-        (None, None) => {
-            println!("Period: (no data)");
-        }
+        (None, None) => match since {
+            Some(cutoff) => println!(
+                "Period: (no data since {})",
+                cutoff.format("%Y-%m-%d %H:%M UTC")
+            ),
+            None => println!("Period: (no data)"),
+        },
     }
 
     // ── Tools ──────────────────────────────────────────────────────────────
@@ -1199,17 +1314,30 @@ fn print_human(rollup: &Rollup) {
     }
 
     // ── Compaction ─────────────────────────────────────────────────────────
-    if rollup.compaction.events > 0 {
+    let compaction_refusals: u64 = rollup.compaction.refusals.values().sum();
+    if rollup.compaction.events > 0 || compaction_refusals > 0 {
         let avg_str = match rollup.compaction.avg_reduction_pct() {
             Some(pct) => format!(", avg {pct:.0}% size reduction"),
             // No message counts were recorded. Saying nothing here reads as
             // "no reduction"; say that it is unknown.
             None => ", size reduction unknown".to_string(),
         };
+        let usage = if rollup.compaction.summarizer_usage_samples > 0 {
+            format!(
+                "{} input / {} output tokens across {} measured passes",
+                fmt_num(rollup.compaction.summarizer_input_tokens),
+                fmt_num(rollup.compaction.summarizer_output_tokens),
+                fmt_num(rollup.compaction.summarizer_usage_samples)
+            )
+        } else {
+            "usage unavailable".to_string()
+        };
         println!(
-            "Compaction: {} events{}",
+            "Compaction: {} completed, {} refused{}; summarizer {}",
             fmt_num(rollup.compaction.events),
-            avg_str
+            fmt_num(compaction_refusals),
+            avg_str,
+            usage
         );
     } else {
         println!("Compaction: (no data)");
@@ -1351,6 +1479,34 @@ fn fmt_num(n: u64) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn compaction_audit_counts_usage_refusals_and_deduplicates_runtime_receipt() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let completed = serde_json::json!({"ts": "2026-09-19T12:00:00Z", "event": "compaction.completed", "details": {
+            "session_id": "engine-session-a", "thread_id": "thread-a", "compaction_id": "pass-a", "trigger": "manual", "path": "summary",
+            "reduction_ratio": 0.75, "summarizer_usage": {"input_tokens": 120, "output_tokens": 15}
+        }});
+        let refused = serde_json::json!({"ts": "2026-09-19T12:01:00Z", "event": "compaction.refused", "details": {"reason": "retained_floor"}});
+        std::fs::write(tmp.path(), format!("{completed}\n{completed}\n{refused}\n")).unwrap();
+        let mut rollup = Rollup::default();
+        read_audit_test_log(tmp.path(), None, &mut rollup);
+        record_compaction_item_receipt(
+            "item.completed",
+            &serde_json::json!({
+                "thread_id": "thread-a", "payload": {"item": {"metadata": {"compaction_id": "pass-a"}}, "messages_before": 4, "messages_after": 1}
+            }),
+            &mut rollup,
+        );
+        assert_eq!(rollup.compaction.events, 1);
+        assert_eq!(rollup.compaction.ratio_samples, 1);
+        assert_eq!(rollup.compaction.avg_reduction_pct(), Some(75.0));
+        assert_eq!(rollup.compaction.refusals["retained_floor"], 1);
+        assert_eq!(rollup.compaction.triggers["manual"], 1);
+        assert_eq!(rollup.compaction.paths["summary"], 1);
+        assert_eq!(rollup.compaction.summarizer_input_tokens, 120);
+        assert_eq!(rollup.compaction.summarizer_output_tokens, 15);
+    }
+
     fn read_audit_test_log(path: &Path, since: Option<DateTime<Utc>>, rollup: &mut Rollup) {
         super::read_audit_log(path, since, rollup, &HashMap::new(), &mut HashMap::new());
     }
@@ -1441,6 +1597,55 @@ mod tests {
             !summary.contains("%"),
             "partial receipts are not a success rate"
         );
+    }
+
+    #[test]
+    fn runtime_worker_usage_sums_tokens_across_completion_receipts() {
+        // #6315: completions with usage receipts sum into the rollup; a
+        // completion without usage is a missing receipt, never zero tokens.
+        let events = vec![
+            runtime_event(
+                0,
+                "2026-09-08T10:00:00Z",
+                "thread-a",
+                Some("turn-a"),
+                "agent.completed",
+                serde_json::json!({
+                    "agent_id": "worker-0",
+                    "worker_status": "completed",
+                    "usage": {
+                        "status": "completed",
+                        "input_tokens": 800,
+                        "output_tokens": 200,
+                        "total_tokens": 1000,
+                        "cost_microusd": 50,
+                    },
+                }),
+            ),
+            runtime_event(
+                1,
+                "2026-09-08T10:01:00Z",
+                "thread-a",
+                Some("turn-a"),
+                "agent.completed",
+                serde_json::json!({
+                    "agent_id": "worker-1",
+                    "worker_status": "completed",
+                }),
+            ),
+        ];
+        let tmp = write_runtime_events(&events);
+        let mut rollup = Rollup::default();
+        read_runtime_test_log(tmp.path(), None, &mut rollup);
+        let agents = &rollup.agents;
+        assert_eq!(agents.successes, 2);
+        assert_eq!(agents.usage_receipts, 1);
+        assert_eq!(agents.input_tokens, 800);
+        assert_eq!(agents.output_tokens, 200);
+        assert_eq!(agents.total_tokens, 1000);
+        assert_eq!(agents.cost_microusd, 50);
+        let summary = agents.summary();
+        assert!(summary.contains("800 in/200 out/1,000 total (1 receipt)"));
     }
 
     #[test]

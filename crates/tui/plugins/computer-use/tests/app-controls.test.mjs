@@ -63,7 +63,7 @@ test("human Pause and Stop cannot be bypassed; a lost owner exits and can reopen
     : path.join(dir, "app.sock");
   const daemonOptions = { env: { ...process.env,
     CODEWHALE_CU_STATE_DIR: dir, CODEWHALE_CU_APP_SOCKET: endpoint, CODEWHALE_CU_APP_WARM: "off",
-    CODEWHALE_CU_TEST_BACKEND: path.join(root, "tests/fixtures/session-backend.mjs"), CU_SESSION_CALLS: log, CODEWHALE_CU_CONTROL_FD: "3" }, stdio: ["ignore", "ignore", "pipe", "pipe"] };
+    CODEWHALE_CU_TEST_BACKEND: path.join(root, "tests/fixtures/session-backend.mjs"), CU_SESSION_CALLS: log, CODEWHALE_CU_CONTROL_FD: "3" }, stdio: ["ignore", "ignore", "pipe", "overlapped"] };
   let errors = "", daemon, exited;
   function launch() {
     daemon = spawn(process.execPath, [path.join(root, "app/daemon.mjs")], daemonOptions);
@@ -95,7 +95,7 @@ test("human Pause and Stop cannot be bypassed; a lost owner exits and can reopen
       sockets.push(result.socket); return result.reply;
     });
   }
-  const control = controlClient(daemon.stdio[3], { signal: t.signal, diagnostics: () => errors });
+  const control = controlClient(daemon.stdio[3], { signal: t.signal, diagnostics: () => errors + (fs.existsSync(log) ? fs.readFileSync(log,"utf8") : "") });
   assert.equal((await control("status")).mode, "ready", "human-control channel responds before input starts");
   assert.equal((await request({tool:"hello"})).app.controlOwner,true);
   const sessionId="human-controls";
@@ -107,7 +107,11 @@ test("human Pause and Stop cannot be bypassed; a lost owner exits and can reopen
   await until(()=>fs.existsSync(log)&&fs.readFileSync(log,"utf8").includes("child_started"));
   const queued=call("type",{text:"must not replay"});
   queued.catch(() => {});
-  const paused=await control("pause");
+  t.diagnostic("control while input runs: " + JSON.stringify(await control("status")));
+  const pausing = control("pause"); pausing.catch(() => {});
+  await delay(200);
+  t.diagnostic("control after pause: " + JSON.stringify(await control("status")));
+  const paused=await pausing;
   assert.equal(paused.mode,"paused"); assert.equal(paused.cleanupPending,false);
   assert.equal((await held).ok,false); assert.equal((await queued).ok,false);
   assert.equal((await call("type",{text:"while paused"})).error.code,"control_paused");
@@ -130,7 +134,7 @@ test("human Pause and Stop cannot be bypassed; a lost owner exits and can reopen
   await assert.rejects(request({tool:"hello"}),error=>error.code==="app_unavailable");
   launch();
   await until(() => fs.existsSync(path.join(dir,"app-run.json")));
-  const reopened = controlClient(daemon.stdio[3], { signal: t.signal, diagnostics: () => errors });
+  const reopened = controlClient(daemon.stdio[3], { signal: t.signal, diagnostics: () => errors + (fs.existsSync(log) ? fs.readFileSync(log,"utf8") : "") });
   assert.equal((await reopened("status")).mode,"stopped");
   assert.equal((await request({tool:"hello"})).app.controlOwner,true);
   const fresh=await request({tool:"open_session",sessionId:"fresh"},true);

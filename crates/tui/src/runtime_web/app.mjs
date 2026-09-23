@@ -14,6 +14,7 @@ export const STREAM_EVENT_NAMES = [
   "turn.lifecycle",
   "turn.usage",
   "turn.steered",
+  "turn.steer_dropped",
   "turn.interrupt_requested",
   "turn.completed",
   "item.started",

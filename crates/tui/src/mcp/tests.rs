@@ -1946,6 +1946,51 @@ async fn plugin_stdio_does_not_surface_reviewed_child_stderr() {
     assert!(!error.contains("ARBITRARY_PLUGIN_CREDENTIAL"));
 }
 
+/// #6187: a crashed stdio child must stop reading as "ready" before any
+/// call is in flight — `is_ready` probes the child, so the pool rebuilds
+/// the connection on the next use instead of handing the dead transport
+/// back.
+#[cfg(unix)]
+#[tokio::test]
+async fn dead_stdio_child_stops_reading_ready_without_a_call_in_flight() {
+    let mut config = test_server_config();
+    config.command = Some("sh".to_string());
+    config.args = vec!["-c".to_string(), "while :; do sleep 1; done".to_string()];
+    let transport = StdioTransport::spawn(
+        "idle",
+        "sh",
+        &config,
+        tokio_util::sync::CancellationToken::new(),
+    )
+    .unwrap();
+    let child = Arc::clone(&transport.child);
+    let connection = test_connection(Box::new(transport));
+
+    // Alive child: the Ready state flag is the whole answer.
+    assert!(
+        connection.is_ready(),
+        "a live stdio child must not be probed dead"
+    );
+
+    child.lock().await.start_kill().unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        if child.lock().await.try_wait().unwrap().is_some() {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "killed stdio child was never reaped"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    assert!(
+        !connection.is_ready(),
+        "a reaped stdio child must fail is_ready without a call in flight"
+    );
+}
+
 #[tokio::test]
 async fn revoked_plugin_mcp_denies_catalog_tool_resource_and_prompt_operations() {
     let dir = tempfile::tempdir().unwrap();
@@ -3231,6 +3276,76 @@ async fn pool_stops_advertising_a_server_whose_write_side_died() {
     );
 }
 
+/// #6187: a failed reconnect must not erase the previous connection — the
+/// last-good tool catalog stays registered (model-visible, since catalog
+/// aggregation filters on authority, not liveness) for the whole outage,
+/// while the restored connection stays non-ready so `get_or_connect`
+/// keeps retrying per the backoff.
+#[tokio::test]
+async fn failed_reconnect_restores_last_good_catalog() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mcp.json");
+    fs::write(
+        &path,
+        r#"{
+            "mcpServers": {
+                "mock": {
+                    "command": "codewhale-tui-test-this-binary-does-not-exist-9f8e7d6c5b4a",
+                    "args": []
+                }
+            }
+        }"#,
+    )
+    .unwrap();
+    let mut pool = McpPool::from_config_path(&path).unwrap();
+    let mut conn = test_connection(Box::new(HangingValueTransport {
+        sent: Arc::new(Mutex::new(Vec::new())),
+    }));
+    conn.name = "mock".to_string();
+    conn.config = pool.config.servers.get("mock").unwrap().clone();
+    conn.catalog_generation = pool.current_catalog_generation();
+    // The shape a crashed server leaves behind: not ready, but its
+    // last-good catalog is still discovered on the connection.
+    conn.state = ConnectionState::Disconnected;
+    conn.tools.push(McpTool {
+        name: "echo".to_string(),
+        description: None,
+        input_schema: serde_json::json!({"type": "object"}),
+    });
+    pool.connections.insert("mock".to_string(), conn);
+
+    // `&mut McpConnection` is not `Debug`, so mirror the sibling test's
+    // match instead of `expect_err`.
+    let error = match pool.get_or_connect("mock").await {
+        Ok(_) => panic!("reconnect against a missing binary must fail"),
+        Err(error) => error,
+    };
+    assert!(
+        format!("{error:#}").contains("spawn failed"),
+        "unexpected error: {error:#}"
+    );
+
+    let restored = pool
+        .connections
+        .get("mock")
+        .expect("failed reconnect must restore the previous connection");
+    assert!(
+        !restored.is_ready(),
+        "the restored connection must stay non-ready so the pool keeps retrying"
+    );
+    assert!(
+        pool.all_tools()
+            .iter()
+            .any(|(name, _)| name == "mcp_mock_echo"),
+        "the model-visible tool surface must survive the failed reconnect"
+    );
+    assert_eq!(
+        restored.tools.len(),
+        1,
+        "the restored connection must keep its last-good catalog"
+    );
+}
+
 #[tokio::test]
 async fn test_mcp_pool_empty_config() {
     let pool = McpPool::new(McpConfig::default());
@@ -4179,6 +4294,15 @@ fn sse_transport_closed_is_retryable() {
 }
 
 #[test]
+fn stdio_transport_closed_is_retryable() {
+    let err = anyhow::anyhow!("Stdio transport closed (exit status: 1)");
+    assert!(
+        is_mcp_stale_session_error(&err),
+        "dead stdio child should force reconnect before retry"
+    );
+}
+
+#[test]
 fn legacy_sse_post_disconnect_is_retryable() {
     let err = anyhow::anyhow!(
         "MCP SSE POST send failed (transport=sse endpoint=http://127.0.0.1:123/messages): connection closed before message completed"
@@ -4490,7 +4614,7 @@ async fn a_failed_server_waits_out_a_cooldown_instead_of_redialing_every_turn() 
     assert_eq!(first.len(), 1, "first pass should dial and fail once");
 
     // Second pass: still reported as failing, but nothing is queued to dial.
-    let (pending, errors) = pool.collect_pending_connects();
+    let (pending, errors) = pool.collect_pending_connects(None);
     assert!(
         pending.is_empty(),
         "a server inside its cooldown must not be re-dialed: {:?}",
@@ -4508,11 +4632,91 @@ async fn a_failed_server_waits_out_a_cooldown_instead_of_redialing_every_turn() 
 
     // Asking for that server by name is explicit intent and lifts the wait.
     assert!(pool.retry_connection("broken").await.is_err());
-    let (pending, _) = pool.collect_pending_connects();
+    let (pending, _) = pool.collect_pending_connects(None);
     assert!(
         pending.is_empty(),
         "the failed retry restarts the ladder rather than clearing it"
     );
+}
+
+/// Lazy boot (#6033): the scoped collect starts only the eager set —
+/// `required` servers plus ones an explicit tool selection covers — and the
+/// pool tracks exactly those names as in-flight, so "connecting" never has
+/// to be inferred from "enabled but unconnected".
+#[test]
+fn lazy_boot_scopes_pending_connects_and_tracks_in_flight() {
+    let mut required_cfg = test_server_config();
+    required_cfg.required = true;
+    let mut pool = McpPool::new(McpConfig {
+        timeouts: McpTimeouts::default(),
+        servers: HashMap::from([
+            ("needed".to_string(), required_cfg),
+            ("selected".to_string(), test_server_config()),
+            ("lazy".to_string(), test_server_config()),
+        ]),
+    });
+    let requested = vec!["mcp_selected_read".to_string()];
+
+    let eager = pool.eager_boot_server_names(&requested);
+    assert_eq!(
+        eager,
+        HashSet::from(["needed".to_string(), "selected".to_string()]),
+        "the eager set is required servers plus selection-covered ones"
+    );
+
+    let (pending, errors) = pool.collect_pending_connects(Some(&eager));
+    assert!(errors.is_empty());
+    let pending_names: HashSet<String> = pending.iter().map(|(name, _)| name.clone()).collect();
+    assert_eq!(pending_names, eager);
+    assert_eq!(
+        pool.connecting_servers()
+            .into_iter()
+            .collect::<HashSet<_>>(),
+        pending_names,
+        "in-flight marks must name exactly the spawned connects"
+    );
+
+    // A lazy server is neither spawned nor reported connecting.
+    let (pending, errors) = pool.collect_pending_connects(Some(&eager));
+    assert!(
+        pending.is_empty() && errors.is_empty(),
+        "an in-flight name is not re-queued by a second scoped pass"
+    );
+
+    // Explicit selection is intent: the lazy server starts on demand and is
+    // marked in-flight while it does.
+    let (pending, errors) = pool.take_pending_connects_for(&["lazy".to_string()]);
+    assert!(errors.is_empty());
+    assert_eq!(pending.len(), 1);
+    assert!(pool.connecting_servers().contains(&"lazy".to_string()));
+
+    // Aborting clears the marks without touching connection state.
+    pool.cancel_connecting(&HashSet::from([
+        "needed".to_string(),
+        "selected".to_string(),
+        "lazy".to_string(),
+    ]));
+    assert!(pool.connecting_servers().is_empty());
+}
+
+/// Selection coverage shared by lazy boot and the per-turn wait: exact
+/// `mcp_<server>_<tool>` names and `mcp_<prefix>*` globs both count.
+#[test]
+fn tool_selection_covers_exact_names_and_globs() {
+    let selected = vec![
+        "mcp_fs_read".to_string(),
+        "mcp_git_*".to_string(),
+        "shell".to_string(),
+    ];
+    assert!(tool_selection_covers_server(&selected, "fs"));
+    assert!(tool_selection_covers_server(&selected, "git_status"));
+    assert!(!tool_selection_covers_server(&selected, "slack"));
+    // A prefix glob reaches every server whose `mcp_<server>_` namespace
+    // starts with it: `mcp_gi*` covers `git` and `gitea` alike.
+    let glob = vec!["mcp_gi*".to_string()];
+    assert!(tool_selection_covers_server(&glob, "git"));
+    assert!(tool_selection_covers_server(&glob, "gitea"));
+    assert!(!tool_selection_covers_server(&glob, "fs"));
 }
 
 #[test]
@@ -7683,7 +7887,7 @@ async fn mcp_ceiling_denied_server_is_absent_across_cached_boot_meta_auth_and_ru
     assert!(pool.all_prompts().is_empty());
     assert!(pool.resolved_tool_servers().is_empty());
     assert!(pool.to_api_tools().is_empty());
-    assert!(pool.model_tool_names().is_empty());
+    assert!(pool.model_tool_names(&pool.to_api_tools()).is_empty());
     assert!(pool.enabled_server_names().is_empty());
     assert!(pool.server_names().is_empty());
     assert!(pool.connected_servers().is_empty());
@@ -7692,7 +7896,7 @@ async fn mcp_ceiling_denied_server_is_absent_across_cached_boot_meta_auth_and_ru
         pool.authenticate_tool_target("mcp_private_a_authenticate")
             .is_none()
     );
-    let (pending, errors) = pool.collect_pending_connects();
+    let (pending, errors) = pool.collect_pending_connects(None);
     assert!(pending.is_empty() && errors.is_empty());
     assert!(
         pool.connect_all().await.is_empty(),
@@ -7943,5 +8147,363 @@ async fn mcp_ceiling_preserves_ordinary_tool_result_tools_field() {
                 .is_err()
             );
         }
+    }
+}
+
+/// #6213 T7: the resource-URI template check is an authorization decision that
+/// runs per URI per advertised template. Pin what it accepts, what it refuses,
+/// and that the anchored pattern is compiled once rather than per call.
+#[test]
+fn resource_uri_template_matching_is_anchored_and_fail_closed() {
+    // Literal templates are anchored: no suffix may sneak past.
+    assert!(resource_uri_matches_template(
+        "file:///readme",
+        "file:///readme"
+    ));
+    assert!(!resource_uri_matches_template(
+        "file:///readme/extra",
+        "file:///readme"
+    ));
+
+    // `{id}` is a simple expansion, so it must not cross a path separator.
+    assert!(resource_uri_matches_template("file:///a", "file:///{id}"));
+    assert!(!resource_uri_matches_template(
+        "file:///a/b",
+        "file:///{id}"
+    ));
+
+    // `{+path}` is a reserved expansion, so it may.
+    assert!(resource_uri_matches_template(
+        "file:///a/b/c",
+        "file:///{+path}"
+    ));
+
+    // An operator this subset does not implement, and a template that never
+    // closes its expression, both stay uncallable rather than over-matching.
+    assert!(!resource_uri_matches_template("x", "x{?query}"));
+    assert!(!resource_uri_matches_template("x", "x{id"));
+
+    // The compile happens once per template and is reused.
+    let first = compiled_resource_template("file:///{path}").expect("template compiles");
+    let second = compiled_resource_template("file:///{path}").expect("template compiles");
+    assert!(Arc::ptr_eq(&first, &second));
+    assert!(compiled_resource_template("x{?query}").is_none());
+}
+
+struct DeadTransport;
+
+#[async_trait::async_trait]
+impl McpTransport for DeadTransport {
+    async fn send(&mut self, _msg: Vec<u8>) -> Result<()> {
+        Ok(())
+    }
+
+    async fn recv(&mut self) -> Result<Vec<u8>> {
+        Ok(Vec::new())
+    }
+
+    fn probe_dead(&self) -> bool {
+        true
+    }
+}
+
+fn supervised_pool(name: &str) -> McpPool {
+    let mut servers = HashMap::new();
+    servers.insert(name.to_string(), test_server_config());
+    McpPool::new(McpConfig {
+        timeouts: McpTimeouts::default(),
+        servers,
+    })
+}
+
+/// #6187: a dead connection is planned for reconnect, and a failed attempt
+/// reports the death once with the diagnosis.
+#[test]
+fn supervisor_plans_dead_connection_and_reports_failed_reconnect() {
+    let mut pool = supervised_pool("alpha");
+    let mut connection = test_connection(Box::new(DeadTransport));
+    connection.name = "alpha".to_string();
+    pool.connections.insert("alpha".to_string(), connection);
+
+    let plan = pool.plan_supervision();
+    assert_eq!(plan.due.len(), 1);
+    assert_eq!(plan.due[0].name, "alpha");
+    assert!(plan.due[0].fresh_death);
+    assert!(plan.recovered.is_empty());
+
+    let update = pool.resolve_supervision_attempt(
+        "alpha",
+        true,
+        Err(anyhow::anyhow!("connection reset by peer")),
+    );
+    assert_eq!(update.died.len(), 1);
+    assert!(update.died[0].1.contains("connection reset"));
+    assert!(update.failed.is_empty() && update.recovered.is_empty());
+
+    // The failure bought a cooldown: the next sweep attempts nothing and
+    // reports nothing new.
+    let plan = pool.plan_supervision();
+    assert!(plan.due.is_empty());
+    assert!(plan.recovered.is_empty() && plan.parked.is_empty());
+}
+
+/// #6187: recovery is reported on the transition back to alive.
+#[test]
+fn supervisor_reports_recovery_on_transition() {
+    let mut pool = supervised_pool("alpha");
+    let mut dead = test_connection(Box::new(DeadTransport));
+    dead.name = "alpha".to_string();
+    pool.connections.insert("alpha".to_string(), dead);
+
+    let plan = pool.plan_supervision();
+    assert_eq!(plan.due.len(), 1);
+    let update = pool.resolve_supervision_attempt("alpha", true, Err(anyhow::anyhow!("boom")));
+    assert_eq!(update.died.len(), 1);
+
+    // The transport reads alive again (a flapping probe, or a connection
+    // restored outside the store path): the next sweep reports recovery.
+    let mut live = test_connection(Box::new(DropCountingTransportForSupervision));
+    live.name = "alpha".to_string();
+    pool.connections.insert("alpha".to_string(), live);
+    let plan = pool.plan_supervision();
+    assert_eq!(plan.recovered, vec!["alpha".to_string()]);
+    assert!(plan.due.is_empty());
+
+    // Reported once: the sweep after is silent.
+    let plan = pool.plan_supervision();
+    assert!(plan.recovered.is_empty() && plan.due.is_empty());
+}
+
+struct DropCountingTransportForSupervision;
+
+#[async_trait::async_trait]
+impl McpTransport for DropCountingTransportForSupervision {
+    async fn send(&mut self, _msg: Vec<u8>) -> Result<()> {
+        Ok(())
+    }
+
+    async fn recv(&mut self) -> Result<Vec<u8>> {
+        Ok(Vec::new())
+    }
+}
+
+/// #6187: five consecutive failures park the server — no more auto attempts
+/// until an explicit retry — and the park is reported once.
+#[test]
+fn supervisor_parks_after_repeated_failures() {
+    let mut pool = supervised_pool("alpha");
+    let mut dead = test_connection(Box::new(DeadTransport));
+    dead.name = "alpha".to_string();
+    pool.connections.insert("alpha".to_string(), dead);
+
+    for attempt in 0..5 {
+        let update = pool.resolve_supervision_attempt(
+            "alpha",
+            attempt == 0,
+            Err(anyhow::anyhow!("refused")),
+        );
+        if attempt < 4 {
+            assert!(update.parked.is_empty(), "parks on the fifth failure");
+        } else {
+            assert_eq!(update.parked, vec!["alpha".to_string()]);
+        }
+    }
+    // Parked: the plan attempts nothing further.
+    let plan = pool.plan_supervision();
+    assert!(plan.due.is_empty());
+
+    // A stored-ready connection clears the park.
+    let mut live = test_connection(Box::new(DropCountingTransportForSupervision));
+    live.name = "alpha".to_string();
+    live.catalog_generation = pool.current_catalog_generation();
+    pool.store_ready_connection("alpha".to_string(), live)
+        .expect("stores");
+    assert!(!pool.supervised_parked.contains("alpha"));
+    assert!(!pool.supervised_dead.contains("alpha"));
+}
+
+/// #6187: an explicit retry restarts supervision even when the retry itself
+/// fails — the user asked, so the park and dead mark clear.
+#[tokio::test]
+async fn manual_retry_clears_supervision_marks() {
+    let mut pool = supervised_pool("alpha");
+    pool.supervised_dead.insert("alpha".to_string());
+    pool.supervised_parked.insert("alpha".to_string());
+    // `mock` is not a real binary, so the retry fails; the marks still clear.
+    let _ = pool.retry_connection("alpha").await;
+    assert!(!pool.supervised_dead.contains("alpha"));
+    assert!(!pool.supervised_parked.contains("alpha"));
+}
+
+/// #6187: tool-call retry covers a dead pipe/socket, not just stale sessions.
+#[test]
+fn retriable_call_error_covers_closed_transports() {
+    use super::wire::is_retriable_mcp_call_error;
+    assert!(is_retriable_mcp_call_error(&anyhow::anyhow!(
+        "MCP session expired"
+    )));
+    assert!(is_retriable_mcp_call_error(&anyhow::anyhow!(
+        "connection reset by peer"
+    )));
+    assert!(is_retriable_mcp_call_error(&anyhow::anyhow!(
+        "Stdio transport closed"
+    )));
+    assert!(!is_retriable_mcp_call_error(&anyhow::anyhow!(
+        "tool returned an application error"
+    )));
+}
+
+// Executed both as an ordinary no-op test and as an isolated OS-process worker.
+#[test]
+fn mcp_transaction_child_worker() {
+    let Some(path) = std::env::var_os("CW_MCP_TRANSACTION_TEST_PATH") else {
+        return;
+    };
+    let path = PathBuf::from(path);
+    let mode = std::env::var("CW_MCP_TRANSACTION_TEST_MODE").unwrap();
+    if mode == "init" {
+        init_config(&path, false).unwrap();
+        return;
+    }
+    mutate_config(&path, None, |cfg| {
+        if mode == "hold" {
+            fs::write(path.with_extension("entered"), b"ready")?;
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while !path.with_extension("release").exists() {
+                anyhow::ensure!(
+                    std::time::Instant::now() < deadline,
+                    "fixture release timed out"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        let server: McpServerConfig =
+            serde_json::from_value(serde_json::json!({"command":"fixture-command"}))?;
+        cfg.servers.insert(mode.clone(), server);
+        Ok(())
+    })
+    .unwrap();
+}
+
+fn mcp_transaction_spawn_worker(path: &Path, mode: &str) -> std::process::Child {
+    std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "mcp::tests::mcp_transaction_child_worker",
+            "--nocapture",
+        ])
+        .env("CW_MCP_TRANSACTION_TEST_PATH", path)
+        .env("CW_MCP_TRANSACTION_TEST_MODE", mode)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap()
+}
+
+#[test]
+fn mcp_transaction_independent_process_writers_and_init_preserve_updates() {
+    for mode in ["second", "init"] {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("mcp.json");
+        let first = mcp_transaction_spawn_worker(&path, "hold");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !path.with_extension("entered").exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "first worker did not acquire lock"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // On Unix the competing process uses an alias of the same directory.
+        #[cfg(unix)]
+        let other_path = {
+            let alias = root.path().join("alias");
+            std::os::unix::fs::symlink(root.path(), &alias).unwrap();
+            alias.join("mcp.json")
+        };
+        #[cfg(not(unix))]
+        let other_path = path.clone();
+        let mut second = mcp_transaction_spawn_worker(&other_path, mode);
+        std::thread::sleep(Duration::from_millis(40));
+        assert!(
+            second.try_wait().unwrap().is_none(),
+            "second writer must wait for shared lock"
+        );
+        fs::write(path.with_extension("release"), b"go").unwrap();
+        for child in [first, second] {
+            let result = child.wait_with_output().unwrap();
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+        let cfg = load_config(&path).unwrap();
+        assert!(cfg.servers.contains_key("hold"));
+        if mode == "second" {
+            assert!(cfg.servers.contains_key("second"));
+        }
+        assert!(
+            !cfg.servers.contains_key("example"),
+            "init must not overwrite a concurrent add"
+        );
+    }
+}
+
+#[test]
+fn mcp_transaction_preserves_unknown_fields_alias_and_rejects_stale_revision() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("mcp.json");
+    fs::write(&path, r#"{"owner_note":{"keep":true},"timeouts":{"connect_timeout":10,"custom":42},"mcpServers":{"one":{"command":"one","extension":{"keep":1}}}}"#).unwrap();
+    let before = read_config_revision(&path).unwrap();
+    let (_, after) = mutate_config(&path, Some(&before), |cfg| {
+        cfg.servers.get_mut("one").unwrap().enabled = false;
+        Ok(())
+    })
+    .unwrap();
+    assert_ne!(before, after);
+    let raw: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    assert_eq!(raw["owner_note"]["keep"], true);
+    assert_eq!(raw["timeouts"]["custom"], 42);
+    assert_eq!(raw["mcpServers"]["one"]["extension"]["keep"], 1);
+    assert!(raw.get("servers").is_none());
+    let bytes = fs::read(&path).unwrap();
+    let err = mutate_config(&path, Some(&before), |cfg| {
+        cfg.servers.clear();
+        Ok(())
+    })
+    .unwrap_err();
+    assert!(err.is::<McpRevisionConflict>());
+    assert_eq!(fs::read(&path).unwrap(), bytes);
+    assert_eq!(
+        mutate_config(&path, Some(&after), |_| Ok(())).unwrap().1,
+        after
+    );
+    assert_eq!(
+        fs::read(&path).unwrap(),
+        bytes,
+        "no-op must not rewrite the document"
+    );
+}
+
+#[test]
+fn mcp_transaction_fails_closed_for_malformed_document_and_symlink() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("mcp.json");
+    fs::write(&path, "{private-malformed-fixture").unwrap();
+    let err = mutate_config(&path, None, |_| Ok(())).unwrap_err();
+    assert!(!err.to_string().contains("private-malformed-fixture"));
+    assert!(init_config(&path, true).is_err());
+    assert_eq!(
+        fs::read_to_string(&path).unwrap(),
+        "{private-malformed-fixture"
+    );
+    #[cfg(unix)]
+    {
+        let link = root.path().join("linked.json");
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+        assert!(mutate_config(&link, None, |_| Ok(())).is_err());
+        assert!(init_config(&link, true).is_err());
     }
 }

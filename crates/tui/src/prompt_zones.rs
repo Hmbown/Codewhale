@@ -23,6 +23,7 @@
 
 use codewhale_models::Role;
 use codewhale_models::{Message, SystemPrompt, Tool};
+use std::sync::Arc;
 // ── helpers ────────────────────────────────────────────────────────────
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -189,55 +190,70 @@ impl std::fmt::Display for PrefixDrift {
 /// whose names make cache impact obvious.
 ///
 /// Phase 4: backing store for `Session.messages` (#2264).
+///
+/// The history is reference-counted (#6214 T2): snapshots hand out `Arc`
+/// clones instead of deep-copying the transcript per event, and mutations
+/// copy-on-write only while a snapshot is outstanding.
 #[derive(Debug, Clone)]
 pub struct AppendLog {
-    messages: Vec<Message>,
+    messages: Arc<Vec<Message>>,
 }
 
 impl AppendLog {
     pub fn new() -> Self {
         Self {
-            messages: Vec::new(),
+            messages: Arc::new(Vec::new()),
         }
     }
 
     pub fn from_messages(messages: Vec<Message>) -> Self {
-        Self { messages }
+        Self {
+            messages: Arc::new(messages),
+        }
+    }
+
+    /// Share the current history without copying. The engine hands this to
+    /// `Event::SessionUpdated`; the `Arc` is immutable, so an outstanding
+    /// snapshot can never observe a later mutation.
+    #[must_use]
+    pub fn snapshot(&self) -> Arc<Vec<Message>> {
+        Arc::clone(&self.messages)
     }
 
     /// Append a message to the log. A single-message push is the cheapest
     /// mutation for prefix-cache stability — it extends the byte sequence
     /// without disturbing earlier turns.
     pub fn push(&mut self, message: Message) {
-        self.messages.push(message);
+        Arc::make_mut(&mut self.messages).push(message);
     }
 
     /// Append multiple messages in one operation (fewer cache-line
     /// invalidations than repeated `push`).
     pub fn push_batch(&mut self, batch: Vec<Message>) {
-        self.messages.extend(batch);
+        Arc::make_mut(&mut self.messages).extend(batch);
     }
 
     /// Truncate to keep only the first `new_len` messages.
     /// Discards newer messages (and their prefix-cache contribution)
     /// from the tail.
     pub fn truncate_to(&mut self, new_len: usize) {
-        self.messages.truncate(new_len);
+        Arc::make_mut(&mut self.messages).truncate(new_len);
     }
 
     /// Remove `count` messages from the front (oldest first).
     /// Cache-destroying: drops the prefix that earlier turns share.
     pub fn trim_front(&mut self, count: usize) {
-        if count >= self.messages.len() {
-            self.messages.clear();
+        let messages = Arc::make_mut(&mut self.messages);
+        if count >= messages.len() {
+            messages.clear();
         } else {
-            self.messages.drain(0..count);
+            messages.drain(0..count);
         }
     }
 
     /// Remove all messages. Resets cache state completely.
     pub fn clear(&mut self) {
-        self.messages.clear();
+        Arc::make_mut(&mut self.messages).clear();
     }
 
     /// Return a mutable reference to the last message, if any.
@@ -245,13 +261,14 @@ impl AppendLog {
     /// that only the most recent turn's content is being modified.
     #[must_use]
     pub fn last_mut(&mut self) -> Option<&mut Message> {
-        self.messages.last_mut()
+        Arc::make_mut(&mut self.messages).last_mut()
     }
 
-    /// Consume and return the inner `Vec<Message>`.
+    /// Consume and return the inner `Vec<Message>`, copying only if a
+    /// snapshot still shares it.
     #[must_use]
     pub fn into_inner(self) -> Vec<Message> {
-        self.messages
+        Arc::try_unwrap(self.messages).unwrap_or_else(|shared| (*shared).clone())
     }
 }
 
@@ -263,13 +280,15 @@ impl Default for AppendLog {
 
 impl From<Vec<Message>> for AppendLog {
     fn from(messages: Vec<Message>) -> Self {
-        Self { messages }
+        Self {
+            messages: Arc::new(messages),
+        }
     }
 }
 
 impl From<AppendLog> for Vec<Message> {
     fn from(log: AppendLog) -> Self {
-        log.messages
+        log.into_inner()
     }
 }
 
@@ -286,14 +305,14 @@ impl std::ops::Deref for AppendLog {
 /// Per-turn ephemeral data. Cleared at every turn boundary.
 ///
 /// **Phase 1 scaffolding** — not yet wired into the engine request path.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg_attr(not(test), expect(dead_code))]
 #[derive(Debug, Clone, Default)]
 pub struct TurnScratch {
     pub working_set: Vec<String>,
     pub user_message: Option<Message>,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg_attr(not(test), expect(dead_code))]
 impl TurnScratch {
     pub fn new() -> Self {
         Self::default()
@@ -422,6 +441,21 @@ mod tests {
                 cache_control: None,
             }],
         }
+    }
+
+    // ── AppendLog ────────────────────────────────────────────────
+
+    #[test]
+    fn append_log_snapshot_shares_and_mutation_detaches() {
+        let mut log = AppendLog::new();
+        log.push(make_message("user", "hello"));
+        let shared = log.snapshot();
+        // No copy: the snapshot aliases the live log.
+        assert!(Arc::ptr_eq(&shared, &log.snapshot()));
+        log.push(make_message("assistant", "hi"));
+        // Copy-on-write: the outstanding snapshot still sees one message.
+        assert_eq!(shared.len(), 1);
+        assert_eq!(log.len(), 2);
     }
 
     // ── FrozenPrefix / PinnedPrefix ────────────────────────────────

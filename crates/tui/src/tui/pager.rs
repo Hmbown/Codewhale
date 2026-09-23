@@ -763,7 +763,7 @@ impl ModalView for PagerView {
                     Color::DarkGray
                 };
                 let fg = if is_current {
-                    Color::Reset
+                    Color::Black
                 } else {
                     Color::Yellow
                 };
@@ -796,7 +796,13 @@ impl ModalView for PagerView {
 
         let content =
             render_panel_scroll_rail(content, buf, page.lines.len(), scroll, visible_height, true);
-        let paragraph = Paragraph::new(visible_lines).wrap(Wrap { trim: false });
+        // Explicit base ink: the surface behind this body is always WHALE_BG,
+        // so spans without their own fg must not inherit a dark terminal
+        // default (light-profile terminals would render them as black-on-black).
+        // Ratatui paints the base first; styled spans patch over it.
+        let paragraph = Paragraph::new(visible_lines)
+            .wrap(Wrap { trim: false })
+            .style(Style::default().fg(palette::TEXT_PRIMARY));
         paragraph.render(content, buf);
     }
 }
@@ -1261,6 +1267,41 @@ mod tests {
     }
 
     #[test]
+    fn body_cells_carry_explicit_ink_on_the_dark_surface() {
+        // The pager paints WHALE_BG behind the body, so a body span
+        // without its own fg inherits the terminal default, black ink on
+        // light-profile terminals, i.e. black-on-black. The base paragraph
+        // style must pin every text cell to the body ink.
+        let p = make_pager(3);
+        let area = Rect::new(0, 0, 100, 16);
+        let mut buf = Buffer::empty(area);
+        p.render(area, &mut buf);
+        let mut checked = 0;
+        for y in 0..area.height {
+            let mut row = String::new();
+            for x in 0..area.width {
+                row.push_str(buf[(x, y)].symbol());
+            }
+            if !row.contains("line-") {
+                continue;
+            }
+            for x in 0..area.width {
+                let cell = &buf[(x, y)];
+                if cell.symbol().trim().is_empty() {
+                    continue;
+                }
+                assert_eq!(
+                    cell.style().fg,
+                    Some(palette::TEXT_PRIMARY),
+                    "body cell ({x}, {y}) must carry explicit body ink",
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked > 0, "expected body rows in the rendered pager");
+    }
+
+    #[test]
     fn c_emits_copy_event_with_full_body() {
         // #1354: the pager intercepts mouse capture, so users have no way to
         // copy content out without an in-app key. Both `c` and `y` should
@@ -1538,7 +1579,7 @@ mod tests {
     /// lines are visually distinguished in the rendered buffer by their
     /// background color. We sample directly across the matched-line text
     /// columns rather than the whole row width because Paragraph leaves
-    /// the trailing-area cells at the default style.
+    /// the trailing-area cells at the default background.
     #[test]
     fn matched_lines_get_highlight_background() {
         let mut p = make_pager(20);
@@ -1553,23 +1594,22 @@ mod tests {
         let mut buf = Buffer::empty(area);
         p.render(area, &mut buf);
 
-        // Text starts at popup_area.x + block_border_left + padding_left
-        // = 1 + 1 + 1 = 3. The fixture text is "line-NNN" (8 chars) so we
-        // sample 3..11. The current-match row is the top of the visible
-        // window because `jump_to_match` set scroll = match_line.
-        let popup_top_y = 1 /* outer popup */ + 1 /* block top border */ + 1 /* padding top */;
-        let mut found_highlight = false;
-        for x in 3..11 {
-            let bg = buf[(x, popup_top_y)].style().bg;
-            if matches!(bg, Some(Color::Yellow) | Some(Color::DarkGray)) {
-                found_highlight = true;
-                break;
-            }
+        // Find the actual painted match: shared compact layout may move it.
+        let row = (0..area.height)
+            .find(|&y| {
+                (0..area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+                    .contains("line-005")
+            })
+            .expect("matched text must be visible");
+        let highlighted = (0..area.width)
+            .filter(|&x| buf[(x, row)].style().bg == Some(Color::Yellow))
+            .collect::<Vec<_>>();
+        assert_eq!(highlighted.len(), "line-005".len());
+        for x in highlighted {
+            assert_eq!(buf[(x, row)].style().fg, Some(Color::Black));
         }
-        assert!(
-            found_highlight,
-            "expected a Yellow/DarkGray highlight cell on the matched-line text columns"
-        );
     }
 
     #[test]

@@ -14,10 +14,6 @@ fn usage_none() -> AgentRunUsage {
         output_tokens: None,
         total_tokens: None,
         cost_microusd: None,
-        token_budget: None,
-        budget_spent_tokens: None,
-        budget_remaining_tokens: None,
-        budget_scope: None,
         note: "no route audit for this worker".to_string(),
     }
 }

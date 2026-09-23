@@ -1,31 +1,37 @@
-//! The Codewhale mark — the founder raster in braille dots (2×4 per cell).
-//!
-//! The rows are generated, never hand-drawn: `scripts/brand/braille-mark.py`
-//! reads the canonical product mark (`brand/codewhalemarkfinal.png`, PRD
-//! section 6: the white whale on the navy rounded square) and derives the
-//! hero whale's navy darkness down to a dot grid (threshold 0.3, aspect
-//! preserved and centred in the rung's box, all-blank edge columns trimmed,
-//! the eye carved as one cleared dot). No redraws, no traced SVG: the dots
-//! are a proportional derivative of the founder file. Two rungs from the
-//! boxes: [`MarkSize::Small`] (box 11×3 → ink 7×3) and [`MarkSize::Tiny`]
-//! (box 8×2 → ink 5×2). The ASCII lane has no mark at all:
-//! `glyphs::ascii_fallback` flattens braille to `#`, so the wordmark line
-//! stands alone there.
-//!
-//! The launch renderer owns the braille mark as ordinary terminal cells.
-//! Graphics probes below are diagnostics only; startup never paints a second
-//! image outside the frame.
-//!
-//! Motion ("surfacing", founder 2026-09-01): over `MARK_SURFACE_MS` the mark
-//! reveals from the bottom of its box upward — the whale rises out of the
-//! field — while its colour lerps from the field to the accent through
-//! [`surface_progress`]'s raised-cosine ease. Then it holds still forever.
-//! Reduced motion passes `progress = 1.0`, which is this same drawing at its
-//! endpoint, so the still frame cannot drift from the animated one.
+//! The Codewhale mark, derived from the canonical founder raster by
+//! `scripts/brand/braille-mark.py`, and terminal color/capability helpers.
+//! The launch header paints the mark as terminal cells; no image is transmitted.
 
 use std::sync::OnceLock;
 
 use ratatui::style::Color;
+
+/// The launch mark resolves once; controls and text never wait for it.
+pub(crate) const REVEAL_MS: u128 = 360;
+
+pub(crate) fn reveal_row(row: &str, elapsed_ms: u128, animated: bool) -> String {
+    let mask = if !animated || elapsed_ms >= REVEAL_MS {
+        0xff
+    } else if elapsed_ms < 60 {
+        0x09
+    } else if elapsed_ms < 140 {
+        0x1b
+    } else if elapsed_ms < 240 {
+        0x3f
+    } else {
+        0x7f
+    };
+    row.chars()
+        .map(|ch| {
+            let code = u32::from(ch);
+            if (0x2800..=0x28ff).contains(&code) {
+                char::from_u32(0x2800 + ((code - 0x2800) & mask)).unwrap_or(ch)
+            } else {
+                ch
+            }
+        })
+        .collect()
+}
 
 /// Rungs of the mark's scale ladder, each generated at its own box.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -117,17 +123,6 @@ fn lerp_channel(from: u8, to: u8, amount: f32) -> u8 {
     let from = f32::from(from);
     let to = f32::from(to);
     (from + (to - from) * amount).round().clamp(0.0, 255.0) as u8
-}
-
-/// Raised-cosine rise over `duration_ms`, saturating at 1.0. Wall-clock keyed,
-/// so a dropped frame costs smoothness, never correctness.
-#[must_use]
-pub fn surface_progress(elapsed_ms: u128, duration_ms: u128) -> f32 {
-    if duration_ms == 0 || elapsed_ms >= duration_ms {
-        return 1.0;
-    }
-    let t = elapsed_ms as f32 / duration_ms as f32;
-    0.5 * (1.0 - (std::f32::consts::PI * t).cos())
 }
 
 // ---------------------------------------------------------------------------
@@ -264,71 +259,39 @@ pub fn probe_sixel_graphics() -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[test]
-    fn every_rung_matches_its_declared_footprint_in_braille_only() {
-        for size in [MarkSize::Large, MarkSize::Small, MarkSize::Tiny] {
-            let (cols, rows) = size.cells();
-            let art = size.rows();
-            assert_eq!(art.len(), usize::from(rows), "{size:?} row count");
-            for line in art {
-                assert_eq!(
-                    line.chars().count(),
-                    usize::from(cols),
-                    "{size:?} row {line:?} is not {cols} cells"
-                );
-                for glyph in line.chars() {
-                    // U+2800..=U+28FF is the braille block. Checked directly
-                    // rather than through the old buffer renderer's bit
-                    // decoder, which went with that renderer.
-                    assert!(
-                        glyph == ' ' || ('\u{2800}'..='\u{28FF}').contains(&glyph),
-                        "{size:?} row {line:?} holds a non-braille glyph {glyph:?}"
-                    );
+    fn launch_reveal_preserves_width_and_only_adds_canonical_dots() {
+        use unicode_width::UnicodeWidthStr;
+        for size in [
+            super::MarkSize::Large,
+            super::MarkSize::Small,
+            super::MarkSize::Tiny,
+        ] {
+            for row in size.rows() {
+                let mut previous = super::reveal_row(row, 0, true);
+                for elapsed in [60, 140, 240, 360, 1000] {
+                    let next = super::reveal_row(row, elapsed, true);
+                    assert_eq!(next.width(), row.width());
+                    for ((old, new), canonical) in
+                        previous.chars().zip(next.chars()).zip(row.chars())
+                    {
+                        if ('\u{2800}'..='\u{28ff}').contains(&canonical) {
+                            let old = u32::from(old) - 0x2800;
+                            let new = u32::from(new) - 0x2800;
+                            let target = u32::from(canonical) - 0x2800;
+                            assert_eq!(old & new, old);
+                            assert_eq!(new & target, new);
+                        }
+                    }
+                    previous = next;
                 }
+                assert_eq!(previous, *row);
+                assert_eq!(super::reveal_row(row, 0, false), *row);
             }
-            // Generated rows are trimmed: the first and last columns carry ink.
-            assert!(art.iter().any(|line| line.starts_with(|c| c != ' ')));
-            assert!(art.iter().any(|line| line.ends_with(|c| c != ' ')));
         }
     }
 
-    #[test]
-    fn the_mark_has_an_eye() {
-        // The script carves the founder whale's eye as one cleared dot
-        // inside the body (bit 0x08 of the eye cell). Without the carve the
-        // small rung reads `⣟` there and the tiny rung `⠏`.
-        assert_eq!(
-            SMALL_ROWS[2].chars().nth(3),
-            Some('⣗'),
-            "small rung lost its carved eye"
-        );
-        assert_eq!(
-            TINY_ROWS[1].chars().nth(3),
-            Some('⠍'),
-            "tiny rung lost its carved eye"
-        );
-    }
-
-    #[test]
-    fn surface_progress_is_a_monotonic_rise_that_settles_at_one() {
-        assert!((surface_progress(0, 640) - 0.0).abs() < 1e-6);
-        assert!((surface_progress(320, 640) - 0.5).abs() < 1e-3);
-        assert!((surface_progress(640, 640) - 1.0).abs() < 1e-6);
-        assert!((surface_progress(5_000, 640) - 1.0).abs() < 1e-6);
-        let mut previous = -1.0;
-        for ms in (0..=640).step_by(20) {
-            let value = surface_progress(ms, 640);
-            assert!(value >= previous, "regressed at {ms}ms");
-            previous = value;
-        }
-    }
-
-    #[test]
-    fn a_zero_length_rise_is_settled_not_divided_by_zero() {
-        assert!((surface_progress(0, 0) - 1.0).abs() < 1e-6);
-    }
+    use super::*;
 
     #[test]
     fn kitty_candidates_are_the_terminals_that_can_answer_and_never_tmux() {

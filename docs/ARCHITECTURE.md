@@ -334,6 +334,11 @@ command = "echo 'Running tool: $TOOL_NAME'"
    are not wired into command execution.
 5. **Minimal dependencies**: Careful dependency selection for build speed
 6. **Local-first runtime API**: HTTP/SSE endpoints are intended for trusted localhost access and are served by the `crates/tui` runtime today
+7. **Lock poison**: fail-stop by default. A poisoned lock means a holder
+   panicked mid-mutation, so `.expect()` with a message naming the lock is
+   the standard posture — never serve half-updated state. Recover with
+   `into_inner()` only where stale state is safe (caches, idempotent
+   rebuilds), with a comment saying why.
 
 ## Configuration Files
 

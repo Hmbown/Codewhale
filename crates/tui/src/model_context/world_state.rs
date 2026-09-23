@@ -7,8 +7,8 @@ use codewhale_models::SystemBlock;
 use super::fragment::{FragmentId, FragmentRender, FragmentRole, ModelContextFragment};
 
 /// Incremental render of WorldState against a previous snapshot.
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-#[allow(dead_code)] // public diff surface; production hosts call render_diff next (TUI-DOG-011)
 pub struct WorldStateDiff {
     /// Fragments whose content hash changed (or are new).
     pub updated: Vec<ModelContextFragment>,
@@ -41,39 +41,14 @@ impl WorldState {
         render
     }
 
-    /// Remove a fragment, returning Cleared when it existed.
-    #[allow(dead_code)] // clear/get/is_empty/render_* for host adapters (TUI-DOG-011)
-    pub fn clear(&mut self, id: FragmentId) -> FragmentRender {
-        match self.fragments.remove(&id) {
-            Some(prev) => FragmentRender::Cleared {
-                marker: prev.marker.to_string(),
-            },
-            None => FragmentRender::Cleared {
-                marker: id.marker().to_string(),
-            },
-        }
-    }
-
-    #[must_use]
-    #[allow(dead_code)] // public WorldState query surface (TUI-DOG-011)
-    pub fn get(&self, id: FragmentId) -> Option<&ModelContextFragment> {
-        self.fragments.get(&id)
-    }
-
     #[must_use]
     pub fn len(&self) -> usize {
         self.fragments.len()
     }
 
-    #[must_use]
-    #[allow(dead_code)] // public WorldState query surface (TUI-DOG-011)
-    pub fn is_empty(&self) -> bool {
-        self.fragments.is_empty()
-    }
-
     /// Full render of every fragment in stable `FragmentId` order.
+    #[cfg(test)]
     #[must_use]
-    #[allow(dead_code)] // full render for Text fallback / inspectors (TUI-DOG-011)
     pub fn render_full(&self) -> String {
         self.fragments
             .values()
@@ -84,8 +59,8 @@ impl WorldState {
 
     /// Diff against a previous WorldState. Unchanged fragments are retained
     /// (listed, not reinjected into `updated`).
+    #[cfg(test)]
     #[must_use]
-    #[allow(dead_code)] // incremental retain-unchanged API for prompt hosts (TUI-DOG-011)
     pub fn render_diff(&self, previous: Option<&WorldState>) -> WorldStateDiff {
         let Some(previous) = previous else {
             return WorldStateDiff {
@@ -245,8 +220,8 @@ impl WorldStateSnapshot {
     }
 
     /// Flat text fallback for callers that still expect `SystemPrompt::Text`.
+    #[cfg(test)]
     #[must_use]
-    #[allow(dead_code)] // Text fallback while Blocks path is primary (TUI-DOG-011)
     pub fn render_text(&self) -> String {
         let world = self.world_state.render_full();
         if world.is_empty() {

@@ -288,7 +288,7 @@ fn non_empty_trimmed(value: &str) -> Option<&str> {
     if value.is_empty() { None } else { Some(value) }
 }
 
-fn base_url_authority(base_url: &str) -> Option<String> {
+pub(crate) fn base_url_authority(base_url: &str) -> Option<String> {
     let base_url = non_empty_trimmed(base_url)?;
     let without_scheme = base_url
         .split_once("://")

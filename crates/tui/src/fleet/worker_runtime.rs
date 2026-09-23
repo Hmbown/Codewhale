@@ -23,7 +23,7 @@ use codewhale_protocol::fleet::{
 };
 use serde::{Deserialize, Serialize};
 
-use super::identity::resolve_member_in_profiles;
+use super::identity::{FleetSelectorError, resolve_member_in_profiles};
 use super::profile::{
     AgentProfile, FleetDelegationHints, FleetLoadout, FleetProfile, FleetProfilePermissions,
     FleetRole as FleetProfileRole, FleetSlot, ProfileOrigin, canonical_public_role_name,
@@ -297,7 +297,7 @@ pub fn validate_fleet_task_routes(
         }
         if pinned_model && explicit_provider.is_none() {
             let config = config.expect("provider authority checked above");
-            let (provider, base_url) = (config.api_provider(), config.deepseek_base_url());
+            let (provider, base_url) = (config.api_provider(), config.active_route_base_url());
             if let Err(reason) =
                 crate::route_runtime::validate_unpinned_model_provider(provider, &model, &base_url)
             {
@@ -468,10 +468,6 @@ pub fn fleet_task_to_worker_spec_with_profiles(
         coordination_contracts,
         expected_artifact: None,
         deliverables: Vec::new(),
-        token_budget: task_spec
-            .budget
-            .as_ref()
-            .and_then(|budget| budget.max_tokens),
         resume_identity: Some(session_name.clone()),
         generation: 1,
         resume_from_agent_id: None,
@@ -935,7 +931,7 @@ pub(crate) fn append_agent_profile_prompt(prompt: &mut String, agent_profile: &A
 pub(crate) fn resolve_pinned_role_profile(
     agent_profiles: &[AgentProfile],
     role: &str,
-) -> Result<Option<AgentProfile>> {
+) -> Result<Option<AgentProfile>, FleetSelectorError> {
     let pinned = agent_profiles
         .iter()
         .filter(|profile| {
@@ -949,11 +945,11 @@ pub(crate) fn resolve_pinned_role_profile(
         })
         .cloned()
         .collect::<Vec<_>>();
-    Ok(resolve_member_in_profiles(
+    resolve_member_in_profiles(
         &pinned,
         &format!("role:{}", canonical_public_role_name(role)),
-    )?
-    .cloned())
+    )
+    .map(|member| member.cloned())
 }
 
 /// Compare only the known route pair; never infer a provider from a wire id's
@@ -2290,7 +2286,9 @@ mod tests {
         assert!(!route.provider_id.is_empty());
         assert!(!route.provider_kind.is_empty());
         assert!(!route.wire_model_id.is_empty());
-        assert_eq!(route.protocol, "chat_completions");
+        // DeepSeek Flash rides Responses since a1c1741afa (see bundled_offerings):
+        // the default route follows the shipped transport, not the old pin.
+        assert_eq!(route.protocol, "responses");
         assert_eq!(route.role.as_deref(), Some("implement"));
         assert_eq!(route.loadout.as_deref(), Some("fast"));
         assert_eq!(route.model_class, None);

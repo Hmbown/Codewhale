@@ -1,4 +1,5 @@
 use super::*;
+use crate::core::ops::TurnSpec;
 
 fn tool(name: &str, deferred: bool) -> Tool {
     Tool {
@@ -600,7 +601,7 @@ async fn planned_route_builds_subagent_catalog_without_installed_client() {
     engine.config.features.disable(Feature::Mcp);
     let _ = engine.config.features.enable(Feature::Subagents);
     engine.config.subagents_enabled = true;
-    engine.deepseek_client = None;
+    engine.codewhale_client = None;
     let planned = plan(&config, &identity, false, "planned child route").await;
     let route = planned.route.validate().expect("planned route validates");
     let planned_model = route.model.clone();
@@ -791,7 +792,6 @@ async fn plan_with_reasoning(
         reasoning_effort,
         mode: AppMode::Agent,
         content: prompt,
-        display_text: prompt,
         auto_router_context: "",
         should_auto_resolve: auto_model,
         allow_auto_router_response_cache: false,
@@ -957,31 +957,31 @@ async fn assert_preview_matches_first_wire_body(
         .clone();
 
     let _ = engine
-        .handle_send_message(
-            prompt.to_string(),
-            AppMode::Agent,
-            production_route,
-            compaction,
-            crate::cost_status::RuntimeUsageBatch::default(),
+        .handle_send_message(TurnSpec {
+            content: prompt.to_string(),
+            mode: AppMode::Agent,
+            route: Box::new(production_route),
+            compaction: Box::new(compaction),
+            initial_routed_usage: Box::new(crate::cost_status::RuntimeUsageBatch::default()),
             goal_objective,
-            None,
+            goal_token_budget: None,
             goal_status,
             reasoning_effort,
             reasoning_effort_auto,
-            false,
-            false,
-            false,
-            false,
-            ApprovalMode::Suggest,
+            auto_model: false,
+            allow_shell: false,
+            trust_mode: false,
+            auto_approve: false,
+            approval_mode: ApprovalMode::Suggest,
             translation_enabled,
-            None,
-            Vec::new(),
-            None,
+            allowed_tools: None,
+            dynamic_tools: Vec::new(),
+            hook_executor: None,
             verbosity,
-            UserInputProvenance::ExternalUser,
-            Vec::new(),
-            None,
-        )
+            provenance: UserInputProvenance::ExternalUser,
+            images: Vec::new(),
+            max_output_tokens: None,
+        })
         .await;
 
     let requests = server
@@ -1924,31 +1924,31 @@ async fn provider_reported_usage_is_unavailable_until_a_response_reports_it() {
     assert_eq!(engine.session.total_usage.output_tokens, 0);
 
     let _ = engine
-        .handle_send_message(
-            prompt.to_string(),
-            AppMode::Agent,
-            production_route,
-            compaction,
-            crate::cost_status::RuntimeUsageBatch::default(),
-            None,
-            None,
-            GoalStatus::Active,
+        .handle_send_message(TurnSpec {
+            content: prompt.to_string(),
+            mode: AppMode::Agent,
+            route: Box::new(production_route),
+            compaction: Box::new(compaction),
+            initial_routed_usage: Box::new(crate::cost_status::RuntimeUsageBatch::default()),
+            goal_objective: None,
+            goal_token_budget: None,
+            goal_status: GoalStatus::Active,
             reasoning_effort,
             reasoning_effort_auto,
-            false,
-            false,
-            false,
-            false,
-            ApprovalMode::Suggest,
-            false,
-            None,
-            Vec::new(),
-            None,
-            None,
-            UserInputProvenance::ExternalUser,
-            Vec::new(),
-            None,
-        )
+            auto_model: false,
+            allow_shell: false,
+            trust_mode: false,
+            auto_approve: false,
+            approval_mode: ApprovalMode::Suggest,
+            translation_enabled: false,
+            allowed_tools: None,
+            dynamic_tools: Vec::new(),
+            hook_executor: None,
+            verbosity: None,
+            provenance: UserInputProvenance::ExternalUser,
+            images: Vec::new(),
+            max_output_tokens: None,
+        })
         .await;
 
     // The completed turn's counts are exactly what `parse_usage` reads off
@@ -2177,7 +2177,7 @@ async fn preview_tool_snapshot_has_no_mcp_or_event_side_effects() {
                 model: engine.session.model.clone(),
                 capabilities: engine.active_route_capabilities,
                 limits: engine.active_route_limits,
-                client: engine.deepseek_client.clone(),
+                client: engine.codewhale_client.clone(),
                 api_config: Box::new(engine.api_config.clone()),
                 locale_tag: engine.config.locale_tag.clone(),
                 role_models: engine.subagent_role_models(),

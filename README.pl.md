@@ -1,11 +1,11 @@
-<!-- source: README.md sha256:a446e3921085 -->
+<!-- source: README.md sha256:29c349b6f2b4 -->
 # Codewhale
 
 Codewhale to agent o otwartym kodzie źródłowym, który czyta Twój projekt, edytuje pliki, wykonuje polecenia i sprawdza swoją pracę przy użyciu wybranego przez Ciebie modelu hostowanego lub lokalnego. Zacznij od jednego zadania w terminalu. Przy większej pracy powierz jej części agentom korzystającym z różnych modeli i pełniącym różne role.
 
-![Codewhale działający w terminalu](web/public/codewhale-tui-171acee.png)
+![Codewhale działający w terminalu](web/public/codewhale-tui-d7a9a1c.png)
 
-*Podgląd terminala z rozwojowej kompilacji v0.9.12.*
+*Podgląd terminala z rozwojowej kompilacji v0.10.0.*
 
 [English](README.md) · [简体中文](README.zh-CN.md) · [日本語](README.ja-JP.md) · [Tiếng Việt](README.vi.md) · [Bahasa Indonesia](README.id.md) · [한국어](README.ko-KR.md) · [Español](README.es-419.md) · [Português](README.pt-BR.md) · [Русский](README.ru.md) · [Українська](README.uk.md) · [Français](README.fr.md) · [Deutsch](README.de.md) · [繁體中文](README.zh-TW.md) · [हिन्दी](README.hi.md) · [Türkçe](README.tr.md) · [Italiano](README.it.md) · [العربية](README.ar.md) · [Català](README.ca.md)
 
@@ -53,7 +53,7 @@ Terminal i klienci graficzni łączą się z Codewhale Runtime, który uruchamia
 
 - **Terminal:** `codewhale` otwiera interaktywny interfejs; `codewhale exec` uruchamia zadanie ze skryptu lub zadania CI.
 - **Lokalna przeglądarka:** `codewhale web` otwiera dołączonego [lokalnego klienta webowego](docs/WEB.md) dla tego samego środowiska wykonawczego.
-- **Aplikacje webowe i desktopowe Codewhale:** graficzne środowiska pracy w trakcie rozwoju. Informacje o ich dostępności znajdują się na [stronie produktu](https://codewhale.net/en/product).
+- **Aplikacja desktopowa Codewhale (GPUI):** natywna aplikacja desktopowa GPUI jest kierunkiem klienta produktu (decyzja z 2026-09-14; mapa etapów w docs/TRANSITION.md w prywatnym repozytorium codehwhale-gpui). Hostowana aplikacja webowa na app.codewhale.net jest wycofywana etapami; strona marketingowa, logowanie, rozliczenia oraz strony prawne i pobierania pozostają w sieci na stałe. Informacje o dostępności znajdują się na [stronie produktu](https://codewhale.net/en/product).
 
 **Computer Use dodaje narzędzia do obserwowania innych aplikacji i interakcji z nimi.** Wtyczka jest dołączona do obecnego kodu źródłowego. Przed użyciem sprawdź, o jaki dostęp prosi, i włącz ją; nadal obowiązują uprawnienia systemu operacyjnego i wymagania platformy. Zobacz dołączony [przewodnik po Computer Use](crates/tui/plugins/computer-use/README.md) oraz [konfigurację wtyczek](docs/PLUGINS.md).
 

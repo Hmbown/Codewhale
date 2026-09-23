@@ -358,6 +358,7 @@ fn owned_auth_names_in_store(store: &XaiOAuthCredentialStore) -> Result<Vec<Stri
     // `fdopendir` consumes its descriptor, so enumerate through a duplicate of
     // the pinned directory handle. No pathname is resolved after the store is
     // opened, even if the lexical directory is renamed or replaced.
+    // SAFETY: duplicates the live store descriptor; CLOEXEC keeps it out of children.
     let duplicated =
         unsafe { libc::fcntl(store.directory_handle.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
     if duplicated < 0 {
@@ -404,24 +405,31 @@ fn chatgpt_auth_names_in_store(store: &XaiOAuthCredentialStore) -> Result<Vec<St
     use std::ffi::CStr;
     use std::os::fd::AsRawFd as _;
 
+    // SAFETY: duplicates the live store descriptor; CLOEXEC keeps it out of children.
     let duplicated =
         unsafe { libc::fcntl(store.directory_handle.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
     if duplicated < 0 {
         return Err(std::io::Error::last_os_error())
             .context("duplicating Codewhale credentials directory handle");
     }
+    // SAFETY: `duplicated` is an owned directory descriptor. `closedir` below
+    // assumes ownership on the successful conversion.
     let stream = unsafe { libc::fdopendir(duplicated) };
     if stream.is_null() {
         let error = std::io::Error::last_os_error();
+        // SAFETY: `fdopendir` failed and therefore did not consume the fd.
         unsafe { libc::close(duplicated) };
         return Err(error).context("enumerating Codewhale credentials directory");
     }
     let mut names = Vec::new();
     loop {
+        // SAFETY: `stream` remains live until `closedir`; each returned entry
+        // is valid until the next call and copied before then.
         let entry = unsafe { libc::readdir(stream) };
         if entry.is_null() {
             break;
         }
+        // SAFETY: POSIX `dirent::d_name` is NUL terminated.
         let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) };
         let Ok(name) = name.to_str() else {
             continue;
@@ -430,6 +438,7 @@ fn chatgpt_auth_names_in_store(store: &XaiOAuthCredentialStore) -> Result<Vec<St
             names.push(name.to_string());
         }
     }
+    // SAFETY: `stream` is still owned and has not previously been closed.
     if unsafe { libc::closedir(stream) } != 0 {
         return Err(std::io::Error::last_os_error())
             .context("closing Codewhale credentials directory enumeration");
@@ -600,6 +609,7 @@ fn open_owned_credentials_directory(directory: &Path) -> Result<XaiOAuthCredenti
             );
         };
         let name = cstring_from_os_str(name)?;
+        // SAFETY: parent borrowed from live `current`; `name` outlives the call.
         let mut fd = unsafe {
             libc::openat(
                 std::os::fd::AsRawFd::as_raw_fd(&current),
@@ -658,6 +668,7 @@ fn open_owned_credentials_directory(directory: &Path) -> Result<XaiOAuthCredenti
         metadata.is_dir(),
         "Codewhale credentials path must be a directory"
     );
+    // SAFETY: geteuid(2) dereferences no pointers.
     anyhow::ensure!(
         metadata.uid() == unsafe { libc::geteuid() },
         "Codewhale credentials directory must be owned by the current user"
@@ -796,6 +807,7 @@ impl XaiOAuthCredentialStore {
                     return Err(std::io::Error::last_os_error())
                         .context("installing a new xAI OAuth generation without replacement");
                 }
+                // SAFETY: same descriptor and staging name as the `linkat` above.
                 if unsafe {
                     libc::unlinkat(self.directory_handle.as_raw_fd(), temporary.as_ptr(), 0)
                 } != 0
@@ -806,6 +818,7 @@ impl XaiOAuthCredentialStore {
                     // error cleanup can safely retire the single remaining
                     // staging link instead of leaving an inert secret with
                     // link count two.
+                    // SAFETY: same descriptor; `target` was just installed above.
                     unsafe {
                         libc::unlinkat(self.directory_handle.as_raw_fd(), target.as_ptr(), 0)
                     };
@@ -887,6 +900,7 @@ fn validate_owned_file_handle(file: &File, path: &Path) -> Result<fs::Metadata> 
         )
     })?;
     anyhow::ensure!(metadata.is_file(), "xAI OAuth path must be a regular file");
+    // SAFETY: geteuid(2) dereferences no pointers.
     anyhow::ensure!(
         metadata.uid() == unsafe { libc::geteuid() },
         "xAI OAuth file must be owned by the current user"
@@ -1194,6 +1208,7 @@ fn reopen_windows_file_for_owner_security(file: &File, path: &Path) -> Result<Fi
 
     // ReOpenFile derives a new handle from the already-created temporary file,
     // so no pathname can be substituted between creation and hardening.
+    // SAFETY: `file` is live; no output pointers passed.
     let handle = unsafe {
         ReOpenFile(
             file.as_raw_handle(),
@@ -1483,6 +1498,7 @@ fn verify_windows_owner_only_handle(file: &File) -> Result<()> {
             .context("reading Codewhale-owned xAI OAuth security descriptor");
     }
     let _descriptor = WindowsLocalAllocation(descriptor.cast());
+    // SAFETY: `owner` is non-null; `user.sid()` is owned by `user`.
     anyhow::ensure!(
         !owner.is_null() && unsafe { EqualSid(owner, user.sid()) } != 0,
         "Codewhale-owned xAI OAuth storage owner is not the current user"
@@ -1508,6 +1524,7 @@ fn verify_windows_owner_only_handle(file: &File) -> Result<()> {
     // SAFETY: `count == 1` proves the first returned entry is initialized.
     let entry = unsafe { &*entries };
     let trustee_sid: PSID = entry.Trustee.ptstrName.cast();
+    // SAFETY: form and null checked in this expression; sid owned by `user`.
     anyhow::ensure!(
         entry.Trustee.TrusteeForm == TRUSTEE_IS_SID
             && !trustee_sid.is_null()

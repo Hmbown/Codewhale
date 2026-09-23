@@ -1,17 +1,19 @@
 //! Canonical action-based wrapper for git inspection tools.
 //!
 //! The model sees one tool: `Git` with an `action` parameter
-//! (status | diff | log | show | blame | commit_plan). The per-action legacy
-//! execution aliases were removed in v0.9.3. `commit_plan` (#3999) is the
-//! propose-only atomic-commit planner: it returns a split plan and writes
-//! nothing, so the family stays read-only end to end.
+//! (status | diff | log | show | blame | commit_plan | fetch | merge_tree).
+//! The per-action legacy execution aliases were removed in v0.9.3.
+//! `commit_plan` (#3999) is the propose-only atomic-commit planner: it returns
+//! a split plan and writes nothing. `fetch` is the family's one ref-mutating,
+//! network-reaching action — the bounded verify-mode surface (#6298) — so the
+//! family is read-only end to end *except* fetch; `merge_tree` is a pure read.
 
 use async_trait::async_trait;
 use serde_json::{Value, json};
 
 use super::canonical_action::required_action;
 use super::git::{GitCommitPlanTool, GitDiffTool, GitStatusTool};
-use super::git_history::{GitBlameTool, GitLogTool, GitShowTool};
+use super::git_history::{GitBlameTool, GitFetchTool, GitLogTool, GitMergeTreeTool, GitShowTool};
 use super::spec::{
     ApprovalRequirement, ToolCapability, ToolContext, ToolError, ToolResult, ToolSpec,
 };
@@ -29,8 +31,16 @@ impl GitTool {
         }
     }
 
-    const ACTIONS: &'static [&'static str] =
-        &["status", "diff", "log", "show", "blame", "commit_plan"];
+    const ACTIONS: &'static [&'static str] = &[
+        "status",
+        "diff",
+        "log",
+        "show",
+        "blame",
+        "commit_plan",
+        "fetch",
+        "merge_tree",
+    ];
 
     fn required_action(&self, input: &Value) -> Result<String, ToolError> {
         if let Some(forced) = self.forced_action {
@@ -63,7 +73,7 @@ impl ToolSpec for GitTool {
     }
 
     fn description(&self) -> &'static str {
-        "Inspect repository state and history with status, diff, log, show, or blame; commit_plan proposes an ordered atomic-commit split of the working tree. All actions are read-only and parallel-safe."
+        "Inspect repository state and history with status, diff, log, show, blame, or merge_tree; commit_plan proposes an ordered atomic-commit split of the working tree; fetch updates remote-tracking refs from a configured remote. Only fetch touches the network or mutates refs; every other action is read-only and parallel-safe."
     }
 
     fn input_schema(&self) -> Value {
@@ -72,8 +82,8 @@ impl ToolSpec for GitTool {
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["status", "diff", "log", "show", "blame", "commit_plan"],
-                    "description": "Action to perform. commit_plan returns a proposed split of the working tree into dependency-ordered commits (rejecting cycles) and writes nothing; land each group with git add/commit."
+                    "enum": ["status", "diff", "log", "show", "blame", "commit_plan", "fetch", "merge_tree"],
+                    "description": "Action to perform. commit_plan returns a proposed split of the working tree into dependency-ordered commits (rejecting cycles) and writes nothing; land each group with git add/commit. fetch updates remote-tracking refs from a configured remote only; merge_tree computes a merge result without touching the working tree."
                 },
                 "path": {
                     "type": "string",
@@ -126,6 +136,27 @@ impl ToolSpec for GitTool {
                 "porcelain": {
                     "type": "boolean",
                     "description": "Emit line-porcelain output (action=blame)"
+                },
+                "remote": {
+                    "type": "string",
+                    "description": "Configured remote name to fetch from, default origin (action=fetch). Never a URL."
+                },
+                "refspecs": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Optional refspecs to fetch, e.g. pull/123/head (action=fetch). Empty fetches the remote's defaults."
+                },
+                "ours": {
+                    "type": "string",
+                    "description": "First revision (action=merge_tree)"
+                },
+                "theirs": {
+                    "type": "string",
+                    "description": "Second revision (action=merge_tree)"
+                },
+                "base": {
+                    "type": "string",
+                    "description": "Optional merge base (--merge-base); omit and git finds the bases itself (action=merge_tree)"
                 }
             },
             "required": ["action"]
@@ -136,16 +167,28 @@ impl ToolSpec for GitTool {
         vec![ToolCapability::ReadOnly, ToolCapability::Sandboxable]
     }
 
-    fn approval_requirement_for(&self, _input: &Value) -> ApprovalRequirement {
-        ApprovalRequirement::Auto
+    fn approval_requirement_for(&self, input: &Value) -> ApprovalRequirement {
+        // `fetch` is the family's one network-reaching, ref-mutating action;
+        // it holds the same bar as the other code/process-executing tools.
+        if input.get("action").and_then(Value::as_str) == Some("fetch") {
+            ApprovalRequirement::Required
+        } else {
+            ApprovalRequirement::Auto
+        }
     }
 
-    fn is_read_only_for(&self, _input: &Value) -> bool {
-        true
+    fn is_read_only_for(&self, input: &Value) -> bool {
+        // Only `fetch` mutates (remote-tracking refs). A missing action
+        // resolves to the `status` policy default, which is read-only.
+        input
+            .get("action")
+            .and_then(Value::as_str)
+            .is_none_or(|action| action != "fetch")
     }
 
-    fn supports_parallel_for(&self, _input: &Value) -> bool {
-        true
+    fn supports_parallel_for(&self, input: &Value) -> bool {
+        // Concurrent fetches contend on ref locks; inspection stays parallel.
+        input.get("action").and_then(Value::as_str) != Some("fetch")
     }
 
     fn starts_detached_for(&self, _input: &Value) -> bool {
@@ -163,6 +206,8 @@ impl ToolSpec for GitTool {
             "show" => GitShowTool.execute(input, context).await,
             "blame" => GitBlameTool.execute(input, context).await,
             "commit_plan" => GitCommitPlanTool.execute(input, context).await,
+            "fetch" => GitFetchTool.execute(input, context).await,
+            "merge_tree" => GitMergeTreeTool.execute(input, context).await,
             other => Err(ToolError::invalid_input(format!(
                 "Unknown Git action \"{other}\"; nothing was run. Pass one of: {}.",
                 Self::ACTIONS.join(", ")
@@ -200,7 +245,7 @@ mod tests {
         let message = err(json!({"action": "commit"})).await;
         assert!(message.contains("commit"), "{message}");
         assert!(
-            message.contains("status, diff, log, show, blame, commit_plan"),
+            message.contains("status, diff, log, show, blame, commit_plan, fetch, merge_tree"),
             "{message}"
         );
     }
@@ -214,6 +259,34 @@ mod tests {
         let input = json!({"action": "commit_plan"});
         assert!(tool.is_read_only_for(&input));
         assert_eq!(classify_call("Git", &input, &tool), CallClass::Bounded);
+    }
+
+    /// `fetch` is the family's one ref-mutating action: held approval, not
+    /// read-only, not parallel-safe, and classed as bounded fetch — shell
+    /// plus network, never workspace write (#6298). `merge_tree` is a pure
+    /// read and stays with the inspection actions.
+    #[test]
+    fn fetch_and_merge_tree_classification() {
+        use crate::tools::execution_envelope::{CallClass, classify_call};
+        let tool = GitTool::new("Git");
+
+        let fetch = json!({"action": "fetch", "remote": "origin"});
+        assert!(!tool.is_read_only_for(&fetch));
+        assert_eq!(
+            tool.approval_requirement_for(&fetch),
+            ApprovalRequirement::Required
+        );
+        assert!(!tool.supports_parallel_for(&fetch));
+        assert_eq!(classify_call("Git", &fetch, &tool), CallClass::BoundedFetch);
+
+        let merge_tree = json!({"action": "merge_tree", "ours": "main", "theirs": "side"});
+        assert!(tool.is_read_only_for(&merge_tree));
+        assert_eq!(
+            tool.approval_requirement_for(&merge_tree),
+            ApprovalRequirement::Auto
+        );
+        assert!(tool.supports_parallel_for(&merge_tree));
+        assert_eq!(classify_call("Git", &merge_tree, &tool), CallClass::Bounded);
     }
 
     #[test]

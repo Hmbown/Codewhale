@@ -14,6 +14,7 @@ import url from "node:url";
 import crypto from "node:crypto";
 import { spawn } from "node:child_process";
 import { stateDir } from "./registry.mjs";
+import { parseGrant, BACKEND_METHOD } from "./tools.mjs";
 import { ExecError, currentSignal, throwIfAborted, wait } from "./exec.mjs";
 
 export const PLUGIN_ROOT = path.resolve(path.dirname(url.fileURLToPath(import.meta.url)), "..");
@@ -88,7 +89,13 @@ export function appRequest(request, options) { return requestConnection(request,
 const sessionLeases = new Map();
 export function openAppSession(sessionId) {
   if (!sessionLeases.has(sessionId)) {
-    const pending = requestConnection({ tool: "open_session", sessionId }, { timeoutMs: 3_000, signal: null, keepOpen: true }).then(({ reply, socket }) => {
+    // Carry the capability grant to the daemon so a narrowed server cannot
+    // smuggle ungranted tools past the boundary that actually sends input.
+    // The daemon sees transport method names (probe, recordingStart, …), so
+    // the grant is normalized through BACKEND_METHOD before it travels.
+    const grant = parseGrant(process.env.CODEWHALE_CU_GRANT);
+    const transportGrant = grant ? [...new Set([...grant].map((name) => BACKEND_METHOD[name] ?? name))] : null;
+    const pending = requestConnection({ tool: "open_session", sessionId, ...(transportGrant ? { grant: transportGrant } : {}) }, { timeoutMs: 3_000, signal: null, keepOpen: true }).then(({ reply, socket }) => {
       if (!reply?.ok || typeof reply.leaseToken !== "string") {
         socket.destroy();
         throw Object.assign(new ExecError(reply?.error?.message ?? "Computer session lease was refused"), { code: reply?.error?.code ?? "app_session_closed" });

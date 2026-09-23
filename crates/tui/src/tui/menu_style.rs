@@ -29,14 +29,13 @@ pub fn selected_row_style() -> Style {
         .add_modifier(Modifier::BOLD)
 }
 
-/// Hovered-but-not-selected row (Slice G global rule: every clickable
-/// element responds visibly on hover). Underline + bold, deliberately *no*
-/// background fill, so a hovered row can never masquerade as the keyboard
-/// selection (`selected_row_style` owns the `SELECTION_BG` band). Callers
-/// apply this only when `!selected`; selection always wins.
+/// Hover is an elevated band with an underline, distinct from the filled,
+/// bold keyboard selection even on terminals without color.
 #[must_use]
 pub fn hovered_row_style() -> Style {
-    Style::default().bg(palette::SURFACE_ELEVATED)
+    Style::default()
+        .bg(palette::SURFACE_ELEVATED)
+        .add_modifier(Modifier::UNDERLINED)
 }
 
 /// Selected row with a caller-chosen foreground (the provider picker tints
@@ -93,13 +92,16 @@ pub struct StatusMark {
 /// The status states shared by the footer, work surface, and pickers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StatusKind {
+    #[cfg_attr(not(test), expect(dead_code))]
     Ready,
+    #[cfg_attr(not(test), expect(dead_code))]
     Working,
+    #[cfg_attr(not(test), expect(dead_code))]
     Paused,
     Done,
     /// Chartered vocabulary entry. No surface renders a failure mark yet, so
     /// nothing constructs it outside the exhaustiveness sweep below.
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), expect(dead_code))]
     Failed,
     Attention,
 }
@@ -203,7 +205,12 @@ mod tests {
     #[test]
     fn hovered_row_is_elevated_band_without_selection_ink() {
         let hovered = hovered_row_style();
-        assert_eq!(hovered, Style::default().bg(palette::SURFACE_ELEVATED));
+        assert_eq!(
+            hovered,
+            Style::default()
+                .bg(palette::SURFACE_ELEVATED)
+                .add_modifier(Modifier::UNDERLINED)
+        );
         assert_ne!(hovered, selected_row_style());
         assert_ne!(hovered, selected_row_bg_style());
     }

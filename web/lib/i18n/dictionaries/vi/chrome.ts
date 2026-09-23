@@ -33,8 +33,10 @@ export const chrome: ChromeDict = {
 
   navProduct: "Sản phẩm",
   navModels: "Mô hình",
+  navPlugins: "Plugin",
   navProductSecondary: "Product",
   navModelsSecondary: "Models",
+  navPluginsSecondary: "Plugins",
 
   skipToContent: "Bỏ qua tới nội dung chính",
 

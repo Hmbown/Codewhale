@@ -11,7 +11,7 @@ gate sweep plus the three manual QA targets is the evidence bar. No sweep, no
 
 ## When to use
 
-- Before telling Hunter (or a PR thread) that release work is complete or
+- Before telling the maintainer (or a PR thread) that release work is complete or
   merge-ready.
 - After harvesting/landing PRs into the release branch, before the publish boundary.
 - When verifying a release candidate on the **real** landing branch
@@ -73,17 +73,17 @@ exercise the relevant scenarios below in an actual terminal. Record dimensions,
 inputs, visible state, and side effects. Do not substitute a full-screen
 assertion harness for looking at and using the product.
 
-1. **Six-worker fanout liveness (#3216/#2211).** Spawn 6 sub-agents. Confirm
+1. **Six-worker fanout liveness** (regression refs #3216, #2211). Spawn 6 sub-agents. Confirm
    typing, render, cancel, and the workbar stay live throughout, and that **Esc
    cancels mid-fanout** (prompt interrupt, not a wedged ~24s burst or freeze).
-   For the Windows Terminal retest path from #3289, start in plan mode, add
+   For the Windows Terminal retest path (ref #3289), start in plan mode, add
    follow-up input to the plan, press Esc, switch to yolo/accept flow, trigger
    at least two auto/Fleet worker spawns, and keep typing/cancel/mode-switch
    checks live for several minutes. Attach logs if the freeze reproduces.
-2. **Multi-terminal route isolation (#3227).** Open multiple terminals on
+2. **Multi-terminal route isolation** (regression ref #3227). Open multiple terminals on
    distinct provider/model routes. Confirm zero cross-terminal contamination and
    no provider+model mismatch — each terminal honors its own route.
-3. **Running-turn input contract (#3203).** During a busy turn, confirm Enter
+3. **Running-turn input contract** (regression ref #3203). During a busy turn, confirm Enter
    queues a typed follow-up, the preview advertises **Enter send now**, and an
    empty Enter promotes the oldest queued follow-up. Confirm Ctrl+Enter steers
    typed text directly, Shift+Enter inserts a newline, and Ctrl+G/Ctrl+S only
@@ -93,7 +93,8 @@ assertion harness for looking at and using the product.
 
 Report a checklist: each command, pass/fail, and the salient output line
 (test counts, the `--version` string, `check-versions.sh` verdict). For manual
-QA, state what you actually observed per target, citing the issue number. If a
+QA, state what you actually observed per target, citing the regression ref where
+one applies. If a
 step was skipped or could not be run (e.g. no display for TUI QA), say so
 explicitly — do not imply coverage you do not have.
 
@@ -106,13 +107,13 @@ explicitly — do not imply coverage you do not have.
 - Don't skip the manual TUI targets because the build is green — the freeze,
   route-mismatch, and steering regressions live in the runtime, not the gates.
 - Don't tag, publish, create a GitHub Release, push artifacts, or merge/close
-  any PR or issue without Hunter's explicit approval. A green sweep is readiness
+  any PR or issue without maintainer approval. A green sweep is readiness
   evidence, not permission.
 - Never harvest/close from a PR title or label alone — review from code, tests,
   comments, and checks.
 - When the sweep clears a harvested PR, preserve contributor credit: cherry-pick
-  keeps the original author, otherwise add `Co-authored-by: Name <email>` and
-  `Harvested-from: PR #N by @handle` so the auto-close-at-main workflow credits
-  the contributor.
+  keeps the original author, otherwise add `Co-authored-by: Name <email>` and a
+  `Harvested from PR #N by @handle` body line (the spaced form the
+  auto-close-at-main workflow greps for).
 - Keep any contributor-facing comment positive and crediting; gates stay
-  dry-run/advisory unless Hunter approves enforcement.
+  dry-run/advisory unless the maintainer approves enforcement.

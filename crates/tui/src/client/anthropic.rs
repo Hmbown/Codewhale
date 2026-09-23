@@ -25,6 +25,7 @@
 //! hacks in the shared paths).
 
 use anyhow::{Context, Result};
+use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::config::{ApiProvider, wire_model_for_provider_route};
@@ -36,12 +37,12 @@ use codewhale_models::{ContentBlock, MessageRequest, MessageResponse, StreamEven
 use super::prepared::WireDialect;
 use super::role_placement::{RolePlacement, role_placement};
 use super::wire::{extract_sse_data_value, next_sse_line};
-use super::{DeepSeekClient, ERROR_BODY_MAX_BYTES, bounded_error_text};
+use super::{CodewhaleClient, ERROR_BODY_MAX_BYTES, bounded_error_text};
 
 /// Maximum `cache_control` breakpoints Anthropic accepts per request.
 const MAX_CACHE_BREAKPOINTS: usize = 4;
 
-impl DeepSeekClient {
+impl CodewhaleClient {
     /// Build the native Messages API request body from a [`MessageRequest`].
     pub(super) fn build_anthropic_body(&self, request: &MessageRequest, stream: bool) -> Value {
         let model =
@@ -78,6 +79,7 @@ impl DeepSeekClient {
             .iter()
             .filter_map(message_to_anthropic)
             .collect();
+        merge_split_tool_results(&mut messages);
         repair_dangling_tool_uses(&mut messages);
         body["messages"] = Value::Array(messages);
 
@@ -454,6 +456,52 @@ fn compat_thinking_budget(effort: Option<&str>, max_tokens: u32) -> Option<u32> 
     (budget >= MIN_THINKING_BUDGET_TOKENS).then_some(budget)
 }
 
+/// Fold a user turn that carries `tool_result`s into the user turn before it
+/// (#6378).
+///
+/// The engine records each tool result as its own user message, so a parallel
+/// tool-call batch arrives here as `assistant{use_a, use_b}`, `user{result_a}`,
+/// `user{result_b}`. Anthropic wants every result in the user turn right after
+/// the `tool_use`s, and the repair below reads only that turn: it would answer
+/// `use_b` with an error placeholder while the real result sits in the next
+/// message. Only turns carrying a `tool_result` are folded, so any other
+/// consecutive user turns keep their shape; inside the merged turn the results
+/// stay ahead of other content so they still lead it.
+fn merge_split_tool_results(messages: &mut Vec<Value>) {
+    let is_user = |message: &Value| message.get("role").and_then(Value::as_str) == Some("user");
+    let is_tool_result =
+        |block: &Value| block.get("type").and_then(Value::as_str) == Some("tool_result");
+    let carries_tool_result = |message: &Value| {
+        message
+            .get("content")
+            .and_then(Value::as_array)
+            .is_some_and(|blocks| blocks.iter().any(is_tool_result))
+    };
+    let mut merged: Vec<Value> = Vec::with_capacity(messages.len());
+    for mut message in messages.drain(..) {
+        if is_user(&message)
+            && carries_tool_result(&message)
+            && let Some(previous) = merged.last_mut()
+            && is_user(previous)
+        {
+            let mut blocks = match previous["content"].take() {
+                Value::Array(blocks) => blocks,
+                other => vec![other],
+            };
+            match message["content"].take() {
+                Value::Array(incoming) => blocks.extend(incoming),
+                other => blocks.push(other),
+            }
+            // Stable sort: results keep their order and lead the turn.
+            blocks.sort_by_key(|block| !is_tool_result(block));
+            previous["content"] = Value::Array(blocks);
+        } else {
+            merged.push(message);
+        }
+    }
+    *messages = merged;
+}
+
 /// Placeholder body for a `tool_use` that never produced a `tool_result`.
 const UNEXECUTED_TOOL_RESULT: &str = "tool call was not executed";
 
@@ -790,13 +838,76 @@ fn apply_anthropic_cache_breakpoints(body: &mut Value) {
     }
 }
 
+/// Provider event types [`convert_anthropic_sse_data`] accepts. Anything else
+/// with a string `type` is tolerated as `None` (future additions); note
+/// `tool_projection_warning` is deliberately absent — it is local-only and
+/// must never decode from provider SSE.
+fn is_known_sse_type(event_type: &str) -> bool {
+    matches!(
+        event_type,
+        "message_start"
+            | "content_block_start"
+            | "content_block_delta"
+            | "content_block_stop"
+            | "message_delta"
+            | "message_stop"
+            | "ping"
+            | "error"
+    )
+}
+
+/// Peek at an SSE payload's `type` without building a DOM.
+#[derive(Deserialize)]
+struct SseTagPeek<'a> {
+    #[serde(borrow)]
+    r#type: Option<&'a str>,
+}
+
 /// Convert one SSE `data:` payload into a [`StreamEvent`], normalizing usage
 /// objects to the #2961 convention. Returns `None` for ignorable payloads.
+///
+/// #6213 T7: the per-token path deserializes directly into the tagged
+/// [`StreamEvent`] instead of building a `Value` DOM and converting it.
+/// Usage-bearing events (two per stream) keep the exact legacy path — the
+/// usage rewrite reads wire fields the normalized [`Usage`] cannot
+/// represent — and decode failures keep their exact legacy outcomes.
 fn convert_anthropic_sse_data(data: &str) -> Option<Result<StreamEvent>> {
     let trimmed = data.trim();
     if trimmed.is_empty() {
         return None;
     }
+    let usage_event = matches!(
+        serde_json::from_str::<SseTagPeek>(trimmed).map(|peek| peek.r#type),
+        Ok(Some("message_start" | "message_delta"))
+    );
+    if usage_event {
+        return convert_anthropic_sse_usage_event(trimmed);
+    }
+    match serde_json::from_str::<StreamEvent>(trimmed) {
+        // Local-only receipt: the legacy path ignored it (not a provider
+        // type), so it stays ignored rather than decoding.
+        Ok(StreamEvent::ToolProjectionWarning { .. }) => None,
+        Ok(event) => Some(Ok(event)),
+        Err(error) => {
+            // Cold path, reached only when direct decode fails: invalid JSON
+            // and unknown types keep their exact legacy outcomes.
+            let value: Value = match serde_json::from_str(trimmed) {
+                Ok(value) => value,
+                Err(e) => return Some(Err(anyhow::anyhow!("invalid SSE JSON: {e}"))),
+            };
+            match value.get("type").and_then(Value::as_str) {
+                // Tolerate unknown event types (e.g. future additions) silently.
+                Some(known) if !is_known_sse_type(known) => None,
+                _ => Some(Err(anyhow::anyhow!("unrecognized SSE event: {error}"))),
+            }
+        }
+    }
+}
+
+/// Legacy `Value` path for `message_start`/`message_delta`: the usage
+/// rewrite reads wire fields the normalized [`Usage`] cannot represent, so
+/// these two events normalize before decoding, exactly as before.
+fn convert_anthropic_sse_usage_event(trimmed: &str) -> Option<Result<StreamEvent>> {
     let mut value: Value = match serde_json::from_str(trimmed) {
         Ok(value) => value,
         Err(e) => return Some(Err(anyhow::anyhow!("invalid SSE JSON: {e}"))),
@@ -817,19 +928,7 @@ fn convert_anthropic_sse_data(data: &str) -> Option<Result<StreamEvent>> {
             }
         }
         // Tolerate unknown event types (e.g. future additions) silently.
-        Some(known)
-            if !matches!(
-                known,
-                "message_start"
-                    | "content_block_start"
-                    | "content_block_delta"
-                    | "content_block_stop"
-                    | "message_delta"
-                    | "message_stop"
-                    | "ping"
-                    | "error"
-            ) =>
-        {
+        Some(known) if !is_known_sse_type(known) => {
             return None;
         }
         _ => {}
@@ -933,11 +1032,87 @@ mod tests {
         }
     }
 
-    fn test_client() -> DeepSeekClient {
+    fn test_client() -> CodewhaleClient {
         anthropic_test_client(None)
     }
 
-    fn anthropic_test_client(base_url: Option<&str>) -> DeepSeekClient {
+    /// #6378: the engine stores each tool result as its own user message, so
+    /// a parallel batch reaches the wire as `assistant{a, b}`, `user{a}`,
+    /// `user{b}`. Both results must land in the one user turn after the batch,
+    /// and the dangling-use repair must not answer `b` a second time.
+    #[test]
+    fn parallel_tool_results_split_across_user_turns_are_answered_once() {
+        let client = test_client();
+        let mut request = request_with("claude-sonnet-4-6", None, None, None);
+        let tool_use = |id: &str, path: &str| ContentBlock::ToolUse {
+            id: id.to_string(),
+            name: "read".to_string(),
+            input: json!({ "path": path }),
+            caller: None,
+            thought_signature: None,
+        };
+        let tool_result = |id: &str, content: &str| ContentBlock::ToolResult {
+            tool_use_id: id.to_string(),
+            content: content.to_string(),
+            is_error: None,
+            content_blocks: None,
+        };
+        request.messages = vec![
+            Message {
+                role: Role::User,
+                content: vec![ContentBlock::Text {
+                    text: "Read a.txt and b.txt".to_string(),
+                    cache_control: None,
+                }],
+            },
+            Message {
+                role: Role::Assistant,
+                content: vec![
+                    ContentBlock::Text {
+                        text: "I will read both files in parallel.".to_string(),
+                        cache_control: None,
+                    },
+                    tool_use("toolu_a", "a.txt"),
+                    tool_use("toolu_b", "b.txt"),
+                ],
+            },
+            Message {
+                role: Role::User,
+                content: vec![tool_result("toolu_a", "content of file A")],
+            },
+            Message {
+                role: Role::User,
+                content: vec![tool_result("toolu_b", "content of file B")],
+            },
+        ];
+
+        let body = client.build_anthropic_body(&request, true);
+        let messages = body["messages"].as_array().expect("messages array");
+        assert_eq!(
+            messages.len(),
+            3,
+            "both results share one user turn: {body}"
+        );
+        let results = messages[2]["content"].as_array().expect("user content");
+        assert_eq!(
+            results
+                .iter()
+                .map(|block| (block["tool_use_id"].as_str(), block["content"].as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (Some("toolu_a"), Some("content of file A")),
+                (Some("toolu_b"), Some("content of file B")),
+            ],
+            "{body}"
+        );
+        assert!(
+            results.iter().all(|block| block.get("is_error").is_none()),
+            "{body}"
+        );
+        assert!(!body.to_string().contains(UNEXECUTED_TOOL_RESULT), "{body}");
+    }
+
+    fn anthropic_test_client(base_url: Option<&str>) -> CodewhaleClient {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let config = crate::config::Config {
             provider: Some("anthropic".to_string()),
@@ -951,14 +1126,14 @@ mod tests {
             }),
             ..Default::default()
         };
-        DeepSeekClient::new(&config).expect("anthropic client constructs")
+        CodewhaleClient::new(&config).expect("anthropic client constructs")
     }
 
-    fn minimax_test_client() -> DeepSeekClient {
+    fn minimax_test_client() -> CodewhaleClient {
         minimax_test_client_for(crate::config::DEFAULT_MINIMAX_ANTHROPIC_BASE_URL)
     }
 
-    fn minimax_test_client_for(base_url: &str) -> DeepSeekClient {
+    fn minimax_test_client_for(base_url: &str) -> CodewhaleClient {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let config = crate::config::Config {
             provider: Some("minimax-anthropic".to_string()),
@@ -972,10 +1147,10 @@ mod tests {
             }),
             ..Default::default()
         };
-        DeepSeekClient::new(&config).expect("MiniMax Messages client constructs")
+        CodewhaleClient::new(&config).expect("MiniMax Messages client constructs")
     }
 
-    fn deepseek_test_client(base_url: &str) -> DeepSeekClient {
+    fn deepseek_test_client(base_url: &str) -> CodewhaleClient {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let config = crate::config::Config {
             provider: Some("deepseek-anthropic".to_string()),
@@ -989,10 +1164,10 @@ mod tests {
             }),
             ..Default::default()
         };
-        DeepSeekClient::new(&config).expect("DeepSeek Messages client constructs")
+        CodewhaleClient::new(&config).expect("DeepSeek Messages client constructs")
     }
 
-    fn modelstudio_test_client(base_url: &str) -> DeepSeekClient {
+    fn modelstudio_test_client(base_url: &str) -> CodewhaleClient {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let config = crate::config::Config {
             provider: Some("modelstudio-token-plan-anthropic".to_string()),
@@ -1008,7 +1183,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        DeepSeekClient::new(&config).expect("Model Studio Messages client constructs")
+        CodewhaleClient::new(&config).expect("Model Studio Messages client constructs")
     }
 
     #[test]
@@ -1388,7 +1563,7 @@ mod tests {
             );
 
             crate::config::normalize_model_config_for_test(&mut config);
-            let client = DeepSeekClient::new(&config).expect("DeepSeek Messages client");
+            let client = CodewhaleClient::new(&config).expect("DeepSeek Messages client");
             let model = config.default_model();
             let body = client.build_anthropic_body(
                 &request_with(&model, config.reasoning_effort(), None, None),
@@ -1712,6 +1887,30 @@ mod tests {
     }
 
     #[test]
+    fn sse_decode_failures_keep_legacy_outcomes_on_the_direct_path() {
+        // Malformed JSON: the invalid-input error, not the unrecognized one.
+        let error = convert_anthropic_sse_data("{oops")
+            .expect("malformed is Some")
+            .expect_err("malformed is Err");
+        assert!(error.to_string().contains("invalid SSE JSON"), "{error:?}");
+        // Structurally invalid known event: unrecognized, not tolerated.
+        let error = convert_anthropic_sse_data(r#"{"type":"content_block_stop"}"#)
+            .expect("known type is Some")
+            .expect_err("missing index is Err");
+        assert!(
+            error.to_string().contains("unrecognized SSE event"),
+            "{error:?}"
+        );
+        // Local-only receipt: never provider SSE, stays ignored.
+        assert!(
+            convert_anthropic_sse_data(
+                r#"{"type":"tool_projection_warning","provider":"x","omitted_tool_names":[],"omitted_tool_count":0}"#
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
     fn usage_mapping_handles_missing_cache_fields() {
         let usage = parse_anthropic_usage(&json!({"input_tokens": 10, "output_tokens": 5}));
         assert_eq!(usage.input_tokens, 10);
@@ -1864,8 +2063,9 @@ mod tests {
         // The real child catalog fixture (not a hand-built tool list) must
         // survive Messages serialization with exactly one canonical `read`
         // entry — no dedup, filter, or sanitizer may drop or duplicate it.
-        // Skills are discoverable through tool_search, so the child wire
-        // catalog carries no load_skill at all.
+        // `load_skill` is eager in DEFAULT_ACTIVE_NATIVE_TOOLS, and children
+        // resolve the same catalog authority the parent does, so it appears
+        // here exactly once like any other default tool.
         let tools = crate::tools::subagent::kimi_general_child_request_tools_fixture();
         assert_eq!(
             tools.iter().filter(|tool| tool.name == "read").count(),
@@ -1877,8 +2077,8 @@ mod tests {
                 .iter()
                 .filter(|tool| tool.name == "load_skill")
                 .count(),
-            0,
-            "load_skill is not part of the child wire catalog"
+            1,
+            "child wire catalog carries one canonical load_skill"
         );
         let client = test_client();
         let mut request = request_with("claude-sonnet-4-6", None, None, None);
@@ -1901,9 +2101,13 @@ mod tests {
             "read keeps a valid object schema: {}",
             reads[0]
         );
-        assert!(
-            serialized.iter().all(|tool| tool["name"] != "load_skill"),
-            "load_skill must not appear on the child Messages wire"
+        assert_eq!(
+            serialized
+                .iter()
+                .filter(|tool| tool["name"] == "load_skill")
+                .count(),
+            1,
+            "exactly one canonical load_skill definition reaches the Messages wire"
         );
     }
 

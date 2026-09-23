@@ -81,6 +81,60 @@ thread_local! {
     static HOLDER_ROOT: OnceLock<PathBuf> = const { OnceLock::new() };
 }
 
+/// A fixture workspace an OS sandbox can still see (#6305).
+///
+/// The Linux bwrap wrapper mounts a fresh `--tmpfs /tmp` before it binds the
+/// policy's writable roots (`sandbox/bwrap.rs`), and an enforced read-only
+/// command has no writable roots at all — nothing re-exposes the host `/tmp`.
+/// A fixture rooted there is shadowed inside the sandbox, so the trailing
+/// `--chdir <workspace>` lands on a path that no longer exists and bwrap exits
+/// with `Can't chdir to /tmp/.tmpXXXXXX`. The tmpfs is deliberate isolation and
+/// a security boundary, so the fixture moves instead of the mount.
+///
+/// Known limitations: this relocates only the directory the sandboxed command
+/// chdirs into. It does not make anything else under the host `/tmp` reachable
+/// from inside the sandbox, and it says nothing about `/dev` or `/proc`, which
+/// bwrap also replaces. Use it for the sandbox probes; plain `tempfile::tempdir`
+/// stays correct everywhere else.
+// Every caller is `#[cfg(unix)]` (the bwrap probes); on Windows these would
+// be dead code and CI builds tests with `-Dwarnings`.
+#[cfg(unix)]
+pub(crate) fn sandbox_visible_tempdir() -> tempfile::TempDir {
+    let root = sandbox_visible_fixture_root();
+    tempfile::tempdir_in(root).unwrap_or_else(|error| {
+        panic!(
+            "failed to create a sandbox-visible fixture workspace in {}: {error}",
+            root.display()
+        )
+    })
+}
+
+/// `OUT_DIR` is this crate's own build directory, so it follows the Cargo
+/// target directory rather than `TMPDIR` — the one path every test binary
+/// already owns and that is outside `/tmp` in every normal layout. A target
+/// directory deliberately placed under `/tmp` would silently reintroduce
+/// #6305, so say so instead of handing back a shadowed path.
+#[cfg(unix)]
+fn sandbox_visible_fixture_root() -> &'static Path {
+    static ROOT: OnceLock<PathBuf> = OnceLock::new();
+    ROOT.get_or_init(|| {
+        let root = Path::new(env!("OUT_DIR")).join("sandbox-fixtures");
+        assert!(
+            !root.starts_with("/tmp"),
+            "sandbox fixtures need a root outside /tmp, which bwrap replaces with a fresh \
+             tmpfs: {} is under it. Point CARGO_TARGET_DIR somewhere else.",
+            root.display()
+        );
+        std::fs::create_dir_all(&root).unwrap_or_else(|error| {
+            panic!(
+                "failed to create the sandbox fixture root {}: {error}",
+                root.display()
+            )
+        });
+        root
+    })
+}
+
 /// Build a syntactically valid, non-secret JWT fixture without embedding a
 /// high-entropy token-shaped literal in Git history.
 pub(crate) fn future_test_jwt(label: &str) -> String {
@@ -108,6 +162,60 @@ pub(crate) fn with_test_state_io_lock<T>(operation: impl FnOnce() -> T) -> T {
         Err(poisoned) => poisoned.into_inner(),
     };
     operation()
+}
+
+/// Build a test phase's future inside this call and box it (#6362).
+///
+/// In debug builds every inline `async {}` value gets a stack slot in the
+/// enclosing poll frame the size of that future's whole state machine, and
+/// the slots are never reused, so a body that awaits four phases inline
+/// carries all four state machines on its own frame at once (measured at
+/// 806 KiB for the runtime-store binding test). Constructing the phase here
+/// leaves the caller holding a pointer, and the phase's own temporaries die
+/// with its poll frame.
+pub(crate) fn boxed_phase<'a, T, M, F>(
+    make: M,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = T> + 'a>>
+where
+    M: FnOnce() -> F,
+    F: std::future::Future<Output = T> + 'a,
+{
+    Box::pin(make())
+}
+
+/// Drive a test future on a thread with libtest's default 2 MiB stack,
+/// whatever `RUST_MIN_STACK` says (#6362).
+///
+/// CI exports a 16 MiB `RUST_MIN_STACK` for every test thread, so a test
+/// that only fits because of that export never learns it overflowed the
+/// stack a contributor's plain `cargo test` gives it. The future is built on
+/// the spawned thread (so it need not be `Send`) and pinned before
+/// `block_on`, exactly as `#[tokio::test]` drives a current-thread runtime;
+/// a panic inside propagates to the caller unchanged. An overflow still
+/// aborts the process with "has overflowed its stack": that is the reported
+/// symptom, not something this helper can turn into a panic.
+pub(crate) fn block_on_default_test_stack<M, F, T>(make: M) -> T
+where
+    M: FnOnce() -> F + Send + 'static,
+    F: std::future::Future<Output = T>,
+    T: Send + 'static,
+{
+    const DEFAULT_TEST_THREAD_STACK: usize = 2 * 1024 * 1024;
+    std::thread::Builder::new()
+        .name("default-test-stack".into())
+        .stack_size(DEFAULT_TEST_THREAD_STACK)
+        .spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("current-thread test runtime");
+            let future = make();
+            tokio::pin!(future);
+            runtime.block_on(future)
+        })
+        .expect("spawn the default-stack test thread")
+        .join()
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
 }
 
 /// Restore one environment variable when dropped.
@@ -358,6 +466,14 @@ pub(crate) fn test_app_with_options(options: crate::tui::app::TuiOptions) -> cra
     // developer checkout can otherwise consume the bounded mention index
     // before the fixture workspace is scanned.
     app.composer.mention_cwd = None;
+    // `App::new` derives onboarding state from the real `~/.codewhale`, and a
+    // pending step makes `ui::frame::render` take its onboarding early return
+    // before it assigns `last_prompt_area` or any other chrome geometry. CI
+    // has no such state, so a layout test written against that machine passes
+    // there and fails on any developer box mid-onboarding — for no product
+    // reason. Shared fixtures render the ordinary session surface; onboarding
+    // has its own tests that set this state deliberately.
+    app.onboarding = crate::tui::app::OnboardingState::None;
     app
 }
 

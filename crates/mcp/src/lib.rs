@@ -1036,14 +1036,20 @@ fn default_rpc_methods() -> Vec<&'static str> {
     ]
 }
 
-const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
+/// Latest dated MCP protocol revision this server implements. Codewhale's
+/// MCP clients advertise the same revision at `initialize`.
+pub(crate) const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
+/// Dated MCP revisions accepted during protocol negotiation, newest first.
+/// Servers answering an older supported revision get it echoed back.
+pub(crate) const MCP_SUPPORTED_PROTOCOL_VERSIONS: &[&str] =
+    &[MCP_PROTOCOL_VERSION, "2025-03-26", "2024-11-05"];
 const MCP_SERVER_NAME: &str = "codewhale-mcp-server";
 
-fn initialize_response(state: &StdioMcpState) -> Value {
+fn initialize_response(state: &StdioMcpState, protocol_version: &str) -> Value {
     json!({
         // Standard MCP initialize result. Keep the management metadata below
         // as additive compatibility fields for existing Codewhale clients.
-        "protocolVersion": MCP_PROTOCOL_VERSION,
+        "protocolVersion": protocol_version,
         "capabilities": {
             "tools": {},
             "resources": {}
@@ -1344,12 +1350,21 @@ fn dispatch_stdio_request(
             // Deserializing into a Map above is the object-shape check. The
             // proxy does not currently consume any client capability.
             let _client_capabilities = parsed.capabilities;
+            // Per spec, echo the requested revision when we support it;
+            // otherwise answer with the newest revision we do support and
+            // let the client decide whether to continue.
+            let negotiated =
+                if MCP_SUPPORTED_PROTOCOL_VERSIONS.contains(&parsed.protocol_version.as_str()) {
+                    parsed.protocol_version
+                } else {
+                    MCP_PROTOCOL_VERSION.to_string()
+                };
             state.session_phase = McpSessionPhase::InitializeResponded;
-            Ok((initialize_response(state), false))
+            Ok((initialize_response(state, &negotiated), false))
         }
         // Pre-standard Codewhale management alias; it intentionally requires
         // no MCP initialize envelope.
-        "capabilities" => Ok((initialize_response(state), false)),
+        "capabilities" => Ok((initialize_response(state, MCP_PROTOCOL_VERSION), false)),
         "notifications/initialized" => {
             if state.session_phase != McpSessionPhase::InitializeResponded {
                 return Err(JsonRpcError::invalid_request(
@@ -2434,7 +2449,7 @@ mod tests {
     #[test]
     fn stdio_initialize_uses_standard_mcp_shape_and_codewhale_identity() {
         let state = build_stdio_state(Vec::new());
-        let response = initialize_response(&state);
+        let response = initialize_response(&state, MCP_PROTOCOL_VERSION);
         assert_eq!(response["protocolVersion"], MCP_PROTOCOL_VERSION);
         assert_eq!(response["serverInfo"]["name"], MCP_SERVER_NAME);
         assert_eq!(response["serverInfo"]["version"], env!("CARGO_PKG_VERSION"));

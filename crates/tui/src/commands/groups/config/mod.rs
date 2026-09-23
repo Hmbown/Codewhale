@@ -42,9 +42,7 @@ impl CommandGroup for ConfigCommands {
 
 static CONFIG_INFO: CommandInfo = CommandInfo {
     name: "config",
-    // /experiments is a discoverable entry to the same view: the Experimental
-    // section exposes the Workflow, goal, and sub-agent opt-ins (#3182).
-    aliases: &["experiments", "experimental"],
+    aliases: &[],
     usage: "/config [ask-rules|status|<key> [value]]",
     description_id: MessageId::CmdConfigDescription,
 };
@@ -207,7 +205,7 @@ pub(in crate::commands) fn dispatch(
     arg: Option<&str>,
 ) -> Option<CommandResult> {
     let result = match command {
-        "config" | "experiments" | "experimental" => config::config_command(app, arg),
+        "config" => config::config_command(app, arg),
         "permissions" | "permission-rules" | "permission_rules" => {
             permissions::permissions_command(app, arg)
         }
@@ -267,31 +265,22 @@ pub(in crate::commands) fn workflow_settings(app: &App) -> CommandResult {
             on(cfg.require_approval_for_writes)
         ),
         format!(
-            "auto_start_child_limit = {}  · larger automatic plans ask first or use /workflow",
-            cfg.auto_start_child_limit
-        ),
-        format!(
             "max_children = {} · max_concurrent = {} · max_depth = {}  · hard ceilings for one run",
             cfg.max_children, cfg.max_concurrent, cfg.max_depth
         ),
         format!(
-            "default_token_budget = {}  · shared admission hint for a run and its children",
+            "default_token_budget = {}  · shared admission cap for a run and its children (0 = none)",
             cfg.default_token_budget
-        ),
-        format!(
-            "max_parallel_writes_without_worktree = {}  · 0 forces worktree isolation for parallel writes",
-            cfg.max_parallel_writes_without_worktree
-        ),
-        format!(
-            "persist_completed_activity = {} · persist_completed_across_restarts = {}  · keep finished runs visible / across restarts (journal: .codewhale/workflow-runs.jsonl)",
-            on(cfg.persist_completed_activity),
-            on(cfg.persist_completed_across_restarts)
         ),
         String::new(),
         "[goal] — config.toml".to_string(),
         format!(
             "max_continuations = {}  · automatic continuation passes before a goal pauses; 0 = unlimited (completion, blocked, or you stop it)",
             app.goal_max_continuations
+        ),
+        format!(
+            "enforce_token_budget = {}  · true = a goal's token budget is a hard stop; false = advisory telemetry",
+            on(app.goal_enforce_token_budget)
         ),
     ];
     CommandResult::message(lines.join("\n"))

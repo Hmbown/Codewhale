@@ -50,8 +50,8 @@ normal turn. Explicit interruption or cancellation remains authoritative.
 it does not remove child budgets or the headless host's deadline.
 
 This doc covers roles and individual worker controls. Use `workflow` to coordinate
-multiple assignments through the same worker runtime; see the sub-agent guidance in
-`crates/tui/src/prompts/text.rs` (`AGENT_MODE`) and the in-line
+multiple assignments through the same worker runtime; see the per-role prompts in
+`crates/tui/src/tools/subagent/mod.rs` (`*_AGENT_INTRO`) and the in-line
 tool description.
 
 ## Role taxonomy
@@ -106,6 +106,16 @@ Resuming a saved worker intersects its saved posture with the current caller's
 posture again. This containment is pinned by
 `a_read_only_parents_delegation_never_widens_authority` in
 `crates/tui/src/fleet/exact.rs` tests.
+
+Inside the process, the resolved authority is one object —
+`ChildGrant` in `crates/tui/src/worker_profile.rs`: `files`
+(none/read/write), `shell` (none/inspect/verify/full), `network`, `desktop`
+(never granted to a child), the named tool `surface`, the caller's explicit
+`scope`, and remaining `spawn` depth. A role is a preset over that object
+(`ChildGrant::for_role`); `ChildGrant::resolve` intersects it with the
+parent-derived profile. The child's tool catalog, its dispatch refusals, and
+its capability envelope all read the same fields — a tool that is visible is
+callable, and a tool that is denied never appears.
 
 The session's **permission posture** applies inside every child exactly as
 it applies to the parent turn: under Auto-Review the same deterministic
@@ -210,8 +220,10 @@ Optional fields:
 - `worktree_path`: exact checkout path. Relative paths stay under the default
   sibling `.codewhale-worktrees/` root.
 
-Do not combine `cwd` with `worktree`; `cwd` remains the manual escape hatch for
-an already-created directory inside the parent workspace.
+`cwd` may be combined with `worktree`: the requested directory becomes the
+discovery anchor the repo root (and the new checkout) is resolved from
+(`prepare_child_workspace`). Without `worktree`, `cwd` remains the manual
+escape hatch for an already-created directory inside the parent workspace.
 
 ### File deliverables and edit claims
 
@@ -286,6 +298,9 @@ structured `dependencies` and `acceptance` arrays for bounded prerequisite facts
 and observable checks; keep the focused objective in `prompt`. Do not copy raw
 parent reasoning or an unbounded transcript.
 
+Default shape for the brief — a plain sentence beats the template when the
+delegation is trivial:
+
 ```
 QUESTION:
 SCOPE:
@@ -297,19 +312,19 @@ OUTPUT: VERDICT, EVIDENCE, GAPS, NEXT
 
 `scout` briefs default to quick, read-only investigation (no writes, but
 network reach and the bounded verification surface are available for real
-scouting). About 3-5 tool calls
-is enough for quick exploration: orient, search, read the decisive lines, and
-return. Do not repeat `ALREADY_KNOWN` work unless evidence contradicts it. Review
-and verifier briefs can spend more calls, but should stop after decisive
-evidence. Builder and repair-style briefs should use checkpoints before
-scope expansion or after repeated failures rather than a tiny call cap.
+scouting). A quick scout usually needs only a handful of calls: orient,
+search, read the decisive lines, and return — but stop at decisive evidence,
+not at a number. There is no per-agent call cap to save; the runtime budgets
+depth and concurrency, not curiosity. Do not repeat `ALREADY_KNOWN` work
+unless evidence contradicts it. Builder and repair-style briefs should use
+checkpoints before scope expansion or after repeated failures.
 
 Good delegation prompt examples:
 
 ```text
-QUESTION: Does PR #3124 introduce release-risk behavior around provider routing?
-SCOPE: PR #3124 diff, linked issue, provider routing tests, docs/PROVIDERS.md.
-ALREADY_KNOWN: Branch is hunter/0.8.62-glm-subagents; workspace version stays 0.8.61.
+QUESTION: Does PR #N introduce release-risk behavior around provider routing?
+SCOPE: PR #N diff, linked issue, provider routing tests, docs/PROVIDERS.md.
+ALREADY_KNOWN: Branch is <release-branch>; workspace version is <live-version>.
 EFFORT: medium
 STOP_CONDITION: Return once you have either one BLOCKER/MAJOR issue or enough evidence for no MAJOR+ issues.
 OUTPUT: VERDICT, EVIDENCE with file:line refs or PR refs, GAPS, NEXT.
@@ -349,21 +364,26 @@ OUTPUT: VERDICT, EVIDENCE, GAPS, NEXT.
   decomposition. Planners write artifacts (`todo_write` items,
   strategy in the response body) but don't carry them out.
 - **`reviewer`** — when there's already a change and the parent wants
-  it graded. Reviewers don't patch — they describe the fix in the
-  finding so the parent can dispatch a builder if the verdict
-  is "fix it".
+  it graded. Reviewers run under read-only posture, so the runtime
+  refuses patch attempts — describe the fix in the finding and the
+  parent dispatches a builder when the verdict is "fix it".
 - **`implement`** — when the change is already specified and just
   needs to land. Builders stay tightly scoped: minimum edit, no
   drive-by refactoring, run a quick verification before handing back.
 - **`test`** — when the parent needs an authoritative pass/fail
-  on the test suite or other validation. Verifiers don't fix
-  failures; they capture the failing assertion + stack and put fix
-  candidates under RISKS. The verifier posture never writes, and shell
-  is clamped to the bounded built-in verification surface: the write
-  ceiling is read-only and unbounded shell forms are refused (#5186).
+  on the test suite or other validation. The verifier posture never
+  writes — the runtime refuses fix attempts — so capture the failing
+  assertion + stack and put fix candidates under RISKS for the parent
+  to dispatch. Shell is clamped to the bounded built-in verification
+  surface: Run tests/verifiers (pass `cwd` when the checks live in a
+  subdirectory), Git fetch for remote refs, Git merge_tree for merge
+  results. The write ceiling is read-only and unbounded shell forms
+  are refused (#5186). A refused probe is reported to the parent,
+  never worked around (#6298).
 - **`advisor`** — when the operator wants a high-leverage second opinion
   before cheaper execution continues. Consultants read enough to ground a
-  recommendation, but cannot write or run shell commands. `oracle` and
+  recommendation; their grant carries no writes and no shell, so the
+  runtime refuses both. `oracle` and
   `consultant` remain accepted only when loading older requests or persisted
   records; new prompts, receipts, and UI use `advisor`.
 - **`custom`** — only when the parent needs to constrain the tool
@@ -401,7 +421,9 @@ request broad fan-out and let the manager drain it without creating an
 unbounded population.
 
 By default every admitted child may start immediately — there is no artificial
-throttle. If you want gentler fan-out, lower `[subagents].launch_concurrency`
+throttle. Request the fan-out the work actually needs and let the runtime
+queue and drain it; the caps above are enforcement, not a reason to
+pre-refuse valid work. If you want gentler fan-out, lower `[subagents].launch_concurrency`
 (how many direct children start at once); children beyond that limit **queue**
 for a launch slot rather than bursting. `launch_concurrency` defaults to the
 resolved `max_subagents` cap. (The pre-v0.8.61 `interactive_max_launch` key is
@@ -433,7 +455,6 @@ max_depth = 6
 # when an operator deliberately wants a per-child cap.
 default_max_steps = 0
 default_wall_time_secs = 1800
-token_budget = 100000
 
 [subagents.providers.deepseek]
 # Direct API key with room to fan out.
@@ -471,8 +492,8 @@ The model-facing `agent` schema exposes these controls:
 | Purpose | Fields |
 | --- | --- |
 | Launch and route | `action`, `prompt`, `type`, `profile`, `name`, `model`, `model_strength`, `thinking` |
-| Scope and outputs | `worktree`, `write_authority`, `write_roots`, `exact_files`, `coordination_contracts`, `deliverables`, `expected_artifact` |
-| Narrow run limits | `token_budget`, `max_steps`, `wall_time_secs` |
+| Scope and outputs | `worktree`, `cwd`, `write_authority`, `write_roots`, `exact_files`, `coordination_contracts`, `deliverables`, `expected_artifact` |
+| Narrow run limits | `max_steps`, `wall_time_secs` |
 | Coordinate and recover | `agent_id`, `agent_ids`, `all_parked`, `message`, `until`, `detached`, `resume_from` |
 | Inspect | `detail`, `offset`, `limit` |
 
@@ -521,7 +542,7 @@ live policy:
   narrow the inherited absolute ceiling. Model-facing calls inherit depth
   from the operator and selected profile.
 - workspace/isolation: `workspace_policy`, `fork_context`,
-  `cwd`, `worktree_path`, `worktree_branch`, `worktree_base`
+  `worktree_path`, `worktree_branch`, `worktree_base`
 - spawn contract: `deliberate`, `dependencies`, `acceptance`, `allowed_tools`
 - lifecycle extras: `timeout_secs` (wait), `reason` (interrupt),
   `include_archived` (status)
@@ -531,10 +552,12 @@ finite budget.
 
 ## Child budgets (steps, wall time, tokens)
 
-`max_steps`, `wall_time_secs`, and `token_budget` are optional per-call limits.
+`max_steps` and `wall_time_secs` are optional per-call limits.
 Each can only narrow the applicable role, operator, parent, and saved-run
 limits. Omission inherits those limits; explicit zero, null, negative, or
-out-of-range values are rejected by the tool parser.
+out-of-range values are rejected by the tool parser (schema minimum is 1).
+Fleet file task-specs use a different convention — there, omitted-or-zero
+means unbounded; see `docs/FLEET.md`.
 
 `max_steps` counts model turns and accepts 1 through 2000. All roles default
 to no model-turn cap unless an operator or ancestor supplies one; the internal
@@ -551,8 +574,7 @@ For example, a focused review can request:
   "type": "reviewer",
   "prompt": "Review the parser diff and report concrete regressions.",
   "max_steps": 12,
-  "wall_time_secs": 300,
-  "token_budget": 20000
+  "wall_time_secs": 300
 }
 ```
 
@@ -563,11 +585,10 @@ remaining steps, original deadline, and token history. A new ID, role, or
 
 ### Token accounting and partial results
 
-`[subagents].token_budget` sets an aggregate allowance for a root child and
-its descendants. An explicit child `token_budget` may add a smaller scope;
-usage still counts toward every applicable ancestor scope. Continuations and
-transcript forks retain their source accounting as well as the current
-parent's scope. Shared descendants are counted once per scope.
+Token budgets were retired in 0.9.14: token usage is tracked, never
+enforced — runs are no longer stopped by token accounting. Legacy input that
+still carries `token_budget` parses and is ignored; `max_steps` and
+`wall_time_secs` remain the narrowable per-call limits.
 
 The governor uses provider-reported input plus output tokens, not a local
 estimate presented as a bill. Request output is capped to the remaining
@@ -940,11 +961,11 @@ scout that discovers a project convention worth carrying across
 sessions, or a verifier that learns "this test is flaky".
 
 `remember` takes a `scope` of `global` or `workspace`
-(`crates/tui/src/tools/remember.rs:79-108`) and writes through
-`NativeMemoryStore` to `~/.codewhale/memory/global/MEMORY.md` or
-`~/.codewhale/memory/workspace/<id>/MEMORY.md`. Writes do not go through the
-standard write-approval flow. The legacy single-file `memory.md` path was
-removed in v0.9.4 (remember.rs:165); see `docs/MEMORY.md` for the full layout.
+(`crates/tui/src/tools/remember.rs`, schema enum plus scope handling) and
+writes through `NativeMemoryStore` to `~/.codewhale/memory/global/MEMORY.md`
+or `~/.codewhale/memory/workspace/<id>/MEMORY.md`. Writes do not go through
+the standard write-approval flow. The legacy single-file `memory.md` path was
+removed in v0.9.4; see `docs/MEMORY.md` for the full layout.
 
 ## Implementation notes
 

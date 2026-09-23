@@ -127,7 +127,7 @@ test("an unresponsive input helper is force-terminated within the MCP cleanup bu
     setInterval(()=>{},1000);
   `]);
   const started=Date.now();
-  await assert.rejects(lease.release(),error=>error.code==='input_release_failed' && error.result.signal==='SIGKILL');
+  await assert.rejects(lease.release(),error=>error.code==='input_release_failed' && error.result.signal===(process.platform==='win32'?'SIGTERM':'SIGKILL'));
   assert.ok(Date.now()-started<2500);
 });
 

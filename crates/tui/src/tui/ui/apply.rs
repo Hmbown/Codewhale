@@ -926,7 +926,7 @@ pub(crate) async fn apply_model_picker_choice(
 
     let model_changed = model != previous_model || app.auto_model != model_is_auto;
     let mut resolved_model = model.clone();
-    let mut route_base_url = config.deepseek_base_url();
+    let mut route_base_url = config.active_route_base_url();
     if !model_is_auto {
         match crate::route_runtime::resolve_runtime_route(config, app.api_provider, Some(&model)) {
             Ok(resolution) => {
@@ -1158,7 +1158,7 @@ pub(crate) async fn apply_provider_fallback_switch(
     let new_model = resolved_route.model;
     let context_window_source = resolved_route.context_window.source;
 
-    if let Err(err) = DeepSeekClient::from_candidate(&next_config, &resolved_route.candidate) {
+    if let Err(err) = CodewhaleClient::from_candidate(&next_config, &resolved_route.candidate) {
         app.set_provider_identity_record(previous_identity);
         app.provider_chain = previous_chain;
         app.last_fallback_reason = Some(format!(
@@ -1205,7 +1205,7 @@ pub(crate) async fn apply_provider_fallback_switch(
         let _ = engine_handle
             .send(Op::SyncSession {
                 session_id: app.current_session_id.clone(),
-                messages: app.api_messages.clone(),
+                messages: app.api_messages.as_ref().clone(),
                 system_prompt: app.system_prompt.clone(),
                 system_prompt_override: false,
                 model: app.model.clone(),
@@ -1310,26 +1310,55 @@ pub(crate) async fn apply_command_result(
                 return Ok(true);
             }
             AppAction::LoadSession(path) => {
-                let session: SavedSession = match std::fs::read_to_string(&path)
+                // Session files can be large; this is the UI action path, so
+                // the read must not park a Tokio worker (blocking-call
+                // convention, #6149).
+                let parsed: SavedSession = match tokio::fs::read_to_string(&path)
+                    .await
                     .map_err(|err| err.to_string())
                     .and_then(|raw| serde_json::from_str(&raw).map_err(|err| err.to_string()))
                 {
                     Ok(session) => session,
                     Err(err) => {
-                        app.status_message = Some(format!(
-                            "Failed to load session from {}: {err}",
-                            path.display()
-                        ));
+                        crate::tui::ui::session_state::surface_session_load_failure(
+                            app,
+                            format!("Failed to load session from {}: {err}", path.display()),
+                        );
                         return Ok(false);
+                    }
+                };
+                // A managed record resumes through the manager so its repair is
+                // hydrated, applied, and persisted in place. A foreign `/load`
+                // file is not ours to rewrite: hydrate its journal projection
+                // and repair in memory only.
+                let session = match SessionManager::default_location() {
+                    Ok(manager) if manager.owns_session_path(&parsed.metadata.id, &path) => {
+                        match manager.resume_session(&parsed.metadata.id) {
+                            Ok(recovery) => recovery.session,
+                            Err(err) => {
+                                crate::tui::ui::session_state::surface_session_load_failure(
+                                    app,
+                                    format!("Failed to resume session {}: {err}", path.display()),
+                                );
+                                return Ok(false);
+                            }
+                        }
+                    }
+                    _ => {
+                        let mut session = parsed;
+                        session.ensure_journal();
+                        crate::session_manager::repair_recovered_session(&mut session);
+                        session
                     }
                 };
                 let fresh_config =
                     match Config::load(app.config_path.clone(), app.config_profile.as_deref()) {
                         Ok(config) => config,
                         Err(err) => {
-                            app.status_message = Some(format!(
-                                "Failed to load live config for session restore: {err}"
-                            ));
+                            crate::tui::ui::session_state::surface_session_load_failure(
+                                app,
+                                format!("Failed to load live config for session restore: {err}"),
+                            );
                             return Ok(false);
                         }
                     };
@@ -1342,7 +1371,10 @@ pub(crate) async fn apply_command_result(
                 ) {
                     Ok(outcome) => outcome,
                     Err(err) => {
-                        app.status_message = Some(format!("Failed to restore session: {err}"));
+                        crate::tui::ui::session_state::surface_session_load_failure(
+                            app,
+                            format!("Failed to restore session: {err}"),
+                        );
                         return Ok(false);
                     }
                 };
@@ -1362,7 +1394,7 @@ pub(crate) async fn apply_command_result(
                 let _ = engine_handle
                     .send(Op::SyncSession {
                         session_id: app.current_session_id.clone(),
-                        messages: app.api_messages.clone(),
+                        messages: app.api_messages.as_ref().clone(),
                         system_prompt: app.system_prompt.clone(),
                         system_prompt_override: false,
                         model: app.model.clone(),
@@ -1375,21 +1407,25 @@ pub(crate) async fn apply_command_result(
                         config: app.compaction_config(),
                     })
                     .await;
-                let success_message = format!(
-                    "Session loaded from {} (ID: {}, {} messages)",
-                    path.display(),
-                    crate::session_manager::truncate_id(&session.metadata.id),
-                    session.metadata.message_count
+                let title = crate::session_manager::sanitize_session_title(&session.metadata.title);
+                // Restore may have queued a legacy configuration notice.
+                // Admit it first so the confirmed resume remains the latest
+                // toast instead of being immediately covered on the next draw.
+                app.sync_status_message_to_toasts();
+                app.push_status_toast_record(
+                    StatusToast::new(
+                        app.tr(MessageId::SessionsResumed)
+                            .replace("{title}", &title),
+                        StatusToastLevel::Success,
+                        Some(4_000),
+                    )
+                    .for_event(format!("session-resumed:{}", session.metadata.id)),
                 );
-                app.add_message(HistoryCell::System {
-                    content: success_message.clone(),
-                });
-                app.status_message = Some(success_message);
                 // A loaded session is the working screen. The launch card's
                 // recent rows reach here through `/resume`-shaped dispatch;
                 // leaving the launch stage visible over the restored
                 // transcript is what made those rows read as dead (#4).
-                app.launch.visible = false;
+                app.launch.dismiss();
                 app.launch.status = None;
             }
             AppAction::SyncSession {
@@ -1533,7 +1569,7 @@ pub(crate) async fn apply_command_result(
                     let _ = engine_handle
                         .send(Op::SyncSession {
                             session_id: app.current_session_id.clone(),
-                            messages: app.api_messages.clone(),
+                            messages: app.api_messages.as_ref().clone(),
                             system_prompt: app.system_prompt.clone(),
                             system_prompt_override: false,
                             model: app.model.clone(),
@@ -1659,24 +1695,22 @@ pub(crate) async fn apply_command_result(
                 let inputs =
                     build_preview_request_inputs(app, config, engine_handle, hypothetical_prompt)
                         .await;
-                if let Err(err) = engine_handle
-                    .send(Op::PreviewOutboundRequest {
-                        inputs: Box::new(inputs),
-                        json,
-                        base_prompt_only,
-                    })
-                    .await
-                {
+                // #6150: the input path never awaits a full op channel; a
+                // rejected preview is reported and retryable.
+                if let Err(err) = engine_handle.try_send(Op::PreviewOutboundRequest {
+                    inputs: Box::new(inputs),
+                    json,
+                    base_prompt_only,
+                }) {
                     app.status_message = Some(format!("Cannot preview request: {err}"));
                 }
             }
             AppAction::CancelSubAgent { agent_id } => {
                 app.status_message = Some(format!("Cancelling {agent_id}..."));
                 if engine_handle
-                    .send(Op::CancelSubAgent {
+                    .try_send(Op::CancelSubAgent {
                         agent_id: agent_id.clone(),
                     })
-                    .await
                     .is_err()
                 {
                     app.status_message = Some(format!("Could not cancel {agent_id}"));
@@ -1692,7 +1726,7 @@ pub(crate) async fn apply_command_result(
                         ),
                     });
                 } else {
-                    let api_key = config.deepseek_api_key().unwrap_or_default();
+                    let api_key = config.active_route_api_key().unwrap_or_default();
                     if api_key.trim().is_empty() {
                         app.add_message(HistoryCell::System {
                             content: format!(
@@ -1701,7 +1735,7 @@ pub(crate) async fn apply_command_result(
                             ),
                         });
                     } else {
-                        let base_url = config.deepseek_base_url();
+                        let base_url = config.active_route_base_url();
                         match fetch_provider_balance(provider, &api_key, &base_url).await {
                             Some(info) => {
                                 if let Ok(mut guard) = app.balance_cell.lock() {
@@ -1857,8 +1891,8 @@ pub(crate) async fn apply_command_result(
             }
             AppAction::SwitchProvider { provider, model } => {
                 switch_provider(app, engine_handle, config, provider, model).await;
-                let api_key = config.deepseek_api_key().unwrap_or_default();
-                let base_url = config.deepseek_base_url();
+                let api_key = config.active_route_api_key().unwrap_or_default();
+                let base_url = config.active_route_base_url();
                 schedule_balance_fetch(app, &api_key, &base_url, false);
             }
             AppAction::SwitchModelRoute { provider, model } => {
@@ -1913,9 +1947,14 @@ pub(crate) async fn apply_command_result(
                 }
             }
             AppAction::UpdateStreamChunkTimeout(timeout_secs) => {
-                let _ = engine_handle
-                    .send(Op::SetStreamChunkTimeout { timeout_secs })
-                    .await;
+                // #6150: the input path never awaits a full op channel.
+                if engine_handle
+                    .try_send(Op::SetStreamChunkTimeout { timeout_secs })
+                    .is_err()
+                {
+                    app.status_message =
+                        Some("Engine busy — setting not applied; try again".to_string());
+                }
             }
             AppAction::UpdateSubagentRuntimeConfig {
                 enabled,
@@ -1925,8 +1964,8 @@ pub(crate) async fn apply_command_result(
                 api_timeout_secs,
                 heartbeat_timeout_secs,
             } => {
-                let _ = engine_handle
-                    .send(Op::SetSubagentRuntimeConfig {
+                if engine_handle
+                    .try_send(Op::SetSubagentRuntimeConfig {
                         enabled,
                         max_subagents,
                         launch_concurrency,
@@ -1934,15 +1973,30 @@ pub(crate) async fn apply_command_result(
                         api_timeout_secs,
                         heartbeat_timeout_secs,
                     })
-                    .await;
+                    .is_err()
+                {
+                    app.status_message =
+                        Some("Engine busy — setting not applied; try again".to_string());
+                }
             }
             AppAction::UpdateSearchProvider { provider } => {
-                let effective_provider = config.set_search_provider(provider);
-                let _ = engine_handle
-                    .send(Op::SetSearchProvider {
-                        provider: effective_provider,
-                    })
-                    .await;
+                // Reserve before committing the config change so a full
+                // channel cannot desync the engine from it.
+                match engine_handle.tx_op.clone().try_reserve_owned() {
+                    Ok(permit) => {
+                        let effective_provider = config.set_search_provider(provider);
+                        engine_handle.send_reserved_op(
+                            permit,
+                            Op::SetSearchProvider {
+                                provider: effective_provider,
+                            },
+                        );
+                    }
+                    Err(_) => {
+                        app.status_message =
+                            Some("Engine busy — provider not applied; try again".to_string());
+                    }
+                }
             }
             AppAction::UpdatePromptSuggestion { enabled } => {
                 config.prompt_suggestion = Some(enabled);
@@ -1953,7 +2007,13 @@ pub(crate) async fn apply_command_result(
                 }
             }
             AppAction::SetAdvisorEnabled { enabled } => {
-                let _ = engine_handle.send(Op::SetAdvisorEnabled { enabled }).await;
+                if engine_handle
+                    .try_send(Op::SetAdvisorEnabled { enabled })
+                    .is_err()
+                {
+                    app.status_message =
+                        Some("Engine busy — setting not applied; try again".to_string());
+                }
             }
             AppAction::OpenConfigView => {
                 if app.view_stack.top_kind() != Some(ModalKind::Config) {
@@ -2012,64 +2072,6 @@ pub(crate) async fn apply_command_result(
                         .with_locale(app.ui_locale)
                         .with_provider_health(&app.provider_health),
                     );
-                }
-            }
-            AppAction::OpenProviderTemplateList => {
-                if app.view_stack.top_kind() != Some(ModalKind::ProviderPicker) {
-                    let runtime_status = query_provider_runtime_status(engine_handle).await;
-                    app.view_stack.push(
-                        crate::tui::provider_picker::ProviderPickerView::new_for_template_list(
-                            app.api_provider,
-                            config,
-                            runtime_status,
-                        )
-                        .with_locale(app.ui_locale)
-                        .with_provider_health(&app.provider_health),
-                    );
-                }
-            }
-            AppAction::OpenTemplateSetup { template_id } => {
-                if app.view_stack.top_kind() != Some(ModalKind::ProviderPicker) {
-                    let runtime_status = query_provider_runtime_status(engine_handle).await;
-                    if let Some(picker) =
-                        crate::tui::provider_picker::ProviderPickerView::new_for_template_setup(
-                            app.api_provider,
-                            &template_id,
-                            config,
-                            runtime_status,
-                        )
-                    {
-                        app.view_stack.push(
-                            picker
-                                .with_locale(app.ui_locale)
-                                .with_provider_health(&app.provider_health),
-                        );
-                        let template = codewhale_config::provider_setup_template(&template_id);
-                        let message = match template {
-                            Some(template) if template.is_unpublished() => {
-                                app.tr(MessageId::ProviderTemplateUnpublished).into_owned()
-                            }
-                            Some(template) if template.is_compatible() => app
-                                .tr(MessageId::ProviderTemplateOpenedEnvOnly)
-                                .replace("{id}", &template_id),
-                            _ => app
-                                .tr(MessageId::ProviderTemplateOpened)
-                                .replace("{id}", &template_id),
-                        };
-                        let level = if template.is_some_and(|item| item.is_unpublished()) {
-                            StatusToastLevel::Warning
-                        } else {
-                            StatusToastLevel::Info
-                        };
-                        app.push_status_toast(message, level, Some(8_000));
-                    } else {
-                        app.push_status_toast(
-                            app.tr(MessageId::ProviderTemplateUnknown)
-                                .replace("{id}", &template_id),
-                            StatusToastLevel::Error,
-                            Some(8_000),
-                        );
-                    }
                 }
             }
             AppAction::EditProjectHooks => {
@@ -2305,8 +2307,12 @@ pub(crate) async fn apply_command_result(
                 try_queue_manual_compaction(app, config, engine_handle, focus);
             }
             AppAction::PurgeContext => {
-                app.status_message = Some("Agent purging context...".to_string());
-                let _ = engine_handle.send(Op::PurgeContext).await;
+                if engine_handle.try_send(Op::PurgeContext).is_err() {
+                    app.status_message =
+                        Some("Engine busy — purge not sent; try again".to_string());
+                } else {
+                    app.status_message = Some("Agent purging context...".to_string());
+                }
             }
             AppAction::TaskAdd { prompt } => {
                 let owner_session_id = app
@@ -2316,6 +2322,7 @@ pub(crate) async fn apply_command_result(
                 app.current_session_id = Some(owner_session_id.clone());
                 let request = NewTaskRequest {
                     prompt: prompt.clone(),
+                    name: None,
                     model: Some(app.model.clone()),
                     model_provider: Some(app.api_provider.as_str().to_string()),
                     model_provider_id: Some(app.provider_identity_for_persistence().to_string()),
@@ -2324,6 +2331,12 @@ pub(crate) async fn apply_command_result(
                     allow_shell: Some(app.allow_shell),
                     trust_mode: Some(app.trust_mode),
                     auto_approve: Some(app_auto_approve_enabled(app)),
+                    // Same as the task tool: the task's own thread runs under
+                    // the posture this session is in, not under whatever a
+                    // legacy bit happens to mean today.
+                    permission_posture: Some(
+                        crate::runtime_policy::approval_wire(app.approval_mode).to_string(),
+                    ),
                     owner_session_id: Some(owner_session_id),
                 };
                 match task_manager.add_task(request).await {
@@ -2462,7 +2475,7 @@ pub(crate) async fn apply_command_result(
                             let _ = engine_handle
                                 .send(Op::SyncSession {
                                     session_id: app.current_session_id.clone(),
-                                    messages: app.api_messages.clone(),
+                                    messages: app.api_messages.as_ref().clone(),
                                     system_prompt: app.system_prompt.clone(),
                                     system_prompt_override: false,
                                     model: app.model.clone(),
@@ -2568,6 +2581,8 @@ fn edit_project_hooks_from_tui(terminal: &mut AppTerminal, app: &mut App, config
         app.use_mouse_capture,
         app.use_bracketed_paste,
         &path,
+        // Open the file, not a position in it: this edits hooks.toml whole.
+        None,
     );
     app.needs_redraw = true;
 
@@ -2798,11 +2813,17 @@ pub(crate) async fn apply_approval_decision(
             }
             app.remote_control
                 .resolve_pending_approval(&event.tool_id, false);
-            if engine_handle
-                .deny_tool_call(event.tool_id.clone())
-                .await
-                .is_ok()
-            {
+            // A bound expiry carries its own outcome (#6101) so the receipt
+            // distinguishes "no answer within the window" from an operator
+            // denial.
+            let denied = if event.timed_out {
+                engine_handle
+                    .deny_tool_call_timed_out(event.tool_id.clone())
+                    .await
+            } else {
+                engine_handle.deny_tool_call(event.tool_id.clone()).await
+            };
+            if denied.is_ok() {
                 app.retire_action_notices(Some(&event.tool_id));
             }
         }
@@ -3144,7 +3165,7 @@ pub(crate) async fn apply_provider_picker_test_connection_with_verifier(
         reopen_provider_picker_list(app, engine_handle, config, selected_id, catalog_view).await;
         return;
     }
-    let api_key = match scoped_config.deepseek_api_key_read_only() {
+    let api_key = match scoped_config.active_route_api_key_read_only() {
         Ok(key) if !key.trim().is_empty() => key,
         _ => {
             app.push_status_toast(
@@ -3158,7 +3179,7 @@ pub(crate) async fn apply_provider_picker_test_connection_with_verifier(
             return;
         }
     };
-    let base_url = scoped_config.deepseek_base_url();
+    let base_url = scoped_config.active_route_base_url();
     let model = scoped_config.default_model();
     match verifier.verify(provider, &api_key, &base_url).await {
         Ok(()) => {
@@ -3235,7 +3256,7 @@ pub(crate) async fn apply_provider_picker_api_key_with_verifier(
     // endpoint is selected by auth mode (notably a legacy Kimi CLI import).
     // This prevents a replacement Kimi Code API key from being probed against
     // the ordinary Moonshot endpoint.
-    let base_url = scoped_config.deepseek_base_url();
+    let base_url = scoped_config.active_route_base_url();
     match verifier.verify(provider, &api_key, &base_url).await {
         Ok(()) => {
             // Keep the readiness row aligned with the live check the wizard
@@ -3286,7 +3307,14 @@ pub(crate) async fn apply_provider_picker_api_key_with_verifier(
         Err(reason) => {
             // Verification failed - keep the picker open at the key-entry
             // stage with the provider's actual error so the user can fix
-            // the key instead of dead-ending with a status toast.
+            // the key instead of dead-ending with a status toast. Name the
+            // endpoint the probe actually used: a 401 from the wrong host
+            // (a legacy root `base_url` leaking into this route, say) is
+            // otherwise indistinguishable from a bad key.
+            let reason = match crate::llm_client::base_url_authority(&base_url) {
+                Some(authority) => format!("{reason} (endpoint: {authority})"),
+                None => reason,
+            };
             let runtime_status = query_provider_runtime_status(engine_handle).await;
             if let Some(picker) =
                 crate::tui::provider_picker::ProviderPickerView::new_for_key_entry_with_error(
@@ -3553,14 +3581,39 @@ pub(crate) fn apply_loaded_session_with_goal(
         && let Some(tasks) = app.runtime_services.task_manager.as_ref()
         && tasks.session_store_binding().as_ref() != Some(binding)
     {
-        if binding
+        // A switch can rebind the conversation but cannot carry the saved
+        // store's durable work into the running host, so it may only adopt a
+        // store there is nothing to lose from leaving: one that is missing, or
+        // one that exists and is provably empty *and* provably unheld, with no
+        // scope-pinned automation. A force-quit leaves the second shape — the
+        // store is on disk, ownerless and holding zero events — and refusing
+        // it protected nothing while making the session unopenable (#6207).
+        let nothing_to_abandon = binding
             .is_missing_session_store()
             .map_err(|error| error.to_string())?
-        {
+            || binding
+                .is_adoptable_empty_store()
+                .map_err(|error| error.to_string())?;
+        if nothing_to_abandon {
             recovered_binding = tasks.session_store_binding();
         }
         if recovered_binding.is_none() {
-            return Err("This session belongs to another Runtime host. Resume it in a new Codewhale process to reopen its saved store.".into());
+            // Name the real condition and the path that actually works. The
+            // old wording ("resume it in a new Codewhale process") sent users
+            // in circles: starting a new process and then picking the session
+            // from `/resume` lands here again, because that is this same
+            // switch path. Opening the session *at launch* is a different
+            // route — `TaskManager::start` passes the saved binding through to
+            // `open_for_session`, which validates the existing store and
+            // adopts it (runtime_threads.rs, `validate_existing_store` then
+            // `open_inner`). So the advice has to say which one (#6207, #6225).
+            return Err(format!(
+                "This session's saved Runtime store belongs to a different host. \
+                 Switching to it from inside a running session cannot carry that \
+                 store's queued work across, but opening it directly can: run \
+                 `codewhale resume {}` from your shell.",
+                session.metadata.id
+            ));
         }
     }
     if app.session_transition_blocked() {
@@ -3617,7 +3670,7 @@ pub(crate) fn apply_loaded_session_with_goal(
     app.refresh_notification_settings(config);
     app.restore_api_messages(
         crate::runtime_handoff::project_messages_for_restore(&session.messages),
-        &session.journal_message_stamps(),
+        session,
     );
     app.clear_history();
     app.tool_cells.clear();

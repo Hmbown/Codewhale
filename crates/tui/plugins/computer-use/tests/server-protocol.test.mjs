@@ -17,36 +17,24 @@ const recDir = fs.mkdtempSync(path.join(os.tmpdir(), "cu-proto-rec-"));
 const fakeHome = fs.mkdtempSync(path.join(os.tmpdir(), "cu-proto-home-"));
 const binDir = fs.mkdtempSync(path.join(os.tmpdir(), "cu-proto-bin-"));
 
-// Fake ssh: rebuild the remote command after user@host, then either run the
-// agent or emulate the one remote command the installer needs (mkdir -p).
-fs.writeFileSync(path.join(binDir, "ssh"), `#!/bin/bash
-CMD=()
-FOUND=0
-for a in "$@"; do
-  if [ "$FOUND" -eq 1 ]; then CMD+=("$a"); fi
-  case "$a" in *@*) [ "$FOUND" -eq 0 ] && FOUND=1 ;; esac
-done
-SUB="\${CMD[0]}"
-if [ "$SUB" = "node" ]; then
-  exec node "$FAKE_HOME/\${CMD[1]}" "\${CMD[2]}"
-fi
-if [ "$SUB" = "mkdir" ]; then
-  LAST="\${CMD[\${#CMD[@]}-1]}"
-  mkdir -p "$FAKE_HOME/$LAST"
-  exit 0
-fi
-exit 0
+// Portable command fixtures still run the real transferred remote agent.
+fs.writeFileSync(path.join(binDir, "ssh.cjs"), `
+const fs = require('node:fs'), path = require('node:path');
+const args = process.argv.slice(2);
+const remote = args.slice(args.findIndex(a => a.includes('@')) + 1);
+if (remote[0] === 'mkdir') fs.mkdirSync(path.join(process.env.FAKE_HOME, remote.at(-1)), {recursive:true});
+else if (remote[0] === 'node') {
+  const agent = path.join(process.env.FAKE_HOME, remote[1]);
+  process.argv = [process.execPath, agent, ...remote.slice(2)];
+  import(require('node:url').pathToFileURL(agent).href);
+} else process.exit(1);
 `);
-// Fake scp: copies <src> to <user@host:dest> under FAKE_HOME.
-fs.writeFileSync(path.join(binDir, "scp"), `#!/bin/bash
-SRC="$(printf '%s\\n' "$@" | tail -n 2 | head -n 1)"
-DEST="$(printf '%s\\n' "$@" | tail -n 1)"
-DEST="$FAKE_HOME/\${DEST#*:}"
-mkdir -p "$(dirname "$DEST")"
-cp "$SRC" "$DEST"
+fs.writeFileSync(path.join(binDir, "scp.cjs"), `
+const fs = require('node:fs'), path = require('node:path');
+const [source, remote] = process.argv.slice(-2);
+const dest = path.join(process.env.FAKE_HOME, remote.slice(remote.indexOf(':') + 1));
+fs.mkdirSync(path.dirname(dest), {recursive:true}); fs.copyFileSync(source, dest);
 `);
-fs.chmodSync(path.join(binDir, "ssh"), 0o755);
-fs.chmodSync(path.join(binDir, "scp"), 0o755);
 
 let server;
 let buf = "";
@@ -72,7 +60,9 @@ before(async () => {
   server = spawn("node", [path.join(ROOT, "mcp", "server.mjs")], {
     env: {
       ...process.env,
-      PATH: `${binDir}:${process.env.PATH}`,
+      PATH: `${binDir}${path.delimiter}${process.env.PATH}`,
+      CU_COMMAND_FIXTURES: binDir,
+      NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ""} --import=${new URL("./fixtures/command-shims.mjs", import.meta.url).href}`,
       FAKE_HOME: fakeHome,
       CODEWHALE_CU_STATE_DIR: stateDir,
       CODEWHALE_CU_RECORDINGS_DIR: recDir,
@@ -104,21 +94,24 @@ after(() => {
   for (const d of [stateDir, recDir, fakeHome]) { try { fs.rmSync(d, { recursive: true, force: true }); } catch {} }
 });
 
-test("tools/list exposes the full frontier surface with valid schemas", async () => {
+test("tools/list advertises the merged surface with valid schemas; wire names stay aliases", async () => {
   const res = await rpc("tools/list", {});
   const tools = res.result.tools;
-  assert.ok(tools.length >= 38, `${tools.length} tools`);
+  assert.ok(tools.length >= 30, `${tools.length} tools`);
+  assert.ok(tools.every((t) => t.hidden !== true), "hidden aliases must not be listed");
   for (const t of tools) {
     assert.ok(t.name && t.description && t.inputSchema, `schema incomplete for ${t.name}`);
   }
   const names = new Set(tools.map((t) => t.name));
-  for (const required of ["screenshot", "zoom", "left_click", "double_click", "triple_click", "right_click", "middle_click",
-    "mouse_move", "left_click_drag", "left_mouse_down", "left_mouse_up", "scroll", "type", "key", "hold_key",
-    "set_value", "select_text", "perform_action", "get_app_state", "list_apps", "list_windows", "list_displays",
-    "switch_display", "open_application", "read_clipboard", "write_clipboard", "cursor_position", "wait",
-    "recording_start", "recording_stop", "recording_status", "recording_list",
-    "computer_list", "computer_switch", "computer_register", "computer_remove", "request_access", "stop_computer_control"]) {
+  for (const required of ["screenshot", "zoom", "click", "pointer", "left_click_drag", "scroll", "type", "key",
+    "set_value", "focus", "get_value", "find_elements", "run_actions", "select_text", "perform_action", "get_app_state", "list_apps", "list_windows", "list_displays",
+    "switch_display", "open_application", "clipboard", "cursor_position", "wait",
+    "recording", "computer", "request_access", "stop_computer_control", "invoke_menu", "preview", "wait_for"]) {
     assert.ok(names.has(required), `missing tool ${required}`);
+  }
+  for (const hidden of ["left_click", "double_click", "right_click", "hold_key", "mouse_move", "read_clipboard",
+    "recording_start", "computer_list", "computer_switch"]) {
+    assert.ok(!names.has(hidden), `${hidden} is an alias, not advertised`);
   }
 });
 
@@ -146,7 +139,13 @@ test("registering an ssh computer installs the agent and probes the platform", a
   const apps = await tool("list_apps", { computer: "box" });
   if (apps.ok) {
     assert.equal(apps.computer.id, "box");
-    assert.ok(Array.isArray(apps.apps) && apps.apps.length > 0, "apps returned over the wire");
+    assert.ok(Array.isArray(apps.apps), "an app list came back over the wire");
+    // An empty list is a real answer, not a broken one: the Linux box in
+    // docker/ runs a live X session with nothing on it. Only a login session
+    // is guaranteed to have an application in it.
+    if (process.platform === "darwin") {
+      assert.ok(apps.apps.length > 0, "apps returned over the wire");
+    }
   } else {
     assert.equal(process.platform, "linux", JSON.stringify(apps.error ?? {}));
     // A headless CI host fails closed with either shape: the modern

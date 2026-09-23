@@ -15,18 +15,18 @@
                     │ Help Expand Groups                 Off            [ ]   │kind      choice                         
                     │ Contextual tips                    On             [x]   │available not observed this session      
                     │ Pin Last Prompt                    On             [x]   │                                         
-                    │ Tool detail level                  Off            [ ]   │system | terminal | underwater |         
-                    │ Inline file changes                Full diff      ‹ ›   │underwater-retro | dark | light |        
-                    │ Output pacing                      auto           ‹ ›   │grayscale | catppuccin-mocha |           
-                    │ Cost currency                      usd            ‹ ›   │tokyo-night | dracula | gruvbox-dark |   
-                    │ Transcript spacing                 comfortable    ‹ ›   │claude | matrix | solarized-light | uwu  
-                    │ Tool cards                         compact        ‹ ›   │Enter or click again: Enter opens        
+                    │ Tool detail level                  Off            [ ]   │system | terminal | shoreline |          
+                    │ Inline file changes                Full diff      ‹ ›   │shoreline-light | underwater |           
+                    │ Output pacing                      auto           ‹ ›   │underwater-retro | dark | light |        
+                    │ Cost currency                      usd            ‹ ›   │grayscale | catppuccin-mocha |           
+                    │ Transcript spacing                 comfortable    ‹ ›   │tokyo-night | dracula | gruvbox-dark |   
+                    │ Tool cards                         compact        ‹ ›   │claude | matrix | solarized-light | uwu  
+                    │                                                         │Enter or click again: Enter opens        
                     │                                                         │choices                                  
                     │                                                         │                                         
                     │                                                         │                                         
-  system | terminal | underwater | underwater-retro | dark | light | grayscale | catppuccin-mocha | tokyo-night |…      
-  Preview: ▶▶ ask · agent                                                                                               
+  system | terminal | shoreline | shoreline-light | underwater | underwater-retro | dark | light | grayscale |…         
+  Preview:  ask   agent                                                                                                 
   type=filter, Up/Down=select, Enter=edit, Esc=close                                                                    
-                                                                                                                        
  ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── 
                                                                                                                         

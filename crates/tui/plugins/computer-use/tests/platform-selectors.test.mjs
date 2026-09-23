@@ -50,12 +50,12 @@ test('Linux production Python uses the same exact unique app-name selection for 
   t.after(()=>fs.rmSync(dir,{recursive:true,force:true}));
   const actions=path.join(dir,'actions.jsonl');
   process.env.DISPLAY='fixture';delete process.env.WAYLAND_DISPLAY;process.env.XDG_SESSION_TYPE='x11';
-  let duplicate=false;
+  let duplicate=false, editMode="text";
   const backend=linux({exec:{have:async()=>true,run:async(cmd,args)=>{
     assert.equal(cmd,'python3','only generated Python may run in this fixture');
     assert.equal(args[0],'-c');
     const prefix=`import importlib.util, sys\nspec = importlib.util.spec_from_file_location("pyatspi", ${JSON.stringify(path.join(fixtures,'pyatspi.py'))})\nmodule = importlib.util.module_from_spec(spec)\nsys.modules["pyatspi"] = module\nspec.loader.exec_module(module)\n`;
-    const result=spawnSync('python3',['-I','-S','-B','-c',prefix+args[1],...args.slice(2)],{encoding:'utf8',env:{...process.env,CU_ATSPI_ACTIONS:actions,CU_ATSPI_DUPLICATE:duplicate?'1':'0'}});
+    const result=spawnSync('python3',['-I','-S','-B','-c',prefix+args[1],...args.slice(2)],{encoding:'utf8',env:{...process.env,CU_ATSPI_ACTIONS:actions,CU_ATSPI_DUPLICATE:duplicate?'1':'0',CU_ATSPI_EDIT_MODE:editMode}});
     assert.equal(result.status,0,result.stderr);
     return {code:result.status,stdout:result.stdout,stderr:result.stderr};
   }}});
@@ -76,4 +76,19 @@ test('Linux production Python uses the same exact unique app-name selection for 
   assert.equal((await backend.resolve_element({app_ref:explicit,path:[]})).found,false);
   await assert.rejects(backend.perform_action({target:{app_ref:explicit,path:[]},action:'click'}),/app_not_found/);
   assert.equal(fs.readFileSync(actions,'utf8').trim().split('\n').length,1,'missing or ambiguous app names must never send a synthetic action');
+  duplicate=false;
+  const target={app_ref:explicit,path:[0],windowIndex:0};
+  const edits=()=>fs.readFileSync(actions,'utf8').trim().split('\n').map(JSON.parse).filter(x=>'value' in x);
+  const text='Updated 漢字 🌊';
+  assert.deepEqual(await backend.set_value({target,value:text}),{action_sent:true,strategy:'a11y',verified:true,after:text});
+  editMode='numeric';
+  assert.equal((await backend.set_value({target,value:12.5})).after,12.5);
+  assert.deepEqual(edits().map(x=>x.value),[text,12.5]);
+  for(const [mode,error,sends] of [['readonly','element_read_only',0],['disabled','element_disabled',0],['query-failed','interface_failed',0],['rejected','value_rejected',1],['mismatch','value_verification_failed',1]]) {
+    editMode=mode;
+    const before=edits().length;
+    await assert.rejects(backend.set_value({target,value:'rejected'}),new RegExp(error));
+    assert.equal(edits().length-before,sends,`${mode}: never replay a failed or unverified edit`);
+  }
+
 });

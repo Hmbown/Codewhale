@@ -56,6 +56,10 @@ impl ToolSpec for RunTestsTool {
                 "all_features": {
                     "type": "boolean",
                     "description": "When true, include `--all-features`."
+                },
+                "cwd": {
+                    "type": "string",
+                    "description": "Optional working directory, relative to the workspace, to run `cargo test` in. Must exist inside the workspace."
                 }
             },
             "additionalProperties": false
@@ -78,6 +82,13 @@ impl ToolSpec for RunTestsTool {
         let extra_args = optional_str(&input, "args")?
             .map(str::trim)
             .filter(|s| !s.is_empty());
+        let workdir = match optional_str(&input, "cwd")?
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            None => context.workspace.clone(),
+            Some(raw) => context.resolve_existing_dir(raw, "cwd")?,
+        };
 
         let mut args = vec!["test".to_string()];
         if all_features {
@@ -90,8 +101,8 @@ impl ToolSpec for RunTestsTool {
             args.extend(split);
         }
 
-        let command_str = format_command(&context.workspace, &args);
-        let output = run_cargo(&context.workspace, &args)?;
+        let command_str = format_command(&workdir, &args);
+        let output = run_cargo(&workdir, &args)?;
 
         let exit_code = output.status.code().unwrap_or(-1);
         let stdout_raw = String::from_utf8_lossy(&output.stdout);
@@ -311,5 +322,60 @@ mod tests {
         let long = "x".repeat(MAX_OUTPUT_CHARS + 128);
         let truncated = truncate_with_note(&long, MAX_OUTPUT_CHARS);
         assert!(truncated.contains("output truncated"));
+    }
+
+    /// A child parked at a workspace root that is not the project root (the
+    /// #6296 verifier) runs the suite where the manifest lives instead of
+    /// failing on cwd.
+    #[tokio::test]
+    async fn run_tests_cwd_scopes_cargo_to_subdir() {
+        if !cargo_available() {
+            return;
+        }
+        let tmp = tempdir().expect("tempdir");
+        let project_dir = init_cargo_project(tmp.path());
+
+        let ctx = ToolContext::new(tmp.path());
+        let result = RunTestsTool
+            .execute(json!({"cwd": "project"}), &ctx)
+            .await
+            .expect("cwd-scoped execute");
+        assert!(result.success);
+
+        let parsed: RunTestsOutput =
+            serde_json::from_str(&result.content).expect("tool result should be json");
+        assert!(
+            parsed.success,
+            "nested cargo test unexpectedly failed:\\n{}",
+            parsed.stderr
+        );
+        // `resolve_existing_dir` returns the canonical path, which on Windows
+        // carries the `\\?\` verbatim prefix the raw tempdir lacks (#6346).
+        let scoped_dir = project_dir.canonicalize().expect("canonical project dir");
+        assert!(
+            parsed.command.contains(&scoped_dir.display().to_string()),
+            "cargo must run in the scoped dir, ran: {}",
+            parsed.command
+        );
+    }
+
+    #[tokio::test]
+    async fn run_tests_cwd_fails_closed_with_a_named_fallback() {
+        let tmp = tempdir().expect("tempdir");
+        let ctx = ToolContext::new(tmp.path());
+
+        let escape = RunTestsTool
+            .execute(json!({"cwd": "../escape"}), &ctx)
+            .await
+            .expect_err("workspace escape must be refused");
+        assert!(escape.to_string().contains("escapes workspace"), "{escape}");
+
+        let missing = RunTestsTool
+            .execute(json!({"cwd": "no-such-dir"}), &ctx)
+            .await
+            .expect_err("missing dir must be refused");
+        let message = missing.to_string();
+        assert!(message.contains("not an existing directory"), "{message}");
+        assert!(message.contains("drop `cwd`"), "{message}");
     }
 }

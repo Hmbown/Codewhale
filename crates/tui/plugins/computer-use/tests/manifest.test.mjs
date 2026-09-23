@@ -46,7 +46,7 @@ test("declared components exist and every skill is named for its directory", () 
   const skills = fs.readdirSync(path.join(ROOT, "skills"));
   assert.deepEqual(skills.sort(), ["computer-use", "recording"]);
   for (const skill of skills) {
-    const text = fs.readFileSync(path.join(ROOT, "skills", skill, "SKILL.md"), "utf8");
+    const text = fs.readFileSync(path.join(ROOT, "skills", skill, "SKILL.md"), "utf8").replace(/\r\n/g, "\n");
     assert.match(text, new RegExp(`^---\\nname: ${skill}\\ndescription: .+`), `${skill} frontmatter`);
   }
 });

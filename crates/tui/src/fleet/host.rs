@@ -993,6 +993,7 @@ fn unix_session_members(
                 if pid > 0 {
                     // Revalidate against the kernel after parsing the snapshot. A PID
                     // reused by an unrelated process must never receive our signal.
+                    // SAFETY: getsid(2) dereferences no pointers.
                     if unsafe { libc::getsid(pid) } == session_id {
                         members.push(pid);
                     }
@@ -1015,6 +1016,7 @@ fn unix_session_members(
 
 #[cfg(unix)]
 fn unix_pid_in_session(pid: libc::pid_t, session_id: libc::pid_t) -> bool {
+    // SAFETY: getsid(2) dereferences no pointers.
     unsafe { libc::getsid(pid) == session_id }
 }
 
@@ -1023,6 +1025,7 @@ fn unix_pid_exists(pid: libc::pid_t) -> bool {
     if pid <= 0 {
         return false;
     }
+    // SAFETY: kill(2) dereferences no pointers; signal 0 sends nothing.
     if unsafe { libc::kill(pid, 0) } == 0 {
         return true;
     }
@@ -1163,6 +1166,7 @@ fn signal_unix_session(
     signal: libc::c_int,
     known_leader: Option<libc::pid_t>,
 ) -> FleetHostResult<Vec<String>> {
+    // SAFETY: getsid(2) dereferences no pointers.
     let own_session = unsafe { libc::getsid(0) };
     if session_id <= 0 || session_id == own_session {
         return Err(FleetHostError::terminal(format!(
@@ -1182,6 +1186,7 @@ fn signal_unix_session(
     for pid in candidates {
         // Verify identity again immediately before signalling. Session IDs
         // remain stable across reparenting and separate process groups.
+        // SAFETY: getsid(2) dereferences no pointers.
         if unsafe { libc::getsid(pid) } != session_id {
             // Leader may already be gone; still try kill on known leader when
             // getsid fails only with ESRCH-equivalent absence.
@@ -1189,6 +1194,7 @@ fn signal_unix_session(
                 continue;
             }
         }
+        // SAFETY: kill(2) dereferences no pointers.
         if unsafe { libc::kill(pid, signal) } != 0 {
             let err = std::io::Error::last_os_error();
             if err.raw_os_error() != Some(libc::ESRCH) {
@@ -1266,10 +1272,12 @@ unsafe impl Sync for FleetWindowsJob {}
 #[cfg(windows)]
 impl FleetWindowsJob {
     fn attach_to_child(child: &Child) -> std::io::Result<Self> {
+        // SAFETY: returned handle is owned by the new wrapper.
         let handle = unsafe { CreateJobObjectW(None, PCWSTR::null()).map_err(windows_io_error)? };
         let job = Self { handle };
         let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
         limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        // SAFETY: `limits` is live with matching size; both handles are live.
         unsafe {
             SetInformationJobObject(
                 job.handle,
@@ -1285,11 +1293,13 @@ impl FleetWindowsJob {
     }
 
     fn terminate(&self) -> std::io::Result<()> {
+        // SAFETY: `self.handle` is a live owned job handle.
         unsafe { TerminateJobObject(self.handle, 1).map_err(windows_io_error) }
     }
 
     fn has_active_processes(&self) -> std::io::Result<bool> {
         let mut accounting = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
+        // SAFETY: `accounting` is live with matching size.
         unsafe {
             QueryInformationJobObject(
                 Some(self.handle),
@@ -1307,6 +1317,7 @@ impl FleetWindowsJob {
 #[cfg(windows)]
 impl Drop for FleetWindowsJob {
     fn drop(&mut self) {
+        // SAFETY: `self.handle` is owned here; Drop runs once.
         unsafe {
             let _ = CloseHandle(self.handle);
         }

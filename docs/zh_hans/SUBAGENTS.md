@@ -41,6 +41,8 @@ Fleet 的八个规范角色名是 `general`、`explore`、`planner`、`reviewer`
 
 **委派移动的是工作，绝不是权限。** 只读父代理可以委派给 `implement`，但子代理的写入、网络、shell 和工具权限仍受父代理实时权限限制。检查角色可以使用分类的只读 shell；平台提供原生强制隔离时，也可以使用显式的只读分析模式。角色名称或 `read_only` 标志都不能授予调用方原本没有的 shell 权限。`fleet/exact.rs` 中的 `ChildAuthority::clamp` 对每个权限字段取较窄的值，并合并拒绝列表；`inherit_disallowed_tools: false` 不能删除操作者或祖先的拒绝规则。恢复保存的 worker 时，还会再次与当前调用方权限求交。测试 `a_read_only_parents_delegation_never_widens_authority` 验证此边界。
 
+进程内部，解析后的权限只有一个对象——`crates/tui/src/worker_profile.rs` 中的 `ChildGrant`：`files`（none/read/write）、`shell`（none/inspect/verify/full）、`network`、`desktop`（子代理一律不授予）、命名工具 `surface`、调用方的显式 `scope`，以及剩余 `spawn` 深度。角色只是该对象上的预设（`ChildGrant::for_role`）；`ChildGrant::resolve` 将它与父代理派生的配置求交。子代理的工具目录、分发拒绝和能力包络读取同一份字段——可见即可调，被拒即不可见。
+
 会话的**权限姿态**在每个子代理内部的应用方式与父代理回合完全一致：在 Auto-Review 下，同一个确定性底线和一次性模型守护者决定 worker 的被扣留调用（绝不是提示词；守护者不可用时拒绝，fail closed）；在 Ask 下，角色无法委派的被扣留调用会作为审批提示在父代理的 UI 中弹出，worker 可见地等待（`waiting for user`），或者在无法提示的主机上带着原因被拒绝；Full Access 仍然在不可绕过的安全底线上 fail closed。每一次没有人被提示的决策都是该 worker 转录中的一行备注（聚焦时可见）和一条审计日志记录。参见 `docs/MODES.md`。
 
 每个角色的完整系统提示词位于 `crates/tui/src/tools/subagent/mod.rs`（搜索 `*_AGENT_INTRO`）。提示词前缀在子代理启动时自动加载；父代理的委派提示词成为第一个回合的用户消息。
@@ -73,7 +75,7 @@ Fleet 的八个规范角色名是 `general`、`explore`、`planner`、`reviewer`
 - `worktree_base`：要从中开分支的 git ref；默认为 `HEAD`。
 - `worktree_path`：确切的检出路径。相对路径留在默认的兄弟目录 `.codewhale-worktrees/` 根下。
 
-不要组合 `cwd` 与 `worktree`；`cwd` 仍是针对父工作区内已经存在的目录的手动逃生舱。
+`cwd` 可与 `worktree` 组合：所请求的目录成为仓库根（及新检出）解析所用的发现锚点（`prepare_child_workspace`）。没有 `worktree` 时，`cwd` 仍是针对父工作区内已经存在的目录的手动逃生舱。
 
 ## 委派简报
 
@@ -126,7 +128,7 @@ OUTPUT: VERDICT、EVIDENCE、GAPS、NEXT。
 - **`planner`** —— 当父代理有目标但没有可执行的分解。planner 写工件（`todo_write` 条目、响应体里的策略），但不执行它们。
 - **`reviewer`** —— 当已经有一个变更，父代理想要它被评分。reviewer 不打补丁——他们在发现里描述修复方案，这样如果判定是"修它"，父代理可以派一个 implement。
 - **`implement`** —— 当变更已经被明确指定、只需要落地。implement 保持严格的范围：最小改动，不做顺手重构，交回前跑一次快速验证。
-- **`test`** —— 当父代理需要测试套件或其他验证上的权威通过/失败结论。test 角色不修失败；他们记录失败的断言 + 栈，把修复候选放在 RISKS 下。
+- **`test`** —— 当父代理需要测试套件或其他验证上的权威通过/失败结论。test 角色不修失败；他们记录失败的断言 + 栈，把修复候选放在 RISKS 下。test 姿态永不写入，shell 被收窄到有界的内置验证面：Run tests/verifiers（当检查位于子目录时传 `cwd`）、Git fetch 拉取远端引用、Git merge_tree 求合并结果。写入上限为只读，无界 shell 形式会被拒绝（#5186）。被拒绝的探测上报给父代理，绝不绕行（#6298）。
 - **`advisor`** —— 当操作者想在更便宜的执行继续之前得到一个高杠杆的第二意见。advisor 读足够的材料来支撑一条建议，但不能写，也不能运行 shell 命令。`oracle` 和 `consultant` 仅作为旧输入兼容接受；新的提示词、回执和 UI 使用 `advisor`。
 - **`custom`** —— 只有当父代理需要显式约束工具集时。通过 legacy/internal 子代理记录上的 `allowed_tools` 字段传 allowlist；面向模型的 `agent` 工具刻意保持公共 schema 很小。
 
@@ -167,7 +169,6 @@ max_depth = 6
 # 可选的操作者步数上限；未配置时角色没有默认模型回合上限。
 default_max_steps = 120
 default_wall_time_secs = 1800
-token_budget = 100000
 
 [subagents.providers.deepseek]
 # 直连 API key，有余地扇出。
@@ -204,8 +205,8 @@ max_admitted = 12
 | 用途 | 字段 |
 |---|---|
 | 启动与路由 | `action`、`prompt`、`type`、`profile`、`name`、`model`、`model_strength`、`thinking` |
-| 作用域与交付 | `worktree`、`write_authority`、`write_roots`、`exact_files`、`coordination_contracts`、`deliverables`、`expected_artifact` |
-| 收窄运行限制 | `token_budget`、`max_steps`、`wall_time_secs` |
+| 作用域与交付 | `worktree`、`cwd`、`write_authority`、`write_roots`、`exact_files`、`coordination_contracts`、`deliverables`、`expected_artifact` |
+| 收窄运行限制 | `max_steps`、`wall_time_secs` |
 | 协调与恢复 | `agent_id`、`agent_ids`、`all_parked`、`message`、`until`、`detached`、`resume_from` |
 | 检查 | `detail`、`offset`、`limit` |
 
@@ -217,11 +218,11 @@ max_admitted = 12
 
 费用类别仅描述当前未缓存文本输入和输出的费率，不代表未来任务的总费用。缺少费率或依赖路由的价格保持未知；订阅和本地路由标记为非按金额计费。查询不会向 provider 发送请求，可达性标记为未验证。
 
-**解析接受但未公布（兼容）。** 其他输入用于旧转录、客户端和内部/操作者兼容，仍须与实时权限求交：`max_depth`（以及 `maxDepth` / `max_spawn_depth`）、`workspace_policy`、`fork_context`、`cwd`、`worktree_path`、`worktree_branch`、`worktree_base`、`deliberate`、`dependencies`、`acceptance`、`allowed_tools`、`timeout_secs`、`reason` 和 `include_archived`。兼容深度值为 0..=8，只能收窄继承的绝对上限；兼容输入不能扩大权限或解除有限预算。
+**解析接受但未公布（兼容）。** 其他输入用于旧转录、客户端和内部/操作者兼容，仍须与实时权限求交：`max_depth`（以及 `maxDepth` / `max_spawn_depth`）、`workspace_policy`、`fork_context`、`worktree_path`、`worktree_branch`、`worktree_base`、`deliberate`、`dependencies`、`acceptance`、`allowed_tools`、`timeout_secs`、`reason` 和 `include_archived`。兼容深度值为 0..=8，只能收窄继承的绝对上限；兼容输入不能扩大权限或解除有限预算。
 
 ## 子代理预算（步数、墙钟时间、token）
 
-`max_steps`、`wall_time_secs` 和 `token_budget` 是可选的每次调用限制，只能收窄角色、操作者、父代理及保存运行的适用限制。省略时继承；工具解析器拒绝显式的零、null、负值和越界值。
+`max_steps` 和 `wall_time_secs` 是可选的每次调用限制，只能收窄角色、操作者、父代理及保存运行的适用限制。省略时继承；工具解析器拒绝显式的零、null、负值和越界值。
 
 `max_steps` 计算模型回合，接受 1..=2000；所有角色默认不限制模型回合数，除非操作者或祖先已经设置上限。内部用零表示未设上限，不会抵消继承的有限限制。`wall_time_secs` 接受 1..=86400，默认 1800 秒，可由操作者配置；计时包含排队、模型请求和工具执行，有效绝对截止时间会持久化。
 
@@ -229,7 +230,7 @@ max_admitted = 12
 
 ### Token 记账与部分结果
 
-`[subagents].token_budget` 为根子代理及后代设置共享额度。子调用可以再指定更小的额度，用量仍计入每个适用的祖先作用域；继续执行和转录分叉同时保留源任务及当前父代理的记账。同一作用域内的后代用量不会重复累计。
+Token 预算已于 0.9.14 退役：token 用量仅被记录，不再强制执行——运行不会因 token 记账而停止。仍携带 `token_budget` 的旧输入可以正常解析但会被忽略；`max_steps` 和 `wall_time_secs` 仍是可收窄的每次调用限制。
 
 额度依据 provider 报告的输入加输出 token；请求输出限制为剩余额度。未知的提示词用量和已在执行的请求仍可能导致超额，回执保留完整的实际报告值；未知用量不等于零。worker 自身用量与共享 `budget_spent_tokens` / `budget_remaining_tokens` 分开记录，不应按后代重复相加同一共享池。
 

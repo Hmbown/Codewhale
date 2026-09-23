@@ -336,6 +336,443 @@ pub const LIGHT_UI_THEME: UiTheme = UiTheme {
 }
 .with_terminal_native_shell();
 
+/// Shoreline — the warm charcoal alternative and the terminal's half of the
+/// product-client palette. Fresh 0.10.0 terminal installs use Underwater.
+///
+/// The GPUI desktop window and this terminal now cite the same slots, so the
+/// two clients read as one product: a warm charcoal ground, one raised plate
+/// for cards and the composer, one restrained blue for action and selection,
+/// and the whale's ivory ink. It does **not** call
+/// [`UiTheme::with_terminal_native_shell`] — the field is painted, the way the
+/// desktop window paints it — and `adapt::theme_remap_active` remaps every
+/// direct terminal constant onto these slots, so nothing navy-tuned leaks
+/// through.
+///
+/// The terminal's `underwater` default keeps the painted
+/// water column, the ambient life and the ombre.
+///
+/// Every pair `contrast::theme_contrast_violations` audits clears its floor.
+pub const SHORELINE_UI_THEME: UiTheme = UiTheme {
+    name: "shoreline",
+    mode: PaletteMode::Dark,
+    surface_bg: Color::Rgb(
+        SHORELINE_SURFACE_RGB.0,
+        SHORELINE_SURFACE_RGB.1,
+        SHORELINE_SURFACE_RGB.2,
+    ),
+    panel_bg: Color::Rgb(
+        SHORELINE_PANEL_RGB.0,
+        SHORELINE_PANEL_RGB.1,
+        SHORELINE_PANEL_RGB.2,
+    ),
+    elevated_bg: Color::Rgb(
+        SHORELINE_ELEVATED_RGB.0,
+        SHORELINE_ELEVATED_RGB.1,
+        SHORELINE_ELEVATED_RGB.2,
+    ),
+    composer_bg: Color::Rgb(
+        SHORELINE_COMPOSER_RGB.0,
+        SHORELINE_COMPOSER_RGB.1,
+        SHORELINE_COMPOSER_RGB.2,
+    ),
+    selection_bg: Color::Rgb(
+        SHORELINE_SELECTION_RGB.0,
+        SHORELINE_SELECTION_RGB.1,
+        SHORELINE_SELECTION_RGB.2,
+    ),
+    header_bg: Color::Rgb(
+        SHORELINE_CHROME_RGB.0,
+        SHORELINE_CHROME_RGB.1,
+        SHORELINE_CHROME_RGB.2,
+    ),
+    footer_bg: Color::Rgb(
+        SHORELINE_CHROME_RGB.0,
+        SHORELINE_CHROME_RGB.1,
+        SHORELINE_CHROME_RGB.2,
+    ),
+    text_dim: Color::Rgb(
+        SHORELINE_TEXT_DIM_RGB.0,
+        SHORELINE_TEXT_DIM_RGB.1,
+        SHORELINE_TEXT_DIM_RGB.2,
+    ),
+    text_hint: Color::Rgb(
+        SHORELINE_TEXT_HINT_RGB.0,
+        SHORELINE_TEXT_HINT_RGB.1,
+        SHORELINE_TEXT_HINT_RGB.2,
+    ),
+    text_muted: Color::Rgb(
+        SHORELINE_TEXT_MUTED_RGB.0,
+        SHORELINE_TEXT_MUTED_RGB.1,
+        SHORELINE_TEXT_MUTED_RGB.2,
+    ),
+    text_body: Color::Rgb(
+        SHORELINE_TEXT_BODY_RGB.0,
+        SHORELINE_TEXT_BODY_RGB.1,
+        SHORELINE_TEXT_BODY_RGB.2,
+    ),
+    text_soft: Color::Rgb(
+        SHORELINE_TEXT_SOFT_RGB.0,
+        SHORELINE_TEXT_SOFT_RGB.1,
+        SHORELINE_TEXT_SOFT_RGB.2,
+    ),
+    border: Color::Rgb(
+        SHORELINE_BORDER_RGB.0,
+        SHORELINE_BORDER_RGB.1,
+        SHORELINE_BORDER_RGB.2,
+    ),
+    accent_primary: Color::Rgb(
+        SHORELINE_ACTION_RGB.0,
+        SHORELINE_ACTION_RGB.1,
+        SHORELINE_ACTION_RGB.2,
+    ),
+    accent_secondary: Color::Rgb(
+        SHORELINE_LIVE_RGB.0,
+        SHORELINE_LIVE_RGB.1,
+        SHORELINE_LIVE_RGB.2,
+    ),
+    accent_action: Color::Rgb(
+        SHORELINE_HUMAN_RGB.0,
+        SHORELINE_HUMAN_RGB.1,
+        SHORELINE_HUMAN_RGB.2,
+    ),
+    error_fg: Color::Rgb(
+        SHORELINE_ERROR_RGB.0,
+        SHORELINE_ERROR_RGB.1,
+        SHORELINE_ERROR_RGB.2,
+    ),
+    error_hover: Color::Rgb(
+        SHORELINE_ERROR_HOVER_RGB.0,
+        SHORELINE_ERROR_HOVER_RGB.1,
+        SHORELINE_ERROR_HOVER_RGB.2,
+    ),
+    error_surface: Color::Rgb(
+        SHORELINE_ERROR_SURFACE_RGB.0,
+        SHORELINE_ERROR_SURFACE_RGB.1,
+        SHORELINE_ERROR_SURFACE_RGB.2,
+    ),
+    error_border: Color::Rgb(
+        SHORELINE_ERROR_RGB.0,
+        SHORELINE_ERROR_RGB.1,
+        SHORELINE_ERROR_RGB.2,
+    ),
+    error_text: Color::Rgb(
+        SHORELINE_ERROR_TEXT_RGB.0,
+        SHORELINE_ERROR_TEXT_RGB.1,
+        SHORELINE_ERROR_TEXT_RGB.2,
+    ),
+    warning: Color::Rgb(
+        SHORELINE_WARNING_RGB.0,
+        SHORELINE_WARNING_RGB.1,
+        SHORELINE_WARNING_RGB.2,
+    ),
+    success: Color::Rgb(
+        SHORELINE_SUCCESS_RGB.0,
+        SHORELINE_SUCCESS_RGB.1,
+        SHORELINE_SUCCESS_RGB.2,
+    ),
+    info: Color::Rgb(
+        SHORELINE_ACTION_RGB.0,
+        SHORELINE_ACTION_RGB.1,
+        SHORELINE_ACTION_RGB.2,
+    ),
+    mode_agent: Color::Rgb(
+        SHORELINE_MODE_AGENT_RGB.0,
+        SHORELINE_MODE_AGENT_RGB.1,
+        SHORELINE_MODE_AGENT_RGB.2,
+    ),
+    mode_yolo: Color::Rgb(
+        SHORELINE_MODE_YOLO_RGB.0,
+        SHORELINE_MODE_YOLO_RGB.1,
+        SHORELINE_MODE_YOLO_RGB.2,
+    ),
+    mode_plan: Color::Rgb(
+        SHORELINE_MODE_PLAN_RGB.0,
+        SHORELINE_MODE_PLAN_RGB.1,
+        SHORELINE_MODE_PLAN_RGB.2,
+    ),
+    mode_operate: Color::Rgb(
+        SHORELINE_MODE_OPERATE_RGB.0,
+        SHORELINE_MODE_OPERATE_RGB.1,
+        SHORELINE_MODE_OPERATE_RGB.2,
+    ),
+    permission_ask: Color::Rgb(
+        SHORELINE_TEXT_MUTED_RGB.0,
+        SHORELINE_TEXT_MUTED_RGB.1,
+        SHORELINE_TEXT_MUTED_RGB.2,
+    ),
+    permission_auto_review: Color::Rgb(
+        SHORELINE_HUMAN_RGB.0,
+        SHORELINE_HUMAN_RGB.1,
+        SHORELINE_HUMAN_RGB.2,
+    ),
+    permission_full_access: Color::Rgb(
+        SHORELINE_WARNING_RGB.0,
+        SHORELINE_WARNING_RGB.1,
+        SHORELINE_WARNING_RGB.2,
+    ),
+    status_ready: Color::Rgb(
+        SHORELINE_SUCCESS_RGB.0,
+        SHORELINE_SUCCESS_RGB.1,
+        SHORELINE_SUCCESS_RGB.2,
+    ),
+    status_working: Color::Rgb(
+        SHORELINE_STATUS_WORKING_RGB.0,
+        SHORELINE_STATUS_WORKING_RGB.1,
+        SHORELINE_STATUS_WORKING_RGB.2,
+    ),
+    status_warning: Color::Rgb(
+        SHORELINE_WARNING_RGB.0,
+        SHORELINE_WARNING_RGB.1,
+        SHORELINE_WARNING_RGB.2,
+    ),
+    diff_added_fg: Color::Rgb(
+        SHORELINE_DIFF_ADDED_FG_RGB.0,
+        SHORELINE_DIFF_ADDED_FG_RGB.1,
+        SHORELINE_DIFF_ADDED_FG_RGB.2,
+    ),
+    diff_deleted_fg: Color::Rgb(
+        SHORELINE_DIFF_DELETED_FG_RGB.0,
+        SHORELINE_DIFF_DELETED_FG_RGB.1,
+        SHORELINE_DIFF_DELETED_FG_RGB.2,
+    ),
+    diff_added_bg: Color::Rgb(
+        SHORELINE_DIFF_ADDED_BG_RGB.0,
+        SHORELINE_DIFF_ADDED_BG_RGB.1,
+        SHORELINE_DIFF_ADDED_BG_RGB.2,
+    ),
+    diff_deleted_bg: Color::Rgb(
+        SHORELINE_DIFF_DELETED_BG_RGB.0,
+        SHORELINE_DIFF_DELETED_BG_RGB.1,
+        SHORELINE_DIFF_DELETED_BG_RGB.2,
+    ),
+    tool_running: Color::Rgb(
+        SHORELINE_LIVE_RGB.0,
+        SHORELINE_LIVE_RGB.1,
+        SHORELINE_LIVE_RGB.2,
+    ),
+    tool_success: Color::Rgb(
+        SHORELINE_SUCCESS_RGB.0,
+        SHORELINE_SUCCESS_RGB.1,
+        SHORELINE_SUCCESS_RGB.2,
+    ),
+    tool_failed: Color::Rgb(
+        SHORELINE_ERROR_RGB.0,
+        SHORELINE_ERROR_RGB.1,
+        SHORELINE_ERROR_RGB.2,
+    ),
+};
+
+/// Shoreline Light — Shoreline on warm paper, for light terminals.
+pub const SHORELINE_LIGHT_UI_THEME: UiTheme = UiTheme {
+    name: "shoreline-light",
+    mode: PaletteMode::Light,
+    surface_bg: Color::Rgb(
+        SHORELINE_LIGHT_SURFACE_RGB.0,
+        SHORELINE_LIGHT_SURFACE_RGB.1,
+        SHORELINE_LIGHT_SURFACE_RGB.2,
+    ),
+    panel_bg: Color::Rgb(
+        SHORELINE_LIGHT_PANEL_RGB.0,
+        SHORELINE_LIGHT_PANEL_RGB.1,
+        SHORELINE_LIGHT_PANEL_RGB.2,
+    ),
+    elevated_bg: Color::Rgb(
+        SHORELINE_LIGHT_ELEVATED_RGB.0,
+        SHORELINE_LIGHT_ELEVATED_RGB.1,
+        SHORELINE_LIGHT_ELEVATED_RGB.2,
+    ),
+    composer_bg: Color::Rgb(
+        SHORELINE_LIGHT_COMPOSER_RGB.0,
+        SHORELINE_LIGHT_COMPOSER_RGB.1,
+        SHORELINE_LIGHT_COMPOSER_RGB.2,
+    ),
+    selection_bg: Color::Rgb(
+        SHORELINE_LIGHT_SELECTION_RGB.0,
+        SHORELINE_LIGHT_SELECTION_RGB.1,
+        SHORELINE_LIGHT_SELECTION_RGB.2,
+    ),
+    header_bg: Color::Rgb(
+        SHORELINE_LIGHT_CHROME_RGB.0,
+        SHORELINE_LIGHT_CHROME_RGB.1,
+        SHORELINE_LIGHT_CHROME_RGB.2,
+    ),
+    footer_bg: Color::Rgb(
+        SHORELINE_LIGHT_CHROME_RGB.0,
+        SHORELINE_LIGHT_CHROME_RGB.1,
+        SHORELINE_LIGHT_CHROME_RGB.2,
+    ),
+    text_dim: Color::Rgb(
+        SHORELINE_LIGHT_TEXT_DIM_RGB.0,
+        SHORELINE_LIGHT_TEXT_DIM_RGB.1,
+        SHORELINE_LIGHT_TEXT_DIM_RGB.2,
+    ),
+    text_hint: Color::Rgb(
+        SHORELINE_LIGHT_TEXT_HINT_RGB.0,
+        SHORELINE_LIGHT_TEXT_HINT_RGB.1,
+        SHORELINE_LIGHT_TEXT_HINT_RGB.2,
+    ),
+    text_muted: Color::Rgb(
+        SHORELINE_LIGHT_TEXT_MUTED_RGB.0,
+        SHORELINE_LIGHT_TEXT_MUTED_RGB.1,
+        SHORELINE_LIGHT_TEXT_MUTED_RGB.2,
+    ),
+    text_body: Color::Rgb(
+        SHORELINE_LIGHT_TEXT_BODY_RGB.0,
+        SHORELINE_LIGHT_TEXT_BODY_RGB.1,
+        SHORELINE_LIGHT_TEXT_BODY_RGB.2,
+    ),
+    text_soft: Color::Rgb(
+        SHORELINE_LIGHT_TEXT_SOFT_RGB.0,
+        SHORELINE_LIGHT_TEXT_SOFT_RGB.1,
+        SHORELINE_LIGHT_TEXT_SOFT_RGB.2,
+    ),
+    border: Color::Rgb(
+        SHORELINE_LIGHT_BORDER_RGB.0,
+        SHORELINE_LIGHT_BORDER_RGB.1,
+        SHORELINE_LIGHT_BORDER_RGB.2,
+    ),
+    accent_primary: Color::Rgb(
+        SHORELINE_LIGHT_ACTION_RGB.0,
+        SHORELINE_LIGHT_ACTION_RGB.1,
+        SHORELINE_LIGHT_ACTION_RGB.2,
+    ),
+    accent_secondary: Color::Rgb(
+        SHORELINE_LIGHT_LIVE_RGB.0,
+        SHORELINE_LIGHT_LIVE_RGB.1,
+        SHORELINE_LIGHT_LIVE_RGB.2,
+    ),
+    accent_action: Color::Rgb(
+        SHORELINE_LIGHT_HUMAN_RGB.0,
+        SHORELINE_LIGHT_HUMAN_RGB.1,
+        SHORELINE_LIGHT_HUMAN_RGB.2,
+    ),
+    error_fg: Color::Rgb(
+        SHORELINE_LIGHT_ERROR_RGB.0,
+        SHORELINE_LIGHT_ERROR_RGB.1,
+        SHORELINE_LIGHT_ERROR_RGB.2,
+    ),
+    error_hover: Color::Rgb(
+        SHORELINE_LIGHT_ERROR_RGB.0,
+        SHORELINE_LIGHT_ERROR_RGB.1,
+        SHORELINE_LIGHT_ERROR_RGB.2,
+    ),
+    error_surface: Color::Rgb(
+        SHORELINE_LIGHT_ERROR_SURFACE_RGB.0,
+        SHORELINE_LIGHT_ERROR_SURFACE_RGB.1,
+        SHORELINE_LIGHT_ERROR_SURFACE_RGB.2,
+    ),
+    error_border: Color::Rgb(
+        SHORELINE_LIGHT_ERROR_RGB.0,
+        SHORELINE_LIGHT_ERROR_RGB.1,
+        SHORELINE_LIGHT_ERROR_RGB.2,
+    ),
+    error_text: Color::Rgb(
+        SHORELINE_LIGHT_ERROR_TEXT_RGB.0,
+        SHORELINE_LIGHT_ERROR_TEXT_RGB.1,
+        SHORELINE_LIGHT_ERROR_TEXT_RGB.2,
+    ),
+    warning: Color::Rgb(
+        SHORELINE_LIGHT_WARNING_RGB.0,
+        SHORELINE_LIGHT_WARNING_RGB.1,
+        SHORELINE_LIGHT_WARNING_RGB.2,
+    ),
+    success: Color::Rgb(
+        SHORELINE_LIGHT_SUCCESS_RGB.0,
+        SHORELINE_LIGHT_SUCCESS_RGB.1,
+        SHORELINE_LIGHT_SUCCESS_RGB.2,
+    ),
+    info: Color::Rgb(
+        SHORELINE_LIGHT_ACTION_RGB.0,
+        SHORELINE_LIGHT_ACTION_RGB.1,
+        SHORELINE_LIGHT_ACTION_RGB.2,
+    ),
+    mode_agent: Color::Rgb(
+        SHORELINE_LIGHT_MODE_AGENT_RGB.0,
+        SHORELINE_LIGHT_MODE_AGENT_RGB.1,
+        SHORELINE_LIGHT_MODE_AGENT_RGB.2,
+    ),
+    mode_yolo: Color::Rgb(
+        SHORELINE_LIGHT_MODE_YOLO_RGB.0,
+        SHORELINE_LIGHT_MODE_YOLO_RGB.1,
+        SHORELINE_LIGHT_MODE_YOLO_RGB.2,
+    ),
+    mode_plan: Color::Rgb(
+        SHORELINE_LIGHT_MODE_PLAN_RGB.0,
+        SHORELINE_LIGHT_MODE_PLAN_RGB.1,
+        SHORELINE_LIGHT_MODE_PLAN_RGB.2,
+    ),
+    mode_operate: Color::Rgb(
+        SHORELINE_LIGHT_MODE_OPERATE_RGB.0,
+        SHORELINE_LIGHT_MODE_OPERATE_RGB.1,
+        SHORELINE_LIGHT_MODE_OPERATE_RGB.2,
+    ),
+    permission_ask: Color::Rgb(
+        SHORELINE_LIGHT_TEXT_MUTED_RGB.0,
+        SHORELINE_LIGHT_TEXT_MUTED_RGB.1,
+        SHORELINE_LIGHT_TEXT_MUTED_RGB.2,
+    ),
+    permission_auto_review: Color::Rgb(
+        SHORELINE_LIGHT_HUMAN_RGB.0,
+        SHORELINE_LIGHT_HUMAN_RGB.1,
+        SHORELINE_LIGHT_HUMAN_RGB.2,
+    ),
+    permission_full_access: Color::Rgb(
+        SHORELINE_LIGHT_WARNING_RGB.0,
+        SHORELINE_LIGHT_WARNING_RGB.1,
+        SHORELINE_LIGHT_WARNING_RGB.2,
+    ),
+    status_ready: Color::Rgb(
+        SHORELINE_LIGHT_SUCCESS_RGB.0,
+        SHORELINE_LIGHT_SUCCESS_RGB.1,
+        SHORELINE_LIGHT_SUCCESS_RGB.2,
+    ),
+    status_working: Color::Rgb(
+        SHORELINE_LIGHT_LIVE_RGB.0,
+        SHORELINE_LIGHT_LIVE_RGB.1,
+        SHORELINE_LIGHT_LIVE_RGB.2,
+    ),
+    status_warning: Color::Rgb(
+        SHORELINE_LIGHT_WARNING_RGB.0,
+        SHORELINE_LIGHT_WARNING_RGB.1,
+        SHORELINE_LIGHT_WARNING_RGB.2,
+    ),
+    diff_added_fg: Color::Rgb(
+        SHORELINE_LIGHT_DIFF_ADDED_FG_RGB.0,
+        SHORELINE_LIGHT_DIFF_ADDED_FG_RGB.1,
+        SHORELINE_LIGHT_DIFF_ADDED_FG_RGB.2,
+    ),
+    diff_deleted_fg: Color::Rgb(
+        SHORELINE_LIGHT_DIFF_DELETED_FG_RGB.0,
+        SHORELINE_LIGHT_DIFF_DELETED_FG_RGB.1,
+        SHORELINE_LIGHT_DIFF_DELETED_FG_RGB.2,
+    ),
+    diff_added_bg: Color::Rgb(
+        SHORELINE_LIGHT_DIFF_ADDED_BG_RGB.0,
+        SHORELINE_LIGHT_DIFF_ADDED_BG_RGB.1,
+        SHORELINE_LIGHT_DIFF_ADDED_BG_RGB.2,
+    ),
+    diff_deleted_bg: Color::Rgb(
+        SHORELINE_LIGHT_DIFF_DELETED_BG_RGB.0,
+        SHORELINE_LIGHT_DIFF_DELETED_BG_RGB.1,
+        SHORELINE_LIGHT_DIFF_DELETED_BG_RGB.2,
+    ),
+    tool_running: Color::Rgb(
+        SHORELINE_LIGHT_LIVE_RGB.0,
+        SHORELINE_LIGHT_LIVE_RGB.1,
+        SHORELINE_LIGHT_LIVE_RGB.2,
+    ),
+    tool_success: Color::Rgb(
+        SHORELINE_LIGHT_SUCCESS_RGB.0,
+        SHORELINE_LIGHT_SUCCESS_RGB.1,
+        SHORELINE_LIGHT_SUCCESS_RGB.2,
+    ),
+    tool_failed: Color::Rgb(
+        SHORELINE_LIGHT_ERROR_RGB.0,
+        SHORELINE_LIGHT_ERROR_RGB.1,
+        SHORELINE_LIGHT_ERROR_RGB.2,
+    ),
+};
+
 pub const SOLARIZED_LIGHT_UI_THEME: UiTheme = UiTheme {
     name: "solarized-light",
     mode: PaletteMode::SolarizedLight,
@@ -888,6 +1325,8 @@ pub const UWU_UI_THEME: UiTheme = UiTheme {
 pub enum ThemeId {
     System,
     Terminal,
+    Shoreline,
+    ShorelineLight,
     Underwater,
     UnderwaterRetro,
     Whale,
@@ -914,6 +1353,8 @@ impl ThemeId {
             "terminal" => Some(Self::Terminal),
             "underwater" | "deepsea" => Some(Self::Underwater),
             "underwater-retro" | "retro" => Some(Self::UnderwaterRetro),
+            "shoreline" => Some(Self::Shoreline),
+            "shoreline-light" => Some(Self::ShorelineLight),
             "dark" => Some(Self::Whale),
             "light" => Some(Self::WhaleLight),
             "grayscale" => Some(Self::Grayscale),
@@ -936,6 +1377,8 @@ impl ThemeId {
         match self {
             Self::System => "system",
             Self::Terminal => "terminal",
+            Self::Shoreline => "shoreline",
+            Self::ShorelineLight => "shoreline-light",
             Self::Underwater => "underwater",
             Self::UnderwaterRetro => "underwater-retro",
             Self::Whale => "dark",
@@ -958,6 +1401,8 @@ impl ThemeId {
         match self {
             Self::System => "System",
             Self::Terminal => "Terminal",
+            Self::Shoreline => "Shoreline",
+            Self::ShorelineLight => "Shoreline Light",
             Self::Underwater => "Underwater",
             Self::UnderwaterRetro => "Underwater Retro",
             Self::Whale => "Blue Stage",
@@ -980,6 +1425,8 @@ impl ThemeId {
         match self {
             Self::System => "Follow terminal background (COLORFGBG / macOS appearance)",
             Self::Terminal => "Inherit terminal colors fully (transparent surfaces, ANSI accents)",
+            Self::Shoreline => "Warm charcoal, one restrained blue — the desktop client's palette",
+            Self::ShorelineLight => "Shoreline on warm paper — the desktop client's light mode",
             Self::Underwater => "The painted ocean field: ombre water, ambient life, the whale",
             Self::UnderwaterRetro => "Flat phosphor-teal ocean: the legacy deepsea look, no ombre",
             Self::Whale => "Stage black, action blue, and one Signal Gold human beacon",
@@ -1007,6 +1454,8 @@ impl ThemeId {
         match self {
             Self::System => UiTheme::detect(),
             Self::Terminal => TERMINAL_UI_THEME,
+            Self::Shoreline => SHORELINE_UI_THEME,
+            Self::ShorelineLight => SHORELINE_LIGHT_UI_THEME,
             Self::Underwater => UNDERWATER_UI_THEME,
             Self::UnderwaterRetro => UNDERWATER_RETRO_UI_THEME,
             Self::Whale => UI_THEME,
@@ -1028,6 +1477,8 @@ impl ThemeId {
 pub const SELECTABLE_THEMES: &[ThemeId] = &[
     ThemeId::System,
     ThemeId::Terminal,
+    ThemeId::Shoreline,
+    ThemeId::ShorelineLight,
     ThemeId::Underwater,
     ThemeId::UnderwaterRetro,
     ThemeId::Whale,
@@ -1090,6 +1541,8 @@ pub fn normalize_theme_name(value: &str) -> Option<&'static str> {
         "terminal" | "term" | "transparent" | "follow-terminal" | "inherit" => Some("terminal"),
         "underwater" | "deepsea" | "deep-sea" | "ocean" | "ombre" => Some("underwater"),
         "underwater-retro" | "retro" | "uw-retro" => Some("underwater-retro"),
+        "shoreline" | "warm" | "charcoal" => Some("shoreline"),
+        "shoreline-light" | "paper" => Some("shoreline-light"),
         "dark" | "whale" | "whale-dark" => Some("dark"),
         "light" | "whale-light" => Some("light"),
         "grayscale" | "greyscale" | "gray" | "grey" | "mono" | "monochrome" | "black-white"
@@ -1117,7 +1570,7 @@ pub fn theme_label_for_mode(mode: PaletteMode) -> &'static str {
 }
 
 #[must_use]
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 pub fn ui_theme_from_settings(theme: &str, background_color: Option<&str>) -> UiTheme {
     super::resolve_theme_setting(theme, background_color)
         .map(|(_, _, theme)| theme)
@@ -1165,6 +1618,8 @@ mod tests {
             [
                 "system",
                 "terminal",
+                "shoreline",
+                "shoreline-light",
                 "underwater",
                 "underwater-retro",
                 "dark",

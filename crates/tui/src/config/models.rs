@@ -153,6 +153,8 @@ pub const DEFAULT_OLLAMA_CLOUD_BASE_URL: &str = codewhale_config::provider::OLLA
 pub const DEFAULT_HUGGINGFACE_MODEL: &str = "deepseek-ai/DeepSeek-V4-Pro";
 pub const DEFAULT_HUGGINGFACE_FLASH_MODEL: &str = "deepseek-ai/DeepSeek-V4-Flash";
 pub const DEFAULT_HUGGINGFACE_BASE_URL: &str = "https://router.huggingface.co/v1";
+pub const DEFAULT_MODELSCOPE_MODEL: &str = "Qwen/Qwen3.5-397B-A17B";
+pub const DEFAULT_MODELSCOPE_BASE_URL: &str = "https://api-inference.modelscope.cn/v1";
 pub const DEFAULT_DEEPINFRA_MODEL: &str = "deepseek-ai/DeepSeek-V4-Pro";
 pub const DEFAULT_DEEPINFRA_FLASH_MODEL: &str = "deepseek-ai/DeepSeek-V4-Flash";
 pub const DEFAULT_DEEPINFRA_BASE_URL: &str = "https://api.deepinfra.com/v1/openai";
@@ -269,6 +271,10 @@ pub const DEFAULT_TELECOMJS_MODEL: &str = "deepseek-v4-pro";
 pub const DEFAULT_TELECOMJS_BASE_URL: &str = "https://aigw.telecomjs.com/v1";
 pub const DEFAULT_EDENAI_MODEL: &str = "deepseek/deepseek-v4-pro";
 pub const DEFAULT_EDENAI_BASE_URL: &str = "https://api.edenai.run/v3";
+pub const DEFAULT_ZENMUX_MODEL: &str = "deepseek/deepseek-v4.1-flash";
+pub const DEFAULT_ZENMUX_BASE_URL: &str = "https://zenmux.ai/api/v1";
+pub const DEFAULT_CSDN_MODEL: &str = "glm_for_coding";
+pub const DEFAULT_CSDN_BASE_URL: &str = "https://ai.csdn.net/api/model/v1";
 // Concentrate (OpenAI Responses-compatible AI gateway) defaults; mirrors
 // crates/config/src/provider_defaults.rs for the docs drift check.
 pub const DEFAULT_CONCENTRATE_MODEL: &str = "deepseek-v4-pro";

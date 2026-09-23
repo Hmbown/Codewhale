@@ -732,19 +732,28 @@ impl FleetManager {
     ) -> Result<FleetStatusSnapshot> {
         let max_workers = max_workers.clamp(1, 128);
         let manager_lock_path = self.manager_lock_path(run_id);
-        if let Some(parent) = manager_lock_path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("creating Fleet manager lock dir {}", parent.display()))?;
-        }
-        let lock_file = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(&manager_lock_path)
-            .with_context(|| {
-                format!("opening Fleet manager lock {}", manager_lock_path.display())
-            })?;
+        // Directory creation and the lock-file open are blocking filesystem
+        // calls; this fn runs on the Tokio runtime, so they go through the
+        // blocking pool (blocking-call convention, #6149).
+        let lock_file = {
+            let path = manager_lock_path.clone();
+            tokio::task::spawn_blocking(move || -> Result<std::fs::File> {
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent).with_context(|| {
+                        format!("creating Fleet manager lock dir {}", parent.display())
+                    })?;
+                }
+                OpenOptions::new()
+                    .create(true)
+                    .truncate(false)
+                    .read(true)
+                    .write(true)
+                    .open(&path)
+                    .with_context(|| format!("opening Fleet manager lock {}", path.display()))
+            })
+            .await
+            .context("Fleet manager lock setup task failed to join")??
+        };
         let mut manager_lock = fd_lock::RwLock::new(lock_file);
         let standby_interval = tick_interval
             .min(Duration::from_millis(100))
@@ -4396,7 +4405,10 @@ exit 0
 
         let (primary_status, standby_status) = rt
             .block_on(async {
-                tokio::time::timeout(Duration::from_secs(5), async {
+                // This proves launch ownership, not a five-second latency SLA.
+                // Allow the same process/ledger headroom as the restart tests:
+                // loaded CI can spend the old deadline scheduling the fake child.
+                tokio::time::timeout(Duration::from_secs(15), async {
                     tokio::join!(
                         manager.run_to_completion(
                             &report.run_id,
@@ -4418,7 +4430,15 @@ exit 0
                 })
                 .await
             })
-            .expect("competing Fleet managers did not converge");
+            .unwrap_or_else(|error| {
+                panic!(
+                    "competing Fleet managers did not converge: {error}; status={:?}; primary={:?}; standby={:?}; starts={:?}",
+                    manager.run_status(&report.run_id),
+                    primary_executor.worker_ids(),
+                    standby_executor.worker_ids(),
+                    std::fs::read_to_string(&starts),
+                )
+            });
 
         assert_eq!(primary_status.unwrap().completed, 1);
         assert_eq!(standby_status.unwrap().completed, 1);

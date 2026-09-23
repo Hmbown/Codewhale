@@ -3,7 +3,7 @@
 use std::cell::Cell;
 use std::io;
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicBool, Ordering},
 };
 use std::thread::{self, JoinHandle};
@@ -44,6 +44,105 @@ impl ObservedTerminalEvent {
     }
 }
 
+/// Process-wide handle on the one terminal input pump's pause flags.
+///
+/// There is one stdin per process and exactly one [`TerminalInputPump`]
+/// reading it, so this is a singleton by construction rather than by
+/// convention. It exists so that *handing the terminal to a child* can be one
+/// operation instead of a rule every call site has to remember (#6165):
+/// suspending raw mode and the alternate screen does not stop the pump
+/// thread, which keeps calling `event::read()` on the same tty and splits the
+/// user's keystrokes between the child and the composer.
+///
+/// Known limitation: the gate only stops the pump reading. It cannot drain
+/// input the pump already buffered, and it cannot refuse the handoff when a
+/// cancellation key is pending — both need the receiver and the event loop's
+/// pending queue, so they stay with [`super::prepare_terminal_input_handoff`]
+/// at the call sites that have them.
+static CHILD_TERMINAL_GATE: Mutex<Option<ChildTerminalGate>> = Mutex::new(None);
+
+#[derive(Clone)]
+struct ChildTerminalGate {
+    paused: Arc<AtomicBool>,
+    paused_ack: Arc<AtomicBool>,
+}
+
+/// Publish this pump as the process's terminal input owner.
+pub(super) fn publish_child_terminal_gate(paused: &Arc<AtomicBool>, paused_ack: &Arc<AtomicBool>) {
+    if let Ok(mut gate) = CHILD_TERMINAL_GATE.lock() {
+        *gate = Some(ChildTerminalGate {
+            paused: Arc::clone(paused),
+            paused_ack: Arc::clone(paused_ack),
+        });
+    }
+}
+
+/// Retract `paused`'s pump, but only if it is still the published one — a
+/// detached wedged thread must not unpublish the replacement that took over.
+fn retract_child_terminal_gate(paused: &Arc<AtomicBool>) {
+    if let Ok(mut gate) = CHILD_TERMINAL_GATE.lock()
+        && gate
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(&current.paused, paused))
+    {
+        *gate = None;
+    }
+}
+
+/// The terminal input pump, paused for as long as this guard is alive.
+///
+/// Held by [`crate::tui::external_editor::with_suspended_tui`] across the
+/// whole child handoff, so the pump resumes on every path out — including a
+/// child that failed to spawn or a panic unwinding through it.
+pub(crate) struct ChildTerminalInputPause {
+    gate: Option<ChildTerminalGate>,
+}
+
+/// Stop the process's terminal input pump before a child takes the tty.
+///
+/// Fails closed: if the pump does not acknowledge the pause, the caller must
+/// not run the child, because that is exactly the keystroke-splitting state
+/// this guards against. A process with no pump published (tests, non-TUI
+/// callers) has nothing to pause and succeeds with an inert guard, matching
+/// [`TerminalInputPump::pause_for_child_terminal`]'s `handle.is_none()` case.
+pub(crate) fn pause_terminal_input_for_child() -> io::Result<ChildTerminalInputPause> {
+    let Some(gate) = CHILD_TERMINAL_GATE
+        .lock()
+        .ok()
+        .and_then(|gate| gate.clone())
+    else {
+        return Ok(ChildTerminalInputPause { gate: None });
+    };
+    gate.paused.store(true, Ordering::Release);
+    let deadline = Instant::now() + TERMINAL_INPUT_CHILD_PAUSE_TIMEOUT;
+    while !gate.paused_ack.load(Ordering::Acquire) {
+        if Instant::now() >= deadline {
+            gate.paused_ack.store(false, Ordering::Release);
+            gate.paused.store(false, Ordering::Release);
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "terminal input pump did not pause before child terminal handoff",
+            ));
+        }
+        // Blocking-call convention (#6149): a bounded retry, capped by
+        // `TERMINAL_INPUT_CHILD_PAUSE_TIMEOUT`, in a synchronous API whose
+        // caller is about to block this very thread on a foreground editor
+        // for as long as the user keeps it open. `tokio::time` is not
+        // reachable from here and would not change what the thread does.
+        thread::sleep(TERMINAL_INPUT_CHILD_PAUSE_POLL_INTERVAL);
+    }
+    Ok(ChildTerminalInputPause { gate: Some(gate) })
+}
+
+impl Drop for ChildTerminalInputPause {
+    fn drop(&mut self) {
+        if let Some(gate) = self.gate.take() {
+            gate.paused_ack.store(false, Ordering::Release);
+            gate.paused.store(false, Ordering::Release);
+        }
+    }
+}
+
 pub(crate) struct TerminalInputPump {
     pub(super) rx: std::sync::mpsc::Receiver<TerminalInputMessage>,
     pub(super) stop: Arc<AtomicBool>,
@@ -64,6 +163,7 @@ pub(super) struct TerminalInputPumpParts {
 impl TerminalInputPump {
     pub(super) fn spawn() -> io::Result<Self> {
         let parts = Self::spawn_parts()?;
+        publish_child_terminal_gate(&parts.paused, &parts.paused_ack);
         Ok(Self {
             rx: parts.rx,
             stop: parts.stop,
@@ -196,7 +296,10 @@ impl TerminalInputPump {
         now.saturating_duration_since(self.last_alive_at.get())
     }
 
-    pub(super) fn pause_for_child_terminal(&self) -> io::Result<()> {
+    /// Async: callers are on the event-loop task, so the ack wait uses
+    /// `tokio::time::sleep` — a `thread::sleep` here would park a Tokio
+    /// worker for up to `TERMINAL_INPUT_CHILD_PAUSE_TIMEOUT`.
+    pub(super) async fn pause_for_child_terminal(&self) -> io::Result<()> {
         self.paused.store(true, Ordering::Release);
         if self.handle.is_none() {
             self.paused_ack.store(true, Ordering::Release);
@@ -214,7 +317,7 @@ impl TerminalInputPump {
                     "terminal input pump did not pause before child terminal handoff",
                 ));
             }
-            thread::sleep(TERMINAL_INPUT_CHILD_PAUSE_POLL_INTERVAL);
+            tokio::time::sleep(TERMINAL_INPUT_CHILD_PAUSE_POLL_INTERVAL).await;
         }
         self.mark_alive();
         Ok(())
@@ -246,10 +349,12 @@ impl TerminalInputPump {
     pub(super) fn detach_current_thread(&mut self) {
         self.stop.store(true, Ordering::Release);
         let _ = self.handle.take();
+        retract_child_terminal_gate(&self.paused);
     }
 
     /// Adopt freshly spawned pump parts and reset the liveness clock.
     pub(super) fn install_parts(&mut self, parts: TerminalInputPumpParts) {
+        publish_child_terminal_gate(&parts.paused, &parts.paused_ack);
         self.rx = parts.rx;
         self.stop = parts.stop;
         self.paused = parts.paused;
@@ -268,6 +373,7 @@ impl Drop for TerminalInputPump {
         // (or its send fails because `rx` was dropped) and exits on its own.
         self.stop.store(true, Ordering::Release);
         let _ = self.handle.take();
+        retract_child_terminal_gate(&self.paused);
     }
 }
 

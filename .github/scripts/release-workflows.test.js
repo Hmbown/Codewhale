@@ -500,8 +500,11 @@ assert.doesNotMatch(
 
 // Cover every test invocation, including named parity and narrow crate gates.
 // These launchers protect production dependencies as well as cfg(test) code.
+// `release` is 4 rather than 3: parity runs the workspace under nextest for the
+// same one-process-per-test isolation CI's lanes use, and keeps a separate
+// doctest invocation because nextest does not run doctests.
 let hermeticInvocations = 0;
-for (const [label, workflow, expected] of [["CI", ci, 5], ["release", release, 3], ["CNB", cnb, 3]]) {
+for (const [label, workflow, expected] of [["CI", ci, 5], ["release", release, 4], ["CNB", cnb, 3]]) {
   const commands = workflow.split("\n").filter((line) =>
     !line.trimStart().startsWith("#") && /\bcargo (?:test|nextest run)\b/.test(line),
   );

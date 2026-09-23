@@ -16,7 +16,9 @@ use crate::tools::spec::{ApprovalRequirement, PreparedToolCall, ResourceClaim, T
 use super::dispatch::{
     mcp_tool_approval_description, mcp_tool_is_parallel_safe, mcp_tool_is_read_only,
 };
-use super::tool_catalog::{CODE_EXECUTION_TOOL_NAME, JS_EXECUTION_TOOL_NAME, is_tool_search_tool};
+use super::tool_catalog::{
+    CODE_EXECUTION_TOOL_NAME, EXECUTE_TOOLS_TOOL_NAME, JS_EXECUTION_TOOL_NAME, is_tool_search_tool,
+};
 
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct PreparedToolPolicy {
@@ -78,6 +80,21 @@ pub(super) fn prepare_tool_call(
             name,
             input,
             "Run model-provided Python code in local execution sandbox",
+            session_auto_approve,
+        ));
+    }
+
+    if name == EXECUTE_TOOLS_TOOL_NAME {
+        reject_unbounded_execution_under_authority(name, registry)?;
+        let first_line = input
+            .get("code")
+            .and_then(Value::as_str)
+            .and_then(|code| code.lines().map(str::trim).find(|line| !line.is_empty()))
+            .unwrap_or("execute_tools program");
+        return Ok(conservative_execution_policy(
+            name,
+            input.clone(),
+            &format!("execute_tools: {first_line}"),
             session_auto_approve,
         ));
     }

@@ -12,7 +12,7 @@ $ARGUMENTS
   taking any action.
 - With `look`: take one screenshot of the active computer and describe what
   is on screen.
-- With `computers`: list registered computers (`computer_list`) and say which
+- With `computers`: list registered computers (`computer {action:"list"}`) and say which
   one is active; every tool also takes `computer` to switch.
 - Anything else (clicking, typing, operating apps, recording) goes through
   the computer-use skill's observe-act-verify loop with per-action approval.

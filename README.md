@@ -18,11 +18,11 @@ agents with different models and roles.
 [![Discord](https://img.shields.io/badge/Discord-join-5865F2?logo=discord&logoColor=white)](https://discord.gg/37gfS3ksug)
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="web/public/codewhale-tui-171acee.png">
-  <img src="web/public/codewhale-tui-171acee.png" alt="A Codewhale terminal session" width="720">
+  <source media="(prefers-color-scheme: dark)" srcset="web/public/codewhale-tui-d7a9a1c.png">
+  <img src="web/public/codewhale-tui-d7a9a1c.png" alt="A Codewhale terminal session" width="720">
 </picture>
 
-*Terminal preview from a v0.9.12 development build.*
+*Terminal preview from a v0.10.0 development build.*
 
 ## Install
 
@@ -82,8 +82,12 @@ the agent and its tools:
   runs a task from a script or CI job.
 - **Local browser:** `codewhale web` opens the bundled
   [local web client](docs/WEB.md) for the same runtime.
-- **Codewhale web and desktop apps:** graphical workbenches in development.
-  Their availability is listed on the [product page](https://codewhale.net/en/product).
+- **Codewhale desktop app (GPUI):** the native GPUI desktop app is the
+  product-client direction (decided 2026-09-14; the phase map lives in
+  `docs/TRANSITION.md` in the private `codehwhale-gpui` repo). The hosted web
+  app at app.codewhale.net sunsets in phases; the marketing site, sign-in,
+  billing, legal, and download pages stay on the web permanently.
+  Availability is listed on the [product page](https://codewhale.net/en/product).
 
 **Computer Use adds tools for observing and interacting with other applications.**
 The plugin is included in the current source.

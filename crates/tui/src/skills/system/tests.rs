@@ -65,22 +65,17 @@ fn bundled_integration_skills_use_current_codewhale_commands_and_paths() {
 }
 
 /// #4227 (requested by @JayBeest): the contributor sync/gate/digest skill
-/// ships in generation 8, and its two load-bearing refusals — never move a
-/// contributor's HEAD, never touch a dirty tree — must survive any later
-/// edit to the body.
+/// shipped in generations 8–11 and moved repo-local in generation 12. Its two
+/// load-bearing refusals — never move a contributor's HEAD, never touch a
+/// dirty tree — must survive any later edit to the retained body.
 #[test]
-fn contributor_onboarding_ships_at_generation_8_and_keeps_its_refusals() {
-    let skill = BUNDLED_SKILLS
-        .iter()
-        .find(|skill| skill.name == "contributor-onboarding")
-        .expect("contributor-onboarding must be bundled");
-    assert_eq!(skill.introduced_in, 8);
-    // The pin tracks the current catalog generation: 9 added handoff,
-    // 10 added mcp-discovery (#5238), 11 rewrote mcp-discovery from a
-    // Registry-first gate into a missing-capability fallback.
-    assert_eq!(BUNDLED_SKILL_VERSION, "11");
+fn contributor_onboarding_is_repo_local_and_keeps_its_refusals() {
+    assert!(
+        !is_bundled_skill_name("contributor-onboarding"),
+        "contributor-onboarding must not ship to every user anymore"
+    );
 
-    let body = skill.body;
+    let body = contributor_onboarding_body();
     assert!(body.contains("invocation: explicit-only"));
     // Read-only by default: sync is proposed, never performed.
     assert!(body.contains("Do not run `git fetch`, `git pull`, `git rebase`"));
@@ -95,6 +90,74 @@ fn contributor_onboarding_ships_at_generation_8_and_keeps_its_refusals() {
     assert!(body.contains("Never select a provider for them"));
     // Contributor credit is part of the skill's own contract.
     assert!(body.contains("@JayBeest"));
+}
+
+/// A generation-11 install carries a bundled `contributor-onboarding` copy.
+/// Generation 12 stops shipping it but never deletes by name alone: an
+/// installed copy — shipped or user-edited — survives the upgrade, while a
+/// fresh generation-12 install never creates one.
+#[test]
+fn upgrade_to_generation_12_leaves_contributor_onboarding_in_place() {
+    let tmp = TempDir::new().unwrap();
+    fs::write(marker_file(&tmp), "11").unwrap();
+    let dir = skill_dir(&tmp, "contributor-onboarding");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("SKILL.md"), contributor_onboarding_body()).unwrap();
+
+    install_system_skills(tmp.path()).unwrap();
+
+    assert_eq!(
+        fs::read_to_string(skill_file(&tmp, "contributor-onboarding")).unwrap(),
+        contributor_onboarding_body(),
+        "upgrade must leave the installed copy untouched"
+    );
+    assert_eq!(
+        fs::read_to_string(marker_file(&tmp)).unwrap().trim(),
+        BUNDLED_SKILL_VERSION
+    );
+
+    let fresh = TempDir::new().unwrap();
+    install_system_skills(fresh.path()).unwrap();
+    assert!(
+        !skill_file(&fresh, "contributor-onboarding").exists(),
+        "fresh installs must not receive the repo-local skill"
+    );
+}
+
+/// Generation 13 trims `social-media` and `health` from the bundle and moves
+/// `feedback` repo-local. None of the three may ship to new installs; a
+/// generation-12 `feedback` copy is left in place, never deleted by name.
+#[test]
+fn generation_13_trims_pack_and_feedback_goes_repo_local() {
+    for name in ["social-media", "health", "feedback"] {
+        assert!(
+            !is_bundled_skill_name(name),
+            "{name} must not ship in generation 13"
+        );
+    }
+
+    let tmp = TempDir::new().unwrap();
+    fs::write(marker_file(&tmp), "12").unwrap();
+    let dir = skill_dir(&tmp, "feedback");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("SKILL.md"), feedback_body()).unwrap();
+
+    install_system_skills(tmp.path()).unwrap();
+
+    assert_eq!(
+        fs::read_to_string(skill_file(&tmp, "feedback")).unwrap(),
+        feedback_body(),
+        "upgrade must leave the installed feedback copy untouched"
+    );
+
+    let fresh = TempDir::new().unwrap();
+    install_system_skills(fresh.path()).unwrap();
+    for name in ["social-media", "health", "feedback"] {
+        assert!(
+            !skill_file(&fresh, name).exists(),
+            "fresh installs must not receive {name}"
+        );
+    }
 }
 
 #[test]
@@ -594,5 +657,45 @@ fn procedural_skill_homes_remain_bundled_and_lazy() {
             is_bundled_skill_name(name),
             "procedural skill home must remain available on demand: {name}"
         );
+    }
+}
+
+#[test]
+fn generation_14_refreshes_known_bodies_and_preserves_customizations_and_deletions() {
+    for (name, old) in SUPERSEDED_BODIES
+        .iter()
+        .filter(|(name, _)| *name != "mcp-discovery")
+    {
+        let skill = BUNDLED_SKILLS
+            .iter()
+            .find(|skill| skill.name == *name)
+            .unwrap();
+        assert_ne!(*old, skill.body);
+        for customized in [false, true] {
+            let tmp = TempDir::new().unwrap();
+            let file = skill_file(&tmp, name);
+            fs::create_dir_all(skill_dir(&tmp, name)).unwrap();
+            let body = if customized {
+                format!("{old}\nMy instructions.\n")
+            } else {
+                old.to_string()
+            };
+            fs::write(&file, &body).unwrap();
+            fs::write(marker_file(&tmp), "13").unwrap();
+            install_system_skills(tmp.path()).unwrap();
+            assert_eq!(
+                fs::read_to_string(file).unwrap(),
+                if customized {
+                    body
+                } else {
+                    skill.body.to_string()
+                },
+                "{name}"
+            );
+        }
+        let tmp = TempDir::new().unwrap();
+        fs::write(marker_file(&tmp), "13").unwrap();
+        install_system_skills(tmp.path()).unwrap();
+        assert!(!skill_file(&tmp, name).exists(), "{name} must stay deleted");
     }
 }

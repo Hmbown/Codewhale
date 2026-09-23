@@ -107,10 +107,11 @@ fn open_server_manager(config: &Config, root: &Path) -> Result<SharedRuntimeThre
 
 #[test]
 fn headless_startup_publishes_cold_endpoint_catalog_capabilities() -> Result<()> {
-    // Lock order: WORKSHOP before ENV (matches workshop-budget tests). ENV then
-    // WORKSHOP ABBA-deadlocks the full libtest suite with the workshop test (#6049).
+    // `active_workshop_test_guard()` takes the env barrier before the workshop
+    // gate and holds both (#6306), so it is the whole lock acquisition. Taking
+    // `lock_test_env()` again here parks this thread on a non-reentrant mutex
+    // it already owns; the ordering that #6049 hand-rolled now lives in the guard.
     let _workshop = crate::tools::large_output_router::active_workshop_test_guard();
-    let _env = lock_test_env();
     let _offline = EnvVarGuard::set("CODEWHALE_DISABLE_CLOUD_FACTS", "1");
     let _live = crate::provider_lake::lock_live_snapshot();
     let home = tempfile::tempdir()?;
@@ -138,9 +139,9 @@ fn headless_startup_publishes_cold_endpoint_catalog_capabilities() -> Result<()>
 
 #[tokio::test(flavor = "current_thread")]
 async fn headless_reload_publishes_only_the_accepted_identity_and_endpoint() -> Result<()> {
-    // Lock order: WORKSHOP before ENV — see headless_startup twin and #6049.
+    // The guard owns the env barrier and the workshop gate — see the
+    // headless_startup twin.
     let _workshop = crate::tools::large_output_router::active_workshop_test_guard();
-    let _env = lock_test_env();
     let _offline = EnvVarGuard::set("CODEWHALE_DISABLE_CLOUD_FACTS", "1");
     let _live = crate::provider_lake::lock_live_snapshot();
     let home = tempfile::tempdir()?;

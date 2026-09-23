@@ -36,9 +36,9 @@ export function Whale({
             <path d={WHALE_MARK} fillRule="evenodd" />
           </clipPath>
           <linearGradient id="codewhale-caustic-light" x1="0" y1="0" x2="1" y2="0">
-            <stop offset="0%" stopColor="#d1ebf4" stopOpacity="0" />
-            <stop offset="50%" stopColor="#d1ebf4" stopOpacity="0.33" />
-            <stop offset="100%" stopColor="#d1ebf4" stopOpacity="0" />
+            <stop offset="0%" stopColor="#90b9ff" stopOpacity="0" />
+            <stop offset="50%" stopColor="#90b9ff" stopOpacity="0.3" />
+            <stop offset="100%" stopColor="#90b9ff" stopOpacity="0" />
           </linearGradient>
         </defs>
       ) : null}

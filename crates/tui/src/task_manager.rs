@@ -274,6 +274,8 @@ pub struct TaskRecord {
     pub schema_version: u32,
     pub id: String,
     pub prompt: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     pub model: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_provider: Option<String>,
@@ -285,13 +287,18 @@ pub struct TaskRecord {
     pub trust_mode: bool,
     #[serde(default = "default_auto_approve")]
     pub auto_approve: bool,
+    /// Permission posture the task's own thread starts on (`ask`,
+    /// `auto_review`, `full_access`). Absent on records written before the
+    /// field existed and on the in-process callers that still express authority
+    /// through `auto_approve` alone; the thread request then derives the
+    /// posture from that bit exactly as it always did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permission_posture: Option<String>,
     pub status: TaskStatus,
     pub created_at: DateTime<Utc>,
     pub started_at: Option<DateTime<Utc>>,
     pub ended_at: Option<DateTime<Utc>>,
     pub duration_ms: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub hunt_verdict: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub result_summary: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -341,6 +348,8 @@ pub struct TaskSummary {
     pub id: String,
     pub status: TaskStatus,
     pub prompt_summary: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     pub model: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_provider: Option<String>,
@@ -354,8 +363,6 @@ pub struct TaskSummary {
     pub duration_ms: Option<u64>,
     #[serde(default)]
     pub lifecycle_seq: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub hunt_verdict: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -375,6 +382,7 @@ impl From<&TaskRecord> for TaskSummary {
             id: value.id.clone(),
             status: value.status,
             prompt_summary: summarize_text(&value.prompt, TIMELINE_SUMMARY_LIMIT),
+            name: value.name.clone(),
             model: value.model.clone(),
             model_provider: value.model_provider.clone(),
             model_provider_id: value.model_provider_id.clone(),
@@ -385,7 +393,6 @@ impl From<&TaskRecord> for TaskSummary {
             ended_at: value.ended_at,
             duration_ms: value.duration_ms,
             lifecycle_seq: value.lifecycle_seq,
-            hunt_verdict: value.hunt_verdict.clone(),
             error: value.error.clone(),
             terminal_reason: value.terminal_reason.clone(),
             thread_id: value.thread_id.clone(),
@@ -411,6 +418,10 @@ pub struct TaskCounts {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NewTaskRequest {
     pub prompt: String,
+    /// Caller-given run name, stored as-given. Absent names stay absent —
+    /// titles derived from the prompt are a presentation concern.
+    #[serde(default)]
+    pub name: Option<String>,
     pub model: Option<String>,
     #[serde(default)]
     pub model_provider: Option<String>,
@@ -421,6 +432,9 @@ pub struct NewTaskRequest {
     pub allow_shell: Option<bool>,
     pub trust_mode: Option<bool>,
     pub auto_approve: Option<bool>,
+    /// Posture for the thread this task runs on. Takes precedence over
+    /// `auto_approve`, which the runtime only reads when no posture is given.
+    pub permission_posture: Option<String>,
     pub owner_session_id: Option<String>,
 }
 
@@ -429,6 +443,7 @@ impl NewTaskRequest {
     pub(crate) fn from_task(task: &TaskRecord) -> Self {
         Self {
             prompt: task.prompt.clone(),
+            name: task.name.clone(),
             model: Some(task.model.clone()),
             model_provider: task.model_provider.clone(),
             model_provider_id: task.model_provider_id.clone(),
@@ -437,6 +452,7 @@ impl NewTaskRequest {
             allow_shell: Some(task.allow_shell),
             trust_mode: Some(task.trust_mode),
             auto_approve: Some(task.auto_approve),
+            permission_posture: task.permission_posture.clone(),
             owner_session_id: task.owner_session_id.clone(),
         }
     }
@@ -446,6 +462,7 @@ impl NewTaskRequest {
     pub fn from_prompt(prompt: impl Into<String>) -> Self {
         Self {
             prompt: prompt.into(),
+            name: None,
             model: None,
             model_provider: None,
             model_provider_id: None,
@@ -454,6 +471,7 @@ impl NewTaskRequest {
             allow_shell: None,
             trust_mode: None,
             auto_approve: Some(true),
+            permission_posture: None,
             owner_session_id: None,
         }
     }
@@ -643,6 +661,7 @@ pub struct ExecutionTask {
     allow_shell: bool,
     trust_mode: bool,
     auto_approve: bool,
+    permission_posture: Option<String>,
 }
 
 impl From<&TaskRecord> for ExecutionTask {
@@ -658,6 +677,7 @@ impl From<&TaskRecord> for ExecutionTask {
             allow_shell: task.allow_shell,
             trust_mode: task.trust_mode,
             auto_approve: task.auto_approve,
+            permission_posture: task.permission_posture.clone(),
         }
     }
 }
@@ -673,6 +693,7 @@ impl ExecutionTask {
             allow_shell: Some(self.allow_shell),
             trust_mode: Some(self.trust_mode),
             auto_approve: Some(self.auto_approve),
+            permission_posture: self.permission_posture.clone(),
             task_id: Some(self.id.clone()),
             ..Default::default()
         }
@@ -870,6 +891,9 @@ async fn drive_engine_turn(
     let mut cursor = 0u64;
     let mut terminal_status: Option<RuntimeTurnStatus> = None;
     let mut terminal_error: Option<String> = None;
+    // Approval requests this turn is waiting on, each with the deadline the
+    // runtime bridge will resolve it by (#6118).
+    let mut pending_approvals: HashMap<String, Instant> = HashMap::new();
 
     loop {
         let batch = match runtime_threads
@@ -902,12 +926,47 @@ async fn drive_engine_turn(
             {
                 continue;
             }
+            match event.event.as_str() {
+                // An approval parks the turn on an external decision until
+                // the runtime bridge answers or its own window closes; note
+                // that deadline so the idle watchdog stays off it (#6118).
+                "approval.required" => {
+                    let approval_id = event
+                        .payload
+                        .get("approval_id")
+                        .and_then(Value::as_str)
+                        .map(ToString::to_string)
+                        .unwrap_or_else(|| format!("approval-{}", event.seq));
+                    let until = match runtime_threads.approval_decision_timeout() {
+                        Some(wait) => Instant::now() + wait,
+                        // `0` waits indefinitely by configuration; the wall
+                        // deadline still bounds the run.
+                        None => Instant::now() + limits.wall_time,
+                    };
+                    pending_approvals.insert(approval_id, until);
+                }
+                "approval.decided" => {
+                    if let Some(approval_id) =
+                        event.payload.get("approval_id").and_then(Value::as_str)
+                    {
+                        pending_approvals.remove(approval_id);
+                    }
+                }
+                _ => {}
+            }
             if runtime_event_is_progress(&event) {
                 guard.note_progress(Instant::now());
             }
             if let Some((status, error)) =
                 ingest_runtime_event(&event, &mut final_text, &events).await
             {
+                // The decision window closed on a pending approval: the
+                // runtime already denied the tool, and an unattended run has
+                // no operator to answer, so stop the turn instead of letting
+                // it keep burning under a failure nobody sees (#6118).
+                if event.event.as_str() == "approval.timeout" {
+                    let _ = runtime_threads.interrupt_turn(thread_id, turn_id).await;
+                }
                 terminal_status = Some(status);
                 terminal_error = error;
             }
@@ -917,7 +976,18 @@ async fn drive_engine_turn(
             break;
         }
 
-        match guard.evaluate(Instant::now(), cancel.is_cancelled(), false) {
+        // While an approval is pending the turn is deliberately waiting on an
+        // external decision, not drifting: keep the idle deadline from firing
+        // so the bridge's own window can resolve and record it. Entries expire
+        // with their window, so a decision that never arrives cannot suspend
+        // the watchdog forever (#6118).
+        let now = Instant::now();
+        pending_approvals.retain(|_, until| now < *until);
+        if !pending_approvals.is_empty() {
+            guard.note_progress(now);
+        }
+
+        match guard.evaluate(now, cancel.is_cancelled(), false) {
             GuardAction::Interrupt { reason } => {
                 let _ = runtime_threads.interrupt_turn(thread_id, turn_id).await;
                 emit_task_event(
@@ -1209,6 +1279,14 @@ async fn ingest_runtime_event(
                 .unwrap_or(false)
                 .then_some((RuntimeTurnStatus::Failed, Some(message)))
         }
+
+        "approval.timeout" => Some((
+            RuntimeTurnStatus::Failed,
+            Some(
+                "Tool approval was not answered within the decision window; the runtime denied the tool and the run stopped."
+                    .to_string(),
+            ),
+        )),
         _ => None,
     }
 }
@@ -1397,14 +1475,17 @@ impl TaskManager {
         let tasks_dir = cfg.data_dir.join("tasks");
         let artifacts_dir = cfg.data_dir.join("artifacts");
         let queue_path = cfg.data_dir.join("queue.json");
-        fs::create_dir_all(&tasks_dir)
+        tokio::fs::create_dir_all(&tasks_dir)
+            .await
             .with_context(|| format!("Failed to create tasks dir {}", tasks_dir.display()))?;
-        fs::create_dir_all(&artifacts_dir).with_context(|| {
-            format!(
-                "Failed to create task artifacts dir {}",
-                artifacts_dir.display()
-            )
-        })?;
+        tokio::fs::create_dir_all(&artifacts_dir)
+            .await
+            .with_context(|| {
+                format!(
+                    "Failed to create task artifacts dir {}",
+                    artifacts_dir.display()
+                )
+            })?;
 
         let execution_lease = TaskExecutionLease::new(&cfg.data_dir, identity.0, identity.1)?;
         let cancel_token = CancellationToken::new();
@@ -1605,6 +1686,18 @@ impl TaskManager {
         {
             bail!("A pinned task provider requires an explicit model");
         }
+        // The worker runs this same projection when it opens the task's
+        // thread. Running it here as well refuses an unknown mode or posture
+        // at the boundary the request crossed, instead of after the task has
+        // sat in the durable queue and a worker has claimed it.
+        crate::runtime_policy::RuntimePolicyProjection::from_request(
+            req.mode
+                .as_deref()
+                .filter(|mode| !mode.trim().is_empty())
+                .unwrap_or(&self.cfg.default_mode),
+            req.permission_posture.as_deref(),
+            req.auto_approve,
+        )?;
         validate_preallocated_task_id(&task_id)?;
 
         let task = TaskRecord {
@@ -1617,6 +1710,10 @@ impl TaskManager {
             // work.
             id: task_id,
             prompt,
+            name: req
+                .name
+                .map(|name| name.trim().to_string())
+                .filter(|name| !name.is_empty()),
             model: req.model.unwrap_or_else(|| self.cfg.default_model.clone()),
             model_provider: req.model_provider,
             model_provider_id: req.model_provider_id,
@@ -1630,12 +1727,12 @@ impl TaskManager {
             // Auto-approval must be opted into explicitly
             // (GHSA-72w5-pf8h-xfp4).
             auto_approve: req.auto_approve.unwrap_or(false),
+            permission_posture: req.permission_posture,
             status: TaskStatus::Queued,
             created_at: Utc::now(),
             started_at: None,
             ended_at: None,
             duration_ms: None,
-            hunt_verdict: None,
             result_summary: None,
             result_detail_path: None,
             error: None,
@@ -1714,7 +1811,9 @@ impl TaskManager {
                 write_json_atomic(&staged_task_path, &task)?;
             }
             if let Err(err) = self.persist_queue_locked(&next_queue) {
-                if !recover_stage && let Err(cleanup_err) = fs::remove_file(&staged_task_path) {
+                if !recover_stage
+                    && let Err(cleanup_err) = tokio::fs::remove_file(&staged_task_path).await
+                {
                     tracing::warn!(
                         task_id = %task.id,
                         error = %cleanup_err,
@@ -1723,12 +1822,12 @@ impl TaskManager {
                 }
                 return Err(err);
             }
-            if let Err(promote_err) = fs::rename(&staged_task_path, &task_path) {
+            if let Err(promote_err) = tokio::fs::rename(&staged_task_path, &task_path).await {
                 let rollback_error = self.persist_queue_locked(&state.queue).err();
                 let cleanup_error = if recover_stage {
                     None
                 } else {
-                    fs::remove_file(&staged_task_path).err()
+                    tokio::fs::remove_file(&staged_task_path).await.err()
                 };
                 let mut message =
                     format!("Failed to promote staged task {}: {promote_err}", task.id);
@@ -2789,25 +2888,6 @@ impl TaskManager {
             );
         }
 
-        if let Some(value) = updates.get("hunt_verdict") {
-            let raw = value
-                .as_str()
-                .ok_or_else(|| anyhow!("hunt_verdict task update must be a string"))?;
-            let verdict = normalize_hunt_verdict(raw)?;
-            if task.hunt_verdict.as_deref() != Some(verdict) {
-                task.hunt_verdict = Some(verdict.to_string());
-                push_timeline_entry(
-                    task,
-                    TaskTimelineEntry {
-                        timestamp: now,
-                        kind: "hunt_verdict".to_string(),
-                        summary: format!("Hunt verdict updated: {verdict}"),
-                        detail_path: None,
-                    },
-                );
-            }
-        }
-
         if let Some(value) = updates.get("attempt") {
             let attempt: TaskAttemptRecord = serde_json::from_value(value.clone())
                 .context("Failed to parse attempt task update")?;
@@ -2867,9 +2947,18 @@ impl TaskManager {
         Ok(())
     }
 
+    /// Acquire the cross-process task-store lock.
+    ///
+    /// Polls with exponential backoff (5ms → 50ms) instead of a flat 5ms
+    /// interval: under contention the old shape woke ~200×/s for up to its
+    /// whole five-second deadline (#6211 R7c). The deadline and the busy
+    /// error are unchanged. What this does not do: it does not add the
+    /// in-process mutex the issue also suggested — in-process contenders
+    /// just back off against the same file lock.
     async fn lock_store(&self) -> Result<RuntimeProcessOwnerLock> {
         let path = self.cfg.data_dir.join("task-store.lock");
         let deadline = Instant::now() + Duration::from_secs(5);
+        let mut wait = Duration::from_millis(5);
         loop {
             if let Some(owner) = RuntimeProcessOwnerLock::try_acquire_file(&path, true)? {
                 return Ok(owner);
@@ -2877,7 +2966,8 @@ impl TaskManager {
             if Instant::now() >= deadline {
                 bail!("Task store is busy; state is unavailable");
             }
-            sleep(Duration::from_millis(5)).await;
+            sleep(wait).await;
+            wait = (wait * 2).min(Duration::from_millis(50));
         }
     }
 
@@ -2986,18 +3076,6 @@ impl TaskManager {
     }
 }
 
-fn normalize_hunt_verdict(raw: &str) -> Result<&'static str> {
-    match raw.trim() {
-        "hunting" => Ok("hunting"),
-        "hunted" => Ok("hunted"),
-        "wounded" => Ok("wounded"),
-        "escaped" => Ok("escaped"),
-        other => bail!(
-            "unsupported hunt_verdict task update '{other}'. Expected one of: hunting, hunted, wounded, escaped"
-        ),
-    }
-}
-
 fn validate_preallocated_task_id(task_id: &str) -> Result<()> {
     if task_id.len() != 21
         || !task_id.starts_with("task_")
@@ -3047,6 +3125,10 @@ pub(crate) fn validate_bound_task_request(
         || request
             .trust_mode
             .is_some_and(|value| value != task.trust_mode)
+        || request
+            .permission_posture
+            .as_deref()
+            .is_some_and(|value| Some(value) != task.permission_posture.as_deref())
         || task.auto_approve != request.auto_approve.unwrap_or(false)
     {
         bail!("Task admission replay does not match the bound request");
@@ -4169,6 +4251,7 @@ mod tests {
             schema_version: CURRENT_TASK_SCHEMA_VERSION,
             id: task_id.clone(),
             prompt: "long-running shell work".to_string(),
+            name: None,
             model: "deepseek-v4-flash".to_string(),
             model_provider: None,
             model_provider_id: None,
@@ -4177,12 +4260,12 @@ mod tests {
             allow_shell: true,
             trust_mode: false,
             auto_approve: false,
+            permission_posture: None,
             status: TaskStatus::Running,
             created_at: started_at,
             started_at: Some(started_at),
             ended_at: None,
             duration_ms: None,
-            hunt_verdict: None,
             result_summary: None,
             result_detail_path: None,
             error: None,
@@ -4304,37 +4387,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn record_tool_metadata_updates_hunt_verdict_summary() -> Result<()> {
-        let root = std::env::temp_dir().join(format!("deepseek-task-test-{}", Uuid::new_v4()));
-        let manager =
-            TaskManager::start_with_executor(test_config(root), Arc::new(MockExecutor)).await?;
-
-        let task = manager
-            .add_task(NewTaskRequest::from_prompt("test verdict metadata"))
-            .await?;
-        let finished = wait_for_terminal_state(&manager, &task.id, Duration::from_secs(10)).await?;
-        let updated = manager
-            .record_tool_metadata(
-                &finished.id,
-                &serde_json::json!({
-                    "task_updates": {
-                        "hunt_verdict": "wounded"
-                    }
-                }),
-            )
-            .await?;
-
-        assert_eq!(updated.hunt_verdict.as_deref(), Some("wounded"));
-        let summaries = manager.list_tasks(Some(10)).await?;
-        let summary = summaries
-            .iter()
-            .find(|summary| summary.id == updated.id)
-            .expect("updated task summary");
-        assert_eq!(summary.hunt_verdict.as_deref(), Some("wounded"));
-        Ok(())
-    }
-
-    #[tokio::test]
     async fn write_task_artifact_rejects_traversal_task_id() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let root = temp.path().join("tasks-root");
@@ -4402,6 +4454,7 @@ mod tests {
 
         let req = NewTaskRequest {
             prompt: "fix TODOs and write a README".to_string(),
+            name: None,
             model: None,
             model_provider: None,
             model_provider_id: None,
@@ -4410,6 +4463,7 @@ mod tests {
             allow_shell: None,
             trust_mode: None,
             auto_approve: None,
+            permission_posture: None,
             owner_session_id: None,
         };
         let task = manager.add_task(req).await?;
@@ -4427,6 +4481,68 @@ mod tests {
             "model-omitted trust_mode must default to false"
         );
         Ok(())
+    }
+
+    /// A task's own thread starts on the posture the request pinned, and the
+    /// posture is what the thread's policy is derived from — the legacy
+    /// `auto_approve` bit is only read when no posture is given.
+    #[tokio::test]
+    async fn add_task_pins_the_posture_its_thread_starts_on() -> Result<()> {
+        let root = std::env::temp_dir().join(format!("deepseek-task-test-{}", Uuid::new_v4()));
+        let manager =
+            TaskManager::start_with_executor(test_config(root.clone()), Arc::new(MockExecutor))
+                .await?;
+
+        let task = manager
+            .add_task(NewTaskRequest {
+                permission_posture: Some("auto_review".to_string()),
+                ..NewTaskRequest::from_prompt("pin the posture")
+            })
+            .await?;
+
+        assert_eq!(task.permission_posture.as_deref(), Some("auto_review"));
+        let request = ExecutionTask::from(&task).thread_request();
+        assert_eq!(request.permission_posture.as_deref(), Some("auto_review"));
+        // `from_prompt` asks for auto-approval; the pinned posture outranks it,
+        // so the thread must not silently run wider than what was requested.
+        assert_eq!(request.auto_approve, Some(true));
+        Ok(())
+    }
+
+    /// The worker's thread projection refuses these postures, so admission
+    /// refuses them too: the request came through the Runtime API, and that
+    /// is where the refusal belongs, not in a worker after the task was
+    /// durably queued.
+    #[tokio::test]
+    async fn add_task_refuses_a_posture_the_thread_would_reject() -> Result<()> {
+        let root = std::env::temp_dir().join(format!("deepseek-task-test-{}", Uuid::new_v4()));
+        let manager =
+            TaskManager::start_with_executor(test_config(root.clone()), Arc::new(MockExecutor))
+                .await?;
+
+        for posture in ["sideways", "never"] {
+            let error = manager
+                .add_task(NewTaskRequest {
+                    permission_posture: Some(posture.to_string()),
+                    ..NewTaskRequest::from_prompt("refuse me")
+                })
+                .await
+                .expect_err("a posture the thread cannot honour is refused at admission");
+            assert!(error.to_string().contains("permission posture"), "{error}");
+        }
+        assert!(manager.list_tasks(None).await?.is_empty());
+        Ok(())
+    }
+
+    /// The Runtime's `POST /v1/tasks` body may omit the posture entirely: it is
+    /// optional on the wire, and absent means "derive it from the legacy bits",
+    /// which is what every client that predates the field sends.
+    #[test]
+    fn new_task_request_accepts_a_body_without_a_posture() {
+        let request: NewTaskRequest =
+            serde_json::from_str(r#"{"prompt":"ship it","mode":"agent"}"#).expect("wire body");
+        assert!(request.permission_posture.is_none());
+        assert_eq!(request.mode.as_deref(), Some("agent"));
     }
 
     #[tokio::test]
@@ -4844,6 +4960,7 @@ mod tests {
             schema_version: CURRENT_TASK_SCHEMA_VERSION,
             id: "task_0123456789abcdef".to_string(),
             prompt: "bound timeline".to_string(),
+            name: None,
             model: "deepseek-v4-flash".to_string(),
             model_provider: None,
             model_provider_id: None,
@@ -4852,12 +4969,12 @@ mod tests {
             allow_shell: false,
             trust_mode: false,
             auto_approve: false,
+            permission_posture: None,
             status: TaskStatus::Running,
             created_at: Utc::now(),
             started_at: Some(Utc::now()),
             ended_at: None,
             duration_ms: None,
-            hunt_verdict: None,
             result_summary: None,
             result_detail_path: None,
             error: None,
@@ -5594,6 +5711,138 @@ mod tests {
         .await;
         assert_eq!(result.status, TaskStatus::Completed);
         assert_eq!(result.terminal_reason, TaskTerminalReason::Completed);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pending_approval_suspends_idle_and_timeout_denial_settles_failed() -> Result<()> {
+        // #6118: a run that needs a tool approval must not die as a silent
+        // idle-timeout cancel; the pending approval suspends the idle
+        // watchdog, and the bridge's own deadline denial then settles the
+        // run Failed with the reason recorded.
+        let runtime = Arc::new(test_runtime_manager().await?);
+        let thread = runtime
+            .create_thread(CreateThreadRequest::default())
+            .await?;
+        let thread_id = thread.id.clone();
+        runtime
+            .emit_event_for_test(
+                &thread.id,
+                Some("turn_approval"),
+                "approval.required",
+                json!({
+                    "approval_id": "approval_fixture_1",
+                    "tool_call_id": "call_fixture_1",
+                    "tool_name": "shell",
+                }),
+            )
+            .await?;
+        let (tx, mut rx) = mpsc::channel(64);
+        let runtime_for_drive = Arc::clone(&runtime);
+        let drive = tokio::spawn(async move {
+            drive_engine_turn(
+                runtime_for_drive.as_ref(),
+                &thread_id,
+                "turn_approval",
+                tx,
+                CancellationToken::new(),
+                TaskExecutionLimits {
+                    wall_time: Duration::from_secs(5),
+                    idle_progress: Duration::from_millis(120),
+                    cancel_grace: Duration::from_millis(200),
+                    persist_debounce: Duration::from_millis(10),
+                },
+            )
+            .await
+        });
+
+        // Well past the idle window, the pending approval must keep the run
+        // alive; the old behavior killed it here with no receipt.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert!(
+            !drive.is_finished(),
+            "a pending approval must suspend the idle watchdog (#6118)"
+        );
+        while let Ok(event) = rx.try_recv() {
+            if let TaskExecutionEvent::Status { message } = event {
+                assert!(
+                    !message.contains("idle deadline"),
+                    "no idle interrupt may fire while an approval is pending: {message}"
+                );
+            }
+        }
+
+        // The decision window closes: the run settles Failed with the reason.
+        runtime
+            .emit_event_for_test(
+                &thread.id,
+                Some("turn_approval"),
+                "approval.timeout",
+                json!({ "approval_id": "approval_fixture_1", "tool_call_id": "call_fixture_1" }),
+            )
+            .await?;
+        let result = tokio::time::timeout(Duration::from_secs(2), drive)
+            .await
+            .context("the decision-window denial must settle the run promptly")??;
+        assert_eq!(result.status, TaskStatus::Failed);
+        assert_eq!(result.terminal_reason, TaskTerminalReason::Failed);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("Tool approval was not answered")),
+            "the run must record why it stopped, got {:?}",
+            result.error
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn resolved_approval_restores_the_idle_watchdog() -> Result<()> {
+        // #6118 counter-check: the suspension ends with the decision, so a
+        // run that then stops making progress is idle-killed exactly as
+        // before.
+        let runtime = test_runtime_manager().await?;
+        let thread = runtime
+            .create_thread(CreateThreadRequest::default())
+            .await?;
+        runtime
+            .emit_event_for_test(
+                &thread.id,
+                Some("turn_approval_resolved"),
+                "approval.required",
+                json!({
+                    "approval_id": "approval_fixture_2",
+                    "tool_call_id": "call_fixture_2",
+                    "tool_name": "shell",
+                }),
+            )
+            .await?;
+        runtime
+            .emit_event_for_test(
+                &thread.id,
+                Some("turn_approval_resolved"),
+                "approval.decided",
+                json!({
+                    "approval_id": "approval_fixture_2",
+                    "tool_call_id": "call_fixture_2",
+                    "decision": "allow",
+                }),
+            )
+            .await?;
+        let (tx, rx) = mpsc::channel(64);
+        tokio::spawn(drain_task_events(rx));
+        let result = drive_engine_turn(
+            &runtime,
+            &thread.id,
+            "turn_approval_resolved",
+            tx,
+            CancellationToken::new(),
+            TaskExecutionLimits::short_for_tests(),
+        )
+        .await;
+        assert_eq!(result.status, TaskStatus::Failed);
+        assert_eq!(result.terminal_reason, TaskTerminalReason::IdleTimeout);
         Ok(())
     }
 

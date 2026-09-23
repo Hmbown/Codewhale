@@ -6,6 +6,7 @@
 //! checkpoints, and loop termination.
 
 use super::dispatch::{
+    FLEET_FINAL_REPORT_NOTICE, FLEET_NO_PROGRESS_STOP, FLEET_STRATEGY_SWITCH_NOTICE,
     FleetDenialAction, FleetDenialBatch, FleetDenialGuard, normalize_schema_json_containers,
 };
 use super::*;
@@ -44,7 +45,11 @@ struct StreamOutcome {
     pending_message_complete: bool,
     last_text_index: Option<usize>,
     stream_errors: u32,
-    pending_steers: Vec<String>,
+    /// Unsettled steers queued mid-stream. Each is committed into the turn's
+    /// record at a step boundary, or dropped — and dropping one reports
+    /// `SteerOutcome::Dropped` to its sender, so an interrupted or failed
+    /// turn cannot silently swallow user guidance (#6276).
+    pending_steers: Vec<handle::PendingSteer>,
     /// Typed, engine-internal drop-recovery state. `Option` + consume-once
     /// means one drop schedules exactly one resume; see [`StreamResume`].
     pending_resume: Option<StreamResume>,
@@ -391,7 +396,8 @@ impl Engine {
         };
         let (mut universe, mut refreshed) = {
             let pool = pool.lock().await;
-            (pool.model_tool_names(), pool.to_api_tools())
+            let refreshed = pool.to_api_tools();
+            (pool.model_tool_names(&refreshed), refreshed)
         };
         // A config/authority change during handshake can remove a server;
         // its previous names must also leave this turn's catalog.
@@ -682,6 +688,15 @@ impl Engine {
 
         // Only interactive TUI hosts own terminal chrome. Headless exec,
         // app-server, and stream-json stdout must remain byte-clean.
+        //
+        // The sleep guard rides the same gate: a turn that outlives the host's
+        // idle timer is lost work, and an interactive host is the only one
+        // that owns a human's machine. Bound to this function, so it releases
+        // on every return path. See `crate::sleep_guard` for its limits.
+        let _sleep_guard = self
+            .config
+            .terminal_chrome_enabled
+            .then(crate::sleep_guard::SleepGuard::hold);
         if self.config.terminal_chrome_enabled {
             crate::tui::notifications::set_taskbar_progress_busy();
             crate::tui::notifications::start_title_animation("codewhale");
@@ -805,11 +820,12 @@ impl Engine {
             }
 
             let mut accepted_steer = false;
-            while let Some(steer) = self.next_turn_steer() {
-                let steer = steer.trim().to_string();
-                if steer.is_empty() {
+            while let Some(pending) = self.next_turn_steer() {
+                if pending.content.trim().is_empty() {
+                    // Nothing to deliver; dropping `pending` settles it.
                     continue;
                 }
+                let steer = pending.commit().trim().to_string();
                 accepted_steer = true;
                 self.session
                     .working_set
@@ -972,6 +988,18 @@ impl Engine {
                         // status line and the trace.
                         if !turn.compaction_refusal_notified {
                             turn.compaction_refusal_notified = true;
+                            let estimated_tokens_before = self.estimated_input_tokens();
+                            self.record_compaction_event("compaction.refused", serde_json::json!({
+                                "trigger": "auto",
+                                "reason": match &reason {
+                                    crate::compaction::CompactionRefusal::TooFewMessages { .. } => "too_few_messages",
+                                    crate::compaction::CompactionRefusal::RetainedFloor { .. } => "retained_floor",
+                                },
+                                "messages_before": self.session.messages.len(),
+                                "estimated_tokens_before": estimated_tokens_before,
+                                "billed_input_tokens": billed_input_tokens,
+                                "threshold_tokens": prepared.config.token_threshold,
+                            })).await;
                             let message = match reason {
                                 crate::compaction::CompactionRefusal::TooFewMessages { count } => {
                                     format!(
@@ -1079,6 +1107,7 @@ impl Engine {
                             let auto_messages_after = result.messages.len();
                             let retries_used = result.retries_used;
                             let coverage_clause = result.coverage.receipt_clause();
+                            let path = result.coverage.path;
                             self.session.replace_messages(result.messages);
                             turn.clear_parent_input_tokens();
                             if let Some(pm) = self.session.prefix_stability.as_mut() {
@@ -1109,6 +1138,13 @@ impl Engine {
                                 status.clone(),
                                 Some(auto_messages_before),
                                 Some(auto_messages_after),
+                                super::compaction::CompactionPass {
+                                    trigger: "auto",
+                                    path,
+                                    tokens_before: auto_tokens_before,
+                                    threshold_tokens: prepared.config.token_threshold,
+                                    usage: compaction_usage.clone(),
+                                },
                             )
                             .await;
                         } else {
@@ -1140,7 +1176,22 @@ impl Engine {
                 self.finish_compaction(&compaction_id);
             }
 
-            let estimated_input = self.estimated_input_tokens();
+            // The guard measures what the compaction gate measures: the honest
+            // estimate, lifted to the provider's last bill plus the growth
+            // since it. `estimated_input_tokens()` carries the ×1.5 overflow
+            // inflation; compared against the honest ceiling it refused at two
+            // thirds of the budget, and emergency compaction — which targets
+            // the honest budget — could never satisfy it (#6374). A request
+            // the estimate still undercounts is rejected by the provider and
+            // takes the bounded context-length recovery below.
+            let estimated_input = turn
+                .live_input_tokens_for_compaction(
+                    &self.session.messages,
+                    self.session.system_prompt.as_ref(),
+                    self.session.latest_parent_input_tokens,
+                )
+                .and_then(|tokens| usize::try_from(tokens).ok())
+                .unwrap_or(0);
             if let Some(budget) = route_context_budget_for_route(
                 self.api_provider,
                 &self.session.model,
@@ -1190,9 +1241,11 @@ impl Engine {
                 );
                 if triggered {
                     if context_recovery_attempts >= MAX_CONTEXT_RECOVERY_ATTEMPTS {
-                        let message = format!(
-                            "Context remains above model limit after {MAX_CONTEXT_RECOVERY_ATTEMPTS} recovery attempts \
-                             (~{estimated_input} token estimate, ~{input_budget} budget). Please run /compact or /clear."
+                        let message = context_overflow_exhausted_message(
+                            self.config.terminal_chrome_enabled,
+                            turn.stop_diagnostics.emergency_compaction_attempts,
+                            estimated_input,
+                            input_budget,
                         );
                         turn_error = Some(message.clone());
                         let _ = self
@@ -1240,9 +1293,8 @@ impl Engine {
             // Resolve `auto` reasoning_effort to a concrete tier (#663).
             let effective_reasoning_effort = resolve_auto_effort(
                 self.session.reasoning_effort.as_deref(),
-                &self.session.messages,
                 self.api_provider,
-                &self.api_config.deepseek_base_url(),
+                &self.api_config.active_route_base_url(),
                 &self.config.model,
             );
 
@@ -2076,7 +2128,8 @@ impl Engine {
                         turn.stop_diagnostics
                             .permission_denial_rounds_without_progress = 0;
                     }
-                    for steer in pending_steers.drain(..) {
+                    for pending in pending_steers.drain(..) {
+                        let steer = pending.commit().trim().to_string();
                         self.session
                             .working_set
                             .observe_user_message(&steer, &self.session.workspace);
@@ -2680,7 +2733,8 @@ impl Engine {
 
             let accepted_steer_after_tools = !pending_steers.is_empty();
             if !pending_steers.is_empty() {
-                for steer in pending_steers.drain(..) {
+                for pending in pending_steers.drain(..) {
+                    let steer = pending.commit().trim().to_string();
                     self.session
                         .working_set
                         .observe_user_message(&steer, &self.session.workspace);
@@ -2712,7 +2766,7 @@ impl Engine {
                     )
                 } else {
                     turn.stop_diagnostics.reason = Some(TurnStopReason::NoProgress);
-                    "Fleet worker stopped after repeated permission denials without new evidence. Work and tool results are retained in the transcript; review the blocker before resuming.".to_string()
+                    FLEET_NO_PROGRESS_STOP.to_string()
                 };
                 let _ = self.tx_event.send(Event::status(error.clone())).await;
                 return (TurnOutcomeStatus::Failed, Some(error));
@@ -2724,15 +2778,11 @@ impl Engine {
                             .stop_diagnostics
                             .permission_strategy_switches
                             .saturating_add(1);
-                        Some(
-                            "Fleet strategy switch required: repeated permission denials produced no new evidence. The rejected action is held. Use another permitted tool from the current catalog to make progress, or report completed work and the blocker. Do not work around permissions or request the same approval again.",
-                        )
+                        Some(FLEET_STRATEGY_SWITCH_NOTICE)
                     }
                     FleetDenialAction::FinalReport => {
                         turn.stop_diagnostics.final_report_requested = true;
-                        Some(
-                            "Fleet no-progress final report: permission denials continued after the strategy switch without new evidence. Your next response is report-only; no tools will execute. Report what you completed, exact evidence, the permission blocker and remaining work. This is the last response unless the user changes direction or authority.",
-                        )
+                        Some(FLEET_FINAL_REPORT_NOTICE)
                     }
                 };
                 if let Some(notice) = notice {
@@ -2978,6 +3028,7 @@ impl Engine {
                 && !McpPool::is_mcp_tool(&tool_name)
                 && tool_name != CODE_EXECUTION_TOOL_NAME
                 && tool_name != JS_EXECUTION_TOOL_NAME
+                && tool_name != EXECUTE_TOOLS_TOOL_NAME
                 && !is_tool_search_tool(&tool_name)
             {
                 blocked_error = Some(ToolError::not_available(missing_tool_error_message(
@@ -3746,6 +3797,16 @@ impl Engine {
                             }));
                         }
 
+                        let result = match result {
+                            Ok(rich) => Ok(super::tool_media::project(
+                                rich,
+                                &session_id,
+                                &plan.id,
+                                &plan.name,
+                            )
+                            .await),
+                            Err(error) => Err(error),
+                        };
                         let content_blocks = result
                             .as_ref()
                             .map(|result| result.content_blocks.clone())
@@ -3890,10 +3951,10 @@ impl Engine {
                                 tool_exec_lock.clone(),
                                 tool_context_for_call(batch_tool_context.clone(), &tool_id),
                             ) => match result {
-                                Ok(rich) => (
-                                    ToolExecutionOutcome::from_legacy(Ok(rich.result)),
-                                    rich.content_blocks,
-                                ),
+                                Ok(rich) => {
+                                    let rich = super::tool_media::project(rich, &self.session.id, &tool_id, &tool_name).await;
+                                    (ToolExecutionOutcome::from_legacy(Ok(rich.result)), rich.content_blocks)
+                                },
                                 Err(err) => (
                                     ToolExecutionOutcome::from_legacy(Err(err)),
                                     Vec::new(),
@@ -4278,6 +4339,16 @@ impl Engine {
                         }));
                     }
 
+                    let result = match result {
+                        Ok(rich) => Ok(super::tool_media::project(
+                            rich,
+                            &self.session.id,
+                            &tool_id,
+                            &tool_name,
+                        )
+                        .await),
+                        Err(error) => Err(error),
+                    };
                     let content_blocks = result
                         .as_ref()
                         .map(|result| result.content_blocks.clone())
@@ -4466,7 +4537,8 @@ impl Engine {
                     if mcp_catalog_changed && let Some(pool) = self.mcp_pool.as_ref().cloned() {
                         let (universe, refreshed) = {
                             let pool = pool.lock().await;
-                            (pool.model_tool_names(), pool.to_api_tools())
+                            let refreshed = pool.to_api_tools();
+                            (pool.model_tool_names(&refreshed), refreshed)
                         };
                         let surface_budget = self
                             .turn_tool_surface_budget
@@ -4675,7 +4747,7 @@ impl Engine {
         // content-block delta delivered to the consumer).
         let mut any_content_received = false;
         let mut transparent_stream_retries = 0u32;
-        let mut pending_steers: Vec<String> = Vec::new();
+        let mut pending_steers: Vec<handle::PendingSteer> = Vec::new();
         // `stream_start` is reset on a transparent retry so the wall-clock
         // budget restarts with the fresh stream.
         let mut stream_start = Instant::now();
@@ -4732,18 +4804,16 @@ impl Engine {
             let Some(event_result) = poll_outcome else {
                 break;
             };
-            while let Some(steer) = self.next_turn_steer() {
-                let steer = steer.trim().to_string();
-                if steer.is_empty() {
+            while let Some(pending) = self.next_turn_steer() {
+                if pending.content.trim().is_empty() {
+                    // Nothing to deliver; dropping `pending` settles it.
                     continue;
                 }
-                pending_steers.push(steer.clone());
+                let preview = summarize_text(pending.content.trim(), 120);
+                pending_steers.push(pending);
                 let _ = self
                     .tx_event
-                    .send(Event::status(format!(
-                        "Steer input queued: {}",
-                        summarize_text(&steer, 120)
-                    )))
+                    .send(Event::status(format!("Steer input queued: {preview}")))
                     .await;
             }
 
@@ -5121,20 +5191,13 @@ impl Engine {
                                     tool_state.name, partial_json, tool_state.input_buffer
                                 ));
                             }
-                            // Mid-stream mirror of a partial buffer. The
-                            // argument text is *expected* to be incomplete
-                            // here, so `structure_synthesized` is ignored on
-                            // purpose; ContentBlockStop below is where an
-                            // unfinished argument becomes an error.
-                            if let Some(parsed) = parse_tool_input(&tool_state.input_buffer) {
-                                tool_state.input = parsed.value.clone();
-                                if crate::logging::is_verbose() {
-                                    crate::logging::info(format!(
-                                        "Tool '{}' input parsed: {:?}",
-                                        tool_state.name, parsed.value
-                                    ));
-                                }
-                            }
+                            // The buffer is the only mid-stream state: nothing
+                            // reads `tool_state.input` before finalization, so
+                            // there is no mirror parse here. Running the
+                            // `arg_repair` ladder per delta re-scanned the whole
+                            // accumulated buffer O(n²) times per tool call to
+                            // produce a value that `finalize_streamed_tool_input`
+                            // unconditionally overwrote (#6213 T4).
                         }
                     }
                 },
@@ -5177,8 +5240,8 @@ impl Engine {
                         && let Some(tool_state) = tool_uses.get_mut(tool_idx)
                     {
                         crate::logging::info(format!(
-                            "Tool '{}' block stop. Buffer: '{}', Current input: {:?}",
-                            tool_state.name, tool_state.input_buffer, tool_state.input
+                            "Tool '{}' block stop. Buffer: '{}'",
+                            tool_state.name, tool_state.input_buffer
                         ));
                         self.finalize_streamed_tool_input(tool_state).await;
 
@@ -5235,14 +5298,12 @@ impl Engine {
             }
         }
         // A stream cut at the provider's output limit ends without the
-        // closing ContentBlockStop for whatever block was in flight. Those
-        // blocks' inputs still hold the mid-stream mirror's best-effort
-        // parse, which ignores `structure_synthesized` by design — left
-        // as-is, a truncated tool call reaches dispatch through
-        // `tool.input` and executes (#5986). Every block that never
-        // stopped goes through the same finalization gate a normal
-        // ContentBlockStop applies, and is announced with the same
-        // finalized input.
+        // closing ContentBlockStop for whatever block was in flight. Before
+        // this drain existed a truncated tool call reached dispatch through
+        // `tool.input` and executed (#5986). Every block that never stopped
+        // goes through the same finalization gate a normal ContentBlockStop
+        // applies, and is announced with the same finalized input — which is
+        // also why no mid-stream parse is needed (#6213 T4).
         for tool_idx in std::mem::take(&mut current_tool_indices).into_values() {
             let Some(tool_state) = tool_uses.get_mut(tool_idx) else {
                 continue;
@@ -5287,9 +5348,9 @@ impl Engine {
     /// execute a truncated tool call (#5986). Called for a tool block that
     /// closes normally (`ContentBlockStop`) and again after the stream ends
     /// for blocks whose Stop never arrived — a provider cutting the stream
-    /// at its output limit omits the closing event, while the mid-stream
-    /// mirror deliberately ignores `structure_synthesized` because partial
-    /// text is the normal state mid-stream.
+    /// at its output limit omits the closing event. This is the only place
+    /// the accumulated buffer is parsed, and the only place
+    /// `structure_synthesized` is rejected.
     async fn finalize_streamed_tool_input(&self, tool_state: &mut ToolUseState) {
         if tool_state.input_buffer.trim().is_empty() {
             crate::logging::warn(format!(
@@ -5365,6 +5426,7 @@ impl Engine {
             crate::goal_loop::GoalBudget {
                 token_budget: snapshot.token_budget.map(u64::from),
                 time_budget_seconds: None,
+                enforce_token_budget: self.config.goal_enforce_token_budget,
                 max_continuations: self.config.goal_max_continuations,
             },
         );
@@ -5635,6 +5697,7 @@ fn mode_blocks_command_execution(mode: AppMode, tool_name: &str) -> bool {
                 | "exec_interact"
                 | CODE_EXECUTION_TOOL_NAME
                 | JS_EXECUTION_TOOL_NAME
+                | EXECUTE_TOOLS_TOOL_NAME
         )
 }
 
@@ -5766,6 +5829,7 @@ mod pre_tool_snapshot_gate_tests {
             "exec_shell_interact",
             CODE_EXECUTION_TOOL_NAME,
             JS_EXECUTION_TOOL_NAME,
+            EXECUTE_TOOLS_TOOL_NAME,
         ] {
             assert!(mode_blocks_command_execution(AppMode::Plan, tool));
             assert!(
@@ -6271,65 +6335,33 @@ pub(super) const REASONING_EFFORT_AUTO: &str = "auto";
 
 /// Resolve an `"auto"` reasoning-effort tier to a concrete value.
 ///
-/// When the configured effort is `"auto"`, inspects the last user message
-/// and calls [`crate::auto_reasoning::select`] to pick the actual tier.
-/// Non-`"auto"` values pass through unchanged.
+/// When the configured effort is `"auto"`, calls
+/// [`crate::auto_reasoning::select`] for the declared policy tier. The message
+/// is no longer inspected: the keyword classifier was deleted with the #6290
+/// rework, and `auto` now means the declared default rather than a guess from
+/// the user's wording. Non-`"auto"` values pass through unchanged.
 pub(super) fn resolve_auto_effort(
     reasoning_effort: Option<&str>,
-    messages: &[Message],
     provider: crate::config::ApiProvider,
     base_url: &str,
     wire_model: &str,
 ) -> Option<String> {
     match reasoning_effort {
         Some(effort) if effort == REASONING_EFFORT_AUTO => {
-            // Find the last user message in the conversation.
-            let last_msg = messages
-                .iter()
-                .rev()
-                .find(|m| m.role == "user")
-                .map(|m| {
-                    m.content
-                        .iter()
-                        .filter_map(|block| {
-                            if let ContentBlock::Text { text, .. } = block {
-                                if is_turn_metadata_text(text) {
-                                    None
-                                } else {
-                                    Some(text.as_str())
-                                }
-                            } else {
-                                None
-                            }
-                        })
-                        .collect::<Vec<&str>>()
-                        .join(" ")
-                })
-                .unwrap_or_default();
-
-            // is_subagent is false here — run_turn runs in the
-            // main engine (not a sub-agent's inner loop). Sub-agents have
-            // their own turn pass and can pass is_subagent=true when they
-            // call this function directly.
-            let tier = crate::auto_reasoning::select(false, &last_msg);
+            let tier = crate::auto_reasoning::select();
             let resolved = tier
                 .normalize_for_route(provider, base_url, wire_model)
                 .as_setting()
                 .to_string();
             tracing::debug!(
                 reasoning_effort = %resolved,
-                is_subagent = false,
-                "auto_reasoning: resolved auto tier from user message"
+                "auto_reasoning: resolved auto tier from declared policy"
             );
             Some(resolved)
         }
         Some(other) => Some(other.to_string()),
         None => None,
     }
-}
-
-fn is_turn_metadata_text(text: &str) -> bool {
-    text.trim_start().starts_with("<turn_meta>")
 }
 
 #[cfg(test)]
@@ -6796,47 +6828,26 @@ mod tests {
     }
 
     #[test]
-    fn resolve_auto_effort_ignores_stored_turn_metadata() {
-        let messages = vec![Message {
-            role: Role::User,
-            content: vec![
-                ContentBlock::Text {
-                    text: "<turn_meta>\nRecent errors: src/failing.rs\n</turn_meta>".to_string(),
-                    cache_control: None,
-                },
-                ContentBlock::Text {
-                    text: "hello".to_string(),
-                    cache_control: None,
-                },
-            ],
-        }];
-
+    fn resolve_auto_effort_is_content_blind() {
+        // #6290 rework: the resolved tier no longer depends on message text
+        // at all — stored metadata, questions, and work prompts alike take
+        // the declared default.
         assert_eq!(
             resolve_auto_effort(
                 Some("auto"),
-                &messages,
                 crate::config::ApiProvider::Deepseek,
                 crate::config::DEFAULT_DEEPSEEK_BASE_URL,
                 "deepseek-v4-pro",
             ),
             Some("high".to_string()),
-            "auto thinking should classify the user request, not stored metadata"
+            "auto resolves the declared default"
         );
     }
 
     #[test]
     fn resolve_auto_effort_selects_a_concrete_kimi_code_tier() {
-        let messages = vec![Message {
-            role: Role::User,
-            content: vec![ContentBlock::Text {
-                text: "inspect this repository and fix the failing tests".to_string(),
-                cache_control: None,
-            }],
-        }];
-
         let resolved = resolve_auto_effort(
             Some("auto"),
-            &messages,
             crate::config::ApiProvider::Moonshot,
             crate::config::DEFAULT_KIMI_CODE_BASE_URL,
             crate::config::KIMI_CODE_K3_MODEL,
@@ -6850,7 +6861,6 @@ mod tests {
         assert_eq!(
             resolve_auto_effort(
                 None,
-                &messages,
                 crate::config::ApiProvider::Moonshot,
                 crate::config::DEFAULT_KIMI_CODE_BASE_URL,
                 crate::config::KIMI_CODE_K3_MODEL,

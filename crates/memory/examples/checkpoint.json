@@ -1,0 +1,11 @@
+{
+  "scope":{"tenant":"local","user":"local","workspace":"codewhale","session":"demo"},
+  "key":"before-compaction",
+  "state":{
+    "summary":"The memory crate is implemented; native host integration still needs compilation and review.",
+    "next_steps":["Run cargo test","Wire the backend through the CodeWhale runtime tool registry"],
+    "artifact_refs":["workspace://crates/memory/Cargo.toml"],
+    "pending_operations":[{"operation_id":"integration-test-run-1","state":"unknown; reconcile before retry"}]
+  },
+  "memory_ids":[]
+}

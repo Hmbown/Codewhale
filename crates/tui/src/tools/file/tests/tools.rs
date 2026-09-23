@@ -555,28 +555,28 @@ async fn test_read_file_missing_path() {
     );
 }
 
-#[test]
-fn pdf_detected_by_extension() {
+#[tokio::test]
+async fn pdf_detected_by_extension() {
     let tmp = tempdir().expect("tempdir");
     let path = tmp.path().join("paper.PDF");
     fs::write(&path, b"not really a pdf, but extension says yes").unwrap();
-    assert!(is_pdf(&path).unwrap());
+    assert!(is_pdf(&path).await.unwrap());
 }
 
-#[test]
-fn pdf_detected_by_magic_bytes_without_extension() {
+#[tokio::test]
+async fn pdf_detected_by_magic_bytes_without_extension() {
     let tmp = tempdir().expect("tempdir");
     let path = tmp.path().join("blob");
     fs::write(&path, b"%PDF-1.7\nrest of bytes").unwrap();
-    assert!(is_pdf(&path).unwrap());
+    assert!(is_pdf(&path).await.unwrap());
 }
 
-#[test]
-fn non_pdf_not_detected() {
+#[tokio::test]
+async fn non_pdf_not_detected() {
     let tmp = tempdir().expect("tempdir");
     let path = tmp.path().join("notes.txt");
     fs::write(&path, "hello").unwrap();
-    assert!(!is_pdf(&path).unwrap());
+    assert!(!is_pdf(&path).await.unwrap());
 }
 
 #[test]
@@ -882,6 +882,203 @@ async fn edit_file_tool_preserves_executable_bits() {
     assert_eq!(
         fs::read_to_string(&path).expect("read"),
         "#!/bin/sh\nexit 1\n"
+    );
+}
+
+/// #6205 — a sloppy edit to a rustfmt-clean file lands normalized, and the
+/// tool result's returned diff matches the bytes on disk, so the model's next
+/// anchor is the real text.
+#[tokio::test]
+async fn edit_file_normalizes_a_sloppy_edit_in_a_rustfmt_clean_file() {
+    let tmp = tempdir().expect("tempdir");
+    let ctx = ToolContext::new(tmp.path().to_path_buf());
+    let path = tmp.path().join("clean.rs");
+    fs::write(&path, "fn main() {\n    let x = 1;\n}\n").expect("write");
+    read_before_edit(&ctx, "clean.rs").await;
+
+    let result = EditFileTool
+        .execute(
+            json!({
+                "path": "clean.rs",
+                "search": "    let x = 1;",
+                "replace": "    let x = 1;\n        let y=2;",
+            }),
+            &ctx,
+        )
+        .await
+        .expect("execute");
+
+    // No skip-if-missing branch: rustfmt ships with the pinned toolchain, and a
+    // test that passes vacuously without it proves nothing.
+    assert_eq!(
+        fs::read_to_string(&path).expect("read"),
+        "fn main() {\n    let x = 1;\n    let y = 2;\n}\n"
+    );
+    assert!(
+        result.content.contains("rustfmt-normalized"),
+        "the result must say the content was normalized: {}",
+        result.content
+    );
+    let diff = result.metadata.as_ref().expect("metadata")["mutation"]["diff"]
+        .as_str()
+        .expect("diff")
+        .to_string();
+    assert!(
+        diff.contains("+    let y = 2;"),
+        "the returned diff must show the normalized text, not what was sent: {diff}"
+    );
+    assert!(!diff.contains("let y=2;"), "{diff}");
+}
+
+/// A file the author formats by hand is never reformatted wholesale.
+#[tokio::test]
+async fn edit_file_leaves_a_hand_formatted_file_alone() {
+    let tmp = tempdir().expect("tempdir");
+    let ctx = ToolContext::new(tmp.path().to_path_buf());
+    let path = tmp.path().join("handmade.rs");
+    // Two-space indentation: rustfmt would rewrite every line of this file.
+    fs::write(&path, "fn main() {\n  let x = 1;\n}\n").expect("write");
+    read_before_edit(&ctx, "handmade.rs").await;
+
+    EditFileTool
+        .execute(
+            json!({
+                "path": "handmade.rs",
+                "search": "  let x = 1;",
+                "replace": "  let x = 1;\n  let y = 2;",
+            }),
+            &ctx,
+        )
+        .await
+        .expect("execute");
+
+    assert_eq!(
+        fs::read_to_string(&path).expect("read"),
+        "fn main() {\n  let x = 1;\n  let y = 2;\n}\n",
+        "unrelated user formatting must survive the edit"
+    );
+}
+
+/// #6206 — a dependency bump that leaves `Cargo.toml` unparseable is refused
+/// at edit time, not discovered by the next `cargo` invocation.
+#[tokio::test]
+async fn edit_file_refuses_an_edit_that_breaks_a_cargo_manifest() {
+    let tmp = tempdir().expect("tempdir");
+    let ctx = ToolContext::new(tmp.path().to_path_buf());
+    let path = tmp.path().join("Cargo.toml");
+    let original = "[dependencies]\nserde = \"1.0\"\n";
+    fs::write(&path, original).expect("write");
+    read_before_edit(&ctx, "Cargo.toml").await;
+
+    let error = EditFileTool
+        .execute(
+            json!({
+                "path": "Cargo.toml",
+                "search": "serde = \"1.0\"",
+                // Unterminated string: the classic half-finished version bump.
+                "replace": "serde = \"1.0",
+            }),
+            &ctx,
+        )
+        .await
+        .expect_err("an unparseable manifest must be refused");
+
+    let message = error.to_string();
+    assert!(message.contains("TOML syntax error at line"), "{message}");
+    assert_eq!(
+        fs::read_to_string(&path).expect("read"),
+        original,
+        "a refused edit must leave the manifest unchanged"
+    );
+}
+
+/// A valid structured-config edit is untouched by the gate.
+#[tokio::test]
+async fn edit_file_applies_a_valid_json_edit() {
+    let tmp = tempdir().expect("tempdir");
+    let ctx = ToolContext::new(tmp.path().to_path_buf());
+    let path = tmp.path().join("data.json");
+    fs::write(&path, "{\n  \"port\": 8080\n}\n").expect("write");
+    read_before_edit(&ctx, "data.json").await;
+
+    EditFileTool
+        .execute(
+            json!({
+                "path": "data.json",
+                "search": "8080",
+                "replace": "9090",
+            }),
+            &ctx,
+        )
+        .await
+        .expect("a valid JSON edit must proceed unchanged");
+
+    assert_eq!(
+        fs::read_to_string(&path).expect("read"),
+        "{\n  \"port\": 9090\n}\n"
+    );
+}
+
+/// #6204 — an edit that takes a parseable Rust file to an unparseable one is
+/// refused before the write, with a `line:column` from `syn`.
+#[tokio::test]
+async fn edit_file_refuses_an_edit_that_breaks_rust_syntax() {
+    let tmp = tempdir().expect("tempdir");
+    let ctx = ToolContext::new(tmp.path().to_path_buf());
+    let path = tmp.path().join("main.rs");
+    let original = "fn main() {\n    println!(\"hi\");\n}\n";
+    fs::write(&path, original).expect("write");
+    read_before_edit(&ctx, "main.rs").await;
+
+    let error = EditFileTool
+        .execute(
+            json!({
+                "path": "main.rs",
+                // Same brace balance, so the payload-corruption heuristic has
+                // no objection; the parenthesis is what breaks the grammar.
+                "search": "fn main() {",
+                "replace": "fn main( {",
+            }),
+            &ctx,
+        )
+        .await
+        .expect_err("an edit that breaks Rust syntax must be refused");
+
+    let message = error.to_string();
+    assert!(message.contains("Rust syntax error at line"), "{message}");
+    assert!(message.contains("Nothing was written"), "{message}");
+    assert_eq!(
+        fs::read_to_string(&path).expect("read"),
+        original,
+        "a refused edit must leave the file byte-for-byte unchanged"
+    );
+}
+
+/// The gate catches the edit that *introduces* breakage, never the one that
+/// repairs it: a file that already fails to parse stays editable.
+#[tokio::test]
+async fn edit_file_still_repairs_an_already_broken_rust_file() {
+    let tmp = tempdir().expect("tempdir");
+    let ctx = ToolContext::new(tmp.path().to_path_buf());
+    let path = tmp.path().join("broken.rs");
+    fs::write(&path, "fn main( {\n    println!(\"hi\");\n}\n").expect("write");
+    read_before_edit(&ctx, "broken.rs").await;
+
+    EditFileTool
+        .execute(
+            json!({
+                "path": "broken.rs",
+                "search": "fn main( {",
+                "replace": "fn main() {",
+            }),
+            &ctx,
+        )
+        .await
+        .expect("repairing a broken file must not be gated");
+
+    assert_eq!(
+        fs::read_to_string(&path).expect("read"),
+        "fn main() {\n    println!(\"hi\");\n}\n"
     );
 }
 

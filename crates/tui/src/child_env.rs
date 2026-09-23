@@ -442,6 +442,7 @@ fn windows_registry_env_vars() -> Vec<(OsString, OsString)> {
 fn append_windows_registry_env_key(env: &mut Vec<(OsString, OsString)>, root: HKEY, subkey: &str) {
     let mut key = HKEY::default();
     let subkey_wide = windows_wide_null(OsStr::new(subkey));
+    // SAFETY: `subkey_wide` is NUL-terminated and live; `key` is live.
     let open =
         unsafe { RegOpenKeyExW(root, PCWSTR(subkey_wide.as_ptr()), None, KEY_READ, &mut key) };
     if open != ERROR_SUCCESS {
@@ -462,6 +463,7 @@ fn append_windows_registry_env_key(env: &mut Vec<(OsString, OsString)>, root: HK
         }
     }
 
+    // SAFETY: `key` was opened above and is not used after.
     let _ = unsafe { RegCloseKey(key) };
 }
 
@@ -481,6 +483,7 @@ fn read_windows_registry_env_value(key: HKEY, index: u32) -> RegistryEnvValue {
         let mut name_len = name.len() as u32;
         let mut data_len = data.len() as u32;
         let mut value_type = 0u32;
+        // SAFETY: buffers are live with matching lengths passed.
         let status = unsafe {
             RegEnumValueW(
                 key,
@@ -545,12 +548,14 @@ fn registry_utf16_value_from_bytes(data: &[u8]) -> OsString {
 #[cfg(windows)]
 fn expand_windows_env_string(value: &OsStr) -> Option<OsString> {
     let src = windows_wide_null(value);
+    // SAFETY: `src` is NUL-terminated and live.
     let required_len = unsafe { ExpandEnvironmentStringsW(PCWSTR(src.as_ptr()), None) };
     if required_len == 0 {
         return None;
     }
 
     let mut expanded = vec![0u16; required_len as usize];
+    // SAFETY: `src` is NUL-terminated; `expanded` has the queried length.
     let written = unsafe { ExpandEnvironmentStringsW(PCWSTR(src.as_ptr()), Some(&mut expanded)) };
     if written == 0 || written > required_len {
         return None;

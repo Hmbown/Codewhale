@@ -128,7 +128,7 @@ fn render_available_skills_context_lists_paths_and_usage() {
 
     assert!(rendered.contains("## Skills"));
     assert!(rendered.contains("- test-skill: A test skill"));
-    assert!(rendered.contains("load the exact skill before use"));
+    assert!(rendered.contains("call `load_skill` with that exact name before starting the work"));
     assert!(rendered.contains("do not expand tool, approval, or trust authority"));
     assert!(
         rendered.contains(&expected_path),

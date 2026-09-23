@@ -7,20 +7,27 @@ import { exec } from "./remote-runtime.mjs";
 import { withSignal, throwIfAborted } from "./exec.mjs";
 
 export const ALLOWED = new Set([
-  "preview", "platform", "probe", "list_displays", "switch_display", "list_apps", "list_windows",
-  "open_application", "get_app_state", "resolve_element", "screenshot", "zoom",
+  "preview", "platform", "probe", "list_displays", "switch_display", "list_apps", "list_sessions", "list_windows",
+  "open_application", "kill_app", "set_window_frame", "get_app_state", "resolve_element", "screenshot", "zoom",
+  "browser_start", "browser_status", "browser_navigate", "browser_click", "browser_type", "browser_screenshot", "browser_stop",
   "left_click", "double_click", "triple_click", "right_click", "middle_click",
   "mouse_move", "left_click_drag", "left_mouse_down", "left_mouse_up", "scroll",
-  "type", "key", "hold_key", "set_value", "select_text", "perform_action",
+  "type", "key", "hold_key", "set_value", "focus", "get_value", "select_text", "perform_action", "invoke_menu",
   "read_clipboard", "write_clipboard", "cursor_position",
   "recordingStart", "recordingStop", "recordingStatus", "recordingList",
+  "app_script",
 ]);
+
+/** app_script runs osascript where this handler executes. The remote agent is
+ *  the exception that proves the transport rule: it must never become a shell,
+ *  so scripting is honored on the local computer (computerId "local") only. */
+const LOCAL_ONLY_TOOLS = new Set(["app_script"]);
 
 const backends = new Map();
 const heldPointers = new Map();
 const INPUT_MUTATIONS = new Set([
   "open_application", "left_click", "double_click", "triple_click", "right_click", "middle_click", "mouse_move",
-  "left_click_drag", "left_mouse_down", "left_mouse_up", "scroll", "type", "key", "hold_key", "set_value", "select_text", "perform_action",
+  "left_click_drag", "left_mouse_down", "left_mouse_up", "scroll", "type", "key", "hold_key", "set_value", "focus", "select_text", "perform_action", "invoke_menu",
 ]);
 let queue = Promise.resolve();
 
@@ -121,6 +128,30 @@ export function closeAllSessions() {
 }
 
 /**
+ * Content-free session registry view for agents: which sessions are live,
+ * what each is bound to, what it is doing right now, and whether any session
+ * holds a pointer. App identity and action names only — task text never
+ * reaches this process, so none can leak. Read-only by construction.
+ */
+export function summarizeSessions() {
+  const live = [...sessions.entries()].filter(([, s]) => !s.closed);
+  return {
+    control: controlMode,
+    count: live.length,
+    sessions: live.map(([key, s]) => {
+      const computerId = key.slice(0, key.indexOf(":"));
+      return {
+        target: s.target ?? null,
+        mode: s.mode ?? null,
+        action: s.action ?? null,
+        ageSec: Math.max(0, Math.round((Date.now() - s.touched) / 1000)),
+        inputHeld: heldPointers.get(computerId) === key,
+      };
+    }),
+  };
+}
+
+/**
  * Execute one {tool, args} request on this machine's backend. Never throws:
  * every outcome is a receipt object with `ok`.
  */
@@ -128,6 +159,9 @@ export async function handle(req, { computerId = "local", sessionId = "direct", 
   const tool = req?.tool;
   if (!ALLOWED.has(tool)) {
     return { ok: false, error: { code: "tool_not_allowed", message: `tool "${tool}" is not in the remote allow-list` } };
+  }
+  if (LOCAL_ONLY_TOOLS.has(tool) && computerId !== "local") {
+    return { ok: false, error: { code: "unsupported_on_transport", message: `"${tool}" runs on the local computer only — a remote agent stays a computer-use channel, never a shell` } };
   }
   if (tool === "platform") return { ok: true, platform: process.platform };
   if (controlMode !== "ready") return { ok: false, error: { code: `control_${controlMode}`, message: `Computer Use is ${controlMode} by the user. Wait for them to resume it in the menu bar.` } };

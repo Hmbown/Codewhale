@@ -3,6 +3,14 @@
 
 use super::*;
 
+pub(super) struct CompactionPass {
+    pub trigger: &'static str,
+    pub path: crate::compaction::CompactionPath,
+    pub tokens_before: usize,
+    pub threshold_tokens: usize,
+    pub usage: Usage,
+}
+
 impl Engine {
     pub(super) async fn emit_compaction_started(
         &mut self,
@@ -23,11 +31,35 @@ impl Engine {
         message: String,
         messages_before: Option<usize>,
         messages_after: Option<usize>,
+        pass: CompactionPass,
     ) {
         let summary_prompt = self.rendered_compaction_summary();
         // Every call site runs after message replacement and checkpoint
         // commit. Reuse the same complete estimate as context pressure.
         let post_input_tokens = Some(self.estimated_input_tokens() as u64);
+        let reduction_ratio = messages_before
+            .zip(messages_after)
+            .filter(|(before, _)| *before > 0)
+            .map(|(before, after)| 1.0 - after as f64 / before as f64);
+        self.record_compaction_event(
+            "compaction.completed",
+            serde_json::json!({
+                "compaction_id": id,
+                "trigger": pass.trigger,
+                "path": match pass.path {
+                    crate::compaction::CompactionPath::Summary => "summary",
+                    crate::compaction::CompactionPath::PruneOnly => "pruning_only",
+                },
+                "messages_before": messages_before,
+                "messages_after": messages_after,
+                "estimated_tokens_before": pass.tokens_before,
+                "estimated_tokens_after": post_input_tokens,
+                "threshold_tokens": pass.threshold_tokens,
+                "summarizer_usage": pass.usage,
+                "reduction_ratio": reduction_ratio,
+            }),
+        )
+        .await;
         let _ = self
             .tx_event
             .send(Event::CompactionCompleted {
@@ -40,6 +72,25 @@ impl Engine {
                 post_input_tokens,
             })
             .await;
+    }
+
+    /// One audit producer shared by interactive, headless and Runtime hosts.
+    /// No transcript content or credentials enter this diagnostic record.
+    pub(super) async fn record_compaction_event(
+        &self,
+        event: &'static str,
+        mut details: serde_json::Value,
+    ) {
+        details["session_id"] = serde_json::json!(self.session.id);
+        details["thread_id"] = serde_json::json!(self.config.runtime_services.active_thread_id);
+        details["model"] = serde_json::json!(self.config.model);
+        if let Err(error) = tokio::task::spawn_blocking(move || {
+            crate::audit::log_sensitive_event(event, details);
+        })
+        .await
+        {
+            tracing::warn!(%error, "compaction audit writer failed");
+        }
     }
 
     pub(super) async fn emit_compaction_cancelled(
@@ -205,7 +256,7 @@ impl Engine {
             output_tokens: 0,
             ..Usage::default()
         };
-        let Some(client) = self.deepseek_client.clone() else {
+        let Some(client) = self.codewhale_client.clone() else {
             let message = "Manual compaction unavailable: API client not configured".to_string();
             self.finish_compaction(&id);
             self.emit_compaction_failed(id, false, message.clone())
@@ -311,6 +362,7 @@ impl Engine {
                     let messages_after = result.messages.len();
                     let retries_used = result.retries_used;
                     let coverage_clause = result.coverage.receipt_clause();
+                    let path = result.coverage.path;
                     self.session.replace_messages(result.messages);
                     if let Some(pm) = self.session.prefix_stability.as_mut() {
                         pm.note_history_reset("compaction");
@@ -334,6 +386,13 @@ impl Engine {
                         message,
                         Some(messages_before),
                         Some(messages_after),
+                        CompactionPass {
+                            trigger: "manual",
+                            path,
+                            tokens_before,
+                            threshold_tokens: prepared.config.token_threshold,
+                            usage: compaction_usage.clone(),
+                        },
                     )
                     .await;
                 } else {
@@ -411,7 +470,13 @@ impl Engine {
         };
         let turn_cancel = self.cancel_token.clone();
 
-        let before_tokens = self.estimated_input_tokens();
+        // Measured with the estimator `after_tokens` and the preflight guard
+        // use, so `recovered` compares like with like and the receipt reads
+        // ~before → ~after on one scale.
+        let before_tokens = crate::compaction::estimate_input_tokens_for_pressure(
+            &self.session.messages,
+            self.session.system_prompt.as_ref(),
+        );
         let before_count = self.session.messages.len();
 
         let mut forced_config = self.config.compaction.clone();
@@ -464,6 +529,7 @@ impl Engine {
         };
         let retries_used = result.retries_used;
         let summary_prompt = result.summary_prompt;
+        let path = result.coverage.path;
         let mut compacted_messages = result.messages;
 
         let turn_was_canceled = turn_cancel.is_cancelled();
@@ -526,6 +592,13 @@ impl Engine {
                 details.clone(),
                 Some(before_count),
                 Some(after_count),
+                CompactionPass {
+                    trigger: "emergency",
+                    path,
+                    tokens_before: before_tokens,
+                    threshold_tokens: prepared.config.token_threshold,
+                    usage: compaction_usage.clone(),
+                },
             )
             .await;
             let _ = self.tx_event.send(Event::status(details)).await;

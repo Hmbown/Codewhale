@@ -2395,20 +2395,23 @@ mod tests {
 // projects `status_toasts`/`sticky_status` into it at the landing slice);
 // not wired into `ui/frame.rs` (#5698 gate).
 
+#[cfg(test)]
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
     style::{Modifier, Style},
 };
+#[cfg(test)]
 use unicode_width::UnicodeWidthStr;
 
+#[cfg(test)]
 use codewhale_palette::{ChromeInk, UiTheme, chrome_style};
 
 /// One attention record: a typed projection of a status toast / sticky
 /// status / desktop payload. `at` is an injected clock string so renders
 /// stay deterministic (spec §5a: caller owns the wall clock).
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // translation scaffolding: wired by the landing slice
+#[cfg(test)] // translation scaffolding: wired by the landing slice
 pub struct TidelineInboxRecord {
     pub kind: NotificationKind,
     pub title: String,
@@ -2419,6 +2422,7 @@ pub struct TidelineInboxRecord {
     pub read: bool,
 }
 
+#[cfg(test)]
 impl TidelineInboxRecord {
     /// Kind word — a noun, never "Error" (spec §7 failure microcopy rule).
     #[must_use]
@@ -2450,7 +2454,7 @@ impl TidelineInboxRecord {
 }
 
 /// What the caller owes the inbox render.
-#[allow(dead_code)] // translation scaffolding: wired by the landing slice
+#[cfg(test)] // translation scaffolding: wired by the landing slice
 pub struct TidelineInbox<'a> {
     pub theme: &'a UiTheme,
     pub records: &'a [TidelineInboxRecord],
@@ -2459,9 +2463,8 @@ pub struct TidelineInbox<'a> {
     pub ascii_safe: bool,
 }
 
-#[allow(dead_code)] // translation scaffolding: builder methods feed tests + the landing slice
+#[cfg(test)] // translation scaffolding: builder methods feed tests + the landing slice
 impl<'a> TidelineInbox<'a> {
-    #[allow(dead_code)] // translation scaffolding: wired by the landing slice
     #[must_use]
     pub fn new(theme: &'a UiTheme, records: &'a [TidelineInboxRecord]) -> Self {
         Self {
@@ -2502,10 +2505,12 @@ impl<'a> TidelineInbox<'a> {
     }
 }
 
+#[cfg(test)]
 fn chrome(theme: &UiTheme, ink: ChromeInk) -> Style {
     chrome_style(theme, ink)
 }
 
+#[cfg(test)]
 fn put(buf: &mut Buffer, x: u16, y: u16, text: &str, style: Style) {
     buf.set_stringn(x, y, text, text.width(), style);
 }
@@ -2513,7 +2518,7 @@ fn put(buf: &mut Buffer, x: u16, y: u16, text: &str, style: Style) {
 /// Paint the notifications inbox: header row (count of unread), then one
 /// row per record — unread gold ◆, read hollow ○, selected `▸`, kind word,
 /// title, injected time. Truncates, never wraps.
-#[allow(dead_code)] // translation scaffolding: wired by the landing slice
+#[cfg(test)] // translation scaffolding: wired by the landing slice
 pub fn render_tideline_inbox(area: Rect, buf: &mut Buffer, inbox: &TidelineInbox<'_>) {
     if area.width < 8 || area.height < 2 {
         return;
@@ -2601,6 +2606,7 @@ pub fn render_tideline_inbox(area: Rect, buf: &mut Buffer, inbox: &TidelineInbox
     }
 }
 
+#[cfg(test)]
 fn truncate_to_width_owned(text: &str, width: usize) -> String {
     let mut out = String::new();
     let mut used = 0;
@@ -2619,7 +2625,7 @@ fn truncate_to_width_owned(text: &str, width: usize) -> String {
 /// painted rows exactly — the selected record's body row belongs to its
 /// rect. Must be called with the same inputs as [`render_tideline_inbox`].
 #[must_use]
-#[allow(dead_code)] // translation scaffolding: wired by the landing slice
+#[cfg(test)] // translation scaffolding: wired by the landing slice
 pub fn tideline_inbox_hitboxes(area: Rect, inbox: &TidelineInbox<'_>) -> Vec<Rect> {
     let mut out = Vec::new();
     if area.width < 8 || area.height < 2 {

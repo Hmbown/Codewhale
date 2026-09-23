@@ -1,11 +1,11 @@
-<!-- source: README.md sha256:a446e3921085 -->
+<!-- source: README.md sha256:29c349b6f2b4 -->
 # Codewhale
 
 Codewhale は、選んだホスト型またはローカルのモデルを使ってプロジェクトを読み、ファイルを編集し、コマンドを実行して、自分の作業結果を確認するオープンソースのエージェントです。まずはターミナルで一つのタスクから始めましょう。大きな仕事では、異なるモデルや役割を持つエージェントに作業の一部を分担させられます。
 
-![ターミナルで動作する Codewhale](web/public/codewhale-tui-171acee.png)
+![ターミナルで動作する Codewhale](web/public/codewhale-tui-d7a9a1c.png)
 
-*v0.9.12 の開発ビルドによるターミナルのプレビュー。*
+*v0.10.0 の開発ビルドによるターミナルのプレビュー。*
 
 [English](README.md) · [简体中文](README.zh-CN.md) · [Tiếng Việt](README.vi.md) · [Bahasa Indonesia](README.id.md) · [한국어](README.ko-KR.md) · [Español](README.es-419.md) · [Português](README.pt-BR.md) · [Русский](README.ru.md) · [Українська](README.uk.md) · [Français](README.fr.md) · [Deutsch](README.de.md) · [繁體中文](README.zh-TW.md) · [हिन्दी](README.hi.md) · [Türkçe](README.tr.md) · [Italiano](README.it.md) · [Polski](README.pl.md) · [العربية](README.ar.md) · [Català](README.ca.md)
 
@@ -53,7 +53,7 @@ Codewhale はリポジトリを読み、ファイルを編集し、コマンド�
 
 - **ターミナル：** `codewhale` は対話型インターフェースを開き、`codewhale exec` はスクリプトや CI ジョブからタスクを実行します。
 - **ローカルブラウザー：** `codewhale web` は、同じ Runtime を使う同梱の[ローカル Web クライアント](docs/WEB.md)を開きます。
-- **Codewhale の Web アプリとデスクトップアプリ：** 開発中のグラフィカルな作業環境です。提供状況は[製品ページ](https://codewhale.net/en/product)をご覧ください。
+- **Codewhale デスクトップアプリ（GPUI）：** ネイティブ GPUI デスクトップアプリが製品クライアントの方向性です（2026-09-14 に決定。フェーズ計画は非公開 codehwhale-gpui リポジトリの docs/TRANSITION.md にあります）。app.codewhale.net のホステッド Web アプリは段階的に終了し、マーケティングサイト・サインイン・課金・法務・ダウンロードの各ページは Web に恒久に残ります。提供状況は[製品ページ](https://codewhale.net/en/product)をご覧ください。
 
 **Computer Use は、ほかのアプリケーションの状態を確認し、操作するためのツールを追加します。** このプラグインは現在のソースコードに含まれています。使用前に要求されるアクセス権を確認し、有効にしてください。OS の権限やプラットフォームの要件も満たす必要があります。同梱の [Computer Use ガイド](crates/tui/plugins/computer-use/README.md)と[プラグインの設定](docs/PLUGINS.md)を参照してください。
 

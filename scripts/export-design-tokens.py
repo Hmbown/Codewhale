@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""Export the TUI whale palette to the other Codewhale clients.
+"""Export the Codewhale palettes to the other Codewhale clients.
 
-`crates/palette/src/tokens.rs` is the single source for the whale colors.
-This script parses its `WHALE_*_RGB` and `LIGHT_*_RGB` consts (aliases
-included) and writes the same values as CSS custom properties so the web app
-stops hand-copying hexes.
+`crates/palette/src/tokens.rs` is the single source for the product colors.
+This script parses its `WHALE_*_RGB`, `LIGHT_*_RGB`, `SHORELINE_*_RGB`, and
+`SHORELINE_LIGHT_*_RGB` consts (aliases included) and writes the same values
+as CSS custom properties so the web app stops hand-copying hexes. The
+Shoreline set is the Shoreline redesign's dark + light pair; `--whale-*` and
+`--light-*` stay until the components that use them migrate.
 
 Target: <repo>/web/app/tokens.css. This script writes nothing outside this
 repository.
@@ -26,8 +28,8 @@ TOKENS_RS = REPO / "crates/palette/src/tokens.rs"
 SOURCE_LABEL = "crates/palette/src/tokens.rs"
 
 CONST_RE = re.compile(
-    r"^pub const ((?:WHALE|LIGHT)_[A-Z0-9_]+)_RGB: \(u8, u8, u8\) = "
-    r"(?:\((\d+), (\d+), (\d+)\)|((?:WHALE|LIGHT)_[A-Z0-9_]+)_RGB);",
+    r"^pub const ((?:SHORELINE_LIGHT|SHORELINE|WHALE|LIGHT)_[A-Z0-9_]+)_RGB: \(u8, u8, u8\) = "
+    r"(?:\((\d+), (\d+), (\d+)\)|((?:SHORELINE_LIGHT|SHORELINE|WHALE|LIGHT)_[A-Z0-9_]+)_RGB);",
     re.MULTILINE,
 )
 
@@ -48,14 +50,23 @@ def parse_tokens(text: str) -> list[tuple[str, tuple[int, int, int] | str]]:
             tokens.append((name, (int(m.group(2)), int(m.group(3)), int(m.group(4)))))
         known.add(name)
     if not tokens:
-        raise SystemExit(f"no WHALE_*_RGB consts found in {TOKENS_RS}")
+        raise SystemExit(f"no palette RGB consts found in {TOKENS_RS}")
     return tokens
 
 
 def css_name(name: str) -> str:
     """`WHALE_*` exports as `--whale-*`; the Blue Stage light preset's
     `LIGHT_*` consts export as `--light-*` so the website's paper surface can
-    reference the same light-mode ink and border values the TUI ships."""
+    reference the same light-mode ink and border values the TUI ships. The
+    Shoreline dark pair exports as `--shoreline-*` and its light pair as
+    `--shoreline-light-*`, matching the theme the TUI and GPUI clients open
+    on."""
+    if name.startswith("SHORELINE_LIGHT_"):
+        return "--shoreline-light-" + name.removeprefix("SHORELINE_LIGHT_").lower().replace(
+            "_", "-"
+        )
+    if name.startswith("SHORELINE_"):
+        return "--shoreline-" + name.removeprefix("SHORELINE_").lower().replace("_", "-")
     if name.startswith("LIGHT_"):
         return "--light-" + name.removeprefix("LIGHT_").lower().replace("_", "-")
     return "--whale-" + name.removeprefix("WHALE_").lower().replace("_", "-")

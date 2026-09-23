@@ -14,8 +14,9 @@ import { pathLocale } from "./i18n/path";
 /**
  * App-icon raster (1254×1254) used on public account-entry pages: the canonical
  * mark in the current brand treatment — blue gradient glyph on a white rounded
- * tile, generated from repo-root-relative `web/public/brand/mark.svg`. The vector is
- * the master — never hand-edit this PNG, regenerate it. Pinned by hash so a
+ * tile. The master vectors are the canonical family in
+ * `codewhale-apps/packages/brand/svg/` (byte copies in `web/public/brand/`) —
+ * never hand-edit this PNG, regenerate it from the family. Pinned by hash so a
  * redrawn or stale substitute fails the test rather than shipping.
  */
 export const CANONICAL_MARK_SRC = "/brand/codewhale-mark.png";

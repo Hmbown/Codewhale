@@ -6,13 +6,11 @@
 //! (`crates/tui/src/client.rs:3484`), so this works on any ChatCompletions
 //! provider — it is not DeepSeek-specific.
 
-use std::fs;
-
 use async_trait::async_trait;
 use serde_json::{Value, json};
 use thiserror::Error;
 
-use crate::client::DeepSeekClient;
+use crate::client::CodewhaleClient;
 
 use super::spec::{
     ApprovalRequirement, ToolCapability, ToolContext, ToolError, ToolResult, ToolSpec,
@@ -31,16 +29,16 @@ pub struct FimEditResult {
 }
 
 /// Tool for performing Fill-in-the-Middle edits via the active route's FIM API.
-/// (`DeepSeekClient` is the historical name of the shared provider client; it is
+/// (`CodewhaleClient` is the historical name of the shared provider client; it is
 /// not a DeepSeek-only type.)
 pub struct FimEditTool {
-    pub client: Option<DeepSeekClient>,
+    pub client: Option<CodewhaleClient>,
     pub model: String,
 }
 
 impl FimEditTool {
     #[must_use]
-    pub fn new(client: Option<DeepSeekClient>, model: String) -> Self {
+    pub fn new(client: Option<CodewhaleClient>, model: String) -> Self {
         Self { client, model }
     }
 }
@@ -117,7 +115,7 @@ impl ToolSpec for FimEditTool {
 
         // 1. Read the file
         let resolved = context.resolve_path(path)?;
-        let content = fs::read_to_string(&resolved).map_err(|e| {
+        let content = tokio::fs::read_to_string(&resolved).await.map_err(|e| {
             ToolError::execution_failed(format!("Failed to read {}: {}", resolved.display(), e))
         })?;
 
@@ -166,6 +164,11 @@ impl ToolSpec for FimEditTool {
         // 7. Build the new content and write it back
         let generated_len = generated_text.len();
         let new_content = format!("{fim_prompt}{generated_text}{fim_suffix}");
+        super::syntax_check::guard_edit(&resolved, path, Some(&content), &new_content)?;
+        // Deliberately not rustfmt-normalized (#6205): this result reports
+        // `prefix_end`/`suffix_start` as byte offsets into the written file,
+        // and reformatting would move them. The syntax gate applies; the
+        // formatting normalization does not.
         crate::utils::write_atomic_workspace(&resolved, new_content.as_bytes()).map_err(|e| {
             ToolError::execution_failed(format!("Failed to write {}: {}", resolved.display(), e))
         })?;

@@ -9,7 +9,7 @@
 //! changed cells rather than history; width/option changes still bust all
 //! cells because wrapping and visibility depend on them.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use ratatui::{
@@ -19,7 +19,7 @@ use ratatui::{
 
 use crate::tui::app::TranscriptSpacing;
 use crate::tui::history::{
-    HistoryCell, ReasoningAction, ReasoningActionTarget, TranscriptActionOwner,
+    HistoryCell, ReasoningAction, ReasoningActionTarget, ThinkingFold, TranscriptActionOwner,
     TranscriptRenderOptions,
 };
 use crate::tui::scrolling::TranscriptLineMeta;
@@ -117,12 +117,18 @@ enum TranscriptBoundary {
 pub struct TranscriptViewCache {
     width: u16,
     options: TranscriptRenderOptions,
-    /// Fold state affects rendering without changing cell revisions.
-    folded_cells: HashSet<usize>,
+    /// Explicit per-cell fold intent affects rendering without changing cell
+    /// revisions. Keyed by original virtual cell index.
+    thinking_folds: HashMap<usize, ThinkingFold>,
     /// Index of the newest durable Work receipt (checklist / plan snapshot)
     /// in the last pass. When a new one lands the previous newest must
     /// re-render collapsed, and its revision alone would not say so.
     newest_work_receipt: Option<usize>,
+    /// Index of the newest user turn in the last pass. Only it carries the
+    /// elevated-surface background; when a new prompt lands the previous
+    /// newest must re-render on the bare ground, and its revision alone
+    /// would not say so.
+    newest_user_turn: Option<usize>,
     reasoning_action_target: Option<ReasoningActionTarget>,
     transcript_action_owner: Option<TranscriptActionOwner>,
     identity_epoch: Option<u64>,
@@ -147,8 +153,9 @@ impl TranscriptViewCache {
         Self {
             width: 0,
             options: TranscriptRenderOptions::default(),
-            folded_cells: HashSet::new(),
+            thinking_folds: HashMap::new(),
             newest_work_receipt: None,
+            newest_user_turn: None,
             reasoning_action_target: None,
             transcript_action_owner: None,
             identity_epoch: None,
@@ -188,7 +195,7 @@ impl TranscriptViewCache {
     }
 
     /// Convenience entry point; the live path uses shards to avoid cloning.
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), expect(dead_code))]
     pub fn ensure(
         &mut self,
         cells: &[HistoryCell],
@@ -201,7 +208,7 @@ impl TranscriptViewCache {
             cell_revisions,
             width,
             options,
-            &HashSet::new(),
+            &HashMap::new(),
             None,
             None,
         );
@@ -217,7 +224,7 @@ impl TranscriptViewCache {
         cell_revisions: &[u64],
         width: u16,
         options: TranscriptRenderOptions,
-        folded_cells: &HashSet<usize>,
+        thinking_folds: &HashMap<usize, ThinkingFold>,
         original_index_map: Option<&[usize]>,
         action_owner: Option<TranscriptActionOwner>,
     ) {
@@ -228,7 +235,7 @@ impl TranscriptViewCache {
             cell_revisions,
             width,
             options,
-            folded_cells,
+            thinking_folds,
             original_index_map,
             action_owner,
         );
@@ -245,7 +252,7 @@ impl TranscriptViewCache {
         cell_revisions: &[u64],
         width: u16,
         options: TranscriptRenderOptions,
-        folded_cells: &HashSet<usize>,
+        thinking_folds: &HashMap<usize, ThinkingFold>,
         original_index_map: Option<&[usize]>,
         action_owner: Option<TranscriptActionOwner>,
     ) {
@@ -255,7 +262,7 @@ impl TranscriptViewCache {
             cell_revisions,
             width,
             options,
-            folded_cells,
+            thinking_folds,
             original_index_map,
             action_owner,
         );
@@ -269,7 +276,7 @@ impl TranscriptViewCache {
         cell_revisions: &[u64],
         width: u16,
         options: TranscriptRenderOptions,
-        folded_cells: &HashSet<usize>,
+        thinking_folds: &HashMap<usize, ThinkingFold>,
         original_index_map: Option<&[usize]>,
         action_owner: Option<TranscriptActionOwner>,
     ) {
@@ -282,7 +289,7 @@ impl TranscriptViewCache {
         }
         self.transcript_action_owner = action_owner;
         let layout_changed = self.width != width || self.options != options || identity_changed;
-        let folded_changed = self.folded_cells != *folded_cells;
+        let folded_changed = self.thinking_folds != *thinking_folds;
         // `todo_write` replaces the whole list on every call, so only the
         // newest snapshot is worth a full card (#5871). When a new one lands
         // the previous newest must re-render collapsed; its own revision has
@@ -299,12 +306,24 @@ impl TranscriptViewCache {
             .next_back();
         let work_receipt_changed = self.newest_work_receipt != newest_work_receipt;
         self.newest_work_receipt = newest_work_receipt;
-        if layout_changed || folded_changed || work_receipt_changed {
+        // Same supersession shape as the work receipt: the highlight lives on
+        // the newest user turn only, so a newly sent prompt must un-highlight
+        // its predecessor even though that cell's own revision never moved.
+        let newest_user_turn = cells
+            .iter()
+            .copied()
+            .enumerate()
+            .filter(|(_, cell)| matches!(cell, HistoryCell::User { .. }))
+            .map(|(idx, _)| idx)
+            .next_back();
+        let user_turn_changed = self.newest_user_turn != newest_user_turn;
+        self.newest_user_turn = newest_user_turn;
+        if layout_changed || folded_changed || work_receipt_changed || user_turn_changed {
             self.per_cell.clear();
         }
         self.width = width;
         self.options = options;
-        self.folded_cells = folded_cells.clone();
+        self.thinking_folds = thinking_folds.clone();
         let previous_rendered_target = self.reasoning_action_rendered_cell;
 
         // Same-index revision reuse is intentional: insert/remove shifts must
@@ -312,8 +331,11 @@ impl TranscriptViewCache {
         // destructive identity epoch also prevents revision reuse after an
         // index is removed and later filled by a different cell.
         let old_len = self.per_cell.len();
-        let mut any_dirty =
-            layout_changed || folded_changed || work_receipt_changed || old_len != total_cells;
+        let mut any_dirty = layout_changed
+            || folded_changed
+            || work_receipt_changed
+            || user_turn_changed
+            || old_len != total_cells;
         let mut first_dirty: Option<usize> = if old_len != total_cells {
             Some(old_len.min(total_cells))
         } else {
@@ -349,9 +371,9 @@ impl TranscriptViewCache {
             } else {
                 width
             };
-            let folded = folded_cells.contains(&original_idx);
+            let fold = thinking_folds.get(&original_idx).copied();
             if is_layout_aware_preview && matches!(cell, HistoryCell::Thinking { .. }) {
-                newest_reasoning = Some((idx, cell, current_rev, folded));
+                newest_reasoning = Some((idx, cell, current_rev, fold));
             }
             if !layout_changed
                 && is_layout_aware_preview == was_layout_aware_preview
@@ -455,12 +477,14 @@ impl TranscriptViewCache {
                 HistoryCell::Tool(tool) if tool.is_durable_work_receipt()
             ) && newest_work_receipt
                 .is_some_and(|newest| newest != idx);
+            cell_options.newest_user_turn = matches!(cell, HistoryCell::User { .. })
+                && newest_user_turn.is_some_and(|newest| newest == idx);
             new_per_cell.push(render_cached_cell(
                 cell,
                 current_rev,
                 width,
                 cell_options,
-                folded,
+                fold,
             ));
             idx += 1;
         }
@@ -509,13 +533,13 @@ impl TranscriptViewCache {
             return;
         };
         let free_rows = viewport_lines.saturating_sub(self.total_lines());
-        let Some((idx, cell, current_rev, folded)) = newest_reasoning.filter(|_| free_rows > 0)
+        let Some((idx, cell, current_rev, fold)) = newest_reasoning.filter(|_| free_rows > 0)
         else {
             return;
         };
         let mut expanded_options = options;
         expanded_options.reasoning_preview_extra_lines = free_rows;
-        let expanded = render_cached_cell(cell, current_rev, width, expanded_options, folded);
+        let expanded = render_cached_cell(cell, current_rev, width, expanded_options, fold);
         if expanded.lines == self.per_cell[idx].lines {
             return;
         }
@@ -769,7 +793,7 @@ fn render_cached_cell(
     revision: u64,
     width: u16,
     options: TranscriptRenderOptions,
-    folded: bool,
+    fold: Option<ThinkingFold>,
 ) -> CachedCell {
     let is_tool_groupable = matches!(cell, HistoryCell::Tool(_));
     let render_width = if is_tool_groupable {
@@ -778,7 +802,7 @@ fn render_cached_cell(
         width
     };
     let (rendered, reasoning_action) =
-        cell.lines_with_copy_metadata_folded(render_width, options, folded);
+        cell.lines_with_copy_metadata_folded(render_width, options, fold);
     let mut lines = Vec::with_capacity(rendered.len());
     let mut links = Vec::with_capacity(rendered.len());
     let mut copy_separators = Vec::with_capacity(rendered.len());

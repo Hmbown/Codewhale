@@ -32,8 +32,8 @@ use super::candidate::{
     SourcedLimitOverride, ValidationReport,
 };
 use super::capabilities::{
-    RouteCapabilities, documented_moonshot_web_search_for_route,
-    documented_zai_web_search_for_route,
+    RouteCapabilities, documented_deepseek_files_api_for_route,
+    documented_moonshot_web_search_for_route, documented_zai_web_search_for_route,
 };
 use super::descriptor::ProviderDescriptor;
 use super::errors::RouteError;
@@ -445,6 +445,20 @@ impl RouteResolver {
                 .as_deref()
                 .unwrap_or_else(|| descriptor.default_base_url());
             selected.capabilities.server_side_web_search = documented_moonshot_web_search_for_route(
+                provider_kind,
+                selected.wire_model_id.as_str(),
+                effective_base_url,
+            );
+        }
+        if matches!(
+            provider_kind,
+            ProviderKind::Deepseek | ProviderKind::DeepseekAnthropic
+        ) {
+            let effective_base_url = req
+                .base_url_override
+                .as_deref()
+                .unwrap_or_else(|| descriptor.default_base_url());
+            selected.capabilities.files_api = documented_deepseek_files_api_for_route(
                 provider_kind,
                 selected.wire_model_id.as_str(),
                 effective_base_url,

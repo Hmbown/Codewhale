@@ -677,6 +677,12 @@ fn render_diff_line(
 ) -> Vec<Line<'static>> {
     let prefix = format_line_numbers(old_line, new_line, marker);
     let prefix_width = prefix.width();
+    // The whole logical row carries the change tint — numbers included. A
+    // bare gutter next to a painted body read as two unrelated strips.
+    let gutter_style = match style.bg {
+        Some(bg) => Style::default().fg(palette::TEXT_MUTED).bg(bg),
+        None => Style::default().fg(palette::TEXT_MUTED),
+    };
     let available = width.saturating_sub(prefix_width as u16).max(1) as usize;
     let wrapped = wrap_text(content, available);
     let mut painted = emphasis.and_then(|segments| emphasised_chunks(&wrapped, style, segments));
@@ -684,9 +690,9 @@ fn render_diff_line(
     let mut out = Vec::new();
     for (idx, chunk) in wrapped.into_iter().enumerate() {
         let gutter = if idx == 0 {
-            Span::styled(prefix.clone(), Style::default().fg(palette::TEXT_MUTED))
+            Span::styled(prefix.clone(), gutter_style)
         } else {
-            Span::raw(" ".repeat(prefix_width))
+            Span::styled(" ".repeat(prefix_width), gutter_style)
         };
         let mut spans = vec![gutter];
         match painted.as_mut() {
@@ -697,10 +703,7 @@ fn render_diff_line(
     }
 
     if out.is_empty() {
-        out.push(Line::from(vec![Span::styled(
-            prefix,
-            Style::default().fg(palette::TEXT_MUTED),
-        )]));
+        out.push(Line::from(vec![Span::styled(prefix, gutter_style)]));
     }
 
     out
@@ -1092,6 +1095,47 @@ diff --git a/src/a.rs b/src/a.rs
         assert!(
             text.iter().any(|line| line.contains(" - old")),
             "deleted line should carry - gutter: {text:?}"
+        );
+    }
+
+    #[test]
+    fn render_diff_tints_the_gutter_with_the_row() {
+        let diff = "\
+diff --git a/src/a.rs b/src/a.rs
+--- a/src/a.rs
++++ b/src/a.rs
+@@ -1,2 +1,3 @@
+ line
++new
+-old
+";
+
+        let rendered = render_diff(diff, 80);
+        let gutter_bg = |needle: &str| {
+            rendered
+                .iter()
+                .find(|line| line_text(line).contains(needle))
+                .expect("diff row renders")
+                .spans
+                .first()
+                .expect("gutter span")
+                .style
+                .bg
+        };
+        assert_eq!(
+            gutter_bg("+ new"),
+            Some(palette::DIFF_ADDED_BG),
+            "added numbers share the added tint"
+        );
+        assert_eq!(
+            gutter_bg("- old"),
+            Some(palette::DIFF_DELETED_BG),
+            "deleted numbers share the deleted tint"
+        );
+        assert_eq!(
+            gutter_bg(" line"),
+            None,
+            "context numbers stay on the bare ground"
         );
     }
 

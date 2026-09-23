@@ -9,6 +9,7 @@ import crypto from "node:crypto";
 import { spawn } from "node:child_process";
 import { run as nativeRun, runOk, ExecError, tryJson, have as nativeHave, withSignal, throwIfAborted, wait } from "../exec.mjs";
 import { pngSize } from "../png-size.mjs";
+import { createBrowser } from "../browser-cdp.mjs";
 
 const XKEYS = {
   return: "Return", enter: "Return", tab: "Tab", escape: "Escape", esc: "Escape",
@@ -58,6 +59,7 @@ function outputPath(file) {
 export function create({ exec } = {}) {
   const run = exec?.run ?? nativeRun;
   const have = exec?.have ?? nativeHave;
+  const browser = createBrowser({ platform: "linux" });
   function requireInputOwner() {
     if (exec?.persistentInputOwner !== true) throw Object.assign(new ExecError(
       "This held-input gesture requires a connected Codewhale Computer Use desktop helper so a disconnected client cannot leave keys or buttons pressed. Start the helper and reconnect before retrying."
@@ -320,6 +322,14 @@ except Exception as e:
   return {
     platform: "linux",
     releaseInput,
+    browser_start: browser.start,
+    browser_status: browser.status,
+    browser_navigate: browser.navigate,
+    browser_click: browser.click,
+    browser_type: browser.type,
+    browser_screenshot: browser.screenshot,
+    browser_stop: browser.stop,
+    closeSession: async () => { await browser.close().catch(() => {}); },
     probe: async () => {
       const s = await probeSession();
       const caps = {
@@ -449,12 +459,30 @@ except Exception as e:
       }
       throw new ExecError("list_windows needs wmctrl (X11), swaymsg (sway) or hyprctl (hyprland)");
     },
-    open_application: async ({ name, bundle_id: bid, url: urlArg } = {}) => {
+    open_application: async ({ name, bundle_id: bid, url: urlArg, activate } = {}) => {
       const target = name ?? bid;
       if (!target || !/^[A-Za-z0-9][A-Za-z0-9 ._-]*$/.test(target)) throw new ExecError("open_application needs a plain executable/desktop name");
+      // activate defaults to background: on X11 a new window grabs focus, so
+      // remember the active window and hand focus back after the launch.
+      let prevWindow = null;
+      if (activate !== true) {
+        try {
+          await probeSession();
+          if (session === "x11" && tools.xdotool) {
+            const active = await run("xdotool", ["getactivewindow"], { timeoutMs: 3_000 });
+            if (active.code === 0 && /^\d+$/.test(active.stdout.trim())) prevWindow = active.stdout.trim();
+          }
+        } catch { /* no session/tools — the launch itself is still fine */ }
+      }
       spawnDetached(target, urlArg ? [urlArg] : [], "", true);
       await new Promise((r) => setTimeout(r, 500));
-      return { launched: true, name: target, url: urlArg ?? null };
+      let focusRestored = false;
+      if (prevWindow) {
+        try {
+          focusRestored = (await run("xdotool", ["windowactivate", prevWindow], { timeoutMs: 3_000 })).code === 0;
+        } catch { /* best-effort */ }
+      }
+      return { launched: true, name: target, url: urlArg ?? null, activate: activate === true, ...(activate === true ? {} : { focus_restored: focusRestored }) };
     },
     get_app_state: async ({ app_ref, window_id } = {}) => {
       const name = appName(app_ref);
@@ -589,7 +617,41 @@ print(json.dumps({"found": True, "reason": None, "element": {
       if (!text) return { action_sent: false, note: "empty text" };
       await probeSession();
       if (session === "x11") {
-        await xdotool(["type", "--delay", "12", "--", String(text)]);
+        // xdotool `type` remaps a spare keycode for characters absent from the
+        // current keymap. Two failure modes follow: a cased letter produces a
+        // single-symbol key whose XKB level 0 is the lowercase form (Ü → ü),
+        // and consecutive remaps inside one `type` call race the X server's
+        // keymap-change propagation, so non-ASCII chars intermittently drop or
+        // arrive mangled (héllo → hllo, 日本 → 本). Route every non-ASCII char
+        // through `key U<hex>` — one synchronous remap+press+restore per char —
+        // adding Shift only when the char is cased-uppercase, and batch ASCII
+        // runs through `type` as before.
+        let runText = "";
+        const chunks = [];
+        for (const ch of String(text)) {
+          if (ch.codePointAt(0) > 127) {
+            if (runText) { chunks.push(runText); runText = ""; }
+            chunks.push(ch);
+          } else runText += ch;
+        }
+        if (runText) chunks.push(runText);
+        for (const chunk of chunks) {
+          // Supplementary-plane chars are one code point but length 2; test
+          // the code point, not the string length.
+          if (chunk.codePointAt(0) > 127) {
+            const hex = chunk.codePointAt(0).toString(16).toUpperCase().padStart(4, "0");
+            const shift = chunk !== chunk.toLowerCase() ? "shift+" : "";
+            await xdotool(["key", `${shift}U${hex}`]);
+            // Each temp remap restores the keymap as soon as the event is
+            // queued; a lagging app can then read the press against the
+            // restored map and drop it. A short settle narrows that window.
+            // Under heavy host saturation XTEST drops remain possible — that
+            // residual is documented in the suite's known_limitations.
+            await new Promise((r) => setTimeout(r, 30));
+          } else {
+            await xdotool(["type", "--delay", "12", "--", chunk]);
+          }
+        }
         return { action_sent: true, chars: text.length };
       }
       need("wtype", "typing on Wayland");
@@ -627,24 +689,37 @@ print(json.dumps({"found": True, "reason": None, "element": {
       return { action_sent: true, key: k, heldSec: d };
     },
     set_value: async ({ target, value }) => {
-      const out = await atspiResolve(
-        target,
-        `    v = found.queryValue()
-    v.currentValue = float(extra)`,
-        value,
-      ).catch(async (e) => {
-        // Fall back to the Text interface for text-bearing widgets.
-        const out2 = await atspiResolve(
-          target,
-          `    t = found.queryText()
-    t.setTextContents(extra)`,
-          String(value),
-        );
-        if (!out2.ok) throw e;
-        return out2;
-      });
+      // Select a supported interface before sending input. A refused write or
+      // failed readback must never trigger a second, ambiguously applied edit.
+      const out = await atspiResolve(target, `    state = found.getState()
+    if not state.contains(pyatspi.STATE_ENABLED):
+        raise RuntimeError("element_disabled")
+    try:
+        editor = found.queryEditableText()
+    except NotImplementedError:
+        editor = None
+    if editor is not None:
+        if not state.contains(pyatspi.STATE_EDITABLE):
+            raise RuntimeError("element_read_only")
+        if not editor.setTextContents(extra):
+            raise RuntimeError("value_rejected")
+        text = found.queryText()
+        after = text.getText(0, text.characterCount)
+        if after != extra:
+            raise RuntimeError("value_verification_failed")
+    else:
+        import math
+        desired = float(extra)
+        if not math.isfinite(desired):
+            raise RuntimeError("invalid_value")
+        numeric = found.queryValue()
+        numeric.currentValue = desired
+        after = numeric.currentValue
+        if after != desired:
+            raise RuntimeError("value_verification_failed")
+    print(json.dumps({"ok": True, "after": after}))`, String(value));
       if (!out.ok) throw new ExecError(`set_value failed: ${out.code}`);
-      return { action_sent: true, strategy: "a11y" };
+      return { action_sent: true, strategy: "a11y", verified: true, after: out.after };
     },
     select_text: async () => { throw new ExecError("select_text is not implemented on the linux backend — fail-closed"); },
     perform_action: async ({ target, action }) => {

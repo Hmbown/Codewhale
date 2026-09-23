@@ -626,7 +626,7 @@ fn open_pr_gitee(
         anyhow!("a Gitee access token is not configured in the Codewhale service slot; the branch was pushed but no pull request was opened")
     })?;
     let url = validate_outbound_origin(&gitee_pr_url(slug))?;
-    let response = reqwest::blocking::Client::builder()
+    let response = crate::tls::reqwest_blocking_client_builder()
         .connect_timeout(std::time::Duration::from_secs(8))
         .timeout(std::time::Duration::from_secs(30))
         .redirect(reqwest::redirect::Policy::none())
@@ -669,7 +669,7 @@ fn open_pr_cnb(
         anyhow!("a CNB access token is not configured in the Codewhale service slot; the branch was pushed but no pull request was opened")
     })?;
     let url = validate_outbound_origin(&cnb_pr_url(slug))?;
-    let response = reqwest::blocking::Client::builder()
+    let response = crate::tls::reqwest_blocking_client_builder()
         .connect_timeout(std::time::Duration::from_secs(8))
         .timeout(std::time::Duration::from_secs(30))
         .redirect(reqwest::redirect::Policy::none())

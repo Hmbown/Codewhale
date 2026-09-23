@@ -52,9 +52,11 @@ path = "skills"
    - run the exact `/plugin trust ...` confirmation shown, then enable again
 8. Verify `/skills inspect` reports plugin provenance and `/plugin list`
    reports the expected trust and activation state. Trust stages the reviewed
-   content but does not activate it; enablement rebuilds the current
-   workspace's Skill/MCP catalogue immediately.
+   content but does not activate it. After enablement, follow the host's
+   reload notice: use `/reload` or a new session to apply changes to a live
+   session's pinned skills and tools.
 
-Every user and workspace bundle starts untrusted and disabled. Do not add a
-marketplace, downloader, updater, compatibility scan, executable extension
-runtime, or automatic trust flow; those surfaces are outside v0.9.1.
+Every user and workspace bundle starts untrusted and disabled. Reuse the
+existing `/plugin marketplace`, install, update, review and reload surfaces;
+do not add a parallel installer, registry or automatic trust flow. Catalog
+membership alone never installs, trusts or enables a plugin.

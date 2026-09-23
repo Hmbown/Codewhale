@@ -15,7 +15,7 @@
     "in_model_catalogue": "true when the skill renders as an ambient catalogue line",
     "shadowed_aliases": "aliases that collide with another canonical bundled name; the canonical skill wins resolution"
   },
-  "generation": "11",
+  "generation": "14",
   "skills": [
     {
       "name": "skill-creator",
@@ -308,11 +308,107 @@
       "shadowed_aliases": []
     },
     {
-      "name": "contributor-onboarding",
+      "name": "github",
       "tier": "core",
-      "invocation": "explicit-only",
+      "invocation": "model+user",
       "aliases": [],
-      "in_model_catalogue": false,
+      "in_model_catalogue": true,
+      "shadowed_aliases": []
+    },
+    {
+      "name": "gmail",
+      "tier": "core",
+      "invocation": "model+user",
+      "aliases": [],
+      "in_model_catalogue": true,
+      "shadowed_aliases": []
+    },
+    {
+      "name": "google-calendar",
+      "tier": "core",
+      "invocation": "model+user",
+      "aliases": [],
+      "in_model_catalogue": true,
+      "shadowed_aliases": []
+    },
+    {
+      "name": "money",
+      "tier": "core",
+      "invocation": "model+user",
+      "aliases": [],
+      "in_model_catalogue": true,
+      "shadowed_aliases": []
+    },
+    {
+      "name": "spotify",
+      "tier": "core",
+      "invocation": "model+user",
+      "aliases": [],
+      "in_model_catalogue": true,
+      "shadowed_aliases": []
+    },
+    {
+      "name": "tts",
+      "tier": "core",
+      "invocation": "model+user",
+      "aliases": [],
+      "in_model_catalogue": true,
+      "shadowed_aliases": []
+    },
+    {
+      "name": "podcast",
+      "tier": "core",
+      "invocation": "model+user",
+      "aliases": [],
+      "in_model_catalogue": true,
+      "shadowed_aliases": []
+    },
+    {
+      "name": "shopping",
+      "tier": "core",
+      "invocation": "model+user",
+      "aliases": [],
+      "in_model_catalogue": true,
+      "shadowed_aliases": []
+    },
+    {
+      "name": "flights",
+      "tier": "core",
+      "invocation": "model+user",
+      "aliases": [],
+      "in_model_catalogue": true,
+      "shadowed_aliases": []
+    },
+    {
+      "name": "photos",
+      "tier": "core",
+      "invocation": "model+user",
+      "aliases": [],
+      "in_model_catalogue": true,
+      "shadowed_aliases": []
+    },
+    {
+      "name": "image-search",
+      "tier": "core",
+      "invocation": "model+user",
+      "aliases": [],
+      "in_model_catalogue": true,
+      "shadowed_aliases": []
+    },
+    {
+      "name": "goals",
+      "tier": "core",
+      "invocation": "model+user",
+      "aliases": [],
+      "in_model_catalogue": true,
+      "shadowed_aliases": []
+    },
+    {
+      "name": "forget",
+      "tier": "core",
+      "invocation": "model+user",
+      "aliases": [],
+      "in_model_catalogue": true,
       "shadowed_aliases": []
     }
   ]

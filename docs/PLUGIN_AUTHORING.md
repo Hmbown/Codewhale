@@ -232,6 +232,27 @@ python3 scripts/convert-plugin.py --format dsh \
 The DSH input may also be JSON, but must be the plain entry list, not a full
 profile or patch composition. Each row must name `@deepseek-ai/dsh-mcp-client`.
 
+A real dsh bundle package — an npm package whose `package.json` declares
+`dsh.bundle.patch` — converts directly with `--bundle`:
+
+```sh
+python3 scripts/convert-plugin.py --format dsh \
+  --bundle ./node_modules/@demo/tools-dsh --name migrated-dsh --output ./migrated-dsh
+```
+
+The converter reads the package's `cordis.patch.yml`, applies its `insert` and
+keyed-override operations over an empty profile (matching `applyEntryPatches`),
+and converts each resulting row. Rows it cannot represent — runtime plugins,
+`dsh.client` UI code, `!!js` expressions outside the documented idioms,
+conditional `disabled` flags — are listed in `CONVERSION.md` rather than
+silently dropped. The `!!js` idioms it does lower: `process.execPath` (becomes
+`node`), `process.env.NAME` and `process.env.NAME || 'literal'` (resolved
+against this machine), and `` `${process.env.NAME}...` `` templates. An `args`
+entry that resolves to a host file is snapshotted: its containing directory is
+copied into `mcp/<server>` and the resolution is recorded in the receipt. Rows
+of `@deepseek-ai/dsh-skill-filesystem` contribute their `customSkillDirs`
+children as skills when those directories live inside the package.
+
 ### Local Node MCP servers
 
 For an already packaged Node MCP server, select its original process working

@@ -1,11 +1,11 @@
-<!-- source: README.md sha256:a446e3921085 -->
+<!-- source: README.md sha256:29c349b6f2b4 -->
 # Codewhale
 
 Codewhale là tác nhân mã nguồn mở có thể đọc dự án, chỉnh sửa tệp, chạy lệnh và kiểm tra công việc của mình bằng mô hình do nhà cung cấp lưu trữ hoặc mô hình cục bộ mà bạn chọn. Hãy bắt đầu với một tác vụ trong terminal. Với công việc lớn hơn, bạn có thể giao từng phần cho các tác nhân dùng mô hình và đảm nhiệm vai trò khác nhau.
 
-![Codewhale đang chạy trong terminal](web/public/codewhale-tui-171acee.png)
+![Codewhale đang chạy trong terminal](web/public/codewhale-tui-d7a9a1c.png)
 
-*Hình xem trước terminal từ bản dựng phát triển v0.9.12.*
+*Hình xem trước terminal từ bản dựng phát triển v0.10.0.*
 
 [English](README.md) · [简体中文](README.zh-CN.md) · [日本語](README.ja-JP.md) · [Bahasa Indonesia](README.id.md) · [한국어](README.ko-KR.md) · [Español](README.es-419.md) · [Português](README.pt-BR.md) · [Русский](README.ru.md) · [Українська](README.uk.md) · [Français](README.fr.md) · [Deutsch](README.de.md) · [繁體中文](README.zh-TW.md) · [हिन्दी](README.hi.md) · [Türkçe](README.tr.md) · [Italiano](README.it.md) · [Polski](README.pl.md) · [العربية](README.ar.md) · [Català](README.ca.md)
 
@@ -53,7 +53,7 @@ Terminal và các ứng dụng khách đồ họa kết nối với Codewhale Ru
 
 - **Terminal:** `codewhale` mở giao diện tương tác; `codewhale exec` chạy tác vụ từ tập lệnh hoặc công việc CI.
 - **Trình duyệt cục bộ:** `codewhale web` mở [ứng dụng web cục bộ](docs/WEB.md) đi kèm, dùng cùng Runtime.
-- **Ứng dụng web và máy tính để bàn Codewhale:** các môi trường làm việc đồ họa đang được phát triển. Thông tin về khả năng sử dụng được liệt kê trên [trang sản phẩm](https://codewhale.net/en/product).
+- **Ứng dụng máy tính để bàn Codewhale (GPUI):** ứng dụng máy tính để bàn gốc GPUI là định hướng client sản phẩm (quyết định ngày 2026-09-14; bản đồ giai đoạn nằm trong docs/TRANSITION.md ở repo riêng tư codehwhale-gpui). Ứng dụng web lưu trữ tại app.codewhale.net sẽ ngừng theo từng giai đoạn; trang marketing, đăng nhập, thanh toán, pháp lý và tải xuống vẫn ở trên web vĩnh viễn. Thông tin về khả năng sử dụng được liệt kê trên [trang sản phẩm](https://codewhale.net/en/product).
 
 **Computer Use bổ sung công cụ để quan sát và tương tác với các ứng dụng khác.** Plugin này có trong mã nguồn hiện tại. Hãy xem xét quyền truy cập được yêu cầu và bật plugin trước khi sử dụng; các yêu cầu về quyền của hệ điều hành và nền tảng vẫn được áp dụng. Xem [hướng dẫn Computer Use](crates/tui/plugins/computer-use/README.md) đi kèm và [thiết lập plugin](docs/PLUGINS.md).
 

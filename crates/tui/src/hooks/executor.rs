@@ -76,7 +76,6 @@ impl HookContext {
         Self::default()
     }
 
-    #[allow(dead_code)] // Public builder API, used in tests
     pub fn with_tool_name(mut self, name: &str) -> Self {
         self.tool_name = Some(name.to_string());
         self
@@ -87,7 +86,6 @@ impl HookContext {
         self
     }
 
-    #[allow(dead_code)] // Public builder API
     pub fn with_tool_args(mut self, args: &serde_json::Value) -> Self {
         self.tool_args = Some(truncate_env_value(
             &args.to_string(),
@@ -96,7 +94,6 @@ impl HookContext {
         self
     }
 
-    #[allow(dead_code)] // Public builder API
     pub fn with_tool_result(mut self, result: &str, success: bool, exit_code: Option<i64>) -> Self {
         self.tool_result = Some(truncate_env_value(
             result,
@@ -107,7 +104,6 @@ impl HookContext {
         self
     }
 
-    #[allow(dead_code)] // Public builder API, used in tests
     pub fn with_mode(mut self, mode: &str) -> Self {
         self.mode = Some(mode.to_string());
         self
@@ -118,7 +114,6 @@ impl HookContext {
         self
     }
 
-    #[allow(dead_code)] // Public builder API, used in tests
     pub fn with_workspace(mut self, path: PathBuf) -> Self {
         self.workspace = Some(path);
         self
@@ -134,13 +129,11 @@ impl HookContext {
         self
     }
 
-    #[allow(dead_code)] // Public builder API
     pub fn with_message(mut self, message: &str) -> Self {
         self.message = Some(message.to_string());
         self
     }
 
-    #[allow(dead_code)] // Public builder API
     pub fn with_error(mut self, error: &str) -> Self {
         self.error_message = Some(truncate_env_value(error, HOOK_ERROR_CONTEXT_MAX_BYTES));
         self
@@ -148,12 +141,6 @@ impl HookContext {
 
     pub fn with_tokens(mut self, tokens: u32) -> Self {
         self.total_tokens = Some(tokens);
-        self
-    }
-
-    #[allow(dead_code)] // Public builder API
-    pub fn with_cost(mut self, cost: f64) -> Self {
-        self.session_cost = Some(cost);
         self
     }
 
@@ -281,7 +268,6 @@ fn truncate_env_value(value: &str, max_bytes: usize) -> String {
 
 /// Result of a hook execution
 #[derive(Debug, Clone, Default)]
-#[allow(dead_code)] // Fields are part of public API for hook consumers
 pub struct HookResult {
     /// Hook name (if specified)
     pub name: Option<String>,
@@ -310,6 +296,7 @@ pub struct HookResult {
     /// Standard output
     pub stdout: String,
     /// Standard error
+    #[allow(dead_code)] // written by prod constructors, read only in tests
     pub stderr: String,
     /// Time taken to execute
     pub duration: Duration,
@@ -950,6 +937,7 @@ impl HookProcessTree {
     fn terminate(&self, child: &mut Child) {
         #[cfg(unix)]
         {
+            // SAFETY: kill(2) dereferences no pointers.
             let result = unsafe { libc::kill(-self.pgid, libc::SIGKILL) };
             if result != 0 {
                 let error = std::io::Error::last_os_error();
@@ -985,6 +973,7 @@ impl HookProcessTree {
 impl Drop for HookProcessTree {
     fn drop(&mut self) {
         #[cfg(unix)]
+        // SAFETY: kill(2) dereferences no pointers.
         unsafe {
             // The shell may have exited while one of its descendants still
             // holds a captured pipe. Reaping the process group keeps hook
@@ -1004,11 +993,13 @@ struct WindowsHookJob {
 #[cfg(windows)]
 impl WindowsHookJob {
     fn attach(child: &Child) -> std::io::Result<Self> {
+        // SAFETY: returned handle is owned by the new wrapper.
         let handle = unsafe { CreateJobObjectW(None, PCWSTR::null()).map_err(windows_io_error)? };
         let job = Self { handle };
         let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
         limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
 
+        // SAFETY: `limits` is live with matching size; both handles are live.
         unsafe {
             SetInformationJobObject(
                 job.handle,
@@ -1024,6 +1015,7 @@ impl WindowsHookJob {
     }
 
     fn terminate(&self) -> std::io::Result<()> {
+        // SAFETY: `self.handle` is a live owned job handle.
         unsafe { TerminateJobObject(self.handle, 1).map_err(windows_io_error) }
     }
 }
@@ -1031,6 +1023,7 @@ impl WindowsHookJob {
 #[cfg(windows)]
 impl Drop for WindowsHookJob {
     fn drop(&mut self) {
+        // SAFETY: `self.handle` is owned here; Drop runs once.
         unsafe {
             let _ = CloseHandle(self.handle);
         }
@@ -1045,21 +1038,26 @@ fn windows_io_error(error: windows::core::Error) -> std::io::Error {
 #[cfg(windows)]
 fn resume_windows_process(child: &Child) -> std::io::Result<()> {
     let snapshot =
+        // SAFETY: returned handle is owned here; closed before return.
         unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0).map_err(windows_io_error)? };
     let result = (|| {
         let mut entry = THREADENTRY32 {
             dwSize: std::mem::size_of::<THREADENTRY32>() as u32,
             ..Default::default()
         };
+        // SAFETY: `entry` is live with dwSize initialized above.
         let mut next = unsafe { Thread32First(snapshot, &mut entry) };
         let mut resumed = 0usize;
         while next.is_ok() {
             if entry.th32OwnerProcessID == child.id() {
+                // SAFETY: returned handle is owned here; closed below.
                 let thread = unsafe {
                     OpenThread(THREAD_SUSPEND_RESUME, false, entry.th32ThreadID)
                         .map_err(windows_io_error)?
                 };
+                // SAFETY: `thread` is a live owned handle.
                 let resume_result = unsafe { ResumeThread(thread) };
+                // SAFETY: `thread` is owned here and not used after.
                 let close_result = unsafe { CloseHandle(thread).map_err(windows_io_error) };
                 if resume_result == u32::MAX {
                     return Err(std::io::Error::last_os_error());
@@ -1067,6 +1065,7 @@ fn resume_windows_process(child: &Child) -> std::io::Result<()> {
                 close_result?;
                 resumed += 1;
             }
+            // SAFETY: `entry` is live with dwSize initialized above.
             next = unsafe { Thread32Next(snapshot, &mut entry) };
         }
         if resumed == 0 {
@@ -1076,6 +1075,7 @@ fn resume_windows_process(child: &Child) -> std::io::Result<()> {
         }
         Ok(())
     })();
+    // SAFETY: `snapshot` is owned here and not used after.
     let close_result = unsafe { CloseHandle(snapshot).map_err(windows_io_error) };
     result?;
     close_result
@@ -1594,7 +1594,7 @@ impl HookExecutor {
     }
 
     /// Create a disabled `HookExecutor` (no hooks will run)
-    #[allow(dead_code)] // Used in tests and as convenience constructor
+    #[cfg(test)]
     pub fn disabled() -> Self {
         Self {
             config: HooksConfig {
@@ -1611,7 +1611,7 @@ impl HookExecutor {
     }
 
     /// Check if hooks are enabled
-    #[allow(dead_code)] // Public API for hook system consumers
+    #[cfg(test)]
     pub fn is_enabled(&self) -> bool {
         self.config.enabled
     }
@@ -2059,11 +2059,11 @@ impl HookExecutor {
         if !pattern.contains('*') {
             return tool_name == pattern;
         }
-        // Escape regex metacharacters except `*`, which becomes `.*`.
-        let escaped = regex::escape(pattern);
-        let regex_pattern = escaped.replace(r"\*", ".*");
-        let anchored = format!("^{regex_pattern}$");
-        regex::Regex::new(&anchored).is_ok_and(|re| re.is_match(tool_name))
+        // #6208: the pattern is fixed by configuration while this runs once per
+        // hook per tool-call/stop event, so compile it once and reuse it rather
+        // than building a fresh `Regex` on every event.
+        codewhale_execpolicy::matcher::compiled_glob(pattern)
+            .is_some_and(|re| re.is_match(tool_name))
     }
 
     /// Check if a hook's condition matches the context
@@ -5882,6 +5882,10 @@ command = "echo project"
             ("create_goal", "other"),
             ("get_goal", "other"),
             ("update_goal", "other"),
+            // Reads the skill registry, not caller-named paths, so it keeps
+            // the classification it already had as a deferred tool. Making it
+            // eager must not silently re-gate it.
+            ("load_skill", "other"),
         ];
         for name in crate::core::engine::tool_catalog::DEFAULT_ACTIVE_NATIVE_TOOLS {
             let expected = EXPECTED.iter().find(|(n, _)| n == name).map(|(_, c)| *c);

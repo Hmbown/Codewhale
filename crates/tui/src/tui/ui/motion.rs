@@ -165,7 +165,17 @@ pub(crate) fn status_animation_interval_ms(app: &App) -> u64 {
     }
 }
 
-pub(crate) fn underwater_animation_interval_ms(app: &App) -> u64 {
+/// Tick interval for the water. `tier` is the draw cadence the frame limiter
+/// enforces this frame: while only ambience moves, the tick lands exactly on
+/// the atmosphere interval the limiter will draw at, so no wake asks for a
+/// frame the limiter then holds. While a turn streams or the user types, the
+/// limiter runs at the interactive cap and the authored ocean cadence rides
+/// inside it unchanged.
+pub(crate) fn underwater_animation_interval_ms(
+    app: &App,
+    tier: crate::tui::display_refresh::DrawCadenceTier,
+) -> u64 {
+    use crate::tui::display_refresh::DrawCadenceTier;
     if app.effective_low_motion_for_status() || app.low_motion {
         crate::tui::display_refresh::adaptive_animation_interval_ms(true)
     } else if app.constrained_frame_rate {
@@ -175,8 +185,11 @@ pub(crate) fn underwater_animation_interval_ms(app: &App) -> u64 {
     } else {
         // Measured display Hz can raise atmosphere cadence on high-Hz
         // panels; missing probe falls back to the ~8 fps floor.
-        crate::tui::display_refresh::adaptive_animation_interval_ms(false)
-            .min(UI_UNDERWATER_ANIMATION_MS)
+        let atmosphere = crate::tui::display_refresh::adaptive_animation_interval_ms(false);
+        match tier {
+            DrawCadenceTier::Atmosphere => atmosphere,
+            DrawCadenceTier::Interactive => atmosphere.min(UI_UNDERWATER_ANIMATION_MS),
+        }
     }
 }
 
@@ -209,8 +222,9 @@ pub(crate) fn animation_interval_ms(
     app: &App,
     status_motion: bool,
     underwater_motion: bool,
+    tier: crate::tui::display_refresh::DrawCadenceTier,
 ) -> u64 {
-    let underwater = underwater_animation_interval_ms(app);
+    let underwater = underwater_animation_interval_ms(app, tier);
     match (status_motion, underwater_motion) {
         (true, true) => status_animation_interval_ms(app).min(underwater),
         (true, false) => status_animation_interval_ms(app),

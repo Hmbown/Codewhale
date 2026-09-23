@@ -6,7 +6,7 @@ import path from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
 import zlib from 'node:zlib';
 import crypto from 'node:crypto';
-import { create } from '../src/backends/darwin.mjs';
+import { create, leaseVerdict, leaseAccounting } from '../src/backends/darwin.mjs';
 import { withSignal, currentSignal, runInputLease } from '../src/exec.mjs';
 
 // Simulate the native lease process: it owns cleanup itself, keeping the
@@ -14,7 +14,7 @@ import { withSignal, currentSignal, runInputLease } from '../src/exec.mjs';
 function leaseExecutor(run) {
   return { async run(cmd,args,opts) {
     const result=await run(cmd,args,opts);
-    if(args[0]?.startsWith('{') && JSON.parse(args[0]).tool==='input_capabilities' && result.code===0 && JSON.parse(result.stdout).input_lease===undefined) return {code:0,stderr:'',stdout:JSON.stringify({input_lease:1})};
+    if(args[0]?.startsWith('{') && JSON.parse(args[0]).tool==='input_capabilities' && result.code===0 && JSON.parse(result.stdout).input_lease===undefined) return {code:0,stderr:'',stdout:JSON.stringify({input_lease:1,background_focus_guard:1})};
     return result;
   }, async runInputLease(cmd, argv) {
     const request = JSON.parse(argv[0]);
@@ -43,13 +43,25 @@ test('native summary keeps text and top-level menus without spending the UI budg
   const build=spawnSync('clang',['-DCU_TEST=1','-fobjc-arc','-Os','-framework','Cocoa','-framework','ApplicationServices','-framework','ScreenCaptureKit','-framework','AVFoundation','-framework','CoreMedia','-framework','Vision','src/backends/darwin-accessibility.m','-o',binary],{encoding:'utf8'});
   assert.equal(build.status,0,build.stderr);
 
+  for (const tool of ['bg_key','bg_pointer','pointer_sequence','inspect_focus_control']) {
+    const r=spawnSync(binary,[JSON.stringify({tool,args:{app_scoped:true,foreground_input:false}})],{encoding:'utf8'});
+    assert.equal(r.status,1);
+    assert.match(r.stderr,/background_focus_required/);
+  }
+  const consented=spawnSync(binary,[JSON.stringify({tool:'inspect_focus_control',args:{foreground_input:true}})],{encoding:'utf8'});
+  assert.equal(consented.status,0,consented.stderr);
+
   for(const [element,context,action] of [
     [{AXRole:'AXTextField',actions:['AXPress'],settable:['AXFocused']},false,'AXFocused'],
     [{AXRole:'AXRow',settable:['AXSelected']},false,'AXSelected'],
     [{AXRole:'AXMenuItem',actions:['AXPick']},false,'AXPick'],
     [{AXRole:'AXButton',actions:['AXShowMenu']},true,'AXShowMenu'],
     [{AXRole:'AXButton',AXEnabled:false,actions:['AXPress']},false,null],
+    // Focusing anything but a text-entry role is not a click; the caller
+    // falls back to real delivery.
     [{AXRole:'AXGroup',settable:['AXFocused']},false,null],
+    [{AXRole:'AXSearchField',settable:['AXFocused']},false,'AXFocused'],
+    [{AXRole:'AXGroup',settable:['AXFocused','AXSelectedText']},false,null],
   ]) {
     const r=spawnSync(binary,[JSON.stringify({tool:'inspect_click_action',args:{element,context}})],{encoding:'utf8'});
     assert.equal(r.status,0,r.stderr);
@@ -176,8 +188,8 @@ test('macOS backend binds native input to the opened process and reports denied 
     const request=JSON.parse(args[0]);calls.push(request);
     return {code:0,stderr:'',stdout:JSON.stringify(request.tool==='app_info'?{found:true,pid:123,bundle_id:'test.app'}:request.tool==='permissions'?{trusted:false}:{action_sent:true})};
   })});
-  await backend.open_application({name:'TextEdit',activate:false});await backend.key({text:'cmd+n'});await backend.type({text:'Hello 世界 🐋'});
-  const events=calls.filter(c=>c.tool==='key_event');assert.equal(events.length,2);assert.equal(events[0].args.code,45);assert.equal(events[0].args.flags,1<<20);assert.equal(events[0].args.input_app_ref.pid,123);assert.equal(events[1].args.down,false);
+  await backend.open_application({name:'TextEdit',activate:false});await backend.key({text:'return'});await backend.type({text:'Hello 世界 🐋'});
+  const events=calls.filter(c=>c.tool==='key_event');assert.equal(events.length,2);assert.equal(events[0].args.code,36);assert.equal(events[0].args.flags,0);assert.equal(events[0].args.input_app_ref.pid,123);assert.equal(events[1].args.down,false);
   assert.equal(calls.find(c=>c.tool==='type').args.text,'Hello 世界 🐋');
   const probe=await backend.probe();assert.equal(probe.permissions.accessibility,'denied');assert.equal(probe.capabilities.raw_input,false);assert.equal(probe.capabilities.screenshot,false);
 });
@@ -235,6 +247,19 @@ function stubBackend(t, reply) {
 }
 
 const PRESSABLE = { found: true, element: { role: 'AXButton', label: 'Tab B', actions: ['AXPress'] }, action: 'AXPress', action_sent: true };
+
+test('busy native input keeps its typed refusal through ordinary and held-input routes', async t => {
+  const { backend } = stubBackend(t, r => {
+    if (r.tool === 'input_capabilities') return { input_lease: 1, background_focus_guard: 1 };
+    if (r.tool === 'type' || r.tool === 'key_event') return { nativeResult: {
+      code: 1, stdout: '', stderr: 'user_busy: no quiet input window became available; no input was sent.',
+    } };
+    return null;
+  });
+  await backend.open_application({ name: 'Fixture' });
+  await assert.rejects(backend.type({ text: 'hello' }), { code: 'user_busy' });
+  await assert.rejects(backend.key({ text: 'a' }), { code: 'user_busy' });
+});
 const NOT_PRESSABLE = { found: false, reason: 'no_pressable_element' };
 const FILES_TARGET = { type:'element', app_ref:{pid:321,bundle_id:'test.app'}, windowIndex:0, path:[0,4,2],
   role:'AXMenuItem', label:'Files', x:1607, y:692 };
@@ -284,8 +309,65 @@ test('macOS failed activation cannot leave a previous shared-desktop binding arm
   assert.ok(!calls.some(r=>r.tool==='pointer_sequence'));
 });
 
+test('macOS lease verdict flags hardware input inside the borrow window only', () => {
+  const base = { front_lease: true, lease_ms: 120, idle_before_s: 5.0 };
+  assert.equal(leaseVerdict({ ...base, idle_after_s: 5.12 }), false);
+  assert.equal(leaseVerdict({ ...base, idle_after_s: 0.05 }), true);
+  assert.equal(leaseVerdict({ ...base, idle_after_s: 5.12 - 0.24 }), false);
+  assert.equal(leaseVerdict({ front_lease: false, lease_ms: 120, idle_before_s: 5, idle_after_s: 0.01 }), null);
+  assert.equal(leaseVerdict({ front_lease: true, lease_ms: 120 }), null);
+  assert.equal(leaseVerdict(null), null);
+  const threaded = leaseAccounting({ ...base, idle_after_s: 0.05, user_input_during_lease: true });
+  assert.deepEqual(threaded, { lease_ms: 120, idle_before_s: 5.0, idle_after_s: 0.05, user_input_during_lease: true });
+  assert.deepEqual(leaseAccounting({ front_lease: true }), {});
+  assert.deepEqual(leaseAccounting({ front_lease: false }), {});
+});
+
+test('background key focus is refused even when an older helper advertises window records', async t => {
+  const { backend, calls } = stubBackend(t, r => r.tool === 'input_capabilities' ? { input_lease: 1, window_record: 1 } : null);
+  for (const args of [{text:'cmd+w'}, {text:'return',target:{type:'element',index:1}}]) {
+    await assert.rejects(backend.key(args), {code:'background_focus_required'});
+  }
+  assert.ok(!calls.some(r => ['bg_key','key_event'].includes(r.tool)));
+});
+
+test('macOS open_application reports launched only when it actually launched the app', async t => {
+  const bundle=fs.mkdtempSync(path.join(os.tmpdir(),'cu-launch-flag-'));
+  const old=process.env.CODEWHALE_CU_APP_BUNDLE;
+  t.after(()=>{ if(old===undefined) delete process.env.CODEWHALE_CU_APP_BUNDLE; else process.env.CODEWHALE_CU_APP_BUNDLE=old; fs.rmSync(bundle,{recursive:true,force:true}); });
+  fs.mkdirSync(path.join(bundle,'Contents','MacOS'),{recursive:true});
+  fs.writeFileSync(path.join(bundle,'Contents','MacOS','accessibility'),'');
+  process.env.CODEWHALE_CU_APP_BUNDLE=bundle;
+  let running=true;
+  const opens=[];
+  const backend=create({exec:{run:async(cmd,args)=>{
+    if(cmd==='open'){ opens.push(args); running=true; return {code:0,stderr:'',stdout:''}; }
+    const request=JSON.parse(args[0]);
+    if(request.tool==='app_info'){
+      if(!running) return {code:1,stderr:'application not found',stdout:''};
+      return {code:0,stderr:'',stdout:JSON.stringify({found:true,pid:321,name:'Fixture',bundle_id:'test.app',frontmost:false})};
+    }
+    return {code:0,stderr:'',stdout:JSON.stringify({action_sent:true})};
+  }}});
+  const rebound=await backend.open_application({name:'Fixture'});
+  assert.equal(rebound.launched,false);
+  assert.equal(opens.length,0);
+  running=false;
+  const fresh=await backend.open_application({name:'Fixture'});
+  assert.equal(fresh.launched,true);
+  assert.equal(opens.length,1);
+  assert.ok(opens[0].includes('-g'),'background launch stays in the background');
+});
+
+test('macOS app-scoped fallback also refuses with an older helper', async t => {
+  const {backend,calls}=stubBackend(t,r=>r.tool==='input_capabilities'?{input_lease:1}:r.tool==='hit_test'?NOT_PRESSABLE:null);
+  await backend.open_application({name:'Fixture'});
+  await assert.rejects(backend.left_click({target:{x:70,y:80},strategy:'app'}),{code:'background_focus_required'});
+  assert.ok(!calls.some(r=>r.tool==='pointer_sequence'));
+});
+
 test('macOS background control never escalates an unavailable semantic action to shared pointer input', async t => {
-  const {backend,calls}=stubBackend(t,r=>r.tool==='input_capabilities'?{input_lease:1,element_identity:1,background_actions:1}:r.tool==='hit_test'?NOT_PRESSABLE:null);
+  const {backend,calls}=stubBackend(t,r=>r.tool==='input_capabilities'?{input_lease:1,element_identity:1,background_actions:1,background_focus_guard:1}:r.tool==='hit_test'?NOT_PRESSABLE:null);
   const binding=await backend.open_application({name:'Fixture'});
   assert.equal(binding.input_scope,'application');
   assert.equal(binding.shared_pointer,false);
@@ -299,8 +381,9 @@ test('macOS background control never escalates an unavailable semantic action to
   ]) await assert.rejects(backend[tool](args),error=>error.code===(tool==='scroll'?'background_scroll_unavailable':'shared_pointer_required'));
   assert.ok(!calls.some(r=>['pointer_sequence','release_input','window_at_point'].includes(r.tool)));
   await backend.type({text:'Background typing'});
-  assert.equal(calls.at(-1).tool,'type');
-  assert.equal(calls.at(-1).args.foreground_input,false);
+  const typed=calls.filter(r=>r.tool==='type');
+  assert.equal(typed.length,1);
+  assert.equal(typed[0].args.foreground_input,false);
 });
 
 test('macOS returning to background stops held-pointer movement while preserving its release', async t => {
@@ -320,7 +403,7 @@ test('macOS returning to background stops held-pointer movement while preserving
 });
 
 test('macOS element click preserves the observed path despite an oversized frame center', async t => {
-  const {backend,calls}=stubBackend(t,r=>r.tool==='input_capabilities'?{input_lease:1,element_identity:1,background_actions:1}:r.tool==='hit_test'?PRESSABLE:null);
+  const {backend,calls}=stubBackend(t,r=>r.tool==='input_capabilities'?{input_lease:1,element_identity:1,background_actions:1,background_focus_guard:1}:r.tool==='hit_test'?PRESSABLE:null);
   await backend.open_application({name:'Fixture'});
   const receipt=await backend.left_click({target:FILES_TARGET});
   assert.equal(receipt.action_sent,true);
@@ -336,7 +419,7 @@ test('macOS element click preserves the observed path despite an oversized frame
 
 for(const reason of ['action is not advertised by this element','element changed label; observe again','window blocked by modal sheet'])
 test(`macOS element click does not fall back after ${reason}`, async t => {
-  const {backend,calls}=stubBackend(t,r=>r.tool==='input_capabilities'?{input_lease:1,element_identity:1,background_actions:1}
+  const {backend,calls}=stubBackend(t,r=>r.tool==='input_capabilities'?{input_lease:1,element_identity:1,background_actions:1,background_focus_guard:1}
     :r.tool==='click_element'?{nativeResult:{code:1,stdout:'',stderr:reason}}:null);
   await backend.open_application({name:'Fixture'});
   await assert.rejects(backend.left_click({target:FILES_TARGET,strategy:'a11y'}),error=>error.message.includes(reason)&&/fresh screenshot or OCR/.test(error.message));
@@ -345,7 +428,7 @@ test(`macOS element click does not fall back after ${reason}`, async t => {
 });
 
 test('macOS ambiguous element press is never retried or converted to pointer input', async t => {
-  const {backend,calls}=stubBackend(t,r=>r.tool==='input_capabilities'?{input_lease:1,element_identity:1,background_actions:1}
+  const {backend,calls}=stubBackend(t,r=>r.tool==='input_capabilities'?{input_lease:1,element_identity:1,background_actions:1,background_focus_guard:1}
     :r.tool==='click_element'?{nativeResult:{code:null,spawned:true,timedOut:true,stdout:'',stderr:''}}:null);
   await backend.open_application({name:'Fixture'});
   await assert.rejects(backend.left_click({target:FILES_TARGET}),error=>error.inputMayHaveBeenSent===true&&/timed out/.test(error.message));
@@ -400,7 +483,7 @@ test('macOS cancellation releases a held key without replaying it', async t => {
     if (request.tool === 'key_event' && request.args.down) controller.abort();
     if (request.tool === 'key_event' && !request.args.down) assert.equal(currentSignal(), null);
   });
-  await backend.open_application({name:'Fixture'});
+  await backend.open_application({name:'Fixture',activate:true});
   await assert.rejects(withSignal(controller.signal, () => backend.hold_key({text:'shift+a', duration:30})), /cancelled/);
   assert.deepEqual(calls.filter(r=>r.tool==='key_event').map(r=>r.args.down), [true,false]);
 });
@@ -426,6 +509,58 @@ test('macOS foreground delivery requires explicit activation and resets on backg
   await backend.open_application({name:'Fixture',activate:false});
   assert.equal((await backend.key({text:'return'})).keyboard_delivery,'process');
   assert.equal(calls.at(-1).args.foreground_input,false);
+});
+
+test('background modifier holds refuse while plain process keys remain available', async t => {
+  const {backend,calls}=stubBackend(t,()=>null);
+  await backend.open_application({name:'Fixture'});
+  await assert.rejects(backend.hold_key({text:'cmd+a',duration:0.05}),{code:'background_focus_required'});
+  assert.ok(!calls.some(c=>['bg_key','key_event'].includes(c.tool)));
+  assert.equal((await backend.key({text:'tab'})).keyboard_delivery,'process');
+  assert.ok(calls.filter(c=>c.tool==='key_event').every(c=>c.args.foreground_input===false));
+});
+
+test('background pointer fallbacks refuse without dispatch or moving focus', async t => {
+  const {backend,calls}=stubBackend(t,r=>r.tool==='input_capabilities'
+    ?{input_lease:1,window_record:1,background_actions:1}:r.tool==='hit_test'?NOT_PRESSABLE:null);
+  await backend.open_application({name:'Fixture'});
+  for (const call of [
+    ()=>backend.left_click({target:{x:20,y:20}}),
+    ()=>backend.left_click({target:{x:20,y:20},strategy:'app'}),
+    ()=>backend.left_click_drag({from_target:{x:20,y:20},to:{x:30,y:30}}),
+    ()=>backend.scroll({target:{x:20,y:20},direction:'down'}),
+  ]) await assert.rejects(call(),{code:'background_focus_required'});
+  assert.ok(!calls.some(c=>['bg_pointer','pointer_sequence'].includes(c.tool)));
+});
+
+test('background web value replacement refuses before focusing or selecting text', async t => {
+  const {backend,calls}=stubBackend(t,r=>r.tool==='set_value'?{nativeResult:{code:1,stderr:'web area refuses direct AXValue'}}:null);
+  await assert.rejects(backend.set_value({target:{type:'element',index:1},value:'replacement'}),{code:'background_focus_required'});
+  assert.ok(!calls.some(c=>['focus_element','bg_key','type'].includes(c.tool)));
+});
+
+test('background typing refuses a helper without the native focus guard', async t => {
+  const {backend,calls}=stubBackend(t,r=>r.tool==='input_capabilities'?{input_lease:1,window_record:1}:null);
+  await assert.rejects(backend.type({text:'Hello 🐋'}),{code:'app_upgrade_required'});
+  assert.ok(!calls.some(c=>c.tool==='type'));
+});
+
+test('macOS input handlers refuse a missing target without dereferencing it', async t => {
+  const {backend,calls}=stubBackend(t,()=>null);
+  await backend.open_application({name:'Fixture'});
+  for (const call of [
+    ()=>backend.left_mouse_down({}),
+    ()=>backend.left_mouse_down(),
+    ()=>backend.mouse_move({}),
+    ()=>backend.left_click({}),
+    ()=>backend.scroll({}),
+    ()=>backend.select_text({}),
+    ()=>backend.set_value({value:'x'}),
+    ()=>backend.perform_action({action:'AXPress'}),
+  ]) {
+    await assert.rejects(call, error=>!(error instanceof TypeError));
+  }
+  assert.ok(!calls.some(c=>['pointer_sequence','bg_pointer','select_text','set_value','perform_action'].includes(c.tool)));
 });
 
 test('macOS foreground refusal never sends an unowned global key-up', async t => {
@@ -533,7 +668,7 @@ test('macOS click strategies: event skips the tree and a11y fails closed', async
   assert.ok(!calls.some((c) => c.tool === 'hit_test'), 'strategy=event never hit-tests');
 
   await assert.rejects(backend.left_click({ target: { x: 10, y: 20 }, strategy: 'a11y' }), /no supported accessibility click/);
-  await assert.rejects(backend.left_click({ target: { x: 10, y: 20 }, strategy: 'sideways' }), /strategy must be auto, a11y or event/);
+  await assert.rejects(backend.left_click({ target: { x: 10, y: 20 }, strategy: 'sideways' }), /strategy must be auto, a11y, app or event/);
 
   calls.length = 0;
   const dbl = await backend.double_click({ target: { x: 10, y: 20 } });
@@ -578,7 +713,7 @@ test('native type verifies delivery against the focused control and fails closed
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cu-type-native-'));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const binary = path.join(dir, 'native');
-  const build = spawnSync('clang', ['-DCU_TEST=1', '-fobjc-arc', '-Os', '-framework', 'Cocoa', '-framework', 'ApplicationServices', '-framework', 'ScreenCaptureKit', '-framework', 'AVFoundation', '-framework', 'CoreMedia', '-framework', 'Vision', 'src/backends/darwin-accessibility.m', '-o', binary], { encoding: 'utf8' });
+  const build = spawnSync('clang', ['-DCU_TEST=1', '-ftrivial-auto-var-init=pattern', '-fobjc-arc', '-Os', '-framework', 'Cocoa', '-framework', 'ApplicationServices', '-framework', 'ScreenCaptureKit', '-framework', 'AVFoundation', '-framework', 'CoreMedia', '-framework', 'Vision', 'src/backends/darwin-accessibility.m', '-o', binary], { encoding: 'utf8' });
   assert.equal(build.status, 0, build.stderr);
   const type = (args) => spawnSync(binary, [JSON.stringify({ tool: 'inspect_type', args })], { encoding: 'utf8' });
 
@@ -609,14 +744,216 @@ test('native type verifies delivery against the focused control and fails closed
     assert.equal(receipt.verified, false);
     assert.equal(receipt.verification_required, 'screenshot');
   }
-  assert.equal(JSON.parse(type({ text: 'hi', focused: null }).stdout).focused_role, null);
+  const unleased = JSON.parse(type({ text: 'hi', focused: null }).stdout);
+  assert.equal(unleased.focused_role, null);
+  for (const field of ['front_restored', 'lease_ms', 'idle_before_s', 'idle_after_s']) {
+    assert.ok(!(field in unleased), `${field} must not be invented for typing without a lease`);
+  }
+
+  // Exercise the real wait with a deterministic HID clock, without posting
+  // input. Reuse this native build; cancellation and a busy deadline refuse.
+  const yieldToUser = (args) => spawnSync(binary, [JSON.stringify({ tool: 'inspect_user_yield',
+    args: { yield_gap_ms: 450, yield_wait_ms: 60, ...args } })], { encoding: 'utf8' });
+  const idle = yieldToUser({ idle_seconds: 1 });
+  assert.equal(idle.status, 0, idle.stderr);
+  assert.ok(Number.isFinite(JSON.parse(idle.stdout).yield_ms));
+  for (const idle_seconds of [0, -1]) {
+    const busy = yieldToUser({ idle_seconds });
+    assert.equal(busy.status, 1, 'busy or unavailable HID clock must refuse');
+    assert.match(busy.stderr, /^user_busy:.*no input was sent/);
+    assert.equal(busy.stdout, '');
+  }
+  const cancelled = yieldToUser({ idle_seconds: 0, cancelled: true });
+  assert.equal(cancelled.status, 1);
+  assert.match(cancelled.stderr, /computer request cancelled/);
+  assert.equal(JSON.parse(yieldToUser({ idle_seconds: 0, yield_gap_ms: 0 }).stdout).yield_ms, 0);
+
 });
 
 test('macOS type passes the native verification receipt through untouched', async (t) => {
   const nativeReceipt = { action_sent: true, chars: 5, strategy: 'unicode-events', keyboard_delivery: 'process', verified: false, focused_role: null, verification_required: 'screenshot' };
   const { backend } = stubBackend(t, (r) => (r.tool === 'type' ? nativeReceipt : null));
   await backend.open_application({ name: 'TextEdit' });
-  assert.deepEqual(await backend.type({ text: 'hello' }), nativeReceipt);
+  const { preview_error, ...receipt } = await backend.type({ text: 'hello' });
+  assert.deepEqual(receipt, nativeReceipt);
+  assert.ok(preview_error, 'preview refresh failure is reported, not swallowed');
+});
+
+// ---------- dogfood 2026-09-17: app_not_found, live preview, sessions, kill ----------
+
+const nap = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+function withEnv(t, vars) {
+  const old = {};
+  for (const [k, v] of Object.entries(vars)) {
+    old[k] = process.env[k];
+    if (v === undefined) delete process.env[k]; else process.env[k] = v;
+  }
+  t.after(() => { for (const [k, v] of Object.entries(old)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; } });
+}
+
+function fakeBundle(t) {
+  const bundle = fs.mkdtempSync(path.join(os.tmpdir(), 'cu-fake-bundle-'));
+  t.after(() => fs.rmSync(bundle, { recursive: true, force: true }));
+  fs.mkdirSync(path.join(bundle, 'Contents', 'MacOS'), { recursive: true });
+  fs.writeFileSync(path.join(bundle, 'Contents', 'MacOS', 'accessibility'), '');
+  return bundle;
+}
+
+test('open_application on an unknown name, bundle or pid fails as app_not_found', async (t) => {
+  withEnv(t, { CODEWHALE_CU_APP_BUNDLE: fakeBundle(t) });
+  const backend = create({ exec: {
+    async run(cmd, args) {
+      if (cmd === 'open') {
+        const stderr = args.includes('-b')
+          ? 'LSCopyApplicationURLsForBundleIdentifier() failed while trying to determine the application with bundle identifier com.nonexistent.app.'
+          : "Unable to find application named 'NoSuchAppZZZ'";
+        return { code: 1, stderr, stdout: '' };
+      }
+      const request = JSON.parse(args[0]);
+      if (request.tool === 'app_info') {
+        const pid = request.args?.app_ref?.pid;
+        return pid
+          ? { code: 1, stderr: `no running application with pid ${pid}`, stdout: '' }
+          : { code: 1, stderr: 'application not found', stdout: '' };
+      }
+      return { code: 0, stderr: '', stdout: '{}' };
+    },
+    async runInputLease() { throw new Error('not used'); },
+  } });
+  await assert.rejects(backend.open_application({ name: 'NoSuchAppZZZ' }),
+    (e) => e.code === 'app_not_found' && /open failed: Unable to find application/.test(e.message),
+    'a name that resolves nowhere is app_not_found, not tool_error');
+  await assert.rejects(backend.open_application({ bundle_id: 'com.nonexistent.app' }),
+    (e) => e.code === 'app_not_found', 'a bundle id that resolves nowhere is app_not_found');
+  await assert.rejects(backend.open_application({ pid: 999999 }),
+    (e) => e.code === 'app_not_found', 'a dead pid is app_not_found');
+});
+
+test('preview goes live after a real capture; mute and session close tear it down', async (t) => {
+  withEnv(t, {
+    CODEWHALE_CU_APP_BUNDLE: fakeBundle(t),
+    CODEWHALE_CU_STATE_DIR: fs.mkdtempSync(path.join(os.tmpdir(), 'cu-preview-state-')),
+    CODEWHALE_CU_PREVIEW_REFRESH_MS: '60',
+  });
+  const calls = [];
+  const backend = create({ exec: {
+    async run(cmd, args) {
+      if (cmd === 'screencapture') {
+        fs.writeFileSync(args[args.length - 1], 'png');
+        calls.push({ tool: 'screencapture' });
+        return { code: 0, stderr: '', stdout: '' };
+      }
+      const request = JSON.parse(args[0]);
+      calls.push(request);
+      const body = request.tool === 'app_info' ? { found: true, pid: 123, bundle_id: 'test.app', name: 'TextEdit' }
+        : request.tool === 'window_info' ? { window_id: 9, name: 'TextEdit', points: { x: 0, y: 0, w: 100, h: 100 } }
+        : request.tool === 'cursor_position' ? { x: 1, y: 2 }
+        : { updated: true };
+      return { code: 0, stderr: '', stdout: JSON.stringify(body) };
+    },
+    async runInputLease() { throw new Error('not used'); },
+  } });
+  const captures = () => calls.filter((c) => c.tool === 'window_info').length;
+
+  await backend.open_application({ name: 'TextEdit' });
+  await nap(400);
+  const live = captures();
+  assert.ok(live >= 2, `the panel refreshes on a timer while bound (${live} captures)`);
+  assert.ok(calls.some((c) => c.tool === 'preview_notify' && c.args?.enabled === true), 'binding shows the panel');
+
+  await backend.preview({ enabled: false });
+  assert.ok(calls.some((c) => c.tool === 'preview_notify' && c.args?.enabled === false), 'mute hides the panel');
+  const muted = captures();
+  await nap(300);
+  assert.equal(captures(), muted, 'muting stops the refresh loop');
+
+  await backend.preview({ enabled: true });
+  await nap(300);
+  assert.ok(captures() > muted, 're-enabling restarts the loop');
+
+  await backend.closeSession();
+  assert.equal(calls.at(-1).tool, 'preview_notify');
+  assert.equal(calls.at(-1).args.enabled, false, 'session close hides the panel it showed');
+  const closed = captures();
+  await nap(300);
+  assert.equal(captures(), closed, 'session close stops the loop');
+});
+
+test('CODEWHALE_CU_PREVIEW_REFRESH_MS=0 keeps the panel a single frame', async (t) => {
+  withEnv(t, {
+    CODEWHALE_CU_APP_BUNDLE: fakeBundle(t),
+    CODEWHALE_CU_STATE_DIR: fs.mkdtempSync(path.join(os.tmpdir(), 'cu-preview-off-')),
+    CODEWHALE_CU_PREVIEW_REFRESH_MS: '0',
+  });
+  const calls = [];
+  const backend = create({ exec: {
+    async run(cmd, args) {
+      if (cmd === 'screencapture') { fs.writeFileSync(args[args.length - 1], 'png'); return { code: 0, stderr: '', stdout: '' }; }
+      const request = JSON.parse(args[0]);
+      calls.push(request);
+      const body = request.tool === 'app_info' ? { found: true, pid: 123, bundle_id: 'test.app', name: 'TextEdit' }
+        : request.tool === 'window_info' ? { window_id: 9, name: 'TextEdit', points: { x: 0, y: 0, w: 10, h: 10 } }
+        : request.tool === 'cursor_position' ? { x: 0, y: 0 }
+        : { updated: true };
+      return { code: 0, stderr: '', stdout: JSON.stringify(body) };
+    },
+    async runInputLease() { throw new Error('not used'); },
+  } });
+  await backend.open_application({ name: 'TextEdit' });
+  await nap(350);
+  assert.equal(calls.filter((c) => c.tool === 'window_info').length, 1, 'exactly the bind capture, no timer');
+});
+
+test('list_sessions in direct mode reports this process as the only session', async (t) => {
+  const { backend } = stubBackend(t, (r) => (r.tool === 'app_info' ? { found: true, pid: 321, bundle_id: 'test.app', name: 'TextEdit' } : null));
+  assert.equal((await backend.list_sessions()).sessions[0].target, null, 'unbound direct session has no target');
+  await backend.open_application({ name: 'TextEdit' });
+  const s = await backend.list_sessions();
+  assert.equal(s.via, 'direct');
+  assert.equal(s.count, 1);
+  assert.deepEqual(s.sessions[0].target, { pid: 321, bundle_id: 'test.app', name: 'TextEdit' });
+  assert.equal(s.sessions[0].mode, 'background');
+  assert.equal(s.sessions[0].inputHeld, false);
+});
+
+test('list_apps {installed:true} returns the installed catalog with running flags', async (t) => {
+  const catalog = { apps: [{ name: 'Safari', bundle_id: 'com.apple.Safari', path: '/Applications/Safari.app', running: true, pid: 42 }, { name: 'Calculator', bundle_id: 'com.apple.calculator', path: '/System/Applications/Calculator.app', running: false }], count: 2 };
+  const { backend, calls } = stubBackend(t, (r) => (r.tool === 'installed_apps' ? catalog : null));
+  const r = await backend.list_apps({ installed: true });
+  assert.equal(r.installed, true);
+  assert.equal(r.apps.length, 2);
+  assert.equal(r.apps[0].running, true);
+  assert.equal(r.apps[1].running, false);
+  assert.match(r.note, /takes a moment/);
+  assert.ok(calls.some((c) => c.tool === 'installed_apps'));
+  assert.ok(!calls.some((c) => c.tool === 'list_apps'), 'the running-process list is not consulted');
+});
+
+test('set_window_frame validates geometry and the window index, then passes the readback through', async (t) => {
+  const receipt = { action_sent: true, window_id: 0, before: { x: 0, y: 0, w: 100, h: 100 }, after: { x: 40, y: 40, w: 300, h: 200 }, verified: true };
+  const { backend, calls } = stubBackend(t, (r) => (r.tool === 'set_window_frame' ? receipt : null));
+  await assert.rejects(backend.set_window_frame({ window_id: 0, frame: { x: 1, y: 2, w: 0, h: 5 } }), (e) => e.code === 'bad_args');
+  await assert.rejects(backend.set_window_frame({ window_id: -1, frame: { x: 1, y: 2, w: 3, h: 5 } }), (e) => e.code === 'bad_args');
+  await assert.rejects(backend.set_window_frame({ window_id: 0, frame: { x: 1, y: 2, w: Number.NaN, h: 5 } }), (e) => e.code === 'bad_args');
+  const r = await backend.set_window_frame({ window_id: 0, frame: { x: 40, y: 40, w: 300, h: 200 } });
+  assert.equal(r.verified, true);
+  assert.deepEqual(r.after, { x: 40, y: 40, w: 300, h: 200 });
+  const sent = calls.filter((c) => c.tool === 'set_window_frame').at(-1);
+  assert.deepEqual(sent.args.frame, { x: 40, y: 40, w: 300, h: 200 });
+  assert.equal(sent.args.window_id, 0);
+});
+
+test('kill_app validates its identity client-side and passes the native receipt through', async (t) => {
+  const receipt = { killed: true, pid: 321, name: 'TextEdit', force_used: false };
+  const { backend, calls } = stubBackend(t, (r) => (r.tool === 'kill_app' ? receipt : null));
+  await assert.rejects(backend.kill_app({}), (e) => e.code === 'bad_args', 'an identity is required');
+  assert.deepEqual(await backend.kill_app({ pid: 321 }), receipt);
+  const sent = calls.filter((c) => c.tool === 'kill_app').at(-1);
+  assert.equal(sent.args.pid, 321);
+  assert.equal(sent.args.force, false, 'force defaults to a graceful quit');
+  await backend.kill_app({ name: 'TextEdit', force: true });
+  assert.equal(calls.filter((c) => c.tool === 'kill_app').at(-1).args.force, true, 'force passes through');
 });
 
 // A 1x1 PNG is enough: screenshot reads its IHDR for the pixel ground truth.

@@ -15,8 +15,6 @@ fn child(
     record.usage.input_tokens = units.map(|units| units * 8);
     record.usage.output_tokens = units.map(|units| units * 2);
     record.usage.total_tokens = units.map(|units| units * 10);
-    // This repeated pool subtotal is deliberately not this child's spend.
-    record.usage.budget_spent_tokens = Some(99_999);
     id
 }
 
@@ -81,7 +79,7 @@ async fn completion_usage_live_terminal_counts_grandchildren_and_continuations_o
         let dir = tempdir().unwrap();
         let mut manager = SubAgentManager::new(dir.path().to_path_buf(), 8);
         let (root, _, _, _) = family(&mut manager);
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = mpsc::channel(16);
         let (event_tx, mut event_rx) = mpsc::channel(8);
         manager.agents.get_mut(&root).unwrap().terminal_delivery =
             Some(SubAgentTerminalDeliveryContext {
@@ -348,6 +346,7 @@ async fn completion_usage_counts_real_manifest_only_root_fork() {
                 checkpoint_continuation: false,
                 ..Default::default()
             },
+            None,
         )
         .unwrap();
     let record = guard.worker_records.get_mut(&fork.agent_id).unwrap();
@@ -407,17 +406,15 @@ async fn completion_usage_dozen_child_status_measures_bytes_and_keeps_descendant
                 provider_id: "deepseek".into(),
                 model_id: "deepseek-v4-flash".into(),
                 route_source: "profile.model".into(),
+                fallback_note: None,
                 requested_reasoning: "inherit".into(),
                 effective_reasoning: Some("medium".into()),
                 runtime_version: "0.9.13".into(),
                 runtime_build_sha: "a".repeat(40),
             });
             record.spec.runtime_profile.max_steps = 12;
-            record.spec.runtime_profile.token_budget = Some(12_000);
             record.spec.runtime_profile.wall_time_secs = Some(600);
             record.spec.runtime_profile.wall_deadline_ms = Some(record.updated_at_ms + 600_000);
-            record.usage.token_budget = Some(12_000);
-            record.usage.budget_remaining_tokens = Some(11_220);
             if index == 11 {
                 record.verification.status = "deliverable_missing".into();
                 record.verification.summary = "The claimed report.md is missing.".into();
@@ -507,7 +504,8 @@ async fn completion_usage_dozen_child_status_measures_bytes_and_keeps_descendant
     let addressed: Value = serde_json::from_str(&addressed.content).unwrap();
     assert_eq!(addressed["compact"], true);
     assert_eq!(addressed["child_route"]["model_id"], "deepseek-v4-flash");
-    assert_eq!(addressed["effective_limits"]["token_budget"], 12_000);
+    assert_eq!(addressed["effective_limits"]["max_steps"], 12);
+    assert_eq!(addressed["effective_limits"]["wall_time_secs"], 600);
     assert_eq!(addressed["max_spawn_depth"], 4);
     assert_eq!(addressed["usage"]["input_tokens"], 8);
     assert_eq!(addressed["usage"]["output_tokens"], 2);

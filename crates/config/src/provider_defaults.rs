@@ -113,6 +113,8 @@ pub(crate) const DEFAULT_ARCEE_BASE_URL: &str = "https://api.arcee.ai/api/v1";
 pub(crate) const DEFAULT_HUGGINGFACE_MODEL: &str = "deepseek-ai/DeepSeek-V4-Pro";
 pub(crate) const DEFAULT_HUGGINGFACE_FLASH_MODEL: &str = "deepseek-ai/DeepSeek-V4-Flash";
 pub(crate) const DEFAULT_HUGGINGFACE_BASE_URL: &str = "https://router.huggingface.co/v1";
+pub(crate) const DEFAULT_MODELSCOPE_MODEL: &str = "Qwen/Qwen3.5-397B-A17B";
+pub(crate) const DEFAULT_MODELSCOPE_BASE_URL: &str = "https://api-inference.modelscope.cn/v1";
 pub(crate) const DEFAULT_TOGETHER_MODEL: &str = "deepseek-ai/DeepSeek-V4-Pro";
 pub(crate) const DEFAULT_TOGETHER_FLASH_MODEL: &str = "deepseek-ai/DeepSeek-V4-Flash";
 pub(crate) const DEFAULT_TOGETHER_BASE_URL: &str = "https://api.together.xyz/v1";
@@ -200,6 +202,10 @@ pub(crate) const DEFAULT_TELECOMJS_BASE_URL: &str = "https://aigw.telecomjs.com/
 // Eden AI (OpenAI-compatible AI gateway) defaults
 pub(crate) const DEFAULT_EDENAI_MODEL: &str = "deepseek/deepseek-v4-pro";
 pub(crate) const DEFAULT_EDENAI_BASE_URL: &str = "https://api.edenai.run/v3";
+// ZenMux (OpenAI-compatible AI gateway) defaults. Default model verified
+// present in the live keyless catalog at https://zenmux.ai/api/v1/models.
+pub(crate) const DEFAULT_ZENMUX_MODEL: &str = "deepseek/deepseek-v4.1-flash";
+pub(crate) const DEFAULT_ZENMUX_BASE_URL: &str = "https://zenmux.ai/api/v1";
 // Concentrate (OpenAI Responses-compatible AI gateway) defaults. Contract:
 // https://concentrate.ai/docs/api-reference/introduction — base URL, bearer
 // Universal API key, `POST /v1/responses`, unauthenticated `GET /v1/models`.
@@ -207,6 +213,8 @@ pub(crate) const DEFAULT_EDENAI_BASE_URL: &str = "https://api.edenai.run/v3";
 // `provider/model` pins a provider and `concentrate/auto` is the gateway router.
 pub(crate) const DEFAULT_CONCENTRATE_MODEL: &str = "deepseek-v4-pro";
 pub(crate) const DEFAULT_CONCENTRATE_BASE_URL: &str = "https://api.concentrate.ai/v1";
+pub(crate) const DEFAULT_CSDN_MODEL: &str = "glm_for_coding";
+pub(crate) const DEFAULT_CSDN_BASE_URL: &str = "https://ai.csdn.net/api/model/v1";
 // Codewhale API (account-backed model access) defaults. The account control
 // plane serves an OpenAI-shaped `GET /v1/models` whose rows carry the wire
 // protocol per model, so this route is model-aware and its catalog is the

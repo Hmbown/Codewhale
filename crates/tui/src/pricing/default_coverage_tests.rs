@@ -120,10 +120,10 @@ fn shipped_default_routes_have_reviewed_pricing_coverage() {
 
     // A deliberate breadth receipt, including the generic Custom placeholder.
     // Inventory still comes from production owners, not these expected counts.
-    assert_eq!(built_in_count, 48, "review changed shipped-default breadth");
+    assert_eq!(built_in_count, 51, "review changed shipped-default breadth");
     assert_eq!(
         defaults.len() - built_in_count,
-        6,
+        7,
         "review compatible-default breadth"
     );
     let recorded_at = Utc.with_ymd_and_hms(2026, 9, 8, 12, 0, 0).unwrap();

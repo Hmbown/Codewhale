@@ -243,6 +243,7 @@ fn probe_macos() -> Result<u32, &'static str> {
         fn CGDisplayModeGetRefreshRate(mode: *mut std::ffi::c_void) -> f64;
         fn CGDisplayModeRelease(mode: *mut std::ffi::c_void);
     }
+    // SAFETY: `mode` is null-checked and released after use.
     unsafe {
         let display = CGMainDisplayID();
         let mode = CGDisplayCopyDisplayMode(display);

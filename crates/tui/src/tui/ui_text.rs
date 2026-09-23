@@ -163,10 +163,11 @@ pub(super) fn history_cell_to_text(cell: &HistoryCell, width: u16) -> String {
 ///
 /// User and assistant cells have canonical source text. Returning it directly
 /// preserves authored Markdown and hard line breaks while keeping role glyphs,
-/// continuation rails, and visual wrapping out of the clipboard. Selection
-/// copy cannot provide that contract: it serializes the rendered live cache,
-/// where Markdown has already been transformed and user-message soft wraps do
-/// not carry join metadata.
+/// continuation rails, and visual wrapping out of the clipboard. Transcript
+/// drag selections reuse this same projection per intersected cell
+/// (`selection_to_markdown`, #6156); only the rendered-text fallback still
+/// serializes the live cache, where Markdown has already been transformed and
+/// user-message soft wraps do not carry join metadata.
 ///
 /// Complex cells intentionally retain the full-transcript representation.
 /// Tool and thinking transcript renderers include semantic headers and complete
@@ -211,7 +212,36 @@ pub(crate) fn text_display_width(text: &str) -> usize {
     text.graphemes(true).map(grapheme_display_width).sum()
 }
 
-pub(super) fn slice_text(text: &str, start: usize, end: usize) -> String {
+/// Visible width of one grapheme: ratatui strips control characters before
+/// painting, so they occupy no cells. Every other grapheme keeps the shared
+/// [`grapheme_display_width`] contract.
+fn visible_grapheme_width(grapheme: &str) -> usize {
+    if grapheme.chars().any(|c| c.is_control()) {
+        0
+    } else {
+        grapheme_display_width(grapheme)
+    }
+}
+
+/// Display width in painted terminal columns: control characters are
+/// invisible (ratatui strips them), so they add nothing.
+///
+/// Mouse selection coordinates are terminal cells, so the copy path must
+/// measure in this space: the fixed-4 [`text_display_width`] would shift
+/// every column after a tab away from what the user dragged over. The two
+/// agree on text without control characters.
+pub(crate) fn text_visible_width(text: &str) -> usize {
+    text.graphemes(true).map(visible_grapheme_width).sum()
+}
+
+/// Slice `[start, end)` in painted terminal columns, the space the mouse
+/// reports.
+///
+/// A grapheme overlapping the window is kept whole under the same strict
+/// rule for every width: zero-width control spans join the output only when
+/// the window strictly covers their position, so interior tabs survive while
+/// un-aimable edge touches stay out.
+pub(crate) fn slice_visible_columns(text: &str, start: usize, end: usize) -> String {
     if end <= start {
         return String::new();
     }
@@ -219,9 +249,8 @@ pub(super) fn slice_text(text: &str, start: usize, end: usize) -> String {
     let mut out = String::new();
     let mut col = 0usize;
     for grapheme in text.graphemes(true) {
-        let grapheme_width = grapheme_display_width(grapheme);
         let grapheme_start = col;
-        let grapheme_end = col.saturating_add(grapheme_width);
+        let grapheme_end = col.saturating_add(visible_grapheme_width(grapheme));
         if grapheme_end > start && grapheme_start < end {
             out.push_str(grapheme);
         }
@@ -318,23 +347,40 @@ mod tests {
     #[test]
     fn slice_text_respects_column_bounds() {
         let text = "hello world";
-        assert_eq!(slice_text(text, 0, 5), "hello");
-        assert_eq!(slice_text(text, 6, 11), "world");
-        assert_eq!(slice_text(text, 0, 0), "");
-        assert_eq!(slice_text(text, 0, 100), text);
+        assert_eq!(slice_visible_columns(text, 0, 5), "hello");
+        assert_eq!(slice_visible_columns(text, 6, 11), "world");
+        assert_eq!(slice_visible_columns(text, 0, 0), "");
+        assert_eq!(slice_visible_columns(text, 0, 100), text);
     }
 
     #[test]
     fn slice_text_handles_multibyte_characters() {
         let text = "a─b"; // U+2500 is 1 display column on supported terminals
-        assert_eq!(slice_text(text, 1, 2), "─");
-        assert_eq!(slice_text(text, 0, 3), text);
+        assert_eq!(slice_visible_columns(text, 1, 2), "─");
+        assert_eq!(slice_visible_columns(text, 0, 3), text);
     }
 
     #[test]
     fn slice_text_truncates_at_end() {
         let text = "ab";
-        assert_eq!(slice_text(text, 1, 5), "b");
+        assert_eq!(slice_visible_columns(text, 1, 5), "b");
+    }
+
+    #[test]
+    fn visible_width_ignores_stripped_controls() {
+        assert_eq!(text_visible_width("\t"), 0);
+        assert_eq!(text_visible_width("\ta"), 1);
+        assert_eq!(text_visible_width("ab\t"), 2);
+        assert_eq!(text_visible_width("a\tb"), 2);
+    }
+
+    #[test]
+    fn visible_slice_keeps_interior_controls_only() {
+        // Interior tab strictly inside the window survives.
+        assert_eq!(slice_visible_columns("ab\tcdef", 0, 4), "ab\tcd");
+        // Zero-width span at the window edge stays out, like any grapheme.
+        assert_eq!(slice_visible_columns("\txy", 0, 2), "xy");
+        assert_eq!(slice_visible_columns("ab", 0, 2), "ab");
     }
 
     // --- Unicode / CJK / terminal-width QA (issue #3488) -------------------
@@ -425,9 +471,9 @@ mod tests {
     fn slice_text_slices_cjk_by_display_column() {
         // Columns:  中=[0,2) 文=[2,4) a=[4,5) b=[5,6)
         let text = "中文ab";
-        assert_eq!(slice_text(text, 0, 2), "中");
-        assert_eq!(slice_text(text, 2, 4), "文");
-        assert_eq!(slice_text(text, 4, 6), "ab");
+        assert_eq!(slice_visible_columns(text, 0, 2), "中");
+        assert_eq!(slice_visible_columns(text, 2, 4), "文");
+        assert_eq!(slice_visible_columns(text, 4, 6), "ab");
     }
 
     // --- New #3488 fixtures: CJK/wide-glyph truncation on selector-style rows.
@@ -543,7 +589,7 @@ mod tests {
         // The keycap occupies columns [5, 7). Any overlapping selection keeps
         // the complete grapheme; no isolated FE0F/U+20E3 mark may escape.
         for (start, end) in [(0, 7), (5, 6), (6, 7)] {
-            let sliced = slice_text(row, start, end);
+            let sliced = slice_visible_columns(row, start, end);
             assert!(
                 sliced.contains("1\u{fe0f}\u{20e3}"),
                 "range=({start}, {end}) split keycap: {sliced:?}"

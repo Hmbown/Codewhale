@@ -20,7 +20,21 @@ export type ComputerUseRelease = {
   size: number;
   /** Which independent evidence confirmed the archive: GitHub's asset digest via the API, or the packager's receipt via the release web endpoint. */
   verification: "github-digest" | "receipt";
+  /** The notarized drag-to-Applications disk image, when the release carries one that its receipt qualifies. */
+  dmg?: { downloadUrl: string; size: number; sha256: string };
 } | { status: "pending" | "unavailable" };
+
+const IMAGE_LIMIT = 256 * 1024 * 1024;
+const imageName = (version: string) => `Codewhale-Computer-Use-${version}-macos-universal.dmg`;
+/** The receipt's disk-image entry, or null when absent or malformed. Absence is allowed; a malformed entry withholds the image only. */
+function receiptImage(receipt: RecordValue, version: string) {
+  if (!("dmg" in receipt)) return null;
+  const image = record(receipt.dmg);
+  return image.archive === imageName(version) && image.notarized === true
+    && typeof image.sha256 === "string" && /^[0-9a-f]{64}$/.test(image.sha256)
+    && Number.isSafeInteger(image.size) && (image.size as number) > 0 && (image.size as number) <= IMAGE_LIMIT
+    ? { sha256: image.sha256, size: image.size as number } : null;
+}
 
 function releaseAssets(value: unknown) {
   const release = record(value);
@@ -44,7 +58,10 @@ function releaseAssets(value: unknown) {
     || !Number.isSafeInteger(receipt.size) || (receipt.size as number) <= 0
     || (receipt.size as number) > 16 * 1024
     || typeof zip.digest !== "string" || !/^sha256:[0-9a-f]{64}$/.test(zip.digest)) return null;
-  return { version, archive, zip, receipt };
+  const image = asset(imageName(version));
+  const dmg = image && Number.isSafeInteger(image.size) && (image.size as number) > 0 && (image.size as number) <= IMAGE_LIMIT
+    && typeof image.digest === "string" && /^sha256:[0-9a-f]{64}$/.test(image.digest) ? image : null;
+  return { version, archive, zip, receipt, dmg };
 }
 
 /** A tag alone is not a download. Require the packager's qualification receipt
@@ -57,12 +74,17 @@ export function qualifiedComputerUseRelease(release: unknown, value: unknown): C
   if (receipt.version !== version || receipt.archive !== archive || receipt.platform !== "macos"
     || receipt.arch !== "universal" || receipt.notarized !== true
     || receipt.sha256 !== sha256 || receipt.size !== zip.size) return { status: "pending" };
+  // The image is offered only when the receipt and GitHub's digest agree on it; otherwise the archive alone is offered.
+  const image = receiptImage(receipt, version);
+  const dmg = assets.dmg && image && (assets.dmg.digest as string).slice(7) === image.sha256 && assets.dmg.size === image.size
+    ? { downloadUrl: assets.dmg.browser_download_url as string, size: image.size, sha256: image.sha256 } : undefined;
   return {
     status: "ready", version, sha256, size: zip.size as number,
     url: `${COMPUTER_USE_REPO}/releases/tag/v${version}`,
     downloadUrl: zip.browser_download_url as string,
     receiptUrl: assets.receipt.browser_download_url as string,
     verification: "github-digest",
+    ...(dmg ? { dmg } : {}),
   };
 }
 
@@ -115,15 +137,22 @@ async function receiptQualifiedRelease(): Promise<ComputerUseRelease> {
       || receipt.archive !== archive || typeof receipt.sha256 !== "string" || !/^[0-9a-f]{64}$/.test(receipt.sha256)
       || !Number.isSafeInteger(receipt.size) || (receipt.size as number) <= 0
       || (receipt.size as number) > 256 * 1024 * 1024) return { status: "unavailable" };
+    const served = async (name: string) => {
+      const head = await fetch(`${COMPUTER_USE_REPO}/releases/download/v${version}/${name}`, { method: "HEAD", redirect: "manual", headers: WEB_HEADERS, signal: AbortSignal.timeout(5000) });
+      await head.body?.cancel();
+      return head.status === 302 || head.status === 200;
+    };
     const downloadUrl = `${COMPUTER_USE_REPO}/releases/download/v${version}/${archive}`;
-    const head = await fetch(downloadUrl, { method: "HEAD", redirect: "manual", headers: WEB_HEADERS, signal: AbortSignal.timeout(5000) });
-    await head.body?.cancel();
-    if (head.status !== 302 && head.status !== 200) return { status: "unavailable" };
+    if (!(await served(archive))) return { status: "unavailable" };
+    const image = receiptImage(receipt, version);
+    const dmg = image && (await served(imageName(version)))
+      ? { downloadUrl: `${COMPUTER_USE_REPO}/releases/download/v${version}/${imageName(version)}`, ...image } : undefined;
     return {
       status: "ready", version, sha256: receipt.sha256, size: receipt.size as number,
       url: `${COMPUTER_USE_REPO}/releases/tag/v${version}`, downloadUrl,
       receiptUrl: `${COMPUTER_USE_REPO}/releases/download/v${version}/release.json`,
       verification: "receipt",
+      ...(dmg ? { dmg } : {}),
     };
   } catch (error) {
     console.error("computer-use release fallback failed", error instanceof Error ? error.message : String(error));

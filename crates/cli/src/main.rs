@@ -17,6 +17,7 @@ fn main() -> std::process::ExitCode {
     // inherit SIGPIPE set to SIG_IGN, which makes write(2) return EPIPE;
     // Rust's `println!` then treats that io::Error as fatal and panics.
     // See issue #4030.
+    // SAFETY: process entry; no threads or handlers yet.
     #[cfg(unix)]
     unsafe {
         libc::signal(libc::SIGPIPE, libc::SIG_DFL);

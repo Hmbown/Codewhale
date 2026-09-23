@@ -1,7 +1,7 @@
-//! HTTP client for DeepSeek's OpenAI-compatible Chat Completions API.
+//! HTTP client for the resolved provider route.
 //!
-//! DeepSeek documents `/chat/completions` as the primary endpoint, and this
-//! client now routes all normal traffic through that surface.
+//! Routes reach the provider through its OpenAI-compatible or native wire
+//! surface; `/chat/completions` is the common primary endpoint.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -116,7 +116,7 @@ pub(crate) fn try_acquire_runtime_chat_inference_ownership() -> Option<RuntimeCh
 }
 
 /// Join the attached interactive CWC run as a provider-output participant.
-/// Standalone background adapters that bypass `DeepSeekClient::create_message`
+/// Standalone background adapters that bypass `CodewhaleClient::create_message`
 /// use this guard and retain it through response decoding.
 pub(crate) async fn acquire_remote_control_inference_participant() -> RemoteControlInferencePermit {
     let gate = runtime_chat_inference_gate().read_owned().await;
@@ -263,9 +263,9 @@ pub(crate) struct TranslationProviderResponse {
     pub(crate) usage: Option<Usage>,
 }
 
-/// Client for DeepSeek's OpenAI-compatible APIs.
+/// Universal client for the resolved provider route.
 #[must_use]
-pub struct DeepSeekClient {
+pub struct CodewhaleClient {
     pub(super) http_client: reqwest::Client,
     // Catalogs and probes must never forward frozen custom auth headers to a
     // provider-supplied redirect destination. Inference keeps its own policy.
@@ -279,6 +279,19 @@ pub struct DeepSeekClient {
     /// this list closes the gap for bare provider tokens with no recognizable
     /// prefix (for example token-plan and provider-specific keys).
     model_bound_secret_values: Arc<Vec<String>>,
+    /// Exact values a catalog endpoint could echo back at us: the active API
+    /// key and every user-configured HTTP header value, plus everything in
+    /// `model_bound_secret_values`.
+    ///
+    /// Deliberately a second, wider list rather than a widening of that one:
+    /// they answer different questions at different trust boundaries. That
+    /// list is "what must never reach a *model*", which is why it covers only
+    /// auth-shaped headers and values of at least
+    /// `MIN_EXACT_SECRET_CHARS`. This one is "what must never come back out
+    /// of an endpoint the user typed during setup" (#6173), where a
+    /// three-character key is still a key and a custom header the user
+    /// configured is still theirs.
+    catalog_error_secret_values: Arc<Vec<String>>,
     /// Whether credential-shaped tool output is masked before it is sent to an
     /// upstream model. The safe default is `true`; it is `false` only after the
     /// user disabled `[redaction] model_bound` and confirmed the opt-out on the
@@ -569,7 +582,7 @@ fn release_stream_buffer(mut buf: Vec<u8>) {
     }
 }
 
-impl Clone for DeepSeekClient {
+impl Clone for CodewhaleClient {
     fn clone(&self) -> Self {
         Self {
             http_client: self.http_client.clone(),
@@ -577,6 +590,7 @@ impl Clone for DeepSeekClient {
             http1_client: self.http1_client.clone(),
             api_key: self.api_key.clone(),
             model_bound_secret_values: Arc::clone(&self.model_bound_secret_values),
+            catalog_error_secret_values: Arc::clone(&self.catalog_error_secret_values),
             model_bound_masking: self.model_bound_masking,
             base_url: self.base_url.clone(),
             api_provider: self.api_provider,
@@ -754,6 +768,58 @@ fn configured_model_bound_secret_values(config: &Config, active_api_key: &str) -
     values
 }
 
+/// Everything a catalog probe could have sent that must not come back.
+///
+/// Longest first, so a value that contains another is masked whole.
+fn catalog_error_secret_values(
+    active_api_key: &str,
+    http_headers: &HashMap<String, String>,
+    model_bound: &[String],
+) -> Vec<String> {
+    let mut values: Vec<String> = Vec::new();
+    let mut push = |value: &str| {
+        let value = value.trim();
+        if !value.is_empty() && !values.iter().any(|existing| existing == value) {
+            values.push(value.to_string());
+        }
+    };
+    // No length floor here, unlike `push_model_bound_secret`: a short key
+    // echoed back by an untrusted endpoint is still a leaked key. The cost of
+    // being wrong is a suppressed message, which is what this path did before.
+    push(active_api_key);
+    for value in http_headers.values() {
+        push(value);
+    }
+    for value in model_bound {
+        push(value);
+    }
+    values.sort_by_key(|value| std::cmp::Reverse(value.len()));
+    values
+}
+
+/// The opaque values in a request's URL query — the pagination cursor.
+///
+/// Collected in both forms: decoded, as a provider that parsed the cursor
+/// would echo it, and raw, as one that quoted the URL back would.
+fn request_query_secret_values(url: &reqwest::Url) -> Vec<String> {
+    let mut values: Vec<String> = Vec::new();
+    let mut push = |value: String| {
+        if !value.trim().is_empty() && !values.contains(&value) {
+            values.push(value);
+        }
+    };
+    for (_, value) in url.query_pairs() {
+        push(value.into_owned());
+    }
+    for pair in url.query().unwrap_or_default().split('&') {
+        if let Some((_, value)) = pair.split_once('=') {
+            push(value.to_string());
+        }
+    }
+    values.sort_by_key(|value| std::cmp::Reverse(value.len()));
+    values
+}
+
 fn redact_model_bound_text(text: &str, exact_secret_values: &[String]) -> String {
     let mut redacted = text.to_string();
     for secret in exact_secret_values {
@@ -769,6 +835,24 @@ fn redact_model_bound_text(text: &str, exact_secret_values: &[String]) -> String
 
 /// Maximum bytes to read from an error response body (64 KB).
 pub(super) const ERROR_BODY_MAX_BYTES: usize = 64 * 1024;
+
+/// How much of a provider's HTTP error body may be shown to the user.
+///
+/// The catalog probe is the one request that contacts a `base_url` the user
+/// typed during setup, and its URL carries an opaque pagination cursor, so a
+/// provider — or anything answering at that URL — can echo a key, a custom
+/// header value or the cursor back inside an error body. #3385 answered that
+/// by discarding the body entirely, and the cost of the blunt version was
+/// #6173: Gemini's real reason ("User location is not supported for the API
+/// use") reached the user as `Invalid request (400): ` with nothing after the
+/// colon, so a geo-block, a bad key and a wrong endpoint were indistinguishable.
+pub(super) enum ErrorBodyDisclosure {
+    /// The endpoint is already established. Surface the provider's message.
+    Full,
+    /// Untrusted endpoint. Surface only what survives redaction — and nothing
+    /// at all if a known secret is still in the result.
+    Guarded { request_secrets: Vec<String> },
+}
 
 /// Read/overall timeout for the shared client's non-streaming requests
 /// (`/models` listing, catalog refresh, health probes). Streaming requests
@@ -1041,59 +1125,13 @@ fn validate_base_url_security(base_url: &str, provider_allows_insecure_http: boo
     )
 }
 
+/// Mask credentials in a URL for display.
+///
+/// Delegates to the single shared implementation in
+/// [`codewhale_secrets::sanitize`] (FEAT-025 D4) so command sanitization and
+/// client diagnostics cannot drift.
 pub(crate) fn redact_url_for_display(url: &str) -> String {
-    let Ok(mut parsed) = reqwest::Url::parse(url) else {
-        return url.to_string();
-    };
-    if !parsed.username().is_empty() || parsed.password().is_some() {
-        let _ = parsed.set_username("***");
-        let _ = parsed.set_password(Some("***"));
-    }
-    if parsed.query().is_none() {
-        return parsed.to_string();
-    }
-    let pairs: Vec<(String, String)> = parsed
-        .query_pairs()
-        .map(|(key, value)| {
-            let value = if is_sensitive_url_query_key(&key) {
-                "***".to_string()
-            } else {
-                value.into_owned()
-            };
-            (key.into_owned(), value)
-        })
-        .collect();
-    parsed.set_query(None);
-    let mut query = parsed.query_pairs_mut();
-    for (key, value) in pairs {
-        query.append_pair(&key, &value);
-    }
-    drop(query);
-    parsed.to_string()
-}
-
-fn is_sensitive_url_query_key(key: &str) -> bool {
-    let normalized = key.trim().replace(['-', '.'], "_").to_ascii_lowercase();
-    matches!(
-        normalized.as_str(),
-        "api_key"
-            | "apikey"
-            | "access_token"
-            | "auth_token"
-            | "authorization"
-            | "bearer"
-            | "client_secret"
-            | "credential"
-            | "id_token"
-            | "password"
-            | "refresh_token"
-            | "secret"
-            | "token"
-    ) || normalized.ends_with("_api_key")
-        || normalized.ends_with("_authorization")
-        || normalized.ends_with("_password")
-        || normalized.ends_with("_secret")
-        || normalized.ends_with("_token")
+    codewhale_secrets::sanitize::redact_url_for_display(url)
 }
 
 pub(super) fn versioned_base_url(base_url: &str) -> String {
@@ -1287,7 +1325,7 @@ fn build_speech_synthesis_body(
     })
 }
 
-// === DeepSeekClient ===
+// === CodewhaleClient ===
 
 /// Returns true when CODEWHALE_FORCE_HTTP1 (legacy alias: DEEPSEEK_FORCE_HTTP1)
 /// is set to a truthy value (`1`, `true`, `yes`, `on`, case-insensitive). Used
@@ -1346,7 +1384,7 @@ fn add_extra_root_certs(
     builder
 }
 
-impl DeepSeekClient {
+impl CodewhaleClient {
     fn is_local_ds4_model(&self, model: &str) -> bool {
         self.api_provider == ApiProvider::Custom
             && self.provider_identity.eq_ignore_ascii_case("ds4")
@@ -1389,7 +1427,7 @@ impl DeepSeekClient {
                     crate::route_budget::known_route_limits(route.candidate.limits())
                 });
         Self::from_parts(
-            config.deepseek_base_url(),
+            config.active_route_base_url(),
             default_model,
             provider_wire_format_for_config(api_provider, Some(config)),
             route_limits,
@@ -1401,7 +1439,7 @@ impl DeepSeekClient {
     /// Catalog bootstrap must not depend on the catalog it is about to fetch.
     pub(crate) fn for_catalog_refresh(config: &Config) -> Result<Self> {
         Self::from_parts(
-            config.deepseek_base_url(),
+            config.active_route_base_url(),
             config.default_model(),
             provider_wire_format_for_config(config.api_provider(), Some(config)),
             None,
@@ -1465,14 +1503,14 @@ impl DeepSeekClient {
                 Ok(credentials) => (credentials.access_token, credentials.account_id),
                 Err(error) => {
                     if config.provider_uses_custom_endpoint(ApiProvider::OpenaiCodex) {
-                        (config.deepseek_api_key()?, None)
+                        (config.active_route_api_key()?, None)
                     } else {
                         return Err(error);
                     }
                 }
             }
         } else {
-            (config.deepseek_api_key()?, None)
+            (config.active_route_api_key()?, None)
         };
         let model_bound_secret_values =
             Arc::new(configured_model_bound_secret_values(config, &api_key));
@@ -1568,12 +1606,18 @@ impl DeepSeekClient {
         )?
         .build()?;
 
+        let catalog_error_secret_values = Arc::new(catalog_error_secret_values(
+            &api_key,
+            &http_headers,
+            &model_bound_secret_values,
+        ));
         Ok(Self {
             http_client,
             models_http_client,
             http1_client,
             api_key,
             model_bound_secret_values,
+            catalog_error_secret_values,
             model_bound_masking,
             base_url,
             api_provider,
@@ -2234,8 +2278,10 @@ pub async fn verify_provider_api_key(
         let body = bounded_provider_catalog_text(response, PROVIDER_CATALOG_MAX_RESPONSE_BYTES)
             .await
             .unwrap_or_default();
-        if matches!(provider, ApiProvider::Telecomjs | ApiProvider::Edenai)
-            && serde_json::from_str::<ModelsPage<'_>>(&body).is_ok_and(|page| !page.has_more)
+        if matches!(
+            provider,
+            ApiProvider::Telecomjs | ApiProvider::Edenai | ApiProvider::Zenmux
+        ) && serde_json::from_str::<ModelsPage<'_>>(&body).is_ok_and(|page| !page.has_more)
             && let Some(kind) = provider.kind()
             && let Ok(offerings) = named_gateway_catalog_offerings_from_body(
                 &body,
@@ -2345,7 +2391,7 @@ fn xiaomi_mimo_api_key_uses_token_plan(api_key: &str) -> bool {
     api_key.trim_start().starts_with("tp-")
 }
 
-impl DeepSeekClient {
+impl CodewhaleClient {
     /// Returns the API base URL used by this client.
     pub fn base_url(&self) -> &str {
         &self.base_url
@@ -2910,10 +2956,18 @@ impl DeepSeekClient {
                         .timeout(NON_STREAMING_HTTP_TIMEOUT)
                 };
                 let response = match mode {
-                    ModelsRequestMode::Interactive => self
-                        .send_with_retry_error_body(build, false)
-                        .await
-                        .map_err(ModelsFetchError::Interactive)?,
+                    // #6173: the provider's own words, minus this client's
+                    // secrets and this request's cursor. The endpoint is not
+                    // established here — it is whatever the user typed during
+                    // setup — so the body is guarded rather than trusted.
+                    ModelsRequestMode::Interactive => {
+                        let disclosure = ErrorBodyDisclosure::Guarded {
+                            request_secrets: request_query_secret_values(&url),
+                        };
+                        self.send_with_retry_error_body(build, &disclosure)
+                            .await
+                            .map_err(ModelsFetchError::Interactive)?
+                    }
                     ModelsRequestMode::Refresh => build()
                         .send()
                         .await
@@ -2952,16 +3006,16 @@ impl DeepSeekClient {
             .unwrap_or_else(|| self.api_provider.as_str().to_string())
     }
 
-    /// Reviewed response schema for a named compatible provider.
+    /// Whether this route speaks Baseten's `/models` dialect.
     ///
-    /// Schema recognition is intentionally separate from catalog ownership:
-    /// `base-ten` may use Baseten's `/models` shape, while its exact configured
-    /// identity remains `base-ten` rather than sharing the `baseten` partition.
-    fn catalog_setup_template_id(&self) -> Option<&'static str> {
-        (self.api_provider == ApiProvider::Custom)
-            .then(|| codewhale_config::provider_setup_template(&self.provider_identity))
-            .flatten()
-            .map(|template| template.id)
+    /// Schema recognition is by endpoint, never by table name: whatever the
+    /// user called the `[providers.<name>]` table, the wire shape is a fact
+    /// about the host (#6289). Catalog ownership still uses the exact
+    /// configured identity, so a renamed Baseten table keeps its own
+    /// partition.
+    fn catalog_endpoint_is_baseten(&self) -> bool {
+        self.api_provider == ApiProvider::Custom
+            && codewhale_config::catalog::endpoint_is_baseten(&self.base_url)
     }
 
     /// Fetch the provider's live `/models` listing as a secret-free
@@ -2998,7 +3052,7 @@ impl DeepSeekClient {
                     openrouter_to_catalog_offering(item, &provider, &fingerprint, fetched_at)
                 })
                 .collect::<Result<Vec<_>, _>>()?
-        } else if self.catalog_setup_template_id() == Some(codewhale_config::BASETEN_TEMPLATE_ID) {
+        } else if self.catalog_endpoint_is_baseten() {
             let baseten_models = parse_baseten_models_response(&body)?;
             if baseten_models.is_empty() {
                 return Err(CatalogRefreshError::EmptyList);
@@ -3019,6 +3073,14 @@ impl DeepSeekClient {
             named_gateway_catalog_offerings_from_body(
                 &body,
                 codewhale_config::ProviderKind::Edenai,
+                &provider,
+                &fingerprint,
+                fetched_at,
+            )?
+        } else if self.api_provider == ApiProvider::Zenmux {
+            named_gateway_catalog_offerings_from_body(
+                &body,
+                codewhale_config::ProviderKind::Zenmux,
                 &provider,
                 &fingerprint,
                 fetched_at,
@@ -3139,8 +3201,10 @@ impl DeepSeekClient {
     /// allowing this provider's successful roster to retire removed ids.
     ///
     /// Activated for model-list authorities that are not satisfied by the
-    /// cross-provider Models.dev snapshot: OpenRouter, named live gateways, and
-    /// the reviewed OpenAI-compatible setup templates (including Baseten).
+    /// cross-provider Models.dev snapshot: OpenRouter, named live gateways,
+    /// and Baseten's account-scoped endpoint (no static snapshot can serve a
+    /// per-credential roster). Every other custom host is an ordinary
+    /// provider served by Models.dev plus its configured models (#6289).
     /// The refresh is non-fatal: on failure, persisted prior rows and static
     /// seeds remain available with a typed failed receipt.
     pub fn spawn_active_provider_catalog_refresh(config: &Config) {
@@ -3151,18 +3215,20 @@ impl DeepSeekClient {
         {
             let provider = config.api_provider();
             let provider_identity = config.provider_identity_for(provider);
-            let is_reviewed_compatible_template = provider == ApiProvider::Custom
-                && codewhale_config::provider_setup_template(&provider_identity)
-                    .is_some_and(|template| template.is_compatible());
+            let is_baseten_endpoint = provider == ApiProvider::Custom
+                && codewhale_config::catalog::endpoint_is_baseten(
+                    &config.base_url_for_route_identity(provider, &provider_identity),
+                );
             if !matches!(
                 provider,
                 ApiProvider::Openrouter
                     | ApiProvider::Telecomjs
                     | ApiProvider::Edenai
+                    | ApiProvider::Zenmux
                     | ApiProvider::Concentrate
                     | ApiProvider::Codewhale
                     | ApiProvider::Ollama
-            ) && !is_reviewed_compatible_template
+            ) && !is_baseten_endpoint
             {
                 return;
             }
@@ -3173,7 +3239,7 @@ impl DeepSeekClient {
             let refresh_ticket = crate::provider_catalog_live::begin_refresh_for_identity(
                 provider,
                 &provider_identity,
-                &config.deepseek_base_url(),
+                &config.active_route_base_url(),
             );
 
             // Publish the exact persisted scope immediately so opening `/model`
@@ -3182,7 +3248,7 @@ impl DeepSeekClient {
             // reload from disk until the current credential proves them again.
             crate::provider_catalog_live::maybe_load_persisted_cache_for_config(config);
 
-            let client = match DeepSeekClient::for_catalog_refresh(config) {
+            let client = match CodewhaleClient::for_catalog_refresh(config) {
                 Ok(client) => client,
                 Err(err) => {
                     tracing::debug!(
@@ -3399,28 +3465,67 @@ impl DeepSeekClient {
         }
     }
 
+    /// Apply `disclosure` to one provider error body.
+    ///
+    /// Redaction runs on the raw bytes, *before* `sanitize_http_error_body`
+    /// truncates them, so a secret can never be split across the truncation
+    /// boundary and survive as a fragment. The result is then checked against
+    /// every value this client knows is secret; if one is still there the
+    /// whole body is dropped, which is exactly the behaviour this path had
+    /// before #6173. The fallback is the old contract, not a weaker one.
+    ///
+    /// Known limitation: this removes what the *client* knows is secret. A
+    /// credential the user configured outside Codewhale — in a proxy, say —
+    /// is not in that set and would pass through, the same limit
+    /// `redact_model_bound_text` has.
+    fn disclosed_http_error_body(
+        &self,
+        disclosure: &ErrorBodyDisclosure,
+        status: u16,
+        raw: &str,
+    ) -> String {
+        let provider = Some(self.api_provider.display_name());
+        let ErrorBodyDisclosure::Guarded { request_secrets } = disclosure else {
+            return sanitize_http_error_body(provider, status, raw);
+        };
+        let mut redacted = raw.to_string();
+        for secret in self
+            .catalog_error_secret_values
+            .iter()
+            .chain(request_secrets.iter())
+        {
+            redacted = redacted.replace(secret.as_str(), codewhale_config::persistence::REDACTED);
+        }
+        let message = sanitize_http_error_body(provider, status, &redacted);
+        let leaked = self
+            .catalog_error_secret_values
+            .iter()
+            .chain(request_secrets.iter())
+            .any(|secret| message.contains(secret.as_str()));
+        if leaked { String::new() } else { message }
+    }
+
     pub(super) async fn send_with_retry<F>(&self, build: F) -> Result<reqwest::Response>
     where
         F: FnMut() -> reqwest::RequestBuilder,
     {
-        self.send_with_retry_error_body(build, true).await
+        self.send_with_retry_error_body(build, &ErrorBodyDisclosure::Full)
+            .await
     }
 
-    // Model-list errors can echo opaque cursors or credentials. Keep status and
-    // Retry-After classification, but suppress their bodies before retry logs
-    // and state updates. Other requests retain their existing error details.
+    /// Model-list errors can echo opaque cursors or credentials. Keep status
+    /// and Retry-After classification either way; `disclosure` decides how
+    /// much of the body reaches retry logs, state updates and the user.
     async fn send_with_retry_error_body<F>(
         &self,
         mut build: F,
-        include_error_body: bool,
+        disclosure: &ErrorBodyDisclosure,
     ) -> Result<reqwest::Response>
     where
         F: FnMut() -> reqwest::RequestBuilder,
     {
         if self.isolated_request_state {
-            return self
-                .send_with_isolated_retry(build, include_error_body)
-                .await;
+            return self.send_with_isolated_retry(build, disclosure).await;
         }
         let retry_cfg: LlmRetryConfig = self.retry.clone().into();
         let request_result = with_retry(
@@ -3446,16 +3551,8 @@ impl DeepSeekClient {
                         return Ok(response);
                     }
                     let retry_after = extract_retry_after(response.headers());
-                    let body = if include_error_body {
-                        let body = bounded_error_text(response, ERROR_BODY_MAX_BYTES).await;
-                        sanitize_http_error_body(
-                            Some(self.api_provider.display_name()),
-                            status.as_u16(),
-                            &body,
-                        )
-                    } else {
-                        String::new()
-                    };
+                    let raw = bounded_error_text(response, ERROR_BODY_MAX_BYTES).await;
+                    let body = self.disclosed_http_error_body(disclosure, status.as_u16(), &raw);
                     Err(LlmError::from_http_response_with_retry_after(
                         status.as_u16(),
                         &body,
@@ -3514,7 +3611,7 @@ impl DeepSeekClient {
     async fn send_with_isolated_retry<F>(
         &self,
         mut build: F,
-        include_error_body: bool,
+        disclosure: &ErrorBodyDisclosure,
     ) -> Result<reqwest::Response>
     where
         F: FnMut() -> reqwest::RequestBuilder,
@@ -3535,16 +3632,8 @@ impl DeepSeekClient {
                         return Ok(response);
                     }
                     let retry_after = extract_retry_after(response.headers());
-                    let body = if include_error_body {
-                        let body = bounded_error_text(response, ERROR_BODY_MAX_BYTES).await;
-                        sanitize_http_error_body(
-                            Some(self.api_provider.display_name()),
-                            status.as_u16(),
-                            &body,
-                        )
-                    } else {
-                        String::new()
-                    };
+                    let raw = bounded_error_text(response, ERROR_BODY_MAX_BYTES).await;
+                    let body = self.disclosed_http_error_body(disclosure, status.as_u16(), &raw);
                     Err(LlmError::from_http_response_with_retry_after(
                         status.as_u16(),
                         &body,
@@ -3634,7 +3723,7 @@ fn retry_reason_label_and_human(err: &LlmError) -> (&'static str, String) {
     }
 }
 
-impl DeepSeekClient {
+impl CodewhaleClient {
     /// Execute a non-streaming request without consulting or updating the
     /// process-global response cache.
     ///
@@ -3675,7 +3764,7 @@ impl DeepSeekClient {
     }
 }
 
-impl LlmClient for DeepSeekClient {
+impl LlmClient for CodewhaleClient {
     fn provider_name(&self) -> &'static str {
         self.api_provider.as_str()
     }
@@ -3689,11 +3778,11 @@ impl LlmClient for DeepSeekClient {
     }
 
     fn route_limits(&self) -> Option<RouteLimits> {
-        DeepSeekClient::route_limits(self)
+        CodewhaleClient::route_limits(self)
     }
 
     fn effective_max_output_tokens(&self, requested_model: &str) -> u32 {
-        DeepSeekClient::effective_max_output_tokens(self, requested_model)
+        CodewhaleClient::effective_max_output_tokens(self, requested_model)
     }
 
     fn effective_route_envelope(
@@ -3701,7 +3790,7 @@ impl LlmClient for DeepSeekClient {
         requested_model: &str,
         dispatched_at: chrono::DateTime<chrono::Utc>,
     ) -> crate::cost_status::EffectiveRouteEnvelope {
-        DeepSeekClient::effective_route_envelope(self, requested_model, dispatched_at)
+        CodewhaleClient::effective_route_envelope(self, requested_model, dispatched_at)
     }
 
     async fn health_check(&self) -> Result<bool> {
@@ -3812,11 +3901,11 @@ struct OpenRouterModelItem {
     id: String,
     // Captured from OpenRouter for future display/deprecation surfaces. The
     // current CatalogOffering shape has no honest fields for these yet.
-    #[allow(dead_code)]
     #[serde(default)]
+    #[expect(dead_code)]
     name: Option<String>,
-    #[allow(dead_code)]
     #[serde(default)]
+    #[expect(dead_code)]
     created: Option<u64>,
     #[serde(default)]
     context_length: Option<u32>,
@@ -3828,8 +3917,8 @@ struct OpenRouterModelItem {
     supported_parameters: Option<Vec<String>>,
     #[serde(default)]
     architecture: Option<OpenRouterArchitecture>,
-    #[allow(dead_code)]
     #[serde(default)]
+    #[expect(dead_code)]
     expiration_date: Option<String>,
 }
 
@@ -3980,12 +4069,27 @@ pub(crate) fn parse_models_response(payload: &str) -> Result<Vec<AvailableModel>
     Ok(models)
 }
 
-/// Keep both live-model consumers on Go's documented three-protocol roster.
+/// Keep both live-model consumers on each provider's documented coding roster.
 /// Unknown models remain hidden until their wire contract is known.
 fn apply_provider_model_cutline(
     provider: ApiProvider,
     models: Vec<AvailableModel>,
 ) -> Vec<AvailableModel> {
+    if provider == ApiProvider::Stepfun {
+        // The shared /models endpoint also lists speech and image generators.
+        // Only expose routes whose text/tool contract is in our catalog.
+        let offerings = codewhale_config::catalog::bundled_catalog_offerings();
+        return models
+            .into_iter()
+            .filter(|model| {
+                offerings.iter().any(|row| {
+                    row.provider == "stepfun"
+                        && row.wire_model_id == model.id
+                        && row.tool_call == Some(true)
+                })
+            })
+            .collect();
+    }
     if provider != ApiProvider::OpencodeGo {
         return models;
     }
@@ -4012,8 +4116,9 @@ fn apply_provider_model_cutline(
 /// The account control plane returns the OpenAI list shape, but every row
 /// carries a `codewhale` block naming the wire protocol Codewhale will use for
 /// that model (`chat-completions` → `{base}/chat/completions`,
-/// `anthropic-messages` → `{base}/messages`). That block is the whole reason
-/// this route is model-aware, so the protocol is read from the response rather
+/// `anthropic-messages` → `{base}/messages`, `responses` →
+/// `{base}/responses`). That block is the whole reason this route is
+/// model-aware, so the protocol is read from the response rather
 /// than inferred — the namespace inference in
 /// [`codewhale_config::route::codewhale_endpoint_key_for_model`] is only the
 /// offline fallback for a row this listing did not describe.
@@ -4058,7 +4163,8 @@ fn codewhale_catalog_offerings_from_body(
         }
         // An unstated or unknown protocol falls back to the namespace rule
         // rather than being dropped: the account already proved it serves this
-        // model by listing it.
+        // model by listing it, and a protocol label this build predates must
+        // not make the row unreachable.
         let endpoint_key = match row
             .codewhale
             .as_ref()
@@ -4067,6 +4173,7 @@ fn codewhale_catalog_offerings_from_body(
         {
             Some("anthropic-messages") => "messages",
             Some("chat-completions") => "chat",
+            Some("responses") => "responses",
             _ => codewhale_config::route::codewhale_endpoint_key_for_model(&id),
         };
         offerings.push(CatalogOffering {
@@ -4402,7 +4509,7 @@ fn baseten_to_catalog_offering(
         endpoint_key: "chat".to_string(),
         default_for_provider: item
             .id
-            .eq_ignore_ascii_case(codewhale_config::BASETEN_DEFAULT_MODEL),
+            .eq_ignore_ascii_case(codewhale_config::catalog::BASETEN_DEFAULT_MODEL),
         family: None,
         limit,
         cost,
@@ -4609,6 +4716,27 @@ pub(super) fn apply_reasoning_effort(
         apply_deepseek_chat_reasoning_effort(body, &normalized);
         return;
     }
+    if provider == ApiProvider::Stepfun {
+        // Step 3.5 has no documented effort selector. The other coding models
+        // are always reasoning-capable; do not invent an Off wire value.
+        let model = body.get("model").and_then(Value::as_str).unwrap_or("");
+        let tier = match (model, normalized.as_str()) {
+            ("step-5-preview" | "step-3.7-flash" | "step-3.5-flash-2603", "minimal" | "low") => {
+                Some("low")
+            }
+            ("step-5-preview" | "step-3.7-flash", "medium") => Some("medium"),
+            ("step-3.5-flash-2603", "medium") => Some("high"),
+            (
+                "step-5-preview" | "step-3.7-flash" | "step-3.5-flash-2603",
+                "high" | "max" | "xhigh" | "ultra",
+            ) => Some("high"),
+            _ => None,
+        };
+        if let Some(tier) = tier {
+            body["reasoning_effort"] = json!(tier);
+        }
+        return;
+    }
     match normalized.as_str() {
         "off" | "disabled" | "none" | "false" => match provider {
             // Handled by the shared DeepSeek table above, before this match.
@@ -4642,6 +4770,10 @@ pub(super) fn apply_reasoning_effort(
             // This gateway can route unrelated model families, so the generic
             // provider must not inject a model-specific reasoning dialect.
             ApiProvider::Edenai => {}
+            ApiProvider::Zenmux => {}
+            // CSDN 星图 is OpenAI-compatible but documents no provider-owned
+            // reasoning dialect; do not invent one.
+            ApiProvider::Csdn => {}
             // The Codewhale API is a passthrough to the account's own
             // connected provider; it documents no Codewhale-owned
             // reasoning-effort translation, so nothing is invented here.
@@ -4683,6 +4815,7 @@ pub(super) fn apply_reasoning_effort(
             | ApiProvider::Qianfan
             | ApiProvider::Arcee
             | ApiProvider::Huggingface
+            | ApiProvider::Modelscope
             | ApiProvider::Custom => {}
             ApiProvider::Moonshot => {
                 // #3024: Kimi models accept thinking enable/disable.
@@ -4740,6 +4873,10 @@ pub(super) fn apply_reasoning_effort(
             // Chat Completions API does not support reasoning_effort or thinking.
             ApiProvider::Telecomjs => {}
             ApiProvider::Edenai => {}
+            ApiProvider::Zenmux => {}
+            // CSDN 星图 is OpenAI-compatible but documents no provider-owned
+            // reasoning dialect; do not invent one.
+            ApiProvider::Csdn => {}
             // The Codewhale API is a passthrough to the account's own
             // connected provider; it documents no Codewhale-owned
             // reasoning-effort translation, so nothing is invented here.
@@ -4772,7 +4909,7 @@ pub(super) fn apply_reasoning_effort(
             ApiProvider::XiaomiMimo => {
                 body["thinking"] = json!({ "type": "enabled" });
             }
-            ApiProvider::Arcee | ApiProvider::Huggingface => {
+            ApiProvider::Arcee | ApiProvider::Huggingface | ApiProvider::Modelscope => {
                 let value = match normalized.as_str() {
                     "minimal" => "minimal",
                     "low" => "low",
@@ -4864,6 +5001,10 @@ pub(super) fn apply_reasoning_effort(
             // Chat Completions API does not support reasoning_effort or thinking.
             ApiProvider::Telecomjs => {}
             ApiProvider::Edenai => {}
+            ApiProvider::Zenmux => {}
+            // CSDN 星图 is OpenAI-compatible but documents no provider-owned
+            // reasoning dialect; do not invent one.
+            ApiProvider::Csdn => {}
             // The Codewhale API is a passthrough to the account's own
             // connected provider; it documents no Codewhale-owned
             // reasoning-effort translation, so nothing is invented here.
@@ -4887,7 +5028,7 @@ pub(super) fn apply_reasoning_effort(
             ApiProvider::XiaomiMimo => {
                 body["thinking"] = json!({ "type": "enabled" });
             }
-            ApiProvider::Arcee | ApiProvider::Huggingface => {
+            ApiProvider::Arcee | ApiProvider::Huggingface | ApiProvider::Modelscope => {
                 body["reasoning_effort"] = json!("high");
             }
             ApiProvider::Fireworks => {
@@ -4951,7 +5092,7 @@ pub(super) fn apply_reasoning_effort(
     }
 }
 
-impl DeepSeekClient {
+impl CodewhaleClient {
     /// Call the DeepSeek `/beta/completions` FIM endpoint.
     pub async fn fim_completion(
         &self,
@@ -5230,7 +5371,7 @@ mod tests {
         assert_eq!(offering.provider, "baseten");
         assert_eq!(
             offering.wire_model_id,
-            codewhale_config::BASETEN_DEFAULT_MODEL
+            codewhale_config::catalog::BASETEN_DEFAULT_MODEL
         );
         assert!(offering.default_for_provider);
         let limit = offering.limit.expect("published limits");
@@ -5433,8 +5574,8 @@ mod tests {
         route_base_url: &str,
         model: &str,
         transport_base_url: String,
-    ) -> DeepSeekClient {
-        let mut client = DeepSeekClient::new(&Config {
+    ) -> CodewhaleClient {
+        let mut client = CodewhaleClient::new(&Config {
             provider: Some("moonshot".to_string()),
             providers: Some(ProvidersConfig {
                 moonshot: ProviderConfig {
@@ -5457,9 +5598,9 @@ mod tests {
         route_base_url: &str,
         model: &str,
         transport_base_url: String,
-    ) -> DeepSeekClient {
+    ) -> CodewhaleClient {
         let _ = rustls::crypto::ring::default_provider().install_default();
-        let mut client = DeepSeekClient::new(&Config {
+        let mut client = CodewhaleClient::new(&Config {
             provider: Some("zai".to_string()),
             providers: Some(ProvidersConfig {
                 zai: ProviderConfig {
@@ -5482,9 +5623,9 @@ mod tests {
         route_base_url: &str,
         model: &str,
         transport_base_url: String,
-    ) -> DeepSeekClient {
+    ) -> CodewhaleClient {
         let _ = rustls::crypto::ring::default_provider().install_default();
-        let mut client = DeepSeekClient::new(&Config {
+        let mut client = CodewhaleClient::new(&Config {
             provider: Some("minimax".to_string()),
             providers: Some(ProvidersConfig {
                 minimax: ProviderConfig {
@@ -5506,8 +5647,8 @@ mod tests {
     fn deepseek_request_boundary_client(
         route_base_url: &str,
         transport_base_url: String,
-    ) -> DeepSeekClient {
-        let mut client = DeepSeekClient::new(&Config {
+    ) -> CodewhaleClient {
+        let mut client = CodewhaleClient::new(&Config {
             provider: Some("deepseek".to_string()),
             api_key: Some("deepseek-request-boundary-key".to_string()),
             base_url: Some(route_base_url.to_string()),
@@ -5519,8 +5660,8 @@ mod tests {
         client
     }
 
-    fn ollama_cloud_request_boundary_client(transport_base_url: String) -> DeepSeekClient {
-        let mut client = DeepSeekClient::new(&Config {
+    fn ollama_cloud_request_boundary_client(transport_base_url: String) -> CodewhaleClient {
+        let mut client = CodewhaleClient::new(&Config {
             provider: Some("ollama-cloud".to_string()),
             providers: Some(ProvidersConfig {
                 ollama_cloud: ProviderConfig {
@@ -6257,7 +6398,7 @@ mod tests {
     async fn capture_route_chat_request_body(
         model: &str,
         request: MessageRequest,
-        client_for_transport: impl FnOnce(String) -> DeepSeekClient,
+        client_for_transport: impl FnOnce(String) -> CodewhaleClient,
     ) -> (String, Value) {
         let streaming = request.stream == Some(true);
         let server = MockServer::start().await;
@@ -6345,9 +6486,9 @@ mod tests {
         route_base_url: &str,
         model: &str,
         transport_base_url: String,
-    ) -> DeepSeekClient {
+    ) -> CodewhaleClient {
         let _ = rustls::crypto::ring::default_provider().install_default();
-        let mut client = DeepSeekClient::new(&Config {
+        let mut client = CodewhaleClient::new(&Config {
             provider: Some("modelstudio-token-plan".to_string()),
             providers: Some(ProvidersConfig {
                 modelstudio_token_plan: ProviderConfig {
@@ -7326,7 +7467,7 @@ mod tests {
         );
     }
 
-    fn concentrate_client(server: &MockServer, model: &str) -> DeepSeekClient {
+    fn concentrate_client(server: &MockServer, model: &str) -> CodewhaleClient {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let config = Config {
             provider: Some("concentrate".to_string()),
@@ -7341,7 +7482,7 @@ mod tests {
             }),
             ..Config::default()
         };
-        DeepSeekClient::new(&config).expect("Concentrate client should resolve its route")
+        CodewhaleClient::new(&config).expect("Concentrate client should resolve its route")
     }
 
     /// The documented Concentrate stream: `event:`-typed `response.*` frames
@@ -7602,7 +7743,7 @@ mod tests {
     /// `CODEWHALE_API_BASE` so the test does not mutate process env, but it
     /// exercises the same "declared origin" path: the key must follow the
     /// route to whatever origin the operator pointed it at.
-    fn codewhale_client(server: &MockServer, model: &str) -> DeepSeekClient {
+    fn codewhale_client(server: &MockServer, model: &str) -> CodewhaleClient {
         let config = Config {
             provider: Some("codewhale".to_string()),
             providers: Some(ProvidersConfig {
@@ -7616,7 +7757,7 @@ mod tests {
             }),
             ..Config::default()
         };
-        DeepSeekClient::new(&config).expect("Codewhale client should resolve its model route")
+        CodewhaleClient::new(&config).expect("Codewhale client should resolve its model route")
     }
 
     /// The account key must ride as `Authorization: Bearer` and never as
@@ -7711,7 +7852,84 @@ mod tests {
         );
     }
 
-    fn opencode_zen_client(server: &MockServer, model: &str) -> DeepSeekClient {
+    /// A catalog row stating `codewhale.protocol = "responses"` must dispatch
+    /// to the account API's Responses surface — `{base}/responses` — not the
+    /// Chat Completions default its `openai/` namespace alone would imply.
+    #[tokio::test]
+    async fn codewhale_responses_catalog_row_dispatches_to_responses_endpoint() {
+        let _env = crate::test_support::lock_test_env();
+        let _live = crate::provider_lake::lock_live_snapshot();
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", home.path());
+        crate::provider_catalog_live::reset_cache_for_test();
+        crate::provider_lake::clear_live_snapshot();
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Type", "text/event-stream")
+                    .set_body_string(concat!(
+                        "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"",
+                        ",\"usage\":{\"input_tokens\":3,\"output_tokens\":1}}}\n\n",
+                        "data: [DONE]\n\n"
+                    )),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        // Seed the account catalog through the same refresh seam the runtime
+        // uses, so the wire choice comes from the row's stated protocol.
+        let fingerprint = base_url_fingerprint(&server.uri());
+        let offerings = codewhale_catalog_offerings_from_body(
+            r#"{"object":"list","data":[
+                {"id":"openai/gpt-5.6","object":"model","owned_by":"openai",
+                 "codewhale":{"provider":"openai","model":"gpt-5.6",
+                              "protocol":"responses","endpoint":"/v1/responses",
+                              "default":true,"usable":true}}
+            ]}"#,
+            "codewhale",
+            &fingerprint,
+            now_unix(),
+        )
+        .expect("fixture catalog parses");
+        crate::provider_catalog_live::record_success(ProviderCatalogDelta {
+            provider: "codewhale".to_string(),
+            base_url_fingerprint: fingerprint,
+            fetched_at: now_unix(),
+            offerings,
+        });
+
+        let mut client = codewhale_client(&server, "openai/gpt-5.6");
+        assert_eq!(client.wire_format, WireFormat::Responses);
+        client.retry.enabled = false;
+        let response = client
+            .create_message(minimal_zen_request("openai/gpt-5.6"))
+            .await
+            .expect("Codewhale responses request should succeed");
+
+        // Responses usage arrives on the terminal `response.completed` event —
+        // the dialect's equivalent of chat's `stream_options.include_usage`.
+        assert_eq!(response.usage.input_tokens, 3);
+        assert_eq!(response.usage.output_tokens, 1);
+        let requests = server.received_requests().await.expect("recorded request");
+        assert_eq!(requests.len(), 1);
+        assert_codewhale_bearer(&requests[0]);
+        let body: Value = serde_json::from_slice(&requests[0].body).expect("responses JSON body");
+        assert_eq!(
+            body.get("model").and_then(Value::as_str),
+            Some("openai/gpt-5.6")
+        );
+        assert!(body.get("input").is_some(), "Responses body: {body}");
+        assert!(body.get("messages").is_none(), "Responses body: {body}");
+
+        crate::provider_catalog_live::reset_cache_for_test();
+        crate::provider_lake::clear_live_snapshot();
+    }
+
+    fn opencode_zen_client(server: &MockServer, model: &str) -> CodewhaleClient {
         let config = Config {
             provider: Some("opencode-zen".to_string()),
             providers: Some(ProvidersConfig {
@@ -7725,7 +7943,7 @@ mod tests {
             }),
             ..Config::default()
         };
-        DeepSeekClient::new(&config).expect("OpenCode Zen client should resolve its model route")
+        CodewhaleClient::new(&config).expect("OpenCode Zen client should resolve its model route")
     }
 
     fn minimal_zen_request(model: &str) -> MessageRequest {
@@ -7812,7 +8030,7 @@ mod tests {
                 .expect(1)
                 .mount(&server)
                 .await;
-            let mut client = DeepSeekClient::new(&Config {
+            let mut client = CodewhaleClient::new(&Config {
                 provider: Some("opencode-go".into()),
                 providers: Some(ProvidersConfig {
                     opencode_go: ProviderConfig {
@@ -8067,7 +8285,7 @@ mod tests {
         };
 
         crate::external_credentials::reset_side_effect_trap();
-        let client = DeepSeekClient::new(&config).expect("Codex client");
+        let client = CodewhaleClient::new(&config).expect("Codex client");
         assert_eq!(client.api_key, token_a);
         assert_eq!(client.codex_account_id.as_deref(), Some("account-a"));
         assert_eq!(
@@ -8087,9 +8305,9 @@ mod tests {
         assert_eq!(client.codex_account_id.as_deref(), Some("account-a"));
     }
 
-    fn client_with_config_secret_sentinels() -> DeepSeekClient {
+    fn client_with_config_secret_sentinels() -> CodewhaleClient {
         let _ = rustls::crypto::ring::default_provider().install_default();
-        DeepSeekClient::new(&Config {
+        CodewhaleClient::new(&Config {
             provider: Some("zai".to_string()),
             api_key: Some(CONFIG_SECRET_SENTINELS[0].to_string()),
             providers: Some(ProvidersConfig {
@@ -8310,7 +8528,7 @@ mod tests {
         )
         .expect("record opt-out confirmation");
 
-        let client = DeepSeekClient::new(&Config {
+        let client = CodewhaleClient::new(&Config {
             loaded_config_path: Some(codewhale_home.join("config.toml")),
             provider: Some("zai".to_string()),
             api_key: Some(CONFIG_SECRET_SENTINELS[0].to_string()),
@@ -8371,7 +8589,7 @@ mod tests {
                 custom.canonicalize().unwrap()
             );
             assert!(crate::tui::redaction_gate::confirmation_required(&config));
-            let client = DeepSeekClient::new(&config).unwrap();
+            let client = CodewhaleClient::new(&config).unwrap();
             let prepared =
                 client.prepare_model_bound_request(request_with_tool_result(tool_output.clone()));
             assert!(!tool_result_content(&prepared).contains(CONFIG_SECRET_SENTINELS[6]));
@@ -8381,7 +8599,7 @@ mod tests {
         for explicit in [Some(custom.clone()), None] {
             let config = Config::load(explicit, None).unwrap();
             assert!(!crate::tui::redaction_gate::confirmation_required(&config));
-            let client = DeepSeekClient::new(&config).unwrap();
+            let client = CodewhaleClient::new(&config).unwrap();
             let prepared =
                 client.prepare_model_bound_request(request_with_tool_result(tool_output.clone()));
             assert_eq!(tool_result_content(&prepared), tool_output);
@@ -8406,7 +8624,7 @@ mod tests {
         let _codewhale_home =
             crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", &codewhale_home);
 
-        let client = DeepSeekClient::new(&Config {
+        let client = CodewhaleClient::new(&Config {
             provider: Some("zai".to_string()),
             api_key: Some(CONFIG_SECRET_SENTINELS[0].to_string()),
             providers: Some(ProvidersConfig {
@@ -8466,7 +8684,7 @@ mod tests {
             .expect("write isolated inactive provider credential");
 
         let _ = rustls::crypto::ring::default_provider().install_default();
-        let client = DeepSeekClient::new(&Config {
+        let client = CodewhaleClient::new(&Config {
             provider: Some("zai".to_string()),
             providers: Some(ProvidersConfig {
                 zai: ProviderConfig {
@@ -8696,7 +8914,7 @@ mod tests {
         assert!(!serialized.contains("retrieve_tool_result ref=sha:"));
     }
 
-    fn deepseek_anthropic_client(server: &MockServer) -> DeepSeekClient {
+    fn deepseek_anthropic_client(server: &MockServer) -> CodewhaleClient {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let providers = ProvidersConfig {
             deepseek_anthropic: ProviderConfig {
@@ -8706,7 +8924,7 @@ mod tests {
             },
             ..ProvidersConfig::default()
         };
-        DeepSeekClient::new(&Config {
+        CodewhaleClient::new(&Config {
             provider: Some("deepseek-anthropic".to_string()),
             providers: Some(providers),
             ..Config::default()
@@ -8714,7 +8932,7 @@ mod tests {
         .expect("deepseek anthropic client")
     }
 
-    fn minimax_anthropic_client_with_base_url(base_url: String) -> DeepSeekClient {
+    fn minimax_anthropic_client_with_base_url(base_url: String) -> CodewhaleClient {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let providers = ProvidersConfig {
             minimax_anthropic: ProviderConfig {
@@ -8724,7 +8942,7 @@ mod tests {
             },
             ..ProvidersConfig::default()
         };
-        DeepSeekClient::new(&Config {
+        CodewhaleClient::new(&Config {
             provider: Some("minimax-anthropic".to_string()),
             providers: Some(providers),
             ..Config::default()
@@ -8732,7 +8950,7 @@ mod tests {
         .expect("minimax anthropic client")
     }
 
-    fn zai_client_for_test() -> DeepSeekClient {
+    fn zai_client_for_test() -> CodewhaleClient {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let providers = ProvidersConfig {
             zai: ProviderConfig {
@@ -8742,7 +8960,7 @@ mod tests {
             },
             ..ProvidersConfig::default()
         };
-        DeepSeekClient::new(&Config {
+        CodewhaleClient::new(&Config {
             provider: Some("zai".to_string()),
             providers: Some(providers),
             ..Config::default()
@@ -8750,8 +8968,8 @@ mod tests {
         .expect("zai client")
     }
 
-    fn runtime_chat_gate_client(isolated: bool, unrelated: bool) -> DeepSeekClient {
-        DeepSeekClient::new(&Config {
+    fn runtime_chat_gate_client(isolated: bool, unrelated: bool) -> CodewhaleClient {
+        CodewhaleClient::new(&Config {
             provider: Some("ollama".to_string()),
             default_text_model: Some("fixture-local:tag".to_string()),
             runtime_chat_isolated: isolated,
@@ -8847,7 +9065,7 @@ mod tests {
                 vec![Ok(StreamEvent::MessageStop)],
             ));
             let mut wrapped =
-                DeepSeekClient::hold_provider_request_permit_for_stream(stream, Some(permit));
+                CodewhaleClient::hold_provider_request_permit_for_stream(stream, Some(permit));
 
             assert_eq!(client.active_provider_requests(), 1);
             assert!(wrapped.next().await.is_some());
@@ -8865,7 +9083,7 @@ mod tests {
             .expect("interactive participant read permit");
         let stream: crate::llm_client::StreamEventBox = Box::pin(futures_util::stream::pending());
         let wrapped =
-            DeepSeekClient::hold_remote_control_inference_permit_for_stream(stream, Some(permit));
+            CodewhaleClient::hold_remote_control_inference_permit_for_stream(stream, Some(permit));
 
         let mut writer = tokio::spawn(acquire_runtime_chat_inference_ownership());
         assert!(
@@ -9160,7 +9378,7 @@ mod tests {
         {
             let mut extra = HashMap::new();
             extra.insert("X-Model-Provider-Id".to_string(), "tongyi".to_string());
-            let headers = DeepSeekClient::default_headers("sk-test", &extra).expect("headers");
+            let headers = CodewhaleClient::default_headers("sk-test", &extra).expect("headers");
             assert_eq!(
                 headers
                     .get("x-model-provider-id")
@@ -9172,7 +9390,7 @@ mod tests {
         {
             let mut extra = HashMap::new();
             extra.insert("X-Blank".to_string(), "   ".to_string());
-            let headers = DeepSeekClient::default_headers("sk-test", &extra).expect("headers");
+            let headers = CodewhaleClient::default_headers("sk-test", &extra).expect("headers");
             assert!(headers.get("x-blank").is_none());
         }
     }
@@ -9205,7 +9423,7 @@ mod tests {
         extra.insert("Cookie".to_string(), "session=secret".to_string());
         extra.insert("X-Route-Metadata".to_string(), "safe".to_string());
 
-        let headers = DeepSeekClient::default_headers_for_provider_with_auth_disabled(
+        let headers = CodewhaleClient::default_headers_for_provider_with_auth_disabled(
             "generated-secret",
             &extra,
             ApiProvider::Deepseek,
@@ -9235,7 +9453,7 @@ mod tests {
 
     #[test]
     fn build_http_client_accepts_default_tls_verification() {
-        let client = DeepSeekClient::build_http_client(
+        let client = CodewhaleClient::build_http_client(
             "sk-test",
             &HashMap::new(),
             ApiProvider::Deepseek,
@@ -9258,7 +9476,7 @@ mod tests {
         };
         assert!(config.insecure_skip_tls_verify());
 
-        let err = match DeepSeekClient::new(&config) {
+        let err = match CodewhaleClient::new(&config) {
             Ok(_) => panic!("tls skip verify should be rejected"),
             Err(err) => err,
         };
@@ -9269,7 +9487,7 @@ mod tests {
 
     #[test]
     fn client_stream_idle_timeout_uses_tui_config() {
-        let client = DeepSeekClient::new(&Config {
+        let client = CodewhaleClient::new(&Config {
             api_key: Some("sk-test".to_string()),
             tui: Some(crate::config::TuiConfig {
                 stream_chunk_timeout_secs: Some(777),
@@ -9291,7 +9509,7 @@ mod tests {
         // Scenario consolidation of: xiaomi_mimo_token_plan_endpoint_uses_api_key_header, xiaomi_mimo_tp_key_uses_api_key_header_with_custom_base_url, xiaomi_mimo_pay_as_you_go_endpoint_keeps_bearer_header
         // from xiaomi_mimo_token_plan_endpoint_uses_api_key_header
         {
-            let headers = DeepSeekClient::default_headers_for_provider(
+            let headers = CodewhaleClient::default_headers_for_provider(
                 "tp-test",
                 &HashMap::new(),
                 ApiProvider::XiaomiMimo,
@@ -9313,7 +9531,7 @@ mod tests {
             let mut extra = HashMap::new();
             extra.insert("api-key".to_string(), "wrong".to_string());
             extra.insert("Authorization".to_string(), "Bearer wrong".to_string());
-            let headers = DeepSeekClient::default_headers_for_provider(
+            let headers = CodewhaleClient::default_headers_for_provider(
                 "tp-custom",
                 &extra,
                 ApiProvider::XiaomiMimo,
@@ -9332,7 +9550,7 @@ mod tests {
         }
         // from xiaomi_mimo_pay_as_you_go_endpoint_keeps_bearer_header
         {
-            let headers = DeepSeekClient::default_headers_for_provider(
+            let headers = CodewhaleClient::default_headers_for_provider(
                 "sk-test",
                 &HashMap::new(),
                 ApiProvider::XiaomiMimo,
@@ -9354,7 +9572,7 @@ mod tests {
     fn openrouter_uses_bearer_header_after_mimo_token_plan_context() {
         let mut extra = HashMap::new();
         extra.insert("api-key".to_string(), "wrong".to_string());
-        let headers = DeepSeekClient::default_headers_for_provider(
+        let headers = CodewhaleClient::default_headers_for_provider(
             "sk-or-test",
             &extra,
             ApiProvider::Openrouter,
@@ -9379,7 +9597,7 @@ mod tests {
         let mut extra = HashMap::new();
         extra.insert("Authorization".to_string(), "Bearer wrong".to_string());
         extra.insert("Content-Type".to_string(), "text/plain".to_string());
-        let headers = DeepSeekClient::default_headers_for_provider(
+        let headers = CodewhaleClient::default_headers_for_provider(
             "sf-cn-test",
             &extra,
             ApiProvider::SiliconflowCn,
@@ -9405,7 +9623,7 @@ mod tests {
     #[test]
     fn opencode_go_and_zen_requests_carry_stable_session_header() {
         for api_provider in [ApiProvider::OpencodeGo, ApiProvider::OpencodeZen] {
-            let headers = DeepSeekClient::default_headers_for_provider(
+            let headers = CodewhaleClient::default_headers_for_provider(
                 "configured-key",
                 &HashMap::new(),
                 api_provider,
@@ -9421,7 +9639,7 @@ mod tests {
 
             // The gateway requires one stable ID per conversation: a second
             // request from the same process must reuse the same value.
-            let headers2 = DeepSeekClient::default_headers_for_provider(
+            let headers2 = CodewhaleClient::default_headers_for_provider(
                 "configured-key",
                 &HashMap::new(),
                 api_provider,
@@ -9445,7 +9663,7 @@ mod tests {
             "x-opencode-session".to_string(),
             "user-configured-id".to_string(),
         );
-        let headers = DeepSeekClient::default_headers_for_provider(
+        let headers = CodewhaleClient::default_headers_for_provider(
             "configured-key",
             &extra,
             ApiProvider::OpencodeGo,
@@ -9468,7 +9686,7 @@ mod tests {
             ApiProvider::Anthropic,
             ApiProvider::Openai,
         ] {
-            let headers = DeepSeekClient::default_headers_for_provider(
+            let headers = CodewhaleClient::default_headers_for_provider(
                 "configured-key",
                 &HashMap::new(),
                 api_provider,
@@ -9487,7 +9705,7 @@ mod tests {
         let mut extra = HashMap::new();
         extra.insert("api-key".to_string(), "wrong".to_string());
         extra.insert("x-api-key".to_string(), "wrong".to_string());
-        let headers = DeepSeekClient::default_headers_for_provider(
+        let headers = CodewhaleClient::default_headers_for_provider(
             "tokenhub-test",
             &extra,
             ApiProvider::Openai,
@@ -9506,11 +9724,15 @@ mod tests {
     }
 
     #[test]
-    fn codewhale_authenticates_both_protocols_with_bearer_never_x_api_key() {
+    fn codewhale_authenticates_every_protocol_with_bearer_never_x_api_key() {
         // The Codewhale API is a passthrough: it authenticates the account key
         // with `Authorization: Bearer` on the Anthropic Messages route too, so
         // the usual Messages `x-api-key` default must not apply here.
-        for wire in [WireFormat::ChatCompletions, WireFormat::AnthropicMessages] {
+        for wire in [
+            WireFormat::ChatCompletions,
+            WireFormat::AnthropicMessages,
+            WireFormat::Responses,
+        ] {
             let headers = build_default_headers(
                 "cwc_key_test",
                 &HashMap::new(),
@@ -9536,7 +9758,7 @@ mod tests {
         let mut extra = HashMap::new();
         extra.insert("Authorization".to_string(), "Bearer wrong".to_string());
         extra.insert("api-key".to_string(), "wrong".to_string());
-        let headers = DeepSeekClient::default_headers_for_provider(
+        let headers = CodewhaleClient::default_headers_for_provider(
             "ds-test",
             &extra,
             ApiProvider::DeepseekAnthropic,
@@ -9568,7 +9790,7 @@ mod tests {
 
     #[test]
     fn minimax_anthropic_uses_anthropic_header_dialect() {
-        let headers = DeepSeekClient::default_headers_for_provider(
+        let headers = CodewhaleClient::default_headers_for_provider(
             "minimax-test",
             &HashMap::new(),
             ApiProvider::MinimaxAnthropic,
@@ -9597,7 +9819,7 @@ mod tests {
         extra.insert("Authorization".to_string(), "Bearer wrong".to_string());
         extra.insert("api-key".to_string(), "wrong".to_string());
         extra.insert("x-api-key".to_string(), "wrong".to_string());
-        let headers = DeepSeekClient::default_headers_for_provider(
+        let headers = CodewhaleClient::default_headers_for_provider(
             "om-test",
             &extra,
             ApiProvider::Openmodel,
@@ -9825,7 +10047,7 @@ mod tests {
     fn custom_api_key_header_is_allowed_without_primary_provider_key() {
         let mut extra = HashMap::new();
         extra.insert("api-key".to_string(), "gateway-key".to_string());
-        let headers = DeepSeekClient::default_headers_for_provider(
+        let headers = CodewhaleClient::default_headers_for_provider(
             "",
             &extra,
             ApiProvider::Openai,
@@ -10645,6 +10867,57 @@ mod tests {
     /// high (#52). Hosted DeepSeek-compatible routes keep the historic
     /// low/medium → high collapse because their own wire contracts are not
     /// verified here.
+    #[test]
+    fn stepfun_reasoning_effort_respects_each_model_wire_contract() {
+        for (model, effort, expected) in [
+            ("step-5-preview", "low", Some("low")),
+            ("step-5-preview", "medium", Some("medium")),
+            ("step-5-preview", "max", Some("high")),
+            ("step-3.7-flash", "medium", Some("medium")),
+            ("step-3.5-flash-2603", "medium", Some("high")),
+            ("step-3.5-flash-2603", "low", Some("low")),
+            ("step-3.5-flash", "high", None),
+            ("step-5-preview", "off", None),
+            ("step-5-preview", "auto", None),
+            ("step-audio-2", "high", None),
+        ] {
+            let mut body = json!({"model": model});
+            apply_reasoning_effort(&mut body, Some(effort), ApiProvider::Stepfun);
+            assert_eq!(
+                body.get("reasoning_effort").and_then(Value::as_str),
+                expected,
+                "{model}/{effort}"
+            );
+            assert!(body.get("thinking").is_none());
+        }
+    }
+
+    #[test]
+    fn stepfun_discovery_excludes_non_coding_and_retired_models() {
+        let models = parse_models_response(
+            r#"{"data":[
+            {"id":"step-5-preview"},{"id":"step-3.7-flash"},
+            {"id":"step-3.5-flash"},{"id":"step-3.5-flash-2603"},
+            {"id":"step-audio-2"},{"id":"step-tts-2"},
+            {"id":"step-image-edit-2"},{"id":"step-2x-large"},{"id":"step-3"}
+        ]}"#,
+        )
+        .unwrap();
+        let filtered = apply_provider_model_cutline(ApiProvider::Stepfun, models);
+        assert_eq!(
+            filtered
+                .iter()
+                .map(|model| model.id.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "step-3.5-flash",
+                "step-3.5-flash-2603",
+                "step-3.7-flash",
+                "step-5-preview"
+            ]
+        );
+    }
+
     #[test]
     fn reasoning_effort_deepseek_maps_the_documented_wire_ladder() {
         let mut body = json!({});
@@ -11677,6 +11950,13 @@ mod tests {
                  "codewhale": {"provider": "anthropic", "model": "claude-sonnet-5",
                                "protocol": "anthropic-messages",
                                "endpoint": "/v1/messages", "usable": true}},
+                {"id": "openai/gpt-5.6", "object": "model", "owned_by": "openai",
+                 "codewhale": {"provider": "openai", "model": "gpt-5.6",
+                               "protocol": "responses",
+                               "endpoint": "/v1/responses", "usable": true}},
+                {"id": "xai/grok-4.6", "object": "model", "owned_by": "xai",
+                 "codewhale": {"provider": "xai", "model": "grok-4.6",
+                               "protocol": "some-future-wire", "usable": true}},
                 {"id": "deepseek/deepseek-v4-pro", "object": "model"},
                 {"id": "   ", "object": "model"},
                 {"id": "anthropic/claude-opus-4-8", "object": "model"}
@@ -11689,12 +11969,17 @@ mod tests {
             .iter()
             .map(|row| (row.wire_model_id.as_str(), row))
             .collect();
-        assert_eq!(rows.len(), 3, "blank and duplicate ids are dropped");
+        assert_eq!(rows.len(), 5, "blank and duplicate ids are dropped");
         // The protocol comes from the response, not from a compiled roster.
         assert_eq!(by_id["deepseek/deepseek-v4-pro"].endpoint_key, "chat");
         assert!(by_id["deepseek/deepseek-v4-pro"].default_for_provider);
         assert_eq!(by_id["anthropic/claude-sonnet-5"].endpoint_key, "messages");
         assert!(!by_id["anthropic/claude-sonnet-5"].default_for_provider);
+        assert_eq!(by_id["openai/gpt-5.6"].endpoint_key, "responses");
+        // A protocol label this build predates is not an error: the row falls
+        // back to the namespace rule so a forward-compatible catalog stays
+        // reachable.
+        assert_eq!(by_id["xai/grok-4.6"].endpoint_key, "chat");
         // A row with no `codewhale` block still resolves through the namespace
         // rule rather than being dropped: the account listed it.
         assert_eq!(by_id["anthropic/claude-opus-4-8"].endpoint_key, "messages");
@@ -11775,9 +12060,9 @@ mod tests {
     // issue's anti-hardcoding rule.
 
     /// Build a client whose OpenRouter base URL points at a mock server.
-    pub(super) fn openrouter_client_for(server: &MockServer) -> DeepSeekClient {
+    pub(super) fn openrouter_client_for(server: &MockServer) -> CodewhaleClient {
         let _ = rustls::crypto::ring::default_provider().install_default();
-        DeepSeekClient::new(&Config {
+        CodewhaleClient::new(&Config {
             provider: Some("openrouter".to_string()),
             providers: Some(ProvidersConfig {
                 openrouter: ProviderConfig {
@@ -11792,27 +12077,23 @@ mod tests {
         .expect("openrouter client")
     }
 
-    pub(super) fn baseten_client_for(server: &MockServer) -> DeepSeekClient {
-        baseten_client_for_identity(server, codewhale_config::BASETEN_TEMPLATE_ID)
-    }
-
-    pub(super) fn baseten_client_for_identity(
+    pub(super) fn custom_mock_client_for_identity(
         server: &MockServer,
         identity: &str,
-    ) -> DeepSeekClient {
+    ) -> CodewhaleClient {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let mut providers = ProvidersConfig::default();
         providers.custom.insert(
             identity.to_string(),
             ProviderConfig {
                 kind: Some("openai-compatible".to_string()),
-                api_key: Some("test-baseten-key".to_string()),
+                api_key: Some("test-custom-key".to_string()),
                 base_url: Some(format!("{}/v1", server.uri())),
-                model: Some(codewhale_config::BASETEN_DEFAULT_MODEL.to_string()),
+                model: Some("synthetic/custom-model".to_string()),
                 ..ProviderConfig::default()
             },
         );
-        DeepSeekClient::new(&Config {
+        CodewhaleClient::new(&Config {
             provider: Some(identity.to_string()),
             providers: Some(providers),
             ..Config::default()
@@ -11820,9 +12101,9 @@ mod tests {
         .expect("Baseten client")
     }
 
-    pub(super) fn opencode_go_client_for(server: &MockServer) -> DeepSeekClient {
+    pub(super) fn opencode_go_client_for(server: &MockServer) -> CodewhaleClient {
         let _ = rustls::crypto::ring::default_provider().install_default();
-        DeepSeekClient::new(&Config {
+        CodewhaleClient::new(&Config {
             provider: Some("opencode-go".to_string()),
             providers: Some(ProvidersConfig {
                 opencode_go: ProviderConfig {
@@ -11837,9 +12118,9 @@ mod tests {
         .expect("OpenCode Go client")
     }
 
-    fn telecomjs_client_for(server: &MockServer) -> DeepSeekClient {
+    fn telecomjs_client_for(server: &MockServer) -> CodewhaleClient {
         let _ = rustls::crypto::ring::default_provider().install_default();
-        DeepSeekClient::new(&Config {
+        CodewhaleClient::new(&Config {
             provider: Some("telecomjs".to_string()),
             providers: Some(ProvidersConfig {
                 telecomjs: ProviderConfig {
@@ -11854,9 +12135,9 @@ mod tests {
         .expect("TelecomJS client")
     }
 
-    fn edenai_client_for(server: &MockServer) -> DeepSeekClient {
+    fn edenai_client_for(server: &MockServer) -> CodewhaleClient {
         let _ = rustls::crypto::ring::default_provider().install_default();
-        DeepSeekClient::new(&Config {
+        CodewhaleClient::new(&Config {
             provider: Some("edenai".to_string()),
             providers: Some(ProvidersConfig {
                 edenai: ProviderConfig {
@@ -11934,7 +12215,7 @@ mod tests {
                 }),
                 ..Config::default()
             };
-            let err = DeepSeekClient::new(&config)
+            let err = CodewhaleClient::new(&config)
                 .err()
                 .expect("unknown protocol must fail before client construction");
             assert!(err.to_string().contains(model), "{err:#}");
@@ -12312,55 +12593,46 @@ mod tests {
             openrouter_lkg
         );
 
-        let baseten_server = MockServer::start().await;
+        // Same plumbing for an ordinary custom host: the generic branch
+        // ignores unknown pricing fields, so the failure injector here is a
+        // body that is not a model list at all. Absurd-price rejection stays
+        // covered at the Baseten builder's own fixture tests.
+        let custom_server = MockServer::start().await;
         mount_models_json(
-            &baseten_server,
+            &custom_server,
             200,
             json!({"data": [{
-                "id": "synthetic/baseten-priced",
-                "pricing": {"prompt": "0.000001", "completion": "0.000002"}
+                "id": "synthetic/custom-model"
             }]}),
         )
         .await;
-        let baseten = baseten_client_for(&baseten_server);
-        let mut baseten_cache = ProviderCatalogCache::new();
+        let custom = custom_mock_client_for_identity(&custom_server, "custom-lkg");
+        let mut custom_cache = ProviderCatalogCache::new();
         assert_eq!(
-            baseten
-                .refresh_catalog_cache(&mut baseten_cache, 3_600)
-                .await,
+            custom.refresh_catalog_cache(&mut custom_cache, 3_600).await,
             CatalogStatus::Fresh
         );
-        let baseten_fp = base_url_fingerprint(&format!("{}/v1", baseten_server.uri()));
-        let baseten_lkg = baseten_cache
-            .get(codewhale_config::BASETEN_TEMPLATE_ID, &baseten_fp)
-            .expect("Baseten LKG")
+        let custom_fp = base_url_fingerprint(&format!("{}/v1", custom_server.uri()));
+        let custom_lkg = custom_cache
+            .get("custom-lkg", &custom_fp)
+            .expect("custom LKG")
             .offerings
             .clone();
 
-        baseten_server.reset().await;
-        mount_models_json(
-            &baseten_server,
-            200,
-            json!({"data": [{
-                "id": "synthetic/baseten-priced",
-                "pricing": {"prompt": "0.100001", "completion": "0.000002"}
-            }]}),
-        )
-        .await;
+        custom_server.reset().await;
+        mount_models_json(&custom_server, 200, json!("not a model list")).await;
         assert!(matches!(
-            baseten
-                .refresh_catalog_cache(&mut baseten_cache, 3_600)
-                .await,
+            custom.refresh_catalog_cache(&mut custom_cache, 3_600).await,
             CatalogStatus::Failed {
                 reason: CatalogRefreshError::InvalidResponse
             }
         ));
         assert_eq!(
-            baseten_cache
-                .get(codewhale_config::BASETEN_TEMPLATE_ID, &baseten_fp)
-                .expect("preserved Baseten LKG")
+            custom_cache
+                .get("custom-lkg", &custom_fp)
+                .expect("preserved custom LKG")
                 .offerings,
-            baseten_lkg
+            custom_lkg
         );
     }
 
@@ -12447,7 +12719,7 @@ mod tests {
             }),
             ..Config::default()
         };
-        let client = DeepSeekClient::new(&config).expect("MiniMax client");
+        let client = CodewhaleClient::new(&config).expect("MiniMax client");
         let dispatched_at =
             chrono::DateTime::<chrono::Utc>::from_timestamp(1_234, 0).expect("timestamp");
         let route = client.effective_route_envelope("MiniMax-M3", dispatched_at);
@@ -12982,7 +13254,7 @@ mod tests {
             let (_config, route) =
                 deepseek_route_for_test("https://route.example.com/v1", "deepseek-v4-pro");
 
-            let client = DeepSeekClient::from_candidate(&route.config, &route.candidate)
+            let client = CodewhaleClient::from_candidate(&route.config, &route.candidate)
                 .expect("client should construct from candidate");
 
             // The transport is bound to the candidate, not re-derived from Config.
@@ -13001,8 +13273,8 @@ mod tests {
             let (_config, route) =
                 deepseek_route_for_test("https://api.deepseek.com/v1", "deepseek-v4-pro");
 
-            let from_new = DeepSeekClient::new(&route.config).expect("new client");
-            let from_candidate = DeepSeekClient::from_candidate(&route.config, &route.candidate)
+            let from_new = CodewhaleClient::new(&route.config).expect("new client");
+            let from_candidate = CodewhaleClient::from_candidate(&route.config, &route.candidate)
                 .expect("candidate client");
 
             assert_eq!(from_candidate.base_url, from_new.base_url);
@@ -13011,7 +13283,7 @@ mod tests {
         }
     }
 
-    fn route_cap_test_client(wire_format: WireFormat, limits: RouteLimits) -> DeepSeekClient {
+    fn route_cap_test_client(wire_format: WireFormat, limits: RouteLimits) -> CodewhaleClient {
         let config = Config {
             provider: Some("custom".to_string()),
             api_key: Some("route-cap-test".to_string()),
@@ -13019,7 +13291,7 @@ mod tests {
             default_text_model: Some("DeepSeek-V4-Flash".to_string()),
             ..Config::default()
         };
-        DeepSeekClient::from_parts(
+        CodewhaleClient::from_parts(
             "https://route-cap.example/v1".to_string(),
             "DeepSeek-V4-Flash".to_string(),
             wire_format,
@@ -13045,10 +13317,11 @@ mod tests {
         };
         config.provider_config_for_mut(ApiProvider::Ollama).base_url = Some(endpoint.into());
         assert!(
-            DeepSeekClient::new(&config).is_err(),
+            CodewhaleClient::new(&config).is_err(),
             "unknown must not become a dispatch model"
         );
-        let probe = DeepSeekClient::for_catalog_refresh(&config).expect("catalog bootstrap client");
+        let probe =
+            CodewhaleClient::for_catalog_refresh(&config).expect("catalog bootstrap client");
         assert_eq!(probe.base_url, endpoint);
         let ticket = crate::provider_catalog_live::begin_refresh_for_identity(
             ApiProvider::Ollama,
@@ -13078,7 +13351,7 @@ mod tests {
                     .collect(),
             },
         );
-        let client = DeepSeekClient::new(&config).expect("fresh local model client");
+        let client = CodewhaleClient::new(&config).expect("fresh local model client");
         assert_eq!(client.default_model, "alpha:tag");
         let route = crate::route_runtime::resolve_runtime_route(&config, ApiProvider::Ollama, None)
             .unwrap();
@@ -13088,7 +13361,7 @@ mod tests {
         );
         config.set_provider_model_override(ApiProvider::Ollama, Some("saved:tag".into()));
         assert_eq!(
-            DeepSeekClient::new(&config).unwrap().default_model,
+            CodewhaleClient::new(&config).unwrap().default_model,
             "saved:tag"
         );
         crate::provider_catalog_live::reset_cache_for_test();
@@ -13113,7 +13386,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let client = DeepSeekClient::new(&config).unwrap();
+        let client = CodewhaleClient::new(&config).unwrap();
         assert_eq!(
             client
                 .route_limits()
@@ -13239,7 +13512,7 @@ mod tests {
             }),
             ..Config::default()
         };
-        let client = DeepSeekClient::new(&config).expect("OpenRouter client resolves");
+        let client = CodewhaleClient::new(&config).expect("OpenRouter client resolves");
         assert_eq!(client.wire_format, WireFormat::ChatCompletions);
         assert!(client.route_limits.is_some());
 
@@ -13313,7 +13586,7 @@ mod tests {
             default_text_model: Some("local-fim".to_string()),
             ..Config::default()
         };
-        let client = DeepSeekClient::from_parts(
+        let client = CodewhaleClient::from_parts(
             base_url,
             "local-fim".to_string(),
             WireFormat::ChatCompletions,
@@ -13347,7 +13620,7 @@ mod tests {
             deepseek_route_for_test("https://api.deepseek.com/beta", "deepseek-v4-flash");
         assert_eq!(route.candidate.protocol(), WireFormat::Responses);
 
-        let client = DeepSeekClient::new(&route.config).expect("Flash client resolves");
+        let client = CodewhaleClient::new(&route.config).expect("Flash client resolves");
         assert_eq!(client.wire_format, WireFormat::Responses);
 
         let prepared = client
@@ -13391,8 +13664,8 @@ mod tests {
         assert!(route.candidate.canonical_model().is_none());
 
         for client in [
-            DeepSeekClient::new(&route.config).expect("preview client resolves"),
-            DeepSeekClient::from_candidate(&route.config, &route.candidate)
+            CodewhaleClient::new(&route.config).expect("preview client resolves"),
+            CodewhaleClient::from_candidate(&route.config, &route.candidate)
                 .expect("preview client binds the admitted candidate"),
         ] {
             assert_eq!(client.wire_format, WireFormat::ChatCompletions);
@@ -13472,7 +13745,7 @@ mod tests {
             default_text_model: Some(model.to_string()),
             ..Default::default()
         };
-        let client = DeepSeekClient::from_candidate(&config, &candidate)
+        let client = CodewhaleClient::from_candidate(&config, &candidate)
             .expect("client binds exact synthetic catalog offering");
         assert!(
             client
@@ -13532,7 +13805,7 @@ mod tests {
         // instead of failing deterministically at first send.
         let (_config, route) =
             deepseek_route_for_test("https://api.deepseek.com/beta", "deepseek-v4-pro");
-        let client = DeepSeekClient::new(&route.config).expect("pro client resolves");
+        let client = CodewhaleClient::new(&route.config).expect("pro client resolves");
         assert_eq!(client.wire_format, WireFormat::ChatCompletions);
 
         let rebound = client
@@ -13548,6 +13821,25 @@ mod tests {
                 .expect("pro rebind resolves")
                 .is_none(),
             "a matching protocol must not rebuild the client"
+        );
+    }
+
+    #[test]
+    fn untethered_cross_protocol_rebound_fails_closed_without_config() {
+        // #6320: the #5042 early-outs cover the already-exact route, but a
+        // cross-protocol rebound with no Config to rebuild from still fails
+        // closed — this is what still guards half-bound dispatch.
+        let (_config, route) =
+            deepseek_route_for_test("https://api.deepseek.com/beta", "deepseek-v4-pro");
+        let client = CodewhaleClient::new(&route.config).expect("pro client resolves");
+        assert_eq!(client.wire_format, WireFormat::ChatCompletions);
+        let err = match client.rebound_for_model_protocol(None, "deepseek-v4-flash") {
+            Ok(_) => panic!("cross-protocol rebound without config fails closed"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("no configuration is available"),
+            "{err}"
         );
     }
 
@@ -13587,7 +13879,7 @@ mod tests {
         unsafe {
             std::env::set_var("EXAMPLE_API_KEY_FROM_CANDIDATE_TEST", "sk-custom");
         }
-        let client = DeepSeekClient::from_candidate(&route.config, &route.candidate)
+        let client = CodewhaleClient::from_candidate(&route.config, &route.candidate)
             .expect("client should construct from custom candidate");
         unsafe {
             std::env::remove_var("EXAMPLE_API_KEY_FROM_CANDIDATE_TEST");
@@ -13710,20 +14002,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn baseten_live_catalog_keeps_exact_identity_auth_and_metadata() {
+    async fn custom_catalog_schema_ignores_table_name() {
+        // The same enriched body served from a non-Baseten endpoint takes
+        // the generic branch for every identity: the table name selects
+        // ownership, never the wire parser (#6289). Baseten enrichment
+        // itself stays covered at the parser's fixture tests.
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/v1/models"))
-            .and(header("authorization", "Bearer test-baseten-key"))
+            .and(header("authorization", "Bearer test-custom-key"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "data": [{
-                    "id": codewhale_config::BASETEN_DEFAULT_MODEL,
+                    "id": "synthetic/custom-model",
                     "context_length": 1_048_576,
-                    "max_completion_tokens": 262_144,
                     "pricing": {
                         "prompt": 0.0000014,
-                        "completion": 0.0000044,
-                        "input_cache_read": 0.00000014
+                        "completion": 0.0000044
                     },
                     "supported_features": ["reasoning", "tools", "structured_outputs", "vision"]
                 }]
@@ -13731,51 +14025,54 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = baseten_client_for(&server);
-        assert_eq!(client.catalog_provider_id(), "baseten");
-        let delta = client.fetch_catalog_delta().await.expect("Baseten delta");
-        assert_eq!(delta.provider, "baseten");
-        assert_eq!(delta.offerings.len(), 1);
-        let offering = &delta.offerings[0];
-        assert_eq!(
-            offering.wire_model_id,
-            codewhale_config::BASETEN_DEFAULT_MODEL
-        );
-        assert_eq!(
-            offering.limit.as_ref().and_then(|limit| limit.context),
-            Some(1_048_576)
-        );
-        assert_eq!(
-            offering.cost.as_ref().and_then(|cost| cost.input),
-            Some(1.4)
-        );
-        assert_eq!(offering.tool_call, Some(true));
-        assert_eq!(offering.structured_output, Some(true));
+        for identity in ["baseten", "renamed-host"] {
+            let client = custom_mock_client_for_identity(&server, identity);
+            assert_eq!(client.catalog_provider_id(), identity);
+            let delta = client.fetch_catalog_delta().await.expect("delta");
+            assert_eq!(delta.provider, identity);
+            assert_eq!(delta.offerings.len(), 1);
+            let offering = &delta.offerings[0];
+            assert_eq!(offering.wire_model_id, "synthetic/custom-model");
+            assert_eq!(offering.provider, identity);
+            assert!(
+                offering.limit.is_none() && offering.cost.is_none() && offering.tool_call.is_none(),
+                "a non-Baseten endpoint takes the generic branch for any identity: {offering:?}"
+            );
+        }
+    }
 
-        let alias = baseten_client_for_identity(&server, "base-ten");
-        assert_eq!(alias.catalog_provider_id(), "base-ten");
-        assert_eq!(
-            alias.catalog_setup_template_id(),
-            Some(codewhale_config::BASETEN_TEMPLATE_ID)
-        );
-        let alias_delta = alias
-            .fetch_catalog_delta()
-            .await
-            .expect("Baseten alias delta");
-        assert_eq!(alias_delta.provider, "base-ten");
+    #[test]
+    fn baseten_dialect_recognized_by_endpoint_not_name() {
+        fn client_for(identity: &str, base_url: &str) -> CodewhaleClient {
+            let mut providers = ProvidersConfig::default();
+            providers.custom.insert(
+                identity.to_string(),
+                ProviderConfig {
+                    kind: Some("openai-compatible".to_string()),
+                    api_key: Some("test-key".to_string()),
+                    base_url: Some(base_url.to_string()),
+                    model: Some("synthetic/custom-model".to_string()),
+                    ..ProviderConfig::default()
+                },
+            );
+            CodewhaleClient::new(&Config {
+                provider: Some(identity.to_string()),
+                providers: Some(providers),
+                ..Config::default()
+            })
+            .expect("client")
+        }
+
+        let baseten_url = codewhale_config::catalog::BASETEN_BASE_URL;
+        assert!(client_for("baseten", baseten_url).catalog_endpoint_is_baseten());
+        assert!(client_for("renamed-host", baseten_url).catalog_endpoint_is_baseten());
         assert!(
-            alias_delta
-                .offerings
-                .iter()
-                .all(|row| row.provider == "base-ten"),
-            "schema aliases must preserve exact catalog ownership"
+            client_for("baseten", &format!("{baseten_url}/")).catalog_endpoint_is_baseten(),
+            "a trailing slash still recognizes the host"
         );
-        assert_eq!(offering.attachment, Some(true));
+        assert!(!client_for("baseten", "https://127.0.0.1:9/v1").catalog_endpoint_is_baseten());
         assert!(
-            offering
-                .modalities
-                .as_ref()
-                .is_some_and(|modalities| modalities.input.iter().any(|value| value == "image"))
+            !client_for("groq", "https://api.groq.com/openai/v1").catalog_endpoint_is_baseten()
         );
     }
 }
@@ -13816,7 +14113,7 @@ mod configured_model_client_tests {
     fn alternate_declared_model_freezes_wire_limits_and_price() {
         let _env = crate::test_support::lock_test_env();
         let mut config = config();
-        let client = DeepSeekClient::from_parts(
+        let client = CodewhaleClient::from_parts(
             "https://api.deepseek.com".into(),
             "initial-model".into(),
             WireFormat::ChatCompletions,
@@ -13887,7 +14184,7 @@ mod configured_model_client_tests {
         declaration.provider = "opencode-go".into();
         declaration.base_url = base_url.into();
         declaration.id = "claude-sonnet-unproven".into();
-        let client = DeepSeekClient::from_parts(
+        let client = CodewhaleClient::from_parts(
             base_url.into(),
             config.default_model(),
             WireFormat::ChatCompletions,
@@ -13968,7 +14265,7 @@ mod openrouter_vendor_tests {
                 .mount(&server)
                 .await;
             let client =
-                DeepSeekClient::new(&config(&server.uri(), Some("deepinfra/turbo"))).unwrap();
+                CodewhaleClient::new(&config(&server.uri(), Some("deepinfra/turbo"))).unwrap();
             let mut input = request();
             input.stream = Some(streaming);
             let preview = client
@@ -14006,18 +14303,18 @@ mod openrouter_vendor_tests {
     fn openrouter_vendor_freezes_rebinds_and_partitions_cached_requests() {
         let _env = crate::test_support::lock_test_env();
         let initial = config("https://openrouter.ai/api/v1", Some("deepinfra/turbo"));
-        let client = DeepSeekClient::new(&initial).unwrap();
+        let client = CodewhaleClient::new(&initial).unwrap();
         let mut updated = initial.clone();
         updated.providers.as_mut().unwrap().openrouter.vendor =
             Some("another-vendor/region".into());
-        let fresh = DeepSeekClient::new(&updated).unwrap();
+        let fresh = CodewhaleClient::new(&updated).unwrap();
         let rebound = client
             .rebound_for_model_protocol(Some(&updated), OPENROUTER_QWEN_3_6_FLASH_MODEL)
             .unwrap()
             .unwrap();
         assert_eq!(rebound.openrouter_vendor(), Some("deepinfra/turbo"));
         assert_eq!(client.clone().openrouter_vendor(), Some("deepinfra/turbo"));
-        let key = |client: &DeepSeekClient| {
+        let key = |client: &CodewhaleClient| {
             let body = client
                 .prepare_outbound_request(request(), false)
                 .unwrap()
@@ -14032,7 +14329,7 @@ mod openrouter_vendor_tests {
         };
         assert_ne!(key(&client), key(&fresh));
         updated.providers.as_mut().unwrap().openrouter.vendor = Some(String::new());
-        let cleared = DeepSeekClient::new(&updated).unwrap();
+        let cleared = CodewhaleClient::new(&updated).unwrap();
         assert!(
             cleared
                 .prepare_outbound_request(request(), false)
@@ -14047,7 +14344,7 @@ mod openrouter_vendor_tests {
             Some("deepinfra/turbo")
         );
         assert!(
-            DeepSeekClient::new(&config("https://openrouter.ai/api/v1", Some("bad vendor")))
+            CodewhaleClient::new(&config("https://openrouter.ai/api/v1", Some("bad vendor")))
                 .is_err()
         );
         updated.provider = Some("openai".into());
@@ -14057,7 +14354,7 @@ mod openrouter_vendor_tests {
             model: Some("deepseek/deepseek-v4-pro".into()),
             ..ProviderConfig::default()
         };
-        let other = DeepSeekClient::new(&updated).unwrap();
+        let other = CodewhaleClient::new(&updated).unwrap();
         assert!(
             other
                 .prepare_outbound_request(request(), false)

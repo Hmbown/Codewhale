@@ -48,14 +48,16 @@ export interface ChromeDict {
   navContributeSecondary: string;
 
   /**
-   * The primary strip: Product / Models / Docs. The older six
-   * (Start, Install, FAQ, Community, Contribute) stay in the dictionary for
-   * the compact sheet's second group and the footer.
+   * The primary strip: Product / Models / Plugins / Docs. The
+   * older six (Start, Install, FAQ, Community, Contribute) stay in the
+   * dictionary for the compact sheet's second group and the footer.
    */
   navProduct: string;
   navModels: string;
+  navPlugins: string;
   navProductSecondary: string;
   navModelsSecondary: string;
+  navPluginsSecondary: string;
 
   /**
    * Skip-to-content link rendered before the nav in app/[locale]/layout.tsx.
@@ -759,4 +761,40 @@ export interface DocsWebDict {
   troubleshootingTitle: string;
   troubleshootingLead: string;
   sourceNote: string;
+}
+
+/** Copy for `app/[locale]/computer-use/page.tsx` and the install page's Computer Use section. */
+export interface ComputerUseDict {
+  metaTitle: string;
+  metaDescription: string;
+  title: string;
+  lead: string;
+  publisher: string;
+  /** Primary button: the notarized disk image when the release carries one, else the archive. */
+  download: string;
+  /** Secondary link to the archive the in-app updater consumes. */
+  downloadZip: string;
+  requirements: string;
+  included: string;
+  pendingTitle: string;
+  pendingBody: string;
+  unavailableTitle: string;
+  unavailableBody: string;
+  releases: string;
+  receipt: string;
+  setup: string;
+  /** Four numbered setup steps, rendered in order. */
+  steps: { title: string; body: string }[];
+  controlsTitle: string;
+  controlsBody: string;
+  updateTitle: string;
+  updateBody: string;
+  help: string;
+  notes: string;
+  demo: string;
+  source: string;
+  platforms: string;
+  installTitle: string;
+  installLead: string;
+  installLink: string;
 }

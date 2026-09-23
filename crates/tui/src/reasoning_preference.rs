@@ -114,15 +114,17 @@ impl ReasoningEffort {
     /// Parse an operator-supplied effort value.
     ///
     /// This is deliberately the one canonical spelling table for every
-    /// human-facing route. Callers that read an old persisted config may use
-    /// [`Self::from_setting`] for its compatibility fallback, but a new CLI,
-    /// settings, or tool input must reject an unknown value instead of quietly
-    /// turning it into `max`.
+    /// human-facing route. Every canonical setting spelling round-trips:
+    /// `parse_strict(as_setting(effort)) == effort`, including `minimal`.
+    /// Callers that read an old persisted config may use [`Self::from_setting`]
+    /// for its compatibility fallback, but a new CLI, settings, or tool input
+    /// must reject an unknown value instead of quietly turning it into `max`.
     pub fn parse_strict(value: &str) -> Result<Self, String> {
         let trimmed = value.trim();
         match trimmed.to_ascii_lowercase().as_str() {
             "off" | "disabled" | "none" | "false" => Ok(Self::Off),
-            "low" | "minimum" | "minimal" | "light" => Ok(Self::Low),
+            "minimal" => Ok(Self::Minimal),
+            "low" | "minimum" | "light" => Ok(Self::Low),
             "medium" | "mid" => Ok(Self::Medium),
             "high" => Ok(Self::High),
             "xhigh" => Ok(Self::XHigh),
@@ -130,7 +132,7 @@ impl ReasoningEffort {
             "ultra" | "ultracode" => Ok(Self::Ultra),
             "max" | "maximum" => Ok(Self::Max),
             _ => Err(format!(
-                "Unrecognized reasoning effort {trimmed:?}. Expected: auto, off, low, medium, high, xhigh, max, or ultra."
+                "Unrecognized reasoning effort {trimmed:?}. Expected one of: auto, off, minimal, low, medium, high, xhigh, ultra, or max."
             )),
         }
     }
@@ -425,9 +427,13 @@ impl ReasoningEffort {
         }
     }
 
-    /// Advance through an exact-route effort list. Unknown current values
-    /// enter at the first listed tier so a persisted `max` on an `xhigh`
-    /// ladder, or `off` on an always-thinking model, still moves.
+    /// Advance through an exact-route effort list.
+    ///
+    /// A value that is literally on the ladder advances one rung and wraps.
+    /// An off-ladder value enters at [`Self::nearest_in`]'s rung and advances
+    /// from there, so the cycler only ever moves forward: a persisted `max` on
+    /// an `xhigh` ladder, `ultra` on a `max` ladder, or `minimal` on a ladder
+    /// starting at `off` still walks upward instead of reversing.
     #[must_use]
     pub fn cycle_next_in(self, efforts: &[Self]) -> Self {
         if efforts.is_empty() {
@@ -436,25 +442,62 @@ impl ReasoningEffort {
         if let Some(index) = self.index_in(efforts) {
             return efforts[(index + 1) % efforts.len()];
         }
-        efforts[0]
+        let Some(entry) = self.nearest_in(efforts) else {
+            return self.cycle_next();
+        };
+        let index = entry.index_in(efforts).unwrap_or(0);
+        efforts[(index + 1) % efforts.len()]
     }
 
+    /// Ladder rank of a concrete tier.
+    ///
+    /// `Auto` is the unresolved sentinel: it names no rung, so it has no rank
+    /// and is never a projection target.
+    const fn rung_rank(self) -> Option<u8> {
+        Some(match self {
+            Self::Off => 0,
+            Self::Minimal => 1,
+            Self::Low => 2,
+            Self::Medium => 3,
+            Self::High => 4,
+            Self::XHigh => 5,
+            Self::Ultra => 6,
+            Self::Max => 7,
+            Self::Auto => return None,
+        })
+    }
+
+    /// Project an effort onto the rungs a route actually offers.
+    ///
+    /// One deterministic rule replaces the hand-written alias buckets: the
+    /// highest allowed rung at or below the current one, or the lowest allowed
+    /// rung when the current value sits below every rung or names no rung at
+    /// all (`Auto`). `None` only when the ladder publishes no rung.
+    #[must_use]
+    pub fn nearest_in(self, efforts: &[Self]) -> Option<Self> {
+        let own_rank = self.rung_rank();
+        let mut nearest_below: Option<Self> = None;
+        let mut lowest: Option<Self> = None;
+        for effort in efforts.iter().copied() {
+            let Some(rank) = effort.rung_rank() else {
+                continue;
+            };
+            if lowest.is_none_or(|current: Self| rank < current.rung_rank().unwrap_or(u8::MAX)) {
+                lowest = Some(effort);
+            }
+            if own_rank.is_some_and(|own| rank <= own)
+                && nearest_below.is_none_or(|current: Self| rank > current.rung_rank().unwrap_or(0))
+            {
+                nearest_below = Some(effort);
+            }
+        }
+        nearest_below.or(lowest)
+    }
+
+    /// Position of a literally listed value on the ladder. Values that are not
+    /// listed are handled by [`Self::nearest_in`], never by an alias table.
     fn index_in(self, efforts: &[Self]) -> Option<usize> {
-        efforts
-            .iter()
-            .position(|&effort| effort == self)
-            .or_else(|| {
-                let aliases: &[Self] = match self {
-                    Self::Max | Self::Ultra => &[Self::XHigh],
-                    Self::XHigh => &[Self::Max],
-                    Self::Minimal => &[Self::Low],
-                    Self::Low => &[Self::Minimal],
-                    _ => return None,
-                };
-                aliases
-                    .iter()
-                    .find_map(|alias| efforts.iter().position(|&effort| effort == *alias))
-            })
+        efforts.iter().position(|&effort| effort == self)
     }
 
     /// Cycle the unresolved auto-model preference without applying any
@@ -472,5 +515,127 @@ impl ReasoningEffort {
             Self::Ultra => Self::Max,
             Self::Max => Self::Auto,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ReasoningEffort;
+
+    const CANONICAL: [ReasoningEffort; 9] = [
+        ReasoningEffort::Auto,
+        ReasoningEffort::Off,
+        ReasoningEffort::Minimal,
+        ReasoningEffort::Low,
+        ReasoningEffort::Medium,
+        ReasoningEffort::High,
+        ReasoningEffort::XHigh,
+        ReasoningEffort::Ultra,
+        ReasoningEffort::Max,
+    ];
+
+    #[test]
+    fn reasoning_effort_parse_strict_round_trips_every_canonical_spelling() {
+        for effort in CANONICAL {
+            assert_eq!(
+                ReasoningEffort::parse_strict(effort.as_setting()),
+                Ok(effort),
+                "{} must parse back to itself",
+                effort.as_setting()
+            );
+            assert_eq!(
+                ReasoningEffort::from_setting(effort.as_setting()),
+                effort,
+                "a persisted {} must load as itself",
+                effort.as_setting()
+            );
+        }
+        assert_eq!(
+            ReasoningEffort::parse_strict("minimal"),
+            Ok(ReasoningEffort::Minimal)
+        );
+        assert_eq!(
+            ReasoningEffort::parse_strict("minimum"),
+            Ok(ReasoningEffort::Low)
+        );
+        assert_eq!(
+            ReasoningEffort::parse_strict("light"),
+            Ok(ReasoningEffort::Low)
+        );
+    }
+
+    #[test]
+    fn reasoning_effort_parse_strict_error_lists_the_complete_vocabulary() {
+        let error = ReasoningEffort::parse_strict("xhihg").expect_err("unknown value must fail");
+        for spelling in [
+            "auto", "off", "minimal", "low", "medium", "high", "xhigh", "ultra", "max",
+        ] {
+            assert!(
+                error.contains(spelling),
+                "the error must name {spelling}, got {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn reasoning_effort_nearest_in_projects_one_value_per_direction() {
+        use ReasoningEffort::*;
+        let full = [Off, Minimal, Low, Medium, High, XHigh, Ultra, Max];
+        // Literal members project onto themselves.
+        for effort in full {
+            assert_eq!(effort.nearest_in(&full), Some(effort));
+        }
+        // A capped ladder: the highest rung at or below wins, never a rung above.
+        let capped = [Off, Low, Medium, High, XHigh];
+        assert_eq!(Max.nearest_in(&capped), Some(XHigh));
+        assert_eq!(Ultra.nearest_in(&capped), Some(XHigh));
+        assert_eq!(Minimal.nearest_in(&capped), Some(Off));
+        // Below every rung: the lowest allowed rung is the entry point.
+        assert_eq!(Off.nearest_in(&[Low, Medium, High, Max]), Some(Low));
+        // `Auto` names no rung, so it enters at the lowest allowed rung.
+        assert_eq!(Auto.nearest_in(&[Low, Medium, High, Max]), Some(Low));
+        assert_eq!(Auto.nearest_in(&[Off, Low, High, Max]), Some(Off));
+        // A ladder that publishes no rung has nothing to project onto.
+        assert_eq!(Medium.nearest_in(&[Auto]), None);
+        assert_eq!(Medium.nearest_in(&[]), None);
+    }
+
+    #[test]
+    fn reasoning_effort_cycle_next_in_only_moves_forward_on_any_ladder() {
+        use ReasoningEffort::*;
+        // Off-ladder values enter at their nearest rung and advance one rung.
+        let capped = [Off, Low, Medium, High, XHigh];
+        assert_eq!(
+            Max.cycle_next_in(&capped),
+            Off,
+            "xhigh-capped ladder wraps forward"
+        );
+        assert_eq!(Ultra.cycle_next_in(&capped), Off);
+        assert_eq!(Minimal.cycle_next_in(&capped), Low);
+        // A value below every rung enters at the lowest rung.
+        assert_eq!(Off.cycle_next_in(&[Low, Medium, High, Max]), Medium);
+        // `Auto` enters at the ladder's lowest rung.
+        assert_eq!(Auto.cycle_next_in(&[Off, Low, High, Max]), Low);
+        // Literal members advance and wrap without an alias table.
+        assert_eq!(High.cycle_next_in(&capped), XHigh);
+        assert_eq!(XHigh.cycle_next_in(&capped), Off);
+        // An empty ladder falls back to the provider-neutral cycle.
+        assert_eq!(Off.cycle_next_in(&[]), Off.cycle_next());
+    }
+
+    #[test]
+    fn reasoning_effort_cycle_for_auto_model_walks_the_full_vocabulary() {
+        use ReasoningEffort::*;
+        let mut effort = Auto;
+        let mut seen = vec![effort];
+        for _ in 0..8 {
+            effort = effort.cycle_next_for_auto_model();
+            seen.push(effort);
+        }
+        assert_eq!(
+            seen,
+            vec![Auto, Off, Minimal, Low, Medium, High, XHigh, Ultra, Max]
+        );
+        assert_eq!(Max.cycle_next_for_auto_model(), Auto);
     }
 }

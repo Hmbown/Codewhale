@@ -199,6 +199,14 @@ pub enum ProviderKind {
     /// [`Google`]: Self::Google
     #[serde(alias = "agy")]
     Antigravity,
+    /// ModelScope — Alibaba's ModelScope inference API (OpenAI-compatible).
+    #[serde(
+        alias = "model-scope",
+        alias = "model_scope",
+        alias = "modelscope-cn",
+        alias = "modelscope_cn"
+    )]
+    Modelscope,
     /// Google — Gemini OpenAI-compatible endpoint. Its own backend, not an
     /// OpenAI alias: thought signatures on tool calls are captured and
     /// replayed per Google's contract.
@@ -218,6 +226,28 @@ pub enum ProviderKind {
     /// namespaced wire ids over the OpenAI Chat Completions protocol.
     #[serde(alias = "eden-ai", alias = "eden_ai", alias = "edenai")]
     Edenai,
+    /// ZenMux — OpenAI-compatible AI gateway (aggregator).
+    ///
+    /// Serves ~200 upstream models under `provider/model` namespaced wire
+    /// ids over the OpenAI Chat Completions protocol at
+    /// `https://zenmux.ai/api/v1`. The `/models` catalog is keyless-readable.
+    #[serde(alias = "zen-mux", alias = "zen_mux")]
+    Zenmux,
+    /// CSDN 星图 (Starmap) — CSDN's hosted OpenAI-compatible model platform
+    /// and Coding Plan subscription.
+    ///
+    /// The plan model id `glm_for_coding` (GLM-5.2 underneath, 200k context
+    /// cap) bills against plan quota and requires the dedicated Coding Plan
+    /// key type; other marketplace model ids and general keys bill metered
+    /// through the same endpoint.
+    #[serde(
+        alias = "csdn-ai",
+        alias = "csdn_ai",
+        alias = "csdn-coding-plan",
+        alias = "csdn_coding_plan",
+        alias = "starmap"
+    )]
+    Csdn,
     /// Concentrate — OpenAI Responses-compatible AI gateway (aggregator).
     ///
     /// Serves a broad catalog of upstream models over the OpenAI Responses
@@ -239,9 +269,9 @@ pub enum ProviderKind {
     /// One base URL, one `cwc_key_…` account API key with the `models:infer`
     /// scope, and a per-model wire chosen from the account's live catalog:
     /// `GET /v1/models` returns `provider/model` rows carrying
-    /// `codewhale.protocol` (`chat-completions` or `anthropic-messages`).
-    /// Both protocols authenticate with `Authorization: Bearer` — the
-    /// Anthropic passthrough does **not** take `x-api-key`.
+    /// `codewhale.protocol` (`chat-completions`, `anthropic-messages`, or
+    /// `responses`). Every protocol authenticates with `Authorization: Bearer`
+    /// — the Anthropic passthrough does **not** take `x-api-key`.
     #[serde(
         alias = "codewhale-api",
         alias = "codewhale_api",
@@ -266,7 +296,7 @@ impl ProviderKind {
     /// stay on the enum for serde and `provider_for_kind`, but they are not
     /// first-class catalog rows. Plan is `mode` / base_url; dialect is
     /// `wire = openai|anthropic` on the primary provider config.
-    pub const ALL: [Self; 43] = [
+    pub const ALL: [Self; 46] = [
         Self::Deepseek,
         Self::NvidiaNim,
         Self::Openai,
@@ -305,8 +335,11 @@ impl ProviderKind {
         Self::Mistral,
         Self::Telecomjs,
         Self::ModelstudioTokenPlan,
+        Self::Modelscope,
         Self::Google,
         Self::Edenai,
+        Self::Zenmux,
+        Self::Csdn,
         Self::Concentrate,
         Self::Codewhale,
         Self::Custom,
@@ -390,11 +423,6 @@ impl ProviderKind {
             .filter(|p| !Self::all().contains(&p.kind()))
             .find(|p| p.aliases().iter().any(|a| trimmed.eq_ignore_ascii_case(a)))
             .map(|p| p.kind())
-    }
-
-    #[must_use]
-    pub fn is_siliconflow(self) -> bool {
-        matches!(self, Self::Siliconflow | Self::SiliconflowCN)
     }
 
     /// Canonical durable-credential slot in the local secret store.

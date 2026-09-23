@@ -48,6 +48,8 @@ pub enum Feature {
     VisionModel,
     /// Enable the agent-callable `verify` adversarial self-critique tool (#4196).
     Verify,
+    /// Expose `execute_tools` eagerly so the model composes by default (CodeMode).
+    CodeMode,
 }
 
 impl fmt::Display for Stage {
@@ -232,6 +234,12 @@ pub const FEATURES: &[FeatureSpec] = &[
         stage: Stage::Stable,
         default_enabled: true,
     },
+    FeatureSpec {
+        id: Feature::CodeMode,
+        key: "code_mode",
+        stage: Stage::Experimental,
+        default_enabled: false,
+    },
 ];
 
 #[cfg(test)]
@@ -252,6 +260,12 @@ mod tests {
         assert!(!features.enabled(Feature::Mcp));
         assert!(!features.enabled(Feature::ShellTool));
         assert_eq!(feature_from_key("not_real"), None);
+    }
+
+    #[test]
+    fn code_mode_flag_parses_and_defaults_off() {
+        assert_eq!(feature_from_key("code_mode"), Some(Feature::CodeMode));
+        assert!(!Features::with_defaults().enabled(Feature::CodeMode));
     }
 
     #[test]
