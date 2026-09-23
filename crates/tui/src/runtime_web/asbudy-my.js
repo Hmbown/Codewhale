@@ -18,6 +18,51 @@
     });
   }
 
+  /* ── 注入元素的落点（2026-09-23 修位置 bug）────────────────────────────────
+   * 【症状·老板报的】「重试 / 撤销 / 压缩 / 记性 这几个标签变到 AI 回复下面了，
+   *   对话过程中也会上下乱窜」。
+   * 【根因·实测】官方的 `<main class="session">` 是 **CSS Grid**，每个官方块靠 `grid-area`
+   *   占位（`main.session{grid-template-areas:"header""status""transcript""attention""composer"}`，
+   *   `.transcript{grid-area:transcript}` / `.composer-wrap{grid-area:composer}` …），
+   *   而**我们的注入元素没有 `grid-area`** ⇒ 走 grid 的**自动放置**：被塞进「此刻恰好空着的行」，
+   *   而空着哪一行取决于**当前有几个我们的元素可见**（`hidden`/`display:none` 的不占格）。
+   *   实测（1440×1000，管理员账号，真浏览器）：
+   *     · 空闲时 `#asbudy-msgbar` top=64（**跑到会话标题正下方**）、`#asbudy-checklist` top=644；
+   *     · AI 一干活（`#asbudy-tick` 出现，多一个自动放置项）⇒ msgbar 掉到 756、checklist 掉到 788
+   *   ⇒ **整块跳**，就是「上下乱窜」。⚠️ 与 v0.9.13/v0.10.0 无关（两个版本的 `.session` 都是这个
+   *   grid，`git show ff76908:…styles.css` 核过）—— 是注入层一直没给 grid 定位，攒到三个元素才显形。
+   * 【修法】落点从「`<main>` 里、footer 之前」改成「**footer(`.composer-wrap`) 内部、输入框之前**」：
+   *   普通文档流，位置恒定；且**不再依赖官方 grid 模板**（官方以后怎么改模板都不会动我们）。
+   *   `rank` 固定上下顺序（小的在上）—— 免得三段代码各自插入的先后决定顺序。
+   */
+  var AB_RANK = { tick: 10, msgbar: 20, checklist: 30 };
+  function abDock() {
+    var f = document.querySelector('.composer-wrap');
+    if (f) return f;
+    var c = document.getElementById('composer');
+    return c ? c.parentNode : null;
+  }
+  /** 已经落在落点里了吗（被官方重渲染挪走 → false） */
+  function abDockHas(el) { var h = abDock(); return !!(h && el && el.parentNode === h); }
+  /** 把注入块放进落点、并按 rank 保持上下顺序（重复调用安全；落点还没起来 → false） */
+  function abDockPlace(el, rank) {
+    var host = abDock();
+    if (!host || !el) return false;
+    el.dataset.abRank = String(rank);
+    var sibs = [], i, kids = host.children;
+    for (i = 0; i < kids.length; i++) {
+      var c = kids[i];
+      if (c !== el && c.dataset && c.dataset.abRank) sibs.push(c);
+    }
+    var after = null;
+    for (i = 0; i < sibs.length; i++) {
+      if (Number(sibs[i].dataset.abRank) <= rank) after = sibs[i]; else break;
+    }
+    var anchor = after ? after.nextSibling : host.firstChild;
+    if (anchor !== el) host.insertBefore(el, anchor);
+    return true;
+  }
+
   /* ── 操作反馈（2026-09-22 加）─────────────────────────────────────────
    * 【为什么要有】老板报「点归档、新建会话、删除项目或文件…点击后都没有状态显示」。
    *   真浏览器实测：官方那两个操作**本身是好的**，但**成功后一律静默** ——
@@ -3106,13 +3151,14 @@
 
     function ensureEl() {
       var el = document.getElementById('asbudy-tick');
-      if (el && document.body.contains(el)) return el;
-      var wrap = document.querySelector('.composer-wrap') || document.getElementById('composer');
-      if (!wrap || !wrap.parentNode) return null;
+      if (el && document.body.contains(el)) {
+        if (!abDockHas(el)) abDockPlace(el, AB_RANK.tick);   // 被官方重渲染挪了 → 归位
+        return el;
+      }
       el = document.createElement('div');
       el.id = 'asbudy-tick';
       el.hidden = true;
-      wrap.parentNode.insertBefore(el, wrap);
+      if (!abDockPlace(el, AB_RANK.tick)) return null;
       return el;
     }
     function fmt(sec) {
@@ -3277,9 +3323,10 @@
 
     function ensure() {
       var el = document.getElementById('asbudy-msgbar');
-      if (el && document.body.contains(el)) return el;
-      var wrap = document.querySelector('.composer-wrap') || document.getElementById('composer');
-      if (!wrap || !wrap.parentNode) return null;
+      if (el && document.body.contains(el)) {
+        if (!abDockHas(el)) abDockPlace(el, AB_RANK.msgbar);
+        return el;
+      }
       el = document.createElement('div');
       el.id = 'asbudy-msgbar';
       var b1 = document.createElement('button');
@@ -3317,7 +3364,7 @@
       liveEl.hidden = true;
       liveEl.setAttribute('aria-live', 'polite');
       el.insertBefore(liveEl, el.firstChild);
-      wrap.parentNode.insertBefore(el, wrap);
+      if (!abDockPlace(el, AB_RANK.msgbar)) return null;
       return el;
     }
 
@@ -3409,6 +3456,31 @@
       liveTick();
     }
     setInterval(liveTick, 1000);
+
+    /* ── 兜底：事件丢了也不能一直显示「工作中」（2026-09-23 老板报 · 实测复现）──────────
+     * 【症状】AI 回复已结束，状态行的「工作中 Ns」**一直涨**（实测到 45s 仍在跑）。
+     * 【实测出来的真时序】真浏览器真发消息，三路对照：
+     *   · 引擎侧 SSE —— **确实推了 `turn.completed`**（seq 33161 / 33174，`curl -N …/events` 抓到）；
+     *   · 页面发给我们的 `asbudy:activity` —— 只有 turn.started / item.* / turn.usage，**没有 turn.completed**；
+     *   · 页面的 events 订阅重连时间线 —— 最后两次是 `since_seq=33169`、`since_seq=33174`。
+     * ⇒ 根因在官方前端那一层：`app.mjs` 的 `applyRuntimeEvent()` 先问
+     *   `runtimeEventContinuity(state, envelope)`，而 `state.latestSeq` **会被 `applySnapshot()`
+     *   用 thread detail 的 `latest_seq` 顶高**（`app.mjs:97`）；turn 结束那一刻这一拉、
+     *   detail 里已经包含这个 turn 的结束 ⇒ 随后的 `turn.completed` 命中
+     *   `sequence <= state.latestSeq → "ignore"` ⇒ `applyRuntimeEvent` 返回 false ⇒ **不广播**
+     *   ⇒ 我们的 `liveStop()` 永远不被调用。官方自己的界面不受影响（它靠 recovery 拿回真状态，
+     *   `#interrupt-turn` 照常收起）—— 所以这是**注入层依赖单一信号**的问题。
+     * 【修法】不改官方逻辑（铁律 #1）—— 用官方还给我们的**另一个真信号**兑底：
+     *   `#interrupt-turn` 的显隐（tick 那个钟早就在用同一个信号，实测它比事件可靠）。
+     *   只在本轮真跑过 2 秒之后才收（避免刚点亮那一瞬误收）；失败态自带 3 秒停留，不抢。
+     */
+    setInterval(function () {
+      if (!LIVE.active || LIVE.what === '失败') return;
+      var btn = document.getElementById('interrupt-turn');
+      if (!btn || !btn.hidden) return;                 // 还在跑（或按钮还没起来）→ 不动
+      if (Date.now() - LIVE.since < 2000) return;      // 刚点亮那一下不误收
+      liveStop();
+    }, 1000);
 
     // ── 会话指标：`ttft 400ms · 38 平均 tok/s · ↓ 1.2K`（2026-09-19 搬 · 逐条照官方 CLI）──
     // 数据来源：引擎每次模型调用推的 `turn.usage`（payload 带 usage / duration_ms /
@@ -3838,11 +3910,11 @@
     var s = ckState();
     if (s.hidden) { if (el) el.remove(); return; }
     if (!el || !document.body.contains(el)) {
-      var wrap = document.querySelector('.composer-wrap') || document.getElementById('composer');
-      if (!wrap || !wrap.parentNode) return;                 // 界面还没起来，下次再说
       el = document.createElement('div');
       el.id = 'asbudy-checklist';
-      wrap.parentNode.insertBefore(el, wrap);
+      if (!abDockPlace(el, AB_RANK.checklist)) return;        // 界面还没起来，下次再说
+    } else if (!abDockHas(el)) {
+      abDockPlace(el, AB_RANK.checklist);                     // 被官方重渲染挪了 → 归位
     }
     var items = [
       { k: 'act', text: '让它帮你做一件事', hint: '在下面跟它说一句就行' },
