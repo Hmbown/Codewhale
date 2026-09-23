@@ -3329,6 +3329,25 @@ pub struct CompactThreadRequest {
     pub reason: Option<String>,
 }
 
+/// Minimal per-thread projection behind `/v1/threads/summary`.
+///
+/// Deliberately *not* `ThreadDetail`: the summary route needs turns, items and
+/// the pending-attention counts only, and building full details one row at a
+/// time is what made the route pay a whole-store walk per row. See
+/// `RuntimeThreadStore::list_thread_summary_details`.
+#[derive(Debug, Clone)]
+pub struct ThreadSummaryDetail {
+    /// Every turn of the thread, ascending by `created_at` — the same order
+    /// `RuntimeThreadStore::list_all_turns` (and therefore the per-thread
+    /// projection) produces.
+    pub turns: Vec<TurnRecord>,
+    /// Every turn's items concatenated in turn order, each turn's items sorted
+    /// by start — the order `RuntimeThreadStore::get_thread_detail` produces.
+    pub items: Vec<TurnItemRecord>,
+    pub pending_approval_count: usize,
+    pub pending_user_input_count: usize,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ThreadDetail {
     pub thread: ThreadRecord,
@@ -7607,6 +7626,88 @@ impl RuntimeThreadManager {
         )
         .await?;
         Ok(())
+    }
+
+    /// Bulk projection behind `/v1/threads/summary` — one store walk for all rows.
+    ///
+    /// The route needs turns + items for *many* threads at once. Going through
+    /// `get_thread_detail` costs one **whole-store** `turns/` + `items/`
+    /// directory walk *per thread* — `list_turns_for_thread` and
+    /// `list_items_for_turns_map` each scan the entire store and filter in
+    /// memory — which made the route O(threads × store): measured at ~70 ms per
+    /// returned row, i.e. 6.9 s for 100 rows on a store holding 4704 item
+    /// files.
+    ///
+    /// #3757 narrowed the terminal-facing boot-recovery path to a single scan
+    /// for exactly this reason; this is the same narrowing for the dashboard
+    /// summary route. The projection it returns is the one the per-thread path
+    /// produces: turns ascending by `created_at`, and each thread's items
+    /// concatenated in turn order with each turn's items sorted by start.
+    ///
+    /// Unknown ids are simply absent from the returned map.
+    pub async fn list_thread_summary_details(
+        &self,
+        thread_ids: &[String],
+    ) -> Result<HashMap<String, ThreadSummaryDetail>> {
+        for thread_id in thread_ids {
+            validated_record_id(thread_id, "thread id")?;
+        }
+        if thread_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        // Recovery receipts are a side effect of the per-thread projection;
+        // flush them here too so batching does not change what reaches disk.
+        // (No-op unless a receipt is actually queued for that thread.)
+        for thread_id in thread_ids {
+            self.flush_recovery_receipts_for_thread(thread_id).await?;
+        }
+
+        let wanted: HashSet<String> = thread_ids.iter().cloned().collect();
+        let store = self.store.clone();
+        let (mut turns_by_thread, mut items_by_turn) = tokio::task::spawn_blocking(move || {
+            let all_turns = store.list_all_turns()?;
+            let wanted_turn_ids: Vec<String> = all_turns
+                .iter()
+                .filter(|turn| wanted.contains(&turn.thread_id))
+                .map(|turn| turn.id.clone())
+                .collect();
+            let items_by_turn = store.list_items_for_turns_map(&wanted_turn_ids)?;
+            let mut turns_by_thread: HashMap<String, Vec<TurnRecord>> = HashMap::new();
+            for turn in all_turns {
+                if wanted.contains(&turn.thread_id) {
+                    turns_by_thread
+                        .entry(turn.thread_id.clone())
+                        .or_default()
+                        .push(turn);
+                }
+            }
+            Ok::<_, anyhow::Error>((turns_by_thread, items_by_turn))
+        })
+        .await
+        .context("Runtime thread summary projection task failed")??;
+
+        let mut out = HashMap::with_capacity(thread_ids.len());
+        for thread_id in thread_ids {
+            let turns = turns_by_thread.remove(thread_id).unwrap_or_default();
+            let mut items = Vec::new();
+            for turn in &turns {
+                if let Some(mut turn_items) = items_by_turn.remove(&turn.id) {
+                    items.append(&mut turn_items);
+                }
+            }
+            let (pending_approvals, pending_user_inputs) =
+                self.pending_requests_for_thread(thread_id);
+            out.insert(
+                thread_id.clone(),
+                ThreadSummaryDetail {
+                    turns,
+                    items,
+                    pending_approval_count: pending_approvals.len(),
+                    pending_user_input_count: pending_user_inputs.len(),
+                },
+            );
+        }
+        Ok(out)
     }
 
     pub async fn get_thread_detail(&self, id: &str) -> Result<ThreadDetail> {

@@ -16170,3 +16170,124 @@ fn output_cap_wire_requires_positive_integer_and_preserves_legacy_absence() -> R
     assert_eq!(valid.max_output_tokens.unwrap().get(), 1500);
     Ok(())
 }
+
+/// `/v1/threads/summary` reads many threads' turns+items at once. Doing that
+/// through `get_thread_detail` cost one whole-store walk *per row* (measured
+/// ~70 ms per row, 6.9 s for 100 rows on a 4704-item store), so the route now
+/// goes through `list_thread_summary_details` — a single scan for the whole
+/// page. This pins what makes that swap safe: the bulk projection is
+/// field-for-field the same as the per-thread one, it keeps the per-thread
+/// ordering (turns by `created_at`, items in turn order with each turn's items
+/// sorted by start), and it returns only the threads that were asked for.
+#[tokio::test]
+async fn list_thread_summary_details_matches_per_thread_projection() -> Result<()> {
+    let manager = test_manager(test_runtime_dir())?;
+    let mut threads = Vec::new();
+    for _ in 0..3 {
+        threads.push(
+            manager
+                .create_thread(CreateThreadRequest {
+                    archived: false,
+                    ..Default::default()
+                })
+                .await?,
+        );
+    }
+
+    let base = Utc::now();
+    for (index, thread) in threads.iter().enumerate() {
+        let offset = index as i64 * 10;
+        let mut turn = sample_turn(
+            &thread.id,
+            &format!("turn_summary_bulk_{index}"),
+            RuntimeTurnStatus::Completed,
+        );
+        turn.created_at = base + chrono::Duration::seconds(offset);
+        manager.store.save_turn(&turn)?;
+
+        // Saved out of order on purpose: the projection must sort by start.
+        let mut later = sample_item(
+            &turn.id,
+            &format!("item_summary_bulk_{index}_later"),
+            TurnItemLifecycleStatus::Completed,
+        );
+        later.started_at = Some(base + chrono::Duration::seconds(offset + 2));
+        let mut earlier = sample_item(
+            &turn.id,
+            &format!("item_summary_bulk_{index}_earlier"),
+            TurnItemLifecycleStatus::Completed,
+        );
+        earlier.started_at = Some(base + chrono::Duration::seconds(offset + 1));
+        manager.store.save_item(&later)?;
+        manager.store.save_item(&earlier)?;
+    }
+
+    // A thread nobody asked for — the projection must not carry it.
+    let stranger = manager
+        .create_thread(CreateThreadRequest {
+            archived: false,
+            ..Default::default()
+        })
+        .await?;
+    let stranger_turn = sample_turn(
+        &stranger.id,
+        "turn_summary_bulk_stranger",
+        RuntimeTurnStatus::Completed,
+    );
+    manager.store.save_turn(&stranger_turn)?;
+
+    let ids: Vec<String> = threads.iter().map(|thread| thread.id.clone()).collect();
+    let bulk = manager.list_thread_summary_details(&ids).await?;
+    assert_eq!(bulk.len(), threads.len());
+
+    for thread in &threads {
+        let detail = manager.get_thread_detail(&thread.id).await?;
+        let projected = bulk
+            .get(&thread.id)
+            .expect("every requested thread must be projected");
+        assert_eq!(
+            projected
+                .turns
+                .iter()
+                .map(|turn| turn.id.clone())
+                .collect::<Vec<_>>(),
+            detail
+                .turns
+                .iter()
+                .map(|turn| turn.id.clone())
+                .collect::<Vec<_>>(),
+            "turns must match the per-thread projection, order included"
+        );
+        assert_eq!(
+            projected
+                .items
+                .iter()
+                .map(|item| item.id.clone())
+                .collect::<Vec<_>>(),
+            detail
+                .items
+                .iter()
+                .map(|item| item.id.clone())
+                .collect::<Vec<_>>(),
+            "items must match: turn order, then sorted by start within a turn"
+        );
+        assert!(!projected.items.is_empty());
+        assert_eq!(
+            projected.pending_approval_count,
+            detail.pending_approvals.len()
+        );
+        assert_eq!(
+            projected.pending_user_input_count,
+            detail.pending_user_inputs.len()
+        );
+    }
+
+    assert!(
+        !bulk.contains_key(&stranger.id),
+        "a thread outside the requested set must not be projected"
+    );
+
+    let none: Vec<String> = Vec::new();
+    assert!(manager.list_thread_summary_details(&none).await?.is_empty());
+    Ok(())
+}

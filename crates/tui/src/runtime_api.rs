@@ -1640,10 +1640,11 @@ async fn list_threads_summary(
     // to find — was invisible. Unsearched listings keep the cheap bounded read;
     // a search scans in newest-first order and stops at `limit` matches.
     //
-    // Match on the thread record *before* `get_thread_detail`. Detail is a
-    // whole-store turns+items walk, so loading it for every thread made a
-    // non-matching dashboard keystroke O(threads × (all_turns + all_items))
-    // JSON reads. Preview is filled only for matches; it is not a search key.
+    // Match on the thread record *before* projecting. The projection walks the
+    // whole turns+items store, so running it for a thread the caller will not
+    // see is wasted work — that is what made a non-matching dashboard keystroke
+    // O(threads × (all_turns + all_items)) JSON reads. Preview is filled only
+    // for matches; it is not a search key.
     let scan_limit = if search.is_some() { None } else { Some(limit) };
     let threads = state
         .runtime_threads
@@ -1651,30 +1652,47 @@ async fn list_threads_summary(
         .await
         .map_err(|e| ApiError::internal(e.to_string()))?;
 
-    let mut summaries = Vec::new();
-    for thread in threads {
-        if summaries.len() >= limit {
-            break;
-        }
-        if let Some(search) = &search
-            && !state
-                .runtime_threads
-                .thread_matches_summary_search(&thread, search)
-        {
+    // Decide which rows this response carries *before* touching the store.
+    // `limit` bounds the rows returned and a search scans in newest-first order
+    // until `limit` matches; both filters look at the thread record alone (a
+    // title-less thread peeks at most one turn file). The projection below is
+    // the expensive part, so it runs once, for the selected rows only.
+    let selected: Vec<_> = threads
+        .into_iter()
+        .filter(|thread| {
+            search.as_ref().is_none_or(|needle| {
+                state
+                    .runtime_threads
+                    .thread_matches_summary_search(thread, needle)
+            })
+        })
+        .take(limit)
+        .collect();
+    // One wholesale turns+items projection for every selected row. Calling
+    // `get_thread_detail` per row walks the whole turns+items store once *per
+    // row*, which is what made this route O(threads × store) — the same trap
+    // #3757 already fixed on the boot-recovery path. See
+    // `RuntimeThreadStore::list_thread_summary_details`.
+    let selected_ids: Vec<String> = selected.iter().map(|thread| thread.id.clone()).collect();
+    let mut details = state
+        .runtime_threads
+        .list_thread_summary_details(&selected_ids)
+        .await
+        .map_err(map_thread_err)?;
+
+    let mut summaries = Vec::with_capacity(selected.len());
+    for thread in selected {
+        // Every selected id comes back from the projection; skip defensively
+        // rather than failing the whole dashboard on a bookkeeping mismatch.
+        let Some(detail) = details.remove(&thread.id) else {
             continue;
-        }
-        let detail = state
-            .runtime_threads
-            .get_thread_detail(&thread.id)
-            .await
-            .map_err(map_thread_err)?;
+        };
         let latest_turn = detail.turns.last();
         let latest_status =
             latest_turn.map(|turn| format!("{:?}", turn.status).to_ascii_lowercase());
         let pending_attention_count = detail
-            .pending_approvals
-            .len()
-            .saturating_add(detail.pending_user_inputs.len());
+            .pending_approval_count
+            .saturating_add(detail.pending_user_input_count);
 
         let title = thread
             .title

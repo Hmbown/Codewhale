@@ -14834,3 +14834,85 @@ async fn output_cap_compatibility_stream_rejects_before_thread_creation() -> Res
     server.abort();
     Ok(())
 }
+
+/// `GET /v1/threads/summary?limit=N` (no search) is the dashboard's list read:
+/// the embedded client asks for `limit=100` on every page load and again after
+/// every new thread. It used to call `get_thread_detail` once per returned row,
+/// and detail walks the entire turns directory *and* the entire items
+/// directory — so the route was O(rows × (all_turns + all_items)) file reads.
+/// Measured against the admin engine: ~70 ms per row, 6.9 s for 100 rows on a
+/// store holding 4704 item files, which is what made entering a conversation
+/// and creating a new one feel like a six-second hang.
+///
+/// The bulk projection must read the whole store a bounded number of times
+/// instead — the read count must not multiply by row count. Its `?search=`
+/// sibling above pins the same property for the search path.
+#[tokio::test]
+async fn thread_summary_listing_does_not_scan_the_whole_store_per_row() -> Result<()> {
+    let Some((addr, runtime_threads, handle)) = spawn_test_server().await? else {
+        return Ok(());
+    };
+    let client = crate::tls::reqwest_client();
+
+    const THREADS: usize = 8;
+    const TURNS_PER_THREAD: usize = 4;
+    const ITEMS_PER_TURN: usize = 4;
+
+    for index in 0..THREADS {
+        let thread: serde_json::Value = client
+            .post(format!("http://{addr}/v1/threads"))
+            .json(&json!({}))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let id = thread["id"]
+            .as_str()
+            .context("missing thread id")?
+            .to_string();
+        seed_summary_search_transcript(
+            runtime_threads.test_store(),
+            &id,
+            index,
+            TURNS_PER_THREAD,
+            ITEMS_PER_TURN,
+            "previewnorm",
+        )?;
+    }
+
+    let total_turns = (THREADS * TURNS_PER_THREAD) as u64;
+    let total_items = (THREADS * TURNS_PER_THREAD * ITEMS_PER_TURN) as u64;
+    let per_row_file_reads = (THREADS as u64) * (total_turns + total_items);
+
+    runtime_threads.reset_whole_store_scan_file_reads();
+    let rows: serde_json::Value = client
+        .get(format!("http://{addr}/v1/threads/summary?limit={THREADS}"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let (turn_files, item_files) = runtime_threads.whole_store_scan_file_reads();
+    let scan_reads = turn_files + item_files;
+
+    assert_eq!(
+        rows.as_array().context("summary should be an array")?.len(),
+        THREADS,
+        "every thread should still be summarised; got {rows}"
+    );
+    assert!(
+        scan_reads > 0,
+        "the counter must actually observe the projection's store walk, otherwise the \
+         bound below passes vacuously"
+    );
+    assert!(
+        scan_reads.saturating_mul(2) < per_row_file_reads,
+        "listing {THREADS} rows read {turn_files} turn files and {item_files} item files \
+         ({total_turns} turns, {total_items} items in the store); a per-row \
+         get_thread_detail would have been ~{per_row_file_reads} whole-store file reads"
+    );
+
+    handle.abort();
+    Ok(())
+}
