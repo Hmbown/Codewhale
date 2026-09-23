@@ -7245,8 +7245,10 @@ impl RuntimeThreadManager {
             .system_prompt
             .as_ref()
             .map(|prompt| SystemPrompt::Text(prompt.clone()));
-        let estimated =
-            crate::compaction::estimate_input_tokens_conservative(&messages, system_prompt.as_ref());
+        let estimated = crate::compaction::estimate_input_tokens_conservative(
+            &messages,
+            system_prompt.as_ref(),
+        );
 
         let config = self.read_config().clone();
         let route = self.resolved_route_for_thread(&config, &thread)?;
@@ -7257,9 +7259,7 @@ impl RuntimeThreadManager {
         );
 
         let window_u64 = u64::from(window);
-        let used = u64::try_from(estimated)
-            .unwrap_or(u64::MAX)
-            .min(window_u64);
+        let used = u64::try_from(estimated).unwrap_or(u64::MAX).min(window_u64);
         let percent = if window_u64 == 0 {
             0.0
         } else {

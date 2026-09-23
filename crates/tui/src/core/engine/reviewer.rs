@@ -143,8 +143,13 @@ pub(crate) async fn consult_reviewer(
     if !worth_retrying(&first) {
         return first;
     }
-    let retry =
-        consult_reviewer_once(client, context_text, cancel_token, REVIEWER_RETRY_MAX_TOKENS).await;
+    let retry = consult_reviewer_once(
+        client,
+        context_text,
+        cancel_token,
+        REVIEWER_RETRY_MAX_TOKENS,
+    )
+    .await;
     ReviewerResult::finish(retry.outcome, merge_usage(first.usage, retry.usage))
 }
 
