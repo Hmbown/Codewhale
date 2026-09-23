@@ -42,6 +42,7 @@ against the vendor's own docs before trusting any value here:
 | Command Code | `https://api.commandcode.ai/provider/v1` | `deepseek/deepseek-v4-flash` | `COMMAND_CODE_API_KEY` |
 | Alibaba Model Studio (DashScope) | `https://dashscope-intl.aliyuncs.com/compatible-mode/v1` | `qwen3.8-flash` | `DASHSCOPE_API_KEY` |
 | AICraft | `https://aicraftapi.com/v1` | `claude-4.6-sonnet`; DeepSeek / Claude / Gemini / Qwen / GLM / MiniMax / Doubao families | `AICRAFT_API_KEY` |
+| Yolo-Auto | `https://yolo-auto.com/v1` | `yolo` (reasoning) / `yolo-small` | `YOLO_AUTO_API_KEY` |
 
 AICraft's roster spans DeepSeek, Anthropic Claude, Google Gemini, Qwen, GLM,
 MiniMax and Doubao ids on its OpenAI-compatible endpoint. The authority is
