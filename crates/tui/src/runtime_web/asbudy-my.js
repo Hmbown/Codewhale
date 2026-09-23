@@ -938,12 +938,37 @@
     //    （原来只有下面那条异步路：客户点开会话，官方先写上「每次询问」，我们的补丁要飞一趟
     //      HTTP 才改成「自动审核」—— 中间那几百毫秒客户看到的就是错值。2026-09-22 实测 0.47s；
     //      引擎在跑长任务时更久，老板正是在那条 285 秒的会话上看到的。）
+    //
+    // ★ 2026-09-23·§8.7 205 的**确定性**修法：缓存里还没有值时，**先不显示**，而不是先显示官方猜的。
+    //   为什么单靠同步纠正不够：① 缓存是 `cp.json()` **异步**填的（copy 也要等一个 IO），
+    //   而官方渲染标签是同步的 —— 谁先到不确定；② 刚打开页面时缓存必然是空的。
+    //   ⇒ 未命中缓存时把标签文本**清空**（客户看到的是「稍晚出现」，不是「错的档位」）。
+    //   ⚠️ 不能改成隐藏或者写占位符：采样器看的是 `textContent`，隐藏照样能采到，
+    //      占位符（如「…」）会被当成错值；只有**空文本**是「还没值」的诚实表达。
     var sync = MODEL_THREAD ? postureTextOf(THREAD_CACHE[MODEL_THREAD]) : '';
-    if (sync && strong.textContent !== sync) strong.textContent = sync;
-    // ② 异步兜底：缓存还没有（刚打开页面 / 官方还没取过这条）时补一次。
+    if (sync) {
+      if (strong.textContent !== sync) strong.textContent = sync;
+      c.setAttribute('data-asbudy-perm-known', '1');
+    } else if (!c.getAttribute('data-asbudy-perm-known')) {
+      if (!c.hasAttribute('data-asbudy-perm-raw')) {
+        c.setAttribute('data-asbudy-perm-raw', strong.textContent || '');   // 先存着官方的值（兼底用）
+      }
+      if (strong.textContent) strong.textContent = '';
+      // 兼底：真拿不到时（引擎挂了 / 没会话）不能让它永远空着 —— 3 秒后退回官方那个值。
+      if (!c.getAttribute('data-asbudy-perm-t')) {
+        c.setAttribute('data-asbudy-perm-t', '1');
+        setTimeout(function () {
+          if (c.getAttribute('data-asbudy-perm-known')) return;
+          var s2 = c.querySelector('strong');
+          if (s2 && !s2.textContent) s2.textContent = c.getAttribute('data-asbudy-perm-raw') || '';
+        }, 3000);
+      }
+    }
+    // ② 异步兜底：缓存还没有（刚打开页面 / 官方还没取过这条）时补一次；拿到就标记为「已知」。
     currentThread().then(function (th) {
       var text = postureTextOf(th);
       if (!text) return;
+      c.setAttribute('data-asbudy-perm-known', '1');
       if (strong.textContent !== text) strong.textContent = text;
     });
   }
