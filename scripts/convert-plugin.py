@@ -442,17 +442,25 @@ def free_of_js(value):
     if isinstance(value, JsExpr):
         return False
     if isinstance(value, dict):
-        return all(free_of_js(child) for child in value.values())
+        return all(free_of_js(key) and free_of_js(child) for key, child in value.items())
     if isinstance(value, list):
         return all(free_of_js(child) for child in value)
     return True
 
 
-def evaluate_patches(patches, notes):
+def evaluate_patches(patches, notes, locations):
     """Apply a dsh bundle patch list over an empty entry list (applyEntryPatches parity):
     `insert` appends rows or appends into a group entry's config, keyed overrides
-    replace fields on an earlier inserted row. Skipped patches are recorded, never fatal."""
-    entries, index = [], {}
+    replace fields on an earlier inserted row. Skipped patches need a manual port;
+    retain their layer and operation index in both human and structured receipts."""
+    entries, index, outcomes = [], {}, []
+    def skipped(order, patch, reason):
+        notes.append(f"patch {order + 1}: {reason}; skipped")
+        identifier, package = patch.get("id"), patch.get("name")
+        outcomes.append({"row": identifier if isinstance(identifier, str) else None,
+                         "package": package if isinstance(package, str) else None,
+                         "kind": "patch", "outcome": "skipped", "reason": reason,
+                         **locations[order]})
     def build_map(rows):
         for row in rows:
             if not isinstance(row, dict):
@@ -474,7 +482,7 @@ def evaluate_patches(patches, notes):
             else:
                 target = index.get(identifier)
                 if target is None or target.get("group") is not True:
-                    notes.append(f"patch {order + 1}: insert target `{identifier}` is missing or not a group; skipped")
+                    skipped(order, patch, f"insert target `{identifier}` is missing or not a group")
                     continue
                 if not isinstance(target.get("config"), list):
                     target["config"] = []
@@ -482,27 +490,27 @@ def evaluate_patches(patches, notes):
             build_map(insert)
             continue
         if not isinstance(identifier, str):
-            notes.append(f"patch {order + 1}: non-insert patch without an `id`; skipped")
+            skipped(order, patch, "non-insert patch without an `id`")
             continue
         target = index.get(identifier)
         if target is None:
-            notes.append(f"patch {order + 1}: entry `{identifier}` was not inserted by an earlier layer; skipped")
+            skipped(order, patch, f"entry `{identifier}` was not inserted by an earlier layer")
             continue
         name = patch.get("name")
         if name is not None and name != target.get("name"):
-            notes.append(f"patch {order + 1}: `name` does not match entry `{identifier}`; skipped")
+            skipped(order, patch, f"`name` does not match entry `{identifier}`")
             continue
         for key, value in patch.items():
             if key not in ("id", "name"):
                 target[key] = value
-    return entries
+    return entries, outcomes
 
 
 def load_dsh_bundle(path):
     """Read a dsh bundle package: package.json → `dsh.bundle.patch` (one path or an ordered
     list of paths) → rows evaluated over one empty profile.
 
-    Returns (manifest, entries, notes, layers, manifest_hash). Every layer is contained in the
+    Returns (manifest, entries, notes, layers, manifest_hash, patch_outcomes). Every layer is contained in the
     package, read once, and bounded in aggregate before any output directory is created."""
     bundle = plain_path(path)
     require(bundle.is_dir(), "Select a dsh bundle package directory (a directory containing package.json).")
@@ -523,7 +531,7 @@ def load_dsh_bundle(path):
     require(all(isinstance(item, str) and bool(item) for item in declared),
             "Every `dsh.bundle.patch` entry must be a non-empty relative path.")
     require(len(declared) <= MAX_PATCH_FILES, "At most 64 `dsh.bundle.patch` files are supported.")
-    layers, patches, total = [], [], 0
+    layers, patches, locations, total = [], [], [], 0
     seen_paths = set()
     for relative in declared:
         require(not Path(relative).is_absolute() and ".." not in Path(relative).parts
@@ -542,8 +550,9 @@ def load_dsh_bundle(path):
         require(isinstance(layer, list), "A dsh bundle patch must be a patch list.")
         layers.append({"path": relative, "sha256": hashlib.sha256(content).hexdigest(), "bytes": len(content)})
         patches.extend(layer)
-    entries = evaluate_patches(patches, notes)
-    return manifest, entries, notes, layers, hashlib.sha256(manifest_content).hexdigest()
+        locations.extend({"layer": relative, "patch": order + 1} for order in range(len(layer)))
+    entries, patch_outcomes = evaluate_patches(patches, notes, locations)
+    return manifest, entries, notes, layers, hashlib.sha256(manifest_content).hexdigest(), patch_outcomes
 
 
 def dsh_bundle_components(entries, bundle, explicit_roots):
@@ -733,11 +742,12 @@ def convert(args):
         roots[name] = source
     bundle_manifest = None
     if bundle_arg is not None:
-        bundle_manifest, entries, bundle_notes, layers, manifest_hash = load_dsh_bundle(bundle_arg)
+        bundle_manifest, entries, bundle_notes, layers, manifest_hash, patch_outcomes = load_dsh_bundle(bundle_arg)
         notes += bundle_notes
         bundle = plain_path(bundle_arg)
         require(bundle != output and bundle not in output.parents, "Output must be outside the selected bundle.")
         servers, hosts, bundled_skills, implicit_roots, row_notes, outcomes = dsh_bundle_components(entries, bundle, roots)
+        outcomes = patch_outcomes + outcomes
         notes += row_notes
         skill_sources += bundled_skills
         implicit_roots.update(roots)
@@ -783,7 +793,8 @@ def convert(args):
         provenance.append(f"Source manifest sha256: {manifest_hash}")
         provenance.append("Selected patch layers, applied in declaration order:")
         provenance += [f"- {layer['path']} (sha256 {layer['sha256']}, {layer['bytes']} bytes)" for layer in layers]
-    outcome_lines = ["## Component outcomes (skipped rows need a manual port)", ""] + [
+    outcome_lines = ["## Component outcomes", "",
+                     "Skipped rows and patch operations need a manual port; skipped-disabled skills are intentionally omitted.", ""] + [
         f"- {outcome['row'] or 'unlabeled'} ({outcome['package'] or 'unlabeled'}) {outcome['kind']}: {outcome['outcome']}"
         + (f" — {outcome['reason']}" if outcome["reason"] else "") for outcome in outcomes]
     lines = ["# Conversion receipt", "", *provenance, "",

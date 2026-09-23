@@ -259,9 +259,12 @@ groups. Preserve their activation and authority rules in a manual port.
 Foreign runtime plugins and `dsh.client` UI code are not executed or translated.
 Other unrepresentable components are reported in `CONVERSION.md` and structured
 `CONVERSION.json`, with source package/version, manifest and ordered-layer SHA-256
-hashes, converter version, per-row outcomes and required manual ports. A partial
-output is an authoring draft, not an equivalent DSH runtime: review every skipped
-component and its dependencies before installing anything.
+hashes, converter version, per-row outcomes and required manual ports. Unapplied
+patch operations also appear in the structured manual-port list, with their source
+layer and one-based operation index; they are not treated as successful overlays.
+Intentionally omitted disabled skills are reported separately, not as manual ports.
+A partial output is an authoring draft, not an equivalent DSH runtime: review every
+skipped component, patch operation and dependency before installing anything.
 
 The only lowered `!!js` expressions are `process.execPath` (becomes `node`) and
 simple quoted/template literals without escapes or interpolation. Environment

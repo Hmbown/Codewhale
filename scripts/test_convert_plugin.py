@@ -618,6 +618,38 @@ for await (const line of readline.createInterface({ input: process.stdin })) {
         self.assertEqual(structured["required_manual_ports"], [])
         self.assertFalse(structured["installed"] or structured["trusted"] or structured["enabled"])
 
+    def test_dsh_skipped_patch_operations_are_structured_manual_ports(self):
+        bundle = self.bundle(manifest={"dsh": {"bundle": {"patch": [
+            "./cordis.patch.yml", "./overlay.yml"]}}})
+        (bundle / "cordis.patch.yml").write_text(yaml.safe_dump([{"insert": self.dsh()}]))
+        (bundle / "overlay.yml").write_text(yaml.safe_dump([
+            {"id": "missing-group", "insert": []},
+            {"disabled": True},
+            {"id": "missing-row", "disabled": True},
+            {"id": "docs-entry", "name": "wrong-package", "disabled": True},
+        ]))
+        args = self.args(bundle=bundle, dialect="dsh")
+        self.assertEqual(converter.convert(args), (0, 1, 0))
+        receipt = json.loads((args.output / "CONVERSION.json").read_text())
+        skipped = receipt["required_manual_ports"]
+        self.assertEqual(len(skipped), 4)
+        self.assertEqual([row["row"] for row in skipped],
+                         ["missing-group", None, "missing-row", "docs-entry"])
+        self.assertEqual([row["patch"] for row in skipped], [1, 2, 3, 4])
+        for row in skipped:
+            self.assertEqual((row["kind"], row["outcome"], row["layer"]),
+                             ("patch", "skipped", "./overlay.yml"))
+            self.assertIn(row, receipt["outcomes"])
+            self.assertIn(row["reason"], (args.output / "CONVERSION.md").read_text())
+        self.assertNotIn("disabled", self.servers(args.output)["docs"]["extensions"]["net.codewhale"])
+
+    def test_dsh_unevaluated_expression_keys_are_not_portable_literals(self):
+        expression = converter.JsExpr("process.env.CONVERSION_TEST_KEY")
+        for value in ({expression: "plain"}, {"outer": [{expression: "plain"}]}, {"key": expression}):
+            with self.subTest(value=value):
+                self.assertFalse(converter.free_of_js(value))
+        self.assertTrue(converter.free_of_js({"outer": [{"literal": "process.env.NOT_EVALUATED"}]}))
+
     def test_dsh_bundle_patch_layer_list_is_bounded_and_contained(self):
         portable = yaml.safe_dump([{"insert": [{"id": "docs-entry", "name": "@deepseek-ai/dsh-mcp-client",
             "config": {"serverName": "docs", "transport": "streamable-http",
@@ -652,7 +684,7 @@ for await (const line of readline.createInterface({ input: process.stdin })) {
         manifest = json.loads((bundle / "package.json").read_text())
         declared = manifest["dsh"]["bundle"]["patch"]
         self.assertEqual(len(declared), 5)
-        parsed, entries, notes, layers, manifest_hash = converter.load_dsh_bundle(bundle)
+        parsed, entries, notes, layers, manifest_hash, patch_outcomes = converter.load_dsh_bundle(bundle)
         self.assertEqual([layer["path"] for layer in layers], declared)
         for layer in layers:
             content = (bundle / layer["path"].removeprefix("./")).read_bytes()
