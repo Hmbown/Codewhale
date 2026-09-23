@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+The website's not-found page now uses the Codwhale poster and typo joke,
+with English/Chinese recovery links to home and docs
+([#6419](https://github.com/Hmbown/Codewhale/issues/6419),
+[#6420](https://github.com/Hmbown/Codewhale/pull/6420)).
+
 ## [0.10.0] - 2026-09-22
 
 Codewhale v0.10.0 brings a redesigned terminal workbench, clearer settings, and
