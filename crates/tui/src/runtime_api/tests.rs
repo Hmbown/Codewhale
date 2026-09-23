@@ -9609,7 +9609,7 @@ async fn provider_models_expose_exact_image_input_facts_and_thread_selection_sta
     let entries = models["models"].as_array().context("models array")?;
     let vision = entries
         .iter()
-        .find(|entry| entry["id"] == "deepseek-v4-flash-vision-exp")
+        .find(|entry| entry["id"] == "deepseek-flash")
         .context("DeepSeek vision model entry")?;
     assert_eq!(vision["image_input"], "supported");
     let text_only = entries
@@ -9626,14 +9626,14 @@ async fn provider_models_expose_exact_image_input_facts_and_thread_selection_sta
         .post(format!("http://{addr}/v1/threads"))
         .json(&json!({
             "model_provider": "deepseek",
-            "model": "deepseek-v4-flash-vision-exp",
+            "model": "deepseek-flash",
         }))
         .send()
         .await?;
     assert_eq!(response.status(), StatusCode::CREATED);
     let thread: serde_json::Value = response.json().await?;
     assert_eq!(thread["model_provider"], "deepseek");
-    assert_eq!(thread["model"], "deepseek-v4-flash-vision-exp");
+    assert_eq!(thread["model"], "deepseek-flash");
 
     let config_after = get_config(&client, &addr).await;
     assert_eq!(config_after["provider"], config_before["provider"]);
@@ -9843,7 +9843,7 @@ fn provider_catalog_keeps_official_deepseek_facts_but_not_custom_proxy_claims() 
         assert!(
             models
                 .iter()
-                .any(|model| model == "deepseek-v4-flash-vision-exp"),
+                .any(|model| model == "deepseek-flash"),
             "official DeepSeek endpoint must expose the experimental vision model: {official_base_url}"
         );
     }
@@ -9864,19 +9864,19 @@ fn provider_catalog_keeps_official_deepseek_facts_but_not_custom_proxy_claims() 
         "a real custom endpoint must expose only its explicitly configured model namespace"
     );
 
-    custom.default_text_model = Some("deepseek-v4-flash-vision-exp".to_string());
+    custom.default_text_model = Some("deepseek-flash".to_string());
     custom.provider_config_for_mut(ApiProvider::Deepseek).model =
-        Some("deepseek-v4-flash-vision-exp".to_string());
+        Some("deepseek-flash".to_string());
     assert_eq!(
         provider_models_for_api(&custom, ApiProvider::Deepseek, ApiProvider::Deepseek),
-        vec!["deepseek-v4-flash-vision-exp".to_string()],
+        vec!["deepseek-flash".to_string()],
         "a custom proxy may legitimately reuse a first-party model id"
     );
     assert_eq!(
         provider_model_image_input_for_api(
             &custom,
             ApiProvider::Deepseek,
-            "deepseek-v4-flash-vision-exp",
+            "deepseek-flash",
         ),
         codewhale_config::route::CapabilityState::Unknown,
         "same-name custom proxy must not surface first-party vision capability as verified"
@@ -14380,13 +14380,13 @@ async fn runtime_image_http_rejects_before_dispatch_and_accepts_large_canonical_
     let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", dir.path());
     let mut config = Config {
         provider: Some("deepseek".into()),
-        default_text_model: Some("deepseek-v4-flash-vision-exp".into()),
+        default_text_model: Some("deepseek-flash".into()),
         api_key: Some("synthetic-image-key".into()),
         ..Default::default()
     };
     config.set_provider_model_override(
         ApiProvider::Deepseek,
-        Some("deepseek-v4-flash-vision-exp".into()),
+        Some("deepseek-flash".into()),
     );
     let (addr, manager, server) = spawn_test_server_with_root_token_mobile_workspace_and_overrides(
         dir.path().to_path_buf(),
@@ -14501,13 +14501,13 @@ async fn runtime_image_stream_rejection_does_not_leave_empty_threads() -> Result
     let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", dir.path());
     let mut config = Config {
         provider: Some("deepseek".into()),
-        default_text_model: Some("deepseek-v4-flash-vision-exp".into()),
+        default_text_model: Some("deepseek-flash".into()),
         api_key: Some("synthetic-image-key".into()),
         ..Default::default()
     };
     config.set_provider_model_override(
         ApiProvider::Deepseek,
-        Some("deepseek-v4-flash-vision-exp".into()),
+        Some("deepseek-flash".into()),
     );
     let (addr, manager, server) = spawn_test_server_with_root_token_mobile_workspace_and_overrides(
         dir.path().to_path_buf(),

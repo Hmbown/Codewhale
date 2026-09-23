@@ -15593,14 +15593,14 @@ mod runtime_image_inputs {
     fn config() -> Config {
         let mut config = Config {
             provider: Some("deepseek".into()),
-            default_text_model: Some("deepseek-v4-flash-vision-exp".into()),
+            default_text_model: Some("deepseek-flash".into()),
             api_key: Some("synthetic-image-fixture-key".into()),
             runtime_chat_isolated: true,
             ..Config::default()
         };
         config.set_provider_model_override(
             ApiProvider::Deepseek,
-            Some("deepseek-v4-flash-vision-exp".into()),
+            Some("deepseek-flash".into()),
         );
         config.set_feature("mcp", false).unwrap();
         config.set_feature("subagents", false).unwrap();
@@ -15626,10 +15626,10 @@ mod runtime_image_inputs {
             ("look", "auto", good.clone()),
             ("look", "deepseek-v4-flash", good.clone()),
             ("look", "unknown-image-fixture", good.clone()),
-            ("", "deepseek-v4-flash-vision-exp", good.clone()),
+            ("", "deepseek-flash", good.clone()),
             (
                 "look",
-                "deepseek-v4-flash-vision-exp",
+                "deepseek-flash",
                 codewhale_protocol::runtime::RuntimeImageInput {
                     mime: "image/jpeg".into(),
                     ..good
