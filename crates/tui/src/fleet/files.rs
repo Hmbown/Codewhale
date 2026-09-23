@@ -166,37 +166,57 @@ impl WorkspaceFile {
         }
         // SAFETY: fd is freshly owned.
         let mut file = unsafe { File::from_raw_fd(fd) };
-        let result = (|| {
+        // Ok(true): published through the legacy hard link, so the
+        // temporary name still exists and must be removed.
+        let result = (|| -> io::Result<bool> {
             file.write_all(bytes)?;
             file.sync_all()?;
-            // SAFETY: both basenames are anchored to the same open parent.
-            // Replacement changes the directory entry, never a symlink target.
-            let published = unsafe {
-                if replace {
+            let directory = self.directory.as_raw_fd();
+            if replace {
+                // SAFETY: both basenames are anchored to the same open parent.
+                // Replacement changes the directory entry, never a symlink target.
+                let renamed = unsafe {
                     libc::renameat(
-                        self.directory.as_raw_fd(),
+                        directory,
                         temporary.as_ptr(),
-                        self.directory.as_raw_fd(),
+                        directory,
                         self.filename.as_ptr(),
                     )
-                } else {
-                    libc::linkat(
-                        self.directory.as_raw_fd(),
-                        temporary.as_ptr(),
-                        self.directory.as_raw_fd(),
-                        self.filename.as_ptr(),
-                        0,
-                    )
+                };
+                if renamed != 0 {
+                    return Err(io::Error::last_os_error());
                 }
-            };
-            if published != 0 {
-                return Err(io::Error::last_os_error());
+                return Ok(false);
             }
-            Ok(())
+            match exclusive_rename(directory, &temporary, &self.filename) {
+                Ok(()) => Ok(false),
+                Err(error) if exclusive_rename_unsupported(&error) => {
+                    // Known limitation: without native exclusive rename
+                    // (other Unix, old kernels, some network/overlay
+                    // filesystems) the entry briefly has two links, and a
+                    // concurrent reader rejects it until the unlink below.
+                    // SAFETY: both basenames are anchored to the same parent;
+                    // linkat without AT_SYMLINK_FOLLOW never follows a link.
+                    let linked = unsafe {
+                        libc::linkat(
+                            directory,
+                            temporary.as_ptr(),
+                            directory,
+                            self.filename.as_ptr(),
+                            0,
+                        )
+                    };
+                    if linked != 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    Ok(true)
+                }
+                Err(error) => Err(error),
+            }
         })();
         // Successful rename already consumed this temporary entry. Never
         // unlink the vacant old name, which another writer could now reuse.
-        if !replace || result.is_err() {
+        if !matches!(result, Ok(false)) {
             // SAFETY: unlink this call's exclusive temporary basename.
             if unsafe { libc::unlinkat(self.directory.as_raw_fd(), temporary.as_ptr(), 0) } != 0 {
                 return Err(io::Error::last_os_error());
@@ -204,6 +224,168 @@ impl WorkspaceFile {
         }
         result?;
         self.directory.sync_all()
+    }
+}
+
+/// Publish `from` as `to` only if `to` does not exist, keeping the new entry
+/// singly linked from the instant it becomes visible (linkat + unlinkat
+/// briefly exposes two links, which `open_with_flags` correctly rejects).
+#[cfg(unix)]
+fn exclusive_rename(
+    directory: std::os::fd::RawFd,
+    from: &std::ffi::CStr,
+    to: &std::ffi::CStr,
+) -> io::Result<()> {
+    #[cfg(target_vendor = "apple")]
+    // SAFETY: both basenames are anchored to the same open parent.
+    let renamed = unsafe {
+        libc::renameatx_np(
+            directory,
+            from.as_ptr(),
+            directory,
+            to.as_ptr(),
+            libc::RENAME_EXCL,
+        )
+    };
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    // SAFETY: as above; the raw syscall avoids depending on a libc wrapper
+    // that static musl builds may lack.
+    let renamed = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            directory,
+            from.as_ptr(),
+            directory,
+            to.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        ) as libc::c_int
+    };
+    #[cfg(not(any(target_vendor = "apple", target_os = "linux", target_os = "android")))]
+    let renamed = {
+        let _ = (directory, from, to);
+        return Err(io::Error::from(io::ErrorKind::Unsupported));
+    };
+    if renamed != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn exclusive_rename_unsupported(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::Unsupported
+        || error.raw_os_error().is_some_and(|code| {
+            [libc::EINVAL, libc::ENOSYS, libc::ENOTSUP, libc::EOPNOTSUPP].contains(&code)
+        })
+}
+
+#[cfg(all(
+    test,
+    any(target_vendor = "apple", target_os = "linux", target_os = "android")
+))]
+mod unix_publication_tests {
+    use super::*;
+    use std::io::Read as _;
+    use std::os::unix::fs::{MetadataExt as _, symlink};
+
+    #[test]
+    fn immutable_publication_preserves_existing_bytes_and_cleans_temporaries() {
+        let workspace = tempfile::tempdir().unwrap();
+        let artifact =
+            WorkspaceFile::open(workspace.path(), Path::new("receipt.json"), true).unwrap();
+        artifact.publish(b"receipt").unwrap();
+        assert_eq!(artifact.open_file().unwrap().metadata().unwrap().nlink(), 1);
+        assert_eq!(
+            artifact.publish(b"replacement").unwrap_err().kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(
+            std::fs::read(workspace.path().join("receipt.json")).unwrap(),
+            b"receipt"
+        );
+        artifact.replace(b"compacted").unwrap();
+        assert_eq!(
+            std::fs::read(workspace.path().join("receipt.json")).unwrap(),
+            b"compacted"
+        );
+        assert_eq!(std::fs::read_dir(workspace.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn concurrent_immutable_publications_are_immediately_readable() {
+        let workspace = tempfile::tempdir().unwrap();
+        let start = std::sync::Barrier::new(8);
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    start.wait();
+                    for round in 0..32 {
+                        let artifact = WorkspaceFile::open(
+                            workspace.path(),
+                            Path::new(&format!("{round}.json")),
+                            true,
+                        )
+                        .unwrap();
+                        if let Err(error) = artifact.publish(b"receipt") {
+                            assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+                        }
+                        let mut bytes = Vec::new();
+                        artifact
+                            .open_file()
+                            .unwrap()
+                            .read_to_end(&mut bytes)
+                            .unwrap();
+                        assert_eq!(bytes, b"receipt");
+                    }
+                });
+            }
+        });
+        assert_eq!(std::fs::read_dir(workspace.path()).unwrap().count(), 32);
+    }
+
+    #[test]
+    fn immutable_publication_does_not_replace_or_follow_a_symlink() {
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(outside.path(), b"outside").unwrap();
+        let path = workspace.path().join("receipt.json");
+        symlink(outside.path(), &path).unwrap();
+        let artifact =
+            WorkspaceFile::open(workspace.path(), Path::new("receipt.json"), true).unwrap();
+        assert_eq!(
+            artifact.publish(b"replacement").unwrap_err().kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        assert!(artifact.open_file().is_err());
+        assert!(path.is_symlink());
+        assert_eq!(std::fs::read(outside.path()).unwrap(), b"outside");
+        assert_eq!(std::fs::read_dir(workspace.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn hard_linked_artifacts_remain_rejected() {
+        let workspace = tempfile::tempdir().unwrap();
+        let artifact =
+            WorkspaceFile::open(workspace.path(), Path::new("receipt.json"), true).unwrap();
+        artifact.publish(b"receipt").unwrap();
+        std::fs::hard_link(
+            workspace.path().join("receipt.json"),
+            workspace.path().join("alias.json"),
+        )
+        .unwrap();
+        assert_eq!(
+            artifact.open_file().unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(
+            artifact.publish(b"replacement").unwrap_err().kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(
+            std::fs::read(workspace.path().join("receipt.json")).unwrap(),
+            b"receipt"
+        );
+        assert_eq!(std::fs::read_dir(workspace.path()).unwrap().count(), 2);
     }
 }
 
