@@ -702,10 +702,12 @@
               return head + g.models.map(function (m) {
                 var on = m.id === thModel;
                 var sub = [];
-                if (!same) sub.push('切换服务商需新建会话');
+                // 别家：现在**能点**了（点一下用这家新开一条）—— 不再只说一句「需新建会话」
+                // 让客户自己去找入口（§8.7 198.2 ②）。
+                if (!same) sub.push('点一下 = 用这家新开一条');
                 if (m.image_input === 'supported') sub.push('可看图');
                 return '<button class="ab-menu-item" data-m="' + esc(m.id) + '" data-p="' + esc(g.p.id) + '"' +
-                  (same ? '' : ' style="opacity:.6"') + '>' + esc(m.id) + (on ? '（当前）' : '') +
+                  (same ? '' : ' style="opacity:.78"') + '>' + esc(m.id) + (on ? '（当前）' : '') +
                   '<small style="' + (on ? 'color:var(--action)' : '') + '">' + esc(sub.join(' · ')) + '</small></button>';
               }).join('');
             }).join('');
@@ -713,7 +715,17 @@
               b.onclick = function () {
                 var mid = b.getAttribute('data-m');
                 var pid = b.getAttribute('data-p');
-                if (thProvider && pid !== thProvider) { msg(msgEl, '切换服务商需新建会话（当前会话在 ' + thProvider + '）', false); return; }
+                if (thProvider && pid !== thProvider) {
+                  // 别家服务商：不能就地换，但可以**用这家新开一条**（官方那个浮层走的就是这一步）
+                  var g2 = null, m2 = null;
+                  for (var gi = 0; gi < groups.length; gi++) {
+                    if (groups[gi].p.id !== pid) continue;
+                    g2 = groups[gi];
+                    for (var mi = 0; mi < g2.models.length; mi++) if (g2.models[mi].id === mid) m2 = g2.models[mi];
+                  }
+                  if (g2) offerNewThreadOnVendor(g2, m2 || { id: mid }, msgEl, thProvider);
+                  return;
+                }
                 api('/v1/threads/' + encodeURIComponent(tid), { method: 'PATCH', body: JSON.stringify({ model: mid }) })
                   .then(function (r2) {
                     if (!r2.ok) { msg(msgEl, (r2.body && r2.body.error) || '换不了', false); return; }
@@ -728,6 +740,57 @@
       });
     });
   }
+  /* ── 「用别的服务商新开一条」────────────────────────────────────────────
+   * 【为什么不能就地换】引擎在**建会话那一刻**就把「用哪家」写进了会话记录
+   *   （`provider_identity_for_thread`：会话记住自己的路线）；`PATCH /v1/threads/{id}`
+   *   只认 `model`、**不收 provider**（2026-09-23 实测：跨厂商模型名 PATCH 返 200
+   *   不校验、发消息才 400）。官方对这件事的官方说法就写在它自己的新建浮层里：
+   *   「此选择仅对当前新会话生效，不会改变运行时的默认设置」——**换家 = 新开一条**。
+   * 【这里做什么】把官方那个浮层走的那一步搬到客户已经点到的这个地方：
+   *   `buildCreateThreadRequest` 的三个字段（model_provider / model_provider_id / model）
+   *   → `POST /v1/threads`。门卫照常补项目提示与工作区（`newThreadInProject`）
+   *   ⇒ 建出来的新会话跟官方建的**一模一样**。
+   * 【为什么必须先说一句】当前这段对话的内容**不会**带过去 —— 不能让客户点完
+   *   才发现「刚才聊的没了」。
+   */
+  function offerNewThreadOnVendor(group, model, msgEl, fromProvider) {
+    var host = msgEl.parentNode;
+    var old = host.querySelector('#mp-confirm');
+    if (old) old.remove();
+    var vendor = esc(group.p.display_name || group.p.id);
+    var d = document.createElement('div');
+    d.id = 'mp-confirm';
+    d.className = 'ab-tip';
+    d.style.cssText = 'margin-top:10px;padding:10px;border:1px solid var(--line);border-radius:8px';
+    d.innerHTML = '这段对话在 <b>' + esc(fromProvider || '另一家') + '</b> 上，' +
+      '<b>' + esc(model.id) + '</b> 属于 <b>' + vendor + '</b>。<br>' +
+      '换服务商要<b>新开一条对话</b> —— 这一段聊的内容不会带过去（AI 仍然知道你在哪个项目）。' +
+      '<div style="margin-top:9px;display:flex;gap:8px">' +
+      '<button class="ab-btn sm" id="mp-go">用 ' + vendor + ' 新开一条</button>' +
+      '<button class="ab-btn sm ghost" id="mp-no">取消</button></div>';
+    host.appendChild(d);
+    d.querySelector('#mp-no').onclick = function () { d.remove(); };
+    d.querySelector('#mp-go').onclick = function () {
+      var go = d.querySelector('#mp-go');
+      go.disabled = true;
+      go.textContent = '正在新建…';
+      // 字段照官方 `buildCreateThreadRequest` —— provider 的 exact id 有就带上（自定义服务商靠它）
+      var req = { model_provider: String(group.p.id), model: String(model.id) };
+      var exact = String(group.p.model_provider_id || '');
+      if (exact) req.model_provider_id = exact;
+      api('/v1/threads', { method: 'POST', body: JSON.stringify(req) }).then(function (r) {
+        if (!r.ok) {
+          d.remove();
+          msg(msgEl, '没建成：' + ((r.body && r.body.error) || '未知原因'), false);
+          return;
+        }
+        msg(msgEl, '已用 ' + vendor + ' 新建一条对话，正在打开…', true);
+        // 刷新后官方会选中**最新**那条（`selectThread(app.summaries[0].id)`）⇒ 正好落在新建上
+        setTimeout(function () { location.reload(); }, 900);
+      });
+    };
+  }
+
   /* ── Provider 小标签：官方显示的是厂商 id（anthropic / moonshot…），换成官方给的友好名 ── */
   var PROVIDER_NAMES = null;
   function loadProviderNames() {
