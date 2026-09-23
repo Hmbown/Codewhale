@@ -1770,11 +1770,11 @@ pub struct App {
     /// fast typing or IME commits could otherwise be mis-classified as a
     /// paste burst (#1322 follow-up).
     pub bracketed_paste_seen: bool,
-    /// The terminal is one we have verified delivers `Event::Paste`, so the
-    /// rapid-keystroke heuristic is skipped from the first keystroke instead
-    /// of waiting for `bracketed_paste_seen` to be proven by an actual
-    /// paste. Resolved once at startup from the environment — never read
-    /// ambiently, so tests and headless runs stay hermetic.
+    /// A non-Windows terminal on the verified `Event::Paste` allowlist may
+    /// skip the rapid-keystroke heuristic from the first keystroke. Windows
+    /// input requires `bracketed_paste_seen`: a terminal name or WT_SESSION
+    /// does not prove that the input backend delivers paste events (#6427).
+    /// Resolved once at startup, so tests and headless runs stay hermetic.
     pub bracketed_paste_trusted: bool,
     pub system_prompt: Option<SystemPrompt>,
     pub auto_compact: bool,
