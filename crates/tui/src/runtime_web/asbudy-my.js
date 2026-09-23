@@ -62,6 +62,26 @@
     if (anchor !== el) host.insertBefore(el, anchor);
     return true;
   }
+  /** 已经落在 msgbar 那一行里了吗 */
+  function abInMsgbar(el) {
+    var b = document.getElementById('asbudy-msgbar');
+    return !!(b && el && el.parentNode === b);
+  }
+  /** 把「已运行 / 处理中」那条读数放进 msgbar 那一行（2026-09-24 老板：「已运行」「压缩」「记性」同一行）。
+   *  ⚠️ 两段代码分属不同 IIFE，而 tick 先跑（那时 msgbar 还没建）—— 所以：
+   *    msgbar 在 → 直接进去（插在状态行后面，保持「状态 → 读数 → 操作 → 记性」这个从左到右的次序）；
+   *    msgbar 还没建 → 先落在 dock 里，等 msgbar 建好时（它 ensure 的末尾）再搬过去。
+   *  两处都会调本函数，所以不管谁先来都归位。 */
+  function abDockTick(el) {
+    if (!el) return true;
+    var bar = document.getElementById('asbudy-msgbar');
+    if (!bar) return abDockPlace(el, AB_RANK.tick);
+    if (el.parentNode !== bar) {
+      var live = document.getElementById('asbudy-live');
+      bar.insertBefore(el, (live && live.parentNode === bar) ? live.nextSibling : bar.firstChild);
+    }
+    return true;
+  }
 
   /* ── 操作反馈（2026-09-22 加）─────────────────────────────────────────
    * 【为什么要有】老板报「点归档、新建会话、删除项目或文件…点击后都没有状态显示」。
@@ -206,7 +226,7 @@
     '.fact-chip[data-asbudy-model]{cursor:pointer}',
     '.fact-chip[data-asbudy-model] strong{text-decoration:underline;text-underline-offset:2px;text-decoration-style:dotted}',
     '.fact-chip[data-asbudy-model]:hover strong{color:var(--action)}',
-    '#asbudy-tick{font-size:13.5px;color:var(--text-dim);padding:0 0 6px 2px}',
+    '#asbudy-tick{font-size:13.5px;color:var(--text-dim);white-space:nowrap}',
     '#asbudy-msgbar{display:flex;flex-wrap:wrap;align-items:center;gap:8px;padding:0 0 6px 2px}',
     '#asbudy-msgbar button{font:inherit;font-size:13.5px;color:var(--text-dim);background:transparent;border:1px solid var(--line);border-radius:6px;padding:3px 10px;cursor:pointer}',
     '#asbudy-msgbar button:hover{color:var(--text)}',
@@ -3152,13 +3172,15 @@
     function ensureEl() {
       var el = document.getElementById('asbudy-tick');
       if (el && document.body.contains(el)) {
-        if (!abDockHas(el)) abDockPlace(el, AB_RANK.tick);   // 被官方重渲染挪了 → 归位
+        if (!abInMsgbar(el)) abDockTick(el);      // 被官方重渲染挪了 → 归位到那一行里
         return el;
       }
       el = document.createElement('div');
       el.id = 'asbudy-tick';
       el.hidden = true;
-      if (!abDockPlace(el, AB_RANK.tick)) return null;
+      // ⚠️ 不要因为「msgbar 还没建」就放弃：这是每条会话都有的常驻读数，
+      //    建不出来等于「已运行」永久消失。abDockTick 会先落 dock、等 msgbar 建好再搬。
+      if (!abDockTick(el)) return null;
       return el;
     }
     function fmt(sec) {
@@ -3299,8 +3321,9 @@
     }
   })();
 
-  /* ── 对话重试 / 撤销（官方有 API，前端没接）──
+  /* ── 对话压缩（官方有 API，前端没接）──
    * 拿不到官方内部的 selectedThreadId，所以拦 fetch 记下当前 thread。
+   * ⚠️ 「重试 / 撤销」2026-09-24 已整颗去掉（它们是 fork 语义、我们那时又丢了返回值，见 msgbar 那段注释）。
    */
   (function () {
     var LAST_THREAD = '';
@@ -3329,23 +3352,18 @@
       }
       el = document.createElement('div');
       el.id = 'asbudy-msgbar';
-      var b1 = document.createElement('button');
-      b1.type = 'button';
-      b1.id = 'asbudy-retry';
-      b1.textContent = '↻ 重试';
-      b1.title = '让 AI 重新作答（不影响项目文件）';
-      var b2 = document.createElement('button');
-      b2.type = 'button';
-      b2.id = 'asbudy-undo-turn';   // 注意：不能叫 asbudy-undo —— 那是退回面板容器的 id（重复 id 会让 getElementById 拿到错的）
-      b2.textContent = '↩ 撤销';
-      b2.title = '移除最后一轮问答，提问将回到输入框（不影响项目文件）';
+      /* ⚠️ 「重试 / 撤销」两颗按钮**已去掉**（2026-09-24 老板拍）—— 原因不是难用，是**假的**：
+       *   官方那两个接口（`POST /v1/threads/{id}/retry` · `…/undo`）都是 **fork 语义**
+       *   —— 另建一条会话（`fork_at_user_message`）再把结果返回；而我们的前端**丢掉了返回值**、
+       *   只 `location.reload()` ⇒ 用户看到「就是刷新了一下」，**后台却每次多一条看不见的会话**
+       *   （实测：老板点了一下，多出 `thr_a5345124`，是原会话的深拷贝（前 5 轮时长逐位一致），
+       *   而重跑那一轮 269ms 就 400 失败——历史里埋着残缺 tool_call）。
+       * 「压缩」保留：`POST /v1/threads/{id}/compact` 在**原会话上**跑，与按钮名字对得上。 */
       var b3 = document.createElement('button');
       b3.type = 'button';
       b3.id = 'asbudy-compact';
       b3.textContent = '🗜 压缩';
       b3.title = '压缩当前对话以节省上下文（保留要点）';
-      el.appendChild(b1);
-      el.appendChild(b2);
       el.appendChild(b3);
       var ctxEl = document.createElement('span');
       ctxEl.id = 'asbudy-ctx';
@@ -3365,6 +3383,7 @@
       liveEl.setAttribute('aria-live', 'polite');
       el.insertBefore(liveEl, el.firstChild);
       if (!abDockPlace(el, AB_RANK.msgbar)) return null;
+      abDockTick(document.getElementById('asbudy-tick'));   // 「已运行」那条也要在同一行里
       return el;
     }
 
@@ -3748,12 +3767,7 @@
 
     async function fire(kind) {
       if (!LAST_THREAD) { alert('请先发送一条消息'); return; }
-      var labels = { retry: '重试', undo: '撤销', compact: '压缩' };
-      // 退文件的地方随形态变：桌面形态下左侧那个「退回」面板被收起来了，得说桌面上的路
-      var whereUndo = document.body.classList.contains('asb-desk')
-        ? '要退文件，回桌面右键这个项目的图标选「退回」'
-        : '要退文件，用左侧的「退回」';
-      if (kind === 'undo' && !confirm('撤销最后这一轮？\n\n这一问一答会从对话里去掉，你那句话回到输入框（可以改了再发）。\n项目里的文件不受影响 —— ' + whereUndo + '。')) return;
+      var labels = { compact: '压缩' };
       if (kind === 'compact' && !confirm('压缩当前对话？\n\n将保留要点，超长历史会被总结 —— 可节省上下文，但部分细节会丢失。')) return;
       try {
         var r = await fetch('/v1/threads/' + encodeURIComponent(LAST_THREAD) + '/' + kind, {
@@ -3777,9 +3791,7 @@
     document.addEventListener('click', function (e) {
       var t = e.target;
       if (!t || !t.id) return;
-      if (t.id === 'asbudy-retry') fire('retry');
-      else if (t.id === 'asbudy-undo-turn') fire('undo');
-      else if (t.id === 'asbudy-compact') fire('compact');
+      if (t.id === 'asbudy-compact') fire('compact');
     });
 
     if (!ensure()) {
