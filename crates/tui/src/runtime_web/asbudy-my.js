@@ -494,7 +494,13 @@
       try {
         u = typeof url === 'string' ? url : ((url && url.url) || '');
         var m = u.match(/\/v1\/threads\/([^\/?]+)/);
-        if (m && m[1] && m[1] !== 'summary') MODEL_THREAD = m[1];
+        // ⚠️ 只认**会话 id**，别把 `/v1/threads` 下面那些「不是一个会话」的子路由当成 id。
+        //   2026-09-23 踩过：新加的「AI 还在跑吗」那段会请求 `/v1/threads/running`，
+        //   而这里当时只排除了 `summary` ⇒ `MODEL_THREAD` 被写成字符串 `"running"`，
+        //   审批标签、图片按钮、菜单里那些会话操作**全跟着错**（实测：内部状态 thread="running"）。
+        //   ⇒ **以后再加不匹配会话 id 的 `/v1/threads/*` 路由，这里要同步补上**。
+        var NOT_A_THREAD_ID = { summary: 1, running: 1 };
+        if (m && m[1] && !NOT_A_THREAD_ID[m[1]]) MODEL_THREAD = m[1];
       } catch (e) {}
       var p = prev.apply(this, arguments);
       // 换了对话 → 把上一条的提示撒掉（**不拿旧结论去猜新对话**，零误报的第一条）
@@ -2429,7 +2435,7 @@
   function openAdvanced() {
     openLayer('高级设置', function (body) {
       body.innerHTML = '<div id="ab-adv">加载中…</div>';
-      Promise.all([api('/_gate/advanced'), api('/_gate/model-key'), api('/v1/config'), api('/_gate/repo'), api('/_gate/prefs')]).then(function (rs) {
+      Promise.all([api('/_gate/advanced'), api('/_gate/model-key'), api('/v1/config'), api('/_gate/repo'), api('/_gate/prefs'), api('/v1/settings/schema')]).then(function (rs) {
         var r = rs[0];
         var mk = rs[1].body || {};
         var cfg = (rs[2] && rs[2].body) || {}
@@ -2441,6 +2447,25 @@
         //   对话上方的「审批」标签说「完全访问」（读线程 posture，对的），
         //   而这里却说「自动审核」—— 同一件事两处不一致（老板一眼就能看到）。
         //   写路径本来就是平台侧（`setCfg` → `/_gate/prefs`），显示也得同源才自洽。
+        /* ── 设置项的名字用**官方的**（2026-09-23 老板拍「用官方」）────────────────────────
+         * 官方 v0.10.0 给了 `GET /v1/settings/schema`：引擎自报每个设置项的**本地化标签 + 说明**。
+         * 以前这些名字是我们手写的 ⇒ 官方改了说法我们不知道、客户在别处看到的又是另一套。
+         * ⚠️ **只认中文标签**：官方语言包没翻全（实测 `thinking_default_expanded` /
+         *    `thinking_preview_lines` 仍是英文），**英文标签不给客户看** ⇒ 回退我们原来那句。
+         * ⚠️ **接口拿不到就全回退**（老引擎没这条路由 / 网络抖）—— 设置页不能因为一个
+         *    附加信息读不到就白屏或者丢标题。
+         * ⚠️ 这里只借**名字**；**值**照旧按人存（`/_gate/prefs`）、项的选择也照旧 —— 没动。
+         */
+        var OFFICIAL_LABEL = (function () {
+          var m = {};
+          var rows = (rs[5] && rs[5].body && rs[5].body.settings) || [];
+          rows.forEach(function (x) {
+            var lab = String((x && x.label) || '');
+            if (lab && /[\u4e00-\u9fff]/.test(lab)) m[String(x.key)] = lab;
+          });
+          return m;
+        })();
+        function lbl(k, mine) { return esc(OFFICIAL_LABEL[k] || mine); }
         var am = (rs[4] && rs[4].body && rs[4].body.prefs && rs[4].body.prefs.approval_mode) || 'auto';
         var cur = cfg.cost_currency === 'cny' ? 'cny' : 'usd';
         // 2026-09-19：官方 /config 里本来就有的显示类键（以前只接了一半，客户调不了）
@@ -2478,29 +2503,29 @@
           '<div id="adv-approval-list" style="display:none;margin:-4px 0 10px 78px"></div>' +
           '<div class="ab-tip" style="margin:-4px 0 10px 78px">也可以直接点对话上方那排小标签里的「审批」—— 两处是同一个设置。改完当前会话立刻生效，以后新建的项目也按这个来。选「完全访问」后，AI 改文件、执行命令不再询问。</div>' +
           '<div style="margin:14px 0 6px;color:var(--text);font-size:14px">思考</div>' +
-          '<div class="ab-row"><label>推理级别</label><select class="ab-input" id="adv-effort">' +
+          '<div class="ab-row"><label>' + lbl('reasoning_effort','推理级别') + '</label><select class="ab-input" id="adv-effort">' +
             EFFORT_OPTS.map(function (o) {
               return '<option value="' + o.v + '"' + (effort === o.v ? ' selected' : '') + '>' + esc(o.t) + '</option>';
             }).join('') +
           '</select></div>' +
           '<div class="ab-tip" style="margin:-2px 0 10px 0">AI 回答前先想多久。调高：难题更稳，但更慢、也更费额度；调低：答得快，简单任务够用。改完下一轮对话生效。</div>' +
           '<div style="margin:14px 0 6px;color:var(--text);font-size:14px">显示</div>' +
-          '<label class="ab-chk"><input type="checkbox" id="adv-think"' + (cfg.show_thinking ? ' checked' : '') + '> 显示思考过程</label>' +
-          '<label class="ab-chk"><input type="checkbox" id="adv-think-exp"' + (cfg.thinking_default_expanded ? ' checked' : '') + '> 默认展开思考过程</label>' +
-          '<label class="ab-chk"><input type="checkbox" id="adv-tools"' + (cfg.show_tool_details ? ' checked' : '') + '> 显示文件与命令明细</label>' +
-          '<label class="ab-chk"><input type="checkbox" id="adv-calm"' + (cfg.calm_mode ? ' checked' : '') + '> 安静模式</label>' +
+          '<label class="ab-chk"><input type="checkbox" id="adv-think"' + (cfg.show_thinking ? ' checked' : '') + '>' + lbl('show_thinking','显示思考过程') + '</label>' +
+          '<label class="ab-chk"><input type="checkbox" id="adv-think-exp"' + (cfg.thinking_default_expanded ? ' checked' : '') + '>' + lbl('thinking_default_expanded','默认展开思考过程') + '</label>' +
+          '<label class="ab-chk"><input type="checkbox" id="adv-tools"' + (cfg.show_tool_details ? ' checked' : '') + '>' + lbl('show_tool_details','显示文件与命令明细') + '</label>' +
+          '<label class="ab-chk"><input type="checkbox" id="adv-calm"' + (cfg.calm_mode ? ' checked' : '') + '>' + lbl('calm_mode','安静模式') + '</label>' +
           // 2026-09-22：这个开关以前**完全无效**（档案 §8.7 201：值写进了引擎，网页零消费方）。
           //   照官方语义（`tui/history.rs:469-480` 的 match 顺序）修好后，它**只在「显示文件与命令明细」开着时**起作用
           //   —— 不把真实条件写给客户，客户在默认档下勾它仍会觉得「没用」。
           '<div class="ab-tip" style="margin:-2px 0 10px 0">开了「显示文件与命令明细」后，工具卡也只露前几行、不铺满屏幕。想看全就点卡上的「查看回执」。</div>' +
-          '<label class="ab-chk"><input type="checkbox" id="adv-think-bg"' + (cfg.thinking_highlight !== false ? ' checked' : '') + '> 思考内容加底色</label>' +
-          '<div class="ab-row"><label>文件改动显示</label><select class="ab-input" id="adv-diffs">' +
+          '<label class="ab-chk"><input type="checkbox" id="adv-think-bg"' + (cfg.thinking_highlight !== false ? ' checked' : '') + '>' + lbl('thinking_highlight','思考内容加底色') + '</label>' +
+          '<div class="ab-row"><label>' + lbl('inline_diffs','文件改动显示') + '</label><select class="ab-input" id="adv-diffs">' +
             '<option value="full"' + (diffsMode === 'full' ? ' selected' : '') + '>完整改动（红绿对照）</option>' +
             '<option value="summary"' + (diffsMode === 'summary' ? ' selected' : '') + '>只显示行数统计</option>' +
             '<option value="off"' + (diffsMode === 'off' ? ' selected' : '') + '>不显示</option>' +
           '</select></div>' +
           (typeof cfg.thinking_preview_lines === 'number'
-            ? '<div class="ab-row"><label>思考预览</label><select class="ab-input" id="adv-think-lines">' +
+            ? '<div class="ab-row"><label>' + lbl('thinking_preview_lines','思考预览') + '</label><select class="ab-input" id="adv-think-lines">' +
                 [0, 1, 2, 3, 5, 10].map(function (n) {
                   return '<option value="' + n + '"' + (thinkLines === n ? ' selected' : '') + '>' +
                     (n === 0 ? '不显示（只看标题）' : n + ' 行') + '</option>';
@@ -2509,7 +2534,7 @@
             // 引擎还没把 thinking_preview_lines 暴露出来时，这个控件**不出现** ——
             //   否则客户一改就会撞到引擎的 400（「未知配置键」）。引擎更新后自动出现。
             : '') +
-          '<div class="ab-row"><label>AI 回复语言</label><select class="ab-input" id="adv-locale">' +
+          '<div class="ab-row"><label>' + lbl('locale','AI 回复语言') + '</label><select class="ab-input" id="adv-locale">' +
             LOCALE_OPTS.map(function (o) {
               return '<option value="' + o.v + '"' + (loc === o.v ? ' selected' : '') + '>' + esc(o.t) + '</option>';
             }).join('') +
@@ -2521,9 +2546,9 @@
           '<div id="adv-statusline-list" style="display:none;margin:-4px 0 10px 78px"></div>' +
           '<div class="ab-tip" style="margin:-4px 0 10px 78px">底部状态行显示哪几项。窗口窄了不够摆时，没关掉的也会按重要性自动少显示几个（最先让出的是输出速度）——「模型」与「记性」两项永不丢。</div>' +
           '<div class="ab-tip" style="margin:-2px 0 10px 78px">这几项都是官方本来就有的设置（页面上文字仍为中文）。</div>' +
-          '<label class="ab-chk"><input type="checkbox" id="adv-compact"' + (cfg.auto_compact ? ' checked' : '') + '> 聊天太长时自动帮我整理前面</label>' +
+          '<label class="ab-chk"><input type="checkbox" id="adv-compact"' + (cfg.auto_compact ? ' checked' : '') + '>' + lbl('auto_compact','聊天太长时自动帮我整理前面') + '</label>' +
           '<div class="ab-tip" style="margin:2px 0 10px 0">自动整理会总结前面的内容 —— 部分细节会丢失（默认开启）。<br>⚠️ 关闭后请留意：长对话可能因超出模型上下文而中断。</div>' +
-          '<div class="ab-row"><label>货币单位</label><select class="ab-input" id="adv-currency">' +
+          '<div class="ab-row"><label>' + lbl('cost_currency','货币单位') + '</label><select class="ab-input" id="adv-currency">' +
             '<option value="cny"' + (cur === 'cny' ? ' selected' : '') + '>人民币 ￥</option>' +
             '<option value="usd"' + (cur === 'usd' ? ' selected' : '') + '>美元 $</option>' +
           '</select></div>' +
@@ -4358,4 +4383,63 @@
       var t2 = setInterval(function () { if (++n2 > 150) { clearInterval(t2); return; } tick(); }, 1000);
     }
   })();
+  /* ── 「AI 还在跑吗」—— 直接问引擎，不靠猜（2026-09-23 · 老板 2026-09-22 那条的续）────────
+   * 【补的是哪一段】发消息那一下官方自己有「发送中」，不用我们管。
+   *   真正**丢状态**的是这三种时刻：**刷新页面 / 切到别的会话再切回来 / 从后台（别的 tab、锁屏）切回前台**
+   *   —— 那时界面上是一条**静止**的会话，客户看不出 AI 还在干活，
+   *   就会以为「我刚才是不是没点成功」，然后再点一遍（老板原话：「这几秒钟不知道自己点了没有」）。
+   * 【做法】官方 v0.10.0 给了 `GET /v1/threads/running`（一次列出所有有活跃回合的会话，带 `thread_id`）
+   *   ⇒ 这里**直接问**，不再靠旁听请求猜。不改官方逻辑、不拦不改任何请求。
+   * 【省着用】只在「可能真有活」时查：页面加载、从后台切回。
+   *   查到在跑 → 每 3 秒复查一次直到跑完；**没活的时候一个请求都不发**。
+   * ⚠️ 只认**当前这条**会话（`MODEL_THREAD`）—— 同一个账号多项目共用一个引擎，
+   *   别的项目的会话在跑不该弹给正在看这个项目的客户看。
+   * ⚠️ 收起时只在「显示的就是我这句」时才收 —— 不把别人（「正在处理…」那套）的提示顶掉。
+   * ⚠️ 查不到（老引擎没这条路由 / 网络抖）**不算「没在跑」**：宁可少显示一次，
+   *   也别把「不知道」写成「跑完了」（§8.7 191 的教训）。
+   */
+  (function () {
+    if (window.__asbudyRunningWatch) return;
+    window.__asbudyRunningWatch = true;
+    var RUN_TEXT = 'AI 正在处理…';
+    var poll = null, last = '';
+
+    function noteEl() { return document.getElementById('asbudy-opnote'); }
+    function showRun() {
+      var e = noteEl();
+      if (e && e.textContent === RUN_TEXT && e.style.opacity === '1') return;
+      notify(RUN_TEXT, true);
+    }
+    function hideRun() {
+      var e = noteEl();
+      if (e && e.textContent === RUN_TEXT) e.style.opacity = '0';
+    }
+    function stopPoll() { if (poll) { clearInterval(poll); poll = null; } }
+
+    function tick() {
+      var tid = MODEL_THREAD;
+      if (!tid || document.hidden) { stopPoll(); return Promise.resolve(); }
+      return api('/v1/threads/running').then(function (r) {
+        if (!r.ok || !Array.isArray(r.body)) return;     // 查不到 → 什么都不做
+        var running = r.body.some(function (x) { return x && x.thread_id === tid; });
+        if (running) {
+          showRun(); last = tid;
+          if (!poll) poll = setInterval(function () { tick().catch(function () {}); }, 3000);
+        } else {
+          if (last === tid) hideRun();
+          last = ''; stopPoll();
+        }
+      }).catch(function () { /* 这一次不显示，不停轮询 */ });
+    }
+
+    window.__asbudyRunningTick = tick;                   // 排查/回归用：手动催一次
+    window.__asbudyRunningDebug = function () {          // 排查用：把内部状态吐出来
+      return { thread: MODEL_THREAD, hidden: document.hidden, polling: !!poll };
+    };
+    setTimeout(tick, 2500);                              // ① 页面加载后（等 MODEL_THREAD 先有值）
+    document.addEventListener('visibilitychange', function () {   // ② 从后台切回前台
+      if (!document.hidden) setTimeout(tick, 300);
+    });
+  })();
+
 })();
