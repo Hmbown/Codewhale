@@ -2329,6 +2329,57 @@
       /* ⚠️ 搜索在前端做子串过滤，**不用引擎的 q**：2026-09-16 实测，引擎的 FTS 对中文
        * 基本搜不出来 —— 文本里明明有「人民币」，`?q=人民币` → 0 条；ASCII 的 `?q=RMB` → 1 条。
        * 所以整批拉下来（上限 200）在浏览器里过滤，中文才搜得到。 */
+      /* ── 「AI 想记住的」待确认清单（2026-09-23 加 · 老板拍「做吧」）────────────────────
+       * 【为什么必须加】官方 v0.10.0 把 `remember` 工具改成**只能提议** —— 它写进的是
+       *   `candidate`，要人确认才成为有效记忆（`codewhale-memory` 换 SQLite ＋ reviewed store）。
+       *   **实测**：对 AI 说「记住我最喜欢的颜色是蓝色」→ AI 回「记好了」→ 而
+       *   `GET /v1/memory`（本面板下面那份列表读的就是它）**返回空**，那一条躺在
+       *   `GET /v1/memory/lens` 里、`status: candidate`。
+       *   ⇒ 客户看到的是「什么都没发生」，过两天 AI 还是不记得 —— 只会觉得「记忆坏了」。
+       *   这一段把那批待确认的**摆出来让客户自己拍**（官方动作接口现成：
+       *   `POST /v1/memory/lens/actions` 的 `approve` / `reject`）。
+       * ⚠️ **两个库不是一回事，别混读**：`/v1/memory` 是旧的 Markdown 索引（下面那份列表）；
+       *   `/v1/memory/lens` 是新的 reviewed store（这段待确认的）。官方自己就是两套并存。
+       * ⚠️ 读不到 lens（老引擎没这条路由 / 网络抖）**就当没有待确认**—— 不弹错、不影响下面那份列表。
+       */
+      var pending = [];
+      function renderPending() {
+        var box = body.querySelector('#mem-pending');
+        if (!box) return;
+        if (!pending.length) { box.innerHTML = ''; return; }
+        box.innerHTML =
+          '<div style="margin:14px 0 6px;color:var(--text);font-size:14px">AI 想记住这些（等你确认）</div>' +
+          '<div class="ab-tip" style="margin-bottom:8px">AI 认为你在对话里表达了偏好或习惯，会先放到这里等你拍板 ——' +
+          '<b>不确认就不会生效</b>，对以后的对话也没有影响。</div>' +
+          pending.map(function (e) {
+            var m = e.memory || {}, d = m.draft || {};
+            return '<div class="ab-card" data-mem-id="' + esc(m.id) + '">' +
+              '<div class="ab-n">' + esc(d.title || d.body || '（无标题）') + '</div>' +
+              '<div style="display:flex;gap:8px;margin-top:8px">' +
+                '<button class="ab-btn sm mem-keep" type="button">留下</button>' +
+                '<button class="ab-btn ghost sm mem-drop" type="button">不要</button>' +
+              '</div></div>';
+          }).join('');
+        Array.prototype.forEach.call(box.querySelectorAll('.ab-card'), function (card) {
+          var id = card.getAttribute('data-mem-id');
+          var hit = pending.filter(function (x) { return String((x.memory || {}).id) === id; })[0] || {};
+          var rev = (hit.memory || {}).revision;
+          function act(action, btn) {
+            btn.disabled = true;
+            api('/v1/memory/lens/actions', {
+              method: 'POST', headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ command: { action: action, id: id, revision: rev } }),
+            }).then(function (r) {
+              if (r.ok) { notify(action === 'approve' ? '已留下' : '已丢弃'); load(); }
+              else { btn.disabled = false; notify('没成功：' + esc((r.body && r.body.error) || ('HTTP ' + r.code))); }
+            }).catch(function () { btn.disabled = false; notify('没成功，请重试'); });
+          }
+          var kb = card.querySelector('.mem-keep'), db = card.querySelector('.mem-drop');
+          if (kb) kb.onclick = function () { act('approve', this); };
+          if (db) db.onclick = function () { act('reject', this); };
+        });
+      }
+
       function renderList() {
         var box = body.querySelector('#mem-list');
         if (!box) return;
@@ -2350,7 +2401,11 @@
         Promise.all([
           api('/v1/config'),
           api('/v1/memory?scope=all&limit=200'),
+          api('/v1/memory/lens'),
         ]).then(function (rs) {
+          // 待确认的（candidate）—— 读不到就当没有，绝不影响下面那份列表
+          var lentries = (rs[2] && rs[2].body && rs[2].body.entries) || [];
+          pending = lentries.filter(function (e) { return e && e.memory && e.memory.status === 'candidate'; });
           var el = body.querySelector('#ab-mem');
           if (!el) return;
           var cfg = rs[0].body || {};
@@ -2375,6 +2430,7 @@
             return;
           }
           var html =
+            '<div id="mem-pending"></div>' +
             '<div class="ab-tip">AI 在对话中记住的内容（最近 32 条会带入对话，请勿作为资料库使用）。' +
             '仅作用于<b>本项目</b>。</div>' +
             '<div class="ab-row"><input class="ab-input" id="mem-q" placeholder="搜索（例如「客户」）" value="' + esc(q) + '"></div>';
@@ -2397,6 +2453,7 @@
             debounce = setTimeout(function () { q = v.trim(); renderList(); }, 150);
           };
           renderList();
+          renderPending();
           body.querySelector('#mem-reload').onclick = load;
           function clearOne(scope, label) {
             var n = (scope === 'workspace')
