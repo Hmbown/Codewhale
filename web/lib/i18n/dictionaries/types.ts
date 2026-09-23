@@ -388,10 +388,12 @@ export interface StatesDict {
   retry: string;
   reload: string;
   homeLink: string;
-  /** The 404 plate's primary action: the docs index, which the body names. */
+  /** Documentation recovery link on the 404 page. */
   docsIndexLink: string;
   notFoundTitle: string;
   notFoundBody: string;
+  notFoundHomeLink: string;
+  notFoundPosterAlt: string;
   /**
    * A data-bearing page whose source was not asked (build-time prerender)
    * or refused (rate limit, outage). Distinct from `empty`, which asserts
