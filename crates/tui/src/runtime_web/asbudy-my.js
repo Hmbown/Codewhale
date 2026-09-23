@@ -2097,6 +2097,51 @@
     return h;
   }
   function tuRefresh() { return '<button class="ab-btn ghost sm" id="tu-refresh" type="button">刷新</button>'; }
+  function tuExportBtn() { return '<button class="ab-btn ghost sm" id="tu-export" type="button" style="margin-left:6px">导出 CSV</button>'; }
+  function tuCsvCell(v) {
+    var s = String(v == null ? '' : v);
+    return /[",\n\r]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+  }
+  /** 导出当前视图（账号 × 天）为 CSV —— 老板 2026-09-23：「用量页导出 CSV」（为定价做准备）。
+   *  ⚠️ 导的是**屏幕上这一份**（当前区间、当前数据），不重新拉接口 —— 所见即所得。
+   *  ⚠️ 开头加 UTF-8 BOM：不加的话 Excel（Windows）按 GBK 解，中文全是乱码。
+   *  ⚠️ 纯前端 Blob 下载，**不新增门卫端点** —— 少一处白名单 / 权限 / 登录态要维护。
+   *     桌面窗口那个 iframe 没有 sandbox 属性，下载不会被拦（2026-09-23 查过源码并真机验过）。 */
+  function tuExportCsv() {
+    var d = TU.last || {};
+    var usd = DISPLAY.cost_currency !== 'cny';
+    var cur = usd ? 'USD' : 'CNY';
+    var num = function (n) { return Math.round(Number(n) || 0); };
+    var moneyOf = function (b) { b = b || {}; return Number(usd ? b.costUsd : b.costCny) || 0; };
+    var rows = [['粒度', '客户', '账号', '名称', '角色', '日期(UTC)', '调用次数',
+                 '输入token', '输出token', '缓存token', '推理token', '金额', '币种', '模型']];
+    function push(gran, clientLabel, a, date, b) {
+      rows.push([gran, clientLabel || '', a.account || '', a.label || '', a.roleZh || '', date || '',
+        num(b.calls), num(b.inTok), num(b.outTok), num(b.cachedTok), num(b.reasonTok),
+        moneyOf(b).toFixed(2), cur,
+        (a.models || []).map(function (m) { return m.model; }).join(' ')]);
+    }
+    function one(clientLabel, a) {
+      if (a.totals) push('账号合计', clientLabel, a, '', a.totals);
+      (a.days || []).forEach(function (day) { push('按天', clientLabel, a, day.date, day); });
+    }
+    var clients = d.clients || [];
+    if (clients.length) {
+      clients.forEach(function (c) {
+        (c.accounts || []).forEach(function (a) { one(c.label || c.key, a); });
+      });
+    } else {
+      (d.accounts || []).forEach(function (a) { one('', a); });
+    }
+    var csv = '\ufeff' + rows.map(function (r) { return r.map(tuCsvCell).join(','); }).join('\r\n') + '\r\n';
+    var name = '用量明细_' + (TU.since || '全部') + (TU.until ? ('_至_' + TU.until) : '') + '.csv';
+    var url = URL.createObjectURL(new Blob([csv], { type: 'text/csv;charset=utf-8' }));
+    var a2 = document.createElement('a');
+    a2.href = url; a2.download = name;
+    document.body.appendChild(a2);
+    a2.click();
+    setTimeout(function () { URL.revokeObjectURL(url); a2.remove(); }, 3000);
+  }
   function tuN(n) { return String(Math.round(Number(n) || 0)).replace(/\B(?=(\d{3})+(?!\d))/g, ','); }
   function tuW(n) {
     n = Number(n) || 0;
@@ -2157,6 +2202,17 @@
           tuMoney(b.costCny, b.costUsd));
       });
     }
+    // 按模型（2026-09-23 老板要「为定价准备」）—— 引擎 `group_by=model` 的原值，不是我们估的。
+    //   一个模型时也照常出一行（不特判：「只有一个模型就不显示」会让老板以为坏了）。
+    if (a.models && a.models.length) {
+      h += '<div class="ab-s" style="margin-top:10px;color:var(--text)">按模型</div>';
+      a.models.forEach(function (m) {
+        var b = m.brief || {};
+        h += tuLine(m.model || '（未标注）',
+          tuN(b.calls) + ' 次 · 进 ' + tuW(b.inTok) + ' · 出 ' + tuW(b.outTok) + ' · 缓存 ' + tuW(b.cachedTok),
+          tuMoney(b.costCny, b.costUsd));
+      });
+    }
     h += '</div>';
     return h;
   }
@@ -2192,7 +2248,7 @@
       '金额是按引擎内置价目表推算的，<b>不是厂商账单</b>；「未归属」是没有记到具体项目的对话（平台内部/测试）。' +
       (d.cached ? '<br>本次为 60 秒内的缓存结果，点「刷新」可强制重读。' : '') + '</div>';
     h += tuRangeBar() + '<div class="ab-card">';
-    h += '<div class="ab-card-top"><b>全部账号合计</b>' + tuRefresh() + '</div>';
+    h += '<div class="ab-card-top"><b>全部账号合计</b>' + tuRefresh() + tuExportBtn() + '</div>';
     h += '<div class="ab-s" style="font-size:16px;color:var(--text)">' + tuMoney(g.costCny, g.costUsd) +
       '　<span style="font-size:13.5px">（调用 ' + tuN(g.calls) + ' 次）</span></div>';
     h += '<div class="ab-s">进 ' + tuW(g.inTok) + ' · 出 ' + tuW(g.outTok) + ' · 缓存命中 ' + tuW(g.cachedTok) +
@@ -2226,6 +2282,8 @@
           body.innerHTML = tuRender(r.body);
           var b = body.querySelector('#tu-refresh');
           if (b) b.onclick = function () { load(true); };
+          var bx = body.querySelector('#tu-export');
+          if (bx) bx.onclick = tuExportCsv;
           // 时间区间：快捷按钮 ＋ 自定义起止（2026-09-20 老板要）
           Array.prototype.forEach.call(body.querySelectorAll('[data-range]'), function (btn) {
             btn.onclick = function () {
