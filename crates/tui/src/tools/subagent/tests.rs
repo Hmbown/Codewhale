@@ -9802,6 +9802,60 @@ fn transient_provider_classifier_matches_structured_rate_limit() {
     assert!(is_transient_subagent_provider_error(&err));
 }
 
+#[test]
+fn transient_provider_classifier_respects_durable_typed_errors() {
+    // The provider body and outer context both contain the old transient
+    // heuristics. Neither may override a durable HTTP-boundary classification.
+    let misleading = "429 rate limited: stream request temporarily unavailable";
+    let mut errors = vec![
+        LlmError::from_http_response(401, misleading),
+        LlmError::AuthorizationError(misleading.to_string()),
+        LlmError::ModelError(misleading.to_string()),
+        LlmError::ContentPolicyError(misleading.to_string()),
+        LlmError::ContextLengthError(misleading.to_string()),
+    ];
+    for status in [400, 402, 429] {
+        let quota = LlmError::from_http_response(
+            status,
+            r#"{"error":{"type":"insufficient_quota","message":"429: insufficient quota for stream request"}}"#,
+        );
+        assert!(matches!(quota, LlmError::QuotaExhausted(_)));
+        errors.push(quota);
+    }
+    for error in errors {
+        assert!(!error.is_retryable(), "fixture must be a durable refusal");
+        let error = anyhow::Error::new(error).context("stream request failed: 503");
+        assert!(
+            !is_transient_subagent_provider_error(&error),
+            "typed refusal must not become transient: {error:#}"
+        );
+        assert!(retryable_subagent_provider_failure(&error, 1).is_none());
+    }
+}
+
+#[test]
+fn transient_provider_classifier_uses_typed_retryability_without_keywords() {
+    for error in [
+        LlmError::ServerError {
+            status: 500,
+            message: "upstream failed".to_string(),
+        },
+        LlmError::NetworkError("socket closed".to_string()),
+        LlmError::Timeout(Duration::from_secs(1)),
+    ] {
+        let error = anyhow::Error::new(error);
+        assert!(is_transient_subagent_provider_error(&error));
+        assert!(retryable_subagent_provider_failure(&error, 1).is_some());
+    }
+    let error = anyhow::Error::new(LlmError::RateLimited {
+        message: "slow down".to_string(),
+        retry_after: Some(Duration::from_secs(7)),
+    });
+    let retry = retryable_subagent_provider_failure(&error, 1).expect("transient rate limit");
+    assert_eq!(retry.delay, Duration::from_secs(7));
+    assert_eq!(retry.checkpoint_reason, "api_rate_limited");
+}
+
 #[tokio::test]
 async fn subagent_retries_transient_provider_header_timeout_before_succeeding() {
     let tmp = tempdir().expect("tempdir");

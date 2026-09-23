@@ -12650,8 +12650,21 @@ fn retryable_subagent_provider_failure(
 }
 
 fn is_transient_subagent_provider_error(error: &anyhow::Error) -> bool {
-    if let Some(LlmError::RateLimited { .. }) = error.downcast_ref::<LlmError>() {
-        return true;
+    // Durable account, model, and policy refusals outrank message text: a
+    // quota error mentioning "429" is not a transient rate limit. Retain the
+    // transport fallback for generic/parse errors and relay HTTP 400s, which
+    // can carry an upstream timeout rather than an invalid request.
+    match error.downcast_ref::<LlmError>() {
+        Some(
+            LlmError::QuotaExhausted(_)
+            | LlmError::AuthenticationError(_)
+            | LlmError::AuthorizationError(_)
+            | LlmError::ModelError(_)
+            | LlmError::ContentPolicyError(_)
+            | LlmError::ContextLengthError(_),
+        ) => return false,
+        Some(error) if error.is_retryable() => return true,
+        _ => {}
     }
 
     let message = format!("{error:#}").to_ascii_lowercase();
