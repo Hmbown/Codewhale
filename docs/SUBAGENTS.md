@@ -76,9 +76,9 @@ stewardship.
 | Role          | Stance                                 | Writes? | Network? | Shell posture | Typical use                                  |
 |---------------|----------------------------------------|---------|----------|---------------|----------------------------------------------|
 | `general`     | flexible; do whatever the parent says  | yes     | yes      | yes           | the default; multi-step tasks                |
-| `explore`     | read-only; map the relevant code fast  | no      | yes      | read-only (net + bounded verify) | "find every call site of `Foo`; check the PR with gh" |
+| `explore`     | read-only; map the relevant code fast  | no      | yes      | bounded inspection | "find every call site of `Foo`; check the PR with gh" |
 | `planner`     | analyse and produce a strategy         | no      | yes      | read-only probes | "design the migration; don't execute"        |
-| `reviewer`    | read-and-grade with severity scores    | no      | yes      | read-only (net + bounded verify) | "audit this PR for bugs"                     |
+| `reviewer`    | read-and-grade with severity scores    | no      | yes      | bounded inspection | "audit this PR for bugs"                     |
 | `implement`   | land a specific change with min edit   | yes     | yes      | yes           | "rewrite `bar.rs::Foo::bar` to do X"         |
 | `test`        | run tests / validation, report outcome | no      | yes      | bounded verification (no writes) | "verify the diff with the bounded test checks; report PASS/FAIL" |
 | `advisor`     | short-lived, high-reasoning counsel     | no      | yes      | none          | "what are we missing in this design?"        |
@@ -212,6 +212,15 @@ before admission. Active overlapping shared claims fail before mutation; a
 real isolated worktree may proceed in parallel. A `custom` role requires
 explicit write-capable authority to claim writes; otherwise it starts
 read-only.
+
+Read-only is not file-only. A normally write-capable agent narrowed with
+`write_authority: "read_only"` keeps the existing classifier-bounded inspection
+shell when its parent permits it: Git history/status, search, and allowed `gh`
+log reads, not arbitrary commands or test programs. Workflow read-only steps
+likewise use the effective role's tools instead of imposing a second File-only
+list; a `test` role retains its bounded verification interface. Explicit tool
+allowlists, `deny_all_tools`, parent denials, network limits, and mutation checks
+still apply. A parent without shell access cannot delegate it.
 
 Optional fields:
 

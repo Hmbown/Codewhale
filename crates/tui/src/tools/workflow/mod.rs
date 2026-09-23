@@ -3518,22 +3518,11 @@ fn leaf_allowed_tools(spec: &LeafSpec) -> Result<Option<Vec<String>>, ToolError>
     if !spec.permissions.allowed_tools.is_empty() {
         return Ok(Some(spec.permissions.allowed_tools.clone()));
     }
-    if spec.mode != TaskMode::ReadOnly {
-        return Ok(None);
-    }
-    Ok(Some(
-        read_only_allowed_tools(spec.agent_type)
-            .iter()
-            .map(|tool| (*tool).to_string())
-            .collect(),
-    ))
-}
-
-fn read_only_allowed_tools(agent_type: AgentType) -> &'static [&'static str] {
-    match agent_type {
-        AgentType::Verifier => &["File"],
-        _ => &["File"],
-    }
+    // The child grant already intersects role, parent permissions and the
+    // emitted writeAuthority. A second File-only default hid bounded Git/CI
+    // inspection from scouts and Run from verifiers without adding safety.
+    // Explicit allowlists and deny_all_tools above remain exact restrictions.
+    Ok(None)
 }
 
 fn is_write_or_shell_tool(tool: &str) -> bool {
@@ -7902,6 +7891,36 @@ export default workflow({
                 .source
                 .contains("writeAuthority: \"worktree_write\"")
         );
+    }
+
+    #[test]
+    fn read_only_workflow_leaves_use_the_runtime_grant_unless_explicitly_narrowed() {
+        for agent_type in ["explore", "review", "verifier", "general"] {
+            let mut leaf: LeafSpec = serde_json::from_value(json!({
+                "id": "inspect",
+                "prompt": "Inspect source and CI evidence",
+                "agent_type": agent_type,
+                "mode": "read_only"
+            }))
+            .expect("read-only leaf");
+            assert_eq!(leaf_allowed_tools(&leaf).unwrap(), None);
+            let source = leaf_task_options_expression(&leaf, None, false).unwrap();
+            assert!(source.contains("writeAuthority: \"read_only\""), "{source}");
+            assert!(!source.contains("allowedTools:"), "{source}");
+
+            leaf.permissions.deny_all_tools = true;
+            assert_eq!(leaf_allowed_tools(&leaf).unwrap(), Some(Vec::new()));
+            leaf.permissions.deny_all_tools = false;
+            leaf.permissions.allowed_tools = vec!["File".into()];
+            assert_eq!(
+                leaf_allowed_tools(&leaf).unwrap(),
+                Some(vec!["File".into()])
+            );
+            leaf.permissions.allowed_tools = vec!["bash".into()];
+            assert!(validate_leaf_runtime_contract(&leaf).is_ok());
+            leaf.permissions.allowed_tools = vec!["exec_shell".into()];
+            assert!(validate_leaf_runtime_contract(&leaf).is_err());
+        }
     }
 
     #[test]

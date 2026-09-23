@@ -10856,14 +10856,16 @@ fn apply_spawn_write_authority(runtime: &mut SubAgentRuntime, request: &SpawnReq
     }
     // `read_only` must be an executable posture, not just metadata. Normally
     // write-capable identities also inherit Full shell, which could mutate the
-    // workspace without a scope-aware claim under Auto/Full Access. Clamp that
-    // shell surface completely; verifier keeps its deliberate test runner.
+    // workspace without a scope-aware claim under Auto/Full Access. Narrow it
+    // to the existing classifier-bounded inspection shell, not a file-only
+    // surface. A parent with no shell stays shell-less; verifier keeps its
+    // deliberate test runner. The grant and executor enforce the same boundary.
     runtime.worker_profile.permissions.write = false;
     if matches!(
         request.agent_type,
         FleetRole::Worker | FleetRole::Builder | FleetRole::Custom
     ) {
-        runtime.worker_profile.shell = ShellPolicy::None;
+        runtime.worker_profile.shell = runtime.worker_profile.shell.min_with(ShellPolicy::ReadOnly);
     }
 }
 
@@ -18714,18 +18716,18 @@ fn annotate_child_model_error(
             route_source_label(route),
         )
     };
+    let lower = err.to_ascii_lowercase();
     match crate::error_taxonomy::classify_error_message(err) {
-        crate::error_taxonomy::ErrorCategory::Authorization
-        | crate::error_taxonomy::ErrorCategory::State => hint(),
+        crate::error_taxonomy::ErrorCategory::Authorization => hint(),
+        crate::error_taxonomy::ErrorCategory::State if lower.contains("model") => hint(),
         _ => {
             // #3020 (#2653): Provider rejections like "Model Not Exist" or
             // "does not exist or you do not have access" often classify as
             // `Internal` rather than `Authorization`/`State`.  Catch these
             // patterns in the raw error text and annotate anyway.
-            let lower = err.to_ascii_lowercase();
             if lower.contains("model not exist")
                 || lower.contains("model_not_found")
-                || lower.contains("does not exist")
+                || lower.contains("model") && lower.contains("does not exist")
                 || lower.contains("no such model")
                 || lower.contains("invalid model")
             {

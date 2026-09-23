@@ -625,8 +625,87 @@ fn declared_read_only_write_roles_derive_without_mutating_shell() {
             false,
         );
         assert!(!profile.permissions.write, "{request:?}");
-        assert_eq!(profile.shell, ShellPolicy::None, "{request:?}");
+        assert_eq!(profile.shell, ShellPolicy::ReadOnly, "{request:?}");
+
+        runtime.worker_profile.shell = ShellPolicy::None;
+        apply_spawn_write_authority(&mut runtime, &request);
+        assert_eq!(runtime.worker_profile.shell, ShellPolicy::None);
     }
+}
+
+#[tokio::test]
+async fn explicit_read_only_general_can_inspect_git_but_cannot_mutate() {
+    let tmp = tempdir().expect("tempdir");
+    init_claim_repo(tmp.path());
+    let workspace = tmp.path().canonicalize().expect("workspace");
+    let request = parse_spawn_request(&json!({
+        "prompt": "inspect CI evidence",
+        "write_authority": "read_only",
+        "allowed_tools": ["read", "bash"]
+    }))
+    .expect("read-only request");
+    let mut runtime =
+        stub_runtime().with_agent_tool_surface_options(enabled_agent_surface_options());
+    runtime.context = ToolContext::new(workspace.clone());
+    runtime.context.auto_approve = true;
+    apply_spawn_write_authority(&mut runtime, &request);
+    runtime.worker_profile = worker_profile_for_spawn(
+        &runtime,
+        &request.agent_type,
+        &AgentWorkerToolProfile::Inherited,
+        "deepseek-v4-pro",
+        None,
+        false,
+    );
+    let registry = SubAgentToolRegistry::new(
+        runtime,
+        request.agent_type,
+        Some(vec!["read".into(), "bash".into()]),
+        crate::tools::todo::new_shared_todo_list(),
+        crate::tools::plan::new_shared_plan_state(),
+    );
+    assert!(registry.unavailable_allowed_tools().is_empty());
+    assert_ne!(
+        registry.grant.files,
+        crate::worker_profile::FileGrant::Write
+    );
+    for command in ["pwd", "git status --short", "git log --oneline -1"] {
+        let output = registry
+            .execute("inspection", "bash", json!({"command": command}))
+            .await
+            .unwrap_or_else(|error| panic!("{command}: {error}"));
+        if command != "git status --short" {
+            assert!(!output.trim().is_empty());
+        }
+    }
+    for command in [
+        "gh run view 123 --repo owner/repo --log-failed",
+        "rg -n TODO src",
+    ] {
+        let input = json!({"command": command});
+        assert!(
+            registry.posture_permits_tool("bash", Some(&input)),
+            "{command}"
+        );
+        assert!(
+            registry.envelope_refusal("bash", &input).is_none(),
+            "{command}"
+        );
+    }
+    for command in [
+        "touch forbidden.txt",
+        "git checkout -b forbidden",
+        "npm test",
+    ] {
+        assert!(
+            registry
+                .execute("inspection", "bash", json!({"command": command}))
+                .await
+                .is_err(),
+            "inspection is not arbitrary execution: {command}"
+        );
+    }
+    assert!(!workspace.join("forbidden.txt").exists());
 }
 
 #[test]
@@ -11962,6 +12041,25 @@ fn annotate_child_model_error_adds_actionable_hint() {
         openai_style.contains("child-agent model config"),
         "OpenAI-style rejection gets the hint: {openai_style}"
     );
+}
+
+#[test]
+fn child_runtime_capability_errors_are_not_misreported_as_model_access_errors() {
+    for error in [
+        "Sub-agent requested unavailable tools: bash",
+        "Requested source file does not exist",
+        "The worktree path is unavailable",
+    ] {
+        assert_eq!(
+            annotate_child_model_error(
+                error,
+                "deepseek-flash",
+                crate::config::ApiProvider::Deepseek,
+                &ModelRoute::Inherit,
+            ),
+            error,
+        );
+    }
 }
 
 #[test]
