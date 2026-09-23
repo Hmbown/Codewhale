@@ -297,6 +297,33 @@ mod tests {
     }
 
     #[test]
+    fn bundled_deepseek_flash_aliases_retain_vision() {
+        // #6421: the offline model fallback must agree with the provider-owned
+        // seed; DeepSeek's Vision and Models guides now name deepseek-flash.
+        let bundled = bundled_catalog();
+        for model in [
+            "deepseek-flash",
+            "deepseek-v4-flash",
+            "deepseek-v4-flash-vision-exp",
+        ] {
+            assert!(
+                bundled.entries[model]
+                    .modalities
+                    .iter()
+                    .any(|m| m == "image"),
+                "{model} lost its documented image input"
+            );
+        }
+        assert!(
+            !bundled.entries["deepseek-v4-pro"]
+                .modalities
+                .iter()
+                .any(|m| m == "image"),
+            "the Flash correction must not widen other model facts"
+        );
+    }
+
+    #[test]
     fn merge_order_is_user_override_then_provider_then_bundled() {
         let now = Utc::now();
         let mut bundled_entries = BTreeMap::new();

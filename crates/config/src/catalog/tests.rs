@@ -834,6 +834,33 @@ fn bundled_asset_parses() {
 }
 
 #[test]
+fn bundled_deepseek_flash_routes_support_image_input() {
+    // #6421: the official Vision guide documents deepseek-flash; the pricing
+    // guide maps both legacy Flash names to it (verified 2026-09-23).
+    // https://api-docs.deepseek.com/guides/vision/
+    // https://api-docs.deepseek.com/quick_start/pricing/
+    let rows = bundled_catalog_offerings();
+    for model in [
+        "deepseek-flash",
+        "deepseek-v4-flash",
+        "deepseek-v4-flash-vision-exp",
+    ] {
+        let row = find(&rows, "deepseek", model);
+        assert_eq!(
+            crate::models_dev::image_input_support(row.modalities.as_ref()),
+            crate::route::CapabilityState::Supported,
+            "native DeepSeek route {model} must retain its documented vision capability"
+        );
+    }
+    let text_only = find(&rows, "deepseek", "deepseek-v4-pro");
+    assert_eq!(
+        crate::models_dev::image_input_support(text_only.modalities.as_ref()),
+        crate::route::CapabilityState::Unsupported,
+        "a Flash correction must not widen other routes"
+    );
+}
+
+#[test]
 fn bundled_asset_meta_describes_offline_fallback_not_competing_truth() {
     // #4188: the asset must document itself as offline/stale fallback, not a
     // competing curated source of truth alongside live Models.dev.
