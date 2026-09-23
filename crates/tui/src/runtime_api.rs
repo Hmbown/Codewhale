@@ -2114,8 +2114,9 @@ async fn cancel_agent_run(
     Path(run_id): Path<String>,
 ) -> Result<(StatusCode, Json<AgentWorkerRecord>), ApiError> {
     // Runs this runtime is executing itself (Fleet-launched children) stop
-    // in place. Only a child running in this process qualifies: records the
-    // manager loaded from disk belong to whichever process wrote them.
+    // in place. Only a running child in this process qualifies for mutation;
+    // a terminal receipt can be returned without mutating or consulting disk.
+    // Other persisted runs still go through their owning session below.
     let owned = {
         let manager = state.sub_agent_manager.read().await;
         manager
@@ -2125,10 +2126,18 @@ async fn cancel_agent_run(
             .filter(|record| {
                 manager
                     .get_result(&record.spec.worker_id)
-                    .is_ok_and(|agent| agent.status == SubAgentStatus::Running)
+                    .is_ok_and(|agent| {
+                        agent.status == SubAgentStatus::Running || record.status.is_terminal()
+                    })
             })
     };
     if let Some(record) = owned {
+        // Persistence is asynchronous. A repeated stop must answer from the
+        // owning manager's terminal receipt, not race the disk projection and
+        // incorrectly report a run we just stopped as missing or still live.
+        if record.status.is_terminal() {
+            return Ok((StatusCode::OK, Json(record)));
+        }
         let agent_id = record.spec.worker_id.clone();
         let cancelled = {
             let mut manager = state.sub_agent_manager.write().await;

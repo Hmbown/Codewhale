@@ -412,11 +412,8 @@ async fn native_exact_fleet_builder_keeps_the_plan_read_only_ceiling() {
         !profile.permissions.write,
         "the authored read_only mode must remain executable policy"
     );
-    assert_eq!(profile.shell, crate::worker_profile::ShellPolicy::None);
-    assert_eq!(
-        profile.tools,
-        crate::worker_profile::ToolScope::Explicit(vec!["File".into()])
-    );
+    assert_eq!(profile.shell, crate::worker_profile::ShellPolicy::ReadOnly);
+    assert_eq!(profile.tools, crate::worker_profile::ToolScope::Inherit);
     assert_eq!(
         records[0].spec.child_route.as_ref().unwrap().provider_id,
         "openrouter"

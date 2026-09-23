@@ -653,7 +653,15 @@ workflow({
             assert_eq!(leaf.role.as_deref(), Some(expected_role));
             assert_eq!(leaf.mode, TaskMode::ReadOnly);
             assert!(!leaf.permissions.allow_write);
-            assert!(leaf.permissions.allowed_tools.is_empty());
+            let expected_tools: &[&str] = if expected_role == "explore" {
+                &["File"]
+            } else {
+                &[]
+            };
+            assert_eq!(
+                leaf.permissions.allowed_tools, expected_tools,
+                "the fixture must explicitly restrict source gathering to File"
+            );
             assert_eq!(
                 leaf.permissions.deny_all_tools,
                 expected_role != "explore",

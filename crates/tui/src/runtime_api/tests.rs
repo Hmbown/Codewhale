@@ -2913,6 +2913,57 @@ async fn agent_run_cancel_stops_a_live_child_and_returns_its_receipt() -> Result
 }
 
 #[tokio::test]
+async fn agent_run_cancel_remains_idempotent_before_receipt_persistence() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let root = temp.path().to_path_buf();
+    let workspace = root.join("workspace");
+    fs::create_dir_all(&workspace)?;
+    // A memory-only manager deterministically models a disk projection that
+    // has not caught up. Repeated stops must use its authoritative receipt.
+    let manager = Arc::new(tokio::sync::RwLock::new(
+        crate::tools::subagent::SubAgentManager::new(workspace.clone(), 2),
+    ));
+    let agent_id = {
+        let mut guard = manager.write().await;
+        let id = guard.insert_test_running_agent("not-yet-persisted", &workspace);
+        guard.assign_test_session_owner(&id, "session-stop");
+        id
+    };
+    let Some((addr, _runtime_threads, handle)) =
+        spawn_test_server_with_root_token_mobile_workspace_and_subagents(
+            root.clone(),
+            root.join("sessions"),
+            None,
+            false,
+            workspace.clone(),
+            Some(manager),
+            None,
+        )
+        .await?
+    else {
+        return Ok(());
+    };
+    let client = crate::tls::reqwest_client();
+    for _ in 0..2 {
+        let response = client
+            .post(format!("http://{addr}/v1/agent-runs/{agent_id}/cancel"))
+            .send()
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let receipt: serde_json::Value = response.json().await?;
+        assert_eq!(receipt["spec"]["worker_id"], agent_id.as_str());
+        assert_eq!(receipt["status"], "cancelled");
+    }
+    assert!(
+        !workspace
+            .join(".codewhale/state/subagents.v1.json")
+            .exists()
+    );
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
 async fn agent_run_cancel_refuses_a_run_owned_by_a_session_it_does_not_host() -> Result<()> {
     let root = std::env::temp_dir().join(format!(
         "codewhale-agent-run-cancel-foreign-{}",
