@@ -149,6 +149,11 @@ pub struct AgentProgressEventMeta {
     /// cannot tell them apart — the producer sets this instead, and UI
     /// consumers rewrite on it rather than sniffing the message (#6290).
     pub routine_wait: bool,
+    /// The child approval id this progress reports on: set while the agent
+    /// waits on a person and on the first progress after that wait ends, so
+    /// hosts can retire the matching card and pending entry by identity
+    /// (approvals C1) instead of by parsing the message.
+    pub approval_id: Option<String>,
 }
 
 impl AgentProgressEventMeta {
@@ -159,6 +164,7 @@ impl AgentProgressEventMeta {
             step: None,
             tool_name: None,
             routine_wait: false,
+            approval_id: None,
         }
     }
 
@@ -177,6 +183,12 @@ impl AgentProgressEventMeta {
     #[must_use]
     pub fn with_tool(mut self, tool_name: impl Into<String>) -> Self {
         self.tool_name = Some(tool_name.into());
+        self
+    }
+
+    #[must_use]
+    pub fn with_approval_id(mut self, approval_id: impl Into<String>) -> Self {
+        self.approval_id = Some(approval_id.into());
         self
     }
 }

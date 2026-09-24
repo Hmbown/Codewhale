@@ -1096,6 +1096,10 @@
   "ApprovalOptionAbortTurn": "यह टर्न रोकें",
   "ApprovalBlockTitle": "अनुमति",
   "ApprovalControlsHint": "  ·  Pg↑/↓ समीक्षा  ·  {details} विवरण  ·  Esc रोकें",
+  "ApprovalOwnerHeader": "एजेंट: {agent} · {role}",
+  "ApprovalGoToAgent": "g एजेंट पर जाएँ",
+  "ApprovalControlsHintChild": "  ·  Pg↑/↓ समीक्षा  ·  {details} विवरण  ·  Esc छिपाएँ",
+  "PendingApprovalInAgent": "{agent} में स्वीकृति चाहिए — /agents",
   "ApprovalTruncationHint": "  … छाँटा गया · पूरा विवरण के लिए {details} दबाएँ",
   "ApprovalFullAccessPolicyBlocked": "{tool} अवरुद्ध: Full Access इस नीति को दरकिनार नहीं कर सकता",
   "AutoReviewQuestionSkipped": "Auto-Review ने उपयोगकर्ता प्रश्न छोड़कर स्वायत्त रूप से जारी रखा",
@@ -1599,7 +1603,7 @@
   "FleetModelReasonOperatorRoute": "यह आपका वर्तमान मॉडल है (टीम का operator रूट); मॉडल बदलें या इसे बदलने के लिए /fleet save का उपयोग करें",
   "FleetModelReasonAlreadyPresent": "पहले से टीम में है",
   "FleetModelErrorNeedsRoute": "टीम मॉडल के लिए provider id और model id दोनों ज़रूरी हैं",
-  "FleetModelErrorNeedsRole": "टीम का सदस्य एक रोल है; कोई एक बताएँ (उदाहरण `/fleet add {route} scout`)",
+  "FleetModelErrorNeedsRole": "एजेंट के लिए भूमिका का नाम ज़रूरी है (जैसे `/fleet add {route} scout`)।",
   "FleetModelErrorNoSelection": "कोई टीम चयनित नहीं है; आपकी टीम केवल सत्र मॉडल है",
   "FleetModelErrorOperatorRoute": "{route} टीम `{fleet}` का operator रूट है; इसे remove से नहीं, /fleet save से बदलें",
   "FleetModelErrorNotInFleet": "{route} टीम `{fleet}` में नहीं है",
@@ -2284,5 +2288,9 @@
   "ExtensionsScopeGlobal": "वैश्विक",
   "ExtensionsScopeProject": "प्रोजेक्ट",
   "ExtensionsScopePlugin": "प्लगइन: {plugin}",
-  "ExtensionsRemoveArmed": "{name} हटाएँ? पुष्टि के लिए फिर से d दबाएँ · Esc रद्द करता है"
+  "ExtensionsRemoveArmed": "{name} हटाएँ? पुष्टि के लिए फिर से d दबाएँ · Esc रद्द करता है",
+  "FleetReviewWorkspaceLimits": "{workspace} · एजेंट {enabled} ({concurrent} एक साथ, {launch_slots} लॉन्च स्लॉट, {admitted} स्वीकृत) · रिकर्शन एजेंट {agent_depth} / Fleet {fleet_depth} (सीमा {ceiling})",
+  "FleetReviewPolicy": "एजेंट के लिए डिफ़ॉल्ट रूप से टोकन सीमा नहीं है · API {api_secs}s, गतिविधि संकेत {heartbeat_secs}s। Fleet → exec से शुरू करें; /fleet workers (या /subagents) इस सत्र के एजेंट दिखाता है; /fleet status और codewhale fleet status .codewhale/fleet.jsonl में सहेजा गया इतिहास पढ़ते हैं।",
+  "SetupProjectPermissionsInvalid": "प्रोजेक्ट कॉन्फ़िगरेशन {path} पढ़ा नहीं जा सका ({reason})। इसकी अनुमति संबंधी पाबंदियाँ लागू नहीं हैं; यह वर्कस्पेस आपके उपयोगकर्ता डिफ़ॉल्ट का इस्तेमाल करता है।",
+  "SetupProjectPermissionsOverride": "प्रोजेक्ट कॉन्फ़िगरेशन में {fields} है। प्रीसेट उपयोगकर्ता डिफ़ॉल्ट सहेजते हैं; प्रोजेक्ट कॉन्फ़िगरेशन इस वर्कस्पेस में अनुमतियों को और सीमित कर सकता है।"
 }

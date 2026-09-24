@@ -1013,14 +1013,14 @@ impl Engine {
                             let message = match reason {
                                 crate::compaction::CompactionRefusal::TooFewMessages { count } => {
                                     format!(
-                                        "Context pressure is high but auto-compaction held: only {count} messages — nothing meaningful to summarize yet"
+                                        "Context is filling up, but there is nothing to make room from yet: only {count} messages"
                                     )
                                 }
                                 crate::compaction::CompactionRefusal::RetainedFloor {
                                     floor,
                                     threshold,
                                 } => format!(
-                                    "Context pressure is high but auto-compaction held: retained context (~{}K tokens) cannot fall below the {}K trigger — /compact to force a pass, or trim pinned context",
+                                    "Context is filling up, but making room would not help: retained context (~{}K tokens) cannot fall below the {}K trigger — /compact to force a pass, or trim pinned context",
                                     floor / 1000,
                                     threshold / 1000
                                 ),
@@ -1051,7 +1051,7 @@ impl Engine {
                 self.emit_compaction_started(
                     compaction_id.clone(),
                     true,
-                    "Auto context compaction started".to_string(),
+                    "Making room…".to_string(),
                 )
                 .await;
                 let auto_messages_before = self.session.messages.len();
@@ -1081,9 +1081,9 @@ impl Engine {
                     auto_compaction_suppressed = true;
                     self.finish_compaction(&compaction_id);
                     let message = if turn_was_canceled {
-                        "Auto-compaction canceled with the active turn; conversation context was not changed"
+                        "Making room stopped with the turn; the conversation was not changed"
                     } else {
-                        "Auto-compaction canceled; conversation context was not changed"
+                        "Making room stopped; the conversation was not changed"
                     }
                     .to_string();
                     self.emit_compaction_cancelled(compaction_id, true, message)
@@ -1105,9 +1105,9 @@ impl Engine {
                                 auto_compaction_suppressed = true;
                                 self.finish_compaction(&compaction_id);
                                 let message = if turn_was_canceled {
-                                    "Auto-compaction canceled with the active turn; conversation context was not changed"
+                                    "Making room stopped with the turn; the conversation was not changed"
                                 } else {
-                                    "Auto-compaction canceled; conversation context was not changed"
+                                    "Making room stopped; the conversation was not changed"
                                 }
                                 .to_string();
                                 self.emit_compaction_cancelled(compaction_id, true, message)
@@ -1138,11 +1138,11 @@ impl Engine {
                             let auto_tokens_after = self.estimated_input_tokens();
                             let status = if retries_used > 0 {
                                 format!(
-                                    "Auto-compaction complete: {auto_messages_before} → {auto_messages_after} messages ({removed} removed, {retries_used} retries), ~{auto_tokens_before} → ~{auto_tokens_after} tokens ({coverage_clause})"
+                                    "Made room: {auto_messages_before} → {auto_messages_after} messages ({removed} removed, {retries_used} retries), ~{auto_tokens_before} → ~{auto_tokens_after} tokens ({coverage_clause})"
                                 )
                             } else {
                                 format!(
-                                    "Auto-compaction complete: {auto_messages_before} → {auto_messages_after} messages ({removed} removed), ~{auto_tokens_before} → ~{auto_tokens_after} tokens ({coverage_clause})"
+                                    "Made room: {auto_messages_before} → {auto_messages_after} messages ({removed} removed), ~{auto_tokens_before} → ~{auto_tokens_after} tokens ({coverage_clause})"
                                 )
                             };
                             self.emit_compaction_completed(
@@ -1162,7 +1162,8 @@ impl Engine {
                             .await;
                         } else {
                             auto_compaction_suppressed = true;
-                            let message = "Auto-compaction skipped: empty result".to_string();
+                            let message =
+                                "Making room skipped: the summary came back empty".to_string();
                             self.emit_compaction_failed(
                                 compaction_id.clone(),
                                 true,
@@ -1176,7 +1177,7 @@ impl Engine {
                         auto_compaction_suppressed = true;
                         // Log error but continue with original messages (never corrupt)
                         let message = crate::compaction::report_compaction_failure(
-                            "Auto-compaction failed",
+                            "Making room failed",
                             &compaction_id,
                             true,
                             &err,
@@ -3509,21 +3510,33 @@ impl Engine {
 
             let first_hydration_this_batch =
                 !deferred_tools_hydrated_this_batch.contains(&tool_name);
-            if blocked_error.is_none()
-                && let Some(result) = maybe_hydrate_requested_deferred_tool(
+            let hydration = if blocked_error.is_none() {
+                maybe_hydrate_requested_deferred_tool(
                     &tool_name,
                     &tool_input,
                     tool_catalog,
                     &active_tools_at_batch_start,
                     &mut deferred_tools_hydrated_this_batch,
                 )
+            } else {
+                None
+            };
+            if first_hydration_this_batch && deferred_tools_hydrated_this_batch.contains(&tool_name)
             {
-                if first_hydration_this_batch {
-                    // Retain first-proposal order separately from the set
-                    // used to deduplicate calls in this batch. LRU bounds
-                    // must not depend on randomized HashSet iteration.
-                    deferred_tools_hydrated_in_order.push(tool_name.clone());
+                // Retain first-proposal order separately from the set used to
+                // deduplicate calls in this batch. LRU bounds must not depend
+                // on randomized HashSet iteration. A well-formed first call
+                // executes below and activates exactly like a hydrated one.
+                deferred_tools_hydrated_in_order.push(tool_name.clone());
+                if hydration.is_none() {
+                    emit_tool_audit(json!({
+                        "event": "tool.deferred_first_use_executed",
+                        "tool_id": tool_id.clone(),
+                        "tool_name": tool_name.clone(),
+                    }));
                 }
+            }
+            if let Some(result) = hydration {
                 emit_tool_audit(json!({
                     "event": "tool.schema_hydrated",
                     "tool_id": tool_id.clone(),
@@ -3536,8 +3549,8 @@ impl Engine {
                 // receives it in the tool result below (E3). The audit
                 // record above is the receipt.
                 // The provider did not advertise this schema in the current
-                // request. Hydration is discovery, never execution authority:
-                // return the schema now and require a subsequent model call.
+                // request and the call does not match it: return the schema
+                // now and require a corrected model call.
                 guard_result = Some(result);
             }
 
@@ -3751,7 +3764,7 @@ impl Engine {
                 );
                 for plan in plans {
                     let result = Err(ToolError::permission_denied(
-                        "Runtime permission posture changed while this tool call was being planned; retry it under the current posture."
+                        "Permissions changed while this tool call was being planned; retry it with the current permissions."
                             .to_string(),
                     ));
                     let _ = self
@@ -4366,7 +4379,7 @@ impl Engine {
                         } else {
                             result_override.or_else(|| {
                                 Some(Err(ToolError::permission_denied(
-                                    "Runtime permission posture changed before this tool call executed; retry it under the current posture."
+                                    "Permissions changed before this tool call executed; retry it with the current permissions."
                                         .to_string(),
                                 )))
                             })
@@ -4411,7 +4424,7 @@ impl Engine {
                         {
                             result_override.get_or_insert_with(|| {
                                 Err(ToolError::permission_denied(
-                                    "Runtime permission posture changed before this tool call executed; retry it under the current posture."
+                                    "Permissions changed before this tool call executed; retry it with the current permissions."
                                         .to_string(),
                                 ))
                             });

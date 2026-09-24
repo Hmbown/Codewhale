@@ -1117,6 +1117,10 @@
   "ApprovalOptionAbortTurn": "Detener este turno",
   "ApprovalBlockTitle": "aprobación",
   "ApprovalControlsHint": "  ·  Pg↑/↓ revisar  ·  {details} detalles  ·  Esc detener",
+  "ApprovalOwnerHeader": "Agente: {agent} · {role}",
+  "ApprovalGoToAgent": "g ir al agente",
+  "ApprovalControlsHintChild": "  ·  Pg↑/↓ revisar  ·  {details} detalles  ·  Esc ocultar",
+  "PendingApprovalInAgent": "Se necesita aprobación en {agent} — /agents",
   "ApprovalTruncationHint": "  … truncado · presiona {details} para ver todos los detalles",
   "ApprovalFullAccessPolicyBlocked": "Bloqueado {tool}: Full Access no puede omitir esta política",
   "AutoReviewQuestionSkipped": "Auto-Review omitió una pregunta y continuó de forma autónoma",
@@ -1622,7 +1626,7 @@
   "FleetModelReasonOperatorRoute": "este es tu modelo actual (la ruta del operador del equipo); cambia de modelo o usa /fleet save para modificarla",
   "FleetModelReasonAlreadyPresent": "ya está en el equipo",
   "FleetModelErrorNeedsRoute": "un modelo del equipo necesita un id de provider y un id de modelo",
-  "FleetModelErrorNeedsRole": "un miembro del equipo es un rol; indica uno (por ejemplo `/fleet add {route} scout`)",
+  "FleetModelErrorNeedsRole": "El agente necesita un nombre de rol (por ejemplo, `/fleet add {route} scout`).",
   "FleetModelErrorNoSelection": "no hay ningún equipo seleccionado; tu equipo es solo el modelo de la sesión",
   "FleetModelErrorOperatorRoute": "{route} es la ruta del operador del equipo `{fleet}`; cámbiala con /fleet save, no con remove",
   "FleetModelErrorNotInFleet": "{route} no está en el equipo `{fleet}`",
@@ -2284,5 +2288,9 @@
   "ExtensionsScopeGlobal": "global",
   "ExtensionsScopeProject": "proyecto",
   "ExtensionsScopePlugin": "complemento: {plugin}",
-  "ExtensionsRemoveArmed": "¿Quitar {name}? Presiona d de nuevo para confirmar · Esc cancela"
+  "ExtensionsRemoveArmed": "¿Quitar {name}? Presiona d de nuevo para confirmar · Esc cancela",
+  "FleetReviewWorkspaceLimits": "{workspace} · agentes {enabled} ({concurrent} simultáneos, {launch_slots} espacios de inicio, {admitted} admitidos) · recursión agente {agent_depth} / Fleet {fleet_depth} (límite {ceiling})",
+  "FleetReviewPolicy": "Los agentes no tienen límite de tokens de forma predeterminada · API {api_secs}s, señal de actividad {heartbeat_secs}s. Inicia con Fleet → exec; /fleet workers (o /subagents) muestra los agentes de esta sesión; /fleet status y codewhale fleet status leen el historial guardado en .codewhale/fleet.jsonl.",
+  "SetupProjectPermissionsInvalid": "No se pudo interpretar la configuración del proyecto {path} ({reason}). Sus restricciones de permisos NO están vigentes; este espacio de trabajo usa tus valores predeterminados de usuario.",
+  "SetupProjectPermissionsOverride": "La configuración del proyecto contiene {fields}. Los ajustes preestablecidos guardan los valores predeterminados del usuario; la configuración del proyecto aún puede restringir los permisos en este espacio de trabajo."
 }

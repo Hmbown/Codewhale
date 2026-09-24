@@ -2881,7 +2881,7 @@ mod tests {
         let compact = execute("/compact the auth refactor", &mut app);
         assert_eq!(
             compact.message.as_deref(),
-            Some("Context compaction triggered (focus: the auth refactor)...")
+            Some("Making room (focus: the auth refactor)…")
         );
         assert!(matches!(
             compact.action,

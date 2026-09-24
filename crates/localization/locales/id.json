@@ -1096,6 +1096,10 @@
   "ApprovalOptionAbortTurn": "Hentikan giliran ini",
   "ApprovalBlockTitle": "persetujuan",
   "ApprovalControlsHint": "  ·  Pg↑/↓ tinjau  ·  {details} detail  ·  Esc hentikan",
+  "ApprovalOwnerHeader": "Agen: {agent} · {role}",
+  "ApprovalGoToAgent": "g buka agen",
+  "ApprovalControlsHintChild": "  ·  Pg↑/↓ tinjau  ·  {details} detail  ·  Esc sembunyikan",
+  "PendingApprovalInAgent": "Persetujuan diperlukan di {agent} — /agents",
   "ApprovalTruncationHint": "  … terpotong · tekan {details} untuk detail lengkap",
   "ApprovalFullAccessPolicyBlocked": "Diblokir {tool}: Full Access tidak dapat melewati kebijakan ini",
   "AutoReviewQuestionSkipped": "Auto-Review melewati pertanyaan pengguna dan lanjut secara mandiri",
@@ -1599,7 +1603,7 @@
   "FleetModelReasonOperatorRoute": "ini model Anda saat ini (rute operator tim); ganti model atau gunakan /fleet save untuk mengubahnya",
   "FleetModelReasonAlreadyPresent": "sudah ada di tim",
   "FleetModelErrorNeedsRoute": "model tim memerlukan id provider dan id model",
-  "FleetModelErrorNeedsRole": "anggota tim adalah sebuah peran; sebutkan satu (misalnya `/fleet add {route} scout`)",
+  "FleetModelErrorNeedsRole": "Agen memerlukan nama peran (misalnya `/fleet add {route} scout`).",
   "FleetModelErrorNoSelection": "tidak ada tim yang dipilih; tim Anda hanya model sesi",
   "FleetModelErrorOperatorRoute": "{route} adalah rute operator tim `{fleet}`; ubah dengan /fleet save, bukan remove",
   "FleetModelErrorNotInFleet": "{route} tidak ada di tim `{fleet}`",
@@ -2284,5 +2288,9 @@
   "ExtensionsScopeGlobal": "global",
   "ExtensionsScopeProject": "proyek",
   "ExtensionsScopePlugin": "plugin: {plugin}",
-  "ExtensionsRemoveArmed": "Hapus {name}? Tekan d lagi untuk mengonfirmasi · Esc membatalkan"
+  "ExtensionsRemoveArmed": "Hapus {name}? Tekan d lagi untuk mengonfirmasi · Esc membatalkan",
+  "FleetReviewWorkspaceLimits": "{workspace} · agen {enabled} ({concurrent} serentak, {launch_slots} slot peluncuran, {admitted} diterima) · rekursi agen {agent_depth} / Fleet {fleet_depth} (batas {ceiling})",
+  "FleetReviewPolicy": "Agen tidak memiliki batas token secara bawaan · API {api_secs}s, sinyal aktivitas {heartbeat_secs}s. Jalankan lewat Fleet → exec; /fleet workers (atau /subagents) menampilkan agen dalam sesi ini; /fleet status dan codewhale fleet status membaca riwayat tersimpan di .codewhale/fleet.jsonl.",
+  "SetupProjectPermissionsInvalid": "Konfigurasi proyek {path} tidak dapat diurai ({reason}). Pembatasan izinnya TIDAK berlaku; ruang kerja ini menggunakan nilai bawaan pengguna Anda.",
+  "SetupProjectPermissionsOverride": "Konfigurasi proyek berisi {fields}. Prasetel menyimpan nilai bawaan pengguna; konfigurasi proyek masih dapat memperketat izin dalam ruang kerja ini."
 }

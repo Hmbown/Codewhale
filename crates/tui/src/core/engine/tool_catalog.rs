@@ -1226,7 +1226,33 @@ pub(super) fn maybe_hydrate_requested_deferred_tool(
     }
 
     hydrated_tools_this_batch.insert(tool_name.to_string());
+    if deferred_first_call_matches_schema(def, tool_input) {
+        // Progressive disclosure keeps unused schemas out of the prefix; it
+        // must not cost a well-formed call its turn. Every authority gate has
+        // already run for this call, so executing it grants nothing new, and
+        // the tool still activates at the tail for later requests.
+        return None;
+    }
     Some(deferred_tool_schema_hydration_result(def, tool_input))
+}
+
+/// Whether a call to a tool whose schema the model has not yet been shown is
+/// shaped like that schema: an object carrying every required field and, when
+/// the schema declares properties, no field outside them. Known limitation:
+/// field types are left to the tool's own input validation, which reports a
+/// wrong type as an ordinary tool error after the schema has been activated.
+pub(crate) fn deferred_first_call_matches_schema(tool: &Tool, tool_input: &Value) -> bool {
+    let Some(input) = tool_input.as_object() else {
+        return false;
+    };
+    let expected = schema_fields(&tool.input_schema);
+    let required = schema_required_fields(&tool.input_schema);
+    required.iter().all(|field| input.contains_key(field))
+        && (expected.is_empty() && input.is_empty()
+            || !expected.is_empty()
+                && input
+                    .keys()
+                    .all(|key| expected.iter().any(|field| &field.name == key)))
 }
 
 #[cfg(test)]
@@ -1249,7 +1275,7 @@ pub(super) fn preflight_requested_deferred_tool(
     result
 }
 
-fn deferred_tool_schema_hydration_result(tool: &Tool, tool_input: &Value) -> ToolResult {
+pub(crate) fn deferred_tool_schema_hydration_result(tool: &Tool, tool_input: &Value) -> ToolResult {
     let expected = schema_fields(&tool.input_schema);
     let required = schema_required_fields(&tool.input_schema);
     let received = received_field_names(tool_input);

@@ -567,6 +567,16 @@ export interface LegalPrivacyDict {
   homeLink: string;
 }
 
+export interface DigestDict {
+  metaTitle: string;
+  metaDescription: string;
+  /** Heading shown with the empty state. */
+  emptyTitle: string;
+  emptyBody: string;
+  title: string;
+  lead: string;
+}
+
 /**
  * `app/[locale]/docs/hooks/page.tsx`.
  *

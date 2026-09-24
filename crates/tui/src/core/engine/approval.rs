@@ -50,6 +50,12 @@ pub(super) enum ApprovalDecision {
     TimedOut {
         id: String,
     },
+    /// The request could not be put in front of a person — it belonged to a
+    /// turn that had already ended or been cancelled locally, or to another
+    /// conversation. Recorded as `unavailable`, never as the person's denial.
+    Unavailable {
+        id: String,
+    },
     /// Retry a tool with an elevated sandbox policy.
     RetryWithPolicy {
         id: String,
@@ -236,6 +242,15 @@ impl Engine {
                         ApprovalDecision::TimedOut { id } if id == tool_id => {
                             self.commit_approval_outcome(tool_id, ApprovalOutcome::Timeout).await?;
                             return Ok(ApprovalResult::Denied);
+                        }
+                        ApprovalDecision::Unavailable { id } if id == tool_id => {
+                            self.commit_approval_outcome(tool_id, ApprovalOutcome::Unavailable).await?;
+                            return Err(ToolError::execution_failed(
+                                "The approval request for this call was no longer current \
+                                 (its turn had ended), so it was not shown to the user and \
+                                 the call did not run. The user did not deny it."
+                                    .to_string(),
+                            ));
                         }
                         ApprovalDecision::RetryWithPolicy { id, policy } if id == tool_id => {
                             self.commit_approval_outcome(

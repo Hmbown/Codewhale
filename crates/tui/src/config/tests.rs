@@ -4091,6 +4091,9 @@ fn ensure_config_file_exists_creates_first_run_template() -> Result<()> {
     assert_eq!(created, temp_root.join(".deepseek").join("config.toml"));
     assert!(content.contains(&format!("default_text_model = \"{DEFAULT_TEXT_MODEL}\"")));
     assert!(content.contains("reasoning_effort = \"auto\""));
+    // Shift+Tab cycles the permission posture; effort moved to Ctrl+T.
+    assert!(content.contains("# Ctrl+T in the TUI"));
+    assert!(!content.contains("Shift+Tab"));
     assert!(!content.contains("api_key ="));
     assert!(ensure_config_file_exists(None)?.is_none());
     Ok(())

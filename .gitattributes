@@ -34,6 +34,9 @@ docs/FLEET_WORKFLOW_TUTORIAL.md text eol=lf
 # The dsh bundle scene is include_str!() into the generated client.js and
 # hashed for stale detection; CRLF would change both across platforms.
 crates/tui/src/integrations/dsh/*.js text eol=lf
+# The native DSH import fixture bundle is hashed into the conversion receipt,
+# so a CRLF checkout changed the expected digest on Windows.
+scripts/fixtures/dsh-web-app/** text eol=lf
 
 # Rustfmt writes LF; keep Rust sources stable across Windows/Linux/macOS.
 *.rs text eol=lf

@@ -525,6 +525,88 @@ fn install_update_uninstall_verbs_drive_the_guided_trust_flow() {
 }
 
 #[test]
+fn dsh_import_reviews_without_installing_then_installs_the_exact_bundle() {
+    let _lock = crate::test_support::lock_test_env();
+    let root = TempDir::new().unwrap();
+    let codewhale_home = root.path().join("codewhale-home");
+    let _codewhale_home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", &codewhale_home);
+    let package = root.path().join("dsh-package");
+    fs::create_dir_all(package.join("pack-skills/guide")).unwrap();
+    fs::write(
+        package.join("package.json"),
+        r#"{"name": "@demo/docs-dsh", "version": "2.0.0", "dsh": {"bundle": {"patch": "./cordis.patch.yml"}}}"#,
+    )
+    .unwrap();
+    fs::write(
+        package.join("cordis.patch.yml"),
+        "- insert:\n  - id: docs\n    name: '@deepseek-ai/dsh-mcp-client'\n    config: {serverName: docs, transport: streamable-http, url: 'https://docs.example.invalid/mcp'}\n  - id: skills\n    name: '@deepseek-ai/dsh-skill-filesystem'\n    config: {customSkillDirs: [pack-skills]}\n  - id: theme\n    name: '@deepseek-ai/dsh-client-ui-theme'\n",
+    )
+    .unwrap();
+    fs::write(
+        package.join("pack-skills/guide/SKILL.md"),
+        "---\nname: guide\ndescription: Bundled guide\n---\nBody.\n",
+    )
+    .unwrap();
+
+    let (mut app, _temp) = create_test_app(root.path());
+    let help = plugins_with_kimi_home_override(&mut app, Some("help"), None)
+        .message
+        .unwrap();
+    assert!(help.contains("/plugin import dsh <package-dir>"), "{help}");
+    let review = plugins_with_kimi_home_override(
+        &mut app,
+        Some(&format!("import dsh {}", package.display())),
+        None,
+    );
+    assert!(!review.is_error, "{:?}", review.message);
+    let message = review.message.unwrap();
+    for fact in [
+        "@demo/docs-dsh@2.0.0",
+        "plugin 'docs-dsh'",
+        "Skills: guide",
+        "Remote MCP servers: docs",
+        "Network hosts it will request: docs.example.invalid",
+        "theme",
+        "Nothing was installed",
+    ] {
+        // Untrusted package text is rendered with review escaping.
+        assert!(
+            message.replace('\\', "").contains(fact),
+            "{fact}: {message}"
+        );
+    }
+    let approval = message
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("/plugin "))
+        .expect("review renders an exact approval command")
+        .to_string();
+    assert!(!codewhale_home.join("plugins/docs-dsh").exists());
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let installed = plugins_with_kimi_home_override(&mut app, Some(&approval), None);
+        assert!(!installed.is_error, "{:?}", installed.message);
+        assert!(
+            installed
+                .message
+                .as_deref()
+                .is_some_and(|m| m.contains("disabled and untrusted"))
+        );
+    });
+    let plugin = app.plugin_registry.get("docs-dsh").unwrap();
+    assert!(!plugin.enabled && !plugin.trusted());
+    assert!(
+        codewhale_home
+            .join("plugins/docs-dsh/CONVERSION.md")
+            .is_file()
+    );
+}
+
+#[test]
 fn kimi_managed_import_is_read_only_until_hash_bound_approval() {
     let _lock = crate::test_support::lock_test_env();
     let root = TempDir::new().unwrap();

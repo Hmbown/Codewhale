@@ -197,6 +197,7 @@ fn parse_codewhale_entry(
                     _,
                 )) => "Tarball URL".to_string(),
                 PluginInstallSource::LocalPath { .. } => "Local directory".to_string(),
+                PluginInstallSource::Dsh(_) => "DeepSeek Harness bundle package".to_string(),
                 PluginInstallSource::Remote(crate::skills::install::InstallSource::Registry(_)) => {
                     "Registry".to_string()
                 }
@@ -350,7 +351,9 @@ fn parse_codewhale_entry(
 
 fn normalize_native_source(spec: &str) -> MarketplaceSourceSpec {
     match PluginInstallSource::parse(spec) {
-        Ok(PluginInstallSource::LocalPath(path)) => MarketplaceSourceSpec::LocalPath { path },
+        Ok(PluginInstallSource::LocalPath(path) | PluginInstallSource::Dsh(path)) => {
+            MarketplaceSourceSpec::LocalPath { path }
+        }
         Ok(PluginInstallSource::Remote(crate::skills::install::InstallSource::GitHubRepo(
             repo,
         ))) => {

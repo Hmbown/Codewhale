@@ -709,7 +709,7 @@ impl FleetRosterView {
             lines
         } else {
             vec![Line::from(Span::styled(
-                "Roster is empty.",
+                "Fleet is empty.",
                 Style::default().fg(palette::TEXT_MUTED),
             ))]
         };

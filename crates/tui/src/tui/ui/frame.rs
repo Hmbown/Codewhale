@@ -1427,6 +1427,7 @@ pub(crate) fn build_pending_input_preview(app: &App) -> PendingInputPreview {
         .iter()
         .map(|m| m.display.clone())
         .collect();
+    preview.pending_approvals = crate::tui::pending_requests::footer_rows(app);
     preview.editing_queued_message = app.queued_draft.as_ref().map(|draft| {
         if app.input.trim().is_empty() {
             draft.display.clone()

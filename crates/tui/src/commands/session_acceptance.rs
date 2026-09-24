@@ -569,10 +569,7 @@ fn codewhale_triggers_context_compaction(world: &mut SessionCommandWorld) {
         world.last_action.as_ref(),
         Some(AppAction::CompactContext { .. })
     ));
-    assert_eq!(
-        world.last_message.as_deref(),
-        Some("Context compaction triggered...")
-    );
+    assert_eq!(world.last_message.as_deref(), Some("Making room…"));
 }
 
 #[then("CodeWhale should trigger context purge")]

@@ -272,11 +272,11 @@ impl Default for SetupRuntimeFacts {
             sandbox_mode_value: "default".to_string(),
             network: "not configured".to_string(),
             network_default_value: "prompt".to_string(),
-            runtime_result: "runtime posture not loaded".to_string(),
+            runtime_result: "permissions not loaded".to_string(),
             operate_runtime_ready: false,
-            operate_runtime_result: "worker runtime not loaded".to_string(),
+            operate_runtime_result: "agent runtime not loaded".to_string(),
             fleet_roster_ready: false,
-            fleet_roster_result: "Team roster not loaded".to_string(),
+            fleet_roster_result: "Fleet not loaded".to_string(),
             operate_concurrency_result: "concurrency not loaded".to_string(),
             operate_result: "operate readiness not loaded".to_string(),
             hotbar_bindings_result: "Hotbar config not loaded".to_string(),
@@ -394,7 +394,7 @@ impl SetupRuntimeFacts {
         );
         let shell = if app.allow_shell { "enabled" } else { "hidden" }.to_string();
         let trust = if app.trust_mode {
-            "trusted workspace / writes allowed by posture"
+            "trusted workspace / writes allowed by permissions"
         } else {
             "workspace trust not elevated"
         }
@@ -4236,15 +4236,11 @@ fn project_runtime_override_warning(workspace: &Path, locale: Locale) -> Option<
     // workspace falls back to the user's baseline. Say so here rather than
     // only in a log line the TUI never shows.
     if let Some((path, reason)) = outcome.invalid() {
-        let path = path.display();
-        return Some(match locale {
-            Locale::ZhHans => format!(
-                "无法解析项目配置 {path}（{reason}）。此工作区的项目级运行姿态限制未生效，将回退到用户默认值。",
-            ),
-            _ => format!(
-                "Project config {path} could not be parsed ({reason}). Its runtime posture restrictions are NOT in effect; this workspace falls back to your user defaults.",
-            ),
-        });
+        return Some(
+            tr(locale, MessageId::SetupProjectPermissionsInvalid)
+                .replace("{path}", &path.display().to_string())
+                .replace("{reason}", reason),
+        );
     }
     let project = outcome.into_config()?;
     let mut fields = Vec::new();
@@ -4257,16 +4253,10 @@ fn project_runtime_override_warning(workspace: &Path, locale: Locale) -> Option<
     if fields.is_empty() {
         return None;
     }
-    Some(match locale {
-        Locale::ZhHans => format!(
-            "此工作区的项目配置包含 {}。预设会保存用户默认值；项目配置仍可在此工作区收紧运行姿态。",
-            fields.join(", ")
-        ),
-        _ => format!(
-            "Project config contains {}. Presets save user defaults; project config can still tighten runtime posture in this workspace.",
-            fields.join(", ")
-        ),
-    })
+    Some(
+        tr(locale, MessageId::SetupProjectPermissionsOverride)
+            .replace("{fields}", &fields.join(", ")),
+    )
 }
 
 fn setup_report_result(state: &SetupState, facts: &SetupRuntimeFacts) -> String {

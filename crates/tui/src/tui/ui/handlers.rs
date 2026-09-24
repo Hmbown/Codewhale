@@ -2291,14 +2291,7 @@ pub(crate) async fn handle_view_events(
                 }
             }
             ViewEvent::OpenAgentTranscript { agent_id } => {
-                // One agent, one destination: focus the worker so its full
-                // transcript owns the main area and the composer addresses
-                // its fork. The register modal closes so the focus is visible.
-                if app.view_stack.top_kind() == Some(ModalKind::SubAgents) {
-                    app.view_stack.pop();
-                }
-                crate::tui::agent_focus::focus_agent(app, &agent_id);
-                app.needs_redraw = true;
+                open_agent_transcript(app, config, &agent_id);
             }
             ViewEvent::AgentDetailsClosed { agent_id } => {
                 crate::tui::work_surface::agent_details_closed(app, &agent_id);
@@ -2918,4 +2911,23 @@ pub(crate) fn handle_view_events_boxed<'a>(
         }
         Ok(false)
     })
+}
+
+/// `/agents` → an agent, or "Go to agent" on its card. One agent, one
+/// destination: focus the worker so its full transcript owns the main area
+/// and the composer addresses its fork; the register modal closes so the
+/// focus is visible. A hidden approval card for this agent comes back on top
+/// of its transcript so the person can answer it (approvals C1).
+pub(super) fn open_agent_transcript(app: &mut App, config: &Config, agent_id: &str) {
+    if app.view_stack.top_kind() == Some(ModalKind::SubAgents) {
+        app.view_stack.pop();
+    }
+    crate::tui::agent_focus::focus_agent(app, agent_id);
+    crate::tui::pending_requests::repush_for_agent(
+        app,
+        agent_id,
+        config.approval_default_selection(),
+        config.approval_timeout(),
+    );
+    app.needs_redraw = true;
 }

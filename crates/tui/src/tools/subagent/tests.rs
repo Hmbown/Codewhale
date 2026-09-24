@@ -6,7 +6,7 @@ use crate::worker_profile::ShellPolicy;
 use axum::{Json, Router, http::StatusCode, response::IntoResponse, routing::post};
 use std::collections::HashSet;
 use std::process::Command;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use tempfile::{Builder as TempDirBuilder, tempdir};
 
 mod launch_receipt;
@@ -255,7 +255,7 @@ fn child_approval_ids_stay_unique_within_and_across_manager_boots() {
 
     let mut first_ids = Vec::new();
     for _ in 0..3 {
-        let (id, _rx) = first.register_child_approval("resumed-agent-7");
+        let (id, _rx) = first.register_child_approval("resumed-agent-7", "bash", "fixture");
         assert!(
             SubAgentManager::is_child_approval_id(&id),
             "routing hint must still recognize {id}"
@@ -274,7 +274,7 @@ fn child_approval_ids_stay_unique_within_and_across_manager_boots() {
     let mut second = SubAgentManager::new(tmp.path().to_path_buf(), 4);
     let mut second_ids = Vec::new();
     for _ in 0..3 {
-        let (id, _rx) = second.register_child_approval("resumed-agent-7");
+        let (id, _rx) = second.register_child_approval("resumed-agent-7", "bash", "fixture");
         assert!(SubAgentManager::is_child_approval_id(&id));
         second_ids.push(id);
     }
@@ -8112,12 +8112,83 @@ async fn small_surface_read_only_child_discovers_web_deferred() {
             &mut surface,
             &request_active,
             "Web",
-            json!({"action": "search", "query": "codewhale"}),
+            // Malformed on purpose: a well-formed first use now executes.
+            json!({"not_a_web_field": "codewhale"}),
         )
         .await
-        .expect("same-batch first use hydrates instead of executing");
+        .expect("a malformed first use hydrates instead of executing");
     assert!(same_batch.result.content.contains("deferred"));
     assert!(model_tool_names(model_request_tools(&mut surface)).contains("Web"));
+}
+
+/// First-call tool policy: a read-only investigator's well-formed first call
+/// to a deferred inspection tool runs immediately instead of costing a
+/// discovery turn, while mutation stays refused at dispatch.
+#[tokio::test]
+async fn small_surface_read_only_child_runs_well_formed_deferred_first_call() {
+    let registry = small_surface_registry(FleetRole::Scout);
+    let catalog = registry.deferred_catalog_for_model(&FleetRole::Scout);
+    assert_eq!(
+        catalog
+            .iter()
+            .find(|tool| tool.name == "list_dir")
+            .and_then(|tool| tool.defer_loading),
+        Some(true),
+        "list_dir is a deferred evidence tool for Scouts"
+    );
+    let mut surface = SubAgentToolSurface::new(catalog, &[]);
+    assert!(!model_tool_names(model_request_tools(&mut surface)).contains("list_dir"));
+    let listing = execute_surface_tool(&registry, &mut surface, "list_dir", json!({}))
+        .await
+        .expect("well-formed first call executes");
+    assert!(
+        !listing.contains("was deferred"),
+        "the call ran instead of returning its schema: {listing}"
+    );
+    assert!(model_tool_names(model_request_tools(&mut surface)).contains("list_dir"));
+
+    let hint = execute_surface_tool(
+        &registry,
+        &mut SubAgentToolSurface::new(registry.deferred_catalog_for_model(&FleetRole::Scout), &[]),
+        "list_dir",
+        json!({"directory": "."}),
+    )
+    .await
+    .expect("malformed first call returns the schema");
+    assert!(
+        hint.contains("was deferred") && hint.contains("path"),
+        "{hint}"
+    );
+
+    for mutation in [
+        ("write", json!({"path": "scout.txt", "content": "x"})),
+        (
+            "edit",
+            json!({"path": "scout.txt", "old_string": "x", "new_string": "y"}),
+        ),
+    ] {
+        assert!(
+            execute_surface_tool(&registry, &mut surface, mutation.0, mutation.1)
+                .await
+                .is_err(),
+            "a Scout must not {}",
+            mutation.0
+        );
+    }
+}
+
+/// Tools an assignment names explicitly start on the child's first request.
+#[test]
+fn small_surface_warms_explicitly_allowed_deferred_tools() {
+    let registry = small_surface_registry(FleetRole::Scout);
+    let catalog = registry.deferred_catalog_for_model(&FleetRole::Scout);
+    let mut surface =
+        SubAgentToolSurface::new(catalog, &["list_dir".to_string(), "read".to_string()]);
+    let names = model_tool_names(model_request_tools(&mut surface));
+    assert!(
+        names.contains("list_dir") && names.contains("read"),
+        "{names:?}"
+    );
 }
 
 #[tokio::test]
@@ -8219,7 +8290,7 @@ async fn small_surface_denied_warm_tool_is_not_resurrected() {
     .await
     .expect("search remains available");
     assert!(!searched.contains("\"tool_name\":\"Web\""));
-    assert!(surface.hydrate("Web").is_err());
+    assert!(surface.hydrate("Web", &json!({})).is_err());
 }
 
 fn synthetic_deferred_tool(name: &str, description_bytes: usize) -> Tool {
@@ -8263,7 +8334,7 @@ fn small_surface_caches_are_independent_bounded_and_revalidated() {
     first
         .catalog
         .push(synthetic_deferred_tool("oversized", 17 * 1024));
-    assert!(first.hydrate("oversized").is_err());
+    assert!(first.hydrate("oversized", &json!({})).is_err());
 
     let mut byte_catalog = (0..3)
         .map(|index| synthetic_deferred_tool(&format!("bytes_{index}"), 6 * 1024))
@@ -8307,7 +8378,9 @@ async fn small_surface_successful_cached_use_touches_lru() {
     execute_surface_tool(&registry, &mut surface, "get_goal", json!({}))
         .await
         .expect("cached read tool executes");
-    surface.hydrate(&ninth).expect("ninth activation");
+    surface
+        .hydrate(&ninth, &json!({}))
+        .expect("ninth activation");
     assert!(model_tool_names(model_request_tools(&mut surface)).contains("get_goal"));
 }
 
@@ -14683,6 +14756,7 @@ pub(crate) fn stub_runtime() -> SubAgentRuntime {
         // Test stubs run without a manager-stamped governor; the LLM call
         // path treats `None` as "report nothing".
         governor: None,
+        compaction: crate::compaction::CompactionConfig::default(),
     }
 }
 
@@ -18028,37 +18102,226 @@ async fn worker_stops_with_typed_wall_time_reason() {
     assert!(reason.contains("operator"), "{reason}");
 }
 
-#[tokio::test]
-async fn worker_lands_with_typed_context_reason_past_the_step_input_bound() {
-    // #6194 item 7: one step billing past the per-step bound lands the run
-    // through budget death (report + preservation) instead of burning
-    // quadratically to wall/token death.
-    let tmp = tempdir().expect("tempdir");
-    let (manager, agent_id, calls, task_handle) =
-        spawn_budget_capped_worker(tmp.path(), 150_000, 40, 120, Duration::from_secs(300)).await;
+/// Scripted provider for the child-compaction test. Task steps call
+/// `read_file` while billing `step_prompt_tokens` each; the compaction
+/// summary request (recognized by its instruction) returns a handoff; the
+/// first task step after it finishes the run and records whether the request
+/// carried the compaction checkpoint instead of the replaced history.
+async fn compacting_child_chat_client(
+    step_prompt_tokens: u64,
+) -> (
+    CodewhaleClient,
+    Arc<AtomicUsize>,
+    Arc<AtomicUsize>,
+    Arc<AtomicBool>,
+) {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let summaries = Arc::new(AtomicUsize::new(0));
+    let saw_checkpoint = Arc::new(AtomicBool::new(false));
+    let app = Router::new().route(
+        "/{*path}",
+        post({
+            let calls = Arc::clone(&calls);
+            let summaries = Arc::clone(&summaries);
+            let saw_checkpoint = Arc::clone(&saw_checkpoint);
+            move |Json(body): Json<Value>| {
+                let calls = Arc::clone(&calls);
+                let summaries = Arc::clone(&summaries);
+                let saw_checkpoint = Arc::clone(&saw_checkpoint);
+                async move {
+                    let attempt = calls.fetch_add(1, Ordering::SeqCst) + 1;
+                    let wire = body["messages"].to_string();
+                    let usage = |prompt: u64, completion: u64| {
+                        json!({
+                            "prompt_tokens": prompt,
+                            "completion_tokens": completion,
+                            "total_tokens": prompt + completion
+                        })
+                    };
+                    let message = if wire.contains("context checkpoint compaction") {
+                        summaries.fetch_add(1, Ordering::SeqCst);
+                        return Json(json!({
+                            "id": format!("chatcmpl-compact-{attempt}"),
+                            "model": "deepseek-v4-flash",
+                            "choices": [{
+                                "index": 0,
+                                "message": {
+                                    "role": "assistant",
+                                    "content": "Objective: inspect README.md. Progress: the file was read three times. Next action: report that the inspection is done."
+                                },
+                                "finish_reason": "stop"
+                            }],
+                            "usage": usage(1_000, 200)
+                        }));
+                    } else if summaries.load(Ordering::SeqCst) > 0 {
+                        saw_checkpoint.store(
+                            wire.contains(crate::compaction::COMPACTION_SUMMARY_MARKER),
+                            Ordering::SeqCst,
+                        );
+                        json!({ "role": "assistant", "content": "done after compaction" })
+                    } else {
+                        json!({
+                            "role": "assistant",
+                            "content": null,
+                            "tool_calls": [{
+                                "id": format!("call_read_{attempt}"),
+                                "type": "function",
+                                "function": {
+                                    "name": "read_file",
+                                    "arguments": "{\"path\":\"README.md\"}"
+                                }
+                            }]
+                        })
+                    };
+                    let finish = if message.get("tool_calls").is_some() {
+                        "tool_calls"
+                    } else {
+                        "stop"
+                    };
+                    let prompt = if summaries.load(Ordering::SeqCst) > 0 {
+                        3_000
+                    } else {
+                        step_prompt_tokens
+                    };
+                    Json(json!({
+                        "id": format!("chatcmpl-step-{attempt}"),
+                        "model": "deepseek-v4-flash",
+                        "choices": [{ "index": 0, "message": message, "finish_reason": finish }],
+                        "usage": usage(prompt, 40)
+                    }))
+                }
+            }
+        }),
+    );
 
-    tokio::time::timeout(Duration::from_secs(10), task_handle)
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
-        .expect("context-capped worker must terminate")
-        .expect("task should finish");
+        .expect("bind fake chat server");
+    let addr = listener.local_addr().expect("fake chat server addr");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let config = crate::config::Config {
+        api_key: Some("test-key".to_string()),
+        base_url: Some(format!("http://{addr}/v1")),
+        ..crate::config::Config::default()
+    };
+    let client = CodewhaleClient::new(&config).expect("fake chat client");
+    (client, calls, summaries, saw_checkpoint)
+}
+
+#[tokio::test]
+async fn worker_compacts_past_its_context_window_and_keeps_working() {
+    // A child whose billed input runs far past the old 100k per-step bound
+    // (and past its route's compaction trigger) compacts at the request
+    // boundary like the parent and completes, instead of landing with
+    // BudgetExhausted.
+    let tmp = tempdir().expect("tempdir");
+    std::fs::write(tmp.path().join("README.md"), "hello from the readme\n").expect("readme");
+    let manager = Arc::new(RwLock::new(SubAgentManager::new(
+        tmp.path().to_path_buf(),
+        2,
+    )));
+    let agent_id = "agent_compacting_worker".to_string();
+    let (task_input_tx, task_input_rx) = mpsc::unbounded_channel();
+    let agent = SubAgent::new(
+        agent_id.clone(),
+        FleetRole::Worker,
+        "Inspect the readme".to_string(),
+        make_assignment(),
+        "deepseek-v4-flash".to_string(),
+        Some("Compact".to_string()),
+        Some(vec!["read_file".to_string()]),
+        task_input_tx,
+        tmp.path().to_path_buf(),
+        "boot_compact".to_string(),
+    );
+    {
+        let mut manager = manager.write().await;
+        manager.agents.insert(agent_id.clone(), agent);
+        manager.register_worker(make_worker_spec(&agent_id, tmp.path().to_path_buf()));
+    }
+
+    let (client, calls, summaries, saw_checkpoint) = compacting_child_chat_client(900_000).await;
+    let mut runtime = stub_runtime();
+    runtime.client = client;
+    runtime.manager = Arc::clone(&manager);
+    runtime.context = ToolContext::new(tmp.path().to_path_buf());
+    assert!(runtime.compaction.enabled, "the inherited default compacts");
+
+    let task = SubAgentTask {
+        manager_handle: Arc::clone(&manager),
+        runtime: runtime.clone(),
+        agent_id: agent_id.clone(),
+        agent_type: FleetRole::Worker,
+        prompt: "Inspect the readme".to_string(),
+        assignment: make_assignment(),
+        allowed_tools: Some(vec!["read_file".to_string()]),
+        fork_context: false,
+        started_at: Instant::now(),
+        max_steps: 20,
+        wall_time: Duration::from_secs(300),
+        input_rx: task_input_rx,
+        launch_gate: None,
+        _foreground_child_registration: None,
+    };
+    tokio::time::timeout(Duration::from_secs(20), run_subagent_task(task))
+        .await
+        .expect("compacting worker must terminate");
 
     let result = manager
         .read()
         .await
         .get_result(&agent_id)
         .expect("agent registered");
-    assert_eq!(result.status, SubAgentStatus::BudgetExhausted);
-    let reason = &result
-        .checkpoint
-        .as_ref()
-        .expect("context-budget checkpoint")
-        .reason;
-    assert!(reason.contains("context budget exhausted"), "{reason}");
-    assert!(reason.contains("150000"), "{reason}");
-    // Task work stopped at the first billed step; only hand-back turns follow.
+    assert_eq!(
+        result.status,
+        SubAgentStatus::Completed,
+        "compaction replaces the old context-budget death: {:?}",
+        result
+            .checkpoint
+            .as_ref()
+            .map(|checkpoint| &checkpoint.reason)
+    );
+    assert_eq!(result.result.as_deref(), Some("done after compaction"));
+    assert_eq!(summaries.load(Ordering::SeqCst), 1, "one summarizer pass");
     assert!(
-        calls.load(Ordering::SeqCst) <= 3,
-        "landed early instead of running 120 steps"
+        saw_checkpoint.load(Ordering::SeqCst),
+        "the post-compaction request carries the checkpoint"
+    );
+    // Three 900k-billed tool steps, the summary, and the finishing step.
+    assert_eq!(calls.load(Ordering::SeqCst), 5);
+
+    // The summarizer's tokens count toward the worker like any other step.
+    let usage = manager
+        .read()
+        .await
+        .worker_records
+        .get(&agent_id)
+        .expect("worker record")
+        .usage
+        .clone();
+    assert_eq!(
+        usage.total_tokens,
+        Some(3 * 900_040 + 1_200 + 3_040),
+        "{usage:?}"
+    );
+
+    // The complete transcript keeps the replaced history, then the checkpoint.
+    let state_root = manager.read().await.state_root.clone();
+    let transcript =
+        load_subagent_transcript_artifact(&state_root, &agent_id).expect("transcript loads");
+    let checkpoint_at = transcript
+        .iter()
+        .position(crate::compaction::is_wire_compaction_checkpoint_message)
+        .expect("checkpoint recorded");
+    assert!(checkpoint_at >= 7, "replaced history kept before it");
+    assert!(
+        transcript[checkpoint_at + 1..]
+            .iter()
+            .any(|message| message.role == Role::Assistant),
+        "the run continued after the checkpoint"
     );
 }
 
@@ -18813,6 +19076,158 @@ async fn agent_wait_wakes_when_child_settles() {
     assert_eq!(settled[0]["agent_id"], json!(agent_id));
     assert_eq!(settled[0]["status"], json!("completed"));
     assert_eq!(payload["timed_out"], json!(false));
+    assert!(
+        payload.get("needs_person").is_none(),
+        "nothing pending, so the payload shape is unchanged"
+    );
+}
+
+#[tokio::test]
+async fn agent_wait_returns_early_with_needs_approval() {
+    let mut inner = SubAgentManager::new(PathBuf::from("."), 1);
+    let agent_id = insert_running_agent(&mut inner, "test_agent_wait_needs_person");
+    // The child is blocked on the Ask prompt for a shell call.
+    let (_approval_id, _rx) =
+        inner.register_child_approval(&agent_id, "bash", "Tool bash requires approval\nand more");
+    let manager = Arc::new(RwLock::new(inner));
+
+    let context = ToolContext::new(".");
+    let started = Instant::now();
+    let result = wait_for_subagents_from_input(
+        &json!({"action": "wait", "timeout_secs": 30}),
+        Arc::clone(&manager),
+        &context,
+    )
+    .await
+    .expect("wait should succeed");
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "wait must return early"
+    );
+    let payload: serde_json::Value =
+        serde_json::from_str(&result.content).expect("wait payload should be json");
+    let needs = payload["needs_person"].as_array().expect("needs_person");
+    assert_eq!(needs.len(), 1);
+    assert_eq!(needs[0]["agent_id"], json!(agent_id));
+    assert_eq!(needs[0]["kind"], json!("needs_approval"));
+    assert_eq!(needs[0]["tool"], json!("bash"));
+    assert_eq!(
+        needs[0]["summary"],
+        json!("Tool bash requires approval and more"),
+        "the summary is one line"
+    );
+    assert_eq!(payload["timed_out"], json!(false));
+    assert!(
+        payload["note"]
+            .as_str()
+            .is_some_and(|note| note.contains("Tell the user")),
+        "{payload}"
+    );
+}
+
+#[tokio::test]
+async fn agent_wait_does_not_rewake_on_reported_request() {
+    let mut inner = SubAgentManager::new(PathBuf::from("."), 1);
+    let agent_id = insert_running_agent(&mut inner, "test_agent_wait_no_rewake");
+    let (_approval_id, _rx) = inner.register_child_approval(&agent_id, "bash", "held");
+    let manager = Arc::new(RwLock::new(inner));
+    let context = ToolContext::new(".");
+
+    let first = wait_for_subagents_from_input(
+        &json!({"action": "wait", "timeout_secs": 30}),
+        Arc::clone(&manager),
+        &context,
+    )
+    .await
+    .expect("first wait");
+    let first: serde_json::Value = serde_json::from_str(&first.content).unwrap();
+    assert_eq!(first["needs_person"].as_array().map(Vec::len), Some(1));
+
+    let second = wait_for_subagents_from_input(
+        &json!({"action": "wait", "timeout_secs": 1}),
+        Arc::clone(&manager),
+        &context,
+    )
+    .await
+    .expect("second wait");
+    let second: serde_json::Value = serde_json::from_str(&second.content).unwrap();
+    assert_eq!(second["timed_out"], json!(true), "{second}");
+    assert!(second.get("needs_person").is_none());
+
+    // `until=all` shares the cursor.
+    let joined = coord::dispatch_wait(
+        &json!({"until": "all", "timeout_secs": 1}),
+        Arc::clone(&manager),
+        &context,
+    )
+    .await
+    .expect("join");
+    let joined: serde_json::Value = serde_json::from_str(&joined.content).unwrap();
+    assert!(joined.get("needs_person").is_none(), "{joined}");
+
+    // A new request wakes the join.
+    let (_next_id, _next_rx) =
+        manager
+            .write()
+            .await
+            .register_child_approval(&agent_id, "write_file", "held again");
+    let joined = coord::dispatch_wait(
+        &json!({"until": "all", "timeout_secs": 30}),
+        Arc::clone(&manager),
+        &context,
+    )
+    .await
+    .expect("join");
+    let joined: serde_json::Value = serde_json::from_str(&joined.content).unwrap();
+    assert_eq!(
+        joined["needs_person"][0]["tool"],
+        json!("write_file"),
+        "{joined}"
+    );
+}
+
+#[tokio::test]
+async fn status_waiting_is_derived_from_pending_store() {
+    let mut inner = SubAgentManager::new(PathBuf::from("."), 1);
+    let agent_id = insert_running_agent(&mut inner, "test_status_pending_store");
+    inner.register_worker_for_session(
+        make_worker_spec(&agent_id, PathBuf::from(".")),
+        "workspace",
+        None,
+    );
+    let (approval_id, _rx) = inner.register_child_approval(&agent_id, "bash", "held");
+    // The WaitingForUser progress write was skipped under contention; the
+    // store still makes the record waiting, with the request and the action.
+    let record = inner.get_worker_record(&agent_id).expect("worker record");
+    assert_eq!(record.status, AgentWorkerStatus::WaitingForUser);
+    let pending = record.pending_request.expect("pending request");
+    assert_eq!(pending.tool, "bash");
+    assert_eq!(pending.kind, "needs_approval");
+    assert_eq!(record.recommended_action.action, "tell_user");
+    assert!(record.recommended_action.tool.is_none());
+    assert!(
+        record
+            .recommended_action
+            .reason
+            .contains("you cannot approve it"),
+        "{}",
+        record.recommended_action.reason
+    );
+
+    // A stale WaitingForUser from the progress path flips off as soon as the
+    // decision lands, with no further progress event.
+    inner.record_worker_event(
+        &agent_id,
+        AgentWorkerStatus::WaitingForUser,
+        Some("waiting".to_string()),
+        None,
+        Some("bash".to_string()),
+    );
+    assert!(inner.resolve_child_approval(&approval_id, ChildApprovalOutcome::Approved));
+    let record = inner.get_worker_record(&agent_id).expect("worker record");
+    assert_ne!(record.status, AgentWorkerStatus::WaitingForUser);
+    assert!(record.pending_request.is_none());
+    assert_ne!(record.recommended_action.action, "tell_user");
 }
 
 #[tokio::test]
@@ -22737,6 +23152,72 @@ mod child_permission_gate {
         }
     }
 
+    #[test]
+    fn child_approval_keys_use_agent_scoped_normal_scheme() {
+        let (exact_a, grouping_a) = child_approval_keys(
+            "agent_one",
+            "bash",
+            &json!({"command": "cargo test -p demo"}),
+        );
+        let (exact_b, grouping_b) = child_approval_keys(
+            "agent_one",
+            "bash",
+            &json!({"command": "cargo test -p demo --lib"}),
+        );
+        assert_eq!(grouping_a, grouping_b, "one command family, one grant");
+        assert_ne!(exact_a, exact_b, "denials stay exact");
+        for key in [&exact_a, &grouping_a, &exact_b, &grouping_b] {
+            assert!(key.starts_with("agent:agent_one:shell:"), "{key}");
+            assert!(!key.contains(":approval:"), "{key}");
+        }
+    }
+
+    #[test]
+    fn child_grant_does_not_match_parent_or_sibling() {
+        let input = json!({"command": "cargo test -p demo"});
+        let (_, child) = child_approval_keys("agent_one", "bash", &input);
+        let (_, sibling) = child_approval_keys("agent_two", "bash", &input);
+        let parent = crate::tools::approval_cache::build_approval_grouping_key("bash", &input).0;
+        assert_ne!(child, sibling);
+        assert_ne!(child, parent);
+        assert!(
+            child.ends_with(&parent),
+            "child key reuses the normal scheme"
+        );
+    }
+
+    #[tokio::test]
+    async fn child_prompt_carries_agent_scoped_keys() {
+        let (registry, mut rx, manager) = worker_registry(ApprovalMode::Suggest, false, true, None);
+        let input = json!({"command": "echo gated"});
+        let expected = child_approval_keys("agent_gate", "bash", &input);
+        let manager_for_answer = Arc::clone(&manager);
+        let answerer = tokio::spawn(async move {
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                while let Some(event) = rx.recv().await {
+                    if let Event::ApprovalRequired {
+                        id,
+                        approval_key,
+                        approval_grouping_key,
+                        ..
+                    } = event
+                    {
+                        manager_for_answer
+                            .write()
+                            .await
+                            .resolve_child_approval(&id, ChildApprovalOutcome::Denied);
+                        return (approval_key, approval_grouping_key);
+                    }
+                }
+                panic!("channel closed before the child prompt");
+            })
+            .await
+            .expect("child prompt arrives")
+        });
+        let _ = registry.execute("agent_gate", "bash", input).await;
+        assert_eq!(answerer.await.expect("answerer"), expected);
+    }
+
     #[tokio::test]
     async fn closed_child_approval_waiter_persists_unavailable_not_cancelled() {
         let (registry, mut rx, manager) = worker_registry(ApprovalMode::Suggest, false, true, None);
@@ -22755,6 +23236,214 @@ mod child_permission_gate {
         assert!(err.to_string().contains("could no longer reach"), "{err}");
         assert_completed_receipt(&receipt_store, &session_id, ApprovalOutcome::Unavailable);
         assert_eq!(manager.read().await.pending_child_approvals(), 0);
+    }
+
+    /// Wait for the non-droppable progress that ends `approval_id`'s wait.
+    async fn next_wait_end(
+        rx: &mut tokio::sync::mpsc::Receiver<Event>,
+        approval_id: &str,
+    ) -> AgentWorkerStatus {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while let Some(event) = rx.recv().await {
+                if let Event::AgentProgress { activity, .. } = event
+                    && activity.approval_id.as_deref() == Some(approval_id)
+                    && activity.worker_status != AgentWorkerStatus::WaitingForUser
+                {
+                    return activity.worker_status;
+                }
+            }
+            panic!("event channel closed before the wait ended");
+        })
+        .await
+        .expect("the end of the wait reaches hosts")
+    }
+
+    /// A running agent in the gate's own manager, so cancel and status paths
+    /// see the same pending store the gate writes.
+    async fn running_gate_agent(
+        registry: &SubAgentToolRegistry,
+        manager: &SharedSubAgentManager,
+        name: &str,
+    ) -> String {
+        let mut manager = manager.write().await;
+        let agent_id = insert_running_agent(&mut manager, name);
+        manager.register_worker_for_session(
+            make_worker_spec(&agent_id, registry.gate_runtime.context.workspace.clone()),
+            "guardian-test-session",
+            None,
+        );
+        agent_id
+    }
+
+    #[tokio::test]
+    async fn cancel_while_pending_withdraws_request_with_cancelled_receipt() {
+        let (registry, mut rx, manager) = worker_registry(ApprovalMode::Suggest, false, true, None);
+        let (receipt_store, session_id) = receipt_context(&registry);
+        let agent_id = running_gate_agent(&registry, &manager, "cancel_pending").await;
+        let registry = Arc::new(registry);
+        let task = tokio::spawn({
+            let registry = Arc::clone(&registry);
+            let agent_id = agent_id.clone();
+            async move {
+                let _ = registry
+                    .execute(&agent_id, "bash", json!({"command": "echo gated"}))
+                    .await;
+            }
+        });
+        let approval_id = next_child_approval_id(&mut rx).await;
+        {
+            let mut manager = manager.write().await;
+            let record = manager.get_worker_record(&agent_id).expect("record");
+            assert_eq!(record.status, AgentWorkerStatus::WaitingForUser);
+            // The agent's task is the gate's task, so cancel aborts the wait.
+            if let Some(old) = manager
+                .agents
+                .get_mut(&agent_id)
+                .and_then(|agent| agent.task_handle.replace(task))
+            {
+                old.abort();
+            }
+            manager.cancel_agent(&agent_id).expect("cancel");
+            assert_eq!(manager.pending_child_approvals(), 0);
+            let record = manager.get_worker_record(&agent_id).expect("record");
+            assert_ne!(
+                record.status,
+                AgentWorkerStatus::WaitingForUser,
+                "a cancelled agent never reports waiting on a person"
+            );
+            assert!(record.pending_request.is_none());
+            assert_ne!(record.recommended_action.action, "tell_user");
+        }
+        let status = next_wait_end(&mut rx, &approval_id).await;
+        assert!(
+            status.is_terminal(),
+            "withdrawal for an ended agent: {status:?}"
+        );
+        assert_completed_receipt(&receipt_store, &session_id, ApprovalOutcome::Cancelled);
+        // A late answer finds nobody waiting and applies to nothing.
+        assert!(
+            !manager
+                .write()
+                .await
+                .resolve_child_approval(&approval_id, ChildApprovalOutcome::Approved)
+        );
+    }
+
+    #[tokio::test]
+    async fn wall_deadline_ends_pending_wait_with_receipt() {
+        let (registry, mut rx, manager) = worker_registry(ApprovalMode::Suggest, false, true, None);
+        let (receipt_store, session_id) = receipt_context(&registry);
+        let work_deadline = Instant::now() + Duration::from_millis(300);
+        let ran = run_tool_with_person_aware_timeout(
+            Duration::from_secs(60),
+            Some(work_deadline),
+            &registry.person_wait,
+            registry.execute("agent_gate", "bash", json!({"command": "echo gated"})),
+        )
+        .await;
+        assert!(
+            ran.is_none(),
+            "the wall-clock deadline still ends the agent"
+        );
+        let approval_id = next_child_approval_id(&mut rx).await;
+        let status = next_wait_end(&mut rx, &approval_id).await;
+        assert!(status.is_terminal(), "{status:?}");
+        assert_eq!(manager.read().await.pending_child_approvals(), 0);
+        assert_completed_receipt(&receipt_store, &session_id, ApprovalOutcome::Cancelled);
+    }
+
+    #[tokio::test]
+    async fn pending_approval_longer_than_tool_timeout_is_answered_and_runs() {
+        let (registry, mut rx, manager) = worker_registry(ApprovalMode::Suggest, false, true, None);
+        let (receipt_store, session_id) = receipt_context(&registry);
+        // Wide margins: after approval the call spawns a real shell, which
+        // can take well over 200ms on a loaded Windows runner.
+        let tool_timeout = Duration::from_secs(2);
+        let manager_for_answer = Arc::clone(&manager);
+        let answerer = tokio::spawn(async move {
+            let id = next_child_approval_id(&mut rx).await;
+            // The person takes several tool timeouts to decide.
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            assert!(
+                manager_for_answer
+                    .write()
+                    .await
+                    .resolve_child_approval(&id, ChildApprovalOutcome::Approved)
+            );
+        });
+        let output = run_tool_with_person_aware_timeout(
+            tool_timeout,
+            None,
+            &registry.person_wait,
+            registry.execute("agent_gate", "bash", json!({"command": "echo gated-ran"})),
+        )
+        .await
+        .expect("the approval wait never spends the tool timeout")
+        .expect("the approved call runs");
+        answerer.await.expect("answerer");
+        assert!(output.contains("gated-ran"), "{output}");
+        assert_completed_receipt(&receipt_store, &session_id, ApprovalOutcome::ApprovedOnce);
+
+        // Without a person wait the same bound still fires.
+        let clock = PersonWaitClock::default();
+        let slow = run_tool_with_person_aware_timeout(
+            tool_timeout,
+            None,
+            &clock,
+            tokio::time::sleep(Duration::from_secs(3)),
+        )
+        .await;
+        assert!(slow.is_none(), "ordinary tool work keeps its timeout");
+    }
+
+    #[tokio::test]
+    async fn session_close_withdraws_old_children_requests() {
+        let (registry, _rx, manager) = worker_registry(ApprovalMode::Suggest, false, true, None);
+        let agent_id = running_gate_agent(&registry, &manager, "old_session_child").await;
+        let mut manager = manager.write().await;
+        let (_id, receiver) = manager.register_child_approval(&agent_id, "bash", "held");
+        assert!(manager.finalize_session_close_for_session("workspace") > 0);
+        assert_eq!(
+            manager.pending_child_approvals(),
+            0,
+            "a conversation boundary ends its children's waits"
+        );
+        assert!(
+            receiver.await.is_err(),
+            "a live waiter sees its channel close"
+        );
+    }
+
+    #[tokio::test]
+    async fn full_event_channel_still_delivers_child_approval_retirement() {
+        let (registry, _rx, _manager) = worker_registry(ApprovalMode::Suggest, false, true, None);
+        let mut runtime = registry.gate_runtime;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        tx.try_send(Event::status("host is busy")).unwrap();
+        runtime.event_tx = Some(tx);
+        let delivery = announce_child_approval_wait_ended(
+            &runtime,
+            "agent_busy",
+            "agent:agent_busy:approval:boot:1",
+            "bash",
+            AgentWorkerStatus::Cancelled,
+            "agent stopped".to_string(),
+        );
+        tokio::pin!(delivery);
+        assert!(
+            futures_util::poll!(&mut delivery).is_pending(),
+            "retirement waits for channel capacity instead of dropping the event"
+        );
+        assert!(matches!(rx.recv().await, Some(Event::Status { .. })));
+        tokio::time::timeout(Duration::from_secs(1), delivery)
+            .await
+            .expect("retirement is delivered once the host drains");
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(Event::AgentProgress { activity, .. })
+                if activity.approval_id.as_deref() == Some("agent:agent_busy:approval:boot:1")
+                    && activity.worker_status == AgentWorkerStatus::Cancelled
+        ));
     }
 
     #[tokio::test]

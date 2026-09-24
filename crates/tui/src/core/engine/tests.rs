@@ -12094,7 +12094,7 @@ fn print_skill_discovery_turn_metrics() {
 }
 
 #[test]
-fn deferred_apply_patch_first_use_hydrates_schema_without_execution() {
+fn deferred_first_use_executes_well_formed_calls_and_hydrates_malformed_ones() {
     let mut apply_patch = api_tool("apply_patch");
     apply_patch.defer_loading = Some(true);
     apply_patch.input_schema = json!({
@@ -12108,40 +12108,48 @@ fn deferred_apply_patch_first_use_hydrates_schema_without_execution() {
     let catalog = vec![apply_patch];
     let active_at_batch_start = HashSet::new();
     let mut hydrated_this_batch = HashSet::new();
-    let result = maybe_hydrate_requested_deferred_tool(
-        "apply_patch",
-        &json!({"patch": "*** Begin Patch\n*** End Patch"}),
-        &catalog,
-        &active_at_batch_start,
-        &mut hydrated_this_batch,
-    )
-    .expect("first deferred use should hydrate");
-
-    assert!(!active_at_batch_start.contains("apply_patch"));
-    assert!(hydrated_this_batch.contains("apply_patch"));
-    assert!(result.success);
-    assert!(result.content.contains("Tool `apply_patch` was deferred"));
-    assert!(result.content.contains("patch: string"));
-    assert!(result.content.contains("The tool was not executed"));
-
-    let metadata = result.metadata.expect("metadata");
-    assert_eq!(metadata["event"], "tool.schema_hydrated");
-    assert_eq!(metadata["executed"], false);
-    assert_eq!(metadata["retry_required"], true);
-
-    let second_result = maybe_hydrate_requested_deferred_tool(
-        "apply_patch",
-        &json!({"patch": "*** Begin Patch\n*** End Patch"}),
-        &catalog,
-        &active_at_batch_start,
-        &mut hydrated_this_batch,
-    )
-    .expect("later calls in the same batch should hydrate instead of executing");
-    assert_eq!(second_result.metadata.unwrap()["executed"], false);
-    assert_eq!(
-        hydrated_this_batch,
-        HashSet::from(["apply_patch".to_string()])
+    // A call already shaped like the unseen schema must not lose its turn.
+    assert!(
+        maybe_hydrate_requested_deferred_tool(
+            "apply_patch",
+            &json!({"patch": "*** Begin Patch\n*** End Patch"}),
+            &catalog,
+            &active_at_batch_start,
+            &mut hydrated_this_batch,
+        )
+        .is_none(),
+        "a well-formed first call executes"
     );
+    assert!(
+        hydrated_this_batch.contains("apply_patch"),
+        "the executed tool still activates for later requests"
+    );
+
+    for malformed in [
+        json!({}),
+        json!({"diff": "*** Begin Patch\n*** End Patch"}),
+        json!({"patch": "x", "path": "src/lib.rs"}),
+        json!("*** Begin Patch"),
+    ] {
+        let mut hydrated = HashSet::new();
+        let result = maybe_hydrate_requested_deferred_tool(
+            "apply_patch",
+            &malformed,
+            &catalog,
+            &active_at_batch_start,
+            &mut hydrated,
+        )
+        .unwrap_or_else(|| panic!("{malformed} must return the schema instead of executing"));
+        assert!(hydrated.contains("apply_patch"));
+        assert!(result.success);
+        assert!(result.content.contains("Tool `apply_patch` was deferred"));
+        assert!(result.content.contains("patch: string"));
+        assert!(result.content.contains("The tool was not executed"));
+        let metadata = result.metadata.expect("metadata");
+        assert_eq!(metadata["event"], "tool.schema_hydrated");
+        assert_eq!(metadata["executed"], false);
+        assert_eq!(metadata["retry_required"], true);
+    }
 
     let mut active_next_batch = active_at_batch_start.clone();
     active_next_batch.extend(hydrated_this_batch);
@@ -12149,13 +12157,13 @@ fn deferred_apply_patch_first_use_hydrates_schema_without_execution() {
     assert!(
         maybe_hydrate_requested_deferred_tool(
             "apply_patch",
-            &json!({"patch": "*** Begin Patch\n*** End Patch"}),
+            &json!({}),
             &catalog,
             &active_next_batch,
             &mut hydrated_next_batch,
         )
         .is_none(),
-        "tools hydrated in a previous batch should execute normally"
+        "tools hydrated in a previous batch execute normally, even malformed"
     );
 }
 
@@ -12174,7 +12182,9 @@ async fn deferred_tool_first_use_does_not_emit_a_retry_status() {
     let tool_call_sse = concat!(
         "data: {\"id\":\"chatcmpl-e3\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[",
         "{\"index\":0,\"id\":\"call_e3_map\",\"type\":\"function\",\"function\":{\"name\":\"project_map\",",
-        "\"arguments\":\"{}\"}}",
+        // Malformed on purpose: a well-formed first call now executes, and
+        // this test covers the schema hint returned for a malformed one.
+        "\"arguments\":\"{\\\"not_a_project_map_field\\\":true}\"}}",
         "]},\"finish_reason\":null}]}\n\n",
         "data: {\"id\":\"chatcmpl-e3\",\"choices\":[{\"index\":0,\"delta\":{},",
         "\"finish_reason\":\"tool_calls\"}]}\n\n",
@@ -13317,7 +13327,7 @@ async fn narrower_posture_patch_during_approval_wait_fails_the_call() {
         let err = result.expect_err("narrowed posture fails the call");
         assert!(
             err.to_string()
-                .contains("posture changed before this tool call executed"),
+                .contains("Permissions changed before this tool call executed"),
             "{change_to:?}: {err}"
         );
         assert!(!written, "{change_to:?}: the shell must not run");
@@ -16357,7 +16367,7 @@ async fn compaction_completed_reports_complete_post_input_tokens() {
         .emit_compaction_completed(
             "compact_test".to_string(),
             false,
-            "Compaction complete".to_string(),
+            "Made room".to_string(),
             Some(4),
             Some(1),
             super::compaction::CompactionPass {
@@ -16510,9 +16520,9 @@ async fn unchanged_compaction_config_is_acknowledged_silently() {
     let mut changed = current;
     changed.enabled = !changed.enabled;
     let expected = if changed.enabled {
-        "Auto-compaction enabled"
+        "Make room automatically: on"
     } else {
-        "Auto-compaction disabled"
+        "Make room automatically: off"
     };
     handle
         .send(Op::SetCompaction { config: changed })
@@ -18922,7 +18932,7 @@ fn turn_metadata_keeps_stable_fields_while_pressure_reports_live_estimates() {
         without_pressure(&second_meta)
     );
     assert!(second_meta.contains("Estimated input:"));
-    assert!(second_meta.contains("Automatic compaction is explicitly disabled"));
+    assert!(second_meta.contains("Making room automatically is off"));
 }
 
 #[tokio::test]
@@ -24697,7 +24707,11 @@ async fn idle_engine_routes_child_approval_decisions_to_the_waiting_child() {
     let manager = engine.subagent_manager.clone();
     let run = tokio::spawn(engine.run());
 
-    let (approval_id, receiver) = manager.write().await.register_child_approval("agent_child");
+    let (approval_id, receiver) =
+        manager
+            .write()
+            .await
+            .register_child_approval("agent_child", "bash", "fixture");
     handle
         .approve_tool_call(approval_id.clone())
         .await
@@ -24710,7 +24724,11 @@ async fn idle_engine_routes_child_approval_decisions_to_the_waiting_child() {
     assert_eq!(manager.read().await.pending_child_approvals(), 0);
 
     // A denial for a second prompt routes the same way.
-    let (approval_id, receiver) = manager.write().await.register_child_approval("agent_child");
+    let (approval_id, receiver) =
+        manager
+            .write()
+            .await
+            .register_child_approval("agent_child", "bash", "fixture");
     handle
         .deny_tool_call(approval_id)
         .await

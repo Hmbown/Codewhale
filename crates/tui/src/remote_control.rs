@@ -1682,6 +1682,21 @@ impl RemoteControlController {
     /// instead of double-answering the engine. First decision wins; the
     /// other surface is told.
     pub fn resolve_pending_approval(&mut self, tool_id: &str, approved: bool) -> bool {
+        self.settle_pending_approval(
+            tool_id,
+            if approved { "approved" } else { "denied" },
+            "terminal",
+        )
+    }
+
+    /// The request's wait ended without a decision from any surface — its
+    /// agent's work ended, or it was answered through another path. Retire
+    /// the web's copy as `withdrawn`, never as a person's denial.
+    pub fn withdraw_pending_approval(&mut self, tool_id: &str) -> bool {
+        self.settle_pending_approval(tool_id, "withdrawn", "agent")
+    }
+
+    fn settle_pending_approval(&mut self, tool_id: &str, decision: &str, decided_by: &str) -> bool {
         let gate = projected_approval_id(tool_id);
         if self.pending_approvals.remove(&gate).is_none() {
             return false;
@@ -1694,8 +1709,8 @@ impl RemoteControlController {
                 json!({
                     "id": gate,
                     "approval_id": gate,
-                    "decision": if approved { "approved" } else { "denied" },
-                    "decided_by": "terminal",
+                    "decision": decision,
+                    "decided_by": decided_by,
                 }),
             );
         }
@@ -7428,14 +7443,16 @@ mod tests {
         let mut stack = ViewStack::new();
         stack.push(card);
         assert!(
-            stack.top_matches_approval_gate(&gate_a),
-            "the matching gate must match"
-        );
-        assert!(
-            !stack.top_matches_approval_gate(&gate_b),
+            !stack.remove_approval_for_gate(&gate_b),
             "a different gate must NEVER match this card — the whole point of identity-aware dismissal"
         );
-        assert!(!stack.top_matches_approval_gate("local_approval_missing"));
+        assert!(!stack.remove_approval_for_gate("local_approval_missing"));
+        assert!(!stack.is_empty());
+        assert!(
+            stack.remove_approval_for_gate(&gate_a),
+            "the matching gate must match"
+        );
+        assert!(stack.is_empty());
     }
 
     #[tokio::test]

@@ -919,12 +919,33 @@ pub(crate) fn keep_failed_immediate_submit_echo(
     // U1: a keyless first message must leave a visible, durable recovery,
     // not only a footer status the next config acknowledgement can replace.
     // Say what happened once in the transcript and open the provider picker,
-    // as a rejected environment key already does.
-    app.add_message(HistoryCell::System {
-        content: "No model connected, so this message was not sent. Choose a provider, then send it again."
-            .to_string(),
-    });
+    // as a rejected environment key already does. The provider's error is a
+    // whole help page (DeepSeek's runs ~15 lines, with the route suffix glued
+    // on), and the footer already carries it in full, so the transcript keeps
+    // only its headline and the `codewhale auth set` line that saves the key.
+    let mut lines = error.lines().map(str::trim).filter(|line| !line.is_empty());
+    let headline = lines.next().unwrap_or_default();
+    let save = if headline.contains("codewhale auth set") {
+        None
+    } else {
+        lines.find(|line| line.starts_with("codewhale auth set"))
+    };
+    let mut content = format!("No model connected, so this message was not sent. {headline}");
+    if let Some(save) = save {
+        content.push_str(&format!("\nSave a key: {save}"));
+    }
+    content.push_str("\nOr choose a provider (F3 or /provider), then send it again.");
+    app.add_message(HistoryCell::System { content });
     app.onboarding_needs_api_key = true;
+    // From the composer, the saved route is the one missing its key: this is
+    // missing-key recovery, as after `/logout`, so Esc returns to the
+    // composer and the picker starts on the configured provider. A first-run
+    // launch with an initial prompt is still in onboarding and keeps its
+    // remaining steps (Esc walks back as before).
+    if app.onboarding == OnboardingState::None {
+        app.onboarding_missing_key_recovery = true;
+        app.onboarding_provider = app.api_provider;
+    }
     app.onboarding = OnboardingState::Provider;
     let status = format!("Message not sent ({error})");
     app.status_message = Some(status.clone());
@@ -1477,12 +1498,48 @@ mod launch_resume_tests {
         assert_eq!(app.onboarding, OnboardingState::Provider);
         assert!(app.onboarding_needs_api_key);
 
-        app.status_message = Some("Auto-compaction enabled".to_string());
+        app.status_message = Some("Make room automatically: on".to_string());
         let shown = app
             .active_status_toast(crate::tui::underwater::ShellPhase::Idle)
             .expect("footer notice");
         assert_eq!(shown.level, StatusToastLevel::Error);
         assert!(shown.text.contains("Message not sent"), "{}", shown.text);
+    }
+
+    /// The keyless-submit line names the missing key and the command that
+    /// saves it, and Esc from the picker it opens returns to the composer
+    /// with the message's recovery still in view, not to the welcome screen.
+    #[test]
+    fn keyless_submit_names_the_key_and_esc_returns_to_the_composer() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = App::new(
+            crate::test_support::test_tui_options(dir.path()),
+            &Config::default(),
+        );
+        app.onboarding = OnboardingState::None;
+        app.onboarding_missing_key_recovery = false;
+        keep_failed_immediate_submit_echo(
+            &mut app,
+            crate::tui::app::QueuedMessage::new("hello".to_string(), None),
+            "DeepSeek API key not found.\n\n 1. Get a key:  https://platform.deepseek.com/api_keys\n 2. Save it (works in every folder, no OS prompts):\n        codewhale auth set --provider deepseek\n\n Alternatives:\n   • export DEEPSEEK_API_KEY=<your-key>. Failed to configure provider route deepseek / deepseek-flash.",
+        );
+        let Some(HistoryCell::System { content }) = app.history.last() else {
+            panic!("keyless submit must leave a transcript line");
+        };
+        assert!(content.contains("DeepSeek API key not found"), "{content}");
+        assert!(
+            content.contains("codewhale auth set --provider deepseek"),
+            "{content}"
+        );
+        assert!(content.contains("F3"), "{content}");
+        // The footer keeps the full help page; the transcript keeps two facts.
+        assert!(!content.contains("Alternatives"), "{content}");
+        assert!(!content.contains("Failed to configure"), "{content}");
+        assert!(app.onboarding_missing_key_recovery);
+
+        back_from_provider_onboarding(&mut app);
+        assert_eq!(app.onboarding, OnboardingState::None);
+        assert!(app.onboarding_needs_api_key);
     }
 
     /// The prominent new-session entry begins a fresh session in place.

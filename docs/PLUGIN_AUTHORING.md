@@ -232,51 +232,59 @@ python3 scripts/convert-plugin.py --format dsh \
 The DSH input may also be JSON, but must be the plain entry list, not a full
 profile or patch composition. Each row must name `@deepseek-ai/dsh-mcp-client`.
 
-A real dsh bundle package — an npm package whose `package.json` declares
-`dsh.bundle.patch` — converts directly with `--bundle`:
+A real DeepSeek Harness bundle package — an npm package whose `package.json`
+declares `dsh.bundle.patch` — is imported natively by Codewhale, not by this
+script (`--bundle` is retired):
 
-```sh
-python3 scripts/convert-plugin.py --format dsh \
-  --bundle ./node_modules/@demo/tools-dsh --name migrated-dsh --output ./migrated-dsh
+```text
+/plugin import dsh ./node_modules/@demo/tools-dsh
+/plugin import dsh approve <package-dir> <content-hash>
 ```
 
+The first command converts the package into scratch and shows what converts,
+what is skipped, the network hosts and local processes the bundle will request,
+and its content hash; nothing is installed. `approve` installs exactly that
+converted bundle through the ordinary reviewed installer: it lands disabled and
+untrusted, and a package edited after review installs nothing. Installing the
+package directory as a plain `/plugin install <dir>` routes to the same importer.
+`/plugin update <name>` re-converts the recorded package; changed output
+replaces the bundle and invalidates its trust receipt. The Runtime API exposes
+the same review as `POST /v1/apps/plugins/import/dsh/preview`, whose
+`install_source` and `content_hash` go to `POST /v1/apps/plugins/install`.
+
 `dsh.bundle.patch` may name one patch file or an ordered list of files. The
-converter reads only contained, non-linked package files (at most 64 files and
+importer reads only contained, non-linked package files (at most 64 files and
 1 MiB of patch data combined), then applies `insert` and keyed overrides over
 one empty profile. As in upstream `applyEntryPatches`, an override replaces a
 whole field: `config` is **not** deep-merged. This is not a complete profile
 resolver: other bundles, user overlays and deployment configuration are absent.
+Plain YAML scalars follow the YAML 1.2 core schema, as DSH's own parser does.
 
 Disabled groups propagate their state to descendants. Disabled MCP declarations
 stay disabled. Disabled skills are omitted with an explicit receipt because the
-native skill format has no disabled state; `--skill` is an explicit selection,
-not an automatic recovery of an omitted skill. A conditional/non-boolean
-`disabled` value on a group or portable row refuses the conversion rather than
-assuming it is enabled. Unsupported entry policy/dependency fields, including
-`inject`, `intercept` and `isolate`, also refuse conversion on those rows or their
-groups. Preserve their activation and authority rules in a manual port.
+native skill format has no disabled state. A conditional/non-boolean `disabled`
+value on a group or portable row refuses the import rather than assuming it is
+enabled. Unsupported entry policy/dependency fields, including `inject`,
+`intercept` and `isolate`, also refuse the import on those rows or their groups.
+Preserve their activation and authority rules in a manual port.
 
 Foreign runtime plugins and `dsh.client` UI code are not executed or translated.
-Other unrepresentable components are reported in `CONVERSION.md` and structured
-`CONVERSION.json`, with source package/version, manifest and ordered-layer SHA-256
-hashes, converter version, per-row outcomes and required manual ports. Unapplied
-patch operations also appear in the structured manual-port list, with their source
-layer and one-based operation index; they are not treated as successful overlays.
-Intentionally omitted disabled skills are reported separately, not as manual ports.
-A partial output is an authoring draft, not an equivalent DSH runtime: review every
-skipped component, patch operation and dependency before installing anything.
+Other unrepresentable components are reported in the bundle's `CONVERSION.md` and
+structured `CONVERSION.json`, with source package/version, manifest and
+ordered-layer SHA-256 hashes, converter version, per-row outcomes and required
+manual ports. Unapplied patch operations also appear in the structured
+manual-port list, with their source layer and one-based operation index.
 
 The only lowered `!!js` expressions are `process.execPath` (becomes `node`) and
 simple quoted/template literals without escapes or interpolation. Environment
 expressions—including fallbacks—are never resolved against this machine.
-Unrepresentable fields are reported without copying their values. For packaged
-Node MCP, a relative entry may resolve inside the selected package and declared
-relative working directory. External source roots require an explicit
-`--stdio-root SERVER=DIRECTORY` and a reviewed relative entry; host paths are
-never inferred or copied from expressions. Rows of
+Packaged Node MCP converts only when its relative entry resolves inside the
+package (and its declared relative working directory); a server outside the
+package is skipped, and host paths are never copied. Rows of
 `@deepseek-ai/dsh-skill-filesystem` contribute their literal `customSkillDirs`
 children only when those directories live inside the package. Default user and
 project skill roots, watchers and foreign service dependencies are not imported.
+Arbitrary DSH TypeScript plugin execution is outside this compatibility scope.
 
 ### Local Node MCP servers
 

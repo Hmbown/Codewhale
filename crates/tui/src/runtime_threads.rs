@@ -3138,6 +3138,44 @@ pub struct RuntimeThreadManagerConfig {
     pub max_active_threads: usize,
 }
 
+/// Why a session switch refused to adopt an existing Runtime store.
+///
+/// Returned by [`RuntimeStoreBinding::adoption_refusal`]; the first guard
+/// that did not provably hold wins. Known limitation: it names one reason,
+/// not every one — a store both held and non-empty reports only the hold.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum StoreAdoptionRefusal {
+    /// The store is not at `<state>/sessions/<id>/runtime` (or a
+    /// `runtime-recovered-*` sibling), or a symlink sits on the way down.
+    Unconfined,
+    /// The confined store path is not an existing directory.
+    NotADirectory,
+    /// Another live process holds the store's process-owner lock.
+    HeldByLiveProcess,
+    /// The named store directory holds work a switch would abandon.
+    HasDurableWork { dir: &'static str },
+    /// An automation is pinned to this store's execution scope.
+    ScopePinnedAutomation,
+}
+
+impl std::fmt::Display for StoreAdoptionRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unconfined => f.write_str("the saved store is outside the session directory"),
+            Self::NotADirectory => f.write_str("the saved store path is not an existing directory"),
+            Self::HeldByLiveProcess => {
+                f.write_str("another running Codewhale process holds the saved store")
+            }
+            Self::HasDurableWork { dir } => {
+                write!(f, "the saved store still holds work in `{dir}`")
+            }
+            Self::ScopePinnedAutomation => {
+                f.write_str("an automation is pinned to the saved store")
+            }
+        }
+    }
+}
+
 /// Durable host authority shared by conversations created in that host.
 /// A conversation id can change at launch; the locked Runtime store cannot.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -3187,8 +3225,8 @@ impl RuntimeStoreBinding {
         }
     }
 
-    /// True when a confined store exists but holds nothing a session switch
-    /// could abandon.
+    /// The first store directory holding durable work, or `None` when the
+    /// store holds nothing a session switch could abandon.
     ///
     /// The switch path can rebind a conversation but cannot carry a store's
     /// durable work across — queued tasks, pending approvals, agent mail —
@@ -3197,22 +3235,16 @@ impl RuntimeStoreBinding {
     /// there is nothing to abandon, so refusing protects nothing, and a
     /// force-quit leaves exactly this shape (#6207).
     ///
-    /// Fails closed: anything unreadable, unconfined, or non-empty is treated
-    /// as work worth keeping. Scope-pinned automations live outside the store
-    /// directories and are covered by [`Self::has_scope_pinned_automation`],
-    /// not here.
-    pub(crate) fn has_no_durable_work(&self) -> Result<bool> {
-        if !self.is_confined_session_store()? {
-            return Ok(false);
-        }
-        if !self.data_dir.is_dir() {
-            return Ok(false);
-        }
+    /// Callers establish confinement and that `data_dir` is a directory
+    /// first; this only reads. Scope-pinned automations live outside the
+    /// store directories and are covered by
+    /// [`Self::has_scope_pinned_automation`], not here.
+    fn first_durable_work_dir(&self) -> Result<Option<&'static str>> {
         for name in RUNTIME_STORE_WORK_DIRS {
             match fs::read_dir(self.data_dir.join(name)) {
                 Ok(mut entries) => {
                     if entries.next().is_some() {
-                        return Ok(false);
+                        return Ok(Some(name));
                     }
                 }
                 // A store opened by an older build may predate a directory;
@@ -3222,13 +3254,13 @@ impl RuntimeStoreBinding {
             }
         }
         // A sequence past its initial value means events were appended, even
-        // if those files have since been pruned.
+        // if those files have since been pruned — reported as `events`.
         match fs::read_to_string(self.data_dir.join("state.json")) {
             Ok(raw) => {
                 let state: RuntimeStoreState = serde_json::from_str(&raw)?;
-                Ok(state.next_seq <= 1)
+                Ok((state.next_seq > 1).then_some("events"))
             }
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(true),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(err) => Err(err.into()),
         }
     }
@@ -3264,7 +3296,7 @@ impl RuntimeStoreBinding {
     /// True when an automation's execution scope matches this binding.
     ///
     /// Scope-pinned automations are recorded outside the store directories, so
-    /// [`Self::has_no_durable_work`] cannot see them — adopting their store
+    /// [`Self::first_durable_work_dir`] cannot see them — adopting their store
     /// would orphan their scheduled work. A missing automations directory
     /// means no definitions exist. Read-only: the manager is only opened when
     /// the directory exists, and listing takes no locks.
@@ -3285,27 +3317,39 @@ impl RuntimeStoreBinding {
         }))
     }
 
-    /// True when the bound store exists and a switch may adopt it: confined,
-    /// empty, unheld, with no scope-pinned automation. Liveness is checked
-    /// before emptiness — a live holder's disk state moves under the read —
-    /// and the automation check runs last because it parses every definition.
-    pub(crate) fn is_adoptable_empty_store(&self) -> Result<bool> {
+    /// Why a session switch may not adopt the bound store, or `None` when it
+    /// may: confined, a directory, unheld, empty, with no scope-pinned
+    /// automation. Liveness is checked before emptiness — a live holder's
+    /// disk state moves under the read — and the automation check runs last
+    /// because it parses every definition.
+    ///
+    /// Fails closed: every refusal is the first condition that did not
+    /// provably hold, and an unexpected IO or parse error is an `Err`, which
+    /// callers treat as a refusal. The reason exists so a user can be told
+    /// *which* guard refused (#6418); it never widens what is adoptable.
+    pub(crate) fn adoption_refusal(&self) -> Result<Option<StoreAdoptionRefusal>> {
         if !self.is_confined_session_store()? {
-            return Ok(false);
+            return Ok(Some(StoreAdoptionRefusal::Unconfined));
         }
         if !self.data_dir.is_dir() {
-            return Ok(false);
+            return Ok(Some(StoreAdoptionRefusal::NotADirectory));
         }
         if self.has_live_holder()? {
-            return Ok(false);
+            return Ok(Some(StoreAdoptionRefusal::HeldByLiveProcess));
         }
-        if !self.has_no_durable_work()? {
-            return Ok(false);
+        if let Some(dir) = self.first_durable_work_dir()? {
+            return Ok(Some(StoreAdoptionRefusal::HasDurableWork { dir }));
         }
         if self.has_scope_pinned_automation()? {
-            return Ok(false);
+            return Ok(Some(StoreAdoptionRefusal::ScopePinnedAutomation));
         }
-        Ok(true)
+        Ok(None)
+    }
+
+    /// True when the bound store exists and a switch may adopt it; see
+    /// [`Self::adoption_refusal`] for the reason when it may not.
+    pub(crate) fn is_adoptable_empty_store(&self) -> Result<bool> {
+        Ok(self.adoption_refusal()?.is_none())
     }
 
     pub(crate) fn validate_existing_store(&self) -> Result<()> {

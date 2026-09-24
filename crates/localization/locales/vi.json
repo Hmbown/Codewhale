@@ -1117,6 +1117,10 @@
   "ApprovalOptionAbortTurn": "Dừng lượt này",
   "ApprovalBlockTitle": "phê duyệt",
   "ApprovalControlsHint": "  ·  Pg↑/↓ xem lại  ·  {details} chi tiết  ·  Esc dừng",
+  "ApprovalOwnerHeader": "Agent: {agent} · {role}",
+  "ApprovalGoToAgent": "g tới agent",
+  "ApprovalControlsHintChild": "  ·  Pg↑/↓ xem lại  ·  {details} chi tiết  ·  Esc ẩn",
+  "PendingApprovalInAgent": "Cần phê duyệt trong {agent} — /agents",
   "ApprovalTruncationHint": "  … đã rút gọn · nhấn {details} để xem đầy đủ",
   "ApprovalFullAccessPolicyBlocked": "Đã chặn {tool}: Full Access không thể bỏ qua chính sách này",
   "AutoReviewQuestionSkipped": "Auto-Review đã bỏ qua một câu hỏi và tiếp tục tự động",
@@ -1622,7 +1626,7 @@
   "FleetModelReasonOperatorRoute": "đây là mô hình hiện tại của bạn (tuyến operator của nhóm); hãy đổi mô hình hoặc dùng /fleet save để thay đổi",
   "FleetModelReasonAlreadyPresent": "đã có trong nhóm",
   "FleetModelErrorNeedsRoute": "một mô hình trong nhóm cần cả id provider lẫn id mô hình",
-  "FleetModelErrorNeedsRole": "một thành viên trong nhóm là một vai trò; hãy nêu một vai trò (ví dụ `/fleet add {route} scout`)",
+  "FleetModelErrorNeedsRole": "Tác tử cần tên vai trò (ví dụ `/fleet add {route} scout`).",
   "FleetModelErrorNoSelection": "chưa chọn nhóm nào; nhóm của bạn chỉ gồm mô hình của phiên",
   "FleetModelErrorOperatorRoute": "{route} là tuyến operator của nhóm `{fleet}`; hãy thay đổi bằng /fleet save, không phải remove",
   "FleetModelErrorNotInFleet": "{route} không có trong nhóm `{fleet}`",
@@ -2284,5 +2288,9 @@
   "ExtensionsScopeGlobal": "toàn cục",
   "ExtensionsScopeProject": "dự án",
   "ExtensionsScopePlugin": "plugin: {plugin}",
-  "ExtensionsRemoveArmed": "Xoá {name}? Nhấn d lần nữa để xác nhận · Esc để huỷ"
+  "ExtensionsRemoveArmed": "Xoá {name}? Nhấn d lần nữa để xác nhận · Esc để huỷ",
+  "FleetReviewWorkspaceLimits": "{workspace} · tác tử {enabled} ({concurrent} đồng thời, {launch_slots} chỗ khởi chạy, {admitted} đã nhận) · đệ quy tác tử {agent_depth} / Fleet {fleet_depth} (giới hạn {ceiling})",
+  "FleetReviewPolicy": "Mặc định tác tử không có giới hạn token · API {api_secs}s, nhịp hoạt động {heartbeat_secs}s. Khởi chạy bằng Fleet → exec; /fleet workers (hoặc /subagents) hiển thị tác tử trong phiên này; /fleet status và codewhale fleet status đọc lịch sử đã lưu tại .codewhale/fleet.jsonl.",
+  "SetupProjectPermissionsInvalid": "Không thể phân tích cấu hình dự án {path} ({reason}). Các giới hạn quyền của cấu hình này KHÔNG có hiệu lực; không gian làm việc dùng giá trị mặc định của bạn.",
+  "SetupProjectPermissionsOverride": "Cấu hình dự án chứa {fields}. Thiết lập sẵn lưu giá trị mặc định của người dùng; cấu hình dự án vẫn có thể thu hẹp quyền trong không gian làm việc này."
 }

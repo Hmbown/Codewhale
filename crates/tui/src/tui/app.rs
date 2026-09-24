@@ -2074,6 +2074,15 @@ pub struct App {
     pub view_stack: ViewStack,
     /// Last `request_user_input` prompt, retained so a failed modal submit can reopen (#1198).
     pub pending_user_input_prompt: Option<(String, crate::tools::user_input::UserInputRequest)>,
+    /// Child-agent approval requests shown to the person and not yet
+    /// answered, keyed by approval id (approvals C1). The footer row, the
+    /// `/agents` re-open, and retiring answered cards all read this store.
+    pub pending_child_requests:
+        std::collections::BTreeMap<String, crate::tui::pending_requests::PendingChildRequest>,
+    /// Which conversation owns each child agent this host has seen, from the
+    /// agent lifecycle events. A request from another conversation's child
+    /// is answered `unavailable` instead of shown here.
+    pub child_agent_sessions: std::collections::HashMap<String, String>,
     /// Esc-Esc backtrack state machine (#133). `Inactive` by default; first
     /// Esc primes, second Esc opens the live-transcript overlay scoped to
     /// previous user messages so the user can rewind a turn.

@@ -1096,6 +1096,10 @@
   "ApprovalOptionAbortTurn": "Остановить этот ход",
   "ApprovalBlockTitle": "одобрение",
   "ApprovalControlsHint": "  ·  Pg↑/↓ просмотр  ·  {details} детали  ·  Esc стоп",
+  "ApprovalOwnerHeader": "Агент: {agent} · {role}",
+  "ApprovalGoToAgent": "g перейти к агенту",
+  "ApprovalControlsHintChild": "  ·  Pg↑/↓ просмотр  ·  {details} детали  ·  Esc скрыть",
+  "PendingApprovalInAgent": "Нужно одобрение в {agent} — /agents",
   "ApprovalTruncationHint": "  … обрезано · нажмите {details} для полных деталей",
   "ApprovalFullAccessPolicyBlocked": "{tool} заблокирован: Full Access не может обойти эту политику",
   "AutoReviewQuestionSkipped": "Auto-Review пропустил вопрос пользователю и продолжил автономно",
@@ -1599,7 +1603,7 @@
   "FleetModelReasonOperatorRoute": "это ваша текущая модель (маршрут оператора команды); переключите модель или измените его через /fleet save",
   "FleetModelReasonAlreadyPresent": "уже в команде",
   "FleetModelErrorNeedsRoute": "модели команды нужны и id провайдера, и id модели",
-  "FleetModelErrorNeedsRole": "участник команды — это роль; укажите её (например `/fleet add {route} scout`)",
+  "FleetModelErrorNeedsRole": "Агенту нужно имя роли (например, `/fleet add {route} scout`).",
   "FleetModelErrorNoSelection": "команда не выбрана; ваша команда — только модель сессии",
   "FleetModelErrorOperatorRoute": "{route} — маршрут оператора команды `{fleet}`; меняйте его через /fleet save, а не remove",
   "FleetModelErrorNotInFleet": "{route} нет в команде `{fleet}`",
@@ -2284,5 +2288,9 @@
   "ExtensionsScopeGlobal": "глобально",
   "ExtensionsScopeProject": "проект",
   "ExtensionsScopePlugin": "плагин: {plugin}",
-  "ExtensionsRemoveArmed": "Удалить {name}? Нажмите d ещё раз для подтверждения · Esc отменяет"
+  "ExtensionsRemoveArmed": "Удалить {name}? Нажмите d ещё раз для подтверждения · Esc отменяет",
+  "FleetReviewWorkspaceLimits": "{workspace} · агенты {enabled} (одновременно {concurrent}, слотов запуска {launch_slots}, допущено {admitted}) · рекурсия: агент {agent_depth} / Fleet {fleet_depth} (предел {ceiling})",
+  "FleetReviewPolicy": "По умолчанию у агентов нет лимита токенов · API {api_secs}с, сигнал активности {heartbeat_secs}с. Запуск через Fleet → exec; /fleet workers (или /subagents) показывает агентов этого сеанса; /fleet status и codewhale fleet status читают сохранённую историю .codewhale/fleet.jsonl.",
+  "SetupProjectPermissionsInvalid": "Не удалось разобрать конфигурацию проекта {path} ({reason}). Её ограничения разрешений НЕ действуют; в этом рабочем пространстве используются ваши пользовательские значения по умолчанию.",
+  "SetupProjectPermissionsOverride": "Конфигурация проекта содержит {fields}. Предустановки сохраняют пользовательские значения по умолчанию; конфигурация проекта по-прежнему может ужесточать разрешения в этом рабочем пространстве."
 }

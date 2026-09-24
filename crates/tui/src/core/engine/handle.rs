@@ -512,6 +512,17 @@ impl EngineHandle {
         Ok(())
     }
 
+    /// Resolve a pending tool call whose request could not be put in front
+    /// of a person (a stale turn's request, or a child from another
+    /// conversation). Kept distinct from [`Self::deny_tool_call`] so neither
+    /// the receipt nor the model message claims the person denied it.
+    pub async fn deny_tool_call_unavailable(&self, id: impl Into<String>) -> Result<()> {
+        self.tx_approval
+            .send(ApprovalDecision::Unavailable { id: id.into() })
+            .await?;
+        Ok(())
+    }
+
     /// Retry a tool call with an elevated sandbox policy.
     pub async fn retry_tool_with_policy(
         &self,

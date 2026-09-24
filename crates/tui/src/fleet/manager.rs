@@ -608,11 +608,20 @@ impl FleetManager {
             .ok_or_else(|| anyhow!("Fleet run {} does not exist", run_id.0))?;
         let worker_ids = worker_ids_for_run(&run, max_workers);
 
+        // Heartbeats are durable ledger appends (a full-drive flush on
+        // macOS). Timestamps have whole-second resolution and the stale window
+        // is minutes, so a worker already stamped this second needs no second
+        // record; a fast driver tick must not turn into a flush storm.
+        let now = timestamp();
         for task in active_tasks_for_run(&state, run_id) {
             if let Some(worker_id) = task.leased_to.as_deref()
                 && worker_ids.iter().any(|id| id == worker_id)
+                && state
+                    .heartbeats
+                    .get(worker_id)
+                    .is_none_or(|heartbeat| heartbeat.timestamp != now)
             {
-                self.ledger.heartbeat(worker_id, &timestamp(), None, None)?;
+                self.ledger.heartbeat(worker_id, &now, None, None)?;
                 report.heartbeats += 1;
             }
         }

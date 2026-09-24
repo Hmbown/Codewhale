@@ -17896,6 +17896,187 @@ async fn engine_plumbing_items_are_tagged_internal_and_retry_hints_are_dropped()
     Ok(())
 }
 
+/// #6418: a refused session switch must say *which* guard refused. One case
+/// per `StoreAdoptionRefusal` variant, each built from a real store so the
+/// layout under test is the product's.
+mod adoption_refusal {
+    use super::*;
+    use crate::automation_manager::{AutomationManager, AutomationStatus, CreateAutomationRequest};
+
+    /// Fields drop in declaration order: the env guards restore before the
+    /// env lock releases.
+    struct Fixture {
+        _home: crate::test_support::EnvVarGuard,
+        _runtime: crate::test_support::EnvVarGuard,
+        _legacy: crate::test_support::EnvVarGuard,
+        root: tempfile::TempDir,
+        _env: crate::test_support::TestEnvLock,
+    }
+
+    fn fixture() -> Result<Fixture> {
+        let env = crate::test_support::lock_test_env();
+        let root = tempfile::tempdir()?;
+        let home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", root.path());
+        let runtime = crate::test_support::EnvVarGuard::remove("CODEWHALE_RUNTIME_DIR");
+        let legacy = crate::test_support::EnvVarGuard::remove("DEEPSEEK_RUNTIME_DIR");
+        Ok(Fixture {
+            root,
+            _env: env,
+            _home: home,
+            _runtime: runtime,
+            _legacy: legacy,
+        })
+    }
+
+    fn opened_binding(
+        fixture: &Fixture,
+        session: &str,
+        scope: &str,
+    ) -> Result<RuntimeStoreBinding> {
+        let data_dir = fixture
+            .root
+            .path()
+            .join("sessions")
+            .join(session)
+            .join("runtime");
+        drop(RuntimeThreadStore::open(data_dir.clone())?);
+        Ok(RuntimeStoreBinding {
+            data_dir,
+            execution_scope: scope.to_string(),
+        })
+    }
+
+    #[test]
+    fn empty_unheld_store_has_no_refusal() -> Result<()> {
+        let fixture = fixture()?;
+        let binding = opened_binding(&fixture, "adoptable", &"0".repeat(64))?;
+        assert_eq!(binding.adoption_refusal()?, None);
+        assert!(binding.is_adoptable_empty_store()?);
+        Ok(())
+    }
+
+    #[test]
+    fn store_outside_the_sessions_dir_is_unconfined() -> Result<()> {
+        let fixture = fixture()?;
+        let data_dir = fixture.root.path().join("elsewhere").join("runtime");
+        drop(RuntimeThreadStore::open(data_dir.clone())?);
+        let binding = RuntimeStoreBinding {
+            data_dir,
+            execution_scope: "0".repeat(64),
+        };
+        assert_eq!(
+            binding.adoption_refusal()?,
+            Some(StoreAdoptionRefusal::Unconfined)
+        );
+        assert!(!binding.is_adoptable_empty_store()?);
+        Ok(())
+    }
+
+    /// A confined path that does not exist reaches `NotADirectory`; a file
+    /// in its place never gets that far — confinement rejects any
+    /// non-directory on the way down as an `Err`, which is still a refusal.
+    #[test]
+    fn missing_confined_store_is_not_a_directory() -> Result<()> {
+        let fixture = fixture()?;
+        let session_dir = fixture.root.path().join("sessions").join("absent");
+        std::fs::create_dir_all(&session_dir)?;
+        let binding = RuntimeStoreBinding {
+            data_dir: session_dir.join("runtime"),
+            execution_scope: "0".repeat(64),
+        };
+        assert_eq!(
+            binding.adoption_refusal()?,
+            Some(StoreAdoptionRefusal::NotADirectory)
+        );
+        assert!(!binding.is_adoptable_empty_store()?);
+
+        std::fs::write(&binding.data_dir, "not a store")?;
+        assert!(
+            binding.adoption_refusal().is_err(),
+            "a file in the store's place fails closed"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn live_owner_lock_is_held_by_live_process() -> Result<()> {
+        let fixture = fixture()?;
+        let binding = opened_binding(&fixture, "held", &"0".repeat(64))?;
+        let held = RuntimeProcessOwnerLock::acquire(&binding.data_dir)?;
+        assert_eq!(
+            binding.adoption_refusal()?,
+            Some(StoreAdoptionRefusal::HeldByLiveProcess)
+        );
+        assert!(!binding.is_adoptable_empty_store()?);
+        drop(held);
+        assert_eq!(binding.adoption_refusal()?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn each_work_dir_is_named_as_durable_work() -> Result<()> {
+        let fixture = fixture()?;
+        let binding = opened_binding(&fixture, "busy", &"0".repeat(64))?;
+        for dir in RUNTIME_STORE_WORK_DIRS {
+            let marker = binding.data_dir.join(dir).join("work.json");
+            std::fs::write(&marker, "{}")?;
+            assert_eq!(
+                binding.adoption_refusal()?,
+                Some(StoreAdoptionRefusal::HasDurableWork { dir }),
+                "{dir} holds work"
+            );
+            assert!(!binding.is_adoptable_empty_store()?);
+            std::fs::remove_file(&marker)?;
+        }
+        // Events appended and since pruned still count, reported as `events`.
+        let state_path = binding.data_dir.join("state.json");
+        let mut state: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&state_path)?)?;
+        state["next_seq"] = serde_json::json!(5);
+        std::fs::write(&state_path, serde_json::to_vec(&state)?)?;
+        assert_eq!(
+            binding.adoption_refusal()?,
+            Some(StoreAdoptionRefusal::HasDurableWork { dir: "events" })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn automation_pinned_to_the_scope_refuses() -> Result<()> {
+        let fixture = fixture()?;
+        let scope = "ab".repeat(32);
+        let binding = opened_binding(&fixture, "pinned", &scope)?;
+        let automations = AutomationManager::open(fixture.root.path().join("automations"))?;
+        let created = automations.create_automation(CreateAutomationRequest {
+            name: "scope fixture".into(),
+            prompt: "local fixture only".into(),
+            rrule: "FREQ=HOURLY;INTERVAL=1".into(),
+            cwds: vec![fixture.root.path().into()],
+            model: None,
+            model_provider: None,
+            model_provider_id: None,
+            mode: None,
+            allow_shell: Some(false),
+            trust_mode: Some(false),
+            auto_approve: Some(false),
+            delivery_mode: None,
+            status: Some(AutomationStatus::Paused),
+        })?;
+        automations.edit_automation(&created.id, |record| {
+            let mut record =
+                record.ok_or_else(|| anyhow::anyhow!("fresh automation must exist"))?;
+            record.execution_scope = Some(scope.clone());
+            Ok(Some(record))
+        })?;
+        assert_eq!(
+            binding.adoption_refusal()?,
+            Some(StoreAdoptionRefusal::ScopePinnedAutomation)
+        );
+        assert!(!binding.is_adoptable_empty_store()?);
+        Ok(())
+    }
+}
+
 #[test]
 fn saved_history_boundary_refuses_until_every_kept_prompt_is_seen() {
     let user = |text: &str| Message {

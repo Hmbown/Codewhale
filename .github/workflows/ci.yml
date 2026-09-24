@@ -110,7 +110,7 @@ jobs:
 
           base=""
           if [[ "${EVENT_NAME}" == "pull_request" && -n "${BASE_REF}" ]]; then
-            git fetch --no-tags origin "${BASE_REF}:refs/remotes/origin/${BASE_REF}" --depth=1
+            git fetch --no-tags origin "+${BASE_REF}:refs/remotes/origin/${BASE_REF}" --depth=1
             base="origin/${BASE_REF}"
           elif [[ -n "${BEFORE_SHA}" && "${BEFORE_SHA}" != "0000000000000000000000000000000000000000" ]]; then
             base="${BEFORE_SHA}"

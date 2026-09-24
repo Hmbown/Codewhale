@@ -180,6 +180,23 @@ pub(super) struct InstallPluginRequest {
 }
 
 #[derive(Debug, Deserialize)]
+pub(super) struct DshPreviewRequest {
+    /// DeepSeek Harness bundle package directory; relative paths resolve
+    /// against the workspace.
+    pub(super) path: String,
+}
+
+#[derive(Debug, Serialize)]
+pub(super) struct DshPreviewResponse {
+    /// Pass to `POST /v1/apps/plugins/install` as `source`, with
+    /// `content_hash` as `expected_content_hash`, to install exactly this
+    /// reviewed bundle.
+    pub(super) install_source: String,
+    pub(super) content_hash: String,
+    pub(super) conversion: crate::plugins::install::dsh::DshConversion,
+}
+
+#[derive(Debug, Deserialize)]
 pub(super) struct TrustPluginRequest {
     /// Review token from `GET /v1/apps/plugins/{selector}`. Required: trust
     /// is an explicit confirmation bound to both SHA-256 receipts.
@@ -780,6 +797,38 @@ pub(super) async fn install_plugin_api(
     };
     let response = run_plugin_mutation(&state, request).await?;
     Ok((StatusCode::CREATED, Json(response)))
+}
+
+/// `POST /v1/apps/plugins/import/dsh/preview`: convert a DeepSeek Harness
+/// bundle package into scratch and return its receipt and review hash.
+/// Nothing is installed; the install endpoint does that with the same hash.
+pub(super) async fn preview_dsh_plugin_api(
+    State(state): State<RuntimeApiState>,
+    Json(req): Json<DshPreviewRequest>,
+) -> Result<Json<DshPreviewResponse>, ApiError> {
+    let requested = std::path::PathBuf::from(req.path.trim());
+    let path = if requested.is_absolute() {
+        requested
+    } else {
+        state.workspace.join(requested)
+    };
+    let preview = tokio::task::spawn_blocking(move || {
+        let canonical = path
+            .canonicalize()
+            .map_err(|_| format!("DSH package not found at {}", path.display()))?;
+        crate::plugins::install::preview_dsh(&canonical)
+            .map(|(conversion, content_hash)| (canonical, conversion, content_hash))
+            .map_err(|error| format!("{error:#}"))
+    })
+    .await
+    .map_err(|error| ApiError::internal(format!("DSH preview task failed: {error}")))?;
+    let (canonical, conversion, content_hash) =
+        preview.map_err(|error| ApiError::bad_request(format!("DSH import refused: {error}")))?;
+    Ok(Json(DshPreviewResponse {
+        install_source: format!("dsh:{}", canonical.display()),
+        content_hash,
+        conversion,
+    }))
 }
 
 /// `POST /v1/apps/plugins/{selector}/update`

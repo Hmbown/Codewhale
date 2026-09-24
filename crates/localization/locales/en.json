@@ -1119,6 +1119,10 @@
   "ApprovalOptionAbortTurn": "Stop this turn",
   "ApprovalBlockTitle": "approval",
   "ApprovalControlsHint": "  ·  Pg↑/↓ review  ·  {details} details  ·  Esc stop",
+  "ApprovalOwnerHeader": "Agent: {agent} · {role}",
+  "ApprovalGoToAgent": "g go to agent",
+  "ApprovalControlsHintChild": "  ·  Pg↑/↓ review  ·  {details} details  ·  Esc hide",
+  "PendingApprovalInAgent": "Approval needed in {agent} — /agents",
   "ApprovalTruncationHint": "  … truncated · press {details} for full details",
   "ApprovalFullAccessPolicyBlocked": "Blocked {tool}: Full Access cannot bypass this policy",
   "AutoReviewQuestionSkipped": "Auto-Review skipped a user question and continued autonomously",
@@ -1622,7 +1626,7 @@
   "FleetModelReasonOperatorRoute": "this is your current model (the Fleet's coordinator route); switch models or use /fleet save to change it",
   "FleetModelReasonAlreadyPresent": "already on the team",
   "FleetModelErrorNeedsRoute": "a team model needs both a provider id and a model id",
-  "FleetModelErrorNeedsRole": "a team member is a role; name one (for example `/fleet add {route} scout`)",
+  "FleetModelErrorNeedsRole": "An agent needs a role name (for example `/fleet add {route} scout`).",
   "FleetModelErrorNoSelection": "no team is selected; your team is the session model only",
   "FleetModelErrorOperatorRoute": "{route} is the coordinator route of the Fleet `{fleet}`; change it with /fleet save, not remove",
   "FleetModelErrorNotInFleet": "{route} is not on the team `{fleet}`",
@@ -2284,5 +2288,9 @@
   "ExtensionsScopeGlobal": "global",
   "ExtensionsScopeProject": "project",
   "ExtensionsScopePlugin": "plugin: {plugin}",
-  "ExtensionsRemoveArmed": "Remove {name}? Press d again to confirm · Esc cancels"
+  "ExtensionsRemoveArmed": "Remove {name}? Press d again to confirm · Esc cancels",
+  "FleetReviewWorkspaceLimits": "{workspace} · agents {enabled} ({concurrent} concurrent, {launch_slots} launch slots, {admitted} admitted) · recursion agent {agent_depth} / Fleet {fleet_depth} (ceiling {ceiling})",
+  "FleetReviewPolicy": "Agents run without a token cap by default · {api_secs}s API, {heartbeat_secs}s heartbeat. Launch with Fleet → exec; /fleet workers (or /subagents) shows agents in this session; /fleet status and codewhale fleet status read the saved .codewhale/fleet.jsonl history.",
+  "SetupProjectPermissionsInvalid": "Project config {path} could not be parsed ({reason}). Its permission restrictions are NOT in effect; this workspace falls back to your user defaults.",
+  "SetupProjectPermissionsOverride": "Project config contains {fields}. Presets save user defaults; project config can still tighten permissions in this workspace."
 }

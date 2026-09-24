@@ -18,6 +18,7 @@ import {
   EN_CHANGELOG,
   EN_DOCS_SHELL,
   EN_DOCS_TROUBLESHOOTING,
+  EN_DIGEST,
   EN_HOME,
   EN_LEGAL_PRIVACY,
   EN_LEGAL_TERMS,
@@ -39,6 +40,7 @@ import {
   getChangelog,
   getDocsShell,
   getDocsTroubleshooting,
+  getDigest,
   getHome,
   getLegalPrivacy,
   getLegalTerms,
@@ -276,6 +278,7 @@ describe("website dictionaries", () => {
       ["changelog", getChangelog, EN_CHANGELOG],
       ["legal-terms", getLegalTerms, EN_LEGAL_TERMS],
       ["legal-privacy", getLegalPrivacy, EN_LEGAL_PRIVACY],
+      ["digest", getDigest, EN_DIGEST],
     ] as const) {
       const enKeys = Object.keys(reference).sort();
       for (const locale of [...DICTIONARY_LOCALES, "fr", "und"]) {

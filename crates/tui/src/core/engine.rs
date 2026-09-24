@@ -2620,6 +2620,9 @@ impl Engine {
             super::engine::approval::ApprovalDecision::TimedOut { id } => {
                 (id.clone(), ChildApprovalOutcome::Denied)
             }
+            super::engine::approval::ApprovalDecision::Unavailable { id } => {
+                (id.clone(), ChildApprovalOutcome::Unavailable)
+            }
             // A sandbox retry only exists for the parent's own tool call.
             super::engine::approval::ApprovalDecision::RetryWithPolicy { .. } => return false,
         };
@@ -3152,8 +3155,8 @@ impl Engine {
                             let _ = self
                                 .tx_event
                                 .send(Event::status(format!(
-                                    "Auto-compaction {}",
-                                    if enabled { "enabled" } else { "disabled" }
+                                    "Make room automatically: {}",
+                                    if enabled { "on" } else { "off" }
                                 )))
                                 .await;
                         }
@@ -4850,7 +4853,7 @@ impl Engine {
                 .with_mcp_pool(mcp_pool.clone())
                 .with_todos(self.config.todos.clone())
                 .with_parent_completion_tx(self.tx_subagent_completion.clone())
-                .with_runtime_cost_owner(self.config.compaction.runtime_cost_owner.as_deref())
+                .with_parent_compaction(&self.config.compaction)
                 .with_parent_mode(input_policy.mode)
                 .with_approval_receipt_store(self.approval_receipt_store.clone())
                 .with_permission_posture(
@@ -6055,7 +6058,7 @@ impl Engine {
         .with_mcp_pool(self.mcp_pool.clone())
         .with_todos(self.config.todos.clone())
         .with_parent_completion_tx(self.tx_subagent_completion.clone())
-        .with_runtime_cost_owner(self.config.compaction.runtime_cost_owner.as_deref())
+        .with_parent_compaction(&self.config.compaction)
         .with_parent_mode(mode)
         .with_approval_receipt_store(self.approval_receipt_store.clone())
         .with_permission_posture(
@@ -7785,6 +7788,9 @@ pub(crate) enum MockApprovalEvent {
     TimedOut {
         id: String,
     },
+    Unavailable {
+        id: String,
+    },
     RetryWithPolicy {
         id: String,
         policy: crate::sandbox::SandboxPolicy,
@@ -7798,6 +7804,7 @@ impl MockEngineHandle {
             ApprovalDecision::Approved { id } => Some(MockApprovalEvent::Approved { id }),
             ApprovalDecision::Denied { id } => Some(MockApprovalEvent::Denied { id }),
             ApprovalDecision::TimedOut { id } => Some(MockApprovalEvent::TimedOut { id }),
+            ApprovalDecision::Unavailable { id } => Some(MockApprovalEvent::Unavailable { id }),
             ApprovalDecision::RetryWithPolicy { id, policy } => {
                 Some(MockApprovalEvent::RetryWithPolicy { id, policy })
             }

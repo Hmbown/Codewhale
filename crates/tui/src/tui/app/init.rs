@@ -993,6 +993,8 @@ impl App {
             },
             view_stack: ViewStack::new(),
             pending_user_input_prompt: None,
+            pending_child_requests: std::collections::BTreeMap::new(),
+            child_agent_sessions: std::collections::HashMap::new(),
             backtrack: crate::tui::backtrack::BacktrackState::new(),
             current_session_id: None,
             offline_queue_lease: None,

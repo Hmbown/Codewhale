@@ -380,7 +380,7 @@ pub(crate) fn try_cancel_compaction(app: &mut App, engine_handle: &EngineHandle)
     if !app.is_compacting && app.deferred_manual_compaction.take().is_some() {
         app.manual_compaction_queued = false;
         app.manual_compaction_id = None;
-        let message = "Context compaction canceled before it started".to_string();
+        let message = "Making room stopped before it started".to_string();
         add_compaction_receipt(app, &message);
         set_explicit_compaction_status(app, message, StatusToastLevel::Info, false);
         return true;
@@ -399,13 +399,13 @@ pub(crate) fn try_cancel_compaction(app: &mut App, engine_handle: &EngineHandle)
         Ok(()) => {
             set_explicit_compaction_status(
                 app,
-                "Canceling context compaction…".to_string(),
+                "Stopping making room…".to_string(),
                 StatusToastLevel::Info,
                 false,
             );
         }
         Err(error) => {
-            let message = format!("Could not cancel context compaction: {error}");
+            let message = format!("Could not stop making room: {error}");
             add_compaction_receipt(app, &message);
             set_explicit_compaction_status(app, message, StatusToastLevel::Error, true);
         }
@@ -476,7 +476,7 @@ pub(crate) fn maybe_warn_context_pressure_for_config(
         ", unverified window"
     };
 
-    let recommendation = "Automatic compaction is disabled. Enable auto_compact or use /compact.";
+    let recommendation = "Making room automatically is off. Turn on auto_compact or use /compact.";
 
     if percent >= CONTEXT_CRITICAL_THRESHOLD_PERCENT {
         set_context_pressure_status(

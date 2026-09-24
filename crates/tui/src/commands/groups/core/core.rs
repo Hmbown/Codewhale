@@ -250,6 +250,9 @@ pub(crate) fn reset_conversation_state(app: &mut App) -> bool {
     // "approve for session" grants (UX-8).
     app.approval_session_denied.clear();
     app.approval_session_approved.clear();
+    // Nor this one's child-agent approval cards, footer rows, or web-mirror
+    // copies: the reset finalizes those children engine-side.
+    crate::tui::pending_requests::clear_all(app);
     true
 }
 

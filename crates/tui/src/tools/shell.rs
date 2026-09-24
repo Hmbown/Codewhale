@@ -2558,7 +2558,10 @@ impl ShellManager {
         } = spawn_context;
         let task_id = format!("shell_{}", &Uuid::new_v4().to_string()[..8]);
         let mut spawn_guard =
-            ShellSpawnIntentGuard::new(work_lifecycle.clone(), &task_id, original_command);
+            ShellSpawnIntentGuard::new(work_lifecycle, &task_id, original_command);
+        // The guard owns the registration outcome: when bookkeeping could not
+        // bind this operation, nothing below may publish to it (#6435).
+        let work_lifecycle = spawn_guard.lifecycle.clone();
         let started = Instant::now();
         let sandbox_type = exec_env.sandbox_type;
         let sandboxed = exec_env.is_sandboxed();
@@ -2801,10 +2804,9 @@ impl ShellManager {
             return Err(err);
         }
 
-        if let Err(err) = bg_shell.publish_lifecycle() {
-            let _ = bg_shell.kill();
-            return Err(err);
-        }
+        // Work-graph publication is bookkeeping: a graph write that fails
+        // now must not kill a command that already started (#6435).
+        bg_shell.publish_lifecycle_best_effort();
 
         self.processes.insert(task_id.clone(), bg_shell);
         spawn_guard.disarm();
@@ -5623,8 +5625,9 @@ impl ToolSpec for BashTool {
                 .map_err(|_| ToolError::execution_failed("shell manager lock poisoned"))?;
             let work_lifecycle = shell_work_lifecycle_from_context(context);
             let task_id = format!("shell_{}", &Uuid::new_v4().to_string()[..8]);
-            let mut spawn_guard =
-                ShellSpawnIntentGuard::new(work_lifecycle.clone(), &task_id, command);
+            let mut spawn_guard = ShellSpawnIntentGuard::new(work_lifecycle, &task_id, command);
+            // Only a registered operation is observed (#6435).
+            let work_lifecycle = spawn_guard.lifecycle.clone();
             let result = manager.execute_interactive_with_policy_env(
                 command,
                 working_dir.as_deref(),

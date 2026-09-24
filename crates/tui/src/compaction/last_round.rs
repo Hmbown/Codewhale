@@ -369,7 +369,7 @@ pub(crate) fn validate_last_round_coverage(
     for text in last_round.iter().copied().filter_map(user_prompt_text_of) {
         if !survives(&text, replacement, user_prompt_text_of) {
             anyhow::bail!(
-                "Compaction coverage floor: a last-round user message was dropped; history was not replaced."
+                "Making room stopped: a last-round user message was dropped; history was not replaced."
             );
         }
     }
@@ -379,7 +379,7 @@ pub(crate) fn validate_last_round_coverage(
             .any(|message| has_tool_result_id(message, &id))
         {
             anyhow::bail!(
-                "Compaction coverage floor: last-round tool result {id} was dropped; history was not replaced."
+                "Making room stopped: last-round tool result {id} was dropped; history was not replaced."
             );
         }
     }
@@ -391,7 +391,7 @@ pub(crate) fn validate_last_round_coverage(
             .any(|message| has_tool_use_id(message, &id))
         {
             anyhow::bail!(
-                "Compaction coverage floor: last-round tool call {id} was dropped; history was not replaced."
+                "Making room stopped: last-round tool call {id} was dropped; history was not replaced."
             );
         }
     }
@@ -401,7 +401,7 @@ pub(crate) fn validate_last_round_coverage(
     for text in last_round.iter().copied().filter_map(assistant_text_of) {
         if !survives(&text, replacement, assistant_text_of) {
             anyhow::bail!(
-                "Compaction coverage floor: last-round assistant output was dropped; history was not replaced."
+                "Making room stopped: last-round assistant output was dropped; history was not replaced."
             );
         }
     }
@@ -413,7 +413,7 @@ pub(crate) fn validate_last_round_coverage(
             .any(|message| message.role.is_assistant_like())
     {
         anyhow::bail!(
-            "Compaction coverage floor: last-round assistant output was dropped; history was not replaced."
+            "Making room stopped: last-round assistant output was dropped; history was not replaced."
         );
     }
     Ok(())
@@ -436,7 +436,7 @@ pub(crate) fn require_text_survives(
         })
     });
     if !kept {
-        anyhow::bail!("Compaction coverage floor: {label} was dropped; history was not replaced.");
+        anyhow::bail!("Making room stopped: {label} was dropped; history was not replaced.");
     }
     Ok(())
 }
@@ -453,12 +453,12 @@ pub(crate) fn validate_survival_contract(
         .count();
     if checkpoints == 0 {
         anyhow::bail!(
-            "Compaction coverage floor: checkpoint receipt was dropped; history was not replaced."
+            "Making room stopped: checkpoint receipt was dropped; history was not replaced."
         );
     }
     if checkpoints > 1 {
         anyhow::bail!(
-            "Compaction coverage floor: prior summaries were duplicated; history was not replaced."
+            "Making room stopped: prior summaries were duplicated; history was not replaced."
         );
     }
     if let Some(anchors) = anchors {

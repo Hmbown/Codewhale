@@ -301,7 +301,7 @@ fn turn_metadata_uses_planned_cross_route_limits_not_installed_limits() {
         .unwrap();
     assert!(pressure.contains("Context pressure: critical"));
     assert!(pressure.contains("Estimated input:"));
-    assert!(pressure.contains("Automatic compaction is explicitly disabled"));
+    assert!(pressure.contains("Making room automatically is off"));
     let message = engine.user_text_message_from_snapshot(
         "cross-route budget".to_string(),
         &prompt_context.model,
@@ -580,7 +580,7 @@ async fn compaction_preview_uses_the_planned_routes_system_prompt() {
         .preview_runtime_transforms(&messages, Some(&planned_prompt), &compaction)
         .await;
     assert!(
-        planned_reasons.contains(&"auto-compaction would rewrite the conversation first"),
+        planned_reasons.contains(&"making room would summarize the conversation first"),
         "the planned route prompt crosses the compaction threshold: {planned_reasons:?}"
     );
 
@@ -588,7 +588,7 @@ async fn compaction_preview_uses_the_planned_routes_system_prompt() {
         .preview_runtime_transforms(&messages, Some(&installed_prompt), &compaction)
         .await;
     assert!(
-        !installed_reasons.contains(&"auto-compaction would rewrite the conversation first"),
+        !installed_reasons.contains(&"making room would summarize the conversation first"),
         "the installed route prompt is the below-threshold control: {installed_reasons:?}"
     );
 }

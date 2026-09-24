@@ -1443,6 +1443,10 @@ pub fn build_router(state: RuntimeApiState) -> Router {
             post(plugins::install_plugin_api),
         )
         .route(
+            "/v1/apps/plugins/import/dsh/preview",
+            post(plugins::preview_dsh_plugin_api),
+        )
+        .route(
             "/v1/apps/plugins/{selector}",
             get(plugins::get_plugin).delete(plugins::uninstall_plugin_api),
         )

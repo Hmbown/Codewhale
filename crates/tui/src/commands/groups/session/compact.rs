@@ -41,8 +41,8 @@ pub(in crate::commands) fn compact_pure(arg: Option<&str>) -> CommandResult {
         .filter(|focus| !focus.is_empty())
         .map(str::to_string);
     let receipt = match focus.as_deref() {
-        Some(focus) => format!("Context compaction triggered (focus: {focus})..."),
-        None => "Context compaction triggered...".to_string(),
+        Some(focus) => format!("Making room (focus: {focus})…"),
+        None => "Making room…".to_string(),
     };
     CommandResult::with_message_and_action(receipt, AppAction::CompactContext { focus })
 }
@@ -55,10 +55,7 @@ mod tests {
     #[test]
     fn pure_compact_matches_baseline_receipts() {
         let none = compact_pure(None);
-        assert_eq!(
-            none.message.as_deref(),
-            Some("Context compaction triggered...")
-        );
+        assert_eq!(none.message.as_deref(), Some("Making room…"));
         assert!(matches!(
             none.action,
             Some(AppAction::CompactContext { focus: None })
@@ -74,7 +71,7 @@ mod tests {
         let focus = compact_pure(Some("  the auth refactor  "));
         assert_eq!(
             focus.message.as_deref(),
-            Some("Context compaction triggered (focus: the auth refactor)...")
+            Some("Making room (focus: the auth refactor)…")
         );
         assert!(matches!(
             focus.action,

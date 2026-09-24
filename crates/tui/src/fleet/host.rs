@@ -190,7 +190,13 @@ struct LocalWorkerProcess {
     stopped: bool,
     last_exit: Option<ExitStatus>,
     last_memory_mb: Option<u64>,
+    /// When `ps` last sampled this worker. Status polls can run every few
+    /// milliseconds; memory is display data, so one sample a second is ample.
+    last_memory_sample: Option<std::time::Instant>,
 }
+
+/// Minimum spacing between `ps` memory samples for one worker.
+const MEMORY_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
 
 impl LocalProcessFleetHostAdapter {
     pub fn new(workspace: impl AsRef<Path>) -> Self {
@@ -303,6 +309,7 @@ impl LocalProcessFleetHostAdapter {
                 stopped: false,
                 last_exit: None,
                 last_memory_mb: None,
+                last_memory_sample: None,
             },
         );
         Ok(handle)
@@ -356,7 +363,11 @@ impl FleetHostAdapter for LocalProcessFleetHostAdapter {
         match process.child.try_wait() {
             Ok(None) => {
                 let pid = process.child.id();
-                let memory_mb = if process.host_kind == FleetHostKind::LocalProcess {
+                let due = process
+                    .last_memory_sample
+                    .is_none_or(|sampled| sampled.elapsed() >= MEMORY_SAMPLE_INTERVAL);
+                let memory_mb = if process.host_kind == FleetHostKind::LocalProcess && due {
+                    process.last_memory_sample = Some(std::time::Instant::now());
                     sample_process_memory_mb(pid)
                 } else {
                     None

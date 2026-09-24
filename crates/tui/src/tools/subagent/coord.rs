@@ -11,9 +11,9 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 
 use super::{
-    COMPLETED_AGENT_RETENTION, ParentMailReceipt, SharedSubAgentManager, SubAgentRuntime,
-    SubAgentStatus, parse_agent_ref, subagent_session_projection, subagent_status_name,
-    wait_for_subagents_from_input,
+    COMPLETED_AGENT_RETENTION, NEEDS_PERSON_WAIT_NOTE, ParentMailReceipt, SharedSubAgentManager,
+    SubAgentRuntime, SubAgentStatus, parse_agent_ref, subagent_session_projection,
+    subagent_status_name, take_new_needs_person, wait_for_subagents_from_input,
 };
 use crate::tools::registry::ToolRegistryBuilder;
 use crate::tools::spec::{
@@ -794,7 +794,7 @@ async fn wait_for_all_children(
                     "steps_taken": snapshot.steps_taken,
                 });
                 drop(manager);
-                return wait_all_payload(&[settled], &[], 0, false);
+                return wait_all_payload(&[settled], &[], &[], 0, false);
             }
             vec![snapshot.agent_id]
         } else {
@@ -809,7 +809,7 @@ async fn wait_for_all_children(
 
     // Zero children is an immediate return, never a hang.
     if watched.is_empty() {
-        return wait_all_payload(&[], &[], 0, false);
+        return wait_all_payload(&[], &[], &[], 0, false);
     }
 
     let started = Instant::now();
@@ -854,12 +854,24 @@ async fn wait_for_all_children(
         };
 
         if still_running.is_empty() {
-            return wait_all_payload(&settled, &[], started.elapsed().as_millis(), false);
+            return wait_all_payload(&settled, &[], &[], started.elapsed().as_millis(), false);
+        }
+        // A child blocked on a person ends the join early (approvals C2).
+        let needs_person = take_new_needs_person(&manager, &watched).await;
+        if !needs_person.is_empty() {
+            return wait_all_payload(
+                &settled,
+                &still_running,
+                &needs_person,
+                started.elapsed().as_millis(),
+                false,
+            );
         }
         if started.elapsed() >= timeout {
             return wait_all_payload(
                 &settled,
                 &still_running,
+                &[],
                 started.elapsed().as_millis(),
                 true,
             );
@@ -882,17 +894,20 @@ async fn wait_for_all_children(
 fn wait_all_payload(
     settled: &[Value],
     still_running: &[Value],
+    needs_person: &[Value],
     waited_ms: u128,
     timed_out: bool,
 ) -> Result<ToolResult, ToolError> {
-    let note = if timed_out {
+    let note = if !needs_person.is_empty() {
+        NEEDS_PERSON_WAIT_NOTE
+    } else if timed_out {
         "The wait interval ended; the children are still running. You may answer the user or continue other work. Ordinary turn completion keeps them running; results arrive as <codewhale:subagent.done> sentinels. Use followup only when a child actually needs continuation."
     } else if settled.is_empty() {
         "No sub-agents were running; nothing to join."
     } else {
         "Every watched child has settled. Full results arrive as <codewhale:subagent.done> sentinels — synthesize from those."
     };
-    let payload = json!({
+    let mut payload = json!({
         "action": "wait",
         "until": "all",
         "all_settled": still_running.is_empty(),
@@ -902,6 +917,9 @@ fn wait_all_payload(
         "timed_out": timed_out,
         "note": note,
     });
+    if !needs_person.is_empty() {
+        payload["needs_person"] = json!(needs_person);
+    }
     let mut tool_result =
         ToolResult::json(&payload).map_err(|err| ToolError::execution_failed(err.to_string()))?;
     tool_result.metadata = Some(json!({

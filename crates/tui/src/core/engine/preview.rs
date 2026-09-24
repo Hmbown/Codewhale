@@ -631,7 +631,7 @@ impl Engine {
         if crate::compaction::compaction_pressure_reached(messages, system_prompt, compaction) {
             let prepared = self.prepare_compaction_envelope(compaction.clone());
             if should_compact(messages, system_prompt, &prepared) {
-                reasons.push("auto-compaction would rewrite the conversation first");
+                reasons.push("making room would summarize the conversation first");
             }
         }
 

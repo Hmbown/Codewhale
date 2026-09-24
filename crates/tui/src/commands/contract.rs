@@ -4030,6 +4030,44 @@ impl CommandPluginContext for PluginAdapter<'_> {
         scan_managed_plugins_portable(home_override)
     }
 
+    fn dsh_preview(
+        &self,
+        package: &Path,
+    ) -> Result<codewhale_command_contract::facets::PluginDshPreview, String> {
+        let canonical = package
+            .canonicalize()
+            .map_err(|_| format!("DSH package not found at {}", package.display()))?;
+        let (conversion, content_hash) = crate::plugins::install::preview_dsh(&canonical)
+            .map_err(|error| format!("{error:#}"))?;
+        Ok(codewhale_command_contract::facets::PluginDshPreview {
+            package_path: canonical,
+            plugin_name: conversion.plugin_name,
+            source_package: conversion.source_package,
+            source_version: conversion.source_version,
+            content_hash,
+            skills: conversion.skills,
+            remote_servers: conversion.remote_servers,
+            local_servers: conversion.local_servers,
+            network_hosts: conversion.network_hosts,
+            requires_node: conversion.requires_node,
+            manual_ports: conversion
+                .outcomes
+                .iter()
+                .filter(|outcome| outcome.needs_manual_port())
+                .map(|outcome| {
+                    format!(
+                        "{} ({}) {}: {}",
+                        outcome.row.as_deref().unwrap_or("unlabeled"),
+                        outcome.package.as_deref().unwrap_or("unlabeled"),
+                        outcome.kind,
+                        outcome.reason
+                    )
+                })
+                .collect(),
+            diagnostics: conversion.diagnostics,
+        })
+    }
+
     fn managed_install(
         &mut self,
         canonical_path: &Path,

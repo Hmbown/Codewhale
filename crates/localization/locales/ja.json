@@ -1117,6 +1117,10 @@
   "ApprovalOptionAbortTurn": "このターンを停止",
   "ApprovalBlockTitle": "承認",
   "ApprovalControlsHint": "  ·  Pg↑/↓ 履歴  ·  {details} 詳細  ·  Esc 停止",
+  "ApprovalOwnerHeader": "エージェント: {agent} · {role}",
+  "ApprovalGoToAgent": "g エージェントへ移動",
+  "ApprovalControlsHintChild": "  ·  Pg↑/↓ 履歴  ·  {details} 詳細  ·  Esc 隠す",
+  "PendingApprovalInAgent": "{agent} で承認が必要です — /agents",
   "ApprovalTruncationHint": "  … 省略 · {details} で詳細を表示",
   "ApprovalFullAccessPolicyBlocked": "{tool} をブロック: Full Access ではこのポリシーを回避できません",
   "AutoReviewQuestionSkipped": "Auto-Review は質問をスキップし、自律的に続行しました",
@@ -1622,7 +1626,7 @@
   "FleetModelReasonOperatorRoute": "これは現在のモデル（チーム のオペレーター経路）です。モデルを切り替えるか /fleet save で変更してください",
   "FleetModelReasonAlreadyPresent": "すでに チーム に含まれています",
   "FleetModelErrorNeedsRoute": "チーム のモデルにはプロバイダー ID とモデル ID の両方が必要です",
-  "FleetModelErrorNeedsRole": "チームのメンバーはロールです。ロールを指定してください（例: `/fleet add {route} scout`）",
+  "FleetModelErrorNeedsRole": "エージェントには役割名が必要です（例：`/fleet add {route} scout`）。",
   "FleetModelErrorNoSelection": "チーム が選択されていません。あなたの チーム はセッションのモデルのみです",
   "FleetModelErrorOperatorRoute": "{route} は チーム `{fleet}` のオペレーター経路です。削除ではなく /fleet save で変更してください",
   "FleetModelErrorNotInFleet": "{route} は チーム `{fleet}` に含まれていません",
@@ -2284,5 +2288,9 @@
   "ExtensionsScopeGlobal": "グローバル",
   "ExtensionsScopeProject": "プロジェクト",
   "ExtensionsScopePlugin": "プラグイン: {plugin}",
-  "ExtensionsRemoveArmed": "{name} を削除しますか？ もう一度 d で確定 · Esc で取消"
+  "ExtensionsRemoveArmed": "{name} を削除しますか？ もう一度 d で確定 · Esc で取消",
+  "FleetReviewWorkspaceLimits": "{workspace} · エージェント {enabled}（同時実行 {concurrent}、起動枠 {launch_slots}、受入済み {admitted}）· 再帰：エージェント {agent_depth} / Fleet {fleet_depth}（上限 {ceiling}）",
+  "FleetReviewPolicy": "エージェントのトークン数は既定で無制限 · API {api_secs} 秒、ハートビート {heartbeat_secs} 秒。Fleet → exec で起動します。/fleet workers（または /subagents）はこのセッションのエージェントを表示し、/fleet status と codewhale fleet status は保存済みの .codewhale/fleet.jsonl 履歴を読み取ります。",
+  "SetupProjectPermissionsInvalid": "プロジェクト設定 {path} を解析できませんでした（{reason}）。この設定の権限制限は適用されていません。このワークスペースではユーザーの既定値が使われます。",
+  "SetupProjectPermissionsOverride": "プロジェクト設定に {fields} が含まれています。プリセットはユーザーの既定値を保存しますが、プロジェクト設定でこのワークスペースの権限をさらに制限できます。"
 }

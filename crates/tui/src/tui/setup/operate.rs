@@ -15,9 +15,9 @@ impl Default for SetupOperateFacts {
     fn default() -> Self {
         Self {
             runtime_ready: false,
-            runtime_result: "worker runtime not loaded".to_string(),
+            runtime_result: "agent runtime not loaded".to_string(),
             roster_ready: false,
-            roster_result: "Team roster not loaded".to_string(),
+            roster_result: "Fleet not loaded".to_string(),
             concurrency_result: "concurrency not loaded".to_string(),
             result: "operate readiness not loaded".to_string(),
         }
@@ -48,20 +48,20 @@ impl SetupOperateFacts {
         // work in the background and report its lifecycle accurately.
         let runtime_ready = runtime_configured && provider_ready;
         let runtime_result = if let Some(reason) = runtime_disabled_reason {
-            format!("worker runtime disabled ({reason})")
+            format!("agent runtime disabled ({reason})")
         } else if runtime_ready {
             format!(
-                "worker runtime ready for {}; max_subagents={}, launch_concurrency={}, admission={}, max_spawn_depth={}; background dispatch and completion receipts are available",
+                "agent runtime ready for {}; max_subagents={}, launch_concurrency={}, admission={}, max_spawn_depth={}; background dispatch and completion receipts are available",
                 provider_identity, max_subagents, launch_concurrency, max_admitted, max_spawn_depth
             )
         } else if runtime_configured {
             format!(
-                "worker runtime configured for {}, but the active provider route is not ready; max_subagents={}, launch_concurrency={}, admission={}, max_spawn_depth={}",
+                "agent runtime configured for {}, but the active provider route is not ready; max_subagents={}, launch_concurrency={}, admission={}, max_spawn_depth={}",
                 provider_identity, max_subagents, launch_concurrency, max_admitted, max_spawn_depth
             )
         } else {
             format!(
-                "worker runtime has no launch capacity for {}; max_subagents={}, launch_concurrency={}, admission={}, max_spawn_depth={}",
+                "agent runtime has no launch capacity for {}; max_subagents={}, launch_concurrency={}, admission={}, max_spawn_depth={}",
                 provider_identity, max_subagents, launch_concurrency, max_admitted, max_spawn_depth
             )
         };
@@ -97,9 +97,9 @@ impl SetupOperateFacts {
             .map(|(label, count)| format!("{label}={count}"))
             .collect::<Vec<_>>()
             .join(", ");
-            format!("{roster_members} team members (custom: {origins})")
+            format!("{roster_members} agents (custom: {origins})")
         } else {
-            format!("{roster_members} built-in team members; starter roster available")
+            format!("{roster_members} built-in agents; starter Fleet available")
         };
 
         let concurrency_result = format!(

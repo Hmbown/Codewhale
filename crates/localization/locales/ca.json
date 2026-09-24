@@ -1096,6 +1096,10 @@
   "ApprovalOptionAbortTurn": "Atura aquest torn",
   "ApprovalBlockTitle": "aprovació",
   "ApprovalControlsHint": "  ·  Pg↑/↓ revisa  ·  {details} detalls  ·  Esc atura",
+  "ApprovalOwnerHeader": "Agent: {agent} · {role}",
+  "ApprovalGoToAgent": "g ves a l'agent",
+  "ApprovalControlsHintChild": "  ·  Pg↑/↓ revisa  ·  {details} detalls  ·  Esc amaga",
+  "PendingApprovalInAgent": "Cal una aprovació a {agent} — /agents",
   "ApprovalTruncationHint": "  … truncat · prem {details} per a tots els detalls",
   "ApprovalFullAccessPolicyBlocked": "{tool} blocat: Full Access no pot evitar aquesta política",
   "AutoReviewQuestionSkipped": "Auto-Review ha omès una pregunta de l'usuari i ha continuat autònomament",
@@ -1599,7 +1603,7 @@
   "FleetModelReasonOperatorRoute": "aquest és el teu model actual (la ruta de l'operador de l'equip); canvia de model o fes servir /fleet save per modificar-la",
   "FleetModelReasonAlreadyPresent": "ja és a l'equip",
   "FleetModelErrorNeedsRoute": "un model de l'equip necessita un id de provider i un id de model",
-  "FleetModelErrorNeedsRole": "un membre de l'equip és un rol; indica'n un (per exemple `/fleet add {route} scout`)",
+  "FleetModelErrorNeedsRole": "L’agent necessita un nom de rol (per exemple, `/fleet add {route} scout`).",
   "FleetModelErrorNoSelection": "no hi ha cap equip seleccionat; el teu equip és només el model de la sessió",
   "FleetModelErrorOperatorRoute": "{route} és la ruta de l'operador de l'equip `{fleet}`; canvia-la amb /fleet save, no amb remove",
   "FleetModelErrorNotInFleet": "{route} no és a l'equip `{fleet}`",
@@ -2284,5 +2288,9 @@
   "ExtensionsScopeGlobal": "global",
   "ExtensionsScopeProject": "projecte",
   "ExtensionsScopePlugin": "connector: {plugin}",
-  "ExtensionsRemoveArmed": "Vols eliminar {name}? Torna a prémer d per confirmar · Esc cancel·la"
+  "ExtensionsRemoveArmed": "Vols eliminar {name}? Torna a prémer d per confirmar · Esc cancel·la",
+  "FleetReviewWorkspaceLimits": "{workspace} · agents {enabled} ({concurrent} simultanis, {launch_slots} places d’inici, {admitted} admesos) · recursió agent {agent_depth} / Fleet {fleet_depth} (límit {ceiling})",
+  "FleetReviewPolicy": "Els agents no tenen límit de tokens per defecte · API {api_secs}s, senyal d’activitat {heartbeat_secs}s. Inicia amb Fleet → exec; /fleet workers (o /subagents) mostra els agents d’aquesta sessió; /fleet status i codewhale fleet status llegeixen l’historial desat a .codewhale/fleet.jsonl.",
+  "SetupProjectPermissionsInvalid": "No s’ha pogut interpretar la configuració del projecte {path} ({reason}). Les seves restriccions de permisos NO són vigents; aquest espai de treball fa servir els teus valors per defecte d’usuari.",
+  "SetupProjectPermissionsOverride": "La configuració del projecte conté {fields}. Els preajustos desen els valors per defecte d’usuari; la configuració del projecte encara pot restringir els permisos en aquest espai de treball."
 }

@@ -34,6 +34,14 @@ telemetry-contract = { max-threads = 1 }
 # parallel load the file never appears (#5355). Serialize them; do not drop
 # the tests.
 exec-persistent-service = { max-threads = 1 }
+# Fleet manager lifecycle tests start real `/bin/sh` workers under setsid and
+# wait 10-15 s for the child's first line. Under full macOS CI load that line
+# never ran for three overlapping tests (#6424, #6428 runs), while each
+# passed alone from the same binary in under 1.2 s. Serialize the module; do
+# not lengthen its deadlines or drop tests. The product side of the load
+# (a durable heartbeat and a `ps` sample on every scheduler tick) is now
+# bounded to once a second per worker.
+fleet-manager-lifecycle = { max-threads = 1 }
 
 # First matching test-group override wins. Keep these more-specific
 # integration filters before binary(integration) so they are not stolen
@@ -55,6 +63,10 @@ test-group = 'telemetry-contract'
 [[profile.default.overrides]]
 filter = 'binary(telemetry_kill_switch_dispatch)'
 test-group = 'telemetry-contract'
+
+[[profile.default.overrides]]
+filter = 'package(codewhale-tui) & kind(lib) & test(/^fleet::manager::tests::/)'
+test-group = 'fleet-manager-lifecycle'
 
 [[profile.default.overrides]]
 filter = 'binary(integration) & test(/^exec_persistent_service::/)'

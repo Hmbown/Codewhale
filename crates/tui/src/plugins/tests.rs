@@ -989,6 +989,133 @@ fn write_install_source(root: &Path, name: &str) -> PathBuf {
     source
 }
 
+/// A DSH bundle package: one remote MCP row and one skill directory.
+fn write_dsh_package(root: &Path, url: &str) -> PathBuf {
+    let package = root.join("dsh-source");
+    fs::create_dir_all(package.join("pack-skills/guide")).unwrap();
+    fs::write(
+        package.join("package.json"),
+        serde_json::json!({"name": "@demo/docs-dsh", "version": "1.0.0",
+                           "dsh": {"bundle": {"patch": "./cordis.patch.yml"}}})
+        .to_string(),
+    )
+    .unwrap();
+    fs::write(
+        package.join("cordis.patch.yml"),
+        format!(
+            "- insert:\n  - id: docs\n    name: '@deepseek-ai/dsh-mcp-client'\n    config: {{serverName: docs, transport: streamable-http, url: '{url}'}}\n  - id: skills\n    name: '@deepseek-ai/dsh-skill-filesystem'\n    config: {{customSkillDirs: [pack-skills]}}\n  - id: theme\n    name: '@deepseek-ai/dsh-client-ui-theme'\n"
+        ),
+    )
+    .unwrap();
+    fs::write(
+        package.join("pack-skills/guide/SKILL.md"),
+        "---\nname: guide\ndescription: Bundled guide\n---\nBody.\n",
+    )
+    .unwrap();
+    package
+}
+
+/// DSH import is the ordinary reviewed install: the preview hash is what an
+/// exact install stages, the bundle lands disabled and untrusted, update
+/// re-converts the recorded package, and a changed package cannot be
+/// installed against a stale review or keep its trust.
+#[test]
+fn dsh_packages_import_through_the_reviewed_install_and_update_flow() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = config(tmp.path());
+    let network = allow_all_network();
+    let package = write_dsh_package(tmp.path(), "https://docs.example.invalid/mcp");
+    let (conversion, reviewed) = super::install::preview_dsh(&package).unwrap();
+    assert_eq!(conversion.plugin_name, "docs-dsh");
+    assert_eq!(conversion.remote_servers, ["docs"]);
+    assert_eq!(conversion.skills, ["guide"]);
+    assert!(
+        conversion
+            .outcomes
+            .iter()
+            .any(|o| o.needs_manual_port() && o.row.as_deref() == Some("theme"))
+    );
+
+    let source = super::install::PluginInstallSource::parse(package.to_str().unwrap()).unwrap();
+    assert!(
+        matches!(source, super::install::PluginInstallSource::Dsh(_)),
+        "{source:?}"
+    );
+    let outcome = block_on(super::install::install_with_expected_content_hash(
+        source,
+        &config.user_plugins_dir,
+        super::install::DEFAULT_MAX_SIZE_BYTES,
+        &network,
+        &|_| None,
+        &reviewed,
+    ))
+    .unwrap();
+    let super::install::PluginInstallOutcome::Installed(installed) = outcome else {
+        panic!("DSH import must install");
+    };
+    assert_eq!(installed.content_hash, reviewed);
+    let marker = fs::read_to_string(
+        config
+            .user_plugins_dir
+            .join("docs-dsh")
+            .join(super::install::INSTALLED_FROM_MARKER),
+    )
+    .unwrap();
+    assert!(marker.contains("dsh:"), "{marker}");
+
+    let mut registry = discover_with_config(&config);
+    let plugin = registry.get("docs-dsh").unwrap();
+    assert!(!plugin.enabled && !plugin.trusted());
+    registry.trust("docs-dsh").unwrap();
+    registry.enable("docs-dsh").unwrap();
+    assert!(registry.is_active("docs-dsh"));
+
+    let unchanged = block_on(super::install::update(
+        "docs-dsh",
+        &config.user_plugins_dir,
+        super::install::DEFAULT_MAX_SIZE_BYTES,
+        &network,
+    ))
+    .unwrap();
+    assert!(matches!(
+        unchanged,
+        super::install::PluginUpdateResult::NoChange
+    ));
+
+    fs::remove_dir_all(&package).unwrap();
+    write_dsh_package(tmp.path(), "https://docs-v2.example.invalid/mcp");
+    let stale = block_on(super::install::install_with_expected_content_hash(
+        super::install::PluginInstallSource::Dsh(package.clone()),
+        &tmp.path().join("other-plugins"),
+        super::install::DEFAULT_MAX_SIZE_BYTES,
+        &network,
+        &|_| None,
+        &reviewed,
+    ))
+    .unwrap_err();
+    assert!(
+        stale.to_string().contains("changed after review"),
+        "{stale:#}"
+    );
+
+    let updated = block_on(super::install::update(
+        "docs-dsh",
+        &config.user_plugins_dir,
+        super::install::DEFAULT_MAX_SIZE_BYTES,
+        &network,
+    ))
+    .unwrap();
+    assert!(matches!(
+        updated,
+        super::install::PluginUpdateResult::Updated(_)
+    ));
+    let registry = discover_with_config(&config);
+    assert!(
+        !registry.get("docs-dsh").unwrap().trusted(),
+        "changed converted bytes invalidate the trust receipt"
+    );
+}
+
 #[test]
 fn installed_bundles_land_disabled_and_untrusted_then_follow_the_trust_flow() {
     let tmp = tempfile::tempdir().unwrap();

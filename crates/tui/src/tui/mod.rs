@@ -86,6 +86,7 @@ pub mod output_rows_cache;
 pub mod pager;
 pub mod paste;
 pub mod paste_burst;
+pub(crate) mod pending_requests;
 pub mod persistence_actor;
 pub mod pet_watch;
 pub mod phase_strip;

@@ -45,6 +45,9 @@ pub struct PendingInputPreview {
     pub queued_messages: Vec<String>,
     pub editing_queued_message: Option<String>,
     pub edit_binding: EditBinding,
+    /// "Approval needed in {agent} — /agents", one row per child agent
+    /// waiting on the person whose card is not on top (approvals C1).
+    pub pending_approvals: Vec<String>,
 }
 
 /// Compact pre-send context row shown above the composer. `included=false`
@@ -69,6 +72,7 @@ impl PendingInputPreview {
             queued_messages: Vec::new(),
             editing_queued_message: None,
             edit_binding: EditBinding::UP,
+            pending_approvals: Vec::new(),
         }
     }
 
@@ -89,7 +93,27 @@ impl PendingInputPreview {
     /// at `width`. Pulled out so `desired_height` can ask the same renderer
     /// without duplicating wrapping logic.
     fn lines(&self, width: u16) -> Vec<Line<'static>> {
-        if (self.context_items.is_empty() && !self.has_pending_inputs()) || width < 4 {
+        if width < 4 {
+            return Vec::new();
+        }
+        // A child agent waiting on the person outranks queued input: it is
+        // work that has stopped until someone answers.
+        let mut lines: Vec<Line<'static>> = self
+            .pending_approvals
+            .iter()
+            .map(|row| {
+                Line::from(Span::styled(
+                    codewhale_localization::truncate_to_width(row, usize::from(width)),
+                    Style::default().fg(palette::STATUS_WARNING),
+                ))
+            })
+            .collect();
+        lines.extend(self.input_lines(width));
+        lines
+    }
+
+    fn input_lines(&self, width: u16) -> Vec<Line<'static>> {
+        if self.context_items.is_empty() && !self.has_pending_inputs() {
             return Vec::new();
         }
 
@@ -224,7 +248,11 @@ impl Renderable for PendingInputPreview {
         }
         // If the rest of a 40x12 layout leaves one preview row, preserve the
         // direct action rather than a non-actionable message summary.
-        if self.is_queued_only() && area.height == 1 && lines.len() == 2 {
+        if self.is_queued_only()
+            && self.pending_approvals.is_empty()
+            && area.height == 1
+            && lines.len() == 2
+        {
             lines.remove(0);
         }
         Paragraph::new(lines).render(area, buf);

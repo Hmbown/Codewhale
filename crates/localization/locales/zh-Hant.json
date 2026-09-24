@@ -138,6 +138,10 @@
   "ApprovalChooseAction": "Enter 執行選中項，或直接按 y/a/d",
   "ApprovalChooseHint": "選擇：",
   "ApprovalControlsHint": "  ·  Pg↑/↓ 回看  ·  {details} 詳情  ·  Esc 停止",
+  "ApprovalOwnerHeader": "智慧體：{agent} · {role}",
+  "ApprovalGoToAgent": "g 前往智慧體",
+  "ApprovalControlsHintChild": "  ·  Pg↑/↓ 回看  ·  {details} 詳情  ·  Esc 隱藏",
+  "PendingApprovalInAgent": "{agent} 需要核准 — /agents",
   "ApprovalDescAgent": "請求啟動或檢視代理；代理仍會自行請求批准。",
   "ApprovalDescFileWrite": "請求修改檔案。請確認路徑和內容符合預期。",
   "ApprovalDescMcpAction": "請求呼叫已連接應用程式的操作，可能產生副作用。",
@@ -881,7 +885,7 @@
   "FleetModelReasonOperatorRoute": "這是你目前的模型（團隊 的操作員路由）；請切換模型或用 /fleet save 變更",
   "FleetModelReasonAlreadyPresent": "已在 團隊 中",
   "FleetModelErrorNeedsRoute": "團隊 模型需要同時提供 provider ID 和模型 ID",
-  "FleetModelErrorNeedsRole": "團隊成員是一個角色；請指定一個（例如 `/fleet add {route} scout`）",
+  "FleetModelErrorNeedsRole": "智慧體需要一個角色名稱（例如 `/fleet add {route} scout`）。",
   "FleetModelErrorNoSelection": "未選取 團隊；你的 團隊 僅包含工作階段模型",
   "FleetModelErrorOperatorRoute": "{route} 是 團隊 `{fleet}` 的操作員路由；請用 /fleet save 變更，而不是移除",
   "FleetModelErrorNotInFleet": "{route} 不在 團隊 `{fleet}` 中",
@@ -2284,5 +2288,9 @@
   "ExtensionsScopeGlobal": "全域",
   "ExtensionsScopeProject": "專案",
   "ExtensionsScopePlugin": "外掛：{plugin}",
-  "ExtensionsRemoveArmed": "移除 {name}？再按一次 d 確認 · Esc 取消"
+  "ExtensionsRemoveArmed": "移除 {name}？再按一次 d 確認 · Esc 取消",
+  "FleetReviewWorkspaceLimits": "{workspace} · 智慧體{enabled}（同時執行 {concurrent}，啟動槽位 {launch_slots}，已接納 {admitted}）· 遞迴深度：智慧體 {agent_depth} / Fleet {fleet_depth}（上限 {ceiling}）",
+  "FleetReviewPolicy": "智慧體預設不設 token 上限 · API {api_secs} 秒，心跳 {heartbeat_secs} 秒。透過 Fleet → exec 啟動；/fleet workers（或 /subagents）顯示目前工作階段的智慧體；/fleet status 和 codewhale fleet status 讀取已儲存的 .codewhale/fleet.jsonl 歷史。",
+  "SetupProjectPermissionsInvalid": "無法解析專案設定 {path}（{reason}）。該設定的權限限制未生效；此工作區將使用你的使用者預設值。",
+  "SetupProjectPermissionsOverride": "專案設定包含 {fields}。預設組合儲存使用者預設值；專案設定仍可收緊此工作區的權限。"
 }

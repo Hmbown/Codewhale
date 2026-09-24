@@ -34,6 +34,7 @@ import type {
   DocsWebDict,
   DocsWorkDict,
   HomeDict,
+  DigestDict,
   LegalPrivacyDict,
   LegalTermsDict,
   StatesDict,
@@ -100,6 +101,8 @@ import { legalTerms as enLegalTerms } from "./en/legal-terms";
 import { legalTerms as zhLegalTerms } from "./zh/legal-terms";
 import { legalPrivacy as enLegalPrivacy } from "./en/legal-privacy";
 import { legalPrivacy as zhLegalPrivacy } from "./zh/legal-privacy";
+import { digest as enDigest } from "./en/digest";
+import { digest as zhDigest } from "./zh/digest";
 import { chrome as zhChrome } from "./zh/chrome";
 import { home as zhHome } from "./zh/home";
 import { chrome as jaChrome } from "./ja/chrome";
@@ -290,9 +293,10 @@ const DOCS_TRUST: Record<string, DocsTrustDict> = {
 };
 
 /**
- * Shared surface states, the changelog page and the two legal pages follow
- * the same optional per-locale rule as the docs page dictionaries: English is
- * the reference, every other locale falls back to it at lookup time.
+ * Shared surface states, the changelog page, the two legal pages and the
+ * digest page follow the same optional per-locale rule as the docs page
+ * dictionaries: English is the reference, every other locale falls back to it
+ * at lookup time.
  */
 const STATES: Record<string, StatesDict> = {
   zh: zhStates,
@@ -308,6 +312,10 @@ const LEGAL_TERMS: Record<string, LegalTermsDict> = {
 
 const LEGAL_PRIVACY: Record<string, LegalPrivacyDict> = {
   zh: zhLegalPrivacy,
+};
+
+const DIGEST: Record<string, DigestDict> = {
+  zh: zhDigest,
 };
 
 export function getChrome(locale: string): ChromeDict {
@@ -406,6 +414,10 @@ export function getLegalPrivacy(locale: string): LegalPrivacyDict {
   return LEGAL_PRIVACY[locale] ?? enLegalPrivacy;
 }
 
+export function getDigest(locale: string): DigestDict {
+  return DIGEST[locale] ?? enDigest;
+}
+
 /**
  * Select one side of a legacy `{ en, zh }` content pair by locale. This is
  * the transitional bridge for `web/lib/content/` modules that still carry
@@ -442,6 +454,7 @@ export const EN_STATES = enStates;
 export const EN_CHANGELOG = enChangelog;
 export const EN_LEGAL_TERMS = enLegalTerms;
 export const EN_LEGAL_PRIVACY = enLegalPrivacy;
+export const EN_DIGEST = enDigest;
 
 /** Interpolate `{name}` tokens in a dictionary template. Unknown tokens are
  * left intact so a template/variable drift is visible in review, not silent. */

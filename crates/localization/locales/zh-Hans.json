@@ -1117,6 +1117,10 @@
   "ApprovalOptionAbortTurn": "停止本轮",
   "ApprovalBlockTitle": "审批",
   "ApprovalControlsHint": "  ·  Pg↑/↓ 回看  ·  {details} 详情  ·  Esc 停止",
+  "ApprovalOwnerHeader": "智能体：{agent} · {role}",
+  "ApprovalGoToAgent": "g 前往智能体",
+  "ApprovalControlsHintChild": "  ·  Pg↑/↓ 回看  ·  {details} 详情  ·  Esc 隐藏",
+  "PendingApprovalInAgent": "{agent} 需要批准 — /agents",
   "ApprovalTruncationHint": "  … 已截断 · 按 {details} 查看完整内容",
   "ApprovalFullAccessPolicyBlocked": "已阻止 {tool}：Full Access 无法绕过此策略",
   "AutoReviewQuestionSkipped": "Auto-Review 已跳过用户问题并自主继续",
@@ -1622,7 +1626,7 @@
   "FleetModelReasonOperatorRoute": "这是你当前的模型（团队 的操作员路由）；请切换模型或用 /fleet save 更改",
   "FleetModelReasonAlreadyPresent": "已在 团队 中",
   "FleetModelErrorNeedsRoute": "团队 模型需要同时提供 provider ID 和模型 ID",
-  "FleetModelErrorNeedsRole": "团队成员是一个角色；请指定一个（例如 `/fleet add {route} scout`）",
+  "FleetModelErrorNeedsRole": "智能体需要一个角色名称（例如 `/fleet add {route} scout`）。",
   "FleetModelErrorNoSelection": "未选择 团队；你的 团队 仅包含会话模型",
   "FleetModelErrorOperatorRoute": "{route} 是 团队 `{fleet}` 的操作员路由；请用 /fleet save 更改，而不是移除",
   "FleetModelErrorNotInFleet": "{route} 不在 团队 `{fleet}` 中",
@@ -2284,5 +2288,9 @@
   "ExtensionsScopeGlobal": "全局",
   "ExtensionsScopeProject": "项目",
   "ExtensionsScopePlugin": "插件：{plugin}",
-  "ExtensionsRemoveArmed": "移除 {name}？再按一次 d 确认 · Esc 取消"
+  "ExtensionsRemoveArmed": "移除 {name}？再按一次 d 确认 · Esc 取消",
+  "FleetReviewWorkspaceLimits": "{workspace} · 智能体{enabled}（并发 {concurrent}，启动槽位 {launch_slots}，已接纳 {admitted}）· 递归深度：智能体 {agent_depth} / Fleet {fleet_depth}（上限 {ceiling}）",
+  "FleetReviewPolicy": "智能体默认不设 token 上限 · API {api_secs} 秒，心跳 {heartbeat_secs} 秒。通过 Fleet → exec 启动；/fleet workers（或 /subagents）显示当前会话的智能体；/fleet status 和 codewhale fleet status 读取已保存的 .codewhale/fleet.jsonl 历史。",
+  "SetupProjectPermissionsInvalid": "无法解析项目配置 {path}（{reason}）。该配置的权限限制未生效；此工作区将使用你的用户默认值。",
+  "SetupProjectPermissionsOverride": "项目配置包含 {fields}。预设保存用户默认值；项目配置仍可收紧此工作区的权限。"
 }

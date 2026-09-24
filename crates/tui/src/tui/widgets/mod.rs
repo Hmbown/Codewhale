@@ -2080,6 +2080,19 @@ impl<'a> ApprovalWidget<'a> {
             ),
         ]));
 
+        // A child's card names the agent that is waiting (approvals C1).
+        if let Some(owner) = self.request.owner.as_ref() {
+            body.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(
+                    approval_owner_header(owner, locale),
+                    Style::default()
+                        .fg(palette::TEXT_SECONDARY)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ]));
+        }
+
         if repo_law {
             body.push(Line::from(vec![
                 Span::raw("  "),
@@ -2203,7 +2216,9 @@ impl<'a> ApprovalWidget<'a> {
         // routine and elevated work the controls speak for themselves; the
         // extra policy prose was noise that made every edit read like an
         // emergency.
-        if critical {
+        // The semantics prose says Esc stops the turn; a child's card hides
+        // on Esc instead, so it never shows that line.
+        if critical && self.request.owner.is_none() {
             push_destructive_approval_semantics(&mut body, locale, false);
         }
 
@@ -2572,7 +2587,11 @@ fn build_approval_controls(
     controls.push(Line::from(vec![
         Span::raw("  "),
         Span::styled(
-            footer_controls(locale),
+            if request.owner.is_some() {
+                child_footer_controls(locale)
+            } else {
+                footer_controls(locale)
+            },
             Style::default().fg(palette::TEXT_MUTED),
         ),
         if request.can_save_ask_rule() {
@@ -3020,6 +3039,31 @@ fn footer_controls(locale: Locale) -> Cow<'static, str> {
     Cow::Owned(tr(locale, MessageId::ApprovalControlsHint).replace("{details}", details.as_ref()))
 }
 
+/// Controls hint for a child's card: Esc hides it, `g` opens the agent.
+fn child_footer_controls(locale: Locale) -> Cow<'static, str> {
+    let details = crate::tui::shell_key_routing::tool_details_chord();
+    Cow::Owned(format!(
+        "{}  ·  {}",
+        tr(locale, MessageId::ApprovalControlsHintChild).replace("{details}", details.as_ref()),
+        tr(locale, MessageId::ApprovalGoToAgent)
+    ))
+}
+
+/// "Agent: {agent} · {role}", dropping the role segment when the roster does
+/// not know the agent's role yet.
+fn approval_owner_header(owner: &crate::tui::approval::ApprovalOwner, locale: Locale) -> String {
+    let template = tr(locale, MessageId::ApprovalOwnerHeader);
+    let with_agent = template.replace("{agent}", &owner.label);
+    match owner.role.as_deref() {
+        Some(role) => with_agent.replace("{role}", role),
+        None => with_agent
+            .replace(" · {role}", "")
+            .replace("{role}", "")
+            .trim_end()
+            .to_string(),
+    }
+}
+
 fn save_ask_rule_hint(locale: Locale) -> Cow<'static, str> {
     tr(locale, MessageId::ApprovalSaveAskRuleHint)
 }
@@ -3088,6 +3132,11 @@ fn approval_options_for_request(
         workflow_approval_options(risk, locale).to_vec()
     } else {
         let mut options = approval_options_for(risk, locale).to_vec();
+        if request.owner.is_some() {
+            // Must match `ApprovalOption::CHILD_ORDER`: no "Stop this turn".
+            options.pop();
+            return options;
+        }
         if request.can_save_allow_rule() {
             options.insert(
                 2,

@@ -1,5 +1,6 @@
 // Bypassing the '@' alias to force TypeScript to find the file
 import { EmptyState } from "../../../components/surface-state";
+import { getDigest } from "../../../lib/i18n/dictionaries";
 import { getEnv } from "../../../lib/kv";
 import { buildPageMetadata } from "../../../lib/page-meta";
 
@@ -23,20 +24,18 @@ export const revalidate = 3600; // Cache page updates hourly
 
 export async function generateMetadata({ params }: { params: Promise<{ locale: string }> }) {
   const { locale } = await params;
-  const isZh = locale === "zh";
+  const t = getDigest(locale);
   return buildPageMetadata({
     path: "/digest",
     locale,
-    title: isZh ? "社区摘要 · Codewhale" : "Community Digest · Codewhale",
-    description: isZh
-      ? "Codewhale 每周社区更新存档：由维护者审核的摘要。"
-      : "Archive of weekly Codewhale community updates — maintainer-approved summaries.",
+    title: t.metaTitle,
+    description: t.metaDescription,
   });
 }
 
 export default async function DigestArchivePage({ params }: { params: Promise<{ locale: string }> }) {
   const { locale } = await params;
-  const isZh = locale === "zh";
+  const t = getDigest(locale);
 
   // 1. Get the correct project environment bindings
   const env = await getEnv();
@@ -84,16 +83,9 @@ export default async function DigestArchivePage({ params }: { params: Promise<{ 
     return (
       <div className="route-state">
         <h1 className="font-display text-3xl mb-6 tracking-crisp text-ink">
-          {isZh ? "社区摘要" : "Community Digest"}
+          {t.emptyTitle}
         </h1>
-        <EmptyState
-          locale={locale}
-          body={
-            isZh
-              ? "还没有经维护者审核的每周摘要。摘要在 cron 生成并审核后才会出现在这里。"
-              : "No maintainer-approved weekly digest exists yet. One appears here only after the cron draft has been reviewed."
-          }
-        />
+        <EmptyState locale={locale} body={t.emptyBody} />
       </div>
     );
   }
@@ -101,10 +93,10 @@ export default async function DigestArchivePage({ params }: { params: Promise<{ 
   return (
     <div className="max-w-4xl mx-auto py-12 px-6">
       <h1 className="font-display text-4xl mb-2 tracking-crisp text-ink">
-        {isZh ? "每周社区更新" : "Weekly Community Updates"}
+        {t.title}
       </h1>
       <p className="text-ink-mute mb-8">
-        {isZh ? "由 Codewhale 维护者审核的摘要" : "Maintainer-approved summaries from Codewhale"}
+        {t.lead}
       </p>
 
       <div className="space-y-12">

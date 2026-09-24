@@ -4708,6 +4708,63 @@ async fn busy_work_graph_degrades_the_spawn_intent_instead_of_failing_it() {
     );
 }
 
+/// #6435: the guard went unbound, but its sibling handle still published the
+/// spawn to the unregistered operation, killed the child and reported
+/// "operation binding shell:<id> is not registered". A busy Work-graph must
+/// let the command run end to end.
+#[cfg(unix)]
+#[tokio::test]
+async fn busy_work_graph_still_runs_the_command() {
+    use crate::tools::plan::new_shared_plan_state;
+    use crate::tools::todo::new_shared_todo_list;
+    use crate::work_graph::new_shared_work_runtime;
+
+    let workspace = tempdir().expect("workspace");
+    let todos = new_shared_todo_list();
+    let plan = new_shared_plan_state();
+    let lifecycle = ShellWorkLifecycle {
+        work: new_shared_work_runtime(todos.clone(), plan.clone()),
+        session_id: "session-test".to_string(),
+    };
+    let _held = todos.lock().await;
+    let mut manager = ShellManager::new(workspace.path().to_path_buf());
+    for background in [false, true] {
+        let marker = format!("ran-{background}.txt");
+        let result = manager
+            .execute_with_options_env_for_owner_and_work(
+                &format!("echo ran > {marker}"),
+                None,
+                10_000,
+                background,
+                None,
+                false,
+                None,
+                HashMap::new(),
+                None,
+                "session-test".to_string(),
+                None,
+                None,
+                Some(lifecycle.clone()),
+                None,
+                false,
+                (1_000, 60_000),
+            )
+            .unwrap_or_else(|err| panic!("background={background}: {err:#}"));
+        if background {
+            let task_id = result.task_id.expect("background task id");
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while !workspace.path().join(&marker).exists() {
+                assert!(std::time::Instant::now() < deadline, "{task_id} never ran");
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+        assert!(
+            workspace.path().join(&marker).exists(),
+            "background={background}: the command ran"
+        );
+    }
+}
+
 #[test]
 fn pty_dimensions_reject_zero_and_unbounded_grid() {
     assert_eq!(

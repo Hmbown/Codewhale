@@ -1169,6 +1169,10 @@ pub(crate) fn escape_cancel_request(
     }
 }
 
+/// Stream events a local cancel hides until the turn completes. Approval,
+/// sandbox-elevation, and question requests are never silently hidden:
+/// `resolve_stale_parent_request` answers a stale parent request explicitly,
+/// and a child agent's request is always delivered (approvals C1).
 fn suppress_engine_event_after_local_cancel(event: &EngineEvent) -> bool {
     matches!(
         event,
@@ -1181,9 +1185,6 @@ fn suppress_engine_event_after_local_cancel(event: &EngineEvent) -> bool {
             | EngineEvent::ToolCallStarted { .. }
             | EngineEvent::ToolCallHeartbeat
             | EngineEvent::ToolCallComplete { .. }
-            | EngineEvent::ApprovalRequired { .. }
-            | EngineEvent::UserInputRequired { .. }
-            | EngineEvent::ElevationRequired { .. }
             | EngineEvent::SessionUpdated { .. }
     )
 }
@@ -1200,9 +1201,6 @@ fn ignore_stale_stream_event_while_idle(event: &EngineEvent) -> bool {
             | EngineEvent::ToolCallStarted { .. }
             | EngineEvent::ToolCallHeartbeat
             | EngineEvent::ToolCallComplete { .. }
-            | EngineEvent::ApprovalRequired { .. }
-            | EngineEvent::UserInputRequired { .. }
-            | EngineEvent::ElevationRequired { .. }
     )
 }
 

@@ -273,10 +273,13 @@ pub(crate) async fn drain_remote_control_events(
                                 // gate, so dismiss exactly the matching card —
                                 // never an unrelated approval that happens to
                                 // be on top (concurrent approvals, fleet).
-                                if app.view_stack.top_matches_approval_gate(&gate) {
-                                    app.view_stack.pop();
+                                // The card may sit under another view
+                                // (a child's card, a pager): remove it at
+                                // any depth, and forget its pending entry.
+                                if app.view_stack.remove_approval_for_gate(&gate) {
                                     app.needs_redraw = true;
                                 }
+                                crate::tui::pending_requests::resolve(app, &tool_id);
                                 let (message_id, level) = if approved {
                                     (
                                         MessageId::NotificationWebApproved,

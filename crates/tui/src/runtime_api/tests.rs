@@ -2769,6 +2769,7 @@ async fn agent_runs_runtime_api_exposes_persisted_worker_receipts() -> Result<()
             tool: Some("handle_read".to_string()),
             reason: "Worker agent_receipt completed; verify its self-report.".to_string(),
         },
+        pending_request: None,
         status: AgentWorkerStatus::Completed,
         created_at_ms: 1,
         updated_at_ms: 2,
@@ -15265,6 +15266,79 @@ async fn plugin_api_404s_for_unknown_selector() -> Result<()> {
         .await?;
     assert_eq!(trust.status(), StatusCode::NOT_FOUND);
 
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn dsh_package_preview_then_exact_install_over_http() -> Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let root = tmp.path().join("runtime");
+    let workspace = tmp.path().join("ws");
+    fs::create_dir_all(&root)?;
+    let package = tmp.path().join("dsh-package");
+    fs::create_dir_all(&package)?;
+    fs::write(
+        package.join("package.json"),
+        r#"{"name": "@demo/docs-dsh", "dsh": {"bundle": {"patch": "./cordis.patch.yml"}}}"#,
+    )?;
+    fs::write(
+        package.join("cordis.patch.yml"),
+        "- insert:\n  - id: docs\n    name: '@deepseek-ai/dsh-mcp-client'\n    config: {serverName: docs, transport: streamable-http, url: 'https://docs.example.invalid/mcp'}\n",
+    )?;
+    let Some((addr, handle)) = spawn_plugin_api_server(root, workspace).await? else {
+        return Ok(());
+    };
+    let client = crate::tls::reqwest_client();
+
+    let preview: serde_json::Value = client
+        .post(format!("http://{addr}/v1/apps/plugins/import/dsh/preview"))
+        .json(&serde_json::json!({"path": package.display().to_string()}))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(preview["conversion"]["plugin_name"], "docs-dsh");
+    assert_eq!(
+        preview["conversion"]["network_hosts"],
+        serde_json::json!(["docs.example.invalid"])
+    );
+    let plugins: serde_json::Value = client
+        .get(format!("http://{addr}/v1/apps/plugins"))
+        .send()
+        .await?
+        .json()
+        .await?;
+    assert!(
+        !plugins["plugins"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p["name"] == "docs-dsh"),
+        "preview installs nothing"
+    );
+
+    let installed = client
+        .post(format!("http://{addr}/v1/apps/plugins/install"))
+        .json(&serde_json::json!({
+            "source": preview["install_source"],
+            "expected_content_hash": preview["content_hash"],
+        }))
+        .send()
+        .await?;
+    assert_eq!(installed.status(), StatusCode::CREATED);
+    let installed: serde_json::Value = installed.json().await?;
+    assert_eq!(installed["name"], "docs-dsh");
+    assert_eq!(installed["plugin"]["enabled"], false);
+    assert_ne!(installed["plugin"]["trust_status"], "trusted");
+
+    let refused = client
+        .post(format!("http://{addr}/v1/apps/plugins/import/dsh/preview"))
+        .json(&serde_json::json!({"path": tmp.path().join("missing").display().to_string()}))
+        .send()
+        .await?;
+    assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
     handle.abort();
     Ok(())
 }

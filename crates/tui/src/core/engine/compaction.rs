@@ -167,7 +167,7 @@ impl Engine {
             input_tokens,
         )?;
         context_pressure_message(budget.usage_percent()).map(|warning| format!(
-            "{warning}. Estimated input: {input_tokens} tokens ({:.1}% of route budget). Automatic compaction is explicitly disabled for this session. A manual /compact saves the original conversation and its model-written handoff before replacing context.",
+            "{warning}. Estimated input: {input_tokens} tokens ({:.1}% of route budget). Making room automatically is off for this session. /compact saves the original conversation and its model-written handoff before replacing context.",
             budget.usage_percent(),
         ))
     }
@@ -192,14 +192,10 @@ impl Engine {
         route: ResolvedRuntimeRoute,
         compaction: CompactionConfig,
     ) {
-        self.emit_compaction_started(
-            id.clone(),
-            false,
-            "Manual context compaction started".to_string(),
-        )
-        .await;
+        self.emit_compaction_started(id.clone(), false, "Making room…".to_string())
+            .await;
         let Some(cancel_token) = self.claim_compaction(&id) else {
-            let message = "Context compaction canceled before it started".to_string();
+            let message = "Making room stopped before it started".to_string();
             self.emit_compaction_cancelled(id, false, message).await;
             let _ = self
                 .tx_event
@@ -257,7 +253,7 @@ impl Engine {
             ..Usage::default()
         };
         let Some(client) = self.codewhale_client.clone() else {
-            let message = "Manual compaction unavailable: API client not configured".to_string();
+            let message = "Can't make room: no model is connected".to_string();
             self.finish_compaction(&id);
             self.emit_compaction_failed(id, false, message.clone())
                 .await;
@@ -313,7 +309,7 @@ impl Engine {
             self.emit_compaction_cancelled(
                 id,
                 false,
-                "Context compaction canceled; conversation context was not changed".to_string(),
+                "Making room stopped; the conversation was not changed".to_string(),
             )
             .await;
             let _ = self
@@ -341,8 +337,7 @@ impl Engine {
                         self.emit_compaction_cancelled(
                             id,
                             false,
-                            "Context compaction canceled; conversation context was not changed"
-                                .to_string(),
+                            "Making room stopped; the conversation was not changed".to_string(),
                         )
                         .await;
                         let _ = self
@@ -373,11 +368,11 @@ impl Engine {
                     let tokens_after = self.estimated_input_tokens();
                     let message = if retries_used > 0 {
                         format!(
-                            "Compaction complete: {messages_before} → {messages_after} messages ({removed} removed, {retries_used} retries), ~{tokens_before} → ~{tokens_after} tokens ({coverage_clause})"
+                            "Made room: {messages_before} → {messages_after} messages ({removed} removed, {retries_used} retries), ~{tokens_before} → ~{tokens_after} tokens ({coverage_clause})"
                         )
                     } else {
                         format!(
-                            "Compaction complete: {messages_before} → {messages_after} messages ({removed} removed), ~{tokens_before} → ~{tokens_after} tokens ({coverage_clause})"
+                            "Made room: {messages_before} → {messages_after} messages ({removed} removed), ~{tokens_before} → ~{tokens_after} tokens ({coverage_clause})"
                         )
                     };
                     self.emit_compaction_completed(
@@ -396,7 +391,7 @@ impl Engine {
                     )
                     .await;
                 } else {
-                    let message = "Compaction skipped: produced empty result".to_string();
+                    let message = "Making room skipped: the summary came back empty".to_string();
                     self.emit_compaction_failed(id.clone(), false, message.clone())
                         .await;
                     turn_status = TurnOutcomeStatus::Failed;
@@ -405,7 +400,7 @@ impl Engine {
             }
             Err(err) => {
                 let message = crate::compaction::report_compaction_failure(
-                    "Manual context compaction failed",
+                    "Making room failed",
                     &id,
                     false,
                     &err,
@@ -461,14 +456,14 @@ impl Engine {
             .stop_diagnostics
             .emergency_compaction_attempts
             .saturating_add(1);
-        let start_message = format!("Emergency context compaction started ({reason})");
+        let start_message = format!("Making room now ({reason})");
         self.emit_compaction_started(id.clone(), true, start_message)
             .await;
         let Some(compaction_cancel) = self.claim_compaction(&id) else {
             self.emit_compaction_cancelled(
                 id,
                 true,
-                "Emergency context compaction canceled before it started; conversation context was not changed"
+                "Making room stopped before it started; the conversation was not changed"
                     .to_string(),
             )
             .await;
@@ -514,9 +509,9 @@ impl Engine {
         let Some(compaction_result) = compaction_result else {
             self.finish_compaction(&id);
             let message = if turn_was_canceled {
-                "Emergency context compaction canceled with the active turn; conversation context was not changed"
+                "Making room stopped with the turn; the conversation was not changed"
             } else {
-                "Emergency context compaction canceled; conversation context was not changed"
+                "Making room stopped; the conversation was not changed"
             }
             .to_string();
             self.emit_compaction_cancelled(id, true, message).await;
@@ -561,9 +556,9 @@ impl Engine {
         if turn_was_canceled || compaction_cancel.is_cancelled() {
             self.finish_compaction(&id);
             let message = if turn_was_canceled {
-                "Emergency context compaction canceled with the active turn; conversation context was not changed"
+                "Making room stopped with the turn; the conversation was not changed"
             } else {
-                "Emergency context compaction canceled; conversation context was not changed"
+                "Making room stopped; the conversation was not changed"
             }
             .to_string();
             self.emit_compaction_cancelled(id, true, message).await;
@@ -577,9 +572,9 @@ impl Engine {
             if turn_was_canceled || compaction_cancel.is_cancelled() {
                 self.finish_compaction(&id);
                 let message = if turn_was_canceled {
-                    "Emergency context compaction canceled with the active turn; conversation context was not changed"
+                    "Making room stopped with the turn; the conversation was not changed"
                 } else {
-                    "Emergency context compaction canceled; conversation context was not changed"
+                    "Making room stopped; the conversation was not changed"
                 }
                 .to_string();
                 self.emit_compaction_cancelled(id, true, message).await;
@@ -606,7 +601,7 @@ impl Engine {
             self.emit_session_updated().await;
             let removed = before_count.saturating_sub(after_count);
             let mut details = format!(
-                "Emergency compaction complete: {before_count} → {after_count} messages ({removed} removed), ~{before_tokens} → ~{after_tokens} tokens"
+                "Made room: {before_count} → {after_count} messages ({removed} removed), ~{before_tokens} → ~{after_tokens} tokens"
             );
             if retries_used > 0 {
                 details.push_str(&format!(" ({retries_used} retries)"));
@@ -639,12 +634,12 @@ impl Engine {
         // reads as self-contradictory. Name the actual outcome instead.
         let message = if after_tokens > target_budget {
             format!(
-                "Emergency context compaction failed to reduce request below model limit \
+                "Making room failed: the request is still over the model limit \
                  (estimate ~{after_tokens} tokens, budget ~{target_budget}). Original conversation was preserved."
             )
         } else {
             format!(
-                "Emergency context compaction made no progress (estimate ~{after_tokens} tokens \
+                "Making room made no progress (estimate ~{after_tokens} tokens \
                  is already within the ~{target_budget} budget; the provider may count the \
                  request differently). Original conversation was preserved."
             )

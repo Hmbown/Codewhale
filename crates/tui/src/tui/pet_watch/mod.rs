@@ -930,6 +930,7 @@ mod tests {
                 step: Some(3),
                 tool_name: Some("exec_command".into()),
                 routine_wait: false,
+                approval_id: None,
             },
             parent_run_id: Some("run-9".into()),
             spawn_depth: 2,

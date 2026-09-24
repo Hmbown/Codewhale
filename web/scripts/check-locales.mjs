@@ -47,6 +47,7 @@ const OPTIONAL_FILES = [
   "changelog.ts",
   "legal-terms.ts",
   "legal-privacy.ts",
+  "digest.ts",
   "computer-use.ts",
 ];
 

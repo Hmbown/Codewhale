@@ -644,8 +644,9 @@ fn adoptable_empty_store_reports_nothing_to_abandon() -> anyhow::Result<()> {
         !binding.is_missing_session_store()?,
         "the store exists, so the old predicate cannot recover it"
     );
-    assert!(
-        binding.has_no_durable_work()?,
+    assert_eq!(
+        binding.adoption_refusal()?,
+        None,
         "a freshly opened store holds nothing to abandon"
     );
     assert!(
@@ -675,8 +676,9 @@ fn adoptable_empty_store_reports_nothing_to_abandon() -> anyhow::Result<()> {
     ] {
         let marker = store_dir.join(dir).join("work.json");
         std::fs::write(&marker, "{}")?;
-        assert!(
-            !binding.has_no_durable_work()?,
+        assert_eq!(
+            binding.adoption_refusal()?,
+            Some(crate::runtime_threads::StoreAdoptionRefusal::HasDurableWork { dir }),
             "{dir} holds work; the store must not be adopted"
         );
         assert!(

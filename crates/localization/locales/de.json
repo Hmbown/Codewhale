@@ -1096,6 +1096,10 @@
   "ApprovalOptionAbortTurn": "Diese Runde stoppen",
   "ApprovalBlockTitle": "Freigabe",
   "ApprovalControlsHint": "  ·  Pg↑/↓ prüfen  ·  {details} Details  ·  Esc stoppen",
+  "ApprovalOwnerHeader": "Agent: {agent} · {role}",
+  "ApprovalGoToAgent": "g zum Agenten",
+  "ApprovalControlsHintChild": "  ·  Pg↑/↓ prüfen  ·  {details} Details  ·  Esc ausblenden",
+  "PendingApprovalInAgent": "Freigabe nötig in {agent} — /agents",
   "ApprovalTruncationHint": "  … gekürzt · {details} für volle Details",
   "ApprovalFullAccessPolicyBlocked": "{tool} blockiert: Full Access kann diese Policy nicht umgehen",
   "AutoReviewQuestionSkipped": "Auto-Review hat eine Nutzerfrage übersprungen und autonom fortgefahren",
@@ -1599,7 +1603,7 @@
   "FleetModelReasonOperatorRoute": "das ist dein aktuelles Modell (die Operator-Route des Teams); wechsle das Modell oder ändere sie mit /fleet save",
   "FleetModelReasonAlreadyPresent": "bereits im Team",
   "FleetModelErrorNeedsRoute": "ein Team-Modell braucht sowohl eine Provider-ID als auch eine Modell-ID",
-  "FleetModelErrorNeedsRole": "ein Teammitglied ist eine Rolle; nenne eine (zum Beispiel `/fleet add {route} scout`)",
+  "FleetModelErrorNeedsRole": "Ein Agent benötigt einen Rollennamen (zum Beispiel `/fleet add {route} scout`).",
   "FleetModelErrorNoSelection": "kein Team ausgewählt; dein Team ist nur das Sitzungsmodell",
   "FleetModelErrorOperatorRoute": "{route} ist die Operator-Route des Teams `{fleet}`; ändere sie mit /fleet save, nicht mit remove",
   "FleetModelErrorNotInFleet": "{route} ist nicht im Team `{fleet}`",
@@ -2284,5 +2288,9 @@
   "ExtensionsScopeGlobal": "global",
   "ExtensionsScopeProject": "Projekt",
   "ExtensionsScopePlugin": "Plugin: {plugin}",
-  "ExtensionsRemoveArmed": "{name} entfernen? Zum Bestätigen erneut d drücken · Esc bricht ab"
+  "ExtensionsRemoveArmed": "{name} entfernen? Zum Bestätigen erneut d drücken · Esc bricht ab",
+  "FleetReviewWorkspaceLimits": "{workspace} · Agenten {enabled} ({concurrent} gleichzeitig, {launch_slots} Startplätze, {admitted} zugelassen) · Rekursion Agent {agent_depth} / Fleet {fleet_depth} (Obergrenze {ceiling})",
+  "FleetReviewPolicy": "Agenten haben standardmäßig kein Token-Limit · API {api_secs}s, Lebenszeichen {heartbeat_secs}s. Start über Fleet → exec; /fleet workers (oder /subagents) zeigt die Agenten dieser Sitzung; /fleet status und codewhale fleet status lesen den gespeicherten Verlauf in .codewhale/fleet.jsonl.",
+  "SetupProjectPermissionsInvalid": "Die Projektkonfiguration {path} konnte nicht gelesen werden ({reason}). Ihre Berechtigungseinschränkungen gelten NICHT; dieser Arbeitsbereich verwendet deine Benutzerstandardwerte.",
+  "SetupProjectPermissionsOverride": "Die Projektkonfiguration enthält {fields}. Voreinstellungen speichern Benutzerstandardwerte; die Projektkonfiguration kann die Berechtigungen in diesem Arbeitsbereich weiterhin einschränken."
 }

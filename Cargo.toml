@@ -69,6 +69,8 @@ rustls = { version = "0.23.36", default-features = false, features = ["ring", "s
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
+# DSH bundle import: event-level parsing so aliases and explicit tags can be refused.
+yaml-rust2 = { version = "0.13.0", default-features = false }
 semver = "1.0.28"
 thiserror = "2.0"
 tempfile = "3.27"

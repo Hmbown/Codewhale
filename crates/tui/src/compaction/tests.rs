@@ -109,7 +109,7 @@ fn untyped_usage_limit_text_never_becomes_quota_exhaustion() {
         "[auth] Authorization failed: You've reached your usage limit for this billing cycle"
     );
     let message = report(&error);
-    assert!(message.contains("provider rate limit blocked compaction"));
+    assert!(message.contains("provider rate limit blocked making room"));
     assert!(!message.contains("quota exhausted"));
 }
 
@@ -133,7 +133,7 @@ fn typed_rate_limit_stays_transient_and_does_not_become_quota() {
         message: "Too Many Requests".into(),
         retry_after: None,
     });
-    assert!(report(&error).contains("provider rate limit blocked compaction"));
+    assert!(report(&error).contains("provider rate limit blocked making room"));
     assert!(is_transient_error(&error));
 }
 

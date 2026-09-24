@@ -454,7 +454,7 @@ fn recovery_failures_from_the_provider_are_told_apart_from_budget_failures() {
         LlmError::ContextLengthError("prompt is too long".to_string())
     )));
     assert!(!is_provider_rejection(&anyhow::anyhow!(
-        "Compaction did not reduce context; original conversation was preserved."
+        "Making room did not shrink the context; the original conversation was preserved."
     )));
 }
 

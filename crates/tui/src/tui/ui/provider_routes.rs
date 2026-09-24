@@ -132,6 +132,9 @@ pub(crate) fn complete_provider_picker_onboarding(app: &mut App, provider: ApiPr
     };
     app.onboarding_provider = provider;
     app.onboarding_needs_api_key = false;
+    // The route now has its key, so a later local-Ollama probe must not treat
+    // this session as still recovering from a missing one.
+    app.onboarding_missing_key_recovery = false;
     app.api_key_env_only = false;
     app.offline_mode = false;
     onboarding::advance_onboarding_after_provider(app);

@@ -47,6 +47,14 @@ impl ApprovalOption {
         ApprovalOption::Abort,
     ];
 
+    /// A child agent's card (approvals C1): the person can hide it, never
+    /// stop the parent's turn from it, so "Stop this turn" is not offered.
+    const CHILD_ORDER: [ApprovalOption; 3] = [
+        ApprovalOption::ApproveOnce,
+        ApprovalOption::ApproveAlways,
+        ApprovalOption::Deny,
+    ];
+
     /// Workflow elevated-plan card (#4126): Approve / Edit plan / Cancel.
     const WORKFLOW_ORDER: [ApprovalOption; 3] = [
         ApprovalOption::ApproveOnce,
@@ -57,6 +65,8 @@ impl ApprovalOption {
     fn order_for(request: &ApprovalRequest) -> &'static [ApprovalOption] {
         if request.tool_name == "workflow" {
             &Self::WORKFLOW_ORDER
+        } else if request.owner.is_some() {
+            &Self::CHILD_ORDER
         } else if request.can_save_allow_rule() {
             &Self::ORDER_WITH_PERSISTENT_ALLOW
         } else {
@@ -162,6 +172,13 @@ impl ApprovalView {
 
     pub(super) fn current_option(&self) -> ApprovalOption {
         ApprovalOption::from_index_for(&self.request, self.selected)
+    }
+
+    /// The agent that owns this card, when it is a child's request.
+    #[cfg(test)]
+    #[must_use]
+    pub fn owner(&self) -> Option<&super::ApprovalOwner> {
+        self.request.owner.as_ref()
     }
 
     /// Whether this approval is the elevated Workflow plan card (#4126).
@@ -344,7 +361,16 @@ impl ModalView for ApprovalView {
             _ if crate::tui::shell_key_routing::is_tool_details_shortcut(&key) => {
                 self.emit_params_pager()
             }
+            // A child's card hides on Esc: the request stays pending (footer
+            // row, `/agents`) and the parent's turn is never cancelled.
+            KeyCode::Esc if self.request.owner.is_some() => ViewAction::Close,
             KeyCode::Esc => self.emit_decision(ReviewDecision::Abort, false),
+            KeyCode::Char('g') | KeyCode::Char('G') => match self.request.owner.as_ref() {
+                Some(owner) => ViewAction::Emit(ViewEvent::OpenAgentTranscript {
+                    agent_id: owner.agent_id.clone(),
+                }),
+                None => ViewAction::None,
+            },
             _ => ViewAction::None,
         }
     }

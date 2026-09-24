@@ -1119,6 +1119,10 @@
   "ApprovalOptionAbortTurn": "이번 턴 중지",
   "ApprovalBlockTitle": "승인",
   "ApprovalControlsHint": "  ·  Pg↑/↓ 기록  ·  {details} 상세  ·  Esc 중지",
+  "ApprovalOwnerHeader": "에이전트: {agent} · {role}",
+  "ApprovalGoToAgent": "g 에이전트로 이동",
+  "ApprovalControlsHintChild": "  ·  Pg↑/↓ 기록  ·  {details} 상세  ·  Esc 숨기기",
+  "PendingApprovalInAgent": "{agent}에서 승인이 필요합니다 — /agents",
   "ApprovalTruncationHint": "  … 잘림 · 전체 상세는 {details}",
   "ApprovalFullAccessPolicyBlocked": "{tool} 차단됨: Full Access는 이 정책을 우회할 수 없습니다",
   "AutoReviewQuestionSkipped": "Auto-Review가 사용자 질문을 건너뛰고 자율적으로 계속했습니다",
@@ -1622,7 +1626,7 @@
   "FleetModelReasonOperatorRoute": "현재 사용 중인 모델(팀의 operator 경로)입니다. 모델을 전환하거나 /fleet save로 변경하세요",
   "FleetModelReasonAlreadyPresent": "이미 팀에 있습니다",
   "FleetModelErrorNeedsRoute": "팀 모델에는 provider ID와 모델 ID가 모두 필요합니다",
-  "FleetModelErrorNeedsRole": "팀 멤버는 역할입니다. 역할을 지정하세요 (예: `/fleet add {route} scout`)",
+  "FleetModelErrorNeedsRole": "에이전트에는 역할 이름이 필요합니다(예: `/fleet add {route} scout`).",
   "FleetModelErrorNoSelection": "선택된 팀이 없습니다. 현재 팀은 세션 모델뿐입니다",
   "FleetModelErrorOperatorRoute": "{route}은(는) 팀 `{fleet}`의 operator 경로입니다. remove가 아니라 /fleet save로 변경하세요",
   "FleetModelErrorNotInFleet": "{route}은(는) 팀 `{fleet}`에 없습니다",
@@ -2284,5 +2288,9 @@
   "ExtensionsScopeGlobal": "전역",
   "ExtensionsScopeProject": "프로젝트",
   "ExtensionsScopePlugin": "플러그인: {plugin}",
-  "ExtensionsRemoveArmed": "{name}을(를) 제거할까요? d를 다시 눌러 확인 · Esc로 취소"
+  "ExtensionsRemoveArmed": "{name}을(를) 제거할까요? d를 다시 눌러 확인 · Esc로 취소",
+  "FleetReviewWorkspaceLimits": "{workspace} · 에이전트 {enabled} (동시 실행 {concurrent}, 시작 슬롯 {launch_slots}, 수용됨 {admitted}) · 재귀 에이전트 {agent_depth} / Fleet {fleet_depth} (상한 {ceiling})",
+  "FleetReviewPolicy": "에이전트는 기본적으로 토큰 한도가 없습니다 · API {api_secs}초, 상태 신호 {heartbeat_secs}초. Fleet → exec로 시작하세요. /fleet workers(또는 /subagents)는 이 세션의 에이전트를 표시하며, /fleet status와 codewhale fleet status는 저장된 .codewhale/fleet.jsonl 기록을 읽습니다.",
+  "SetupProjectPermissionsInvalid": "프로젝트 설정 {path}을(를) 해석할 수 없습니다({reason}). 이 설정의 권한 제한이 적용되지 않습니다. 이 작업 공간은 사용자 기본값을 사용합니다.",
+  "SetupProjectPermissionsOverride": "프로젝트 설정에 {fields}이(가) 포함되어 있습니다. 사전 설정은 사용자 기본값을 저장하지만, 프로젝트 설정으로 이 작업 공간의 권한을 더 제한할 수 있습니다."
 }

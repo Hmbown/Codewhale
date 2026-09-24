@@ -332,6 +332,15 @@ fn new_session_from_resumed_state_creates_distinct_empty_session() {
 
 #[test]
 fn new_session_forgets_denials_and_session_grants() {
+    conversation_reset_forgets_approvals("new");
+}
+
+#[test]
+fn clear_session_forgets_denials_and_session_grants() {
+    conversation_reset_forgets_approvals("clear");
+}
+
+fn conversation_reset_forgets_approvals(command: &str) {
     // UX-8: a Deny used to outlive `/new` for the whole process ("Restart
     // Codewhale to reconsider it"); a fresh conversation starts clean.
     let tmpdir = TempDir::new().unwrap();
@@ -341,17 +350,49 @@ fn new_session_forgets_denials_and_session_grants() {
         .insert("shell:rm -rf build:call-1".to_string());
     app.approval_session_approved
         .insert("shell:git status".to_string());
+    // A child agent's pending approval card from the old conversation.
+    let child_id = "agent:agent_a:approval:boot:1";
+    crate::tui::ui::push_approval_request_view(
+        &mut app,
+        child_id,
+        "exec_shell",
+        "agent_a wants to run 'exec_shell'",
+        &serde_json::json!({"command": "cargo build"}),
+        "k",
+        "g",
+        None,
+        crate::config::ApprovalDefaultSelection::Deny,
+        None,
+    );
+    crate::tui::pending_requests::record(
+        &mut app,
+        child_id,
+        crate::tui::pending_requests::PendingChildRequest {
+            agent_id: "agent_a".to_string(),
+            tool_name: "exec_shell".to_string(),
+            description: String::new(),
+            input: serde_json::json!({}),
+            approval_key: "k".to_string(),
+            approval_grouping_key: "g".to_string(),
+            intent_summary: None,
+            requested_at: std::time::Instant::now(),
+        },
+    );
 
-    let result = new_session(&mut app, None);
+    let result = dispatch_lifecycle(&mut app, command, None);
 
     assert!(matches!(result.action, Some(AppAction::SyncSession { .. })));
     assert!(
+        app.pending_child_requests.is_empty() && app.view_stack.is_empty(),
+        "an old conversation's child approval card must not follow /{command}"
+    );
+    assert!(
         app.approval_session_denied.is_empty(),
-        "a denied call must prompt again after /new"
+        "a denied call must prompt again after /{command}"
     );
     assert!(
         app.approval_session_approved.is_empty(),
-        "an approve-for-session grant must not follow the user into /new"
+        "an approve-for-session grant must not follow the user into /{command}"
     );
 }
 
@@ -802,7 +843,7 @@ fn test_compact_toggles_state() {
     let result = compact(&mut app, None);
     assert!(result.message.is_some());
     let msg = result.message.unwrap();
-    assert!(msg.contains("compaction") || msg.contains("Compact"));
+    assert!(msg.contains("Making room"), "{msg}");
     assert!(matches!(
         result.action,
         Some(AppAction::CompactContext { focus: None })

@@ -148,12 +148,7 @@ pub(crate) fn load_fleet_document(
                         .join(store::FLEET_DIR)
                         .join(format!("{bare}.toml"))
                 })
-                .filter(|path| {
-                    std::fs::read_to_string(path).ok().is_some_and(|text| {
-                        codewhale_workflow::fleet_exact::declared_schema_kind(&text).as_deref()
-                            == Some(store::FLEET_SCHEMA_KIND)
-                    })
-                });
+                .filter(|path| store::declares_v2_schema(path));
             let Some(path) = saved else {
                 return FleetDocument::load_by_name(name, &roots);
             };
@@ -175,10 +170,9 @@ pub(crate) fn load_fleet_document(
         .iter()
         .filter_map(|root| {
             let path = root.root.join(store::FLEET_DIR).join(&file_name);
-            let text = std::fs::read_to_string(&path).ok()?;
-            (codewhale_workflow::fleet_exact::declared_schema_kind(&text).as_deref()
-                != Some(store::FLEET_SCHEMA_KIND))
-            .then(|| format!("{}/{bare} ({})", root.origin, path.display()))
+            let schema = store::read_declared_schema(&path)?;
+            (schema.as_deref() != Some(store::FLEET_SCHEMA_KIND))
+                .then(|| format!("{}/{bare} ({})", root.origin, path.display()))
         })
         .collect();
 

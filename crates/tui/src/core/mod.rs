@@ -32,6 +32,8 @@ pub mod ops;
 // engine's `Op` / `Event` onto `codewhale_protocol::{op::Op, EventMsg}`.
 // A new engine variant without a protocol twin fails to compile there.
 pub mod protocol_parity;
+#[cfg(test)]
+mod queued_approval_tests;
 pub mod session;
 #[path = "runtime_contract/termination.rs"]
 pub mod termination;

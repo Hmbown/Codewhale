@@ -1056,7 +1056,7 @@ pub fn report_compaction_failure(
                 .to_string()
         }
         Some(crate::llm_client::LlmError::RateLimited { .. }) => {
-            "provider rate limit blocked compaction — retry after the limit resets or switch provider/model"
+            "provider rate limit blocked making room — retry after the limit resets or switch provider/model"
                 .to_string()
         }
         Some(crate::llm_client::LlmError::AuthenticationError(_)) => {
@@ -1064,12 +1064,12 @@ pub fn report_compaction_failure(
                 .to_string()
         }
         Some(crate::llm_client::LlmError::AuthorizationError(_)) => {
-            "provider authorization rejected compaction — verify account access or switch provider/model"
+            "provider authorization rejected making room — verify account access or switch provider/model"
                 .to_string()
         }
         _ => match crate::error_taxonomy::classify_error_message(&raw) {
             crate::error_taxonomy::ErrorCategory::RateLimit => {
-                "provider rate limit blocked compaction — retry after the limit resets or switch provider/model"
+                "provider rate limit blocked making room — retry after the limit resets or switch provider/model"
                     .to_string()
             }
             crate::error_taxonomy::ErrorCategory::Authentication => {
@@ -1077,7 +1077,7 @@ pub fn report_compaction_failure(
                     .to_string()
             }
             crate::error_taxonomy::ErrorCategory::Authorization => {
-                "provider authorization rejected compaction — verify account access or switch provider/model"
+                "provider authorization rejected making room — verify account access or switch provider/model"
                     .to_string()
             }
             _ => safe_raw,
@@ -1235,7 +1235,7 @@ pub async fn compact_messages_safe(
                         >= estimate_input_tokens_for_pressure(messages, system_prompt)
                 {
                     anyhow::bail!(
-                        "Compaction did not reduce context; original conversation was preserved."
+                        "Making room did not shrink the context; the original conversation was preserved."
                     );
                 }
                 let keep: CompactionKeep = inspect_compaction_keep(&kept);
@@ -1274,7 +1274,7 @@ pub async fn compact_messages_safe(
     }
 
     Err(last_error
-        .unwrap_or_else(|| anyhow::anyhow!("Compaction failed after {MAX_RETRIES} retries")))
+        .unwrap_or_else(|| anyhow::anyhow!("Making room failed after {MAX_RETRIES} retries")))
 }
 
 pub(crate) fn build_compaction_summary_block_text(summary: &str, anchors: &str) -> String {
@@ -1516,7 +1516,7 @@ checkpoint machinery, or return a placeholder. {COMPACTION_LANGUAGE_CONTRACT}"
 fn validate_compaction_summary(summary: &str) -> Result<()> {
     let trimmed = summary.trim();
     if trimmed.is_empty() {
-        anyhow::bail!("Compaction summary response was unusable: no text was returned.");
+        anyhow::bail!("The summary for making room was unusable: no text was returned.");
     }
 
     // Strip every non-word edge, not just ASCII punctuation. Providers can
@@ -1529,7 +1529,7 @@ fn validate_compaction_summary(summary: &str) -> Result<()> {
         .to_ascii_lowercase();
     if normalized.is_empty() {
         anyhow::bail!(
-            "Compaction summary response was unusable: only whitespace or punctuation was returned."
+            "The summary for making room was unusable: only whitespace or punctuation was returned."
         );
     }
     if matches!(
@@ -1544,7 +1544,7 @@ fn validate_compaction_summary(summary: &str) -> Result<()> {
             | "i can't provide a summary"
             | "unable to provide a summary"
     ) {
-        anyhow::bail!("Compaction summary response was unusable: a placeholder was returned.");
+        anyhow::bail!("The summary for making room was unusable: a placeholder was returned.");
     }
     Ok(())
 }
@@ -1673,7 +1673,7 @@ async fn create_summary(
         // with a fragment.
         if codewhale_models::is_incomplete_stop_reason(response.stop_reason.as_deref()) {
             anyhow::bail!(
-                "Compaction summary response incomplete: provider stop reason `{}`; the partial summary was not accepted.",
+                "The summary for making room was incomplete: provider stop reason `{}`; the partial summary was not accepted.",
                 codewhale_models::stop_reason_detail(response.stop_reason.as_deref())
             );
         }
@@ -1683,7 +1683,7 @@ async fn create_summary(
             .any(|block| matches!(block, ContentBlock::ToolUse { .. }))
         {
             anyhow::bail!(
-                "Compaction returned a tool call instead of a completed handoff; original conversation was preserved."
+                "Making room returned a tool call instead of a summary; the original conversation was preserved."
             );
         }
 

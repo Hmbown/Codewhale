@@ -40,7 +40,8 @@ use crate::commands::traits::{CommandGroup, ContextualCommand};
 use crate::tui::app::App;
 use crate::tui::app::AppAction;
 
-pub(crate) mod kimi_import;
+pub(crate) mod dsh_import;
+mod kimi_import;
 pub(crate) mod legacy;
 pub(crate) mod marketplace;
 #[cfg(test)]
@@ -150,14 +151,20 @@ pub(super) fn plugins(
         }),
         ["list"] => list_bundles_and_legacy_tools(presentation, plugin),
         ["help"] => CommandResult::message(format!(
-            "{}\n\n/plugin import kimi [list]\n/plugin import kimi approve <name> <content-hash>",
-            translate(presentation, "cmd_plugin_bundle_usage")
+            "{}\n\n/plugin import kimi [list]\n/plugin import kimi approve <name> <content-hash>\n{}",
+            translate(presentation, "cmd_plugin_bundle_usage"),
+            dsh_import::USAGE
         )),
         ["marketplace", rest @ ..] => marketplace::dispatch(presentation, plugin, rest),
         ["import", "kimi", rest @ ..] => {
             kimi_import::dispatch(presentation, plugin, rest, kimi_home)
         }
-        ["import", ..] => CommandResult::error(kimi_import::usage(presentation)),
+        ["import", "dsh", rest @ ..] => dsh_import::dispatch(presentation, plugin, rest),
+        ["import", ..] => CommandResult::error(format!(
+            "{}\n{}",
+            kimi_import::usage(presentation),
+            dsh_import::USAGE
+        )),
         ["show", selector] => show_bundle(presentation, plugin, selector),
         ["suggest"] | ["recommend"] => CommandResult::error("Usage: /plugin suggest <task>"),
         ["suggest", task @ ..] | ["recommend", task @ ..] => {

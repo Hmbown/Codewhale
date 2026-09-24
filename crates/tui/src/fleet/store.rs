@@ -604,19 +604,19 @@ pub(crate) fn v2_fleet_candidates(name: &str, workspace: &Path) -> Vec<(FleetSco
     found
 }
 
-/// Whether a file declares the v2 `schema = "fleet"`. Unreadable or
-/// malformed TOML is not a v2 declaration.
-fn declares_v2_schema(path: &Path) -> bool {
+/// The `schema` a Fleet file declares, normalized to lowercase. `None` when
+/// the file cannot be read; `Some(None)` when it is readable but declares no
+/// schema (or is not valid TOML).
+pub(crate) fn read_declared_schema(path: &Path) -> Option<Option<String>> {
     fs::read_to_string(path)
         .ok()
-        .and_then(|text| toml::from_str::<toml::Value>(&text).ok())
-        .and_then(|value| {
-            value
-                .get("schema")
-                .and_then(toml::Value::as_str)
-                .map(|schema| schema.trim().eq_ignore_ascii_case(FLEET_SCHEMA_KIND))
-        })
-        .unwrap_or(false)
+        .map(|text| codewhale_workflow::fleet_exact::declared_schema_kind(&text))
+}
+
+/// Whether a file declares the v2 `schema = "fleet"`. Unreadable or
+/// malformed TOML is not a v2 declaration.
+pub(crate) fn declares_v2_schema(path: &Path) -> bool {
+    read_declared_schema(path).flatten().as_deref() == Some(FLEET_SCHEMA_KIND)
 }
 
 /// Load a v2 Fleet by name. Ambiguity between the two scopes is an error that
@@ -1046,6 +1046,29 @@ mod tests {
     /// `lock_test_env`.
     fn set_sealed_home() -> crate::test_support::EnvVarGuard {
         crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", sealed_home())
+    }
+
+    #[test]
+    fn declared_schema_separates_unreadable_from_undeclared() {
+        let dir = tempfile::tempdir().unwrap();
+        let v2 = dir.path().join("v2.toml");
+        std::fs::write(&v2, "name = \"a\"\nschema = \" Fleet \"\n").unwrap();
+        let legacy = dir.path().join("legacy.toml");
+        std::fs::write(&legacy, "name = \"b\"\n[roles]\nscout = \"scout\"\n").unwrap();
+        let malformed = dir.path().join("bad.toml");
+        std::fs::write(&malformed, "schema = [").unwrap();
+        let missing = dir.path().join("missing.toml");
+
+        assert!(
+            declares_v2_schema(&v2),
+            "case and whitespace are normalized"
+        );
+        assert_eq!(read_declared_schema(&legacy), Some(None));
+        assert_eq!(read_declared_schema(&malformed), Some(None));
+        assert_eq!(read_declared_schema(&missing), None);
+        assert!(!declares_v2_schema(&legacy));
+        assert!(!declares_v2_schema(&malformed));
+        assert!(!declares_v2_schema(&missing));
     }
 
     #[test]

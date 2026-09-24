@@ -504,6 +504,26 @@ pub struct PluginManagedScan {
     pub rejected: Vec<String>,
 }
 
+/// Portable review of a DeepSeek Harness bundle package before import: what
+/// converts, what is skipped, the authority it will request, and the content
+/// hash an exact install of the same package stages.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginDshPreview {
+    pub package_path: PathBuf,
+    pub plugin_name: String,
+    pub source_package: Option<String>,
+    pub source_version: Option<String>,
+    pub content_hash: String,
+    pub skills: Vec<String>,
+    pub remote_servers: Vec<String>,
+    pub local_servers: Vec<String>,
+    pub network_hosts: Vec<String>,
+    pub requires_node: bool,
+    /// One line per skipped row or patch operation (a manual port).
+    pub manual_ports: Vec<String>,
+    pub diagnostics: Vec<String>,
+}
+
 /// Portable marketplace candidate install plan (FEAT-020 D2).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PluginMarketplaceInstallPlan {
@@ -665,6 +685,12 @@ pub trait CommandPluginContext {
         canonical_path: &Path,
         expected_content_hash: &str,
     ) -> Result<PluginMutationReceipt, String>;
+    /// Read-only: convert a DeepSeek Harness bundle package into scratch and
+    /// review it without installing anything.
+    fn dsh_preview(&self, package: &Path) -> Result<PluginDshPreview, String> {
+        let _ = package;
+        Err("DeepSeek Harness import is not available in this host.".to_string())
+    }
     /// Read-only: marketplace state (optional host catalog + stored catalogs).
     fn marketplace_state(&self) -> Result<PluginMarketplaceState, String>;
     /// Mutation: add a local catalog document to the marketplace store.
